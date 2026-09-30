@@ -20,6 +20,7 @@ import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/el
 import { FileText, Folder } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
+import { paneTabs } from '../../utils/splitPanesModel.mjs';
 import { getTabChromeColorConfig, flattenRgbaOnTabbarPanel, adjustRgbaAlpha } from './tabChrome';
 import {
   resolveTabCardBackground,
@@ -30,10 +31,14 @@ import { openTabContextMenuAt, TAB_RENAME_REQUEST_EVENT } from './TabBar';
 import {
   resolveTabCompletionNotificationShadow,
   TabCompletionNotificationAlert,
+  TabCompletionNotificationBadge,
+  TAB_COMPLETION_NOTIFICATION_INSET_PX,
   TabProcessBar,
   TabSessionAvailabilityMarker,
   TabStatusMarkerButton,
   TabTopLeftSignals,
+  TabContextUpdateBadge,
+  TAB_CONTEXT_UPDATE_INSET_PX,
   TabTaskMarker,
   TASK_MARKER_GAP_PX,
   TASK_MARKER_LANE_HEIGHT_PX,
@@ -43,6 +48,7 @@ import {
   useTabContextUsage,
   type SharedTabActivityMaps,
 } from './TabSignals';
+import { useTabWorkContext } from '../../utils/tabWorkContext';
 import {
   resolveTabSessionDescriptor,
   useSessionAvailability,
@@ -116,6 +122,9 @@ export default function PaneTabChip({
   const completionNotificationFired = useWorkspaceStore((s) => (
     s.openProjects.get(projectId)?.tabs.get(tabId)?.completionNotificationFired === true
   ));
+  const completionNotificationPersistent = useWorkspaceStore((s) => (
+    s.openProjects.get(projectId)?.tabs.get(tabId)?.completionNotificationPersistent === true
+  ));
   const codexSessionId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexSessionId || '');
   const codexLiveServiceTier = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveServiceTier);
   const codexLiveServiceTierSessionId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveServiceTierSessionId);
@@ -142,6 +151,7 @@ export default function PaneTabChip({
   );
   const completionNotificationDismissing = useTabCompletionNotificationDismissing(completionNotificationFired);
   const tabContextPct = useTabContextUsage(tabId);
+  const hasContextUpdate = useTabWorkContext(tabId).pendingCount > 0;
   const codexFastActive = resolveCodexFastModeState({
     currentSessionId: codexLiveSettingsSessionId || codexLiveServiceTierSessionId || codexSessionId,
     serviceTierSessionId: codexLiveServiceTierSessionId,
@@ -321,10 +331,13 @@ export default function PaneTabChip({
   // tab. Before this, the chip was 21px tall at 11.5px text next to a 27px
   // card at 14px, and its hover painted a flat white wash OVER the tab's own
   // colour — a green tab flashed grey-green and read as another widget.
-  const cardMetrics = resolveTabCardMetrics(tabGeo, {
+  const cardMetrics = resolveTabCardMetrics({
+    ...tabGeo,
+    paddingLeft: Math.max(tabGeo.paddingLeft, hasContextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 0),
+  }, {
     fontSize: tabsFontSize,
     showTaskLane: taskItems.length > 0,
-    hasStatusMarker: !!statusMeta,
+    hasStatusMarker: !!statusMeta || hasContextUpdate,
   });
   // `active` = this chip's tab fills THE FOCUSED window. `shown` alone is not
   // enough: every pane has one shown tab, so it lit one background per pane and
@@ -333,6 +346,7 @@ export default function PaneTabChip({
   const visuallyActive = shown && paneFocused;
   const pendingOperationLabel = resolveTabPendingOperationLabel({ aiClosing, pendingOperation });
   const completionNotificationWaiting = completionNotificationArmed && !completionNotificationFired;
+  const hasCompletionNotification = completionNotificationArmed || completionNotificationPersistent || completionNotificationFired;
   const completionNotificationShadow = resolveTabCompletionNotificationShadow({
     armed: completionNotificationWaiting,
     fired: completionNotificationFired,
@@ -353,17 +367,18 @@ export default function PaneTabChip({
   ));
   const removeFromWindow = (event: React.MouseEvent): boolean => {
     if (!inSplit) {
-      // Single mode: only a real strip has another chip to leave behind.
-      if (!inStrip) return false;
       event.preventDefault();
       event.stopPropagation();
-      useWorkspaceStore.getState().removeTabFromCenterStrip(projectId, tabId);
-      return true;
+      // The last chip still has an undo and leaves a vacant window. The store
+      // also validates that this named tab really belongs to the centre.
+      return useWorkspaceStore.getState().detachTabFromWindow(projectId, tabId);
     }
     const store = useWorkspaceStore.getState();
-    const paneOfThisTab = store.splitPanes
-      .some((pane) => pane.projectId === projectId && pane.tabId === tabId);
-    if (!paneOfThisTab && !inStrip) return false;
+    const candidates = paneIndex !== null && paneIndex !== undefined
+      ? [store.splitPanes[paneIndex]] : store.splitPanes;
+    const paneOfThisTab = candidates.some(pane => paneTabs(pane)
+      .some(entry => entry.projectId === projectId && entry.tabId === tabId));
+    if (!paneOfThisTab) return false;
     event.preventDefault();
     event.stopPropagation();
     store.clearTabFromSplitPane(tabId);
@@ -558,6 +573,7 @@ export default function PaneTabChip({
         // Left padding clears the status marker when one is shown, so the
         // name never sits under it — same rule as the sidebar card.
         padding: cardMetrics.padding,
+        paddingRight: hasCompletionNotification ? Math.max(tabGeo.paddingX, TAB_COMPLETION_NOTIFICATION_INSET_PX) : undefined,
         transform: pointerHeld && !dragging ? 'scale(0.985)' : undefined,
         // Selection is state, not a progress animation. A symmetric 120ms
         // background/color transition kept the OLD chip visibly active after
@@ -595,13 +611,15 @@ export default function PaneTabChip({
           dense pane strip context is useful only from 50%; Fast is always
           shown when its writer proof is exact. */}
       <TabTopLeftSignals
-        tabId={tabId}
         fastActive={codexFastActive}
         contextPct={tabContextPct}
         minContextPct={50}
         zIndex={8}
         muted={sessionSignalsMuted}
       />
+      <TabContextUpdateBadge active={hasContextUpdate} />
+      <TabCompletionNotificationBadge armed={completionNotificationArmed}
+        persistent={completionNotificationPersistent} fired={completionNotificationFired} />
       {/* Кликабельный маркер: смена статуса на месте, без активации вкладки
           и без смены фокуса окна — тот же компонент, что на карточке списка. */}
       <TabStatusMarkerButton projectId={projectId} tabId={tabId} color={statusMeta?.color} title={statusMeta?.label} />
@@ -674,7 +692,7 @@ export default function PaneTabChip({
           data-task-plan-tab-markers
           style={{
             position: 'absolute',
-            left: 6,
+            left: hasContextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 6,
             right: 6,
             // Hangs below the bottom edge by the shared rule, same as the
             // sidebar card — the squares straddle the seam rather than

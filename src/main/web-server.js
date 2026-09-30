@@ -6929,7 +6929,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         });
       }
       return sendJson(res, 405, { ok: false, error: 'unsupported context operation' });
-    } catch (error) { return sendJson(res, error.statusCode || 400, { ok: false, error: error.message }); }
+    } catch (error) { return sendJson(res, error.statusCode || 400, {
+      ok: false, error: error.message, ...(error.code ? { code: error.code } : {}),
+    }); }
   }
 
   if (parsed.pathname === '/api/external-research/orchestrations' && req.method === 'POST') {

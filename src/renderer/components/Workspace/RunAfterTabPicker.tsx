@@ -1607,6 +1607,7 @@ function StatusIcon({ status, color }: { status: TabRuntimeStatus; color: string
     >
       {isBusy ? (
         <LoaderCircle
+          className="noted-infinite-animation"
           size={9}
           strokeWidth={3}
           color={color}

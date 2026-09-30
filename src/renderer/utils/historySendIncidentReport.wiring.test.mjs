@@ -46,7 +46,9 @@ test('History send errors copy a self-contained incident report', () => {
   assert.match(catchBody, /sendAttemptId:/);
   assert.match(catchBody, /sendOperationKey:/);
   assert.match(catchBody, /statusAtSend: sendIncidentStatusAtSend/);
-  assert.match(catchBody, /promptText: sendIncidentPromptText/);
+  assert.match(catchBody, /promptChars: sendIncidentPromptText\.length/);
+  assert.match(catchBody, /textInserts: sendIncidentTextInserts/);
+  assert.doesNotMatch(catchBody, /promptText: sendIncidentPromptText/);
 });
 
 test('incident copy feedback returns to the copy action', () => {

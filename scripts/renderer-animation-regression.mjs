@@ -234,6 +234,11 @@ try {
     window.savedScroller.append(entry);
     const lateSpinner = document.createElement('span'); lateSpinner.className = 'cb-composer-runtime-spinner';
     window.savedOwner.querySelector('header').append(lateSpinner);
+    const lateInline = document.createElement('span');
+    lateInline.className = 'noted-infinite-animation';
+    lateInline.style.animation = 'spinner-rotate 0.85s linear infinite';
+    window.savedOwner.querySelector('header').append(lateInline);
+    window.lateInlineAnimation = lateInline.getAnimations()[0];
     const handoff = document.createElement('span');
     handoff.style.animation = 'fixture-one-shot 20ms linear';
     handoff.addEventListener('animationend', () => { window.oneShotFinished = true; });
@@ -242,6 +247,7 @@ try {
   await page.waitForTimeout(250);
   assert.equal(await page.evaluate(() => window.savedAnimation.currentTime), pausedAt, 'hidden animation clock is frozen');
   assert.equal((await animations()).running, 0, 'even an indicator inserted while hidden is paused');
+  assert.equal(await page.evaluate(() => window.lateInlineAnimation.playState), 'paused', 'marked inline feedback inserted while hidden also pauses');
   assert.equal(await page.evaluate(() => window.oneShotFinished), true, 'finite animationend handoffs still complete while hidden');
   await page.evaluate(() => {
     const mixed = document.createElement('span');

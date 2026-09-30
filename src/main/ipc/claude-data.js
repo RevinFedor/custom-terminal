@@ -2171,6 +2171,7 @@ function register({
   getClaudeEditableLastPromptState,
   recoverManagedHistoryImageRef,
   getClaudeRuntimeSettingsScope,
+  resolveTimelineNoteAnchor,
 }) {
   _projectManager = projectManager;
   _getClaudeEditableLastPromptState = typeof getClaudeEditableLastPromptState === 'function' ? getClaudeEditableLastPromptState : null;
@@ -6006,6 +6007,8 @@ function register({
             role: isContinued ? 'continued' : 'user',
             timestamp: entry.timestamp || '',
             content: cleanContent,
+            imageCount: Array.isArray(entry.message?.content)
+              ? entry.message.content.filter(part => part?.type === 'image').length : 0,
             sessionId: entrySid,
             recordByteOffset: entry.__byteOffset,
             // Display normalization must not erase the exact provider bytes
@@ -6490,11 +6493,19 @@ function register({
     }
   });
 
-  ipcMain.handle('timeline:save-note', async (event, { entryUuid, sessionId, tabId, content, position }) => {
+  ipcMain.handle('timeline:save-note', async (event, request) => {
     try {
+      const { entryUuid, sessionId, tabId, content, position } = request;
       const db = projectManager.db;
-      db.saveTimelineNote(entryUuid, sessionId, tabId, content, position || 'before');
-      return { success: true };
+      const resolved = typeof resolveTimelineNoteAnchor === 'function'
+        ? await resolveTimelineNoteAnchor(request) : { success: !String(entryUuid || '').startsWith('codex-live-'), entryUuid };
+      if (resolved.success !== true) return { success: false, error: resolved.error || 'timeline_note_source_unavailable' };
+      if (request.previousEntryUuid) {
+        const moved = db.moveTimelineNote({ ...request, entryUuid: resolved.entryUuid });
+        return moved.success ? { ...resolved, success: true } : moved;
+      }
+      db.saveTimelineNote(resolved.entryUuid, sessionId, tabId, content, position || 'before');
+      return { ...resolved, success: true };
     } catch (error) {
       console.error('[TimelineNotes] save-note error:', error);
       return { success: false, error: error.message };

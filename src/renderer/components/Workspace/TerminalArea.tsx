@@ -1,4 +1,5 @@
 import React, { memo, useCallback, useMemo, useEffect, useLayoutEffect, useState, useRef } from 'react';
+import { uiPerformancePhase } from '../../utils/uiPerformanceDiagnostics.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -337,6 +338,7 @@ function TerminalArea({
   sharedActivity = null,
 }: TerminalAreaProps) {
   const terminalAreaRenderStartedAt = performance.now();
+  uiPerformancePhase('terminal-area-render-start');
   const terminalAreaRootRef = useRef<HTMLDivElement | null>(null);
   const paneFocusIsolationRef = useRef<PaneFocusIsolationManager | null>(null);
   const tabLayerElementsRef = useRef(new Map<string, HTMLDivElement>());
@@ -521,6 +523,8 @@ function TerminalArea({
     const layoutAt = performance.now();
     const state = useWorkspaceStore.getState();
     const renderToLayoutMs = layoutAt - probe.renderStartedAt;
+    uiPerformancePhase('terminal-area-layout-effect', { renderMs: renderToLayoutMs, panes: state.splitPanes.length });
+    queueMicrotask(() => uiPerformancePhase('terminal-area-after-layout-effects', { ms: performance.now() - layoutAt }));
     console.warn('[Perf:TerminalAreaCommit] seq=' + probe.seq
       + ' project=' + projectId.slice(-12)
       + ' space=' + String(state.activeSpaceId || '-').slice(-12)
@@ -1664,6 +1668,7 @@ function TerminalArea({
       + ' chromeMissing=' + missingChrome
       + ' historyEvents=' + historyEvents
       + ' ms=' + elapsed.toFixed(1));
+    uiPerformancePhase('pane-presentation-complete', { ms: elapsed, changed: changedTabIds.length, historyEvents });
   }, [activeLayerKey, terminals]);
 
   // Listen for Claude fork completion to create new tab with command

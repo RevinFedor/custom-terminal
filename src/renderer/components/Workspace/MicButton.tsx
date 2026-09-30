@@ -191,6 +191,7 @@ export default function MicButton({ tabId }: Props) {
         {recording && (
           <span
             aria-hidden
+            className="noted-infinite-animation"
             style={{
               position: 'absolute',
               top: -2, right: -2,
@@ -343,7 +344,7 @@ function FloatingTranscript({ anchorRef, final, partial, stopping, onCancel, onS
         fontWeight: 600,
       }}>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <span style={{
+          <span className="noted-infinite-animation" style={{
             width: 8, height: 8, borderRadius: '50%',
             background: stopping ? '#888' : '#ef4444',
             boxShadow: stopping ? 'none' : '0 0 6px rgba(239,68,68,0.85)',
@@ -394,6 +395,7 @@ function FloatingTranscript({ anchorRef, final, partial, stopping, onCancel, onS
             {stopping && (
               <svg width="9" height="9" viewBox="0 0 24 24" fill="none"
                    stroke="currentColor" strokeWidth={2.6} strokeLinecap="round"
+                   className="noted-infinite-animation"
                    style={{ animation: 'mic-spin 0.7s linear infinite' }}>
                 <path d="M21 12a9 9 0 1 1-6.219-8.56" />
               </svg>

@@ -303,6 +303,8 @@ class CodexAccountProfileManager {
     this.profiles = new Map();
     this.pendingLogins = new Map();
     this.latestResults = new Map();
+    this.profileProbes = new Map();
+    this.probeClients = new Set();
     this.hydrate();
     this.seedDefaultProfileIdentity();
   }
@@ -470,7 +472,22 @@ class CodexAccountProfileManager {
   }
 
   async probeProfile(profile, { refreshToken = false, includeRateLimits = true } = {}) {
+    const active = this.profileProbes.get(profile.profileId);
+    if (active) {
+      const result = await active.promise;
+      if ((!refreshToken || active.refreshToken) && (!includeRateLimits || active.includeRateLimits)) return result;
+      return this.probeProfile(profile, { refreshToken, includeRateLimits });
+    }
+    const state = { refreshToken, includeRateLimits,
+      promise: this.probeProfileInner(profile, { refreshToken, includeRateLimits }) };
+    this.profileProbes.set(profile.profileId, state);
+    try { return await state.promise; }
+    finally { if (this.profileProbes.get(profile.profileId) === state) this.profileProbes.delete(profile.profileId); }
+  }
+
+  async probeProfileInner(profile, { refreshToken = false, includeRateLimits = true } = {}) {
     const client = this.clientFactory({ codexHome: profile.homePath });
+    this.probeClients.add(client);
     try {
       await client.start();
       const accountResult = await client.request('account/read', { refreshToken });
@@ -509,6 +526,7 @@ class CodexAccountProfileManager {
       return result;
     } finally {
       client.close();
+      this.probeClients.delete(client);
     }
   }
 
@@ -724,6 +742,8 @@ class CodexAccountProfileManager {
   }
 
   shutdown() {
+    for (const client of this.probeClients) client.close();
+    this.probeClients.clear();
     for (const pending of this.pendingLogins.values()) {
       clearTimeout(pending.timer);
       pending.client.close();

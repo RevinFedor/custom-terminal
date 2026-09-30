@@ -58,12 +58,18 @@ test('context update details render source tabs as real navigation targets', () 
   assert.doesNotMatch(contextChip, /setArmed/);
 });
 
-test('History owns one left-to-right preview sequence for orange and purple chips', () => {
+test('History owns one left-to-right preview sequence for context updates and saved prompts', () => {
   assert.match(history, /contextUpdates\.map\(\(update\) => historyContextUpdatePreviewId\(update\.id\)\)/);
   assert.match(history, /composerPromptChips\.map\(\(chip\) => chip\.id\)/);
   assert.match(history, /resolveOrderedPreviewNavigation\(composerPromptBandPreviewIds, previewChipId\)/);
   assert.match(history, /open=\{previewChipId === updatePreviewId\}/);
   assert.match(history, /navigation=\{composerPromptBandPreviewNavigation\}/);
+});
+
+test('pending, restored and sent updates use the same context-chip presentation', () => {
+  assert.match(contextChip, /<ComposerChip kind="prompt" label=\{update.title\} \{\.\.\.contextUpdateChipProps\}/);
+  assert.match(history, /chip.contextUpdateId\s*\? contextUpdateChipProps/);
+  assert.doesNotMatch(contextChip + history, /#e9a345|#8d612c|#2c2419/);
 });
 
 test('context-chip dismissal participates in the composer Undo payload', () => {

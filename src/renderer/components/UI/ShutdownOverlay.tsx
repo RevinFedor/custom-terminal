@@ -48,6 +48,7 @@ export default function ShutdownOverlay() {
       }}
     >
       <div
+        className="noted-infinite-animation"
         style={{
           width: 48,
           height: 48,

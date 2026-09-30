@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { captureTabRestorePlacement, readTabRestorePlacement, restoreSidebarTab,
-  restoreArchivedTabWindow, tabsAfterClose, tabPlacementId, tabPlacementSlotKey } from '../utils/tabRestorePlacement.mjs';
+  restoreArchivedTabWindow, tabsAfterClose, tabPlacementId, tabPlacementSlotKey,
+  captureWindowCloseScope, resolveWindowCloseScope, chooseWindowCloseAction } from '../utils/tabRestorePlacement.mjs';
 import { startTransition } from 'react';
 import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
@@ -56,6 +57,9 @@ import {
   emptyPaneByClosedTab,
   rememberPaneDetachedTab,
   restorePaneDetachedTab,
+  nextPaneCloseOrder,
+  nextRestorablePaneClose,
+  paneDetachedTabs,
   packSplitSizes,
   paneTabs,
   addTabToPane,
@@ -1606,7 +1610,7 @@ export interface SplitPane {
    */
   history?: Array<{ projectId: string; tabId: string }>;
   /** Explicitly removed chips, newest first; Shift+Cmd+T undoes this per pane. */
-  detachedTabs?: Array<{ projectId: string; tabId: string }>;
+  detachedTabs?: Array<{ projectId: string; tabId: string; closedOrder?: number; position?: any }>;
   /** @deprecated one-step predecessor of `history`; read-only via paneHistory(). */
   prevProjectId?: string;
   /** @deprecated see prevProjectId */
@@ -1733,7 +1737,7 @@ interface WorkspaceStore {
   /** Middle-click on a file pane: bring back what that pane showed before. */
   restoreSplitPanePreviousTab: (tabId: string) => boolean;
   /** Reinsert the newest chip explicitly removed from this pane. */
-  restoreLastDetachedTabToSplitPane: (paneIndex: number) => boolean;
+  restoreLastDetachedTabToSplitPane: (paneIndex: number, expectedTabId?: string) => boolean;
   /**
    * Double-click on the header's empty space: a brand-new tab joins THIS
    * window's strip as one more chip, shown immediately.
@@ -2735,7 +2739,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     return true;
   },
 
-  restoreLastDetachedTabToSplitPane: (paneIndex) => {
+  restoreLastDetachedTabToSplitPane: (paneIndex, expectedTabId) => {
     const st = get();
     if (!Number.isInteger(paneIndex) || paneIndex < 0 || !st.splitPanes[paneIndex]) return false;
     const restored = restorePaneDetachedTab(
@@ -2743,6 +2747,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       paneIndex,
       (projectId, tabId) => !!st.openProjects.get(projectId)?.tabs.has(tabId),
       tabPlacementSlotKey(st),
+      expectedTabId,
     );
     if (!restored) return false;
     set({ splitPanes: restored.panes, splitFocusedIndex: paneIndex });
@@ -5610,6 +5615,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
 
   closeTab: async (projectId, tabId, options) => {
     const closeStartedAt = Date.now();
+    const closeOrder = nextPaneCloseOrder(get().splitPanes);
+    let closedPlacement: any = null;
     const { openProjects, clearTerminalBuffer } = get();
     const workspace = openProjects.get(projectId);
 
@@ -5745,7 +5752,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         toolType: effectiveCommandType,
         reason: 'close-tab-archive-retry',
       }),
-      archive: () => ipcRenderer.invoke('project:archive-tab', {
+      archive: () => {
+        closedPlacement = captureTabRestorePlacement(get(), workspace, tabId);
+        if (closedPlacement) closedPlacement = {...closedPlacement,closedOrder:closeOrder};
+        return ipcRenderer.invoke('project:archive-tab', {
         projectId,
         tab: {
           tabId,
@@ -5779,10 +5789,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
           groupId: tab.groupId,
           windowScoped: tab.windowScoped,
           position: closedPosition >= 0 ? closedPosition : null,
-          restorePlacement: captureTabRestorePlacement(get(), workspace, tabId),
+          restorePlacement: closedPlacement,
           processWasRunning,
         }
-      }),
+        });
+      },
     });
     if (!archiveCommit.ok) {
       clearClosingLoader();
@@ -6364,62 +6375,97 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     };
   },
 
-  // Shift+Cmd+T restores the latest row serially per project. Rapid repeated
-  // key presses walk backwards through History instead of racing on one row.
+  // Shift+Cmd+T orders removals and Full closes in the captured window.
+  // Serial key presses walk back through both sources without racing on a row.
   reopenLastClosedTab: (projectId, options) => {
-    // Capture the pane named by the gesture, not whatever happens to be focused
-    // after the async history/PTY work completes.
+    const beforeOrder = nextPaneCloseOrder(get().splitPanes);
     const requestedPaneIndex = Number.isInteger(options?.targetPaneIndex)
-      ? Number(options?.targetPaneIndex)
-      : -1;
-    const previous = reopenLastClosedQueues.get(projectId)
-      || Promise.resolve<TabHistoryRestoreResult>({ tabId: null });
-    const restore = previous
-      .catch((): TabHistoryRestoreResult => ({ tabId: null }))
-      .then((previousResult): Promise<TabHistoryRestoreResult> => {
-        // If the preceding queued operation did not consume its row, the same
-        // row is still latest. Do not turn a rapid second keypress into a
-        // duplicate live tab; a later deliberate keypress may retry it.
+      ? Number(options?.targetPaneIndex) : -1;
+    const scope = captureWindowCloseScope(get(), requestedPaneIndex);
+    const detachedSnapshot = scope ? paneDetachedTabs(get().splitPanes[requestedPaneIndex]).slice() : [];
+    const queueKey = scope ? 'window:' + scope.spaceId + ':' + (scope.windowId || scope.paneIndex) : 'project:' + projectId;
+    const previous = reopenLastClosedQueues.get(queueKey)
+      || Promise.resolve<TabHistoryRestoreResult>({tabId:null});
+    const restore = previous.catch(():TabHistoryRestoreResult => ({tabId:null}))
+      .then(async (previousResult):Promise<TabHistoryRestoreResult> => {
         if (previousResult.historyId && (!previousResult.tabId || previousResult.historyDeleteFailed)) {
-          return Promise.resolve({
-            tabId: null,
-            historyId: previousResult.historyId,
-            reason: 'busy',
-            message: 'Предыдущее восстановление не завершено; повтор остановлен',
-          });
+          return {tabId:null,historyId:previousResult.historyId,reason:'busy',
+            message:'Предыдущее восстановление не завершено; повтор остановлен'};
         }
-        const paneTargetExists = requestedPaneIndex >= 0 && !!get().splitPanes[requestedPaneIndex];
-        return get().restoreTabHistoryEntry(projectId, undefined, {
-          // Keep createTab from selecting a project-wide active tab before the
-          // pane slot exists. Placement below is the visible commit.
-          background: paneTargetExists,
-          restorePosition: true,
-          resumePolicy: 'if-process-was-running',
-        }).then((result) => {
-          if (result.tabId && result.restoredWindowSpaceId) {
-            if (result.restoredWindowSpaceId !== get().activeSpaceId) get().switchWorkspaceSpace(result.restoredWindowSpaceId);
-            get().activateCenterTab(projectId, result.tabId);
-            return result;
+        let archived = null;
+        if (scope?.windowId) {
+          try {
+            const reply = await ipcRenderer.invoke('project:peek-window-tab-history', {
+              spaceId:scope.spaceId,windowId:scope.windowId,projectIds:[...get().openProjects.keys()],beforeOrder,
+            });
+            if (!reply?.success) throw new Error('archive-read-failed');
+            archived = reply.entry || null;
+          } catch (error) {
+            console.warn('[Reopen] candidate read failed window=' + scope.windowId, error);
+            return {tabId:null,reason:'error',message:'Не удалось прочитать историю закрытия окна'};
           }
-          if (!result.tabId || !paneTargetExists) return result;
-          const current = get();
-          if (current.splitPanes[requestedPaneIndex]) {
-            current.addTabToSplitPaneStrip(requestedPaneIndex, projectId, result.tabId);
-          } else {
-            // The pane disappeared while PTY creation was in flight. Preserve
-            // access to the restored tab instead of silently losing the action.
-            current.activateCenterTab(projectId, result.tabId);
+        }
+        const current = get();
+        const target = resolveWindowCloseScope(current,scope);
+        const held = new Set(allPaneTabIds(current.splitPanes));
+        const detached = target ? nextRestorablePaneClose(target.panes,target.index,
+          (pid:string,id:string)=>!!current.openProjects.get(pid)?.tabs.has(id),beforeOrder)
+          : detachedSnapshot.find((entry:any)=>!held.has(entry.tabId)
+            && current.openProjects.get(entry.projectId)?.tabs.has(entry.tabId)) || null;
+        const action = chooseWindowCloseAction(detached,archived);
+        console.log('[Reopen] choose kind=' + (action?.kind || 'project-archive')
+          + ' window=' + (scope?.windowId || '-')
+          + ' detached=' + (detached?.tabId?.slice(-12) || '-')
+          + ' detachedOrder=' + (detached?.closedOrder || 'legacy-unknown')
+          + ' archive=' + (archived?.id || '-') + ' archiveOrder=' + (archived?.closedOrder || '-'));
+        if (action?.kind === 'detach') {
+          if (scope!.spaceId !== get().activeSpaceId) get().switchWorkspaceSpace(scope!.spaceId);
+          const liveTarget = resolveWindowCloseScope(get(),scope);
+          if (liveTarget && get().restoreLastDetachedTabToSplitPane(liveTarget.index,action.entry.tabId)) return {tabId:action.entry.tabId};
+          // The requested window was removed during the read. Match Full's
+          // existing fallback: preserve access to the named tab, never pick
+          // an unrelated project archive or recreate the deleted window.
+          get().activateCenterTab(action.entry.projectId,action.entry.tabId);
+          return {tabId:action.entry.tabId};
+        }
+        let archiveEntry = action?.entry;
+        if (!archiveEntry) {
+          try {
+            // Legacy/project fallback obeys the same keypress boundary. A Full
+            // started after this request must remain for the next undo.
+            const reply = await ipcRenderer.invoke('project:peek-window-tab-history', {
+              projectOnly:true,projectIds:[projectId],beforeOrder,
+            });
+            if (!reply?.success) throw new Error('archive-read-failed');
+            archiveEntry = reply.entry;
+            if (!archiveEntry) return {tabId:null,reason:'empty'};
+          } catch (error) {
+            console.warn('[Reopen] project candidate read failed', error);
+            return {tabId:null,reason:'error',message:'Не удалось прочитать историю закрытых вкладок'};
           }
-          return result;
+        }
+        const restoreProjectId = archiveEntry.project_id;
+        const result = await get().restoreTabHistoryEntry(restoreProjectId, archiveEntry.id, {
+          background: !!target, restorePosition:true, resumePolicy:'if-process-was-running',
         });
+        if (result.tabId && result.restoredWindowSpaceId) {
+          if (result.restoredWindowSpaceId !== get().activeSpaceId) get().switchWorkspaceSpace(result.restoredWindowSpaceId);
+          get().activateCenterTab(restoreProjectId,result.tabId);
+          return result;
+        }
+        if (!result.tabId || !target) return result;
+        // A deleted original window or a legacy archive without placement
+        // retains the existing accessible focused-window fallback.
+        const restoredTarget = resolveWindowCloseScope(get(),scope);
+        if (restoredTarget) {
+          if (scope!.spaceId !== get().activeSpaceId) get().switchWorkspaceSpace(scope!.spaceId);
+          get().addTabToSplitPaneStrip(restoredTarget.index,restoreProjectId,result.tabId);
+        } else get().activateCenterTab(restoreProjectId,result.tabId);
+        return result;
       });
-    reopenLastClosedQueues.set(projectId, restore);
-    const cleanup = () => {
-      if (reopenLastClosedQueues.get(projectId) === restore) {
-        reopenLastClosedQueues.delete(projectId);
-      }
-    };
-    void restore.then(cleanup, cleanup);
+    reopenLastClosedQueues.set(queueKey,restore);
+    const cleanup=()=>{if(reopenLastClosedQueues.get(queueKey)===restore)reopenLastClosedQueues.delete(queueKey);};
+    void restore.then(cleanup,cleanup);
     return restore;
   },
 

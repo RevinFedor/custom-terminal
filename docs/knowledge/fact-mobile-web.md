@@ -875,6 +875,35 @@ Codex metadata для этого read берётся из main event projection,
 read при событии в полёте. Unconditional full reload, SSE на каждый чат и новый
 локальный учёт длительности не требуются.
 
+### Завершение compact в send receipt
+
+`GET /api/terminal-tabs/:tabId/send-receipts?handoffId=...` сохраняет прежнюю
+доставку `status:sent/receiptState:confirmed`. Для exact завершённого Codex
+compact additive `coordinatedSettlement.compact` имеет `version:1`,
+`kind:"compact"`, `settled:true`, `outcome:"completed"`; поля `operationKey`,
+`attemptId`, `operationId`, `handoffId`, `tabId`, `provider`, `sessionId`,
+`generation`, `promptGeneration` связывают его с той же отправкой и владельцем.
+`reason:"compacted"`, `proof`, `settledAt` (Unix milliseconds) и causal offsets
+`sourceByteOffset/taskStartedByteOffset/compactedByteOffset/taskCompleteByteOffset`
+описывают результат. `proof` бывает `rollout-compacted-before-task-complete`
+или `rollout-compacted`; оба требуют source≤start<compacted<task_complete.
+
+Это отдельная вложенная сущность: прежние `coordinatedSettlement.settled/reason/stopped`
+относятся к очереди Send/Stop и не доказывают compact. Верхний `settledAt` —
+время подтверждения доставки, вложенный — завершения compact. `entryUuid` и
+`sourceIdentity` могут оставаться null; не изобретать user-row и не требовать её
+для удаления exact local compact journal. Canonical compactSummary/slash rows
+остаются. Ранее существовавший `exactAuditConfirmed:true` сам по себе этого
+завершения не доказывает. Для ordinary messages adoption по canonical UUID
+остаётся независимым клиентским контрактом.
+
+Main связывает send tuple до PTY, сохраняет registry completion в ту же SQLite
+receipt до публикации operational-phase. GET после restart не зависит от
+renderer и не повторяет команду. Pending/unknown/interrupted/superseded или
+task_complete без предыдущего compacted не дают `.compact.settled:true`.
+Поздний ответ renderer не стирает settlement. Sent-only квитанции старых
+сборок без этой связи не восстанавливаются по тексту/времени/текущему SID.
+
 ### Общие владельцы состояния
 
 `mobile-web` больше не основной потребитель этого сервера. Нативный iOS-клиент Habit Tracker (`fact-voice-chat-tab.md::Terminal mode`) ходит в те же REST/SSE endpoints и рисует Terminal сам на SwiftUI; React `mobile-web/` оставлен только как legacy/debug surface и не является целевым клиентом. Это не вторая модель terminal-control: source of truth остаётся в custom-terminal renderer/main, а native app только отображает снапшоты и шлёт команды.

@@ -18,7 +18,7 @@ const parsed = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, tr
 const serverSource = parsed.statements.find(node => ts.isFunctionDeclaration(node)
   && node.name?.text === 'startClaudeHookServer').getText(parsed);
 function fixture({ fresh = false } = {}) {
-  const ipc = [], web = [], activity = [], preview = [], logs = [], semantic = [];
+  const ipc = [], web = [], activity = [], preview = [], logs = [], semantic = [], accessOutcomes = [];
   const holds = new Map();
   const context = vm.createContext({
     console: { log: (...args) => logs.push(args.join(' ')), warn: (...args) => logs.push(args.join(' ')), error() {} },
@@ -68,6 +68,7 @@ function fixture({ fresh = false } = {}) {
     mainWindow: { isDestroyed: () => false, webContents: { send: (channel, data) => ipc.push({ channel, ...data }) } },
     _webBroadcast: (_tabId, data) => web.push(data),
     claudeProviderFailureFromHook, completeClaudeLocalCommand() {}, clearClaudePtyCompactProofAttempt() {},
+    observeClaudeAccessOutcome: (tabId, outcome) => accessOutcomes.push({ tabId, ...outcome }),
     getCombinedTabBackgroundWorkCount: () => 0, getClaudePtyRuntimePresence: () => ({ inputReady: true }),
     emitAgentReadinessChanged() {}, recordActivity: (_tab, busy, _provider, details) => activity.push({ busy, ...details }),
     shouldCreateHistoryResponseTiming: ({ event }) => event === 'Stop',
@@ -84,8 +85,28 @@ function fixture({ fresh = false } = {}) {
       prompt_id: 'P-current', prompt: 'new user request', ...extra }) + '\n');
     assert.equal(ack, 'ok\n', 'ignored events are acknowledged without forcing a resend');
   }
-  return { context, hook, ipc, web, activity, preview, semantic, logs, holds };
+  return { context, hook, ipc, web, activity, preview, semantic, logs, holds, accessOutcomes };
 }
+
+test('actual hook counts only distinct owned terminal 403 outcomes, not foreign/subagent/duplicate events', () => {
+  const { reduceClaudeAccessFailure } = require('./claude-access-failure-stop');
+  const h = fixture();
+  const refusal = { apiErrorStatus: 403, error: 'authentication_error',
+    error_details: 'OAuth authentication is currently not allowed for this organization' };
+  h.hook('UserPromptSubmit', { prompt_id: 'P-one' });
+  h.hook('StopFailure', { ...refusal, prompt_id: 'foreign' });
+  h.hook('SubagentStop', { ...refusal, agent_id: 'child' });
+  assert.equal(h.accessOutcomes.length, 0);
+  h.hook('StopFailure', { ...refusal, prompt_id: 'P-one' });
+  h.hook('StopFailure', { ...refusal, prompt_id: 'P-one' });
+  let state = null;
+  for (const event of h.accessOutcomes) state = reduceClaudeAccessFailure(state, event) || state;
+  assert.equal(state.count, 1);
+  h.hook('UserPromptSubmit', { prompt_id: 'P-two' });
+  h.hook('StopFailure', { ...refusal, prompt_id: 'P-two' });
+  state = reduceClaudeAccessFailure(state, h.accessOutcomes.at(-1));
+  assert.equal(state.blocked, true);
+});
 
 test('actual main: confirmed start → subagent StopFailure keeps main busy and exact main Stop settles it', () => {
   const h = fixture();

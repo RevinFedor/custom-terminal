@@ -290,8 +290,10 @@ if (SOCKET_PATH) {
         if (!m || m.proc !== 'renderer' || !Number.isInteger(m.pid) || m.pid <= 0) continue;
         if (m.t === 'incident') {
           const owner = procs.get('renderer-' + m.pid);
-          if (owner?.vis === 'visible' && Number.isFinite(m.durationMs) && m.durationMs >= 250) {
-            flight?.incident(String(m.kind).slice(0, 64), { pid: m.pid, startAbs: m.startAbs, durationMs: m.durationMs });
+          const kind = String(m.kind || '').slice(0, 64);
+          if (owner?.vis === 'visible' && Number.isFinite(m.durationMs) && m.durationMs >= (kind.startsWith('ui-') ? 120 : 250)) {
+            flight?.incident(kind, { pid: m.pid, startAbs: m.startAbs, durationMs: m.durationMs,
+              actionId: /^ui-[a-z0-9-]{1,80}$/.test(m.actionId || '') ? m.actionId : undefined });
           }
           continue;
         }
@@ -330,6 +332,6 @@ setInterval(() => {
 wdLog(
   '[Watchdog] started mainPid=' + MAIN_PID +
   ' sampleSupported=' + (sampleSupported ? '1' : '0') +
-  ' thresholds=main:500,renderer:750-focused/1500-background capture=4-per-rolling-day' +
+  ' thresholds=main:500,renderer:750-focused/1500-background,ui:120 capture=4-per-rolling-day/background-max2' +
   ' log=' + LOG_PATH
 );

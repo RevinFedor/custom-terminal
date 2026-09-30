@@ -126,6 +126,33 @@ writer adoption. Иначе Resume реально показывает стар�
 desktop считает session ID пустым, блокирует hotkey и рисует пустую History до
 тестового первого prompt.
 
+### Большой догоняющий append после Fork/Resume
+
+History worker и SSD-кэш не ограничивают память отдельного live turn-watcher
+в main. После копирования Fork или withheld source replay его новый диапазон
+может содержать сотни МБ. Нельзя собирать весь диапазон в `out += part`, затем
+делать UTF-8 Buffer и вторую общую строку для audit: transient копии способны
+уронить main даже при исправном History-кэше и сохранённой дочерней вкладке.
+
+Watcher читает фиксированную границу двумя ограниченными проходами: первый
+сохраняет только user-carrier text/coordinates и выбирает прежний preferred
+carrier на всём append; второй последовательно подаёт исходные байты прежним
+обработчикам. Выбирать preferred carrier отдельно для каждого I/O-куска нельзя:
+`response_item(role=user)` и его `event_msg/user_message` могут попасть в разные
+куски и поменять exact sent identity. Между порциями main отдаёт очередь событий;
+предел порции — размер чтения плюс самая большая физическая JSONL-запись, а не
+постоянные 256 KiB для любой записи. Одиночный большой JSON.parse всё ещё имеет
+синхронную стоимость.
+
+Смена owner, замена/truncate источника и несовпадение SHA-256 прочитанной порции
+не разрешают применить непроверенные байты. Offset продвигается по реально
+прочитанным порциям; UTF-8 partial хранится байтами, включая source→writer replay.
+Финализация compact и снятие provisional suppression принадлежат завершению
+всего успешного scan, а не I/O-порции. Обе user-carrier формы, image-only input,
+background/source audit и прежние writer/launch/lifecycle проверки сохраняются.
+`[CodexTurn:Read/Delta]` различает физические bytes/readBytes, maxBatch/record,
+число порций и elapsed; старое `bytes=chunk.length` считало UTF-16 символы.
+
 ### Готовая пустая сессия: чтение History до writer
 
 Native16.09 new tab124 показал ready/Sol/max/0turns, но initial History delta
@@ -192,11 +219,24 @@ Codex — ровно один раз в main, а materialization status чита
 
 Standalone slash-команды Codex (`/status`, `/compact`, `/fast` и другие однострочные команды без attachments/chips) не являются conversation prompt: Codex может выполнить их, не записав `event_msg.user_message`. History поэтому отправляет их через отдельную TUI-транзакцию, которая сначала видит полную команду в текущем composer-фрейме, затем пишет Enter и не ждёт обычного user-message audit. Во время активного ответа тот же History-путь может положить команду в нативную очередь. ControlBar Fast больше не является непосредственной slash-кнопкой: он сохраняет желаемый service tier, а main выполняет внутренний `/fast` только после exact readiness/tier proof. Многострочный текст или slash с вложениями остаётся обычным prompt и обязан получить transcript proof. `/compact` строже остальных: локальная строка становится `SENT` только после причинного `task_started`; последующее завершение подтверждают terminal compact evidence, а служебный `Conversation compacted` не является user-message carrier.
 
-У такой локальной `SENT`-строки намеренно нет generic send receipt: он ждал бы
+У такой локальной desktop `SENT`-строки намеренно нет generic user-message receipt: он ждал бы
 несуществующий `user_message` audit. Поэтому её крестик потребляет локальный
 handoff и убирает только карточку; он не обращается к durable receipt API.
 Обычные prompts и receipt-backed карточки по-прежнему скрываются через main,
 чтобы presentation переживала restart независимо от результата доставки.
+
+У внешнего `/send` (включая native iOS) durable receipt всё же есть: он хранит
+доставку local command, а не фиктивный user UUID. Для `/compact` Main до записи
+PTY связывает этот exact operationKey/attemptId с compact operation, handoff,
+session/generation и causal boundary. При принятом `task_started` receipt
+подтверждает доставку; только registry outcome `completed/compacted` с
+предшествующим compacted record добавляет `coordinatedSettlement.compact`
+v1 (`settled:true`, `outcome:"completed"`, exact owner tuple, reason/proof,
+settledAt и offsets). Верхний `status:sent` остаётся статусом доставки.
+Snapshot/GET после app restart читает этот терминальный факт из той же SQLite
+квитанции, не оживляя live COMPACTING. Interrupted/unknown/superseded и
+task_complete без compacted не получают успешный settlement. Renderer reply,
+опоздавший с `coordinatedSettlement:null`, не стирает факт из Main.
 
 Programmatic `/compact` регистрирует exact pending operation до первой PTY
 записи, чтобы `task_started` уже имел владельца. Эта собственная reservation не
@@ -383,6 +423,26 @@ settings→reconcile→slash настоящими main-функциями: за�
 не воспроизводит повторное открытие discovery. Process replacement, unknown
 inspection и чужая session по-прежнему не разрешают запись.
 
+### Очистка данных запуска не завершает Rewind
+
+Временный `codexLastRunCommandPayload` живёт до первого `task_started`, а
+подтверждённый процесс — дальше. Post-Enter continuation native Rewind хранит
+собственный original launch в принятой authority. При отсутствии startup payload
+он остаётся действительным только вместе с exact terminal/run/lifecycle,
+authority object, operation/request, journal, mirror и input revision. Новый
+опубликованный launch, даже неполный, сильнее старой authority и запрещает
+продолжение; удаление кэша не разрешает новый Enter или выбор writer по saved SID.
+
+Шрам29.09 tab34: штатная очистка payload в07:18:13UTC ошибочно оборвала поздний
+Rewind в07:19:54 после confirm Enter, до Ctrl+G. Журнал остался `entered`,
+writer — ambiguous; `/compact` в10:52:01 отказал до paste, хотя обычный prompt
+в10:52:19 получил exact rollout audit в той же session. Успех второго prompt
+не завершает старый Rewind. Регрессия исполняет настоящий continuation с уже
+удалённым payload и отдельные negative replacement/input/journal guards;
+постоянно заполненный launch Map в fixture этого дефекта не воспроизводит.
+Отсутствующий подтверждённый адресат local slash теперь классифицируется как
+`agent_send_target_unresolved`, не доказанный `agent_send_target_changed`.
+
 ### Устаревшая проверка процесса не отменяет подтверждённого writer
 
 `process_scope_changed` означает, что ps-запрос больше не относится к
@@ -461,6 +521,14 @@ Stop-all фиксирует текущие Codex jobs и вызывает общ
 с повторным owner guard перед сигналом; это не composer Escape и не Enter.
 Capacity-overload retry не меняется и не является usage exhaustion.
 
+29.09 tab754 показал обе ошибки от одной причины: History Send истёк за30s,
+а startup watchdog отдельно за60s, хотя current committed frame содержал
+`Resume paused goal?`. Новый footer `enter select · esc back` не совпадал со
+старым `Press enter to confirm or esc to go back`. Оба точных формата теперь
+распознаёт один parser; title, обе options/descriptions, current frame и input
+owner по-прежнему обязательны. Автовыбор из System не меняется и не выполняется
+повторно по таймеру. Сам native Goal сохраняется Codex, не является app Run After.
+
 Прод-инцидент24.09: в 03:57 UTC 17 живых Codex-вкладок получили usage-меню;
 каждая операция записала `policy=continue` и выбор Reserve, ни одна не прочитала
 `stop-all`. Меню уже говорило «You’re now using Luna» до действия приложения,
@@ -495,8 +563,17 @@ Action принадлежит terminal/lifecycle/run/input и текущему �
 повторной клавиши нет. Только последующий готовый composer завершает выбор.
 Неподтверждённый выбор даёт typed manual-action, живой процесс сохраняется;
 поздний настоящий composer снимает объяснение. UI/remount и таймаут HTTP не
-запускают Resume/выбор заново. Desktop показывает статическое предупреждение,
+запускают Resume/выбор заново. Desktop показывает статическую синюю информацию,
 не Starting-spinner; скрытие плашки не меняет main policy.
+
+Desktop Send теперь читает тот же typed manual-action, что API waiter, и сразу
+завершает unwritten операцию с `submitted/pasteWritten/enterWritten=false`.
+Исходный authoring snapshot возвращается штатным merge в input; поздняя
+готовность после ручного выбора не продолжает отменённую отправку. Send выдаёт
+info-подсказку вместо красного incident, только при таком no-write receipt.
+Unknown и post-Enter ошибки не перекрашиваются и не восстанавливаются как
+несостоявшаяся отправка. Record-without-reply, уже записавший историю до Resume,
+сохраняет собственный `historyRecorded/reopenWarning`, не возвращает её в draft.
 
 Если после Enter тот же input-owner уже получил новый operational task_started,
 ожидание меню отступает перед существующей готовностью работающего хода. Это
@@ -1578,16 +1655,26 @@ revision; copy/grab не вызывает Ctrl+G над таким неразр�
 в History, служебная команда не переносится как пользовательское сообщение.
 
 После Resume ранний `tui-ready` может сразу запустить pending model intent.
-Локальная slash-команда, уже дождавшаяся первого ready, не должна принять
+Send, уже дождавшийся первого ready, не должен принять
 освобождение PTY после timeout picker за окончание подготовки: retained
-`/model` ещё может ждать своего кадра. Общий local-command path ждёт тот же
-settings intent вне PTY/settings queues и только затем повторяет точные
+`/model` ещё может ждать своего кадра. Local slash и обычный prompt с текстом/
+картинками используют одно ожидание того же settings intent вне PTY/settings
+queues и только затем повторяют точные
 target/run/input/draft guards. Иначе `/compact` ложно отказывает
 `codex_tui_not_ready`, хотя через несколько секунд старый picker штатно
 восстанавливается. Очистки служебной строки недостаточно: нужен конец текущей
 settings-операции и подтверждение её intent; новая revision/action sequence
 отзывает ожидание. Единственный deadline ограничивает наблюдение, не разрешает
 повтор slash/Enter. Reentrant settings+Send сохраняет свой уже взятый owner.
+
+Шрам27.09 после saved-history Rewind4412: общий готовый composer запустил
+model intent, а обычный Send ещё обходил local-command continuation и ждал
+retained `/model` только1800ms внутри writer-lock. Отказ пришёл19.089UTC,
+control очистился21.301, intent применился21.697. Поэтому одно расширение
+slash-path не закрывало отправку текста. Обычный Send теперь отпускает lock
+до подготовки и не резервирует input revision, не подготавливает вложения
+и не вставляет prompt до её окончания. Новый ручной ввод/Stop/owner/intent
+по-прежнему отменяет именно старый запрос; тот же handoff не повторяется.
 
 Проверка: `codex-owned-model-input.test.js` исполняет actual main functions;
 `scripts/check-codex-model-input-pty.cjs` — изолированный Codex0.156.1 + задержка

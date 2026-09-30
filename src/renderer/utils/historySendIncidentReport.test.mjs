@@ -6,7 +6,7 @@ import {
   formatHistoryIncidentMoscowTime,
 } from './historySendIncidentReport.mjs';
 
-test('send incident copy contains exact tab, Moscow time, handoff and prompt', () => {
+test('send incident copy contains exact operation metadata but never the prompt body', () => {
   const occurredAt = Date.parse('2026-08-17T18:58:20.120Z');
   assert.equal(
     formatHistoryIncidentMoscowTime(occurredAt),
@@ -25,13 +25,26 @@ test('send incident copy contains exact tab, Moscow time, handoff and prompt', (
     pasteWritten: false,
     code: 'terminal_draft_state_unknown',
     images: 1,
+    chips: 3,
+    textInserts: 2,
     promptText: 'exact prompt text',
   });
   assert.match(report, /Tab ID: project-tab-3604/);
   assert.match(report, /Time \(Moscow\): 2026-08-17 21:58:20\.120 MSK/);
   assert.match(report, /Handoff ID: msxljtsv-trg751/);
   assert.match(report, /Log lookup: \[HistoryHandoff\] SEND_RESULT tab=ect-tab-3604 handoff=msxljtsv-trg751/);
-  assert.match(report, /Prompt \(17 chars\):\nexact prompt text/);
+  assert.match(report, /Prompt: 17 chars \(content omitted\)/);
+  assert.match(report, /Chips: 3/);
+  assert.match(report, /Text inserts: 2/);
+  assert.doesNotMatch(report, /exact prompt text/);
+});
+
+test('metadata-only caller does not require or expose pasted text, image paths, or saved prompt bodies', () => {
+  const report = buildHistorySendIncidentReport({ promptChars: 500_000, images: 1, chips: 2, textInserts: 1,
+    promptText: 'secret body /private/image.png <pasted_content>large private data</pasted_content>' });
+  assert.match(report, /Prompt: 500000 chars/);
+  assert.doesNotMatch(report, /secret|private|pasted_content/);
+  assert.ok(report.length < 1000);
 });
 
 test('startup settings incident names Claude, the failed command, auth code and useful log key', () => {

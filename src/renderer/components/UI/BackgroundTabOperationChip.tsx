@@ -22,7 +22,7 @@ export default function BackgroundTabOperationChip({ label, tabName, pending = t
     style={{ minHeight: 30, padding: '6px 10px', background: 'rgba(20,20,20,0.94)',
       border: `1px solid ${completed ? 'rgba(74,222,128,0.50)' : failed ? 'rgba(248,113,113,0.45)' : 'rgba(218,119,86,0.45)'}`,
       color: '#e8e8e8', fontSize: 12 }}>
-    {pending ? <span aria-hidden style={{ width: 12, height: 12, borderRadius: '50%',
+    {pending ? <span aria-hidden className="noted-infinite-animation" style={{ width: 12, height: 12, borderRadius: '50%',
       border: '2px solid rgba(218,119,86,0.25)', borderTopColor: '#DA7756',
       animation: 'background-tab-operation-spin 0.9s linear infinite', flexShrink: 0 }} />
       : <span aria-hidden style={{ color }}>{failed ? '!' : '✓'}</span>}

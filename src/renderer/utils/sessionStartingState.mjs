@@ -170,7 +170,7 @@ export function syncSessionStartingWithPresence(previous, info, presence, now = 
       startupPending: false,
       startupFailed: false,
       startupError: null,
-      ...(presence.runtimePolicy ? { manualActionRequired: true } : {}),
+      manualActionRequired: true,
     };
   }
 

@@ -13,7 +13,8 @@ test('graceful shutdown persists the exact provider snapshot before replacement'
   assert.match(mainSource, /markInterruptedAiSessionEntries\(activeAiSessions, 'before-quit'\)/);
   assert.match(mainSource, /reconcileInterruptedAiSessionEntries\([\s\S]{0,180}'before-quit-process-proof'/);
   assert.match(mainSource, /markInterruptedAiSessionEntries\(activeAiSessions, 'will-quit'\)/);
-  assert.match(mainSource, /persistShutdownInterruptedAgentSnapshot\(entries \|\| new Map\(\), reason\)/);
+  assert.match(mainSource, /persistShutdownInterruptedAgentSnapshot\(eligibleEntries, reason\)/);
+  assert.match(mainSource, /entry\.engine !== 'claude' \|\| !isClaudeAccessAutoResumeBlocked\(tabId, entry\.sessionId\)/);
   assert.match(mainSource, /captureStartupInterruptedAgentSnapshot\(\);/);
   assert.match(mainSource, /startupInterruptedAgentSnapshot,/);
 });

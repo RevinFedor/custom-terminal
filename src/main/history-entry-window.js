@@ -160,6 +160,7 @@ function applyHistoryEntryWindow(entries, bounds = null) {
  *     projection and "what just happened" all read the tail).
  */
 const HISTORY_ROW_STUB_FIELDS = [
+  'imageCount',
   'uuid', 'role', 'timestamp', 'sessionId', 'messageId', 'textPhase',
   'preTokens', 'postTokens', 'compactEncrypted',
   'viewOwnerSessionId', 'physicalSessionId', 'transcriptSegmentId',

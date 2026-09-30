@@ -1,8 +1,13 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
+import HistorySearchBar from './HistorySearchBar';
+import {HISTORY_SEARCH_PAGE_SIZE, searchHistoryEntries, historySearchEntryKeys} from '../../../shared/history-search.mjs';
+import {publishHistorySearchMarkers, clearHistorySearchMarkers, useHistorySearchMarkers, consumeHistorySearchRequest} from '../../utils/historySearchMarkers';
+import {setHistorySearchHighlights, clearHistorySearchHighlights} from '../../utils/historySearchHighlights.mjs';
+import {currentUIActionId, uiPerformancePhase} from '../../utils/uiPerformanceDiagnostics.mjs';
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, RefreshCw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { canInterruptHistoryTurn, requestHistoryTurnInterrupt } from '../../utils/historyTurnInterrupt.mjs';
@@ -35,9 +40,8 @@ import {
   settleTabWorkContext,
   type TabContextUpdate,
   useTabWorkContext,
-  WORK_CONTEXT_COLOR,
 } from '../../utils/tabWorkContext';
-import { ContextUpdatePreviewBody, TabContextUpdateChip } from './TabContextUpdates';
+import { ContextUpdatePreviewBody, TabContextUpdateChip, contextUpdateChipProps } from './TabContextUpdates';
 import {
   useSessionAvailability,
   type AgentSessionAvailability,
@@ -81,6 +85,7 @@ import {
   resolveAgentDraftConflict,
 } from '../../utils/agentDraftPreflight.mjs';
 import { showAgentDraftScreenContradictionToast } from '../../utils/agentDraftContradictionToast.mjs';
+import manualActionContract from '../../../shared/agent-manual-action.cjs';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import {
   beginCoordinatedAgentSend,
@@ -465,6 +470,15 @@ const showHistoryIncidentToast = (
   cause: unknown,
   incident: Record<string, unknown> = {},
 ) => {
+  if (manualActionContract.isAgentManualActionPreSubmit(cause)) {
+    // The ordinary catch has already restored/retracted the unwritten handoff.
+    // Do not create a second red incident for a known, actionable picker.
+    useUIStore.getState().showToast(
+      'Выберите действие в терминале. Сообщение возвращено в поле ввода.',
+      'info', 6000, false, undefined, undefined, undefined, tabId,
+    );
+    return;
+  }
   const message = (typeof cause === 'string'
     ? cause
     : String((cause as any)?.message ?? cause ?? '')).trim();
@@ -481,7 +495,7 @@ const showHistoryIncidentToast = (
     occurredAt: Date.now(),
   });
   const incidentPreview = incidentReport.length > 4000
-    ? incidentReport.slice(0, 4000) + '\n… full prompt remains available via copy'
+    ? incidentReport.slice(0, 4000) + '\n… full diagnostic metadata available via copy'
     : incidentReport;
   useUIStore.getState().showToast(
     headline,
@@ -659,6 +673,7 @@ interface FullHistoryEntry {
   compactEncrypted?: boolean;
   promptChips?: HistoryPromptDraftChip[];
   imagePaths?: HistoryPromptDraftImageRef[];
+  imageCount?: number;
   requiresAuditIdentity?: boolean;
   auditTimestamp?: string;
   auditHash?: string;
@@ -2191,7 +2206,7 @@ const SubAgentBlock = memo(({
         title="Открыть агента"
       >
         {subagentRunning && (
-          <Loader2 size={11} strokeWidth={2.5} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
+          <Loader2 className="noted-infinite-animation" size={11} strokeWidth={2.5} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
         )}
         {!subagentRunning && <Bot size={11} style={{ flexShrink: 0 }} />}
         <span className="truncate" style={{ minWidth: 0, flex: 1 }}>{description}</span>
@@ -2899,7 +2914,7 @@ const HistoryBackgroundTaskCallContext = React.createContext<ReadonlySet<string>
 
 const HistoryBackgroundDot = () => (
   <span
-    className="inline-block w-[6px] h-[6px] rounded-full shrink-0"
+    className="noted-infinite-animation inline-block w-[6px] h-[6px] rounded-full shrink-0"
     style={{
       background: '#d97706',
       animation: 'sdk-bg-task-pulse 1.4s ease-in-out infinite',
@@ -4199,7 +4214,7 @@ type HistoryPromptPresentationPart = {
 
 const historyContextFileChipProps = (chip: HistoryPromptDraftChip) => (
   chip.contextUpdateId
-    ? { leading: <RefreshCw size={13} aria-hidden="true" />, title: 'Обновление рабочего состояния', style: { color: WORK_CONTEXT_COLOR, borderColor: '#8d612c', background: '#2c2419' } }
+    ? contextUpdateChipProps
     : chip.attachmentKind === 'file'
     ? {
       leading: <FileText size={13} aria-hidden="true" />,
@@ -5479,13 +5494,9 @@ const historyPanelStyleText = `@keyframes hp-flash {
 [data-agent-status-row][data-agent-status-action='start']:hover > [data-agent-status-idle-glyph] {
   display: none;
 }
-::highlight(hp-search) {
-  background-color: rgba(234, 179, 8, 0.35);
-  color: inherit;
-}
-::highlight(hp-search-current) {
-  background-color: rgba(234, 179, 8, 0.8);
-  color: #000;
+.gt-composer-editor .cm-panels {
+  border: 0 !important;
+  background: transparent;
 }
 .hp-agent-prompt::placeholder {
   color: #666;
@@ -6217,7 +6228,7 @@ const historyPanelStyleText = `@keyframes hp-flash {
 /* Полоса промптов над рамкой — единственное место, где чип стоит НА линии, а не
    в строке. Здесь он получает компактный vertical padding и не несёт inline
    actions живут в navbar раскрытого preview; средний клик остаётся быстрым
-   обратимым dismiss, а отдельная корзина orange update удаляет его навсегда. */
+   обратимым dismiss, а отдельная корзина context update удаляет его навсегда. */
 [data-history-composer-prompt-band] .cb-composer-chip {
   padding: 1px 6px;
   box-sizing: border-box;
@@ -6392,6 +6403,7 @@ const prependPromptTextOnce = (base: string, addition: string,
 function HistorySpinner({ size = 14, flexShrink = 0 }: { size?: number; flexShrink?: number }) {
   return (
     <svg
+      className="noted-infinite-animation"
       width={size}
       height={size}
       viewBox="0 0 16 16"
@@ -7573,15 +7585,30 @@ function AgentHistoryControls({
       const applyFocus = () => {
         const editor = promptTextareaRef.current;
         if (!editor) return;
+        const focusStartedAt = performance.now();
         editor.focus();
-        if (!Number.isFinite(detail.selectionStart)) return;
-        const start = Math.max(0, Math.min(detail.selectionStart!, editor.value.length));
-        const requestedEnd = Number.isFinite(detail.selectionEnd)
-          ? detail.selectionEnd!
-          : start;
-        const end = Math.max(start, Math.min(requestedEnd, editor.value.length));
-        editor.setSelectionRange(start, end);
-        promptCaretRef.current = { start, end };
+        const focusDoneAt = performance.now();
+        if (Number.isFinite(detail.selectionStart)) {
+          const start = Math.max(0, Math.min(detail.selectionStart!, editor.value.length));
+          const requestedEnd = Number.isFinite(detail.selectionEnd)
+            ? detail.selectionEnd!
+            : start;
+          const end = Math.max(start, Math.min(requestedEnd, editor.value.length));
+          editor.setSelectionRange(start, end);
+          promptCaretRef.current = { start, end };
+        }
+        const selectionDoneAt = performance.now();
+        uiPerformancePhase('composer-focus-complete', { tab: tabId,
+          focusMs: focusDoneAt - focusStartedAt, selectionMs: selectionDoneAt - focusDoneAt });
+        // No extra editor/geometry reads. An outer dispatch log used to land
+        // only AFTER this synchronous callback, hiding its cost inside the
+        // interval between pane presentation and the reported "dispatch".
+        console.log('[HistoryComposerFocus] tab=' + tabId.slice(-12)
+          + ' startAbs=' + (performance.timeOrigin + focusStartedAt).toFixed(1)
+          + ' endAbs=' + (performance.timeOrigin + selectionDoneAt).toFixed(1)
+          + ' focusMs=' + (focusDoneAt - focusStartedAt).toFixed(1)
+          + ' selectionMs=' + (selectionDoneAt - focusDoneAt).toFixed(1)
+          + ' immediate=' + (detail.immediate ? 1 : 0));
       };
       if (detail.immediate) applyFocus();
       else requestAnimationFrame(applyFocus);
@@ -7689,6 +7716,10 @@ function AgentHistoryControls({
           ? Number(timing.durationMs)
           : null,
       } : null);
+      // Ending paste and receiving the main-owned activity snapshot are two
+      // deliveries. Replace the provisional clock in the same state batch as
+      // that snapshot, not in the earlier paste=false event.
+      if (!pasteBusyRef.current) setPasteActivityStartedAt(null);
     } catch (e: any) {
       if (
         tabIdRef.current !== requestTabId
@@ -7699,6 +7730,9 @@ function AgentHistoryControls({
         + tabId.slice(-12)
         + ' reason=' + reason
         + ' error=' + String(e?.message || e));
+      // A failed read cannot keep claiming paste work indefinitely. A known
+      // running activity is independent and remains owned by its last result.
+      if (!pasteBusyRef.current) setPasteActivityStartedAt(null);
     }
   }, [runtime.logPrefix, tabId, toolType]);
 
@@ -8195,13 +8229,13 @@ function AgentHistoryControls({
         advanceHistoryPromptHandoffTransportPhase(tabId, data.handoffId, data.phase);
       }
       const nextBusy = !!data.busy;
-      if (nextBusy && !pasteBusyRef.current) {
+      const wasPasteBusy = pasteBusyRef.current;
+      if (nextBusy && !wasPasteBusy) {
         setPasteActivityStartedAt(Date.now());
-      } else if (!nextBusy) {
-        setPasteActivityStartedAt(null);
       }
       pasteBusyRef.current = nextBusy;
       setIsPasteBusy(nextBusy);
+      if (!nextBusy && wasPasteBusy) void refreshActivityTiming('paste-settled');
       console.log('[' + runtime.logPrefix + '] paste-busy tab=' + tabId.slice(-12) + ' busy=' + !!data.busy);
     };
 
@@ -8219,7 +8253,7 @@ function AgentHistoryControls({
       ipcRenderer.removeListener('terminal:command-started', handleStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleFinished);
     };
-  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom, isNonAuthoritativeBusyEvent, refreshHistoryInBackground]);
+  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom, isNonAuthoritativeBusyEvent, refreshHistoryInBackground, refreshActivityTiming]);
 
   const readTerminalDraft = useCallback(async (reason: string) => {
     const requestTabId = tabId;
@@ -8853,6 +8887,7 @@ function AgentHistoryControls({
     let sendIncidentStatusAtSend = '';
     let sendIncidentImages = 0;
     let sendIncidentChips = 0;
+    let sendIncidentTextInserts = 0;
     let sendFailureResult: any = null;
     let sendCoordinatedSettlement: any = null;
     let historyRecordSettledEarly = false;
@@ -8982,6 +9017,7 @@ function AgentHistoryControls({
         }).trim();
         sendIncidentPromptText = presentationText;
         sendIncidentChips = sendDraftChips.length;
+        sendIncidentTextInserts = sendDraftChips.filter(chip => chip.kind === 'paste').length;
         if (!presentationText) return;
         if (pendingQuestionRef.current) throw new Error(runtime.label + ' is waiting for a question answer');
         const statusAtSend = statusRef.current;
@@ -9700,7 +9736,8 @@ function AgentHistoryControls({
           code: sendFailureResult?.code,
           images: sendIncidentImages,
           chips: sendIncidentChips,
-          promptText: sendIncidentPromptText,
+          textInserts: sendIncidentTextInserts,
+          promptChars: sendIncidentPromptText.length,
         });
         if (kind === 'stop') {
           processStopInFlightRef.current = false;
@@ -11198,7 +11235,8 @@ function AgentHistoryControls({
   const statusDetail = activeLifecycle?.detail || null;
   const statusSessionId = sessionId || activeLifecycle?.sessionId || null;
   const lifecycleIsWarning = activeLifecycle?.kind === 'warning';
-  const lifecycleNeedsExplanation = activeLifecycle?.kind === 'error' || lifecycleIsWarning;
+  const lifecycleIsInfo = activeLifecycle?.kind === 'info';
+  const lifecycleNeedsExplanation = activeLifecycle?.kind === 'error' || lifecycleIsWarning || lifecycleIsInfo;
   const statusAccent = unifiedTransientStatus?.accent || (
     activeLifecycle?.kind === 'error'
       ? '#ef4444'
@@ -11410,7 +11448,7 @@ function AgentHistoryControls({
             data-agent-lifecycle-description
             title={activeLifecycle.detail || activeLifecycle.description}
             style={{
-              color: lifecycleIsWarning ? '#fbbf24' : '#fca5a5',
+              color: lifecycleIsInfo ? '#93c5fd' : lifecycleIsWarning ? '#fbbf24' : '#fca5a5',
               // The chip straddles a 1px border; a 20px line-height would push
               // it off the line it is supposed to sit on.
               lineHeight: 1.35,
@@ -12831,9 +12869,6 @@ function HistoryPanel({
   useEffect(() => {
     return () => {
       if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
-      const CSS_HL = (CSS as any).highlights;
-      CSS_HL?.delete('hp-search');
-      CSS_HL?.delete('hp-search-current');
     };
   }, [tabId]);
 
@@ -14458,6 +14493,13 @@ function HistoryPanel({
     }
     return active;
   }, [historyTailPinScheduler, setHistoryTailFollowIntent, tabId]);
+  // Working is Footer content, so it can grow while the data-list and preview
+  // stay unchanged. Virtuoso's append/row-size follow does not cover that
+  // update. Reuse the same owner/gesture-bound writer as transcript mutations.
+  useLayoutEffect(() => {
+    if (!responseTailTiming) return;
+    keepHistoryTailPinnedAfterMutation('response-timing');
+  }, [responseTailTiming, keepHistoryTailPinnedAfterMutation]);
   // Card- and group-level toggles both need this panel's follow ownership.
   // Card toggles run through the shared applyHistoryRevealUpdate helper,
   // which looks the ops up by scroller element (column mode mounts several
@@ -15039,150 +15081,124 @@ function HistoryPanel({
 
   // ========== SEARCH ==========
   const [searchOpen, setSearchOpen] = useState(false);
+  const requestedHistorySearch = useHistorySearchMarkers(state=>state.requests[tabId] || 0);
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchType, setSearchType] = useState('all');
   const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
+  const [searchNavigationRequest, setSearchNavigationRequest] = useState(0);
   const [historySeekPresentationEpoch, setHistorySeekPresentationEpoch] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  // Build flat list of match positions: { entryIdx, entryUuid, offset }
-  // Matches found by main over the FULL projection (codex row-window path).
-  // Kept keyed by query so a stale response cannot answer a newer query.
-  const [serverMatches, setServerMatches] = useState<{
-    query: string;
-    positions: Array<{ entryUuid: string; offset: number }>;
-  } | null>(null);
-  const matchPositions = useMemo(() => {
-    if (!searchQuery || searchQuery.length < 2) return [];
-    const positions: Array<{ entryIdx: number; entryUuid: string; offset: number }> = [];
-    // Row-window sessions: a far-away row is a stub with no content locally,
-    // so scanning what the renderer holds would silently miss matches. Main
-    // scanned the whole projection; map its row identities to current
-    // indices (identity is stable, index is what Virtuoso needs).
-    if (serverMatches && serverMatches.query === searchQuery) {
-      for (const match of serverMatches.positions) {
-        const entryIdx = displayEntryIndexByUuid.get(match.entryUuid);
-        if (entryIdx === undefined) continue;
-        positions.push({ entryIdx, entryUuid: match.entryUuid, offset: match.offset });
-      }
-      return positions;
+  const [serverMatches, setServerMatches] = useState<any>(null);
+  const [searchError, setSearchError] = useState('');
+  const searchPage = Math.floor(currentMatchIdx / HISTORY_SEARCH_PAGE_SIZE);
+  const searchScope = JSON.stringify([historyOwnerKey, searchQuery, searchType]);
+  const searchKey = JSON.stringify([searchScope, searchPage]);
+  const searchResult = searchOpen && serverMatches?.key === searchKey ? serverMatches.result : null;
+  const searchActive = searchOpen && (!!searchQuery || searchType !== 'all');
+  const searchLoading = searchActive && !searchResult && !searchError;
+  const searchLastEntry = displayEntries[displayEntries.length - 1];
+  const searchRevision = [displayEntries.length, searchLastEntry?.uuid, searchLastEntry?.content?.length, searchLastEntry?.contentRevision].join(':');
+  const searchEntriesRef = useRef(displayEntries);
+  searchEntriesRef.current = displayEntries;
+  const searchMarkerLease = useMemo(() => ({}), [historyOwnerKey]);
+  const matchPositions = useMemo(() => (searchResult?.matches || []).map((match:any) => {
+    let entryUuid = match.entryUuid;
+    let entryIdx = displayEntryIndexByUuid.get(entryUuid);
+    if (entryIdx === undefined && match.sourceIdentity) {
+      const entry = displayEntries.find(item => historySearchEntryKeys(item).includes(match.sourceIdentity));
+      if (entry) { entryUuid = entry.uuid; entryIdx = displayEntryIndexByUuid.get(entryUuid); }
     }
-    const q = searchQuery.toLowerCase();
-    for (let i = 0; i < displayEntries.length; i++) {
-      const text = (displayEntries[i].content || '').toLowerCase();
-      let idx = text.indexOf(q);
-      while (idx !== -1) {
-        // entryIdx must address the display-UNIT list (what Virtuoso renders),
-        // not the raw entry array — a match inside a collapsed group resolves
-        // to the group's own row.
-        const unitIdx = displayEntryIndexByUuid.get(displayEntries[i].uuid);
-        if (unitIdx !== undefined) {
-          positions.push({ entryIdx: unitIdx, entryUuid: displayEntries[i].uuid, offset: idx });
-        }
-        idx = text.indexOf(q, idx + 1);
-      }
-    }
-    return positions;
-  }, [displayEntries, displayEntryIndexByUuid, searchQuery, serverMatches]);
+    return {...match, entryUuid, entryIdx};
+  }).filter((match:any) => match.entryIdx !== undefined), [displayEntries, displayEntryIndexByUuid, searchResult]);
+  const matchingEntryUuids = useMemo(() => new Set<string>([
+    ...(searchResult?.entryUuids || []), ...matchPositions.map((match:any)=>match.entryUuid),
+  ]), [matchPositions, searchResult]);
 
-  // Ask main to search whenever the query changes on a row-windowed session.
-  // Local scanning still runs meanwhile (hydrated rows answer instantly), and
-  // the server answer replaces it when it lands.
   useEffect(() => {
-    if (toolType !== 'codex' || !sessionId) return;
-    if (!searchOpen || searchQuery.length < 2) {
-      setServerMatches(null);
-      return;
-    }
+    setServerMatches((previous:any)=>previous?.key===searchKey?previous:null); setSearchError('');
+    if (!searchActive) return;
     let disposed = false;
-    const queryAtStart = searchQuery;
-    void ipcRenderer.invoke('agent-transcript:search-history', {
-      toolType, sessionId, cwd, query: queryAtStart,
-    }).then((result: any) => {
-      if (disposed || !result?.success) return;
-      setServerMatches({
-        query: queryAtStart,
-        positions: (result.matches || []).map((match: any) => ({
-          entryUuid: match.entryUuid,
-          offset: match.offset,
-        })),
-      });
-      historyDiag('SEARCH_SERVER tab=' + tabId.slice(-12) +
-        ' matches=' + (result.total ?? -1) +
-        ' returned=' + (result.matches?.length ?? 0) +
-        ' truncated=' + (result.truncated ? '1' : '0'));
-    }).catch(() => {});
-    return () => { disposed = true; };
-  }, [cwd, searchOpen, searchQuery, sessionId, tabId, toolType]);
+    const timer = window.setTimeout(async () => {
+      const payload = {toolType, sessionId, tabId, cwd, query:searchQuery, type:searchType,
+        diagnosticActionId:currentUIActionId(),
+        offset:searchPage * HISTORY_SEARCH_PAGE_SIZE, limit:HISTORY_SEARCH_PAGE_SIZE};
+      const searchStartedAt = performance.now();
+      uiPerformancePhase('search-request', { tab:tabId, rows:searchEntriesRef.current.length });
+      try {
+        const result = toolType === 'codex' && sessionId
+          ? await ipcRenderer.invoke('agent-transcript:search-history', payload)
+          : {success:true,...searchHistoryEntries(searchEntriesRef.current, payload)};
+        if (disposed) return;
+        if (!result?.success) throw new Error(result?.error || 'history-search-failed');
+        uiPerformancePhase('search-result', { tab:tabId, ms:performance.now()-searchStartedAt, matches:result.total });
+        setServerMatches({key:searchKey,result});
+        if (currentMatchIdx >= result.total && currentMatchIdx !== 0) setCurrentMatchIdx(0);
+      } catch (error) {
+        if (disposed) return;
+        setSearchError('Попробуйте ещё раз.');
+        historyDiag('SEARCH_FAILED tab=' + tabId.slice(-12) + ' error=' + String(error));
+      }
+    }, 180);
+    return () => { disposed = true; window.clearTimeout(timer); };
+  }, [cwd, searchActive, searchKey, searchRevision, sessionId, tabId, toolType]);
 
-  // Reset current match when query changes and scroll to first match
   useEffect(() => {
-    if (matchPositions.length > 0) {
-      setCurrentMatchIdx(0);
-      const match = matchPositions[0];
-      setHistoryTailFollowIntent(false);
-      historyTailPinScheduler.cancel();
-      virtuosoRef.current?.scrollToIndex({ index: match.entryIdx, align: 'center', behavior: 'smooth' });
-    }
-  }, [historyTailPinScheduler, searchQuery, setHistoryTailFollowIntent]);
+    if (!searchResult || !searchActive) { clearHistorySearchMarkers(tabId, searchMarkerLease); return; }
+    const match = searchResult.matches.find((item:any) => item.matchIndex === currentMatchIdx);
+    publishHistorySearchMarkers(tabId, {lease:searchMarkerLease,sessionId:sessionId || '',
+      keys:new Set<string>(searchResult.turnKeys),currentKeys:new Set<string>(match?.turnKeys || [])});
+    return () => clearHistorySearchMarkers(tabId, searchMarkerLease);
+  }, [currentMatchIdx, searchActive, searchMarkerLease, searchResult, sessionId, tabId]);
 
   // Navigate to current match entry. A match found by main can live outside
   // the hydrated span (that is the whole reason the search moved to main), so
   // re-centre hydration on it — the row is a placeholder until its content
   // arrives, and the highlight pass runs again when it does.
   const scrollToMatch = useCallback((idx: number) => {
-    if (idx < 0 || idx >= matchPositions.length) return;
-    const match = matchPositions[idx];
+    const match = matchPositions.find((item:any) => item.matchIndex === idx);
+    if (!match) return;
     setHistoryTailFollowIntent(false);
     historyTailPinScheduler.cancel();
-    // A match inside a collapsed series: expand its group first so the
-    // highlight pass has real text to walk. The unit index shifts after the
-    // expansion commit — jump on the next frame via the uuid map.
-    if (expandGroupForUuid(match.entryUuid, 'search-match')) {
-      requestAnimationFrame(() => {
-        const liveIdx = unitIndexByUuidRef.current.get(match.entryUuid);
-        if (liveIdx !== undefined) {
-          virtuosoRef.current?.scrollToIndex({ index: liveIdx, align: 'center', behavior: 'smooth' });
-        }
-      });
-      return;
-    }
-    virtuosoRef.current?.scrollToIndex({ index: match.entryIdx, align: 'center', behavior: 'smooth' });
-    // rowStub check runs by uuid over the ENTRY array (match.entryIdx is a
-    // display-unit index and must not address the server-entry array).
-    if (toolType === 'codex') {
-      if (isHistoryHydrationTargetStub(
-        presentationEntriesRef.current,
-        match.entryUuid,
-      )) {
-        requestHistoryHydrationAt(match.entryUuid, 'search-match', ' idx=' + match.entryIdx);
-      }
-    }
-  }, [expandGroupForUuid, historyTailPinScheduler, matchPositions, requestHistoryHydrationAt, setHistoryTailFollowIntent, toolType]);
+    // Use the existing Timeline seek owner: it suspends the old reading
+    // anchor, hydrates far stubs and waits for a stable real row. A direct
+    // smooth scroll fought hydration's anchor-preservation and snapped back.
+    setHistoryScrollToUuid(match.sourceIdentity || match.entryUuid, tabId);
+  }, [historyTailPinScheduler, matchPositions, setHistoryScrollToUuid, setHistoryTailFollowIntent, tabId]);
 
   const goNextMatch = useCallback(() => {
-    if (matchPositions.length === 0) return;
-    const next = (currentMatchIdx + 1) % matchPositions.length;
-    setCurrentMatchIdx(next);
-    scrollToMatch(next);
-  }, [currentMatchIdx, matchPositions.length, scrollToMatch]);
-
+    const count = searchResult?.total || 0;
+    if (count) { setCurrentMatchIdx(index => (index + 1) % count); setSearchNavigationRequest(value=>value+1); }
+  }, [searchResult]);
   const goPrevMatch = useCallback(() => {
-    if (matchPositions.length === 0) return;
-    const prev = (currentMatchIdx - 1 + matchPositions.length) % matchPositions.length;
-    setCurrentMatchIdx(prev);
-    scrollToMatch(prev);
-  }, [currentMatchIdx, matchPositions.length, scrollToMatch]);
+    const count = searchResult?.total || 0;
+    if (count) { setCurrentMatchIdx(index => (index - 1 + count) % count); setSearchNavigationRequest(value=>value+1); }
+  }, [searchResult]);
+  const selectSearchMatch = useCallback((index:number) => {
+    setCurrentMatchIdx(index);setSearchNavigationRequest(value=>value+1);
+  },[]);
+  const lastSearchNavigation = useRef('');
+  useEffect(() => {
+    if (!searchActive) { lastSearchNavigation.current = ''; return; }
+    const match = matchPositions.find((item:any) => item.matchIndex === currentMatchIdx);
+    if (!match) return;
+    // Refresh/alias adoption can change the row address without another
+    // navigation gesture. Only a new query or explicit result selection moves
+    // the viewport; clicking the current result is still a fresh request.
+    const key = searchScope + ':' + currentMatchIdx + ':' + searchNavigationRequest;
+    if (key === lastSearchNavigation.current) return;
+    lastSearchNavigation.current = key;
+    scrollToMatch(currentMatchIdx);
+  }, [currentMatchIdx, matchPositions, scrollToMatch, searchActive, searchScope, searchNavigationRequest]);
 
   // CSS Highlight API — apply highlights after render
   useEffect(() => {
     const CSS_HL = (CSS as any).highlights;
     if (!CSS_HL || !virtuosoScrollerRef.current) {
-      CSS_HL?.delete('hp-search');
-      CSS_HL?.delete('hp-search-current');
+      clearHistorySearchHighlights(searchMarkerLease);
       return;
     }
-    if (!searchQuery || searchQuery.length < 2 || matchPositions.length === 0) {
-      CSS_HL.delete('hp-search');
-      CSS_HL.delete('hp-search-current');
+    if (!searchActive || !searchQuery || matchPositions.length === 0) {
+      clearHistorySearchHighlights(searchMarkerLease);
       return;
     }
 
@@ -15192,7 +15208,7 @@ function HistoryPanel({
       const qLen = searchQuery.length;
       const allRanges: Range[] = [];
       const currentRanges: Range[] = [];
-      const currentMatch = matchPositions[currentMatchIdx];
+      const currentMatch = matchPositions.find((item:any) => item.matchIndex === currentMatchIdx);
 
       // Walk all text nodes in scroll container
       const walker = document.createTreeWalker(virtuosoScrollerRef.current!, NodeFilter.SHOW_TEXT);
@@ -15212,6 +15228,7 @@ function HistoryPanel({
           parent = parent.parentElement;
         }
 
+        if (!matchingEntryUuids.has(entryUuid)) continue;
         let idx = text.indexOf(q);
         while (idx !== -1) {
           try {
@@ -15224,8 +15241,7 @@ function HistoryPanel({
             if (currentMatch && entryUuid === currentMatch.entryUuid) {
               const occ = entryOccurrences.get(entryUuid) || 0;
               // Find how many matches exist for this entry before currentMatchIdx
-              const entryMatches = matchPositions.filter(m => m.entryUuid === entryUuid);
-              const localIdx = entryMatches.findIndex(m => m === currentMatch);
+              const localIdx = currentMatch.occurrence || 0;
               if (occ === localIdx) {
                 currentRanges.push(range);
               }
@@ -15236,29 +15252,19 @@ function HistoryPanel({
         }
       }
 
-      if (allRanges.length > 0) {
-        CSS_HL.set('hp-search', new (window as any).Highlight(...allRanges));
-      } else {
-        CSS_HL.delete('hp-search');
-      }
-      if (currentRanges.length > 0) {
-        CSS_HL.set('hp-search-current', new (window as any).Highlight(...currentRanges));
-      } else {
-        CSS_HL.delete('hp-search-current');
-      }
+      setHistorySearchHighlights(searchMarkerLease, allRanges, currentRanges);
     }, 50);
 
     return () => {
       clearTimeout(timer);
-      CSS_HL?.delete('hp-search');
-      CSS_HL?.delete('hp-search-current');
+      clearHistorySearchHighlights(searchMarkerLease);
     };
     // mountWaveRenderState: highlights walk DOM text nodes, and a mount-wave
     // shell has none — each upgrade step must re-walk so matches inside
     // freshly hydrated rows get painted (the match COUNTER is data-driven and
     // was always right; only the paint needs the re-run).
   }, [
-    searchQuery,
+    searchQuery, searchActive, searchMarkerLease, matchingEntryUuids,
     matchPositions,
     currentMatchIdx,
     displayEntries,
@@ -15295,8 +15301,10 @@ function HistoryPanel({
         // A local composer search owns Escape as well. Run after is rendered
         // through a portal, so React ancestry cannot establish ownership.
         if (isComposerKeyboardTarget(e.target)) return;
+        e.preventDefault();
         e.stopPropagation();
         setSearchOpen(false);
+        setSearchType('all');
         setSearchQuery('');
         setCurrentMatchIdx(0);
       }
@@ -15306,15 +15314,18 @@ function HistoryPanel({
   }, [isOpen, mainSurface, searchOpen, terminalOpen, terminalIsPrimary]);
 
   const openSearch = useCallback(() => {
+    uiPerformancePhase('search-open', {tab:tabId});
     setSearchOpen(true);
     setTimeout(() => searchInputRef.current?.focus(), 50);
-  }, []);
+  }, [tabId]);
 
   const closeSearch = useCallback(() => {
+    uiPerformancePhase('search-close', {tab:tabId});
     setSearchOpen(false);
+    setSearchType('all');
     setSearchQuery('');
     setCurrentMatchIdx(0);
-  }, []);
+  }, [tabId]);
 
   useEffect(() => {
     // Opening the floating terminal hands find over to it — but in
@@ -15322,6 +15333,21 @@ function HistoryPanel({
     // panel's search on that basis would make it impossible to keep open.
     if (mainSurface && terminalOpen && !terminalIsPrimary && searchOpen) closeSearch();
   }, [closeSearch, mainSurface, searchOpen, terminalOpen, terminalIsPrimary]);
+
+  useEffect(() => {
+    const handler = (event:Event) => {
+      if ((event as CustomEvent).detail?.tabId !== tabId || !isOpen) return;
+      openSearch();
+    };
+    window.addEventListener('history-panel:open-search', handler);
+    return () => window.removeEventListener('history-panel:open-search', handler);
+  }, [isOpen, openSearch, tabId]);
+  useEffect(() => { closeSearch(); }, [historyOwnerKey, closeSearch]);
+  useEffect(() => {
+    if (!isOpen || !requestedHistorySearch) return;
+    openSearch();
+    consumeHistorySearchRequest(tabId,requestedHistorySearch);
+  }, [isOpen, openSearch, requestedHistorySearch, tabId]);
 
   // Explicit jump-to-bottom helper. First let Virtuoso materialize/measure the
   // final transcript row, then include the composer spacer in the final pixel
@@ -22152,17 +22178,17 @@ function HistoryPanel({
           transform: 'translateX(-50%)',
           zIndex: 30,
           width: 'min(440px, calc(100% - 32px))',
-          height: 32,
+          height: 'auto',
           display: 'flex',
           alignItems: 'center',
           gap: 6,
-          padding: '0 8px',
+          padding: '7px 9px',
           border: '1px solid #3f3f46',
           borderRadius: 7,
           background: 'rgba(24,24,27,0.96)',
           boxShadow: '0 8px 24px rgba(0,0,0,0.38)',
         } : {
-          display: 'flex', alignItems: 'center', height: 30,
+          display: 'flex', flexWrap: 'wrap', alignItems: 'center', minHeight: 30,
           padding: '0 8px 0 12px', borderBottom: '1px solid #333', flexShrink: 0, gap: 6,
         }}
       >
@@ -22184,50 +22210,14 @@ function HistoryPanel({
         </button>
         </ControlHint>
         )}
-        {searchOpen && (
-          <>
-            <input
-              ref={searchInputRef}
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); goNextMatch(); }
-                if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); goPrevMatch(); }
-                if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
-                if (e.key === 'Enter' || e.key === 'Escape') e.stopPropagation();
-              }}
-              placeholder="Search..."
-              style={{
-                flex: 1, minWidth: 0, height: 20, fontSize: 12,
-                backgroundColor: '#2a2a2a', border: '1px solid #444', borderRadius: 3,
-                color: '#e0e0e0', padding: '0 6px', outline: 'none',
-              }}
-              onFocus={(e) => { (e.currentTarget as HTMLInputElement).style.borderColor = '#5b9cf5'; }}
-              onBlur={(e) => { (e.currentTarget as HTMLInputElement).style.borderColor = '#444'; }}
-            />
-            <ControlHint label="Предыдущее совпадение" shortcut="Shift+Enter">
-            <button onClick={goPrevMatch} style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: 1, display: 'flex' }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#888'; }}
-            ><ArrowUp size={14} /></button>
-            </ControlHint>
-            <ControlHint label="Следующее совпадение" shortcut="Enter">
-            <button onClick={goNextMatch} style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: 1, display: 'flex' }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#888'; }}
-            ><ArrowDown size={14} /></button>
-            </ControlHint>
-            <span style={{ fontSize: 11, color: '#666', flexShrink: 0, minWidth: 35, textAlign: 'right' }}>
-              {matchPositions.length > 0 ? `${currentMatchIdx + 1}/${matchPositions.length}` : searchQuery.length >= 2 ? '0' : ''}
-            </span>
-            <ControlHint label="Закрыть поиск" shortcut="Esc">
-            <button onClick={closeSearch} style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: 1, display: 'flex', flexShrink: 0 }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#666'; }}
-            ><X size={13} /></button>
-            </ControlHint>
-          </>
-        )}
+        {searchOpen && <>
+          <HistorySearchBar inputRef={searchInputRef} query={searchQuery} type={searchType}
+            onQuery={(value:string)=>{setSearchQuery(value);setCurrentMatchIdx(0);}}
+            onType={(value:string)=>{setSearchType(value);setCurrentMatchIdx(0);}}
+            onPrevious={goPrevMatch} onNext={goNextMatch} onSelect={selectSearchMatch}
+            onClose={closeSearch} result={searchResult} current={currentMatchIdx}
+            loading={searchLoading} error={searchError}/>
+        </>}
         {!searchOpen && !mainSurface && <div style={{ flex: 1 }} />}
         {!previewMode && !mainSurface && (
           <>
@@ -22903,8 +22893,7 @@ function HistoryPanel({
                     onDismissPromptPresentation={dismissPromptPresentation}
                     onDismissRewindPresentation={dismissLocalRewindPresentation}
                     forceExpanded={
-                      searchQuery.length >= 2
-                      && entry.content.toLowerCase().includes(searchQuery.toLowerCase())
+                      searchActive && matchingEntryUuids.has(entry.uuid)
                     }
                   />
                 </>

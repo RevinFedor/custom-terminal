@@ -20,6 +20,7 @@ import {
 import { showAgentDraftScreenContradictionToast } from './agentDraftContradictionToast.mjs';
 import { draftTransferResultFields, readAgentDraftTransfer } from './agentDraftTransfer.mjs';
 import sendTargetContract from '../../shared/agent-send-target-precondition.cjs';
+import manualActionContract from '../../shared/agent-manual-action.cjs';
 
 const { createAgentSendTargetExpectation, resolveReadyAgentSendTarget } = sendTargetContract;
 
@@ -177,6 +178,10 @@ export async function prepareAgentRuntimeForSend({
     ) {
       throw new Error('Send cancelled before terminal submission');
     }
+    const action = runtime.toolType === 'codex' ? manualActionContract.describeAgentManualAction(presence) : null;
+    if (action) throw Object.assign(new Error(action.message), action, {
+      submitted: false, pasteWritten: false, enterWritten: false,
+    });
   };
   const waitStartupGate = async () => {
     await providerContract.waitForStartupGate(tabId, 'agent-send');

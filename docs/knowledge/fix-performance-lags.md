@@ -231,6 +231,26 @@ const ids = useStore(useShallow(s => s.items.filter(i => i.active).map(i => i.id
 
 Контринтуитивный шрам: parsed/UI object нельзя использовать как payload для Fork/Edit/Delete. Первая версия записала `[image omitted]` в child и сделала его не-resumable. Write-path теперь потоково возвращает точный raw data URL по byte range + SHA-256 и fail-closed при source-CAS mismatch. Экономия памяти разрешена presentation-слою, но не переписывает durable source. См. `fact-codex.md::Timeline и History`.
 
+### Падение main после Fork во время переименования
+
+28.09,16:06BKK: child2941 успела создаться, затем main68878 завершился
+`SIGABRT/FatalProcessOutOfMemory` при выделении UTF-8→two-byte string.
+Непосредственно перед аварией live watcher обрабатывал диапазон
+238991632..548841803 нового child, параллельно full raw readers читали parent
+и child примерно по523MiB. Стек без JS-frame не доказывает единственного
+allocator-owner, но all-at-once watcher отдельно воспроизвёл OOM на synthetic
+325099828bytes с heap512MiB. Ограниченное чтение того же actual callback
+сохранило digest/порядок всех585records и завершилось с observed heap≈175MiB.
+
+Это отдельный потребитель данных: прежний ремонт History worker/prepared SSD
+не охватывал main watcher. Он теперь использует два ограниченных прохода,
+сохраняя exact carrier selection и целую границу compact/lifecycle; контракт —
+`fact-codex.md::Большой догоняющий append после Fork/Resume`. Нельзя чинить
+отключением Fork/фонового чтения или только увеличением heap. Native acceptance,
+суммарный пик остальных full-read callers и предел одиночного большого record
+не объявлены закрытыми этим regression. Переименование не переписывает rollout:
+имя child после повторной попытки16:09 подтверждено живым Project API.
+
 ### GPU-ускорение для лоадеров
 Лоадеры (спиннеры) используют трансформацию вместо анимации CSS:
 
@@ -370,7 +390,97 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab
 
 Единственный временной предел в этом пути — error fail-safe, который снимает pending при несостоявшемся switch; он не управляет happy path. Для остаточного tab-switch CPU добавлены подфазы `[Perf:TabSwitchStart] notifyMs/activePointerMs/mruMs/spaceRouteMs/placementMs/finalSetMs`: следующий production-инцидент должен показать, какой store-step владел `syncMs=105`, вместо очередной гипотезы по общей метке. Source-проверка: 130 focused tests, targeted transpile и diff-check; physical production proof новой дельты остаётся отдельным шагом.
 
+29.09,17:56–17:57BKK: семь возвратов в warm `main` показали click EventTiming
+288–432мс при store sync10.0–20.6мс.53 retained tab hosts и16chrome reused,
+rebuilt0; четыре History gen1, geometry stable, loader hidden, без нового load
+в границе переключений. Эти факты подтверждают работу retention, но не бесплатный
+показ слоёв. Renderer LongTask пересекается с click, а TerminalArea projection
+занимает1мс: нельзя объявлять причиной повторный parse или только этот projection.
+
+Прежние `Focus:PrimaryInput phase=dispatch/result` ОБЕ записывались после
+синхронного dispatchEvent и callback редактора. Разрыв133мс от presentation
+до такого «dispatch» не доказывает ожидание перед фокусом: внутрь мог входить
+сам focus/selection. SOURCE добавляет dispatch-start/dispatchMs и отдельный
+HistoryComposerFocus focusMs/selectionMs с исходными absolute times, без новых
+DOM/geometry reads, timers или IPC. Интервалы вложены, складывать их нельзя.
+Это диагностическая граница: длинный inner focus/selection требует профиля
+редактора/forced layout; короткий inner при длинном промежутке — соседнего
+renderer commit/paint. До такого совпадающего замера producer не назначен,
+нового ускорения не заявлено; сохранённый native sample без точных JS/Chromium
+символов не заменяет CPU/paint trace.
+
+После install29.09T12:47:22Z новые логи23:35–23:36BKK разделили остаток:
+15workflow clicks192–344мс, store7.8–14.5мс. У повторных main-return composer
+focus+selection3.5–6.4мс, но между окончанием PaneLayerPresentation и началом
+focus88.9–119.1мс. Один переход в116 тратит98мс на focus/selection. Следовательно, перенос
+focus в таймер не чинит основную цену тёплого commit и меняет порядок feedback.
+Совпадающего CPU/paint trace для этих жестов нет; следующий такой профиль должен
+разделить React commit и нативные style/layout в этом конкретном интервале.
+В фоне Timeline3314/3894 действительно делали rebuild9.45/10.62с; показ retained
+History их не ждал. Это отдельная нагрузка, а не доказательство, что каждый
+click ждал JSONL. Точная причина отказа SSD-кэша по этим суммарным логам неизвестна;
+RAM eviction, schema/source invalidation и disk eviction нельзя объявлять одним.
+
+## 7b. Пустой поиск чата инвалидировал стили всех окон
+
+29.09 после Build Install открытие «Найти в чате» и закрытие крестиком давали
+click424–496мс в уже показанной754. Реальный поиск11 358сообщений занимал11–16мс
+в worker. Тяжёлый путь воспроизводился и без запроса: условная панель добавляла
+и удаляла `<style>` с `::highlight(owner-name)`. Highlight наследуется через
+дерево, поэтому Chromium пересчитывал даже скрытые retained History.
+
+Actual HistoryPanel +60 047DOM nodes в private Electron28: три open/close,
+RecalcStyle255–389мс; trace UpdateLayoutTree обошёл60 093элемента. Контроль,
+убирающий только динамический stylesheet из той же фикстуры, дал1–7мс.
+Это доказательство механизма на контролируемой нагрузке, не production trace.
+
+Правила вынесены в постоянный CSS, Range принадлежат отдельным History leases
+и объединяются в два статических Highlight. Закрытие/смена owner не очищает
+соседнюю подсветку. Тексты, типы, пустой image-filter, Timeline rings, пагинация
+и exact seek сохранены. Actual UI проверяет два одновременно ищущих чата и
+закрывает каждый; cost regression ловит сам факт динамической вставки правил
+на пустом поиске. Малый прежний функциональный тест правильно проверял поиск,
+но не стоимость глобальной CSS-инвалидации при большом persistent DOM.
+
 ---
+
+## 7c. Правило фоновых анимаций тормозило показ прогретых окон
+
+30.09 после Build Install возвраты на Main224–392мс при reuse50tab nodes и16chrome
+не требовали повторного mount. Native intervals подтверждали style57–108мс,
+но были шире клика и сами не назначали конкретный writer. Private Electron28
+с actual TerminalArea/SpaceStrip/History/Timeline и~58k DOM воспроизвёл механизм.
+
+`presentationAnimations.css` искал hidden indicators через descendant
+`[style*="animation:"][style*="infinite"]` и `[class*="animate-glow-"]`.
+Изменение inline CSS/класса владельца давало invalidation set по ЛЮБОМУ style/class:
+обычные сообщения, кнопки и иконки тоже попадали в обход. Trace UpdateLayoutTree
+4392elements/67–74мс; style median77.5. Guard одинаковых style writes не помог
+(79.7мс); только убрать inline selector недостаточно (60.2мс), class substring
+сохранял обход3239elements/49мс. Это CSS invalidation, не цена чтения истории.
+
+Цели теперь индексируются по точным классам.37inline indicators помечены
+`noted-infinite-animation`, включая условные infinite/none; семь glow-классов
+перечислены явно. Скрытые анимации по-прежнему paused, visible-unfocused running,
+новые индикаторы в скрытом owner сразу paused, finite/mixed dismiss завершён.
+AST coverage проверяет существующие inline JSX styles, включая ternary objects;
+новый цикл требует marker на том же элементе. Не возвращать substring fallback.
+
+Same-harness CSS baseline RED77.5мс; final GREEN13.5мс. EventTiming click median
+112→40мс, processing79.7→15.2мс; driver elapsed включает управление тестом и2rAF
+и не является этими величинами.33focused checks и private actual UI проходят:
+8switches сохраняют DOM/row/scroll/draft/focus, reads6→6; background transcript
+delivery показывается после reveal и не сдвигает соседнюю читаемую строку.
+Отдельный animation UI проверяет4owners, clocks/identity, late inline indicator,
+finite/mixed dismiss и реальное движение пикселей. Repeatable:
+`scripts/workflow-switch-cost-regression.mjs` (`NOTED_WORKFLOW_EXPECT_FAST=1`),
+`scripts/renderer-animation-regression.mjs --skip-perf`.
+
+Это source/isolated proof механизма. В рабочем12:13renderer style мог быть
+принудительно выполнен до focus, в малой fixture — внутри focus. Совпадающий
+production JS trace утрачен quota; цена всего оставшегося commit и новые
+installed задержки не приписаны одному правилу. Истории/lifecycle/production
+не менялись; source-правка требует обычного следующего Build Install.
 
 ## 7b. Первый wheel зависал из-за Git fan-out скрытых окон
 

@@ -184,7 +184,7 @@ export const getSessionStartingPresentation = (state: SessionStartingState) => {
     return { isError: false,
       title: manual ? 'CODEX ЖДЁТ ВЫБОРА' : 'CODEX: ВЫБОР ДЕЙСТВИЯ',
       subtitle: state.lastNotReady?.message || (hasBlocker('resume-goal') ? 'Настройка возобновления Goal' : 'Достигнут лимит использования'),
-      detail: manual ? 'Откройте терминал: процесс не остановлен, повторная отправка не нужна' : 'Применяется глобальная настройка System' };
+      detail: manual ? 'Откройте терминал и завершите выбор. Затем можно отправить сообщение из поля ввода.' : 'Применяется глобальная настройка System' };
   }
 
   if (hasBlocker('trust-directory') || hasBlocker('cwd-chooser')) {
@@ -750,14 +750,15 @@ export function useAgentLifecycle({
     }
     if (sessionStarting && sessionStarting.tabId === tabId) {
       const presentation = getSessionStartingPresentation(sessionStarting);
-      const isWarning = !!sessionStarting.lifecycleWarning || sessionStarting.manualActionRequired === true;
+      const isInfo = sessionStarting.manualActionRequired === true && !sessionStarting.lifecycleWarning;
+      const isWarning = !!sessionStarting.lifecycleWarning;
       const canRetryStartupSettings = presentation.isError
         && sessionStarting.startupUserRetryable === true;
       return {
         tabId: sessionStarting.tabId,
         sessionId: sessionStarting.sessionId || null,
         engine: sessionStarting.engine,
-        kind: isWarning ? 'warning' : presentation.isError ? 'error' : 'starting',
+        kind: isWarning ? 'warning' : presentation.isError ? 'error' : isInfo ? 'info' : 'starting',
         title: presentation.title,
         description: presentation.subtitle,
         detail: presentation.detail,
@@ -767,9 +768,9 @@ export function useAgentLifecycle({
             error: sessionStarting.startupError, errorCode: sessionStarting.startupErrorCode,
             failedCommand: sessionStarting.startupFailedCommand, proofOutcome: sessionStarting.startupProofOutcome })
           : undefined,
-        spinner: !presentation.isError && !isWarning,
-        dismissLabel: presentation.isError || isWarning ? 'Скрыть сообщение' : undefined,
-        onDismiss: presentation.isError || isWarning ? handleDismiss : undefined,
+        spinner: !presentation.isError && !isWarning && !isInfo,
+        dismissLabel: presentation.isError || isWarning || isInfo ? 'Скрыть сообщение' : undefined,
+        onDismiss: presentation.isError || isWarning || isInfo ? handleDismiss : undefined,
         retryLabel: canRetryStartupSettings ? 'RETRY SETTINGS' : undefined,
         onRetry: canRetryStartupSettings ? handleRetry : undefined,
       };

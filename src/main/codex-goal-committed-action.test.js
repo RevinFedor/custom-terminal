@@ -95,6 +95,19 @@ test('raw goal announcement never writes; one completed frame selects Resume exa
   assert.equal(h.policy().phase, 'confirming', 'key write alone is not completion');
 });
 
+test('29Sep footer uses the same committed policy and preserves both saved choices', async () => {
+  const compact = menu.replace('Press enter to confirm or esc to go back', 'enter select · esc back');
+  for (const configured of [true, false]) {
+    const h = harness({ configured, screen: compact });
+    h.frame(compact, false); await h.drain(); assert.deepEqual(h.writes, []);
+    h.frame(compact); await h.drain();
+    assert.deepEqual(h.writes, configured ? ['\r'] : ['\x1b[B', '\r']);
+    assert.equal(h.policy().phase, 'confirming');
+    h.frame(h.runtime.screen); await h.drain();
+    assert.deepEqual(h.writes, configured ? ['\r'] : ['\x1b[B', '\r'], 'no second Enter for an unchanged modal');
+  }
+});
+
 test('actual main adapter selects only quota fallback through its real PTY lock, or delegates Stop-all without keys', async () => {
   const usage = 'You’re now using Luna, a faster model for simpler tasks.\n› 1. Add Credits\n  2. Reset usage\n  3. Continue with Luna Reserve\nPress enter to confirm or esc to continue working';
   const h = harness({ screen: usage }); h.frame(usage); await h.drain();

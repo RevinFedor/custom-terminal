@@ -27,6 +27,27 @@ M1 Pro отношение равно 125/3; маленькие значения 
 ошибкой не затронуты. Проверка единиц и предел поправки старых округлённых
 чисел — [ресурсная панель](fact-resource-usage-panel.md#загрузка-процессора-только-из-двух-замеров).
 
+С30.09 каждый interval/checkpoint отдельно сохраняет `appCpu` (прямые Electron
+процессы), `appChildCpu` (служебные потомки без tab binding), `tabCpu` и
+`externalCpu`, плюс `cores`. Группы считаются до отсечения top rows. Процесс
+вкладки и Docker не превращаются в CPU renderer; высокая внешняя нагрузка и
+лишняя работа приложения могут присутствовать одновременно. Для вывода нужна
+та же временная граница, не текущий Activity Monitor после вчерашнего события.
+`external` означает отсутствие процесса в известном дереве Noted, а не
+доказанную независимость нагрузки: Docker-daemon мог обслуживать команду из
+нашей вкладки. Фоновый сигнал только системного CPU без Electron hotspot не
+расходует профиль Noted (`system-pressure-no-electron-hotspot`); настоящий
+медленный UI-жест всё равно проходит отдельную responsiveness-политику.
+
+`[Perf:SystemPressure]` раз в30с читает только OS query (`sysctl` и `vm_stat`)
+вне main/renderer. Он сохраняет raw pressure level, сжатую физическую/логическую
+память, занятый swap и прирост swap/page counters, время/цену измерения. CPU frame
+содержит возраст последнего memory sample. Мало свободной RAM не называется
+memory pressure; page-in не называется swap-in, накопленное за boot число не
+выдаётся за текущую скорость. Reset, частично недоступный счётчик и не-macOS
+остаются явными unknown/partial. Эти поля объясняют условия, а не автоматически
+назначают виновника задержки. GPU-process CPU также не равен загрузке видеокарты.
+
 Постоянный сбор раз в 2с не запускает `ps`, не читает аргументы команд и не
 гоняет список процессов через renderer. Каждые 30с сохраняются средние/пики
 всего окна наблюдения, а не один случайный снимок. У инцидента есть подробная
@@ -36,21 +57,80 @@ M1 Pro отношение равно 125/3; маленькие значения 
 при заполнении старые диагностические артефакты удаляются раньше. Журналы
 пользователя и неизвестные файлы этой очистке не принадлежат.
 
-Сигналы инцидента: задержанный input/LongTask от 250мс, отсутствие heartbeat
+Сигналы инцидента: UI EventTiming от120мс, остальные delayed input/LongTask от250мс, отсутствие heartbeat
 (main 500мс, focused renderer 750мс, видимый нефокусный 1500мс), либо минимум
 6с нагрузки Noted от 80% одного ядра / системы от 90%. Новый подробный пакет
-создаётся не чаще раза в 10 минут; обычные CPU-окна продолжаются между ними.
+для фонового CPU создаётся не чаще раза в10минут, для responsiveness —30с;
+активное20с окно объединяет новые события и считает неуместившиеся. Обычные
+CPU/native/UI-измерения продолжаются между пакетами.
 
 Не более четырёх раз за скользящие сутки запускается native sample и короткий
-10-секундный профиль main/renderer JS плюс browser trace. Лимит переживает
+10-секундный профиль main/renderer JS плюс browser trace. Из четырёх слотов
+фоновой sustained-CPU нагрузке доступны максимум два; два остаются для
+responsiveness. Cooldown10минут считается по этой группе. Все причины
+(`startup-warmup`, `reserved-for-responsiveness`, `capture-group-cooldown`,
+`rolling-quota-exhausted`, merge/incident-window cooldown) и следующий доступный
+wall time идут в `[Perf:CaptureDecision]`; повторный skip имеет счётчик.
+Лимит переживает
 перезапуск и восстанавливается со временем: прежние десять sample на весь boot
 оставляли длинную рабочую сессию навсегда без стека. Первая минута startup не
 запускает тяжёлую запись. Trace ограничен буфером 8MiB, экспортом 16MiB;
 потеря данных, занятый DevTools, ошибка/опоздание захвата записываются явно.
+С30.09 JS sampling1мс; профиль пишет triggerStart/end, actual start,
+`triggerOverlap=trigger-already-finished|partial|unknown`, полноту экспорта и
+peak buffer. Начатый после жеста профиль нельзя выдавать за стек этого жеста.
+Занятый своим другим capture также оставляет явный profile status.
 Профилировщик не поднимает окно и не отбирает существующий debugger/trace.
 Он не собирает полный DOM, скриншоты, heap dump, тексты переписки или network
 payload. Дополнение 14.09 сохраняет ограниченные метаданные элементов, описанные
 ниже; это не постоянное сканирование страницы.
+
+## UI → native counters → запрос чтения
+
+С30.09 дешёвая цепочка не зависит от доступности тяжёлого capture. На capture
+click/pointer/key/wheel сохраняются `ui-…` ID и структурный адрес цели до её
+удаления. `[Perf:UIAction]` объединяет EventTiming, callback первого/второго
+кадра, render/layout-effect/after-effects, presentation, focus, activity и
+scroll-writer phases. `frameAbs` — доставка callback, исходный rAF timestamp
+сохранён отдельно: после длинного handler он бывает раньше самого клика.
+Stylesheet identities показывают добавление/удаление даже вложенного `<style>`
+без чтения cssRules, текста, computed style или обхода всех потомков.
+
+Кольцо96действий,32phases (первые8 и последние24),24stylesheet changes каждого
+вида; переполнение явно помечено. Wheel — максимум один sample за200мс,
+не изменение пути прокрутки. Уже существующие wheel/scroll-writer probes
+сохраняют собственные owner/generation/visit и добавляют actionId. Это
+временная связь, не автоматическое назначение причины чужой фоновой работе.
+
+`[Perf:NativeWindow]` раз в секунду читает Chromium Performance counters:
+ScriptDuration, RecalcStyleDuration, LayoutDuration, TaskDuration/ThreadTime,
+число layout/style проходов, DOM nodes/documents и heap. Это собственное
+подключение debugger без Profiler/Tracing/DOM/Runtime.evaluate. Оно уступает
+DevTools и снимается на время incident profile; чужое подключение не закрывает.
+Reload/crash сбрасывает baseline. `[Perf:NativeStatus]` явно сообщает паузу,
+ошибку и состояние коллектора; тихие интервалы не печатаются построчно.
+
+`[Perf:NativeAction]` связывает действие с перекрывающимися окнами счётчиков,
+включая уже снятое periodic окно: нулевой следующий delta не стирает дорогой
+предыдущий. Хранятся32окна, максимум6в одном action; время query — также ожидание
+renderer, а не собственная CPU-цена наблюдателя. Интервал может содержать другую
+работу, Script/style/layout вложены в Task/ThreadTime и не суммируются.
+Недоступное значение остаётся неизвестным, не нулём.
+`intervalWallMs` и `rendererThreadCpuPercent` отделяют прошедшее время от
+собственной работы renderer thread: длинное ожидание при малом thread CPU
+требует проверки очереди/планировщика/внешней нагрузки, но само по себе не
+доказывает Docker. Высокий собственный Script/style/layout требует ремонта
+соответствующей работы даже при занятой системе.
+
+`[Perf:HistoryTransport]` добавляет `hr-…` ID и отделяет IPC wait от V8 decode,
+байты полученного бинарного ответа от числа строк. ID доходит до `[HistoryRead]`
+client/request/attempt/worker-generation. Диагностические поля удаляются из
+payload перед service и не входят в cache/source identity, DTO и read proof.
+
+Проверка диагностики — воспроизводимый известный CPU-блок + global restyle,
+удаление нажатой кнопки, соседние periodic samples, ввод canary и wheel.
+`scripts/renderer-diagnostics-regression.mjs` использует настоящий Electron28
+с private userData; рабочие вкладки, native cursor и provider input не нужны.
 
 ## Cold History: чтение, проекция и ожидания
 
@@ -84,7 +164,21 @@ serialize/write ms, metadata/row/payload write bytes и `baseCache`/`preparedCac
 учитывается отдельно от source bytes; virtual имеет свои read/verification counters.
 Эти счётчики относятся к projector lanes, не ко всем file I/O приложения.
 Main heartbeat подтверждает доступность main, но не ограничивает ожидание
-другого запроса в синхронной фазе worker; для него нужен отдельный queue/slice замер.
+другого запроса в синхронной фазе worker. С30.09 `[HistoryRead]` различает
+sessionQueueMs и coldAdmissionMs, execution, serialization/postMessage,
+main delivery, revoke/retry/worker death. Cache phases ограничены16группами;
+поздний exception вытесняет обычную группу, последний отказ и счётчики причин
+сохраняются отдельно от truncation. Bytes structured clone или raw records-path,
+который не отдаёт измерение, обозначаются unavailable, а не оценкой по stringify.
+
+SSD причины разделены: no-file, disk-quota, version-mismatch, source identity/
+size/truncate/rewrite, контекст/owner, checksum/index corruption, disabled,
+permission/disk-full и write invalidation. Prune, RAM index eviction и source
+invalidation — разные события. История удалений/версий ограничена256ключами и
+не переживает restart; version hint берётся из уже существующего quota scan,
+без нового сканирования на каждый read. Неизвестная ошибка сохраняет класс и
+безопасную точку JS-source, без message/payload. Bootstrap cache outcomes тоже
+передаются; hit после RAM eviction отдельно доказывает SSD, а не новый raw parse.
 
 ## Как читать доказательства
 
@@ -201,6 +295,16 @@ verificationBytes/cacheHit и elapsed ms адресного enrichment. Счёт
 trace одно время завершения чтения такой доли не доказывает.
 
 ### Когда JavaScript-профиль почти пуст, а интерфейс занят
+
+30.09 warm-switch trace показал другой класс browser работы: CSS pause-rule
+с descendant style/class substring selectors заставлял UpdateLayoutTree
+перепроверять4392обычных элементов за67–74мс при opacity/class mutation owner.
+После exact class targets и37inline markers style median77.5→13.5мс в одной
+actual fixture. CPU sample `focus` означал место принудительного flush;
+первичная причина была раньше в invalidation selectors. В production flush
+может оказаться до focus в соседнем layout effect. Native interval overlap
+не выбирает этот writer; точная связь требует trace+одного CSS control.
+Доказательства/контракт/пределы — `fix-performance-lags.md::7c`.
 
 19.09 sidecar связал повторный root с `HistoryTerminalActivityIcon`3314,
 `cb-terminal-perimeter-travel`;40–46 скрытых HistorySpinner оставались running.

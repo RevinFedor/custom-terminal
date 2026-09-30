@@ -81,6 +81,33 @@ test('actual main request catches up after renderer reply and rejects its older 
   assert.ok(h.logs.some(line => line.includes('renderer-frame-behind')), 'ordinary log remains');
 });
 
+test('tab34: unknown main → older renderer hint → fresh empty stays routine even without positive merging', async () => {
+  let reads = 0;
+  const h = createCodexDraftRequestHarness({
+    mirror: { generation: 'tab34-generation', generationOrdinal: 2, complete: true,
+      synchronizedFrameWaiters: new Set() },
+    getDraft: () => ++reads === 1
+      ? { success: true, hasDraft: null, frameBlocker: 'synchronized-output-open', source: 'headless-main:partial' }
+      : { success: true, hasDraft: false, preview: 'Ask Codex to do anything',
+        source: 'headless-main:cursor:1034:dim-hint',
+        frameIdentity: { generation: 'tab34-generation', writeSeq: 141 } },
+  });
+  // Same options as codex:get-draft-state: inner read never promotes positive
+  // hints. It can still ask for one while its first main read is unknown.
+  const pending = h.read('agent-send-preflight:history-panel', {});
+  await drainMicrotasks();
+  assert.ok(h.rendererRequest);
+  h.replyRenderer({ success: true, hasDraft: true, preview: '› Ask Codex to do anything',
+    source: 'cursor:664:multiline-draft-row-667',
+    frameIdentity: { generation: 'tab34-generation', writeSeq: 100 } });
+  const result = await pending;
+  assert.equal(result.hasDraft, false);
+  assert.equal(result.observation.status, 'settled');
+  assert.equal(result.rendererPositiveIgnored, 'renderer-frame-behind');
+  assert.equal(h.reports.length, 0, 'no incident or user notification for frames100→141');
+  assert.equal(reads, 2, 'no extra waiting or PTY action');
+});
+
 for (const rendererFrame of [null, { generation: 'other-pty', writeSeq: 41 },
   { generation: 'pty-a', writeSeq: 43 }, { generation: 'pty-a', writeSeq: 44 }]) {
   test('actual main preserves incident capture for a conflict not resolved as an older same-process frame: '

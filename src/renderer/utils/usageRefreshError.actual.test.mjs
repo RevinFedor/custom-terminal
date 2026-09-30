@@ -105,6 +105,7 @@ test('real Codex refresh callback flags a per-account error even with an IPC suc
     selectedAccountKey: 'account-a', currentAccountKey: 'account-a',
     activeCodexSessionId: null, activeCodexCwd: null,
     refreshSeqRef: { current: 0 }, refreshContextRef: { current: 'account-a||' },
+    refreshInFlightRef: { current: false },
     lastRefreshStartedAtRef: { current: 0 },
     usageRefreshFlashTarget: target,
     clearRefreshFailureFlash: () => {},

@@ -76,6 +76,10 @@ test('History routes standalone Claude/Codex slash through local TUI ingestion i
   assert.match(main, /localCommandProof = 'codex-tui-input-frame-and-enter'/);
   assert.match(panel, /projectAgentLocalCommandSendResult\(\{/);
   assert.match(panel, /requiresAuditIdentity: !localSlashReceipt\.handled/);
+  const localPayload = runtime.slice(runtime.indexOf("? ipcRenderer.invoke('codex:send-live-slash-command'"),
+    runtime.indexOf(": ipcRenderer.invoke('codex:send-command'"));
+  assert.match(localPayload, /sendOperationKey: options\.sendOperationKey/);
+  assert.match(localPayload, /sendAttemptId: options\.sendAttemptId/);
 });
 
 test('provider-busy slash is admitted only for an owned History queue source', () => {

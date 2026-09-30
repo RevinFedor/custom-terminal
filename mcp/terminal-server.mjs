@@ -753,7 +753,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
 const TOOLS = [
   {
     name: 'get_tab_context',
-    description: 'Read a tab responsibility, linked working Markdown files, and pending context updates. Does not launch or message the agent. Omit tabId for this full session. Use before updating another tab working state: edit its linked Markdown when present; otherwise publish_context_update.',
+    description: 'Read a tab responsibility, linked working Markdown files, and pending context updates. Does not launch or message the agent. Omit tabId for this full session. Before updating another tab, edit its linked Markdown when present; otherwise publish_context_update to that other tab. Reading your own tab with no linked Markdown is not a reason to publish an update to yourself.',
     inputSchema: { type: 'object', properties: {
       tabId: { type: 'string' }, projectId: { type: 'string' }, cwd: { type: 'string' },
     } },
@@ -777,7 +777,7 @@ const TOOLS = [
   },
   {
     name: 'publish_context_update',
-    description: 'Queue a working-state update for another tab WITHOUT sending a message or waking an agent. The orange update chip is attached to that tab next real prompt from History, Run after, MCP or Project API. Prefer editing the linked working Markdown from get_tab_context when present. Separate updates stay separate; requestId deduplicates exact retries.',
+    description: 'Queue a working-state update for ANOTHER tab WITHOUT sending a message or waking an agent. The target must differ from current_context.tabId; self-updates are rejected, including when your own tab has no linked Markdown. Describe a new fact that affects the target responsibility, not a report to yourself. The orange chip attaches to the target next real prompt. Prefer editing its linked working Markdown when present. requestId deduplicates exact retries.',
     inputSchema: { type: 'object', properties: {
       tabId: { type: 'string' }, projectId: { type: 'string' },
       title: { type: 'string', description: 'Short change label.' },
@@ -1832,6 +1832,10 @@ async function callTool(name, args) {
     case 'publish_context_update': {
       const tabId = args.tabId || PARENT_TAB_ID();
       if (!tabId) throw new Error('tabId is required outside a full Noted Terminal session');
+      const sourceTabId = PARENT_TAB_ID();
+      if (name === 'publish_context_update' && sourceTabId && tabId === sourceTabId) {
+        throw new Error('context_update_self_target: publish_context_update is for another tab. Your own work is already in this session; keep your own checkpoint in its working Markdown, not in a self-addressed update chip.');
+      }
       const target = projectHint(args, tabId);
       const endpoint = '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/work-context';
       const result = name === 'get_tab_context'
@@ -1840,7 +1844,7 @@ async function callTool(name, args) {
           ? await httpApiPost(target, endpoint + '/responsibility', { description: args.description })
           : await httpApiPost(target, endpoint + '/updates', {
             title: args.title, text: args.text, requestId: args.requestId,
-            sourceTabId: PARENT_TAB_ID() || undefined,
+            sourceTabId: sourceTabId || undefined,
           });
       return JSON.stringify(result, null, 2);
     }

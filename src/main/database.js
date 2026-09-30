@@ -5089,6 +5089,32 @@ class DatabaseManager {
     ).get(projectId);
   }
 
+  // Metadata-only candidate for one durable window. The ordinary project
+  // archive remains the fallback when this window has no close undo.
+  getLatestWindowTabHistory({ spaceId, windowId, projectIds, beforeOrder, projectOnly = false } = {}) {
+    if ((!projectOnly && (!spaceId || !windowId)) || !Array.isArray(projectIds) || !projectIds.length) return null;
+    const projects = [...new Set(projectIds.filter(id => typeof id === 'string' && id))];
+    if (!projects.length) return null;
+    const row = this.db.prepare(`
+      SELECT * FROM (SELECT id, project_id, tab_id, closed_at,
+        COALESCE(CASE WHEN json_valid(restore_placement) THEN
+          CASE WHEN json_type(restore_placement,'$.closedOrder') IN ('integer','real')
+            AND json_extract(restore_placement,'$.closedOrder') > 0
+            AND json_extract(restore_placement,'$.closedOrder') <= 9007199254740991
+            THEN CAST(json_extract(restore_placement,'$.closedOrder') AS INTEGER) END
+          END, ROUND((julianday(closed_at)-2440587.5)*86400000)) AS closedOrder
+      FROM tab_history
+      WHERE project_id IN (${projects.map(() => '?').join(',')})
+        AND (tab_type IS NULL OR tab_type != 'file')
+        ${projectOnly ? '' : `AND CASE WHEN json_valid(restore_placement) THEN
+          json_extract(restore_placement,'$.window.spaceId') = ? AND
+          json_extract(restore_placement,'$.window.windowId') = ?
+        ELSE 0 END`})
+      WHERE closedOrder <= ? ORDER BY closedOrder DESC, id DESC LIMIT 1
+    `).get(...projects, ...(projectOnly ? [] : [spaceId, windowId]), Number.isSafeInteger(beforeOrder) ? beforeOrder : Number.MAX_SAFE_INTEGER);
+    return row || null;
+  }
+
   getTabHistoryEntry(id, projectId) {
     return this.db.prepare(
       "SELECT * FROM tab_history WHERE id = ? AND project_id = ? AND (tab_type IS NULL OR tab_type != 'file') LIMIT 1"
@@ -7134,6 +7160,19 @@ class DatabaseManager {
 
   deleteTimelineNote(entryUuid, sessionId) {
     this.db.prepare('DELETE FROM timeline_notes WHERE entry_uuid = ? AND session_id = ?').run(entryUuid, sessionId);
+  }
+
+  moveTimelineNote({ previousEntryUuid, entryUuid, sessionId, tabId, content, position, expectedPreviousContent }) {
+    return this.db.transaction(() => {
+      const prior = this.db.prepare('SELECT * FROM timeline_notes WHERE entry_uuid=? AND session_id=?')
+        .get(previousEntryUuid, sessionId);
+      if (!prior || prior.content !== expectedPreviousContent) return { success: false, error: 'timeline_note_changed' };
+      if (entryUuid !== previousEntryUuid && this.db.prepare('SELECT 1 FROM timeline_notes WHERE entry_uuid=? AND session_id=?')
+        .get(entryUuid, sessionId)) return { success: false, error: 'timeline_note_target_occupied' };
+      this.db.prepare("UPDATE timeline_notes SET entry_uuid=?,tab_id=?,content=?,position=?,updated_at=strftime('%s','now') WHERE entry_uuid=? AND session_id=?")
+        .run(entryUuid, tabId, content, position || 'before', previousEntryUuid, sessionId);
+      return { success: true, entryUuid };
+    })();
   }
 
   // Rewind markers

@@ -57,6 +57,22 @@ test('recorded stale More reasoning tail cannot override a newer committed empty
   assert.equal(result.rendererPositiveIgnored, 'renderer-frame-behind');
 });
 
+test('a hint-only read preserves frame rejection metadata without changing its draft authority', () => {
+  const main = { success: true, hasDraft: false, source: 'headless-main', frameIdentity: frame(141) };
+  for (const writeSeq of [100, 141, 142]) {
+    const renderer = { success: true, hasDraft: true, preview: 'real text or old hint', frameIdentity: frame(writeSeq) };
+    const result = mergeCodexDraftAuthority(main, renderer);
+    assert.equal(result.hasDraft, false, 'positive promotion remains explicitly opt-in');
+    assert.equal(isExpectedStaleCodexDraftObservation(main, renderer, result), writeSeq < 141);
+    assert.equal(result.rendererPositiveIgnored, writeSeq < 141 ? 'renderer-frame-behind' : undefined);
+  }
+  for (const mergeRendererPositive of [false, undefined, 'true', 1]) {
+    assert.equal(mergeCodexDraftAuthority(main, {
+      success: true, hasDraft: true, frameIdentity: frame(141),
+    }, { mergeRendererPositive }).hasDraft, false, 'only boolean true enables promotion');
+  }
+});
+
 test('unscoped or replaced renderer frame cannot veto current main empty proof', () => {
   for (const frameIdentity of [undefined, frame(43, 'old-pty'), { generation: 'current-pty', writeSeq: null }]) {
     const result = mergeCodexDraftAuthority(

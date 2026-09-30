@@ -118,6 +118,9 @@ export async function runAgentSendFlow({
           status: 'not-submitted',
           code: error.code || 'agent_send_preflight_failed',
           error: String(error.message || error),
+          ...(error.manualActionRequired === true ? {
+            manualActionRequired: true, manualActionType: error.manualActionType,
+          } : {}),
           sendFlowPhase: snapshot.phase,
           sendFlowTrace: snapshot.trace,
           ...(error.draftTransfer ? { draftTransfer: error.draftTransfer } : {}),

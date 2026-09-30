@@ -1,0 +1,32 @@
+:root {
+  --work-context-accent: #a78bfa;
+  --work-context-segment: #382b55;
+  --work-context-border: #62517f;
+  --work-context-background: #242426;
+  --work-context-text: #dedee3;
+}
+
+/* The neutral body distinguishes updates from fully tinted saved prompts.
+   The icon segment is paint only: it cannot change chip height or wrapping. */
+.cb-composer-chip.cb-composer-chip--prompt.hp-context-update-chip {
+  position: relative;
+  color: var(--work-context-text);
+  border-color: var(--work-context-border);
+  background: var(--work-context-background);
+}
+.hp-context-update-chip::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 23px;
+  background: var(--work-context-segment);
+  border-right: 1px solid var(--work-context-border);
+  border-radius: inherit;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  pointer-events: none;
+}
+.hp-context-update-chip .cb-composer-chip-leading {
+  position: relative;
+  color: var(--work-context-accent);
+}

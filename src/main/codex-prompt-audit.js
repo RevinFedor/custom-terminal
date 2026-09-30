@@ -508,9 +508,10 @@ function consumeCodexUserMessageAuditChunk({
   incomingStartOffset = 0,
   partial = '',
   partialStartOffset = null,
+  preservePartialBytes = false,
 } = {}) {
-  const incoming = Buffer.from(String(chunk || ''), 'utf8');
-  const carried = Buffer.from(String(partial || ''), 'utf8');
+  const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk || ''), 'utf8');
+  const carried = Buffer.isBuffer(partial) ? partial : Buffer.from(String(partial || ''), 'utf8');
   const combined = carried.length > 0
     ? Buffer.concat([carried, incoming])
     : incoming;
@@ -560,7 +561,7 @@ function consumeCodexUserMessageAuditChunk({
   const remaining = combined.subarray(lineStart);
   return {
     records,
-    partial: remaining.toString('utf8'),
+    partial: preservePartialBytes ? Buffer.from(remaining) : remaining.toString('utf8'),
     partialStartOffset: combinedStartOffset + lineStart,
   };
 }

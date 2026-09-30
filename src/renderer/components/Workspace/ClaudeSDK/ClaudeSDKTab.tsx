@@ -3566,7 +3566,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
                 }}
               >
                 <div
-                  className="w-7 h-7 rounded-full border-2 border-[#333] border-t-[#DA7756]"
+                  className="noted-infinite-animation w-7 h-7 rounded-full border-2 border-[#333] border-t-[#DA7756]"
                   style={{ animation: 'spin 0.9s linear infinite' }}
                 />
                 <div className="mt-3 text-[0.85em] text-[#666] select-none">
@@ -4019,7 +4019,7 @@ const CompactingLoader = () => {
       </div>
       <div className="relative h-[6px] w-full rounded-full bg-[#1a1a1a] overflow-hidden">
         <div
-          className="absolute h-full w-[40%] rounded-full"
+          className="noted-infinite-animation absolute h-full w-[40%] rounded-full"
           style={{
             background: 'linear-gradient(90deg, transparent 0%, #DA7756 50%, transparent 100%)',
             animation: 'sdk-compact-bar 1.8s linear infinite',

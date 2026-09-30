@@ -219,6 +219,7 @@ test('actual main audit→SQLite→orchestration→actual StopFailure publicatio
     taskTurnSnapshot: { generation: 23, startedAt: h.executionContext.startedAt },
     taskCompletionMeta: {}, hookEventTs: Date.now(), session_id: 'S', ppid: '27889',
     internalAgentContinuationKind: null, prevSpinner: true, console: quiet,
+    observeClaudeAccessOutcome() {}, getTerminalLifecycleGeneration: () => 'G',
     claudeLocalCommandWatchers: new Map(), clearClaudePtyCompactProofAttempt() {},
     mainWindow: { isDestroyed: () => false, webContents: { send: (type, data) => renderer.push({ type, data }) } },
     getCombinedTabBackgroundWorkCount: () => 1, _webBroadcast: (_id, payload) => web.push(payload) });

@@ -56,6 +56,31 @@ export function captureTabRestorePlacement(state, workspace, tabId) {
   return { version: 1, id, sidebar, window };
 }
 
+export function captureWindowCloseScope(state, paneIndex) {
+  const pane=state.splitPanes?.[paneIndex];
+  return pane ? {spaceId:state.activeSpaceId,windowId:pane.windowId || null,paneIndex} : null;
+}
+export function resolveWindowCloseScope(state, scope) {
+  if (!scope) return null;
+  const active=scope.spaceId===state.activeSpaceId;
+  const layout=active?state:state.spaces?.find(space=>space.id===scope.spaceId)?.layout;
+  if (!layout) return null;
+  const panes=layout.splitPanes || [];
+  const index=scope.windowId?panes.findIndex(p=>p.windowId===scope.windowId):scope.paneIndex;
+  if (!panes[index] || (!scope.windowId && panes[index].windowId)) return null;
+  return {panes,index};
+}
+// New removals share a monotonic order with Full's durable restore metadata.
+// Old detached rows have no timestamp: keep their own order, but do not let an
+// unknown date override a dated archive (the reported 919 -> 834 failure).
+export function chooseWindowCloseAction(detached, archived) {
+  if (!detached) return archived ? {kind:'archive',entry:archived} : null;
+  if (!archived) return {kind:'detach',entry:detached};
+  const localOrder=Number.isSafeInteger(detached.closedOrder)?detached.closedOrder:0;
+  return localOrder > Number(archived.closedOrder || 0)
+    ? {kind:'detach',entry:detached} : {kind:'archive',entry:archived};
+}
+
 // Closing a parent promotes only its direct children. Keep a separate undo
 // relation, so they stay usable while it is closed, even across restart.
 export function tabsAfterClose(tabs, tabId, rememberParent = true) {

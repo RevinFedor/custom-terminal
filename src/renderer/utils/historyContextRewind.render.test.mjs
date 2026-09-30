@@ -31,11 +31,19 @@ new Function('require', 'module', 'exports', compile(fs.readFileSync(
   new URL('../../../packages/claude-blocks/src/components/ComposerFrame.tsx', import.meta.url), 'utf8',
 )))(require, componentModule, componentModule.exports);
 const { ComposerChip } = componentModule.exports;
+const contextChipSource = fs.readFileSync(new URL('../components/Workspace/TabContextUpdates.tsx', import.meta.url), 'utf8');
+const contextAst = ts.createSourceFile('TabContextUpdates.tsx', contextChipSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const chipPropsDeclaration = contextAst.statements.flatMap(node => ts.isVariableStatement(node)
+  ? [...node.declarationList.declarations] : []).find(node => node.name.getText(contextAst) === 'contextUpdateChipProps');
+assert.ok(chipPropsDeclaration);
+const chipPropsContext = vm.createContext({ React, ...icons });
+vm.runInContext(compile('const ' + chipPropsDeclaration.getText(contextAst) + ';')
+  + '\nthis.props = contextUpdateChipProps;', chipPropsContext);
 const update = { id: 'update-chip', kind: 'prompt', label: 'Состояние вкладки',
   contextUpdateId: 'file-context-exact-source', text: 'Exact saved diff\nincluding <saved_prompt>example<\\/saved_prompt>' };
 const ordinary = { id: 'library-chip', kind: 'prompt', label: 'Состояние вкладки', text: 'Ordinary library prompt' };
 
-test('actual Rewind reconstruction and actual composer band preserve orange context type alongside purple prompts', () => {
+test('actual Rewind reconstruction and composer band preserve the distinct context segment alongside saved prompts', () => {
   const transport = serializeComposerDraft({ text: 'User draft', chips: [update, ordinary] });
   const restored = restoreComposerDraftFromHistoryPresentation({ text: transport });
   assert.equal(restored.chips[0].contextUpdateId, update.contextUpdateId);
@@ -43,10 +51,11 @@ test('actual Rewind reconstruction and actual composer band preserve orange cont
   assert.equal(serializeComposerDraft(restored), transport);
   const discarded = [];
   const context = vm.createContext({ React, ...icons, ComposerChip,
-    WORK_CONTEXT_COLOR: '#e9a345', promptChipDisplayLabel,
+    contextUpdateChipProps: chipPropsContext.props, promptChipDisplayLabel,
     composerPromptChips: restored.chips, contextUpdates: [],
     TabContextUpdateChip: () => { throw new Error('restored snapshots must not invent pending DB updates'); },
     historyComposerStatusRise: () => 0, historyTranscriptFontSize: 14,
+    promptBandRightInset: 12,
     HISTORY_SERVICE_TEXT_RATIO: 0.9, HISTORY_SERVICE_TEXT_WEIGHT: 600,
     historyComposerPromptBandLayout: {
       gapPx: 5,
@@ -63,10 +72,11 @@ test('actual Rewind reconstruction and actual composer band preserve orange cont
   vm.runInContext(script, context);
   const chips = React.Children.toArray(context.band.props.children);
   assert.equal(chips.length, 2);
-  assert.equal(chips[0].props.style.color, '#e9a345');
+  assert.equal(chips[0].props.className, 'hp-context-update-chip');
+  assert.equal(chips[1].props.className, undefined);
   assert.equal(chips[1].props.style, undefined);
   const html = renderToStaticMarkup(context.band);
-  assert.match(html, /color:#e9a345/);
+  assert.match(html, /hp-context-update-chip/);
   assert.match(html, /lucide-refresh-cw/);
   assert.match(html, /Обновление рабочего состояния/);
   assert.equal(chips[0].props.trailing, undefined);

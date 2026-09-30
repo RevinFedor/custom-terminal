@@ -1,6 +1,7 @@
 import { resolveTabTerminalPrimary, useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { resolvePtyAgentOwner } from './ptyAgentOwner.mjs';
+import { uiPerformancePhase } from './uiPerformanceDiagnostics.mjs';
 
 function focusedEditableBelongsToUser(): boolean {
   const active = document.activeElement as HTMLElement | null;
@@ -117,6 +118,10 @@ function dispatchTabPrimaryInputFocus(tabId: string, reason: string): void {
     || ui.historyPanelOpenTabs[tabId] === true
   );
   if (historyOwnsInput) {
+    const dispatchStartedAt = performance.now();
+    uiPerformancePhase('primary-focus-dispatch-start', { tab: tabId, reason });
+    focusDiag('phase=dispatch-start tab=' + tabId.slice(-12) + ' target=history'
+      + ' startAbs=' + (performance.timeOrigin + dispatchStartedAt).toFixed(1));
     window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
       // History clamps these values to its current text length. Supplying an
       // explicit range makes navigation focus deterministic instead of
@@ -129,7 +134,8 @@ function dispatchTabPrimaryInputFocus(tabId: string, reason: string): void {
         selectionEnd: Number.MAX_SAFE_INTEGER,
       },
     }));
-    focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=history');
+    focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=history'
+      + ' dispatchMs=' + (performance.now() - dispatchStartedAt).toFixed(1));
     focusDiag('phase=result tab=' + tabId.slice(-12) + ' target=history');
     return;
   }

@@ -260,6 +260,9 @@ async function buildScenarioBundle() {
   global.window = { require: () => ({ ipcRenderer }) };
   const built = await esbuild.build({
     stdin: { contents: wrapper, loader: 'ts', resolveDir: repoDir, sourcefile: 'record-context-wrapper.ts' },
+    // This harness executes scenario/IPC behavior, not CSS or layout. The
+    // shared context adapter now imports its stylesheet in normal bundles.
+    loader: { '.css': 'empty' },
     bundle: true, write: false, platform: 'node', format: 'cjs', target: 'node20', logLevel: 'silent', plugins: [plugin],
   });
   const loaded = new Module(path.join(repoDir, 'record-context-wrapper.cjs'), module);

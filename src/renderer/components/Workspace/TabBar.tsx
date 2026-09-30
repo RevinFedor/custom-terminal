@@ -42,13 +42,19 @@ import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import {
   resolveTabCompletionNotificationShadow,
   TabCompletionNotificationAlert,
+  TabCompletionNotificationBadge,
+  TabCompletionNotificationIcon,
+  TAB_COMPLETION_NOTIFICATION_INSET_PX,
   TabProcessBar,
   TabStatusMarkerButton,
   TabSessionAvailabilityMarker,
   TabTopLeftSignals,
+  TabContextUpdateBadge,
+  TAB_CONTEXT_UPDATE_INSET_PX,
   useTabCompletionNotificationDismissing,
   useTabContextUsage,
 } from './TabSignals';
+import { useTabWorkContext } from '../../utils/tabWorkContext';
 import {
   getTabSessionAvailabilitySnapshot,
   resolveTabSessionDescriptor,
@@ -114,7 +120,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, Inbox, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, FileText, Inbox, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
 import {
   normalizeSelectedVisualRootIds,
   orderVisualHierarchyItems,
@@ -1056,6 +1062,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
           // user sees that a stop is actually happening even after moving away.
           <Tooltip content="Stopping…">
           <div
+            className="noted-infinite-animation"
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -1098,6 +1105,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
           // Claude/Gemini tabs show spinning arc when busy
           ((commandType === 'claude' || commandType === 'gemini' || commandType === 'codex') && (isBusy || isSendPending)) ? (
             <span
+              className="noted-infinite-animation"
               style={{
                 display: 'block',
                 width: '8px',
@@ -1243,6 +1251,7 @@ const TabItem = memo(({
   sessionStatus,
   completionNotificationArmed = false,
   completionNotificationFired = false,
+  completionNotificationPersistent = false,
   restartAfterFallbackCommand = null,
   onCommandHistoryOpen,
   disableLegacyDnd = false,
@@ -1523,6 +1532,7 @@ const TabItem = memo(({
   // SDK Claude override на 0.30 (выше PTY claude 0.20) → SDK active = 0.55 vs PTY active = 0.45,
   // SDK явно светлее/жёлтее на одинаковом #252526 фоне.
   const isVerticalMode = !isHorizontal;
+  const hasContextUpdate = useTabWorkContext(tab.id).pendingCount > 0;
   const taskStatusMarkerShape = useUIStore((s) => s.taskStatusMarker.shape);
   const taskStatuses = useUIStore((s) => s.taskStatuses);
   const taskStatusById = useMemo(
@@ -1539,7 +1549,8 @@ const TabItem = memo(({
     && (activeTaskPlanItems.length > 0 || archivedTaskPlanItems.length > 0);
   const verticalPaddingTop = showTaskMarkerLane ? Math.max(0, tabGeo.paddingY - 2) : tabGeo.paddingY;
   const verticalPaddingBottom = showTaskMarkerLane ? tabGeo.paddingY + 2 : tabGeo.paddingY;
-  const taskMarkerLaneLeft = tabGeo.paddingLeft;
+  const contextSignalInset = hasContextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 0;
+  const taskMarkerLaneLeft = Math.max(tabGeo.paddingLeft, contextSignalInset);
   const taskMarkerLaneRight = archivedTaskPlanItems.length > 0
     ? TASK_ARCHIVE_RIGHT_INSET_PX + TASK_ARCHIVE_COUNTER_SIZE_PX + TASK_MARKER_SECONDARY_GAP_PX
     : tabGeo.paddingX;
@@ -1640,6 +1651,7 @@ const TabItem = memo(({
   //   достаточно резервировать ~20px слева.
   const dragLiftActive = isVerticalMode && (isPressing || isDragging || isDraggedRoot);
   const completionNotificationWaiting = completionNotificationArmed && !completionNotificationFired;
+  const hasCompletionNotification = completionNotificationArmed || completionNotificationPersistent || completionNotificationFired;
   const completionNotificationDismissing = useTabCompletionNotificationDismissing(completionNotificationFired);
   const completionNotificationShadow = resolveTabCompletionNotificationShadow({
     armed: completionNotificationWaiting,
@@ -1676,7 +1688,7 @@ const TabItem = memo(({
     padding: isCollapsed
       ? '0'
         : ((isVerticalMode
-          ? `${verticalPaddingTop}px ${tabGeo.paddingX}px ${verticalPaddingBottom}px ${tabGeo.paddingLeft}px`
+          ? `${verticalPaddingTop}px ${Math.max(tabGeo.paddingX, hasCompletionNotification ? TAB_COMPLETION_NOTIFICATION_INSET_PX : 0)}px ${verticalPaddingBottom}px ${Math.max(tabGeo.paddingLeft, contextSignalInset)}px`
           // SDK tabs: left gutter 32px (matches PTY claude — keeps the green dot
           // the same distance from the left edge so adjacent PTY+SDK tabs align
           // perfectly).
@@ -2211,11 +2223,13 @@ const TabItem = memo(({
                   нижней. Рисуется независимо от полоски: Fast может быть
                   доказан и когда процесс уже не идёт. */}
               <TabTopLeftSignals
-                tabId={tab.id}
                 fastActive={codexFastActive}
                 contextPct={tabContextPct}
                 muted={sessionSignalsMuted}
               />
+              <TabContextUpdateBadge active={hasContextUpdate} />
+              <TabCompletionNotificationBadge armed={completionNotificationArmed}
+                persistent={completionNotificationPersistent} fired={completionNotificationFired} />
               {/* Context + Fast already share one top-left lane above. */}
               {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
                   rendered above). The whole-tab background pulse was removed —
@@ -2438,6 +2452,7 @@ const TabItem = memo(({
             >
               {isBusy ? (
                 <span
+                  className="noted-infinite-animation"
                   style={{
                     display: 'block',
                     width: '8px',
@@ -2862,6 +2877,7 @@ const TabItem = memo(({
                 <RotateCw
                   size={11}
                   strokeWidth={2.2}
+                  className="noted-infinite-animation"
                   style={isStopping ? { animation: 'tab-dot-spin 0.8s linear infinite' } : undefined}
                   aria-hidden
                 />
@@ -9559,6 +9575,7 @@ function TabBar({
                       isViewingSubAgent={viewingSubAgentParentId === tab.id}
                       completionNotificationArmed={!!tab.completionNotificationArmed}
                       completionNotificationFired={!!tab.completionNotificationFired}
+                      completionNotificationPersistent={!!tab.completionNotificationPersistent}
                     />
                   </div>
                 );
@@ -9673,6 +9690,7 @@ function TabBar({
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
                     completionNotificationArmed={!!tab.completionNotificationArmed}
                     completionNotificationFired={!!tab.completionNotificationFired}
+                    completionNotificationPersistent={!!tab.completionNotificationPersistent}
                   />
                 );
                 if (!visualDepth && !horizontalIntent) return tabNode;
@@ -10222,6 +10240,7 @@ function TabBar({
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
                     completionNotificationArmed={!!tab.completionNotificationArmed}
                     completionNotificationFired={!!tab.completionNotificationFired}
+                    completionNotificationPersistent={!!tab.completionNotificationPersistent}
                   />
                 ))}
               </div>
@@ -10747,6 +10766,8 @@ function TabBar({
                       <button
                         data-context-menu-row="compact"
                         data-tab-context-action="notify-once"
+                        aria-label={notificationTitle}
+                        aria-pressed={oneShotActive}
                         className="flex-1 basis-0 min-w-0 text-[13px] hover:bg-white/10 cursor-pointer flex items-center justify-center"
                         style={{
                           ...CONTEXT_MENU_COMPACT_ROW_STYLE,
@@ -10759,17 +10780,19 @@ function TabBar({
                           setContextMenu(null);
                         }}
                       >
-                        <Bell size={13} style={{ color: tint, flexShrink: 0 }} />
+                        <TabCompletionNotificationIcon color={tint} />
                       </button>
                     </Tooltip>
                     <Tooltip content={isPersistent ? 'Постоянные уведомления включены' : 'Включать уведомление для каждого нового запроса'}>
                       <button
                         data-context-menu-row="compact"
                         data-tab-context-action="notify-persistent"
+                        aria-label="Уведомления для каждого нового запроса"
+                        aria-pressed={isPersistent}
                         className="flex-1 basis-0 min-w-0 text-[12px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
                         style={{
                           ...CONTEXT_MENU_COMPACT_ROW_STYLE,
-                          color: isPersistent ? '#fecaca' : '#777',
+                          color: isPersistent ? '#f87171' : '#777',
                           backgroundColor: isPersistent ? 'rgba(239, 68, 68, 0.16)' : 'transparent',
                         }}
                         onClick={(e) => {
@@ -10778,7 +10801,7 @@ function TabBar({
                           setContextMenu(null);
                         }}
                       >
-                        <BellRing size={13} fill={isPersistent ? 'rgba(239, 68, 68, 0.35)' : 'none'} />
+                        <TabCompletionNotificationIcon persistent />
                       </button>
                     </Tooltip>
                   </div>

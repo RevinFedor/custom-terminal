@@ -106,6 +106,25 @@ function codexCall(callId, tool, args, source = {}) {
   };
 }
 
+test('manual context publication rejects its own author but keeps peer and external updates', async (t) => {
+  const h = await openHarness(t, 'Context\n');
+  if (!h) return;
+  const { context, owner } = h;
+  const revision = context.get(owner.tabId).revision;
+  assert.throws(() => context.publish(owner.tabId, {
+    sourceTabId: owner.tabId, title: 'Own checkpoint', text: 'Already known', requestId: 'self',
+  }), (error) => error.code === 'context_update_self_target' && error.statusCode === 400);
+  assert.equal(context.get(owner.tabId).pendingCount, 0);
+  assert.equal(context.get(owner.tabId).revision, revision);
+
+  const peer = { sourceTabId: 'other-tab', title: 'Peer checkpoint', text: 'New fact', requestId: 'peer' };
+  const accepted = context.publish(owner.tabId, peer);
+  assert.deepEqual(context.publish(owner.tabId, peer), { updateId: accepted.updateId, deduplicated: true });
+  assert.equal(context.get(owner.tabId).pendingCount, 1);
+  context.publish(owner.tabId, { title: 'External checkpoint', text: 'External client fact' });
+  assert.equal(context.get(owner.tabId).pendingCount, 2);
+});
+
 test('a path-first prompt includes pending context; only a standalone command leaves it pending', async t => {
   const h = await openHarness(t, '# Work\nbefore\n');
   if (!h) return;

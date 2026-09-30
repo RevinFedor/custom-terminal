@@ -291,7 +291,7 @@ export default memo(function SemanticSearchSection({ projectPath }: SemanticSear
         {/* Loading */}
         {searching && (
           <div className="flex items-center justify-center py-4 text-[#818cf8] text-xs gap-2">
-            <Loader2 size={14} style={{ animation: 'spinner-rotate 1s linear infinite' }} />
+            <Loader2 size={14} className="noted-infinite-animation" style={{ animation: 'spinner-rotate 1s linear infinite' }} />
             Searching...
           </div>
         )}

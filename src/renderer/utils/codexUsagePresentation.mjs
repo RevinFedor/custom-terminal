@@ -59,3 +59,18 @@ export function visibleCodexResetCredits(snapshot, nowMs = Date.now()) {
     }))
     .sort((left, right) => Date.parse(left.expires_at) - Date.parse(right.expires_at));
 }
+
+export function codexCreditExpirySummary(credits, snapshot, nowMs = Date.now()) {
+  if (credits?.unlimited || !snapshot || !(credits?.balance > 0)
+    || Math.abs(credits.balance - snapshot.balance) > 0.000001
+    || !Number.isFinite(Date.parse(snapshot.fetchedAt))
+    || nowMs - Date.parse(snapshot.fetchedAt) > 6 * 60_000) return null;
+  const expirations = (Array.isArray(snapshot.expirations) ? snapshot.expirations : [])
+    .filter(row => row?.amount > 0 && Number.isFinite(Date.parse(row.expiresAt)))
+    .sort((a, b) => Date.parse(a.expiresAt) - Date.parse(b.expiresAt));
+  const first = expirations[0];
+  if (!first) return null;
+  // An already expired bucket cannot describe the still displayed balance.
+  if (Date.parse(first.expiresAt) <= nowMs) return null;
+  return { ...first, allCredits: Math.abs(first.amount - credits.balance) < 0.000001 };
+}

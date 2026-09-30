@@ -5,11 +5,11 @@ import type { AgentLifecycleSummary } from './agentLifecycleSummary';
 // Controls share the caption's baseline and colour, without nested warning
 // boxes or button text that can wrap below a small composer annotation.
 export default function AgentLifecycleActions({ lifecycle }: { lifecycle: AgentLifecycleSummary | null }) {
-  if (!lifecycle || !['error', 'warning'].includes(lifecycle.kind)) return null;
+  if (!lifecycle || !['error', 'warning', 'info'].includes(lifecycle.kind)) return null;
   const style: React.CSSProperties = {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
     width: 16, height: 16, padding: 0, margin: 0, flexShrink: 0,
-    border: 0, background: 'transparent', color: lifecycle.kind === 'warning' ? '#fbbf24' : '#ef4444', lineHeight: 0,
+    border: 0, background: 'transparent', color: lifecycle.kind === 'info' ? '#60a5fa' : lifecycle.kind === 'warning' ? '#fbbf24' : '#ef4444', lineHeight: 0,
     cursor: 'pointer', pointerEvents: 'auto',
   };
   return <>

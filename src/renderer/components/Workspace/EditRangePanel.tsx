@@ -455,9 +455,9 @@ export default function EditRangePanel({
           padding: '24px',
         }}>
           <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
-            <div style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#ec4899', animation: 'bounce 1s infinite', animationDelay: '-0.3s' }} />
-            <div style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#ec4899', animation: 'bounce 1s infinite', animationDelay: '-0.15s' }} />
-            <div style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#ec4899', animation: 'bounce 1s infinite' }} />
+            <div className="noted-infinite-animation" style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#ec4899', animation: 'bounce 1s infinite', animationDelay: '-0.3s' }} />
+            <div className="noted-infinite-animation" style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#ec4899', animation: 'bounce 1s infinite', animationDelay: '-0.15s' }} />
+            <div className="noted-infinite-animation" style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#ec4899', animation: 'bounce 1s infinite' }} />
           </div>
           <span style={{ fontSize: '12px', fontWeight: 600, color: '#ec4899' }}>Применяю откат...</span>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '8px' }}>
@@ -466,7 +466,7 @@ export default function EditRangePanel({
                 {step.status === 'done' ? (
                   <Check size={12} color="#4ade80" />
                 ) : step.status === 'active' ? (
-                  <div style={{ width: 12, height: 12, borderRadius: '50%', border: '2px solid #ec4899', borderTopColor: 'transparent', animation: 'spin 0.8s linear infinite' }} />
+                  <div className="noted-infinite-animation" style={{ width: 12, height: 12, borderRadius: '50%', border: '2px solid #ec4899', borderTopColor: 'transparent', animation: 'spin 0.8s linear infinite' }} />
                 ) : (
                   <div style={{ width: 12, height: 12, borderRadius: '50%', border: '2px solid #444' }} />
                 )}
@@ -722,9 +722,9 @@ export default function EditRangePanel({
             <div className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-glow-blue" />
             <span style={{ fontSize: '11px', color: '#a8c7fa', fontWeight: 'bold', letterSpacing: '0.05em' }}>THINKING...</span>
             <div style={{ display: 'flex', gap: '3px', marginLeft: 'auto' }}>
-              <div style={{ width: 4, height: 4, borderRadius: '50%', backgroundColor: '#a8c7fa', animation: 'bounce 1s infinite', animationDelay: '-0.3s' }} />
-              <div style={{ width: 4, height: 4, borderRadius: '50%', backgroundColor: '#a8c7fa', animation: 'bounce 1s infinite', animationDelay: '-0.15s' }} />
-              <div style={{ width: 4, height: 4, borderRadius: '50%', backgroundColor: '#a8c7fa', animation: 'bounce 1s infinite' }} />
+              <div className="noted-infinite-animation" style={{ width: 4, height: 4, borderRadius: '50%', backgroundColor: '#a8c7fa', animation: 'bounce 1s infinite', animationDelay: '-0.3s' }} />
+              <div className="noted-infinite-animation" style={{ width: 4, height: 4, borderRadius: '50%', backgroundColor: '#a8c7fa', animation: 'bounce 1s infinite', animationDelay: '-0.15s' }} />
+              <div className="noted-infinite-animation" style={{ width: 4, height: 4, borderRadius: '50%', backgroundColor: '#a8c7fa', animation: 'bounce 1s infinite' }} />
             </div>
           </div>
         )}

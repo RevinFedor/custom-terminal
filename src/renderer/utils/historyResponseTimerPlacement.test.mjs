@@ -26,7 +26,8 @@ test('one-second ticks are isolated inside the O(1) footer component', () => {
 });
 
 test('group headers do not confuse summed thinking with response work time', () => {
-  assert.doesNotMatch(source, /hp-history-group-think/);
+  // The later thinking-count icon is not the removed summed-duration label.
+  assert.doesNotMatch(source, /hp-history-group-think(?![\w-])/);
   assert.doesNotMatch(source, />\{thinkingLabel\}<\/span>/);
 });
 

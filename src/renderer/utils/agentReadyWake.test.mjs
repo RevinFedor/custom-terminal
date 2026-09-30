@@ -5,6 +5,8 @@ import { EventEmitter } from 'node:events';
 import { stripTypeScriptTypes } from 'node:module';
 import test from 'node:test';
 import sendTargetContract from '../../shared/agent-send-target-precondition.cjs';
+import manualActionContract from '../../shared/agent-manual-action.cjs';
+import { runAgentSendFlow } from './agentSendFlow.mjs';
 
 const preparation = fs.readFileSync(new URL('./agentSendPreparation.ts', import.meta.url), 'utf8');
 const history = fs.readFileSync(new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url), 'utf8');
@@ -25,7 +27,7 @@ function harness(toolType = 'codex') {
     preparation.indexOf('export async function proveAgentComposerForSend('));
   const api = vm.runInNewContext(stripTypeScriptTypes(body.replace(/\bexport /g, ''))
     + '\n({ createAgentReadyWait, prepareAgentRuntimeForSend })', {
-    ...sendTargetContract,
+    ...sendTargetContract, manualActionContract,
     ipcRenderer, Date: { now: () => now }, console: { log() {}, warn() {} },
     setTimeout: (callback, ms) => { const id = ++serial; timers.set(id, { callback, ms }); return id; },
     clearTimeout: id => timers.delete(id),
@@ -94,6 +96,44 @@ test('a still-open menu times out with no launch or input; cancellation cleans a
   await tick(); c.cancel(); await cancelled;
   assert.equal(c.ipcRenderer.eventNames().length, 0);
   assert.equal(c.timers.size, 0);
+});
+
+const manualGoal = { status: 'active', inputReady: false, manualActionRequired: true,
+  manualActionType: 'resume-goal', runtimePolicy: { type: 'resume-goal', phase: 'manual' },
+  lastNotReady: { reason: 'codex_resume_goal_action_required', blockers: ['resume-goal'], message: 'Завершите выбор для Goal в терминале.' } };
+
+for (const cold of [false, true]) test('known Goal choice ends unwritten Send, not a timeout or late auto-send; cold=' + cold, async () => {
+  const h = harness();
+  if (cold) {
+    h.setState({ status: 'inactive', inputReady: false });
+    const resume = h.runtime.resume;
+    h.runtime.resume = async (...args) => { const result = await resume(...args); h.setState(manualGoal); return result; };
+  } else h.setState(manualGoal);
+  let pasteCalls = 0;
+  const pending = runAgentSendFlow({ prepareContext: async () => ({}), ensureReady: () => h.start(),
+    proveComposer: async () => { pasteCalls++; }, runProviderOperation: async () => { pasteCalls++; } });
+  await assert.rejects(pending, error => {
+    assert.equal(error.code, 'codex_resume_goal_action_required');
+    assert.equal(error.sendReceipt.status, 'not-submitted');
+    assert.equal(error.sendReceipt.manualActionRequired, true);
+    assert.equal(manualActionContract.isAgentManualActionPreSubmit(error), true);
+    return true;
+  });
+  assert.equal(h.resumes, cold ? 1 : 0);
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.ipcRenderer.eventNames().length, 0);
+  h.setState({ status: 'active', inputReady: true });
+  h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
+  await tick(); assert.equal(pasteCalls, 0, 'a later user choice cannot resume the cancelled send');
+});
+
+test('Goal policy manual transition wakes the same pending Send and releases listeners immediately', async () => {
+  const h = harness(); const pending = h.start();
+  const rejected = assert.rejects(pending, error => error.code === 'codex_resume_goal_action_required');
+  await tick(); h.setState(manualGoal);
+  h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex', source: 'runtime-policy' });
+  await rejected;
+  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
 });
 
 test('normal History Send leaves draft proof after readiness in the common scenario', () => {

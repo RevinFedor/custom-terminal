@@ -249,9 +249,27 @@ test('unknown process ownership still refuses before slash write', async () => {
   const result = await h.compact();
   assert.equal(result.success, false);
   assert.equal(result.submitted, false);
+  assert.equal(result.error, 'agent_send_target_unresolved');
   assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId), null);
   assert.equal(h.events.some(event => event.startsWith('write:')), false);
   assert.equal(h.events.some(event => event.startsWith('reconcile-error:')), false);
+});
+
+test('tab34: an unresolved earlier Rewind is not reported as a proven conversation change', async () => {
+  const h = harness();
+  h.context.codexLastRunCommandPayload.delete(h.tabId);
+  h.context.codexSessionDiscoveryIntents.set(h.tabId, {
+    sourceMode: 'writer-handoff', sourceSessionId: h.sessionId,
+    launchId: 'codex-writer-handoff-unsettled',
+  });
+  h.candidate.status = 'ambiguous';
+  const result = await h.compact();
+  assert.equal(result.error, 'agent_send_target_unresolved', JSON.stringify(result));
+  assert.equal(result.submitted, false);
+  assert.equal(result.pasteWritten, false);
+  assert.equal(result.enterWritten, false);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId), null);
+  assert.equal(h.events.some(event => event.startsWith('write:')), false);
 });
 
 test('a replacement during process inspection cannot admit the old slash target', async () => {

@@ -112,12 +112,16 @@ function mergeCodexDraftAuthority(headlessState, rendererState, {
   if (hasDefinitiveDraftState(headlessState)) {
     if (
       headlessState.hasDraft === false
-      && mergeRendererPositive === true
       && hasDefinitiveDraftState(rendererState)
       && rendererState.hasDraft === true
     ) {
       const frameRejection = rendererDraftFrameRejection(headlessState, rendererState);
+      // The inner IPC read may request a renderer hint while main is unknown,
+      // then recover current main-empty without enabling positive promotion.
+      // Still retain WHY that older hint is ignored. Otherwise diagnostics
+      // call ordinary catch-up a protected contradiction (tab34,100→141).
       if (frameRejection) return { ...headlessState, rendererPositiveIgnored: frameRejection };
+      if (mergeRendererPositive !== true) return headlessState;
       return {
         ...headlessState,
         success: true,

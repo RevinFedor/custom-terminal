@@ -107,7 +107,7 @@ test('движок едет полем сводки, а не разбором з
 test('приоритет состояний: остановка → текущий launch/error; interrupted не рисуется', () => {
   const build = hook.slice(hook.indexOf('return useMemo<AgentLifecycleSummary | null>'));
   const iStop = build.indexOf("kind: 'stopping'");
-  const iStart = build.indexOf("isWarning ? 'warning' : presentation.isError ? 'error' : 'starting'");
+  const iStart = build.indexOf("isWarning ? 'warning' : presentation.isError ? 'error' : isInfo ? 'info' : 'starting'");
   assert.ok(iStop >= 0 && iStart >= 0);
   assert.ok(iStop < iStart, 'остановка перекрывает launch');
   // 2026-09-11: wasInterrupted больше не имеет собственной плашки/статуса —

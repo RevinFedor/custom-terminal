@@ -47,6 +47,14 @@ test('recognizes a wide Resume goal frame', () => {
   assert.equal(inspectCodexResumeGoalPrompt(frame).canAutoEnter, true);
 });
 
+test('29Sep compact footer recognizes the same complete picker, not its scrollback copy', () => {
+  const frame = narrowProductionFrame.replace('Press enter to confirm or esc to go back', 'enter select · esc back');
+  assert.equal(inspectCodexResumeGoalPrompt(frame).interactiveVisible, true);
+  assert.equal(inspectCodexResumeGoalPrompt(frame).canAutoEnter, true);
+  assert.equal(inspectCodexResumeGoalPrompt(frame + '\n› Actual composer\nGPT-6-Astra max · Context 40% used').interactiveVisible, false);
+  assert.equal(inspectCodexResumeGoalPrompt(frame.replace('  2. Leave paused', '  2. Something else')).interactiveVisible, false);
+});
+
 test('does not override a user-selected Leave paused choice', () => {
   const frame = narrowProductionFrame
     .replace('› 1. Resume goal', '  1. Resume goal')

@@ -659,6 +659,96 @@ test('usage refresh targets only the account whose numbers are being requested',
   }).refreshAllManaged, true);
 });
 
+test('fresh connected managed account stays fresh when another account is selected/current', async () => {
+  _api.resetCodexUsageStateForTests();
+  const auth = authFor('managed-fresh');
+  await _api.getCodexRemoteUsage({
+    authReader: () => auth,
+    fetchImpl: async () => fetchResponse(whamUsageFor(auth)),
+  });
+  const fresh = _api.listCodexRemoteUsageAccounts('other-account', [
+    { accountKey: auth.accountKey, status: 'connected' },
+  ]);
+  assert.equal(fresh[0].isCurrent, false);
+  assert.equal(fresh[0].stale, false);
+  assert.equal(_api.listCodexRemoteUsageAccounts('other-account', [])[0].stale, true,
+    'historical disconnected accounts remain stale');
+  await _api.getCodexRemoteUsage({
+    force: true, authReader: () => auth,
+    fetchImpl: async () => fetchResponse({}, 500),
+  });
+  assert.equal(_api.listCodexRemoteUsageAccounts('other-account', [
+    { accountKey: auth.accountKey, status: 'connected' },
+  ])[0].stale, true, 'a failed refresh preserves the old value as stale');
+  _api.resetCodexUsageStateForTests();
+});
+
+test('server Retry-After prevents automatic and manual usage requests for that account only', async () => {
+  _api.resetCodexUsageStateForTests();
+  const auth = authFor('limited');
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls++;
+    const result = fetchResponse({}, 429);
+    result.headers.get = name => name === 'retry-after' ? '300' : null;
+    return result;
+  };
+  await _api.getCodexRemoteUsage({ authReader: () => auth, fetchImpl });
+  await _api.getCodexRemoteUsage({ force: true, authReader: () => auth, fetchImpl });
+  assert.equal(calls, 1);
+  const other = authFor('healthy');
+  const result = await _api.getCodexRemoteUsage({
+    authReader: () => other,
+    fetchImpl: async () => fetchResponse(whamUsageFor(other)),
+  });
+  assert.equal(result.error, null);
+  _api.resetCodexUsageStateForTests();
+});
+
+test('credit expiry is account-scoped optional data and is excluded from persisted usage', async () => {
+  _api.resetCodexUsageStateForTests();
+  const auth = authFor('credit-expiry');
+  const store = createFakeUsageStore();
+  _api.setCodexUsageStateStoreForTests(store);
+  const result = await _api.getCodexRemoteUsage({
+    authReader: () => auth,
+    fetchImpl: async () => fetchResponse(whamUsageFor(auth)),
+    creditExpirationFetchImpl: async () => fetchResponse({ balance: '62500', expiring_balance_details: [
+      { amount_remaining: '62500', expiry_date: '2027-01-01T00:00:00Z' },
+    ] }),
+  });
+  assert.equal(result.accounts[0].credit_expiration.expirations[0].amount, 62500);
+  assert.doesNotMatch(JSON.stringify(store.snapshot()), /credit_expiration|expirations/);
+  const failed = await _api.getCodexRemoteUsage({ force: true,
+    authReader: () => auth, fetchImpl: async () => fetchResponse(whamUsageFor(auth)),
+    creditExpirationFetchImpl: async () => fetchResponse({}, 403),
+  });
+  assert.equal(failed.error, null);
+  assert.equal(failed.accounts[0].credit_expiration, null);
+  _api.resetCodexUsageStateForTests();
+});
+
+test('an account rotation during credit expiry read cannot attach the old grant to the new account', async () => {
+  _api.resetCodexUsageStateForTests();
+  const first = authFor('expiry-a');
+  const second = authFor('expiry-b');
+  let current = first;
+  const result = await _api.getCodexRemoteUsage({ authReader: () => current,
+    fetchImpl: async () => fetchResponse(whamUsageFor(current)),
+    creditExpirationFetchImpl: async (_url, options) => {
+      const isFirst = options.headers['ChatGPT-Account-Id'] === first.accountId;
+      if (isFirst) current = second;
+      return fetchResponse({ balance: isFirst ? '62500' : '500', expiring_balance_details: [
+        { amount_remaining: isFirst ? '62500' : '500', expiry_date: '2027-01-01T00:00:00Z' },
+      ] });
+    },
+  });
+  assert.equal(result.currentAccountKey, second.accountKey);
+  assert.equal(result.accounts.find(a => a.accountKey === second.accountKey).credit_expiration.balance, 500);
+  assert.equal(result.accounts.some(a => a.accountKey === first.accountKey), false);
+  _api.resetCodexUsageStateForTests();
+});
+
 test('preferred server account replaces only the matching cached account', () => {
   const cached = [
     { accountKey: 'a', timestamp: '2027-01-01T00:00:00Z', usage: { marker: 'old-a' } },

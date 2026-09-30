@@ -16,7 +16,7 @@ export interface AgentLifecycleSummary {
   // 'interrupted' удалён (2026-09-11): wasInterrupted-маркер больше не имеет
   // собственной плашки/цвета — вкладка с прерванной сессией выглядит просто
   // неактивной, ошибки автозапуска показываются тостом из AutoResume.
-  kind: 'starting' | 'stopping' | 'warning' | 'error';
+  kind: 'starting' | 'stopping' | 'info' | 'warning' | 'error';
   title: string;
   description: string;
   detail?: string | null;

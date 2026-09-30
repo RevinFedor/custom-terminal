@@ -1,5 +1,6 @@
 // Observe only this History scroller. Native behavior, return values and
 // exceptions are preserved; no geometry is read and no position is written.
+import { currentUIActionId, uiPerformancePhase } from './uiPerformanceDiagnostics.mjs';
 export function installHistoryScrollWriterDiagnostics(scroller, {
   context, log, now = () => performance.timeOrigin + performance.now(),
   schedule = callback => setTimeout(callback, 0), cancel = clearTimeout,
@@ -38,7 +39,8 @@ export function installHistoryScrollWriterDiagnostics(scroller, {
         const value = Object.getOwnPropertyDescriptor(args[0], 'behavior')?.value;
         if (['auto', 'instant', 'smooth'].includes(value)) behavior = value;
       } else { x = typeof args[0] === 'number' ? args[0] : null; y = typeof args[1] === 'number' ? args[1] : null; }
-      pending.push({ ...owner, method, x, y, behavior, limitReached: count >= maxPerGesture, calledAbs: now(),
+      uiPerformancePhase('history-scroll-write', { reason: method, x, y });
+      pending.push({ ...owner, actionId: currentUIActionId(), method, x, y, behavior, limitReached: count >= maxPerGesture, calledAbs: now(),
         stack: String(new Error().stack || '').split('\n').slice(2, 11).join('\n').slice(0, 1800) });
       if (task === null) task = schedule(flush);
     } catch {} // An unavailable diagnostic must not affect a scroll operation.

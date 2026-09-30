@@ -1,7 +1,7 @@
 'use strict';
 
 const RESUME_GOAL_TITLE_RE = /Resume\s+paused\s+goal\?/gi;
-const RESUME_GOAL_FOOTER_RE = /\bPress enter to confirm or esc to go back$/i;
+const RESUME_GOAL_FOOTER_RE = /\b(?:Press enter to confirm or esc to go back|enter\s+select\s*·\s*esc\s+back)$/i;
 const RESUME_GOAL_FIRST_SELECTED_RE = /^[\t ]*[›❯»>][\t ]*1\.[\t ]*Resume\s+goal\b/im;
 const RESUME_GOAL_SECOND_SELECTED_RE = /^[\t ]*[›❯»>][\t ]*2\.[\t ]*Leave\s+paused\b/im;
 

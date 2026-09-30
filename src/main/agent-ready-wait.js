@@ -6,6 +6,7 @@ const {
 
 const READY_EVENT = 'agent:tui-ready-internal';
 const READINESS_CHANGED_EVENT = 'agent:readiness-changed-internal';
+const { describeAgentManualAction } = require('../shared/agent-manual-action.cjs');
 
 function startupFailureFromStatus(status) {
   if (!status || typeof status !== 'object') return null;
@@ -20,22 +21,9 @@ function startupFailureFromStatus(status) {
 }
 
 function manualActionFailureFromStatus(status) {
-  if (!status) return null;
-  const blockers = Array.isArray(status.lastNotReady?.blockers)
-    ? status.lastNotReady.blockers
-    : [];
-  if (status.manualActionRequired !== true && !blockers.includes('auth-required')) {
-    return null;
-  }
-  const type = status.manualActionType;
-  // Claude startup settings already carry their exact structured failure in
-  // startupDefaultsError. Let startupFailureFromStatus preserve that code and
-  // message instead of misclassifying the generic manual flag as Codex auth.
-  if (type === 'claude-startup-settings') return null;
-  const policyDialog = ['resume-goal', 'usage-exhaustion'].includes(type);
-  const code = policyDialog ? 'codex_' + type.replace(/-/g, '_') + '_action_required' : 'codex_auth_required';
-  const failure = new Error(policyDialog ? status.lastNotReady?.message || code : code);
-  failure.code = code;
+  const action = describeAgentManualAction(status);
+  if (!action) return null;
+  const failure = Object.assign(new Error(action.message), action);
   failure.statusCode = 409;
   failure.status = status;
   return failure;

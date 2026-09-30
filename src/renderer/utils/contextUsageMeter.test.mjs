@@ -58,7 +58,7 @@ test('все три поверхности берут цвет из общего
   // Прежняя тройная тернарка в панели не должна вернуться.
   assert.doesNotMatch(bar, /contextPct > 80 \? '#ef4444'/);
   assert.match(signals, /import \{ contextUsageColor, contextUsageDisplayValue \}/);
-  assert.match(signals, /color: contextUsageColor\(pct\)/);
+  assert.match(signals, /color: muted \? SESSION_STALE_VALUE_TINT : contextUsageColor\(pct\)/);
 });
 
 test('число 8px, без знака процента, прижато к левому краю', () => {
@@ -80,7 +80,7 @@ test('число 8px, без знака процента, прижато к ле
   // (`${value}%`), и запрет по всему тексту падал именно на ней.
   assert.match(badge, /^\s*\{value\}$/m);
   assert.doesNotMatch(badge, /^\s*\{value\}%/m);
-  assert.match(badge, /title=\{`Использовано \$\{value\}% контекстного окна`\}/);
+  assert.match(badge, /title=\{muted\s*\? `Последнее известное значение:[^`]*`\s*: `Использовано \$\{value\}% контекстного окна`\}/);
   // Моноширинные цифры: иначе число дёргается при каждом изменении.
   assert.match(badge, /fontVariantNumeric: 'tabular-nums'/);
   // line-height: 1 — иначе строка свисает на ~40% кегля и уезжает на соседа.
@@ -186,7 +186,7 @@ test('кадр чужой сессии не может проставить чи
 });
 
 test('одна реализация меток используется sidebar и pane-chip', () => {
-  assert.match(tabbar, /<TabTopLeftSignals fastActive=\{codexFastActive\} contextPct=\{tabContextPct\} \/>/);
+  assert.match(tabbar, /<TabTopLeftSignals\s+fastActive=\{codexFastActive\}\s+contextPct=\{tabContextPct\}\s+muted=\{sessionSignalsMuted\}\s*\/>/);
   assert.match(tabbar, /resolveCodexFastModeState\(\{/, 'TabBar: резолвер тарифа');
   assert.match(pane, /<TabTopLeftSignals[\s\S]{0,180}minContextPct=\{50\}/);
   assert.match(pane, /useTabContextUsage\(tabId\)/);

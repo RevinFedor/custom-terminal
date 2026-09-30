@@ -791,7 +791,8 @@ test('Shift+Cmd+T возвращает именно chip, явно убранн�
   };
   const removed = emptyPaneByClosedTab([pane, p('p2', 'other')], 0, 'b');
   const remembered = rememberPaneDetachedTab(removed.panes, 0, p('p1', 'b'));
-  assert.deepEqual(paneDetachedTabs(remembered.panes[0]), [p('p1', 'b')]);
+  assert.ok(Number.isSafeInteger(paneDetachedTabs(remembered.panes[0])[0].closedOrder));
+  assert.deepEqual(paneDetachedTabs(remembered.panes[0]).map(({closedOrder,...entry})=>entry), [p('p1', 'b')]);
 
   const restored = restorePaneDetachedTab(
     remembered.panes,
@@ -815,7 +816,7 @@ test('последний chip можно вернуть в оставшийся 
 test('project transfer переписывает owner у detached chip даже в пустой pane', () => {
   const remembered = rememberPaneDetachedTab([EMPTY, p('p2', 'other')], 0, p('old', 'gone'));
   const reprojected = reprojectPaneTabs(remembered.panes, (tabId) => tabId === 'gone', 'new');
-  assert.deepEqual(paneDetachedTabs(reprojected[0]), [p('new', 'gone')]);
+  assert.deepEqual(paneDetachedTabs(reprojected[0]), [{...p('new', 'gone'),closedOrder:paneDetachedTabs(remembered.panes[0])[0].closedOrder}]);
 });
 
 // ── Полоса вкладок в одном окне ───────────────────────────────────────────

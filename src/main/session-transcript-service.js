@@ -4,6 +4,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { createHash } = require('node:crypto');
 const { getCodexProcessActionOwnershipRevision } = require('./codex-process-action-ownership');
 const { performance } = require('node:perf_hooks');
+const { searchHistoryEntries, normalizeHistorySearchType } = require('../shared/history-search.cjs');
 const { describeCodexForkPrefixFailure } = require('./codex-fork-lineage-diagnostic');
 const { codexForkCopyPayload } = require('./codex-fork-copy-payload');
 const { ipcMain } = require('node:worker_threads').isMainThread ? require('electron') : {};
@@ -1663,7 +1664,8 @@ class SessionTranscriptService {
     const sessionId = payload.sessionId;
     const query = typeof payload.query === 'string' ? payload.query : '';
     if (!sessionId) return { success: false, error: 'sessionId required', matches: [] };
-    if (query.length < 2) return { success: true, matches: [], total: 0, truncated: false };
+    const searchType = normalizeHistorySearchType(payload.type);
+    if (!query && searchType === 'all') return { success: true, ...searchHistoryEntries([], payload) };
     if (toolType !== 'codex') {
       // Claude keeps its renderer-side scan: its projections are small enough
       // to hold whole, and it has no row-window path yet.
@@ -1696,9 +1698,6 @@ class SessionTranscriptService {
       : await projectFromFile(sessionId, payload.cwd);
     if (!projected?.success) return { success: false, error: projected?.error || 'projection failed', matches: [] };
     const limit = Math.max(1, Math.min(5000, Number(payload.limit) || 2000));
-    const needle = query.toLowerCase();
-    const matches = [];
-    let total = 0;
     const contentRevision = lineage.kind === 'virtual'
       ? this._buildCodexContentRevision(sessionId, payload.cwd, projected)
       : null;
@@ -1714,24 +1713,8 @@ class SessionTranscriptService {
         matches: [],
       };
     }
-    for (let index = 0; index < entries.length; index += 1) {
-      const text = String(entries[index]?.content || '').toLowerCase();
-      if (!text) continue;
-      let at = text.indexOf(needle);
-      while (at !== -1) {
-        total += 1;
-        if (matches.length < limit) {
-          matches.push({
-            entryIndex: index,
-            entryUuid: entries[index].uuid,
-            entryRef: entries[index].entryRef || null,
-            physicalSessionId: entries[index].physicalSessionId || entries[index].sessionId || null,
-            offset: at,
-          });
-        }
-        at = text.indexOf(needle, at + 1);
-      }
-    }
+    const searchResult = searchHistoryEntries(entries, { query, type: searchType, limit, offset: payload.offset });
+    const { matches, total } = searchResult;
     console.log('[TranscriptService:HistorySearch] session=' + shortId(sessionId)
       + ' rows=' + entries.length
       + ' matches=' + total
@@ -1739,9 +1722,7 @@ class SessionTranscriptService {
       + ' ms=' + (Date.now() - startedAt));
     return {
       success: true,
-      matches,
-      total,
-      truncated: total > matches.length,
+      ...searchResult,
       rows: entries.length,
       contentRevision: contentRevision?.token || null,
       viewOwnerSessionId: sessionId,

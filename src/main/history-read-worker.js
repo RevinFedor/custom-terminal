@@ -1,13 +1,16 @@
 'use strict';
 
 const { parentPort, workerData } = require('node:worker_threads');
-for (const level of ['log', 'warn', 'error']) console[level] = (...args) => parentPort.postMessage({
-  event: 'log', level, emittedAt: Date.now(), text: args.map(value => String(value)).join(' ').slice(0, 16000),
-});
 const { AsyncLocalStorage } = require('node:async_hooks');
+const requestContext = new AsyncLocalStorage();
+for (const level of ['log', 'warn', 'error']) console[level] = (...args) => parentPort.postMessage({
+  event: 'log', level, emittedAt: Date.now(), correlation: requestContext.getStore()?.correlation,
+  text: args.map(value => String(value)).join(' ').slice(0, 16000),
+});
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const v8 = require('node:v8');
+const { performance } = require('node:perf_hooks');
 const Database = require('better-sqlite3');
 const DatabaseManager = require('./database');
 const codexData = require('./ipc/codex-data');
@@ -37,10 +40,129 @@ for (const filename of Object.keys(require.cache).filter(name => name.startsWith
   schemaHash.update(require('node:path').relative(srcRoot, filename));
   schemaHash.update(fs.readFileSync(filename));
 }
+const startupCacheDiagnostics = [];
 const cache = new HistoryPreparedCache({ directory: workerData.cacheDirectory, maxBytes: workerData.diskBudgetBytes,
+  onDiagnostic: event => { if (startupCacheDiagnostics.length < 8) startupCacheDiagnostics.push(event); },
   indexBudgetBytes: workerData.indexBudgetBytes,
   schema: '1-' + schemaHash.digest('hex').slice(0, 20) });
-const requestContext = new AsyncLocalStorage();
+const DIAGNOSTIC_SCHEMA = 1, MAX_PHASE_GROUPS = 16;
+const slowMs = Number.isFinite(workerData.diagnosticSlowMs) ? Math.max(0, workerData.diagnosticSlowMs) : 100;
+const stamp = () => { const perf = performance.now(); return { abs: performance.timeOrigin + perf, perf }; };
+const token = value => typeof value === 'string' && /^[\w.:-]{1,80}$/.test(value) ? value : 'other';
+const identity = value => value == null || value === '' ? null : token(String(value)) !== 'other' ? String(value)
+  : 'sha256:' + crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 24);
+const counters = { requests: 0, completed: 0, errors: 0, rebuilds: 0, cacheMisses: 0, cacheErrors: 0, cacheEvictions: 0, droppedPhaseGroups: 0 };
+const count = name => { counters[name] = Math.min(Number.MAX_SAFE_INTEGER, counters[name] + 1); };
+function emitDiagnostic(event, fields = {}) {
+  const now = stamp();
+  try { parentPort.postMessage({ event: 'diagnostic', diagnostic: { schema: DIAGNOSTIC_SCHEMA, side: 'worker', event,
+    clientId: workerData.diagnosticClientId || null, workerGeneration: workerData.diagnosticGeneration || 0,
+    emittedAbs: now.abs, emittedPerf: now.perf, ...fields } }); } catch {}
+}
+// A fixed-size, request-local summary. No payload, path, SQL, row identity or
+// error text is retained, and repeated row/page phases only increment counters.
+function phaseDiagnostic(event) {
+  const context = requestContext.getStore();
+  const phase = token(event.phase || event.operation), outcome = token(event.outcome), reason = token(event.reason);
+  if (outcome === 'miss') count('cacheMisses');
+  if (outcome === 'error') count('cacheErrors');
+  if (outcome === 'evicted') count('cacheEvictions');
+  const exceptional = ['miss', 'error', 'invalidated', 'evicted', 'rebuild', 'disabled', 'rejected', 'removed', 'deferred', 'skipped'].includes(outcome)
+    || event.indexOutcome === 'miss' || event.evictedCount > 0 || event.errorCount > 0;
+  if (!context) {
+    if (exceptional) emitDiagnostic('cache-background', { phase, outcome, reason });
+    return;
+  }
+  context.exceptional ||= exceptional;
+  // Fixed categories survive phase truncation, even when a late rejection
+  // follows many successful cache operations. They are observations, not proof.
+  if (exceptional) {
+    context.lastException = { phase, outcome, reason, atAbs: performance.timeOrigin + performance.now() };
+    for (const field of ['errorName', 'errorCode', 'errorModule', 'cacheVersion', 'otherVersion']) {
+      if (typeof event[field] === 'string') context.lastException[field] = token(event[field]);
+    }
+    for (const field of ['errorLine', 'errorColumn']) {
+      if (Number.isFinite(event[field])) context.lastException[field] = event[field];
+    }
+    const category = outcome === 'error' ? 'error' : reason === 'no-file' ? 'missingFile'
+      : reason === 'disk-quota' ? 'diskEvicted' : reason.includes('version') ? 'version'
+      : outcome === 'disabled' || reason === 'disabled' ? 'disabled'
+      : /^(source-|write-invalidated|invalidation)/.test(reason) ? 'sourceChange' : 'other';
+    context.cacheReasons[category] = Math.min(Number.MAX_SAFE_INTEGER, context.cacheReasons[category] + 1);
+  }
+  if (outcome === 'hit' && (event.source === 'ssd'
+    || ['readPrepared', 'readTimeline', 'readPayload', 'readContinuation', 'readVirtualProjection', 'readVirtualState'].includes(phase))) context.ssdHits++;
+  if (event.source === 'ram' && outcome === 'hit') context.ramHits++;
+  const key = phase + ':' + outcome + ':' + reason + ':' + token(event.indexReason) + ':' + token(event.errorReason);
+  let group = context.phases.get(key);
+  if (!group) {
+    if (context.phases.size >= MAX_PHASE_GROUPS) {
+      context.droppedPhaseGroups++; count('droppedPhaseGroups');
+      const ordinary = exceptional ? [...context.phases].find(([, item]) => !item.exceptional) : null;
+      if (!ordinary) return;
+      context.phases.delete(ordinary[0]);
+    }
+    const now = stamp();
+    group = { phase, outcome, reason, exceptional, count: 0, firstAbs: now.abs, lastAbs: now.abs };
+    for (const field of ['layer', 'indexOutcome', 'indexReason', 'errorReason', 'causeOperation', 'cacheVersion', 'otherVersion', 'errorName', 'errorCode', 'errorModule']) {
+      if (typeof event[field] === 'string') group[field] = token(event[field]);
+    }
+    context.phases.set(key, group);
+  }
+  group.count = Math.min(Number.MAX_SAFE_INTEGER, group.count + 1);
+  group.lastAbs = performance.timeOrigin + performance.now();
+  const started = context.cacheOperations?.findLast(item => item.operation === event.operation)?.started;
+  const now = stamp();
+  if (started) {
+    group.durationMs = (group.durationMs || 0) + now.perf - started.perf;
+    group.startAbs ??= started.abs; group.startPerf ??= started.perf;
+    group.endAbs = now.abs; group.endPerf = now.perf;
+  }
+  for (const field of ['durationMs', 'serializeMs', 'writeMs', 'bytes', 'rows', 'records', 'pageRows', 'indexBytes', 'evictedBytes', 'evictedCount']) {
+    if (field === 'durationMs' && started) continue;
+    if (Number.isFinite(event[field]) && event[field] >= 0) group[field] = Math.min(Number.MAX_SAFE_INTEGER, (group[field] || 0) + event[field]);
+  }
+  for (const field of ['snapshotBytes', 'sourceBytes', 'indexMemoryBytes', 'indexBudgetBytes', 'diskBytes', 'budgetBytes', 'errorLine', 'errorColumn']) {
+    if (Number.isFinite(event[field]) && event[field] >= 0) group[field] = event[field];
+  }
+}
+// Optional on older cache implementations; assigned AFTER initialization so
+// diagnostics cannot become constructor/proof/cache state.
+cache.onDiagnostic = phaseDiagnostic;
+for (const event of startupCacheDiagnostics) emitDiagnostic('cache-startup', {
+  ...event, cacheVersion: require('node:path').basename(cache.directory),
+});
+startupCacheDiagnostics.length = 0;
+// Cache summaries are emitted inside these operations. Their elapsed times
+// include nested codec/I/O/prune work; do not subtract or sum them as CPU time.
+for (const operation of ['readPrepared', 'savePrepared', 'readTimeline', 'saveTimeline', 'readContinuation', 'saveContinuation',
+  'readSource', 'readSourceProof', 'readPayload', 'savePayload', 'savePayloads', 'readVirtualProjection', 'saveVirtualProjection',
+  'readVirtualState', 'saveVirtualState']) {
+  const original = cache[operation];
+  cache[operation] = function (...args) {
+    const context = requestContext.getStore();
+    if (!context) return original.apply(this, args);
+    const item = { operation, started: stamp() };
+    const active = context.cacheOperations ||= [];
+    active.push(item);
+    const finish = () => { const index = active.indexOf(item); if (index >= 0) active.splice(index, 1); };
+    try {
+      const result = original.apply(this, args);
+      if (result?.then) return result.finally(finish);
+      finish(); return result;
+    } catch (error) { finish(); throw error; }
+  };
+}
+const setMeta = cache.setMeta;
+cache.setMeta = function (db, key, value, diagnostic) {
+  if (key !== 'continuation' && key !== 'virtualState') return setMeta.call(this, db, key, value, diagnostic);
+  const started = stamp(), before = { ...this.metrics };
+  try { return setMeta.call(this, db, key, value, diagnostic); }
+  finally { phaseDiagnostic({ phase: 'continuation-codec-write', outcome: 'observed', reason: key,
+    durationMs: performance.now() - started.perf, bytes: this.metrics.continuationWriteBytes - before.continuationWriteBytes,
+    serializeMs: this.metrics.continuationSerializeMs - before.continuationSerializeMs,
+    writeMs: this.metrics.continuationWriteMs - before.continuationWriteMs }); }
+};
 cache.pendingPayloads = () => requestContext.getStore()?.payloads;
 if (workerData.diagnosticStages) cache.onStage = phase => parentPort.postMessage({ event: 'cache-stage',
   sessionId: requestContext.getStore()?.payload.sessionId, ...phase });
@@ -69,6 +191,7 @@ const epochSlot = file => sourceEpochSlots.get(file) ?? 0;
 cache.assertCurrent = () => {
   const context = requestContext.getStore();
   if (context && [...context.sources].some(file => context.sourceEpochs[epochSlot(file)] !== Atomics.load(sourceEpochs, epochSlot(file)))) {
+    phaseDiagnostic({ phase: 'source-fence', outcome: 'invalidated', reason: 'source-epoch-invalidated' });
     throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
   }
 };
@@ -100,7 +223,9 @@ api.isCodexSourceSnapshotCurrent = snapshot => {
   if (context && snapshot?.filePath) {
     context.sources.add(snapshot.filePath);
     const slot = epochSlot(snapshot.filePath);
-    if (context.sourceEpochs[slot] !== Atomics.load(sourceEpochs, slot)) return false;
+    if (context.sourceEpochs[slot] !== Atomics.load(sourceEpochs, slot)) {
+      phaseDiagnostic({ phase: 'source-fence', outcome: 'invalidated', reason: 'source-epoch-invalidated' }); return false;
+    }
   }
   return originalSourceCurrent(snapshot);
 };
@@ -136,7 +261,16 @@ async function enterCold() {
   if (!context) return acquireCold();
   // Keep admission through yielded preparation/commit. Otherwise many cold
   // requests could accumulate full transient graphs while writing in turns.
-  if (!context.coldAdmission) context.coldAdmission = acquireCold().then(release => { context.coldRelease = release; });
+  if (!context.coldAdmission) {
+    const queued = stamp();
+    context.coldQueuedAbs = queued.abs; context.coldQueuedPerf = queued.perf;
+    context.coldQueueDepth = coldWaiters.length + Number(coldActive);
+    context.coldAdmission = acquireCold().then(release => {
+      const admitted = stamp();
+      context.coldAdmittedAbs = admitted.abs; context.coldAdmittedPerf = admitted.perf;
+      context.coldAdmissionMs = admitted.perf - queued.perf; context.coldRelease = release;
+    });
+  }
   await context.coldAdmission;
   return () => {}; // The owning RPC releases exactly once in its finally.
 }
@@ -148,26 +282,43 @@ api.findCodexSessionFile = async (id, cwd) => {
   if (found?.filePath) await prepareSourceEpoch(found.filePath);
   return found;
 };
-if (workerData.sessionsDir) {
-  const load = api.loadSessionRecords;
-  api.loadSessionRecords = (id, cwd, options = {}) => load(id, cwd, { ...options, sessionsDir: workerData.sessionsDir });
-}
+const load = api.loadSessionRecords;
+api.loadSessionRecords = async (id, cwd, options = {}) => {
+  const result = await load(id, cwd, { ...options, ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}) });
+  const context = requestContext.getStore();
+  if (context && result.success) {
+    context.loadedRecords = (context.loadedRecords || 0) + result.records.length;
+    context.sourceSize = result.sourceSnapshot?.size;
+    // This raw-record API does not expose its I/O/cache mode. Do not infer a
+    // RAM hit or claim zero bytes from another session's cumulative counters.
+    context.unmeasuredRecordRead = true;
+  }
+  return result;
+};
 const originalHistory = api.projectCodexFullHistoryFromFile;
-api.projectCodexFullHistoryFromFile = (id, cwd, options = {}) => originalHistory(id, cwd, {
+function observeProjection(result) {
+  const context = requestContext.getStore();
+  if (context && Number.isFinite(result?.fedRecords)) context.fedRecords += result.fedRecords;
+  return result;
+}
+api.projectCodexFullHistoryFromFile = async (id, cwd, options = {}) => observeProjection(await originalHistory(id, cwd, {
   ...options, ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
-});
+}));
 const originalTimeline = api.projectCodexTimelineFromFile;
 api.projectCodexTimelineFromFile = async (id, cwd, options = {}) => {
   const found = await api.findCodexSessionFile(id, cwd);
   const stat = found?.filePath ? await fs.promises.stat(found.filePath).catch(() => null) : null;
   const saved = stat ? cache.readTimeline({ sessionId: id, cwd }, found.filePath, stat) : null;
-  if (saved && api.restoreCodexSourceSnapshot(saved.source)) return {
+  if (saved && api.restoreCodexSourceSnapshot(saved.source)) {
+    const context = requestContext.getStore(); if (context) context.ssdHits++;
+    return {
     success: true, filePath: found.filePath, entries: saved.entries, sessionMeta: saved.sessionMeta,
     sourceSnapshot: saved.source, mode: 'disk', fedRecords: 0,
-  };
-  return originalTimeline(id, cwd, {
+    };
+  }
+  return observeProjection(await originalTimeline(id, cwd, {
     ...options, ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
-  });
+  }));
 };
 
 async function verifyPrefix(filePath, stat, restored) {
@@ -186,6 +337,7 @@ async function verifyPrefix(filePath, stat, restored) {
         const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, remaining), offset);
         if (!bytesRead) return false;
         sourceVerificationBytes += bytesRead;
+        const context = requestContext.getStore(); if (context) context.verificationBytes += bytesRead;
         hash.update(buffer.subarray(0, bytesRead)); offset += bytesRead; remaining -= bytesRead;
       }
       if (hash.digest('hex') !== proof.hash) return false;
@@ -218,28 +370,46 @@ api.setCodexProjectionStorage({
   enterCold,
   async read({ sessionId, cwd, filePath, stat }) {
     let restoreLease;
+    const context = requestContext.getStore();
+    if (context) context.sourceSize = stat.size;
     try {
       const restored = cache.readContinuation({ sessionId, cwd }, filePath, stat, snapshot => {
         restoreLease = historyPreparationActivity.begin({ sessionId, tabId: requestContext.getStore()?.payload.tabId,
           bytes: snapshot.size, source: { toolType: 'codex', cwd } });
         restoreLease.update({ phase: 'preparing' });
       });
-      if (!restored) return null;
-      if (!await verifyPrefix(filePath, stat, restored)) { cache.invalidate(filePath); return null; }
+      if (!restored) { phaseDiagnostic({ phase: 'projection-restore', outcome: 'miss', reason: 'continuation-unavailable' }); return null; }
+      if (!await verifyPrefix(filePath, stat, restored)) {
+        phaseDiagnostic({ phase: 'projection-restore', outcome: 'invalidated', reason: 'source-prefix-changed' });
+        cache.invalidate(filePath); return null;
+      }
+      if (context) { context.ssdHits++; context.continuationRestored = true; }
       rememberWrittenSource(filePath);
       return restored;
     } finally { restoreLease?.(); }
   },
   write({ sessionId, cwd, snapshot, state, timelineEntries, sessionMeta }) {
-    const payloads = requestContext.getStore()?.payloads || new Map();
+    const context = requestContext.getStore();
+    if (context) { context.sourceSize = snapshot.size; context.lineCount = state.lineCount; }
+    const payloads = context?.payloads || new Map();
     const stored = cache.saveContinuation({ sessionId, cwd }, snapshot, state, payloads);
     if (stored) payloads.clear();
     cache.saveTimeline({ sessionId, cwd }, snapshot, timelineEntries, sessionMeta);
     rememberWrittenSource(snapshot.filePath);
   },
-  onRead({ bytes }) { sourceBytes += bytes; },
+  onRead({ bytes, mode }) {
+    sourceBytes += bytes;
+    const context = requestContext.getStore();
+    if (!context) return;
+    context.sourceBytes += bytes;
+    if (mode === 'rebuild') { context.rebuilds++; context.exceptional = true; count('rebuilds'); }
+    else if (mode === 'unchanged' && !context.continuationRestored) context.ramHits++;
+    phaseDiagnostic({ phase: 'source-read', outcome: mode === 'rebuild' ? 'rebuild' : 'success', reason: token(mode), bytes });
+  },
   onRewrite(filePath) { cache.invalidate(filePath); writtenSources.delete(filePath); },
   prepare(cached) {
+    const context = requestContext.getStore();
+    if (context) context.consumedRecords = cached.historyProjector.getConsumedRecords();
     // Charge/store the graph we actually retain, not the pre-dehydration
     // outputs. Full payloads and the continuation commit atomically together.
     dehydrateHistoryEntries({ toolType: 'codex', sessionId: cached.sessionId,
@@ -261,7 +431,7 @@ historyPayloadStash.set = (tool, sessionId, id, text) => {
 };
 historyPayloadStash.get = (tool, sessionId, id) => {
   const hit = originalGet(tool, sessionId, id);
-  if (hit != null) return hit;
+  if (hit != null) { const context = requestContext.getStore(); if (context) context.ramHits++; return hit; }
   const context = requestContext.getStore();
   return tool === 'codex' && context && sessionId === context.payload.sessionId
     ? context.payloads.get(id) ?? cache.readPayload(context.payload, id, context.payloadSource) : null;
@@ -284,6 +454,7 @@ const service = createSessionTranscriptService({ codexData, promptPresentationSt
 historyPreparationActivity.subscribe(snapshot => send({ event: 'preparation', snapshot }));
 observeHistoryResponseTimingBindings(payload => send({ event: 'timing-bound', payload }));
 const chains = new Map();
+const queueDepths = new Map(); // Diagnostic-only; entries follow the existing RPC chains.
 const receipts = new Map();
 const originalReceipt = api.getCodexRewriteReceipt;
 api.getCodexRewriteReceipt = (id, source) => {
@@ -308,9 +479,29 @@ parentPort.on('message', message => {
     return;
   }
   if (!message.id) return;
-  const { id, method, payload = {} } = message;
+  const { id, method } = message;
+  // UI correlation is transport context only, never input to source/cache
+  // identity, revision construction or a returned transcript DTO.
+  const { diagnosticActionId, diagnosticReadId, ...payload } = message.payload || {};
   const key = JSON.stringify([payload.sessionId, payload.cwd]);
+  const received = stamp();
+  count('requests');
+  const context = { payload, phases: new Map(), droppedPhaseGroups: 0, sourceBytes: 0, verificationBytes: 0,
+    fedRecords: 0, rebuilds: 0, ramHits: 0, ssdHits: 0, coldAdmissionMs: 0, exceptional: false,
+    cacheReasons: { missingFile: 0, diskEvicted: 0, sourceChange: 0, version: 0, disabled: 0, error: 0, other: 0 } };
+  const correlation = { requestId: id, callId: message.diagnostic?.callId ?? id,
+    attempt: message.diagnostic?.attempt || 1, method: identity(method), tool: identity(payload.toolType),
+    tab: identity(payload.tabId), session: identity(payload.sessionId),
+    diagnosticActionId: typeof diagnosticActionId === 'string' && /^[a-z0-9-]{1,90}$/.test(diagnosticActionId)
+      ? diagnosticActionId : undefined,
+    diagnosticReadId: typeof diagnosticReadId === 'string' && /^[a-z0-9-]{1,90}$/.test(diagnosticReadId)
+      ? diagnosticReadId : undefined };
+  context.correlation = { ...correlation, workerGeneration: workerData.diagnosticGeneration || 0 };
+  const sessionQueueDepth = queueDepths.get(key) || 0;
+  queueDepths.set(key, sessionQueueDepth + 1);
+  let executionStart, executionEnd, serializationStart, serializationEnd;
   const work = async () => {
+    executionStart = stamp();
     if (method === 'stats') return { value: { cache: cache.stats(), projector: api.getCodexHistoryProjectorStats(), sourceBytes, sourceVerificationBytes,
       virtual: { ...service.codexVirtualTranscriptStore?.stats(), budgetBytes: virtualGraphBudget }, workerGraphBudget,
       memory: { heapUsed: process.memoryUsage().heapUsed, rss: process.memoryUsage().rss } }, readProof: [] };
@@ -319,13 +510,14 @@ parentPort.on('message', message => {
     if (!['getHistory', 'getTimeline', 'getToolPayload', 'getMessages', 'searchHistory',
       'resolveCodexPhysicalRow', 'copyCodexVirtualRange', 'exportCodexSession'].includes(method)) throw new Error('history_read_method');
     if (message.rewriteReceipt) receipts.set(payload.sessionId, message.rewriteReceipt);
-    const context = { payload, payloads: new Map(), sources: new Set(), sourceEpochs: sourceEpochs.slice(), preparations: [], assets: new Map() };
+    Object.assign(context, { payloads: new Map(), sources: new Set(), sourceEpochs: sourceEpochs.slice(), preparations: [], assets: new Map() });
     return requestContext.run(context, async () => {
       try {
         const result = await service[method](payload);
         const readProof = [...context.sources].map(filePath => ({ filePath,
           epoch: context.sourceEpochs[epochSlot(filePath)], slot: epochSlot(filePath) }));
         if (readProof.some(source => source.epoch !== Atomics.load(sourceEpochs, source.slot))) {
+          phaseDiagnostic({ phase: 'source-fence', outcome: 'invalidated', reason: 'source-epoch-invalidated' });
           throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
         }
         if (context.payloads.size) cache.savePayloads(payload, context.payloads);
@@ -339,18 +531,74 @@ parentPort.on('message', message => {
   };
   const run = (chains.get(key) || Promise.resolve()).catch(() => {}).then(work);
   chains.set(key, run);
+  const reply = (body, resultBytes = null, transfer = []) => {
+    const ready = stamp();
+    const executionMs = executionEnd.perf - executionStart.perf;
+    const exceptional = context.exceptional || !!body.error || body.result?.success === false || !!body.result?.error
+      || !!body.result?.proof?.error;
+    const outcome = body.error ? 'error' : body.result?.success === false || body.result?.error || body.result?.proof?.error ? 'result-error' : 'success';
+    count('completed'); if (outcome !== 'success') count('errors');
+    const reason = body.error?.code === 'CODEX_SOURCE_READ_INVALIDATED' ? 'source-epoch-invalidated'
+      : body.error ? token(body.error.code || 'execution-error')
+      : body.result?.error === 'Codex session file not found' ? 'source-missing'
+      : outcome === 'result-error' ? token(body.result?.error || body.result?.proof?.error) : undefined;
+    const diagnostic = { ...correlation, receivedAbs: received.abs, receivedPerf: received.perf,
+      executionStartAbs: executionStart.abs, executionStartPerf: executionStart.perf,
+      executionEndAbs: executionEnd.abs, executionEndPerf: executionEnd.perf,
+      sessionQueueDepth, sessionQueueMs: executionStart.perf - received.perf, executionMs,
+      coldAdmissionMs: context.coldAdmissionMs, coldQueueDepth: context.coldQueueDepth || 0,
+      coldQueuedAbs: context.coldQueuedAbs, coldQueuedPerf: context.coldQueuedPerf,
+      coldAdmittedAbs: context.coldAdmittedAbs, coldAdmittedPerf: context.coldAdmittedPerf,
+      serializationStartAbs: serializationStart?.abs, serializationStartPerf: serializationStart?.perf,
+      serializationEndAbs: serializationEnd?.abs, serializationEndPerf: serializationEnd?.perf,
+      serializationMs: serializationEnd ? serializationEnd.perf - serializationStart.perf : null,
+      replyReadyAbs: ready.abs, replyReadyPerf: ready.perf, resultBytes, transport: message.binary ? 'v8-transfer' : 'structured-clone',
+      source: context.rebuilds ? 'raw-rebuild' : context.sourceBytes ? 'raw-append' : context.ssdHits ? 'ssd' : context.ramHits ? 'ram'
+        : context.unmeasuredRecordRead ? 'records-cache-or-raw' : 'unobserved',
+      sourceBytes: context.unmeasuredRecordRead ? null : context.sourceBytes, projectionSourceBytes: context.sourceBytes,
+      sourceSize: context.sourceSize, loadedRecords: context.loadedRecords, verificationBytes: context.verificationBytes,
+      fedRecords: context.fedRecords, consumedRecords: context.consumedRecords, lineCount: context.lineCount,
+      ramHits: context.ramHits, ssdHits: context.ssdHits, rebuilds: context.rebuilds, outcome, reason, exceptional };
+    send({ ...body, diagnostic }, transfer);
+    const posted = stamp();
+    if (exceptional || posted.perf - received.perf >= slowMs) {
+      const stats = cache.stats();
+      emitDiagnostic('request-complete', { ...diagnostic, postMessageMs: posted.perf - ready.perf,
+        postedAbs: posted.abs, postedPerf: posted.perf, phases: [...context.phases.values()], droppedPhaseGroups: context.droppedPhaseGroups,
+        counters: { ...counters }, cacheReasons: { ...context.cacheReasons }, lastException: context.lastException || null,
+        cache: { hits: stats.hits, misses: stats.misses, errors: stats.errors, diskBytes: stats.diskBytes,
+          budgetBytes: stats.budgetBytes, indexMemoryBytes: stats.indexMemoryBytes, indexMemoryBudget: stats.indexMemoryBudget },
+        timing: 'elapsed-wall; cold/cache phases nested in execution; overlapping phases are not summed CPU' });
+    }
+  };
   run.then(({ value: result, readProof }) => {
+    executionEnd = stamp();
     if (message.binary) {
+      serializationStart = stamp();
       const data = new Uint8Array(v8.serialize(result));
+      serializationEnd = stamp();
       // Transfer bytes, not tens of thousands of objects through main. Only
       // this small witness is needed there to reject a revoked response.
-      send({ id, readProof, result: { __notedHistoryTransport: 'v8-1', data,
+      reply({ id, readProof, result: { __notedHistoryTransport: 'v8-1', data,
         proof: { filePath: result.filePath, error: result.error,
-          sourcePaths: (result.revision?.sources || []).map(source => source.filePath) } } }, [data.buffer]);
-    } else send({ id, readProof, result });
-  }, error => send({ id, error: { message: error.message, code: error.code } }))
-    .catch(error => { try { send({ id, error: { message: error.message, code: error.code } }); } catch {} })
-    .finally(() => { if (chains.get(key) === run) chains.delete(key); receipts.delete(payload.sessionId); });
+          sourcePaths: (result.revision?.sources || []).map(source => source.filePath) } } }, data.byteLength, [data.buffer]);
+    } else reply({ id, readProof, result });
+  }, error => { executionEnd = stamp(); reply({ id, error: { message: error.message, code: error.code } }); })
+    .catch(error => { try {
+      if (serializationStart && !serializationEnd) serializationEnd = stamp();
+      reply({ id, error: { message: error.message, code: error.code } });
+    } catch {} })
+    .finally(() => {
+      if (chains.get(key) === run) chains.delete(key);
+      const remaining = queueDepths.get(key) - 1;
+      if (remaining) queueDepths.set(key, remaining); else queueDepths.delete(key);
+      receipts.delete(payload.sessionId);
+    });
 });
 
+emitDiagnostic('worker-ready', { cacheEnabled: cache.enabled, cacheSchema: require('node:path').basename(cache.directory),
+  slowMs, phaseGroups: MAX_PHASE_GROUPS, workerGraphBudget, virtualGraphBudget,
+  capabilities: { cacheOnDiagnostic: typeof cache.diagnose === 'function', sourceOnRead: 'projection-storage-only',
+    recordReadBytes: false, binaryBytes: true, structuredCloneBytes: false },
+  startupCacheErrors: cache.stats().errors, counters: { ...counters } });
 send({ event: 'ready' });

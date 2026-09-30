@@ -36,11 +36,14 @@ import {
   Loader2,
   Trash2,
   Gauge,
+  Coins,
+  CalendarDays,
 } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import {
   buildCodexMainUsageView,
   visibleCodexResetCredits,
+  codexCreditExpirySummary,
 } from '../../utils/codexUsagePresentation.mjs';
 import { resolveUsageAccountPresentation } from '../../utils/usageAccountPresentation.mjs';
 import { ClaudeSparkle } from './CopySessionButton';
@@ -187,6 +190,11 @@ interface CodexResetCredits {
     expires_at: string;
   }>;
 }
+interface CodexCreditExpiration {
+  balance: number;
+  fetchedAt: string;
+  expirations: Array<{ amount: number; expiresAt: string }>;
+}
 interface CodexUsageAccount {
   accountKey: string;
   label: string;
@@ -202,6 +210,7 @@ interface CodexUsageAccount {
   warning?: string | null;
   lastAttemptAt?: number | null;
   reset_credits?: CodexResetCredits | null;
+  credit_expiration?: CodexCreditExpiration | null;
   profileId?: string | null;
   connected?: boolean;
   authStatus?: string | null;
@@ -482,6 +491,7 @@ interface UsageRefreshRequest {
   accountKey?: string | null;
   preserveSelection?: boolean;
   reason?: string;
+  snapshotOnly?: boolean;
 }
 
 type UsageRefreshFlashTarget = 'detail' | 'compact' | 'both';
@@ -759,7 +769,7 @@ function UsageSourceRefreshRow({
             flexShrink: 0,
           }}
         >
-          <RefreshCw size={11} style={{
+          <RefreshCw size={11} className="noted-infinite-animation" style={{
             animation: loading ? 'spin 1s linear infinite' : 'none',
             color: errorFlash && !loading ? '#f87171' : undefined,
             filter: errorFlash && !loading ? 'drop-shadow(0 0 3px rgba(248,113,113,0.5))' : 'none',
@@ -899,9 +909,7 @@ function formatCodexCreditBalance(credits: CodexUsageData['credits']): string | 
   if (credits.unlimited) return 'unlimited';
   if (typeof credits.balance === 'number' && Number.isFinite(credits.balance) && credits.balance > 0) {
     return new Intl.NumberFormat(undefined, {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: credits.balance < 10 ? 2 : 0,
+      style: 'decimal',
       maximumFractionDigits: 2,
     }).format(credits.balance);
   }
@@ -909,9 +917,13 @@ function formatCodexCreditBalance(credits: CodexUsageData['credits']): string | 
   return null;
 }
 
-function CodexCreditBalanceRow({ credits }: { credits: CodexUsageData['credits'] }) {
+function CodexCreditBalanceRow({ credits, expiration }: {
+  credits: CodexUsageData['credits'];
+  expiration?: CodexCreditExpiration | null;
+}) {
   const value = formatCodexCreditBalance(credits);
   if (!value) return null;
+  const expiry = codexCreditExpirySummary(credits, expiration);
   return (
     <div style={{
       display: 'flex',
@@ -921,8 +933,21 @@ function CodexCreditBalanceRow({ credits }: { credits: CodexUsageData['credits']
       borderTop: '1px solid rgba(255,255,255,0.08)',
       fontSize: 11,
     }}>
-      <span style={{ color: '#aaa' }}>Codex credits</span>
-      <span style={{ color: '#ddd', fontVariantNumeric: 'tabular-nums' }}>{value}</span>
+      <span style={{ color: '#aaa', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        <Coins size={13} aria-hidden />
+        Codex credits
+      </span>
+      <span style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 3 }}>
+        <span style={{ color: '#ddd', fontVariantNumeric: 'tabular-nums' }}>{value}</span>
+        {!credits?.unlimited && (
+          <span data-codex-credit-expiry style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: '#888', fontSize: 10 }}>
+            <CalendarDays size={11} aria-hidden />
+            {expiry
+              ? `${expiry.allCredits ? '' : `${formatCodexCreditBalance({ balance: expiry.amount })} `}expires ${formatCodexResetCreditExpiry(expiry.expiresAt)}`
+              : 'expiry unavailable'}
+          </span>
+        )}
+      </span>
     </div>
   );
 }
@@ -1453,7 +1478,7 @@ function ClaudeUsageChip({
       >
         {compactLoading && !compactData ? (
           <>
-            <RefreshCw size={12} color="#777" style={{ animation: 'spin 1s linear infinite' }} />
+            <RefreshCw size={12} color="#777" className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
             <span>…</span>
           </>
         ) : (refreshFailureTarget === 'compact' || refreshFailureTarget === 'both') && !compactData ? (
@@ -1474,7 +1499,7 @@ function ClaudeUsageChip({
         ) : (
           <>
             {compactLoading
-              ? <RefreshCw size={12} color="#DA7756" style={{ animation: 'spin 1s linear infinite' }} />
+              ? <RefreshCw size={12} color="#DA7756" className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
               : refreshFailureTarget === 'compact' || refreshFailureTarget === 'both'
                 ? <RefreshCw size={12} color="#f87171" />
                 : <ClaudeSparkle size={13} color={compactWeeklyUsedPct != null ? '#DA7756' : '#777'} />}
@@ -1831,7 +1856,7 @@ function CodexDeviceLoginSection({
                 }}
               >
                 {busyProfileId === profile.profileId
-                  ? <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} />
+                  ? <Loader2 size={13} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
                   : <X size={13} />}
               </button>
             </div>
@@ -1966,6 +1991,7 @@ function CodexUsageChip({
   const { target: refreshFailureTarget, clear: clearRefreshFailureFlash,
     flash: flashRefreshFailure } = useUsageRefreshFailureFlash();
   const refreshSeqRef = useRef(0);
+  const refreshInFlightRef = useRef(false);
   const refreshContextRef = useRef('');
   // Throttles the context-driven refresh (see the effect below). 0 = never
   // fetched, so the first mount always fetches.
@@ -1993,20 +2019,23 @@ function CodexUsageChip({
   refreshContextRef.current = refreshContext;
 
   const refresh = useCallback(async (force = false, request: UsageRefreshRequest = {}) => {
+    if (request.snapshotOnly && refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
     const seq = ++refreshSeqRef.current;
     const requestedContext = `${selectedAccountKey || ''}|${activeCodexSessionId || ''}|${activeCodexCwd || ''}`;
     const requestedAccountKey = Object.prototype.hasOwnProperty.call(request, 'accountKey')
       ? request.accountKey || null
       : selectedAccountKey;
     const flashTarget = usageRefreshFlashTarget(requestedAccountKey, selectedAccountKey, currentAccountKey);
-    clearRefreshFailureFlash();
+    if (!request.snapshotOnly) clearRefreshFailureFlash();
     // Every real fetch stamps the throttle clock (manual, interval, context),
     // so the context gate below always measures from the LAST fetch.
     lastRefreshStartedAtRef.current = Date.now();
-    setLoading(true);
-    setCompactLoading(!currentAccountKey || !requestedAccountKey || requestedAccountKey === currentAccountKey);
+    setLoading(!request.snapshotOnly);
+    setCompactLoading(!request.snapshotOnly && (!currentAccountKey || !requestedAccountKey || requestedAccountKey === currentAccountKey));
     try {
       const res = await invokeCodexUsage({
+        snapshotOnly: request.snapshotOnly === true,
         accountKey: requestedAccountKey,
         force,
         reason: request.reason || (force ? 'manual' : 'automatic'),
@@ -2067,6 +2096,7 @@ function CodexUsageChip({
       console.warn(`[CodexUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
       if (seq === refreshSeqRef.current) {
+        refreshInFlightRef.current = false;
         setLoading(false);
         setCompactLoading(false);
       }
@@ -2119,7 +2149,9 @@ function CodexUsageChip({
           schedule();
           return;
         }
-        void refresh(false, { reason: 'interval' }).finally(() => {
+        // Main owns network polling for every connected account; this timer
+        // only projects its cache and also catches a hidden-window return.
+        void refresh(false, { reason: 'interval', snapshotOnly: true }).finally(() => {
           if (!disposed) schedule();
         });
       }, delay);
@@ -2132,6 +2164,25 @@ function CodexUsageChip({
     document.addEventListener('visibilitychange', onVis);
     return () => { disposed = true; clear(); document.removeEventListener('visibilitychange', onVis); };
   }, [refresh, codexUsagePollInterval]);
+
+  useEffect(() => {
+    const readSnapshot = (_event: unknown, payload?: { accountKey?: string }) => {
+      if (document.visibilityState === 'visible') {
+        void refresh(false, {
+          accountKey: payload?.accountKey || selectedAccountKey,
+          snapshotOnly: true,
+          preserveSelection: true,
+          reason: 'background-updated',
+        });
+      }
+    };
+    ipcRenderer.on('codex:usage-updated', readSnapshot);
+    document.addEventListener('visibilitychange', readSnapshot);
+    return () => {
+      ipcRenderer.removeListener('codex:usage-updated', readSnapshot);
+      document.removeEventListener('visibilitychange', readSnapshot);
+    };
+  }, [refresh, selectedAccountKey]);
 
   useEffect(() => {
     const onProfilesUpdated = (_event: unknown, payload: any) => {
@@ -2365,7 +2416,7 @@ function CodexUsageChip({
           }}
         >
           {selectedProfileBusy
-            ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
+            ? <Loader2 size={12} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
             : <LogOut size={12} />}
         </button>
       ) : selectedProfile?.status === 'signing_in' ? (
@@ -2391,7 +2442,7 @@ function CodexUsageChip({
           }}
         >
           {selectedProfileBusy
-            ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
+            ? <Loader2 size={12} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
             : <X size={12} />}
         </button>
       ) : (
@@ -2418,7 +2469,7 @@ function CodexUsageChip({
             }}
           >
             {selectedProfileBusy
-              ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
+              ? <Loader2 size={12} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
               : <LogIn size={12} />}
           </button>
           {selectedProfile?.canRemove && (
@@ -2499,7 +2550,7 @@ function CodexUsageChip({
       >
         {compactLoading && !compactUsageData ? (
           <>
-            <RefreshCw size={12} color="#777" style={{ animation: 'spin 1s linear infinite' }} />
+            <RefreshCw size={12} color="#777" className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
             <span>…</span>
           </>
         ) : (refreshFailureTarget === 'compact' || refreshFailureTarget === 'both') && !compactUsageData ? (
@@ -2515,7 +2566,7 @@ function CodexUsageChip({
         ) : (
           <>
             {compactLoading
-              ? <RefreshCw size={12} color={chipColor} style={{ animation: 'spin 1s linear infinite' }} />
+              ? <RefreshCw size={12} color={chipColor} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
               : refreshFailureTarget === 'compact' || refreshFailureTarget === 'both'
                 ? <RefreshCw size={12} color="#f87171" />
                 : <CodexIcon size={15} muted={!compactHasWeekly && !compactHasFiveHour} />}
@@ -2568,7 +2619,7 @@ function CodexUsageChip({
                 }}
               >
                 {profileAction === 'new'
-                  ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
+                  ? <Loader2 size={12} className="noted-infinite-animation" style={{ animation: 'spin 1s linear infinite' }} />
                   : <Plus size={13} />}
               </button>
             )}
@@ -2620,7 +2671,7 @@ function CodexUsageChip({
                   resetsAt={fiveHour?.resets_at}
                 />
               )}
-              <CodexCreditBalanceRow credits={usageData.credits} />
+              <CodexCreditBalanceRow credits={usageData.credits} expiration={selectedAccount?.credit_expiration} />
             </>
           ) : !error ? (
             <div style={{ padding: '12px', fontSize: 11, color: '#666' }}>
@@ -2705,7 +2756,7 @@ function SharedActivitySection({
               cursor: loading ? 'default' : 'pointer',
             }}
           >
-            <RefreshCw size={10} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
+            <RefreshCw size={10} className="noted-infinite-animation" style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
           </button>
         )}
       </div>

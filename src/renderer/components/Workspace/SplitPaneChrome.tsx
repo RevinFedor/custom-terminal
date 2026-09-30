@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { ArrowLeftRight, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, WrapText } from 'lucide-react';
+import { ArrowLeftRight, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, WrapText, Search } from 'lucide-react';
+import {requestHistorySearch} from '../../utils/historySearchMarkers';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -197,6 +198,10 @@ export function SplitPaneAttachRow({
   const stripAutoReveal = useUIStore((s) => s.paneTabStripAutoReveal);
   const setStripAutoReveal = useUIStore((s) => s.setPaneTabStripAutoReveal);
   const timelineTreeMode = useUIStore((s) => s.timelineTreeModeTabs[tabId] ?? false);
+  const canSearchHistory = useWorkspaceStore(state => {
+    const tab=state.openProjects.get(projectId)?.tabs.get(tabId);
+    return !!tab && tab.tabType !== 'file' && (tab.commandType === 'claude' || tab.commandType === 'codex' || tab.tabType === 'claude-sdk');
+  });
   const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
   const historyPinned = useUIStore((s) => s.historyPinned);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
@@ -892,6 +897,16 @@ export function SplitPaneAttachRow({
                 the pointer through the rest of the application. The ellipsis
                 suffix promises a second explicit choice instead of a hover
                 chevron. */}
+            {!vacant && canSearchHistory && <button type="button" role="menuitem" data-split-strip-menu-item="search-history"
+              onClick={(event)=>{
+                event.stopPropagation();setStripMenu(null);
+                useUIStore.getState().setHistoryPanelOpen(tabId,true);
+                useUIStore.getState().setSideTerminalOpen(tabId,false);
+                requestHistorySearch(tabId);
+              }}
+              style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',cursor:'pointer'}}>
+              <Search size={13}/><span style={{flex:1,textAlign:'left'}}>Найти в чате</span><span style={{fontSize:10,color:'#999'}}>⌘F</span>
+            </button>}
             <button
               ref={stripSwapMenuItemRef}
               type="button"

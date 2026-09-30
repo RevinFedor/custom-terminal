@@ -6779,7 +6779,7 @@ function App() {
     };
     window.addEventListener('keydown', handlePickerOpenCapture, true);
 
-    // Shift+Cmd+T — reopen last closed tab in active project (VS Code-style).
+    // Shift+Cmd+T — undo the newest close in this window, then project history.
     // Same capture-phase pattern as Opt+V: layout-agnostic via e.code, so the
     // shortcut works on Cyrillic / QWERTY / Dvorak; stops propagation before
     // xterm's customKeyEventHandler sees it (otherwise the literal `T` would
@@ -6807,11 +6807,9 @@ function App() {
       // the same frame as the keypress, even though createTab + claude-c resume
       // can take 300-800ms. Without this, the hotkey feels deaf during the gap.
       useUIStore.getState().triggerReopenPulse();
-      // A pane middle-click/Cmd+W removes only its chip; the tab itself remains
-      // alive in the sidebar. Undo that exact local close before consulting the
-      // project-wide archive, otherwise this shortcut resurrects an unrelated
-      // old session while the tab just removed is still alive.
-      if (targetPaneIndex >= 0 && ws.restoreLastDetachedTabToSplitPane(targetPaneIndex)) return;
+      // One window-ordered undo path owns both removed live chips and Full
+      // archives. A detached-first fast path can undo an older action before
+      // a newer Full close, and also bypasses serialization of rapid repeats.
       ws.reopenLastClosedTab(restoreProjectId, targetPaneIndex >= 0
         ? { targetPaneIndex }
         : undefined).then((res) => {

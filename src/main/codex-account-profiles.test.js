@@ -84,6 +84,25 @@ function nextTurn() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+test('foreground and background reads share a profile probe and shutdown closes it', async t => {
+  const roots = tempProfileRoots(t);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const client = new FakeAppServerClient({ account: { type: 'chatgpt', email: 'probe@example.com' } });
+  client.start = () => gate;
+  let created = 0;
+  const manager = new CodexAccountProfileManager({ ...roots,
+    clientFactory: () => { created++; return client; } });
+  const profile = manager.createManagedProfile();
+  const first = manager.probeProfile(profile);
+  const second = manager.probeProfile(profile);
+  assert.equal(created, 1);
+  manager.shutdown();
+  assert.equal(client.closed, true);
+  release();
+  await Promise.all([first, second]);
+});
+
 function tempProfileRoots(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-codex-profiles-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

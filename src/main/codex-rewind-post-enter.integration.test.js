@@ -215,6 +215,7 @@ function fixture(t, {
     reconcileReturned() { return false; },
   };
   context = vm.createContext({
+    tabId,
     codexSettingsMutationQueue: require('./codex-settings-mutation-queue').createCodexSettingsMutationQueue(),
     ...authorityApi, ...promptApi, ...postEnterApi,
     hashCodexRewindTargetText,
@@ -319,6 +320,7 @@ function fixture(t, {
   const functionNames = [
     'codexRewindPostEnterKey', 'readCodexRewindPostEnterResult', 'persistCodexRewindPostEnter',
     'createCodexRewindPostEnterOperation', 'isCodexRewindPostEnterCurrent',
+    'readCodexRewindContinuationLaunchId',
     'waitForCodexRewindPostEnterComposer', 'captureCodexRewindPostEnterInput',
     'completeCodexRewindPostEnterRecord', 'recoverCodexRewindPostEnterOperation',
     'captureAgentInputAtWriteBoundary', 'getTerminalStopRevision', 'captureAgentInputIdentity', 'validateAgentInputIdentity',
@@ -473,6 +475,50 @@ test('actual nested Grab waits through startup, persists full capture before cle
   assert.equal(record.durable.preparedDraft.capturedText, f.expectedText);
   assert.equal(record.durable.captureResult.draftTransfer.text, f.expectedText);
   assert.equal(f.mirror.synchronizedFrameWaiters.size, 0);
+});
+
+test('tab34: retired startup payload does not invalidate the same consumed Rewind after Enter', async t => {
+  const f = fixture(t);
+  // task_started retires this temporary startup/watchdog payload before the
+  // later Rewind; the admitted action still owns the same physical run.
+  f.context.codexLastRunCommandPayload.delete(f.tabId);
+  const record = f.create();
+  const result = await f.nestedGrab(record);
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.equal(result.text, f.expectedText);
+  assert.equal(result.matchedTarget, true);
+  assert.deepEqual(f.writes, ['\x07']);
+  assert.equal(f.context.isCodexRewindPostEnterCurrent(record), true);
+  f.commitChild();
+  const completed = await f.context.completeCodexRewindPostEnterRecord(record, record.durable.captureResult);
+  assert.equal(completed.success, true, JSON.stringify(completed));
+  assert.equal(completed.handoffStatus, 'adopted-child');
+  assert.deepEqual(f.writes, ['\x07'], 'settlement never replays Enter or Send');
+});
+
+test('retired launch payload cannot mask a replacement launch or changed physical Rewind owner', async t => {
+  for (const kind of ['terminal', 'lifecycle', 'run', 'input', 'stopping', 'launch', 'invalid-launch']) {
+    const f = fixture(t);
+    f.context.codexLastRunCommandPayload.delete(f.tabId);
+    const record = f.create();
+    if (kind === 'launch' || kind === 'invalid-launch') {
+      f.context.codexLastRunCommandPayload.set(f.tabId,
+        kind === 'launch' ? { launchId: 'replacement-launch' } : {});
+    } else f.mutate(kind);
+    const result = await f.capture(record);
+    assert.equal(result.success, false, kind);
+    assert.deepEqual(f.writes, [], kind);
+    assert.equal(f.composer, f.expectedText, kind);
+  }
+});
+
+test('legacy exact post-Enter recovery survives startup payload retirement across its process await', async t => {
+  const f = fixture(t, { legacy: true, expiredWatcher: true });
+  f.context.codexLastRunCommandPayload.delete(f.tabId);
+  const result = await f.context.recoverCodexRewindPostEnterOperation(f.request);
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.equal(result.historyDraftText, f.expectedText);
+  assert.deepEqual(f.writes, ['\x07']);
 });
 
 test('actual wait/capture cancels and refuses changed terminal, lifecycle, run, launch and input before Ctrl+G', async t => {

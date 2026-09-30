@@ -26,6 +26,12 @@ import {
 
 type ContextSourceTab = TabContextUpdateSource;
 
+export const contextUpdateChipProps = {
+  className: 'hp-context-update-chip',
+  leading: <RefreshCw size={13} aria-hidden="true" />,
+  title: 'Обновление рабочего состояния',
+};
+
 function ContextSourceTabChip({ source, onNavigate }: {
   source: ContextSourceTab;
   onNavigate: () => void;
@@ -127,7 +133,7 @@ function ContextUpdateSourceRow({ value, onNavigate }: {
       {value.hasUnknownSource && (
         <span data-context-source-external style={{
           display: 'inline-flex', alignItems: 'center', minHeight: 24, padding: '2px 7px',
-          border: '1px dashed #8d612c', borderRadius: 5, color: '#b9a27e',
+          border: '1px dashed var(--work-context-border)', borderRadius: 5, color: '#b3aabd',
           fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', fontSize: 12,
         }}>
           Внешнее изменение
@@ -264,9 +270,9 @@ export function TabContextUpdateChip({
       onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); event.stopPropagation(); void dismiss(); } }}
       onMouseDown={(event) => { if (event.button === 1) event.preventDefault(); }}
       onKeyDown={(event) => { if (event.key === 'Escape') setOpen(false); }}>
-      <ComposerChip kind="prompt" label={update.title} leading={<RefreshCw size={12} />}
+      <ComposerChip kind="prompt" label={update.title} {...contextUpdateChipProps}
         title={[update.title, update.path].filter(Boolean).join('\n') || 'Обновление рабочего состояния'}
-        style={{ color: WORK_CONTEXT_COLOR, borderColor: '#8d612c', background: '#2c2419', opacity: busy ? 0.55 : 1, transition: 'opacity 120ms ease' }}
+        style={{ opacity: busy ? 0.55 : 1, transition: 'opacity 120ms ease' }}
         onClick={() => setOpen(!open)} />
     </span>
     {open && rect && createPortal(<div ref={popover} role="dialog" aria-label={update.title}
@@ -277,7 +283,7 @@ export function TabContextUpdateChip({
         width: 'min(600px, calc(100vw - 16px))', boxSizing: 'border-box',
         maxHeight: Math.max(60, Math.min(window.innerHeight * 0.55, rect.top >= 180 ? rect.top - 16 : window.innerHeight - rect.bottom - 16)),
         display: 'flex', flexDirection: 'column', overflow: 'hidden',
-        background: '#191919', color: '#ddd', border: '1px solid #8d612c',
+        background: '#191919', color: '#ddd', border: '1px solid var(--work-context-border)',
         borderRadius: 5, padding: 0, boxShadow: '0 6px 25px #0008' }}>
       <AttachmentPreviewBar
         meta={<span data-context-update-summary style={{ color: WORK_CONTEXT_COLOR }}>{update.title}</span>}

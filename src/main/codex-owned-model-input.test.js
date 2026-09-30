@@ -19,7 +19,7 @@ const names = ['withPtyWriteLock', 'captureCodexOwnedSlashDraftIdentity', 'valid
   'releaseCodexOwnedModelInput', 'validateCodexOwnedModelInputIdentity', 'readCodexOwnedModelInputDecision', 'reconcileCodexOwnedModelInputAtWriteBoundary',
   'settleCodexOwnedModelInput', 'waitForCodexOwnedModelPaste', 'retainCodexOwnedModelInput', 'inspectCodexOwnedSlashDraft',
   'rollbackCodexOwnedSlashDraft', 'sendCodexSlashCommand', 'captureAgentInputAtWriteBoundary', 'selectCodexModelEffort',
-  'safePasteAndSubmit', 'getCodexLiveInputControl'];
+  'safePasteAndSubmit', 'getCodexLiveInputControl', 'waitForCodexInputPreparation'];
 const tick = () => new Promise(r => setImmediate(r));
 
 function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
@@ -46,6 +46,8 @@ function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
     terminals: new Map([['T', term]]), terminalCommandState: new Map([['T', { isRunning: true, runSeq: run }]]),
     aiStoppingTabs: new Map(), codexLastRunCommandPayload: new Map([['T', { launchId: 'L' }]]),
     codexSettingsMutationQueue: createCodexSettingsMutationQueue(),
+    codexModelEffortIntentReconcileInflight: new Map(), codexReserveResumeGuards: new WeakMap(),
+    getCodexModelEffortIntentRecord: () => null, isCodexTuiEffectivelyReady: () => false,
     pasteInflight: new WeakMap(), ptyActiveWriteOperation: new WeakMap(),
     ptyLastQueuedWriteOperation: new WeakMap(), ptyWriteOwners: new WeakMap(),
     getTerminalInputRevision: () => inputRevision, getTerminalStopRevision: () => stopRevision,
@@ -206,7 +208,7 @@ test('actual Send wrapper cannot erase pending service ownership by reserving a 
   const receipt = h.receipt;
   const result = await h.ctx.safePasteAndSubmit(h.term, 'USER PROMPT', { source: 'codex-history-panel' });
   assert.equal(result.submitted, false);
-  assert.equal(result.error, 'codex_owned_model_input_pending');
+  assert.equal(result.error, 'codex_local_command_preparation_pending');
   assert.equal(h.receipt, receipt);
   assert.equal(h.writes.length, 1);
   h.change('input');

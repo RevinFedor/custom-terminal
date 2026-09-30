@@ -68,7 +68,7 @@ compact boundary старый carrier команды может уйти за г
   поэтому запрет и подсказка `← Terminal only` удалены. Само сообщение
   отображается как обычное user message; отсутствие видимого результата у
   локальной команды принято сознательно. Расписка об отправке для таких команд не
-  создаётся (см. `fact-история-как-основная-поверхность.md`) — иначе она ждала бы
+  создаётся в обычном desktop user-message audit (см. `fact-история-как-основная-поверхность.md`) — иначе она ждала бы
   запись `user_message`, которой у локальной команды нет.
 - Ручной ввод в живом xterm остаётся полноценным путём и по-прежнему доказывается
   PTY Enter boundary. E2E, проверяющий compact lifecycle, должен использовать
@@ -78,6 +78,8 @@ compact boundary старый carrier команды может уйти за г
   соответствующую временную строку. Небольшой count-bounded список завершённых
   операций существует только в памяти main, чтобы remount мог забрать
   пропущенный handoff; время не определяет исход операции.
+  Receipt-backed внешний submit дополнительно сохраняет exact completion в
+  той же durable send receipt; это терминальный факт, не восстановление live registry.
 - В Claude History принятый queue item с точным `/compact` переводится в обычную
   slash-строку при dequeue/remove/popAll. Boundary и `Compaction canceled` —
   fallback для версий Claude без отдельного queue transition. Поэтому
@@ -128,6 +130,22 @@ catch-up границы собственного record и публикует te
 нет; `context_compacted` по-прежнему только telemetry.
 
 ### Codex local slash: causal start без `user_message`
+
+#### Native reconnect: завершённый compact остался SENT (30.09.2026)
+
+В tab367 операция B5C2ECA4 стартовала09:16UTC, а causal compacted→task_complete
+завершил её09:19. Desktop потребил событие из оперативного registry, но native
+через часы получал только первоначальное `sent`, без canonical user UUID и
+без terminal settlement. Его локальный journal поэтому законно сохранялся.
+Это не продолжающееся сжатие и не отдельная карточка Prompt Queue.
+
+Main теперь привязывает существующие send operationKey/attemptId до PTY записи
+к immutable compact owner. Тот же registry publisher сохраняет
+`coordinatedSettlement.compact` в receipt прежде, чем уведомить desktop/SSE.
+Start и completion могут опередить ответ renderer: поздний result лишь
+дополняет transport metadata, не стирает завершение. Старые sent-only receipts
+без exact owner не мигрируют по тексту, saved/current SID либо близости времени.
+Форма wire и causal/restart guards — `fact-mobile-web.md::Завершение compact в send receipt`.
 
 #### Exclusive EOF semantics (2026-07-31)
 

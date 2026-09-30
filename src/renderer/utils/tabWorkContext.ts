@@ -1,7 +1,8 @@
 import { useEffect, useSyncExternalStore } from 'react';
+import '../styles/tabWorkContext.css';
 
 const { ipcRenderer } = window.require('electron');
-export const WORK_CONTEXT_COLOR = '#e9a345';
+export const WORK_CONTEXT_COLOR = 'var(--work-context-accent)';
 export interface TabContextUpdateSource {
   tabId: string;
   tabName: string;

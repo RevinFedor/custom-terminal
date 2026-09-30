@@ -126,7 +126,8 @@ test('live source scanner records activity even when its old send audit rejects 
   context.processCodexSourceAuditOnlyText(state, text.slice(42), launch.startByte + Buffer.byteLength(first));
   assert.deepEqual(auditResults, [false]);
   assert.equal(matchesCodexResumeUserActivityProof(state.sourceLiveUserActivityProof, owner), true);
-  assert.match(main, /processCodexSourceAuditOnlyText\(state, chunk, start\);\s*requestCodexSourceWriterProof\(state\)/);
+  assert.match(main, /processCodexSourceAuditOnlyText\(state, batch\.buffer, batch\.start, prepared\.preferredUserAuditOffsets\)/);
+  assert.match(main, /if \(sourceAuditOnly\) requestCodexSourceWriterProof\(state\)/);
   assert.match(main, /sourceUserMessageProven && !candidateSubmitAuditProven/);
   assert.match(main, /audit\.awaitUserMessage = false;\s*audit\.writerResolvedIndependently = true/);
 });

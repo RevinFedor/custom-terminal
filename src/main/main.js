@@ -479,6 +479,7 @@ const {
   selectCodexPreferredUserMessageAuditRecords,
   selectCodexPendingPromptAudit,
 } = require(path.join(srcMainDir, 'codex-prompt-audit'));
+const { readCodexTurnAppend } = require(path.join(srcMainDir, 'codex-turn-append-reader'));
 const {
   captureCodexQueuedMessageBaseline,
   classifyCodexQueuedMessageFrame,
@@ -545,6 +546,7 @@ const {
 } = require(path.join(srcMainDir, 'claude-prompt-transport'));
 const { projectClaudePromptAuditToRequest } = require(path.join(srcMainDir, 'claude-prompt-request-projection'));
 const { claudeProviderFailureFromHook } = require(path.join(srcMainDir, '../shared/claude-provider-failure.cjs'));
+const { reduceClaudeAccessFailure, isClaudeAccessFailureBlocked, claudeSettingAccessOutcome } = require(path.join(srcMainDir, 'claude-access-failure-stop'));
 const {
   STORE_STATES: AGENT_SEND_DURABLE_STATES,
   createAgentSendReceiptStore,
@@ -1919,6 +1921,26 @@ if (process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
 }
 
 // ========== EXTERNAL FREEZE WATCHDOG ==========
+const perfNativeMonitors = new Map();
+function ensureNativePerfMonitor(webContents) {
+  if (!webContents || webContents.isDestroyed() || process.env.NOTED_PERF_WATCHDOG === '0'
+    || process.env.NOTED_E2E_TEST === 'true') return null;
+  if (!perfNativeMonitors.has(webContents.id)) {
+    const { createNativePerfMonitor } = require(path.join(srcMainDir, 'perf-native-metrics.js'));
+    const monitor = createNativePerfMonitor({ webContents, log: message => console.warn(message) });
+    perfNativeMonitors.set(webContents.id, monitor);
+    webContents.once('destroyed', () => { monitor.dispose(); perfNativeMonitors.delete(webContents.id); });
+  }
+  return perfNativeMonitors.get(webContents.id);
+}
+ipcMain.on('perf:ui-summary', (event, payload = {}) => {
+  if (!/^ui-[a-z0-9-]{1,80}$/.test(payload.id || '') || !Number.isFinite(payload.startAbs)
+    || !Number.isFinite(payload.durationMs) || payload.durationMs < 100) return;
+  const action = { id: payload.id, event: String(payload.event || '').replace(/[^a-z-]/g, '').slice(0, 24),
+    startAbs: payload.startAbs, durationMs: payload.durationMs };
+  void ensureNativePerfMonitor(event.sender)?.sample('ui-action', action);
+});
+
 // Forked plain-node process (src/main/perf-watchdog.js) with its OWN event
 // loop. In-process probes ([Perf:MainLoopGap], renderer EventTiming) are
 // themselves frozen during the freeze they should attribute — gap logs always
@@ -1955,10 +1977,12 @@ if (process.env.NOTED_PERF_WATCHDOG !== '0' && process.env.NOTED_E2E_TEST !== 't
       const all = BrowserWindow.getAllWindows().filter(win => !win.isDestroyed());
       const target = all.find(win => win.webContents.getOSProcessId() === request.pid) ||
         all.find(win => win.isFocused()) || all.find(win => win === mainWindow);
+      const resumeNative = perfNativeMonitors.get(target?.webContents.id)?.suspend('incident-profile');
       void captureIncidentProfile({ request, webContents: target?.webContents,
         directory: path.join(path.dirname(mainLogPath), 'perf-incidents'),
         log: message => console.warn(message),
-      }).catch(err => console.warn('[Perf:IncidentProfile] failed ' + String(err.message).slice(0, 160)));
+      }).catch(err => console.warn('[Perf:IncidentProfile] failed ' + String(err.message).slice(0, 160)))
+        .finally(() => resumeNative?.());
     });
     let contextDueAt = 0;
     let heartbeatPending = false;
@@ -2072,6 +2096,7 @@ const compactOperations = createCompactOperationRegistry({
     };
   },
   publish: (operation) => {
+    persistCompactSendReceipt(operation);
     for (const listener of compactOperationSubscribers) {
       try { listener(operation); } catch {}
     }
@@ -2096,6 +2121,21 @@ const compactOperations = createCompactOperationRegistry({
   },
 });
 const agentSendCancellations = createAgentSendCancellationRegistry();
+
+function persistCompactSendReceipt(operation) {
+  if (!operation?.sendOperationKey || !operation?.sendAttemptId) return null;
+  try {
+    const result = agentSendReceiptStore.observeCompactOperation(operation);
+    if (!result.ok && operation.outcome === 'completed') {
+      console.warn('[CompactOperation] durable receipt rejected operation=' + operation.operationId
+        + ' reason=' + result.reason);
+    }
+    return result;
+  } catch (error) {
+    console.error('[CompactOperation] durable receipt failed operation=' + operation.operationId, error);
+    return null;
+  }
+}
 const agentLaunchPreparations = createAgentLaunchPreparationRegistry({
   onChange: (state) => {
     console.log('[AgentLaunchPreparation] tab=' + String(state?.tabId || '').slice(-12)
@@ -14873,11 +14913,14 @@ async function augmentShutdownStateFromProcessProof(seedEntries, seedLiveTabIds)
 function markInterruptedAiSessionEntries(entries, reason) {
   if (!projectManager?.db?.db) return 0;
   let marked = 0;
+  const eligibleEntries = new Map([...entries || []].filter(([tabId, entry]) => (
+    entry.engine !== 'claude' || !isClaudeAccessAutoResumeBlocked(tabId, entry.sessionId)
+  )));
   const markStmt = projectManager.db.db.prepare(
     'UPDATE tabs SET was_interrupted = 1, overlay_dismissed = 0 WHERE tab_id = ?'
   );
-  for (const [tabId] of entries || []) marked += markStmt.run(tabId).changes;
-  persistShutdownInterruptedAgentSnapshot(entries || new Map(), reason);
+  for (const [tabId] of eligibleEntries) marked += markStmt.run(tabId).changes;
+  persistShutdownInterruptedAgentSnapshot(eligibleEntries, reason);
   return marked;
 }
 
@@ -14924,6 +14967,9 @@ function captureStartupInterruptedAgentSnapshot() {
       projects: projectManager.db.getAllProjects(),
       resolvedAt: Date.now(),
     });
+    startupInterruptedAgentSnapshot.targets = startupInterruptedAgentSnapshot.targets.filter(target => (
+      target.provider !== 'claude' || !isClaudeAccessAutoResumeBlocked(target.tabId, target.sessionId)
+    ));
     console.log('[Startup:ContinueSnapshot] source=' + startupInterruptedAgentSnapshot.source
       + ' targets=' + startupInterruptedAgentSnapshot.targets.length
       + ' unresolved=' + startupInterruptedAgentSnapshot.unresolved.length
@@ -15847,6 +15893,7 @@ async function readClaudeStartupSlashProof(payload = {}) {
   }
   const result = await scanClaudeStartupSlashProof(tabId, command, afterMs, sessionId, payload.commandId);
   result.outcome = claudeStartupProofOutcome(result);
+  observeClaudeSettingAccessOutcome(tabId, result);
   console.log('[ClaudeStartupSlashProof] tab=' + tabId.slice(-12)
     + ' label=' + label
     + ' command=' + JSON.stringify(command)
@@ -15863,6 +15910,71 @@ async function readClaudeStartupSlashProof(payload = {}) {
     + ' output=' + JSON.stringify(result.outputPreview || '')
     + ' error=' + (result.error || '-'));
   return result;
+}
+
+function claudeAccessFailureStateKey(tabId) {
+  return 'claude-access-failure:' + tabId;
+}
+
+function isClaudeAccessAutoResumeBlocked(tabId, sessionId) {
+  return isClaudeAccessFailureBlocked(
+    projectManager.db.getAppState(claudeAccessFailureStateKey(tabId)), sessionId,
+  );
+}
+
+function observeClaudeSettingAccessOutcome(tabId, proof) {
+  const outcome = claudeSettingAccessOutcome(proof);
+  const owner = proof?.evidence?.owner;
+  if (!outcome || !owner || owner.launchId !== claudeLaunchGenerationByTab.get(tabId)?.generation
+    || owner.lifecycleGeneration !== getTerminalLifecycleGeneration(tabId)
+    || owner.runSeq !== Number(terminalCommandState.get(tabId)?.runSeq || 0)
+    || owner.processId !== findClaudePidByTab(tabId)
+    || proof.evidence.write.enterInputRevision !== getTerminalInputRevision(tabId)) return;
+  observeClaudeAccessOutcome(tabId, outcome);
+}
+
+function observeClaudeAccessOutcome(tabId, outcome) {
+  const terminal = terminals.get(tabId);
+  const launch = claudeLaunchGenerationByTab.get(tabId);
+  const sessionId = bridgeKnownSessions.get(tabId) || launch?.sessionIdHint;
+  const pid = findClaudePidByTab(tabId);
+  if (!terminal || !launch || !pid || sessionId !== outcome.sessionId || aiStoppingTabs.has(tabId)) return;
+  const identity = currentAiLifecycleIdentity(tabId, {
+    processStatus: 'found', processPid: pid, processName: 'claude',
+  });
+  const key = claudeAccessFailureStateKey(tabId);
+  try {
+    const next = reduceClaudeAccessFailure(projectManager.db.getAppState(key), outcome);
+    if (!next) return;
+    projectManager.db.setAppState(key, next);
+    if (!next.blocked) return;
+    // Persist refusal to auto-restore BEFORE the fallible Stop. A process
+    // observation timeout or application shutdown must not reopen this loop.
+    projectManager.db.db.prepare('UPDATE tabs SET was_interrupted = 0 WHERE tab_id = ?').run(tabId);
+    console.warn('[ClaudeAccessStop] tab=' + String(tabId).slice(-12)
+      + ' session=' + sessionId.slice(0, 8) + ' count=2 reason=repeated-403');
+    // Let the same settings/turn outcome finish publishing first. This is an
+    // event continuation, not a retry timer or a new process-control queue.
+    setImmediate(() => {
+      void stopAiProcessInTabSerialized(tabId, {
+        toolType: 'claude', reason: 'claude-repeated-access-denied',
+        preSignalGuard: observed => ({
+          allowed: terminals.get(tabId) === terminal
+            && claudeLaunchGenerationByTab.get(tabId) === launch
+            && projectManager.db.getAppState(key)?.lastEventId === next.lastEventId
+            && isClaudeAccessAutoResumeBlocked(tabId, sessionId)
+            && compareAiLifecycleIdentity(identity, observed).matches,
+          reason: 'claude-access-stop-owner-changed',
+        }),
+      }).then(result => {
+        console.log('[ClaudeAccessStop] tab=' + String(tabId).slice(-12)
+          + ' success=' + (result?.success === true)
+          + ' reason=' + String(result?.error || 'stopped'));
+      }).catch(error => console.error('[ClaudeAccessStop] stop failed:', error));
+    });
+  } catch (error) {
+    console.error('[ClaudeAccessStop] outcome persistence failed:', error);
+  }
 }
 
 async function waitForClaudeStartupSlashProofInMain({
@@ -17818,6 +17930,19 @@ function startClaudeHookServer() {
         claudeSpinnerBusy.set(tabId, busy);
         const lifecycleReason = (!busy && event === 'StopFailure') ? 'error' : undefined;
         const providerFailure = claudeProviderFailureFromHook(msg);
+        if (!busy && taskTurnId) {
+          // This branch has already passed the shared PID/session/prompt hook
+          // guards. Retry/system rows and quoted errors never reach it.
+          const details = providerFailure?.details || providerFailure?.message || '';
+          const explicitStatus = details.match(/^API error:\s*(\d{3})\b/i);
+          observeClaudeAccessOutcome(tabId, {
+            verified: true, sessionId: session_id,
+            eventId: 'turn:' + getTerminalLifecycleGeneration(tabId) + ':' + taskTurnId,
+            success: event === 'Stop',
+            status: providerFailure?.status || (explicitStatus ? Number(explicitStatus[1]) : null),
+            message: details,
+          });
+        }
         const providerFailureMeta = providerFailure ? {
           terminalProviderFailure: true,
           providerErrorCode: providerFailure.code,
@@ -18892,6 +19017,7 @@ function createWindow() {
   };
 
   mainWindow = new BrowserWindow(windowOptions);
+  ensureNativePerfMonitor(mainWindow.webContents);
   console.log('[Window] BrowserWindow created');
   require(path.join(srcMainDir, 'display-profiles')).attachDisplayProfiles(mainWindow, {
     screen: require('electron').screen,
@@ -27644,13 +27770,37 @@ async function safePasteAndSubmit(term, content, options = {}) {
   const requestedInputRevision = operationTabId
     ? getTerminalInputRevision(operationTabId)
     : null;
+  const preparationDeadline = Date.now() + 30_000;
+  let preparationWaited = false;
+  let preparationIntent = null;
   let result;
-  try { result = await withPtyWriteLock(
+  const perform = () => withPtyWriteLock(
     term,
     async () => {
       const executionFailure = agentSendExecutionFailure(operationTabId, term, operation.executionIdentity,
         { stage: 'write-owner-admission' });
       if (executionFailure) return executionFailure;
+      if (preparationWaited && getTerminalInputRevision(operationTabId) !== requestedInputRevision) {
+        return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+          error: 'codex_input_ownership_changed', manualTakeover: true };
+      }
+      if (preparationWaited) {
+        const current = getCodexModelEffortIntentRecord(operationTabId);
+        if (current?.revision !== preparationIntent?.revision
+          || current?.actionSequence !== preparationIntent?.actionSequence) {
+          return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+            error: 'codex_settings_intent_changed' };
+        }
+      }
+      if (operationTabId && String(options.source || '').startsWith('codex-')
+        && !options.ptyWriteOwner && (codexSettingsMutationQueue.getUnsubmittedInput(term)
+          || codexModelEffortIntentReconcileInflight.has(operationTabId))) {
+        if (getTerminalInputRevision(operationTabId) !== requestedInputRevision) {
+          return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+            error: 'codex_input_ownership_changed', manualTakeover: true };
+        }
+        return { waitForInputPreparation: true, intent: getCodexModelEffortIntentRecord(operationTabId) };
+      }
       // Do this BEFORE reserving the next input revision. Reservation is not
       // user takeover and must not erase the previous unsubmitted /model.
       if (operationTabId && String(options.source || '').startsWith('codex-')
@@ -27707,7 +27857,21 @@ async function safePasteAndSubmit(term, content, options = {}) {
     },
     operation,
     options.ptyWriteOwner || null,
-  ); } catch (error) {
+  );
+  try {
+    for (;;) {
+      result = await perform();
+      if (!result?.waitForInputPreparation) break;
+      if (!preparationWaited) preparationIntent = result.intent;
+      preparationWaited = true;
+      const prepared = await waitForCodexInputPreparation(operationTabId, term, {
+        deadline: preparationDeadline, intent: preparationIntent, handoffId: options.handoffId,
+      });
+      if (prepared.success !== true) { result = prepared; break; }
+      // No reservation, image staging, paste or Enter has occurred. The same
+      // request re-enters the writer queue after the settings owner released it.
+    }
+  } catch (error) {
     result = resolveSafePasteFailureAfterWrite(error, term, options, operation);
   }
   const finish = async () => {
@@ -37070,6 +37234,16 @@ function createCodexRewindPostEnterOperation(tabId, {
   return record;
 }
 
+function readCodexRewindContinuationLaunchId(tabId, authority) {
+  const pendingLaunch = codexLastRunCommandPayload.get(tabId);
+  // This map owns startup/watchdog work, not the lifetime of a consumed
+  // Rewind. task_started normally removes it before a later native Rewind.
+  // The retained action supplies its original launch only while the caller
+  // revalidates its exact terminal/run/lifecycle/authority/input. A newly
+  // published launch (including an incomplete one) still overrides it.
+  return pendingLaunch ? pendingLaunch.launchId || null : authority?.identity?.launchId || null;
+}
+
 function isCodexRewindPostEnterCurrent(record) {
   if (!record || record.durable.phase === 'prepared') return false;
   const { tabId } = record.durable;
@@ -37080,7 +37254,7 @@ function isCodexRewindPostEnterCurrent(record) {
     || getHeadlessTerminalMirror(tabId) !== record.mirror
     || getTerminalLifecycleGeneration(tabId) !== expectation.sourceLifecycleGeneration
     || Number(terminalCommandState.get(tabId)?.runSeq || 0) !== expectation.sourceRunSeq
-    || codexLastRunCommandPayload.get(tabId)?.launchId !== record.originalLaunchId
+    || readCodexRewindContinuationLaunchId(tabId, record.authority) !== record.originalLaunchId
     || resolveAuthoritativeTabProjectId(tabId) !== expectation.projectId
     || getTerminalInputRevision(tabId) !== record.expectedInputRevision
     || aiStoppingTabs.get(tabId)?.toolType === 'codex'
@@ -37089,7 +37263,7 @@ function isCodexRewindPostEnterCurrent(record) {
   if (receipt.committed === true) return true;
   const journal = readPendingCodexNativeRewindHandoff(tabId);
   const observed = currentCodexActionAuthorityIdentity(tabId, record.authority, {
-    launchId: codexLastRunCommandPayload.get(tabId)?.launchId,
+    launchId: readCodexRewindContinuationLaunchId(tabId, record.authority),
     sourceSessionId: codexWatchers.get(tabId)?.sourceSessionId,
   });
   return classifyCodexRewindPostEnterRecovery({
@@ -37286,7 +37460,7 @@ async function recoverCodexRewindPostEnterOperation({ tabId, operationId, action
       const retainedIntent = codexSessionDiscoveryIntents.get(tabId);
       const discovery = observer || retainedIntent;
       const current = { ...currentCodexActionAuthorityIdentity(tabId, authority, {
-        launchId: codexLastRunCommandPayload.get(tabId)?.launchId,
+        launchId: readCodexRewindContinuationLaunchId(tabId, authority),
         sourceSessionId: discovery?.sourceSessionId,
       }), actionGeneration: discovery?.launchId,
       isRunning: terminalCommandState.get(tabId)?.isRunning === true,
@@ -37317,7 +37491,7 @@ async function recoverCodexRewindPostEnterOperation({ tabId, operationId, action
       const processProof = await inspectAiDescendantProcessesByTab(tabId, 'codex', { forceFresh: true });
       if (processProof?.status !== AI_PROCESS_LOOKUP_STATUS.FOUND
         || terminals.get(tabId) !== term || getTerminalInputRevision(tabId) !== current.inputRevision
-        || codexLastRunCommandPayload.get(tabId)?.launchId !== current.launchId
+        || readCodexRewindContinuationLaunchId(tabId, authority) !== current.launchId
         || getTerminalLifecycleGeneration(tabId) !== current.lifecycleGeneration) {
         return { success: false, pending: true, error: 'codex_rewind_recovery_process_unproven' };
       }
@@ -42058,6 +42232,11 @@ ipcMain.handle('project:update-tab-history-title', (event, { id, name, nameSetMa
 // consuming it; finish(commit=true) deletes it only after renderer has created
 // and persisted the replacement tab. A failed create releases the lease and
 // leaves History retryable.
+ipcMain.handle('project:peek-window-tab-history', (_event, payload = {}) => ({
+  success: true,
+  entry: projectManager.db.getLatestWindowTabHistory(payload),
+}));
+
 ipcMain.handle('project:begin-tab-history-restore', (event, { projectId, id } = {}) => {
   const started = Date.now();
   const result = tabHistoryRestoreLeases.begin({ projectId, id });
@@ -43994,6 +44173,11 @@ async function readAiLifecycleIdentityForTab(tabId, requestedToolType = null) {
 
 async function admitAiLifecycleLaunch(tabId, payload = {}) {
   const launchSource = normalizeAgentLaunchSource(payload?.launchSource);
+  if (launchSource === 'auto-resume' && String(payload?.command || '').startsWith('claude')
+    && isClaudeAccessAutoResumeBlocked(tabId, payload.sessionId)) {
+    return { allowed: false, suppressed: true, source: launchSource,
+      reason: 'claude-repeated-access-denied' };
+  }
   try {
     const webServer = require(path.join(srcMainDir, 'web-server'));
     if (typeof webServer.admitAgentLifecycleLaunch !== 'function') {
@@ -45293,6 +45477,8 @@ require(path.join(srcMainDir, 'ipc', 'semantic-search')).register({
 // claude:get-timeline, claude:export-clean-session, claude:get-full-history → ipc/claude-data.js
 require(path.join(srcMainDir, 'ipc', 'claude-data')).register({
   projectManager,
+  resolveTimelineNoteAnchor: request => require(path.join(srcMainDir, 'timeline-note-identity'))
+    .resolveTimelineNoteAnchor(request, payload => transcriptService.getTimeline(payload)),
   formatToolAction: formatSemanticToolAction,
   getClaudeEditableLastPromptState: (tabId, reason) =>
     getClaudeEditableLastPromptState(tabId, reason || 'claude-full-history-editable-last-prompt'),
@@ -50551,12 +50737,13 @@ function processCodexUserMessagePasteAudit(state, record) {
   }
 }
 
-function processCodexSourceAuditOnlyText(state, text, incomingStartOffset) {
+function processCodexSourceAuditOnlyText(state, text, incomingStartOffset, preferredUserAuditOffsets = null) {
   const consumed = consumeCodexUserMessageAuditChunk({
     chunk: text,
     incomingStartOffset,
     partial: state.sourceAuditPartial || '',
     partialStartOffset: state.sourceAuditPartialStartOffset,
+    preservePartialBytes: true,
   });
   state.sourceAuditPartial = consumed.partial;
   state.sourceAuditPartialStartOffset = consumed.partialStartOffset;
@@ -50569,7 +50756,9 @@ function processCodexSourceAuditOnlyText(state, text, incomingStartOffset) {
   // Prefer Codex's normal event_msg carrier when one fs batch contains both
   // forms. response_item(role=user) is a fallback for Resume/image turns where
   // that event is absent, not a second competing identity for ordinary sends.
-  const auditCandidates = selectCodexPreferredUserMessageAuditRecords(consumed.records);
+  const auditCandidates = preferredUserAuditOffsets
+    ? consumed.records.filter(candidate => preferredUserAuditOffsets.has(candidate.byteOffset))
+    : selectCodexPreferredUserMessageAuditRecords(consumed.records);
   for (const candidate of auditCandidates) {
     candidate.record.__byteOffset = candidate.byteOffset;
     const activityProof = createCodexResumeUserActivityProof({
@@ -51988,8 +52177,10 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, {
   }
 }
 
-function processCodexTurnText(state, text, incomingStartOffset) {
-  const incoming = Buffer.from(String(text || ''), 'utf8');
+function processCodexTurnText(state, text, incomingStartOffset, {
+  preferredUserAuditOffsets = null, deferCompactFinalization = false,
+} = {}) {
+  const incoming = Buffer.isBuffer(text) ? text : Buffer.from(String(text || ''), 'utf8');
   const partial = Buffer.from(state.partial || '', 'utf8');
   const combined = partial.length > 0
     ? Buffer.concat([partial, incoming])
@@ -52001,7 +52192,9 @@ function processCodexTurnText(state, text, incomingStartOffset) {
   let lineStart = 0;
   let newlineIndex = combined.indexOf(0x0a, lineStart);
   const lastCompleteNewline = combined.lastIndexOf(0x0a);
-  if (lastCompleteNewline >= 0) {
+  if (preferredUserAuditOffsets) {
+    state.preferredUserAuditOffsets = preferredUserAuditOffsets;
+  } else if (lastCompleteNewline >= 0) {
     const completeText = combined.subarray(0, lastCompleteNewline + 1).toString('utf8');
     const carriers = consumeCodexUserMessageAuditChunk({
       chunk: completeText,
@@ -52022,9 +52215,10 @@ function processCodexTurnText(state, text, incomingStartOffset) {
     newlineIndex = combined.indexOf(0x0a, lineStart);
   }
   const remaining = combined.subarray(lineStart);
-  state.partial = remaining.toString('utf8');
+  state.partial = Buffer.from(remaining);
   state.partialStartOffset = combinedStartOffset + lineStart;
   state.preferredUserAuditOffsets = null;
+  if (deferCompactFinalization) return;
   // The canonical consumer has now processed every complete record in this
   // append. Only here may task_complete become the deterministic failure
   // fallback; no timer or polling is involved.
@@ -52076,25 +52270,55 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
       if (stat.size === state.offset) continue;
 
       const start = state.offset;
-      const end = stat.size - 1;
-      const chunk = await new Promise((resolve, reject) => {
-        let out = '';
-        const stream = fs.createReadStream(state.filePath, { start, end, encoding: 'utf8' });
-        stream.on('data', (part) => { out += part; });
-        stream.on('error', reject);
-        stream.on('end', () => resolve(out));
+      const sourceAuditOnly = !!state.sourceObservationLaunchId
+        && reason !== 'watcher-close-final-audit' && !state.closeAfterPendingAuditDrain;
+      const partialKey = sourceAuditOnly ? 'sourceAuditPartial' : 'partial';
+      const partialOffsetKey = sourceAuditOnly ? 'sourceAuditPartialStartOffset' : 'partialStartOffset';
+      const readStartedAt = Date.now();
+      if (stat.size - start > 4 * 1024 * 1024) {
+        console.log('[CodexTurn:Read] tab=' + String(tabId).slice(-12)
+          + ' session=' + String(state.sessionId || '').slice(0, 8)
+          + ' reason=' + reason + ' startAbs=' + readStartedAt
+          + ' bytes=' + (stat.size - start) + ' mode=bounded-two-pass');
+      }
+      const read = await readCodexTurnAppend({
+        filePath: state.filePath, start, end: stat.size,
+        partial: state[partialKey] || '', partialStartOffset: state[partialOffsetKey],
+        isCurrent: () => codexTurnWatchers.get(tabId) === state,
+        onBatch: (batch, prepared) => {
+          // Commit only a successfully read, source-verified batch. A retry
+          // continues after applied bytes; unread bytes never count as proof.
+          if (sourceAuditOnly && !Number.isFinite(state.sourceWriterReplayOffset)) {
+            state.sourceWriterReplayOffset = start;
+            state.sourceWriterReplayPartial = state.partial || '';
+            state.sourceWriterReplayPartialStartOffset = state.partialStartOffset;
+          }
+          state.offset = batch.end;
+          // The reader has already prepended the exact carried bytes to its
+          // first batch, including a UTF-8 character split by a provider write.
+          state[partialKey] = '';
+          state[partialOffsetKey] = batch.start;
+          if (sourceAuditOnly) {
+            processCodexSourceAuditOnlyText(state, batch.buffer, batch.start, prepared.preferredUserAuditOffsets);
+          } else {
+            processCodexTurnText(state, batch.buffer, batch.start, {
+              preferredUserAuditOffsets: prepared.preferredUserAuditOffsets,
+              deferCompactFinalization: true,
+            });
+          }
+        },
       });
       if (codexTurnWatchers.get(tabId) !== state) return;
-      // Commit the byte offset only after the range was read successfully.
-      // Otherwise a transient read failure would make the retry look caught up
-      // and could release a provisional lifecycle without parsing its events.
-      state.offset = stat.size;
-      const chunkSummary = summarizeCodexTurnChunk(chunk);
+      // An I/O batch is not a lifecycle boundary. Only the whole captured
+      // append can settle compact failure or release provisional public state.
+      if (sourceAuditOnly) requestCodexSourceWriterProof(state);
+      else processCodexTurnText(state, '', state.offset);
+      const chunkSummary = read.summary;
       console.log('[CodexTurn:Delta]' +
         ' tab=' + String(tabId).slice(-12) +
         ' session=' + (state.sessionId || 'unknown') +
         ' reason=' + reason +
-        ' bytes=' + chunk.length +
+        ' bytes=' + read.stats.bytes +
         ' range=' + start + '..' + stat.size +
         ' lines=' + chunkSummary.lines +
         ' parseErrors=' + chunkSummary.parseErrors +
@@ -52103,33 +52327,11 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
         ' compacted=' + chunkSummary.compacted +
         ' other=' + chunkSummary.other +
         ' lastEvent=' + chunkSummary.lastEvent +
-        ' lastResponseItem=' + chunkSummary.lastResponseItem);
-      if (state.sourceObservationLaunchId) {
-        if (reason === 'watcher-close-final-audit' || state.closeAfterPendingAuditDrain) {
-          // The source rollout is still ownership-neutral for public runtime
-          // state, but a post-Enter user_message after the exact byte boundary
-          // is sufficient delivery proof. Process this final range under the
-          // existing public-suppression flags before the observer disappears.
-          processCodexTurnText(state, chunk, start);
-          continue;
-        }
-        // Keep ownership-neutral source appends on disk, not in a bounded RAM
-        // queue. The scan offset advances so fs.watch remains cheap; once lsof
-        // proves this tab owns the source, releaseCodexSourceObservation... rolls
-        // the offset back and replays the exact byte range losslessly.
-        if (!Number.isFinite(state.sourceWriterReplayOffset)) {
-          state.sourceWriterReplayOffset = start;
-          state.sourceWriterReplayPartial = state.partial || '';
-          state.sourceWriterReplayPartialStartOffset = state.partialStartOffset;
-        }
-        // User activity proves the writer independently from any one pending
-        // send. Keep this bounded source scan alive after an audit times out or
-        // is evicted; otherwise a later manual prompt never releases History.
-        processCodexSourceAuditOnlyText(state, chunk, start);
-        requestCodexSourceWriterProof(state);
-        continue;
-      }
-      processCodexTurnText(state, chunk, start);
+        ' lastResponseItem=' + chunkSummary.lastResponseItem +
+        ' readBytes=' + read.stats.readBytes + ' batches=' + read.stats.batches +
+        ' maxBatchBytes=' + read.stats.maxBatchBytes + ' maxRecordBytes=' + read.stats.maxRecordBytes +
+        ' candidateTextBytes=' + read.stats.candidateTextBytes + ' yields=' + read.stats.yields +
+        ' elapsedMs=' + (Date.now() - readStartedAt));
     } while (state.needsScan);
     scanSucceeded = true;
   } catch (e) {
@@ -64784,7 +64986,7 @@ ipcMain.handle('codex:get-persistent-model-effort-proof', (_event, { tabId } = {
   readCodexPersistentModelEffortProofForTab(tabId)
 ));
 
-async function waitForCodexLocalSlashPreparation(tabId, term, { deadline, intent, handoffId } = {}) {
+async function waitForCodexInputPreparation(tabId, term, { deadline, intent, handoffId } = {}) {
   // Observation only, OUTSIDE the PTY/settings queues: the existing model
   // owner must remain able to clear its insertion and finish its same intent.
   // Expiry never retries /model, clears an unknown draft, or submits the slash.
@@ -64792,8 +64994,7 @@ async function waitForCodexLocalSlashPreparation(tabId, term, { deadline, intent
     Math.max(0, deadline - Date.now()), { handoffId });
   const probe = () => {
     const current = getCodexModelEffortIntentRecord(tabId);
-    if (intent && (!current || current.revision !== intent.revision
-      || current.actionSequence !== intent.actionSequence)) {
+    if (current?.revision !== intent?.revision || current?.actionSequence !== intent?.actionSequence) {
       return { success: false, error: 'codex_settings_intent_changed' };
     }
     const controlPending = !!codexSettingsMutationQueue.getUnsubmittedInput(term)
@@ -64827,6 +65028,8 @@ async function executeCodexLiveSlashCommandRequest({
   tabId,
   command,
   handoffId = null,
+  sendOperationKey = null,
+  sendAttemptId = null,
   source = null,
   queue = false,
   statusAtSend = null,
@@ -64861,6 +65064,7 @@ async function executeCodexLiveSlashCommandRequest({
   const preparationDeadline = Date.now() + 30_000;
   const preparationLifecycle = getTerminalLifecycleGeneration(tabId);
   const preparationStopRevision = getTerminalStopRevision(tabId);
+  let preparationIntent;
   const slashOperation = {
     kind: 'codex-live-slash-command',
     source: 'codex-send-live-slash-command',
@@ -64881,6 +65085,14 @@ async function executeCodexLiveSlashCommandRequest({
     try {
       const perform = () => withPtyWriteLock(term, async () => {
         let compactPendingOperation = null;
+        if (preparationIntent !== undefined) {
+          const current = getCodexModelEffortIntentRecord(tabId);
+          if (current?.revision !== preparationIntent?.revision
+            || current?.actionSequence !== preparationIntent?.actionSequence) {
+            return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+              error: 'codex_settings_intent_changed' };
+          }
+        }
         if (terminals.get(tabId) !== term
           || getTerminalLifecycleGeneration(tabId) !== preparationLifecycle
           || getTerminalStopRevision(tabId) !== preparationStopRevision
@@ -64903,9 +65115,14 @@ async function executeCodexLiveSlashCommandRequest({
           const settingsCheck = typeof settingsWriteGuard === 'function' ? settingsWriteGuard() : null;
           if (settingsCheck && settingsCheck.allowed !== true) return settingsCheck;
           if (expectedTarget) {
-            const targetFailure = agentSendRequestTargetFailure(tabId, 'codex', { expectedTarget },
+            const currentTarget = readAgentSendDestinationAtWriteBoundary(tabId, 'codex',
               targetWriter?.available === true ? targetWriter.sessionId : null);
-            if (targetFailure) return { allowed: false, reason: targetFailure.code };
+            const targetFailure = agentSendTargetPreconditionFailure(expectedTarget, currentTarget);
+            if (targetFailure) return { allowed: false,
+              // Unknown ownership (for example an unsettled Rewind) is not
+              // evidence that another conversation replaced the target.
+              reason: expectedTarget.sessionId && !currentTarget.sessionId
+                ? 'agent_send_target_unresolved' : targetFailure.code };
           }
           return validateCodexPickerRuntimeAdmission({
             sameTerminal: terminals.get(tabId) === term,
@@ -65016,10 +65233,13 @@ async function executeCodexLiveSlashCommandRequest({
             provider: 'codex',
             command: '/compact',
             promptGeneration: boundary.promptSeq,
+            causalBoundaryEventSequence: boundary.boundaryEventSequence,
             operationId: handoffId
               ? 'codex:api:' + handoffId
               : undefined,
             handoffId,
+            sendOperationKey,
+            sendAttemptId,
             source: 'programmatic-live-slash',
             acceptedAt: Date.now(),
           });
@@ -65029,6 +65249,19 @@ async function executeCodexLiveSlashCommandRequest({
               error: 'codex_compact_operation_conflict',
               submitted: false,
             };
+          }
+          if (sendOperationKey || sendAttemptId) {
+            if (compactPendingOperation.sendOperationKey !== sendOperationKey
+              || compactPendingOperation.sendAttemptId !== sendAttemptId) {
+              return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+                error: 'compact_send_receipt_binding_failed', reason: 'compact-operation-owned-by-another-attempt' };
+            }
+            const bound = agentSendReceiptStore.bindCompactOperation(compactPendingOperation);
+            if (!bound.ok) {
+              cancelCodexManualCompactPending(tabId, 'compact-receipt-binding-failed', compactPendingOperation.operationId);
+              return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+                error: 'compact_send_receipt_binding_failed', reason: bound.reason };
+            }
           }
         }
 
@@ -65119,8 +65352,9 @@ async function executeCodexLiveSlashCommandRequest({
       for (;;) {
         const physical = await perform();
         if (!physical?.waitForLocalPreparation) return physical;
-        const prepared = await waitForCodexLocalSlashPreparation(tabId, term, {
-          deadline: preparationDeadline, intent: physical.intent, handoffId,
+        if (preparationIntent === undefined) preparationIntent = physical.intent || null;
+        const prepared = await waitForCodexInputPreparation(tabId, term, {
+          deadline: preparationDeadline, intent: preparationIntent, handoffId,
         });
         if (prepared.success !== true) return prepared;
         // No bytes were written. Re-enter the SAME serializer and repeat the

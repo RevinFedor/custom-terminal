@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { cpuFrame, systemCpu, summarizeFrames, createArtifactStore } = require('./perf-flight-recorder');
+const { cpuFrame, systemCpu, summarizeFrames, createArtifactStore, captureDecision } = require('./perf-flight-recorder');
 
 const proc = (pid, cpuNs, extra = {}) => ({ pid, ppid: 1, startedAtTicks: '10', cpuNs,
   name: 'process', footprintBytes: 1048576, ...extra });
@@ -41,6 +41,15 @@ test('system busy uses all-core delta and rejects a reset/topology change', () =
   assert.equal(systemCpu([cpu(0, 0), cpu(0, 0)], [cpu(100, 0), cpu(0, 100)]), 50);
   assert.equal(systemCpu([cpu(100, 0)], [cpu(0, 100)]), null);
   assert.equal(systemCpu([], [cpu(0, 0)]), null);
+});
+test('CPU ownership keeps Electron, its helpers, tab processes and unrelated Docker separate', () => {
+  const before = { processes: [proc(10,0),proc(11,0,{ppid:10}),proc(20,0,{ppid:10}),proc(30,0,{name:'Docker'})] };
+  const after = { processes: [proc(10,2e8),proc(11,4e8,{ppid:10}),proc(20,6e8,{ppid:10}),proc(30,8e8,{name:'Docker'})] };
+  const frame = cpuFrame(before,after,1000,[{pid:10,type:'Browser'}],[{pid:20,tabId:'tab'}],10);
+  assert.equal(frame.appCpu,20);assert.equal(frame.appChildCpu,40);assert.equal(frame.tabCpu,60);assert.equal(frame.externalCpu,80);
+  const summary=summarizeFrames([{...frame,wallMs:1000,elapsedMs:1000,cores:8,systemBusy:25,probeMs:1,observerGapMs:0}]);
+  assert.equal(summary.ownerGroups.externalCpu.peakCpu,80);assert.equal(summary.cores,8);
+  assert.equal(summary.ownerGroups.appCpu.meanCpu,20);
 });
 test('checkpoint preserves burst BETWEEN flushes and observed identity coverage', () => {
   const frames = [10, 300, 20].map((cpu, i) => ({ wallMs: 2000 * (i + 1), elapsedMs: 2000,
@@ -81,4 +90,22 @@ test('passive renderer diagnostics never hit-test, read computed style or scan t
   assert.doesNotMatch(source, /document\.elementFromPoint\s*\(|window\.getComputedStyle\s*\(|querySelectorAll\(['"]:hover/);
   assert.match(source, /targetEvidence=event/);
   assert.match(source, /writableLength > 16384/);
+});
+
+test('ambient CPU cannot consume the two responsiveness slots; skip reason and expiry are exact', () => {
+  const now = 86400000;
+  const background = [{ at: now - 1200000, group: 'background' }, { at: now - 600001, group: 'background' }];
+  assert.equal(captureDecision(background, now, 'sustained-cpu').reason, 'reserved-for-responsiveness');
+  assert.equal(captureDecision(background, now, 'ui-click').allowed, true);
+  const recent = [...background, { at: now - 1000, group: 'responsiveness' }];
+  const cooldown = captureDecision(recent, now, 'ui-click');
+  assert.equal(cooldown.reason, 'capture-group-cooldown'); assert.equal(cooldown.nextEligibleWallMs, now + 599000);
+  recent.push({ at: now - 2000, group: 'responsiveness' });
+  assert.equal(captureDecision(recent, now, 'ui-click').reason, 'rolling-quota-exhausted');
+});
+test('system load without an Electron hotspot does not waste a background profile or suppress a real UI stall', () => {
+  const pressure = { appCpu: 10, appChildCpu: 3, externalCpu: 750, systemBusy: 98 };
+  assert.equal(captureDecision([], Date.now(), 'sustained-cpu', pressure).reason, 'system-pressure-no-electron-hotspot');
+  assert.equal(captureDecision([], Date.now(), 'ui-click', pressure).allowed, true);
+  assert.equal(captureDecision([], Date.now(), 'sustained-cpu', { ...pressure, appCpu: 150 }).allowed, true);
 });

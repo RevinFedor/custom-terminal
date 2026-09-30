@@ -10,6 +10,16 @@ import * as spaces from '../utils/workspaceSpacesModel.mjs';
 import { dropFromMru } from '../utils/tabSwitcherModel.mjs';
 import { commitArchiveWithStopRetry, isDurableSaveTabsAck } from '../utils/tabPersistenceTransactions.mjs';
 import { stopAiBeforeTerminalKill } from '../utils/terminalCloseLifecycle.mjs';
+import ts from 'typescript';
+
+const appSource=fs.readFileSync(process.env.NOTED_REOPEN_BASELINE_APP || new URL('../App.tsx',import.meta.url),'utf8');
+const appAst=ts.createSourceFile('App.tsx',appSource,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
+let hotkeySource;
+function visit(node){
+  if(ts.isVariableDeclaration(node)&&node.name.getText(appAst)==='handleReopenLastClosedCapture')hotkeySource=node.initializer.getText(appAst);
+  ts.forEachChild(node,visit);
+}
+visit(appAst);assert.ok(hotkeySource);
 
 const source = process.env.NOTED_RESTORE_CONTROL === 'before'
   ? execFileSync('git', ['show', 'HEAD:src/renderer/store/useWorkspaceStore.ts'], { encoding: 'utf8' })
@@ -33,21 +43,23 @@ function fixture() {
   const workspace = { projectId: 'p', projectPath: '/fixture', tabCounter: 20,
     tabs: new Map([tab('left'), tab('parent'), tab('child', 'parent'), tab('grandchild', 'child'), tab('right')].map(t => [t.id, t])),
     tabGroups: [{ id: 'g' }], tabHistory: [], activeTabId: 'child' };
-  const archive = [], saves = [], calls = [], opts = [];
+  const archive = [], saves = [], calls = [], opts = [];let historySequence=0;
   const state = { openProjects: new Map([['p', workspace]]), activeProjectId: 'p', activeSpaceId: 'main',
     spaces: [{ id: 'main', layout: {} }], centerStrips: {}, globalTabMru: [],
     splitPanes: [{ ...chip('child'), windowId: 'original', tabs: [chip('left'), chip('child'), { slotId: 'new', projectId: 'p' }, chip('right')] }],
     splitFocusedIndex: 0, activeSpaceTab: chip('child'), clearTerminalBuffer() {},
     centerStripKey: () => 'p', getEffectiveTabId: () => workspace.activeTabId,
+    getFocusedProjectId: () => 'p',
     saveSession: () => calls.push('save-layout'), setProjectView() {},
-    switchTab: (p, id) => { workspace.activeTabId = id; calls.push('switch:' + id); },
-    activateCenterTab: (p, id) => { workspace.activeTabId = id; calls.push('activate:' + id); },
+    switchTab: (p, id) => { state.openProjects.get(p).activeTabId = id; calls.push('switch:' + id); },
+    activateCenterTab: (p, id) => { state.openProjects.get(p).activeTabId = id; calls.push('activate:' + id); },
     addTabToSplitPaneStrip: (index, p, id) => { calls.push('fallback'); state.splitPanes = panes.restoreTabAtPanePosition(state.splitPanes, index, chip(id)).panes; },
     createTab: async (_p, name, cwd, options) => {
       opts.push(options);
       if (state.createError) throw Error('fixture-create-failure');
-      const id = options.restoreId || 'new-' + workspace.tabCounter++;
-      workspace.tabs.set(id, { id, name, cwd, groupId: options.groupId, tabType: options.tabType });
+      const targetWorkspace=state.openProjects.get(_p);
+      const id = options.restoreId || (_p==='p'?'':_p+'-')+'new-' + targetWorkspace.tabCounter++;
+      targetWorkspace.tabs.set(id, { id, name, cwd, groupId: options.groupId, tabType: options.tabType });
       return id;
     },
   };
@@ -72,13 +84,25 @@ function fixture() {
       if (channel === 'project:archive-tab') {
         if (state.archiveError) return { success: false, error: 'fixture-archive-failure' };
         const t = args.tab;
-        const row = { id: archive.length + 1, project_id: 'p', tab_id: t.tabId, name: t.name, cwd: t.cwd,
+        const row = { id: ++historySequence, project_id: args.projectId, tab_id: t.tabId, name: t.name, cwd: t.cwd,
           position: t.position, group_id: t.groupId, restore_placement: t.restorePlacement ? JSON.stringify(t.restorePlacement) : null };
         archive.push(row); return { success: true, historyId: row.id };
       }
       if (channel === 'project:begin-tab-history-restore') {
         const row = args.id ? archive.find(e => e.id === args.id) : archive.at(-1);
         return row ? { ok: true, entry: row, token: 'lease' } : { ok: false, reason: 'not_found' };
+      }
+      if (channel === 'project:peek-window-tab-history') {
+        if (state.peekError) throw Error('fixture-peek-failure');
+        await state.peekWait?.();
+        const rows=archive.filter(row=>{
+          const p=placement.readTabRestorePlacement(row.restore_placement);
+          return args.projectIds.includes(row.project_id) && (args.projectOnly
+            || p?.window?.spaceId===args.spaceId && p?.window?.windowId===args.windowId);
+        }).map(row=>({...row,closedOrder:JSON.parse(row.restore_placement)?.closedOrder || row.closedOrder || 1}))
+          .filter(row=>row.closedOrder<=args.beforeOrder);
+        rows.sort((a,b)=>b.closedOrder-a.closedOrder);
+        return {success:true,entry:rows[0]||null};
       }
       if (channel === 'project:finish-tab-history-restore') {
         calls.push('finish:' + args.commit);
@@ -90,8 +114,116 @@ function fixture() {
     } },
   });
   Object.assign(state, module.exports);
-  return { state, workspace, archive, saves, calls, opts };
+  const pending=[];
+  const pressUndo=vm.runInNewContext(transformSync('(' + hotkeySource + ')',{loader:'tsx'}).code,{
+    view:'workspace',console,
+    useWorkspaceStore:{getState:()=>({...state,reopenLastClosedTab:(...args)=>{const p=state.reopenLastClosedTab(...args);pending.push(p);return p;}})},
+    useUIStore:{getState:()=>({triggerReopenPulse:()=>calls.push('pulse')})},showToast:message=>calls.push('toast:'+message),
+  });
+  return { state, workspace, archive, saves, calls, opts,
+    pressUndo:()=>pressUndo({metaKey:true,shiftKey:true,altKey:false,ctrlKey:false,code:'KeyT',preventDefault(){},stopPropagation(){},stopImmediatePropagation(){}}),
+    flushUndo:()=>Promise.all(pending.splice(0)),
+  };
 }
+
+test('actual hotkey restores newer Full before an older detached chip (919 -> 834 regression)', async()=>{
+  const f=fixture();f.state.clearTabFromSplitPane('left');await f.state.closeTab('p','child');
+  f.pressUndo();await f.flushUndo();
+  assert.equal(f.workspace.tabs.get(f.workspace.activeTabId)?.name,'child');
+  assert.equal(f.archive.length,0);
+  f.pressUndo();await f.flushUndo();assert.equal(f.workspace.activeTabId,'left');
+  assert.equal(f.opts.length,1,'detached tab remains the same runtime');
+});
+
+test('actual hotkey restores newer removal before older Full, including rapid repeated presses', async()=>{
+  const f=fixture();await f.state.closeTab('p','child');f.state.clearTabFromSplitPane('left');
+  f.pressUndo();f.pressUndo();await f.flushUndo();
+  assert.equal(f.calls.filter(c=>c.startsWith('activate:'))[0],'activate:left');
+  assert.equal(f.workspace.tabs.get(f.workspace.activeTabId)?.name,'child');
+  assert.equal(f.archive.length,0);assert.equal(f.opts.length,1);
+});
+
+test('archive candidate is window-scoped; a newer Full in another window does not displace local undo', async()=>{
+  const f=fixture();f.state.clearTabFromSplitPane('left');
+  f.state.splitPanes.push({...chip('right'),windowId:'neighbour'});
+  f.state.splitPanes[0]=panes.vacantPaneWithTabs(f.state.splitPanes[0],[chip('child')]);
+  await f.state.closeTab('p','right');f.state.splitFocusedIndex=0;
+  f.pressUndo();await f.flushUndo();assert.equal(f.workspace.activeTabId,'left');
+  assert.equal(f.archive.length,1);assert.equal(f.opts.length,0);
+});
+
+test('a moved focus/pane while archive peek waits retains the requested window identity',async()=>{
+  const f=fixture();f.state.clearTabFromSplitPane('left');let release;
+  f.state.peekWait=()=>new Promise(resolve=>{release=resolve;});
+  f.pressUndo();await new Promise(resolve=>setImmediate(resolve));
+  f.state.splitPanes.unshift({...chip('right'),windowId:'other'});f.state.splitFocusedIndex=0;
+  release();await f.flushUndo();
+  assert.ok(panes.paneSlots(f.state.splitPanes[1]).some(t=>t.tabId==='left'));
+  assert.equal(f.state.splitFocusedIndex,1);
+});
+
+test('archive read failure consumes neither undo source',async()=>{
+  const f=fixture();f.state.clearTabFromSplitPane('left');await f.state.closeTab('p','child');
+  f.state.peekError=true;f.pressUndo();await f.flushUndo();
+  assert.equal(f.archive.length,1);assert.equal(f.opts.length,0);
+  assert.ok(panes.paneDetachedTabs(f.state.splitPanes[0]).some(t=>t.tabId==='left'));
+});
+
+test('a later removal during archive read cannot replace the undo requested by the keypress',async()=>{
+  const f=fixture();f.state.clearTabFromSplitPane('left');let release;
+  f.state.peekWait=()=>new Promise(resolve=>{release=resolve;});
+  f.pressUndo();await new Promise(resolve=>setImmediate(resolve));
+  f.state.clearTabFromSplitPane('right');release();await f.flushUndo();
+  assert.equal(f.workspace.activeTabId,'left');
+  assert.ok(panes.paneDetachedTabs(f.state.splitPanes[0]).some(t=>t.tabId==='right'));
+  f.state.peekWait=null;f.pressUndo();await f.flushUndo();
+  assert.equal(f.workspace.activeTabId,'right');assert.equal(f.opts.length,0);
+});
+
+test('a later Full during archive read remains for the next keypress',async()=>{
+  const f=fixture();f.state.clearTabFromSplitPane('left');let release;
+  f.state.peekWait=()=>new Promise(resolve=>{release=resolve;});
+  f.pressUndo();await new Promise(resolve=>setImmediate(resolve));
+  await f.state.closeTab('p','child');release();await f.flushUndo();
+  assert.equal(f.workspace.activeTabId,'left');assert.equal(f.archive.length,1);
+  f.state.peekWait=null;f.pressUndo();await f.flushUndo();
+  assert.equal(f.workspace.tabs.get(f.workspace.activeTabId)?.name,'child');assert.equal(f.archive.length,0);
+});
+
+test('an initially empty undo cannot pick a later Full through the project fallback',async()=>{
+  const f=fixture();let release;
+  f.state.peekWait=()=>new Promise(resolve=>{release=resolve;});
+  f.pressUndo();await new Promise(resolve=>setImmediate(resolve));
+  await f.state.closeTab('p','child');f.state.peekWait=null;release();await f.flushUndo();
+  assert.equal(f.archive.length,1);assert.equal(f.opts.length,0);
+  f.pressUndo();await f.flushUndo();
+  assert.equal(f.workspace.tabs.get(f.workspace.activeTabId)?.name,'child');
+});
+
+test('Full from another project in this window is restored even when sidebar names the first project',async()=>{
+  const f=fixture();const q={projectId:'q',projectPath:'/fixture',tabCounter:20,tabs:new Map([['remote',tab('remote')]]),tabGroups:[],tabHistory:[],activeTabId:'remote'};
+  f.state.openProjects.set('q',q);
+  f.state.splitPanes[0]={...f.state.splitPanes[0],projectId:'q',tabId:'remote',tabs:[chip('left'),{projectId:'q',tabId:'remote'}]};
+  f.state.clearTabFromSplitPane('left');await f.state.closeTab('q','remote');
+  f.pressUndo();await f.flushUndo();assert.equal(q.tabs.get(q.activeTabId)?.name,'remote');
+  assert.ok(panes.paneSlots(f.state.splitPanes[0]).some(t=>t.projectId==='q'));
+});
+
+test('window removed during candidate read keeps access to the exact detached tab without a new runtime',async()=>{
+  const f=fixture();f.state.clearTabFromSplitPane('left');let release;
+  f.state.peekWait=()=>new Promise(resolve=>{release=resolve;});f.pressUndo();await new Promise(resolve=>setImmediate(resolve));
+  f.state.splitPanes=[{...chip('right'),windowId:'replacement'}];release();await f.flushUndo();
+  assert.equal(f.workspace.activeTabId,'left');assert.equal(f.opts.length,0);
+  assert.equal(f.state.splitPanes[0].windowId,'replacement');
+});
+
+test('a legacy un-timed detached row does not override a dated Full in the same window',async()=>{
+  const f=fixture();f.state.clearTabFromSplitPane('left');
+  delete f.state.splitPanes[0].detachedTabs[0].closedOrder;
+  await f.state.closeTab('p','child');f.pressUndo();await f.flushUndo();
+  assert.equal(f.workspace.tabs.get(f.workspace.activeTabId)?.name,'child');
+  f.pressUndo();await f.flushUndo();assert.equal(f.workspace.activeTabId,'left');
+});
 
 test('actual close → Cmd Shift T restores hierarchy and strip order with a fresh runtime identity', async () => {
   const f = fixture();

@@ -169,6 +169,16 @@ Desktop IPC отдельно согласует бинарный ответ: mai
 декодирует прежний DTO. HTTP/MCP и старый main остаются на object-протоколе;
 формат revision/delta/rewrite receipt не меняется.
 
+С30.09 диагностика имеет отдельные `hr-…`/UI context IDs и request/attempt/worker
+generation. Они удаляются перед service, не становятся source identity или
+read proof. `[HistoryRead]` отделяет очередь своей сессии, cold admission,
+cache/read/preparation, serialization и main delivery; renderer отдельно пишет
+decode. Причина SSD miss и RAM eviction различается, поздний отказ не теряется
+за успешными фазами. Точный словарь/пределы — `fact-performance-diagnostics.md`.
+Source fingerprint кэша сохранён: изменение реализации, включая этот этап,
+создаёт новую версию disposable cache; первый read после установки может быть
+cold. Это не потеря исходной истории и не разрешение ослаблять проверку версии.
+
 Проверки: `history-read-worker.test.js`, `historyReadTransport.test.mjs`,
 `scripts/history-disk-cache-cost-regression.cjs`, `history-disk-cache-e2e.mjs`
 и `history-worker-asar-regression.mjs`. ASAR smoke идёт через настоящий IPC:
@@ -229,6 +239,24 @@ consumer-mode range-reader сохраняет UTF-8 partial-tail и физиче
 остаётся неизвестной. ID-less совместимость также читает только выбранное
 семантическое окно, сохраняя прежний collector. Границы проверки —
 `fact-оркестрация-вкладок.md::Цена проверки результата`.
+
+## Поиск History: полный источник и ограниченная выдача
+
+`searchHistory` у Codex выполняется тем же History worker над полной canonical
+проекцией, включая virtual fork. Renderer не сканирует только загруженный кусок:
+у далёких строк бывают пустые identity stubs, которые дали бы ложное «не найдено».
+После вытеснения графа поиск читает подготовленную SSD-проекцию, не разбирает
+rollout заново. Claude использует полную локальную History-проекцию; matcher
+общий, буквальный, с фильтрами user/assistant/user-images и пустым запросом при
+выбранном типе. `imageCount` — небольшая metadata реальных image blocks, а не
+передача base64 в renderer; row stubs сохраняют этот признак.
+
+API принимает `offset/limit` и возвращает ограниченные snippets/offsets, но
+считает полный `total` совпадений, `entryTotal` сообщений и exact ключи всех
+затронутых итераций для Timeline. Assistant match относится к предшествующему
+user-turn. UI отправляет запрос после короткого debounce, отвергает устаревший
+ответ и показывает ошибку чтения отдельно от нуля совпадений. Новые поля
+не меняют source/writer authority, сохранённый transcript или submit proof.
 
 ## Смена физической сессии после JSONL-Rewind
 

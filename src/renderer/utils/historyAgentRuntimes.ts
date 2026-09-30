@@ -586,6 +586,8 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
         ...settingsIntent,
         command: normalizeCodexLocalSlashCommand(prompt),
         handoffId: options.handoffId || null,
+        sendOperationKey: options.sendOperationKey || null,
+        sendAttemptId: options.sendAttemptId || null,
         source: options.source || null,
         promptQueueAction: options.promptQueueAction,
         queue,

@@ -26,8 +26,8 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useAgentSendPending } from '../../hooks/useAgentSendActivity';
 import { resolveAgentBusyPresentation } from '../../utils/agentBusyPresentation.mjs';
-import { Archive, ArchiveX, RefreshCw } from 'lucide-react';
-import { useTabWorkContext, WORK_CONTEXT_COLOR } from '../../utils/tabWorkContext';
+import { Archive, ArchiveX, Bell, RefreshCw } from 'lucide-react';
+import { WORK_CONTEXT_COLOR } from '../../utils/tabWorkContext';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
@@ -52,6 +52,45 @@ const TAB_MARKER_HOVER_SCALE = 1.32;
 
 /** One completion-bell visual contract for sidebar cards and pane chips. */
 export const TAB_COMPLETION_NOTIFICATION_DISMISS_MS = 420;
+export const TAB_COMPLETION_NOTIFICATION_INSET_PX = 18;
+
+export function TabCompletionNotificationIcon({ persistent = false, size = 13, color }: {
+  persistent?: boolean;
+  size?: number;
+  color?: string;
+}) {
+  return <Bell size={size} color={color} fill={persistent ? 'currentColor' : 'none'}
+    data-tab-notification-mode={persistent ? 'persistent' : 'once'}
+    style={{ flexShrink: 0 }} aria-hidden="true" />;
+}
+
+/** The bell names the enabled mode; the existing border still owns unread completion. */
+export function TabCompletionNotificationBadge({ armed, persistent, fired }: {
+  armed: boolean;
+  persistent: boolean;
+  fired: boolean;
+}) {
+  const gapPx = useUIStore((s) => s.tabGeometry.gap);
+  if (!armed && !persistent && !fired) return null;
+  const label = persistent
+    ? 'Уведомления для каждого нового запроса'
+    : fired ? 'Разовое уведомление готово' : 'Разовое уведомление включено';
+  return <span data-tab-completion-notification-badge role="img" aria-label={label} title={label}
+    style={{
+      position: 'absolute',
+      right: TAB_PROCESS_BAR_W_PX + 1,
+      top: 1 - tabFastBadgeOutsidePx(gapPx),
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      width: 11,
+      height: 11,
+      color: fired ? '#ef4444' : '#f87171',
+      zIndex: 8,
+    }}>
+    <TabCompletionNotificationIcon persistent={persistent} size={11} />
+  </span>;
+}
 
 export function resolveTabCompletionNotificationShadow({
   armed,
@@ -654,14 +693,12 @@ export function TabContextUsageBadge({
 
 /** One shared top-left signal lane for sidebar rows and pane chips. */
 export function TabTopLeftSignals({
-  tabId,
   fastActive,
   contextPct,
   minContextPct = 0,
   zIndex = 8,
   muted = false,
 }: {
-  tabId: string;
   fastActive: boolean;
   contextPct?: number | null;
   /** Pane strips suppress low-value noise; sidebar keeps the complete reading. */
@@ -670,11 +707,9 @@ export function TabTopLeftSignals({
   muted?: boolean;
 }) {
   const gapPx = useUIStore((s) => s.tabGeometry.gap);
-  const workContext = useTabWorkContext(tabId);
-  const hasContextUpdate = workContext.pendingCount > 0;
   const numericPct = Number(contextPct);
   const showContext = Number.isFinite(numericPct) && numericPct >= minContextPct;
-  if (!showContext && !fastActive && !hasContextUpdate) return null;
+  if (!showContext && !fastActive) return null;
   return (
     <span
       data-tab-top-left-signals
@@ -695,9 +730,39 @@ export function TabTopLeftSignals({
     >
       {showContext && <TabContextUsageBadge pct={numericPct} zIndex={zIndex} muted={muted} />}
       <TabFastBadge active={fastActive} zIndex={zIndex} muted={muted} />
-      {hasContextUpdate && <span title="Есть обновления рабочего состояния" style={{ display: 'inline-flex', pointerEvents: 'auto' }}>
-        <RefreshCw size={11} color={WORK_CONTEXT_COLOR} data-tab-context-update-marker />
-      </span>}
+    </span>
+  );
+}
+
+export const TAB_CONTEXT_UPDATE_INSET_PX = 14;
+
+/** Pending information has its own lower-left slot, separate from usage/Fast. */
+export function TabContextUpdateBadge({ active, zIndex = 8 }: { active: boolean; zIndex?: number }) {
+  const gapPx = useUIStore((s) => s.tabGeometry.gap);
+  if (!active) return null;
+  return (
+    <span
+      data-tab-context-update-badge
+      role="img"
+      aria-label="Есть обновления рабочего состояния"
+      title="Есть обновления рабочего состояния"
+      style={{
+        position: 'absolute',
+        left: -CONTEXT_BADGE_BAR_OVERLAP_PX,
+        bottom: 1 - tabFastBadgeOutsidePx(gapPx),
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        width: 11,
+        height: 11,
+        maxHeight: 'calc(100% - 13px)',
+        borderRadius: 2,
+        background: 'var(--work-context-segment)',
+        color: WORK_CONTEXT_COLOR,
+        zIndex,
+      }}
+    >
+      <RefreshCw size={11} style={{ maxHeight: '100%' }} aria-hidden="true" data-tab-context-update-marker />
     </span>
   );
 }

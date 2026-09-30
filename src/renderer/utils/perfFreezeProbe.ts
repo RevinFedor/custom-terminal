@@ -2,6 +2,7 @@ import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { attributeFreeze, recentRendererActivities } from './rendererActivityTrail';
 import { reportPerfIncident, setPerfIncidentWriter } from './perfIncidentChannel';
 import { getInteractionCursor } from './interactionCursor';
+import { installUIActionDiagnostics, captureUIAction, recordUIFrame, recordUIEventTiming } from './uiPerformanceDiagnostics.mjs';
 
 let installed = false;
 
@@ -203,6 +204,12 @@ export function installPerfFreezeProbe() {
   );
 
   installWatchdogHeartbeat();
+  let diagnosticIpc: any = null;
+  try { diagnosticIpc = (window as any).require?.('electron')?.ipcRenderer; } catch {}
+  installUIActionDiagnostics({ emit: log, notify: (action: any) => {
+    try { diagnosticIpc?.send('perf:ui-summary', action); } catch {}
+  } });
+  log('[Perf:Probe] actionSchema=1 targetSnapshot=1 stylesheetIdentity=1 nativeCounters=' + Number(!!diagnosticIpc));
 
   const rafSamples: LoopSample[] = [];
   const timerSamples: LoopSample[] = [];
@@ -212,6 +219,7 @@ export function installPerfFreezeProbe() {
   const rafProbe = (now: number) => {
     const gapMs = now - lastRaf;
     const frameAbs = performance.timeOrigin + now;
+    recordUIFrame(frameAbs);
     pushLoopSample(rafSamples, { abs: frameAbs, gapMs });
     if (
       document.visibilityState === 'visible' &&
@@ -335,6 +343,10 @@ export function installPerfFreezeProbe() {
         for (const entry of list.getEntries() as any[]) {
           const name = String(entry.name || '');
           if (!/^(click|pointerdown|mousedown|keydown|keyup)$/.test(name)) continue;
+          const capturedAction = recordUIEventTiming(entry);
+          if (document.visibilityState === 'visible' && entry.duration >= 120) {
+            reportPerfIncident('ui-' + name, performance.timeOrigin + entry.startTime, entry.duration, capturedAction?.id);
+          }
           const inputDelay = typeof entry.processingStart === 'number'
             ? entry.processingStart - entry.startTime
             : NaN;
@@ -346,6 +358,8 @@ export function installPerfFreezeProbe() {
             : NaN;
           log(
             '[Perf:EventTiming] event=' + name +
+            ' actionId=' + (capturedAction?.id || 'uncaptured-or-evicted') +
+            ' targetSource=' + (capturedAction?.target.source || 'unknown') +
             ' interactionId=' + (entry.interactionId || 0) +
             ' startAbs=' + (performance.timeOrigin + entry.startTime).toFixed(1) +
             ' processingStartAbs=' + (typeof entry.processingStart === 'number' ? (performance.timeOrigin + entry.processingStart).toFixed(1) : 'na') +
@@ -452,6 +466,7 @@ export function installPerfFreezeProbe() {
   };
 
   const captureInput = (event: Event) => {
+    if (['click', 'pointerdown', 'mousedown', 'keydown', 'keyup', 'wheel'].includes(event.type)) captureUIAction(event);
     const pointer = event as PointerEvent | MouseEvent;
     const now = performance.now();
     if ('clientX' in pointer) {
@@ -520,6 +535,9 @@ export function installPerfFreezeProbe() {
   window.addEventListener('click', captureInput, { capture: true, passive: true });
   window.addEventListener('pointerdown', captureInput, { capture: true, passive: true });
   window.addEventListener('mousedown', captureInput, { capture: true, passive: true });
+  window.addEventListener('keydown', captureInput, { capture: true, passive: true });
+  window.addEventListener('keyup', captureInput, { capture: true, passive: true });
+  window.addEventListener('wheel', captureInput, { capture: true, passive: true });
   window.addEventListener('mouseover', captureInput, { capture: true, passive: true });
   window.addEventListener('pointermove', (event) => {
     lastPointerX = event.clientX;

@@ -1,6 +1,8 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { compactSendOwner, compactSendOwnerMatches, compactSendStartProven,
+  compactSendTerminalSettlement } = require('./compact-send-settlement');
 
 const {
   RECEIPT_STATES,
@@ -443,6 +445,13 @@ class AgentSendReceiptStore {
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
           AND state IN ('in-flight', 'enter-armed')
+      `),
+      compactReceipt: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET receipt_json = @receiptJson, state = @state,
+            updated_at = @updatedAt, settled_at = @settledAt
+        WHERE operation_key = @operationKey AND attempt_id = @attemptId
+          AND state IN ('in-flight', 'enter-armed', 'audit-pending', 'delivery-unknown', 'confirmed')
       `),
       settleAuditPendingFinal: this.db.prepare(`
         UPDATE ${TABLE_NAME}
@@ -1056,6 +1065,66 @@ class AgentSendReceiptStore {
     })());
   }
 
+  bindCompactOperation(operation) {
+    const owner = compactSendOwner(operation);
+    if (!owner) return { ok: false, reason: 'compact-owner-incomplete' };
+    return this.db.transaction(() => {
+      const record = this._record(owner.sendOperationKey);
+      if (!record || record.attemptId !== owner.sendAttemptId
+        || record.tabId !== owner.tabId || record.handoffId !== owner.handoffId
+        || record.provider !== owner.provider || record.state !== STORE_STATES.IN_FLIGHT) {
+        return { ok: false, reason: 'compact-attempt-mismatch', record };
+      }
+      const prior = record.receipt?.compactOperationOwner;
+      if (prior) return { ok: compactSendOwnerMatches(prior, operation), applied: false,
+        reason: 'compact-owner-already-bound', record };
+      return this.stageAttemptContext(owner.sendOperationKey, owner.sendAttemptId, {
+        compactOperationId: owner.operationId, compactOperationOwner: owner,
+      });
+    })();
+  }
+
+  observeCompactOperation(operation) {
+    const owner = compactSendOwner(operation);
+    if (!owner) return { ok: false, applied: false, reason: 'compact-owner-incomplete' };
+    const terminal = compactSendTerminalSettlement(operation);
+    const started = operation.active === true && compactSendStartProven(operation);
+    // Interrupted, superseded, unknown and task_complete without compacted
+    // evidence cannot retire the native optimistic journal as a success.
+    if (!terminal && !started) return { ok: false, applied: false, reason: 'compact-not-proven' };
+    return this._observeChange(this.db.transaction(() => {
+      const record = this._record(owner.sendOperationKey);
+      if (!record || record.attemptId !== owner.sendAttemptId
+        || record.tabId !== owner.tabId || record.handoffId !== owner.handoffId
+        || record.provider !== owner.provider || record.auditIdentity
+        || !compactSendOwnerMatches(record.receipt?.compactOperationOwner, operation)) {
+        return { ok: false, applied: false, reason: 'compact-attempt-mismatch', record };
+      }
+      const previous = record.receipt || {};
+      const settled = previous.coordinatedSettlement?.compact;
+      if (settled) return { ok: !terminal || JSON.stringify(settled) === JSON.stringify(terminal),
+        applied: false, idempotent: true, reason: 'compact-already-settled', record };
+      if (!terminal && record.state === STORE_STATES.CONFIRMED && previous.compactStartConfirmed === true) {
+        return { ok: true, applied: false, idempotent: true, record };
+      }
+      const receipt = { ...previous, success: true, accepted: true, submitted: true,
+        status: 'sent', receiptState: STORE_STATES.CONFIRMED,
+        localSlashCommand: true, compactStartConfirmed: true,
+        compactOperationId: owner.operationId, handoffId: owner.handoffId,
+        localCommandProof: 'codex-compact-causal-task-started',
+        deliveryOutcome: 'local-command-confirmed', auditPending: false, deliveryUnknown: false,
+        ...(terminal ? { coordinatedSettlement: { ...(previous.coordinatedSettlement || {}), compact: terminal } } : {}),
+      };
+      const updatedAt = this.now();
+      const info = this.statements.compactReceipt.run({ operationKey: owner.sendOperationKey,
+        attemptId: owner.sendAttemptId, receiptJson: encodeJson(receipt),
+        state: STORE_STATES.CONFIRMED, updatedAt, settledAt: record.settledAt || updatedAt });
+      return { ok: info.changes === 1, applied: info.changes === 1,
+        reason: info.changes === 1 ? null : 'compact-attempt-state-changed',
+        record: this._record(owner.sendOperationKey) };
+    })());
+  }
+
   settleAttempt(operationKeyInput, attemptIdInput, receiptInput) {
     const operationKey = requiredString(operationKeyInput, 'operationKey');
     const attemptId = requiredString(attemptIdInput, 'attemptId');
@@ -1075,6 +1144,24 @@ class AgentSendReceiptStore {
         return { ok: false, applied: false, stale: true, reason: 'stale-attempt', record };
       }
       if (record.state === STORE_STATES.CONFIRMED) {
+        // Causal compact start/completion can precede the renderer reply.
+        // Enrich transport metadata, but never overwrite the owner fact with
+        // its late null coordinator or regress success after a lost reply.
+        if (record.receipt?.compactOperationOwner && nextReceipt.success === true
+          && nextReceipt.submitted === true && nextReceipt.localSlashCommand === true
+          && nextReceipt.compactOperationId === record.receipt.compactOperationId
+          && nextReceipt.handoffId === record.handoffId) {
+          const receipt = { ...nextReceipt, ...record.receipt,
+            coordinatedSettlement: record.receipt.coordinatedSettlement
+              ? { ...(nextReceipt.coordinatedSettlement || {}), ...record.receipt.coordinatedSettlement }
+              : nextReceipt.coordinatedSettlement || null };
+          if (encodeJson(receipt) !== encodeJson(record.receipt)) {
+            this.statements.compactReceipt.run({ operationKey, attemptId,
+              receiptJson: encodeJson(receipt), state: STORE_STATES.CONFIRMED,
+              updatedAt: this.now(), settledAt: record.settledAt });
+            return { ok: true, applied: true, record: this._record(operationKey) };
+          }
+        }
         return {
           ok: true,
           applied: false,

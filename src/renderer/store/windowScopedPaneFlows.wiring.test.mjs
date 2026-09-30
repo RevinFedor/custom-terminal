@@ -211,21 +211,18 @@ test('живая вкладка не прячется из бокового сп
   assert.match(tabBar, /const mainTabsBase = allTabs;/);
 });
 
-test('Shift+Cmd+T сначала отменяет локальное удаление chip, затем восстанавливает full-close', () => {
+test('Shift+Cmd+T delegates both close kinds to the window-ordered serialized restore', () => {
   assert.match(app, /const targetPaneIndex = ws\.splitPanes\.length > 0 \? ws\.splitFocusedIndex : -1/);
-  assert.match(app, /ws\.restoreLastDetachedTabToSplitPane\(targetPaneIndex\)/);
+  assert.doesNotMatch(app, /ws\.restoreLastDetachedTabToSplitPane\(targetPaneIndex\)/);
   assert.match(app, /ws\.reopenLastClosedTab\(restoreProjectId, targetPaneIndex >= 0/);
-  assert.ok(
-    app.indexOf('restoreLastDetachedTabToSplitPane(targetPaneIndex)')
-      < app.indexOf('ws.reopenLastClosedTab(restoreProjectId'),
-    'local pane undo must win over an unrelated archived tab',
-  );
-  assert.match(store, /restoreLastDetachedTabToSplitPane: \(paneIndex\) => \{/);
+  assert.match(store, /chooseWindowCloseAction\(detached,archived\)/);
+  assert.match(store, /project:peek-window-tab-history/);
+  assert.match(store, /restoreLastDetachedTabToSplitPane: \(paneIndex, expectedTabId\) => \{/);
   assert.match(store, /const keepFocusedEmpty = detachedPaneIndex === splitFocusedIndex/);
   assert.match(store, /if \(keepFocusedEmpty\) \{/);
   assert.match(store, /reopenLastClosedTab: \(projectId, options\) => \{/);
-  assert.match(store, /background: paneTargetExists/);
-  assert.match(store, /current\.addTabToSplitPaneStrip\(requestedPaneIndex, projectId, result\.tabId\)/);
+  assert.match(store, /background: !!target/);
+  assert.match(store, /addTabToSplitPaneStrip\(restoredTarget\.index,restoreProjectId,result\.tabId\)/);
 });
 
 test('поле переживает сохранение и восстановление — старые сессии не ломаются', () => {

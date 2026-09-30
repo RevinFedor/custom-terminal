@@ -1165,7 +1165,7 @@ export function paneHistory(pane) {
   return [];
 }
 
-/** Tabs explicitly removed from this window, newest first (middle-click/Cmd+W). */
+/** Local window removals, newest first; closedOrder merges these with durable Full archives. */
 export function paneDetachedTabs(pane) {
   return Array.isArray(pane?.detachedTabs)
     ? pane.detachedTabs.filter((entry) => entry?.projectId && entry?.tabId)
@@ -1177,6 +1177,19 @@ const withPaneDetachedTabs = (pane, entries) => {
   return entries.length > 0 ? { ...rest, detachedTabs: entries } : rest;
 };
 
+let lastPaneCloseOrder = 0;
+export function nextPaneCloseOrder(panes = []) {
+  const previous = (Array.isArray(panes)?panes:[]).flatMap(paneDetachedTabs).reduce((max, entry) =>
+    Math.max(max, Number.isSafeInteger(entry.closedOrder) && entry.closedOrder > 0 ? entry.closedOrder : 0), 0);
+  lastPaneCloseOrder = Math.max(Date.now(), lastPaneCloseOrder + 1, previous + 1);
+  return lastPaneCloseOrder;
+}
+export function nextRestorablePaneClose(panes, paneIndex, tabExists = () => true, beforeOrder = Infinity) {
+  const list=Array.isArray(panes)?panes:[];
+  const held = new Set(allPaneTabIds(list));
+  return paneDetachedTabs(list[paneIndex]).find(entry => !held.has(entry.tabId) && tabExists(entry.projectId,entry.tabId)
+    && (!Number.isSafeInteger(entry.closedOrder) || entry.closedOrder <= beforeOrder)) || null;
+}
 export function rememberPaneDetachedTab(panes, paneIndex, entry, originalPane = null, keyOf = tabSlotKey) {
   const list = Array.isArray(panes) ? panes : [];
   const pane = list[paneIndex];
@@ -1184,7 +1197,7 @@ export function rememberPaneDetachedTab(panes, paneIndex, entry, originalPane = 
   const next = list.slice();
   const prior = paneDetachedTabs(pane).filter((candidate) => candidate.tabId !== entry.tabId);
   next[paneIndex] = withPaneDetachedTabs(pane, [
-    { projectId: entry.projectId, tabId: entry.tabId,
+    { projectId: entry.projectId, tabId: entry.tabId, closedOrder: nextPaneCloseOrder(list),
       ...(originalPane ? { position: { ...captureTabOrder(paneSlots(originalPane).map(keyOf), keyOf(entry)), logical: keyOf !== tabSlotKey } } : {}),
     },
     ...prior,
@@ -1193,13 +1206,15 @@ export function rememberPaneDetachedTab(panes, paneIndex, entry, originalPane = 
 }
 
 /** Undo the newest explicit removal in this exact pane. */
-export function restorePaneDetachedTab(panes, paneIndex, tabExists = () => true, keyOf = tabSlotKey) {
+export function restorePaneDetachedTab(panes, paneIndex, tabExists = () => true, keyOf = tabSlotKey, expectedTabId = null) {
   const list = Array.isArray(panes) ? panes : [];
   const pane = list[paneIndex];
   if (!pane) return null;
-  const held = new Set(allPaneTabIds(list));
   const detached = paneDetachedTabs(pane);
-  const target = detached.find((entry) => !held.has(entry.tabId) && tabExists(entry.projectId, entry.tabId));
+  const held = new Set(allPaneTabIds(list));
+  const target = expectedTabId
+    ? detached.find(entry => entry.tabId === expectedTabId && !held.has(entry.tabId) && tabExists(entry.projectId,entry.tabId))
+    : nextRestorablePaneClose(list, paneIndex, tabExists);
   if (!target) return null;
   const restored = restoreTabAtPanePosition(list, paneIndex, target, target.position, true,
     target.position?.logical ? keyOf : tabSlotKey).panes[paneIndex];

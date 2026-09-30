@@ -7,6 +7,7 @@ const path = require('path');
 const os = require('os');
 const { performance } = require('perf_hooks');
 const { captureNativeSnapshot } = require('./process-metrics-source');
+const { collectSystemPressure, pressureDelta } = require('./perf-system-pressure');
 
 const DAY = 86400000;
 const RETENTION_MS = 7 * DAY;
@@ -14,6 +15,26 @@ const DISK_CAP = 256 * 1024 * 1024;
 const OWN_FILE = /^(?:cpu-\d{10}\.ndjson|incident-\d+-\d+(?:\.json|\.sample\.txt|\.main\.cpuprofile|\.cpuprofile|\.trace\.json|\.profile\.json|\.capture\.json|\.ui\.json))$/;
 const round = (n) => Math.round(n * 10) / 10;
 const monoNow = () => performance.now();
+
+function captureDecision(recent, now, kind = 'unknown', detail = {}) {
+  const background = kind === 'sustained-cpu';
+  const group = background ? 'background' : 'responsiveness';
+  if (background && Number.isFinite(detail.appCpu) && detail.appCpu < 80
+    && Number.isFinite(detail.appChildCpu) && detail.appChildCpu < 80 && detail.systemBusy >= 90) {
+    return { allowed: false, reason: 'system-pressure-no-electron-hotspot', remaining: Math.max(0, 4 - recent.length), group };
+  }
+  if (recent.length >= 4) return { allowed: false, reason: 'rolling-quota-exhausted',
+    nextEligibleWallMs: Math.min(...recent.map(e => e.at)) + DAY, remaining: 0, group };
+  const ownGroup = recent.filter(e => e.group === group || !e.group);
+  // The same four captures/day, with two slots unavailable to recurring
+  // ambient CPU. It previously consumed all four before the user's click.
+  if (background && ownGroup.length >= 2) return { allowed: false, reason: 'reserved-for-responsiveness',
+    nextEligibleWallMs: Math.min(...ownGroup.map(e => e.at)) + DAY, remaining: 4 - recent.length, group };
+  const last = ownGroup.length ? Math.max(...ownGroup.map(e => e.at)) : -Infinity;
+  if (now - last < 600000) return { allowed: false, reason: 'capture-group-cooldown',
+    nextEligibleWallMs: last + 600000, remaining: 4 - recent.length, group };
+  return { allowed: true, reason: 'reserved', nextEligibleWallMs: now, remaining: 3 - recent.length, group };
+}
 
 function cpuFrame(before, after, elapsedMs, appPids, tabs, mainPid) {
   const previous = new Map((before?.processes || []).map(p => [p.pid, p]));
@@ -40,6 +61,8 @@ function cpuFrame(before, after, elapsedMs, appPids, tabs, mainPid) {
   }
   rows.sort((a, b) => b.cpu - a.cpu);
   return { measured: rows.length, appCpu: round(rows.filter(p => p.owner === 'app').reduce((n, p) => n + p.cpu, 0)),
+    appChildCpu: round(rows.filter(p => p.owner === 'app-child').reduce((n, p) => n + p.cpu, 0)),
+    externalCpu: round(rows.filter(p => p.owner === 'external').reduce((n, p) => n + p.cpu, 0)),
     ...(after.cpuTimeNormalization ? { cpuTimeNormalization: after.cpuTimeNormalization } : {}),
     tabCpu: round(rows.filter(p => p.owner === 'tab').reduce((n, p) => n + p.cpu, 0)),
     // Keep every Electron process and the top external/tab processes. Missing
@@ -73,7 +96,15 @@ function summarizeFrames(frames) {
     acc.sum += p.cpu * f.elapsedMs; acc.ms += f.elapsedMs; acc.peak = Math.max(acc.peak, p.cpu);
     byIdentity.set(key, acc);
   }
+  const ownerGroups = {};
+  for (const key of ['appCpu', 'appChildCpu', 'tabCpu', 'externalCpu']) {
+    const known = frames.filter(frame => Number.isFinite(frame[key]));
+    const duration = known.reduce((sum, frame) => sum + frame.elapsedMs, 0);
+    ownerGroups[key] = known.length ? { meanCpu: round(known.reduce((sum, frame) => sum + frame[key] * frame.elapsedMs, 0) / duration),
+      peakCpu: Math.max(...known.map(frame => frame[key])), observedMs: duration } : null;
+  }
   return { from: frames[0].wallMs - frames[0].elapsedMs, to: frames.at(-1).wallMs,
+    cores: frames.at(-1).cores ?? null, ownerGroups, systemPressure: frames.at(-1).systemPressure ?? null,
     ...(frames.at(-1).cpuTimeNormalization ? { cpuTimeNormalization: frames.at(-1).cpuTimeNormalization } : {}),
     samples: frames.length, systemPeak: systemValues.length ? Math.max(...systemValues) : null,
     appPeak: Math.max(...frames.map(f => f.appCpu)), maxProbeMs: Math.max(...frames.map(f => f.probeMs)),
@@ -123,16 +154,23 @@ function createArtifactStore(directory) {
         fs.unlinkSync(file(e.name)); bytes -= e.size;
       }
     },
-    reserveCapture(id, now = Date.now()) {
-      const recent = entries().filter(e => e.name.endsWith('.capture.json') && now - e.at < DAY);
-      if (recent.length >= 4 || recent.some(e => now - e.at < 10 * 60000)) return false;
-      write(id + '.capture.json', { requestedAt: now });
-      return true;
+    reserveCaptureDetails(id, now = Date.now(), kind = 'unknown', detail = {}) {
+      const recent = entries().filter(e => e.name.endsWith('.capture.json') && now - e.at < DAY).map(e => {
+        try { return { ...e, group: JSON.parse(fs.readFileSync(file(e.name), 'utf8')).group }; }
+        catch { return e; } // Legacy/unreadable receipt still consumes its slot.
+      });
+      const decision = captureDecision(recent, now, kind, detail);
+      if (decision.allowed) write(id + '.capture.json', { requestedAt: now, kind, group: decision.group });
+      return decision;
+    },
+    reserveCapture(id, now = Date.now(), kind = 'unknown') {
+      return this.reserveCaptureDetails(id, now, kind).allowed;
     },
   };
 }
 
-function createFlightRecorder({ directory, mainPid, log, requestCapture, context, snapshot = captureNativeSnapshot }) {
+function createFlightRecorder({ directory, mainPid, log, requestCapture, context, snapshot = captureNativeSnapshot,
+  pressure = collectSystemPressure }) {
   const artifacts = createArtifactStore(directory);
   artifacts.prune();
   let previous = null, previousCpus = null, previousAt = monoNow();
@@ -141,6 +179,27 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
   let lastCheckpoint = previousAt, lastIncident = -Infinity, lastPrune = previousAt;
   let hotSince = null, timer = null, stopped = false, consecutiveFailures = 0;
   let lastWriteErrorAt = -Infinity;
+  let pressureSample = null, pressurePending = false, lastPressureAt = -Infinity;
+  const decisionReports = new Map();
+  function logDecision(kind, detail, decision) {
+    const key = kind + ':' + decision.reason;
+    const previous = decisionReports.get(key);
+    const now = monoNow();
+    if (previous && now - previous.at < 10000 && !decision.allowed) { previous.omitted++; return; }
+    log('[Perf:CaptureDecision] ' + JSON.stringify({ kind, actionId: detail.actionId || null,
+      ...decision, omittedRepeats: previous?.omitted || 0 }));
+    decisionReports.set(key, { at: now, omitted: 0 });
+    if (decisionReports.size > 32) decisionReports.delete(decisionReports.keys().next().value);
+  }
+  function maybeCapture(kind, detail) {
+    const decision = monoNow() - startedAt < 60000
+      ? { allowed: false, reason: 'startup-warmup', nextEligibleWallMs: Date.now() + 60000 - (monoNow() - startedAt) }
+      : artifacts.reserveCaptureDetails(active.id, Date.now(), kind, detail);
+    active.capture = { requested: decision.allowed, skipReason: decision.allowed ? null : decision.reason, ...decision };
+    logDecision(kind, detail, decision); persist();
+    if (decision.allowed) requestCapture({ id: active.id, requestedWallMs: Date.now(), kind, ...detail });
+    return decision.allowed;
+  }
   function persist() {
     try { if (active) artifacts.write(active.id + '.json', active); }
     catch (err) {
@@ -157,21 +216,26 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
     const now = monoNow();
     if (active) {
       if (active.events.length < 24) active.events.push({ kind, ...detail, observedWallMs: Date.now() });
+      else active.omittedEvents = (active.omittedEvents || 0) + 1;
+      if (!active.capture?.requested && kind !== 'sustained-cpu') maybeCapture(kind, detail);
+      else logDecision(kind, detail, { allowed: false, reason: 'merged-into-active-incident', incident: active.id });
       return null;
     }
-    if (now - lastIncident < 10 * 60000) return null;
+    const incidentCooldown = kind === 'sustained-cpu' ? 600000 : 30000;
+    if (now - lastIncident < incidentCooldown) {
+      logDecision(kind, detail, { allowed: false, reason: 'incident-window-cooldown',
+        nextEligibleWallMs: Date.now() + incidentCooldown - (now - lastIncident) });
+      return null;
+    }
     lastIncident = now;
     const id = 'incident-' + Date.now() + '-' + process.pid;
     active = { id, version: 1, startedWallMs: Date.now(), endsMono: now + 20000,
       coverage: 'current-user-processes; CPU100=one-core; systemBusy100=all-cores',
       complete: false, frames: ring.slice(-30), events: [{ kind, ...detail, observedWallMs: Date.now() }], context: context() };
     persist(); // survive a later kill without waiting for the post-window
-    const heavy = now - startedAt >= 60000 && artifacts.reserveCapture(id);
-    active.capture = { requested: !!heavy, skipReason: heavy ? null : now - startedAt < 60000 ? 'startup-warmup' : 'rolling-quota-or-cooldown' };
-    persist();
+    const heavy = maybeCapture(kind, detail);
     log('[Perf:Incident] id=' + id + ' kind=' + kind + ' capture=' + Number(heavy) +
       ' captureSkip=' + (active.capture.skipReason || 'none') + ' file=' + artifacts.file(id + '.json'));
-    if (heavy) requestCapture({ id, requestedWallMs: Date.now(), kind, ...detail });
     return heavy ? id : null;
   }
   function tick() {
@@ -179,6 +243,18 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
     const start = monoNow(), elapsedMs = start - previousAt;
     let delayMs = 2000;
     try {
+      if (!pressurePending && start - lastPressureAt >= 30000) {
+        pressurePending = true; lastPressureAt = start;
+        Promise.resolve().then(() => pressure()).then(sample => {
+          if (stopped) return;
+          const delta = pressureDelta(pressureSample, sample);
+          pressureSample = { ...sample, delta };
+          log('[Perf:SystemPressure] ' + JSON.stringify(pressureSample));
+        }).catch(() => {
+          pressureSample = { sampledAt: Date.now(), available: false, reason: 'pressure-query-failed' };
+          log('[Perf:SystemPressure] ' + JSON.stringify(pressureSample));
+        }).finally(() => { pressurePending = false; });
+      }
       const nowCpus = os.cpus();
       const now = snapshot({ includeCommandLine: false });
       if (!now.ok) throw new Error(now.reason || 'native snapshot failed');
@@ -187,6 +263,7 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
         const cpu = cpuFrame(previous, now, elapsedMs, ctx.appPids || [], ctx.tabs || [], mainPid);
         const frame = { ...cpu, wallMs: Date.now(), absMs: performance.timeOrigin + start, monoMs: start, elapsedMs: round(elapsedMs),
           systemBusy: systemCpu(previousCpus, nowCpus), cores: nowCpus.length, loadAvg: os.loadavg(),
+          systemPressure: pressureSample ? { ...pressureSample, ageMs: Date.now() - pressureSample.sampledAt } : { available: false, reason: 'pending-first-sample' },
           probeMs: round(monoNow() - start), observerGapMs: round(Math.max(0, elapsedMs - 2000)),
           inaccessible: now.skipped, contextAgeMs: ctx.contextAgeMs };
         ring.push(frame); if (ring.length > 30) ring.shift();
@@ -197,7 +274,8 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
         hotSince = hot ? (hotSince ?? start) : null;
         if (hotSince !== null && start - hotSince >= 6000) incident('sustained-cpu', {
           pid: frame.rows.find(p => p.owner === 'app')?.pid,
-          appCpu: frame.appCpu, systemBusy: frame.systemBusy });
+          appCpu: frame.appCpu, appChildCpu: frame.appChildCpu, tabCpu: frame.tabCpu,
+          externalCpu: frame.externalCpu, systemBusy: frame.systemBusy });
       } else if (previous) {
         log('[Perf:CpuWindow] coverage-gap elapsedMs=' + round(elapsedMs) + ' reason=observer-delayed-or-sleep');
         hotSince = null;
@@ -212,6 +290,7 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
           const bucket = 'cpu-' + new Date().toISOString().slice(0, 13).replace(/\D/g, '') + '.ndjson';
           artifacts.write(bucket, JSON.stringify(summary) + '\n', true);
           log('[Perf:CpuWindow] from=' + summary.from + ' to=' + summary.to + ' appPeak=' + summary.appPeak +
+            ' ownerGroups=' + JSON.stringify(summary.ownerGroups) + ' cores=' + summary.cores +
             ' systemPeak=' + summary.systemPeak + ' probeMaxMs=' + summary.maxProbeMs +
             (summary.cpuTimeNormalization ? ' cpuUnit=' + summary.cpuTimeNormalization.outputUnit +
               ' timebase=' + summary.cpuTimeNormalization.numer + '/' + summary.cpuTimeNormalization.denom : '') +
@@ -234,4 +313,4 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
   return { artifacts, incident, stop() { stopped = true; clearTimeout(timer); persist(); } };
 }
 
-module.exports = { cpuFrame, systemCpu, summarizeFrames, createArtifactStore, createFlightRecorder };
+module.exports = { cpuFrame, systemCpu, summarizeFrames, createArtifactStore, createFlightRecorder, captureDecision };

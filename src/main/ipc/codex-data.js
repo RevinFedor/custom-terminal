@@ -1,6 +1,7 @@
 const { ipcMain } = require('node:worker_threads').isMainThread ? require('electron') : {};
 const path = require('path');
 const fs = require('fs');
+const { historyImageCountFromProviderRecord } = require('../../shared/history-search.cjs');
 const os = require('os');
 const crypto = require('crypto');
 const { historyRewriteOperation } = require('../../shared/fork-operation.cjs');
@@ -70,6 +71,8 @@ const {
   buildCodexHistoryContextItem,
 } = require('../agent-history-context-injection');
 const { execFile } = require('child_process');
+const { createCodexUsagePolling } = require('../codex-usage-polling');
+const { fetchCodexCreditExpiration, createCodexCreditExpirationReader } = require('../codex-credit-expiration');
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
@@ -80,7 +83,7 @@ const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const USAGE_ACCOUNTS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS = 1200;
 const USAGE_ACCOUNTS_ERROR_COOLDOWN_MS = 6 * 60 * 60 * 1000;
-// A visible renderer checks the selected account every 30 seconds. Keep the
+// Main checks all connected accounts every 30 seconds. Keep the
 // successful response briefly reusable for concurrent readers while allowing
 // the next scheduled check to reach OpenAI without forcing profile probes.
 const CODEX_REMOTE_USAGE_CACHE_TTL_MS = 25 * 1000;
@@ -160,6 +163,19 @@ async function loadCodexOperationSource(sessionId, cwd, options = {}) {
 let codexUsageStateHydrated = false;
 let codexAccountProfileManager = null;
 let codexAccountProfileCleanupBound = false;
+let codexUsagePolling = null;
+const codexManagedUsageInflight = new Map();
+const codexManagedUsageAccounts = new Map();
+let codexCreditExpirationReader = null;
+
+function readCodexCreditExpiration(auth, force) {
+  // This route is challenged by Cloudflare through Node fetch. Chromium's
+  // network stack accepts the same Codex OAuth, without a separate web login.
+  const { net } = require('electron');
+  if (!net?.fetch) return Promise.resolve(null);
+  codexCreditExpirationReader ||= createCodexCreditExpirationReader({ fetchImpl: (url, options) => net.fetch(url, options) });
+  return codexCreditExpirationReader.read(auth, { force });
+}
 const codexRemoteUsageByAccount = new Map();
 const codexRemoteUsageInflight = new Map();
 const codexActiveUsageOverrides = new Map();
@@ -4235,6 +4251,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
           pending.entry.sessionId = physicalSessionId;
           const imageRefs = mergeCodexUserMessageImageRefs(codexUserMessageImageRefs(record), pending.entry.imagePaths);
           if (imageRefs.length > 0) pending.entry.imagePaths = imageRefs;
+          pending.entry.imageCount = Math.max(pending.entry.imageCount || 0, historyImageCountFromProviderRecord(record));
           currentTurnCanonicalUserEntry = pending.entry;
         } else {
           currentTurnIndex += 1;
@@ -4245,6 +4262,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
             promptPresentationAuditTimestamp: recordTimestamp(record),
             promptPresentationTransportHash: promptAuditFingerprint(userText),
             role: goalContinuation ? 'goal' : 'user',
+            imageCount: historyImageCountFromProviderRecord(record),
             timestamp: recordTimestamp(record),
             content: goalContinuation
               ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
@@ -4350,6 +4368,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
         const imageRefs = mergeCodexUserMessageImageRefs(currentTurnCanonicalUserEntry?.imagePaths,
           codexUserMessageImageRefs(record));
         if (imageRefs.length > 0) currentTurnCanonicalUserEntry.imagePaths = imageRefs;
+        currentTurnCanonicalUserEntry.imageCount = Math.max(currentTurnCanonicalUserEntry.imageCount || 0, historyImageCountFromProviderRecord(record));
         rememberUserUuidAlias(currentTurnCanonicalUserEntry, stableUuidForRecord(sessionId, record, 'codex-user'));
         addStableSourceIdentityAlias(
           currentTurnCanonicalUserEntry,
@@ -4382,6 +4401,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       pendingResponseUsers.push({ entry, text: userText });
       const imageRefs = codexUserMessageImageRefs(record);
       if (imageRefs.length > 0) entry.imagePaths = imageRefs;
+      entry.imageCount = historyImageCountFromProviderRecord(record);
       return;
     }
 
@@ -9383,7 +9403,13 @@ async function fetchCodexUsageFromOpenAI(auth, {
       throw new CodexUsageFetchError('unauthorized', 'Codex OAuth token is invalid', response.status);
     }
     if (response.status === 429) {
-      throw new CodexUsageFetchError('rate_limited', 'OpenAI usage endpoint is rate limited', response.status);
+      const error = new CodexUsageFetchError('rate_limited', 'OpenAI usage endpoint is rate limited', response.status);
+      const retryAfter = response.headers?.get?.('retry-after');
+      const seconds = retryAfter == null || retryAfter.trim() === '' ? NaN : Number(retryAfter);
+      error.retryAt = Number.isFinite(seconds)
+        ? now() + Math.max(0, seconds) * 1000
+        : Date.parse(retryAfter || '');
+      throw error;
     }
     if (!response.ok) {
       throw new CodexUsageFetchError('server_error', 'OpenAI usage endpoint failed', response.status);
@@ -9500,8 +9526,9 @@ function pruneCodexRemoteUsageAccounts(currentAccountKey = null) {
   }
 }
 
-function listCodexRemoteUsageAccounts(currentAccountKey = null) {
+function listCodexRemoteUsageAccounts(currentAccountKey = null, profiles = codexAccountProfileManager?.listPublicProfiles() || []) {
   const now = Date.now();
+  const connected = new Set(profiles.filter(profile => profile.status === 'connected').map(profile => profile.accountKey));
   return [...codexRemoteUsageByAccount.entries()]
     .map(([accountKey, entry]) => {
       if (!entry?.account) return null;
@@ -9509,7 +9536,7 @@ function listCodexRemoteUsageAccounts(currentAccountKey = null) {
       return {
         ...entry.account,
         isCurrent,
-        stale: !isCurrent || !!entry.error || !!entry.warning
+        stale: (!isCurrent && !connected.has(accountKey)) || !entry.tokenFingerprint || !!entry.error || !!entry.warning
           || now - Number(entry.fetchedAt || 0) > CODEX_REMOTE_USAGE_STALE_MS,
         lastError: entry.error || null,
         warning: entry.warning || null,
@@ -9570,6 +9597,7 @@ async function getCodexRemoteUsage({
   verifyInitial = false,
   fetchImpl = global.fetch,
   resetCreditsFetchImpl = null,
+  creditExpirationFetchImpl = null,
   authReader = readCurrentCodexAuthSession,
   authRetryCount = 0,
 } = {}) {
@@ -9587,6 +9615,15 @@ async function getCodexRemoteUsage({
 
   const now = Date.now();
   const cached = codexRemoteUsageByAccount.get(auth.accountKey) || null;
+  if (cached?.retryAt > now && cached.tokenFingerprint === auth.tokenFingerprint) {
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: cached.error || null,
+      warning: cached.warning || null,
+      lastAttemptAt: cached.lastAttemptAt || cached.errorAt,
+    };
+  }
   if (auth.accessExpiresAtMs && auth.accessExpiresAtMs <= now + 30_000) {
     const message = codexUsageErrorMessage(new CodexUsageFetchError('unauthorized', 'Codex access token expired'));
     codexRemoteUsageByAccount.set(auth.accountKey, {
@@ -9632,6 +9669,9 @@ async function getCodexRemoteUsage({
   if (!request) {
     request = (async () => {
       const attemptAuth = auth;
+      const creditExpirationRequest = typeof creditExpirationFetchImpl === 'function'
+        ? fetchCodexCreditExpiration(attemptAuth, { fetchImpl: creditExpirationFetchImpl }).catch(() => null)
+        : fetchImpl === global.fetch ? readCodexCreditExpiration(attemptAuth, force) : Promise.resolve(null);
       const shouldFetchResetCredits = typeof resetCreditsFetchImpl === 'function'
         || fetchImpl === global.fetch;
       const resetCreditsRequest = shouldFetchResetCredits
@@ -9683,11 +9723,13 @@ async function getCodexRemoteUsage({
           };
         }
         const resetCreditsResult = await resetCreditsRequest;
+        const creditExpiration = await creditExpirationRequest;
         result = {
           ...result,
           account: {
             ...result.account,
             reset_credits: resetCreditsResult.value,
+            credit_expiration: creditExpiration,
           },
         };
         if (resetCreditsResult.error) {
@@ -9726,11 +9768,13 @@ async function getCodexRemoteUsage({
       lastAttemptAt,
       error: null,
       errorAt: 0,
+      retryAt: 0,
     };
     if (nextEntry.account) {
       nextEntry.account = {
         ...nextEntry.account,
         reset_credits: result.account.reset_credits || null,
+        credit_expiration: result.account.credit_expiration || null,
       };
     }
     codexRemoteUsageByAccount.set(result.account.accountKey, nextEntry);
@@ -9761,6 +9805,7 @@ async function getCodexRemoteUsage({
           verifyInitial,
           fetchImpl,
           resetCreditsFetchImpl,
+          creditExpirationFetchImpl,
           authReader,
           authRetryCount: authRetryCount + 1,
         });
@@ -9786,6 +9831,7 @@ async function getCodexRemoteUsage({
       lastAttemptAt,
       error: message,
       errorAt: Date.now(),
+      retryAt: Number.isFinite(error.retryAt) ? error.retryAt : 0,
     });
     pruneCodexRemoteUsageAccounts(errorAccountKey);
     console.warn('[CodexData] remote usage failed account=' +
@@ -9849,8 +9895,34 @@ function codexProfileFallbackAccount(result, receivedAtMs = Date.now()) {
   }, profile, { stale: false });
 }
 
-async function refreshCodexManagedProfileAccounts({ force = false, accountKey = null } = {}) {
+async function refreshCodexManagedProfileAccounts(options = {}) {
+  const key = options.accountKey || 'all';
+  if (codexManagedUsageInflight.has(key)) return codexManagedUsageInflight.get(key);
+  const request = refreshCodexManagedProfileAccountsInner(options);
+  codexManagedUsageInflight.set(key, request);
+  try { return await request; }
+  finally { if (codexManagedUsageInflight.get(key) === request) codexManagedUsageInflight.delete(key); }
+}
+
+async function refreshCodexManagedProfileAccountsInner({ force = false, accountKey = null } = {}) {
   if (!codexAccountProfileManager) return { accounts: [], results: [] };
+  const selectedProfile = accountKey && codexAccountProfileManager.listPublicProfiles()
+    .find(profile => !profile.isDefault && profile.accountKey === accountKey);
+  const profile = selectedProfile && codexAccountProfileManager.getProfile(selectedProfile.profileId);
+  const auth = profile && readCodexAuthSession(profile.homePath);
+  const cached = auth && codexRemoteUsageByAccount.get(auth.accountKey);
+  if (auth && cached?.tokenFingerprint === auth.tokenFingerprint
+    && (cached.retryAt > Date.now() || (!force && cached.errorAt
+      && Date.now() - cached.errorAt < CODEX_REMOTE_USAGE_ERROR_COOLDOWN_MS))) {
+    // A native app-server probe also reads quotas: do not bypass the account's
+    // known server pause by changing the transport while its HTTP reader waits.
+    const snapshot = getCodexRemoteUsageSnapshot(auth);
+    const account = snapshot.accounts.find(item => item.accountKey === auth.accountKey);
+    return {
+      accounts: account ? [decorateCodexProfileAccount(account, selectedProfile, { isCurrent: false })] : [],
+      results: [], error: snapshot.error,
+    };
+  }
   const initialResults = await codexAccountProfileManager.refreshManagedProfiles({ force, accountKey });
   const accounts = [];
   const results = [];
@@ -9905,9 +9977,13 @@ async function refreshCodexManagedProfileAccounts({ force = false, accountKey = 
     const remoteAccount = auth?.accountKey
       ? remoteResult?.accounts?.find((account) => account.accountKey === auth.accountKey)
       : null;
-    const decorated = remoteAccount?.usage && !remoteResult?.error
-      ? decorateCodexProfileAccount(remoteAccount, profile, { isCurrent: false, stale: false })
-      : codexProfileFallbackAccount(result);
+    const decorated = remoteAccount?.usage
+      ? decorateCodexProfileAccount(remoteAccount, profile, {
+        isCurrent: false,
+        stale: !!remoteResult?.error || !!remoteAccount.warning || remoteAccount.stale,
+        lastError: remoteResult?.error || remoteAccount.lastError || null,
+      })
+      : codexProfileFallbackAccount(result, profile.lastCheckedAt || Date.now());
     if (decorated) {
       if (profile.status !== 'connected') {
         profile = codexAccountProfileManager.markProfileConnected(profile.profileId, {
@@ -9917,17 +9993,64 @@ async function refreshCodexManagedProfileAccounts({ force = false, accountKey = 
           planType: decorated.plan_type,
         }) || profile;
       }
-      accounts.push(decorateCodexProfileAccount(decorated, profile, { isCurrent: false, stale: false }));
+      accounts.push(decorateCodexProfileAccount(decorated, profile, { isCurrent: false }));
+      codexManagedUsageAccounts.set(profile.profileId, accounts[accounts.length - 1]);
     }
     results.push(result);
   }
 
-  return { accounts, results };
+  return { accounts, results, error: results.find(result => result?.error)?.error
+    || accounts.find(account => account?.lastError)?.lastError || null };
+}
+
+function getCodexManagedUsageSnapshot() {
+  const profiles = codexAccountProfileManager?.listPublicProfiles() || [];
+  const byId = new Map(profiles.map(profile => [profile.profileId, profile]));
+  const accounts = [];
+  for (const [id, account] of codexManagedUsageAccounts) {
+    const profile = byId.get(id);
+    if (!profile || profile.status !== 'connected') {
+      codexManagedUsageAccounts.delete(id);
+      continue;
+    }
+    // Prefer the remote cache, which also owns account-specific errors/cooldown.
+    if (codexRemoteUsageByAccount.has(account.accountKey)) continue;
+    accounts.push(decorateCodexProfileAccount(account, profile, {
+      stale: codexUsageAccountIsStale({ ...account, stale: undefined }),
+    }));
+  }
+  return { accounts, results: [] };
+}
+
+function listCodexUsagePollingTargets() {
+  const auth = readCurrentCodexAuthSession();
+  const targets = [];
+  if (auth?.accessToken && auth?.accountId && auth?.accountKey) {
+    targets.push({ key: auth.accountKey, identity: auth.tokenFingerprint, isDefault: true });
+  }
+  for (const profile of codexAccountProfileManager?.listPublicProfiles() || []) {
+    if (profile.isDefault || !profile.accountKey || !['connected', 'error'].includes(profile.status)
+      || targets.some(target => target.key === profile.accountKey)) continue;
+    targets.push({ key: profile.accountKey, identity: profile.profileId, isDefault: false });
+  }
+  return targets;
+}
+
+function broadcastCodexUsageUpdated(target) {
+  try {
+    const { BrowserWindow } = require('electron');
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('codex:usage-updated', { accountKey: target.key });
+    }
+  } catch {}
 }
 
 function resetCodexUsageStateForTests() {
+  codexCreditExpirationReader = null;
+  codexUsagePolling?.stop();
   codexRemoteUsageByAccount.clear();
   codexRemoteUsageInflight.clear();
+  codexManagedUsageAccounts.clear();
   codexUsageStateStore = null;
   codexUsageStateHydrated = false;
 }
@@ -10528,7 +10651,9 @@ function register({ projectManager, transcriptService } = {}) {
   codexUsageStateStore = projectManager?.db || null;
   codexUsageStateHydrated = false;
   hydrateCodexUsageState();
+  codexUsagePolling?.stop();
   codexAccountProfileManager?.shutdown?.();
+  codexManagedUsageAccounts.clear();
   codexAccountProfileManager = new CodexAccountProfileManager({
     store: codexUsageStateStore,
     defaultCodexHome: CODEX_HOME,
@@ -10547,7 +10672,10 @@ function register({ projectManager, transcriptService } = {}) {
     codexAccountProfileCleanupBound = true;
     try {
       const { app } = require('electron');
-      app.once('before-quit', () => codexAccountProfileManager?.shutdown?.());
+      app.once('before-quit', () => {
+        codexUsagePolling?.stop();
+        codexAccountProfileManager?.shutdown?.();
+      });
     } catch {}
   }
 
@@ -11014,7 +11142,7 @@ function register({ projectManager, transcriptService } = {}) {
       let remoteMs = 0;
       let profilesMs = 0;
       const remoteStartedAt = Date.now();
-      const remotePromise = (refreshScope.refreshDefault
+      const remotePromise = (!opts.snapshotOnly && refreshScope.refreshDefault
         ? getCodexRemoteUsage({
           force: !!opts?.force,
           verifyInitial: true,
@@ -11022,12 +11150,12 @@ function register({ projectManager, transcriptService } = {}) {
         : Promise.resolve(getCodexRemoteUsageSnapshot(defaultAuthSnapshot)))
         .finally(() => { remoteMs = Date.now() - remoteStartedAt; });
       const profilesStartedAt = Date.now();
-      const profilesPromise = (refreshScope.managedAccountKey || refreshScope.refreshAllManaged
+      const profilesPromise = (!opts.snapshotOnly && (refreshScope.managedAccountKey || refreshScope.refreshAllManaged)
         ? refreshCodexManagedProfileAccounts({
           force: !!opts?.force,
           accountKey: refreshScope.managedAccountKey,
         })
-        : Promise.resolve({ accounts: [], results: [] }))
+        : Promise.resolve(getCodexManagedUsageSnapshot()))
         .finally(() => { profilesMs = Date.now() - profilesStartedAt; });
       const [remoteResult, managedProfileResult] = await Promise.all([
         remotePromise,
@@ -11048,7 +11176,7 @@ function register({ projectManager, transcriptService } = {}) {
       });
       // The local log is discovery/fallback only. A healthy OpenAI response
       // must not start or wait for a multi-gigabyte log scan.
-      const needsFallback = shouldLoadCodexFallbackUsage(remoteResult, opts?.accountKey);
+      const needsFallback = !opts.snapshotOnly && shouldLoadCodexFallbackUsage(remoteResult, opts?.accountKey);
       const accountResult = needsFallback
         ? await getCodexUsageAccountsFast({ force: false, reason: 'ipc-fallback' })
         : getCodexUsageAccountsSnapshot('ipc-server-primary');
@@ -11156,7 +11284,7 @@ function register({ projectManager, transcriptService } = {}) {
         usage = activeUsage;
         source = 'active-session-rollout';
       }
-      if (!usage && !accountResult.refreshing && !opts?.accountKey && accountUsages.length === 0) {
+      if (!opts.snapshotOnly && !usage && !accountResult.refreshing && !opts?.accountKey && accountUsages.length === 0) {
         usage = await findLatestCodexUsage();
         source = usage ? 'latest-rollout-unverified' : source;
         markUsageStage('latestRolloutScan');
@@ -11203,7 +11331,7 @@ function register({ projectManager, transcriptService } = {}) {
         cacheAgeMs: accountResult.cacheAgeMs,
         lastAttemptAt: selectedIsCurrent
           ? remoteResult.lastAttemptAt
-          : accountResult.lastAttemptAt,
+          : selectedAccount?.lastAttemptAt || accountResult.lastAttemptAt,
         lastSuccessAt: usage?.timestamp || null,
         warning,
         error: relevantError,
@@ -11216,6 +11344,14 @@ function register({ projectManager, transcriptService } = {}) {
     }
   };
   ipcMain.handle('codex:get-usage', (_event, opts = {}) => module.exports._api.getUsage(opts));
+  codexUsagePolling = createCodexUsagePolling({
+    listTargets: listCodexUsagePollingTargets,
+    refreshTarget: target => target.isDefault
+      ? getCodexRemoteUsage({ force: false, verifyInitial: true })
+      : refreshCodexManagedProfileAccounts({ force: false, accountKey: target.key }),
+    onUpdated: broadcastCodexUsageUpdated,
+  });
+  codexUsagePolling.start();
 }
 
 module.exports = {
@@ -11359,6 +11495,7 @@ module.exports = {
     fetchCodexResetCreditsFromOpenAI,
     getCodexRemoteUsage,
     getCodexRemoteUsageSnapshot,
+    listCodexRemoteUsageAccounts,
     resolveCodexUsageRefreshScope,
     readCodexAuthSession,
     readCurrentCodexAuthSession,

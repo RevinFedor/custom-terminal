@@ -298,6 +298,31 @@ test('read clients retain full messages, full-text search and export outside the
   assert.match(exported.content, /offscreen needle/);
 });
 
+test('search images and text across the full cached history retains paging and Timeline ownership after RAM eviction', async t => {
+  const user = (message, index) => ({type:'event_msg',timestamp:new Date(1700000000000+index).toISOString(),payload:{type:'user_message',message}});
+  const records=[];
+  for(let i=0;i<125;i++) {
+    records.push({type:'response_item',timestamp:new Date(1700000000000+i).toISOString(),payload:{type:'message',role:'user',content:[
+      {type:'input_image',image_url:'data:image/png;base64,AA'}, {type:'input_text',text:'photo '+i},
+    ]}});
+    records.push(user('[Image #1] photo '+i,i));
+    records.push(message('answer needle '+i,i));
+  }
+  records.push(user('literal [Image #1] without attachment',999));
+  const f=await fixture(t,records);
+  const full=await f.client.call('getHistory',f.payload);
+  assert.equal(full.success,true);
+  const sourceBytes=(await f.client.call('stats')).sourceBytes;
+  await f.client.call('releaseMemory');
+  const images=await f.client.call('searchHistory',{...f.payload,query:'',type:'user-images',offset:100,limit:100});
+  assert.equal(images.success,true);assert.equal(images.total,125);assert.equal(images.matches.length,25);
+  assert.equal(images.matches[0].matchIndex,100);assert.equal(images.entryTotal,125);
+  assert.ok(images.matches.every(m=>m.role==='user'&&m.hasImages));
+  const answer=await f.client.call('searchHistory',{...f.payload,query:'needle',type:'assistant',limit:2});
+  assert.equal(answer.total,125);assert.equal(answer.matches.length,2);assert.ok(answer.turnKeys.length>=125);
+  assert.equal((await f.client.call('stats')).sourceBytes,sourceBytes,'search must use prepared SSD data after graph eviction');
+});
+
 test('unavailable cache directory retains the canonical history capability', async t => {
   const f = await fixture(t, [message('canonical')]);
   await fs.writeFile(f.config.cacheDirectory, 'not a directory');

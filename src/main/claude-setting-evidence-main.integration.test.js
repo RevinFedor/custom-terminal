@@ -52,7 +52,7 @@ const names = ['resolveClaudeSessionFileForTab', 'captureClaudeSettingEvidenceOw
   'claudeSettingEvidenceProcessScopeCurrent', 'ensureClaudeSettingEvidenceProcessOwner',
   'resolveClaudeSettingEvidenceBinding',
   'normalizeClaudeLocalCommandText', 'claudeStartupProofOutcome', 'scanClaudeStartupSlashProof',
-  'readClaudeStartupSlashProof', 'waitForClaudeStartupSlashProofInMain',
+  'readClaudeStartupSlashProof', 'observeClaudeSettingAccessOutcome', 'waitForClaudeStartupSlashProofInMain',
   'trackClaudeInputLineForLocalCommands', 'reconcileClaudeInputLineBridgeTransition',
   'inspectClaudeExactSettingInputAtWriteBoundary', 'inspectClaudeExactSettingInput',
   'sendClaudeCommandInternal', 'sendClaudeCommandUnclaimed'];
@@ -140,6 +140,8 @@ function harness(t, options = {}) {
   const bridgePidCache = new Map(pid ? [[pid, 'tab-a']] : []);
   const launch = { generation: 'launch-a', launchMode: options.freshMissing ? 'fresh' : 'resume', sessionIdHint: 'session-a' };
   const context = vm.createContext({ console: quiet, Buffer, path, crypto, srcMainDir: __dirname,
+    claudeSettingAccessOutcome: require('./claude-access-failure-stop').claudeSettingAccessOutcome,
+    observeClaudeAccessOutcome() {}, // Separate actual-main/SQLite suite owns policy and Stop.
     Date: class extends Date { static now() { return 1000; } },
     require(filePath) {
       if (filePath === path.join(__dirname, 'claude-setting-evidence')) {

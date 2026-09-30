@@ -1,6 +1,17 @@
 @import "tailwindcss";
 @import "./presentationAnimations.css";
 
+/* Search ranges are owned per History, but these rules are loaded once.
+   Adding/removing a stylesheet on open/close restyles every retained window. */
+::highlight(hp-search) {
+  background: rgba(234, 179, 8, .35);
+  color: inherit;
+}
+::highlight(hp-search-current) {
+  background: rgba(234, 179, 8, .85);
+  color: #111;
+}
+
 /* Keep drag feedback local to chips. Inserting a universal cursor stylesheet
    on pickup/release invalidates every retained History in the document. */
 html[data-tabbar-drag-visual-lock="true"] [data-tab-item],

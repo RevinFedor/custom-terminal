@@ -26,7 +26,33 @@ function extractEffect(needle, name) {
   }).outputText;
 }
 
-test('Codex checks 30 seconds after the last request even across manual reads and tab switches', async () => {
+test('background notifications read the changed account cache while preserving the selected detail', () => {
+  const listeners = new Map();
+  const calls = [];
+  const context = {
+    selectedAccountKey: 'B',
+    refresh: (force, request) => calls.push({ force, ...request }),
+    ipcRenderer: { on: (key, fn) => listeners.set(key, fn), removeListener: key => listeners.delete(key) },
+    document: { visibilityState: 'visible', addEventListener: (key, fn) => listeners.set(key, fn),
+      removeEventListener: key => listeners.delete(key) },
+  };
+  vm.runInNewContext(extractEffect("reason: 'background-updated'", 'backgroundEffect'), context);
+  const cleanup = context.backgroundEffect();
+  listeners.get('codex:usage-updated')(null, { accountKey: 'A' });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0])), {
+    force: false, accountKey: 'A', snapshotOnly: true, preserveSelection: true, reason: 'background-updated',
+  });
+  context.document.visibilityState = 'hidden';
+  listeners.get('codex:usage-updated')(null, { accountKey: 'A' });
+  assert.equal(calls.length, 1);
+  context.document.visibilityState = 'visible';
+  listeners.get('visibilitychange')({});
+  assert.equal(calls[1].accountKey, 'B');
+  cleanup();
+  assert.equal(listeners.size, 0);
+});
+
+test('Codex reads the background cache after 30 seconds even across manual reads and tab switches', async () => {
   let now = 0;
   let nextTimerId = 0;
   const timers = new Map();
@@ -34,6 +60,7 @@ test('Codex checks 30 seconds after the last request even across manual reads an
   const calls = [];
   const lastRefreshStartedAtRef = { current: 0 };
   const makeRefresh = (account) => (force, request) => {
+    assert.equal(request.snapshotOnly, true, 'renderer polling must not make its own network sweep');
     calls.push({ account, force, reason: request.reason, at: now });
     lastRefreshStartedAtRef.current = now;
     return Promise.resolve();

@@ -19,6 +19,8 @@ export function buildHistorySendIncidentReport(input = {}) {
   const handoffId = text(input.handoffId) || '-';
   const error = text(input.error) || 'Unknown error';
   const promptText = typeof input.promptText === 'string' ? input.promptText : '';
+  const promptChars = Number.isSafeInteger(input.promptChars) && input.promptChars >= 0
+    ? input.promptChars : promptText.length;
   const incidentKind = text(input.incidentKind) || 'send';
   const startupSettingsIncident = incidentKind === 'startup-settings';
   const lines = [
@@ -53,13 +55,17 @@ export function buildHistorySendIncidentReport(input = {}) {
       'Error code: ' + (text(input.code) || '-'),
       'Images: ' + (Number.isFinite(Number(input.images)) ? Number(input.images) : 0),
       'Chips: ' + (Number.isFinite(Number(input.chips)) ? Number(input.chips) : 0),
+      'Text inserts: ' + (Number.isSafeInteger(input.textInserts) && input.textInserts >= 0 ? input.textInserts : 0),
       'Log lookup: ' + (text(input.logLookup)
         || ('[HistoryHandoff] SEND_RESULT tab=' + tabId.slice(-12)
           + ' handoff=' + handoffId)),
     );
   }
-  if (promptText) {
-    lines.push('Prompt (' + promptText.length + ' chars):', promptText);
+  if (!startupSettingsIncident) {
+    // The copied incident identifies an operation, not a second copy of its
+    // authoring. The exact content stays in the draft/receipt owned by that
+    // operation; attachments and pasted blocks must not enter clipboard here.
+    lines.push('Prompt: ' + promptChars + ' chars (content omitted)');
   }
   return lines.join('\n');
 }

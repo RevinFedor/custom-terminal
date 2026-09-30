@@ -1,8 +1,11 @@
+import {useHistorySearchMarkers} from '../../utils/historySearchMarkers';
+import {historySearchEntryKeys} from '../../../shared/history-search.mjs';
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
+import { projectTimelineNoteAnchors } from '../../utils/timelineNoteIdentity.mjs';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -861,6 +864,8 @@ interface TimelineRowApi {
 }
 
 interface TimelineSegmentRowProps {
+  searchMatch?: boolean;
+  searchCurrent?: boolean;
   entry: TimelineEntry;
   index: number;
   api: TimelineRowApi;
@@ -911,6 +916,8 @@ interface TimelineSegmentRowProps {
 }
 
 const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
+  searchMatch = false,
+  searchCurrent = false,
   entry,
   index,
   api,
@@ -1051,6 +1058,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
     dotGlow = isHovered ? '0 0 10px rgba(236, 72, 153, 0.5)' : '0 0 6px rgba(236, 72, 153, 0.25)';
   }
 
+  if (searchMatch) dotGlow = searchCurrent ? '0 0 0 3px #facc15, 0 0 8px #eab308' : '0 0 0 2px #ca8a04';
   const noteStrip = (
     <div
       className="flex-shrink-0 w-full flex items-center justify-center"
@@ -1096,6 +1104,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
         ref={(el) => api.setSegmentRef(index, el)}
         data-segment
         data-timeline-entry-uuid={entry.uuid}
+        data-history-search-match={searchMatch ? 'true' : undefined}
+        data-history-search-current={searchCurrent ? 'true' : undefined}
         {...(isUnreachable ? { 'data-unreachable': '' } : {})}
         className="relative w-full flex items-center"
         onMouseEnter={() => {
@@ -1262,7 +1272,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
             : undefined;
           return (
             <div
-              className="flex-1 min-w-0 pointer-events-none"
+              className="flex-1 min-w-0 pointer-events-none noted-infinite-animation"
               style={{
                 fontSize: isSummaryPreview ? `${timelineSummaryFontSize}px` : '1em',
                 lineHeight: 1.3,
@@ -1413,6 +1423,12 @@ function Timeline({
   backgroundPrewarmAdmitted = false,
   onInitialSourceSignal,
 }: TimelineProps) {
+  const historySearchMarkers = useHistorySearchMarkers(state => state.byTab[tabId]);
+  const historySearchMatches = useCallback((entry:any, current = false) => {
+    if (!historySearchMarkers || historySearchMarkers.sessionId !== (sessionId || '')) return false;
+    const keys = current ? historySearchMarkers.currentKeys : historySearchMarkers.keys;
+    return historySearchEntryKeys(entry).some((key:string) => keys.has(key));
+  }, [historySearchMarkers, sessionId]);
   const onInitialSourceSignalRef = useRef(onInitialSourceSignal);
   onInitialSourceSignalRef.current = onInitialSourceSignal;
   const isGemini = toolType === 'gemini';
@@ -1513,6 +1529,9 @@ function Timeline({
     ownerKey: timelineOwnerKey,
     entries: [],
   });
+  const [noteAnchorSnapshot, setNoteAnchorSnapshot] = useState<{ ownerKey: string; entries: any[] }>({
+    ownerKey: timelineOwnerKey, entries: [],
+  });
   // A prop switch immediately makes the previous array invisible. This is the
   // ownership boundary that prevents new session IDs from being paired with
   // stale prompts while the next async JSONL read is still in flight.
@@ -1526,8 +1545,11 @@ function Timeline({
     ? liveUserSnapshot.entries
     : [];
   const entries = useMemo<TimelineEntry[]>(() => (
-    mergeTimelineEntriesWithSentHandoffs(durableEntries, sentHandoffEntries, liveUserEntries)
-  ), [durableEntries, liveUserEntries, sentHandoffEntries]);
+    projectTimelineNoteAnchors(
+      mergeTimelineEntriesWithSentHandoffs(durableEntries, sentHandoffEntries, liveUserEntries),
+      noteAnchorSnapshot.ownerKey === timelineOwnerKey ? noteAnchorSnapshot.entries : [],
+    )
+  ), [durableEntries, liveUserEntries, sentHandoffEntries, noteAnchorSnapshot, timelineOwnerKey]);
   const [loadingOwnerKey, setLoadingOwnerKey] = useState<string | null>(
     sessionId ? timelineOwnerKey : null
   );
@@ -6967,15 +6989,28 @@ function Timeline({
       await handleDeleteNote(entry);
       return;
     }
-    await ipcRenderer.invoke('timeline:save-note', {
+    const owner = timelineOwnerKey;
+    const result = await ipcRenderer.invoke('timeline:save-note', {
       entryUuid: entry.uuid,
       sessionId,
       tabId,
+      cwd,
+      sourceIdentity: entry.sourceIdentity,
       content: text,
       position: noteEditPosition,
     });
-    setNotes(prev => ({ ...prev, [entry.uuid]: text }));
-    setNotePositions(prev => ({ ...prev, [entry.uuid]: noteEditPosition }));
+    if (timelineOwnerKeyRef.current !== owner) return;
+    if (result?.success !== true) {
+      useUIStore.getState().showToast(result?.error || 'Could not save note', 'error', 6000, true,
+        undefined, undefined, undefined, tabId);
+      return; // retain the author's text and editor; a failed save is not success
+    }
+    const savedUuid = result.entryUuid || entry.uuid;
+    if (result.anchor) setNoteAnchorSnapshot(current => ({ ownerKey: owner,
+      entries: [...(current.ownerKey === owner ? current.entries : []).filter(anchor => anchor.uuid !== savedUuid), result.anchor],
+    }));
+    setNotes(prev => ({ ...prev, [savedUuid]: text }));
+    setNotePositions(prev => ({ ...prev, [savedUuid]: noteEditPosition }));
     setIsNoteEditing(false);
   };
 
@@ -7031,36 +7066,41 @@ function Timeline({
 
     if (!nextAnchorUuid) return; // can't move further in this direction
 
-    // If anchor doesn't change (just position flip on same entry), do a single save.
-    // Otherwise: delete old, save under new anchor.
-    if (nextAnchorUuid === entry.uuid) {
-      await ipcRenderer.invoke('timeline:save-note', {
-        entryUuid: entry.uuid, sessionId, tabId, content: text, position: nextPosition,
-      });
-      setNotePositions(prev => ({ ...prev, [entry.uuid]: nextPosition }));
-      // Keep notes[uuid] in sync if user was actively editing
-      if (noteEditText.trim()) setNotes(prev => ({ ...prev, [entry.uuid]: text }));
-    } else {
-      await ipcRenderer.invoke('timeline:delete-note', { entryUuid: entry.uuid, sessionId });
-      await ipcRenderer.invoke('timeline:save-note', {
-        entryUuid: nextAnchorUuid, sessionId, tabId, content: text, position: nextPosition,
-      });
-      setNotes(prev => {
-        const next = { ...prev };
-        delete next[entry.uuid];
-        next[nextAnchorUuid!] = text;
-        return next;
-      });
-      setNotePositions(prev => {
-        const next = { ...prev };
-        delete next[entry.uuid];
-        next[nextAnchorUuid!] = nextPosition;
-        return next;
-      });
-      // Update active index so tooltip follows the note to its new anchor
-      const newIdx = entries.findIndex(e => e.uuid === nextAnchorUuid);
-      if (newIdx >= 0) setActiveNoteIndex(newIdx);
+    // Resolve a live neighbour before moving; the server changes both anchor
+    // and content atomically, never delete-old followed by a fallible save.
+    const target = entries.find(candidate => candidate.uuid === nextAnchorUuid)!;
+    const owner = timelineOwnerKey;
+    const result = await ipcRenderer.invoke('timeline:save-note', {
+      entryUuid: nextAnchorUuid, sessionId, tabId, cwd, content: text, position: nextPosition,
+      sourceIdentity: target.sourceIdentity,
+      previousEntryUuid: notes[entry.uuid] ? entry.uuid : undefined,
+      expectedPreviousContent: notes[entry.uuid],
+    });
+    if (timelineOwnerKeyRef.current !== owner) return;
+    if (result?.success !== true) {
+      useUIStore.getState().showToast(result?.error || 'Could not move note', 'error', 6000, true,
+        undefined, undefined, undefined, tabId);
+      return;
     }
+    const savedUuid = result.entryUuid || nextAnchorUuid;
+    if (result.anchor) setNoteAnchorSnapshot(current => ({ ownerKey: owner,
+      entries: [...(current.ownerKey === owner ? current.entries : []).filter(anchor => anchor.uuid !== savedUuid), result.anchor],
+    }));
+    setNotes(prev => {
+      const next = { ...prev };
+      delete next[entry.uuid];
+      next[savedUuid] = text;
+      return next;
+    });
+    setNotePositions(prev => {
+      const next = { ...prev };
+      delete next[entry.uuid];
+      next[savedUuid] = nextPosition;
+      return next;
+    });
+    // Update active index so tooltip follows the note to its new anchor
+    const newIdx = entries.findIndex(e => e.uuid === nextAnchorUuid);
+    if (newIdx >= 0) setActiveNoteIndex(newIdx);
     // Stay in edit mode so user can continue moving without re-opening
     setNoteEditPosition(nextPosition);
   };
@@ -7664,6 +7704,7 @@ function Timeline({
   const renderSemanticGroupHeader = (group: TimelineSemanticGroup, expanded: boolean) => (
     <div
       key={`semantic-header:${group.id}`}
+      data-history-search-match={group.members.some(member=>historySearchMatches(member)) ? 'true' : undefined}
       ref={(element) => {
         if (element) semanticGroupHeaderRefs.current.set(group.id, element);
         else semanticGroupHeaderRefs.current.delete(group.id);
@@ -7680,6 +7721,7 @@ function Timeline({
         alignItems: 'flex-start',
         cursor: 'pointer',
         borderTop: '1px solid rgba(192,132,252,0.18)',
+        boxShadow: group.members.some(member=>historySearchMatches(member)) ? 'inset 3px 0 #eab308' : undefined,
         borderBottom: '1px solid rgba(192,132,252,0.12)',
         background: hoveredSemanticGroupId === group.id
           ? 'linear-gradient(90deg, rgba(217,70,239,0.18), rgba(139,92,246,0.11)), #18131d'
@@ -8050,6 +8092,8 @@ function Timeline({
               <React.Fragment key={entry.uuid}>
                 {isExpandedLayout && semanticGroup && isSemanticGroupStart && renderSemanticGroupHeader(semanticGroup, true)}
                 <TimelineSegmentRow
+                  searchMatch={historySearchMatches(entry) || (!!isGroupCollapsed && entries.slice(index,index+(groupInfo?.groupSize || 1)).some(item=>historySearchMatches(item)))}
+                  searchCurrent={historySearchMatches(entry,true) || (!!isGroupCollapsed && entries.slice(index,index+(groupInfo?.groupSize || 1)).some(item=>historySearchMatches(item,true)))}
                   entry={entry}
                   index={index}
                   api={rowApi}

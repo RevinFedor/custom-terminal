@@ -6,7 +6,10 @@
 
    Target the indicators rather than every retained message. Keep this sheet
    static: no body-wide style mutations, observers, or React prop broadcasts.
-   Inline animations include HistorySpinner and the background-task dot.
+   Inline animations explicitly carry noted-infinite-animation. Attribute
+   substring selectors for style/class made an opacity or class update on a
+   retained owner invalidate thousands of ordinary descendants on every visit.
+   Keep the target indexed by exact classes instead of inspecting inline CSS.
    Finite animationend handoffs must still finish while hidden. */
 :is(
   [data-terminal-pane-wrapper][data-terminal-surface-presented="0"],
@@ -14,12 +17,17 @@
   [data-single-center-focus-boundary][aria-hidden="true"],
   [data-history-owner][data-history-presented="0"]
 ) :is(
-  [style*="animation:"][style*="infinite"],
-  [style*="animation-name:"][style*="infinite"],
+  .noted-infinite-animation,
   .animate-spin,
   .animate-pulse,
   .animate-bounce,
-  [class*="animate-glow-"],
+  .animate-glow-yellow,
+  .animate-glow-purple,
+  .animate-glow-green,
+  .animate-glow-indigo,
+  .animate-glow-blue,
+  .animate-glow-red,
+  .animate-glow-white,
   .cb-terminal-perimeter-loader-dot,
   .cb-spin,
   .cb-history-action-spinner,

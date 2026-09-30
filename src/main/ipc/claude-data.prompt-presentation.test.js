@@ -44,3 +44,21 @@ for (const arrayCarrier of [false, true]) {
     assert.equal(JSON.stringify(record), original, 'the source record is never rewritten');
   });
 }
+
+test('actual Claude History user branch retains pathless image evidence without counting literal markers', () => {
+  const records=[
+    {type:'user',uuid:'image',sessionId:'S',message:{content:[{type:'image',source:{type:'base64',data:'AA=='}},{type:'text',text:'photo'}]}},
+    {type:'user',uuid:'literal',sessionId:'S',message:{content:[{type:'text',text:'literal [Image #1]'}]}},
+  ];
+  const rows=[];
+  vm.runInNewContext('const normalizeQueuedText = ' + normalizer + ';\n'
+    + 'for (let i = 0; i < records.length; i++) { const entry = records[i]; const entrySid = entry.sessionId;\n'
+    + source.slice(start,end) + '\n}', {
+    records,promptAuditFingerprint,claudeUserRecordText:_api.claudeUserRecordText,
+    shouldSkipPromptText:()=>false,takeMatchingQueuedEntry:()=>null,isClaudeCompactSummaryCandidate:()=>false,
+    slashCommandEntryFromText:()=>null,appendProjectedEntry:entry=>rows.push(entry),
+  });
+  const {searchHistoryEntries}=require('../../shared/history-search.cjs');
+  assert.equal(rows[0].imageCount,1);assert.equal(rows[1].imageCount,0);
+  assert.deepEqual(searchHistoryEntries(rows,{type:'user-images'}).matches.map(m=>m.entryUuid),['image']);
+});

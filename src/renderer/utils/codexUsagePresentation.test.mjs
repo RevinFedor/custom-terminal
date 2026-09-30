@@ -4,7 +4,30 @@ import {
   buildCodexAdditionalLimitRows,
   buildCodexMainUsageView,
   visibleCodexResetCredits,
+  codexCreditExpirySummary,
 } from './codexUsagePresentation.mjs';
+
+test('credit expiry describes the full balance only when every credit has that date', () => {
+  const now = Date.parse('2026-09-30T00:00:00Z');
+  const snapshot = { balance: 62500, fetchedAt: new Date(now).toISOString(),
+    expirations: [{ amount: 62500, expiresAt: '2027-01-01T00:00:00Z' }] };
+  assert.equal(codexCreditExpirySummary({ balance: 62500 }, snapshot, now).allCredits, true);
+  const mixed = { ...snapshot, expirations: [{ amount: 10000, expiresAt: '2026-12-01T00:00:00Z' }, ...snapshot.expirations] };
+  const partial = codexCreditExpirySummary({ balance: 62500 }, mixed, now);
+  assert.equal(partial.allCredits, false);
+  assert.equal(partial.amount, 10000);
+});
+
+test('a date cannot be borrowed from a different balance, an old snapshot, or an expired package', () => {
+  const now = Date.parse('2026-09-30T00:00:00Z');
+  const snapshot = { balance: 62500, fetchedAt: new Date(now).toISOString(),
+    expirations: [{ amount: 62500, expiresAt: '2027-01-01T00:00:00Z' }] };
+  assert.equal(codexCreditExpirySummary({ balance: 60000 }, snapshot, now), null);
+  assert.equal(codexCreditExpirySummary({ balance: 62500 }, snapshot, now + 400000), null);
+  assert.equal(codexCreditExpirySummary({ balance: 62500, unlimited: true }, snapshot, now), null);
+  assert.equal(codexCreditExpirySummary({ balance: 62500 }, { ...snapshot,
+    expirations: [{ amount: 62500, expiresAt: '2026-09-29T00:00:00Z' }] }, now), null);
+});
 
 test('weekly-only Codex usage has no five-hour metric or compact divider', () => {
   assert.deepEqual(buildCodexMainUsageView({

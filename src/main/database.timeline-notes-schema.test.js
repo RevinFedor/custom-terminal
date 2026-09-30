@@ -47,4 +47,18 @@ test('fresh database creates timeline_notes with its current position column', (
     content: 'note',
     position: 'after',
   }]);
+
+  manager.saveTimelineNote('entry-2', 'session-1', 'tab-1', 'occupied', 'before');
+  assert.equal(manager.moveTimelineNote({ previousEntryUuid: 'entry-1', entryUuid: 'entry-2',
+    sessionId: 'session-1', tabId: 'tab-1', expectedPreviousContent: 'note', content: 'edited', position: 'before' }).error,
+  'timeline_note_target_occupied');
+  assert.equal(manager.moveTimelineNote({ previousEntryUuid: 'entry-1', entryUuid: 'entry-3',
+    sessionId: 'session-1', tabId: 'tab-1', expectedPreviousContent: 'stale', content: 'edited' }).error,
+  'timeline_note_changed');
+  assert.equal(manager.getTimelineNotes('session-1').length, 2);
+  assert.equal(manager.moveTimelineNote({ previousEntryUuid: 'entry-1', entryUuid: 'entry-3',
+    sessionId: 'session-1', tabId: 'tab-1', expectedPreviousContent: 'note', content: 'edited', position: 'before' }).success, true);
+  assert.equal(manager.getTimelineNotes('session-1').find(row => row.entry_uuid === 'entry-3').content, 'edited');
+  manager.copyTimelineMetadataForMappedFork('child-session', [{ sourceUuid: 'entry-3', childUuid: 'child-entry' }], 'child-tab');
+  assert.deepEqual(manager.getTimelineNotes('child-session'), [{ entry_uuid: 'child-entry', content: 'edited', position: 'before' }]);
 });

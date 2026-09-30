@@ -25,13 +25,26 @@ async function saveJson(file, data, limit = LIMIT) {
 }
 
 async function captureIncidentProfile({ request, webContents, directory, log, durationMs = 10000, inspector = require('inspector') }) {
-  if (!/^incident-\d+-\d+$/.test(request.id) || inFlight) return;
+  if (!/^incident-\d+-\d+$/.test(request.id)) return;
+  if (inFlight) {
+    log('[Perf:IncidentProfile] id=' + request.id + ' skipped=capture-in-flight');
+    try { await saveJson(path.join(directory, request.id + '.profile.json'), {
+      requestedWallMs: request.requestedWallMs, receivedWallMs: Date.now(), skipped: 'capture-in-flight',
+      coverage: 'not-recorded',
+    }); } catch {}
+    return;
+  }
   inFlight = true;
   const file = suffix => path.join(directory, request.id + suffix);
   const status = { requestedWallMs: request.requestedWallMs, receivedWallMs: Date.now(),
     requestDelayMs: Date.now() - request.requestedWallMs, pid: request.pid,
     engines: { electron: process.versions.electron, chrome: process.versions.chrome, node: process.versions.node },
-    intendedDurationMs: durationMs, errors: [], coverage: 'after-trigger-only; native sample is captured independently' };
+    intendedDurationMs: durationMs, samplingIntervalUs: 1000, errors: [],
+    triggerStartAbs: Number.isFinite(request.startAbs) ? request.startAbs : null,
+    triggerEndAbs: Number.isFinite(request.startAbs) && Number.isFinite(request.durationMs)
+      ? request.startAbs + request.durationMs : null,
+    actionId: typeof request.actionId === 'string' ? request.actionId.slice(0, 90) : null,
+    coverage: 'after-trigger-only; native sample is captured independently' };
   let owned = false, cpuStarted = false, tracing = false, traceResolved = null;
   let mainSession = null, mainPost = null, mainStarted = false;
   let mainStopped = false, cpuStopped = false, traceStopped = false, traceRequested = false;
@@ -42,6 +55,9 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
   const traceReady = new Promise(resolve => { traceComplete = resolve; });
   const onMessage = (_e, method, params) => {
     if (method === 'Tracing.tracingComplete' && tracing) { traceResolved = params; traceComplete(params); }
+    if (method === 'Tracing.bufferUsage' && Number.isFinite(params?.percentFull)) {
+      status.tracePeakBufferFraction = Math.max(status.tracePeakBufferFraction || 0, params.percentFull);
+    }
   };
   const send = (method, params = {}) => {
     if (!owned) return Promise.reject(new Error('debugger-ownership-lost'));
@@ -57,7 +73,7 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
         mainPost = (method, params = {}) => deadline(new Promise((resolve, reject) =>
           mainSession.post(method, params, (err, result) => err ? reject(err) : resolve(result))), method);
         await mainPost('Profiler.enable');
-        await mainPost('Profiler.setSamplingInterval', { interval: 10000 });
+        await mainPost('Profiler.setSamplingInterval', { interval: status.samplingIntervalUs });
         mainStarted = true; await mainPost('Profiler.start');
         status.mainStartedWallMs = Date.now();
       } else status.mainSkipped = 'external-inspector';
@@ -69,13 +85,15 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
       dbg.attach('1.3'); owned = true;
       dbg.on('detach', onDetach); dbg.on('message', onMessage);
       await send('Profiler.enable');
-      await send('Profiler.setSamplingInterval', { interval: 10000 });
+      await send('Profiler.setSamplingInterval', { interval: status.samplingIntervalUs });
       // Set before await so cleanup also covers a late reply after a timeout.
       cpuStarted = true;
       await send('Profiler.start');
       status.rendererPid = webContents.getOSProcessId();
       status.rendererStartedWallMs = Date.now();
       status.rendererStartedAbs = performance.timeOrigin + performance.now();
+      status.triggerOverlap = status.triggerEndAbs === null ? 'unknown'
+        : status.rendererStartedAbs <= status.triggerEndAbs ? 'partial' : 'trigger-already-finished';
       try {
         // Unlike contentTracing.startRecording, CDP rejects an existing global
         // recording rather than silently adopting it. Never end another trace.
@@ -83,8 +101,9 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
         traceRequested = true;
         // Chromium's wheel queue/ACK lives in `input`, not JS profiling. Keep
         // the existing privacy filter, capture quota and byte limits unchanged.
-        const traceCategories = ['toplevel', 'devtools.timeline', 'v8', 'blink', 'cc', 'gpu', 'input', 'latencyInfo'];
+        const traceCategories = ['toplevel', 'devtools.timeline', 'v8', 'blink', 'cc', 'gpu', 'input', 'latencyInfo', 'blink.user_timing'];
         const start = dbg.sendCommand('Tracing.start', { transferMode: 'ReturnAsStream',
+          bufferUsageReportingInterval: 1000,
           traceConfig: { recordMode: 'recordUntilFull', traceBufferSizeInKb: 8192,
             enableArgumentFilter: true, excludedCategories: ['*'],
             includedCategories: traceCategories } });
@@ -177,6 +196,8 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
     try { await saveJson(file('.profile.json'), status); } catch (err) { noteError(err); }
     log('[Perf:IncidentProfile] id=' + request.id + ' delayMs=' + status.requestDelayMs +
       ' durationMs=' + (status.finishedWallMs - status.receivedWallMs) + ' errors=' + status.errors.length +
+      ' overlap=' + (status.triggerOverlap || 'unknown') + ' traceComplete=' + Number(status.traceComplete === true) +
+      ' dataLoss=' + String(status.traceDataLoss ?? 'unknown') + ' peakBuffer=' + String(status.tracePeakBufferFraction ?? 'unknown') +
       ' file=' + file('.profile.json'));
     inFlight = false;
   }

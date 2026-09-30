@@ -33,6 +33,20 @@ xterm вернул старую строку меню. Система счита
 - Текст меню не внесён в blacklist: пользователь может сам набрать ровно те
   же слова, и такой настоящий draft должен блокировать смешивание сообщений.
 
+29.09 tab34 выявил диагностическую грань того же правила. При cold Resume
+первый main read ещё unknown, поэтому inner `codex:get-draft-state` запрашивает
+renderer hint. После await main уже доказывает empty на frame141, а renderer
+вернул frame100 той же generation и назвал placeholder draft. В этом входе
+positive promotion отключён: Send правильно продолжился и exact1396char audit
+подтвердился. Но причина отбрасывания hint вычислялась только при включённом
+promotion; её отсутствие создало ложный `draft-screen-contradiction` и тяжёлый
+capture/уведомление. Теперь возраст hint сохраняется независимо от opt-in:
+разрешение записи не меняется, безопасное отставание остаётся обычным логом.
+Same/newer, unknown/foreign generation и failed main по-прежнему диагностируются
+или защищают draft по прежним правилам. Проверять реальный request с порядком
+unknown→renderer await→empty и БЕЗ `mergeRendererPositive`, не только сам merge
+либо IPC с заглушкой «main уже definitive».
+
 Общий guard находится перед первой PTY-записью, поэтому правило действует для
 History, Project API, Inbox, Terminal MCP, оркестраций и Run After. Защита
 input revision и независимые проверки native picker/Rewind не снимаются.

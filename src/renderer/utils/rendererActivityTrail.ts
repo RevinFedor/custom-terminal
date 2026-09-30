@@ -17,6 +17,8 @@
  * trail WITHOUT dragging the probe — and the stores — in with it.
  */
 
+import { uiPerformancePhase } from './uiPerformanceDiagnostics.mjs';
+
 export type ActivityMark = {
   label: string;
   startAbs: number;
@@ -36,6 +38,7 @@ function absNow(): number {
  */
 export function markRendererActivity(label: string): () => void {
   const mark: ActivityMark = { label, startAbs: absNow(), endAbs: null };
+  uiPerformancePhase('activity-start:' + label);
   trail.push(mark);
   if (trail.length > TRAIL_MAX) trail.shift();
   let closed = false;
@@ -43,6 +46,7 @@ export function markRendererActivity(label: string): () => void {
     if (closed) return;
     closed = true;
     mark.endAbs = absNow();
+    uiPerformancePhase('activity-end:' + label, { ms: mark.endAbs - mark.startAbs });
   };
 }
 

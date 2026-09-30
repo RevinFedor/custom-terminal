@@ -1213,6 +1213,10 @@ class TabWorkContext {
 
   publish(tabId, { title, text, sourceTabId = null, requestId = null }) {
     this.requireTab(tabId);
+    sourceTabId = clean(sourceTabId) || null;
+    if (sourceTabId === tabId) throw Object.assign(fail(
+      'publish_context_update is for another tab; do not queue your own work as a self-addressed context update',
+    ), { code: 'context_update_self_target' });
     if (!clean(text) || text.length > 100000) throw fail('update text must contain 1-100000 characters');
     const key = clean(requestId) || null;
     const storedTitle = clean(title) || 'Обновление состояния';

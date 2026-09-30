@@ -295,7 +295,7 @@ function prepareCodexSourceProofReplay(state, {
   const replayOffset = Number.isFinite(state.sourceWriterReplayOffset)
     ? Number(state.sourceWriterReplayOffset)
     : null;
-  const replayPartial = typeof state.sourceWriterReplayPartial === 'string'
+  const replayPartial = (typeof state.sourceWriterReplayPartial === 'string' || Buffer.isBuffer(state.sourceWriterReplayPartial))
     ? state.sourceWriterReplayPartial
     : '';
   const replayPartialStartOffset = Number.isFinite(state.sourceWriterReplayPartialStartOffset)

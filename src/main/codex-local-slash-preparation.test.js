@@ -17,6 +17,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
 function fixture() {
   const events = new EventEmitter(), writes = [];
+  const reservations = [];
   const term = { write: bytes => writes.push(bytes) };
   const state = { runSeq: 1, isRunning: true };
   let input = 1, stopped = false, ready = false, lifecycle = 'G';
@@ -36,6 +37,20 @@ function fixture() {
     terminalCommandState: new Map([['T', state]]),
     getTerminalInputRevision: () => input, getTerminalLifecycleGeneration: () => lifecycle,
     getTerminalStopRevision: () => stopped ? 1 : 0,
+    findTabIdForTerm: () => 'T',
+    captureAgentInputIdentity: () => ({ terminalToken: term, terminalRunSeq: state.runSeq,
+      terminalLifecycleGeneration: lifecycle, terminalStopRevision: stopped ? 1 : 0 }),
+    assertKnownEmptySend() {}, isLocalSlashCommandPrompt: text => text.startsWith('/'),
+    conversationOwners: { noteInput() {} },
+    bumpTerminalInputRevision: () => { reservations.push(++input); return input; },
+    reserveClaudeExactEmptyEvidence: () => null, getHeadlessTerminalMirror: () => null,
+    finishSafePasteAfterWrite: async (_term, _text, _options, _operation, result) => result,
+    resolveSafePasteFailureAfterWrite: error => { throw error; },
+    settleCodexOwnedModelInput: async () => ({ success: false, error: 'codex_owned_model_input_pending' }),
+    _safePasteAndSubmitInner: async (_term, text, options) => {
+      writes.push({ text, images: options.presentationSnapshot.imagePaths });
+      return { success: true, submitted: true, pasteWritten: true, enterWritten: true };
+    },
     getCodexModelEffortIntentRecord: () => intent,
     getCodexWriterProofSnapshot: () => ({ sessionId: 'S' }), getCodexProvisionalSettingsSnapshot: () => null,
     isCodexTuiEffectivelyReady: () => ready,
@@ -61,13 +76,19 @@ function fixture() {
       });
     },
   });
-  for (const name of ['withPtyWriteLock', 'waitForCodexLocalSlashPreparation', 'executeCodexLiveSlashCommandRequest']) {
+  for (const name of ['withPtyWriteLock', 'waitForCodexInputPreparation', 'waitForCodexLocalSlashPreparation',
+    'executeCodexLiveSlashCommandRequest', 'safePasteAndSubmit', 'agentSendExecutionFailure']) {
     const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
     if (node) vm.runInContext(node.getText(ast), context);
   }
   const wake = () => events.emit('change');
-  return { context, term, writes, queue, events, wake,
-    send: () => context.executeCodexLiveSlashCommandRequest({ tabId: 'T', command: '/compact', handoffId: 'H', source: 'history-panel' }),
+  return { context, term, writes, queue, events, wake, reservations,
+    sendImage: () => context.safePasteAndSubmit(term, 'original prompt [Image #1]', {
+      source: 'codex-history-panel', handoffId: 'IMAGE', presentationSnapshot: {
+        text: 'original prompt [Image #1]', imagePaths: [{ id: 1, path: '/fixture/original.png' }],
+      },
+    }),
+    send: (options = {}) => context.executeCodexLiveSlashCommandRequest({ tabId: 'T', command: '/compact', handoffId: 'H', source: 'history-panel', ...options }),
     async finishSettings() {
       // This must acquire the real serializer while the slash is waiting.
       return context.withPtyWriteLock(term, async () => {
@@ -99,6 +120,48 @@ test('actual /compact joins delayed model preparation outside the PTY lock and s
   assert.deepEqual(h.writes, ['/compact', 'Enter']);
   assert.equal(h.events.listenerCount('change'), 0);
 });
+
+test('actual normal Send with image waits outside the writer queue without reserving input, then pastes once', async () => {
+  const h = fixture(); const result = h.sendImage(); await tick();
+  assert.deepEqual(h.writes, []); assert.deepEqual(h.reservations, []);
+  h.clearOnly(); await tick();
+  assert.deepEqual(h.writes, []); assert.deepEqual(h.reservations, []);
+  await h.finishSettings();
+  assert.equal((await result).submitted, true);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].text, 'original prompt [Image #1]');
+  assert.equal(h.writes[0].images[0].path, '/fixture/original.png');
+  assert.deepEqual(h.reservations, [2]);
+});
+
+for (const kind of ['input', 'stop', 'run', 'lifecycle', 'terminal', 'intent', 'intent-action']) {
+  test('normal image Send cancels before reservation and paste after ' + kind, async () => {
+    const h = fixture(); const result = h.sendImage(); await tick(); h.change(kind);
+    assert.equal((await result).success, false);
+    assert.deepEqual(h.writes, []); assert.deepEqual(h.reservations, []);
+  });
+}
+
+test('normal image Send deadline retains the service receipt and original input', async () => {
+  const h = fixture(); const result = await h.sendImage();
+  assert.equal(result.submitted, false);
+  assert.ok(h.queue.getUnsubmittedInput(h.term));
+  assert.deepEqual(h.writes, []); assert.deepEqual(h.reservations, []);
+});
+
+for (const type of ['sendImage', 'send']) {
+  test(type + ' retains the original settings choice between observation completion and writer reacquisition', async () => {
+    const h = fixture(); const observe = h.context.waitForCodexInputPreparation;
+    h.context.waitForCodexInputPreparation = async (...args) => {
+      const ready = await observe(...args);
+      if (ready.success) h.change('intent');
+      return ready;
+    };
+    const result = h[type](); await tick(); await h.finishSettings();
+    assert.equal((await result).error, 'codex_settings_intent_changed');
+    assert.deepEqual(h.writes, []); assert.deepEqual(h.reservations, []);
+  });
+}
 
 test('cleared /model alone does not overtake the same pending settings intent', async () => {
   const h = fixture(); const result = h.send(); await tick();
@@ -132,6 +195,40 @@ test('warm ready local command keeps its immediate path', async () => {
   assert.equal((await h.send()).success, true);
   assert.deepEqual(h.writes, ['/compact', 'Enter']);
   assert.equal(h.events.listenerCount('change'), 0);
+});
+
+test('actual API compact binds the exact durable attempt before any PTY submission and preserves boundary sequence', async t => {
+  const Database = require('better-sqlite3');
+  const db = new Database(':memory:'); t.after(() => db.close());
+  const store = require('./agent-send-receipt-store').createAgentSendReceiptStore(db);
+  const h = fixture(); await h.finishSettings();
+  const attempt = store.beginAttempt({ operationKey: 'project:T:H', surface: 'project-api',
+    tabId: 'T', handoffId: 'H', provider: 'codex', promptHash: 'unused', promptLength: 8,
+    requestFingerprint: 'one-request' });
+  h.context.agentSendReceiptStore = store;
+  h.context.compactOperations = require('./compact-operation-state').createCompactOperationRegistry();
+  h.context.captureCodexManualCompactBoundary = () => ({ tabId: 'T', sessionId: 'S',
+    generation: 'G', promptSeq: 7, sourceByteOffset: 128, boundaryEventSequence: 10 });
+  const sender = h.context.sendCodexLiveSlashCommand;
+  h.context.sendCodexLiveSlashCommand = async (...args) => {
+    const record = store.get('project:T:H');
+    assert.equal(record.receipt.compactOperationOwner.sendAttemptId, attempt.attemptId);
+    assert.equal(record.receipt.compactOperationOwner.causalBoundaryEventSequence, 10);
+    assert.equal(record.receipt.compactOperationOwner.generation, 'G');
+    return sender(...args);
+  };
+  const result = await h.send({ sendOperationKey: 'project:T:H', sendAttemptId: attempt.attemptId });
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.deepEqual(h.writes, ['/compact', 'Enter']);
+});
+
+test('failed exact compact receipt binding refuses before slash bytes without starting another executor', async () => {
+  const h = fixture(); await h.finishSettings();
+  h.context.agentSendReceiptStore = { bindCompactOperation: () => ({ ok: false, reason: 'stale-attempt' }) };
+  const result = await h.send({ sendOperationKey: 'project:T:H', sendAttemptId: 'old-attempt' });
+  assert.equal(result.error, 'compact_send_receipt_binding_failed');
+  assert.equal(result.submitted, false); assert.equal(result.pasteWritten, false);
+  assert.equal(result.enterWritten, false); assert.deepEqual(h.writes, []);
 });
 
 test('actual settings work, without a retained insertion yet, finishes before compact admission', async () => {

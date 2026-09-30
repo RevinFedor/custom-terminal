@@ -204,7 +204,7 @@ function projectCodexPolicyRuntime(base, policy) {
   const manual = policy.manualActionRequired === true;
   const message = policy.type === 'usage-exhaustion'
     ? manual ? 'Codex ждёт выбора после исчерпания лимита. Откройте терминал.' : 'Codex: обрабатывается лимит использования'
-    : manual ? 'Codex не подтвердил выбор для Goal. Откройте терминал.' : 'Codex: выбирается действие для Goal';
+    : manual ? 'Завершите выбор для Goal в терминале.' : 'Codex: выбирается действие для Goal';
   return { ...base, runtimePolicy: policy, inputReady: false, textReady: false,
     // A live modal is not an absent process. Only a known unhandled modal
     // terminates the starting presentation; it never invents input readiness.

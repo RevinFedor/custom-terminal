@@ -65,6 +65,7 @@ import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlac
 import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
 import { pointInHoverCluster, pointInRect } from '../../utils/hoverBridge.mjs';
 import { shouldDisarmAfterTriggerClear } from '../../utils/runAfterTriggerClear.mjs';
+import { consumePromptQueueMiddleClick } from '../../utils/promptQueueMiddleClick.mjs';
 import { getAppRuntimeIdentity } from '../../utils/appRuntimeIdentity';
 import { shouldArmQueueForTrigger } from '../../utils/promptTriggerArm.mjs';
 import {
@@ -1059,6 +1060,32 @@ export function PromptQueueOverlay({
       if (removeHoverId === id) setRemoveHoverId(null);
     }, 260);
   }, [removePrompt, removeHoverId, tabId]);
+
+  const clearItemTrigger = useCallback((id: string) => {
+    setPromptTrigger(tabId, id, null);
+    // Clearing the only runnable item's trigger must not accidentally arm
+    // plain turn-end execution. Both the cross and middle click use this path.
+    const live = usePromptQueueStore.getState().getQueue(tabId);
+    const runnableCount = live.items.filter(isQueuedPromptEnabled).length;
+    if (live.autoRun && shouldDisarmAfterTriggerClear({ runnableCount })) {
+      if (live.firstDelayCountdownAt !== null) {
+        usePromptQueueStore.getState().cancelFirstDelayCountdown(tabId);
+      }
+      setAutoRun(tabId, false);
+    }
+    setOnTabTriggerDraftIds((current) => {
+      if (!current.has(id)) return current;
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
+    setTimerTriggerDraftIds((current) => {
+      if (!current.has(id)) return current;
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
+  }, [setPromptTrigger, setAutoRun, tabId]);
 
   const generateRunAfterTitle = useCallback((id: string, opts?: { force?: boolean }) => {
     const queuedItem = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === id);
@@ -3310,6 +3337,7 @@ export function PromptQueueOverlay({
             const attachmentNotice = runAfterImageNotice(it.text, it.imagePaths || []);
             const chipClass = [
               'pq-chip',
+              'pq-middle-delete-target',
               appearingIds.has(it.id) ? 'pq-chip-enter' : '',
               savedFlashIds.has(it.id) ? 'pq-chip-saved' : '',
               isRemoving ? 'pq-chip-removing' : '',
@@ -3325,6 +3353,7 @@ export function PromptQueueOverlay({
               <Fragment key={it.id}>
               <div
                 className={chipClass}
+                data-prompt-queue-item={it.id}
                 data-run-after-send-status={isSendPending ? promptTransportProgress?.queueStatus : undefined}
                 data-run-after-dictation={dictationBlocked ? (dictationFailed ? 'error' : 'pending') : undefined}
                 ref={(el) => { if (el) chipRefs.current.set(it.id, el); else chipRefs.current.delete(it.id); }}
@@ -3334,6 +3363,7 @@ export function PromptQueueOverlay({
                 onDrop={onDrop(idx)}
                 onDragEnd={onDragEnd}
                 onMouseDownCapture={(e) => {
+                  if (consumePromptQueueMiddleClick(e)) return;
                   if (e.button === 2) return;
                   const target = e.target as HTMLElement;
                   if (target.closest('[data-chip-action]')) return;
@@ -3342,6 +3372,7 @@ export function PromptQueueOverlay({
                     e.stopPropagation();
                   }
                 }}
+                onAuxClickCapture={(event) => consumePromptQueueMiddleClick(event, () => animateRemovePrompt(it.id))}
                 onClick={(e) => {
                   // Ignore clicks that originated on the replay/remove buttons
                   // (they call stopPropagation themselves, but defensively skip
@@ -3370,7 +3401,7 @@ export function PromptQueueOverlay({
                       ? `1px solid ${DELETE_RED}99`
                       : (isEditing && editorPinned ? '1px solid rgba(190,190,190,0.34)' : `1px solid ${BORDER}`)),
                   borderRadius: 7,
-                  background: isSendPending
+                  backgroundColor: isSendPending
                     ? `${PULSE}18`
                     : isRemoveHovered
                     ? `${DELETE_RED}18`
@@ -3585,6 +3616,7 @@ export function PromptQueueOverlay({
               </div>
               {(showTimerTrigger || showOnTabTrigger || showAppRestartTrigger) && (
                 <div
+                  className="pq-middle-delete-target"
                   data-prompt-trigger-row={it.id}
                   data-prompt-trigger-kind={it.trigger?.kind}
                   style={{
@@ -3597,9 +3629,11 @@ export function PromptQueueOverlay({
                     borderLeft: `1px solid ${PULSE}66`,
                     borderBottom: `1px solid ${BORDER}`,
                     borderRadius: '0 0 5px 5px',
-                    background: 'rgba(167,139,250,0.045)',
+                    backgroundColor: 'rgba(167,139,250,0.045)',
                     fontSize: Math.max(8, Math.round(promptQueueChipFontSize * 0.85)),
                   }}
+                  onMouseDownCapture={(event) => { consumePromptQueueMiddleClick(event); }}
+                  onAuxClickCapture={(event) => consumePromptQueueMiddleClick(event, () => clearItemTrigger(it.id))}
                   onMouseDown={(event) => event.stopPropagation()}
                   onClick={(event) => event.stopPropagation()}
                 >
@@ -3679,37 +3713,14 @@ export function PromptQueueOverlay({
                     data-chip-action="remove-trigger"
                     aria-label="Clear trigger"
                     title="Clear trigger"
-                    onClick={() => {
-                      setPromptTrigger(tabId, it.id, null);
-                      // With ONE item left, removing its condition also removes
-                      // the queue's only answer to "when" — an armed queue would
-                      // then fire on the next plain turn end. With two or more,
-                      // the plan survives and the switch must stay untouched.
-                      const live = usePromptQueueStore.getState().getQueue(tabId);
-                      const runnableCount = live.items.filter(isQueuedPromptEnabled).length;
-                      if (live.autoRun && shouldDisarmAfterTriggerClear({ runnableCount })) {
-                        if (live.firstDelayCountdownAt !== null) {
-                          usePromptQueueStore.getState().cancelFirstDelayCountdown(tabId);
-                        }
-                        setAutoRun(tabId, false);
-                      }
-                      setOnTabTriggerDraftIds((current) => {
-                        const next = new Set(current);
-                        next.delete(it.id);
-                        return next;
-                      });
-                      setTimerTriggerDraftIds((current) => {
-                        const next = new Set(current);
-                        next.delete(it.id);
-                        return next;
-                      });
-                    }}
+                    onClick={() => clearItemTrigger(it.id)}
                     style={{ width: 17, height: 17, flex: '0 0 17px', display: 'grid', placeItems: 'center', padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: TEXT_DIM, cursor: 'pointer' }}
                   ><X size={10} /></button>
                 </div>
               )}
               {showContextCondition && (
                 <div
+                  className="pq-middle-delete-target"
                   data-prompt-context-condition-row={it.id}
                   style={{
                     minHeight: 21,
@@ -3721,9 +3732,11 @@ export function PromptQueueOverlay({
                     borderLeft: `1px solid ${PULSE}66`,
                     borderBottom: `1px solid ${BORDER}`,
                     borderRadius: '0 0 5px 5px',
-                    background: 'rgba(167,139,250,0.045)',
+                    backgroundColor: 'rgba(167,139,250,0.045)',
                     fontSize: Math.max(8, Math.round(promptQueueChipFontSize * 0.85)),
                   }}
+                  onMouseDownCapture={(event) => { consumePromptQueueMiddleClick(event); }}
+                  onAuxClickCapture={(event) => consumePromptQueueMiddleClick(event, () => setPromptCondition(tabId, it.id, null))}
                   onMouseDown={(event) => event.stopPropagation()}
                   onClick={(event) => event.stopPropagation()}
                 >
@@ -4697,6 +4710,12 @@ export function PromptQueueOverlay({
           The spinner adds ~16px to the right of the input which shifted layout
           when the input narrowed under flex pressure (Run/after wrap bug). */}
       <style>{`
+        /* One hover target per removable row, including child controls and
+           their gaps. Layer the highlight over the state-owned background;
+           no React hover state or page-wide style changes are needed. */
+        .pq-middle-delete-target:hover {
+          background-image: linear-gradient(rgba(255,255,255,0.06), rgba(255,255,255,0.06));
+        }
         @keyframes pq-run-armed-once {
           0%, 100% { filter: brightness(1); }
           38%      { filter: brightness(1.34); }
