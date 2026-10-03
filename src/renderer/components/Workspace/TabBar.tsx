@@ -6,6 +6,7 @@ import { useWorkspaceStore, TabColor, TabGroup } from '../../store/useWorkspaceS
 import { useProjectsStore } from '../../store/useProjectsStore';
 import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
+import TabNotificationControls from './TabNotificationControls';
 import {
   CONTEXT_MENU_BLOCK_DIVIDER_STYLE,
   CONTEXT_MENU_BOTTOM_DIVIDER_STYLE,
@@ -43,7 +44,6 @@ import {
   resolveTabCompletionNotificationShadow,
   TabCompletionNotificationAlert,
   TabCompletionNotificationBadge,
-  TabCompletionNotificationIcon,
   TAB_COMPLETION_NOTIFICATION_INSET_PX,
   TabProcessBar,
   TabStatusMarkerButton,
@@ -96,11 +96,12 @@ import {
 } from '../../utils/tabDragNavigationBridge';
 import {
   beginSidebarTabDrag,
-  getSidebarTabDragCursorChip,
+  getSidebarTabDragSessionSnapshot,
   getSidebarTabDragProjectionKey,
   getSidebarTabDragSnapshot,
-  subscribeSidebarTabDrag,
+  subscribeSidebarTabDragSession,
 } from '../../utils/sidebarTabDragBridge.mjs';
+import SidebarTabDragCursorChip from './SidebarTabDragCursorChip';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 import { replaceShellInputLine } from '../../utils/shellCommandInput.mjs';
 import {
@@ -8320,33 +8321,15 @@ function TabBar({
   const tabOutlineHostTabs = isMultiSelect ? mainTabsForDisplay : mainTabsBase;
   const tabOutlineHostGroups = isMultiSelect ? tabGroupsForDisplay : tabGroups;
   const [externalPaneSidebarSource, setExternalPaneSidebarSource] = useState<PaneTabPointerSnapshot | null>(null);
-  const sidebarDragOrigin = useSyncExternalStore(
-    subscribeSidebarTabDrag,
-    getSidebarTabDragSnapshot,
-    getSidebarTabDragSnapshot,
+  useSyncExternalStore(
+    subscribeSidebarTabDragSession,
+    getSidebarTabDragSessionSnapshot,
+    getSidebarTabDragSessionSnapshot,
   );
+  // Read the newest point on an ownership/outline render; coordinates alone
+  // no longer render every retained or menu-only instance of this host.
+  const sidebarDragOrigin = getSidebarTabDragSnapshot();
   const sidebarDragProjectionKey = getSidebarTabDragProjectionKey(sidebarDragOrigin);
-  const sidebarDragCursorChip = getSidebarTabDragCursorChip(sidebarDragOrigin);
-  const sidebarDragCursorChipPosition = (() => {
-    if (!sidebarDragCursorChip
-      || menuOnlyForProject
-      || focusedSidebarProjectId !== projectId
-      || typeof window === 'undefined') return null;
-    const gapX = 14;
-    const gapY = 14;
-    const estimatedWidth = 240;
-    const estimatedHeight = 34;
-    const right = sidebarDragCursorChip.clientX + gapX;
-    const below = sidebarDragCursorChip.clientY + gapY;
-    return {
-      left: right + estimatedWidth <= window.innerWidth - 8
-        ? right
-        : Math.max(8, sidebarDragCursorChip.clientX - estimatedWidth - gapX),
-      top: below + estimatedHeight <= window.innerHeight - 8
-        ? below
-        : Math.max(8, sidebarDragCursorChip.clientY - estimatedHeight - gapY),
-    };
-  })();
   const externalPanePointerRef = useRef<PaneTabPointerSnapshot>(getPaneTabPointerSnapshot());
 
   // Pane drags are native pragmatic-DnD gestures, while the sidebar outline is
@@ -10052,79 +10035,7 @@ function TabBar({
       {/* Ordinary outline reorder already shows its result in-tree and must not
           grow a second ghost. Cmd freezes that tree for cross-context
           navigation, so only that mode gets a small pointer payload chip. */}
-      {sidebarDragCursorChip && sidebarDragCursorChipPosition && typeof document !== 'undefined'
-        ? createPortal(
-            <div
-              aria-hidden
-              data-sidebar-tab-drag-cursor-chip
-              data-drag-session-id={sidebarDragCursorChip.sessionId}
-              data-root-tab-id={sidebarDragCursorChip.rootTabId}
-              data-tab-count={sidebarDragCursorChip.count}
-              style={{
-                position: 'fixed',
-                left: 0,
-                top: 0,
-                transform: `translate3d(${sidebarDragCursorChipPosition.left}px, ${sidebarDragCursorChipPosition.top}px, 0)`,
-                zIndex: 100080,
-                maxWidth: 240,
-                minHeight: 28,
-                padding: '4px 7px 4px 9px',
-                borderRadius: 7,
-                border: '1px solid rgba(167, 139, 250, 0.72)',
-                background: 'rgba(24, 23, 37, 0.96)',
-                boxShadow: '0 5px 16px rgba(0, 0, 0, 0.42)',
-                color: '#f5f3ff',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 7,
-                pointerEvents: 'none',
-                userSelect: 'none',
-                contain: 'layout paint',
-                willChange: 'transform',
-                transition: 'none',
-              }}
-            >
-              <span
-                style={{
-                  minWidth: 0,
-                  maxWidth: 184,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  fontSize: 12,
-                  fontWeight: 650,
-                  lineHeight: '18px',
-                }}
-              >
-                {sidebarDragCursorChip.label}
-              </span>
-              {sidebarDragCursorChip.count > 1 && (
-                <span
-                  data-sidebar-tab-drag-cursor-count
-                  style={{
-                    flexShrink: 0,
-                    minWidth: 20,
-                    height: 18,
-                    padding: '0 5px',
-                    borderRadius: 9,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    color: '#ecfdf5',
-                    background: '#15803d',
-                    border: '1px solid rgba(255, 255, 255, 0.30)',
-                    fontSize: 10,
-                    fontWeight: 750,
-                    lineHeight: '16px',
-                  }}
-                >
-                  {`×${sidebarDragCursorChip.count}`}
-                </span>
-              )}
-            </div>,
-            document.body,
-          )
-        : null}
+      <SidebarTabDragCursorChip enabled={!menuOnlyForProject && focusedSidebarProjectId === projectId} />
       {/* menuOnlyForProject: the LIST is not rendered, the menu below still is.
           This instance exists only so a right click on a pane header chip whose
           project the sidebar is not showing has an owner to open — see
@@ -10755,56 +10666,11 @@ function TabBar({
                 const isArmed = !!ctxTab.completionNotificationArmed;
                 const isFired = !!ctxTab.completionNotificationFired;
                 const isPersistent = !!ctxTab.completionNotificationPersistent;
-                const oneShotActive = isArmed || isFired;
-                const tint = isFired ? '#ef4444' : (oneShotActive ? '#f87171' : '#888');
-                const notificationTitle = isFired
-                  ? 'Уведомление готово'
-                  : (oneShotActive ? 'Уведомление включено' : 'Активировать уведомления');
                 return (
-                  <div className="flex items-stretch w-full" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
-                    <Tooltip content={notificationTitle}>
-                      <button
-                        data-context-menu-row="compact"
-                        data-tab-context-action="notify-once"
-                        aria-label={notificationTitle}
-                        aria-pressed={oneShotActive}
-                        className="flex-1 basis-0 min-w-0 text-[13px] hover:bg-white/10 cursor-pointer flex items-center justify-center"
-                        style={{
-                          ...CONTEXT_MENU_COMPACT_ROW_STYLE,
-                          color: oneShotActive ? '#fecaca' : '#ccc',
-                          backgroundColor: oneShotActive ? 'rgba(239, 68, 68, 0.10)' : 'transparent',
-                        }}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setTabCompletionNotificationArmed(projectId, contextMenu.tabId, !oneShotActive);
-                          setContextMenu(null);
-                        }}
-                      >
-                        <TabCompletionNotificationIcon color={tint} />
-                      </button>
-                    </Tooltip>
-                    <Tooltip content={isPersistent ? 'Постоянные уведомления включены' : 'Включать уведомление для каждого нового запроса'}>
-                      <button
-                        data-context-menu-row="compact"
-                        data-tab-context-action="notify-persistent"
-                        aria-label="Уведомления для каждого нового запроса"
-                        aria-pressed={isPersistent}
-                        className="flex-1 basis-0 min-w-0 text-[12px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
-                        style={{
-                          ...CONTEXT_MENU_COMPACT_ROW_STYLE,
-                          color: isPersistent ? '#f87171' : '#777',
-                          backgroundColor: isPersistent ? 'rgba(239, 68, 68, 0.16)' : 'transparent',
-                        }}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setTabCompletionNotificationPersistent(projectId, contextMenu.tabId, !isPersistent);
-                          setContextMenu(null);
-                        }}
-                      >
-                        <TabCompletionNotificationIcon persistent />
-                      </button>
-                    </Tooltip>
-                  </div>
+                  <TabNotificationControls armed={isArmed} fired={isFired} persistent={isPersistent}
+                    onOnce={enabled => setTabCompletionNotificationArmed(projectId, contextMenu.tabId, enabled)}
+                    onPersistent={enabled => setTabCompletionNotificationPersistent(projectId, contextMenu.tabId, enabled)}
+                    onAction={() => setContextMenu(null)} />
                 );
               })()}
 

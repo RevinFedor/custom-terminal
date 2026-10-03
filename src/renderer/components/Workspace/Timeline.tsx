@@ -107,7 +107,7 @@ import {
 } from '../../utils/historyRewriteRewind';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
-import { isSystemPromptEntry } from '../../../shared/prompt-origin.mjs';
+import { isServicePromptEntry, isSystemPromptEntry } from '../../../shared/prompt-origin.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -475,6 +475,18 @@ interface TimelineEntry {
     sourceTabId?: string;
     targetTabId?: string;
     outcome?: string;
+  } | {
+    id?: string;
+    kind: 'tab-message';
+    messageId: string;
+    replyTo?: string | null;
+    phase: 'question' | 'reply';
+    sourceTabId: string;
+    sourceTabName?: string;
+    sourceProjectId?: string;
+    targetTabId: string;
+    targetTabName?: string;
+    targetProjectId?: string;
   } | {
     id?: string;
     kind: 'prompt-origin';
@@ -972,7 +984,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   const orchestrationTag = getOrchestrationTag(entry);
   const entryIsOrchestration = !!orchestrationTag;
   const entryIsSystem = isSystemPromptEntry(entry);
-  const entryIsServicePrompt = entryIsOrchestration || entryIsSystem;
+  const entryIsServicePrompt = isServicePromptEntry(entry);
   const orchestrationGroup = groupInfo?.groupKind === 'orchestration';
   const groupAccent = orchestrationGroup ? '#a855f7' : '#818cf8';
   const groupAccentDim = orchestrationGroup ? '#7e22ce' : '#7c86f0';

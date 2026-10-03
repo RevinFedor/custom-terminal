@@ -19,11 +19,12 @@ const names = ['withPtyWriteLock', 'captureCodexOwnedSlashDraftIdentity', 'valid
   'releaseCodexOwnedModelInput', 'validateCodexOwnedModelInputIdentity', 'readCodexOwnedModelInputDecision', 'reconcileCodexOwnedModelInputAtWriteBoundary',
   'settleCodexOwnedModelInput', 'waitForCodexOwnedModelPaste', 'retainCodexOwnedModelInput', 'inspectCodexOwnedSlashDraft',
   'rollbackCodexOwnedSlashDraft', 'sendCodexSlashCommand', 'captureAgentInputAtWriteBoundary', 'selectCodexModelEffort',
-  'safePasteAndSubmit', 'getCodexLiveInputControl', 'waitForCodexInputPreparation'];
+  'safePasteAndSubmit', 'getCodexLiveInputControl', 'waitForCodexInputPreparation',
+  'isCodexOwnedSlashSubmitReady', 'sendCodexLiveSlashCommand'];
 const tick = () => new Promise(r => setImmediate(r));
 
 function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
-  const writes = [], wakes = [];
+  const writes = [], wakes = [], fastWakes = [];
   let inputRevision = 1, stopRevision = 0, run = 2, lifecycle = 'G:2';
   let proof;
   const mirror = { generation: 'M', writeSeq: 10, synchronizedFrameWaiters: new Set(),
@@ -39,7 +40,8 @@ function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
   const term = { write(data) {
     writes.push(data);
     if (data === '\x01\x0b' && synchronousClear) frame('');
-    if (!frameTimedOut && data.includes('\x1b[200~/model')) frame('/model');
+    const slash = data.match(/\x1b\[200~(\/model|\/fast)\x1b\[201~/)?.[1];
+    if (!frameTimedOut && slash) frame(slash);
   } };
   const ctx = vm.createContext({ ...picker, codexNativeDraftTransfer, observeAgentInput,
     console: { log() {}, warn() {} }, queueMicrotask, setTimeout, clearTimeout,
@@ -55,9 +57,11 @@ function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
     getHeadlessCodexDraftState: () => proof, recordComposerForensicPtyInput() {},
     getCodexWriterProofSnapshot: () => null, getCodexProvisionalSettingsSnapshot: () => null,
     ipcMain: events, scheduleCodexModelEffortIntentReconcile: (...args) => wakes.push(args),
+    scheduleCodexFastIntentReconcile: (...args) => fastWakes.push(args),
     emitAgentReadinessChanged: (_tabId, event) => events.emit('agent:readiness-changed-internal', null, { tabId: 'T', ...event }),
     hasCodexEstablishedComposerLifecycle: () => true, codexTuiReadyMeta: new Map(), codexTuiReadyTabs: new Set(['T']),
     codexLateMcpProofPending: new Map(), codexRuntimePolicies: null,
+    codexTurnWatchers: new Map(),
     codexInputControlFromCommittedSnapshot: () => null,
     findTabIdForTerm: () => 'T', captureAgentInputIdentity: () => ({}), agentSendExecutionFailure: () => null,
     assertKnownEmptySend() {}, isLocalSlashCommandPrompt: () => false, conversationOwners: { noteInput() {} },
@@ -78,9 +82,9 @@ function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
     },
   });
   vm.runInContext(names.map(declaration).join('\n'), ctx);
-  return { ctx, term, writes, wakes, mirror, frame,
+  return { ctx, term, writes, wakes, fastWakes, mirror, frame,
     get receipt() { return ctx.codexSettingsMutationQueue.getUnsubmittedInput(term); },
-    async expire() { return ctx.withPtyWriteLock(term, () => ctx.sendCodexSlashCommand(term, '/model', '[test]', {
+    async expire(command = '/model') { return ctx.withPtyWriteLock(term, () => ctx.sendCodexSlashCommand(term, command, '[test]', {
       tabId: 'T', readDraftState: async () => proof, writeGuard: () => ({ allowed: true }),
     }), { manualInputYields: true }); },
     change(kind) {
@@ -110,6 +114,139 @@ test('actual timeout retains its insertion; a late exact frame clears only /mode
   assert.equal(h.ctx.getCodexLiveInputControl('T'), null);
   assert.equal(h.wakes.length, 1, 'the existing intent owner wakes once, not the failed picker');
   assert.equal(h.mirror.synchronizedFrameWaiters.size, 0);
+});
+
+test('production /fast timeout cannot release a stale empty composer to the next History Send', async () => {
+  const h = harness();
+  const result = await h.expire('/fast');
+  assert.equal(result.submitted, false);
+  assert.ok(h.receipt, 'the physical /fast insertion outlives its caller timeout');
+  assert.equal(h.receipt.command, '/fast');
+  assert.equal(h.ctx.getCodexLiveInputControl('T'), 'owned-model-input');
+  const next = await h.ctx.safePasteAndSubmit(h.term, 'ORIGINAL USER TEXT', { source: 'codex-history-panel' });
+  assert.equal(next.submitted, false);
+  assert.equal(h.writes.length, 1, 'stale empty frame cannot accept author text after /fast');
+  h.frame('/fast'); await tick(); await tick();
+  assert.deepEqual(h.writes, ['\x01\x0b\x1b[200~/fast\x1b[201~', '\x01\x0b']);
+  assert.equal(h.receipt, null);
+  assert.equal(h.wakes.length, 0, 'Fast cleanup must not replay a model picker');
+  assert.equal(h.fastWakes.length, 1, 're-evaluate the existing Fast intent, not the old toggle');
+});
+
+test('a late /fast echo clears while the SAME ordinary Send waits outside the PTY queue', async () => {
+  const h = harness(); await h.expire('/fast');
+  assert.ok(h.receipt);
+  let submits = 0;
+  h.ctx.isCodexTuiEffectivelyReady = () => h.ctx.getCodexLiveInputControl('T') == null;
+  h.ctx._safePasteAndSubmitInner = async (_term, author) => {
+    assert.equal(h.receipt, null);
+    submits++; h.term.write(author + '\r');
+    return { success: true, submitted: true };
+  };
+  const pending = h.ctx.safePasteAndSubmit(h.term, 'ORIGINAL USER TEXT', { source: 'codex-history-panel' });
+  await tick();
+  assert.equal(submits, 0);
+  h.frame('/fast');
+  assert.equal((await pending).success, true);
+  assert.equal(submits, 1);
+  assert.deepEqual(h.writes, ['\x01\x0b\x1b[200~/fast\x1b[201~', '\x01\x0b', 'ORIGINAL USER TEXT\r']);
+});
+
+test('/fast success writes one Enter and late frames cannot trigger cleanup or another toggle', async () => {
+  const h = harness({ frameTimedOut: false });
+  const result = await h.expire('/fast');
+  assert.equal(result.success, true); assert.equal(h.receipt, null);
+  h.frame('/fast'); await tick();
+  assert.deepEqual(h.writes, ['\x01\x0b\x1b[200~/fast\x1b[201~', '\r']);
+  assert.equal(h.fastWakes.length, 0);
+});
+
+test('only the current slash writer can submit its exact fresh /fast; readiness stays closed to everyone else', async () => {
+  const h = harness();
+  const operation = { kind: 'codex-live-slash-command', phase: 'slash-command-enter' };
+  const pending = h.ctx.withPtyWriteLock(h.term, () => h.ctx.sendCodexSlashCommand(h.term, '/fast', '[test]', {
+    tabId: 'T', readDraftState: async () => ({ success: true, hasDraft: false }),
+  }), operation);
+  await tick();
+  assert.ok(h.receipt);
+  assert.equal(h.ctx.isCodexOwnedSlashSubmitReady('T', h.term, '/fast', operation), false, 'old empty is not paste proof');
+  h.frame('/fast');
+  assert.equal(h.ctx.isCodexOwnedSlashSubmitReady('T', h.term, '/fast', operation), true);
+  assert.equal(h.ctx.getCodexLiveInputControl('T'), 'owned-model-input');
+  assert.equal(h.ctx.isCodexOwnedSlashSubmitReady('T', h.term, '/fast', { ...operation }), false);
+  assert.equal(h.ctx.isCodexOwnedSlashSubmitReady('T', h.term, '/model', operation), false);
+  assert.equal(h.ctx.isCodexOwnedSlashSubmitReady('OTHER', h.term, '/fast', operation), false);
+  operation.phase = 'slash-command-paste';
+  assert.equal(h.ctx.isCodexOwnedSlashSubmitReady('T', h.term, '/fast', operation), false);
+  operation.phase = 'slash-command-enter';
+  h.ctx.codexLateMcpProofPending.set('T', {});
+  assert.equal(h.ctx.isCodexOwnedSlashSubmitReady('T', h.term, '/fast', operation), false);
+  h.ctx.codexLateMcpProofPending.clear();
+  assert.equal((await pending).success, true);
+});
+
+test('actual live-slash admission does not reject its own retained /fast as a foreign control', async () => {
+  const h = harness({ frameTimedOut: false });
+  Object.assign(h.ctx, require('./codex-runtime-contract'), {
+    codexPickerQueue: new Map(), terminalProjects: new Map([['T', '/fixture']]),
+    isOwnedDesktopHistorySendSource: () => false,
+    isCodexTuiEffectivelyReady: () => !h.ctx.getCodexLiveInputControl('T'),
+    codexHasLivePtySubmitEvidence: () => true, hasCodexPromptOrTurnInFlight: () => false,
+    requestTerminalCodexDraftState: async () => ({ success: true, hasDraft: false }),
+    getCurrentCodexServiceTierProofIdentity: () => null,
+    createCodexPickerDraftCapture: () => null,
+    // Feedback parsing is covered by the existing service-tier suites. This
+    // case executes the real request/admission and physical slash sender.
+    sendCodexLiveSlashCommand: (_term, request) => h.ctx.sendCodexSlashCommand(_term, request.command, '[request]', request),
+    readCodexPickerWriteRefusal: (guard, phase) => {
+      const result = guard?.(phase);
+      return result?.allowed === false ? { success: false, error: result.reason } : null;
+    },
+  });
+  vm.runInContext(declaration('executeCodexLiveSlashCommandRequest'), h.ctx);
+  const result = await h.ctx.executeCodexLiveSlashCommandRequest({ tabId: 'T', command: '/fast', source: 'codex-fast-intent' });
+  assert.equal(result.success, true, result.error);
+  assert.equal(result.submitted, true);
+  assert.deepEqual(h.writes, ['\x01\x0b\x1b[200~/fast\x1b[201~', '\r']);
+  assert.equal(h.receipt, null);
+});
+
+test('failed Fast keeps the captured author draft/images out of the uncertain service composer', async () => {
+  const h = harness();
+  const snapshot = { text: 'USER TEXT [Image #1]', captureOperationId: 'C', images: 1,
+    imagePaths: [{ id: 1, path: '/fixture/image.png', assetId: 'image' }] };
+  h.ctx.stashCodexDraftForPicker = async () => ({ success: true, draftSnapshot: snapshot });
+  h.ctx.restoreCodexDraftAfterPicker = () => assert.fail('no ArrowUp/restore over unconfirmed /fast');
+  const result = await h.ctx.withPtyWriteLock(h.term, () => h.ctx.sendCodexLiveSlashCommand(h.term, {
+    tabId: 'T', command: '/fast', hasDraft: true,
+  }));
+  assert.equal(result.success, false); assert.equal(result.serviceInputPending, true);
+  assert.equal(result.draftTransfer.text, snapshot.text);
+  assert.equal(result.draftTransfer.imagePaths[0].assetId, 'image');
+  assert.equal(h.writes.length, 1); h.change('input');
+});
+
+test('background Fast reconciler publishes the captured draft through existing History recovery', async () => {
+  const h = harness(); const notifications = [];
+  const transfer = { id: 'exact-capture', text: 'USER TEXT', imagePaths: [] };
+  Object.assign(h.ctx, {
+    getCodexFastIntentRecord: () => ({ desiredFast: false, revision: 3 }),
+    codexFastIntentReconcileInflight: new Map(), codexFastIntentReconcileRequested: new Set(),
+    reconcileCodexServiceTierProofIdentity: () => ({ preserved: true, proof: { serviceTier: 'fast' } }),
+    planCodexFastIntentReconcile: () => ({ action: 'toggle', reason: 'desired-tier-differs' }),
+    codexHasLivePtySubmitEvidence: () => true, hasCodexPromptOrTurnInFlight: () => false,
+    mainWindow: { isDestroyed: () => false, webContents: { isDestroyed: () => false,
+      send: (...args) => notifications.push(args) } },
+    executeCodexLiveSlashCommandRequest: async () => ({ success: false, submitted: false,
+      error: 'Codex slash input frame timed out', draftTransfer: transfer }),
+  });
+  vm.runInContext(declaration('scheduleCodexFastIntentReconcile'), h.ctx);
+  const result = await h.ctx.scheduleCodexFastIntentReconcile('T');
+  assert.equal(result.queued, true); assert.equal(result.draftTransfer, transfer);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0][0], 'codex:model-effort-intent-deferred');
+  assert.equal(notifications[0][1].control, 'fast');
+  assert.equal(notifications[0][1].result.draftTransfer, transfer);
 });
 
 test('newer frame must prove clear; elapsed time and old empty frame do not retire ownership', async () => {

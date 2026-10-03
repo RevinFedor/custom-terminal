@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import type { GeminiModelId } from '../constants/geminiModels';
+import { RUN_AFTER_LOOP_PROMPT_ID, DEFAULT_LOOP_PROMPT } from '../../shared/prompt-loop.mjs';
+export { RUN_AFTER_LOOP_PROMPT_ID };
 
 export type AIModel = GeminiModelId;
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
@@ -29,6 +31,7 @@ export interface AIPrompt {
 }
 
 const { ipcRenderer } = window.require('electron');
+let loopPromptWriteRevision = 0;
 
 interface PromptsStore {
   prompts: AIPrompt[];
@@ -36,6 +39,7 @@ interface PromptsStore {
   loadPrompts: () => Promise<void>;
   getPromptById: (id: string) => AIPrompt | undefined;
   savePrompt: (prompt: AIPrompt) => Promise<void>;
+  savePromptContent: (id: string, content: string) => Promise<void>;
   deletePrompt: (id: string) => Promise<void>;
   rewindPromptId: string;
   setRewindPromptId: (id: string) => void;
@@ -43,6 +47,9 @@ interface PromptsStore {
 
 // Fallback defaults (used before DB loads)
 const FALLBACK_PROMPTS: AIPrompt[] = [
+  { id: RUN_AFTER_LOOP_PROMPT_ID, name: 'Run After Loop', content: DEFAULT_LOOP_PROMPT,
+    model: 'gemini-3.8-flash', thinkingLevel: 'NONE', color: '#a78bfa',
+    isBuiltIn: true, showInContextMenu: false, position: 10, filePaths: [] },
   {
     id: 'rewind',
     name: 'Rewind (Откат)',
@@ -146,10 +153,15 @@ export const usePromptsStore = create<PromptsStore>((set, get) => ({
   isLoaded: false,
 
   loadPrompts: async () => {
+    const loopRevision = loopPromptWriteRevision;
     try {
       const result = await ipcRenderer.invoke('ai-prompts:get');
       if (result.success && Array.isArray(result.data) && result.data.length > 0) {
-        set({ prompts: result.data, isLoaded: true });
+        const currentLoop = get().getPromptById(RUN_AFTER_LOOP_PROMPT_ID);
+        const prompts = loopRevision !== loopPromptWriteRevision && currentLoop
+          ? result.data.map((prompt: AIPrompt) => prompt.id === RUN_AFTER_LOOP_PROMPT_ID ? currentLoop : prompt)
+          : result.data;
+        set({ prompts, isLoaded: true });
       } else {
         // DB empty — use fallbacks
         set({ isLoaded: true });
@@ -171,8 +183,11 @@ export const usePromptsStore = create<PromptsStore>((set, get) => ({
   },
 
   savePrompt: async (prompt: AIPrompt) => {
+    const loopRevision = prompt.id === RUN_AFTER_LOOP_PROMPT_ID ? ++loopPromptWriteRevision : null;
     try {
-      await ipcRenderer.invoke('ai-prompts:save', prompt);
+      const result = await ipcRenderer.invoke('ai-prompts:save', prompt);
+      if (prompt.id === RUN_AFTER_LOOP_PROMPT_ID && result?.success === false) throw new Error(result.error || 'Loop prompt save failed');
+      if (loopRevision !== null && loopRevision !== loopPromptWriteRevision) return;
       // Update local state
       set((state) => {
         const idx = state.prompts.findIndex(p => p.id === prompt.id);
@@ -186,6 +201,21 @@ export const usePromptsStore = create<PromptsStore>((set, get) => ({
       });
     } catch (e) {
       console.error('[PromptsStore] Failed to save prompt:', e);
+    }
+  },
+
+  savePromptContent: async (id, content) => {
+    const before = get().getPromptById(id)?.content;
+    const revision = id === RUN_AFTER_LOOP_PROMPT_ID ? ++loopPromptWriteRevision : null;
+    set((state) => ({ prompts: state.prompts.map((prompt) => prompt.id === id ? { ...prompt, content } : prompt) }));
+    try {
+      const result = await ipcRenderer.invoke('ai-prompts:save-content', { id, content });
+      if (result?.success === false) throw new Error(result.error || 'prompt save failed');
+    } catch (error) {
+      if (before !== undefined && (revision === null || revision === loopPromptWriteRevision)) {
+        set((state) => ({ prompts: state.prompts.map((prompt) => prompt.id === id && prompt.content === content ? { ...prompt, content: before } : prompt) }));
+      }
+      throw error;
     }
   },
 

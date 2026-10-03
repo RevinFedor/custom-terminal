@@ -1150,6 +1150,9 @@ export default function Workspace({
         }
         const targetId = target.id;
         e.preventDefault();
+        // This surface shortcut must win before CodeMirror handles Mod-]
+        // as indent-more, or opening the terminal also edits the draft.
+        e.stopPropagation();
         // In a split pane the shortcut opens THE OTHER surface of that pane,
         // whichever it is — symmetric by design, so the key never feels dead:
         //   transcript-primary → the pane's side TERMINAL,
@@ -1186,8 +1189,8 @@ export default function Workspace({
         setHistoryPanelOpen(targetId, !currentOpen);
       }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
   }, [workspaceView, historyIsPrimary, floatingTerminalOpen, toggleFloatingTerminal, splitActiveLayout, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCodexReadSessionId, effectiveCommandType, setHistoryPanelOpen]);
 
   // CMD+[ / Option+[ — swap the center surface (History ↔ terminal).

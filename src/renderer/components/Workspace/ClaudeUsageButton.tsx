@@ -40,6 +40,7 @@ import {
   CalendarDays,
 } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useUsageVisibilityStore } from '../../store/useUsageVisibilityStore';
 import {
   buildCodexMainUsageView,
   visibleCodexResetCredits,
@@ -439,20 +440,6 @@ function CodexIcon({ size = 12, muted = false, monochrome = false }: { size?: nu
 }
 
 type UsageProvider = 'codex' | 'claude';
-
-const USAGE_VISIBLE_PROVIDERS_STORAGE_KEY = 'noted-terminal-usage-visible-providers';
-
-function loadVisibleUsageProviders(): Record<UsageProvider, boolean> {
-  try {
-    const saved = JSON.parse(window.localStorage.getItem(USAGE_VISIBLE_PROVIDERS_STORAGE_KEY) || '{}');
-    return {
-      codex: saved?.codex !== false,
-      claude: saved?.claude !== false,
-    };
-  } catch {
-    return { codex: true, claude: true };
-  }
-}
 
 interface UsagePopoverLayout {
   top: number | null;
@@ -2782,7 +2769,8 @@ function SharedActivitySection({
 
 export default function ClaudeUsageButton() {
   const [activeProvider, setActiveProvider] = useState<UsageProvider>('codex');
-  const [visibleProviders, setVisibleProviders] = useState(loadVisibleUsageProviders);
+  const visibleProviders = useUsageVisibilityStore(state => state.visibleProviders);
+  const toggleProviderVisibility = useUsageVisibilityStore(state => state.toggleProvider);
   const [clicked, setClicked] = useState(false);
   const [sticky, setSticky] = useState(false);
   const [cmdPressed, setCmdPressed] = useState(false);
@@ -3049,16 +3037,6 @@ export default function ClaudeUsageButton() {
   const handleTriggerEnter = (provider: UsageProvider) => {
     setHoveredProvider(provider);
     if (!clicked && !sticky && cmdPressed) setActiveProvider(provider);
-  };
-
-  const toggleProviderVisibility = (provider: UsageProvider) => {
-    const next = { ...visibleProviders, [provider]: !visibleProviders[provider] };
-    setVisibleProviders(next);
-    try {
-      window.localStorage.setItem(USAGE_VISIBLE_PROVIDERS_STORAGE_KEY, JSON.stringify(next));
-    } catch {
-      // The current window still reflects the user's choice if persistence is unavailable.
-    }
   };
 
   const activitySection = (

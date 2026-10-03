@@ -20,6 +20,8 @@ async function loadQueueStore(t, persisted) {
   });
   const ipcRenderer = {
     invoke: async (channel, key) => {
+      if (channel === 'ai-prompts:get') return { success: true, data: [{ id: 'run-after-loop', content: require('../../shared/prompt-loop.cjs').DEFAULT_LOOP_PROMPT }] };
+      if (channel === 'ai-prompts:save-content') return { success: true };
       if (channel === 'app:getState') {
         if (key === 'promptQueueByTab') return JSON.stringify(persisted || {});
         return null;

@@ -1,6 +1,70 @@
 # Fact: Claude SDK Tab
 
-Параллельный режим работы с Claude в отдельной вкладке через `@anthropic-ai/claude-agent-sdk` — без PTY, без TUI, поверх React/assistant-ui. Живёт рядом с обычными PTY-Claude табами, но это **другая система**: свой JSONL, свой lifecycle, свой набор инструментов.
+Параллельный режим работы с Claude в отдельной вкладке через `@anthropic-ai/claude-agent-sdk` — без PTY, без TUI, поверх React/assistant-ui. Живёт рядом с обычными PTY-Claude табами, но это **другая интеграционная поверхность Noted**: свой JSONL, свой lifecycle, свой набор инструментов. Это не другое ядро агента: SDK управляет штатным Claude Code.
+
+## Машинный протокол CLI без импорта SDK
+
+Проверенные Claude Code 2.1.284 и 2.1.287 принимают `-p --input-format stream-json
+--output-format stream-json --verbose --include-partial-messages` по обычным
+pipes, без PTY. `control_request` поддерживает initialize, set_model и
+interrupt; штатные `--resume`, `--fork-session`, `--resume-session-at` сохраняют
+историю и выбирают точный assistant UUID. npm SDK — готовый клиент этого
+канала, а не обязательный способ подключить оригинальный agent loop.
+
+02.10 это сверено с установленным Agent SDK 0.3.156: его `sdk.mjs` формирует
+те же `--output-format stream-json --verbose --input-format stream-json`,
+поддерживает `pathToClaudeCodeExecutable` и stdio permission callbacks.
+Прямой host из `/tmp/noted-agy-proof.R14Ohk/probe.mjs` сам делает spawn с pipes,
+читает события и отвечает на control requests; он заменяет клиентскую обёртку,
+не Claude agent runtime. Поэтому отказ от npm SDK сам по себе не доказывает
+экономию памяти: тяжёлый процесс Claude остаётся в обоих вариантах. Сравнивать
+нужно одинаковые CLI version, model, tools, settings и workload, а не названия
+«SDK» и «бинарник». Измеренный в probes RSS относится к дочернему CLI и не
+является общим footprint Noted либо сравнением SDK/TUI.
+Отдельный живой A/B 02.10 сравнил TUI с прямым JSON host, не SDK с JSON host;
+числа и границы — `fact-terminal-rendering.md::Цена TUI в живых CLI`.
+
+### Время жизни процесса не определяется наличием SDK
+
+Agent SDK поддерживает и конечный одноразовый input с последующим resume, и
+долгоживущий streaming input. В текущем Noted `sdkStartQuery` передаёт
+`channel.iterable`, а не строку: канал ждёт следующих сообщений, обычный result
+не закрывает его. Есть и warm-start с `prompt === null`, намеренно запускающий
+процесс до первого ввода. Поэтому «SDK всегда убирает процесс после ответа»
+не описывает наш текущий flow. Закрытие канала/query и teardown потока — другая
+граница, чем завершение одного ответа.
+
+Собственный JSON host тоже может закрыть процесс после полного завершения
+работы и снова запустить его с точным session ID при следующем вводе. Это
+отдельная политика lifecycle, не преимущество SDK над прямым каналом и не
+уже реализованный здесь auto-sleep. Она освобождает память процесса в простое
+ценой повторного запуска, загрузки сессии и подключения инструментов. Нельзя
+принимать один final text/result за отсутствие фоновых агентов, ожидающего
+вопроса или очереди: освобождение не должно обрезать незавершённую работу.
+
+01.10.2026 исходный native CLI прошёл контрольный прогон с локальным
+Messages/SSE fixture: 7 model requests, поток частей ответа, смена модели,
+active interrupt и следующий prompt в том же процессе, настоящий durable
+fork до assistant UUID, исключение позднего факта из отправленного модельного
+контекста и сохранение исходной ветки. SDK не импортировался. Это proof
+управления CLI и сериализации контекста, **не** успешный Anthropic inference
+или проверка подписки. Живой auth/billing статус и артефакты — в рабочем
+`docs/tmp/исследование-терминалов-и-агентов.md`.
+
+02.10 тот же сценарий прошёл уже с настоящим Anthropic API на CLI 2.1.287:
+16 assertions PASS, Sonnet 5.5 → Haiku 4.5, streamed deltas, active interrupt,
+следующий turn, fork/rewind до exact assistant UUID и независимый resume.
+Отдельные 6 assertions подтвердили настоящий Read/Write tool loop и
+`can_use_tool`/`control_response` без SDK: manual permission mode, deny сохранил
+файл, allow разрешил точную запись; fixture восстановлена. Артефакты:
+`/tmp/noted-agy-proof.R14Ohk/claude-live-result.json` и
+`claude-permissions-live-result.json`. Авторизация этой живой проверки —
+Console `user_oauth`, а не проверка покупки/лимитов Max.
+
+Для подписочного сценария нельзя незаметно включать `--bare`: он не читает
+OAuth/keychain и требует отдельную API-авторизацию. Обычный `-p` использует
+штатный выбранный login; Pro/Max login и Console balance — разные источники
+оплаты. Текущий SDK-tab и PTY-таб на собственный adapter не переводились.
 
 ## Tool-call rendering: семантика `result`
 

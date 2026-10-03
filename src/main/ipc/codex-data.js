@@ -36,6 +36,7 @@ const { prepareHistoryRowWindow } = require('../history-entry-window');
 const { CodexReadFence, retryInvalidatedCodexRead } = require('../codex-read-fence');
 const { CodexSourceGenerations } = require('../codex-source-generations');
 const { resolveCodexSourceSettingsProof, extractCodexSettingsCandidate } = require('../codex-source-settings');
+const { codexSettingsHistoryValues, codexSettingsHistoryEntry } = require('../codex-settings-history');
 const {
   codexUserCarrierTextsMatch,
   codexUserMessageAuditText,
@@ -168,11 +169,12 @@ const codexManagedUsageInflight = new Map();
 const codexManagedUsageAccounts = new Map();
 let codexCreditExpirationReader = null;
 
-function readCodexCreditExpiration(auth, force) {
+async function readCodexCreditExpiration(auth, force) {
   // This route is challenged by Cloudflare through Node fetch. Chromium's
   // network stack accepts the same Codex OAuth, without a separate web login.
-  const { net } = require('electron');
+  const { net, app } = require('electron');
   if (!net?.fetch) return Promise.resolve(null);
+  await app.whenReady();
   codexCreditExpirationReader ||= createCodexCreditExpirationReader({ fetchImpl: (url, options) => net.fetch(url, options) });
   return codexCreditExpirationReader.read(auth, { force });
 }
@@ -1081,6 +1083,7 @@ function parseApplyPatchHistoryActions(patchText) {
     }
     return {
       toolName: 'Edit',
+      ...(header.kind === 'Delete' ? { diffStatsKnown: false } : {}),
       args: {
         file_path: header.filePath,
         old_string: hunks[0]?.old_string || '',
@@ -1189,6 +1192,7 @@ function parseCodexPatchApplyChanges(payload) {
       const content = typeof change.content === 'string' ? change.content : '';
       actions.push({
         toolName: 'Write',
+        ...(typeof change.content !== 'string' ? { diffStatsKnown: false } : {}),
         args: { file_path: change.move_path || filePath, content },
         diffHunks: [{
           oldStart: 0,
@@ -1206,6 +1210,7 @@ function parseCodexPatchApplyChanges(payload) {
       const content = typeof change.content === 'string' ? change.content : '';
       actions.push({
         toolName: 'Edit',
+        ...(typeof change.content !== 'string' ? { diffStatsKnown: false } : {}),
         args: {
           file_path: filePath,
           old_string: content,
@@ -1639,6 +1644,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
         result: action.result,
         isError: action.isError,
         diffHunks: action.diffHunks,
+        ...(action.diffStatsKnown === false ? { diffStatsKnown: false } : {}),
       },
     };
   });
@@ -4022,6 +4028,8 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
   let latestTokenCountInfo = seed.latestTokenCountInfo ?? null;
   let lastDisplayedModel = seed.lastDisplayedModel ?? null;
   let lastDisplayedEffort = seed.lastDisplayedEffort ?? null;
+  let lastModelEntry = seed.lastModelEntry ?? null;
+  let lastEffortEntry = seed.lastEffortEntry ?? null;
   // Inline companion counter (was codexCompactCompanionLines): a top-level
   // `compacted` snapshot arms it; the next compact-like event_msg before a
   // real user turn is that snapshot's telemetry twin and renders nothing.
@@ -4129,33 +4137,25 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
 
     if (record.type === 'turn_context'
       || (record.type === 'event_msg' && payload.type === 'thread_settings_applied')) {
-      const setting = extractCodexSettingsCandidate(record, consumedRecords - 1);
-      const model = setting?.complete ? setting.model
-        : record.type === 'turn_context' && typeof payload.model === 'string' ? payload.model.trim() : '';
-      const effort = setting?.complete ? setting.effort
-        : record.type === 'turn_context' && typeof payload.effort === 'string' ? payload.effort.trim() : '';
+      const { model, effort } = codexSettingsHistoryValues(record) || {};
       const nextTurnIndex = currentTurnIndex + 1;
       if (model && model !== lastDisplayedModel) {
-        entries.push({
-          uuid: stableUuidForRecord(sessionId, record, 'codex-model'),
-          role: 'slash',
-          timestamp: recordTimestamp(record),
-          content: `/model ${model}`,
-          sessionId: physicalSessionId,
-          turnIndex: nextTurnIndex,
-        });
+        lastModelEntry = { ...codexSettingsHistoryEntry(record, sessionId, 'model', model), turnIndex: nextTurnIndex };
+        entries.push(lastModelEntry);
         lastDisplayedModel = model;
+      } else if (model && lastModelEntry && payload.type === 'thread_settings_applied' && Number.isSafeInteger(record.__byteOffset)) {
+        const alias = stableSourceIdentity(sessionId, record, 'codex-model');
+        const aliases = lastModelEntry.sourceIdentityAliases ||= [];
+        if (alias !== lastModelEntry.sourceIdentity && aliases[aliases.length - 1] !== alias) aliases.push(alias);
       }
       if (effort && effort !== lastDisplayedEffort) {
-        entries.push({
-          uuid: stableUuidForRecord(sessionId, record, 'codex-effort'),
-          role: 'slash',
-          timestamp: recordTimestamp(record),
-          content: `/effort ${effort}`,
-          sessionId: physicalSessionId,
-          turnIndex: nextTurnIndex,
-        });
+        lastEffortEntry = { ...codexSettingsHistoryEntry(record, sessionId, 'effort', effort), turnIndex: nextTurnIndex };
+        entries.push(lastEffortEntry);
         lastDisplayedEffort = effort;
+      } else if (effort && lastEffortEntry && payload.type === 'thread_settings_applied' && Number.isSafeInteger(record.__byteOffset)) {
+        const alias = stableSourceIdentity(sessionId, record, 'codex-effort');
+        const aliases = lastEffortEntry.sourceIdentityAliases ||= [];
+        if (alias !== lastEffortEntry.sourceIdentity && aliases[aliases.length - 1] !== alias) aliases.push(alias);
       }
       return;
     }
@@ -4289,6 +4289,16 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
         }
         cachedUserOwner = null;
         logCodexRollback('full-history', sessionId, record, rollback);
+        // The last rendered setting may have belonged to the removed turn.
+        // Do not attach a later provider observation to that detached row.
+        lastModelEntry = null;
+        lastEffortEntry = null;
+        for (let i = entries.length - 1; i >= 0 && (!lastModelEntry || !lastEffortEntry); i -= 1) {
+          if (!lastModelEntry && entries[i].settingsFact?.kind === 'model') lastModelEntry = entries[i];
+          if (!lastEffortEntry && entries[i].settingsFact?.kind === 'effort') lastEffortEntry = entries[i];
+        }
+        lastDisplayedModel = lastModelEntry?.settingsFact.value || null;
+        lastDisplayedEffort = lastEffortEntry?.settingsFact.value || null;
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
         currentTurnCanonicalUserEntry = [...entries].reverse().find((entry) => (
           entry?.role === 'user' || entry?.role === 'goal'
@@ -4696,7 +4706,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       entries, pendingResponseUsers, pendingProjectInstructions, pendingCalls,
       pendingExecCells, subagents: subagents.exportState(), sessionCwd, currentTurnIndex,
       pendingThinking, pendingThinkingOwner, unrenderedThinkingByUser, latestTokenCountInfo,
-      lastDisplayedModel, lastDisplayedEffort, pendingCompactCompanions, consumedRecords,
+      lastDisplayedModel, lastDisplayedEffort, lastModelEntry, lastEffortEntry, pendingCompactCompanions, consumedRecords,
       currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, currentInterruptedNotice,
       cachedUserOwner,
       userMetadata: [...new Set([
@@ -9671,7 +9681,7 @@ async function getCodexRemoteUsage({
       const attemptAuth = auth;
       const creditExpirationRequest = typeof creditExpirationFetchImpl === 'function'
         ? fetchCodexCreditExpiration(attemptAuth, { fetchImpl: creditExpirationFetchImpl }).catch(() => null)
-        : fetchImpl === global.fetch ? readCodexCreditExpiration(attemptAuth, force) : Promise.resolve(null);
+        : fetchImpl === global.fetch ? readCodexCreditExpiration(attemptAuth, force).catch(() => null) : Promise.resolve(null);
       const shouldFetchResetCredits = typeof resetCreditsFetchImpl === 'function'
         || fetchImpl === global.fetch;
       const resetCreditsRequest = shouldFetchResetCredits

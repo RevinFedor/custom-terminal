@@ -201,11 +201,11 @@ const HOVER_CLUSTER_SELECTOR = [
   '[data-run-after-picker-menu]',
   '[data-prompt-queue-chip-menu]',
   '[data-prompt-queue-meta-actions]',
+  '[data-run-after-satellite]',
 ].join(', ');
 // Допуск по краю: субпиксельные координаты панели и округление позиции курсора
 // иначе дают «курсор снаружи» на самой границе.
 const HOVER_CLUSTER_PAD = 2;
-const PANEL_SLIDE_MS = 100;
 
 // Which screen edge the overlay is docked to. The panel is pinned by this edge
 // (it never moves), and the resize handle lives on the OPPOSITE (free) edge so
@@ -325,10 +325,12 @@ type Props = {
   hideHistoryToggle?: boolean;
   inputSurface?: 'terminal' | 'history';
   embedded?: boolean;
+  embeddedPinned?: boolean;
   embeddedWidth?: number;
   embeddedMaxHeight?: number;
   beforeCloseRef?: { current: (reason?: 'outside') => boolean };
   onRewindTargetModeChange?: (active: boolean) => void;
+  onHoverGestureChange?: (active: boolean, point: { clientX: number; clientY: number } | null) => void;
 };
 
 export function PromptQueueOverlay({
@@ -338,10 +340,12 @@ export function PromptQueueOverlay({
   rightInset = 0,
   inputSurface = 'terminal',
   embedded = false,
+  embeddedPinned = false,
   embeddedWidth = 460,
   embeddedMaxHeight = 430,
   beforeCloseRef,
   onRewindTargetModeChange,
+  onHoverGestureChange,
 }: Props) {
   const FLOATING_OVERLAY_Z_INDEX = embedded ? 15100 : 130;
   const [localPreviewId, setLocalPreviewId] = useState<string | null>(null);
@@ -779,10 +783,9 @@ export function PromptQueueOverlay({
   const [queueHoverPreviewOpen, setQueueHoverPreviewOpen] = useState(false);
   const [cmdPressed, setCmdPressed] = useState(false);
   const cmdPressedRef = useRef(false);
-  const [panelOpening, setPanelOpening] = useState(false);
-  const [panelClosing, setPanelClosing] = useState(false);
-  const collapseTimerRef = useRef<number | null>(null);
-  const openingTimerRef = useRef<number | null>(null);
+  const previewPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const previewResizeActiveRef = useRef(false);
+  const recheckQueueHoverRef = useRef<(point: { clientX: number; clientY: number } | null) => void>(() => {});
   const queueCountButtonRef = useRef<HTMLButtonElement>(null);
   const railRef = useRef<HTMLDivElement>(null);
   const prevHintRef = useRef(false);
@@ -1418,22 +1421,24 @@ export function PromptQueueOverlay({
     }
   }, [addPrompt, editorChips, editorImagePaths, editorOpen, editorText, editorTitle, generateRunAfterTitle, markAppearing, markSaved, releaseEditorPayloadLock, removePrompt, resetEditor, tabId, updatePrompt, writeThroughEditorPayload]);
 
+  const prepareQueueClose = useCallback((reason?: 'outside') => {
+    // Pointer dismissal is an editor exit, not a pin. Keep pending attachments
+    // and a requested Timeline selection alive without changing click ownership.
+    if (editorOpen && editorText.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) return false;
+    if (rewindTargetRequestId && reason === 'outside') return false;
+    if (rewindTargetRequestId) cancelQueuedRewindTarget(tabId, rewindTargetRequestId);
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && (panelRef.current?.contains(active)
+      || editorRef.current?.contains(active) || editorPreviewRef.current?.contains(active))) active.blur();
+    commitEditor();
+    return true;
+  }, [commitEditor, editorOpen, editorText, rewindTargetRequestId, tabId]);
+
   useLayoutEffect(() => {
     if (!beforeCloseRef) return;
-    const close = (reason?: 'outside') => {
-      // A parent switching pages/unmounting the queue is also an editor exit.
-      // Keep an in-flight image draft mounted until it can be committed.
-      if (editorOpen && editorText.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) return false;
-      // A Timeline click is the requested selection, not an outside dismissal
-      // of the global editor that must receive that click's result.
-      if (rewindTargetRequestId && reason === 'outside') return false;
-      if (rewindTargetRequestId) cancelQueuedRewindTarget(tabId, rewindTargetRequestId);
-      commitEditor();
-      return true;
-    };
-    beforeCloseRef.current = close;
-    return () => { if (beforeCloseRef.current === close) beforeCloseRef.current = () => true; };
-  }, [beforeCloseRef, commitEditor, editorOpen, editorText, rewindTargetRequestId, tabId]);
+    beforeCloseRef.current = prepareQueueClose;
+    return () => { if (beforeCloseRef.current === prepareQueueClose) beforeCloseRef.current = () => true; };
+  }, [beforeCloseRef, prepareQueueClose]);
 
   const suppressChipReopen = useCallback((id: string) => {
     chipCloseSuppressRef.current = { id, until: performance.now() + 450 };
@@ -1556,20 +1561,35 @@ export function PromptQueueOverlay({
 
   const { start: startEditorResizeGesture } = usePointerGesture();
   const startEditorResize = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    if (e.button !== 0) return;
     const rect = editorRef.current?.getBoundingClientRect();
     if (!rect || !editorAnchor) return;
     const startX = e.clientX;
     const startWidth = rect.width;
     const rightEdge = window.innerWidth - editorAnchor.right;
     const maxWidth = Math.max(EDITOR_MIN_WIDTH, Math.min(EDITOR_MAX_WIDTH, rightEdge - EDITOR_MARGIN));
+    previewPointerRef.current = { clientX: e.clientX, clientY: e.clientY };
     startEditorResizeGesture(e, {
       cursor: 'ew-resize',
-      onMove: (ev) => setEditorSize((prev) => ({
-        ...prev,
-        width: Math.max(EDITOR_MIN_WIDTH, Math.min(maxWidth, startWidth + startX - ev.clientX)),
-      })),
+      onMove: (ev) => {
+        previewPointerRef.current = { clientX: ev.clientX, clientY: ev.clientY };
+        onHoverGestureChange?.(true, previewPointerRef.current);
+        setEditorSize((prev) => ({
+          ...prev,
+          width: Math.max(EDITOR_MIN_WIDTH, Math.min(maxWidth, startWidth + startX - ev.clientX)),
+        }));
+      },
+      onEnd: (reason, event) => {
+        previewResizeActiveRef.current = false;
+        if (event) previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
+        if (reason === 'blur') previewPointerRef.current = null;
+        onHoverGestureChange?.(false, previewPointerRef.current);
+        if (reason !== 'dispose') recheckQueueHoverRef.current(previewPointerRef.current);
+      },
     });
-  }, [editorAnchor, startEditorResizeGesture]);
+    previewResizeActiveRef.current = true;
+    onHoverGestureChange?.(true, previewPointerRef.current);
+  }, [editorAnchor, onHoverGestureChange, startEditorResizeGesture]);
 
   const openEditor = useCallback((id?: string, mode: 'hover' | 'pin' | 'restore' = 'pin') => {
     if (id && mode === 'hover' && isChipReopenSuppressed(id)) return;
@@ -1872,7 +1892,7 @@ export function PromptQueueOverlay({
   }, [editingId, items, resetEditor]);
 
   useEffect(() => {
-    if (!pinnedPreviewId || collapsed || panelClosing) return;
+    if (!pinnedPreviewId || collapsed) return;
     if (editorOpen && editorPinned && editingId === pinnedPreviewId && !isSpecialPromptMode) return;
     if (!items.some((i) => i.id === pinnedPreviewId)) {
       setPreviewId(tabId, null);
@@ -1888,7 +1908,6 @@ export function PromptQueueOverlay({
     isSpecialPromptMode,
     items,
     openEditor,
-    panelClosing,
     pinnedPreviewId,
     setPreviewId,
     tabId,
@@ -2763,30 +2782,13 @@ export function PromptQueueOverlay({
     return () => window.removeEventListener('prompt-queue:toggle-auto-run', onToggleAutoRun);
   }, [tabId, toggleAutoRun, embedded]);
 
-  const expandPanel = useCallback((animate = true) => {
+  const expandPanel = useCallback(() => {
     setQueueHoverPreviewOpen(false);
-    if (collapseTimerRef.current !== null) {
-      window.clearTimeout(collapseTimerRef.current);
-      collapseTimerRef.current = null;
-    }
-    if (openingTimerRef.current !== null) {
-      window.clearTimeout(openingTimerRef.current);
-    }
-    setPanelClosing(false);
-    setPanelOpening(animate);
     setPanelCollapsed(tabId, false);
-    if (animate) {
-      openingTimerRef.current = window.setTimeout(() => {
-        setPanelOpening(false);
-        openingTimerRef.current = null;
-      }, PANEL_SLIDE_MS);
-    } else {
-      openingTimerRef.current = null;
-    }
   }, [tabId, setPanelCollapsed]);
 
   const collapsePanel = useCallback(() => {
-    commitEditor();
+    if (!prepareQueueClose()) return;
     setQueueHoverPreviewOpen(false);
     // Programmatic «pick a tab now» requests are one-shot UI commands. Closing
     // the whole panel explicitly retires any request that has not yet mounted,
@@ -2794,42 +2796,22 @@ export function PromptQueueOverlay({
     setOnTabTriggerOpenKeys(new Map());
     setMetaActionsMenu(null);
     setChipContextMenu(null);
-    if (openingTimerRef.current !== null) {
-      window.clearTimeout(openingTimerRef.current);
-      openingTimerRef.current = null;
-    }
-    if (collapseTimerRef.current !== null) {
-      window.clearTimeout(collapseTimerRef.current);
-    }
-    setPanelOpening(false);
-    setPanelClosing(true);
     setPanelCollapsed(tabId, true);
-    collapseTimerRef.current = window.setTimeout(() => {
-      setPanelClosing(false);
-      collapseTimerRef.current = null;
-    }, PANEL_SLIDE_MS);
-  }, [commitEditor, tabId, setPanelCollapsed]);
-
-  const pinPanelForInteraction = useCallback(() => {
-    if (!collapsed && !panelClosing) return;
-    // Hover already painted the exact panel. Pinning only changes ownership
-    // from cursor → click; replaying the entrance animation makes the same
-    // visible surface disappear and arrive a second time.
-    expandPanel(!queueHoverPreviewOpen);
-  }, [collapsed, expandPanel, panelClosing, queueHoverPreviewOpen]);
+  }, [prepareQueueClose, tabId, setPanelCollapsed]);
 
   // A click-open queue is persistent tab layout, not a modal. Outside clicks
   // and Escape belong to the satellite that is currently open (item editor,
   // tab picker, context menu); they must not also collapse the prompt list
   // behind it. The count button is the single explicit close control.
 
-  const openQueueHoverPreview = useCallback(() => {
+  const openQueueHoverPreview = useCallback((event: React.MouseEvent) => {
     // Empty is still a useful Run After state: Post, Loop, manual add and meta
     // actions are how the first item/settings get created. Tying hover to an
     // existing item made the zero-count rail a dead control.
-    if (!collapsed || panelClosing) return;
+    if (!collapsed) return;
+    previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
     setQueueHoverPreviewOpen(true);
-  }, [collapsed, panelClosing]);
+  }, [collapsed]);
 
   useEffect(() => {
     if (collapsed) return;
@@ -2858,67 +2840,79 @@ export function PromptQueueOverlay({
   // Читаются живые прямоугольники: список вкладок раскрывается влево или
   // вправо, вверх или вниз в зависимости от места у края экрана, и любой
   // заранее записанный «список сторон» разошёлся бы с тем, что на экране.
+  const closeQueueHoverPreview = useCallback(() => {
+    if (!prepareQueueClose('outside')) return;
+    setQueueHoverPreviewOpen(false);
+    setOnTabTriggerOpenKeys(new Map());
+    setMetaActionsMenu(null);
+    setChipContextMenu(null);
+  }, [prepareQueueClose]);
+
+  const recheckQueueHover = useCallback((point: { clientX: number; clientY: number } | null) => {
+    if (!queueHoverPreviewOpen || dragIdRef.current || previewResizeActiveRef.current || rewindTargetRequestId) return;
+    if (!point) { closeQueueHoverPreview(); return; }
+    const countRect = queueCountButtonRef.current?.getBoundingClientRect() ?? null;
+    const railRect = railRef.current?.getBoundingClientRect() ?? null;
+    // Only the orange count owns hover. The wide bridge can cover sibling
+    // controls, but the thin rail border directly below the count remains a
+    // path into the panel rather than an accidental close strip.
+    if (pointInRect(railRect, point.clientX, point.clientY, 0)
+      && (!countRect || point.clientX < countRect.left || point.clientX > countRect.right)) {
+      closeQueueHoverPreview();
+      return;
+    }
+    const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect() ?? null;
+    if (!previewRect) return;
+    const satellites: (DOMRect | null)[] = [
+      countRect,
+      ...Array.from(queueHoverPreviewPanelRef.current?.querySelectorAll<HTMLElement>('[data-prompt-queue-edge-controls]') || [])
+        .map((el) => el.getBoundingClientRect()),
+      ...Array.from(document.querySelectorAll<HTMLElement>(HOVER_CLUSTER_SELECTOR))
+        .filter((el) => el.dataset.runAfterHoverOwner === editorLockTokenRef.current)
+        .map((el) => el.getBoundingClientRect()),
+    ];
+    if (pointInHoverCluster({
+      hub: previewRect,
+      satellites,
+      x: point.clientX,
+      y: point.clientY,
+      pad: HOVER_CLUSTER_PAD,
+    })) return;
+    closeQueueHoverPreview();
+  }, [closeQueueHoverPreview, queueHoverPreviewOpen, rewindTargetRequestId, dragId]);
+  recheckQueueHoverRef.current = recheckQueueHover;
+
   useEffect(() => {
     if (!queueHoverPreviewOpen) return;
     const onMouseMove = (event: MouseEvent) => {
-      if (dragIdRef.current) return;
-      if (editorOpen && editorPinned) return;
-      const countRect = queueCountButtonRef.current?.getBoundingClientRect() ?? null;
-      const railRect = railRef.current?.getBoundingClientRect() ?? null;
-      // Only the orange count owns hover. The wide bridge can cover sibling
-      // controls, but the thin rail border directly below the count remains a
-      // path into the panel rather than an accidental close strip.
-      if (pointInRect(railRect, event.clientX, event.clientY, 0)
-        && (!countRect || event.clientX < countRect.left || event.clientX > countRect.right)) {
-        setQueueHoverPreviewOpen(false);
-        return;
-      }
-      // Клик по строке закрепил модалку: пока она открыта, кластер держится
-      // КЛИКОМ, а не курсором — «могу увести курсор куда угодно». Закрытием
-      // владеет mousedown снаружи (см. outside-обработчик редактора), который
-      // гасит и модалку, и превью одним кликом.
-      if (editorOpen) return;
-      const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect() ?? null;
-      if (!previewRect) return;
-      const satellites: (DOMRect | null)[] = [
-        countRect,
-        ...Array.from(document.querySelectorAll<HTMLElement>(HOVER_CLUSTER_SELECTOR))
-          .map((el) => el.getBoundingClientRect()),
-      ];
-      if (pointInHoverCluster({
-        hub: previewRect,
-        satellites,
-        x: event.clientX,
-        y: event.clientY,
-        pad: HOVER_CLUSTER_PAD,
-      })) return;
-      setQueueHoverPreviewOpen(false);
+      previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
+      recheckQueueHover(event);
     };
+    const onExitWindow = () => { previewPointerRef.current = null; recheckQueueHover(null); };
+    const onMouseOut = (event: MouseEvent) => { if (!event.relatedTarget) onExitWindow(); };
+    recheckQueueHover(previewPointerRef.current);
     window.addEventListener('mousemove', onMouseMove);
-    return () => window.removeEventListener('mousemove', onMouseMove);
-  }, [editorOpen, editorPinned, queueHoverPreviewOpen]);
-
-  useEffect(() => {
+    window.addEventListener('mouseout', onMouseOut);
+    window.addEventListener('blur', onExitWindow);
     return () => {
-      if (collapseTimerRef.current !== null) {
-        window.clearTimeout(collapseTimerRef.current);
-        collapseTimerRef.current = null;
-      }
-      if (openingTimerRef.current !== null) {
-        window.clearTimeout(openingTimerRef.current);
-        openingTimerRef.current = null;
-      }
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseout', onMouseOut);
+      window.removeEventListener('blur', onExitWindow);
     };
-  }, []);
+  }, [queueHoverPreviewOpen, recheckQueueHover]);
 
   // ─── drag-and-drop reorder ───────────────────────────────────────────────
   const onDragStart = (id: string) => (e: React.DragEvent) => {
     dragIdRef.current = id;
+    previewPointerRef.current = { clientX: e.clientX, clientY: e.clientY };
+    onHoverGestureChange?.(true, previewPointerRef.current);
     setDragId(id);
     e.dataTransfer.effectAllowed = 'move';
   };
   const onDragOver = (idx: number) => (e: React.DragEvent) => {
     e.preventDefault();
+    previewPointerRef.current = { clientX: e.clientX, clientY: e.clientY };
+    if (dragIdRef.current) onHoverGestureChange?.(true, previewPointerRef.current);
     if (dragOverIdx !== idx) setDragOverIdx(idx);
   };
   const onDrop = (idx: number) => (e: React.DragEvent) => {
@@ -2928,29 +2922,37 @@ export function PromptQueueOverlay({
     if (fromIdx < 0) return;
     reorderPrompt(tabId, fromIdx, idx);
     dragIdRef.current = null;
+    previewPointerRef.current = { clientX: e.clientX, clientY: e.clientY };
+    onHoverGestureChange?.(false, previewPointerRef.current);
     setDragId(null);
     setDragOverIdx(null);
   };
-  const onDragEnd = () => {
+  const onDragEnd = (e: React.DragEvent) => {
     dragIdRef.current = null;
+    previewPointerRef.current = { clientX: e.clientX, clientY: e.clientY };
+    onHoverGestureChange?.(false, previewPointerRef.current);
     setDragId(null);
     setDragOverIdx(null);
   };
 
+  useEffect(() => () => {
+    if (!dragIdRef.current) return;
+    dragIdRef.current = null;
+    onHoverGestureChange?.(false, previewPointerRef.current);
+  }, [onHoverGestureChange]);
+
   // chipRefs is still used: openEditor() needs each chip's top coordinate to
   // anchor the editor slideout next to the clicked chip.
   const chipRefs = useRef<Map<string, HTMLDivElement>>(new Map());
-  const panelOpen = !collapsed || panelClosing;
-  const panelPinned = !collapsed && !panelClosing;
-  const queueHoverPreviewVisible = collapsed
-    && !panelClosing
-    && queueHoverPreviewOpen;
+  const panelOpen = !collapsed;
+  const panelPinned = embedded ? embeddedPinned : panelOpen;
+  const queueHoverPreviewVisible = collapsed && queueHoverPreviewOpen;
   const panelAttached = panelOpen || queueHoverPreviewVisible;
   // Модалка-редактор существует в ОБОИХ режимах панели: в развёрнутом и в
   // ховер-превью свёрнутого рейла. Превью — это тот же список сообщений, а не
   // витрина без действий: клик по строке открывает ту же боковую модалку
   // (юзер: «я кликаю на строку, у меня появляется сбоку модалка»).
-  const editorSurfaceVisible = (!collapsed && !panelClosing) || queueHoverPreviewVisible;
+  const editorSurfaceVisible = panelOpen || queueHoverPreviewVisible;
   const railRunAppearance = resolveRunAfterPlayAppearance({
     autoRun,
     activeItemCount,
@@ -3006,6 +3008,7 @@ export function PromptQueueOverlay({
         ref={panelRef}
         data-prompt-queue-instance={embedded ? 'global' : 'tab'}
         data-prompt-queue-owner={tabId}
+        data-prompt-queue-hover-owner={editorLockTokenRef.current}
         style={{
           position: embedded ? 'relative' : 'absolute',
           ...(embedded ? { width: '100%' } : {}),
@@ -3031,14 +3034,8 @@ export function PromptQueueOverlay({
         {(panelOpen || queueHoverPreviewVisible) && (
           <div
             ref={queueHoverPreviewVisible ? queueHoverPreviewPanelRef : undefined}
-            className={panelClosing ? 'pq-panel-closing' : (panelOpening ? 'pq-panel-opening' : undefined)}
+            data-prompt-queue-panel-mode={panelPinned ? 'pinned' : 'preview'}
             data-prompt-queue-hover-preview={queueHoverPreviewVisible ? 'true' : undefined}
-            onPointerDownCapture={(event) => {
-              if (!queueHoverPreviewVisible) return;
-              const target = event.target as HTMLElement;
-              if (target.closest('[data-prompt-queue-transient-action]')) return;
-              pinPanelForInteraction();
-            }}
             style={{
               position: 'relative',
               width: embedded ? '100%' : effectiveWidth,
@@ -3126,7 +3123,6 @@ export function PromptQueueOverlay({
                 className="pq-edge-action"
                 aria-pressed={postPromptEnabled}
                 onClick={() => {
-                  pinPanelForInteraction();
                   setPostPromptEnabled(tabId, !postPromptEnabled);
                 }}
                 title={postPromptText ? 'Post-prompt: ' + (postPromptText.length > 60 ? postPromptText.slice(0, 60) + '…' : postPromptText) : 'Post-prompt is empty — click ✏ to add'}
@@ -3156,7 +3152,6 @@ export function PromptQueueOverlay({
                 className="pq-edge-action"
                 data-editor-trigger="post"
                 onClick={() => {
-                  pinPanelForInteraction();
                   openPostPromptEditor();
                 }}
                 aria-label="Изменить post-prompt"
@@ -3198,7 +3193,6 @@ export function PromptQueueOverlay({
                 className="pq-edge-action"
                 aria-pressed={loopPromptEnabled}
                 onClick={() => {
-                  pinPanelForInteraction();
                   setLoopPromptEnabled(tabId, !loopPromptEnabled);
                 }}
                 title={loopPromptText ? 'Loop: ' + (loopPromptText.length > 60 ? loopPromptText.slice(0, 60) + '…' : loopPromptText) : 'Loop is empty — click the pencil to add text'}
@@ -3228,7 +3222,6 @@ export function PromptQueueOverlay({
                 className="pq-edge-action"
                 data-editor-trigger="loop"
                 onClick={() => {
-                  pinPanelForInteraction();
                   openLoopPromptEditor();
                 }}
                 aria-label="Изменить циклический prompt"
@@ -3259,12 +3252,10 @@ export function PromptQueueOverlay({
               data-editor-trigger="add"
               aria-label="Добавить prompt вручную"
               onClick={() => {
-                pinPanelForInteraction();
                 openEditor();
               }}
               onContextMenu={(event) => {
                 event.preventDefault(); event.stopPropagation();
-                pinPanelForInteraction();
                 if (metaActionsMenu) setMetaActionsMenu(null); else openMetaActionsMenu();
               }}
               style={{
@@ -3413,7 +3404,7 @@ export function PromptQueueOverlay({
                   display: 'flex',
                   alignItems: 'center',
                   gap: 6,
-                  transition: 'background 0.15s, border-color 0.15s',
+                  transition: 'none',
                   // Prevent native text selection while dragging — the synthetic
                   // selection that appears when the cursor moves over the chip
                   // body during a drag looks broken (blue highlight covers the
@@ -3487,7 +3478,7 @@ export function PromptQueueOverlay({
                     padding: 0, lineHeight: 1, fontSize: 10,
                     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                     width: 16, height: 16, borderRadius: 999,
-                    transition: 'background 0.12s, border-color 0.12s, color 0.12s',
+                    transition: 'none',
                     flexShrink: 0,
                     boxSizing: 'border-box',
                   }}
@@ -3609,7 +3600,7 @@ export function PromptQueueOverlay({
                     display: 'inline-flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    transition: 'background 0.12s, color 0.12s',
+                    transition: 'none',
                   }}
                 ><Trash2 size={13} strokeWidth={1.9} /></button>
                 </ControlHint>
@@ -3661,6 +3652,7 @@ export function PromptQueueOverlay({
                   ) : (
                     <div style={{ minWidth: 0, flex: 1 }}>
                       <RunAfterTabPicker
+                        hoverOwner={editorLockTokenRef.current}
                         zIndex={FLOATING_OVERLAY_Z_INDEX + 20}
                         tabId={tabId}
                         autoRun={autoRun}
@@ -3803,7 +3795,7 @@ export function PromptQueueOverlay({
           />
           <AutoCompactControl tabId={tabId} />
           <ControlHint
-            label={(collapsed || panelClosing) ? 'Открыть очередь Run after' : 'Закрыть очередь Run after'}
+            label={collapsed ? 'Закрепить очередь Run after' : 'Закрыть очередь Run after'}
             shortcut={`${activeItemCount} активных шагов`}
             side="left"
           >
@@ -3811,12 +3803,12 @@ export function PromptQueueOverlay({
               ref={queueCountButtonRef}
               className={`pq-rail-button pq-rail-count ${panelAttached ? 'pq-rail-count-open' : 'pq-rail-count-closed'}`}
               onClick={() => {
-                if (collapsed || panelClosing) expandPanel(!queueHoverPreviewVisible);
+                if (collapsed) expandPanel();
                 else collapsePanel();
               }}
               onMouseEnter={openQueueHoverPreview}
               title={`Run after: ${activeItemCount} queued`}
-              aria-label={`${panelAttached ? 'Close' : 'Open'} Run after queue, ${activeItemCount} queued`}
+              aria-label={`${collapsed ? 'Pin' : 'Close'} Run after queue, ${activeItemCount} queued`}
               aria-expanded={panelAttached}
               style={{
                 position: 'relative',
@@ -3920,6 +3912,7 @@ export function PromptQueueOverlay({
         <div
           ref={metaActionsMenuRef}
           data-run-after-satellite="true"
+          data-run-after-hover-owner={editorLockTokenRef.current}
           data-prompt-queue-meta-actions
           onMouseDown={(event) => event.stopPropagation()}
           style={{
@@ -4105,6 +4098,7 @@ export function PromptQueueOverlay({
           <div
             data-prompt-queue-chip-menu
             data-run-after-satellite="true"
+            data-run-after-hover-owner={editorLockTokenRef.current}
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             style={{
@@ -4279,6 +4273,7 @@ export function PromptQueueOverlay({
         <div
           ref={editorPreviewRef}
           data-run-after-satellite="true"
+          data-run-after-hover-owner={editorLockTokenRef.current}
           className="pq-editor-preview-sibling"
           data-run-after-preview-sibling
           data-preview-placement={editorPreviewBeside ? 'left' : 'below'}
@@ -4360,6 +4355,7 @@ export function PromptQueueOverlay({
         <div
           ref={editorRef}
           data-run-after-satellite="true"
+          data-run-after-hover-owner={editorLockTokenRef.current}
           style={{
             position: 'fixed',
             top: editorAnchor.top,
@@ -4760,36 +4756,6 @@ export function PromptQueueOverlay({
         .pq-spin-icon {
           animation: pq-spin 1.35s linear infinite;
         }
-        .pq-panel-opening {
-          transform-origin: center top;
-          animation: pq-panel-open ${PANEL_SLIDE_MS}ms ease-out both;
-        }
-        .pq-panel-closing {
-          pointer-events: none;
-          transform-origin: center top;
-          animation: pq-panel-close ${PANEL_SLIDE_MS}ms ease-in both;
-        }
-        @keyframes pq-panel-open {
-          /* Rail is above the panel now: the panel drops DOWN from under it. */
-          0% {
-            transform: translateY(calc(-100% - ${COLLAPSED_RAIL_GAP}px));
-            opacity: 0;
-          }
-          100% {
-            transform: translateY(0);
-            opacity: 1;
-          }
-        }
-        @keyframes pq-panel-close {
-          0% {
-            transform: translateY(0);
-            opacity: 1;
-          }
-          100% {
-            transform: translateY(calc(-100% - ${COLLAPSED_RAIL_GAP}px));
-            opacity: 0;
-          }
-        }
         .pq-rail-top-row {
           display: flex;
           align-items: center;
@@ -4821,7 +4787,7 @@ export function PromptQueueOverlay({
           padding: 0;
           line-height: 1;
           appearance: none;
-          transition: background 0.12s, border-color 0.12s, color 0.12s, transform 0.08s;
+          transition: none;
         }
         /* Count owns only panel visibility: dim orange while the list is
            hidden, full orange while it is visibly open (including hover
@@ -4873,7 +4839,7 @@ export function PromptQueueOverlay({
            alone was ambiguous because Post / pencil / Loop / pencil shared one
            tiny frame and only changed to pointer without showing the hit area. */
         .pq-edge-action {
-          transition: box-shadow 0.12s, filter 0.12s, color 0.12s;
+          transition: none;
         }
         .pq-edge-action:hover {
           box-shadow: inset 0 0 0 999px rgba(255,255,255,0.09);
@@ -4887,7 +4853,7 @@ export function PromptQueueOverlay({
         }
         .pq-editor-resize-handle {
           background: transparent;
-          transition: background 0.12s;
+          transition: none;
         }
         .pq-editor-resize-handle:hover {
           background: ${TINT}18;

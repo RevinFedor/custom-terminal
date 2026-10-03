@@ -207,6 +207,9 @@ export interface AcceptHistoryPromptHandoffProviderQueueInput
 }
 
 export interface DurableHistorySendReceiptRecord {
+  promptHash?: string | null;
+  imagePresentation?: { version: number; operationKey: string; attemptId: string; requestHash: string;
+    imagePaths: HistoryPromptHandoffImageRef[] } | null;
   operationKey?: string | null;
   surface?: string | null;
   tabId?: string | null;
@@ -935,6 +938,30 @@ export class HistoryPromptHandoffStore {
     this.limits = Object.freeze({ ...limits });
   }
 
+  hydrateImagePresentation(record: DurableHistorySendReceiptRecord): boolean {
+    const tab = this.tabs.get(String(record.tabId || ''));
+    const current = tab?.get(String(record.handoffId || ''));
+    const proof = record.imagePresentation;
+    if (!tab || !current || current.value.imagePaths.length || !proof || proof.version !== 1
+      || proof.operationKey !== record.operationKey || proof.attemptId !== record.attemptId
+      || proof.requestHash !== record.promptHash || record.provider !== current.value.toolType
+      || record.receipt?.promptText !== current.value.text
+      || current.value.sendAttemptId !== record.attemptId || current.value.sendOperationKey !== record.operationKey
+      || (current.value.sessionIdHint && current.value.sessionIdHint !== record.sessionId)
+      || !Array.isArray(proof.imagePaths) || !proof.imagePaths.length
+      || proof.imagePaths.some((ref, i) => ref.id !== i + 1 || !ref.path?.startsWith('/'))) return false;
+    const next = freezeHandoff({ ...current.value, imagePaths: proof.imagePaths });
+    const approxBytes = estimateHandoffBytes(next);
+    if (approxBytes > this.limits.maxBytes) return false;
+    this.approxBytes += approxBytes - current.approxBytes;
+    tab.set(next.handoffId, { value: next, approxBytes });
+    this.promoteTab(next.tabId);
+    this.enforceLimits(next.tabId, next.handoffId);
+    if (!this.tabs.get(next.tabId)?.has(next.handoffId)) return false;
+    this.notify(next.tabId, { type: 'replay' });
+    return true;
+  }
+
   begin(input: BeginHistoryPromptHandoffInput): Readonly<HistoryPromptHandoff> | undefined {
     const tabId = requireKey(input.tabId, 'tabId');
     const handoffId = requireKey(input.handoffId, 'handoffId');
@@ -1542,6 +1569,8 @@ export class HistoryPromptHandoffStore {
 }
 
 const historyPromptHandoffStore = new HistoryPromptHandoffStore();
+export const hydrateHistoryPromptHandoffImages = (record: DurableHistorySendReceiptRecord) =>
+  historyPromptHandoffStore.hydrateImagePresentation(record);
 
 const createHistoryPromptHandoffId = () => {
   const uuid = globalThis.crypto?.randomUUID?.();

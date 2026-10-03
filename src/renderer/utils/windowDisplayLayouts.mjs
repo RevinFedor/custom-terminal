@@ -1,4 +1,5 @@
-import { paneColumns, paneGridRects, packSplitSizes } from './splitPanesModel.mjs';
+import { paneColumns, paneGridRects, packSplitSizes, paneTabs, paneChooserSlots,
+  replacePaneShownTab, selectChooserSlot } from './splitPanesModel.mjs';
 
 // The pane array owns window CONTENT once. Display profiles contain addresses
 // and geometry only; they can never restore deleted tabs or fork a live owner.
@@ -125,17 +126,34 @@ export function reconcileWindowDisplay(layout, display, namespace = 'workspace')
   return out;
 }
 
-/** The explicit two-click switch, also used by navigation to a hidden tab. */
-export function revealHiddenWindow(layout, targetIndex, hiddenWindowId) {
+/** Reveal a whole window, optionally selecting one of its existing chips first. */
+export function revealHiddenWindow(layout, targetIndex, hiddenWindowId, selection) {
   const panes = layout.splitPanes || [];
   const from = panes[targetIndex];
-  const incoming = panes.find(p => p.windowId === hiddenWindowId && !isWindowVisible(p));
+  const incomingIndex = panes.findIndex(p => p.windowId === hiddenWindowId && !isWindowVisible(p));
+  let incoming = panes[incomingIndex];
   if (!isWindowVisible(from) || !incoming) return null;
+  if (selection !== undefined) {
+    if (!selection || typeof selection !== 'object' || Array.isArray(selection)) return null;
+    const keys = Object.keys(selection);
+    if (keys.length === 2 && keys.includes('projectId') && keys.includes('tabId')
+        && typeof selection.projectId === 'string' && selection.projectId
+        && typeof selection.tabId === 'string' && selection.tabId) {
+      if (!paneTabs(incoming).some(tab => tab.projectId === selection.projectId && tab.tabId === selection.tabId)) return null;
+      incoming = replacePaneShownTab([incoming], 0, selection.projectId, selection.tabId)?.panes[0] || incoming;
+    } else if (keys.length === 1 && keys[0] === 'slotId'
+        && typeof selection.slotId === 'string' && selection.slotId) {
+      if (!paneChooserSlots(incoming).some(slot => slot.slotId === selection.slotId)) return null;
+      incoming = selectChooserSlot([incoming], 0, selection.slotId)?.panes[0] || incoming;
+    } else {
+      return null;
+    }
+  }
   const rects = paneGridRects(panes, layout.splitSizes);
   const { displayHidden, displayRect, column, ...content } = incoming;
   const next = panes.map((pane, index) => pane === from
     ? { ...content, column: from.column ?? targetIndex }
-    : pane === incoming
+    : index === incomingIndex
       ? { ...from, displayHidden: true, displayRect: rects[targetIndex] }
       : pane);
   return { ...layout, splitPanes: next, splitFocusedIndex: targetIndex };

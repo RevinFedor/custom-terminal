@@ -92,6 +92,26 @@ test('post-Enter sidecar decorates the exact durable prompt without changing its
   assert.equal(store.rows[0].entryUuid, 'codex-user-writer-1-17');
 });
 
+for (const toolType of ['claude', 'codex']) {
+  test(toolType + ' exact durable message sidecar preserves body hash and address for renderer projection', () => {
+    const store = createStore();
+    const envelopeText = 'Generated envelope\n\nAnswer:\n';
+    const content = envelopeText + '**Exact answer**';
+    const tag = { id: 'message-tag', kind: 'tab-message', messageId: 'answer-id',
+      replyTo: 'question-id', phase: 'reply', sourceTabId: 'B', sourceTabName: 'Owner B',
+      sourceProjectId: 'project-b', targetTabId: 'A', targetTabName: 'Source A', targetProjectId: 'project-a',
+      envelopeStart: 0, envelopeText, bodyStart: envelopeText.length, bodyEnd: content.length,
+      bodyProjectionHash: require('node:crypto').createHash('sha256').update(content).digest('hex') };
+    assert.equal(saveAuditedPromptPresentation(store, { toolType, sessionId: 'recipient-session',
+      entryUuid: 'exact-user-entry', auditTimestamp: '2026-10-03T00:00:00Z', actualText: content,
+      snapshot: { semanticTags: [tag] } }), true);
+    const entries = decorateHistoryPromptPresentations(store, { toolType, sessionId: 'recipient-session',
+      entries: [{ uuid: 'exact-user-entry', role: 'user', content }] });
+    assert.equal(entries[0].content, content);
+    assert.deepEqual(entries[0].semanticTags, [tag]);
+  });
+}
+
 test('file-chip sidecar keeps only validated snapshot metadata beside its text', () => {
   const store = createStore();
   const content = 'file body\n\nuser task';

@@ -22,8 +22,18 @@ export function isSystemPromptEntry(entry) {
 }
 
 export function isServicePromptEntry(entry) {
-  return isSystemPromptEntry(entry) || (Array.isArray(entry?.semanticTags)
+  return isSystemPromptEntry(entry) || !!getTabMessageTag(entry) || (Array.isArray(entry?.semanticTags)
     && entry.semanticTags.some(tag => tag?.kind === 'orchestration'));
+}
+
+export function getTabMessageTag(entry) {
+  return (Array.isArray(entry?.semanticTags) && entry.semanticTags.find(tag => (
+    tag?.kind === 'tab-message'
+    && typeof tag.messageId === 'string' && tag.messageId.trim().length > 0
+    && (tag.phase === 'question' || tag.phase === 'reply')
+    && typeof tag.sourceTabId === 'string' && tag.sourceTabId.trim().length > 0
+    && typeof tag.targetTabId === 'string' && tag.targetTabId.trim().length > 0
+  ))) || null;
 }
 
 export function withPromptOriginPresentation(snapshot, source) {

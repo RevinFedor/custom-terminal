@@ -160,6 +160,7 @@ function applyHistoryEntryWindow(entries, bounds = null) {
  *     projection and "what just happened" all read the tail).
  */
 const HISTORY_ROW_STUB_FIELDS = [
+  'settingsFact',
   'imageCount',
   'uuid', 'role', 'timestamp', 'sessionId', 'messageId', 'textPhase',
   'preTokens', 'postTokens', 'compactEncrypted',
@@ -303,9 +304,14 @@ function makeHistoryRowStub(entry) {
   if (entry.sourceIdentityAliases !== undefined) {
     stub.sourceIdentityAliases = entry.sourceIdentityAliases;
   }
-  // Whether the row has visible text matters to grouping (text ends a series);
-  // ship the fact without the content.
-  if (typeof entry.content === 'string' && entry.content.trim()) stub.hasContent = true;
+  // A short caption belongs to its action group, while a long reply is a
+  // boundary. Keep its exact trimmed length: hasContent alone changes that
+  // decision when an old row leaves the hydration span, reindexing everything
+  // below it even though the transcript has not changed.
+  if (typeof entry.content === 'string') {
+    stub.contentLength = entry.content.trim().length;
+    if (stub.contentLength > 0) stub.hasContent = true;
+  }
   // Reasoning text is heavy and stays dehydrated, but its structural presence
   // and duration participate in grouping exactly like a hydrated row.
   if (typeof entry.thinking === 'string' && entry.thinking.trim()) stub.hasThinking = true;

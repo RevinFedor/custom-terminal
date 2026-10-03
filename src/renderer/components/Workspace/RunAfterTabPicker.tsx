@@ -13,25 +13,16 @@ import {
   UNPLACED_WORKFLOW_ID,
   UNPLACED_WORKFLOW_NAME,
   resolveWorkflowIcon,
-  workflowFallbackColor,
-  workflowInitial,
 } from '../../utils/workflowVisuals.mjs';
 import ControlHint from '../UI/ControlHint';
+import TabCard from './TabCard';
+import WorkflowChipPresentation from './WorkflowChip';
 import { CONTEXT_MENU_ICON_SLOT_STYLE, CONTEXT_MENU_ROW_STYLE } from '../UI/contextMenuMetrics.mjs';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
 import {
   TabProcessBar,
-  TabSessionAvailabilityMarker,
   TabStatusMarker,
 } from './TabSignals';
-import {
-  resolveTabSessionDescriptor,
-  useSessionAvailability,
-} from '../../utils/sessionAvailabilityTracker';
-import {
-  sessionAvailabilityBackgroundImage,
-  sessionAvailabilityRailShadow,
-} from '../../utils/sessionAvailabilityVisual.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -121,6 +112,7 @@ export type RunAfterTabPickerProps = {
   waitingTabIds?: ReadonlySet<string>;
   setRunAfterTab: (tabId: string, target: string | null) => void;
   panelRef: RefObject<HTMLDivElement | null>;
+  hoverOwner?: string;
   ownerProjectId?: string | null;
   title?: string;
   emptyLabel?: string;
@@ -187,28 +179,6 @@ const flattenRgbaOnTabbarPanel = (color: string): string => {
   if (alpha >= 1) return `rgb(${r}, ${g}, ${b})`;
   const blend = (fg: number, bg: number) => Math.round((fg * alpha) + (bg * (1 - alpha)));
   return `rgb(${blend(r, TABBAR_PANEL_RGB.r)}, ${blend(g, TABBAR_PANEL_RGB.g)}, ${blend(b, TABBAR_PANEL_RGB.b)})`;
-};
-
-const getTabChromeColorConfig = (tab: Pick<AiTab, 'color' | 'tabType'>) => {
-  const base = TAB_COLORS.find((c) => c.color === tab.color) || TAB_COLORS[0];
-  return tab.tabType === 'claude-sdk' && tab.color === 'claude'
-    ? { ...base, bgColor: 'rgba(210, 140, 90, 0.30)', borderColor: '#D28C5A' }
-    : tab.tabType === 'file'
-      ? { ...base, bgColor: '#181725', borderColor: '#8b5cf6' }
-      : base;
-};
-
-const pickerTabBackground = (tab: AiTab, selected: boolean, hover: boolean): string => {
-  const colorConfig = getTabChromeColorConfig(tab);
-  const hasColor = tab.color && tab.color !== 'default';
-  if (selected) {
-    return flattenRgbaOnTabbarPanel(hasColor ? adjustRgbaAlpha(colorConfig.bgColor, 0.20) : 'rgba(255,255,255,0.16)');
-  }
-  if (hover) {
-    return flattenRgbaOnTabbarPanel(hasColor ? adjustRgbaAlpha(colorConfig.bgColor, 0.08) : 'rgba(255,255,255,0.12)');
-  }
-  if (hasColor) return flattenRgbaOnTabbarPanel(colorConfig.bgColor);
-  return flattenRgbaOnTabbarPanel('rgba(255,255,255,0.035)');
 };
 
 const pickerGroupBackground = (group: TabGroup, hover: boolean): string => {
@@ -321,6 +291,7 @@ export function RunAfterTabPicker({
   waitingTabIds,
   setRunAfterTab,
   panelRef,
+  hoverOwner,
   ownerProjectId: ownerProjectIdProp = null,
   title = 'Run after - pick a tab',
   emptyLabel = 'on tab',
@@ -1129,6 +1100,7 @@ export function RunAfterTabPicker({
             <div
               ref={menuRef}
               data-run-after-picker-menu
+              data-run-after-hover-owner={hoverOwner}
               style={{
                 position: 'fixed',
                 top: anchor.top,
@@ -1301,64 +1273,16 @@ function WorkflowChip({
   total: number;
   onClick: () => void;
 }) {
-  const [hover, setHover] = useState(false);
   return (
-    <button
+    <WorkflowChipPresentation workflowId={workflowId} label={label} icon={icon} unplaced={unplaced}
+      selected={selected}
       data-run-after-workflow-chip={workflowId}
       onClick={onClick}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
       title={`${label}: ${count} loader / ${total} AI tabs`}
-      style={{
-        flex: '0 0 auto',
-        maxWidth: 118,
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 4,
-        padding: '2px 6px',
-        borderRadius: 999,
-        border: `1px solid ${selected ? 'rgba(255,255,255,0.5)' : (hover ? `${DEEP_PULSE}55` : BORDER)}`,
-        background: selected ? 'rgba(255,255,255,0.08)' : (hover ? `${DEEP_PULSE}1f` : 'transparent'),
-        color: selected ? '#fff' : (hover ? '#ddd' : TEXT_DIM),
-        cursor: 'pointer',
-        fontSize: 9,
-        lineHeight: 1.25,
-        whiteSpace: 'nowrap',
-        minWidth: 0,
-      }}
     >
-      {icon ? (
-        <img
-          src={icon}
-          alt=""
-          draggable={false}
-          style={{ width: 12, height: 12, borderRadius: 3, objectFit: 'cover', flexShrink: 0 }}
-        />
-      ) : (
-        <span
-          aria-hidden
-          style={{
-            width: 12,
-            height: 12,
-            borderRadius: 3,
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            flexShrink: 0,
-            border: unplaced ? '1px dashed rgba(148,163,184,0.72)' : 'none',
-            background: unplaced ? 'rgba(148,163,184,0.08)' : workflowFallbackColor(workflowId),
-            color: '#fff',
-            fontSize: 7,
-            fontWeight: 800,
-          }}
-        >
-          {unplaced ? '' : workflowInitial(label)}
-        </span>
-      )}
       {isOwner && <span style={{ width: 4, height: 4, borderRadius: '50%', background: '#fff', opacity: 0.7, flexShrink: 0 }} />}
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
       {count > 0 && <span style={{ color: selected ? '#fff' : PULSE, fontSize: 8, flexShrink: 0 }}>{count}</span>}
-    </button>
+    </WorkflowChipPresentation>
   );
 }
 
@@ -1529,70 +1453,15 @@ function PickerTabRow({
   titleText?: string;
   trailingActions?: ReactNode;
 }) {
-  const [hover, setHover] = useState(false);
-  const statusMeta = tab.sessionStatus
-    ? sessionStatuses.find((status) => status.id === tab.sessionStatus)
-    : null;
-  const selectedActive = selected && active;
-  const sessionAvailability = useSessionAvailability(resolveTabSessionDescriptor(tab, tab.id));
-  const availabilityShadow = sessionAvailabilityRailShadow(sessionAvailability);
-
-  return (
-    <button
-      ref={buttonRef}
-      type="button"
-      // Named so a test can ask "is the row for THIS tab showing it as
-      // working" — the exact question this list answered wrongly.
-      data-run-after-tab-row={tab.id}
-      data-run-after-tab-status={status}
-      data-tab-session-availability={sessionAvailability.state === 'none' ? undefined : sessionAvailability.state}
-      onClick={onClick}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      style={{
-        width: '100%',
-        position: 'relative',
-        minHeight: 24,
-        padding: `${Math.max(2, tabGeo.paddingY)}px ${tabGeo.paddingX}px ${Math.max(2, tabGeo.paddingY)}px ${tabGeo.paddingLeft}px`,
-        background: pickerTabBackground(tab, selected, hover),
-        backgroundImage: sessionAvailabilityBackgroundImage(sessionAvailability),
-        border: `1px solid ${selectedActive ? 'rgba(196,181,253,0.42)' : (selected ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.05)')}`,
-        borderRadius: tabGeo.borderRadius,
-        color: selectedActive ? '#fff' : (selected ? '#d8d8d8' : '#ddd'),
-        cursor: 'pointer',
-        fontSize,
-        lineHeight: 1.18,
-        display: 'flex',
-        alignItems: 'center',
-        gap: 8,
-        textAlign: 'left',
-        overflow: 'hidden',
-        boxSizing: 'border-box',
-        boxShadow: [
-          selectedActive ? 'inset 0 0 0 1px rgba(139,92,246,0.16)' : null,
-          availabilityShadow,
-        ].filter(Boolean).join(', ') || undefined,
-      }}
-      title={titleText ?? (status === 'waiting' ? `${tab.name} - waiting for its Run after trigger` : tab.name)}
-    >
-      {/* Shared tab signal (TabSignals) — same bar as the sidebar card. Here
-          'busy' and 'inherited' are two distinct states, never both. */}
-      <TabProcessBar
-        hasProcess={false}
-        busy={status === 'busy'}
-        inheritedBusy={status === 'inherited'}
-        radius={tabGeo.borderRadius}
-        zIndex={2}
-      />
-      <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} zIndex={3} />
-      <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {label ?? tab.name}
-      </span>
-      <TabSessionAvailabilityMarker availability={sessionAvailability} size={10} />
-      {status === 'waiting' && <StatusIcon status="waiting" color={PULSE} />}
-      {trailingActions}
-    </button>
-  );
+  return <TabCard as="button" ref={buttonRef} projectId={tab.projectId} tabId={tab.id}
+    data-run-after-tab-row={tab.id} data-run-after-tab-status={status}
+    selected={selected} active={selected && active} fullWidth
+    geometry={tabGeo} fontSize={fontSize} label={label ?? tab.name} showProjectIcon reserveSignalSpace
+    activityOverride={{ hasProcess: false, busy: status === 'busy', inheritedBusy: status === 'inherited' }}
+    onClick={onClick}
+    title={titleText ?? (status === 'waiting' ? `${tab.name} - waiting for its Run after trigger` : tab.name)}
+    trailingActions={<>{status === 'waiting' && <StatusIcon status="waiting" color={PULSE} />}{trailingActions}</>}
+  />;
 }
 
 function StatusIcon({ status, color }: { status: TabRuntimeStatus; color: string }) {

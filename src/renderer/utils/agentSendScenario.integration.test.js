@@ -161,6 +161,9 @@ async function buildBundle() {
   const built = await esbuild.build({
     stdin: { contents: wrapper, loader: 'ts', resolveDir: repoDir, sourcefile: 'send-scenario-integration.ts' },
     bundle: true, write: false, platform: 'node', format: 'cjs', target: 'node20', logLevel: 'silent', plugins: [plugin],
+    // The real work-context wrapper imports its UI stylesheet. This Node
+    // scenario fixture verifies delivery, not CSS, and has no output file.
+    loader: { '.css': 'empty' },
   });
   const loaded = new Module(path.join(repoDir, 'send-scenario-integration.cjs'), module);
   loaded.filename = path.join(repoDir, 'send-scenario-integration.cjs');

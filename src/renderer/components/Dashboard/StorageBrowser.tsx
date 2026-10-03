@@ -4,6 +4,7 @@ import { Check, ChevronDown, ChevronRight, Database, HardDrive, RefreshCw, Shiel
 import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
 import { useUIStore } from '../../store/useUIStore';
+import { storageCleanupIncident } from '../../utils/storageCleanupIncident.mjs';
 import {
   RETENTION_DAY_OPTIONS,
   STORAGE_GROUPS,
@@ -28,6 +29,7 @@ type StorageSortDirection = 'asc' | 'desc';
 
 interface StorageItem {
   id: string;
+  deletionRevision?: string;
   section: StorageSection;
   group: string;
   provider: 'codex' | 'claude' | null;
@@ -84,6 +86,7 @@ interface DeleteConfirmation {
   items: number;
   bytes: number;
   confirmationToken: string;
+  generation: string;
 }
 
 // Dashboard itself is intentionally allowed to unmount. Keep one bounded
@@ -106,6 +109,7 @@ export default function StorageBrowser() {
   const [section, setSection] = useState<StorageSection>('sessions');
   const [provider, setProvider] = useState<ProviderFilter>('all');
   const [group, setGroup] = useState<string | null>(null);
+  const [deletableOnly, setDeletableOnly] = useState(false);
   const [query, setQuery] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
@@ -174,7 +178,8 @@ export default function StorageBrowser() {
     dateTo,
     sort,
     sortDirection,
-  }), [dateFrom, dateTo, group, inventory?.items, provider, query, section, sort, sortDirection]);
+    deletableOnly,
+  }), [dateFrom, dateTo, deletableOnly, group, inventory?.items, provider, query, section, sort, sortDirection]);
 
   const selectableVisibleIds = useMemo(() => storageSelectableIds(visibleItems), [visibleItems]);
   const allVisibleChecked = selectableVisibleIds.length > 0
@@ -200,7 +205,7 @@ export default function StorageBrowser() {
     setCheckedIds(new Set());
     selectionAnchorRef.current = null;
     setConfirmation(null);
-  }, [dateFrom, dateTo, group, provider, query, section]);
+  }, [dateFrom, dateTo, deletableOnly, group, provider, query, section]);
 
   useEffect(() => {
     if (!inventory) return;
@@ -267,28 +272,40 @@ export default function StorageBrowser() {
 
   const eligibleItems = useMemo(() => (inventory?.items || []).filter((item) => item.eligible), [inventory?.items]);
 
+  const reportStorageFailure = (phase: string, result: any, itemIds: string[] = [], operationId: string | null = null, generation = inventory?.generation) => {
+    const incident = storageCleanupIncident({
+      phase, result, operationId, generation,
+      items: (inventory?.items || []).filter((item) => itemIds.includes(item.id)),
+    });
+    showToast(incident.message, incident.type, 0, true, incident.report);
+  };
+
   const prepareDeleteConfirmation = async (mode: DeleteConfirmation['mode'], itemIds: string[]) => {
     if (!inventory || itemIds.length === 0 || confirmationPreparing) return;
     const preparationSeq = ++confirmationPreparationSeqRef.current;
     setConfirmationPreparing(true);
     setConfirmation(null);
     try {
+      const selectedItems = inventory.items.filter((item) => itemIds.includes(item.id));
       const result = await ipcRenderer.invoke('storage:prepare-delete', {
         itemIds,
         generation: inventory.generation,
+        ...(selectedItems.every((item) => item.deletionRevision)
+          ? { itemRevisions: Object.fromEntries(selectedItems.map((item) => [item.id, item.deletionRevision])) }
+          : {}),
       });
       if (confirmationPreparationSeqRef.current !== preparationSeq) return;
       if (result?.error === 'storage_scan_stale') {
-        showToast('Storage changed while checking the deletion scope. Review the refreshed list.', 'warning', 6000);
+        reportStorageFailure('prepare-delete', result, itemIds);
         await loadInventory(true);
         return;
       }
       if (result?.error === 'storage_production_authority_unavailable') {
-        showToast('Deletion blocked: this development instance cannot verify the production session database.', 'error', 7000, true);
+        reportStorageFailure('prepare-delete', { ...result, detail: 'Deletion blocked: this development instance cannot verify the production session database.' }, itemIds);
         return;
       }
       if (result?.success !== true || !result?.confirmationToken) {
-        showToast(result?.detail || result?.error || 'Could not verify the deletion scope', 'error', 7000, true);
+        reportStorageFailure('prepare-delete', result, itemIds);
         return;
       }
       setConfirmation({
@@ -297,10 +314,11 @@ export default function StorageBrowser() {
         items: Number(result.affectedItems) || itemIds.length,
         bytes: Number(result.affectedBytes) || 0,
         confirmationToken: result.confirmationToken,
+        generation: result.generation || inventory.generation,
       });
     } catch (cause: any) {
       if (confirmationPreparationSeqRef.current === preparationSeq) {
-        showToast(cause?.message || 'Could not verify the deletion scope', 'error', 7000, true);
+        reportStorageFailure('prepare-delete', { error: 'storage_preparation_failed', detail: cause?.message }, itemIds);
       }
     } finally {
       if (confirmationPreparationSeqRef.current === preparationSeq) setConfirmationPreparing(false);
@@ -383,7 +401,7 @@ export default function StorageBrowser() {
   };
 
   const applyDelete = async () => {
-    if (!confirmation || !inventory) return;
+    if (!confirmation || !inventory || activeDeleteOperationRef.current) return;
     const operationId = `storage-delete-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
     activeDeleteOperationRef.current = operationId;
     setDeleteProgress({ completed: 0, total: confirmation.itemIds.length, removed: 0, failed: 0 });
@@ -391,22 +409,24 @@ export default function StorageBrowser() {
     try {
       const result = await ipcRenderer.invoke('storage:delete-items', {
         itemIds: confirmation.itemIds,
-        generation: inventory.generation,
+        generation: confirmation.generation,
         operationId,
         confirmationToken: confirmation.confirmationToken,
       });
       if (result?.error === 'storage_scan_stale') {
-        showToast('Storage changed during confirmation. Review the refreshed list.', 'warning', 5500);
+        reportStorageFailure('delete-items', result, confirmation.itemIds, operationId, confirmation.generation);
       } else if (result?.error === 'storage_production_authority_unavailable') {
-        showToast('Deletion blocked: this development instance cannot verify the production session database.', 'error', 7000, true);
+        reportStorageFailure('delete-items', { ...result, detail: 'Deletion blocked: this development instance cannot verify the production session database.' }, confirmation.itemIds, operationId, confirmation.generation);
       } else if (result?.success !== true && (!result?.removed || result.removed.length === 0)) {
-        showToast(result?.failures?.[0]?.detail || result?.error || 'Storage cleanup failed', 'error', 7000, true);
+        reportStorageFailure('delete-items', result, confirmation.itemIds, operationId, confirmation.generation);
       } else {
         const failed = result?.failures?.length || 0;
         showToast(
           `Deleted ${result?.removed?.length || 0} item${result?.removed?.length === 1 ? '' : 's'} · ${formatStorageBytes(result?.reclaimedBytes || 0)}${failed ? ` · ${failed} failed` : ''}`,
           failed ? 'warning' : 'success',
           failed ? 6500 : 3000,
+          failed > 0,
+          failed ? storageCleanupIncident({ phase: 'delete-items', result, operationId, generation: confirmation.generation, items: inventory.items.filter((item) => confirmation.itemIds.includes(item.id)) }).report : undefined,
         );
       }
       setConfirmation(null);
@@ -414,6 +434,8 @@ export default function StorageBrowser() {
       setCheckedIds(new Set());
       selectionAnchorRef.current = null;
       await loadInventory(true);
+    } catch (cause: any) {
+      reportStorageFailure('delete-items', { error: 'storage_delete_request_failed', detail: cause?.message }, confirmation.itemIds, operationId, confirmation.generation);
     } finally {
       activeDeleteOperationRef.current = null;
       setDeleteProgress(null);
@@ -532,6 +554,19 @@ export default function StorageBrowser() {
                   <option value="date:asc">Oldest first</option>
                   <option value="iterations:desc">Most iterations</option>
                 </select>
+                <label className="flex h-7 items-center gap-1.5 px-1 text-[11px] text-[#aaa]">
+                  <input data-storage-deletable-only type="checkbox" checked={deletableOnly} onChange={(event) => setDeletableOnly(event.target.checked)} className="accent-[#d47b35]" />
+                  Can delete only
+                </label>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-4 border-b border-[#292929] px-2 py-2 text-[11px] text-[#888]">
+                <span>{formatStorageBytes(groupSummaries.reduce((sum: number, entry: any) => sum + entry.bytes, 0))} total in this category</span>
+                <span className="text-[#d19a61]">{formatStorageBytes(groupSummaries.reduce((sum: number, entry: any) => sum + entry.deletableBytes, 0))} can delete</span>
+                <span>{formatStorageBytes(groupSummaries.reduce((sum: number, entry: any) => sum + entry.bytes - entry.deletableBytes, 0))} protected</span>
+                {section === 'sessions' && <span>Open tabs keep their history protected, even when the agent is stopped.</span>}
+                {section === 'builds' && <span>Generated build output. Cleanup is manual; the installed runtime is protected.</span>}
+                {section === 'app' && <span>Application databases, backups and caches. Active data is protected.</span>}
               </div>
 
               {section === 'sessions' && (
@@ -616,7 +651,7 @@ export default function StorageBrowser() {
                     ));
                     return (
                       <div key={summary.group} className={`mb-1 rounded-md border ${group === summary.group ? 'border-[#6b491f] bg-[#261b10]' : 'border-transparent hover:bg-white/[0.025]'}`}>
-                        <ControlHint label={definition.description} modifiedAction={!groupHasDeletable ? 'Never auto-deleted' : `Auto-delete: ${retentionValue == null ? 'Never' : `${retentionValue} day${retentionValue === 1 ? '' : 's'}`}`} side="right">
+                        <ControlHint label={definition.description} modifiedAction={!groupHasDeletable ? 'Never auto-deleted' : section === 'builds' ? 'Manual cleanup only; Ready after controls Clean all ready' : `Auto-delete: ${retentionValue == null ? 'Never' : `${retentionValue} day${retentionValue === 1 ? '' : 's'}`}`} side="right">
                           <button
                             type="button"
                             data-storage-group={summary.group}
@@ -627,12 +662,12 @@ export default function StorageBrowser() {
                               <span className="block truncate font-medium">{definition.label}</span>
                               <span className="mt-0.5 block text-[10px] text-[#666]">{summary.items} · {formatStorageBytes(summary.bytes)}</span>
                             </span>
-                            {summary.eligibleBytes > 0 && <span className="text-[10px] text-[#b66f40]">{formatStorageBytes(summary.eligibleBytes)}</span>}
+                            {summary.deletableBytes > 0 && <span className="shrink-0 text-right text-[10px] text-[#b66f40]">{formatStorageBytes(summary.deletableBytes)}<span className="block text-[9px] text-[#777]">can delete</span></span>}
                           </button>
                         </ControlHint>
                         {groupHasDeletable && (
                           <div className="flex items-center gap-1 border-t border-white/[0.04] px-2 py-1.5">
-                            <span className="text-[9px] uppercase tracking-wide text-[#555]">Delete after</span>
+                            <span className="text-[9px] uppercase tracking-wide text-[#555]">{section === 'builds' ? 'Ready after' : 'Delete after'}</span>
                             <select
                               value={retentionValue == null ? 'never' : String(retentionValue)}
                               onChange={(event) => void updateRetention(summary.group, event.target.value === 'never' ? null : Number(event.target.value))}
@@ -645,6 +680,7 @@ export default function StorageBrowser() {
                             </select>
                           </div>
                         )}
+                        {groupHasDeletable && section === 'builds' && <div className="px-2 pb-1.5 text-[9px] text-[#777]">Manual cleanup · no auto-delete</div>}
                       </div>
                     );
                   })}
@@ -767,13 +803,13 @@ export default function StorageBrowser() {
                         <dt className="text-[#666]">Created by</dt><dd className="text-[#ccc]">{STORAGE_GROUPS[selected.group]?.label || selected.group}</dd>
                         <dt className="text-[#666]">Parent</dt><dd className="break-all font-mono text-[9px] text-[#888]">{selected.parentSessionId || '—'}</dd>
                         <dt className="text-[#666]">Modified</dt><dd className="text-[#ccc]">{formatStorageDate(selected.modifiedAt)}</dd>
-                        <dt className="text-[#666]">Retention</dt><dd className="text-[#ccc]">{selected.protected ? 'Never' : formatDeleteCountdown(selected.deleteAfter)}</dd>
+                        <dt className="text-[#666]">Retention</dt><dd className="text-[#ccc]">{selected.protected ? 'Never' : selected.section === 'builds' ? 'Manual cleanup' : formatDeleteCountdown(selected.deleteAfter)}</dd>
                       </dl>
                       <Tooltip content={selected.path} side="left">
                         <div className="mt-3 max-h-16 overflow-hidden break-all rounded border border-[#292929] bg-[#101010] p-2 font-mono text-[9px] text-[#777]">{selected.path}</div>
                       </Tooltip>
                       <div className={`mt-3 border-l-2 p-2 text-[10px] ${selected.protected ? 'border-[#555] bg-[#111] text-[#888]' : 'border-[#794325] bg-[#1c130e] text-[#b98260]'}`}>
-                        {selected.protectedReason || `Deletable · ${formatDeleteCountdown(selected.deleteAfter)}`}
+                        {selected.protectedReason || (selected.section === 'builds' ? 'Can delete manually · no auto-delete' : `Deletable · ${formatDeleteCountdown(selected.deleteAfter)}`)}
                         {(selected.affectedItems || 1) > 1 && <div className="mt-1">Deleting this Codex thread also affects {selected.affectedItems} files · {formatStorageBytes(selected.affectedBytes || 0)}.</div>}
                       </div>
                       <div className="mt-4 flex gap-2">
@@ -796,12 +832,15 @@ export default function StorageBrowser() {
               </div>
 
               <div className="flex min-h-10 items-center gap-3 border-t border-[#292929] bg-white/[0.008] px-1 text-[10px] text-[#666]">
-                <span>{inventory.summary.totalItems} items · {formatStorageBytes(inventory.summary.totalBytes)}</span>
+                <span>All categories: {inventory.summary.totalItems} items · {formatStorageBytes(inventory.summary.totalBytes)}</span>
                 <span>{visibleItems.length} filtered</span>
                 {checkedItems.length > 0 && <span className="text-[#c98758]">{checkedItems.length} selected · {formatStorageBytes(checkedBytes)}</span>}
+                {checkedItems.length > 0 && section !== 'sessions' && (
+                  <button type="button" data-storage-delete-checked disabled={confirmationPreparing || deleting} onClick={confirmCheckedDelete} className="flex h-7 items-center gap-1 rounded border border-red-500/25 px-2 text-red-300 disabled:opacity-40"><Trash2 size={11} /> Delete selected</button>
+                )}
                 {confirmationPreparing && <span className="flex items-center gap-1 text-[#c98758]"><RefreshCw size={10} className="animate-spin" /> Checking exact deletion scope…</span>}
                 <span>{formatStorageBytes(inventory.summary.protectedBytes)} protected</span>
-                <span>{formatStorageBytes(inventory.summary.reclaimableBytes)} reclaimable</span>
+                <span>{formatStorageBytes(inventory.summary.reclaimableBytes)} can delete</span>
                 {inventory.summary.eligibleBytes > 0 && (
                   <button
                     type="button"
@@ -810,7 +849,7 @@ export default function StorageBrowser() {
                     className="ml-auto flex h-7 items-center gap-1 rounded border border-[#74452c] bg-[#21150f] px-2.5 text-[#d18b5f] disabled:cursor-wait disabled:opacity-50"
                     onClick={confirmEligibleDelete}
                   >
-                    {confirmationPreparing ? <RefreshCw size={11} className="animate-spin" /> : <Trash2 size={11} />} Clean ready · {formatStorageBytes(inventory.summary.eligibleBytes)}
+                    {confirmationPreparing ? <RefreshCw size={11} className="animate-spin" /> : <Trash2 size={11} />} Clean all ready · {formatStorageBytes(inventory.summary.eligibleBytes)}
                   </button>
                 )}
               </div>

@@ -26,6 +26,11 @@ const {
 } = require('./history-response-timings');
 const {
   dehydrateHistoryEntries,
+  HISTORY_PAYLOAD_ON_DEMAND,
+  HISTORY_PAYLOAD_HEADER_VERSION,
+  projectHistoryOnDemand,
+  historyPayloadHash,
+  sliceHistoryPayload,
   historyPayloadStash,
   capPayloadForRender,
 } = require('./history-payload-dehydrate');
@@ -62,6 +67,7 @@ const {
   readLatestCodexContextObservation,
 } = require('./codex-context-usage');
 const { claudeSettingsServiceDisplayFromRecord } = require('../shared/claude-slash-display.cjs');
+const { codexSettingsWindowBaseline } = require('./codex-settings-history');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -301,6 +307,7 @@ class SessionTranscriptService {
   async getToolPayload(payload = {}) {
     const toolType = normalizeToolType(payload.toolType);
     if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getToolPayload', payload);
+    if (payload.payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND) return this._getOnDemandToolPayload(payload);
     const sessionId = payload.sessionId;
     const cwd = payload.cwd;
     const payloadId = typeof payload.payloadId === 'string' ? payload.payloadId : '';
@@ -308,6 +315,12 @@ class SessionTranscriptService {
       return { success: false, error: 'sessionId and payloadId required' };
     }
     const payloadGeneration = String(payload.payloadGeneration || '');
+    const presentPayload = text => {
+      if (payload.expectedContentHash && historyPayloadHash(text) !== payload.expectedContentHash) {
+        return { success: false, error: 'history_payload_changed', payloadId };
+      }
+      return payload.expectedContentHash ? sliceHistoryPayload(text, payload) : capPayloadForRender(text);
+    };
     // A payload in a fork can originate in a frozen ancestor. Checking only
     // the child's physical file would let a RAM-stash hit bypass lineage.
     const payloadLineage = toolType === 'codex' ? this._resolveCodexLineage(sessionId, 'full') : null;
@@ -336,10 +349,11 @@ class SessionTranscriptService {
       entries: virtualPayload.historyEntries || [], stash: historyPayloadStash });
     const stashed = historyPayloadStash.get(toolType, sessionId, payloadId);
     if (typeof stashed === 'string') {
-      const capped = capPayloadForRender(stashed);
+      const capped = presentPayload(stashed);
       console.log(`[FullHistory:Rehydrate] session=${String(sessionId).slice(0, 8)} payload=${payloadId.slice(0, 24)} source=stash bytes=${stashed.length}`);
       return { success: true, source: 'stash', payloadId, ...capped };
     }
+    let capturedPayload = null;
     try {
       if (toolType === 'codex') {
         const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
@@ -358,6 +372,7 @@ class SessionTranscriptService {
           sessionId,
           entries,
           stash: historyPayloadStash,
+          onPayload: (id, text) => { if (id === payloadId) capturedPayload = text; },
         });
       } else if (toolType === 'claude') {
         const rebuild = this.claudeData?._api?.rebuildHistoryPayloadStash;
@@ -372,14 +387,59 @@ class SessionTranscriptService {
       return { success: false, error: String(error?.message || error) };
     }
     if (!await generationMatches()) return { success: false, error: 'history_payload_generation_changed', payloadId };
-    const rebuilt = historyPayloadStash.get(toolType, sessionId, payloadId);
+    const rebuilt = capturedPayload ?? historyPayloadStash.get(toolType, sessionId, payloadId);
     if (typeof rebuilt !== 'string') {
       console.log(`[FullHistory:Rehydrate] session=${String(sessionId).slice(0, 8)} payload=${payloadId.slice(0, 24)} source=miss`);
       return { success: false, error: 'payload not found', payloadId };
     }
-    const capped = capPayloadForRender(rebuilt);
+    const capped = presentPayload(rebuilt);
     console.log(`[FullHistory:Rehydrate] session=${String(sessionId).slice(0, 8)} payload=${payloadId.slice(0, 24)} source=rebuild bytes=${rebuilt.length}`);
     return { success: true, source: 'rebuild', payloadId, ...capped };
+  }
+
+  async _getOnDemandToolPayload(payload) {
+    const { toolType, sessionId, cwd, tabId, entryUuid, payloadId, payloadGeneration, contentHash } = payload;
+    if (!['codex', 'claude'].includes(toolType) || !sessionId || !entryUuid || !payloadId
+      || !payloadGeneration || !/^[a-f0-9]{64}$/.test(contentHash || '')) {
+      return { success: false, error: 'history_payload_reference_required' };
+    }
+    // Reuse the canonical bounded read (including worker/SSD/lineage). Besides
+    // surviving stash eviction/restart this proves row membership, not merely
+    // an arbitrary payload ID supplied by a client. No fallback to another SID.
+    let captured = null;
+    const current = await this.getHistory({ toolType, sessionId, cwd, tabId,
+      dehydrate: true, payloadPolicy: HISTORY_PAYLOAD_ON_DEMAND,
+      bounds: { aroundUuid: entryUuid, radius: 1 },
+    }, 0, (id, text) => { if (id === payloadId) captured = text; });
+    if (!current?.success) return current;
+    if (current.payloadGeneration !== payloadGeneration) return { success: false, error: 'history_payload_generation_changed', reason: 'projection-generation' };
+    const row = current.entries?.find(entry => entry.uuid === entryUuid);
+    const refs = row ? [row.thinkingRef, row.compactSummaryRef,
+      ...(row.actions || []).flatMap(action => [action?.actionRef, action?.rawTool?.resultRef])] : [];
+    const ref = refs.find(value => value?.payloadId === payloadId);
+    if (!ref) return { success: false, error: 'history_payload_not_found' };
+    if (ref.contentHash !== contentHash) return { success: false, error: 'history_payload_changed' };
+    let result;
+    if (captured !== null) result = { success: true, source: 'projection', ...sliceHistoryPayload(captured, payload) };
+    else result = await this.getToolPayload({ toolType, sessionId, cwd, tabId, payloadId, payloadGeneration,
+      expectedContentHash: contentHash, offset: payload.offset, limit: payload.limit });
+    if (!result?.success) return result;
+    // A frozen prefix revision deliberately has mtime=0: its proof is the
+    // lineage digest, not whole-file stat equality (the ancestor may append).
+    // Reuse the canonical virtual verifier and its physical read tickets.
+    let validation;
+    if (toolType === 'codex' && current.composite) {
+      const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
+      if (lineage.kind !== 'virtual') return { success: false, error: 'history_payload_generation_changed' };
+      const saved = await this._readVirtualProjection(lineage, cwd);
+      const projected = saved?.projection || await this._projectCodexVirtual(lineage, cwd);
+      if (!projected?.success) return projected;
+      validation = { unchanged: this._buildCodexContentRevision(sessionId, cwd, projected)?.token === current.contentRevision,
+        reason: 'lineage-changed' };
+    } else validation = await validateHistoryRevision(current.revision, { toolType, sessionId, cwd });
+    if (!validation.unchanged) return { success: false, error: 'history_payload_generation_changed', reason: validation.reason };
+    return { ...result, payloadId, contentHash, encoding: ref.encoding, entryUuid,
+      toolType, sessionId, payloadGeneration };
   }
 
   _getCodexVirtualTranscriptStore() {
@@ -2076,7 +2136,7 @@ class SessionTranscriptService {
     };
   }
 
-  async getHistory(payload = {}, sourceAttempt = 0) {
+  async getHistory(payload = {}, sourceAttempt = 0, onPayload = null) {
     const toolType = normalizeToolType(payload.toolType);
     if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getHistory', payload);
     const sessionId = payload.sessionId;
@@ -2145,7 +2205,8 @@ class SessionTranscriptService {
       // SAME hydration request.
       const rowWindowRequest = normalizeHistoryRowWindowRequest(payload.hydrate);
       const entryWindowRequest = normalizeHistoryEntryWindowRequest(payload.bounds);
-      const payloadPolicy = payload.dehydrate === true ? 'dehydrated' : 'full';
+      const payloadPolicy = payload.payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND
+        ? HISTORY_PAYLOAD_ON_DEMAND : payload.dehydrate === true ? 'dehydrated' : 'full';
       const ownershipRevision = getCodexProcessActionOwnershipRevision([sessionId,
         ...(virtualProjected?.frozenSnapshots || []).map(source => source.sessionId)]);
       const presentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
@@ -2160,6 +2221,7 @@ class SessionTranscriptService {
         rowWindowRequest,
         entryWindowRequest,
         payloadPolicy,
+        ...(payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND ? { payloadHeaderVersion: HISTORY_PAYLOAD_HEADER_VERSION } : {}),
         ownershipRevision,
         ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
       });
@@ -2205,10 +2267,10 @@ class SessionTranscriptService {
       // appended since the cached projector's file cursor instead of
       // re-loading and replaying all 74K records of a giant rollout
       // (~3.5s → ~ms), and does not require the parsed records array to stay
-      // cached at all. Restricted to dehydrate consumers (the desktop
-      // panel): dehydration mutates the cached projector's shared action
+      // cached at all. Restricted to dehydrate consumers (desktop and
+      // opt-in HTTP): dehydration mutates the cached projector's shared action
       // objects into previews+refs, which is stable across dehydrating calls
-      // but would poison a full-payload consumer (web/iOS) — those keep the
+      // but would poison an ordinary full-payload consumer — those keep the
       // fresh one-shot build, as does getToolPayload's stash rebuild below
       // for the same reason. Falls back to load+one-shot when the
       // incremental API is absent (minimal test stubs).
@@ -2220,7 +2282,7 @@ class SessionTranscriptService {
       const preparedContext = JSON.stringify({ presentationRevision, responseTimingRevision,
         ...(virtualProjected ? { contentRevision: contentRevision?.token || null } : {}) });
       if (virtualPage?.page && virtualPage.page.context !== preparedContext) {
-        return sourceAttempt < 2 ? this.getHistory(payload, sourceAttempt + 1)
+        return sourceAttempt < 2 ? this.getHistory(payload, sourceAttempt + 1, onPayload)
           : { success: false, error: 'history_source_changed_during_preparation', entries: [] };
       }
       let prepared = virtualPage?.page || null;
@@ -2298,12 +2360,12 @@ class SessionTranscriptService {
       }
       // Heavy payloads (tool outputs, thinking, compact snapshots) leave main
       // as previews + refs; the renderer pulls full text on expand through
-      // history:get-tool-payload. OPT-IN per call: web/iOS consumers of this
-      // service have no rehydration path yet and keep full payloads.
+      // history:get-tool-payload. OPT-IN per call: ordinary HTTP clients keep
+      // full payloads; on-demand-v1 adds its detached bounded projection below.
       const sourceIsCurrent = () => (virtualProjected?.physicalSources || projectedSnapshots || [projectedSnapshot])
         .every(source => this.codexData?._api?.isCodexSourceSnapshotCurrent?.(source) !== false);
       const refreshChangedSource = () => sourceAttempt < 2
-        ? this.getHistory(payload, sourceAttempt + 1)
+        ? this.getHistory(payload, sourceAttempt + 1, onPayload)
         : { success: false, error: 'history_source_changed_during_preparation', entries: [] };
       if (!sourceIsCurrent()) return refreshChangedSource();
       const payloadGeneration = projectedSnapshot?.sourceGeneration || projectedSnapshot?.fileIdentity || '';
@@ -2400,6 +2462,7 @@ class SessionTranscriptService {
             rowWindowRequest,
             entryWindowRequest,
             payloadPolicy,
+            ...(payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND ? { payloadHeaderVersion: HISTORY_PAYLOAD_HEADER_VERSION } : {}),
             ownershipRevision,
             ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
           }),
@@ -2423,6 +2486,12 @@ class SessionTranscriptService {
           + (rowWindow.centerMissing ? ' centerMissing=1' : ''));
       }
       const historyWindow = applyHistoryEntryWindow(rowWindow.entries, entryWindowRequest);
+      const settingsBaseline = codexSettingsWindowBaseline(rowWindow.entries, historyWindow, {
+        sessionId, revision, payloadGeneration, contentRevision: contentRevision?.token || null,
+      });
+      if (payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND) historyWindow.entries = projectHistoryOnDemand({
+        toolType, sessionId, entries: historyWindow.entries, onPayload,
+      });
       finishPreparePhase('entryWindow');
       // Recheck against the actual projection cursor, not the pre-await stat.
       if (rewriteReceipt && (!projectedSnapshot
@@ -2513,6 +2582,7 @@ class SessionTranscriptService {
             filePath: loadedFilePath,
             revision,
             payloadGeneration,
+            settingsBaseline,
             ...(virtualProjected ? {
               contentRevision: contentRevision?.token || null,
               viewOwnerSessionId: sessionId,
@@ -2572,6 +2642,7 @@ class SessionTranscriptService {
             success: true, rewriteDelta: true, rewriteReceipt, carriedEntries, changedEntries,
             order: historyWindow.entries.map((row) => row.uuid), revision,
             payloadGeneration,
+            settingsBaseline,
             hydrationRequest: rowWindowRequest,
           };
         }
@@ -2601,6 +2672,7 @@ class SessionTranscriptService {
         filePath: loadedFilePath,
         revision,
         payloadGeneration,
+        settingsBaseline,
         ...(virtualProjected ? {
           contentRevision: contentRevision?.token || null,
           viewOwnerSessionId: sessionId,
@@ -2614,13 +2686,38 @@ class SessionTranscriptService {
     }
     const mainWindow = this.getMainWindow?.();
     const sender = mainWindow && !mainWindow.isDestroyed?.() ? mainWindow.webContents : null;
-    return getFullHistory({
+    const onDemand = payload.payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND;
+    let baseRevision = payload.ifRevision;
+    if (onDemand && baseRevision) {
+      let context;
+      try { context = JSON.parse(baseRevision.context); } catch {}
+      baseRevision = context?.payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND
+        && context.payloadHeaderVersion === HISTORY_PAYLOAD_HEADER_VERSION
+        && JSON.stringify(context.bounds) === JSON.stringify(normalizeHistoryEntryWindowRequest(payload.bounds))
+        ? buildHistoryRevision({ toolType, sessionId, cwd }, baseRevision.sources, { context: context.base }) : null;
+    }
+    const result = await getFullHistory({
       ...payload,
+      ...(onDemand ? { dehydrate: false, ifRevision: baseRevision } : {}),
       toolType: 'claude',
       sessionId,
       cwd,
       bounds: payload.bounds || null,
     }, { sender });
+    if (!onDemand || !result?.success) return result;
+    if (!(await validateHistoryRevision(result.revision, { toolType, sessionId, cwd })).unchanged) {
+      return sourceAttempt < 2 ? this.getHistory(payload, sourceAttempt + 1, onPayload)
+        : { success: false, error: 'history_source_changed_during_preparation', entries: [] };
+    }
+    const revision = result.unchanged ? payload.ifRevision : buildHistoryRevision({ toolType, sessionId, cwd }, result.revision?.sources, {
+      context: JSON.stringify({ payloadPolicy: HISTORY_PAYLOAD_ON_DEMAND, base: result.revision?.context,
+        payloadHeaderVersion: HISTORY_PAYLOAD_HEADER_VERSION,
+        bounds: normalizeHistoryEntryWindowRequest(payload.bounds) }),
+    });
+    return { ...result, revision,
+      payloadGeneration: buildHistoryRevision({ toolType, sessionId, cwd }, revision?.sources)?.token || '',
+      ...(result.entries ? { entries: projectHistoryOnDemand({ toolType, sessionId, entries: result.entries, onPayload }) } : {}),
+    };
   }
 
   async getMessages(payload = {}) {
@@ -3266,6 +3363,7 @@ class SessionTranscriptService {
       mtimeMs: state.mtimeMs,
       filePath: state.filePath,
       ...(state.fileIdentity ? { fileIdentity: state.fileIdentity } : {}),
+      sourceRewriteVersion: state.sourceRewriteVersion || 0,
       reason,
     };
     const mainWindow = this.getMainWindow?.();

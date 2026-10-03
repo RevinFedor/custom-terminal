@@ -14,6 +14,7 @@ import { homedir } from 'os';
 import { createInterface } from 'readline';
 import { execFile } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { buildStartAiRequest } from './terminal-start-ai-request.mjs';
 import { buildPromptCatalog, buildPromptResult, selectPrompt } from './terminal-prompt-catalog.mjs';
@@ -439,7 +440,13 @@ async function httpApiPost(target, endpoint, body) {
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (json.error || text));
+  if (!res.ok) {
+    const error = new Error('HTTP ' + res.status + ': ' + (json.error || text));
+    error.code = json.code;
+    error.messageId = json.messageId;
+    error.deliveryState = json.deliveryState;
+    throw error;
+  }
   return json;
 }
 
@@ -734,6 +741,23 @@ async function ensureExternalResearchOrchestrationSupport(target) {
   }
 }
 
+async function ensureTabMessagesSupport(target) {
+  const response = await httpApiGet(target, '/api/me');
+  const capability = response?.capabilities?.tabMessages;
+  if (Number(capability?.version) !== 1 || capability?.replyTo !== true || capability?.durable !== true) {
+    const error = new Error('This Noted Terminal app requires an update for durable tab messages (tabMessages version 1, replyTo and durable). No message POST or send_prompt fallback was attempted.');
+    error.code = 'app_update_required';
+    throw error;
+  }
+}
+
+function requireNonemptyString(value, field) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(field + ' must be a non-empty string');
+  return value;
+}
+
+const ORCHESTRATION_COMPLETION_GUIDANCE = ' On apps advertising orchestrationInlineResults:{version:1}, the later completion notification normally carries the full answer. Check the actual notification: use an inline full answer directly; call get_delegation_result only if it says the result is omitted/oversize, does not include the full answer (including older apps), or for explicit recovery. Do not poll or wait inside the initiating turn.';
+
 const STRUCTURED_JSON_TOOLS = new Set([
   'get_tab_context', 'list_tab_contexts', 'set_tab_responsibility', 'publish_context_update',
   'current_context',
@@ -748,6 +772,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'start_external_research',
   'import_external_conversation',
   'continue_external_research',
+  'send_message', 'reply_to_message', 'get_message', 'get_send_receipt',
 ]);
 
 const TOOLS = [
@@ -929,10 +954,13 @@ const TOOLS = [
   },
   {
     name: 'complete_task',
-    description: 'Loop-only completion acknowledgement. Call exactly once near the end only when THIS current user turn contains the app-injected terminal_task_completion_protocol and the repeated task is genuinely complete. Never call it for an ordinary/manual request, a normal delegation result, or merely because the tool/global instructions mention task completion. The backend rejects turns not proven to originate from Prompt Queue Loop. Active child Terminal MCP delegations, partial work, waiting, and errors also block completion.',
+    description: 'Stop this exact Prompt Queue Loop turn. Call once near the end only when THIS current user turn has the app-injected terminal_task_completion_protocol. Use status completed (default) only for finished work; use status blocked with a concrete reason and required external action when the task cannot continue without user intervention, access, unlock or service recovery. Explain unfinished work and the blocker in the final answer. Do not signal blocked merely because no files were edited, for recoverable work, or while an in-flight operation/child delegation can still finish. Never call for ordinary/manual turns or because old/global instructions mention completion. Backend validates exact Loop origin and refuses active child delegations.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        status: { type: 'string', enum: ['completed', 'blocked'], description: 'completed by default; blocked stops repetition without claiming task success.' },
+        reason: { type: 'string', description: 'Required for blocked: concrete blocker and external action needed to continue.' },
+      },
     },
   },
   {
@@ -950,7 +978,7 @@ const TOOLS = [
   },
   {
     name: 'close_tab',
-    description: 'Close an open Noted Terminal tab through the Project API. Use this after get_delegation_result for a one-off full-session test that will not be reused. Idle tabs close normally; force=true is only for an explicitly approved close while the agent is still busy.',
+    description: 'Close an open Noted Terminal tab through the Project API. Use this after handling the completed answer (inline notification or result recovery) for a one-off full-session test that will not be reused. Idle tabs close normally; force=true is only for an explicitly approved close while the agent is still busy.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -976,7 +1004,7 @@ const TOOLS = [
   },
   {
     name: 'delegate_to_session',
-    description: 'Start a persistent cross-tab delegation through the Project API. `files` sends local UTF-8 text as server-resolved context snapshots; pass paths and roles only, never read large bodies into this caller context. This is for a separate visible Claude/Codex session, not for a temporary internal subagent. It returns immediately with a durable runId; only a non-empty runId proves success, while an error, null, or missing runId means nothing was sent and must be reported as failure. The source tab receives one completion notification, and get_delegation_result reads the final outcome in one request. A delegation created by an executor is linked to that executor run automatically and waits for nested Terminal MCP delegations by default.',
+    description: 'Start a persistent cross-tab delegation through the Project API. `files` sends local UTF-8 text as server-resolved context snapshots; pass paths and roles only, never read large bodies into this caller context. This is for a separate visible Claude/Codex session, not for a temporary internal subagent or a short question to a busy owner (use send_message). It returns immediately with a durable runId; only a non-empty runId proves acceptance, not completion. An error, null, or missing runId is not confirmed acceptance. Finish the current turn after acceptance; the source receives one later completion notification. A delegation created by an executor is linked to that executor run automatically and waits for nested Terminal MCP delegations by default.' + ORCHESTRATION_COMPLETION_GUIDANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1015,7 +1043,7 @@ const TOOLS = [
   },
   {
     name: 'start_external_research',
-    description: 'Start a tracked browser consultation through SC Desktop without creating a Claude/Codex tab. Returns quickly with a durable runId; finish the current turn after acceptance. Noted Terminal waits in the background, shows the run in the existing orchestration UI, and sends one short completion notification to this source session. Read the full answer exactly once with get_delegation_result after that notification. An existing untracked ChatGPT link may be passed as conversationUrl to send a new question there. For a persistent ChatGPT review conversation pass options:{mode:"chat",temporaryChat:false,autoClose:true}; model and effort remain explicit caller choices.',
+    description: 'Start a tracked browser consultation through SC Desktop without creating a Claude/Codex tab. Returns quickly with a durable runId; finish the current turn after acceptance. Noted Terminal waits in the background, shows the run in the existing orchestration UI, and sends one later completion notification to this source session. An existing untracked ChatGPT link may be passed as conversationUrl to send a new question there. For a persistent ChatGPT review conversation pass options:{mode:"chat",temporaryChat:false,autoClose:true}; model and effort remain explicit caller choices.' + ORCHESTRATION_COMPLETION_GUIDANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1038,7 +1066,7 @@ const TOOLS = [
   },
   {
     name: 'continue_external_research',
-    description: 'Send a new question and current file versions to the same ChatGPT conversation as one completed external-research run. This always creates a new runId and SC jobId; previousRunId supplies only the durable conversation identity and default provider/options, so the old answer can never be returned as the new review. After acceptance finish the current turn, then read the result once through get_delegation_result when notified.',
+    description: 'Send a new question and current file versions to the same ChatGPT conversation as one completed external-research run. This always creates a new runId and SC jobId; previousRunId supplies only the durable conversation identity and default provider/options, so the old answer can never be returned as the new review. After acceptance finish the current turn and handle the later completion notification.' + ORCHESTRATION_COMPLETION_GUIDANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1060,7 +1088,7 @@ const TOOLS = [
   },
   {
     name: 'import_external_conversation',
-    description: 'Import the current final answer from an existing ChatGPT conversation URL as a tracked read-only run. Nothing is pasted or sent to ChatGPT. The tool returns a durable runId/jobId, then the normal completion notification and one get_delegation_result deliver the result. Repeat the same runId only to recover the same import; use a new runId after the conversation receives a newer answer.',
+    description: 'Import the current final answer from an existing ChatGPT conversation URL as a tracked read-only run. Nothing is pasted or sent to ChatGPT. The tool returns a durable runId/jobId; finish the current turn after acceptance and handle the later completion notification. Repeat the same runId only to recover the same import; use a new runId after the conversation receives a newer answer.' + ORCHESTRATION_COMPLETION_GUIDANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1096,7 +1124,7 @@ const TOOLS = [
   },
   {
     name: 'get_delegation_result',
-    description: 'Read the final answer or terminal failure for a full-session delegation or tracked external research run in one request. External research also returns jobId, conversationUrl and its structured SC result. A 202 response means the result is not ready; wait for the source completion notification instead of polling in a loop.',
+    description: 'Recover the final answer or terminal failure for a full-session delegation or tracked external research run in one request. External research also returns jobId, conversationUrl and its structured SC result. A 202 response means the result is not ready; wait for the source completion notification instead of polling in a loop.' + ORCHESTRATION_COMPLETION_GUIDANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1413,8 +1441,59 @@ const TOOLS = [
     },
   },
   {
+    name: 'send_message',
+    description: 'Ask a short question of a busy owner, with a durable messageId and server-owned return address. Both sessions may continue their current work; this creates no delegation/run dependency. The recipient should reply_to_message by messageId when the facts are ready, before its final answer. Accepted/queued means persistence or transport acceptance, not that the model has read or answered it. Do not poll; get_message is for explicit diagnosis/recovery. Source identity always comes from this full session. An omitted requestId is generated before network access and returned even on transport failure; retry only the identical text/target with that exact requestId, never a blind new ID. Requires the updated tabMessages API; no send_prompt fallback.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', minLength: 1, description: 'Recipient owner tab ID.' },
+        text: { type: 'string', minLength: 1, description: 'Short question; the recipient can answer while continuing its current work.' },
+        requestId: { type: 'string', minLength: 1, description: 'Exact retry key for unchanged text and recipient. Generated before network access when omitted.' },
+      },
+      required: ['tabId', 'text'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'reply_to_message',
+    description: 'Reply to one exact incoming messageId when the facts are ready, before your final answer, then continue your current work. The server derives the recipient from the original message; never copy or override a return tab ID. A reply is durable before delivery; acceptance is not proof the requesting model has read it. No polling or automatic reply-to-reply acknowledgement. On transport failure retry only identical text/messageId with the returned exact requestId, never a new ID. Source identity comes only from this full session; requires the updated tabMessages API, with no send_prompt fallback.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', minLength: 1, description: 'Original incoming question ID; recipient resolution is server-side.' },
+        text: { type: 'string', minLength: 1, description: 'Answer to this question, including the limits of verification.' },
+        requestId: { type: 'string', minLength: 1, description: 'Exact retry key for unchanged text/messageId. Generated before network access when omitted.' },
+      },
+      required: ['messageId', 'text'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_message',
+    description: 'Read one durable message and its bounded reply data for an explicit status check or recovery. This read never sends or retries delivery. Acceptance/delivery and the presence of an answer are separate; never poll this tool while waiting for a reply.',
+    inputSchema: {
+      type: 'object',
+      properties: { messageId: { type: 'string', minLength: 1 } },
+      required: ['messageId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_send_receipt',
+    description: 'Read the existing delivery receipt for the exact tabId/handoffId returned by send_prompt. Read-only: no paste, Enter, retry or new message. Use for pending/unknown delivery instead of sending changed or empty text with an old handoffId. Delivery status is not an agent answer; do not poll.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', minLength: 1 },
+        handoffId: { type: 'string', minLength: 1, description: 'Exact send operation ID from the original response.' },
+      },
+      required: ['tabId', 'handoffId'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'send_prompt',
-    description: 'Send text to a Claude/Codex tab through the Project API scenario layer. `files` attaches local UTF-8 text by path: Noted Terminal reads and snapshots it server-side, so this caller must not call read_file or paste the body itself. Files require submit=true. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns only after delivery is accepted. If a previous response was pending/unknown, pass its exact handoffId to read the same operation safely; never invent a new retry for that prompt. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use run_command for generic shells.',
+    description: 'Send text to a Claude/Codex tab through the Project API scenario layer. `files` attaches local UTF-8 text by path: Noted Terminal reads and snapshots it server-side, so this caller must not call read_file or paste the body itself. Files require submit=true. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns a delivery status, not an answer. For pending/unknown delivery use get_send_receipt({tabId,handoffId}); never retry changed or empty text to check status, and never invent a new operation ID for an unresolved send. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use send_message for short questions with an addressed reply, and run_command for generic shells.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1432,7 +1511,7 @@ const TOOLS = [
         effort: { type: 'string', description: 'Optional effort override for scenario send.' },
         thinking: { type: 'string', description: 'Optional thinking mode override for scenario send.' },
         queue: { type: 'boolean', description: 'When true, queue the prompt if the agent is busy instead of failing.' },
-        handoffId: { type: 'string', description: 'Optional exact operation id from a previous pending/unknown response. Reusing it must query the same send without a second paste/Enter.' },
+        handoffId: { type: 'string', description: 'Optional exact operation id for an identical retry, never changed text. For a pending/unknown status check use get_send_receipt({tabId,handoffId}), not send_prompt.' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
       },
       required: ['tabId', 'prompt'],
@@ -1816,7 +1895,7 @@ async function handleRequest(msg) {
         isError: true,
       };
       if (STRUCTURED_JSON_TOOLS.has(name)) {
-        toolResult.structuredContent = { ok: false, error: err.message };
+        toolResult.structuredContent = { ...err.toolDetails, ok: false, error: err.message };
       }
       return jsonRpcResponse(id, toolResult);
     }
@@ -2096,14 +2175,23 @@ async function callTool(name, args) {
         throw new Error('complete_task is available only inside the full Noted Terminal session that owns this MCP process');
       }
       const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, PARENT_TAB_ID());
+      if (args.status === 'blocked') {
+        const capabilities = await httpApiGet(target, '/api/me');
+        if (!(Number(capabilities?.capabilities?.loopTaskCompletion?.version) >= 2)
+          || !capabilities?.capabilities?.loopTaskCompletion?.statuses?.includes('blocked')) {
+          throw new Error('This Noted Terminal backend cannot stop Loop as blocked. Nothing was marked complete. Update the app before retrying.');
+        }
+      }
       const result = await httpApiPost(
         target,
         '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID()) + '/complete-task',
-        { sourceMeta: buildSourceMeta() },
+        { sourceMeta: buildSourceMeta(), status: args.status, reason: args.reason },
       );
       return JSON.stringify({
         ok: true,
-        message: 'Current turn marked complete. Finish the final response now; do not start more work in this turn.',
+        message: args.status === 'blocked'
+          ? 'Loop marked blocked, not completed. Explain the blocker and required action in the final response; do not start more work in this turn.'
+          : 'Current turn marked complete. Finish the final response now; do not start more work in this turn.',
         ...result,
       }, null, 2);
     }
@@ -2512,6 +2600,76 @@ async function callTool(name, args) {
       return 'Command sent to tab ' + args.tabId + ': ' + args.command;
     }
 
+    case 'send_message':
+    case 'reply_to_message': {
+      const sourceTabId = PARENT_TAB_ID();
+      if (!sourceTabId) throw new Error(name + ' requires a full Noted Terminal session; source identity cannot be supplied by the caller');
+      const isReply = name === 'reply_to_message';
+      const address = requireNonemptyString(isReply ? args.messageId : args.tabId, isReply ? 'messageId' : 'tabId');
+      const text = requireNonemptyString(args.text, 'text');
+      const requestId = args.requestId === undefined ? randomUUID() : requireNonemptyString(args.requestId, 'requestId');
+      let postAttempted = false;
+      try {
+        // Route by the trusted source, never by a caller-supplied destination/project.
+        const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, sourceTabId);
+        await ensureTabMessagesSupport(target);
+        postAttempted = true;
+        const result = await httpApiPost(
+          target,
+          isReply ? '/api/tab-messages/' + encodeURIComponent(address) + '/replies' : '/api/tab-messages',
+          {
+            sourceTabId,
+            ...(!isReply ? { targetTabId: address } : {}),
+            text,
+            requestId,
+            sourceMeta: buildSourceMeta(),
+          },
+        );
+        const messageId = result?.messageId || result?.message?.messageId;
+        if (result?.ok === false || typeof messageId !== 'string' || !messageId.trim()) {
+          const error = new Error(result?.error || 'Project API returned no durable messageId; acceptance is unconfirmed');
+          error.code = result?.code || 'invalid_message_response';
+          error.messageId = messageId;
+          error.deliveryState = result?.deliveryState;
+          throw error;
+        }
+        return JSON.stringify({
+          ...result,
+          messageId,
+          requestId,
+          deliveryState: result.deliveryState || result.message?.deliveryState || 'unknown',
+          guidance: 'Acceptance/delivery is not proof the model has read or answered this message. Continue independent work; do not poll. Use get_message only for explicit diagnosis/recovery.',
+        }, null, 2);
+      } catch (cause) {
+        const recovery = 'Retry only the identical ' + name + ' call with requestId=' + JSON.stringify(requestId) + '; never use a new ID or changed text to check status.';
+        const error = new Error(String(cause?.message || cause) + ' ' + recovery);
+        error.toolDetails = {
+          code: cause?.code || (postAttempted ? 'message_delivery_unknown' : 'message_preflight_failed'),
+          messageId: cause?.messageId || null,
+          requestId,
+          deliveryState: cause?.deliveryState || (postAttempted ? 'unknown' : 'not-submitted'),
+          recovery,
+        };
+        throw error;
+      }
+    }
+
+    case 'get_message': {
+      const messageId = requireNonemptyString(args.messageId, 'messageId');
+      const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, PARENT_TAB_ID());
+      return JSON.stringify(await httpApiGet(target, '/api/tab-messages/' + encodeURIComponent(messageId)), null, 2);
+    }
+
+    case 'get_send_receipt': {
+      const tabId = requireNonemptyString(args.tabId, 'tabId');
+      const handoffId = requireNonemptyString(args.handoffId, 'handoffId');
+      const target = projectHint({}, tabId);
+      return JSON.stringify(await httpApiGet(
+        target,
+        '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/send-receipts?handoffId=' + encodeURIComponent(handoffId),
+      ), null, 2);
+    }
+
     case 'send_prompt': {
       const target = projectHint(args, args.tabId);
       if (args.submit !== false) {
@@ -2534,13 +2692,13 @@ async function callTool(name, args) {
         );
         if (result.status === 'delivery-unknown' || result.deliveryUnknown === true) {
           return 'Prompt delivery state is unknown for tab ' + args.tabId
-            + '; do not retry with a new operation.'
-            + (result.handoffId ? ' Recheck only this handoff: ' + result.handoffId + '.' : '');
+            + '; do not retry with a new operation or changed/empty text to check status.'
+            + (result.handoffId ? ' Read only get_send_receipt(' + JSON.stringify({ tabId: args.tabId, handoffId: result.handoffId }) + ').' : ' No handoffId was returned; recover the original receipt before any retry.');
         }
         if (result.status === 'audit-pending' || result.auditPending === true) {
           return 'Prompt Enter crossed in tab ' + args.tabId
-            + ' through Project API scenario layer. Exact delivery confirmation is pending; do not retry this handoff.'
-            + (result.handoffId ? ' Handoff: ' + result.handoffId + '.' : '');
+            + ' through Project API scenario layer. Exact delivery confirmation is pending; do not retry this handoff or send changed/empty text to check status.'
+            + (result.handoffId ? ' Read only get_send_receipt(' + JSON.stringify({ tabId: args.tabId, handoffId: result.handoffId }) + ').' : ' No handoffId was returned; recover the original receipt before any retry.');
         }
         return 'Prompt sent to tab ' + args.tabId + ' through Project API scenario layer. Status: ' + (result.status || 'sent')
           + (result.queued ? ' (queued)' : '')

@@ -57,6 +57,48 @@ test('physical tab122 confirmed native slot transfers its original source/ref me
   assert.deepEqual(read(reopened, f.entry), projected, 'reader survives receipt pruning/reopen with no receipt lookup');
 });
 
+test('captured iOS31728 uses its confirmed response carrier alias without changing original /var paths or footer', t => {
+  const fs = require('node:fs');
+  const root = '/private/tmp/ios-settings-images-20261003';
+  if (!fs.existsSync(root + '/receipt-captures.json')) return t.skip('captured incident packet unavailable');
+  const captures = JSON.parse(fs.readFileSync(root + '/receipt-captures.json', 'utf8'));
+  const entry = JSON.parse(fs.readFileSync(root + '/image-entry.json', 'utf8'));
+  const x = captures[0].records[0];
+  const record = { ...x, receipt: x, promptLength: x.imageRequestProjection.requestLength,
+    auditIdentity: { provider: x.provider, attemptId: x.attemptId, sessionId: x.sessionId,
+      promptHash: x.actualHash, entryUuid: x.entryUuid, sourceIdentity: x.sourceIdentity, auditTimestamp: x.auditTimestamp } };
+  const store = memoryStore();
+  assert.equal(backfillConfirmedCanonicalAuthoringPresentations(store, [record]), 1);
+  const projected = read(store, entry);
+  assert.equal(projected.content, entry.content); assert.equal(projected.uuid, entry.uuid);
+  assert.equal(projected.imagePaths.length, 2);
+  for (let index = 0; index < 2; index++) {
+    assert.equal(projected.imagePaths[index].path, x.expectedImageRefs[index].path);
+    assert.ok(projected.imagePaths[index].path.startsWith('/var/'));
+    assert.equal(projected.imagePaths[index].sourcePath, x.expectedImageRefs[index].path);
+    assert.equal(projected.imagePaths[index].transportPath, entry.imagePaths[index].path);
+  }
+  const projection = historyAuthoringProjectionFromReceipt(record);
+  const row = store.rows[0], refs = projected.imagePaths;
+  for (const changed of [
+    { ...entry, sourceIdentityAliases: [] }, { ...entry, sessionId: 'foreign' },
+    { ...entry, content: entry.content + '!' }, { ...entry, promptPresentationTransportHash: 'bad' },
+    { ...entry, imagePaths: [...entry.imagePaths].reverse() },
+  ]) assert.equal(projectHistoryAuthoringEntry(projection, row, changed, refs), null);
+});
+
+test('exact request image presentation preserves repeated source occurrences and never substitutes realpath', () => {
+  const { imagePresentationFromReceipt } = require('./history-authoring-projection');
+  const f = clone(nativeFixture), record = f.record;
+  const proof = imagePresentationFromReceipt(record);
+  assert.ok(proof); assert.equal(proof.imagePaths[0].path, record.receipt.expectedImageRefs[0].path);
+  assert.equal(proof.imagePaths[0].id, 1); assert.equal(proof.attemptId, record.attemptId);
+  const bad = clone(record); bad.receipt.expectedImageRefs[0].path = '/private' + bad.receipt.expectedImageRefs[0].path;
+  assert.equal(imagePresentationFromReceipt(bad), null);
+  const foreign = clone(record); foreign.attemptId = 'other';
+  assert.equal(imagePresentationFromReceipt(foreign), null);
+});
+
 for (const [name, mutate] of [
   ['unconfirmed', f => { f.record.state = 'audit-pending'; }],
   ['foreign attempt', f => { f.record.attemptId = 'other'; }],

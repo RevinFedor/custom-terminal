@@ -5,6 +5,7 @@ const {
   TaskCompletionIntentRegistry,
   findTaskCompletionBlockers,
   loopTaskCompletionEligibility,
+  taskCompletionOutcomeMeta,
 } = require('./task-completion-intent');
 const { LOOP_TASK_COMPLETION_PROTOCOL } = require('../shared/task-completion-protocol.cjs');
 
@@ -33,6 +34,7 @@ test('completion belongs only to the successful current turn', () => {
       generation: 1, active: true, startedAt: 101,
       completionEligible: true, completionSource: 'prompt-loop',
       intentId: 'intent-1', intentRequestedAt: 102,
+      completionStatus: 'completed', completionReason: null,
     },
   });
   const finished = intents.finishTurn({
@@ -42,6 +44,37 @@ test('completion belongs only to the successful current turn', () => {
   assert.equal(finished.explicitTaskComplete, true);
   assert.equal(finished.taskCompletionIntentId, 'intent-1');
   assert.equal(intents.getTurn('tab-a'), null);
+});
+
+test('blocked stops only the audited current Loop turn and never claims success', () => {
+  for (const provider of ['claude', 'codex']) {
+    const intents = registry();
+    intents.beginTurn({ tabId: 'tab-a', provider, turnId: 't1', completionEligible: true });
+    const request = { tabId: 'tab-a', status: 'blocked', reason: 'Экран заблокирован: разблокируйте Mac' };
+    assert.equal(intents.requestCompletion(request).ok, true);
+    assert.equal(intents.requestCompletion(request).idempotent, true);
+    assert.equal(intents.requestCompletion({ tabId: 'tab-a' }).code, 'completion_intent_conflict');
+    const finished = intents.finishTurn({ tabId: 'tab-a', provider, turnId: 't1', success: true });
+    assert.equal(finished.explicitTaskComplete, false);
+    assert.equal(finished.explicitTaskBlocked, true);
+    assert.equal(finished.taskCompletionReason, request.reason);
+    assert.equal(taskCompletionOutcomeMeta(finished).explicitTaskBlocked, true);
+    assert.equal(taskCompletionOutcomeMeta(finished).explicitTaskComplete, false);
+    assert.deepEqual(taskCompletionOutcomeMeta(intents.finishTurn({ tabId: 'tab-a', success: true })), {});
+  }
+});
+
+test('blocked needs a reason, exact Loop eligibility, and a natural final outcome', () => {
+  const intents = registry();
+  intents.beginTurn({ tabId: 'tab-a', provider: 'codex', turnId: 't1' });
+  assert.equal(intents.requestCompletion({ tabId: 'tab-a', status: 'blocked', reason: 'locked' }).code, 'completion_protocol_not_active');
+  intents.authorizeCompletion({ tabId: 'tab-a', provider: 'codex', turnId: 't1' });
+  assert.equal(intents.requestCompletion({ tabId: 'tab-a', status: 'blocked', reason: '  ' }).code, 'blocked_reason_required');
+  assert.equal(intents.requestCompletion({ tabId: 'tab-a', status: 'failed' }).code, 'invalid_completion_status');
+  assert.equal(intents.requestCompletion({ tabId: 'tab-a', sourceTabId: 'other', status: 'blocked', reason: 'locked' }).code, 'source_tab_mismatch');
+  intents.requestCompletion({ tabId: 'tab-a', status: 'blocked', reason: 'locked' });
+  assert.equal(intents.finishTurn({ tabId: 'tab-a', provider: 'codex', turnId: 'old', success: true }).matched, false);
+  assert.equal(intents.finishTurn({ tabId: 'tab-a', success: false }).explicitTaskBlocked, false);
 });
 
 test('duplicate request is idempotent and an error never becomes success', () => {

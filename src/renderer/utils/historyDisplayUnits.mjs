@@ -258,9 +258,12 @@ const entryHasText = (entry) => {
  */
 const contentLength = (entry) => {
   if (typeof entry?.content === 'string') return entry.content.trim().length;
-  // A stub with hasContent but no content: length unknown — treat as long
-  // (standalone) so hydration state can only SPLIT groups it cannot verify,
-  // never merge across a possible reply.
+  // Main and the prepared SSD cache preserve this structural fact without
+  // the text. Hydrating/dehydrating a caption must not split its group and
+  // move the reading position of unrelated rows further down the list.
+  if (Number.isSafeInteger(entry?.contentLength) && entry.contentLength >= 0) return entry.contentLength;
+  // Legacy/invalid metadata is not proof of a short caption. Updated reader
+  // fingerprints rebuild old prepared stubs through the normal cache path.
   return entry?.hasContent === true ? Number.POSITIVE_INFINITY : 0;
 };
 

@@ -313,18 +313,27 @@ test('actual main PTY queue and paste/Enter destination guard reject late contex
   };
   visit(tree); assert.ok(destination); assert.equal(physicalChecks.length, 2);
   let writes = 0, inputReservations = 0;
+  const term = { write: () => writes++ };
   const env = vm.createContext({ console, tabWorkContext: h.context,
+    terminals: new Map([['T', term]]), terminalCommandState: new Map(),
+    terminalStopRevisions: new WeakMap(), aiStoppingTabs: new Map(),
+    getHeadlessTerminalMirror: () => null, getTerminalLifecycleGeneration: () => 'test-generation',
+    ...require('../shared/agent-local-command.cjs'),
     expectedKnownEmptySend: () => null, conversationOwners: { noteInput() {} },
     findTabIdForTerm: () => 'T', getTerminalInputRevision: () => 0,
     withPtyWriteLock: async (_term, work) => { h.setScope({ ...scope, sessionId: 'B' }); return work(); },
     bumpTerminalInputRevision: () => { inputReservations++; return 1; },
     _safePasteAndSubmitInner: async () => { writes++; },
   });
-  vm.runInContext(['assertKnownEmptySend', 'safePasteAndSubmit', 'finishSafePasteAfterWrite'].map(mainFn).join('\n'), env);
-  const result = await env.safePasteAndSubmit({ write: () => writes++ }, prepared.prompt, { handoffId: 'one' });
+  vm.runInContext(['getTerminalStopRevision', 'captureAgentInputIdentity', 'agentSendExecutionFailure',
+    'assertKnownEmptySend', 'safePasteAndSubmit', 'finishSafePasteAfterWrite', 'resolveSafePasteFailureAfterWrite'].map(mainFn).join('\n'), env);
+  const result = await env.safePasteAndSubmit(term, prepared.prompt, { handoffId: 'one' });
   assert.equal(result.code, 'agent_context_source_changed');
   assert.equal(result.submitted, false); assert.equal(writes, 0); assert.equal(inputReservations, 0);
   const gateEnv = vm.createContext({ assertKnownEmptySend: env.assertKnownEmptySend, broadcastTabId: 'T',
+    agentSendExecutionFailure: env.agentSendExecutionFailure, term,
+    writeExecutionIdentity: env.captureAgentInputIdentity('T', term),
+    pasteWritten: false,
     handoffId: 'one', expectedDestination: null, expectedTarget: null, sendOperationKey: null, sendAttemptId: null, options: {} });
   const gate = vm.runInContext(destination, gateEnv);
   assert.equal(gate().code, 'agent_context_source_changed', 'runs even without legacy expectedTarget');

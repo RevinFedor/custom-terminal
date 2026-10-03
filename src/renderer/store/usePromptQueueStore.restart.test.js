@@ -14,6 +14,8 @@ test('restart preserves deadlines and dependency promises; old shutdown outcomes
   const persisted = new Map();
   const ipcRenderer = {
     invoke: async (channel, value) => {
+      if (channel === 'ai-prompts:get') return { success: true, data: [{ id: 'run-after-loop', content: require('../../shared/prompt-loop.cjs').DEFAULT_LOOP_PROMPT }] };
+      if (channel === 'ai-prompts:save-content') return { success: true };
       if (channel === 'app:getState') return persisted.get(value);
       if (channel === 'app:setState') { persisted.set(value.key, value.value); return { success: true }; }
       throw Error('unexpected IPC: ' + channel);

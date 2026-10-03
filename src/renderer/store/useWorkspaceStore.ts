@@ -1661,7 +1661,9 @@ interface WorkspaceStore {
   windowDisplayKey: string | null;
   windowDisplayLayouts: Record<string, any>;
   setWorkspaceDisplay: (display: NonNullable<WorkspaceStore['workspaceDisplay']>) => void;
-  showHiddenWindow: (targetPaneIndex: number, windowId: string) => boolean;
+  showHiddenWindow: (targetPaneIndex: number, windowId: string, selection?:
+    | { projectId: string; tabId: string; slotId?: never }
+    | { slotId: string; projectId?: never; tabId?: never }) => boolean;
   view: 'dashboard' | 'workspace';
   // Project of the CENTER tab. Follows every tab activation (sidebar click,
   // Ctrl+Tab, pane focus) so all tab-owned surfaces (control bar, History,
@@ -2439,9 +2441,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       + ' total=' + get().splitPanes.length);
     get().saveSession();
   },
-  showHiddenWindow: (targetPaneIndex, windowId) => {
-    const result = revealHiddenWindow(get(), targetPaneIndex, windowId);
+  showHiddenWindow: (targetPaneIndex, windowId, selection) => {
+    const state = get();
+    const result = revealHiddenWindow(state, targetPaneIndex, windowId, selection);
     if (!result) return false;
+    const selected = result.splitPanes[result.splitFocusedIndex];
+    if (selected?.tabId && !state.openProjects.get(selected.projectId)?.tabs.has(selected.tabId)) return false;
+    // Commit the chosen body before activation can record a visit or follow
+    // the sidebar. A chooser must never activate the window's previous tab.
     set({ splitPanes: result.splitPanes, splitFocusedIndex: result.splitFocusedIndex });
     useUIStore.getState().setActiveArea('workspace');
     const pane = get().splitPanes[get().splitFocusedIndex];

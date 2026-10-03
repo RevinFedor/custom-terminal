@@ -4,7 +4,7 @@ function createCodexSettingsMutationQueue() {
   let tail = Promise.resolve();
   let pending = 0;
   // The settings transaction may release its observation/queue slot before
-  // the CLI paints our unsubmitted /model. Retain that physical write receipt
+  // the CLI paints our unsubmitted /model or /fast. Retain that physical write receipt
   // on the SAME terminal; it is not a new settings coordinator or a timer.
   const unsubmittedInputs = new WeakMap();
 

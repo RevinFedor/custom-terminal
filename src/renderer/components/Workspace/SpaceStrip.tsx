@@ -21,13 +21,14 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
-import { PROJECT_CARD_MAX_H, SPACE_STRIP_H } from '../../constants/layout';
+import { SPACE_STRIP_H } from '../../constants/layout';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { resolveWorkflowActivityCounts } from '../../utils/workflowActivityCounts.mjs';
 import { allPaneTabIds } from '../../utils/splitPanesModel.mjs';
 import { tabSpaceIndexMap } from '../../utils/workspaceSpacesModel.mjs';
 import { spacesWithLiveLayout } from '../../utils/workspaceSpaceRecovery.mjs';
 import WorkflowActivityBadges from './WorkflowActivityBadges';
+import WorkflowChip from './WorkflowChip';
 import { HORIZONTAL_ROW_DRAG_START, HORIZONTAL_ROW_DRAG_END, useConstrainedHorizontalReorder } from '../../hooks/useConstrainedHorizontalReorder';
 import { PANE_TAB_DND_TYPE } from '../../utils/paneTabDragBridge';
 import {
@@ -130,7 +131,6 @@ function SpaceChip({
   // Кегль и мера карточки — те же, что у карточек проектов наверху. Полоса
   // пространств и полоса проектов это две строки одного языка: свой мелкий
   // размер делал бы её похожей на служебную подпись, а не на переключатель.
-  const fontSize = useUIStore((s) => s.projectTabsFontSize);
   // Activity принадлежит МЕСТУ, где вкладка реально разложена, а не project-
   // папке на sidebar. Project и workflow — разные оси: вкладку из iOS project
   // можно положить в окно main, и её loader обязан светиться на main. Старый
@@ -287,8 +287,19 @@ function SpaceChip({
   };
 
   return (
-    <span
+    <WorkflowChip
       ref={chipRef}
+      as="span"
+      workflowId={id}
+      label={name}
+      icon={icon}
+      selected={active}
+      pending={pending}
+      hovered={hovered}
+      pointerHeld={pointerHeld}
+      swapTarget={windowSwapTarget}
+      navigationTarget={paneTabNavigationTarget}
+      showIdentity={!renaming}
       data-space-chip={id}
       data-space-active={active ? '1' : '0'}
       data-space-pending={pending ? '1' : '0'}
@@ -370,47 +381,8 @@ function SpaceChip({
         if (windowSwapPicker.active) return;
         useWorkspaceStore.getState().removeWorkspaceSpace(id);
       }}
-      style={{
-        position: 'relative',
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 5,
-        flexShrink: 0,
-        maxWidth: 220,
-        height: PROJECT_CARD_MAX_H,
-        padding: '0 8px',
-        borderRadius: 4,
-        fontSize,
-        lineHeight: `${PROJECT_CARD_MAX_H}px`,
-        whiteSpace: 'nowrap',
-        cursor: 'pointer',
-        userSelect: 'none',
-        // Три состояния, и наведённое НЕ дотягивает до текущего: подсветка
-        // отвечает «попадёшь сюда», а не «ты здесь». Сравняй их — и полоса
-        // перестанет отвечать на вопрос, где человек находится.
-        // `pending` рисуется как активное: решение принято, человек уже «там» —
-        // это не наведение, а подтверждение клика в первом же кадре.
-        color: (active || pending || windowSwapTarget) ? '#e8e8ea' : (hovered ? '#cfcfd4' : '#9b9ba1'),
-        background: windowSwapTarget
-          ? 'rgba(139,92,246,0.18)'
-          : (active || pending)
-          ? 'rgba(255,255,255,0.10)'
-          : (paneTabNavigationTarget ? 'rgba(139,92,246,0.14)' : undefined)
-            || (hovered ? 'rgba(255,255,255,0.055)' : 'transparent'),
-        border: '1px solid ' + (windowSwapTarget
-          ? 'rgba(167,139,250,0.95)'
-          : (active || pending)
-          ? 'rgba(255,255,255,0.22)'
-          : paneTabNavigationTarget
-            ? 'rgba(167,139,250,0.9)'
-          : (hovered ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.08)')),
-        transform: pointerHeld ? 'scale(0.985)' : undefined,
-        // Hover, active, drag-threshold and drop are truthful state changes,
-        // not motion. A transition made each one arrive in two visible steps.
-        transition: 'none',
-      }}
     >
-      {renaming ? (
+      {renaming && (
         <input
           ref={renameInput.ref}
           value={draft}
@@ -438,39 +410,6 @@ function SpaceChip({
             font: 'inherit',
           }}
         />
-      ) : (
-        <>
-          {icon ? (
-            <img
-              data-workflow-icon={id}
-              src={icon}
-              alt=""
-              draggable={false}
-              style={{ width: 16, height: 16, borderRadius: 4, objectFit: 'cover', flexShrink: 0 }}
-            />
-          ) : (
-            <span
-              aria-hidden
-              style={{
-                width: 16,
-                height: 16,
-                borderRadius: 4,
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                flexShrink: 0,
-                border: '1px solid rgba(255,255,255,0.16)',
-                background: 'rgba(255,255,255,0.06)',
-                color: '#9b9ba1',
-                fontSize: 9,
-                fontWeight: 700,
-              }}
-            >
-              {name.trim().slice(0, 1).toUpperCase() || 'W'}
-            </span>
-          )}
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</span>
-        </>
       )}
       <WorkflowActivityBadges
         activeCount={activity.activeCount}
@@ -548,7 +487,7 @@ function SpaceChip({
         </div>,
         document.body,
       )}
-    </span>
+    </WorkflowChip>
   );
 }
 

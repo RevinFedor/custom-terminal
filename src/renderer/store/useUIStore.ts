@@ -790,15 +790,6 @@ interface UIStore {
   setRunAfterPickerProjectId: (workflowId: string | null) => void;
   timelinePinned: boolean;
   setTimelinePinned: (v: boolean) => void;
-  /** Полоса вкладок в шапке окна ПЕРЕНОСИТ чипы на следующие строки вместо
-   *  горизонтальной прокрутки. Переключается пунктом «Перенос вкладок» в
-   *  ⋮-меню шапки; глобальная, как и остальные режимы раскладки. */
-  paneTabStripWrap: boolean;
-  setPaneTabStripWrap: (v: boolean) => void;
-  /** Automatically reveal a selected pane chip that is outside the current
-   * horizontal viewport. Off by default: manual scroll position wins. */
-  paneTabStripAutoReveal: boolean;
-  setPaneTabStripAutoReveal: (v: boolean) => void;
   // Center-surface owner for Claude/Codex PTY tabs. See loader comment above.
   terminalIsPrimary: boolean;
   setTerminalIsPrimary: (v: boolean) => void;
@@ -1623,68 +1614,9 @@ const initialTimelinePinned = loadTimelinePinned();
   } catch {}
 })();
 
-// paneTabStripWrap — «Перенос вкладок»: полоса чипов в шапке окна переносит
-// строки вместо горизонтальной прокрутки. Та же двойная запись, что у
-// timelinePinned: localStorage для мгновенного старта + SQLite-зеркало, чтобы
-// настройка переживала смену dev-порта.
-const APP_STATE_KEY_PANE_STRIP_WRAP = 'paneTabStripWrap';
-const loadPaneTabStripWrap = (): boolean => {
-  try {
-    const saved = localStorage.getItem('noted-terminal-pane-strip-wrap');
-    return saved === null ? true : saved === 'true';
-  } catch { return true; }
-};
-const savePaneTabStripWrap = (v: boolean) => {
-  try { localStorage.setItem('noted-terminal-pane-strip-wrap', String(v)); } catch {}
-  try {
-    const { ipcRenderer } = window.require('electron');
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_PANE_STRIP_WRAP, value: v }).catch(() => {});
-  } catch {}
-};
-const initialPaneTabStripWrap = loadPaneTabStripWrap();
-(async () => {
-  try {
-    const { ipcRenderer } = window.require('electron');
-    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_PANE_STRIP_WRAP);
-    if (v !== null && v !== undefined) {
-      const bool = parsePersistedBool(v);
-      if (useUIStore.getState().paneTabStripWrap !== bool) {
-        useUIStore.setState({ paneTabStripWrap: bool });
-        try { localStorage.setItem('noted-terminal-pane-strip-wrap', String(bool)); } catch {}
-      }
-    }
-  } catch {}
-})();
-
-// Optional automatic reveal of a selected pane chip. Default OFF: selecting a
-// tab must not rewrite a manually chosen horizontal position unless the user
-// explicitly opts into that behaviour from the strip's ⋮ menu.
-const APP_STATE_KEY_PANE_STRIP_AUTO_REVEAL = 'paneTabStripAutoReveal';
-const loadPaneTabStripAutoReveal = (): boolean => {
-  try { return localStorage.getItem('noted-terminal-pane-strip-auto-reveal') === 'true'; }
-  catch { return false; }
-};
-const savePaneTabStripAutoReveal = (v: boolean) => {
-  try { localStorage.setItem('noted-terminal-pane-strip-auto-reveal', String(v)); } catch {}
-  try {
-    const { ipcRenderer } = window.require('electron');
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_PANE_STRIP_AUTO_REVEAL, value: v }).catch(() => {});
-  } catch {}
-};
-const initialPaneTabStripAutoReveal = loadPaneTabStripAutoReveal();
-(async () => {
-  try {
-    const { ipcRenderer } = window.require('electron');
-    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_PANE_STRIP_AUTO_REVEAL);
-    if (v !== null && v !== undefined) {
-      const bool = parsePersistedBool(v);
-      if (useUIStore.getState().paneTabStripAutoReveal !== bool) {
-        useUIStore.setState({ paneTabStripAutoReveal: bool });
-        try { localStorage.setItem('noted-terminal-pane-strip-auto-reveal', String(bool)); } catch {}
-      }
-    }
-  } catch {}
-})();
+// Legacy paneTabStripWrap/paneTabStripAutoReveal settings are intentionally not
+// loaded or mirrored anymore: window headers always wrap, including the first
+// frame and late SQLite hydration. Stored old values may remain inert.
 
 // historyPinned — global layout mode for Cmd+] / Option+] HistoryPanel. Defaults to the
 // legacy combined timelinePinned value so users keep their previous layout.
@@ -3617,13 +3549,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
   },
   timelinePinned: initialTimelinePinned,
   setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
-  paneTabStripWrap: initialPaneTabStripWrap,
-  setPaneTabStripWrap: (v) => { set({ paneTabStripWrap: v }); savePaneTabStripWrap(v); },
-  paneTabStripAutoReveal: initialPaneTabStripAutoReveal,
-  setPaneTabStripAutoReveal: (v) => {
-    set({ paneTabStripAutoReveal: v });
-    savePaneTabStripAutoReveal(v);
-  },
   terminalIsPrimary: initialTerminalIsPrimary,
   setTerminalIsPrimary: (v) => { set({ terminalIsPrimary: v }); saveTerminalIsPrimary(v); },
   newTabPrimarySurface: initialNewTabPrimarySurface,

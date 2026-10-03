@@ -41,6 +41,7 @@ import {
 import { cancelPendingAutoCompact, requestAutoCompactNow } from '../../hooks/usePromptQueueRunner';
 import { autoCompactIncludesTarget, UNPLACED_AUTOMATION_WORKFLOW } from '../../utils/autoCompactPolicy.mjs';
 import { summarizeRunningAutoCompacts } from '../../utils/autoCompactActivityPresentation.mjs';
+import WorkflowChip from './WorkflowChip';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
 import { layoutRunAfterDependencyGraph } from '../../utils/runAfterDependencyLayout.mjs';
@@ -74,6 +75,16 @@ const GLOBAL_PANEL_SIZE_KEY = 'noted-terminal-global-run-after-size';
 
 type GlobalPanelSize = { width: number; height: number; heightFixed: boolean };
 type QueueEditorState = { tabId: string; mode: 'preview' | 'pinned' };
+
+function queueHoverSatelliteRects(root: HTMLElement | null): DOMRect[] {
+  const owner = root?.querySelector<HTMLElement>('[data-prompt-queue-hover-owner]')?.dataset.promptQueueHoverOwner;
+  if (!owner) return [];
+  // An overlay covering the viewport is click dismissal, not hover territory.
+  // Nor can a popup belonging to another local/global queue hold this one open.
+  return Array.from(document.querySelectorAll<HTMLElement>('[data-run-after-hover-owner]'))
+    .filter((element) => element.dataset.runAfterHoverOwner === owner)
+    .map((element) => element.getBoundingClientRect());
+}
 
 const button: CSSProperties = {
   border: '1px solid #383838',
@@ -162,7 +173,7 @@ function QueueTabNode({ tab, queue, busy, selected, onEdit, onPreview }: {
   busy: boolean;
   selected: boolean;
   onEdit: () => void;
-  onPreview: () => void;
+  onPreview: (event: React.MouseEvent) => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const [runHovered, setRunHovered] = useState(false);
@@ -400,7 +411,7 @@ function QueueDependencyMap({ inventory, queues, busy, selectedId, onSelect, onP
   busy: Map<string, boolean>;
   selectedId: string | null;
   onSelect: (tabId: string) => void;
-  onPreview: (tabId: string) => void;
+  onPreview: (tabId: string, event: React.MouseEvent) => void;
 }) {
   const tabGeo = useUIStore((state) => state.tabGeometry);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
@@ -478,7 +489,7 @@ function QueueDependencyMap({ inventory, queues, busy, selectedId, onSelect, onP
               return (
                 <div key={node.id} style={{ position: 'absolute', left: node.x, top: node.y, width: node.width, height: node.height }}>
                   <QueueTabNode tab={tab} queue={queueIsConfigured(queue) ? queue : undefined} busy={busy.get(tab.id) === true}
-                    selected={selectedId === tab.id} onEdit={() => onSelect(tab.id)} onPreview={() => onPreview(tab.id)} />
+                    selected={selectedId === tab.id} onEdit={() => onSelect(tab.id)} onPreview={(event) => onPreview(tab.id, event)} />
                 </div>
               );
             })}
@@ -631,7 +642,9 @@ function AutoCompactPage({ inventory, busy }: {
             const selectedGroup = unplaced ? policy.includeUnplaced : policy.allWorkflows || policy.workflowIds.includes(group.id);
             const runningCount = running.workflowCounts.get(group.id) || 0;
             return (
-              <ChoiceChip key={group.id} selected={selectedGroup} disabled={!hydrated || (!unplaced && policy.allWorkflows)}
+              <WorkflowChip key={group.id} workflowId={group.id} label={group.name} icon={group.icon}
+                data-auto-compact-workflow-chip={group.id} unplaced={unplaced}
+                selected={selectedGroup} disabled={!hydrated || (!unplaced && policy.allWorkflows)}
                 title={group.projectNames.length ? group.projectNames.join(', ') : undefined}
                 onClick={() => {
                   if (unplaced) update({ includeUnplaced: !policy.includeUnplaced });
@@ -639,9 +652,9 @@ function AutoCompactPage({ inventory, busy }: {
                     ? policy.workflowIds.filter((id: string) => id !== group.id)
                     : [...policy.workflowIds, group.id] });
                 }}>
-                <span>{group.name}</span>
+                {selectedGroup && <Check aria-hidden size={11} strokeWidth={2.5} style={{ flexShrink: 0 }} />}
                 {runningCount > 0 && <AutoCompactRunningIndicator count={runningCount} scope={group.id} />}
-              </ChoiceChip>
+              </WorkflowChip>
             );
           })}
         </div>
@@ -706,7 +719,9 @@ function QueueOverview({
   setEditorState,
   beforeCloseRef,
   onRewindTargetModeChange,
-  pinParent,
+  pickingRewind,
+  editorGestureActive,
+  onHoverGestureChange,
   geometryKey,
 }: {
   inventory: ReturnType<typeof useAutomationInventory>;
@@ -716,7 +731,9 @@ function QueueOverview({
   setEditorState: (state: QueueEditorState | null) => void;
   beforeCloseRef: { current: (reason?: 'outside') => boolean };
   onRewindTargetModeChange: (active: boolean) => void;
-  pinParent: () => void;
+  pickingRewind: boolean;
+  editorGestureActive: boolean;
+  onHoverGestureChange: (active: boolean, point: { clientX: number; clientY: number } | null) => void;
   geometryKey: string;
 }) {
   const [showDisabled, setShowDisabled] = useState(false);
@@ -728,6 +745,11 @@ function QueueOverview({
     maxHeight: FLOATING_QUEUE_MAX_H,
   });
   const editorPopoverRef = useRef<HTMLDivElement>(null);
+  const editorPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const relayEditorGesture = useCallback((active: boolean, point: { clientX: number; clientY: number } | null) => {
+    editorPointerRef.current = point;
+    onHoverGestureChange(active, point);
+  }, [onHoverGestureChange]);
   const tabGeo = useUIStore((state) => state.tabGeometry);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
   const promptQueueWidth = useUIStore((state) => state.promptQueueWidth);
@@ -753,10 +775,12 @@ function QueueOverview({
   const selectedTab = selectedId ? inventory.tabs.find((tab) => tab.id === selectedId) : undefined;
   const selectedQueue = selectedId ? queues.get(selectedId) : undefined;
 
-  const preview = useCallback((tabId: string) => {
+  const preview = useCallback((tabId: string, event: React.MouseEvent) => {
     if (editorState?.mode === 'pinned') return;
+    if (editorState?.tabId !== tabId && !beforeCloseRef.current()) return;
+    editorPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
     setEditorState({ tabId, mode: 'preview' });
-  }, [editorState?.mode, setEditorState]);
+  }, [beforeCloseRef, editorState, setEditorState]);
 
   const select = useCallback((tabId: string) => {
     if (editorState?.tabId === tabId && editorState.mode === 'pinned') {
@@ -764,9 +788,8 @@ function QueueOverview({
       return;
     }
     if (editorState?.tabId !== tabId && !beforeCloseRef.current()) return;
-    pinParent();
     setEditorState({ tabId, mode: 'pinned' });
-  }, [beforeCloseRef, editorState, pinParent, setEditorState]);
+  }, [beforeCloseRef, editorState, setEditorState]);
 
   const toggleDisabled = useCallback(() => {
     const hidesEditorTrigger = showDisabled
@@ -846,20 +869,33 @@ function QueueOverview({
 
   useEffect(() => {
     if (editorState?.mode !== 'preview') return;
-    const onMove = (event: MouseEvent) => {
+    const recheck = (point: { clientX: number; clientY: number } | null) => {
+      if (pickingRewind || editorGestureActive) return;
       const hub = editorPopoverRef.current?.getBoundingClientRect() || null;
       const trigger = document.querySelector<HTMLElement>(
         `[data-global-run-after-editor-trigger="${CSS.escape(editorState.tabId)}"]`,
       )?.getBoundingClientRect() || null;
-      const satellites = [trigger, ...Array.from(document.querySelectorAll<HTMLElement>(
-        '[data-run-after-picker-menu], [data-run-after-picker-overlay], [data-prompt-queue-chip-menu], [data-prompt-queue-meta-actions]',
-      )).map((element) => element.getBoundingClientRect())];
-      if (pointInHoverCluster({ hub, satellites, x: event.clientX, y: event.clientY, pad: 2 })) return;
+      const satellites = [trigger, ...queueHoverSatelliteRects(editorPopoverRef.current)];
+      if (point && pointInHoverCluster({ hub, satellites, x: point.clientX, y: point.clientY, pad: 2 })) return;
+      if (!beforeCloseRef.current('outside')) return;
       setEditorState(null);
     };
+    const onMove = (event: MouseEvent) => {
+      editorPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
+      recheck(event);
+    };
+    const onExitWindow = () => { editorPointerRef.current = null; recheck(null); };
+    const onMouseOut = (event: MouseEvent) => { if (!event.relatedTarget) onExitWindow(); };
+    recheck(editorPointerRef.current);
     window.addEventListener('mousemove', onMove);
-    return () => window.removeEventListener('mousemove', onMove);
-  }, [editorState, setEditorState]);
+    window.addEventListener('mouseout', onMouseOut);
+    window.addEventListener('blur', onExitWindow);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseout', onMouseOut);
+      window.removeEventListener('blur', onExitWindow);
+    };
+  }, [beforeCloseRef, editorGestureActive, editorState, pickingRewind, setEditorState]);
 
   return (
     <div data-global-run-after-queues style={{ minHeight: 0 }}>
@@ -876,7 +912,7 @@ function QueueOverview({
           {showDisabled && <div data-global-run-after-disabled style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 7 }}>
             {disabledTabs.map((tab) => <div key={tab.id} style={{ width: GRAPH_NODE_W, height: disabledNodeHeight }}>
               <QueueTabNode tab={tab} queue={queues.get(tab.id)} busy={busy.get(tab.id) === true}
-                selected={selectedId === tab.id} onEdit={() => select(tab.id)} onPreview={() => preview(tab.id)} />
+                selected={selectedId === tab.id} onEdit={() => select(tab.id)} onPreview={(event) => preview(tab.id, event)} />
             </div>)}
           </div>}
         </div>}
@@ -888,10 +924,6 @@ function QueueOverview({
           data-global-run-after-floating-editor={selectedTab.id}
           data-global-run-after-editor-mode={editorState.mode}
           data-run-after-satellite="true"
-          onPointerDownCapture={() => {
-            pinParent();
-            if (editorState.mode === 'preview') setEditorState({ tabId: editorState.tabId, mode: 'pinned' });
-          }}
           style={{
             position: 'fixed',
             left: editorPosition.left,
@@ -913,10 +945,12 @@ function QueueOverview({
             agentBusy={busy.get(selectedTab.id) === true}
             inputSurface="history"
             embedded
+            embeddedPinned={editorState.mode === 'pinned'}
             embeddedWidth={editorPosition.width}
             embeddedMaxHeight={Math.max(90, editorPosition.maxHeight - 11)}
             beforeCloseRef={beforeCloseRef}
             onRewindTargetModeChange={onRewindTargetModeChange}
+            onHoverGestureChange={relayEditorGesture}
           />
         </div>,
         document.body,
@@ -930,12 +964,24 @@ export function GlobalRunAfterControl() {
   const [page, setPage] = useState<'queues' | 'compact'>('queues');
   const [editorState, setEditorState] = useState<QueueEditorState | null>(null);
   const [pickingRewind, setPickingRewind] = useState(false);
+  const [editorGestureActive, setEditorGestureActive] = useState(false);
   const [panelSize, setPanelSize] = useState(loadPanelSize);
   const [position, setPosition] = useState({ left: PANEL_MARGIN, top: 65, width: PANEL_DEFAULT_W, height: PANEL_DEFAULT_H });
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const panelContentRef = useRef<HTMLDivElement>(null);
   const beforeCloseRef = useRef<(reason?: 'outside') => boolean>(() => true);
+  const resizeActiveRef = useRef(false);
+  const editorGestureActiveRef = useRef(false);
+  const previewPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const handleEditorGesture = useCallback((active: boolean, point: { clientX: number; clientY: number } | null) => {
+    // Captured pointermove/native drag can suppress compatibility mousemove.
+    // Forward actual gesture coordinates; never recover with a delayed close.
+    previewPointerRef.current = point;
+    if (editorGestureActiveRef.current === active) return;
+    editorGestureActiveRef.current = active;
+    setEditorGestureActive(active);
+  }, []);
   const sidebarWidth = useUIStore((state) => state.tabSidebarWidth);
   const policy = useAutoCompactStore((state) => state.policy);
   const activities = useAutoCompactStore((state) => state.activities);
@@ -951,6 +997,21 @@ export function GlobalRunAfterControl() {
     [activities, inventory.tabs],
   );
   const visible = mode !== 'hidden';
+  const closePanel = useCallback((reason?: 'outside') => {
+    // Hover dismissal is an editor exit too. Blur fields before unmount so
+    // threshold/timer edits take the same save path as an ordinary blur.
+    const active = document.activeElement;
+    const floatingEditor = editorState?.tabId ? document.querySelector<HTMLElement>(
+      `[data-global-run-after-floating-editor="${CSS.escape(editorState.tabId)}"]`,
+    ) : null;
+    if (active instanceof HTMLElement && (panelRef.current?.contains(active) || floatingEditor?.contains(active))) {
+      active.blur();
+    }
+    if (!beforeCloseRef.current(reason)) return false;
+    setEditorState(null);
+    setMode('hidden');
+    return true;
+  }, [editorState?.tabId]);
   const lastPositionWarningRef = useRef(0);
   useEffect(() => {
     console.log('[GlobalRunAfter:Presentation] mode=' + mode + ' activeQueues=' + activeCount);
@@ -996,24 +1057,49 @@ export function GlobalRunAfterControl() {
     };
   }, [panelSize, sidebarWidth, visible]);
 
+  const recheckPreviewHover = useCallback((point: { clientX: number; clientY: number } | null) => {
+    if (mode !== 'preview' || pickingRewind || editorGestureActive || resizeActiveRef.current) return;
+    if (!point) { closePanel(); return; }
+    const panelRect = panelRef.current?.getBoundingClientRect() || null;
+    const floatingEditor = editorState?.tabId ? document.querySelector<HTMLElement>(
+      `[data-global-run-after-floating-editor="${CSS.escape(editorState.tabId)}"]`,
+    ) : null;
+    const satelliteRects = [triggerRef.current?.getBoundingClientRect() || null,
+      ...Array.from(panelRef.current?.querySelectorAll<HTMLElement>(
+        '[data-global-run-after-pages], [data-global-run-after-resize]',
+      ) || []).map((element) => element.getBoundingClientRect()),
+      floatingEditor?.getBoundingClientRect() || null,
+      ...queueHoverSatelliteRects(floatingEditor)];
+    if (pointInHoverCluster({ hub: panelRect, satellites: satelliteRects, x: point.clientX, y: point.clientY, pad: 2 })) return;
+    closePanel();
+  }, [closePanel, editorGestureActive, editorState?.tabId, mode, pickingRewind]);
+  const recheckPreviewHoverRef = useRef(recheckPreviewHover);
+  recheckPreviewHoverRef.current = recheckPreviewHover;
   useEffect(() => {
     if (mode !== 'preview') return;
     const onMove = (event: MouseEvent) => {
-      const panelRect = panelRef.current?.getBoundingClientRect() || null;
-      const satelliteRects = [triggerRef.current?.getBoundingClientRect() || null,
-        ...Array.from(document.querySelectorAll<HTMLElement>('[data-run-after-satellite], [data-run-after-picker-menu], [data-run-after-picker-overlay]'))
-          .map((element) => element.getBoundingClientRect())];
-      if (pointInHoverCluster({ hub: panelRect, satellites: satelliteRects, x: event.clientX, y: event.clientY, pad: 2 })) return;
-      setMode('hidden');
+      previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
+      recheckPreviewHover(event);
     };
+    const onExitWindow = () => { previewPointerRef.current = null; recheckPreviewHover(null); };
+    const onMouseOut = (event: MouseEvent) => { if (!event.relatedTarget) onExitWindow(); };
+    // Rewind temporarily hides the surface, not its ownership. Once target
+    // selection ends, recheck the real last pointer even without a new move.
+    recheckPreviewHover(previewPointerRef.current);
     window.addEventListener('mousemove', onMove);
-    return () => window.removeEventListener('mousemove', onMove);
-  }, [mode]);
+    window.addEventListener('mouseout', onMouseOut);
+    window.addEventListener('blur', onExitWindow);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseout', onMouseOut);
+      window.removeEventListener('blur', onExitWindow);
+    };
+  }, [mode, recheckPreviewHover]);
 
   const { start: startResizeGesture } = usePointerGesture();
   const startResize = useCallback((edge: 'right' | 'bottom' | 'corner', event: React.PointerEvent<HTMLElement>) => {
     if (event.button !== 0) return;
-    setMode('pinned');
+    previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
     const liveRect = panelRef.current?.getBoundingClientRect();
     const startX = event.clientX;
     const startY = event.clientY;
@@ -1030,6 +1116,7 @@ export function GlobalRunAfterControl() {
     startResizeGesture(event, {
       cursor: edge === 'right' ? 'ew-resize' : edge === 'bottom' ? 'ns-resize' : 'nwse-resize',
       onMove: (moveEvent) => {
+        previewPointerRef.current = { clientX: moveEvent.clientX, clientY: moveEvent.clientY };
         const width = edge === 'bottom' ? startWidth
           : clamp(startWidth + moveEvent.clientX - startX, Math.min(PANEL_MIN_W, maxWidth), maxWidth);
         const height = edge === 'right' ? startHeight
@@ -1049,7 +1136,12 @@ export function GlobalRunAfterControl() {
         }
         if (edge !== 'right' && panelContentRef.current) panelContentRef.current.style.maxHeight = 'none';
       },
-      onEnd: (reason) => {
+      onEnd: (reason, endEvent) => {
+        resizeActiveRef.current = false;
+        if (endEvent) previewPointerRef.current = { clientX: endEvent.clientX, clientY: endEvent.clientY };
+        const recheckAfterGesture = () => {
+          if (reason !== 'dispose') recheckPreviewHoverRef.current(previewPointerRef.current);
+        };
         if (!moved || reason !== 'up') {
           if (panelRef.current) {
             panelRef.current.style.width = `${position.width}px`;
@@ -1061,6 +1153,7 @@ export function GlobalRunAfterControl() {
               ? 'none'
               : `${Math.max(90, position.height - 26)}px`;
           }
+          recheckAfterGesture();
           return;
         }
         setPanelSize({
@@ -1068,8 +1161,10 @@ export function GlobalRunAfterControl() {
           height: nextHeight,
           heightFixed: panelSize.heightFixed || edge !== 'right',
         });
+        recheckAfterGesture();
       },
     });
+    resizeActiveRef.current = true;
   }, [panelSize, position, startResizeGesture]);
 
   const switchPage = (next: 'queues' | 'compact') => {
@@ -1077,11 +1172,6 @@ export function GlobalRunAfterControl() {
     if (!beforeCloseRef.current()) return;
     setEditorState(null);
     setPage(next);
-  };
-  const closePanel = (reason?: 'outside') => {
-    if (!beforeCloseRef.current(reason)) return;
-    setEditorState(null);
-    setMode('hidden');
   };
   const togglePinned = () => {
     if (mode === 'pinned') {
@@ -1108,7 +1198,10 @@ export function GlobalRunAfterControl() {
       `}</style>
       <button ref={triggerRef} type="button" data-global-run-after-trigger aria-expanded={visible}
         data-global-run-after-auto-compact-running={runningCompacts.total || undefined}
-        onMouseEnter={() => { if (mode === 'hidden') setMode('preview'); }} onClick={togglePinned}
+        onMouseEnter={(event) => {
+          previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
+          if (mode === 'hidden') setMode('preview');
+        }} onClick={togglePinned}
         title={runningCompacts.total > 0
           ? `Очереди всех вкладок и глобальный автокомпакт · выполняется: ${runningCompacts.total}`
           : 'Очереди всех вкладок и глобальный автокомпакт'} style={{ ...button, position: 'relative', display: 'inline-flex', alignItems: 'center',
@@ -1143,7 +1236,6 @@ export function GlobalRunAfterControl() {
             />
           )}
           <div ref={panelRef} data-global-run-after-panel data-global-run-after-mode={mode}
-            onPointerDownCapture={() => { if (mode === 'preview') setMode('pinned'); }}
             style={{ position: 'fixed', zIndex: 15000, left: position.left, top: position.top, width: position.width,
               height: panelSize.heightFixed ? position.height : 'auto', maxHeight: position.height,
               boxSizing: 'border-box', visibility: pickingRewind ? 'hidden' : 'visible', display: 'flex',
@@ -1170,7 +1262,10 @@ export function GlobalRunAfterControl() {
           {page === 'compact' ? <AutoCompactPage inventory={inventory} busy={busy} /> :
             <QueueOverview inventory={inventory} queues={queues} busy={busy} editorState={editorState}
               setEditorState={setEditorState} beforeCloseRef={beforeCloseRef}
-              onRewindTargetModeChange={setPickingRewind} pinParent={() => setMode('pinned')}
+              onRewindTargetModeChange={setPickingRewind}
+              pickingRewind={pickingRewind}
+              editorGestureActive={editorGestureActive}
+              onHoverGestureChange={handleEditorGesture}
               geometryKey={`${position.left}:${position.top}:${position.width}:${position.height}`} />}
         </div>
 
@@ -1188,7 +1283,7 @@ export function GlobalRunAfterControl() {
 
         <style>{`
           .gra-control, .gra-choice, .gra-page, .gra-node-action {
-            transition: filter 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+            transition: none;
           }
           .gra-control:not(:disabled):hover,
           .gra-choice:not(:disabled):hover,

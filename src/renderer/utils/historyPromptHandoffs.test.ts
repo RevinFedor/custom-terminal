@@ -1,6 +1,48 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import test from 'node:test';
+test('read-only image proof can enrich only the same already-owned empty image presentation', () => {
+  const store = new HistoryPromptHandoffStore();
+  store.begin({ tabId:'T', handoffId:'H', toolType:'codex', text:'[imagePath: /image.jpg]', promptChips:[], imagePaths:[],
+    sendAttemptId:'A', sendOperationKey:'O', sessionIdHint:'S', submittedAt:1, source:'codex-ios-terminal', statusAtSend:'active' });
+  const record:any={tabId:'T',handoffId:'H',provider:'codex',sessionId:'S',operationKey:'O',attemptId:'A',promptHash:'hash',
+    receipt:{promptText:'[imagePath: /image.jpg]'},imagePresentation:{version:1,operationKey:'O',attemptId:'A',requestHash:'hash',
+      imagePaths:[{id:1,path:'/image.jpg'}]}};
+  assert.equal(store.hydrateImagePresentation({...record,attemptId:'wrong'}),false);
+  assert.equal(store.hydrateImagePresentation({...record,receipt:{promptText:'changed'}}),false);
+  assert.equal(store.hydrateImagePresentation(record),true);
+  const handoff=store.getSnapshot('T')[0];
+  assert.equal(handoff.text,'[imagePath: /image.jpg]'); assert.equal(handoff.imagePaths[0].path,'/image.jpg');
+  assert.equal(store.hydrateImagePresentation(record),false);
+});
+test('all three captured mobile sends enrich their existing desktop handoff from the actual Main request proof', t => {
+  const packet = '/private/tmp/ios-settings-images-20261003/receipt-captures.json';
+  if (!existsSync(packet)) return t.skip('captured incident packet unavailable');
+  const { imagePresentationFromReceipt } = createRequire(import.meta.url)('../../main/history-authoring-projection.js');
+  const captures = JSON.parse(readFileSync(packet, 'utf8'));
+  const ids = ['1D6A70F3-CFA0-4947-8080-828CADECD38B', '63E69481-CBCD-4F4B-8149-3B1B179C4B12', '8885E10C-EE8E-4DEE-8318-FE36EFF6F698'];
+  const store = new HistoryPromptHandoffStore();
+  for (const [index, capture] of captures.entries()) {
+    const raw = capture.records[0];
+    assert.equal(raw.handoffId, ids[index]);
+    const record = { ...raw, receipt: raw, promptLength: raw.imageRequestProjection.requestLength };
+    const imagePresentation = imagePresentationFromReceipt(record);
+    assert.ok(imagePresentation, 'existing immutable Main proof, not guessed paths');
+    assert.equal(imagePresentation.imagePaths.length, 2);
+    store.begin({ tabId:raw.tabId, handoffId:raw.handoffId, toolType:'codex', text:raw.promptText,
+      promptChips:[], imagePaths:[], sendAttemptId:raw.attemptId, sendOperationKey:raw.operationKey,
+      sessionIdHint:raw.sessionId, submittedAt:Date.now(), source:'codex-ios-terminal', statusAtSend:'active' });
+    const prior = store.getSnapshot(raw.tabId).find(row => row.handoffId === raw.handoffId)!;
+    assert.equal(store.hydrateImagePresentation({ ...record, imagePresentation }), true);
+    const adopted = store.getSnapshot(raw.tabId).find(row => row.handoffId === raw.handoffId)!;
+    assert.equal(adopted.text, prior.text);
+    assert.equal(adopted.queueStatus, prior.queueStatus);
+    assert.deepEqual(adopted.imagePaths.map(ref => ref.path), raw.expectedImageRefs.map((ref:any) => ref.path));
+    assert.deepEqual(adopted.imagePaths.map(ref => ref.id), [1, 2]);
+  }
+  assert.equal(captures.length, ids.length);
+});
 import {
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   HISTORY_PROMPT_SENT_PRESENTATION_MS,

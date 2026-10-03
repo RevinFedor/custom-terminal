@@ -11,6 +11,7 @@ const Database = require('better-sqlite3');
 const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
 const { createCompactOperationRegistry } = require('./compact-operation-state');
 const receiptApi = require('./agent-send-receipt-registry');
+const { compactSendReceiptPresentation } = require('./compact-send-settlement');
 
 function reader(name) {
   const source = fs.readFileSync(path.join(__dirname, name), 'utf8');
@@ -75,6 +76,7 @@ function fixture(t, { disk = false } = {}) {
 
 async function httpReceipt(store) {
   const context = vm.createContext({ agentSendReceiptStore: store, agentSendReceiptStartupReady: Promise.resolve(),
+    compactSendReceiptPresentation,
     AGENT_SEND_RECEIPT_STATES: receiptApi.RECEIPT_STATES,
     isAgentSendProviderQueueAccepted: () => false,
     decId: decodeURIComponent, cleanOptionalString: value => String(value || '').trim(),
@@ -151,6 +153,107 @@ test('legacy sent-only receipt without a bound operation is not upgraded by matc
   f.start(); f.finish();
   assert.equal(f.record().receipt.coordinatedSettlement?.compact, undefined,
     'no historical owner/generation reconstruction from a sent-only receipt');
+});
+
+// Exact relevant wire fields captured from old B5 GET on 02.10. No synthetic
+// session/generation/offsets: these are the fields the legacy receipt LOST.
+const legacyB5 = Object.freeze({
+  tabId, toolType: 'codex', provider: 'codex', handoffId,
+  operationKey: `project:${tabId}:${handoffId}`,
+  attemptId: '76db1ae4-80b6-40ba-a3ad-dce5cbf6d6c6',
+  success: true, accepted: true, submitted: true, status: 'sent', receiptState: 'confirmed',
+  compactStartConfirmed: true, compactEnterCount: 1,
+  compactStartProof: 'task_started-after-programmatic-slash', localSlashCommand: true,
+  localCommandProof: 'codex-compact-causal-task-started',
+  compactOperationId: 'codex:api:' + handoffId, deliveryOutcome: 'local-command-confirmed',
+  coordinatedSettlement: null, sessionId: null, entryUuid: null, sourceIdentity: null,
+  createdAt: 1790759768454, updatedAt: 1790759768847, settledAt: 1790759768847,
+});
+
+test('real legacy B5 HTTP GET classifies operation-only presentation without completion, migration or current SID', async t => {
+  const f = fixture(t, { disk: true });
+  f.db.prepare(`UPDATE agent_send_receipts SET receipt_json=?, state='confirmed', attempt_id=?,
+    created_at=?,updated_at=?,settled_at=? WHERE operation_key=?`)
+    .run(JSON.stringify(legacyB5), legacyB5.attemptId, legacyB5.createdAt,
+      legacyB5.updatedAt, legacyB5.settledAt, f.identity.operationKey);
+  const before = JSON.stringify(f.record());
+  const first = (await httpReceipt(f.store)).body.receipts[0];
+  assert.equal(first.serviceCommand.kind, 'compact');
+  assert.equal(first.serviceCommand.historyPresentation, 'operation-only');
+  assert.equal(first.serviceCommand.delivery, 'confirmed');
+  assert.equal(first.serviceCommand.deliveryProof, legacyB5.localCommandProof);
+  for (const key of ['operationKey', 'attemptId', 'handoffId', 'tabId']) {
+    assert.equal(first.serviceCommand[key], legacyB5[key], key);
+  }
+  assert.equal(first.serviceCommand.operationId, legacyB5.compactOperationId);
+  assert.equal(first.serviceCommand.historyScope, null, 'no current/saved/fork SID inference');
+  assert.equal(first.coordinatedSettlement, null, 'no invented completion');
+  assert.equal(first.sessionId, null); assert.equal(first.entryUuid, null);
+  assert.equal(first.sourceIdentity, null);
+  assert.equal(first.createdAt, legacyB5.createdAt); assert.equal(first.updatedAt, legacyB5.updatedAt);
+  assert.equal(JSON.stringify(f.record()), before, 'GET is a pure projection, not a data repair');
+  f.reopen();
+  assert.deepEqual(JSON.parse(JSON.stringify((await httpReceipt(f.store)).body.receipts[0])),
+    JSON.parse(JSON.stringify(first)), 'same delivery presentation survives DB reopen');
+  assert.equal(JSON.stringify(f.record()), before);
+});
+
+test('bound service scope is historical compact owner, independent of completion and current conversation', async t => {
+  const f = fixture(t); f.start();
+  const started = (await httpReceipt(f.store)).body.receipts[0];
+  assert.equal(started.serviceCommand.historyScope.sessionId, sessionId);
+  assert.equal(started.serviceCommand.historyScope.generation, f.pending.generation);
+  assert.equal(started.serviceCommand.historyScope.sourceByteOffset, f.pending.sourceByteOffset);
+  assert.equal(started.coordinatedSettlement?.compact, undefined);
+  f.finish();
+  const completed = (await httpReceipt(f.store)).body.receipts[0];
+  assert.deepEqual(completed.serviceCommand, started.serviceCommand,
+    'presentation classification does not claim/change terminal outcome');
+  assert.equal(completed.coordinatedSettlement.compact.outcome, 'completed');
+});
+
+test('ordinary, unknown, unsent, partial and foreign proofs never get service-command hiding authority', () => {
+  const record = { ...legacyB5, state: 'confirmed', receipt: { ...legacyB5 }, auditIdentity: null };
+  assert.ok(compactSendReceiptPresentation(record));
+  for (const state of ['reserved', 'preparing', 'in-flight', 'enter-armed', 'audit-pending',
+    'delivery-unknown', 'not-submitted', 'provider-not-accepted']) {
+    assert.equal(compactSendReceiptPresentation({ ...record, state }), null, state);
+  }
+  for (const patch of [{ provider: 'claude' }, { attemptId: '' }, { handoffId: 'foreign' },
+    { tabId: 'foreign' }, { operationKey: 'foreign' },
+    { auditIdentity: { sessionId: 'canonical', entryUuid: 'real-user' } }]) {
+    assert.equal(compactSendReceiptPresentation({ ...record, ...patch }), null, JSON.stringify(patch));
+  }
+  for (const patch of [{ success: false }, { submitted: null }, { localSlashCommand: false },
+    { deliveryUnknown: true }, { auditPending: true }, { queued: true }, { providerAccepted: false },
+    { compactStartConfirmed: false }, { compactOperationId: '' }, { handoffId: 'foreign' },
+    { localCommandProof: 'ordinary-user-audit' }, { deliveryOutcome: 'audit-confirmed' },
+    { entryUuid: 'real-user' }, { sourceIdentity: 'real-source' }, { sourceIdentityAliases: ['real-source'] },
+    { attemptId: 'foreign' }, { provider: 'claude' }, { toolType: 'claude' }]) {
+    assert.equal(compactSendReceiptPresentation({ ...record, receipt: { ...legacyB5, ...patch } }), null,
+      JSON.stringify(patch));
+  }
+  assert.equal(compactSendReceiptPresentation({ ...record, receipt: { promptText: '/compact' } }), null,
+    'command spelling/title/time cannot classify a receipt');
+});
+
+test('incomplete or foreign bound owner cannot supply a historical scope', t => {
+  const f = fixture(t); f.start();
+  const record = f.record();
+  const owner = record.receipt.compactOperationOwner;
+  for (const field of ['version', 'sendOperationKey', 'sendAttemptId', 'operationId', 'tabId', 'handoffId',
+    'provider', 'sessionId', 'generation', 'promptGeneration', 'sourceByteOffset', 'causalBoundaryEventSequence']) {
+    const invalid = { ...owner, [field]: typeof owner[field] === 'number' ? -1 : '' };
+    assert.equal(compactSendReceiptPresentation({ ...record,
+      receipt: { ...record.receipt, compactOperationOwner: invalid } }), null, field);
+  }
+});
+
+test('GET never forwards stale stored service presentation on an unconfirmed receipt', async t => {
+  const f = fixture(t);
+  f.db.prepare('UPDATE agent_send_receipts SET receipt_json=? WHERE operation_key=?')
+    .run(JSON.stringify({ serviceCommand: { historyPresentation: 'operation-only', kind: 'compact' } }), f.identity.operationKey);
+  assert.equal((await httpReceipt(f.store)).body.receipts[0].serviceCommand, undefined);
 });
 
 test('pending and causal start without terminal proof never retire the local compact journal', t => {

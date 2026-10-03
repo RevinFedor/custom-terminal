@@ -37,6 +37,7 @@ export interface SendAgentPromptScenarioArgs {
   toolType: AgentHistoryTool;
   runtime: HistoryAgentRuntime;
   sessionId?: string | null;
+  expectedTarget?: import('./historyAgentRuntimes').AgentSendTarget;
   cwd?: string;
   prompt: string;
   handoffId?: string;
@@ -132,6 +133,7 @@ async function runAgentPromptScenario({
   toolType,
   runtime,
   sessionId,
+  expectedTarget,
   cwd,
   prompt,
   handoffId,
@@ -220,6 +222,7 @@ async function runAgentPromptScenario({
       const readyForSend = await adapter.ensureReady({
         sendOperationKey, sendAttemptId,
         sessionId: context.recordWithoutReply ? context.restartSessionId : sessionId,
+        expectedTarget: context.recordWithoutReply ? undefined : expectedTarget,
         cwd,
         coordinatedSendToken,
         requestedStatusAtSend: context.requestedStatusForSend,

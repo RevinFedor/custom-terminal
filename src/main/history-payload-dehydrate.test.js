@@ -5,6 +5,7 @@ const {
   dehydrateHistoryEntries,
   capPayloadForRender,
   HISTORY_PAYLOAD_RENDER_CAP,
+  historyPayloadHash,
 } = require('./history-payload-dehydrate');
 
 const bigText = (fill, chars) => fill.repeat(Math.ceil(chars / fill.length)).slice(0, chars);
@@ -27,7 +28,7 @@ test('dehydrates a heavy raw tool result into preview + ref and stashes the orig
   const rawTool = entries[0].actions[0].rawTool;
   assert.ok(rawTool.result.length < original.length);
   assert.ok(rawTool.result.includes('полный вывод загрузится'));
-  assert.deepEqual(rawTool.resultRef, { payloadId: 'result:toolu_01', totalChars: original.length });
+  assert.deepEqual(rawTool.resultRef, { payloadId: 'result:toolu_01', totalChars: original.length, contentHash: historyPayloadHash(original) });
   assert.equal(stash.get('claude', 's1', 'result:toolu_01'), original);
 });
 

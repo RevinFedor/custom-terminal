@@ -315,6 +315,11 @@ class AgentSendReceiptStore {
         ON ${TABLE_NAME}(state, updated_at);
       CREATE INDEX IF NOT EXISTS idx_agent_send_receipts_tab_handoff
         ON ${TABLE_NAME}(tab_id, handoff_id);
+      CREATE TABLE IF NOT EXISTS agent_send_receipt_pins (
+        operation_key TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        PRIMARY KEY (operation_key, owner)
+      );
     `);
     const existingColumns = new Set(
       this.db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all().map((row) => row.name),
@@ -550,6 +555,7 @@ class AgentSendReceiptStore {
         WHERE state IN ('confirmed', 'not-submitted', 'provider-not-accepted')
           AND settled_at IS NOT NULL
           AND settled_at <= ?
+          AND operation_key NOT IN (SELECT operation_key FROM agent_send_receipt_pins)
       `),
     };
   }
@@ -1745,6 +1751,16 @@ class AgentSendReceiptStore {
       }
       return { changed, records: this.list() };
     })();
+  }
+
+  pinForOwner(operationKey, owner) {
+    this.db.prepare('INSERT OR IGNORE INTO agent_send_receipt_pins(operation_key, owner) VALUES (?, ?)')
+      .run(requiredString(operationKey, 'operationKey'), requiredString(owner, 'owner'));
+  }
+
+  unpinForOwner(operationKey, owner) {
+    this.db.prepare('DELETE FROM agent_send_receipt_pins WHERE operation_key = ? AND owner = ?')
+      .run(requiredString(operationKey, 'operationKey'), requiredString(owner, 'owner'));
   }
 
   prune(timestamp = this.now()) {

@@ -38,6 +38,7 @@ function fixture({ fresh = false } = {}) {
     claudeLaunchGenerationByTab: new Map([['T', { generation: 'launch-1', pid: 28777 }]]),
     admitClaudeMainHook, resolveClaudeHookTab,
     taskCompletionIntents: new TaskCompletionIntentRegistry(), loopTaskCompletionEligibility,
+    taskCompletionOutcomeMeta: require('./task-completion-intent').taskCompletionOutcomeMeta,
     claudeHookLastEvent: new Map(), claudeTurnBusy: new Map(), claudeSpinnerBusy: new Map(),
     claudeSpinnerLastSeenAt: new Map(), claudeSpinnerIdleTimer: new Map(),
     claudeTurnWatchdog: new Map(), claudeAwaitingInput: new Map(), claudePendingQuestion: new Map(),
@@ -186,6 +187,18 @@ test('actual main: duplicate exact start preserves generation, completion intent
   assert.equal(h.preview.length, 1);
   h.hook('Stop');
   assert.equal(h.ipc.filter(event => event.channel === 'claude:turn-state').at(-1).explicitTaskComplete, true);
+});
+
+test('actual main Stop publishes a blocked Loop outcome separately from task completion', () => {
+  const h = fixture();
+  h.hook('UserPromptSubmit');
+  h.context.taskCompletionIntents.authorizeCompletion({ tabId: 'T', provider: 'claude' });
+  h.context.taskCompletionIntents.requestCompletion({ tabId: 'T', status: 'blocked', reason: 'unlock Mac' });
+  h.hook('Stop');
+  const outcome = h.ipc.filter((event) => event.channel === 'claude:turn-state').at(-1);
+  assert.equal(outcome.explicitTaskBlocked, true);
+  assert.equal(outcome.explicitTaskComplete, false);
+  assert.equal(outcome.taskCompletionReason, 'unlock Mac');
 });
 
 test('actual main preserves existing subagent tool/question handling without making its failure a parent end', () => {

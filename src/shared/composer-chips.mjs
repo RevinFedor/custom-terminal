@@ -809,10 +809,12 @@ function splitHistoryImageParts(text, imagePaths = []) {
   const value = String(text || '');
   const refs = Array.isArray(imagePaths) ? imagePaths : [];
   const refsById = new Map(refs.map((ref) => [Number(ref?.id), ref]));
-  const refsByPath = new Map(refs.flatMap((ref) => {
+  const refsByPath = new Map();
+  for (const ref of refs) {
     const filePath = typeof ref?.path === 'string' ? ref.path.trim() : '';
-    return filePath ? [[filePath, ref]] : [];
-  }));
+    if (filePath) refsByPath.set(filePath, [...(refsByPath.get(filePath) || []), ref]);
+  }
+  const pathOccurrences = new Map();
   const parts = [];
   const re = createHistoryImageMarkerRegex();
   let cursor = 0;
@@ -822,7 +824,9 @@ function splitHistoryImageParts(text, imagePaths = []) {
     const portablePath = match[2] ? match[2].trim() : '';
     const ref = markerId !== null
       ? refsById.get(markerId)
-      : refsByPath.get(portablePath);
+      : refsByPath.get(portablePath)?.[Math.min(pathOccurrences.get(portablePath) || 0,
+        (refsByPath.get(portablePath)?.length || 1) - 1)];
+    if (portablePath) pathOccurrences.set(portablePath, (pathOccurrences.get(portablePath) || 0) + 1);
     // A missing ref must be an explicit error, not ordinary text or a fake
     // thumbnail. Pasted-content/code wrappers are excluded by the caller.
     const error = match[3] || (!ref?.path

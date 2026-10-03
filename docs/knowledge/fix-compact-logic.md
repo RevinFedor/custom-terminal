@@ -147,6 +147,22 @@ Start и completion могут опередить ответ renderer: позд�
 без exact owner не мигрируют по тексту, saved/current SID либо близости времени.
 Форма wire и causal/restart guards — `fact-mobile-web.md::Завершение compact в send receipt`.
 
+02.10 тот же старый B5 снова появился в хвосте iPhone, уже при writer6656e3cc,
+потомке прежнего019efa1f. Installed01.10 содержал новый publisher/store, но
+первоначальная receipt B5 оставалась30.09 start-only без owner/settlement.
+Новый publisher не может задним числом связать потерянный exact attempt.
+Сохранение native journal правильно; восстановление его как НОВОЙ user-строки
+на несвязанном хвосте — отдельный presentation bug. Исторический owner нельзя
+получать из нынешнего SID, ancestry или близкого compact в JSONL.
+
+Main read-only projection теперь отдельно классифицирует такую подтверждённую
+доставку `serviceCommand/historyPresentation:operation-only`, оставляя legacy
+historyScope и completion пустыми. Native должен исключить именно этот replay
+из user-tail merge, сохранив journal/result recovery; ordinary unknown/unsent
+не затронуты. Та же строгая совместимая проверка использует уже установленные
+typed proof-поля B5, без новой установки Main. Это не backfill успеха, не скрытие
+живого COMPACTING и не удаление canonical slash/compactSummary.
+
 #### Exclusive EOF semantics (2026-07-31)
 
 Manual Codex `/compact` stores the watcher/file EOF as an exclusive source

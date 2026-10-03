@@ -5,7 +5,7 @@ VSCode-style полоса по всей нижней границе окна (п
 **Зачем существует.** Глобальный хост для индикаторов и переключателей, которые:
 - применимы ко **всему** приложению (не привязаны к конкретному табу/проекту);
 - редко используются — не хочется отдавать им место в InfoPanel/TabBar;
-- должны быть всегда видны (debug-флаги, default-настройки).
+- требуют постоянного глобального места (debug-флаги, default-настройки).
 
 ## Что живёт сейчас
 
@@ -31,6 +31,13 @@ VSCode-style полоса по всей нижней границе окна (п
 | `H` / `T` pin split | `History pin` (`Cmd+]` / `Option+]`) и `Timeline pin` (`Cmd+\` / `Option+\`) независимо выбирают overlay vs reserved layout для двух разных правых поверхностей | SQLite `app:setState(historyPinned/timelinePinned)` + localStorage boot mirror |
 | `● freeze tooltips` toggle | Cmd-popup'ы Timeline (tooltip / note / fork) не закрываются по Cmd-release / mouseleave — для инспекции DOM в DevTools | SQLite `app:setState(freezeCmdPopups)` + localStorage boot mirror |
 | `⚙` Settings button | Открывает `SettingsModal` | — |
+
+Видимость Claude/Codex default chips следует серым переключателям в футере
+Usage-popover: скрытие провайдера убирает одновременно его лимиты из шапки и
+эту кнопку модели/effort. Общий `useUsageVisibilityStore` сохраняет прежний
+`noted-terminal-usage-visible-providers` через SQLite mirror; изменение сразу
+видно на обеих поверхностях и переживает restart. Значения model/effort не
+сбрасываются, работающие сессии и provider detail в Usage остаются доступны.
 
 **Чип лимитов Claude — не здесь.** Weekly% Anthropic подписки и per-tab token-cost живут в правой части шапки ([`WorkspaceTitleBarTools.tsx`](../../src/renderer/components/Workspace/WorkspaceTitleBarTools.tsx)), не в StatusBar. Причина: chip session-aware (читает `getEffectiveTabId` и активный проект), а status bar — глобальные toggle'ы без привязки к табу. См. [`fact-claude-usage-chip.md`](fact-claude-usage-chip.md).
 

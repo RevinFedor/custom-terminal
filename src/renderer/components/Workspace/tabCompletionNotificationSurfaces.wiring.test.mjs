@@ -13,6 +13,7 @@ const workspaceDir = dirname(fileURLToPath(import.meta.url));
 const rendererDir = join(workspaceDir, '..', '..');
 const signals = readFileSync(join(workspaceDir, 'TabSignals.tsx'), 'utf8');
 const sidebar = readFileSync(join(workspaceDir, 'TabBar.tsx'), 'utf8');
+const menuControls = readFileSync(join(workspaceDir, 'TabNotificationControls.tsx'), 'utf8');
 const pane = readFileSync(join(workspaceDir, 'PaneTabChip.tsx'), 'utf8');
 const store = readFileSync(join(rendererDir, 'store/useWorkspaceStore.ts'), 'utf8');
 const css = readFileSync(join(rendererDir, 'styles/globals.css'), 'utf8');
@@ -40,14 +41,16 @@ test('sidebar and pane chip render the same completion-bell visual contract', ()
 });
 
 test('the two bells keep distinct one-shot and persistent semantics', () => {
-  const menuStart = sidebar.indexOf('data-tab-context-action="notify-once"');
-  const menuEnd = sidebar.indexOf('data-tab-context-action="notify-persistent"', menuStart);
-  const oneShot = sidebar.slice(menuStart, menuEnd);
-  const persistent = sidebar.slice(menuEnd, sidebar.indexOf('</Tooltip>', menuEnd));
-  assert.match(oneShot, /setTabCompletionNotificationArmed\(projectId, contextMenu\.tabId, !oneShotActive\)/);
+  const menuStart = menuControls.indexOf('data-tab-context-action="notify-once"');
+  const menuEnd = menuControls.indexOf('data-tab-context-action="notify-persistent"', menuStart);
+  const oneShot = menuControls.slice(menuStart, menuEnd);
+  const persistent = menuControls.slice(menuEnd, menuControls.indexOf('</Tooltip>', menuEnd));
+  assert.match(oneShot, /onOnce\(!oneShotActive\)/);
+  assert.match(sidebar, /onOnce=\{enabled => setTabCompletionNotificationArmed\(projectId, contextMenu\.tabId, enabled\)\}/);
   assert.doesNotMatch(oneShot, /title=\{notificationTitle\}/, 'bell help must use the custom tooltip, never native title');
-  assert.match(sidebar.slice(sidebar.lastIndexOf('<Tooltip', menuStart), menuEnd), /content=\{notificationTitle\}/);
-  assert.match(persistent, /setTabCompletionNotificationPersistent\(projectId, contextMenu\.tabId, !isPersistent\)/);
+  assert.match(menuControls.slice(menuControls.lastIndexOf('<Tooltip', menuStart), menuEnd), /content=\{notificationTitle\}/);
+  assert.match(persistent, /onPersistent\(!persistent\)/);
+  assert.match(sidebar, /onPersistent=\{enabled => setTabCompletionNotificationPersistent\(projectId, contextMenu\.tabId, enabled\)\}/);
   assert.match(oneShot, /<TabCompletionNotificationIcon color=\{tint\}/);
   assert.match(persistent, /<TabCompletionNotificationIcon persistent/);
   assert.doesNotMatch(oneShot + persistent, /<BellRing/);

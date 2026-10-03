@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { applyWindowDisplay, reconcileWindowDisplay, revealHiddenWindow, reconcileWorkspaceDisplayPatch } from './windowDisplayLayouts.mjs';
-import { paneGridRects, paneColumns, paneTabs, dropTabFromAllPaneStrips, sanitizePanes, removePaneAt, addTabToPane } from './splitPanesModel.mjs';
+import { paneGridRects, paneColumns, paneTabs, paneSlots, selectChooserSlot, dropTabFromAllPaneStrips, sanitizePanes, removePaneAt, addTabToPane } from './splitPanesModel.mjs';
 import { buildSessionSnapshot } from './sessionSnapshot.mjs';
 import { captureSpaceLayout, restoreSpaces } from './workspaceSpacesModel.mjs';
 import { applyWorkspaceWindowMutation } from './workspaceWindowMutation.mjs';
@@ -121,4 +121,129 @@ test('store boundary covers dormant layouts and skips non-layout traffic', () =>
   assert.deepEqual(visible(next.spaces[1].layout), ['a', 'b']);
   assert.deepEqual(reconcileWorkspaceDisplayPatch(next, { unrelated: 1 }), { unrelated: 1 });
   assert.equal(captureSpaceLayout(next).windowDisplayKey, 'builtin');
+});
+
+function mixedHiddenLayout() {
+  const layout = original();
+  layout.splitPanes.forEach(pane => { pane.windowId = 'window-' + pane.tabId; });
+  layout.splitPanes[1].tabs = [
+    { projectId: 'p', tabId: 'b' }, { slotId: 'outgoing-slot', projectId: 'p', cwd: '/outgoing' },
+  ];
+  Object.assign(layout.splitPanes[2], {
+    tabs: [
+      { slotId: 'leading', projectId: 'p', cwd: '/leading' },
+      { projectId: 'p', tabId: 'c' },
+      { slotId: 'middle', projectId: 'q', cwd: '/middle' },
+      { projectId: 'q', tabId: 'c2' },
+      { slotId: 'trailing', projectId: 'p', cwd: '/trailing' },
+    ],
+    history: [{ projectId: 'p', tabId: 'older' }],
+    detachedTabs: [{ projectId: 'p', tabId: 'detached', closedOrder: 9 }],
+  });
+  return applyWindowDisplay(applyWindowDisplay(layout, big), small);
+}
+
+function freeze(value) {
+  if (value && typeof value === 'object') {
+    Object.values(value).forEach(freeze);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+test('reveal selects a parked cross-project tab without changing mixed order or other window content', () => {
+  const layout = freeze(mixedHiddenLayout());
+  const incoming = layout.splitPanes[2];
+  const next = revealHiddenWindow(layout, 1, incoming.windowId, { projectId: 'q', tabId: 'c2' });
+  assert.equal(next.splitFocusedIndex, 1);
+  assert.equal(next.splitPanes[1].projectId, 'q');
+  assert.equal(next.splitPanes[1].tabId, 'c2');
+  assert.equal(next.splitPanes[1].selectedSlotId, undefined);
+  assert.deepEqual(paneSlots(next.splitPanes[1]), paneSlots(incoming));
+  assert.deepEqual(next.splitPanes[1].history, [
+    { projectId: 'p', tabId: 'c' }, { projectId: 'p', tabId: 'older' },
+  ]);
+  assert.deepEqual(next.splitPanes[1].detachedTabs, incoming.detachedTabs);
+  assert.deepEqual(next.splitPanes[2], {
+    ...layout.splitPanes[1], displayHidden: true,
+    displayRect: paneGridRects(layout.splitPanes, layout.splitSizes)[1],
+  });
+  assert.equal(next.splitPanes[0], layout.splitPanes[0]);
+  assert.equal(next.splitPanes[3], layout.splitPanes[3]);
+  assert.equal(next.splitSizes, layout.splitSizes);
+  assert.equal(next.windowDisplayLayouts, layout.windowDisplayLayouts);
+});
+
+test('chooser reveal keeps every chip and retains an already selected chooser', () => {
+  const layout = freeze(mixedHiddenLayout());
+  const next = revealHiddenWindow(layout, 0, 'window-c', { slotId: 'middle' });
+  assert.equal(next.splitPanes[0].tabId, '');
+  assert.equal(next.splitPanes[0].projectId, '');
+  assert.equal(next.splitPanes[0].selectedSlotId, 'middle');
+  assert.deepEqual(paneSlots(next.splitPanes[0]), paneSlots(layout.splitPanes[2]));
+  assert.deepEqual(next.splitPanes[0].history[0], { projectId: 'p', tabId: 'c' });
+
+  const selected = { ...layout, splitPanes: selectChooserSlot(layout.splitPanes, 2, 'middle').panes };
+  for (const selection of [undefined, { slotId: 'middle' }]) {
+    const revealed = revealHiddenWindow(selected, 1, 'window-c', selection);
+    assert.equal(revealed.splitPanes[1].selectedSlotId, 'middle');
+    assert.equal(revealed.splitPanes[1].tabId, '');
+    assert.deepEqual(revealed.splitPanes[1].history, selected.splitPanes[2].history);
+    assert.deepEqual(paneSlots(revealed.splitPanes[1]), paneSlots(selected.splitPanes[2]));
+  }
+  const real = revealHiddenWindow(selected, 1, 'window-c', { projectId: 'q', tabId: 'c2' });
+  assert.equal(real.splitPanes[1].tabId, 'c2');
+  assert.equal(real.splitPanes[1].selectedSlotId, undefined);
+  assert.deepEqual(paneSlots(real.splitPanes[1]), paneSlots(selected.splitPanes[2]));
+});
+
+test('default reveal and explicit current-tab reveal preserve the prior selection and history', () => {
+  const layout = freeze(mixedHiddenLayout());
+  for (const selection of [undefined, { projectId: 'p', tabId: 'c' }]) {
+    const next = revealHiddenWindow(layout, 1, 'window-c', selection);
+    const { displayHidden, displayRect, column, ...content } = layout.splitPanes[2];
+    assert.deepEqual(next.splitPanes[1], { ...content, column: layout.splitPanes[1].column });
+  }
+});
+
+test('foreign, missing and malformed selections fail without changing layout', () => {
+  const layout = freeze(mixedHiddenLayout());
+  const before = JSON.stringify(layout);
+  for (const selection of [
+    { projectId: 'p', tabId: 'b' }, { projectId: 'p', tabId: 'c2' },
+    { projectId: 'q', tabId: 'c' }, { projectId: 'p', tabId: 'missing' },
+    { slotId: 'outgoing-slot' }, { slotId: 'missing' },
+    { projectId: 'p', tabId: 'c', slotId: 'middle' },
+    { projectId: 'p', tabId: 'c', extra: true }, { tabId: 'c' },
+    { projectId: '', tabId: 'c' }, { slotId: '' }, { slotId: 1 }, {}, null, [], 'c',
+  ]) {
+    assert.equal(revealHiddenWindow(layout, 1, 'window-c', selection), null, JSON.stringify(selection));
+    assert.equal(JSON.stringify(layout), before);
+  }
+  for (const targetIndex of [-1, 2, 20, 0.5, NaN]) {
+    assert.equal(revealHiddenWindow(layout, targetIndex, 'window-c', { slotId: 'middle' }), null);
+  }
+  assert.equal(revealHiddenWindow(layout, 1, 'deleted-window', { slotId: 'middle' }), null);
+});
+
+test('repeated reveal is a no-op; swapping back and monitor round trips keep placement and selection', () => {
+  const layout = freeze(mixedHiddenLayout());
+  const next = reconcileWindowDisplay(revealHiddenWindow(layout, 1, 'window-c', { projectId: 'q', tabId: 'c2' }), small);
+  assert.equal(revealHiddenWindow(next, 1, 'window-c', { slotId: 'middle' }), null);
+  assert.deepEqual(next.windowDisplayLayouts.external, layout.windowDisplayLayouts.external);
+  assert.deepEqual(next.windowDisplayLayouts.builtin.positions, [
+    { windowId: 'window-a', column: 0, row: 0 }, { windowId: 'window-c', column: 1, row: 0 },
+  ]);
+  const returned = applyWindowDisplay(next, big);
+  assert.deepEqual(returned.windowDisplayLayouts.external.positions, layout.windowDisplayLayouts.external.positions);
+  assert.deepEqual(returned.splitSizes, layout.windowDisplayLayouts.external.sizes);
+  assert.deepEqual(visible(returned), ['a', 'b', 'c2', 'd']);
+  const laptop = applyWindowDisplay(returned, small);
+  assert.deepEqual(visible(laptop), ['a', 'c2']);
+  const outgoing = revealHiddenWindow(laptop, 1, 'window-b');
+  assert.equal(outgoing.splitPanes[1].tabId, 'b');
+  assert.deepEqual(paneSlots(outgoing.splitPanes[1]), paneSlots(layout.splitPanes[1]));
+  const again = revealHiddenWindow(outgoing, 1, 'window-c');
+  assert.equal(again.splitPanes[1].tabId, 'c2');
+  assert.deepEqual(paneSlots(again.splitPanes[1]), paneSlots(layout.splitPanes[2]));
 });

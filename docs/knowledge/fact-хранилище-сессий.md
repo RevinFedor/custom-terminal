@@ -30,8 +30,8 @@ subagents, `tool-results` и многочисленные `.bak`/`autorepair`/ma
   название, проект и дата видны, но Preview/Resume после удаления невозможны.
 - Таймер можно переопределить по группе: 1/3/7/30 дней либо Never.
 - Renderer не решает, что безопасно удалить. Main отдаёт `deletable`,
-  `protectedReason`, closure и opaque item ID, затем повторно проверяет тот же
-  scan generation перед записью.
+  `protectedReason`, closure и opaque item ID, затем повторно проверяет версии
+  выбранных физических файлов и полный подтверждённый состав удаления.
 
 Отсутствие сессии в текущей prod DB само по себе не является доказательством
 «мусор»: dev/prod имеют разные SQLite, standalone CLI/worktree/subagent могут
@@ -77,6 +77,19 @@ Session groups также пользовательские, а не внутре
 `Required by an open session`. При Cmd-hover общий `ControlHint/Tooltip`
 объясняет определение группы и текущий timer.
 
+`Open now` означает сохранённые открытые вкладки, включая stopped agents,
+а также защищённые родительские файлы и subagents. Сумма не является размером
+только работающих процессов. Codex parent может быть защищён даже при
+self-contained child: provider delete родителя способен удалить открытого
+потомка. `Forks` показывает закрытые ветки; открытые уже входят в `Open now`.
+
+Суммы имеют явные подписи `total / can delete / protected`; `Can delete only`
+убирает protected rows из списка, сохраняя общий размер категории. Это ответ
+на задачу очистки, не изменение защиты. Footer `All categories` и
+`Clean all ready` обозначают общий охват. В `Codex builds` порог возраста
+подписан `Ready after` рядом с `Manual cleanup`: он по-прежнему настраивает
+состав `Clean all ready`, но автоматический sweep build directories не удаляет.
+
 Строка показывает title/UUID, source, date и size. Правая область лениво
 дочитывает iteration count только после явного выбора сессии: раскрытие Storage,
 смена provider или сортировки не выбирают самый большой файл автоматически и
@@ -88,7 +101,7 @@ retention, protection reason и размер provider deletion closure.
 выбирают **весь отфильтрованный массив**, а не только смонтированные Virtuoso
 rows. Shift+Click берёт два ID, находит их индексы в этом массиве и добавляет
 все deletable ID между ними; protected rows пропускаются. Смена provider/group/
-query/date очищает набор, чтобы Delete не затронул скрытые прежним фильтром
+query/date/`Can delete only` очищает набор, чтобы Delete не затронул скрытые прежним фильтром
 строки. Сортировка size/date переключается кликом по заголовку
 `desc ↔ asc`: выбранные ID сохраняются, но Shift-якорь и открытое подтверждение
 сбрасываются, потому что позиционный порядок изменился. `Delete selected`
@@ -108,7 +121,7 @@ retention sweep; initial disclosure после нового запуска че�
 legacy-удаления строка `tabs` может сохраниться вместе с названием, цветом,
 задачами, заметками и последним `context_pct`, хотя provider-файла больше нет.
 Карточка в этом случае не становится «удалённой вкладкой»: её собственный цвет
-сохраняется, справа появляется малиновая полоса + `HistoryOff`, а session-derived
+сохраняется, справа появляется малиновая полоса + `ArchiveX`, а session-derived
 показатели (последний context %, Fast) сереют только когда нет живого runtime.
 Статусы/задачи остаются цветными, process/busy сигнал живого процесса не
 гасится. History показывает явное missing-state; Resume и Copy Session
@@ -150,14 +163,21 @@ materialization verdict управляет `canResume` в Project API: сохр�
 - main-owned runtime session IDs;
 - `du -sk` только для агрегированных build/app directories.
 
-Scan single-flight/cache имеет immutable generation fingerprint по item ID,
-size, mtime, protection и settings. Постоянно растущие protected transcripts в
-fingerprint не входят: они никогда не являются delete-target, а раньше делали
-любое подтверждение stale. Переход `deletable → protected` меняет fingerprint
-и по-прежнему останавливает удаление. Действие передаёт opaque IDs и
-generation; main заново сканирует и отказывает при изменении. Непосредственно
-перед каждой session deletion он ещё раз проверяет runtime и `tabs`, чтобы
-вкладка, открытая после confirmation, не была удалена.
+Scan single-flight/cache сохраняет общий generation fingerprint списка.
+Legacy callers без per-item revisions всё ещё проходят прежнюю проверку всей
+generation. Исключения protected growth оказалось недостаточно: новые или
+растущие deletable файлы в другом разделе делали неизменную выбранную сборку
+stale. Production03.10: disclosure02.10 → Delete03.10 дважды остановился на
+prepare, до mutation. Конкретный изменившийся посторонний ID старый log не писал.
+
+Desktop теперь передаёт main-owned `deletionRevision` каждого выбранного item.
+Main сравнивает physical path/inode, size/mtime, provider/session и protection,
+затем подписывает V2 token с версиями всех известных затрагиваемых файлов,
+включая provider descendants. Confirmation хранит возвращённую main generation,
+а не подставляет более поздний UI snapshot. Изменение постороннего файла не
+отзывает пользовательский выбор; изменение выбранного/затрагиваемого файла,
+расширение provider closure и новый runtime/DB reference по-прежнему запрещают
+удаление. Непосредственный runtime/`tabs` recheck и durable audit сохранены.
 
 Claude tool-results учитываются в размере primary session и удаляются вместе с
 ней. Recovery JSONL с тем же session ID остаётся отдельным item и не становится
@@ -191,7 +211,7 @@ runtime не получает destructive authority даже при доступ
   сначала вызывает `storage:prepare-delete`: main получает exact closure,
   пересчитывает count/bytes и возвращает короткоживущий подписанный token.
   Второй клик Delete обязан предъявить этот token; новый descendant либо другая
-  generation делают confirmation stale до mutation. Так дополнительные нити не
+  версия затрагиваемого файла делают confirmation stale до mutation. Так дополнительные нити не
   могут появиться после уже показанного пользователю состава.
 - После успеха Noted собирает фактические `thread/deleted` notifications.
   Поэтому в результате и аудите перечислены все реально удалённые provider
@@ -202,11 +222,17 @@ runtime не получает destructive authority даже при доступ
 - DB recovery backup можно удалить exact unlink; active DB/Chromium/prompt
   assets защищены своими владельцами.
 
+Отказ проверки/удаления использует общий persistent toast с `Copy`. Короткое
+сообщение отделено от отчёта: phase, operation ID, shown/current generation,
+exact selected IDs/paths и changed-item reasons. Отказ до mutation явно
+сообщает «Nothing was deleted»; частичный результат не выдаётся за нулевое
+удаление. Повторный Delete при in-flight operation блокируется синхронно.
+
 Automatic sweep стартует только в packaged production через 90 секунд после
 app-ready. Dev и E2E не являются владельцами таймера. Один проход ограничен
 25 items либо примерно 2 ГБ и повторяется через 15 минут, пока есть eligible
 leaves; спокойный интервал — шесть часов. Изменение settings перевзводит sweep
-только у production owner. `Clean ready` и `Delete now` используют inline
+только у production owner. `Clean all ready` и `Delete now` используют inline
 two-step confirmation и показывают точный count/bytes.
 
 Большой batch не выглядит зависшим: `storage:delete-progress` несёт

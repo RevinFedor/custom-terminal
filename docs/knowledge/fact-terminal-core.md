@@ -267,6 +267,12 @@ Claude и post-Enter queue/audit Codex — другие фазы, их не за
 deadline или видимость терминального окна. Проверки исполнения и потери
 ответа находятся в `agent-input-observation*.test.js` и actual Send/Stop suites.
 
+Короткие settings-вставки Codex `/model` и `/fast` сохраняют physical receipt,
+если timeout наступил до Enter. Освобождение PTY mutex само по себе не означает,
+что их байты исчезли из composer: поздний echo может прийти уже перед обычным
+Send. Отложенная exact cleanup идёт через тот же writer, Send ждёт вне lock;
+старый empty-frame не разрешает дописать author text к служебной строке.
+
 ### Main-side headless xterm mirror для фонового proof
 
 Main process держит lightweight `@xterm/headless` mirror на tab, который получает тот же PTY stream, что и renderer. Это не новый UI renderer и не замена Canvas: mirror нужен для proof-операций, которые могут идти из фоновой вкладки или API без mounted React terminal. Общие запросы visible snapshot и Codex draft-state сначала читают headless mirror, а renderer `terminalRegistry` остаётся fallback/debug каналом.

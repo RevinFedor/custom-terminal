@@ -1,6 +1,6 @@
 'use strict';
 // Explicit isolated PTY integration, not a production/provider run.
-// ELECTRON_RUN_AS_NODE=1 electron scripts/check-codex-model-input-pty.cjs <artifact-dir> <codex-binary>
+// ELECTRON_RUN_AS_NODE=1 electron scripts/check-codex-model-input-pty.cjs <artifact-dir> <codex-binary> [/model|/fast]
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
@@ -13,6 +13,8 @@ const { Terminal } = require('@xterm/headless');
 const root = path.resolve(__dirname, '..');
 const artifacts = path.resolve(process.argv[2] || '');
 const binary = process.argv[3];
+const controlCommand = process.argv[4] || '/model';
+if (!['/model', '/fast'].includes(controlCommand)) throw Error('explicit short control required');
 if (!artifacts.startsWith('/private/tmp/noted-model-input-repair-') || !binary) throw Error('explicit isolated paths required');
 const fixture = fs.mkdtempSync(path.join(artifacts, 'pty-'));
 const profile = path.join(fixture, 'codex-profile');
@@ -123,6 +125,7 @@ const server = http.createServer((req, res) => {
     pasteInflight: new WeakMap(), ptyActiveWriteOperation: new WeakMap(),
     ptyLastQueuedWriteOperation: new WeakMap(), ptyWriteOwners: new WeakMap(),
     recordComposerForensicPtyInput() {}, scheduleCodexModelEffortIntentReconcile: () => { log('intent-wake'); events.emit('frame'); },
+    scheduleCodexFastIntentReconcile: () => { log('fast-intent-wake'); events.emit('frame'); },
     PASTE_START: '\x1b[200~', PASTE_END: '\x1b[201~', CODEX_SYNC_MARKER: '\x1b[?2026l',
     readCodexPickerWriteRefusal: () => null,
     createMainAgentInputObservation: (_tab, _tool, timeoutMs) => {
@@ -159,7 +162,7 @@ const server = http.createServer((req, res) => {
   const runDelayed = async label => {
     held = true;
     const before = operations.length;
-    const result = await ctx.withPtyWriteLock(term, () => ctx.sendCodexSlashCommand(term, '/model', '[private-' + label + ']', { tabId: 'T' }));
+    const result = await ctx.withPtyWriteLock(term, () => ctx.sendCodexSlashCommand(term, controlCommand, '[private-' + label + ']', { tabId: 'T' }));
     assert.equal(result.submitted, false);
     assert.ok(queue.getUnsubmittedInput(term));
     assert.equal(operations.length, before + 1);
@@ -168,7 +171,7 @@ const server = http.createServer((req, res) => {
     const pending = chunks; chunks = []; pending.forEach(feed);
     await waitFor(() => !queue.getUnsubmittedInput(term) && draft().hasDraft === false, label + ' owned clear');
     assert.equal(closed, false);
-    assert.deepEqual(operations.slice(before), ['\x01\x0b\x1b[200~/model\x1b[201~', '\x01\x0b']);
+    assert.deepEqual(operations.slice(before), ['\x01\x0b\x1b[200~' + controlCommand + '\x1b[201~', '\x01\x0b']);
     fs.writeFileSync(path.join(fixture, label + '-after.txt'), fullScreen());
     log('owned-clear-pass', { label, draft: draft(), processAlive: !closed });
   };
@@ -184,7 +187,7 @@ const server = http.createServer((req, res) => {
   assert.ok([...streams].every(response => !response.destroyed), 'no local stream may be cancelled by cleanup');
   assert.equal(stream.destroyed, false, 'cleanup must not interrupt the active local response');
   assert.match(fullScreen(), /Working|Thinking/);
-  const result = { success: true, fixture, pid: child.pid, requests, provider: 'loopback-only',
+  const result = { success: true, fixture, pid: child.pid, requests, provider: 'loopback-only', controlCommand,
     cases: ['idle-late-echo', 'busy-late-echo'], noControlC: !operations.includes('\x03'), noEnter: !operations.includes('\r') };
   fs.writeFileSync(path.join(fixture, 'result.json'), JSON.stringify(result, null, 2));
   log('PASS', result);

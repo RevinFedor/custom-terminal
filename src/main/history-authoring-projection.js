@@ -118,6 +118,19 @@ function historyAuthoringProjectionFromReceipt(record) {
     parts, requestSha256: sha(proof.requestText), transportSha256: sha(receipt.transportText) });
 }
 
+// Read-only attachment DTO for an already owned local handoff. This is
+// request->transport presentation proof, never a delivery/acceptance ACK.
+function imagePresentationFromReceipt(record) {
+  if (!readPersistedCodexImageRequestProjection(record).valid) return null;
+  const receipt = record.receipt, images = receipt.imageRequestProjection.images;
+  const refs = receipt.expectedImageRefs;
+  if (!Array.isArray(refs) || refs.length !== images.length
+    || images.some((image, index) => refs[index]?.path !== image.sourcePath)) return null;
+  return { version: 1, operationKey: record.operationKey, attemptId: record.attemptId,
+    requestHash: record.promptHash, imagePaths: refs.map((ref, index) => ({ ...ref, id: index + 1,
+      path: images[index].sourcePath, sourcePath: images[index].sourcePath, transportPath: images[index].transportPath })) };
+}
+
 function projectHistoryAuthoringEntry(value, row, entry, imagePaths) {
   const projection = normalizeHistoryAuthoringProjection(value);
   if (!projection || row?.toolType !== 'codex') return null;
@@ -125,12 +138,22 @@ function projectHistoryAuthoringEntry(value, row, entry, imagePaths) {
   const physicalSession = entry?.physicalSessionId || entry?.sessionId;
   if (row.sessionId !== bound.sessionId || physicalSession !== bound.sessionId
     || timestamp(row.auditTimestamp) !== bound.auditTimestamp
-    || timestamp(entry.timestamp) !== bound.auditTimestamp || row.transportHash !== bound.transportHash) return null;
+    || row.transportHash !== bound.transportHash) return null;
   const sources = [entry.sourceIdentity, ...(Array.isArray(entry.sourceIdentityAliases) ? entry.sourceIdentityAliases : [])].filter(nonempty);
   if (entry.uuid !== bound.entryUuid && (!bound.sourceIdentity || !sources.includes(bound.sourceIdentity))) return null;
   const content = typeof entry.fullText === 'string' ? entry.fullText : entry.content;
   if (typeof content !== 'string') return null;
   const nativeSlots = projection.carrier === 'native-image-slots';
+  // response_item -> event_msg promotion keeps an exact physical alias but
+  // may change the timestamp and native text hash. Only that proven carrier
+  // relationship may use the same immutable authoring projection; ordinary
+  // or same-text rows cannot bypass the original timestamp/hash boundary.
+  const pairedCarrier = nativeSlots && bound.sourceIdentity
+    && bound.sourceIdentity !== entry.sourceIdentity
+    && (entry.sourceIdentityAliases || []).includes(bound.sourceIdentity)
+    && timestamp(entry.promptPresentationAuditTimestamp) === timestamp(entry.timestamp)
+    && entry.promptPresentationTransportHash === promptAuditFingerprint(content);
+  if (timestamp(entry.timestamp) !== bound.auditTimestamp && !pairedCarrier) return null;
   if (!nativeSlots && sha(content) !== projection.transportSha256) return null;
   const images = projection.parts.filter(part => part.kind === 'image');
   if (!Array.isArray(imagePaths) || imagePaths.length !== images.length
@@ -138,7 +161,7 @@ function projectHistoryAuthoringEntry(value, row, entry, imagePaths) {
   if (nativeSlots) {
     const rawRefs = entry.imagePaths;
     const hash = entry.promptPresentationTransportHash || promptAuditFingerprint(content);
-    if (hash !== projection.canonicalHash || !Array.isArray(rawRefs) || rawRefs.length !== images.length
+    if ((hash !== projection.canonicalHash && !pairedCarrier) || !Array.isArray(rawRefs) || rawRefs.length !== images.length
       || images.some((image, index) => rawRefs[index]?.id !== image.id
         || ![image.sourcePath, image.transportPath].includes(rawRefs[index]?.path))) return null;
     const match = codexCanonicalUserMessageMatch({ expectedText: projectionText(projection.parts, 'transport'),
@@ -179,4 +202,4 @@ function rebindHistoryAuthoringProjection(value, { sourceSessionId, childSession
 }
 
 module.exports = { historyAuthoringProjectionFromReceipt, normalizeHistoryAuthoringProjection,
-  projectHistoryAuthoringEntry, rebindHistoryAuthoringProjection };
+  projectHistoryAuthoringEntry, rebindHistoryAuthoringProjection, imagePresentationFromReceipt };

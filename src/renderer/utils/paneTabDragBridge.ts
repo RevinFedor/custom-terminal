@@ -1,7 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import {
   createHorizontalDragGeometryCache,
-  horizontalDragAutoScrollDelta,
 } from './horizontalDragGeometry.mjs';
 
 export const PANE_TAB_DND_TYPE = 'PANE_TAB_CHIP_V2';
@@ -199,16 +198,6 @@ export function resolvePaneTabDropTarget(
     : zone.querySelector<HTMLElement>('[data-pane-tab-strip-scroller]') || zone.closest<HTMLElement>('[data-pane-tab-strip-scroller]');
   if (!strip) return null;
   const stripRect = strip.getBoundingClientRect();
-  const wrap = strip.dataset.paneTabStripWrap === 'true';
-  const autoScrollDelta = wrap ? 0 : horizontalDragAutoScrollDelta({
-    clientX,
-    viewportLeft: stripRect.left,
-    viewportRight: stripRect.right,
-    scrollLeft: strip.scrollLeft,
-    scrollWidth: strip.scrollWidth,
-    clientWidth: strip.clientWidth,
-  });
-  if (autoScrollDelta) strip.scrollLeft += autoScrollDelta;
   // The native preview is centered under the pointer, so the pointer itself is
   // the dragged chip's semantic center. No initial grab offset participates in
   // placement; left-edge and right-edge grabs therefore have identical slots.
@@ -222,7 +211,7 @@ export function resolvePaneTabDropTarget(
     viewportTop: stripRect.top,
     scrollLeft: strip.scrollLeft,
     scrollTop: strip.scrollTop,
-    wrap,
+    wrap: true,
     // This callback runs once per target strip and drag gesture. In particular,
     // it does NOT read rectangles again after the live preview starts moving
     // those same chips under the pointer.
@@ -240,12 +229,12 @@ export function resolvePaneTabDropTarget(
     debug: {
       dragCenterX,
       dragCenterY: clientY,
-      wrap,
+      wrap: true,
       viewportLeft: stripRect.left,
       viewportWidth: stripRect.width,
       scrollLeft: strip.scrollLeft,
       scrollWidth: strip.scrollWidth,
-      autoScrollDelta,
+      autoScrollDelta: 0,
     },
   };
 }

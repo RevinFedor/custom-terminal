@@ -759,6 +759,132 @@ physical остаток — `docs/tmp/claude-startup-failure-audit-2026-09-14.md
 
 ## Native clients share the REST/SSE contract
 
+### Canonical settings baseline для ограниченного окна
+
+Source03.10: `historyRead.settingsBaselineVersion=1` и additive `settingsBaseline`
+в Codex History дают два canonical facts ПЕРЕД выбранным окном, не текущие params.
+`before.model/effort` — null либо `{uuid,sourceIdentity,sessionId,timestamp,settingsFact}`;
+`scope` связывает read SID, `revision.token`, payloadGeneration и contentRevision,
+`window` — startIndex/firstUuid/lastUuid/total/hasMoreBelow. Факты читаются из
+прежнего полного row/stub index без body read/длинных aliases/второго reader.
+
+Клиент атомарно сохраняет baseline+rows, затем редуцирует settings внутри окна.
+Только окно без hasMoreBelow может задавать latest live baseline; around несёт
+историческое состояние. Unchanged startup pair не должна сначала появляться и
+затем переезжать/исчезать: unknown live pair ждёт canonical baseline, known
+changed pair не ждёт heavy full History. A→B→A сохраняется; buffered live
+сначала сверяется по exact source/aliases и физической read coverage, не
+накладывается как новый хвост поверх более свежего read. Params/ControlBar
+не являются History authority. `unchanged` сохраняет прежний bound baseline;
+без него нужен fresh nonconditional read, не fallback в current model.
+
+Read-owner/lineage/rewrite или неизвестная stream gap инвалидируют baseline.
+`transcript-changed.sourceRewriteVersion` дополняет прежний physical witness,
+а SSE/IPC `history_settings_reset` v1 с reason `thread_rolled_back`, physical
+sessionId/recordByteOffset сбрасывает live display baseline. Это не settings
+executor ACK и не delivery outcome. Wire/проверки — рабочий result03.10
+`/private/tmp/ios-settings-images-20261003/MAIN-RESULT.md`; установленность там
+отделена от source capability.
+
+### Original image occurrences после transport→native carrier
+
+Canonical Codex imagePaths сохраняют original authored upload `path` и
+`sourcePath`, отдельно `transportPath`; один occurrence не превращается в две
+картинки. `/var/...` не заменяется realpath `/private/var/...`; native footer/ref
+merge — one-to-one по exact paths, intentional same-file repeats сохраняются.
+Response→event promotion может изменить timestamp/hash: decorator принимает
+прежний immutable authoring sidecar только через parser-proven physical alias,
+полный canonical image/body proof и прежний scope, не basename/count/text match.
+Подробный шрам — `fix-codex-image-receipt-projection.md`.
+
+Desktop может дополнить уже существующий local handoff missing image refs из
+read-only `imagePresentation` v1 на прежнем receipt IPC (не HTTP delivery ACK).
+Preview использует тот же mobile upload-root reader, не произвольный transport
+alias. Права `POST /api/mobile-attachments/preview` и 12MB cap не расширены;
+JSONL, literal footer и receipt delivery не переписываются.
+
+### Durable Mac acceptance и единый header Stop
+
+Закрытие телефона не отменяет main-owned send scenario. Галочка «принято Mac»
+допустима по exact same-ID persisted `audit-pending/submitted:true`, доказанному
+providerQueueAccepted или `confirmed/exactAuditConfirmed`. Это Enter/queue/
+canonical delivery соответственно, не завершение ответа. `accepted:true` само
+по себе допускает submitted:null; network transmission, reserved/preparing/
+in-flight/enter-armed не доказывают приём. Раннего публичного outbox/executor ACK
+до submission/queue acceptance нет. Потерянный HTTP ответ сверяется GET той же
+send-receipt, не новым Send; Mac restart не гарантирует автономный retry unknown.
+
+Busy `/interrupt` — прервать текущий turn, idle `/stop` — явный Stop процесса.
+Interrupt ACK не означает idle: следующий queued turn уже может работать.
+Второй click не должен эскалироваться по старому состоянию; нужен свежий
+coherent same-owner status, отдельный process-Stop style и transition gate.
+Точный предел: public `/stop` не принимает атомарный expected-idle-turn/runtime
+precondition и может остановить busy процесс. Клиентское status→POST окно
+гонки не равно server CAS. Текущий source Stop остаётся у прежнего main owner,
+продолжает сценарий после HTTP disconnect; handoff audit drain независим.
+
+### History: скрытые тела только по tap
+
+Source03.10: `/api/me.capabilities.historyPayloads.version=1` и `headerVersion>=2` разрешают
+`GET /api/terminal-tabs/T/history?view=history&last=80&payloads=on-demand-v1`.
+Без capability/opt-in прежний полный ответ неизменен. Нельзя включить режим
+клиенту без rehydration: обрезание ПОСЛЕ скачивания не экономит сеть, а превью
+без exact способа догрузки теряет данные. Обычные user/assistant content полны;
+все actions имеют `actionRef` (JSON), thinking/compact — text refs. Заголовки
+и actionSummary используют прежнюю grammar, максимум512 UTF-16 units на label;
+toolUseId/type/family/status/grouping и row IDs сохраняются. Внутри раскрытого
+action большой result может всё ещё иметь `rawTool.resultRef`: это отдельное
+полное тело по тому же API, не конец вывода. Старый16Ki threshold относится
+к resultRef canonical projection, а не к скрытию action: actionRef есть даже
+для маленькой action. Нет изменения initial full desktop или legacy web.
+
+Первый header-контракт без версии2 был неполным: маленький, в том числе пустой
+успешный result исчезал без resultRef и выглядел как pending; args/diff уносили
+путь и `+N −M`. Теперь actions[] и actionSummary[] несут `hasResult:boolean`
+и `status:running|done|error|waiting|interrupted|unknown`. ActionRef НЕ является
+результатом. Пустая строка — настоящий result; Task/background running сильнее
+наличия acceptance body, explicit completed может быть done ещё без body.
+Typed error не угадывается из текста; Claude Task сохраняет isError результата.
+
+У file-edit action есть `fileChange:{filePath,displayPath,added,removed,countsSource}`:
+оба пути exact, без512-cap, displayPath из той же grammar. Счётчики из canonical
+hunks (`countsSource:hunks`), иначе полных Edit/Update/MultiEdit/Write arguments
+(`arguments`) по тем же минимальным line-diff counts, что desktop. Это статистика
+показанного/proposed diff, не независимое доказательство filesystem success.
+Неизвестные contents/неизмеренный shell write дают оба count=null/source=null;
+удаление без contents несёт canonical diffStatsKnown=false, а не fake0.
+Заведомый no-op может честно иметь0. Неприменённый Patch не выдумывает fileChange.
+Ответ отдаёт `payloadHeaderVersion:2`; версия входит также в service revision,
+public conditional scope/ETag. Старый неполный header не получает unchanged.
+
+Ref содержит `payloadId,totalChars,contentHash,rowUuid,encoding` (`text|json`),
+при наличии сохраняет `recordLine`. GET `/api/terminal-tabs/T/history-payload`
+требует `toolType,sessionId,entryUuid=ref.rowUuid,payloadId,payloadGeneration`
+из History и `contentHash` из ref. `offset` по умолчанию0, `limit`2..4194304
+UTF-16 units (по умолчанию4194304). Ответ: `success,payload,encoding,totalChars,
+offset,nextOffset,payloadId,contentHash,entryUuid,toolType,sessionId,
+payloadGeneration,source,truncatedForRender:false`. `nextOffset:null` означает
+конец; JSON action декодируется после сборки всех страниц. Пара UTF-16 не
+разрывается. contentHash — SHA-256 UTF-8 полного возвращаемого string, до
+декодирования JSON action. Исходные args/diff/result остаются доступны целиком.
+
+До и после read сервер сверяет tab/provider/read SID/cwd. Сам reader заново
+доказывает membership row/ref, generation и hash; frozen Fork использует
+существующий lineage verifier, не текст/title/current-SID inference. Wrong scope,
+rewrite/late changed body дают409; missing row/ref404; bad query/range400;
+недоступный payload-owner503. Это не empty-success и не разрешение очистить чат.
+Клиент сохраняет rows, локально показывает ошибку раскрытия и refresh-ит заголовок;
+после смены ref старый async payload не применяется. Claude source generation
+консервативно меняется и при append; Codex при обычном append сохраняется.
+
+`payloadPolicy` и версия заголовков входят в historyRevision, ETag и HTTP delta consumer scope;
+full↔light и смена окна не дают чужой unchanged/delta. Payload cache клиента
+должен включать tab/tool/read SID, entryUuid, payloadId, generation, hash.
+Режим не предписывает background body prefetch: по согласованному native flow
+загрузка начинается только явным tap. Body transport использует прежние
+SessionTranscriptService/getToolPayload, worker/stash/SSD; PTY/send/receipt
+и native UIKit этим изменением не затронуты.
+
 ### Read-only timing, multiplex и условная History
 
 Capabilities `/api/me`: `responseTiming.version=1`, `tabEvents.version=1`
@@ -875,6 +1001,30 @@ Codex metadata для этого read берётся из main event projection,
 read при событии в полёте. Unconditional full reload, SSE на каждый чат и новый
 локальный учёт длительности не требуются.
 
+### Живые строки модели и effort
+
+Codex main отдаёт уже прочитанный `thread_settings_applied` через существующий
+tab SSE как `{type:"history_entry",toolType:"codex",tabId,sessionId,timestamp,
+recordByteOffset,entry}`. `entry.role="slash"`; `content` — `/model <id>` либо
+`/effort <value>`, `sourceIdentity="codex-<kind>-source-<session>-<offset>"`.
+`entry.settingsFact={version:1,provider:"codex",kind:"model"|"effort",value,
+source:"thread_settings_applied",live:true}` — структурная идентичность и значение,
+не user-message и не fake settings operation. UUID ранней строки равен source
+identity; full History сохраняет прежний line-based UUID, тот же sourceIdentity,
+aliases и settingsFact без live. Полный parser может брать canonical fact из
+старого `turn_context`; его source указан явно.
+
+Native получает готовую запись без ожидания тяжёлого GET History. Повтор пары
+при смене одного поля не должен рожать вторую unchanged строку; сравниваются
+структурные kind/value по текущей History-ветке, не тексты промптов. Canonical
+adoption идёт по sourceIdentity/aliases со стабильным display key. Отсутствие
+первичного UUID у раннего alias не меняет этот key после удаления live-копии;
+связь очищается только с владельцем History/источником. Отсутствие
+canonical строки ещё не mismatch; другой session/следующая model record тоже
+не конфликтуют. Только противоречие value одной exact identity показывается
+рядом со строкой и не меняет input readiness, busy, settings intent или Send.
+Это source wire30.09; native consumer проверяется/реализуется своим владельцем.
+
 ### Завершение compact в send receipt
 
 `GET /api/terminal-tabs/:tabId/send-receipts?handoffId=...` сохраняет прежнюю
@@ -903,6 +1053,33 @@ renderer и не повторяет команду. Pending/unknown/interrupted/
 task_complete без предыдущего compacted не дают `.compact.settled:true`.
 Поздний ответ renderer не стирает settlement. Sent-only квитанции старых
 сборок без этой связи не восстанавливаются по тексту/времени/текущему SID.
+
+#### Старый sent compact без terminal settlement: показ отдельно от журнала
+
+Подтверждённая служебная доставка без canonical user identity не должна при
+reopen/смене сессии/окна History дописываться новой user-карточкой в хвост.
+Это не разрешение объявить compact завершённым или удалить его recovery journal.
+Текущую live operational-phase и первоначальный локальный показ отправки это
+правило не переопределяет; canonical compactSummary/slash остаются на своих местах.
+
+Read-only GET добавляет `serviceCommand` v1: `kind:compact`, `provider:codex`,
+`operationId/operationKey/attemptId/handoffId/tabId`, `delivery:confirmed`,
+`deliveryProof:codex-compact-causal-task-started`,
+`historyPresentation:operation-only`, `historyScope`. Scope бывает только из
+exact bound `compactOperationOwner`: source=compact-operation-owner,
+sessionId/generation/promptGeneration/sourceByteOffset. Это owner, не canonical
+row anchor; у legacy scope=null, независимо от текущего SID и fork ancestry.
+Проекция не пишет SQLite и не меняет delivery/completion/retryability.
+
+На старом сервере тот же узкий признак можно получить из exact своей квитанции:
+confirmed + success/submitted + provider=codex + localSlashCommand=true +
+compactStartConfirmed=true + localCommandProof=codex-compact-causal-task-started
+и deliveryOutcome=local-command-confirmed, непустой compactOperationId,
+без user UUID/source identity. Сначала сверяются tab/handoff/operation/attempt;
+противоречивые поля не разрешают скрытие. Ни текст `/compact`, ни просто sent,
+ни возраст записи не являются классификатором. Ordinary/unknown/unsent prompt
+сохраняет прежнее восстановление. B5 от30.09 уже удовлетворяет legacy-признакам,
+поэтому исправление native merge не обязано ждать установки additive GET.
 
 ### Общие владельцы состояния
 

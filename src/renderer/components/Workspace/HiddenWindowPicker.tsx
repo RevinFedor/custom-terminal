@@ -5,27 +5,13 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { paneSlots } from '../../utils/splitPanesModel.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
-import { getTabChromeColorConfig } from './tabChrome';
-import { TabProcessBar, useTabActivitySignals } from './TabSignals';
+import TabCard from './TabCard';
+import { useUIStore } from '../../store/useUIStore';
+import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 
-type PreviewTab = { id: string; name: string; color?: string; tabType?: string; chooser?: boolean };
-function WindowTabActivity({ tabId }: { tabId: string }) {
-  const activity = useTabActivitySignals(tabId);
-  return <TabProcessBar {...activity} radius={4} />;
-}
-function WindowTabPreview({ tab, shown }: { tab: PreviewTab; shown: boolean }) {
-  const chrome = getTabChromeColorConfig(tab as any);
-  return <span
-    data-hidden-window-tab-id={tab.chooser ? undefined : tab.id}
-    title={tab.chooser ? undefined : `${tab.name}\nCmd+клик или средний клик — убрать из окна`}
-    style={{ position: 'relative', fontSize: 11, padding: '2px 6px',
-    borderRadius: 4, border: `1px solid ${chrome.borderColor}`, background: chrome.bgColor,
-    color: shown ? '#eee' : '#aaa' }}>
-    {!tab.chooser && <WindowTabActivity tabId={tab.id} />}{tab.name}
-  </span>;
-}
+type PreviewTab = { id: string; projectId: string; name: string; chooser?: boolean };
 
-/** Hover previews the hidden windows; clicking a card chooses an entire window. */
+/** Background chooses the window's current selection; a card chooses its exact tab. */
 export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: number; spaceId: string }) {
   const button = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
@@ -33,18 +19,18 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
   const [position, setPosition] = useState({ left: 0, top: 0 });
   const [hoveredWindowId, setHoveredWindowId] = useState<string | null>(null);
   const [openMode, setOpenMode] = useState<'hover' | 'pinned' | null>(null);
+  const tabGap = useUIStore(state => state.tabGeometry.gap);
   const key = useWorkspaceStore(state => {
     if (state.activeSpaceId !== spaceId) return '[]';
     return JSON.stringify(state.splitPanes.filter(p => p.displayHidden).map(pane => ({
       id: pane.windowId,
       shownTabId: pane.selectedSlotId || pane.tabId,
       tabs: paneSlots(pane).map((tab: any) => tab.slotId ? {
-        id: tab.slotId, name: 'Новая вкладка', chooser: true,
+        id: tab.slotId, projectId: tab.projectId || pane.projectId || '', name: 'Новая вкладка', chooser: true,
       } : ({
         id: tab.tabId,
+        projectId: tab.projectId,
         name: state.openProjects.get(tab.projectId)?.tabs.get(tab.tabId)?.name || 'Вкладка',
-        color: state.openProjects.get(tab.projectId)?.tabs.get(tab.tabId)?.color,
-        tabType: state.openProjects.get(tab.projectId)?.tabs.get(tab.tabId)?.tabType,
       })),
     })));
   });
@@ -76,12 +62,21 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
   }, [target]);
   useLayoutEffect(() => {
     if (!target || !button.current || !popup.current) return;
-    const anchor = button.current.getBoundingClientRect();
-    const rect = popup.current.getBoundingClientRect();
-    const next = clampMenuToViewport({ x: anchor.right - rect.width, y: anchor.bottom + 4,
-      width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight });
-    setPosition(previous => previous.left === next.x && previous.top === next.y
-      ? previous : { left: next.x, top: next.y });
+    const place = () => {
+      if (!button.current || !popup.current) return;
+      const anchor = button.current.getBoundingClientRect();
+      const rect = popup.current.getBoundingClientRect();
+      const next = clampMenuToViewport({ x: anchor.right - rect.width, y: anchor.bottom + 4,
+        width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight });
+      setPosition(previous => previous.left === next.x && previous.top === next.y
+        ? previous : { left: next.x, top: next.y });
+    };
+    place();
+    const observer = new ResizeObserver(place);
+    observer.observe(popup.current);
+    observer.observe(button.current);
+    window.addEventListener('resize', place);
+    return () => { observer.disconnect(); window.removeEventListener('resize', place); };
   }, [target, key]);
   useEffect(() => {
     if (!target || openMode !== 'hover') return;
@@ -131,11 +126,23 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
     state.clearTabFromSplitPane(tabId);
     return true;
   };
-  const previewChipFromEvent = (event: React.MouseEvent<HTMLButtonElement>) => (
-    event.target instanceof Element
-      ? event.target.closest<HTMLElement>('[data-hidden-window-tab-id]')
-      : null
-  );
+  const chooseWindow = (candidateId: string, tab?: PreviewTab) => {
+    if (!target) return;
+    const state = useWorkspaceStore.getState();
+    const index = state.splitPanes.findIndex(p => p.windowId === target.windowId && !p.displayHidden);
+    if (state.activeSpaceId !== target.spaceId || state.windowDisplayKey !== target.displayKey || index < 0) {
+      setTarget(null);
+      return;
+    }
+    let selected: Parameters<typeof state.showHiddenWindow>[2];
+    if (tab?.chooser) selected = { slotId: tab.id };
+    else if (tab) selected = { projectId: tab.projectId, tabId: tab.id };
+    if (state.showHiddenWindow(index, candidateId, selected)) {
+      const shown = useWorkspaceStore.getState().splitPanes[index];
+      if (shown?.tabId && !shown.selectedSlotId) requestTabPrimaryInputFocus(shown.tabId, 'hidden-window-picker');
+    }
+    setTarget(null);
+  };
   if (!windows.length) return null;
   return <>
     <button ref={button} type="button" data-hidden-window-picker-button data-split-button
@@ -157,52 +164,48 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
     </button>
     {target && createPortal(<div ref={popup} role="dialog" aria-label="Скрытые окна"
       data-hidden-window-picker style={{ position: 'fixed', ...position, zIndex: 100060,
-        width: 'min(360px, calc(100vw - 16px))', maxHeight: 'min(560px, calc(100vh - 16px))',
-        overflowY: 'auto', padding: 5, background: '#242427', border: '1px solid #444', borderRadius: 7,
+        width: 'min(420px, calc(100vw - 16px))', maxHeight: 'min(560px, calc(100vh - 16px))',
+        display: 'flex', flexDirection: 'column', gap: Math.max(4, tabGap),
+        overflowY: 'auto', padding: 0, background: '#242427', border: '1px solid #444', borderRadius: 7,
         boxShadow: '0 8px 24px #0008' }}>
-      {windows.map(candidate => <button key={candidate.id} type="button" data-hidden-window-id={candidate.id}
-        onMouseEnter={() => setHoveredWindowId(candidate.id)}
+      {windows.map(candidate => <div key={candidate.id} role="button" tabIndex={0} data-hidden-window-id={candidate.id}
+        aria-label={`Показать окно: ${candidate.tabs.map(tab => tab.name).join(', ') || 'Пустое окно'}`}
+        onMouseOver={event => setHoveredWindowId((event.target as Element).closest('[data-tab-card]') ? null : candidate.id)}
         onMouseLeave={() => setHoveredWindowId(current => current === candidate.id ? null : current)}
-        onFocus={() => setHoveredWindowId(candidate.id)}
+        onFocus={event => setHoveredWindowId(event.target === event.currentTarget ? candidate.id : null)}
         onBlur={() => setHoveredWindowId(current => current === candidate.id ? null : current)}
         onClick={event => {
           event.stopPropagation();
-          const previewChip = previewChipFromEvent(event);
-          if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && previewChip) {
-            event.preventDefault();
-            removeHiddenChip(candidate.id, previewChip.dataset.hiddenWindowTabId || '');
-            return;
-          }
-          const state = useWorkspaceStore.getState();
-          const index = state.splitPanes.findIndex(p => p.windowId === target.windowId && !p.displayHidden);
-          if (state.activeSpaceId === target.spaceId && state.windowDisplayKey === target.displayKey && index >= 0) state.showHiddenWindow(index, candidate.id);
-          setTarget(null);
+          chooseWindow(candidate.id);
         }}
-        onMouseDown={event => {
-          if (event.button !== 1 || !previewChipFromEvent(event)) return;
-          event.preventDefault();
-          event.stopPropagation();
+        onKeyDown={event => {
+          if (event.target !== event.currentTarget || !['Enter', ' '].includes(event.key)) return;
+          event.preventDefault(); event.stopPropagation(); chooseWindow(candidate.id);
         }}
-        onAuxClick={event => {
-          if (event.button !== 1) return;
-          const previewChip = previewChipFromEvent(event);
-          if (!previewChip) return;
-          event.preventDefault();
-          event.stopPropagation();
-          removeHiddenChip(candidate.id, previewChip.dataset.hiddenWindowTabId || '');
-        }}
-        style={{ display: 'block', width: '100%', textAlign: 'left', cursor: 'pointer', padding: 8,
-          border: `1px solid ${hoveredWindowId === candidate.id ? 'rgba(255,255,255,0.75)' : '#414148'}`,
-          borderRadius: 5, margin: '3px 0', color: '#ddd',
-          background: hoveredWindowId === candidate.id ? 'rgba(255,255,255,0.10)' : '#1b1b1f',
-          transition: 'background-color 0.12s, border-color 0.12s' }}>
-        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 5 }}>
-          {candidate.tabs.find(tab => tab.id === candidate.shownTabId)?.name || 'Нет вкладки'}
-        </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
-          {candidate.tabs.map(tab => <WindowTabPreview key={tab.id} tab={tab} shown={tab.id === candidate.shownTabId} />)}
-        </div>
-      </button>)}
+        style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: tabGap,
+          width: '100%', minHeight: 28, boxSizing: 'border-box', textAlign: 'left', cursor: 'pointer', padding: 0,
+          border: '1px solid #75658b', borderRadius: 7, margin: 0,
+          background: hoveredWindowId === candidate.id ? 'rgba(255,255,255,0.10)' : 'transparent', transition: 'none' }}>
+        {candidate.tabs.map(tab => <TabCard key={tab.id} as="button" projectId={tab.projectId} tabId={tab.id}
+          chooser={tab.chooser} label={tab.name} shown={tab.id === candidate.shownTabId} showShownStripe showProjectIcon reserveSignalSpace
+          data-hidden-window-tab-id={tab.chooser ? undefined : tab.id}
+          data-hidden-window-slot-id={tab.chooser ? tab.id : undefined}
+          title={tab.chooser ? tab.name : `${tab.name}\nCmd+клик или средний клик — убрать из окна`}
+          style={{ maxWidth: '100%' }}
+          onPointerDown={event => { event.stopPropagation(); if (event.button === 1) event.preventDefault(); }}
+          onClick={event => {
+            event.stopPropagation();
+            if (!tab.chooser && event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+              event.preventDefault(); removeHiddenChip(candidate.id, tab.id); return;
+            }
+            chooseWindow(candidate.id, tab);
+          }}
+          onAuxClick={event => {
+            if (event.button !== 1 || tab.chooser) return;
+            event.preventDefault(); event.stopPropagation(); removeHiddenChip(candidate.id, tab.id);
+          }}
+        />)}
+      </div>)}
     </div>, document.body)}
   </>;
 }

@@ -46,8 +46,8 @@ test('окно под курсором держится геометрией, а
   // Счётчик, панель и открытые из неё блоки входят в кластер. Соседние
   // кнопки rail явно исключены, даже если широкий gap-bridge их перекрывает.
   assert.match(source, /queueCountButtonRef\.current\?\.getBoundingClientRect\(\)/);
-  assert.match(source, /pointInRect\(railRect, event\.clientX, event\.clientY, 0\)/);
-  assert.match(source, /event\.clientX < countRect\.left \|\| event\.clientX > countRect\.right/);
+  assert.match(source, /pointInRect\(railRect, point\.clientX, point\.clientY, 0\)/);
+  assert.match(source, /point\.clientX < countRect\.left \|\| point\.clientX > countRect\.right/);
   assert.doesNotMatch(source, /satellites:[\s\S]{0,100}railRef\.current\?\.getBoundingClientRect\(\)/);
   assert.match(source, /HOVER_CLUSTER_SELECTOR/);
   for (const marker of [
@@ -80,20 +80,17 @@ test('закрытием предпросмотра владеет только 
   );
 });
 
-test('клик по строке превью закрепляет модалку, и кластер закрывается только кликом снаружи', () => {
-  // «Кликаю на строку — сбоку модалка; могу увести курсор куда угодно;
-  // закрывается по клику в другом месте».
-  // 1. Пока модалка открыта, геометрический обход курсора спит.
-  assert.match(
-    source,
-    /if \(dragIdRef\.current\) return;[\s\S]{0,1200}if \(editorOpen\) return;[\s\S]{0,700}queueHoverPreviewPanelRef/,
-  );
-  // 2. Модалка и её превью-сосед рендерятся и в свёрнутом режиме (из ховер-превью).
-  assert.match(source, /const editorSurfaceVisible = \(!collapsed && !panelClosing\) \|\| queueHoverPreviewVisible;/);
+test('клик по строке закрепляет только её редактор, не родительское hover-меню', () => {
+  const hover = source.slice(source.indexOf('const recheckQueueHover ='), source.indexOf('// ─── drag-and-drop reorder'));
+  assert.doesNotMatch(hover, /if \(editorOpen/);
+  assert.match(hover, /el\.dataset\.runAfterHoverOwner === editorLockTokenRef\.current/);
+  assert.doesNotMatch(source, /pinPanelForInteraction|PANEL_SLIDE_MS|panelOpening|panelClosing/);
+  assert.doesNotMatch(source, /onPointerDownCapture/);
+  assert.match(source, /const editorSurfaceVisible = panelOpen \|\| queueHoverPreviewVisible;/);
   assert.match(source, /\{editorSurfaceVisible && editorOpen && editorAnchor && createPortal\(/);
-  // 3. Клик снаружи гасит весь кластер: и модалку, и карточки превью.
+  // Outside click remains an editor exit; hover leave now is also an exit.
   assert.match(source, /commitEditor\(\);[\s\S]{0,300}setQueueHoverPreviewOpen\(false\);/);
-  // 4. Клики ВНУТРИ превью и по счётчику — не «снаружи».
+  // Internal controls still work and do not count as an outside click.
   assert.match(source, /previewPanel\?\.contains\(target\)\) return;/);
   assert.match(source, /previewPanel && queueCountButtonRef\.current\?\.contains\(target\)/);
 });

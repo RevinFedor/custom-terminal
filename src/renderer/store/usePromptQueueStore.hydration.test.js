@@ -29,6 +29,8 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   const syncWrites = [];
   const ipcRenderer = {
     invoke: async (channel, payload) => {
+      if (channel === 'ai-prompts:get') return { success: true, data: [{ id: 'run-after-loop', content: 'continue until done' }] };
+      if (channel === 'ai-prompts:save-content') return { success: true };
       if (channel === 'app:getState') return rawState.promise;
       if (channel === 'prompt-queue:materialize-image-refs') {
         const refs = payload.refs.map((ref) => String(ref.path || '').includes('/missing/')
@@ -392,9 +394,9 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
 
   queueModule.flushPromptQueueStoreSync();
   assert.equal(syncWrites.length, 2);
-  assert.ok(syncWrites.every((write) => write.channel === 'app:setStateSync'));
+  assert.deepEqual(syncWrites.map((write) => write.channel), ['app:setStateSync', 'ai-prompts:save-content-sync']);
   const queueWrite = syncWrites.find((write) => write.payload.key === 'promptQueueByTab');
-  const sharedLoopWrite = syncWrites.find((write) => write.payload.key === 'promptQueueSharedLoopPrompt');
+  const sharedLoopWrite = syncWrites.find((write) => write.payload.id === 'run-after-loop');
   assert.ok(queueWrite);
   assert.ok(sharedLoopWrite);
   const saved = JSON.parse(queueWrite.payload.value);
@@ -424,7 +426,7 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.equal(saved['tab-loop'].loopPromptArmedAt, 81_000);
   assert.equal(saved['tab-loop-runtime'].loopPromptText, undefined);
   assert.equal(saved['tab-loop-runtime'].loopPromptArmedAt, 81_000);
-  assert.equal(JSON.parse(sharedLoopWrite.payload.value), 'finish the remaining work');
+  assert.equal(sharedLoopWrite.payload.content, 'finish the remaining work');
   assert.equal(
     queueModule.usePromptQueueStore.getState().getQueue('tab-loop').loopPromptText,
     'finish the remaining work',

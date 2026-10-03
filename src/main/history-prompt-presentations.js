@@ -289,6 +289,29 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
   });
   const tags = Array.isArray(snapshot?.semanticTags) ? snapshot.semanticTags : [];
   const semanticTags = tags.flatMap((tag, index) => {
+    if (tag?.kind === 'tab-message') {
+      const messageId = typeof tag.messageId === 'string' ? tag.messageId.trim() : '';
+      if (!messageId || !['question', 'reply'].includes(tag.phase)) return [];
+      const value = { id: String(tag.id || `durable-tab-message-tag-${index}`),
+        kind: 'tab-message', messageId, phase: tag.phase };
+      for (const key of ['replyTo', 'sourceTabId', 'sourceTabName', 'sourceProjectId',
+        'targetTabId', 'targetTabName', 'targetProjectId']) {
+        if (typeof tag[key] === 'string' && tag[key].trim()) value[key] = tag[key].trim();
+      }
+      if (Number.isSafeInteger(tag.bodyStart) && tag.bodyStart >= 0
+        && Number.isSafeInteger(tag.bodyEnd) && tag.bodyEnd >= tag.bodyStart) {
+        value.bodyStart = tag.bodyStart;
+        value.bodyEnd = tag.bodyEnd;
+        if (Number.isSafeInteger(tag.envelopeStart) && tag.envelopeStart >= 0 && tag.envelopeStart <= tag.bodyStart) {
+          value.envelopeStart = tag.envelopeStart;
+        }
+        if (typeof tag.envelopeText === 'string' && tag.envelopeText.length <= 16000) value.envelopeText = tag.envelopeText;
+        if (typeof tag.bodyProjectionHash === 'string' && /^[a-f0-9]{64}$/.test(tag.bodyProjectionHash)) {
+          value.bodyProjectionHash = tag.bodyProjectionHash;
+        }
+      }
+      return [value];
+    }
     if (tag?.kind === 'prompt-origin') {
       const source = String(tag.source || '').trim();
       const systemSource = source === 'system' ? systemPromptSource(tag.systemSource) : null;
@@ -316,6 +339,19 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
       kind: 'orchestration',
       runId,
       phase,
+      ...(Number.isSafeInteger(tag.bodyStart) && tag.bodyStart >= 0
+        && Number.isSafeInteger(tag.bodyEnd) && tag.bodyEnd >= tag.bodyStart
+        ? { bodyStart: tag.bodyStart, bodyEnd: tag.bodyEnd,
+          ...(typeof tag.envelopeText === 'string' && tag.envelopeText.length <= 16000 ? { envelopeText: tag.envelopeText } : {}),
+          ...(typeof tag.bodyProjectionHash === 'string' && /^[a-f0-9]{64}$/.test(tag.bodyProjectionHash)
+            ? { bodyProjectionHash: tag.bodyProjectionHash } : {}),
+          ...(Number.isSafeInteger(tag.envelopeStart) && tag.envelopeStart >= 0 && tag.envelopeStart <= tag.bodyStart
+            ? { envelopeStart: tag.envelopeStart } : {}) } : {}),
+      ...(optionalString(tag.sourceTabName) ? { sourceTabName: optionalString(tag.sourceTabName) } : {}),
+      ...(optionalString(tag.targetTabName) ? { targetTabName: optionalString(tag.targetTabName) } : {}),
+      ...(optionalString(tag.sourceProjectId) ? { sourceProjectId: optionalString(tag.sourceProjectId) } : {}),
+      ...(optionalString(tag.targetProjectId) ? { targetProjectId: optionalString(tag.targetProjectId) } : {}),
+      ...(optionalString(tag.runKind) ? { runKind: optionalString(tag.runKind) } : {}),
       ...(optionalString(tag.parentRunId) ? { parentRunId: optionalString(tag.parentRunId) } : {}),
       ...(optionalString(tag.sourceTabId) ? { sourceTabId: optionalString(tag.sourceTabId) } : {}),
       ...(optionalString(tag.targetTabId) ? { targetTabId: optionalString(tag.targetTabId) } : {}),
@@ -444,7 +480,7 @@ function splitPromptPresentationRow(row) {
   return {
     promptChips: chips.filter(item => item?.kind === 'prompt'),
     semanticTags: chips.filter(item => (
-      item?.kind === 'orchestration' || item?.kind === 'prompt-origin'
+      item?.kind === 'orchestration' || item?.kind === 'prompt-origin' || item?.kind === 'tab-message'
     )),
     imagePaths: chips
       .filter(item => item?.kind === 'image-ref')
@@ -841,6 +877,7 @@ function decorateHistoryPromptPresentations(db, {
   const exact = new Map();
   const pending = new Map();
   const pendingBySourceIdentity = new Map();
+  const nativeBySourceIdentity = new Map();
   for (const row of Array.isArray(rows) ? rows : []) {
     if (row.entryUuid) exact.set(row.entryUuid, row);
     pending.set(`${row.auditTimestamp}\u0000${row.transportHash}`, row);
@@ -848,6 +885,16 @@ function decorateHistoryPromptPresentations(db, {
     if (sourceIdentity) {
       pendingBySourceIdentity.set(sourceIdentity,
         pendingBySourceIdentity.has(sourceIdentity) ? null : row);
+    }
+    const nativeProjection = storedAuthoringProjection(row);
+    const nativeSource = nativeProjection?.carrier === 'native-image-slots' ? nativeProjection.binding?.sourceIdentity : null;
+    if (nativeSource) {
+      const prior = nativeBySourceIdentity.get(nativeSource);
+      const same = prior && prior.entryUuid === row.entryUuid && prior.sessionId === row.sessionId
+        && prior.auditTimestamp === row.auditTimestamp && prior.transportHash === row.transportHash
+        && JSON.stringify(storedAuthoringProjection(prior)) === JSON.stringify(nativeProjection);
+      if (!nativeBySourceIdentity.has(nativeSource)) nativeBySourceIdentity.set(nativeSource, row);
+      else if (!same) nativeBySourceIdentity.set(nativeSource, null);
     }
   }
 
@@ -859,6 +906,13 @@ function decorateHistoryPromptPresentations(db, {
       || entry?.kind === 'user';
     if (!isPromptEntry || !entry.uuid) return entry;
     let row = exact.get(entry.uuid) || null;
+    if (!row) {
+      for (const identity of [entry.sourceIdentity, ...(entry.sourceIdentityAliases || [])].filter(Boolean)) {
+        const candidate = nativeBySourceIdentity.get(identity);
+        if (candidate && projectHistoryAuthoringEntry(storedAuthoringProjection(candidate), candidate, entry,
+          splitPromptPresentationRow(candidate).imagePaths)) { row = candidate; break; }
+      }
+    }
     if (!row) {
       const candidates = [{
         auditTimestamp: String(

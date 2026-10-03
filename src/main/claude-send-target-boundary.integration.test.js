@@ -53,6 +53,7 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
     ...require('./prompt-queue-source'),
     ...require('./terminal-paste-profile'),
     ...require('./prompt-audit-fingerprint'),
+    ...require('../shared/agent-local-command.cjs'),
     AGENT_SEND_DURABLE_STATES: require('./agent-send-receipt-store').STORE_STATES,
     Buffer, Date, console: { log() {}, warn() {}, error() {} },
     require, path, crypto: require('node:crypto'), srcMainDir: __dirname,
@@ -60,6 +61,7 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance']]),
     terminalCommandState: new Map([['tab', { runSeq: 7, isRunning: true }]]),
     terminalInputRevisions: new Map([['tab', 1]]),
+    terminalStopRevisions: new WeakMap(),
     getTerminalLifecycleGeneration: () => 'G', getHeadlessTerminalMirror: () => null,
     bridgeKnownSessions: bindings, claudeLaunchGenerationByTab: new Map(), findClaudePidByTab: () => 100,
     mainWindow: null, aiStoppingTabs: new Map(), hasLiveClaudeInTab: () => true,
@@ -93,9 +95,10 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
   const lockEnd = mainSource.indexOf('\nfunction markActivePtySubmit(', lockStart);
   vm.runInContext(mainSource.slice(lockStart, lockEnd), context);
   for (const name of ['getTerminalInputRevision', 'bumpTerminalInputRevision', 'findTabIdForTerm',
+    'getTerminalStopRevision', 'captureAgentInputIdentity', 'agentSendExecutionFailure',
     'pasteAuditHash', 'pasteAuditPreview', 'readAgentSendDestinationAtWriteBoundary',
     'agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure', 'expectedKnownEmptySend', 'assertKnownEmptySend',
-    'safePasteAndSubmit', '_safePasteAndSubmitInner', 'finishSafePasteAfterWrite']) {
+    'safePasteAndSubmit', '_safePasteAndSubmitInner', 'finishSafePasteAfterWrite', 'resolveSafePasteFailureAfterWrite']) {
     vm.runInContext(declaration(mainAst, name), context);
   }
   const settingsRuntime = mainAst.statements.find(node => ts.isVariableStatement(node)

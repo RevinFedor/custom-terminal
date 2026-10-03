@@ -1,6 +1,37 @@
 'use strict';
 
 const crypto = require('crypto');
+const { HISTORY_PAYLOAD_ON_DEMAND, HISTORY_PAYLOAD_LABEL_CHARS, HISTORY_PAYLOAD_HEADER_VERSION,
+  HISTORY_PAYLOAD_RENDER_CAP } = require('./history-payload-dehydrate');
+
+const historyPayloadCapability = Object.freeze({ version: 1, providers: ['codex', 'claude'],
+  headerVersion: HISTORY_PAYLOAD_HEADER_VERSION,
+  historyQuery: { payloads: HISTORY_PAYLOAD_ON_DEMAND }, endpoint: '/api/terminal-tabs/:tabId/history-payload',
+  refFields: ['actions[].actionRef', 'actions[].rawTool.resultRef', 'thinkingRef', 'compactSummaryRef'],
+  previewChars: HISTORY_PAYLOAD_LABEL_CHARS, maxPageChars: HISTORY_PAYLOAD_RENDER_CAP, rangeUnit: 'utf16',
+});
+
+function historyPayloadQuery(query) {
+  const result = {};
+  for (const field of ['toolType', 'sessionId', 'entryUuid', 'payloadId', 'payloadGeneration', 'contentHash']) {
+    const value = query[field];
+    if (typeof value !== 'string' || !value || value.length > 2048 || /[\x00-\x1f]/.test(value)) {
+      throw Error('history_payload_reference_required');
+    }
+    result[field] = value;
+  }
+  if (!['codex', 'claude'].includes(result.toolType) || !/^[a-f0-9]{64}$/.test(result.contentHash)) {
+    throw Error('history_payload_reference_required');
+  }
+  for (const [field, fallback, min, max] of [['offset', 0, 0, Number.MAX_SAFE_INTEGER],
+    ['limit', HISTORY_PAYLOAD_RENDER_CAP, 2, HISTORY_PAYLOAD_RENDER_CAP]]) {
+    const value = query[field];
+    const number = value === undefined ? fallback : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
+    if (!Number.isSafeInteger(number) || number < min || number > max) throw Error('history_payload_range_invalid');
+    result[field] = number;
+  }
+  return { ...result, payloadPolicy: HISTORY_PAYLOAD_ON_DEMAND };
+}
 
 const MAX_EVENT_TABS = 32;
 
@@ -141,4 +172,5 @@ class TabTranscriptSubscriptions {
   }
 }
 
-module.exports = { MAX_EVENT_TABS, eventTabIds, stampedEventSink, PublicHistoryRevisions, TabTranscriptSubscriptions };
+module.exports = { MAX_EVENT_TABS, eventTabIds, stampedEventSink, PublicHistoryRevisions, TabTranscriptSubscriptions,
+  historyPayloadCapability, historyPayloadQuery };

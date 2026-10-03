@@ -35,3 +35,19 @@ test('CommonJS and browser prompt-origin projections remain identical and preser
     assert.equal(cjs.withPromptOriginPresentation(projected, source), projected);
   }
 });
+
+test('durable tab messages are service prompts, not system or orchestration runs, in both module formats', async () => {
+  const esm = await import('./prompt-origin.mjs');
+  for (const api of [cjs, esm]) {
+    for (const phase of ['question', 'reply']) {
+      const tag = { kind: 'tab-message', phase, messageId: 'm', sourceTabId: 'a', targetTabId: 'b', replyTo: phase === 'reply' ? 'q' : null };
+      const entry = { semanticTags: [tag] };
+      assert.equal(api.isServicePromptEntry(entry), true);
+      assert.equal(api.isSystemPromptEntry(entry), false);
+      assert.equal(api.getTabMessageTag(entry), tag);
+      assert.equal(tag.runId, undefined);
+      assert.equal(api.isServicePromptEntry({ semanticTags: [{ ...tag, messageId: '' }] }), false);
+    }
+    assert.equal(api.isServicePromptEntry({ content: 'tab-message messageId=m phase=reply' }), false);
+  }
+});

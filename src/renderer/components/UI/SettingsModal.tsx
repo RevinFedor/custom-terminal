@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useUIStore, type DisplayContext, type DisplaySizeKey } from '../../store/useUIStore';
-import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel, PROMPT_SUMMARY_PROMPT_ID } from '../../store/usePromptsStore';
+import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel, PROMPT_SUMMARY_PROMPT_ID, RUN_AFTER_LOOP_PROMPT_ID } from '../../store/usePromptsStore';
 import { GEMINI_MODEL_OPTIONS, legacyGeminiModelLabel } from '../../constants/geminiModels';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
@@ -1800,6 +1800,16 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [filePathInputs, setFilePathInputs] = useState<{ value: string; valid: boolean | null }[]>([]);
   const [savedFlashField, setSavedFlashField] = useState<'name' | 'content' | null>(null);
   const savedFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previousLoopPromptContent = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const content = aiPrompts.find((prompt) => prompt.id === RUN_AFTER_LOOP_PROMPT_ID)?.content;
+    if (editingPromptId === RUN_AFTER_LOOP_PROMPT_ID && content !== undefined) {
+      const previous = previousLoopPromptContent.current;
+      // Follow external edits unless this textarea owns an unsaved local draft.
+      setLocalPromptContent((current) => current === previous ? content : current);
+    }
+    previousLoopPromptContent.current = content;
+  }, [aiPrompts, editingPromptId]);
   const [aiUsageRange, setAIUsageRange] = useState<AIUsageRange>('week');
   const [aiUsageStats, setAIUsageStats] = useState<any | null>(null);
   const [aiUsageLoading, setAIUsageLoading] = useState(false);
@@ -3106,6 +3116,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           </div>
         );
       }
+      const isLoopPrompt = editingAIPrompt.id === RUN_AFTER_LOOP_PROMPT_ID;
 
       const saveField = (overrides: Partial<AIPrompt>) => {
         saveAIPrompt({
@@ -3176,7 +3187,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               />
             </VRField>
 
+            {isLoopPrompt && <div style={{ color: VR_DIM, fontSize: 11.5, lineHeight: 1.5 }}>
+              Общий текст Loop. Выполняется агентом своей вкладки с её моделью и effort.
+              Завершённая задача или явная блокировка останавливает повторение; незавершённая доступная работа продолжается.
+            </div>}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {!isLoopPrompt && <>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Model:</span>
                 {legacyGeminiModelLabel(localPromptModel) && (
@@ -3208,6 +3224,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 ))}
               </div>
 
+              </>}
               {editingAIPrompt.id === PROMPT_SUMMARY_PROMPT_ID && (
                 <FontSizeSlider
                   label="Предыдущие user-сообщения"
@@ -3231,7 +3248,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 ))}
               </div>
 
-              <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: VR_DIM, fontSize: 11.5 }}>
+              {!isLoopPrompt && <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: VR_DIM, fontSize: 11.5 }}>
                 <span>Show in context menu:</span>
                 <button
                   onClick={(e) => {
@@ -3245,7 +3262,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 >
                   <span style={{ width: 13, height: 13, borderRadius: '50%', backgroundColor: '#fff', position: 'absolute', top: 2, left: localPromptShowInMenu ? 15 : 2, transition: 'left 0.2s' }} />
                 </button>
-              </label>
+              </label>}
             </div>
 
             <VRField label="Prompt">
@@ -3259,7 +3276,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               />
             </VRField>
 
-            <VRSection title="Files appended to prompt" onAdd={pickFile} addLabel="Finder">
+            {!isLoopPrompt && <VRSection title="Files appended to prompt" onAdd={pickFile} addLabel="Finder">
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {localPromptFilePaths.map((fp, idx) => (
                   <div key={`${fp}-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: 7, border: `1px solid ${VR_BORDER}`, background: VR_FIELD, borderRadius: 7, padding: '6px 8px' }}>
@@ -3309,7 +3326,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   </button>
                 </div>
               </div>
-            </VRSection>
+            </VRSection>}
 
             {!editingAIPrompt.isBuiltIn && (
               <button onClick={() => { deleteAIPrompt(editingAIPrompt.id); setEditingPromptId(null); showToast('Deleted', 'success'); }} style={{ alignSelf: 'flex-start', padding: 0, background: 'transparent', border: 'none', color: '#ff6b6b', fontSize: 12, fontWeight: 650, cursor: 'pointer' }}>
@@ -3364,8 +3381,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 >
                   <span style={{ width: 8, height: 8, borderRadius: '50%', background: displayColor, flexShrink: 0 }} />
                   <div style={{ flex: 1, minWidth: 0, color: isSelected ? '#bfdbfe' : VR_TEXT, fontWeight: 620, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
-                  <VRTag accent={displayModel.includes('pro')}>{displayModel.includes('pro') ? 'PRO' : 'FLASH'}</VRTag>
-                  {displayThinking !== 'HIGH' && <VRTag>{displayThinking === 'NONE' ? 'DEFAULT' : displayThinking}</VRTag>}
+                  {aiPrompt.id === RUN_AFTER_LOOP_PROMPT_ID ? <VRTag>АГЕНТ ВКЛАДКИ</VRTag> : <>
+                    <VRTag accent={displayModel.includes('pro')}>{displayModel.includes('pro') ? 'PRO' : 'FLASH'}</VRTag>
+                    {displayThinking !== 'HIGH' && <VRTag>{displayThinking === 'NONE' ? 'DEFAULT' : displayThinking}</VRTag>}
+                  </>}
                   {displayMenu && <VRTag>MENU</VRTag>}
                 </div>
               );
@@ -3378,7 +3397,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 onChange={(e) => setRewindPromptId(e.target.value)}
                 style={{ ...vrFieldStyle, height: 32, cursor: 'pointer' }}
               >
-                {aiPrompts.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                {aiPrompts.filter((p) => p.id !== RUN_AFTER_LOOP_PROMPT_ID).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
             </div>
 

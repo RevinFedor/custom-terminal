@@ -30,6 +30,28 @@ function identity(overrides = {}) {
   };
 }
 
+test('message owner pins survive receipt retention until the delivered state is durably recorded', (t) => {
+  const h = openMemoryHarness(t, { now: () => 100, settledRetentionMs: 10 });
+  if (!h) return;
+  const store = h.store;
+  const request = identity();
+  store.pinForOwner(request.operationKey, 'tab-message');
+  store.reserveOrGet(request);
+  const attempt = store.beginAttempt(request);
+  store.settleAttempt(request.operationKey, attempt.attemptId, { success: true, accepted: true,
+    submitted: true, status: 'sent', exactAuditConfirmed: true });
+  assert.equal(store.get(request.operationKey).state, STORE_STATES.CONFIRMED);
+  store.prune(1000);
+  assert.ok(store.get(request.operationKey), 'a crashed message projection can still recover positive delivery');
+  store.pinForOwner(request.operationKey, 'another-owner');
+  store.unpinForOwner(request.operationKey, 'tab-message');
+  store.prune(1000);
+  assert.ok(store.get(request.operationKey), 'each owner releases only its own pin');
+  store.unpinForOwner(request.operationKey, 'another-owner');
+  store.prune(1000);
+  assert.equal(store.get(request.operationKey), null);
+});
+
 function exactAudit(attemptId, overrides = {}) {
   return {
     success: true,

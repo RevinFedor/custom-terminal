@@ -1,5 +1,6 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
+import { historyImageRuns } from '../../utils/historyImageRuns.mjs';
 import HistorySearchBar from './HistorySearchBar';
 import {HISTORY_SEARCH_PAGE_SIZE, searchHistoryEntries, historySearchEntryKeys} from '../../../shared/history-search.mjs';
 import {publishHistorySearchMarkers, clearHistorySearchMarkers, useHistorySearchMarkers, consumeHistorySearchRequest} from '../../utils/historySearchMarkers';
@@ -363,6 +364,7 @@ import {
   historyPromptHandoffStatusPresentation,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
   hydrateHistoryPromptHandoffFromDurableReceipt,
+  hydrateHistoryPromptHandoffImages,
   legacyOrchestrationCompletionMatchesCanonicalEntry,
   reconcileHistoryPromptHandoffRows,
   retractHistoryPromptHandoff,
@@ -389,7 +391,10 @@ import { planHistoryPromptPresentationDismissal } from '../../utils/historyPromp
 import {
   resolveHistoryOrchestrationHandoffPresentation,
   resolveHistoryOrchestrationPromptPresentation,
+  projectHistoryServicePromptBody,
+  resolveHistoryPromptSender,
 } from '../../utils/historyOrchestrationPromptPresentation.mjs';
+import { TabMessageSourceChip } from './TabMessageSourceChip';
 import {
   formatHistoryResponseCompletedAt,
   historyResponseTailLabel,
@@ -450,6 +455,9 @@ import {
 } from './HistoryTranscriptPresentation';
 
 const { ipcRenderer, clipboard } = window.require('electron');
+const historyServicePromptFingerprint = (text: string): string => (
+  window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex')
+);
 export const HISTORY_SURFACE_PRESENTATION_EVENT = 'history-panel:external-presentation';
 
 const HISTORY_SLASH_COMMANDS = [
@@ -547,6 +555,7 @@ const historyMeasuredUnitKey = (unit: any): string => {
     'entry',
     historyVirtuosoUnitKey(unit),
     typeof entry.content === 'string' ? entry.content.length : 0,
+    entry.settingsProjectionError || '',
     entry.rowStub ? 'stub' : 'full',
     Array.isArray(entry.promptChips) ? entry.promptChips.length : 0,
     Array.isArray(entry.imagePaths) ? entry.imagePaths.length : 0,
@@ -633,6 +642,8 @@ const historyActionToolUseId = (action: Action) => {
 };
 
 interface FullHistoryEntry {
+  settingsProjectionError?: string;
+  settingsFact?: { version: number; provider: string; kind: string; value: string; source: string; live?: boolean };
   rewriteRenderKey?: string;
   rewriteLayoutUuid?: string;
   uuid: string;
@@ -687,9 +698,23 @@ interface FullHistoryEntry {
   recordByteOffset?: number;
   semanticTags?: Array<{
     id?: string;
-    kind: 'orchestration' | 'prompt-origin';
+    kind: 'orchestration' | 'prompt-origin' | 'tab-message';
     runId?: string;
-    phase?: 'request' | 'completion' | 'failure';
+    phase?: 'request' | 'completion' | 'failure' | 'question' | 'reply';
+    messageId?: string;
+    replyTo?: string | null;
+    sourceTabId?: string;
+    sourceTabName?: string;
+    sourceProjectId?: string;
+    targetTabId?: string;
+    targetTabName?: string;
+    targetProjectId?: string;
+    envelopeStart?: number;
+    envelopeText?: string;
+    bodyProjectionHash?: string;
+    bodyStart?: number;
+    bodyEnd?: number;
+    runKind?: string;
     source?: 'loop' | 'system';
     systemSource?: 'build-install-return' | 'codex-capacity-retry';
     auditSourceIdentity?: string;
@@ -710,6 +735,7 @@ interface FullHistoryEntry {
   // Row-window stub metadata (main ships identity + grouping facts only).
   rowStub?: boolean;
   hasContent?: boolean;
+  contentLength?: number;
   actionSummary?: Array<{
     toolUseId?: string;
     toolName?: string;
@@ -4330,6 +4356,8 @@ const HistoryUserPromptBand = ({
 
 const HistoryUserPromptContent = ({
   text,
+  messageText = text,
+  markdown = false,
   tabId,
   promptChips = [],
   imagePaths = [],
@@ -4338,6 +4366,8 @@ const HistoryUserPromptContent = ({
   presentationParts,
 }: {
   text: string;
+  messageText?: string;
+  markdown?: boolean;
   tabId: string;
   promptChips?: HistoryPromptDraftChip[];
   imagePaths?: HistoryPromptDraftImageRef[];
@@ -4346,8 +4376,8 @@ const HistoryUserPromptContent = ({
   presentationParts?: Array<any>;
 }) => {
   const instructionAttachment = useMemo(
-    () => historyInstructionAttachment(text, toolType),
-    [text, toolType],
+    () => markdown ? null : historyInstructionAttachment(text, toolType),
+    [text, toolType, markdown],
   );
   const [expandedPart, setExpandedPart] = useState<string | null>(null);
   // Раскрытие всего сообщения — отдельное состояние от раскрытия одной части
@@ -4400,13 +4430,14 @@ const HistoryUserPromptContent = ({
 
   if (!hasOpaquePart) {
     const plainText = parts.map((part) => String(part?.text || '')).join('');
+    if (markdown) return <CBMarkdown text={plainText} />;
     return <HistoryCollapsiblePrompt text={plainText} forceExpanded={forceExpanded} />;
   }
 
   // Единица сворачивания — СООБЩЕНИЕ, а не отдельный текстовый кусок. Кнопка
   // сидит на рамке пузыря (сверху и снизу слева), ровно как у обычного длинного
   // сообщения; внутри текста её быть не может.
-  const needsCollapse = mixedMessageNeedsCollapse(parts, HISTORY_USER_TEXT_COLLAPSE_THRESHOLD);
+  const needsCollapse = !markdown && mixedMessageNeedsCollapse(parts, HISTORY_USER_TEXT_COLLAPSE_THRESHOLD);
   const open = forceExpanded || mixedExpanded;
   const visible = needsCollapse && !open
     ? truncateMixedMessageParts(parts, HISTORY_USER_TEXT_COLLAPSED_CHARS)
@@ -4426,17 +4457,9 @@ const HistoryUserPromptContent = ({
     </button>
   ) : null;
 
-  return (
-    <div
-      className="cb-msg-text"
-      data-history-user-composer-flow
-      ref={mixedAnchorRef}
-      style={{ display: 'block' }}
-    >
-      {/* Верхняя кнопка только у раскрытого: у свёрнутого начало видно целиком. */}
-      {open && collapseToggle && <div className="cb-collapse-top">{collapseToggle}</div>}
-      {visible.parts.map((part, index) => {
+  const renderVisiblePart = (part: any, index: number) => {
         if (part.kind === 'text') {
+          if (markdown) return <CBMarkdown key={`text:${index}`} text={part.text} />;
           return (
             <HistoryInlineTextPart
               key={`text:${index}`}
@@ -4463,7 +4486,7 @@ const HistoryUserPromptContent = ({
               </span>
               {forceExpanded && (
                 chip.contextUpdateId
-                  ? <SentContextUpdatePreview tabId={tabId} messageText={text} chip={chip}
+                  ? <SentContextUpdatePreview tabId={tabId} messageText={messageText} chip={chip}
                     clampToViewport onNavigate={() => {}} />
                   : <PastedContentPreview text={chip.text} />
               )}
@@ -4473,7 +4496,7 @@ const HistoryUserPromptContent = ({
                   onClose={closePopover}
                 >
                   {chip.contextUpdateId
-                    ? <SentContextUpdatePreview tabId={tabId} messageText={text} chip={chip}
+                    ? <SentContextUpdatePreview tabId={tabId} messageText={messageText} chip={chip}
                       clampToViewport={false} onNavigate={closePopover} />
                     : <PastedContentPreview text={chip.text} clampToViewport={false} />}
                 </HistoryChipPopover>
@@ -4545,7 +4568,24 @@ const HistoryUserPromptContent = ({
             )}
           </React.Fragment>
         );
-      })}
+  };
+
+
+  return (
+    <div
+      className="cb-msg-text"
+      data-history-user-composer-flow
+      ref={mixedAnchorRef}
+      style={{ display: 'block' }}
+    >
+      {/* Верхняя кнопка только у раскрытого: у свёрнутого начало видно целиком. */}
+      {open && collapseToggle && <div className="cb-collapse-top">{collapseToggle}</div>}
+      {historyImageRuns(visible.parts).map((run: any) => run.kind === 'images' ? (
+        <span key={`images:${run.index}`} data-history-image-row
+          style={{ display: 'inline-flex', flexWrap: 'nowrap', gap: 8, maxWidth: '100%', overflowX: 'auto', verticalAlign: 'middle' }}>
+          {run.items.map(({ part, index }: any) => renderVisiblePart(part, index))}
+        </span>
+      ) : renderVisiblePart(run.part, run.index))}
       {/* Многоточие ставится ОДИН раз, за всё сообщение: обрезка принадлежит
           сообщению, а не куску, иначе в одном пузыре было бы несколько «…». */}
       {visible.truncated && '…'}
@@ -4630,11 +4670,14 @@ const HistoryUserEntry = memo(({
     && !!entry.handoffId
     && queueStatus !== 'sent'
     && !!onDismissPromptPresentation;
+  const serviceBody = useMemo(() => projectHistoryServicePromptBody({
+    role: entry.role, content: entry.content, semanticTags: entry.semanticTags,
+  }, historyServicePromptFingerprint), [entry.role, entry.content, entry.semanticTags]);
   const promptPresentation = useMemo(() => buildHistoryComposerPresentationParts({
-    text: entry.content,
+    text: serviceBody.text,
     chips: entry.promptChips,
     imagePaths: entry.imagePaths,
-  }), [entry.content, entry.imagePaths, entry.promptChips]);
+  }), [serviceBody.text, entry.imagePaths, entry.promptChips]);
   const detachedPrompts = useMemo(() => (
     forceExpanded
       ? { promptParts: [] as HistoryPromptPresentationPart[], bodyParts: promptPresentation.parts as Array<any> }
@@ -4643,16 +4686,17 @@ const HistoryUserEntry = memo(({
   const hasDetachedPromptBand = detachedPrompts.promptParts.length > 0;
   const chipOnly = useMemo(() => (
     !forceExpanded && historyUserPromptIsChipOnly({
-      text: entry.content,
+      text: serviceBody.text,
       promptChips: entry.promptChips,
       imagePaths: entry.imagePaths,
       toolType,
     })
-  ), [entry.content, entry.imagePaths, entry.promptChips, forceExpanded, toolType]);
+  ), [serviceBody.text, entry.imagePaths, entry.promptChips, forceExpanded, toolType]);
   const orchestrationPrompt = useMemo(
     () => resolveHistoryOrchestrationPromptPresentation(entry),
     [entry],
   );
+  const promptSender = resolveHistoryPromptSender(orchestrationPrompt);
   const userBubbleClassName = [
     chipOnly ? 'hp-history-user-bubble--single-chip' : '',
     orchestrationPrompt ? 'hp-history-user-bubble--orchestration' : '',
@@ -4800,6 +4844,7 @@ const HistoryUserEntry = memo(({
       entryUuid={entry.uuid}
       className={orchestrationPrompt ? 'hp-history-user--orchestration' : undefined}
       data-history-orchestration-phase={orchestrationPrompt?.phase}
+      data-history-tab-message-id={orchestrationPrompt?.messageId}
       emphasis={editableLastPrompt ? 'editable' : 'none'}
       title={editableLastPrompt ? 'Editable last prompt' : undefined}
       contentClassName={userBubbleClassName}
@@ -4985,8 +5030,16 @@ const HistoryUserEntry = memo(({
         </>
       )}
     >
+      {promptSender && (
+        <div data-history-tab-message-source style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0, marginBottom: 6 }}>
+          <span style={{ fontSize: 10, color: '#a3a3a3' }}>{orchestrationPrompt.phase === 'question' ? 'Вопрос' : orchestrationPrompt.phase === 'request' ? 'Запрос' : 'Ответ'}</span>
+          {promptSender.sourceTabId ? <TabMessageSourceChip source={promptSender} /> : <span style={{ fontSize: 11, color: '#c4b5fd' }}>{promptSender.label}</span>}
+        </div>
+      )}
       <HistoryUserPromptContent
-        text={entry.content}
+        text={serviceBody.text}
+        messageText={entry.content}
+        markdown={serviceBody.projected}
         tabId={tabId}
         promptChips={entry.promptChips}
         imagePaths={entry.imagePaths}
@@ -5175,6 +5228,8 @@ const HistorySlashRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
     <div className="hp-history-slash">
       <SlidersHorizontal size={12} className="hp-history-slash-ic" />
       <span className="hp-history-slash-cmd">{entry.content}</span>
+      {entry.settingsProjectionError && <span role="status" title={entry.settingsProjectionError}
+        style={{ color: '#d97706', marginLeft: 8 }}>History mismatch</span>}
     </div>
   </ConversationMessage>
 ));
@@ -13598,9 +13653,19 @@ function HistoryPanel({
   // The durable version wins by source identity, while computeItemKey keeps
   // the same DOM row across the handoff. This removes the old footer/indexed
   // dual presentation and its materialization race.
+  const settingsPresentationKeysRef = useRef({ ownerKey: historyOwnerKey,
+    generation: historyOwnerGenerationRef.current, keys: new Map<string, string>() });
   const mergedTranscriptEntries = useMemo(
-    () => buildHistoryLivePresentation(renderEntries, visibleLiveEntries),
-    [renderEntries, visibleLiveEntries],
+    () => {
+      if (settingsPresentationKeysRef.current.ownerKey !== historyOwnerKey
+        || settingsPresentationKeysRef.current.generation !== historyOwnerGenerationRef.current) {
+        settingsPresentationKeysRef.current = { ownerKey: historyOwnerKey,
+          generation: historyOwnerGenerationRef.current, keys: new Map() };
+      }
+      return buildHistoryLivePresentation(renderEntries, visibleLiveEntries,
+        { settingsPresentationKeys: settingsPresentationKeysRef.current.keys });
+    },
+    [historyOwnerKey, renderEntries, visibleLiveEntries],
   ) as FullHistoryEntry[];
   // Rewind owns the final presentation boundary. Applying it before the live
   // merge allowed an old live row beyond the target to reappear afterwards.
@@ -15917,6 +15982,7 @@ function HistoryPanel({
         }
       };
       for (const record of result.records) {
+        hydrateHistoryPromptHandoffImages(record);
         if (record?.provider !== toolType) continue;
         const canonicalProjectionReady = presentedOwnerKey === historyOwnerKey
           && (rawServerEntriesRef.current.length > 0
@@ -19581,7 +19647,10 @@ function HistoryPanel({
             const identities = historyLivePresentationIdentities(entry);
             return identities.length === 0
               || !identities.some((identity) => durableSourceIdentitiesRef.current.has(identity))
-              || identities.some((identity) => alreadyPresentedLiveIdentities.has(identity));
+              || identities.some((identity) => alreadyPresentedLiveIdentities.has(identity))
+              // A same-record settings contradiction must still reach the
+              // shared merge when the canonical read arrived before the event.
+              || entry.settingsFact?.provider === 'codex';
           });
         projectionChanged = projected !== current;
         liveProjectionRef.current = { ownerKey, entries: projected };

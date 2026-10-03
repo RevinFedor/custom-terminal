@@ -6,6 +6,31 @@ Codex поддержан как третий PTY-agent рядом с Claude и G
 
 Сводный шрам про ложную привязку, production-доказательства и принятый lifecycle-контракт: [`fix-codex-привязка-сессии.md`](fix-codex-привязка-сессии.md).
 
+## Открытое ядро без TUI: граница возможной интеграции
+
+В upstream Codex 0.159.3 есть `codex-core-api` и `thread-manager-sample`:
+готовые ThreadManager/CodexThread принимают turn input и отдают agent events
+без терминального frontend. Поэтому собственный runner может переиспользовать
+auth, tool loop, streaming, approvals и history вместо их реализации с нуля;
+app-server не является обязательным процессом для такого пути.
+Rewind требует отдельно собрать shutdown → ThreadStore.revert_thread → resume
+и восстановление settings; это не одна команда HTTP-перехватчика.
+Подтверждение собственного runner 01.10 — чтение стабильного source tag,
+не сборка этого Rust runner. Исследование/точные артефакты находятся в
+`docs/tmp/исследование-терминалов-и-агентов.md`. Текущий PTY-контракт и источники
+writer/lifecycle Noted не изменены; переход требует отдельного решения.
+
+Отдельный живой probe 01.10 запустил установленный **0.159.2** через
+`exec --json --ignore-user-config --sandbox read-only` с обычным ChatGPT login,
+без PTY и сборки. Четыре настоящих turn / 8 проверок PASS: ответ, native
+`exec fork`, новый thread ID, наследование раннего факта, отсутствие нового
+branch-only факта в родителе и независимый resume ветки. Артефакт:
+`/tmp/noted-agy-proof.R14Ohk/codex-live-result.json`.
+Не смешивать этот результат с embedding core: source 0.159.3 реализует exec
+через `InProcessAppServerClient`; отдельный app-server process не запускается,
+но это не собственный ThreadManager host. Короткие JSONL ответы этого probe
+также не доказывают token-delta streaming всего exec-интерфейса.
+
 ## Источник session id
 
 Авторитетный session id Codex берётся не из PTY-вывода, а из первой записи `session_meta.payload.id` в rollout JSONL. Файлы лежат по датам: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Парсер обязан игнорировать битую последнюю строку: Codex пишет append-only JSONL во время работы, и в момент чтения хвост может быть неполным.
@@ -237,6 +262,14 @@ Snapshot/GET после app restart читает этот терминальны
 квитанции, не оживляя live COMPACTING. Interrupted/unknown/superseded и
 task_complete без compacted не получают успешный settlement. Renderer reply,
 опоздавший с `coordinatedSettlement:null`, не стирает факт из Main.
+
+У старой confirmed local-command receipt без canonical user UUID отсутствие
+completion не разрешает воскресить её новым user bubble при reopen/смене ветки.
+`serviceCommand` в GET — read-only классификация доставки, не terminal outcome;
+исторический scope берётся только из bound compact owner, иначе null. Native
+сохраняет journal, но не дописывает unpositioned service replay в хвост;
+ordinary unknown/unsent восстанавливаются прежним путём. Legacy proof и wire —
+`fact-mobile-web.md::Старый sent compact без terminal settlement`.
 
 Programmatic `/compact` регистрирует exact pending operation до первой PTY
 записи, чтобы `task_started` уже имел владельца. Эта собственная reservation не
@@ -1437,6 +1470,21 @@ Process-tree — отказоустойчивый наблюдатель, а н�
 
 ## Модели и effort
 
+Строки `/model`/`/effort` в History не должны ждать тяжёлого полного refresh:
+main turn watcher публикует короткий canonical `thread_settings_applied` в
+существующий live History/SSE. Это представление уже записанного факта, не
+подстановка requested модели и не новое application proof. Full parser
+сохраняет ту же physical source identity/aliases и settingsFact, поэтому
+ранняя строка подхватывается без дубля/нового DOM key. Отсутствие записи не
+ошибка; несовпавшие values одной identity дают локальный History mismatch,
+не автоматическую повторную настройку или блокировку Send. Причина, repeated
+pair и rollback boundaries — `fact-живой-ответ-в-history.md::Текущие владельцы по провайдерам`.
+
+Ограниченное HTTP/native окно получает canonical `settingsBaseline` v1 перед
+окном: повторная startup pair не становится новой строкой только из-за того,
+что primary лежит выше tail80. Это display proof, не current model authority;
+wire/rewrite/around guards — `fact-mobile-web.md::Canonical settings baseline для ограниченного окна`.
+
 Пара, сохранённая пользователем, — намерение, не вечное доказательство живой
 модели. Main `codex-live-settings.js` принимает текущий committed composer footer
 в том же terminal/lifecycle/run, включая provider fallback и возврат на Sol/Astra.
@@ -1681,6 +1729,24 @@ slash-path не закрывало отправку текста. Обычный
 реальных PTY-frame idle/busy, локальный held Responses без аккаунта. Это не
 production/UI acceptance и не разрешение чистить legacy input без receipt.
 Настоящий unknown Ctrl+G по-прежнему требует helper return/retirement, не TTL.
+
+02.10 тот же physical-input контракт расширен на exact `/fast`, ранее шедшую
+по старому generic slash timeout. В918b после Resume Fast вставил5символов,
+не дождался кадра и освободил очередь без retained owner; следующий Send
+прочёл старый empty и дописал573символа. Rollout сохранил578 (`/fast`+author),
+поэтому строгий audit не связал canonical row с исходной receipt. Нельзя
+«чинить» это удалением `/fast` из любых сравниваемых сообщений или подтверждать
+старую receipt по одному факту ответа.
+
+Теперь Fast использует тот же retained receipt до Enter/clear/takeover, а
+обычный Send ждёт его вне PTY-lock и продолжает ОДИН запрос после exact clear.
+Точный свежий echo разрешает Enter только собственной активной slash-operation;
+это не общий input-ready bypass для других callers. После cleanup просыпается
+существующий Fast intent, не model picker и не старый toggle. Stashed user text/
+images при незавершённом control не восстанавливаются ArrowUp поверх него:
+Fast передаёт exact capture в прежний History draft-recovery consumer. Внутренние
+имена owned-model-input/error сохранены для совместимости, но защищают и Fast.
+Ordinary audit, canonical UUID/хеши и право повторного Send не ослаблялись.
 
 ## Stop и ввод
 

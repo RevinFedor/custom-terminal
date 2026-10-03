@@ -166,6 +166,7 @@ const {
 const {
   TaskCompletionIntentRegistry,
   loopTaskCompletionEligibility,
+  taskCompletionOutcomeMeta,
 } = require(path.join(srcMainDir, 'task-completion-intent'));
 const {
   assertAgentProviderModel,
@@ -1105,6 +1106,8 @@ const {
 const { inspectCodexUsagePrompt } = require(path.join(srcMainDir, 'codex-usage-prompt'));
 const { createCodexRuntimePolicyController, sameCodexPolicyOwner, stopCodexPolicyTargets, projectCodexPolicyRuntime } = require(path.join(srcMainDir, 'codex-runtime-policies'));
 const { createCodexLiveSettingsObserver } = require(path.join(srcMainDir, 'codex-live-settings'));
+const { projectCodexLiveSettingsHistory } = require(path.join(srcMainDir, 'codex-settings-history'));
+const { imagePresentationFromReceipt } = require(path.join(srcMainDir, 'history-authoring-projection'));
 const { isCodexReserveModel, codexReserveReturnChoice, captureCodexReserveReturnPreference,
   sameCodexReserveReturnChoice, planCodexReserveReturn, createCodexReserveAvailabilityProbe,
 } = require(path.join(srcMainDir, 'codex-reserve-recovery'));
@@ -15069,14 +15072,18 @@ function waitForClaudeAuditOrTurnIdle(tabId, audit) {
   return promise;
 }
 
-function registerTaskCompletionIntent({ tabId, sourceTabId = null } = {}) {
+function registerTaskCompletionIntent({ tabId, sourceTabId = null, status, reason } = {}) {
   const current = taskCompletionIntents.getTurn(tabId);
   if (!current) return { ok: false, code: 'no_active_turn' };
   const liveBusy = current.provider === 'codex'
     ? codexTurnWatchers.get(tabId)?.busy === true
     : claudeTurnBusy.get(tabId) === true;
   if (!liveBusy) return { ok: false, code: 'no_active_turn' };
-  return taskCompletionIntents.requestCompletion({ tabId, sourceTabId });
+  const result = taskCompletionIntents.requestCompletion({ tabId, sourceTabId, status, reason });
+  console.log('[TaskCompletion] tab=' + String(tabId).slice(-12) + ' provider=' + current.provider
+    + ' status=' + (status || 'completed') + ' ok=' + result.ok
+    + ' code=' + (result.code || '-') + ' intent=' + (result.turn?.intentId || '-'));
+  return result;
 }
 
 function getActiveAgentExecutionContext(tabId) {
@@ -17868,13 +17875,7 @@ function startClaudeHookServer() {
               'user-prompt-submit-execution-context-unavailable';
           }
         }
-        const taskCompletionMeta = !busy && taskTurn?.explicitTaskComplete === true
-          ? {
-              explicitTaskComplete: true,
-              taskCompletionIntentId: taskTurn.taskCompletionIntentId,
-              taskCompletionRequestedAt: taskTurn.taskCompletionRequestedAt,
-            }
-          : {};
+        const taskCompletionMeta = !busy ? taskCompletionOutcomeMeta(taskTurn) : {};
         claudeHookLastEvent.set(tabId, {
           event,
           ts: hookEventTs,
@@ -24217,6 +24218,12 @@ app.whenReady().then(async () => {
     ipcMain.handle('orchestration:list-for-tab', async (_event, tabId) => {
       if (!tabId) return [];
       return webServer.listOrchestrationRunsForTab(tabId);
+    });
+    ipcMain.handle('tab-messages:list', async (_event, payload = {}) => {
+      return payload.tabId ? webServer.listTabMessages(payload.tabId) : [];
+    });
+    ipcMain.handle('tab-messages:get', async (_event, payload = {}) => {
+      return payload.messageId ? webServer.getTabMessage(payload.messageId) : null;
     });
     ipcMain.handle('orchestration:list-active', async () => {
       return webServer.listActiveOrchestrationRuns();
@@ -31516,6 +31523,7 @@ ipcMain.handle('agent:list-send-receipts', async (_event, { tabId, surface = nul
     state: record.state,
     attemptId: record.attemptId,
     receipt: record.receipt,
+    imagePresentation: imagePresentationFromReceipt(record),
     transcriptBoundary: record.transcriptBoundary,
     auditIdentity: record.auditIdentity,
     presentation: record.presentation,
@@ -35453,13 +35461,23 @@ function scheduleCodexFastIntentReconcile(tabId, reason = 'scheduled') {
           + ' desired=' + intent.desiredFast
           + ' revision=' + intent.revision
           + ' error=' + (result?.error || 'unknown'));
-        return {
+        const deferredResult = {
+          ...result,
           success: true,
           queued: true,
           desiredFast: intent.desiredFast,
           revision: intent.revision,
           reason: result?.error || 'fast-apply-unconfirmed',
         };
+        if (result?.draftTransfer && mainWindow && !mainWindow.isDestroyed()) {
+          // The existing settings recovery consumer adopts by capture identity;
+          // it does not mutate model/effort. Fast must not lose a stashed draft
+          // merely because its background caller only reports a queued intent.
+          mainWindow.webContents.send('codex:model-effort-intent-deferred', {
+            tabId, control: 'fast', revision: intent.revision, result: deferredResult,
+          });
+        }
+        return deferredResult;
       }
       // `/fast` is a toggle. Re-read the durable intent before the next pass:
       // clicks that arrived while the TUI transaction was in flight win.
@@ -40683,16 +40701,19 @@ ipcMain.handle('prompt-queue:materialize-image-refs', async (_event, { refs } = 
 
 ipcMain.handle('prompt-queue:get-image-preview-data-url', async (_event, ref = {}) => {
   try {
-    // Preview bytes are exposed only for files already owned by the durable
-    // prompt-queue asset store.  In particular this must not become a generic
-    // renderer primitive for reading arbitrary absolute paths.
+    // The two existing attachment owners: durable queue assets and native
+    // mobile uploads. Reuse the upload API's authorization/limits; aliases or
+    // arbitrary absolute paths do not gain preview permission.
     const managed = await promptQueueAssetStore.existingManagedRef(ref);
-    if (!managed) {
-      return { success: false, error: 'managed_image_missing' };
+    let source;
+    if (managed) source = nativeImage.createFromPath(managed.path);
+    else {
+      const uploaded = await require(path.join(srcMainDir, 'web-server')).readMobileAttachmentPreview({ path: ref.path });
+      if (uploaded.kind !== 'image' || !uploaded.dataBase64) return { success: false, error: 'mobile_image_preview_unavailable' };
+      source = nativeImage.createFromBuffer(Buffer.from(uploaded.dataBase64, 'base64'));
     }
-    const source = nativeImage.createFromPath(managed.path);
     if (!source || source.isEmpty()) {
-      return { success: false, assetId: managed.assetId, error: 'image_decode_failed' };
+      return { success: false, assetId: managed?.assetId, error: 'image_decode_failed' };
     }
     const variant = ref?.variant === 'detail' ? 'detail' : 'thumbnail';
     const maxSide = variant === 'detail' ? 1024 : 64;
@@ -40708,15 +40729,15 @@ ipcMain.handle('prompt-queue:get-image-preview-data-url', async (_event, ref = {
       : source;
     const dataUrl = preview.toDataURL();
     if (!dataUrl.startsWith('data:image/')) {
-      return { success: false, assetId: managed.assetId, error: 'preview_encode_failed' };
+      return { success: false, assetId: managed?.assetId, error: 'preview_encode_failed' };
     }
-    console.log('[PromptQueueAssets:Preview] ready asset=' + managed.assetId
+    console.log('[PromptQueueAssets:Preview] ready asset=' + (managed?.assetId || 'mobile-upload')
       + ' variant=' + variant
       + ' source=' + size.width + 'x' + size.height
       + ' preview=' + preview.getSize().width + 'x' + preview.getSize().height);
     return {
       success: true,
-      assetId: managed.assetId,
+      assetId: managed?.assetId,
       variant,
       width: preview.getSize().width,
       height: preview.getSize().height,
@@ -43234,6 +43255,7 @@ ipcMain.handle('storage:prepare-delete', async (_event, request = {}) => {
     return await getStorageCleanupService().prepareDeleteItems({
       itemIds: request?.itemIds,
       generation: request?.generation,
+      itemRevisions: request?.itemRevisions,
     });
   } catch (error) {
     return { success: false, error: error?.code || error?.message || 'storage_delete_preflight_failed' };
@@ -48702,13 +48724,7 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
     || (taskTurnSnapshot?.generation ? 'codex:' + taskTurnSnapshot.generation : exactTurnId);
   if (busy) replayDeferredCodexPromptAuditExecutionContext(tabId);
   else discardDeferredCodexPromptAuditExecutionContexts(tabId, reason || 'turn-ended');
-  const taskCompletionMeta = !busy && taskTurn?.explicitTaskComplete === true
-    ? {
-        explicitTaskComplete: true,
-        taskCompletionIntentId: taskTurn.taskCompletionIntentId,
-        taskCompletionRequestedAt: taskTurn.taskCompletionRequestedAt,
-      }
-      : {};
+  const taskCompletionMeta = !busy ? taskCompletionOutcomeMeta(taskTurn) : {};
   if (!busy && state) state.activeTaskCompletionProtocol = null;
   console.log('[CodexTurn] busy tab=' + String(tabId).slice(-12) + ' busy=' + busy + ' reason=' + reason);
   if (busy) {
@@ -49831,6 +49847,30 @@ function buildCodexHistoryLiveCompactEntry(state, record) {
     compactEncrypted: true,
     sessionId,
   };
+}
+
+function emitCodexHistoryLiveSettings(state, record) {
+  if (record?.type === 'event_msg' && record.payload?.type === 'thread_rolled_back') {
+    projectCodexLiveSettingsHistory(state, record);
+    if (Number.isSafeInteger(record.__byteOffset) && record.__byteOffset >= 0) {
+      const detail = { type: 'history_settings_reset', version: 1, reason: 'thread_rolled_back',
+        tabId: state.tabId, toolType: 'codex', sessionId: state.sessionId,
+        recordByteOffset: record.__byteOffset, timestamp: record.timestamp };
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent-transcript:live-message', detail);
+      _webBroadcast(state.tabId, detail);
+    }
+    return;
+  }
+  for (const entry of projectCodexLiveSettingsHistory(state, record)) {
+    const detail = { type: 'history_entry', tabId: state.tabId, toolType: 'codex',
+      sessionId: state.sessionId, timestamp: entry.timestamp,
+      recordByteOffset: record.__byteOffset, entry };
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent-transcript:live-message', detail);
+    _webBroadcast(state.tabId, detail);
+    console.log('[CodexHistorySettings] published tab=' + String(state.tabId).slice(-12)
+      + ' source=' + entry.sourceIdentity + ' kind=' + entry.settingsFact.kind
+      + ' value=' + entry.settingsFact.value);
+  }
 }
 
 const CODEX_HISTORY_TURN_BOUNDARIES = new Set([
@@ -51482,6 +51522,9 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
   const liveHistoryEntry = suppressPublications
     ? null
     : buildCodexHistoryLiveCompactEntry(state, record);
+  if (!suppressPublications && (event === 'thread_settings_applied' || event === 'thread_rolled_back')) {
+    emitCodexHistoryLiveSettings(state, record);
+  }
   if (liveHistoryEntry && mainWindow && !mainWindow.isDestroyed()) {
     // A top-level compact snapshot can be hundreds of kilobytes. History only
     // needs its exact physical position while the full durable refresh is held
@@ -60537,7 +60580,9 @@ function releaseCodexOwnedModelInput(term, receipt, reason) {
   });
   if (reason === 'owned-input-cleared') {
     // Wake the existing revisioned intent, never replay the old picker/send.
-    queueMicrotask(() => scheduleCodexModelEffortIntentReconcile(receipt.identity.tabId, 'owned-model-input-cleared'));
+    queueMicrotask(() => receipt.command === '/fast'
+      ? scheduleCodexFastIntentReconcile(receipt.identity.tabId, 'owned-fast-input-cleared')
+      : scheduleCodexModelEffortIntentReconcile(receipt.identity.tabId, 'owned-model-input-cleared'));
   }
   return true;
 }
@@ -60619,6 +60664,19 @@ async function waitForCodexOwnedModelPaste(tabId, term, receipt) {
     ownerChanged: report.observation?.status === 'superseded'
       || ['retire', 'retired'].includes(report.value?.action),
   };
+}
+
+function isCodexOwnedSlashSubmitReady(tabId, term, command, operation) {
+  // The retained insertion blocks OTHER callers, not its own exact Enter.
+  // This is private PTY-owner authority, never a renderer readiness override.
+  if (operation?.kind !== 'codex-live-slash-command'
+    || !['slash-command-enter', 'slash-command-enter-retry'].includes(operation.phase)
+    || ptyActiveWriteOperation.get(term) !== operation) return false;
+  const receipt = codexSettingsMutationQueue.getUnsubmittedInput(term);
+  return !!receipt && receipt.identity.tabId === tabId
+    && receipt.command === String(command || '').trim()
+    && !receipt.recoveryPending && receipt.clearWriteSeq == null
+    && readCodexOwnedModelInputDecision(term, receipt, { observePaste: true }).action === 'clear';
 }
 
 function reconcileCodexOwnedModelInputAtWriteBoundary(tabId, term, expectedReceipt = null) {
@@ -61188,7 +61246,11 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   // PTY frame either echoes the command or closes a synchronized TUI render.
   // Both are deterministic "Codex has ingested the input" signals; timeout is
   // only the error path.
-  const inputFrame = text === '/model' && tabId ? null : captureCodexFrame(term, {
+  // /fast has the same unsubmitted-input lifetime as /model. A timeout can
+  // precede its first echo; releasing the write receipt at that point lets a
+  // queued author prompt append to the delayed slash over an old empty frame.
+  const ownsShortControlInput = !!tabId && (text === '/model' || text === '/fast');
+  const inputFrame = ownsShortControlInput ? null : captureCodexFrame(term, {
     timeoutMs: 2500,
     logPrefix: logPrefix + ':slash-input',
     predicate: (clean, raw) => clean.includes(text) || raw.includes(CODEX_SYNC_MARKER),
@@ -61197,14 +61259,14 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   const slashDraftIdentity = tabId
     ? captureCodexOwnedSlashDraftIdentity(tabId, term)
     : null;
-  const modelInputReceipt = text === '/model' && slashDraftIdentity
+  const modelInputReceipt = ownsShortControlInput && slashDraftIdentity
     ? retainCodexOwnedModelInput(term, slashDraftIdentity, text) : null;
-  if (text === '/model' && slashDraftIdentity && !modelInputReceipt) {
+  if (ownsShortControlInput && slashDraftIdentity && !modelInputReceipt) {
     return { success: false, submitted: false, error: 'codex_owned_model_input_pending' };
   }
   try { term.write(clearPrefix + PASTE_START + text + PASTE_END); }
   catch (error) { modelInputReceipt?.requestRecovery(); throw error; }
-  // Other slash commands keep their existing protocol. /model has a short,
+  // Other slash commands keep their existing protocol. /model and /fast have a short,
   // exactly owned composer value: an unrelated busy render/sync marker is not
   // its acknowledgement and must not authorize Enter.
   const frame = modelInputReceipt
@@ -62848,7 +62910,10 @@ async function sendCodexLiveSlashCommand(term, {
     outcome = { success: false, error: error?.message || String(error), applied: slashSubmitted };
   } finally {
     if (shouldRestoreDraft) {
-      const restoreResult = await restoreCodexDraftAfterPicker(term, {
+      const unsubmittedControlInput = codexSettingsMutationQueue.getUnsubmittedInput(term);
+      const restoreResult = unsubmittedControlInput
+        ? { success: false, serviceInputPending: true, error: 'codex_owned_model_input_pending' }
+        : await restoreCodexDraftAfterPicker(term, {
         tabId,
         logPrefix,
         slashSubmitted,
@@ -62864,6 +62929,7 @@ async function sendCodexLiveSlashCommand(term, {
           success: false,
           applied: slashSubmitted,
           draftRestoreFailed: true,
+          ...(restoreResult.serviceInputPending ? { serviceInputPending: true } : {}),
           draftTransfer: codexNativeDraftTransfer(tabId, stashedDraftSnapshot),
           admissionRejected: inputOwnershipLost
             || outcome?.admissionRejected === true,
@@ -62871,7 +62937,9 @@ async function sendCodexLiveSlashCommand(term, {
             || outcome?.manualTakeover === true,
           error: inputOwnershipLost
             ? 'Codex slash command yielded to newer terminal input; the previous input text was not restored'
-            : 'Codex slash command ran, but the previous input text could not be restored safely',
+            : restoreResult.serviceInputPending
+              ? 'Codex service input is unconfirmed; the captured draft is available for History recovery'
+              : 'Codex slash command ran, but the previous input text could not be restored safely',
           draftProof: restoreResult.draftProof || null,
         };
       }
@@ -65132,7 +65200,9 @@ async function executeCodexLiveSlashCommandRequest({
             currentInputRevision: getTerminalInputRevision(tabId),
             processRunning: currentState?.isRunning === true,
             hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(tabId),
-            tuiReady: isCodexTuiEffectivelyReady(tabId),
+            tuiReady: isCodexTuiEffectivelyReady(tabId)
+              || (['slash-command-enter', 'slash-command-enter-retry'].includes(slashOperation.phase)
+                && isCodexOwnedSlashSubmitReady(tabId, term, command, slashOperation)),
             stopping: aiStoppingTabs.get(tabId)?.toolType === 'codex',
             turnBusy: hasCodexPromptOrTurnInFlight(tabId, {
               ignorePendingCompactOperationId: compactPendingOperation?.operationId || null,

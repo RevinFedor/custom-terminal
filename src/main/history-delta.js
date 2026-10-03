@@ -95,6 +95,7 @@ function taskResultWitness(action) {
 
 function fingerprintAction(action) {
   if (!action || typeof action !== 'object') return String(action ?? '');
+  if (action.actionRef) return JSON.stringify(action); // bounded on-demand header + exact body hash
   if (action.tool === '__raw__') {
     const raw = action.rawTool || {};
     // Per-hunk coordinates matter: a late patch_apply_end swaps heuristic
@@ -141,9 +142,9 @@ function fingerprintHistoryEntry(entry) {
     entry.textPhase || '', String(entry.thinkingSeconds ?? ''),
     String(entry.postTokens ?? ''), entry.compactEncrypted ? '1' : '0',
     sampleText(entry.thinking || ''),
-    entry.thinkingRef ? entry.thinkingRef.payloadId + ':' + entry.thinkingRef.totalChars + ':' + (entry.thinkingRef.recordLine ?? '') : '-',
+    entry.thinkingRef ? entry.thinkingRef.payloadId + ':' + entry.thinkingRef.totalChars + ':' + (entry.thinkingRef.recordLine ?? '') + ':' + (entry.thinkingRef.contentHash || '') : '-',
     sampleText(entry.compactSummary || ''),
-    entry.compactSummaryRef ? entry.compactSummaryRef.payloadId + ':' + entry.compactSummaryRef.totalChars + ':' + (entry.compactSummaryRef.recordLine ?? '') : '-',
+    entry.compactSummaryRef ? entry.compactSummaryRef.payloadId + ':' + entry.compactSummaryRef.totalChars + ':' + (entry.compactSummaryRef.recordLine ?? '') + ':' + (entry.compactSummaryRef.contentHash || '') : '-',
     String(entry.sourceRecordLine ?? ''),
     sampleValue(entry.sourceIdentityAliases), sampleValue(entry.sourceUuidAliases),
     sampleValue(entry.promptPresentationAuditAliases),

@@ -482,6 +482,31 @@ production JS trace утрачен quota; цена всего оставшего
 installed задержки не приписаны одному правилу. Истории/lifecycle/production
 не менялись; source-правка требует обычного следующего Build Install.
 
+## 7d. Home обходил retained DOM через наследуемую visibility
+
+03.10 Home открывался и закрывался медленнее переключения workflow. В installed
+01.10 наблюдались EventTiming280–520мс: input7–32, processing83–161,
+presentation151–335. Native style43.8–66.7мс относится к более широким
+пересекающимся интервалам, не к эксклюзивному CPU каждого клика. Тот же30с
+срез: app201.5%, external159.4%,10cores/systempeak65.8%, swapdelta0; внешняя
+нагрузка не объясняет весь лаг и не отменяет собственную лишнюю работу.
+
+Workspace уже был смонтирован, но его общий предок переключал наследуемую
+`visibility`. В controlled Electron28 с теми же~58kDOM это инвалидировало
+~22.6kпотомков. Парный source-map diff меняет только эту boundary: медиана
+RecalcStyle184.4→16.3мс. Это самостоятельный дефект от прежнего Home SQL-scan
+в разделе1c и от CSS-selector дефекта7c; повторное чтение History не требуется
+ни до, ни после этого ремонта.
+
+Boundary сохраняет скрытие через opacity/stacking и прежнюю изоляцию input,
+не перемонтирует Workspace и не ставит native inert на общий предок.14focused
+и9private UI checks сохраняют DOM,scroll27872,draft,reads6→6,тот же xterm,
+background output и отказ скрытого Home принимать surface shortcut.
+`scripts/home-floating-cost-regression.mjs` с `NOTED_HOME_EXPECT_FAST=1`
+отличает baselineRED от sourceGREEN. Ни16мс, ни время полного test interval
+не являются обещанием total installed latency; оставшиеся JS/layout/paint
+и рабочая нагрузка измеряются прежней диагностикой после обычной установки.
+
 ## 7b. Первый wheel зависал из-за Git fan-out скрытых окон
 
 Пользовательский симптом: переключение выглядело мгновенным, но первый scroll в соседней видимой History замирал как системный ввод, хотя память и усреднённый CPU в панели казались нормальными. Production 08.09 21:31:03 МСК дал точное разделение: wheel `tab-4553` дошёл до renderer с `inputDelayMs=233.4`, одновременно Electron main/browser thread имел `MainLoopGap=528.7мс` и `cpuUserMs=524.4`. History не владела паузой: `seek/restore/hydration/wave=0`, `scrollHeight 52793→52794`; следующие жесты пришли за 26–43мс и дали `input≈deltaTop` до субпикселя.

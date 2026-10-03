@@ -58,6 +58,45 @@ App-CrMYhyA7.js с проверенным SHA d6d4e40f…16b8f71;19 source/compi
 
 ## Текущие владельцы по провайдерам
 
+Codex `thread_settings_applied` — уже сохранённое подтверждение пары, не
+пользовательский prompt. Его короткая проекция теперь приходит от существующего
+main turn watcher сразу как `history_entry/role:slash` в Desktop IPC и SSE,
+без ожидания full History refresh и без нового чтения rollout. Full parser и
+live используют один formatter; `sourceIdentity` содержит physical session,
+kind model/effort и byte offset. Канонический UUID остаётся прежним line-based,
+а React key — source-based, поэтому adoption не пересоздаёт строку.
+Если первым показался alias более ранней canonical строки, клиент удерживает
+выбранный display key и после удаления live-копии, до смены History owner/rewrite
+generation. Иначе сам adoption пройдёт, но следующий кадр снова remount'ит row.
+
+30.09 tab4505: main получил настоящие settings records примерно через155мс
+после окончания picker (сама append-пачка читалась221мс), однако History не
+имела этого live-пути. Отдельная
+предположительная строка по requested model/ACK здесь не нужна: готовая запись
+уже доступна. Если записи ещё нет, отсутствие не превращается в mismatch.
+Malformed/incomplete pair, чужая session и suppressed historical catch-up не
+публикуют такое подтверждение; живые settings/loader/Send authority не меняются.
+
+Codex повторяет полную пару при изменении одного поля. `settingsFact`
+(`version:1,provider:codex,kind,value,source`) сохраняется и в offscreen stubs.
+Проекция показывает только изменившееся значение, как full parser; повторный
+record неизменного поля получает exact source alias прежней строки. Это
+сверка структурного состояния, не дедупликация prompt по тексту. После rollback
+display baseline перечитывается по оставшимся строкам, а live baseline сбрасывается:
+нельзя прикрепить новый record к уже удалённой модели. При конфликте value у
+ОДНОЙ physical identity History оставляет `History mismatch` рядом со строкой;
+поздняя другая смена модели не конфликтует, ввод и settings executor не блокируются.
+
+В ограниченном HTTP/native окне preceding settings могут лежать далеко выше
+tail80. Canonical `settingsBaseline` v1 даёт максимум два facts перед окном из
+того же row/stub index и связывает их с read SID/revision/generation. Клиент
+редуцирует окно поверх них, не берёт params как History truth и не публикует
+unknown startup pair до baseline. Around не заменяет latest live состояние;
+unchanged удерживает прежний bound baseline. Physical rollback публикует
+`history_settings_reset`, rewrite/read-owner/stream gap снимают его право на
+показ. A→B→A и exact alias adoption сохранены. Wire —
+`fact-mobile-web.md::Canonical settings baseline для ограниченного окна`.
+
 Локальные Claude `/model` и `/effort` не создают сетевой AI-turn. Их уже
 записанные JSONL carriers приходят по существующему Transcript Service и сразу
 показываются в History служебными строками, включая `isMeta` записи. Это тот же

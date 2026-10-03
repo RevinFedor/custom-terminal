@@ -27,39 +27,115 @@ Gemini API balance. В мае 2026 Google ввёл Ultra за $100 (5× лими
 app-server: вход принимает только text, следующий prompt разрешён после
 `result`, `control_request/control_response` и slash-команды завершают stream
 ошибкой. Публичных steer, fork, rewind, approval-response или ACP/JSON-RPC
-методов нет.
+методов в этом публичном stdio-контракте нет. Это не доказывает отсутствие
+других интерфейсов внутри бинарника: локальный API 1.2.14 проверен ниже.
 
 Интерактивный TUI `agy` имеет `/resume`, `/fork` и `/rewind`. Они являются
 единственным документированным путём для обязательных fork/rewind: в headless
 stream они недоступны. Нельзя переносить старый True Fork путём копирования
 файла: `agy` хранит разговоры в другой связке server identity, protobuf/SQLite
-и `brain/`, а resume проверяет ID через backend. Для автоматизации нужен
-ограниченный handoff одного conversation между headless-процессом и официальным
-TUI; исходный разговор сначала fork-ается, rewind применяется уже к ветке, затем
-новый ID возвращается headless-владельцу. Пока это не проверено на живом CLI,
-полный нативный fork/rewind нельзя считать доказанным.
+и `brain/`, а resume проверяет ID через backend. Прежняя рекомендация обязательно
+передавать conversation из headless в TUI для fork/rewind была основана только
+на публичной документации. 01.10.2026 нативные fork, conversation rewind и
+независимое продолжение обеих веток доказаны через loopback API штатного 1.2.14
+без TUI, PTY, SDK и редактирования хранилища.
 
 Целевая интеграция должна быть новым runtime `antigravity`, а не заменой строки
 `gemini` в текущем коде: нынешние Sniper, History, Timeline и Rewind знают
-`~/.gemini/tmp/.../session-*.json` и старые ANSI-маркеры. Обычные ходы лучше
-вести через официальный stream-json adapter в main; разрешения — через sandbox
-и узкие allow rules (headless не может спросить пользователя и soft-deny-ит
-неразрешённый shell), а fork/rewind — через TUI transaction. Жёсткий
-пятиминутный default `--print-timeout` нельзя принимать как конец долгого turn:
-его надо сделать конфигурируемым и отличать от provider completion.
+`~/.gemini/tmp/.../session-*.json` и старые ANSI-маркеры. Официальный stream-json
+и внутренний локальный API — разные по стабильности кандидаты адаптера.
+В 1.2.14 `--print-timeout` по умолчанию равен 0 (без лимита); прежний default
+5 минут отменён начиная с 1.2.6. Клиентский таймер не является turn completion.
 
 Не перехватывать и не воспроизводить внутренние OAuth-запросы. Документированный
 subprocess/headless остаётся внутри официального клиента; Antigravity Terms
 отдельно запрещают доступ к сервису сторонним ПО через OAuth и допускают
 блокировку аккаунта. Сетевой reverse engineering вдобавок не даёт владельца
-tool state, permission и conversation mutation. Приёмочный spike до покупки:
-free-tier login → model list → два stream-json turn одного ID → process resume →
-TUI fork → rewind ветки → возврат в headless, плюс точный большой prompt canary.
+tool state, permission и conversation mutation. Проверенный ниже локальный
+control API не извлекает Google OAuth credential: запрос к модели выполняет
+сам AGY с текущим входом. Техническая работоспособность приватного API не делает
+его документированным поддерживаемым интерфейсом.
 Актуальный открытый issue 1.1.27 показывает обрезку ~452 KB входа до ~192 KB,
 поэтому длину принятого текста нужно доказывать до model generation, а не по
 самому факту появления `user` event.
 
 ---
+
+## Внутренний API AGY 1.2.14 без терминального экрана
+
+Штатный macOS arm64 `agy` одновременно с print-mode поднимает собственные
+loopback HTTP/HTTPS listeners. В исследовании порты получены по PID именно
+своего процесса. Параметр `--csrf_token=<случайный локальный токен>` задаёт
+доступ к этому процессу; это не Google OAuth token. JSON RPC находятся под
+`/exa.language_server_pb.LanguageServerService/`. Имена и protobuf-поля
+восстановлены из установленного бинарника, затем проверены запросами.
+
+На неизменённом CLI с Google account sign-in подтверждены:
+
+- `SendUserCascadeMessage` + Connect-поток `StreamAgentStateUpdates`:
+  настоящий ответ Gemini и события `RUNNING → steps → fullyIdle`, без prompt
+  на stdin. Старый `StreamCascadeReactiveUpdates` отвечает `reactive state is
+  deprecated`; наличие символа в бинарнике само по себе не доказывает работу.
+- `GetCascadeTrajectory`, `ForkConversation` с
+  `FORK_TARGET_CURRENT_WORKSPACE`, `RevertToCascadeStep`. Revert сохраняет
+  `stepIndex` **включительно**; чтобы удалить выбранный user turn, нужен индекс
+  перед ним. Требуется `overrideConfig` с настоящим model config исходника,
+  иначе сервер отвечает `plan model not specified`.
+- После fork/rewind hash исходных steps не изменился; новый процесс на ветке
+  помнит ранний canary и не знает удалённый поздний, исходник помнит поздний.
+- Native `CancelCascadeInvocation` прекращает генерацию, сохраняя процесс;
+  следующий запрос работает. Также проверены обычный stream-json, реальный
+  file-read tool, resume и переключение low → medium через новый процесс.
+
+Отдельное ограничение print-обвязки: она автоматически пропускает `ask_question`
+и отклоняет permission requests. Успеть ответить HTTP-вызовом нельзя считать
+решением: в наблюдении `WAITING → skipped` заняло 2 мс. В **изолированной копии**
+1.2.14 исследовательский патч getter `Manager.IsPrintMode` (4 байта, exact
+SHA/version guard) оставил запросы ожидающими собственного host UI. На этой
+копии подтверждены `HandleCascadeUserInteraction`, ответ RED, очередь
+`WHEN_IDLE` и `NEXT_INVOCATION` (ввод потреблён до idle текущего turn),
+отказ записи без изменения файла и разовый allow с реальной
+записью; fixture восстановлена. Это не auto-approve и не установленный патч.
+Полное устранение TUI поэтому требует учёта host-owned interactions, а не
+только подключения к локальному порту. Поддержка закрытого протокола/патча
+при обновлениях остаётся ценой такого варианта.
+
+Патч не сохраняет доверенную подпись вендора. Read-only проверка `codesign -dv`
+02.10 показала у оригинала Developer ID Google / TeamIdentifier `EQHXZ8M8AV`,
+у тестовой копии — `Signature=adhoc`, без TeamIdentifier. Копия работала с
+текущим локальным Google login, но это не доказательство переносимости её
+доверия/доступа к credentials на другой Mac или будущие версии. Нельзя
+приравнивать локально работающий research executable к готовой подписанной
+поставке; глобальные проверки macOS ради интеграции не отключались.
+
+Артефакты: `/tmp/noted-agy-proof.R14Ohk/`, рабочий статус и пределы проверок —
+`docs/tmp/исследование-терминалов-и-агентов.md`. Исходный `~/.local/bin/agy`
+не изменён; runtime Noted на этот протокол не переводился. Снятие TUI не
+устраняет agent process: в этих коротких прогонах его RSS был примерно
+180–220 MiB; это не сравнительный benchmark с TUI.
+Позднейший сопоставимый A/B с живыми процессами, включая эту host-копию,
+измерял `phys_footprint`, а не RSS: см.
+`fact-terminal-rendering.md::Цена TUI в живых CLI: ограниченный A/B 02.10.2026`.
+
+## Переиспользование открытого ядра без TUI
+
+Исходники старого Gemini CLI нельзя приравнивать к подписочному `agy`.
+В Gemini CLI 0.62.0 отдельный npm-пакет `@google/gemini-cli-core` экспортирует
+`LegacyAgentSession`: его цикл уже связывает `GeminiClient.sendMessageStream`
+с `Scheduler.schedule`, записью результатов и следующим обращением к модели.
+Обязательно писать этот цикл с нуля при удалении TUI не требуется. Approvals
+идут через MessageBus, запись и conversation rewind — через
+ChatRecordingService; часть composition для fork/rewind и file rollback остаётся
+в CLI. Одного импорта ядра недостаточно для полного сохранения этих действий.
+
+01.10 пакет 0.62.0 импортирован отдельным Node runner без Ink, PTY и
+терминального renderer. Контролируемые client/scheduler подтвердили
+model → tool → model, следующий prompt, native отказ concurrent send и abort.
+Это runtime-proof границы ядра с тестовыми providers, не запуск настоящих
+инструментов, подписочный inference или проверка durable fork/rewind.
+Артефакт/продолжение — `docs/tmp/исследование-терминалов-и-агентов.md`.
+Переход текущих Noted-вкладок на embedded core не выполнялся; код старого
+Gemini не доказывает права на Antigravity quota или AGY-only модели.
 
 ## 1. Smart Gemini Resume (State Detection)
 **Файл-источник:** `fix-smart-gemini-resume.md`

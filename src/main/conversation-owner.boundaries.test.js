@@ -308,6 +308,7 @@ test('actual authenticated HTTP receipt/applicability/strict Send with SQLite: O
   let bridges = 0;
   const sendJson = (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
   const ctx = vm.createContext({ console: quiet, url, crypto, token: 'fixture', conversationOwners: h.owner,
+    compactSendReceiptPresentation: require('./compact-send-settlement').compactSendReceiptPresentation,
     require: name => { if (name.endsWith('project-manager')) return { db }; throw Error('unexpected module ' + name); },
     savedHistoryOperations: h.registry, inboxSavedHistoryOperations: null,
     agentSendReceiptStore: receiptStore, agentSendReceiptRegistry: createAgentSendReceiptRegistry(), agentSendReceiptStartupReady: Promise.resolve(),

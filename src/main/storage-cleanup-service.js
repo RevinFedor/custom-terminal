@@ -9,6 +9,7 @@ const {
   DEFAULT_SETTINGS,
   normalizeStorageRetentionSettings,
   scanStorageInventory,
+  storageItemDeletionRevision,
 } = require('./storage-inventory');
 const { CodexStorageDeletionProvider, uniqueSessionIds } = require('./codex-storage-deletion-provider');
 const { StorageDeletionAudit } = require('./storage-deletion-audit');
@@ -118,8 +119,15 @@ class StorageCleanupService {
       settings: this.getSettings(),
       nowMs,
     }).then((result) => {
-      this.cached = result;
-      return result;
+      const snapshot = {
+        ...result,
+        items: result.items.map((item) => ({
+          ...item,
+          deletionRevision: storageItemDeletionRevision(item),
+        })),
+      };
+      this.cached = snapshot;
+      return snapshot;
     }).finally(() => {
       this.scanInflight = null;
     });
@@ -285,7 +293,7 @@ class StorageCleanupService {
     try { payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')); } catch {}
     const expectedItemIds = uniqueSessionIds(itemIds).sort();
     const confirmedItemIds = uniqueSessionIds(payload?.itemIds).sort();
-    if (payload?.version !== 1
+    if (![1, 2].includes(payload?.version)
       || payload?.generation !== generation
       || JSON.stringify(expectedItemIds) !== JSON.stringify(confirmedItemIds)) {
       throw deletionError('storage_delete_confirmation_invalid', 'Deletion confirmation does not match the requested items');
@@ -296,7 +304,23 @@ class StorageCleanupService {
     return payload;
   }
 
-  async prepareDeleteItems({ itemIds, generation } = {}) {
+  _checkItemRevisions(inventory, revisions, itemIds, phase) {
+    const byId = new Map(inventory.items.map((item) => [item.id, item]));
+    const changedItems = itemIds.filter((id) => (
+      !byId.has(id) || revisions?.[id] !== byId.get(id).deletionRevision
+    )).map((id) => ({
+      itemId: id,
+      title: byId.get(id)?.title || null,
+      reason: !byId.has(id) ? 'item-missing'
+        : byId.get(id).protected || !byId.get(id).deletable ? 'item-protected'
+          : 'item-changed',
+    }));
+    if (changedItems.length === 0) return null;
+    this.logger.log?.('[StorageCleanup:ScopeRejected] ' + JSON.stringify({ phase, changedItems }));
+    return { success: false, error: 'storage_scan_stale', scope: 'selected-items', changedItems, currentGeneration: inventory.generation };
+  }
+
+  async prepareDeleteItems({ itemIds, generation, itemRevisions = null } = {}) {
     const ids = [...new Set((Array.isArray(itemIds) ? itemIds : []).map(String).filter(Boolean))];
     if (ids.length === 0) return { success: false, error: 'storage_item_ids_required' };
     const authority = this._mutationAuthority();
@@ -304,7 +328,15 @@ class StorageCleanupService {
       return { success: false, error: 'storage_production_authority_unavailable', reason: authority.reason };
     }
     const before = await this.scan({ force: true });
-    if (!generation || generation !== before.generation) {
+    const scoped = itemRevisions != null;
+    if (scoped) {
+      if (typeof itemRevisions !== 'object' || Array.isArray(itemRevisions)
+        || JSON.stringify(Object.keys(itemRevisions).sort()) !== JSON.stringify([...ids].sort())) {
+        return { success: false, error: 'storage_item_revisions_invalid' };
+      }
+      const rejected = this._checkItemRevisions(before, itemRevisions, ids, 'prepare');
+      if (rejected) return rejected;
+    } else if (!generation || generation !== before.generation) {
       return { success: false, error: 'storage_scan_stale', currentGeneration: before.generation };
     }
     const byId = new Map(before.items.map((item) => [item.id, item]));
@@ -320,6 +352,7 @@ class StorageCleanupService {
     }
     const closures = {};
     const affectedKeys = new Set();
+    const affectedItemIds = new Set(ids);
     let affectedBytes = 0;
     let codexProvider = null;
     try {
@@ -358,7 +391,9 @@ class StorageCleanupService {
             const key = `${item.provider}:${sessionId}`;
             if (affectedKeys.has(key)) continue;
             affectedKeys.add(key);
-            affectedBytes += Number(canonicalSessionItems.get(key)?.sizeBytes) || 0;
+            const physicalItem = canonicalSessionItems.get(key);
+            if (physicalItem) affectedItemIds.add(physicalItem.id);
+            affectedBytes += Number(physicalItem?.sizeBytes) || 0;
           }
         } else if (!affectedKeys.has(`item:${item.id}`)) {
           affectedKeys.add(`item:${item.id}`);
@@ -372,15 +407,17 @@ class StorageCleanupService {
     }
     const issuedAt = this.now();
     const payload = {
-      version: 1,
+      version: scoped ? 2 : 1,
       generation: before.generation,
       itemIds: [...ids].sort(),
       closures,
+      ...(scoped ? { itemRevisions: Object.fromEntries([...affectedItemIds].map((id) => [id, byId.get(id).deletionRevision])) } : {}),
       issuedAt,
       expiresAt: issuedAt + this.confirmationTtlMs,
     };
     return {
       success: true,
+      generation: before.generation,
       confirmationToken: this._signDeleteConfirmation(payload),
       affectedItems: affectedKeys.size,
       affectedBytes,
@@ -508,16 +545,24 @@ class StorageCleanupService {
     const resolvedOperationId = String(operationId || '').trim()
       || `storage-${source}-${this.now().toString(36)}`;
     const before = await this.scan({ force: true });
-    if (!generation || generation !== before.generation) {
-      return { success: false, error: 'storage_scan_stale', currentGeneration: before.generation };
-    }
     let deleteConfirmation = null;
     if (source === 'dashboard') {
       try {
-        deleteConfirmation = this._verifyDeleteConfirmation(confirmationToken, { itemIds: ids, generation: before.generation });
+        deleteConfirmation = this._verifyDeleteConfirmation(confirmationToken, { itemIds: ids, generation });
       } catch (error) {
         return { success: false, error: error?.code || 'storage_delete_confirmation_invalid', detail: error?.message || String(error) };
       }
+    }
+    if (deleteConfirmation?.version === 2) {
+      const revisions = deleteConfirmation.itemRevisions;
+      if (!revisions || typeof revisions !== 'object' || Array.isArray(revisions)
+        || ids.some((id) => typeof revisions[id] !== 'string')) {
+        return { success: false, error: 'storage_delete_confirmation_invalid' };
+      }
+      const rejected = this._checkItemRevisions(before, revisions, Object.keys(revisions), 'confirm');
+      if (rejected) return rejected;
+    } else if (!generation || generation !== before.generation) {
+      return { success: false, error: 'storage_scan_stale', currentGeneration: before.generation };
     }
     const byId = new Map(before.items.map((item) => [item.id, item]));
     const requested = ids.map((id) => byId.get(id)).filter(Boolean);

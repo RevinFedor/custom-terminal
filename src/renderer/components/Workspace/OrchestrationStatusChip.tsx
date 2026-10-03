@@ -20,6 +20,7 @@ import {
   X,
 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
+import { TabMessageTracker } from './TabMessageTracker';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import type { OrchestrationRun, OrchestrationStatus } from '../../store/useOrchestrationStore';
 import { isOrchestrationResultProofPending } from '../../utils/orchestrationRunProjection.mjs';
@@ -689,6 +690,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
       data-orchestration-status
       style={{ display: 'contents', pointerEvents: 'auto' }}
     >
+      <TabMessageTracker tabId={tabId} />
       {statusRuns.length > 0 && (
         <div
           data-orchestration-active-list

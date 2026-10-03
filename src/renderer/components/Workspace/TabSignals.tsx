@@ -970,18 +970,19 @@ export function TabTaskMarker({
   color: string;
   shape: 'dot' | 'square';
   title: string;
-  onClick: (event: React.MouseEvent<HTMLButtonElement>) => void;
+  onClick?: (event: React.MouseEvent<HTMLButtonElement>) => void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const Tag = onClick ? 'button' : 'span';
   return (
-    <button
-      type="button"
+    <Tag
+      {...(onClick ? { type: 'button' as const } : {})}
       data-task-plan-tab-marker
       title={title}
-      onPointerDown={(event) => event.stopPropagation()}
-      onDoubleClick={(event) => event.stopPropagation()}
+      onPointerDown={(event) => { if (onClick) event.stopPropagation(); }}
+      onDoubleClick={(event) => { if (onClick) event.stopPropagation(); }}
       onClick={onClick}
-      onMouseEnter={() => setHovered(true)}
+      onMouseEnter={() => { if (onClick) setHovered(true); }}
       onMouseLeave={() => setHovered(false)}
       style={{
         display: 'block',
@@ -993,8 +994,10 @@ export function TabTaskMarker({
         backgroundColor: color,
         border: '1px solid rgba(0,0,0,0.38)',
         boxSizing: 'border-box',
+        // A static marker remains part of the enclosing tab's hit target,
+        // including the few pixels that hang below its border.
         pointerEvents: 'auto',
-        cursor: 'pointer',
+        cursor: onClick ? 'pointer' : undefined,
         outline: 'none',
         transform: `scale(${hovered ? TASK_MARKER_HOVER_SCALE : 1})`,
         transformOrigin: 'center bottom',

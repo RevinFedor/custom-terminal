@@ -143,6 +143,16 @@ limit» в обычном ответе, user prompt или tool result не яв
   угадыванием path или переносом base64 во весь список History: preview/copy
   должны лениво адресовать exact record UUID + image-part и при необходимости
   материализовать проверенный managed asset через main.
+
+  Source03.10 mobile-origin images используют original upload path плюс exact
+  sourcePath/transportPath на том же occurrence. Missing refs существующего
+  local handoff могут дополниться из bounded receipt request proof без новой
+  строки/смены delivery. Adjacent images, разделённые только whitespace, стоят
+  в одной горизонтальной inline полосе; иной текст не переставляется. Два
+  повтора одного файла сохраняют ordinal refs1/2. Preview переиспользует mobile
+  upload-root authorization/12MB cap, не расширяет доступ к arbitrary alias.
+  Промоутированный response→event carrier связан через immutable source alias,
+  не угадывается по footer/count. Шрам — `fix-codex-image-receipt-projection.md`.
 - **Undo/Redo восстанавливает весь draft, а не только текст.** CodeMirror history хранит рядом с изменением документа точные image refs и тела chips. Обычное удаление, Cut и `Select all → Delete` одним Undo возвращают markers, sidecars и selection; Redo удаляет их вместе. Pending→ready замена картинки не создаёт второй шаг: Undo удаляет всю вставку, Redo возвращает уже финальный ref. При смене `tabId` стек обнуляется, поэтому история одной вкладки не может изменить другую.
 - **Весь draft и его view state принадлежат вкладке.** Один durable snapshot хранит editable text, image refs и полные тела prompt/paste chips; отдельно рядом с ним сохраняются selection и внутренний `scrollTop`. Оба состояния сбрасываются в синхронное localStorage/SQLite-зеркало на blur, смене вкладки, `beforeunload` и явном flush, а при mount/restart восстанавливаются по `tabId`. События selection/scroll от технической подмены CodeMirror owner игнорируются до завершения restore, иначе временные `0` перезапишут координаты возвращаемой вкладки. Высота отдельно не хранится и каждый раз выводится из актуального документа; пустая вкладка не наследует раскрытые восемь строк заполненной. Кэш ограничен 100 вкладками и общим бюджетом примерно 3 млн символов, но самый свежий draft сохраняется даже если он один превышает бюджет.
   Durable receipt с доказанным `not-submitted` — только одноразовый источник
@@ -177,6 +187,14 @@ limit» в обычном ответе, user prompt или tool result не яв
 - Пока bitmap сохраняется, composer показывает `[Image saving…]`; Send и перенос в Run After запрещены. Перед Send файл заново проверяется, после чего marker раскрывается в transport path. Для транспорта крайние whitespace обрезаются, но compare-and-clear сверяет неизменённый исходный draft: сравнение raw draft с trimmed payload ложно принимает завершающий перенос за новую пользовательскую правку и оставляет уже отправленный текст в input. Если пользователь действительно успел допечатать или заменить вложение во время асинхронной проверки, отправляется нажатый snapshot, а более новый draft не очищается.
 
 ### Escape, следующий ход и подтверждение доставки
+
+Общий Send держит readiness-listener и исходный deadline до окончания последнего
+чтения готовности. Первый `ready` не завершает подготовку: автоматический picker
+может занять input между двумя чтениями. Тогда тот же handoff продолжает ждать,
+не пересобирая контекст и не запуская процесс повторно. Cleanup выполняется при
+выходе из прохода, а не перед последней проверкой. Иначе ожидание отменённого
+Promise не получит ни события, ни таймаута и оставит карточку `PREPARING` навсегда.
+Это правило не заменяет main-owned Claude startup gate renderer-таймером.
 
 Известное ожидание пользовательского выбора Codex (например, paused Goal) —
 информационное состояние, не failed launch. Если Send остановился здесь до

@@ -2,6 +2,7 @@ import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { History, Pin, Settings } from 'lucide-react';
 import { useUIStore } from '../store/useUIStore';
+import { useUsageVisibilityStore } from '../store/useUsageVisibilityStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import type { CodexModelOption } from '../constants/codexSettings';
 import {
@@ -37,6 +38,7 @@ interface StatusBarProps {
 }
 
 export default function StatusBar({ onOpenSettings, onOpenHelp }: StatusBarProps) {
+  const visibleProviders = useUsageVisibilityStore(state => state.visibleProviders);
   const debugHoverBridges = useUIStore((s) => s.debugHoverBridges);
   const setDebugHoverBridges = useUIStore((s) => s.setDebugHoverBridges);
   const streamerMode = useUIStore((s) => s.streamerMode);
@@ -141,7 +143,7 @@ export default function StatusBar({ onOpenSettings, onOpenHelp }: StatusBarProps
             здесь остались НАСТРОЙКИ: они общие для всех копирований, не свойство
             одной вкладки, и место им — там же, где прочие умолчания приложения. */}
         <CopySessionSettingsChip />
-        <EngineDefaultsSelector
+        {visibleProviders.claude && <EngineDefaultsSelector
           engine="Claude"
           accent="#DA7756"
           icon={CUSTOM_ICONS.claude}
@@ -151,8 +153,8 @@ export default function StatusBar({ onOpenSettings, onOpenHelp }: StatusBarProps
           effortOptions={claudeEfforts}
           onModelChange={setDefaultClaudeModelWithEffort}
           onEffortChange={setDefaultClaudeEffort}
-        />
-        <EngineDefaultsSelector
+        />}
+        {visibleProviders.codex && <EngineDefaultsSelector
           engine="Codex"
           accent="#34D399"
           icon={<img src={CODEX_ICON_URL} alt="" style={{ width: '100%', height: '100%', display: 'block' }} />}
@@ -162,7 +164,7 @@ export default function StatusBar({ onOpenSettings, onOpenHelp }: StatusBarProps
           effortOptions={codexEfforts}
           onModelChange={setDefaultCodexModelWithEffort}
           onEffortChange={setDefaultCodexEffort}
-        />
+        />}
         <StatusToggle
           label="kill dev-ports"
           title="Если ВКЛ — перед каждым запуском npm-скрипта / restart / stop сначала убиваются занятые порты проекта (vite/backend), считанные из vite.config / .env / NestJS main.ts. Защита от 'address in use' после крашей."

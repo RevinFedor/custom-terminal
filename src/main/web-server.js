@@ -47,6 +47,11 @@ const http2 = require('http2');
 const url = require('url');
 const path = require('path');
 const srcMainDir = __dirname;
+const { TabMessageService, formatTabMessagePrompt } = require(path.join(srcMainDir, 'tab-messages'));
+const { compactTabMessage, handleTabMessageApi } = require(path.join(srcMainDir, 'tab-message-api'));
+const { messageRuntimeIdentity, scenarioDestination, identityUnavailable } = require(path.join(srcMainDir, 'agent-message-identity'));
+const { CompletionContentStore, buildOrchestrationCompletionContent,
+  MAX_INLINE_ASSISTANT_CHARS } = require(path.join(srcMainDir, 'orchestration-completion-content'));
 const { prepareStructuredAuthoring, validateStructuredSendEnvelope, bindStructuredAuthoringPresentation, STRUCTURED_AUTHORING_LIMITS } = require(path.join(srcMainDir, 'structured-authoring'));
 const { MAX_EVENT_TABS, eventTabIds, stampedEventSink, PublicHistoryRevisions, TabTranscriptSubscriptions } = require(path.join(srcMainDir, 'public-history-read'));
 const { observeHistoryResponseTimingBindings } = require(path.join(srcMainDir, 'history-response-timings'));
@@ -144,6 +149,7 @@ const {
 const {
   agentPromptAuditMatchesHash,
 } = require('./agent-prompt-audit-identity');
+const { compactSendReceiptPresentation } = require(path.join(srcMainDir, 'compact-send-settlement'));
 const {
   RECEIPT_STATES: AGENT_SEND_RECEIPT_STATES,
   createAgentSendReceiptRegistry,
@@ -151,6 +157,7 @@ const {
   isAgentSendProviderQueueAccepted,
 } = require('./agent-send-receipt-registry');
 const { applyHistoryEntryWindow } = require('./history-entry-window');
+const { historyPayloadCapability, historyPayloadQuery } = require(path.join(srcMainDir, 'public-history-read'));
 const {
   orchestrationRequestFingerprint,
   reservedOrchestrationTargetTabId,
@@ -466,6 +473,9 @@ let externalResearchCoordinator = null;
 // in-memory registry below only joins concurrent callers and projects the
 // current-process waiter; it must never recreate retry authority after restart.
 let agentSendReceiptStore = null;
+let tabMessageService = null;
+let tabMessageSdkSessions = null;
+let orchestrationCompletionContentStore = null;
 let agentSendReceiptStartupReady = Promise.resolve({ ready: true });
 
 function normalizePublicRuntimeStatus(value) {
@@ -596,6 +606,157 @@ function getOrchestrationRunStore() {
     orchestrationRunStore = new OrchestrationRunStore(path.join(app.getPath('userData'), 'orchestration-runs.json'));
   }
   return orchestrationRunStore;
+}
+
+function getCompletionContentStore() {
+  if (!orchestrationCompletionContentStore) {
+    orchestrationCompletionContentStore = new CompletionContentStore({
+      db: require(path.join(srcMainDir, 'project-manager')).db.db,
+    });
+  }
+  return orchestrationCompletionContentStore;
+}
+
+async function prepareOrchestrationCompletionContent(run) {
+  const snapshots = getCompletionContentStore();
+  const frozen = snapshots.get(run.runId);
+  if (frozen) return frozen;
+  // A pre-upgrade handoff may already be in the provider queue. Its payload
+  // must remain the original legacy notification through every retry.
+  if (run.notificationAttemptedAt || run.notificationPromptHash || run.notificationAttempt) return null;
+  if (!run.sourceSendTarget && !run.sourceSessionId && !run.sourceExecutionContext?.sessionId) return null;
+  const resultAttempt = captureOrchestrationResultAttempt(run);
+  let result;
+  if (run.status !== 'completed') {
+    result = { runId: run.runId, success: false, error: run.error || run.resultError || run.outcome };
+  } else if (isExternalResearchRun(run)) {
+    const read = await readExternalResearchResult(run.runId, MAX_INLINE_ASSISTANT_CHARS);
+    if (read.statusCode !== 200 || read.body?.ready !== true || read.body?.success !== true) {
+      throw Object.assign(new Error(read.body?.error || 'external_research_result_not_ready'), {
+        code: read.body?.code || 'external_research_result_not_ready',
+      });
+    }
+    result = read.body;
+  } else {
+    result = await probeOrchestrationResult(run, { maxChars: MAX_INLINE_ASSISTANT_CHARS,
+      forceFresh: true, resultReadMode: 'source-proof', resultAttempt });
+    if (!isCompleteOrchestrationResult(result)) {
+      throw Object.assign(new Error(result.error || 'orchestration_result_not_ready'), {
+        code: result.errorCode || 'orchestration_result_not_ready',
+      });
+    }
+  }
+  const current = await getOrchestrationRunStore().getInternal(run.runId);
+  if (!current || current.status !== run.status || current.completedAt !== run.completedAt
+    || current.notificationSuppressed || current.notificationCancelRequestedAt
+    || (!isExternalResearchRun(run) && !orchestrationResultAttemptMatches(current, resultAttempt))) {
+    throw Object.assign(new Error('orchestration_completion_changed_during_read'), {
+      code: 'orchestration_completion_changed_during_read',
+    });
+  }
+  const content = snapshots.freeze(buildOrchestrationCompletionContent(current, result, {
+    baseUrl: 'http://127.0.0.1:' + resolvedPort,
+  }));
+  console.log('[OrchestrationContent] frozen run=' + run.runId + ' mode=' + content.mode
+    + ' chars=' + content.assistantChars + ' promptChars=' + content.prompt.length
+    + ' hash=' + content.promptHash + ' source=' + run.sourceTabId);
+  return content;
+}
+
+async function resolveTabMessageIdentity(tabId) {
+  const descriptor = findOrchestrationTabDescriptor(tabId);
+  if (!descriptor) return null;
+  if (descriptor.tabType === 'claude-sdk') {
+    const sessionId = tabMessageSdkSessions?.get(tabId)?.sessionId || descriptor.sessionId;
+    if (!sessionId) throw identityUnavailable();
+    return { ...descriptor, provider: 'claude', sessionId, sendTarget: { toolType: 'claude', sessionId } };
+  }
+  if (typeof readAgentRuntimeSnapshot !== 'function') throw identityUnavailable();
+  return messageRuntimeIdentity(descriptor, await readAgentRuntimeSnapshot(tabId));
+}
+
+async function readScenarioDestination(tabId) {
+  const descriptor = findOrchestrationTabDescriptor(tabId);
+  if (descriptor?.tabType === 'claude-sdk') return (await resolveTabMessageIdentity(tabId)).sendTarget;
+  if (typeof readAgentRuntimeSnapshot !== 'function') return descriptor;
+  return scenarioDestination(await readAgentRuntimeSnapshot(tabId));
+}
+
+async function captureOrchestrationSourceTarget(source, priorRun, expectedExecution = null) {
+  if (priorRun) return priorRun.sourceSendTarget || null;
+  const identity = await resolveTabMessageIdentity(source.tabId);
+  if (!identity) throw identityUnavailable('orchestration_source_tab_unavailable');
+  if (expectedExecution && (expectedExecution.provider !== identity.provider
+    || (expectedExecution.sessionId && expectedExecution.sessionId !== identity.sessionId
+      && expectedExecution.sessionId !== identity.acceptedResumeSourceSessionId))) {
+    throw identityUnavailable('orchestration_source_changed_during_reservation');
+  }
+  return identity.sendTarget;
+}
+
+function emitTabMessage(message, reason) {
+  const payload = { type: 'tab-message-update', message: compactTabMessage(message), reason };
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send('tab-messages:changed', payload);
+  }
+  for (const tabId of new Set([message.sourceTabId, message.targetTabId])) webBroadcast(tabId, payload);
+}
+
+function getTabMessageService() {
+  if (!tabMessageService) {
+    tabMessageService = new TabMessageService({
+      db: require(path.join(srcMainDir, 'project-manager')).db.db,
+      resolveTab: resolveTabMessageIdentity,
+      getReceipt: operationKey => agentSendReceiptStore?.get(operationKey) || null,
+      receiptRequiredBeforeSend: true,
+      releaseReceipt: operationKey => agentSendReceiptStore?.unpinForOwner(operationKey, 'tab-message'),
+      send: sendTabMessage,
+      onChanged: emitTabMessage,
+      log: (event, detail) => console.log('[TabMessages] ' + event + ' ' + JSON.stringify(detail)),
+    });
+  }
+  return tabMessageService;
+}
+
+async function sendTabMessage(message) {
+  await agentSendReceiptStartupReady;
+  if (!agentSendReceiptStore) throw Object.assign(new Error('message_receipt_store_unavailable'), { submitted: false });
+  // Receipt absence proves no send only while pruning cannot remove the
+  // evidence between physical submission and the message's durable sent state.
+  agentSendReceiptStore.pinForOwner(message.operationKey, 'tab-message');
+  const service = getTabMessageService();
+  const status = await resolveAgentSessionInfo(message.targetTabId, 2000);
+  const expectedTarget = { toolType: message.targetProvider, sessionId: message.targetSessionId };
+  const source = 'tab-message:' + message.messageId;
+  const question = message.replyTo ? service.getMessage(message.replyTo)?.message : null;
+  const rawPrompt = formatTabMessagePrompt(message, question);
+  let prompt = message.preparedPrompt || message.prompt;
+  if (!message.preparedPrompt) {
+    prompt = tabWorkContext
+      ? (await tabWorkContext.prepare(message.targetTabId, message.handoffId, prompt)).prompt
+      : prompt;
+    service.updateFrozenPrompt(message.messageId, prompt);
+  }
+  const result = await runAgentSendScenario({
+    tabId: message.targetTabId, prompt, workContextPrepared: true,
+    handoffId: message.handoffId, source,
+    statusAtSend: status?.status || 'unknown', queue: true, ownership: 'project',
+    provider: message.targetProvider, sessionId: message.targetSessionId,
+    expectedTarget, cwd: message.targetCwd,
+    sendOperationKey: message.operationKey, sendSurface: 'tab-message',
+    presentationSnapshot: { semanticTags: [{ kind: 'tab-message',
+      messageId: message.messageId, replyTo: message.replyTo || null, phase: message.kind,
+      ...(prompt.endsWith(rawPrompt) ? { envelopeStart: prompt.length - rawPrompt.length } : {}),
+      envelopeText: rawPrompt.slice(0, rawPrompt.length - message.text.length),
+      bodyProjectionHash: crypto.createHash('sha256').update(prompt, 'utf8').digest('hex'),
+      bodyStart: prompt.length - message.text.length, bodyEnd: prompt.length,
+      sourceTabId: message.sourceTabId, sourceTabName: message.sourceTabName,
+      sourceProjectId: message.sourceProjectId, targetTabId: message.targetTabId,
+      targetTabName: message.targetTabName, targetProjectId: message.targetProjectId,
+    }] },
+    onLateReceipt: () => service.reconcileReceipts(message.targetTabId, 'late-receipt'),
+  });
+  return result;
 }
 
 function getScExternalResearchClient() {
@@ -2341,8 +2502,10 @@ function publicAgentSendReceipt(record) {
     operationKey: record.operationKey,
     attemptId: record.attemptId || null,
   });
+  const serviceCommand = compactSendReceiptPresentation(record);
+  const { serviceCommand: _storedPresentation, ...delivery } = replay;
   return {
-    ...replay,
+    ...delivery,
     operationKey: record.operationKey,
     attemptId: record.attemptId || null,
     surface: record.surface,
@@ -2362,6 +2525,7 @@ function publicAgentSendReceipt(record) {
     sourceIdentity: record.auditIdentity?.sourceIdentity || null,
     auditSourceIdentity: record.auditIdentity?.sourceIdentity || null,
     sourceIdentityAliases: record.auditIdentity?.sourceIdentityAliases || [],
+    ...(serviceCommand ? { serviceCommand } : {}),
   };
 }
 
@@ -2527,8 +2691,14 @@ async function runPreparedAgentSendScenario({
       catch (error) { result = { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
     }
     if (!result && expectedTarget) {
-      const currentTarget = findOrchestrationTabDescriptor(tabId);
-      result = agentSendTargetPreconditionFailure(expectedTarget, currentTarget);
+      try {
+        const currentTarget = typeof readAgentRuntimeSnapshot === 'function'
+          ? await readScenarioDestination(tabId) : findOrchestrationTabDescriptor(tabId);
+        result = agentSendTargetPreconditionFailure(expectedTarget, currentTarget);
+      } catch (error) {
+        result = { success: false, accepted: false, submitted: false, status: 'not-submitted',
+          code: error.code || 'agent_send_target_unavailable', error: error.message, httpStatus: 503 };
+      }
     }
     if (!result && durableIdentity) {
       const begun = agentSendReceiptStore.beginAttempt(durableIdentity);
@@ -2596,9 +2766,10 @@ async function runPreparedAgentSendScenario({
       result = await bridgeRequest('sendAgentPromptScenario', {
         tabId,
         targetProjectId: target?.projectId || null,
-        expectedToolType: target?.toolType || provider || null,
+        expectedToolType: expectedTarget?.toolType || target?.toolType || provider || null,
         expectedTabType: target?.tabType || null,
         expectedSessionId: expectedTarget?.sessionId || null,
+        ...(expectedTarget ? { expectedTarget } : {}),
         ...(expectedTarget?.expectedBinding === 'none' ? { expectedBinding: 'none' } : {}),
         requireLive,
         prompt,
@@ -3851,7 +4022,7 @@ function orchestrationNotificationText(run) {
   ].filter(Boolean).join('\n');
 }
 
-function orchestrationPresentationSnapshot(run, phase) {
+function orchestrationPresentationSnapshot(run, phase, content = null, preparedPrompt = null) {
   if (!run?.runId) return null;
   const promptChips = phase === 'request' && Array.isArray(run.deliveryIntent?.promptChips)
     ? run.deliveryIntent.promptChips
@@ -3865,9 +4036,20 @@ function orchestrationPresentationSnapshot(run, phase) {
       parentRunId: run.parentRunId || undefined,
       sourceTabId: run.sourceTabId || undefined,
       targetTabId: run.targetTabId || undefined,
+      sourceTabName: run.sourceTabName || undefined,
+      targetTabName: run.targetTabName || undefined,
+      sourceProjectId: run.sourceProjectId || undefined,
+      targetProjectId: run.targetProjectId || undefined,
       runKind: run.runKind || 'agent',
       externalProvider: run.externalResearchProvider || undefined,
       outcome: run.outcome || undefined,
+      ...(content && typeof preparedPrompt === 'string' && preparedPrompt.endsWith(content.prompt)
+        && Number.isSafeInteger(content.bodyStart) && Number.isSafeInteger(content.bodyEnd)
+        ? { envelopeStart: preparedPrompt.length - content.prompt.length,
+          envelopeText: content.prompt.slice(0, content.bodyStart),
+          bodyProjectionHash: crypto.createHash('sha256').update(preparedPrompt, 'utf8').digest('hex'),
+          bodyStart: preparedPrompt.length - content.prompt.length + content.bodyStart,
+          bodyEnd: preparedPrompt.length - content.prompt.length + content.bodyEnd } : {}),
     }],
   };
 }
@@ -3902,6 +4084,8 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
   let notificationText = orchestrationNotificationText(current);
   const notificationHandoffId = 'orchestration-complete:' + current.runId;
   try {
+    const completionContent = await prepareOrchestrationCompletionContent(current);
+    if (completionContent) notificationText = completionContent.prompt;
     const status = await resolveAgentSessionInfo(current.sourceTabId, 2000);
     if (!status) {
       await releaseOrchestrationSourceProof(current.runId, 'source-unavailable');
@@ -3913,6 +4097,17 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       return;
     }
     const sourceSendOptions = resolveOrchestrationSourceNotificationSendOptions(status);
+    const completionTarget = completionContent ? current.sourceSendTarget || {
+      toolType: current.sourceToolType || current.sourceExecutionContext?.provider
+        || status.toolType || status.commandType,
+      sessionId: completionContent.metadata.sourceSessionId || current.notificationSourceSessionId
+        || current.sourceExecutionContext?.sessionId || null,
+    } : null;
+    if (completionTarget) {
+      const actual = await readScenarioDestination(current.sourceTabId);
+      const failure = agentSendTargetPreconditionFailure(completionTarget, actual);
+      if (failure) throw Object.assign(new Error(failure.error), failure);
+    }
     if (tabWorkContext && (!current.notificationPromptAuditHash
       || tabWorkContext.hasHandoff(current.sourceTabId, notificationHandoffId))) {
       notificationText = (await tabWorkContext.prepare(current.sourceTabId, notificationHandoffId, notificationText)).prompt;
@@ -3950,9 +4145,12 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       presentationSnapshot: orchestrationPresentationSnapshot(
         current,
         current.status === 'completed' ? 'completion' : 'failure',
+        completionContent,
+        notificationText,
       ),
       provider: status?.toolType || status?.commandType || null,
       sessionId: notificationSourceSessionId,
+      ...(completionTarget ? { expectedTarget: completionTarget } : {}),
       timeoutMs: 60_000,
     });
     const sendReceipt = classifyAgentSendReceipt(result);
@@ -4052,6 +4250,9 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
     }
   } catch (error) {
     await releaseOrchestrationSourceProof(current.runId, 'notification-send-threw');
+    console.warn('[OrchestrationContent] delivery-failed run=' + current.runId
+      + ' source=' + current.sourceTabId + ' code=' + (error?.code || 'notification_error')
+      + ' error=' + String(error?.message || error).slice(0, 500));
     const latest = await store.getInternal(current.runId);
     if (latest?.notificationCancelRequestedAt) {
       const suppressed = await store.markNotification(current.runId, 'suppressed', {
@@ -4143,6 +4344,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
   } else {
     tabWorkContext?.settle(detail.tabId, detail.handoffId, detail);
   }
+  if (tabMessageService) await tabMessageService.reconcileReceipts(detail.tabId, 'prompt-audit');
   const sendReceiptPromotion = durableAuditAccepted
     ? agentSendReceiptRegistry.promoteFromAudit(detail)
     : { matched: false, promoted: false, reason: 'durable-audit-rejected' };
@@ -6332,7 +6534,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
       lanIp: getLanIp(),
       service: webServerServiceHealth(),
       capabilities: {
-        historyRead: { version: 1, view: 'history', conditional: 'ifRevision', delta: true, deltaProviders: ['codex'] },
+        historyRead: { version: 1, view: 'history', conditional: 'ifRevision', delta: true, deltaProviders: ['codex'], settingsBaselineVersion: 1 },
+        ...(transcriptService?.getToolPayload ? { historyPayloads: historyPayloadCapability } : {}),
         tabEvents: { version: 1, multiplex: 'tabIds', maxTabs: MAX_EVENT_TABS },
         ...(readAgentTabTiming ? { responseTiming: { version: 1, providers: ['claude', 'codex'], live: true, historySidecars: true } } : {}),
         mobileDiagnostics: { version: 1, serviceHealth: 'api-me' },
@@ -6373,6 +6576,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
           version: 1,
           kinds: ['catalog', 'custom'],
         },
+        loopTaskCompletion: { version: 2, statuses: ['completed', 'blocked'] },
+        tabMessages: { version: 1, durable: true, replyTo: true },
+        orchestrationInlineResults: { version: 1 },
         externalResearchOrchestration: {
           version: 1,
           startEndpoint: '/api/external-research/orchestrations',
@@ -6934,6 +7140,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }); }
   }
 
+  if (parsed.pathname === '/api/tab-messages' || parsed.pathname.startsWith('/api/tab-messages/')) {
+    const handled = await handleTabMessageApi(req, res, parsed, { service: getTabMessageService(),
+      resolveTab: resolveTabMessageIdentity, readBody, sendJson });
+    if (!handled) sendJson(res, 404, { ok: false, error: 'unknown_tab_message_route' });
+    return;
+  }
+
   if (parsed.pathname === '/api/external-research/orchestrations' && req.method === 'POST') {
     try {
       const body = await readBody(req);
@@ -6977,6 +7190,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const jobId = externalResearchJobId(requestedRunId);
       const targetLabel = externalResearchTargetLabel(request);
       const existingRun = await getOrchestrationRunStore().getInternal(requestedRunId);
+      const sourceSendTarget = notifySource ? await captureOrchestrationSourceTarget(source, existingRun, sourceExecutionContext) : null;
       if (!existingRun) await assertExternalResearchCapabilities(request.provider);
       const reservation = await getOrchestrationRunStore().reserveOrGet({
         runId: requestedRunId,
@@ -6990,7 +7204,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         sourceProjectName: source.projectName,
         sourceProjectPath: source.projectPath,
         sourceExecutionContext,
-        sourceToolType: source.toolType,
+        sourceToolType: sourceSendTarget?.toolType || source.toolType,
+        sourceSendTarget,
+        sourceSessionId: sourceSendTarget?.sessionId || null,
         targetTabId: null,
         targetTabName: targetLabel,
         targetProjectId: null,
@@ -7276,6 +7492,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         reactToManualInterrupt: body.reactToManualInterrupt,
         autoStopCreatedTargets: body.autoStopCreatedTargets,
       });
+      const sourceSendTarget = notifySource
+        ? await captureOrchestrationSourceTarget(source, priorContextRun, sourceExecutionContext) : null;
       const reservation = await getOrchestrationRunStore().reserveOrGet({
         runId: requestedRunId,
         requestFingerprint,
@@ -7303,6 +7521,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         compactBeforeTask: forkFromTabId ? body.compactBeforeTask === true : false,
         parentRunId: cleanOptionalString(body.parentRunId, '') || undefined,
         sourceExecutionContext,
+        sourceToolType: sourceSendTarget?.toolType || source.toolType,
+        sourceSendTarget,
+        sourceSessionId: sourceSendTarget?.sessionId || null,
         waitForDescendants: body.waitForDescendants !== false,
         notifySource,
         failureGraceMs: Number.isFinite(Number(body.failureGraceMs)) ? Number(body.failureGraceMs) : undefined,
@@ -10902,7 +11123,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       });
     }
 
-    const result = registerTaskCompletionIntent({ tabId, sourceTabId });
+    const result = registerTaskCompletionIntent({ tabId, sourceTabId, status: body?.status, reason: body?.reason });
     if (result?.ok !== true) {
       return sendJson(res, 409, { ok: false, code: result?.code || 'completion_rejected' });
     }
@@ -11108,6 +11329,37 @@ async function handleApi(req, res, parsed, sdkSessions) {
   //    backfill). Combined with phase 1 `?last=200` → phase 2 `?before=<firstTailUuid>`,
   //    the cold-open paint flow is: tail in 1s, prefix streams in behind it.
   // - `?last=N` returns the last N messages.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/history-payload$/);
+  if (m && req.method === 'GET') {
+    const tabId = decId(m[1]);
+    const started = Date.now();
+    let request;
+    try { request = historyPayloadQuery(parsed.query); }
+    catch (error) { return sendJson(res, 400, { success: false, error: error.message }); }
+    if (!transcriptService?.getToolPayload) return sendJson(res, 503, { success: false, error: 'history_payload_unavailable' });
+    try {
+      const info = await resolveHistorySessionInfo(tabId, 1500);
+      if (!info?.sessionId) return sendJson(res, 409, { success: false, error: 'history_read_identity_unavailable' });
+      if (info.sessionId !== request.sessionId || info.toolType !== request.toolType) {
+        return sendJson(res, 409, { success: false, error: 'history_read_identity_changed' });
+      }
+      const result = await transcriptService.getToolPayload({ ...request, tabId, cwd: info.cwd || null });
+      const current = await resolveHistorySessionInfo(tabId, 1500);
+      if (current?.sessionId !== info.sessionId || current?.toolType !== info.toolType || (current?.cwd || null) !== (info.cwd || null)) {
+        return sendJson(res, 409, { success: false, error: 'history_read_identity_changed' });
+      }
+      console.log('[WebTiming] /history-payload tab=' + tabId.slice(-12) + ' tool=' + info.toolType
+        + ' success=' + (result?.success === true) + ' source=' + (result?.source || '-')
+        + ' reason=' + (result?.error || '-') + ' chars=' + (result?.payload?.length || 0) + ' ms=' + (Date.now() - started));
+      const status = result?.success ? 200 : result?.error === 'history_payload_not_found' || result?.error === 'payload not found' ? 404
+        : /^(history_payload_(generation_changed|changed)|history_source_changed_during_preparation|lineage_unresolved)/.test(result?.error || '') ? 409 : 500;
+      return sendJson(res, status, result || { success: false, error: 'history_payload_unavailable' });
+    } catch (error) {
+      console.log('[WebTiming] /history-payload ERROR reason=' + String(error.message) + ' ms=' + (Date.now() - started));
+      return sendJson(res, error.message === 'history_payload_range_invalid' ? 400 : 500,
+        { success: false, error: error.message });
+    }
+  }
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/history$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
@@ -11125,13 +11377,18 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const wantNdjson = /\bapplication\/x-ndjson\b/.test(req.headers['accept'] || '') || parsed.query.ndjson === '1';
     const requestedRevision = parsed.query.ifRevision;
     const deltaOk = parsed.query.delta === '1';
+    const payloadPolicy = parsed.query.payloads;
+    if (payloadPolicy != null && payloadPolicy !== historyPayloadCapability.historyQuery.payloads) {
+      return sendJson(res, 400, { success: false, error: 'history_payload_policy_invalid' });
+    }
+    if (payloadPolicy && !wantHistoryEntries) return sendJson(res, 400, { success: false, error: 'history payloads require view=history' });
     if (requestedRevision != null && (typeof requestedRevision !== 'string' || !/^[a-f0-9]{64}$/.test(requestedRevision))) {
       return sendJson(res, 400, { error: 'ifRevision must be an opaque historyRevision token' });
     }
     if ((requestedRevision != null || deltaOk) && !wantHistoryEntries) {
       return sendJson(res, 400, { error: 'conditional history requires view=history' });
     }
-    console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'} after=${afterUuid ? afterUuid.slice(0, 8) : 'none'} before=${beforeUuid ? beforeUuid.slice(0, 8) : 'none'} around=${aroundUuid ? aroundUuid.slice(0, 8) : 'none'} radius=${aroundRadius} view=${wantHistoryEntries ? 'history' : 'messages'} ndjson=${wantNdjson}`);
+    console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'} after=${afterUuid ? afterUuid.slice(0, 8) : 'none'} before=${beforeUuid ? beforeUuid.slice(0, 8) : 'none'} around=${aroundUuid ? aroundUuid.slice(0, 8) : 'none'} radius=${aroundRadius} view=${wantHistoryEntries ? 'history' : 'messages'} ndjson=${wantNdjson} payloads=${payloadPolicy || 'full'}`);
     try {
       if (wantHistoryEntries) {
         let data = null;
@@ -11142,6 +11399,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
             if ((info?.toolType === 'codex' || info?.toolType === 'claude') && info?.sessionId) {
               const bounds = { last: lastN, afterUuid, beforeUuid, fromUuid, aroundUuid, radius: aroundRadius };
               readScope = { tabId, toolType: info.toolType, sessionId: info.sessionId, cwd: info.cwd || null, bounds };
+              if (payloadPolicy) Object.assign(readScope, { payloadPolicy, dehydrate: true,
+                payloadHeaderVersion: historyPayloadCapability.headerVersion });
               data = await transcriptService.getHistory({
                 ...readScope,
                 ifRevision: publicHistoryRevisions.lookup(requestedRevision, readScope),
@@ -11151,7 +11410,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
                   : null,
               });
               if (data?.success) {
-                if (requestedRevision != null || deltaOk || info.readIdentitySource === 'empty-resume-source') {
+                if (payloadPolicy || requestedRevision != null || deltaOk || info.readIdentitySource === 'empty-resume-source') {
                   const current = await resolveHistorySessionInfo(tabId, 1500);
                   if (current?.sessionId !== info.sessionId || current?.toolType !== info.toolType || (current?.cwd || null) !== (info.cwd || null)
                     || (info.readIdentitySource === 'empty-resume-source' && current?.readIdentitySource !== 'empty-resume-source')) {
@@ -11163,6 +11422,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
                 data = { ...data, toolType: info.toolType, commandType: info.toolType, sessionId: info.sessionId,
                   readSessionId: info.sessionId, writerSessionId: info.writerSessionId || null,
                   writerConfirmed: info.writerConfirmed === true,
+                  ...(payloadPolicy ? { payloadPolicy, payloadHeaderVersion: historyPayloadCapability.headerVersion } : {}),
                   historyRevision: publicHistoryRevisions.remember(data.revision, readScope) };
                 publishTabTiming(tabId, 'history-read');
               } else if (data?.error) {
@@ -11180,7 +11440,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             console.log(`[WebTiming] /history TRANSCRIPT_HISTORY_SKIP ${String(e.message)}`);
           }
         }
-        if (!data && (requestedRevision != null || deltaOk)) {
+        if (!data && (payloadPolicy || requestedRevision != null || deltaOk)) {
           return sendJson(res, 409, { success: false, error: 'history_read_identity_unavailable' });
         }
         if (!data) data = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
@@ -11206,7 +11466,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
               radius: aroundRadius,
             });
         const { entries, total, dropped, truncated, firstUuid, lastUuid } = historyWindow;
-        const etagSrc = entries.map((e) => `${e?.uuid || ''}:${e?.queueStatus || ''}:${e?.deliveryStatus || ''}`).join('|');
+        const etagSrc = (payloadPolicy ? payloadPolicy + ':headers:' + historyPayloadCapability.headerVersion + ':' : '')
+          + entries.map((e) => `${e?.uuid || ''}:${e?.queueStatus || ''}:${e?.deliveryStatus || ''}`).join('|');
         const etag = crypto.createHash('sha1').update(etagSrc).digest('hex').slice(0, 16);
         console.log(`[WebTiming] /history DONE view=history tool=${data?.toolType || '-'} total=${total} returned=${entries.length} dropped=${dropped} around=${aroundUuid ? aroundUuid.slice(0, 8) : 'none'} ms=${Date.now()-t0}`);
         return sendJson(res, 200, { ...data, entries, total, truncated, dropped, etag, firstUuid, lastUuid });
@@ -11490,6 +11751,11 @@ function webBroadcast(tabId, payload) {
     payload = stampPublicRuntimeSnapshot(tabId, payload);
   }
   const type = payload && payload.type;
+  if (tabMessageService && ['busy', 'done', 'snapshot', 'bridge-update'].includes(type)) {
+    void tabMessageService.wake(tabId, type).catch(error => {
+      console.warn('[TabMessages] wake-failed tab=' + tabId + ' reason=' + type + ' error=' + error.message);
+    });
+  }
   const loggable = BCAST_LOG_TYPES.has(type);
   if (type === 'busy' || type === 'done' || type === 'snapshot' || type === 'background-work') {
     void processOrchestrationLifecycle(tabId, payload);
@@ -11923,6 +12189,7 @@ function start({
     return;
   }
   if (!sdkSessions) throw new Error('start({sdkSessions}) — Map of live SDK sessions required');
+  tabMessageSdkSessions = sdkSessions;
   tabWorkContext = tabWorkContextInstance || null;
   agentSendReceiptStore = agentSendReceiptStoreFn || null;
   agentSendReceiptStartupReady = agentSendReceiptStartupReadyFn
@@ -12033,6 +12300,9 @@ function start({
   console.log('[WebServer:Health] start-request pid=' + process.pid + ' preferredPort=' + PORT_PREFERRED
     + ' instance=' + webServerInstanceId);
   registerBridgeReplyHandler();
+  const messageServiceForStart = getTabMessageService();
+  void agentSendReceiptStartupReady.then(() => messageServiceForStart.initialize())
+    .catch(error => console.warn('[TabMessages] startup-failed error=' + error.message));
   void getOrchestrationRunStore().initialize()
     .then(() => reconcileActiveOrchestrations())
     .catch((error) => console.warn('[Orchestration] startup recovery failed:', error?.message || error));
@@ -12206,6 +12476,10 @@ function stop() {
   // same durable authority again after an app/server restart.
   agentSendReceiptStore = null;
   agentSendReceiptStartupReady = Promise.resolve({ ready: true });
+  tabMessageService?.dispose();
+  tabMessageService = null;
+  tabMessageSdkSessions = null;
+  orchestrationCompletionContentStore = null;
   projectPromptCatalog = null;
   for (const sink of new Set([...subscribers.values()].flatMap(set => [...set]))) sink.close();
   subscribers.clear();
@@ -12339,6 +12613,9 @@ async function sendCodexCapacityContinuation({ tabId, sessionId, turnId, generat
 }
 
 module.exports = {
+  listTabMessages: async (tabId) => (await getTabMessageService().listForTab(tabId)).map(compactTabMessage),
+  getTabMessage: (messageId) => getTabMessageService().getMessage(messageId),
+  readMobileAttachmentPreview,
   commitSavedHistoryCodexBinding,
   validateSavedHistoryStop,
   validateSavedHistoryResume,

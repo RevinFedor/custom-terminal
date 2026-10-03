@@ -519,7 +519,48 @@ clock.
 
 Каждая committed привязка History к owner получает монотонное поколение. Проверка только по owner-key недостаточна для A → B → A: поздний ответ первого A снова совпадёт по ключу и перетрёт более новый A. Любая state/cache write после async должна подтвердить и key, и generation.
 
-**Дегидрация тяжёлых payload (реализовано).** Tool-результаты/thinking/compact больше порога (16KB) покидают main как превью 2KB + детерминированная ссылка (`result:<tool_use_id>` / `thinking:<uuid>` / `compact:<uuid>`); полный текст renderer получает по требованию через `history:get-tool-payload` при раскрытии карточки (render-cap 4MB на один проход, «сколько скрыто» пишется в самом превью). Это не молчаливое truncation: preview+identity сохраняют доступ к полному результату. Оригиналы держит byte-bounded stash (`history-payload-dehydrate.js`, LRU192MiB). Codex worker сохраняет их также на SSD; при RAM miss сначала проверяется его exact-owner/source cache, только затем canonical rebuild. Для Claude остаётся точечный re-extract из recordMap, включая background-notification (`rebuildHistoryPayloadStash`). Payload identity детерминирована per source record; одинаковый payloadId после rewrite не отменяет проверку поколения. **Дегидрация строго opt-in per call** (`dehydrate: true` шлёт только desktop HistoryPanel): web/iOS/Timeline потребители тех же каналов получают полные payload, пока не заведут собственный rehydration-путь — молча выдать им превью было бы capability downgrade. Compact у Claude не дегидрируется (короткая проза + branch look-ahead extraction); у Codex — дегидрируется (replacement_history бывает сотни MB). Смежное правило для live-overlay: durable-строка с `resultRef` покрывает live tool-result по факту наличия ссылки, не по равенству текста — иначе превью никогда не совпадёт с полным live-текстом и reconcile зациклит refreshes.
+### Дегидрация и полное тело по запросу
+
+Desktop `dehydrate:true` заменяет tool-result/thinking/compact больше16Ki
+символов на preview2Ki + детерминированную ссылку; `history:get-tool-payload`
+сохраняет прежний render-cap4Mi символов. Полный текст держит общий byte-bounded
+stash192MiB, Codex worker также сохраняет его на SSD. Claude legacy rebuild
+восстанавливает result/thinking по recordMap с background-notification; его
+compact остаётся inline из-за branch look-ahead. Default full HTTP и Timeline
+не получают превью молча. Durable `resultRef` покрывает live tool-result по
+наличию exact ссылки, а не по равенству полного текста и превью.
+
+С03.10 source HTTP предлагает отдельный opt-in `payloads=on-demand-v1`
+(контракт — `fact-mobile-web.md::History: скрытые тела только по tap`). Причина:
+native раньше обрезала до2K уже ПОСЛЕ загрузки; один80-row ответ весил1.22MB,
+включая150 tool actions и compact157K. Только прежних resultRef недостаточно:
+аргументы shell/code/Edit и diffHunks тоже тяжёлые. Новый detached projection
+оставляет обычную prose, UUID/source identities и дешёвые grouping headers,
+но передаёт action целиком через JSON payload того же stash; resultRef внутри
+action по-прежнему адресует большой отдельный text. Native policy не мутирует
+canonical prepared rows/desktop graph. Thinking presence остаётся структурной.
+
+Тот же getToolPayload проверяет exact row/ref/hash на bounded canonical read;
+Claude compact восстанавливается тем же branch projector, не новым extract-парсером.
+Ответ идёт страницами до4Mi UTF-16 units, без потери остатка и без разрыва
+surrogate pair. Policy участвует в conditional revision и HTTP delta-consumer;
+hash различает позднее изменение action при том же source generation. Codex
+generation переживает SSD/restart, Claude native generation привязано к source
+revision и меняется также при append. Устаревшая ссылка требует refresh rows,
+не подстановки текста другой сессии. Frozen ancestor проверяется canonical
+lineage digest/read tickets: stat по synthetic frozen revision с mtime0 дал бы
+ложный отказ даже неизменному Fork. Desktop/старые клиенты сохраняют прежний
+контракт; наличие source не означает установленную capability или готовую iOS.
+
+Native headerVersion2 сохраняет различия, которые раньше читались из тела:
+`hasResult` не путает absent/null с успешным пустым result, а `status` не принимает
+async acceptance за конец Task/background. `fileChange` передаёт exact пути и
+счётчики canonical hunks либо полного argument diff; неизвестное — null, не0.
+Подсчёт использует уже нормализованные actions, не второй JSONL/patch parser;
+count-only frontier не строит квадратичную UI LCS-матрицу. Delete без исходного содержимого
+сохраняет явную неизвестность в canonical normalization. Version2 включена в
+read revision: иначе прежний header мог остаться unchanged навсегда. Wire —
+`fact-mobile-web.md::History: скрытые тела только по tap`.
 
 **Кладбище: tail-window и reading-window (реализованы 25.07, удалены 26.07).** Две механики «показать короткий массив мгновенно, затем подменить целым» — хвост ~120 записей и mini-кэш видимого фрагмента. Они почти не экономили parse, но создавали шов с тёмным кадром, прыжком viewport и порчей позиции; оба пути также обходили viewport-proof. Не путать их с нынешними stubs полного позиционного массива: там нет подмены списка и перенумерации. Допустимый display-only survivor — rewind-префикс внутри одной вкладки с writer proof. Не возвращать короткие массивы «для скорости» без замера реального bottleneck.
 

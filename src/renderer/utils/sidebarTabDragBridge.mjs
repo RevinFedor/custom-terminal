@@ -16,12 +16,23 @@ const EMPTY = Object.freeze({
 });
 
 let snapshot = EMPTY;
+let sessionSnapshot = EMPTY;
 let cleanupInputListeners = null;
 let scheduledEndSession = null;
 const listeners = new Set();
+const sessionListeners = new Set();
 
 const publish = (next) => {
+  const sessionChanged = next.active !== snapshot.active
+    || next.sessionId !== snapshot.sessionId
+    || next.sourceNode !== snapshot.sourceNode
+    || next.pointerId !== snapshot.pointerId
+    || next.metaKey !== snapshot.metaKey;
   snapshot = next;
+  if (sessionChanged) {
+    sessionSnapshot = next;
+    sessionListeners.forEach((listener) => listener());
+  }
   listeners.forEach((listener) => listener());
 };
 
@@ -169,6 +180,13 @@ export function endSidebarTabDrag(sessionId) {
 }
 
 export const getSidebarTabDragSnapshot = () => snapshot;
+// All retained/menu-only TabBars need ownership and Cmd changes, not every
+// pointer packet. The pointer remains current for destination adoption.
+export const getSidebarTabDragSessionSnapshot = () => sessionSnapshot;
+export const subscribeSidebarTabDragSession = (listener) => {
+  sessionListeners.add(listener);
+  return () => sessionListeners.delete(listener);
+};
 export const getSidebarTabDragProjectionKey = (value = snapshot) => {
   if (!value?.active) return '';
   // Pointer coordinates and modifier state intentionally do not participate.
@@ -203,5 +221,7 @@ export function resetSidebarTabDragForTests() {
   scheduledEndSession = null;
   detachInputListeners();
   snapshot = EMPTY;
+  sessionSnapshot = EMPTY;
   listeners.clear();
+  sessionListeners.clear();
 }

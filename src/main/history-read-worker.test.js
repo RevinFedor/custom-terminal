@@ -482,6 +482,27 @@ test('virtual legacy payload cannot bypass an invalidated ancestor through RAM s
   const next = await f.client.call('getToolPayload', { ...f.payload, payloadId: ref.payloadId });
   assert.equal(next.success, false); assert.equal(next.lineageReason, 'source-segment-digest-mismatch');
 });
+
+test('on-demand action and result use the same virtual owner after restart, and reject changed frozen ancestry', async t => {
+  const output = 'PARENT-PAYLOAD-' + 'x'.repeat(20000);
+  const f = await virtualFixture(t, toolRecords(output));
+  const request = { ...f.payload, payloadPolicy: 'on-demand-v1', bounds: { last: 80 } };
+  const first = await f.client.call('getHistory', request);
+  assert.equal(first.success, true, first.error);
+  const action = first.entries.flatMap(row => row.actions || []).find(action => action.actionRef);
+  const read = ref => f.client.call('getToolPayload', { ...f.payload, payloadPolicy: 'on-demand-v1',
+    entryUuid: ref.rowUuid, payloadId: ref.payloadId, contentHash: ref.contentHash, payloadGeneration: first.payloadGeneration });
+  await f.restart();
+  const recovered = await read(action.actionRef);
+  assert.equal(recovered.success, true, JSON.stringify({ error: recovered.error, reason: recovered.reason || recovered.lineageReason,
+    generation: first.payloadGeneration }));
+  const full = await read(action.rawTool.resultRef);
+  assert.equal(full.success, true, full.error); assert.equal(full.payload, output);
+  await fs.writeFile(f.parentFile, encode(f.parentRecords).replace('PARENT-PAYLOAD-', 'REWRITTEN-DATA-'));
+  f.client.invalidate({ filePath: f.parentFile });
+  const stale = await read(action.actionRef);
+  assert.equal(stale.success, false); assert.equal(stale.lineageReason, 'source-segment-digest-mismatch');
+});
 test('ownership arriving before first read distinguishes the same call id at two physical offsets', async t => {
   const spawn = { type: 'response_item', timestamp: '2026-09-25T00:00:00Z', payload: {
     type: 'function_call', namespace: 'multi_agent_v1', name: 'spawn_agent', call_id: 'duplicate', arguments: '{"message":"work"}' } };

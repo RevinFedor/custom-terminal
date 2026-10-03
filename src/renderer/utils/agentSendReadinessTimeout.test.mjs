@@ -17,6 +17,7 @@ test('real send readiness deadline yields exact before-paste failure, not delive
   let waits = 0, cleanup = 0;
   const context = vm.createContext({
     ...target, Date: { now: () => now }, console: { log() {}, warn() {} },
+    manualActionContract: require('../../shared/agent-manual-action.cjs'),
     isCoordinatedAgentSendCancellationRequested: () => false,
     createAgentReadyWait() {
       waits++;

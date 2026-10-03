@@ -20,11 +20,17 @@ type Snapshot = {
 
 const EMPTY: Snapshot = Object.freeze({ revision: 0, cycle: 0, source: null, target: null });
 let snapshot: Snapshot = EMPTY;
+let targetSnapshot: Snapshot = EMPTY;
 const listeners = new Set<() => void>();
+const pointerListeners = new Set<() => void>();
 
-const publish = (next: Snapshot) => {
+const publish = (next: Snapshot, targetChanged = true) => {
   snapshot = next;
-  listeners.forEach((listener) => listener());
+  if (targetChanged) {
+    targetSnapshot = next;
+    listeners.forEach((listener) => listener());
+  }
+  pointerListeners.forEach((listener) => listener());
 };
 
 export function setTabDragNavigationTarget(
@@ -45,7 +51,7 @@ export function setTabDragNavigationTarget(
     cycle: sameTarget ? snapshot.cycle : snapshot.cycle + 1,
     source,
     target: { ...target, blocked: !!target.blocked },
-  });
+  }, !sameTarget);
 }
 
 export function clearTabDragNavigationTarget(source?: TabDragNavigationSource) {
@@ -63,11 +69,16 @@ export const subscribeTabDragNavigation = (listener: () => void) => {
   listeners.add(listener);
   return () => listeners.delete(listener);
 };
+export const subscribeTabDragNavigationPointer = (listener: () => void) => {
+  pointerListeners.add(listener);
+  return () => { pointerListeners.delete(listener); };
+};
+const getTabDragNavigationTargetSnapshot = () => targetSnapshot;
 
 export function useTabDragNavigationSnapshot() {
   return useSyncExternalStore(
     subscribeTabDragNavigation,
-    getTabDragNavigationSnapshot,
-    getTabDragNavigationSnapshot,
+    getTabDragNavigationTargetSnapshot,
+    getTabDragNavigationTargetSnapshot,
   );
 }

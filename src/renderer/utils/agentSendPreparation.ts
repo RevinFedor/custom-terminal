@@ -2,6 +2,7 @@ import type {
   AgentDraftInspection,
   AgentHistoryTool,
   AgentPtyStatus,
+  AgentSendTarget,
   HistoryAgentRuntime,
 } from './historyAgentRuntimes';
 import type { AgentSendProviderContract } from './agentSendProviderContract';
@@ -157,6 +158,7 @@ export async function prepareAgentRuntimeForSend({
   requireLive = false,
   sendOperationKey,
   sendAttemptId,
+  expectedTarget: pinnedTarget,
 }: {
   tabId: string;
   runtime: HistoryAgentRuntime;
@@ -169,8 +171,11 @@ export async function prepareAgentRuntimeForSend({
   requireLive?: boolean;
   sendOperationKey?: string | null;
   sendAttemptId?: string | null;
+  expectedTarget?: AgentSendTarget;
 }) {
-  const expectedTarget = createAgentSendTargetExpectation(runtime.toolType, sessionId);
+  const expectedTarget = pinnedTarget
+    ? Object.freeze({ ...pinnedTarget })
+    : createAgentSendTargetExpectation(runtime.toolType, sessionId);
   const assertSendNotCancelled = () => {
     if (
       coordinatedSendToken
@@ -287,7 +292,7 @@ export async function prepareAgentRuntimeForSend({
   const deadline = Date.now() + 30000;
   const readinessTimeout = () => Object.assign(
     new Error(runtime.label + ' session is not ready for send'),
-    { code: 'agent_send_readiness_timeout', submitted: false, pasteWritten: false,
+    { code: 'agent_send_readiness_timeout', submitted: false, pasteWritten: false, enterWritten: false,
       readinessStatus: presence?.status || 'unknown',
       readinessReason: presence?.lastNotReady?.reason || 'no-ready-proof',
       sendReceipt: { success: false, accepted: false, submitted: false,
@@ -340,7 +345,11 @@ export async function prepareAgentRuntimeForSend({
       }
       if (submitCapability() === 'queue') return resolved('busy', 'queue');
       if (submitCapability() === 'direct') {
-        readyWait.cancel();
+        // A picker can acquire the composer while the gate/final presence read
+        // yields. Keep this pass's wake AND original deadline alive until the
+        // final read accepts the send; otherwise the blocked branch below
+        // would await a cancelled, permanently unresolved promise. Finally
+        // retires the observation on every return/error/next pass.
         await waitStartupGate();
         presence = await runtime.getPresence(tabId).catch(() => null);
         assertSendNotCancelled();
@@ -349,6 +358,15 @@ export async function prepareAgentRuntimeForSend({
         }
         if (submitCapability() === 'queue') return resolved('busy', 'queue');
         if (submitCapability() === 'direct') return resolved('active', 'direct');
+      }
+      if (pass > 0) {
+        console.log('[AgentScenario:send] wait retained tool=' + runtime.toolType
+          + ' tab=' + String(tabId).slice(-12)
+          + ' pass=' + pass
+          + ' status=' + (presence?.status || 'unknown')
+          + ' inputReady=' + !!presence?.inputReady
+          + ' reason=' + (presence?.lastNotReady?.reason || 'no-ready-proof')
+          + ' remainingMs=' + Math.max(0, deadline - Date.now()));
       }
       if (remainingMs <= 0) throw readinessTimeout();
       if (cancellationWait) {

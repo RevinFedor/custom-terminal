@@ -177,9 +177,14 @@ nullable `grace_period_end_timestamp` не даёт права обещать с
 Codex app-server `account/read` содержит лишь `type,email,planType`, а в OAuth
 JWT нет billing status. Live-проверка24.09: ChatGPT web bearer прочитал данные,
 но тот же subscription GET с Codex OAuth получил403; transaction-history с
-Codex OAuth сначала вернул200, затем HTML403. Поэтому динамический платёжный
-значок в Noted пока не внедрён: нужен устойчивый account-bound источник для
-каждого подключённого профиля, а не ручная пометка или вывод из `Pro`.
+Codex OAuth сначала вернул200, затем HTML403. Проверка30.09 различила транспорт
+и права: Node fetch к `/accounts/{id}/remaining_balance` получил HTML403 с
+`cf-mitigated: challenge`, а браузер MCP и Electron `net.fetch` с тем же Codex
+OAuth получили JSON200. Через `net.fetch` подтверждён также `subscriptions`
+для текущего Codex-профиля. Это не требует отдельного web-login и не позволяет
+выводить конец подписки из отказа оплаты: `has_active_subscription` и
+`is_delinquent` могут одновременно быть true; nullable billing timestamps
+сохраняют неизвестность даты первой неуспешной попытки и grace-period.
 
 Баланс Codex берётся из того же `wham/usage` и показывается только при `has_credits`, положительном balance или unlimited. `credits.balance` — **количество usage credits**, не USD: desktop форматирует число без валютного знака. Прод-шрам30.09: OpenAI вернул `balance: "62500"` обоим подключённым аккаунтам, а прежний `Intl.NumberFormat(currency: USD)` ложно показал `62 500 $`. Отдельный DTO уже отдавал kind `codex` без валюты. `code_review_rate_limit` не является core OAuth-источником и сейчас не рендерится. Инвентарь сбросов читается один раз на refresh соответствующего подключённого профиля через `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits` либо официальный app-server fallback. Строка `Usage resets` остаётся видимой у подключённого профиля: показывает число доступных сбросов, `0 available` для доказанного пустого списка или `unavailable`, если optional источник не дал снимок. Детали содержат только доступные и ещё не истёкшие элементы; сохраняются только title и `expires_at`, без id/profile/description. Ошибка optional источника не ломает проценты. Результат применяется только после повторной проверки account+token; mutable inventory не сохраняется между рестартами.
 
@@ -188,6 +193,31 @@ Codex OAuth сначала вернул200, затем HTML403. Поэтому �
 [Правила OpenAI для personal credits](https://help.openai.com/en/articles/12642688-using-credits-for-flexible-usage-in-chatgpt-personal-plans): сначала included usage, затем credits для доступных Codex/Work и других поддерживаемых agentic features. Это не API credits, не наличные и не переносимый между аккаунтами баланс. Автопополнение отдельно покупает новые credits; оно не определяет расход уже имеющихся. `approx_local_messages`/`approx_cloud_messages` в `wham/usage` — оценки числа сообщений, не отдельные квоты и не фиксированная стоимость одного prompt.
 
 [Опубликованное письмо OpenAI29–30.09](https://www.reddit.com/r/OpenAI/comments/1wtlpx7/its_been_a_good_run/) описывает разовую выдачу существующим Pro200:62 500 credits с номинальной стоимостью$2 500, истекающие31.12.2026, в связи с переходом20×→10× Plus для Work/Codex с30.10. Старый allowance до29.10 подтверждён также [официальной страницей Pro tiers](https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers). Совпадение суммы/плана/даты с live-балансами — основание связать их с этой выдачей, но `wham/usage` не отдаёт происхождение или expiry credit grant. Не переносить дату этой акции на любые credits: купленные credits имеют собственный12-месячный срок. Даты в `Usage resets` принадлежат другим сущностям и не являются сроком `credits.balance`.
+
+### Точная дата кредитов: account-scoped remaining_balance
+
+Desktop читает `GET /backend-api/accounts/{account_id}/remaining_balance` через
+Electron `net.fetch` с тем же Codex OAuth и без cookies. Ответ содержит `balance`
+и `expiring_balance_details[]` с `amount_remaining`, `expiry_date`, `grant_type`.
+Live30.09: оба исследованных аккаунта дали62500 promotional credits и
+`expiry_date: 2027-01-01T00:00:00Z`. UI использует точный timestamp в локальном
+часовом поясе: в Bangkok это01.01.2027 07:00;31.12 в письме — последний день
+до UTC-границы, не причина жёстко прописывать такую дату всем балансам.
+
+Запрос optional и параллелен основному usage: physical abort4с, success-cache25с,
+ошибка/cooldown60с и server Retry-After, coalescing по account+token. Результат
+проходит прежний post-request auth guard. Без свежего снимка с тем же balance
+строка показывает `expiry unavailable`; неизвестность срока не меняет проценты
+или количество credits. Если разные пакеты имеют разные даты, показывается
+количество credits ближайшего истекающего пакета; весь balance подписывается
+одной датой только при совпадении суммы. `credit_expiration` — runtime-only
+account field desktop IPC; в persisted usage и публичный HTTP DTO не добавлен.
+
+Старое20× определяется eligibility старого Pro200 при активной подписке, а не
+месяцем очередного списания. Официальная справка явно описывает восстановление
+после lapse в7 дней до cutoff; разрыв5→10 октября после cutoff отдельно не
+гарантирован. Не объявлять ни автоматическую потерю20×, ни сохранение20× в таком
+будущем сценарии по одному `plan_type:pro` или наличию промо-кредитов.
 
 Network-path имеет физический `AbortController` deadline 8s, renderer-level IPC deadline 12s, один in-flight запрос на auth fingerprint и 25s success-cache. Force refresh обходит success-cache, но не account guard или серверный Retry-After и сам по себе не запускает тяжёлый локальный scan. Он также не ждёт другие профили: scope определяется requested/current account до сетевого шага. Auth перечитывается перед применением любого результата; если account/token сменился во время запроса, старый успех и старая ошибка не могут записаться в новый аккаунт, а запрос один раз повторяется с уже готовой новой auth snapshot. Сам Noted Terminal не расходует общий refresh token: при `401/403` без внешней rotation сохраняется последнее значение и показывается `Codex login expired`, чтобы не получить cross-process `refresh_token_reused` race с живым Codex CLI.
 
@@ -274,7 +304,7 @@ Edit-range / fork ломают cache — следующий после прав�
 
 В текущем UI sticky-режим не содержит tab-зависимой секции: закреплённое окно показывает выбранного провайдера, его аккаунт и общий `Activity`.
 
-Нижняя строка popover'а остаётся на месте в обоих режимах pin. Справа она показывает `⌘⇧ to pin across tabs` или `Pinned across tabs · ⌘⇧`, поэтому подсказка меняется, а строка не исчезает. Слева две серые SVG-иконки включают/выключают **только компактные чипы в шапке**; выбранный провайдер, его аккаунты, лимиты, обновление и общий `Activity` остаются в popover'е. Скрытый чип не размонтирует источник данных. Если скрыты оба, в шапке остаётся нейтральная кнопка для открытия того же popover'а и возврата чипов. Выбор не привязан к вкладке и переживает перезапуск через `noted-terminal-usage-visible-providers` в SQLite-mirrored UI storage; по умолчанию оба чипа видны.
+Нижняя строка popover'а остаётся на месте в обоих режимах pin. Справа она показывает `⌘⇧ to pin across tabs` или `Pinned across tabs · ⌘⇧`, поэтому подсказка меняется, а строка не исчезает. Слева две серые SVG-иконки включают/выключают компактные чипы в шапке **и соответствующие default model/effort кнопки StatusBar**. Обе поверхности подписаны на общий `useUsageVisibilityStore`; это видимость, сохранённые defaults и текущая модель не меняются. Выбранный провайдер, его аккаунты, лимиты, обновление и общий `Activity` остаются в popover'е. Скрытый чип не размонтирует источник данных. Если скрыты оба, в шапке остаётся нейтральная кнопка для открытия того же popover'а и возврата чипов. Выбор не привязан к вкладке и переживает перезапуск через прежний `noted-terminal-usage-visible-providers` в SQLite-mirrored UI storage; по умолчанию оба чипа видны.
 
 **Trap:** общий click-outside handler не должен закрывать sticky. Иначе клик по TabBar закрывает окно в тот момент, когда пользователь пытается проверить другую вкладку, и режим теряет смысл. Click-outside и Esc закрывают light pin; sticky снимается только явным жестом.
 

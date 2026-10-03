@@ -1,5 +1,6 @@
 import React, { useLayoutEffect, useRef } from 'react';
 import { createPaneFocusIsolationManager } from '../../utils/paneFocusIsolation';
+import { uiPerformancePhase } from '../../utils/uiPerformanceDiagnostics.mjs';
 
 const MANAGED_PANE_BOUNDARIES = [
   '[data-terminal-pane-wrapper][data-pane-focus-isolated]',
@@ -33,7 +34,13 @@ export default function WorkspacePresentationBoundary({
     };
   }, []);
 
-  useLayoutEffect(() => { isolationRef.current?.sync(); }, [view]);
+  useLayoutEffect(() => {
+    const started = performance.now();
+    isolationRef.current?.sync();
+    uiPerformancePhase('workspace-home-presentation', {
+      view, ms: performance.now() - started,
+    });
+  }, [view]);
 
   const presented = view === 'workspace';
   return (
@@ -44,7 +51,10 @@ export default function WorkspacePresentationBoundary({
       aria-hidden={!presented}
       className="flex-1 flex flex-col min-h-0"
       style={{
-        visibility: presented ? 'visible' : 'hidden',
+        // Keep descendant visibility stable. It is inherited: toggling it
+        // revisited thousands of retained nodes on every Home round trip.
+        // Opacity hides pixels; the stacking and focus boundaries below
+        // independently prevent hidden descendants from taking input.
         opacity: presented ? 1 : 0,
         position: presented ? 'relative' : 'absolute',
         // Child panes/portals can explicitly opt into pointer-events:auto and

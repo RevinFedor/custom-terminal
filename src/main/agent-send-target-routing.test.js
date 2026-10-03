@@ -26,34 +26,41 @@ test('bridge tab lookup observes a restored workspace rather than its pre-await 
   assert.equal(context.lookup('target', 'project'), tab);
 });
 
-async function route({ initial = null, restored = null, restoreError = null, expectedToolType = 'codex', expectedTabType = 'terminal', expectedSessionId = null } = {}) {
+async function route({ initial = null, restored = null, restoreError = null, expectedToolType = 'codex',
+  expectedTabType = 'terminal', expectedSessionId = null, expectedTarget = undefined,
+  describedSessionId = 'S', scenarioResult = null } = {}) {
   const start = source.indexOf("if (action === 'sendMessageAuto' || action === 'sendAgentPromptScenario')");
   const end = source.indexOf("if (action === 'sendClaudeMessage')", start);
   assert.ok(start > 0 && end > start);
   const calls = [];
+  const scenarioCalls = [];
   let current = initial;
   const context = vm.createContext({
     action: 'sendAgentPromptScenario',
     payload: { tabId: 'target', targetProjectId: 'project', prompt: 'user prompt',
-      handoffId: 'handoff', source: 'terminal-mcp', expectedToolType, expectedTabType, expectedSessionId },
+      handoffId: 'handoff', source: 'terminal-mcp', expectedToolType, expectedTabType, expectedSessionId, expectedTarget },
     describeAgentTab: () => ({ tab: current, toolType: current?.tabType === 'claude-sdk'
       ? null : current?.commandType || null, runtime: current?.tabType === 'claude-sdk' ? null : current,
-      sessionId: 'S' }),
+      sessionId: describedSessionId }),
     ensureProjectWorkspace: async project => {
       calls.push('restore:' + project);
       if (restoreError) throw restoreError;
       current = restored;
     },
     runHistoryPromptHandoff: async args => args.send(args.handoffId),
+    prepareTabWorkContext: async (_tabId, _handoffId, prompt) => ({ prompt }),
     createAgentSettingsIntent: () => ({}),
-    sendAgentPromptScenario: async args => { calls.push('pty:' + args.toolType); return { success: true, submitted: true }; },
+    sendAgentPromptScenario: async args => {
+      calls.push('pty:' + args.toolType); scenarioCalls.push(args);
+      return scenarioResult || { success: true, submitted: true };
+    },
     maybeAutoTitleAfterMobileSend() {},
     reply: (ok, data) => ({ ok, data }),
     window: { dispatchEvent() {} }, CustomEvent: function () {},
     ipcRenderer: { invoke: async channel => { calls.push(channel); return { success: true }; } },
   });
   vm.runInContext(compile('async function run(){' + source.slice(start, end) + '}'), context);
-  return { result: await context.run(), calls };
+  return { result: await context.run(), calls, scenarioCalls };
 }
 
 test('a closed Codex project restores in background and keeps its PTY provider', async () => {
@@ -101,4 +108,56 @@ test('a delayed callback cannot submit into another session now occupying the sa
   assert.deepEqual(r.calls, []);
   const same = await route({ initial: { commandType: 'codex' }, expectedSessionId: 'S' });
   assert.equal(same.result.data.submitted, true);
+});
+
+for (const toolType of ['claude', 'codex']) {
+  test(toolType + ' App passes a full provisional pin unchanged when the launch has materialized', async () => {
+    const expectedTarget = Object.freeze({ toolType, terminalInstanceId: 'terminal-A', launchId: 'launch-A', runSeq: 7 });
+    const r = await route({ initial: { commandType: toolType }, expectedToolType: toolType,
+      expectedTarget, describedSessionId: 'materialized-A' });
+    assert.equal(r.result.data.submitted, true);
+    assert.equal(r.scenarioCalls.length, 1);
+    assert.equal(r.scenarioCalls[0].expectedTarget, expectedTarget, 'App must not reconstruct the pin from its current session');
+    assert.equal(r.scenarioCalls[0].sessionId, 'materialized-A');
+    assert.deepEqual({ ...r.scenarioCalls[0].expectedTarget },
+      { toolType, terminalInstanceId: 'terminal-A', launchId: 'launch-A', runSeq: 7 });
+  });
+
+  test(toolType + ' App defers accepted Resume SID differences to authoritative scenario proof', async () => {
+    const expectedTarget = Object.freeze({ toolType, sessionId: 'original-A' });
+    const r = await route({ initial: { commandType: toolType }, expectedToolType: toolType,
+      expectedSessionId: 'original-A', describedSessionId: 'resumed-writer-B', expectedTarget });
+    assert.equal(r.result.data.submitted, true, 'App SID equality must not preempt the exact Resume proof');
+    assert.equal(r.scenarioCalls[0].expectedTarget, expectedTarget);
+    assert.equal(r.scenarioCalls[0].sessionId, 'resumed-writer-B');
+    assert.deepEqual(r.calls, ['pty:' + toolType]);
+  });
+
+  test(toolType + ' App preserves the original pin and returns the scenario refusal after target replacement', async () => {
+    const expectedTarget = Object.freeze({ toolType, terminalInstanceId: 'terminal-A', launchId: 'launch-A', runSeq: 7 });
+    const r = await route({ initial: { commandType: toolType }, expectedToolType: toolType,
+      expectedTarget, describedSessionId: 'replacement-B', scenarioResult: {
+        success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+        code: 'agent_send_target_changed',
+      } });
+    assert.equal(r.scenarioCalls[0].expectedTarget, expectedTarget);
+    assert.equal(r.result.data.code, 'agent_send_target_changed');
+    assert.equal(r.result.data.submitted, false);
+    assert.equal(r.result.data.pasteWritten, false);
+    assert.equal(r.result.data.enterWritten, false);
+  });
+}
+
+test('SDK keeps direct SID equality even when the bridge carries a full expectedTarget', async () => {
+  const expectedTarget = Object.freeze({ toolType: 'claude', sessionId: 'sdk-A' });
+  const mismatch = await route({ initial: { tabType: 'claude-sdk' }, expectedToolType: 'claude',
+    expectedTabType: 'claude-sdk', expectedSessionId: 'sdk-A', describedSessionId: 'sdk-B', expectedTarget });
+  assert.equal(mismatch.result.data.code, 'agent_send_target_changed');
+  assert.equal(mismatch.result.data.submitted, false);
+  assert.deepEqual(mismatch.calls, []);
+  assert.equal(mismatch.scenarioCalls.length, 0);
+  const same = await route({ initial: { tabType: 'claude-sdk' }, expectedToolType: 'claude',
+    expectedTabType: 'claude-sdk', expectedSessionId: 'sdk-A', describedSessionId: 'sdk-A', expectedTarget });
+  assert.equal(same.result.data.success, true);
+  assert.deepEqual(same.calls, ['claude-sdk:send-message']);
 });

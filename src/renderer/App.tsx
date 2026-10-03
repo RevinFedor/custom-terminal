@@ -674,6 +674,8 @@ const ProjectTabItem = memo(({
   const [isTabDropBlocked, setIsTabDropBlocked] = useState(false);
   const [tabDropCount, setTabDropCount] = useState(0);
   const [isTabNavigationTarget, setIsTabNavigationTarget] = useState(false);
+  const isActiveRef = useRef(isActive);
+  isActiveRef.current = isActive;
   const [structuredDropState, setStructuredDropState] = useState<'allowed' | 'blocked' | null>(null);
 
   // Settings → Размеры → ТАБЫ → Проекты. Padding x/y чипа проекта в TitleBar.
@@ -740,13 +742,13 @@ const ProjectTabItem = memo(({
         },
         onDragEnter: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setIsTabNavigationTarget(!isActive);
+            setIsTabNavigationTarget(!isActiveRef.current);
             setTabDragNavigationTarget('pane', {
               kind: 'project',
               id: projectId,
               clientX: location.current.input.clientX,
               clientY: location.current.input.clientY,
-              blocked: isActive,
+              blocked: isActiveRef.current,
             });
             return;
           }
@@ -761,13 +763,13 @@ const ProjectTabItem = memo(({
         },
         onDrag: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setIsTabNavigationTarget(!isActive);
+            setIsTabNavigationTarget(!isActiveRef.current);
             setTabDragNavigationTarget('pane', {
               kind: 'project',
               id: projectId,
               clientX: location.current.input.clientX,
               clientY: location.current.input.clientY,
-              blocked: isActive,
+              blocked: isActiveRef.current,
             });
             return;
           }
@@ -846,7 +848,7 @@ const ProjectTabItem = memo(({
       // на которой ничего не написано, не должна быть ещё и неопознаваемой.
       // В остальных случаях подсказки нет — имя и так написано.
       title={hideProjectName ? projectName : undefined}
-      className={`no-drag relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${textColor}`}
+      className={`no-drag relative inline-flex items-center text-sm font-medium cursor-pointer rounded-sm overflow-visible ${textColor}`}
       style={{
         // padding x/y из Settings (раньше был хардкод px-3 py-1.5 = 12px 6px).
         padding: `${projectTabGeometry.paddingY}px ${projectTabGeometry.paddingX}px`,
@@ -5225,7 +5227,8 @@ function App() {
           // A stale renderer SID must not turn its first launch into Resume.
           // Main rechecks the exact durable attempt again at launch/paste.
           const sessionId = payload?.expectedBinding === 'none' ? null : describedSessionId;
-          if (payload?.expectedSessionId && sessionId !== payload.expectedSessionId) {
+          if ((!payload?.expectedTarget || tab?.tabType === 'claude-sdk')
+            && payload?.expectedSessionId && sessionId !== payload.expectedSessionId) {
             return reply(true, {
               success: false, accepted: false, submitted: false,
               pasteWritten: false, enterWritten: false,
@@ -5279,6 +5282,7 @@ function App() {
                 toolType,
                 runtime,
                 sessionId,
+                expectedTarget: payload?.expectedTarget,
                 cwd: cwd || tab?.cwd,
                 prompt,
                 handoffId: resolvedHandoffId,

@@ -14,11 +14,11 @@
 - **Подменю с отступом:** Scripts отображаются как подменю контекстного меню (CSS `group-hover/scripts`), открывающееся вправо.
 
 ## 3. Stop Running Process
-Все script/devServer stop-пути отправляют `\x03` — Ctrl+C в PTY. Не подменять это SIGTERM по PID: shell сам доставляет SIGINT foreground process group, dev-server получает graceful exit, а UI остаётся в той же терминальной модели.
+React Stop-пути script/devServer в TabBar вызывают `terminal:deterministic-stop` с `restart:false`: main сигналит дерево потомков SIGINT и при необходимости эскалирует SIGTERM/SIGKILL, оставляя shell жить. Это не запись байта `\x03` в PTY: внешний SIGINT не очищает уже накопленные строки его ввода. Нативное меню `Scripts → Stop process (Ctrl+C)` отдельно пишет `\x03`; эти два механизма нельзя объявлять одной и той же реализацией. Для обычной остановки сохраняются graceful SIGINT-first и текущая shell/tab модель, не blanket kill shell.
 
 Текущие поверхности остановки:
 - **ПКМ по табу → верхний Close+Stop split-pill** — основной путь для running script/devServer в tab context menu. Stop script mirror'ит Stop Claude UX, но зовёт script-stop ветку.
-- **Cmd+hover по правой reload-кнопке в vertical sidebar** — только для зелёной `commandType === 'devServer'` вкладки с живым process-status. Та же кнопка превращается из restart в красный square-stop; click шлёт только Ctrl+C. Подробнее — `fact-process-bar.md::Restart button stop-mode для devServer`.
+- **Cmd+hover по правой reload-кнопке в vertical sidebar** — только для зелёной `commandType === 'devServer'` вкладки с живым process-status. Та же кнопка превращается из restart в красный square-stop; click вызывает Stop без повторного запуска. Подробнее — `fact-process-bar.md::Restart button stop-mode для devServer`.
 - **Middle-click на RestartZone** — fallback для horizontal layout, где RestartZone всё ещё рендерится отдельно и `onAuxClick` перехватывает middle-click ДО TabItem.
 - **ПКМ по терминалу → Scripts (● running) → ● Stop process** — нативное Electron меню в main.js, проверяет `terminalCommandState.get(tabId).isRunning`.
 - **External REST `POST /terminal/stop`** — тот же deterministic Ctrl+C stop для sibling-процессов
@@ -56,6 +56,10 @@ Main хранит короткую историю фактических зап�
 UI читает историю через `terminal:get-command-run-history` по `tabId` + live cwd. Формат строки намеренно короткий: название команды (`npm run build:install` показывается как `build:install`) и локальное время `DD-Mon-YY HH:mm`. История доступна из ПКМ вкладки → `Info` submenu даже когда `Restart after` выключен; когда на vertical tab есть фиолетовый restart-after command label (`build:install [3]`), сам label кликабелен и открывает тот же список.
 
 ## Restart after AI completion
+
+**Подтверждённый дефект 02–03.10.2026, ещё не исправлен.** Side-effect исполняется из каждого смонтированного TabBar, а busy/stop-lock/finite-pending maps принадлежат отдельному instance. Поэтому заявленный ниже «один pending rerun» действует внутри одной панели, но не гарантирован глобально. Для habit-tracker tab96 в16:51:06.556–558UTC main принял10 одинаковых `\x15./deploy.sh\r` от Restart after. В17:12–17:13 ручной Stop действительно убивал процессы, после чего shell запускал следующую заранее принятую строку; новых `terminal:input` к tab96 после16:51 не было. Закрытие источников не отзывает уже введённые в shell команды. Actual-function proof с10 независимыми экземплярами дал10 writes; отдельный native PTY доказал запуск следующей буферизованной команды после SIGTERM без нового write. Это диагноз, не выполненный ремонт и не гарантия исправления после обычной сборки текущего source.
+
+Правильный ремонт сохраняет фоновые workflow: один общий исполнитель на owner, dedupe exact completion перед admission, одна текущая операция + один latest pending для действительно новых событий. Manual Stop должен отменять ещё не переданные попытки/повтор до сигнала процессу; уже введённые строки требуют отдельного терминального разбора, их нельзя считать отменёнными от `restart:false`. Делать executor только в сфокусированной/видимой панели нельзя — это снимет дубли ценой утраты background-сценария. Пока дефект открыт, закрытая tab96 не требует удаления истории; не восстанавливать её автоматическую подписку ради проверки без отдельного поручения.
 
 Обычная terminal/devServer вкладка может быть привязана к завершению одной или нескольких AI-вкладок через ПКМ → `Restart after`. Это не Prompt Queue и не отправка prompt'а: owner — обычная вкладка с процессом или script'ом, triggers — Claude/Gemini/Codex/SDK вкладки, у которых ждём штатный busy→idle edge. Любой выбранный trigger может запустить side effect в owner-вкладке.
 

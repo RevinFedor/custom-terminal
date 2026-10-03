@@ -127,6 +127,8 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
       send: (channel, value) => publications.push({ channel, value }),
     } },
     agentSendReceiptStore: store,
+    codexSettingsMutationQueue: require('./codex-settings-mutation-queue').createCodexSettingsMutationQueue(),
+    codexModelEffortIntentReconcileInflight: new Map(),
     tabWorkContext: { assertContinuationScope() {} },
     conversationOwners: { assertNone() {}, noteInput() {} },
     isCodexTuiEffectivelyReady: () => ready,

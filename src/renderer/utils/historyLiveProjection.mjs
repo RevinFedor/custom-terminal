@@ -53,6 +53,20 @@ const normalizeCodexServiceCarrierEntries = (entries) => {
 const isObject = (value) =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
+const codexSettingFact = (entry) => {
+  const fact = entry?.settingsFact;
+  return entry?.role === 'slash' && fact?.version === 1 && fact.provider === 'codex'
+    && (fact.kind === 'model' || fact.kind === 'effort') && typeof fact.value === 'string' && fact.value
+    ? fact : null;
+};
+
+const settingConflict = (live, durable) => {
+  const expected = codexSettingFact(live), observed = codexSettingFact(durable);
+  if (!expected || !observed || live.sessionId !== durable.sessionId) return null;
+  return expected.kind !== observed.kind || expected.value !== observed.value
+    ? `History mismatch: /${expected.kind} ${expected.value} → /${observed.kind} ${observed.value}` : null;
+};
+
 const stableJson = (value) => {
   try {
     return JSON.stringify(value);
@@ -486,6 +500,9 @@ export function reconcileHistoryLiveToolResults(durableEntries, liveResults) {
  * create a frame with neither copy.
  */
 export function reconcileCommittedHistoryLiveProjection(liveEntries, durableEntries) {
+  const settingByIdentity = (liveEntries || []).some(codexSettingFact)
+    ? new Map((durableEntries || []).filter(codexSettingFact)
+      .flatMap(entry => historyLivePresentationIdentities(entry).map(id => [id, entry]))) : new Map();
   const durableIdentities = new Set(
     (durableEntries || [])
       .flatMap((entry) => historyLivePresentationIdentities(entry)),
@@ -496,6 +513,7 @@ export function reconcileCommittedHistoryLiveProjection(liveEntries, durableEntr
   }
   const remaining = source.filter((entry) => {
     const identities = historyLivePresentationIdentities(entry);
+    if (codexSettingFact(entry) && identities.some(id => settingConflict(entry, settingByIdentity.get(id)))) return true;
     return identities.length === 0
       || !identities.some((identity) => durableIdentities.has(identity));
   });
@@ -512,7 +530,57 @@ export function reconcileCommittedHistoryLiveProjection(liveEntries, durableEntr
  * turns live → durable into an in-place React update instead of two competing
  * DOM surfaces.
  */
-export function buildHistoryLivePresentation(durableEntries, liveEntries) {
+function retainSettingsPresentationKeys(entries, keys) {
+  if (!keys) return entries;
+  let changed = false;
+  const next = entries.map(entry => {
+    if (!codexSettingFact(entry) || !entry.sourceIdentity) return entry;
+    const identities = historyLivePresentationIdentities(entry);
+    const key = identities.map(id => keys.get(id)).find(Boolean) || 'source:' + entry.sourceIdentity;
+    // Remember only an actually presented primary, not every historical alias.
+    // A later canonical primary can adopt an earlier visible alias's key.
+    keys.set(entry.sourceIdentity, key);
+    if (key === 'source:' + entry.sourceIdentity) return entry;
+    changed = true;
+    return { ...entry, settingsPresentationKey: key };
+  });
+  return changed ? next : entries;
+}
+
+export function buildHistoryLivePresentation(durableEntries, liveEntries, { settingsPresentationKeys } = {}) {
+  const liveSettings = (liveEntries || []).filter(codexSettingFact);
+  if (!liveSettings.length) return retainSettingsPresentationKeys(
+    buildHistoryLivePresentationBase(durableEntries, liveEntries), settingsPresentationKeys);
+  const expected = new Map(liveSettings.flatMap(entry => historyLivePresentationIdentities(entry).map(id => [id, entry])));
+  let changed = false;
+  const durable = (durableEntries || []).map(entry => {
+    if (!codexSettingFact(entry)) return entry;
+    const conflict = historyLivePresentationIdentities(entry)
+      .map(id => settingConflict(expected.get(id), entry)).find(Boolean);
+    if (!conflict) return entry;
+    changed = true;
+    return { ...entry, settingsProjectionError: conflict };
+  });
+  const merged = buildHistoryLivePresentationBase(changed ? durable : durableEntries, liveEntries);
+  // Codex thread_settings_applied observes a full pair and can repeat it.
+  // Match the canonical projector's *setting-state* rule, not prompt text:
+  // an unchanged effort alongside a new model is not another /effort row.
+  // This affects presentation only, never operation/delivery ownership.
+  const values = new Map();
+  let removed = false;
+  const shown = merged.filter(entry => {
+    const fact = codexSettingFact(entry);
+    if (!fact) return true;
+    const key = String(entry.viewOwnerSessionId || entry.sessionId || '') + ':' + fact.kind;
+    const unchanged = fact.live === true && values.get(key) === fact.value;
+    values.set(key, fact.value);
+    if (unchanged) removed = true;
+    return !unchanged;
+  });
+  return retainSettingsPresentationKeys(removed ? shown : merged, settingsPresentationKeys);
+}
+
+function buildHistoryLivePresentationBase(durableEntries, liveEntries) {
   const durable = Array.isArray(durableEntries) ? durableEntries : [];
   const live = Array.isArray(liveEntries) ? liveEntries : [];
   if (live.length === 0) return durable;
@@ -688,6 +756,7 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
 
 export function historyLivePresentationKey(entry) {
   if (entry?.rewriteRenderKey) return entry.rewriteRenderKey;
+  if (entry?.settingsPresentationKey) return entry.settingsPresentationKey;
   const sourceIdentity = String(entry?.sourceIdentity || '');
   // Assistant and compact rows have a live → durable replacement in this
   // projection.
@@ -700,6 +769,7 @@ export function historyLivePresentationKey(entry) {
       entry?.role === 'assistant'
       || entry?.role === 'compact'
       || entry?.role === 'goal'
+      || !!codexSettingFact(entry)
       || sourceIdentity.startsWith('claude-queue:')
     )
   ) {
@@ -849,7 +919,8 @@ export function reduceHistoryLiveProjection(
   if (
     envelope?.type === 'history_entry'
     && isObject(envelope.entry)
-    && (envelope.entry.role === 'compact' || envelope.entry.role === 'goal')
+    && (envelope.entry.role === 'compact' || envelope.entry.role === 'goal'
+      || (envelope.toolType === 'codex' && !!codexSettingFact(envelope.entry)))
     && typeof envelope.entry.uuid === 'string'
   ) {
     const entry = {

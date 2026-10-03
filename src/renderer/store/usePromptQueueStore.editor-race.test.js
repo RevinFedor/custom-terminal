@@ -21,6 +21,8 @@ async function loadQueueStore(t) {
 
   const ipcRenderer = {
     invoke: async (channel) => {
+      if (channel === 'ai-prompts:get') return { success: true, data: [{ id: 'run-after-loop', content: require('../../shared/prompt-loop.cjs').DEFAULT_LOOP_PROMPT }] };
+      if (channel === 'ai-prompts:save-content') return { success: true };
       if (channel === 'app:getState') return {};
       if (channel === 'app:setState') return { success: true };
       throw new Error('Unexpected IPC invoke: ' + channel);

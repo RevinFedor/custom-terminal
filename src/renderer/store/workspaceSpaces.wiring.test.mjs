@@ -14,6 +14,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const store = fs.readFileSync(path.join(here, 'useWorkspaceStore.ts'), 'utf8');
 const workspaceDir = path.join(here, '..', 'components', 'Workspace');
 const strip = fs.readFileSync(path.join(workspaceDir, 'SpaceStrip.tsx'), 'utf8');
+const workflowChip = fs.readFileSync(path.join(workspaceDir, 'WorkflowChip.tsx'), 'utf8');
 const map = fs.readFileSync(path.join(workspaceDir, 'PaneMap.tsx'), 'utf8');
 const workspace = fs.readFileSync(path.join(workspaceDir, 'Workspace.tsx'), 'utf8');
 const navigation = fs.readFileSync(path.join(workspaceDir, 'WorkspaceNavigationRow.tsx'), 'utf8');
@@ -160,8 +161,9 @@ test('полоса пространств той же меры, что стро�
   // Две строки-переключателя одной высоты читаются как один язык. Высота берётся
   // ИЗ строки проектов, а не повторяется числом.
   assert.match(layoutConsts, /export const SPACE_STRIP_H = TITLE_BAR_H;/);
-  assert.match(strip, /height: PROJECT_CARD_MAX_H/);
-  assert.match(strip, /useUIStore\(\(s\) => s\.projectTabsFontSize\)/);
+  assert.match(strip, /<WorkflowChip/);
+  assert.match(workflowChip, /height: PROJECT_CARD_MAX_H/);
+  assert.match(workflowChip, /useUIStore\(s => s\.projectTabsFontSize\)/);
 });
 
 test('обычный клик ведёт К ВКЛАДКЕ, Shift выбирает visible range', () => {
@@ -263,7 +265,8 @@ test('activity badge принадлежит фактическому workflow в
   // иначе полоса перестанет отвечать, где человек находится.
   assert.match(strip, /const \[hovered, setHovered\] = useState\(false\);/);
   assert.match(strip, /onMouseEnter=\{\(\) => setHovered\(true\)\}/);
-  assert.match(strip, /hovered \? 'rgba\(255,255,255,0\.055\)' : 'transparent'/);
+  assert.match(strip, /<WorkflowChip[\s\S]{0,350}hovered=\{hovered\}/);
+  assert.match(workflowChip, /hover \? 'rgba\(255,255,255,0\.055\)' : 'transparent'/);
 });
 
 test('workflow metadata durable и project имеет одного родителя', () => {
@@ -277,83 +280,27 @@ test('workflow metadata durable и project имеет одного родите�
 });
 
 
-test('действия окна — блочный сосед; скрытый focus-блок сохраняет scroll-space без чёрной коробки', () => {
-  // Третья итерация (2026-08-20). Слой ПОВЕРХ полосы дал три бага разом: чип
-  // уезжал под кнопки («вкладка должна оканчиваться там, где начинается
-  // гит»), колесо полосы молчало (clientWidth включал закрытую часть — полоса
-  // «думала», что прокручивать нечего), подложка рисовала вторую вертикальную
-  // границу рядом с рамкой Git. Юзер: «он, наверное, всегда должен быть
-  // блочным, по логике».
+test('действия окна остаются в потоке при скрытом focus-блоке', () => {
   const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
   const at = chrome.indexOf('data-split-pane-actions');
   const box = chrome.slice(at, at + 1800);
-  assert.match(box, /position: 'relative',/);
-  assert.ok(!/position: 'absolute'/.test(box), 'ряд больше не absolute-слой');
-  assert.match(box, /flexShrink: 0,/);
-  // Ростом с один чип, кнопки тянутся на высоту ряда.
-  assert.match(box, /height: chipH,/);
-  assert.match(box, /alignItems: 'stretch',/);
-  // Инлайнового фона и подложек нет: ряд ничего не перекрывает.
-  assert.ok(!/background: '#1e1e1e',/.test(box), 'фону поверх чипов неоткуда взяться');
-  // Git+split принадлежат focus-owner в обоих режимах. Wrap держит невидимый
-  // блок в потоке как резерв, scroll переносит измеренную ширину в strip.
-  assert.match(chrome, /data-split-pane-focus-actions/);
-  assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
-  assert.match(chrome, /const focusActionsInFlow = stripWrap \|\| focusActionsVisible/);
-  assert.match(chrome, /data-wrap-reserved=\{stripWrap \? '1' : undefined\}/);
-  assert.match(chrome, /position: focusActionsInFlow \? 'relative' : 'absolute'/);
+  assert.match(box, /position: 'relative'/);
+  assert.doesNotMatch(box, /position: 'absolute'/);
+  assert.match(box, /flexShrink: 0/);
+  assert.match(box, /height: chipH/);
+  assert.match(box, /alignItems: 'stretch'/);
+  assert.match(chrome, /data-wrap-reserved="1"/);
   assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
-  assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
+  assert.doesNotMatch(chrome, /focusActionsWidth|endInsetPx/);
+});
+
+test('удалённые настройки горизонтального ряда не загружаются и не предлагаются', () => {
+  const store = fs.readFileSync(path.join(here, 'useUIStore.ts'), 'utf8');
+  assert.doesNotMatch(store, /paneTabStrip(?:Wrap|AutoReveal):|setPaneTabStrip|APP_STATE_KEY_PANE_STRIP/);
+  const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
+  assert.doesNotMatch(chrome, /data-split-strip-menu-item="(?:wrap|auto-reveal)"|stripWrap|stripAutoReveal/);
   assert.match(chrome, /data-split-strip-menu-button/);
-  const strip = fs.readFileSync(path.join(workspaceDir, 'PaneTabStrip.tsx'), 'utf8');
-  assert.match(strip, /data-pane-strip-end-reserve/);
-  assert.match(strip, /flex: `0 0 \$\{Math\.max\(0, endInsetPx\)\}px`/);
-});
-
-test('ширина focus-actions измеряется событием layout и не становится вторым viewport formula', () => {
-  const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
-  assert.match(chrome, /const \[focusActionsWidth, setFocusActionsWidth\] = useState\(0\)/);
-  assert.match(chrome, /new ResizeObserver/);
-  assert.match(chrome, /focusActionsWidth \+ 2/);
-  assert.doesNotMatch(chrome, /clientWidth\s*-\s*focusActionsWidth/);
-  assert.ok(!/STRIP_MENU_BUTTON_INSET/.test(chrome), 'резерв под три точки удалён');
-});
-
-test('перенос вкладок: настройка живёт в сторе и переживает перезапуск', () => {
-  const store = fs.readFileSync(path.join(here, 'useUIStore.ts'), 'utf8');
-  assert.match(store, /paneTabStripWrap: boolean;/);
-  // Двойная запись, как у остальных режимов раскладки: localStorage — чтобы
-  // применилось в первом кадре, SQLite — чтобы пережило смену dev-порта.
-  assert.match(store, /localStorage\.setItem\('noted-terminal-pane-strip-wrap'/);
-  assert.match(store, /key: APP_STATE_KEY_PANE_STRIP_WRAP, value: v/);
-  const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
-  // Пункт меню — один checkbox-row. Активность рисуется фоном/рамкой, поэтому
-  // SVG действия остаётся в общей левой колонке и не сдвигается галочкой.
-  assert.match(chrome, /data-split-strip-menu-item="wrap"/);
-  assert.match(chrome, /role="menuitemcheckbox"/);
-  assert.match(chrome, /aria-checked=\{stripWrap\}/);
-  assert.match(chrome, /Перенос вкладок/);
-  assert.doesNotMatch(chrome, /\bCheck\b/);
-  assert.match(chrome, /STRIP_MENU_ACTIVE_BACKGROUND/);
-  assert.match(chrome, /STRIP_MENU_ACTIVE_FRAME/);
-  // Три точки видны ВСЕГДА: это вопрос про вкладки окна, а не действие над ним.
-  const at = chrome.indexOf('data-split-strip-menu-button');
-  assert.ok(at > 0, 'кнопка меню полосы существует');
-  const button = chrome.slice(at, at + 1400);
-  assert.ok(!/data-split-button/.test(button),
-    'три точки не помечены как действие окна — иначе они гасли бы вне фокуса');
-});
-
-test('автодовод выбранной вкладки — отдельная настройка, по умолчанию выключена', () => {
-  const store = fs.readFileSync(path.join(here, 'useUIStore.ts'), 'utf8');
-  assert.match(store, /paneTabStripAutoReveal: boolean;/);
-  assert.match(store, /localStorage\.getItem\('noted-terminal-pane-strip-auto-reveal'\) === 'true'/);
-  assert.match(store, /key: APP_STATE_KEY_PANE_STRIP_AUTO_REVEAL, value: v/);
-  const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
-  assert.match(chrome, /data-split-strip-menu-item="auto-reveal"/);
-  assert.match(chrome, /aria-checked=\{stripAutoReveal\}/);
-  assert.match(chrome, /Показывать выбранную/);
-  assert.match(chrome, /autoReveal=\{stripAutoReveal\}/);
+  assert.match(chrome, /data-split-strip-menu-item="swap-workspace-window"/);
 });
 
 test('шапка окна СООБЩАЕТ измеренную высоту, а не только предсказанную', () => {

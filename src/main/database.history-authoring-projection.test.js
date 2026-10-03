@@ -78,7 +78,7 @@ test((fixture.native ? 'native slots: ' : 'typed path: ') + 'actual audit caller
     console:{log(){},warn(){}},path,srcMainDir:__dirname,
     cleanOptionalString:(s,f='')=>typeof s==='string'?s.trim():f,shortId:s=>s,
     agentSendReceiptStore:receiptStore,agentSendReceiptRegistry:{promoteFromAudit:()=>({matched:false})},
-    backfillConfirmedCanonicalAuthoringPresentations,tabWorkContext:null,
+    backfillConfirmedCanonicalAuthoringPresentations,tabWorkContext:null,tabMessageService:null,
     getOrchestrationRunStore:()=>({}),orchestrationTargetRunIdFromAudit:()=>null,orchestrationCompletionRunIdFromAudit:()=>null,
     require:id=>{assert.equal(id,path.join(__dirname,'project-manager'));return {db};},
   });

@@ -21,6 +21,7 @@ const DESKTOP_AUTOMATION_SEND_SOURCES = new Set([
 ]);
 
 const ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX = 'orchestration-completion:';
+const TAB_MESSAGE_SEND_SOURCE_PREFIX = 'tab-message:';
 
 function isOwnedDesktopHistorySendSource(source) {
   const normalized = String(source || '');
@@ -30,6 +31,8 @@ function isOwnedDesktopHistorySendSource(source) {
   // keep the raw source unchanged in fingerprints and persisted attempt data.
   const origin = normalized.startsWith('codex-') ? normalized.slice('codex-'.length) : normalized;
   return DESKTOP_AUTOMATION_SEND_SOURCES.has(origin)
+    || (origin.startsWith(TAB_MESSAGE_SEND_SOURCE_PREFIX)
+      && origin.slice(TAB_MESSAGE_SEND_SOURCE_PREFIX.length).trim().length > 0)
     || (
       origin.startsWith(ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX)
       && origin.slice(ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX.length).trim().length > 0

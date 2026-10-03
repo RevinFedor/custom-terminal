@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { ArrowLeftRight, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, WrapText, Search } from 'lucide-react';
+import { ArrowLeftRight, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search } from 'lucide-react';
 import {requestHistorySearch} from '../../utils/historySearchMarkers';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -172,10 +172,7 @@ export function SplitPaneAttachRow({
   const splitPanes = useWorkspaceStore((s) => paneLayout || s.splitPanes);
   const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
-  // Меню трёх точек — настройки САМОЙ ПОЛОСЫ (пока одна: перенос вкладок).
-  // Отдельное от меню деления: то отвечает на вопрос «куда добавить окно»,
-  // это — «как показывать вкладки», и складывать их в одно меню значило бы
-  // спрятать постоянную настройку внутрь редкого действия.
+  // Window actions remain in the ellipsis menu; wrapping is unconditional.
   const [stripMenu, setStripMenu] = useState<{ x: number; y: number } | null>(null);
   const stripMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [stripMenuPos, setStripMenuPos] = useState<{ x: number; y: number } | null>(null);
@@ -193,10 +190,6 @@ export function SplitPaneAttachRow({
   const ownsWorkspaceSwapPicker = workspaceSwapPicker.active
     && workspaceSwapPicker.sourceSpaceId === activeSpaceId
     && workspaceSwapPicker.sourcePaneIndex === sourcePaneAddress;
-  const stripWrap = useUIStore((s) => s.paneTabStripWrap);
-  const setStripWrap = useUIStore((s) => s.setPaneTabStripWrap);
-  const stripAutoReveal = useUIStore((s) => s.paneTabStripAutoReveal);
-  const setStripAutoReveal = useUIStore((s) => s.setPaneTabStripAutoReveal);
   const timelineTreeMode = useUIStore((s) => s.timelineTreeModeTabs[tabId] ?? false);
   const canSearchHistory = useWorkspaceStore(state => {
     const tab=state.openProjects.get(projectId)?.tabs.get(tabId);
@@ -206,18 +199,13 @@ export function SplitPaneAttachRow({
   const historyPinned = useUIStore((s) => s.historyPinned);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const activeArea = useUIStore((s) => s.activeArea);
-  // Git+split name the keyboard-owned workplace, so both display modes use
-  // the same visibility rule. Wrap keeps the hidden block in normal flow to
-  // reserve its exact width; scroll mode turns that width into strip inset.
+  // Focus changes paint/hits only; the block always reserves its width.
   const focusActionsVisible = focused && activeArea !== 'sidebar';
-  const focusActionsInFlow = stripWrap || focusActionsVisible;
   // Живая высота шапки. В переносе она зависит от того, сколько строк заняли
   // чипы, — то есть от ширины окна и числа вкладок, а не только от настроек
   // размеров. Публикуется РОДИТЕЛЮ переменной CSS, чтобы содержимое окна
   // отступало ровно на неё; см. PANE_HEADER_HEIGHT_VAR.
   const rowRef = React.useRef<HTMLDivElement | null>(null);
-  const focusActionsRef = React.useRef<HTMLDivElement | null>(null);
-  const [focusActionsWidth, setFocusActionsWidth] = useState(0);
   // Measured position of the split-direction menu, clamped into the window.
   const splitMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [splitMenuPos, setSplitMenuPos] = useState<{ x: number; y: number } | null>(null);
@@ -240,32 +228,6 @@ export function SplitPaneAttachRow({
     const rect = button.getBoundingClientRect();
     setStripMenu((prev) => (prev ? null : { x: rect.right - 168, y: rect.bottom }));
   };
-
-  // Hidden focus-actions stay measurable. Scroll mode removes them from outer
-  // flex layout and reserves the same width inside PaneTabStrip. Wrap mode
-  // leaves the invisible block in flow, so row breaks never change on focus.
-  useEffect(() => {
-    const element = focusActionsRef.current;
-    if (!element) return undefined;
-    const accept = (width: number) => {
-      const next = Math.ceil(width || 0);
-      if (next <= 0) return;
-      setFocusActionsWidth((previous) => previous === next ? previous : next);
-    };
-    if (typeof ResizeObserver === 'undefined') {
-      accept(element.getBoundingClientRect().width);
-      return undefined;
-    }
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      const borderBox = Array.isArray(entry?.borderBoxSize)
-        ? entry.borderBoxSize[0]
-        : entry?.borderBoxSize;
-      accept(borderBox?.inlineSize || entry?.contentRect.width || 0);
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
 
   // The strip this header draws. A STRING selector (Fingerprint Pattern) — a
   // selector returning the entry array would allocate on every store write and
@@ -343,7 +305,7 @@ export function SplitPaneAttachRow({
 
   // Used by the layout-effect dependency list below. Keep this declaration
   // above the first hook that reads it: a `const` declared after the effect is
-  // still in the temporal dead zone while React evaluates `[stripWrap, rowH]`
+  // still in the temporal dead zone while React evaluates `[paneIndex, rowH]`
   // (DEV 20.08: `Cannot access 'rowH' before initialization`).
   const rowH = resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize, withPath: false });
   const currentHeaderTabIdRef = React.useRef(tabId);
@@ -406,20 +368,18 @@ export function SplitPaneAttachRow({
       }
     };
 
-    // The one-row mode is known from settings and can publish immediately.
     // Wrapped height is content-driven, but reading getBoundingClientRect in
     // this layout effect made every incoming pane synchronously lay out the
     // entire workspace. Keep the last/fallback height for this commit and let
     // ResizeObserver publish the exact border box from the browser's single
     // shared layout pass before paint.
-    publish(stripWrap ? (publishedHeaderHeightRef.current || rowH) : rowH);
+    publish(publishedHeaderHeightRef.current || rowH);
     const syncMs = performance.now() - startedAt;
     if (syncMs >= 8) {
       console.warn('[Perf:PaneHeaderCommit] pane=' + (paneIndex ?? 'center')
-        + ' wrap=' + (stripWrap ? '1' : '0')
         + ' syncMs=' + syncMs.toFixed(1));
     }
-    if (!stripWrap || typeof ResizeObserver === 'undefined') {
+    if (typeof ResizeObserver === 'undefined') {
       return undefined;
     }
     const ro = new ResizeObserver((entries) => {
@@ -431,7 +391,7 @@ export function SplitPaneAttachRow({
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, [paneIndex, stripWrap, rowH]);
+  }, [paneIndex, rowH]);
 
   // The pane-index chrome is stable while its shown tab changes. Copy the
   // already published height only to the newly shown tab wrapper; do not tear
@@ -504,16 +464,13 @@ export function SplitPaneAttachRow({
   // переносе шапка выше на столько строк, сколько заняли вкладки, и кнопка
   // ростом со всю шапку стала бы вертикальной колонкой рядом с ними.
   const chipH = resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize });
-  const hiddenFocusReservePx = stripWrap || focusActionsVisible || focusActionsWidth <= 0
-    ? 0
-    : focusActionsWidth + 2;
   return (
     <div
       ref={rowRef}
       data-split-attach-row
       data-vacant-pane-parked-count={vacant ? entries.length : undefined}
       data-focused={focused ? 'true' : undefined}
-      data-strip-wrap={stripWrap ? '1' : undefined}
+      data-strip-wrap="1"
       style={{
         position: 'absolute',
         top: 0,
@@ -522,7 +479,7 @@ export function SplitPaneAttachRow({
         // В переносе высота — СЛЕДСТВИЕ раскладки, а не настройка: сколько
         // строк заняли чипы, столько шапка и занимает. Поэтому здесь минимум,
         // а точное число измеряется и публикуется окну (см. эффект выше).
-        ...(stripWrap ? { minHeight: rowH } : { height: rowH }),
+        minHeight: rowH,
         // TWO lines: the strip of tab chips, and the working directory of the
         // tab currently shown. The path moved here from a full-width row of its
         // own — it belongs to the tab, so it belongs where the tab is named, and
@@ -550,7 +507,7 @@ export function SplitPaneAttachRow({
       display: 'flex',
       // В переносе строки чипов заполняются сверху вниз, и кнопки окна стоят у
       // ПЕРВОЙ строки, а не по центру выросшей коробки.
-      alignItems: stripWrap ? 'flex-start' : 'center',
+      alignItems: 'flex-start',
       gap: 6,
       minWidth: 0,
       position: 'relative',
@@ -568,9 +525,6 @@ export function SplitPaneAttachRow({
         onCreateTab={onCreateTab || createTabInThisWindow}
         slots={slots}
         selectedSlotId={selectedSlotId}
-        wrap={stripWrap}
-        autoReveal={stripAutoReveal}
-        endInsetPx={hiddenFocusReservePx}
         sharedActivity={sharedActivity}
       />
 
@@ -640,17 +594,14 @@ export function SplitPaneAttachRow({
         </div>
       )}
 
-      {/* Действия окна — один flex-ряд у правого края, сосед scroller'а. Сам ряд
-          живёт всегда, потому что `⋮` живёт всегда. Focus-блок Git+split вне
-          фокуса снимается из flex-layout ТОЛЬКО в scroll-режиме, но его ширина
-          превращается в невидимый trailing reserve ВНУТРИ scroll-content.
-          В переносе строк скрытый блок остаётся в потоке как прозрачный
-          резерв: Git и split гаснут, а переносы чипов не пересчитываются.
+      {/* Действия окна — один flex-ряд у правого края, сосед полосы. Сам ряд
+          живёт всегда. Скрытый focus-блок остаётся в потоке как прозрачный
+          резерв: кнопки гаснут, а переносы чипов не пересчитываются.
 
           Внутри ряда — два РАЗНЫХ по смыслу блока:
             • Git + деление — про рабочее место и видны только у focus-owner;
-              wrap резервирует их ширину, scroll отдаёт её strip-inset;
-            • три точки — про саму полосу вкладок («как их показывать»), и это
+              их ширина всегда зарезервирована;
+            • три точки — действия окна, и это
               вопрос к любому окну, а не только к рабочему. Видимы всегда и
               стоят последними, замыкая правый край. */}
       <div
@@ -685,20 +636,17 @@ export function SplitPaneAttachRow({
 
       {/* Git follows the focused window from the application titlebar.
           The remaining focus actions retain their geometry reservation.
-          В scroll-режиме скрытый блок уходит из flex-layout, а его ширину
-          резервирует strip. В wrap-режиме он остаётся relative/hidden: место
+          Скрытый блок остаётся relative/hidden: место
           сохранено, поэтому focus не меняет число строк вкладок. */}
       <div
-        ref={focusActionsRef}
         data-split-pane-focus-actions
-        data-wrap-reserved={stripWrap ? '1' : undefined}
+        data-wrap-reserved="1"
         data-visible={focusActionsVisible ? '1' : '0'}
         aria-hidden={!focusActionsVisible}
         inert={!focusActionsVisible}
         style={{
           display: 'flex',
-          position: focusActionsInFlow ? 'relative' : 'absolute',
-          ...(focusActionsInFlow ? null : { right: '100%', top: 0 }),
+          position: 'relative',
           visibility: focusActionsVisible ? 'visible' : 'hidden',
           alignItems: 'stretch',
           alignSelf: 'stretch',
@@ -784,10 +732,8 @@ export function SplitPaneAttachRow({
         <Columns2 size={12} />
       </button>
       </div>
-      {/* Три точки — меню САМОЙ ПОЛОСЫ вкладок. Она про полосу целиком («как
-          показывать вкладки»), а это вопрос к ЛЮБОМУ окну, а не только к
-          рабочему, — поэтому кнопка видима всегда и стоит последней, замыкая
-          правый край.
+      {/* Три точки — действия этого окна: обмен, Timeline, поиск History.
+          Кнопка доступна и вне фокуса, стоит последней у правого края.
 
           Коробка идёт во всю высоту ряда и до самого края шапки. Её ширина —
           та же, что у вертикального Timeline rail под ней: их левые границы
@@ -954,76 +900,6 @@ export function SplitPaneAttachRow({
               </span>
               <span aria-hidden style={{ color: '#777', paddingLeft: 8 }}>…</span>
             </button>
-            <div
-              data-split-strip-menu-item="wrap"
-              role="menuitemcheckbox"
-              aria-checked={stripWrap}
-              onMouseDown={(e) => e.stopPropagation()}
-              onClick={(e) => {
-                e.stopPropagation();
-                if (ownsWorkspaceSwapPicker) endWorkspaceWindowSwapPicker();
-                setStripWrap(!stripWrap);
-                setStripMenu(null);
-              }}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '5px 12px',
-                cursor: 'pointer',
-                whiteSpace: 'nowrap',
-                background: stripWrap ? STRIP_MENU_ACTIVE_BACKGROUND : 'transparent',
-                boxShadow: stripWrap ? STRIP_MENU_ACTIVE_FRAME : 'none',
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLElement).style.background = stripWrap
-                  ? STRIP_MENU_ACTIVE_HOVER_BACKGROUND
-                  : 'rgba(255,255,255,0.08)';
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLElement).style.background = stripWrap
-                  ? STRIP_MENU_ACTIVE_BACKGROUND
-                  : 'transparent';
-              }}
-            >
-              <WrapText size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
-              Перенос вкладок
-            </div>
-            <div
-              data-split-strip-menu-item="auto-reveal"
-              role="menuitemcheckbox"
-              aria-checked={stripAutoReveal}
-              onMouseDown={(e) => e.stopPropagation()}
-              onClick={(e) => {
-                e.stopPropagation();
-                if (ownsWorkspaceSwapPicker) endWorkspaceWindowSwapPicker();
-                setStripAutoReveal(!stripAutoReveal);
-                setStripMenu(null);
-              }}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '5px 12px',
-                cursor: 'pointer',
-                whiteSpace: 'nowrap',
-                background: stripAutoReveal ? STRIP_MENU_ACTIVE_BACKGROUND : 'transparent',
-                boxShadow: stripAutoReveal ? STRIP_MENU_ACTIVE_FRAME : 'none',
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLElement).style.background = stripAutoReveal
-                  ? STRIP_MENU_ACTIVE_HOVER_BACKGROUND
-                  : 'rgba(255,255,255,0.08)';
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLElement).style.background = stripAutoReveal
-                  ? STRIP_MENU_ACTIVE_BACKGROUND
-                  : 'transparent';
-              }}
-            >
-              <LocateFixed size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
-              Показывать выбранную
-            </div>
             {!vacant && <div
               data-split-strip-menu-item="timeline"
               role="menuitemcheckbox"

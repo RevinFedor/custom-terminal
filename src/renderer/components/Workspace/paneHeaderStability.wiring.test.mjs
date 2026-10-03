@@ -29,11 +29,10 @@ test('each stable pane publishes its measured header height through a pane-scope
 });
 
 test('unfocused Git+split hides paint, preserves wrap width, and keeps ellipsis mounted', () => {
-  assert.match(chrome, /const focusActionsInFlow = stripWrap \|\| focusActionsVisible/);
-  assert.match(chrome, /position: focusActionsInFlow \? 'relative' : 'absolute'/);
+  assert.match(chrome, /position: 'relative'/);
   assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
-  assert.match(chrome, /data-wrap-reserved=\{stripWrap \? '1' : undefined\}/);
-  assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
+  assert.match(chrome, /data-wrap-reserved="1"/);
+  assert.doesNotMatch(chrome, /endInsetPx|focusActionsWidth/);
   assert.match(chrome, /data-split-strip-menu-button/);
-  assert.match(chrome, /autoReveal=\{stripAutoReveal\}/);
+  assert.doesNotMatch(chrome, /stripAutoReveal/);
 });

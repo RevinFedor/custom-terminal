@@ -5,6 +5,7 @@ import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 import { automationWorkflowForProject, UNPLACED_AUTOMATION_WORKFLOW } from '../utils/autoCompactPolicy.mjs';
 import { getBusyTabsSnapshot } from './usePromptQueueRunner';
 import { resolveAgentBusyPresentation } from '../utils/agentBusyPresentation.mjs';
+import { resolveWorkflowIcon } from '../utils/workflowVisuals.mjs';
 
 export type AutomationTab = {
   id: string; name: string; projectId: string; projectName: string;
@@ -36,6 +37,8 @@ export function useAutomationInventory() {
     })));
     const groups = [...state.spaces, { id: UNPLACED_AUTOMATION_WORKFLOW, name: 'Без workflow', projectIds: [] }]
       .map((s: any) => ({ ...s,
+        icon: s.id === UNPLACED_AUTOMATION_WORKFLOW ? null
+          : resolveWorkflowIcon(s, (id: string) => metadata.get(id)?.[1] || null),
         projectNames: s.id === UNPLACED_AUTOMATION_WORKFLOW
           ? projects.filter((p: any) => automationWorkflowForProject(state.spaces, p.id) === s.id).map((p: any) => p.name)
           : (s.projectIds || []).map((id: string) => metadata.get(id)?.[0]

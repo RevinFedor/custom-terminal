@@ -50,7 +50,7 @@ test('global resize owns only its handle and commits React state once', () => {
   assert.match(globalPanel, /usePointerGesture\(\)/);
   assert.doesNotMatch(globalPanel, /document\.body\.style\.(?:cursor|userSelect)/);
   const moveStart = globalPanel.indexOf('onMove: (moveEvent) => {', globalPanel.indexOf('const startResize'));
-  const moveEnd = globalPanel.indexOf('onEnd: (reason) => {', moveStart);
+  const moveEnd = globalPanel.indexOf('onEnd: (reason, endEvent) => {', moveStart);
   assert.ok(moveStart >= 0 && moveEnd > moveStart);
   const moveBody = globalPanel.slice(moveStart, moveEnd);
   assert.match(moveBody, /panelRef\.current\.style\.width/);

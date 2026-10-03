@@ -93,6 +93,8 @@ class TaskCompletionIntentRegistry {
       startedAt: this.now(),
       intentId: null,
       intentRequestedAt: null,
+      completionStatus: null,
+      completionReason: null,
       completionEligible: completionEligible === true,
       completionSource: completionEligible === true
         ? (normalize(completionSource) || 'prompt-loop')
@@ -102,7 +104,7 @@ class TaskCompletionIntentRegistry {
     return this.snapshot(state);
   }
 
-  requestCompletion({ tabId, sourceTabId = null }) {
+  requestCompletion({ tabId, sourceTabId = null, status = 'completed', reason = null }) {
     const normalizedTabId = normalize(tabId);
     const normalizedSourceTabId = normalize(sourceTabId) || normalizedTabId;
     if (!normalizedTabId) return { ok: false, code: 'tab_required' };
@@ -115,12 +117,24 @@ class TaskCompletionIntentRegistry {
     if (state.completionEligible !== true) {
       return { ok: false, code: 'completion_protocol_not_active' };
     }
+    if (status !== 'completed' && status !== 'blocked') {
+      return { ok: false, code: 'invalid_completion_status' };
+    }
+    const completionReason = status === 'blocked' ? normalize(reason) : null;
+    if (status === 'blocked' && !completionReason) {
+      return { ok: false, code: 'blocked_reason_required' };
+    }
     if (state.intentId) {
+      if (state.completionStatus !== status || state.completionReason !== completionReason) {
+        return { ok: false, code: 'completion_intent_conflict' };
+      }
       return { ok: true, idempotent: true, turn: this.snapshot(state) };
     }
 
     state.intentId = this.createId();
     state.intentRequestedAt = this.now();
+    state.completionStatus = status;
+    state.completionReason = completionReason;
     return { ok: true, idempotent: false, turn: this.snapshot(state) };
   }
 
@@ -153,14 +167,16 @@ class TaskCompletionIntentRegistry {
     }
 
     this.turns.delete(normalizedTabId);
-    const explicitTaskComplete = success === true
+    const explicitLoopStop = success === true
       && state.completionEligible === true
       && !!state.intentId;
     return {
       matched: true,
-      explicitTaskComplete,
-      taskCompletionIntentId: explicitTaskComplete ? state.intentId : null,
-      taskCompletionRequestedAt: explicitTaskComplete ? state.intentRequestedAt : null,
+      explicitTaskComplete: explicitLoopStop && state.completionStatus === 'completed',
+      explicitTaskBlocked: explicitLoopStop && state.completionStatus === 'blocked',
+      taskCompletionReason: explicitLoopStop ? state.completionReason : null,
+      taskCompletionIntentId: explicitLoopStop ? state.intentId : null,
+      taskCompletionRequestedAt: explicitLoopStop ? state.intentRequestedAt : null,
       turn: this.snapshot(state),
     };
   }
@@ -193,8 +209,21 @@ class TaskCompletionIntentRegistry {
       completionSource: state.completionSource || null,
       intentId: state.intentId,
       intentRequestedAt: state.intentRequestedAt,
+      completionStatus: state.completionStatus,
+      completionReason: state.completionReason,
     };
   }
+}
+
+function taskCompletionOutcomeMeta(turn) {
+  if (turn?.explicitTaskComplete !== true && turn?.explicitTaskBlocked !== true) return {};
+  return {
+    explicitTaskComplete: turn.explicitTaskComplete === true,
+    explicitTaskBlocked: turn.explicitTaskBlocked === true,
+    taskCompletionReason: turn.taskCompletionReason || null,
+    taskCompletionIntentId: turn.taskCompletionIntentId,
+    taskCompletionRequestedAt: turn.taskCompletionRequestedAt,
+  };
 }
 
 function findTaskCompletionBlockers(runs, tabId) {
@@ -214,4 +243,5 @@ module.exports = {
   TaskCompletionIntentRegistry,
   findTaskCompletionBlockers,
   loopTaskCompletionEligibility,
+  taskCompletionOutcomeMeta,
 };

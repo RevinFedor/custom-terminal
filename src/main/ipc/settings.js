@@ -173,6 +173,18 @@ function register({ projectManager, savedPromptService }) {
     }
   });
 
+  // Content-only updates keep metadata edited in Settings intact. The sync
+  // variant is exclusively the renderer's shutdown flush, not a hot path.
+  const savePromptContent = (id, content) => {
+    projectManager.db.saveAIPromptContent(id, content);
+    return { success: true };
+  };
+  ipcMain.handle('ai-prompts:save-content', (_event, { id, content }) => savePromptContent(id, content));
+  ipcMain.on('ai-prompts:save-content-sync', (event, { id, content }) => {
+    try { event.returnValue = savePromptContent(id, content); }
+    catch (error) { event.returnValue = { success: false, error: error.message }; }
+  });
+
   ipcMain.handle('ai-prompts:log-call', async (event, payload) => {
     try {
       projectManager.logAIPromptCall(payload);

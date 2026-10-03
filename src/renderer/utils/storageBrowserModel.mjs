@@ -13,7 +13,7 @@ export const STORAGE_PROVIDER_FILTERS = Object.freeze([
 export const STORAGE_GROUPS = Object.freeze({
   open: {
     label: 'Open now',
-    description: 'Sessions open in Noted Terminal, plus physical source files required by an open fork. Never auto-deleted.',
+    description: 'History of open Noted Terminal tabs, including stopped agents, plus source files required by their forks. Close the tab first to make its history eligible for cleanup.',
   },
   regular: {
     label: 'Regular sessions',
@@ -178,11 +178,13 @@ export function selectStorageItems(items, {
   dateTo = '',
   sort = 'size',
   sortDirection = 'desc',
+  deletableOnly = false,
 } = {}) {
   const selected = (Array.isArray(items) ? items : [])
     .filter((item) => item?.section === section)
     .filter((item) => section !== 'sessions' || provider === 'all' || item.provider === provider)
     .filter((item) => !group || item.group === group)
+    .filter((item) => !deletableOnly || (item.deletable === true && item.protected !== true))
     .filter((item) => queryMatches(item, query))
     .filter((item) => dateRangeMatches(item, dateFrom, dateTo));
   const direction = sortDirection === 'asc' ? 1 : -1;
@@ -206,14 +208,15 @@ export function selectStorageItems(items, {
 
 export function summarizeStorageGroups(items, section, provider = 'all') {
   const order = STORAGE_GROUP_ORDER[section] || [];
-  const summary = new Map(order.map((group) => [group, { group, items: 0, bytes: 0, eligibleBytes: 0 }]));
+  const summary = new Map(order.map((group) => [group, { group, items: 0, bytes: 0, eligibleBytes: 0, deletableBytes: 0 }]));
   for (const item of Array.isArray(items) ? items : []) {
     if (item?.section !== section) continue;
     if (section === 'sessions' && provider !== 'all' && item.provider !== provider) continue;
-    const current = summary.get(item.group) || { group: item.group, items: 0, bytes: 0, eligibleBytes: 0 };
+    const current = summary.get(item.group) || { group: item.group, items: 0, bytes: 0, eligibleBytes: 0, deletableBytes: 0 };
     current.items += 1;
     current.bytes += Number(item.sizeBytes) || 0;
     if (item.eligible) current.eligibleBytes += Number(item.sizeBytes) || 0;
+    if (item.deletable && !item.protected) current.deletableBytes += Number(item.sizeBytes) || 0;
     summary.set(item.group, current);
   }
   return [...summary.values()].filter((group) => group.items > 0);

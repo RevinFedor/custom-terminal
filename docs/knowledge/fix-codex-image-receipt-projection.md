@@ -71,6 +71,36 @@ basename/count/глобального path equality. Native canonical hash ос�
 от staged hash; exact confirmed scope/body/path checks и late audit/reopen/copy
 сохраняют projection, без переписывания JSONL/доставки.
 
+### 03.10: promotion сохранила alias, но read lookup потерял original refs
+
+Native31728 и три exact sends1D6A/63E6/8885 имели persisted schema4 projection
+уже в production log. Первый audit связывал response31727/source236434874,
+а parser повысил его до event31728/source237217420 с exact source alias,
+timestamp +1ms и другим canonical hash. Старый lookup по UUID/time/hash не
+нашёл sidecar; API оставила transport symlinks, native добавила их к двум
+original footer paths как ещё две картинки и preview получил403.
+
+Reader индексирует native projection также по её immutable physical source
+binding. Изменившиеся timestamp/hash принимаются только для parser-proven
+paired carrier, с совпавшим текущим audit timestamp/body hash и полным image
+canonical proof. Session, прежний stored audit binding, staged formatter replay,
+весь обычный текст и ordered slots/paths проверяются по-прежнему. Missing alias,
+foreign scope/body/hash/order не заменяются basename/count/realpath inference.
+DTO оставляет UUID/content/literal footer и original `/var/...` path, аннотирует
+sourcePath/transportPath у ОДНОГО occurrence. Production receipts/JSONL не правятся;
+существующей постоянной projection достаточно после обновления reader.
+
+Desktop missing refs уже существующего local handoff дополняются read-only
+`imagePresentation` v1 из той же request proof на bounded receipt IPC. Exact
+operation/attempt/session/request text обязательны; новый row/status/send не
+создаётся. Adjacent image occurrences стоят в одной inline полосе, same-path
+повторы потребляют разные ordinal refs. Preview использует прежний mobile
+upload-root owner с12MB cap, не разрешает arbitrary transport aliases.
+Actual captured projector/три request→handoff regressions и private actual
+History gestures + отдельный source-extracted Main preview handler прошли;
+это SOURCE/isolated acceptance, не installed/iPhone proof. Wire/артефакты —
+`/private/tmp/ios-settings-images-20261003/MAIN-RESULT.md`.
+
 Regression: `history-authoring-projection.test.js` +
 `database.history-authoring-projection.test.js`: реальные37DE user13/alias12,
 actual audit consumer→SQLite→HTTP delta, receipt pruning/reopen, exact child copy,

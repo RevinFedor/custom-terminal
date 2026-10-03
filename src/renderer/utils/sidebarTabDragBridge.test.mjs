@@ -6,6 +6,8 @@ import {
   getSidebarTabDragCursorChip,
   getSidebarTabDragProjectionKey,
   getSidebarTabDragSnapshot,
+  getSidebarTabDragSessionSnapshot,
+  subscribeSidebarTabDragSession,
   resetSidebarTabDragForTests,
   updateSidebarTabDragPointer,
 } from './sidebarTabDragBridge.mjs';
@@ -99,4 +101,24 @@ test('stale release cannot end a newer physical drag', () => {
   assert.equal(endSidebarTabDrag('drag-new'), true);
   assert.equal(getSidebarTabDragSnapshot().active, false);
   assert.equal(historyForegroundPriority.active(), false);
+});
+
+test('pointer packets retain latest adoption coordinates without notifying every TabBar', () => {
+  let changes = 0;
+  const unsubscribe = subscribeSidebarTabDragSession(() => { changes++; });
+  const sourceNode = { id: 'tab:a', entityType: 'tab', tabId: 'a' };
+  beginSidebarTabDrag({ sessionId: 'drag', sourceProjectId: 'project', sourceId: 'tab:a',
+    sourceNode, rootTabId: 'a', tabIds: ['a'], metaKey: true });
+  const initial = getSidebarTabDragSessionSnapshot();
+  for (let i = 1; i <= 100; i++) updateSidebarTabDragPointer({ clientX: i, clientY: i * 2 });
+  assert.equal(changes, 1);
+  assert.equal(getSidebarTabDragSessionSnapshot(), initial);
+  assert.equal(getSidebarTabDragSnapshot().clientY, 200);
+  updateSidebarTabDragPointer({ metaKey: false });
+  assert.equal(changes, 2);
+  assert.equal(getSidebarTabDragSessionSnapshot().clientY, 200);
+  endSidebarTabDrag();
+  assert.equal(changes, 3);
+  assert.equal(getSidebarTabDragSessionSnapshot().active, false);
+  unsubscribe();
 });

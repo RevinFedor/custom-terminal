@@ -508,6 +508,7 @@ async function scanSessionFile(filePath, provider) {
     sizeBytes: stat.size,
     modifiedAt: stat.mtimeMs,
     createdAt: stat.birthtimeMs || stat.mtimeMs,
+    fileIdentity: `${stat.dev}:${stat.ino}`,
     notedTerminal: false,
     title: '',
     project: '',
@@ -614,6 +615,7 @@ async function buildDirectoryItem({ targetPath, title, group, project, protected
     sizeBytes,
     modifiedAt: stat.mtimeMs,
     createdAt: stat.birthtimeMs || stat.mtimeMs,
+    fileIdentity: `${stat.dev}:${stat.ino}`,
     protected: !!protectedReason,
     protectedReason,
     deletable: !protectedReason,
@@ -686,6 +688,7 @@ async function appPathItem({ targetPath, title, group, protectedReason = null })
     sizeBytes,
     modifiedAt: stat.mtimeMs,
     createdAt: stat.birthtimeMs || stat.mtimeMs,
+    fileIdentity: `${stat.dev}:${stat.ino}`,
     protected: !!protectedReason,
     protectedReason,
     deletable: !protectedReason,
@@ -784,6 +787,19 @@ function inventoryGeneration(items, settings) {
   return hash.digest('hex').slice(0, 24);
 }
 
+// A deletion confirmation owns its selected physical files, not unrelated
+// sessions arriving elsewhere in the global Home inventory.
+function storageItemDeletionRevision(item) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    item.id, item.path, item.section, item.provider || null,
+    item.sessionId || null, item.fileIdentity || null,
+    item.sizeBytes, item.modifiedAt, item.createdAt,
+    item.deletable === true, item.protected === true,
+    item.protectedReason || null, item.recoveryCopy === true,
+    [...(item.auxiliaryPaths || [])].sort(),
+  ])).digest('hex').slice(0, 32);
+}
+
 async function scanStorageInventory({
   sqlite,
   codexHome = path.join(os.homedir(), '.codex'),
@@ -836,6 +852,7 @@ module.exports = {
   classifySessionItem,
   decorateCodexDeletionClosures,
   inventoryGeneration,
+  storageItemDeletionRevision,
   normalizeStorageRetentionSettings,
   opaqueItemId,
   readStorageRelations,

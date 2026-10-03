@@ -35,15 +35,15 @@ function resolveReadyAgentSendTarget(expected, presence, toolType) {
   // authoritative admission instead of replacing it with a history hint or
   // denying an otherwise supported first-turn/background send.
   const failure = agentSendTargetPreconditionFailure(
-    actual?.sessionId ? expected : { toolType: expected.toolType }, actual,
+    actual?.sessionId ? expected : { ...expected, sessionId: null }, actual,
   );
   if (failure) throw Object.assign(new Error(failure.error), failure);
   const provisionalLaunchScope = !actual?.sessionId && actual?.terminalInstanceId && actual?.launchId;
   return Object.freeze({
     ...expected,
     ...(!expected.sessionId && actual?.sessionId ? { sessionId: actual.sessionId } : {}),
-    ...(actual?.terminalInstanceId ? { terminalInstanceId: actual.terminalInstanceId } : {}),
-    ...(actual?.launchId ? { launchId: actual.launchId } : {}),
+    ...(actual?.terminalInstanceId ? { terminalInstanceId: expected.terminalInstanceId || actual.terminalInstanceId } : {}),
+    ...(actual?.launchId ? { launchId: expected.launchId || actual.launchId } : {}),
     // A first OSC-B may advance runSeq after provisional TUI readiness without
     // replacing this accepted launch. Preserve its exact instance/launch, not
     // an incidental pre-OSC run alias. Known writers retain the stronger check.

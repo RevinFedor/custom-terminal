@@ -6131,6 +6131,7 @@ function register({
                     const rr = findToolResult();
                     if (rr) {
                       actionObj.result = rr.text;
+                      actionObj.isError = rr.isError === true;
                       if (rr.completedAt > 0) {
                         actionObj.completedAt = rr.completedAt;
                         if (Number(actionObj.startedAt) > 0) {

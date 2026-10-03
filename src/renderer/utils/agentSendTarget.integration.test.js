@@ -31,9 +31,10 @@ const compile = source => ts.transpileModule(source, { compilerOptions: {
 async function harness({ toolType = 'codex', status = 'active', sessionId = 'A', liveSessionId = 'A',
   acceptedResumeSourceSessionId = null, afterStartupGate = null, afterReady = null,
   resumeTo = null, joinStarting = false, fresh = false, materializationSessionId = null,
-  hidden = false } = {}) {
+  hidden = false, expectedTarget = undefined, liveTarget = null } = {}) {
   let current = { toolType, sessionId: liveSessionId, acceptedResumeSourceSessionId,
-    lifecycleGeneration: 'generation-a', terminalInstanceId: 'terminal-instance', launchId: 'launch-a' };
+    lifecycleGeneration: 'generation-a', terminalInstanceId: 'terminal-instance', launchId: 'launch-a',
+    ...liveTarget };
   let phase = status;
   let reads = 0;
   const events = [];
@@ -90,6 +91,7 @@ async function harness({ toolType = 'codex', status = 'active', sessionId = 'A',
     },
   };
   const context = vm.createContext({
+    manualActionContract: require('../../shared/agent-manual-action.cjs'),
     console: { log() {}, warn() {} }, setTimeout, clearTimeout,
     ipcRenderer: { on() {}, removeListener() {} },
     terminalRegistry: { get: () => hidden ? null : ({}), getDraftDiagnosticSnapshot: () => ({}) },
@@ -118,7 +120,7 @@ async function harness({ toolType = 'codex', status = 'active', sessionId = 'A',
     send: async () => {
       try {
         return await context.runAgentPromptScenario({ tabId: 'tab', toolType, runtime,
-          sessionId, prompt: draft.text, handoffId: 'same-handoff', settingsIntent: { kind: 'none' },
+          sessionId, expectedTarget, prompt: draft.text, handoffId: 'same-handoff', settingsIntent: { kind: 'none' },
           source: 'history-panel', statusAtSend: status,
           onReadyForSend: () => { if (afterReady) current = { ...current, ...afterReady }; },
         });
@@ -201,3 +203,85 @@ test('unresolved public writer identity reaches the main admission without a fal
   assert.equal(h.events.some(event => event[0] === 'resume' || event[0] === 'startFresh'), false);
   assert.equal(h.events.filter(event => event[0] === 'paste').length, 1);
 });
+
+for (const toolType of ['claude', 'codex']) {
+  const provisionalPin = () => Object.freeze({ toolType,
+    terminalInstanceId: 'terminal-instance', launchId: 'launch-a', runSeq: 7 });
+
+  test(toolType + ' full provisional pin survives actual readiness materialization and reaches the provider intact', async () => {
+    const expectedTarget = provisionalPin();
+    const h = await harness({ toolType, expectedTarget, sessionId: 'stale-renderer-SID',
+      liveSessionId: null, liveTarget: { runSeq: 7 },
+      afterStartupGate: { sessionId: 'materialized-A', runSeq: 8 } });
+    const result = await h.send();
+    assert.equal(result.submitted, true);
+    assert.equal(h.beforeReadyScopes[0].sessionId, null);
+    assert.equal(h.beforeReadyScopes.at(-1).sessionId, 'materialized-A');
+    assert.equal(h.sendOptions.length, 1);
+    const target = h.sendOptions[0].expectedTarget;
+    assert.equal(target.toolType, toolType);
+    assert.equal(target.sessionId, 'materialized-A', 'the original launch may acquire its first writer');
+    assert.equal(target.terminalInstanceId, expectedTarget.terminalInstanceId);
+    assert.equal(target.launchId, expectedTarget.launchId);
+    assert.equal(target.runSeq, expectedTarget.runSeq, 'the supplied scope is not rebuilt from a later readiness snapshot');
+    assert.equal(Object.hasOwn(expectedTarget, 'sessionId'), false, 'readiness must not mutate the caller pin');
+    assert.equal(h.events.some(event => event[0] === 'startFresh' || event[0] === 'resume'), false);
+    assert.deepEqual(h.events.filter(event => event[0] === 'paste'), [['paste', 'materialized-A', h.draft.text]]);
+  });
+
+  test(toolType + ' full pin rejects a replacement instance or launch even before a SID exists', async () => {
+    for (const liveTarget of [{ terminalInstanceId: 'terminal-B' }, { launchId: 'launch-B' }]) {
+      const h = await harness({ toolType, status: 'busy', sessionId: null, liveSessionId: null,
+        expectedTarget: provisionalPin(), liveTarget });
+      const result = await h.send();
+      assert.equal(result.code, 'agent_send_target_changed');
+      assert.equal(result.submitted, false);
+      assert.equal(h.sendOptions.length, 0, 'replacement must fail before the provider adapter');
+      assert.equal(h.events.some(event => event[0] === 'paste'), false);
+      assert.equal(h.draft.text, 'original authoring text');
+    }
+  });
+
+  test(toolType + ' replacement after provisional readiness cannot overwrite the pin during the startup gate', async () => {
+    const h = await harness({ toolType, sessionId: null, liveSessionId: null, expectedTarget: provisionalPin(),
+      afterStartupGate: { sessionId: 'writer-B', terminalInstanceId: 'terminal-B', launchId: 'launch-B' } });
+    const result = await h.send();
+    assert.equal(result.code, 'agent_send_target_changed');
+    assert.equal(result.submitted, false);
+    assert.equal(h.beforeReadyScopes[0].sessionId, null);
+    assert.equal(h.beforeReadyScopes.at(-1).sessionId, 'writer-B');
+    assert.equal(h.sendOptions.length, 0);
+    assert.equal(h.events.some(event => event[0] === 'paste'), false);
+  });
+
+  test(toolType + ' materialized provisional pin remains original if replacement occurs immediately before the provider', async () => {
+    const expectedTarget = provisionalPin();
+    const h = await harness({ toolType, expectedTarget, sessionId: 'renderer-SID', liveSessionId: null,
+      afterStartupGate: { sessionId: 'materialized-A' },
+      afterReady: { sessionId: 'writer-B', terminalInstanceId: 'terminal-B', launchId: 'launch-B' } });
+    const result = await h.send();
+    assert.equal(result.code, 'agent_send_target_changed');
+    assert.equal(result.submitted, false);
+    assert.equal(h.sendOptions.length, 1, 'the provider boundary receives the exact original expectation');
+    const target = h.sendOptions[0].expectedTarget;
+    assert.equal(target.sessionId, 'materialized-A');
+    assert.equal(target.terminalInstanceId, expectedTarget.terminalInstanceId);
+    assert.equal(target.launchId, expectedTarget.launchId);
+    assert.equal(target.runSeq, expectedTarget.runSeq);
+    assert.equal(h.events.some(event => event[0] === 'paste'), false);
+  });
+
+  test(toolType + ' supplied session pin permits only its exact accepted Resume rather than the renderer SID', async () => {
+    const expectedTarget = Object.freeze({ toolType, sessionId: 'original-A' });
+    const accepted = await harness({ toolType, expectedTarget, sessionId: 'stale-renderer-SID',
+      liveSessionId: 'writer-B', acceptedResumeSourceSessionId: 'original-A' });
+    assert.equal((await accepted.send()).submitted, true);
+    assert.equal(accepted.sendOptions[0].expectedTarget.sessionId, 'original-A');
+    assert.deepEqual(accepted.events.filter(event => event[0] === 'paste'), [['paste', 'writer-B', accepted.draft.text]]);
+    assert.equal(accepted.events.some(event => event[0] === 'resume' || event[0] === 'startFresh'), false);
+    const unrelated = await harness({ toolType, expectedTarget, sessionId: 'writer-B',
+      liveSessionId: 'writer-B', acceptedResumeSourceSessionId: 'unrelated-C' });
+    assert.equal((await unrelated.send()).code, 'agent_send_target_changed');
+    assert.equal(unrelated.sendOptions.length, 0);
+  });
+}

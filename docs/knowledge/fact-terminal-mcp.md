@@ -139,7 +139,30 @@ MCP не выбирает пункт повторным Send; настройка
 
 ### Статус доставки и получение результата
 
-`send_prompt` / `Status: sent` — это delivery-only сигнал. Для остановленной или восстановленной вкладки он включает ожидание запуска, но возвращается только после принятия prompt целевым агентом; завершения ответа он не ждёт. Для ручной инспекции уже открытой сессии history-tools того же Terminal MCP читают `list_open_sessions` → `busy/status` → targeted turn/text. Для долгой делегации этот цикл запрещён: `delegate_to_session` создаёт persistent run, после чего текущий assistant-turn заканчивается. Completion-уведомление приходит отдельным следующим user-turn, и только он вызывает `get_delegation_result` ровно один раз. Чтение result/status/transcript до этого уведомления является polling и не доказывает штатный flow. Так 30-минутный turn не держит HTTP/MCP-вызов и переживает restart.
+Короткий вопрос занятому владельцу и делегация самостоятельной задачи сейчас
+идут разными путями. `send_message`/`reply_to_message` сохраняют адресную связь
+вопроса и ответа, не ожидая final занятого владельца; `get_message` читает одну
+пару для диагностики. Контракт — `fact-tab-messages.md`.
+Низкоуровневый `send_prompt` пользуется provider queue общего send-сценария
+и сам не создаёт отношения «вопрос → адресный ответ». В `delegate_to_session`
+`queue:true` означает долговечное ожидание освобождения target в приложении:
+независимые runs доставляются отдельными provider-turn, с predecessor-очередью.
+Completion-уведомление, напротив, разрешено доставить в уже busy source через
+native queue. Поэтому ожидание занятого target штатно и само по себе не ошибка.
+
+Проверенная цепочка02.10: источник257 отправил вопрос4735 через `send_prompt`,
+вписав в текст собственный tabId и просьбу ответить через обратный `send_prompt`
+во время работы. Ответ7941символ пришёл источнику, пока адресат продолжал
+benchmark. Обе exact квитанции confirmed; runId у них отсутствует. Две
+последующие ошибки400/409 возникли при попытке читать статус повторной
+отправкой пустого/сокращённого текста под старым handoffId. Статус читается
+через `GET /api/terminal-tabs/:id/send-receipts?handoffId=...`; новый payload
+не является проверкой старой отправки. После этого разбора добавлен
+`get_send_receipt({tabId,handoffId})`, который читает тот же endpoint без Send.
+Ручной reply-back заменяется адресными message/reply, а не длинной инструкцией
+с вручную вписанным return-tab.
+
+`send_prompt` / `Status: sent` — это delivery-only сигнал. Для остановленной или восстановленной вкладки он включает ожидание запуска; завершения ответа не ждёт. Pending/unknown проверяются через get_send_receipt, не новым Send. Для ручной инспекции уже открытой сессии history-tools того же Terminal MCP читают `list_open_sessions` → `busy/status` → targeted turn/text. Для долгой делегации этот цикл запрещён: `delegate_to_session` создаёт persistent run, после чего текущий assistant-turn заканчивается. Новый completion обычно уже содержит полный проверенный ответ: его используют напрямую. `get_delegation_result` нужен при явном omitted/reference, старом техническом уведомлении либо адресном восстановлении. Чтение result/status/transcript циклом до уведомления не доказывает штатный flow. Так 30-минутный turn не держит HTTP/MCP-вызов и переживает restart.
 
 Для делегации в уже существующую вкладку провайдер определяет сама target-вкладка: Terminal MCP не передаёт default `toolType=claude`. Этот default относится только к созданию новой сессии; явный конфликт провайдера Project API отклоняет до создания run. Успешный `delegate_to_session` всегда возвращает верхнеуровневый durable `runId` и тот же объект в `structuredContent`; HTTP/MCP-ошибка остаётся `isError=true` и также содержит структурированное `{ ok:false, error }`. `null`, пустой результат или ответ без `runId` не являются отправкой и запрещают отчёт «запрос отправлен».
 
@@ -150,9 +173,10 @@ Claude/Codex-вкладкой. `start_external_research` вызывает
 `jobId=noted_<runId>`, затем main в фоне обращается к SC Desktop
 `/research-start` и ждёт `/research-status`. MCP-вызов возвращает после durable
 reservation; вызывающая модель завершает ход. При `done|error` тот же
-source-handoff доставляет короткое уведомление, а один
-`get_delegation_result({runId})` возвращает текст, structured SC result,
-`jobId` и `conversationUrl`. Ошибка доставки уведомления не переписывает
+source-handoff доставляет полный проверенный ответ вместе с run/job/conversation
+identity; отдельный GET в обычном пути не требуется. `get_delegation_result`
+остаётся для явного reference/legacy notification, structured SC result или
+адресного восстановления. Ошибка доставки уведомления не переписывает
 успешный browser-result: он остаётся доступен по runId.
 
 Для обычного ChatGPT URL без предыдущего tracked run доступны две разные операции.
@@ -163,7 +187,7 @@ source-handoff доставляет короткое уведомление, а 
 подменяется старым ответом; optional `waitForFinal` только наблюдает тот же conversation.
 Метод принимает доступный текущему browser-account `chatgpt.com/c/<id>`, а другой origin
 или share URL отклоняет до Project API mutation. Повтор одного runId восстанавливает тот
-же импорт, новый final требует нового ID и нового единственного result-read.
+же импорт, новый final требует нового ID и отдельного результата этого импорта.
 Тяжёлый provider activity не входит в обычный импорт: живой Astra E2E показал, что
 дублированный tool/file trace раздувает один result до сотен тысяч токенов. Wrapper
 передаёт `includeActivity:false` по умолчанию; явный forensic-вызов может включить его.
@@ -187,7 +211,7 @@ browser-tab registry. Только доказанное отсутствие р�
 автоматический recovery не создаёт второй платный prompt. Изменение текста,
 файлового диапазона, options или conversation требует нового runId.
 
-Вложенная делегация сохраняет ту же модель. Terminal MCP передаёт Project API точный контекст текущего source-turn; только его совпадение с конкретным исполняемым входящим run разрешает автоматический `parentRunId`. Само наличие A→B не делает независимый ручной B→C его ребёнком. `waitForDescendants` по умолчанию не даёт target отчитаться наверх, пока его дочерняя ветка не закончена и результат не обработан следующим turn. Это зависимость durable run, а не visual-child вкладки и не встроенный Claude/Codex subagent. Ранний отчёт разрешается только явным `waitForDescendants:false`; progress/status polling не заменяет этот параметр.
+Вложенная делегация сохраняет ту же модель. Terminal MCP передаёт Project API точный контекст текущего source-turn; только его совпадение с конкретным исполняемым входящим run разрешает автоматический `parentRunId`. Само наличие A→B не делает независимый ручной B→C его ребёнком. `waitForDescendants` по умолчанию не даёт target отчитаться наверх, пока его дочерняя ветка не закончена и её completion не принят по точному source-handoff. Новый provider-turn не обязателен: текущий store поддерживает exact `same-active-turn` и recovery `same-settled-turn`; отдельное app-owned user-message остаётся обязательным. Это доказательство доставки, не семантического использования текста. Зависимость принадлежит durable run, а не visual-child вкладки и не встроенному Claude/Codex subagent. Ранний отчёт разрешается только явным `waitForDescendants:false`; progress/status polling не заменяет этот параметр.
 
 Входящий run получает этот контекст не от generic `busy` по `tabId`, а вместе с exact post-Enter proof собственного prompt. Это закрывает порядок, где `UserPromptSubmit` уже создал новый ход, а Project API ещё не успел отметить transport acceptance. Совпадение provider/session обязательно; повтор одного proof идемпотентно дополняет отсутствующий контекст и никогда не заменяет уже доказанный соседним turn. У Codex audit и `task_started` допустимы в обоих порядках: ранний audit дожидается start-события, а ранний start прикрепляется к следующей exact `user_message` записи того же хода. Polling и угадывание по `tabId` не используются; неоднозначность остаётся root с diagnostic.
 
@@ -239,7 +263,7 @@ UUID target-prompt; текстовый hash используется тольк�
 
 `get_session_progress` решает другой сценарий: по явному запросу посмотреть, какие структурные операции появились в уже существующей сессии после прошлого просмотра. Клиент возвращает opaque cursor из предыдущего ответа; сервер не хранит watermark и не решает за агента, что уже прочитано. Если Rewind/fork заменил ветку и cursor больше не принадлежит текущей истории, ответ явно помечает reset вместо молчаливого пропуска. Этот метод не является completion-gate: готовность по-прежнему определяется `busy/status`, а progress не возвращает полные аргументы и результаты инструментов.
 
-`complete_task` — отдельный self-only сигнал готовности Prompt Queue Loop, а не общая церемония завершения, команда остановки процесса или результат оркестрации. Метод не принимает target: родительская вкладка берётся из `NOTED_PARENT_TAB_ID`. Main принимает вызов только если точный текущий Claude/Codex turn доказан как отправленный источником `prompt-loop` и его фактически принятый user-prompt содержит app-owned `terminal_task_completion_protocol`. Обычный активный turn, даже полностью законченная ручная задача и один лишь включённый Loop toggle получают `completion_protocol_not_active`. Вызов регистрирует одноразовый intent и сразу отвечает; готовность считается доказанной лишь после последующего авторитетного успешного конца того же turn. Duplicate-call идемпотентен, старый intent не переносится на следующий turn, а error/interrupt/manual stop/PTY exit не могут превратить вызов в ложный успех.
+`complete_task` — self-only сигнал остановки Prompt Queue Loop, а не общая церемония завершения, команда остановки процесса или результат оркестрации. Метод не принимает target: parent берётся из `NOTED_PARENT_TAB_ID`. `status` по умолчанию completed; `status:"blocked"` с обязательной конкретной `reason` означает невозможность продолжить без внешнего действия и не объявляет задачу готовой. До blocked POST MCP проверяет `/api/me` → `loopTaskCompletion` version2/statuses: старый backend, который мог бы проигнорировать новое поле, не получает мутацию. Main по-прежнему требует exact текущий Claude/Codex turn, app-owned source=`prompt-loop` и принятый user-prompt с `terminal_task_completion_protocol`; обычный turn и один лишь включённый toggle получают `completion_protocol_not_active`. ACK сохраняет intent, не выключает Loop до natural final того же turn. Тогда публикуется completed либо отдельный blocked outcome с причиной. Идентичный duplicate-call идемпотентен, изменение принятого исхода конфликтует; новый turn/error/interrupt/manual stop/PTY exit инвалидируют intent. Blocked требует объяснить пользователю остаток и нужное действие, не просто назвать задачу выполненной.
 
 Исходящий orchestration-run той же вкладки блокирует допустимый Loop-вызов `complete_task`, пока идёт работа исполнителя, доказательство полного результата или completion-handoff в source; recovery и ошибка доставки также остаются блокерами решения, хотя не изображаются активным shimmer. После доказанного начала отдельного follow-up хода смысловая обработка уже полученного результата принадлежит агенту и Loop-инструкции, а не выводится сервером из текста. Эта граница не обходится `waitForDescendants:false`, потому что тот параметр управляет отчётом конкретного durable run, а не готовностью всей текущей задачи. Точный успешный outcome выключает Loop до reconciliation, не удаляя обычные queued prompts.
 
@@ -363,6 +387,14 @@ provider, audit-session и exact row identity; совпадение текста
 квитанция ждёт первого чтения канонической History, чтобы не появиться в хвосте
 на один кадр перед уже сохранённым ответом. ACK failure не скрывает
 каноническую строку; следующий remount повторяет exact reconciliation.
+
+Для native краткая галочка «принято Mac» читает ту же durable квитанцию, не
+создаёт второй executor/ACK. Exact audit-pending+submitted, typed provider queue
+acceptance и confirmed имеют разные силы доказательства; accepted:true/unknown
+сам по себе не разрешает галочку или Retry. Раннего публичного pre-submission
+outbox ACK нет. Phone close отличается от Mac restart; полный read-only
+контракт и second-click Stop предел —
+`fact-mobile-web.md::Durable Mac acceptance и единый header Stop`.
 
 #### Когда повтор разрешён, а когда нужно ждать
 

@@ -45,6 +45,7 @@ function harness(toolType = 'codex') {
     start: () => api.prepareAgentRuntimeForSend({ tabId: 'T', runtime, providerContract,
       sessionId: 'S', requestedStatusAtSend: 'active', coordinatedSendToken: 1 }),
     setState: value => { state = value; },
+    advance: ms => { now += ms; },
     cancel: () => { cancelled = true; cancelWake(); },
     expire: async () => { now = 30001; for (const timer of [...timers.values()]) timer.callback(); await tick(); },
     get reads() { return reads; }, get resumes() { return resumes; },
@@ -73,6 +74,112 @@ for (const tool of ['codex', 'claude']) {
     assert.equal(h.timers.size, 0);
   });
 }
+
+// The picker may acquire the composer between the two authoritative reads.
+// This is the production 4410 order: startup-ready -> /model -> ready again.
+async function regressReadyDuringFinalRead(h) {
+  await tick();
+  const read = h.runtime.getPresence;
+  let nextReads = 0;
+  h.runtime.getPresence = async (...args) => {
+    if (++nextReads === 2) h.setState({ status: 'active', inputReady: false });
+    return read(...args);
+  };
+  h.setState({ status: 'active', inputReady: true });
+  h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: h.runtime.toolType });
+  await tick();
+  assert.equal(nextReads, 2, 'final presence, not the wake label, revokes readiness');
+  assert.equal(h.timers.size, 1, 'the original deadline must remain armed after readiness regresses');
+  assert.equal(h.ipcRenderer.listenerCount('agent:readiness-changed'), 1);
+}
+
+for (const tool of ['codex', 'claude']) for (const cold of [false, true]) {
+  test(tool + ': ready -> picker retains its wake and submits the frozen context once; cold=' + cold, async () => {
+    const h = harness(tool);
+    if (cold) {
+      h.setState({ status: 'inactive', inputReady: false });
+      const resume = h.runtime.resume;
+      h.runtime.resume = async (...args) => {
+        const result = await resume(...args);
+        h.setState({ status: 'starting', inputReady: false });
+        return result;
+      };
+    }
+    const prompt = Array.from({ length: 11 }, (_, i) =>
+      `<saved_prompt context-update-id="update-${i}">original context ${i}</saved_prompt>`).join('\n')
+      + '\noriginal dictated text';
+    const context = Object.freeze({ prompt, handoffId: 'same-original-handoff' });
+    let writes = 0;
+    let preparations = 0;
+    const pending = runAgentSendFlow({ prepareContext: async () => { preparations++; return context; }, ensureReady: () => h.start(),
+      proveComposer: async () => {}, runProviderOperation: async received => {
+        assert.strictEqual(received, context);
+        assert.equal(received.prompt, prompt);
+        writes++; return { success: true };
+      } });
+    await regressReadyDuringFinalRead(h);
+    assert.equal(writes, 0);
+    h.setState({ status: 'active', inputReady: true });
+    h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: tool });
+    await pending;
+    assert.equal(writes, 1);
+    assert.equal(preparations, 1, 'readiness cannot rebuild the context or add newer chips');
+    assert.equal(h.resumes, cold ? 1 : 0);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.ipcRenderer.eventNames().length, 0);
+  });
+}
+
+test('ready -> picker still expires with a no-write receipt; no event or second launch is needed', async () => {
+  const h = harness();
+  let writes = 0;
+  const pending = runAgentSendFlow({ prepareContext: async () => ({}), ensureReady: () => h.start(),
+    proveComposer: async () => { writes++; }, runProviderOperation: async () => { writes++; } });
+  const rejected = assert.rejects(pending, error => {
+    assert.equal(error.code, 'agent_send_readiness_timeout');
+    assert.equal(error.sendReceipt.status, 'not-submitted');
+    assert.equal(error.sendReceipt.pasteWritten, false);
+    return true;
+  });
+  const inspection = regressReadyDuringFinalRead(h);
+  await inspection;
+  await h.expire(); await rejected;
+  assert.equal(writes, 0); assert.equal(h.resumes, 0);
+  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+});
+
+test('cancelling after ready -> picker retires the same attempt and every listener', async () => {
+  const h = harness();
+  const rejected = assert.rejects(h.start(), /cancelled/);
+  await regressReadyDuringFinalRead(h);
+  h.cancel(); await rejected;
+  assert.equal(h.resumes, 0);
+  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+});
+
+test('another blocked wake keeps the original absolute deadline, not a new 30s budget', async () => {
+  const h = harness();
+  const rejected = assert.rejects(h.start(), error => error.code === 'agent_send_readiness_timeout');
+  await regressReadyDuringFinalRead(h);
+  h.advance(12000);
+  h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
+  await tick();
+  assert.equal(h.timers.size, 1);
+  assert.equal([...h.timers.values()][0].ms, 18000);
+  await h.expire(); await rejected;
+  assert.equal(h.timers.size, 0); assert.equal(h.resumes, 0);
+});
+
+test('readiness recovered by another conversation cannot submit the old handoff', async () => {
+  const h = harness();
+  const rejected = assert.rejects(h.start(), error => error.code === 'agent_send_target_changed');
+  await regressReadyDuringFinalRead(h);
+  h.setState({ status: 'active', inputReady: true, sessionId: 'OTHER' });
+  h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
+  await rejected;
+  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assert.equal(h.resumes, 0);
+});
 
 test('deadline re-reads ready state even if its edge was lost; it is not a false refusal', async () => {
   const h = harness();

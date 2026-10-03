@@ -9,7 +9,8 @@ const http = require('node:http');
 const url = require('node:url');
 const crypto = require('node:crypto');
 const ts = require('typescript');
-const { MAX_EVENT_TABS, eventTabIds, stampedEventSink, PublicHistoryRevisions, TabTranscriptSubscriptions } = require('./public-history-read');
+const { MAX_EVENT_TABS, eventTabIds, stampedEventSink, PublicHistoryRevisions, TabTranscriptSubscriptions,
+  historyPayloadCapability, historyPayloadQuery } = require('./public-history-read');
 const { SessionTranscriptService } = require('./session-transcript-service');
 const { applyHistoryEntryWindow } = require('./history-entry-window');
 const { historyReadSession } = require('./history-read-session');
@@ -138,10 +139,10 @@ test('bound sidecar observer only sees successful exact bindings and can unsubsc
   release(); decorateHistoryResponseTimings(db, input); assert.equal(notifications.length, 1);
 });
 
-async function historyHarness(t, realRecords = null, ownerProof = false) {
+async function historyHarness(t, realRecords = null, ownerProof = false, worker = false) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'public-history-read-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const file = path.join(dir, 'fixture.jsonl'); fs.writeFileSync(file, realRecords ? realRecords.map(r=>JSON.stringify(r)).join('\n')+'\n' : '{"type":"session_meta"}\n');
+  const file = path.join(dir, 'rollout-source.jsonl'); fs.writeFileSync(file, realRecords ? realRecords.map(r=>JSON.stringify(r)).join('\n')+'\n' : '{"type":"session_meta"}\n');
   const realParser = realRecords ? require('./ipc/codex-data')._api : null;
   let sid = 'source', loads = 0, nextSid = null, rows = [{ uuid:'u', role:'user', content:'prompt' }, { uuid:'a', role:'assistant', content:'answer' }];
   let timingRevision = 'none', timings = [];
@@ -164,6 +165,7 @@ async function historyHarness(t, realRecords = null, ownerProof = false) {
         const projection=rows.map(row => ({ ...row, sessionId:sid })); if(nextSid){sid=nextSid;nextSid=null;} return projection; },
     } } });
   const scope = vm.createContext({ console:quiet, crypto, sendJson, decId:decodeURIComponent, applyHistoryEntryWindow,
+    historyPayloadCapability, historyPayloadQuery,
     conversationOwners: owner,
     publicHistoryRevisions:new PublicHistoryRevisions(), transcriptService:service,
     resolveHistorySessionInfo: async () => ({ toolType:'codex', sessionId:sid, writerSessionId:null, writerConfirmed:false, cwd:dir }),
@@ -175,15 +177,308 @@ async function historyHarness(t, realRecords = null, ownerProof = false) {
   vm.runInContext(ownerRead.getText(webAst), scope);
   const handler = vm.runInContext('(async (req,res,parsed) => { let m; ' + source.slice(start, end) + '})', scope);
   const server = http.createServer((req,res) => handler(req,res,url.parse(req.url,true)).catch(e => sendJson(res,500,{error:e.message})));
+  let client;
+  const config = { sessionsDir: dir, cacheDirectory: path.join(dir, 'prepared'), memoryBudgetMb: 64 };
+  if (worker) {
+    client = new (require('./history-read-client').HistoryReadClient)(config);
+    service.historyReader = client;
+    t.after(() => client.close());
+  }
   await new Promise(r => server.listen(0,'127.0.0.1',r));
   t.after(() => new Promise(r => { server.closeAllConnections(); server.close(r); }));
-  return { read: async query => { const response = await fetch(`http://127.0.0.1:${server.address().port}/api/terminal-tabs/A/history?${new URLSearchParams(query)}`);
+  return { read: async (query, route = 'history') => { const response = await fetch(`http://127.0.0.1:${server.address().port}/api/terminal-tabs/A/${route}?${new URLSearchParams(query)}`);
     return { status:response.status, data:await response.json() }; }, loads: () => loads,
+    file, service, scope, get client() { return client; },
+    async restartWorker() { await client.close(); client = new (require('./history-read-client').HistoryReadClient)(config); service.historyReader = client; },
     owner, duringReadInput: () => { inputDuringRead = true; },
     setSid: x => { sid=x; }, duringRead: x => { nextSid=x; }, change: next => { rows=next; fs.appendFileSync(file,'{}\n'); },
     append: records => fs.appendFileSync(file,records.map(r=>JSON.stringify(r)).join('\n')+'\n'),
     setTiming: () => { timingRevision='bound'; timings=[{ entryUuid:'a', intervalId:7, startTs:1, endTs:1001, durationMs:1000 }]; } };
 }
+
+const hiddenRecords = () => [
+  { type: 'session_meta', timestamp: '2026-10-03T00:00:00Z', payload: { id: 'source', cwd: '/fixture' } },
+  { type: 'event_msg', timestamp: '2026-10-03T00:00:01Z', payload: { type: 'user_message', message: 'ordinary prompt '.repeat(2500) } },
+  { type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'call-hidden',
+    arguments: JSON.stringify({ cmd: 'echo ' + 'code '.repeat(20000) }) } },
+  { type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-hidden', output: 'OUTPUT '.repeat(10000) } },
+  { type: 'response_item', payload: { type: 'reasoning', summary: [{ type: 'summary_text', text: 'THINK '.repeat(10000) }] } },
+  { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ordinary answer '.repeat(2500) }] } },
+  { type: 'compacted', message: 'COMPACT '.repeat(20000) },
+].map((row, index) => ({ ...row, timestamp: new Date(Date.UTC(2026, 9, 3) + index * 1000).toISOString() }));
+const lightQuery = { view: 'history', last: '80', delta: '1', payloads: 'on-demand-v1' };
+const payloadQuery = (history, ref) => ({ toolType: history.toolType, sessionId: history.sessionId,
+  entryUuid: ref.rowUuid, payloadId: ref.payloadId, payloadGeneration: history.payloadGeneration, contentHash: ref.contentHash });
+
+test('actual /api/me advertises the opt-in only with an available payload owner and requires auth', async t => {
+  const ast = ts.createSourceFile('web.js', source, ts.ScriptTarget.Latest, true);
+  const method = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'handleApi');
+  const block = method.body.statements.find(node => ts.isIfStatement(node) && node.expression.getText(ast).includes("'/api/me'"));
+  const scope = vm.createContext({ sendJson, checkAuth: req => req.headers.authorization === 'Bearer fixture',
+    getLanIp: () => '127.0.0.1', webServerServiceHealth: () => ({ instanceId: 'fixture' }), MAX_EVENT_TABS,
+    transcriptService: { getToolPayload() {} }, historyPayloadCapability,
+    readAgentTabTiming: null, readAgentUsage: null, readAgentParams: null, readAgentRuntimeSnapshot: null,
+    readCodexAuthProfile: null, savedHistoryOperations: null, conversationOwners: null, inboxSavedHistoryOperations: null,
+    agentSendReceiptStore: null, STRUCTURED_AUTHORING_LIMITS: { bytes: 1 }, MAX_CONTEXT_FILES: 1,
+    MAX_CONTEXT_FILE_BYTES: 1, MAX_CONTEXT_TOTAL_BYTES: 1 });
+  const handler = vm.runInContext('(async (req,res,parsed) => {' + block.getText(ast) + '})', scope);
+  const server = http.createServer((req, res) => handler(req, res, url.parse(req.url, true)).catch(error => sendJson(res, 500, { error: error.message })));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
+  const address = `http://127.0.0.1:${server.address().port}/api/me`;
+  assert.equal((await fetch(address)).status, 401);
+  const allowed = await (await fetch(address, { headers: { authorization: 'Bearer fixture' } })).json();
+  assert.deepEqual(allowed.capabilities.historyPayloads, historyPayloadCapability);
+  assert.equal(allowed.capabilities.historyPayloads.headerVersion, 2);
+  scope.transcriptService = null;
+  const absent = await (await fetch(address, { headers: { authorization: 'Bearer fixture' } })).json();
+  assert.equal(absent.capabilities.historyPayloads, undefined);
+});
+
+test('actual HTTP -> worker -> canonical parser: no hidden bodies, full prose, exact on-tap action/result/compact', async t => {
+  const h = await historyHarness(t, hiddenRecords(), false, true);
+  const legacy = await h.read({ view: 'history', last: '80', delta: '1' });
+  const first = await h.read({ ...lightQuery, ifRevision: legacy.data.historyRevision });
+  assert.equal(first.status, 200, JSON.stringify(first)); assert.equal(first.data.unchanged, false);
+  assert.notEqual(first.data.historyRevision, legacy.data.historyRevision);
+  assert.deepEqual(first.data.entries.map(row => row.uuid), legacy.data.entries.map(row => row.uuid));
+  for (const row of legacy.data.entries.filter(row => row.role === 'user' || row.content?.startsWith('ordinary answer'))) {
+    assert.equal(first.data.entries.find(value => value.uuid === row.uuid).content, row.content);
+  }
+  assert.ok(JSON.stringify(first).length < JSON.stringify(legacy).length / 2);
+  const row = first.data.entries.find(row => row.actions?.[0]?.actionRef);
+  const action = row.actions[0];
+  assert.equal(first.data.payloadHeaderVersion, 2);
+  assert.equal(action.hasResult, true); assert.equal(action.status, 'done');
+  assert.equal(action.rawTool.args, undefined); assert.equal(action.rawTool.result, undefined);
+  for (const ref of [action.actionRef, action.rawTool.resultRef,
+    first.data.entries.find(row => row.thinkingRef)?.thinkingRef,
+    first.data.entries.find(row => row.compactSummaryRef)?.compactSummaryRef]) {
+    assert.ok(ref, 'every hidden field has a ref');
+    const body = await h.read(payloadQuery(first.data, ref), 'history-payload');
+    assert.equal(body.status, 200, JSON.stringify(body));
+    assert.equal(body.data.totalChars, ref.totalChars); assert.equal(body.data.nextOffset, null);
+    if (ref.encoding === 'json') assert.ok(JSON.stringify(JSON.parse(body.data.payload).rawTool.args).length > 100000);
+  }
+  assert.equal((await h.read({ ...lightQuery, ifRevision: first.data.historyRevision })).data.unchanged, true);
+  const normal = await h.read({ view: 'history', last: '80', delta: '1', ifRevision: first.data.historyRevision });
+  assert.equal(normal.data.unchanged, false); assert.deepEqual(normal.data.entries, legacy.data.entries);
+});
+
+test('canonical settings baseline precedes a bounded tail, survives SSD restart, and preserves A→B→A and rollback', async t => {
+  const settings = (model, effort, index) => ({ type: 'event_msg', timestamp: new Date(1000000 + index * 1000).toISOString(),
+    payload: { type: 'thread_settings_applied', thread_settings: { model, reasoning_effort: effort } } });
+  const user = text => ({ type: 'event_msg', payload: { type: 'user_message', message: text } });
+  const records = [{ type: 'session_meta', payload: { id: 'source' } }, settings('A', 'max', 1), user('one'),
+    settings('B', 'max', 2), user('two'), settings('A', 'max', 3), user('tail')];
+  const h = await historyHarness(t, records, false, true);
+  const query = { view: 'history', last: '1', delta: '1', payloads: 'on-demand-v1' };
+  const first = (await h.read(query)).data;
+  assert.equal(first.entries.length, 1); assert.equal(first.entries[0].content, 'tail');
+  const baseline = first.settingsBaseline;
+  assert.equal(baseline.before.model.settingsFact.value, 'A');
+  assert.equal(baseline.before.model.timestamp, records[5].timestamp);
+  assert.equal(baseline.before.effort.settingsFact.value, 'max');
+  assert.equal(baseline.scope.revisionToken, first.revision.token);
+  assert.equal(baseline.scope.payloadGeneration, first.payloadGeneration);
+  assert.equal(baseline.window.hasMoreBelow, false);
+  assert.equal(baseline.before.model.sourceIdentityAliases, undefined, 'baseline never carries long alias arrays');
+  const fullBefore = (await h.read({ view: 'history', last: '100' })).data;
+  const secondUser = fullBefore.entries.find(row => row.content === 'two');
+  const around = (await h.read({ view: 'history', around: secondUser.uuid, radius: '1' })).data;
+  assert.equal(around.entries.length, 3);
+  assert.equal(around.entries[1].uuid, secondUser.uuid);
+  assert.equal(around.settingsBaseline.before.model.settingsFact.value, 'A');
+  assert.equal(around.settingsBaseline.before.model.timestamp, records[1].timestamp, 'baseline belongs before this historical window');
+  assert.equal(around.settingsBaseline.window.hasMoreBelow, true, 'historical around baseline is not the live tail');
+  await h.restartWorker();
+  const again = (await h.read(query)).data;
+  assert.deepEqual(again.settingsBaseline.before, baseline.before);
+  assert.deepEqual(again.settingsBaseline.window, baseline.window);
+  assert.equal(again.settingsBaseline.scope.payloadGeneration, baseline.scope.payloadGeneration);
+  assert.equal(again.settingsBaseline.scope.revisionToken, again.revision.token);
+  h.append([settings('A', 'max', 4)]);
+  const repeated = (await h.read({ ...query, ifRevision: again.historyRevision })).data;
+  assert.equal(repeated.settingsBaseline.before.model.uuid, baseline.before.model.uuid);
+  h.append([{ type: 'event_msg', payload: { type: 'thread_rolled_back', num_turns: 1 } }]);
+  const rolled = (await h.read(query)).data;
+  assert.equal(rolled.settingsBaseline.before.model.settingsFact.value, 'B');
+  const full = (await h.read({ view: 'history', last: '100' })).data;
+  assert.deepEqual(full.settingsBaseline.before, { model: null, effort: null });
+  const unchanged = (await h.read({ ...query, ifRevision: rolled.historyRevision })).data;
+  assert.equal(unchanged.unchanged, true);
+  assert.equal(unchanged.settingsBaseline, undefined, 'unchanged retains the previously received bound baseline');
+});
+
+test('on-demand refs survive worker restart/SSD and reject rewrite, wrong row/hash/session and malformed ranges', async t => {
+  const h = await historyHarness(t, hiddenRecords(), false, true);
+  const first = (await h.read(lightQuery)).data;
+  const ref = first.entries.find(row => row.actions?.[0]?.actionRef).actions[0].actionRef;
+  const query = payloadQuery(first, ref);
+  await h.restartWorker();
+  const body = await h.read(query, 'history-payload');
+  assert.equal(body.status, 200, JSON.stringify(body));
+  assert.equal((await h.client.call('stats')).sourceBytes, 0, 'SSD read without raw replay');
+  for (const [change, status] of [[{ sessionId: 'foreign' }, 409], [{ entryUuid: 'missing' }, 404],
+    [{ contentHash: '0'.repeat(64) }, 409], [{ payloadId: 'missing' }, 404], [{ offset: '-1' }, 400],
+    [{ limit: '1' }, 400], [{ offset: String(ref.totalChars + 1) }, 400], [{ payloadGeneration: '' }, 400]]) {
+    assert.equal((await h.read({ ...query, ...change }, 'history-payload')).status, status, JSON.stringify(change));
+  }
+  const previous = fs.statSync(h.file);
+  const rewritten = fs.readFileSync(h.file, 'utf8').replace('echo ', 'READ ');
+  fs.writeFileSync(h.file + '.replacement', rewritten); fs.utimesSync(h.file + '.replacement', previous.atime, previous.mtime);
+  fs.renameSync(h.file + '.replacement', h.file);
+  const stale = await h.read(query, 'history-payload');
+  assert.equal(stale.status, 409, JSON.stringify(stale)); assert.equal(stale.data.error, 'history_payload_generation_changed');
+});
+
+test('on-demand delta preserves the exact body revision for late results; old ref never returns new content', async t => {
+  const records = hiddenRecords().slice(0, 3);
+  const h = await historyHarness(t, records, false, true);
+  const first = (await h.read(lightQuery)).data;
+  const ref = first.entries.find(row => row.actions?.[0]?.actionRef).actions[0].actionRef;
+  const pending = first.entries.find(row => row.uuid === ref.rowUuid).actions[0];
+  assert.deepEqual([pending.hasResult, pending.status], [false, 'running']);
+  h.append([{ type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-hidden', output: 'late result' } }]);
+  const next = (await h.read({ ...lightQuery, ifRevision: first.historyRevision })).data;
+  assert.equal(next.delta, true); assert.ok(next.changedEntries.some(row => row.uuid === ref.rowUuid));
+  const stale = await h.read(payloadQuery(first, ref), 'history-payload');
+  assert.equal(stale.status, 409); assert.equal(stale.data.error, 'history_payload_changed');
+  const changed = next.changedEntries.find(row => row.uuid === ref.rowUuid).actions[0].actionRef;
+  const finished = next.changedEntries.find(row => row.uuid === ref.rowUuid).actions[0];
+  assert.deepEqual([finished.hasResult, finished.status], [true, 'done']);
+  const valid = await h.read(payloadQuery({ ...first, ...next }, changed), 'history-payload');
+  assert.equal(valid.status, 200, JSON.stringify(valid));
+  assert.equal(JSON.parse(valid.data.payload).rawTool.result, 'late result');
+});
+
+test('actual HTTP and canonical reader do not reuse header-v1 revisions as header-v2 unchanged', async t => {
+  const { buildHistoryRevision } = require('./history-revision');
+  const h = await historyHarness(t, hiddenRecords(), false, true);
+  const first = (await h.read(lightQuery)).data;
+  const context = JSON.parse(first.revision.context);
+  assert.equal(context.payloadHeaderVersion, 2);
+  delete context.payloadHeaderVersion;
+  const oldRevision = buildHistoryRevision(first.revision, first.revision.sources, { context: JSON.stringify(context) });
+  const held = h.scope.publicHistoryRevisions.entries.get(first.historyRevision);
+  const oldScope = JSON.parse(held.scope); delete oldScope.payloadHeaderVersion;
+  const oldToken = h.scope.publicHistoryRevisions.remember(oldRevision, oldScope);
+  const reply = await h.read({ ...lightQuery, ifRevision: oldToken });
+  assert.equal(reply.status, 200); assert.equal(reply.data.unchanged, false);
+  assert.equal(reply.data.payloadHeaderVersion, 2);
+  assert.equal(reply.data.entries.find(row => row.actions?.[0]).actions[0].hasResult, true);
+  const direct = await h.service.getHistory({ ...oldScope, ifRevision: oldRevision });
+  assert.equal(direct.unchanged, false); assert.equal(JSON.parse(direct.revision.context).payloadHeaderVersion, 2);
+});
+
+test('payload read rejects a session change while awaiting the reader, and has no renderer/full fallback', async t => {
+  const h = await historyHarness(t, hiddenRecords(), false, true);
+  const first = (await h.read(lightQuery)).data;
+  const ref = first.entries.find(row => row.actions?.[0]?.actionRef).actions[0].actionRef;
+  const original = h.service.getToolPayload.bind(h.service);
+  h.service.getToolPayload = async request => { const result = await original(request); h.setSid('child'); return result; };
+  assert.equal((await h.read(payloadQuery(first, ref), 'history-payload')).status, 409);
+  for (const query of [{ payloads: 'on-demand-v1' }, { view: 'history', payloads: 'unknown' }]) {
+    assert.equal((await h.read(query)).status, 400);
+  }
+});
+
+test('actual payload HTTP pages retain the complete >4 MiB action, not a truncated JSON success', async t => {
+  const full = '🧪'.repeat(2200000);
+  const h = await historyHarness(t, [{ type: 'response_item', payload: { type: 'function_call', name: 'write_file',
+    call_id: 'large-input', arguments: JSON.stringify({ path: '/tmp/body.txt', content: full }) } },
+  { type: 'response_item', payload: { type: 'function_call_output', call_id: 'large-input', output: full } }], false, true);
+  const first = (await h.read(lightQuery)).data;
+  const action = first.entries[0].actions[0];
+  for (const ref of [action.actionRef, action.rawTool.resultRef]) {
+  let text = '', offset = 0;
+  do {
+    const body = await h.read({ ...payloadQuery(first, ref), offset: String(offset) }, 'history-payload');
+    assert.equal(body.status, 200, body.data.error);
+    text += body.data.payload; offset = body.data.nextOffset;
+  } while (offset !== null);
+  assert.equal(text.length, ref.totalChars);
+  assert.equal(ref.encoding === 'json' ? JSON.parse(text).rawTool.args.content : text, full);
+  }
+});
+
+test('Claude actual branch reader supports on-demand Edit/thinking/compact and rejects same-size source rewrite', async t => {
+  const Module = require('node:module');
+  const h = await historyHarness(t);
+  const root = path.dirname(h.file), projectDir = path.join(root, '.claude/projects/-fixture');
+  fs.mkdirSync(projectDir, { recursive: true });
+  const full = 'BODY '.repeat(10000);
+  const records = [
+    { uuid: 'user', type: 'user', message: { role: 'user', content: 'ordinary '.repeat(5000) } },
+    { uuid: 'edit', parentUuid: 'user', type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'thinking', thinking: full }, { type: 'text', text: 'complete prose '.repeat(2000) },
+      { type: 'tool_use', id: 'edit-call', name: 'Edit', input: { file_path: '/tmp/file.md', old_string: full, new_string: 'NEW ' + full } },
+    ] } },
+    { uuid: 'result', parentUuid: 'edit', type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'edit-call', content: full }] } },
+    { uuid: 'task', parentUuid: 'result', type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'tool_use', id: 'task-call', name: 'Agent', input: { description: 'sync failure', prompt: 'test' } },
+    ] } },
+    { uuid: 'task-result', parentUuid: 'task', type: 'user', message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'task-call', content: '', is_error: true },
+    ] } },
+    { uuid: 'async-task', parentUuid: 'task-result', type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'tool_use', id: 'async-call', name: 'Agent', input: { description: 'background child', prompt: 'test' } },
+    ] } },
+    { uuid: 'async-result', parentUuid: 'async-task', type: 'user', toolUseResult: { isAsync: true, agentId: 'a1' }, message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'async-call', content: 'async launched' },
+    ] } },
+    { uuid: 'compact', parentUuid: 'async-result', type: 'system', subtype: 'compact_boundary', compactMetadata: { preTokens: 1000 } },
+    { uuid: 'summary', parentUuid: 'compact', type: 'user', isCompactSummary: true, message: { role: 'user', content: full } },
+    { uuid: 'tail', parentUuid: 'summary', type: 'assistant', message: { role: 'assistant', content: 'after compact' } },
+  ].map((row, index) => ({ ...row, sessionId: 'S', timestamp: new Date(1000000 + index * 1000).toISOString() }));
+  const file = path.join(projectDir, 'S.jsonl'); fs.writeFileSync(file, records.map(row => JSON.stringify(row)).join('\n') + '\n');
+  const originalLoad = Module._load, modulePath = require.resolve('./ipc/claude-data');
+  delete require.cache[modulePath];
+  Module._load = function(name, parent, isMain) {
+    if (name === 'electron') return { ipcMain: { handle() {} } };
+    if (name === 'os' || name === 'node:os') return { ...os, homedir: () => root };
+    return originalLoad.call(this, name, parent, isMain);
+  };
+  let data;
+  try { data = require(modulePath); } finally { Module._load = originalLoad; }
+  data.register({ projectManager: {}, formatToolAction: () => null });
+  h.service.claudeData = data;
+  h.scope.resolveHistorySessionInfo = async () => ({ toolType: 'claude', sessionId: 'S', cwd: '/fixture' });
+  const legacy = (await h.read({ view: 'history', last: '80' })).data;
+  const first = (await h.read({ ...lightQuery, ifRevision: legacy.historyRevision })).data;
+  assert.equal(first.success, true, first.error);
+  assert.equal(first.payloadHeaderVersion, 2);
+  const edited = first.entries.find(row => row.uuid === 'edit').actions[0];
+  assert.equal(edited.hasResult, true); assert.equal(edited.status, 'done');
+  assert.deepEqual(edited.fileChange, { filePath: '/tmp/file.md', displayPath: 'file.md', added: 1, removed: 1, countsSource: 'arguments' });
+  const failedTask = first.entries.find(row => row.uuid === 'task').actions[0];
+  assert.equal(failedTask.tool, 'Task'); assert.equal(failedTask.hasResult, true); assert.equal(failedTask.status, 'error');
+  const asyncTask = first.entries.find(row => row.uuid === 'async-task').actions[0];
+  assert.equal(asyncTask.hasResult, false); assert.equal(asyncTask.status, 'running');
+  assert.ok(legacy.entries?.find(row => row.uuid === 'edit'), JSON.stringify({ legacy: legacy.entries?.map(row => [row.uuid, row.role]), keys: Object.keys(legacy) }));
+  assert.equal(first.entries.find(row => row.uuid === 'edit').content, legacy.entries.find(row => row.uuid === 'edit').content);
+  assert.equal((await h.read({ ...lightQuery, ifRevision: first.historyRevision })).data.unchanged, true);
+  const oldHeaderContext = JSON.parse(first.revision.context); delete oldHeaderContext.payloadHeaderVersion;
+  const oldHeaderRevision = require('./history-revision').buildHistoryRevision(first.revision, first.revision.sources,
+    { context: JSON.stringify(oldHeaderContext) });
+  const upgraded = await h.service.getHistory({ toolType: 'claude', sessionId: 'S', cwd: '/fixture', tabId: 'A',
+    dehydrate: true, payloadPolicy: 'on-demand-v1', bounds: { last: 80 }, ifRevision: oldHeaderRevision });
+  assert.equal(upgraded.unchanged, false); assert.equal(JSON.parse(upgraded.revision.context).payloadHeaderVersion, 2);
+  const refs = [first.entries.find(row => row.uuid === 'edit').actions[0].actionRef,
+    first.entries.find(row => row.uuid === 'edit').thinkingRef,
+    first.entries.find(row => row.uuid === 'compact').compactSummaryRef];
+  for (const ref of refs) {
+    assert.ok(ref);
+    const body = await h.read(payloadQuery(first, ref), 'history-payload');
+    assert.equal(body.status, 200, JSON.stringify(body));
+    if (ref.encoding === 'json') assert.equal(JSON.parse(body.data.payload).rawTool.args.old_string, full);
+    else assert.equal(body.data.payload, ref === refs[2] ? legacy.entries.find(row => row.uuid === 'compact').compactSummary : full);
+  }
+  const stat = fs.statSync(file);
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('BODY ', 'EDIT '));
+  fs.utimesSync(file, stat.atime, stat.mtime);
+  assert.equal((await h.read(payloadQuery(first, refs[0]), 'history-payload')).status, 409);
+});
 
 test('actual HTTP History -> shared reader: full, unchanged, exact delta, changed bounds and read owner', async t => {
   const h = await historyHarness(t), query = { view:'history', last:'200', delta:'1' };

@@ -1555,6 +1555,8 @@ type BusyStatePayload = {
   lastAbnormalOutcomeHasQueuedContinuation?: boolean;
   lastAbnormalOutcomeContinuationTs?: number | null;
   explicitTaskComplete?: boolean;
+  explicitTaskBlocked?: boolean;
+  taskCompletionReason?: string | null;
   taskCompletionIntentId?: string | null;
   taskCompletionRequestedAt?: number | null;
 };
@@ -2167,14 +2169,20 @@ export function usePromptQueueRunner() {
 
       const tabId = data.tabId;
       const explicitTaskComplete = data.explicitTaskComplete === true;
-      if (explicitTaskComplete) {
+      const explicitTaskBlocked = data.explicitTaskBlocked === true;
+      if (explicitTaskComplete || explicitTaskBlocked) {
         const currentQueue = usePromptQueueStore.getState().getQueue(tabId);
         if (currentQueue.loopPromptEnabled) {
           usePromptQueueStore.getState().setLoopPromptEnabled(tabId, false);
         }
         console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
-          + ' exact turn marked complete intent=' + (data.taskCompletionIntentId || '-')
+          + ' exact turn marked ' + (explicitTaskBlocked ? 'blocked' : 'complete')
+          + ' intent=' + (data.taskCompletionIntentId || '-')
           + ' → Loop disabled');
+        if (explicitTaskBlocked) {
+          useUIStore.getState().showToast('Loop · ' + getTabName(tabId) + ' остановлен: '
+            + (data.taskCompletionReason || 'требуется внешнее действие'), 'info', 8000);
+        }
       }
       const ownersAtOutcome = findOwnersWaitingOn(tabId, outcomeTs);
       if (getPromptQueueAgent(tabId) === 'codex') {

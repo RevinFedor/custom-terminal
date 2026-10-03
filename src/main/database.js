@@ -7,6 +7,7 @@ const { app } = require('node:worker_threads').isMainThread ? require('electron'
 const { normalizeForkOperation, historyRewriteOperation, resolveForkOperation } = require('../shared/fork-operation.cjs');
 const { selectDirectForkMarker } = require('../shared/fork-marker-boundary.cjs');
 const { normalizePromptPresentationSnapshot } = require('./history-prompt-presentations');
+const { RUN_AFTER_LOOP_PROMPT_ID, migrateLoopPromptContent } = require('../shared/prompt-loop.cjs');
 const { rebindHistoryAuthoringProjection } = require('./history-authoring-projection');
 const {
   emptyTaskPlan,
@@ -298,6 +299,7 @@ class DatabaseManager {
     this.ensureAdoptPrompt();
     this.ensureTabTitlePrompt();
     this.ensureRunAfterTitlePrompt();
+    this.ensureRunAfterLoopPrompt();
     this.ensurePromptSummaryPrompt();
     this.ensureTimelineGroupingPrompt();
     this.ensureGitCommitPrompt();
@@ -5468,6 +5470,9 @@ class DatabaseManager {
   }
 
   saveAIPrompt(prompt) {
+    if (prompt.id === RUN_AFTER_LOOP_PROMPT_ID) {
+      prompt = { ...prompt, showInContextMenu: false, filePaths: [] };
+    }
     this.db.prepare(`
       INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position, file_paths)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -5497,6 +5502,12 @@ class DatabaseManager {
   deleteAIPrompt(id) {
     // Only delete non-built-in prompts
     this.db.prepare('DELETE FROM ai_prompts WHERE id = ? AND is_built_in = 0').run(id);
+  }
+
+  saveAIPromptContent(id, content) {
+    if (typeof content !== 'string') throw new Error('prompt content must be text');
+    const result = this.db.prepare('UPDATE ai_prompts SET content = ? WHERE id = ?').run(content, id);
+    if (!result.changes) throw new Error('system prompt not found');
   }
 
   getTimelinePromptSummaries(toolType, sessionId) {
@@ -6343,6 +6354,17 @@ class DatabaseManager {
       this.db.prepare('UPDATE ai_prompts SET content = ? WHERE id = ? AND is_built_in = 1').run(adoptContent, 'adopt');
       console.log('[DB] Migrated: updated adopt prompt content');
     }
+  }
+
+  ensureRunAfterLoopPrompt() {
+    if (this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get(RUN_AFTER_LOOP_PROMPT_ID)) return;
+    const content = migrateLoopPromptContent(
+      this.getAppState('promptQueueSharedLoopPrompt'), this.getAppState('promptQueueByTab'),
+    );
+    this.saveAIPrompt({ id: RUN_AFTER_LOOP_PROMPT_ID, name: 'Run After Loop', content,
+      model: 'gemini-3.8-flash', thinkingLevel: 'NONE', color: '#a78bfa',
+      isBuiltIn: true, showInContextMenu: false, position: 10, filePaths: [] });
+    console.log('[DB] Migrated: Run After Loop is a system prompt (executes in owner agent)');
   }
 
   // Ensure built-in prompt for automatic tab naming exists (migration for existing DBs).

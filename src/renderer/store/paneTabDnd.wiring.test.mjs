@@ -14,6 +14,7 @@ const strip = read(path.join(workspace, 'PaneTabStrip.tsx'));
 const body = read(path.join(workspace, 'PaneTabBodyDropZone.tsx'));
 const area = read(path.join(workspace, 'TerminalArea.tsx'));
 const tabBar = read(path.join(workspace, 'TabBar.tsx'));
+const sidebarCursorChip = read(path.join(workspace, 'SidebarTabDragCursorChip.tsx'));
 const app = read(path.join(renderer, 'App.tsx'));
 const store = read(path.join(here, 'useWorkspaceStore.ts'));
 const shared = read(path.resolve(here, '../../../../noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js'));
@@ -94,9 +95,10 @@ test('sidebar project navigation hands the exact root and subtree to the destina
   assert.match(tabBar, /const sidebarCrossProjectProjection = useMemo/);
   assert.match(tabBar, /const sidebarDragProjectionKey = getSidebarTabDragProjectionKey\(sidebarDragOrigin\)/);
   assert.doesNotMatch(tabBar, /projectId, sidebarDragOrigin\.revision\]\)/);
-  assert.match(tabBar, /data-sidebar-tab-drag-cursor-chip/);
-  assert.match(tabBar, /sidebarDragCursorChip\.count > 1/);
-  assert.match(tabBar, /pointerEvents: 'none'/);
+  assert.match(tabBar, /<SidebarTabDragCursorChip enabled=/);
+  assert.match(sidebarCursorChip, /data-sidebar-tab-drag-cursor-chip/);
+  assert.match(sidebarCursorChip, /sidebarDragCursorChip\.count > 1/);
+  assert.match(sidebarCursorChip, /pointerEvents: 'none'/);
   assert.match(tabBar, /menuOnlyForProject[\s\S]{0,120}focusedSidebarProjectId !== projectId/);
   assert.match(tabBar, /disabled: menuOnlyForProject \|\| !isVerticalLayout/);
   assert.match(tabBar, /externalSidebarSource: metadata,[\s\S]{0,100}externalDragReplacement: true/);
@@ -131,13 +133,11 @@ test('release commits the painted pane target instead of resolving again', () =>
     'source cleanup must not erase the painted target before the global release barrier');
 });
 
-test('drag keeps overflow geometry stable, reveals body append and supports horizontal edge scroll', () => {
-  assert.match(strip, /if \(getPaneTabDragSnapshot\(\)\.active\) return false/);
-  assert.match(strip, /pendingRevealReasonRef\.current = 'body-drop-preview'/);
-  assert.match(strip, /revealChip\(rootTabId\)/);
-  assert.match(strip, /data-pane-strip-end-reserve/);
+test('drag keeps wrapped row geometry and native preview without edge scrolling', () => {
+  assert.doesNotMatch(strip, /revealChip|data-pane-strip-end-reserve/);
   const bridge = read(path.join(renderer, 'utils/paneTabDragBridge.ts'));
-  assert.match(bridge, /horizontalDragAutoScrollDelta/);
+  assert.doesNotMatch(bridge, /horizontalDragAutoScrollDelta/);
+  assert.match(bridge, /wrap: true/);
   assert.match(bridge, /const dragCenterX = Number\(clientX\) \|\| 0/);
   assert.doesNotMatch(bridge, /anchorDeltaX|effectiveClientX/);
   assert.match(chip, /getOffset: centerUnderPointer/);

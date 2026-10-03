@@ -1,4 +1,7 @@
 import { create } from 'zustand';
+import { usePromptsStore, RUN_AFTER_LOOP_PROMPT_ID } from './usePromptsStore';
+import { DEFAULT_LOOP_PROMPT, parsePersistedSharedLoopPrompt } from '../../shared/prompt-loop.mjs';
+export { parsePersistedSharedLoopPrompt };
 import {
   buildPromptImagePayload,
   collectPromptImageRefIds,
@@ -42,22 +45,7 @@ const { ipcRenderer } = window.require('electron');
 //                                postPromptEnabled, postPromptText, panelCollapsed,
 //                                previewId } }.
 const APP_STATE_KEY_QUEUE = 'promptQueueByTab';
-const APP_STATE_KEY_SHARED_LOOP_PROMPT = 'promptQueueSharedLoopPrompt';
-export const DEFAULT_SHARED_LOOP_PROMPT = [
-  'Проверь, полностью ли выполнена исходная задача.',
-  'Если осталась работа, продолжай её сейчас и не ограничивайся планом или обещанием.',
-].join(' ');
-
-export function parsePersistedSharedLoopPrompt(raw: unknown): string | null {
-  if (typeof raw !== 'string') return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (typeof parsed === 'string') return parsed;
-  } catch {
-    // Older/dev rows may contain the prompt directly rather than JSON text.
-  }
-  return raw;
-}
+export const DEFAULT_SHARED_LOOP_PROMPT = DEFAULT_LOOP_PROMPT;
 
 // Throttle disk writes — drag-reorder fires many state updates per second and
 // SQLite IO on every keystroke would be wasteful. 250ms covers fast typing and
@@ -209,10 +197,8 @@ function scheduleSharedLoopPromptSave(text: string): void {
   if (sharedLoopPromptSaveTimer) clearTimeout(sharedLoopPromptSaveTimer);
   sharedLoopPromptSaveTimer = setTimeout(() => {
     sharedLoopPromptSaveTimer = null;
-    ipcRenderer.invoke('app:setState', {
-      key: APP_STATE_KEY_SHARED_LOOP_PROMPT,
-      value: JSON.stringify(text),
-    }).catch((e: unknown) => console.warn('[PromptQueue] shared Loop prompt save failed:', e));
+    usePromptsStore.getState().savePromptContent(RUN_AFTER_LOOP_PROMPT_ID, text)
+      .catch((e: unknown) => console.warn('[PromptQueue] system Loop prompt save failed:', e));
   }, 250);
 }
 
@@ -247,9 +233,9 @@ export function flushPromptQueueStoreSync(): void {
       return;
     }
     ipcRenderer.sendSync('app:setStateSync', { key: APP_STATE_KEY_QUEUE, value: JSON.stringify(out) });
-    ipcRenderer.sendSync('app:setStateSync', {
-      key: APP_STATE_KEY_SHARED_LOOP_PROMPT,
-      value: JSON.stringify(usePromptQueueStore.getState().sharedLoopPromptText),
+    ipcRenderer.sendSync('ai-prompts:save-content-sync', {
+      id: RUN_AFTER_LOOP_PROMPT_ID,
+      content: usePromptQueueStore.getState().sharedLoopPromptText,
     });
   } catch (e) {
     console.warn('[PromptQueue] sync save failed:', e);
@@ -1074,6 +1060,19 @@ function queuedPromptMatchesExpected(
   return true;
 }
 
+function projectSystemLoopPrompt(state: PromptQueueStore, text: string) {
+  if (state.sharedLoopPromptText === text) return state;
+  const next = new Map(state.queues);
+  const editedAt = Date.now();
+  for (const [ownerTabId, queue] of next) {
+    next.set(ownerTabId, { ...queue, loopPromptText: text,
+      loopPromptArmedAt: queue.loopPromptEnabled ? editedAt : queue.loopPromptArmedAt });
+  }
+  trackPreHydrateQueueChanges(state.queues, next);
+  scheduleSave(next);
+  return { queues: next, sharedLoopPromptText: text };
+}
+
 export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
   // setAndPersist: write next state, then schedule a debounced disk save.
   // PreviewId-only mutations skip the save (UI-only, see scheduleSave).
@@ -1746,20 +1745,8 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       if (!hasHydratedPromptQueueStore) preHydrateSharedLoopPromptChanged = true;
       set((state) => {
         if (state.sharedLoopPromptText === text) return state;
-        const next = new Map(state.queues);
-        const editedAt = Date.now();
-        for (const [ownerTabId, queue] of next) {
-          next.set(ownerTabId, {
-            ...queue,
-            loopPromptText: text,
-            // Editing the shared body changes every enabled Loop operation.
-            loopPromptArmedAt: queue.loopPromptEnabled ? editedAt : queue.loopPromptArmedAt,
-          });
-        }
-        trackPreHydrateQueueChanges(state.queues, next);
-        scheduleSave(next);
         scheduleSharedLoopPromptSave(text);
-        return { queues: next, sharedLoopPromptText: text };
+        return projectSystemLoopPrompt(state, text);
       });
     },
 
@@ -1998,6 +1985,25 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         : { ...queue, loopPromptText: state.sharedLoopPromptText };
     },
   };
+});
+
+// Settings and the Loop pencil share one system-prompt record; queues contain
+// its runtime projection, never a second independently persisted text setting.
+usePromptsStore.subscribe((state, previous) => {
+  const content = state.prompts.find((prompt) => prompt.id === RUN_AFTER_LOOP_PROMPT_ID)?.content;
+  const previousContent = previous.prompts.find((prompt) => prompt.id === RUN_AFTER_LOOP_PROMPT_ID)?.content;
+  if (content === undefined || content === previousContent) return;
+  if (!hasHydratedPromptQueueStore) {
+    if (preHydrateSharedLoopPromptChanged && !previous.isLoaded && state.isLoaded) return;
+    if (previous.isLoaded || !state.isLoaded) preHydrateSharedLoopPromptChanged = true;
+  }
+  // A confirmed Settings edit supersedes a not-yet-written pencil draft.
+  // Otherwise its old debounce would overwrite the newer canonical body.
+  if (sharedLoopPromptSaveTimer && content !== usePromptQueueStore.getState().sharedLoopPromptText) {
+    clearTimeout(sharedLoopPromptSaveTimer);
+    sharedLoopPromptSaveTimer = null;
+  }
+  usePromptQueueStore.setState((queueState) => projectSystemLoopPrompt(queueState, content));
 });
 
 const promptImageMaterializationInflight = new Map<string, Promise<{
@@ -2332,9 +2338,9 @@ export function hydratePromptQueueStore(): Promise<void> {
 
   hydratePromptQueuePromise = (async () => {
     try {
-      const [raw, rawSharedLoopPrompt] = await Promise.all([
+      const [raw] = await Promise.all([
         ipcRenderer.invoke('app:getState', APP_STATE_KEY_QUEUE),
-        ipcRenderer.invoke('app:getState', APP_STATE_KEY_SHARED_LOOP_PROMPT),
+        usePromptsStore.getState().loadPrompts(),
       ]);
       const parsedValue = !raw ? {} : (typeof raw === 'string' ? JSON.parse(raw) : raw);
       const parsed = parsedValue && typeof parsedValue === 'object' && !Array.isArray(parsedValue)
@@ -2346,13 +2352,9 @@ export function hydratePromptQueueStore(): Promise<void> {
         persistedQueues.set(tabId, makeHydratedTabQueue(entry));
       }
 
-      const legacySharedLoopPrompt = Array.from(persistedQueues.values())
-        .filter((queue) => queue.loopPromptText.trim().length > 0)
-        .sort((a, b) => (b.loopPromptArmedAt ?? -1) - (a.loopPromptArmedAt ?? -1))[0]
-        ?.loopPromptText;
-      const persistedSharedLoopPrompt = parsePersistedSharedLoopPrompt(rawSharedLoopPrompt)
-        ?? legacySharedLoopPrompt
-        ?? DEFAULT_SHARED_LOOP_PROMPT;
+      const persistedSharedLoopPrompt = usePromptsStore.getState()
+        .getPromptById(RUN_AFTER_LOOP_PROMPT_ID)?.content ?? DEFAULT_SHARED_LOOP_PROMPT;
+      const preserveLocalLoopEdit = preHydrateSharedLoopPromptChanged;
 
       usePromptQueueStore.setState((state) => {
         const sharedLoopPromptText = preHydrateSharedLoopPromptChanged
@@ -2375,7 +2377,7 @@ export function hydratePromptQueueStore(): Promise<void> {
       preHydrateQueueChanges.clear();
       preHydrateSharedLoopPromptChanged = false;
       scheduleSave(usePromptQueueStore.getState().queues);
-      scheduleSharedLoopPromptSave(usePromptQueueStore.getState().sharedLoopPromptText);
+      if (preserveLocalLoopEdit) scheduleSharedLoopPromptSave(usePromptQueueStore.getState().sharedLoopPromptText);
 
       const validationTasks: Promise<unknown>[] = [];
       for (const [tabId, queue] of usePromptQueueStore.getState().queues) {
@@ -2388,13 +2390,14 @@ export function hydratePromptQueueStore(): Promise<void> {
     } catch (e) {
       // Do not leave the store permanently read-only after one bad row or IPC
       // failure. Existing in-memory actions remain saveable on the next mutation.
+      const preserveLocalLoopEdit = preHydrateSharedLoopPromptChanged;
       markPromptQueueStoreHydrated();
       preHydrateQueueChanges.clear();
       preHydrateSharedLoopPromptChanged = false;
       if (usePromptQueueStore.getState().queues.size > 0) {
         scheduleSave(usePromptQueueStore.getState().queues);
       }
-      scheduleSharedLoopPromptSave(usePromptQueueStore.getState().sharedLoopPromptText);
+      if (preserveLocalLoopEdit) scheduleSharedLoopPromptSave(usePromptQueueStore.getState().sharedLoopPromptText);
       console.warn('[PromptQueue] hydrate failed:', e instanceof Error ? e.message : String(e));
     }
   })().finally(() => {

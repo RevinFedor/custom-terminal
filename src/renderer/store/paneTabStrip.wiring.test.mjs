@@ -16,6 +16,7 @@ const workspaceDir = path.join(here, '..', 'components', 'Workspace');
 const header = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
 const strip = fs.readFileSync(path.join(workspaceDir, 'PaneTabStrip.tsx'), 'utf8');
 const chip = fs.readFileSync(path.join(workspaceDir, 'PaneTabChip.tsx'), 'utf8');
+const card = fs.readFileSync(path.join(workspaceDir, 'TabCard.tsx'), 'utf8');
 const terminalArea = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
 const bridge = fs.readFileSync(path.join(here, '..', 'utils', 'paneTabDragBridge.ts'), 'utf8');
 const snapshot = fs.readFileSync(path.join(here, '..', 'utils', 'sessionSnapshot.mjs'), 'utf8');
@@ -82,12 +83,10 @@ test('вкладка живёт в одном окне: чип — не копи
   assert.match(store, /paneIndexHoldingTab/);
 });
 
-test('счётчик вместо скроллбара', () => {
-  // Полоса — одна строка в двухстрочной шапке; горизонтальный скроллбар отнял бы
-  // третью ради того, что счётчики говорят точнее.
-  assert.match(strip, /data-strip-overflow/);
-  assert.match(strip, /scrollbarWidth: 'none'/);
-  assert.doesNotMatch(strip, /overflowX: 'scroll'/);
+test('полоса окна всегда переносит вкладки без скрытого горизонтального ряда', () => {
+  assert.match(strip, /flexWrap: 'wrap'/);
+  assert.match(strip, /overflowX: 'clip'/);
+  assert.doesNotMatch(strip, /data-strip-overflow|onWheel=|onScroll=/);
 });
 
 test('имя вкладки в полосе не обрезается', () => {
@@ -95,27 +94,13 @@ test('имя вкладки в полосе не обрезается', () => {
   // которой в том, чтобы сказать, какая вкладка какая. Уезжает за край — про
   // это говорят счётчики, а не огрызок имени.
   assert.doesNotMatch(chip, /maxWidth: inStrip \? 220/);
-  assert.match(chip, /inStrip\n\s+\? \{ whiteSpace: 'nowrap' \}/);
+  assert.match(chip, /truncate=\{!inStrip\}/);
+  assert.match(card, /overflow: truncate \? 'hidden' : undefined/);
+  assert.match(card, /whiteSpace: 'nowrap'/);
 });
 
-test('счётчик скрытых красится цветом агента и растёт столбиком', () => {
-  // Одно число отвечает «сколько», а спрашивают «что»: две Claude и один Codex
-  // — другая ситуация, чем три Codex. Цвет берётся из ОБЩЕЙ таблицы вкладок:
-  // вторая таблица на одну полосу разошлась бы с первой.
-  assert.match(strip, /groupOverflowByKind/);
-  assert.match(strip, /from '\.\/tabChrome'/);
-  assert.match(strip, /flexDirection: 'column'/);
-  assert.match(strip, /data-strip-overflow-kind/);
-  // Цвет вкладки меняется в момент старта агента — часто уже за краем. Без
-  // подписки квадратик остался бы серым до случайной прокрутки.
-  assert.match(strip, /const kindsKey = useWorkspaceStore/);
-  assert.match(strip, /const ro = new ResizeObserver\(\(\) => \{\s*measure\(\);\s*\}\)/);
-  assert.match(strip, /\}, \[entriesKey, kindsKey, measure\]\);/);
-  assert.doesNotMatch(
-    strip,
-    /useLayoutEffect\(\(\) => \{ measure\(\); \}/,
-    'overflow measurement must wait for committed browser geometry',
-  );
+test('полоса не измеряет скрытые вкладки и не подписывается на их цвета', () => {
+  assert.doesNotMatch(strip, /groupOverflowByKind|kindsKey|revealChip|new ResizeObserver/);
 });
 
 test('иконка проекта одна на группу подряд идущих вкладок', () => {
@@ -124,19 +109,22 @@ test('иконка проекта одна на группу подряд иду
   assert.match(strip, /groupStripByProject/);
 });
 
-test('показанный чип виден: шапка не спорит с окном под ней', () => {
-  assert.match(strip, /scrollOffsetForChip/);
+test('показанный чип остаётся в переносимой полосе без автопрокрутки', () => {
+  assert.match(strip, /shown=\{tabId === shownTabId\}/);
+  assert.doesNotMatch(strip, /scrollOffsetForChip|requestReveal/);
 });
 
 test('чип отвечает за себя сам', () => {
   // Один компонент на N чипов означал бы один набор подписок на все вкладки
   // окна — так лоадер и оказывается на соседе занятой вкладки.
-  assert.match(chip, /useTabActivitySignals\(tabId, sharedActivity\)/);
+  assert.match(chip, /projectId=\{projectId\} tabId=\{tabId\}/);
+  assert.match(chip, /sharedActivity=\{sharedActivity\}/);
+  assert.match(card, /useTabActivitySignals\(tabId, signalSnapshot\)/);
   assert.match(chip, /data-chip-shown/);
-  assert.match(chip, /data-chip-active=\{visuallyActive \? '1' : '0'\}/);
+  assert.match(chip, /data-chip-active=\{shown && paneFocused \? '1' : '0'\}/);
   assert.match(
     chip,
-    /const visuallyActive = shown && paneFocused/,
+    /active=\{shown && paneFocused\}/,
     'показанная вкладка активна только в сфокусированном окне, включая одинокий чип',
   );
   assert.doesNotMatch(chip, /active: shown[,}]/);
@@ -348,27 +336,17 @@ test('чип в полосе не сжимается — иначе соседи
   // В ПЕРЕНОСЕ действует то же правило и по той же причине: сжимать чип, чтобы
   // строка «влезла», там особенно бессмысленно — на то и перенос, чтобы лишний
   // чип ушёл строкой ниже целым.
-  assert.match(strip, /flexShrink: \(inStrip \|\| wrap\) \? 0 : 1/);
+  assert.match(strip, /flexShrink: 0, minWidth: 0/);
 });
 
-test('автодовод чипа существует только как выключенный по умолчанию opt-in', () => {
-  // Manual scroll — основной контракт. Перехват клика остаётся для явной
-  // настройки, но без autoReveal requestReveal ничего не меняет.
-  assert.match(strip, /autoReveal = false/);
-  assert.match(strip, /if \(!autoReveal \|\| !targetTabId \|\| wrap\) return/);
-  assert.match(strip, /onClickCapture=\{\(e\) => \{/);
-  assert.match(strip, /requestReveal\(clicked, 'chip-click'\)/);
-  assert.match(strip, /\[PaneTabStrip:Reveal\]/);
+test('меню не предлагает удалённые scroll-mode и автодовод', () => {
+  assert.doesNotMatch(header, /data-split-strip-menu-item="(?:wrap|auto-reveal)"/);
+  assert.doesNotMatch(strip, /autoReveal|endInsetPx|scrollLeft/);
 });
 
-test('возврат фокуса не переписывает ручной горизонтальный scroll', () => {
-  // Фокус меняет реальную ширину viewport, но trailing reserve сохраняет тот
-  // же right-edge scroll range без видимой чёрной коробки.
-  // Даже включённый opt-in не привязан к splitFocusedIndex: focus не является
-  // запросом на смену scrollLeft.
-  assert.match(strip, /autoRevealShownRef\.current === shownTabId/);
-  assert.match(strip, /data-pane-strip-end-reserve/);
-  assert.doesNotMatch(strip, /const paneFocused =|\[shownTabId, inStrip, paneFocused/);
+test('возврат фокуса сохраняет зарезервированную геометрию кнопок', () => {
+  assert.match(header, /data-wrap-reserved="1"/);
+  assert.match(header, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
 });
 
 // ── Git в шапке окна ──────────────────────────────────────────────────────
@@ -397,7 +375,8 @@ test('освобождённая шапка даёт прямой вход к с
   assert.doesNotMatch(header, /<PersistentPaneGitStatus/);
   assert.match(header, /<HiddenWindowPicker paneIndex=\{paneIndex\}/);
   const picker = fs.readFileSync(path.join(workspaceDir, 'HiddenWindowPicker.tsx'), 'utf8');
-  assert.match(picker, /state\.showHiddenWindow\(index, candidate\.id\)/);
+  assert.match(picker, /state\.showHiddenWindow\(index, candidateId, selected\)/);
+  assert.match(picker, /chooseWindow\(candidate\.id, tab\)/);
 });
 
 test('средний клик по shown-чипу оставляет vacant body и не выбирает соседа', () => {

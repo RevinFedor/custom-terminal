@@ -30,7 +30,7 @@ test('provider, section, group, query, date range and sort compose deterministic
 
 test('group summary never mixes providers or sections', () => {
   assert.deepEqual(summarizeStorageGroups(items, 'sessions', 'claude'), [
-    { group: 'outside', items: 1, bytes: 30, eligibleBytes: 30 },
+    { group: 'outside', items: 1, bytes: 30, eligibleBytes: 30, deletableBytes: 30 },
   ]);
 });
 
@@ -42,6 +42,13 @@ test('selection uses the complete filtered array, not mounted virtual rows', () 
   assert.deepEqual(storageSelectionRangeIds(visible, 'missing', 'b'), ['b']);
   const ascending = selectStorageItems(items, { section: 'sessions', sort: 'date', sortDirection: 'asc' });
   assert.deepEqual(storageSelectionRangeIds(ascending, 'b', 'e'), ['b', 'd', 'e']);
+});
+
+test('deletable-only filtering excludes protected history while selection follows date and size ordering', () => {
+  const ascending = selectStorageItems(items, { section: 'sessions', deletableOnly: true, sort: 'size', sortDirection: 'asc' });
+  assert.deepEqual(ascending.map((item) => item.id), ['e', 'd', 'b']);
+  assert.deepEqual(storageSelectionRangeIds(ascending, 'e', 'b'), ['e', 'd', 'b']);
+  assert.deepEqual(selectStorageItems(items, { section: 'builds', deletableOnly: true }).map((item) => item.id), ['c']);
 });
 
 test('byte and countdown labels use compact English UI text', () => {

@@ -283,15 +283,19 @@ test('real UIStore migrates every legacy size and commits each existing setter a
   assert.equal(reloaded.getState().displayProfiles[odyssey.key].sizes.historyFontSize, live.historyFontSize);
 });
 
-test('real UIStore keeps History spacing global and wrap defaults on only when absent', async () => {
-  const { store, storage } = await loadStore();
-  assert.equal(store.getState().paneTabStripWrap, true);
+test('real UIStore ignores retired pane scroll settings across reload/display switch and preserves History spacing', async () => {
+  const { store, storage } = await loadStore(new Map([
+    ['noted-terminal-pane-strip-wrap', 'false'],
+    ['noted-terminal-pane-strip-auto-reveal', 'true'],
+  ]));
+  assert.equal('paneTabStripWrap' in store.getState(), false);
+  assert.equal('setPaneTabStripWrap' in store.getState(), false);
+  assert.equal('paneTabStripAutoReveal' in store.getState(), false);
   assert.equal(store.getState().historyHorizontalPadding, 4);
   assert.equal(store.getState().historyLetterSpacing, 0);
   store.getState().setDisplayContext(snapshot(odyssey));
   store.getState().setHistoryHorizontalPadding(0);
   store.getState().setHistoryLetterSpacing(0.3);
-  store.getState().setPaneTabStripWrap(false);
   store.getState().adjustSurfaceFontSizes('history', 1);
   assert.equal(store.getState().historyFontSize, 14);
   assert.equal(store.getState().historyComposerFontSize, 13);
@@ -303,7 +307,9 @@ test('real UIStore keeps History spacing global and wrap defaults on only when a
   assert.equal(store.getState().historyLetterSpacing, 0.3);
   assert.equal('historyHorizontalPadding' in store.getState().displayProfiles[macbook.key].sizes, false);
   const reloaded = (await loadStore(storage)).store.getState();
-  assert.equal(reloaded.paneTabStripWrap, false);
+  assert.equal('paneTabStripWrap' in reloaded, false);
+  assert.equal('paneTabStripAutoReveal' in reloaded, false);
+  assert.equal(storage.get('noted-terminal-pane-strip-wrap'), 'false', 'legacy data stays inert; no migration write');
   assert.equal(reloaded.historyHorizontalPadding, 0);
   assert.equal(reloaded.historyLetterSpacing, 0.3);
 });

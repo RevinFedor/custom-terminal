@@ -630,6 +630,7 @@ test('transcript changes notify the main-process proof owner with exact session 
     size: 4096,
     mtimeMs: 1234,
     filePath: '/tmp/session-proof.jsonl',
+    sourceRewriteVersion: 0,
     reason: 'fs-watch',
   }]);
 });

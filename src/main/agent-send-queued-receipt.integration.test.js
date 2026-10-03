@@ -13,6 +13,7 @@ const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { desktopHistorySendReplayResult } = require('./agent-history-send-receipt');
 const { terminalSendIncidentNotification } = require('./terminal-incident-reporting');
+const { compactSendReceiptPresentation } = require('./compact-send-settlement');
 
 const webSource = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const webAst = ts.createSourceFile('web-server.js', webSource, ts.ScriptTarget.Latest, true);
@@ -93,6 +94,7 @@ function harness(t, { outcome = 'queued', provider = 'codex', scopeLoss = 'termi
     };
   }
   const context = vm.createContext({
+    compactSendReceiptPresentation,
     ...registryModule,
     AGENT_SEND_RECEIPT_STATES: registryModule.RECEIPT_STATES,
     agentSendReceiptRegistry: registry,

@@ -26,16 +26,12 @@ const area = fs.readFileSync(path.join(here, 'TerminalArea.tsx'), 'utf8');
 test('действия окна сохраняют геометрию wrap, Git находится в общей шапке', () => {
   assert.match(chrome, /data-split-pane-focus-actions/);
   assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
-  assert.match(chrome, /const focusActionsInFlow = stripWrap \|\| focusActionsVisible/);
-  assert.match(chrome, /data-wrap-reserved=\{stripWrap \? '1' : undefined\}/);
+  assert.match(chrome, /data-wrap-reserved="1"/);
   assert.match(chrome, /data-visible=\{focusActionsVisible \? '1' : '0'\}/);
-  // Wrap сохраняет скрытый блок в потоке; scroll выносит его и отдаёт ту же
-  // измеренную ширину trailing reserve внутри scroll-content.
-  assert.match(chrome, /position: focusActionsInFlow \? 'relative' : 'absolute'/);
+  // Скрытый блок всегда остаётся в потоке; focus не меняет перенос строк.
+  assert.match(chrome, /position: 'relative'/);
   assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
-  assert.match(chrome, /const hiddenFocusReservePx = stripWrap \|\| focusActionsVisible \|\| focusActionsWidth <= 0/);
-  assert.match(chrome, /const hiddenFocusReservePx/);
-  assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
+  assert.doesNotMatch(chrome, /endInsetPx|focusActionsWidth/);
   assert.match(chrome, /inert=\{!focusActionsVisible\}/);
   // Git has one focused owner in the application toolbar. Window switching
   // remains reachable in every pane, outside the focus-only action block.
