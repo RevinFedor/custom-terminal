@@ -216,6 +216,7 @@ test('actual /api/me advertises the opt-in only with an available payload owner 
   const method = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'handleApi');
   const block = method.body.statements.find(node => ts.isIfStatement(node) && node.expression.getText(ast).includes("'/api/me'"));
   const scope = vm.createContext({ sendJson, checkAuth: req => req.headers.authorization === 'Bearer fixture',
+    publicTabActivity: null, projectCardSignals: null, codexGoalActions: null,
     publicHistoryFreshness: null, agentSendQueue: null, systemPromptService: null, agentParamsService: null, completionNotificationCapability,
     getLanIp: () => '127.0.0.1', webServerServiceHealth: () => ({ instanceId: 'fixture' }), MAX_EVENT_TABS,
     transcriptService: { getToolPayload() {} }, historyPayloadCapability,
@@ -237,6 +238,13 @@ test('actual /api/me advertises the opt-in only with an available payload owner 
   assert.equal(allowed.capabilities.historyPayloads.headerVersion, 2);
   assert.deepEqual(allowed.capabilities.completionNotifications, completionNotificationCapability);
   assert.equal(allowed.capabilities.historyFreshness, undefined);
+  assert.equal(allowed.capabilities.tabActivity, undefined);
+  scope.publicTabActivity = require('./public-tab-activity').createPublicTabActivity({ epoch: 'metadata-epoch',
+    readState: () => { throw Error('capability must not read tab metadata'); },
+    readInherited: () => { throw Error('capability must not read registry'); } });
+  const activity = await (await fetch(address, { headers: { authorization: 'Bearer fixture' } })).json();
+  assert.deepEqual(activity.capabilities.tabActivity, scope.publicTabActivity.capability);
+  scope.publicTabActivity = null;
   scope.publicHistoryFreshness = {};
   const freshness = await (await fetch(address, { headers: { authorization: 'Bearer fixture' } })).json();
   assert.deepEqual(freshness.capabilities.historyFreshness, { version: 1, providers: ['claude','codex'],
@@ -595,7 +603,7 @@ test('actual timing HTTP handler and project activity wakeups read the same owne
   const owner=timingOwner(); owner.preflight.set('A',{engine:'codex',startTs:90000});
   const events=[], snapshots=new Map();
   const scope=vm.createContext({ console:quiet, crypto, readAgentTabTiming: payload => ({...owner.read(payload),scope:{tabId:payload.tabId,readSessionId:'source',writerConfirmed:false},observedAt:100000}),
-    publicTimingSnapshots:snapshots, webServerInstanceId:'instance', subscribers:new Map([['A',new Set([{isAlive:()=>true}])]]),
+    publicTimingSnapshots:snapshots, publicTabActivity:null, webServerInstanceId:'instance', subscribers:new Map([['A',new Set([{isAlive:()=>true}])]]),
     PROJECT_ACTIVITY_TOPIC:'projects', webBroadcast: (_tab,payload)=>events.push(payload), projectActivitySnapshot:()=>{throw Error('not subscribed');} });
   vm.runInContext(functions(source,['hasTabSubscribers','publicTabTimingSnapshot','publishTabTiming','broadcastProjectActivity']),scope);
   scope.publicTabTimingSnapshot('A'); scope.broadcastProjectActivity('activity-open');

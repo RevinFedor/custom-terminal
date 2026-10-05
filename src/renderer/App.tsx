@@ -86,9 +86,11 @@ import {
   updatePaneTabPointerMeta,
 } from './utils/paneTabPointerBridge';
 import { commitPaintedPaneTabDrop } from './utils/paneTabDropCommit';
+import { cancelPaneTabPointerDrag } from './utils/paneTabPointerGesture';
 import {
   clearTabDragNavigationTarget,
   setTabDragNavigationTarget,
+  useTabDragNavigationSnapshot,
 } from './utils/tabDragNavigationBridge';
 import { replaceShellInputLine } from './utils/shellCommandInput.mjs';
 import { tabAllowsShellActions } from './utils/emptyTab.mjs';
@@ -678,7 +680,9 @@ const ProjectTabItem = memo(({
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
   const [isTabDropBlocked, setIsTabDropBlocked] = useState(false);
   const [tabDropCount, setTabDropCount] = useState(0);
-  const [isTabNavigationTarget, setIsTabNavigationTarget] = useState(false);
+  const navigationTarget = useTabDragNavigationSnapshot().target;
+  const isTabNavigationTarget = navigationTarget?.kind === 'project'
+    && navigationTarget.id === projectId && !navigationTarget.blocked;
   const isActiveRef = useRef(isActive);
   isActiveRef.current = isActive;
   const [structuredDropState, setStructuredDropState] = useState<'allowed' | 'blocked' | null>(null);
@@ -747,7 +751,6 @@ const ProjectTabItem = memo(({
         },
         onDragEnter: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setIsTabNavigationTarget(!isActiveRef.current);
             setTabDragNavigationTarget('pane', {
               kind: 'project',
               id: projectId,
@@ -768,7 +771,6 @@ const ProjectTabItem = memo(({
         },
         onDrag: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setIsTabNavigationTarget(!isActiveRef.current);
             setTabDragNavigationTarget('pane', {
               kind: 'project',
               id: projectId,
@@ -791,14 +793,12 @@ const ProjectTabItem = memo(({
           setIsTabDropTarget(false);
           setIsTabDropBlocked(false);
           setTabDropCount(0);
-          setIsTabNavigationTarget(false);
           clearTabDragNavigationTarget('pane');
         },
         onDrop: ({ source }) => {
           setIsTabDropTarget(false);
           setIsTabDropBlocked(false);
           setTabDropCount(0);
-          setIsTabNavigationTarget(false);
           if (source.data.type === PANE_TAB_DND_TYPE) {
             clearTabDragNavigationTarget('pane');
             return;
@@ -1314,6 +1314,7 @@ function App() {
   // updates land in useUIStore and the visible TabBar picks them up immediately.
   const processBar = useUIStore((s) => s.processBar);
   useEffect(() => {
+    ipcRenderer.send('tab-activity:process-bar', processBar);
     const root = document.documentElement;
     const peakAlpha = opacityPctToAlpha(processBar.shimmerOpacityPct);
     root.style.setProperty('--process-bar-color-a', processBar.colorA);
@@ -1336,7 +1337,7 @@ function App() {
       ' peakAlpha=' + peakAlpha.toFixed(3) +
       ' edgeAlpha=' + Math.max(0.01, peakAlpha * 0.22).toFixed(3)
     );
-  }, [processBar.colorA, processBar.shimmerColor, processBar.inheritedColor, processBar.shimmerSpacingPct, processBar.shimmerOpacityPct]);
+  }, [processBar.colorA, processBar.shimmerColor, processBar.inheritedColor, processBar.shimmerSpacingPct, processBar.shimmerOpacityPct, processBar.position]);
 
   useEffect(() => {
     const showNativeNotification = async (detail: TabCompletionNotificationDetail) => {
@@ -6295,6 +6296,7 @@ function App() {
     let paneMetaHeld = false;
     const finishPaneGesture = (reason: string) => {
       const drag = getPaneTabDragSnapshot();
+      if (drag.source?.input === 'pointer') return;
       const pointer = getPaneTabPointerSnapshot();
       const rootTabId = drag.source?.rootTabId;
       const insidePaintedTarget = !!(
@@ -6318,6 +6320,7 @@ function App() {
       clearTabDragNavigationTarget('pane');
     };
     const cancelPaneGesture = () => {
+      if (cancelPaneTabPointerDrag('app-cleanup')) return;
       const rootTabId = getPaneTabDragSnapshot().source?.rootTabId;
       cancelPaneTabPointer();
       if (rootTabId) endPaneTabDrag(rootTabId);

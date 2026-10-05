@@ -7,6 +7,62 @@ const { groupProcessMetrics, describeTool, describeAgent, describeCommand, isSha
 
 const MB = 1024 * 1024;
 
+test('deploy shell-скрипт учитывает полное поддерево как команду, sh -c остаётся обёрткой', () => {
+  const snapshot = snapshotOf([
+    procCmd(2300, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(2301, 2300, 100, '/usr/bin/codex'),
+    procCmd(2302, 2301, 2, 'sh -c bash ./deploy.sh'),
+    procCmd(2303, 2302, 20, 'bash -e ./deploy.sh', '/bin/bash'),
+    procCmd(2304, 2303, 45, 'node deploy-worker.js'),
+  ]);
+  const result = groupProcessMetrics({ snapshot, tabs: [{ tabId: 'a', pid: 2300, projectId: 'p1' }] });
+  const tab = result.projectTabs[0];
+  assert.equal(tab.commands[0].label, 'deploy.sh');
+  assert.equal(tab.commands[0].bytes, 65 * MB);
+  assert.equal(tab.commandTotalBytes, 65 * MB);
+  assert.equal(tab.otherBytes, 2 * MB);
+  assert.equal(tab.agentBytes, 100 * MB);
+  assert.equal(tab.totalBytes, 170 * MB);
+});
+
+test('итог команд включает маленькие поддеревья всех проектов, без повторного учёта вкладок', () => {
+  const snapshot = snapshotOf([
+    procCmd(2000, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(2001, 2000, 100, '/usr/bin/codex'),
+    procCmd(2002, 2001, 2, 'sh -c npm run dev'),
+    procCmd(2003, 2002, 50, 'npm run dev'),
+    procCmd(2004, 2003, 60, 'node vite'),
+    procCmd(2005, 2001, 5, 'git status'),
+    procCmd(2010, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(2011, 2010, 7, 'python deploy.py'),
+  ]);
+  const tabs = [{ tabId: 'a', pid: 2000, projectId: 'p1' },
+    { tabId: 'b', pid: 2010, projectId: 'p2' }, { tabId: 'duplicate', pid: 2000, projectId: 'p2' }];
+  const cpuByPid = new Map([[2000, 1], [2001, 2], [2002, 3], [2003, 4], [2004, 5], [2005, 6], [2010, 7], [2011, 8]]);
+  const result = groupProcessMetrics({ snapshot, tabs, cpuByPid, projectId: 'p1' });
+  const a = result.projectTabs[0], b = result.otherTabs[0], duplicate = result.otherTabs[1];
+  assert.equal(a.commandTotalBytes, 115 * MB);
+  assert.equal(a.smallCommandBytes, 5 * MB);
+  assert.equal(a.commandTotalCpu, 15);
+  assert.equal(a.smallCommandCpu, 6);
+  assert.equal(b.commandTotalBytes, 7 * MB);
+  assert.equal(duplicate.commandTotalBytes, 0);
+  assert.equal(result.totals.commandBytes, 122 * MB);
+  assert.equal(result.totals.commandCpu, 23);
+  assert.equal(result.totals.allBytes, 230 * MB, 'root/agent/wrapper/commands counted once');
+});
+
+test('CPU команд различает первый замер, неизвестные новые PID и известное отсутствие команд', () => {
+  const snapshot = snapshotOf([procCmd(2200, 1, 3, '-zsh', '/bin/zsh'), procCmd(2201, 2200, 25, 'npm run build')]);
+  const tabs = [{ tabId: 'a', pid: 2200, projectId: 'p1' }];
+  assert.equal(groupProcessMetrics({ snapshot, tabs }).totals.commandCpu, null);
+  assert.equal(groupProcessMetrics({ snapshot, tabs, cpuByPid: new Map([[2200, 0]]) }).totals.commandCpu, null);
+  assert.equal(groupProcessMetrics({ snapshot, tabs, cpuByPid: new Map([[2200, 0], [2201, 0]]) }).totals.commandCpu, 0);
+  const empty = groupProcessMetrics({ snapshot: snapshotOf([snapshot.processes[0]]), tabs, cpuByPid: new Map([[2200, 0]]) });
+  assert.equal(empty.projectTabs[0].commandTotalBytes, 0);
+  assert.equal(empty.totals.commandCpu, 0);
+});
+
 function proc(pid, ppid, footprintMb, execPath, name) {
   return {
     pid,
@@ -305,6 +361,8 @@ test('запущенная во вкладке команда — своя ст�
   assert.equal(tab.commands[0].bytes, 650 * MB, 'поддерево команды целиком у команды');
   assert.equal(tab.commands[0].count, 3);
   assert.equal(tab.totalBytes, 653 * MB);
+  assert.equal(tab.commandTotalBytes, 650 * MB);
+  assert.equal(result.totals.commandBytes, 650 * MB);
 });
 
 test('лёгкая команда не получает строку — уходит в «прочее»', () => {
@@ -323,6 +381,11 @@ test('лёгкая команда не получает строку — ухо�
   assert.equal(tab.commands.length, 0, 'git на 5 МБ не мерцает отдельной строкой');
   assert.equal(tab.otherBytes, 5 * MB);
   assert.equal(tab.totalBytes, 8 * MB);
+  assert.equal(tab.commandBytes, 0, 'порог скрывает только отдельную строку');
+  assert.equal(tab.commandTotalBytes, 5 * MB, 'полный итог включает скрытую команду');
+  assert.equal(tab.smallCommandBytes, 5 * MB);
+  assert.equal(result.totals.commandBytes, 5 * MB);
+  assert.equal(result.totals.allBytes, 8 * MB, 'маленькая команда не удвоила общий расход');
 });
 
 test('прозрачная оболочка не строка: потомки классифицируются сами', () => {

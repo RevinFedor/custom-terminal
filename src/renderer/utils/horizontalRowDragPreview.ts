@@ -28,6 +28,7 @@ export function createHorizontalRowDragPreview(source: HTMLElement) {
   host.appendChild(clone);
   document.body.appendChild(host);
   return {
+    element: host,
     move: (x: number, y: number) => {
       host.style.transform = `translate3d(${x - rect.width / 2}px, ${y - rect.height / 2}px, 0)`;
     },

@@ -48,6 +48,13 @@ async function bundleStamp(file) {
   const s = await fs.promises.stat(path.join(file, 'Contents/Resources/app.asar'));
   return { dev: s.dev, ino: s.ino, size: s.size, mtimeMs: s.mtimeMs };
 }
+async function writeMarker(root, value) {
+  const temporary = path.join(root, MARKER + '.' + crypto.randomUUID() + '.tmp');
+  try {
+    await fs.promises.writeFile(temporary, JSON.stringify(value) + '\n', { mode: 0o600, flag: 'wx' });
+    await fs.promises.rename(temporary, path.join(root, MARKER));
+  } finally { await fs.promises.unlink(temporary).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
+}
 async function completionReceipt(dir) {
   const file = path.join(dir, 'installed.json');
   try {
@@ -70,7 +77,7 @@ async function markPrepared(root, source) {
   const old = await readMarker(root);
   const value = { version: 1, type: 'generated-build-artifacts', status: 'prepared', source,
     createdAt: old?.createdAt || Date.now(), updatedAt: Date.now() };
-  await fs.promises.writeFile(path.join(root, MARKER), JSON.stringify(value) + '\n', { mode: 0o600 });
+  await writeMarker(root, value);
   return value;
 }
 function namedDate(name) {
@@ -99,14 +106,19 @@ function inUse(target, refs) {
     refs.commands.some(command => command.includes(target));
 }
 async function applyTargets(targets, { audit = auditFor(), probe = references, operationId = 'build-artifacts-' + crypto.randomUUID(), source = 'automatic-build-cleanup' } = {}) {
-  const refs = await probe(); // A broken probe is a refusal, never "nothing is running".
+  let refs = await probe(); // A broken probe is a refusal, never "nothing is running".
   const removed = [], skipped = [];
+  let referenceRoot = null, consultations = 0;
   for (const target of targets) {
     const root = path.resolve(target.root), file = path.resolve(target.path);
     if (!allowedRoot(root) || !within(root, file) || !['app-bundle', 'unpacked-app', 'private-build'].includes(target.kind)) {
       throw new Error('Forbidden cleanup scope: ' + file);
     }
     await identity(root);
+    if (referenceRoot !== root || consultations >= 10) {
+      refs = await probe(); referenceRoot = root; consultations = 0;
+    }
+    consultations++;
     const state = await readMarker(root);
     if (target.kind !== 'private-build' && state && state.status !== 'verified') {
       skipped.push({ path: file, reason: 'prepared-or-unverified' }); continue;
@@ -262,7 +274,7 @@ async function cleanupVerifiedDeployment({ root, candidate, contents, retired, b
   if (!backup || !within(root, path.resolve(backup))) throw new Error('A proven rollback must remain in this deployment');
   await identity(path.resolve(backup));
   const value = { version: 1, type: 'generated-build-artifacts', status: 'verified', updatedAt: Date.now(), installedAsar: expectedAsar, rollback: backup };
-  await fs.promises.writeFile(path.join(root, MARKER), JSON.stringify(value) + '\n', { mode: 0o600 });
+  await writeMarker(root, value);
   const targets = [];
   for (const [kind, file] of [['app-bundle', candidate], ['unpacked-app', contents], ['app-bundle', retired]]) {
     if (!file || !await exists(file)) continue;

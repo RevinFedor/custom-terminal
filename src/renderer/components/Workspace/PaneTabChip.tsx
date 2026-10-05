@@ -14,9 +14,6 @@
 // coloured tab stays its colour in both states instead of being painted over.
 
 import React, { useEffect, useRef, useState } from 'react';
-import { draggable } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-import { centerUnderPointer } from '@atlaskit/pragmatic-drag-and-drop/element/center-under-pointer';
-import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { paneTabs } from '../../utils/splitPanesModel.mjs';
 import { openTabContextMenuAt, TAB_RENAME_REQUEST_EVENT } from './TabBar';
@@ -24,10 +21,9 @@ import type { SharedTabActivityMaps } from './TabSignals';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import TabCard from './TabCard';
 import {
-  beginPaneTabDrag,
   paneStripKey,
-  PANE_TAB_DND_TYPE,
 } from '../../utils/paneTabDragBridge';
+import { bindPaneTabPointerDrag } from '../../utils/paneTabPointerGesture';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 
@@ -69,9 +65,7 @@ export default function PaneTabChip({
   // the pane, so the background never flashes off during the 80–120ms commit.
   const [pressed, setPressed] = useState(false);
   const [pointerHeld, setPointerHeld] = useState(false);
-  const pointerIdRef = useRef(1);
   const pressedFallbackRef = useRef<number | null>(null);
-  const [dragging, setDragging] = useState(false);
   // Rename in place: same action as double-click in the sidebar list, so a tab
   // can be renamed from whichever surface the user is already looking at.
   const [renaming, setRenaming] = useState(false);
@@ -129,74 +123,14 @@ export default function PaneTabChip({
   const paneDndEnabled = inSplit || inStrip;
   useEffect(() => {
     const element = chipRef.current;
-    if (!element || !paneDndEnabled || previewOnly) return undefined;
+    if (!element || !paneDndEnabled || previewOnly || renaming) return undefined;
     const paneKey = paneStripKey(paneIndex);
-    return draggable({
-        element,
-        getInitialData: () => ({
-          type: PANE_TAB_DND_TYPE,
-          tabId,
-          projectId,
-          index,
-          paneKey,
-          spaceId: activeSpaceId,
-          pointerId: pointerIdRef.current,
-        }),
-        onGenerateDragPreview: ({ nativeSetDragImage }) => {
-          const rect = element.getBoundingClientRect();
-          // The dragged chip is a floating object whose CENTER is the pointer.
-          // The row keeps only a quiet placeholder at the future slot. Keeping
-          // the original grab offset made the same neighbour require a
-          // different crossing point depending on where the user pressed.
-          setCustomNativeDragPreview({
-            nativeSetDragImage,
-            getOffset: centerUnderPointer,
-            render({ container }) {
-              const clone = element.cloneNode(true) as HTMLElement;
-              clone.setAttribute('data-pane-tab-native-drag-preview', '1');
-              clone.removeAttribute('data-pane-chip-drag-placeholder');
-              Object.assign(container.style, {
-                display: 'inline-flex',
-                width: `${rect.width}px`,
-                height: `${rect.height}px`,
-                pointerEvents: 'none',
-              });
-              Object.assign(clone.style, {
-                width: `${rect.width}px`,
-                height: `${rect.height}px`,
-                maxWidth: 'none',
-                margin: '0',
-                opacity: '1',
-                transform: 'none',
-                pointerEvents: 'none',
-              });
-              container.appendChild(clone);
-              return () => clone.remove();
-            },
-          });
-        },
-        onDragStart: () => {
-          setPointerHeld(false);
-          setPressed(false);
-          setDragging(true);
-          beginPaneTabDrag({
-            owner: 'pane',
-            entries: [{ projectId, tabId }],
-            rootTabId: tabId,
-            sourcePaneKey: paneKey,
-            sourceSpaceId: activeSpaceId,
-            pointerId: pointerIdRef.current,
-          });
-          console.log('[PaneTabDnd:start] tab=' + tabId.slice(-12) + ' pane=' + paneKey);
-        },
-        onDrop: () => {
-          setDragging(false);
-          // The global release barrier owns cleanup. Ending here used to erase
-          // the painted target before a drop on empty strip space reached the
-          // monitor, so the preview snapped back without a commit.
-        },
-      });
-  }, [activeSpaceId, paneDndEnabled, paneIndex, previewOnly, projectId, tabId]);
+    return bindPaneTabPointerDrag(element, () => ({
+      owner: 'pane', entries: [{ projectId, tabId }], rootTabId: tabId,
+      sourcePaneKey: paneKey, sourceSpaceId: activeSpaceId,
+    }), () => { setPointerHeld(false); setPressed(false); });
+  }, [activeSpaceId, paneDndEnabled, paneIndex, previewOnly, projectId, tabId, renaming]);
+
 
   if (!tabExists) return null;
   const removeFromWindow = (event: React.MouseEvent): boolean => {
@@ -243,14 +177,13 @@ export default function PaneTabChip({
       data-chip-pressed={pressed ? '1' : '0'}
       data-chip-index={index}
       data-pane-chip-preview-only={previewOnly ? '1' : '0'}
-      data-pane-chip-drag-placeholder={(dragging || dragPlaceholder || previewOnly) ? '1' : undefined}
+      data-pane-chip-drag-placeholder={(dragPlaceholder || previewOnly) ? '1' : undefined}
       // Only a LEFT press may take focus. A right-click opens a menu about
       // this tab — inspecting a tab is not switching to it, and stealing
       // focus there moves the surface out from under the menu the user just
       // opened. (pointerdown fires for every button, hence the check.)
       onPointerDown={(e) => {
         e.stopPropagation();
-        pointerIdRef.current = e.pointerId;
         if (e.button !== 0) {
           e.preventDefault();
           return;
@@ -349,9 +282,11 @@ export default function PaneTabChip({
       }}
       style={{
         flexShrink: inStrip ? 0 : 1,
-        transform: pointerHeld && !dragging ? 'scale(0.985)' : undefined,
-        transition: pointerHeld ? 'none' : 'transform 70ms ease-out',
-        opacity: (dragging || dragPlaceholder || previewOnly) ? 0.12 : 1,
+        transform: pointerHeld && !dragPlaceholder ? 'scale(0.985)' : undefined,
+        transition: 'none',
+        touchAction: 'none',
+        userSelect: 'none',
+        opacity: (dragPlaceholder || previewOnly) ? 0.12 : 1,
       }}
     >
       {renaming ? (

@@ -1129,6 +1129,14 @@ run» описывает чтение актуальных файлов, а не
 
 `codex:get-full-history` строит HistoryPanel из `response_item`: reasoning summary идёт в thinking, assistant message — в обычный ответ, `function_call` + `function_call_output` превращаются в raw tool carrier для общего `claude-blocks` renderer. Новый Codex tool surface записывает реальные вызовы верхнеуровневым `exec`, а их имена и аргументы оставляет внутри JavaScript source (`tools.exec_command(...)`, `tools.apply_patch(...)`, `tools.mcp__...(...)`). History обязан снять эту transport-оболочку до renderer: shell становится Bash-карточкой, `apply_patch` раскладывается по файлам в Edit/Write/MultiEdit, image/read — в Read, MCP — в компактную MCP-карточку. Парсер читает только вызовы вне строк и комментариев и разбирает безопасный literal-subset без `eval`; иначе пример `"tools.exec_command(...)"` или строка внутри самого patch создаст ложное действие. Симптом нарушения этой границы — строки `EXEC const r = await tools...` в History; это потеря семантики в rollout adapter, а не проблема CSS-пакета.
 
+При response-first promotion сохраняется прежняя audit-пара timestamp/hash
+в `promptPresentationAuditAliases`, а не только source/UUID alias. Иначе
+подтверждённый по раннему carrier prompt теряет attached metadata в History:
+например, Astra completion становится обычным оранжевым текстом с JSON.
+См. `fact-оркестрация-вкладок.md::UI в History`. Worker cache уже включает hash
+исходников parser/preparation, поэтому новая сборка не переиспользует старую
+проекцию, потерявшую alias; ручная правка истории или очистка БД не нужна.
+
 ### In-process субагенты (multi_agent_v1 / collaboration)
 
 Codex-субагенты приходят в rollout **двумя поколениями инструментов**, и History рендерит оба одинаковыми Task-карточками (тот же вид, что субагенты Claude SDK), а не сырыми JSON-вызовами. v1 — namespace `multi_agent_v1`: `spawn_agent` output несёт `{agent_id, nickname}`, результат приходит в output `wait_agent`/`close_agent`. v2 — namespace `collaboration`: у `spawn_agent` в arguments вместо текста задачи лежит **зашифрованный** блоб (`gAAAA…`, та же Fernet-капсула, что compact) — его нельзя показывать как описание карточки; человекочитаемое имя берётся из `task_name` → `/root/<task_name>`. Привязка call→карточка в v2 идёт через `event_msg.sub_agent_activity` (`event_id` = call_id вызова, `agent_thread_id` = session id дочернего rollout), а финальный текст — через `agent_message` response_item с префиксом `FINAL_ANSWER` (эта запись НЕ обычный assistant-ответ и не должна попадать в transcript отдельной строкой).

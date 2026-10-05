@@ -48,8 +48,9 @@ f.render = (tabId = 'a') => root.render(<>
   <div style={{ position: 'absolute', right: 12, top: 12, display: 'flex', alignItems: 'start', gap: 4 }}>
     <OrchestrationStatusChip tabId={tabId} panelOpen={false} effectiveWidth={200} />
   </div>
-  <div data-history-fixture style={{ margin: '260px 20px 20px', maxWidth: 720 }}>
-    <HistoryUserEntry entry={f.history} tabId="a" toolType="codex" allowRewind={false} rewindLocked={false}
+  <div data-history-fixture className="hp-history-transcript" style={{ margin: '260px 20px 20px', maxWidth: 720 }}>
+    <HistoryUserEntry key={f.history.uuid} entry={f.history} tabId="a" toolType="codex" forceExpanded={f.forceExpanded}
+      allowRewind={false} rewindLocked={false}
       allowHistoryRewriteRewind historyRewriteRewindLocked={false} onHistoryRewriteRewind={(entry: { content: string }) => f.rewinds.push(entry.content)}
       allowDeleteIteration={false} deleteIterationLocked={false} />
   </div>

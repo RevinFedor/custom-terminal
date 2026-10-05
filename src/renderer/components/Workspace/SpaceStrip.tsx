@@ -34,6 +34,7 @@ import { PANE_TAB_DND_TYPE } from '../../utils/paneTabDragBridge';
 import {
   clearTabDragNavigationTarget,
   setTabDragNavigationTarget,
+  useTabDragNavigationSnapshot,
 } from '../../utils/tabDragNavigationBridge';
 import {
   CONTEXT_MENU_METRICS,
@@ -208,7 +209,9 @@ function SpaceChip({
   const renameInput = useInlineRenameInputRef(renaming);
   const canDelete = useWorkspaceStore((s) => s.spaces.length > 1);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
-  const [paneTabNavigationTarget, setPaneTabNavigationTarget] = useState(false);
+  const navigationTarget = useTabDragNavigationSnapshot().target;
+  const paneTabNavigationTarget = navigationTarget?.kind === 'workflow'
+    && navigationTarget.id === id && !navigationTarget.blocked;
   const windowSwapPicker = useWorkspaceWindowSwapPickerSnapshot();
   const windowSwapTarget = windowSwapPicker.active && windowSwapPicker.targetSpaceId === id;
 
@@ -227,7 +230,6 @@ function SpaceChip({
         canDrop: ({ source }) => source.data.type === PANE_TAB_DND_TYPE,
         onDragEnter: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setPaneTabNavigationTarget(!active);
             setTabDragNavigationTarget('pane', {
               kind: 'workflow',
               id,
@@ -240,7 +242,6 @@ function SpaceChip({
         },
         onDrag: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setPaneTabNavigationTarget(!active);
             setTabDragNavigationTarget('pane', {
               kind: 'workflow',
               id,
@@ -252,12 +253,10 @@ function SpaceChip({
           }
         },
         onDragLeave: () => {
-          setPaneTabNavigationTarget(false);
           clearTabDragNavigationTarget('pane');
         },
         onDrop: ({ source }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setPaneTabNavigationTarget(false);
             clearTabDragNavigationTarget('pane');
           }
         },

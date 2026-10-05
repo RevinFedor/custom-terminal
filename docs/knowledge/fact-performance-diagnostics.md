@@ -257,6 +257,13 @@ options читаются по data descriptor: getters не исполняютс
 Вывод отложен, сравнивать calledAbs с WHEEL/SCROLL, не timestamp flush.
 Cleanup восстанавливает только собственные wrappers и не трогает поздние чужие.
 
+`VIRTUOSO_MEASUREMENT_VIEWPORT_SYNC` обозначает раннюю публикацию уже изменённой
+позиции после измерения карточки. Это synthetic scroll notification без записи
+координат; он не является новым user input или измерением native browser ACK.
+Позднейшее обычное scroll event остаётся допустимым. При анализе пустого кадра
+сравнивать physical writer и native paint; rAF до RO может видеть промежуточную
+геометрию даже в исправленном варианте. Механизм — fact-история-производительность.
+
 Стек абсолютного scrollTo отличает повтор index/tail-команды от относительной
 компенсации scrollBy. Если JS-записи нет, это ещё не доказательство browser
 anchoring: сначала проверить полноту охвата/лога, затем native trace. Рост

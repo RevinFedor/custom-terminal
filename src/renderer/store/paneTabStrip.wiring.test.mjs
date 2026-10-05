@@ -19,6 +19,7 @@ const chip = fs.readFileSync(path.join(workspaceDir, 'PaneTabChip.tsx'), 'utf8')
 const card = fs.readFileSync(path.join(workspaceDir, 'TabCard.tsx'), 'utf8');
 const terminalArea = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
 const bridge = fs.readFileSync(path.join(here, '..', 'utils', 'paneTabDragBridge.ts'), 'utf8');
+const pointerGesture = fs.readFileSync(path.join(here, '..', 'utils', 'paneTabPointerGesture.ts'), 'utf8');
 const snapshot = fs.readFileSync(path.join(here, '..', 'utils', 'sessionSnapshot.mjs'), 'utf8');
 const visitRule = fs.readFileSync(path.join(here, '..', 'utils', 'tabVisitHistoryRule.mjs'), 'utf8');
 
@@ -145,7 +146,7 @@ test('порядок чипов меняют тем же перетаскива�
   // Чип — только source. Вся полоса является одним target и показывает
   // будущий порядок самими чипами; per-chip target/белая линия создавали
   // конкурирующего владельца release и лишний feedback.
-  assert.match(chip, /from '@atlaskit\/pragmatic-drag-and-drop\/element\/adapter'/);
+  assert.match(chip, /bindPaneTabPointerDrag/);
   assert.doesNotMatch(chip, /dropTargetForElements|attachClosestEdge|data-pane-chip-drop-edge/);
   assert.match(strip, /ref=\{stripRootRef\}/);
   assert.match(strip, /dropTargetForElements\(\{/);
@@ -166,14 +167,14 @@ test('точный slot считается без удерживаемого sou
   assert.match(bridge, /ownerKey: `\$\{spaceId \|\| 'unknown'\}:\$\{paneKey\}`/);
   assert.match(bridge, /claimPaneTabDragDrop/);
   assert.match(strip, /commitPaintedPaneTabDrop/);
-  assert.match(chip, /centerUnderPointer/);
+  assert.match(pointerGesture, /createHorizontalRowDragPreview/);
   assert.match(strip, /dragPlaceholder=\{paneDrag\.active/);
   assert.doesNotMatch(strip, /anchorDeltaX/);
 });
 
 test('прямой DnD переносит между окнами, а карта остаётся точным fallback', () => {
   assert.match(strip, /data-pane-tab-drop-zone="strip"/);
-  assert.match(chip, /PANE_TAB_DND_TYPE/);
+  assert.match(chip, /bindPaneTabPointerDrag/);
   assert.match(tabbar, /Move to window/);
   assert.match(tabbar, /<MoveToWindowMenu/);
   // Карта повторяет раскладку: сетка по колонкам, окна колонки — друг под

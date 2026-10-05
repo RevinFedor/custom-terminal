@@ -90,6 +90,10 @@ self-contained child: provider delete родителя способен удал
 подписан `Ready after` рядом с `Manual cleanup`: он по-прежнему настраивает
 состав `Clean all ready`, но автоматический sweep build directories не удаляет.
 
+Developer post-build уборка SC/Voice/WebODM — другой механизм, не этот session
+sweep и не разрешение удалить Cargo/transcript по возрасту. Граница, prepared
+packages и rollback — [очистка сборок](fact-очистка-сборок.md).
+
 Строка показывает title/UUID, source, date и size. Правая область лениво
 дочитывает iteration count только после явного выбора сессии: раскрытие Storage,
 смена provider или сортировки не выбирают самый большой файл автоматически и

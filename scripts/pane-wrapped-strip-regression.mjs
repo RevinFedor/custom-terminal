@@ -45,7 +45,7 @@ try {
     localStorage.setItem('noted-terminal-pane-strip-auto-reveal','true');
     const f = window.pickerFixture = { calls: [], obsoleteRequests: [], unknown: [], violations: [], reads: 0, gestures: [],
       capabilities: ['synthetic structured-clone history', 'diagnostic socket unavailable'] };
-    for (const type of ['dragstart','drop']) document.addEventListener(type,event=>f.gestures.push({type,trusted:event.isTrusted}),true);
+    for (const type of ['dragstart','drop','pointerdown','pointerup']) document.addEventListener(type,event=>f.gestures.push({type,trusted:event.isTrusted}),true);
     const deny = kind => { f.violations.push(kind); throw Error('Fixture forbids ' + kind); };
     f.rowsFor = sid => {
       if (!rows.has(sid)) rows.set(sid, Array.from({ length: 240 }, (_, i) => ({
@@ -227,6 +227,7 @@ try {
     await page.mouse.move(from.x+from.width/2+8,from.y+from.height/2,{steps:4});
     await page.mouse.move(x,y,{steps:12});await page.mouse.move(x,y);await frames();
     await page.waitForFunction(()=>window.pickerFixture.state().drag.active);
+    assert.equal((await state()).drag.source.input,'pointer');
     const before=await state(),preview=[await order(0),await order(1)];
     await page.mouse.up();await page.waitForFunction(()=>!window.pickerFixture.state().drag.active);await frames();
     const after=await state();
@@ -249,11 +250,58 @@ try {
   await reset();s=await drag('b','g');assert.deepEqual(s.panes[1].ids,['f','b','g']);assert.equal(s.panes[1].shown,'b');assert.ok(!s.panes[0].ids.includes('b'));assert.ok(s.panes[0].ids.includes('choice'));
   result.checks.push('trusted cross-window drop moves exactly once, preserves chooser and shows chosen tab');
 
+  // A single crossing must paint immediately. No stationary hold and no
+  // browser dragover are needed, and the next reverse crossing is immediate.
+  await reset();
+  const aFast=await chip('a').boundingBox(),bFast=await chip('b').boundingBox();
+  await page.mouse.move(bFast.x+bFast.width/2,bFast.y+bFast.height/2);await page.mouse.down();
+  await page.mouse.move(bFast.x+bFast.width/2+8,bFast.y+bFast.height/2);await frames();
+  const fastStart=Date.now();
+  await page.mouse.move(aFast.x+2,aFast.y+aFast.height/2);await frames();
+  assert.deepEqual((await order(0)).slice(0,2),['b','a']);
+  result.samples.push({label:'single-crossing-immediate',driverMs:Date.now()-fastStart});
+  await page.mouse.move(bFast.x+bFast.width-2,bFast.y+bFast.height/2);await frames();
+  assert.deepEqual((await order(0)).slice(0,2),['a','b']);
+  await page.keyboard.press('Escape');await page.mouse.up();await frames();
+  assert.equal((await state()).drag.active,false);assert.equal(await page.locator('[data-horizontal-row-cursor-chip]').count(),0);
+  assert.deepEqual((await state()).panes[0].ids,['a','b','choice','c','d','e']);
+  result.checks.push('single pointer crossing and reverse paint within two frames without dwell; Escape clears preview');
+
+  await reset();const fromWorkflow=await chip('b').boundingBox(),nav=await page.locator('[data-space-chip="other-space"]').boundingBox();
+  await page.mouse.move(fromWorkflow.x+fromWorkflow.width/2,fromWorkflow.y+fromWorkflow.height/2);await page.mouse.down();
+  await page.mouse.move(fromWorkflow.x+fromWorkflow.width/2+8,fromWorkflow.y+fromWorkflow.height/2);await frames();
+  await page.mouse.move(nav.x+nav.width/2,nav.y+nav.height/2);await frames();
+  await page.waitForFunction(()=>window.pickerFixture.state().spaceId==='other-space');
+  assert.equal((await state()).drag.source.rootTabId,'b','source survives replacement of its header');
+  assert.equal(await page.locator('[data-horizontal-row-cursor-chip]').count(),1);
+  const otherTarget=await item('g').boundingBox();await page.mouse.move(otherTarget.x+2,otherTarget.y+otherTarget.height/2);await frames();
+  const navigationPreview=await order(0);await page.mouse.up();await frames();
+  assert.deepEqual((await state()).panes[0].ids,navigationPreview);assert.deepEqual(navigationPreview,['b','g']);
+  assert.equal((await state()).panes[0].shown,'b');assert.equal((await state()).pointer.active,false);
+  assert.equal(await page.locator('[data-horizontal-row-cursor-chip]').count(),0);
+  result.checks.push('pointer gesture survives workflow navigation/source DOM replacement and commits in exact target workflow');
+
+  await reset();await page.locator('[data-show-sidebar]').click();await frames();
+  const sidebarBox=await page.locator('[data-test-adoption] [data-tabbar-vertical]').boundingBox();
+  assert.ok(sidebarBox,'real TabBar sidebar mounted');
+  const fromSidebar=await chip('b').boundingBox();
+  await page.mouse.move(fromSidebar.x+fromSidebar.width/2,fromSidebar.y+fromSidebar.height/2);await page.mouse.down();
+  await page.mouse.move(fromSidebar.x+fromSidebar.width/2+8,fromSidebar.y+fromSidebar.height/2);await frames();
+  await page.keyboard.down('Meta');
+  const sidebarX=sidebarBox.x+sidebarBox.width/2,sidebarY=sidebarBox.y+Math.min(sidebarBox.height-15,70);
+  await page.mouse.move(sidebarX,sidebarY);await frames();await page.mouse.move(sidebarX+1,sidebarY);await frames();
+  await page.mouse.up();await page.keyboard.up('Meta');await frames();
+  await page.waitForFunction(()=>!window.pickerFixture.state().panes.some(p=>p.ids.includes('b')));
+  assert.equal((await state()).pointer.active,false);
+  assert.equal(await page.locator('[data-pane-tab-pointer-drag-preview]').count(),0);
+  assert.ok(await page.locator('[data-test-adoption] [data-tab-id="b"]').count()>0);
+  result.checks.push('same pointer gesture is adopted by actual TabBar; Cmd sidebar drop detaches placement and keeps the tab');
+
   const grouping=await page.locator('[data-strip-project-start]').evaluateAll(nodes=>nodes.every(node=>{const icon=node.querySelector('[data-strip-project-icon]'),card=node.querySelector('[data-tab-card]');const a=icon.getBoundingClientRect(),b=card.getBoundingClientRect();return a.left<b.left&&a.top>=b.top&&a.bottom<=b.bottom;}));assert.equal(grouping,true);
   await page.screenshot({path:path.join(artifact,'wrapped-dnd.png')});
   assert.deepEqual(result.errors,[]);
   result.state=await page.evaluate(()=>({violations:window.pickerFixture.violations,unknown:[...new Set(window.pickerFixture.unknown)],gestures:window.pickerFixture.gestures}));
-  assert.equal(result.state.gestures.filter(x=>x.type==='dragstart').length,4);
+  assert.equal(result.state.gestures.filter(x=>x.type==='dragstart').length,0,'pane reordering must not enter browser native drag cadence');
   assert.ok(result.state.gestures.every(x=>x.trusted),'DnD enters through trusted Chromium input');
   assert.deepEqual(result.state.violations,[]);result.pass=true;
 } catch (error) { result.failure=error.stack||String(error);process.exitCode=1; }

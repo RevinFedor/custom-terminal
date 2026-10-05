@@ -15,6 +15,7 @@ export type PaneTabDragSource = {
   sourcePaneKey?: PaneStripKey | null;
   sourceSpaceId?: string | null;
   pointerId?: number;
+  input?: 'pointer' | 'native';
 };
 
 export type PaneTabDropDebug = {
@@ -77,6 +78,7 @@ export function beginPaneTabDrag(source: PaneTabDragSource) {
   if (entries.length === 0) return;
   const sameSource = snapshot.active
     && snapshot.source?.owner === source.owner
+    && snapshot.source?.input === source.input
     && snapshot.source?.rootTabId === source.rootTabId
     && snapshot.source?.sourcePaneKey === source.sourcePaneKey
     && snapshot.source?.sourceSpaceId === source.sourceSpaceId

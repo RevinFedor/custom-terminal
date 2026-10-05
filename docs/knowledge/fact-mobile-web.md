@@ -1664,6 +1664,37 @@ Editable-last-prompt proof: для `view=history` сервер может вер
 
 Known edge 2026-06-14: если project-card loader на экране всех проектов не горит при уже активном desktop turn, но после захода в проект tab-row loader виден и после возврата project-card тоже начинает гореть, не чини Codex/Claude streaming заново. In-tab SSE уже жив; рассинхрон находится между child tab runtime/revalidation и parent `ProjectsView` aggregate/cache adoption. Симптом важен для поиска: «loader на проекте появляется только после открытия проекта».
 
+## Ожидание дочерней работы в native
+
+Фиолетовая полоса означает принадлежащую вкладке дочернюю работу/result-proof/
+source-handoff, не Claude awaiting-input и не новый provider turn. При capability
+`tabActivity.version:1` общий desktop predicate используется над тем же registry.
+`ownBusy` читает существующий Main runtime и live Send activity; reserved/preparing
+без активной попытки, audit-pending и неизвестная доставка не выдумывают own turn.
+Локальный ещё не принятый gesture остаётся локальной презентацией клиента.
+
+`/projects/:id/tabs`, `/terminal-tabs/:id/status` и `/project-activity` получают
+отдельный `tabActivity`. Scope project/tab содержит и idle-вкладки, all — полный
+active set. Только `known:true` разрешает трактовать отсутствие в all как отсутствие
+этого loader. `loaderCount` считает distinct own OR inherited, включая source без
+PTY; прежний `projects[].count` по-прежнему считает процессы. `kind:own` приоритетен
+над inherited, но оба факта остаются в строке. `turnBusy`, readiness, Stop, completion
+и квитанции не меняются. Recovery/attention остаются блокерами без ложной анимации.
+
+Ключ клиента включает origin, capability epoch, scope/project/tab и owner. Metadata
+revision упорядочен лишь внутри epoch и не является runtimeRevision. Поздний GET
+не может понизить более новую metadata; reconnect/новый epoch требует seed. Owner
+содержит conversation token/order и текущую physical launch/generation/run-привязку,
+но не даёт права вводить команды. Registry-not-ready/read failure — unknown, не ноль.
+SSE `project-activity` и `tab-activity` уже подписанных чатов получают один captured
+sample через прежний coalesced scheduler; фонового History/params/launch fanout нет.
+
+`tabActivity.processBar` — снимок прежних desktop settings с known/stale/value,
+не вторая настройка. Изменение App-поля и ответ существующего renderer bridge
+обновляют его; source окна проверяется, старый callback не стирает новую настройку.
+При потере renderer сохранённый цвет только stale. Legacy root `processBar` и его
+fallback оставлены совместимыми, но не заменяют этот proof у нового consumer.
+
 ## Project activity snapshot для native iOS badges
 
 Для нативного iPhone Terminal project list нужен не transcript и не live-канал каждой вкладки,
@@ -1677,7 +1708,8 @@ Known edge 2026-06-14: если project-card loader на экране всех �
 Snapshot намеренно полный, а не дельты `+1/-1`. iOS может потерять событие, уйти в background
 или поймать zombie-SSE; следующий full snapshot исправляет count/loader без ручного захода в
 проект. Heartbeat остаётся обычным `: hb`, reconnect на клиенте всегда делает REST seed.
-Отсутствующий project или tab в snapshot означает inactive/zero, а не «оставь старое».
+Отсутствующий project или tab в этом runtime snapshot означает inactive/zero,
+но не отсутствие отдельно опубликованной inherited activity.
 
 Строка `status` в этом payload — часть той же versioned runtime-проекции, а не самостоятельный источник правды.
 Реальный владелец состояния остаётся на Mac: жив ли процесс, готов ли Codex/Claude к вводу,

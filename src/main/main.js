@@ -642,6 +642,7 @@ const { createAgentSendActivity } = require(path.join(srcMainDir, 'agent-send-ac
 const agentSendActivity = createAgentSendActivity({
   onChanged: snapshot => {
     if (!app.isReady()) return;
+    scheduleProjectActivityBroadcast('agent-send-activity');
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
         win.webContents.send('agent:send-activity', snapshot);
@@ -8807,7 +8808,32 @@ function computeProjectActivity() {
   };
 }
 
+function readPublicTabActivityState() {
+  const own = new Map(computeProjectActivity().projects.flatMap(project => project.tabs)
+    .map(tab => [tab.tabId, tab.turnBusy === true]));
+  const pending = new Set(agentSendActivity.snapshot().pendingTabIds);
+  const rows = projectManager.db.db.prepare(
+    'SELECT tab_id, project_id, command_type, tab_type FROM tabs',
+  ).all();
+  return { known: true, tabs: rows.filter(row => row.tab_type !== 'file').map(row => {
+    const tabId = row.tab_id;
+    const currentProcess = terminals.has(tabId) && terminalCommandState.get(tabId)?.isRunning === true;
+    return { tabId, projectId: row.project_id, ownBusy: own.get(tabId) === true || pending.has(tabId),
+      owner: { conversation: conversationOwners.current(tabId),
+        lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+        terminalRunSeq: terminalCommandState.get(tabId)?.runSeq || null,
+        launchId: !currentProcess ? null : row.command_type === 'codex' ? codexLastRunCommandPayload.get(tabId)?.launchId || null
+          : row.command_type === 'claude' ? claudeLaunchGenerationByTab.get(tabId)?.generation || null : null } };
+  }) };
+}
+
+ipcMain.on('tab-activity:process-bar', (event, value) => {
+  if (!BrowserWindow.fromWebContents(event.sender) || event.sender.isDestroyed()) return;
+  require(path.join(srcMainDir, 'web-server')).observeTabActivityStyle?.(value, undefined, event.sender);
+});
+
 function scheduleProjectActivityBroadcast(reason = 'event') {
+  require(path.join(srcMainDir, 'web-server')).invalidateTabActivity?.(reason);
   if (projectActivityBroadcastTimer) return;
   projectActivityBroadcastTimer = setTimeout(() => {
     projectActivityBroadcastTimer = null;
@@ -24291,6 +24317,8 @@ app.whenReady().then(async () => {
       tabWorkContext,
       computeActiveLoaders,
       computeProjectActivity,
+      readTabActivityState: readPublicTabActivityState,
+      scheduleTabActivityBroadcast: scheduleProjectActivityBroadcast,
       readAgentTabTiming: readPublicAgentTabTiming,
       readAgentUsage: require(path.join(srcMainDir, 'public-agent-usage')).createPublicAgentUsageReader({
         getClaudeUsage: options => require(path.join(srcMainDir, 'ipc', 'claude-usage'))._api.getUsage(options),
@@ -52015,6 +52043,9 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     }
   }
   if (event === 'user_message') {
+    // This block also uses the physical offset to retire old conversation
+    // checkpoints. Initialize it before that guard; missing is not offset 0.
+    const sourceByteOffset = record.__byteOffset == null ? NaN : Number(record.__byteOffset);
     if (!suppressPublications && codexTurnWatchers.get(state.tabId) === state
       && state.processGeneration === getTerminalLifecycleGeneration(state.tabId)
       && Number.isSafeInteger(sourceByteOffset) && Number.isSafeInteger(state.processGenerationBoundaryOffset)
@@ -52081,7 +52112,6 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
         promptAuthority: 'exact-transcript',
       });
     }
-    const sourceByteOffset = Number(record.__byteOffset);
     const processBoundary = Number(state.processGenerationBoundaryOffset);
     const generation = String(state.processGeneration || '');
     const currentGeneration = getTerminalLifecycleGeneration(state.tabId);
@@ -53805,6 +53835,7 @@ async function recoverPendingCodexStableSourceFromTranscript({
   currentSessionId,
   discoveryComplete,
   descendants,
+  readOnly = false,
 } = {}) {
   if (!journal || discoveryComplete !== true || (descendants || []).length > 0) {
     return { success: false, reason: 'stable-source-preconditions-missing' };
@@ -53862,6 +53893,8 @@ async function recoverPendingCodexStableSourceFromTranscript({
     ...transcript,
   });
   if (rollbackProof.proven === true) {
+    if (readOnly) return { success: true, reason: rollbackProof.reason,
+      proof: rollbackProof, transcript, scanned };
     const resolved = projectManager.db.settlePendingCodexStableSourceHandoff({
       journalKey: key,
       projectId: journal.projectId,
@@ -53891,10 +53924,24 @@ async function recoverPendingCodexStableSourceFromTranscript({
   if (proof.proven !== true) {
     return { success: false, reason: proof.reason, proof, transcript, scanned };
   }
+  if (readOnly) return { success: true, reason: proof.reason, proof, transcript, scanned };
+  const resolved = commitCodexStableSourceTranscriptRecovery(key, journal, proof, transcript);
+  return {
+    ...resolved,
+    reason: resolved?.success === true
+      ? proof.reason
+      : (resolved?.error || 'stable-source-transcript-commit-failed'),
+    proof,
+    transcript,
+    scanned,
+  };
+}
+
+function commitCodexStableSourceTranscriptRecovery(key, journal, proof, transcript) {
   const taskStarted = transcript.sourceLifecycleEvents.find((event) => (
     Number(event.sourceLine) === Number(proof.taskStartedSourceLine)
   ));
-  const resolved = projectManager.db.resolvePendingCodexStableSourceFromTranscript({
+  return projectManager.db.resolvePendingCodexStableSourceFromTranscript({
     journalKey: key,
     projectId: journal.projectId,
     tabId: journal.tabId,
@@ -53912,15 +53959,6 @@ async function recoverPendingCodexStableSourceFromTranscript({
     userMessageAuditHash: proof.userMessageAuditHash,
     submitProof: proof.submitProof,
   });
-  return {
-    ...resolved,
-    reason: resolved?.success === true
-      ? proof.reason
-      : (resolved?.error || 'stable-source-transcript-commit-failed'),
-    proof,
-    transcript,
-    scanned,
-  };
 }
 
 async function proveCodexRecoveredRewindDescendantMatchesTarget(journal, descendantSessionId, {
@@ -54778,20 +54816,11 @@ async function buildCodexDelayedStableSourceProofContext(tabId, userCandidates) 
     let parsed;
     try {
       stat = await fs.promises.stat(candidate.filePath);
-      const sourceBoundary = audit.preSubmitBoundary;
-      const sourceStartByte = sessionId === reservation.sourceSessionId
-        && sourceBoundary?.sessionId === sessionId
-        && sourceBoundary?.filePath === candidate.filePath
-        && Number.isSafeInteger(sourceBoundary?.fileSize)
-        && sourceBoundary.fileSize >= 0
-        ? sourceBoundary.fileSize
-        : 0;
-      if (sourceStartByte > stat.size) {
-        return { active: true, proofError: 'resume_submit_source_truncated' };
-      }
+      // This loop admits children only (the source is excluded above). Its
+      // own causal user record starts in that child, not a Resume reservation.
       parsed = await codexDataModule._api.readJsonlRange(
         candidate.filePath,
-        sourceStartByte,
+        0,
         Math.max(-1, Number(stat.size) - 1),
       );
     } catch (error) {
@@ -55473,6 +55502,118 @@ function commitCodexResumedSubmitWriterBinding(tabId, owned, intent, reservation
   }
 }
 
+async function reconcileCodexNativeRewindSourceSubmit(tabId, owned, intent) {
+  const journal = readPendingCodexNativeRewindHandoff(tabId);
+  // A restored draft alone remains an incumbent, never a writer. Only the
+  // durable first-submit tuple can settle its continued source, even if the
+  // in-memory delivery audit has already completed or expired.
+  if (owned?.status !== 'incumbent-overlap-pending'
+    || intent?.sourceMode !== 'writer-handoff'
+    || !journal || journal.invalid === true || journal.version !== 2
+    || journal.phase !== 'stable-source-submit-written'
+    || journal.submitProof?.originPhase !== 'branch-draft-restored'
+    || journal.sourceSessionId !== intent.sourceSessionId
+    || journal.actionGeneration !== intent.launchId) {
+    return { success: false, reason: 'source-submit-not-current' };
+  }
+  const observer = codexWatchers.get(tabId) || null;
+  const terminal = terminals.get(tabId) || null;
+  const lifecycle = getTerminalLifecycleGeneration(tabId);
+  const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const inputRevision = getTerminalInputRevision(tabId);
+  const observationGeneration = getCodexWriterObservationGeneration(tabId);
+  const exitGeneration = getCodexExitObserverGeneration(tabId);
+  const launchPayload = codexLastRunCommandPayload.get(tabId) || null;
+  const journalIdentity = JSON.stringify(journal);
+  const physicalIdentity = (proof) => {
+    const candidates = proof?.candidates || [];
+    const candidate = candidates[0];
+    const meta = candidate?.meta || candidate?.metadata?.meta || {};
+    if (proof?.status !== 'incumbent-overlap-pending' || candidates.length !== 1
+      || meta.id !== journal.sourceSessionId
+      || candidate.filePath !== journal.submitProof.sourceFilePath
+      || path.resolve(String(meta.cwd || '')) !== path.resolve(journal.cwd)
+      || !candidate.pids?.length) return null;
+    return JSON.stringify([candidate.filePath, [...candidate.pids].sort(),
+      (candidate.fds || []).map(fd => JSON.stringify(fd)).sort()]);
+  };
+  const initialPhysicalIdentity = physicalIdentity(owned);
+  const scopeCurrent = () => !!terminal && !!initialPhysicalIdentity
+    && terminals.get(tabId) === terminal
+    && getTerminalLifecycleGeneration(tabId) === lifecycle
+    && lifecycle === journal.sourceLifecycleGeneration
+    && Number.isInteger(runSeq) && runSeq > 0
+    && Number(terminalCommandState.get(tabId)?.runSeq || 0) === runSeq
+    && Number(journal.sourceRunSeq) === runSeq
+    && Number(journal.submitProof.runSeq) === runSeq
+    && getTerminalInputRevision(tabId) === inputRevision
+    && getCodexWriterObservationGeneration(tabId) === observationGeneration
+    && isCodexExitObserverCurrent(tabId, exitGeneration, runSeq)
+    && (codexLastRunCommandPayload.get(tabId) || null) === launchPayload
+    && codexSessionDiscoveryIntents.get(tabId) === intent
+    && codexWatchers.get(tabId) === observer
+    && observer?.handoffTerminalToken === terminal
+    && observer?.sourceTerminalToken === terminal
+    && observer?.sourceLifecycleGeneration === lifecycle
+    && Number(observer?.handoffRunSeq) === runSeq
+    && observer?.launchId === journal.actionGeneration
+    && terminalProjectIds.get(tabId) === journal.projectId
+    && terminalProjects.get(tabId) === journal.cwd
+    && codexSessionIdFromDb(tabId, journal.projectId) === journal.sourceSessionId
+    && JSON.stringify(readPendingCodexNativeRewindHandoff(tabId)) === journalIdentity;
+  if (!scopeCurrent()) return { success: false, reason: 'source-submit-scope-changed' };
+  const sourceStat = await fs.promises.stat(journal.submitProof.sourceFilePath);
+  if (!scopeCurrent()) return { success: false, reason: 'source-submit-scope-changed' };
+  const descendants = await codexDataModule._api.inspectCodexDescendantSessions({
+    sourceSessionId: journal.sourceSessionId, cwd: journal.cwd,
+    sinceMs: journal.actionStartedAtMs,
+    untilMs: Number(journal.actionStartedAtMs) + CODEX_NATIVE_REWIND_CHILD_WINDOW_MS,
+  });
+  if (!scopeCurrent() || descendants?.complete !== true || descendants.descendants?.length) {
+    return { success: false, reason: 'source-submit-descendants-unresolved' };
+  }
+  const recovery = await recoverPendingCodexStableSourceFromTranscript({
+    journal, currentSessionId: journal.sourceSessionId,
+    discoveryComplete: true, descendants: [], readOnly: true,
+  });
+  if (!scopeCurrent() || recovery?.success !== true
+    || recovery.proof?.reason !== 'stable-source-exact-submit-task-and-user-message') {
+    return { success: false, reason: recovery?.reason || 'source-submit-proof-missing' };
+  }
+  // Revalidate physical ownership after all async disk reads. The original
+  // source descriptor or a saved SID cannot stand in for this fresh pass.
+  const revalidated = await inspectCodexOwnedWriter(tabId, intent, { forceFreshProcessSnapshot: true });
+  const currentStat = await fs.promises.stat(journal.submitProof.sourceFilePath);
+  const sameSourceFile = stat => stat.dev === sourceStat.dev && stat.ino === sourceStat.ino
+    && stat.size >= sourceStat.size
+    && (stat.size > sourceStat.size
+      || (stat.mtimeMs === sourceStat.mtimeMs && stat.ctimeMs === sourceStat.ctimeMs));
+  if (!scopeCurrent() || !sameSourceFile(currentStat) || physicalIdentity(revalidated) !== initialPhysicalIdentity) {
+    return { success: false, reason: 'source-submit-physical-owner-changed' };
+  }
+  return runKeyedExclusive(codexWriterSessionInflight, journal.sourceSessionId, () => {
+    // A queued cross-tab lock is another async boundary. O(stat) is permitted
+    // here; no source body is synchronously read between this guard and CAS.
+    if (!scopeCurrent() || getCodexSessionOwner(journal.sourceSessionId, tabId)
+      || !sameSourceFile(fs.statSync(journal.submitProof.sourceFilePath))) {
+      return { success: false, reason: 'source-submit-final-owner-changed' };
+    }
+    const committed = commitCodexStableSourceTranscriptRecovery(
+      codexNativeRewindHandoffJournalKey(tabId), journal, recovery.proof, recovery.transcript,
+    );
+    if (committed?.success !== true) return committed;
+    closeCodexDelayedWriterObserver(tabId, 'source-submit-confirmed');
+    closeCodexWatcher(tabId, 'source-submit-confirmed');
+    console.log('[CodexWriterHandoff] continued source submit reconciled tab=' + String(tabId).slice(-12)
+      + ' source=' + journal.sourceSessionId.slice(0, 8)
+      + ' generation=' + journal.actionGeneration
+      + ' taskLine=' + recovery.proof.taskStartedSourceLine
+      + ' userLine=' + recovery.proof.userMessageSourceLine
+      + ' proof=' + recovery.proof.reason + ' rollbackClaimed=false');
+    return committed;
+  });
+}
+
 async function reconcileCodexWriterFromProcessInner(tabId, {
   reason = 'process-open-rollout',
   sender = null,
@@ -55554,6 +55695,31 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
   if (postInspectionScope.status !== 'current') {
     return staleObservationResult(postInspectionScope, owned);
   }
+  if (owned.status === 'incumbent-overlap-pending') {
+    let sourceSubmit;
+    try {
+      sourceSubmit = await reconcileCodexNativeRewindSourceSubmit(tabId, owned, intentAtStart);
+    } catch (error) {
+      // Optional proof I/O must not turn a guarded pending writer into a
+      // thrown public read, or discard its original written-action journal.
+      sourceSubmit = { success: false, reason: 'source-submit-read-failed' };
+      console.warn('[CodexWriterHandoff] continued source proof read failed tab=' + String(tabId).slice(-12)
+        + ' generation=' + String(intentAtStart?.launchId || '-')
+        + ' error=' + (error?.message || String(error)));
+    }
+    if (!exitObserverCurrent()) return staleExitObserverResult(owned);
+    if (sourceSubmit?.success === true) {
+      // The exact journal is settled, not a guessed child. Re-enter the same
+      // normal physical writer/binding/publication path with the resolved
+      // discovery removed. This never sends keys, resumes, or replays a prompt.
+      return reconcileCodexWriterFromProcessInner(tabId, {
+        reason: 'native-rewind-source-submit-confirmed', sender,
+        expectedExitObserverGeneration: lifecycleGeneration,
+        expectedExitObserverRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      });
+    }
+    owned = { ...owned, sourceSubmitReason: sourceSubmit?.reason || sourceSubmit?.error || null };
+  }
   if (owned.status !== 'owned') {
     syncCodexDelayedWriterCandidateWatchers(tabId, owned);
     if (owned.preserveWriterProof !== true) {
@@ -55565,7 +55731,8 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
       console.log('[CodexDelayedWriter] preserving stable source while awaiting exact audit'
         + ' tab=' + String(tabId).slice(-12)
         + ' status=' + (owned.status || 'unknown')
-        + ' reason=' + (owned.reason || owned.error || '-'));
+        + ' reason=' + (owned.reason || owned.error || '-')
+        + (owned.sourceSubmitReason ? ' sourceSubmit=' + owned.sourceSubmitReason : ''));
     }
     return owned;
   }

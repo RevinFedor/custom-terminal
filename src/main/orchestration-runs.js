@@ -789,8 +789,10 @@ function publicRun(run) {
 }
 
 class OrchestrationRunStore {
-  constructor(filePath) {
+  constructor(filePath, { onActivityChanged = () => {} } = {}) {
     this.filePath = filePath;
+    this.onActivityChanged = onActivityChanged;
+    this.activityReadError = null;
     this.runs = new Map();
     this.createdTargetTabIds = new Set();
     this.targetActivityByTab = new Map();
@@ -868,10 +870,12 @@ class OrchestrationRunStore {
         if (migrationNeeded) this._schedulePersist();
       } catch (error) {
         if (error?.code !== 'ENOENT') {
+          this.activityReadError = 'orchestration-load-failed';
           console.warn('[OrchestrationRuns] load failed:', error?.message || error);
         }
       }
       this.initialized = true;
+      this._notifyActivityChanged();
     })();
     return this.initializePromise;
   }
@@ -944,6 +948,7 @@ class OrchestrationRunStore {
         await this.persistStrict();
       } catch (error) {
         this.runs.delete(run.runId);
+        this._notifyActivityChanged();
         if (input.targetCreated === true
           && !Array.from(this.runs.values()).some((candidate) => (
             candidate.targetTabId === input.targetTabId
@@ -2885,6 +2890,15 @@ class OrchestrationRunStore {
       .map(publicRun);
   }
 
+  // Uses the initialized registry; a metadata GET never initializes/migrates it.
+  readInheritedActivity() {
+    if (!this.initialized || this.activityReadError) return { known: false,
+      reason: this.activityReadError || 'orchestration-not-ready', sourceTabIds: [] };
+    const { isOrchestrationInheritedActivity } = require('../shared/orchestration-activity.cjs');
+    return { known: true, sourceTabIds: [...new Set([...this.runs.values()]
+      .filter(isOrchestrationInheritedActivity).map(run => run.sourceTabId))] };
+  }
+
   async listAll() {
     await this.initialize();
     return Array.from(this.runs.values())
@@ -3244,8 +3258,15 @@ class OrchestrationRunStore {
     void this._enqueuePersist(false);
   }
 
+  _notifyActivityChanged() {
+    try { this.onActivityChanged(); } catch (error) {
+      console.warn('[OrchestrationRuns] activity observer failed:', error?.message || error);
+    }
+  }
+
   _enqueuePersist(strict) {
     this._pruneInMemory();
+    this._notifyActivityChanged();
     const snapshot = JSON.stringify({
       version: 4,
       settings: this.settings,

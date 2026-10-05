@@ -6,12 +6,15 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { build } from 'esbuild';
 import { _electron as electron } from 'playwright';
 
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const artifactRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-tab-message-ui-'));
 const results = [];
+const require = createRequire(import.meta.url);
 after(async () => {
   await fs.writeFile(path.join(artifactRoot, 'result.json'), JSON.stringify({
     pass: results.length === 2 && results.every(result => result.pass), results,
@@ -33,6 +36,25 @@ for (const width of [900, 350]) test(`isolated tracker, History hash/envelope gu
     for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name), { recursive: true, filter: p => !p.includes('/node_modules') });
     await fs.mkdir(path.join(snapshot, 'scripts/fixtures'), { recursive: true });
     await fs.copyFile(path.join(repo, 'scripts/fixtures/tab-message-ui.tsx'), path.join(snapshot, 'scripts/fixtures/tab-message-ui.tsx'));
+    await fs.copyFile(path.join(repo, 'scripts/fixtures/codex-service-presentation.cjs'), path.join(snapshot, 'scripts/fixtures/codex-service-presentation.cjs'));
+    const { makeServiceFixture, memoryPresentationStore } = require(path.join(snapshot, 'scripts/fixtures/codex-service-presentation.cjs'));
+    const service = makeServiceFixture(memoryPresentationStore());
+    const longBody = service.body + '\n' + 'Long answer paragraph. Details remain available after expanding.\n\n'.repeat(320)
+      + '\nFULL ANSWER END';
+    const longServices = [
+      { name: 'browser', fixture: makeServiceFixture(memoryPresentationStore(), { sessionId: 'long-browser', body: longBody }) },
+      { name: 'native', fixture: makeServiceFixture(memoryPresentationStore(), { sessionId: 'long-native', runKind: 'agent', body: longBody }) },
+      { name: 'reply', fixture: makeServiceFixture(memoryPresentationStore(), { sessionId: 'long-reply', kind: 'tab-message', phase: 'reply', body: longBody }) },
+      { name: 'mixed', fixture: makeServiceFixture(memoryPresentationStore(), { sessionId: 'long-mixed',
+        body: 'Start of answer.\n\n<saved_prompt name="Attached scope">\nScope body\n</saved_prompt>\n\n' + longBody }) },
+      { name: 'ordinary', fixture: { content: longBody,
+        entries: [{ uuid: 'long-ordinary', role: 'user', content: longBody }] } },
+    ];
+    await fs.writeFile(path.join(artifact, 'service-projection.json'), JSON.stringify(service.entries, null, 2));
+    await fs.writeFile(path.join(artifact, 'source-hashes.json'), JSON.stringify(Object.fromEntries(await Promise.all([
+      'src/main/ipc/codex-data.js', 'src/main/history-prompt-presentations.js',
+      'src/renderer/utils/historyOrchestrationPromptPresentation.mjs', 'src/renderer/components/Workspace/HistoryPanel.tsx',
+    ].map(async file => [file, createHash('sha256').update(await fs.readFile(path.join(snapshot, file))).digest('hex')]))), null, 2));
     await build({ entryPoints: [path.join(snapshot, 'scripts/fixtures/tab-message-ui.tsx')], bundle: true, outfile: path.join(artifact, 'bundle.js'), platform: 'browser', format: 'iife', target: 'chrome120', jsx: 'automatic', logLevel: 'silent',
       define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env': '{"DEV":false,"MODE":"test"}' },
       alias: { '@noted/claude-blocks': path.join(snapshot, 'packages/claude-blocks/src'), '@noted/structured-dnd': path.join(shared, 'structured-dnd/src'), '@noted/file-explorer': path.join(shared, 'file-explorer/src'), react: path.join(repo, 'node_modules/react'), 'react-dom': path.join(repo, 'node_modules/react-dom') },
@@ -202,6 +224,68 @@ for (const width of [900, 350]) test(`isolated tracker, History hash/envelope gu
     assert.equal(await history.locator('[data-tab-message-source]').count(), 0);
     assert.equal(await history.locator('table').count(), 1);
     await page.screenshot({ path: path.join(artifact, 'external-completion.png') });
+    await page.evaluate(entry => { window.fixture.history = entry; window.fixture.render(); }, service.entries[0]);
+    await history.getByText('ChatGPT - Astra', { exact: true }).waitFor();
+    const serviceBubble = history.locator('.cb-user-bubble');
+    assert.equal(await serviceBubble.evaluate(node => getComputedStyle(node).backgroundColor), 'rgba(124, 58, 237, 0.08)');
+    assert.equal(await serviceBubble.evaluate(node => getComputedStyle(node).borderTopColor), 'rgba(167, 139, 250, 0.2)');
+    assert.equal(await history.locator('table').count(), 1);
+    assert.equal(await history.locator('.cb-code-block').count(), 1);
+    assert.equal((await history.innerText()).includes('[orchestration-result'), false);
+    assert.equal(await history.locator('[data-tab-message-source]').count(), 0, 'browser executor is not a fake native tab');
+    await history.getByRole('button', { name: 'Copy prompt', exact: true }).click({ force: true });
+    assert.equal(await page.evaluate(() => window.fixture.copies.at(-1)), service.content);
+    await history.getByRole('button', { name: 'Rewrite saved history to prompt', exact: true }).click({ force: true });
+    assert.equal(await page.evaluate(() => window.fixture.rewinds.at(-1)), service.content);
+    await page.screenshot({ path: path.join(artifact, 'canonical-astra-completion.png') });
+    await page.evaluate(entry => { window.fixture.history = { ...entry, uuid: 'ordinary-quote', semanticTags: undefined }; window.fixture.render(); }, service.entries[0]);
+    await page.waitForFunction(() => !document.querySelector('[data-history-fixture] .hp-history-user-bubble--orchestration'));
+    assert.notEqual(await serviceBubble.evaluate(node => getComputedStyle(node).backgroundColor), 'rgba(124, 58, 237, 0.08)');
+    assert.ok((await history.innerText()).includes('[orchestration-result'), 'a literal quote must retain its full text');
+    for (const { name, fixture: long } of longServices) {
+      await page.evaluate(entry => { window.fixture.history = entry; window.fixture.render(); }, long.entries[0]);
+      const expand = history.getByRole('button', { name: /^Раскрыть полностью/ });
+      await expand.waitFor();
+      assert.equal(await expand.count(), 1, name + ': one collapsed message toggle');
+      assert.equal(await history.locator('.cb-collapse-top').count(), 0);
+      assert.equal((await history.innerText()).includes('FULL ANSWER END'), false, name + ': full answer leaked into collapsed view');
+      assert.equal((await history.innerText()).includes('[orchestration-result'), false);
+      const collapsedHeight = await serviceBubble.evaluate(node => node.getBoundingClientRect().height);
+      assert.equal(await history.locator('.cb-prose').count(), 0, name + ': collapsed view must share the ordinary text preview');
+      const previewText = (await history.locator('.cb-msg-text').allTextContents()).join('');
+      assert.ok(previewText.length < 500, name + ': preview exceeds the shared 400-character budget');
+      if (name === 'mixed') assert.equal(await history.getByText('Attached scope', { exact: true }).count(), 1);
+      await history.getByRole('button', { name: 'Copy prompt', exact: true }).click({ force: true });
+      const copied = await page.evaluate(() => window.fixture.copies.at(-1));
+      if (name === 'mixed') {
+        assert.ok(copied.includes(longBody), 'Copy retains the complete answer beside the restored prompt attachment');
+        assert.ok(copied.includes('Scope body'), 'Copy retains the full attached scope');
+      } else assert.ok(copied === long.content, name + ': Copy lost the hidden tail');
+      await page.screenshot({ path: path.join(artifact, 'long-' + name + '-collapsed.png') });
+      for (const position of ['top', 'bottom']) {
+        await expand.click();
+        await history.getByText(/FULL ANSWER END/).waitFor();
+        assert.equal(await history.getByRole('button', { name: 'Свернуть', exact: true }).count(), 2);
+        if (name !== 'ordinary') {
+          assert.equal(await history.locator('table').count(), 1, name + ': expanded Markdown table missing');
+          assert.equal(await history.locator('.cb-code-block').count(), 1, name + ': expanded Markdown code missing');
+        }
+        assert.ok(await serviceBubble.evaluate(node => node.getBoundingClientRect().height) > collapsedHeight * 3);
+        assert.equal((await history.innerText()).includes('[orchestration-result'), false);
+        await history.locator('.cb-collapse-' + position).getByRole('button', { name: 'Свернуть', exact: true }).click();
+        await expand.waitFor();
+        assert.equal((await history.innerText()).includes('FULL ANSWER END'), false);
+        assert.ok(Math.abs(await serviceBubble.evaluate(node => node.getBoundingClientRect().height) - collapsedHeight) < 2,
+          name + ': collapse did not return to preview geometry');
+      }
+      await history.getByRole('button', { name: 'Rewrite saved history to prompt', exact: true }).click({ force: true });
+      assert.ok(await page.evaluate(() => window.fixture.rewinds.at(-1)) === long.content, name + ': Rewind lost the hidden tail');
+      await page.evaluate(() => { window.fixture.forceExpanded = true; window.fixture.render(); });
+      await history.getByText(/FULL ANSWER END/).waitFor();
+      assert.equal(await history.locator('.cb-collapse-btn').count(), 0, name + ': full-text search view exposes collapse controls');
+      await page.evaluate(() => { window.fixture.forceExpanded = false; window.fixture.render(); });
+      await expand.waitFor();
+    }
     await page.evaluate(() => { window.fixture.history = window.fixture.originalHistory; window.fixture.render(); });
     for (const kind of ['tab-message', 'orchestration']) {
       for (const transform of ['body-tabs', 'body-crlf', 'prefix-shift', 'same-length-body', 'same-length-prefix', 'saved-envelope-mismatch', 'missing-hash']) {
@@ -273,7 +357,7 @@ for (const width of [900, 350]) test(`isolated tracker, History hash/envelope gu
     assert.deepEqual(errors, []);
     console.log('Tab message isolated screenshots:', artifact);
     results.push({ width, pass: true, artifact });
-    await fs.writeFile(path.join(artifact, 'result.json'), JSON.stringify({ pass: true, artifact, errors, checks: ['message-only root', 'event before list', 'lazy bounded selected get', 'question and failed reverse reply', 'Markdown table/code', 'exact body copy', 'stored source navigation', 'exact ID follows moved project/color while stored label/provenance survives and same-name decoy is ignored', 'deferred context chip', 'envelope stripped', 'raw transport Copy/Rewind', 'canonical TAB/CRLF and same-length prefix shift preserve full text for both tag types', 'full UTF-8 SHA256 refuses equal-length body/prefix edits with unchanged header and UUID', 'late selected get', 'ISO tie', '350/900 viewport', 'Escape/outside/retry', 'tab ownership cleanup', 'no live mutations'] }, null, 2));
+    await fs.writeFile(path.join(artifact, 'result.json'), JSON.stringify({ pass: true, artifact, errors, checks: ['message-only root', 'event before list', 'lazy bounded selected get', 'question and failed reverse reply', 'Markdown table/code', 'exact body copy', 'stored source navigation', 'exact ID follows moved project/color while stored label/provenance survives and same-name decoy is ignored', 'deferred context chip', 'envelope stripped', 'raw transport Copy/Rewind', 'actual Codex response/event promotion retains the service tag, computed purple background/border and body-only Markdown', 'literal orchestration quote stays ordinary and complete', 'canonical TAB/CRLF and same-length prefix shift preserve full text for both tag types', 'full UTF-8 SHA256 refuses equal-length body/prefix edits with unchanged header and UUID', 'late selected get', 'ISO tie', '350/900 viewport', 'Escape/outside/retry', 'tab ownership cleanup', 'no live mutations'] }, null, 2));
   } catch (error) {
     if (app) await app.firstWindow().then(page => page.screenshot({ path: path.join(artifact, 'failure.png') })).catch(() => {});
     console.log('Failed isolated renderer artifact:', artifact);
@@ -282,6 +366,21 @@ for (const width of [900, 350]) test(`isolated tracker, History hash/envelope gu
     await fs.writeFile(path.join(artifact, 'result.json'), JSON.stringify(failure, null, 2));
     throw error;
   } finally {
-    if (app) await app.close();
+    try { if (app) await app.close(); }
+    finally {
+      const cleanup = { removed: [], errors: [] };
+      try {
+        if (await fs.stat(path.join(snapshot, '.git')).catch(() => null)) {
+          execFileSync('git', ['worktree', 'remove', '--force', snapshot], { cwd: repo, stdio: 'pipe' });
+          cleanup.removed.push('source');
+        }
+      } catch (error) { cleanup.errors.push(String(error)); }
+      for (const name of ['noted-shared', 'user-data', 'bundle.js', 'bundle.css', 'globals.css', 'index.html', 'main.cjs']) {
+        try { await fs.rm(path.join(artifact, name), { recursive: true, force: true }); cleanup.removed.push(name); }
+        catch (error) { cleanup.errors.push(String(error)); }
+      }
+      await fs.writeFile(path.join(artifact, 'cleanup.json'), JSON.stringify(cleanup, null, 2));
+      assert.deepEqual(cleanup.errors, [], 'private test cleanup failed');
+    }
   }
 });

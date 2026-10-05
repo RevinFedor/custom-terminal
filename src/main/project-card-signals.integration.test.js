@@ -68,6 +68,7 @@ async function harness(t) {
   let bridgeHook = null;
   const webCtx = vm.createContext({
     projectManager: { db: manager }, projectCardSignals: cards,
+    publicTabActivity: null, observeTabActivityStyle: () => {}, tabActivityProjection: () => ({}),
     console: ctx.console, Map, Date, JSON,
     decId: decodeURIComponent, sdkSessions: new Map(),
     bridgeRequest: async action => {

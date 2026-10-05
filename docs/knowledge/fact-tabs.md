@@ -423,8 +423,10 @@ Legacy native transport не считается завершённым по пе
 при переносе между проектами владельцем становится projected source-row.
 Cmd меняет назначение переноса, сохраняя этот cursor-owner. Физический release
 снимает курсор сразу, даже если сохранение ещё ждёт ACK. Блокировка hover-анимаций
-остаётся статическим правилом только для tab/group chips; native HTML drag
-сохраняет собственный transport без добавочного pointer capture.
+остаётся статическим правилом только для tab/group chips; legacy native HTML drag
+сохраняет собственный transport без добавочного pointer capture. Оконная шапка
+05.10 перешла на непрерывный pointer-жест, чтобы reorder не ждал редких `dragover`;
+её active source переживает замену DOM и передаётся тому же sidebar-outline.
 Логи `[TabDnd:cursor]` показывают acquisition/cleanup без geometry-read.
 Контроль с actual outline и host hooks — `scripts/tab-gesture-cursor-regression.mjs`;
 это изолированный Electron, installed acceptance отмечается отдельно в рабочем tmp.

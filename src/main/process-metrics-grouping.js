@@ -117,6 +117,11 @@ const SHELL_WRAPPER_PATTERNS = [
 ];
 
 function isShellWrapper(item) {
+  // Явно запущенный shell-скрипт — задача со своим поддеревом. `sh -c …`
+  // остаётся прозрачной обёрткой: настоящая команда будет её потомком.
+  const command = item.commandLine || '';
+  const directScript = /^\s*(?:\S*\/)?-?(?:zsh|bash|sh|dash|fish)\s+(?:-[A-Za-z]+\s+)*(?:--\s+)?(?:"[^"]+\.sh"|'[^']+\.sh'|\S+\.sh)(?:\s|$)/.test(command);
+  if (directScript && !/(?:^|\s)-[A-Za-z]*c(?:\s|$)/.test(command)) return false;
   return matchesAny(SHELL_WRAPPER_PATTERNS, item.commandLine)
     || matchesAny(SHELL_WRAPPER_PATTERNS, item.execPath)
     || matchesAny(SHELL_WRAPPER_PATTERNS, item.name);
@@ -145,7 +150,7 @@ function describeCommand(item) {
 
   // Расширение — часть пользовательского смысла: `main` выглядит как
   // безымянный системный процесс, а `main.js` сразу читается как скрипт.
-  const script = source.match(/([^\\/\s]+\.(?:mjs|cjs|js|ts))(?:\s|$)/);
+  const script = source.match(/([^\\/\s]+\.(?:mjs|cjs|js|ts|sh))(?:\s|$)/);
   if (script) return script[1];
 
   // `node /…/node_modules/.bin/vite` — бинарь без расширения: именем служит
@@ -268,6 +273,10 @@ function groupProcessMetrics({
         agentBytes: 0,
         commands: [],
         commandBytes: 0,
+        commandTotalBytes: 0,
+        commandTotalCpu: null,
+        smallCommandBytes: 0,
+        smallCommandCpu: null,
         toolsBytes: 0,
         totalBytes: 0,
         selfCpu: null,
@@ -297,6 +306,10 @@ function groupProcessMetrics({
         agentBytes: 0,
         commands: [],
         commandBytes: 0,
+        commandTotalBytes: 0,
+        commandTotalCpu: null,
+        smallCommandBytes: 0,
+        smallCommandCpu: null,
         toolsBytes: 0,
         totalBytes: 0,
         selfCpu: null,
@@ -401,9 +414,13 @@ function groupProcessMetrics({
     // Команда легче порога не заслуживает строки: короткоживущие git/ps на
     // пару мегабайт мерцали бы в списке. Их вес уходит в «прочее».
     const commandRows = [];
+    const commandItems = [];
+    const smallCommandItems = [];
     for (const bucket of commandBuckets) {
+      commandItems.push(...bucket.items);
       const bytes = sumFootprint(bucket.items);
       if (bytes < MIN_COMMAND_ROW_BYTES) {
+        smallCommandItems.push(...bucket.items);
         helpers.push(...bucket.items);
         continue;
       }
@@ -417,6 +434,11 @@ function groupProcessMetrics({
     }
     commandRows.sort((a, b) => b.bytes - a.bytes);
     const commandBytes = commandRows.reduce((total, row) => total + row.bytes, 0);
+    // Порог скрывает строку, но не расход команды. Отдельный итог включает
+    // маленькие команды; прежние commandBytes/otherBytes сохраняют свою
+    // раскладку, чтобы общий totalBytes не посчитал их дважды.
+    const commandTotalBytes = sumFootprint(commandItems);
+    const smallCommandBytes = sumFootprint(smallCommandItems);
 
     const selfBytes = rootProcess.footprintBytes || 0;
     const toolsOnlyBytes = toolRows.reduce((total, row) => total + row.bytes, 0);
@@ -439,6 +461,10 @@ function groupProcessMetrics({
       agentBytes,
       commands: commandRows,
       commandBytes,
+      commandTotalBytes,
+      commandTotalCpu: cpuByPid && commandItems.length === 0 ? 0 : sumCpu(commandItems, cpuByPid),
+      smallCommandBytes,
+      smallCommandCpu: cpuByPid && smallCommandItems.length === 0 ? 0 : sumCpu(smallCommandItems, cpuByPid),
       toolsBytes: toolsOnlyBytes + agentBytes + commandBytes + helpersBytes,
       totalBytes: selfBytes + toolsOnlyBytes + agentBytes + commandBytes + helpersBytes,
       selfCpu,
@@ -530,9 +556,15 @@ function groupProcessMetrics({
     totals: (() => {
       const projectBytes = projectTabs.reduce((total, group) => total + group.totalBytes, 0);
       const otherBytes = otherTabs.reduce((total, group) => total + group.totalBytes, 0);
+      const commandGroups = tabGroups.filter(group => group.commandTotalBytes > 0);
       return {
         projectBytes,
         otherBytes,
+        commandBytes: tabGroups.reduce((total, group) => total + group.commandTotalBytes, 0),
+        commandCpu: !cpuByPid ? null : commandGroups.length === 0 ? 0
+          : commandGroups.some(group => group.commandTotalCpu !== null)
+            ? commandGroups.reduce((total, group) => total + (group.commandTotalCpu || 0), 0)
+            : null,
         // Итог считается ЗДЕСЬ, а не складывается заново у каждого потребителя.
         // Чип в шапке и подпись внизу панели показывают одно и то же число, и
         // две копии формулы разъезжаются на первом же новом слагаемом.

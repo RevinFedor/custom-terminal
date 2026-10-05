@@ -434,6 +434,27 @@ SC Desktop не доказывает отправку в браузере, да�
 оранжевым перед подтверждением. Это атрибуция, а не новая граница ответа:
 очередь, группировка итераций и response timing не меняются.
 
+Codex response-first пара может подтвердиться по `response_item` раньше, чем
+History выберет canonical `event_msg` с другим UUID и timestamp. При promotion
+сохраняются не только sourceIdentity aliases, но и прежняя пара
+`promptPresentationAuditTimestamp + promptPresentationTransportHash`: через неё
+reader находит уже сохранённый presentation sidecar. Alias добавляется ПОСЛЕ
+смены primary identity, иначе helper считает его текущим primary и пропускает.
+Шрам05.10, Astra completion8b438bdd в367: receipt24241/.763, History24242/.764,
+один transport hash; пропущенный alias оставлял оранжевый bubble и raw
+`orchestration-result`, хотя Timeline был фиолетовым. Исправляется reducer,
+не CSS и не External Research skill. Existing sidecar читается без переписывания
+receipt/разговора; renderer снова получает тот же trusted tag и проверяет полный
+body hash перед скрытием оболочки. Литеральная цитата не становится оркестрацией.
+
+Фиолетовый user-message использует те же правила collapse, что обычный:
+HistoryCollapsiblePrompt для текста и общий mixed-message toggle для вставок.
+Markdown не обходит порог600/preview400; в закрытом состоянии обычное текстовое
+preview, при раскрытии полный Markdown с верхним и нижним «Свернуть».
+forceExpanded для поиска сохраняет полный ответ без toggles. Это только
+видимая проекция: скрытый хвост остаётся доступен Copy/Rewind. Неподтверждённый
+body hash по-прежнему показывает исходный transport через обычный collapse.
+
 ## Проекция в Timeline
 
 Сообщение оркестрации распознаётся не по редактируемой строке `[Оркестрация]`, а по app-owned semantic tag в `history_prompt_presentations`. Tag сохраняется только после post-Enter audit рядом с точной durable identity пользовательской записи; Claude/Codex JSONL остаётся неизменным. Тот же sidecar переносит tag в доказанный Codex child при Resume/Fork вместе с presentation metadata.

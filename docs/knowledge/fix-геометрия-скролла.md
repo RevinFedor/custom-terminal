@@ -64,6 +64,14 @@ hydration-centre после quiet; уже показанная full-row удер
 окне только при exact physical revision proof и не деградирует обратно в stub.
 Перед React apply mid-list reader вооружает смысловой якорь до DOM mutation.
 
+Первое измерение ранее невидимой длинной карточки имеет отдельную границу:
+Virtuoso уже компенсировал высоту native scrollBy, но browser scroll event ещё
+не пришёл. После measurement batch helper публикует актуальный viewport до
+paint, без второго scroll-write; при неизменном scrollTop события нет. Owner/
+generation/visit/scroller и чужая geometry-транзакция проверяются повторно.
+Это не wheel-intent, не height-freeze и не новый reader. Причина пустого кадра
+и отвергнутые варианты — fact-история-производительность::Первое измерение длинной строки.
+
 Seek требует измеренного движения **и** объясняющего его ввода: для wheel
 направление должно совпасть, а величина ограничена свежим неиспользованным
 вводом. Это закрывает как противоположную коррекцию, так и shrink в направлении

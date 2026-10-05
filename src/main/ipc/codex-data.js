@@ -420,9 +420,11 @@ function promoteCodexPromptPresentationAuditIdentity(entry, record, text) {
         transportHash: entry.promptPresentationTransportHash,
       }
     : null;
-  if (previous) addCodexPromptPresentationAuditAlias(entry, previous);
   entry.promptPresentationAuditTimestamp = next.auditTimestamp;
   entry.promptPresentationTransportHash = next.transportHash;
+  // The alias helper skips the current primary identity. Promote first so
+  // the earlier audited carrier survives as an alias of the canonical event.
+  if (previous) addCodexPromptPresentationAuditAlias(entry, previous);
   if (Array.isArray(entry.promptPresentationAuditAliases)) {
     entry.promptPresentationAuditAliases = entry.promptPresentationAuditAliases.filter((candidate) => !(
       candidate.auditTimestamp === next.auditTimestamp

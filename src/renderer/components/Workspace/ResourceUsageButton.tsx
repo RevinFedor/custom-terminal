@@ -6,6 +6,8 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { CUSTOM_ICONS } from '../../assets/icons/registry';
 import { historyPreparationStatus, historyPreparationLabel } from '../../utils/historyPreparationStatus.mjs';
+import { useCmdKey } from '../../hooks/useCmdHoverPopover';
+import { findTabPlacement, placementWorldFromState } from '../../utils/tabPlacementResolver.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -40,6 +42,10 @@ type TabGroup = {
   agentBytes?: number;
   commands?: ToolRow[];
   commandBytes?: number;
+  commandTotalBytes?: number;
+  commandTotalCpu?: number | null;
+  smallCommandBytes?: number;
+  smallCommandCpu?: number | null;
   toolsBytes: number;
   totalBytes: number;
   selfCpu: number | null;
@@ -61,7 +67,7 @@ type MetricsPayload = {
   app?: { totalBytes: number; totalCpu: number | null; rows: ToolRow[] };
   orphans?: { count: number; totalBytes: number; rows: ToolRow[] };
   sharedServices?: ToolRow[];
-  totals?: { projectBytes: number; otherBytes: number; allBytes?: number };
+  totals?: { projectBytes: number; otherBytes: number; allBytes?: number; commandBytes?: number; commandCpu?: number | null };
 };
 
 /** Итог для чипа: то же число, что в подписи панели, но без разбора по строкам. */
@@ -70,6 +76,7 @@ type AmbientPayload = {
   reason?: string;
   scannedAt?: number | null;
   totalBytes?: number;
+  commandBytes?: number | null;
   orphanCount?: number;
 };
 
@@ -147,6 +154,18 @@ function tabLabel(group: TabGroup, storeTitle?: string): string {
   return 'вкладка ' + group.pid;
 }
 
+function commandTotals(groups: TabGroup[], hasCpu: boolean) {
+  // Старый main не сообщает полный итог команд: отсутствие поля не равно 0.
+  if (groups.some(group => typeof group.commandTotalBytes !== 'number')) return { bytes: null, cpu: null };
+  const bytes = groups.reduce((sum, group) => sum + group.commandTotalBytes!, 0);
+  const active = groups.filter(group => group.commandTotalBytes! > 0);
+  const cpu = !hasCpu ? null : active.length === 0 ? 0
+    : active.some(group => typeof group.commandTotalCpu === 'number')
+      ? active.reduce((sum, group) => sum + (group.commandTotalCpu || 0), 0)
+      : null;
+  return { bytes, cpu };
+}
+
 const ResourceUsageButton: React.FC = () => {
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<Mode>('memory');
@@ -154,6 +173,7 @@ const ResourceUsageButton: React.FC = () => {
   const [ambient, setAmbient] = useState<AmbientPayload | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [killing, setKilling] = useState(false);
+  const cmdPressed = useCmdKey();
   const buttonRef = useRef<HTMLButtonElement>(null);
   const preparationStore = historyPreparationStatus();
   const preparation = useSyncExternalStore(preparationStore.subscribe, preparationStore.getActivitySnapshot);
@@ -232,7 +252,7 @@ const ResourceUsageButton: React.FC = () => {
   // только вместе с панелью, поэтому у закрытой кнопки стоял прочерк — цифра
   // появлялась лишь тогда, когда её уже и так открыли посмотреть.
   //
-  // Здесь приходит только итог (~75 байт против 5+ КБ полной раскладки), шаг —
+  // Здесь приходят только общий итог и итог команд, без строк процессов; шаг —
   // 5 с. Замер в main общий с панелью: когда она открыта, её быстрый тик
   // кормит и этот канал тоже.
   useEffect(() => {
@@ -284,6 +304,21 @@ const ResourceUsageButton: React.FC = () => {
       else next.add(tabId);
       return next;
     });
+  }, []);
+
+  const openResourceTab = useCallback((tabId: string) => {
+    // Замер может пережить закрытие вкладки. Владелец и размещение берутся
+    // из живого store в момент клика, а не из снимка процессов.
+    const store = useWorkspaceStore.getState();
+    for (const [projectId, workspace] of store.openProjects) {
+      if (!workspace.tabs.has(tabId)) continue;
+      const placement = findTabPlacement({ tabId, ...placementWorldFromState(store) });
+      // Уже размещённую сессию показываем там, где она лежит. Без размещения
+      // добавляем чип в текущее окно, сохраняя его прежние вкладки.
+      store.placeTab(projectId, tabId, { mode: placement ? 'default' : 'add-here' });
+      setOpen(false);
+      return;
+    }
   }, []);
 
   const handleKillOrphans = useCallback(async () => {
@@ -344,6 +379,7 @@ const ResourceUsageButton: React.FC = () => {
       const minor = mode === 'cpu' ? [] : sorted.filter(tab => tab.totalBytes < MINOR_TAB_LIMIT_BYTES);
       const meta = projectMeta.get(projectId);
       const isCurrent = projectId === currentId;
+      const commands = commandTotals(sorted, metrics?.hasCpu === true);
       return {
         projectId,
         isCurrent,
@@ -354,6 +390,8 @@ const ResourceUsageButton: React.FC = () => {
         minorBytes: minor.reduce((total, tab) => total + tab.totalBytes, 0),
         totalBytes: sorted.reduce((total, tab) => total + tab.totalBytes, 0),
         totalCpu: sorted.reduce((total, tab) => total + (tab.totalCpu || 0), 0),
+        commandTotalBytes: commands.bytes,
+        commandTotalCpu: commands.cpu,
       };
     });
 
@@ -372,6 +410,9 @@ const ResourceUsageButton: React.FC = () => {
   const projectsTotalCpu = metrics?.hasCpu
     ? projectSections.reduce((total, project) => total + project.totalCpu, 0)
     : null;
+  const projectsCommands = commandTotals(
+    [...(metrics?.projectTabs || []), ...(metrics?.otherTabs || [])], metrics?.hasCpu === true,
+  );
 
   // Итог считает main (`totals.allBytes`) — это же число уходит в чип. Старое
   // сложение четырёх полей здесь оставлено запасным путём для payload прежнего
@@ -386,17 +427,23 @@ const ResourceUsageButton: React.FC = () => {
   // Пока панель открыта, она сама свежее фонового канала — берём её цифры.
   // Иначе чип живёт на лёгком итоге, который идёт всегда.
   const chipSource = (open && metrics?.ok)
-    ? { ok: true, totalBytes, orphanCount: metrics?.orphans?.count || 0 }
+    ? { ok: true, totalBytes, commandBytes: metrics.totals?.commandBytes ?? projectsCommands.bytes,
+      orphanCount: metrics?.orphans?.count || 0 }
     : ambient;
   const orphanCount = (open ? (metrics?.orphans?.count || 0) : (ambient?.orphanCount || 0));
   const chipValue = chipSource?.ok ? formatBytes(chipSource.totalBytes || 0) : '—';
+  const chipCommands = chipSource?.ok && typeof chipSource.commandBytes === 'number'
+    ? formatBytes(chipSource.commandBytes) : '—';
 
-  const valueOf = (bytes: number, cpu: number | null) =>
-    mode === 'memory' ? formatBytes(bytes) : formatCpu(cpu);
+  const valueOf = (bytes: number | null | undefined, cpu: number | null | undefined) =>
+    mode === 'memory' ? bytes == null ? '—' : formatBytes(bytes) : formatCpu(cpu ?? null);
+  const valuePair = (bytes: number, cpu: number | null, commandBytes: number | null | undefined, commandCpu: number | null | undefined) =>
+    <ResourceValues total={valueOf(bytes, cpu)} commands={valueOf(commandBytes, commandCpu)} />;
 
   return (
     <>
-      <Tooltip content={historyPreparationLabel(preparation, tabInfoById)}>
+      <Tooltip content={preparation.active ? historyPreparationLabel(preparation, tabInfoById)
+        : 'Память: всего приложение и вкладки / запущенные команды'}>
         <button
           ref={buttonRef}
           onClick={() => setOpen(value => !value)}
@@ -439,7 +486,7 @@ const ResourceUsageButton: React.FC = () => {
               whiteSpace: 'nowrap',
             }}
           >
-            {chipValue}
+            <ResourceValues total={chipValue} commands={chipCommands} />
           </span>
           {orphanCount > 0 && (
             <span style={{ color: '#fca5a5' }}>·{orphanCount}</span>
@@ -560,7 +607,7 @@ const ResourceUsageButton: React.FC = () => {
                     {/* Проекты подряд, текущий первым. Заголовок проекта —
                         он же переключатель раскрытия: раньше чужие проекты
                         были тупиковой строкой «вкладок: 77». */}
-                    <SectionTitle value={valueOf(projectsTotalBytes, projectsTotalCpu)}>Проекты</SectionTitle>
+                    <SectionTitle value={valuePair(projectsTotalBytes, projectsTotalCpu, projectsCommands.bytes, projectsCommands.cpu)}>Проекты</SectionTitle>
                     {projectSections.map(project => {
                       // При первом открытии все проекты свёрнуты. Текущий
                       // выделен стилем, а состав раскрывается только кликом.
@@ -617,7 +664,7 @@ const ResourceUsageButton: React.FC = () => {
                               color: project.isCurrent ? '#ddd' : '#999',
                               fontVariantNumeric: 'tabular-nums',
                             }}>
-                              {valueOf(project.totalBytes, project.totalCpu)}
+                              {valuePair(project.totalBytes, metrics.hasCpu ? project.totalCpu : null, project.commandTotalBytes, project.commandTotalCpu)}
                             </span>
                           </button>
 
@@ -627,6 +674,7 @@ const ResourceUsageButton: React.FC = () => {
 
                           {isOpen && visibleTabs.map(group => {
                             const isExpanded = expanded.has(group.tabId);
+                            const canNavigate = tabInfoById.has(group.tabId);
                             const canExpand = group.tools.length > 0
                               || (group.agents || []).length > 0
                               || (group.commands || []).length > 0
@@ -635,19 +683,29 @@ const ResourceUsageButton: React.FC = () => {
                             return (
                               <div key={group.tabId}>
                                 <button
-                                  onClick={() => canExpand && toggleExpanded(group.tabId)}
+                                  data-resource-tab-id={group.tabId}
+                                  aria-expanded={canExpand ? isExpanded : undefined}
+                                  onClick={event => {
+                                    if (event.metaKey) {
+                                      event.preventDefault();
+                                      openResourceTab(group.tabId);
+                                      return;
+                                    }
+                                    if (canExpand) toggleExpanded(group.tabId);
+                                  }}
                                   style={{
                                     width: '100%',
                                     display: 'flex',
                                     alignItems: 'center',
                                     gap: 6,
                                     padding: '4px 10px 4px 24px',
-                                    background: 'transparent',
                                     border: 'none',
-                                    cursor: canExpand ? 'pointer' : 'default',
+                                    cursor: canExpand || (cmdPressed && canNavigate) ? 'pointer' : 'default',
                                     textAlign: 'left',
                                   }}
-                                  className={canExpand ? 'hover:bg-white/[0.03]' : ''}
+                                  className={cmdPressed && canNavigate
+                                    ? 'bg-transparent hover:bg-sky-400/[0.16]'
+                                    : canExpand ? 'bg-transparent hover:bg-white/[0.03]' : 'bg-transparent'}
                                 >
                                   <span style={{ width: 12, display: 'flex', color: '#666' }}>
                                     {canExpand && (isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />)}
@@ -667,7 +725,7 @@ const ResourceUsageButton: React.FC = () => {
                                     {group.sharedWithOtherTab && <span style={{ color: '#666' }}> · учтено выше</span>}
                                   </span>
                                   <span style={{ fontSize: 11, color: '#ddd', fontVariantNumeric: 'tabular-nums' }}>
-                                    {valueOf(group.totalBytes, group.totalCpu)}
+                                    {valuePair(group.totalBytes, group.totalCpu, group.commandTotalBytes, group.commandTotalCpu)}
                                   </span>
                                 </button>
 
@@ -701,13 +759,20 @@ const ResourceUsageButton: React.FC = () => {
                                         value={valueOf(tool.bytes, tool.cpu)}
                                       />
                                     ))}
+                                    {(group.smallCommandBytes || 0) > 0 && (
+                                      <DetailRow
+                                        icon={<SquareTerminal size={11} strokeWidth={1.8} aria-hidden />}
+                                        label="мелкие команды"
+                                        value={valueOf(group.smallCommandBytes, group.smallCommandCpu)}
+                                      />
+                                    )}
                                     <DetailRow
                                       label="оболочка терминала"
                                       value={valueOf(group.selfBytes, group.selfCpu)}
                                       muted
                                     />
-                                    {group.otherBytes > 0 && (
-                                      <DetailRow label="прочее" value={formatBytes(group.otherBytes)} muted />
+                                    {group.otherBytes - (group.smallCommandBytes || 0) > 0 && (
+                                      <DetailRow label="прочее" value={formatBytes(group.otherBytes - (group.smallCommandBytes || 0))} muted />
                                     )}
                                   </div>
                                 )}
@@ -774,7 +839,10 @@ const ResourceUsageButton: React.FC = () => {
                   color: '#666',
                   fontVariantNumeric: 'tabular-nums',
                 }}>
-                  <span style={{ flex: 1 }}>всего {formatBytes(totalBytes)}</span>
+                  <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 4 }}>
+                    всего <ResourceValues total={formatBytes(totalBytes)} commands={typeof metrics.totals?.commandBytes === 'number'
+                      ? formatBytes(metrics.totals.commandBytes) : projectsCommands.bytes == null ? '—' : formatBytes(projectsCommands.bytes)} />
+                  </span>
                   {mode === 'cpu' && !metrics.hasCpu && <span>замеряю нагрузку…</span>}
                   {metrics.durationMs !== undefined && <span>{metrics.durationMs.toFixed(0)} мс</span>}
                 </div>
@@ -787,7 +855,17 @@ const ResourceUsageButton: React.FC = () => {
   );
 };
 
-const SectionTitle: React.FC<{ children: React.ReactNode; value: string }> = ({ children, value }) => (
+const ResourceValues: React.FC<{ total: string; commands: string }> = ({ total, commands }) => (
+  <span data-resource-values style={{ display: 'inline-flex', alignItems: 'center', gap: 4, whiteSpace: 'nowrap' }}
+    aria-label={'Всего ' + total + '; команды ' + commands}>
+    <span data-resource-total-value>{total}</span>
+    <span style={{ color: '#666' }} aria-hidden>/</span>
+    <SquareTerminal size={10} style={{ color: '#888', flexShrink: 0 }} aria-hidden />
+    <span data-resource-command-value style={{ color: '#aaa' }}>{commands}</span>
+  </span>
+);
+
+const SectionTitle: React.FC<{ children: React.ReactNode; value: React.ReactNode }> = ({ children, value }) => (
   <div style={{
     padding: '8px 10px 4px',
     display: 'flex',

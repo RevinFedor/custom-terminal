@@ -323,6 +323,30 @@ Observer начальной Timeline имеет lifetime effect: старый A�
 объявляет новый load завершённым. Main subscriptions также owner-bound, чтобы
 cleanup старого cwd не удалял новый consumer.
 
+## Первое измерение длинной строки: позиция уже новая, диапазон ещё старый
+
+Загруженный текст не означает измеренную DOM-высоту. При первом движении вверх
+Virtuoso может заменить оценку короткой строки реальной длинной карточкой и
+правильно компенсировать рост через native scrollBy. Но его virtual viewport
+прежде ждал следующего browser scroll event: между записью позиции и обновлением
+диапазона возникал настоящий пустой paint. В Inbox51 05.10 это была research
+карточка22626chars:197→11905px; это не History reload, eviction или новый loader.
+
+После size-observer batch один coalesced microtask публикует scroll текущего
+scroller, только если физическая позиция за этот batch действительно изменилась.
+Он не двигает позицию повторно и не выдаёт событие за пользовательский ввод.
+Exact scroller + owner/generation/presentationVisit проверяются до публикации;
+hide, tail-follow, restore/jump, resize, seek и другой anchor-owner её подавляют.
+Измеренная строка может уже выйти из overscan — владельцем остаётся scroller.
+Два чтения scrollTop на batch выполняются после измерения, не в wheel-handler.
+
+skipAnimationFrameInResizeObserver уже был включён. В private paint RED не
+помогли ни flushSync после измерения/всего RO callback, ни отдельный3D-layer
+списка. Причина — недоставленная позиция во viewport stream; новая физическая
+коррекция поверх Virtuoso и фиксация оценочной высоты неверны. Проверять native
+paint/pixels: rAF перед RO ещё может увидеть промежуточную геометрию, хотя до
+paint она исправится. Проба: scripts/history-tall-row-regression.mjs.
+
 ## Один физический низ
 
 Working/Worked живёт в Footer, а не в `data` виртуального списка. Его появление

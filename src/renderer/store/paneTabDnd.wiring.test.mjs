@@ -19,9 +19,10 @@ const app = read(path.join(renderer, 'App.tsx'));
 const store = read(path.join(here, 'useWorkspaceStore.ts'));
 const shared = read(path.resolve(here, '../../../../noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js'));
 const sidebarBridge = read(path.join(renderer, 'utils/sidebarTabDragBridge.mjs'));
+const pointerGesture = read(path.join(renderer, 'utils/paneTabPointerGesture.ts'));
 
 test('pane chips, headers and bodies share one explicit drag protocol', () => {
-  assert.match(chip, /PANE_TAB_DND_TYPE/);
+  assert.match(chip, /bindPaneTabPointerDrag/);
   assert.match(strip, /canDrop: \(\{ source \}\) =>[\s\S]{0,100}source\.data\.type === PANE_TAB_DND_TYPE/);
   assert.match(strip, /!element\.closest\('\[data-pane-focus-isolated="1"\]'\)/);
   assert.match(strip, /data-pane-tab-drop-zone="strip"/);
@@ -133,14 +134,14 @@ test('release commits the painted pane target instead of resolving again', () =>
     'source cleanup must not erase the painted target before the global release barrier');
 });
 
-test('drag keeps wrapped row geometry and native preview without edge scrolling', () => {
+test('drag keeps wrapped row geometry and immediate pointer preview without edge scrolling', () => {
   assert.doesNotMatch(strip, /revealChip|data-pane-strip-end-reserve/);
   const bridge = read(path.join(renderer, 'utils/paneTabDragBridge.ts'));
   assert.doesNotMatch(bridge, /horizontalDragAutoScrollDelta/);
   assert.match(bridge, /wrap: true/);
   assert.match(bridge, /const dragCenterX = Number\(clientX\) \|\| 0/);
   assert.doesNotMatch(bridge, /anchorDeltaX|effectiveClientX/);
-  assert.match(chip, /getOffset: centerUnderPointer/);
-  assert.match(chip, /data-pane-tab-native-drag-preview/);
+  assert.match(pointerGesture, /createHorizontalRowDragPreview/);
+  assert.match(pointerGesture, /data(set)?\.paneTabPointerDragPreview/);
   assert.match(chip, /data-pane-chip-drag-placeholder/);
 });

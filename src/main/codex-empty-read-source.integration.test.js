@@ -68,7 +68,7 @@ async function fixture(t) {
     codexTurnStateSnapshot: () => ({ busy: false, hasWatcher: false }),
     getCodexProvisionalSettingsSnapshot: () => null, getCodexMcpStartupStatus: () => null,
     currentAiLifecycleIdentity: () => ({ terminalLifecycleGeneration: 'G:2', inputRevision: 0 }),
-    scheduleProjectActivityBroadcast() {},
+    scheduleProjectActivityBroadcast() {}, noteProjectCardSignalsChanged() {},
     require: id => { assert.equal(id, path.join(__dirname, 'web-server')); return { webBroadcast: (_tab, data) => events.push(data) }; },
   });
   for (const name of ['codexWriterProofs', 'codexKnownSessions', 'codexWatchers', 'codexTurnWatchers',

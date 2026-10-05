@@ -1,5 +1,6 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
+import { createHistoryMeasurementViewportSync } from '../../utils/historyMeasurementViewportSync.mjs';
 import { historyImageRuns } from '../../utils/historyImageRuns.mjs';
 import HistorySearchBar from './HistorySearchBar';
 import {HISTORY_SEARCH_PAGE_SIZE, searchHistoryEntries, historySearchEntryKeys} from '../../../shared/history-search.mjs';
@@ -3851,9 +3852,11 @@ const openHistoryEntryContextMenu = (
 
 const HistoryCollapsiblePrompt = ({
   text,
+  markdown = false,
   forceExpanded = false,
 }: {
   text: string;
+  markdown?: boolean;
   forceExpanded?: boolean;
 }) => {
   const [expanded, setExpanded] = useState(false);
@@ -3861,10 +3864,12 @@ const HistoryCollapsiblePrompt = ({
   const needsCollapse = text.length > HISTORY_USER_TEXT_COLLAPSE_THRESHOLD;
   const open = forceExpanded || expanded;
   const toggleExpanded = useHistoryRevealToggle(anchorRef, expanded, setExpanded);
-  if (!needsCollapse) {
-    return <p className="cb-msg-text">{renderSentHistoryPromptHighlight(text)}</p>;
-  }
   const preview = text.slice(0, HISTORY_USER_TEXT_COLLAPSED_CHARS).trimEnd();
+  const visibleText = needsCollapse && !open ? preview + '…' : text;
+  const body = markdown && (!needsCollapse || open)
+    ? <CBMarkdown text={visibleText} />
+    : <p className="cb-msg-text">{renderSentHistoryPromptHighlight(visibleText)}</p>;
+  if (!needsCollapse) return body;
   const toggle = (
     <button
       type="button"
@@ -3886,9 +3891,7 @@ const HistoryCollapsiblePrompt = ({
           нечего. У раскрытого же конец текста может быть далеко, поэтому
           «Свернуть» нужно и там, где чтение началось, и там, где закончилось. */}
       {open && !forceExpanded && <div className="cb-collapse-top">{toggle}</div>}
-      <p className="cb-msg-text">
-        {renderSentHistoryPromptHighlight(open ? text : preview + '…')}
-      </p>
+      {body}
       {!forceExpanded && <div className="cb-collapse-bottom">{toggle}</div>}
     </div>
   );
@@ -4457,18 +4460,18 @@ const HistoryUserPromptContent = ({
 
   if (!hasOpaquePart) {
     const plainText = parts.map((part) => String(part?.text || '')).join('');
-    if (markdown) return <CBMarkdown text={plainText} />;
-    return <HistoryCollapsiblePrompt text={plainText} forceExpanded={forceExpanded} />;
+    return <HistoryCollapsiblePrompt text={plainText} markdown={markdown} forceExpanded={forceExpanded} />;
   }
 
   // Единица сворачивания — СООБЩЕНИЕ, а не отдельный текстовый кусок. Кнопка
   // сидит на рамке пузыря (сверху и снизу слева), ровно как у обычного длинного
   // сообщения; внутри текста её быть не может.
-  const needsCollapse = !markdown && mixedMessageNeedsCollapse(parts, HISTORY_USER_TEXT_COLLAPSE_THRESHOLD);
+  const needsCollapse = mixedMessageNeedsCollapse(parts, HISTORY_USER_TEXT_COLLAPSE_THRESHOLD);
   const open = forceExpanded || mixedExpanded;
   const visible = needsCollapse && !open
     ? truncateMixedMessageParts(parts, HISTORY_USER_TEXT_COLLAPSED_CHARS)
     : { parts, truncated: false };
+  const renderMarkdown = markdown && (!needsCollapse || open);
   const collapseToggle = needsCollapse && !forceExpanded ? (
     <button
       type="button"
@@ -4486,7 +4489,7 @@ const HistoryUserPromptContent = ({
 
   const renderVisiblePart = (part: any, index: number) => {
         if (part.kind === 'text') {
-          if (markdown) return <CBMarkdown key={`text:${index}`} text={part.text} />;
+          if (renderMarkdown) return <CBMarkdown key={`text:${index}`} text={part.text} />;
           return (
             <HistoryInlineTextPart
               key={`text:${index}`}
@@ -21190,6 +21193,23 @@ function HistoryPanel({
     releaseHistoryWheelGeometryFreeze(false);
   }, [releaseHistoryWheelGeometryFreeze, setHistorySeekGeometryMask]);
 
+  const historyMeasurementViewportSync = useMemo(() => createHistoryMeasurementViewportSync({
+    getScroller: () => virtuosoScrollerRef.current,
+    getOwnerToken: historyScrollerOwnerToken,
+    isSuppressed: () => !historyPresentationProofRef.current.presented
+      || isAtBottomRef.current
+      || historyResizeRef.current?.active() === true
+      || historyRestoreInFlightRef.current !== 0
+      || historyScrollInFlightRef.current !== null
+      || historyScrollSeekController.isActive()
+      || historyWheelGeometryReleaseSettleCancelRef.current !== null
+      || terminalPreviewAnchorSettleCancelRef.current !== null,
+    onSync: () => historyDiag('VIRTUOSO_MEASUREMENT_VIEWPORT_SYNC tab=' + historyTabIdRef.current.slice(-12)
+      + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current)
+      + ' visit=' + historyPresentationProofRef.current.visit),
+  }), [historyScrollerOwnerToken, historyScrollSeekController]);
+  useEffect(() => () => historyMeasurementViewportSync.cancel(), [historyMeasurementViewportSync]);
+
   const measureHistoryVirtuosoItemSize = useCallback((element: HTMLElement, field: string) => {
     const rect = element.getBoundingClientRect();
     const actualSize = Math.round(field === 'offsetWidth' ? rect.width : rect.height);
@@ -21212,6 +21232,10 @@ function HistoryPanel({
           index: element.getAttribute('data-item-index'), key: unitKey,
           delta: actualSize - knownSize,
         });
+        // The size batch may now trigger Virtuoso's native resize compensation.
+        // Update its virtual viewport before paint, without writing a position
+        // or waiting one more frame for the browser's own scroll event.
+        historyMeasurementViewportSync.schedule(element);
       }
     }
     const trace = historyScrollGestureTraceRef.current;
@@ -21256,7 +21280,7 @@ function HistoryPanel({
       }
     }
     return actualSize;
-  }, [historyScrollSeekController]);
+  }, [historyScrollSeekController, historyMeasurementViewportSync]);
 
   const handleUserScrollIntent = useMemo(() => historyWheelDiagnostics.wrap('intent', (event: Event) => {
     if (!event.isTrusted || !historyPresentationProofRef.current.presented) return;
@@ -22869,9 +22893,9 @@ function HistoryPanel({
             // next rAF. A newly mounted variable-height row is then painted
             // once with its estimate and corrected one frame later — the
             // visible up/down flash from both 26.08 incidents. Immediate
-            // measurement keeps the size publication in the same rendering
-            // opportunity; the semantic wheel anchor above owns any resulting
-            // position correction.
+            // measurement removes that delay; the post-measurement viewport
+            // sync above also publishes Virtuoso's compensated position before
+            // paint. The virtualizer remains the physical position writer.
             skipAnimationFrameInResizeObserver
             className="hp-history-transcript"
             style={{

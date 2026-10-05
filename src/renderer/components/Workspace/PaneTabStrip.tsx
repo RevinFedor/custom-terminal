@@ -120,12 +120,14 @@ export default function PaneTabStrip({
     scrollerRef,
     '[data-strip-item]',
     'data-strip-tab-id',
+    { animate: false },
   );
   const desiredPreviewEntries = React.useMemo(() => {
-    if (!paneDrag.active || !paneDrag.source || paneDrag.target?.paneKey !== paneKey) return null;
+    if (!paneDrag.active || !paneDrag.source || paneDrag.target?.paneKey !== paneKey
+      || paneDrag.target?.spaceId !== activeSpaceId) return null;
     return moveEntriesToIndex(entries, paneDrag.source.entries, paneDrag.target.at);
-  }, [baseEntriesKey, paneDrag.active, paneDrag.revision, paneDrag.source, paneDrag.target, paneKey]);
-  useEffect(() => {
+  }, [baseEntriesKey, paneDrag.active, paneDrag.revision, paneDrag.source, paneDrag.target, paneKey, activeSpaceId]);
+  useLayoutEffect(() => {
     horizontalPreview.updatePreview(desiredPreviewEntries?.map((entry) => entry.tabId) || null);
   }, [desiredPreviewEntries, horizontalPreview.updatePreview]);
   const entryById = React.useMemo(() => {

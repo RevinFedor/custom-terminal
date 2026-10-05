@@ -23,10 +23,11 @@ const {
 async function makeStore() {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'noted-orchestration-'));
   const filePath = path.join(dir, 'runs.json');
+  const store = new OrchestrationRunStore(filePath);
   return {
-    store: new OrchestrationRunStore(filePath),
+    store,
     filePath,
-    cleanup: () => fs.promises.rm(dir, { recursive: true, force: true }),
+    cleanup: async () => { await store.persistChain; await fs.promises.rm(dir, { recursive: true, force: true }); },
   };
 }
 

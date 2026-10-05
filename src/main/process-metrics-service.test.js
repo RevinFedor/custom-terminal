@@ -3,7 +3,7 @@
 const assert = require('node:assert');
 const test = require('node:test');
 
-const { createProcessMetricsService } = require('./process-metrics-service');
+const { createProcessMetricsService, toAmbient } = require('./process-metrics-service');
 
 function makeHarness(overrides = {}) {
   const timers = [];
@@ -37,6 +37,25 @@ function makeHarness(overrides = {}) {
 
   return { service, timers, updates, ambientUpdates, getCaptureCount: () => captureCount };
 }
+
+test('общий расход и команды в фоне приходят из одного снимка без нового таймера', () => {
+  const { service, timers, updates, ambientUpdates, getCaptureCount } = makeHarness({
+    group: ({ snapshot }) => ({ ok: true, scannedAt: snapshot.scannedAt,
+      totals: { allBytes: snapshot.scannedAt * 2, commandBytes: snapshot.scannedAt }, orphans: { count: 0 } }),
+  });
+  const first = service.enableAmbient();
+  assert.equal(first.totalBytes, 4000); assert.equal(first.commandBytes, 2000);
+  service.subscribe('panel');
+  const before = getCaptureCount();
+  timers.at(-1).fn();
+  assert.equal(getCaptureCount(), before + 1);
+  assert.equal(service.isAmbientRunning(), false);
+  assert.equal(ambientUpdates.at(-1).scannedAt, updates.at(-1).scannedAt);
+  assert.equal(ambientUpdates.at(-1).commandBytes, updates.at(-1).totals.commandBytes);
+  assert.equal(ambientUpdates.at(-1).totalBytes, updates.at(-1).totals.allBytes);
+  assert.equal(toAmbient({ ok: true, totals: { allBytes: 100 } }).commandBytes, null,
+    'старый payload без breakdown не превращается в ложный ноль');
+});
 
 test('первый замер не выдумывает загрузку процессора', () => {
   const { service } = makeHarness();

@@ -482,6 +482,32 @@ const externalRunByConversationKey = new Map(); // conversationKey -> runId
 const publicRuntimeSnapshots = new Map(); // tabId -> { revision, fingerprint, snapshot }
 const DEFAULT_EXTERNAL_AUTO_CLOSE_MS = 15 * 60 * 1000;
 let orchestrationRunStore = null;
+let publicTabActivity = null;
+let scheduleTabActivityBroadcast = null;
+let activityStyleOwner = null;
+
+function tabActivityProjection(scope = {}) {
+  return publicTabActivity ? { tabActivity: publicTabActivity.capture(scope) } : {};
+}
+
+function observeTabActivityStyle(value, expectedRevision, sender = null) {
+  if (sender?.isDestroyed?.()) value = null;
+  const accepted = publicTabActivity?.observeStyle(value, expectedRevision);
+  if (accepted && value && sender && sender !== activityStyleOwner) {
+    activityStyleOwner = sender;
+    sender.once('destroyed', () => {
+      if (activityStyleOwner !== sender) return;
+      activityStyleOwner = null;
+      publicTabActivity?.observeStyle(null);
+    });
+  }
+  return accepted;
+}
+
+function invalidateTabActivity(reason) {
+  // Main owns the single coalescing scheduler. No recursive schedule here.
+  publicTabActivity?.invalidate(reason, false);
+}
 let scExternalResearchClient = null;
 let externalResearchCoordinator = null;
 // Injected from main. SQLite is the restart-safe authority for whether one
@@ -623,7 +649,9 @@ let orchestrationSourceProofCoordinator = null;
 
 function getOrchestrationRunStore() {
   if (!orchestrationRunStore) {
-    orchestrationRunStore = new OrchestrationRunStore(path.join(app.getPath('userData'), 'orchestration-runs.json'));
+    orchestrationRunStore = new OrchestrationRunStore(path.join(app.getPath('userData'), 'orchestration-runs.json'), {
+      onActivityChanged: () => scheduleTabActivityBroadcast?.('orchestration-registry'),
+    });
   }
   return orchestrationRunStore;
 }
@@ -4275,6 +4303,7 @@ function emitOrchestrationRun(run, reason = 'changed') {
     tabWorkContext?.release(run.targetTabId, 'orchestration:' + run.runId);
   }
   if (!run) return;
+  scheduleTabActivityBroadcast?.('orchestration-' + reason);
   const payload = { type: 'orchestration-update', reason, run: withOrchestrationUrls(run) };
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) win.webContents.send('orchestration:changed', payload);
@@ -6361,7 +6390,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
     });
-    sink.send(JSON.stringify(snapshot));
+    sink.send(JSON.stringify({ ...snapshot, ...tabActivityProjection({ tabId }) }));
     replayExternalRunTerminalEvent();
     await replayOrchestrationRuns();
     return;
@@ -6399,7 +6428,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
     });
-    sink.send(JSON.stringify(snapshot));
+    sink.send(JSON.stringify({ ...snapshot, ...tabActivityProjection({ tabId }) }));
     replayExternalRunTerminalEvent();
     await replayOrchestrationRuns();
   } catch {
@@ -6418,13 +6447,13 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
     });
-    sink.send(JSON.stringify(snapshot));
+    sink.send(JSON.stringify({ ...snapshot, ...tabActivityProjection({ tabId }) }));
     replayExternalRunTerminalEvent();
     await replayOrchestrationRuns();
   }
 }
 
-function projectActivitySnapshot(reason = 'snapshot') {
+function projectActivitySnapshot(reason = 'snapshot', activitySample = publicTabActivity?.sample()) {
   if (!computeProjectActivity) {
     return { type: 'project-activity', projects: [], ts: Date.now(), reason, unavailable: true };
   }
@@ -6452,6 +6481,7 @@ function projectActivitySnapshot(reason = 'snapshot') {
       layoutChangedProjectIds: Array.isArray(snap.layoutChangedProjectIds) ? snap.layoutChangedProjectIds : [],
       projectOrderChanged: snap.projectOrderChanged === true,
       ...(snap.cardSignals ? { cardSignals: snap.cardSignals } : {}),
+      ...(activitySample ? { tabActivity: activitySample() } : {}),
       ts: snap.ts || Date.now(),
       reason,
     };
@@ -6547,7 +6577,7 @@ function bridgeRequest(action, payload, timeoutMs = 5000, {
       captureReply,
       onAbort,
       dispose: null,
-      expectedSender: observationOnly ? win.webContents : null,
+      expectedSender: observationOnly || action === 'getStatusMarkerConfig' ? win.webContents : null,
     });
     console.log('[BridgeDiag] SEND action=' + action + label + ' rid=' + requestId + ' wins=' + wins.length);
     try {
@@ -6785,7 +6815,8 @@ function registerBridgeReplyHandler() {
     if (pending.lateCleanupTimer) clearTimeout(pending.lateCleanupTimer);
     pendingBridge.delete(requestId);
     if (typeof pending.captureReply === 'function') {
-      try { pending.captureReply({ requestId, ok, data, error, elapsedMs: elapsed }); }
+      try { pending.captureReply({ requestId, ok, data, error, elapsedMs: elapsed,
+        ...(pending.action === 'getStatusMarkerConfig' ? { sender: event.sender } : {}) }); }
       catch (captureError) {
         captureError.code ||= 'bridge_owned_result_unknown';
         try { pending.onAbort?.(captureError); } catch {}
@@ -6870,6 +6901,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       service: webServerServiceHealth(),
       capabilities: {
         ...(projectCardSignals ? { cardSignals: projectCardSignals.capability } : {}),
+        ...(publicTabActivity ? { tabActivity: publicTabActivity.capability } : {}),
         ...(publicHistoryFreshness ? { historyFreshness: historyFreshnessCapability } : {}),
         completionNotifications: completionNotificationCapability,
         ...(agentSendQueue ? { sendQueue: { version: 1, providers: ['claude', 'codex'], durable: true,
@@ -7173,7 +7205,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 503, { error: 'project-activity unavailable', projects: [], ts: Date.now() });
     }
     try {
-      return sendJson(res, 200, computeProjectActivity());
+      return sendJson(res, 200, { ...computeProjectActivity(), ...tabActivityProjection() });
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message), projects: [], ts: Date.now() });
     }
@@ -8584,7 +8616,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
             const { type: _type, ...publicRuntime } = stamped;
             return { ...tab, ...publicRuntime };
           });
-          return sendJson(res, 200, { ...live, tabs, ...projectCardsSnapshot(projectId, tabs) });
+          const activity = tabActivityProjection({ projectId }).tabActivity;
+          return sendJson(res, 200, { ...live, tabs, ...projectCardsSnapshot(projectId, tabs),
+            ...(activity ? { tabActivity: { ...activity, known: false, reason: 'project-not-persisted', loaderCount: null, tabs: [] } } : {}) });
         }
       } catch (e) {
         // bridge failed, fall through to 404
@@ -8730,15 +8764,21 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let processBarCfg = { colorA: '#155E75', shimmerColor: '#FFFFFF', shimmerSpacingPct: 50, shimmerOpacityPct: 55, position: 'left' };
     let statusesForClient = [];
     let paletteById = new Map();
+    const activityStyleRevision = publicTabActivity?.styleRevision();
     try {
-      const cfg = await bridgeRequest('getStatusMarkerConfig', {}, 1500);
+      let styleSource = null;
+      const cfg = await bridgeRequest('getStatusMarkerConfig', {}, 1500, {
+        captureReply: reply => { styleSource = reply.sender; },
+      });
       if (cfg?.shape) markerCfg = { shape: cfg.shape, sizePx: cfg.sizePx || 8 };
       if (Array.isArray(cfg?.statuses)) {
         statusesForClient = cfg.statuses.map(s => ({ id: s.id, color: s.color, label: s.label }));
         for (const s of statusesForClient) paletteById.set(s.id, s);
       }
       if (cfg?.processBar) processBarCfg = cfg.processBar;
+      observeTabActivityStyle(cfg?.processBar, activityStyleRevision, styleSource);
     } catch (e) {
+      observeTabActivityStyle(null, activityStyleRevision);
       // renderer not ready — phone renders runtime-only markers, no category tint
     }
     const tabs = (project.tabs || []).map(t => {
@@ -8879,6 +8919,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       statuses: statusesForClient,
       processBar: processBarCfg,
       ...projectCardsSnapshot(projectId, tabs),
+      ...tabActivityProjection({ projectId }),
     });
   }
 
@@ -10925,7 +10966,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ' command=' + (data?.commandType || '-') +
         ' tool=' + (data?.toolType || '-') +
         ' ms=' + (Date.now() - started));
-      return sendJson(res, 200, data);
+      return sendJson(res, 200, { ...data, ...tabActivityProjection({ tabId }) });
     } catch (e) {
       clearPending();
       console.warn(statusPrefix + ' error=' + String(e.message || e) + ' ms=' + (Date.now() - started));
@@ -12215,7 +12256,7 @@ function webBroadcast(tabId, payload) {
   }
   payload = withMessageProjection(payload);
   if (payload && (payload.type === 'snapshot' || payload.type === 'busy' || payload.type === 'done')) {
-    payload = stampPublicRuntimeSnapshot(tabId, payload);
+    payload = { ...stampPublicRuntimeSnapshot(tabId, payload), ...tabActivityProjection({ tabId }) };
   }
   const type = payload && payload.type;
   if (publicHistoryFreshness?.hasTab(tabId)
@@ -12300,10 +12341,16 @@ function broadcastProjectActivity(reason = 'event') {
     if (tabId !== PROJECT_ACTIVITY_TOPIC) publishTabTiming(tabId, reason);
   }
   const set = subscribers.get(PROJECT_ACTIVITY_TOPIC);
-  if (!set || set.size === 0) return false;
-  const payload = projectActivitySnapshot(reason);
-  webBroadcast(PROJECT_ACTIVITY_TOPIC, payload);
-  return true;
+  if (![...subscribers.values()].some(sinks => sinks.size > 0)) return false;
+  const activitySample = publicTabActivity?.sample();
+  if (set?.size) webBroadcast(PROJECT_ACTIVITY_TOPIC, projectActivitySnapshot(reason, activitySample));
+  // One captured metadata read for all already-subscribed chats. No watcher,
+  // params request, or per-tab registry query is created for this event.
+  if (activitySample) for (const tabId of subscribers.keys()) {
+    if (tabId !== PROJECT_ACTIVITY_TOPIC) webBroadcast(tabId,
+      { type: 'tab-activity', tabActivity: activitySample({ tabId }) });
+  }
+  return !!set?.size;
 }
 
 // ───────── JSONL tail-watchers for PTY+Claude tabs ─────────
@@ -12632,6 +12679,8 @@ function start({
   cancelAgentSend: cancelAgentSendFn,
   computeActiveLoaders: computeFn,
   computeProjectActivity: computeProjectActivityFn,
+  readTabActivityState,
+  scheduleTabActivityBroadcast: scheduleTabActivityBroadcastFn,
   readAgentTabTiming: readAgentTabTimingFn,
   readAgentUsage: readAgentUsageFn,
   readCodexAuthProfile: readCodexAuthProfileFn,
@@ -12670,6 +12719,13 @@ function start({
   tabMessageSdkSessions = sdkSessions;
   tabWorkContext = tabWorkContextInstance || null;
   projectCardSignals = projectCardSignalsInstance || null;
+  scheduleTabActivityBroadcast = scheduleTabActivityBroadcastFn || null;
+  publicTabActivity = typeof readTabActivityState === 'function'
+    ? require('./public-tab-activity').createPublicTabActivity({
+      readState: readTabActivityState,
+      readInherited: () => getOrchestrationRunStore().readInheritedActivity(),
+      onChanged: reason => scheduleTabActivityBroadcast?.(reason),
+    }) : null;
   mobileAttachmentAssetStore = mobileAttachmentAssetStoreInstance || null;
   agentSendReceiptStore = agentSendReceiptStoreFn || null;
   sendQueueRecoveryReady = false;
@@ -12976,6 +13032,9 @@ function stop() {
   wss = null;
   computeActiveLoaders = null;
   computeProjectActivity = null;
+  publicTabActivity = null;
+  scheduleTabActivityBroadcast = null;
+  activityStyleOwner = null;
   startupInterruptedSnapshot = null;
   answerClaudeQuestion = null;
   getClaudePendingQuestion = null;
@@ -13235,4 +13294,6 @@ module.exports = {
     stamp: stampPublicRuntimeSnapshot,
     reset: () => publicRuntimeSnapshots.clear(),
   },
+  invalidateTabActivity,
+  observeTabActivityStyle,
 };

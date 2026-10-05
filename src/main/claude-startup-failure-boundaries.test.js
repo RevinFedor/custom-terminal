@@ -22,7 +22,7 @@ function harness() {
     claudeLaunchGenerationByTab: new Map([['T', { generation: 'L' }]]),
     claudeStartupDefaultsGateByTab: new Map(), claudeStartupGateRevisions: new Map(), claudeCliActive: new Map([['T', true]]),
     terminalProjectIds: new Map([['T', 'P']]), activityOpenIntervals: new Map(), tabCompletionNotifications: new Map(),
-    projectLayoutChangedIds: new Set(), projectOrderChanged: false,
+    projectLayoutChangedIds: new Set(), projectOrderChanged: false, projectCardSignals: null,
     codexKnownSessions: new Map(), codexTurnWatchers: new Map(), codexLastRunCommandPayload: new Map(),
     codexTuiReadyTabs: new Set(), geminiActiveTabs: new Set(), geminiSpinnerBusy: new Map(), sdkSessions: new Map(),
     projectManager: { db: { db: { prepare: () => ({ get: () => ({ project_id: 'P', command_type: 'claude', claude_session_id: 'S' }) }) } } },
