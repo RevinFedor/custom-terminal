@@ -174,6 +174,16 @@ test('split can recover the existing blank slot from the reported bad layout wit
   assert.ok(f.store.getState().splitPanes.every(pane => !pane.displayHidden && pane.tabId));
 });
 
+test('split with a stale hidden selection does not publish an empty or foreign window', () => {
+  const f = fixture({ customLayout: oneVisibleWithHidden() });
+  f.store.getState().openProjects.get('p').tabs.delete('old');
+  const before = snapshot(f.store.getState());
+  assert.equal(f.store.getState().addEmptySplitPane(0), false);
+  assert.equal(f.store.getState().addVerticalSplitPane(0, 'below'), false);
+  assert.deepEqual(snapshot(f.store.getState()), before);
+  assert.equal(f.writes.length, 0);
+});
+
 test('actual reveal selects a parked real tab before navigation/MRU, preserving mixed order and every other window', () => {
   const f = fixture();
   const before = snapshot(f.store.getState());

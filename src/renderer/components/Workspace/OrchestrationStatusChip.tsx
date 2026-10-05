@@ -30,6 +30,7 @@ import { RequestTrackerRow, RequestTrackerStatus, requestRowActionStyle, request
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import type { OrchestrationRun, OrchestrationStatus } from '../../store/useOrchestrationStore';
 import { isOrchestrationResultProofPending } from '../../utils/orchestrationRunProjection.mjs';
+import { orchestrationRequestTime, orchestrationDetailRows } from '../../utils/orchestrationDetails.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -242,9 +243,14 @@ function StatusIcon({ presentation }: { presentation: RunPresentation }) {
   );
 }
 
-function runTime(value?: number | null): string {
-  if (!value) return '—';
-  return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function RunDetailFields({ run, tabId, omitTime = false }: { run: OrchestrationRun; tabId: string; omitTime?: boolean }) {
+  return <>{orchestrationDetailRows(run, tabId).filter(row => !omitTime || row.key !== 'time').map(row => (
+    <div key={row.key} data-orchestration-detail-field={row.key} style={{ display: 'contents' }}>
+      <span>{row.label}</span>
+      <span style={{ color: row.error ? '#fca5a5' : '#c7c7c7', minWidth: 0,
+        overflowWrap: 'anywhere', whiteSpace: 'pre-wrap', fontVariantNumeric: 'tabular-nums' }}>{row.value}</span>
+    </div>
+  ))}</>;
 }
 
 function countdown(deadline: number | null | undefined, now: number): string | null {
@@ -504,22 +510,17 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     const remaining = countdown(run.recoveryDeadlineAt, now);
     return (
       <div style={{ width: 276, display: 'grid', gap: 6, fontSize: 11, lineHeight: 1.35 }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '70px minmax(0, 1fr)', gap: '3px 7px', color: '#a3a3a3' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '82px minmax(0, 1fr)', gap: '3px 7px', color: '#a3a3a3' }}>
           <span>Состояние</span><span style={{ color: presentation.color }}>{presentation.label}</span>
           {remaining && <><span>Отправка</span><span style={{ color: '#fbbf24', fontVariantNumeric: 'tabular-nums' }}>{remaining}</span></>}
           {run.status === 'waiting_recovery' && run.outcome === 'interrupted' && <><span>Продолжение</span><span style={{ color: '#e5e7eb' }}>Следующее сообщение в этой вкладке</span></>}
           {isPaused(run) && <><span>Возобновление</span><span style={{ color: '#e5e7eb' }}>Следующий новый ход во вкладке</span></>}
           <span>Проект</span><span style={{ color: '#e5e7eb' }}>{linkedProjectName || '—'}</span>
           <span>{run.runKind === 'external-research' && isSource ? 'Исполнитель' : 'Вкладка'}</span><span style={{ color: '#e5e7eb' }}>{linkedTabName || '—'}</span>
-          <span>Начало</span><span>{runTime(run.createdAt)}</span>
+          <RunDetailFields run={run} tabId={tabId} />
           <span>runId</span><span style={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.runId}</span>
           {run.externalResearchJobId && <><span>jobId</span><span style={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.externalResearchJobId}</span></>}
-          {run.notificationStatus && isSource && run.notifySource !== false && <><span>Уведомление</span><span>{run.notificationStatus}</span></>}
         </div>
-        {run.error && <div style={{ color: '#fca5a5', overflowWrap: 'anywhere' }}>{run.error}</div>}
-        {run.notificationError && <div style={{ color: '#fca5a5', overflowWrap: 'anywhere' }}>{run.notificationError}</div>}
-        {run.resultError && <div style={{ color: '#fca5a5', overflowWrap: 'anywhere' }}>{run.resultError}</div>}
-        {run.externalResearchTransportError && <div style={{ color: '#fbbf24', overflowWrap: 'anywhere' }}>{run.externalResearchTransportError}</div>}
         {actionError[run.runId] && <div style={{ color: '#fca5a5' }}>{actionError[run.runId]}</div>}
       </div>
     );
@@ -611,18 +612,12 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
           const linkedProjectName = isSource ? run.targetProjectName : run.sourceProjectName;
           const presentation = runPresentation(run, tabId);
+          const requestTime = orchestrationRequestTime(run);
           const expanded = expandedRunIds.has(run.runId);
           const canDismissAttention = presentation.icon === 'error'
             && run.status !== 'waiting_recovery'
             && Boolean(run.attentionRequiredAt)
             && !attentionDismissedForTab(run, tabId);
-          const details = [
-            ['Ошибка', run.error],
-            ['Ошибка доставки', run.notificationError],
-            ['Результат', run.resultError],
-            ['Причина', run.completionReason],
-            ['Исход', run.outcome],
-          ].filter((item): item is [string, string] => Boolean(item[1]));
           return (
             <div key={run.runId} data-orchestration-run-id={run.runId} style={{ borderBottom: '1px solid #292929', background: expanded ? '#191919' : 'transparent' }}>
               <div style={{ minHeight: 44, padding: '0 6px 0 3px', display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto', alignItems: 'center', gap: 3 }}>
@@ -641,7 +636,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
                   <span style={{ color: presentation.color, display: 'grid', placeItems: 'center' }}><StatusIcon presentation={presentation} /></span>
                   <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, fontWeight: 600 }}>{run.label || linkedTabName || 'Запрос'}</span>
                   <span style={{ color: '#8f8f8f', display: 'grid', placeItems: 'center' }}>{isSource ? <ArrowUpRight size={12} /> : <ArrowDownLeft size={12} />}</span>
-                  <span style={{ color: '#858585', fontSize: 9, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{linkedProjectName || '—'} · {linkedTabName || '—'} · {runTime(run.createdAt)}</span>
+                  <span style={{ color: '#858585', fontSize: 9, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{linkedProjectName || '—'} · {linkedTabName || '—'}</span>
                 </button>
                 <span style={{ color: presentation.color, fontSize: 9, whiteSpace: 'nowrap' }}>{presentation.label}</span>
                 {canDismissAttention ? (
@@ -655,17 +650,15 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
                     <X size={13} />
                   </button>
                 ) : <span style={{ width: 23 }} />}
+                <time data-orchestration-request-time dateTime={requestTime.dateTime}
+                  style={{ gridColumn: '1 / -1', margin: '-4px 0 5px 54px', minWidth: 0, color: '#858585',
+                    fontSize: 9, fontVariantNumeric: 'tabular-nums', overflowWrap: 'anywhere' }}>
+                  {requestTime.label} {requestTime.value}
+                </time>
               </div>
               {expanded && (
-                <div data-orchestration-run-details={run.runId} style={{ margin: '0 8px 8px 36px', padding: '7px 8px', display: 'grid', gridTemplateColumns: '62px minmax(0, 1fr)', gap: '4px 7px', borderLeft: `2px solid ${presentation.color}`, background: '#121212', color: '#919191', fontSize: 9, lineHeight: 1.35 }}>
-                  <span>Состояние</span><span style={{ color: presentation.color }}>{presentation.label}</span>
-                  {run.notificationStatus && isSource && run.notifySource !== false && <><span>Доставка</span><span>{run.notificationStatus}</span></>}
-                  {details.map(([label, value]) => (
-                    <div key={`${run.runId}-${label}`} style={{ display: 'contents' }}>
-                      <span>{label}</span>
-                      <span style={{ color: label === 'Ошибка' || label === 'Ошибка доставки' || label === 'Результат' ? '#fca5a5' : '#c7c7c7', overflowWrap: 'anywhere' }}>{value}</span>
-                    </div>
-                  ))}
+                <div data-orchestration-run-details={run.runId} style={{ margin: '0 8px 8px 36px', padding: '7px 8px', display: 'grid', gridTemplateColumns: '68px minmax(0, 1fr)', gap: '4px 7px', borderLeft: `2px solid ${presentation.color}`, background: '#121212', color: '#919191', fontSize: 9, lineHeight: 1.35 }}>
+                  <RunDetailFields run={run} tabId={tabId} omitTime />
                   <span>runId</span><span style={{ color: '#aaa', fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.runId}</span>
                   <span />
                   <span style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>

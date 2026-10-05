@@ -15,7 +15,7 @@ test('manual recovery shows a static yellow timer and warning together', () => {
   const presentationEnd = source.indexOf('function StatusIcon', presentationStart);
   const presentation = source.slice(presentationStart, presentationEnd);
   const iconStart = presentationEnd;
-  const iconEnd = source.indexOf('function runTime', iconStart);
+  const iconEnd = source.indexOf('function RunDetailFields', iconStart);
   const statusIcon = source.slice(iconStart, iconEnd);
 
   assert.match(presentation, /run\.status === 'waiting_recovery'/);
@@ -129,5 +129,6 @@ test('external research uses the same tracker without a fake linked tab action',
   assert.match(source, /!\(isSource && run\.runKind === 'external-research'\)[\s\S]*?Открыть связанную вкладку/);
   assert.match(source, /run\.runKind !== 'external-research'[\s\S]*?!isOrchestrationResultProofPending\(run\)/);
   assert.match(source, /run\.externalResearchJobId[\s\S]*?<span>jobId<\/span>/);
-  assert.match(source, /run\.notificationStatus && isSource && run\.notifySource !== false/);
+  assert.match(source, /orchestrationDetailRows\(run, tabId\)/);
+  assert.equal((source.match(/<RunDetailFields run=\{run\} tabId=\{tabId\}/g) || []).length, 2);
 });

@@ -2680,6 +2680,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       side,
     );
     if (!res) return false;
+    const revealed = res.revealedWindowId ? res.panes[res.focusedIndex] : null;
+    if (revealed?.tabId && !st.openProjects.get(revealed.projectId)?.tabs.has(revealed.tabId)) return false;
     // New layout from single mode opens equal — see addTabToSplit.
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, ...(st.splitPanes.length === 0 ? { splitSizes: null } : {}) });
     const shown = get().splitPanes[get().splitFocusedIndex];
@@ -2707,6 +2709,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       side,
     );
     if (!res) return false;
+    const revealed = res.revealedWindowId ? res.panes[res.focusedIndex] : null;
+    if (revealed?.tabId && !st.openProjects.get(revealed.projectId)?.tabs.has(revealed.tabId)) return false;
     // New layout from single mode opens equal — see addTabToSplit.
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, ...(st.splitPanes.length === 0 ? { splitSizes: null } : {}) });
     const shown = get().splitPanes[get().splitFocusedIndex];

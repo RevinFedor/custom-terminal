@@ -206,6 +206,28 @@ async function mount() {
       emit('orchestration:changed', { run });
     }
   };
+  fixture.historyDetails = () => {
+    const createdAt = Date.parse('2026-10-04T15:10:31.022Z');
+    const error = 'Extension not connected (auto-wake failed; toggle the extension off/on)';
+    const base = { ...fixture.runs[0], createdAt, deliveryAcceptedAt: null, targetPromptProofAt: null,
+      completedAt: createdAt + 6200, sourceAttentionDismissedAt: createdAt + 9000 };
+    fixture.runs = [
+      { ...base, runId: 'details-browser-failed', runKind: 'external-research',
+        label: 'Browser audit with a deliberately long title', status: 'failed', outcome: 'failed',
+        completionReason: 'external-research-error', error, resultError: error, notificationStatus: 'sent',
+        deliveryAcceptedAt: createdAt + 6245, externalResearchStage: 'open_failed',
+        externalResearchJobId: 'synthetic-browser-job', targetTabName: 'ChatGPT - audit', targetProjectName: 'SC Desktop' },
+      { ...base, runId: 'details-completed-undelivered', status: 'completed', outcome: 'success',
+        completionReason: 'task_complete', resultComplete: true, label: 'Successful task; notification failed',
+        notificationStatus: 'failed', notificationError: 'Synthetic notification-only failure',
+        deliveryAcceptedAt: createdAt + 1000, targetPromptProofAt: createdAt + 1100 },
+      { ...base, runId: 'details-different-errors', status: 'failed', outcome: 'failed',
+        completionReason: 'future-specific-reason', label: 'Distinct error evidence', notificationStatus: 'unconfirmed',
+        error: 'Synthetic execution failure', resultError: 'Synthetic result proof failure' },
+    ];
+    version += 1;
+    render();
+  };
   fixture.overflow = () => {
     for (let index = 0; index < 6; index++) {
       const question = { ...fixture.messages[0], messageId: 'layout-extra-' + index,

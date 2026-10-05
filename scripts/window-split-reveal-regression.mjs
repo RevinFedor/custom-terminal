@@ -40,6 +40,8 @@ function installShim() {
   const deny = kind => { f.violations.push(kind); throw Error('Fixture forbids ' + kind); };
   const answer = (channel, payload) => {
     if (channel === 'file:read') return { success: true, content: '# Document ' + payload.split('/').pop() + '\n\nSynthetic file body. No terminal process exists.' };
+    if (channel === 'file:exists-batch') return Object.fromEntries(payload.map(file => [file,true]));
+    if (channel === 'agent:get-stopping-state') return { stopping: false };
     if (channel === 'project:list') return [{ id: 'split-reveal-project', name: 'Split fixture', path: '/synthetic-window-split' }];
     if (channel === 'project:get-tab-history-count') return 0;
     if (channel === 'app:getState') return saved.get(payload) ?? null;
@@ -166,7 +168,13 @@ try {
       if (side === 'right') await split(0).click();
       else { await split(0).click({ button: 'right' }); await page.locator(`[data-split-direction-item="${side}"]`).click(); }
     };
-    const openPicker = async index => { await pane(index).locator('[data-hidden-window-picker-button]').hover(); await popup.waitFor(); await frames(2); };
+    const openPicker = async index => {
+      // Escape leaves the pointer on the trigger. A real leave/re-entry is
+      // required to open another hover preview; do not fake mouseenter.
+      await page.mouse.move(800,15);
+      await pane(index).locator('[data-hidden-window-picker-button]').hover();
+      await popup.waitFor(); await frames(2);
+    };
     const pickWindow = async (target, exact) => {
       await openPicker(target);
       if (exact) await popup.locator(`[data-hidden-window-tab-id="${exact}"]`).click();
@@ -237,6 +245,7 @@ try {
       const after = await checkpoint('bad-after-'+(exact || 'background'));
       check('existing A + bare C + hidden B: '+(exact || 'background')+' consumes C without ghost',() => requireTwo(after,exact || 'b3'));
       check('recovered blank slot no longer exposes hidden-window popup',() => assert.equal(after.state.panes.filter(p => p.hidden).length,0));
+      if (red) { await openPicker(1); await checkpoint('ghost-popup-'+(exact || 'background')); }
     }
     await reset('filled'); await traceAction('filled-swap',() => pickWindow(1,null));
     const filled = await checkpoint('filled-swap');
@@ -247,6 +256,15 @@ try {
       assert.deepEqual(p.find(x => x.id === 'B').slots,['b1','b2','b3']);
     });
     if (!red) {
+      for (const target of [0,1]) {
+        await reset('bad');
+        // Focus-only controls in an unfocused pane appear after entering that
+        // pane, just as in the production header. Use the real body click.
+        if (target) await pane(target).click({ position: { x: 80, y: 100 } });
+        await traceAction('split-existing-empty-'+target,() => split(target).click());
+        const repaired = await checkpoint('split-existing-empty-'+target);
+        check('split from '+(target ? 'bare' : 'filled')+' header fills existing bare C with whole B',() => requireTwo(repaired));
+      }
       await reset('no-hidden'); await traceAction('empty-fallback',() => split(0).click());
       const fallback = await checkpoint('empty-fallback');
       check('no hidden content still creates a usable empty second column',() => {
@@ -285,6 +303,8 @@ try {
   result.failure = String(error?.stack || error); process.exitCode = 1;
   if (page) await page.screenshot({ path: path.join(artifact,'failure.png') }).catch(() => {});
   if (page) result.failedState = await page.evaluate(() => window.splitRevealFixture?.state?.()).catch(() => null);
+  if (page) result.failedRuntime = await page.evaluate(() => { const f=window.splitRevealFixture;
+    return { unknown:[...new Set(f?.unknown)], violations:f?.violations, errors:f?.earlyErrors }; }).catch(() => null);
 } finally {
   if (app) await app.close();
   if (worktreeCreated) execFileSync('git',['worktree','remove','--force',snapshot],{ cwd: repo, stdio: 'pipe' });

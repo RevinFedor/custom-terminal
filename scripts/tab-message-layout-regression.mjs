@@ -61,7 +61,8 @@ for (const name of ['PromptQueueOverlay', 'OrchestrationStatusChip', 'TabMessage
   report.source[file] = createHash('sha256').update(await fs.readFile(path.join(snapshot, file))).digest('hex');
 }
 for (const file of ['src/renderer/hooks/useRequestDockLayout.ts', 'src/renderer/hooks/useTabMessages.ts',
-  'src/renderer/utils/tabMessageProjection.ts', 'src/renderer/utils/requestTrackerVisibility.mjs', 'src/renderer/styles/globals.css']) {
+  'src/renderer/utils/tabMessageProjection.ts', 'src/renderer/utils/requestTrackerVisibility.mjs',
+  'src/renderer/utils/orchestrationDetails.mjs', 'src/renderer/styles/globals.css']) {
   report.source[file] = createHash('sha256').update(await fs.readFile(path.join(snapshot, file))).digest('hex');
 }
 for (const file of ['scripts/tab-message-layout-regression.mjs', 'scripts/fixtures/tab-message-layout.tsx']) {
@@ -207,6 +208,56 @@ for (const width of widths) await suite.test(`actual tab-message layout at ${wid
         assert.ok(send.right <= reply.left + 1 && source.right <= dismiss.left + 1, `${row.id}: controls overlap`);
       }
     };
+
+    await page.evaluate(() => window.tabMessageLayout.historyDetails());
+    await historyButton.click();
+    await historyPanel.waitFor();
+    const failedHistoryRow = historyPanel.locator('[data-orchestration-run-id="details-browser-failed"]');
+    await failedHistoryRow.locator('button[aria-expanded]').click();
+    const failedDetails = failedHistoryRow.locator('[data-orchestration-run-details]');
+    const detailText = await failedDetails.innerText();
+    assert.doesNotMatch(detailText, /Состояние|Доставка\s+sent|Причина\s|Исход\s/);
+    assert.equal(detailText.split('Extension not connected').length - 1, 1, 'same execution/result error must appear once');
+    assert.match(detailText, /Об ошибке доставлено/);
+    assert.match(detailText, /Не выполнено: ошибка внешнего исследования/);
+    assert.doesNotMatch(detailText, /Отправлен/, 'browser job acceptance must not invent ChatGPT delivery');
+    const date = failedHistoryRow.locator('[data-orchestration-request-time]');
+    const expectedDate = await page.evaluate(() => new Date('2026-10-04T15:10:31.022Z').toLocaleString('ru-RU', {
+      day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }));
+    assert.equal(await date.innerText(), 'Создан ' + expectedDate);
+    assert.equal((await failedHistoryRow.innerText()).split(expectedDate).length - 1, 1, 'request timestamp is not repeated in details');
+    assert.equal(await date.evaluate(node => node.scrollWidth <= node.clientWidth), true, 'creation date clipped by a long title');
+    assert.equal(await failedDetails.evaluate(node => node.scrollWidth <= node.clientWidth), true, 'details have horizontal overflow');
+    await page.screenshot({ path: path.join(runDir, 'history-failed-details.png') });
+    await failedHistoryRow.locator('button[aria-expanded]').click();
+    const successHistoryRow = historyPanel.locator('[data-orchestration-run-id="details-completed-undelivered"]');
+    await successHistoryRow.locator('button[aria-expanded]').click();
+    const successText = await successHistoryRow.locator('[data-orchestration-run-details]').innerText();
+    assert.match(successText, /Выполнено/);
+    assert.match(successText, /С результатом не доставлено/);
+    assert.match(successText, /Synthetic notification-only failure/);
+    assert.match(await successHistoryRow.locator('[data-orchestration-request-time]').innerText(), /Отправлен/);
+    await page.screenshot({ path: path.join(runDir, 'history-success-notification-failed.png') });
+    await successHistoryRow.locator('button[aria-expanded]').click();
+    const differentHistoryRow = historyPanel.locator('[data-orchestration-run-id="details-different-errors"]');
+    await differentHistoryRow.locator('button[aria-expanded]').click();
+    const differentText = await differentHistoryRow.locator('[data-orchestration-run-details]').innerText();
+    assert.match(differentText, /Synthetic execution failure/);
+    assert.match(differentText, /Synthetic result proof failure/);
+    assert.match(differentText, /future-specific-reason/);
+    assert.match(differentText, /Доставка уведомления не подтверждена/);
+    const historyDateGeometry = await historyPanel.locator('[data-orchestration-request-time]').evaluateAll(nodes => nodes.map(node => {
+      const date = node.getBoundingClientRect();
+      const header = node.parentElement.getBoundingClientRect();
+      const preceding = [...node.parentElement.querySelectorAll('button[aria-expanded] span')].map(child => child.getBoundingClientRect());
+      return { clipped: node.scrollWidth > node.clientWidth, contained: date.left >= header.left && date.right <= header.right,
+        overlaps: preceding.some(box => box.bottom > date.top + 1 && box.right > date.left && box.left < date.right) };
+    }));
+    assert.ok(historyDateGeometry.every(item => !item.clipped && item.contained && !item.overlaps), 'request date overlaps or clips on a long status/title');
+    result.checks.push('History: one error copy, combined outcome, notification distinct from execution, full minute dates, unknown evidence retained');
+    await page.keyboard.press('Escape');
+    await historyPanel.waitFor({ state: 'hidden' });
 
     for (const mode of ['pinned', 'preview']) {
       await page.evaluate(width => window.tabMessageLayout.reset(width), width);
