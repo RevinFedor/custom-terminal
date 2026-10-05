@@ -282,6 +282,26 @@ class SessionTranscriptService {
     this.codexForkSourceProofInflight = new Map();
   }
 
+  async getHistoryFreshnessContext(scope, sourceSessionIds = []) {
+    if (typeof this.promptPresentationStore?.getHistoryFreshnessMetadata !== 'function') {
+      throw new Error('history_freshness_metadata_unavailable');
+    }
+    const metadata = this.promptPresentationStore.getHistoryFreshnessMetadata({ ...scope, sourceSessionIds });
+    let runtime;
+    if (scope.toolType === 'codex') runtime = getCodexProcessActionOwnershipRevision(sourceSessionIds);
+    else {
+      if (typeof this.claudeData?._api?.getHistoryFreshnessRuntime !== 'function') {
+        throw new Error('history_freshness_runtime_unavailable');
+      }
+      runtime = await this.claudeData._api.getHistoryFreshnessRuntime(scope);
+    }
+    const reader = scope.toolType === 'codex' && this.historyReader ? {
+      clientId: this.historyReader.clientId, generation: this.historyReader.workerGeneration,
+      alive: !!this.historyReader.worker,
+    } : null;
+    return { metadata, runtime, reader };
+  }
+
   registerIpc() {
     ipcMain.handle('agent-transcript:subscribe', async (_event, payload = {}) => this.subscribe(payload));
     ipcMain.handle('agent-transcript:unsubscribe', async (_event, payload = {}) => this.unsubscribe(payload));
@@ -2255,6 +2275,7 @@ class SessionTranscriptService {
             success: true,
             unchanged: true,
             revision: payload.ifRevision,
+            ...(payload.freshnessProof === true ? { freshnessReadSources: virtualProjected?.physicalSources || payload.ifRevision.sources } : {}),
             ...(virtualProjected ? {
               contentRevision: contentRevision?.token || null,
               viewOwnerSessionId: sessionId,
@@ -2489,6 +2510,8 @@ class SessionTranscriptService {
       const settingsBaseline = codexSettingsWindowBaseline(rowWindow.entries, historyWindow, {
         sessionId, revision, payloadGeneration, contentRevision: contentRevision?.token || null,
       });
+      const freshnessFields = payload.freshnessProof === true
+        ? { freshnessReadSources: virtualProjected?.physicalSources || revision?.sources } : {};
       if (payloadPolicy === HISTORY_PAYLOAD_ON_DEMAND) historyWindow.entries = projectHistoryOnDemand({
         toolType, sessionId, entries: historyWindow.entries, onPayload,
       });
@@ -2583,6 +2606,7 @@ class SessionTranscriptService {
             revision,
             payloadGeneration,
             settingsBaseline,
+            ...freshnessFields,
             ...(virtualProjected ? {
               contentRevision: contentRevision?.token || null,
               viewOwnerSessionId: sessionId,
@@ -2644,6 +2668,7 @@ class SessionTranscriptService {
             payloadGeneration,
             settingsBaseline,
             hydrationRequest: rowWindowRequest,
+            ...freshnessFields,
           };
         }
       }
@@ -2673,6 +2698,7 @@ class SessionTranscriptService {
         revision,
         payloadGeneration,
         settingsBaseline,
+        ...freshnessFields,
         ...(virtualProjected ? {
           contentRevision: contentRevision?.token || null,
           viewOwnerSessionId: sessionId,
@@ -2704,6 +2730,9 @@ class SessionTranscriptService {
       cwd,
       bounds: payload.bounds || null,
     }, { sender });
+    if (payload.freshnessProof === true && result?.unchanged && !result.freshnessReadSources) {
+      result.freshnessReadSources = result.revision?.sources;
+    }
     if (!onDemand || !result?.success) return result;
     if (!(await validateHistoryRevision(result.revision, { toolType, sessionId, cwd })).unchanged) {
       return sourceAttempt < 2 ? this.getHistory(payload, sourceAttempt + 1, onPayload)

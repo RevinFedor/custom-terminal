@@ -5,12 +5,14 @@ const CODEX_CANONICAL_REASONS = new Set([
   'codex_image_placeholder_canonical',
   'codex_image_path_alias_exact',
   'codex_pty_crlf_materialized_as_double_lf',
+  'owned_mobile_attachment_paths',
 ]);
 const CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON =
   'claude_owned_composer_provider_transform';
 const CLAUDE_CANONICAL_REASONS = new Set([
   CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON,
   'claude_request_transport_exact',
+  'owned_mobile_attachment_paths',
 ]);
 
 function cleanString(value) {

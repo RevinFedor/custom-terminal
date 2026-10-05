@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import type { GeminiModelId } from '../constants/geminiModels';
 import { RUN_AFTER_LOOP_PROMPT_ID, DEFAULT_LOOP_PROMPT } from '../../shared/prompt-loop.mjs';
+import { DEFAULT_TAB_TITLE_PROMPT } from '../../shared/tab-title-prompt.mjs';
+export { DEFAULT_TAB_TITLE_PROMPT };
 export { RUN_AFTER_LOOP_PROMPT_ID };
 
 export type AIModel = GeminiModelId;
@@ -11,13 +13,14 @@ export const RUN_AFTER_TITLE_PROMPT_ID = 'run-after-title';
 export const PROMPT_SUMMARY_PROMPT_ID = 'prompt-summary';
 export const TIMELINE_GROUPING_PROMPT_ID = 'timeline-grouping';
 export const GIT_COMMIT_PROMPT_ID = 'git-commit';
-export const DEFAULT_TAB_TITLE_PROMPT = 'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.';
 export const DEFAULT_RUN_AFTER_TITLE_PROMPT = 'На основе текста задачи Run after придумай короткое название задачи. Верни только название: 2-7 слов, без кавычек, без точки, без markdown, без пояснений. Если текст на русском — название тоже на русском; если на английском — на английском.';
 export const DEFAULT_PROMPT_SUMMARY_PROMPT = 'Кратко передай смысл пользовательского сообщения для таймлайна, до 70 символов. Верни только пересказ: без кавычек, точки в конце и пояснений. Сохрани язык исходного сообщения. Формулируй действие или вопрос прямо; не добавляй слова «запрос», «просьба» или «диалог», если без них смысл ясен. Ровно один непрерывный смысловой акцент оберни одной парой одинарных звездочек; внутри может быть одно или несколько соседних слов. Вторую пару звездочек не используй. Примеры: проверить *конфликт инструментов с WebODM*; что такое *мультиселектор*. Не выделяй всю строку и не используй другой markdown.';
 export const DEFAULT_TIMELINE_GROUPING_PROMPT = 'Group a chronological list of user turns into a compact semantic outline.\nA group is one concrete work phase with at least two contiguous turns.\nKeep the hierarchy flat, preserve chronological order, and leave uncertain or isolated turns ungrouped.\nNever cross an item marked boundaryBefore.\nUse short titles and descriptions in the predominant language of the supplied turns.\nMeta-prompt markers describe workflow actions; do not infer their omitted template body.';
 export const DEFAULT_GIT_COMMIT_PROMPT = 'You write concise Git commit messages for local commits.\nReturn only JSON with keys "summary" and "description".\n\nRules:\n- The summary must be one line, imperative mood when possible, no trailing period, under 72 characters.\n- The description may be empty. If non-empty, use 1-4 short lines with concrete facts.\n- Do not mention files that are not present in the provided changes.\n- If docs/ changed, base the commit message on changed docs files only when the prompt data says docs-only context was applied.\n- If docs/ did not change, use all included changes.';
 
 export interface AIPrompt {
+  revision?: string;
+  editBase?: AIPrompt;
   id: string;              // built-ins like 'research' | 'compact' | 'tab-title' or 'prompt-<timestamp>'
   name: string;            // "Research", "Compact (Резюме)", "Code Review"
   content: string;         // Текст промпта
@@ -32,13 +35,14 @@ export interface AIPrompt {
 
 const { ipcRenderer } = window.require('electron');
 let loopPromptWriteRevision = 0;
+let systemPromptReadRevision = 0;
 
 interface PromptsStore {
   prompts: AIPrompt[];
   isLoaded: boolean;
   loadPrompts: () => Promise<void>;
   getPromptById: (id: string) => AIPrompt | undefined;
-  savePrompt: (prompt: AIPrompt) => Promise<void>;
+  savePrompt: (prompt: AIPrompt) => Promise<AIPrompt>;
   savePromptContent: (id: string, content: string) => Promise<void>;
   deletePrompt: (id: string) => Promise<void>;
   rewindPromptId: string;
@@ -153,9 +157,11 @@ export const usePromptsStore = create<PromptsStore>((set, get) => ({
   isLoaded: false,
 
   loadPrompts: async () => {
+    const readRevision = systemPromptReadRevision;
     const loopRevision = loopPromptWriteRevision;
     try {
       const result = await ipcRenderer.invoke('ai-prompts:get');
+      if (readRevision !== systemPromptReadRevision) return get().loadPrompts();
       if (result.success && Array.isArray(result.data) && result.data.length > 0) {
         const currentLoop = get().getPromptById(RUN_AFTER_LOOP_PROMPT_ID);
         const prompts = loopRevision !== loopPromptWriteRevision && currentLoop
@@ -169,7 +175,7 @@ export const usePromptsStore = create<PromptsStore>((set, get) => ({
 
       // Also load rewindPromptId from app_state
       const rewindId = await ipcRenderer.invoke('app:getState', 'rewindPromptId');
-      if (rewindId) {
+      if (rewindId && readRevision === systemPromptReadRevision) {
         set({ rewindPromptId: rewindId });
       }
     } catch (e) {
@@ -183,24 +189,30 @@ export const usePromptsStore = create<PromptsStore>((set, get) => ({
   },
 
   savePrompt: async (prompt: AIPrompt) => {
+    systemPromptReadRevision++;
     const loopRevision = prompt.id === RUN_AFTER_LOOP_PROMPT_ID ? ++loopPromptWriteRevision : null;
     try {
       const result = await ipcRenderer.invoke('ai-prompts:save', prompt);
-      if (prompt.id === RUN_AFTER_LOOP_PROMPT_ID && result?.success === false) throw new Error(result.error || 'Loop prompt save failed');
-      if (loopRevision !== null && loopRevision !== loopPromptWriteRevision) return;
+      if (result?.success === false) throw new Error(result.error || 'System prompt save failed');
+      const saved = result?.data || prompt;
+      if (loopRevision !== null && loopRevision !== loopPromptWriteRevision) return saved;
       // Update local state
       set((state) => {
         const idx = state.prompts.findIndex(p => p.id === prompt.id);
         if (idx >= 0) {
+          const current = state.prompts[idx];
+          if (current.revision && prompt.revision && current.revision !== prompt.revision && current.revision !== saved.revision) return state;
           const updated = [...state.prompts];
-          updated[idx] = prompt;
+          updated[idx] = saved;
           return { prompts: updated };
         } else {
-          return { prompts: [...state.prompts, prompt] };
+          return { prompts: [...state.prompts, saved] };
         }
       });
+      return saved;
     } catch (e) {
       console.error('[PromptsStore] Failed to save prompt:', e);
+      throw e;
     }
   },
 
@@ -221,19 +233,39 @@ export const usePromptsStore = create<PromptsStore>((set, get) => ({
 
   deletePrompt: async (id: string) => {
     try {
-      await ipcRenderer.invoke('ai-prompts:delete', id);
+      const result = await ipcRenderer.invoke('ai-prompts:delete', id);
+      if (result?.success === false) throw new Error(result.error || 'System prompt delete failed');
       set((state) => ({
         prompts: state.prompts.filter(p => p.id !== id)
       }));
     } catch (e) {
       console.error('[PromptsStore] Failed to delete prompt:', e);
+      throw e;
     }
   },
 
   rewindPromptId: 'rewind',
 
   setRewindPromptId: (id: string) => {
+    const previous = get().rewindPromptId;
     set({ rewindPromptId: id });
-    ipcRenderer.invoke('app:setState', { key: 'rewindPromptId', value: id });
+    ipcRenderer.invoke('ai-prompts:set-rewind', id).catch((error: Error) => {
+      if (get().rewindPromptId === id) set({ rewindPromptId: previous });
+      console.error('[PromptsStore] Rewind assignment failed:', error);
+    });
   }
 }));
+
+const onSystemPromptsChanged = (_event: unknown, change: { prompts?: AIPrompt[]; removedIds?: string[]; settings?: { rewindPromptId: string } }) => {
+  systemPromptReadRevision++;
+  const updated = new Map((change.prompts || []).map(prompt => [prompt.id, prompt]));
+  const removed = new Set(change.removedIds || []);
+  usePromptsStore.setState(state => ({
+    prompts: [...state.prompts.filter(prompt => !removed.has(prompt.id)).map(prompt => updated.get(prompt.id) || prompt),
+      ...(change.prompts || []).filter(prompt => !state.prompts.some(current => current.id === prompt.id))]
+      .sort((a, b) => a.position - b.position),
+    ...(change.settings ? { rewindPromptId: change.settings.rewindPromptId } : {}),
+  }));
+};
+ipcRenderer.on('ai-prompts:changed', onSystemPromptsChanged);
+if (import.meta.hot) import.meta.hot.dispose(() => ipcRenderer.removeListener('ai-prompts:changed', onSystemPromptsChanged));

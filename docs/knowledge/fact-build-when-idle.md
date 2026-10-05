@@ -127,7 +127,7 @@ blocker/error предыдущего. Это исключает launch storm о�
 | SDK Claude | `sdkSessions` | одна запись = один in-flight `query()` → `busy` |
 | Gemini | `geminiSpinnerBusy` | `busy` только при `=== true` |
 | Codex | `codexTurnWatchers` | блокирует только rollout `task_started → task_complete/turn_aborted`; живой idle Codex CLI не blocker |
-| Restart-after non-AI процесс | `terminalCommandState.isRunning` + `activeCommandSource === 'restart-after'` + (`tabs.restart_after_tab_ids` или legacy `tabs.restart_after_tab_id`) | `running`. Ручные shell-команды (`npm run dev`, `npm run build`, `./deploy.sh`) сами по себе **не блокируют** `build:i-obs`; blocker'ом становится только команда, которую реально запустил `Restart after`, пока у вкладки есть хотя бы одна trigger-подписка. AI CLI tabs исключены из этой ветки, потому что их PTY-процесс может быть живым и idle |
+| Restart-after non-AI процесс | `terminalCommandState.isRunning` + `activeCommandSource === 'restart-after'` + (`tabs.restart_after_workflow_ids`, `tabs.restart_after_tab_ids` или legacy `tabs.restart_after_tab_id`) | `running`. Ручные shell-команды (`npm run dev`, `npm run build`, `./deploy.sh`) сами по себе **не блокируют** `build:i-obs`; blocker'ом становится только команда, которую реально запустил `Restart after`, пока у вкладки есть хотя бы одна trigger-подписка. AI CLI tabs исключены из этой ветки, потому что их PTY-процесс может быть живым и idle |
 | Git-операции | `ipc/git.js` active operations registry | `kind:"git"` для generate/commit/undo/push/fetch/checkout пока операция in-flight. Это нужно для сценария Git run-after: AI-вкладка завершилась, Git-панель начала generate+commit, и `build:i-obs` не должен закрыть приложение между AI-trigger и фактическим commit/push |
 | Взведённая очередь (Run after / Loop) | persisted `promptQueueByTab` + `promptQueueSharedLoopPrompt` через `computePromptQueueInstallBlockers` | Общий endpoint по-прежнему проецирует обещание как `kind:"prompt-queue", status:"queued"`, но ручной `build:i-obs` отбрасывает этот пассивный вид перед подсчётом idle. Вооружённое условие на остановленной вкладке не является текущей работой; когда оно реально запускает `/compact` или следующий prompt, появившийся `claude`/`codex busy` снова блокирует сборку. Другие потребители `/api/active-loaders` сохраняют прежнюю семантику. |
 | Оркестрация | `orchestration-runs.json` через `OrchestrationRunStore.listActive()` | `kind:"orchestration"`: активный child блокирует реальный target и inherited source; `waiting_descendants` остаётся работой ветки; `completed + resultComplete=false` проецируется как `result-proof`; после terminal-state source остаётся `completion-handoff`, пока post-Enter audit не подтвердит точный `runId`. `waiting_recovery` и ошибка доставки также блокируют install как нерешённые состояния, но не считаются активной анимацией. Generic `busy:true` ничего из этого не снимает. Все tracked-состояния переживают restart и retention, а auto-stop запрещён до полного result-proof |
@@ -176,6 +176,23 @@ GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token
 Соответствует ментальной модели юзера: «закрыта такая-то вкладка… все вкладки закрыты». Печатает baseline-список один раз, потом по одной строке на каждое появление (`＋ active`) / уход в idle (`✓ idle`), затем `✓ all tabs idle`. Без очистки экрана → переживает scrollback, нет хрупкой cursor-математики.
 
 Если первый poll уже видит `idle:true`, wrapper пишет `✓ no install blockers`. Это специально не формулируется как «nothing running»: эндпоинт отвечает про безопасность install, а не про все процессы в приложении.
+
+04.10.2026: долгий observer12:05–19:30BKK удерживала не Inbox34. Полный scrollback
+Terminal и main-log подтвердили её `task_complete`14:40:19 / `✓ idle`14:40:20,
+без нового turn до quit. После16:01:14 до19:24 оставался один install blocker:
+Inbox2862 «система docs->uav», `orchestration:notification-blocked`, run
+`ee43c4fc-f108-479f-b3e6-46d0b9168a99`. Исполнитель4412 завершился15:21,
+resultComplete=true, но completion получил agent_send_handoff_conflict / failed,
+pasteWritten=false / enterWritten=false. Passive prompt-queue wrapper уже отфильтровал.
+Текущий feed сообщает лишь добавление/удаление tabId; смена codex busy на blocked
+notification при том же ID не создаёт новую строку, поэтому хвост «все idle» не
+доказывает очистку остатка. Проверять надо полный baseline и ActiveLoaders snapshot.
+Ремонт stable operationKey до completion FIFO уже присутствовал в вручную
+установленном app.asar после19:32, но старая failed-квитанция не стала delivered.
+Она также оставалась blocker после update: сначала получить/передать сохранённый
+ответ source2862, затем закрыть уведомление об ошибке; не повторять разработку
+у4412 и не считать dismiss доказательством AI-reading. В этом аудите состояние run,
+условия idle и production не менялись. Артефакт `/private/tmp/noted-build-obs-audit-20261004.vlkw4tba`.
 
 ### Гарантии безопасности
 - **`IDLE_CONFIRM=2`** (env-настраиваемо): ребилд только после N подряд idle-поллов. Гасит 1-тиковый разрыв между двумя turn'ами из очереди (turn A кончился → 0 на один полл → turn B стартанул).

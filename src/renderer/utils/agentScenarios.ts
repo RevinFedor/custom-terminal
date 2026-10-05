@@ -28,6 +28,7 @@ import {
 import { buildClaudeRewindPromptProjection } from './composerChips.mjs';
 import { enqueueAgentSendScenario } from './agentSendSequencer.mjs';
 import { prepareTabWorkContext, settleTabWorkContext, activateTabWorkContext } from './tabWorkContext';
+import { isStandaloneAgentLocalCommand } from './agentLocalCommand.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -63,6 +64,7 @@ export interface SendAgentPromptScenarioArgs {
   // authoring snapshot into model-visible history WITHOUT a model turn, then
   // reopen that exact session and wait for an idle composer.
   recordWithoutReply?: boolean;
+  authoringSnapshot?: { editorText: string; chips: readonly Record<string, any>[]; imagePaths: readonly HistoryPromptDraftImageRef[] };
   onRestartPhase?: (phase: 'stopping' | 'starting') => void;
   onHistoryRecorded?: (result: any) => void | Promise<void>;
   onReadyForSend?: (status: Extract<AgentPtyStatus, 'active' | 'busy'>) => void;
@@ -334,6 +336,39 @@ export function sendAgentPromptScenario(
   args: SendAgentPromptScenarioArgs,
 ): Promise<any> {
   if (!args.handoffId) args = { ...args, handoffId: 'context-send:' + crypto.randomUUID() };
+  if (!args.sendOperationKey && !args.recordWithoutReply && !isStandaloneAgentLocalCommand({ prompt: args.prompt })) {
+    const contractError = agentSendSettingsContractError(args);
+    if (contractError) return { success: false, accepted: false, submitted: false,
+      pasteWritten: false, code: 'agent_send_settings_contract_invalid', error: contractError };
+    // Admission returns independently of the physical send. Main persists the
+    // immutable request and re-enters this SAME scenario through the existing
+    // bridge with its operation/attempt identity only when this tab is at head.
+    const request = {
+      tabId: args.tabId, toolType: args.toolType, sessionId: args.sessionId,
+      expectedTarget: args.expectedTarget, cwd: args.cwd, prompt: args.prompt,
+      handoffId: args.handoffId, source: args.source, statusAtSend: args.statusAtSend,
+      queue: args.queue, requireLive: args.requireLive, settingsIntent: args.settingsIntent,
+      workContextPrepared: args.workContextPrepared,
+      returnDraftOnConflict: args.returnDraftOnConflict,
+      presentationSnapshot: args.presentationSnapshot, authoringSnapshot: args.authoringSnapshot,
+    };
+    return (async () => { try {
+      return await ipcRenderer.invoke('agent:enqueue-prompt', request);
+    } catch (error: any) {
+      // A lost IPC response may follow a committed admission. Keep this exact
+      // operation visible for reconciliation, never restore/resend it as new.
+      return { success: null, accepted: true, submitted: null, deliveryUnknown: true,
+        status: 'delivery-unknown', code: 'agent_send_admission_ack_unknown',
+        error: error?.message, handoffId: args.handoffId,
+        operationKey: `history:${args.tabId}:${args.handoffId}` };
+    } finally {
+      if (args.coordinatedSendToken) await settleCoordinatedAgentSend({
+        tabId: args.tabId, token: args.coordinatedSendToken,
+        runQueuedStop: () => stopAgentProcessScenario({ tabId: args.tabId, toolType: args.toolType,
+          runtime: args.runtime, reason: 'queued-stop-after-send' }),
+      });
+    } })();
+  }
   return enqueueAgentSendScenario({
     tabId: args.tabId,
     handoffId: args.handoffId,

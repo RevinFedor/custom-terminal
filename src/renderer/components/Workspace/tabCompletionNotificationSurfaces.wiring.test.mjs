@@ -15,6 +15,7 @@ const signals = readFileSync(join(workspaceDir, 'TabSignals.tsx'), 'utf8');
 const sidebar = readFileSync(join(workspaceDir, 'TabBar.tsx'), 'utf8');
 const menuControls = readFileSync(join(workspaceDir, 'TabNotificationControls.tsx'), 'utf8');
 const pane = readFileSync(join(workspaceDir, 'PaneTabChip.tsx'), 'utf8');
+const card = readFileSync(join(workspaceDir, 'TabCard.tsx'), 'utf8');
 const store = readFileSync(join(rendererDir, 'store/useWorkspaceStore.ts'), 'utf8');
 const css = readFileSync(join(rendererDir, 'styles/globals.css'), 'utf8');
 
@@ -24,18 +25,19 @@ test('sidebar and pane chip render the same completion-bell visual contract', ()
   assert.match(signals, /export function TabCompletionNotificationAlert/);
   assert.match(signals, /export function TabCompletionNotificationBadge/);
 
-  for (const source of [sidebar, pane]) {
+  assert.match(pane, /<TabCard/);
+  for (const source of [sidebar, card]) {
     assert.match(source, /resolveTabCompletionNotificationShadow/);
     assert.match(source, /useTabCompletionNotificationDismissing/);
     assert.match(source, /<TabCompletionNotificationAlert/);
-    assert.match(source, /<TabCompletionNotificationBadge armed=\{completionNotificationArmed\}/);
-    assert.match(source, /persistent=\{completionNotificationPersistent\}/);
+    assert.match(source, /<TabCompletionNotificationBadge armed=\{(?:completionNotificationArmed|armed)\}/);
+    assert.match(source, /persistent=\{(?:completionNotificationPersistent|persistent)\}/);
   }
 
-  assert.match(pane, /completionNotificationArmed === true/);
-  assert.match(pane, /completionNotificationFired === true/);
-  assert.match(pane, /const chipBoxShadow = \[\s*completionNotificationShadow,\s*activeStripeShadow,/);
-  assert.match(pane, /completionNotificationPersistent === true/);
+  assert.match(card, /completionNotificationArmed === true/);
+  assert.match(card, /completionNotificationFired === true/);
+  assert.match(card, /completionNotificationPersistent === true/);
+  assert.match(card, /showShownStripe && \(shown \|\| pressed\)/);
   assert.match(css, /\.tab-completion-notification-alert \{/);
   assert.match(css, /\.tab-completion-notification-alert--dismiss \{/);
 });
@@ -85,7 +87,11 @@ test('bell silhouette names the mode independently of its active color', () => {
   assert.equal(render({ armed: false, persistent: false, fired: false }), '');
   const once = render({ armed: true, persistent: false, fired: false });
   assert.match(once, /data-tab-notification-mode="once"/);
-  assert.match(once, /right:4px;top:-2px/);
+  assert.match(once, /right:0;top:-2px/);
+  assert.match(once, /width:3px;height:11px/, 'the anchor stays inside the rail to avoid scroll overflow');
+  assert.match(once, /width="3" height="11"/);
+  assert.match(once, /preserveAspectRatio="xMidYMid slice"/);
+  assert.match(once, /overflow:visible/, 'the full-size bell extends as vector ink, not an oversized HTML box');
   assert.match(once, /color:#f87171/);
   assert.match(once, /fill="none"/);
   const persistent = render({ armed: false, persistent: true, fired: false });
@@ -98,7 +104,7 @@ test('bell silhouette names the mode independently of its active color', () => {
   assert.doesNotMatch(once + persistent, /animation|animate-spin/);
 });
 
-test('turning off persistent notifications also cancels the pending or unread one-shot alert', () => {
+test('turning off persistent notifications also cancels the pending or unread one-shot alert', async () => {
   const ast = ts.createSourceFile('useWorkspaceStore.ts', store, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   let actionSource = null;
   const visit = (node) => {
@@ -121,16 +127,19 @@ test('turning off persistent notifications also cancels the pending or unread on
     const cleared = [];
     const saved = [];
     const published = [];
-    const action = vm.runInNewContext(`(${actionSource})`, {
+    const action = vm.runInNewContext(ts.transpileModule(`(${actionSource})`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText, {
       get: () => ({ openProjects }),
       set: (value) => published.push(value),
       emitTabCompletionNotificationCleared: (value) => cleared.push(value),
+      emitTabCompletionNotificationStateChanged: () => {},
       logRestartAfterState: () => {},
-      saveTabs: (...args) => saved.push(args),
+      saveTabs: (...args) => { saved.push(args); return Promise.resolve({success:true}); },
       console: { warn: () => {} },
     });
 
-    action('project', 'tab', false);
+    await action('project', 'tab', false);
     assert.equal(tab.completionNotificationPersistent, undefined);
     assert.equal(tab.completionNotificationArmed, undefined, 'no final one-shot bell remains');
     assert.equal(tab.completionNotificationFired, undefined, 'old unread signal is cleared');
@@ -139,7 +148,7 @@ test('turning off persistent notifications also cancels the pending or unread on
     assert.equal(published.length, 1);
     assert.equal(saved.length, 1, 'persistent setting is saved');
 
-    action('project', 'tab', true);
+    await action('project', 'tab', true);
     assert.equal(tab.completionNotificationPersistent, true);
     assert.equal(tab.completionNotificationArmed, true, 'explicit re-enable arms the next completion');
     assert.equal(tab.completionNotificationFired, undefined);

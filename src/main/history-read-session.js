@@ -8,4 +8,15 @@ function historyReadSession(info) {
   return { ...info, sessionId: readId };
 }
 
-module.exports = { historyReadSession };
+function historyReadOwnerFromProjection(persisted, runtime, hasCodexRuntime = false) {
+  if (persisted?.toolType === 'claude' && persisted.sessionId) return persisted;
+  if (persisted?.toolType !== 'codex' || !hasCodexRuntime) return null;
+  return historyReadSession({ ...persisted, ...(runtime || {}),
+    sessionId: runtime?.sessionId || null,
+    readSessionId: runtime?.readSessionId || null,
+    writerSessionId: runtime?.provenWriterSessionId || null,
+    writerConfirmed: runtime?.writerConfirmed === true,
+  });
+}
+
+module.exports = { historyReadSession, historyReadOwnerFromProjection };

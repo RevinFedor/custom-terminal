@@ -70,6 +70,41 @@ Discovery файла сессии (`findCodexSessionFile` — полный walk 
 
 Атрибуция «медленного subscribe»: `[Perf:IpcSlow] channel=agent-transcript:subscribe` меряет invoke→ответ, то есть включает очередь за чужим main-блокером. Проба `[TranscriptService:SubscribeSlow] ensureMs=…` печатается только когда СОБСТВЕННАЯ работа handler'а превысила 50мс: IpcSlow без этой строки рядом = виноват сосед (искать по `MainLoopGap.ops`), с ней = реальный медленный `_ensureState`.
 
+## Ранняя свежесть native History, отдельно от runtime
+
+04.10 пользователь потребовал не ждать тяжёлой History, чтобы понять, устарел ли
+видимый iPhone-кэш: в реальном возврате busy уже закончился, а новые rows пришли
+позже. `busy=false`, runtimeRevision и SSE sequence не подтверждают доставку
+истории или успешный outcome. Новый opt-in `freshness=v1` связывает ответ
+прежнего reader с фактически прочитанными physical witnesses и metadata;
+лёгкий `/api/history-freshness` сравнивает их без parse/lineage/worker admission.
+Сохранённый read SID допустим для остановленной вкладки, но не становится writer.
+
+Это bounded набор сертификатов зависимостей **от реального reader**, не второй
+кэш содержимого. До первого подтверждённого чтения, после eviction/restart или
+изменения topology ответ unknown: каталог не должен тайком готовить все сессии.
+Проверка делает async stat и прежнюю validation по dev:ino/size/mtime/ctime;
+SQLite witnesses транзакционно учитывают chips, timing/alias/joined duration и
+lineage, включая записи другого connection. Счётчик watcher не доказывает
+отсутствие пропущенного append. Epoch меняется при restart; поколение worker
+тоже участвует, чтобы старый page/payload owner не оживал после его смерти.
+
+Full/unchanged/delta несут `historyFreshness` с exact window coverage. Клиент
+сохраняет её только после публикации соответствующих rows; более поздний dirty
+event не очищается старым HTTP reply. Неизменившееся certified окно отвечает до
+тяжёлой подготовки. Для virtual Fork/Rewind берутся физические, не обрезанные
+логические snapshots: parent append может вызвать лишнюю проверку, но не расширяет
+замороженную историю. Неизвестные новые зависимости могут потребовать одного
+дополнительного выбранного чтения. Pending/unknown не превращаются в fresh по
+deadline. Wire и правила сравнения — `fact-mobile-web.md::Ранняя свежесть кэша`.
+
+В Claude устранён prerequisite-дефект: equal size раньше позволял прикрепить
+новые stat к старому recordMap после replacement/rewrite. Теперь совпадает
+физический witness; timestamp-only touch сохраняет прежний graph лишь после
+точной потоковой hash-проверки. Обычный unchanged остаётся stat-only, append —
+suffix-only. Необъявленная in-place rewrite+growth всё ещё требует штатной writer
+invalidation, как Codex; эти metadata не обещают hash всего prefix на каждом GET.
+
 ## Тёплая пауза наблюдения (park/unpark)
 
 Уход последнего consumer'а раньше немедленно уничтожал state — и возврат на вкладку заново читал тот же файл целиком, хотя фоновая подписка секунду назад держала данные актуальными (прод: девять переключений за 11с → LongTask 1088мс на полных перечитках при готовом кэше). Теперь state переходит в «тёплую паузу» на 90с: файл не перечитывается, но и НЕ публикуется наружу — иначе фоновая сессия кормила бы событиями подсистемы, для которых её никто не показывает. Возврат внутри окна забирает то же состояние и один раз догоняет пропущенный хвост. Спящих сессий максимум восемь, самая старая вытесняется. Логи: `[TranscriptService:Park] reason=no-consumers graceMs=90000` / `[TranscriptService:Unpark] idleMs=`.

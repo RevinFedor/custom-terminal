@@ -25,6 +25,8 @@ function normalizeChip(value) {
   const result = { id, kind, text: value.text };
   if (typeof value.label === 'string') result.label = value.label;
   if (typeof value.sourceKey === 'string' && value.sourceKey) result.sourceKey = value.sourceKey;
+  if (typeof value.replaySourceKey === 'string' && value.replaySourceKey) result.replaySourceKey = value.replaySourceKey;
+  if (typeof value.replayChipId === 'string' && value.replayChipId) result.replayChipId = value.replayChipId;
   if (Number.isFinite(Number(value.createdAt)) && Number(value.createdAt) > 0) {
     result.createdAt = Number(value.createdAt);
   }

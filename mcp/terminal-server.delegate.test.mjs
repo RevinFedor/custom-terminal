@@ -10,6 +10,69 @@ import { fileURLToPath } from 'node:url';
 
 const terminalServerPath = fileURLToPath(new URL('./terminal-server.mjs', import.meta.url));
 
+test('Codex Goal tools read exact state and choose only an addressed native option', async t => {
+  const h = await createHarness(t, (body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { codexGoal: { version: 1 } } } }
+    : { status: 200, body: { status: 'available', availableActions: ['resume', 'leave-paused'], ...body } });
+  await h.invoke({ tabId: 'target' }, 'get_codex_goal');
+  await h.invoke({ tabId: 'target', operationId: 'op', action: 'leave-paused', requestId: 'choice' }, 'resolve_codex_goal');
+  await h.invoke({ tabId: 'target', requestId: 'choice' }, 'get_codex_goal');
+  assert.deepEqual(h.requests.filter(x => x.url !== '/api/me'), [
+    { method: 'GET', url: '/api/terminal-tabs/target/codex/goal', body: {} },
+    { method: 'POST', url: '/api/terminal-tabs/target/codex/goal', body: { operationId: 'op', requestId: 'choice', action: 'leave-paused' } },
+    { method: 'GET', url: '/api/terminal-tabs/target/codex/goal?requestId=choice', body: {} },
+  ]);
+});
+
+test('Codex Goal errors retain recovery identity and cannot fall back to terminal keys or Resume', async t => {
+  const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { codexGoal: { version: 1 } } } }
+    : { status: 409, body: { error: 'goal-action-outcome-unknown', code: 'goal-action-outcome-unknown', status: 'rejected' } });
+  const result = await h.invoke({ tabId: 'target', operationId: 'op', action: 'resume' }, 'resolve_codex_goal');
+  assert.equal(result.result.isError, true);
+  assert.equal(result.result.structuredContent.code, 'goal-action-outcome-unknown');
+  assert.equal(result.result.structuredContent.requestId, h.requests[1].body.requestId);
+  assert.ok(h.requests[1].body.requestId);
+  assert.equal(h.requests.length, 2);
+  const old = await createHarness(t, () => ({ status: 200, body: { capabilities: {} } }));
+  const failed = await old.invoke({ tabId: 'target', operationId: 'op', action: 'resume' }, 'resolve_codex_goal');
+  assert.equal(failed.result.isError, true);
+  assert.match(failed.result.content[0].text, /requires an update/);
+  assert.deepEqual(old.requests.map(x => x.method + ' ' + x.url), ['GET /api/me']);
+});
+
+test('System Prompts tools route editor fields and revisions through the dedicated API', async t => {
+  const harness = await createHarness(t, (body, _index, req) => {
+    if (req.url === '/api/me') return { status: 200, body: { capabilities: { systemPrompts: { version: 1 } } } };
+    return { status: 200, body: { prompt: { id: 'tab-title', revision: 'current', ...body } } };
+  });
+  await harness.invoke({}, 'list_system_prompts');
+  await harness.invoke({ promptId: 'tab-title' }, 'get_system_prompt');
+  const fields = { name: 'Заголовок', content: 'короткая тема', model: 'gemini-3.8-flash', thinkingLevel: 'NONE',
+    color: '#22c55e', showInContextMenu: false, position: 5, filePaths: ['/tmp/title.md'] };
+  await harness.invoke({ promptId: 'tab-title', revision: 'before', ...fields }, 'update_system_prompt');
+  await harness.invoke({ promptId: 'my-custom', name: 'Custom', content: 'body' }, 'create_system_prompt');
+  await harness.invoke({}, 'get_system_prompt_settings');
+  await harness.invoke({ revision: 'settings-before', rewindPromptId: 'my-custom' }, 'update_system_prompt_settings');
+  await harness.invoke({ promptId: 'my-custom', revision: 'delete-before' }, 'delete_system_prompt');
+  const calls = harness.requests.filter(req => req.url !== '/api/me');
+  assert.deepEqual(calls.map(req => [req.method, req.url]), [
+    ['GET', '/api/system-prompts'], ['GET', '/api/system-prompts/tab-title'], ['PATCH', '/api/system-prompts/tab-title'],
+    ['POST', '/api/system-prompts'], ['GET', '/api/system-prompts/settings'], ['PATCH', '/api/system-prompts/settings'],
+    ['DELETE', '/api/system-prompts/my-custom'],
+  ]);
+  assert.deepEqual(calls[2].body, { ...fields, revision: 'before' });
+  assert.deepEqual(calls[3].body, { id: 'my-custom', name: 'Custom', content: 'body' });
+});
+
+test('System Prompts on an older app fail before any mutation or saved-library fallback', async t => {
+  const harness = await createHarness(t, () => ({ status: 200, body: { capabilities: {} } }));
+  const response = await harness.invoke({ promptId: 'tab-title', revision: 'old', content: 'new' }, 'update_system_prompt');
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /requires an update.*System Prompts/);
+  assert.deepEqual(harness.requests.map(req => [req.method, req.url]), [['GET', '/api/me']]);
+});
+
 function readJsonLine(stream, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     let buffer = '';
@@ -43,7 +106,7 @@ function readJsonLine(stream, timeoutMs = 5000) {
   });
 }
 
-async function createHarness(t, respond) {
+async function createHarness(t, respond, { historyApi = false } = {}) {
   const home = await mkdtemp(join(tmpdir(), 'terminal-mcp-delegate-'));
   const discoveryDir = join(home, '.noted-terminal');
   const projectId = 'test-project';
@@ -72,7 +135,7 @@ async function createHarness(t, respond) {
     updatedAt: Date.now(),
   }), 'utf8');
   await writeFile(join(discoveryDir, `mcp-port-${ownerPid}`), JSON.stringify({
-    port: 1,
+    port: historyApi ? webPort : 1,
     openProjectPaths: [projectPath],
     openProjects: [{ id: projectId, path: projectPath, name: 'test-project' }],
     updatedAt: Date.now(),
@@ -130,6 +193,43 @@ test('read_draft preserves full transferred authoring data and its outcome', asy
   assert.deepEqual(body.draftTransfer, draft.draftTransfer);
   assert.equal(body.success, false);
   assert.equal(body.error, draft.error);
+});
+
+test('filtered user history and batch body reads preserve exact filters, cursors and refs', async t => {
+  const harness = await createHarness(t, (body, _index, req) => ({ status: 200, body:
+    req.url === '/overseer/capabilities' ? { userMessageHistory: { version: 1 } } : { messages: [], body } }), { historyApi: true });
+  const search = { sessionIds: ['sid-a', 'sid-b'], dateFrom: '2026-08-01', dateTo: '2026-10-05',
+    promptName: 'Product review', query: 'actual request', kinds: ['user', 'context-only'], limit: 10, sessionLimit: 2, cursor: 'opaque' };
+  const first = await harness.invoke(search, 'search_user_messages');
+  assert.equal(first.result.isError, undefined);
+  const url = new URL(harness.requests[1].url, 'http://fixture');
+  assert.equal(url.pathname, '/overseer/user-messages');
+  assert.equal(url.searchParams.get('sessionIds'), 'sid-a,sid-b');
+  assert.equal(url.searchParams.get('kinds'), 'user,context-only');
+  assert.equal(url.searchParams.get('dateFrom'), '2026-08-01');
+  assert.equal(url.searchParams.get('promptName'), 'Product review');
+  const read = { messages: [{ sessionId: 'sid-a', turnIndex: 2, userUuid: 'uuid', textHash: 'a'.repeat(64) }], maxChars: 2000, cursor: 'next-page' };
+  await harness.invoke(read, 'get_user_messages');
+  assert.deepEqual(harness.requests.at(-1), { method: 'POST', url: '/overseer/user-messages/read', body: read });
+});
+
+test('new history methods reject an old application before source reads', async t => {
+  const harness = await createHarness(t, () => ({ status: 404, body: { error: 'Unknown overseer route' } }), { historyApi: true });
+  for (const [name, args] of [['search_user_messages', { project: 'p' }], ['get_user_messages', { messages: [] }], ['session_stats', { sessionId: 's', diagnosticsOnly: true }]]) {
+    const response = await harness.invoke(args, name);
+    assert.equal(response.result.isError, true);
+    assert.match(response.result.content[0].text, /app update required/);
+  }
+  assert.deepEqual(harness.requests.map(row => row.url), Array(3).fill('/overseer/capabilities'));
+});
+
+test('history errors retain provider diagnostics and the precise lineage reason', async t => {
+  const harness = await createHarness(t, () => ({ status: 409, body: { error: 'lineage_unresolved',
+    code: 'history_lineage_unresolved', lineageReason: 'provider-history-base-absent', diagnostics: { expectedProvider: 'codex' } } }), { historyApi: true });
+  const response = await harness.invoke({ sessionId: 'old-fork' }, 'session_stats');
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /provider-history-base-absent/);
+  assert.match(response.result.content[0].text, /expectedProvider/);
 });
 
 test('existing targets infer their provider while newly created targets keep the Claude default', async (t) => {

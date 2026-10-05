@@ -336,10 +336,14 @@ export default function SidebarToolsRow({ projectId, presentation = 'workspace',
         // Панель сужается до 140px — ряд обязан пережить это, а не выдавить
         // последнюю кнопку за край без следа. Полоса прокрутки спрятана: она
         // съела бы половину высоты ряда; обычный wheel листает ряд вбок без Shift.
-        overflowX: 'auto',
+        overflowX: 'hidden',
         overflowY: 'hidden',
         borderBottom: '1px solid rgba(255,255,255,0.06)',
       }}
+    >
+      <div data-sidebar-tools-scroll className="scrollbar-hide"
+        style={{ display: 'flex', alignItems: 'center', gap: 3, flex: '1 1 auto', minWidth: 0,
+          height: '100%', overflowX: 'auto', overflowY: 'hidden' }}
       onWheel={(event) => {
         const element = event.currentTarget;
         if (element.scrollWidth <= element.clientWidth) return;
@@ -447,7 +451,11 @@ export default function SidebarToolsRow({ projectId, presentation = 'workspace',
           </button>
         </ControlHint>
       )}
-      {trailingControls}
+      </div>
+      {trailingControls && <div data-sidebar-tools-trailing
+        style={{ display: 'flex', alignItems: 'center', flex: '0 0 auto', marginLeft: 'auto' }}>
+        {trailingControls}
+      </div>}
     </div>
   );
 }

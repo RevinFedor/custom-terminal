@@ -53,6 +53,23 @@ test('portable parts use the desktop serializer and perform zero file/image mate
   assert.doesNotMatch(result.prompt, /Attached files from iOS/);
 });
 
+test('declared upload files are exact UTF-16 text-part spans handled by the existing serializer', async () => {
+  const path = '/not-read/документ.pdf', prefix = '📄 PDF: ';
+  const input = { version: 1, imagePaths: [], chips: [{ id: 'p', kind: 'paste', text: 'PASTE' }],
+    parts: [{ kind: 'paste', chipId: 'p' }, { kind: 'text', text: '\n' + prefix + path,
+      uploadFiles: [{ path, start: 1 + prefix.length, end: 1 + prefix.length + path.length, name: 'документ.pdf' }] }] };
+  await assert.rejects(prepareStructuredAuthoring(input), /supported terminal Send upload ownership/);
+  const before = clone(input), result = await prepareStructuredAuthoring(input, { allowUploadFiles: true });
+  assert.deepEqual(input, before);
+  assert.equal(result.prompt, codec.serializeComposerDraft(input).trim());
+  assert.equal(result.uploadAttachments[0].path, path);
+  const range = result.uploadFileRanges[0]; assert.equal(result.prompt.slice(range.start, range.end), path);
+  const bound = bindStructuredAuthoringPresentation(result.presentationSnapshot, result.prompt, 'EXACT PREFIX\n' + result.prompt);
+  const moved = bound.authoringTransport.fileRanges[0];
+  assert.equal(('EXACT PREFIX\n' + result.prompt).slice(moved.start, moved.end), path);
+  assert.equal(result.authoringSnapshot.parts[1].text, input.parts[1].text, 'binary upload is not a fabricated context_file body');
+});
+
 test('Rewind -> edited portable parts -> Send -> audited History -> Rewind retains all metadata', async () => {
   const original = draft();
   const presentationText = codec.serializeComposerDraft({ parts: original.parts, chips: original.chips });

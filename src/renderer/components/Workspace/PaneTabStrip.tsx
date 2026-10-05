@@ -1,5 +1,5 @@
 // Wrapped tab chips in a window header. All places stay visible; the first
-// chip and project icon are one flex item. DnD owns only the preview/order.
+// chip and project icon are one inline box. DnD owns only the preview/order.
 
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -328,13 +328,10 @@ export default function PaneTabStrip({
         });
       }}
       style={{
-        display: 'flex',
-        // В переносе полоса — это НЕСКОЛЬКО строк, и выравнивать их по центру
-        // общей коробки нечего: строки заполняются сверху вниз.
-        alignItems: 'flex-start',
-        gap: 4,
+        // Do not create a flex/BFC here: inline descendants must wrap beside
+        // the header's action float, then below it at the FULL pane width.
+        display: 'block',
         minWidth: 0,
-        flex: 1,
       }}
     >
       <div
@@ -345,68 +342,67 @@ export default function PaneTabStrip({
         data-pane-key={paneKey}
         data-space-id={activeSpaceId}
         style={{
-          display: 'flex',
-          alignItems: 'center',
-          // Перенос строк вместо прокрутки. Вертикальный зазор — тот же, что
-          // между чипами по горизонтали, чтобы вторая строка не выглядела
-          // отдельным блоком под первой.
-          flexWrap: 'wrap',
-          gap: 6,
-          rowGap: 6,
+          display: 'block',
+          // Inline boxes flow around the first-row actions. Explicit spaces
+          // supply the same 6px gap as before, and collapse at line breaks;
+          // margins would also charge a trailing gap against each row's width.
+          fontSize: 0,
+          lineHeight: 0,
+          wordSpacing: 6,
+          // Keep the final row gutter inside the measured header as well:
+          // subtracting it with a negative margin leaves the strip's hit box
+          // over the content below and can steal its top controls' clicks.
           minWidth: 0,
-          flex: 1,
           overflowX: 'clip',
           overflowY: 'clip',
         }}
       >
         {renderItems.map((item, itemIndex) => (item.kind === 'chooser' ? (
-          <PaneChooserChip
-            key={`chooser:${item.slotId}`}
-            slotId={item.slotId}
-            paneIndex={paneIndex}
-            selected={item.slotId === selectedSlotId}
-            paneFocused={focused}
-          />
+          <React.Fragment key={`chooser:${item.slotId}`}>
+            {/* The chooser compensates its border with -1px margins. Keep its
+                physical top/bottom aligned with the adjacent full cards. */}
+            <span style={{ display: 'inline-flex', verticalAlign: 'top', padding: '1px 0', marginBottom: 6, wordSpacing: 'normal' }}>
+              <PaneChooserChip
+                slotId={item.slotId}
+                paneIndex={paneIndex}
+                selected={item.slotId === selectedSlotId}
+                paneFocused={focused}
+              />
+            </span>{' '}
+          </React.Fragment>
         ) : (
           <React.Fragment key={`${item.projectId}:${itemIndex}`}>
             {item.tabIds.map((tabId, tabIndex) => (
-              <span
-                key={tabId}
-                data-strip-item
-                data-strip-tab-id={tabId}
-                data-strip-project-start={tabIndex === 0 ? item.projectId : undefined}
-                // Чип НЕ сжимается в полосе. Обёртка — элемент flex-строки, а
-                // flex по умолчанию ужимает элементы, лишь бы строка влезла:
-                // ширина обёртки становилась меньше чипа, а сам чип шире не
-                // становился (`whiteSpace: nowrap`, обрезки нет намеренно —
-                // под нижней кромкой висят квадратики задач). Итог — чипы
-                // наезжали друг на друга, и прокручивать было нечего: строка
-                // «влезала».
-                //
-                // Лишний чип переходит на следующую строку целиком.
-                // The project label and its first tab are one flex item, so
-                // wrapping cannot strand the icon on the preceding line.
-                // Tight inner spacing and a wider run boundary make the icon
-                // read as a prefix of the tabs to its right.
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 3,
-                  marginLeft: tabIndex === 0 && itemIndex > 0 ? 4 : undefined,
-                  flexShrink: 0, minWidth: 0 }}
-              >
-                {tabIndex === 0 && <StripProjectIcon projectId={item.projectId} />}
-                <PaneTabChip
-                  projectId={item.projectId}
-                  tabId={tabId}
-                  shown={tabId === shownTabId}
-                  paneFocused={focused}
-                  paneIndex={paneIndex}
-                  inSplit={inSplit}
-                  index={indexOfTab.get(tabId) ?? 0}
-                  inStrip={inStrip}
-                  sharedActivity={sharedActivity}
-                  previewOnly={!baseEntryIds.has(tabId)}
-                  dragPlaceholder={paneDrag.active && paneDrag.source?.entries.some((entry) => entry.tabId === tabId)}
-                />
-              </span>
+              <React.Fragment key={tabId}>
+                <span
+                  data-strip-item
+                  data-strip-tab-id={tabId}
+                  data-strip-project-start={tabIndex === 0 ? item.projectId : undefined}
+                  // The project label and its first tab are one inline box, so
+                  // wrapping cannot strand the icon on the preceding line.
+                  // Tight inner spacing and a wider run boundary make the icon
+                  // read as a prefix of the tabs to its right.
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 3,
+                    verticalAlign: 'top', marginBottom: 6, wordSpacing: 'normal',
+                    marginLeft: tabIndex === 0 && itemIndex > 0 ? 4 : undefined,
+                    flexShrink: 0, minWidth: 0 }}
+                >
+                  {tabIndex === 0 && <StripProjectIcon projectId={item.projectId} />}
+                  <PaneTabChip
+                    projectId={item.projectId}
+                    tabId={tabId}
+                    shown={tabId === shownTabId}
+                    paneFocused={focused}
+                    paneIndex={paneIndex}
+                    inSplit={inSplit}
+                    index={indexOfTab.get(tabId) ?? 0}
+                    inStrip={inStrip}
+                    sharedActivity={sharedActivity}
+                    previewOnly={!baseEntryIds.has(tabId)}
+                    dragPlaceholder={paneDrag.active && paneDrag.source?.entries.some((entry) => entry.tabId === tabId)}
+                  />
+                </span>{' '}
+              </React.Fragment>
             ))}
           </React.Fragment>
         )))}

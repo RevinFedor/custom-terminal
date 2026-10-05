@@ -8,6 +8,7 @@ import { transformSync } from 'esbuild';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, 'OrchestrationStatusChip.tsx'), 'utf8');
+const rowSource = fs.readFileSync(path.join(here, 'RequestTrackerRow.tsx'), 'utf8');
 
 test('manual recovery shows a static yellow timer and warning together', () => {
   const presentationStart = source.indexOf('function runPresentation');
@@ -23,7 +24,8 @@ test('manual recovery shows a static yellow timer and warning together', () => {
   assert.match(statusIcon, /presentation\.icon === 'recovery'/);
   assert.match(statusIcon, /presentation\.icon === 'recovery'[\s\S]*?<Timer size=\{13\}/);
   assert.match(statusIcon, /<CircleAlert size=\{10\}/);
-  assert.match(statusIcon, /width: 26, height: 14/);
+  assert.match(statusIcon, /<RequestTrackerStatus/);
+  assert.match(rowSource, /width: 26, height: 14/);
 });
 
 test('yellow delivery and queued states use a static timer instead of a frozen loader', () => {
@@ -66,7 +68,8 @@ test('incomplete result proof can be detached from the tooltip and compact statu
 
 test('active orchestration runs stack vertically and open top-aligned details on the left', () => {
   assert.match(source, /data-orchestration-active-list[\s\S]*?flexDirection: 'column'/);
-  assert.match(source, /data-orchestration-active-list[\s\S]*?overflowY: 'auto'/);
+  assert.match(source, /data-orchestration-activity-dock[\s\S]*?overflowY: 'auto'/);
+  assert.doesNotMatch(source.slice(source.indexOf('data-orchestration-active-list'), source.indexOf('{statusRuns.map')), /overflowY/);
   assert.match(source, /data-orchestration-active-run=\{run\.runId\}[\s\S]*?borderBottom:/);
   assert.match(source, /<Tooltip[\s\S]*?side="left"[\s\S]*?align="start"/);
 });
@@ -90,10 +93,14 @@ test('retry count is an integer 1..10 and only its config input is disabled with
   assert.match(source, /после ответа или вызова инструмента отсчёт начинается заново/);
 });
 
-test('request settings remain available without delegation history while empty History stays hidden', () => {
+test('request controls keep fixed slots and shared History admits message-only activity', () => {
   assert.doesNotMatch(source, /if \(orderedRuns\.length === 0\) return null/);
-  assert.match(source, /\{orderedRuns\.length > 0 && <button\s+type="button"\s+data-orchestration-history-button/);
-  assert.match(source, /<\/button>\}\s*<button\s+type="button"\s+data-orchestration-settings-button/);
+  assert.doesNotMatch(source, /\{orderedRuns\.length > 0 && <button/);
+  assert.match(source, /<button\s+type="button"\s+data-orchestration-history-button/);
+  assert.match(source, /<\/button>\s*<button\s+type="button"\s+data-orchestration-settings-button/);
+  assert.match(source, /messages\.threads\.map\(thread/);
+  assert.match(source, /data-orchestration-activity-dock[\s\S]*?position: 'absolute'/);
+  assert.match(source, /renderTooltipActions\(run, true\)/);
 });
 
 test('deferred delivery to a busy target is waiting, not an error or an already delivered request', () => {

@@ -4,6 +4,7 @@ import { historyLivePresentationIdentities } from './historyLiveProjection.mjs';
 import {
   HISTORY_TERMINAL_PREVIEW_LIVE_LABEL,
   HISTORY_TERMINAL_PREVIEW_SYNC_LABEL,
+  HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL,
   filterHistoryTerminalPreviewLiveDuplicate,
   historyTerminalPreviewHandoffAction,
   historyTerminalPreviewHandoffAnchor,
@@ -12,6 +13,8 @@ import {
   historyTerminalPreviewHasNewUserGesture,
   historyTerminalPreviewHasCanonicalIdentity,
   historyTerminalPreviewStatusLabel,
+  historyTerminalPreviewHandoffRebaseVerdict,
+  historyTerminalPreviewHandoffCoversPreview,
   resolveHistoryTerminalPreviewCanonicalTarget,
 } from './historyTerminalPreviewHandoff.mjs';
 
@@ -24,6 +27,43 @@ const handoff = {
   gestureGeneration: 3,
   phase: 'waiting-row',
 };
+
+test('renderer epoch replacement needs exact canonical data/hash before a new scoped handoff', () => {
+  const pending = { ...handoff, phase: 'waiting-row', canonicalIdentity: 'codex-assistant-source-S-829539335',
+    canonicalTextHash: '7c340ad9cfc2', previewItemIds: ['item617'] };
+  const proof = { previewId: pending.previewId, ownerKey: pending.ownerKey,
+    ownerGeneration: 9, presentationVisit: 12, presented: true,
+    canonicalInPresentation: true, canonicalTextHash: pending.canonicalTextHash };
+  assert.equal(historyTerminalPreviewHandoffRebaseVerdict(pending, proof), 'rebase');
+  assert.equal(historyTerminalPreviewHandoffOwnsWrite(pending, proof), false,
+    'proof must not grant write authority to the OLD epoch');
+  assert.equal(historyTerminalPreviewHandoffOwnsWrite({ ...pending, ownerGeneration: 9, presentationVisit: 12 }, proof), true);
+  for (const [patch, reason] of [
+    [{ ownerKey: 'other-session' }, 'foreign-owner'],
+    [{ previewId: 'other-preview' }, 'foreign-preview'],
+    [{ presented: false }, 'hidden'],
+    [{ canonicalInPresentation: false }, 'waiting-canonical'],
+    [{ canonicalTextHash: 'changed-offset-body' }, 'waiting-canonical-integrity'],
+  ]) assert.equal(historyTerminalPreviewHandoffRebaseVerdict(pending, { ...proof, ...patch }), reason);
+  assert.equal(historyTerminalPreviewHandoffRebaseVerdict({ ...pending, canonicalTextHash: null }, proof), 'waiting-canonical-integrity');
+});
+
+test('ordinary handoff and post-Footer geometry keep their original current scope', () => {
+  const scope = { previewId: handoff.previewId, ownerKey: handoff.ownerKey,
+    ownerGeneration: handoff.ownerGeneration, presentationVisit: handoff.presentationVisit };
+  assert.equal(historyTerminalPreviewHandoffRebaseVerdict(handoff, scope), 'current');
+  assert.equal(historyTerminalPreviewHandoffRebaseVerdict({ ...handoff, phase: 'clearing-preview' }, { ...scope, previewId: '' }), 'current');
+  assert.equal(historyTerminalPreviewHandoffRebaseVerdict({ ...handoff, phase: 'waiting-row' }, { ...scope, previewId: '' }), 'foreign-preview');
+});
+
+test('canonical617 proof cannot own new/unknown response items of the same turn', () => {
+  const pending = { ...handoff, previewItemIds: ['saved617'] };
+  const preview = { previewId: pending.previewId, responseSegments: [{ itemId: 'saved617' }] };
+  assert.equal(historyTerminalPreviewHandoffCoversPreview(pending, preview), true);
+  assert.equal(historyTerminalPreviewHandoffCoversPreview(pending, { ...preview,
+    responseSegments: [{ itemId: 'unknown245' }, { itemId: 'next-live' }] }), false);
+  assert.equal(historyTerminalPreviewHandoffCoversPreview(pending, { ...preview, previewId: 'other-turn' }), false);
+});
 
 test('native Claude canonical UUID retires its exact commentary preview across live and durable carriers', () => {
   // Actual H1 failure, Claude 2.1.261. Main clear carries the raw JSONL UUID;
@@ -84,6 +124,13 @@ test('preview label reflects durable proof without exposing transport details', 
   );
   assert.doesNotMatch(HISTORY_TERMINAL_PREVIEW_LIVE_LABEL, /terminal|jsonl|api/i);
   assert.doesNotMatch(HISTORY_TERMINAL_PREVIEW_SYNC_LABEL, /terminal|jsonl|api/i);
+  assert.equal(historyTerminalPreviewStatusLabel({ phase: 'settled' }),
+    HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL);
+  assert.equal(historyTerminalPreviewStatusLabel({ deliveryState: 'unknown' }),
+    HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL);
+  assert.equal(historyTerminalPreviewStatusLabel({ phase: 'settled', canonicalMaterialized: true }),
+    HISTORY_TERMINAL_PREVIEW_SYNC_LABEL);
+  assert.doesNotMatch(HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL, /live|saved|terminal|jsonl|api/i);
 });
 
 test('handoff ownership rejects stale owner, generation, visit and hidden presentation', () => {

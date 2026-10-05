@@ -88,6 +88,9 @@ function createTerminalHistoryPreviewController({
     phase: state.phase,
     sourceMode: state.sourceMode || 'screen',
     text: state.text,
+    // The turn can continue through tools while a previous response item is
+    // complete but unconfirmed. Each block describes its own generation state.
+    ...(state.sourceMode === 'semantic' ? { responseSegments: semanticSegments(state) } : {}),
     textHash: state.text ? previewTextHash(state.text) : null,
     startedAt: state.startedAt,
     updatedAt: state.updatedAt,
@@ -358,6 +361,25 @@ function createTerminalHistoryPreviewController({
     .filter((text) => text.length > 0)
     .join('\n\n');
 
+  const semanticSegments = (state) => {
+    const items = state.semanticItemOrder.map(id => state.semanticItems.get(id))
+      .filter(item => item?.materialized !== true && item?.text);
+    const fullLength = items.reduce((size, item) => size + item.text.length, 0)
+      + Math.max(0, items.length - 1) * 2;
+    const cut = Math.max(0, fullLength - MAX_PREVIEW_CHARS);
+    let offset = 0;
+    return items.flatMap((item) => {
+      const start = offset;
+      offset += item.text.length + 2;
+      const text = item.text.slice(Math.max(0, cut - start));
+      return text ? [{ itemId: item.itemId, requestId: item.requestId,
+        text, phase: state.phase === 'settled' || item.completed === true
+          || item.deliveryState === 'unknown' ? 'settled' : 'streaming',
+        deliveryState: item.deliveryState || 'pending',
+      }] : [];
+    });
+  };
+
   const semanticItemDiagnostic = (item) => {
     const text = normalizedSemanticText(item?.text);
     return {
@@ -366,6 +388,8 @@ function createTerminalHistoryPreviewController({
       messageId: short(item?.messageId, 18),
       completed: item?.completed === true,
       materialized: item?.materialized === true,
+      deliveryState: item?.deliveryState || 'pending',
+      deliveryReason: item?.deliveryReason || null,
       chars: text.length,
       hash: text ? previewTextHash(text) : '-',
     };
@@ -444,6 +468,9 @@ function createTerminalHistoryPreviewController({
           .find((candidate) => (
             candidate?.materialized !== true
             && candidate?.completed === true
+            // After transport closure, equal prose cannot prove the missing
+            // item's adoption. Only its exact canonical item id can retire it.
+            && candidate?.deliveryState !== 'unknown'
             && normalizedSemanticText(candidate.text) === receipt.text
           )) || null;
         if (item) match = receipt.itemId ? 'exact-text-after-id-miss' : 'exact-text';
@@ -594,6 +621,8 @@ function createTerminalHistoryPreviewController({
     }
     if (!event || typeof event !== 'object') return false;
     const provider = authority.provider || 'codex';
+    const current = turns.get(tabId);
+    if (current && !exactContext(current).ok) return false;
     if (provider === 'claude') {
       const state = turns.get(tabId);
       if (!state || state.provider !== provider || state.turnId !== event.turnId
@@ -610,7 +639,9 @@ function createTerminalHistoryPreviewController({
       authority.gap = gap === true;
       return true;
     }
-    if (type === 'request_failed') {
+    if (event.turnId && authority.turnId && event.turnId !== authority.turnId) return false;
+    if (event.threadId && authority.threadId && event.threadId !== authority.threadId) return false;
+    if (type === 'request_failed' || type === 'request_delivery_unknown') {
       const state = turns.get(tabId);
       if (!state || state.provider !== provider || state.sourceMode !== 'semantic') return false;
       if (event.turnId && state.turnId && String(event.turnId) !== String(state.turnId)) {
@@ -619,21 +650,37 @@ function createTerminalHistoryPreviewController({
       const requestId = String(event.requestId || '');
       if (!requestId) return false;
       const before = state.semanticItemOrder.length;
+      let retained = 0;
+      let metadataChanged = false;
       state.semanticItemOrder = state.semanticItemOrder.filter((itemId) => {
         const candidate = state.semanticItems.get(itemId);
         if (candidate?.requestId !== requestId || candidate?.materialized === true) return true;
+        if (candidate.completed === true || type === 'request_delivery_unknown') {
+          metadataChanged ||= candidate.deliveryState !== 'unknown';
+          candidate.deliveryState = 'unknown';
+          candidate.deliveryReason = String(event.reason || 'transport-closed');
+          retained += 1;
+          return true;
+        }
         state.semanticItems.delete(itemId);
         return false;
       });
-      state.semanticGap = false;
-      authority.gap = false;
+      if (type === 'request_failed') {
+        state.semanticGap = false;
+        authority.gap = false;
+      }
       const changed = setSemanticText(state, 'semantic-request-failed');
-      writeLog('warn', 'SEMANTIC_REQUEST_FAILED', state, {
+      if (!changed && metadataChanged && state.text) {
+        state.lastMergeReason = 'semantic-delivery-unknown';
+        scheduleFramePublication(state);
+      }
+      writeLog('warn', type === 'request_failed' ? 'SEMANTIC_REQUEST_FAILED' : 'SEMANTIC_DELIVERY_UNKNOWN', state, {
         request: short(requestId, 20),
         removed: before - state.semanticItemOrder.length,
+        retained,
         reason: String(event.reason || 'provider-request-failed'),
       });
-      return changed || before !== state.semanticItemOrder.length;
+      return changed || metadataChanged || before !== state.semanticItemOrder.length;
     }
     if (type !== 'assistant_delta'
       && type !== 'item_started'
@@ -646,6 +693,7 @@ function createTerminalHistoryPreviewController({
     if (!assistantEvent) return true;
     const itemId = String(event.itemId || item?.itemId || '');
     if (!itemId) return false;
+    if (current?.phase === 'settled' && current.turnId === event.turnId) return false;
     const state = ensureSemanticTurn({
       tabId,
       provider,
@@ -672,6 +720,7 @@ function createTerminalHistoryPreviewController({
         phase: null,
         completed: false,
         materialized: false,
+        deliveryState: 'pending',
         canonicalIdentity: null,
       };
       state.semanticItems.set(itemId, semanticItem);
@@ -683,6 +732,7 @@ function createTerminalHistoryPreviewController({
     if (item?.phase != null) semanticItem.phase = item.phase;
     const identityMatches = reconcileSemanticCanonicalReceipts(state);
     if (type === 'item_completed') {
+      const wasCompleted = semanticItem.completed === true;
       if (typeof item?.text === 'string') semanticItem.text = item.text;
       semanticItem.completed = true;
       // Item completion is the exact full text for this item and repairs any
@@ -692,7 +742,10 @@ function createTerminalHistoryPreviewController({
       const textMatches = reconcileSemanticCanonicalReceipts(state, {
         allowTextFallback: true,
       });
-      return setSemanticText(state, 'semantic-assistant-completed')
+      const textChanged = setSemanticText(state, 'semantic-assistant-completed');
+      const completionChanged = !wasCompleted && semanticItem.materialized !== true;
+      if (!textChanged && completionChanged && state.text) scheduleFramePublication(state);
+      return textChanged || completionChanged
         || identityMatches > 0
         || textMatches > 0;
     }

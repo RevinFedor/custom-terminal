@@ -24,12 +24,12 @@ Namespace объединён, ownership нет:
 **Чтение** — agent сам решает сколько контекста забрать, сервер не навязывает:
 - `list_open_sessions` — все Claude/Codex табы всех проектов: tabId, sessionId, cwd, project, createdAt + runtime-поля `status`, `busy`, `busySources`, `turnBusy`, `lastEventType/lastEventTs`. Для Claude дополнительно отдаёт `model`, `contextUsedPct/contextRemainingPct` и `contextSource` (`bridge` или persisted DB), если это видно из statusline bridge. Эти поля нужны регистратору: `isLive` означает только «PTY/таб жив», а не «ответ уже готов».
 - `session_stats` — масштаб **без контента**: turnCount, char-counts по ролям, toolUseCount, largestUserTurn/largestThinkingTurn, compact-счётчики, заметки/rewind-маркеры/docs-edits
-- `list_turns` — карта ходов: preview (220 char) + размеры каждого thinking/text-блока + имена tool_uses. Контент НЕ грузится
+- `list_turns` — карта ходов: preview (220 char) + размеры каждого thinking/text-блока + имена tool_uses. Полные тела не возвращаются клиенту, но canonical transcript подготавливается внутри приложения
 - `list_notes` — пользовательские якоря Timeline (заметки, rewind-маркеры, orphan-notes)
-- `get_user_prompt` / `get_thinking` / `get_assistant_text` — точечный pull одного блока, byte-range через `start/end` (negative offsets как в Python)
+- `get_user_prompt` / `get_thinking` / `get_assistant_text` — точечный pull одного блока, UTF-16 диапазон через `start/end` (negative offsets как в Python)
 - `get_turn_evidence` — историческая модель/effort и страничная карта инструментов одного выбранного хода; по точному `operationId` возвращает ограниченные input/result и их источник. `operationOffset/operationLimit` листают операции, `inputStart/inputEnd` и `resultStart/resultEnd` читают нужный диапазон; `maxChars` ограничен 65536
 
-**Два разных поиска по сессиям, и это не настройка порога.** `search_sessions`
+**Поиск обсуждения и поиск инструментов — разные операции.** `search_sessions`
 (`/overseer/search-sessions`) отвечает на «где я это обсуждал»: он строит
 turn-модель каждой сессии-кандидата и сравнивает запрос токенами с текстом
 промпта и видимым ответом. Правок файлов он не видит в принципе — сборщик
@@ -79,6 +79,73 @@ turn-модель каждой сессии-кандидата и сравнив
 ## Granular-чтение: почему agent decides volume
 
 19MB-сессия (262 turn'а) → читаемый overview за ~6K токенов. Сервер отдаёт **карту размеров** (`session_stats` → `list_turns`), агент видит где мясо и тянет точечно `get_thinking` только нужных ходов с byte-range для больших. Это не truncate-на-сервере: агент сам решает глубину. Эмпирически agent сначала зовёт thinking (плотнее текста — Claude в нём пересказывает задачу), text только если непонятно.
+
+## Фильтрованные пользовательские сообщения
+
+Для аудита пользовательского feedback `search_user_messages` читает прежнюю
+canonical turn-модель, но возвращает только выбранные user records и их refs.
+Это не новый transcript reader или индекс. Scope — один `project` либо явные
+`sessionIds`; `dateFrom/dateTo` относятся к времени сообщения, не созданию вкладки.
+`query` ищет подстроку только в полном user text. `promptName` сравнивается с
+историческим именем структурной saved_prompt-обёртки: упоминание и plain Markdown
+не доказывают вставку, context-update-id — другой вид контекста. Даже найденная
+обёртка не доказывает жест Opt+V. Примеры в Markdown code/blockquote не считаются
+обёртками вставки. Найденные `prompts/contextUpdates` возвращаются раздельно.
+
+Default `kinds:[user]` включает Claude queued_command. Complete leading AGENTS/
+environment и context wrappers отделяются от собственного пользовательского
+хвоста, а не выкидывают весь turn. Compact, служебный/агентский ввод и пустая
+continuation имеют отдельные классы. Durable semantic tag сильнее текстового
+service-envelope; у старого текста без sidecar классификация остаётся явно
+помеченной envelope evidence, а не независимым доказательством авторства.
+
+`get_user_messages({messages:[...ref],maxChars,cursor})` возвращает только выбранные
+полные canonical user bodies. Ref содержит sessionId, turnIndex, userUuid и textHash;
+изменение UUID/текста даёт явный отказ, не чтение другого сообщения по старому номеру.
+Budget тела60000 по умолчанию, максимум250000 UTF-16 символов и100refs за запрос;
+большое тело продолжается по nextCursor без разрыва surrogate pair. На странице
+сохраняются start/end/totalChars и признаки остатка. Ошибки прежних страниц
+не превращаются в complete=true при успешном последнем фрагменте.
+
+Search: default50/max200 строк и5/max25 сессий за страницу; дополнительные
+128000символов бюджета summaries, ограниченные названия/списки с явными flags.
+Пустая страница может иметь nextCursor. Cursor stateless, привязан к фильтрам,
+каталогу и source revision недочитанной сессии; изменение требует нового поиска.
+Порядок catalog-then-turn, не глобальная сортировка сообщений. Живой обход разных
+сессий не является атомарным снимком архива. scanComplete означает конец каталога;
+coverageComplete отдельно учитывает ошибки и неизвестные timestamps.
+
+Записи fork не считаются новыми использованиями промпта: copyStatus показывает
+доказанное наследование либо неизвестность; usageProof не выводится из равенства
+текста/имени. `evidenceTurnIndex/evidenceAddress` сохраняют границу канонического
+proof: послеcompact overview может создать пустую строку, тогда exact operation
+адресуется в предыдущем настоящем user-turn. Переносить proof по соседству без
+совпавшего operationId нельзя. Шрам04.10: map18 child2a561 → evidence16 по exact
+call_ROhEcHK0BzgjOGRBIl5K8MaI:canonical:3, без чтения raw JSONL агентом.
+
+Wire: GET `/overseer/user-messages`, POST `/overseer/user-messages/read`;
+`/overseer/capabilities.userMessageHistory.version=1` проверяется MCP до вызова.
+Новый MCP поверх старого Main требует app update, а не выдаёт пустой архив.
+
+## Недоступный источник и основание fork
+
+History resolver учитывает точную provider-column binding, общий availability
+resolver и прежний metadata lookup Codex. Ошибочный cwd не ограничивает поиск
+одним project directory. Отсутствующий Claude-файл больше не выдаётся за Codex
+только из-за fallback; missing, I/O unknown, provider conflict и lineage failure
+различаются. Error сохраняет diagnostics и lineageReason через HTTP и MCP.
+`session_stats({diagnosticsOnly:true})` читает metadata/availability без turn parse;
+наличие файла и записанной relation не обещает успешного canonical чтения.
+
+При архивном пробеле нельзя делать вывод о чистке по одному404. В UAV e4aa28e4
+старый живой shared resolver подтвердил именно Codex catalog и unresolved source
+в active/archived roots; альтернативный cwd не помог. Для6b47b298 найден child59MB,
+но отказ provider-history-base-absent означает legacy unknown relation без списка
+доказанных inherited UUID и пригодного provider history_base. Новая сборка даёт
+точную диагностику, но не восстанавливает отсутствующий файл или недостающий proof.
+Нельзя подставить parent как child или объявить все218missing/5lineage случаев
+восстановленными по двум примерам. Retention policy — fact-хранилище-сессий.md;
+факт удаления конкретного источника требует отдельного свидетельства.
 
 ## Ожидание ответа: status первичен, текст вторичен
 

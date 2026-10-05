@@ -475,7 +475,7 @@ test('Cmd-hover is the only alternate gesture and reaches canonical History reco
   assert.match(history, /sendAgentPromptScenario\(\{[\s\S]*recordWithoutReply,[\s\S]*onRestartPhase:/);
   assert.match(history, /const initialQueueStatus = recordWithoutReply[\s\S]*\? 'preparing'/);
   assert.match(history, /recordContextAcceptsFollowup[\s\S]*!recordContextAcceptsFollowup/);
-  assert.match(history, /authoringText: rawDraftSnapshot[\s\S]*authoringChips: sourceDraftChips/);
+  assert.match(history, /authoringText: rawDraftSnapshot[\s\S]*authoringChips: sendDraftChips/);
   assert.match(history, /history-context-head-failed[\s\S]*SEND_CASCADE_RESTORE/);
   assert.match(history, /source: 'history-panel'/);
 });

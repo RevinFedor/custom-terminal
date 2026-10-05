@@ -364,8 +364,26 @@ async function httpGetOnPort(port, endpoint) {
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (json.error || text));
+  if (!res.ok) throw historyHttpError(res.status, json, text);
   return json;
+}
+
+function historyHttpError(status, json, text) {
+  const details = { ...(json.code ? { code: json.code } : {}),
+    ...(json.lineageReason ? { lineageReason: json.lineageReason } : {}),
+    ...(json.diagnostics ? { diagnostics: json.diagnostics } : {}) };
+  return Object.assign(new Error('HTTP ' + status + ': ' + (json.error || text)
+    + (Object.keys(details).length ? '\n' + JSON.stringify(details) : '')), { status, ...details });
+}
+
+async function requireUserMessageHistory(cwd) {
+  try {
+    const capabilities = await httpGet('/overseer/capabilities', cwd);
+    if (capabilities?.userMessageHistory?.version === 1) return;
+  } catch (error) {
+    if (!/HTTP 404:.*Unknown overseer route/.test(error?.message || '')) throw error;
+  }
+  throw new Error('Noted Terminal app update required for filtered/batch user history and session diagnostics. This is not an empty archive; do not read raw transcript/storage files as a fallback.');
 }
 
 async function httpPost(endpoint, body, hintCwd) {
@@ -384,7 +402,7 @@ async function httpPostOnPort(port, endpoint, body) {
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (json.error || text));
+  if (!res.ok) throw historyHttpError(res.status, json, text);
   return json;
 }
 
@@ -425,6 +443,7 @@ async function httpApiGet(target, endpoint) {
     const error = new Error('HTTP ' + res.status + ': ' + (json.error || text));
     error.code = json.code;
     error.revision = json.revision;
+    if (/\/codex\/goal(?:\?|$)/.test(endpoint)) error.toolDetails = json;
     throw error;
   }
   return json;
@@ -445,6 +464,7 @@ async function httpApiPost(target, endpoint, body) {
     error.code = json.code;
     error.messageId = json.messageId;
     error.deliveryState = json.deliveryState;
+    if (/\/codex\/goal(?:\?|$)/.test(endpoint)) error.toolDetails = json;
     throw error;
   }
   return json;
@@ -756,7 +776,30 @@ function requireNonemptyString(value, field) {
   return value;
 }
 
+async function ensureSystemPromptSupport(target) {
+  const response = await httpApiGet(target, '/api/me');
+  if (response?.capabilities?.systemPrompts?.version !== 1) {
+    throw new Error('This Noted Terminal app requires an update for the System Prompts API. Insert Prompt is a separate library; no storage or whole-library fallback was attempted.');
+  }
+}
+
+async function ensureCodexGoalSupport(target) {
+  const response = await httpApiGet(target, '/api/me');
+  if (response?.capabilities?.codexGoal?.version !== 1) {
+    throw Object.assign(new Error('This Noted Terminal app requires an update for the Codex Goal action API. No keys, Send or Resume fallback was attempted.'), { code: 'app_update_required' });
+  }
+}
+const SYSTEM_PROMPT_FIELDS = {
+  name: { type: 'string' }, content: { type: 'string', description: 'Own system instruction text, not resolved file contents.' },
+  model: { type: 'string', description: 'Exact stored auxiliary model ID. Loop uses the tab agent instead.' },
+  thinkingLevel: { type: 'string', enum: ['NONE', 'LOW', 'MEDIUM', 'HIGH'] },
+  color: { type: 'string', description: '#RRGGBB' }, showInContextMenu: { type: 'boolean' },
+  position: { type: 'integer', minimum: 0 }, filePaths: { type: 'array', items: { type: 'string' }, description: 'Absolute linked-file paths; [] clears attachments.' },
+};
+const SYSTEM_PROMPT_SCOPE = { projectId: { type: 'string' }, cwd: { type: 'string' } };
+
 const ORCHESTRATION_COMPLETION_GUIDANCE = ' On apps advertising orchestrationInlineResults:{version:1}, the later completion notification normally carries the full answer. Check the actual notification: use an inline full answer directly; call get_delegation_result only if it says the result is omitted/oversize, does not include the full answer (including older apps), or for explicit recovery. Do not poll or wait inside the initiating turn.';
+const CODEX_GOAL_GUIDANCE = ' If native Codex reports codex_resume_goal_action_required, read get_codex_goal and use resolve_codex_goal for the authorized choice; do not retry Start/Send or synthesize terminal keys.';
 
 const STRUCTURED_JSON_TOOLS = new Set([
   'get_tab_context', 'list_tab_contexts', 'set_tab_responsibility', 'publish_context_update',
@@ -773,9 +816,60 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'import_external_conversation',
   'continue_external_research',
   'send_message', 'reply_to_message', 'get_message', 'get_send_receipt',
+  'get_codex_goal', 'resolve_codex_goal',
 ]);
 
 const TOOLS = [
+  {
+    name: 'get_codex_goal',
+    description: 'Read the native paused-Goal dialog and its exact operationId in an existing Codex tab, without starting it or pressing keys. Use after codex_resume_goal_action_required. Optional requestId reads a prior choice outcome after lost ACK. Pending/unknown is not permission to repeat Enter; do not poll.',
+    inputSchema: { type: 'object', properties: { tabId: { type: 'string' },
+      requestId: { type: 'string', description: 'Exact resolve_codex_goal request to recover, if needed.' },
+      projectId: { type: 'string' } }, required: ['tabId'] },
+  },
+  {
+    name: 'resolve_codex_goal',
+    description: 'Choose Resume Goal or Leave paused on the exact current native Codex Goal dialog returned by get_codex_goal. Requires availableActions and operationId; the app proves current screen/owner before arrow/Enter. leave-paused does not delete the goal or stop Codex. Does not resend a failed prompt, change global preferences or resume a stopped process. requestId retries must preserve the identical action/operation/tab; after unknown ACK use get_codex_goal with that requestId, not a new action. A key write alone is not confirmed choice.',
+    inputSchema: { type: 'object', properties: { tabId: { type: 'string' },
+      operationId: { type: 'string' }, action: { type: 'string', enum: ['resume', 'leave-paused'] },
+      requestId: { type: 'string', description: 'Exact idempotency key. Generated before network access if omitted.' },
+      projectId: { type: 'string' } }, required: ['tabId', 'operationId', 'action'] },
+  },
+  {
+    name: 'list_system_prompts',
+    description: 'List Settings System Prompts with IDs, revisions, editable fields and where each is used; excludes prompt bodies. This is separate from Opt+V text insertions.',
+    inputSchema: { type: 'object', properties: { ...SYSTEM_PROMPT_SCOPE, query: { type: 'string' } } },
+  },
+  {
+    name: 'get_system_prompt',
+    description: 'Read one Settings System Prompt, including content, linked paths, model, thinking, color, usage and revision. Read before editing. Does not resolve linked files or execute the instruction.',
+    inputSchema: { type: 'object', properties: { ...SYSTEM_PROMPT_SCOPE, promptId: { type: 'string' } }, required: ['promptId'] },
+  },
+  {
+    name: 'create_system_prompt',
+    description: 'Create a custom Settings System Prompt. Built-in IDs and execution roles cannot be created or reassigned. All normal editor fields are supported.',
+    inputSchema: { type: 'object', properties: { ...SYSTEM_PROMPT_SCOPE, ...SYSTEM_PROMPT_FIELDS, promptId: { type: 'string' } }, required: ['name'] },
+  },
+  {
+    name: 'update_system_prompt',
+    description: 'Patch one Settings System Prompt using its exact revision. Omitted fields are preserved; stale revisions fail without overwriting. Built-in execution roles are fixed; context-menu visibility is editable. Loop permits name/content/color/position only.',
+    inputSchema: { type: 'object', properties: { ...SYSTEM_PROMPT_SCOPE, ...SYSTEM_PROMPT_FIELDS, promptId: { type: 'string' }, revision: { type: 'string' } }, required: ['promptId', 'revision'] },
+  },
+  {
+    name: 'delete_system_prompt',
+    description: 'Delete one custom System Prompt with revision protection. Built-ins cannot be deleted; reassign Rewind first if it uses this prompt.',
+    inputSchema: { type: 'object', properties: { ...SYSTEM_PROMPT_SCOPE, promptId: { type: 'string' }, revision: { type: 'string' } }, required: ['promptId', 'revision'] },
+  },
+  {
+    name: 'get_system_prompt_settings',
+    description: 'Read the current selectable System Prompt assignments and their revision (currently Rewind). Fixed built-in roles are shown as usage on each prompt.',
+    inputSchema: { type: 'object', properties: SYSTEM_PROMPT_SCOPE },
+  },
+  {
+    name: 'update_system_prompt_settings',
+    description: 'Change the Rewind system-prompt assignment with the settings revision. The chosen prompt must exist and cannot be Run After Loop.',
+    inputSchema: { type: 'object', properties: { ...SYSTEM_PROMPT_SCOPE, revision: { type: 'string' }, rewindPromptId: { type: 'string' } }, required: ['revision', 'rewindPromptId'] },
+  },
   {
     name: 'get_tab_context',
     description: 'Read a tab responsibility, linked working Markdown files, and pending context updates. Does not launch or message the agent. Omit tabId for this full session. Before updating another tab, edit its linked Markdown when present; otherwise publish_context_update to that other tab. Reading your own tab with no linked Markdown is not a reason to publish an update to yourself.',
@@ -1205,13 +1299,48 @@ const TOOLS = [
     },
   },
   {
+    name: 'search_user_messages',
+    description: 'Search historical user messages in one project OR explicit sessionIds without returning assistant/tool payloads. Dates filter MESSAGE timestamps, not tab creation/closure. Default kinds=[user] includes Claude queued_command and retains user text after context/AGENTS wrappers. Exact promptName matches observed saved_prompt names, not mentions/plain Markdown/context-update-id; prompts include evidence, never proof of pressing Option+V. Fork copies have copyStatus/usageProof and are not new usage counts. Results contain bounded previews and exact refs for get_user_messages plus evidenceTurnIndex for get_turn_evidence. Follow nextCursor with unchanged filters; scanComplete is not coverageComplete when sources are missing. No raw transcript fallback. Requires updated Noted Terminal history API.',
+    inputSchema: {
+      type: 'object', properties: {
+        project: { type: 'string', description: 'Exact project id, path or name. Use this OR sessionIds.' },
+        sessionIds: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 100 },
+        dateFrom: { type: 'string', description: 'Inclusive message timestamp, ISO date/time.' },
+        dateTo: { type: 'string', description: 'Exclusive message timestamp, ISO date/time.' },
+        promptName: { type: 'string', description: 'Exact historical saved_prompt name, case-insensitive; context updates are not saved prompts.' },
+        query: { type: 'string', description: 'Literal substring of full user text, including plain Markdown. No assistant/tool search.' },
+        caseSensitive: { type: 'boolean' },
+        kinds: { type: 'array', items: { type: 'string', enum: ['user', 'context-only', 'project-instructions', 'agent-message', 'service', 'compact', 'continuation'] } },
+        limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum returned rows; default50.' },
+        sessionLimit: { type: 'integer', minimum: 1, maximum: 25, description: 'Maximum sessions inspected this page; default5. More coverage may require nextCursor even with zero matches.' },
+        cursor: { type: 'string', description: 'Opaque nextCursor; keep project/sessionIds and filters unchanged.' },
+        cwd: { type: 'string', description: 'Only chooses the Noted Terminal instance.' },
+      },
+    },
+  },
+  {
+    name: 'get_user_messages',
+    description: 'Read selected full canonical user bodies in a batch. Pass exact ref objects from search_user_messages; UUID plus textHash reject shifted/edited messages. maxChars is a total UTF-16 page budget, not silent truncation; repeat unchanged messages with nextCursor until complete, keeping all slices. Only selected user text is returned, never assistant/tools. errors and failedMessages remain explicit. Existing get_user_prompt still serves a single selected turn. Requires updated Noted Terminal history API.',
+    inputSchema: {
+      type: 'object', properties: {
+        messages: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'object', properties: {
+          sessionId: { type: 'string' }, turnIndex: { type: 'integer', minimum: 0 },
+          userUuid: { type: ['string', 'null'] }, textHash: { type: 'string' },
+        }, required: ['sessionId', 'turnIndex', 'userUuid', 'textHash'] } },
+        maxChars: { type: 'integer', minimum: 256, maximum: 250000, description: 'Total text budget per page; default60000.' },
+        cursor: { type: 'string' }, cwd: { type: 'string' },
+      }, required: ['messages'],
+    },
+  },
+  {
     name: 'session_stats',
-    description: 'Read metadata and size statistics for one Claude/Codex transcript without loading its content. Includes totalIterations, app-owned compact/fork historyEvents, separate visual tab relations, the live lifecycle wait gate, context/model data when available, Timeline note counts, and docs activity. Fork iteration coordinates are zero-based and describe the parent session at fork time.',
+    description: 'Read metadata and size statistics for one Claude/Codex transcript without returning its bodies. Default stats still prepares the canonical transcript; diagnosticsOnly reads saved bindings, availability and fork-proof metadata without turn preparation. Includes totalIterations, app-owned compact/fork historyEvents, separate visual tab relations, lifecycle, context/model data, notes and docs activity. Fork coordinates are zero-based. Missing source is not proof of deletion; lineageReason and diagnostics must remain explicit.',
     inputSchema: {
       type: 'object',
       properties: {
         sessionId: { type: 'string' },
         cwd: { type: 'string' },
+        diagnosticsOnly: { type: 'boolean', description: 'Read exact saved provider bindings, physical availability and compact fork-proof metadata without loading turns. A present file is not proof of readable lineage. Requires the updated app.' },
       },
       required: ['sessionId'],
     },
@@ -1519,7 +1648,7 @@ const TOOLS = [
   },
   {
     name: 'start_ai',
-    description: 'Start or resume an AI process (Claude, Codex, or Gemini) in an existing terminal tab using Noted Terminal native launch hooks. This is the AI-safe alternative to run_command("codex"/"claude"): it marks the tab as an AI tab and starts the correct session watcher. For a new tab, call create_tab with command "codex", "claude", "codex-c <sessionId>", or "claude-c <sessionId>".',
+    description: 'Start or resume an AI process (Claude, Codex, or Gemini) in an existing terminal tab using Noted Terminal native launch hooks. This is the AI-safe alternative to run_command("codex"/"claude"): it marks the tab as an AI tab and starts the correct session watcher. For a new tab, call create_tab with command "codex", "claude", "codex-c <sessionId>", or "claude-c <sessionId>".' + CODEX_GOAL_GUIDANCE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -2002,6 +2131,33 @@ async function callTool(name, args) {
       }, null, 2);
     }
 
+    case 'list_system_prompts':
+    case 'get_system_prompt':
+    case 'create_system_prompt':
+    case 'update_system_prompt':
+    case 'delete_system_prompt':
+    case 'get_system_prompt_settings':
+    case 'update_system_prompt_settings': {
+      const target = projectHint({ projectId: args.projectId || PARENT_PROJECT_ID(), cwd: args.cwd || PROJECT_CWD_() });
+      await ensureSystemPromptSupport(target);
+      const root = '/api/system-prompts';
+      let result;
+      if (name === 'list_system_prompts') result = await httpApiGet(target, root + qs({ query: args.query }));
+      else if (name === 'get_system_prompt_settings') result = await httpApiGet(target, root + '/settings');
+      else if (name === 'update_system_prompt_settings') result = await httpApiPatch(target, root + '/settings', { revision: args.revision, rewindPromptId: args.rewindPromptId });
+      else if (name === 'get_system_prompt') result = await httpApiGet(target, root + '/' + encodeURIComponent(requireNonemptyString(args.promptId, 'promptId')));
+      else {
+        const fields = Object.fromEntries(Object.keys(SYSTEM_PROMPT_FIELDS).filter(k => args[k] !== undefined).map(k => [k, args[k]]));
+        if (name === 'create_system_prompt') result = await httpApiPost(target, root, { ...fields, id: args.promptId });
+        else {
+          const endpoint = root + '/' + encodeURIComponent(requireNonemptyString(args.promptId, 'promptId'));
+          if (name === 'delete_system_prompt') result = await httpPromptLibraryMutation(target, 'DELETE', endpoint, { revision: args.revision });
+          else result = await httpApiPatch(target, endpoint, { ...fields, revision: args.revision });
+        }
+      }
+      return JSON.stringify(result, null, 2);
+    }
+
     case 'list_prompt_catalog': {
       const target = projectHint(args);
       const { payload: result, legacy } = await readPromptCatalog(target);
@@ -2411,13 +2567,31 @@ async function callTool(name, args) {
     }
 
     case 'session_stats': {
-      const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/stats' + qs({ cwd: args.cwd });
+      if (args.diagnosticsOnly) await requireUserMessageHistory(args.cwd || PROJECT_CWD_());
+      const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + (args.diagnosticsOnly ? '/diagnostics' : '/stats') + qs({ cwd: args.cwd });
       const result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       return JSON.stringify(
         await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD_(), result),
         null,
         2,
       );
+    }
+
+    case 'search_user_messages':
+    case 'get_user_messages': {
+      try {
+        await requireUserMessageHistory(args.cwd || PROJECT_CWD_());
+        const result = name === 'search_user_messages'
+          ? await httpGet('/overseer/user-messages' + qs({ ...args,
+              sessionIds: args.sessionIds?.join(','), kinds: args.kinds?.join(','), cwd: undefined }), args.cwd || PROJECT_CWD_())
+          : await httpPost('/overseer/user-messages/read', { messages: args.messages, cursor: args.cursor, maxChars: args.maxChars }, args.cwd || PROJECT_CWD_());
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        if (/Unknown overseer|Unknown mutation/.test(error?.message || '')) {
+          throw new Error('Noted Terminal app update required for filtered/batch user history. This is not an empty archive; do not read raw transcript/storage files as a fallback.');
+        }
+        throw error;
+      }
     }
 
     case 'get_session_progress': {
@@ -2668,6 +2842,35 @@ async function callTool(name, args) {
         target,
         '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/send-receipts?handoffId=' + encodeURIComponent(handoffId),
       ), null, 2);
+    }
+
+    case 'get_codex_goal': {
+      const tabId = requireNonemptyString(args.tabId, 'tabId');
+      const target = projectHint(args, tabId);
+      await ensureCodexGoalSupport(target);
+      return JSON.stringify(await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(tabId)
+        + '/codex/goal' + (args.requestId ? '?requestId=' + encodeURIComponent(args.requestId) : '')), null, 2);
+    }
+
+    case 'resolve_codex_goal': {
+      const tabId = requireNonemptyString(args.tabId, 'tabId');
+      const operationId = requireNonemptyString(args.operationId, 'operationId');
+      if (!['resume', 'leave-paused'].includes(args.action)) throw new Error('action must be resume or leave-paused');
+      const requestId = args.requestId === undefined ? randomUUID() : requireNonemptyString(args.requestId, 'requestId');
+      const target = projectHint(args, tabId);
+      let attempted = false;
+      try {
+        await ensureCodexGoalSupport(target);
+        attempted = true;
+        return JSON.stringify(await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(tabId)
+          + '/codex/goal', { operationId, requestId, action: args.action }), null, 2);
+      } catch (error) {
+        error.toolDetails = { ...(error.toolDetails || {}), tabId, operationId, requestId,
+          code: error.code || (attempted ? 'goal_action_outcome_unknown' : 'goal_action_preflight_failed'),
+          recovery: 'Read get_codex_goal with this tabId and requestId; do not press keys, restart, or create a new request to check delivery.' };
+        error.message += ' requestId=' + requestId + '. ' + error.toolDetails.recovery;
+        throw error;
+      }
     }
 
     case 'send_prompt': {

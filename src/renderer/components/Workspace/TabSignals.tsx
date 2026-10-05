@@ -52,16 +52,18 @@ const TAB_MARKER_HOVER_SCALE = 1.32;
 
 /** One completion-bell visual contract for sidebar cards and pane chips. */
 export const TAB_COMPLETION_NOTIFICATION_DISMISS_MS = 420;
-export const TAB_COMPLETION_NOTIFICATION_INSET_PX = 18;
 
-export function TabCompletionNotificationIcon({ persistent = false, size = 13, color }: {
+export function TabCompletionNotificationIcon({ persistent = false, size = 13, color, viewportWidth = size }: {
   persistent?: boolean;
   size?: number;
   color?: string;
+  /** A narrow anchor may let the full-size vector overhang without scroll overflow. */
+  viewportWidth?: number;
 }) {
-  return <Bell size={size} color={color} fill={persistent ? 'currentColor' : 'none'}
+  return <Bell size={size} width={viewportWidth} color={color} fill={persistent ? 'currentColor' : 'none'}
+    preserveAspectRatio={viewportWidth < size ? 'xMidYMid slice' : undefined}
     data-tab-notification-mode={persistent ? 'persistent' : 'once'}
-    style={{ flexShrink: 0 }} aria-hidden="true" />;
+    style={{ flexShrink: 0, overflow: viewportWidth < size ? 'visible' : undefined }} aria-hidden="true" />;
 }
 
 /** The bell names the enabled mode; the existing border still owns unread completion. */
@@ -70,6 +72,7 @@ export function TabCompletionNotificationBadge({ armed, persistent, fired }: {
   persistent: boolean;
   fired: boolean;
 }) {
+  const size = 11;
   const gapPx = useUIStore((s) => s.tabGeometry.gap);
   if (!armed && !persistent && !fired) return null;
   const label = persistent
@@ -78,17 +81,20 @@ export function TabCompletionNotificationBadge({ armed, persistent, fired }: {
   return <span data-tab-completion-notification-badge role="img" aria-label={label} title={label}
     style={{
       position: 'absolute',
-      right: TAB_PROCESS_BAR_W_PX + 1,
+      // The anchor covers the right rail; the SVG keeps its full 11px ink size.
+      // An overhanging HTML box would add a scrollbar to tightly fitted pickers.
+      // Keep this corner even when Settings place the process rail on the left.
+      right: 0,
       top: 1 - tabFastBadgeOutsidePx(gapPx),
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',
-      width: 11,
-      height: 11,
+      width: TAB_PROCESS_BAR_W_PX,
+      height: size,
       color: fired ? '#ef4444' : '#f87171',
       zIndex: 8,
     }}>
-    <TabCompletionNotificationIcon persistent={persistent} size={11} />
+    <TabCompletionNotificationIcon persistent={persistent} size={size} viewportWidth={TAB_PROCESS_BAR_W_PX} />
   </span>;
 }
 

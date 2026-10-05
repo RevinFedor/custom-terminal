@@ -2,6 +2,7 @@
 
 const { prepareClaudePromptTransport } = require('./claude-prompt-transport');
 const { agentPromptAuditMatchesHash } = require('./agent-prompt-audit-identity');
+const { attachmentProjectionSourceRecord } = require('./owned-mobile-attachments');
 
 const CLAUDE_REQUEST_TRANSPORT_REASON = 'claude_request_transport_exact';
 
@@ -9,6 +10,7 @@ const CLAUDE_REQUEST_TRANSPORT_REASON = 'claude_request_transport_exact';
 // but are not necessarily identical strings. Replay the existing transport
 // codec over the persisted pre-Enter pair, never normalize provider evidence.
 function validateClaudePromptRequestProjection({ tabId, record, audit } = {}) {
+  record = attachmentProjectionSourceRecord(record);
   const refused = reason => ({ valid: false, reason });
   const receipt = record?.receipt;
   if (record?.provider !== 'claude' || !receipt) return refused('claude-request-provider-mismatch');

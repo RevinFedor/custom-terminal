@@ -2352,6 +2352,7 @@ async function scanCodexStableSourceRewindProof(filePath, {
   let targetRecord = null;
   let taskStartedRecord = null;
   let pendingTaskStartedRecord = null;
+  let pendingSubmitUserRecord = null;
   let userMessageRecord = null;
   let threadRolledBackRecord = null;
   let stoppedAtProof = false;
@@ -2364,10 +2365,13 @@ async function scanCodexStableSourceRewindProof(filePath, {
     if (!raw) return false;
     const couldMatter = sourceLine === targetLine
       || (sourceLine > targetLine
-        && raw.includes('"event_msg"')
-        && (raw.includes('"task_started"')
-          || raw.includes('"user_message"')
-          || raw.includes('"thread_rolled_back"')));
+        && ((raw.includes('"event_msg"')
+          && (raw.includes('"task_started"')
+            || raw.includes('"user_message"')
+            || raw.includes('"task_complete"')
+            || raw.includes('"turn_aborted"')
+            || raw.includes('"thread_rolled_back"')))
+          || (raw.includes('"response_item"') && raw.includes('"message"') && raw.includes('"user"'))));
     if (!couldMatter) return false;
     let record;
     try {
@@ -2381,19 +2385,39 @@ async function scanCodexStableSourceRewindProof(filePath, {
       targetRecord = decorated;
       return false;
     }
-    if (record?.type !== 'event_msg') return false;
+    const userText = codexUserMessageAuditText(decorated);
+    const authoredUser = userText !== null
+      && !isCodexEnvironmentContextUserText(userText)
+      && !isCodexProjectInstructionsUserText(userText)
+      && !isCodexTurnAbortedUserText(userText)
+      && !isCodexGoalContinuationUserText(userText);
+    if (record?.type !== 'event_msg' && !authoredUser) return false;
     const timestampMs = parseTimestampMs(record.timestamp);
     if (!Number.isFinite(timestampMs) || timestampMs < actionAt) return false;
     if (record.payload?.type === 'task_started') {
       if (hasExpectedSubmit) {
         if (timestampMs >= expectedSubmitSentAt && byteOffset >= expectedSubmitFileSize) {
           pendingTaskStartedRecord = decorated;
+          pendingSubmitUserRecord = null;
         }
       } else if (!taskStartedRecord) {
         taskStartedRecord = decorated;
       }
-    } else if (record.payload?.type === 'user_message') {
+    } else if (authoredUser) {
       if (hasExpectedSubmit) {
+        // One task owns its first logical user input. Its response/event pair
+        // may arrive in separate records; use the existing carrier grammar so
+        // a canonical companion can confirm the same slot, never steering.
+        if (!pendingTaskStartedRecord) return false;
+        if (pendingSubmitUserRecord
+          && groupCodexPreferredUserMessageAuditRecords([
+            { record: pendingSubmitUserRecord }, { record: decorated },
+          ]).length !== 1) {
+          pendingTaskStartedRecord = null;
+          pendingSubmitUserRecord = null;
+          submitMismatchCount += 1;
+          return false;
+        }
         const actualText = codexUserMessageAuditText(decorated, {
           // Match the exact transport identity used by the live post-Enter
           // Codex audit. Presentation normalization is a different proof
@@ -2418,14 +2442,26 @@ async function scanCodexStableSourceRewindProof(filePath, {
         } else {
           submitMismatchCount += 1;
         }
-        // One task_started owns only its first logical user_message. A later
-        // exact prompt needs its own provider turn boundary.
-        pendingTaskStartedRecord = null;
+        if (pendingSubmitUserRecord || exactSubmit) {
+          pendingTaskStartedRecord = null;
+          pendingSubmitUserRecord = null;
+        } else {
+          // Pairing needs text and physical position, not retained image bytes.
+          pendingSubmitUserRecord = { type: decorated.type, __line: sourceLine,
+            __byteOffset: byteOffset, payload: decorated.type === 'response_item'
+              ? { type: 'message', role: 'user', content: [{ type: 'input_text', text: userText }] }
+              : { type: 'user_message', message: userText } };
+        }
       } else if (!userMessageRecord) {
         userMessageRecord = decorated;
       }
     } else if (record.payload?.type === 'thread_rolled_back' && !threadRolledBackRecord) {
       threadRolledBackRecord = decorated;
+      pendingTaskStartedRecord = null;
+      pendingSubmitUserRecord = null;
+    } else if (record.payload?.type === 'task_complete' || record.payload?.type === 'turn_aborted') {
+      pendingTaskStartedRecord = null;
+      pendingSubmitUserRecord = null;
     }
     return !!taskStartedRecord && !!userMessageRecord;
   };
@@ -3561,6 +3597,18 @@ function isCodexSubagentNotification(payload = {}) {
 }
 
 const CODEX_INTERRUPTED_HISTORY_TEXT = 'Conversation interrupted';
+
+function buildCodexInterruptedHistoryEntry(record, sessionId, turnIndex, { live = false } = {}) {
+  const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+  if (live && (!physicalSessionId || record?.type !== 'event_msg' || record.payload?.type !== 'turn_aborted'
+    || !Number.isSafeInteger(record.__byteOffset) || record.__byteOffset < 0)) return null;
+  const sourceIdentity = stableSourceIdentity(sessionId, record, 'codex-interrupted');
+  return { uuid: live && !Number.isSafeInteger(record.__line) ? sourceIdentity
+      : stableUuidForRecord(sessionId, record, 'codex-interrupted'),
+    sourceIdentity, role: 'interrupted', timestamp: recordTimestamp(record),
+    content: CODEX_INTERRUPTED_HISTORY_TEXT, sessionId: physicalSessionId,
+    ...(Number.isInteger(turnIndex) ? { turnIndex } : {}), serviceCarrier: 'turn-aborted' };
+}
 const CODEX_GOAL_CONTINUATION_HISTORY_TEXT = 'Goal continued';
 
 const { codexProviderErrorEntry } = require('../codex-provider-error');
@@ -4065,16 +4113,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       addStableSourceIdentityAlias(currentInterruptedNotice.entry, sourceIdentity);
       return;
     }
-    const entry = {
-      uuid: stableUuidForRecord(sessionId, record, 'codex-interrupted'),
-      sourceIdentity,
-      role: 'interrupted',
-      timestamp: recordTimestamp(record),
-      content: CODEX_INTERRUPTED_HISTORY_TEXT,
-      sessionId: physicalSessionId,
-      turnIndex: currentTurnIndex,
-      serviceCarrier: 'turn-aborted',
-    };
+    const entry = buildCodexInterruptedHistoryEntry(record, sessionId, currentTurnIndex);
     entries.push(entry);
     currentInterruptedNotice = { entry, turnIndex: currentTurnIndex, physicalSessionId };
   };
@@ -5753,33 +5792,32 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
   const pending = [];
   let currentTurnIndex = -1;
   let currentTurnKey = null;
+  let currentTurnCanonicalUserText = null;
 
-  const flushPending = (turnIndex) => {
-    const fallbackIndex = pending.findIndex((item) => {
-      if (!isCodexResponseUserRecord(item?.record)) return false;
-      const text = codexUserMessageAuditText(item.record) || '';
-      return !!text
-        && !text.includes('<subagent_notification>')
-        && !isCodexEnvironmentContextUserText(text)
-        && !isCodexProjectInstructionsUserText(text);
-    });
-    if (fallbackIndex >= 0) {
-      const fallbackText = codexUserMessageAuditText(pending[fallbackIndex].record) || '';
-      const turnStart = codexPendingStartForUserMessage(pending, fallbackText);
-      for (let index = 0; index < turnStart; index += 1) {
-        pushCodexVisibleWrapper(wrappers, pending[index].record, turnIndex, {
+  const flushPending = (turnIndex, batch = pending) => {
+    let cursor = 0;
+    // Response-only inputs (including Goal continuation) can precede the
+    // response/event pair of ANOTHER input without an assistant in between.
+    // Keep each exact physical carrier; the first fallback is not the whole
+    // batch and the next event must not absorb its prefix into the old turn.
+    for (let fallbackIndex = 0; fallbackIndex < batch.length; fallbackIndex += 1) {
+      if (!batch[fallbackIndex].fallbackUser) continue;
+      let turnStart = fallbackIndex;
+      while (turnStart > cursor && isCodexTurnPreambleRecord(batch[turnStart - 1].record)) turnStart -= 1;
+      for (let index = cursor; index < turnStart; index += 1) {
+        pushCodexVisibleWrapper(wrappers, batch[index].record, currentTurnIndex, {
           turnKey: currentTurnKey,
         });
       }
       currentTurnIndex = Math.max(currentTurnIndex, turnIndex) + 1;
-      currentTurnKey = turnKeyFor(pending[fallbackIndex].record);
-      for (let index = turnStart; index < pending.length; index += 1) {
-        const record = pending[index].record;
+      currentTurnKey = turnKeyFor(batch[fallbackIndex].record);
+      for (let index = turnStart; index <= fallbackIndex; index += 1) {
+        const record = batch[index].record;
         pushCodexVisibleWrapper(
           wrappers,
           record,
           currentTurnIndex,
-          record === pending[fallbackIndex].record
+          record === batch[fallbackIndex].record
             ? {
                 sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
                 kind: 'user',
@@ -5788,15 +5826,14 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
             : { turnKey: currentTurnKey },
         );
       }
-      pending.length = 0;
-      return;
+      cursor = fallbackIndex + 1;
     }
-    while (pending.length > 0) {
-      const item = pending.shift();
-      pushCodexVisibleWrapper(wrappers, item.record, turnIndex, {
+    for (let index = cursor; index < batch.length; index += 1) {
+      pushCodexVisibleWrapper(wrappers, batch[index].record, currentTurnIndex, {
         turnKey: currentTurnKey,
       });
     }
+    batch.length = 0;
   };
 
   for (const record of records) {
@@ -5805,43 +5842,41 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
     if (record?.type === 'event_msg' && payload.type === 'thread_rolled_back') {
       // Materialize the current visible thread: old rolled-back turns and the
       // rollback event itself are intentionally omitted from rewritten files.
-      pending.length = 0;
+      if (pending.length > 0) flushPending(currentTurnIndex);
       removeLastCodexRecordTurns(wrappers, Number(payload.num_turns || payload.turns || 1));
       currentTurnIndex = maxCodexRecordTurnIndex(wrappers);
       currentTurnKey = [...wrappers].reverse().find((wrapper) => Number.isFinite(wrapper?.turnKey))?.turnKey ?? null;
+      const lastUser = [...wrappers].reverse().find(wrapper => wrapper.kind === 'user');
+      const lastText = codexUserMessageAuditText(lastUser?.record) || null;
+      currentTurnCanonicalUserText = isCodexGoalContinuationUserText(lastText) ? null : lastText;
       continue;
     }
 
     if (record?.type === 'event_msg' && payload.type === 'user_message') {
       if (isCodexSubagentNotification(payload)) {
-        for (const item of pending) {
-          pushCodexVisibleWrapper(wrappers, item.record, currentTurnIndex, {
-            turnKey: currentTurnKey,
-          });
-        }
-        pending.length = 0;
+        if (pending.length > 0) flushPending(currentTurnIndex);
         pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
           turnKey: currentTurnKey,
         });
         continue;
       }
       const text = codexUserMessageAuditText(record) || '';
+      if (isCodexTurnAbortedUserText(text)) {
+        if (pending.length > 0) flushPending(currentTurnIndex);
+        pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, { turnKey: currentTurnKey });
+        continue;
+      }
       if (isCodexEnvironmentContextUserText(text)
         || isCodexProjectInstructionsUserText(text)) {
         pending.push({ record });
         continue;
       }
-      const previousTurnIndex = currentTurnIndex;
-      const previousTurnKey = currentTurnKey;
+      const turnStart = codexPendingStartForUserMessage(pending, text);
+      if (turnStart > 0) flushPending(currentTurnIndex, pending.splice(0, turnStart));
       currentTurnIndex += 1;
       currentTurnKey = turnKeyFor(record);
-      const turnStart = codexPendingStartForUserMessage(pending, text);
-      for (let i = 0; i < turnStart; i++) {
-        pushCodexVisibleWrapper(wrappers, pending[i].record, previousTurnIndex, {
-          turnKey: previousTurnKey,
-        });
-      }
-      for (let i = turnStart; i < pending.length; i++) {
+      currentTurnCanonicalUserText = text;
+      for (let i = 0; i < pending.length; i++) {
         pushCodexVisibleWrapper(wrappers, pending[i].record, currentTurnIndex, {
           turnKey: currentTurnKey,
         });
@@ -5856,7 +5891,14 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
     }
 
     if (isCodexPreUserRecord(record)) {
-      pending.push({ record });
+      if (record.type === 'event_msg' && payload.type === 'task_started') currentTurnCanonicalUserText = null;
+      const text = isCodexResponseUserRecord(record) ? codexUserMessageAuditText(record) || '' : '';
+      const fallbackUser = !!text && !text.includes('<subagent_notification>')
+        && !isCodexTurnAbortedUserText(text)
+        && !isCodexEnvironmentContextUserText(text)
+        && !isCodexProjectInstructionsUserText(text)
+        && !(currentTurnCanonicalUserText && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, text));
+      pending.push({ record, fallbackUser });
       continue;
     }
 
@@ -11398,6 +11440,7 @@ module.exports = {
     setCodexExternalReadVersion: readVersion => { _codexReadFence.externalVersion = readVersion; },
     refreshCodexSubagentCards,
     getCodexPayloadGeneration,
+    buildCodexInterruptedHistoryEntry,
     observeCodexReadInvalidation,
     setCodexProjectionStorage,
     restoreCodexSourceSnapshot,

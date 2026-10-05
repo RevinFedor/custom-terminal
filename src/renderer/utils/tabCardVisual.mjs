@@ -67,17 +67,19 @@ export function resolveTabCardTextColor({ active = false, hovered = false, selec
  * @param {object} args
  * @returns {{padding: string, borderRadius: number, fontSize: number, laneBottomPx: number}}
  */
-export function resolveTabCardMetrics(geo, { fontSize, showTaskLane = false, hasStatusMarker = false, nextCardClearancePx = 1 } = {}) {
+export function resolveTabCardMetrics(geo, { fontSize, showTaskLane = false, hasStatusMarker = false, nextCardClearancePx = 1,
+  minPaddingLeft = 0, minPaddingRight = 0 } = {}) {
   const paddingX = num(geo?.paddingX, 6);
   const paddingY = num(geo?.paddingY, 3);
   const paddingLeft = num(geo?.paddingLeft, 16);
   const gap = num(geo?.gap, 4);
   const top = showTaskLane ? Math.max(0, paddingY - 2) : paddingY;
   const bottom = showTaskLane ? paddingY + 2 : paddingY;
-  const left = hasStatusMarker ? paddingLeft : paddingX;
+  const left = Math.max(hasStatusMarker ? paddingLeft : paddingX, num(minPaddingLeft, 0));
+  const right = Math.max(paddingX, num(minPaddingRight, 0));
   const overhang = Math.max(0, gap - num(nextCardClearancePx, 1));
   return {
-    padding: `${top}px ${paddingX}px ${bottom}px ${left}px`,
+    padding: `${top}px ${right}px ${bottom}px ${left}px`,
     borderRadius: num(geo?.borderRadius, 6),
     fontSize: num(fontSize, 14),
     // NEGATIVE, so the squares straddle the bottom edge instead of sitting

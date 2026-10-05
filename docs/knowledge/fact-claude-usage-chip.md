@@ -368,4 +368,4 @@ Local-date, не UTC: юзер думает о расходе «вчера vs с
 - [`fact-claude-sdk-tab.md`](fact-claude-sdk-tab.md) — отдельный context-%-meter для SDK табов читает usage из live SSE stream'а, не из JSONL на диске. Это два разных потока: SDK-meter — мгновенный отклик на конкретное message_start, chip — устаканенное число для всех табов проекта.
 - [`methodology/сценарии-багов-design.md`](../methodology/сценарии-багов-design.md) секция 4 — click-outside ловушки.
 - [`methodology/дизайн-принципы.md`](../methodology/дизайн-принципы.md) секция «Историю провайдерского ресурса храним как снимки источника» — переносимый принцип, обосновывает почему не пересчитываем из JSONL.
-- Global `~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/tooltip-resize-modal.md::Закреп` — базовая механика ⌘⇧-pin'а.
+- Global `~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/всплывающие-окна.md::Закреп` — базовая механика ⌘⇧-pin'а.

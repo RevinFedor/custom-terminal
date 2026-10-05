@@ -397,6 +397,166 @@ test('UI events and lists are compact; full text and response are available only
   assert.ok(h.logs.some(({ metadata }) => metadata.textHash === sha(text)));
 });
 
+test('dismissal is independent per question participant, accepts a reply ID, and changes only presentation metadata', async (t) => {
+  const h = await fixture(t);
+  const q = (await h.question('A', 'private-dismiss-question')).message;
+  await drained(h.service);
+  const reply = (await h.service.replyToMessage({ responder: 'B', messageId: q.messageId,
+    text: 'private-dismiss-answer', requestId: 'r' })).message;
+  await drained(h.service);
+  const readRows = () => h.db.prepare(`SELECT * FROM ${TABLE_NAME} ORDER BY rowid`).all();
+  const [beforeQuestion, beforeReply] = readRows();
+  const eventStart = h.changes.length;
+  h.tabs.clear();
+  for (const method of ['resolveTab', 'send', 'getReceipt', 'releaseReceipt', '_enqueue']) {
+    h.service[method] = () => assert.fail(`dismissal must not call ${method}`);
+  }
+
+  const source = h.service.dismissMessage({ tabId: 'A', messageId: reply.messageId });
+  assert.equal(source.deduplicated, false);
+  assert.equal(source.message.messageId, q.messageId);
+  assert.equal(source.message.kind, 'question');
+  assert.ok(source.message.sourceDismissedAt > beforeQuestion.updatedAt);
+  assert.equal(source.message.updatedAt, source.message.sourceDismissedAt);
+  assert.equal(source.message.targetDismissedAt, null);
+  assert.deepEqual(readRows(), [{ ...beforeQuestion,
+    sourceDismissedAt: source.message.sourceDismissedAt, updatedAt: source.message.updatedAt }, beforeReply]);
+  assert.equal(h.changes.length, eventStart + 1);
+  assert.equal(h.changes.at(-1).reason, 'dismissed');
+  assert.equal(h.changes.at(-1).message.sourceDismissedAt, source.message.sourceDismissedAt);
+
+  const logCount = h.logs.length;
+  for (const messageId of [reply.messageId, q.messageId]) {
+    assert.deepEqual(h.service.dismissMessage({ tabId: 'A', messageId }), { ...source, deduplicated: true });
+  }
+  assert.equal(h.changes.length, eventStart + 1, 'exact repeats do not publish another event');
+  assert.equal(h.logs.length, logCount, 'exact repeats do not log another transition');
+
+  const target = h.service.dismissMessage({ tabId: 'B', messageId: q.messageId });
+  assert.equal(target.deduplicated, false);
+  assert.equal(target.message.sourceDismissedAt, source.message.sourceDismissedAt);
+  assert.ok(target.message.targetDismissedAt > source.message.updatedAt);
+  assert.equal(target.message.updatedAt, target.message.targetDismissedAt);
+  assert.deepEqual(readRows(), [{ ...beforeQuestion, sourceDismissedAt: source.message.sourceDismissedAt,
+    targetDismissedAt: target.message.targetDismissedAt, updatedAt: target.message.updatedAt }, beforeReply]);
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.changes.length, eventStart + 2);
+  for (const tabId of ['A', 'B']) {
+    const list = h.service.listForTab(tabId);
+    assert.equal(list.length, 2, 'dismissed questions and replies remain in history');
+    const listed = list.find((message) => message.messageId === q.messageId);
+    assert.equal(listed.sourceDismissedAt, source.message.sourceDismissedAt);
+    assert.equal(listed.targetDismissedAt, target.message.targetDismissedAt);
+    assert.equal(listed.updatedAt, target.message.updatedAt);
+    assert.equal(Object.hasOwn(listed, 'text'), false);
+  }
+  assert.deepEqual(h.service.getMessage(q.messageId).message, target.message);
+  assert.equal(h.service.getMessage(q.messageId).reply.text, reply.text);
+  const diagnostic = h.logs.at(-1).metadata;
+  assert.equal(diagnostic.sourceDismissedAt, source.message.sourceDismissedAt);
+  assert.equal(diagnostic.targetDismissedAt, target.message.targetDismissedAt);
+  assert.equal(diagnostic.updatedAt, target.message.updatedAt);
+  assert.equal(JSON.stringify(h.logs).includes('private-dismiss-'), false);
+});
+
+test('dismissal rejects missing and foreign participants without changing a question or its reply', async (t) => {
+  const h = await fixture(t);
+  const q = (await h.question()).message;
+  await drained(h.service);
+  const reply = (await h.service.replyToMessage({ responder: 'B', messageId: q.messageId,
+    text: 'answer', requestId: 'r' })).message;
+  await drained(h.service);
+  const before = h.service.getMessage(q.messageId);
+  const events = h.changes.length;
+  for (const messageId of [q.messageId, reply.messageId]) {
+    assert.throws(() => h.service.dismissMessage({ tabId: 'C', messageId }),
+      { code: 'tab_message_foreign_participant', statusCode: 403 });
+  }
+  for (const payload of [{ tabId: '', messageId: q.messageId }, { tabId: 'A', messageId: '' },
+    { messageId: q.messageId }, { tabId: 'A' }]) {
+    assert.throws(() => h.service.dismissMessage(payload), { code: 'tab_message_invalid_input', statusCode: 400 });
+  }
+  assert.throws(() => h.service.dismissMessage({ tabId: 'A', messageId: 'missing' }),
+    { code: 'tab_message_not_found', statusCode: 404 });
+  assert.deepEqual(h.service.getMessage(q.messageId), before);
+  assert.equal(h.changes.length, events);
+  assert.equal(h.calls.length, 2);
+});
+
+test('dismissal survives preparation, late transport callbacks and a live reply with monotonic question events', async (t) => {
+  const entered = deferred();
+  const gate = deferred();
+  const h = await fixture(t, { send: async (message) => {
+    if (message.kind === 'question') { entered.resolve(); return gate.promise; }
+    return { state: 'confirmed' };
+  } });
+  t.after(() => gate.resolve(null));
+  const q = (await h.question()).message;
+  await entered.promise;
+  const future = '2100-01-01T00:00:00.000Z';
+  h.db.prepare(`UPDATE ${TABLE_NAME} SET updatedAt = ? WHERE messageId = ?`).run(future, q.messageId);
+  const eventStart = h.changes.length;
+  const dismissed = h.service.dismissMessage({ tabId: 'A', messageId: q.messageId }).message;
+  assert.ok(dismissed.updatedAt > future);
+  assert.equal(dismissed.deliveryState, 'sending');
+  assert.equal(dismissed.replyMessageId, null);
+  const prepared = h.service.updateFrozenPrompt(q.messageId, h.calls[0].prompt + '\nAttached context');
+  assert.equal(prepared.sourceDismissedAt, dismissed.sourceDismissedAt);
+  assert.ok(prepared.updatedAt > dismissed.updatedAt);
+  h.service.observeReceipt(q.operationKey, { state: 'queued' });
+  gate.resolve({ state: 'audit-pending' });
+  await drained(h.service);
+  assert.equal(h.message(q.messageId).deliveryState, 'queued');
+  assert.equal(h.calls.length, 1, 'dismissal never adds a send');
+
+  const reply = (await h.service.replyToMessage({ responder: 'B', messageId: q.messageId,
+    text: 'Answer arriving after dismissal', requestId: 'late-reply' })).message;
+  await drained(h.service);
+  h.service.observeReceipt(q.operationKey, { state: 'confirmed' });
+  const answered = h.service.getMessage(q.messageId);
+  assert.equal(answered.message.sourceDismissedAt, dismissed.sourceDismissedAt);
+  assert.equal(answered.message.targetDismissedAt, null);
+  assert.equal(answered.message.replyMessageId, reply.messageId);
+  assert.equal(answered.message.deliveryState, 'sent');
+  assert.equal(answered.reply.text, reply.text);
+  assert.equal(answered.reply.deliveryState, 'sent');
+  assert.equal(h.calls.length, 2);
+  let previous = future;
+  for (const { message } of h.changes.slice(eventStart).filter(({ message }) => message.messageId === q.messageId)) {
+    assert.equal(message.sourceDismissedAt, dismissed.sourceDismissedAt);
+    assert.equal(message.targetDismissedAt, null);
+    assert.ok(message.updatedAt > previous);
+    previous = message.updatedAt;
+  }
+  h.service.observeReceipt(q.operationKey, { state: 'not-submitted' });
+  assert.deepEqual(h.service.getMessage(q.messageId), answered, 'late negative delivery cannot undo dismissal');
+});
+
+test('dismissing a waiting question neither retries nor cancels the existing delivery', async (t) => {
+  let attempts = 0;
+  const h = await fixture(t, { send: async () => ++attempts === 1
+    ? { submitted: false, code: 'draft_conflict' } : { state: 'confirmed' } });
+  const q = (await h.question()).message;
+  await drained(h.service);
+  const before = h.db.prepare(`SELECT * FROM ${TABLE_NAME} WHERE messageId = ?`).get(q.messageId);
+  assert.equal(before.deliveryState, 'waiting-for-input');
+  assert.equal(before.retryAllowed, 1);
+  h.service.dismissMessage({ tabId: 'A', messageId: q.messageId });
+  const dismissed = h.service.dismissMessage({ tabId: 'B', messageId: q.messageId }).message;
+  await drained(h.service);
+  assert.equal(attempts, 1);
+  assert.deepEqual(h.db.prepare(`SELECT * FROM ${TABLE_NAME} WHERE messageId = ?`).get(q.messageId),
+    { ...before, sourceDismissedAt: dismissed.sourceDismissedAt,
+      targetDismissedAt: dismissed.targetDismissedAt, updatedAt: dismissed.updatedAt });
+  await h.service.wake('B', 'input-cleared');
+  assert.equal(attempts, 2, 'the ordinary wake still delivers a dismissed question');
+  assert.equal(h.message(q.messageId).deliveryState, 'sent');
+  assert.equal(h.message(q.messageId).sourceDismissedAt, dismissed.sourceDismissedAt);
+  assert.equal(h.message(q.messageId).targetDismissedAt, dismissed.targetDismissedAt);
+  assert.equal(h.calls[1].operationKey, h.calls[0].operationKey);
+  assert.equal(h.calls[1].prompt, h.calls[0].prompt);
+});
+
 test('prompt includes full answer, bounded original label, explicit question identity and no auto reply', () => {
   const base = { messageId: 'm-1', sourceTabName: 'Owner', sourceTabId: 'B', text: 'full response\n'.repeat(10000) };
   const question = formatTabMessagePrompt({ ...base, kind: 'question' });
@@ -407,6 +567,113 @@ test('prompt includes full answer, bounded original label, explicit question ide
   assert.match(reply, /Reply to: q-1/);
   assert.match(reply, /No automatic reply is requested/);
   assert.ok(reply.length - base.text.length < 500);
+});
+
+test('legacy table migration is additive and per-side dismissal survives SQLite reopen with history intact', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tab-message-dismiss-'));
+  const file = path.join(dir, 'test.sqlite');
+  const db = new Database(file);
+  const databases = [db];
+  t.after(() => {
+    for (const database of databases) if (database.open) database.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  db.exec(`CREATE TABLE tab_messages (
+    messageId TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('question', 'reply')),
+    replyTo TEXT UNIQUE REFERENCES tab_messages(messageId),
+    sourceTabId TEXT NOT NULL, sourceTabName TEXT NOT NULL,
+    sourceProjectId TEXT NOT NULL, sourceProjectName TEXT NOT NULL, sourceCwd TEXT,
+    sourceProvider TEXT NOT NULL, sourceSessionId TEXT NOT NULL,
+    targetTabId TEXT NOT NULL, targetTabName TEXT NOT NULL,
+    targetProjectId TEXT NOT NULL, targetProjectName TEXT NOT NULL, targetCwd TEXT,
+    targetProvider TEXT NOT NULL, targetSessionId TEXT NOT NULL,
+    text TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL,
+    deliveryState TEXT NOT NULL CHECK(deliveryState IN
+      ('pending','sending','queued','sent','waiting-for-input','unconfirmed','failed')),
+    error TEXT, code TEXT, replyMessageId TEXT, answeredAt TEXT,
+    operationKey TEXT NOT NULL UNIQUE, handoffId TEXT NOT NULL UNIQUE,
+    requestId TEXT NOT NULL, requestFingerprint TEXT NOT NULL,
+    frozenPrompt TEXT NOT NULL, promptPrepared INTEGER NOT NULL DEFAULT 0,
+    attemptCount INTEGER NOT NULL DEFAULT 0, retryAllowed INTEGER NOT NULL DEFAULT 0,
+    receiptAttempt INTEGER NOT NULL DEFAULT 0, receiptUpdatedAt TEXT, deliverySessionId TEXT,
+    UNIQUE(sourceTabId, requestId)
+  );`);
+  const timestamp = '2026-01-01T00:00:00.000Z';
+  const insert = db.prepare(`INSERT INTO tab_messages (
+    messageId, kind, replyTo, sourceTabId, sourceTabName, sourceProjectId, sourceProjectName,
+    sourceProvider, sourceSessionId, targetTabId, targetTabName, targetProjectId, targetProjectName,
+    targetProvider, targetSessionId, text, createdAt, updatedAt, deliveryState,
+    operationKey, handoffId, requestId, requestFingerprint, frozenPrompt, attemptCount
+  ) VALUES (@messageId, @kind, @replyTo, @source, @source, 'project', 'Project', 'codex', @source,
+    @target, @target, 'project', 'Project', 'codex', @target, @text, @timestamp, @timestamp, 'sent',
+    @operationKey, @operationKey, @messageId, @fingerprint, @prompt, 1)`);
+  for (const row of [
+    { messageId: 'legacy-question', kind: 'question', replyTo: null, source: 'A', target: 'B', text: 'Original question' },
+    { messageId: 'legacy-reply', kind: 'reply', replyTo: 'legacy-question', source: 'B', target: 'A', text: 'Original answer' },
+  ]) {
+    insert.run({ ...row, timestamp, operationKey: `tab-message:${row.messageId}`,
+      fingerprint: sha(row.text), prompt: `Frozen legacy envelope\n${row.text}` });
+  }
+  db.prepare(`UPDATE tab_messages SET replyMessageId = 'legacy-reply', answeredAt = ? WHERE messageId = 'legacy-question'`)
+    .run(timestamp);
+  const legacyRows = db.prepare('SELECT * FROM tab_messages ORDER BY rowid').all();
+  const oldColumns = db.prepare('PRAGMA table_info(tab_messages)').all().map(({ name }) => name);
+  assert.equal(oldColumns.includes('sourceDismissedAt'), false);
+  assert.equal(oldColumns.includes('targetDismissedAt'), false);
+  const first = await fixture(t, { db });
+  assert.deepEqual(db.prepare('SELECT * FROM tab_messages ORDER BY rowid').all(),
+    legacyRows.map((row) => ({ ...row, sourceDismissedAt: null, targetDismissedAt: null })));
+  assert.equal(db.prepare('PRAGMA table_info(tab_messages)').all().length, oldColumns.length + 2);
+  assert.equal(first.calls.length, 0);
+  assert.equal(first.changes.length, 0);
+  const source = first.service.dismissMessage({ tabId: 'A', messageId: 'legacy-reply' }).message;
+  await first.service.initialize();
+  assert.equal(first.message('legacy-question').sourceDismissedAt, source.sourceDismissedAt);
+  first.service.dispose();
+  db.close();
+
+  const reopenedDb = new Database(file);
+  databases.push(reopenedDb);
+  const reopened = await fixture(t, { db: reopenedDb,
+    send: () => assert.fail('reopen must not resend'), resolveTab: () => assert.fail('reopen must not resolve tabs') });
+  assert.deepEqual(reopened.service.getMessage('legacy-question').message, source);
+  assert.equal(reopened.service.listForTab('B').find((m) => m.messageId === 'legacy-question').targetDismissedAt, null);
+  assert.deepEqual(reopened.service.dismissMessage({ tabId: 'A', messageId: 'legacy-question' }),
+    { message: source, deduplicated: true });
+  assert.equal(reopened.changes.length, 0);
+  const target = reopened.service.dismissMessage({ tabId: 'B', messageId: 'legacy-reply' }).message;
+  assert.equal(target.sourceDismissedAt, source.sourceDismissedAt);
+  assert.ok(target.targetDismissedAt > source.updatedAt);
+  reopened.service.dispose();
+  reopenedDb.close();
+
+  const finalDb = new Database(file);
+  databases.push(finalDb);
+  const final = await fixture(t, { db: finalDb,
+    send: () => assert.fail('reopen must not resend'), resolveTab: () => assert.fail('reopen must not resolve tabs') });
+  const pair = final.service.getMessage('legacy-question');
+  assert.deepEqual(pair.message, target);
+  assert.equal(pair.message.text, 'Original question');
+  assert.equal(pair.reply.text, 'Original answer');
+  assert.equal(pair.reply.messageId, 'legacy-reply');
+  assert.equal(pair.reply.sourceDismissedAt, null, 'presentation metadata belongs to the question');
+  assert.equal(pair.reply.targetDismissedAt, null);
+  for (const tabId of ['A', 'B']) {
+    const list = final.service.listForTab(tabId);
+    assert.equal(list.length, 2);
+    const listed = list.find((m) => m.messageId === 'legacy-question');
+    assert.equal(listed.sourceDismissedAt, target.sourceDismissedAt);
+    assert.equal(listed.targetDismissedAt, target.targetDismissedAt);
+    assert.equal(listed.updatedAt, target.updatedAt);
+    assert.equal(final.service.dismissMessage({ tabId, messageId: 'legacy-reply' }).deduplicated, true);
+  }
+  assert.deepEqual(finalDb.prepare('SELECT * FROM tab_messages ORDER BY rowid').all(), [
+    { ...legacyRows[0], sourceDismissedAt: target.sourceDismissedAt,
+      targetDismissedAt: target.targetDismissedAt, updatedAt: target.updatedAt },
+    { ...legacyRows[1], sourceDismissedAt: null, targetDismissedAt: null },
+  ]);
+  assert.equal(final.calls.length, 0);
+  assert.equal(final.changes.length, 0);
 });
 
 test('SQLite restart recovers an in-flight message from the exact durable receipt without send', async (t) => {

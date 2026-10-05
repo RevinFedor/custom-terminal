@@ -99,14 +99,17 @@ export const getSessionStartingPresentation = (state: SessionStartingState) => {
   const isError = state.startupFailed === true;
 
   if (state.lifecycleWarning?.type === 'model-capacity') {
+    const notSubmitted = state.lifecycleWarning.code === 'codex_capacity_retry_not_submitted';
+    const exhausted = state.lifecycleWarning.code === 'codex_capacity_retry_exhausted';
     return {
-      isError: state.lifecycleWarning.code === 'codex_capacity_retry_exhausted',
+      isError: notSubmitted || exhausted,
       title: '⚠ CODEX MODEL AT CAPACITY',
       subtitle: state.lifecycleWarning.message
         || 'Selected model is at capacity. Please try a different model.',
-      detail: state.lifecycleWarning.code === 'codex_capacity_retry_exhausted'
-        ? 'Automatic retries stopped; choose another model or continue manually'
-        : 'Automatic continuation follows request settings; you can also choose another model',
+      detail: notSubmitted
+        ? 'Automatic continuation was not submitted; resolve the reported blocker or continue manually'
+        : exhausted ? 'Automatic retries stopped; choose another model or continue manually'
+          : 'Automatic continuation follows request settings; you can also choose another model',
     };
   }
 

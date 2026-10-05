@@ -94,8 +94,13 @@ function createCodexCapacityRetryRuntime({ getSettings, loadState, saveState, is
     try {
       const result = await send(owner, effect, stillCurrent);
       if (result?.submitted === false && await stillCurrent()) {
-        cancel(owner.tabId, 'retry-not-submitted');
-        await notify(owner, effect, result.error || result.code || 'continue was not submitted');
+        // Retire this exact effect, not the whole feature as if the user had
+        // pressed Stop. Keep the consumed budget/error ID (no blind replay),
+        // while later verified work can replenish it through the same policy.
+        entry.state = { ...entry.state, pendingEffectId: null };
+        saveState(owner.tabId, entry.state);
+        cancelSend?.(owner.tabId, effect.handoffId, 'retry-not-submitted');
+        await notify(owner, effect, result.error || result.code || 'continue was not submitted', result);
       }
       // Unknown delivery is not permission to issue another Enter. Its exact
       // receipt and the next typed provider event own further reconciliation.

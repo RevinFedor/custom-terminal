@@ -26,6 +26,7 @@ while (ts.isParenthesizedExpression(object)) object = object.expression;
 const names = [
   'showHiddenWindow', 'activateCenterTab', 'switchTab', 'touchGlobalTabMru',
   'getFocusedProjectId', 'requestTabListReveal', 'setProjectView', 'workspaceSpaceIndexOfTab',
+  'addEmptySplitPane', 'addVerticalSplitPane',
 ];
 const methods = names.map(name => {
   const property = object.properties.find(candidate => candidate.name?.getText(ast) === name);
@@ -41,7 +42,7 @@ const chip = (tabId, projectId = 'p') => ({ projectId, tabId });
 const big = { key: 'external', internal: false };
 const small = { key: 'builtin', internal: true };
 
-function fixture({ chooser = false, vacant = false } = {}) {
+function fixture({ chooser = false, vacant = false, customLayout = null } = {}) {
   const original = {
     splitPanes: [
       { ...chip('a'), windowId: 'left', column: 0 },
@@ -61,7 +62,7 @@ function fixture({ chooser = false, vacant = false } = {}) {
   };
   if (chooser) original.splitPanes = panes.selectChooserSlot(original.splitPanes, 2, 'middle').panes;
   if (vacant) original.splitPanes[2] = panes.vacantPaneWithTabs(original.splitPanes[2], panes.paneTabs(original.splitPanes[2]));
-  const layout = displays.applyWindowDisplay(displays.applyWindowDisplay(original, big), small);
+  const layout = customLayout || displays.applyWindowDisplay(displays.applyWindowDisplay(original, big), small);
   const workspace = (projectId, ids, activeTabId) => ({
     projectId, activeTabId, currentView: 'home', tabHistory: [activeTabId], selectedTabIds: [activeTabId],
     tabs: new Map(ids.map(id => [id, {
@@ -116,6 +117,62 @@ function snapshot(state) {
     projects: [...state.openProjects].map(([id, workspace]) => [id, { ...workspace, tabs: [...workspace.tabs] }]),
   });
 }
+
+function oneVisibleWithHidden({ placeholder = false } = {}) {
+  return displays.reconcileWindowDisplay({
+    windowDisplayKey: small.key, windowDisplayLayouts: {}, splitFocusedIndex: 0, splitSizes: null,
+    splitPanes: [
+      { ...chip('a'), windowId: 'left' },
+      ...(placeholder ? [{ projectId: '', tabId: '', windowId: 'blank', column: 1 }] : []),
+      { ...chip('old'), windowId: 'incoming', displayHidden: true, column: 1,
+        tabs: [chip('old'), chip('target', 'q')], history: [chip('older')], detachedTabs: [chip('removed')] },
+    ],
+  }, small);
+}
+
+for (const side of ['right', 'left', 'above', 'below']) {
+  test(`actual ${side} split reveals the existing hidden window atomically instead of making a blank`, () => {
+    const initial = oneVisibleWithHidden();
+    const f = fixture({ customLayout: initial });
+    const state = f.store.getState();
+    const opened = ['right', 'left'].includes(side)
+      ? state.addEmptySplitPane(0, side)
+      : state.addVerticalSplitPane(0, side);
+    assert.equal(opened, true);
+    const next = f.store.getState();
+    assert.equal(next.splitPanes.length, 2);
+    assert.ok(next.splitPanes.every(pane => !pane.displayHidden && pane.tabId));
+    const incoming = next.splitPanes[next.splitFocusedIndex];
+    assert.equal(incoming.windowId, 'incoming');
+    assert.equal(incoming.tabId, 'old');
+    assert.deepEqual(panes.paneSlots(incoming), panes.paneSlots(initial.splitPanes[1]));
+    assert.deepEqual(incoming.history, initial.splitPanes[1].history);
+    assert.deepEqual(incoming.detachedTabs, initial.splitPanes[1].detachedTabs);
+    assert.ok(f.writes.every(write => write.pane.windowId === 'incoming'), 'no transient empty focused pane');
+    assert.equal(next.activeSpaceTab.tabId, 'old');
+    assert.equal(next.windowDisplayLayouts.builtin.positions.length, 2);
+  });
+}
+
+test('actual picker consumes a new empty slot, so switching cannot toggle back to a hidden ghost', () => {
+  const initial = oneVisibleWithHidden({ placeholder: true });
+  const f = fixture({ customLayout: initial });
+  assert.equal(f.reveal(1, 'incoming', chip('target', 'q')), true);
+  const state = f.store.getState();
+  assert.equal(state.splitPanes.length, 2);
+  assert.ok(state.splitPanes.every(pane => !pane.displayHidden));
+  assert.equal(state.splitPanes[1].windowId, 'incoming');
+  assert.equal(state.splitPanes[1].tabId, 'target');
+  assert.ok(!JSON.stringify(state.windowDisplayLayouts).includes('blank'));
+  assert.equal(f.reveal(1, 'blank'), false);
+});
+
+test('split can recover the existing blank slot from the reported bad layout without making a third column', () => {
+  const f = fixture({ customLayout: oneVisibleWithHidden({ placeholder: true }) });
+  assert.equal(f.store.getState().addEmptySplitPane(0), true);
+  assert.equal(f.store.getState().splitPanes.length, 2);
+  assert.ok(f.store.getState().splitPanes.every(pane => !pane.displayHidden && pane.tabId));
+});
 
 test('actual reveal selects a parked real tab before navigation/MRU, preserving mixed order and every other window', () => {
   const f = fixture();

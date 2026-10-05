@@ -31,6 +31,8 @@ const setterSource = part(storeSource, '  setHistoryPromptDraft: (tabId, draft, 
 const applySource = part(source, '  const applyHistoryComposerSnapshot = useCallback((', '  const acceptHistorySlashCommand =');
 const handlerSource = part(source, '  const handleComposerImagePaste = useCallback((', '  const restoreChipToComposer =');
 const copySource = part(source, '  const handleComposerImageAwareCopy =', '  const handleComposerImagePaste =');
+const messageCopySource = part(source, '  const copyPrompt = (event:', '  const requestRewind =');
+const adapterSource = fs.readFileSync(path.join(directory, 'electronComposerClipboardAdapter.ts'), 'utf8');
 const deriveSource = part(source, '  const deriveComposerHistoryPayload =', '  const ');
 const equalSource = part(source, 'const historyComposerAggregateEqual =', 'const retainHistoryDraftImages');
 const syntax = ts.createSourceFile('HistoryPanel.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -129,9 +131,24 @@ function harness() {
   const warnings = [];
   const frames = [];
   let snapshot = null;
+  const contexts = {};
+  let clipboardItem = {};
+  const fakeClipboard = {
+    clear() { clipboardItem = {}; },
+    write(item) { clipboardItem = { ...item }; },
+    writeText(text) { clipboardItem = { text }; },
+    readText: () => clipboardItem.text || '',
+    readHTML: () => clipboardItem.html || '',
+    availableFormats: () => Object.keys(clipboardItem).map(type => 'text/' + (type === 'text' ? 'plain' : type)),
+  };
+  const adapter = vm.createContext({ exports: {}, Buffer, console: { log() {}, warn() {} },
+    require: name => name.includes('composerClipboard') ? clipboard : chips,
+    window: { require: () => ({ clipboard: fakeClipboard }) },
+  });
+  vm.runInContext(compile(adapterSource), adapter);
   let nextId = 1;
   const mounted = [];
-  const api = { getState: () => ({ ...state, ...storeContext.methods }) };
+  const api = { getState: () => ({ ...state, ...storeContext.methods, showToast() {} }) };
   function mount(tabId = 'T') {
     const element = { selectionStart: 0, selectionEnd: 0,
       getAttribute: name => name === 'data-history-composer-tab-id' ? tabId : null,
@@ -143,6 +160,7 @@ function harness() {
       ...chips, ...images, ...clipboard, ...ownership, useUIStore: api,
       tabId, tabIdRef: { current: tabId }, promptTextareaRef: { current: element }, promptCaretRef: { current: { start: 0, end: 0 } },
       dismissedContextUpdatesRef: { current: [] },
+      getTabWorkContextSnapshot: id => ({ updates: contexts[id] || [] }),
       reconcileContextDismissalHistory: () => {},
       // Dictation-chip hooks referenced by the extracted onChange. Real
       // registry semantics are covered by dictationChips.test.mjs; here they
@@ -155,7 +173,9 @@ function harness() {
       retainHistoryDraftImages: images.retainPromptImageRefsForText,
       setHistoryPromptDraft: storeContext.methods.setHistoryPromptDraft,
       setDraftWarning: value => warnings.push({ tabId, value }),
-      readElectronComposerSnapshotClipboard: () => snapshot,
+      readElectronComposerSnapshotClipboard: () => snapshot || adapter.exports.readElectronComposerSnapshotClipboard(),
+      writeElectronComposerSnapshotClipboard: adapter.exports.writeElectronComposerSnapshotClipboard,
+      setCopied() {}, copiedTimerRef: { current: null }, setTimeout() {}, clearTimeout() {},
       clipboard: { writeText() {} }, draftChips: [], draftImages: [],
       isElectronDictationClipboardPayload: () => false,
       createComposerChipId: kind => `${kind}-${nextId++}`,
@@ -171,12 +191,13 @@ function harness() {
         return promise;
       } },
     });
-    vm.runInContext(compile(deriveSource + equalSource + applySource + copySource + handlerSource
+    vm.runInContext(compile(deriveSource + equalSource + applySource + copySource + handlerSource + messageCopySource
       + '\nglobalThis.paste = handleComposerImagePaste;'
       + '\nglobalThis.apply = applyHistoryComposerSnapshot;'
       + '\nglobalThis.derive = deriveComposerHistoryPayload;'
       + '\nglobalThis.equal = historyComposerAggregateEqual;'
       + '\nglobalThis.copy = handleComposerImageAwareCopy;'
+      + '\nglobalThis.copyMessage = copyPrompt;'
       + '\nglobalThis.onChange = ' + changeCallback.getText(syntax) + ';'), context);
     const native = installedEditor({ initial: { text: text(tabId), payload: {
       images: state.historyPromptDraftImages[tabId] || [], chips: state.historyPromptDraftChips[tabId] || [],
@@ -190,6 +211,12 @@ function harness() {
       context.reconcilePending();
     };
     const result = { context, element, native, reconcile,
+      copyMessage(entry) {
+        context.entry = { uuid: 'failed-message', ...entry };
+        snapshot = null;
+        context.copyMessage({ preventDefault() {}, stopPropagation() {} });
+        return { ...clipboardItem };
+      },
       syncFromStore() {
         native.apply({ value: text(tabId), history: 'external', historyPayload: {
           images: state.historyPromptDraftImages[tabId] || [], chips: state.historyPromptDraftChips[tabId] || [],
@@ -229,7 +256,7 @@ function harness() {
   const finish = (request, name = 'saved') => request.resolve(request.channel === 'prompt-queue:save-clipboard-image'
     ? { success: true, path: `/synthetic/${name}.png`, assetId: name, size: 1 }
     : { refs: [{ id: 1, path: `/synthetic/${name}.png`, assetId: name, size: 1 }] });
-  return { mount, requests, warnings, updates, frames, text, write, serialized, finish,
+  return { mount, requests, warnings, updates, frames, text, write, serialized, finish, contexts,
     state: () => state, snapshot: () => structuredClone(state), api };
 }
 
@@ -241,6 +268,66 @@ function twoPastes(reverse = false) {
   return chips.insertComposerSnapshotAtSelection({ text: initial.text, chips: initial.chips,
     insertedText: (reverse ? '' : '|') + chips.buildPasteChipMarker(second) + (reverse ? '|' : ''),
     insertedChips: [second], selectionStart: reverse ? 0 : initial.text.length, selectionEnd: reverse ? 0 : initial.text.length });
+}
+
+test('failed Send -> actual History Copy/clipboard/paste keeps returned prompt chips once and inserts text', () => {
+  const h = harness();
+  const returned = { id: 'returned', kind: 'prompt', label: 'Attached', text: 'attached context' };
+  const deferred = { id: 'update-1', title: 'Deferred', text: 'deferred context', status: 'pending' };
+  h.contexts.T = [deferred];
+  h.write('T', 'new draft', { chips: [returned] });
+  const view = h.mount();
+  const transport = chips.serializeComposerDraft({ text: 'message text', chips: [
+    { id: 'deferred-chip', kind: 'prompt', label: deferred.title, text: deferred.text, contextUpdateId: deferred.id },
+    returned,
+  ] });
+  const copied = view.copyMessage({ content: transport, promptChips: [returned] });
+  assert.equal(copied.text, transport, 'portable copy still contains every chip and message byte');
+  assert.ok(copied.html.includes('data-noted-terminal-composer-snapshot'));
+  view.paste({ mode: 'clipboard', start: 0, end: h.text('T').length });
+  assert.equal(h.text('T'), 'message text');
+  assert.deepEqual(h.state().historyPromptDraftChips.T, [returned]);
+  assert.deepEqual(h.contexts.T, [deferred], 'paste never consumes the pending context owner');
+  view.paste({ mode: 'clipboard', start: 0, end: h.text('T').length });
+  assert.deepEqual(h.state().historyPromptDraftChips.T, [returned]);
+  assert.equal(view.undo(), true);
+  assert.equal(view.undo(), true);
+  assert.equal(h.text('T'), 'new draft');
+  assert.deepEqual(h.state().historyPromptDraftChips.T, [returned]);
+});
+
+test('actual Copy/paste keeps revised same-source chips beside the returned version', () => {
+  const h = harness();
+  const current = { id: 'prompt-1', kind: 'prompt', sourceKey: 'prompt:1', text: 'revision two' };
+  const previous = { ...current, text: 'revision one' };
+  h.write('T', '', { chips: [current] });
+  const view = h.mount();
+  view.copyMessage({ content: chips.serializeComposerDraft({ text: 'old message', chips: [previous] }), promptChips: [previous] });
+  view.paste({ mode: 'clipboard' });
+  assert.deepEqual(h.state().historyPromptDraftChips.T.map(chip => chip.text), ['revision two', 'revision one']);
+  assert.equal(h.text('T'), 'old message');
+});
+
+for (const changed of [false, true]) {
+  test(`async copied-image replay compares latest owner chips/context on background completion (changed=${changed})`, async () => {
+    const h = harness();
+    const attached = { id: 'attached', kind: 'prompt', text: 'attached', label: 'Attached' };
+    const update = { id: 'update-1', status: 'pending', text: 'context', title: 'Deferred' };
+    const contextChip = { id: 'context', kind: 'prompt', text: update.text, label: update.title, contextUpdateId: update.id };
+    const view = h.mount();
+    view.copyMessage({ content: chips.serializeComposerDraft({ text: 'message [Image #1]', chips: [contextChip, attached] }),
+      promptChips: [attached], imagePaths: [{ id: 1, path: '/synthetic/copied.png' }] });
+    view.paste({ mode: 'clipboard' });
+    h.contexts.T = [{ ...update, text: changed ? 'new version' : update.text }];
+    h.write('T', h.text('T'), { chips: [attached], pendingImages: h.state().historyPromptDraftPendingImages.T });
+    h.write('OTHER', 'unrelated');
+    view.context.tabIdRef.current = 'OTHER';
+    h.finish(h.requests[0]); await tick();
+    assert.equal(h.text('T'), 'message [Image #1]');
+    assert.equal(h.text('OTHER'), 'unrelated');
+    assert.equal(h.state().historyPromptDraftChips.T.length, changed ? 2 : 1);
+    assert.equal(h.state().historyPromptDraftChips.T.filter(chip => chip.id === attached.id).length, 1);
+  });
 }
 
 for (const mode of ['bitmap', 'snapshot', 'path']) {
@@ -466,7 +553,9 @@ test('actual persisted draft initialization expires unavailable imports only at 
     updatedAtByTab: before.historyPromptDraftUpdatedAt, pendingImages: before.historyPromptDraftPendingImages });
   const raw = JSON.stringify(memory);
   assert.equal(raw.includes('history-image-import:'), false, 'operation handles are never persisted');
-  const initializer = part(storeSource, 'const initialHistoryComposerDraftState =', '\nexport const useUIStore');
+  const storeSyntax = ts.createSourceFile('useUIStore.ts', storeSource, ts.ScriptTarget.Latest, true);
+  const initializer = storeSyntax.statements.find(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(declaration => declaration.name.getText(storeSyntax) === 'initialHistoryComposerDraftState')).getText(storeSyntax);
   const reload = vm.createContext({ ...persistence, ...ownership,
     HISTORY_COMPOSER_DRAFTS_STORAGE_KEY: 'drafts', localStorage: { getItem: () => raw } });
   vm.runInContext(compile(initializer + '\nglobalThis.restored = initialHistoryComposerDraftState;'), reload);

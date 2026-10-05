@@ -105,7 +105,8 @@ test('History renders terminal preview as an O(1) footer, outside durable rows',
   );
   assert.match(footerSource, /<ConversationMessage/);
   assert.match(footerSource, /layout="assistant"/);
-  assert.match(footerSource, /<CBMarkdown text=\{preview\.text\}/);
+  assert.match(footerSource, /text: preview\.text/);
+  assert.match(footerSource, /<CBMarkdown text=\{segment\.text\}/);
   assert.match(footerSource, /position: 'absolute'/);
   assert.match(footerSource, /transform: 'translateY\(-50%\)'/);
   assert.doesNotMatch(footerSource, /margin: '2px 0 4px'/);

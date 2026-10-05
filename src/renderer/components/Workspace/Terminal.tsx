@@ -11,6 +11,7 @@ import {
 } from '../../utils/xtermWritePump';
 import ControlHint from '../UI/ControlHint';
 import SideSurfaceToggleButton from './SideSurfaceToggleButton';
+import { requestTerminalFullView } from '../../utils/terminalFullView.mjs';
 
 const { shell } = window.require('electron');
 
@@ -3994,18 +3995,21 @@ function Terminal({
             за то, чтобы в маленьком окне он остался рабочим, а не свернулся в
             нечитаемую сетку. Молчать об этом нельзя: строка, уехавшая под
             границу, читается как поломка, поэтому обрезка названа словами.
-            Пометка мелкая, в углу и кликов не ловит — сообщение, не орган
-            управления. */}
+            Пометка также открывает полный просмотр: обычная шапка панели
+            сама может находиться выше вертикальной обрезки. */}
         {effectivePresented && terminalClipped && (
-          <div
+          <button type="button"
             data-terminal-clipped={tabId}
-            title="Окну не хватает места — терминал нарисован целиком и обрезан краем. Раздвиньте окно перегородкой."
+            data-terminal-full-view-open={tabId}
+            title="Показать терминал поверх окон"
+            onClick={() => requestTerminalFullView(terminalRef.current, tabId)}
             style={{
               position: 'absolute',
               right: 6,
               bottom: 6,
               zIndex: 45,
-              pointerEvents: 'none',
+              pointerEvents: 'auto',
+              cursor: 'pointer',
               padding: '2px 6px',
               borderRadius: 5,
               background: 'rgba(22,22,22,0.86)',
@@ -4019,7 +4023,7 @@ function Terminal({
             }}
           >
             терминал не помещается
-          </div>
+          </button>
         )}
 
         {/* Вкладка без агента — место ВНИЗУ терминала, куда панель управления

@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { hashFileSegment } = require('../codex-virtual-transcript');
 const { historyPreparationActivity } = require('../history-preparation-activity');
 const { claudeProjectsDir: getClaudeProjectsDir, assertClaudeDataPath } = require('../claude-paths');
 const { readClaudeMutationFile, claudeMutationRevision, checkClaudeMutationRevision,
@@ -775,24 +776,34 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
     filePath,
     size: stat.size,
     mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+    fileIdentity: stat.dev + ':' + stat.ino,
     sessionId,
   };
 
   // ── Case 1: File unchanged → return cached result immediately ──────────────
   //
-  // Same BYTE COUNT is the proof, not the modification time. These files are
-  // append-only: nothing can change inside them without the size changing too.
-  // The timestamp, on the other hand, moves on its own — the full read below
-  // re-stats the file AFTER streaming it, so the stored timestamp belongs to a
-  // later moment than the stored size, and a touch alone shifts it as well.
-  // While both had to match, that harmless drift fell through to «the file was
-  // rewritten» and re-parsed the whole transcript: the live 111MB session was
-  // read twice in a row (prod 18.08 00:0x, «full … reason=first-read» followed
-  // immediately by «full … reason=rewrite-or-shrink»), each pass allocating a
-  // fresh copy of ~15k records. Matching on size keeps the timestamp as a hint
-  // and refreshes it in place.
-  if (cached && cached.size === stat.size) {
-    if (cached.mtimeMs !== stat.mtimeMs) cached.mtimeMs = stat.mtimeMs;
+  // Size alone cannot prove the same file: atomic replacement and equal-size
+  // rewrite must not attach today's stat to yesterday's parsed records.
+  const samePhysicalFile = cached?.fileIdentity === sourceSnapshot.fileIdentity;
+  if (cached && samePhysicalFile && cached.size === stat.size && cached.contentHasher
+    && (cached.mtimeMs !== stat.mtimeMs || cached.ctimeMs !== stat.ctimeMs)) {
+    // A touch is not a rewrite. Reuse the already parsed graph only after an
+    // exact bounded-memory byte check; never guess from equal byte count.
+    const checked = await hashFileSegment(filePath, 0, stat.size).catch(() => null);
+    const after = await fs.promises.stat(filePath).catch(() => null);
+    if (claudeJsonlEpoch(filePath) !== expectedEpoch || _jsonlCache.get(filePath) !== cached) return { stale: true, value: null };
+    if (!checked || !after || after.dev + ':' + after.ino !== sourceSnapshot.fileIdentity
+      || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) {
+      deleteClaudeJsonlCacheEntry(filePath); return { stale: true, value: null };
+    }
+    if (checked.sha256 === cached.contentHasher.copy().digest('hex')) {
+      cached.mtimeMs = stat.mtimeMs; cached.ctimeMs = stat.ctimeMs;
+      console.log('[ClaudeJsonlCache] timestamp-verified file=' + path.basename(filePath) + ' bytes=' + stat.size);
+    }
+  }
+  if (cached && samePhysicalFile && cached.size === stat.size
+    && cached.mtimeMs === stat.mtimeMs && cached.ctimeMs === stat.ctimeMs) {
     touchClaudeJsonlCacheEntry(filePath, cached);
     return { stale: false, value: {
       recordMap: cached.recordMap,
@@ -805,7 +816,7 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
   }
 
   // ── Case 2: File grew (normal for active sessions) → read ONLY new bytes ──
-  if (cached && stat.size > cached.size) {
+  if (cached && samePhysicalFile && stat.size > cached.size) {
     // CRITICAL: Snapshot cache state BEFORE any await — concurrent loadJsonlRecords
     // calls for the same file can mutate cached.size/leftover between await points,
     // causing the read offset to jump forward and SKIP records permanently.
@@ -817,11 +828,13 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
 
     const fd = await fs.promises.open(filePath, 'r');
     let newContent = '';
+    let contentHasher = cached.contentHasher?.copy() || null;
     try {
       const newByteCount = stat.size - prevSize;
       const buf = Buffer.allocUnsafe(newByteCount);
       const { bytesRead } = await fd.read(buf, 0, newByteCount, prevSize);
       if (bytesRead !== newByteCount) return { stale: true, value: null };
+      contentHasher?.update(buf.subarray(0, bytesRead));
       newContent = buf.subarray(0, bytesRead).toString('utf-8');
     } finally {
       await fd.close();
@@ -857,6 +870,15 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
       return { stale: true, value: null };
     }
 
+    const afterAppend = await fs.promises.stat(filePath).catch(() => null);
+    if (claudeJsonlEpoch(filePath) !== expectedEpoch || _jsonlCache.get(filePath) !== cached) {
+      return { stale: true, value: null };
+    }
+    if (!afterAppend || afterAppend.dev + ':' + afterAppend.ino !== sourceSnapshot.fileIdentity
+      || afterAppend.size < stat.size || (afterAppend.size === stat.size && afterAppend.ctimeMs !== stat.ctimeMs)) {
+      deleteClaudeJsonlCacheEntry(filePath);
+      return { stale: true, value: null };
+    }
     for (const [uuid, entry] of deltaRecordMap) cached.recordMap.set(uuid, entry);
     cached.progressEntries.push(...deltaProgressEntries);
     const queueOperations = cached.queueOperations || [];
@@ -867,6 +889,8 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
 
     setClaudeJsonlCacheEntry(filePath, {
       size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
+      ctimeMs: stat.ctimeMs, fileIdentity: sourceSnapshot.fileIdentity,
+      contentHasher,
       recordMap: cached.recordMap, lastRecord: newLastRecord,
       bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries,
       queueOperations, fileIndex, queueIndex
@@ -911,6 +935,7 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
   let byteOffset = 0;
   let leftover = '';
   let capturedSizeFromStream = 0;
+  const contentHasher = crypto.createHash('sha256');
 
   {
     const stream = fs.createReadStream(filePath, {
@@ -926,6 +951,7 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
     const finishPreparation = historyPreparationActivity.begin({ kind: 'history', sessionId, bytes: stat.size });
     try {
       for await (const chunk of stream) {
+        contentHasher.update(chunk, 'utf8');
         capturedSizeFromStream += Buffer.byteLength(chunk, 'utf8');
         const lines = (leftover + chunk).split('\n');
         // The last piece may be a partial line split across chunks; it is
@@ -970,11 +996,25 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
   // of bytes actually consumed is the only safe next incremental offset.
   const capturedSize = capturedSizeFromStream;
   let capturedMtimeMs = stat.mtimeMs;
-  try {
-    capturedMtimeMs = (await fs.promises.stat(filePath)).mtimeMs;
-  } catch {}
+  let capturedCtimeMs = stat.ctimeMs;
+  const afterFull = await fs.promises.stat(filePath).catch(() => null);
+  if (claudeJsonlEpoch(filePath) !== expectedEpoch) return { stale: true, value: null };
+  if (!afterFull || afterFull.dev + ':' + afterFull.ino !== sourceSnapshot.fileIdentity || afterFull.size < capturedSize) {
+    deleteClaudeJsonlCacheEntry(filePath);
+    return { stale: true, value: null };
+  }
+  if (afterFull.size === stat.size && (afterFull.ctimeMs !== stat.ctimeMs || afterFull.mtimeMs !== stat.mtimeMs)) {
+    deleteClaudeJsonlCacheEntry(filePath);
+    return { stale: true, value: null };
+  }
+  if (afterFull.size === capturedSize) {
+    capturedMtimeMs = afterFull.mtimeMs;
+    capturedCtimeMs = afterFull.ctimeMs;
+  }
   setClaudeJsonlCacheEntry(filePath, {
     size: capturedSize, mtimeMs: capturedMtimeMs, leftover: leftover || '',
+    ctimeMs: capturedCtimeMs, fileIdentity: sourceSnapshot.fileIdentity,
+    contentHasher,
     recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null,
     progressEntries, queueOperations, fileIndex, queueIndex
   });
@@ -998,6 +1038,7 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
       ...sourceSnapshot,
       size: capturedSize,
       mtimeMs: capturedMtimeMs,
+      ctimeMs: capturedCtimeMs,
     },
   } };
 }
@@ -5366,6 +5407,8 @@ function register({
         discovery = {
           projectDir: path.resolve(primaryFound.projectDir),
           mtimeMs: stat.mtimeMs,
+          ctimeMs: stat.ctimeMs,
+          fileIdentity: stat.dev + ':' + stat.ino,
         };
       } catch {}
     }
@@ -5415,6 +5458,10 @@ function register({
       unchanged: !!(validation.unchanged && presentationStillCurrent && responseTimingStillCurrent),
     };
   };
+
+  _api.getHistoryFreshnessRuntime = async ({ tabId }) => _claudeHistoryContext(
+    tabId && _getClaudeEditableLastPromptState
+      ? await _getClaudeEditableLastPromptState(tabId, 'history-freshness') : null, null);
 
   // Stats-only freshness probe: answers "would get-full-history say unchanged?"
   // without resolving the session chain or serializing anything. This is what
@@ -5491,6 +5538,7 @@ function register({
           entries: [],
           latestSessionId: sessionId,
           revision,
+          ...(payload.freshnessProof === true ? { freshnessReadSources: historySources } : {}),
         };
       }
 
@@ -6464,6 +6512,7 @@ function register({
         claudeMemoryBoundaryUuid: _firstOrphanRecoveredFromUuid,
         editableLastPromptStatus,
         revision,
+        ...(payload.freshnessProof === true ? { freshnessReadSources: historySources } : {}),
       };
     } catch (error) {
       console.error('[Claude FullHistory] Error:', error);

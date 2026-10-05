@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildSync } from 'esbuild';
+import { nextRequestSuccessExpiry, REQUEST_SUCCESS_VISIBLE_MS } from './requestTrackerVisibility.mjs';
 
 const compiled = { exports: {} };
 const output = buildSync({ entryPoints: [new URL('./tabMessageProjection.ts', import.meta.url).pathname], bundle: true, write: false, platform: 'node', format: 'cjs' }).outputFiles[0].text;
@@ -8,6 +9,81 @@ new Function('module', 'exports', output)(compiled, compiled.exports);
 const { mergeTabMessages: merge, tabMessageThreads: threads, tabMessageDelivery: delivery, tabMessageQuestionLabel: label } = compiled.exports;
 const question = (patch = {}) => ({ messageId: 'q1', kind: 'question', sourceTabId: 'a', sourceProjectId: 'pa', sourceSessionId: 'sa', targetTabId: 'b', targetProjectId: 'pb', targetSessionId: 'sb', deliveryState: 'sent', createdAt: 10, updatedAt: 20, ...patch });
 const reply = (patch = {}) => question({ messageId: 'r1', kind: 'reply', replyTo: 'q1', sourceTabId: 'b', targetTabId: 'a', ...patch });
+
+test('confirmed question and reply leave the live tracker after four seconds, not History', () => {
+  const { tabMessageSuccessAt, tabMessageVisibleInTracker } = compiled.exports;
+  const index = merge({}, [question(), reply({ updatedAt: 1000 })]);
+  for (const tabId of ['a', 'b']) {
+    const [thread] = threads(index, tabId);
+    assert.equal(tabMessageSuccessAt(thread), 1000);
+    assert.equal(tabMessageVisibleInTracker(thread, tabId, 4999), true);
+    assert.equal(tabMessageVisibleInTracker(thread, tabId, 5000), false);
+    assert.equal(threads(index, tabId).length, 1);
+    assert.equal(thread.question.sourceDismissedAt, undefined);
+  }
+  assert.equal(REQUEST_SUCCESS_VISIBLE_MS, 4000);
+});
+
+test('pending, missing and failed reply never disappear as a success', () => {
+  const { tabMessageSuccessAt, tabMessageVisibleInTracker, tabMessagePresentation } = compiled.exports;
+  for (const deliveryState of ['pending', 'sending', 'queued', 'waiting-for-input', 'unconfirmed', 'failed']) {
+    const [thread] = threads(merge({}, [question(), reply({ deliveryState })]), 'a');
+    assert.equal(tabMessageSuccessAt(thread), null);
+    assert.equal(tabMessageVisibleInTracker(thread, 'a', 100000), true);
+    assert.equal(tabMessagePresentation(thread).icon, delivery(thread.reply).icon);
+  }
+  for (const input of [[question()], [question({ replyMessageId: 'r1', answeredAt: 30 })],
+    [question({ deliveryState: 'unconfirmed' }), reply()]]) {
+    const [thread] = threads(merge({}, input), 'a');
+    assert.equal(tabMessageSuccessAt(thread), null);
+    assert.equal(tabMessageVisibleInTracker(thread, 'a', 100000), true);
+  }
+});
+
+test('other participant dismissal and late body hydration do not revive completed messages', () => {
+  const { tabMessageSuccessAt, tabMessageVisibleInTracker } = compiled.exports;
+  let index = merge({}, [question({ updatedAt: 100 }), reply({ updatedAt: '2026-10-04T18:00:00Z' })]);
+  const completedAt = Date.parse('2026-10-04T18:00:00Z');
+  index = merge(index, [question({ updatedAt: completedAt + 10000, targetDismissedAt: completedAt + 10000 }),
+    reply({ updatedAt: 200, text: 'late full body' })]);
+  const [thread] = threads(index, 'a');
+  assert.equal(tabMessageSuccessAt(thread), completedAt);
+  assert.equal(tabMessageVisibleInTracker(thread, 'a', completedAt + 10001), false);
+  assert.equal(thread.reply.text, 'late full body');
+});
+
+test('success timer advances to every next expiry, including message-only updates', () => {
+  assert.equal(nextRequestSuccessExpiry([1000, 2000, null, undefined, NaN], 3000), 5000);
+  assert.equal(nextRequestSuccessExpiry([1000, 2000], 5020), 6000);
+  assert.equal(nextRequestSuccessExpiry([1000, 2000], 6020), null);
+  assert.equal(nextRequestSuccessExpiry([0, null, -10], 0), null);
+});
+
+test('dismissal stays per participant and does not erase history or a failed reply', () => {
+  const { tabMessageDismissed, tabMessageReplyPresentation, tabMessagePeer } = compiled.exports;
+  let state = merge({}, [question({ sourceDismissedAt: 30, updatedAt: 30 })]);
+  state = merge(state, [question({ sourceDismissedAt: null, updatedAt: 40, replyMessageId: 'r1' }), reply({ deliveryState: 'failed' })]);
+  const [sent] = threads(state, 'a');
+  const [received] = threads(state, 'b');
+  assert.equal(tabMessageDismissed(sent.question, 'a'), true);
+  assert.equal(tabMessageDismissed(received.question, 'b'), false);
+  assert.equal(tabMessageReplyPresentation(sent).icon, 'error');
+  assert.equal(tabMessagePeer(sent).sourceTabId, 'b');
+  assert.equal(tabMessagePeer(received).sourceTabId, 'a');
+  assert.equal(threads(state, 'a').length, 1, 'hidden still belongs to shared history');
+});
+
+test('two stages keep answer delivery distinct without treating saved text as received', () => {
+  const { tabMessageReplyPresentation } = compiled.exports;
+  const [waiting] = threads(merge({}, [question()]), 'a');
+  assert.equal(tabMessageReplyPresentation(waiting).label, 'Ожидает ответа');
+  const [saved] = threads(merge({}, [question({ replyMessageId: 'r1' })]), 'a');
+  assert.notEqual(tabMessageReplyPresentation(saved).icon, 'delivered');
+  for (const deliveryState of ['queued', 'unconfirmed', 'waiting-for-input', 'failed', 'sent']) {
+    const [thread] = threads(merge({}, [question(), reply({ deliveryState })]), 'a');
+    assert.deepEqual(tabMessageReplyPresentation(thread), delivery(thread.reply));
+  }
+});
 
 test('answer existence survives reverse delivery failure without changing question delivery', () => {
   const [thread] = threads(merge({}, [question(), reply({ deliveryState: 'failed', error: 'draft conflict' })]), 'a');

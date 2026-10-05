@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
+import ts from 'typescript';
 
 const repoRoot = path.join(import.meta.dirname, '../..');
 const read = (relative) => fs.readFileSync(path.join(repoRoot, relative), 'utf8');
@@ -20,6 +22,22 @@ const codeOnly = (source) => source
   .join('\n');
 const hookCode = codeOnly(hook);
 const areaCode = codeOnly(area);
+
+test('actual capacity presentation distinguishes blocked submission, exhausted budget and ordinary overload', () => {
+  const ast = ts.createSourceFile('hook.ts', hook, ts.ScriptTarget.Latest, true);
+  const declaration = ast.statements.flatMap(node => ts.isVariableStatement(node) ? [...node.declarationList.declarations] : [])
+    .find(node => node.name.getText(ast) === 'getSessionStartingPresentation');
+  assert.ok(declaration);
+  const compiled = ts.transpileModule('const present = ' + declaration.initializer.getText(ast),
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const present = vm.runInNewContext(compiled + '\npresent');
+  const input = code => ({ engine:'codex', sessionId:'S', lifecycleWarning:{type:'model-capacity',code,message:'exact cause'} });
+  const blocked = present(input('codex_capacity_retry_not_submitted'));
+  assert.equal(blocked.isError, true); assert.equal(blocked.subtitle, 'exact cause');
+  assert.match(blocked.detail, /was not submitted/);
+  assert.equal(present(input('codex_capacity_retry_exhausted')).isError, true);
+  assert.equal(present(input('codex_model_at_capacity')).isError, false);
+});
 
 /**
  * Плашка процесса — свойство ВКЛАДКИ, не фокуса.

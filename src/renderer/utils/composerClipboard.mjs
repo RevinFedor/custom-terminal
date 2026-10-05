@@ -2,6 +2,7 @@ import {
   buildPasteChipMarker,
   buildHistoryComposerPresentationParts,
   getPasteMarkerHighlightRanges,
+  insertComposerSnapshotAtSelection,
   normalizeComposerChips,
   serializeComposerDraft,
   shouldCreatePasteChip,
@@ -16,6 +17,52 @@ const PORTABLE_IMAGE_PATH_SOURCE = String.raw`\[imagePath:\s*([^\]\r\n]+?)\s*\]`
 const createImageMarkerRegex = () => new RegExp(IMAGE_MARKER_SOURCE, 'gi');
 const createPasteMarkerRegex = () => new RegExp(PASTE_MARKER_SOURCE, 'g');
 const createPortableImagePathRegex = () => new RegExp(PORTABLE_IMAGE_PATH_SOURCE, 'gi');
+
+const promptPayload = (chip) => serializeComposerDraft({ chips: [chip] });
+const promptReplayIdentity = (chip) => {
+  if (chip.contextUpdateId) return ['context', chip.contextUpdateId];
+  if (chip.attachmentKind === 'file') return ['file', chip.filePath, chip.role || 'source'];
+  if (chip.sourceKey || chip.replaySourceKey) return ['source', chip.sourceKey || chip.replaySourceKey];
+  return ['chip', chip.replayChipId || chip.id];
+};
+const promptReplayKey = (chip) => JSON.stringify([promptReplayIdentity(chip), promptPayload(chip)]);
+
+/** Clipboard replay is not picker upsert: keep the current revision and add a
+ * different one, but do not attach an exact already-owned prompt a second time.
+ * Inline paste chips retain their positional, intentionally repeatable meaning. */
+export function insertHistoryClipboardSnapshotAtSelection({
+  chips = [], insertedChips = [], pendingContextUpdates = [], dismissedContextUpdateIds = [], ...options
+} = {}) {
+  const current = normalizeComposerChips(chips);
+  const seen = new Set(current.filter(chip => chip.kind === 'prompt').map(promptReplayKey));
+  const sourceKeys = new Set(current.filter(chip => chip.kind === 'prompt').map(chip => chip.sourceKey).filter(Boolean));
+  const ids = new Set(current.map(chip => chip.id));
+  const dismissed = new Set(dismissedContextUpdateIds);
+  const pending = pendingContextUpdates.filter(update => update.status === 'pending'
+    && !(update.memberIds?.length ? update.memberIds : [update.id]).every(id => dismissed.has(id)));
+  const replay = normalizeComposerChips(insertedChips).flatMap(chip => {
+    if (chip.kind !== 'prompt') return [chip];
+    const key = promptReplayKey(chip);
+    if (seen.has(key)) return [];
+    if (chip.contextUpdateId && pending.some(update => (
+      [update.id, ...(update.memberIds || [])].includes(chip.contextUpdateId)
+      && update.text === chip.text && update.title === chip.label
+    ))) return [];
+    seen.add(key);
+    const next = { ...chip };
+    // The picker codec replaces matching sourceKeys. Preserve both revisions
+    // here, retaining provenance for a subsequent replay of the same revision.
+    if (next.sourceKey && sourceKeys.has(next.sourceKey)) {
+      next.replaySourceKey = next.sourceKey;
+      delete next.sourceKey;
+    }
+    if (next.sourceKey) sourceKeys.add(next.sourceKey);
+    if (ids.has(next.id)) next.replayChipId = next.replayChipId || next.id;
+    ids.add(next.id);
+    return [next];
+  });
+  return insertComposerSnapshotAtSelection({ ...options, chips: current, insertedChips: replay });
+}
 
 function clampSelection(value, selectionStart, selectionEnd) {
   const start = Math.max(0, Math.min(Number(selectionStart) || 0, value.length));
@@ -46,10 +93,14 @@ export function buildHistoryMessageComposerSnapshot({
   const sourcePromptChips = normalizeComposerChips(chips)
     .filter((chip) => chip.kind === 'prompt');
   const promptChips = [];
-  let promptIndex = 0;
+  const usedSourcePrompts = new Set();
   const appendPromptChip = (presented) => {
-    const source = sourcePromptChips[promptIndex++];
-    promptChips.push(source && source.text === presented?.text ? source : presented);
+    // Deferred wrappers need not have sidecars. Do not let their prefix shift
+    // the attached prompt's identity or borrow metadata from an equal body.
+    const source = sourcePromptChips.find(chip => !usedSourcePrompts.has(chip)
+      && promptPayload(chip) === promptPayload(presented));
+    if (source) usedSourcePrompts.add(source);
+    promptChips.push(source || presented);
   };
   let cursor = 0;
 

@@ -118,7 +118,7 @@ repo source, без остановки NT/AI-вкладок или дополн�
 `McpHubButton.tsx` в шапке рядом с ResourceUsageButton: точка-статус
 (зелёная 6/6 / янтарная часть / красная 0 готовых или хаб недоступен), панель со списком серверов
 (pid, аптайм, счётчик рестартов), кнопка рестарта per-server, кнопка
-«Перезапустить все MCP» всегда; при недоступном хабе — «Восстановить все MCP».
+«Перезапустить MCP хаба» всегда; при недоступном хабе — «Восстановить хаб».
 Во время запроса виден процесс, повторные клики заблокированы. Ошибка IPC/HTTP или
 `ok:false` показывается целиком, частичный успех не выдаётся за полный; длинный
 lastError в строке доступен по hover. При недоступном хабе UI не обещает stdio-
@@ -130,6 +130,42 @@ IPC: `mcp-hub:status`, `mcp-hub:restart-server`, `mcp-hub:restart-all`,
 панели не убивается. Зелёный учитывает не только PID, но и завершённый initialize
 и отсутствие активного recovery; во время автоматической замены ребёнок янтарный.
 
+С 04.10.2026 source-панель также содержит `Codex · конфигурация`: внешние MCP и
+MCP установленных плагинов появляются/исчезают по нативному каталогу, без отдельной
+правки под название сервера. «Настроен»/«отключён» относятся к конфигурации, а не
+к соединению уже запущенной вкладки; для него остаётся `/mcp`. У внешних строк нет
+выдуманного PID, uptime, зелёного connected или кнопки рестарта хаба. Счётчик и
+зелёная точка по-прежнему подтверждают initialize только детей хаба. Popup скроллится,
+поэтому большой каталог не выдавливает строки за viewport.
+
+`mcp-hub:codex-catalog` читает native `config/read`, `plugin/installed` и
+`plugin/read` через отдельный metadata app-server без threads/tool calls.
+Scope — cwd реально показанной вкладки окна в фокусе; Home/chooser используют
+корень своего проекта, Inbox не исключается. Native API сам разрешает global/
+trusted-project layers. Managed hub URL определяется по endpoint и реестру хаба,
+поэтому aliases не дублируются, а внешний сервер с таким же именем не скрывается.
+Авторизация и запуск внешних MCP остаются у Codex.
+
+При открытой панели чтение идёт раз в 3с, main объединяет совпавшие запросы,
+кэширует snapshot на 2.5с и ограничивает один read 12с с закрытием своего процесса.
+Metadata helper закрывается через 15с простоя/shutdown; новая вкладка и inference
+не создаются. Plugin names кешируются на 30с с ключом scope/id/version/localVersion/
+installedAt; новые/удалённые plugins меняют список по `plugin/installed`, правка
+существующего пакета без новой версии может быть видна после этого TTL.
+Первый plugin read выполняется максимум четырьмя параллельными запросами.
+Изменение plugin settings обновляет только свой metadata client, без трогания агентов.
+Ошибка сохраняет последнюю полезную конфигурацию своего scope и видимый статус;
+поздний ответ другого cwd не заполняет новую панель. Headers/env/args/instructions,
+credentials и секреты URL не передаются renderer; HTTP display показывает origin.
+
+Приёмка: 47 профильных checks, actual React/Electron+IPC/private hub (add/remove,
+partial failure/retry, late cwd, прежний all/single restart), native Codex0.159.2
+с приватным config и установленным local plugin. Чтение видит plugin MCP/изменение
+enabled, stdio-marker не создан и HTTP-запросов к MCP0. Отдельный readonly UI показал
+реальный figma_console/yandex-wiki и production status, без restart или Figma calls.
+Paired main/renderer build PASS; source ещё не установлен. Артефакты:
+`/private/tmp/noted-mcp-catalog-20261004.fouy8eg6`.
+
 ## Конфиги (источник правды)
 
 - `~/.claude.json::mcpServers` — все шесть `type: "http"` на hub-url с `${VAR}`.
@@ -140,6 +176,16 @@ IPC: `mcp-hub:status`, `mcp-hub:restart-server`, `mcp-hub:restart-all`,
   секунду; это окно вмещает четырёхсекундное recovery каталога.
 - Бэкапы: `~/.claude.json.bak-hub-*`, `~/.codex/config.toml.bak-hub-*`,
   код серверов до правок — `~/mcp-backups-<ts>/`.
+
+### Внешний MCP в Codex не становится ребёнком хаба
+
+Список хаба задан `defaultServerDefs()` и содержит шесть наших stdio-серверов; он не импортирует произвольные записи из Codex/Claude config. `6/6` подтверждает здоровье этого хаба, а внешние регистрации source-панель показывает отдельно из Codex (раздел UI выше). Например, `codex mcp add figma --url https://mcp.figma.com/mcp` добавляет прямое HTTP/OAuth-подключение в глобальный конфиг Codex. Отдельный локальный процесс Figma не нужен, а её native OAuth остаётся у Codex.
+
+04.10.2026 на Codex 0.159.2: глобальная Figma enabled/OAuth, новый native app-server получил 43 инструмента через `mcpServerStatus/list`; чтение/изменение design-файлов не выполнялось. Старая сессия может держать прежний каталог. Для использования нового MCP достаточно нового запуска Codex (либо перезапуска процесса с Resume сохранённой сессии), затем `/mcp` проверяет активный список. Build Install Noted Terminal для этого не требуется; «Перезапустить все MCP» обновляет только шесть детей хаба и не перечитывает native MCP config в живом Codex. App-server имеет отдельный `config/mcpServer/reload`, но текущий Noted PTY-клиент не предоставляет такого действия. Число 43 — результат этого среза, не постоянный контракт Figma.
+
+Вторая проверка того же дня закрыла отличие внешнего shell от штатного запуска Noted: через Terminal MCP создана background child-вкладка4933 командой `codex`, затем Project API отправил только `/mcp verbose`. Реальный TUI0.159.2 внутри установленного Noted ответил `figma: connected (43 tools)` / `Auth: OAuth`, также `figma_console: connected (121 tools)` и готовые штатные MCP. Вкладка закрыта обычным `close_tab`, model prompt/design reads/writes не запускались. У текущей4875 фактическое окружение CLI использует стандартный `~/.codex`, без отдельного CODEX_HOME/profile, project `.codex/config.toml` отсутствует. Для нового штатного запуска недоступность Figma из-за Noted опровергнута; более старый каталог конкретной уже открытой сессии не проверялся этой пробой. Установленная панель этой диагностической проверки читала только IPC `mcp-hub:status`; последующий source-ремонт каталога описан в UI выше. Источник проверки — `/private/tmp/noted-figma-native-launch-20261004.3bt6p062/HANDOFF.md`.
+
+Источники: [native MCP/config](https://learn.chatgpt.com/docs/extend/mcp), [active `/mcp`](https://learn.chatgpt.com/docs/developer-commands), [Figma manual setup](https://developers.figma.com/docs/figma-mcp-server/remote-server-installation/), [обновление каталога после restart клиента](https://developers.figma.com/docs/figma-mcp-server/code-to-canvas/). Общий popup использует независимые источники здоровья хаба и native конфигурации; metadata не является proof live connection конкретной сессии или её profile overrides.
 
 ## Ловушки
 

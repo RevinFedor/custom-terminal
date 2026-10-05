@@ -61,6 +61,24 @@ test('N empty retries then one alert; real progress replenishes the budget', asy
   assert.equal(f.calls.filter(x => x[0] === 'send').length, 3);
 });
 
+test('not-submitted retires only that effect, never repeats it, and real subsequent work replenishes retry capability', async () => {
+  const outcome = { submitted: false, error: 'identity not proven' };
+  const f = fixture({ outcome, limit: 1 });
+  await f.runtime.capacity(f.owner, { type: 'capacity', errorId: 'E1', at: 10 });
+  assert.equal(f.persisted.get('tab').pendingEffectId, null);
+  assert.equal(f.persisted.get('tab').cancelled, false, 'a failed send is not manual Stop/disable');
+  const reopened = fixture({ state: f.persisted.get('tab'), limit: 1 });
+  await reopened.runtime.capacity(reopened.owner, { type: 'capacity', errorId: 'E1', at: 10 });
+  assert.equal(reopened.calls.length, 0, 'the same failed effect cannot resurrect after restart');
+  await f.runtime.capacity(f.owner, { type: 'capacity', errorId: 'E1', at: 10 });
+  assert.equal(f.calls.filter(x => x[0] === 'send').length, 1);
+  f.runtime.progress(f.owner, { type: 'progress', eventId: 'real-work', at: 20 });
+  assert.equal(f.persisted.get('tab').attempts, 0);
+  outcome.submitted = true;
+  await f.runtime.capacity(f.owner, { type: 'capacity', errorId: 'E2', at: 30 });
+  assert.equal(f.calls.filter(x => x[0] === 'send').length, 2);
+});
+
 test('uncertain delivery and repeated same error never issue another Enter, including restart', async () => {
   const f = fixture({ outcome: { submitted: null, deliveryUnknown: true }, limit: 1 });
   await f.runtime.capacity(f.owner, { type: 'capacity', errorId: 'E1', at: 10 });

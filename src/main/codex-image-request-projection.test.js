@@ -236,7 +236,7 @@ test('actual pre-Enter staging persists typed image proof across SQLite close/re
     sendOperationKey: identity.operationKey, sendAttemptId: identity.attemptId,
     handoffId: identity.handoffId, broadcastTabId: identity.tabId,
     isCodexPasteSource: true, durablePreSubmitBoundary: null, codexImageRequestProjection: null,
-    expectedDestination: null,
+    expectedDestination: null, ownedAttachmentTransport: null,
     captureCodexPromptAuditBoundary: () => boundary,
     durableRawPrompt: actual.requestText, content: actual.plan.text,
     codexImagePasteSegments: actual.plan.segments, stagedCodexImageRefs: actual.plan.staged,

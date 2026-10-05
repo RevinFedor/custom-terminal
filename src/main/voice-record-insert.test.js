@@ -14,6 +14,33 @@ function fixture(t) {
   return { directory };
 }
 
+test('actual orchestration/fork IDs cross discovery and the single recording POST unchanged', async t => {
+  const f = fixture(t), calls = [];
+  const ids = [
+    'new_project_1770989259412_9ryw9s-tab-orchestration-9943cdb9-cb5d-4497-9c14-d8bb746ece32',
+    'project-tab-orchestration-run-a',
+    'project-tab-fork-9943cdb9-cb5d-4497-9c14-d8bb746ece32',
+    'L1VzZXJzL2ZlZG9yL0Rlc2t0b3AvY3VzdG9tLXRlcm1pbmFs-tab-3951',
+    'tab-8',
+  ];
+  const result = await insertTabIdsInVoiceRecord(ids, { ...f, fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, json: async () => url.endsWith('/api/me')
+      ? { ok: true, application: 'voice-record', pid: 987, capabilities: { recordingInsert: { version: 2 } } }
+      : { ok: true } };
+  } });
+  assert.deepEqual(result, { ok: true });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(calls[1].options.body).tabIds, ids);
+});
+
+test('malformed or oversized IDs fail before discovery or a recording request', async () => {
+  for (const id of ['tab-1x', 'project-tab-', 'project-tab-a\nother', 'project-tab-a\n', 'project-tab-a\u2028', 'project-tab-a\0', 'project-tab-a b', 'project-tab-' + 'x'.repeat(1024)]) {
+    const result = await insertTabIdsInVoiceRecord([id], { directory: '/nonexistent-discovery', fetchImpl: () => assert.fail('no network') });
+    assert.deepEqual(result, { ok: false, error: 'Некорректный ID вкладки' }, id);
+  }
+});
+
 test('authenticated identity overrides stale discovery and pins the only POST to the live process', async t => {
   const f = fixture(t), calls = [];
   const fetchImpl = async (url, options) => {

@@ -133,7 +133,7 @@ post-Enter rollout-аудитом.
 
 У одной живой вкладки поэтому существуют разные роли идентификатора. `resume source` — намерение запуска; `saved session` в SQLite — durable цель остановленной вкладки; `read identity` — единственный ID, который сейчас безопасно читать/копировать; `active writer` — rollout, который текущий Codex-процесс реально держит открытым на запись. Только writer разрешает разрушительные Edit/Delete и заменяет durable binding; native Rewind использует отдельную точную generation-bound authority. Fork не изменяет source и потому использует отдельный snapshot-контракт ниже. Read identity может быть stopped history, proven writer, exact idle Resume-source либо отдельно доказанный empty standalone source. Для обычного idle Resume-source main одновременно сверяет persisted source, exclusive Resume lease, tab, terminal object, run, lifecycle/launch generation, source watcher и process-open rollout. Ни одно сохранённое поле renderer само этот verdict не выводит.
 
-Готовый composer во время resume ещё не превращает source в writer, но завершает startup-loader и разрешает обычный ручной ввод. До первого submit обе copy-поверхности могут использовать exact idle read identity, не меняя writer-state. Перед первыми paste/Enter main ставит отдельный launch-scoped барьер read identity; неотправленная попытка снимает его, но после записанного Enter он переживает TTL временного prompt-сигнала и остаётся до causal source-vs-child resolution либо смены lifecycle. После durable adoption read identity становится точным writer child либо подтверждённым source-in-place. `inputReady`, read identity и `writerConfirmed` — независимые оси: mutation/API-команды всё ещё ждут writer, даже когда Copy уже безопасен.
+Готовый composer во время resume ещё не превращает source в writer, но завершает startup-loader и разрешает обычный ручной ввод. До первого submit обе copy-поверхности могут использовать exact idle read identity, не меняя writer-state. Перед первыми paste/Enter main ставит отдельный launch-scoped барьер read identity; неотправленная попытка снимает его, но после записанного Enter он переживает TTL временного prompt-сигнала и остаётся до causal source-vs-child resolution либо смены lifecycle. После durable adoption read identity становится точным writer child либо подтверждённым source-in-place. `inputReady`, read identity и `writerConfirmed` — независимые оси: read identity сама не разрешает API-ввод или изменение истории. Первые Send/local slash используют отдельный exact provisional Resume admission; Edit/Delete не получают writer-права от готового composer или Copy.
 
 Fork и Compact Fork не мутируют выбранный source: они создают независимый
 snapshot. Поэтому после JSONL-Rewind готовый idle Resume может использовать
@@ -456,6 +456,19 @@ settings→reconcile→slash настоящими main-функциями: за�
 не воспроизводит повторное открытие discovery. Process replacement, unknown
 inspection и чужая session по-прежнему не разрешают запись.
 
+05.10 warm4875 выявил ещё одну границу: public local slash обходит обычный FIFO,
+и web preflight сравнивал pinned SID с пока null writer ещё до вызова Main.
+При наличии coherent exact terminal instance/launch API теперь сохраняет
+исходный SID, усиливает physical pin и передаёт команду прежнему Main handler.
+Это не writer/ready proof и не разрешение Enter: `ensureCodexSubmissionWatcher`
+должен подтвердить текущие process/discovery/sourceTurn/lease, а target/input/Stop
+guards повторяются у записи. Нет savedSID fallback, нового Resume или повторной
+отправки. Actual web→SQLite→Main slash проверяет и успех provisional Resume,
+и unknown/missing lease/foreign source/process replacement/manual takeover.
+Явный отказ до beginAttempt/bridge сохраняется через существующий no-write
+settlement: future GET/restart не оставляют такую операцию в preparing.
+Исторический recovery receipt4875 не переписывается по одному старому HTTP409.
+
 ### Очистка данных запуска не завершает Rewind
 
 Временный `codexLastRunCommandPayload` живёт до первого `task_started`, а
@@ -562,6 +575,12 @@ Capacity-overload retry не меняется и не является usage exh
 owner по-прежнему обязательны. Автовыбор из System не меняется и не выполняется
 повторно по таймеру. Сам native Goal сохраняется Codex, не является app Run After.
 
+04.10 добавлен явный recovery через Project API/Terminal MCP поверх этого же
+контроллера: Resume/Leave paused выбирается по exact operationId и requestId.
+GET не действует; unknown не разрешает новый Enter без нового committed
+same-dialog proof. Этот маршрут не меняет автонастройку и не запускает stopped
+Codex. Wire/повторы: `fact-terminal-mcp.md::Явный выбор native Goal через MCP`.
+
 Прод-инцидент24.09: в 03:57 UTC 17 живых Codex-вкладок получили usage-меню;
 каждая операция записала `policy=continue` и выбор Reserve, ни одна не прочитала
 `stop-all`. Меню уже говорило «You’re now using Luna» до действия приложения,
@@ -662,9 +681,26 @@ ASAR10:07UTC совпадали с source; это не объясняется т
 а спорный decorated placeholder проходит прежний exact Copy с owner proof.
 Текущий committed frame теперь будит общий verifier и для уже запущенного idle
 launch; открытый frame, другой процесс/launch и настоящий startup blocker не
-получают разрешения. Ни30s send deadline, ни60s startup deadline не увеличены.
+получают разрешения. В ремонте10.09 ни30s send deadline, ни60s startup deadline
+не увеличивались. С04.10 cold Send следует конечному deadline того же
+main-owned launch, а не отказывает раньше него; live-picker guard остаётся30s.
 Timeout send несёт `agent_send_readiness_timeout` и явное `submitted:false`;
 main startup-timeout сохраняет общий screen/PTY incident этой launch generation.
+
+04.10 после установки нового deadline обнаружен отдельный разрыв fast presence:
+`projectCodexRuntimeSnapshotFromEvents` передавал `startupWait.launchId`, но не
+`sendTarget`. Ожидание фиксировало launch, а следующее сравнение с fallback без
+launchId давало ложный `agent_send_target_changed` ещё до paste. Это воспроизведено
+для обычного cold Send4505 и локального `/compact`4875; не timeout и не смена SID.
+Event snapshot теперь получает ту же physical target projection, что `/status`
+и write boundary, без History/saved SID как writer. Renderer сохраняет наблюдённые
+terminal instance/launch до ready; generation первого OSC принимает из final ready
+read, не затирая сильный caller pin. Exact Resume source→writer остаётся допустим.
+Новый объект того же target не меняет runtime revision, изменённый owner меняет.
+Один прежний deadline, Stop, foreign session/launch/instance и финальный запрет
+PTY-write сохранены. Регрессия исполняет actual Main event producer→presence→Send,
+а не вручную дополненный snapshot; local `/compact` не требует обычной prompt receipt.
+Это source/isolated proof, не физическая повторная отправка инцидентов.
 
 Готовый после Resume TUI не заменяет отдельное доказательство пустого input.
 20.09 tab3314 получил ready, но следующий History preflight96раз увидел
@@ -770,6 +806,24 @@ failed turn на следующий будущий turn; старый done/final
 Проверки: policy/runtime + actual main→web/store integration с реальным
 форматом JSONL, wrong-owner, Stop, duplicate, restart, grace=0 и old-done.
 Настоящую перегрузку внешнего провайдера тест искусственно не вызывает.
+
+03.10 incident2846: setting действительно enabled/limit1. В15:18:51UTC
+typed `server_overloaded` был распознан и policy зарезервировала attempt1,
+но common Send отказал до physical attempt: внутренний coherent Main snapshot
+не переносил `sendTarget` из write-boundary proof. Установленный ASAR14:10:43UTC
+содержал byte-exact такой getter; ready/read SID не могли заменить destination.
+Source возвращает тот же scoped writer/instance/launch/turn/generation tuple
+в проверенной snapshot-границе, не берёт saved/history SID и не ставит fake ready.
+Обычные target/draft/Stop/unknown/replay guards не ослаблены.
+
+Отказ `submitted:false` снимает pending ТОГО ЖЕ effect, сохраняет бюджет/seen
+error ID, но не выключает capability как manual Stop. Новый verified progress
+снова восполняет лимит; ни тот же error, ни restart не переотправляют effect.
+Такой отказ имеет `codex_capacity_retry_not_submitted`, а не exhausted; поздний
+TUI кадр того же turn не снижает его severity. History показывает точный текст
+capacity через прежний canonical/live formatter; role/outcome остаётся failed
+provider-error, не successful completion. Неподтверждённый writer по-прежнему
+может запретить автоматическую запись: N — бюджет, не приказ обойти безопасность.
 
 ### Шрам 05.09.2026: AutoResume и callback установки запускают одну сессию
 
@@ -1297,7 +1351,24 @@ History textarea draft хранится per-tab вне mount-cycle панели.
 
 Production-шрам 01.09.2026, `tab-753`: Enter был записан в 11:34:31, Codex уже показывал image-prompt в нативной очереди, но 8-секундный rollout timeout перевёл карточку в `UNCONFIRMED`; спустя 20,2 секунды тот же handoff стал `SENT`. Исправленный dev E2E удерживал текущий Bash tool: committed TUI proof дал `QUEUED` через 2,26 секунды, статус сохранялся 25+ секунд и после `user_message` тот же handoff стал `SENT`, без промежуточного `delivery-unknown`.
 
+### Программная очередь Send во время streaming
+
+Обычные программные Send используют Main FIFO: CLI может поддерживать много
+native pending messages, но приложение передаёт только один отслеживаемый head,
+пока его exact user audit не освободит slot. Остальные неизменные snapshots —
+`IN APP QUEUE` в SQLite; конец ответа ждать не нужно. TUI `queued` по-прежнему
+не равно `sent`. Ручной terminal input не ограничивается. Полный shared
+Claude/Codex контракт — `fact-terminal-mcp.md::Main FIFO принятых Send`.
+
 ### Native backtrack / Timeline Rewind
+
+Recovery обязана поддерживать обе user-carrier формы, разрешённые pre-Enter
+target admission: event_msg/user_message и response_item/message(role=user).
+Точные line/UUID/hash — прежние; response target проходит тот же presentation
+formatter. Post-action submit отдельно требует прежний raw audit hash/length,
+первый logical user своего task_started и допускает только его exact companion.
+Service context/Goal/aborted markers и steering не заменяют этот user. Шрам34
+и доказанное восстановление continued source — `fix-rewind-navigation.md::04.10`.
 
 У Codex нет Claude-style `/rewind`. Обычный Timeline `Откатиться` идёт через родной backtrack TUI: первый `Escape` должен показать hint `esc again to edit previous message`, второй `Escape` открывает transcript overlay на последнем user prompt, к более старым prompt'ам автоматика двигается `←`, а `Enter` отправляет `ThreadRollback { num_turns }`. Footer Codex показывает `esc/← to edit prev`, но для нашего cleanup это не значит что `Escape` безопасно закрывает overlay: отмена открытого overlay идёт через `q`. В rollout JSONL rollback появляется как `event_msg.payload.type === "thread_rolled_back"`, и парсеры `codex:get-timeline` / `codex:get-full-history` физически откатывают уже построенный список на `num_turns`.
 

@@ -1,4 +1,5 @@
 const DELIVERY_OUTCOMES = new Set([
+  'application-queued',
   'confirmed',
   'queued',
   'audit-pending',
@@ -15,6 +16,8 @@ const DELIVERY_OUTCOMES = new Set([
  */
 export function normalizeAgentSendOutcome(result) {
   if (DELIVERY_OUTCOMES.has(result?.deliveryOutcome)) return result.deliveryOutcome;
+  if (result?.applicationQueued === true && result?.applicationQueue?.version === 1
+    && result?.accepted === true && result?.submitted === false) return 'application-queued';
   if (result?.localSlashCommand === true && result?.submitted === true && result?.success === true) {
     return 'local-command-confirmed';
   }

@@ -50,7 +50,7 @@ test('source completion uses the shared send scenario while streaming', () => {
   assert.match(send, /resolveOrchestrationSourceNotificationSendOptions\(status\)/);
   assert.match(send, /queue: sourceSendOptions\.queue/);
   assert.doesNotMatch(send, /notification-deferred-source-busy/);
-  assert.doesNotMatch(send, /sendOperationKey:/);
+  assert.match(send, /sendOperationKey: `history:\$\{current\.sourceTabId\}:\$\{notificationHandoffId\}`/);
 });
 
 test('startup repairs a reserved target or makes its absence explicit', () => {

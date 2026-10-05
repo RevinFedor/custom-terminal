@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { transformSync } from 'esbuild';
 import { pointInHoverCluster, pointInRect } from './hoverBridge.mjs';
+import { createHoverReturnGate } from './hoverReturnGate.mjs';
 
 const source = fs.readFileSync(new URL('../components/Workspace/PromptQueueOverlay.tsx', import.meta.url), 'utf8');
 const bodies = {
@@ -23,6 +24,7 @@ function fixture() {
     editorText: 'User text', rewindTargetRequestId: null, tabId: 'owner', HOVER_CLUSTER_SELECTOR: 'owned-menu', HOVER_CLUSTER_PAD: 2,
     RUN_AFTER_IMAGE_PENDING_MARKER: '[Image saving…]', HTMLElement: Element,
     dragIdRef: { current: null }, previewResizeActiveRef: { current: false }, editorLockTokenRef: { current: 'local-owner' },
+    hoverReturnRef: { current: createHoverReturnGate() },
     panelRef: { current: panel }, queueHoverPreviewPanelRef: { current: panel },
     queueCountButtonRef: { current: surface(rect(440, 100, 466, 126)) }, railRef: { current: surface(rect(400, 100, 500, 128)) },
     editorRef: { current: { contains: () => false } }, editorPreviewRef: { current: null },

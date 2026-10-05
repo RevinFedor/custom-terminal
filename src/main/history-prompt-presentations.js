@@ -1,6 +1,8 @@
 const crypto = require('crypto');
 const path = require('path');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { readOwnedAttachmentProjection, validateOwnedAttachmentSnapshot,
+  renderOwnedAttachmentTransport } = require('./owned-mobile-attachments');
 const { findPastedContentEnvelope } = require('../shared/pasted-content.cjs');
 const { claudeNativePastedPromptText } = require('./claude-prompt-audit');
 const { prepareClaudePromptTransport } = require('./claude-prompt-transport');
@@ -519,11 +521,18 @@ function normalizeClaudeRequestPresentation(value) {
     || !Number.isFinite(Date.parse(binding.auditTimestamp))
     || !/^[a-f0-9]{16}$/.test(binding.transportHash || '')) return null;
   let prepared;
-  try { prepared = prepareClaudePromptTransport(value.requestText); } catch { return null; }
+  try {
+    let source = value.requestText;
+    if (value.ownedAttachments) {
+      if (!validateOwnedAttachmentSnapshot(value.ownedAttachments, source, origin)) return null;
+      source = renderOwnedAttachmentTransport(value.ownedAttachments, source, 'claude', value.ownedPaths).text;
+    }
+    prepared = prepareClaudePromptTransport(source);
+  } catch { return null; }
   if (prepared.transport.text !== transportText
-    || prepared.raw.auditHash !== value.requestHash
+    || promptAuditFingerprint(value.requestText) !== value.requestHash
     || prepared.transport.auditHash !== value.preparedHash
-    || (binding.transportHash === value.preparedHash && !binding.sourceIdentity)) return null;
+    || (binding.transportHash === value.preparedHash && !binding.sourceIdentity && !value.ownedAttachments)) return null;
   return { kind: value.kind, version: 1,
     origin: Object.fromEntries(['tabId', 'handoffId', 'operationKey', 'attemptId'].map(key => [key, origin[key]])),
     binding: { sessionId: binding.sessionId,
@@ -532,7 +541,8 @@ function normalizeClaudeRequestPresentation(value) {
       auditTimestamp: binding.auditTimestamp, transportHash: binding.transportHash },
     requestText: value.requestText,
     ...(transportText !== value.requestText ? { transportText } : {}),
-    requestHash: value.requestHash, preparedHash: value.preparedHash };
+    requestHash: value.requestHash, preparedHash: value.preparedHash,
+    ...(value.ownedAttachments ? { ownedAttachments: value.ownedAttachments, ownedPaths: value.ownedPaths } : {}) };
 }
 
 function storedClaudeRequestPresentation(row) {
@@ -543,7 +553,7 @@ function storedClaudeRequestPresentation(row) {
 function claudeRequestPresentationFromReceipt(record) {
   const receipt = record?.receipt, audit = record?.auditIdentity;
   const directReason = ['claude_owned_composer_provider_transform',
-    'claude_request_transport_exact'].includes(receipt?.canonicalReason);
+    'claude_request_transport_exact', 'owned_mobile_attachment_paths'].includes(receipt?.canonicalReason);
   const queuedReason = ['provider-queue-dequeue', 'provider-queue-remove'].includes(
     receipt?.canonicalReason,
   );
@@ -568,6 +578,8 @@ function claudeRequestPresentationFromReceipt(record) {
     expectedText: transport, expectedHash: promptTransportHash(transport), expectedLen: transport.length,
   } });
   if (!checked.valid) return null;
+  const owned = receipt.ownedAttachmentProjection ? readOwnedAttachmentProjection(record) : null;
+  if (owned && !owned.valid) return null;
   return normalizeClaudeRequestPresentation({ kind: 'claude-request-presentation', version: 1,
     origin: { tabId: record.tabId, handoffId: record.handoffId,
       operationKey: record.operationKey, attemptId: record.attemptId },
@@ -575,7 +587,8 @@ function claudeRequestPresentationFromReceipt(record) {
       ...(directReason ? { entryUuid: audit.entryUuid } : { sourceIdentity: queuedSourceIdentity }),
       auditTimestamp: audit.auditTimestamp, transportHash: audit.promptHash },
     requestText: receipt.promptText, transportText: transport,
-    requestHash: checked.requestHash, preparedHash: checked.transportHash });
+    requestHash: owned ? record.promptHash : checked.requestHash, preparedHash: checked.transportHash,
+    ...(owned ? { ownedAttachments: receipt.ownedAttachments, ownedPaths: owned.proof.paths } : {}) });
 }
 
 function projectClaudeRequestPresentation(row, entry) {
@@ -594,7 +607,8 @@ function projectClaudeRequestPresentation(row, entry) {
   const content = typeof entry.fullText === 'string' ? entry.fullText : entry.content;
   const transportText = projection.transportText ?? projection.requestText;
   if (typeof content !== 'string'
-    || claudeNativePastedPromptText(content, transportText) !== transportText) return null;
+    || (!(projection.ownedAttachments && content === transportText)
+      && claudeNativePastedPromptText(content, transportText) !== transportText)) return null;
   // Remove only the extra proven outer envelope. Any app-authored saved/paste
   // wrappers INSIDE the original request retain their existing representation.
   return { ...entry, content: projection.requestText,
@@ -661,7 +675,8 @@ function backfillConfirmedCanonicalAuthoringPresentations(db, records) {
     if (existing?.entryUuid && existing.entryUuid !== projection.binding.entryUuid) continue;
     const normalized = normalizePromptPresentationSnapshot(record.receipt.presentationSnapshot)
       || (nativeSlots ? normalizePromptPresentationSnapshot({ imagePaths:
-        record.receipt.expectedImageRefs.map((ref, index) => ({ ...ref, id: index + 1 })) }) : null);
+        record.receipt.expectedImageRefs.map((ref, index) => ({ ...ref, id: index + 1 })) }) : null)
+      || (projection.parts.some(part => part.kind === 'file') ? { promptChips: [], semanticTags: [], imagePaths: [] } : null);
     if (!normalized) continue;
     let chips = existing?.chips || [...normalized.promptChips, ...normalized.semanticTags, ...normalized.imagePaths];
     let refs = splitPromptPresentationRow({ chips }).imagePaths;
@@ -995,7 +1010,7 @@ function decorateHistoryPromptPresentations(db, {
         + ' images=' + recovery.recovered
         + ' saved=' + presentationSaved);
     }
-    if (promptChips.length === 0 && semanticTags.length === 0 && imagePaths.length === 0 && !requestPresentation) return entry;
+    if (promptChips.length === 0 && semanticTags.length === 0 && imagePaths.length === 0 && !requestPresentation && !authoredEntry) return entry;
     changed = true;
     return {
       ...(authoredEntry || presentationEntry),

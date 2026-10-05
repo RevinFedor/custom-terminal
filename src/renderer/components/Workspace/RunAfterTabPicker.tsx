@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode, RefObject } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronDown, Folder, Hourglass, LoaderCircle, Play, X } from 'lucide-react';
+import { ChevronDown, Folder, Hourglass, LoaderCircle, Pencil, Play, X } from 'lucide-react';
 import { useWorkspaceStore, type TabColor, type TabGroup } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { resolveRunAfterTabStatus } from '../../utils/runAfterTabStatus.mjs';
+import { aiKindForTab, runAfterWorkflowByProject } from '../../utils/runAfterTabScope.mjs';
+import { getRestartAfterTriggerIds } from '../../utils/restartAfterCommand.mjs';
 import { resolveAgentBusyPresentation } from '../../utils/agentBusyPresentation.mjs';
 import {
   UNPLACED_WORKFLOW_ID,
@@ -109,6 +111,9 @@ export type RunAfterTabPickerProps = {
   autoRun: boolean;
   runAfterTabId: string | null;
   runAfterTabIds?: string[];
+  runAfterWorkflowIds?: string[];
+  /** Restart after only: caller persists a live subscription to this workflow. */
+  onToggleAllTabs?: (workflowId: string) => void;
   waitingTabIds?: ReadonlySet<string>;
   setRunAfterTab: (tabId: string, target: string | null) => void;
   panelRef: RefObject<HTMLDivElement | null>;
@@ -157,6 +162,9 @@ export type RunAfterTabPickerProps = {
   modalOverlay?: boolean;
   /** A surrounding row may already own the clear action. */
   showPillClearAction?: boolean;
+  /** In the overview a visible target is navigation; pencil/ПКМ changes it. */
+  navigateOnPillClick?: boolean;
+  showTaskMarkers?: boolean;
 };
 
 const adjustRgbaAlpha = (rgba: string, delta: number): string => {
@@ -265,29 +273,13 @@ function buildPickerRows(
   return rows;
 }
 
-function aiKindForTab(tab: {
-  tabType?: string;
-  commandType?: string;
-  claudeSessionId?: string;
-  codexSessionId?: string;
-  geminiSessionId?: string;
-}): AiTabKind | null {
-  if (tab.tabType === 'claude-sdk') return 'claude-sdk';
-  // The picker describes which AI tab should satisfy the condition, not which
-  // tab already has a materialized session. A typed-but-unstarted tab is a
-  // valid target and intentionally stays in the hourglass state until its first
-  // real busy -> idle outcome.
-  if (tab.commandType === 'claude') return 'claude-pty';
-  if (tab.commandType === 'codex') return 'codex';
-  if (tab.commandType === 'gemini') return 'gemini';
-  return null;
-}
-
 export function RunAfterTabPicker({
   tabId,
   autoRun,
   runAfterTabId,
   runAfterTabIds,
+  runAfterWorkflowIds = [],
+  onToggleAllTabs,
   waitingTabIds,
   setRunAfterTab,
   panelRef,
@@ -318,12 +310,14 @@ export function RunAfterTabPicker({
   closeRequestKey = 0,
   modalOverlay = false,
   showPillClearAction = true,
+  navigateOnPillClick = false,
+  showTaskMarkers = true,
 }: RunAfterTabPickerProps) {
   const toggleTabGroupCollapsed = useWorkspaceStore((state) => state.toggleTabGroupCollapsed);
   const sessionStatuses = useUIStore((state) => state.sessionStatuses);
   const tabGeo = useUIStore((state) => state.tabGeometry);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
-  const selectedInputIds = useMemo(() => {
+  const explicitInputIds = useMemo(() => {
     const raw = multiSelect && Array.isArray(runAfterTabIds)
       ? runAfterTabIds
       : (runAfterTabId ? [runAfterTabId] : []);
@@ -331,7 +325,7 @@ export function RunAfterTabPicker({
       .map((id) => typeof id === 'string' ? id.trim() : '')
       .filter((id) => id.length > 0)));
   }, [multiSelect, runAfterTabId, runAfterTabIds]);
-  const selectedInputKey = selectedInputIds.join('|');
+  const selectedWorkflowKey = runAfterWorkflowIds.join('|');
   const projectIconFingerprint = useProjectsStore((state) => Object.entries(state.projects)
     .map(([projectId, project]) => `${projectId}:${project.icon || ''}`)
     .sort()
@@ -390,6 +384,12 @@ export function RunAfterTabPicker({
     return parts.join('|');
   });
 
+  const selectedInputIds = useMemo(() => getRestartAfterTriggerIds({
+    id: tabId, restartAfterTabIds: explicitInputIds,
+    restartAfterWorkflowIds: multiSelect ? runAfterWorkflowIds : [],
+  }, useWorkspaceStore.getState()), [fingerprint, tabId, explicitInputIds, multiSelect, selectedWorkflowKey]);
+  const selectedInputKey = selectedInputIds.join('|');
+
   const inventory = useMemo<{
     groups: AiWorkflowGroup[];
     ownerWorkflowId: string | null;
@@ -436,12 +436,7 @@ export function RunAfterTabPicker({
     // Workflow membership is project metadata, not current window placement.
     // A project has one workflow parent; every one of its sidebar tabs belongs
     // to that workflow even if it is not currently shown in a pane.
-    const workflowByProjectId = new Map<string, string>();
-    for (const space of state.spaces) {
-      for (const projectId of Array.isArray(space.projectIds) ? space.projectIds : []) {
-        if (!workflowByProjectId.has(projectId)) workflowByProjectId.set(projectId, space.id);
-      }
-    }
+    const workflowByProjectId = runAfterWorkflowByProject(state.spaces);
     const ownerWorkflowId = ownerProjectId
       ? workflowByProjectId.get(ownerProjectId) || UNPLACED_WORKFLOW_ID
       : UNPLACED_WORKFLOW_ID;
@@ -453,7 +448,7 @@ export function RunAfterTabPicker({
       ? (selectedTargetProjectId
         ? workflowByProjectId.get(selectedTargetProjectId) || UNPLACED_WORKFLOW_ID
         : UNPLACED_WORKFLOW_ID)
-      : null;
+      : (runAfterWorkflowIds[0] || null);
     const placedProjectIds = new Set<string>();
     const groups: AiWorkflowGroup[] = [];
 
@@ -466,7 +461,7 @@ export function RunAfterTabPicker({
       const orderedTabs = workflowProjectIds.flatMap(
         (projectId) => allTabsByProject.get(projectId) || [],
       );
-      if (orderedTabs.length === 0 && space.id !== ownerWorkflowId) continue;
+      if (orderedTabs.length === 0 && space.id !== ownerWorkflowId && !runAfterWorkflowIds.includes(space.id)) continue;
       groups.push({
         workflowId: space.id,
         name: space.name || 'Workflow',
@@ -483,7 +478,7 @@ export function RunAfterTabPicker({
         .filter(([projectId]) => !placedProjectIds.has(projectId))
         .flatMap(([, tabs]) => tabs),
     );
-    if (unplacedTabs.length > 0 || ownerWorkflowId === UNPLACED_WORKFLOW_ID) {
+    if (unplacedTabs.length > 0 || ownerWorkflowId === UNPLACED_WORKFLOW_ID || runAfterWorkflowIds.includes(UNPLACED_WORKFLOW_ID)) {
       groups.push({
         workflowId: UNPLACED_WORKFLOW_ID,
         name: UNPLACED_WORKFLOW_NAME,
@@ -496,7 +491,7 @@ export function RunAfterTabPicker({
     }
 
     return { groups, ownerWorkflowId, selectedTargetWorkflowId };
-  }, [fingerprint, projectIconFingerprint, tabId, selectedInputKey]);
+  }, [fingerprint, projectIconFingerprint, tabId, selectedInputKey, selectedWorkflowKey]);
 
   const [busyMap, setBusyMap] = useState<Map<string, boolean>>(() => getBusyTabsSnapshot());
   // Which tabs are working right now, app-wide. A STRING, not a Set: a selector
@@ -739,6 +734,8 @@ export function RunAfterTabPicker({
   const selectedWorkflow = inventory.groups.find((g) => g.workflowId === selectedWorkflowId) ?? inventory.groups[0] ?? null;
   const targetTabs = selectedWorkflow ? selectedWorkflow.tabs.filter((t) => t.id !== tabId) : [];
   const activeCount = targetTabs.filter((t) => statusFor(t.id) !== 'idle').length;
+  const allSelected = !!selectedWorkflow && runAfterWorkflowIds.includes(selectedWorkflow.workflowId);
+  const [allHover, setAllHover] = useState(false);
 
   useEffect(() => {
     if (!open || !selectedWorkflow?.workflowId) return;
@@ -777,8 +774,10 @@ export function RunAfterTabPicker({
     return rows;
   }, [isVisibleTab, selectedWorkflow]);
 
-  const hasSelectedTarget = selectedInputIds.length > 0;
-  const selectedSummaryText = multiSelect && selectedInputIds.length > 1
+  const hasSelectedTarget = selectedInputIds.length > 0 || (multiSelect && runAfterWorkflowIds.length > 0);
+  const selectedSummaryText = multiSelect && runAfterWorkflowIds.length > 0
+    ? `All · ${selectedInputIds.length}`
+    : multiSelect && selectedInputIds.length > 1
     ? `${selectedInputIds.length} tabs`
     : (selectedTab?.name || (hasSelectedTarget ? 'Missing tab' : emptyLabel));
   const activeTargetWait = hasSelectedTarget && autoRun;
@@ -811,13 +810,28 @@ export function RunAfterTabPicker({
       buttonRef={internalTriggerRef}
       tab={selectedTab}
       label={selectedSummaryText}
+      showTaskMarkers={showTaskMarkers}
       selected
       active={autoRun}
       status={selectedStatus ?? 'idle'}
       sessionStatuses={sessionStatuses}
       tabGeo={tabGeo}
       fontSize={tabsFontSize}
-      onClick={() => open ? setOpen(false) : handleOpen()}
+      onClick={event => {
+        if (!navigateOnPillClick) { open ? setOpen(false) : handleOpen(); return; }
+        if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+          event.preventDefault(); event.stopPropagation();
+          useWorkspaceStore.getState().placeTab(selectedTab.projectId, selectedTab.id, { mode: 'add-here' });
+        } else navigateToSelectedTab();
+      }}
+      onAuxClick={navigateOnPillClick ? event => {
+        if (event.button !== 1) return;
+        event.preventDefault(); event.stopPropagation();
+        useWorkspaceStore.getState().placeTab(selectedTab.projectId, selectedTab.id, { mode: 'add-here' });
+      } : undefined}
+      onContextMenu={navigateOnPillClick ? event => {
+        event.preventDefault(); event.stopPropagation(); handleOpen();
+      } : undefined}
       titleText={
         (autoRun
           ? `Run after ${selectedSummaryText} finishes`
@@ -834,8 +848,8 @@ export function RunAfterTabPicker({
         <>
           <span
             role="button"
-            aria-label={`Open ${selectedSummaryText}`}
-            title="Перейти к вкладке"
+            aria-label={navigateOnPillClick ? 'Изменить вкладку ожидания' : `Open ${selectedSummaryText}`}
+            title={navigateOnPillClick ? 'Изменить вкладку ожидания' : 'Перейти к вкладке'}
             onMouseDown={(event) => {
               event.preventDefault();
               event.stopPropagation();
@@ -843,7 +857,7 @@ export function RunAfterTabPicker({
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              navigateToSelectedTab();
+              if (navigateOnPillClick) handleOpen(); else navigateToSelectedTab();
             }}
             onMouseEnter={() => setPillActionHover('navigate')}
             onMouseLeave={() => setPillActionHover((current) => current === 'navigate' ? null : current)}
@@ -861,7 +875,8 @@ export function RunAfterTabPicker({
               transition: 'background 0.12s, color 0.12s',
             }}
           >
-            <Play size={10} strokeWidth={2.2} fill="currentColor" aria-hidden="true" />
+            {navigateOnPillClick ? <Pencil size={10} aria-hidden="true" />
+              : <Play size={10} strokeWidth={2.2} fill="currentColor" aria-hidden="true" />}
           </span>
           {showPillClearAction && (
             <span
@@ -1064,7 +1079,7 @@ export function RunAfterTabPicker({
       `}</style>
       {!hideTrigger && (
         <ControlHint
-          label={hasSelectedTarget
+          label={hasSelectedTarget && navigateOnPillClick ? 'Перейти к вкладке; карандаш или ПКМ — изменить условие' : hasSelectedTarget
             ? `Изменить вкладку ожидания: ${selectedSummaryText}`
             : 'Выбрать вкладку, после которой продолжить'}
           disabled={open}
@@ -1100,6 +1115,7 @@ export function RunAfterTabPicker({
             <div
               ref={menuRef}
               data-run-after-picker-menu
+              data-tab-context-menu-host={panelRef?.current?.getAttribute('data-tab-context-menu-host') || undefined}
               data-run-after-hover-owner={hoverOwner}
               style={{
                 position: 'fixed',
@@ -1134,7 +1150,25 @@ export function RunAfterTabPicker({
                 <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {title}
                 </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+                {multiSelect && onToggleAllTabs && <button
+                  type="button"
+                  data-run-after-select-all
+                  aria-pressed={allSelected}
+                  aria-label={allSelected ? 'Снять весь выбор' : `Выбрать все вкладки: ${selectedWorkflow?.name || ''}`}
+                  disabled={!selectedWorkflow}
+                  title={allSelected ? 'Снять весь выбор, включая ранее выбранные вкладки'
+                    : `Все вкладки «${selectedWorkflow?.name || ''}», включая новые`}
+                  onClick={() => { if (selectedWorkflow) onToggleAllTabs(selectedWorkflow.workflowId); }}
+                  onMouseEnter={() => setAllHover(true)}
+                  onMouseLeave={() => setAllHover(false)}
+                  style={{ flexShrink: 0, padding: '1px 5px', borderRadius: 999,
+                    border: `1px solid ${allSelected ? 'rgba(255,255,255,0.38)' : BORDER}`,
+                    background: allHover ? `${DEEP_PULSE}26` : (allSelected ? `${DEEP_PULSE}33` : 'transparent'),
+                    color: allHover || allSelected ? '#fff' : TEXT_MUTED, cursor: 'pointer', fontSize: 9, lineHeight: 1.35 }}
+                >All</button>}
                 <button
+                  data-run-after-visibility-filter
                   onClick={() => setShowAllTabs((v) => !v)}
                   onMouseEnter={() => setCountHover(true)}
                   onMouseLeave={() => setCountHover(false)}
@@ -1153,6 +1187,7 @@ export function RunAfterTabPicker({
                 >
                   {activeCount}/{targetTabs.length}
                 </button>
+                </div>
               </div>
 
               <div
@@ -1208,6 +1243,7 @@ export function RunAfterTabPicker({
                     <PickerTabRow
                       key={row.tab.id}
                       tab={row.tab}
+                      showTaskMarkers={showTaskMarkers}
                       selected={isSelected}
                       active={autoRun}
                       status={statusFor(row.tab.id)}
@@ -1227,6 +1263,7 @@ export function RunAfterTabPicker({
                     projectId={row.projectId}
                     group={row.group}
                     tabs={row.tabs}
+                    showTaskMarkers={showTaskMarkers}
                     active={autoRun}
                     selectedTabId={runAfterTabId}
                     selectedTabIds={selectedIdSet}
@@ -1304,6 +1341,7 @@ function PickerGroupRow({
   fontSize,
   onToggle,
   onSelect,
+  showTaskMarkers,
 }: {
   projectId: string;
   group: TabGroup;
@@ -1317,6 +1355,7 @@ function PickerGroupRow({
   fontSize: number;
   onToggle: () => void;
   onSelect: (tabId: string, isSelected: boolean) => void;
+  showTaskMarkers?: boolean;
 }) {
   const [hover, setHover] = useState(false);
   const collapsed = !!group.collapsed;
@@ -1410,6 +1449,7 @@ function PickerGroupRow({
               <PickerTabRow
                 key={tab.id}
                 tab={tab}
+                showTaskMarkers={showTaskMarkers}
                 selected={isSelected}
                 active={active}
                 status={statusFor(tab.id)}
@@ -1437,8 +1477,11 @@ function PickerTabRow({
   tabGeo,
   fontSize,
   onClick,
+  onAuxClick,
+  onContextMenu,
   titleText,
   trailingActions,
+  showTaskMarkers,
 }: {
   buttonRef?: RefObject<HTMLButtonElement | null>;
   tab: AiTab;
@@ -1449,29 +1492,35 @@ function PickerTabRow({
   sessionStatuses: SessionStatusLike[];
   tabGeo: PickerTabGeometry;
   fontSize: number;
-  onClick: () => void;
+  onClick: (event: React.MouseEvent<HTMLElement>) => void;
+  onAuxClick?: (event: React.MouseEvent<HTMLElement>) => void;
+  onContextMenu?: (event: React.MouseEvent<HTMLElement>) => void;
   titleText?: string;
   trailingActions?: ReactNode;
+  showTaskMarkers?: boolean;
 }) {
   return <TabCard as="button" ref={buttonRef} projectId={tab.projectId} tabId={tab.id}
     data-run-after-tab-row={tab.id} data-run-after-tab-status={status}
     selected={selected} active={selected && active} fullWidth
     geometry={tabGeo} fontSize={fontSize} label={label ?? tab.name} showProjectIcon reserveSignalSpace
+    showTaskMarkers={showTaskMarkers}
     activityOverride={{ hasProcess: false, busy: status === 'busy', inheritedBusy: status === 'inherited' }}
     onClick={onClick}
+    onAuxClick={onAuxClick}
+    onContextMenu={onContextMenu}
     title={titleText ?? (status === 'waiting' ? `${tab.name} - waiting for its Run after trigger` : tab.name)}
-    trailingActions={<>{status === 'waiting' && <StatusIcon status="waiting" color={PULSE} />}{trailingActions}</>}
+    trailingActions={<>{status === 'waiting' && <RunAfterStatusIcon status="waiting" color={PULSE} />}{trailingActions}</>}
   />;
 }
 
-function StatusIcon({ status, color }: { status: TabRuntimeStatus; color: string }) {
+export function RunAfterStatusIcon({ status, color, title }: { status: TabRuntimeStatus; color: string; title?: string }) {
   if (status === 'idle') return null;
   const isBusy = status === 'busy' || status === 'inherited';
   return (
     <span
-      title={status === 'inherited'
+      title={title ?? (status === 'inherited'
         ? 'Child agent is running'
-        : (status === 'busy' ? 'Agent is running' : 'Waiting for its Run after trigger')}
+        : (status === 'busy' ? 'Agent is running' : 'Waiting for its Run after trigger'))}
       style={{ width: 11, height: 11, flexShrink: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
     >
       {isBusy ? (

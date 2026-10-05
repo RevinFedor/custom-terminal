@@ -929,3 +929,27 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
   animation: none;
   background-color: #f5a623;
 }
+
+/* The existing terminal is lifted atomically after its native scroll offsets
+   are captured. Static rules avoid a React commit briefly changing geometry
+   before the portal host is relocated. No fitting or scaling belongs here. */
+[data-terminal-full-view-host] > [data-floating-terminal] {
+  position: relative !important;
+  left: 0 !important;
+  top: 0 !important;
+  right: auto !important;
+  bottom: auto !important;
+  width: var(--terminal-lift-width) !important;
+  height: var(--terminal-lift-height) !important;
+  box-sizing: border-box !important;
+  overflow: visible !important;
+  transform: none !important;
+  transition: none !important;
+}
+[data-terminal-full-view-host] > [data-floating-terminal] > [data-terminal-view-body] {
+  overflow: visible !important;
+}
+[data-terminal-full-view-host] > [data-floating-terminal] > [data-terminal-view-body] > [data-terminal-view-content] {
+  width: var(--terminal-lift-content-width) !important;
+  height: var(--terminal-lift-content-height) !important;
+}

@@ -134,6 +134,115 @@ test('response_item-only user turn remains editable as one real turn', () => {
   assert.deepEqual(userTexts(plan.outputRecords), []);
 });
 
+function goalPreambleFixture() {
+  const id = '918b29e9-3369-4d94-8739-3b2cbefe7351';
+  const rows = [
+    { __line: 0, type: 'session_meta', payload: { id, cwd: '/tmp/project' } },
+    { __line: 23654, type: 'event_msg', payload: { type: 'task_started', turn_id: 'same-provider-turn' } },
+    { __line: 23655, type: 'response_item', payload: {
+      type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: '<codex_internal_context source="goal">Continue the active goal.</codex_internal_context>' }],
+      internal_chat_message_metadata_passthrough: { turn_id: 'same-provider-turn', content_item_kinds: ['goal.internal_context'] },
+    } },
+    { __line: 23656, type: 'response_item', payload: {
+      type: 'message', role: 'user', content: [{ type: 'input_text', text: 'the new user prompt' }],
+      internal_chat_message_metadata_passthrough: { turn_id: 'same-provider-turn', content_item_kinds: ['user.text'] },
+    } },
+    { __line: 23657, type: 'event_msg', payload: { type: 'user_message', message: 'the new user prompt' } },
+    { __line: 23658, ...assistantRecord('answer') },
+  ];
+  return { id, rows };
+}
+
+test('incident 23655 Goal preamble retains its exact address before the next canonical user carrier', () => {
+  const { id, rows } = goalPreambleFixture();
+  const before = JSON.stringify(rows);
+  const timeline = _api.buildCodexTimeline(rows, id);
+  assert.deepEqual(timeline.map(row => row.content), ['Goal continued', 'the new user prompt']);
+  const wrappers = _api.buildCodexVisibleRecordWrappers(rows, id);
+  for (const row of timeline) {
+    const owner = wrappers.find(wrapper => wrapper.sourceUuid === row.uuid);
+    assert.equal(owner?.kind, 'user', row.uuid);
+    assert.ok(Number.isFinite(owner?.turnKey), row.uuid);
+  }
+  const plan = _api.planCodexRangeRewrite(rows, id, timeline[0].uuid, timeline[1].uuid);
+  assert.equal(plan.success, true, JSON.stringify(plan));
+  assert.equal(plan.removedUsers, 2);
+  assert.deepEqual(userTexts(plan.outputRecords), []);
+  assert.equal(JSON.stringify(rows), before);
+});
+
+test('deleting only the response-only Goal keeps the exact following prompt and its response/event pair', () => {
+  const { id, rows } = goalPreambleFixture();
+  const [goal, user] = _api.buildCodexTimeline(rows, id);
+  const plan = _api.planCodexRangeRewrite(rows, id, goal.uuid, goal.uuid);
+  assert.equal(plan.success, true, JSON.stringify(plan));
+  assert.equal(plan.removedUsers, 1);
+  assert.deepEqual(userTexts(plan.outputRecords), ['the new user prompt']);
+  assert.ok(plan.outputRecords.some(row => row.payload?.message === 'the new user prompt'));
+  assert.ok(plan.outputRecords.some(row => row.payload?.content?.[0]?.text === 'the new user prompt'));
+  assert.equal(user.uuid, 'codex-user-' + id + '-23657');
+});
+
+test('multiple response-only preambles keep distinct physical turns and exact duplicate text addresses', () => {
+  const { id, rows } = goalPreambleFixture();
+  const goal = rows[2];
+  for (const row of rows.slice(3)) row.__line += 1;
+  rows.splice(3, 0, { ...goal, __line: 23656 });
+  const timeline = _api.buildCodexTimeline(rows, id);
+  const plan = _api.planCodexRangeRewrite(rows, id, timeline[0].uuid, timeline.at(-1).uuid);
+  assert.equal(plan.success, true, JSON.stringify(plan));
+  assert.equal(plan.removedUsers, 3);
+  assert.equal(new Set(plan.selectedTurnKeys).size, 3);
+});
+
+test('response-only user is counted before a native rollback removes it, preserving the previous turn', () => {
+  const rows = [
+    { __line: 0, type: 'session_meta', payload: { id: 'rollback-source' } },
+    ...userRecords('previous').map((row, i) => ({ ...row, __line: i + 1 })),
+    { ...assistantRecord('previous answer'), __line: 3 },
+    { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'rolled back' }] }, __line: 4 },
+    { type: 'event_msg', payload: { type: 'thread_rolled_back', num_turns: 1 }, __line: 5 },
+  ];
+  const timeline = _api.buildCodexTimeline(rows, 'rollback-source');
+  assert.deepEqual(timeline.map(row => row.content), ['previous']);
+  const plan = _api.planCodexRangeRewrite(rows, 'rollback-source', timeline[0].uuid, timeline[0].uuid);
+  assert.equal(plan.success, true, JSON.stringify(plan));
+  assert.deepEqual(userTexts(plan.outputRecords), []);
+});
+
+test('event-first response alias remains one exact turn, while the next identical prompt retains its own address', () => {
+  const rows = [
+    { type: 'session_meta', payload: { id: 'same-text-source' } },
+    { type: 'event_msg', payload: { type: 'task_started' } },
+    { type: 'event_msg', payload: { type: 'user_message', message: 'same text' } },
+    userRecords('same text')[0],
+    assistantRecord('first answer'),
+    { type: 'event_msg', payload: { type: 'task_started' } },
+    ...userRecords('same text'),
+    assistantRecord('second answer'),
+  ].map((row, __line) => ({ ...row, __line }));
+  const timeline = _api.buildCodexTimeline(rows, 'same-text-source');
+  assert.equal(timeline.length, 2);
+  const plan = _api.planCodexRangeRewrite(rows, 'same-text-source', timeline[0].uuid, timeline[0].uuid);
+  assert.equal(plan.success, true, JSON.stringify(plan));
+  assert.equal(plan.removedUsers, 1);
+  assert.deepEqual(userTexts(plan.outputRecords), ['same text']);
+  assert.ok(plan.outputRecords.some(row => row.payload?.content?.[0]?.text === 'second answer'));
+  assert.equal(plan.outputRecords.some(row => row.payload?.content?.[0]?.text === 'first answer'), false);
+});
+
+test('service notification after a response-only input does not erase its mutation identity', () => {
+  const { id, rows } = goalPreambleFixture();
+  rows.splice(3, 0, { type: 'event_msg', __line: 23655, payload: { type: 'user_message', message: '<subagent_notification>done</subagent_notification>' } });
+  for (let i = 0; i < rows.length; i += 1) rows[i].__line = i;
+  const timeline = _api.buildCodexTimeline(rows, id);
+  assert.equal(timeline.length, 2);
+  const plan = _api.planCodexRangeRewrite(rows, id, timeline[0].uuid, timeline[0].uuid);
+  assert.equal(plan.success, true, JSON.stringify(plan));
+  assert.deepEqual(userTexts(plan.outputRecords), ['the new user prompt']);
+});
+
 test('unresolved user identity preserves exact range diagnostics without dumping or mutating the prompt', t => {
   const records = [
     { type: 'session_meta', payload: { id: 'source-session' }, __line: 0 },

@@ -13,7 +13,7 @@ const cwd = '/synthetic-wrap', p = 'p', q = 'q';
 const icon = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="#e75"/></svg>');
 const owner = (id: string) => ['c','d'].includes(id) ? q : p;
 const chip = (tabId: string) => ({ projectId: owner(tabId), tabId });
-const tabs = [['a','Alpha task'],['b','Beta task'],['c','Gamma task'],['d','Delta task'],['e','Epsilon task'],['f','Another window'],['g','Second target']]
+const tabs = [['a','Alpha task'],['b','Beta task'],['c','Gamma task'],['d','Delta task'],['e','Epsilon task'],['f','Another window'],['g','Second target'],['h','Hidden work']]
   .map(([id,name]) => ({ id,name,cwd,tabType:'terminal',color:'codex',sessionStatus:'working' }));
 const initialPanes = [
   { ...chip('a'), windowId:'left', column:0, tabs:[chip('a'),chip('b'),{slotId:'choice',projectId:p,cwd},chip('c'),chip('d'),chip('e')] },
@@ -40,9 +40,10 @@ f.state=()=>{const s=useWorkspaceStore.getState();return{panes:s.splitPanes.map(
   obsoleteKeys:Object.keys(useUIStore.getState()).filter(x=>/^paneTabStrip/.test(x))};};
 function Fixture() {
   const panes=useWorkspaceStore(s=>s.splitPanes), focus=useWorkspaceStore(s=>s.splitFocusedIndex);
+  const [width,setWidth]=React.useState(410);
   return <>
     <div data-terminal-pane-chrome-host style={{display:'flex',gap:16,padding:16}}>
-      {panes.map((pane,i)=><section key={pane.windowId} data-test-pane={i} style={{width:410,height:360,position:'relative',border:'1px solid #666'}}>
+      {panes.map((pane,i)=>pane.displayHidden?null:<section key={pane.windowId} data-test-pane={i} style={{width,flexShrink:0,height:360,position:'relative',border:'1px solid #666'}}>
         <SplitPaneAttachRow projectId={pane.projectId} tabId={pane.tabId} focused={focus===i} paneIndex={i}
           vacant={!pane.tabId} paneLayout={panes} spaceId="wrap-space" />
         <div data-test-content={i} style={{position:'absolute',top:`var(${splitPaneHeaderHeightVar(i)},26px)`,left:0,right:0,bottom:0,padding:12}}>
@@ -52,6 +53,11 @@ function Fixture() {
       </section>)}
     </div>
     <button data-reset onClick={reset}>Reset synthetic layout</button>
+    <label>Pane width<input data-pane-width type="number" value={width} onChange={e=>setWidth(Number(e.target.value))}/></label>
+    <button data-large-font onClick={()=>useUIStore.setState({tabsFontSize:22} as any)}>22px cards</button>
+    <button data-zero-gap onClick={()=>useUIStore.setState({tabGeometry:{paddingX:6,paddingY:3,paddingLeft:16,borderRadius:6,gap:0}} as any)}>Zero badge gap</button>
+    <button data-add-hidden onClick={()=>useWorkspaceStore.setState(s=>({splitPanes:[...s.splitPanes.filter(x=>x.windowId!=='hidden'),
+      {...chip('h'),windowId:'hidden',column:2,displayHidden:true,tabs:[chip('h')]}]}))}>Add hidden window</button>
   </>;
 }
 createRoot(document.getElementById('root')!).render(<Fixture/>);

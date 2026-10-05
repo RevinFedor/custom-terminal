@@ -1,5 +1,6 @@
 import { paneColumns, paneGridRects, packSplitSizes, paneTabs, paneChooserSlots,
-  replacePaneShownTab, selectChooserSlot } from './splitPanesModel.mjs';
+  paneSlots, paneHistory, isBareEmptyPane, addEmptyPane, addEmptyPaneVertical,
+  splitAvailability, replacePaneShownTab, selectChooserSlot } from './splitPanesModel.mjs';
 
 // The pane array owns window CONTENT once. Display profiles contain addresses
 // and geometry only; they can never restore deleted tabs or fork a live owner.
@@ -8,6 +9,59 @@ const newId = () => globalThis.crypto?.randomUUID?.()
   || `window-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 export const isWindowVisible = (pane) => !!pane && pane.displayHidden !== true;
 export const visibleWindowCount = (panes) => (panes || []).filter(isWindowVisible).length;
+
+// A freshly created split slot has no content or return history of its own.
+// An intentional vacancy after Remove/Full may still own Ctrl+[ / Cmd+Shift+T
+// history; never discard that window merely because its body is empty.
+const isNewEmptyWindow = pane => isBareEmptyPane(pane)
+  && paneHistory(pane).length === 0 && !(pane?.detachedTabs?.length);
+const hiddenWindowForSplit = panes => panes.find(p => !isWindowVisible(p) && paneSlots(p).length > 0)
+  || panes.find(p => !isWindowVisible(p));
+
+/** UI split adds a visible place, reusing existing offscreen content first. */
+export function windowSplitAvailability(panes, paneIndex) {
+  const list = Array.isArray(panes) ? panes : [];
+  const visible = list.filter(isWindowVisible);
+  if (hiddenWindowForSplit(list) && visible.some(isNewEmptyWindow)) {
+    return { horizontal: true, vertical: true, reason: null };
+  }
+  return splitAvailability(visible, visible.indexOf(list[paneIndex ?? 0]));
+}
+
+export function splitWindowPane(panes, focusedIndex, current, anchorIndex = null, side = 'right') {
+  if (!Array.isArray(panes) || !['right', 'left', 'above', 'below'].includes(side)) return null;
+  const list = ensureWindowIds(panes);
+  const visible = list.filter(isWindowVisible);
+  const anchor = list[anchorIndex ?? focusedIndex];
+  if (list.length && !isWindowVisible(anchor)) return null;
+  const incoming = hiddenWindowForSplit(list);
+  const placeholderIndex = list.findIndex(p => isWindowVisible(p) && isNewEmptyWindow(p));
+  if (incoming && placeholderIndex >= 0) {
+    // Recovery for a split made by older builds: fill its existing vacancy,
+    // don't create yet another column or exchange it into the hidden picker.
+    const revealed = revealHiddenWindow({ splitPanes: list, splitFocusedIndex: focusedIndex },
+      placeholderIndex, incoming.windowId);
+    return revealed && { panes: revealed.splitPanes, focusedIndex: revealed.splitFocusedIndex,
+      revealedWindowId: incoming.windowId };
+  }
+  const visibleFocus = Math.max(0, visible.indexOf(list[focusedIndex]));
+  const visibleAnchor = list.length ? visible.indexOf(anchor) : null;
+  // Hidden window columns belong to their saved monitor projection. The
+  // ordinary geometry primitives must see only the currently visible grid.
+  const opened = side === 'above' || side === 'below'
+    ? addEmptyPaneVertical(visible, visibleFocus, current, visibleAnchor, side)
+    : addEmptyPane(visible, visibleFocus, current, visibleAnchor, side);
+  if (!opened) return null;
+  const next = opened.panes.slice();
+  if (incoming) {
+    const { displayHidden, displayRect, column, ...content } = incoming;
+    const slot = next[opened.focusedIndex];
+    next[opened.focusedIndex] = { ...content,
+      ...(slot.column !== undefined ? { column: slot.column } : {}) };
+  }
+  return { panes: [...next, ...list.filter(p => !isWindowVisible(p) && p !== incoming)],
+    focusedIndex: opened.focusedIndex, revealedWindowId: incoming?.windowId };
+}
 
 export function ensureWindowIds(panes, _namespace = 'workspace') {
   const used = new Set();
@@ -151,12 +205,14 @@ export function revealHiddenWindow(layout, targetIndex, hiddenWindowId, selectio
   }
   const rects = paneGridRects(panes, layout.splitSizes);
   const { displayHidden, displayRect, column, ...content } = incoming;
+  const consumePlaceholder = isNewEmptyWindow(from);
   const next = panes.map((pane, index) => pane === from
     ? { ...content, column: from.column ?? targetIndex }
     : index === incomingIndex
-      ? { ...from, displayHidden: true, displayRect: rects[targetIndex] }
-      : pane);
-  return { ...layout, splitPanes: next, splitFocusedIndex: targetIndex };
+      ? consumePlaceholder ? null : { ...from, displayHidden: true, displayRect: rects[targetIndex] }
+      : pane).filter(Boolean);
+  return { ...layout, splitPanes: next,
+    splitFocusedIndex: targetIndex - (consumePlaceholder && incomingIndex < targetIndex ? 1 : 0) };
 }
 
 const fields = ['splitPanes', 'splitFocusedIndex', 'splitSizes', 'windowDisplayKey', 'windowDisplayLayouts'];

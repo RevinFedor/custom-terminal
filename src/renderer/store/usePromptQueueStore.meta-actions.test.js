@@ -19,6 +19,8 @@ async function loadQueueStore(t, persisted) {
     logLevel: 'silent',
   });
   const ipcRenderer = {
+    on() {},
+    removeListener() {},
     invoke: async (channel, key) => {
       if (channel === 'ai-prompts:get') return { success: true, data: [{ id: 'run-after-loop', content: require('../../shared/prompt-loop.cjs').DEFAULT_LOOP_PROMPT }] };
       if (channel === 'ai-prompts:save-content') return { success: true };
@@ -54,6 +56,7 @@ test('queued Restart and Rewind actions survive hydration as actions, not blank 
             kind: 'rewind',
             targetUuid: 'user-uuid',
             targetText: 'target prompt',
+            targetIteration: 23,
             sourceSessionId: 'session-a',
             toolType: 'codex',
           },
@@ -70,6 +73,7 @@ test('queued Restart and Rewind actions survive hydration as actions, not blank 
     kind: 'rewind',
     targetUuid: 'user-uuid',
     targetText: 'target prompt',
+    targetIteration: 23,
     sourceSessionId: 'session-a',
     toolType: 'codex',
   });
@@ -86,6 +90,7 @@ test('addMetaAction uses the ordinary queue ordering and first-item staging cont
     kind: 'rewind',
     targetUuid: 'target-2',
     targetText: 'second target',
+    targetIteration: 17,
     sourceSessionId: 'session-2',
     toolType: 'claude',
   });
@@ -94,7 +99,7 @@ test('addMetaAction uses the ordinary queue ordering and first-item staging cont
   assert.equal(queue.autoRun, false);
   assert.equal(queue.firstChipHintActive, true);
   assert.equal(queue.items[0].title, 'Restart tab');
-  assert.match(queue.items[1].title, /^Rewind: second target/);
+  assert.equal(queue.items[1].title, 'Rewind: 17');
 });
 
 test('corrupt persisted action is dropped instead of becoming an empty submitted prompt', async (t) => {

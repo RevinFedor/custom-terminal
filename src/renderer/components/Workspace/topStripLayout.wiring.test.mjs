@@ -111,7 +111,9 @@ test('кнопки проекта стоят над списком вкладо�
 test('узкая строка проекта оставляет Историю и Run After компактными', () => {
   assert.doesNotMatch(sidebarTools, /showHistoryLabel|WIDTH_FOR_HISTORY_LABEL/);
   assert.doesNotMatch(sidebarTools, /<span>История<\/span>/);
-  assert.match(globalRunAfter, /<GitBranch size=\{13\} \/> run-after · \{activeCount\}/);
+  assert.match(globalRunAfter, /<GitBranch size=\{13\} aria-hidden="true" \/> \{activeCount\}/);
+  assert.match(sidebarTools, /data-sidebar-tools-scroll/);
+  assert.match(sidebarTools, /data-sidebar-tools-trailing/);
 });
 
 test('глобальное меню Run After закрывается кликом по своему оверлею', () => {

@@ -10,6 +10,7 @@ import {
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
 
 export type HistoryPromptHandoffStatus =
+  | 'application-queued'
   | 'preparing'
   | 'sending'
   | 'queued'
@@ -96,6 +97,7 @@ export interface HistoryPromptHandoffProviderQueueProof {
 }
 
 export interface HistoryPromptHandoff {
+  applicationQueueId?: number | null;
   tabId: string;
   handoffId: string;
   sendAttemptId: string | null;
@@ -154,6 +156,7 @@ export function historyPromptHandoffPresentationIdentity(
 }
 
 export interface BeginHistoryPromptHandoffInput {
+  applicationQueueId?: number | null;
   tabId: string;
   handoffId: string;
   sendAttemptId?: string | null;
@@ -169,7 +172,7 @@ export interface BeginHistoryPromptHandoffInput {
   submittedAt?: number;
   source?: string;
   statusAtSend?: HistoryPromptHandoffAgentStatus;
-  initialStatus?: Extract<HistoryPromptHandoffStatus, 'preparing' | 'sending' | 'queued'>;
+  initialStatus?: Extract<HistoryPromptHandoffStatus, 'preparing' | 'sending' | 'queued' | 'application-queued'>;
   requiresAuditIdentity?: boolean;
   initialProviderQueueProof?: HistoryPromptHandoffProviderQueueProof | null;
   /** Durable remount only: seed the first observable snapshot at its receipt state. */
@@ -196,6 +199,7 @@ export interface AdoptHistoryPromptHandoffCanonicalInput {
 }
 
 export interface BindHistoryPromptHandoffSendIdentityInput {
+  applicationQueueId?: number | null;
   sendAttemptId?: string | null;
   sendOperationKey?: string | null;
 }
@@ -207,6 +211,7 @@ export interface AcceptHistoryPromptHandoffProviderQueueInput
 }
 
 export interface DurableHistorySendReceiptRecord {
+  applicationQueue?: { version: number; id: number; state: string; queuedAt: number } | null;
   promptHash?: string | null;
   imagePresentation?: { version: number; operationKey: string; attemptId: string; requestHash: string;
     imagePaths: HistoryPromptHandoffImageRef[] } | null;
@@ -394,7 +399,8 @@ export function selectLatestHistoryPromptInputStatus(
   let latest: Pick<HistoryPromptHandoff, 'submittedAt' | 'statusChangedAt' | 'queueStatus'> | null = null;
   for (const handoff of handoffs) {
     if (
-      handoff.queueStatus !== 'preparing'
+      handoff.queueStatus !== 'application-queued'
+      && handoff.queueStatus !== 'preparing'
       && handoff.queueStatus !== 'sending'
       && handoff.queueStatus !== 'queued'
       && handoff.queueStatus !== 'audit-pending'
@@ -983,6 +989,7 @@ export class HistoryPromptHandoffStore {
         const initialStatus = initialReceipt?.queueStatus || input.initialStatus || 'sending';
         const next = freezeHandoff({
           ...existing.value,
+          applicationQueueId: existing.value.applicationQueueId || input.applicationQueueId || null,
           sendAttemptId: nextAttemptId,
           sendOperationKey: typeof input.sendOperationKey === 'string'
             ? input.sendOperationKey.trim() || null
@@ -992,7 +999,13 @@ export class HistoryPromptHandoffStore {
             : existing.value.sessionIdHint,
           submittedAt,
           source: typeof input.source === 'string' ? input.source : existing.value.source,
-          statusAtSend: input.statusAtSend || existing.value.statusAtSend,
+          // null → first attempt only binds the existing click to its durable
+          // receipt. Hydration has no new click-time observation (usually
+          // 'unknown') and must not erase the known busy/active placement.
+          // A real attempt A → B still resets from the new send's observation.
+          statusAtSend: !currentAttemptId && existing.value.statusAtSend !== 'unknown'
+            ? existing.value.statusAtSend
+            : input.statusAtSend || existing.value.statusAtSend,
           queueStatus: initialStatus,
           statusReason: initialReceipt?.reason
             || (initialStatus === 'preparing' ? 'send-retry-preparing' : 'send-retry-start'),
@@ -1012,6 +1025,7 @@ export class HistoryPromptHandoffStore {
       }
       if (input.initialReceipt) {
         const bound = this.bindSendIdentity(tabId, handoffId, {
+          applicationQueueId: input.applicationQueueId,
           sendAttemptId: input.sendAttemptId,
           sendOperationKey: input.sendOperationKey,
         });
@@ -1033,6 +1047,7 @@ export class HistoryPromptHandoffStore {
     const value = freezeHandoff({
       tabId,
       handoffId,
+      applicationQueueId: input.applicationQueueId || null,
       sendAttemptId: typeof input.sendAttemptId === 'string'
         ? input.sendAttemptId.trim() || null
         : null,
@@ -1108,16 +1123,17 @@ export class HistoryPromptHandoffStore {
 
     let queueStatus: HistoryPromptHandoffStatus | null = null;
     if (phase === 'queued') {
-      if (current.value.queueStatus === 'preparing' || current.value.queueStatus === 'sending') {
+      if (current.value.queueStatus === 'application-queued' || current.value.queueStatus === 'preparing' || current.value.queueStatus === 'sending') {
         queueStatus = 'queued';
       }
     } else if (phase === 'sending') {
-      if (current.value.queueStatus === 'preparing' || current.value.queueStatus === 'queued') {
+      if (current.value.queueStatus === 'application-queued' || current.value.queueStatus === 'preparing' || current.value.queueStatus === 'queued') {
         queueStatus = 'sending';
       }
     } else if (phase === 'confirming') {
       if (
-        current.value.queueStatus === 'preparing'
+        current.value.queueStatus === 'application-queued'
+        || current.value.queueStatus === 'preparing'
         || current.value.queueStatus === 'sending'
         || current.value.queueStatus === 'queued'
       ) {
@@ -1236,9 +1252,11 @@ export class HistoryPromptHandoffStore {
 
     const sendAttemptId = current.value.sendAttemptId || incomingAttemptId;
     const sendOperationKey = current.value.sendOperationKey || incomingOperationKey;
+    const applicationQueueId = current.value.applicationQueueId || input.applicationQueueId || null;
     if (
       sendAttemptId === current.value.sendAttemptId
       && sendOperationKey === current.value.sendOperationKey
+      && applicationQueueId === (current.value.applicationQueueId || null)
     ) {
       this.promoteTab(tabId);
       return { ok: true, changed: false, handoff: current.value };
@@ -1251,6 +1269,7 @@ export class HistoryPromptHandoffStore {
       ...current.value,
       sendAttemptId,
       sendOperationKey,
+      applicationQueueId,
     });
     const approxBytes = estimateHandoffBytes(next);
     if (approxBytes > this.limits.maxBytes) return { ok: false, reason: 'bounds' };
@@ -1301,6 +1320,10 @@ export class HistoryPromptHandoffStore {
     }
 
     const nextProof = mergeCompatibleAuditProof(current.value.auditProof, input.proof);
+    // A delayed admission ACK cannot move a physically executing/confirmed
+    // attempt back to the application backlog.
+    if (input.queueStatus === 'application-queued'
+      && (current.value.sendAttemptId || current.value.auditProof || current.value.providerQueueProof)) return current.value;
     const currentHasExactReceipt = current.value.queueStatus === 'sent'
       && current.value.auditProof !== null;
     const incomingKeepsExactReceipt = input.queueStatus === 'sent'
@@ -1495,6 +1518,7 @@ export class HistoryPromptHandoffStore {
       const status = record.value.queueStatus;
       if (status !== 'failed' && status !== 'cancelled') continue;
       if (now - record.value.statusChangedAt < HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS) continue;
+      if (record.value.applicationQueueId) continue;
       tab.delete(handoffId);
       this.handoffs -= 1;
       this.approxBytes -= record.approxBytes;
@@ -1660,12 +1684,17 @@ export function historyPromptHandoffStatusPresentation(
         pending: true,
         title: 'Сообщение отправляется',
       };
+    case 'application-queued':
+      return {
+        label: 'IN APP QUEUE', tone: 'info', pending: false,
+        title: 'Сохранено в очереди приложения. Ещё не передано Claude/Codex',
+      };
     case 'queued':
       return {
         label: 'QUEUED',
         tone: 'accent',
         pending: true,
-        title: 'Сообщение ждёт завершения текущего ответа',
+        title: 'Сообщение принято очередью Claude/Codex и ждёт обработки',
       };
     case 'audit-pending':
       return {
@@ -1738,6 +1767,13 @@ export async function runHistoryPromptHandoff(
 
   try {
     const result = await input.send(handoffId);
+    if (result?.applicationQueued === true && result?.applicationQueue?.version === 1) {
+      store.bindSendIdentity(input.tabId, handoffId, { sendOperationKey: result.operationKey,
+        applicationQueueId: result.applicationQueue.id });
+      store.settle(input.tabId, handoffId, { queueStatus: 'application-queued',
+        reason: 'application-queue-admitted', requiresAuditIdentity: true });
+      return result;
+    }
     const localCommandReceipt = projectAgentLocalCommandSendResult({
       candidate: localCommandCandidate,
       result,
@@ -2011,11 +2047,16 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     ? record.receipt
     : {};
   const promptText = typeof receipt.promptText === 'string' ? receipt.promptText : '';
-  if (record?.surface !== 'desktop-history'
+  const applicationWaiting = record.applicationQueue?.version === 1
+    && record.applicationQueue.state === 'waiting'
+    && !attemptId && (record.state === 'reserved' || record.state === 'preparing');
+  const applicationNoWrite = record.applicationQueue?.version === 1
+    && record.state === 'not-submitted';
+  if ((record?.surface !== 'desktop-history' && record.applicationQueue?.version !== 1)
     || !tabId
     || !handoffId
     || !operationKey
-    || !attemptId
+    || (!attemptId && !applicationWaiting && !applicationNoWrite)
     || !toolType
     || !promptText) {
     return { hydrated: false, reason: 'durable-history-receipt-incomplete' };
@@ -2027,6 +2068,23 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     return { hydrated: false, reason: 'durable-history-presentation-dismissed' };
   }
   if (record.state === 'not-submitted') {
+    if (applicationNoWrite) {
+      const current = getHistoryPromptHandoffsSnapshot(tabId).find(item => item.handoffId === handoffId);
+      if (current && !historyPromptHandoffAcceptsAuditIdentity(current,
+        { sendAttemptId: attemptId, sendOperationKey: operationKey })) {
+        return { hydrated: false, reason: 'durable-history-receipt-owner-mismatch' };
+      }
+      const presentation = receipt.presentationSnapshot || {};
+      const handoff = beginHistoryPromptHandoff({ tabId, handoffId, sendOperationKey: operationKey, sendAttemptId: attemptId,
+        applicationQueueId: record.applicationQueue?.id,
+        toolType, text: promptText, imagePaths: presentation.imagePaths || [],
+        promptChips: presentation.promptChips || [], authoringText: receipt.authoringSnapshot?.editorText,
+        authoringChips: receipt.authoringSnapshot?.chips, authoringImagePaths: receipt.authoringSnapshot?.imagePaths,
+        submittedAt: Number(record.createdAt), requiresAuditIdentity: true,
+        initialReceipt: { queueStatus: receipt.cancelled ? 'cancelled' : 'failed',
+          reason: receipt.code || 'application-queue-not-submitted' } });
+      return { hydrated: !!handoff, reason: 'application-queue-not-submitted', handoff };
+    }
     return {
       hydrated: false,
       reason: 'durable-history-send-not-submitted',
@@ -2072,7 +2130,8 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     && providerQueue.operationKey === operationKey
     && providerQueue.attemptId === attemptId;
   let queueStatus: SettledHistoryPromptHandoffStatus | null = null;
-  if (record.state === 'confirmed') queueStatus = 'sent';
+  if (applicationWaiting) queueStatus = 'application-queued';
+  else if (record.state === 'confirmed') queueStatus = 'sent';
   else if (exactProviderQueueAccepted) queueStatus = 'queued';
   else if (record.state === 'audit-pending') queueStatus = 'audit-pending';
   else if (record.state === 'delivery-unknown' || record.state === 'enter-armed') {
@@ -2175,6 +2234,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
       }
     : undefined;
   const begun = beginHistoryPromptHandoff({
+    applicationQueueId: record.applicationQueue?.id,
     tabId,
     handoffId,
     sendAttemptId: attemptId,
@@ -2184,6 +2244,9 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     text: promptText,
     promptChips: Array.isArray(presentation.promptChips) ? presentation.promptChips : [],
     imagePaths: Array.isArray(presentation.imagePaths) ? presentation.imagePaths : [],
+    authoringText: receipt.authoringSnapshot?.editorText,
+    authoringChips: receipt.authoringSnapshot?.chips,
+    authoringImagePaths: receipt.authoringSnapshot?.imagePaths,
     submittedAt: Number(record.createdAt) || Date.now(),
     source: typeof receipt.source === 'string' ? receipt.source : 'history-panel',
     statusAtSend: 'unknown',
@@ -2193,19 +2256,29 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   });
   if (!begun) return { hydrated: false, reason: 'durable-history-handoff-bounds' };
   const bound = bindHistoryPromptHandoffSendIdentity(tabId, handoffId, {
+    applicationQueueId: record.applicationQueue?.id,
     sendAttemptId: attemptId,
     sendOperationKey: operationKey,
   });
   if (!bound.ok) return { hydrated: false, reason: bound.reason };
-  const hydratedHandoff = initialProviderQueueProof
+  let hydratedHandoff = initialProviderQueueProof
     && bound.handoff.providerQueueProof?.sourceIdentity !== initialProviderQueueProof.sourceIdentity
     ? acceptHistoryPromptHandoffProviderQueue(tabId, handoffId, {
         sendAttemptId: attemptId,
         sendOperationKey: operationKey,
         proof: initialProviderQueueProof,
         changedAt: Number(record.updatedAt) || Date.now(),
-      }) || bound.handoff
+    }) || bound.handoff
     : bound.handoff;
+
+  // The receipt may be the first creator or the first attempt binding of
+  // this local card. Enrichment before begin/bind cannot prove that identity.
+  // Reuse the same strict Main presentation proof after the owner exists;
+  // do not infer a path from marker text, nor change its delivery outcome.
+  if (hydrateHistoryPromptHandoffImages(record)) {
+    hydratedHandoff = getHistoryPromptHandoffsSnapshot(tabId)
+      .find(item => item.handoffId === handoffId) || hydratedHandoff;
+  }
 
   if (!queueStatus) {
     return { hydrated: true, reason: 'durable-history-send-active', handoff: hydratedHandoff };

@@ -22,11 +22,15 @@ const mainCode = functions('main.js', ['stopAgentProcessScenarioInMain', 'stopAi
 const webCode = functions('web-server.js', ['checkAuth', 'handleApi', 'runAgentStopScenario']);
 
 function fixture({ residual = false, guarded = false } = {}) {
-  const events = [], writes = [], waits = [], signals = [];
+  const events = [], writes = [], waits = [], signals = [], queueCancellations = [];
   let release, calls = 0;
   const exitProof = new Promise(resolve => release = resolve);
   const term = { pid: 10, write: bytes => writes.push(bytes) };
   const ctx = vm.createContext({ console: quiet, path, srcMainDir: __dirname, clearTimeout,
+    require: modulePath => {
+      assert.equal(modulePath, path.join(__dirname, 'web-server'));
+      return { cancelQueuedAgentSends: (...args) => queueCancellations.push(args) };
+    },
     terminals: new Map([['T', term]]), terminalCommandState: new Map([['T', { isRunning: true, runSeq: 2 }]]),
     aiLifecycleActionInflight: new Map(), runKeyedExclusive,
     cancelCodexManualCompactPending() {}, resolveAiToolTypeForTab: (_tab, tool) => tool || 'claude',
@@ -66,13 +70,14 @@ function fixture({ residual = false, guarded = false } = {}) {
   ctx.bridgeKnownSessions.set('T', 'S'); ctx.claudeTurnBusy.set('T', true); ctx.claudeCliActive = new Set(['T']);
   vm.runInContext(mainCode, ctx);
   const web = vm.createContext({ console: quiet, url, require: () => ({}), token: 'fixture', ...contract,
+    handleSystemPromptApi: async () => false, systemPromptService: null, readBody: async () => ({}),
     decId: decodeURIComponent,
     stopAgentProcess: request => ctx.stopAgentProcessScenarioInMain(request),
     bridgeRequest: () => { throw Error('renderer must not be involved in paired main Stop'); },
     sendJson: (res, status, data) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(data)); },
   });
   vm.runInContext(webCode, web);
-  return { ctx, web, events, writes, signals, waits, release, calls: () => calls };
+  return { ctx, web, events, writes, signals, waits, queueCancellations, release, calls: () => calls };
 }
 
 test('actual HTTP→shared main Stop waits past renderer timeout for exact exit/audit; no duplicate Stop or Enter', async t => {
@@ -96,6 +101,10 @@ test('actual HTTP→shared main Stop waits past renderer timeout for exact exit/
   assert.equal(result.status, 200); assert.equal(result.body.success, true); assert.equal(result.body.stopped, true);
   assert.equal(result.body.escalated, true); assert.equal(result.body.runtimeStateUnknown, undefined);
   assert.deepEqual(h.writes, ['\x03']); assert.deepEqual(h.signals, ['SIGTERM', 'SIGKILL']); assert.equal(h.calls(), 1);
+  assert.equal(h.queueCancellations.length, 1);
+  assert.equal(h.queueCancellations[0][0], 'T');
+  assert.equal(h.queueCancellations[0][1], null);
+  assert.equal(h.queueCancellations[0][2].stop, true);
   assert.ok(h.events.indexOf('scope-exited') < h.events.indexOf('final-audit'));
   assert.ok(h.events.includes('inactive')); assert.ok(h.events.includes('live-binding-retired'));
 });
@@ -149,6 +158,7 @@ test('shared main authority refuses a foreign owner before any process signal or
   const result = await h.web.runAgentStopScenario('T', 1, { authority: { kind: 'orchestration-auto-stop' } });
   assert.equal(result.success, false); assert.equal(result.guardRejected, true);
   assert.deepEqual(h.writes, []); assert.deepEqual(h.signals, []); assert.deepEqual(h.waits, []);
+  assert.deepEqual(h.queueCancellations, []);
 });
 
 test('legacy isolated transport still returns unknown on timeout, never guesses success from a later SID', async () => {

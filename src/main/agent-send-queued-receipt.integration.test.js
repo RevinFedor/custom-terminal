@@ -407,3 +407,32 @@ test('queued pending audit still accepts orchestration delivery immediately', as
   assert.equal(h.record().state, STORE_STATES.AUDIT_PENDING);
   assert.equal(h.bridgeCalls.length, 1);
 });
+
+test('explicit pre-paste cancellation cancels delegation; a late cancellation cannot undo accepted delivery', async t => {
+  const h = harness(t);
+  if (!h) return;
+  const policy = require('./orchestration-runs');
+  let current = { status: 'sending', targetTabId: h.request.tabId };
+  let cancellations = 0;
+  Object.assign(h.context, {
+    orchestrationSendFailureRecoveryPolicy: policy.orchestrationSendFailureRecoveryPolicy,
+    getOrchestrationRunStore: () => ({
+      getInternal: async () => current, get: async () => current,
+      cancel: async (_id, options) => {
+        cancellations++;
+        assert.equal(options.suppressNotification, false, 'source learns that its request was cancelled');
+        current = { ...current, status: 'cancelled' };
+        return { changed: [current], settled: [current] };
+      },
+      beginRecovery: () => assert.fail('manual cancellation is not execution failure'),
+    }),
+    isTerminalStatus: () => false, emitOrchestrationChanges() {}, finalizeSettledOrchestrations: async () => {},
+  });
+  const receipt = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+    status: 'not-submitted', code: 'agent_send_cancelled', cancelled: true };
+  assert.equal((await h.context.applyOrchestrationTargetSendReceipt('run', receipt)).kind, 'send-cancelled');
+  assert.equal(cancellations, 1);
+  current = { status: 'sent', targetPromptProofAt: Date.now() };
+  assert.equal((await h.context.applyOrchestrationTargetSendReceipt('run', receipt)).kind, 'accepted');
+  assert.equal(cancellations, 1);
+});

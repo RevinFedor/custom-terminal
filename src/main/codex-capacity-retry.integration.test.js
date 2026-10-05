@@ -185,6 +185,23 @@ test('disabled and replaced main owners receive no continuation or forced notifi
   assert.equal(replaced.sends().length, 0);
 });
 
+test('a rejected continuation publishes not-submitted, not exhausted; later real progress retains the feature', async () => {
+  const h = liveHarness({ submitted: false, limit: 1 });
+  h.observe(failure('E1', 110));
+  await tick();
+  const failureWarning = h.calls.find(call => call.type === 'warning'
+    && call.warning.code === 'codex_capacity_retry_not_submitted');
+  assert.ok(failureWarning);
+  assert.match(failureWarning.warning.message, /Автопродолжение не отправлено/);
+  assert.equal(h.runtime().snapshot('T').cancelled, false);
+  assert.equal(h.runtime().snapshot('T').pendingEffectId, null);
+  h.observe({ type: 'event_msg', timestamp, __byteOffset: 120,
+    payload: { type: 'agent_message', message: 'real subsequent work' } });
+  h.observe(failure('E2', 130));
+  await tick();
+  assert.equal(h.sends().length, 2);
+});
+
 test('physical write precondition rejects a newer turn and lifecycle generation before paste', () => {
   const expected = { toolType: 'codex', sessionId: 'S', turnId: 'E1', lifecycleGeneration: 'G' };
   for (const patch of [{ turnId: 'user-new-turn' }, { lifecycleGeneration: 'new-process' }]) {
@@ -215,6 +232,7 @@ test('actual common readiness scenario forbids both fresh start and resume for a
   const context = vm.createContext({
     exports: {},
     ...require('../shared/agent-send-target-precondition.cjs'),
+    manualActionContract: require('../shared/agent-manual-action.cjs'),
     console: { log() {}, warn() {} },
     isCoordinatedAgentSendCancellationRequested: () => false,
     createAgentReadyWait: () => assert.fail('stopped automatic continuation must not wait for/restart a process'),
@@ -442,9 +460,10 @@ test('an earlier TUI capacity frame updates presentation but cannot start a sour
   assert.equal((emissions.match(/capacitySurfaceOnly: true/g) || []).length, 2);
 });
 
-test('a late same-turn TUI frame cannot downgrade the red exhausted warning', () => {
+for (const code of ['codex_capacity_retry_exhausted', 'codex_capacity_retry_not_submitted'])
+test('a late same-turn TUI frame cannot downgrade the red ' + code + ' warning', () => {
   const warnings = new Map();
-  const red = { type: 'model-capacity', code: 'codex_capacity_retry_exhausted', turnId: 'E', terminalLifecycleGeneration: 'G' };
+  const red = { type: 'model-capacity', code, turnId: 'E', terminalLifecycleGeneration: 'G' };
   warnings.set('T', red);
   const context = vm.createContext({ codexLifecycleWarnings: warnings,
     getTerminalLifecycleGeneration: () => 'G', publishCodexLifecycleWarning() {}, console: { warn() {} } });

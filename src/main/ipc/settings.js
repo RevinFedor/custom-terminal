@@ -80,7 +80,7 @@ function sanitizeFileForPrompt(raw, filePath) {
   return out;
 }
 
-function register({ projectManager, savedPromptService }) {
+function register({ projectManager, savedPromptService, systemPromptService }) {
   // ── Prompts ──
 
   ipcMain.handle('prompts:get', async () => {
@@ -144,7 +144,7 @@ function register({ projectManager, savedPromptService }) {
 
   ipcMain.handle('ai-prompts:get', async () => {
     try {
-      const prompts = projectManager.getAIPrompts();
+      const prompts = systemPromptService ? systemPromptService.list({ includeContent: true }) : projectManager.getAIPrompts();
       return { success: true, data: prompts };
     } catch (error) {
       console.error('[main] Error getting AI prompts:', error);
@@ -155,17 +155,18 @@ function register({ projectManager, savedPromptService }) {
   ipcMain.handle('ai-prompts:save', async (event, prompt) => {
     try {
       console.log('[AIPrompts] Saving:', prompt.id, 'thinkingLevel=' + prompt.thinkingLevel, 'model=' + prompt.model);
-      projectManager.saveAIPrompt(prompt);
-      return { success: true };
+      const data = systemPromptService ? systemPromptService.saveFromSettings(prompt) : projectManager.saveAIPrompt(prompt);
+      return { success: true, data };
     } catch (error) {
-      console.error('[main] Error saving AI prompt:', error);
-      return { success: false, error: error.message };
+      console.error('[AIPrompts] Save failed:', error.code || '', error.message);
+      return { success: false, error: error.message, code: error.code, current: error.current };
     }
   });
 
   ipcMain.handle('ai-prompts:delete', async (event, id) => {
     try {
-      projectManager.deleteAIPrompt(id);
+      if (systemPromptService) systemPromptService.remove(id, systemPromptService.get(id).revision);
+      else projectManager.deleteAIPrompt(id);
       return { success: true };
     } catch (error) {
       console.error('[main] Error deleting AI prompt:', error);
@@ -176,9 +177,16 @@ function register({ projectManager, savedPromptService }) {
   // Content-only updates keep metadata edited in Settings intact. The sync
   // variant is exclusively the renderer's shutdown flush, not a hot path.
   const savePromptContent = (id, content) => {
-    projectManager.db.saveAIPromptContent(id, content);
-    return { success: true };
+    const data = systemPromptService ? systemPromptService.saveContent(id, content) : projectManager.db.saveAIPromptContent(id, content);
+    return { success: true, data };
   };
+  ipcMain.handle('ai-prompts:set-rewind', (_event, id) => {
+    if (systemPromptService) return { success: true, data: systemPromptService.updateSettings({
+      revision: systemPromptService.getSettings().revision, rewindPromptId: id,
+    }) };
+    projectManager.db.setAppState('rewindPromptId', id);
+    return { success: true };
+  });
   ipcMain.handle('ai-prompts:save-content', (_event, { id, content }) => savePromptContent(id, content));
   ipcMain.on('ai-prompts:save-content-sync', (event, { id, content }) => {
     try { event.returnValue = savePromptContent(id, content); }

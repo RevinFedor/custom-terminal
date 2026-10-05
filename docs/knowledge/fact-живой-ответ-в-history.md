@@ -45,8 +45,10 @@ App-CrMYhyA7.js с проверенным SHA d6d4e40f…16b8f71;19 source/compi
 2. Структурный producer сообщает, какой смысл имел фрагмент до превращения в
    клетки терминала: assistant text, thinking, tool, activity или side request.
 3. Временная проекция History показывает только ещё не материализованный
-   assistant text с пометкой `Live response · not yet saved to history`;
-   после canonical proof до замены представления — `synchronizing view`.
+   assistant text: растущий item помечен `Live response · not yet saved to history`,
+   завершённый без receipt — `Response · history not confirmed`; после canonical
+   proof до замены представления — `Response · synchronizing view`. Завершение
+   одного ответа и продолжающийся tool-turn могут существовать одновременно.
 4. JSONL/rollout остаётся долговечной истиной. Его точная запись вытесняет
    только соответствующий временный item.
 
@@ -96,6 +98,19 @@ unchanged удерживает прежний bound baseline. Physical rollback 
 `history_settings_reset`, rewrite/read-owner/stream gap снимают его право на
 показ. A→B→A и exact alias adoption сохранены. Wire —
 `fact-mobile-web.md::Canonical settings baseline для ограниченного окна`.
+
+Та же граница была пропущена у `Conversation interrupted`: main watcher уже
+прочитал `turn_aborted` и снял busy, но передавал только turn_boundary; строка
+ждала полного History refresh. Source04.10 сразу публикует в desktop IPC и SSE
+`history_entry/role:interrupted` тем же formatter, что canonical parser, с exact
+physical SID/byte offset. Нажатие Escape, transport ACK, idle и timeout такого
+права не дают; historical catch-up suppression остаётся. Если provider ещё не
+записал abort, приложение не выдумывает его по клавише, которая может открыть Rewind.
+Canonical row иногда выбирает более ранний reserved user carrier: event offset
+остаётся exact alias. Display key переживает эту adoption и offscreen stub, поэтому
+не возникает remove/reinsert или второго interrupted. Другая session/новый prompt
+не схлопываются по одинаковому тексту. Lifecycle, outcome и notification eligibility
+этот display-путь не меняет; native получает тот же additive service envelope.
 
 Локальные Claude `/model` и `/effort` не создают сетевой AI-turn. Их уже
 записанные JSONL carriers приходят по существующему Transcript Service и сразу
@@ -197,8 +212,9 @@ JSONL assistant-record несёт тот же Responses `itemId`. После exa
 являются identity.
 
 WebSocket и HTTP fallback питают одного launch-владельца. Ошибка transport не
-разрешает xterm угадывать прозу: незавершённый request снимается, а следующий
-точный provider request продолжает тот же ход. Приложение запускает актуальный
+разрешает xterm угадывать прозу: открытый partial item снимается, завершённый
+неподтверждённый item сохраняется, а следующий точный provider request продолжает
+тот же ход. Приложение запускает актуальный
 пользовательский Codex; отдельной патченной сборки для preview больше нет.
 
 Шрам 03.09.2026: эти два транспорта несут одну identity в разных оболочках.
@@ -212,6 +228,37 @@ WebSocket кладёт `x-codex-turn-metadata` в `response.create.client_metada
 `non-stream`. Это не ослабляет ownership — `request_kind`, session, turn и
 subagent по-прежнему проверяются из точной metadata, а основной response
 форвардится байт-в-байт.
+
+### Завершённый ответ без подтверждения после разрыва соединения
+
+04.10.2026 History367 показывала245символов как Live после конца хода. Прокси
+увидел `response.completed` request291 в13:34:11.037UTC, затем `client-close:1006`
+через16мс. Из пяти assistant-items четыре получили exact canonical receipt;
+245-item — нет. В bounded публичном History-read вместо него следовал другой
+255-item. Это не полный raw-rollout proof отсутствия245 и не доказательство
+того, что CLI принял все байты. Причина предшествующей532s паузы main не установлена.
+
+Доказанный дефект observer: `context.finished` после `response.completed`
+пропускал последующий transport-close. Теперь close сохраняет отдельный факт
+`request_delivery_unknown` по exact request/turn/source. Failed/cancelled request
+также не выбрасывает completed item вместе с открытым partial. При неизвестной
+доставке даже равный полный текст другого item не заменяет exact `itemId`;
+idle, `task_complete`, timeout и похожий следующий ответ не подтверждают сохранение.
+
+Один O(1)-Footer проецирует неподтверждённые items отдельными стабильными
+блоками: completed block не носит Live/spinner, пока следующий item того же
+хода действительно растёт. Это фаза отображения ответа, не новая
+lifecycle-authority: loader всего агента следует его авторитетному outcome.
+Новый пользовательский turn сохраняет собственную boundary; старый
+responseId/turn/thread/run не вправе вернуть предыдущий preview.
+
+Повторная проверка без реального provider replay:
+`scripts/history-preview-delivery-regression.mjs` — изолированный
+HistoryPanel/Virtuoso, controlled incoming IPC, late exact adoption в одну
+canonical строку, без дубля/remount и с bottom-gap0.
+`codex-preview-delivery.integration.test.js` повторяет142/245/255/215/381 и
+close после completed. Непринятие245 самим CLI остаётся недоказанным;
+подделывать durable запись ради исчезновения плашки нельзя.
 
 ### Долгий busy: ответы отдельно от полосы отправок
 
@@ -426,6 +473,27 @@ pool. Шрам и точная диагностика — `fact-provider-proxy.m
 дать новой вкладке адрес другого процесса. Каждая попытка владеет парой
 `listening/error` и снимает оба listener'а до retry.
 
+## Порядок новой отправки относительно живого ответа
+
+Ожидающий prompt остаётся после уже показанного ответа текущего хода. Смена
+`IN APP QUEUE → SENDING → QUEUED` сама по себе не даёт ему владение этим ответом.
+После точного подтверждения порядок задаёт адрес записи в transcript; новый
+ответ следует за своим prompt. Это действует и до тяжёлого полного History read.
+
+Шрам04.10: при первой привязке attemptId renderer принимал `unknown` из durable
+receipt вместо известного состояния `busy` в момент клика. Проекция переставала
+считать prompt ожидающим и на≈475мс ставила его ПЕРЕД уже видимым live-ответом;
+provider queue ACK возвращал вниз. Первая привязка `null → A` сохраняет известное
+наблюдение. Настоящая новая попытка `A → B` по-прежнему получает новое состояние,
+а same-ID replay идемпотентен; stale/foreign receipt ничего не переопределяет.
+
+После холодного восстановления `unknown` не превращается в выдуманное `busy`.
+Неподтверждённая строка с неизвестным состоянием и `application-queued` остаётся
+после текущего вывода; известный `active` сохраняет обычный порядок нового хода.
+Failed/cancelled не удерживают будущие ответы. Эта логика меняет только порядок
+History, не подтверждение доставки, очередь Main, source identity или scroll writer.
+Проверка: `historyPromptOrder.test.ts` и изолированный `history-prompt-order-regression.mjs`.
+
 ## Canonical replacement и геометрия
 
 Working имеет отдельную короткую передачу: локальная вставка сообщения →
@@ -502,6 +570,45 @@ Canonical proof, пришедший в hidden pane, сохраняется по�
 середина сохраняется semantic anchor'ом, хвост — живым bottom-gap. Общий
 переносимый принцип описан в `../methodology/дизайн-принципы.md`.
 
+### Canonical-передача переживает новое поколение renderer
+
+05.10 после пользовательского Build Install в3314 был иной дубль, чем orphan245:
+617-ответ уже имел exact canonical source829539335, Main ACK/pending0 и
+`SETTLE_CANONICAL`; incident86ebecb3 показывал `currentPreview/controller=null`,
+но renderer держал `Response · synchronizing view` ещё92с. Старый transport fix
+действительно был установлен. В17:13:23UTC hidden refresh выдал
+`FILE_REPLACED reason=content-generation`, сохранил тот же read SID/owner key,
+но перевёл renderer data-owner1→3. Pending handoff остался в1; прежний
+`sameOwner` wake отклонял любое дальнейшее пробуждение, даже с exact replacement
+в новой projection. Причина самой смены source generation здесь не расследовалась.
+
+Нельзя разрешать старой транзакции писать в новое поколение или очищать Footer
+по idle/таймеру/тексту. Wake теперь лишь будит layout-проверку. После commit
+той же owner-key renderer заново проверяет exact canonical identity; для
+позиционного Codex source при смене поколения дополнительно нужен full-record
+hash из принятой Main-квитанции. Затем создаётся новая bound транзакция с
+новыми generation/visit и текущей геометрией. Tail intent сохраняется до нового
+реального жеста; старая scroll-lease снимается только при exact token match.
+Другая identity, owner или body на повторно использованном offset не очищают
+preview. Здесь hash — проверка целостности ПОСЛЕ identity, не text matching.
+
+Whole-turn previewId не является identity каждого ответа. Handoff держит IDs
+показанных items; новый непокрытый item снимает только старую передачу, сохраняя
+новый live/unconfirmed текст. Дополнительный hidden-шрам: запись
+`terminalPreviewRef.current = terminalPreview` во время render откатывала уже
+принятую IPC-seq к старому painted state; deferred publisher затем ошибочно
+отбрасывал новый snapshot. Ref изменяется только явным accepted/clear-путём,
+как и ref самого handoff, не render-mirror.
+
+Повторная проверка: `scripts/history-preview-delivery-regression.mjs --canonical-handoff`.
+Private actual HistoryPanel воспроизводит canonical receipt → response end →
+task_complete → hidden durable epoch1→3 → return; до ремонта видны canonical+Footer,
+после — одна painted canonical строка/bottom-gap0. Cases `mid-reader`,
+`preview-reader`, `wrong-hash`, `unrelated-items` проверяют anchors/целостность/
+непокрытые items. `HANDOFF_HOLD` пишет точную причину остановки и обе generation/
+visit, `HANDOFF_REBASE` — основание новой транзакции. Source подтверждён отдельно
+от установленной версии; Main receipt/lifecycle/launch/writer protocol не менялся.
+
 Шрам Claude tail-reader: main уже опубликовал exact canonical assistant UUID и
 `clear`, durable строка физически была видна, но Footer оставался ниже с
 `Live response · synchronizing view`. Handoff всё ещё требовал производный
@@ -543,7 +650,9 @@ Incident-файлы имеют `0600`, лежат в
 
 Для semantic preview пакет дополнительно хранит bounded controller-state без
 текста ответа: phase/source, длину и hash preview, message/item/request suffix,
-completed/materialized и ожидающие canonical receipts. Лог-цепочка
+completed/materialized, deliveryState/reason и ожидающие canonical receipts.
+`DELIVERY_UNKNOWN → SEMANTIC_DELIVERY_UNKNOWN` отдельно сохраняет close после
+завершения сетевого request; это не доказательство failed/accepted. Лог-цепочка
 `SETTLE_WAITING_CANONICAL → SEMANTIC_CANONICAL_RECEIPT →
 SEMANTIC_CANONICAL_ACK|PENDING → CANONICAL_ROUTE → renderer
 CLEAR_PENDING/HANDOFF_DONE` показывает точное оборванное звено даже после

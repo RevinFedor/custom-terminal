@@ -290,7 +290,7 @@ async function acceptanceInChild(root) {
       assert.equal(db.prepare('SELECT count(*) n FROM tab_messages').get().n, 0);
       const me = await request('/api/me');
       assert.equal(me.status, 200);
-      assert.deepEqual(me.body.capabilities.tabMessages, { version: 1, durable: true, replyTo: true });
+      assert.deepEqual(me.body.capabilities.tabMessages, { version: 1, durable: true, replyTo: true, dismiss: true });
       assert.equal((await request('/api/tab-messages/missing/unsupported')).status, 404);
       const provenSource = statuses.get('A');
       statuses.set('A', { ...provenSource, coherent: false });

@@ -32,6 +32,7 @@ const projects = new Map(['a', 'b'].map(id => ['p' + id, {
 useWorkspaceStore.setState({
   openProjects: projects,
   activateCenterTab: (projectId: string, tabId: string) => f.navigation.push({ projectId, tabId }),
+  placeTab: (projectId: string, tabId: string) => f.navigation.push({ projectId, tabId }),
 } as any);
 f.moveSource = () => {
   const original = projects.get('pb')!;

@@ -366,6 +366,10 @@ function orchestrationSendFailureRecoveryPolicy(sendResult = {}) {
 }
 
 function classifyAgentSendReceipt(sendResult = {}) {
+  if (sendResult?.applicationQueued === true && sendResult?.applicationQueue?.version === 1
+    && sendResult?.accepted === true && sendResult?.submitted === false) {
+    return { state: 'application-queued', submitted: false, accepted: true };
+  }
   const registryState = typeof sendResult?.receiptState === 'string'
     ? sendResult.receiptState
     : null;

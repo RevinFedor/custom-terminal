@@ -173,19 +173,40 @@ export async function prepareAgentRuntimeForSend({
   sendAttemptId?: string | null;
   expectedTarget?: AgentSendTarget;
 }) {
-  const expectedTarget = pinnedTarget
+  let expectedTarget = pinnedTarget
     ? Object.freeze({ ...pinnedTarget })
     : createAgentSendTargetExpectation(runtime.toolType, sessionId);
+  const observePhysicalTarget = () => {
+    const observed = resolveReadyAgentSendTarget(expectedTarget, presence, runtime.toolType);
+    // Pin the process as soon as Main proves it, including while starting.
+    // A joined Resume may still strengthen its source into the accepted writer
+    // and advance the first OSC generation. Adopt that generation only from
+    // the final ready read; never discard a stronger caller-supplied pin.
+    expectedTarget = Object.freeze({
+      ...expectedTarget,
+      ...(observed.terminalInstanceId ? { terminalInstanceId: observed.terminalInstanceId } : {}),
+      ...(observed.launchId ? { launchId: observed.launchId } : {}),
+    });
+  };
+  const cancelledBeforeSubmit = () => Object.assign(
+    new Error('Send cancelled before terminal submission'),
+    { code: 'agent_send_cancelled', cancelled: true, submitted: false, pasteWritten: false, enterWritten: false },
+  );
   const assertSendNotCancelled = () => {
     if (
       coordinatedSendToken
       && isCoordinatedAgentSendCancellationRequested(tabId, coordinatedSendToken)
     ) {
-      throw new Error('Send cancelled before terminal submission');
+      throw cancelledBeforeSubmit();
     }
+    if (presence?.status === 'stopping') throw cancelledBeforeSubmit();
     const action = runtime.toolType === 'codex' ? manualActionContract.describeAgentManualAction(presence) : null;
     if (action) throw Object.assign(new Error(action.message), action, {
       submitted: false, pasteWritten: false, enterWritten: false,
+    });
+    if (presence?.startupFailed) throw Object.assign(new Error(
+      presence.startupError || runtime.label + ' startup failed before send'), {
+      code: 'agent_send_startup_failed', submitted: false, pasteWritten: false, enterWritten: false,
     });
   };
   const waitStartupGate = async () => {
@@ -199,7 +220,7 @@ export async function prepareAgentRuntimeForSend({
   });
   assertSendNotCancelled();
   if (presence && ['active', 'busy', 'starting'].includes(presence.status)) {
-    resolveReadyAgentSendTarget(expectedTarget, presence, runtime.toolType);
+    observePhysicalTarget();
   }
   const resolved = (
     status: Extract<AgentPtyStatus, 'active' | 'busy'>,
@@ -289,17 +310,41 @@ export async function prepareAgentRuntimeForSend({
       + ' tab=' + String(tabId).slice(-12));
   }
 
-  const deadline = Date.now() + 30000;
-  const readinessTimeout = () => Object.assign(
-    new Error(runtime.label + ' session is not ready for send'),
-    { code: 'agent_send_readiness_timeout', submitted: false, pasteWritten: false, enterWritten: false,
-      readinessStatus: presence?.status || 'unknown',
-      readinessReason: presence?.lastNotReady?.reason || 'no-ready-proof',
-      sendReceipt: { success: false, accepted: false, submitted: false,
-        pasteWritten: false, enterWritten: false, code: 'agent_send_readiness_timeout' } },
-  );
+  let deadline = Date.now() + 30000;
+  let startupWait: { launchId: string; lifecycleGeneration: string; deadlineAt: number } | null = null;
+  const followStartupDeadline = () => {
+    const window = runtime.toolType === 'codex' ? presence?.runtimeSnapshot?.startupWait : null;
+    if (!window?.launchId || !window.lifecycleGeneration || !Number.isFinite(window.deadlineAt)) return;
+    if (startupWait && (window.launchId !== startupWait.launchId
+      || window.lifecycleGeneration !== startupWait.lifecycleGeneration)) {
+      throw Object.assign(new Error('The target launch changed before submission; input was not touched.'), {
+        code: 'agent_send_target_changed', submitted: false, pasteWritten: false, enterWritten: false,
+      });
+    }
+    if (startupWait) return;
+    // Follow the existing main-owned launch deadline once, not a fresh budget
+    // for every wake. An open picker without a launch keeps the ordinary bound.
+    startupWait = window;
+    expectedTarget = Object.freeze({ ...expectedTarget, launchId: expectedTarget.launchId || window.launchId });
+    deadline = Math.max(deadline, window.deadlineAt);
+    console.log('[AgentScenario:send] startup-deadline tab=' + String(tabId).slice(-12)
+      + ' launch=' + window.launchId + ' deadlineAt=' + deadline);
+  };
+  const readinessTimeout = () => {
+    console.warn('[AgentScenario:send] readiness-expired tab=' + String(tabId).slice(-12)
+      + ' launch=' + (startupWait?.launchId || '-') + ' deadlineAt=' + deadline
+      + ' status=' + (presence?.status || 'unknown')
+      + ' reason=' + (presence?.lastNotReady?.reason || 'no-ready-proof'));
+    return Object.assign(new Error(runtime.label + ' session is not ready for send'),
+      { code: 'agent_send_readiness_timeout', submitted: false, pasteWritten: false, enterWritten: false,
+        readinessStatus: presence?.status || 'unknown',
+        readinessReason: presence?.lastNotReady?.reason || 'no-ready-proof',
+        sendReceipt: { success: false, accepted: false, submitted: false,
+          pasteWritten: false, enterWritten: false, code: 'agent_send_readiness_timeout' } });
+  };
   for (let pass = 0; ; pass += 1) {
     assertSendNotCancelled();
+    followStartupDeadline();
     const remainingMs = deadline - Date.now();
     const readyWait = createAgentReadyWait(tabId, runtime, Math.max(1, remainingMs), 'send');
     const cancellationWait = coordinatedSendToken
@@ -308,8 +353,12 @@ export async function prepareAgentRuntimeForSend({
     try {
       presence = await runtime.getPresence(tabId).catch(() => null);
       assertSendNotCancelled();
+      const previousDeadline = deadline;
+      followStartupDeadline();
+      if (deadline > previousDeadline) continue;
+      if (startupWait && presence?.status === 'inactive') throw cancelledBeforeSubmit();
       if (presence && ['active', 'busy', 'starting'].includes(presence.status)) {
-        resolveReadyAgentSendTarget(expectedTarget, presence, runtime.toolType);
+        observePhysicalTarget();
       }
       if (pass > 0) {
         console.log('[AgentScenario:send] presence after wait tool=' + runtime.toolType

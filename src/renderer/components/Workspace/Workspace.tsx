@@ -1972,7 +1972,7 @@ export default function Workspace({
   }
 
   return (
-    <div ref={workspaceRootRef} className="flex-1 flex flex-col h-full min-h-0 overflow-hidden relative">
+    <div ref={workspaceRootRef} data-terminal-full-view-bounds className="flex-1 flex flex-col h-full min-h-0 overflow-hidden relative">
       {/* Полоса кнопок во всю ширину окна стояла здесь и удалена 2026-08-18.
           Она тянулась через весь экран ради десятка кнопок и отнимала высоту у
           терминала постоянно. Кнопки проекта (файлы, история вкладок, VS Code,

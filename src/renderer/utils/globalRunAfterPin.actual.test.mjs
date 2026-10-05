@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import { pointInHoverCluster } from './hoverBridge.mjs';
+import { pointInHoverCluster, pointInRect } from './hoverBridge.mjs';
+import { createHoverReturnGate } from './hoverReturnGate.mjs';
 
 const source = fs.readFileSync(new URL('../components/Workspace/GlobalRunAfterControl.tsx', import.meta.url), 'utf8');
 function body(pattern) {
@@ -10,8 +11,8 @@ function body(pattern) {
   assert.ok(matched, 'actual callback must exist');
   return matched.replaceAll('<HTMLElement>', '');
 }
-const recheck = body(/const recheckPreviewHover = useCallback\(\(point: \{ clientX: number; clientY: number \} \| null\) => \{([\s\S]*?)\n  \}, \[closePanel, editorGestureActive, editorState\?\.tabId, mode, pickingRewind\]\);/);
-const close = body(/const closePanel = useCallback\(\(reason\?: 'outside'\) => \{([\s\S]*?)\n  \}, \[editorState\?\.tabId\]\);/);
+const recheck = body(/const recheckPreviewHover = useCallback\(\(point: \{ clientX: number; clientY: number \} \| null\) => \{([\s\S]*?)\n  \}, \[closePanel, editorGestureActive, mode, pickingRewind\]\);/);
+const close = body(/const closePanel = useCallback\(\(reason\?: 'outside'\) => \{([\s\S]*?)\n  \}, \[\]\);/);
 const toggle = body(/const togglePinned = \(\) => \{([\s\S]*?)\n  \};/);
 const resize = body(/const startResize = useCallback\(\(edge: 'right' \| 'bottom' \| 'corner', event: React\.PointerEvent<HTMLElement>\) => \{([\s\S]*?)\n  \}, \[panelSize, position, startResizeGesture\]\);/);
 const relay = body(/const handleEditorGesture = useCallback\(\(active: boolean, point: \{ clientX: number; clientY: number \} \| null\) => \{([\s\S]*?)\n  \}, \[\]\);/);
@@ -28,6 +29,7 @@ function fixture() {
     HTMLElement: Element, CSS: { escape: (s) => s },
     beforeCloseRef: { current: () => { calls.push('save'); return allowed; } },
     resizeActiveRef: { current: false }, previewPointerRef: { current: null },
+    hoverReturnRef: { current: createHoverReturnGate() },
     editorGestureActiveRef: { current: false },
     panelRef: { current: { style: {}, contains: (el) => el?.inside === true,
       getBoundingClientRect() {
@@ -39,9 +41,11 @@ function fixture() {
     triggerRef: { current: { getBoundingClientRect: () => rect(100, 165, 230, 191) } },
     document: { activeElement: null, querySelectorAll: () => [], querySelector: () => null },
     window: { innerWidth: 1000, innerHeight: 900 },
-    panelSize: { width: 500, height: 300, heightFixed: false }, position: { left: 100, top: 200, width: 500, height: 300 },
+    panelSize: { width: 500, height: 300, resizeEnabled: true }, position: { left: 100, top: 200, width: 500, height: 300 },
+    minimumWidthRef: { current: 300 }, contentWidthRef: { current: null }, setContentWidth: () => {},
+    pagesRef: { current: null }, globalRunAfterMinimumWidth: () => 300,
     PANEL_MARGIN: 8, PANEL_MIN_W: 300, clamp: (v, lo, hi) => Math.max(lo, Math.min(hi, v)),
-    pointInHoverCluster, queueHoverSatelliteRects: () => [], startResizeGesture: (_e, options) => { ctx.gesture = options; },
+    pointInHoverCluster, pointInRect, queueHoverSatelliteRects: () => [], startResizeGesture: (_e, options) => { ctx.gesture = options; },
     setPanelSize: (size) => { ctx.panelSize = size; calls.push('size'); },
     setEditorGestureActive: (active) => { ctx.editorGestureActive = active; calls.push('gesture:' + active); },
     setEditorState: (state) => { ctx.editorState = state; calls.push('editor'); },
@@ -60,7 +64,8 @@ test('only the header trigger can promote the global preview to pinned', () => {
   assert.doesNotMatch(panel, /onPointerDownCapture|onMouseDownCapture|onClickCapture/);
   const floating = source.slice(source.indexOf('data-global-run-after-floating-editor={selectedTab.id}'), source.indexOf('export function GlobalRunAfterControl'));
   assert.doesNotMatch(floating, /onPointerDownCapture|onMouseDownCapture|onClickCapture/);
-  assert.match(floating, /embeddedPinned=\{editorState\.mode === 'pinned'\}/);
+  assert.doesNotMatch(source, /data-global-run-after-floating-editor|data-global-run-after-editor-trigger/);
+  assert.match(source, /embedded overview/);
 });
 
 test('internal page/control use remains preview; pointer leave closes through the save guard', () => {
@@ -69,7 +74,7 @@ test('internal page/control use remains preview; pointer leave closes through th
   assert.equal(ctx.mode, 'preview');
   ctx.recheckPreviewHover({ clientX: 900, clientY: 700 });
   assert.equal(ctx.mode, 'hidden');
-  assert.deepEqual(calls, ['save', 'editor', 'hidden']);
+  assert.deepEqual(calls, ['save', 'hidden']);
 });
 
 test('header pages and protruding resize handles are part of preview hover geometry', () => {
@@ -96,7 +101,7 @@ test('hover exit commits focused fields before the editor is unmounted', () => {
   field.blur = () => calls.push('blur-field');
   ctx.document.activeElement = field;
   ctx.recheckPreviewHover({ clientX: 900, clientY: 700 });
-  assert.deepEqual(calls, ['blur-field', 'save', 'editor', 'hidden']);
+  assert.deepEqual(calls, ['blur-field', 'save', 'hidden']);
 });
 
 test('pending image ownership refuses close without turning preview into a pin', () => {
@@ -123,6 +128,13 @@ test('resize holds the preview only for its captured gesture and releases withou
   assert.equal(ctx.mode, 'hidden');
   assert.equal(calls.filter((c) => c === 'size').length, 1);
   assert.ok(!calls.includes('pinned'));
+});
+
+test('viewing mode cannot start a resize or pin through a stale edge event', () => {
+  const { ctx, calls } = fixture(); ctx.panelSize.resizeEnabled = false;
+  ctx.startResize('corner', { button: 0, clientX: 600, clientY: 420 });
+  assert.equal(ctx.gesture, undefined); assert.equal(ctx.resizeActiveRef.current, false);
+  assert.equal(ctx.mode, 'preview'); assert.deepEqual(calls, []);
 });
 
 test('cancelling a resize preserves the old size and an explicitly pinned panel', () => {
@@ -190,5 +202,5 @@ test('window exit while a temporary hold is active closes when that hold ends', 
 test('viewport backdrops are not part of hover geometry', () => {
   const recheckSource = source.slice(source.indexOf('const recheckPreviewHover'), source.indexOf('const recheckPreviewHoverRef'));
   assert.doesNotMatch(recheckSource, /data-run-after-picker-overlay/);
-  assert.match(source, /element\.dataset\.runAfterHoverOwner === owner/);
+  assert.match(source, /owners\.has\(element\.dataset\.runAfterHoverOwner\)/);
 });

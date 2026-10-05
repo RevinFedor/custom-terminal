@@ -107,7 +107,45 @@ actual audit consumer→SQLite→HTTP delta, receipt pruning/reopen, exact child
 literal paths, corrupted spans/hashes/scope, conflicting attempts. Новый parser,
 iOS regex, provider send и изменение recordActivity для этой дельты не нужны.
 
+### 04.10: local queued/SENT терял refs между публикацией и первым binding
+
+Повторный mobile4944 был уже confirmed, canonical36520 имел original upload ref,
+а локальная карточка показывала «В записи сообщения нет пути». Это другой слой:
+proof request→transport был исправен. Live FIFO publisher отдавал raw receipt без
+`imagePresentation`, в отличие от bounded list IPC. Список пытался обогатить
+карточку до её создания/первой привязки attempt; строгая проверка закономерно
+отказывала, а после begin/bind общего hydrate enrichment не повторялся.
+
+Live и list теперь дают DTO от одного `imagePresentationFromReceipt`; общий
+hydrate применяет его после exact begin/bind и возвращает уже обогащённый immutable
+handoff. Новая карточка, первый null→A, поздний proof и remount проходят одну
+границу. Это только attachment presentation: status/audit/source/авторский текст
+не меняются, existing refs не перезаписываются. При отсутствии доказательства
+путь не угадывается из marker/filename, чужой attempt/session/body остаётся отказом.
+SSE остаётся компактным wake, не раздаёт тела/refs повторно; preview roots прежние.
+
+Прежние три unit-кейса начинали с уже bound карточки, а private UI проверял
+canonical row — этого недостаточно для local-before-canonical. Новые регрессии
+исполняют actual Main publisher→общий renderer hydrate и captured4944 без
+canonical read. Private actual styled HistoryPanel теперь проверяет local
+queued/SENT, trusted image click с decoded JPG, cold/remount и позднюю canonical
+adoption без второй карточки;14checks PASS. Parent просмотрел viewport с открытым
+popup и сверил222 source hashes. Это synthetic IPC/captured fixture, не installed
+provider retake. Протокол не добавляет fake refs до проверенной staged mapping.
+
 ## Проверки delivery mapping
+
+SOURCE05.10: owned mobile uploads добавляют внешний exact path projection над
+тем же provider codec. Frozen request остаётся авторским; только formatter/image
+occurrences получают owned bytes. Для Codex image alias sourcePath прежний, document
+path подменяется в transport; для Claude этот transport затем проходит прежнюю
+unicode/newline нормализацию. Audit в обратном порядке восстанавливает original
+request hash, не выдаёт metadata-only proof. Missing/foreign attempt/projection
+не подтверждает Send. History sidecar сохраняет исходный document path и image
+occurrences, в том числе native `[Image #N]`; JSONL/literal text не переписываются.
+Старые4944/legacy records не backfill'ятся этой byte-ownership дельтой. Actual
+Main prepare/pre-Enter/publisher→SQLite→History и startup cases —
+`owned-mobile-attachments.integration.test.js`.
 
 `ELECTRON_RUN_AS_NODE=1 ./node_modules/electron/dist/Electron.app/Contents/MacOS/Electron --test src/main/codex-image-request-projection.test.js src/main/agent-send-startup-reconcile.test.js src/main/agent-send-receipt-registry.test.js src/main/agent-send-receipt-store.test.js src/main/agent-prompt-audit-identity.test.js src/main/codex-prompt-audit.test.js`
 

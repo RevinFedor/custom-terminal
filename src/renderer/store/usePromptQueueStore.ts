@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { queuedRewindLabel, rewindIteration } from '../utils/queuedRewindLabel.mjs';
 import { usePromptsStore, RUN_AFTER_LOOP_PROMPT_ID } from './usePromptsStore';
 import { DEFAULT_LOOP_PROMPT, parsePersistedSharedLoopPrompt } from '../../shared/prompt-loop.mjs';
 export { parsePersistedSharedLoopPrompt };
@@ -282,6 +283,7 @@ export type QueuedMetaAction =
       kind: 'rewind';
       targetUuid: string;
       targetText: string;
+      targetIteration?: number;
       sourceSessionId: string;
       toolType: 'claude' | 'codex';
     };
@@ -297,7 +299,7 @@ export function queuedMetaActionDefaultTitle(action: QueuedMetaAction): string {
   if (action.kind === 'stop') return 'Stop';
   if (action.kind === 'close-tab') return 'Close tab';
   if (action.kind === 'model-effort') return 'Model → ' + action.model + ' · ' + action.effort;
-  return 'Rewind: ' + action.targetText.replace(/\s+/g, ' ').trim().slice(0, 56);
+  return queuedRewindLabel(action);
 }
 
 function defaultQueuedPromptContextCondition(text: string): QueuedPromptContextCondition | undefined {
@@ -2210,6 +2212,7 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
               kind: 'rewind',
               targetUuid: item.metaAction.targetUuid,
               targetText: item.metaAction.targetText,
+              ...(rewindIteration(item.metaAction.targetIteration) ? { targetIteration: item.metaAction.targetIteration } : {}),
               sourceSessionId: item.metaAction.sourceSessionId,
               toolType: item.metaAction.toolType,
             }

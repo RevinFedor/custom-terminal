@@ -1,149 +1,127 @@
-/**
- * Compact layered layout for the global Run After overview.
- *
- * The runtime queue remains a per-tab ordered list. This module only projects
- * its `on tab` relations into a readable graph: referenced tab -> queue owner.
- * Components are independent flex items, so short chains can share a row while
- * one wide/deep chain may scroll without reserving empty columns for its peers.
- */
+/** Presentation only: an edge reads "owner waits for target", per queue item. */
+export const RUN_AFTER_GROUP_INSET = 14;
+export const RUN_AFTER_DEPTH_INSET = 16;
+export function queueItemDependencyTarget(queue, item) {
+  if (item?.trigger?.kind === 'onTab') return item.trigger.tabId || null;
+  const head = queue?.items?.find(candidate => candidate.enabled !== false);
+  return item && head && item.id === head.id ? queue.runAfterTabId || null : null;
+}
 
-const finite = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
-
-/**
- * @param {{
- *   nodeIds: string[],
- *   edges: Array<{ source: string, target: string, kind?: 'current'|'future' }>,
- *   nodeWidth?: number,
- *   nodeHeight?: number,
- *   columnGap?: number,
- *   rowGap?: number,
- *   padding?: number,
- * }} input
- */
-export function layoutRunAfterDependencyGraph(input) {
-  const nodeIds = [...new Set((input?.nodeIds || []).filter(Boolean))];
-  const order = new Map(nodeIds.map((id, index) => [id, index]));
-  const nodeSet = new Set(nodeIds);
-  const edgeByPair = new Map();
-
-  for (const raw of input?.edges || []) {
-    if (!raw?.source || !raw?.target || raw.source === raw.target) continue;
-    if (!nodeSet.has(raw.source) || !nodeSet.has(raw.target)) continue;
-    const key = `${raw.source}\u0000${raw.target}`;
-    const edge = { source: raw.source, target: raw.target, kind: raw.kind === 'current' ? 'current' : 'future' };
-    const previous = edgeByPair.get(key);
-    if (!previous || edge.kind === 'current') edgeByPair.set(key, edge);
-  }
-  const edges = [...edgeByPair.values()];
-
-  const neighbours = new Map(nodeIds.map((id) => [id, new Set()]));
-  for (const edge of edges) {
-    neighbours.get(edge.source)?.add(edge.target);
-    neighbours.get(edge.target)?.add(edge.source);
-  }
-
-  const components = [];
-  const visited = new Set();
-  for (const first of nodeIds) {
-    if (visited.has(first)) continue;
-    const ids = [];
-    const pending = [first];
-    visited.add(first);
-    while (pending.length) {
-      const id = pending.shift();
-      ids.push(id);
-      const adjacent = [...(neighbours.get(id) || [])]
-        .sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
-      for (const next of adjacent) {
-        if (visited.has(next)) continue;
-        visited.add(next);
-        pending.push(next);
-      }
-    }
-    components.push(ids);
-  }
-
-  const nodeWidth = Math.max(180, finite(input?.nodeWidth, 260));
-  // The host owns tab geometry. A 26px private floor kept global nodes taller
-  // than a real PaneTabChip (22.8px with the user's current settings) even
-  // after the caller removed its own minimum.
-  const nodeHeight = Math.max(1, finite(input?.nodeHeight, 34));
-  const columnGap = Math.max(24, finite(input?.columnGap, 42));
-  const rowGap = Math.max(7, finite(input?.rowGap, 12));
-  const padding = Math.max(4, finite(input?.padding, 8));
-
-  return components.map((ids, componentIndex) => {
-    const idSet = new Set(ids);
-    const componentEdges = edges.filter((edge) => idSet.has(edge.source) && idSet.has(edge.target));
-    const incoming = new Map(ids.map((id) => [id, []]));
-    const outgoing = new Map(ids.map((id) => [id, []]));
-    for (const edge of componentEdges) {
-      incoming.get(edge.target).push(edge.source);
-      outgoing.get(edge.source).push(edge.target);
-    }
-
-    // Longest-path depth for the acyclic contract. A damaged legacy cycle is
-    // still rendered: its unprocessed nodes remain in column zero rather than
-    // making the whole overview disappear.
-    const indegree = new Map(ids.map((id) => [id, incoming.get(id).length]));
-    const depth = new Map(ids.map((id) => [id, 0]));
-    const ready = ids.filter((id) => indegree.get(id) === 0)
-      .sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
-    const processed = new Set();
-    while (ready.length) {
-      const id = ready.shift();
-      if (processed.has(id)) continue;
-      processed.add(id);
-      const targets = [...(outgoing.get(id) || [])]
-        .sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
-      for (const target of targets) {
-        depth.set(target, Math.max(depth.get(target) || 0, (depth.get(id) || 0) + 1));
-        indegree.set(target, (indegree.get(target) || 0) - 1);
-        if (indegree.get(target) === 0) ready.push(target);
-      }
-      ready.sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
-    }
-
-    const columns = new Map();
-    for (const id of ids) {
-      const d = processed.has(id) ? depth.get(id) || 0 : 0;
-      if (!columns.has(d)) columns.set(d, []);
-      columns.get(d).push(id);
-    }
-    const depths = [...columns.keys()].sort((a, b) => a - b);
-    const maxRows = Math.max(1, ...depths.map((d) => columns.get(d).length));
-    const pitch = nodeHeight + rowGap;
-    const positions = new Map();
-    for (const d of depths) {
-      const column = columns.get(d);
-      // Parents/children remain near one another while the input order is the
-      // deterministic tie-breaker. One source with many dependants therefore
-      // sits vertically centred beside them instead of at the top of a void.
-      column.sort((a, b) => {
-        const parentRank = (id) => {
-          const parents = incoming.get(id) || [];
-          if (!parents.length) return order.get(id) ?? 0;
-          return parents.reduce((sum, parent) => sum + (order.get(parent) ?? 0), 0) / parents.length;
-        };
-        return parentRank(a) - parentRank(b) || (order.get(a) ?? 0) - (order.get(b) ?? 0);
-      });
-      const yOffset = ((maxRows - column.length) * pitch) / 2;
-      column.forEach((id, index) => positions.set(id, {
-        id,
-        x: padding + d * (nodeWidth + columnGap),
-        y: padding + yOffset + index * pitch,
-        width: nodeWidth,
-        height: nodeHeight,
-      }));
-    }
-
-    const maxDepth = Math.max(0, ...depths);
-    return {
-      id: `component-${componentIndex}-${ids[0]}`,
-      width: padding * 2 + (maxDepth + 1) * nodeWidth + maxDepth * columnGap,
-      height: padding * 2 + maxRows * nodeHeight + (maxRows - 1) * rowGap,
-      nodes: ids.map((id) => positions.get(id)),
-      edges: componentEdges,
-    };
+export function collectQueueRelations(ownerId, queue) {
+  const head = queue?.items?.find(item => item.enabled !== false);
+  const edges = (queue?.items || []).flatMap(item => {
+    const target = queueItemDependencyTarget(queue, item);
+    return target ? [{ source: ownerId, target, itemId: item.id,
+      kind: item.enabled !== false && item.id === head?.id ? 'current' : 'future',
+      enabled: item.enabled !== false }] : [];
   });
+  if (!head && queue?.runAfterTabId) edges.push({ source: ownerId, target: queue.runAfterTabId,
+    itemId: 'queue-target', kind: 'current', enabled: true });
+  return edges;
+}
+
+/**
+ * Order connected queues top-down. Heights belong to the real DOM editor;
+ * indentation is capped at one level, so deep chains never grow horizontally.
+ * Edges retain item identity even when several steps await the same tab.
+ */
+export function groupRunAfterDependencies({ nodeIds, edges }) {
+  const ids = [...new Set(nodeIds)];
+  const known = new Set(ids);
+  const relations = edges.filter(e => known.has(e.source) && known.has(e.target));
+  const neighbours = new Map(ids.map(id => [id, new Set()]));
+  for (const edge of relations) {
+    neighbours.get(edge.source).add(edge.target);
+    neighbours.get(edge.target).add(edge.source);
+  }
+  const visited = new Set();
+  const components = [];
+  for (const first of ids) {
+    if (visited.has(first)) continue;
+    const connected = new Set([first]), pending = [first];
+    visited.add(first);
+    for (let index = 0; index < pending.length; index++) {
+      for (const next of neighbours.get(pending[index])) {
+        if (visited.has(next)) continue;
+        visited.add(next); connected.add(next); pending.push(next);
+      }
+    }
+    const members = ids.filter(id => connected.has(id));
+    const links = relations.filter(edge => connected.has(edge.source));
+    const incoming = new Map(members.map(id => [id, new Set()]));
+    const outgoing = new Map(members.map(id => [id, new Set()]));
+    for (const { source, target } of links) {
+      if (source === target) continue;
+      outgoing.get(source).add(target); incoming.get(target).add(source);
+    }
+    const nodes = [], placed = new Set(), depths = new Map();
+    while (nodes.length < members.length) {
+      // Cyclic legacy data stays visible; no recursion and no disappearing queue.
+      const next = members.find(id => !placed.has(id) && [...incoming.get(id)].every(parent => placed.has(parent)))
+        || members.find(id => !placed.has(id));
+      const depth = Math.min(1, depths.get(next) || 0);
+      placed.add(next); nodes.push({ id: next, depth });
+      for (const target of outgoing.get(next)) depths.set(target, 1);
+    }
+    components.push({ id: first, nodes, edges: links });
+  }
+  return components;
+}
+
+/** Keep already inspected groups/order/indentation for this overview. A new
+ * target may join its owner, but adding/removing a link never reparents an
+ * existing visible card. Resize still packs the same content-sized groups. */
+export function retainRunAfterGroups(previous, { nodeIds, edges }) {
+  if (previous === null) return groupRunAfterDependencies({ nodeIds, edges });
+  const known = new Set(nodeIds);
+  const groups = previous.map(group => ({ ...group, nodes: group.nodes.filter(node => known.has(node.id)) }))
+    .filter(group => group.nodes.length);
+  const assigned = new Map(groups.flatMap(group => group.nodes.map(node => [node.id, group])));
+  for (const id of nodeIds) {
+    if (assigned.has(id)) continue;
+    const parent = edges.find(edge => edge.target === id && assigned.has(edge.source));
+    const group = parent ? assigned.get(parent.source) : { id, nodes: [], edges: [] };
+    if (!parent) groups.push(group);
+    group.nodes.push({ id, depth: parent ? 1 : 0 });
+    assigned.set(id, group);
+  }
+  return groups;
+}
+
+/** Pack content-sized groups. Only positions depend on viewport width. */
+export function layoutRunAfterCards({ nodeIds, edges, sizes, availableWidth, gap = 14, groups = null }) {
+  const width = Math.max(1, availableWidth);
+  const sizeMap = new Map(sizes.map(size => [size.id, size]));
+  const placed = [], nodes = [], components = [];
+  for (const group of groups || groupRunAfterDependencies({ nodeIds, edges })) {
+    let y = 0, componentWidth = 0;
+    const local = group.nodes.flatMap(node => {
+      const size = sizeMap.get(node.id);
+      if (!size) return [];
+      const x = RUN_AFTER_GROUP_INSET + node.depth * RUN_AFTER_DEPTH_INSET;
+      const result = { ...node, x, y, width: size.width, height: size.height };
+      y += size.height + gap;
+      componentWidth = Math.max(componentWidth, x + size.width);
+      return [result];
+    });
+    if (!local.length) continue;
+    const height = Math.max(0, y - gap);
+    const candidates = [...new Set([0, ...placed.flatMap(rect => [rect.x, rect.x + rect.width + gap])])]
+      .filter(x => x === 0 || x + componentWidth <= width + 0.5).sort((a, b) => a - b);
+    let position = null;
+    for (const x of candidates) {
+      let top = 0, collision;
+      do {
+        collision = placed.find(rect => x < rect.x + rect.width + gap && x + componentWidth + gap > rect.x
+          && top < rect.y + rect.height + gap && top + height + gap > rect.y);
+        if (collision) top = collision.y + collision.height + gap;
+      } while (collision);
+      if (!position || top < position.y || (top === position.y && x < position.x)) position = { x, y: top };
+    }
+    const rect = { ...position, width: componentWidth, height };
+    placed.push(rect); components.push({ ...rect, id: group.id });
+    nodes.push(...local.map(node => ({ ...node, x: node.x + rect.x, y: node.y + rect.y, lane: rect.x + 3 })));
+  }
+  return { nodes, components, width: Math.max(0, ...placed.map(rect => rect.x + rect.width)),
+    height: Math.max(0, ...placed.map(rect => rect.y + rect.height)) };
 }

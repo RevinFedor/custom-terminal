@@ -85,7 +85,9 @@ test('current accepted Resume may change physical writer; stale launch/PID canno
 test('exact source precondition is fingerprinted, persisted on the attempt and rechecked before physical paste', () => {
   const scenario = declaration(web, 'runPreparedAgentSendScenario');
   assert.match(scenario, /\.\.\.\(expectedTarget \? \{ expectedTarget \} : \{\}\)/);
-  const checkAt = scenario.indexOf('agentSendTargetPreconditionFailure(expectedTarget, currentTarget)');
+  // The existing application FIFO may defer only an unpublished writer SID.
+  // Locate the actual guard call, including that conditional first argument.
+  const checkAt = scenario.indexOf('result = agentSendTargetPreconditionFailure(');
   const beginAt = scenario.indexOf('agentSendReceiptStore.beginAttempt');
   const recordAt = scenario.indexOf('agentSendReceiptStore.stageAttemptContext');
   const bridgeAt = scenario.indexOf("bridgeRequest('sendAgentPromptScenario'");

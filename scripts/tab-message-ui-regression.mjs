@@ -112,7 +112,16 @@ for (const width of [900, 350]) test(`isolated tracker, History hash/envelope gu
     assert.equal(await page.locator('[data-orchestration-active-list]').count(), 0);
     assert.equal(await q1.locator('[data-tab-question-delivery]').getAttribute('data-tab-question-delivery'), 'sent');
     assert.equal(await page.locator('[data-tab-message-row="q2"] .animate-spin').count(), 0);
-    await q1.click();
+    await q1.locator('[data-tab-message-source]').click();
+    assert.deepEqual(await page.evaluate(() => window.fixture.navigation.at(-1)), { projectId: 'pb', tabId: 'b' });
+    assert.equal(await page.locator('[data-tab-message-preview]').count(), 0);
+    assert.equal(await q1.locator('[data-tab-message-open]').count(), 1);
+    assert.equal(await q1.locator('button[data-tab-message-stage]').count(), 0);
+    await q1.locator('[data-tab-message-open]').click();
+    await page.locator('[data-tab-message-body="r1"]').waitFor();
+    assert.equal(await page.locator('[data-tab-message-preview] [data-tab-message-body][open]').count(), 0);
+    await page.locator('[data-tab-message-body="q1"] > summary').click();
+    await page.locator('[data-tab-message-body="r1"] > summary').click();
     await page.locator('[data-tab-message-preview="q1"] [data-tab-message-body="r1"] table').waitFor();
     assert.ok(await page.evaluate(() => window.fixture.calls.filter(x => x.c === 'tab-messages:get').length) <= 2);
     assert.equal(await page.evaluate(() => window.fixture.calls.filter(x => x.c === 'tab-messages:get').every(x => x.p.messageId === 'q1')), true);
@@ -123,7 +132,7 @@ for (const width of [900, 350]) test(`isolated tracker, History hash/envelope gu
     await page.locator('[data-tab-message-body="q1"] [data-tab-message-source]').click();
     assert.deepEqual(await page.evaluate(() => window.fixture.navigation.at(-1)), { projectId: 'pa', tabId: 'a' });
     await page.waitForFunction(() => !document.querySelector('[data-tab-message-preview]'));
-    await q1.click();
+    await q1.locator('[data-tab-message-open]').click();
     await page.locator('[data-tab-message-preview]').waitFor();
     const checkGeometry = async () => {
       const geometry = await page.evaluate(() => {
@@ -228,12 +237,12 @@ for (const width of [900, 350]) test(`isolated tracker, History hash/envelope gu
     await page.screenshot({ path: path.join(artifact, 'canonical-offset-fallback.png') });
     await page.evaluate(() => { window.fixture.history = window.fixture.originalHistory; window.fixture.render(); });
     await page.evaluate(() => { window.fixture.hold = 'q2'; });
-    await page.locator('[data-tab-message-row="q2"]').click();
+    await page.locator('[data-tab-message-row="q2"] [data-tab-message-open]').click();
     await page.waitForFunction(() => window.fixture.deferred.q2);
     // A narrow viewport puts the preview over the list; close it before
     // choosing another row while its previous body read is still pending.
     if (width === 350) await page.keyboard.press('Escape');
-    await q1.click();
+    await q1.locator('[data-tab-message-open]').click();
     await page.evaluate(() => window.fixture.deferred.q2({ message: { ...window.fixture.q2, text: 'LATE WRONG QUESTION' } }));
     assert.equal((await page.locator('[data-tab-message-preview]').innerText()).includes('LATE WRONG QUESTION'), false);
     await page.evaluate(() => window.fixture.ipc.emit('tab-messages:changed', {}, { message: { ...window.fixture.q, deliveryState: 'pending' }, reason: 'old-same-time' }));
@@ -252,10 +261,11 @@ for (const width of [900, 350]) test(`isolated tracker, History hash/envelope gu
     await page.waitForFunction(() => !document.querySelector('[data-tab-message-preview]'));
     await page.screenshot({ path: path.join(artifact, 'history-narrow.png') });
     await page.evaluate(() => { window.fixture.failRead = true; window.fixture.hold = null; });
-    await page.locator('[data-tab-message-row="q2"]').click();
+    await page.locator('[data-tab-message-row="q2"] [data-tab-message-open]').click();
     await page.getByRole('button', { name: 'Повторить загрузку текста' }).waitFor();
     await page.evaluate(() => { window.fixture.failRead = false; });
     await page.getByRole('button', { name: 'Повторить загрузку текста' }).click();
+    await page.locator('[data-tab-message-body="q2"] > summary').click();
     await page.getByText('Second exact question', { exact: true }).waitFor();
     await page.evaluate(() => window.fixture.render('unrelated'));
     await page.waitForFunction(() => !document.querySelector('[data-tab-message-tracker]'));

@@ -41,8 +41,10 @@ test('терминал не помещается — об этом сказан�
   assert.match(terminal, /setTerminalClipped\(geometry\.clipped\)/);
   assert.match(terminal, /data-terminal-clipped=\{tabId\}/);
   assert.match(terminal, /терминал не помещается/);
-  // Сообщение, а не орган управления: кликов не ловит.
-  assert.match(terminal, /data-terminal-clipped=\{tabId\}[\s\S]{0,600}pointerEvents: 'none'/);
+  // Its titlebar can itself be clipped; the notice is an accessible entry to
+  // the same terminal's explicit full-workspace view.
+  assert.match(terminal, /data-terminal-clipped=\{tabId\}[\s\S]{0,600}pointerEvents: 'auto'/);
+  assert.match(terminal, /requestTerminalFullView\(terminalRef\.current, tabId\)/);
 });
 
 test('боковой терминал не ужимается под узкое окно', () => {

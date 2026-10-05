@@ -45,6 +45,7 @@ import {
 } from './promptOutlineModel.mjs';
 import { normalizeInterruptedRestoreParallelism } from '../../utils/interruptedAutoRestore.mjs';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
+import { mergeSystemPromptDraft } from '../../utils/systemPromptDraft.mjs';
 import {
   applySavedPromptLibraryUpdate,
   mergeSavedPromptDraft,
@@ -1800,15 +1801,25 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [filePathInputs, setFilePathInputs] = useState<{ value: string; valid: boolean | null }[]>([]);
   const [savedFlashField, setSavedFlashField] = useState<'name' | 'content' | null>(null);
   const savedFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const previousLoopPromptContent = useRef<string | undefined>(undefined);
+  const systemPromptBaseline = useRef<AIPrompt | null>(null);
   useEffect(() => {
-    const content = aiPrompts.find((prompt) => prompt.id === RUN_AFTER_LOOP_PROMPT_ID)?.content;
-    if (editingPromptId === RUN_AFTER_LOOP_PROMPT_ID && content !== undefined) {
-      const previous = previousLoopPromptContent.current;
-      // Follow external edits unless this textarea owns an unsaved local draft.
-      setLocalPromptContent((current) => current === previous ? content : current);
-    }
-    previousLoopPromptContent.current = content;
+    const incoming = aiPrompts.find(prompt => prompt.id === editingPromptId);
+    const baseline = systemPromptBaseline.current;
+    if (!incoming || !baseline || baseline.id !== incoming.id) return;
+    const merged = mergeSystemPromptDraft(baseline, {
+      ...baseline, name: localPromptName, content: localPromptContent, color: localPromptColor,
+      showInContextMenu: localPromptShowInMenu, model: localPromptModel,
+      thinkingLevel: localPromptThinkingLevel, filePaths: localPromptFilePaths,
+    }, incoming);
+    setLocalPromptName(merged.draft.name);
+    setLocalPromptContent(merged.draft.content);
+    setLocalPromptColor(merged.draft.color);
+    setLocalPromptShowInMenu(merged.draft.showInContextMenu);
+    setLocalPromptModel(merged.draft.model);
+    setLocalPromptThinkingLevel(merged.draft.thinkingLevel);
+    setLocalPromptFilePaths(merged.draft.filePaths);
+    systemPromptBaseline.current = merged.baseline;
+    if (merged.conflicts.length) showToast('Промпт изменён извне. Ваш черновик сохранён в редакторе; перед сохранением сверьте изменения.', 'warning');
   }, [aiPrompts, editingPromptId]);
   const [aiUsageRange, setAIUsageRange] = useState<AIUsageRange>('week');
   const [aiUsageStats, setAIUsageStats] = useState<any | null>(null);
@@ -1901,12 +1912,16 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   };
 
   // Save current AI prompt from local state to DB (all fields from local state)
-  const saveCurrentAIPrompt = (flashField?: 'name' | 'content') => {
+  const saveCurrentAIPrompt = async (flashField?: 'name' | 'content') => {
     if (editingPromptId) {
-      const prompt = aiPrompts.find(p => p.id === editingPromptId);
+      const prompt = aiPrompts.find(p => p.id === editingPromptId)
+        || (systemPromptBaseline.current?.id === editingPromptId ? systemPromptBaseline.current : null);
       if (prompt) {
-        saveAIPrompt({
+        try {
+        const saved = await saveAIPrompt({
           ...prompt,
+          revision: systemPromptBaseline.current?.id === prompt.id ? systemPromptBaseline.current.revision : prompt.revision,
+          editBase: systemPromptBaseline.current?.id === prompt.id ? systemPromptBaseline.current : undefined,
           content: localPromptContent,
           name: localPromptName,
           color: localPromptColor,
@@ -1915,18 +1930,23 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           thinkingLevel: localPromptThinkingLevel,
           filePaths: localPromptFilePaths
         });
+        if (systemPromptBaseline.current?.id === saved.id) systemPromptBaseline.current = saved;
         if (flashField) {
           if (savedFlashTimer.current) clearTimeout(savedFlashTimer.current);
           setSavedFlashField(flashField);
           savedFlashTimer.current = setTimeout(() => setSavedFlashField(null), 400);
         }
+        } catch (error: any) {
+          showToast(error?.message || 'Не удалось сохранить системный промпт', 'error');
+          return false;
+        }
       }
     }
+    return true;
   };
 
-  const closeAIPromptEditor = () => {
-    saveCurrentAIPrompt();
-    setEditingPromptId(null);
+  const closeAIPromptEditor = async () => {
+    if (await saveCurrentAIPrompt()) setEditingPromptId(null);
   };
 
   const loadAIUsageStats = useCallback(async () => {
@@ -2300,12 +2320,13 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
 
   // Start editing an AI prompt (auto-saves current before switching)
-  const startEditingAIPrompt = (prompt: AIPrompt) => {
+  const startEditingAIPrompt = async (prompt: AIPrompt) => {
     if (prompt.id === editingPromptId) return;
-    saveCurrentAIPrompt();
+    if (!await saveCurrentAIPrompt()) return;
     saveCurrentInsertion();
     setEditingInsertionPromptId(null);
     setEditingPromptId(prompt.id);
+    systemPromptBaseline.current = prompt;
     setLocalPromptContent(prompt.content);
     setLocalPromptName(prompt.name);
     setLocalPromptColor(prompt.color);
@@ -2317,7 +2338,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   };
 
   // Add new custom AI prompt
-  const addAIPrompt = () => {
+  const addAIPrompt = async () => {
     const newId = `prompt-${Date.now()}`;
     const maxPos = aiPrompts.reduce((max, p) => Math.max(max, p.position), 0);
     const newPrompt: AIPrompt = {
@@ -2332,8 +2353,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       position: maxPos + 1,
       filePaths: []
     };
-    saveAIPrompt(newPrompt);
-    startEditingAIPrompt(newPrompt);
+    try { await startEditingAIPrompt(await saveAIPrompt(newPrompt)); }
+    catch (error: any) { showToast(error?.message || 'Не удалось создать промпт', 'error'); }
   };
 
   // Compute max flat position across groups and ungrouped prompts
@@ -3106,7 +3127,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   };
 
   const renderSystemPrompts = () => {
-    const editingAIPrompt = editingPromptId !== null ? aiPrompts.find(p => p.id === editingPromptId) : null;
+    const editingAIPrompt = editingPromptId !== null ? aiPrompts.find(p => p.id === editingPromptId)
+      || (systemPromptBaseline.current?.id === editingPromptId ? systemPromptBaseline.current : null) : null;
 
     const renderAIPromptEditor = () => {
       if (!editingAIPrompt) {
@@ -3119,8 +3141,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       const isLoopPrompt = editingAIPrompt.id === RUN_AFTER_LOOP_PROMPT_ID;
 
       const saveField = (overrides: Partial<AIPrompt>) => {
-        saveAIPrompt({
+        void saveAIPrompt({
           ...editingAIPrompt,
+          revision: systemPromptBaseline.current?.revision || editingAIPrompt.revision,
+          editBase: systemPromptBaseline.current?.id === editingAIPrompt.id ? systemPromptBaseline.current : undefined,
           name: localPromptName,
           content: localPromptContent,
           color: localPromptColor,
@@ -3129,7 +3153,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           thinkingLevel: localPromptThinkingLevel,
           filePaths: localPromptFilePaths,
           ...overrides
-        });
+        }).then(saved => { if (systemPromptBaseline.current?.id === saved.id) systemPromptBaseline.current = saved; })
+          .catch((error: any) => showToast(error?.message || 'Не удалось сохранить промпт', 'error'));
       };
 
       const pickFile = async () => {
@@ -3329,7 +3354,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             </VRSection>}
 
             {!editingAIPrompt.isBuiltIn && (
-              <button onClick={() => { deleteAIPrompt(editingAIPrompt.id); setEditingPromptId(null); showToast('Deleted', 'success'); }} style={{ alignSelf: 'flex-start', padding: 0, background: 'transparent', border: 'none', color: '#ff6b6b', fontSize: 12, fontWeight: 650, cursor: 'pointer' }}>
+              <button onClick={async () => { try { await deleteAIPrompt(editingAIPrompt.id); setEditingPromptId(null); showToast('Deleted', 'success'); } catch (error: any) { showToast(error?.message || 'Не удалось удалить промпт', 'error'); } }} style={{ alignSelf: 'flex-start', padding: 0, background: 'transparent', border: 'none', color: '#ff6b6b', fontSize: 12, fontWeight: 650, cursor: 'pointer' }}>
                 Удалить промпт
               </button>
             )}

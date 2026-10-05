@@ -117,6 +117,7 @@ export async function runAgentSendFlow({
           enterWritten: false,
           status: 'not-submitted',
           code: error.code || 'agent_send_preflight_failed',
+          ...(error.cancelled === true ? { cancelled: true } : {}),
           error: String(error.message || error),
           ...(error.manualActionRequired === true ? {
             manualActionRequired: true, manualActionType: error.manualActionType,

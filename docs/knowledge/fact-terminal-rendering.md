@@ -68,7 +68,14 @@ Smoke/harness-прогоны исключены: в Claude маркер мог �
 | --- | --- | --- | --- |
 | Claude 2.1.287 / Haiku 4.5 | 0.426 (0.386–0.858) | 0.461 (0.309–0.620) | 2.587 → 2.546 |
 | Codex 0.159.2 / GPT-6-Luna low | 0.322 (0.318–0.324) | 0.731 (0.159–1.519) | 5.268 → 4.802 |
-| AGY 1.2.14 / Flash low, host-патч | 1.783 (1.362–2.194) | 2.991 (2.748–3.193) | 5.594 → 4.929 |
+| AGY TUI 1.2.15 / host-копия 1.2.14, Flash low | 1.783 (1.362–2.194) | 2.991 (2.748–3.193) | 5.594 → 4.929 |
+
+Уточнение по исходным артефактам: все шесть cold-TUI banner содержат1.2.15,
+host-копия основана на1.2.14; отдельный build/hash stock headless не сохранён.
+Поэтому cold-AGY здесь **не version-matched A/B** и не доказывает цену TUI/патча.
+Числа остаются реальными наблюдениями этих запусков. Warm A/B02.10 выше
+сохраняет1.2.14 в обоих TUI-banner и исходный binary hash в `audit.json`.
+Нельзя переносить native API/patch proof1.2.14 на обновлённый executable.
 
 У штатного AGY headless init медиана 3.103 s, первый текст 5.187 s. Из этого
 не следует стабильный выигрыш самого 4-byte патча: сеть/генерация не фиксированы.
@@ -153,6 +160,107 @@ API здесь быстрее до первого запроса, но RAM не 
 отправляли. Тестовые rollouts/копии и четыре записи thread удалены native API,
 test-cwd thread/list пуст, собственных PID не осталось. Исследовательский стенд
 не включает Electron/Canvas/History Noted; runtime продукта не менялся.
+
+---
+
+## Noted с одной AGY-вкладкой: реальный renderer/PTY04.10.2026
+
+Отдельный UI smoke, не продолжение CLI-only A/B: frozen built DEV Electron28.3.3,
+одна generic shell-tab → original AGY1.2.16/Gemini3.8Flash low, два настоящих
+ответа, без нового AGY provider-кода. Дерево native phys_footprint:
+
+| Состояние | Noted целиком с дочерними процессами | Входящий в него AGY |
+| --- | --- | --- |
+| Пустая shell |312.27MiB |— |
+| После двух ответов |634.63MiB |159.84MiB |
+
+Вложенные деревья не суммируются. GPU helper134.00→286.39MiB, renderer
+60.06→68.17MiB, main103.92→106.11MiB. Это point samples с разным состоянием
+терминального содержимого, не причинный профиль GPU и не matched no-TUI A/B.
+Нельзя объявлять634−160 «ценой терминала»: здесь весь Electron/UI, а сравнимого
+Noted с headless AGY/History не было. Native window1900×1000 был hidden/focus=false,
+DOM visibility=visible; UI/PTY проверены через CDP, foreground latency — нет.
+Не считать паузы между действиями тестировщика временем запуска или модели.
+
+Артефакты `/private/tmp/noted-agy-pty-e2e.8WKVDr/REPORT.md`,
+`artifacts/metrics-before.json`, `metrics-after-second.json`. Базовый ввод,
+draft, реальный picker/cancel и exit прошли; история восстановлена в63steps с
+исходным canonical hash, собственные processes/ports закрыты. Методика и
+границы AGY-поддержки — fact-gemini-automation; production не устанавливался.
+
+---
+
+## Большой синтетический AGY: RAM и CPU с TUI и без него,04.10.2026
+
+Original AGY1.2.16, M1Pro10cores/32GiB; создан внешний import artifact с11000
+user/assistant парами и финальным checkpoint. Файл731426816bytes (~697.5MiB)
+выбран по масштабу Codex3314, но это text-heavy стресс, не копия её267turns/
+tools/61compacted. Checkpoint оставляет короткий активный контекст: реальные
+Gemini3.8Flash low ответы подтвердили последний canary, SUMMARY_BRFSHE и40строк.
+
+CLI tree phys_footprint, медиана15s после ответа; два квалифицированных запуска
+на режим, новый процесс каждый раз, между ними native conversation-only rewind:
+
+| Метрика | TUI | Штатный stream-json |
+| --- | --- | --- |
+| После ответа, MiB |3470.7–4635.2 |2182.3–2185.9 |
+| Максимальный sample, MiB |4316.4–4635.2 |2182.3–2186.0 |
+| CPU восстановления, CPU-s |138.27–138.45 |145.27–147.61 |
+| CPU нового40-line ответа, CPU-s |1.29–1.47 |0.48–0.82 |
+| CPU idle после ответа, % одного ядра |0.62–0.85 |0.04–0.06 |
+
+Память без TUI на этом стрессе заметно ниже, но CPU восстановления не меньше:
+значительная работа принадлежит самому agent runtime. Не обещать фиксированные
+20% экономии или обязательные200MiB на агента. Время до спокойного состояния
+~146–156s включает3s guard низкого CPU и drainage; это НЕ измерение earliest
+HTTP send. Процесс на протяжении замера остаётся прогретым и живым.
+
+Первая загрузка нового импорта исключена из A/B: после первого model-turn AGY
+сам нормализовал сохранённые payload725791311→376039579bytes при сохранённом
+числе22001steps и SHA трёх ответов в начале/середине/конце. First-import headless
+2941.7MiB нельзя напрямую сравнивать с последующими нормализованными запусками.
+Порядок квалифицированных больших случаев TUI-b,TUI-c,headless-b,headless-c;
+это не рандомизированная статистика. Medium1000turns дал525.3/335.8MiB, одна пара.
+Offline audit собственного import artifact:11000 исходных `response` суммарно
+360448000bytes, `modifiedResponse` остался у396 записей (12976128bytes).
+Поэтому размер файла~698MiB не равен актуальному payload/объёму запроса к модели.
+
+Измерение не включает Electron/Canvas и Node-хост с двумя xterm5000lines.
+TUI выдал364MiB ANSI; runner потреблял его с backpressure, не держал весь raw
+поток в RAM. Появление composer/JSON init раньше окончания загрузки не считается
+idle: первая версия стенда ошибочно смешала restore и простой, исправлена.
+Первый large-TUI остановлен своим3GiB guard (не crash); принятые прогоны с
+5GiB CLI/1200MiB runner cap завершились штатно, все процессы закрылись.
+
+Источник `/tmp/noted-agy-large.BRfShe/summary.json`, phase samples/real output
+по путям внутри; исключённые прогоны сохранены отдельно. Воспроизводимые команды,
+fixture builder/контекст и полный Noted UI этап — в рабочем
+`docs/tmp/исследование-терминалов-и-агентов.md`. Продовый код/AGY binary не менялись.
+
+### Полный Noted с этим архивом: ограниченный результат, не after-answer benchmark
+
+Два bounded UI-прогона в том же frozen DEV, CDP9356/API7996, одна generic
+terminal-tab. Первый остановлен на readiness gate без отправки model prompt:
+позднее hostWithoutAgy держал~220–250% одного ядра при почти idle AGY, строки
+на экране менялись. `/exit` затем принят (main-log21:08:44 UTC, exit0), поэтому
+из этого нельзя выводить неработоспособность ввода. Пик wholeNoted5634.3MiB,
+вложенного AGY5104.0MiB; root cause высокой hostCPU не профилирован.
+
+Коррекция не требовала низкого CPU, планировала один prompt через180s жизни
+AGY. На176.45s сработал собственный5GiB engine guard: AGY5220.2MiB,
+wholeNoted5713.1MiB (5.58GiB). SIGTERM от monitor подтверждён AGY-log
+04:23:43local; это не crash и не абсолютный максимум runtime. Prompt ещё не
+отправлен, новых native steps нет. **RAM/CPU полного Noted после нового ответа
+этими UI-прогонами не измерены.** CLI A/B выше остаётся отдельным успешным proof.
+Нельзя подменять эту границу обещанием готового AGY History adapter или выводом,
+что интерфейс вообще не умеет посылать сообщения. Перед production rollout
+большие restore/send требуют отдельной проверки массового вывода и ресурсов;
+повышение safety cap само по себе не чинит наблюдавшуюся нагрузку UI.
+
+Родитель сверил source main-log, native guard log, screenshots и raw metrics.
+Сохранены `noted-ui/report.md`, `noted-ui-retry/report.md` в том же artifact-root.
+Оба lease остановлены, Inbox0 восстановлен, fixture вернули к22001steps перед
+native cleanup. Новый AGY control/runtime в продукт не внедрялся.
 
 ---
 
@@ -294,6 +402,31 @@ ipcRenderer.on('terminal:data', (event, tabId, data) => {
 -   **Пауза циклического feedback:** статический `presentationAnimations.css` адресует точные классы индикаторов, inline infinite-анимации имеют `noted-infinite-animation` на animated DOM/SVG. Владельцы скрытия — terminal wrapper, pane chrome, single-center boundary и History; скрытый внешний owner выигрывает над locally-presented потомком. Видимое unfocused окно продолжает анимироваться. Finite callbacks работают в фоне; у notification dismiss paused только бесконечное кольцо. Generic style/class substring selectors запрещены из-за descendant invalidation при каждом warm show/hide; причина и контроль — `fix-performance-lags.md::7c`.
 -   **History-primary — тот же контракт:** когда History занимает центр, floating-терминал оборачивает тот же единственный `TerminalArea`. `active`, retained pixels и actual presentation — разные оси: закрытое окно не крадёт focus/input и не получает чужой `safeFit`, но PTY, listeners, xterm buffer и Canvas pixels остаются живыми. Полный контракт — `fact-история-как-основная-поверхность.md`.
 -   **Raw scrollback ограничен 5000 строками в обоих xterm-слоях.** Renderer и main/headless mirror используют один бюджет; прежняя lazy-ветка случайно создавала 50 000 строк и делала память зависимой от первого способа показа вкладки. Сокращение ограничивает JS/xterm heap и стоимость snapshot, но почти не уменьшает GPU `IOSurface`: там живут viewport-sized Canvas pixels, а не все строки scrollback. Для AI полный transcript принадлежит JSONL/rollout History; 5000 строк остаются большим диагностическим хвостом и для обычного terminal/dev-server.
+    Проверка04.10 предложения500rows: полный ANSI replay двух старых
+    controlled Codex0.159.2 запусков копии3314 (11391/11479bytes) при5000/500
+    сохранил одинаковые40rows на границах chunks и snapshot2609bytes/exact hash.
+    Тогдашняя35s подготовка доHTTP не объясняется заполненным xterm scrollback.
+    Уменьшенный retention не предотвращает upstream rollout read/ANSI emission
+    и не позволяет пропускать ANSI parser. Видимая высота/PTY rows — другой
+    параметр, влияющий на layout TUI. Источник `/tmp/noted-scrollback-replay.mqzdqb/`;
+    это replay записанного вывода, не новый CLI/GUI speed benchmark. Вsource5k
+    не менялся; отдельный500-row AI budget пока только предложение.
+    Последующее живое сравнение04.10: свежая копия3314 (773.80MiB,
+    278turn_context), шесть новых Codex0.159.2 PID, два повтора5000/40,
+    500/40,500/20 (retained rows / PTY height), порядок A/B/C/C/B/A. Реально
+    принятый UUID-текст в input — медианы351/355/347ms; первый исходящий запрос
+    к локальному Responses-приёмнику —33.27/31.25/30.49s. Это не время первого
+    ответа: сервер отдавал контролируемый SSE без облачной генерации. Во всех
+    вариантах восстановлена одна история, запрос373items/5921272bytes, ответ
+    виден; MCP/hooks/goals отключены, OS-cache не очищен. На40-row экране оба
+    буфера удерживали только40rows, на20-row —20rows. Выигрыша до доступного
+    input не обнаружено; два повтора не доказывают причинность разницы доHTTP,
+    а30s подготовки не устраняются уменьшением терминального хвоста/экрана.
+    Граница — реальный CLI+PTY+два headless xterm, НЕ Electron/History/внешний
+    composer Noted. Артефакты `/tmp/noted-codex-input-ready.oysEGJ/`
+    (`summary.json`,scripts,полный ANSI,frames,cleanup);6/6 PASS, оригинальный
+    frozen prefix неизменен, собственные thread/копии/PID убраны. Ограничения
+    xterm в продукте этим исследованием не изменены.
 
 ---
 

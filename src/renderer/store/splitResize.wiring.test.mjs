@@ -151,7 +151,7 @@ test('the split button greys out when refused instead of disappearing', () => {
   // vanishes reads as a bug whatever made it unavailable.
   const row = block(chrome, 'export function SplitPaneAttachRow(', '\n/** Above every surface');
   assert.ok(!/\{canSplit && \(/.test(row), 'the button must not be conditionally mounted');
-  assert.match(row, /splitAvailability\(splitPanes, paneIndex \?\? null\)/);
+  assert.match(row, /windowSplitAvailability\(splitPanes, paneIndex \?\? null\)/);
   // Both directions asked separately: a full column must not hide the
   // still-possible sideways split.
   assert.match(row, /splitCan\.horizontal/);

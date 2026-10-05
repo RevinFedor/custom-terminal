@@ -4,7 +4,8 @@ import { ArrowRightLeft, Check, Settings2 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import { useUIStore } from '../../store/useUIStore';
-import { useWorkspaceStore, selectFocusedProjectId } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { focusedMcpCwd } from '../../utils/mcpCatalogPresentation.mjs';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import ClaudeUsageButton from './ClaudeUsageButton';
 import ResourceUsageButton from './ResourceUsageButton';
@@ -56,9 +57,8 @@ type ToolbarExternalRunMeta = {
 
 export default function WorkspaceTitleBarTools() {
   const showToast = useUIStore((state) => state.showToast);
-  const focusedProjectId = useWorkspaceStore(selectFocusedProjectId);
   const centerProjectId = useWorkspaceStore((state) => state.activeProjectId);
-  const isSystemProject = isInboxProjectId(focusedProjectId);
+  const mcpCwd = useWorkspaceStore(focusedMcpCwd);
 
   const centerProjectName = useProjectsStore((state) => (
     centerProjectId ? state.projects[centerProjectId]?.name : undefined
@@ -562,13 +562,12 @@ export default function WorkspaceTitleBarTools() {
         onToggleGlobalAuto={() => setSummaryGlobalAuto(!summaryGlobalAuto)}
       />
 
-      {/* Потребление ресурсов проекта: вкладки с их инструментами, само
-          приложение и брошенные остатки. Замер идёт только пока панель открыта. */}
-      {!isSystemProject && <ResourceUsageButton />}
+      {/* Общие ресурсы приложения доступны из любого проекта, включая Inbox. */}
+      <ResourceUsageButton />
 
       {/* Статус общего MCP-бэкенда: шесть серверов в одном хабе на все
           AI-вкладки; точка — здоровье, панель — аптайм и рестарты. */}
-      {!isSystemProject && <McpHubButton />}
+      <McpHubButton cwd={mcpCwd} />
 
       <ClaudeUsageButton />
 

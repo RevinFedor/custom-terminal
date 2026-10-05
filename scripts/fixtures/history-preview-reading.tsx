@@ -32,7 +32,8 @@ function installTransport() {
       || [...fixtures.values()].find((entry) => entry.tabId === payload?.tabId);
     if (fixture) {
       if (channel === 'agent-transcript:get-history' || channel === 'claude:get-full-history') {
-        return { success: true, entries: fixture.entries, revision: { version: fixture.revision } };
+        return { success: true, entries: fixture.entries, revision: { version: fixture.revision },
+          ...(fixture.payloadGeneration ? { payloadGeneration: fixture.payloadGeneration } : {}) };
       }
       if (channel === 'agent-transcript:subscribe') return { success: true, filePath: 'fixture-only' };
       if (channel === 'agent-transcript:get-terminal-preview') return { success: true, preview: null };
@@ -44,7 +45,7 @@ function installTransport() {
   };
 }
 
-export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, composer = false, readerText }: { provider?: 'claude' | 'codex'; left?: number; composer?: boolean; readerText?: string } = {}) {
+export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, composer = false, readerText, payloadGeneration }: { provider?: 'claude' | 'codex'; left?: number; composer?: boolean; readerText?: string; payloadGeneration?: string } = {}) {
   installTransport();
   // Saved reading anchors survive a DEV restart. Each case needs a new owner,
   // otherwise an earlier test's mid-list position becomes its initial state.
@@ -64,7 +65,7 @@ export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, compo
     row(`${id}-reader`, readerText ?? Array.from({ length: 70 }, (_, i) => `Читаемый абзац ${i}. Этот текст должен оставаться на месте.`).join('\n\n'), 21),
   ];
   const text = Array.from({ length: 55 }, (_, i) => `Новый ответ, абзац ${i}. Постепенно записываем результат.`).join('\n\n');
-  const fixture = { tabId, sessionId, entries, revision: 1 };
+  const fixture = { tabId, sessionId, entries, revision: 1, payloadGeneration };
   fixtures.set(sessionId, fixture);
   const previousStreaming = useUIStore.getState().terminalHistoryStreamingEnabled;
   useUIStore.setState({ terminalHistoryStreamingEnabled: true, historyFontSize: 16 });
@@ -107,6 +108,7 @@ export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, compo
   const api = {
     id, tabId, sessionId, readerUuid: `${id}-reader`, canonicalUuid, canonicalIdentity,
     host,
+    setPayloadGeneration(value: string) { fixture.payloadGeneration = value; },
     setBusy(busy: boolean) {
       useWorkspaceStore.setState((state) => {
         const projects = new Map(state.openProjects);
@@ -123,8 +125,10 @@ export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, compo
         message: { ...record, sessionId },
       });
     },
-    async appendDurable(rows: any[]) {
-      fixture.entries = [...fixture.entries, ...rows.map((row) => ({ ...row, sessionId }))];
+    async appendDurable(rows: any[], { replaceSameUuid = false } = {}) {
+      const uuids = new Set(rows.map(row => row.uuid));
+      fixture.entries = [...(replaceSameUuid ? fixture.entries.filter(row => !uuids.has(row.uuid)) : fixture.entries),
+        ...rows.map((row) => ({ ...row, sessionId }))];
       fixture.revision++;
       api.setBusy(false);
       await new Promise(requestAnimationFrame);

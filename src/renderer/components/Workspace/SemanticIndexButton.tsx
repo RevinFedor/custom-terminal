@@ -3,6 +3,7 @@ import { CircleCheck, AlertTriangle, Loader2 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
+import { showSemanticIndexFailureToast } from '../../utils/semanticIndexFailureToast.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -158,12 +159,17 @@ export default function SemanticIndexButton({ onOpenSettings, compact = false }:
         projectId: string;
         success: boolean;
         error?: string;
+        projectPath?: string;
+        provider?: string;
+        model?: string;
         stats?: {
+          sawSummary?: boolean;
           outdatedTotal: number;
           outdatedCompleted: number;
           summaryErrors: number;
           summaryWarnings: number;
           perFileBad: number;
+          failedFiles?: string[];
         };
       },
     ) => {
@@ -175,7 +181,7 @@ export default function SemanticIndexButton({ onOpenSettings, compact = false }:
         const summary = s ? `Индекс обновлён: ${s.outdatedCompleted}/${s.outdatedTotal} файлов` : 'Индекс обновлён';
         showToast(summary, 'success');
       } else {
-        showToast(`Индексация не удалась: ${payload.error || 'unknown'}`, 'error');
+        showSemanticIndexFailureToast(showToast, payload);
       }
     };
 
@@ -194,12 +200,19 @@ export default function SemanticIndexButton({ onOpenSettings, compact = false }:
 
   const handleClick = async () => {
     if (!activeProjectId || isRunning) return;
-    const res = await ipcRenderer.invoke('semantic-index:rebuild', {
-      projectId: activeProjectId,
-      parallelism: semanticIndexParallelism,
-    });
-    if (!res?.success) {
-      showToast(res?.error || 'Не удалось запустить индексацию', 'error');
+    try {
+      const res = await ipcRenderer.invoke('semantic-index:rebuild', {
+        projectId: activeProjectId,
+        parallelism: semanticIndexParallelism,
+      });
+      if (!res?.success) {
+        showSemanticIndexFailureToast(showToast, { ...res, projectId: activeProjectId });
+      }
+    } catch (error) {
+      showSemanticIndexFailureToast(showToast, {
+        projectId: activeProjectId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   };
 

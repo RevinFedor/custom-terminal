@@ -531,6 +531,8 @@ const {
   createCodexImageRequestProjection,
   projectCodexImageAuditToRequest,
 } = require(path.join(srcMainDir, 'codex-image-request-projection'));
+const { prepareOwnedAttachmentTransport, attachmentProjectionSourceRecord,
+  projectOwnedAttachmentAuditToRequest } = require(path.join(srcMainDir, 'owned-mobile-attachments'));
 const { agentSendTargetPreconditionFailure } = require(path.join(srcMainDir, 'agent-send-target-precondition'));
 const { projectLegacyAiPromptReceipt } = require(path.join(srcMainDir, 'legacy-ai-prompt-receipt'));
 const {
@@ -587,6 +589,15 @@ const {
 } = require(path.join(srcMainDir, 'codex-context-session-observer'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const { createSavedPromptService } = require(path.join(srcMainDir, 'saved-prompt-service'));
+const { createSystemPromptService } = require(path.join(srcMainDir, 'system-prompt-service'));
+const systemPromptService = createSystemPromptService({
+  projectManager,
+  onChanged: (change) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('ai-prompts:changed', change);
+    }
+  },
+});
 const savedPromptService = createSavedPromptService({
   projectManager,
   onUpdated: (prompt) => {
@@ -659,6 +670,7 @@ const conversationOwners = new ConversationOwners({
   publish: (tabId, conversationOwner) => _webBroadcast(tabId, { type: 'conversation-owner', conversationOwner }),
 });
 const { TabWorkContext } = require(path.join(srcMainDir, 'tab-work-context'));
+let projectCardSignals = null;
 const tabWorkContext = new TabWorkContext({
   db: projectManager.db.db,
   listTabs: () => projectManager.db.db.prepare(`SELECT tab_id AS tabId, project_id AS projectId,
@@ -673,6 +685,7 @@ const tabWorkContext = new TabWorkContext({
       commandType: row.command_type, claudeSessionId: row.claude_session_id, codexSessionId: row.codex_session_id };
   },
   onChanged: (state) => {
+    noteProjectCardSignalsChanged(state.projectId, state.tabId);
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
         try { win.webContents.send('tab-work-context:changed', state); }
@@ -881,6 +894,7 @@ const {
   collectComposerDraftAssetIds,
   collectReferencedAssetIds,
   normalizeAssetId,
+  normalizeStoredAssetId,
 } = require(path.join(srcMainDir, 'prompt-queue-assets'));
 const { CodexImageBindingRegistry } = require(path.join(srcMainDir, 'codex-image-bindings'));
 const {
@@ -937,6 +951,7 @@ const {
   projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  projectCodexSendStartupWait,
   projectCodexWriterInspectionFromProof,
   resolveCodexReadIdentity,
   codexEmptyReadSourceMatchesStat,
@@ -1193,7 +1208,7 @@ const promptQueueAssetStore = new PromptQueueAssetStore({
 const promptQueueAssetSessionLeases = new Set();
 function leasePromptQueueAssetRefs(refs) {
   for (const ref of Array.isArray(refs) ? refs : []) {
-    const assetId = normalizeAssetId(ref?.assetId) || normalizeAssetId(ref?.path);
+    const assetId = normalizeStoredAssetId(ref?.assetId) || normalizeAssetId(ref?.path);
     if (assetId && ref?.availability === 'available') {
       promptQueueAssetSessionLeases.add(assetId);
     }
@@ -1232,6 +1247,7 @@ const codexImageTransport = new CodexImageTransport({
 });
 
 function broadcastTabTaskPlan(tabId, document, source) {
+  noteProjectCardSignalsChanged(null, tabId);
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
       win.webContents.send('tab-task-plan:updated', { tabId, document, source });
@@ -1259,6 +1275,61 @@ function getTaskStatusCatalog() {
       color: status.color,
       description: typeof status.description === 'string' ? status.description : '',
     }));
+}
+
+function readMainCardFast(tabId, row) {
+  const { projectFastSignal, unknownFast } = require(path.join(srcMainDir, 'project-card-signals'));
+  if (row.tabType === 'file' || row.tabType === 'claude-sdk') return unknownFast('not-codex');
+  if (terminalCommandState.get(tabId)?.isRunning !== true) {
+    return unknownFast('inactive-or-unproven-process');
+  }
+  if (resolveAiToolTypeForTab(tabId) !== 'codex') return unknownFast('not-current-codex-owner');
+  const identity = getCurrentCodexServiceTierProofIdentity(tabId);
+  return projectFastSignal(identity, identity.success ? preserveCodexServiceTierProofForTurnEnd(
+    codexTuiReadyMeta.get(tabId)?.serviceTierProof, identity,
+  ) : null);
+}
+
+function getProjectCardSignals() {
+  if (!projectCardSignals) projectCardSignals = require(path.join(srcMainDir, 'project-card-signals')).createProjectCardSignals({
+    epoch: appRuntimeIdentity.instanceId,
+    readTabs: (projectId, tabIds) => projectManager.db.getProjectCardPlanSummaries(projectId, tabIds),
+    readPending: tabIds => tabWorkContext.summaries(tabIds),
+    readFast: readMainCardFast,
+    readCatalog: () => {
+      const marker = projectManager.db.getAppState('noted-terminal-task-status-marker')
+        || projectManager.db.getAppState('noted-terminal-status-marker') || {};
+      return {
+        taskStatuses: getTaskStatusCatalog().map(({ id, label, color }) => ({ id, label, color })),
+        taskStatusMarker: { shape: marker.shape === 'square' ? 'square' : 'dot',
+          sizePx: Number.isFinite(marker.sizePx) ? Math.max(4, Math.min(16, Math.round(marker.sizePx))) : 8 },
+      };
+    },
+    onDirty: () => scheduleProjectActivityBroadcast('card-signals'),
+  });
+  return projectCardSignals;
+}
+
+function noteProjectCardSignalsChanged(projectId = null, tabId = null) {
+  if (!projectCardSignals) return;
+  try {
+    if (!projectId && tabId) {
+      projectId = projectManager.db.db.prepare('SELECT project_id FROM tabs WHERE tab_id=? LIMIT 1').get(tabId)?.project_id;
+      if (!projectId) return;
+    }
+    projectCardSignals.invalidate(projectId);
+  } catch (error) {
+    // Metadata notification failure must not fail a committed setting, plan,
+    // provider lifecycle edge, or shutdown. A later scoped read revalidates.
+    console.warn('[CardSignals] wake unavailable reason=' + String(error.code || error.message));
+  }
+}
+
+function noteCardSignalSettingsChanged(key) {
+  if (['noted-terminal-task-statuses', 'noted-terminal-task-status-marker',
+    'noted-terminal-session-statuses', 'noted-terminal-status-marker'].includes(key)) {
+    noteProjectCardSignalsChanged();
+  }
 }
 
 // SDK session registry — declared early so the mobile-web server can receive
@@ -2843,6 +2914,9 @@ claudeStartupProofSession = createClaudeStartupProofSession({
   log: console,
 });
 const terminals = new Map(); // tabId -> ptyProcess
+const { createTerminalCommandAdmission } = require(path.join(srcMainDir, 'terminal-command-admission.js'));
+const terminalCommandAdmission = createTerminalCommandAdmission(tabId => terminals.get(tabId));
+const terminalCommandStops = new Map();
 const terminalProjects = new Map(); // tabId -> cwd path
 const terminalCwdChangeProofs = new TerminalCwdChangeProofRegistry();
 const PROCESS_TREE_SNAPSHOT_TTL_MS = 750;
@@ -8250,13 +8324,13 @@ function computeActiveLoaders() {
   const hasRestartAfterSubscription = (row) => {
     if (!row) return false;
     if (row.restart_after_tab_id) return true;
-    if (!row.restart_after_tab_ids) return false;
-    try {
-      const ids = JSON.parse(row.restart_after_tab_ids);
-      return Array.isArray(ids) && ids.some((id) => typeof id === 'string' && id.trim());
-    } catch {
-      return false;
+    for (const serialized of [row.restart_after_tab_ids, row.restart_after_workflow_ids]) {
+      try {
+        const ids = JSON.parse(serialized || 'null');
+        if (Array.isArray(ids) && ids.some((id) => typeof id === 'string' && id.trim())) return true;
+      } catch {}
     }
+    return false;
   };
 
   // tabId → DB row. Reused both for labels and for separating "AI CLI alive"
@@ -8268,7 +8342,7 @@ function computeActiveLoaders() {
     if (projectManager?.db?.db) {
       try {
         row = projectManager.db.db.prepare(
-          'SELECT project_id, name, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused FROM tabs WHERE tab_id = ? LIMIT 1'
+          'SELECT project_id, name, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id, restart_after_tab_id, restart_after_tab_ids, restart_after_workflow_ids, restart_after_command, restart_after_paused FROM tabs WHERE tab_id = ? LIMIT 1'
         ).get(tabId) || null;
       } catch {}
     }
@@ -8727,6 +8801,7 @@ function computeProjectActivity() {
       .filter((p) => p.count > 0 || p.streaming || p.notificationCount > 0)
       .sort((a, b) => String(a.projectId).localeCompare(String(b.projectId))),
     layoutChangedProjectIds: Array.from(projectLayoutChangedIds),
+    ...(projectCardSignals ? { cardSignals: projectCardSignals.wake() } : {}),
     projectOrderChanged,
     ts: Date.now(),
   };
@@ -8741,6 +8816,7 @@ function scheduleProjectActivityBroadcast(reason = 'event') {
     } catch {}
     projectLayoutChangedIds.clear();
     projectOrderChanged = false;
+    projectCardSignals?.flushed();
   }, 80);
 }
 
@@ -9150,6 +9226,11 @@ async function readMainPublicRuntimeSnapshot(tabId) {
     const gate = currentClaudeStartupDefaultsGate(tabId);
     const sessionStatus = runtime.status || runtime.sessionStatus || 'unknown';
     return { ...runtime, ...history, coherent: true,
+      // Read/display SID and the authorized input destination are different
+      // facts. Keep the same scoped writer proof used at the physical boundary;
+      // readiness alone (or a saved SID) must never supply a substitute.
+      sendTarget: before.toolType === 'claude' || before.toolType === 'codex'
+        ? readAgentSendDestinationAtWriteBoundary(tabId, before.toolType) : null,
       status: sessionStatus, sessionStatus,
       busy: sessionStatus === 'busy', starting: sessionStatus === 'starting',
       stopping: sessionStatus === 'stopping',
@@ -9313,6 +9394,7 @@ ipcMain.on('claude:startup-defaults-gate', (_event, payload = {}) => {
 
 function scheduleProjectLayoutBroadcast(projectId, reason = 'tab-layout') {
   if (projectId) projectLayoutChangedIds.add(projectId);
+  noteProjectCardSignalsChanged(projectId);
   scheduleProjectActivityBroadcast(reason);
 }
 
@@ -10139,6 +10221,10 @@ const providerProxy = http.createServer((req, res) => {
               semanticObserver.markGap(event.reason);
               semanticObserver.finish(event.reason);
             });
+          }
+          if (event.event === 'terminated' && codexSemanticConnection) {
+            safelyObserveProviderSemantic('codex-http-terminated', () =>
+              codexSemanticConnection.finishAll(event.reason));
           }
         },
       });
@@ -13080,6 +13166,7 @@ function clearCodexServiceTierProof(
   if (expectedOwnerId && previousProof.ownerId !== expectedOwnerId) return false;
   const { serviceTierProof: _discardedProof, ...remainingMeta } = previousMeta;
   codexTuiReadyMeta.set(tabId, remainingMeta);
+  noteProjectCardSignalsChanged(null, tabId);
   console.warn('[CodexServiceTier] proof cleared tab=' + String(tabId).slice(-12)
     + ' owner=' + String(previousProof.ownerId || 'none').slice(0, 24)
     + ' reason=' + reason);
@@ -13235,6 +13322,7 @@ function publishCodexServiceTierProof(
     || Number(previousProof?.terminalRunSeq) !== proof.terminalRunSeq
     || previousProof?.launchId !== proof.launchId;
   if (changed) {
+    noteProjectCardSignalsChanged(null, tabId);
     console.log('[CodexServiceTier] proof tab=' + String(tabId).slice(-12)
       + ' owner=' + proof.ownerId.slice(0, 24)
       + ' tier=' + normalizedTier
@@ -13614,11 +13702,11 @@ function clearCodexLifecycleWarning(
 function setCodexLifecycleWarning(tabId, warning, reason = 'detected', { publish = true } = {}) {
   if (!tabId || !warning?.type) return null;
   const previous = codexLifecycleWarnings.get(tabId);
-  if (previous?.code === 'codex_capacity_retry_exhausted'
+  if (['codex_capacity_retry_exhausted', 'codex_capacity_retry_not_submitted'].includes(previous?.code)
     && warning.code === 'codex_model_at_capacity'
     && previous.turnId === warning.turnId
     && previous.terminalLifecycleGeneration === warning.terminalLifecycleGeneration) {
-    return previous; // a late TUI frame cannot downgrade the exhausted alert
+    return previous; // a late TUI frame cannot downgrade the stopped retry alert
   }
   const next = {
     ...warning,
@@ -13723,7 +13811,7 @@ function getCodexCapacityRetryRuntime() {
       generation: owner.generation, handoffId: effect.handoffId, isCurrent,
     }),
     cancelSend: (tabId, handoffId, reason) => agentSendCancellations.cancel(tabId, handoffId, { reason }),
-    notify: async (owner, effect, failure = null) => {
+    notify: async (owner, effect, failure = null, delivery = null) => {
       const projectId = resolveAuthoritativeTabProjectId(owner.tabId);
       if (!projectId) return;
       const row = projectManager.db.getAllProjects().find(p => p.id === projectId)?.tabs?.find(t => t.tabId === owner.tabId);
@@ -13731,9 +13819,9 @@ function getCodexCapacityRetryRuntime() {
         ? 'Автопродолжение не отправлено: ' + failure
         : 'Перегрузка модели: ' + effect.attempt + ' повторов без прогресса. Автопродолжение остановлено.';
       setCodexLifecycleWarning(owner.tabId, {
-        type: 'model-capacity', code: 'codex_capacity_retry_exhausted', message,
+        type: 'model-capacity', code: failure ? 'codex_capacity_retry_not_submitted' : 'codex_capacity_retry_exhausted', message,
         terminalLifecycleGeneration: owner.generation, turnId: effect.errorId,
-      }, 'capacity-retry-exhausted');
+      }, failure ? 'capacity-retry-not-submitted' : 'capacity-retry-exhausted');
       const detail = {
         tabId: owner.tabId, projectId,
         tabName: (row?.name || 'Codex') + ' — ' + message,
@@ -13746,7 +13834,9 @@ function getCodexCapacityRetryRuntime() {
         ipcMain.emit('tab-notification:fired', null, detail);
       }
       mainWindow?.webContents?.send('tab-notification:force-fired', detail);
-      console.warn('[CodexCapacityRetry] exhausted tab=' + owner.tabId.slice(-12) + ' attempts=' + effect.attempt);
+      console.warn('[CodexCapacityRetry] ' + (failure ? 'not-submitted' : 'exhausted')
+        + ' tab=' + owner.tabId.slice(-12) + ' attempts=' + effect.attempt
+        + (failure ? ' code=' + (delivery?.code || 'capacity_retry_not_submitted') : ''));
     },
     log: message => console.log('[CodexCapacityRetry] ' + message),
   });
@@ -14385,6 +14475,14 @@ function projectCodexRuntimeSnapshotFromEvents(
     outcomeKnown: turnState.outcomeKnown === true,
     lastOutcomeReason: turnState.lastOutcomeReason || null,
     hasLaunchPayload: !!currentPayload,
+    startupWait: projectCodexSendStartupWait({ payload: currentPayload, terminal: currentTerminal,
+      lifecycleGeneration: currentLifecycleGeneration, runSeq: currentRunSeq,
+      commandRunning: commandState?.isRunning === true, stopping, inputReady,
+      timeoutMs: CODEX_STARTUP_NO_STATE_TIMEOUT_MS }),
+    // The fast renderer presence path must carry the SAME physical target as
+    // /status and submit. A startup deadline alone names a launch, but the
+    // caller cannot compare it against a snapshot that dropped that identity.
+    sendTarget: readAgentSendDestinationAtWriteBoundary(tabId, 'codex'),
     ...(provisionalSettings || {}),
     runtimePolicy: null,
     liveSettings,
@@ -18731,6 +18829,7 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
             + ' launch=' + String(preclaimedGeneration?.launchId || '-'));
         }
         applyTerminalCommandStartMeta(tabId, state);
+        const commandOperationId = terminalCommandAdmission.started(tabId, state.runSeq);
         const startedAt = Date.now();
         const freshLastCommand = state.lastCommand && (!state.lastCommandAt || startedAt - state.lastCommandAt < 15000)
           ? state.lastCommand
@@ -18759,6 +18858,9 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
           mainWindow.webContents.send('terminal:command-started', {
             tabId,
             commandType: oscAgentTool || undefined,
+            commandOperationId,
+            runSeq: state.runSeq,
+            ...(commandOperationId ? { commandSource: state.activeCommandSource, command: state.activeCommand } : {}),
           });
         }
         break;
@@ -18885,6 +18987,7 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
           break;
         }
         state.isRunning = false;
+        const finishedCommandOperationId = terminalCommandAdmission.finished(tabId, state.runSeq);
         clearTerminalCommandOrigin(tabId, state, 'osc-d');
         terminalCommandState.set(tabId, state);
         const hadCodexRuntimeState = codexLastRunCommandPayload.has(tabId)
@@ -18920,7 +19023,9 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('terminal:command-finished', {
             tabId,
-            exitCode: state.lastExitCode
+            exitCode: state.lastExitCode,
+            commandOperationId: finishedCommandOperationId,
+            runSeq: state.runSeq,
           });
         }
         // Clear bridge + claudeCliActive when the shell regains control.
@@ -20016,6 +20121,7 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
         codexProviderTurnIndex: Number.isInteger(timelineUser?.turnIndex)
           ? timelineUser.turnIndex
           : (Number.isInteger(entry.turnIndex) ? entry.turnIndex : null),
+        physicalSessionId: entry.sessionId || sessionId,
         docsEdited: Array.isArray(timelineUser?.docsEdited) ? [...timelineUser.docsEdited] : undefined,
         docsSearchQueries: Array.isArray(timelineUser?.docsSearchQueries)
           ? [...timelineUser.docsSearchQueries]
@@ -20146,9 +20252,16 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
 }
 
 async function _loadSessionTurns(sessionId, cwd, options = {}) {
-  const located = findSessionFile(sessionId, cwd);
-  if (!located) {
-    return _loadCodexSessionTurns(sessionId, cwd, options);
+  const located = await _resolveHistoryReadSession(sessionId, cwd, options.provider);
+  if (located.provider === 'codex') {
+    try { return await _loadCodexSessionTurns(sessionId, cwd, options); }
+    catch (error) {
+      error.diagnostics = located.diagnostics;
+      error.code ||= error.lineageReason ? 'history_lineage_unresolved' : 'history_source_read_failed';
+      console.warn('[HistorySessionRead] failed session=' + sessionId + ' provider=codex code=' + error.code
+        + ' lineage=' + (error.lineageReason || '-'));
+      throw error;
+    }
   }
   const stat = fs.statSync(located.filePath);
   const cacheKey = 'claude:' + sessionId;
@@ -20184,6 +20297,64 @@ async function _loadSessionTurns(sessionId, cwd, options = {}) {
   };
   _setOverseerTurnsCache(cacheKey, result);
   return result;
+}
+
+function _historyReadBindings(sessionId) {
+  const bindings = [];
+  for (const table of ['tabs', 'tab_history']) {
+    const rows = projectManager.db.db.prepare(`SELECT tab_id, project_id, cwd, command_type,
+      claude_session_id, codex_session_id FROM ${table}
+      WHERE claude_session_id = ? OR codex_session_id = ?`).all(sessionId, sessionId);
+    for (const row of rows) for (const provider of ['claude', 'codex']) {
+      if (row[provider + '_session_id'] === sessionId) bindings.push({ provider, tabId: row.tab_id,
+        projectId: row.project_id, cwd: row.cwd || null, source: table });
+    }
+  }
+  return bindings;
+}
+
+async function _resolveHistoryReadSession(sessionId, cwd, provider = null) {
+  try {
+    return await require(path.join(srcMainDir, 'history-session-resolution')).resolveHistorySession({ sessionId, cwd, provider }, {
+      getBindings: _historyReadBindings,
+      getFork: id => projectManager.db.getSessionHistoryContext(id)?.fork || null,
+      resolveFiles: request => getAgentSessionAvailabilityService().resolveSessionFiles(request),
+      resolveLegacyCodexFile: (id, hint) => codexDataModule?._api?.findCodexSessionFile?.(id, hint),
+    });
+  } catch (error) {
+    console.warn('[HistorySessionRead] resolve failed session=' + sessionId + ' provider='
+      + (error.diagnostics?.expectedProvider || '-') + ' code=' + (error.code || 'unknown'));
+    throw error;
+  }
+}
+
+let userMessageHistory = null;
+function _getUserMessageHistory() {
+  if (userMessageHistory) return userMessageHistory;
+  const { UserMessageHistory } = require(path.join(srcMainDir, 'user-message-history'));
+  const { decorateHistoryPromptPresentations } = require(path.join(srcMainDir, 'history-prompt-presentations'));
+  userMessageHistory = new UserMessageHistory({
+    listCandidates: async ({ project, sessionIds }) => {
+      if (sessionIds) return sessionIds.map(sessionId => ({ sessionId, cwd: null, provider: null }));
+      const rows = [];
+      let offset = 0;
+      for (;;) {
+        const page = await listSessionCatalogCandidates({ project, candidateOffset: offset, maxCandidates: 250 });
+        rows.push(...page.candidates);
+        offset += page.candidates.length;
+        if (offset >= page.total || !page.candidates.length) break;
+      }
+      return rows;
+    },
+    loadSession: _loadSessionTurns,
+    extractText: _extractTurnPromptText,
+    getFork: sessionId => projectManager.db.getSessionHistoryContext(sessionId)?.fork || null,
+    decorateEntries: (entries, toolType, sessionId) => decorateHistoryPromptPresentations({
+      getHistoryPromptPresentations: (...args) => projectManager.db.getHistoryPromptPresentations(...args),
+      getHistoryPromptPresentationsForEntries: (...args) => projectManager.db.getHistoryPromptPresentationsForEntries(...args),
+    }, { entries, toolType, sessionId }),
+  });
+  return userMessageHistory;
 }
 
 function _sessionHistoryAppRelations(sessionId) {
@@ -21094,12 +21265,13 @@ async function searchSessionCatalog(options = {}) {
   for (const candidate of candidates) {
     let data;
     try {
-      data = await _loadSessionTurns(candidate.sessionId, candidate.cwd);
+      data = await _loadSessionTurns(candidate.sessionId, candidate.cwd, { provider: candidate.provider });
     } catch (error) {
       errors.push({
         sessionId: candidate.sessionId,
         title: candidate.title,
-        error: String(error?.message || error),
+        provider: candidate.provider,
+        ...require(path.join(srcMainDir, 'history-session-resolution')).historyReadError(error),
       });
       continue;
     }
@@ -21522,6 +21694,15 @@ async function handleOverseerRequest(rawUrl) {
   const url = new URL(rawUrl, 'http://localhost');
   const p = url.pathname; // e.g. /overseer/sessions
 
+  if (p === '/overseer/capabilities') return { body: { userMessageHistory: { version: 1, diagnostics: true } } };
+
+  if (p === '/overseer/user-messages') {
+    const input = Object.fromEntries(url.searchParams);
+    for (const key of ['sessionIds', 'kinds']) if (input[key]) input[key] = input[key].split(',');
+    input.caseSensitive = input.caseSensitive === 'true';
+    return { body: await _getUserMessageHistory().search(input) };
+  }
+
   if (p === '/overseer/search-sessions') {
     const result = await searchSessionCatalog({
       query: url.searchParams.get('query') || '',
@@ -21690,6 +21871,12 @@ async function handleOverseerRequest(rawUrl) {
   const sessionId = m[1];
   const subpath = m[2] || '';
   const cwd = url.searchParams.get('cwd') || null;
+
+  if (subpath === '/diagnostics') {
+    const resolved = await _resolveHistoryReadSession(sessionId, cwd);
+    return { body: { ...resolved.diagnostics, sourceAvailable: true, readability: 'not-verified',
+      guidance: 'A present child file and a saved fork relation do not prove a readable composite history. stats performs the canonical read.' } };
+  }
 
   const data = await _loadSessionTurns(sessionId, cwd);
   const sessionHistoryProjection = (subpath === '/stats' || subpath === '' || subpath === '/turns')
@@ -22214,6 +22401,10 @@ async function handleOverseerMutation(rawUrl, payload) {
   const url = new URL(rawUrl, 'http://localhost');
   const p = url.pathname;
 
+  if (p === '/overseer/user-messages/read') {
+    return { body: await _getUserMessageHistory().read(payload) };
+  }
+
   if (p === '/overseer/fork') {
     const { sessionId, cwd } = payload;
     if (!sessionId) return { status: 400, body: { error: 'sessionId required' } };
@@ -22362,6 +22553,9 @@ function rendererBridgeRequestForMcp(action, payload, timeoutMs = 60_000) {
 // servers (electron, ios) can drop that tab's connections, (c) exposes status
 // for the resource panel UI.
 const MCP_HUB_PORT = 53133;
+const codexMcpCatalogReader = require(path.join(srcMainDir, 'codex-mcp-catalog'))
+  .createCodexMcpCatalogReader({ codexHome: process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), hubPort: MCP_HUB_PORT });
+app.on('will-quit', () => codexMcpCatalogReader.close());
 // Windowed E2E instances have private userData but share the machine's loopback
 // ports. They may use an already-running global hub, but must never become its
 // owner: a temporary fixture source can be stale and outlive the test itself.
@@ -23725,7 +23919,7 @@ function startMcpHttpServer() {
         } catch (e) {
           console.error('[MCP:Overseer] Error:', e.message, e.stack);
           res.writeHead(Number(e?.statusCode || e?.status) || 500);
-          res.end(JSON.stringify({ error: e.message, ...(e.lineageReason ? { lineageReason: e.lineageReason } : {}) }));
+          res.end(JSON.stringify(require(path.join(srcMainDir, 'history-session-resolution')).historyReadError(e)));
         }
       })();
 
@@ -23746,8 +23940,8 @@ function startMcpHttpServer() {
           res.end(JSON.stringify(out.body));
         } catch (e) {
           console.error('[MCP:Overseer:POST] Error:', e.message, e.stack);
-          res.writeHead(500);
-          res.end(JSON.stringify({ error: e.message }));
+          res.writeHead(Number(e?.statusCode || e?.status) || 500);
+          res.end(JSON.stringify(require(path.join(srcMainDir, 'history-session-resolution')).historyReadError(e)));
         }
       });
 
@@ -24023,6 +24217,7 @@ app.whenReady().then(async () => {
     const st = await mcpHubStatus();
     return st || { port: MCP_HUB_PORT, servers: [], down: true };
   });
+  ipcMain.handle('mcp-hub:codex-catalog', (_event, request = {}) => codexMcpCatalogReader.read({ cwd: request?.cwd }));
   ipcMain.handle('mcp-hub:restart-server', async (_e, name) => {
     if (!name || typeof name !== 'string') return { ok: false, error: 'Не выбран MCP-сервер' };
     return mcpHubController.restart(name);
@@ -24134,6 +24329,7 @@ app.whenReady().then(async () => {
       resolveCodexRuntimeProjectionBatch: (tabIds, projectId = null) => (
         getCodexRuntimeProjectionBatch(tabIds, projectId)
       ),
+      projectCardSignals: getProjectCardSignals(),
       resolveAgentToolType: (tabId) => {
         const liveOwners = getLiveAiRuntimeOwners(tabId);
         return {
@@ -24148,6 +24344,10 @@ app.whenReady().then(async () => {
       readAgentLifecycleIdentity: readAiLifecycleIdentityForTab,
       readAgentStartReadiness: readMainAgentStartReadinessForTab,
       readAgentRuntimeSnapshot: readMainPublicRuntimeSnapshot,
+      codexGoalActions: {
+        read: (tabId, request) => getCodexRuntimePolicies().readGoalAction(tabId, request),
+        apply: (tabId, request) => getCodexRuntimePolicies().applyGoalAction(tabId, request),
+      },
       stopAgentProcess: stopAgentProcessScenarioInMain,
       readAgentParams: tabId => mainAgentParamsReader.read(tabId),
       agentParamsService: mainAgentParamsService,
@@ -24156,8 +24356,12 @@ app.whenReady().then(async () => {
       e2eBoundaryTestGate: aiBoundaryTestGate,
       agentSendReceiptStore,
       agentSendReceiptStartupReady,
+      mobileAttachmentAssetStore: promptQueueAssetStore,
+      cancelAgentSend: record => agentSendCancellations.cancel(record.tabId, record.handoffId,
+        { attemptId: record.attemptId || null }),
       projectPromptCatalog,
       savedPromptService,
+      systemPromptService,
     });
     console.log('[Startup] Mobile WebServer start requested; readiness is confirmed by [WebServer:Health] listening');
 
@@ -24224,6 +24428,9 @@ app.whenReady().then(async () => {
     });
     ipcMain.handle('tab-messages:get', async (_event, payload = {}) => {
       return payload.messageId ? webServer.getTabMessage(payload.messageId) : null;
+    });
+    ipcMain.handle('tab-messages:dismiss', async (_event, payload = {}) => {
+      return webServer.dismissTabMessage(payload.tabId, payload.messageId);
     });
     ipcMain.handle('orchestration:list-active', async () => {
       return webServer.listActiveOrchestrationRuns();
@@ -26375,7 +26582,13 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
       return;
     }
     if (result?.success === true) {
-      if (toolType === 'claude' && durable.promptHash !== (result.expectedHash || audit.expectedHash)) {
+      const attachmentSourceRecord = durable.receipt?.ownedAttachmentProjection
+        ? attachmentProjectionSourceRecord(durable) : durable;
+      if (!attachmentSourceRecord) {
+        console.warn('[AgentSendReceipt] owned attachment projection invalid operation=' + audit.sendOperationKey);
+        return;
+      }
+      if (toolType === 'claude' && attachmentSourceRecord.promptHash !== (result.expectedHash || audit.expectedHash)) {
         const projection = projectClaudePromptAuditToRequest({ tabId, record: durable, audit, result });
         if (projection.applied) {
           result = { ...result, expectedHash: projection.requestHash, expectedLen: projection.requestLength,
@@ -26386,7 +26599,7 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
             + ' transportLen=' + projection.transportLength);
         }
       }
-      if (toolType === 'codex' && durable.promptHash !== (result.expectedHash || audit.expectedHash)) {
+      if (toolType === 'codex' && attachmentSourceRecord.promptHash !== (result.expectedHash || audit.expectedHash)) {
         const projection = projectCodexImageAuditToRequest({ tabId, record: durable, audit, result });
         if (projection.applied) {
           // Original request identity and PTY image aliases are different
@@ -26411,6 +26624,15 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
           console.warn('[CodexImageAuditProjection] rejected reason=' + projection.reason
             + ' operation=' + String(audit.sendOperationKey).slice(0, 72));
         }
+      }
+      if (durable.receipt?.ownedAttachmentProjection) {
+        const projection = projectOwnedAttachmentAuditToRequest(durable, result);
+        if (!projection.applied) {
+          console.warn('[OwnedAttachmentAudit] rejected operation=' + audit.sendOperationKey + ' reason=' + projection.reason);
+          return;
+        }
+        result = { ...result, expectedHash: projection.requestHash, expectedLen: projection.requestLength,
+          canonicalized: true, canonicalReason: projection.canonicalReason };
       }
       const durablePromotion = agentSendReceiptStore.promoteFromAudit({
         success: true,
@@ -26440,12 +26662,12 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
           + ' mismatches=' + (durablePromotion?.mismatchedFields || []).join(','));
         return;
       }
-      if (toolType === 'claude') {
+      if (toolType === 'claude' || durable.receipt?.ownedAttachmentProjection) {
         try {
           backfillConfirmedCanonicalAuthoringPresentations(projectManager?.db, [durablePromotion.record]);
         } catch (error) {
           // Presentation failure cannot undo delivery or trigger another Send.
-          console.warn('[HistoryPromptPresentation] Claude request restore failed:', error?.message || error);
+          console.warn('[HistoryPromptPresentation] Request restore failed:', error?.message || error);
         }
       }
       // Keep a previously enriched address when a duplicate early audit only
@@ -28259,6 +28481,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const expectedDestination = (destinationRecord?.attemptId === sendAttemptId
     ? destinationRecord.receipt?.expectedTarget || null : null) || expectedTarget;
   const knownEmptyDestination = expectedDestination?.expectedBinding === 'none' || expectedTarget?.expectedBinding === 'none';
+  let ownedAttachmentTransport = null;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
   // Only used in fast-mode (Gemini/bash) where Ink isn't involved and we don't
@@ -28567,8 +28790,24 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       };
     }
   }
+  if (destinationRecord?.receipt?.ownedAttachments) {
+    try {
+      ownedAttachmentTransport = await prepareOwnedAttachmentTransport({ record: destinationRecord,
+        prompt: durableRawPrompt, provider: responsePreflightEngine, assetStore: promptQueueAssetStore,
+        authoringTransport: presentationSnapshot?.authoringTransport || null });
+      content = ownedAttachmentTransport.text;
+      leasePromptQueueAssetRefs(destinationRecord.receipt.ownedAttachments.refs.map(ref => ({ ...ref, availability: 'available' })));
+    } catch (error) {
+      return { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+        code: error.code || 'attachment_owned_bytes_unavailable', error: error.message };
+    }
+  }
   if (requiresImagePathValidation && !presentationSnapshot?.authoringTransport) {
     const queueImages = await validatePromptQueueImageMarkers(content);
+    if (ownedAttachmentTransport) {
+      queueImages.missing = queueImages.missing.filter(item => !ownedAttachmentTransport.imageRefs.some(ref => !ref?.unowned && ref?.sourcePath === item.path));
+      queueImages.success = queueImages.missing.length === 0;
+    }
     if (!queueImages.success) {
       content = replaceUnavailableImagePathMarkers(
         content,
@@ -28580,7 +28819,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
   }
   if (isCodexPasteSource) {
-    const prepared = prepareCodexImagePathMarkersForPaste(broadcastTabId, content, source || 'codex-paste', presentationSnapshot?.authoringTransport || null);
+    const prepared = prepareCodexImagePathMarkersForPaste(broadcastTabId, content, source || 'codex-paste',
+      ownedAttachmentTransport?.authoringTransport || presentationSnapshot?.authoringTransport || null,
+      ownedAttachmentTransport?.imageRefs || []);
     if (prepared.replaced > 0 || prepared.missing.length > 0) {
       console.log(logPrefix + ' [CodexImagePathPaste] markers=' + prepared.replaced
         + ' staged=' + prepared.staged.length
@@ -29227,11 +29468,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         handoffId,
         operationKey: sendOperationKey,
         attemptId: sendAttemptId,
-        requestText: durableRawPrompt,
+        requestText: ownedAttachmentTransport?.text || durableRawPrompt,
         transportText: content,
         segments: codexImagePasteSegments,
         imageRefs: stagedCodexImageRefs,
-        authoringTransport: presentationSnapshot?.authoringTransport || null,
+        authoringTransport: ownedAttachmentTransport?.authoringTransport || presentationSnapshot?.authoringTransport || null,
       })
       : null;
     if (codexImageRequestProjection) {
@@ -29240,8 +29481,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       // identity. It needs no request->transport bridge. Persist a projection
       // only when this exact attempt actually owns its original request hash.
       if (projectionOwner?.attemptId !== sendAttemptId
-        || projectionOwner.promptHash !== codexImageRequestProjection.requestHash
-        || projectionOwner.promptLength !== codexImageRequestProjection.requestLength) {
+        || (ownedAttachmentTransport?.projection.preparedHash || projectionOwner.promptHash) !== codexImageRequestProjection.requestHash
+        || (ownedAttachmentTransport?.projection.preparedLength ?? projectionOwner.promptLength) !== codexImageRequestProjection.requestLength) {
         codexImageRequestProjection = null;
       }
     }
@@ -29254,6 +29495,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         ...(expectedDestination ? { expectedTarget: expectedDestination } : {}),
         promptText: durableRawPrompt,
         transportText: content,
+        ...(ownedAttachmentTransport ? { ownedAttachmentProjection: ownedAttachmentTransport.projection } : {}),
         expectedImagePaths: (codexImagePasteSegments || [])
           .filter((segment) => segment?.kind === 'image' && typeof segment.text === 'string')
           .map((segment) => segment.text),
@@ -30654,6 +30896,16 @@ async function handleTerminalInput(
     console.error('[main] Terminal not found for tabId:', tabId);
     return;
   }
+  if (meta?.source === 'restart-after' && !terminalCommandAdmission.valid(tabId, meta.commandOperationId)) {
+    console.warn('[RestartAfter:Write] rejected tab=' + String(tabId).slice(-12) + ' reason=cancelled-or-missing-operation');
+    return;
+  }
+  if (meta?.source !== 'restart-after' && typeof data === 'string' && /[\r\n\x03]/.test(data)) {
+    terminalCommandAdmission.cancel(tabId);
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('terminal:command-operation-cancelled', {
+      tabId, reason: data.includes('\x03') ? 'manual-interrupt' : 'manual-input',
+    });
+  }
   const xtermInputOrigin = meta && typeof meta === 'object'
     ? meta.xtermInputOrigin
     : null;
@@ -31407,7 +31659,16 @@ async function handleTerminalInput(
       checkpoint: data === '\r' || data === '\n',
     });
     const nativeSettings = prepareCodexNativeSettingsIntentInput(tabId, term, data, xtermInputOrigin);
+    // No await between admission and the write. Stop revokes this operation
+    // even if the renderer was awaiting CWD/port/process preflight meanwhile.
+    if (meta?.source === 'restart-after' && (_gracefulShutdownInProgress || terminalCommandState.get(tabId)?.isRunning === true
+      || getLiveAiRuntimeOwners(tabId).length > 0
+      || resolveAiToolTypeForTab(tabId) || !terminalCommandAdmission.commit(tabId, meta.commandOperationId))) {
+      console.warn('[RestartAfter:Write] rejected tab=' + String(tabId).slice(-12) + ' reason=stale-or-ai-owner');
+      return;
+    }
     term.write(data);
+    if (meta?.source === 'restart-after') terminalCommandAdmission.confirm(tabId, meta.commandOperationId);
     for (const token of manualClaudeLocalCommandPreparation?.settingEvidenceTokens || []) {
       claudeSettingEvidence.markWritten(token, 'enter');
     }
@@ -31428,6 +31689,27 @@ async function handleTerminalInput(
 }
 
 ipcMain.on('terminal:input', handleTerminalInput);
+
+ipcMain.handle('terminal:begin-command-operation', (_event, { tabId, operationId } = {}) => {
+  if (_gracefulShutdownInProgress) return { success: false, reason: 'shutdown' };
+  if (terminalCommandStops.has(tabId)) return { success: false, reason: 'stop-in-progress' };
+  if (getLiveAiRuntimeOwners(tabId).length || resolveAiToolTypeForTab(tabId)) return { success: false, reason: 'ai-owned' };
+  return { success: terminalCommandAdmission.begin(tabId, operationId) };
+});
+ipcMain.on('terminal:cancel-command-operation', (_event, { tabId, operationId } = {}) => {
+  terminalCommandAdmission.cancel(tabId, operationId);
+});
+ipcMain.handle('terminal:command-operation-status', (_event, { tabId, operationId } = {}) => ({
+  valid: terminalCommandAdmission.valid(tabId, operationId),
+  isRunning: terminalCommandState.get(tabId)?.isRunning === true,
+  runningOperationId: terminalCommandAdmission.running(tabId),
+}));
+ipcMain.handle('terminal:submit-command-operation', async (event, { tabId, operationId, data, command } = {}) => {
+  if (terminalCommandAdmission.committed(tabId, operationId)) return { success: true, duplicate: true };
+  if (typeof data !== 'string' || !terminalCommandAdmission.valid(tabId, operationId)) return { success: false, reason: 'cancelled' };
+  await handleTerminalInput(event, tabId, data, { source: 'restart-after', command, commandOperationId: operationId });
+  return { success: terminalCommandAdmission.committed(tabId, operationId) };
+});
 
 function resolveAgentSendCancellationAttempt(tabId, handoffId, requestedAttemptId) {
   const requested = typeof requestedAttemptId === 'string' && requestedAttemptId.trim()
@@ -31459,7 +31741,34 @@ function resolveAgentSendCancellationAttempt(tabId, handoffId, requestedAttemptI
   return { accepted: false, attemptId: null, durableRecords };
 }
 
+ipcMain.handle('agent:enqueue-prompt', (_event, input) =>
+  require(path.join(srcMainDir, 'web-server')).enqueueDesktopAgentPrompt(input));
+const sendQueueRendererObservers = new Set();
+ipcMain.handle('agent:send-queue-ready', (event, ready = true) => {
+  const ownerId = event.sender.id;
+  const web = require(path.join(srcMainDir, 'web-server'));
+  web.markSendQueueRendererReady(ready === true, ownerId);
+  if (ready && !sendQueueRendererObservers.has(ownerId)) {
+    sendQueueRendererObservers.add(ownerId);
+    event.sender.once('destroyed', () => {
+      sendQueueRendererObservers.delete(ownerId);
+      web.markSendQueueRendererReady(false, ownerId);
+    });
+  }
+  return { success: true };
+});
+ipcMain.handle('agent:cancel-queued-send', (_event, { tabId, handoffId } = {}) => {
+  if (!tabId || !handoffId) return { cancelled: false, reason: 'exact-handoff-required' };
+  const web = require(path.join(srcMainDir, 'web-server'));
+  const result = web.cancelQueuedAgentSends(tabId, handoffId, { dismiss: true });
+  return result.cancelled ? result : web.dismissUnwrittenQueuedSend(tabId, handoffId);
+});
+
 ipcMain.handle('agent:cancel-send', (_event, { tabId, handoffId, sendAttemptId = null } = {}) => {
+  const queued = tabId && handoffId
+    ? require(path.join(srcMainDir, 'web-server')).cancelQueuedAgentSends(tabId, handoffId)
+    : { cancelled: false };
+  if (queued.cancelled) return { ...queued, reason: 'application-queue-cancelled' };
   const resolved = resolveAgentSendCancellationAttempt(tabId, handoffId, sendAttemptId);
   const durableAttemptId = resolved.attemptId;
   if (!resolved.accepted) {
@@ -31511,7 +31820,7 @@ ipcMain.handle('agent:list-send-receipts', async (_event, { tabId, surface = nul
   const records = agentSendReceiptStore.list({
     tabId: exactTabId,
     ...(exactSurface ? { surface: exactSurface } : {}),
-  }).map((record) => ({
+  }).map(record => require(path.join(srcMainDir, 'web-server')).projectQueuedSendReceipt(record)).map((record) => ({
     operationKey: record.operationKey,
     surface: record.surface,
     tabId: record.tabId,
@@ -31529,6 +31838,7 @@ ipcMain.handle('agent:list-send-receipts', async (_event, { tabId, surface = nul
     presentation: record.presentation,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
+    applicationQueue: require(path.join(srcMainDir, 'web-server')).applicationQueueInfo(record.operationKey),
   }));
   return { success: true, records };
 });
@@ -31600,6 +31910,7 @@ ipcMain.handle('agent:dismiss-send-receipt-presentation', async (_event, input =
     + ' applied=' + (result.applied === true ? '1' : '0')
     + ' idempotent=' + (result.idempotent === true ? '1' : '0')
     + ' reason=' + (result.reason || '-'));
+  if (result.ok) require(path.join(srcMainDir, 'web-server')).releaseQueuedSendPresentation(record.operationKey);
   return {
     success: result.ok === true,
     dismissed: result.applied === true || result.idempotent === true,
@@ -32158,16 +32469,17 @@ async function stageCodexImagePathForTab(tabId, filePath) {
   return { success: true, ...ref, inputPath: transport.path, stageToken: staged.token };
 }
 
-function stageCodexImagePathForPasteSync(tabId, filePath) {
+function stageCodexImagePathForPasteSync(tabId, filePath, ownedRef = null) {
   const candidate = typeof filePath === 'string' ? filePath.trim() : '';
   if (!candidate || !path.isAbsolute(candidate)) {
     return { success: false, error: 'invalid_path', path: candidate || null };
   }
-  if (!/\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(candidate)) {
+  if (!ownedRef && !/\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(candidate)) {
     return { success: false, error: 'unsupported_image_path', path: candidate };
   }
+  const bytePath = ownedRef?.path || candidate;
   let st = null;
-  try { st = fs.statSync(candidate); } catch {}
+  try { st = fs.statSync(bytePath); } catch {}
   if (!st || !st.isFile()) {
     return { success: false, error: 'image_path_missing', path: candidate };
   }
@@ -32176,18 +32488,28 @@ function stageCodexImagePathForPasteSync(tabId, filePath) {
     path: candidate,
     size: st.size,
     mediaType: mediaTypeFromImagePath(candidate),
-    assetId: path.basename(candidate).match(/^[a-f0-9]{64}\./i) ? path.basename(candidate) : undefined,
+    assetId: ownedRef?.assetId || (path.basename(candidate).match(/^[a-f0-9]{64}\./i) ? path.basename(candidate) : undefined),
     availability: 'available',
   };
-  const transport = codexImageTransport.stageSync(ref);
+  const transport = codexImageTransport.stageSync({ ...ref, path: bytePath });
   if (!transport.success) {
     return { success: false, error: transport.error || 'image_alias_failed', path: candidate };
   }
   return { ...ref, inputPath: transport.path };
 }
 
-function prepareCodexImagePathMarkersForPaste(tabId, text, source = 'codex-paste', authoringTransport = null) {
-  const plan = buildCodexImagePastePlan(text, rawPath => stageCodexImagePathForPasteSync(tabId, rawPath), { authoringTransport });
+function prepareCodexImagePathMarkersForPaste(tabId, text, source = 'codex-paste', authoringTransport = null, ownedRefs = []) {
+  const byPath = new Map(), next = new Map();
+  for (const ref of ownedRefs) {
+    if (!ref?.sourcePath) continue;
+    if (!byPath.has(ref.sourcePath)) byPath.set(ref.sourcePath, []);
+    byPath.get(ref.sourcePath).push(ref);
+  }
+  const plan = buildCodexImagePastePlan(text, rawPath => {
+    const occurrence = next.get(rawPath) || 0; next.set(rawPath, occurrence + 1);
+    const owned = byPath.get(rawPath)?.[occurrence] || null;
+    return stageCodexImagePathForPasteSync(tabId, rawPath, owned?.unowned ? null : owned);
+  }, { authoringTransport });
   const staged = plan.staged.map(result => ({
     id: 0,
     path: result.path,
@@ -40664,7 +40986,9 @@ async function garbageCollectPromptQueueAssets(queueState, reason = 'state-save'
     const historyPresentationAssets = projectManager.db.getHistoryPromptPresentationAssetIds?.() || [];
     for (const assetId of historyPresentationAssets) referenced.add(assetId);
     for (const assetId of promptQueueAssetSessionLeases) referenced.add(assetId);
+    for (const assetId of require(path.join(srcMainDir, 'agent-send-queue')).readQueuedSendAssetIds(projectManager.db.db)) referenced.add(assetId);
     const result = await promptQueueAssetStore.garbageCollect(referenced);
+    require(path.join(srcMainDir, 'agent-send-queue')).forgetCollectedUploadAliases(projectManager.db.db, result.removed);
     if (result.removed.length > 0) {
       console.log('[PromptQueueAssets] gc reason=' + reason
         + ' referenced=' + referenced.size + ' removed=' + result.removed.length);
@@ -40823,6 +41147,7 @@ ipcMain.handle('app:setState', (event, {
     return result;
   }
   if (key === 'promptQueueByTab') schedulePromptQueueAssetGc(value, 'queue-save');
+  noteCardSignalSettingsChanged(key);
   return { success: true };
 });
 
@@ -40846,6 +41171,7 @@ ipcMain.on('app:setStateSync', (event, {
     event.returnValue = result;
     return;
   }
+  noteCardSignalSettingsChanged(key);
   event.returnValue = { success: true };
 });
 
@@ -40872,6 +41198,7 @@ ipcMain.on('app:mirrorLocalStorageSync', (event, { key, value }) => {
     } else {
       projectManager.db.setAppState(key, String(value));
     }
+    noteCardSignalSettingsChanged(key);
     event.returnValue = { success: true };
   } catch (e) {
     console.warn('[app:mirrorLocalStorageSync] failed:', e);
@@ -41204,6 +41531,7 @@ ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, exp
     projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress)
   ));
   if (result.success === true && !_gracefulShutdownInProgress) {
+    noteProjectCardSignalsChanged(projectId);
     void tabWorkContext.syncLinks().catch((error) => console.warn('[TabContext] save sync:', error.message));
   }
   const durMs = Date.now() - started;
@@ -41607,6 +41935,17 @@ ipcMain.on('tab-notification:fired', (_event, detail = {}) => {
   } catch (e) {
     console.warn('[TabNotification] fired sync failed: ' + (e?.message || e));
   }
+});
+
+// Wake only: renderer/SQLite remain the setting owners. This carries neither
+// successful completion nor an APNs/Telegram trigger; clients GET current flags.
+ipcMain.on('tab-notification:state-changed', (_event, detail = {}) => {
+  if (typeof detail.tabId !== 'string' || typeof detail.projectId !== 'string') return;
+  const tab = projectManager.db.getTabCompletionNotificationPreference(detail.tabId);
+  if (!tab || tab.projectId !== detail.projectId) return;
+  require(path.join(srcMainDir, 'web-server')).publishCompletionNotificationChange({
+    tabId: detail.tabId, projectId: tab.projectId,
+  });
 });
 
 ipcMain.on('tab-notification:cleared', (_event, detail = {}) => {
@@ -43865,6 +44204,20 @@ ipcMain.handle('system:free-project-ports', async (event, cwd) => {
 //
 // Emits IPC `terminal:stop-progress` so the UI can lock the ↻ button until done.
 async function deterministicStopTerminal(tabId, restart = false, options = {}) {
+  if (options.commandOperationId) {
+    if (!terminalCommandAdmission.valid(tabId, options.commandOperationId)) return { success: false, error: 'command-operation-cancelled' };
+  } else {
+    terminalCommandAdmission.cancel(tabId);
+  }
+  terminalCommandStops.set(tabId, (terminalCommandStops.get(tabId) || 0) + 1);
+  try { return await performDeterministicStopTerminal(tabId, restart, options); }
+  finally {
+    const remaining = (terminalCommandStops.get(tabId) || 1) - 1;
+    if (remaining) terminalCommandStops.set(tabId, remaining); else terminalCommandStops.delete(tabId);
+  }
+}
+
+async function performDeterministicStopTerminal(tabId, restart = false, options = {}) {
   if (!tabId) return { success: false, error: 'no tabId' };
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
@@ -43884,7 +44237,7 @@ async function deterministicStopTerminal(tabId, restart = false, options = {}) {
 
   const emit = (phase, extra = {}) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('terminal:stop-progress', { tabId, phase, ...extra });
+      mainWindow.webContents.send('terminal:stop-progress', { tabId, phase, commandOperationId: options.commandOperationId || null, ...extra });
     }
   };
 
@@ -43892,7 +44245,19 @@ async function deterministicStopTerminal(tabId, restart = false, options = {}) {
   console.log('[DetermStop] tab=' + tabId + ' shellPid=' + term.pid + ' restart=' + restart + ' ports=[' + ports.join(',') + ']');
 
   const descendants = await findDescendantPids(term.pid);
+  if (options.commandOperationId && !terminalCommandAdmission.valid(tabId, options.commandOperationId)) {
+    emit('done', { cancelled: true });
+    return { success: false, error: 'command-operation-cancelled' };
+  }
   console.log('[DetermStop] tab=' + tabId + ' descendants=[' + descendants.join(',') + ']');
+
+  // A PID signal alone leaves queued terminal input intact. A shell interrupt
+  // also flushes that input; descendant cleanup below covers detached children.
+  // Never feed this extra prelude into an AI TUI.
+  if (descendants.length && !getLiveAiRuntimeOwners(tabId).length && !resolveAiToolTypeForTab(tabId)) {
+    term.write('\x03');
+    console.log('[DetermStop] tab=' + tabId + ' shell-input-interrupt=true');
+  }
 
   if (descendants.length === 0 && ports.length === 0) {
     const state = terminalCommandState.get(tabId);
@@ -44023,8 +44388,8 @@ async function deterministicStopTerminal(tabId, restart = false, options = {}) {
 }
 
 ipcMain.handle('terminal:deterministic-stop', async (_event, args) => {
-  const { tabId, restart = false, commandMeta = null } = args || {};
-  return deterministicStopTerminal(tabId, restart, { commandMeta });
+  const { tabId, restart = false, commandMeta = null, commandOperationId = null } = args || {};
+  return deterministicStopTerminal(tabId, restart, { commandMeta, commandOperationId });
 });
 
 // Small accessor for the "kill dev-ports" toggle (lives in renderer state).
@@ -45059,6 +45424,9 @@ async function stopAgentProcessScenarioInMain(request) {
   const authority = payload.authority && typeof payload.authority === 'object'
     ? payload.authority
     : null;
+  if (!authority && (!payload.reason || /^(manual|history-stop|queued-stop)/.test(payload.reason))) {
+    require(path.join(srcMainDir, 'web-server')).cancelQueuedAgentSends(payload.tabId, null, { stop: true });
+  }
   return stopAiProcessInTabSerialized(payload.tabId, {
     toolType: payload.toolType || null,
     reason: payload.reason || 'manual-stop',
@@ -45461,7 +45829,7 @@ ipcMain.handle('file:unwatch-folder', async () => {
 });
 
 // research:*, commands:*, prompts:*, ai-prompts:* → ipc/settings.js
-require(path.join(srcMainDir, 'ipc', 'settings')).register({ projectManager, savedPromptService });
+require(path.join(srcMainDir, 'ipc', 'settings')).register({ projectManager, savedPromptService, systemPromptService });
 projectPromptsIpc.register({ service: projectPromptCatalog });
 ipcMain.handle('gt-editor-transfer:paste', async (_event, payload = {}) => {
   try {
@@ -49881,6 +50249,20 @@ const CODEX_HISTORY_TURN_BOUNDARIES = new Set([
 
 function emitCodexHistoryLiveTurnBoundary(state, record, boundary) {
   if (!CODEX_HISTORY_TURN_BOUNDARIES.has(boundary)) return;
+  if (boundary === 'turn_aborted') {
+    // The watcher already has the physical provider record which stops busy.
+    // Publish its SAME canonical service row now, not after full History work.
+    // Escape/input intent alone never calls this formatter or proves an abort.
+    const entry = codexDataModule?._api?.buildCodexInterruptedHistoryEntry?.(
+      record, state.sessionId, undefined, { live: true });
+    if (entry) {
+      const detail = { type: 'history_entry', tabId: state.tabId, toolType: 'codex',
+        sessionId: entry.sessionId, timestamp: entry.timestamp,
+        sourceSequence: record.__eventSequence, recordByteOffset: record.__byteOffset, entry };
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent-transcript:live-message', detail);
+      _webBroadcast(state.tabId, detail);
+    }
+  }
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send('agent-transcript:live-message', {
     type: 'turn_boundary',
@@ -53369,11 +53751,14 @@ function projectCodexSourceTranscriptForRewindRecovery(records, sessionId = null
   const sourceLifecycleEvents = [];
   for (const record of records || []) {
     const payload = record?.payload || {};
-    if (record?.type !== 'event_msg') continue;
+    const responseUser = record?.type === 'response_item' && payload.type === 'message' && payload.role === 'user';
+    if (record?.type !== 'event_msg' && !responseUser) continue;
     const sourceLine = Number(record.__line);
     const timestampMs = Date.parse(String(record.timestamp || ''));
-    if (payload.type === 'user_message') {
-      const text = String(
+    if (payload.type === 'user_message' || responseUser) {
+      // Native target admission already accepts response-only users and hashes
+      // this same presentation text. Recovery must keep their physical address.
+      const text = responseUser ? codexUserMessagePresentationText(record).trim() : String(
         payload.message
         || codexDataModule._api.extractTextContent(payload.content)
         || '',
@@ -56327,6 +56712,10 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     liveLifecycle,
     lifecycleGeneration: liveLifecycle === false ? null : currentLifecycleGeneration,
     hasLaunchPayload: !!currentPayload,
+    startupWait: projectCodexSendStartupWait({ payload: currentPayload, terminal: terminals.get(tabId),
+      lifecycleGeneration: currentLifecycleGeneration, runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      commandRunning: terminalCommandState.get(tabId)?.isRunning === true, stopping, inputReady,
+      timeoutMs: CODEX_STARTUP_NO_STATE_TIMEOUT_MS }),
     ...(provisionalSettings || {}),
     runtimePolicy: null,
     liveSettings,
@@ -66757,6 +67146,7 @@ function _webBroadcast(tabId, payload) {
     console.warn('[WebBcast:MainError] tab=' + String(tabId || '').slice(-12) + ' type=' + (payload?.type || '-') + ' error=' + (err?.message || String(err)));
   }
   if (type === 'busy' || type === 'done' || type === 'snapshot') {
+    noteProjectCardSignalsChanged(payload?.projectId, tabId);
     scheduleProjectActivityBroadcast('tab-' + type);
   }
 }

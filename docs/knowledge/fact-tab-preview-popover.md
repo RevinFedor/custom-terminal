@@ -8,7 +8,7 @@
 1. **Активация**: hover на вкладке/карточке + удержание ⌘. Появляется popover с заметкой.
 2. **Контент**: markdown notes (read-only). В split-mode (Home) дополнительно metadata-блок (Path / Closed / Created / Type / Messages) **под** карточкой; notes — **над** карточкой. В TabBar — только notes под табом.
 3. **Закрытие**: уход курсора с popover'а + отпускание ⌘.
-4. **Закреп**: CMD+Shift над любым открытым popover'ом — popover «прибивается» (белая рамка 1px). CMD можно отпустить, курсор увести куда угодно, перенаведение на другие триггеры игнорируется. Снятие — повторный CMD+Shift или mousedown в любом месте приложения вне popover-обёртки (атрибут `data-cmd-hover-popover` защищает внутренние клики). Общая механика закрепа — в global `tooltip-resize-modal.md::Закреп: Cmd+Shift делает любой popover пинованным`.
+4. **Закреп**: CMD+Shift над любым открытым popover'ом — popover «прибивается» (белая рамка 1px). CMD можно отпустить, курсор увести куда угодно, перенаведение на другие триггеры игнорируется. Снятие — повторный CMD+Shift или mousedown в любом месте приложения вне popover-обёртки (атрибут `data-cmd-hover-popover` защищает внутренние клики). Общая механика закрепа — в global `всплывающие-окна.md::Закреп: явный trigger или Cmd+Shift`.
 
 ## Sizing: resize-ширина + динамическая высота
 
@@ -80,7 +80,7 @@ Iteration-results в ProjectHome не используют `TabPreviewPopover`: 
 
 Аналогично работает в Timeline (entry / note / fork tooltip'ы) — единая methodology, разные компоненты. Старый `freezeCmdPopups` toggle в StatusBar (жёлтый чип «freeze tooltips» для DevTools-инспекции) работает параллельно — это режим для разработки, оставлен нетронутым.
 
-Подробнее про закреп вообще — `~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/tooltip-resize-modal.md::Закреп`.
+Подробнее про закреп вообще — `~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/всплывающие-окна.md::Закреп`.
 
 ## Persistence settings
 
@@ -116,7 +116,7 @@ Migration: при отсутствии новых ключей (`noted-terminal-
 - **CSS-ловушки три**: `overflow:hidden` обрезал handles на `-5px` → нужен был card-wrap без overflow. `flex:1 + maxHeight: limit` давал effective `min(natural, limit)` → drag-up не реагировал визуально на коротком content → нужен был `height: limit + flex: 0 0 auto`. `Math.round(dy/lineHeight)` создавал discrete-step jitter → нужен был float. Все три пропали вместе с handles. Принцип остаётся в `methodology/дизайн-принципы.md::Drag-state буфер`.
 - **Autobalance по target-ratio (бисекция W в [MIN, maxWidth] под `ratioW/ratioH`)**: пришла на смену тем handles, прожила недолго и тоже снята. Баг, по которому сняли: при пропорции 6:2 и max 400×400 длинный текст давал коробку **уже** maxWidth и высокую — фактическое W/H ≈ 1.07 вместо целевого 3.0. Причина: ветка «коробка слишком плоская» **сужала** chosenW (242→157) ради ratio, хотя был запас до 400; настройка maxWidth почти не работала, алгоритм сам отказывался её использовать. Плюс `min(naturalH, maxHeight)` накладывался ПОСЛЕ выбора ширины — ratio не «видел» что лишнюю высоту срежет scroll, и сужал ширину зря. Юзер: *«ширина меньше 400, хотя и ширина и высота 400, а пропорция 6:2»*. Заменено на resize-ширина + динамическая высота (см. Sizing). `tabPreviewRatioW/H` + `setTabPreviewRatio` + `RatioRow` удалены из store/Settings; localStorage-ключи `noted-terminal-tab-preview-ratio-{w,h}` осиротели (никто не читает, безвредны).
 
-Невозврат: **не возвращать проекционную autobalance** (бисекцию под пропорцию) — она душит ширину и делает настройку maxWidth бесполезной. Resize-ширина вернулась намеренно (юзер сам попросил: предсказуемая фикс-ширина + обрезка пустого места справа на коротком тексте), но **только по ширине** — высота остаётся динамической. Resize info-popover оправдан здесь потому что превью часто закрепляют (CMD+Shift lock) и читают долго; для короткоживущего hover он избыточен, но lock меняет режим. См. global `tooltip-resize-modal.md::Tooltip с resize`.
+Невозврат: **не возвращать проекционную autobalance** (бисекцию под пропорцию) — она душит ширину и делает настройку maxWidth бесполезной. Resize-ширина вернулась намеренно (юзер сам попросил: предсказуемая фикс-ширина + обрезка пустого места справа на коротком тексте), но **только по ширине** — высота остаётся динамической. Resize info-popover оправдан здесь потому что превью часто закрепляют (CMD+Shift lock) и читают долго; для короткоживущего hover он избыточен, но lock меняет режим. См. global `всплывающие-окна.md::Tooltip с resize`.
 
 ## Связи
 
@@ -126,4 +126,4 @@ Migration: при отсутствии новых ключей (`noted-terminal-
 - `fact-project-home.md::Hover Popover (CMD+hover)` — конкретные карточки Home, split-mode на месте.
 - `fact-notes.md::Tab Notes Slideout` — drag-resize в slide-out (единственный оставшийся в проекте после rewrite'а превью).
 - `fix-notes-font-fragmentation.md` — предыдущая итерация (схлопывание в один шрифт) и постскриптум о пересмотре.
-- `~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/tooltip-resize-modal.md` — глобальный mental model для всех всплывающих окон с привязкой.
+- `~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/всплывающие-окна.md` — глобальный mental model для всех всплывающих окон с привязкой.

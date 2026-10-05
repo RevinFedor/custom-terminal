@@ -1,4 +1,5 @@
 'use strict';
+const { readOwnedAttachmentProjection } = require('./owned-mobile-attachments');
 
 const crypto = require('node:crypto');
 const { compactSendOwner, compactSendOwnerMatches, compactSendStartProven,
@@ -256,6 +257,7 @@ class AgentSendReceiptStore {
     }
     this.db = db;
     this.onChanged = typeof options.onChanged === 'function' ? options.onChanged : null;
+    this.listeners = new Set();
     this.onDeliveryUnknown = typeof options.onDeliveryUnknown === 'function' ? options.onDeliveryUnknown : null;
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.randomUUID = typeof options.randomUUID === 'function'
@@ -594,7 +596,7 @@ class AgentSendReceiptStore {
     return Number(info.changes || 0);
   }
 
-  _reserveOrGet(identity) {
+  _reserveOrGet(identity, options = {}) {
     const existing = this._record(identity.operationKey);
     if (existing) {
       const mismatchedFields = identityMismatches(existing, identity, {
@@ -626,7 +628,7 @@ class AgentSendReceiptStore {
 
     const timestamp = this.now();
     this._pruneAt(timestamp);
-    if (Number(this.statements.count.get().count) >= this.maxRecords) {
+    if (options.queuedAdmission !== true && Number(this.statements.count.get().count) >= this.maxRecords) {
       return this._capacity(identity);
     }
     try {
@@ -660,9 +662,45 @@ class AgentSendReceiptStore {
     };
   }
 
-  reserveOrGet(identityInput) {
+  reserveOrGet(identityInput, options = {}) {
     const identity = normalizeIdentity(identityInput);
-    return this.db.transaction(() => this._reserveOrGet(identity))();
+    return this.db.transaction(() => this._reserveOrGet(identity, options))();
+  }
+
+  // Admission is durable before a physical attempt exists. This is the same
+  // receipt, not an invented provider ACK; beginAttempt still owns its UUID.
+  stageQueuedRequest(operationKey, context) {
+    return this._observeChange(this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record || ![STORE_STATES.RESERVED, STORE_STATES.PREPARING].includes(record.state)) {
+        return { ok: false, reason: 'not-waiting', record };
+      }
+      this.db.prepare(`UPDATE ${TABLE_NAME} SET receipt_json = ?, updated_at = ?
+        WHERE operation_key = ? AND attempt_id IS NULL`).run(
+        encodeJson({ ...(record.receipt || {}), ...context }), this.now(), operationKey);
+      return { ok: true, record: this._record(operationKey) };
+    })());
+  }
+
+  settleQueuedNoWrite(operationKey, result) {
+    return this._observeChange(this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record || record.attemptId || !RESUMABLE_STATES.has(record.state)) {
+        return { ok: false, reason: 'attempt-already-started', record };
+      }
+      const now = this.now();
+      this.db.prepare(`UPDATE ${TABLE_NAME} SET state = ?, receipt_json = ?, updated_at = ?, settled_at = ?
+        WHERE operation_key = ? AND attempt_id IS NULL`).run(STORE_STATES.NOT_SUBMITTED,
+        encodeJson({ ...(record.receipt || {}), ...result, success: false, accepted: false,
+          submitted: false, pasteWritten: false, enterWritten: false, status: 'not-submitted' }),
+        now, now, operationKey);
+      return { ok: true, record: this._record(operationKey) };
+    })());
+  }
+
+  subscribe(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   beginAttempt(identityInput) {
@@ -1267,6 +1305,10 @@ class AgentSendReceiptStore {
     if (result?.ok && result.record) {
       try { this.onChanged?.(result.record); }
       catch (error) { console.warn('[AgentSendReceipt] activity observer failed', error?.message); }
+      for (const listener of this.listeners) {
+        try { listener(result.record); }
+        catch (error) { console.warn('[AgentSendReceipt] receipt observer failed', error?.message); }
+      }
     }
     return result;
   }
@@ -1376,6 +1418,11 @@ class AgentSendReceiptStore {
       if (!record) return { ok: false, matched: false, promoted: false, reason: 'not-found' };
       if (!audit.success) {
         return { ok: true, matched: true, promoted: false, reason: 'audit-not-successful', record };
+      }
+      if ((record.receipt?.ownedAttachments || record.receipt?.ownedAttachmentProjection
+        || auditInput?.canonicalReason === 'owned_mobile_attachment_paths')
+        && !readOwnedAttachmentProjection(record).valid) {
+        return { ok: false, matched: true, promoted: false, reason: 'attachment-canonical-proof-missing', record };
       }
       const mismatchedFields = [];
       if (record.attemptId !== audit.attemptId) mismatchedFields.push('attemptId');

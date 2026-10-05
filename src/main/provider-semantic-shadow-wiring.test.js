@@ -8,7 +8,7 @@ const test = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 
 test('provider proxy keeps Claude legacy routing and adds an explicit Codex route', () => {
-  assert.match(source, /const proxyRoute = parseProviderProxyRoute\(req\.url\)/);
+  assert.match(source, /(?:const|let) proxyRoute = parseProviderProxyRoute\(req\.url\)/);
   assert.match(source, /const proxyProvider = proxyRoute\.provider/);
   assert.match(source, /mode = proxyProvider === 'codex' \? 'codex' : reqState\.type/);
   assert.match(source, /resolveCodexUpstream\(\{ headers: req\.headers, forwardUrl \}\)/);

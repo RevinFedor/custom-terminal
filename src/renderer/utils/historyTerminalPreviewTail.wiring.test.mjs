@@ -22,7 +22,7 @@ test('the Footer contains only real preview/timing content, never synthetic rese
   const footer = sliceFrom('const HistoryTerminalPreviewFooter =', '// Cheap stand-in row');
   assert.match(footer, /context\?\.terminalPreview/);
   assert.match(footer, /terminalPreviewCanonicalMaterialized/);
-  assert.match(footer, /historyTerminalPreviewStatusLabel\(\{ canonicalMaterialized \}\)/);
+  assert.match(footer, /historyTerminalPreviewStatusLabel\(\{ canonicalMaterialized,\s*phase: segment\.phase, deliveryState: segment\.deliveryState \}\)/);
   assert.doesNotMatch(footer, /Terminal output|JSONL|API output/i);
   assert.match(footer, /context\?\.responseTiming/);
   assert.doesNotMatch(footer, /tailSpacer|data-history-tail-spacer|aria-hidden="true"/);
@@ -167,8 +167,9 @@ test('Virtuoso range changes wake one bounded preview handoff probe', () => {
   assert.match(scheduler, /terminalPreviewHandoffWakeRafRef\.current/);
   assert.match(scheduler, /requestAnimationFrame\(/);
   assert.match(scheduler, /setTerminalPreviewHandoffWakeSeq/);
-  assert.match(scheduler, /presentationVisit/);
-  assert.match(scheduler, /ownerGeneration/);
+  assert.match(scheduler, /pending\.ownerKey !== historyOwnerKeyRef\.current/);
+  assert.doesNotMatch(scheduler, /captureHistoryTerminalPreviewHandoffAnchor/,
+    'an imperative wake cannot capture geometry or grant the old generation writes');
   assert.equal(
     (scheduler.match(/requestAnimationFrame\(/g) || []).length,
     1,
@@ -190,9 +191,13 @@ test('a newly presented persistent pane wakes a hidden canonical handoff', () =>
     'const scheduleTerminalPreviewHandoffWake =',
     '// Terminal bytes can appear before Claude\/Codex',
   );
-  assert.match(scheduler, /pending\.presentationVisit !== presentation\.visit/);
-  assert.match(scheduler, /TERMINAL_PREVIEW_HANDOFF_REBASE/);
   assert.match(scheduler, /terminalPreviewPresentationWakeRef\.current = scheduleTerminalPreviewHandoffWake/);
+  const layout = sliceFrom('const rebase = historyTerminalPreviewHandoffRebaseVerdict', 'const ownsWrite =');
+  assert.match(layout, /presentationVisit: presentation\.visit/);
+  assert.match(layout, /canonicalInPresentation: !!canonicalEntry/);
+  assert.match(layout, /canonicalTextHash: canonicalHash/);
+  assert.match(layout, /ownerGeneration: historyOwnerGenerationRef\.current/);
+  assert.match(layout, /TERMINAL_PREVIEW_HANDOFF_REBASE/);
 });
 
 test('the removed second-bottom subsystem cannot be wired back accidentally', () => {

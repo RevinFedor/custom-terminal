@@ -427,6 +427,19 @@ function verifyCodexNextLaunchSettings({
   };
 }
 
+function projectCodexSendStartupWait({
+  payload, terminal, lifecycleGeneration, runSeq, commandRunning,
+  stopping = false, inputReady = false, timeoutMs,
+} = {}) {
+  if (!terminal || !payload?.launchId || !lifecycleGeneration || !commandRunning
+    || stopping || inputReady || payload.terminalToken !== terminal
+    || payload.lifecycleGeneration !== lifecycleGeneration || payload.runSeq !== runSeq
+    || !Number.isFinite(payload.startedAt) || payload.startedAt <= 0
+    || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return null;
+  return { launchId: payload.launchId, lifecycleGeneration, startedAt: payload.startedAt,
+    deadlineAt: payload.startedAt + timeoutMs };
+}
+
 function shouldSurfaceCodexStartupTimeout({
   expectedLaunchId = null,
   currentLaunchId = null,
@@ -1479,6 +1492,7 @@ module.exports = {
   projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  projectCodexSendStartupWait,
   resolveCodexReadIdentity,
   resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,

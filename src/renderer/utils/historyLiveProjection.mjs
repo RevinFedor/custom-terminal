@@ -530,11 +530,14 @@ export function reconcileCommittedHistoryLiveProjection(liveEntries, durableEntr
  * turns live → durable into an in-place React update instead of two competing
  * DOM surfaces.
  */
+const isCodexInterruptionEntry = entry => entry?.role === 'interrupted' && entry.serviceCarrier === 'turn-aborted'
+  && String(entry.sourceIdentity || '').startsWith('codex-interrupted-source-');
+
 function retainSettingsPresentationKeys(entries, keys) {
   if (!keys) return entries;
   let changed = false;
   const next = entries.map(entry => {
-    if (!codexSettingFact(entry) || !entry.sourceIdentity) return entry;
+    if ((!codexSettingFact(entry) && !isCodexInterruptionEntry(entry)) || !entry.sourceIdentity) return entry;
     const identities = historyLivePresentationIdentities(entry);
     const key = identities.map(id => keys.get(id)).find(Boolean) || 'source:' + entry.sourceIdentity;
     // Remember only an actually presented primary, not every historical alias.
@@ -542,7 +545,7 @@ function retainSettingsPresentationKeys(entries, keys) {
     keys.set(entry.sourceIdentity, key);
     if (key === 'source:' + entry.sourceIdentity) return entry;
     changed = true;
-    return { ...entry, settingsPresentationKey: key };
+    return { ...entry, [isCodexInterruptionEntry(entry) ? 'servicePresentationKey' : 'settingsPresentationKey']: key };
   });
   return changed ? next : entries;
 }
@@ -596,9 +599,12 @@ function buildHistoryLivePresentationBase(durableEntries, liveEntries) {
   });
   if (unmatchedLive.length === 0) return durable;
 
-  // A prompt submitted while the current turn is busy remains the final
-  // presentation barrier until it actually crosses Enter. Everything already
-  // streamed belongs before that still-deferred prompt.
+  // Application backlog and a prompt sent during the current busy turn stay
+  // after that turn until consumption is confirmed. A restored receipt may
+  // lack the click-time status; that is not evidence that it owns the current
+  // live answer. Keep unconfirmed unknown input at the same waiting boundary.
+  // Known active sends retain their own response order, and exact SENT rows
+  // use physical transcript positions below.
   const deferredPromptIndex = durable.findIndex((entry) =>
     entry?.role === 'queued'
     // A finished local attempt remains visible, but is no longer future input.
@@ -607,10 +613,15 @@ function buildHistoryLivePresentationBase(durableEntries, liveEntries) {
     && entry?.queueStatus !== 'failed'
     && entry?.queueStatus !== 'cancelled'
     && (
-      entry?.queueStatus === 'queued'
+      entry?.queueStatus === 'application-queued'
+      || entry?.queueStatus === 'queued'
       || (
         entry?.statusAtSend === 'busy'
         && entry?.queueStatus !== 'sent'
+      )
+      || (
+        (entry?.statusAtSend == null || entry?.statusAtSend === 'unknown')
+        && ['preparing', 'sending', 'audit-pending', 'delivery-unknown'].includes(entry?.queueStatus)
       )
     )
   );
@@ -757,6 +768,7 @@ function buildHistoryLivePresentationBase(durableEntries, liveEntries) {
 export function historyLivePresentationKey(entry) {
   if (entry?.rewriteRenderKey) return entry.rewriteRenderKey;
   if (entry?.settingsPresentationKey) return entry.settingsPresentationKey;
+  if (entry?.servicePresentationKey) return entry.servicePresentationKey;
   const sourceIdentity = String(entry?.sourceIdentity || '');
   // Assistant and compact rows have a live → durable replacement in this
   // projection.
@@ -769,6 +781,7 @@ export function historyLivePresentationKey(entry) {
       entry?.role === 'assistant'
       || entry?.role === 'compact'
       || entry?.role === 'goal'
+      || isCodexInterruptionEntry(entry)
       || !!codexSettingFact(entry)
       || sourceIdentity.startsWith('claude-queue:')
     )
@@ -920,7 +933,7 @@ export function reduceHistoryLiveProjection(
     envelope?.type === 'history_entry'
     && isObject(envelope.entry)
     && (envelope.entry.role === 'compact' || envelope.entry.role === 'goal'
-      || (envelope.toolType === 'codex' && !!codexSettingFact(envelope.entry)))
+      || (envelope.toolType === 'codex' && (!!codexSettingFact(envelope.entry) || isCodexInterruptionEntry(envelope.entry))))
     && typeof envelope.entry.uuid === 'string'
   ) {
     const entry = {

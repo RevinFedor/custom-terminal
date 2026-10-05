@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Server, RotateCw } from 'lucide-react';
+import { Server, RotateCw, Cloud, Terminal, Puzzle, Loader2 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
+import { externalMcpServers, mcpCatalogErrorMessage } from '../../utils/mcpCatalogPresentation.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -29,6 +30,24 @@ type HubStatus = {
   down?: boolean;
 };
 
+type CodexMcpServer = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  source: 'config' | 'plugin';
+  pluginName?: string;
+  transport: 'http' | 'stdio' | 'plugin' | 'unknown';
+  address: string | null;
+  hubServer: string | null;
+};
+
+type CodexMcpCatalog = {
+  servers: CodexMcpServer[];
+  fetchedAt: string | null;
+  stale: boolean;
+  error: string | null;
+};
+
 function formatUptime(startedAt: number | null): string {
   if (!startedAt) return '—';
   const sec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
@@ -42,11 +61,14 @@ function formatUptime(startedAt: number | null): string {
 // живы, янтарная — часть упала, красная — хаб недоступен. Панель показывает
 // каждый сервер с аптаймом и кнопкой рестарта. Опрос идёт только пока панель
 // открыта (или раз в 30с для цвета точки — дешёвый fetch статуса).
-const McpHubButton: React.FC = () => {
+const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
   const [open, setOpen] = useState(false);
   const [status, setStatus] = useState<HubStatus | null>(null);
   const [restarting, setRestarting] = useState<string | null>(null);
   const [restartError, setRestartError] = useState<string | null>(null);
+  const [catalog, setCatalog] = useState<CodexMcpCatalog | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const catalogScopeRef = useRef<string | null>(cwd);
   const restartInFlight = useRef(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -66,6 +88,34 @@ const McpHubButton: React.FC = () => {
   }, [open, refresh]);
 
   useEffect(() => {
+    if (catalogScopeRef.current !== cwd) {
+      catalogScopeRef.current = cwd;
+      setCatalog(null);
+    }
+    if (!open) return;
+    let cancelled = false;
+    let reading = false;
+    const read = async () => {
+      if (reading) return;
+      reading = true;
+      setCatalogLoading(true);
+      try {
+        const next = await ipcRenderer.invoke('mcp-hub:codex-catalog', { cwd });
+        if (!cancelled) setCatalog(next);
+      } catch {
+        if (!cancelled) setCatalog(previous => ({ servers: previous?.servers || [],
+          fetchedAt: previous?.fetchedAt || null, stale: true, error: 'catalog_unavailable' }));
+      } finally {
+        reading = false;
+        if (!cancelled) setCatalogLoading(false);
+      }
+    };
+    void read();
+    const timer = setInterval(read, 3000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [open, cwd]);
+
+  useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
       const t = e.target as Node;
@@ -83,6 +133,8 @@ const McpHubButton: React.FC = () => {
   }, [open]);
 
   const servers = status?.servers || [];
+  const visibleCatalog = catalogScopeRef.current === cwd ? catalog : null;
+  const externalServers: CodexMcpServer[] = externalMcpServers(visibleCatalog);
   const isReady = (server: HubServer) => server.up && server.initialized && !server.recovering;
   const readyCount = servers.filter(isReady).length;
   const allUp = !status?.down && servers.length > 0 && readyCount === servers.length;
@@ -114,7 +166,7 @@ const McpHubButton: React.FC = () => {
 
   return (
     <>
-      <Tooltip content="Общий MCP-бэкенд: один процесс каждого сервера на все AI-вкладки">
+      <Tooltip content="Общий MCP-хаб и внешние подключения Codex">
         <button
           ref={buttonRef}
           aria-label="Статус MCP-хаба"
@@ -163,6 +215,8 @@ const McpHubButton: React.FC = () => {
               background: 'rgba(24,24,27,0.98)',
               borderColor: 'rgba(255,255,255,0.12)',
               color: '#d4d4d8',
+              maxHeight: 'min(560px, calc(100vh - 80px))',
+              overflowY: 'auto',
             }}
           >
             <div className="mb-2 flex items-center justify-between">
@@ -188,7 +242,7 @@ const McpHubButton: React.FC = () => {
               onClick={() => restart()}
             >
               <RotateCw size={12} className={restarting === '__hub__' ? 'animate-spin' : ''} />
-              {restarting === '__hub__' ? 'Перезапускаю MCP…' : status?.down ? 'Восстановить все MCP' : 'Перезапустить все MCP'}
+              {restarting === '__hub__' ? 'Перезапускаю хаб…' : status?.down ? 'Восстановить хаб' : 'Перезапустить MCP хаба'}
             </button>
             {restartError && (
               <div role="alert" className="mb-2 rounded border p-2 text-[11px] break-words"
@@ -233,6 +287,39 @@ const McpHubButton: React.FC = () => {
                 Активных клиентов-вкладок: {status?.clients?.length ?? 0}
               </div>
             )}
+
+            <section className="mt-2 border-t pt-2" aria-label="Внешние MCP Codex"
+              style={{ borderColor: 'rgba(255,255,255,0.08)' }}>
+              <div className="mb-1 flex items-center gap-1.5 text-[11px]" style={{ color: '#a1a1aa' }}>
+                <span title={cwd || undefined}>Codex · конфигурация</span>
+                {catalogLoading && !visibleCatalog && <Loader2 size={11} className="animate-spin noted-infinite-animation" />}
+              </div>
+              {visibleCatalog?.error && (
+                <div role="status" className="mb-1 text-[11px]" style={{ color: '#fbbf24' }}>
+                  {mcpCatalogErrorMessage(visibleCatalog.error)}
+                </div>
+              )}
+              {externalServers.map(server => {
+                const Icon = server.transport === 'http' ? Cloud : server.source === 'plugin' ? Puzzle : Terminal;
+                return (
+                  <div key={server.id} className="flex items-center gap-2 rounded px-1 py-[3px]"
+                    style={{ opacity: server.enabled ? 1 : 0.6 }}
+                    title={[server.address, server.pluginName ? 'Плагин: ' + server.pluginName : null].filter(Boolean).join(' · ')}>
+                    <Icon size={12} className="flex-none" style={{ color: '#71717a' }} />
+                    <span className="min-w-0 flex-1 truncate font-mono text-[11px]" style={{ color: '#e4e4e7' }}>{server.name}</span>
+                    <span className="flex-none text-[11px]" style={{ color: '#71717a' }}>
+                      {server.enabled ? 'настроен' : 'отключён'}
+                    </span>
+                  </div>
+                );
+              })}
+              {visibleCatalog && !visibleCatalog.error && !externalServers.length && (
+                <div className="px-1 py-1 text-[11px]" style={{ color: '#71717a' }}>Нет внешних MCP</div>
+              )}
+              <div className="mt-1 text-[10px]" style={{ color: '#71717a' }}>
+                Активные подключения вкладки: /mcp
+              </div>
+            </section>
           </div>
         </Portal>
       )}

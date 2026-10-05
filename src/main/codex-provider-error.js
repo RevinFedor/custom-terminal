@@ -1,5 +1,7 @@
 'use strict';
 
+const { CODEX_MODEL_CAPACITY_MESSAGE } = require('./codex-model-capacity-state');
+
 // Only the durable terminal event owns this notice. Neither a quoted error in
 // user/assistant prose nor a transient network error terminates a conversation.
 function codexProviderErrorEntry(record, fallbackSessionId, turnIndex = undefined) {
@@ -18,6 +20,7 @@ function codexProviderErrorEntry(record, fallbackSessionId, turnIndex = undefine
   if (!Number.isFinite(position)) return null;
   const revoked = /refresh token[\s\S]{0,120}\brevoked\b|please log out and sign in again/i.test(message);
   const content = usageLimit ? 'Usage limit reached'
+    : code === 'server_overloaded' && message === CODEX_MODEL_CAPACITY_MESSAGE ? message
     : revoked ? 'Codex: вход недействителен. Войдите в аккаунт снова.'
     : 'Codex: запрос завершился ошибкой провайдера.';
   return {

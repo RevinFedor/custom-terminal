@@ -4,6 +4,8 @@ import test from 'node:test';
 import { normalizeAgentSendOutcome } from './agentSendOutcome.mjs';
 
 test('normalizes only evidence-backed delivery outcomes', () => {
+  assert.equal(normalizeAgentSendOutcome({ applicationQueued: true, applicationQueue: { version: 1 },
+    accepted: true, submitted: false }), 'application-queued');
   assert.equal(normalizeAgentSendOutcome({
     success: true,
     submitted: true,

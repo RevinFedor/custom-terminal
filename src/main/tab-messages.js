@@ -12,6 +12,7 @@ const LIST_COLUMNS = `messageId, kind, replyTo,
   sourceTabId, sourceTabName, sourceProjectId, sourceProjectName, sourceProvider, sourceSessionId,
   targetTabId, targetTabName, targetProjectId, targetProjectName, targetProvider, targetSessionId,
   createdAt, updatedAt, deliveryState, error, code, replyMessageId, answeredAt,
+  sourceDismissedAt, targetDismissedAt,
   operationKey, handoffId, requestId`;
 const hash = (text) => createHash('sha256').update(text).digest('hex');
 const now = () => new Date().toISOString();
@@ -165,6 +166,7 @@ class TabMessageService {
       deliveryState TEXT NOT NULL CHECK(deliveryState IN
         ('pending','sending','queued','sent','waiting-for-input','unconfirmed','failed')),
       error TEXT, code TEXT, replyMessageId TEXT, answeredAt TEXT,
+      sourceDismissedAt TEXT, targetDismissedAt TEXT,
       operationKey TEXT NOT NULL UNIQUE, handoffId TEXT NOT NULL UNIQUE,
       requestId TEXT NOT NULL, requestFingerprint TEXT NOT NULL,
       frozenPrompt TEXT NOT NULL, promptPrepared INTEGER NOT NULL DEFAULT 0,
@@ -174,6 +176,12 @@ class TabMessageService {
     );
     CREATE INDEX IF NOT EXISTS tab_messages_target ON ${TABLE_NAME}(targetTabId, createdAt);
     CREATE INDEX IF NOT EXISTS tab_messages_source ON ${TABLE_NAME}(sourceTabId, createdAt);`);
+    this.db.transaction(() => {
+      const columns = new Set(this.db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all().map((column) => column.name));
+      for (const column of ['sourceDismissedAt', 'targetDismissedAt']) {
+        if (!columns.has(column)) this.db.exec(`ALTER TABLE ${TABLE_NAME} ADD COLUMN ${column} TEXT`);
+      }
+    })();
     this.initialized = true;
     this.initialization = (async () => {
       // A crash can leave the receipt pinned after the sent row was committed.
@@ -224,6 +232,31 @@ class TabMessageService {
       length(text) AS textChars FROM ${TABLE_NAME} WHERE sourceTabId = ? OR targetTabId = ?
       ORDER BY createdAt DESC, rowid DESC LIMIT ?`).all(id, id, limit)
       .map((message) => ({ ...message, textPreview: message.textPreview.slice(0, 200) }));
+  }
+
+  // Dismissal is per-tab presentation on the question, including for reply IDs.
+  // It neither needs a live session nor participates in transport transitions.
+  dismissMessage({ tabId: id, messageId }) {
+    this._assertReady();
+    required(id, 'tabId');
+    required(messageId, 'messageId');
+    const result = this.db.transaction(() => {
+      let row = this._row(messageId);
+      if (row?.kind === 'reply') row = this._row(row.replyTo);
+      if (!row) throw new TabMessageError('tab_message_not_found', 'The question does not exist', 404);
+      const column = row.sourceTabId === id ? 'sourceDismissedAt'
+        : row.targetTabId === id ? 'targetDismissedAt' : null;
+      if (!column) {
+        throw new TabMessageError('tab_message_foreign_participant', 'Only an involved tab may dismiss this question', 403);
+      }
+      if (row[column]) return { row, deduplicated: true };
+      const timestamp = updatedAfter(row.updatedAt);
+      this.db.prepare(`UPDATE ${TABLE_NAME} SET ${column} = ?, updatedAt = ? WHERE messageId = ?`)
+        .run(timestamp, timestamp, row.messageId);
+      return { row: this._row(row.messageId), deduplicated: false };
+    })();
+    if (!result.deduplicated) this._changed(result.row, 'dismissed');
+    return { message: publicMessage(result.row), deduplicated: result.deduplicated };
   }
 
   async _resolve(value, allowResume = false) {
@@ -363,6 +396,8 @@ class TabMessageService {
         operationKey: row?.operationKey || null, sourceTabId: row?.sourceTabId || null,
         targetTabId: row?.targetTabId || null, sourceSessionId: row?.sourceSessionId || null,
         targetSessionId: row?.targetSessionId || null, deliveryState: row?.deliveryState || null,
+        sourceDismissedAt: row?.sourceDismissedAt || null, targetDismissedAt: row?.targetDismissedAt || null,
+        updatedAt: row?.updatedAt || null,
         sourceProvider: row?.sourceProvider || null, targetProvider: row?.targetProvider || null,
         attemptCount: row?.attemptCount || 0,
         textLength: row?.text?.length || 0, textHash: row ? hash(row.text) : null,

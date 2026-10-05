@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { ArrowLeftRight, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search } from 'lucide-react';
+import { ArrowLeftRight, BringToFront, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search } from 'lucide-react';
 import {requestHistorySearch} from '../../utils/historySearchMarkers';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { useUIStore } from '../../store/useUIStore';
+import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
+import { terminalRegistry } from '../../utils/terminalRegistry';
+import { requestTerminalFullView } from '../../utils/terminalFullView.mjs';
 import {
   resolveSplitAttachRowHeight,
   resolveTabCardBottomOverhang,
@@ -17,9 +19,9 @@ import {
   paneTabs,
   normalizeSplitSizes,
   resizeFractions,
-  splitAvailability,
   splitDividerDescriptors, splitCornerDescriptors,
 } from '../../utils/splitPanesModel.mjs';
+import { windowSplitAvailability } from '../../utils/windowDisplayLayouts.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import PaneTabStrip from './PaneTabStrip';
 import MoveToWindowMenu, { WorkspaceWindowSwapPicker } from './MoveToWindowMenu';
@@ -171,6 +173,7 @@ export function SplitPaneAttachRow({
 }: AttachRowProps) {
   const splitPanes = useWorkspaceStore((s) => paneLayout || s.splitPanes);
   const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
+  const sideTerminalShown = useUIStore(s => !!s.sideTerminalOpenTabs[tabId] && !resolveTabTerminalPrimary(s, tabId));
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
   // Window actions remain in the ellipsis menu; wrapping is unconditional.
   const [stripMenu, setStripMenu] = useState<{ x: number; y: number } | null>(null);
@@ -217,7 +220,8 @@ export function SplitPaneAttachRow({
   // control that vanishes reads as a bug ("кнопка пропала"), a greyed one with
   // a tooltip states the rule. Each direction is asked about separately —
   // three columns full does not mean this column cannot still be stacked.
-  const splitCan = splitAvailability(splitPanes, paneIndex ?? null);
+  const splitCan = windowSplitAvailability(splitPanes, paneIndex ?? null);
+  const hasHiddenWindows = splitPanes.some(pane => pane.displayHidden);
   const inSplit = splitPanes.length > 0;
   const toggleStripMenuFromButton = (button: HTMLElement) => {
     if (ownsWorkspaceSwapPicker) {
@@ -504,29 +508,31 @@ export function SplitPaneAttachRow({
       }}
     >
     <div style={{
-      display: 'flex',
-      // В переносе строки чипов заполняются сверху вниз, и кнопки окна стоят у
-      // ПЕРВОЙ строки, а не по центру выросшей коробки.
-      alignItems: 'flex-start',
-      gap: 6,
+      // A browser formatting context contains the action float. Inline tab
+      // boxes wrap beside its first row, then use the entire pane width.
+      display: 'flow-root',
       minWidth: 0,
       position: 'relative',
     }}>
-      {/* The strip: project icon per RUN of same-project chips, then the chips.
-          The icon labels a run rather than riding on every chip — with one icon
-          per chip it sits BETWEEN two of them and it is unreadable which of the
-          two it belongs to. */}
-      <PaneTabStrip
-        entries={entries}
-        shownTabId={vacant ? '' : tabId}
-        focused={focused}
-        paneIndex={paneIndex ?? null}
-        inSplit={inSplit}
-        onCreateTab={onCreateTab || createTabInThisWindow}
-        slots={slots}
-        selectedSlotId={selectedSlotId}
-        sharedActivity={sharedActivity}
-      />
+      {/* The focus-only buttons keep their width even while hidden. This
+          right float reserves only ONE row; a flex sibling would take that
+          width away from every wrapped row below it. */}
+      <div
+        data-split-pane-actions
+        style={{
+          position: 'relative',
+          float: 'right',
+          marginLeft: 6,
+          flexShrink: 0,
+          height: chipH,
+          display: 'flex',
+          // Кнопки — РОСТОМ С ЧИП, как вкладки рядом: своя высота внутри более
+          // высокой строки оставляла воздух, и подсветка при наведении вставала
+          // отдельной коробкой посреди шапки.
+          alignItems: 'stretch',
+          gap: 2,
+        }}
+      >
 
       {/* «Нет вкладки» — это ответ на вопрос «что здесь показано», и он верен
           ровно до тех пор, пока показывать действительно нечего. Открытая
@@ -594,46 +600,6 @@ export function SplitPaneAttachRow({
         </div>
       )}
 
-      {/* Действия окна — один flex-ряд у правого края, сосед полосы. Сам ряд
-          живёт всегда. Скрытый focus-блок остаётся в потоке как прозрачный
-          резерв: кнопки гаснут, а переносы чипов не пересчитываются.
-
-          Внутри ряда — два РАЗНЫХ по смыслу блока:
-            • Git + деление — про рабочее место и видны только у focus-owner;
-              их ширина всегда зарезервирована;
-            • три точки — действия окна, и это
-              вопрос к любому окну, а не только к рабочему. Видимы всегда и
-              стоят последними, замыкая правый край. */}
-      <div
-        data-split-pane-actions
-        style={{
-          // В ПОТОКЕ, а не слоем поверх полосы (2026-08-20, вторая итерация).
-          // Слой поверх давал три бага разом: чип уезжал ПОД кнопки («вкладка
-          // должна оканчиваться там, где начинается компонент гита»), колесо
-          // полосы молчало — её scrollWidth ≤ clientWidth, потому что
-          // clientWidth включал закрытую кнопками часть, и полоса «думала»,
-          // что прокручивать нечего, — а подложка рисовала вторую вертикальную
-          // границу с отступом слева от собственной рамки Git. Юзер: «он,
-          // наверное, всегда должен быть блочным, по логике».
-          //
-          // Ряд — обычный сосед полосы: не сжимается, чипы заканчиваются на
-          // его левом крае, видимой области полосы соответствует её clientWidth
-          // без поправок. Фокус меняет только paint/hit-testing внутреннего
-          // ряда; геометрия wrap стабильна. `⋮` и внешний ряд остаются.
-          position: 'relative',
-          flexShrink: 0,
-          // Ростом с ОДИН чип: в переносе шапка выше на столько строк, сколько
-          // заняли чипы, и кнопки во всю её высоту стали бы колонкой.
-          height: chipH,
-          display: 'flex',
-          // Кнопки — РОСТОМ С ЧИП, как вкладки рядом: своя высота внутри более
-          // высокой строки оставляла воздух, и подсветка при наведении вставала
-          // отдельной коробкой посреди шапки.
-          alignItems: 'stretch',
-          gap: 2,
-        }}
-      >
-
       {/* Git follows the focused window from the application titlebar.
           The remaining focus actions retain their geometry reservation.
           Скрытый блок остаётся relative/hidden: место
@@ -656,16 +622,35 @@ export function SplitPaneAttachRow({
           pointerEvents: focusActionsVisible ? 'auto' : 'none',
         }}
       >
+      {/* This header is outside the translated/clipped terminal stage. A side
+          panel can fit its minimum grid while still losing its own titlebar. */}
+      {sideTerminalShown && !vacant && <button type="button"
+        data-terminal-full-view-open={tabId}
+        aria-label="Показать терминал поверх окон" title="Показать терминал поверх окон"
+        onPointerDown={event => { event.preventDefault(); event.stopPropagation(); }}
+        onClick={event => {
+          event.stopPropagation();
+          useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+          const terminal = terminalRegistry.get(tabId)?.element
+            || document.querySelector(`[data-floating-terminal-tab-id="${CSS.escape(tabId)}"][data-floating-terminal-side="1"]`);
+          requestTerminalFullView(terminal, tabId);
+        }}
+        style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:22,alignSelf:'stretch',padding:0,
+          border:0,borderRadius:4,background:'transparent',color:'#a78bfa',cursor:'pointer'}}>
+        <BringToFront size={14} />
+      </button>}
       {/* Split remains mounted and visible in every pane. `splitCan` changes
           only whether the action is available; it never changes geometry. */}
       <button
         data-split-button
         data-split-horizontal={splitCan.horizontal ? '1' : '0'}
         data-split-vertical={splitCan.vertical ? '1' : '0'}
-        // Количество панелей больше не ограничено (2026-08-17), поэтому
-        // единственная оставшаяся причина отказа — незаполненная пустая панель.
+        // A free split slot is filled from hidden inventory first. Without
+        // hidden windows, an unfilled slot still blocks another empty one.
         title={splitCan.horizontal || splitCan.vertical
-          ? 'Разделить рабочую область. Правый клик — разделить по горизонтали'
+          ? hasHiddenWindows
+            ? 'Показать скрытое окно рядом. Правый клик — выбрать сторону'
+            : 'Разделить рабочую область. Правый клик — разделить по горизонтали'
           : 'Сначала выберите вкладку для пустой панели'}
         onClick={(e) => {
           e.stopPropagation();
@@ -793,6 +778,22 @@ export function SplitPaneAttachRow({
         <MoreVertical size={13} />
       </button>
       </div>
+      {/* The strip: project icon per RUN of same-project chips, then the chips.
+          The icon labels a run rather than riding on every chip — with one icon
+          per chip it sits BETWEEN two of them and it is unreadable which of the
+          two it belongs to. */}
+      <PaneTabStrip
+        entries={entries}
+        shownTabId={vacant ? '' : tabId}
+        focused={focused}
+        paneIndex={paneIndex ?? null}
+        inSplit={inSplit}
+        onCreateTab={onCreateTab || createTabInThisWindow}
+        slots={slots}
+        selectedSlotId={selectedSlotId}
+        sharedActivity={sharedActivity}
+      />
+
       </div>
 
       {/* Строки пути здесь больше нет (2026-08-20): она занимала целую строку

@@ -49,7 +49,8 @@ const settingsContract = fs.readFileSync(
 test('shared History/API/Queue prompt callers enter the tab-scoped intent sequencer', () => {
   assert.match(source, /function runAgentPromptScenario\(/);
   assert.match(source, /export function sendAgentPromptScenario[\s\S]*enqueueAgentSendScenario\(\{/);
-  assert.match(source, /result = await runAgentPromptScenario\(args\)/);
+  assert.match(source, /result = await runAgentPromptScenario\(\{ \.\.\.args, prompt: context\.prompt \}\)/);
+  assert.match(source, /ipcRenderer\.invoke\('agent:enqueue-prompt', request\)/);
   assert.match(source, /createAgentSendAdapter\(/);
   assert.match(source, /return runAgentSendFlow\(\{/);
   assert.match(queueRunner, /return sendAgentPromptScenario\(\{/,

@@ -28,6 +28,14 @@ prompt не являются этим исключением и получают
 Копирование и Rewind сохраняют идентификатор обновления вместе с текстом.
 Обычные библиотечные промпты сохраняют своё оформление.
 
+При вставке копии сообщения учитывается уже ожидающий pending update по его
+ID/member ID и точному содержимому. Совпавший чип второй раз не добавляется;
+изменённая версия остаётся отдельным вложением, а dismissed update не считается
+присутствующим в composer. Paste не подтверждает доставку и не потребляет pending
+update. Асинхронный импорт изображения сверяет актуальный контекст исходной вкладки
+в момент завершения, а не snapshot до начала копирования. См.
+`fact-clipboard-tools.md::Копия сообщения обратно в History composer`.
+
 Явный `publish_context_update` предназначен для другой вкладки. При совпадении
 получателя с известным отправителем MCP отклоняет вызов до HTTP; main также
 возвращает `context_update_self_target` (400), не создавая update и не меняя
@@ -329,6 +337,13 @@ Terminal MCP:
 
 HTTP: `GET /api/tab-contexts`, `GET /api/terminal-tabs/:id/work-context`,
 `POST .../work-context/responsibility`, `POST .../work-context/updates`.
+Для native карточек есть отдельная read-проекция того же owner: `summaries`
+возвращает revision/count без texts, file reads и syncLinks. Она сохраняет
+grouped-file семантику `presentUpdates`: несколько валидных pending file members
+дают один count, sending не участвует. SOURCE05.10 передаёт это внутри общего
+`cardSignals` у `/api/projects/:id/tabs`; прежний onChanged будит coalesced
+project-activity metadata, а не запускает агент. Полный work-context API и
+delivery membership не меняются. Wire/ordering — `fact-mobile-web.md`.
 Skill `terminal` и общий `claude-dev/02-instructions.md`, step 6, задают
 порядок работы агента. При начале/возобновлении он получает собственную
 актуальную ответственность и список рабочих файлов, если их ещё нет в

@@ -84,7 +84,12 @@ test('вкладка живёт в одном окне: чип — не копи
 });
 
 test('полоса окна всегда переносит вкладки без скрытого горизонтального ряда', () => {
-  assert.match(strip, /flexWrap: 'wrap'/);
+  // Inline places wrap around the first-row action float. Keeping the former
+  // flex container would reinstate a reserved right column on every row.
+  assert.match(strip, /data-pane-tab-strip-wrap="true"/);
+  const flow=strip.slice(strip.indexOf('data-pane-tab-strip-scroller'),strip.indexOf('{renderItems.map'));
+  assert.match(flow, /display: 'block'/);
+  assert.doesNotMatch(flow, /display: 'flex'|whiteSpace: 'nowrap'/);
   assert.match(strip, /overflowX: 'clip'/);
   assert.doesNotMatch(strip, /data-strip-overflow|onWheel=|onScroll=/);
 });

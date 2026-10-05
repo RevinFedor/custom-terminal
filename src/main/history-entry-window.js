@@ -304,6 +304,7 @@ function makeHistoryRowStub(entry) {
   if (entry.sourceIdentityAliases !== undefined) {
     stub.sourceIdentityAliases = entry.sourceIdentityAliases;
   }
+  if (entry.serviceCarrier !== undefined) stub.serviceCarrier = entry.serviceCarrier;
   // A short caption belongs to its action group, while a long reply is a
   // boundary. Keep its exact trimmed length: hasContent alone changes that
   // decision when an old row leaves the hydration span, reindexing everything

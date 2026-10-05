@@ -3,6 +3,7 @@
 const path = require('node:path');
 const { buildCodexImagePastePlan } = require('./codex-image-transport');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { attachmentProjectionSourceRecord } = require('./owned-mobile-attachments');
 
 const KIND = 'codex-image-path-aliases';
 const SCOPE_FIELDS = ['tabId', 'handoffId', 'operationKey', 'attemptId'];
@@ -62,6 +63,7 @@ function createCodexImageRequestProjection({ requestText, transportText, segment
 // provider response. Recovery must establish this before transcript matching,
 // not manufacture a successful canonical result just to validate metadata.
 function validateCodexImageRequestProjection({ tabId, record, audit } = {}) {
+  record = attachmentProjectionSourceRecord(record);
   const proof = audit?.imageRequestProjection;
   const refused = reason => ({ valid: false, reason });
   if (!proof || proof.kind !== KIND || proof.version !== 1) return refused('image-request-projection-missing');
@@ -112,6 +114,8 @@ function validateCodexImageRequestProjection({ tabId, record, audit } = {}) {
 }
 
 function readPersistedCodexImageRequestProjection(record) {
+  record = attachmentProjectionSourceRecord(record);
+  if (!record) return { valid: false, reason: 'attachment-projection-invalid' };
   const receipt = record?.receipt || {};
   const refused = reason => ({ valid: false, reason });
   if (receipt.operationKey !== record.operationKey || receipt.attemptId !== record.attemptId) {

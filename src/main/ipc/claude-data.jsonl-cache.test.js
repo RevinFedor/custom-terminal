@@ -89,6 +89,24 @@ test('incremental append preserves the existing Map and adds only new records', 
   assert.equal(_api.getJsonlCacheStats().rawBytes, fs.statSync(filePath).size);
 });
 
+test('same-size replacement with preserved mtime cannot certify the previous parsed Claude records', async () => {
+  const filePath = path.join(tempDir, 'source.jsonl');
+  const firstText = JSON.stringify({ uuid: 'user-A', type: 'user', message: { content: 'AAAA' } }) + '\n';
+  const nextText = firstText.replace('AAAA', 'BBBB');
+  fs.writeFileSync(filePath, firstText);
+  const first = await loadJsonlRecords(filePath); const before = fs.statSync(filePath);
+  const replacement = path.join(tempDir, 'replacement'); fs.writeFileSync(replacement, nextText);
+  fs.utimesSync(replacement, before.atime, before.mtime); fs.renameSync(replacement, filePath);
+  const changed = await loadJsonlRecords(filePath);
+  assert.equal(changed.recordMap.get('user-A').message.content, 'BBBB');
+  assert.notEqual(changed.sourceSnapshot.fileIdentity, first.sourceSnapshot.fileIdentity);
+  fs.writeFileSync(filePath, nextText.replace('BBBB', 'CCCC'));
+  fs.utimesSync(filePath, before.atime, before.mtime);
+  const rewritten = await loadJsonlRecords(filePath);
+  assert.equal(rewritten.recordMap.get('user-A').message.content, 'CCCC');
+  assert.ok(Number.isFinite(rewritten.sourceSnapshot.ctimeMs));
+});
+
 test('full and incremental parses preserve exact UTF-8 byte offsets', async () => {
   const sessionId = 'byte-offset-session';
   const filePath = path.join(tempDir, sessionId + '.jsonl');

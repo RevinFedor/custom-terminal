@@ -46,11 +46,82 @@ function harness(toolType = 'codex') {
       sessionId: 'S', requestedStatusAtSend: 'active', coordinatedSendToken: 1 }),
     setState: value => { state = value; },
     advance: ms => { now += ms; },
+    wakeAt: async time => { now = time; for (const timer of [...timers.values()]) timer.callback(); await tick(); },
     cancel: () => { cancelled = true; cancelWake(); },
     expire: async () => { now = 30001; for (const timer of [...timers.values()]) timer.callback(); await tick(); },
     get reads() { return reads; }, get resumes() { return resumes; },
   };
 }
+
+const startupSnapshot = (launchId = 'L') => ({ launchId, lifecycleGeneration: 'G',
+  sendTarget: { toolType: 'codex', sessionId: 'S', launchId },
+  startupWait: { launchId, lifecycleGeneration: 'G', startedAt: 1000, deadlineAt: 61000 } });
+
+test('cold Codex Send survives the old 30s limit and sends frozen context once on the same launch ready', async () => {
+  const h = harness();
+  h.setState({ status: 'starting', inputReady: false, runtimeSnapshot: startupSnapshot() });
+  let writes = 0, prepared = 0;
+  const frozen = Object.freeze({ text: 'original text and context', handoffId: 'H' });
+  const pending = runAgentSendFlow({ prepareContext: async () => { prepared++; return frozen; },
+    ensureReady: () => h.start(), proveComposer: async () => {}, runProviderOperation: async value => {
+      assert.strictEqual(value, frozen); writes++; return { success: true };
+    } });
+  await tick();
+  await h.wakeAt(30001);
+  assert.equal(writes, 0);
+  assert.equal(h.timers.size, 1);
+  assert.equal([...h.timers.values()][0].ms, 30999);
+  h.advance(2600);
+  h.setState({ status: 'active', inputReady: true,
+    runtimeSnapshot: { ...startupSnapshot(), startupWait: null } });
+  h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
+  await pending;
+  assert.equal(writes, 1); assert.equal(prepared, 1); assert.equal(h.resumes, 0);
+  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+});
+
+for (const status of ['stopping', 'inactive']) test('Stop during startup cancels without waiting for ready: ' + status, async () => {
+  const h = harness();
+  h.setState({ status: 'starting', inputReady: false, runtimeSnapshot: startupSnapshot() });
+  const rejected = assert.rejects(runAgentSendFlow({ prepareContext: async () => ({}), ensureReady: () => h.start(),
+    proveComposer: async () => assert.fail('no paste after stop'), runProviderOperation: async () => assert.fail('no Enter') }),
+  error => error.code === 'agent_send_cancelled' && error.sendReceipt.cancelled === true
+    && error.sendReceipt.pasteWritten === false);
+  await tick(); h.setState({ status, inputReady: false });
+  h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
+  await rejected;
+  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+});
+
+test('main launch failure ends preparation immediately, while a missing ready edge remains finitely bounded', async () => {
+  for (const failure of [true, false]) {
+    const h = harness();
+    h.setState({ status: 'starting', inputReady: false, runtimeSnapshot: startupSnapshot() });
+    const rejected = assert.rejects(h.start(), error => error.code === (failure
+      ? 'agent_send_startup_failed' : 'agent_send_readiness_timeout'));
+    await tick();
+    if (failure) {
+      h.setState({ status: 'starting', inputReady: false, startupFailed: true, startupError: 'launch failed' });
+      h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
+    } else await h.wakeAt(61001);
+    await rejected;
+    assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+  }
+});
+
+test('a replacement launch cannot extend or submit the previous startup send', async () => {
+  for (const ready of [false, true]) {
+    const h = harness();
+    h.setState({ status: 'starting', inputReady: false, runtimeSnapshot: startupSnapshot() });
+    const rejected = assert.rejects(h.start(), error => error.code === 'agent_send_target_changed');
+    await tick();
+    h.setState({ status: ready ? 'active' : 'starting', inputReady: ready,
+      runtimeSnapshot: { ...startupSnapshot('OTHER'), ...(ready ? { startupWait: null } : {}) } });
+    h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
+    await rejected;
+    assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+  }
+});
 
 for (const tool of ['codex', 'claude']) {
   test(tool + ': a live picker waits for current readiness, not another process-start event', async () => {

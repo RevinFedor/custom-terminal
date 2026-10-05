@@ -90,7 +90,7 @@ test('карта Run After ведёт к уже размещённой вкла�
   const node = between(
     globalRunAfter,
     'function QueueTabNode(',
-    'type DependencyEdge =',
+    'function QueueBlock(',
   );
   assert.match(node, /const navigate = \(\) => \{[\s\S]{0,420}placeTab\(tab\.projectId, tab\.id\)/);
   assert.doesNotMatch(node, /const navigate = \(\) => \{[\s\S]{0,420}activateCenterTab/);

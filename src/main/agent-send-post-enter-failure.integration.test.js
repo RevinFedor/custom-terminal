@@ -149,6 +149,7 @@ function createHarness(t, options = {}) {
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance-A']]),
     terminalStopRevisions: new WeakMap(),
     terminalCommandState: new Map([[tabId, { runSeq: 4, isRunning: true }]]),
+    terminalCommandAdmission: require('./terminal-command-admission').createTerminalCommandAdmission(() => term),
     terminalInputRevisions: new Map([[tabId, 0]]),
     terminalProjects: new Map([[tabId, '/fixture/project']]),
     bridgeKnownSessions: new Map([[tabId, sessionId]]),

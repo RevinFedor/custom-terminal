@@ -19,6 +19,16 @@ Tab и tab-group используют общий mount-driven rename ref. Это
 ### AI auto-title по первому пользовательскому prompt
 Claude/Codex вкладка может получить человекочитаемое имя через встроенный prompt `tab-title` из Settings → AI. Prompt редактируемый пользователем; приложение только передаёт в Gemini первое **реальное** user-сообщение из Timeline/Codex rollout и применяет короткий ответ как название вкладки. Служебные команды (`#pack`, `#effort`, `#usage`, slash-команды модели/статуса/help/compact/exit и т.п.) не считаются первым prompt'ом — иначе вкладка получит название по настройке runtime, а не по задаче пользователя.
 
+По требованию03.10 стандартный prompt даёт короткую узнаваемую тему, обычно1–3слова,
+а не краткое содержание всех вопросов. Прежнее требование2–6слов провоцировало
+«выбор массажа и терминология», когда пользователю нужна метка «массаж».
+`\` или `/` отделяет только полезное уточнение (`history \ scroll`), `->` означает
+направление (`yougile -> sc-desk`), не заменяет произвольный союз. Слова-процессы
+и второстепенные вопросы не добавляются ради длины. Предпочтение32символам мягкое:
+узнаваемое имя продукта не обрезается. Default общий для seed/migration/renderer;
+точно прежний shipped text обновляется, собственные инструкции/model/name/files
+сохраняются. Это не автоматическое переименование уже существующих вкладок.
+
 Автоназвание — не постоянный watcher визуального Timeline, а одноразовый side-effect свежего запуска. При старте Claude/Codex launch-path сначала создаёт `AiLaunchSnapshot`, затем явно помечает его `autoTitleEligible`, и при первом materialized session id store армит transient pending `{tabId, toolType, sessionId}`. App-global `AutoTabTitleCoordinator` подписывает точную сессию через общий `SessionTranscriptService` и читает durable JSONL/rollout headless: открыта ли Timeline, видна ли панель и идёт ли сейчас длинный ответ, на именование не влияют. Pending живёт только в памяти: restore из БД, Cmd+Shift+T, app restart и обычный `--resume` не переименовывают старую вкладку.
 
 Pending consume'ится только после terminal decision: успешного rename, manual-name skip, смены/очистки session id, закрытия вкладки, отклонённого запуска или другого честного terminal skip. Временного TTL до первого prompt больше нет: ответ может идти дольше десяти минут, а fresh-вкладка может оставаться фоновой сколько угодно. Gemini/API failure сам по себе не удаляет pending: сначала строится локальный fallback из первой содержательной строки prompt'а. Если ни AI, ни fallback не дают usable title, `generated-null` уже terminal skip. In-flight guard и trailing invalidation не дают параллельных генераций и не теряют append, пришедший во время чтения. Диагностический порядок: arm → coordinator subscribe → candidate → generator result/fallback → rename/skip → consume.
@@ -298,7 +308,18 @@ Status marker 8px (dot или square, sizePx 4..16) рисуется absolute н
 включённом persistent показана заполненная форма, иначе armed/fired показывают
 контурную. Полное выключение убирает маркер; acknowledgement сработавшего
 одноразового убирает его, но не стирает маркер сохраняемого persistent-режима.
-Правый слот освобождён от названия/карты окон и от process-bar. Сам значок
+Значок расположен absolute на правом верхнем углу: его центр **над центром
+правой3px process-bar**, а не слева перед полоской. При выборе левой полоски
+колокольчик всё равно остаётся справа. Высота прежняя; с04.10 под него не
+добавляется padding/spacer, в том числе постоянный. Переходы
+off/armed/persistent/fired и dismiss не двигают имя, карточку или её соседей.
+Уточнение05.10 исправило прежний внутренний right4px, из-за которого центр
+колокольчика отставал от правой полоски на8px. Просто вынести11px HTML-box
+наружу нельзя: у плотно упакованного picker появлялся horizontal scrollbar,
+менявший высоту окна. Anchor и SVG viewport теперь шириной полоски, а
+`xMidYMid slice`/visible overflow сохраняют полный11px рисунок как SVG ink,
+не расширяя scrollable area. Это один badge для sidebar/TabCard/Run After.
+Сам значок
 статичный: он сообщает режим, а прежняя рамка ниже — состояние unread completion.
 У обоих вариантов SVG прозрачная обёртка: цвет заливает только силуэт
 постоянного колокольчика, квадратной подложки вокруг значка нет.
@@ -313,6 +334,19 @@ One-shot (`completionNotificationArmed`) и fired-state (`completionNotification
 следующий busy-edge снова вооружает, поэтому полное выключение делается справа.
 
 Для native клиентов main держит только volatile mirror **сработавших** уведомлений: renderer посылает `tab-notification:fired` при semantic fired-edge и `tab-notification:cleared` при acknowledgement. Не переносить ownership armed/persistent в main: armed/persistent — состояние настройки и текущей вкладки в renderer/SQLite, а main mirror нужен только чтобы `/api/project-activity`, `/api/projects` и `/api/projects/:id/tabs` могли показать уже готовый unread-сигнал iOS без доступа к Zustand.
+
+04.10 native long-press получает те же два действия через отдельный capability-
+gated GET/POST `completion-notification`, не через перегруженный clear. Явный
+enabled не инвертирует режим при повторе. Persistent setter теперь возвращает
+promise прежней общей save-очереди: public success требует её строгого ACK и
+SQLite-проверки, не факта изменения Zustand. Ошибка записи не объявляет новый
+volatile intent долговечным и не откатывает более поздний desktop выбор.
+Read возвращает все четыре флага с capture-order версии renderer и отдельно
+storedPersistent/persistentDurable. Событие settings-changed только будит GET
+на tab/project-activity topics; оно не звонит и не создаёт второй mirror.
+При неизвестном POST исходе читается состояние, повтор настройки не планируется.
+GET — текущие флаги, не квитанция, доказывающая отмену старого запроса.
+Wire/границы — `fact-mobile-web.md::Удалённые настройки уведомления вкладки`.
 
 Natural completion определяется тем же outcome-языком, что Run-after: `busy:false` без reason (Claude/Gemini/SDK natural end) или `reason:'task_complete'` для Codex, когда есть непустой `last_agent_message` либо корневая assistant-запись `phase:'final_answer'` с явным `turn_id`, совпадающим с завершившимся turn. `codex-no-final-result`, `manual-stop`, `interrupt`, `turn_aborted`, `close`, `watchdog`, `local-command` и error-like reasons — только cleanup/liveness edges, они не должны звонить и не должны зажигать completed-сигнал. Это закрывает пользовательские симптомы «нажал Escape/ручную остановку, а уведомление всё равно пришло» и «Codex показал ошибку без ответа, но вкладка позвонила как готовая»: окончание работы ещё не доказывает результат.
 
@@ -499,6 +533,13 @@ Preview обновляет только renderer-state; persistence выполн
 Закрытый VR и технический отказ дают toast, без молчаливого fallback в clipboard.
 «Копировать сессию» и «Move to Project» из меню вкладки удалены по запросу26.09;
 перенос вкладки через DnD сохранён. Меню группы — отдельная поверхность.
+
+Полный ID — непрозрачный адрес, а не числовой индекс: `-tab-orchestration-`
+и `-tab-fork-` имеют непустой suffix, который не обязательно UUID. Numeric-only
+проверка на любой стороне Voice-транспорта даёт «Некорректный ID вкладки» для
+существующей вкладки, хотя Copy ID работает. Клиент, recording bridge и
+фиолетовая подсветка сохраняют весь ID; количество/длина, границы текста,
+запрет whitespace/control и exact recording ACK остаются отдельными guards.
 См. [диктовку](fact-dictation.md#id-вкладки-в-живую-запись-voice-record).
 
 ## Правый слот контекстного меню: «Стоп» или «Запустить»

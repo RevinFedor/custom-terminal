@@ -20,7 +20,13 @@ import {
   X,
 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
-import { TabMessageTracker } from './TabMessageTracker';
+import { TabMessagePreview, TabMessageRow, TabMessageTracker } from './TabMessageTracker';
+import type { MessageSelection } from './TabMessageTracker';
+import { useTabMessages } from '../../hooks/useTabMessages';
+import { useRequestDockLayout } from '../../hooks/useRequestDockLayout';
+import { tabMessageSuccessAt, tabMessageTimestamp, tabMessageVisibleInTracker } from '../../utils/tabMessageProjection';
+import { REQUEST_SUCCESS_VISIBLE_MS, nextRequestSuccessExpiry } from '../../utils/requestTrackerVisibility.mjs';
+import { RequestTrackerRow, RequestTrackerStatus, requestRowActionStyle, requestRowLinkStyle } from './RequestTrackerRow';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import type { OrchestrationRun, OrchestrationStatus } from '../../store/useOrchestrationStore';
 import { isOrchestrationResultProofPending } from '../../utils/orchestrationRunProjection.mjs';
@@ -40,6 +46,7 @@ type Props = {
   tabId: string;
   panelOpen: boolean;
   effectiveWidth: number;
+  queueVisible?: boolean;
 };
 
 const ACTIVE = new Set<OrchestrationStatus>([
@@ -53,7 +60,6 @@ const ACTIVE = new Set<OrchestrationStatus>([
   'waiting_recovery',
 ]);
 
-const SUCCESS_VISIBLE_MS = 4_000;
 const NOTIFICATION_ERRORS = new Set(['waiting-for-input', 'failed', 'unconfirmed']);
 
 const STATUS_LABEL: Record<OrchestrationStatus, string> = {
@@ -228,12 +234,11 @@ function StatusIcon({ presentation }: { presentation: RunPresentation }) {
     );
   }
   return (
-    <span
+    <RequestTrackerStatus
       data-orchestration-status-icon={presentation.icon}
-      style={{ width: 26, height: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 2, flexShrink: 0 }}
     >
       {icon}
-    </span>
+    </RequestTrackerStatus>
   );
 }
 
@@ -254,7 +259,7 @@ function minutes(ms: number): number {
   return Math.round(Math.max(0, ms) / 60_000);
 }
 
-export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Props) {
+export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queueVisible = panelOpen }: Props) {
   const [runs, setRuns] = useState<OrchestrationRun[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(() => new Set());
@@ -263,9 +268,29 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
   const [actionError, setActionError] = useState<Record<string, string>>({});
   const [now, setNow] = useState(Date.now());
   const rootRef = useRef<HTMLDivElement>(null);
+  const messagePreviewRef = useRef<HTMLElement>(null);
+  const messages = useTabMessages(tabId);
+  const [selectedMessage, setSelectedMessage] = useState<MessageSelection | null>(null);
+  const selectedThread = messages.threads.find(thread => thread.question.messageId === selectedMessage?.messageId);
+  const dock = useRequestDockLayout(rootRef, queueVisible, effectiveWidth);
+  const closeMessage = useCallback(() => setSelectedMessage(null), []);
+  const openMessage = useCallback((selection: MessageSelection) => {
+    setSettingsOpen(false);
+    setSelectedMessage(current => current?.messageId === selection.messageId ? null : selection);
+  }, []);
+  const dismissMessage = async (messageId: string) => {
+    if (await messages.dismiss(messageId)) {
+      setSelectedMessage(current => current?.messageId === messageId ? null : current);
+    }
+  };
 
   useEffect(() => {
     let alive = true;
+    setRuns([]);
+    setExpandedRunIds(new Set());
+    setHistoryOpen(false);
+    setSettingsOpen(false);
+    setSelectedMessage(null);
     void ipcRenderer.invoke('orchestration:list-for-tab', tabId)
       .then((items: OrchestrationRun[]) => {
         if (alive) {
@@ -307,16 +332,20 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
 
   useEffect(() => {
     if (!historyOpen && !settingsOpen) return;
+    // Read the child surface through a ref so its close cannot replace the
+    // parent's outside-click listener in the middle of the same event.
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (event.key === 'Escape' && !event.defaultPrevented && !messagePreviewRef.current) {
         setHistoryOpen(false);
         setSettingsOpen(false);
       }
     };
     const onMouseDown = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) {
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !messagePreviewRef.current?.contains(target)) {
         setHistoryOpen(false);
         setSettingsOpen(false);
+        closeMessage();
       }
     };
     document.addEventListener('keydown', onKeyDown);
@@ -325,18 +354,20 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
       document.removeEventListener('keydown', onKeyDown);
       document.removeEventListener('mousedown', onMouseDown);
     };
-  }, [historyOpen, settingsOpen]);
+  }, [historyOpen, settingsOpen, closeMessage]);
 
   const orderedRuns = useMemo(() => [...runs]
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)), [runs]);
-  const nextSuccessExpiry = useMemo(() => orderedRuns.reduce<number | null>((nearest, run) => {
-    const presentation = runPresentation(run, tabId);
-    const visibleAt = successVisibleAt(run);
-    if (presentation.icon !== 'success' || !visibleAt) return nearest;
-    const expiresAt = visibleAt + SUCCESS_VISIBLE_MS;
-    if (expiresAt <= Date.now()) return nearest;
-    return nearest === null || expiresAt < nearest ? expiresAt : nearest;
-  }, null), [orderedRuns, tabId]);
+  const historyEntries = useMemo(() => [
+    ...orderedRuns.map(run => ({ kind: 'run' as const, run, at: run.createdAt || 0, id: 'run:' + run.runId })),
+    ...messages.threads.map(thread => ({ kind: 'message' as const, thread,
+      at: tabMessageTimestamp(thread.question.createdAt), id: 'message:' + thread.question.messageId })),
+  ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads]);
+  const visibilityNow = Math.max(now, Date.now());
+  const nextSuccessExpiry = nextRequestSuccessExpiry([
+    ...orderedRuns.map(run => runPresentation(run, tabId).icon === 'success' ? successVisibleAt(run) : null),
+    ...messages.threads.map(tabMessageSuccessAt),
+  ], visibilityNow);
   useEffect(() => {
     if (!nextSuccessExpiry) return;
     const timer = window.setTimeout(() => setNow(Date.now()), Math.max(0, nextSuccessExpiry - Date.now()) + 20);
@@ -353,8 +384,10 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
     }
     return presentation.icon === 'success'
       && Boolean(successVisibleAt(run))
-      && Number(successVisibleAt(run)) + SUCCESS_VISIBLE_MS > now;
-  }), [now, orderedRuns, tabId]);
+      && Number(successVisibleAt(run)) + REQUEST_SUCCESS_VISIBLE_MS > visibilityNow;
+  }), [visibilityNow, orderedRuns, tabId]);
+  const hasVisibleMessages = messages.threads.some(thread => tabMessageVisibleInTracker(thread, tabId, visibilityNow));
+  const hasDockEntries = statusRuns.length > 0 || hasVisibleMessages || Boolean(messages.listError);
 
   const openLinkedTab = useCallback(async (run: OrchestrationRun) => {
     const isSource = run.sourceTabId === tabId;
@@ -365,6 +398,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
     if (!projectId || !linkedTabId) return;
 
     setHistoryOpen(false);
+    closeMessage();
     const state = useWorkspaceStore.getState();
     let resolvedPath = projectPath || '';
     if (!state.openProjects.has(projectId) && !resolvedPath) {
@@ -387,7 +421,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
     // бокового списка и `Ctrl+Tab`.
     latest.placeTab(projectId, linkedTabId);
     void ipcRenderer.invoke('orchestration:acknowledge', { runId: run.runId, tabId }).catch(() => {});
-  }, [tabId]);
+  }, [tabId, closeMessage]);
 
   const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume') => {
     let cancelSendAccepted = false;
@@ -491,7 +525,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
     );
   };
 
-  const renderTooltipActions = (run: OrchestrationRun) => {
+  const renderTooltipActions = (run: OrchestrationRun, compact = false) => {
     const isSource = run.sourceTabId === tabId;
     const canCancelActiveRun = ACTIVE.has(run.status) && run.status !== 'waiting_recovery';
     const canCancelHandoff = canCancelPendingSourceHandoff(run, tabId);
@@ -506,11 +540,12 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
       && !attentionDismissedForTab(run, tabId);
     return (
       <div style={{ width: '100%', minWidth: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 5, color: '#f3f4f6', fontWeight: 600 }}>
+        {!compact && <span style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 5, color: '#f3f4f6', fontWeight: 600 }}>
           {isSource ? <ArrowUpRight size={14} /> : <ArrowDownLeft size={14} />}
           <span>{isSource ? 'Исходящий запрос' : 'Входящий запрос'}</span>
-        </span>
-        <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+        </span>}
+        <span style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: compact ? 1 : 0,
+          ...(compact ? { flexWrap: 'wrap', justifyContent: 'flex-end', minWidth: 0 } as const : {}) }}>
           {(canCancelActiveRun || canCancelHandoff || canDetachResultProof) && actionButton(
             run,
             'detach',
@@ -539,9 +574,9 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
 
   const panelStyle: CSSProperties = {
     position: 'absolute',
-    top: 'calc(100% + 4px)',
-    right: panelOpen ? effectiveWidth + 8 : 0,
-    width: 310,
+    top: dock.panelTop,
+    right: dock.panelRight,
+    width: dock.panelWidth,
     maxHeight: 'min(290px, calc(100vh - 110px))',
     display: 'flex',
     flexDirection: 'column',
@@ -559,13 +594,19 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
       <div style={{ height: 34, padding: '0 7px 0 9px', display: 'flex', alignItems: 'center', gap: 7, borderBottom: '1px solid #303030', flexShrink: 0 }}>
         <HistoryIcon size={14} color="#a3a3a3" />
         <span style={{ minWidth: 0, flex: 1, fontSize: 11, fontWeight: 650 }}>История запросов</span>
-        <span style={{ fontSize: 10, color: '#777' }}>{orderedRuns.length}</span>
-        <button type="button" aria-label="Закрыть" onClick={() => setHistoryOpen(false)} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: 0, background: 'transparent', color: '#999', cursor: 'pointer' }}>
+        <span style={{ fontSize: 10, color: '#777' }}>{historyEntries.length}</span>
+        <button type="button" aria-label="Закрыть" onClick={() => { setHistoryOpen(false); closeMessage(); }} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: 0, background: 'transparent', color: '#999', cursor: 'pointer' }}>
           <X size={14} />
         </button>
       </div>
-      <div style={{ minHeight: 0, overflowY: 'auto' }}>
-        {orderedRuns.map((run) => {
+      <div data-request-history-list className="scrollbar-thin" style={{ minHeight: 0, overflowY: 'auto' }}>
+        {messages.listError && <div role="alert" style={{ padding: 8, fontSize: 10, color: '#fbbf24' }}>Сообщения недоступны: {messages.listError}</div>}
+        {!historyEntries.length && !messages.listError && <div style={{ padding: 10, fontSize: 11, color: '#888' }}>Запросов пока нет</div>}
+        {historyEntries.map((entry) => {
+          if (entry.kind === 'message') return <TabMessageRow key={entry.id} thread={entry.thread} tabId={tabId}
+            history selected={selectedMessage?.messageId === entry.thread.question.messageId}
+            onOpen={openMessage} onDismiss={dismissMessage} error={messages.actionErrors[entry.thread.question.messageId]} />;
+          const run = entry.run;
           const isSource = run.sourceTabId === tabId;
           const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
           const linkedProjectName = isSource ? run.targetProjectName : run.sourceProjectName;
@@ -628,6 +669,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
                   <span>runId</span><span style={{ color: '#aaa', fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.runId}</span>
                   <span />
                   <span style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
+                    {renderTooltipActions(run, true)}
                     {!(isSource && run.runKind === 'external-research') && (
                       <button type="button" title="Открыть связанную вкладку" aria-label="Открыть связанную вкладку" onClick={() => void openLinkedTab(run)} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: '1px solid #333', borderRadius: 4, background: '#191919', color: '#aaa', cursor: 'pointer' }}>
                         {isSource ? <ArrowUpRight size={13} /> : <ArrowDownLeft size={13} />}
@@ -690,21 +732,22 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
       data-orchestration-status
       style={{ display: 'contents', pointerEvents: 'auto' }}
     >
-      <TabMessageTracker tabId={tabId} />
+      <div data-orchestration-activity-dock data-collapsed={!dock.visible || undefined} className="scrollbar-thin"
+        style={{ position: 'absolute', top: 0, right: dock.right, width: 178, maxHeight: dock.maxHeight,
+          display: dock.visible && hasDockEntries ? 'flex' : 'none', flexDirection: 'column',
+          border: '1px solid #444', borderRadius: 5, background: '#171717', boxSizing: 'border-box',
+          boxShadow: '0 2px 10px rgba(0,0,0,0.22)',
+          overflowY: 'auto', overflowX: 'hidden', pointerEvents: 'auto' }}>
+      <TabMessageTracker tabId={tabId} controller={messages} onOpen={openMessage} onDismiss={dismissMessage} selectedMessageId={selectedMessage?.messageId} now={visibilityNow} />
       {statusRuns.length > 0 && (
         <div
           data-orchestration-active-list
           style={{
-            width: 178,
-            maxHeight: 'min(208px, calc(100vh - 110px))',
+            width: '100%',
+            minWidth: 0,
+            flexShrink: 0,
             display: 'flex',
             flexDirection: 'column',
-            overflowX: 'hidden',
-            overflowY: 'auto',
-            border: '1px solid #444',
-            borderRadius: 5,
-            background: '#171717',
-            boxShadow: '0 2px 10px rgba(0,0,0,0.22)',
           }}
         >
           {statusRuns.map((run, index) => {
@@ -734,14 +777,25 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
                 actionBar={renderTooltipActions(run)}
                 side="left"
                 align="start"
+                disabled={!dock.visible || historyOpen || settingsOpen || Boolean(selectedMessage)}
                 always
               >
-                <div data-orchestration-active-run={run.runId} style={{ width: '100%', height: 26, display: 'flex', alignItems: 'center', borderBottom: index < statusRuns.length - 1 ? '1px solid #303030' : 0, boxSizing: 'border-box', flexShrink: 0 }}>
+                <RequestTrackerRow data-orchestration-active-run={run.runId}
+                  style={{ borderBottom: index < statusRuns.length - 1 ? '1px solid #303030' : 0 }}
+                  actions={(canDismissAttention || canDismissRecovery || canDetachResultProof) && (
+                    <button type="button" data-orchestration-dismiss={run.runId}
+                      title={canDetachResultProof || paused ? 'Отвязать запрос' : canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке'}
+                      aria-label={canDetachResultProof || paused ? 'Отвязать запрос' : canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке'}
+                      onClick={event => {
+                        event.stopPropagation();
+                        void runAction(run, canDetachResultProof || paused ? 'detach' : canDismissRecovery ? 'dismiss' : 'dismiss-attention');
+                      }} style={requestRowActionStyle}><X size={13} /></button>
+                  )}>
                   {externalSourceRun ? (
                     <div
                       data-orchestration-external-target
                       aria-label={`${linkedTabName || 'Browser research'} через SC Desktop`}
-                      style={{ minWidth: 0, height: '100%', padding: '0 4px 0 6px', display: 'flex', alignItems: 'center', gap: 5, flex: 1, color: presentation.color }}
+                      style={{ ...requestRowLinkStyle, color: presentation.color, cursor: 'default' }}
                     >
                       {activeRunContent}
                     </div>
@@ -750,50 +804,33 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
                       type="button"
                       onClick={() => void openLinkedTab(run)}
                       aria-label={`Открыть ${linkedTabName || 'связанную вкладку'}`}
-                      style={{ minWidth: 0, height: '100%', padding: '0 4px 0 6px', display: 'flex', alignItems: 'center', gap: 5, flex: 1, border: 0, background: 'transparent', color: presentation.color, cursor: 'pointer' }}
+                      onMouseEnter={event => { event.currentTarget.style.background = '#303030'; }}
+                      onMouseLeave={event => { event.currentTarget.style.background = 'transparent'; }}
+                      style={{ ...requestRowLinkStyle, color: presentation.color }}
                     >
                       {activeRunContent}
                     </button>
                   )}
-                  {(canDismissAttention || canDismissRecovery || canDetachResultProof) && (
-                    <button
-                      type="button"
-                      data-orchestration-dismiss={run.runId}
-                      title={canDetachResultProof || paused
-                        ? 'Отвязать запрос'
-                        : (canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке')}
-                      aria-label={canDetachResultProof || paused
-                        ? 'Отвязать запрос'
-                        : (canDismissRecovery ? 'Закрыть без сообщения' : 'Закрыть уведомление об ошибке')}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void runAction(run, canDetachResultProof || paused
-                          ? 'detach'
-                          : (canDismissRecovery ? 'dismiss' : 'dismiss-attention'));
-                      }}
-                      style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', flexShrink: 0, border: 0, background: 'transparent', color: '#999', cursor: 'pointer' }}
-                    >
-                      <X size={13} />
-                    </button>
-                  )}
-                </div>
+                </RequestTrackerRow>
               </Tooltip>
             );
           })}
         </div>
       )}
+      </div>
       {/* A button that opened a panel must LOOK opened: without it the only
           way to tell which of the two panels is on screen is to read the panel
           itself. Active state brightens border/background/text together — an
           opacity-only difference is not reliably visible. Hover matches the
           neighbouring controls. */}
-      {orderedRuns.length > 0 && <button
+      <button
         type="button"
         data-orchestration-history-button
         data-active={historyOpen ? 'true' : undefined}
-        onClick={() => { setHistoryOpen((open) => !open); setSettingsOpen(false); }}
+        onClick={() => { setHistoryOpen((open) => !open); setSettingsOpen(false); closeMessage(); }}
         aria-label="Открыть историю запросов"
         aria-expanded={historyOpen}
+        title="История запросов и переписки"
         style={{
           height: 26,
           padding: '0 7px',
@@ -820,13 +857,14 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
           (e.currentTarget as HTMLElement).style.color = '#aaa';
         }}
       >
-        <HistoryIcon size={13} /><span>History</span>
-      </button>}
+        <HistoryIcon size={13} color={!dock.visible && (statusRuns.length > 0
+          || hasVisibleMessages) ? '#a78bfa' : undefined} /><span>History</span>
+      </button>
       <button
         type="button"
         data-orchestration-settings-button
         data-active={settingsOpen ? 'true' : undefined}
-        onClick={() => { setSettingsOpen((open) => !open); setHistoryOpen(false); }}
+        onClick={() => { setSettingsOpen((open) => !open); setHistoryOpen(false); closeMessage(); }}
         aria-label="Настройки запросов"
         aria-expanded={settingsOpen}
         title="Настройки запросов"
@@ -857,6 +895,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
       </button>
       {historyPanel}
       {settingsPanel}
+      {selectedMessage && selectedThread && <TabMessagePreview key={tabId + ':' + selectedMessage.messageId}
+        selection={selectedMessage} thread={selectedThread} controller={messages} onClose={closeMessage} previewRef={messagePreviewRef} />}
     </div>
   );
 }

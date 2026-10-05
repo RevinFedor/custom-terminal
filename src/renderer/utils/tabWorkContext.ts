@@ -75,6 +75,10 @@ export function loadTabWorkContext(tabId: string) {
   return request;
 }
 
+export function getTabWorkContextSnapshot(tabId: string): TabWorkContextSnapshot {
+  return states.get(tabId) || EMPTY;
+}
+
 export function useTabWorkContext(tabId: string) {
   useEffect(() => { void loadTabWorkContext(tabId); }, [tabId]);
   return useSyncExternalStore(
@@ -84,7 +88,7 @@ export function useTabWorkContext(tabId: string) {
       listeners.set(tabId, set);
       return () => { set.delete(notify); if (!set.size) listeners.delete(tabId); };
     },
-    () => states.get(tabId) || EMPTY,
+    () => getTabWorkContextSnapshot(tabId),
   );
 }
 

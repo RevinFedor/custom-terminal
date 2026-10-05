@@ -37,7 +37,7 @@ function loadCodecs() {
 /** Pure authoring preparation. Never reads linked files, imports/uploads an
  * image, touches a draft, or starts a provider. PTY staging/audit stays below
  * the existing Send scenario. Public metadata is NOT delivery authority. */
-async function prepareStructuredAuthoring(input) {
+async function prepareStructuredAuthoring(input, { allowUploadFiles = false } = {}) {
   object(input, ['version', 'text', 'parts', 'chips', 'imagePaths'], 'authoring');
   if (input.version !== 1) fail('version must be 1');
   if (own(input, 'text') === own(input, 'parts')) fail('provide exactly one of text or parts');
@@ -94,15 +94,34 @@ async function prepareStructuredAuthoring(input) {
     return { ...ref };
   });
   const [composer, imageCodec] = await loadCodecs();
-  let authoring, prompt, usedImages, transportParts;
+  let authoring, prompt, usedImages, transportParts, declaredUploadFiles = 0;
   if (own(input, 'parts')) {
     if (!Array.isArray(input.parts) || input.parts.length > LIMITS.parts) fail('parts invalid');
     const usedPasteIds = new Set();
     const usedImageIds = new Set();
     const imageOrder = [];
     const parts = input.parts.map(part => {
-      object(part, part?.kind === 'text' ? ['kind', 'text'] : part?.kind === 'paste' ? ['kind', 'chipId'] : ['kind', 'imageId'], 'part');
-      if (part.kind === 'text') string(part.text, 'part.text');
+      object(part, part?.kind === 'text' ? ['kind', 'text', 'uploadFiles'] : part?.kind === 'paste' ? ['kind', 'chipId'] : ['kind', 'imageId'], 'part');
+      if (part.kind === 'text') {
+        string(part.text, 'part.text');
+        if (own(part, 'uploadFiles')) {
+          if (!allowUploadFiles) fail('uploadFiles requires supported terminal Send upload ownership');
+          if (!Array.isArray(part.uploadFiles) || part.uploadFiles.length > LIMITS.parts) fail('part.uploadFiles invalid');
+          declaredUploadFiles += part.uploadFiles.length;
+          let previousEnd = 0;
+          for (const ref of part.uploadFiles) {
+            object(ref, ['path', 'start', 'end', 'uploadId', 'assetId', 'name', 'mediaType', 'size'], 'uploadFile');
+            absolutePath(ref.path, 'uploadFile.path');
+            integer(ref.start, 'uploadFile.start'); integer(ref.end, 'uploadFile.end', 1);
+            if (ref.start < previousEnd || ref.end <= ref.start || ref.end > part.text.length
+              || part.text.slice(ref.start, ref.end) !== ref.path) fail('uploadFile span does not match its exact path');
+            previousEnd = ref.end;
+            for (const key of ['uploadId', 'assetId', 'name', 'mediaType']) string(ref[key], 'uploadFile.' + key, { optional: true, nonempty: true, max: 8192 });
+            if (ref.assetId !== undefined && !/^[a-f0-9]{64}\.document\.[a-z0-9]{1,16}$/.test(ref.assetId)) fail('uploadFile.assetId invalid');
+            if (ref.size !== undefined) integer(ref.size, 'uploadFile.size');
+          }
+        }
+      }
       else if (part.kind === 'paste') {
         if (!chips.some(chip => chip.id === part.chipId && chip.kind === 'paste') || usedPasteIds.has(part.chipId)) fail('paste part identity invalid');
         usedPasteIds.add(part.chipId);
@@ -111,7 +130,7 @@ async function prepareStructuredAuthoring(input) {
         usedImageIds.add(part.imageId);
         imageOrder.push(part.imageId);
       } else fail('part.kind unsupported');
-      return { ...part };
+      return { ...part, ...(part.uploadFiles ? { uploadFiles: part.uploadFiles.map(ref => ({ ...ref })) } : {}) };
     });
     if (chips.some(chip => chip.kind === 'paste' && !usedPasteIds.has(chip.id))) fail('unreferenced paste chip');
     if (images.some(ref => !usedImageIds.has(ref.id))) fail('unreferenced image');
@@ -147,6 +166,7 @@ async function prepareStructuredAuthoring(input) {
     if (cursor < input.text.length) transportParts.push({ kind: 'text', text: input.text.slice(cursor) });
   }
   const imageRanges = [];
+  const uploadAttachments = [], uploadFileRanges = [];
   let bodyStart = 0;
   prompt = composer.serializeComposerDraft({ parts: transportParts, chips,
     renderImage: id => imageCodec.buildPromptImagePayload(`[Image #${id}]`, images),
@@ -155,7 +175,18 @@ async function prepareStructuredAuthoring(input) {
       const ref = images.find(ref => ref.id === range.id);
       if (ref.path && ref.availability !== 'missing') imageRanges.push({ start: range.start, end: range.end, path: ref.path });
     },
+    onTextRange: range => {
+      for (const ref of transportParts[range.partIndex].uploadFiles || []) {
+        if (uploadAttachments.length >= LIMITS.parts) fail('upload file reference limit exceeded', 413);
+        uploadFileRanges.push({ start: range.start + ref.start, end: range.start + ref.end,
+          sourcePath: ref.path, refIndex: uploadAttachments.length });
+        uploadAttachments.push({ path: ref.path, kind: 'file', id: ref.uploadId || '',
+          name: ref.name || path.basename(ref.path), mimeType: ref.mediaType || 'application/octet-stream',
+          size: ref.size || 0, ...(ref.assetId ? { assetId: ref.assetId } : {}) });
+      }
+    },
   });
+  if (uploadAttachments.length !== declaredUploadFiles) fail('serializer did not bind every upload file declaration');
   if (imageRanges.length > LIMITS.images) fail('image occurrence limit exceeded', 413);
   if (Buffer.byteLength(JSON.stringify(authoring), 'utf8') > LIMITS.bytes || Buffer.byteLength(prompt, 'utf8') > LIMITS.bytes) fail('size limit exceeded', 413);
   const trimmedPrefix = prompt.length - prompt.trimStart().length;
@@ -165,6 +196,8 @@ async function prepareStructuredAuthoring(input) {
   return {
     prompt, authoringSnapshot: { ...authoring,
       editorText: authoring.parts ? composer.composerTextFromParts(authoring.parts, chips) : authoring.text },
+    ...(uploadAttachments.length ? { uploadAttachments,
+      uploadFileRanges: uploadFileRanges.map(range => ({ ...range, start: range.start - trimmedPrefix, end: range.end - trimmedPrefix })) } : {}),
     // Authoring IDs stay editable/client-owned. Native image slots on the new
     // send are numbered in transport occurrence order, including repetitions.
     // A declared missing image is an imageError text part, not a native slot.
@@ -173,6 +206,7 @@ async function prepareStructuredAuthoring(input) {
       .map((ref, index) => ({ ...ref, id: index + 1 })),
       authoringTransport: { sourceHash: hash(prompt), bodyLength: prompt.length - normalizedBodyStart,
         bodyHash: hash(prompt.slice(normalizedBodyStart)),
+        ...(uploadFileRanges.length ? { fileRanges: uploadFileRanges.map(range => ({ ...range, start: range.start - trimmedPrefix, end: range.end - trimmedPrefix })) } : {}),
         imageRanges: imageRanges.map(range => ({ ...range, start: range.start - trimmedPrefix, end: range.end - trimmedPrefix })) },
     },
     contextFiles: chips.filter(chip => chip.attachmentKind === 'file').map(chip => ({
@@ -191,6 +225,7 @@ function bindStructuredAuthoringPresentation(snapshot, originalPrompt, preparedP
     || hash(preparedPrompt.slice(preparedPrompt.length - plan.bodyLength)) !== plan.bodyHash) fail('prepared context changed authoring body');
   const delta = preparedPrompt.length - originalPrompt.length;
   return { ...snapshot, authoringTransport: { sourceHash: hash(preparedPrompt),
+    ...(plan.fileRanges ? { fileRanges: plan.fileRanges.map(range => ({ ...range, start: range.start + delta, end: range.end + delta })) } : {}),
     imageRanges: plan.imageRanges.map(range => ({ ...range, start: range.start + delta, end: range.end + delta })) } };
 }
 

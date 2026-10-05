@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -15,16 +16,11 @@ import {
   Eye,
   EyeOff,
   GitBranch,
-  Pause,
   Percent,
-  Play,
+  PanelRightDashed,
   Power,
-  Repeat2,
-  RotateCw,
-  Timer,
 } from 'lucide-react';
 import {
-  countEnabledQueuedPrompts,
   hasPendingPromptQueueContinuation,
   isQueuedPromptEnabled,
   usePromptQueueStore,
@@ -43,47 +39,41 @@ import { autoCompactIncludesTarget, UNPLACED_AUTOMATION_WORKFLOW } from '../../u
 import { summarizeRunningAutoCompacts } from '../../utils/autoCompactActivityPresentation.mjs';
 import WorkflowChip from './WorkflowChip';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
-import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
-import { layoutRunAfterDependencyGraph } from '../../utils/runAfterDependencyLayout.mjs';
-import {
-  resolveTabCardBackground,
-  resolveTabCardBoxHeight,
-  resolveTabCardMetrics,
-  TAB_CARD_LINE_HEIGHT,
-} from '../../utils/tabCardVisual.mjs';
-import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
+import { pointInHoverCluster, pointInRect } from '../../utils/hoverBridge.mjs';
+import { captureQueueHoverReturn, createHoverReturnGate } from '../../utils/hoverReturnGate.mjs';
+import { collectQueueRelations, layoutRunAfterCards, retainRunAfterGroups, RUN_AFTER_GROUP_INSET, RUN_AFTER_DEPTH_INSET } from '../../utils/runAfterDependencyLayout.mjs';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 import { retainPanelPosition, scrollMovesAnchor } from '../../utils/anchoredPanelPosition.mjs';
-import ControlHint from '../UI/ControlHint';
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { TabPaneMap } from './PaneMap';
-import { TabProcessBar } from './TabSignals';
-import { adjustRgbaAlpha, flattenRgbaOnTabbarPanel, getTabChromeColorConfig } from './tabChrome';
+import TabCard from './TabCard';
+import { RunAfterStatusIcon } from './RunAfterTabPicker';
 
 const PANEL_MARGIN = 8;
 // Page controls straddle the top frame by 14px. The full gap therefore owns
 // that outside half instead of letting it overlap the navigation row.
 const PANEL_GAP = 17;
-const PANEL_MIN_W = 520;
+const PANEL_MIN_W = 240;
 const PANEL_DEFAULT_W = 760;
 const PANEL_DEFAULT_H = 600;
-const GRAPH_NODE_W = 270;
-const FLOATING_QUEUE_MIN_W = 168;
-const FLOATING_QUEUE_MAX_W = 600;
-const FLOATING_QUEUE_MAX_H = 430;
 const GLOBAL_PANEL_SIZE_KEY = 'noted-terminal-global-run-after-size';
 
-type GlobalPanelSize = { width: number; height: number; heightFixed: boolean };
-type QueueEditorState = { tabId: string; mode: 'preview' | 'pinned' };
+type GlobalPanelSize = { width: number; height: number; resizeEnabled: boolean };
+type QueueCloseRef = { current: (reason?: 'outside') => boolean };
+type QueueLayoutMemory = {
+  primary: ReturnType<typeof retainRunAfterGroups> | null;
+  secondary: ReturnType<typeof retainRunAfterGroups> | null;
+};
 
 function queueHoverSatelliteRects(root: HTMLElement | null): DOMRect[] {
-  const owner = root?.querySelector<HTMLElement>('[data-prompt-queue-hover-owner]')?.dataset.promptQueueHoverOwner;
-  if (!owner) return [];
-  // An overlay covering the viewport is click dismissal, not hover territory.
-  // Nor can a popup belonging to another local/global queue hold this one open.
+  const owners = new Set(Array.from(root?.querySelectorAll<HTMLElement>(
+    '[data-prompt-queue-hover-owner]',
+  ) || []).map(element => element.dataset.promptQueueHoverOwner));
+  if (!owners.size) return [];
+  // Each inline queue owns its own portals; viewport backdrops are not territory.
   return Array.from(document.querySelectorAll<HTMLElement>('[data-run-after-hover-owner]'))
-    .filter((element) => element.dataset.runAfterHoverOwner === owner)
-    .map((element) => element.getBoundingClientRect());
+    .filter(element => owners.has(element.dataset.runAfterHoverOwner))
+    .map(element => element.getBoundingClientRect());
 }
 
 const button: CSSProperties = {
@@ -107,14 +97,26 @@ function loadPanelSize(): GlobalPanelSize {
     return {
       width: Number.isFinite(parsed.width) ? Math.max(PANEL_MIN_W, parsed.width) : PANEL_DEFAULT_W,
       height: Number.isFinite(parsed.height) ? Math.max(170, parsed.height) : PANEL_DEFAULT_H,
-      // Values saved by the first implementation had a mandatory 600px
-      // height. Treat that legacy shape as a ceiling, not an intentional fixed
-      // empty canvas. Only a new vertical resize opts into fixed height.
-      heightFixed: parsed.heightFixed === true,
+      // Old fixed dimensions become limits. Only explicit resize mode exposes
+      // the reserved canvas; ordinary viewing always trims to the content.
+      resizeEnabled: parsed.resizeEnabled === true,
     };
   } catch {
-    return { width: PANEL_DEFAULT_W, height: PANEL_DEFAULT_H, heightFixed: false };
+    return { width: PANEL_DEFAULT_W, height: PANEL_DEFAULT_H, resizeEnabled: false };
   }
+}
+
+function globalRunAfterMinimumWidth(panel: HTMLElement | null, pages: HTMLElement | null) {
+  const legend = (pages?.getBoundingClientRect().width || PANEL_MIN_W - 24) + 24;
+  const controls = Array.from(panel?.querySelectorAll<HTMLElement>('[data-prompt-queue-edge-controls]') || []);
+  return Math.ceil(Math.max(legend, ...controls.map(control => {
+    const node = control.closest<HTMLElement>('[data-global-run-after-node]');
+    const canvas = control.closest<HTMLElement>('[data-global-run-after-graph]');
+    if (!node || !canvas || !panel) return 0;
+    const inset = panel.getBoundingClientRect().width - canvas.clientWidth;
+    const indent = RUN_AFTER_GROUP_INSET + (Number(node.dataset.globalRunAfterDepth) || 0) * RUN_AFTER_DEPTH_INSET;
+    return control.getBoundingClientRect().right - node.getBoundingClientRect().left + indent + inset + 1;
+  })));
 }
 
 function queueIsConfigured(queue: TabQueue | undefined): boolean {
@@ -127,377 +129,83 @@ function queueIsConfigured(queue: TabQueue | undefined): boolean {
   );
 }
 
-function queueHead(queue: TabQueue | undefined) {
-  return queue?.items.find(isQueuedPromptEnabled);
-}
-
-function queueHeadTarget(queue: TabQueue | undefined): string | null {
-  const head = queueHead(queue);
-  if (head?.trigger?.kind === 'onTab') return head.trigger.tabId;
-  return queue?.runAfterTabId || null;
-}
-
-function QueueStatusMarks({ queue, activityMessage }: {
-  queue: TabQueue;
-  activityMessage?: string;
-}) {
-  const head = queueHead(queue);
-  const condition = head?.condition;
-  const timer = head?.trigger?.kind === 'timer' ? head.trigger.seconds : null;
-  const afterRestart = head?.trigger?.kind === 'app-restart';
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexShrink: 0 }}>
-      {condition && (
-        <span
-          title={`Контекст использован ${condition.operator === 'gte' ? 'не меньше' : 'не больше'} ${condition.percent}%`}
-          style={{ color: '#82d9a4', fontSize: 9.5, fontVariantNumeric: 'tabular-nums' }}
-        >
-          {condition.operator === 'gte' ? '≥' : '≤'}{condition.percent}%
-        </span>
-      )}
-      {timer !== null && (
-        <span title={`Таймер ${timer} секунд`} style={{ display: 'inline-flex', alignItems: 'center', gap: 2, color: '#c9a46c', fontSize: 9.5 }}>
-          <Timer size={9} />{timer}s
-        </span>
-      )}
-      {afterRestart && <RotateCw size={10} color="#a78bfa" aria-label="После перезапуска приложения" />}
-      {queue.loopPromptEnabled && <Repeat2 size={10} color="#a78bfa" aria-label="Loop включён" />}
-      {activityMessage && <Percent size={10} color="#d5b48b" aria-label={activityMessage} />}
-    </span>
-  );
-}
-
-function QueueTabNode({ tab, queue, busy, selected, onEdit, onPreview }: {
+function QueueTabNode({ tab, queue, busy, awaited }: {
   tab: AutomationTab;
   queue?: TabQueue;
   busy: boolean;
-  selected: boolean;
-  onEdit: () => void;
-  onPreview: (event: React.MouseEvent) => void;
+  awaited: boolean;
 }) {
-  const [hovered, setHovered] = useState(false);
-  const [runHovered, setRunHovered] = useState(false);
-  const active = useWorkspaceStore((state) => (
-    state.activeProjectId === tab.projectId
-    && state.openProjects.get(tab.projectId)?.activeTabId === tab.id
-  ));
-  const tabGeo = useUIStore((state) => state.tabGeometry);
-  const tabsFontSize = useUIStore((state) => state.tabsFontSize);
-  const activity = useAutoCompactStore((state) => state.activities[tab.id]);
-  const chrome = getTabChromeColorConfig({ color: tab.color, tabType: tab.tabType });
-  const hasColor = !!tab.color && tab.color !== 'default';
-  const metrics = resolveTabCardMetrics(tabGeo, { fontSize: tabsFontSize });
-  const tabBackground = flattenRgbaOnTabbarPanel(resolveTabCardBackground(
-    { bgColor: chrome.bgColor, hasColor, active, hovered, selected },
-    adjustRgbaAlpha,
-  ));
-  const count = queue ? countEnabledQueuedPrompts(queue.items) : 0;
-  const runAppearance = resolveRunAfterPlayAppearance({
-    autoRun: queue?.autoRun === true,
-    activeItemCount: count,
-    firstChipArmedHint: queue?.firstChipHintActive === true,
-    hovered: runHovered,
-  });
-
+  const active = useWorkspaceStore(state => state.activeProjectId === tab.projectId
+    && state.openProjects.get(tab.projectId)?.activeTabId === tab.id);
+  const hasCondition = queue?.items.some(item => isQueuedPromptEnabled(item) && item.condition);
   const navigate = () => {
-    // Ordinary click follows the tab's existing placement, just like the
-    // sidebar and Ctrl+Tab. Only an unplaced tab may use the focused window;
-    // middle-click/Cmd+click below remain the explicit "move/add here" gesture.
     useWorkspaceStore.getState().placeTab(tab.projectId, tab.id);
     useUIStore.getState().setActiveArea('workspace');
     requestTabPrimaryInputFocus(tab.id, 'global-run-after-tab');
   };
-
   const placeHere = (event: React.MouseEvent) => {
-    const cmdClick = event.button === 0
-      && event.metaKey
-      && !event.ctrlKey
-      && !event.altKey
-      && !event.shiftKey;
+    const cmdClick = event.button === 0 && event.metaKey
+      && !event.ctrlKey && !event.altKey && !event.shiftKey;
     if (event.button !== 1 && !cmdClick) return;
-    event.preventDefault();
-    event.stopPropagation();
+    event.preventDefault(); event.stopPropagation();
     useWorkspaceStore.getState().placeTab(tab.projectId, tab.id, { mode: 'add-here' });
     useUIStore.getState().setActiveArea('workspace');
     requestTabPrimaryInputFocus(tab.id, 'global-run-after-add-here');
   };
-
-  return (
-    <div
-      data-global-run-after-node={tab.id}
-      style={{
-        position: 'relative',
-        width: '100%',
-        height: '100%',
-        display: 'flex',
-        alignItems: 'stretch',
-        gap: 4,
-        zIndex: 2,
-        borderRadius: metrics.borderRadius,
+  return <div data-global-run-after-heading={tab.id}
+    style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 4, width: 'max-content', maxWidth: '100%', minWidth: 0, zIndex: 3 }}>
+    <span data-global-run-after-project-icon={tab.projectId} title={tab.projectName} aria-hidden
+      style={{ width: 12, flex: '0 0 12px', display: 'grid', placeItems: 'center', marginRight: 2 }}>
+      {tab.projectIcon ? <img src={tab.projectIcon} alt="" draggable={false}
+        style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover' }} />
+        : <span style={{ width: 12, height: 12, borderRadius: 2, border: '1px dashed #949cae' }} />}
+    </span>
+    {hasCondition && <span data-global-run-after-condition-mark title="В очереди есть условие по контексту"
+      style={{ position: 'absolute', top: -5, left: 0, color: '#a78bfa', lineHeight: 1 }}>
+      <Percent size={9} />
+    </span>}
+    <TabCard as="button" projectId={tab.projectId} tabId={tab.id} active={active} reserveSignalSpace showTaskMarkers={false}
+      data-global-run-after-tab-chip={tab.id}
+      activityOverride={{ hasProcess: false, busy, inheritedBusy: false }}
+      style={{ flex: '0 1 auto', maxWidth: 280 }}
+      onClick={(event) => {
+        if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) placeHere(event);
+        else navigate();
       }}
-    >
-      <span
-        data-global-run-after-project-icon={tab.projectId}
-        title={tab.projectName}
-        aria-hidden
-        style={{
-          width: 12,
-          flex: '0 0 12px',
-          display: 'grid',
-          placeItems: 'center',
-          alignSelf: 'center',
-          marginRight: 2,
-        }}
-      >
-        {tab.projectIcon ? (
-          <img src={tab.projectIcon} alt="" draggable={false}
-            style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover' }} />
-        ) : (
-          <span style={{ width: 12, height: 12, borderRadius: 2, boxSizing: 'border-box',
-            border: '1px dashed rgba(148,163,184,0.8)', background: 'rgba(148,163,184,0.08)' }} />
-        )}
-      </span>
-      <button
-        type="button"
-        data-global-run-after-tab-chip={tab.id}
-        onClick={(event) => {
-          if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
-            placeHere(event);
-            return;
-          }
-          navigate();
-        }}
-        onAuxClick={placeHere}
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
-        title={`${tab.name} · ${tab.projectName}\nКлик — перейти; Cmd+клик или средний клик — поместить в текущее окно`}
-        style={{
-          position: 'relative',
-          flex: 1,
-          minWidth: 0,
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 4,
-          padding: metrics.padding,
-          boxSizing: 'border-box',
-          overflow: 'hidden',
-          whiteSpace: 'nowrap',
-          fontFamily: 'inherit',
-          fontSize: metrics.fontSize,
-          lineHeight: TAB_CARD_LINE_HEIGHT,
-          color: active || hovered ? '#fff' : '#b2b2b7',
-          cursor: 'pointer',
-          borderRadius: metrics.borderRadius,
-          // Match the visible PaneTabChip: project identity is its sibling and
-          // the tab itself is an unframed opaque-composited colour surface.
-          border: 'none',
-          background: tabBackground,
-          boxShadow: selected ? 'inset 0 0 0 1px rgba(255,255,255,0.28)' : undefined,
-        }}
-      >
-        <TabProcessBar hasProcess={false} busy={busy} inheritedBusy={false} radius={metrics.borderRadius} zIndex={1} />
-        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', textAlign: 'left' }}>
-          {tab.name}
-        </span>
-        {queue && <QueueStatusMarks queue={queue} activityMessage={activity?.message} />}
+      onAuxClick={placeHere}
+      title={tab.name + ' · ' + tab.projectName + '\nКлик — перейти; Cmd+клик или средний клик — поместить в текущее окно'}
+      trailingActions={<>
+        {awaited && <span data-global-run-after-awaited={tab.id} style={{ display: 'inline-flex', flexShrink: 0 }}>
+          <RunAfterStatusIcon status="waiting" color="#a78bfa" title="Эту вкладку ожидает шаг Run After" />
+        </span>}
         <TabPaneMap projectId={tab.projectId} tabId={tab.id} />
-      </button>
-
-      {queueIsConfigured(queue) && (
-        <>
-          <ControlHint label={selected ? 'Свернуть редактор очереди' : 'Открыть редактор очереди'} shortcut={`${count} активных шагов`} side="top">
-            <button
-              type="button"
-              className="gra-node-action"
-              data-global-run-after-editor-trigger={tab.id}
-              aria-expanded={selected}
-              onMouseEnter={onPreview}
-              onClick={onEdit}
-              style={{
-                ...button,
-                width: 26,
-                padding: 0,
-                display: 'grid',
-                placeItems: 'center',
-                flexShrink: 0,
-                fontSize: 10,
-                fontWeight: count ? 700 : 500,
-                color: selected ? '#f0b47e' : '#aaa',
-                borderColor: selected ? '#99603b' : '#3a3a3d',
-                background: selected ? 'rgba(147,75,33,0.20)' : '#202020',
-              }}
-            >
-              {count > 99 ? '99' : count}
-            </button>
-          </ControlHint>
-          <ControlHint
-            label={queue?.autoRun ? 'Приостановить Run After' : 'Запустить Run After'}
-            shortcut={count ? `${count} активных шагов` : 'Нет активных шагов'}
-            side="top"
-            disabled={count === 0}
-          >
-            <button
-              type="button"
-              className="gra-node-action"
-              disabled={count === 0}
-              aria-label={queue?.autoRun ? 'Приостановить Run After' : 'Запустить Run After'}
-              aria-pressed={queue?.autoRun === true}
-              onMouseEnter={() => setRunHovered(true)}
-              onMouseLeave={() => setRunHovered(false)}
-              onClick={() => {
-                if (!queue || count === 0) return;
-                usePromptQueueStore.getState().setAutoRun(tab.id, !queue.autoRun);
-              }}
-              style={{
-                ...button,
-                width: 26,
-                padding: 0,
-                display: 'grid',
-                placeItems: 'center',
-                flexShrink: 0,
-                background: runAppearance.background,
-                borderColor: runAppearance.borderColor,
-                color: runAppearance.color,
-                opacity: runAppearance.opacity,
-                cursor: count ? 'pointer' : 'default',
-              }}
-            >
-              {queue?.autoRun ? <Pause size={11} fill="currentColor" /> : <Play size={11} fill="none" style={{ marginLeft: 1 }} />}
-            </button>
-          </ControlHint>
-        </>
-      )}
-    </div>
-  );
+      </>} />
+  </div>;
 }
 
-type DependencyEdge = { source: string; target: string; kind: 'current' | 'future' };
-
-function collectQueueRelations(ownerId: string, queue: TabQueue): DependencyEdge[] {
-  const enabled = queue.items.filter(isQueuedPromptEnabled);
-  const head = enabled[0];
-  const currentTarget = queueHeadTarget(queue);
-  const relations: DependencyEdge[] = [];
-  enabled.forEach((item, index) => {
-    if (item.trigger?.kind !== 'onTab') return;
-    relations.push({
-      source: item.trigger.tabId,
-      target: ownerId,
-      kind: index === 0 && item.trigger.tabId === currentTarget ? 'current' : 'future',
-    });
-  });
-  if (currentTarget && head?.trigger?.kind !== 'onTab') {
-    relations.push({ source: currentTarget, target: ownerId, kind: 'current' });
-  }
-  return relations;
-}
-
-function edgePath(source: { x: number; y: number; width: number; height: number }, target: { x: number; y: number; width: number; height: number }) {
-  const sx = source.x + source.width;
-  const sy = source.y + source.height / 2;
-  const tx = target.x;
-  const ty = target.y + target.height / 2;
-  if (tx > sx) {
-    const bend = Math.max(16, (tx - sx) * 0.52);
-    return `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`;
-  }
-  const top = Math.max(4, Math.min(sy, ty) - 18);
-  return `M ${sx} ${sy} C ${sx + 18} ${top}, ${tx - 18} ${top}, ${tx} ${ty}`;
-}
-
-function QueueDependencyMap({ inventory, queues, busy, selectedId, onSelect, onPreview }: {
-  inventory: ReturnType<typeof useAutomationInventory>;
-  queues: Map<string, TabQueue>;
-  busy: Map<string, boolean>;
-  selectedId: string | null;
-  onSelect: (tabId: string) => void;
-  onPreview: (tabId: string, event: React.MouseEvent) => void;
+function QueueBlock({ tab, queue, busy, awaited, register, onRewindTargetModeChange, onHoverGestureChange, graphTargets }: {
+  tab: AutomationTab; queue: TabQueue; busy: boolean; graphTargets: ReadonlySet<string>;
+  awaited: boolean;
+  register: (tabId: string, ref: QueueCloseRef | null) => void;
+  onRewindTargetModeChange: (active: boolean) => void;
+  onHoverGestureChange: (active: boolean, point: { clientX: number; clientY: number } | null) => void;
 }) {
-  const tabGeo = useUIStore((state) => state.tabGeometry);
-  const tabsFontSize = useUIStore((state) => state.tabsFontSize);
-  // resolveTabCardBoxHeight reserves 2px for a border. The visible window chip
-  // is borderless, so graph geometry removes exactly that reserve: 22.8px at
-  // the current 14px/3px settings instead of our previous 26px row.
-  const nodeHeight = Math.max(1, resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize }) - 2);
-  const tabMap = useMemo(() => new Map(inventory.tabs.map((tab) => [tab.id, tab])), [inventory.tabs]);
-  const activeOwners = useMemo(() => inventory.tabs.filter((tab) => {
-    const queue = queues.get(tab.id);
-    return !!queue && hasPendingPromptQueueContinuation(queue);
-  }), [inventory.tabs, queues]);
-
-  const projection = useMemo(() => {
-    const nodeIds = new Set(activeOwners.map((tab) => tab.id));
-    const edges: DependencyEdge[] = [];
-    for (const tab of activeOwners) {
-      const queue = queues.get(tab.id);
-      if (!queue) continue;
-      for (const edge of collectQueueRelations(tab.id, queue)) {
-        if (!tabMap.has(edge.source)) continue;
-        nodeIds.add(edge.source);
-        edges.push(edge);
-      }
-    }
-    const orderedNodeIds = inventory.tabs.map((tab) => tab.id).filter((id) => nodeIds.has(id));
-    return layoutRunAfterDependencyGraph({
-      nodeIds: orderedNodeIds,
-      edges,
-      nodeWidth: GRAPH_NODE_W,
-      nodeHeight,
-      columnGap: 34,
-      rowGap: 12,
-      padding: 8,
-    });
-  }, [activeOwners, inventory.tabs, nodeHeight, queues, tabMap]);
-
-  if (!activeOwners.length) {
-    return <div style={{ padding: '18px 8px', color: '#777', textAlign: 'center' }}>Нет активных цепочек Run After</div>;
-  }
-
-  return (
-    <div data-global-run-after-graph style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 14, minWidth: 'min-content' }}>
-      {projection.map((component: any, componentIndex: number) => {
-        const currentMarker = `gra-current-${componentIndex}`;
-        const futureMarker = `gra-future-${componentIndex}`;
-        const positions = new Map(component.nodes.map((node: any) => [node.id, node]));
-        return (
-          <div key={component.id} data-global-run-after-component style={{ position: 'relative', width: component.width, height: component.height, flex: '0 0 auto' }}>
-            <svg aria-hidden="true" width={component.width} height={component.height} viewBox={`0 0 ${component.width} ${component.height}`}
-              style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'visible', zIndex: 0 }}>
-              <defs>
-                <marker id={currentMarker} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-                  <path d="M 0 0 L 8 4 L 0 8 z" fill="#9b83e3" />
-                </marker>
-                <marker id={futureMarker} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-                  <path d="M 0 0 L 8 4 L 0 8 z" fill="#66616f" />
-                </marker>
-              </defs>
-              {component.edges.map((edge: DependencyEdge) => {
-                const source = positions.get(edge.source) as any;
-                const target = positions.get(edge.target) as any;
-                if (!source || !target) return null;
-                const current = edge.kind === 'current';
-                return <path key={`${edge.source}-${edge.target}`} data-run-after-edge={edge.kind} d={edgePath(source, target)} fill="none"
-                  stroke={current ? '#8b75d9' : '#5e5967'} strokeWidth={current ? 1.6 : 1.15}
-                  strokeDasharray={current ? undefined : '4 4'} markerEnd={`url(#${current ? currentMarker : futureMarker})`}
-                  vectorEffect="non-scaling-stroke" />;
-              })}
-            </svg>
-            {component.nodes.map((node: any) => {
-              const tab = tabMap.get(node.id);
-              if (!tab) return null;
-              const queue = queues.get(node.id);
-              return (
-                <div key={node.id} style={{ position: 'absolute', left: node.x, top: node.y, width: node.width, height: node.height }}>
-                  <QueueTabNode tab={tab} queue={queueIsConfigured(queue) ? queue : undefined} busy={busy.get(tab.id) === true}
-                    selected={selectedId === tab.id} onEdit={() => onSelect(tab.id)} onPreview={(event) => onPreview(tab.id, event)} />
-                </div>
-              );
-            })}
-          </div>
-        );
-      })}
+  const closeRef = useRef<(reason?: 'outside') => boolean>(() => true);
+  useLayoutEffect(() => {
+    register(tab.id, closeRef);
+    return () => register(tab.id, null);
+  }, [register, tab.id]);
+  return <div data-global-run-after-node={tab.id}
+    style={{ position: 'absolute', top: 0, left: 0, width: 'max-content',
+      maxWidth: 'var(--ra-card-max-width, 320px)', minWidth: 0 }}>
+    <QueueTabNode tab={tab} queue={queue} busy={busy} awaited={awaited} />
+    <div data-global-run-after-inline-editor={tab.id}
+      style={{ position: 'relative', zIndex: 4, width: 'max-content', maxWidth: 'calc(100% - 18px)', marginLeft: 18, paddingTop: 8 }}>
+      <PromptQueueOverlay tabId={tab.id} sessionType={tab.provider} agentBusy={busy} inputSurface="history"
+        embedded overview graphTargets={graphTargets} embeddedWidth={300} beforeCloseRef={closeRef}
+        onRewindTargetModeChange={onRewindTargetModeChange} onHoverGestureChange={onHoverGestureChange} />
     </div>
-  );
+  </div>;
 }
 
 function ChoiceChip({ selected, disabled, onClick, children, title }: {
@@ -539,10 +247,30 @@ function AutoCompactRunningIndicator({ count, scope }: { count: number; scope: s
 
 type Candidate = { tab: AutomationTab; percent: number; stopped: boolean };
 
-function AutoCompactPage({ inventory, busy }: {
+function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContentWidth }: {
   inventory: ReturnType<typeof useAutomationInventory>;
   busy: Map<string, boolean>;
+  widthLimit: number;
+  resizeEnabled: boolean;
+  onContentWidth: (width: number) => void;
 }) {
+  const contentRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    const container = content.parentElement!;
+    const panel = content.closest<HTMLElement>('[data-global-run-after-panel]')!;
+    const measure = () => {
+      const inset = panel.getBoundingClientRect().width - container.clientWidth;
+      const maxWidth = Math.max(1, resizeEnabled ? container.clientWidth : widthLimit - inset) + 'px';
+      if (content.style.maxWidth !== maxWidth) content.style.maxWidth = maxWidth;
+      onContentWidth(content.getBoundingClientRect().width + inset);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(content); observer.observe(container);
+    return () => observer.disconnect();
+  }, [widthLimit, resizeEnabled, onContentWidth]);
   const policy = useAutoCompactStore((state) => state.policy);
   const hydrated = useAutoCompactStore((state) => state.hydrated);
   const activities = useAutoCompactStore((state) => state.activities);
@@ -609,7 +337,8 @@ function AutoCompactPage({ inventory, busy }: {
   };
 
   return (
-    <div data-global-auto-compact style={{ padding: '10px 2px 4px' }}>
+    <div ref={contentRef} data-global-auto-compact style={{ padding: '10px 2px 4px', width: 'max-content',
+      maxWidth: Math.max(1, widthLimit - 28), boxSizing: 'border-box' }}>
       <div style={{ position: 'relative', border: '1px solid #343434', borderRadius: 8, padding: '19px 10px 10px' }}>
         <div style={{ position: 'absolute', top: 0, left: 10, transform: 'translateY(-50%)', display: 'inline-flex',
           alignItems: 'center', gap: 4, padding: '0 4px', background: '#181818' }}>
@@ -711,258 +440,191 @@ function AutoCompactPage({ inventory, busy }: {
   );
 }
 
-function QueueOverview({
-  inventory,
-  queues,
-  busy,
-  editorState,
-  setEditorState,
-  beforeCloseRef,
-  onRewindTargetModeChange,
-  pickingRewind,
-  editorGestureActive,
-  onHoverGestureChange,
-  geometryKey,
-}: {
+function QueueOverview({ inventory, queues, busy, beforeCloseRef, layoutMemoryRef, widthLimit, resizeEnabled, onContentWidth, onRewindTargetModeChange, onHoverGestureChange }: {
   inventory: ReturnType<typeof useAutomationInventory>;
-  queues: Map<string, TabQueue>;
-  busy: Map<string, boolean>;
-  editorState: QueueEditorState | null;
-  setEditorState: (state: QueueEditorState | null) => void;
-  beforeCloseRef: { current: (reason?: 'outside') => boolean };
+  queues: Map<string, TabQueue>; busy: Map<string, boolean>; beforeCloseRef: QueueCloseRef;
+  layoutMemoryRef: { current: QueueLayoutMemory };
+  widthLimit: number;
+  resizeEnabled: boolean;
+  onContentWidth: (width: number) => void;
   onRewindTargetModeChange: (active: boolean) => void;
-  pickingRewind: boolean;
-  editorGestureActive: boolean;
   onHoverGestureChange: (active: boolean, point: { clientX: number; clientY: number } | null) => void;
-  geometryKey: string;
 }) {
   const [showDisabled, setShowDisabled] = useState(false);
-  const [editorPosition, setEditorPosition] = useState({
-    left: PANEL_MARGIN,
-    top: 80 as number | null,
-    bottom: null as number | null,
-    width: FLOATING_QUEUE_MAX_W,
-    maxHeight: FLOATING_QUEUE_MAX_H,
-  });
-  const editorPopoverRef = useRef<HTMLDivElement>(null);
-  const editorPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
-  const relayEditorGesture = useCallback((active: boolean, point: { clientX: number; clientY: number } | null) => {
-    editorPointerRef.current = point;
-    onHoverGestureChange(active, point);
-  }, [onHoverGestureChange]);
-  const tabGeo = useUIStore((state) => state.tabGeometry);
-  const tabsFontSize = useUIStore((state) => state.tabsFontSize);
-  const promptQueueWidth = useUIStore((state) => state.promptQueueWidth);
-  const disabledNodeHeight = Math.max(1, resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize }) - 2);
-  const activeIds = useMemo(() => new Set(inventory.tabs.filter((tab) => {
-    const queue = queues.get(tab.id);
-    return !!queue && hasPendingPromptQueueContinuation(queue);
-  }).map((tab) => tab.id)), [inventory.tabs, queues]);
-  const graphIds = useMemo(() => {
-    const ids = new Set(activeIds);
-    for (const ownerId of activeIds) {
-      const queue = queues.get(ownerId);
-      if (!queue) continue;
-      for (const relation of collectQueueRelations(ownerId, queue)) ids.add(relation.source);
-    }
-    return ids;
-  }, [activeIds, queues]);
-  const disabledTabs = useMemo(() => inventory.tabs.filter((tab) => {
-    const queue = queues.get(tab.id);
-    return queueIsConfigured(queue) && !graphIds.has(tab.id);
-  }), [graphIds, inventory.tabs, queues]);
-  const selectedId = editorState?.tabId || null;
-  const selectedTab = selectedId ? inventory.tabs.find((tab) => tab.id === selectedId) : undefined;
-  const selectedQueue = selectedId ? queues.get(selectedId) : undefined;
-
-  const preview = useCallback((tabId: string, event: React.MouseEvent) => {
-    if (editorState?.mode === 'pinned') return;
-    if (editorState?.tabId !== tabId && !beforeCloseRef.current()) return;
-    editorPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
-    setEditorState({ tabId, mode: 'preview' });
-  }, [beforeCloseRef, editorState, setEditorState]);
-
-  const select = useCallback((tabId: string) => {
-    if (editorState?.tabId === tabId && editorState.mode === 'pinned') {
-      if (beforeCloseRef.current()) setEditorState(null);
-      return;
-    }
-    if (editorState?.tabId !== tabId && !beforeCloseRef.current()) return;
-    setEditorState({ tabId, mode: 'pinned' });
-  }, [beforeCloseRef, editorState, setEditorState]);
-
-  const toggleDisabled = useCallback(() => {
-    const hidesEditorTrigger = showDisabled
-      && !!selectedId
-      && disabledTabs.some((tab) => tab.id === selectedId);
-    if (hidesEditorTrigger && !beforeCloseRef.current()) return;
-    if (hidesEditorTrigger) setEditorState(null);
-    setShowDisabled((value) => !value);
-  }, [beforeCloseRef, disabledTabs, selectedId, setEditorState, showDisabled]);
-
+  const canvasRef = useRef<HTMLDivElement>(null), svgRef = useRef<SVGSVGElement>(null);
+  const shelfRef = useRef<HTMLDivElement>(null);
+  const markerId = useId().replace(/:/g, '');
+  const editors = useRef(new Map<string, QueueCloseRef>());
+  const register = useCallback((tabId: string, ref: QueueCloseRef | null) => {
+    if (ref) editors.current.set(tabId, ref); else editors.current.delete(tabId);
+  }, []);
   useLayoutEffect(() => {
-    if (!editorState) return;
-    const measure = () => {
-      const trigger = document.querySelector<HTMLElement>(
-        `[data-global-run-after-editor-trigger="${CSS.escape(editorState.tabId)}"]`,
-      );
-      if (!trigger?.isConnected) {
-        setEditorState(null);
-        return;
+    const close = (reason?: 'outside') => {
+      let allowed = true;
+      for (const ref of editors.current.values()) if (!ref.current(reason)) allowed = false;
+      return allowed;
+    };
+    beforeCloseRef.current = close;
+    return () => { if (beforeCloseRef.current === close) beforeCloseRef.current = () => true; };
+  }, [beforeCloseRef]);
+  const known = new Set(inventory.tabs.map(tab => tab.id));
+  const edges = inventory.tabs.flatMap(tab => collectQueueRelations(tab.id, queues.get(tab.id)));
+  const shelves = useRef(new Map<string, boolean>());
+  const primary = new Set(inventory.tabs.filter(tab => {
+    const queue = queues.get(tab.id);
+    return shelves.current.get(tab.id) === false || (queue && hasPendingPromptQueueContinuation(queue));
+  }).map(tab => tab.id));
+  const expand = (ids: Set<string>) => {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const edge of edges) if (ids.has(edge.source) && known.has(edge.target) && !ids.has(edge.target)) {
+        ids.add(edge.target); changed = true;
       }
-      const rect = trigger.getBoundingClientRect();
-      const ownerRect = trigger.closest<HTMLElement>('[data-global-run-after-node]')?.getBoundingClientRect() || rect;
-      const viewportW = window.innerWidth;
-      const viewportH = window.innerHeight;
-      const width = Math.min(
-        Math.max(FLOATING_QUEUE_MIN_W, Math.min(FLOATING_QUEUE_MAX_W, promptQueueWidth)),
-        Math.max(FLOATING_QUEUE_MIN_W, viewportW - PANEL_MARGIN * 2),
-      );
-      // Align to the entire owner node, not the count alone. Otherwise the next
-      // row's Play sat just outside the popup and visually became its button.
-      const left = clamp(ownerRect.right - width, PANEL_MARGIN, viewportW - width - PANEL_MARGIN);
-      // Border-mounted controls occupy the popup's own top edge. A tiny seam is
-      // enough; the previous 15px gap broke the visible ownership link.
-      const gap = 3;
-      const belowTop = ownerRect.bottom + gap;
-      const belowSpace = viewportH - belowTop - PANEL_MARGIN;
-      const aboveSpace = ownerRect.top - gap - PANEL_MARGIN;
-      const openBelow = belowSpace >= Math.min(190, Math.max(0, aboveSpace));
-      const maxHeight = Math.max(100, Math.min(
-        FLOATING_QUEUE_MAX_H,
-        openBelow ? belowSpace : aboveSpace,
-      ));
-      const next = {
-        left,
-        top: openBelow ? belowTop : null,
-        bottom: openBelow ? null : viewportH - ownerRect.top + gap,
-        width,
-        maxHeight,
-      };
-      setEditorPosition((previous) => (
-        previous.left === next.left
-        && previous.top === next.top
-        && previous.bottom === next.bottom
-        && previous.width === next.width
-        && previous.maxHeight === next.maxHeight
-          ? previous
-          : next
-      ));
+    }
+  };
+  expand(primary);
+  for (const id of primary) shelves.current.set(id, false);
+  const disabled = new Set(inventory.tabs.filter(tab => !primary.has(tab.id)
+    && (queueIsConfigured(queues.get(tab.id)) || shelves.current.get(tab.id) === true)).map(tab => tab.id));
+  for (const id of disabled) if (!shelves.current.has(id)) shelves.current.set(id, true);
+  const secondary = new Set(showDisabled ? disabled : []);
+  expand(secondary);
+  for (const id of primary) secondary.delete(id);
+  const visible = inventory.tabs.filter(tab => primary.has(tab.id) || secondary.has(tab.id));
+  const graphTargets = new Set(visible.map(tab => tab.id));
+  const visibleEdges = edges.filter(edge => graphTargets.has(edge.source) && graphTargets.has(edge.target));
+  const awaitedTargets = new Set(visibleEdges.filter(edge => edge.enabled).map(edge => edge.target));
+  const geometryKey = JSON.stringify({ primary: [...primary], secondary: [...secondary], disabled: [...disabled],
+    edges: visibleEdges.map(edge => [edge.source, edge.target, edge.itemId, edge.kind]),
+    // Reordering a non-dependent step can move an edge's origin without changing
+    // node height or the edge list. Item order is part of geometry, not topology.
+    items: visible.map(tab => [tab.id, queues.get(tab.id)?.items.map(item => [item.id, item.enabled, item.trigger?.kind, item.condition?.kind])]),
+  });
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let frame = 0;
+    const measure = () => {
+      frame = 0;
+      const panel = canvas.closest<HTMLElement>('[data-global-run-after-panel]');
+      const inset = (panel?.getBoundingClientRect().width || canvas.clientWidth) - canvas.clientWidth;
+      // Packing uses the saved limit, not the trimmed frame. Otherwise fitting
+      // the frame feeds back into packing and prevents later content growth.
+      const availableWidth = Math.max(1, resizeEnabled ? canvas.clientWidth : widthLimit - inset);
+      canvas.style.setProperty('--ra-layout-width', availableWidth + 'px');
+      const maximum = Math.max(180, Math.min(320, availableWidth - 32));
+      const cssWidth = maximum + 'px';
+      if (canvas.style.getPropertyValue('--ra-card-max-width') !== cssWidth) canvas.style.setProperty('--ra-card-max-width', cssWidth);
+      const elements = Array.from(canvas.querySelectorAll<HTMLElement>('[data-global-run-after-node]'));
+      const snapshots = elements.map(element => {
+        const rect = element.getBoundingClientRect();
+        const header = element.querySelector<HTMLElement>('[data-global-run-after-heading]')!;
+        const chip = element.querySelector<HTMLElement>('[data-global-run-after-tab-chip]')!;
+        const editor = element.querySelector<HTMLElement>('[data-global-run-after-inline-editor]')!;
+        const controls = editor.querySelector<HTMLElement>('[data-prompt-queue-edge-controls]')!;
+        const headerRect = header.getBoundingClientRect(), chipRect = chip.getBoundingClientRect(), controlsRect = controls.getBoundingClientRect();
+        const stepAnchors = new Map<string, { x: number; y: number }>(Array.from(element.querySelectorAll<HTMLElement>('[data-prompt-queue-item]')).map(step => {
+          const bounds = step.getBoundingClientRect();
+          return [step.dataset.promptQueueItem!, { x: bounds.left - rect.left - 3, y: bounds.top - rect.top + bounds.height / 2 }];
+        }));
+        const loopRect = element.querySelector<HTMLElement>('[data-prompt-queue-loop-toggle]')?.getBoundingClientRect() || controlsRect;
+        stepAnchors.set('queue-target', { x: loopRect.left - rect.left - 3, y: loopRect.top - rect.top + loopRect.height / 2 });
+        return { id: element.dataset.globalRunAfterNode!, element, editor, width: rect.width, height: rect.height,
+          stepAnchors,
+          headerY: headerRect.top - rect.top + headerRect.height / 2,
+          // The whole header starts with the project icon. No path crosses it.
+          headerX: headerRect.left - rect.left,
+          overlapAdjustment: chipRect.bottom - 2 - controlsRect.top };
+      });
+      const sizes = snapshots.map(({ id, width, height }) => ({ id, width, height }));
+      layoutMemoryRef.current.primary = retainRunAfterGroups(layoutMemoryRef.current.primary, { nodeIds: [...primary], edges: visibleEdges });
+      const main = layoutRunAfterCards({ nodeIds: [...primary], edges: visibleEdges, sizes, availableWidth, groups: layoutMemoryRef.current.primary });
+      const shelfHeight = shelfRef.current?.getBoundingClientRect().height || 0;
+      const shelfTop = main.height ? main.height + 12 : 26;
+      const secondaryTop = shelfTop + (shelfHeight ? shelfHeight + 10 : 0);
+      layoutMemoryRef.current.secondary = retainRunAfterGroups(layoutMemoryRef.current.secondary, { nodeIds: [...secondary], edges: visibleEdges });
+      const extra = layoutRunAfterCards({ nodeIds: [...secondary], edges: visibleEdges, sizes, availableWidth, groups: layoutMemoryRef.current.secondary });
+      const positions = new Map([...main.nodes, ...extra.nodes.map(node => ({ ...node, y: node.y + secondaryTop }))].map(node => [node.id, node]));
+      for (const item of snapshots) {
+        const position = positions.get(item.id);
+        if (!position) continue;
+        const transform = `translate(${position.x}px, ${position.y}px)`;
+        if (item.element.style.transform !== transform) item.element.style.transform = transform;
+        item.element.dataset.globalRunAfterDepth = String(position.depth);
+        item.element.dataset.globalRunAfterLane = String(position.lane);
+        // Only a scoped margin changes; the shared TabCard's padding remains its owner's.
+        if (Math.abs(item.overlapAdjustment) > 0.1) {
+          item.editor.style.marginTop = (parseFloat(item.editor.style.marginTop || '0') + item.overlapAdjustment) + 'px';
+        }
+      }
+      const shelfTransform = `translate(0px, ${shelfTop}px)`;
+      if (shelfRef.current && shelfRef.current.style.transform !== shelfTransform) shelfRef.current.style.transform = shelfTransform;
+      const totalHeight = extra.nodes.length ? secondaryTop + extra.height : shelfHeight ? shelfTop + shelfHeight : main.height;
+      const emptyBounds = canvas.querySelector('[data-global-run-after-empty]')?.getBoundingClientRect();
+      const height = Math.max(totalHeight, emptyBounds?.height || 0) + 'px';
+      if (canvas.style.height !== height) canvas.style.height = height;
+      const shelfWidth = shelfRef.current?.querySelector('button')?.getBoundingClientRect().width || 0;
+      const emptyWidth = emptyBounds?.width || 0;
+      onContentWidth(Math.max(main.width, extra.width, shelfWidth, emptyWidth + 8) + inset);
+      const headerMap = new Map(snapshots.map(item => [item.id, item]));
+      for (const path of svgRef.current?.querySelectorAll<SVGPathElement>('[data-run-after-edge-item]') || []) {
+        const source = positions.get(path.dataset.runAfterEdgeOwner!), target = positions.get(path.dataset.runAfterEdgeTarget!);
+        const sourceHeader = headerMap.get(path.dataset.runAfterEdgeOwner!), targetHeader = headerMap.get(path.dataset.runAfterEdgeTarget!);
+        if (!source || !target || !sourceHeader || !targetHeader) continue;
+        const origin = sourceHeader.stepAnchors.get(path.dataset.runAfterEdgeItem!);
+        if (!origin) { path.setAttribute('d', ''); continue; }
+        const sx = source.x + origin.x, sy = source.y + origin.y;
+        const tx = target.x + targetHeader.headerX - 3, ty = target.y + targetHeader.headerY;
+        const lane = Math.min(source.lane, target.lane), r = 4, down = ty >= sy ? 1 : -1;
+        const d = `M ${sx} ${sy} H ${lane + r} Q ${lane} ${sy} ${lane} ${sy + down * r} V ${ty - down * r} Q ${lane} ${ty} ${lane + r} ${ty} H ${tx}`;
+        if (path.getAttribute('d') !== d) path.setAttribute('d', d);
+        const dot = path.nextElementSibling;
+        dot?.setAttribute('cx', String(sx)); dot?.setAttribute('cy', String(sy));
+      }
     };
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(measure); };
     measure();
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
-    const trigger = document.querySelector<HTMLElement>(
-      `[data-global-run-after-editor-trigger="${CSS.escape(editorState.tabId)}"]`,
-    );
-    if (trigger) observer?.observe(trigger);
-    const onAncestorScroll = (event: Event) => {
-      if (!trigger?.isConnected || scrollMovesAnchor(event.target, trigger)) measure();
-    };
-    window.addEventListener('resize', measure);
-    window.addEventListener('scroll', onAncestorScroll, true);
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener('resize', measure);
-      window.removeEventListener('scroll', onAncestorScroll, true);
-    };
-  }, [editorState, geometryKey, inventory.tabs.length, promptQueueWidth, queues, setEditorState, showDisabled]);
-
-  useEffect(() => {
-    if (editorState?.mode !== 'preview') return;
-    const recheck = (point: { clientX: number; clientY: number } | null) => {
-      if (pickingRewind || editorGestureActive) return;
-      const hub = editorPopoverRef.current?.getBoundingClientRect() || null;
-      const trigger = document.querySelector<HTMLElement>(
-        `[data-global-run-after-editor-trigger="${CSS.escape(editorState.tabId)}"]`,
-      )?.getBoundingClientRect() || null;
-      const satellites = [trigger, ...queueHoverSatelliteRects(editorPopoverRef.current)];
-      if (point && pointInHoverCluster({ hub, satellites, x: point.clientX, y: point.clientY, pad: 2 })) return;
-      if (!beforeCloseRef.current('outside')) return;
-      setEditorState(null);
-    };
-    const onMove = (event: MouseEvent) => {
-      editorPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
-      recheck(event);
-    };
-    const onExitWindow = () => { editorPointerRef.current = null; recheck(null); };
-    const onMouseOut = (event: MouseEvent) => { if (!event.relatedTarget) onExitWindow(); };
-    recheck(editorPointerRef.current);
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseout', onMouseOut);
-    window.addEventListener('blur', onExitWindow);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseout', onMouseOut);
-      window.removeEventListener('blur', onExitWindow);
-    };
-  }, [beforeCloseRef, editorGestureActive, editorState, pickingRewind, setEditorState]);
-
-  return (
-    <div data-global-run-after-queues style={{ minHeight: 0 }}>
-      <div data-global-run-after-map-scroll
-        style={{ minHeight: 0, overflowX: 'auto', overflowY: 'hidden', padding: '2px 2px 9px' }}>
-        <QueueDependencyMap inventory={inventory} queues={queues} busy={busy} selectedId={selectedId}
-          onSelect={select} onPreview={preview} />
-
-        {!!disabledTabs.length && <div style={{ marginTop: 8, borderTop: '1px solid #2e2e2e', paddingTop: 7 }}>
-          <button type="button" className="gra-control" aria-expanded={showDisabled} onClick={toggleDisabled}
-            style={{ ...button, height: 25, display: 'inline-flex', alignItems: 'center', gap: 5, color: '#8f8f95' }}>
-            {showDisabled ? <EyeOff size={12} /> : <Eye size={12} />} Выключенные · {disabledTabs.length}
-          </button>
-          {showDisabled && <div data-global-run-after-disabled style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 7 }}>
-            {disabledTabs.map((tab) => <div key={tab.id} style={{ width: GRAPH_NODE_W, height: disabledNodeHeight }}>
-              <QueueTabNode tab={tab} queue={queues.get(tab.id)} busy={busy.get(tab.id) === true}
-                selected={selectedId === tab.id} onEdit={() => select(tab.id)} onPreview={(event) => preview(tab.id, event)} />
-            </div>)}
-          </div>}
-        </div>}
-      </div>
-
-      {editorState && selectedTab && selectedQueue && createPortal(
-        <div
-          ref={editorPopoverRef}
-          data-global-run-after-floating-editor={selectedTab.id}
-          data-global-run-after-editor-mode={editorState.mode}
-          data-run-after-satellite="true"
-          style={{
-            position: 'fixed',
-            left: editorPosition.left,
-            ...(editorPosition.top === null ? { bottom: editorPosition.bottom ?? PANEL_MARGIN } : { top: editorPosition.top }),
-            width: editorPosition.width,
-            maxHeight: editorPosition.maxHeight,
-            paddingTop: 11,
-            // Embedded queue satellites use 15100+. Keep the shell below them
-            // while still above the 15000 global overview.
-            zIndex: 15050,
-            boxSizing: 'border-box',
-            pointerEvents: 'auto',
-            filter: 'drop-shadow(0 12px 24px rgba(0,0,0,0.46))',
-          }}
-        >
-          <PromptQueueOverlay
-            tabId={selectedTab.id}
-            sessionType={selectedTab.provider}
-            agentBusy={busy.get(selectedTab.id) === true}
-            inputSurface="history"
-            embedded
-            embeddedPinned={editorState.mode === 'pinned'}
-            embeddedWidth={editorPosition.width}
-            embeddedMaxHeight={Math.max(90, editorPosition.maxHeight - 11)}
-            beforeCloseRef={beforeCloseRef}
-            onRewindTargetModeChange={onRewindTargetModeChange}
-            onHoverGestureChange={relayEditorGesture}
-          />
-        </div>,
-        document.body,
-      )}
-    </div>
-  );
+    const observer = new ResizeObserver(schedule);
+    observer.observe(canvas);
+    canvas.querySelectorAll<HTMLElement>('[data-global-run-after-node], [data-global-run-after-heading], [data-prompt-queue-edge-controls], [data-prompt-queue-item]')
+      .forEach(element => observer.observe(element));
+    return () => { observer.disconnect(); if (frame) cancelAnimationFrame(frame); };
+  }, [geometryKey, showDisabled, widthLimit, resizeEnabled, onContentWidth]);
+  return <div ref={canvasRef} data-global-run-after-queues data-global-run-after-graph
+    style={{ position: 'relative', minWidth: 0, margin: '6px 2px 0' }}>
+    {!primary.size && <div data-global-run-after-empty style={{ position: 'absolute', top: 0, left: 8, width: 'max-content', maxWidth: 'var(--ra-layout-width)', color: '#777', fontSize: 11 }}>Нет активных цепочек Run After</div>}
+    {visible.map(tab => <QueueBlock key={tab.id} tab={tab}
+      queue={queues.get(tab.id) || usePromptQueueStore.getState().getQueue(tab.id)} busy={busy.get(tab.id) === true}
+      awaited={awaitedTargets.has(tab.id)}
+      graphTargets={graphTargets} register={register} onRewindTargetModeChange={onRewindTargetModeChange}
+      onHoverGestureChange={onHoverGestureChange} />)}
+    {!!disabled.size && <div ref={shelfRef} data-global-run-after-disabled-shelf
+      style={{ position: 'absolute', left: 0, top: 0, width: '100%', borderTop: '1px solid #2e2e2e', paddingTop: 7 }}>
+      <button type="button" className="gra-control" aria-expanded={showDisabled}
+        onClick={() => { if (!showDisabled || beforeCloseRef.current()) setShowDisabled(value => !value); }}
+        style={{ ...button, height: 25, display: 'inline-flex', alignItems: 'center', gap: 5, color: '#8f8f95' }}>
+        {showDisabled ? <EyeOff size={12} /> : <Eye size={12} />} Выключенные · {disabled.size}
+      </button>
+    </div>}
+    <svg ref={svgRef} aria-hidden data-global-run-after-links
+      style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none', zIndex: 2 }}>
+      <defs><marker id={markerId} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+        <path d="M 0 0 L 8 4 L 0 8 z" fill="#9b83e3" />
+      </marker></defs>
+      {visibleEdges.map(edge => <g key={edge.source + ':' + edge.itemId}><path data-run-after-edge={edge.kind}
+        data-run-after-edge-owner={edge.source} data-run-after-edge-target={edge.target} data-run-after-edge-item={edge.itemId}
+        fill="none" stroke={edge.kind === 'current' ? '#9b83e3' : '#676072'} strokeWidth={1.2}
+        strokeDasharray={edge.kind === 'current' ? undefined : '3 3'} markerEnd={`url(#${markerId})`} />
+        <circle data-run-after-source-dot={edge.itemId} r={2} fill={edge.kind === 'current' ? '#a78bfa' : '#8c7caa'} />
+      </g>)}
+    </svg>
+  </div>;
 }
 
 export function GlobalRunAfterControl() {
   const [mode, setMode] = useState<'hidden' | 'preview' | 'pinned'>('hidden');
   const [page, setPage] = useState<'queues' | 'compact'>('queues');
-  const [editorState, setEditorState] = useState<QueueEditorState | null>(null);
   const [pickingRewind, setPickingRewind] = useState(false);
   const [editorGestureActive, setEditorGestureActive] = useState(false);
   const [panelSize, setPanelSize] = useState(loadPanelSize);
@@ -970,10 +632,24 @@ export function GlobalRunAfterControl() {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const panelContentRef = useRef<HTMLDivElement>(null);
+  const pagesRef = useRef<HTMLDivElement>(null);
+  const minimumWidthRef = useRef(PANEL_MIN_W);
+  const contentWidthRef = useRef<number | null>(null);
+  const [contentWidth, setContentWidth] = useState<number | null>(null);
+  const [minimumWidth, setMinimumWidth] = useState(PANEL_MIN_W);
+  // Closing the popup or visiting AutoCompact is not permission to reorder
+  // the same tab cards when the user returns. No persisted queue state changes.
+  const layoutMemoryRef = useRef<QueueLayoutMemory>({ primary: null, secondary: null });
   const beforeCloseRef = useRef<(reason?: 'outside') => boolean>(() => true);
   const resizeActiveRef = useRef(false);
+  const onContentWidth = useCallback((width: number) => {
+    const next = Math.ceil(width);
+    contentWidthRef.current = next;
+    if (!resizeActiveRef.current) setContentWidth(previous => previous === next ? previous : next);
+  }, []);
   const editorGestureActiveRef = useRef(false);
   const previewPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const hoverReturnRef = useRef(createHoverReturnGate());
   const handleEditorGesture = useCallback((active: boolean, point: { clientX: number; clientY: number } | null) => {
     // Captured pointermove/native drag can suppress compatibility mousemove.
     // Forward actual gesture coordinates; never recover with a delayed close.
@@ -997,21 +673,17 @@ export function GlobalRunAfterControl() {
     [activities, inventory.tabs],
   );
   const visible = mode !== 'hidden';
+  const fittedWidth = Math.min(position.width, Math.max(minimumWidth, contentWidth ?? position.width));
   const closePanel = useCallback((reason?: 'outside') => {
     // Hover dismissal is an editor exit too. Blur fields before unmount so
     // threshold/timer edits take the same save path as an ordinary blur.
     const active = document.activeElement;
-    const floatingEditor = editorState?.tabId ? document.querySelector<HTMLElement>(
-      `[data-global-run-after-floating-editor="${CSS.escape(editorState.tabId)}"]`,
-    ) : null;
-    if (active instanceof HTMLElement && (panelRef.current?.contains(active) || floatingEditor?.contains(active))) {
-      active.blur();
-    }
+    if (active instanceof HTMLElement && panelRef.current?.contains(active)) active.blur();
     if (!beforeCloseRef.current(reason)) return false;
-    setEditorState(null);
+    hoverReturnRef.current.reset();
     setMode('hidden');
     return true;
-  }, [editorState?.tabId]);
+  }, []);
   const lastPositionWarningRef = useRef(0);
   useEffect(() => {
     console.log('[GlobalRunAfter:Presentation] mode=' + mode + ' activeQueues=' + activeCount);
@@ -1030,8 +702,12 @@ export function GlobalRunAfterControl() {
       const viewportW = Math.max(1, window.innerWidth);
       const viewportH = Math.max(1, window.innerHeight);
       const maxW = Math.max(1, viewportW - PANEL_MARGIN * 2);
-      const width = Math.min(panelSize.width, maxW);
-      const left = clamp(rect.left, PANEL_MARGIN, viewportW - width - PANEL_MARGIN);
+      const controlsWidth = globalRunAfterMinimumWidth(panelRef.current, pagesRef.current);
+      minimumWidthRef.current = controlsWidth;
+      setMinimumWidth(previous => previous === controlsWidth ? previous : controlsWidth);
+      const width = Math.min(Math.max(panelSize.width, controlsWidth), maxW);
+      const displayedWidth = panelSize.resizeEnabled ? width : Math.min(width, Math.max(controlsWidth, contentWidth ?? width));
+      const left = clamp(rect.left, PANEL_MARGIN, viewportW - displayedWidth - PANEL_MARGIN);
       const top = Math.max(PANEL_MARGIN, rect.bottom + PANEL_GAP);
       const maxH = Math.max(1, viewportH - top - PANEL_MARGIN);
       const height = Math.min(panelSize.height, maxH);
@@ -1048,6 +724,7 @@ export function GlobalRunAfterControl() {
     measure();
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
     if (triggerRef.current) observer?.observe(triggerRef.current);
+    if (pagesRef.current) observer?.observe(pagesRef.current);
     window.addEventListener('resize', measure);
     window.addEventListener('scroll', onAncestorScroll, true);
     return () => {
@@ -1055,28 +732,27 @@ export function GlobalRunAfterControl() {
       window.removeEventListener('resize', measure);
       window.removeEventListener('scroll', onAncestorScroll, true);
     };
-  }, [panelSize, sidebarWidth, visible]);
+  }, [panelSize, sidebarWidth, visible, contentWidth]);
 
   const recheckPreviewHover = useCallback((point: { clientX: number; clientY: number } | null) => {
     if (mode !== 'preview' || pickingRewind || editorGestureActive || resizeActiveRef.current) return;
     if (!point) { closePanel(); return; }
     const panelRect = panelRef.current?.getBoundingClientRect() || null;
-    const floatingEditor = editorState?.tabId ? document.querySelector<HTMLElement>(
-      `[data-global-run-after-floating-editor="${CSS.escape(editorState.tabId)}"]`,
-    ) : null;
     const satelliteRects = [triggerRef.current?.getBoundingClientRect() || null,
       ...Array.from(panelRef.current?.querySelectorAll<HTMLElement>(
         '[data-global-run-after-pages], [data-global-run-after-resize]',
-      ) || []).map((element) => element.getBoundingClientRect()),
-      floatingEditor?.getBoundingClientRect() || null,
-      ...queueHoverSatelliteRects(floatingEditor)];
+      ) || []).map(element => element.getBoundingClientRect())];
+    const insideParent = [panelRect, ...satelliteRects].some(rect => pointInRect(rect, point.clientX, point.clientY, 2));
+    if (hoverReturnRef.current.holds(point, insideParent)) return;
+    satelliteRects.push(...queueHoverSatelliteRects(panelRef.current));
     if (pointInHoverCluster({ hub: panelRect, satellites: satelliteRects, x: point.clientX, y: point.clientY, pad: 2 })) return;
     closePanel();
-  }, [closePanel, editorGestureActive, editorState?.tabId, mode, pickingRewind]);
+  }, [closePanel, editorGestureActive, mode, pickingRewind]);
   const recheckPreviewHoverRef = useRef(recheckPreviewHover);
   recheckPreviewHoverRef.current = recheckPreviewHover;
   useEffect(() => {
-    if (mode !== 'preview') return;
+    if (mode !== 'preview') { hoverReturnRef.current.reset(); return; }
+    const onChildClick = (event: MouseEvent) => captureQueueHoverReturn(event, panelRef.current, hoverReturnRef.current);
     const onMove = (event: MouseEvent) => {
       previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
       recheckPreviewHover(event);
@@ -1086,10 +762,12 @@ export function GlobalRunAfterControl() {
     // Rewind temporarily hides the surface, not its ownership. Once target
     // selection ends, recheck the real last pointer even without a new move.
     recheckPreviewHover(previewPointerRef.current);
+    window.addEventListener('click', onChildClick, true);
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseout', onMouseOut);
     window.addEventListener('blur', onExitWindow);
     return () => {
+      window.removeEventListener('click', onChildClick, true);
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseout', onMouseOut);
       window.removeEventListener('blur', onExitWindow);
@@ -1098,7 +776,8 @@ export function GlobalRunAfterControl() {
 
   const { start: startResizeGesture } = usePointerGesture();
   const startResize = useCallback((edge: 'right' | 'bottom' | 'corner', event: React.PointerEvent<HTMLElement>) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || !panelSize.resizeEnabled) return;
+    minimumWidthRef.current = globalRunAfterMinimumWidth(panelRef.current, pagesRef.current);
     previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
     const liveRect = panelRef.current?.getBoundingClientRect();
     const startX = event.clientX;
@@ -1118,7 +797,7 @@ export function GlobalRunAfterControl() {
       onMove: (moveEvent) => {
         previewPointerRef.current = { clientX: moveEvent.clientX, clientY: moveEvent.clientY };
         const width = edge === 'bottom' ? startWidth
-          : clamp(startWidth + moveEvent.clientX - startX, Math.min(PANEL_MIN_W, maxWidth), maxWidth);
+          : clamp(startWidth + moveEvent.clientX - startX, Math.min(minimumWidthRef.current, maxWidth), maxWidth);
         const height = edge === 'right' ? startHeight
           : clamp(startHeight + moveEvent.clientY - startY, Math.min(170, maxHeight), maxHeight);
         nextWidth = edge === 'bottom' ? panelSize.width : width;
@@ -1145,11 +824,11 @@ export function GlobalRunAfterControl() {
         if (!moved || reason !== 'up') {
           if (panelRef.current) {
             panelRef.current.style.width = `${position.width}px`;
-            panelRef.current.style.height = panelSize.heightFixed ? `${position.height}px` : 'auto';
+            panelRef.current.style.height = panelSize.resizeEnabled ? `${position.height}px` : 'auto';
             panelRef.current.style.maxHeight = `${position.height}px`;
           }
           if (panelContentRef.current) {
-            panelContentRef.current.style.maxHeight = panelSize.heightFixed
+            panelContentRef.current.style.maxHeight = panelSize.resizeEnabled
               ? 'none'
               : `${Math.max(90, position.height - 26)}px`;
           }
@@ -1159,8 +838,9 @@ export function GlobalRunAfterControl() {
         setPanelSize({
           width: nextWidth,
           height: nextHeight,
-          heightFixed: panelSize.heightFixed || edge !== 'right',
+          resizeEnabled: true,
         });
+        if (contentWidthRef.current !== null) setContentWidth(contentWidthRef.current);
         recheckAfterGesture();
       },
     });
@@ -1170,7 +850,6 @@ export function GlobalRunAfterControl() {
   const switchPage = (next: 'queues' | 'compact') => {
     if (next === page) return;
     if (!beforeCloseRef.current()) return;
-    setEditorState(null);
     setPage(next);
   };
   const togglePinned = () => {
@@ -1197,6 +876,7 @@ export function GlobalRunAfterControl() {
         }
       `}</style>
       <button ref={triggerRef} type="button" data-global-run-after-trigger aria-expanded={visible}
+        aria-label={`Run After · ${activeCount}`}
         data-global-run-after-auto-compact-running={runningCompacts.total || undefined}
         onMouseEnter={(event) => {
           previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
@@ -1214,7 +894,7 @@ export function GlobalRunAfterControl() {
             height: '44%', background: 'linear-gradient(180deg, transparent, #ddd6fe 42%, #8b5cf6 68%, transparent)',
             willChange: 'transform' }} />
         </span>}
-        <GitBranch size={13} /> run-after · {activeCount}
+        <GitBranch size={13} aria-hidden="true" /> {activeCount}
         {policy.enabled && <Percent size={11} color="#d9a76f" aria-label={`Автокомпакт включён при ${policy.percent}%`} />}
       </button>
 
@@ -1236,13 +916,14 @@ export function GlobalRunAfterControl() {
             />
           )}
           <div ref={panelRef} data-global-run-after-panel data-global-run-after-mode={mode}
-            style={{ position: 'fixed', zIndex: 15000, left: position.left, top: position.top, width: position.width,
-              height: panelSize.heightFixed ? position.height : 'auto', maxHeight: position.height,
+            data-global-run-after-sizing={panelSize.resizeEnabled ? 'resize' : 'content'}
+            style={{ position: 'fixed', zIndex: 15000, left: position.left, top: position.top, width: panelSize.resizeEnabled ? position.width : fittedWidth,
+              height: panelSize.resizeEnabled ? position.height : 'auto', maxHeight: position.height,
               boxSizing: 'border-box', visibility: pickingRewind ? 'hidden' : 'visible', display: 'flex',
               flexDirection: 'column', minWidth: 0, minHeight: 0, overflow: 'visible', background: '#181818', color: '#ccc',
               border: `1px solid ${mode === 'pinned' ? 'rgba(255,255,255,0.34)' : '#414141'}`, borderRadius: 9,
               padding: '18px 9px 8px', fontSize: 12, boxShadow: '0 12px 35px #0008' }}>
-        <div data-global-run-after-pages style={{ position: 'absolute', top: 0, left: 12, transform: 'translateY(-50%)',
+        <div ref={pagesRef} data-global-run-after-pages style={{ position: 'absolute', top: 0, left: 12, transform: 'translateY(-50%)',
           display: 'inline-flex', gap: 4, alignItems: 'center', padding: '0 4px', background: '#181818', zIndex: 3 }}>
           <button type="button" className="gra-page" onClick={() => switchPage('queues')} aria-pressed={page === 'queues'}
             style={{ ...button, height: 28, padding: '0 9px', color: page === 'queues' ? '#e6bb8b' : '#929297',
@@ -1254,32 +935,45 @@ export function GlobalRunAfterControl() {
             <span>Автокомпакт{policy.enabled ? ` · ≥${policy.percent}%` : ''}</span>
             {runningCompacts.total > 0 && <AutoCompactRunningIndicator count={runningCompacts.total} scope="global" />}
           </button>
+          <button type="button" className="gra-page" data-global-run-after-resize-toggle
+            aria-label="Настроить размер" aria-pressed={panelSize.resizeEnabled}
+            title={panelSize.resizeEnabled ? 'Скрыть настройку размера' : 'Настроить предел ширины и высоты'}
+            onClick={() => {
+              if (contentWidthRef.current !== null) setContentWidth(contentWidthRef.current);
+              setPanelSize(current => ({ ...current, resizeEnabled: !current.resizeEnabled }));
+            }}
+            style={{ ...button, width: 28, height: 28, padding: 0, display: 'grid', placeItems: 'center',
+              color: panelSize.resizeEnabled ? '#a78bfa' : '#929297',
+              borderColor: panelSize.resizeEnabled ? '#8b5cf6' : '#363636' }}><PanelRightDashed size={14} /></button>
         </div>
 
-        <div ref={panelContentRef} style={{ flex: panelSize.heightFixed ? 1 : '0 1 auto', minHeight: 0,
-          maxHeight: panelSize.heightFixed ? 'none' : Math.max(90, position.height - 26),
+        <div ref={panelContentRef} data-global-run-after-content style={{ flex: panelSize.resizeEnabled ? 1 : '0 1 auto', minHeight: 0,
+          maxHeight: panelSize.resizeEnabled ? 'none' : Math.max(0, position.height - 28),
           overflow: 'auto', scrollbarGutter: 'stable' }}>
-          {page === 'compact' ? <AutoCompactPage inventory={inventory} busy={busy} /> :
-            <QueueOverview inventory={inventory} queues={queues} busy={busy} editorState={editorState}
-              setEditorState={setEditorState} beforeCloseRef={beforeCloseRef}
-              onRewindTargetModeChange={setPickingRewind}
-              pickingRewind={pickingRewind}
-              editorGestureActive={editorGestureActive}
-              onHoverGestureChange={handleEditorGesture}
-              geometryKey={`${position.left}:${position.top}:${position.width}:${position.height}`} />}
+          {page === 'compact' ? <AutoCompactPage inventory={inventory} busy={busy} widthLimit={position.width}
+            resizeEnabled={panelSize.resizeEnabled} onContentWidth={onContentWidth} /> :
+            <QueueOverview inventory={inventory} queues={queues} busy={busy} beforeCloseRef={beforeCloseRef}
+              layoutMemoryRef={layoutMemoryRef} widthLimit={position.width} resizeEnabled={panelSize.resizeEnabled} onContentWidth={onContentWidth}
+              onRewindTargetModeChange={setPickingRewind} onHoverGestureChange={handleEditorGesture} />}
         </div>
 
+        {panelSize.resizeEnabled && <>
         <div data-global-run-after-resize="right" onPointerDown={(event) => startResize('right', event)}
           style={{ position: 'absolute', top: 10, right: -4, bottom: 14, width: 8, cursor: 'ew-resize',
-            userSelect: 'none', touchAction: 'none', zIndex: 2 }} />
+            userSelect: 'none', touchAction: 'none', zIndex: 2 }}>
+          <span style={{ position: 'absolute', left: 3, top: 0, bottom: 0, width: 2, borderRadius: 2, background: '#a78bfa' }} />
+        </div>
         <div data-global-run-after-resize="bottom" onPointerDown={(event) => startResize('bottom', event)}
           style={{ position: 'absolute', left: 10, right: 14, bottom: -4, height: 8, cursor: 'ns-resize',
-            userSelect: 'none', touchAction: 'none', zIndex: 2 }} />
+            userSelect: 'none', touchAction: 'none', zIndex: 2 }}>
+          <span style={{ position: 'absolute', top: 3, left: 0, right: 0, height: 2, borderRadius: 2, background: '#60a5fa' }} />
+        </div>
         <div data-global-run-after-resize="corner" onPointerDown={(event) => startResize('corner', event)} title="Изменить размер"
           style={{ position: 'absolute', right: -3, bottom: -3, width: 15, height: 15, cursor: 'nwse-resize',
             userSelect: 'none', touchAction: 'none', zIndex: 4,
-            background: 'linear-gradient(135deg, transparent 52%, rgba(255,255,255,0.22) 53%, rgba(255,255,255,0.22) 61%, transparent 62%, transparent 72%, rgba(255,255,255,0.16) 73%, rgba(255,255,255,0.16) 80%, transparent 81%)',
+            background: 'linear-gradient(135deg, transparent 52%, #a78bfa 53%, #a78bfa 61%, transparent 62%, transparent 72%, #60a5fa 73%, #60a5fa 80%, transparent 81%)',
             borderRadius: '0 0 8px 0' }} />
+        </>}
 
         <style>{`
           .gra-control, .gra-choice, .gra-page, .gra-node-action {

@@ -1,7 +1,11 @@
 import { usePointerGesture } from './hooks/usePointerGesture';
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import { startAgentSendActivity, useAgentSendPendingTabs } from './hooks/useAgentSendActivity';
-import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId } from './store/useWorkspaceStore';
+import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId, isProjectTabSavePending } from './store/useWorkspaceStore';
+import { createTabCompletionNotificationBridge } from './utils/tabCompletionNotificationBridge.mjs';
+const completionNotificationBridge = createTabCompletionNotificationBridge({
+  getState: () => useWorkspaceStore.getState(), persistencePending: isProjectTabSavePending,
+});
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
 import { describeClaudeRestoreFailure } from './utils/claudeStartupFailure.mjs';
 import { resolveAgentBusyPresentation } from './utils/agentBusyPresentation.mjs';
@@ -92,6 +96,7 @@ import { tabAllowsShellActions } from './utils/emptyTab.mjs';
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
 import { signalPromptQueueDictationResolved, usePromptQueueRunner } from './hooks/usePromptQueueRunner';
+import { useRestartAfterRunner } from './hooks/useRestartAfterRunner';
 import { openHistoryOperationOwner } from './utils/historyOperationActivity.mjs';
 import { useGitRunAfterRunner } from './hooks/useGitRunAfterRunner';
 import {
@@ -153,7 +158,7 @@ import {
   AGENT_SETTINGS_INTENT_NONE,
   createAgentSettingsIntent,
 } from './utils/agentSendSettingsContract';
-import { runHistoryPromptHandoff } from './utils/historyPromptHandoffs';
+import { runHistoryPromptHandoff, hydrateHistoryPromptHandoffFromDurableReceipt } from './utils/historyPromptHandoffs';
 import { executeHistoryRewriteRewindScenario, executeHistoryDeleteIterationScenario } from './utils/historyRewriteRewind';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { installTerminalInputFeedback } from './utils/terminalInputFeedback.mjs';
@@ -1190,6 +1195,7 @@ function App() {
   // and kill the runner). See hooks/usePromptQueueRunner.ts comment for the bug
   // it fixes (auto-run silently breaking the moment user goes to another tab).
   usePromptQueueRunner();
+  useRestartAfterRunner();
 
   // Git Run-after is project-scoped but must keep listening while the user is
   // viewing another project or Dashboard. The App-root runner owns that lifetime.
@@ -3549,6 +3555,11 @@ function App() {
           }
           return reply(true, { tabId, notFound: true });
         }
+        if (action === 'getTabCompletionNotification' || action === 'setTabCompletionNotification') {
+          const data = action === 'getTabCompletionNotification'
+            ? completionNotificationBridge.read(payload || {}) : await completionNotificationBridge.set(payload || {});
+          return reply(true, data);
+        }
         if (action === 'getStatusMarkerConfig') {
           // Mobile-web reads the desktop's status-marker palette + shape/size AND
           // the process-bar config (position/base color/shimmer) so it can render the
@@ -5642,6 +5653,12 @@ function App() {
       }
     };
     ipcRenderer.on('web:bridge-request', handleWebBridge);
+    const handleSendQueueReceipt = (_event: any, record: any) => {
+      hydrateHistoryPromptHandoffFromDurableReceipt(record);
+    };
+    ipcRenderer.on('agent:send-queue-receipt', handleSendQueueReceipt);
+    void ipcRenderer.invoke('agent:send-queue-ready', true).catch((error: any) =>
+      console.warn('[AgentSendQueue] renderer readiness failed:', error?.message));
 
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
@@ -5911,6 +5928,8 @@ function App() {
       ipcRenderer.removeListener('codex:model-migration-settings-pending', handleCodexModelMigrationPending);
       ipcRenderer.removeListener('codex:model-migration-settings-applied', handleCodexModelMigrationApplied);
       ipcRenderer.removeListener('web:bridge-request', handleWebBridge);
+      ipcRenderer.removeListener('agent:send-queue-receipt', handleSendQueueReceipt);
+      void ipcRenderer.invoke('agent:send-queue-ready', false).catch(() => {});
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
       ipcRenderer.removeListener('terminal:exit', handleTerminalExit);

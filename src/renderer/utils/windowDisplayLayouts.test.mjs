@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyWindowDisplay, reconcileWindowDisplay, revealHiddenWindow, reconcileWorkspaceDisplayPatch } from './windowDisplayLayouts.mjs';
+import { applyWindowDisplay, reconcileWindowDisplay, revealHiddenWindow, reconcileWorkspaceDisplayPatch,
+  splitWindowPane, windowSplitAvailability } from './windowDisplayLayouts.mjs';
 import { paneGridRects, paneColumns, paneTabs, paneSlots, selectChooserSlot, dropTabFromAllPaneStrips, sanitizePanes, removePaneAt, addTabToPane } from './splitPanesModel.mjs';
 import { buildSessionSnapshot } from './sessionSnapshot.mjs';
 import { captureSpaceLayout, restoreSpaces } from './workspaceSpacesModel.mjs';
@@ -16,6 +17,91 @@ const original = () => ({ splitPanes: ['a', 'b', 'c', 'd'].map((id, i) => ({
 })), splitFocusedIndex: 0, splitSizes: { cols: [.3, .3, .4], rows: [[1], [1], [.6, .4]] } });
 const visible = layout => layout.splitPanes.filter(p => !p.displayHidden).map(p => p.tabId);
 const idOf = (layout, tab) => layout.splitPanes.find(p => p.tabId === tab).windowId;
+
+const hiddenSplitFixture = () => ({ windowDisplayKey: 'builtin', windowDisplayLayouts: {},
+  splitFocusedIndex: 0, splitSizes: null, splitPanes: [
+    { projectId: 'p', tabId: 'a', windowId: 'a' },
+    { projectId: 'p', tabId: 'b', windowId: 'b', column: 7, displayHidden: true,
+      displayRect: { leftPct: 50, widthPct: 50, topPct: 0, heightPct: 100 },
+      tabs: [{ projectId: 'p', tabId: 'b' }, { projectId: 'q', tabId: 'b2' }] },
+  ] });
+
+for (const side of ['left', 'right', 'above', 'below']) {
+  test(`split hidden window ${side} uses the visible grid and preserves content identity`, () => {
+    const initial = hiddenSplitFixture();
+    const hidden = initial.splitPanes[1];
+    const opened = splitWindowPane(freeze(initial.splitPanes), 0, null, 0, side);
+    assert.equal(opened.panes.length, 2);
+    assert.equal(opened.panes[opened.focusedIndex].windowId, 'b');
+    assert.deepEqual(paneSlots(opened.panes[opened.focusedIndex]), paneSlots(hidden));
+    const rect = paneGridRects(opened.panes, null)[opened.focusedIndex];
+    assert.deepEqual(rect, side === 'left'
+      ? { leftPct: 0, topPct: 0, widthPct: 50, heightPct: 100 }
+      : side === 'right' ? { leftPct: 50, topPct: 0, widthPct: 50, heightPct: 100 }
+      : side === 'above' ? { leftPct: 0, topPct: 0, widthPct: 100, heightPct: 50 }
+      : { leftPct: 0, topPct: 50, widthPct: 100, heightPct: 50 });
+  });
+}
+
+test('split preserves other hidden windows, then falls back to the ordinary empty slot', () => {
+  const initial = hiddenSplitFixture();
+  const other = { projectId: 'p', tabId: 'c', windowId: 'c', displayHidden: true, column: 10 };
+  let next = splitWindowPane([...initial.splitPanes, other], 0, null, 0);
+  assert.strictEqual(next.panes[2], other, 'hidden geometry is not re-columned by the visible split');
+  assert.equal(next.panes[2].displayHidden, true);
+  next = splitWindowPane(next.panes, 1, null, 1);
+  assert.deepEqual(next.panes.map(p => p.windowId), ['a', 'b', 'c']);
+  next = splitWindowPane(next.panes, 2, null, 2);
+  assert.equal(next.panes.length, 4);
+  assert.equal(next.panes[3].tabId, '');
+  assert.equal(splitWindowPane(next.panes, 3, null, 3), null);
+});
+
+test('filling a fresh placeholder removes its profile address without changing another monitor layout', () => {
+  let layout = hiddenSplitFixture();
+  layout.splitPanes.splice(1, 0, { projectId: '', tabId: '', windowId: 'placeholder', column: 1 });
+  layout = reconcileWindowDisplay(layout, small);
+  const external = { positions: [{ windowId: 'b', column: 0, row: 0 }, { windowId: 'a', column: 1, row: 0 }],
+    focusedWindowId: 'a', sizes: { cols: [.4, .6], rows: [[1], [1]] } };
+  layout.windowDisplayLayouts.external = external;
+  assert.equal(windowSplitAvailability(layout.splitPanes, 0).horizontal, true);
+  layout = reconcileWindowDisplay(revealHiddenWindow(layout, 1, 'b'), small);
+  assert.equal(layout.splitPanes.length, 2);
+  assert.ok(!JSON.stringify(layout.windowDisplayLayouts).includes('placeholder'));
+  assert.deepEqual(layout.windowDisplayLayouts.external, external);
+  const roundTrip = applyWindowDisplay(applyWindowDisplay(layout, big), small);
+  assert.deepEqual(visible(roundTrip), ['a', 'b']);
+  assert.equal(roundTrip.splitPanes.length, 2);
+});
+
+test('chooser, parked chips and return history are not disposable blank windows', () => {
+  for (const fields of [
+    { tabs: [{ slotId: 'choose', projectId: 'p' }], selectedSlotId: 'choose' },
+    { tabs: [{ projectId: 'p', tabId: 'parked' }] },
+    { history: [{ projectId: 'p', tabId: 'previous' }] },
+    { prevProjectId: 'p', prevTabId: 'legacy-previous' },
+    { detachedTabs: [{ projectId: 'p', tabId: 'removed', closedOrder: 4 }] },
+  ]) {
+    const layout = hiddenSplitFixture();
+    layout.splitPanes[0] = { projectId: '', tabId: '', windowId: 'a', ...fields };
+    const shown = revealHiddenWindow(layout, 0, 'b');
+    assert.equal(shown.splitPanes.length, 2);
+    assert.equal(shown.splitPanes[1].windowId, 'a');
+    assert.equal(shown.splitPanes[1].displayHidden, true);
+    for (const [key, value] of Object.entries(fields)) assert.deepEqual(shown.splitPanes[1][key], value);
+  }
+});
+
+test('a hidden empty window cannot disable a visible split and a stale hidden anchor cannot move it', () => {
+  const panes = [{ projectId: 'p', tabId: 'a', windowId: 'a' },
+    { projectId: '', tabId: '', windowId: 'hidden-blank', displayHidden: true }];
+  assert.equal(windowSplitAvailability(panes, 0).horizontal, true);
+  assert.equal(splitWindowPane(panes, 0, null, 1), null);
+  const next = splitWindowPane(panes, 0, null, 0);
+  assert.equal(next.panes.length, 2);
+  assert.equal(next.panes[1].windowId, 'hidden-blank');
+  assert.equal(next.panes[1].displayHidden, undefined);
+});
 
 test('hidden source remains an exact MCP target; sidebar switcher can still offer its tabs', () => {
   const layout = applyWindowDisplay(applyWindowDisplay(original(), big), small);

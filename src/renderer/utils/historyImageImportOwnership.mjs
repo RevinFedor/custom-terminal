@@ -1,4 +1,5 @@
 import { insertComposerSnapshotAtSelection } from './composerChips.mjs';
+import { insertHistoryClipboardSnapshotAtSelection } from './composerClipboard.mjs';
 import { insertPromptImageAttachments, retainPromptImageRefsForText } from './promptImageAttachments.mjs';
 
 export const HISTORY_IMAGE_PENDING_MARKER = '[Image saving…]';
@@ -105,7 +106,8 @@ export function prepareHistoryImageImport({ ownerTabId, text = '', images = [], 
   };
 }
 
-export function resolveHistoryImageImport({ operation, text = '', images = [], chips = [], pendingImages = [] } = {}) {
+export function resolveHistoryImageImport({ operation, text = '', images = [], chips = [], pendingImages = [],
+  pendingContextUpdates = [], dismissedContextUpdateIds = [] } = {}) {
   if (!operation?.id) return null;
   const outcome = getHistoryImageImportOutcome(operation);
   if (!outcome) return null;
@@ -117,7 +119,8 @@ export function resolveHistoryImageImport({ operation, text = '', images = [], c
     start: owned.start, end: owned.end, insertedText: snapshot.text,
     insertedImagePaths: snapshot.imagePaths || [] });
   const insertedText = imageInsertion.text.slice(owned.start, imageInsertion.caret);
-  const insertion = insertComposerSnapshotAtSelection({ text, chips, insertedText,
+  const insertion = insertHistoryClipboardSnapshotAtSelection({ text, chips, insertedText,
+    pendingContextUpdates, dismissedContextUpdateIds,
     insertedChips: snapshot.chips || [], selectionStart: owned.start, selectionEnd: owned.end });
   return { ...insertion, images: retainPromptImageRefsForText(insertion.text, imageInsertion.imagePaths),
     pendingImages: mapHistoryPendingImageImports(text, pendingImages,

@@ -19,6 +19,21 @@ const event = (line, type, fields = {}) => ({ type: 'event_msg', __line: line, _
   timestamp: '2026-09-13T22:49:33.457Z', payload: { type, turn_id: 'turn-1', ...fields } });
 const failed = event(9, 'task_complete', { error: { message: authError, codex_error_info: 'other' } });
 const records = [event(6, 'task_started'), event(8, 'user_message', { message: 'one prompt' }), failed];
+
+test('observed2846 typed capacity message stays exact in canonical and live History, not a generic provider-error caption', () => {
+  const text = 'Selected model is at capacity. Please try a different model.';
+  const capacity = { ...event(939, 'task_complete', { turn_id: '01a10240-7bd0-7320-99ea-8b4d8d4dc437',
+    error: { message: text, codex_error_info: 'server_overloaded' } }), __byteOffset: 6900145,
+    timestamp: '2026-10-03T15:18:51.454Z' };
+  const row = codexProviderErrorEntry(capacity, sid);
+  assert.equal(row.content, text);
+  assert.equal(row.role, 'provider-error', 'capacity is still a failed provider request, not successful completion');
+  assert.equal(row.providerError.code, 'server_overloaded');
+  assert.equal(classifyCodexTurnEvent('task_complete', capacity.payload).reason, 'model_capacity');
+  const history = codexData._api.buildCodexFullHistory([capacity], sid);
+  assert.equal(history.find(entry => entry.role === 'provider-error').content, text);
+  assert.equal(codexProviderErrorMessage(capacity, sid).message.content[0].text, text);
+});
 const declaration = (source, name) => {
   const ast = ts.createSourceFile('actual.js', source, ts.ScriptTarget.Latest, true);
   return ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name).getText(ast);

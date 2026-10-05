@@ -1,24 +1,38 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { PanelsTopLeft } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { paneSlots } from '../../utils/splitPanesModel.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
-import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
+import { hiddenWindowHoverContains } from '../../utils/hiddenWindowHover.mjs';
+import { hiddenWindowTabContextHost } from '../../utils/tabContextSurface.mjs';
+import { openTabContextMenuAt, TAB_CONTEXT_MENU_CLOSE_EVENT, TAB_RENAME_REQUEST_EVENT } from './TabBar';
+import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 import TabCard from './TabCard';
 import { useUIStore } from '../../store/useUIStore';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 
 type PreviewTab = { id: string; projectId: string; name: string; chooser?: boolean };
+type MenuLease = { host: string; windowId: string; tab: PreviewTab };
+type Rename = { tab: PreviewTab; windowId: string; draft: string };
 
 /** Background chooses the window's current selection; a card chooses its exact tab. */
 export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: number; spaceId: string }) {
   const button = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
+  const instanceId = useId();
+  const menuLease = useRef<MenuLease | null>(null);
+  const [renaming, setRenaming] = useState<Rename | null>(null);
+  const renameRef = useRef(renaming);
+  renameRef.current = renaming;
+  const renameInput = useInlineRenameInputRef(!!renaming);
+  const pointer = useRef<{ x: number; y: number } | null>(null);
+  const recheckHover = useRef<() => void>(() => {});
   const [target, setTarget] = useState<{ windowId: string; spaceId: string; displayKey: string | null } | null>(null);
   const [position, setPosition] = useState({ left: 0, top: 0 });
-  const [hoveredWindowId, setHoveredWindowId] = useState<string | null>(null);
   const [openMode, setOpenMode] = useState<'hover' | 'pinned' | null>(null);
+  const targetRef = useRef(target);
+  targetRef.current = target;
   const tabGap = useUIStore(state => state.tabGeometry.gap);
   const key = useWorkspaceStore(state => {
     if (state.activeSpaceId !== spaceId) return '[]';
@@ -37,21 +51,81 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
   const windows: Array<{ id: string; shownTabId: string; tabs: PreviewTab[] }> = JSON.parse(key);
   const activeSpaceId = useWorkspaceStore(state => state.activeSpaceId);
   const displayKey = useWorkspaceStore(state => state.windowDisplayKey);
+  function closeContextMenu() {
+    const lease = menuLease.current;
+    menuLease.current = null;
+    if (lease) window.dispatchEvent(new CustomEvent(TAB_CONTEXT_MENU_CLOSE_EVENT, { detail: { host: lease.host } }));
+  }
+  function finishRename(commit: boolean) {
+    const value = renameRef.current;
+    if (!value) return;
+    renameRef.current = null;
+    setRenaming(null);
+    const name = value.draft.trim();
+    if (commit && name) {
+      const state = useWorkspaceStore.getState();
+      const tab = state.openProjects.get(value.tab.projectId)?.tabs.get(value.tab.id);
+      if (tab && name !== tab.name) state.renameTab(value.tab.projectId, value.tab.id, name);
+    }
+    recheckHover.current();
+  }
+  function dismissPicker() {
+    finishRename(true);
+    closeContextMenu();
+    setTarget(null);
+  }
   useEffect(() => { setTarget(null); }, [activeSpaceId, displayKey]);
   useEffect(() => {
+    if (!target) return;
+    const state = useWorkspaceStore.getState();
+    if (!state.splitPanes.some(p => p.windowId === target.windowId && !p.displayHidden)) {
+      dismissPicker(); return;
+    }
+    const holds = (windowId: string, tab: PreviewTab) => windows.some(p => p.id === windowId
+      && p.tabs.some(t => t.id === tab.id && t.projectId === tab.projectId));
+    if (menuLease.current && !holds(menuLease.current.windowId, menuLease.current.tab)) closeContextMenu();
+    if (renameRef.current && !holds(renameRef.current.windowId, renameRef.current.tab)) finishRename(false);
+  }, [key, target]);
+  useEffect(() => {
     if (!target) {
-      setHoveredWindowId(null);
       setOpenMode(null);
     }
   }, [target]);
   useEffect(() => {
     if (!target) return;
+    const onRename = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      const lease = menuLease.current;
+      if (!lease || detail?.host !== lease.host || detail?.tabId !== lease.tab.id) return;
+      const tab = useWorkspaceStore.getState().openProjects.get(lease.tab.projectId)?.tabs.get(lease.tab.id);
+      if (!tab || tab.tabType === 'file') return;
+      const value = { tab: lease.tab, windowId: lease.windowId, draft: tab.name };
+      renameRef.current = value;
+      setRenaming(value);
+    };
+    window.addEventListener(TAB_RENAME_REQUEST_EVENT, onRename);
+    return () => {
+      window.removeEventListener(TAB_RENAME_REQUEST_EVENT, onRename);
+      closeContextMenu();
+      renameRef.current = null;
+      setRenaming(null);
+    };
+  }, [target]);
+  useEffect(() => {
+    if (!target) return;
     const dismiss = (event: PointerEvent) => {
-      if (!button.current?.contains(event.target as Node) && !popup.current?.contains(event.target as Node)) setTarget(null);
+      const ownedMenu = (event.target as Element)?.closest?.('[data-tab-context-menu-host]');
+      if (menuLease.current && ownedMenu?.getAttribute('data-tab-context-menu-host') === menuLease.current.host) return;
+      if (!button.current?.contains(event.target as Node) && !popup.current?.contains(event.target as Node)) dismissPicker();
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      event.preventDefault(); event.stopPropagation(); setTarget(null); button.current?.focus();
+      const lease = menuLease.current;
+      if (lease && document.querySelector(`[data-run-after-picker-menu][data-tab-context-menu-host="${CSS.escape(lease.host)}"]`)) return;
+      event.preventDefault(); event.stopPropagation();
+      if (renameRef.current) { finishRename(false); return; }
+      if (menuLease.current) { closeContextMenu(); recheckHover.current(); return; }
+      setTarget(null); button.current?.focus();
     };
     document.addEventListener('pointerdown', dismiss, true);
     document.addEventListener('keydown', onKey, true);
@@ -81,28 +155,34 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
   useEffect(() => {
     if (!target || openMode !== 'hover') return;
     let frame = 0;
-    const onMove = (event: MouseEvent) => {
+    const check = () => {
+      if (menuLease.current || renameRef.current || !pointer.current) return;
+      const trigger = button.current;
+      if (hiddenWindowHoverContains({
+        popup: popup.current?.getBoundingClientRect() || null,
+        button: trigger?.getBoundingClientRect() || null,
+        header: trigger?.closest('[data-split-attach-row]')?.getBoundingClientRect() || null,
+        ...pointer.current,
+      })) return;
+      setTarget(null);
+    };
+    const schedule = () => {
       if (frame) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        const popupRect = popup.current?.getBoundingClientRect() || null;
-        const buttonRect = button.current?.getBoundingClientRect() || null;
-        if (pointInHoverCluster({
-          hub: popupRect,
-          satellites: [buttonRect],
-          x: event.clientX,
-          y: event.clientY,
-          pad: 6,
-        })) return;
-        setTarget(null);
-      });
+      frame = requestAnimationFrame(check);
+    };
+    recheckHover.current = schedule;
+    const onMove = (event: MouseEvent) => {
+      pointer.current = { x: event.clientX, y: event.clientY };
+      schedule();
     };
     const onWindowLeave = (event: MouseEvent) => {
-      if (event.relatedTarget === null) setTarget(null);
+      if (event.relatedTarget === null && !menuLease.current && !renameRef.current) setTarget(null);
     };
     window.addEventListener('mousemove', onMove, true);
     window.addEventListener('mouseout', onWindowLeave, true);
     return () => {
       if (frame) cancelAnimationFrame(frame);
+      recheckHover.current = () => {};
       window.removeEventListener('mousemove', onMove, true);
       window.removeEventListener('mouseout', onWindowLeave, true);
     };
@@ -118,6 +198,29 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
       setTarget({ windowId: pane.windowId, spaceId, displayKey: state.windowDisplayKey });
       setOpenMode(mode);
     }
+  };
+  const openTabMenu = (event: React.MouseEvent, windowId: string, tab: PreviewTab) => {
+    event.preventDefault(); event.stopPropagation();
+    if (!target || tab.chooser) return;
+    finishRename(true);
+    const lease = { windowId, tab, host: hiddenWindowTabContextHost(instanceId, target.spaceId, windowId, tab.id) };
+    menuLease.current = lease;
+    openTabContextMenuAt(tab.projectId, tab.id, event.clientX, event.clientY, {
+      renameHost: lease.host,
+      singleTarget: true,
+      isCurrent: () => {
+        const state = useWorkspaceStore.getState();
+        return menuLease.current === lease && targetRef.current === target
+          && state.activeSpaceId === target.spaceId && state.windowDisplayKey === target.displayKey
+          && state.splitPanes.some(p => p.windowId === windowId && p.displayHidden
+            && paneSlots(p).some((slot: any) => slot.tabId === tab.id && slot.projectId === tab.projectId));
+      },
+      onClose: () => {
+        if (menuLease.current !== lease) return;
+        menuLease.current = null;
+        recheckHover.current();
+      },
+    });
   };
   const removeHiddenChip = (candidateId: string, tabId: string): boolean => {
     const state = useWorkspaceStore.getState();
@@ -138,7 +241,8 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
     if (tab?.chooser) selected = { slotId: tab.id };
     else if (tab) selected = { projectId: tab.projectId, tabId: tab.id };
     if (state.showHiddenWindow(index, candidateId, selected)) {
-      const shown = useWorkspaceStore.getState().splitPanes[index];
+      const after = useWorkspaceStore.getState();
+      const shown = after.splitPanes[after.splitFocusedIndex];
       if (shown?.tabId && !shown.selectedSlotId) requestTabPrimaryInputFocus(shown.tabId, 'hidden-window-picker');
     }
     setTarget(null);
@@ -163,17 +267,16 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
       <PanelsTopLeft size={14} /><span>{windows.length}</span>
     </button>
     {target && createPortal(<div ref={popup} role="dialog" aria-label="Скрытые окна"
-      data-hidden-window-picker style={{ position: 'fixed', ...position, zIndex: 100060,
+      data-hidden-window-picker style={{ position: 'fixed', ...position, zIndex: 100020,
         width: 'min(420px, calc(100vw - 16px))', maxHeight: 'min(560px, calc(100vh - 16px))',
         display: 'flex', flexDirection: 'column', gap: Math.max(4, tabGap),
         overflowY: 'auto', padding: 0, background: '#242427', border: '1px solid #444', borderRadius: 7,
         boxShadow: '0 8px 24px #0008' }}>
       {windows.map(candidate => <div key={candidate.id} role="button" tabIndex={0} data-hidden-window-id={candidate.id}
         aria-label={`Показать окно: ${candidate.tabs.map(tab => tab.name).join(', ') || 'Пустое окно'}`}
-        onMouseOver={event => setHoveredWindowId((event.target as Element).closest('[data-tab-card]') ? null : candidate.id)}
-        onMouseLeave={() => setHoveredWindowId(current => current === candidate.id ? null : current)}
-        onFocus={event => setHoveredWindowId(event.target === event.currentTarget ? candidate.id : null)}
-        onBlur={() => setHoveredWindowId(current => current === candidate.id ? null : current)}
+        // A nested card is still inside this window. CSS keeps the whole
+        // surface highlighted without resetting it on descendant mouseover.
+        className="hover:bg-white/10 focus-visible:bg-white/10"
         onClick={event => {
           event.stopPropagation();
           chooseWindow(candidate.id);
@@ -185,14 +288,16 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
         style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: tabGap,
           width: '100%', minHeight: 28, boxSizing: 'border-box', textAlign: 'left', cursor: 'pointer', padding: 0,
           border: '1px solid #75658b', borderRadius: 7, margin: 0,
-          background: hoveredWindowId === candidate.id ? 'rgba(255,255,255,0.10)' : 'transparent', transition: 'none' }}>
-        {candidate.tabs.map(tab => <TabCard key={tab.id} as="button" projectId={tab.projectId} tabId={tab.id}
+          transition: 'none' }}>
+        {candidate.tabs.length === 0 && <span style={{ padding: '2px 6px', color: '#8f8f94' }}>Нет вкладки</span>}
+        {candidate.tabs.map(tab => <TabCard key={tab.id} as={renaming?.tab.id === tab.id ? 'span' : 'button'} projectId={tab.projectId} tabId={tab.id}
           chooser={tab.chooser} label={tab.name} shown={tab.id === candidate.shownTabId} showShownStripe showProjectIcon reserveSignalSpace
           data-hidden-window-tab-id={tab.chooser ? undefined : tab.id}
           data-hidden-window-slot-id={tab.chooser ? tab.id : undefined}
           title={tab.chooser ? tab.name : `${tab.name}\nCmd+клик или средний клик — убрать из окна`}
           style={{ maxWidth: '100%' }}
-          onPointerDown={event => { event.stopPropagation(); if (event.button === 1) event.preventDefault(); }}
+          onPointerDown={event => { event.stopPropagation(); if (event.button !== 0) event.preventDefault(); }}
+          onContextMenu={event => openTabMenu(event, candidate.id, tab)}
           onClick={event => {
             event.stopPropagation();
             if (!tab.chooser && event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
@@ -204,7 +309,25 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
             if (event.button !== 1 || tab.chooser) return;
             event.preventDefault(); event.stopPropagation(); removeHiddenChip(candidate.id, tab.id);
           }}
-        />)}
+        >
+          {renaming?.tab.id === tab.id ? <input ref={renameInput.ref} data-hidden-window-tab-rename
+            aria-label="Название вкладки" value={renaming.draft}
+            onChange={event => {
+              const value = { ...renaming, draft: event.target.value };
+              renameRef.current = value; setRenaming(value);
+            }}
+            onPointerDown={event => event.stopPropagation()} onClick={event => event.stopPropagation()}
+            onContextMenu={event => event.stopPropagation()} onBlur={() => finishRename(true)}
+            onKeyDown={event => {
+              event.stopPropagation();
+              if (event.key === 'Enter') { event.preventDefault(); finishRename(true); }
+              else if (event.key === 'Escape') { event.preventDefault(); finishRename(false); }
+            }}
+            style={{ width: Math.max(60, renaming.draft.length * 6.5 + 12), maxWidth: '100%', minWidth: 60,
+              padding: '0 4px', border: 'none', outline: 'none', background: '#333', borderRadius: 3,
+              boxShadow: 'inset 0 0 0 1px var(--color-accent)', color: '#fff', font: 'inherit' }}
+          /> : undefined}
+        </TabCard>)}
       </div>)}
     </div>, document.body)}
   </>;

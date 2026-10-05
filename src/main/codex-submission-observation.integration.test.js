@@ -167,6 +167,130 @@ function harness({ hasTurn = true, provisional = false, failFirstAttach = false 
     tabId, sessionId, term, observe, drainDiscovery, compact };
 }
 
+function projectLocalHarness(t, { beforeBridge, currentTarget } = {}) {
+  const h = harness({ provisional: true });
+  const Database = require('better-sqlite3');
+  const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
+  const registry = require('./agent-send-receipt-registry');
+  const db = new Database(':memory:');
+  const store = createAgentSendReceiptStore(db);
+  t.after(() => db.close());
+  h.context.agentSendReceiptStore = store;
+  h.context.captureCodexManualCompactBoundary = () => ({
+    tabId: h.tabId, sessionId: h.sessionId, generation: h.runtime.lifecycle,
+    promptSeq: 1, sourceByteOffset: h.state.offset, boundaryEventSequence: 0,
+  });
+  h.context.compactOperations.armPending = request => ({ ...request, kind: 'compact' });
+  let bridgeCalls = 0;
+  const webContext = vm.createContext({
+    ...registry, AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
+    agentSendReceiptStore: store, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
+    agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,
+    promptAuditFingerprint: require('./prompt-audit-fingerprint').promptAuditFingerprint,
+    isLocalSlashCommandPrompt: require('./agent-history-send-receipt').isLocalSlashCommandPrompt,
+    compactSendReceiptPresentation: require('./compact-send-settlement').compactSendReceiptPresentation,
+    agentSendTargetPreconditionFailure: require('./agent-send-target-precondition').agentSendTargetPreconditionFailure,
+    scenarioDestination: require('./agent-message-identity').scenarioDestination,
+    crypto: require('node:crypto'), Buffer, console: quiet, shortId: value => value,
+    withPromptOriginPresentation: value => value, tabWorkContext: null,
+    findOrchestrationTabDescriptor: () => ({ projectId: 'P', toolType: 'codex', sessionId: h.sessionId }),
+    readAgentRuntimeSnapshot: async () => ({ coherent: true, toolType: 'codex', status: 'active',
+      inputReady: true, sessionId: null, readSessionId: h.sessionId,
+      sendTarget: currentTarget || h.context.readAgentSendDestinationAtWriteBoundary(h.tabId, 'codex') }),
+    bridgeRequest: async (action, payload) => {
+      bridgeCalls++;
+      assert.equal(action, 'sendAgentPromptScenario');
+      assert.equal(payload.expectedTarget.sessionId, payload.expectedSessionId);
+      const record = store.get(payload.sendOperationKey);
+      assert.deepEqual(record.receipt.expectedTarget, JSON.parse(JSON.stringify(payload.expectedTarget)));
+      if (beforeBridge) await beforeBridge(h);
+      return h.context.executeCodexLiveSlashCommandRequest({ ...payload, command: payload.prompt });
+    },
+  });
+  const web = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
+  const tree = ts.createSourceFile('web-server.js', web, ts.ScriptTarget.Latest, true);
+  for (const name of ['readScenarioDestination', 'durableRecordHasProviderQueueAcceptance',
+    'durableAgentSendReplay', 'durableAgentSendFailure', 'runPreparedAgentSendScenario']) {
+    const node = tree.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);
+    assert.ok(node, name);
+    vm.runInContext(node.getText(tree), webContext);
+  }
+  const operationKey = 'project:fixture-tab:local-handoff';
+  const send = (expectedTarget = { toolType: 'codex', sessionId: h.sessionId }) =>
+    webContext.runPreparedAgentSendScenario({ tabId: h.tabId, prompt: '/compact',
+      handoffId: 'local-handoff', sendOperationKey: operationKey, provider: 'codex',
+      expectedTarget, source: 'terminal-mcp', queue: true,
+      prepareSend: async () => ({ descriptor: { projectId: 'P', toolType: 'codex', sessionId: h.sessionId } }),
+    });
+  return { ...h, store, db, send, operationKey, get bridgeCalls() { return bridgeCalls; } };
+}
+
+test('Project API local command reaches exact provisional Resume proof without inventing a writer', async t => {
+  const h = projectLocalHarness(t);
+  assert.equal(h.context.readAgentSendDestinationAtWriteBoundary(h.tabId, 'codex').sessionId, null);
+  const result = await h.send();
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.equal(result.submitted, true);
+  assert.equal(h.bridgeCalls, 1);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId), null, 'local admission does not promote a writer');
+  assert.deepEqual(h.events.filter(value => value.startsWith('write:')), ['write:/compact']);
+  const target = h.store.get(h.operationKey).receipt.expectedTarget;
+  assert.equal(target.sessionId, h.sessionId);
+  assert.equal(target.terminalInstanceId, 'fixture-terminal');
+  assert.equal(target.launchId, 'fixture-launch');
+  const attemptId = h.store.get(h.operationKey).attemptId;
+  h.launch.launchId = 'later-unrelated-launch';
+  await h.send();
+  assert.equal(h.store.get(h.operationKey).attemptId, attemptId);
+  assert.equal(h.bridgeCalls, 1, 'exact request replay does not dispatch into a new process');
+  assert.deepEqual(h.events.filter(value => value.startsWith('write:')), ['write:/compact']);
+});
+
+for (const change of ['launch', 'instance', 'foreign-source', 'unknown-process', 'missing-lease', 'stop', 'draft-takeover']) {
+  test('Project API local provisional admission still refuses ' + change + ' before input', async t => {
+    const h = projectLocalHarness(t, { beforeBridge: actual => {
+      if (change === 'launch') actual.launch.launchId = 'replacement-launch';
+      if (change === 'instance') {
+        const replacement = {};
+        actual.context.terminals.set(actual.tabId, replacement);
+        actual.context.terminalLifecycleEpochs.set(replacement, 'replacement-instance');
+      }
+      if (change === 'unknown-process') actual.candidate.status = 'unknown';
+      if (change === 'missing-lease') actual.context.getCodexResumeSourceLeaseForTab = () => null;
+      if (change === 'stop') actual.context.aiStoppingTabs.set(actual.tabId, { toolType: 'codex' });
+      if (change === 'draft-takeover') actual.context.requestTerminalCodexDraftState = async () => {
+        actual.runtime.input++;
+        return { success: true, hasDraft: false };
+      };
+    } });
+    const result = await h.send({ toolType: 'codex', sessionId: change === 'foreign-source' ? 'foreign' : h.sessionId });
+    assert.equal(h.bridgeCalls, 1, 'the current physical owner is pinned; only Main grants input');
+    assert.equal(result.success, false);
+    assert.equal(result.submitted, false, JSON.stringify(result));
+    assert.equal(h.events.some(value => value.startsWith('write:')), false);
+    assert.equal(h.store.get(h.operationKey).state, 'not-submitted');
+  });
+}
+
+for (const target of [{ toolType: 'codex', sessionId: 'other-writer' },
+  { toolType: 'codex', sessionId: null, terminalInstanceId: 'I', launchId: null }]) {
+  test('Project API local early refusal is restart-readable no-write, not stuck preparing: ' + JSON.stringify(target), async t => {
+    const h = projectLocalHarness(t, { currentTarget: target });
+    const result = await h.send();
+    assert.equal(result.submitted, false);
+    assert.equal(h.bridgeCalls, 0);
+    assert.equal(h.store.get(h.operationKey).attemptId, null);
+    assert.equal(h.store.get(h.operationKey).state, 'not-submitted');
+    const reopened = new (require('better-sqlite3'))(h.db.serialize());
+    try {
+      const record = require('./agent-send-receipt-store').createAgentSendReceiptStore(reopened).get(h.operationKey);
+      assert.equal(record.state, 'not-submitted');
+      assert.equal(record.receipt.pasteWritten, false);
+      assert.equal(record.receipt.enterWritten, false);
+    } finally { reopened.close(); }
+  });
+}
+
 test('confirmed Resume -> settings preparation -> /compact does not reopen consumed discovery', async () => {
   const h = harness();
   assert.equal((await h.observe('model-effort-picker-writer')).available, true, JSON.stringify(h.events));

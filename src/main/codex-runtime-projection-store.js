@@ -10,7 +10,14 @@ function createCodexRuntimeProjectionStore() {
     const previousKeys = Object.keys(previous).filter(structuralKey);
     const nextKeys = Object.keys(next).filter(structuralKey);
     if (previousKeys.length !== nextKeys.length) return false;
-    return nextKeys.every((key) => Object.is(previous[key], next[key]));
+    return nextKeys.every((key) => {
+      if (key !== 'sendTarget' || !previous[key] || !next[key]) return Object.is(previous[key], next[key]);
+      // A freshly read physical target is a tiny scalar DTO, not a runtime
+      // change merely because its object was allocated again.
+      const fields = Object.keys(next[key]);
+      return fields.length === Object.keys(previous[key]).length
+        && fields.every(field => Object.hasOwn(previous[key], field) && Object.is(previous[key][field], next[key][field]));
+    });
   }
 
   function publish(tabId, projection, reason = 'runtime-event') {

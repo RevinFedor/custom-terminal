@@ -722,6 +722,8 @@ function createProviderSemanticShadow({
         items: new Map(),
         itemOrder: [],
         finished: false,
+        finishReason: null,
+        deliveryUnknown: false,
       };
       contexts.set(requestId, current);
       record(tabId, 'codex', 'REQUEST', {
@@ -845,6 +847,7 @@ function createProviderSemanticShadow({
         for (const context of Array.from(contexts.values()).reverse()) {
           if (context.responseId === responseId) return context;
         }
+        if (current?.responseId) return null;
       }
       return current;
     };
@@ -852,6 +855,7 @@ function createProviderSemanticShadow({
     const finishContext = (context, reason, response = null) => {
       if (!context || context.finished) return false;
       context.finished = true;
+      context.finishReason = reason;
       if (reason !== 'response-completed') {
         context.gap = true;
         for (const item of context.items.values()) item.gap = true;
@@ -932,11 +936,13 @@ function createProviderSemanticShadow({
       if (!payload) return false;
       const type = String(payload.type || '');
       const context = findContext(payload);
+      if (!context || context.finished) return false;
       if (type === 'response.created' && context && payload.response?.id) {
         context.responseId = String(payload.response.id);
         return true;
       }
-      if (!context) return false;
+      // A delayed frame from a completed/replaced response is not a new
+      // segment. In particular it must not fall back into the next turn.
       if (type === 'response.output_text.delta' && typeof payload.delta === 'string') {
         const item = ensureItem(context, payload.item_id || payload.itemId);
         appendItemText(item, payload.delta);
@@ -991,6 +997,26 @@ function createProviderSemanticShadow({
     const finishAll = (reason = 'transport-closed') => {
       let finished = 0;
       for (const context of contexts.values()) {
+        // response.completed proves provider generation, not CLI acceptance.
+        // A later socket close used to disappear behind context.finished.
+        // Preserve that separate fact without fabricating rejection/canonical
+        // receipt, retracting completed prose, or finishing the whole turn.
+        if (context.finished && context.finishReason === 'response-completed'
+          && context.deliveryUnknown !== true
+          && !['response-end', 'non-stream-response-end'].includes(reason)) {
+          context.deliveryUnknown = true;
+          const itemIds = context.itemOrder.filter(id => context.items.get(id)?.text);
+          record(tabId, 'codex', 'DELIVERY_UNKNOWN', {
+            request: short(context.requestId, 20), turn: short(context.turnId, 18),
+            items: itemIds.length, reason,
+          });
+          if (context.classification === 'main' && sourceId && itemIds.length) {
+            emitCodexSemanticEvent({ tabId, sourceId, transport, event: {
+              type: 'request_delivery_unknown', requestId: context.requestId,
+              threadId: context.threadId, turnId: context.turnId, itemIds, reason,
+            } });
+          }
+        }
         if (finishContext(context, reason)) finished += 1;
       }
       return finished;

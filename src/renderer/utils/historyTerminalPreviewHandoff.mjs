@@ -9,12 +9,16 @@ const finiteOrNull = (value) => {
 export const HISTORY_TERMINAL_PREVIEW_LIVE_LABEL =
   'Live response · not yet saved to history';
 export const HISTORY_TERMINAL_PREVIEW_SYNC_LABEL =
-  'Live response · synchronizing view';
+  'Response · synchronizing view';
+export const HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL =
+  'Response · history not confirmed';
 
-export function historyTerminalPreviewStatusLabel({ canonicalMaterialized = false } = {}) {
-  return canonicalMaterialized
-    ? HISTORY_TERMINAL_PREVIEW_SYNC_LABEL
-    : HISTORY_TERMINAL_PREVIEW_LIVE_LABEL;
+export function historyTerminalPreviewStatusLabel({
+  canonicalMaterialized = false, phase = 'streaming', deliveryState = 'pending',
+} = {}) {
+  if (canonicalMaterialized) return HISTORY_TERMINAL_PREVIEW_SYNC_LABEL;
+  return phase === 'settled' || deliveryState === 'unknown'
+    ? HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL : HISTORY_TERMINAL_PREVIEW_LIVE_LABEL;
 }
 
 export function historyTerminalPreviewHandoffOwnsWrite(handoff, {
@@ -28,6 +32,39 @@ export function historyTerminalPreviewHandoffOwnsWrite(handoff, {
     && Number(handoff.ownerGeneration) === Number(ownerGeneration)
     && Number(handoff.presentationVisit) === Number(presentationVisit)
     && presented === true;
+}
+
+// A receipt can outlive a renderer data-owner generation (e.g. a hidden
+// durable refresh). Do not let the old transaction write into the new scope;
+// admit a NEW transaction only on exact canonical data and integrity proof.
+export function historyTerminalPreviewHandoffRebaseVerdict(handoff, {
+  previewId = '', ownerKey = '', ownerGeneration = 0, presentationVisit = 0,
+  presented = false, canonicalInPresentation = false, canonicalTextHash = null,
+} = {}) {
+  if (!handoff) return 'idle';
+  if (handoff.ownerKey !== ownerKey) return 'foreign-owner';
+  if ((previewId && handoff.previewId !== previewId)
+    || (!previewId && handoff.phase === 'waiting-row')) return 'foreign-preview';
+  const generationChanged = Number(handoff.ownerGeneration) !== Number(ownerGeneration);
+  if (!generationChanged && Number(handoff.presentationVisit) === Number(presentationVisit)) return 'current';
+  if (!presented) return 'hidden';
+  if (!canonicalInPresentation) return 'waiting-canonical';
+  // Codex source offsets are positional: a replacement document can reuse
+  // one. The receipt's exact full-record hash is an ADDITIONAL guard after
+  // identity, never a way to join different records by prose.
+  if ((generationChanged && String(handoff.canonicalIdentity).startsWith('codex-assistant-source-')
+      && !handoff.canonicalTextHash)
+    || (handoff.canonicalTextHash && canonicalTextHash !== handoff.canonicalTextHash)) {
+    return 'waiting-canonical-integrity';
+  }
+  return 'rebase';
+}
+
+export function historyTerminalPreviewHandoffCoversPreview(handoff, preview) {
+  if (!handoff || handoff.previewId !== preview?.previewId) return false;
+  if (!Array.isArray(handoff.previewItemIds) || !Array.isArray(preview.responseSegments)) return true;
+  const covered = new Set(handoff.previewItemIds);
+  return preview.responseSegments.every(segment => covered.has(segment.itemId));
 }
 
 export function historyTerminalPreviewHasNewUserGesture(handoff, {

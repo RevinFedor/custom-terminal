@@ -1,5 +1,42 @@
 # Fix: Rewind Navigation Logic
 
+## 04.10 — Resume34: recovery не читала response-only user carriers
+
+Exact send `project-send:6b2c4f0d…`03.10,18:55:58UTC был not-submitted,
+paste/Enter=false. Resume19:03:47 снова получил codex_rewind_recovery_pending.
+В shell процесса уже не было; блокировал journal native Rewind29.09
+`mumcjbkq-codex-us`, phase confirm-enter-boundary, source01a05364, target1772.
+
+Target действительно существовал: public History вернула UUID1772/offset22455757
+и прежний137char hash. Но физический carrier — response_item/message(user).
+Native target admission поддерживала эту форму, тогда как stable-source scanner
+и recovery projector читали только event_msg/user_message. Следующий реальный
+source turn1778→1780 также был response-only, поэтому recovery ложно сообщала
+source-target-proof-mismatch и не могла увидеть продолжение исходной сессии.
+
+SOURCE scanner/projector принимают обе структурные формы через прежние audit/
+presentation helpers. Exact source line/UUID/hash сохраняются. Для submit proof
+только первый logical user после task_started и его единственный response/event
+companion допустимы; pairing использует прежнюю grammar. Steering, terminal
+boundary, environment/project/aborted/Goal service carriers не подтверждают send.
+Response target hash строится тем же formatter, что его pre-Enter admission;
+raw audit hash/length остаются отдельным proof-доменом.
+
+На real source read-only проверены полный no-child scan, прежний target hash,
+новые task1778 и authored response1780 после action, unchanged binding. По ранее
+разрешённому SQL выполнен existing DatabaseManager.resolvePendingCodexStableSourceFromTranscript
+в exact raw-value CAS: удалён только блокирующий journal, source/history не
+переписывались. Backup — `/private/tmp/noted-rewind34-20261004.9eAH4t/original-journal-backup.json`.
+Resume через Terminal MCP вернул ту же source session active/inputReady/
+writerConfirmed=true, process found; старый failed prompt не переотправлялся.
+Это proof разрешения старого handoff на continued source, не ложное заявление
+о выполненном rollback и не успешный post-Enter draft capture задним числом.
+
+75 focused tests и main/renderer build4541/syntax/diff PASS. Generic source repair
+ещё не установлен; production37537 не перезапускался. Результат/границы —
+`/private/tmp/noted-rewind34-20261004.9eAH4t/RESULT.md`. Отдельная геометрия
+side-terminal/overflow передана владельцу4196, не чинится recovery-флагом.
+
 ### Симптомы
 При попытке восстановить сессию из Timeline (Rewind) курсор в меню истории Claude начинает быстро прыгать вверх, но "промахивается" мимо нужного сообщения. В результате либо восстанавливается неверная точка истории, либо (в старых версиях) сессия ошибочно откатывалась в самый верх (к первому сообщению).
 

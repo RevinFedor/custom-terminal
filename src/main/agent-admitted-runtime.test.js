@@ -134,6 +134,7 @@ test('actual main public selector re-observes changed process/gate/owner as one 
       getTerminalInputRevision: () => version, bridgeKnownSessions: new Map(), codexKnownSessions: new Map(),
       claudeStartupGateRevisions: { get: () => version }, getActiveAgentExecutionContext: () => ({ turnId: 'turn' + version }), claudeTurnBusy: new Map(),
       readMainAgentStartReadiness: async () => { reads++; return { ...owned('L' + version), sessionId: 'S' + version }; },
+      readAgentSendDestinationAtWriteBoundary: (_tab, toolType) => ({ toolType, sessionId: 'S' + version, launchId: 'L' + version }),
       readAiLifecycleIdentityForTab: async () => { if (continual || version === 1) version++; return { processStatus: 'found', processPid: version, terminalRunSeq: version, inputRevision: version }; },
       getPersistedAiSessionBindingForShutdown: () => ({ claude_session_id: 'S' + version }),
       getSessionMaterialization: () => ({ materialized: true, timelineCount: 7 }),

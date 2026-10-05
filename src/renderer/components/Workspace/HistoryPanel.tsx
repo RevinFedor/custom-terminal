@@ -36,6 +36,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import {
   deleteTabContextUpdate,
   dismissTabContextUpdate,
+  getTabWorkContextSnapshot,
   prepareTabWorkContext,
   restoreDismissedTabContextUpdate,
   settleTabWorkContext,
@@ -163,6 +164,7 @@ import {
   buildPortableImageImportSnapshot,
   collapsePortableImageImportSnapshot,
   collectPortableImagePathMarkers,
+  insertHistoryClipboardSnapshotAtSelection,
   normalizeHistoryMessageComposerSnapshot,
 } from '../../utils/composerClipboard.mjs';
 import {
@@ -270,6 +272,7 @@ import {
   reconcileHistoryTailFollowIntent,
   scheduleHistoryBottomScroll,
 } from '../../utils/historyBottomScroll.mjs';
+import { createHistoryWheelTailIntent } from '../../utils/historyWheelTailIntent.mjs';
 import { createHistoryScrollSeekController } from '../../utils/historyScrollSeek.mjs';
 import { beginHistoryResize } from '../../utils/historyResizeAnchor.mjs';
 import { createHistoryResizeController } from '../../utils/historyResizeController.mjs';
@@ -311,6 +314,8 @@ import {
   captureHistoryTerminalPreviewHandoffAnchor,
   readHistoryTerminalPreviewReadingTop,
   historyTerminalPreviewHandoffOwnsWrite,
+  historyTerminalPreviewHandoffRebaseVerdict,
+  historyTerminalPreviewHandoffCoversPreview,
   historyTerminalPreviewHandoffScrollTop,
   historyTerminalPreviewHasCanonicalIdentity,
   historyTerminalPreviewHasNewUserGesture,
@@ -793,6 +798,13 @@ interface TerminalHistoryPreview {
   previewSeq: number;
   phase: 'streaming' | 'settled';
   sourceMode?: 'screen' | 'semantic' | 'semantic-pending';
+  responseSegments?: Array<{
+    itemId: string;
+    requestId: string | null;
+    text: string;
+    phase: 'streaming' | 'settled';
+    deliveryState: 'pending' | 'unknown';
+  }>;
   text: string;
   textHash: string | null;
   startedAt: number;
@@ -803,6 +815,7 @@ interface TerminalHistoryPreview {
 
 interface TerminalHistoryPreviewClearHandoff {
   previewId: string;
+  previewItemIds?: string[];
   canonicalIdentity: string;
   canonicalTextHash: string | null;
   ownerKey: string;
@@ -1238,26 +1251,38 @@ const HistoryTerminalPreviewFooter = memo(({ context }: {
 }) => {
   const preview = context?.terminalPreview || null;
   const canonicalMaterialized = context?.terminalPreviewCanonicalMaterialized === true;
+  const segments = preview?.responseSegments?.length ? preview.responseSegments
+    : preview ? [{ itemId: preview.previewId, text: preview.text,
+      phase: preview.phase, deliveryState: 'pending' as const }] : [];
   useLayoutEffect(() => {
     context?.onHandoffDomCommit?.();
   }, [preview, context?.onHandoffDomCommit]);
   return (
     <>
       {preview && (
-        <ConversationMessage
-          layout="assistant"
-          tone="accent"
+        <div
           data-history-terminal-preview
           data-preview-id={preview.previewId}
           data-preview-phase={preview.phase}
           aria-live="polite"
           onContextMenu={(event) => openTerminalHistoryPreviewContextMenu(event, preview)}
+        >
+          {segments.map((segment, index) => (
+        <ConversationMessage
+          key={segment.itemId}
+          layout="assistant"
+          tone="accent"
+          data-preview-item-id={segment.itemId}
+          data-response-phase={segment.phase}
+          data-response-delivery={segment.deliveryState}
           status={(
             <MessageStatusBadge
-              label={historyTerminalPreviewStatusLabel({ canonicalMaterialized })}
+              label={historyTerminalPreviewStatusLabel({ canonicalMaterialized,
+                phase: segment.phase, deliveryState: segment.deliveryState })}
               tone="accent"
-              pending={preview.phase === 'streaming'}
-              meta={preview.truncated ? 'начало скрыто' : undefined}
+              pending={!canonicalMaterialized && segment.phase === 'streaming'
+                && segment.deliveryState !== 'unknown'}
+              meta={index === 0 && preview.truncated ? 'начало скрыто' : undefined}
               style={{
                 position: 'absolute',
                 top: 0,
@@ -1279,9 +1304,11 @@ const HistoryTerminalPreviewFooter = memo(({ context }: {
           }}
         >
           <div style={{ fontSize: '1em' }}>
-            <CBMarkdown text={preview.text} />
+            <CBMarkdown text={segment.text} />
           </div>
         </ConversationMessage>
+          ))}
+        </div>
       )}
       {context?.responseTiming && (
         <HistoryResponseTailTimer timing={context.responseTiming} />
@@ -4851,14 +4878,14 @@ const HistoryUserEntry = memo(({
       status={hasDetachedPromptBand ? (
         <HistoryUserPromptBand parts={detachedPrompts.promptParts} tabId={tabId} messageText={entry.content} />
       ) : undefined}
-      footer={queueStatusPresentation ? (
+      footer={queueStatusPresentation || isLocalPromptEntry(entry) ? (
         <span className="hp-user-message-status">
           {canDismissPromptPresentation && (
-            <Tooltip content="Скрыть эту карточку">
+            <Tooltip content={queueStatus === 'application-queued' ? 'Отменить отправку из очереди' : 'Скрыть эту карточку'}>
               <button
                 type="button"
                 className="hp-user-message-status-dismiss"
-                aria-label="Скрыть статусную карточку сообщения"
+                aria-label={queueStatus === 'application-queued' ? 'Отменить отправку из очереди' : 'Скрыть статусную карточку сообщения'}
                 onMouseDown={stopActionPropagation}
                 onContextMenu={(event) => {
                   event.preventDefault();
@@ -4870,7 +4897,7 @@ const HistoryUserEntry = memo(({
               </button>
             </Tooltip>
           )}
-          <MessageStatusBadge
+          {queueStatusPresentation && <MessageStatusBadge
             label={queueStatusPresentation.label}
             tone={queueStatusPresentation.tone}
             pending={queueStatusPresentation.pending}
@@ -4878,7 +4905,7 @@ const HistoryUserEntry = memo(({
             meta={entry.timestamp
               ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
               : undefined}
-          />
+          />}
         </span>
       ) : undefined}
       actions={(
@@ -5577,21 +5604,19 @@ const historyPanelStyleText = `@keyframes hp-flash {
 }
 .hp-user-message-status {
   --hp-user-message-status-height: 20px;
-  /* Delivery status is a temporary annotation of the prompt, not a second
-     History row. The next live/loader slot already owns the visual space
-     below a just-sent prompt, so keeping this in flex flow made the feed grow
-     and then shrink once the durable record arrived. Anchor it to the user
-     column instead: it stays directly below the bubble without changing the
-     measured height of this Virtuoso item. */
-  position: absolute;
-  top: calc(100% + 4px);
-  right: 0;
+  /* Consecutive accepted prompts have no intervening assistant/loader slot.
+     Their annotation must own its space or it overlays the next bubble.
+     Keep the slot for the lifetime of the local row, including SENT expiry;
+     the two-second badge timer must not change that row's measured height. */
+  position: relative;
+  align-self: flex-end;
+  min-height: var(--hp-user-message-status-height);
   z-index: 2;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 3px;
-  margin-top: 0;
+  margin-top: 4px;
   margin-bottom: 0;
   white-space: nowrap;
 }
@@ -7459,6 +7484,9 @@ function AgentHistoryControls({
       images: state.historyPromptDraftImages[ownerTabId] || [],
       chips: state.historyPromptDraftChips[ownerTabId] || [],
       pendingImages: state.historyPromptDraftPendingImages[ownerTabId] || [],
+      pendingContextUpdates: getTabWorkContextSnapshot(ownerTabId).updates,
+      dismissedContextUpdateIds: tabIdRef.current === ownerTabId
+        ? dismissedContextUpdatesRef.current.flatMap(entry => entry.memberIds) : [],
     });
     if (!resolved) return;
     const editor = promptTextareaRef.current;
@@ -8809,7 +8837,8 @@ function AgentHistoryControls({
       });
     }
     const recordWithoutReply = kind === 'send' && options.recordWithoutReply === true;
-    if (kind === 'send' && historyPromptHandoffBlocksNewSubmit(
+    if (kind === 'send' && (recordWithoutReply || isTerminalOnlyComposerDraft(
+      useUIStore.getState().historyPromptDrafts[tabId] || '')) && historyPromptHandoffBlocksNewSubmit(
       getHistoryPromptHandoffsSnapshot(tabId),
     )) {
       setDraftWarning(HISTORY_PENDING_DELIVERY_BLOCK_NOTICE);
@@ -8893,7 +8922,7 @@ function AgentHistoryControls({
         return;
       }
     }
-    if (kind === 'send' && pasteBusyRef.current && !queuedBehindExistingSend) {
+    if (kind === 'send' && recordWithoutReply && pasteBusyRef.current && !queuedBehindExistingSend) {
       console.log('[' + runtime.logPrefix + '] drop-action tab=' + tabId.slice(-12) + ' kind=send reason=paste-busy');
       return;
     }
@@ -9442,8 +9471,22 @@ function AgentHistoryControls({
             promptChips: promptChipsForHistory,
             imagePaths: sendDraftImages,
           },
+          authoringSnapshot: { editorText: rawDraftSnapshot, chips: sendDraftChips, imagePaths: sendDraftImages },
         });
         sendFailureResult = result;
+        if (result?.applicationQueued === true && result?.applicationQueue?.version === 1) {
+          bindHistoryPromptHandoffSendIdentity(actionTabId, handoffId, { sendOperationKey: result.operationKey,
+            applicationQueueId: result.applicationQueue.id });
+          settleHistoryPromptHandoff(actionTabId, handoffId, { queueStatus: 'application-queued',
+            reason: 'application-queue-admitted', requiresAuditIdentity: true });
+          sendOwnershipTransferred = true;
+          sendTransferredQueueStatus = 'application-queued';
+          // Main may already have published stronger physical proof before the
+          // admission response reaches us. Project the monotonic handoff state.
+          const owned = getHistoryPromptHandoffsSnapshot(actionTabId).find(item => item.handoffId === handoffId);
+          onPromptStatusChange(handoffId, owned?.queueStatus || 'application-queued', 'application-queue-admitted');
+          return;
+        }
         sendCoordinatedSettlement = result?.coordinatedSettlement || null;
         const localSlashReceipt = projectAgentLocalCommandSendResult({
           candidate: localCommandCandidate,
@@ -10176,7 +10219,7 @@ function AgentHistoryControls({
     : rawActiveLifecycle;
   const isTurnBusy = status === 'busy';
   const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion || rewindLocked || effectiveStopping;
-  const sendControlsLocked = controlsLocked
+  const sendControlsLocked = (!!busyAction || answeringQuestion || rewindLocked || effectiveStopping)
     && !(busyAction === 'resume' && status === 'starting')
     && !recordContextAcceptsFollowup;
   const isCancellingTurn = interruptRequestPending;
@@ -10438,7 +10481,7 @@ function AgentHistoryControls({
   // the composer keydown), so the user's intent is preserved, not swallowed.
   const dictationHoldsSend = dictationBlocksSend(prompt);
   const canSend = canAcceptSubmitIntent
-    && activeInputStatus === null
+    && (activeInputStatus === null || !isTerminalOnlyComposerDraft(prompt))
     && !dictationHoldsSend
     && (prompt.trim().length > 0 || draftChips.length > 0);
   const canGrabDraft = (status === 'active' || status === 'busy') && !pendingQuestion && !controlsLocked;
@@ -10787,9 +10830,11 @@ function AgentHistoryControls({
       editor.setSelectionRange(caret, caret);
     });
     const insertSnapshot = (snapshot: { text: string; chips: HistoryPromptDraftChip[] }) => {
-      const insertion = insertComposerSnapshotAtSelection({
+      const insertion = insertHistoryClipboardSnapshotAtSelection({
         text: current, chips: currentChips, insertedText: snapshot.text,
         insertedChips: snapshot.chips, selectionStart: start, selectionEnd: end,
+        pendingContextUpdates: getTabWorkContextSnapshot(actionTabId).updates,
+        dismissedContextUpdateIds: dismissedContextUpdatesRef.current.flatMap(entry => entry.memberIds),
       });
       applyHistoryComposerSnapshot({
         ownerTabId: actionTabId, text: insertion.text,
@@ -12967,7 +13012,9 @@ function HistoryPanel({
   const [liveEntries, setLiveEntries] = useState<FullHistoryEntry[]>([]);
   const [terminalPreview, setTerminalPreview] = useState<TerminalHistoryPreview | null>(null);
   const terminalPreviewRef = useRef<TerminalHistoryPreview | null>(null);
-  terminalPreviewRef.current = terminalPreview;
+  // Accepted IPC may be newer than the painted/deferred React state. A render
+  // must not overwrite that exact seq and make the deferred publisher discard
+  // the next response after cancelling an obsolete canonical handoff.
   const [terminalPreviewClearHandoff, setTerminalPreviewClearHandoff] =
     useState<TerminalHistoryPreviewClearHandoff | null>(null);
   const terminalPreviewClearHandoffRef = useRef<TerminalHistoryPreviewClearHandoff | null>(null);
@@ -12991,6 +13038,7 @@ function HistoryPanel({
   const terminalPreviewPresentationWakeRef = useRef<((source: string) => void) | null>(null);
   const [terminalPreviewHandoffWakeSeq, setTerminalPreviewHandoffWakeSeq] = useState(0);
   const terminalPreviewHandoffWakeRafRef = useRef(0);
+  const terminalPreviewHandoffGuardDigestRef = useRef('');
   const onHistoryHandoffRowMounted = useCallback((node: HTMLDivElement | null = null) => {
     const pending = terminalPreviewClearHandoffRef.current;
     if (!pending || (!node && pending.phase !== 'clearing-preview')
@@ -14346,7 +14394,11 @@ function HistoryPanel({
   // explicit reveal-unpin reaches the library before the row count changes.
   const [historyFollowOutputEnabled, setHistoryFollowOutputEnabled] = useState(true);
   const historyFollowOutputEnabledRef = useRef(true);
+  const historyTailIntentRevisionRef = useRef(0);
   const setHistoryTailFollowIntent = useCallback((next: boolean) => {
+    // Even another `false` is an ownership decision (e.g. reveal/search), and
+    // must supersede a provisional wheel suspension waiting for native motion.
+    historyTailIntentRevisionRef.current += 1;
     isAtBottomRef.current = next;
     if (historyFollowOutputEnabledRef.current === next) return;
     historyFollowOutputEnabledRef.current = next;
@@ -14478,6 +14530,18 @@ function HistoryPanel({
     },
     [],
   );
+  const historyWheelTailIntent = useMemo(() => createHistoryWheelTailIntent({
+    getScroller: () => virtuosoScrollerRef.current,
+    getOwnerToken: historyScrollerOwnerToken,
+    getIntentRevision: () => historyTailIntentRevisionRef.current,
+    setFollowIntent: setHistoryTailFollowIntent,
+    onResolved: (result) => historyDiag('WHEEL_TAIL_INTENT tab=' + historyTabIdRef.current.slice(-12)
+      + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current)
+      + ' visit=' + historyPresentationProofRef.current.visit
+      + ' restored=' + (result.restored ? '1' : '0') + ' reason=' + result.reason
+      + ' scrollTop=' + result.top + ' scrollHeight=' + result.height + ' clientHeight=' + result.client),
+  }), [historyScrollerOwnerToken, setHistoryTailFollowIntent]);
+  useEffect(() => () => historyWheelTailIntent.cancel(), [historyWheelTailIntent]);
   useEffect(
     () => () => historyScrollSeekController.dispose(),
     [historyScrollSeekController],
@@ -15810,6 +15874,18 @@ function HistoryPanel({
       });
       const currentHandoff = getHistoryPromptHandoffsSnapshot(tabId)
         .find((handoff) => handoff.handoffId === handoffId);
+      if (currentHandoff?.queueStatus === 'application-queued'
+        || (currentHandoff?.applicationQueueId && !currentHandoff.sendAttemptId)) {
+        const cancelled = await ipcRenderer.invoke('agent:cancel-queued-send', { tabId, handoffId });
+        if (cancelled?.cancelled) {
+          consumeHistoryPromptHandoff(tabId, handoffId);
+          removeLocalPromptEntry(handoffId, 'application-queue-cancelled');
+          return;
+        }
+        // Admission may have won the race. Do not hide a now-physical attempt
+        // as though cancelling the untouched application item had succeeded.
+        return;
+      }
       const dismissalPlan = planDismissal(entry, currentHandoff);
       if (dismissalPlan.mode === 'local-only') {
         historyDiag('LOCAL_PRESENTATION_DISMISS tab=' + tabId.slice(-12)
@@ -18872,52 +18948,13 @@ function HistoryPanel({
     if (terminalPreviewHandoffWakeRafRef.current) return;
     terminalPreviewHandoffWakeRafRef.current = requestAnimationFrame(() => {
       terminalPreviewHandoffWakeRafRef.current = 0;
-      let pending = terminalPreviewClearHandoffRef.current;
+      const pending = terminalPreviewClearHandoffRef.current;
       if (!pending) return;
       const presentation = historyPresentationProofRef.current;
-      const sameOwner = pending.ownerKey === historyOwnerKeyRef.current
-        && pending.ownerGeneration === historyOwnerGenerationRef.current;
-      if (!sameOwner) return;
-
-      // A persistent pane may receive canonical proof while hidden, then get
-      // a new presentation visit when shown. The old visit is never allowed to
-      // write; establish a fresh handoff only after the same exact canonical
-      // identity is proven in the new owner's current projection.
-      if (pending.presentationVisit !== presentation.visit) {
-        if (!presentation.presented || !terminalPreviewRef.current) return;
-        const target = resolveTerminalPreviewCanonicalTarget(pending.canonicalIdentity);
-        if (!target) return;
-        const scroller = virtuosoScrollerRef.current;
-        const previewNode = panelRef.current?.querySelector(
-          `[data-history-terminal-preview][data-preview-id="${CSS.escape(pending.previewId)}"]`,
-        ) as HTMLElement | null;
-        const followBottom = isAtBottomRef.current;
-        const handoffAnchor = captureHistoryTerminalPreviewHandoffAnchor({ scroller, previewNode, followBottom });
-        pending = {
-          ...pending,
-          presentationVisit: presentation.visit,
-          ...handoffAnchor,
-          gestureGeneration: historyUserGestureGenerationRef.current,
-          gestureAt: historyUserGestureAtRef.current,
-          followBottom,
-          requestedAt: performance.now(),
-        };
-        publishTerminalPreviewClearHandoff(pending);
-        historyDiag('TERMINAL_PREVIEW_HANDOFF_REBASE tab=' + tabId.slice(-12)
-          + ' provider=' + toolType
-          + ' preview=' + pending.previewId.slice(-18)
-          + ' identity=' + pending.canonicalIdentity.slice(-32)
-          + ' presentationVisit=' + presentation.visit
-          + ' anchorKind=' + handoffAnchor.anchorKind
-          + ' source=' + source);
-        return;
-      }
-      if (!historyTerminalPreviewHandoffOwnsWrite(pending, {
-        ownerKey: historyOwnerKeyRef.current,
-        ownerGeneration: historyOwnerGenerationRef.current,
-        presentationVisit: presentation.visit,
-        presented: presentation.presented,
-      })) return;
+      // The wake has no write authority. A same-key data-generation change
+      // used to stop here forever; the layout commit below now re-proves the
+      // exact canonical row and binds a fresh transaction before any write.
+      if (pending.ownerKey !== historyOwnerKeyRef.current || !presentation.presented) return;
       setTerminalPreviewHandoffWakeSeq((value) => value + 1);
       historyDiag('TERMINAL_PREVIEW_HANDOFF_WAKE tab=' + tabId.slice(-12)
         + ' provider=' + toolType
@@ -18925,7 +18962,7 @@ function HistoryPanel({
         + ' identity=' + pending.canonicalIdentity.slice(-32)
         + ' source=' + source);
     });
-  }, [publishTerminalPreviewClearHandoff, resolveTerminalPreviewCanonicalTarget, tabId, toolType]);
+  }, [tabId, toolType]);
 
   useLayoutEffect(() => {
     terminalPreviewPresentationWakeRef.current = scheduleTerminalPreviewHandoffWake;
@@ -19037,11 +19074,18 @@ function HistoryPanel({
       }
       if (
         terminalPreviewClearHandoffRef.current
-        && terminalPreviewClearHandoffRef.current.previewId !== incoming.previewId
+        && !historyTerminalPreviewHandoffCoversPreview(terminalPreviewClearHandoffRef.current, incoming)
       ) {
+        const obsolete = terminalPreviewClearHandoffRef.current;
         terminalPreviewAnchorSettleCancelRef.current?.();
         terminalPreviewAnchorSettleCancelRef.current = null;
+        if (obsolete.scrollOwnerToken !== null && historyRestoreInFlightRef.current === obsolete.scrollOwnerToken) {
+          historyRestoreInFlightRef.current = 0;
+          historyScrollSeekController.stampMachineScrollCooldown();
+        }
         publishTerminalPreviewClearHandoff(null);
+        historyDiag('TERMINAL_PREVIEW_HANDOFF_CANCEL tab=' + tabId.slice(-12)
+          + ' preview=' + obsolete.previewId.slice(-18) + ' reason=new-preview-items');
       }
       const typedIncoming = incoming as TerminalHistoryPreview;
       terminalPreviewRef.current = typedIncoming;
@@ -19085,6 +19129,7 @@ function HistoryPanel({
           const { anchorOffsetPx, bottomGapPx } = handoffAnchor;
           const handoff: TerminalHistoryPreviewClearHandoff = {
             previewId: previous.previewId,
+            previewItemIds: previous.responseSegments?.map(segment => segment.itemId),
             canonicalIdentity,
             canonicalTextHash: typeof detail.canonicalTextHash === 'string'
               ? detail.canonicalTextHash
@@ -19155,6 +19200,7 @@ function HistoryPanel({
     };
   }, [
     publishTerminalPreviewClearHandoff,
+    historyScrollSeekController,
     sessionId,
     tabId,
     terminalHistoryStreamingEnabled,
@@ -19180,6 +19226,61 @@ function HistoryPanel({
       let current = terminalPreviewClearHandoffRef.current;
       if (!current || current.previewId !== requested.previewId) return;
       const presentation = historyPresentationProofRef.current;
+      const canonicalEntry = displayEntries.find(entry => historyTerminalPreviewHasCanonicalIdentity(
+        entry, current.canonicalIdentity, historyLivePresentationIdentities));
+      const canonicalHash = canonicalEntry && current.canonicalTextHash
+        ? historyServicePromptFingerprint(String(canonicalEntry.content || '').trim())
+          .slice(0, current.canonicalTextHash.length) : null;
+      const rebase = historyTerminalPreviewHandoffRebaseVerdict(current, {
+        previewId: terminalPreviewRef.current?.previewId || '',
+        ownerKey: historyOwnerKeyRef.current, ownerGeneration: historyOwnerGenerationRef.current,
+        presentationVisit: presentation.visit, presented: presentation.presented,
+        canonicalInPresentation: !!canonicalEntry, canonicalTextHash: canonicalHash,
+      });
+      if (rebase === 'rebase') {
+        const scroller = virtuosoScrollerRef.current;
+        if (!scroller) return;
+        const old = current;
+        const node = panelRef.current?.querySelector(
+          `[data-history-terminal-preview][data-preview-id="${CSS.escape(current.previewId)}"]`,
+        ) as HTMLElement | null;
+        const gesture = historyTerminalPreviewHasNewUserGesture(old, {
+          gestureGeneration: historyUserGestureGenerationRef.current,
+          gestureAt: historyUserGestureAtRef.current, pointerActive: historyPointerScrollActiveRef.current,
+        });
+        // A model rebind is not a new user scroll. Preserve tail INTENT while
+        // the new list measures; a real gesture chooses the current anchor.
+        const followBottom = !gesture && old.anchorKind === 'tail' ? true : isAtBottomRef.current;
+        terminalPreviewAnchorSettleCancelRef.current?.();
+        terminalPreviewAnchorSettleCancelRef.current = null;
+        if (old.scrollOwnerToken !== null && historyRestoreInFlightRef.current === old.scrollOwnerToken) {
+          historyRestoreInFlightRef.current = 0;
+        }
+        current = { ...old, ownerGeneration: historyOwnerGenerationRef.current,
+          presentationVisit: presentation.visit, phase: 'waiting-row', scrollOwnerToken: null,
+          ...captureHistoryTerminalPreviewHandoffAnchor({ scroller, previewNode: node, followBottom }),
+          followBottom, gestureGeneration: historyUserGestureGenerationRef.current,
+          gestureAt: historyUserGestureAtRef.current, requestedAt: performance.now() };
+        publishTerminalPreviewClearHandoff(current);
+        terminalPreviewHandoffGuardDigestRef.current = '';
+        historyDiag('TERMINAL_PREVIEW_HANDOFF_REBASE tab=' + tabId.slice(-12)
+          + ' preview=' + current.previewId.slice(-18) + ' identity=' + current.canonicalIdentity.slice(-32)
+          + ' generation=' + old.ownerGeneration + '->' + current.ownerGeneration
+          + ' visit=' + old.presentationVisit + '->' + current.presentationVisit
+          + ' anchorKind=' + current.anchorKind + ' proof=exact-canonical-data-and-receipt');
+      } else if (rebase !== 'current') {
+        const digest = [current.previewId, rebase, current.ownerGeneration,
+          historyOwnerGenerationRef.current, current.presentationVisit, presentation.visit, canonicalHash].join(':');
+        if (terminalPreviewHandoffGuardDigestRef.current !== digest) {
+          terminalPreviewHandoffGuardDigestRef.current = digest;
+          historyDiag('TERMINAL_PREVIEW_HANDOFF_HOLD tab=' + tabId.slice(-12)
+            + ' preview=' + current.previewId.slice(-18) + ' identity=' + current.canonicalIdentity.slice(-32)
+            + ' reason=' + rebase + ' generation=' + current.ownerGeneration + '->' + historyOwnerGenerationRef.current
+            + ' visit=' + current.presentationVisit + '->' + presentation.visit
+            + ' canonicalInPresentation=' + (canonicalEntry ? '1' : '0'));
+        }
+        return;
+      }
       const ownsWrite = historyTerminalPreviewHandoffOwnsWrite(current, {
         ownerKey: historyOwnerKeyRef.current,
         ownerGeneration: historyOwnerGenerationRef.current,
@@ -19189,9 +19290,7 @@ function HistoryPanel({
       const canonicalTarget = resolveTerminalPreviewCanonicalTarget(
         current.canonicalIdentity,
       );
-      const canonicalInPresentation = displayEntriesRef.current.some((entry) => (
-        historyTerminalPreviewHasCanonicalIdentity(entry, current.canonicalIdentity, historyLivePresentationIdentities)
-      ));
+      const canonicalInPresentation = !!canonicalEntry;
       const scroller = virtuosoScrollerRef.current;
       if (!scroller) return;
       const targetNode = canonicalTarget
@@ -19459,6 +19558,7 @@ function HistoryPanel({
   }, [
     displayEntries,
     displayUnits,
+    historyOwnerVisit,
     historyOwnerDomId,
     historyScrollSeekController,
     historyTailPinScheduler,
@@ -21231,8 +21331,22 @@ function HistoryPanel({
       }, 500);
     }
     if (isUpwardIntent) {
-      setHistoryTailFollowIntent(false);
+      if (event.type === 'wheel') {
+        historyWheelTailIntent.suspend({ following: isAtBottomRef.current });
+      } else {
+        historyWheelTailIntent.cancel();
+        setHistoryTailFollowIntent(false);
+      }
       historyTailPinScheduler.cancel();
+    } else {
+      historyWheelTailIntent.cancel();
+      // A downward wheel against the existing bottom can produce no scroll
+      // event. It is still an explicit return-to-tail gesture; do not wait
+      // for an event that the browser has no displacement to report.
+      if (!isAtBottomRef.current && event.type === 'wheel' && (event as WheelEvent).deltaY > 0
+        && scrollerAtInput && isHistoryAtContentBottom(scrollerAtInput, { thresholdPx: 0.5 })) {
+        setHistoryTailFollowIntent(true);
+      }
     }
     // Any real wheel/touch takes position ownership from a running restore
     // convergence loop (same contract as the Timeline-jump cancel below).
@@ -21266,6 +21380,7 @@ function HistoryPanel({
     historyFontSize,
     historyScrollerOwnerToken,
     historyTailPinScheduler,
+    historyWheelTailIntent,
     setHistorySeekGeometryMask,
     tabId,
     traceHistoryWheelInput,
@@ -21273,11 +21388,12 @@ function HistoryPanel({
 
   const handleHistoryTouchStart = useCallback((event: TouchEvent) => {
     if (!event.isTrusted || !historyPresentationProofRef.current.presented) return;
+    historyWheelTailIntent.cancel();
     historyTouchYRef.current = event.touches[0]?.clientY ?? null;
     historyUserScrollDirectionRef.current = null;
     historyScrollSeekController.setScroller(virtuosoScrollerRef.current, historyScrollerOwnerToken());
     historyScrollSeekController.beginDirectScroll('touch');
-  }, [historyScrollSeekController, historyScrollerOwnerToken]);
+  }, [historyScrollSeekController, historyScrollerOwnerToken, historyWheelTailIntent]);
 
   const handleHistoryTouchEnd = useCallback(() => {
     historyTouchYRef.current = null;
@@ -21295,6 +21411,7 @@ function HistoryPanel({
     // A click on empty scroller background is not scroll intent. Only a native
     // scrollbar drag may unpin a concurrently growing preview through scroll.
     if (onVerticalScrollbar || onHorizontalScrollbar) {
+      historyWheelTailIntent.cancel();
       historyPointerScrollActiveRef.current = true;
       historyScrollSeekController.setScroller(scroller, historyScrollerOwnerToken());
       historyScrollSeekController.beginDirectScroll('scrollbar');
@@ -21311,7 +21428,7 @@ function HistoryPanel({
       burst.count = 0;
       burst.tripped = false;
     }
-  }, [historyScrollSeekController, historyScrollerOwnerToken, historyTailPinScheduler, tabId]);
+  }, [historyScrollSeekController, historyScrollerOwnerToken, historyTailPinScheduler, historyWheelTailIntent, tabId]);
 
   const handleHistoryScrollerPointerEnd = useCallback(() => {
     historyScrollSeekController.endDirectScroll('scrollbar');
@@ -21326,6 +21443,7 @@ function HistoryPanel({
     if (target?.closest('input, textarea, select, [contenteditable="true"]')) return;
     const scrollKeys = ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '];
     if (!scrollKeys.includes(event.key)) return;
+    historyWheelTailIntent.cancel();
     historyUserGestureAtRef.current = performance.now();
     historyForegroundPriority.mark(tabId, HISTORY_FOREGROUND_PRIORITY_HOLD_MS);
     historyUserGestureGenerationRef.current += 1;
@@ -21343,7 +21461,7 @@ function HistoryPanel({
     if (!movesUp) return;
     setHistoryTailFollowIntent(false);
     historyTailPinScheduler.cancel();
-  }, [historyScrollSeekController, historyScrollerOwnerToken, historyTailPinScheduler, tabId]);
+  }, [historyScrollSeekController, historyScrollerOwnerToken, historyTailPinScheduler, historyWheelTailIntent, tabId]);
 
   useEffect(() => {
     window.addEventListener('pointerup', handleHistoryScrollerPointerEnd, true);

@@ -13,7 +13,8 @@ const { MAX_EVENT_TABS, eventTabIds, stampedEventSink, PublicHistoryRevisions, T
   historyPayloadCapability, historyPayloadQuery } = require('./public-history-read');
 const { SessionTranscriptService } = require('./session-transcript-service');
 const { applyHistoryEntryWindow } = require('./history-entry-window');
-const { historyReadSession } = require('./history-read-session');
+const { historyReadSession, historyReadOwnerFromProjection } = require('./history-read-session');
+const { completionNotificationCapability } = require('./tab-completion-notification-api');
 const { normalizeHistoryResponseToolType, decorateHistoryResponseTimings, observeHistoryResponseTimingBindings } = require('./history-response-timings');
 const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
@@ -215,6 +216,7 @@ test('actual /api/me advertises the opt-in only with an available payload owner 
   const method = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'handleApi');
   const block = method.body.statements.find(node => ts.isIfStatement(node) && node.expression.getText(ast).includes("'/api/me'"));
   const scope = vm.createContext({ sendJson, checkAuth: req => req.headers.authorization === 'Bearer fixture',
+    publicHistoryFreshness: null, agentSendQueue: null, systemPromptService: null, agentParamsService: null, completionNotificationCapability,
     getLanIp: () => '127.0.0.1', webServerServiceHealth: () => ({ instanceId: 'fixture' }), MAX_EVENT_TABS,
     transcriptService: { getToolPayload() {} }, historyPayloadCapability,
     readAgentTabTiming: null, readAgentUsage: null, readAgentParams: null, readAgentRuntimeSnapshot: null,
@@ -222,6 +224,9 @@ test('actual /api/me advertises the opt-in only with an available payload owner 
     agentSendReceiptStore: null, STRUCTURED_AUTHORING_LIMITS: { bytes: 1 }, MAX_CONTEXT_FILES: 1,
     MAX_CONTEXT_FILE_BYTES: 1, MAX_CONTEXT_TOTAL_BYTES: 1 });
   const handler = vm.runInContext('(async (req,res,parsed) => {' + block.getText(ast) + '})', scope);
+  const freshnessDeclaration = ast.statements.find(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(item => item.name.getText(ast) === 'historyFreshnessCapability'));
+  vm.runInContext(freshnessDeclaration.getText(ast), scope);
   const server = http.createServer((req, res) => handler(req, res, url.parse(req.url, true)).catch(error => sendJson(res, 500, { error: error.message })));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
@@ -230,6 +235,13 @@ test('actual /api/me advertises the opt-in only with an available payload owner 
   const allowed = await (await fetch(address, { headers: { authorization: 'Bearer fixture' } })).json();
   assert.deepEqual(allowed.capabilities.historyPayloads, historyPayloadCapability);
   assert.equal(allowed.capabilities.historyPayloads.headerVersion, 2);
+  assert.deepEqual(allowed.capabilities.completionNotifications, completionNotificationCapability);
+  assert.equal(allowed.capabilities.historyFreshness, undefined);
+  scope.publicHistoryFreshness = {};
+  const freshness = await (await fetch(address, { headers: { authorization: 'Bearer fixture' } })).json();
+  assert.deepEqual(freshness.capabilities.historyFreshness, { version: 1, providers: ['claude','codex'],
+    endpoint: '/api/history-freshness', maxTabs: 32, historyQuery: { freshness: 'v1' },
+    event: 'history-freshness', ordering: 'epoch-sequence', outcomeCoverage: false });
   scope.transcriptService = null;
   const absent = await (await fetch(address, { headers: { authorization: 'Bearer fixture' } })).json();
   assert.equal(absent.capabilities.historyPayloads, undefined);
@@ -570,7 +582,7 @@ test('an async subscribe failure releases its partial consumer without an automa
 });
 
 test('read-only Codex resolution uses main event projection, not bridge or process lookup, and keeps writer distinct', async () => {
-  const scope = vm.createContext({ historyReadSession,
+  const scope = vm.createContext({ historyReadSession, historyReadOwnerFromProjection,
     findOrchestrationTabDescriptor: () => ({toolType:'codex',sessionId:'saved',projectId:'P',cwd:'/fixture'}),
     resolveCodexRuntimeProjectionBatch: () => ({A:{sessionId:null,readSessionId:'source',writerConfirmed:false,provenWriterSessionId:null}}),
     resolveAgentSessionInfo: () => { throw Error('no process/renderer query'); } });

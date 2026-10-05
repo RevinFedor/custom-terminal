@@ -21,6 +21,14 @@ actionWritten и manualActionRequired. Неподтверждённый выбо
 409 `codex_resume_goal_action_required` или `codex_usage_exhaustion_action_required`
 с коротким русским сообщением; HTTP timeout не отменяет main operation.
 
+Явный native Goal choice доступен при `codexGoal.version=1` через GET/POST
+`/api/terminal-tabs/:tabId/codex/goal`. GET возвращает operationId/availableActions
+или исход requestId; POST требует operationId/requestId/action (`resume|leave-paused`).
+Read-only не восстанавливает stopped process. 202/pending/unknown не означают
+нажатый и принятый выбор; renderer не нужен для owner/frame/PTY proof.
+Старый prompt не отправляется после выбора автоматически. Подробный контракт
+recovery и граница runtime-scoped квитанций — `fact-terminal-mcp.md`.
+
 `liveSettings` содержит фактическую model/effort, ownerId/sessionId,
 source=`committed-composer-footer`, proofAt/frameSeq/lifecycleGeneration/runSeq
 и reason. `/params` предпочитает ту же живую пару; requestedModel/requestedEffort
@@ -653,6 +661,75 @@ UI: `MarkdownFileSheet` — bottom-sheet с backdrop, drag handle и swipe-down 
 
 Terminal Control на iOS прикрепляет реальные фото/файлы не как base64 в prompt и не как iOS sandbox URL, а как предварительный upload на Mac. Причина: после выбора из Photos/FileImporter ссылка живёт в sandbox телефона, а Claude/Codex исполняются на Mac и должны читать локальный path. `/api/mobile-attachments` принимает `{name, kind, mimeType, dataBase64}`, кладёт файл в `app.getPath('temp')/noted-terminal-mobile-attachments/<id>/<sanitized-name>` и режет payload по 25MB. После успешного Send temp-файл остаётся жить для sent history preview: upload-route не запускает age-cleanup, а `DELETE /api/mobile-attachments/:id` — только best-effort cleanup при удалении chip до отправки. Если понадобится автоматическая уборка, она должна быть history-aware, иначе iOS reload теряет preview отправленного изображения.
 
+Upload сам по себе выдаёт `id` и temp path, не durable lease. В SOURCE05.10
+ordinary Claude/Codex `/send` до freeze/enqueue копирует подтверждённые mobile
+upload refs в прежний `PromptQueueAssetStore`: изображения сохраняют прежний
+content-addressed формат, документы — `<sha256>.document.<ext>`. Проверяются
+physical upload root (включая `/var`↔`/private/var`), id, regular/no-symlink FD,
+стабильность source во время bounded copy, hash, fsync файла/каталога. Новый
+provider executor, parser документов или разрешение импортировать произвольный
+path не добавлены. GT/context files и literal paths остаются своими контрактами.
+
+Capability: `capabilities.sendQueue.attachmentOwnership = {version:1,
+scope:'mobile-upload',durableBeforeAck:true,images:true,files:true}`. Она требует
+сконфигурированных queue И shared asset owner. Same-ID receipt/POST добавляет
+`attachmentOwnership:{version:1,scope:'mobile-upload',durable:true,count,images,
+files,imageOccurrences,fileOccurrences,refs:[{index,uploadId,sourcePath,assetId,
+kind,name,mediaType,size}]}` только после проверенного импорта и SQLite commit
+immutable request/inventory. `count/images/files` описывают принятые refs,
+`*Occurrences` — фактические spans; byte-dedup не удаляет повторные occurrences.
+Это file ownership, не provider delivery/успешное выполнение. Старые receipts
+без этого поля, в том числе4944, не backfill'ятся и такой гарантии не получают.
+
+Явный structured `imagePaths[].assetId` проходит в importer вместе с sourcePath:
+если запросил A, текущий temp B не заменяет его. Retained A выбирается только по
+точной паре path+assetId; чужой/неподтверждённый ID —403 до ACK. Manifest ranges
+сохраняют refIndex каждого вхождения, включая A/B/A на одном пути; plain formatter
+фиксирует такие же spans для image/file refs. Нельзя брать первый asset по path
+для всех slots. `refs.index` не равен client imageId; повторения могут делить ref,
+но их отдельные occurrences сохраняются. Frozen/SAME-ID body не переписывается.
+
+Rich/known-empty-Claude документы требуют отдельного объявленного пути:
+`sendQueue.attachmentOwnership.structuredFiles:{version:1,partField:'uploadFiles',
+rangeUnit:'utf16',endpoint:'/api/terminal-tabs/:tabId/send'}`. Text part сохраняет
+свой текст и дополнительно несёт `uploadFiles:[{path,start,end,uploadId?,assetId?,
+name?,mediaType?,size?}]`. Offsets внутри part.text, UTF-16, end exclusive; spans
+упорядочены, не пересекаются и обязаны точно указывать path. Обычный `[file] name:
+path` без metadata остаётся текстом, не декларацией файлов и не byte ACK.
+Нельзя читать PDF по regex из body или переключать rich→plain ради импорта.
+Прежний общий serializer возвращает text ranges; Main переносит их через chips/
+images/context body-hash в тот же owned manifest. На старом Main новые поля не
+посылаются; legacy rich Send сохраняется без выдуманной byte гарантии. Root
+authoring+attachments по-прежнему запрещён. Новый metadata путь — только ordinary
+PTY Terminal Send, не Inbox/SDK/create-agent/local slash. Declared ref с ошибкой
+не деградирует в текст-only success; known-empty owner claim остаётся прежним.
+Wire/проверки: `/private/tmp/noted-owned-uploads-20261005.3vSZwv/RICH-FILES-CONTRACT.md`.
+
+Оригинальные request/hash, sourcePath и literal text сохраняются. Exact scope
+operation/handoff/attempt связывает formatter spans с owned paths: существующие
+Codex image aliases читают копию, Claude/document transport получает owned path;
+прежние audit/History projection восстанавливают авторское представление. Missing
+или изменённая копия даёт явный no-write failure, не пустую успешную отправку.
+Failed/waiting/unknown inventory переживает restart до explicit dismissal;
+после canonical adoption refs сохраняет прежний History sidecar. Startup GC читает
+SQLite inventory ещё до создания web executor. Временные import leases независимы;
+GC revalidates lease revision и сериализует уже начатый unlink с новым import,
+чтобы stale inventory не удалил копию после ACK. После допустимого release действует
+прежняя30-day unreferenced GC. DELETE удаляет temp original, не accepted copy.
+
+Same-ID POST сначала читает принятый snapshot и проверяет fingerprint исходного
+JSON-запроса, без повторного temp read/context refresh/open/Enter. Изменённый payload
+под тем же handoff —409 conflict. После потери ответа предпочтителен обычный
+`send-receipts?handoffId=...`; retry допустим лишь исходного неизменного запроса.
+Copy/storage/commit failure до ACK — явный non-2xx/no-input; чужие leases не снимаются.
+Без `applicationQueue:true` сохраняется прежнее ожидание provider receipt.
+
+Старый установленный API, проверенный05.10, ещё без `attachmentOwnership`:
+там durable request защищает лишь ранее materialized asset IDs, не temp bytes.
+Отсутствие поля нельзя заменять выводом из path, upload id или `accepted:true`.
+Не вызываемый24h cleanup не даёт гарантии против OS temp/DELETE. Это отдельная
+граница от исправленного original/transport presentation и native deploy.
+
 В legacy plain-режиме `POST /api/terminal-tabs/:tabId/send` принимает `attachments` отдельно от `prompt`, заново валидирует что каждый path absolute и лежит внутри temp-root, а затем добавляет в prompt блок `Attached files from iOS are already uploaded to this Mac...` со списком local paths. Это намеренно дублируется с visible text, который iOS уже показывает пользователю: агент получает обычный текстовый контракт «прочитай эти path», а API response возвращает нормализованные attachments для аудита. Если такой блок уже есть в prompt, сервер не добавляет второй. Structured authoring использует уже загруженные image refs/parts и не входит в этот prefix-path; смешивать формы нельзя. GT file chips остаются другой моделью: они path-only ссылки на уже существующие файлы проекта, а mobile upload attachments — временные копии пользовательских файлов/фото.
 
 Отдельный `files:[{path,role,label?}]` у Project API send/orchestration означает
@@ -663,7 +740,7 @@ Terminal Control на iOS прикрепляет реальные фото/фа�
 операцию до Enter. Не подменять `files` существующим mobile `attachments`: у них
 разные ownership, security boundary и поведение целевого агента.
 
-Path-block в prompt — машинный контракт для Mac agent, а не UI-текст истории. iOS обязан распарсить строки вида `[image, image/jpeg] name: /tmp/...` в sent attachment chips и скрыть сам блок из transcript/copy/full-prompt view; если агент случайно эхо'ит этот блок в assistant content, native transcript тоже фильтрует его из видимого ответа. Иначе пользователь видит raw temp path вместо того же chip'а, который только что отправлял. `POST /api/mobile-attachments/preview` существует только для восстановления preview после history reload: он принимает temp path, проверяет что файл всё ещё внутри mobile-attachments root, и отдаёт base64 только для image-файлов до 12MB. Для произвольных документов preview не пытается читать содержимое — достаточно имени/иконки/path в chip/detail sheet.
+Path-block в prompt — машинный контракт для Mac agent, а не UI-текст истории. iOS обязан распарсить строки вида `[image, image/jpeg] name: /tmp/...` в sent attachment chips и скрыть сам блок из transcript/copy/full-prompt view; если агент случайно эхо'ит этот блок в assistant content, native transcript тоже фильтрует его из видимого ответа. Иначе пользователь видит raw temp path вместо того же chip'а, который только что отправлял. `POST /api/mobile-attachments/preview` принимает original upload path; SOURCE05.10 сначала разрешает exact persisted source→asset alias (опциональный `assetId` уточняет его), затем прежний temp-root fallback. Owned bytes доступны после DELETE/restart; неизвестный asset/path —403, ambiguous без assetId —409, missing copy —410. Bare durable asset path и transport path не становятся новым разрешённым root. Base64 возвращается только для image до12MB; документы — metadata, не body.
 
 ## ParamsSheet (model/effort/think) — close-on-select + invisible-intent источники
 
@@ -797,8 +874,11 @@ Response→event promotion может изменить timestamp/hash: decorator
 полный canonical image/body proof и прежний scope, не basename/count/text match.
 Подробный шрам — `fix-codex-image-receipt-projection.md`.
 
-Desktop может дополнить уже существующий local handoff missing image refs из
-read-only `imagePresentation` v1 на прежнем receipt IPC (не HTTP delivery ACK).
+Desktop дополняет local handoff missing image refs из read-only `imagePresentation`
+v1 на receipt IPC: с04.10 тот же доказанный DTO есть и в live FIFO publication,
+и в bounded list. Общий hydrate применяет refs после exact создания/binding
+карточки, иначе cold/late attempt терял их при наличии canonical картинки.
+Это не HTTP delivery ACK, не новая отправка и не proof из одного image marker.
 Preview использует тот же mobile upload-root reader, не произвольный transport
 alias. Права `POST /api/mobile-attachments/preview` и 12MB cap не расширены;
 JSONL, literal footer и receipt delivery не переписываются.
@@ -810,9 +890,28 @@ JSONL, literal footer и receipt delivery не переписываются.
 providerQueueAccepted или `confirmed/exactAuditConfirmed`. Это Enter/queue/
 canonical delivery соответственно, не завершение ответа. `accepted:true` само
 по себе допускает submitted:null; network transmission, reserved/preparing/
-in-flight/enter-armed не доказывают приём. Раннего публичного outbox/executor ACK
-до submission/queue acceptance нет. Потерянный HTTP ответ сверяется GET той же
-send-receipt, не новым Send; Mac restart не гарантирует автономный retry unknown.
+in-flight/enter-armed сами по себе не доказывают приём.
+
+Source04.10 добавляет отдельный ранний ACK сохранённого Main backlog. Только
+при `capabilities.sendQueue.version=1` клиент может явно передать
+`applicationQueue:true` в обычный `/send`. HTTP202/same-ID GET с
+`applicationQueued:true`, `status:'application-queued'`, `accepted:true`,
+`submitted:false`, точным operation/tab/handoff и `applicationQueue.version=1`
+доказывает snapshot на Mac. `attemptId:null` до dispatch штатен; это НЕ
+providerQueueAccepted и НЕ exactAuditConfirmed. Один item передаётся провайдеру,
+остальные остаются в SQLite; exact canonical receipt выпускает следующий ещё
+во время streaming. Без opt-in POST сохраняет ожидание provider receipt.
+Native consumer/его UI этим Main этапом не меняются. Полная схема и recovery —
+`fact-terminal-mcp.md::Main FIFO принятых Send`.
+
+Для upload bytes дополнительно требуется exact `attachmentOwnership.durable:true`
+того же receipt и поддержанный capability выше. Legacy ACK без этого поля доказывает
+запрос, но не копию temp-файла. Наличие пути или client-supplied assetId не является
+арендой; новый Main сам проверяет/импортирует refs до ACK.
+
+Потерянный HTTP ответ сверяется GET той же send-receipt, не новым Send;
+Mac restart не разрешает автономный retry entered/unknown. Waiting snapshot
+без attempt восстанавливает сам Main после receipt reconciliation и App ready.
 
 Busy `/interrupt` — прервать текущий turn, idle `/stop` — явный Stop процесса.
 Interrupt ACK не означает idle: следующий queued turn уже может работать.
@@ -995,11 +1094,55 @@ Claude использует тот же main-owned full-history adapter и ус�
 для conditional/delta запроса. Ни одна ошибка не очищает удерживаемые rows сама.
 Codex metadata для этого read берётся из main event projection, без process scan.
 
-На reopen/foreground/reconnect клиент сохраняет rows, восстанавливает один SSE
-на свой набор активных чатов и проверяет их ревизии. `transcript-changed` и
+На reopen/foreground/reconnect legacy-клиент сохраняет rows, восстанавливает один SSE
+на свой набор активных чатов и проверяет их ревизии. Capability-aware native вместо
+массовых History GET использует раннюю metadata-проверку ниже. `transcript-changed` и
 `timing-changed` — поводы для одного conditional read с максимум одним trailing
 read при событии в полёте. Unconditional full reload, SSE на каждый чат и новый
 локальный учёт длительности не требуются.
+
+### Ранняя свежесть кэша
+
+04.10 source: `/api/me.capabilities.historyFreshness.version=1` разрешает
+`GET /api/history-freshness?tabIds=<URL-encoded JSON array,1..32>` и добавление
+`freshness=v1` к `history?view=history`. Старые History/catalog DTO не меняются.
+Batch отдаёт `{ok,epoch,snapshots}`; snapshot содержит `schema:1,epoch,sequence,
+tabId,toolType,readSessionId,scope,state,token,observedAt`. `state=known` несёт
+opaque `source/token,sourceCount`; unknown — `token:null,reason,revalidate:true`.
+Это metadata источника, не сообщение «ответ успешно завершён» (`outcomeCoverage:false`).
+
+Одна запись около0,5KB. Main использует не более16 reader-proven источников на
+scope,512 сертификатов;4 concurrent probes,1s probe/2s batch budget. Async stat и
+SQLite metadata не ждут worker cold queue, не открывают JSONL и не выполняют
+тяжёлую подготовку в catalog GET. Unknown после restart/eviction/нового read owner
+требует bounded History только выбранного чата; неизвестность после fallback
+остаётся видимой, не бесконечным автоматическим циклом. Missing/unsupported tab
+не считается пустой или свежей и не меняет project count/runtime.
+
+Full/unchanged/delta History добавляет тот же proof плюс
+`coverage:{requestKey,historyRevision}` для точного окна и payload-policy.
+Запоминается версия **применённых** строк, не время HTTP-старта и не current
+runtime. Token/source/scope — только equality. `sequence` упорядочивает наблюдения
+внутри одного `epoch`, не версии данных; nested sequence не равен outer SSE
+sequence. После gap/reconnect нужна metadata-проверка; после смены epoch — новое
+доказательство, а не сравнение чисел. Поздний ответ прежней клиентской epoch/selection
+не принимается. Более старый ответ не снимает новый dirty; одинаковый known token
+может подтвердить уже применённое окно, неизвестный — никогда.
+
+Existing SSE/WS добавляет `type:history-freshness,tabId,historyFreshness`: при
+connect — проверенный snapshot, при source/timing/runtime wake — unknown/revalidate.
+Событие не само History и не право перечитывать тела всех закрытых чатов. Нет
+постоянного polling. Состояние Working остаётся provider-owned; при idle и dirty
+истории интерфейс показывает получение данных, при непройденной проверке — checking,
+при сети/unknown — конечную неопределённость с Retry, сохраняя кэш. Native UI
+реализуется отдельным владельцем, Main не утверждает публикацию на экране по GET.
+
+Изменение source/sidecar в ходе чтения не получает known coverage старых rows.
+Смена read owner даёт409; неверная version/query —400, отсутствующий batch owner —503.
+Сертификат использует physical witnesses, включая frozen ancestry; parent append
+может консервативно инвалидировать окно, но не добавляет в него новые parent rows.
+Exact schema/ошибки/consumer algorithm и source evidence:
+`/private/tmp/ios-working-reopen-20261004/MAIN-RESULT.md`.
 
 ### Живые строки модели и effort
 
@@ -1082,6 +1225,13 @@ compactStartConfirmed=true + localCommandProof=codex-compact-causal-task-started
 поэтому исправление native merge не обязано ждать установки additive GET.
 
 ### Общие владельцы состояния
+
+Внутренний coherent Main snapshot для common scenario admission сохраняет
+`sendTarget` от physical write-boundary reader отдельно от read/display SID.
+Этот tuple не ставит inputReady и не является новым ACK: pinned caller всё
+ещё проверяет actual writer/instance/launch/turn/generation перед paste/Enter.
+Готовность процесса без переноса destination ложно останавливала capacity retry
+2846; source repair восстановил прежний proof path, без saved-SID fallback.
 
 `mobile-web` больше не основной потребитель этого сервера. Нативный iOS-клиент Habit Tracker (`fact-voice-chat-tab.md::Terminal mode`) ходит в те же REST/SSE endpoints и рисует Terminal сам на SwiftUI; React `mobile-web/` оставлен только как legacy/debug surface и не является целевым клиентом. Это не вторая модель terminal-control: source of truth остаётся в custom-terminal renderer/main, а native app только отображает снапшоты и шлёт команды.
 
@@ -1260,6 +1410,7 @@ GET  /api/terminal-tabs/:tabId/pending-question      → текущий AskUserQ
 POST /api/terminal-tabs/:tabId/answer-question       → answerClaudeQuestion ({source, answers, stop})
 GET  /api/active-loaders                       → live loaders snapshot для external install preflight
 GET  /api/project-activity                     → full project activity snapshot для native project badges
+GET  /api/history-freshness?tabIds=<JSON array> → opt-in small read-source metadata, без History fanout; не outcome/provider status
 GET  /api/events?scope=projects                → SSE только project-activity, без tab transcript watcher'ов
 POST /api/mobile-attachments                   → upload iOS camera/gallery/file bytes в Mac temp, cap 25MB
 POST /api/mobile-attachments/preview           → восстановить preview temp upload по absolute path, image cap 12MB
@@ -1573,6 +1724,98 @@ remote APNs alert по зарегистрированным iOS token'ам. Push
 `tabCompletionNotifications`, `project-activity` snapshot и APNs payload. Не пересчитывать timestamp
 отдельно по каналам: native dedupe держится на `tabId:firedAt`, и разные значения превращают один
 завершившийся turn в два баннера или два unread-state.
+
+### Компактные сигналы карточек вкладок
+
+SOURCE05.10: capability `cardSignals.version=1` добавляет один блок `cardSignals`
+в существующий `GET /api/projects/:id/tabs`, без N+1 params/context/plan HTTP.
+Cap указывает `responseField:'cardSignals'`, `wakeTransport:'project-activity'`,
+`wakeField:'cardSignals'`, `maxPlanItems:200` (предел прежнего plan owner).
+Блок: `{version:1,epoch,revision,projectId,taskStatuses,taskStatusMarker,tabs}`.
+`epoch` — `appRuntimeIdentity.instanceId` этого Main process; `revision` —
+процессный монотонный clock ТОЛЬКО новых card metadata. Сравнивать числа можно
+внутри epoch, не с runtimeRevision/History revision/ревизией отдельного плана.
+Клиент дополнительно привязывает ответ к исходному API origin и projectId запроса;
+UUID процесса не заменяет origin cache namespace.
+
+В каждой строке `tabs` только `tabId` и три независимых факта:
+
+- `fast:{known,enabled,serviceTier,owner,proof,reason}`. Только exact current
+  service-tier proof: `priority`→true, `default`→false. При inactive/missing/
+  чужом writer/launch/PTY/run — known=false, enabled=null, не saved toggle.
+  Owner: `{ownerId,generationMode,generationId,launchId,
+  terminalLifecycleGeneration,terminalRunSeq}`; proof: `{source,proofAt}`.
+  Недоказанный tier может иметь текущий owner hint, но не `known:true`.
+- `plan:{known:true,revision,items:[{id,statusId,order}]}` — только активные
+  корневые задачи, order с0. Без title/body/подзадач/архива/undo journal.
+  Unknown statusId сохраняется; это не удаление задачи. Invalid/unavailable
+  stored plan даёт known=false/revision=null, не фальшивый пустой план.
+- `pendingContext:{known:true,revision,count}` — число логических pending
+  чипов того же TabWorkContext. Валидные file/file-batch members объединены
+  в один чип, sending/delivered/deleted не входят. Не число SQL rows. Нет чтения
+  Markdown, syncLinks, History subscriptions или передачи текста обновлений.
+
+Общий `taskStatuses:[{id,label,color}]` без descriptions и
+`taskStatusMarker:{shape,sizePx}` приходят один раз из прежнего Main каталога/
+SQLite mirror настроек. Временное несохранённое renderer intent не выдаётся за
+подтверждённое server setting. Старые top-level contextPct/status/bell/runtime
+сохраняют прежнюю authority: card clock не удостоверяет их и не является
+completion proof. Нижние маркеры — задачи, не старые notes.
+
+Card capture синхронный после await прежнего `/tabs`: fresh metadata и Fast
+не берутся из начала долгого bridge-запроса. Его revision покрывает только
+перечисленные tab IDs, не подтверждает свежесть внешней layout/runtime части.
+Saved inactive tabs читают свои планы/count без Resume, а Fast у них unknown.
+Не сохранённая/перемещённая из проекта строка имеет unknown plan/pending/Fast,
+без чтения чужого проекта. Ошибка summary-read не ломает старый `/tabs`: блок
+получает `unavailable:true,reason:'metadata-read-failed'` без массива tabs.
+Такой блок не применять как новый пустой/known snapshot; сохранить cache stale.
+
+Existing project-activity SSE/REST добавляет компактный wake
+`cardSignals:{version:1,epoch,revision,allProjects,projectIds:[...]}`.
+Это invalidation, не значения Fast/плана. Изменения tier/owner runtime,
+плана, pending updates, layout/save и палитры используют прежний80ms debounce.
+Catalog/marker change ставит allProjects; metadata не добавляет fake busy/count
+проект. Нет отдельного scheduler, provider action или History fanout.
+
+Для выбранного проекта native держит minimum revision из релевантных wakes
+(`allProjects` или projectId в списке) и не принимает более старый GET. Более
+новый current owner из runtime также запрещает применить несовместимый Fast proof.
+При gap/reconnect/смене origin/epoch требуется новый scoped seed; пустой список
+projectIds после coalescing не доказывает отсутствие offline изменений. Один
+coalesced `/tabs` выбранного проекта достаточен; closed projects не требуют
+History/params fanout. GET, уже покрывающий wake, не нужно читать повторно.
+Не сравнивать arrival order и не переносить revision между epoch.
+
+Actual handler/SQLite/owner/late HTTP/restart/coalescing и bounded payload checks:
+`src/main/project-card-signals.integration.test.js`. Это source/private proof,
+не установленный Main/native UI acceptance; capability проверяется на живом `/me`.
+
+### Удалённые настройки уведомления вкладки
+
+Source04.10 capability `completionNotifications.version=1` открывает GET/POST
+`/api/terminal-tabs/:tabId/completion-notification`. Body только
+`{mode:oneshot|persistent,enabled:boolean}`; проект определяется сервером, file
+не разрешён, отсутствующий/не загруженный renderer-owner не запускается ради меню.
+Это прежние desktop setters: one-shot/fired volatile, только persistent — SQLite.
+Persistent POST ждёт точный save ACK и проверяет записанное значение; результат
+не является доставкой уведомления или доказательством завершения AI.
+
+Ответ несёт четыре completionNotification флага, `version:{epoch,sequence}`, а
+также `persistencePending,storedPersistent,persistentDurable`; успешный persistent
+POST добавляет `persistentCommitted:true`. Версия захватывается в renderer до
+ответа HTTP. Старый menu GET не откатывает новый POST по порядку arrival; sequence
+сравнивается только внутри epoch. Legacy full-tab flags остаются seed, не более
+сильной истиной после versioned write. Failure может оставить volatile intent,
+поэтому без durable proof нельзя показывать сохранённую настройку.
+
+`completion-notification-changed` на existing tab и project-activity SSE/WS topics
+несёт лишь tabId/projectId: desktop set, clear, arm/fire и save settlement будят
+GET открытого меню, не History fanout. Late wake не несёт старого значения. Native
+не шлёт overlapping writes и не повторяет неизвестный POST автоматически; same-tab
+GET сверяет текущее состояние, но не доказывает, что старый запрос не выполнится
+позднее. Полный contract/пределы —
+`/private/tmp/ios-working-reopen-20261004/NOTIFICATION-RESULT.md`.
 
 `POST /api/terminal-tabs/:tabId/completion-notification/clear` — idempotent acknowledgement
 для native: повторный clear или уже закрытая вкладка возвращают success, потому что тап по

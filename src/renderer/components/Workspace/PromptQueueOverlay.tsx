@@ -1,4 +1,6 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
+import { useQueuedRewindLabels } from '../../hooks/useQueuedRewindLabels';
+import { queuedRewindLabel } from '../../utils/queuedRewindLabel.mjs';
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo, useSyncExternalStore } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
@@ -19,6 +21,7 @@ import { claudeEffortsForModel } from '../../constants/claudeLevels';
 import { CODEX_EFFORT_LEVELS, mergeCodexModelOptions } from '../../constants/codexSettings';
 import { isTabBusyNow, signalPromptQueueDictationResolved } from '../../hooks/usePromptQueueRunner';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
+import { queueItemDependencyTarget } from '../../utils/runAfterDependencyLayout.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario } from '../../utils/agentScenarios';
 import { AGENT_SETTINGS_INTENT_NONE } from '../../utils/agentSendSettingsContract';
@@ -64,6 +67,7 @@ import {
 import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlacement.mjs';
 import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
 import { pointInHoverCluster, pointInRect } from '../../utils/hoverBridge.mjs';
+import { captureQueueHoverReturn, createHoverReturnGate } from '../../utils/hoverReturnGate.mjs';
 import { shouldDisarmAfterTriggerClear } from '../../utils/runAfterTriggerClear.mjs';
 import { consumePromptQueueMiddleClick } from '../../utils/promptQueueMiddleClick.mjs';
 import { getAppRuntimeIdentity } from '../../utils/appRuntimeIdentity';
@@ -210,7 +214,7 @@ const HOVER_CLUSTER_PAD = 2;
 // Which screen edge the overlay is docked to. The panel is pinned by this edge
 // (it never moves), and the resize handle lives on the OPPOSITE (free) edge so
 // dragging only grows/shrinks toward the available space — per
-// `🧩 Code-Patterns/.../tooltip-resize-modal.md`: «resize только в сторону,
+// `🧩 Code-Patterns/.../всплывающие-окна.md`: «resize только в сторону,
 // противоположную опорной границе». Today the overlay sits flush against the
 // terminal's RIGHT edge (left of Timeline), so anchor = 'right' → handle on the
 // LEFT → drag-left grows.
@@ -262,7 +266,8 @@ const createQueuedComposerChipId = () => (
   'paste-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
 );
 
-function chipTitle(item: QueuedPrompt): string {
+function chipTitle(item: QueuedPrompt, rewindIteration?: number): string {
+  if (item.metaAction?.kind === 'rewind') return queuedRewindLabel(item.metaAction, rewindIteration);
   return (item.title || '').trim() || makeDefaultPromptTitle(item.text, item.images, item.chips?.length || 0);
 }
 
@@ -325,6 +330,10 @@ type Props = {
   hideHistoryToggle?: boolean;
   inputSurface?: 'terminal' | 'history';
   embedded?: boolean;
+  /** The global map keeps the same editor in normal flow, with compact chrome. */
+  overview?: boolean;
+  /** Dependencies rendered as full peer nodes by the global map. */
+  graphTargets?: ReadonlySet<string>;
   embeddedPinned?: boolean;
   embeddedWidth?: number;
   embeddedMaxHeight?: number;
@@ -340,6 +349,8 @@ export function PromptQueueOverlay({
   rightInset = 0,
   inputSurface = 'terminal',
   embedded = false,
+  overview = false,
+  graphTargets,
   embeddedPinned = false,
   embeddedWidth = 460,
   embeddedMaxHeight = 430,
@@ -352,6 +363,7 @@ export function PromptQueueOverlay({
   const agentLabel = AGENT_LABEL[sessionType];
   const chipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
   const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
+  const chipFontSize = overview ? Math.max(9, promptQueueChipFontSize - 2) : promptQueueChipFontSize;
   const promptQueueEditorFontSize = useUIStore((s) => s.promptQueueEditorFontSize);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
   const codexSettings = useUIStore((s) => s.codexSettings);
@@ -723,7 +735,7 @@ export function PromptQueueOverlay({
   const setPromptQueueWidth = useUIStore((s) => s.setPromptQueueWidth);
   const [dragWidth, setDragWidth] = useState<number | null>(null);
   const effectiveWidth = embedded ? embeddedWidth : dragWidth ?? promptQueueWidth;
-  const chipTextLineHeight = Math.max(12, Math.round(promptQueueChipFontSize * 1.27));
+  const chipTextLineHeight = Math.max(12, Math.round(chipFontSize * 1.27));
   const editorTitleHeight = Math.max(EDITOR_TITLE_HEIGHT, Math.round(promptQueueEditorFontSize * 1.8));
   const editorTextareaMinHeight = Math.max(EDITOR_TEXTAREA_MIN_HEIGHT, Math.round(promptQueueEditorFontSize * 4.8));
 
@@ -784,6 +796,7 @@ export function PromptQueueOverlay({
   const [cmdPressed, setCmdPressed] = useState(false);
   const cmdPressedRef = useRef(false);
   const previewPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const hoverReturnRef = useRef(createHoverReturnGate());
   const previewResizeActiveRef = useRef(false);
   const recheckQueueHoverRef = useRef<(point: { clientX: number; clientY: number } | null) => void>(() => {});
   const queueCountButtonRef = useRef<HTMLButtonElement>(null);
@@ -955,7 +968,11 @@ export function PromptQueueOverlay({
     if (embedded) {
       const workspace = useWorkspaceStore.getState();
       for (const [projectId, project] of workspace.openProjects) {
-        if (project.tabs.has(tabId)) { workspace.activateCenterTab(projectId, tabId); break; }
+        if (project.tabs.has(tabId)) {
+          workspace.placeTab(projectId, tabId);
+          useUIStore.getState().setActiveArea('workspace');
+          break;
+        }
       }
     }
     publishQueuedRewindTarget(tabId, requestId);
@@ -977,6 +994,7 @@ export function PromptQueueOverlay({
         requestId?: string;
         uuid?: string;
         text?: string;
+        iteration?: number;
         sessionId?: string;
         toolType?: 'claude' | 'codex';
       }>).detail;
@@ -991,6 +1009,7 @@ export function PromptQueueOverlay({
         kind: 'rewind',
         targetUuid: detail.uuid,
         targetText: detail.text,
+        targetIteration: detail.iteration,
         sourceSessionId: detail.sessionId,
         toolType: detail.toolType,
       });
@@ -1529,9 +1548,11 @@ export function PromptQueueOverlay({
     // already a wide resizable work surface, so forcing the same side-out there
     // pushed the editor past the viewport. In embedded mode the editor mirrors
     // the queue inside its own bounds, aligned to the panel's right edge.
-    const anchorRight = embedded
+    const desiredRight = embedded
       ? Math.max(EDITOR_MARGIN, window.innerWidth - panelRect.right + EDITOR_MARGIN)
       : window.innerWidth - panelRect.left + 8; // 8px gap
+    const anchorRight = Math.max(EDITOR_MARGIN, Math.min(desiredRight,
+      window.innerWidth - Math.min(editorSize.width, window.innerWidth - EDITOR_MARGIN * 2) - EDITOR_MARGIN));
     let anchorTop = panelRect.top;
     if (id) {
       const it = usePromptQueueStore.getState().getQueue(tabId).items.find((i) => i.id === id);
@@ -1546,18 +1567,18 @@ export function PromptQueueOverlay({
           : listRect.top;
       }
     }
-    if (embedded) {
+    if (embedded && !overview) {
       const minTop = panelRect.top + EDITOR_MARGIN;
       const maxTop = Math.max(minTop, panelRect.bottom - EDITOR_MIN_HEIGHT - EDITOR_MARGIN);
       anchorTop = Math.max(minTop, Math.min(maxTop, anchorTop));
     } else {
-      anchorTop = Math.max(EDITOR_MARGIN, anchorTop);
+      anchorTop = Math.max(EDITOR_MARGIN, Math.min(anchorTop, window.innerHeight - EDITOR_MIN_HEIGHT - EDITOR_MARGIN));
     }
-    const maxHeight = Math.max(96, embedded
+    const maxHeight = Math.max(96, embedded && !overview
       ? panelRect.bottom - anchorTop - EDITOR_MARGIN
       : window.innerHeight - anchorTop - EDITOR_MARGIN);
     return { top: anchorTop, right: anchorRight, maxHeight };
-  }, [embedded, tabId]);
+  }, [embedded, overview, editorSize.width, tabId]);
 
   const { start: startEditorResizeGesture } = usePointerGesture();
   const startEditorResize = useCallback((e: React.PointerEvent<HTMLElement>) => {
@@ -2842,6 +2863,7 @@ export function PromptQueueOverlay({
   // заранее записанный «список сторон» разошёлся бы с тем, что на экране.
   const closeQueueHoverPreview = useCallback(() => {
     if (!prepareQueueClose('outside')) return;
+    hoverReturnRef.current.reset();
     setQueueHoverPreviewOpen(false);
     setOnTabTriggerOpenKeys(new Map());
     setMetaActionsMenu(null);
@@ -2853,6 +2875,11 @@ export function PromptQueueOverlay({
     if (!point) { closeQueueHoverPreview(); return; }
     const countRect = queueCountButtonRef.current?.getBoundingClientRect() ?? null;
     const railRect = railRef.current?.getBoundingClientRect() ?? null;
+    const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect() ?? null;
+    const parentRects = [countRect, previewRect,
+      ...Array.from(queueHoverPreviewPanelRef.current?.querySelectorAll<HTMLElement>('[data-prompt-queue-edge-controls]') || [])
+        .map(el => el.getBoundingClientRect())];
+    if (hoverReturnRef.current.holds(point, parentRects.some(rect => pointInRect(rect, point.clientX, point.clientY, 2)))) return;
     // Only the orange count owns hover. The wide bridge can cover sibling
     // controls, but the thin rail border directly below the count remains a
     // path into the panel rather than an accidental close strip.
@@ -2861,7 +2888,6 @@ export function PromptQueueOverlay({
       closeQueueHoverPreview();
       return;
     }
-    const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect() ?? null;
     if (!previewRect) return;
     const satellites: (DOMRect | null)[] = [
       countRect,
@@ -2883,7 +2909,8 @@ export function PromptQueueOverlay({
   recheckQueueHoverRef.current = recheckQueueHover;
 
   useEffect(() => {
-    if (!queueHoverPreviewOpen) return;
+    if (!queueHoverPreviewOpen) { hoverReturnRef.current.reset(); return; }
+    const onChildClick = (event: MouseEvent) => captureQueueHoverReturn(event, panelRef.current, hoverReturnRef.current);
     const onMouseMove = (event: MouseEvent) => {
       previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
       recheckQueueHover(event);
@@ -2891,10 +2918,12 @@ export function PromptQueueOverlay({
     const onExitWindow = () => { previewPointerRef.current = null; recheckQueueHover(null); };
     const onMouseOut = (event: MouseEvent) => { if (!event.relatedTarget) onExitWindow(); };
     recheckQueueHover(previewPointerRef.current);
+    window.addEventListener('click', onChildClick, true);
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseout', onMouseOut);
     window.addEventListener('blur', onExitWindow);
     return () => {
+      window.removeEventListener('click', onChildClick, true);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseout', onMouseOut);
       window.removeEventListener('blur', onExitWindow);
@@ -2948,6 +2977,7 @@ export function PromptQueueOverlay({
   const panelPinned = embedded ? embeddedPinned : panelOpen;
   const queueHoverPreviewVisible = collapsed && queueHoverPreviewOpen;
   const panelAttached = panelOpen || queueHoverPreviewVisible;
+  const rewindLabels = useQueuedRewindLabels(tabId, items, panelAttached);
   // Модалка-редактор существует в ОБОИХ режимах панели: в развёрнутом и в
   // ховер-превью свёрнутого рейла. Превью — это тот же список сообщений, а не
   // витрина без действий: клик по строке открывает ту же боковую модалку
@@ -2976,11 +3006,12 @@ export function PromptQueueOverlay({
     ? `${editorPreviewChip.text.length.toLocaleString()} symbols`
     : editorPreviewFileName;
   const hasEditorPreview = !!editorPreviewLabel;
+  const editorVisibleWidth = Math.min(editorSize.width, Math.max(1, editorViewport.width - EDITOR_MARGIN * 2));
   const editorPreviewLayout = editorAnchor
     ? resolveRunAfterPreviewPlacement({
       viewport: editorViewport,
       anchor: editorAnchor,
-      editorWidth: editorSize.width,
+      editorWidth: editorVisibleWidth,
       editorHeight: editorMeasuredHeight,
       margin: EDITOR_MARGIN,
       gap: EDITOR_PREVIEW_GAP,
@@ -3011,20 +3042,20 @@ export function PromptQueueOverlay({
         data-prompt-queue-hover-owner={editorLockTokenRef.current}
         style={{
           position: embedded ? 'relative' : 'absolute',
-          ...(embedded ? { width: '100%' } : {}),
+          ...(embedded ? { width: overview ? 'max-content' : '100%', maxWidth: overview ? '100%' : undefined } : {}),
           top: 0,
           // Anchored edge — pinned, never moves during resize.
           ...(ANCHOR_SIDE === 'right' ? { right: rightInset } : { left: 0 }),
           background: 'transparent',
           border: 'none',
           borderRadius: 0,
-          zIndex: OVERLAY_Z_INDEX,
+          zIndex: overview ? undefined : OVERLAY_Z_INDEX,
           fontSize: 11,
           color: '#ddd',
-          maxHeight: embedded ? embeddedMaxHeight : '100%',
+          maxHeight: overview ? undefined : embedded ? embeddedMaxHeight : '100%',
           display: 'flex',
           flexDirection: 'column',
-          alignItems: ANCHOR_SIDE === 'right' ? 'flex-end' : 'flex-start',
+          alignItems: overview ? 'flex-start' : ANCHOR_SIDE === 'right' ? 'flex-end' : 'flex-start',
           gap: COLLAPSED_RAIL_GAP,
           overflow: 'visible',
           pointerEvents: 'auto',
@@ -3038,7 +3069,8 @@ export function PromptQueueOverlay({
             data-prompt-queue-hover-preview={queueHoverPreviewVisible ? 'true' : undefined}
             style={{
               position: 'relative',
-              width: embedded ? '100%' : effectiveWidth,
+              width: overview ? 'max-content' : embedded ? '100%' : effectiveWidth,
+              maxWidth: overview ? '100%' : undefined,
               // The global editor floats over other graph rows. It must be
               // opaque there: a 0.92 surface let the covered row's Play glyph
               // show through and read as an action belonging to this popup.
@@ -3049,7 +3081,7 @@ export function PromptQueueOverlay({
               border: `1px solid ${panelPinned ? PINNED_PANEL_BORDER : BORDER}`,
               borderRadius: 6,
               backdropFilter: embedded ? undefined : 'blur(8px)',
-              maxHeight: embedded
+              maxHeight: overview ? undefined : embedded
                 ? embeddedMaxHeight
                 : (queueHoverPreviewVisible ? 'min(60vh, 420px)' : '100%'),
               display: 'flex',
@@ -3057,7 +3089,7 @@ export function PromptQueueOverlay({
               // Border-mounted policy controls extend half a button above the
               // frame. The scrolling list remains its own clipped region.
               overflow: 'visible',
-              paddingTop: 11,
+              paddingTop: overview ? 0 : 11,
               boxSizing: 'border-box',
               flexShrink: 0,
               zIndex: 1,
@@ -3091,9 +3123,13 @@ export function PromptQueueOverlay({
         <div
           data-prompt-queue-edge-controls
           style={{
-            position: 'absolute',
+            position: overview ? 'relative' : 'absolute',
             top: 0,
-            left: 12,
+            left: overview ? 0 : 12,
+            marginLeft: overview ? 12 : undefined,
+            marginRight: overview ? 4 : undefined,
+            marginBottom: overview ? -10 : undefined,
+            alignSelf: overview ? 'flex-start' : undefined,
             transform: 'translateY(-50%)',
             zIndex: FLOATING_OVERLAY_Z_INDEX + 1,
             display: 'inline-flex',
@@ -3107,7 +3143,7 @@ export function PromptQueueOverlay({
           <div
             style={{
               display: 'inline-flex',
-              height: 22,
+              height: overview ? 20 : 22,
               border: `1px solid ${postPromptEnabled ? TINT : BORDER}`,
               borderRadius: 6,
               overflow: 'hidden',
@@ -3128,13 +3164,13 @@ export function PromptQueueOverlay({
                 title={postPromptText ? 'Post-prompt: ' + (postPromptText.length > 60 ? postPromptText.slice(0, 60) + '…' : postPromptText) : 'Post-prompt is empty — click ✏ to add'}
                 style={{
                   minWidth: effectiveWidth >= 220 ? 34 : 22,
-                  height: 20,
+                  height: overview ? 18 : 20,
                   padding: '0 6px',
                   background: postPromptEnabled ? `${TINT}26` : 'transparent',
                   border: 0,
                   color: postPromptEnabled ? TINT : TEXT_MUTED,
                   cursor: 'pointer',
-                  fontSize: 9,
+                  fontSize: overview ? 7 : 9,
                   fontFamily: 'inherit',
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -3157,7 +3193,7 @@ export function PromptQueueOverlay({
                 aria-label="Изменить post-prompt"
                 style={{
                   width: 22,
-                  height: 20,
+                  height: overview ? 18 : 20,
                   padding: 0,
                   background: 'transparent',
                   border: 0,
@@ -3177,7 +3213,7 @@ export function PromptQueueOverlay({
           <div
             style={{
               display: 'inline-flex',
-              height: 22,
+              height: overview ? 20 : 22,
               border: `1px solid ${loopPromptEnabled ? PULSE : BORDER}`,
               borderRadius: 6,
               overflow: 'hidden',
@@ -3191,6 +3227,7 @@ export function PromptQueueOverlay({
               <button
                 type="button"
                 className="pq-edge-action"
+                data-prompt-queue-loop-toggle
                 aria-pressed={loopPromptEnabled}
                 onClick={() => {
                   setLoopPromptEnabled(tabId, !loopPromptEnabled);
@@ -3198,13 +3235,13 @@ export function PromptQueueOverlay({
                 title={loopPromptText ? 'Loop: ' + (loopPromptText.length > 60 ? loopPromptText.slice(0, 60) + '…' : loopPromptText) : 'Loop is empty — click the pencil to add text'}
                 style={{
                   minWidth: 24,
-                  height: 20,
+                  height: overview ? 18 : 20,
                   padding: effectiveWidth >= 220 ? '0 6px' : '0 5px',
                   background: loopPromptEnabled ? `${PULSE}22` : 'transparent',
                   border: 0,
                   color: loopPromptEnabled ? PULSE : TEXT_MUTED,
                   cursor: 'pointer',
-                  fontSize: 9,
+                  fontSize: overview ? 7 : 9,
                   fontFamily: 'inherit',
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -3227,7 +3264,7 @@ export function PromptQueueOverlay({
                 aria-label="Изменить циклический prompt"
                 style={{
                   width: 22,
-                  height: 20,
+                  height: overview ? 18 : 20,
                   padding: 0,
                   background: 'transparent',
                   border: 0,
@@ -3259,8 +3296,8 @@ export function PromptQueueOverlay({
                 if (metaActionsMenu) setMetaActionsMenu(null); else openMetaActionsMenu();
               }}
               style={{
-                width: 22,
-                height: 22,
+                width: overview ? 20 : 22,
+                height: overview ? 20 : 22,
                 padding: 0,
                 borderRadius: 6,
                 border: `1px solid ${BORDER}`,
@@ -3276,25 +3313,57 @@ export function PromptQueueOverlay({
             </button>
           </ControlHint>
 
-          <AutoCompactControl tabId={tabId} settings global={embedded} />
+          <AutoCompactControl tabId={tabId} settings global={embedded} compact={overview} hoverOwner={editorLockTokenRef.current} />
+          {overview && <ControlHint label={autoRun ? 'Приостановить Run After' : 'Запустить Run After'} side="top" disabled={activeItemCount === 0}>
+            <button type="button" className="pq-edge-action gra-node-action" data-global-run-after-run-control={tabId}
+              aria-label={autoRun ? 'Приостановить Run After' : 'Запустить Run After'} aria-pressed={autoRun}
+              disabled={activeItemCount === 0} onClick={toggleAutoRun}
+              onMouseEnter={() => setRailRunHover(true)} onMouseLeave={() => setRailRunHover(false)}
+              style={{ ...railRunAppearance, borderStyle: 'solid', borderWidth: 1, width: 20, height: 20, padding: 0, flexShrink: 0, borderRadius: 6,
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+              {autoRun ? <Pause size={10} fill="currentColor" /> : <Play size={10} />}
+            </button>
+          </ControlHint>}
         </div>
         {/* Chip list */}
         <div
           ref={chipListRef}
           data-prompt-queue-item-list
           style={{
-            overflowY: 'auto',
+            overflowY: overview ? 'visible' : 'auto',
+            display: overview ? 'flex' : undefined,
+            flexDirection: overview ? 'column' : undefined,
+            alignItems: overview ? 'flex-start' : undefined,
             flex: 1,
             minHeight: 0,
             maxHeight: queueHoverPreviewVisible ? 'min(56vh, 390px)' : undefined,
             // Hover → pinned changes ownership only. These values used to be
             // 3px in preview and 0px after click, shrinking the same list by
             // 6px and pulling its first row toward the edge controls.
-            paddingTop: 3,
-            paddingBottom: 3,
+            paddingTop: overview ? 1 : 3,
+            paddingBottom: overview ? 1 : 3,
           }}
         >
-          {items.length === 0 && (
+          {overview && activeItemCount === 0 && runAfterTabId && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '2px 5px 4px 12px', padding: '1px 3px 1px 5px' }}>
+              <div data-prompt-queue-dependency-target={runAfterTabId} data-prompt-queue-dependency-item="queue-target"
+                style={{ flex: 1, minWidth: 0 }}>
+                <RunAfterTabPicker tabId={tabId} autoRun={autoRun} runAfterTabId={runAfterTabId}
+                  showTaskMarkers={false}
+                  setRunAfterTab={usePromptQueueStore.getState().setRunAfterTab}
+                  hideTrigger={graphTargets?.has(runAfterTabId)}
+                  panelRef={panelRef} hoverOwner={editorLockTokenRef.current} zIndex={FLOATING_OVERLAY_Z_INDEX + 20}
+                  persistProjectSelection waitingTabIds={pendingQueueTabIds} />
+              </div>
+              {graphTargets?.has(runAfterTabId) && <button type="button" data-chip-action="remove-trigger"
+                aria-label="Clear trigger" title="Убрать зависимость очереди"
+                onClick={() => usePromptQueueStore.getState().setRunAfterTab(tabId, null)}
+                style={{ width: 17, height: 17, padding: 0, border: 0, background: 'transparent', color: TEXT_DIM, cursor: 'pointer' }}>
+                <X size={10} />
+              </button>}
+            </div>
+          )}
+          {items.length === 0 && !runAfterTabId && (
             <div style={{ padding: '4px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.2 }}>
               empty
             </div>
@@ -3304,7 +3373,7 @@ export function PromptQueueOverlay({
             const isMetaAction = !!it.metaAction;
             const isTitleLoading = titleLoadingIds.has(it.id)
               && !getQueuedPromptLocalCommand(it.text, it.images, it.chips?.length || 0);
-            const title = isTitleLoading ? '' : chipTitle(it);
+            const title = isTitleLoading ? '' : chipTitle(it, rewindLabels[it.id]);
             const isMultiLine = chipLineClamp > 1;
             const isEditing = editorOpen && editingId === it.id;
             const isDragOver = dragOverIdx === idx;
@@ -3335,13 +3404,26 @@ export function PromptQueueOverlay({
             ].filter(Boolean).join(' ');
             const editingOnTabTrigger = onTabTriggerDraftIds.has(it.id);
             const editingTimerTrigger = timerTriggerDraftIds.has(it.id);
+            const dependencyTarget = overview ? queueItemDependencyTarget(queue, it) : null;
+            const legacyDependency = overview && !!dependencyTarget && it.trigger?.kind !== 'onTab';
+            const graphDependency = !!dependencyTarget && graphTargets?.has(dependencyTarget);
             const showOnTabTrigger = editingOnTabTrigger || (!editingTimerTrigger && it.trigger?.kind === 'onTab');
             const showTimerTrigger = editingTimerTrigger || (!editingOnTabTrigger && it.trigger?.kind === 'timer');
             const showAppRestartTrigger = !editingOnTabTrigger && !editingTimerTrigger
               && it.trigger?.kind === 'app-restart';
             const showContextCondition = it.condition?.kind === 'context-used';
+            const triggerRows = [
+              ...(showTimerTrigger ? ['timer'] : []),
+              ...(showAppRestartTrigger ? ['app-restart'] : []),
+              ...(showOnTabTrigger || legacyDependency ? ['onTab'] : []),
+            ];
+            const ItemFrame = overview ? 'div' : Fragment;
             return (
-              <Fragment key={it.id}>
+              <ItemFrame key={it.id} {...(overview ? {
+                'data-prompt-queue-item-group': it.id,
+                style: { display: graphDependency ? 'grid' : 'flex', flexDirection: 'column', alignItems: 'flex-start',
+                  gridTemplateColumns: 'minmax(0, 1fr) max-content', width: 'max-content', maxWidth: '100%' },
+              } : {})}>
               <div
                 className={chipClass}
                 data-prompt-queue-item={it.id}
@@ -3382,7 +3464,11 @@ export function PromptQueueOverlay({
                 onContextMenu={(e) => openChipContextMenu(it.id, e)}
                 style={{
                   position: 'relative',
-                  padding: '4px 7px',
+                  gridColumn: overview ? '1' : undefined,
+                  gridRow: overview ? '1' : undefined,
+                  width: overview ? 'max-content' : undefined,
+                  maxWidth: overview ? 'min(290px, 100%)' : undefined,
+                  padding: overview ? '2px 5px' : '4px 7px',
                   margin: '2px 5px',
                   border: isSendPending
                     ? `1px solid ${PULSE}88`
@@ -3528,7 +3614,7 @@ export function PromptQueueOverlay({
                   </span>
                 ) : isMultiLine ? (
                   <span style={{
-                    flex: 1, minWidth: 0, fontSize: promptQueueChipFontSize, lineHeight: `${chipTextLineHeight}px`,
+                    flex: overview ? '0 1 auto' : 1, minWidth: 0, fontSize: chipFontSize, lineHeight: `${chipTextLineHeight}px`,
                     color: isEnabled ? '#ddd' : DISABLED_PROMPT_TEXT,
                     display: '-webkit-box',
                     WebkitBoxOrient: 'vertical' as const,
@@ -3539,7 +3625,7 @@ export function PromptQueueOverlay({
                     wordBreak: 'break-word',
                   }}>{title}</span>
                 ) : (
-                  <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: promptQueueChipFontSize, lineHeight: `${chipTextLineHeight}px`, color: isEnabled ? '#ddd' : DISABLED_PROMPT_TEXT }}>{title}</span>
+                  <span style={{ flex: overview ? '0 1 auto' : 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: chipFontSize, lineHeight: `${chipTextLineHeight}px`, color: isEnabled ? '#ddd' : DISABLED_PROMPT_TEXT }}>{title}</span>
                 )}
                 {(it.images > 0 || attachmentState === 'missing') && (
                   <span
@@ -3605,30 +3691,47 @@ export function PromptQueueOverlay({
                 ><Trash2 size={13} strokeWidth={1.9} /></button>
                 </ControlHint>
               </div>
-              {(showTimerTrigger || showOnTabTrigger || showAppRestartTrigger) && (
+              {triggerRows.map(triggerKind => (
                 <div
                   className="pq-middle-delete-target"
+                  key={triggerKind}
                   data-prompt-trigger-row={it.id}
-                  data-prompt-trigger-kind={it.trigger?.kind}
+                  data-prompt-trigger-kind={triggerKind}
                   style={{
                     minHeight: 21,
-                    margin: '0 5px 3px 19px',
+                    gridColumn: overview ? (triggerKind === 'onTab' && graphDependency ? '2' : '1 / -1') : undefined,
+                    gridRow: overview && triggerKind === 'onTab' && graphDependency ? '1' : undefined,
+                    alignSelf: overview ? 'center' : undefined,
+                    width: overview ? (triggerKind === 'timer' ? 180 : 'max-content') : undefined,
+                    maxWidth: overview ? 'calc(100% - 24px)' : undefined,
+                    margin: overview && triggerKind === 'onTab' && graphDependency ? '0 5px 0 0' : '0 5px 3px 19px',
                     padding: '1px 3px 1px 5px',
                     display: 'flex',
                     alignItems: 'center',
                     gap: 3,
-                    borderLeft: `1px solid ${PULSE}66`,
-                    borderBottom: `1px solid ${BORDER}`,
+                    position: overview ? 'relative' : undefined,
+                    zIndex: overview ? 3 : undefined,
+                    borderLeft: overview && triggerKind === 'onTab' && graphDependency ? 'none' : `1px solid ${PULSE}66`,
+                    borderBottom: overview && triggerKind === 'onTab' && graphDependency ? 'none' : `1px solid ${BORDER}`,
                     borderRadius: '0 0 5px 5px',
-                    backgroundColor: 'rgba(167,139,250,0.045)',
+                    backgroundColor: overview && triggerKind === 'onTab' ? 'transparent' : 'rgba(167,139,250,0.045)',
                     fontSize: Math.max(8, Math.round(promptQueueChipFontSize * 0.85)),
                   }}
-                  onMouseDownCapture={(event) => { consumePromptQueueMiddleClick(event); }}
-                  onAuxClickCapture={(event) => consumePromptQueueMiddleClick(event, () => clearItemTrigger(it.id))}
+                  onMouseDownCapture={(event) => {
+                    if (overview && triggerKind === 'onTab' && (event.target as HTMLElement).closest('[data-tab-card]')) return;
+                    consumePromptQueueMiddleClick(event);
+                  }}
+                  onAuxClickCapture={(event) => {
+                    if (overview && triggerKind === 'onTab' && (event.target as HTMLElement).closest('[data-tab-card]')) return;
+                    consumePromptQueueMiddleClick(event, () => {
+                      if (triggerKind === 'onTab' && legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, null);
+                      else clearItemTrigger(it.id);
+                    });
+                  }}
                   onMouseDown={(event) => event.stopPropagation()}
                   onClick={(event) => event.stopPropagation()}
                 >
-                  {showTimerTrigger ? (
+                  {triggerKind === 'timer' ? (
                     <PromptTriggerTimerInput
                       tabId={tabId}
                       item={it}
@@ -3643,26 +3746,33 @@ export function PromptQueueOverlay({
                         armRunAfterForSchedulingIfBusy();
                       }}
                     />
-                  ) : showAppRestartTrigger ? (
+                  ) : triggerKind === 'app-restart' ? (
                     <div style={{ minWidth: 0, flex: 1, display: 'inline-flex', alignItems: 'center', gap: 5,
                       color: '#c4b5fd' }} title="Запустить эту итерацию после следующего перезапуска приложения">
                       <RotateCw size={11} strokeWidth={1.9} />
                       <span>после перезапуска</span>
                     </div>
                   ) : (
-                    <div style={{ minWidth: 0, flex: 1 }}>
+                    <>
+                    <div style={{ minWidth: 0, flex: 1 }}
+                      data-prompt-queue-dependency-target={overview ? dependencyTarget : undefined}
+                      data-prompt-queue-dependency-item={overview ? it.id : undefined}>
                       <RunAfterTabPicker
+                        showTaskMarkers={false}
                         hoverOwner={editorLockTokenRef.current}
                         zIndex={FLOATING_OVERLAY_Z_INDEX + 20}
                         tabId={tabId}
                         autoRun={autoRun}
-                        runAfterTabId={it.trigger?.kind === 'onTab' ? it.trigger.tabId : null}
+                        runAfterTabId={it.trigger?.kind === 'onTab' ? it.trigger.tabId : dependencyTarget}
+                        hideTrigger={graphDependency}
                         setRunAfterTab={(_ownerTabId, targetTabId) => {
                           if (targetTabId) {
-                            setPromptTrigger(tabId, it.id, { kind: 'onTab', tabId: targetTabId });
+                            if (legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, targetTabId);
+                            else setPromptTrigger(tabId, it.id, { kind: 'onTab', tabId: targetTabId });
                             armRunAfterForSchedulingIfBusy(targetTabId);
                           } else {
-                            setPromptTrigger(tabId, it.id, null);
+                            if (triggerKind === 'onTab' && legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, null);
+                            else setPromptTrigger(tabId, it.id, null);
                           }
                           setOnTabTriggerDraftIds((current) => {
                             const next = new Set(current);
@@ -3699,23 +3809,30 @@ export function PromptQueueOverlay({
                         showPillClearAction={false}
                       />
                     </div>
+                    </>
                   )}
                   <button
                     type="button"
                     data-chip-action="remove-trigger"
                     aria-label="Clear trigger"
                     title="Clear trigger"
-                    onClick={() => clearItemTrigger(it.id)}
+                    onClick={() => {
+                      if (triggerKind === 'onTab' && legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, null);
+                      else clearItemTrigger(it.id);
+                    }}
                     style={{ width: 17, height: 17, flex: '0 0 17px', display: 'grid', placeItems: 'center', padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: TEXT_DIM, cursor: 'pointer' }}
                   ><X size={10} /></button>
                 </div>
-              )}
+              ))}
               {showContextCondition && (
                 <div
                   className="pq-middle-delete-target"
                   data-prompt-context-condition-row={it.id}
                   style={{
+                    gridColumn: overview ? '1 / -1' : undefined,
                     minHeight: 21,
+                    width: overview ? 'max-content' : undefined,
+                    maxWidth: overview ? 'calc(100% - 24px)' : undefined,
                     margin: '0 5px 3px 19px',
                     padding: '1px 3px 1px 5px',
                     display: 'flex',
@@ -3754,7 +3871,7 @@ export function PromptQueueOverlay({
                   ><X size={10} /></button>
                 </div>
               )}
-              </Fragment>
+              </ItemFrame>
             );
           })}
         </div>
@@ -3792,6 +3909,7 @@ export function PromptQueueOverlay({
             tabId={tabId}
             panelOpen={panelOpen}
             effectiveWidth={effectiveWidth}
+            queueVisible={panelOpen || queueHoverPreviewVisible}
           />
           <AutoCompactControl tabId={tabId} />
           <ControlHint
@@ -4360,8 +4478,8 @@ export function PromptQueueOverlay({
             position: 'fixed',
             top: editorAnchor.top,
             right: editorAnchor.right,
-            width: editorSize.width,
-            minWidth: EDITOR_MIN_WIDTH,
+            width: editorVisibleWidth,
+            minWidth: Math.min(EDITOR_MIN_WIDTH, editorVisibleWidth),
             minHeight: EDITOR_MIN_HEIGHT,
             maxHeight: editorAnchor.maxHeight,
             background: PANEL_BG,

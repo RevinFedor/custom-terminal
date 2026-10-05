@@ -127,3 +127,95 @@ test('HTTP accepts two addressed questions while delivery waits; replies return 
   assert.equal(db.prepare('SELECT count(*) n FROM tab_messages').get().n, 4);
   assert.equal(deliveries.length, before);
 });
+
+test('HTTP dismissal maps replies to questions, validates the participant and leaves transport and history untouched', async t => {
+  const db = new Database(':memory:');
+  const deliveries = [];
+  const changes = [];
+  const resolveTab = async tabId => ({ tabId, tabName: tabId, projectId: 'project', projectName: 'Project',
+    provider: 'codex', sessionId: 'session-' + tabId });
+  const service = new TabMessageService({ db, resolveTab,
+    send: async message => { deliveries.push(message); return { state: 'confirmed' }; },
+    onChanged: message => changes.push(message),
+  });
+  await service.initialize();
+  const q = (await service.sendMessage({ source: 'a', target: 'b', text: 'Retained question', requestId: 'q' })).message;
+  while (service.lanes.size) await Promise.all([...service.lanes.values()]);
+  const reply = (await service.replyToMessage({ responder: 'b', messageId: q.messageId,
+    text: 'Retained answer', requestId: 'r' })).message;
+  while (service.lanes.size) await Promise.all([...service.lanes.values()]);
+  const eventStart = changes.length;
+  const noResolve = () => assert.fail('dismissal must not resolve a live session');
+  service.resolveTab = noResolve;
+  let dismissCalls = 0;
+  const dismiss = service.dismissMessage.bind(service);
+  service.dismissMessage = payload => { dismissCalls++; return dismiss(payload); };
+  const server = http.createServer(async (req, res) => {
+    const handled = await handleTabMessageApi(req, res, url.parse(req.url, true), {
+      service, resolveTab: noResolve,
+      readBody: async req => { const chunks = []; for await (const chunk of req) chunks.push(chunk); return JSON.parse(Buffer.concat(chunks)); },
+      sendJson: (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); },
+    });
+    if (!handled) { res.writeHead(404); res.end(); }
+  });
+  t.after(async () => { service.dispose(); server.closeAllConnections(); await new Promise(r => server.close(r)); db.close(); });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const base = 'http://127.0.0.1:' + server.address().port;
+  const request = async (pathname, body, method = 'POST') => {
+    const res = await fetch(base + pathname, { method, headers: { 'content-type': 'application/json' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    return { status: res.status, body: await res.json() };
+  };
+  const route = '/api/tab-messages/' + q.messageId + '/dismiss';
+  for (const body of [{}, { tabId: '' }, { tabId: 42 }, null]) {
+    const missingTab = await request(route, body);
+    assert.equal(missingTab.status, 400);
+    assert.equal(missingTab.body.code, 'message_tab_required');
+    assert.equal(Object.hasOwn(missingTab.body, 'deliveryState'), false, 'dismissal errors are not send receipts');
+  }
+  const forged = await request(route, { tabId: 'a', sourceMeta: { server: 'terminal', mode: 'internal', tabId: 'b' } });
+  assert.equal(forged.status, 403);
+  assert.equal(forged.body.code, 'message_source_identity_mismatch');
+  assert.equal(dismissCalls, 0, 'caller metadata must be checked before calling the service');
+  const foreign = await request(route, { tabId: 'c' });
+  assert.equal(foreign.status, 403);
+  assert.equal(foreign.body.code, 'tab_message_foreign_participant');
+  const absent = await request('/api/tab-messages/missing/dismiss', { tabId: 'a' });
+  assert.equal(absent.status, 404);
+  assert.equal(absent.body.code, 'tab_message_not_found');
+  assert.equal((await request(route, undefined, 'GET')).status, 405);
+  assert.equal(changes.length, eventStart);
+
+  const source = await request('/api/tab-messages/' + reply.messageId + '/dismiss', { tabId: 'a' });
+  assert.equal(source.status, 200);
+  assert.equal(source.body.ok, true);
+  assert.equal(source.body.messageId, q.messageId);
+  assert.equal(source.body.deduplicated, false);
+  assert.ok(source.body.message.sourceDismissedAt);
+  assert.equal(source.body.message.targetDismissedAt, null);
+  assert.equal(source.body.message.text, undefined);
+  assert.equal(source.body.message.frozenPrompt, undefined);
+  const repeated = await request(route, { tabId: 'a' });
+  assert.deepEqual(repeated, { status: 200, body: { ...source.body, deduplicated: true } });
+  assert.equal(changes.length, eventStart + 1);
+  const target = await request(route, { tabId: 'b', sourceMeta: { server: 'terminal', mode: 'internal', tabId: 'b' } });
+  assert.equal(target.status, 200);
+  assert.equal(target.body.message.sourceDismissedAt, source.body.message.sourceDismissedAt);
+  assert.ok(target.body.message.targetDismissedAt > source.body.message.updatedAt);
+  for (const tabId of ['a', 'b']) {
+    const list = await request('/api/tab-messages?tabId=' + tabId, undefined, 'GET');
+    assert.equal(list.status, 200);
+    assert.equal(list.body.messages.length, 2);
+    assert.deepEqual(list.body.messages.find(m => m.messageId === q.messageId), target.body.message);
+  }
+  const full = await request('/api/tab-messages/' + q.messageId, undefined, 'GET');
+  assert.equal(full.status, 200);
+  assert.equal(full.body.message.sourceDismissedAt, source.body.message.sourceDismissedAt);
+  assert.equal(full.body.message.targetDismissedAt, target.body.message.targetDismissedAt);
+  assert.equal(full.body.message.updatedAt, target.body.message.updatedAt);
+  assert.equal(full.body.message.text, q.text);
+  assert.equal(full.body.reply.text, reply.text);
+  assert.equal(deliveries.length, 2);
+  assert.equal(changes.length, eventStart + 2);
+});

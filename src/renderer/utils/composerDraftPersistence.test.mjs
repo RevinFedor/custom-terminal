@@ -7,6 +7,21 @@ import {
   readComposerDraftMemory,
   splitComposerDraftMemory,
 } from './composerDraftPersistence.mjs';
+import { insertHistoryClipboardSnapshotAtSelection } from './composerClipboard.mjs';
+
+test('replayed prompt revision keeps its provenance across draft persistence and subsequent paste', () => {
+  for (const sourceKey of [undefined, 'prompt:1']) {
+    const previous = { id: 'same-id', kind: 'prompt', text: 'old version', ...(sourceKey ? { sourceKey } : {}) };
+    const first = insertHistoryClipboardSnapshotAtSelection({ chips: [{ ...previous, text: 'new version' }],
+      insertedText: 'message', insertedChips: [previous] });
+    const memory = buildComposerDraftMemory({ drafts: { T: first.text }, chips: { T: first.chips } });
+    const restored = splitComposerDraftMemory(JSON.parse(JSON.stringify(memory)));
+    const replay = insertHistoryClipboardSnapshotAtSelection({ text: restored.drafts.T, chips: restored.chips.T,
+      insertedText: 'message', insertedChips: [previous] });
+    assert.deepEqual(replay.chips, first.chips);
+    assert.equal(replay.text, 'messagemessage');
+  }
+});
 
 test('composer draft persistence round-trips text, image refs, and hidden chip bodies together', () => {
   const memory = buildComposerDraftMemory({

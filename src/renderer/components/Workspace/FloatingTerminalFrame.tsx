@@ -1,10 +1,14 @@
-import React, { useCallback, useEffect, useRef } from 'react';
-import { SquareTerminal, X } from 'lucide-react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { BringToFront, Undo2, SquareTerminal, X } from 'lucide-react';
 import ControlHint from '../UI/ControlHint';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { resolveStableTerminalViewportOffsets } from '../../utils/stableTerminalViewport.mjs';
 import { acquireInteractionCursor } from '../../utils/interactionCursor';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { PANE_LAYER_PRESENTATION_EVENT } from '../../utils/paneLayerPresentation.mjs';
+import { acquireTerminalFullView, preserveTerminalViewportScroll, resolveTerminalLiftGeometry, TERMINAL_FULL_VIEW_REQUEST } from '../../utils/terminalFullView.mjs';
 
 const SIDE_TERMINAL_MIN_WIDTH = 360;
 const SIDE_TERMINAL_MAX_WIDTH = 1200;
@@ -41,6 +45,17 @@ export default function FloatingTerminalFrame({
   children,
 }: FloatingTerminalFrameProps) {
   const frameRef = useRef<HTMLDivElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const slotRef = useRef<HTMLDivElement | null>(null);
+  const liftedRect = useRef<{ owner: string; left: number; top: number; width: number; height: number;
+    contentWidth: number; contentHeight: number } | null>(null);
+  // React always portals into this SAME node. Only its DOM placement changes;
+  // changing a portal target or JSX parent would remount the live xterm tree.
+  const [host] = useState(() => document.createElement('div'));
+  const [expandedOwner, setExpandedOwner] = useState<string | null>(null);
+  const viewOwner = `${tabId || ''}:${floating ? 'side' : 'primary'}`;
+  const fullView = !!tabId && expandedOwner === viewOwner && liftedRect.current?.owner === viewOwner && (!floating || open);
+  const closeFullView = useCallback(() => setExpandedOwner(null), []);
   const sideTerminalWidth = useUIStore((state) => state.sideTerminalWidth);
   const setSideTerminalWidth = useUIStore((state) => state.setSideTerminalWidth);
   const endResizeRef = useRef<(() => void) | null>(null);
@@ -49,17 +64,136 @@ export default function FloatingTerminalFrame({
     tabId ? (state.promptQueueInputSurfaceTabs[tabId] ?? 'history') : 'history'
   ));
   const setPromptQueueInputSurface = useUIStore((state) => state.setPromptQueueInputSurface);
+  const openFullView = useCallback(() => {
+    if (!tabId || fullView || (floating && !open)) return;
+    const rect = frameRef.current?.getBoundingClientRect();
+    const content = bodyRef.current?.getBoundingClientRect();
+    if (!rect?.width || !rect.height || !content?.width || !content.height) return;
+    liftedRect.current = { owner: viewOwner, left: rect.left, top: rect.top, width: rect.width, height: rect.height,
+      contentWidth: content.width, contentHeight: content.height };
+    setPromptQueueInputSurface(tabId, 'terminal');
+    setExpandedOwner(viewOwner);
+  }, [tabId, floating, open, fullView, viewOwner, setPromptQueueInputSurface]);
   const terminalSelected = floating && open && selectedInputSurface === 'terminal';
   const stageOffsets = resolveStableTerminalViewportOffsets({ floating, bottomInset });
   // Pinned only means anything while this frame is the SIDE panel (floating)
   // and actually open — a closed panel reserves nothing.
   const reservesColumn = floating && open && pinned;
 
+  useLayoutEffect(() => {
+    slotRef.current?.appendChild(host);
+    return () => host.remove();
+  }, [host]);
+
+  useLayoutEffect(() => {
+    const slot = slotRef.current;
+    if (!slot) return;
+    if (!fullView) {
+      if (expandedOwner !== null) setExpandedOwner(null);
+      preserveTerminalViewportScroll(host, () => {
+        slot.appendChild(host);
+        host.removeAttribute('data-terminal-full-view-host');
+        host.removeAttribute('data-terminal-full-view-tab-id');
+        host.style.cssText = 'position:absolute;inset:0;pointer-events:none';
+        host.scrollTop = 0; host.scrollLeft = 0;
+      });
+      return;
+    }
+    const release = acquireTerminalFullView(closeFullView);
+    const bounds = slot.closest<HTMLElement>('[data-terminal-full-view-bounds]');
+    const originPane = slot.closest<HTMLElement>('[data-terminal-pane-wrapper]')
+      || host.querySelector<HTMLElement>(`[data-terminal-pane-wrapper="${CSS.escape(tabId!)}"]`);
+    const originWorkspace = slot.closest<HTMLElement>('[data-workspace-presentation]');
+    const place = () => {
+      const rect = bounds?.getBoundingClientRect();
+      const geometry = resolveTerminalLiftGeometry(liftedRect.current!, {
+        left: Math.max(0, rect?.left ?? 0), top: Math.max(0, rect?.top ?? 0),
+        right: Math.min(innerWidth, rect?.right ?? innerWidth), bottom: Math.min(innerHeight, rect?.bottom ?? innerHeight),
+      });
+      Object.assign(host.style, { left: `${geometry.left}px`, top: `${geometry.top}px`,
+        width: `${geometry.viewportWidth}px`, height: `${geometry.viewportHeight}px` });
+    };
+    const validOrigin = () => {
+      if (originPane?.getAttribute('data-terminal-surface-presented') === '0'
+        || (originWorkspace && originWorkspace.getAttribute('data-workspace-presentation') !== 'workspace')) {
+        host.style.visibility = 'hidden';
+        closeFullView();
+      }
+    };
+    const presentation = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (detail?.tabId === tabId && (detail.presented === false || detail.focused === false)) closeFullView();
+    };
+    const startSpace = useWorkspaceStore.getState().activeSpaceId;
+    const unsubscribe = useWorkspaceStore.subscribe(state => {
+      if (state.view !== 'workspace' || state.activeSpaceId !== startSpace) {
+        host.style.visibility = 'hidden';
+        closeFullView();
+      }
+    });
+    const originObserver = new MutationObserver(validOrigin);
+    if (originPane) originObserver.observe(originPane, { attributes: true, attributeFilter: ['data-terminal-surface-presented'] });
+    if (originWorkspace) originObserver.observe(originWorkspace, { attributes: true, attributeFilter: ['data-workspace-presentation'] });
+    const resize = new ResizeObserver(place);
+    if (bounds) resize.observe(bounds);
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      // A child menu/search owns its first Escape. Ordinary terminal Escape
+      // exits this viewing mode before xterm can deliver it to the provider.
+      if (document.querySelector('[data-tab-context-menu], [data-run-after-picker-menu], [data-terminal-search-overlay]')) return;
+      event.preventDefault(); event.stopImmediatePropagation(); closeFullView();
+    };
+    window.addEventListener('resize', place);
+    window.addEventListener(PANE_LAYER_PRESENTATION_EVENT, presentation);
+    window.addEventListener('keydown', escape, true);
+    preserveTerminalViewportScroll(host, () => {
+      host.style.cssText = 'position:fixed;z-index:9000;pointer-events:auto;overflow:auto';
+      host.style.setProperty('--terminal-lift-width', `${liftedRect.current!.width}px`);
+      host.style.setProperty('--terminal-lift-height', `${liftedRect.current!.height}px`);
+      host.style.setProperty('--terminal-lift-content-width', `${liftedRect.current!.contentWidth}px`);
+      host.style.setProperty('--terminal-lift-content-height', `${liftedRect.current!.contentHeight}px`);
+      host.setAttribute('data-terminal-full-view-host', '');
+      host.setAttribute('data-terminal-full-view-tab-id', tabId!);
+      document.body.appendChild(host);
+      place();
+    });
+    validOrigin();
+    console.log('[TerminalFullView] open tab=' + tabId?.slice(-12));
+    return () => {
+      release(); unsubscribe(); resize.disconnect(); originObserver.disconnect();
+      window.removeEventListener('resize', place);
+      window.removeEventListener(PANE_LAYER_PRESENTATION_EVENT, presentation);
+      window.removeEventListener('keydown', escape, true);
+      console.log('[TerminalFullView] return tab=' + tabId?.slice(-12));
+    };
+  }, [closeFullView, expandedOwner, fullView, host, tabId]);
+
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const request = (event: Event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-floating-terminal]') !== frame) return;
+      if ((event as CustomEvent).detail?.tabId !== tabId) return;
+      event.stopPropagation(); openFullView();
+    };
+    frame.addEventListener(TERMINAL_FULL_VIEW_REQUEST, request);
+    return () => frame.removeEventListener(TERMINAL_FULL_VIEW_REQUEST, request);
+  }, [openFullView, tabId]);
+
   useEffect(() => {
     if (!floating || !open || !tabId) return;
     let second: number | null = null;
     const first = requestAnimationFrame(() => {
       second = requestAnimationFrame(() => {
+        const slot = slotRef.current;
+        if (slot?.closest('[data-terminal-surface-presented="0"]')) return;
+        const workspace = slot?.closest('[data-workspace-presentation]');
+        if (workspace && workspace.getAttribute('data-workspace-presentation') !== 'workspace') return;
+        const ownerPane = slot?.closest('[data-terminal-pane-wrapper]')
+          || host.querySelector(`[data-terminal-pane-wrapper="${CSS.escape(tabId)}"]`);
+        const paneIndex = ownerPane?.getAttribute('data-pane-event-index');
+        if (paneIndex != null && Number(paneIndex) !== useWorkspaceStore.getState().splitFocusedIndex) return;
         const terminal = terminalRegistry.get(tabId);
         if (!terminal) return;
         try {
@@ -72,7 +206,7 @@ export default function FloatingTerminalFrame({
       cancelAnimationFrame(first);
       if (second !== null) cancelAnimationFrame(second);
     };
-  }, [floating, open, tabId]);
+  }, [floating, open, tabId, fullView, host]);
 
   useEffect(() => {
     if (!floating || open || !tabId || selectedInputSurface !== 'terminal') return;
@@ -140,9 +274,12 @@ export default function FloatingTerminalFrame({
         zIndex: floating ? 130 : 0,
       }}
     >
-      <div
+      <div ref={slotRef} style={{ position: 'absolute', inset: 0 }} />
+      {createPortal(<div
         ref={frameRef}
         data-floating-terminal
+        data-floating-terminal-tab-id={tabId || ''}
+        data-floating-terminal-side={floating ? '1' : '0'}
         data-floating-terminal-open={isPresented ? '1' : '0'}
         data-floating-terminal-selected={terminalSelected ? '1' : '0'}
         // A CLOSED side panel is closed for the keyboard too.
@@ -172,6 +309,7 @@ export default function FloatingTerminalFrame({
         style={floating ? {
           position: 'absolute',
           top: 0,
+          left: 'auto',
           // Pinned: sits just outside the shortened stage, i.e. in its own
           // column. Unpinned: overlays the centre's right edge as before.
           right: reservesColumn ? -sideTerminalWidth : 0,
@@ -200,7 +338,7 @@ export default function FloatingTerminalFrame({
           background: '#151515',
         } : {
           position: 'absolute',
-          inset: 0,
+          left: 0, top: 0, right: 0, bottom: 0,
           overflow: 'visible',
           pointerEvents: 'auto',
           background: '#1a1a1a',
@@ -230,12 +368,24 @@ export default function FloatingTerminalFrame({
               header right above, and repeating it here read as a second,
               competing tab chip. */}
           <SquareTerminal size={13} />
-          <div style={{ flex: 1 }} />
+          <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {fullView ? tabName : null}
+          </div>
+          <ControlHint label={fullView ? 'Вернуть терминал в окно' : 'Показать терминал поверх окон'}>
+            <button type="button" data-terminal-full-view-toggle={tabId || ''}
+              aria-label={fullView ? 'Вернуть терминал в окно' : 'Показать терминал поверх окон'}
+              onPointerDown={event => event.preventDefault()}
+              onClick={fullView ? closeFullView : openFullView}
+              style={{width:24,height:24,border:0,padding:0,background:'transparent',color:fullView?'#c4b5fd':'#8a8a8f',
+                display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}>
+              {fullView ? <Undo2 size={14} /> : <BringToFront size={14} />}
+            </button>
+          </ControlHint>
           <ControlHint label="Закрыть терминал">
             <button
               type="button"
               aria-label="Hide terminal"
-              onClick={onClose}
+              onClick={() => { closeFullView(); if (floating) onClose(); }}
               style={{
                 width: 24,
                 height: 24,
@@ -255,6 +405,8 @@ export default function FloatingTerminalFrame({
         </div>
 
         <div
+          ref={bodyRef}
+          data-terminal-view-body
           style={{
             position: floating ? 'relative' : 'absolute',
             inset: floating ? undefined : 0,
@@ -264,11 +416,20 @@ export default function FloatingTerminalFrame({
             background: '#1a1a1a',
           }}
         >
+          <div data-terminal-view-content style={{ position: 'absolute', left: 0, top: 0,
+            width: '100%', height: '100%' }}>
           {children}
           {floating && open ? searchNode : null}
+          </div>
         </div>
 
-        {floating && (
+        {fullView && !floating && <button type="button" data-terminal-full-view-toggle={tabId || ''}
+          aria-label="Вернуть терминал в окно" title="Вернуть терминал в окно"
+          onClick={closeFullView} style={{position:'absolute',right:6,top:6,zIndex:10002,width:24,height:24,
+            display:'flex',alignItems:'center',justifyContent:'center',background:'#2b2340',color:'#c4b5fd',
+            border:'1px solid #a78bfa',borderRadius:4,cursor:'pointer'}}><Undo2 size={14}/></button>}
+
+        {floating && !fullView && (
           <div
             data-floating-terminal-resize="w"
             onPointerDown={handleResizePointerDown}
@@ -288,7 +449,7 @@ export default function FloatingTerminalFrame({
             onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
           />
         )}
-      </div>
+      </div>, host)}
     </div>
   );
 }

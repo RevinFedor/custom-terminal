@@ -24,17 +24,22 @@ Gemini API balance. В мае 2026 Google ввёл Ultra за $100 (5× лими
 `result`; `conversation_id` сохраняется между ходами, а новый процесс может
 возобновить его через `--conversation`. Это достаточная основа для точных live
 ответов, tool cards, usage и lifecycle без разбора TUI. Но это не аналог Codex
-app-server: вход принимает только text, следующий prompt разрешён после
-`result`, `control_request/control_response` и slash-команды завершают stream
+app-server: вход принимает строку либо список text-блоков, не image/PDF blocks.
+Несколько JSON prompt можно передать заранее — они исполняются последовательно;
+в динамическом цикле документация предписывает ждать текущий `result` перед
+следующим prompt. Это очередь turns, не steer работающего turn.
+`control_request/control_response` и slash-команды завершают stream
 ошибкой. Публичных steer, fork, rewind, approval-response или ACP/JSON-RPC
 методов в этом публичном stdio-контракте нет. Это не доказывает отсутствие
 других интерфейсов внутри бинарника: локальный API 1.2.14 проверен ниже.
 
 Интерактивный TUI `agy` имеет `/resume`, `/fork` и `/rewind`. Они являются
 единственным документированным путём для обязательных fork/rewind: в headless
-stream они недоступны. Нельзя переносить старый True Fork путём копирования
-файла: `agy` хранит разговоры в другой связке server identity, protobuf/SQLite
-и `brain/`, а resume проверяет ID через backend. Прежняя рекомендация обязательно
+stream они недоступны. Старое копирование/обрезание JSONL нельзя переносить
+буквально: `agy` хранит разговоры в связке server identity, protobuf/SQLite
+и `brain/`, а resume проверяет ID через backend. Новый внешний `.db` можно
+зарегистрировать нативным import API (proof1.2.16 ниже), но это не простой rename
+файла и не доказательство полноценного fork всех side effects. Прежняя рекомендация обязательно
 передавать conversation из headless в TUI для fork/rewind была основана только
 на публичной документации. 01.10.2026 нативные fork, conversation rewind и
 независимое продолжение обеих веток доказаны через loopback API штатного 1.2.14
@@ -100,6 +105,17 @@ SHA/version guard) оставил запросы ожидающими собст
 только подключения к локальному порту. Поддержка закрытого протокола/патча
 при обновлениях остаётся ценой такого варианта.
 
+Read-only сверка обновления1.2.15 (03.10): Go symbols и восемь выбранных
+control-функций сохранились, но patch offset `IsPrintMode` сместился
+37908336→38282656; getter240bytes и load флага на relative+160 остались.
+У серверного `SendUserCascadeMessage` размер изменился528→544bytes. Это
+не доказательство одинакового поведения: старый exact-version патч нельзя
+накладывать на новый адрес вслепую. Новая1.2.15 live вернула63steps заранее
+известной disposable ветки через `GetCascadeTrajectory`; send/interactions
+и перенос патча этим read-only probe не подтверждены. Executable не менялись.
+Артефакт: `/tmp/noted-agy-proof.R14Ohk/agy-version-comparison-1.2.15.json`;
+актуальная методика/следующий UI-прогон — в рабочем файле ниже.
+
 Патч не сохраняет доверенную подпись вендора. Read-only проверка `codesign -dv`
 02.10 показала у оригинала Developer ID Google / TeamIdentifier `EQHXZ8M8AV`,
 у тестовой копии — `Signature=adhoc`, без TeamIdentifier. Копия работала с
@@ -116,6 +132,115 @@ SHA/version guard) оставил запросы ожидающими собст
 Позднейший сопоставимый A/B с живыми процессами, включая эту host-копию,
 измерял `phys_footprint`, а не RSS: см.
 `fact-terminal-rendering.md::Цена TUI в живых CLI: ограниченный A/B 02.10.2026`.
+
+## Stock TUI AGY1.2.16 и локальный observer — протокольный proof04.10
+
+Пользователь выбрал управление оригинальным TUI через PTY, без stdio-only
+backend и патча binary. Это не означает читать transcript из экранных клеток:
+структурный native observer подключается к тому же process/conversation.
+
+В `/tmp/noted-agy-tui-bridge.Pzyp1h/` реально запущен original1.2.16
+(SHA7dca095c…84cb3aa), node-pty+headless xterm, без print/input-format/output-format.
+Собственный PID/loopback port/CSRF связаны с exact conversation. Native fork
+protected63steps → собственный64step child; source остался на прежнем ID и
+сохранил hash. PTY prompt дал BRIDGE-E5198A31, native64→67steps и тот же текст
+на экране. Это **current-native-state read**, не новый proof сохранения после crash.
+
+Для `LanguageServerService` локальный stream использует
+`exa.jetski_cortex_pb.StreamAgentStateUpdates*`: Connect JSON, не SSE.
+`initialStepsPageBounds{startIndex,endIndexExclusive}` и
+`RequestAgentStatePageUpdate{conversationId,subscriberId,stepPageBounds}`
+реально переключили одну подписку `[61,63)→[0,2)→[61,63)`; ровно2rows,
+точное совпадение с native read. Ответ page-update200{}, данные идут по stream.
+Но при новых rows64–66 старая страница давала только totalLength, не их текст.
+Живой хвост надо вести отдельно от исторической страницы; incremental text
+на правильно настроенном TUI observer этим конкретным probe ещё не проверен.
+
+**Две строки не означают маленькую подписку.** Первый frame471361bytes,
+steps10190bytes, остальные — все26generator/21executor metadata. Отдельные
+metadata page bounds есть в descriptor, их семантика ещё не проверена.
+`GetCascadeTrajectorySteps` имеет только offset, без limit/end; это не замена
+page API. Везде учитывать omitted zero/false protobuf JSON и фактический enum
+`CASCADE_RUN_STATUS_RUNNING`, а не похожее имя. Старый ошибочный waiter сохранён:
+его timeout остановил тест до attached Revert/reconnect, это не AGY FAIL.
+
+У local stream не доказан sequence/replay token. ExecutionId общий для
+user/system/planner, userInput не имеет универсального messageId; planner ID
+появляется поздно. SourceTrajectoryStepInfo в fork-префиксе сохраняет ancestor
+provenance; она не назначает live owner и не разрешает мутацию parent.
+StepGenerationVersion в live proof не наблюдался. Reused indices после rewind
+нельзя заранее объявлять устойчивыми UUID. Все own branches удалены native API,
+четыре own AGY завершились с0, protected hash и executable не изменены.
+
+### История stopped-сессии и граница сохранения
+
+GetCascadeTrajectory идёт через GetTrajectoryForServing/GetTrajectory/
+ensureTrajectoryLoaded и возвращает обслуживаемое runtime state. В response
+нет persistedRevision/savedStepCount/flush ACK. DONE→второй Get не доказывает
+durable replacement; нужны restart/crash и независимый persisted-source proof.
+Старый graceful fork/resume1.2.14 не подтверждает каждое событие1.2.16.
+
+Отдельный read-helper ещё не доказан. В текущем бинарнике есть `--hub` и
+`--hub-port` (server вместо terminal UI), также gate AGY_ENABLE_HUB. Это только
+static кандидат: startup имеет migrations/state saver и путь resume interrupted
+conversations. Нельзя объявлять запуск read-only/no-inference по отсутствию
+prompt. `agentapi` — клиент уже живого сервера, а remote-control daemon — иной
+канал. Cache Noted может хранить последнюю копию, но не доказывает свежесть
+неизвестной/внешне изменённой истории. Новый provider должен сохранить текущий
+контракт чтения stopped history без Resume пользовательского агента; если
+native source не позволяет это без ограничения, требуется отдельное решение.
+
+## Большая тестовая история через native import AGY1.2.16
+
+`LoadSharedTrajectory({path:<own external .db>})` зарегистрировал искусственную
+историю, подготовленную вне внутренних stores AGY. Формат получен из schema,
+которую оригинальный CLI создал в нашем пустом import artifact, и protobuf
+descriptors его binary. `ReplayGroundTruthTrajectory` возвращает501/unimplemented.
+Проверка `GetCascadeTrajectory` сама по себе недостаточна: для model context
+нужен `userInput.userResponse`, не только отображаемый `items[].text`. Исправленная
+fixture реально продолжилась с точным canary; type23 checkpoint сохранил summary
+и позволил тестировать698MiB archive без отправки всего архива в модель.
+
+После настоящего turn runtime нормализует payload: одинаковая conversation
+history не означает неизменный физический storage size или стоимость первого
+импорта. Нагрузочный A/B поэтому отделяет первый импорт от следующих restore.
+В timed run не подключать полный trajectory observer: он сам добавит сотни MiB
+копий и исказит RAM. Verification читает sparse native tail; полные size/integrity
+проверены на offline-копии только нашего внешнего import artifact. Источник и
+методика `/tmp/noted-agy-large.BRfShe/`, результаты — fact-terminal-rendering.
+Это research fixture, не готовый production importer/AGY History adapter.
+
+## AGY как обычный PTY в реальном Noted — исследовательский UI proof04.10
+
+В frozen isolated Noted Electron28.3.3 со своей БД проверен штатный
+`/Users/fedor/.local/bin/agy`1.2.16, без патчей и без AGY adapter в продукте.
+Одна generic terminal-tab: trusted CDP click/insertText/Enter дошли через
+настоящий xterm/PTY/zsh до Gemini3.8Flash low с сохранённым Google login.
+Два пользовательских turn сохранили canary/тот же PID; неотправленный русский
+draft пережил смену фокуса; настоящий Switch Model открылся и отменился
+Escape без смены модели; /exit завершил AGY с0.
+
+Slash autocomplete — не model picker. Первоначальный E2E «FAIL: после Escape
+остался /model» был снят после просмотра screenshot: Enter не нажимали,
+закрылась только подсказка. Коррекция проверила список моделей/current/effort
+и возврат к пустому composer. Ни сохранение draft в подсказке, ни всегда
+видимый footer модели не доказывают открытие picker. Не добавлять слепой
+второй Enter вместо чтения фактической стадии интерфейса.
+
+Native read после UI дал63→68steps с двумя done ответами; native
+conversation-only RevertToCascadeStep оригинала1.2.16 вернул63steps/exact
+canonical hash. JSON object keys нужно сортировать для межпроцессного hash,
+не отбрасывая полей/не переставляя arrays. Первые reader/rollback упали из-за
+временного DNS Google endpoint; повтор после проверки DNS прошёл. Это не
+потеря истории. Перенос patch/questions/queue suite1.2.14 этим не подтверждён.
+
+Результат доказывает базовую PTY-совместимость, НЕ готовую AGY History/Timeline/
+автоматику Noted. Native BrowserWindow был hidden, DOM visibility=visible;
+кадры получены с настоящего renderer, но foreground/native latency не мерилась.
+Ресурсные point samples и границы: fact-terminal-rendering, раздел «Noted с
+одной AGY-вкладкой». Production не менялся; test projects/процессы убраны,
+исходная disposable история восстановлена. Индекс артефактов и точные команды:
+`/private/tmp/noted-agy-pty-e2e.8WKVDr/REPORT.md`; рабочий файл темы прежний.
 
 ## Переиспользование открытого ядра без TUI
 

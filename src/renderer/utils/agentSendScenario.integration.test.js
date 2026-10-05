@@ -99,6 +99,10 @@ async function buildBundle() {
         sessionId: options.sessionId || null,
         prompt: 'integration prompt',
         handoffId: options.handoffId || 'integration-handoff',
+        // This suite exercises the executing side of the shared scenario;
+        // application admission is tested with actual Main/SQLite separately.
+        sendOperationKey: 'history:scenario-integration-tab:integration-handoff',
+        sendAttemptId: 'integration-attempt',
         source: options.source || 'prompt-queue',
         statusAtSend: options.statusAtSend || options.status || 'active',
         ...(options.omitSettingsIntent ? {} : {

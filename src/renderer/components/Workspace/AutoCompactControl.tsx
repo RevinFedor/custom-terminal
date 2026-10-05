@@ -7,8 +7,8 @@ import { automationWorkflowForProject, autoCompactIncludesTarget } from '../../u
 import { cancelPendingAutoCompact } from '../../hooks/usePromptQueueRunner';
 import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
 
-export function AutoCompactControl({ tabId, settings = false, global = false }: {
-  tabId: string; settings?: boolean; global?: boolean;
+export function AutoCompactControl({ tabId, settings = false, global = false, compact = false, hoverOwner }: {
+  tabId: string; settings?: boolean; global?: boolean; compact?: boolean; hoverOwner?: string;
 }) {
   const policy = useAutoCompactStore((s) => s.policy);
   const hydrated = useAutoCompactStore((s) => s.hydrated);
@@ -42,7 +42,7 @@ export function AutoCompactControl({ tabId, settings = false, global = false }: 
       aria-label={settings ? 'Настройки Run After' : label} aria-expanded={open}
       title={activity?.message || label} disabled={!hydrated}
       onClick={() => setOpen(!open)}
-      style={{ position: 'relative', width: 22, height: 22, padding: 0, display: 'inline-grid', placeItems: 'center',
+      style={{ position: 'relative', width: compact ? 20 : 22, height: compact ? 20 : 22, padding: 0, display: 'inline-grid', placeItems: 'center',
         border: '1px solid rgba(255,255,255,.10)', borderRadius: 6, background: open ? '#333' : '#171717',
         color: excluded || activity?.phase === 'error' ? '#da9865' : '#a1a1a7', cursor: 'pointer', flexShrink: 0 }}>
       {settings ? <MoreHorizontal size={13} /> : <FoldVertical size={13} />}
@@ -50,6 +50,7 @@ export function AutoCompactControl({ tabId, settings = false, global = false }: 
     </button>
     {open && createPortal(<CenteredUpwardPopover ref={menu} getAnchorRect={() => trigger.current?.getBoundingClientRect() || null}
       zIndex={global ? 15300 : 10000} data-run-after-satellite="true"
+      data-run-after-hover-owner={hoverOwner}
       onMouseDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}
       style={{ width: 265, padding: 10, background: '#181818', border: '1px solid #444', borderRadius: 8, color: '#ccc', fontSize: 12 }}>
       <div style={{ marginBottom: 8 }}>Автокомпакт · эта вкладка</div>

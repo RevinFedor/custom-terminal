@@ -364,6 +364,7 @@ function chooseNewestTaskPlan(incoming, persisted) {
 module.exports = {
   TASK_PLAN_VERSION,
   TASK_PLAN_HISTORY_LIMIT,
+  TASK_PLAN_MAX_ROOTS,
   emptyTaskPlan,
   normalizeTaskPlan,
   normalizeItems,

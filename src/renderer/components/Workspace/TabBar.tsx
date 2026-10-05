@@ -19,22 +19,21 @@ import {
 } from '../UI/contextMenuMetrics.mjs';
 import { useUIStore } from '../../store/useUIStore';
 import {
-  isOrchestrationCompletionBlocked,
-  subscribeOrchestrationRunChanges,
   useOrchestrationStore,
 } from '../../store/useOrchestrationStore';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { refreshGeneratedTabTitle, type RefreshTabTitleReason } from '../../utils/generateTabTitle';
 import { terminalRegistry } from '../../utils/terminalRegistry';
-import { isNaturalAgentTurnEndReason } from '../../utils/agentCompletionOutcome.mjs';
+import { cancelRestartAfterCommand, runRestartAfterCommand } from '../../hooks/useRestartAfterRunner';
+import { getRestartAfterTriggerIds, getRestartAfterWorkflowIds, hasRestartAfterSubscription, isAiLaunchCommand, isDevRestartCommand } from '../../utils/restartAfterCommand.mjs';
 import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexForkSourceSessionId, requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { TabPaneMap } from './PaneMap';
 import { TabIdActions } from './TabIdActions';
 import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
-import { tabContextSurface } from '../../utils/tabContextSurface.mjs';
+import { tabContextSurface, tabContextPaneIndex } from '../../utils/tabContextSurface.mjs';
 import MoveToWindowMenu, { type WindowCell } from './MoveToWindowMenu';
 import NewTabMenuRows from './NewTabMenuRows';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
@@ -44,7 +43,6 @@ import {
   resolveTabCompletionNotificationShadow,
   TabCompletionNotificationAlert,
   TabCompletionNotificationBadge,
-  TAB_COMPLETION_NOTIFICATION_INSET_PX,
   TabProcessBar,
   TabStatusMarkerButton,
   TabSessionAvailabilityMarker,
@@ -241,6 +239,18 @@ function useShiftKey(): boolean {
 // ONE menu implementation — a second copy in the pane header would drift from
 // this one action by action.
 export const TAB_CONTEXT_MENU_EVENT = 'tab-context-menu:open';
+export const TAB_CONTEXT_MENU_CLOSE_EVENT = 'tab-context-menu:close';
+
+interface ExternalTabContextMenu {
+  projectId: string;
+  tabId: string;
+  x: number;
+  y: number;
+  renameHost?: string;
+  singleTarget?: boolean;
+  isCurrent?: () => boolean;
+  onClose?: () => void;
+}
 
 /**
  * "Rename this tab" asked for by a menu that was opened from ANOTHER surface.
@@ -263,31 +273,20 @@ export const TAB_RENAME_REQUEST_EVENT = 'tab-context-menu:rename';
 /**
  * Ask the sidebar list of `projectId` to open its context menu for `tabId`.
  *
- * Only ONE list is mounted — the sidebar's, for the project the sidebar shows —
- * and every item in this menu is built from that list's own project (scripts and
- * favourites of its cwd, "Move to project", the workspace toggle). So the
- * request can only be served by the list of the tab's own project.
- *
- * Panes are cross-project, so the pane header regularly names a tab whose
- * project is NOT in the sidebar. That request used to be dropped silently: the
- * user right-clicked the other pane's tab and nothing happened at all, and only
- * a preceding left click (which moved the sidebar as a side effect) made the
- * menu work. Pointing the sidebar at the tab's project first is what makes the
- * gesture land, and it is also the honest thing to show: the menu is about a tab
- * of that project.
- *
- * Deliberately NOT changing the CENTER: a right click asks about a tab, it does
- * not switch to it.
+ * The presented sidebar or that project's existing menu-only host serves the
+ * request. Cross-project pane/picker cards never navigate the sidebar or center
+ * just to get a menu. A transient opener can keep a lease until onClose and
+ * reject a late async open through isCurrent; it does not create another menu.
  */
 export function openTabContextMenuAt(
   projectId: string,
   tabId: string,
   x: number,
   y: number,
-  options?: { renameHost?: string },
+  options?: Pick<ExternalTabContextMenu, 'renameHost' | 'singleTarget' | 'isCurrent' | 'onClose'>,
 ): void {
   window.dispatchEvent(new CustomEvent(TAB_CONTEXT_MENU_EVENT, {
-    detail: { projectId, tabId, x, y, renameHost: options?.renameHost },
+    detail: { projectId, tabId, x, y, ...options },
   }));
 }
 
@@ -347,13 +346,6 @@ function TaskLaneMarker({
   );
 }
 
-const isAiLaunchCommand = (command: string): boolean => {
-  const text = command.trim();
-  if (!text) return false;
-  if (/(^|[;&|]\s*)(?:command\s+)?(?:codex|claude|gemini)(?=\s|$)/i.test(text)) return true;
-  if (/(^|[;&|]\s*)(?:npx|pnpm\s+dlx|bunx)\s+@openai\/codex(?=\s|$)/i.test(text)) return true;
-  return false;
-};
 const formatRestartAfterCommandLabel = (command?: string | null) => {
   const clean = String(command || '').trim();
   const npmRunMatch = clean.match(/^npm\s+run(?:-script)?\s+(.+)$/);
@@ -378,27 +370,6 @@ const formatCommandRunHistoryTime = (at?: number | null) => {
   const mm = String(date.getMinutes()).padStart(2, '0');
   return `${dd}-${mon}-${yy} ${hh}:${mm}`;
 };
-const getRestartAfterTriggerIds = (tab: { id?: string; restartAfterTabId?: string; restartAfterTabIds?: string[] } | null | undefined): string[] => {
-  if (!tab) return [];
-  const out: string[] = [];
-  const push = (value: unknown) => {
-    const id = typeof value === 'string' ? value.trim() : '';
-    if (!id || id === tab.id || out.includes(id)) return;
-    out.push(id);
-  };
-  if (Array.isArray(tab.restartAfterTabIds)) {
-    for (const id of tab.restartAfterTabIds) push(id);
-  }
-  push(tab.restartAfterTabId);
-  return out;
-};
-
-type RestartAfterScriptRunState = {
-  command: string;
-  running: boolean;
-  pendingCommand: string | null;
-};
-
 let tabbarVisualLockDepth = 0;
 
 // Last tab-list reveal request (seq) already handled — see the reveal effect
@@ -493,6 +464,7 @@ interface TabData {
   };
   restartAfterTabId?: string;
   restartAfterTabIds?: string[];
+  restartAfterWorkflowIds?: string[];
   restartAfterCommand?: string;
   restartAfterPaused?: boolean;
   restartAfterPersistent?: boolean;
@@ -1652,7 +1624,6 @@ const TabItem = memo(({
   //   достаточно резервировать ~20px слева.
   const dragLiftActive = isVerticalMode && (isPressing || isDragging || isDraggedRoot);
   const completionNotificationWaiting = completionNotificationArmed && !completionNotificationFired;
-  const hasCompletionNotification = completionNotificationArmed || completionNotificationPersistent || completionNotificationFired;
   const completionNotificationDismissing = useTabCompletionNotificationDismissing(completionNotificationFired);
   const completionNotificationShadow = resolveTabCompletionNotificationShadow({
     armed: completionNotificationWaiting,
@@ -1689,7 +1660,7 @@ const TabItem = memo(({
     padding: isCollapsed
       ? '0'
         : ((isVerticalMode
-          ? `${verticalPaddingTop}px ${Math.max(tabGeo.paddingX, hasCompletionNotification ? TAB_COMPLETION_NOTIFICATION_INSET_PX : 0)}px ${verticalPaddingBottom}px ${Math.max(tabGeo.paddingLeft, contextSignalInset)}px`
+          ? `${verticalPaddingTop}px ${tabGeo.paddingX}px ${verticalPaddingBottom}px ${Math.max(tabGeo.paddingLeft, contextSignalInset)}px`
           // SDK tabs: left gutter 32px (matches PTY claude — keeps the green dot
           // the same distance from the left edge so adjacent PTY+SDK tabs align
           // perfectly).
@@ -1769,12 +1740,14 @@ const TabItem = memo(({
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
   const restartAfterTriggerIds = getRestartAfterTriggerIds(tab);
+  const restartAfterAll = getRestartAfterWorkflowIds(tab).length > 0;
+  const restartAfterHasSelection = hasRestartAfterSubscription(tab);
   const restartAfterConfigured = tabAllowsShellActions(tab)
-    && (restartAfterTriggerIds.length > 0 || !!tab.restartAfterCommand);
+    && (restartAfterHasSelection || !!tab.restartAfterCommand);
   const restartAfterCommandLabel = formatRestartAfterCommandLabel(tab.restartAfterCommand)
-    || (restartAfterTriggerIds.length > 0 ? formatRestartAfterCommandLabel(restartAfterFallbackCommand) : '');
+    || (restartAfterHasSelection ? formatRestartAfterCommandLabel(restartAfterFallbackCommand) : '');
   const restartAfterCommandDisplayLabel = restartAfterCommandLabel
-    ? `${restartAfterCommandLabel}${restartAfterTriggerIds.length > 0 ? ` [${restartAfterTriggerIds.length}]` : ''}`
+    ? `${restartAfterCommandLabel}${restartAfterAll ? ' [All]' : restartAfterTriggerIds.length > 0 ? ` [${restartAfterTriggerIds.length}]` : ''}`
     : '';
   const restartAfterPaused = !!tab.restartAfterPaused;
   const canShowVerticalRestartButton = isVerticalMode && (
@@ -3776,6 +3749,7 @@ function TabBar({
   const setTabCompletionNotificationArmed = useWorkspaceStore((state) => state.setTabCompletionNotificationArmed);
   const setTabCompletionNotificationPersistent = useWorkspaceStore((state) => state.setTabCompletionNotificationPersistent);
   const setTabRestartAfterTarget = useWorkspaceStore((state) => state.setTabRestartAfterTarget);
+  const toggleTabRestartAfterWorkflow = useWorkspaceStore((state) => state.toggleTabRestartAfterWorkflow);
   const setTabRestartAfterCommand = useWorkspaceStore((state) => state.setTabRestartAfterCommand);
   const setTabRestartAfterPaused = useWorkspaceStore((state) => state.setTabRestartAfterPaused);
   const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
@@ -3828,6 +3802,20 @@ function TabBar({
   // A ref, not state: nothing re-renders because of it — it is read once, at
   // the moment Rename is clicked.
   const renameHostRef = useRef<string | null>(null);
+  const externalContextMenuRef = useRef<ExternalTabContextMenu | null>(null);
+
+  useLayoutEffect(() => {
+    const owner = externalContextMenuRef.current;
+    if (!contextMenu || !owner) return;
+    const close = (event: Event) => {
+      if ((event as CustomEvent).detail?.host === owner.renameHost) setContextMenu(null);
+    };
+    window.addEventListener(TAB_CONTEXT_MENU_CLOSE_EVENT, close);
+    return () => {
+      window.removeEventListener(TAB_CONTEXT_MENU_CLOSE_EVENT, close);
+      owner.onClose?.();
+    };
+  }, [contextMenu]);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [groupEditValue, setGroupEditValue] = useState('');
   const [groupContextMenu, setGroupContextMenu] = useState<{ x: number; y: number; groupId: string } | null>(null);
@@ -3898,9 +3886,6 @@ function TabBar({
   const [claudeBusyMap, setClaudeBusyMap] = useState<Map<string, boolean>>(new Map());
   const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
   const [codexBusyMap, setCodexBusyMap] = useState<Map<string, boolean>>(new Map());
-  const restartAfterBusyRef = useRef<Map<string, boolean>>(new Map());
-  const restartAfterDeferredNaturalRef = useRef<Set<string>>(new Set());
-  const restartAfterScriptRunsRef = useRef<Map<string, RestartAfterScriptRunState>>(new Map());
   const [pasteBusyMap, setPasteBusyMap] = useState<Map<string, boolean>>(new Map());
   // Live background work (in-process subagents / background Bash chips)
   // published by the main-process transcript observers. Display-only.
@@ -4067,7 +4052,7 @@ function TabBar({
 
     const candidates = Array.from(workspace.tabs.values()).filter((tab) =>
       tab.tabType !== 'file'
-      && getRestartAfterTriggerIds(tab).length > 0
+      && hasRestartAfterSubscription(tab)
       && !tab.restartAfterCommand
     );
     const candidateIds = new Set(candidates.map((tab) => tab.id));
@@ -4158,6 +4143,8 @@ function TabBar({
   // Selection state
   const selectedTabIds = workspace?.selectedTabIds || [];
   const isMultiSelect = selectedTabIds.length > 1;
+  // A picker card names one tab, independently of a retained sidebar range.
+  const isContextMultiSelect = isMultiSelect && !externalContextMenuRef.current?.singleTarget;
 
   const confirmCloseTabs = async (tabIds: string[]): Promise<boolean> => {
     if (!workspace) return false;
@@ -4294,8 +4281,12 @@ function TabBar({
   // OSC 133 Event-driven process status (replaces polling)
   // Stable listeners — subscribe once, never re-create
   useEffect(() => {
-    const handleCommandStarted = (_: any, { tabId }: { tabId: string }) => {
+    const handleCommandStarted = (_: any, { tabId, commandSource, command }: { tabId: string; commandSource?: string; command?: string }) => {
       console.warn('[TabBar:ProcessStatus] tabId=' + tabId.slice(-8) + ' running=true source=command-started');
+      if (commandSource === 'restart-after' && command) setRestartAfterFallbackCommands(previous => {
+        if (previous.get(tabId) === command) return previous;
+        const next = new Map(previous); next.set(tabId, command); return next;
+      });
       setProcessStatus(prev => {
         const next = new Map(prev);
         next.set(tabId, true);
@@ -4305,29 +4296,6 @@ function TabBar({
 
     const handleCommandFinished = (_: any, { tabId }: { tabId: string }) => {
       console.warn('[TabBar:ProcessStatus] tabId=' + tabId.slice(-8) + ' running=false source=command-finished');
-      const restartAfterRun = restartAfterScriptRunsRef.current.get(tabId);
-      if (restartAfterRun?.running) {
-        const pendingCommand = restartAfterRun.pendingCommand;
-        restartAfterScriptRunsRef.current.delete(tabId);
-        if (pendingCommand) {
-          let paused = false;
-          for (const ws of useWorkspaceStore.getState().openProjects.values()) {
-            const targetTab = ws.tabs.get(tabId);
-            if (targetTab) {
-              paused = !!targetTab.restartAfterPaused;
-              break;
-            }
-          }
-          if (paused) {
-            console.warn('[TabBar:RestartAfter] skip-pending-paused target=' + tabId.slice(-8) + ' command=' + JSON.stringify(pendingCommand));
-            return;
-          }
-          console.warn('[TabBar:RestartAfter] draining-pending target=' + tabId.slice(-8) + ' command=' + JSON.stringify(pendingCommand));
-          void runRestartAfterAction(tabId, pendingCommand, { coalesceFiniteScript: true });
-        } else {
-          console.warn('[TabBar:RestartAfter] script-finished target=' + tabId.slice(-8) + ' command=' + JSON.stringify(restartAfterRun.command));
-        }
-      }
       setProcessStatus(prev => {
         const next = new Map(prev);
         next.set(tabId, false);
@@ -4353,55 +4321,9 @@ function TabBar({
       });
     };
 
-    const executeRestartAfterTrigger = (triggerTabId: string, reason?: string) => {
-      const restartTargets = useWorkspaceStore.getState().consumeRestartAfterTriggerIdle(triggerTabId, true);
-      for (const target of restartTargets) {
-        if (target.tabId === triggerTabId) continue;
-        console.warn('[TabBar:RestartAfter] trigger=' + triggerTabId.slice(-8) + ' target=' + target.tabId.slice(-8) + ' command=' + JSON.stringify(target.command || '') + ' reason=' + (reason || 'natural'));
-        void runRestartAfterAction(target.tabId, target.command, { coalesceFiniteScript: true });
-      }
-    };
-
-    const applyRestartAfterBusyEdge = (triggerTabId: string, busy: boolean, reason?: string) => {
-      // Claude PTY spinner edges are visual heuristics, not authoritative turn boundaries.
-      if (reason === 'spinner') return;
-      const prevBusy = restartAfterBusyRef.current.get(triggerTabId) || false;
-      restartAfterBusyRef.current.set(triggerTabId, busy);
-      if (busy) {
-        restartAfterDeferredNaturalRef.current.delete(triggerTabId);
-        return;
-      }
-      if (!prevBusy) return;
-      const naturalEnd = isNaturalAgentTurnEndReason(reason);
-      if (!naturalEnd) return;
-      if (isOrchestrationCompletionBlocked(triggerTabId)) {
-        restartAfterDeferredNaturalRef.current.add(triggerTabId);
-        console.warn('[TabBar:RestartAfter] deferred trigger=' + triggerTabId.slice(-8) + ' while descendants/handoff remain active');
-        return;
-      }
-      executeRestartAfterTrigger(triggerTabId, reason);
-    };
-
-    const unsubscribeRestartAfterOrchestration = subscribeOrchestrationRunChanges((change) => {
-      if (!change.releaseKind) return;
-      const triggerTabId = change.sourceTabId;
-      if (change.releaseKind === 'handoff-started') {
-        restartAfterDeferredNaturalRef.current.delete(triggerTabId);
-        return;
-      }
-      if (change.releaseKind === 'abnormal') {
-        restartAfterDeferredNaturalRef.current.delete(triggerTabId);
-        return;
-      }
-      if (restartAfterBusyRef.current.get(triggerTabId) === true) return;
-      restartAfterDeferredNaturalRef.current.delete(triggerTabId);
-      executeRestartAfterTrigger(triggerTabId, 'orchestration-complete');
-    });
-
     const handleClaudeBusy = (_: any, data: { tabId: string; busy: boolean; reason?: string; activityBusy?: boolean }) => {
       const { tabId, busy, reason } = data;
       console.warn('[TabBar:BusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
-      applyRestartAfterBusyEdge(tabId, busy, reason);
       if (reason === 'spinner') return;
 
       applyClaudeVisualBusy(tabId, resolveAgentBusyPresentation(data));
@@ -4409,7 +4331,6 @@ function TabBar({
 
     const handleGeminiBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
       console.warn('[TabBar:GeminiBusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
-      applyRestartAfterBusyEdge(tabId, busy, reason);
       setGeminiBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
         const next = new Map(prev);
@@ -4420,7 +4341,6 @@ function TabBar({
 
     const handleCodexBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
       console.warn('[TabBar:CodexBusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
-      applyRestartAfterBusyEdge(tabId, busy, reason);
       setCodexBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
         const next = new Map(prev);
@@ -4506,7 +4426,6 @@ function TabBar({
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('terminal:stop-progress', handleStopProgress);
-      unsubscribeRestartAfterOrchestration();
     };
   }, []); // Stable — no re-subscriptions
 
@@ -7274,8 +7193,8 @@ function TabBar({
     newTabId: string,
   ) => {
     const state = useWorkspaceStore.getState();
-    if (surface?.kind === 'pane') {
-      const paneIndex = surface.paneIndex;
+    if (surface?.kind === 'pane' || surface?.kind === 'window') {
+      const paneIndex = tabContextPaneIndex(surface, state, sourceTabId);
       const pane = state.splitPanes[paneIndex];
       // The UI stays interactive while a large fork is prepared. If the
       // source left this exact pane meanwhile, do not rewrite the user's new
@@ -7535,6 +7454,7 @@ function TabBar({
     setEmptyContextMenu(null);
     setCommandHistoryPopover(null);
     setContextMenuPos({ x: e.clientX, y: e.clientY });
+    externalContextMenuRef.current = null;
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
     setContextLastCommand(null);
     const scriptsLoadSeq = ++contextScriptsLoadSeqRef.current;
@@ -7631,8 +7551,7 @@ function TabBar({
   // two no-ops it calls on a real event.
   useEffect(() => {
     const onOpenRequest = (event: Event) => {
-      const detail = (event as CustomEvent).detail as
-        { projectId?: string; tabId?: string; x?: number; y?: number; renameHost?: string } | undefined;
+      const detail = (event as CustomEvent).detail as ExternalTabContextMenu | undefined;
       if (!detail?.tabId || detail.projectId !== projectId) return;
       // A retained hidden sidebar owns rows, not presentation. Its menu would
       // inherit opacity=0 from the cached layer and duplicate the visible
@@ -7645,6 +7564,7 @@ function TabBar({
       if (!workspace.tabs.has(detail.tabId)) return;
       const tabId = detail.tabId;
       const openAt = () => {
+        if (detail.isCurrent && !detail.isCurrent()) { detail.onClose?.(); return; }
         handleContextMenu(
           {
             preventDefault: () => {},
@@ -7658,6 +7578,7 @@ function TabBar({
         // opened the menu, and can they host the rename input themselves.
         // Remembered for exactly as long as the menu lives.
         renameHostRef.current = detail.renameHost || null;
+        externalContextMenuRef.current = detail;
       };
       if (!menuOnlyForProject || sharedProcessStatus) { openAt(); return; }
       // Hidden menu owners skip the mount-time status sync (see the guard in
@@ -7736,15 +7657,6 @@ function TabBar({
     }
   };
 
-  const isDevRestartCommand = (command: string): boolean => {
-    const text = command.trim();
-    const npmMatch = text.match(/\bnpm\s+run\s+([^\s;&|]+)/i);
-    if (npmMatch) return /^(dev|start|serve|watch)/i.test(npmMatch[1]);
-    const shMatch = text.match(/(?:^|\s)\.\/([^/\s;&|]+)$/);
-    if (shMatch) return /^(dev|start|serve|watch)/i.test(shMatch[1]);
-    return false;
-  };
-
   const normalizeShellPromptCommand = (line: string): string => {
     let text = String(line || '').replace(/^\x15+/, '').trim();
     const promptMatch = text.match(/^[^"'`]*@[^"'`]*(?:\s[%$#]|[❯➜])\s+(.+)$/);
@@ -7792,22 +7704,6 @@ function TabBar({
     return '';
   };
 
-  const resolveRestartAfterFallbackCommand = async (tabId: string): Promise<{ command: string; reason: string; cwd?: string | null; projectId?: string | null; sourceTabId?: string | null; rejectedCommand?: string }> => {
-    const owner = resolveTabProjectContext(tabId);
-    const tab = owner.tab;
-    const liveCwd = await ipcRenderer.invoke('terminal:getCwd', tabId).catch(() => null);
-    const cwd = liveCwd || tab?.cwd || null;
-    if (!cwd) return { command: '', reason: 'no-cwd', cwd: null, projectId: owner.projectId };
-
-    const result = await ipcRenderer.invoke('terminal:get-last-project-command', { projectId: owner.projectId, tabId, cwd });
-    const command = String(result?.command || '').trim();
-    if (!result?.success || !command) return { command: '', reason: 'no-last-command', cwd, projectId: owner.projectId };
-    if (isAiLaunchCommand(command)) {
-      return { command: '', reason: 'last-command-ai', cwd, projectId: result?.projectId || owner.projectId, sourceTabId: result?.tabId || null, rejectedCommand: command };
-    }
-    return { command, reason: 'last-cwd-command', cwd: result?.cwd || cwd, projectId: result?.projectId || owner.projectId, sourceTabId: result?.tabId || null };
-  };
-
   // Restart / Stop — deterministic, event-driven, no setTimeout guesses.
   //
   // The legacy flow ("Ctrl+C → setTimeout(300) → kill+!!") was broken in two ways:
@@ -7832,6 +7728,7 @@ function TabBar({
     restart: boolean,
     commandMeta?: { source: 'restart-after'; command?: string }
   ): Promise<boolean> {
+    cancelRestartAfterCommand(tabId);
     if (restartInFlightRef.current.has(tabId)) return false;
     const refNext = new Set(restartInFlightRef.current);
     refNext.add(tabId);
@@ -7839,10 +7736,8 @@ function TabBar({
     setRestartInFlight(new Set(refNext));
     try {
       const res = await ipcRenderer.invoke('terminal:deterministic-stop', { tabId, restart, commandMeta });
-      if (!res?.success) {
-        console.warn('[TabBar] deterministic-stop residual', res);
-      }
-      return true;
+      if (!res?.success) console.warn('[TabBar] deterministic-stop residual', res);
+      return res?.success === true;
     } catch (e) {
       console.error('[TabBar] deterministic-stop failed', e);
       return false;
@@ -7856,95 +7751,10 @@ function TabBar({
     }
   }
 
-  const runRestartAfterAction = async (
-    tabId: string,
-    command?: string,
-    options?: { coalesceFiniteScript?: boolean }
-  ) => {
-    if (!tabAllowsShellActions(resolveTabProjectContext(tabId).tab)) {
-      console.error('[TabBar:RestartAfter] blocked AI-owned target=' + tabId.slice(-8));
-      return;
-    }
-    let cleanCommand = command?.trim() || '';
-    if (!cleanCommand) {
-      const resolved = await resolveRestartAfterFallbackCommand(tabId);
-      if (!resolved.command) {
-        console.warn(
-          '[TabBar:RestartAfter] skip-empty-command target=' + tabId.slice(-8)
-          + ' reason=' + resolved.reason
-          + ' project=' + (resolved.projectId || projectId || '-')
-          + ' cwd=' + JSON.stringify(resolved.cwd || '')
-          + (resolved.sourceTabId ? ' sourceTab=' + resolved.sourceTabId.slice(-8) : '')
-          + (resolved.rejectedCommand ? ' rejected=' + JSON.stringify(resolved.rejectedCommand) : '')
-        );
-        return;
-      }
-      cleanCommand = resolved.command;
-      setRestartAfterFallbackCommands((previous) => {
-        if (previous.get(tabId) === cleanCommand) return previous;
-        const next = new Map(previous);
-        next.set(tabId, cleanCommand);
-        return next;
-      });
-      console.warn(
-        '[TabBar:RestartAfter] resolved-last-command target=' + tabId.slice(-8)
-        + ' project=' + (resolved.projectId || projectId || '-')
-        + ' cwd=' + JSON.stringify(resolved.cwd || '')
-        + (resolved.sourceTabId ? ' sourceTab=' + resolved.sourceTabId.slice(-8) : '')
-        + ' command=' + JSON.stringify(cleanCommand)
-      );
-    }
-    const coalesceFiniteScript = !!options?.coalesceFiniteScript && !isDevRestartCommand(cleanCommand);
-    if (coalesceFiniteScript) {
-      const existing = restartAfterScriptRunsRef.current.get(tabId);
-      if (existing) {
-        existing.pendingCommand = cleanCommand;
-        console.warn('[TabBar:RestartAfter] queued-pending target=' + tabId.slice(-8) + ' command=' + JSON.stringify(cleanCommand) + ' running=' + existing.running);
-        return;
-      }
-      restartAfterScriptRunsRef.current.set(tabId, {
-        command: cleanCommand,
-        running: false,
-        pendingCommand: null,
-      });
-    } else {
-      restartAfterScriptRunsRef.current.delete(tabId);
-    }
-    const stopAccepted = await runDeterministicStop(tabId, false);
-    if (!stopAccepted) {
-      if (coalesceFiniteScript) {
-        const existing = restartAfterScriptRunsRef.current.get(tabId);
-        if (existing?.command === cleanCommand && !existing.running) {
-          restartAfterScriptRunsRef.current.delete(tabId);
-        }
-      }
-      return;
-    }
-    const killPrefix = await buildKillPortsPrefix(tabId);
-    if (!tabAllowsShellActions(resolveTabProjectContext(tabId).tab)) {
-      console.error('[TabBar:RestartAfter] ownership changed before write target=' + tabId.slice(-8));
-      if (coalesceFiniteScript) restartAfterScriptRunsRef.current.delete(tabId);
-      return;
-    }
-    ipcRenderer.send('terminal:input', tabId, replaceShellInputLine(`${killPrefix}${cleanCommand}\r`), {
-      source: 'restart-after',
-      command: cleanCommand,
-    });
-    if (coalesceFiniteScript) {
-      const existing = restartAfterScriptRunsRef.current.get(tabId);
-      if (existing?.command === cleanCommand) {
-        existing.running = true;
-      }
-    }
-    if (isDevRestartCommand(cleanCommand)) {
-      useWorkspaceStore.getState().setTabCommandType(tabId, 'devServer');
-    }
-  };
-
   const handleRestart = async (tabId: string) => {
     const tab = resolveTabProjectContext(tabId).tab;
-    if (tab?.restartAfterCommand || getRestartAfterTriggerIds(tab).length > 0) {
-      await runRestartAfterAction(tabId, tab.restartAfterCommand);
+    if (tab?.restartAfterCommand || hasRestartAfterSubscription(tab)) {
+      runRestartAfterCommand(tabId, tab.restartAfterCommand);
       return;
     }
     await runDeterministicStop(tabId, true);
@@ -10190,6 +10000,7 @@ function TabBar({
         <div
           ref={contextMenuRef}
           data-tab-context-menu
+          data-tab-context-menu-host={renameHostRef.current || undefined}
           data-context-menu-metrics={CONTEXT_MENU_METRICS_HOOK}
           className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl"
           style={{
@@ -10213,16 +10024,16 @@ function TabBar({
 
             // Tabs targeted by Stop = either the single right-clicked tab, or
             // all selected tabs when right-click happened on a selected one
-            // (isMultiSelect already gates this). We count AI engines separately
+            // (isContextMultiSelect already gates this). We count AI engines separately
             // so the badge can show majority+minority split.
-            const targetTabIds = isMultiSelect ? selectedTabIds : (contextMenu ? [contextMenu.tabId] : []);
-            const targetFileTab = !isMultiSelect && targetTabIds.length === 1 ? workspace.tabs.get(targetTabIds[0]) : null;
+            const targetTabIds = isContextMultiSelect ? selectedTabIds : (contextMenu ? [contextMenu.tabId] : []);
+            const targetFileTab = !isContextMultiSelect && targetTabIds.length === 1 ? workspace.tabs.get(targetTabIds[0]) : null;
             const isFileTab = targetFileTab?.tabType === 'file';
             // Sidebar has only the durable Close Tab action. A pane chip has
             // two scopes that share one compact split control below: remove
             // this placement, or close the durable tab everywhere.
             const contextSurface = (
-              !isMultiSelect
+              !isContextMultiSelect
               && contextMenu
               && tabContextSurface(renameHostRef.current, contextMenu.tabId)
             );
@@ -10320,7 +10131,7 @@ function TabBar({
               : `Stop ${majorCount}`;
 
             const handleClose = async () => {
-              if (isMultiSelect) {
+              if (isContextMultiSelect) {
                 const startedAt = performance.now();
                 console.warn(
                   '[Perf:CloseTabsBatch] start' +
@@ -10364,9 +10175,10 @@ function TabBar({
               setContextMenu(null);
               renameHostRef.current = null;
               const store = useWorkspaceStore.getState();
-              const removed = contextSurface.kind === 'pane'
-                ? store.clearTabFromSplitPane(target.tabId)
-                : store.detachTabFromWindow(projectId, target.tabId, null);
+              const removed = contextSurface.kind === 'center'
+                ? store.detachTabFromWindow(projectId, target.tabId, null)
+                : tabContextPaneIndex(contextSurface, store, target.tabId) >= 0
+                  && store.clearTabFromSplitPane(target.tabId);
               if (!removed) showToast('Вкладка уже убрана из этого окна', 'info');
             };
 
@@ -10559,7 +10371,7 @@ function TabBar({
 
             // Multi-select keeps the legacy single-row "[Close N] [Stop N]" layout —
             // Rename / + add new make no sense for a multi-select target set.
-            if (isMultiSelect) {
+            if (isContextMultiSelect) {
               return (
                 <div className="flex items-stretch w-full">
                   <button
@@ -10658,7 +10470,7 @@ function TabBar({
             );
           })()}
 
-          {!isMultiSelect && (
+          {!isContextMultiSelect && (
             <>
               {(() => {
                 const ctxTab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
@@ -10680,7 +10492,7 @@ function TabBar({
                 const ctxTabId = contextMenu.tabId;
                 const selectedTriggerIds = getRestartAfterTriggerIds(ctxTab);
                 const selectedTriggerId = selectedTriggerIds[0] || null;
-                const hasSelection = selectedTriggerIds.length > 0;
+                const hasSelection = hasRestartAfterSubscription(ctxTab);
                 const restartAfterPaused = !!ctxTab.restartAfterPaused;
                 const selectedCommand = ctxTab.restartAfterCommand || null;
                 const selectedCommandLabel = formatRestartAfterCommandLabel(selectedCommand);
@@ -10703,6 +10515,8 @@ function TabBar({
 	                          autoRun={hasSelection && !restartAfterPaused}
 	                          runAfterTabId={selectedTriggerId}
 	                          runAfterTabIds={selectedTriggerIds}
+                            runAfterWorkflowIds={ctxTab.restartAfterWorkflowIds}
+                            onToggleAllTabs={(workflowId) => toggleTabRestartAfterWorkflow(projectId, ctxTabId, workflowId)}
 	                          setRunAfterTab={(ownerTabId, targetTabId) => {
 	                            setTabRestartAfterTarget(projectId, ownerTabId, targetTabId);
 	                          }}
@@ -10948,7 +10762,7 @@ function TabBar({
               an SDK variant for Claude. The third slot appears only for Claude
               because SDK does not run Codex; the row keeps two columns for
               Codex rather than showing a dead third one. */}
-          {!isMultiSelect && contextForkProvider && contextForkSessionAvailable && (
+          {!isContextMultiSelect && contextForkProvider && contextForkSessionAvailable && (
             <div
               data-tab-fork-split
               data-context-menu-row="fork"
@@ -10995,7 +10809,7 @@ function TabBar({
           )}
 
           {/* Scripts - submenu */}
-          {!isMultiSelect && contextAllowsShellActions && (contextScripts.length > 0 || contextShScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
+          {!isContextMultiSelect && contextAllowsShellActions && (contextScripts.length > 0 || contextShScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
             <div className="relative group/scripts">
               <button
                 data-context-menu-row="ordinary"
@@ -11090,7 +10904,7 @@ function TabBar({
             </div>
           )}
 
-          {!isMultiSelect && contextAllowsShellActions && contextMenu && (
+          {!isContextMultiSelect && contextAllowsShellActions && contextMenu && (
             <div className="relative group/command-info">
               <button
                 data-context-menu-row="ordinary"
@@ -11127,7 +10941,7 @@ function TabBar({
               MoveToWindowMenu. The split-button menu renders the same
               component in swap mode, so side selection, bridge, compact cards
               and scrolling cannot drift. */}
-          {!isMultiSelect && contextMenu && (
+          {!isContextMultiSelect && contextMenu && (
             <MoveToWindowMenu
               projectId={projectId}
               tabId={contextMenu.tabId}
@@ -11139,7 +10953,7 @@ function TabBar({
           {/* Separator */}
           <div data-context-menu-divider style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
 
-          {!isMultiSelect && isContextFileTab ? (
+          {!isContextMultiSelect && isContextFileTab ? (
             <>
               <button
                 data-context-menu-row="ordinary"
@@ -11212,14 +11026,14 @@ function TabBar({
               </button>
             </>
           ) : (() => {
-            const targetTabs = (isMultiSelect ? selectedTabIds : [contextMenu.tabId])
+            const targetTabs = (isContextMultiSelect ? selectedTabIds : [contextMenu.tabId])
               .map(tabId => workspace.tabs.get(tabId))
               .filter((tab): tab is NonNullable<typeof tab> => !!tab);
             const uuidCandidateTabs = targetTabs.filter(tab => getTabSessionUuid(tab) || isCodexSessionTab(tab));
             const hasUuid = uuidCandidateTabs.length > 0;
             const missingCount = targetTabs.length - uuidCandidateTabs.length;
             const disabledTitle = 'У вкладки нет UUID сессии';
-            const uuidPathTitle = isMultiSelect
+            const uuidPathTitle = isContextMultiSelect
               ? `UUID + пути: ${uuidCandidateTabs.length}${missingCount > 0 ? `, без UUID: ${missingCount}` : ''}`
               : 'UUID сессии + путь';
             const copyButtonClass = (enabled: boolean, withDivider = false) =>
@@ -11247,7 +11061,7 @@ function TabBar({
                   return `${uuid}\ncwd: ${path}`;
                 });
                 window.require('electron').clipboard.writeText(lines.join('\n\n'));
-                showToast(isMultiSelect ? `Скопировано UUID + путей: ${resolvedRows.length}` : 'UUID + путь скопированы', 'success');
+                showToast(isContextMultiSelect ? `Скопировано UUID + путей: ${resolvedRows.length}` : 'UUID + путь скопированы', 'success');
                 setContextMenu(null);
               } catch (error: any) {
                 showToast(error?.message || 'Не удалось проверить Codex-сессию перед копированием UUID', 'warning');
@@ -11277,7 +11091,7 @@ function TabBar({
               Safety-net for accidental overwrites by bridge watcher / AutoResume / Timeline
               chain resolver — user can return to the previous value with one click.
               See docs/knowledge/fix-bridge-stale-takeover.md. */}
-          {!isMultiSelect && contextMenu && (() => {
+          {!isContextMultiSelect && contextMenu && (() => {
             const ctxTab = workspace.tabs.get(contextMenu.tabId);
             const hist = ctxTab?.claudeSessionHistory;
             if (!ctxTab || ctxTab.commandType !== 'claude' || !hist || hist.length === 0) return null;
@@ -11339,7 +11153,7 @@ function TabBar({
               this is a user command, so it may override a manually named tab.
               The resulting name is still marked manual to block future auto
               launch naming from replacing it. */}
-          {!isMultiSelect && contextMenu && !isContextFileTab && (() => {
+          {!isContextMultiSelect && contextMenu && !isContextFileTab && (() => {
             const refreshing = titleRefreshInFlight.has(contextMenu.tabId) || tabTitleNamingIds.has(contextMenu.tabId);
             return (
               <button

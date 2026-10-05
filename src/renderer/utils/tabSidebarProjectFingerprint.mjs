@@ -95,6 +95,7 @@ export function tabSidebarProjectFingerprint(workspace) {
     pushScalar(parts, tab?.completionNotificationFired);
     pushScalar(parts, tab?.restartAfterTabId);
     pushList(parts, tab?.restartAfterTabIds);
+    pushList(parts, tab?.restartAfterWorkflowIds);
     pushScalar(parts, tab?.restartAfterCommand);
     pushScalar(parts, tab?.restartAfterPaused);
     pushScalar(parts, tab?.sdkProcessAlive);

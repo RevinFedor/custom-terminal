@@ -107,7 +107,8 @@ class HistoryReadClient {
       }
       this.pending.delete(message.id);
       if (message.error) request.reject(Object.assign(new Error(message.error.message), { code: message.error.code }));
-      else request.resolve({ value: message.result, readProof: message.readProof });
+      else request.resolve({ value: message.result, readProof: message.readProof,
+        reader: { clientId: this.clientId, generation: request.identity.workerGeneration } });
       if (!this.pending.size) worker.unref();
     });
     const fail = error => {
@@ -188,7 +189,10 @@ class HistoryReadClient {
         if (attempt || proof?.success === false || proof?.error || elapsedMs >= this.diagnosticSlowMs) this.diagnose('call-complete', {
           ...call, outcome: proof?.success === false || proof?.error ? 'result-error' : 'success', elapsedMs,
           startAbs: started.abs, startPerf: started.perf, counters: { ...this.diagnosticCounters } });
-        return result;
+        // Public freshness is bound to the reader that produced this result,
+        // not whichever worker happens to exist when HTTP publishes it.
+        return method === 'getHistory' && payload.freshnessProof === true && !binary && result?.success
+          ? { ...result, freshnessReader: envelope.reader } : result;
       }
       if (attempt < 2) this.count('retries');
       this.diagnose(attempt < 2 ? 'request-retry' : 'request-revoked', { ...call,

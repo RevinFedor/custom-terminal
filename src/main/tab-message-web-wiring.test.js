@@ -18,6 +18,36 @@ const declaration = name => {
   assert.ok(node, name); return node.getText(ast);
 };
 
+test('actual dismiss IPC routes to presentation-only service and returns compact metadata', async () => {
+  const exported = ast.statements.find(n => ts.isExpressionStatement(n)
+    && ts.isBinaryExpression(n.expression) && n.expression.left.getText(ast) === 'module.exports').expression.right;
+  const dismiss = exported.properties.find(n => n.name?.getText(ast) === 'dismissTabMessage').initializer.getText(ast);
+  const calls = [];
+  const context = vm.createContext({ compactTabMessage: require('./tab-message-api').compactTabMessage,
+    getTabMessageService: () => ({ dismissMessage: input => {
+      calls.push(JSON.parse(JSON.stringify(input)));
+      return { message: { messageId: 'q', sourceDismissedAt: 9, text: 'private body', deliveryState: 'sent' }, deduplicated: false };
+    } }) });
+  const dismissTabMessage = vm.runInContext('(' + dismiss + ')', context);
+  const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+  const tree = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
+  let registration;
+  const visit = node => {
+    if (ts.isCallExpression(node) && node.expression.getText(tree) === 'ipcMain.handle'
+      && node.arguments[0]?.text === 'tab-messages:dismiss') registration = node.getText(tree);
+    ts.forEachChild(node, visit);
+  };
+  visit(tree);
+  assert.ok(registration);
+  let handler;
+  vm.runInNewContext(registration, { ipcMain: { handle: (_name, fn) => { handler = fn; } }, webServer: { dismissTabMessage } });
+  const result = await handler({}, { tabId: 'a', messageId: 'q' });
+  assert.deepEqual(calls, [{ tabId: 'a', messageId: 'q' }]);
+  assert.equal(result.message.sourceDismissedAt, 9);
+  assert.equal(Object.hasOwn(result.message, 'text'), false);
+  assert.equal(result.message.deliveryState, 'sent');
+});
+
 test('actual message adapter pins the recipient, prepares context once and passes durable receipts to the shared sender', async () => {
   const calls = [], frozen = [];
   const message = { messageId: 'm', kind: 'question', text: 'Exact question', sourceTabId: 'a', sourceTabName: 'A',

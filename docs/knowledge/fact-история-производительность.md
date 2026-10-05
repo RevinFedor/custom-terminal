@@ -154,6 +154,15 @@ keys. Для append допустим доказанный неизменный p
 
 Правило подсистемы: любой ответ «ничего не поменялось» стоит O(stat), не O(чтение). Свидетель — identity+mtime+size каждого файла цепочки (+ mtime папки проекта: resume/fork-ребёнок появляется НОВЫМ файлом, не меняя существующие — без dir-свидетеля latestSessionId «замерзает»). Четыре кэша одного паттерна: probe полной истории, unchanged-путь `claude:get-timeline` (ifRevision), confirmed model/effort (см. `fact-claude-control-bar.md`), материализация сессии в get-presence (см. `fix-performance-lags.md::1e`). Эти проверки держат быстрые witnesses в RAM. Для Codex потеря RAM теперь отдельно покрывается подготовленным SSD-кэшем; она не означает обязательный полный JSONL parse после каждого restart (см. ниже). Claude и остальные перечисленные проверки сохраняют прежний путь.
 
+Native foreground с04.10 source может отдельно проверять certified read sources
+через `/api/history-freshness`; Main не входит в тяжёлую worker preparation для
+всех вкладок. Unknown при новом source/restart — честный bounded selected fallback,
+не повод прогревать каталог. Обычный unchanged остаётся O(stat). Claude equal-size
+replacement/rewrite теперь проверяет dev:ino/mtime/ctime: прежняя size-only reuse
+могла прикрепить свежий stat к старым строкам. При одном touch streaming byte hash
+позволяет оставить уже построенный graph; это редкий changed-witness read, а не
+hash на каждом metadata GET. Контракт — `fact-transcript-сервис.md::Ранняя свежесть`.
+
 ## Codex-гиганты: проектор с файловым курсором вместо перечитывания
 
 Готовая renderer History не пинит backend parser в RAM. После реального
@@ -320,11 +329,24 @@ Working/Worked живёт в Footer, а не в `data` виртуального 
 без новой transcript-row не включает append-follow Virtuoso. Поэтому отдельное
 изменение response timing тоже запускает **тот же** bounded tail writer при
 сохранённом follow-intent; не новую анимацию и не постоянный polling. Physical
-growth не отменяет намерение держать низ. Upward wheel/drag/reveal, resize,
+growth не отменяет намерение держать низ. Реальный уход вверх/drag/reveal, resize,
 hidden presentation и смена owner по-прежнему отменяют/не допускают этот writer.
 Шрам27.09: после Working→нет→Working gap оставался28px при follow=true; прежние
 12 кадров после Send уже закончились и последующее изменение Footer не будило
 их снова. Синтетический actual UI воспроизводит этот случай без новых записей.
+
+Wheel-пакет вверх ещё не доказывает уход из низа. На4505 03.10,23:51:54BKK
+один `deltaY=-2` оставил `scrollTop=64976`, `height=65517`, `client=541` и не
+породил ни одного scroll за234мс, но прежний обработчик навсегда выключил follow.
+Рост composer затем отодвинул низ, поэтому даже send23:52:27 не смог rearm.
+Upward wheel по-прежнему сразу приостанавливает follow и отменяет writer.
+Только эта временная приостановка отменяется после двух кадров с тем же точным
+низом, размерами, scroller/owner/visit и ревизией намерения. Сдвиг даже1px,
+новая навигация/reveal/resize, touch/scrollbar/scroll-key или скрытие отменяют
+проверку; прежнее намерение читать историю она не меняет. Downward wheel на
+уже достигнутом низу сам подтверждает возврат, даже если DOM scroll не возник.
+`WHEEL_TAIL_INTENT` различает no-movement/moved/resized/intent-changed/owner-changed.
+Это bounded проверка ввода, без нового scroll writer и постоянного polling.
 
 Искусственный пустой tail reserve удалён по продуктовому решению 19.08. После уменьшения документа браузер вправе ограничить `scrollTop` новым достижимым максимумом; History не создаёт второй воображаемый низ и не держит 400-мс цикл компенсации. Явный клик по нижней rail/стрелке длинной группы адресует её header по identity, а обычный tail-follow работает с живой DOM-геометрией. Возврат старой недостижимой пиксельной координаты через пустой Footer запрещён: именно он породил конкурирующих burn/reconcile writers и самоподдерживающиеся scroll-циклы.
 

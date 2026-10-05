@@ -1,7 +1,6 @@
-// One tab accepts one unresolved UI send intent. Provider-native queueing may
-// begin only after that intent reaches SENT; PREPARING/SENDING/QUEUED/
-// CONFIRMING keeps the composer editable but rejects another submit so two
-// drafts can never share an ambiguous launch/delivery owner.
+// One tab captures one composer snapshot at a time. After durable Main queue
+// admission this short UI lease ends, so the next distinct draft can be queued.
+// Main's application queue, not this UI token, owns provider delivery ordering.
 const actionsByTab = new Map();
 const settlements = new WeakMap();
 const listeners = new Set();

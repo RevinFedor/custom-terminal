@@ -62,6 +62,7 @@ export function resolveTabExecutionRole(tab) {
 
   const hasRestartAfter = !!tab.restartAfterTabId
     || (Array.isArray(tab.restartAfterTabIds) && tab.restartAfterTabIds.some(Boolean))
+    || (Array.isArray(tab.restartAfterWorkflowIds) && tab.restartAfterWorkflowIds.some(Boolean))
     || !!tab.restartAfterCommand;
   if (tab.commandType === 'generic' || tab.commandType === 'devServer' || hasRestartAfter) {
     return 'terminal';

@@ -1,7 +1,6 @@
 import React, { useMemo } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
-import { isInboxProjectId } from '../../constants/systemProjects';
 import GitStatusButton from './GitStatusButton';
 
 type GitTarget = {
@@ -18,7 +17,7 @@ export function focusedWorkspaceGitTargetKey(state: ReturnType<typeof useWorkspa
   // A vacant/chooser window owns focus even if another project has a live tab.
   if (state.splitPanes.length > 0 && (!pane?.tabId || pane.selectedSlotId || pane.displayHidden)) return '';
   const projectId = pane ? pane.projectId : state.activeProjectId;
-  if (!projectId || isInboxProjectId(projectId)) return '';
+  if (!projectId) return '';
   const workspace = state.openProjects.get(projectId);
   if (!workspace || (!pane && workspace.currentView !== 'terminal')) return '';
   const viewedTab = workspace.viewingSubAgentTabId

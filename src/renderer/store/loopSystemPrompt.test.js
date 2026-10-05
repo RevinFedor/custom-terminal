@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const esbuild = require('esbuild');
+const { EventEmitter } = require('node:events');
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; }
@@ -15,8 +16,10 @@ async function harness(t, { pendingCatalog } = {}) {
   await esbuild.build({ stdin: { contents: `export * from './usePromptQueueStore'; export { usePromptsStore } from './usePromptsStore';`, resolveDir: __dirname, loader: 'ts' },
     outfile, bundle: true, platform: 'node', format: 'cjs', logLevel: 'silent' });
   const writes = [];
+  const events = new EventEmitter();
   const loop = { id: 'run-after-loop', name: 'Run After Loop', content: 'canonical text', isBuiltIn: true, color: '#a78bfa', position: 10, model: 'gemini-3.8-flash', thinkingLevel: 'NONE', filePaths: [], showInContextMenu: false };
   global.window = { require: () => ({ ipcRenderer: {
+    on: events.on.bind(events), removeListener: events.removeListener.bind(events),
     invoke: async (channel, args) => {
       if (channel === 'ai-prompts:get') return pendingCatalog ? pendingCatalog.promise : { success: true, data: [loop] };
       if (channel === 'app:getState') return args === 'promptQueueByTab' ? JSON.stringify({ owner: { items: [], loopPromptEnabled: true, loopPromptText: 'obsolete per-tab', loopPromptArmedAt: 10 } }) : null;
@@ -26,7 +29,7 @@ async function harness(t, { pendingCatalog } = {}) {
     sendSync: (channel, args) => { writes.push({ channel, args }); return { success: true }; },
   } }) };
   t.after(() => { delete global.window; });
-  return { ...require(outfile), writes, loop };
+  return { ...require(outfile), writes, loop, events };
 }
 
 test('Settings is authoritative; both editors update all queues without resurrecting old debounce', async (t) => {
@@ -59,4 +62,18 @@ test('late initial catalog read cannot erase a pencil edit made before hydration
   await delay(280);
   assert.equal(h.usePromptQueueStore.getState().getQueue('owner').loopPromptText, 'pre-hydrate edit');
   assert.equal(h.usePromptsStore.getState().getPromptById('run-after-loop').content, 'pre-hydrate edit');
+});
+
+test('live System Prompt API events update the same store and Loop queues without replaying saves', async t => {
+  const h = await harness(t);
+  await h.hydratePromptQueueStore();
+  const promptWrites = () => h.writes.filter(write => write.channel.startsWith('ai-prompts:save')).length;
+  const before = promptWrites();
+  h.events.emit('ai-prompts:changed', {}, { prompts: [{ ...h.loop, content: 'external API edit', revision: 'updated' }],
+    removedIds: [], settings: { rewindPromptId: 'description' } });
+  assert.equal(h.usePromptsStore.getState().getPromptById('run-after-loop').content, 'external API edit');
+  assert.equal(h.usePromptQueueStore.getState().getQueue('owner').loopPromptText, 'external API edit');
+  assert.equal(h.usePromptsStore.getState().rewindPromptId, 'description');
+  await delay(280);
+  assert.equal(promptWrites(), before, 'an external event must not save the same system prompt back');
 });

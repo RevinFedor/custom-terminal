@@ -8,6 +8,7 @@ const { normalizeForkOperation, historyRewriteOperation, resolveForkOperation } 
 const { selectDirectForkMarker } = require('../shared/fork-marker-boundary.cjs');
 const { normalizePromptPresentationSnapshot } = require('./history-prompt-presentations');
 const { RUN_AFTER_LOOP_PROMPT_ID, migrateLoopPromptContent } = require('../shared/prompt-loop.cjs');
+const { DEFAULT_TAB_TITLE_PROMPT, LEGACY_TAB_TITLE_PROMPT } = require('../shared/tab-title-prompt.cjs');
 const { rebindHistoryAuthoringProjection } = require('./history-authoring-projection');
 const {
   emptyTaskPlan,
@@ -16,6 +17,7 @@ const {
   undoTaskPlan,
   redoTaskPlan,
   chooseNewestTaskPlan,
+  TASK_PLAN_MAX_ROOTS,
 } = require('./tab-task-plan');
 const {
   normalizeForkMarkerEntryUuids,
@@ -793,6 +795,7 @@ class DatabaseManager {
     // Target, one-shot armed state, and repeat mode all survive app restarts.
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_tab_id TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_tab_ids TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_workflow_ids TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_command TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_paused INTEGER DEFAULT 0`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_armed INTEGER DEFAULT 0`); } catch (e) {}
@@ -1244,6 +1247,8 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_history_response_timing_aliases_entry
       ON history_response_timing_aliases(tool_type, entry_uuid)
     `);
+
+    require('./history-freshness-metadata').installHistoryFreshnessMetadata(this.db);
 
     // Runtime state in main is keyed by tab_id alone. Repair legacy collisions
     // before enforcing the same identity contract in SQLite; otherwise a PTY,
@@ -2199,6 +2204,12 @@ class DatabaseManager {
           } catch {
             return undefined;
           }
+        })(),
+        restartAfterWorkflowIds: (() => {
+          try {
+            const ids = JSON.parse(t.restart_after_workflow_ids || 'null');
+            return Array.isArray(ids) ? [...new Set(ids.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()))] : undefined;
+          } catch { return undefined; }
         })(),
         restartAfterCommand: t.restart_after_command || undefined,
         restartAfterPaused: t.restart_after_paused === 1 || undefined,
@@ -4097,6 +4108,43 @@ class DatabaseManager {
     return normalizeTaskPlan(row?.task_plan);
   }
 
+  getProjectCardPlanSummaries(projectId, tabIds) {
+    // Read only canonical root markers, not titles, subtasks, archived bodies
+    // or the sixty-version undo journal. No one-query-per-tab fanout.
+    const rows = this.db.prepare(`
+      WITH selected AS (
+        SELECT tab_id, tab_type, command_type, task_plan,
+          CASE WHEN json_valid(task_plan) THEN task_plan ELSE '{}' END AS plan
+        FROM tabs WHERE project_id = ? AND tab_id IN (SELECT value FROM json_each(?))
+      )
+      SELECT tab_id AS tabId, tab_type AS tabType, command_type AS commandType,
+        task_plan IS NULL OR (json_extract(plan, '$.version') = 1
+          AND json_type(plan, '$.items') = 'array') AS valid,
+        json_extract(plan, '$.revision') AS revision,
+        (SELECT json_group_array(json_object('id', json_extract(item.value, '$.id'),
+          'statusId', json_extract(item.value, '$.statusId'), 'order', item.key))
+          FROM json_each(CASE WHEN json_type(plan, '$.items') = 'array'
+            THEN json_extract(plan, '$.items') ELSE '[]' END) item
+          WHERE item.type = 'object' AND item.key < ${TASK_PLAN_MAX_ROOTS}) AS items
+      FROM selected
+    `).all(projectId, JSON.stringify(tabIds));
+    return rows.map(row => {
+      const items = JSON.parse(row.items), ids = new Set();
+      const valid = row.valid && items.every((item, index) => {
+        if (typeof item.id !== 'string' || !/^[a-zA-Z0-9:_-]{1,160}$/.test(item.id)
+          || ids.has(item.id) || item.order !== index
+          || item.statusId != null && typeof item.statusId !== 'string') return false;
+        ids.add(item.id); return true;
+      });
+      return { tabId: row.tabId, tabType: row.tabType, commandType: row.commandType,
+        plan: valid ? { known: true,
+          revision: Number.isFinite(row.revision) ? Math.max(0, Math.floor(row.revision)) : 0,
+          items: items.map(item => ({ ...item, statusId: item.statusId || null })) }
+          : { known: false, revision: null, items: [], reason: 'invalid-stored-plan' },
+      };
+    });
+  }
+
   setTabTaskPlan(tabId, rawDocument) {
     if (!tabId) throw new Error('tab_id_required');
     const document = normalizeTaskPlan(rawDocument);
@@ -4547,8 +4595,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats, last_activated_at, window_scoped, closed_visual_parent_tab_id, restore_placement_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_workflow_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats, last_activated_at, window_scoped, closed_visual_parent_tab_id, restore_placement_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -4609,6 +4657,10 @@ class DatabaseManager {
           ? Array.from(new Set(tab.restartAfterTabIds.filter((id) => typeof id === 'string' && id.trim())))
           : (tab.restartAfterTabId ? [tab.restartAfterTabId] : []);
         const restartAfterIdsJson = restartAfterIds.length > 0 ? JSON.stringify(restartAfterIds) : null;
+        const restartAfterWorkflows = Array.isArray(tab.restartAfterWorkflowIds)
+          ? [...new Set(tab.restartAfterWorkflowIds.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()))]
+          : [];
+        const restartAfterWorkflowsJson = restartAfterWorkflows.length ? JSON.stringify(restartAfterWorkflows) : null;
         const taskPlanDocument = chooseNewestTaskPlan(tab.taskPlan, taskPlanSnapshot.get(tab.tabId));
         const taskPlanJson = taskPlanDocument.revision > 0
           || taskPlanDocument.items.length > 0
@@ -4655,7 +4707,7 @@ class DatabaseManager {
           )
           ? persistedCodexSettings
           : incomingCodexSettings;
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, claudeSessionId, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson, lastActivatedAt, tab.windowScoped ? 1 : 0, tab.closedVisualParentTabId || null, tab.restorePlacementId || null);
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, claudeSessionId, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, restartAfterWorkflowsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson, lastActivatedAt, tab.windowScoped ? 1 : 0, tab.closedVisualParentTabId || null, tab.restorePlacementId || null);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
@@ -5835,6 +5887,12 @@ class DatabaseManager {
       }
       if (!Array.isArray(items)) continue;
       for (const item of items) {
+        const documents = item?.kind === 'authoring-projection'
+          ? (item.parts || []).filter(part => part?.kind === 'file')
+          : item?.kind === 'claude-request-presentation' ? (item.ownedAttachments?.refs || []) : [];
+        for (const ref of documents) {
+          if (/^[a-f0-9]{64}\.document\.[a-z0-9]{1,16}$/i.test(ref?.assetId || '')) assetIds.add(ref.assetId.toLowerCase());
+        }
         if (item?.kind !== 'image-ref') continue;
         const explicit = typeof item.assetId === 'string'
           ? path.basename(item.assetId.trim())
@@ -6253,7 +6311,7 @@ class DatabaseManager {
       {
         id: 'tab-title',
         name: 'Tab Title',
-        content: 'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.',
+        content: DEFAULT_TAB_TITLE_PROMPT,
         model: 'gemini-3.8-flash',
         thinking_level: 'NONE',
         color: '#22c55e',
@@ -6368,10 +6426,9 @@ class DatabaseManager {
   }
 
   // Ensure built-in prompt for automatic tab naming exists (migration for existing DBs).
-  // Content is intentionally user-editable in Settings → AI, so unlike adopt we do not
-  // overwrite an existing row.
+  // Only the known former default is migrated; user-authored instructions survive.
   ensureTabTitlePrompt() {
-    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('tab-title');
+    const exists = this.db.prepare('SELECT id, content FROM ai_prompts WHERE id = ?').get('tab-title');
     if (!exists) {
       this.db.prepare(`
         INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
@@ -6379,7 +6436,7 @@ class DatabaseManager {
       `).run(
         'tab-title',
         'Tab Title',
-        'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.',
+        DEFAULT_TAB_TITLE_PROMPT,
         'gemini-3.8-flash',
         'NONE',
         '#22c55e',
@@ -6388,6 +6445,10 @@ class DatabaseManager {
         5
       );
       console.log('[DB] Migrated: added tab-title prompt');
+    } else if (exists.content === LEGACY_TAB_TITLE_PROMPT) {
+      this.db.prepare('UPDATE ai_prompts SET content = ? WHERE id = ? AND content = ?')
+        .run(DEFAULT_TAB_TITLE_PROMPT, 'tab-title', LEGACY_TAB_TITLE_PROMPT);
+      console.log('[DB] Migrated: concise tab-title default');
     }
   }
 
@@ -7753,6 +7814,12 @@ class DatabaseManager {
     if (!toolType) return 'none';
     const normalizedSessionId = String(sessionId || '').trim();
     const normalizedTabId = String(tabId || '').trim();
+    // Include changes to the joined duration and parent timing behind a child
+    // alias, even when its old binding row itself did not change. The same
+    // witness lets lightweight freshness avoid scanning these metadata rows.
+    let freshnessVersion = null;
+    try { freshnessVersion = require('./history-freshness-metadata').readHistoryTimingFreshnessVersion(
+      this.db, toolType, normalizedSessionId, normalizedTabId); } catch { /* legacy/private read-only schema */ }
     const identityClauses = [];
     const params = [toolType];
     if (normalizedSessionId) {
@@ -7794,12 +7861,32 @@ class DatabaseManager {
         ${aliasIdentityFilter}
       ORDER BY interval_id ASC, projection ASC
     `).all(...params, ...aliasParams);
-    if (rows.length === 0) return 'none';
+    if (rows.length === 0 && (!freshnessVersion || freshnessVersion.every(value => value === 0))) return 'none';
     return crypto
       .createHash('sha256')
-      .update(JSON.stringify(rows))
+      .update(JSON.stringify(freshnessVersion ? [rows, freshnessVersion] : rows))
       .digest('hex')
       .slice(0, 24);
+  }
+
+  getHistoryFreshnessMetadata(scope) {
+    return require('./history-freshness-metadata').readHistoryFreshnessMetadata(this.db, scope);
+  }
+
+  getTabCompletionNotificationPreference(tabId) {
+    return this.db.prepare(`SELECT tab_id AS tabId, project_id AS projectId,
+      COALESCE(tab_type,'terminal') AS tabType, completion_notification_persistent AS persistent
+      FROM tabs WHERE tab_id=?`).get(tabId) || null;
+  }
+
+  getHistoryReadTabDescriptors(tabIds) {
+    if (!Array.isArray(tabIds) || !tabIds.length || tabIds.length > 32) return [];
+    return this.db.prepare(`SELECT t.tab_id AS tabId, t.project_id AS projectId,
+      t.tab_type AS tabType, t.command_type AS commandType, t.color,
+      COALESCE(NULLIF(t.cwd,''),p.path) AS cwd,
+      t.claude_session_id AS claudeSessionId, t.codex_session_id AS codexSessionId
+      FROM tabs t JOIN projects p ON p.id=t.project_id
+      WHERE t.tab_id IN (${tabIds.map(() => '?').join(',')})`).all(...tabIds);
   }
 
   close() { this.db.close(); }

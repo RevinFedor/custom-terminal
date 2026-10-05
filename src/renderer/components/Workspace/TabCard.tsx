@@ -16,7 +16,8 @@ import {
   TabContextUpdateBadge, TabCompletionNotificationAlert, TabCompletionNotificationBadge,
   TabSessionAvailabilityMarker, TabTaskMarker, useTabActivitySignals, useTabContextUsage,
   useTabCompletionNotificationDismissing, resolveTabCompletionNotificationShadow,
-  TAB_CONTEXT_UPDATE_INSET_PX, TAB_COMPLETION_NOTIFICATION_INSET_PX,
+  TAB_CONTEXT_UPDATE_INSET_PX,
+  TAB_PROCESS_BAR_W_PX,
   TASK_MARKER_GAP_PX, TASK_MARKER_LANE_HEIGHT_PX, TASK_MARKER_DEFAULT_COLOR,
   tabFastBadgeOutsidePx,
   type SharedTabActivityMaps,
@@ -36,6 +37,7 @@ export interface TabCardProps extends React.HTMLAttributes<HTMLElement> {
   truncate?: boolean;
   showShownStripe?: boolean;
   showProjectIcon?: boolean;
+  showTaskMarkers?: boolean;
   /** Popover scroll boxes need the signal overhang included in card layout. */
   reserveSignalSpace?: boolean;
   interactiveStatus?: boolean;
@@ -53,7 +55,7 @@ export interface TabCardProps extends React.HTMLAttributes<HTMLElement> {
 const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   projectId, tabId, as = 'span', shown = false, active = false, selected = false,
   pressed = false, fullWidth = false, truncate = true, showShownStripe = false,
-  showProjectIcon = false, reserveSignalSpace = false, interactiveStatus = false, chooser = false,
+  showProjectIcon = false, showTaskMarkers = true, reserveSignalSpace = false, interactiveStatus = false, chooser = false,
   label, children, trailingActions, sharedActivity = null, activityOverride,
   geometry, fontSize, onTaskClick, style, onMouseEnter, onMouseLeave, ...elementProps
 }, ref) {
@@ -88,9 +90,10 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   const taskShape = useUIStore(s => s.taskStatusMarker.shape);
   const configuredGeometry = useUIStore(s => s.tabGeometry);
   const configuredFontSize = useUIStore(s => s.tabsFontSize);
+  const processBarPosition = useUIStore(s => s.processBar.position);
   const projectIcon = useProjectsStore(s => s.projects[projectId]?.icon || '');
   const projectName = useProjectsStore(s => s.projects[projectId]?.name || '');
-  const taskItems = taskPlan?.items || [];
+  const taskItems = showTaskMarkers ? taskPlan?.items || [] : [];
   const geo = geometry || configuredGeometry;
   // Run After already has an authoritative activity snapshot. Reuse it rather
   // than starting an extra process lookup for every row in its picker.
@@ -112,7 +115,13 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   const chrome = getTabChromeColorConfig({ color: tabColor, tabType });
   const metrics = resolveTabCardMetrics({ ...geo,
     paddingLeft: Math.max(geo.paddingLeft, contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 0),
-  }, { fontSize: fontSize ?? configuredFontSize, showTaskLane: taskItems.length > 0, hasStatusMarker: !!status || contextUpdate });
+  }, { fontSize: fontSize ?? configuredFontSize, showTaskLane: taskItems.length > 0, hasStatusMarker: !!status || contextUpdate,
+    // Reserve the rail even while idle so starting a process cannot rewrap the
+    // strip. The bell overlays the corner without changing the configured
+    // spacing; a separate paddingRight would overwrite this single writer.
+    minPaddingLeft: processBarPosition === 'left' ? TAB_PROCESS_BAR_W_PX : 0,
+    minPaddingRight: processBarPosition === 'right' ? TAB_PROCESS_BAR_W_PX : 0,
+  });
   const pending = resolveTabPendingOperationLabel({ aiClosing, pendingOperation });
   const shadows = [resolveTabCompletionNotificationShadow({ armed: armed && !fired, fired }),
     showShownStripe && (shown || pressed) ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)' : null,
@@ -132,7 +141,6 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     marginTop: reserveSignalSpace ? Math.max(0, tabFastBadgeOutsidePx(geo.gap ?? 4) - 1) : undefined,
     marginBottom: reserveSignalSpace ? Math.max(0, -metrics.laneBottomPx,
       contextUpdate ? tabFastBadgeOutsidePx(geo.gap ?? 4) - 1 : 0) : undefined,
-    paddingRight: armed || persistent || fired ? Math.max(geo.paddingX, TAB_COMPLETION_NOTIFICATION_INSET_PX) : undefined,
     transition: 'none', ...style,
   };
   const contents = <>
@@ -172,7 +180,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
 // creating activity/context subscriptions for a placeholder slot ID.
 const ChooserTabCard = forwardRef<HTMLElement, TabCardProps>(function ChooserTabCard({
   projectId, tabId, as = 'span', shown, active, selected, pressed, fullWidth, truncate = true,
-  showShownStripe, showProjectIcon, reserveSignalSpace: _reserveSignalSpace, interactiveStatus: _interactiveStatus, chooser: _chooser,
+  showShownStripe, showProjectIcon, showTaskMarkers: _showTaskMarkers, reserveSignalSpace: _reserveSignalSpace, interactiveStatus: _interactiveStatus, chooser: _chooser,
   label, children, trailingActions, sharedActivity: _sharedActivity, activityOverride: _activity,
   geometry, fontSize, onTaskClick: _onTaskClick, style, onMouseEnter, onMouseLeave, ...props
 }, ref) {

@@ -31,6 +31,7 @@ const {
   projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  projectCodexSendStartupWait,
   projectCodexWriterInspectionFromProof,
   resolveCodexReadIdentity,
   resolveCodexPickerCurrentWriterSessionId,
@@ -44,6 +45,19 @@ const {
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require('./codex-runtime-contract');
+
+test('send startup wait belongs only to the current launch and reuses its absolute deadline', () => {
+  const terminal = {};
+  const input = { terminal, lifecycleGeneration: 'G', runSeq: 2, commandRunning: true, timeoutMs: 60000,
+    payload: { terminalToken: terminal, lifecycleGeneration: 'G', runSeq: 2, launchId: 'L', startedAt: 1000 } };
+  assert.deepEqual(projectCodexSendStartupWait(input), {
+    launchId: 'L', lifecycleGeneration: 'G', startedAt: 1000, deadlineAt: 61000,
+  });
+  for (const changed of [{ terminal: {} }, { lifecycleGeneration: 'other' }, { runSeq: 3 },
+    { commandRunning: false }, { stopping: true }, { inputReady: true }, { timeoutMs: NaN }, { payload: null }]) {
+    assert.equal(projectCodexSendStartupWait({ ...input, ...changed }), null);
+  }
+});
 
 test('service-tier acknowledgement identity belongs to one exact terminal writer generation', () => {
   const terminal = {};

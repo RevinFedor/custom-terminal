@@ -14,7 +14,7 @@ const { projectCodexPolicyRuntime } = require('./codex-runtime-policies');
 const { createCodexRuntimeProjectionStore } = require('./codex-runtime-projection-store');
 const { SessionTranscriptService } = require('./session-transcript-service');
 const { PublicHistoryRevisions } = require('./public-history-read');
-const { historyReadSession } = require('./history-read-session');
+const { historyReadSession, historyReadOwnerFromProjection } = require('./history-read-session');
 const api = require('./ipc/codex-data')._api;
 const quiet = { log() {}, warn() {}, error() {} };
 function functions(file, names) {
@@ -27,7 +27,8 @@ function functions(file, names) {
 const mainCode = functions('main.js', ['getCodexResumeSourceLeaseForTab', 'getCodexResumeReadIdentityLeaseForTab',
   'bindCodexResumeReadIdentityLease', 'getCurrentCodexEmptyReadSource', 'refreshCodexEmptyReadSource', 'projectCodexRuntimeSnapshotFromEvents',
   'publishCodexRuntimeProjection', 'getCodexRuntimeProjectionBatch', 'getCodexPublicWriterFields',
-  'getCodexPublicRuntimeProjection', 'broadcastCodexReadySnapshot', '_webBroadcast', 'armCodexReadIdentitySubmitBarrier']);
+  'getCodexPublicRuntimeProjection', 'broadcastCodexReadySnapshot', '_webBroadcast', 'armCodexReadIdentitySubmitBarrier',
+  'currentCodexAcceptedResumeSourceProof', 'readAgentSendDestinationAtWriteBoundary']);
 const webCode = functions('web-server.js', ['checkAuth', 'handleApi', 'resolveHistorySessionInfo']);
 
 async function fixture(t) {
@@ -43,11 +44,13 @@ async function fixture(t) {
     lifecycleGeneration: 'G:2', terminalToken: term, materializedFresh: true, emptyReadSource: inspected.emptyReadSource };
   let savedSessionId = sessionId, ready = false, inFlight = false;
   const ctx = vm.createContext({ path, srcMainDir: __dirname, fs, console: quiet, ...contract, projectCodexPolicyRuntime,
+    CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000,
     codexRuntimeProjectionStore: createCodexRuntimeProjectionStore(),
     codexDataModule: { _api: { inspectConversationMaterializationFromFile: (sid, dir) =>
       api.inspectConversationMaterializationFromFile(sid, dir, { sessionsDir }) } },
     terminalProjects: new Map([['T', cwd]]),
     terminals: new Map([['T', term]]), terminalCommandState: new Map([['T', { runSeq: 2, isRunning: true }]]),
+    terminalLifecycleEpochs: new Map([[term, 'fixture-terminal']]),
     codexLastRunCommandPayload: new Map([['T', launch]]),
     codexResumeSourceLeases: new Map([[sessionId, { tabId: 'T', launchId: 'L' }]]),
     codexSessionDiscoveryIntents: new Map([['T', { sourceMode: 'resume', sourceSessionId: sessionId,
@@ -87,7 +90,8 @@ async function fixture(t) {
   } } });
   const sendJson = (res, status, data) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(data)); };
   const web = vm.createContext({ url, crypto, console: quiet, require: () => ({}), token: 'fixture', path,
-    decId: decodeURIComponent, sendJson, historyReadSession, transcriptService: service,
+    handleSystemPromptApi: async () => false, systemPromptService: null, readBody: async () => ({}),
+    decId: decodeURIComponent, sendJson, historyReadSession, historyReadOwnerFromProjection, transcriptService: service,
     conversationOwners: null, finishConversationOwnerRead: () => ({}), publishTabTiming() {},
     publicHistoryRevisions: new PublicHistoryRevisions(),
     findOrchestrationTabDescriptor: () => ({ tabId: 'T', projectId: 'P', toolType: 'codex', sessionId: savedSessionId, cwd }),
@@ -113,7 +117,8 @@ test('actual ready broadcast→main read lease→HTTP returns settled empty Hist
     { headers: { authorization: 'Bearer fixture' } });
     return { status: res.status, data: await res.json() };
   };
-  assert.equal((await read()).status, 409, 'source existence alone does not admit startup read');
+  const beforeReady = await read();
+  assert.equal(beforeReady.status, 409, 'source existence alone does not admit startup read: ' + JSON.stringify(beforeReady));
   h.ready();
   assert.equal(h.events.at(-1).readSessionId, h.sessionId, 'causal readiness broadcasts the newly readable source');
   assert.equal(h.events.at(-1).writerConfirmed, false);
@@ -130,6 +135,19 @@ test('actual ready broadcast→main read lease→HTTP returns settled empty Hist
   h.ctx.publishCodexRuntimeProjection('T', 'fixture-reservation');
   const reserved = await read(); assert.equal(reserved.status, 409); assert.equal(reserved.data.error, 'history_read_identity_unavailable');
   assert.deepEqual(fs.readFileSync(h.created.filePath), bytes, 'no Send/Enter/launch/JSONL mutation');
+});
+
+test('actual main event projection supplies the same launch deadline, then revokes it on readiness and Stop', async t => {
+  const h = await fixture(t);
+  h.launch.startedAt = 1000;
+  const snapshot = () => h.ctx.projectCodexRuntimeSnapshotFromEvents('T', 'P');
+  assert.equal(snapshot().startupWait.launchId, 'L');
+  assert.equal(snapshot().startupWait.deadlineAt, 61000);
+  h.ctx.aiStoppingTabs.set('T', { toolType: 'codex' });
+  assert.equal(snapshot().startupWait, null);
+  h.ctx.aiStoppingTabs.delete('T');
+  h.ready();
+  assert.equal(snapshot().startupWait, null);
 });
 
 test('file append/in-place ABA and wrong runtime owner revoke empty read at O(stat), never reuse cached empty admission', async t => {

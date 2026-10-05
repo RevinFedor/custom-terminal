@@ -80,6 +80,13 @@ restore, Timeline jump, preview или смена presentation owner отмен�
 composer collapse, live text и durable adoption принадлежат одной bounded tail
 transaction. Mid-list semantic owner и tail owner взаимоисключающие.
 
+Обратный шрам — ложное выключение follow без движения: wheel вверх пришёл, но
+физическая History осталась внизу. Его временная приостановка проверяется по
+неизменной геометрии и ревизии намерения; её нельзя лечить безусловным «вниз»
+на каждом Send или расширением4px-порога. Реальный сдвиг1px уже сохраняет
+место чтения, а раскрытие/Timeline/search не разрешают поздний rearm. Условия
+и доказанный4505 incident — `fact-история-производительность.md::Один физический низ`.
+
 `SCROLL_SEEK_REJECT` связывает отклонённую выборку с input-owner, направлением,
 остатком ввода и последним изменением размера. Расширенный
 `VIRTUOSO_ROW_HEIGHT_DELTA` отличает первое измерение в этом wrapper от

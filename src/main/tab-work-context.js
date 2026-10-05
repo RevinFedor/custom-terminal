@@ -949,6 +949,8 @@ function groupedFileUpdatePresentation(tabId, status, entries) {
 class TabWorkContext {
   constructor({ db, listTabs, archivedTab, onChanged }) {
     this.db = db;
+    // Reuse this owner's string validity rule in its metadata-only SQL view.
+    this.db.function('noted_context_has_file_path', value => clean(value) ? 1 : 0);
     this.listTabs = listTabs;
     this.archivedTab = archivedTab;
     this.onChanged = onChanged;
@@ -1156,6 +1158,37 @@ class TabWorkContext {
       sessionId: tab?.codexSessionId || tab?.claudeSessionId || null,
       cwd: tab?.cwd || null,
     };
+  }
+
+  summaries(tabIds) {
+    // Same logical grouping as presentUpdates: all valid pending file members
+    // make ONE chip; manual/file-error/invalid file members each make one.
+    // Inspect only shape metadata in SQLite, never materialize prompt/diff
+    // bodies, sync linked files, or subscribe to a transcript for a card read.
+    const rows = this.db.prepare(`
+      WITH requested AS (SELECT value AS tab_id FROM json_each(?)),
+      members AS (
+        SELECT u.tab_id, CASE WHEN u.kind IN ('file','file-batch') THEN
+          CASE WHEN json_valid(u.file_changes_json)
+            AND json_type(u.file_changes_json) = 'array' THEN EXISTS (
+              SELECT 1 FROM json_each(u.file_changes_json) c WHERE c.type = 'object'
+                AND json_type(c.value, '$.path') = 'text'
+                AND noted_context_has_file_path(json_extract(c.value, '$.path')) = 1
+                AND json_type(c.value, '$.beforeText') = 'text'
+                AND json_type(c.value, '$.afterText') = 'text'
+            ) ELSE (typeof(u.path) = 'text' AND noted_context_has_file_path(u.path) = 1
+              AND typeof(u.before_text) = 'text' AND typeof(u.after_text) = 'text') END
+          ELSE 0 END AS grouped_file
+        FROM tab_context_updates u JOIN requested r ON r.tab_id = u.tab_id WHERE u.status = 'pending'
+      ), counts AS (
+        SELECT tab_id, sum(CASE WHEN grouped_file THEN 0 ELSE 1 END) + max(grouped_file) AS count
+        FROM members GROUP BY tab_id
+      )
+      SELECT r.tab_id, coalesce(w.revision,0) AS revision, coalesce(c.count,0) AS count
+      FROM requested r LEFT JOIN tab_work_context w ON w.tab_id = r.tab_id
+        LEFT JOIN counts c ON c.tab_id = r.tab_id
+    `).all(JSON.stringify(tabIds));
+    return Object.fromEntries(rows.map(row => [row.tab_id, { known: true, revision: row.revision, count: row.count }]));
   }
 
   deliveredUpdatePresentation(tabId, prompt, updateId) {

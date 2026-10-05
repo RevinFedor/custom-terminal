@@ -69,17 +69,18 @@ test('card deletion captures before replay/remove/edit and keeps the animated re
 });
 
 test('all trigger types and context gate own their whole sub-row, not the iteration', () => {
-  const trigger = source.slice(source.indexOf('{(showTimerTrigger || showOnTabTrigger || showAppRestartTrigger)'), source.indexOf('{showContextCondition &&'));
-  const context = source.slice(source.indexOf('{showContextCondition &&'), source.indexOf('</Fragment>', source.indexOf('{showContextCondition &&')));
+  const trigger = source.slice(source.indexOf('{triggerRows.map('), source.indexOf('{showContextCondition &&'));
+  const context = source.slice(source.indexOf('{showContextCondition &&'), source.indexOf('</ItemFrame>', source.indexOf('{showContextCondition &&')));
   for (const row of [trigger, context]) {
     assert.match(row, /className="pq-middle-delete-target"/);
-    assert.match(row, /onMouseDownCapture=.*consumePromptQueueMiddleClick\(event\)/);
+    assert.match(row, /onMouseDownCapture=[\s\S]{0,300}consumePromptQueueMiddleClick\(event\)/);
     assert.doesNotMatch(row, /animateRemovePrompt|removePrompt\(/);
     assert.match(row, /backgroundColor:/);
     assert.match(row, /data-chip-action="remove-/);
   }
-  assert.match(trigger, /onAuxClickCapture=.*clearItemTrigger\(it\.id\)/);
-  assert.match(trigger, /onClick=\{\(\) => clearItemTrigger\(it\.id\)\}/);
+  assert.match(trigger, /onAuxClickCapture=[\s\S]{0,500}clearItemTrigger\(it\.id\)/);
+  assert.match(trigger, /onClick=\{\(\) => \{[\s\S]{0,230}else clearItemTrigger\(it\.id\)/);
+  assert.match(trigger, /overview && triggerKind === 'onTab' && \(event\.target as HTMLElement\)\.closest\('\[data-tab-card\]'\)/);
   assert.match(context, /onAuxClickCapture=.*setPromptCondition\(tabId, it\.id, null\)/);
   assert.match(context, /onClick=\{\(\) => setPromptCondition\(tabId, it\.id, null\)\}/);
 });

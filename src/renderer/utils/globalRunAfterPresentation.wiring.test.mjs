@@ -9,41 +9,30 @@ const workspace = path.join(here, '..', 'components', 'Workspace');
 const globalPanel = fs.readFileSync(path.join(workspace, 'GlobalRunAfterControl.tsx'), 'utf8');
 const queueOverlay = fs.readFileSync(path.join(workspace, 'PromptQueueOverlay.tsx'), 'utf8');
 
-test('global overview uses natural height and a floating queue surface', () => {
-  assert.match(globalPanel, /heightFixed: parsed\.heightFixed === true/,
-    'legacy fixed canvas height must not survive as an intentional user choice');
-  assert.match(globalPanel, /height: panelSize\.heightFixed \? position\.height : 'auto'/);
-  assert.match(globalPanel, /data-global-run-after-floating-editor/);
-  assert.match(globalPanel, /data-run-after-satellite="true"/);
-  assert.doesNotMatch(globalPanel, /data-global-run-after-editor-area/,
-    'opening one queue must not append a block to the overview flow');
-  assert.match(globalPanel, /embeddedWidth=\{editorPosition\.width\}/);
-  assert.match(globalPanel, /embeddedMaxHeight=\{Math\.max\(90, editorPosition\.maxHeight - 11\)\}/);
-  assert.match(queueOverlay, /embeddedWidth\?: number/);
-  assert.match(queueOverlay, /embeddedMaxHeight\?: number/);
-  assert.match(globalPanel, /const ownerRect = trigger\.closest<HTMLElement>\('\[data-global-run-after-node\]'\)/);
-  assert.match(globalPanel, /const left = clamp\(ownerRect\.right - width/,
-    'floating editor must align to its whole owner node, not leave the next Play beside its edge');
-  assert.match(globalPanel, /const gap = 3;/);
-  assert.match(queueOverlay, /background: embedded \? '#141414' : PANEL_BG/,
-    'covered graph controls must not show through the floating editor');
-  assert.match(globalPanel, /const liveRect = panelRef\.current\?\.getBoundingClientRect\(\)/,
-    'auto-height resize must start from the visible panel, not its stored ceiling');
+test('global overview has natural height and uses the shared editor in normal flow', () => {
+  assert.match(globalPanel, /resizeEnabled: parsed\.resizeEnabled === true/);
+  assert.doesNotMatch(globalPanel, /parsed\.heightFixed/);
+  assert.match(globalPanel, /height: panelSize\.resizeEnabled \? position\.height : 'auto'/);
+  assert.match(globalPanel, /width: panelSize\.resizeEnabled \? position\.width : fittedWidth/);
+  assert.match(globalPanel, /data-global-run-after-resize-toggle/);
+  assert.match(globalPanel, /\{panelSize\.resizeEnabled && <>/);
+  assert.match(globalPanel, /data-global-run-after-inline-editor/);
+  assert.match(globalPanel, /embedded overview/);
+  assert.doesNotMatch(globalPanel, /data-global-run-after-floating-editor|data-global-run-after-editor-trigger/);
+  assert.match(queueOverlay, /overflowY: overview \? 'visible' : 'auto'/);
+  assert.match(globalPanel, /const liveRect = panelRef\.current\?\.getBoundingClientRect\(\)/);
 });
 
-test('project identity is outside the canonical opaque tab chip', () => {
+test('global owner uses the whole content-sized TabCard without redundant step count or task lane', () => {
   const icon = globalPanel.indexOf('data-global-run-after-project-icon');
   const tab = globalPanel.indexOf('data-global-run-after-tab-chip');
-  assert.ok(icon >= 0 && tab > icon, 'project icon must be the tab chip sibling on its left');
-  assert.match(globalPanel, /flattenRgbaOnTabbarPanel\(resolveTabCardBackground/);
-  assert.match(globalPanel, /border: 'none'/);
-  assert.match(globalPanel, /width: 12,\n\s+flex: '0 0 12px'/,
-    'project icon slot must use the same 12px measure as PaneTabStrip');
-  assert.match(globalPanel, /const nodeHeight = Math\.max\(1, resolveTabCardBoxHeight[\s\S]{0,120}- 2\)/,
-    'graph node height removes the helper border reserve because the visible pane chip is borderless');
-  assert.match(globalPanel, /const GRAPH_NODE_W = 270/);
-  assert.ok((globalPanel.match(/width: 26,/g) || []).length >= 2,
-    'count and Play/Pause use the compact local-control measure');
+  assert.ok(icon >= 0 && tab > icon);
+  assert.match(globalPanel, /<TabCard as="button"/);
+  assert.doesNotMatch(globalPanel, /data-global-run-after-step-count/);
+  assert.match(globalPanel, /showTaskMarkers=\{false\}/);
+  assert.doesNotMatch(globalPanel, /active=\{active\} fullWidth/);
+  assert.match(globalPanel, /data-global-run-after-condition-mark/);
+  assert.doesNotMatch(globalPanel, /function QueueStatusMarks/);
 });
 
 test('global resize owns only its handle and commits React state once', () => {

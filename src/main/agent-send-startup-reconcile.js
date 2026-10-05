@@ -35,6 +35,7 @@ const {
   projectCodexImageAuditToRequest,
   readPersistedCodexImageRequestProjection,
 } = require('./codex-image-request-projection');
+const { readOwnedAttachmentProjection } = require('./owned-mobile-attachments');
 
 const DEFAULT_STARTUP_AUDIT_READ_BYTES = 2 * 1024 * 1024;
 const MAX_STARTUP_AUDIT_READ_BYTES = 8 * 1024 * 1024;
@@ -163,19 +164,25 @@ function normalizeUnresolvedRecord(record) {
   const transportLength = prompt.text.length;
   let imageRequestProjection = null;
   let claudeRequestProjection = null;
+  const ownedRequestProjection = record.receipt?.ownedAttachmentProjection
+    ? readOwnedAttachmentProjection(record) : null;
+  if (ownedRequestProjection && !ownedRequestProjection.valid) return { ok: false, reason: ownedRequestProjection.reason };
+  if (record.receipt?.ownedAttachments && !ownedRequestProjection) return { ok: false, reason: 'attachment-projection-missing' };
+  const preparedHash = ownedRequestProjection?.preparedHash || promptHash;
+  const preparedLength = ownedRequestProjection?.preparedLength ?? promptLength;
   if (provider === 'codex' && record.receipt?.imageRequestProjection) {
     const projected = readPersistedCodexImageRequestProjection(record);
     if (!projected.valid) return { ok: false, reason: projected.reason };
     imageRequestProjection = projected;
-  } else if (provider === 'claude' && (transportLength !== promptLength || transportHash !== promptHash)) {
+  } else if (provider === 'claude' && (transportLength !== preparedLength || transportHash !== preparedHash)) {
     claudeRequestProjection = validateClaudePromptRequestProjection({ tabId: record.tabId, record,
       audit: { handoffId: record.handoffId, sendOperationKey: operationKey, sendAttemptId: attemptId,
         expectedText: prompt.text, expectedHash: transportHash, expectedLen: transportLength } });
     if (!claudeRequestProjection.valid) return { ok: false, reason: claudeRequestProjection.reason };
-  } else if (transportLength !== promptLength || transportHash !== promptHash) {
+  } else if (transportLength !== preparedLength || transportHash !== preparedHash) {
     // Never fall back to raw promptText merely because transport differs.
     // Old receipts without the exact staged proof remain unconfirmed.
-    return { ok: false, reason: transportLength !== promptLength
+    return { ok: false, reason: transportLength !== preparedLength
       ? 'receipt-prompt-length-mismatch' : 'receipt-prompt-hash-mismatch' };
   }
   if (!record.transcriptBoundary || typeof record.transcriptBoundary !== 'object') {
@@ -222,6 +229,7 @@ function normalizeUnresolvedRecord(record) {
       transportLength,
       imageRequestProjection,
       claudeRequestProjection,
+      ownedRequestProjection,
       expectedImagePaths: provider === 'codex'
         ? codexExpectedImagePathsFromReceipt(record)
         : [],
@@ -469,8 +477,9 @@ function makeAudit(context, {
     expectedHash: context.promptHash,
     actualLen: actualText.length,
     expectedLen: context.promptLength,
-    canonicalized: !!canonicalReason || !!context.claudeRequestProjection,
-    canonicalReason: context.claudeRequestProjection ? CLAUDE_REQUEST_TRANSPORT_REASON : canonicalReason,
+    canonicalized: !!canonicalReason || !!context.claudeRequestProjection || !!context.ownedRequestProjection,
+    canonicalReason: context.claudeRequestProjection ? CLAUDE_REQUEST_TRANSPORT_REASON
+      : canonicalReason || (context.ownedRequestProjection ? 'owned_mobile_attachment_paths' : null),
     entryUuid: cleanString(entryUuid) || null,
     sourceIdentity: cleanString(sourceIdentity) || null,
     recordByteOffset: Number.isSafeInteger(Number(recordByteOffset))

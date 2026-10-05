@@ -5,6 +5,13 @@ MCP-сервер для управления терминальными вкла
 
 ## Архитектура
 
+Settings → Системные промпты доступны отдельно от Opt+V библиотеки через
+`list_system_prompts`/`get_system_prompt` и `create/update/delete_system_prompt`.
+Поля редактора и selectable Rewind assignment меняются по revision через
+`/api/system-prompts`; назначение built-in по ID сохраняется. Capability
+`systemPrompts.version=1` проверяется до обращения. Контракт и защита открытого
+черновика — `fact-settings.md::Системные промпты через Application API и Terminal MCP`.
+
 О завершении run нельзя отвечать по старой реплике «жду». Успешный backend result
 не зависит от доставки уведомления; dismiss attention не является чтением ответа.
 Source14.09 общий Send передаёт короткий terminal fact со следующим обычным prompt
@@ -99,6 +106,12 @@ process lookups. Установка из собственной сессии —
 
 ### План задач вкладки
 
+Public native cards читают компактную проекцию того же плана в `/api/projects/:id/tabs`
+при `cardSignals.version=1`; это не новый MCP editor и не замена full `get_tab_plan`.
+Ответ содержит root id/status/order/revision, общий каталог без descriptions,
+pending count и exact current Fast. Scope/wake —
+`fact-mobile-web.md::Компактные сигналы карточек вкладок`.
+
 Terminal MCP публикует две отдельные команды структурированного плана:
 
 - `get_tab_plan` читает план целевой вкладки и одновременно возвращает актуальные статусы задач с их описаниями;
@@ -137,6 +150,31 @@ bridge. Поэтому холодный/reloading renderer не оставляе
 MCP не выбирает пункт повторным Send; настройка System по-прежнему владеет
 разрешённым автоматическим выбором, readiness подтверждается отдельно.
 
+Cold Codex Send использует `startupWait` того же main-owned launch: его
+absolute deadline, terminal/run/lifecycle proof, не собственный ранний30s отказ.
+Новый wake срок не продлевает; смена launch, Stop, manual picker и startup failure
+завершают подготовку без paste. Обычный live-picker без launch сохраняет30s guard.
+Точный Stop до paste даёт cancelled receipt, не generic preflight failure;
+уже подтверждённая отправка сильнее поздней отмены. Старые failed receipts не replay.
+
+### Явный выбор native Goal через MCP
+
+`get_codex_goal({tabId,requestId?})` читает состояние меню/точной попытки без
+запуска вкладки. `resolve_codex_goal({tabId,operationId,action,requestId?})`
+выбирает `resume` или `leave-paused` по `availableActions`; это штатный native
+пункт, не удаление Goal и не Stop процесса. Новый endpoint GET/POST
+`/api/terminal-tabs/:tabId/codex/goal`, capability `codexGoal.version=1`.
+Main переиспользует parser, current committed frame, owner/input proof и PTY-lock.
+HTTP202/pending и actionWritten не подтверждают выбор; confirmed требует
+последующего composer-proof. GET с requestId восстанавливает неизвестный ACK.
+Same requestId связан с tab/operation/action; другой payload конфликтует.
+После unknown новая явная попытка возможна только по recoveryAvailable и новому
+committed кадру того же интерактивного меню после завершения прежнего writer.
+Старая квитанция остаётся unknown, простой повтор Enter запрещён.
+Квитанции runtime-scoped:1024 без вытеснения, затем явный capacity error;
+после restart namespace новый, старый operationId не может нажать новое меню.
+Ни выбор, ни GET не пересылают failed prompt и не меняют System preference.
+
 ### Статус доставки и получение результата
 
 Короткий вопрос занятому владельцу и делегация самостоятельной задачи сейчас
@@ -163,6 +201,20 @@ benchmark. Обе exact квитанции confirmed; runId у них отсут
 с вручную вписанным return-tab.
 
 `send_prompt` / `Status: sent` — это delivery-only сигнал. Для остановленной или восстановленной вкладки он включает ожидание запуска; завершения ответа не ждёт. Pending/unknown проверяются через get_send_receipt, не новым Send. Для ручной инспекции уже открытой сессии history-tools того же Terminal MCP читают `list_open_sessions` → `busy/status` → targeted turn/text. Для долгой делегации этот цикл запрещён: `delegate_to_session` создаёт persistent run, после чего текущий assistant-turn заканчивается. Новый completion обычно уже содержит полный проверенный ответ: его используют напрямую. `get_delegation_result` нужен при явном omitted/reference, старом техническом уведомлении либо адресном восстановлении. Чтение result/status/transcript циклом до уведомления не доказывает штатный flow. Так 30-минутный turn не держит HTTP/MCP-вызов и переживает restart.
+
+При явном восстановлении после Build Install проверяется весь обмен, а не только
+запуск CLI или доставка нового «продолжай» родителю. Shutdown snapshot перечисляет
+живые процессы, не все незавершённые поручения. `GET /api/orchestrations` даёт только
+tracked runs; терминальные отказы нужно брать также через `?tabId=...` для источников
+и связанных targets, включая не запущенный до shutdown target. Exact send receipts
+и логи различают отказ до input, неизвестную доставку, уже принятый последующий
+повтор и готовый ответ с неудавшимся возвратом. Совпавший текст поздней confirmed
+квитанции доказывает доставку повторного сообщения, но не выполнение всей задачи.
+Отменённое ожидание busy-target тоже не доказывает, что его поручение доставлялось.
+Новая установка не оживляет старую failed квитанцию: новое восстановление допускается
+по явному поручению после проверки прежнего исхода и отсутствия успешной замены.
+Снятие attention допустимо после обработки/возврата результата, но само его не
+доставляет; старую ошибку нельзя переписать в sent ради исчезновения карточки.
 
 Для делегации в уже существующую вкладку провайдер определяет сама target-вкладка: Terminal MCP не передаёт default `toolType=claude`. Этот default относится только к созданию новой сессии; явный конфликт провайдера Project API отклоняет до создания run. Успешный `delegate_to_session` всегда возвращает верхнеуровневый durable `runId` и тот же объект в `structuredContent`; HTTP/MCP-ошибка остаётся `isError=true` и также содержит структурированное `{ ok:false, error }`. `null`, пустой результат или ответ без `runId` не являются отправкой и запрещают отчёт «запрос отправлен».
 
@@ -281,6 +333,14 @@ proof, а Retry в `audit-pending` не выполняет второй physical
 привязывает поздний audit ещё и к provider/session/prompt hash, поэтому
 одинаковый текст соседней операции не является подтверждением.
 
+Явный `submitted:false` из подготовки, которая ещё не вызвала beginAttempt и
+renderer bridge, также сохраняется на той же durable receipt как not-submitted
+с paste/Enter=false и attemptId=null. Иначе ответ HTTP409 расходился с поздним
+GET preparing/delivery-unknown (warm local compact4875,04.10). Это attestation
+исполняющей ветки, не вывод из null attemptId: старые unresolved записи не
+backfill. Local Codex slash с unpublished writer проходит только к прежнему
+Main proof при exact physical launch pin, не получает writer из read/saved SID.
+
 Диагностический пакет фиксирует состояние на момент таймаута; асинхронное
 сохранение файла может закончиться уже после exact audit. Перед отправкой
 уведомления main перечитывает квитанцию по тем же operation/attempt/tab/handoff
@@ -332,6 +392,75 @@ handoff не перезаписывают друг друга. Если точн
 позже, файл этой попытки удаляется; трасса не является доказательством доставки
 и не разрешает повторный Enter. Теги журнала: `[ClaudePostEnterForensics]`.
 
+#### Main FIFO принятых Send
+
+Обычные программные Send Claude/Codex принимаются без фиксированного лимита
+количества сообщений в backlog приложения. Main `AgentSendQueue` сохраняет
+snapshot запроса в SQLite `agent_send_queue`, связывая его с прежней
+`agent_send_receipts` по operationKey/handoffId. Текст, authoring chips и image
+refs фиксируются при приёме; дальнейший input их не меняет. Очередь не зависит
+от смонтированной History. Ошибка сохранения не является ACK.
+
+В каждый момент только head входит в прежний общий readiness/settings/draft/
+PTY scenario. Native acceptance (`QUEUED`) остаётся промежуточной границей:
+следующий item получает ход после exact canonical audit предыдущего, даже
+если ответ ещё streaming. Generic success, очередь TUI, timeout, чужой audit и
+потеря ответа не освобождают slot. Доказанный отказ завершает свою попытку без
+повторного Enter, но не отменяет проверки чужого composer у следующей.
+Повтор handoff читает прежнюю операцию; другой payload с тем же ID — конфликт,
+одинаковый текст с разными ID — разные items.
+
+Completion caller резервирует stable `history:<sourceTabId>:orchestration-complete:<runId>`
+до первого входа в FIFO/renderer. Вход без operationKey регистрировался в memory,
+затем новый renderer повторно enqueue-ил того же caller и конфликтовал по fingerprint;
+просто уравнять хэш означало бы риск self-join. Guard сохранён, callback audit
+переносит точные operationKey/attemptId. Явно скрытые старые completions не оживляются.
+
+Это не Run After: его future conditions и natural-turn completion прежние.
+Независимая orchestration по-прежнему требует idle/new turn; после ожидания
+Main повторно использует её существующий admission policy и lifecycle wake,
+не превращая делегацию в steering. Raw TUI-ввод не перехватывается/не лимитируется.
+Standalone slash и record-without-reply остаются в своих доказательных flows.
+
+Waiting item можно отменить до начала attempt; race с dispatch не объявляется
+успешной отменой. Явный process Stop/закрытие вкладки снимает принятый backlog и
+отзывает текущую подготовку через прежний cancellation registry. Interrupt
+по-прежнему относится к текущему turn и не превращается в process Stop.
+Непереданные failed/cancelled snapshots не пропадают по15s UI-таймеру или общей
+receipt-retention: остаются pinned до явного скрытия, image asset IDs входят в
+прежний GC inventory. Зависимые cold items удерживают exact proof начального
+provider writer, а не подставляют текущий SID в момент исполнения.
+
+Очередь сама не читает/копирует bytes: inventory содержит только materialized
+managed assets. SOURCE05.10 добавляет импорт подтверждённых mobile image/document
+uploads прежним asset owner ДО freeze/enqueue; snapshot хранит original sourcePath,
+ordered occurrences и scoped transport proof. Waiting/unknown/failed bytes и exact
+source→asset mapping переживают restart/DELETE original; metadata-only legacy записи
+не мигрируются. Нужны отдельные `sendQueue.attachmentOwnership` capability и
+`attachmentOwnership.durable:true` exact receipt, не один общий durable ACK.
+Произвольный authored path/GT ссылка не импортируются. Same-ID replay читает старый
+snapshot до temp/context read; original body не меняется, unknown не replay'ит Enter.
+Контракт и source/installed граница — `fact-mobile-web.md::Mobile upload attachments`.
+
+После restart сначала reconcile прежних receipts, затем подключение App bridge
+разрешает dispatch. Waiting без physical attempt продолжает прежний snapshot;
+entered/unknown не повторяет отправку и держит следующих. Закрытие одной
+renderer-поверхности не отзывает готовность другого живого App renderer.
+Уже существовавшие legacy unknown receipts не переписываются этой миграцией.
+
+Ранний ACK — opt-in `POST /api/terminal-tabs/:tabId/send` с
+`applicationQueue:true`. Capability `sendQueue.version=1`, `durable:true`,
+`providerPendingLimit:1`, `optIn:'applicationQueue'`. HTTP202 возвращает
+`status:'application-queued', applicationQueued:true, accepted:true,
+submitted:false, pasteWritten:false, enterWritten:false,
+providerQueueAccepted:false, exactAuditConfirmed:false`, прежние tab/handoff/
+operationKey, `attemptId:null` и `applicationQueue:{version:1,id,state,queuedAt}`.
+`state` здесь waiting/dispatching до начала physical attempt; это подтверждение
+сохранения на Mac, не чтения провайдером. Same-ID send-receipts GET сохраняет это
+различие. Без opt-in POST ждёт прежний результат provider-сценария. Native/MCP
+могут подключать раннюю галочку только по этому typed contract, не по одному
+`accepted:true`. Desktop использует тот же Main adapter через `agent:enqueue-prompt`.
+
 #### Принятие в очередь Codex и сохранение user_message
 
 У занятого Codex точная новая карточка `Messages to be submitted after next tool call`
@@ -376,6 +505,11 @@ Enter. Тот же контракт используют обычные Prompt Q
 создаёт промежуточный `SENDING`, который успел бы попасть в локальный cache и
 пережить уже подтверждённую отправку.
 
+Image refs той же local карточки также восстанавливаются после exact attempt
+binding, включая live FIFO receipt, не только mount-list. Read-only proof не
+меняет receipt/status и не заимствует пути из похожей canonical строки;
+canonical image preview сам по себе не проверяет local queued/SENT путь.
+
 Подтверждение доставки и завершение временного показа — разные долговечные
 факты. Exact audit сохраняет Claude `entryUuid` либо Codex `sourceIdentity` и
 каноническое ISO-время. Когда History находит именно эту строку, main принимает
@@ -391,8 +525,9 @@ provider, audit-session и exact row identity; совпадение текста
 Для native краткая галочка «принято Mac» читает ту же durable квитанцию, не
 создаёт второй executor/ACK. Exact audit-pending+submitted, typed provider queue
 acceptance и confirmed имеют разные силы доказательства; accepted:true/unknown
-сам по себе не разрешает галочку или Retry. Раннего публичного pre-submission
-outbox ACK нет. Phone close отличается от Mac restart; полный read-only
+сам по себе не разрешает галочку или Retry. Ранний pre-submission ACK теперь
+есть только у typed Main FIFO opt-in выше; это не provider ACK. Phone close
+отличается от Mac restart; полный read-only
 контракт и second-click Stop предел —
 `fact-mobile-web.md::Durable Mac acceptance и единый header Stop`.
 
@@ -522,6 +657,11 @@ Noted Terminal должен инициировать `npm run build:install` с�
 Единый namespace не отменяет внутреннюю границу: live-действия идут через scenario
 layer, чтение/редактирование прошлого — через history backend. Нельзя реализовать
 обычную отправку/orchestration записью prompt в Codex JSONL вместо CLI.
+`search_user_messages/get_user_messages` дают фильтрованные сообщения и пакетное
+чтение их exact refs; даты означают время сообщений. Saved-prompt wrapper,
+context update и plain text не взаимозаменяемы; metadata-only диагноз включается
+через session_stats.diagnosticsOnly. Контракт страниц/покрытия и примеры границ —
+fact-session-history.md::Фильтрованные пользовательские сообщения.
 Явный saved-history Rewind/Delete — другой контракт: Stop → copy-on-write →
 adopt → Resume; его tab HTTP-вход описан в fact-mobile-web.md. Он не меняет
 native поведение существующего `rewind_ai` и не превращает Terminal MCP в

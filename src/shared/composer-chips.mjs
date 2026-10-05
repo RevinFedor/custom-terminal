@@ -470,7 +470,7 @@ export function composerTextFromParts(parts, chips = []) {
   }).join('');
 }
 
-export function serializeComposerDraft({ text = '', chips = [], parts = null, renderImage = null, onBody = null, onImageRange = null } = {}) {
+export function serializeComposerDraft({ text = '', chips = [], parts = null, renderImage = null, onBody = null, onImageRange = null, onTextRange = null } = {}) {
   const normalized = normalizeComposerChips(chips);
   // Сохранённый промпт уезжает В СВОЕЙ МЕТКЕ, как и вставка: тогда чип в истории
   // читается из самого текста, а не из отдельной записи, которая может с ним
@@ -490,9 +490,12 @@ export function serializeComposerDraft({ text = '', chips = [], parts = null, re
     const prefix = promptParts.join('\n\n');
     const bodyStart = prefix ? prefix.length + 2 : 0;
     let position = bodyStart;
-    const body = parts.map(part => {
+    const body = parts.map((part, partIndex) => {
       let value;
-      if (part.kind === 'text') value = part.text;
+      if (part.kind === 'text') {
+        value = part.text;
+        onTextRange?.({ partIndex, start: position, end: position + value.length });
+      }
       else if (part.kind === 'paste') value = `${PASTED_CONTENT_OPEN}\n${byId.get(part.chipId).text}\n${PASTED_CONTENT_CLOSE}`;
       else if (part.kind === 'image') {
         value = renderImage ? renderImage(part.imageId) : `[Image #${part.imageId}]`;

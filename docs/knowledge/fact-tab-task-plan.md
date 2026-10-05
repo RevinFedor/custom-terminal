@@ -95,6 +95,14 @@ HTTP-граница main process:
 - `GET /terminal/tab-plan` — чтение плана и каталога статусов;
 - `POST /terminal/tab-plan/apply` — атомарное применение подтверждённых операций.
 
+Native card metadata использует SOURCE05.10 `cardSignals` у public `/tabs`:
+только текущая revision и активные корневые `{id,statusId,order}`. Один маркер
+соответствует корневой задаче, не подзадаче/архиву/notes. SQL projection читает
+поля уже нормализованного документа; прежний лимит `TASK_PLAN_MAX_ROOTS` общий,
+названия и undo body не передаются. Это не новый plan writer и не замена
+полного `get_tab_plan`. Общий task catalog/marker и clock/wake описаны в
+`fact-mobile-web.md::Компактные сигналы карточек вкладок`.
+
 ## Проверки
 
 - `src/main/tab-task-plan.test.js` проверяет нормализацию двух уровней, архив/восстановление, общий undo/redo и защиту новой ревизии от устаревшего сохранения.

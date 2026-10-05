@@ -96,11 +96,16 @@ class PublicHistoryRevisions {
     this.entries.delete(token); this.entries.set(token, entry);
     return entry.revision;
   }
-  remember(revision, request) {
+  lookupFreshness(token, request) {
+    const entry = this.entries.get(token);
+    return entry?.scope === this.scope(request) ? entry.freshness || null : null;
+  }
+  remember(revision, request, freshness = null) {
     if (!revision?.token) return null;
     const scope = this.scope(request);
-    const token = crypto.createHash('sha256').update(scope + '\n' + revision.token).digest('hex');
-    this.entries.delete(token); this.entries.set(token, { scope, revision });
+    const token = crypto.createHash('sha256').update(scope + '\n' + revision.token
+      + (freshness?.state === 'known' ? '\n' + freshness.token : '')).digest('hex');
+    this.entries.delete(token); this.entries.set(token, { scope, revision, freshness });
     while (this.entries.size > this.limit) this.entries.delete(this.entries.keys().next().value);
     return token;
   }

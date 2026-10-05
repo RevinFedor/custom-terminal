@@ -18,6 +18,12 @@ const logs = [];
 try {
   for (const name of ['src', 'packages/claude-blocks']) await fs.cp(path.join(repo, name), path.join(snapshot, name),
     { recursive: true, force: true, filter: p => !p.includes('/node_modules') && !p.includes('/.git') });
+  // Optional source-only RED control: run the identical browser scenario with
+  // the captured pre-repair header. Never modifies the shared checkout.
+  if (process.env.NOTED_PANE_HEADER_BASELINE_DIR) for (const name of ['SplitPaneChrome.tsx','PaneTabStrip.tsx']) {
+    const relative=path.join('src/renderer/components/Workspace',name);
+    await fs.copyFile(path.join(process.env.NOTED_PANE_HEADER_BASELINE_DIR,relative),path.join(snapshot,relative));
+  }
   await fs.mkdir(path.join(snapshot, 'scripts/fixtures'), { recursive: true });
   await fs.copyFile(path.join(repo, 'scripts/fixtures/pane-wrapped-strip.tsx'), path.join(snapshot, 'scripts/fixtures/pane-wrapped-strip.tsx'));
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
@@ -124,12 +130,19 @@ try {
   const reset=async()=>{await page.locator('[data-reset]').click();await frames();};
   await item('a').waitFor();await frames();
   const measure=()=>pane(0).evaluate(el=>{const strip=el.querySelector('[data-pane-tab-strip-scroller]'),header=el.querySelector('[data-split-attach-row]'),content=el.querySelector('[data-test-content]');
-    return{wrap:getComputedStyle(strip).flexWrap,overflow:getComputedStyle(strip).overflowX,scroll:strip.scrollLeft,
+    const actions=el.querySelector('[data-split-pane-actions]').getBoundingClientRect();
+    return{overflow:getComputedStyle(strip).overflowX,scroll:strip.scrollLeft,
+      actions:{left:actions.left,right:actions.right,top:actions.top,bottom:actions.bottom},
+      paneRight:el.getBoundingClientRect().right,
+      chooserY:el.querySelector('[data-pane-chooser-chip]')?.getBoundingClientRect().top,
+      stripBottom:strip.getBoundingClientRect().bottom,
+      headerBottom:header.getBoundingClientRect().bottom,
+      belowHeaderHit:document.elementFromPoint(el.getBoundingClientRect().left+20,header.getBoundingClientRect().bottom+2)?.closest('[data-split-attach-row]')!=null,
       header:header.getBoundingClientRect().height,content:content.getBoundingClientRect().top,
       rows:[...new Set([...strip.querySelectorAll('[data-strip-item], [data-pane-chooser-chip]')].map(x=>Math.round(x.getBoundingClientRect().top)))],
       cards:[...strip.querySelectorAll('[data-strip-item]')].map(x=>{const r=x.getBoundingClientRect();return{id:x.dataset.stripTabId,x:r.left,y:r.top,w:r.width,h:r.height};})};});
   const initial=await measure();result.samples.push(initial);
-  assert.equal(initial.wrap,'wrap');assert.equal(initial.overflow,'clip');assert.ok(initial.rows.length>=3);assert.equal(initial.scroll,0);
+  assert.equal(initial.overflow,'clip');assert.ok(initial.rows.length>=3);assert.equal(initial.scroll,0);
   assert.deepEqual((await state()).obsoleteKeys,[]);
   assert.deepEqual(await page.evaluate(()=>window.pickerFixture.obsoleteRequests),[]);
   assert.deepEqual(await order(0),['a','b','choice','c','d','e']);
@@ -156,6 +169,51 @@ try {
   await reset();await chip('c').click();await frames();assert.equal((await state()).panes[0].shown,'c');
   assert.equal(await pane(0).locator('[data-test-input]').inputValue(),'unchanged draft 0');
   result.checks.push('focus and chooser selection preserve row geometry, exact shown tab and input');
+
+  // Choose the exact width at which chooser + project-C + D fit on row two,
+  // while the first two cards plus the actions still fit on row one. The old
+  // two-column header cannot do this: D remains on a third row.
+  const fullSecondRowWidth=()=>pane(0).evaluate(el=>{
+    const chooser=el.querySelector('[data-pane-chooser-chip]').getBoundingClientRect();
+    const c=el.querySelector('[data-strip-tab-id="c"]').getBoundingClientRect();
+    const d=el.querySelector('[data-strip-tab-id="d"]').getBoundingClientRect();
+    return Math.ceil(chooser.width+c.width+d.width+12+4+16+2+2);
+  });
+  const widthForSecondRow=await fullSecondRowWidth();
+  const setWidth=async width=>{await page.locator('[data-pane-width]').fill(String(width));await frames();};
+  const assertHeaderGeometry=async(label,{mustUseActionsColumn=false}={})=>{
+    const m=await measure();result.samples.push({label,...m});
+    const first=m.cards.filter(c=>c.y<m.actions.bottom-1);
+    assert.ok(first.length>0,label+': real chips remain beside first-row actions');
+    assert.ok(first.every(c=>c.x+c.w<=m.actions.left-5),label+': first row avoids buttons');
+    assert.ok(m.cards.every(c=>c.x+c.w<=m.paneRight-7),label+': cards stay within pane');
+    assert.equal(m.belowHeaderHit,false,label+': header hit region cannot cover content below its published height');
+    const rowBelow=m.cards.filter(c=>c.y>=m.actions.bottom-1);
+    if(mustUseActionsColumn)assert.ok(rowBelow.some(c=>c.x+c.w>m.actions.left+4),label+': later rows use width below buttons');
+    const h=await pane(0).locator('[data-split-attach-row]').boundingBox();
+    assert.ok(Math.abs(m.content-(h.y+Math.ceil(h.height)))<1,label+': published height follows full header');
+    const pairs=m.cards.flatMap((a,i)=>m.cards.slice(i+1).map(b=>({a,b})));
+    assert.ok(pairs.every(({a,b})=>a.x+a.w<=b.x+.1||b.x+b.w<=a.x+.1||a.y+a.h<=b.y+.1||b.y+b.h<=a.y+.1),label+': cards never overlap');
+    return m;
+  };
+  await reset();await page.locator('[data-add-hidden]').click();await frames();
+  assert.equal(await pane(0).locator('[data-hidden-window-picker-button]').count(),1);
+  await setWidth(widthForSecondRow);
+  const reclaimed=await assertHeaderGeometry('first-row-only reservation',{mustUseActionsColumn:true});
+  assert.equal(reclaimed.cards.find(x=>x.id==='c').y,reclaimed.cards.find(x=>x.id==='d').y,'C and D fit beside chooser on the full-width second row');
+  assert.equal(reclaimed.chooserY,reclaimed.cards.find(x=>x.id==='c').y,'chooser and real cards share the same row top');
+  await page.screenshot({path:path.join(artifact,'actions-first-row-only.png')});
+  await chip('g').click();await frames();
+  const reserved=await assertHeaderGeometry('unfocused reservation',{mustUseActionsColumn:true});
+  assert.deepEqual(reserved.cards,reclaimed.cards);assert.equal(reserved.header,reclaimed.header);
+  result.checks.push('only first row reserves actions; second row fills beneath buttons, focus does not rewrap, published content offset follows');
+
+  for (const width of [320,470,widthForSecondRow]) {await setWidth(width);await assertHeaderGeometry('resize '+width);}
+  await page.locator('[data-large-font]').click();await frames();await setWidth(await fullSecondRowWidth());await assertHeaderGeometry('font22',{mustUseActionsColumn:true});
+  await page.locator('[data-zero-gap]').click();await frames();await assertHeaderGeometry('font22-gap0',{mustUseActionsColumn:true});
+  await page.screenshot({path:path.join(artifact,'actions-large-gap0.png')});
+  await reset();await setWidth(410);
+  result.checks.push('browser reflow handles resize, large live font and zero badge gap without packing JS or overlapping actions');
 
   await item('a').hover();await page.mouse.wheel(0,150);await frames();assert.equal((await measure()).scroll,0);
   // Clip also rejects programmatic scroll for very long single items.

@@ -47,6 +47,15 @@ const http2 = require('http2');
 const url = require('url');
 const path = require('path');
 const srcMainDir = __dirname;
+const { AgentSendQueue } = require(path.join(srcMainDir, 'agent-send-queue'));
+const { importMobileUploads, uploadPathKey, createOwnedAttachmentSnapshot,
+  bindOwnedAttachmentSnapshot, attachmentOwnershipReceipt } = require(path.join(srcMainDir, 'owned-mobile-attachments'));
+const { buildCodexImagePastePlan } = require(path.join(srcMainDir, 'codex-image-transport'));
+const { imagePresentationFromReceipt } = require(path.join(srcMainDir, 'history-authoring-projection'));
+const { completionNotificationCapability, completionNotificationRequest } = require(path.join(srcMainDir, 'tab-completion-notification-api'));
+const { codexGoalCapability, codexGoalActionRequest } = require(path.join(srcMainDir, 'codex-goal-action-api'));
+const { HistoryFreshness, historyFreshnessScopeKey } = require(path.join(srcMainDir, 'history-freshness'));
+const { isLocalSlashCommandPrompt } = require(path.join(srcMainDir, 'agent-history-send-receipt'));
 const { TabMessageService, formatTabMessagePrompt } = require(path.join(srcMainDir, 'tab-messages'));
 const { compactTabMessage, handleTabMessageApi } = require(path.join(srcMainDir, 'tab-message-api'));
 const { messageRuntimeIdentity, scenarioDestination, identityUnavailable } = require(path.join(srcMainDir, 'agent-message-identity'));
@@ -69,7 +78,7 @@ const { resolveAiToolOwner } = require('./ai-tool-owner');
 const { prepareReusedInboxTab } = require('./inbox-tab-reuse');
 const { prepareClosedCodexSettings } = require('./closed-codex-settings');
 const { resolveSavedPromptComposition } = require('./saved-prompt-resolution');
-const { historyReadSession } = require('./history-read-session');
+const { historyReadSession, historyReadOwnerFromProjection } = require('./history-read-session');
 const { resolveClaudeWatcherRuntime } = require('./claude-watcher-runtime');
 const { readInboxResult } = require('./inbox-result-reader');
 const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
@@ -393,10 +402,15 @@ let startupInterruptedSnapshot = null;
 let answerClaudeQuestion = null;
 let getClaudePendingQuestion = null;
 let transcriptService = null;
+let publicHistoryFreshness = null;
+const historyFreshnessCapability = Object.freeze({ version: 1, providers: ['claude','codex'],
+  endpoint: '/api/history-freshness', maxTabs: 32, historyQuery: { freshness: 'v1' },
+  event: 'history-freshness', ordering: 'epoch-sequence', outcomeCoverage: false });
 let getAgentTurnResult = null;
 let getAgentExecutionContext = null;
 let readAgentLifecycleIdentity = null;
 let readAgentRuntimeSnapshot = null;
+let codexGoalActions = null;
 let stopAgentProcess = null;
 let readAgentParams = null;
 let agentParamsService = null;
@@ -411,6 +425,8 @@ let readAgentStartReadiness = null;
 // clients (GT Editor) see the exact same paths/order as the desktop picker.
 let projectPromptCatalog = null;
 let savedPromptService = null;
+let systemPromptService = null;
+const { handleSystemPromptApi } = require('./system-prompt-api');
 // Main-owned Codex process/writer resolver. Renderer state and SQLite are not
 // authoritative for a live rollout, so web routes fall back to this callback
 // when the bridge is unavailable instead of publishing the saved resume ID.
@@ -473,6 +489,10 @@ let externalResearchCoordinator = null;
 // in-memory registry below only joins concurrent callers and projects the
 // current-process waiter; it must never recreate retry authority after restart.
 let agentSendReceiptStore = null;
+let agentSendQueue = null;
+let sendQueueRendererReady = false;
+const sendQueueRendererOwners = new Set();
+let sendQueueRecoveryReady = false;
 let tabMessageService = null;
 let tabMessageSdkSessions = null;
 let orchestrationCompletionContentStore = null;
@@ -924,6 +944,7 @@ function claudeMaterializationFor(sessionId, cwd) {
 const MOBILE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 const MOBILE_ATTACHMENT_PREVIEW_MAX_BYTES = 12 * 1024 * 1024;
 const mobileAttachmentIndex = new Map();
+let mobileAttachmentAssetStore = null;
 
 function mobileAttachmentRoot() {
   return path.join(app.getPath('temp'), 'noted-terminal-mobile-attachments');
@@ -1032,7 +1053,25 @@ function sendAttachmentError(code, message, statusCode = 400) {
   const error = new Error(message || code);
   error.code = code;
   error.statusCode = statusCode;
+  error.submitted = false;
+  error.pasteWritten = false;
+  error.enterWritten = false;
   return error;
+}
+
+function findOwnedMobileUpload(sourcePath, assetId = null) {
+  if (typeof agentSendQueue === 'undefined' || !agentSendQueue) return null;
+  const exact = agentSendQueue.ownedUploadRef(sourcePath, assetId);
+  if (exact) return exact;
+  const root = path.resolve(mobileAttachmentRoot());
+  let physicalRoot = root;
+  try { physicalRoot = fs.realpathSync(root); } catch {}
+  const candidate = path.resolve(sourcePath);
+  const prefix = [root, physicalRoot].find(base => candidate.startsWith(base + path.sep));
+  if (!prefix) return null;
+  const parts = path.relative(prefix, candidate).split(path.sep);
+  if (parts.length !== 2) return null;
+  return agentSendQueue.ownedUploadRef(null, assetId, parts.join('/'));
 }
 
 function normalizeSendAttachments(attachments, { strict = false } = {}) {
@@ -1060,11 +1099,13 @@ function normalizeSendAttachments(attachments, { strict = false } = {}) {
       continue;
     }
     const resolved = path.resolve(rawPath);
-    if (!resolved.startsWith(path.resolve(root) + path.sep)) {
+    const retained = typeof findOwnedMobileUpload === 'function' ? findOwnedMobileUpload(rawPath, item.assetId || null) : null;
+    if (!retained && !resolved.startsWith(path.resolve(root) + path.sep)
+      && !(strict && (() => { try { return resolved.startsWith(fs.realpathSync(root) + path.sep); } catch { return false; } })())) {
       if (strict) throw sendAttachmentError('attachment_path_outside_owner', 'attachment path is outside the managed upload root', 403);
       continue;
     }
-    if (!fs.existsSync(resolved)) {
+    if (!retained && !fs.existsSync(resolved)) {
       if (strict) throw sendAttachmentError('attachment_missing', 'uploaded attachment is no longer available', 410);
       continue;
     }
@@ -1072,7 +1113,8 @@ function normalizeSendAttachments(attachments, { strict = false } = {}) {
     const mimeType = cleanOptionalString(item?.mimeType || known?.mimeType, 'application/octet-stream');
     const kind = normalizeMobileAttachmentKind(item?.kind || known?.kind, mimeType);
     const size = Number(item?.size || known?.size || 0) || 0;
-    normalized.push({ id, kind, name, mimeType, size, path: resolved });
+    normalized.push({ id, kind, name, mimeType, size, path: resolved,
+      ...(typeof item.assetId === 'string' && item.assetId ? { assetId: item.assetId } : {}) });
   }
   return normalized;
 }
@@ -1083,6 +1125,21 @@ async function readMobileAttachmentPreview(payload) {
     const err = new Error('absolute attachment path required');
     err.statusCode = 400;
     throw err;
+  }
+  const owned = typeof findOwnedMobileUpload === 'function' ? findOwnedMobileUpload(rawPath, payload?.assetId || null) : null;
+  if (owned?.ambiguous) throw sendAttachmentError('attachment_upload_identity_ambiguous', 'assetId is required for this captured upload', 409);
+  if (payload?.assetId && !owned) throw sendAttachmentError('attachment_upload_identity_mismatch', 'assetId does not belong to this upload path', 403);
+  if (owned && mobileAttachmentAssetStore) {
+    let materialized;
+    try { materialized = await mobileAttachmentAssetStore.verifyOwnedRef(owned, { touch: true }); }
+    catch { throw sendAttachmentError('attachment_missing', 'owned attachment is no longer available', 410); }
+    const result = { id: owned.uploadId, kind: owned.kind, name: owned.name,
+      mimeType: owned.mediaType, size: owned.size, path: owned.sourcePath,
+      sourcePath: owned.sourcePath, assetId: owned.assetId };
+    if (owned.kind === 'image' && owned.size <= MOBILE_ATTACHMENT_PREVIEW_MAX_BYTES) {
+      result.dataBase64 = (await fs.promises.readFile(materialized.path)).toString('base64');
+    }
+    return result;
   }
   const root = path.resolve(mobileAttachmentRoot());
   const resolved = path.resolve(rawPath);
@@ -1125,14 +1182,27 @@ async function readMobileAttachmentPreview(payload) {
   return result;
 }
 
-function appendAttachmentsToPrompt(prompt, attachments, { strict = false } = {}) {
+function appendAttachmentsToPrompt(prompt, attachments, { strict = false, includeFileRanges = false } = {}) {
   const cleanPrompt = String(prompt || '').trim();
   const normalized = normalizeSendAttachments(attachments, { strict });
   if (!normalized.length) return { prompt: cleanPrompt, attachments: [] };
+  const remainingMarkers = new Map();
+  const prefixImageBindings = [], bodyImageBindings = [];
   const imageMarkers = normalized
     .filter((attachment) => attachment.kind === 'image')
-    .map((attachment) => '[imagePath: ' + attachment.path + ']')
-    .filter((marker) => !cleanPrompt.includes(marker));
+    .filter((attachment) => {
+      const marker = '[imagePath: ' + attachment.path + ']';
+      if (!includeFileRanges) return !cleanPrompt.includes(marker);
+      const next = remainingMarkers.get(marker) || 0;
+      const at = cleanPrompt.indexOf(marker, next);
+      const binding = { refIndex: normalized.indexOf(attachment), marker };
+      if (at >= 0) {
+        remainingMarkers.set(marker, at + marker.length);
+        bodyImageBindings.push({ ...binding, start: at }); return false;
+      }
+      prefixImageBindings.push(binding);
+      return true;
+    }).map(attachment => '[imagePath: ' + attachment.path + ']');
   const lines = normalized.filter((attachment) => attachment.kind !== 'image').map((att) => {
     const sizePart = att.size ? ', ' + Math.ceil(att.size / 1024) + ' KB' : '';
     const meta = [att.kind, att.mimeType].filter(Boolean).join(', ');
@@ -1142,16 +1212,42 @@ function appendAttachmentsToPrompt(prompt, attachments, { strict = false } = {})
     'Attached files from iOS are already uploaded to this Mac. Read them from these local paths if relevant:',
     ...lines,
   ].filter((line, index) => index === 0 ? lines.length > 0 : true).join('\n');
+  const withRanges = result => {
+    if (!includeFileRanges) return result;
+    const fileRanges = [];
+    let prefixAt = 0;
+    const imageRanges = prefixImageBindings.map(binding => {
+      const range = { start: prefixAt, end: prefixAt + binding.marker.length, refIndex: binding.refIndex };
+      prefixAt += binding.marker.length + 2; return range;
+    });
+    for (const binding of bodyImageBindings) imageRanges.push({
+      start: prefixAt + binding.start, end: prefixAt + binding.start + binding.marker.length, refIndex: binding.refIndex,
+    });
+    let after = result.prompt.indexOf('Attached files from iOS are already uploaded to this Mac');
+    for (const [index, att] of normalized.filter(item => item.kind === 'file').entries()) {
+      const line = lines[index];
+      let at = result.prompt.indexOf(line, Math.max(0, after));
+      if (at < 0) {
+        at = result.prompt.length + 1;
+        result.prompt += '\n' + line;
+      }
+      const start = at + line.indexOf(att.path);
+      fileRanges.push({ start, end: start + att.path.length, sourcePath: att.path, line,
+        refIndex: normalized.indexOf(att) });
+      after = at + line.length;
+    }
+    return { ...result, fileRanges, imageRanges };
+  };
   if (cleanPrompt.includes('Attached files from iOS are already uploaded to this Mac')) {
-    return {
+    return withRanges({
       prompt: [...imageMarkers, cleanPrompt].filter(Boolean).join('\n\n'),
       attachments: normalized,
-    };
+    });
   }
-  return {
+  return withRanges({
     prompt: [...imageMarkers, cleanPrompt, attachmentBlock].filter(Boolean).join('\n\n'),
     attachments: normalized,
-  };
+  });
 }
 
 function inboxAttachmentPresentationSnapshot(snapshot, attachments) {
@@ -1170,6 +1266,65 @@ function inboxAttachmentPresentationSnapshot(snapshot, attachments) {
   return promptChips.length || semanticTags.length || imagePaths.length
     ? { promptChips, semanticTags, imagePaths }
     : null;
+}
+
+async function prepareMobileSendOwnership({ tabId, handoffId, operationKey, requestFingerprint,
+  prompt, attachments, fileRanges, imageRanges = [], presentationSnapshot }) {
+  if (!mobileAttachmentAssetStore || !agentSendQueue) return null;
+  const root = path.resolve(mobileAttachmentRoot());
+  const physicalRoot = await fs.promises.realpath(root).catch(() => root);
+  const isUpload = sourcePath => [root, physicalRoot].some(base => String(sourcePath).startsWith(base + path.sep));
+  const candidates = [...(attachments || [])];
+  const declaredImages = presentationSnapshot?.authoringTransport ? presentationSnapshot.imagePaths : null;
+  // Reuse the SAME image grammar as physical Send. A plain local/GT path is
+  // not import authority. Legacy mobile image markers already name upload refs.
+  const images = buildCodexImagePastePlan(prompt, sourcePath => ({
+    success: true, path: sourcePath, inputPath: sourcePath,
+  }), { authoringTransport: presentationSnapshot?.authoringTransport || null, includeSourceRanges: true });
+  const imageParts = images.segments.filter(segment => segment.kind === 'image');
+  if (declaredImages && declaredImages.length !== imageParts.length) {
+    throw sendAttachmentError('attachment_authoring_changed', 'image occurrence proof changed', 409);
+  }
+  const imageRefIndexes = [];
+  for (const [index, part] of imageParts.entries()) {
+    const declared = declaredImages?.[index];
+    if (declared && declared.path !== part.sourcePath) throw sendAttachmentError('attachment_authoring_changed', 'image occurrence path changed', 409);
+    if (!isUpload(part.sourcePath)) { imageRefIndexes.push(-1); continue; }
+    const formatted = !declaredImages && imageRanges.find(range => range.start === part.sourceRange.start && range.end === part.sourceRange.end);
+    let refIndex = formatted ? formatted.refIndex : candidates.findIndex(ref => ref.path === part.sourcePath && ref.kind === 'image'
+      && (!declared || (ref.assetId || null) === (declared.assetId || null)));
+    if (refIndex < 0) {
+      refIndex = candidates.length;
+      candidates.push({ path: part.sourcePath, kind: 'image', name: path.basename(part.sourcePath),
+        mimeType: declared?.mediaType || inferMobileAttachmentMimeType(part.sourcePath), id: '',
+        ...(declared?.assetId ? { assetId: declared.assetId } : {}) });
+    }
+    imageRefIndexes.push(refIndex);
+  }
+  if (!candidates.length) return null;
+  const retained = await importMobileUploads({ rootDir: root, attachments: candidates, assetStore: mobileAttachmentAssetStore,
+    resolveRetained: findOwnedMobileUpload });
+  try {
+    const snapshot = createOwnedAttachmentSnapshot({ tabId, handoffId, operationKey,
+      requestFingerprint, prompt, refs: retained.refs, fileRanges: fileRanges || [],
+      imageRefIndexes,
+      authoringTransport: presentationSnapshot?.authoringTransport || null });
+    const imagePaths = snapshot.ranges.filter(range => snapshot.refs[range.refIndex].kind === 'image')
+      .map((range, index) => { const ref = snapshot.refs[range.refIndex]; return {
+        id: index + 1, path: ref.sourcePath, assetId: ref.assetId,
+        mediaType: ref.mediaType, size: ref.size, availability: 'available',
+      }; });
+    // Existing authored refs (including non-mobile images) stay ordered; only
+    // their proven upload asset metadata is enriched.
+    const oldRefs = presentationSnapshot?.imagePaths;
+    const presentedImages = Array.isArray(oldRefs) && oldRefs.length
+      ? oldRefs.map((ref, index) => { const owned = declaredImages ? snapshot.refs[imageRefIndexes[index]]
+        : snapshot.refs.find(value => value.kind === 'image' && value.sourcePath === ref.path && (!ref.assetId || value.assetId === ref.assetId));
+        return owned ? { ...ref, assetId: owned.assetId, size: owned.size } : ref; })
+      : imagePaths;
+    return { snapshot, release: retained.release,
+      presentationSnapshot: { ...(presentationSnapshot || {}), imagePaths: presentedImages } };
+  } catch (error) { retained.release(); throw error; }
 }
 
 async function resolveInboxAttachmentPrompt(prompt, attachments) {
@@ -2404,9 +2559,14 @@ function externalRunStatusFromDurableRecord(record) {
 }
 
 function durableAgentSendReplay(record, overrides = {}) {
-  const receipt = record?.receipt && typeof record.receipt === 'object'
+  const applicationQueued = typeof agentSendQueue !== 'undefined' && agentSendQueue?.receipt(record?.operationKey);
+  if (applicationQueued) return { ...applicationQueued, ...overrides, replayed: true };
+  const storedReceipt = record?.receipt && typeof record.receipt === 'object'
     ? record.receipt
     : {};
+  const receipt = storedReceipt.ownedAttachments
+    ? { ...storedReceipt, attachmentOwnership: attachmentOwnershipReceipt(storedReceipt.ownedAttachments) }
+    : storedReceipt;
   const state = record?.state || 'delivery-unknown';
   if (durableRecordHasProviderQueueAcceptance(record)
     && (state === 'enter-armed' || state === 'audit-pending' || state === 'delivery-unknown')) {
@@ -2498,6 +2658,7 @@ function durableAgentSendReplay(record, overrides = {}) {
 }
 
 function publicAgentSendReceipt(record) {
+  if (typeof agentSendQueue !== 'undefined' && agentSendQueue) record = agentSendQueue.projectRecord(record);
   const replay = durableAgentSendReplay(record, {
     operationKey: record.operationKey,
     attemptId: record.attemptId || null,
@@ -2519,6 +2680,7 @@ function publicAgentSendReceipt(record) {
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
     settledAt: record.settledAt || null,
+    ...(record.applicationQueue ? { applicationQueue: record.applicationQueue } : {}),
     exactAuditConfirmed: record.state === 'confirmed',
     entryUuid: record.auditIdentity?.entryUuid || null,
     auditEntryUuid: record.auditIdentity?.entryUuid || null,
@@ -2556,16 +2718,49 @@ function durableAgentSendFailure(verdict, { tabId, handoffId } = {}) {
 }
 
 let tabWorkContext = null;
+let projectCardSignals = null;
+
+function projectCardsSnapshot(projectId, tabs) {
+  if (!projectCardSignals) return {};
+  try {
+    const startedAt = Date.now();
+    const cardSignals = projectCardSignals.snapshot(projectId, tabs.map(tab => tab.tabId));
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs >= 20) console.log('[CardSignals] read project=' + String(projectId).slice(-16)
+      + ' revision=' + cardSignals.revision + ' tabs=' + cardSignals.tabs.length + ' durationMs=' + elapsedMs);
+    return { cardSignals };
+  } catch (error) {
+    console.warn('[CardSignals] read failed project=' + String(projectId).slice(-16) + ' reason=' + String(error.code || error.message));
+    return { cardSignals: { version: 1, projectId, epoch: projectCardSignals.wake().epoch,
+      revision: projectCardSignals.wake().revision, unavailable: true, reason: 'metadata-read-failed' } };
+  }
+}
 
 async function runAgentSendScenario(args) {
   if (!args.handoffId) args = { ...args, handoffId: 'context-send:' + crypto.randomUUID() };
+  // Capture the intended conversation at admission, not when a later slot is
+  // finally dispatched. Runtime/writer proof is still obtained by the scenario.
+  if (!args.expectedTarget && typeof agentSendQueue !== 'undefined' && agentSendQueue) {
+    const admitted = args.sendOperationKey && agentSendQueue.item(args.sendOperationKey);
+    const target = findOrchestrationTabDescriptor(args.tabId);
+    if (admitted) {
+      const original = JSON.parse(admitted.request_json);
+      args = { ...args, expectedTarget: original.expectedTarget || null };
+    } else if (target?.sessionId && ['claude','codex'].includes(target.toolType)) {
+      args = { ...args, expectedTarget: { toolType: target.toolType, sessionId: target.sessionId } };
+    }
+  }
   const prepared = tabWorkContext && args.workContextPrepared !== true
     ? await tabWorkContext.prepare(args.tabId, args.handoffId, args.prompt)
     : { prompt: args.prompt };
   try {
     const presentationSnapshot = bindStructuredAuthoringPresentation(args.presentationSnapshot, args.authoringSourcePrompt ?? args.prompt, prepared.prompt);
-    const result = await runPreparedAgentSendScenario({ ...args, prompt: prepared.prompt, presentationSnapshot });
-    tabWorkContext?.settle(args.tabId, args.handoffId, result);
+    const ownedAttachments = args.ownedAttachments
+      ? bindOwnedAttachmentSnapshot(args.ownedAttachments, args.prompt, prepared.prompt,
+        { prefix: prepared.prefix || '', authoringTransport: presentationSnapshot?.authoringTransport || null }) : null;
+    const result = await runPreparedAgentSendScenario({ ...args, prompt: prepared.prompt, presentationSnapshot,
+      ...(ownedAttachments ? { ownedAttachments } : {}) });
+    if (result?.applicationQueued !== true) tabWorkContext?.settle(args.tabId, args.handoffId, result);
     return result;
   } catch (error) {
     if (error?.submitted === false) tabWorkContext?.release(args.tabId, args.handoffId);
@@ -2573,7 +2768,8 @@ async function runAgentSendScenario(args) {
   }
 }
 
-async function runPreparedAgentSendScenario({
+async function runPreparedAgentSendScenario(args) {
+  const {
   tabId,
   prompt,
   model,
@@ -2587,6 +2783,7 @@ async function runPreparedAgentSendScenario({
   ownership,
   presentationSnapshot,
   authoringSnapshot = null,
+  ownedAttachments = null,
   provider,
   sessionId,
   sendOperationKey,
@@ -2598,7 +2795,9 @@ async function runPreparedAgentSendScenario({
   requireLive = false,
   timeoutMs = agentSendBridgeTimeoutMs,
   onLateReceipt = null,
-}) {
+  applicationQueueAcceptedResponse = false,
+  applicationQueueExecution = false,
+  } = args;
   // A restart may have left an Enter-armed operation whose exact transcript
   // proof is still being reconciled. Never reserve/replay that operation until
   // the single bounded startup pass has settled its durable truth.
@@ -2639,6 +2838,27 @@ async function runPreparedAgentSendScenario({
   }
 
   if (durableIdentity) {
+    if (typeof agentSendQueue !== 'undefined' && agentSendQueue && !applicationQueueExecution
+      && ['claude', 'codex'].includes(provider) && !isLocalSlashCommandPrompt(prompt)
+      && findOrchestrationTabDescriptor(tabId)?.tabType !== 'claude-sdk') {
+      const { prepareSend: _prepare, onLateReceipt: _late, ...request } = args;
+      const admitted = agentSendQueue.enqueue({ identity: durableIdentity, request,
+        execute: typeof prepareSend === 'function' || typeof onLateReceipt === 'function' ? async scope => {
+          const receipt = await runPreparedAgentSendScenario({ ...args, applicationQueueExecution: true,
+            sendRequestFingerprint: scope.requestFingerprint,
+            ...(scope.expectedTarget ? { expectedTarget: scope.expectedTarget } : {}),
+          });
+          tabWorkContext?.settle(tabId, handoffId, receipt);
+          return receipt;
+        } : undefined,
+      });
+      if (!admitted.ok) return durableAgentSendFailure(admitted, { tabId, handoffId });
+      if (admitted.receipt && applicationQueueAcceptedResponse) return admitted.receipt;
+      const record = admitted.item?.state === 'waiting'
+        ? await agentSendQueue.result(sendOperationKey) : admitted.record;
+      return durableAgentSendReplay(record, { operationKey: sendOperationKey,
+        attemptId: record?.attemptId || null, tabId, handoffId });
+    }
     const reservation = agentSendReceiptStore.reserveOrGet(durableIdentity);
     if (!reservation?.ok) {
       return durableAgentSendFailure(reservation, { tabId, handoffId });
@@ -2663,6 +2883,7 @@ async function runPreparedAgentSendScenario({
     let durableAttemptId = null;
     let result;
     let preparedTarget = null;
+    let admittedExpectedTarget = expectedTarget;
     try { tabWorkContext?.assertContinuationScope?.(tabId, handoffId); }
     catch (error) { result = { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
     if (!result && typeof prepareSend === 'function') {
@@ -2694,13 +2915,32 @@ async function runPreparedAgentSendScenario({
       try {
         const currentTarget = typeof readAgentRuntimeSnapshot === 'function'
           ? await readScenarioDestination(tabId) : findOrchestrationTabDescriptor(tabId);
-        result = agentSendTargetPreconditionFailure(expectedTarget, currentTarget);
+        // A first-turn/Resume launch can be input-ready before its writer SID
+        // exists. The common readiness + physical boundary prove the original
+        // SID later; an early null is not evidence of a different conversation.
+        const provisionalLocalCommand = currentTarget?.toolType === 'codex'
+          && !currentTarget.sessionId && !!currentTarget.terminalInstanceId && !!currentTarget.launchId
+          && isLocalSlashCommandPrompt(prompt);
+        result = agentSendTargetPreconditionFailure((applicationQueueExecution || provisionalLocalCommand) && !currentTarget?.sessionId
+          ? { ...expectedTarget, sessionId: null } : expectedTarget, currentTarget);
+        if (!result && provisionalLocalCommand) {
+          // This is admission to the existing local-command proof, NOT input
+          // permission. Keep the requested SID and bind the observed process;
+          // Main must still prove its exact provisional Resume at every write.
+          admittedExpectedTarget = Object.freeze({ ...expectedTarget,
+            terminalInstanceId: expectedTarget.terminalInstanceId || currentTarget.terminalInstanceId,
+            launchId: expectedTarget.launchId || currentTarget.launchId });
+        }
       } catch (error) {
         result = { success: false, accepted: false, submitted: false, status: 'not-submitted',
           code: error.code || 'agent_send_target_unavailable', error: error.message, httpStatus: 503 };
       }
     }
     if (!result && durableIdentity) {
+      if (applicationQueueExecution && agentSendQueue?.item(sendOperationKey)?.state === 'cancelled') {
+        return { success: false, accepted: false, submitted: false, pasteWritten: false,
+          code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' };
+      }
       const begun = agentSendReceiptStore.beginAttempt(durableIdentity);
       if (!begun?.ok) {
         return durableAgentSendFailure(begun, { tabId, handoffId });
@@ -2718,7 +2958,8 @@ async function runPreparedAgentSendScenario({
         // Persist the immutable destination on the same attempt. The physical
         // PTY boundary rechecks it; no renderer-only lease or new side registry.
         const staged = agentSendReceiptStore.stageAttemptContext(sendOperationKey, durableAttemptId, {
-          expectedTarget,
+          expectedTarget: admittedExpectedTarget,
+          ...(ownedAttachments ? { ownedAttachments } : {}),
         });
         if (staged?.ok !== true) result = {
           success: false, accepted: false, submitted: false, pasteWritten: false,
@@ -2729,6 +2970,11 @@ async function runPreparedAgentSendScenario({
       if (!result && expectedTarget?.expectedBinding === 'none') {
         try { conversationOwners.claimSend(tabId, expectedTarget, { sendOperationKey, sendAttemptId: durableAttemptId }); }
         catch (error) { result = { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
+      }
+      if (!result && ownedAttachments && !expectedTarget) {
+        const staged = agentSendReceiptStore.stageAttemptContext(sendOperationKey, durableAttemptId, { ownedAttachments });
+        if (staged?.ok !== true) result = { success: false, submitted: false, pasteWritten: false,
+          code: 'attachment_context_not_durable', error: 'Attachment ownership could not be staged.' };
       }
     }
     const settleLateBridgeReceipt = async ({ ok, data, error }) => {
@@ -2769,7 +3015,7 @@ async function runPreparedAgentSendScenario({
         expectedToolType: expectedTarget?.toolType || target?.toolType || provider || null,
         expectedTabType: target?.tabType || null,
         expectedSessionId: expectedTarget?.sessionId || null,
-        ...(expectedTarget ? { expectedTarget } : {}),
+        ...(admittedExpectedTarget ? { expectedTarget: admittedExpectedTarget } : {}),
         ...(expectedTarget?.expectedBinding === 'none' ? { expectedBinding: 'none' } : {}),
         requireLive,
         prompt,
@@ -2884,8 +3130,15 @@ async function runPreparedAgentSendScenario({
         }
       }
     }
+    if (durableIdentity && !durableAttemptId && result?.submitted === false) {
+      // This branch has not begun an attempt or crossed the renderer bridge.
+      // Persist its explicit refusal on the same receipt instead of leaving
+      // a failed local command in preparing/delivery-unknown after restart.
+      agentSendReceiptStore.settleQueuedNoWrite(sendOperationKey, result);
+    }
     return {
       ...(result || {}),
+      ...(ownedAttachments ? { attachmentOwnership: attachmentOwnershipReceipt(ownedAttachments) } : {}),
       ...(sendOperationKey ? { operationKey: sendOperationKey } : {}),
       ...(durableAttemptId ? { attemptId: durableAttemptId } : {}),
     };
@@ -3025,6 +3278,16 @@ async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
       return { kind: 'accepted', receiptState: provenReceiptState, run: await store.get(runId) };
     }
     const recoveryPolicy = orchestrationSendFailureRecoveryPolicy(sendResult);
+    if (recoveryPolicy.provenNotSent && sendResult?.cancelled === true) {
+      const cancelled = await store.cancel(runId, {
+        reason: 'target-send-cancelled-before-submit', suppressNotification: false,
+      });
+      console.log('[OrchestrationDelivery] cancelled before submit run=' + runId
+        + ' target=' + String(current.targetTabId || '').slice(-12));
+      emitOrchestrationChanges(cancelled.changed, reason + '-send-cancelled');
+      await finalizeSettledOrchestrations(cancelled.settled, reason + '-send-cancelled');
+      return { kind: 'send-cancelled', receiptState: sendReceipt.state, run: await store.get(runId) };
+    }
     if (recoveryPolicy.provenNotSent) {
       await store.resetDeferredDelivery(runId, 'send-refused-before-submit');
       console.warn('[OrchestrationDelivery] exact pre-submit failure run=' + runId
@@ -3720,14 +3983,76 @@ async function resolveHistorySessionInfo(tabId, timeoutMs = 1500) {
     const runtime = resolveCodexRuntimeProjectionBatch([
       { tabId, savedSessionId: persisted.sessionId || null },
     ], persisted.projectId || null)?.[tabId];
-    return historyReadSession({ ...persisted, ...(runtime || {}),
-      sessionId: runtime?.sessionId || null,
-      readSessionId: runtime?.readSessionId || null,
-      writerSessionId: runtime?.provenWriterSessionId || null,
-      writerConfirmed: runtime?.writerConfirmed === true,
-    });
+    return historyReadOwnerFromProjection(persisted, runtime, true);
   }
   return historyReadSession(await resolveAgentSessionInfo(tabId, timeoutMs));
+}
+
+function historyFreshnessReadOwners(tabIds) {
+  const db = require('./project-manager').db;
+  const rows = db.getHistoryReadTabDescriptors(tabIds).map(row => {
+    const toolType = row.tabType === 'claude-sdk' ? null : resolveCurrentPtyAgentOwner(row);
+    return { ...row, toolType, sessionId: toolType === 'codex' ? row.codexSessionId : row.claudeSessionId };
+  });
+  const codex = rows.filter(row => row.toolType === 'codex');
+  const available = typeof resolveCodexRuntimeProjectionBatch === 'function';
+  const projection = available ? resolveCodexRuntimeProjectionBatch(codex.map(row => ({
+    tabId: row.tabId, savedSessionId: row.sessionId || null,
+  })), null) || {} : {};
+  return new Map(rows.map(row => [row.tabId,
+    historyReadOwnerFromProjection(row, projection[row.tabId], available)
+      || { ...row, sessionId: null }]));
+}
+
+async function readPublicHistoryFreshness(tabIds) {
+  const owner = publicHistoryFreshness;
+  if (!owner) throw Object.assign(new Error('history_freshness_unavailable'), { statusCode: 503 });
+  const started = Date.now();
+  const scopes = historyFreshnessReadOwners(tabIds);
+  const snapshots = new Array(tabIds.length); let index = 0;
+  const jobs = Array.from({ length: Math.min(4, tabIds.length) }, async () => {
+    while (index < tabIds.length) {
+      const position = index++, tabId = tabIds[position];
+      const scope = scopes.get(tabId) || { tabId };
+      const budget = Math.min(1000, 2000 - (Date.now() - started));
+      snapshots[position] = budget > 0 ? await owner.probe(scope, budget)
+        : owner.envelope(scope, 'unknown', { reason: 'batch-budget-exceeded', revalidate: true });
+    }
+  });
+  await Promise.all(jobs);
+  const current = historyFreshnessReadOwners(tabIds);
+  for (let i = 0; i < tabIds.length; i++) {
+    const scope = current.get(tabIds[i]) || { tabId: tabIds[i] };
+    if (historyFreshnessScopeKey(scope) !== historyFreshnessScopeKey(scopes.get(tabIds[i]) || { tabId: tabIds[i] })) {
+      snapshots[i] = owner.envelope(scope, 'unknown', { reason: 'read-owner-changed', revalidate: true });
+    }
+  }
+  const result = { ok: true, epoch: owner.epoch, snapshots };
+  console.log('[HistoryFreshness] batch tabs=' + tabIds.length + ' known='
+    + snapshots.filter(s => s.state === 'known').length + ' bytes=' + Buffer.byteLength(JSON.stringify(result))
+    + ' ms=' + (Date.now() - started));
+  return result;
+}
+
+async function readHistoryFreshnessWindow({ info, readScope, requestedRevision, deltaOk }) {
+  const owner = publicHistoryFreshness;
+  const scope = { ...readScope, readIdentitySource: info.readIdentitySource };
+  const prior = publicHistoryRevisions.lookup(requestedRevision, readScope);
+  const priorCoverage = publicHistoryRevisions.lookupFreshness(requestedRevision, readScope);
+  const head = await owner.probe(scope);
+  if (prior && priorCoverage?.state === 'known' && head.state === 'known'
+    && priorCoverage.epoch === head.epoch && priorCoverage.token === head.token) {
+    return { success: true, unchanged: true, revision: prior, historyFreshness: head };
+  }
+  const ticket = await owner.beginRead(scope);
+  const result = await transcriptService.getHistory({ ...readScope, ifRevision: prior,
+    freshnessProof: true, deltaOk,
+    deltaConsumerId: deltaOk ? 'http:' + crypto.createHash('sha256').update(JSON.stringify(readScope)).digest('hex') : null,
+  });
+  if (!result?.success) return result;
+  const historyFreshness = await owner.bounded(scope, owner.completeRead(scope, result, ticket));
+  const { freshnessReadSources: _sources, freshnessReader: _reader, ...data } = result;
+  return { ...data, historyFreshness };
 }
 
 function findOrchestrationProjectDescriptor(projectId) {
@@ -4138,6 +4463,11 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       prompt: notificationText,
       workContextPrepared: true,
       handoffId: notificationHandoffId,
+      // Reserve the existing History identity before entering the shared FIFO.
+      // Without it the renderer re-admits this same handoff into its caller's
+      // in-memory registry, causing a fingerprint conflict (or a self-join).
+      sendOperationKey: `history:${current.sourceTabId}:${notificationHandoffId}`,
+      sendSurface: 'desktop-history',
       source: 'orchestration-completion:' + current.runId,
       statusAtSend: sourceSendOptions.statusAtSend,
       queue: sourceSendOptions.queue,
@@ -4218,6 +4548,8 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
         await notifyAgentPromptAuditResult({
           tabId: current.sourceTabId,
           handoffId: notificationHandoffId,
+          sendOperationKey: result.operationKey || null,
+          sendAttemptId: result.attemptId || null,
           source: 'orchestration-completion:' + current.runId,
           success: true,
           toolType: audit.executionContext?.provider
@@ -4330,6 +4662,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     || (durablePromotion?.idempotent === true && durablePromotion?.record?.state === 'confirmed');
   if (durableAuditAccepted && durablePromotion?.record?.state === 'confirmed'
     && (durablePromotion.record.receipt?.imageRequestProjection
+      || durablePromotion.record.receipt?.ownedAttachmentProjection
       || durablePromotion.record.provider === 'claude')) {
     try {
       backfillConfirmedCanonicalAuthoringPresentations(
@@ -5835,6 +6168,7 @@ async function finalizeClosedTargetResultProof(runId, {
 
 async function handleOrchestrationTabClosed(tabId) {
   if (!tabId) return [];
+  agentSendQueue?.stop(tabId);
   const store = getOrchestrationRunStore();
   const pendingResultRuns = (await store.listForTab(tabId, { activeOnly: true }))
     .filter((run) => run.targetTabId === tabId
@@ -6117,6 +6451,7 @@ function projectActivitySnapshot(reason = 'snapshot') {
       projects,
       layoutChangedProjectIds: Array.isArray(snap.layoutChangedProjectIds) ? snap.layoutChangedProjectIds : [],
       projectOrderChanged: snap.projectOrderChanged === true,
+      ...(snap.cardSignals ? { cardSignals: snap.cardSignals } : {}),
       ts: snap.ts || Date.now(),
       reason,
     };
@@ -6534,6 +6869,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
       lanIp: getLanIp(),
       service: webServerServiceHealth(),
       capabilities: {
+        ...(projectCardSignals ? { cardSignals: projectCardSignals.capability } : {}),
+        ...(publicHistoryFreshness ? { historyFreshness: historyFreshnessCapability } : {}),
+        completionNotifications: completionNotificationCapability,
+        ...(agentSendQueue ? { sendQueue: { version: 1, providers: ['claude', 'codex'], durable: true,
+          providerPendingLimit: 1, optIn: 'applicationQueue', acceptanceStatus: 'application-queued',
+          ...(mobileAttachmentAssetStore ? { attachmentOwnership: { version: 1, scope: 'mobile-upload',
+            durableBeforeAck: true, images: true, files: true,
+            structuredFiles: { version: 1, partField: 'uploadFiles', rangeUnit: 'utf16',
+              endpoint: '/api/terminal-tabs/:tabId/send' } } } : {}),
+          receiptEndpoint: '/api/terminal-tabs/:tabId/send-receipts' } } : {}),
+        ...(systemPromptService ? { systemPrompts: { version: 1, revision: true, endpoint: '/api/system-prompts', settings: '/api/system-prompts/settings' } } : {}),
         historyRead: { version: 1, view: 'history', conditional: 'ifRevision', delta: true, deltaProviders: ['codex'], settingsBaselineVersion: 1 },
         ...(transcriptService?.getToolPayload ? { historyPayloads: historyPayloadCapability } : {}),
         tabEvents: { version: 1, multiplex: 'tabIds', maxTabs: MAX_EVENT_TABS },
@@ -6545,6 +6891,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           requestId: 'client-stable', operationRead: '/api/terminal-tabs/:tabId/params?operationId=:operationId' } } : {}),
         ...(readAgentRuntimeSnapshot ? { codexRuntimePolicy: { version: 1, dialogs: ['resume-goal', 'usage-exhaustion'],
           liveSettings: true, manualAction: true, background: true } } : {}),
+        ...(codexGoalActions ? { codexGoal: codexGoalCapability } : {}),
         ...(readCodexAuthProfile ? { codexAuthProfile: { version: 1, mode: 'server-profile', readOnly: true, endpoint: '/api/codex-auth-profile' } } : {}),
         nativeRewind: { version: 2, escapeReady: 'committed-frame', wrappedSelection: 'display-rows', postEnterRecovery: 1 },
         ...(savedHistoryOperations ? { savedHistory: { version: 1, providers: savedHistoryOperations.claude ? ['codex', 'claude'] : ['codex'], operations: ['rewind', 'delete'],
@@ -6577,7 +6924,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           kinds: ['catalog', 'custom'],
         },
         loopTaskCompletion: { version: 2, statuses: ['completed', 'blocked'] },
-        tabMessages: { version: 1, durable: true, replyTo: true },
+        tabMessages: { version: 1, durable: true, replyTo: true, dismiss: true },
         orchestrationInlineResults: { version: 1 },
         externalResearchOrchestration: {
           version: 1,
@@ -6895,6 +7242,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         const initialSink = sink.beginInitial(id);
         sendInitialSnapshot(id, initialSink, sdkSessions)
           .then(() => sendTabTimingSnapshot(id, initialSink, 'connect'))
+          .then(() => sendHistoryFreshnessSnapshot(id, initialSink))
           .catch(() => {}).finally(() => initialSink.finish());
         startClaudeTabWatcher(id).catch(() => {});
         startTranscriptSubscriptionForTab(id).catch(() => {});
@@ -6925,6 +7273,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+
+  if (parsed.pathname === '/api/history-freshness' && req.method === 'GET') {
+    let ids;
+    try { ids = eventTabIds(parsed.query); if (!ids) throw new Error('tabIds required'); }
+    catch (error) { return sendJson(res, 400, { ok: false, error: error.message }); }
+    try { return sendJson(res, 200, await readPublicHistoryFreshness(ids)); }
+    catch (error) { return sendJson(res, error.statusCode || 503, { ok: false, error: error.message }); }
+  }
 
   if (parsed.pathname === '/api/codex-auth-profile') {
     if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' });
@@ -7030,6 +7386,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   const projectManager = require('./project-manager');
+
+  if (await handleSystemPromptApi({ req, res, parsed, service: systemPromptService, readBody, sendJson })) return;
 
   if (parsed.pathname === '/api/prompt-library' && req.method === 'GET') {
     if (!savedPromptService) return sendJson(res, 503, { error: 'saved prompt library service unavailable', code: 'app_update_required' });
@@ -8226,7 +8584,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             const { type: _type, ...publicRuntime } = stamped;
             return { ...tab, ...publicRuntime };
           });
-          return sendJson(res, 200, { ...live, tabs });
+          return sendJson(res, 200, { ...live, tabs, ...projectCardsSnapshot(projectId, tabs) });
         }
       } catch (e) {
         // bridge failed, fall through to 404
@@ -8520,6 +8878,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       statusMarker: markerCfg,
       statuses: statusesForClient,
       processBar: processBarCfg,
+      ...projectCardsSnapshot(projectId, tabs),
     });
   }
 
@@ -8641,6 +9000,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/send$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
+    let releaseOwnedUploads = null;
     try {
       const body = await readBody(req);
       const { prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue, attachments } = body;
@@ -8660,23 +9020,69 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const operationHandoffId = cleanOptionalString(handoffId, '')
         || 'project-send:' + crypto.randomUUID();
       const sendOperationKey = `project:${tabId}:${operationHandoffId}`;
+      const uploadRequestFingerprint = fingerprintAgentSendRequest({ tabId, body });
+      const previousQueuedSend = typeof agentSendQueue !== 'undefined' && agentSendQueue
+        ? agentSendQueue.item(sendOperationKey) : null;
+      const previousUploadSnapshot = previousQueuedSend
+        ? JSON.parse(previousQueuedSend.request_json).ownedAttachments : null;
+      if (previousUploadSnapshot) {
+        if (previousUploadSnapshot.requestFingerprint !== uploadRequestFingerprint) {
+          return sendSendFailure(res, durableAgentSendFailure({ action: 'conflict',
+            mismatchedFields: ['requestFingerprint'] }, { tabId, handoffId: operationHandoffId }));
+        }
+        // Replays read the admitted request before path validation, linked-file
+        // rereads, target reopening or import. A removed temp is not a new Send.
+        const replay = publicAgentSendReceipt(agentSendReceiptStore.get(sendOperationKey));
+        if (replay.submitted === false && replay.applicationQueued !== true) return sendSendFailure(res, replay);
+        const pending = replay.applicationQueued === true || replay.auditPending === true || replay.deliveryUnknown === true;
+        return sendJson(res, pending ? 202 : 200, { ok: true, ...replay });
+      }
+      const ownUploads = typeof mobileAttachmentAssetStore !== 'undefined' && mobileAttachmentAssetStore
+        && typeof agentSendQueue !== 'undefined' && agentSendQueue && !previousQueuedSend;
       let structured = null;
       if (body.authoring != null) {
         validateStructuredSendEnvelope(body);
-        structured = await prepareStructuredAuthoring(body.authoring);
+        structured = await prepareStructuredAuthoring(body.authoring, { allowUploadFiles: !!ownUploads });
       }
       const promptPresentation = structured || await resolveSendPromptPresentation(projectManager, body, prompt);
       // Structured snapshots already contain ordered image parts. Do not add
       // upload prefixes or re-resolve saved/context files over those snapshots.
       const sendPayload = structured
-        ? { prompt: structured.prompt, attachments: [] }
-        : appendAttachmentsToPrompt(promptPresentation.prompt, attachments);
+        ? { prompt: structured.prompt, attachments: structured.uploadAttachments || [], fileRanges: structured.uploadFileRanges || [] }
+        : appendAttachmentsToPrompt(promptPresentation.prompt, attachments, { strict: !!ownUploads, includeFileRanges: !!ownUploads });
       // This request is the user's explicit authorization to reopen a closed
       // archived AI tab. Passive lifecycle/reconcile paths never call this.
       const openDescriptor = findOrchestrationTabDescriptor(tabId);
       const restorable = openDescriptor ? null : findRestorableAgentTabDescriptor(tabId);
       const targetProvider = openDescriptor?.toolType
         || (restorable?.ok === true ? restorable.toolType : null);
+      if (structured?.uploadAttachments?.length && (!['codex', 'claude'].includes(targetProvider)
+        || openDescriptor?.tabType === 'claude-sdk')) {
+        throw sendAttachmentError('structured_upload_files_target_unsupported', 'typed uploads require a Claude/Codex terminal target', 400);
+      }
+      if (structured?.uploadAttachments?.length && isLocalSlashCommandPrompt(sendPayload.prompt)) {
+        throw sendAttachmentError('structured_upload_files_local_command', 'standalone commands do not carry upload files', 400);
+      }
+      let sendPresentation = structured?.presentationSnapshot || (promptPresentation.promptChips.length > 0
+        ? { promptChips: promptPresentation.promptChips } : null);
+      let sendAuthoring = structured?.authoringSnapshot || null;
+      let ownedAttachments = null;
+      if (ownUploads && ['codex', 'claude'].includes(targetProvider)
+        && openDescriptor?.tabType !== 'claude-sdk' && !isLocalSlashCommandPrompt(sendPayload.prompt)) {
+        const owned = await prepareMobileSendOwnership({ tabId, handoffId: operationHandoffId,
+          operationKey: sendOperationKey, requestFingerprint: uploadRequestFingerprint,
+          prompt: sendPayload.prompt, attachments: sendPayload.attachments, fileRanges: sendPayload.fileRanges,
+          imageRanges: sendPayload.imageRanges,
+          presentationSnapshot: sendPresentation });
+        if (owned) {
+          ownedAttachments = owned.snapshot; releaseOwnedUploads = owned.release; sendPresentation = owned.presentationSnapshot;
+          if (sendAuthoring) sendAuthoring = { ...sendAuthoring, imagePaths: sendAuthoring.imagePaths.map(ref => {
+            const asset = ref.availability !== 'missing' && owned.snapshot.refs.find(value => value.kind === 'image'
+              && value.sourcePath === ref.path && (!ref.assetId || value.assetId === ref.assetId));
+            return asset ? { ...ref, assetId: asset.assetId, size: asset.size } : ref;
+          }) };
+        }
+      }
       let resolvedModel = model;
       if (targetProvider) {
         const hasExplicitTargetProvider = Boolean(
@@ -8714,10 +9120,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
         sendSurface: 'project-api',
         expectedTarget,
         provider: targetProvider,
-        authoringSnapshot: structured?.authoringSnapshot || null,
-        presentationSnapshot: structured?.presentationSnapshot || (promptPresentation.promptChips.length > 0
-          ? { promptChips: promptPresentation.promptChips }
-          : null),
+        applicationQueueAcceptedResponse: body.applicationQueue === true,
+        restoreClosedTab: true,
+        ...(ownedAttachments ? { ownedAttachments } : {}),
+        authoringSnapshot: sendAuthoring,
+        presentationSnapshot: sendPresentation,
         // A stopped/new Claude prompt can create a new physical session. The
         // exact post-Enter audit binds that session to the receipt.
         sessionId: null,
@@ -8726,6 +9133,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         prepareSend: () => ensureExplicitAgentTabOpen(tabId, restorable),
       });
       const sendReceipt = classifyAgentSendReceipt(data);
+      if (data?.applicationQueued === true) return sendJson(res, 202, { ok: true,
+        ...data, attachments: sendPayload.attachments, contextFiles: promptPresentation.contextFiles });
       if (sendReceipt.state === 'not-submitted'
         || sendReceipt.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) {
         return sendSendFailure(res, data, { tabId, handoffId: operationHandoffId });
@@ -8778,6 +9187,39 @@ async function handleApi(req, res, parsed, sdkSessions) {
         error: String(e.message),
         ...(e?.submitted === false ? { submitted: false, pasteWritten: false, enterWritten: false } : {}),
       });
+    } finally { releaseOwnedUploads?.(); }
+  }
+
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/codex\/goal$/);
+  if (m && (req.method === 'GET' || req.method === 'POST')) {
+    let body;
+    if (req.method === 'POST') {
+      try { body = await readBody(req); }
+      catch { return sendJson(res, 400, { ok: false, code: 'invalid-goal-action', error: 'Invalid Goal action request.' }); }
+    }
+    const tabId = decId(m[1]);
+    const result = codexGoalActionRequest({ method: req.method, tabId, body,
+      requestId: parsed.query.requestId, actions: codexGoalActions,
+      descriptor: findOrchestrationTabDescriptor(tabId) });
+    return sendJson(res, result.status, result.data);
+  }
+
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/completion-notification$/);
+  if (m && (req.method === 'GET' || req.method === 'POST')) {
+    let body = null;
+    if (req.method === 'POST') {
+      try { body = await readBody(req); }
+      catch { return sendJson(res, 400, { ok: false, success: false,
+        error: 'completion_notification_request_invalid', mutationOutcome: 'not-started' }); }
+    }
+    try {
+      const result = await completionNotificationRequest({ method: req.method, tabId: decId(m[1]),
+        body,
+        db: require('./project-manager').db, bridge: bridgeRequest });
+      return sendJson(res, result.status, result.data);
+    } catch (error) {
+      return sendJson(res, 500, { ok: false, success: false, error: 'completion_notification_unavailable',
+        mutationOutcome: req.method === 'POST' ? 'unknown' : 'not-started' });
     }
   }
 
@@ -11378,6 +11820,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const requestedRevision = parsed.query.ifRevision;
     const deltaOk = parsed.query.delta === '1';
     const payloadPolicy = parsed.query.payloads;
+    const freshnessRequested = parsed.query.freshness === 'v1';
+    if (parsed.query.freshness != null && !freshnessRequested) return sendJson(res, 400,
+      { success: false, error: 'history_freshness_version_invalid' });
+    if (freshnessRequested && (!wantHistoryEntries || !publicHistoryFreshness)) return sendJson(res, 400,
+      { success: false, error: 'history_freshness_unavailable' });
     if (payloadPolicy != null && payloadPolicy !== historyPayloadCapability.historyQuery.payloads) {
       return sendJson(res, 400, { success: false, error: 'history_payload_policy_invalid' });
     }
@@ -11399,9 +11846,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
             if ((info?.toolType === 'codex' || info?.toolType === 'claude') && info?.sessionId) {
               const bounds = { last: lastN, afterUuid, beforeUuid, fromUuid, aroundUuid, radius: aroundRadius };
               readScope = { tabId, toolType: info.toolType, sessionId: info.sessionId, cwd: info.cwd || null, bounds };
+              if (freshnessRequested) readScope.freshness = 'v1';
               if (payloadPolicy) Object.assign(readScope, { payloadPolicy, dehydrate: true,
                 payloadHeaderVersion: historyPayloadCapability.headerVersion });
-              data = await transcriptService.getHistory({
+              data = freshnessRequested ? await readHistoryFreshnessWindow({ info, readScope, requestedRevision, deltaOk })
+                : await transcriptService.getHistory({
                 ...readScope,
                 ifRevision: publicHistoryRevisions.lookup(requestedRevision, readScope),
                 deltaOk,
@@ -11410,7 +11859,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
                   : null,
               });
               if (data?.success) {
-                if (payloadPolicy || requestedRevision != null || deltaOk || info.readIdentitySource === 'empty-resume-source') {
+                if (freshnessRequested || payloadPolicy || requestedRevision != null || deltaOk || info.readIdentitySource === 'empty-resume-source') {
                   const current = await resolveHistorySessionInfo(tabId, 1500);
                   if (current?.sessionId !== info.sessionId || current?.toolType !== info.toolType || (current?.cwd || null) !== (info.cwd || null)
                     || (info.readIdentitySource === 'empty-resume-source' && current?.readIdentitySource !== 'empty-resume-source')) {
@@ -11423,7 +11872,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
                   readSessionId: info.sessionId, writerSessionId: info.writerSessionId || null,
                   writerConfirmed: info.writerConfirmed === true,
                   ...(payloadPolicy ? { payloadPolicy, payloadHeaderVersion: historyPayloadCapability.headerVersion } : {}),
-                  historyRevision: publicHistoryRevisions.remember(data.revision, readScope) };
+                  historyRevision: publicHistoryRevisions.remember(data.revision, readScope, data.historyFreshness) };
+                if (data.historyFreshness) data.historyFreshness = { ...data.historyFreshness,
+                  coverage: { requestKey: crypto.createHash('sha256').update(JSON.stringify(readScope)).digest('hex'),
+                    historyRevision: data.historyRevision } };
                 publishTabTiming(tabId, 'history-read');
               } else if (data?.error) {
                 // A known read failure is authoritative. Renderer fallback
@@ -11440,7 +11892,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             console.log(`[WebTiming] /history TRANSCRIPT_HISTORY_SKIP ${String(e.message)}`);
           }
         }
-        if (!data && (payloadPolicy || requestedRevision != null || deltaOk)) {
+        if (!data && (freshnessRequested || payloadPolicy || requestedRevision != null || deltaOk)) {
           return sendJson(res, 409, { success: false, error: 'history_read_identity_unavailable' });
         }
         if (!data) data = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
@@ -11664,6 +12116,14 @@ function hasTabSubscribers(tabId) {
   return [...(subscribers.get(tabId) || [])].some(sink => sink.isAlive());
 }
 
+function publishCompletionNotificationChange({ tabId, projectId }) {
+  const payload = { type: 'completion-notification-changed', tabId, projectId };
+  webBroadcast(tabId, payload);
+  // Directory/menu clients need no per-tab History subscription just to see
+  // a desktop bell change. This is a wake, not another settings mirror.
+  webBroadcast(PROJECT_ACTIVITY_TOPIC, payload);
+}
+
 function publicTabTimingSnapshot(tabId, toolType = null) {
   const value = readAgentTabTiming({ tabId, ...(toolType ? { toolType } : {}) });
   const fingerprint = JSON.stringify({ success: value.success, timing: value.timing, scope: value.scope });
@@ -11676,6 +12136,13 @@ function publicTabTimingSnapshot(tabId, toolType = null) {
 function sendTabTimingSnapshot(tabId, sink, reason) {
   if (!readAgentTabTiming || !sink.isAlive()) return;
   sink.send(JSON.stringify({ type: 'timing-changed', ...publicTabTimingSnapshot(tabId), reason }));
+}
+
+async function sendHistoryFreshnessSnapshot(tabId, sink) {
+  if (!publicHistoryFreshness || !sink.isAlive()) return;
+  const result = await readPublicHistoryFreshness([tabId]);
+  if (sink.isAlive()) sink.send(JSON.stringify({ type: 'history-freshness', tabId,
+    historyFreshness: result.snapshots[0], reason: 'connect' }));
 }
 
 function publishTabTiming(tabId, reason, force = false) {
@@ -11751,6 +12218,12 @@ function webBroadcast(tabId, payload) {
     payload = stampPublicRuntimeSnapshot(tabId, payload);
   }
   const type = payload && payload.type;
+  if (publicHistoryFreshness?.hasTab(tabId)
+    && ['transcript-changed','timing-changed','snapshot','bridge-update'].includes(type)) {
+    const historyFreshness = publicHistoryFreshness.invalidate(tabId, type);
+    webBroadcast(tabId, { type: 'history-freshness', historyFreshness });
+  }
+  if (['busy','done','snapshot','bridge-update'].includes(type)) agentSendQueue?.notifyRuntime(tabId);
   if (tabMessageService && ['busy', 'done', 'snapshot', 'bridge-update'].includes(type)) {
     void tabMessageService.wake(tabId, type).catch(error => {
       console.warn('[TabMessages] wake-failed tab=' + tabId + ' reason=' + type + ' error=' + error.message);
@@ -12125,7 +12598,7 @@ function attachWebSocket(server, sdkSessions) {
         subscribe(tabId, sink);
         // Send initial snapshot of live state — what the phone needs to render
         // immediately without waiting for the next message.
-        sendInitialSnapshot(tabId, sink, sdkSessions).catch(() => {});
+        sendInitialSnapshot(tabId, sink, sdkSessions).then(() => sendHistoryFreshnessSnapshot(tabId, sink)).catch(() => {});
         // Start fs-watch on PTY+Claude tab's JSONL (no-op for SDK tabs).
         startClaudeTabWatcher(tabId).catch(() => {});
         startTranscriptSubscriptionForTab(tabId).catch(() => {});
@@ -12135,7 +12608,7 @@ function attachWebSocket(server, sdkSessions) {
           const msg = JSON.parse(raw.toString());
           if (msg.type === 'subscribe' && msg.tabId) {
             subscribe(msg.tabId, sink);
-            sendInitialSnapshot(msg.tabId, sink, sdkSessions).catch(() => {});
+            sendInitialSnapshot(msg.tabId, sink, sdkSessions).then(() => sendHistoryFreshnessSnapshot(msg.tabId, sink)).catch(() => {});
             startClaudeTabWatcher(msg.tabId).catch(() => {});
             startTranscriptSubscriptionForTab(msg.tabId).catch(() => {});
           }
@@ -12151,9 +12624,12 @@ function attachWebSocket(server, sdkSessions) {
 
 function start({
   tabWorkContext: tabWorkContextInstance,
+  projectCardSignals: projectCardSignalsInstance,
+  mobileAttachmentAssetStore: mobileAttachmentAssetStoreInstance,
   sdkSessions,
   agentSendReceiptStore: agentSendReceiptStoreFn,
   agentSendReceiptStartupReady: agentSendReceiptStartupReadyFn,
+  cancelAgentSend: cancelAgentSendFn,
   computeActiveLoaders: computeFn,
   computeProjectActivity: computeProjectActivityFn,
   readAgentTabTiming: readAgentTabTimingFn,
@@ -12175,6 +12651,7 @@ function start({
   readAgentLifecycleIdentity: readAgentLifecycleIdentityFn,
   readAgentStartReadiness: readAgentStartReadinessFn,
   readAgentRuntimeSnapshot: readAgentRuntimeSnapshotFn,
+  codexGoalActions: codexGoalActionsValue,
   stopAgentProcess: stopAgentProcessFn,
   readAgentParams: readAgentParamsFn,
   agentParamsService: agentParamsServiceValue,
@@ -12183,6 +12660,7 @@ function start({
   agentSendBridgeTimeoutMs: agentSendBridgeTimeoutMsFn,
   projectPromptCatalog: projectPromptCatalogFn,
   savedPromptService: savedPromptServiceFn,
+  systemPromptService: systemPromptServiceFn,
 }) {
   if (httpServer) {
     console.log('[WebServer] already started state=' + webServerServiceHealth().state);
@@ -12191,13 +12669,72 @@ function start({
   if (!sdkSessions) throw new Error('start({sdkSessions}) — Map of live SDK sessions required');
   tabMessageSdkSessions = sdkSessions;
   tabWorkContext = tabWorkContextInstance || null;
+  projectCardSignals = projectCardSignalsInstance || null;
+  mobileAttachmentAssetStore = mobileAttachmentAssetStoreInstance || null;
   agentSendReceiptStore = agentSendReceiptStoreFn || null;
+  sendQueueRecoveryReady = false;
+  if (agentSendReceiptStore?.subscribe) {
+    agentSendQueue = new AgentSendQueue({ store: agentSendReceiptStore,
+      ready: () => sendQueueRendererReady && sendQueueRecoveryReady,
+      cancelAttempt: record => cancelAgentSendFn?.(record),
+      admit: async request => {
+        // Independent delegated runs still need their own turn. Ordinary
+        // prompts/notifications may steer streaming; a delayed delegation may
+        // not silently become steering just because it waited in this backlog.
+        if (request.sendSurface !== 'orchestration') return true;
+        const status = await resolveAgentSessionInfo(request.tabId, 2000, {
+          onLateStatus: () => agentSendQueue?.notifyRuntime(request.tabId),
+        });
+        return resolveOrchestrationDeliveryAdmission(status).canDispatch;
+      },
+      execute: async (request, scope) => {
+        const receipt = await runPreparedAgentSendScenario({ ...request, applicationQueueExecution: true,
+          sendRequestFingerprint: scope.requestFingerprint,
+          ...(scope.expectedTarget ? { expectedTarget: scope.expectedTarget } : {}),
+          ...(request.restoreClosedTab === true ? {
+            prepareSend: () => ensureExplicitAgentTabOpen(request.tabId,
+              findOrchestrationTabDescriptor(request.tabId) ? null : findRestorableAgentTabDescriptor(request.tabId)),
+          } : {}),
+        });
+        tabWorkContext?.settle(request.tabId, request.handoffId, receipt);
+        return receipt;
+      },
+      publish: record => {
+        if (record.state === 'not-submitted' && !record.attemptId) {
+          tabWorkContext?.settle(record.tabId, record.handoffId, record.receipt);
+        }
+        // Live receipts must carry the same exact image proof as the bounded
+        // list IPC. Otherwise a mounted local card stays pathless until remount.
+        const rendererRecord = { ...record, imagePresentation: imagePresentationFromReceipt(record) };
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('agent:send-queue-receipt', rendererRecord);
+        }
+        // Remote clients already own the authored prompt. Wake their exact
+        // receipt reader without resending every context chip/image snapshot
+        // over SSE on each transition.
+        const receipt = publicAgentSendReceipt(record);
+        webBroadcast(record.tabId, { type: 'send-receipt', receipt: {
+          tabId: record.tabId, handoffId: record.handoffId, operationKey: record.operationKey,
+          attemptId: record.attemptId, status: receipt.status, receiptState: record.state,
+          applicationQueue: record.applicationQueue, submitted: receipt.submitted,
+          providerQueueAccepted: receipt.providerQueueAccepted === true,
+          exactAuditConfirmed: receipt.exactAuditConfirmed === true,
+        } });
+      },
+    });
+  }
   agentSendReceiptStartupReady = agentSendReceiptStartupReadyFn
     ? Promise.resolve(agentSendReceiptStartupReadyFn).catch((error) => ({
       ready: false,
       error: error?.message || String(error),
     }))
     : Promise.resolve({ ready: true });
+  const startupQueue = agentSendQueue;
+  void agentSendReceiptStartupReady.then(result => {
+    if (agentSendQueue !== startupQueue || result?.ready === false) return;
+    sendQueueRecoveryReady = true;
+    agentSendQueue?.resume();
+  });
   if (agentSendReceiptStore && !agentSendReceiptStartupReadyFn) {
     const reconciled = agentSendReceiptStore.reconcileStartup();
     if (reconciled?.changed) {
@@ -12213,6 +12750,8 @@ function start({
   answerClaudeQuestion = answerFn || null;
   getClaudePendingQuestion = getQFn || null;
   transcriptService = transcriptServiceFn || null;
+  publicHistoryFreshness = typeof transcriptService?.getHistoryFreshnessContext === 'function'
+    ? new HistoryFreshness({ readContext: (scope, ids) => transcriptService.getHistoryFreshnessContext(scope, ids) }) : null;
   if (transcriptService) {
     const service = transcriptService; // cleanup cannot target a later server
     tabTranscriptSubscriptions = new TabTranscriptSubscriptions({
@@ -12274,6 +12813,7 @@ function start({
   getAgentExecutionContext = getAgentExecutionContextFn || null;
   readAgentLifecycleIdentity = readAgentLifecycleIdentityFn || null;
   readAgentRuntimeSnapshot = readAgentRuntimeSnapshotFn || null;
+  codexGoalActions = codexGoalActionsValue || null;
   stopAgentProcess = stopAgentProcessFn || null;
   readAgentParams = readAgentParamsFn || null;
   agentParamsService = agentParamsServiceValue || null;
@@ -12282,6 +12822,7 @@ function start({
   e2eBoundaryTestGate = e2eBoundaryTestGateFn || null;
   projectPromptCatalog = projectPromptCatalogFn || null;
   savedPromptService = savedPromptServiceFn || null;
+  systemPromptService = systemPromptServiceFn || null;
   agentSendBridgeTimeoutMs = Math.max(
     1,
     Number(agentSendBridgeTimeoutMsFn) || 60_000,
@@ -12426,6 +12967,7 @@ function stop() {
   conversationOwners = null;
   publicTimingSnapshots.clear();
   publicHistoryRevisions.clear();
+  publicHistoryFreshness = null;
   for (const tabId of new Set([...claudeTabWatchers.keys(), ...claudeTabWatcherPending])) stopClaudeTabWatcher(tabId);
   httpServer = null;
   webServerState = 'stopped';
@@ -12444,6 +12986,7 @@ function stop() {
   getAgentExecutionContext = null;
   readAgentLifecycleIdentity = null;
   readAgentRuntimeSnapshot = null;
+  codexGoalActions = null;
   stopAgentProcess = null;
   readAgentParams = null;
   agentParamsService = null;
@@ -12474,6 +13017,9 @@ function stop() {
   // The injected SQLite store deliberately remains intact. Clearing this
   // reference only releases the current server instance; start() receives the
   // same durable authority again after an app/server restart.
+  agentSendQueue?.dispose();
+  agentSendQueue = null;
+  sendQueueRecoveryReady = false;
   agentSendReceiptStore = null;
   agentSendReceiptStartupReady = Promise.resolve({ ready: true });
   tabMessageService?.dispose();
@@ -12613,8 +13159,49 @@ async function sendCodexCapacityContinuation({ tabId, sessionId, turnId, generat
 }
 
 module.exports = {
+  markSendQueueRendererReady: (ready = true, ownerId = 0) => {
+    if (ready) sendQueueRendererOwners.add(ownerId); else sendQueueRendererOwners.delete(ownerId);
+    sendQueueRendererReady = sendQueueRendererOwners.size > 0;
+    if (sendQueueRendererReady) agentSendQueue?.resume();
+  },
+  cancelQueuedAgentSends: (tabId, handoffId, options) => (options?.stop
+    ? agentSendQueue?.stop(tabId) : agentSendQueue?.cancelWaiting(tabId, handoffId, options))
+    || { cancelled: false, count: 0 },
+  dismissUnwrittenQueuedSend: (tabId, handoffId) => agentSendQueue?.dismissUnwritten(tabId, handoffId)
+    || { cancelled: false, count: 0 },
+  releaseQueuedSendPresentation: operationKey => agentSendQueue?.releasePresentation(operationKey),
+  queuedSendAssetIds: () => agentSendQueue?.referencedAssetIds() || new Set(),
+  applicationQueueInfo: operationKey => {
+    const item = agentSendQueue?.item(operationKey);
+    return item ? { version: 1, id: item.id, state: item.state, queuedAt: item.created_at } : null;
+  },
+  projectQueuedSendReceipt: record => agentSendQueue?.projectRecord(record) || record,
+  enqueueDesktopAgentPrompt: async input => {
+    if (!input?.tabId || !input.handoffId || typeof input.prompt !== 'string'
+      || !['claude', 'codex'].includes(input.toolType)) throw new Error('Invalid application send request');
+    if (input.ownedAttachments || input.ownedAttachmentProjection) {
+      throw new Error('Upload ownership is issued by Main upload admission, not a renderer request');
+    }
+    if (Buffer.byteLength(JSON.stringify(input), 'utf8') > STRUCTURED_AUTHORING_LIMITS.bytes) {
+      throw new Error('Send request is too large');
+    }
+    const settings = input.settingsIntent?.kind === 'explicit-change' ? input.settingsIntent : {};
+    return runAgentSendScenario({ ...input, provider: input.toolType,
+      model: settings.model, effort: settings.effort, thinking: settings.thinking,
+      expectedTarget: input.expectedTarget || (input.sessionId
+        ? { toolType: input.toolType, sessionId: input.sessionId } : null),
+      sessionId: null,
+      sendOperationKey: `history:${input.tabId}:${input.handoffId}`, sendSurface: 'desktop-history',
+      ownership: input.returnDraftOnConflict === true ? 'external' : 'project',
+      applicationQueueAcceptedResponse: input.source === 'history-panel',
+    });
+  },
   listTabMessages: async (tabId) => (await getTabMessageService().listForTab(tabId)).map(compactTabMessage),
   getTabMessage: (messageId) => getTabMessageService().getMessage(messageId),
+  dismissTabMessage: (tabId, messageId) => {
+    const result = getTabMessageService().dismissMessage({ tabId, messageId });
+    return { ...result, message: compactTabMessage(result.message) };
+  },
   readMobileAttachmentPreview,
   commitSavedHistoryCodexBinding,
   validateSavedHistoryStop,
@@ -12622,6 +13209,7 @@ module.exports = {
   start,
   stop,
   webBroadcast,
+  publishCompletionNotificationChange,
   broadcastProjectActivity,
   getInfo,
   updateExternalRunSettings,

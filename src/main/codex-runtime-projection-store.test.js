@@ -20,3 +20,23 @@ test('runtime projections are immutable, monotonic and batch-readable without ob
   assert.equal(store.remove('tab-a'), true);
   assert.equal(store.read('tab-a'), null);
 });
+
+test('physical sendTarget allocation does not churn revisions but every changed owner field does', () => {
+  const sendTarget = {
+    toolType: 'codex', terminalInstanceId: 'I', launchId: 'L', sessionId: null,
+    acceptedResumeSourceSessionId: null, lifecycleGeneration: 'G:1', turnId: null,
+  };
+  for (const field of Object.keys(sendTarget)) {
+    const store = createCodexRuntimeProjectionStore();
+    const before = store.publish('T', { sessionStatus: 'starting', sendTarget });
+    assert.strictEqual(store.publish('T', {
+      sessionStatus: 'starting', sendTarget: { ...sendTarget },
+    }), before);
+    const after = store.publish('T', {
+      sessionStatus: 'starting', sendTarget: { ...sendTarget, [field]: 'changed-' + field },
+    });
+    assert.equal(after.runtimeRevision, before.runtimeRevision + 1, field);
+    const missingTarget = store.publish('T', { sessionStatus: 'starting', sendTarget: null });
+    assert.equal(missingTarget.runtimeRevision, after.runtimeRevision + 1);
+  }
+});

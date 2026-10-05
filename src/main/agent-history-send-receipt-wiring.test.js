@@ -262,8 +262,11 @@ test('orchestration completion uses the same durable desktop History receipt as 
   assert.match(completionBody, /const notificationHandoffId = 'orchestration-complete:' \+ current\.runId/);
   assert.match(completionBody, /handoffId:\s*notificationHandoffId/);
   assert.match(completionBody, /source:\s*'orchestration-completion:' \+ current\.runId/);
-  assert.doesNotMatch(completionBody, /sendOperationKey:/,
-    'main must mint the receipt from the exact History handoff instead of accepting caller identity');
+  assert.match(completionBody, /sendOperationKey: `history:\$\{current\.sourceTabId\}:\$\{notificationHandoffId\}`/,
+    'the main-owned completion must enter FIFO with its stable History identity before the renderer');
+  assert.match(completionBody, /sendSurface: 'desktop-history'/);
+  assert.match(completionBody, /sendOperationKey: result\.operationKey \|\| null/);
+  assert.match(completionBody, /sendAttemptId: result\.attemptId \|\| null/);
   assert.match(mainSource, /isDesktopHistorySendReceiptEligible\(\{/);
   assert.match(mainSource, /buildDesktopHistorySendIdentity\(\{/);
 });

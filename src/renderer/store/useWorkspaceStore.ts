@@ -1,4 +1,6 @@
 import { create } from 'zustand';
+import { getRestartAfterTriggerIds, getRestartAfterWorkflowIds, hasRestartAfterSubscription } from '../utils/restartAfterCommand.mjs';
+import { UNPLACED_WORKFLOW_ID } from '../utils/workflowVisuals.mjs';
 import { captureTabRestorePlacement, readTabRestorePlacement, restoreSidebarTab,
   restoreArchivedTabWindow, tabsAfterClose, tabPlacementId, tabPlacementSlotKey,
   captureWindowCloseScope, resolveWindowCloseScope, chooseWindowCloseAction } from '../utils/tabRestorePlacement.mjs';
@@ -40,8 +42,6 @@ import {
 } from '../utils/tabSwitcherModel.mjs';
 import { resolveSiblingInsertionIndex, resolveTabInsertionIndex } from '../utils/tabInsertionModel.mjs';
 import {
-  addEmptyPane,
-  addEmptyPaneVertical,
   restorePanePreviousTab,
   addPane,
   isEmptyPane,
@@ -134,7 +134,7 @@ import {
 } from '../utils/workspaceWindowMutation.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
-import { reconcileWorkspaceDisplayPatch, revealHiddenWindow } from '../utils/windowDisplayLayouts.mjs';
+import { reconcileWorkspaceDisplayPatch, revealHiddenWindow, splitWindowPane } from '../utils/windowDisplayLayouts.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
 import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
@@ -910,12 +910,14 @@ interface Tab {
    * Restart-after AI triggers for ordinary terminal tabs.
    * restartAfterTabIds is the multi-select trigger list; restartAfterTabId is
    * kept as a legacy first-trigger mirror for older persisted rows and main-side
-   * compatibility. Target list and command survive restarts. paused keeps the
+   * compatibility. Workflow IDs are live ALL subscriptions, not expanded snapshots.
+   * Target selection and command survive restarts. paused keeps the
    * selection visible but disables the side effect; armed/persistent are legacy
    * bell-mode fields cleaned up when touched.
    */
   restartAfterTabId?: string;
   restartAfterTabIds?: string[];
+  restartAfterWorkflowIds?: string[];
   restartAfterCommand?: string;
   restartAfterPaused?: boolean;
   restartAfterPersistent?: boolean;
@@ -1024,31 +1026,17 @@ interface Tab {
   bgTasks?: BgTask[];
 }
 
-const getRestartAfterTriggerIds = (tab: Pick<Tab, 'id' | 'restartAfterTabId' | 'restartAfterTabIds'> | null | undefined): string[] => {
-  if (!tab) return [];
-  const out: string[] = [];
-  const push = (value: unknown) => {
-    const id = typeof value === 'string' ? value.trim() : '';
-    if (!id || id === tab.id || out.includes(id)) return;
-    out.push(id);
-  };
-  if (Array.isArray(tab.restartAfterTabIds)) {
-    for (const id of tab.restartAfterTabIds) push(id);
-  }
-  push(tab.restartAfterTabId);
-  return out;
-};
-
 const logRestartAfterState = (
-  action: 'target' | 'command' | 'paused',
+  action: 'target' | 'workflow' | 'command' | 'paused',
   projectId: string,
-  tab: Pick<Tab, 'id' | 'restartAfterTabId' | 'restartAfterTabIds' | 'restartAfterCommand' | 'restartAfterPaused'>,
+  tab: Pick<Tab, 'id' | 'restartAfterTabId' | 'restartAfterTabIds' | 'restartAfterWorkflowIds' | 'restartAfterCommand' | 'restartAfterPaused'>,
 ) => {
   console.info(
     '[RestartAfter:Store] action=' + action
     + ' project=' + projectId
     + ' target=' + String(tab.id || '').slice(-8)
     + ' triggers=' + JSON.stringify(getRestartAfterTriggerIds(tab).map((id) => id.slice(-8)))
+    + ' workflows=' + JSON.stringify(getRestartAfterWorkflowIds(tab))
     + ' paused=' + (tab.restartAfterPaused === true)
     + ' command=' + JSON.stringify(tab.restartAfterCommand || '')
   );
@@ -1180,6 +1168,7 @@ const restoreTabOptions = (savedTab: any) => ({
   completionNotificationPersistent: savedTab.completionNotificationPersistent,
   restartAfterTabId: savedTab.restartAfterTabId,
   restartAfterTabIds: savedTab.restartAfterTabIds,
+  restartAfterWorkflowIds: savedTab.restartAfterWorkflowIds,
   restartAfterCommand: savedTab.restartAfterCommand,
   restartAfterPaused: savedTab.restartAfterPaused,
   restartAfterPersistent: savedTab.restartAfterPersistent,
@@ -1268,6 +1257,7 @@ const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err
     completionNotificationPersistent: savedTab.completionNotificationPersistent || undefined,
     restartAfterTabId: savedTab.restartAfterTabId || undefined,
     restartAfterTabIds: Array.isArray(savedTab.restartAfterTabIds) ? savedTab.restartAfterTabIds : undefined,
+    restartAfterWorkflowIds: Array.isArray(savedTab.restartAfterWorkflowIds) ? savedTab.restartAfterWorkflowIds : undefined,
     restartAfterCommand: savedTab.restartAfterCommand || undefined,
     restartAfterPaused: savedTab.restartAfterPaused || undefined,
     restartAfterPersistent: savedTab.restartAfterPersistent || undefined,
@@ -1452,6 +1442,7 @@ type TabCompletionNotificationDetail = {
 };
 
 const emitTabCompletionNotification = (detail: TabCompletionNotificationDetail) => {
+  emitTabCompletionNotificationStateChanged(detail);
   try {
     ipcRenderer.send('tab-notification:completed', detail);
   } catch {}
@@ -1464,9 +1455,14 @@ const emitTabCompletionNotification = (detail: TabCompletionNotificationDetail) 
 };
 
 const emitTabCompletionNotificationCleared = (detail: { projectId: string; tabId: string }) => {
+  emitTabCompletionNotificationStateChanged(detail);
   try {
     ipcRenderer.send('tab-notification:cleared', detail);
   } catch {}
+};
+
+const emitTabCompletionNotificationStateChanged = (detail: { projectId: string; tabId: string }) => {
+  try { ipcRenderer.send('tab-notification:state-changed', { projectId: detail.projectId, tabId: detail.tabId }); } catch {}
 };
 
 // Does this tab still owe the user queued work? Reads the SAME predicate the
@@ -1978,8 +1974,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string, options?: { targetPaneIndex?: number }) => Promise<TabHistoryRestoreResult>;
@@ -2006,10 +2002,11 @@ interface WorkspaceStore {
   setTabColor: (projectId: string, tabId: string, color: TabColor, manual?: boolean) => void;
   setTabSessionStatus: (projectId: string, tabId: string, status: string | null) => void;
   setTabCompletionNotificationArmed: (projectId: string, tabId: string, armed: boolean) => void;
-  setTabCompletionNotificationPersistent: (projectId: string, tabId: string, persistent: boolean) => void;
+  setTabCompletionNotificationPersistent: (projectId: string, tabId: string, persistent: boolean) => Promise<any> | undefined;
   clearTabCompletionNotification: (projectId: string, tabId: string, options?: { keepPersistent?: boolean }) => void;
   applyTabCompletionOrchestrationState: (tabId: string, phase: 'active' | 'success' | 'abnormal') => void;
   setTabRestartAfterTarget: (projectId: string, tabId: string, triggerTabId: string | null) => void;
+  toggleTabRestartAfterWorkflow: (projectId: string, tabId: string, workflowId: string) => void;
   setTabRestartAfterCommand: (projectId: string, tabId: string, command: string | null) => void;
   setTabRestartAfterPaused: (projectId: string, tabId: string, paused: boolean) => void;
   consumeRestartAfterTriggerIdle: (triggerTabId: string, naturalEnd: boolean) => Array<{ tabId: string; command?: string }>;
@@ -2183,6 +2180,7 @@ const normalizeGeneratedTabName = (name: string): string => {
 // Debounce timer for session saving
 let saveSessionTimer: NodeJS.Timeout | null = null;
 const projectTabSaveQueue = createProjectTabSaveQueue();
+export const isProjectTabSavePending = (projectId: string) => projectTabSaveQueue.pending(projectId);
 const projectTabCreationQueue = createProjectTabSaveQueue();
 const projectTabSaveRevisions = new Map<string, number>();
 
@@ -2234,6 +2232,7 @@ const saveTabs = (
     completionNotificationPersistent: tab.completionNotificationPersistent,
     restartAfterTabId: tab.restartAfterTabId,
     restartAfterTabIds: tab.restartAfterTabIds,
+    restartAfterWorkflowIds: tab.restartAfterWorkflowIds,
     restartAfterCommand: tab.restartAfterCommand,
     restartAfterPaused: tab.restartAfterPaused,
     restartAfterPersistent: tab.restartAfterPersistent,
@@ -2667,13 +2666,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
   addEmptySplitPane: (anchorPaneIndex, side = 'right') => {
     const st = get();
     const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
-    // Single mode: the current CENTER tab becomes pane 0. In split mode the
-    // placeholder opens immediately to the RIGHT of the pane whose split
-    // button was pressed (afterPaneIndex), not at the far end.
+    // Single mode: the current CENTER tab becomes pane 0. An existing hidden
+    // window fills the new place first; only an exhausted inventory needs a
+    // fresh placeholder. The whole change is committed once, without a blank frame.
     const current = st.activeProjectId && activeWs?.activeTabId
       ? { projectId: st.activeProjectId, tabId: activeWs.activeTabId }
       : null;
-    const res = addEmptyPane(
+    const res = splitWindowPane(
       st.splitPanes,
       st.splitFocusedIndex,
       current,
@@ -2683,9 +2682,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     if (!res) return false;
     // New layout from single mode opens equal — see addTabToSplit.
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, ...(st.splitPanes.length === 0 ? { splitSizes: null } : {}) });
-    console.log('[Split] addEmptyPane side=' + side + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
-    // Placeholder is session-transient (sanitizePanes drops it on restore),
-    // but persisting the REAL panes' new geometry keeps restart honest.
+    const shown = get().splitPanes[get().splitFocusedIndex];
+    if (res.revealedWindowId && shown?.tabId) {
+      useUIStore.getState().setActiveArea('workspace');
+      get().activateCenterTab(shown.projectId, shown.tabId);
+    }
+    console.log('[Split] addEmptyPane side=' + side + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex
+      + ' revealed=' + (res.revealedWindowId || '-'));
     get().saveSession();
     return true;
   },
@@ -2696,7 +2699,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const current = st.activeProjectId && activeWs?.activeTabId
       ? { projectId: st.activeProjectId, tabId: activeWs.activeTabId }
       : null;
-    const res = addEmptyPaneVertical(
+    const res = splitWindowPane(
       st.splitPanes,
       st.splitFocusedIndex,
       current,
@@ -2706,8 +2709,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     if (!res) return false;
     // New layout from single mode opens equal — see addTabToSplit.
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, ...(st.splitPanes.length === 0 ? { splitSizes: null } : {}) });
+    const shown = get().splitPanes[get().splitFocusedIndex];
+    if (res.revealedWindowId && shown?.tabId) {
+      useUIStore.getState().setActiveArea('workspace');
+      get().activateCenterTab(shown.projectId, shown.tabId);
+    }
     console.log('[Split] addVerticalPane side=' + side
-      + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
+      + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex + ' revealed=' + (res.revealedWindowId || '-'));
     get().saveSession();
     return true;
   },
@@ -5277,6 +5285,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       completionNotificationPersistent: (options as any)?.completionNotificationPersistent || undefined,
       restartAfterTabId: (options as any)?.restartAfterTabId || undefined,
       restartAfterTabIds: Array.isArray((options as any)?.restartAfterTabIds) ? (options as any).restartAfterTabIds : undefined,
+      restartAfterWorkflowIds: Array.isArray((options as any)?.restartAfterWorkflowIds) ? (options as any).restartAfterWorkflowIds : undefined,
       restartAfterCommand: (options as any)?.restartAfterCommand || undefined,
       restartAfterPaused: (options as any)?.restartAfterPaused || undefined,
       restartAfterPersistent: (options as any)?.restartAfterPersistent || undefined,
@@ -5485,6 +5494,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       lastActivatedAt: (options as any)?.lastActivatedAt,
       restartAfterTabId: (options as any)?.restartAfterTabId || undefined,
       restartAfterTabIds: Array.isArray((options as any)?.restartAfterTabIds) ? (options as any).restartAfterTabIds : undefined,
+      restartAfterWorkflowIds: Array.isArray((options as any)?.restartAfterWorkflowIds) ? (options as any).restartAfterWorkflowIds : undefined,
       restartAfterCommand: (options as any)?.restartAfterCommand || undefined,
       restartAfterPaused: (options as any)?.restartAfterPaused || undefined,
       restartAfterPersistent: (options as any)?.restartAfterPersistent || undefined,
@@ -6913,7 +6923,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       + ' enabled=' + (persistent ? '1' : '0')
       + ' armed=' + (tab.completionNotificationArmed ? '1' : '0'));
     logRestartAfterState('target', workspace.projectId, tab);
-    saveTabs(workspace.projectId, workspace.tabs);
+    return saveTabs(workspace.projectId, workspace.tabs).then((result: any) => {
+      emitTabCompletionNotificationStateChanged({ projectId, tabId });
+      return result;
+    });
   },
 
   clearTabCompletionNotification: (projectId, tabId, options) => {
@@ -6950,7 +6963,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
           emitTabCompletionNotificationCleared({ projectId: workspace.projectId, tabId });
           changed = true;
         }
-        if (changed) set({ openProjects: new Map(openProjects) });
+        if (changed) {
+          set({ openProjects: new Map(openProjects) });
+          emitTabCompletionNotificationStateChanged({ projectId: workspace.projectId, tabId });
+        }
         return;
       }
 
@@ -6973,6 +6989,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       });
       if (!settled.changed) return;
       set({ openProjects: new Map(openProjects) });
+      emitTabCompletionNotificationStateChanged({ projectId: workspace.projectId, tabId });
       if (settled.detail) emitTabCompletionNotification(settled.detail);
       console.warn('[TabNotification] orchestration release tab=' + tabId.slice(-12)
         + ' outcome=' + phase
@@ -6990,7 +7007,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const value = typeof triggerTabId === 'string' && triggerTabId.trim() && triggerTabId !== tabId
       ? triggerTabId.trim()
       : null;
-    const hadTerminalAutomation = getRestartAfterTriggerIds(tab).length > 0 || !!tab.restartAfterCommand;
+    const hadTerminalAutomation = hasRestartAfterSubscription(tab) || !!tab.restartAfterCommand;
     if (value && !tabAllowsShellActions(tab)) {
       console.error('[RestartAfter:Store] rejected target on AI-owned tab=' + tabId.slice(-8));
       return;
@@ -7002,7 +7019,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       tab.commandType = 'generic';
     }
     if (value) {
-      const prevIds = getRestartAfterTriggerIds(tab);
+      // A manual exception leaves ALL mode and keeps the other current choices.
+      const prevIds = getRestartAfterTriggerIds(tab, get());
+      delete tab.restartAfterWorkflowIds;
       const nextIds = prevIds.includes(value)
         ? prevIds.filter((id) => id !== value)
         : [...prevIds, value];
@@ -7018,6 +7037,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       delete tab.restartAfterArmed;
       delete tab.restartAfterPersistent;
     } else {
+      delete tab.restartAfterWorkflowIds;
       delete tab.restartAfterTabIds;
       delete tab.restartAfterTabId;
       delete tab.restartAfterCommand;
@@ -7030,12 +7050,35 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     saveTabs(workspace.projectId, workspace.tabs);
   },
 
+  toggleTabRestartAfterWorkflow: (projectId, tabId, workflowId) => {
+    const state = get();
+    const workspace = state.openProjects.get(projectId);
+    const tab = workspace?.tabs.get(tabId);
+    if (!tab || !workspace) return;
+    if (getRestartAfterWorkflowIds(tab).includes(workflowId)) {
+      state.setTabRestartAfterTarget(projectId, tabId, null);
+      return;
+    }
+    if (!tabAllowsShellActions(tab)) {
+      console.error('[RestartAfter:Store] rejected workflow on AI-owned tab=' + tabId.slice(-8));
+      return;
+    }
+    if (workflowId !== UNPLACED_WORKFLOW_ID && !state.spaces.some(space => space.id === workflowId)) return;
+    if (!tab.commandType) tab.commandType = 'generic';
+    tab.restartAfterWorkflowIds = [...getRestartAfterWorkflowIds(tab), workflowId];
+    delete tab.restartAfterArmed;
+    delete tab.restartAfterPersistent;
+    set({ openProjects: new Map(state.openProjects) });
+    logRestartAfterState('workflow', projectId, tab);
+    saveTabs(projectId, workspace.tabs);
+  },
+
   setTabRestartAfterCommand: (projectId, tabId, command) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
     if (!workspace) return;
     const tab = workspace.tabs.get(tabId);
-    if (!tab || getRestartAfterTriggerIds(tab).length === 0) return;
+    if (!tab || !hasRestartAfterSubscription(tab)) return;
     const nextCommand = command?.trim();
     if (nextCommand && !tabAllowsShellActions(tab)) {
       console.error('[RestartAfter:Store] rejected command on AI-owned tab=' + tabId.slice(-8));
@@ -7057,7 +7100,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const workspace = openProjects.get(projectId);
     if (!workspace) return;
     const tab = workspace.tabs.get(tabId);
-    if (!tab || getRestartAfterTriggerIds(tab).length === 0) return;
+    if (!tab || !hasRestartAfterSubscription(tab)) return;
     if (paused) {
       tab.restartAfterPaused = true;
     } else {
@@ -7073,13 +7116,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     // liveness update. Keep the persistent subscription armed for the next
     // successful turn instead of consuming it on the failure.
     if (!naturalEnd) return [];
-    const { openProjects } = get();
+    const state = get();
+    const { openProjects } = state;
     const restartTargets: Array<{ tabId: string; command?: string }> = [];
     let changed = false;
     const changedProjectIds = new Set<string>();
     for (const [, workspace] of openProjects) {
       for (const tab of workspace.tabs.values()) {
-        if (!getRestartAfterTriggerIds(tab).includes(triggerTabId)) continue;
+        if (!getRestartAfterTriggerIds(tab, state).includes(triggerTabId)) continue;
         if (tab.restartAfterPaused) continue;
         if (!tabAllowsShellActions(tab)) {
           console.error('[RestartAfter:Store] skipped AI-owned target=' + tab.id.slice(-8));
@@ -8645,6 +8689,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         }
         set({ openProjects: new Map(openProjects) });
         if (notificationDetail) emitTabCompletionNotification(notificationDetail);
+        emitTabCompletionNotificationStateChanged({ projectId: workspace.projectId, tabId });
         return;
       }
     }
@@ -9004,6 +9049,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
           completionNotificationPersistent: tab.completionNotificationPersistent,
           restartAfterTabId: tab.restartAfterTabId,
           restartAfterTabIds: tab.restartAfterTabIds,
+          restartAfterWorkflowIds: tab.restartAfterWorkflowIds,
           restartAfterCommand: tab.restartAfterCommand,
           restartAfterPaused: tab.restartAfterPaused,
           restartAfterPersistent: tab.restartAfterPersistent,

@@ -284,7 +284,8 @@ function callKnowledgeDocsReindex(projectPath, parallelism, onProcess, onProgres
         KNOWLEDGE_DISABLE_CLAUDE_P: 'true',
         KNOWLEDGE_ROUTER_PROVIDER: 'codex',
         KNOWLEDGE_INDEX_PROVIDER: 'codex',
-        KNOWLEDGE_CODEX_MODEL: process.env.KNOWLEDGE_CODEX_MODEL || 'gpt-5.4-mini',
+        // The knowledge server owns the default model. A UI-only fallback here
+        // kept requesting retired mini after the MCP default had been updated.
         KNOWLEDGE_CODEX_EFFORT: process.env.KNOWLEDGE_CODEX_EFFORT || 'low',
       }),
     });
@@ -516,8 +517,21 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
       'summaryWarn=', summaryWarnings,
       result?.error ? `error=${result.error}` : ''
     );
+    if (!success) {
+      console.error('[SemanticIndexStatus] Rebuild failure:', JSON.stringify({
+        projectId,
+        projectPath: state.projectPath,
+        provider: result?.provider || 'codex',
+        model: result?.model || null,
+        error: result?.error || 'docs_reindex failed',
+        failedFiles,
+      }));
+    }
     send('semantic-index:rebuild-done', {
       success,
+      projectPath: state.projectPath,
+      provider: result?.provider || 'codex',
+      model: result?.model || null,
       code: success ? 0 : 1,
       signal: null,
       error: success ? null : (result?.error || 'docs_reindex failed'),
@@ -538,6 +552,7 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
     state.rebuildProc = null;
     send('semantic-index:rebuild-done', {
       success: false,
+      projectPath: state.projectPath,
       code: 1,
       signal: null,
       error: err.message,

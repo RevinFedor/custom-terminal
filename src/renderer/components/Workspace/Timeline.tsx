@@ -17,6 +17,7 @@ import {
   makeTimelineSnapshotKey,
 } from '../../utils/timelineSnapshotCache.mjs';
 import { consumeQueuedRewindTarget, pendingQueuedRewindTarget } from '../../utils/queuedRewindTarget.mjs';
+import { findRewindIteration } from '../../utils/queuedRewindLabel.mjs';
 import {
   useUIStore,
   type HistoryPromptDraftChip,
@@ -4987,6 +4988,7 @@ function Timeline({
           requestId,
           uuid: entry.uuid,
           text: entry.content,
+          iteration: findRewindIteration(entries, entry.uuid),
           sessionId,
           toolType,
         },
