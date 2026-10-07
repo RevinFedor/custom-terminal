@@ -317,13 +317,13 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
     if (tag?.kind === 'prompt-origin') {
       const source = String(tag.source || '').trim();
       const systemSource = source === 'system' ? systemPromptSource(tag.systemSource) : null;
-      if (source !== 'loop' && !systemSource) return [];
+      if (source !== 'loop' && source !== 'terminal-mcp' && !systemSource) return [];
       return [{
         id: String(tag.id || `durable-prompt-origin-tag-${index}`),
         kind: 'prompt-origin',
         source,
         ...(systemSource ? { systemSource } : {}),
-        ...(systemSource && typeof tag.auditSourceIdentity === 'string' && tag.auditSourceIdentity.trim()
+        ...((systemSource || source === 'terminal-mcp') && typeof tag.auditSourceIdentity === 'string' && tag.auditSourceIdentity.trim()
           ? { auditSourceIdentity: tag.auditSourceIdentity.trim() }
           : {}),
       }];
@@ -714,6 +714,8 @@ function backfillConfirmedCanonicalAuthoringPresentations(db, records) {
  * Idempotent and bounded by the existing receipt store's retention/capacity.
  */
 function backfillConfirmedSystemPromptPresentations(db, records) {
+  // Legacy entry point also restores MCP origins from exact confirmed receipts.
+  // Both are service metadata; neither creates an orchestration run.
   // Reuse the existing startup pass over confirmed receipts. This persists
   // canonical authoring before any new send can prune TTL-settled receipts.
   backfillConfirmedCanonicalAuthoringPresentations(db, records);
@@ -724,7 +726,7 @@ function backfillConfirmedSystemPromptPresentations(db, records) {
     const receipt = record?.receipt;
     const audit = record?.auditIdentity;
     const tag = promptOriginTagForSource(receipt?.source);
-    if (tag?.source !== 'system' || record.state !== 'confirmed'
+    if (!['system', 'terminal-mcp'].includes(tag?.source) || record.state !== 'confirmed'
       || receipt?.exactAuditConfirmed !== true || !audit
       || !record.attemptId || audit.attemptId !== record.attemptId
       || receipt.attemptId !== record.attemptId
@@ -779,7 +781,7 @@ function backfillConfirmedSystemPromptPresentations(db, records) {
 
 function matchesPendingPromptPresentationIdentity(row, entry) {
   const bindings = (Array.isArray(row?.chips) ? row.chips : []).filter(item => (
-    item?.kind === 'prompt-origin' && item.source === 'system' && item.auditSourceIdentity
+    item?.kind === 'prompt-origin' && ['system', 'terminal-mcp'].includes(item.source) && item.auditSourceIdentity
   ));
   const requestBinding = storedClaudeRequestPresentation(row)?.binding?.sourceIdentity;
   if (requestBinding) bindings.push({ auditSourceIdentity: requestBinding });

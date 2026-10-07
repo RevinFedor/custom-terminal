@@ -1,6 +1,6 @@
 import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
 import { resolveHistoryOrchestrationHandoffPresentation } from './historyOrchestrationPromptPresentation.mjs';
-import { isServicePromptEntry, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
+import { getTerminalMcpTag, isServicePromptEntry, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
 
 const TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS = 2048;
 
@@ -83,7 +83,7 @@ export function projectTimelineSentHandoff(handoff, {
   const promptOriginTag = promptOriginTagForSource(handoff.source);
   const orchestration = resolveHistoryOrchestrationHandoffPresentation(handoff);
   const semanticTags = [
-    ...(orchestration ? [{ kind: 'orchestration', ...orchestration }] : []),
+    ...(orchestration?.runId ? [{ kind: 'orchestration', ...orchestration }] : []),
     ...(promptOriginTag ? [promptOriginTag] : []),
   ];
   const promptChipLabels = [...new Set((Array.isArray(handoff.promptChips) ? handoff.promptChips : [])
@@ -312,15 +312,14 @@ export function mergeTimelineEntriesWithSentHandoffs(
 ) {
   const source = Array.isArray(canonicalEntries) ? canonicalEntries : [];
   const orchestrationHandoffs = (Array.isArray(handoffEntries) ? handoffEntries : [])
-    .filter((handoff) => handoff?.isSentHandoffProjection === true
-      && handoff.semanticTags?.some((tag) => tag.kind === 'orchestration'));
+    .filter((handoff) => handoff?.isSentHandoffProjection === true && getTerminalMcpTag(handoff));
   const canonical = orchestrationHandoffs.length === 0 ? source : source.map((entry) => {
-    if (entry.semanticTags?.some((tag) => tag.kind === 'orchestration')) return entry;
+    if (getTerminalMcpTag(entry)) return entry;
     const matches = orchestrationHandoffs.filter((handoff) => (
       timelineEntryMatchesSentHandoff(entry, handoff)
     ));
     if (matches.length !== 1) return entry;
-    const tag = matches[0].semanticTags.find((candidate) => candidate.kind === 'orchestration');
+    const tag = getTerminalMcpTag(matches[0]);
     return { ...entry, semanticTags: [...(entry.semanticTags || []), tag] };
   });
   const retainedHandoffs = retainUnmaterializedTimelineSentHandoffs(canonical, handoffEntries);

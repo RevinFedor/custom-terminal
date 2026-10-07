@@ -81,3 +81,38 @@ test('the shared handoff wrapper distinguishes accepted application work from pr
   assert.equal(result.applicationQueued, true);
   assert.equal(store.getSnapshot(r.tabId)[0].queueStatus, 'application-queued');
 });
+
+const noInput = { success: false, accepted: false, deferred: true, automaticReadinessWait: 1,
+  error: 'codex_input_not_ready', submitted: false, pasteWritten: false, enterWritten: false };
+test('Main-certified busy deferral is IN APP QUEUE, not failed, through wrapper and remount', async () => {
+  const r = record('automatic-wait'), store = new HistoryPromptHandoffStore();
+  const result = await runHistoryPromptHandoff({ tabId: r.tabId, handoffId: r.handoffId, toolType: 'codex',
+    text: r.receipt.promptText, sendAttemptId: 'A', sendOperationKey: r.operationKey,
+    send: async () => noInput }, store);
+  assert.equal(result.submitted, false);
+  assert.equal(store.getSnapshot(r.tabId)[0].queueStatus, 'application-queued');
+  const wait = { ...r, attemptId: 'A', state: 'not-submitted', receipt: { ...r.receipt, ...noInput },
+    applicationQueue: { ...r.applicationQueue, waitingBeforeInput: true, lastNoWriteAttemptId: 'A' } };
+  assert.equal(hydrateHistoryPromptHandoffFromDurableReceipt(wait).handoff?.queueStatus, 'application-queued');
+  assert.equal(hydrateHistoryPromptHandoffFromDurableReceipt({ ...wait,
+    applicationQueue: { ...wait.applicationQueue, state: 'cancelled' } }).handoff?.queueStatus, 'cancelled');
+  hydrateHistoryPromptHandoffFromDurableReceipt(wait);
+  assert.equal(getHistoryPromptHandoffsSnapshot(r.tabId)[0].queueStatus, 'cancelled', 'late waiting cannot undo Pause/Stop');
+  consumeHistoryPromptHandoff(r.tabId, r.handoffId);
+});
+
+test('a late no-input receipt cannot replace a newer physical attempt or confirmed result', async () => {
+  const r = record('wait-ordering'), store = new HistoryPromptHandoffStore();
+  await runHistoryPromptHandoff({ tabId: r.tabId, handoffId: r.handoffId, toolType: 'codex', text: 'body',
+    sendAttemptId: 'A', sendOperationKey: r.operationKey, send: async () => noInput }, store);
+  store.begin({ tabId: r.tabId, handoffId: r.handoffId, toolType: 'codex', text: 'body',
+    sendAttemptId: 'B', sendOperationKey: r.operationKey });
+  store.settle(r.tabId, r.handoffId, { queueStatus: 'application-queued', reason: 'automatic-readiness-wait',
+    sendAttemptId: 'A', sendOperationKey: r.operationKey, noWriteAttemptId: 'A' });
+  assert.equal(store.getSnapshot(r.tabId)[0].sendAttemptId, 'B');
+  assert.equal(store.getSnapshot(r.tabId)[0].queueStatus, 'sending');
+  store.settle(r.tabId, r.handoffId, { queueStatus: 'delivery-unknown', reason: 'lost reply', sendAttemptId: 'B', sendOperationKey: r.operationKey });
+  store.settle(r.tabId, r.handoffId, { queueStatus: 'application-queued', reason: 'automatic-readiness-wait',
+    sendAttemptId: 'B', sendOperationKey: r.operationKey, noWriteAttemptId: 'B' });
+  assert.equal(store.getSnapshot(r.tabId)[0].queueStatus, 'delivery-unknown');
+});

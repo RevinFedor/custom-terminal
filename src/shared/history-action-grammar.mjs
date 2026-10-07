@@ -877,5 +877,7 @@ export function historyActionPresentationMeta({ toolName, args, family, bashWord
     targetLabel,
     operationLabel,
     docsKind,
+    // Display subjects can be summaries (e.g. "Patch not applied"), not paths.
+    ...(fam === 'edit' && rawPathTarget ? { fileEditTarget: normalizeTarget(rawPathTarget) } : {}),
   };
 }

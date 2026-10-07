@@ -28,6 +28,7 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   const rawState = deferred();
   const syncWrites = [];
   const ipcRenderer = {
+    on() {}, removeListener() {},
     invoke: async (channel, payload) => {
       if (channel === 'ai-prompts:get') return { success: true, data: [{ id: 'run-after-loop', content: 'continue until done' }] };
       if (channel === 'ai-prompts:save-content') return { success: true };

@@ -6,6 +6,7 @@ import {
   isStandaloneAgentLocalCommand,
   projectAgentLocalCommandSendResult,
 } from './agentLocalCommand.mjs';
+import { isAutomaticReadinessWaitReceipt } from '../../shared/prompt-queue-send-intent.cjs';
 
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
 
@@ -189,6 +190,8 @@ export interface SettleHistoryPromptHandoffInput {
   sendAttemptId?: string | null;
   sendOperationKey?: string | null;
   toolType?: HistoryPromptHandoffTool;
+  /** Main certified this exact attempt ended before any terminal input. */
+  noWriteAttemptId?: string;
 }
 
 export interface AdoptHistoryPromptHandoffCanonicalInput {
@@ -211,7 +214,8 @@ export interface AcceptHistoryPromptHandoffProviderQueueInput
 }
 
 export interface DurableHistorySendReceiptRecord {
-  applicationQueue?: { version: number; id: number; state: string; queuedAt: number } | null;
+  applicationQueue?: { version: number; id: number; state: string; queuedAt: number;
+    waitingBeforeInput?: boolean; lastNoWriteAttemptId?: string } | null;
   promptHash?: string | null;
   imagePresentation?: { version: number; operationKey: string; attemptId: string; requestHash: string;
     imagePaths: HistoryPromptHandoffImageRef[] } | null;
@@ -1323,7 +1327,9 @@ export class HistoryPromptHandoffStore {
     // A delayed admission ACK cannot move a physically executing/confirmed
     // attempt back to the application backlog.
     if (input.queueStatus === 'application-queued'
-      && (current.value.sendAttemptId || current.value.auditProof || current.value.providerQueueProof)) return current.value;
+      && (current.value.auditProof || current.value.providerQueueProof
+        || (current.value.sendAttemptId && (input.noWriteAttemptId !== current.value.sendAttemptId
+          || ['sent', 'queued', 'audit-pending', 'delivery-unknown'].includes(current.value.queueStatus))))) return current.value;
     const currentHasExactReceipt = current.value.queueStatus === 'sent'
       && current.value.auditProof !== null;
     const incomingKeepsExactReceipt = input.queueStatus === 'sent'
@@ -1767,6 +1773,13 @@ export async function runHistoryPromptHandoff(
 
   try {
     const result = await input.send(handoffId);
+    if (isAutomaticReadinessWaitReceipt(result) && input.sendAttemptId) {
+      store.settle(input.tabId, handoffId, { queueStatus: 'application-queued',
+        reason: 'automatic-readiness-wait', sendAttemptId: input.sendAttemptId,
+        sendOperationKey: input.sendOperationKey, noWriteAttemptId: input.sendAttemptId,
+        requiresAuditIdentity: true });
+      return result; // the physical receipt stays NOT_SUBMITTED, never Sent
+    }
     if (result?.applicationQueued === true && result?.applicationQueue?.version === 1) {
       store.bindSendIdentity(input.tabId, handoffId, { sendOperationKey: result.operationKey,
         applicationQueueId: result.applicationQueue.id });
@@ -2049,7 +2062,10 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   const promptText = typeof receipt.promptText === 'string' ? receipt.promptText : '';
   const applicationWaiting = record.applicationQueue?.version === 1
     && record.applicationQueue.state === 'waiting'
-    && !attemptId && (record.state === 'reserved' || record.state === 'preparing');
+    && ((!attemptId && (record.state === 'reserved' || record.state === 'preparing'))
+      || (record.applicationQueue.waitingBeforeInput === true && !!attemptId
+        && record.applicationQueue.lastNoWriteAttemptId === attemptId && record.state === 'not-submitted'
+        && isAutomaticReadinessWaitReceipt(receipt)));
   const applicationNoWrite = record.applicationQueue?.version === 1
     && record.state === 'not-submitted';
   if ((record?.surface !== 'desktop-history' && record.applicationQueue?.version !== 1)
@@ -2067,7 +2083,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   ) {
     return { hydrated: false, reason: 'durable-history-presentation-dismissed' };
   }
-  if (record.state === 'not-submitted') {
+  if (record.state === 'not-submitted' && !applicationWaiting) {
     if (applicationNoWrite) {
       const current = getHistoryPromptHandoffsSnapshot(tabId).find(item => item.handoffId === handoffId);
       if (current && !historyPromptHandoffAcceptsAuditIdentity(current,
@@ -2081,7 +2097,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
         promptChips: presentation.promptChips || [], authoringText: receipt.authoringSnapshot?.editorText,
         authoringChips: receipt.authoringSnapshot?.chips, authoringImagePaths: receipt.authoringSnapshot?.imagePaths,
         submittedAt: Number(record.createdAt), requiresAuditIdentity: true,
-        initialReceipt: { queueStatus: receipt.cancelled ? 'cancelled' : 'failed',
+        initialReceipt: { queueStatus: receipt.cancelled || record.applicationQueue?.state === 'cancelled' ? 'cancelled' : 'failed',
           reason: receipt.code || 'application-queue-not-submitted' } });
       return { hydrated: !!handoff, reason: 'application-queue-not-submitted', handoff };
     }
@@ -2221,8 +2237,10 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   const initialReceipt = queueStatus
     ? {
         queueStatus,
+        ...(applicationWaiting && attemptId ? { noWriteAttemptId: attemptId } : {}),
         reason: queueStatus === 'sent'
           ? 'durable-audit-confirmed'
+          : applicationWaiting ? 'automatic-readiness-wait'
           : queueStatus === 'queued'
             ? 'durable-provider-queue-accepted'
           : queueStatus === 'audit-pending'

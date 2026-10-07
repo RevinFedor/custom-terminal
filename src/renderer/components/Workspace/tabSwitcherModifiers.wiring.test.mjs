@@ -82,7 +82,9 @@ test('меню оркестрации — тот же consumer, а не прям
     'const openLinkedTab = useCallback(async (run: OrchestrationRun) => {',
     'const runAction = useCallback(',
   );
-  assert.match(open, /placeTab\(projectId, linkedTabId\)/);
+  assert.match(open, /await useWorkspaceStore\.getState\(\)\.openTabById\(linkedTabId,/);
+  assert.match(open, /if \(!opened\) return;/);
+  assert.doesNotMatch(open, /placeTab\(/);
   assert.doesNotMatch(open, /switchTab\(projectId, linkedTabId\)/);
 });
 

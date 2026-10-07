@@ -444,6 +444,11 @@ async function httpApiGet(target, endpoint) {
     error.code = json.code;
     error.revision = json.revision;
     if (/\/codex\/goal(?:\?|$)/.test(endpoint)) error.toolDetails = json;
+    if (/\/history-operations(?:\/|\?|$)/.test(endpoint)
+      || /\/send-receipts\/(?:reconcile|release)$/.test(endpoint)) {
+      error.toolDetails = json;
+      error.code = json.code || json.error;
+    }
     throw error;
   }
   return json;
@@ -465,6 +470,11 @@ async function httpApiPost(target, endpoint, body) {
     error.messageId = json.messageId;
     error.deliveryState = json.deliveryState;
     if (/\/codex\/goal(?:\?|$)/.test(endpoint)) error.toolDetails = json;
+    if (/\/history-operations(?:\/|\?|$)/.test(endpoint)
+      || /\/send-receipts\/(?:reconcile|release)$/.test(endpoint)) {
+      error.toolDetails = json;
+      error.code = json.code || json.error;
+    }
     throw error;
   }
   return json;
@@ -789,6 +799,116 @@ async function ensureCodexGoalSupport(target) {
     throw Object.assign(new Error('This Noted Terminal app requires an update for the Codex Goal action API. No keys, Send or Resume fallback was attempted.'), { code: 'app_update_required' });
   }
 }
+
+function historyArgumentError(message) {
+  return Object.assign(new Error(message), {
+    toolDetails: { code: 'invalid_history_operation_arguments', mutationAttempted: false },
+  });
+}
+
+function historyOperationArgs(args, { read = false } = {}) {
+  const allowed = read
+    ? ['tabId', 'operationId', 'projectId', 'includeStatus']
+    : ['tabId', 'operationId', 'projectId', 'expectedSessionId', 'targetUuid', 'toolType',
+      'targetSourceIdentity', 'targetEntryRef', 'expectedContentRevision', 'repairOfOperationId'];
+  if (!args || typeof args !== 'object' || Array.isArray(args)
+    || Object.keys(args).some(key => !allowed.includes(key))) {
+    throw historyArgumentError('Only exact saved-history arguments are accepted; native/AI-summary modes and menu/text/index arguments are removed.');
+  }
+  const string = (value, field) => {
+    if (typeof value !== 'string' || !value.trim()) throw historyArgumentError(field + ' must be a non-empty string');
+    return value;
+  };
+  const tabId = string(args.tabId, 'tabId');
+  // Caller-owned before the MCP request too: losing the entire MCP ACK or
+  // process must not erase the only recovery key for an accepted mutation.
+  const operationId = string(args.operationId, 'operationId');
+  if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(operationId)) throw historyArgumentError('Invalid operationId (1..160 letters, digits, underscore, dot, colon or hyphen)');
+  if (args.projectId !== undefined) string(args.projectId, 'projectId');
+  if (read) {
+    if (args.includeStatus !== undefined && typeof args.includeStatus !== 'boolean') throw historyArgumentError('includeStatus must be boolean');
+    return { tabId, operationId };
+  }
+  const toolType = args.toolType === undefined ? 'codex' : args.toolType;
+  if (!['codex', 'claude'].includes(toolType)) throw historyArgumentError('toolType must be codex or claude');
+  const request = { operationId, kind: 'rewind', toolType,
+    expectedSessionId: string(args.expectedSessionId, 'expectedSessionId'),
+    targetUuid: string(args.targetUuid, 'targetUuid') };
+  if (args.repairOfOperationId !== undefined) {
+    const previous = string(args.repairOfOperationId, 'repairOfOperationId');
+    if (toolType !== 'codex' || previous === operationId || !/^[A-Za-z0-9_.:-]{1,160}$/.test(previous)) {
+      throw historyArgumentError('repairOfOperationId must address another completed Codex saved-history operation');
+    }
+    request.repairOfOperationId = previous;
+  }
+  for (const key of ['targetSourceIdentity', 'expectedContentRevision']) {
+    if (args[key] !== undefined) request[key] = args[key] === null ? null : string(args[key], key);
+  }
+  if (toolType === 'claude' && !request.expectedContentRevision) throw historyArgumentError('Claude saved-history requires expectedContentRevision');
+  if (args.targetEntryRef === null) request.targetEntryRef = null;
+  else if (args.targetEntryRef !== undefined) {
+    const ref = args.targetEntryRef;
+    const fields = ['physicalSessionId', 'rawUuid', 'sourceIdentity', 'segmentId', 'viewOwnerSessionId', 'contentRevision'];
+    if (!ref || typeof ref !== 'object' || Array.isArray(ref)
+      || Object.keys(ref).some(key => !fields.includes(key)) || !request.expectedContentRevision) {
+      throw historyArgumentError('targetEntryRef requires exact physicalSessionId/rawUuid and expectedContentRevision');
+    }
+    string(ref.physicalSessionId, 'targetEntryRef.physicalSessionId');
+    string(ref.rawUuid, 'targetEntryRef.rawUuid');
+    for (const key of fields) {
+      if (ref[key] !== undefined && !(key === 'sourceIdentity' && ref[key] === null)) string(ref[key], 'targetEntryRef.' + key);
+    }
+    if (ref.viewOwnerSessionId && ref.viewOwnerSessionId !== request.expectedSessionId) throw historyArgumentError('targetEntryRef.viewOwnerSessionId differs from expectedSessionId');
+    if (ref.contentRevision !== undefined && ref.contentRevision !== request.expectedContentRevision) {
+      throw historyArgumentError('targetEntryRef.contentRevision differs from expectedContentRevision');
+    }
+    request.targetEntryRef = { ...ref };
+  }
+  return { tabId, operationId, request };
+}
+
+async function ensureSavedHistorySupport(target, toolType = null, request = null) {
+  const response = await httpApiGet(target, '/api/me');
+  const cap = response?.capabilities?.savedHistory;
+  if (cap?.version !== 1 || cap.receipts !== true || cap.structuredDraft !== true
+    || !Array.isArray(cap.operations) || !cap.operations.includes('rewind')
+    || (toolType && (!Array.isArray(cap.providers) || !cap.providers.includes(toolType)))
+    || request?.toolType === 'codex' && cap.codexPhysicalSuffix !== true
+    || request?.repairOfOperationId && cap.repairOfOperationId !== true) {
+    throw Object.assign(new Error('This Noted Terminal app requires an update for saved-history Rewind/receipts. No native, AI-summary or raw-file fallback is allowed.'), { code: 'app_update_required' });
+  }
+}
+
+const HISTORY_OPERATION_GUIDANCE = 'Acceptance/202 and a completed receipt are not inputReady or proof of a clean history prefix. Inspect operation historyMutated, bindingCommitted/binding, newSessionId, draft and resume separately. Read current status and the exact resulting history before an authorized single send_prompt; Rewind never submits the restored prompt. Do not poll or repeat an unknown operation.';
+
+function requireHistoryOperationResponse(result, tabId, operationId, kind = null, request = null) {
+  const op = result?.operation;
+  if (result?.ok === false || !op || op.tabId !== tabId || op.operationId !== operationId
+    || !['rewind', 'delete'].includes(op.kind) || (kind && op.kind !== kind)
+    || (request && (op.expectedSessionId !== request.expectedSessionId
+      || op.targetUuid !== request.targetUuid || op.toolType !== request.toolType))) {
+    throw Object.assign(new Error('Saved-history response has no matching operation receipt'), {
+      code: 'history_operation_response_mismatch',
+    });
+  }
+  return result;
+}
+
+function historyOperationError(cause, tabId, operationId, mutationAttempted = false) {
+  let details = cause?.toolDetails || {};
+  let code = cause?.code || details.code;
+  if (details.operation) {
+    try { requireHistoryOperationResponse(details, tabId, operationId); }
+    catch { details = {}; code = 'history_operation_response_mismatch'; }
+  }
+  const receiptRead = { tabId, operationId };
+  const recovery = 'For explicit recovery read get_history_operation(' + JSON.stringify(receiptRead)
+    + ') with this SAME identity. Never use native keys, repeat a mutation, create a new operationId, or infer no mutation from an absent/unknown receipt.';
+  const error = new Error(String(cause?.message || cause) + ' ' + recovery);
+  error.toolDetails = { ...details, code: code || (mutationAttempted ? 'history_operation_outcome_unknown' : 'history_operation_read_failed'),
+    tabId, operationId, mutationAttempted, receiptRead, recovery };
+  return error;
+}
 const SYSTEM_PROMPT_FIELDS = {
   name: { type: 'string' }, content: { type: 'string', description: 'Own system instruction text, not resolved file contents.' },
   model: { type: 'string', description: 'Exact stored auxiliary model ID. Loop uses the tab agent instead.' },
@@ -816,7 +936,9 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'import_external_conversation',
   'continue_external_research',
   'send_message', 'reply_to_message', 'get_message', 'get_send_receipt',
+  'reconcile_send_receipt', 'release_send_queue_head',
   'get_codex_goal', 'resolve_codex_goal',
+  'rewind_history', 'get_history_operation', 'rewind_ai',
 ]);
 
 const TOOLS = [
@@ -1621,6 +1743,23 @@ const TOOLS = [
     },
   },
   {
+    name: 'reconcile_send_receipt',
+    description: 'Run the existing app-owned exact auditor for one operation/attempt. No input or retry of that operation. Positive proof may wake its already-admitted follower through normal guards; absent/unknown stays unknown. Not a poll or a caller-supplied proof API.',
+    inputSchema: { type: 'object', additionalProperties: false,
+      properties: { tabId: { type: 'string', minLength: 1 }, operationKey: { type: 'string', minLength: 1 },
+        attemptId: { type: 'string', minLength: 1 }, projectId: { type: 'string' } },
+      required: ['tabId', 'operationKey', 'attemptId'] },
+  },
+  {
+    name: 'release_send_queue_head',
+    description: 'USER-AUTHORIZED exact FIFO recovery only: re-audit one uncertain head, then continue the queue despite its unknown outcome. Keeps submitted/delivery-unknown/frozen payload and historical proof; never replays it or revives cancelled followers. No automatic batch skip. Choose requestId before calling; after ACK loss read get_send_receipt and use only the SAME unchanged request if recovery is needed.',
+    inputSchema: { type: 'object', additionalProperties: false,
+      properties: { tabId: { type: 'string', minLength: 1 }, operationKey: { type: 'string', minLength: 1 },
+        attemptId: { type: 'string', minLength: 1 }, requestId: { type: 'string', minLength: 1 },
+        acknowledgeDeliveryUnknown: { type: 'boolean', const: true }, projectId: { type: 'string' } },
+      required: ['tabId', 'operationKey', 'attemptId', 'requestId', 'acknowledgeDeliveryUnknown'] },
+  },
+  {
     name: 'send_prompt',
     description: 'Send text to a Claude/Codex tab through the Project API scenario layer. `files` attaches local UTF-8 text by path: Noted Terminal reads and snapshots it server-side, so this caller must not call read_file or paste the body itself. Files require submit=true. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns a delivery status, not an answer. For pending/unknown delivery use get_send_receipt({tabId,handoffId}); never retry changed or empty text to check status, and never invent a new operation ID for an unresolved send. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use send_message for short questions with an addressed reply, and run_command for generic shells.',
     inputSchema: {
@@ -1852,25 +1991,42 @@ const TOOLS = [
     },
   },
   {
-    name: 'rewind_ai',
-    description: 'Run native or AI rewind for a Claude/Codex terminal tab through the shared scenario layer. Use exact target fields from the history/timeline item when available.',
+    name: 'rewind_history',
+    description: 'Rewind saved history through the existing app Stop/rewrite/adopt/Resume executor (Codex copy-on-write). Only exact session/user identity; no native menu, AI-summary, text/index guessing or fallback. Choose a stable operationId BEFORE this MCP call so ACK loss/restart cannot lose the recovery key. Reads/retries must retain that exact ID and unchanged request. Acceptance/202 is not completion/readiness or proof of a clean prefix; use get_history_operation for an explicit receipt read. Restores a structured draft but does not submit its prompt.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
-        mode: { type: 'string', enum: ['native', 'ai'], description: 'Default native. ai builds a compact/rewind prompt.' },
-        targetIndex: { type: 'integer', description: 'Timeline/history index to rewind to, when available.' },
-        targetText: { type: 'string', description: 'Short target text shown in the history UI.' },
-        targetFullText: { type: 'string', description: 'Full target prompt/assistant text, when available.' },
-        rewindableCount: { type: 'integer', description: 'Number of rewindable items visible to the caller.' },
-        skipDuplicates: { type: 'integer', description: 'Number of duplicate prompt entries to skip.' },
-        startUuid: { type: 'string', description: 'Start UUID for AI rewind range.' },
-        endUuid: { type: 'string', description: 'End UUID for AI rewind range.' },
-        targetUuid: { type: 'string', description: 'Fallback target UUID.' },
-        additionalPrompt: { type: 'string', description: 'Optional extra instruction for AI rewind.' },
+        operationId: { type: 'string', minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_.:-]+$', description: 'Required caller-owned durable ID, chosen before this call. After unknown/ACK loss read the SAME ID; no automatic retry or new ID.' },
+        expectedSessionId: { type: 'string', minLength: 1, description: 'Exact saved/view-owner SID of the selected history. Never inferred from current tab or prompt text.' },
+        targetUuid: { type: 'string', minLength: 1, description: 'Exact user UUID from the selected history/timeline entry, not a numeric turn or text match.' },
+        repairOfOperationId: { type: 'string', minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_.:-]+$',
+          description: 'Optional exact completed same-tab Codex Rewind receipt to repair an untouched erroneous COW child. expectedSessionId must be its current child and targetUuid its original target. App derives the original source, proves unchanged prefix/target and no new child work; no arbitrary session switch. Requires advertised repair capability.' },
+        toolType: { type: 'string', enum: ['codex', 'claude'], description: 'Provider of that saved history. Default codex; Claude requires expectedContentRevision.' },
+        targetSourceIdentity: { type: ['string', 'null'], minLength: 1, description: 'Exact sourceIdentity of the selected entry when available.' },
+        expectedContentRevision: { type: ['string', 'null'], minLength: 1, description: 'Exact content revision from the selected public timeline. Required for composite/Claude; optional for standalone Codex, never discarded if supplied.' },
+        targetEntryRef: { type: ['object', 'null'], additionalProperties: false, required: ['physicalSessionId', 'rawUuid'],
+          description: 'Exact public entryRef for composite history; requires expectedContentRevision. Do not reconstruct from offsets/text.',
+          properties: { physicalSessionId: { type: 'string', minLength: 1 }, rawUuid: { type: 'string', minLength: 1 },
+            viewOwnerSessionId: { type: 'string', minLength: 1 }, sourceIdentity: { type: ['string', 'null'], minLength: 1 }, segmentId: { type: 'string', minLength: 1 },
+            contentRevision: { type: 'string', minLength: 1, description: 'Nested revision returned by public Timeline. When present it must equal expectedContentRevision; pass the public entryRef unchanged.' } } },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
       },
-      required: ['tabId'],
+      required: ['tabId', 'operationId', 'expectedSessionId', 'targetUuid'],
+    },
+  },
+  {
+    name: 'get_history_operation',
+    description: 'Read one durable saved-history operation receipt by the original tabId/operationId, including after ACK loss or restart. GET only: no Stop, Resume, rewrite or retry. Pending/outcome-unknown or a missing receipt is not permission for another mutation. Preserves historyMutated, binding, new SID, full structured draft and resume result; completed is not current inputReady or prefix proof. Optional includeStatus reads current live status separately; a status failure cannot erase the receipt. Explicit recovery read, not a polling loop.',
+    inputSchema: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        tabId: { type: 'string', minLength: 1 },
+        operationId: { type: 'string', minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_.:-]+$', description: 'Original durable operation ID, never a new one for a status check.' },
+        includeStatus: { type: 'boolean', description: 'Default false. Read /status separately as currentStatus; do not infer readiness from the immutable operation receipt.' },
+        projectId: { type: 'string', description: 'Optional project routing hint.' },
+      }, required: ['tabId', 'operationId'],
     },
   },
   {
@@ -2852,6 +3008,40 @@ async function callTool(name, args) {
         + '/codex/goal' + (args.requestId ? '?requestId=' + encodeURIComponent(args.requestId) : '')), null, 2);
     }
 
+    case 'reconcile_send_receipt':
+    case 'release_send_queue_head': {
+      const release = name === 'release_send_queue_head';
+      const allowed = ['tabId', 'operationKey', 'attemptId', 'projectId', ...(release ? ['requestId', 'acknowledgeDeliveryUnknown'] : [])];
+      if (!args || Object.keys(args).some(key => !allowed.includes(key)) || release && args.acknowledgeDeliveryUnknown !== true) {
+        throw Object.assign(new Error('Only exact receipt recovery arguments and explicit unknown acknowledgement are accepted'),
+          { toolDetails: { code: 'invalid_send_receipt_arguments', mutationAttempted: false } });
+      }
+      const tabId = requireNonemptyString(args.tabId, 'tabId');
+      const target = projectHint(args, tabId);
+      const operationKey = requireNonemptyString(args.operationKey, 'operationKey');
+      const attemptId = requireNonemptyString(args.attemptId, 'attemptId');
+      const requestId = release ? requireNonemptyString(args.requestId, 'requestId') : null;
+      let mutationAttempted = false;
+      try {
+        const me = await httpApiGet(target, '/api/me');
+        const cap = me?.capabilities?.sendQueue?.[release ? 'explicitUnknownRelease' : 'receiptReconciliation'];
+        if (cap?.version !== 1 || cap.exactAttempt !== true) throw Object.assign(new Error('Noted Terminal app requires an update for exact receipt recovery'), { code: 'app_update_required' });
+        mutationAttempted = true;
+        const result = await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(tabId)
+          + '/send-receipts/' + (release ? 'release' : 'reconcile'), { operationKey, attemptId,
+          ...(release ? { requestId, acknowledgeDeliveryUnknown: true } : {}) });
+        if (result.tabId !== tabId || result.operationKey !== operationKey || result.attemptId !== attemptId
+          || release && result.requestId !== requestId) {
+          throw Object.assign(new Error('Receipt recovery response identity mismatch'), { code: 'send_receipt_recovery_response_mismatch' });
+        }
+        return JSON.stringify(result, null, 2);
+      } catch (error) {
+        throw Object.assign(error, { toolDetails: { code: error.code || 'send_receipt_recovery_failed',
+          tabId, operationKey, attemptId, ...(release ? { requestId } : {}), mutationAttempted,
+          recovery: 'Read the original receipt/release marker; never replay the uncertain prompt or use a new recovery ID.' } });
+      }
+    }
+
     case 'resolve_codex_goal': {
       const tabId = requireNonemptyString(args.tabId, 'tabId');
       const operationId = requireNonemptyString(args.operationId, 'operationId');
@@ -3140,19 +3330,46 @@ async function callTool(name, args) {
     }
 
     case 'rewind_ai': {
-      const target = projectHint(args, args.tabId);
-      const result = await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/rewind', {
-        mode: args.mode || 'native',
-        targetIndex: args.targetIndex,
-        targetText: args.targetText,
-        targetFullText: args.targetFullText,
-        rewindableCount: args.rewindableCount,
-        skipDuplicates: args.skipDuplicates || 0,
-        startUuid: args.startUuid || args.targetUuid || undefined,
-        endUuid: args.endUuid || undefined,
-        additionalPrompt: args.additionalPrompt || undefined,
+      throw Object.assign(new Error('rewind_ai is removed from Terminal MCP. Use rewind_history with operationId, expectedSessionId and exact targetUuid. Native menu and AI-summary Rewind remain UI-only; no HTTP mutation was attempted.'), {
+        toolDetails: { code: 'rewind_ai_removed', mutationAttempted: false, replacement: 'rewind_history' },
       });
-      return 'Rewind requested for tab ' + args.tabId + ':\n\n' + JSON.stringify(result, null, 2);
+    }
+
+    case 'rewind_history': {
+      const { tabId, operationId, request } = historyOperationArgs(args);
+      let mutationAttempted = false;
+      try {
+        const target = projectHint(args, tabId);
+        await ensureSavedHistorySupport(target, request.toolType, request);
+        mutationAttempted = true;
+        const result = requireHistoryOperationResponse(await httpApiPost(target,
+          '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/history-operations', request), tabId, operationId, 'rewind', request);
+        return JSON.stringify({ ...result, tabId, operationId, guidance: HISTORY_OPERATION_GUIDANCE }, null, 2);
+      } catch (error) { throw historyOperationError(error, tabId, operationId, mutationAttempted); }
+    }
+
+    case 'get_history_operation': {
+      const { tabId, operationId } = historyOperationArgs(args, { read: true });
+      try {
+        const target = projectHint(args, tabId);
+        await ensureSavedHistorySupport(target);
+        let result;
+        try {
+          result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(tabId)
+            + '/history-operations/' + encodeURIComponent(operationId));
+        } catch (error) {
+          // HTTP 409 can be a successfully read FAILED operation receipt.
+          // Keep that outcome distinct from an unavailable receipt reader.
+          if (error.toolDetails?.ok !== true || !error.toolDetails?.operation) throw error;
+          result = error.toolDetails;
+        }
+        requireHistoryOperationResponse(result, tabId, operationId);
+        if (args.includeStatus === true) {
+          try { result.currentStatus = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/status'); }
+          catch (error) { result.currentStatus = null; result.currentStatusError = String(error.message || error); }
+        }
+        return JSON.stringify({ ...result, tabId, operationId, guidance: HISTORY_OPERATION_GUIDANCE }, null, 2);
+      } catch (error) { throw historyOperationError(error, tabId, operationId); }
     }
 
     case 'get_pending_question': {

@@ -181,6 +181,15 @@ Paired main/renderer build PASS; source ещё не установлен. Арт
 
 Список хаба задан `defaultServerDefs()` и содержит шесть наших stdio-серверов; он не импортирует произвольные записи из Codex/Claude config. `6/6` подтверждает здоровье этого хаба, а внешние регистрации source-панель показывает отдельно из Codex (раздел UI выше). Например, `codex mcp add figma --url https://mcp.figma.com/mcp` добавляет прямое HTTP/OAuth-подключение в глобальный конфиг Codex. Отдельный локальный процесс Figma не нужен, а её native OAuth остаётся у Codex.
 
+Это объяснение относится к remote Figma HTTP/OAuth, не к Figma Console.
+В срезе05.10 native config/read показал enabled stdio `figma_console`
+(`node …/figma-console-mcp/dist/local.js`) и `yandex-wiki`. Реальные процессы
+под Codex: отдельные node/Figma и uv→Python/Yandex экземпляры в разных
+сессиях. Повторение в «Ресурсах» является реальным расходом внешних MCP,
+не размножением шести детей хаба. В панели теперь они подписаны именами MCP
+и не входят в расход пользовательских команд. Исправление отображения не
+меняет stdio-транспорт, config или активные подключения.
+
 04.10.2026 на Codex 0.159.2: глобальная Figma enabled/OAuth, новый native app-server получил 43 инструмента через `mcpServerStatus/list`; чтение/изменение design-файлов не выполнялось. Старая сессия может держать прежний каталог. Для использования нового MCP достаточно нового запуска Codex (либо перезапуска процесса с Resume сохранённой сессии), затем `/mcp` проверяет активный список. Build Install Noted Terminal для этого не требуется; «Перезапустить все MCP» обновляет только шесть детей хаба и не перечитывает native MCP config в живом Codex. App-server имеет отдельный `config/mcpServer/reload`, но текущий Noted PTY-клиент не предоставляет такого действия. Число 43 — результат этого среза, не постоянный контракт Figma.
 
 Вторая проверка того же дня закрыла отличие внешнего shell от штатного запуска Noted: через Terminal MCP создана background child-вкладка4933 командой `codex`, затем Project API отправил только `/mcp verbose`. Реальный TUI0.159.2 внутри установленного Noted ответил `figma: connected (43 tools)` / `Auth: OAuth`, также `figma_console: connected (121 tools)` и готовые штатные MCP. Вкладка закрыта обычным `close_tab`, model prompt/design reads/writes не запускались. У текущей4875 фактическое окружение CLI использует стандартный `~/.codex`, без отдельного CODEX_HOME/profile, project `.codex/config.toml` отсутствует. Для нового штатного запуска недоступность Figma из-за Noted опровергнута; более старый каталог конкретной уже открытой сессии не проверялся этой пробой. Установленная панель этой диагностической проверки читала только IPC `mcp-hub:status`; последующий source-ремонт каталога описан в UI выше. Источник проверки — `/private/tmp/noted-figma-native-launch-20261004.3bt6p062/HANDOFF.md`.

@@ -7,8 +7,58 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { SavedHistoryOperations } = require('../src/main/saved-history-operation.js');
+const { SessionTranscriptService } = require('../src/main/session-transcript-service.js');
 
 const terminalServerPath = fileURLToPath(new URL('./terminal-server.mjs', import.meta.url));
+
+test('exact receipt recovery methods forward only operation/attempt and explicit caller-owned release identity', async t => {
+  const h = await createHarness(t, (body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { sendQueue: { receiptReconciliation: { version: 1, exactAttempt: true },
+      explicitUnknownRelease: { version: 1, exactAttempt: true } } } } }
+    : { status: 200, body: { ok: true, tabId: 'target', ...body, receipt: { state: 'delivery-unknown', submitted: true } } });
+  const exact = { tabId: 'target', operationKey: 'old-operation', attemptId: 'old-attempt' };
+  const audit = await h.invoke(exact, 'reconcile_send_receipt');
+  const release = await h.invoke({ ...exact, requestId: 'release-old-v1', acknowledgeDeliveryUnknown: true }, 'release_send_queue_head');
+  assert.equal(audit.result.isError, undefined);
+  assert.equal(release.result.isError, undefined);
+  assert.equal(audit.result.structuredContent.receipt.state, 'delivery-unknown');
+  assert.equal(release.result.structuredContent.requestId, 'release-old-v1');
+  assert.deepEqual(h.requests.filter(request => request.method === 'POST'), [
+    { method: 'POST', url: '/api/terminal-tabs/target/send-receipts/reconcile', body: { operationKey: exact.operationKey, attemptId: exact.attemptId } },
+    { method: 'POST', url: '/api/terminal-tabs/target/send-receipts/release', body: { operationKey: exact.operationKey, attemptId: exact.attemptId,
+      requestId: 'release-old-v1', acknowledgeDeliveryUnknown: true } },
+  ]);
+});
+
+test('recovery refuses old capabilities/extra proof and retains original recovery IDs after ACK loss', async t => {
+  const exact = { tabId: 'target', operationKey: 'old-operation', attemptId: 'old-attempt',
+    requestId: 'release-old-v1', acknowledgeDeliveryUnknown: true };
+  const old = await createHarness(t, () => ({ status: 200, body: { capabilities: {} } }));
+  assert.equal((await old.invoke(exact, 'release_send_queue_head')).result.structuredContent.code, 'app_update_required');
+  assert.deepEqual(old.requests.map(request => request.method), ['GET']);
+  const invalid = await createHarness(t, () => { throw Error('invalid recovery must not use HTTP'); });
+  assert.equal((await invalid.invoke({ ...exact, prompt: 'do not replay' }, 'release_send_queue_head')).result.isError, true);
+  assert.equal((await invalid.invoke({ ...exact, acknowledgeDeliveryUnknown: false }, 'release_send_queue_head')).result.isError, true);
+  assert.deepEqual(invalid.requests, []);
+  const lost = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { sendQueue: { explicitUnknownRelease: { version: 1, exactAttempt: true } } } } }
+    : { disconnect: true });
+  const result = await lost.invoke(exact, 'release_send_queue_head');
+  assert.equal(result.result.isError, true);
+  assert.equal(result.result.structuredContent.requestId, exact.requestId);
+  assert.equal(result.result.structuredContent.operationKey, exact.operationKey);
+  assert.equal(result.result.structuredContent.attemptId, exact.attemptId);
+  assert.equal(result.result.structuredContent.mutationAttempted, true);
+  assert.equal(lost.requests.filter(request => request.method === 'POST').length, 1);
+  const rejected = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { sendQueue: { explicitUnknownRelease: { version: 1, exactAttempt: true } } } } }
+    : { status: 409, body: { error: 'send_queue_release_not_head' } });
+  assert.equal((await rejected.invoke(exact, 'release_send_queue_head')).result.structuredContent.code, 'send_queue_release_not_head');
+});
 
 test('Codex Goal tools read exact state and choose only an addressed native option', async t => {
   const h = await createHarness(t, (body, _i, req) => req.url === '/api/me'
@@ -84,11 +134,13 @@ function readJsonLine(stream, timeoutMs = 5000) {
       clearTimeout(timeout);
       stream.off('data', onData);
       stream.off('error', onError);
+      stream.off('end', onEnd);
     };
     const onError = (error) => {
       cleanup();
       reject(error);
     };
+    const onEnd = () => onError(new Error('Terminal MCP closed before responding'));
     const onData = (chunk) => {
       buffer += String(chunk);
       const newline = buffer.indexOf('\n');
@@ -103,6 +155,7 @@ function readJsonLine(stream, timeoutMs = 5000) {
     };
     stream.on('data', onData);
     stream.on('error', onError);
+    stream.on('end', onEnd);
   });
 }
 
@@ -120,7 +173,8 @@ async function createHarness(t, respond, { historyApi = false } = {}) {
     for await (const chunk of req) raw += String(chunk);
     const body = raw ? JSON.parse(raw) : {};
     requests.push({ method: req.method, url: req.url, body });
-    const response = respond(body, requests.length, req);
+    const response = await respond(body, requests.length, req);
+    if (response.disconnect) { req.socket.destroy(); return; }
     res.writeHead(response.status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(response.body));
   });
@@ -141,7 +195,7 @@ async function createHarness(t, respond, { historyApi = false } = {}) {
     updatedAt: Date.now(),
   }), 'utf8');
 
-  const child = spawn(process.execPath, [terminalServerPath, '--project', projectPath], {
+  const spawnChild = () => spawn(process.execPath, [terminalServerPath, '--project', projectPath], {
     env: {
       ...process.env,
       NOTED_DISCOVERY_DIR: discoveryDir,
@@ -151,31 +205,340 @@ async function createHarness(t, respond, { historyApi = false } = {}) {
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
-
-  t.after(async () => {
+  let child = spawnChild();
+  const stopChild = async () => {
     child.stdin.end();
     if (child.exitCode === null) child.kill('SIGTERM');
     if (child.exitCode === null) await once(child, 'exit');
+  };
+
+  t.after(async () => {
+    await stopChild();
     await new Promise((resolve) => webServer.close(resolve));
     await rm(home, { recursive: true, force: true });
   });
 
   let requestId = 0;
+  const rpc = async (method, params) => {
+    const response = readJsonLine(child.stdout);
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: ++requestId, method, params }) + '\n');
+    return response;
+  };
   return {
     requests,
+    rpc,
+    async restart() { await stopChild(); child = spawnChild(); },
     async invoke(args, name = 'delegate_to_session') {
-      requestId += 1;
-      const response = readJsonLine(child.stdout);
-      child.stdin.write(JSON.stringify({
-        jsonrpc: '2.0',
-        id: requestId,
-        method: 'tools/call',
-        params: { name, arguments: args },
-      }) + '\n');
-      return response;
+      return rpc('tools/call', { name, arguments: args });
     },
   };
 }
+
+const savedHistoryCapability = { version: 1, providers: ['codex', 'claude'],
+  operations: ['rewind', 'delete'], receipts: true, structuredDraft: true, codexPhysicalSuffix: true, repairOfOperationId: true };
+const rewindArgs = { tabId: 'target', operationId: 'rewind-exact-v1',
+  expectedSessionId: 'saved-source', targetUuid: 'exact-user' };
+
+function savedHistoryFixture() {
+  const rows = new Map(), dispatches = [];
+  const db = { getAppState: key => rows.get(key), setAppState: (key, value) => rows.set(key, value) };
+  const options = { db, runtime: {}, claude: { loadOperationSource: () => {} },
+    inspectRepair: () => {}, hashRecords: () => {},
+    dispatch: async (name, args) => { dispatches.push({ name, args }); } };
+  let operations = new SavedHistoryOperations(options);
+  return {
+    dispatches,
+    restart() { operations = new SavedHistoryOperations(options); },
+    complete(id = rewindArgs.operationId) {
+      const lease = operations.leases.get(operations.key('target', id));
+      operations.save(lease, { state: 'completed', phase: 'completed', pending: false,
+        success: true, historyMutated: true, bindingCommitted: true, newSessionId: 'child',
+        binding: { applied: true, sessionId: 'child' }, draft: { text: 'original prompt', promptChips: [] },
+        resume: { success: false, inputReady: false, error: 'resume-still-pending' } });
+    },
+    respond(body, _i, req) {
+      if (req.url === '/api/me') return { status: 200, body: { capabilities: { savedHistory: savedHistoryCapability } } };
+      if (req.url === '/api/terminal-tabs/target/status') return { status: 200,
+        body: { inputReady: false, lifecycle: 'starting', sessionId: null } };
+      try {
+        const base = '/api/terminal-tabs/target/history-operations';
+        const operation = req.method === 'POST' && req.url === base
+          ? operations.accept('target', body)
+          : req.method === 'GET' && req.url.startsWith(base + '/')
+            ? operations.read('target', decodeURIComponent(req.url.slice(base.length + 1))) : null;
+        if (!operation) return { status: 404, body: { ok: false, error: 'history_operation_not_found' } };
+        return { status: operation.pending ? 202 : operation.success ? 200 : 409, body: { ok: true, operation } };
+      } catch (error) { return { status: error.statusCode || 500, body: { ok: false, error: error.code || error.message } }; }
+    },
+  };
+}
+
+test('MCP exposes saved-history Rewind and its receipt reader, not native/AI-summary Rewind', async t => {
+  const h = await createHarness(t, () => { throw new Error('tools/list must not use HTTP'); });
+  const tools = (await h.rpc('tools/list')).result.tools;
+  assert.equal(tools.some(tool => tool.name === 'rewind_ai'), false);
+  const rewind = tools.find(tool => tool.name === 'rewind_history');
+  assert.ok(rewind);
+  assert.deepEqual(rewind.inputSchema.required, ['tabId', 'operationId', 'expectedSessionId', 'targetUuid']);
+  assert.equal(rewind.inputSchema.additionalProperties, false);
+  assert.equal(rewind.inputSchema.properties.mode, undefined);
+  assert.match(rewind.description, /saved.history/i);
+  assert.ok(tools.find(tool => tool.name === 'get_history_operation'));
+  assert.deepEqual(h.requests, []);
+});
+
+test('saved-history dispatcher preserves exact identity and an accepted operation without asserting readiness', async t => {
+  const fixture = savedHistoryFixture();
+  const h = await createHarness(t, fixture.respond);
+  const args = { ...rewindArgs, toolType: 'codex', targetSourceIdentity: 'physical-source-offset',
+    expectedContentRevision: 'composite-token', targetEntryRef: { physicalSessionId: 'ancestor', rawUuid: 'raw-user',
+      viewOwnerSessionId: 'saved-source', segmentId: 'frozen-segment', sourceIdentity: 'physical-source-offset' } };
+  const response = await h.invoke(args, 'rewind_history');
+  assert.equal(response.result.isError, undefined);
+  const result = response.result.structuredContent;
+  assert.equal(result.operationId, args.operationId);
+  assert.equal(result.operation.pending, true);
+  assert.equal(result.operation.historyMutated, false);
+  assert.equal(result.inputReady, undefined);
+  assert.match(result.guidance, /not.*inputReady/i);
+  assert.deepEqual(h.requests, [
+    { method: 'GET', url: '/api/me', body: {} },
+    { method: 'POST', url: '/api/terminal-tabs/target/history-operations', body: {
+      operationId: args.operationId, kind: 'rewind', toolType: 'codex', expectedSessionId: args.expectedSessionId,
+      targetUuid: args.targetUuid, targetSourceIdentity: args.targetSourceIdentity,
+      targetEntryRef: args.targetEntryRef, expectedContentRevision: args.expectedContentRevision,
+    } },
+  ]);
+  assert.equal(fixture.dispatches.length, 1);
+});
+
+test('actual public Timeline entryRef round-trips through MCP without stripping its nested revision', async t => {
+  const [entry] = SessionTranscriptService.prototype._decorateCodexContentRevision.call({}, [{
+    uuid: 'public-user', entryRef: { physicalSessionId: 'ancestor', rawUuid: 'raw-user',
+      viewOwnerSessionId: 'saved-source', sourceIdentity: 'physical-source-offset', segmentId: 'frozen-segment' },
+  }], { token: 'exact-composite-revision' });
+  const fixture = savedHistoryFixture();
+  const h = await createHarness(t, fixture.respond);
+  const args = { ...rewindArgs, targetUuid: entry.uuid, targetEntryRef: entry.entryRef,
+    expectedContentRevision: entry.contentRevision };
+  const response = await h.invoke(args, 'rewind_history');
+  assert.equal(response.result.isError, undefined);
+  assert.equal(fixture.dispatches.length, 1);
+  assert.deepEqual(h.requests.at(-1).body.targetEntryRef, entry.entryRef);
+  assert.equal(h.requests.at(-1).body.expectedContentRevision, entry.contentRevision);
+});
+
+test('MCP forwards an exact completed-COW repair selector only to an app advertising repair and physical suffix', async t => {
+  const fixture = savedHistoryFixture();
+  const h = await createHarness(t, fixture.respond);
+  await h.invoke(rewindArgs, 'rewind_history');
+  fixture.complete();
+  const args = { ...rewindArgs, operationId: 'repair-exact-v1', expectedSessionId: 'child',
+    repairOfOperationId: rewindArgs.operationId };
+  const result = await h.invoke(args, 'rewind_history');
+  assert.equal(result.result.isError, undefined);
+  assert.equal(h.requests.at(-1).body.repairOfOperationId, rewindArgs.operationId);
+  for (const patch of [{ codexPhysicalSuffix: false }, { repairOfOperationId: false }]) {
+    const old = await createHarness(t, () => ({ status: 200,
+      body: { capabilities: { savedHistory: { ...savedHistoryCapability, ...patch } } } }));
+    const rejected = await old.invoke(args, 'rewind_history');
+    assert.equal(rejected.result.isError, true);
+    assert.equal(rejected.result.structuredContent.code, 'app_update_required');
+    assert.deepEqual(old.requests.map(request => request.method), ['GET']);
+  }
+});
+
+test('legacy Rewind, invalid identities and partial composite arguments refuse before any HTTP mutation', async t => {
+  const h = await createHarness(t, () => { throw new Error('invalid arguments must not use HTTP'); });
+  for (const args of [{}, { ...rewindArgs, mode: 'native' }, { ...rewindArgs, mode: 'ai' }]) {
+    const result = await h.invoke(args, 'rewind_ai');
+    assert.equal(result.result.isError, true);
+    assert.equal(result.result.structuredContent.code, 'rewind_ai_removed');
+  }
+  for (const args of [
+    { tabId: 'target', operationId: 'op', targetUuid: 'user' },
+    { ...rewindArgs, operationId: undefined }, { ...rewindArgs, expectedSessionId: '' },
+    { ...rewindArgs, targetUuid: '' }, { ...rewindArgs, operationId: '../old' },
+    { ...rewindArgs, operationId: 'x'.repeat(161) }, { ...rewindArgs, toolType: 'unknown' },
+    { ...rewindArgs, expectedContentRevision: '' }, { ...rewindArgs, toolType: 'claude' },
+    { ...rewindArgs, targetEntryRef: { physicalSessionId: 'p', rawUuid: 'r' } },
+    { ...rewindArgs, targetEntryRef: { physicalSessionId: 'p' }, expectedContentRevision: 'rev' },
+    { ...rewindArgs, targetEntryRef: { physicalSessionId: 'p', rawUuid: 'r', viewOwnerSessionId: 'foreign' }, expectedContentRevision: 'rev' },
+    { ...rewindArgs, targetEntryRef: { physicalSessionId: 'p', rawUuid: 'r', contentRevision: 'stale' }, expectedContentRevision: 'rev' },
+    { ...rewindArgs, targetEntryRef: { physicalSessionId: 'p', rawUuid: 'r', contentRevision: '' }, expectedContentRevision: 'rev' },
+    ...['mode', 'targetIndex', 'targetText', 'targetFullText', 'rewindableCount', 'skipDuplicates',
+      'startUuid', 'endUuid', 'additionalPrompt', 'kind', 'provider', 'sourceTabId'].map(key => ({ ...rewindArgs, [key]: 'legacy' })),
+  ]) {
+    const result = await h.invoke(args, 'rewind_history');
+    assert.equal(result.result.isError, true, JSON.stringify(args));
+    assert.equal(result.result.structuredContent.code, 'invalid_history_operation_arguments');
+  }
+  for (const args of [{ tabId: 'target' }, { tabId: 'target', operationId: '../old' },
+    { tabId: 'target', operationId: 'old', includeStatus: 'yes' },
+    { tabId: 'target', operationId: 'old', mode: 'native' }]) {
+    assert.equal((await h.invoke(args, 'get_history_operation')).result.isError, true);
+  }
+  assert.deepEqual(h.requests, []);
+});
+
+test('public nullable metadata remains valid for physical and composite saved-history identities', async t => {
+  const fixture = savedHistoryFixture(), h = await createHarness(t, fixture.respond);
+  for (const args of [
+    { ...rewindArgs, operationId: 'nullable-physical', targetEntryRef: null, targetSourceIdentity: null, expectedContentRevision: null },
+    { ...rewindArgs, operationId: 'nullable-composite', expectedContentRevision: 'exact-public-token',
+      targetEntryRef: { viewOwnerSessionId: 'saved-source', physicalSessionId: 'ancestor', rawUuid: 'raw-user',
+        segmentId: 'frozen', sourceIdentity: null } },
+    { ...rewindArgs, operationId: 'claude-exact', toolType: 'claude', expectedContentRevision: 'claude-revision' },
+  ]) {
+    const response = await h.invoke(args, 'rewind_history');
+    assert.equal(response.result.isError, undefined);
+    const body = h.requests.at(-1).body;
+    if (args.targetEntryRef !== undefined) assert.deepEqual(body.targetEntryRef, args.targetEntryRef);
+    assert.equal(body.expectedContentRevision, args.expectedContentRevision);
+    fixture.complete(args.operationId);
+  }
+});
+
+test('older or unsupported saved-history capability never falls back to native, AI or raw history', async t => {
+  for (const capability of [undefined, { ...savedHistoryCapability, version: 0 },
+    { ...savedHistoryCapability, receipts: false }, { ...savedHistoryCapability, structuredDraft: false },
+    { ...savedHistoryCapability, operations: ['delete'] }, { ...savedHistoryCapability, providers: ['claude'] }]) {
+    const h = await createHarness(t, () => ({ status: 200, body: { capabilities: { savedHistory: capability } } }));
+    const result = await h.invoke(rewindArgs, 'rewind_history');
+    assert.equal(result.result.isError, true);
+    assert.equal(result.result.structuredContent.code, 'app_update_required');
+    assert.equal(result.result.structuredContent.operationId, rewindArgs.operationId);
+    assert.equal(result.result.structuredContent.mutationAttempted, false);
+    assert.deepEqual(h.requests.map(r => r.method + ' ' + r.url), ['GET /api/me']);
+  }
+});
+
+test('same saved-history operation is idempotent; changed payload retains app conflict and original receipt', async t => {
+  const fixture = savedHistoryFixture(), h = await createHarness(t, fixture.respond);
+  const first = await h.invoke(rewindArgs, 'rewind_history');
+  const second = await h.invoke(rewindArgs, 'rewind_history');
+  assert.equal(first.result.structuredContent.operation.operationId, rewindArgs.operationId);
+  assert.equal(second.result.structuredContent.operation.idempotent, true);
+  assert.equal(fixture.dispatches.length, 1);
+  const conflict = await h.invoke({ ...rewindArgs, targetUuid: 'different' }, 'rewind_history');
+  assert.equal(conflict.result.isError, true);
+  assert.equal(conflict.result.structuredContent.code, 'history_operation_request_mismatch');
+  assert.equal(conflict.result.structuredContent.operationId, rewindArgs.operationId);
+  const receipt = await h.invoke({ tabId: 'target', operationId: rewindArgs.operationId }, 'get_history_operation');
+  assert.equal(receipt.result.structuredContent.operation.targetUuid, rewindArgs.targetUuid);
+  assert.equal(fixture.dispatches.length, 1);
+});
+
+test('lost HTTP ACK retains caller-known operation identity; MCP/app restart reads only the original receipt', async t => {
+  const fixture = savedHistoryFixture();
+  const h = await createHarness(t, (body, i, req) => {
+    const response = fixture.respond(body, i, req);
+    return req.method === 'POST' ? { disconnect: true } : response;
+  });
+  const lost = await h.invoke(rewindArgs, 'rewind_history');
+  assert.equal(lost.result.isError, true);
+  assert.equal(lost.result.structuredContent.code, 'history_operation_outcome_unknown');
+  assert.equal(lost.result.structuredContent.operationId, rewindArgs.operationId);
+  assert.deepEqual(lost.result.structuredContent.receiptRead, { tabId: 'target', operationId: rewindArgs.operationId });
+  assert.match(lost.result.structuredContent.recovery, /get_history_operation/);
+  assert.equal(fixture.dispatches.length, 1);
+  await h.restart();
+  fixture.restart();
+  const read = await h.invoke(lost.result.structuredContent.receiptRead, 'get_history_operation');
+  assert.equal(read.result.structuredContent.operation.state, 'outcome-unknown');
+  assert.equal(read.result.structuredContent.operation.pending, true);
+  assert.equal(read.result.structuredContent.operation.historyMutated, false);
+  assert.equal(h.requests.filter(r => r.method === 'POST').length, 1);
+  assert.equal(fixture.dispatches.length, 1);
+});
+
+test('losing the whole MCP ACK still leaves the caller-known ID for a GET-only recovery', async t => {
+  const fixture = savedHistoryFixture();
+  let accepted;
+  const onAccepted = new Promise(resolve => { accepted = resolve; });
+  const h = await createHarness(t, (body, i, req) => {
+    const response = fixture.respond(body, i, req);
+    if (req.method === 'POST') { accepted(); return { disconnect: true }; }
+    return response;
+  });
+  // Deliberately ignore the MCP response itself, not just the HTTP response.
+  const ignored = h.invoke(rewindArgs, 'rewind_history').catch(() => {});
+  await onAccepted;
+  await h.restart();
+  fixture.restart();
+  const read = await h.invoke({ tabId: rewindArgs.tabId, operationId: rewindArgs.operationId }, 'get_history_operation');
+  assert.equal(read.result.structuredContent.operation.operationId, rewindArgs.operationId);
+  assert.equal(read.result.structuredContent.operation.state, 'outcome-unknown');
+  assert.equal(h.requests.filter(r => r.method === 'POST').length, 1);
+  assert.equal(fixture.dispatches.length, 1);
+  await ignored;
+});
+
+test('completed receipt, new binding/draft/resume and live status remain separate', async t => {
+  const fixture = savedHistoryFixture(), h = await createHarness(t, fixture.respond);
+  await h.invoke(rewindArgs, 'rewind_history');
+  fixture.complete();
+  const read = await h.invoke({ tabId: 'target', operationId: rewindArgs.operationId, includeStatus: true }, 'get_history_operation');
+  const result = read.result.structuredContent;
+  assert.equal(result.operation.state, 'completed');
+  assert.equal(result.operation.newSessionId, 'child');
+  assert.equal(result.operation.binding.applied, true);
+  assert.equal(result.operation.draft.text, 'original prompt');
+  assert.equal(result.operation.resume.inputReady, false);
+  assert.equal(result.currentStatus.inputReady, false);
+  assert.equal(result.currentStatus.sessionId, null);
+  assert.equal(result.inputReady, undefined);
+  assert.equal(result.prefixVerified, undefined);
+  assert.equal(fixture.dispatches.length, 1);
+  assert.equal(h.requests.at(-1).url, '/api/terminal-tabs/target/status');
+});
+
+test('failed mutation receipt and failed current status preserve receipt evidence without a retry', async t => {
+  const operation = { ...rewindArgs, kind: 'rewind', state: 'failed', phase: 'adopting', pending: false,
+    success: false, historyMutated: true, bindingCommitted: false, newSessionId: 'orphan-child',
+    draft: { text: 'original' }, error: 'binding-conflict' };
+  const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { savedHistory: savedHistoryCapability } } }
+    : { status: 409, body: { ok: true, operation } });
+  const failed = await h.invoke({ tabId: 'target', operationId: rewindArgs.operationId }, 'get_history_operation');
+  assert.equal(failed.result.isError, undefined);
+  assert.equal(failed.result.structuredContent.ok, true);
+  assert.equal(failed.result.structuredContent.operation.success, false);
+  assert.deepEqual(failed.result.structuredContent.operation, operation);
+  const other = await createHarness(t, (_body, _i, req) => req.url.endsWith('/status')
+    ? { status: 503, body: { error: 'status-reader-unavailable' } }
+    : req.url === '/api/me' ? { status: 200, body: { capabilities: { savedHistory: savedHistoryCapability } } }
+      : { status: 200, body: { ok: true, operation: { ...operation, state: 'completed', success: true } } });
+  const receipt = await other.invoke({ tabId: 'target', operationId: rewindArgs.operationId, includeStatus: true }, 'get_history_operation');
+  assert.equal(receipt.result.structuredContent.operation.success, true);
+  assert.match(receipt.result.structuredContent.currentStatusError, /status-reader-unavailable/);
+  assert.equal(receipt.result.structuredContent.currentStatus, null);
+  assert.equal(other.requests.every(req => req.method === 'GET'), true);
+});
+
+test('stale revision, absent receipt and foreign/malformed responses never become an accepted rewind', async t => {
+  for (const reply of [
+    { status: 409, body: { error: 'stale_transcript_revision' } },
+    { status: 200, body: { ok: true } },
+    { status: 202, body: { ok: true, operation: { ...rewindArgs, kind: 'rewind', operationId: 'foreign' } } },
+    { status: 202, body: { ok: true, operation: { ...rewindArgs, kind: 'rewind', toolType: 'codex', expectedSessionId: 'foreign-session' } } },
+    { status: 202, body: { ok: true, operation: { ...rewindArgs, kind: 'rewind', toolType: 'codex', targetUuid: 'foreign-user' } } },
+  ]) {
+    const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+      ? { status: 200, body: { capabilities: { savedHistory: savedHistoryCapability } } } : reply);
+    const result = await h.invoke(rewindArgs, 'rewind_history');
+    assert.equal(result.result.isError, true);
+    assert.equal(result.result.structuredContent.operationId, rewindArgs.operationId);
+    assert.equal(h.requests.filter(req => req.method === 'POST').length, 1);
+    assert.equal(h.requests.some(req => req.url.endsWith('/rewind')), false);
+  }
+  const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { savedHistory: savedHistoryCapability } } }
+    : { status: 404, body: { error: 'history_operation_not_found' } });
+  const missing = await h.invoke({ tabId: 'target', operationId: rewindArgs.operationId }, 'get_history_operation');
+  assert.equal(missing.result.structuredContent.code, 'history_operation_not_found');
+  assert.equal(h.requests.every(req => req.method === 'GET'), true);
+});
 
 test('read_draft preserves full transferred authoring data and its outcome', async (t) => {
   const draft = {

@@ -46,7 +46,7 @@ const noop = () => {};
 function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}) {
   const handoffs = handoffModule();
   const handlers = new Map();
-  const pasted = [], removed = [], notices = [], calls = [], stages = [];
+  const pasted = [], removed = [], notices = [], calls = [], stages = [], paused = [];
   const item = { id: 'item', text: 'manual Run After message', imagePaths: [], chips: [] };
   const terminal = {};
   const presence = { status, sessionStatus: status, busy: status === 'busy',
@@ -55,7 +55,7 @@ function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}
   const state = { openProjects: new Map([['P', workspace]]), clearInterruptedState: noop };
   let replaying = new Set();
   const context = {
-    ...sourceRules, ...codexSettings, ...localSlash,
+    ...sourceRules, ...codexSettings, ...localSlash, ...agentLocalCommand,
     ...require('../../main/agent-send-target-precondition'),
     console: { log() {}, warn() {}, error() {} },
     tabId: 'T', sessionType: 'codex',
@@ -72,6 +72,7 @@ function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}
     runHistoryPromptHandoff: handoffs.runHistoryPromptHandoff,
     historyPromptHandoffInitialStatus: handoffs.historyPromptHandoffInitialStatus,
     useWorkspaceStore: { getState: () => state },
+    usePromptQueueStore: { getState: () => ({ setAutoRun: (tabId, value) => paused.push({tabId,value}) }) },
     showToast: message => notices.push(message),
     removePrompt: (_tabId, id) => removed.push(id),
     queueSendTransferredOwnership: result => result.submitted === true,
@@ -90,6 +91,7 @@ function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}
     proveAgentComposerForSend: async () => { stages.push('prove-composer'); return { complete: false }; },
     findTabRuntimeContext: () => ({ tab: workspace.tabs.get('T'), projectId: 'P' }),
     codexSendInflight: new Map(),
+    agentSendReceiptStore: { get: () => null },
     terminalRegistry: { getCodexDraftState: () => ({ hasDraft: false }) },
     readCodexDraftAuthority: async () => ({ success: true, hasDraft: false, source: 'headless-test' }),
     isSubmittedCodexAuditTimeout: () => false,
@@ -105,6 +107,8 @@ function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}
     codexLastRunCommandPayload: new Map(), codexTurnWatchers: new Map(),
     getCodexResumeReadIdentityLeaseForTab: () => null,
     isCodexTuiEffectivelyReady: () => inputReady,
+    codexHasLivePtySubmitEvidence: () => status !== 'inactive',
+    getCodexPublicRuntimeProjection: () => presence,
     ensureCodexInputReadyForExternalPrompt: async () => ({ success: inputReady, error: 'not-ready' }),
     getCodexRuntimeSessionSnapshot: async () => presence,
     CODEX_PASTE_AUDIT_TIMEOUT_MS: 1000,
@@ -123,6 +127,7 @@ function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}
   vm.createContext(context);
   vm.runInContext(part(main, 'function readAgentSendDestinationAtWriteBoundary(',
     'function captureClaudeDraftPasteTarget('), context);
+  vm.runInContext(part(main, 'function isCodexOperationalInputReady(', 'function observeCodexInputControlReadinessFrame('), context);
   vm.runInContext(part(main, "ipcMain.handle('codex:send-command'", 'async function executeCodexSelectModelEffortRequest('), context);
   vm.runInContext(compile(part(read('./historyAgentRuntimes.ts'), 'async function sendCodexPrompt(', 'async function interruptCodexTurn(')), context);
   const runtime = { getPresence: async () => presence,
@@ -130,9 +135,18 @@ function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}
   context.getHistoryAgentRuntime = () => runtime;
   vm.runInContext(compile(read('./agentSendAdapter.ts').slice(read('./agentSendAdapter.ts').indexOf('export function createAgentSendAdapter('))), context);
   vm.runInContext(compile(part(read('./agentScenarios.ts'), 'const normalizeStatus =', 'export async function stopAgentProcessScenario(')), context);
+  // This fixture controls admission only; the real SQLite FIFO and App DTO
+  // round trip are exercised by agent-send-application-queue.integration.test.
+  // Re-enter the SAME scenario with Main-issued attempt identity, as Main does.
+  handlers.set('agent:enqueue-prompt', (_event, input) => context.sendAgentPromptScenario({
+    ...input, runtime, workContextPrepared: true, sendOperationKey: 'history:T:' + input.handoffId,
+    sendAttemptId: 'private-attempt',
+  }));
+  const sendNowSource = read('./runAfterSendNow.ts');
+  vm.runInContext(compile(sendNowSource.slice(sendNowSource.indexOf('export async function sendQueuedPromptNow('))), context);
   vm.runInContext(compile(part(overlay, '  const replayChip = useCallback(', '  useEffect(() => {\n    const setCmd'))
     + '\nglobalThis.replayChip = replayChip;', context);
-  return { context, handlers, handoffs, item, pasted, removed, notices, calls, stages };
+  return { context, handlers, handoffs, item, pasted, removed, notices, calls, stages, paused };
 }
 
 test('actual Cmd+Replay caller reaches native busy send through the ordinary scenario and main handler', async () => {
@@ -193,6 +207,14 @@ test('manual send-now preserves a downstream draft/identity refusal and leaves t
   assert.equal(h.pasted[0].options.verifyCodexVisibleDraftBeforeSubmit, true);
   assert.deepEqual(h.removed, []);
   assert.equal(h.handoffs.getHistoryPromptHandoffsSnapshot('T')[0].queueStatus, 'failed');
+  assert.deepEqual(h.paused,[{tabId:'T',value:false}]);
+});
+
+test('unknown selected Send-now pauses automatic continuation without removing or repeating the card',async()=>{
+  const h=harness({pasteResult:{success:null,submitted:null,deliveryUnknown:true,status:'delivery-unknown'}});
+  await h.context.replayChip('item',h.item,{submit:true});
+  assert.equal(h.pasted.length,1);assert.equal(h.removed.length,0);
+  assert.deepEqual(h.paused,[{tabId:'T',value:false}]);
 });
 
 test('slow Codex confirmation remains a pending History row through the actual send runtime and scenario', async () => {

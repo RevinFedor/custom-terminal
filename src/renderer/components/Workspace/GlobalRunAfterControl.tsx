@@ -41,7 +41,8 @@ import WorkflowChip from './WorkflowChip';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { pointInHoverCluster, pointInRect } from '../../utils/hoverBridge.mjs';
 import { captureQueueHoverReturn, createHoverReturnGate } from '../../utils/hoverReturnGate.mjs';
-import { collectQueueRelations, layoutRunAfterCards, retainRunAfterGroups, RUN_AFTER_GROUP_INSET, RUN_AFTER_DEPTH_INSET } from '../../utils/runAfterDependencyLayout.mjs';
+import { layoutRunAfterCards, retainRunAfterGroups, RUN_AFTER_GROUP_INSET, RUN_AFTER_DEPTH_INSET } from '../../utils/runAfterDependencyLayout.mjs';
+import { selectRunAfterOverview } from '../../utils/runAfterInventory.mjs';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 import { retainPanelPosition, scrollMovesAnchor } from '../../utils/anchoredPanelPosition.mjs';
 import { PromptQueueOverlay } from './PromptQueueOverlay';
@@ -117,16 +118,6 @@ function globalRunAfterMinimumWidth(panel: HTMLElement | null, pages: HTMLElemen
     const indent = RUN_AFTER_GROUP_INSET + (Number(node.dataset.globalRunAfterDepth) || 0) * RUN_AFTER_DEPTH_INSET;
     return control.getBoundingClientRect().right - node.getBoundingClientRect().left + indent + inset + 1;
   })));
-}
-
-function queueIsConfigured(queue: TabQueue | undefined): boolean {
-  return !!queue && (
-    queue.items.length > 0
-    || queue.postPromptEnabled
-    || queue.loopPromptEnabled
-    || queue.firstDelaySeconds > 0
-    || !!queue.runAfterTabId
-  );
 }
 
 function QueueTabNode({ tab, queue, busy, awaited }: {
@@ -467,34 +458,9 @@ function QueueOverview({ inventory, queues, busy, beforeCloseRef, layoutMemoryRe
     beforeCloseRef.current = close;
     return () => { if (beforeCloseRef.current === close) beforeCloseRef.current = () => true; };
   }, [beforeCloseRef]);
-  const known = new Set(inventory.tabs.map(tab => tab.id));
-  const edges = inventory.tabs.flatMap(tab => collectQueueRelations(tab.id, queues.get(tab.id)));
   const shelves = useRef(new Map<string, boolean>());
-  const primary = new Set(inventory.tabs.filter(tab => {
-    const queue = queues.get(tab.id);
-    return shelves.current.get(tab.id) === false || (queue && hasPendingPromptQueueContinuation(queue));
-  }).map(tab => tab.id));
-  const expand = (ids: Set<string>) => {
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const edge of edges) if (ids.has(edge.source) && known.has(edge.target) && !ids.has(edge.target)) {
-        ids.add(edge.target); changed = true;
-      }
-    }
-  };
-  expand(primary);
-  for (const id of primary) shelves.current.set(id, false);
-  const disabled = new Set(inventory.tabs.filter(tab => !primary.has(tab.id)
-    && (queueIsConfigured(queues.get(tab.id)) || shelves.current.get(tab.id) === true)).map(tab => tab.id));
-  for (const id of disabled) if (!shelves.current.has(id)) shelves.current.set(id, true);
-  const secondary = new Set(showDisabled ? disabled : []);
-  expand(secondary);
-  for (const id of primary) secondary.delete(id);
-  const visible = inventory.tabs.filter(tab => primary.has(tab.id) || secondary.has(tab.id));
-  const graphTargets = new Set(visible.map(tab => tab.id));
-  const visibleEdges = edges.filter(edge => graphTargets.has(edge.source) && graphTargets.has(edge.target));
-  const awaitedTargets = new Set(visibleEdges.filter(edge => edge.enabled).map(edge => edge.target));
+  const { primary, disabled, secondary, visible, graphTargets, visibleEdges, awaitedTargets } = selectRunAfterOverview(
+    inventory, queues, { shelves: shelves.current, showDisabled, hasPending: hasPendingPromptQueueContinuation });
   const geometryKey = JSON.stringify({ primary: [...primary], secondary: [...secondary], disabled: [...disabled],
     edges: visibleEdges.map(edge => [edge.source, edge.target, edge.itemId, edge.kind]),
     // Reordering a non-dependent step can move an edge's origin without changing

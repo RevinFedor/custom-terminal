@@ -206,14 +206,16 @@ function scanSource({ projectId, rootPath, sourceName, layout, fsImpl = fs }) {
 }
 
 class ProjectPromptCatalogService {
-  constructor({ db, layoutStore, onChanged = null, fsImpl = fs, watch = true } = {}) {
+  constructor({ db, layoutStore, rootRegistry = null, onChanged = null, fsImpl = fs, watch = true } = {}) {
     if (!db) throw new Error('ProjectPromptCatalogService requires db');
     this.db = db;
     this.layoutStore = layoutStore || null;
+    this.rootRegistry = rootRegistry;
     this.onChanged = typeof onChanged === 'function' ? onChanged : null;
     this.fs = fsImpl;
     this.watchEnabled = watch;
     this.cache = new Map();
+    this.tabCache = new Map();
     this.watchers = new Map();
     this.watchDebounce = new Map();
     if (watch) this.refreshWatchers();
@@ -221,6 +223,10 @@ class ProjectPromptCatalogService {
 
   getSources(projectId) {
     const rows = this.db.getProjectPromptSources(projectId);
+    return this.describeSources(rows);
+  }
+
+  describeSources(rows) {
     // Preserve the configured spelling for the shared layout key. A symlinked
     // root and its real path are the same source identity, but the explorer's
     // manual order is intentionally keyed by the exact root the user opened.
@@ -242,6 +248,68 @@ class ProjectPromptCatalogService {
         docsExists,
       };
     });
+  }
+
+  getTabSources(tabId) {
+    if (!this.rootRegistry) {
+      throw Object.assign(new Error('root_registry_unavailable'), { code: 'root_registry_unavailable' });
+    }
+    if (typeof tabId !== 'string' || !tabId) {
+      throw Object.assign(new Error('tab_id_required'), { code: 'tab_id_required' });
+    }
+    return this.describeSources(this.rootRegistry.sourcesForTab(tabId));
+  }
+
+  setTabSources(request) {
+    const current = this.getTabSources(request?.tabId);
+    const snapshot = this.rootRegistry.read();
+    const roots = snapshot.roots;
+    const byId = new Map([...current, ...roots.map(root => ({ ...root, rootPath: root.path }))]
+      .map(root => [root.rootId || root.id, root]));
+    const selected = (Array.isArray(request.rootIds) ? request.rootIds : []).map(id => byId.get(id));
+    // Preserve unavailable registrations; path existence is not binding validity.
+    const known = selected.filter(Boolean);
+    // A committed retry has an older revision. Let the registry return its
+    // durable receipt before validating paths that may since have changed.
+    if (request.expectedRevision === snapshot.revision && normalizeSourceRoots(known, this.fs).length !== known.length) {
+      throw Object.assign(new Error('overlapping_prompt_sources'), {
+        code: 'overlapping_prompt_sources', paths: known.map(source => source.rootPath),
+      });
+    }
+    const result = this.rootRegistry.setTabSources(request);
+    this.invalidateTabs([request.tabId], 'sources-changed');
+    this.refreshWatchers();
+    return result;
+  }
+
+  listTab(tabId, { force = false, refreshWatchers = true } = {}) {
+    const allSources = this.getTabSources(tabId);
+    const signature = JSON.stringify(allSources);
+    const cached = this.tabCache.get(tabId);
+    if (!force && cached?.signature === signature && Date.now() - cached.cachedAt < CACHE_TTL_MS) return cached.value;
+    const sources = allSources.filter(source => source.enabled === true)
+      .sort((a, b) => naturalCompare(a.sourceName, b.sourceName));
+    const scannedSources = sources.map(source => ({
+      ...source,
+      ...scanSource({
+        // The namespace of the ORIGINAL binding is part of the prompt id.
+        projectId: source.projectId,
+        rootPath: source.rootPath,
+        sourceName: source.sourceName,
+        layout: this.layoutStore?.get(source.rootPath)?.layout || null,
+        fsImpl: this.fs,
+      }),
+    }));
+    const value = {
+      tabId,
+      sources: scannedSources.map(({ prompts, ...source }) => ({ ...source, promptCount: prompts.length })),
+      prompts: scannedSources.flatMap(source => source.prompts),
+      updatedAt: Date.now(),
+    };
+    this.tabCache.set(tabId, { signature, cachedAt: Date.now(), value });
+    // Missing roots can reappear while the picker was closed.
+    if (refreshWatchers) this.refreshWatchers();
+    return value;
   }
 
   setSources(projectId, roots) {
@@ -296,6 +364,26 @@ class ProjectPromptCatalogService {
   usageForRoot(rootPath) {
     const canonicalRoot = canonicalPath(rootPath, this.fs);
     const byPath = new Map();
+    if (this.rootRegistry) {
+      for (const scope of this.rootRegistry.listSourceScopes()) {
+        const catalog = this.listTab(scope.tabId, { refreshWatchers: false });
+        for (const prompt of catalog.prompts) {
+          if (!isInside(canonicalRoot, canonicalPath(prompt.path, this.fs))) continue;
+          const usage = byPath.get(prompt.path) || { projects: new Map(), tabs: new Map() };
+          usage.tabs.set(scope.tabId, { id: scope.tabId, name: scope.name || scope.tabId });
+          const project = prompt.projectId && this.db.getProjectById(prompt.projectId);
+          if (project) usage.projects.set(project.id, { id: project.id, name: project.name, icon: project.icon || null });
+          byPath.set(prompt.path, usage);
+        }
+      }
+      this.refreshWatchers();
+      return [...byPath.entries()].sort(([a], [b]) => naturalCompare(a, b))
+        .map(([filePath, usage]) => ({
+          path: filePath,
+          projects: [...usage.projects.values()].sort((a, b) => naturalCompare(a.name, b.name)),
+          tabs: [...usage.tabs.values()],
+        }));
+    }
     for (const project of this.db.getProjectsWithPromptSources()) {
       let catalog;
       try { catalog = this.listProject(project.id); } catch { continue; }
@@ -322,27 +410,49 @@ class ProjectPromptCatalogService {
     const ids = projectIds ? [...new Set(projectIds.filter(Boolean))] : [...this.cache.keys()];
     if (projectIds) ids.forEach((projectId) => this.cache.delete(projectId));
     else this.cache.clear();
+    // Old callers invalidate after shared-layout/root edits. In registry mode
+    // resolve exact tab consumers instead of treating a namespace as a union.
+    const tabIds = this.rootRegistry ? this.rootRegistry.listSourceScopes()
+      .filter(scope => !projectIds || this.getTabSources(scope.tabId).some(source => ids.includes(source.projectId)))
+      .map(scope => scope.tabId) : [];
+    this.invalidateTabs(tabIds, reason, ids);
+  }
+
+  invalidateTabs(tabIds = null, reason = 'filesystem', projectIds = []) {
+    const ids = tabIds ? [...new Set(tabIds.filter(Boolean))] : [...this.tabCache.keys()];
+    if (tabIds) ids.forEach(tabId => this.tabCache.delete(tabId));
+    else this.tabCache.clear();
     if (this.onChanged) {
-      try { this.onChanged({ projectIds: ids, reason, at: Date.now() }); } catch {}
+      try { this.onChanged({ projectIds, ...(this.rootRegistry ? { tabIds: ids } : {}), reason, at: Date.now() }); } catch {}
     }
   }
 
   refreshWatchers() {
     if (!this.watchEnabled) return;
     const wanted = new Map();
-    for (const project of this.db.getProjectsWithPromptSources()) {
-      for (const source of this.getSources(project.id)) {
-        const target = source.docsExists ? source.docsPath : (source.exists ? source.rootPath : null);
-        if (!target) continue;
-        const ids = wanted.get(target) || new Set();
-        ids.add(project.id);
-        wanted.set(target, ids);
+    const scopes = this.rootRegistry ? this.rootRegistry.listSourceScopes() : this.db.getProjectsWithPromptSources();
+    const add = (source, projectId = null, tabId = null) => {
+      const target = source.docsExists ? source.docsPath : (source.exists ? source.rootPath : null);
+      if (!target) return;
+      const ids = wanted.get(target) || { projectIds: new Set(), tabIds: new Set() };
+      if (projectId) ids.projectIds.add(projectId);
+      if (tabId) ids.tabIds.add(tabId);
+      wanted.set(target, ids);
+    };
+    for (const scope of scopes) {
+      for (const source of this.rootRegistry ? this.getTabSources(scope.tabId) : this.getSources(scope.id)) {
+        add(source, this.rootRegistry ? source.projectId : scope.id, scope.tabId);
+      }
+    }
+    if (this.rootRegistry) {
+      for (const source of this.describeSources(this.rootRegistry.read().roots.map(root => ({ ...root, rootPath: root.path })))) {
+        add(source);
       }
     }
 
     for (const [target, entry] of this.watchers) {
       if (wanted.has(target)) {
-        entry.projectIds = wanted.get(target);
+        Object.assign(entry, wanted.get(target));
         wanted.delete(target);
         continue;
       }
@@ -350,14 +460,16 @@ class ProjectPromptCatalogService {
       this.watchers.delete(target);
     }
 
-    for (const [target, projectIds] of wanted) {
+    for (const [target, scopeIds] of wanted) {
       try {
-        const entry = { watcher: null, projectIds };
+        const entry = { watcher: null, ...scopeIds };
         entry.watcher = this.fs.watch(target, { recursive: true }, () => {
           if (this.watchDebounce.has(target)) clearTimeout(this.watchDebounce.get(target));
           const timer = setTimeout(() => {
             this.watchDebounce.delete(target);
-            this.invalidate([...entry.projectIds], 'filesystem');
+            for (const projectId of entry.projectIds) this.cache.delete(projectId);
+            this.invalidateTabs([...entry.tabIds], 'filesystem', [...entry.projectIds]);
+            this.refreshWatchers();
           }, 180);
           timer.unref?.();
           this.watchDebounce.set(target, timer);
@@ -377,6 +489,7 @@ class ProjectPromptCatalogService {
     }
     this.watchers.clear();
     this.cache.clear();
+    this.tabCache.clear();
   }
 }
 

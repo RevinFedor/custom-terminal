@@ -58,6 +58,11 @@ interface FilePreview {
   language: string | null;
   source?: 'sidebar' | 'terminal-link' | 'tab';
   sourceTabId?: string;
+  /** Exact link identity for a document opened from its owner pane card. */
+  ownerTabId?: string;
+  ownerProjectId?: string;
+  sourceProjectId?: string;
+  sourceSpaceId?: string;
 }
 
 /** Reading position per absolute file path. See utils/filePreviewScrollMemory. */
@@ -571,6 +576,7 @@ interface UIStore {
   // File Preview
 
   filePreview: FilePreview | null;
+  filePreviewRevision: number;
 
   openFilePreview: (preview: FilePreview) => void;
 
@@ -619,6 +625,8 @@ interface UIStore {
   sideTerminalOpenTabs: Record<string, boolean>;
   historyScrollToUuid: string | null;
   historyScrollTargetTabId: string | null;
+  historyScrollToolTarget: { toolUseId: string; readSessionId: string; requestId: string } | null;
+  historyScrollRequestGeneration: number;
   historyVisibleUuids: Record<string, string[]>;
   historyScrollPositions: Record<string, number>;
   historyPromptDrafts: Record<string, string>;
@@ -636,7 +644,8 @@ interface UIStore {
   setHistoryPanelWidth: (width: number) => void;
   setSideTerminalWidth: (width: number) => void;
   setSideTerminalOpen: (tabId: string, open: boolean) => void;
-  setHistoryScrollToUuid: (uuid: string | null, tabId?: string | null) => void;
+  setHistoryScrollToUuid: (uuid: string | null, tabId?: string | null, tool?: UIStore['historyScrollToolTarget']) => void;
+  cancelHistoryScrollRequest: (generation: number) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
   setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
   setHistoryPromptDraft: (tabId: string, draft: string, options?: HistoryPromptDraftWriteOptions) => void;
@@ -2912,8 +2921,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // File Preview
   filePreview: null,
-  openFilePreview: (preview) => set({ filePreview: preview }),
-  closeFilePreview: () => set({ filePreview: null }),
+  filePreviewRevision: 0,
+  openFilePreview: (preview) => set(s => ({ filePreview: preview, filePreviewRevision: s.filePreviewRevision + 1 })),
+  closeFilePreview: () => set(s => ({ filePreview: null, filePreviewRevision: s.filePreviewRevision + 1 })),
 
   // Reading position per file. Deliberately keyed by path rather than by tab:
   // the sidebar opens previews without a tab at all, and the user expects the
@@ -2987,6 +2997,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   sideTerminalOpenTabs: initialSideTerminalOpenTabs,
   historyScrollToUuid: null,
   historyScrollTargetTabId: null,
+  historyScrollToolTarget: null,
+  historyScrollRequestGeneration: 0,
   historyVisibleUuids: {},
   historyScrollPositions: {},
   historyPromptDrafts: initialHistoryComposerDraftState.drafts,
@@ -3024,16 +3036,24 @@ export const useUIStore = create<UIStore>((set, get) => ({
       },
     };
   }),
-  setHistoryScrollToUuid: (uuid, tabId = null) => set(state => {
+  setHistoryScrollToUuid: (uuid, tabId = null, tool = null) => set(state => {
     const targetTabId = uuid ? (tabId || null) : null;
+    const toolTarget = uuid ? tool : null;
     if (
       state.historyScrollToUuid === uuid
       && state.historyScrollTargetTabId === targetTabId
+      && state.historyScrollToolTarget?.requestId === toolTarget?.requestId
     ) return state;
     return {
       historyScrollToUuid: uuid,
       historyScrollTargetTabId: targetTabId,
+      historyScrollToolTarget: toolTarget,
+      historyScrollRequestGeneration: uuid ? state.historyScrollRequestGeneration + 1 : state.historyScrollRequestGeneration,
     };
+  }),
+  cancelHistoryScrollRequest: generation => set(state => state.historyScrollRequestGeneration !== generation ? state : {
+    historyScrollToUuid: null, historyScrollTargetTabId: null, historyScrollToolTarget: null,
+    historyScrollRequestGeneration: generation + 1,
   }),
   setHistoryVisibleUuids: (tabId, uuids) => set(state => ({
     historyVisibleUuids: { ...state.historyVisibleUuids, [tabId]: uuids }

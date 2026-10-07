@@ -64,6 +64,14 @@ Failed application snapshots не исчезают по15s legacy TTL и ост�
 queued user bubbles. Slot остаётся при истечении SENT badge, поэтому его
 двухсекундный таймер не меняет высоту строки.
 
+Старый failed completion может иметь durable operation, но ни одной physical
+attempt: требование непустого attemptId ломало его крестик после Build Install
+с `invalid-presentation-dismiss`. Hide теперь сопоставляет и явный null точно,
+не создаёт фиктивную попытку и не приписывает доставку/отмену. Legacy local card
+и уже hydrated FIFO card проверяются отдельно: последняя сохраняет прежний
+cancel/dismiss-unwritten путь. Повторное открытие не возвращает hidden карточку,
+а каноническая user-строка с тем же текстом не удаляется.
+
 Ошибка API Claude — отдельная служебная строка, а не текст ответа. Assistant
 с `isApiErrorMessage=true`, system `api_error` и явный отказ внутри system
 `local_command` stdout/stderr используют один display-classifier:429/rate_limit

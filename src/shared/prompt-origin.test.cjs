@@ -51,3 +51,22 @@ test('durable tab messages are service prompts, not system or orchestration runs
     assert.equal(api.isServicePromptEntry({ content: 'tab-message messageId=m phase=reply' }), false);
   }
 });
+
+test('plain MCP sends and legacy addressed sends share an owned origin without a fake run', async () => {
+  const esm = await import('./prompt-origin.mjs');
+  for (const api of [cjs, esm]) {
+    for (const source of ['terminal-mcp', 'codex-terminal-mcp', 'claude-terminal-mcp',
+      'codex-tab-message:fd4156d7-3441-410a-bad3-534c2c8f005f']) {
+      const tag = api.promptOriginTagForSource(source);
+      assert.equal(tag.source, 'terminal-mcp');
+      assert.equal(api.getTerminalMcpTag({ semanticTags: [tag] }), tag);
+      assert.equal(api.isServicePromptEntry({ semanticTags: [tag] }), true);
+      assert.equal(api.isSystemPromptEntry({ semanticTags: [tag] }), false);
+      assert.equal(tag.runId, undefined);
+    }
+    for (const source of ['terminal-mcp quoted', 'tab-message:', 'tab-message:not-a-message', 'history-panel']) {
+      assert.equal(api.promptOriginTagForSource(source), null);
+    }
+    assert.equal(api.getTerminalMcpTag({ content: '[Tab message: reply] terminal-mcp' }), null);
+  }
+});

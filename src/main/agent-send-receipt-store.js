@@ -12,6 +12,8 @@ const {
 } = require('./agent-send-receipt-registry');
 const {
   classifyAgentPromptAuditIdentity,
+  agentPromptAuditAddresses,
+  agentPromptAuditAddressesOverlap,
 } = require('./agent-prompt-audit-identity');
 
 const TABLE_NAME = 'agent_send_receipts';
@@ -115,6 +117,7 @@ function normalizeIdentity(identity) {
 
 function normalizeAudit(audit) {
   const identity = classifyAgentPromptAuditIdentity(audit);
+  const addresses = agentPromptAuditAddresses(audit);
   return {
     operationKey: requiredString(audit?.operationKey, 'operationKey'),
     attemptId: requiredString(audit?.attemptId, 'attemptId'),
@@ -129,6 +132,8 @@ function normalizeAudit(audit) {
     canonicalReason: identity.canonicalReason || null,
     entryUuid: optionalString(audit?.entryUuid),
     sourceIdentity: optionalString(audit?.sourceIdentity),
+    entryUuidAliases: addresses.entryUuids.filter(value => value !== audit?.entryUuid),
+    sourceIdentityAliases: addresses.sourceIdentities.filter(value => value !== audit?.sourceIdentity),
     recordByteOffset: audit?.recordByteOffset != null && Number.isSafeInteger(Number(audit.recordByteOffset))
       && Number(audit.recordByteOffset) >= 0
       ? Number(audit.recordByteOffset)
@@ -156,6 +161,7 @@ function decodeJson(value) {
 
 function rowToRecord(row) {
   if (!row) return null;
+  const receipt = decodeJson(row.receipt_json);
   return {
     operationKey: row.operation_key,
     surface: row.surface,
@@ -170,7 +176,7 @@ function rowToRecord(row) {
     state: row.state,
     attempt: row.attempt,
     attemptId: row.attempt_id,
-    receipt: decodeJson(row.receipt_json),
+    receipt,
     inboxSetup: decodeJson(row.inbox_setup_json),
     transcriptBoundary: decodeJson(row.transcript_boundary_json),
     auditIdentity: row.audit_attempt_id ? {
@@ -180,6 +186,8 @@ function rowToRecord(row) {
       promptHash: row.audit_prompt_hash,
       entryUuid: row.audit_entry_uuid,
       sourceIdentity: row.audit_source_identity,
+      entryUuidAliases: decodeJson(row.audit_entry_uuid_aliases_json) || receipt?.entryUuidAliases || [],
+      sourceIdentityAliases: decodeJson(row.audit_source_identity_aliases_json) || receipt?.sourceIdentityAliases || [],
       auditTimestamp: row.audit_timestamp,
     } : null,
     presentation: row.presentation_at ? {
@@ -271,6 +279,7 @@ class AgentSendReceiptStore {
       : DEFAULT_MAX_RECORDS;
     this._initializeSchema();
     this._prepareStatements();
+    this._backfillAuditClaims();
   }
 
   _initializeSchema() {
@@ -321,6 +330,15 @@ class AgentSendReceiptStore {
         operation_key TEXT NOT NULL,
         owner TEXT NOT NULL,
         PRIMARY KEY (operation_key, owner)
+      );
+      CREATE TABLE IF NOT EXISTS agent_send_audit_claims (
+        provider TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        address_kind TEXT NOT NULL,
+        address_value TEXT NOT NULL,
+        operation_key TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        PRIMARY KEY (provider, session_id, address_kind, address_value, operation_key)
       );
     `);
     const existingColumns = new Set(
@@ -498,6 +516,26 @@ class AgentSendReceiptStore {
           AND state = 'confirmed' AND audit_entry_uuid IS NULL
           AND audit_source_identity = @sourceIdentity
       `),
+      enrichAuditAliases: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET audit_entry_uuid = @entryUuid, audit_source_identity = @sourceIdentity,
+            receipt_json = @receiptJson, updated_at = @updatedAt
+        WHERE operation_key = @operationKey AND attempt_id = @attemptId AND state = 'confirmed'
+          AND audit_entry_uuid IS @previousEntryUuid AND audit_source_identity IS @previousSourceIdentity
+      `),
+      auditClaimConflict: this.db.prepare(`
+        SELECT operation_key AS operationKey, attempt_id AS attemptId
+        FROM agent_send_audit_claims
+        WHERE provider = @provider AND session_id = @sessionId
+          AND address_kind = @kind AND address_value = @value
+          AND NOT (operation_key = @operationKey AND attempt_id = @attemptId)
+        LIMIT 1
+      `),
+      insertAuditClaim: this.db.prepare(`
+        INSERT OR IGNORE INTO agent_send_audit_claims
+          (provider, session_id, address_kind, address_value, operation_key, attempt_id)
+        VALUES (@provider, @sessionId, @kind, @value, @operationKey, @attemptId)
+      `),
       acknowledgePresentation: this.db.prepare(`
         UPDATE ${TABLE_NAME}
         SET presentation_attempt_id = @attemptId,
@@ -517,7 +555,7 @@ class AgentSendReceiptStore {
         SET receipt_json = @receiptJson,
             updated_at = @dismissedAt
         WHERE operation_key = @operationKey
-          AND attempt_id = @attemptId
+          AND attempt_id IS @attemptId
           AND state = @expectedState
       `),
       startupInFlight: this.db.prepare(`
@@ -1406,6 +1444,43 @@ class AgentSendReceiptStore {
     });
   }
 
+  _auditClaims(audit) {
+    const addresses = agentPromptAuditAddresses(audit);
+    return [...addresses.entryUuids.map(value => ({ kind: 'uuid', value })),
+      ...addresses.sourceIdentities.map(value => ({ kind: 'source', value }))];
+  }
+
+  _rememberAuditClaims(audit) {
+    if (audit.provider !== 'codex') return;
+    for (const address of this._auditClaims(audit)) this.statements.insertAuditClaim.run({
+      provider: audit.provider, sessionId: audit.sessionId, operationKey: audit.operationKey,
+      attemptId: audit.attemptId, ...address,
+    });
+  }
+
+  _backfillAuditClaims() {
+    // Claims outlive pruned receipts. Legacy duplicate claims are retained as
+    // competing owners, never silently assigned to an arbitrary operation.
+    this.db.transaction(() => {
+      for (const record of this.listAuditReferences('codex')) {
+        if (record.state === STORE_STATES.CONFIRMED && record.auditIdentity) {
+          this._rememberAuditClaims({ ...record.auditIdentity, operationKey: record.operationKey });
+        }
+      }
+    })();
+  }
+
+  findConflictingAuditClaim(audit) {
+    if (audit.provider !== 'codex') return null;
+    for (const address of this._auditClaims(audit)) {
+      const conflict = this.statements.auditClaimConflict.get({
+        provider: audit.provider, sessionId: audit.sessionId, operationKey: audit.operationKey, attemptId: audit.attemptId, ...address,
+      });
+      if (conflict) return conflict;
+    }
+    return null;
+  }
+
   promoteFromAudit(auditInput) {
     let audit;
     try {
@@ -1461,6 +1536,9 @@ class AgentSendReceiptStore {
           record,
         };
       }
+      if (this.findConflictingAuditClaim(audit)) {
+        return { ok: false, matched: true, promoted: false, reason: 'canonical-user-already-owned', record };
+      }
       if (record.state === STORE_STATES.CONFIRMED && record.auditIdentity) {
         const sameExactRow = record.auditIdentity.entryUuid
           ? (record.auditIdentity.entryUuid === audit.entryUuid
@@ -1479,6 +1557,41 @@ class AgentSendReceiptStore {
             || audit.recordByteOffset == null
             || Number(record.receipt.recordByteOffset) === audit.recordByteOffset)
           && sameExactRow;
+        const sameLogicalUser = record.provider === 'codex'
+          && record.auditIdentity.attemptId === audit.attemptId
+          && record.auditIdentity.provider === audit.provider
+          && record.auditIdentity.sessionId === audit.sessionId
+          && record.auditIdentity.promptHash === audit.actualHash
+          && agentPromptAuditAddressesOverlap(record.auditIdentity, audit)
+          && (sameAuditIdentity
+            || audit.sourceIdentityAliases.includes(record.auditIdentity.sourceIdentity)
+            || audit.entryUuidAliases.includes(record.auditIdentity.entryUuid)
+            || record.auditIdentity.sourceIdentityAliases.includes(audit.sourceIdentity)
+            || record.auditIdentity.entryUuidAliases.includes(audit.entryUuid));
+        if (sameLogicalUser && (!sameExactRow || audit.sourceIdentityAliases.length || audit.entryUuidAliases.length)) {
+          const previous = agentPromptAuditAddresses(record.auditIdentity);
+          const incoming = agentPromptAuditAddresses(audit);
+          // Only an audit proving the old primary as an alias may upgrade it.
+          // An early duplicate carrying its old address cannot downgrade it.
+          const upgrades = audit.sourceIdentityAliases.includes(record.auditIdentity.sourceIdentity)
+            || audit.entryUuidAliases.includes(record.auditIdentity.entryUuid);
+          const entryUuid = upgrades ? audit.entryUuid : record.auditIdentity.entryUuid;
+          const sourceIdentity = upgrades ? audit.sourceIdentity : record.auditIdentity.sourceIdentity;
+          const receipt = { ...record.receipt, entryUuid, sourceIdentity,
+            recordByteOffset: upgrades ? audit.recordByteOffset : record.receipt?.recordByteOffset ?? null,
+            entryUuidAliases: [...new Set([...previous.entryUuids, ...incoming.entryUuids])].filter(value => value !== entryUuid),
+            sourceIdentityAliases: [...new Set([...previous.sourceIdentities, ...incoming.sourceIdentities])].filter(value => value !== sourceIdentity),
+          };
+          const info = this.statements.enrichAuditAliases.run({
+            operationKey: record.operationKey, attemptId: audit.attemptId, entryUuid, sourceIdentity,
+            previousEntryUuid: record.auditIdentity.entryUuid, previousSourceIdentity: record.auditIdentity.sourceIdentity,
+            receiptJson: encodeJson(receipt), updatedAt: this.now(),
+          });
+          if (info.changes === 1) this._rememberAuditClaims({ ...audit, ...receipt });
+          return { ok: info.changes === 1, matched: true, promoted: false, enriched: info.changes === 1,
+            idempotent: info.changes === 1, reason: info.changes === 1 ? 'canonical-address-enriched' : 'state-changed',
+            record: this._record(record.operationKey) };
+        }
         // A source-only confirmed receipt may learn its canonical line UUID
         // later, independently of History presentation. This is metadata
         // enrichment of the SAME audited row, not a second delivery/settlement.
@@ -1490,6 +1603,7 @@ class AgentSendReceiptStore {
             sourceIdentity: audit.sourceIdentity, entryUuid: audit.entryUuid,
             receiptJson: encodeJson(receipt), updatedAt: this.now(),
           });
+          if (info.changes === 1) this._rememberAuditClaims(audit);
           return { ok: info.changes === 1, matched: true, promoted: false,
             enriched: info.changes === 1, idempotent: info.changes === 1,
             reason: info.changes === 1 ? 'canonical-address-enriched' : 'state-changed',
@@ -1546,6 +1660,8 @@ class AgentSendReceiptStore {
         auditTimestamp,
         entryUuid: audit.entryUuid,
         sourceIdentity: audit.sourceIdentity,
+        entryUuidAliases: audit.entryUuidAliases,
+        sourceIdentityAliases: audit.sourceIdentityAliases,
         recordByteOffset: audit.recordByteOffset,
       };
       const info = this.statements.promote.run({
@@ -1561,6 +1677,7 @@ class AgentSendReceiptStore {
         transcriptBoundaryJson: encodeJson(audit.transcriptBoundary),
         updatedAt,
       });
+      if (info.changes === 1) this._rememberAuditClaims(audit);
       return {
         ok: info.changes === 1,
         matched: true,
@@ -1679,7 +1796,10 @@ class AgentSendReceiptStore {
     let handoffId;
     try {
       operationKey = requiredString(input.operationKey, 'operationKey');
-      attemptId = requiredString(input.attemptId, 'attemptId');
+      // A durable admission/refusal can precede the first physical attempt.
+      // Explicit null is that exact identity, never a wildcard or a new UUID.
+      // Undefined/empty/malformed input still fails validation.
+      attemptId = input.attemptId === null ? null : requiredString(input.attemptId, 'attemptId');
       surface = requiredString(input.surface, 'surface');
       tabId = requiredString(input.tabId, 'tabId');
       handoffId = requiredString(input.handoffId, 'handoffId');
@@ -1768,6 +1888,22 @@ class AgentSendReceiptStore {
       + ' ORDER BY created_at ASC, operation_key ASC'
       + (limit ? ` LIMIT ${limit}` : '');
     return this.db.prepare(sql).all(...params).map(rowToRecord);
+  }
+
+  listAuditReferences(provider) {
+    // A targeted proof read needs global competing boundaries/claimed rows,
+    // not every prompt, attachment or presentation body in the receipt table.
+    const sql = `SELECT operation_key, tab_id, attempt_id, provider, session_id,
+      state, request_fingerprint, prompt_hash, prompt_length,
+      CASE WHEN transcript_boundary_json IS NOT NULL THEN transcript_boundary_json
+        WHEN json_valid(receipt_json) THEN json_extract(receipt_json, '$.transcriptBoundary')
+      END AS transcript_boundary_json,
+      audit_attempt_id, audit_provider, audit_session_id, audit_prompt_hash,
+      audit_entry_uuid, audit_source_identity,
+      CASE WHEN json_valid(receipt_json) THEN json_extract(receipt_json, '$.entryUuidAliases') END AS audit_entry_uuid_aliases_json,
+      CASE WHEN json_valid(receipt_json) THEN json_extract(receipt_json, '$.sourceIdentityAliases') END AS audit_source_identity_aliases_json
+      FROM ${TABLE_NAME} WHERE provider = ?`;
+    return this.db.prepare(sql).all(requiredString(provider, 'provider')).map(rowToRecord);
   }
 
   reconcileStartup() {

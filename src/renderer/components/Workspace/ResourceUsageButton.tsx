@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
-import { Activity, ChevronRight, ChevronDown, Folder, SquareTerminal, X } from 'lucide-react';
+import { Activity, ChevronRight, ChevronDown, Folder, Server, SquareTerminal } from 'lucide-react';
+import GlobalProcessControls from './GlobalProcessControls';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { CUSTOM_ICONS } from '../../assets/icons/registry';
 import { historyPreparationStatus, historyPreparationLabel } from '../../utils/historyPreparationStatus.mjs';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
-import { findTabPlacement, placementWorldFromState } from '../../utils/tabPlacementResolver.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -172,7 +172,6 @@ const ResourceUsageButton: React.FC = () => {
   const [metrics, setMetrics] = useState<MetricsPayload | null>(null);
   const [ambient, setAmbient] = useState<AmbientPayload | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [killing, setKilling] = useState(false);
   const cmdPressed = useCmdKey();
   const buttonRef = useRef<HTMLButtonElement>(null);
   const preparationStore = historyPreparationStatus();
@@ -269,8 +268,8 @@ const ResourceUsageButton: React.FC = () => {
     return () => {
       cancelled = true;
       ipcRenderer.removeListener('system:process-metrics-ambient', onAmbient);
-      // Чип живёт только в рабочей области: уходя на Home, гасим и замер,
-      // иначе main продолжал бы тикать для того, кого уже нет на экране.
+      // Общий чип остаётся на Home; подписка заканчивается только при
+      // размонтировании самого интерфейса, а не при смене его содержимого.
       ipcRenderer.invoke('system:process-metrics-ambient-stop').catch(() => {});
     };
   }, []);
@@ -306,35 +305,9 @@ const ResourceUsageButton: React.FC = () => {
     });
   }, []);
 
-  const openResourceTab = useCallback((tabId: string) => {
-    // Замер может пережить закрытие вкладки. Владелец и размещение берутся
-    // из живого store в момент клика, а не из снимка процессов.
-    const store = useWorkspaceStore.getState();
-    for (const [projectId, workspace] of store.openProjects) {
-      if (!workspace.tabs.has(tabId)) continue;
-      const placement = findTabPlacement({ tabId, ...placementWorldFromState(store) });
-      // Уже размещённую сессию показываем там, где она лежит. Без размещения
-      // добавляем чип в текущее окно, сохраняя его прежние вкладки.
-      store.placeTab(projectId, tabId, { mode: placement ? 'default' : 'add-here' });
-      setOpen(false);
-      return;
-    }
+  const openResourceTab = useCallback(async (tabId: string) => {
+    if (await useWorkspaceStore.getState().openTabById(tabId,{reason:'resources'})) setOpen(false);
   }, []);
-
-  const handleKillOrphans = useCallback(async () => {
-    const rows = metrics?.orphans?.rows || [];
-    if (rows.length === 0 || killing) return;
-    setKilling(true);
-    try {
-      // Переиспользуем общий путь остановки: в нём уже есть защита от
-      // убийства процессов самого приложения.
-      await Promise.all(rows.map(row =>
-        ipcRenderer.invoke('system:kill-process', row.pid).catch(() => null)
-      ));
-    } finally {
-      setKilling(false);
-    }
-  }, [metrics, killing]);
 
   // Неактивные вкладки — это пустые оболочки по несколько мегабайт. Их бывает
   // несколько десятков, и в общем списке они вытесняют то, ради чего панель
@@ -433,12 +406,12 @@ const ResourceUsageButton: React.FC = () => {
   const orphanCount = (open ? (metrics?.orphans?.count || 0) : (ambient?.orphanCount || 0));
   const chipValue = chipSource?.ok ? formatBytes(chipSource.totalBytes || 0) : '—';
   const chipCommands = chipSource?.ok && typeof chipSource.commandBytes === 'number'
-    ? formatBytes(chipSource.commandBytes) : '—';
+    ? chipSource.commandBytes === 0 ? null : formatBytes(chipSource.commandBytes) : '—';
 
   const valueOf = (bytes: number | null | undefined, cpu: number | null | undefined) =>
     mode === 'memory' ? bytes == null ? '—' : formatBytes(bytes) : formatCpu(cpu ?? null);
   const valuePair = (bytes: number, cpu: number | null, commandBytes: number | null | undefined, commandCpu: number | null | undefined) =>
-    <ResourceValues total={valueOf(bytes, cpu)} commands={valueOf(commandBytes, commandCpu)} />;
+    <ResourceValues total={valueOf(bytes, cpu)} commands={commandBytes === 0 ? null : valueOf(commandBytes, commandCpu)} />;
 
   return (
     <>
@@ -446,6 +419,7 @@ const ResourceUsageButton: React.FC = () => {
         : 'Память: всего приложение и вкладки / запущенные команды'}>
         <button
           ref={buttonRef}
+          data-resource-usage-button
           onClick={() => setOpen(value => !value)}
           className="flex h-[26px] shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-1.5 text-[11px] transition-colors cursor-pointer"
           style={{
@@ -503,12 +477,15 @@ const ResourceUsageButton: React.FC = () => {
               style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'transparent' }}
             />
             <div
+              data-resource-usage-panel
               onClick={event => event.stopPropagation()}
               onMouseDown={event => event.stopPropagation()}
               style={{
                 position: 'fixed',
                 top: rect.bottom + 6,
-                right: Math.max(8, window.innerWidth - rect.right),
+                // Keep the anchored menu inside a narrow/resized viewport;
+                // the anchor sits left of the other global chips.
+                right: `clamp(8px, ${Math.max(8, window.innerWidth - rect.right)}px, max(8px, calc(100vw - min(400px, calc(100vw - 24px)) - 8px)))`,
                 zIndex: 10000,
                 width: 'min(400px, calc(100vw - 24px))',
                 maxHeight: 'min(560px, calc(100vh - 80px))',
@@ -558,8 +535,8 @@ const ResourceUsageButton: React.FC = () => {
 
                 {metrics && metrics.ok && (
                   <>
-                    {/* Брошенное — наверху: единственное место, где один клик
-                        реально освобождает память. */}
+                    {/* Учёт брошенного остаётся в ресурсах. Подтверждение и
+                        перечитывание точных MCP PID — в меню MCP-хаба. */}
                     {orphanCount > 0 && (
                       <div style={{
                         margin: '0 8px 6px',
@@ -579,28 +556,7 @@ const ResourceUsageButton: React.FC = () => {
                             {orphanCount} шт · {formatBytes(metrics.orphans!.totalBytes)}
                           </div>
                         </div>
-                        <button
-                          onClick={handleKillOrphans}
-                          disabled={killing}
-                          style={{
-                            height: 22,
-                            padding: '0 8px',
-                            borderRadius: 5,
-                            border: '1px solid rgba(248,113,113,0.3)',
-                            background: 'rgba(248,113,113,0.12)',
-                            color: '#fca5a5',
-                            fontSize: 10,
-                            fontWeight: 700,
-                            cursor: killing ? 'default' : 'pointer',
-                            opacity: killing ? 0.6 : 1,
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 4,
-                          }}
-                        >
-                          <X size={11} />
-                          {killing ? 'Убираю' : 'Убрать'}
-                        </button>
+                        <span style={{ fontSize: 10, color: '#999' }}>Управление в меню MCP</span>
                       </div>
                     )}
 
@@ -755,7 +711,8 @@ const ResourceUsageButton: React.FC = () => {
                                     {group.tools.map(tool => (
                                       <DetailRow
                                         key={tool.pid}
-                                        label={tool.label}
+                                        icon={<Server size={11} strokeWidth={1.8} aria-hidden />}
+                                        label={'MCP · ' + tool.label}
                                         value={valueOf(tool.bytes, tool.cpu)}
                                       />
                                     ))}
@@ -827,6 +784,7 @@ const ResourceUsageButton: React.FC = () => {
 
                   </>
                 )}
+                <GlobalProcessControls />
               </div>
 
               {metrics?.ok && (
@@ -840,8 +798,10 @@ const ResourceUsageButton: React.FC = () => {
                   fontVariantNumeric: 'tabular-nums',
                 }}>
                   <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 4 }}>
-                    всего <ResourceValues total={formatBytes(totalBytes)} commands={typeof metrics.totals?.commandBytes === 'number'
-                      ? formatBytes(metrics.totals.commandBytes) : projectsCommands.bytes == null ? '—' : formatBytes(projectsCommands.bytes)} />
+                    всего <ResourceValues total={formatBytes(totalBytes)} commands={
+                      (metrics.totals?.commandBytes ?? projectsCommands.bytes) === 0 ? null
+                        : typeof metrics.totals?.commandBytes === 'number'
+                          ? formatBytes(metrics.totals.commandBytes) : projectsCommands.bytes == null ? '—' : formatBytes(projectsCommands.bytes)} />
                   </span>
                   {mode === 'cpu' && !metrics.hasCpu && <span>замеряю нагрузку…</span>}
                   {metrics.durationMs !== undefined && <span>{metrics.durationMs.toFixed(0)} мс</span>}
@@ -855,13 +815,15 @@ const ResourceUsageButton: React.FC = () => {
   );
 };
 
-const ResourceValues: React.FC<{ total: string; commands: string }> = ({ total, commands }) => (
+const ResourceValues: React.FC<{ total: string; commands: string | null }> = ({ total, commands }) => (
   <span data-resource-values style={{ display: 'inline-flex', alignItems: 'center', gap: 4, whiteSpace: 'nowrap' }}
-    aria-label={'Всего ' + total + '; команды ' + commands}>
+    aria-label={'Всего ' + total + (commands === null ? '' : '; команды ' + commands)}>
     <span data-resource-total-value>{total}</span>
-    <span style={{ color: '#666' }} aria-hidden>/</span>
-    <SquareTerminal size={10} style={{ color: '#888', flexShrink: 0 }} aria-hidden />
-    <span data-resource-command-value style={{ color: '#aaa' }}>{commands}</span>
+    {commands !== null && <>
+      <span style={{ color: '#666' }} aria-hidden>/</span>
+      <SquareTerminal size={10} style={{ color: '#888', flexShrink: 0 }} aria-hidden />
+      <span data-resource-command-value style={{ color: '#aaa' }}>{commands}</span>
+    </>}
   </span>
 );
 

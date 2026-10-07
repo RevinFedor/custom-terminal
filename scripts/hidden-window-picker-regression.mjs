@@ -190,6 +190,7 @@ try {
             // The sidebar map/actions and all the shared-card marks are neighbors too.
             neighbors:Array.from(card.querySelectorAll('[data-tab-pane-map], [data-tab-status-marker], [data-task-plan-tab-marker], [data-tab-context-usage], [data-tab-fast-badge], [data-tab-card-project-icon], button'),box)},
           label:label.textContent,bar:box(bar),
+          frame:{boxShadow:css.boxShadow,borderColor:css.borderColor,outline:css.outline},
           rightEdge:card.getBoundingClientRect().right-Number.parseFloat(css.borderRightWidth),
           bell:bell?{...box(bell),position:bellCss.position,right:bellCss.right,top:bellCss.top,
             inkScaleX:icon?.getScreenCTM()?.a,inkScaleY:icon?.getScreenCTM()?.d,
@@ -200,7 +201,7 @@ try {
   });
   result.notificationCases=[];
   const notificationDrift=[];
-  const layoutOnly=sample=>({trigger:sample.trigger,popup:sample.popup,cards:sample.cards.map(({surface,tab,layout})=>({surface,tab,layout}))});
+  const layoutOnly=sample=>({trigger:sample.trigger,popup:sample.popup,cards:sample.cards.map(({surface,tab,layout,frame})=>({surface,tab,layout,frame}))});
   for(const settings of [
     {fontSize:14,paddingX:6,position:'right'},
     {fontSize:22,paddingX:6,position:'right'},
@@ -212,10 +213,10 @@ try {
     for(const notification of ['off','armed','persistent','persistent-fired','off','fired','off']){
       await page.evaluate(settings=>window.pickerFixture.cardLabelCase(settings),{...settings,notification});await frames();
       if(notification==='off'&&previousNotification?.endsWith('fired')){
-        const sample=await notificationGeometry();result.notificationCases.push({settings,notification,phase:'dismissing',sample});
-        assert.ok(sample.cards.filter(c=>c.tab!=='e').every(c=>c.dismissing&&!c.bell),'clearing removes bells while the existing alert fades');
+        const sample=await notificationGeometry();result.notificationCases.push({settings,notification,phase:'cleared',sample});
+        assert.ok(sample.cards.every(c=>!c.dismissing&&!c.bell&&!c.alert),'clearing removes bells immediately without a notification frame or fade');
         const geometry=layoutOnly(sample);
-        if(JSON.stringify(geometry)!==JSON.stringify(baseline))notificationDrift.push({settings,notification,phase:'dismissing',expected:baseline,actual:geometry});
+        if(JSON.stringify(geometry)!==JSON.stringify(baseline))notificationDrift.push({settings,notification,phase:'cleared',expected:baseline,actual:geometry});
       }
       if(notification==='off')await page.waitForFunction(()=>!document.querySelector('[data-tab-completion-notification-alert]'));
       const sample=await notificationGeometry();result.notificationCases.push({settings,notification,sample});
@@ -229,7 +230,8 @@ try {
       for(const c of sample.cards){
         const enabled=notification!=='off'&&c.tab!=='e',persistent=notification.startsWith('persistent'),fired=notification.endsWith('fired');
         assert.equal(!!c.bell,enabled,`${c.surface}/${c.tab}: ${notification} bell`);
-        assert.equal(c.alert,enabled&&fired,`${c.surface}/${c.tab}: ${notification} alert`);
+        assert.equal(c.alert,false,`${c.surface}/${c.tab}: ${notification} must not add a notification frame`);
+        assert.equal(c.dismissing,false,`${c.surface}/${c.tab}: no notification-frame fade`);
         const paddingRight=c.surface==='sidebar'?settings.paddingX:Math.max(settings.paddingX,settings.position==='right'?3:0);
         assert.equal(Number.parseFloat(c.layout.paddingRight),paddingRight,'only configured spacing and the existing process rail reserve space');
         if(enabled){
@@ -259,8 +261,8 @@ try {
     }
   }
   result.notificationDrift=notificationDrift;
-  assert.equal(notificationDrift.length,0,'completion bells must not move/resize cards, labels, adjacent chips or sidebar maps/actions');
-  result.checks.push('off → armed → persistent → fired → off: bell centered over right rail with unchanged top and zero layout drift on pane/picker/sidebar/Run After; 14/22px text, 0/6/12px padding, both rail sides');
+  assert.equal(notificationDrift.length,0,'completion bells must not change card frames or move/resize cards, labels, adjacent chips or sidebar maps/actions');
+  result.checks.push('off → armed → persistent → fired → off: no notification frame/shadow/fade and zero layout drift on pane/picker/sidebar/Run After; bell mode/color and process rail preserved; 14/22px text, 0/6/12px padding, both rail sides');
   await page.evaluate(()=>window.pickerFixture.sidebar(false));
   await reset();
   const leftRow=async()=>{

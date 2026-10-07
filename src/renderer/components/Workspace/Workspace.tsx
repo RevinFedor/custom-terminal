@@ -1,18 +1,20 @@
 import React, { startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
 import ReactDOM from 'react-dom';
-import { selectFocusedProjectId, useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { selectFocusedProjectId, useWorkspaceStore, buildHistoryPendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import TabBar from './TabBar';
 import { PersistentTabSidebarStack } from './TabSidebar';
-import ProjectHome from './ProjectHome';
+import ConnectedWorkflowSidebar from './ConnectedWorkflowSidebar';
+import GlobalTabArchive, {type ArchiveRequest,type GlobalArchiveRecord} from './GlobalTabArchive';
 import TerminalArea, { type AgentLifecycleSummary } from './TerminalArea';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
 import Timeline from './Timeline';
 import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
+import { useTabLinkedFilePreviewBounds } from '../../utils/tabLinkedFilePreviewBounds';
 import { useSplitAttachRowHeight, PANE_HEADER_HEIGHT_VAR, SplitPaneAttachRow } from './SplitPaneChrome';
 import { EXPLORER_TOP_H } from '../../constants/layout';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
@@ -37,8 +39,276 @@ import {
   type PaneFocusIsolationManager,
 } from '../../utils/paneFocusIsolation';
 import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
+import { generateTabTitleFromSession } from '../../utils/generateTabTitle';
+import { createArchiveTitleRefresher } from '../../utils/workflowOrganizationClient.mjs';
+import {archiveReceiptMatches} from '../../utils/globalTabArchive.mjs';
+import {findOpenTabOwner} from '../../utils/tabLinkNavigation.mjs';
+import {GLOBAL_EXECUTION_NAMESPACE} from '../../utils/workflowMembership.mjs';
+import {archiveServiceScopes, archiveScopeLabel, freezeArchiveClearIntent, archiveClearRequest,
+  archiveClearAcknowledged, archiveClearFailure, createArchiveNavigationIntent} from './rootArchiveIntent.mjs';
 
 const { ipcRenderer } = window.require('electron');
+
+/** Saved transcript owner: selection never creates a runtime tab. */
+function GlobalArchivePreview({record,entryUuid}:{record:GlobalArchiveRecord;entryUuid?:string}) {
+  const toolType = record.command_type === 'codex' && record.codex_session_id ? 'codex'
+    : record.command_type === 'gemini' && record.gemini_session_id ? 'gemini'
+    : record.command_type === 'claude' && record.claude_session_id ? 'claude'
+    : record.codex_session_id ? 'codex' : record.gemini_session_id ? 'gemini' : record.claude_session_id ? 'claude' : null;
+  const sessionId = toolType === 'codex' ? record.codex_session_id : toolType === 'gemini' ? record.gemini_session_id : record.claude_session_id;
+  const tabId = 'archive-preview:' + JSON.stringify([record.namespace,record.id,toolType,sessionId]);
+  useEffect(() => {
+    if (!toolType || !sessionId) return;
+    const ui = useUIStore.getState();ui.setHistoryPanelOpen(tabId,true);
+    if (entryUuid) ui.setHistoryScrollToUuid(entryUuid,tabId);
+    return () => {useUIStore.getState().setHistoryPanelOpen(tabId,false);};
+  },[tabId,toolType,sessionId,entryUuid]);
+  if (!toolType || !sessionId) return <div className="gta-metadata">{record.notes || 'У записи нет сохранённого диалога'}<br/>{record.cwd}</div>;
+  return <div data-global-archive-preview style={{display:'flex',height:450,minHeight:250,position:'relative'}}>
+    <div style={{flex:1,minWidth:0}}><HistoryPanel tabId={tabId} sessionId={String(sessionId)} cwd={record.cwd || ''}
+      width={420} notesPanelWidth={0} isOpen toolType={toolType} enableClaudePtyControls={false} embedded embeddedFill previewMode /></div>
+    <div style={{width:33,flexShrink:0,position:'relative',overflow:'hidden'}}>
+      <Timeline tabId={tabId} sessionId={String(sessionId)} cwd={record.cwd || ''} isActive={false}
+        isVisible isOpen toolType={toolType} readOnly />
+    </div>
+  </div>;
+}
+
+export function RootGlobalArchive({onClose}:{onClose:()=>void}) {
+  const workflows = useWorkspaceStore(state => state.spaces);
+  const [snapshot,setSnapshot] = useState<any>(null),[service,setService] = useState(false);
+  const [namespace,setNamespace] = useState(GLOBAL_EXECUTION_NAMESPACE),[serviceResult,setServiceResult] = useState<any>(null);
+  const [busy,setBusy] = useState(false),[failure,setFailure] = useState('');
+  const [confirm,setConfirm] = useState<ReturnType<typeof freezeArchiveClearIntent>|null>(null);
+  const [dateFrom,setDateFrom] = useState(''),[provider,setProvider] = useState('all');
+  const serviceLock = useRef(false), clearAttempts = useRef(new Set<string>());
+  const confirmationRef = useRef(confirm);
+  confirmationRef.current = confirm;
+  const cancelConfirm = useCallback(() => {confirmationRef.current = null;setConfirm(null);},[]);
+  const scopesRef = useRef<ReturnType<typeof archiveServiceScopes>>([]);
+  const navigationIntents = useRef(new Map<string,ReturnType<typeof createArchiveNavigationIntent>>());
+  const alive = useRef(true);
+  const cancelNavigation = useCallback(() => {
+    alive.current = false;
+    const store = useWorkspaceStore.getState();
+    for (const intent of navigationIntents.current.values()) {
+      intent.cancel();
+      if (intent.ownedNavigationId && store.activeTabNavigationIntent?.id === intent.ownedNavigationId)
+        useWorkspaceStore.setState({activeTabNavigationIntent:null});
+    }
+  },[]);
+  const closeArchive = useCallback(() => {cancelNavigation();onClose();},[cancelNavigation,onClose]);
+  useEffect(() => {alive.current = true;return cancelNavigation;},[cancelNavigation]);
+  const captureNavigation = (request:ArchiveRequest) => {
+    let intent = navigationIntents.current.get(request.requestId);
+    if (!intent) {
+      if (request.background !== true) {
+        for (const previous of navigationIntents.current.values()) previous.cancel();
+      }
+      intent = createArchiveNavigationIntent(useWorkspaceStore.getState(),request.requestId);
+      if (!alive.current) intent.cancel();
+      navigationIntents.current.set(request.requestId,intent);
+    }
+    const unsubscribe = useWorkspaceStore.subscribe(intent.observe);
+    return {intent,unsubscribe};
+  };
+  useEffect(() => {
+    if (!confirm) return;
+    const cancel = (event:KeyboardEvent) => {if (event.key === 'Escape') {event.preventDefault();event.stopImmediatePropagation();cancelConfirm();}};
+    window.addEventListener('keydown',cancel,true);return () => window.removeEventListener('keydown',cancel,true);
+  },[confirm,cancelConfirm]);
+  const readArchive = useCallback(async () => {
+    const result = await ipcRenderer.invoke('workflow:archive-read');
+    if (result?.version !== 1 || !Array.isArray(result.history) || !Array.isArray(result.favorites)) throw new Error('Архив недоступен');
+    scopesRef.current = archiveServiceScopes(result,scopesRef.current);
+    setSnapshot(result);return result;
+  },[]);
+  const scopes = snapshot ? scopesRef.current : [];
+  const selectedScope = scopes.find(scope => scope.namespace === namespace);
+  const exactRequest = (request:ArchiveRequest):ArchiveRequest => {
+    const raw = request.record.__notedArchiveSourceV1 as GlobalArchiveRecord | undefined;
+    if (!raw) return request;
+    if (raw.namespace !== request.namespace || raw.id !== request.record.id) throw new Error('Адрес результата поиска изменился');
+    return {...request,record:raw};
+  };
+  const action = (kind:string) => (request:ArchiveRequest) => ipcRenderer.invoke('workflow:archive-mutate',{kind,request:exactRequest(request)});
+  const titleRefresher = useRef<ReturnType<typeof createArchiveTitleRefresher>|null>(null);
+  if (!titleRefresher.current) titleRefresher.current = createArchiveTitleRefresher({
+    generateTitle:generateTabTitleFromSession,
+    renameHistory:(request:ArchiveRequest) => ipcRenderer.invoke('workflow:archive-mutate',{kind:'rename-history',request}),
+  });
+  const refreshTitle = (request:ArchiveRequest) => titleRefresher.current!(exactRequest(request));
+  const restore = async (input:ArchiveRequest) => {
+    const request = exactRequest(input);
+    const {intent,unsubscribe} = captureNavigation(request);
+    try {
+    const store = useWorkspaceStore.getState();
+    await store.refreshOrganizationCatalog();
+    const result = await useWorkspaceStore.getState().restoreTabHistoryEntry(request.namespace,request.historyId,{
+      background:true,expectedTabId:request.expectedTabId,resumePolicy:'always',
+      targetWorkflowId:request.targetWorkflowId,archiveRequest:request,
+      navigationOwnerId:request.requestId,isNavigationCurrent:()=>intent.isCurrent(useWorkspaceStore.getState()),
+    } as any);
+    if (!result.tabId || result.historyDeleteFailed) return {...result,namespace:request.namespace,requestId:request.requestId};
+    if (request.background !== true && intent.isCurrent(useWorkspaceStore.getState())
+      && !(await intent.applyOwnedNavMutations(() => useWorkspaceStore.getState().openTabById(result.tabId!,{reason:'global-archive'})))) return false;
+    return {...result,namespace:request.namespace,requestId:request.requestId};
+    } finally {unsubscribe();}
+  };
+  const favoriteLaunchIntents = useRef(new Map<string,{tabId:string;tab:any;prepared:boolean}>());
+  const openFavorite = async (input:ArchiveRequest) => {
+    const request = exactRequest(input);
+    const {intent,unsubscribe} = captureNavigation(request);
+    try {
+    const receipt = await action('open-favorite')(request);
+    if (receipt?.success !== true || typeof receipt.tabId !== 'string' || !receipt.tabId
+      || !archiveReceiptMatches(receipt,request)) return false;
+    await useWorkspaceStore.getState().refreshOrganizationCatalog();
+    const store = useWorkspaceStore.getState(),owner = findOpenTabOwner(store,receipt.tabId);
+    if (!owner || store.tabCatalog[receipt.tabId]?.active === false) return false;
+    const old = favoriteLaunchIntents.current.get(request.requestId);
+    if (old && (old.tabId !== receipt.tabId || old.tab !== owner.tab)) return false;
+    const launch = old || {tabId:receipt.tabId,tab:owner.tab,prepared:false};
+    if (!launch.prepared) {
+      owner.tab.pendingAction = buildHistoryPendingAction(request.record as any,'always');
+      launch.prepared = true;favoriteLaunchIntents.current.set(request.requestId,launch);
+    }
+    if (!(await store.ensureTabRuntime(receipt.tabId))) return false;
+    if (request.background !== true && intent.isCurrent(useWorkspaceStore.getState())
+      && !(await intent.applyOwnedNavMutations(() => useWorkspaceStore.getState().openTabById(receipt.tabId,{reason:'favorite'})))) return false;
+    return receipt;
+    } finally {unsubscribe();}
+  };
+  const searchArchive = async (request:any) => {
+    const current = await readArchive();
+    const scopes = [...new Set<string>(current.history.filter((row:any) => (!request.workflowId || row.workflowId === request.workflowId)
+      && (!request.cwd || row.cwd === request.cwd)).map((row:any) => row.namespace))];
+    const history:GlobalArchiveRecord[] = [];
+    for (const scope of scopes) {
+      const result = await ipcRenderer.invoke(request.mode === 'iterations' ? 'tab-iteration-search:semantic' : 'tab-title-search:semantic',{
+        projectId:scope,query:request.query,maxResults:120,minScore:.32,dateFrom:request.dateFrom || null});
+      if (!result?.success) throw new Error(result?.error || 'Поиск архива не подтверждён');
+      for (const hit of result.data || []) {
+        const row = current.history.find((row:any) => row.namespace === scope && row.id === (hit.historyId ?? hit.tabHistoryId ?? hit.id));
+        if (row && (provider === 'all' || row.command_type === provider)) history.push({...hit,...row,
+          entryUuid:hit.entryUuid,score:hit.score,summary:hit.summary,__notedArchiveSourceV1:row});
+      }
+    }
+    return {version:1 as const,history};
+  };
+  const runService = async (kind:string) => {
+    if (serviceLock.current || !selectedScope) return;
+    const target = {namespace,dateFrom};
+    serviceLock.current = true;setBusy(true);setFailure('');setServiceResult(null);
+    try {
+      const channels:Record<string,string[]> = {
+        stats:['tab-title-index:stats','tab-iteration-index:stats'],
+        titles:['tab-title-index:reindex'],iterations:['tab-iteration-index:reindex'],
+      };
+      const results = [];
+      for (const channel of channels[kind]) {
+        const result = await ipcRenderer.invoke(channel,{projectId:target.namespace,force:false,dateFrom:target.dateFrom || null});
+        if (result?.success !== true || Number(result.data?.errors || result.errors || 0) > 0)
+          throw new Error(result?.error || 'Операция не завершена полностью');
+        results.push(result);
+      }
+      setServiceResult(results);await readArchive();
+    } catch (error:any) {setFailure(error?.message || String(error));}
+    finally {serviceLock.current = false;setBusy(false);}
+  };
+  const openConfirm = (kind:string) => {
+    try {
+      const intent = freezeArchiveClearIntent(kind,selectedScope,dateFrom,crypto.randomUUID());
+      confirmationRef.current = intent;setConfirm(intent);
+      setFailure('');setServiceResult(null);
+    } catch (error:any) {setFailure(error?.message || String(error));}
+  };
+  const runClear = async (intent:ReturnType<typeof freezeArchiveClearIntent>) => {
+    if (serviceLock.current || confirmationRef.current?.requestId !== intent.requestId) return;
+    serviceLock.current = true;setBusy(true);setFailure('');setServiceResult(null);
+    try {
+      // An explicit retry rereads durable state, but never rebuilds this intent.
+      const retry=clearAttempts.current.has(intent.requestId);
+      if (retry) await readArchive();
+      if (confirmationRef.current?.requestId !== intent.requestId) return;
+      clearAttempts.current.add(intent.requestId);
+      let result;
+      if (intent.kind === 'clear-history' || intent.kind === 'clear-except-notes') {
+        const request = archiveClearRequest(intent);
+        if(retry)
+          result=await ipcRenderer.invoke('workflow:archive-clear-receipt',request).catch(()=>null);
+        if(!result)result = await ipcRenderer.invoke('workflow:archive-clear',request);
+        if (!archiveClearAcknowledged(result,request)) {
+          const refusal = result?.code || result?.error || result?.message || '';
+          const knownRefusal = refusal.includes('archive_clear_scope_changed') || refusal.includes('archive_restore_busy');
+          throw new Error(knownRefusal ? archiveClearFailure({message:refusal}) : result?.disposition === 'not-applied'
+            ? 'Архив изменился или очистка недоступна. Очистка не применена. Отмените подтверждение, обновите архив и проверьте новый состав.'
+            : result?.message || result?.error || 'Очистка не подтверждена. Повторить можно только для показанного состава архива.');
+        }
+      } else {
+        const channel = intent.kind === 'clear-titles' ? 'tab-title-index:clear' : 'tab-iteration-index:clear';
+        result = await ipcRenderer.invoke(channel,{projectId:intent.namespace,force:false,dateFrom:intent.dateFrom});
+        if (result?.success !== true || Number(result.data?.errors || result.errors || 0) > 0)
+          throw new Error(result?.error || 'Очистка индекса не подтверждена');
+      }
+      if (confirmationRef.current?.requestId === intent.requestId) cancelConfirm();
+      setServiceResult([result]);await readArchive();
+    } catch (error:any) {setFailure(archiveClearFailure(error));}
+    finally {serviceLock.current = false;setBusy(false);}
+  };
+  useEffect(() => {
+    const progress = (_event:any,value:any) => {if (value?.projectId === namespace) setServiceResult(value);};
+    ipcRenderer.on('tab-title-index:progress',progress);ipcRenderer.on('tab-iteration-index:progress',progress);
+    return () => {ipcRenderer.removeListener('tab-title-index:progress',progress);ipcRenderer.removeListener('tab-iteration-index:progress',progress);};
+  },[namespace]);
+  return <div data-root-global-archive role="dialog" aria-label="Общий архив" style={{
+    position:'fixed',inset:0,zIndex:2147482100,background:'#171717',overflow:'hidden',color:'#ccc',display:'flex',flexDirection:'column'}}>
+    <div className="global-tab-archive" style={{height:'auto',flexShrink:0,padding:8,display:'flex',flexDirection:'row',gap:8,flexWrap:'wrap'}}>
+      <button onClick={() => setService(!service)}>Индексы и очистка</button>
+      <select aria-label="Провайдер поиска" value={provider} onChange={event => setProvider(event.target.value)}>
+        <option value="all">Все агенты</option><option value="claude">Claude</option><option value="codex">Codex</option><option value="gemini">Gemini</option>
+      </select>
+    </div>
+    {service && <div className="global-tab-archive" data-archive-services style={{height:'auto',flexShrink:0,padding:12,display:'flex',flexDirection:'row',gap:8,flexWrap:'wrap',maxHeight:240,overflow:'auto'}}>
+      <select aria-label="Область архива" value={namespace} onChange={event => setNamespace(event.target.value)}>
+        <option value="">Выберите архив</option>{scopes.map(scope => <option key={scope.namespace} value={scope.namespace}>{archiveScopeLabel(scope)}</option>)}
+      </select>
+      {selectedScope && <div style={{width:'100%'}}>Все каталоги выбранного архива:
+        {selectedScope.cwds.length ? <ul>{selectedScope.cwds.map(cwd => <li key={cwd}>{cwd || 'Каталог не указан'}</li>)}</ul> : ' нет записей с каталогом'}</div>}
+      <input aria-label="Индексировать с даты" type="date" value={dateFrom} onChange={event => setDateFrom(event.target.value)}/>
+      {['stats','titles','iterations','clear-titles','clear-iterations','clear-history','clear-except-notes'].map((kind,index) =>
+        <button key={kind} disabled={busy || !!confirm || !selectedScope} onClick={() => kind.startsWith('clear') ? openConfirm(kind) : void runService(kind)}>
+          {['Статистика','Индекс названий','Индекс итераций','Очистить индекс названий','Очистить индекс итераций','Очистить архив','Очистить без заметок'][index]}</button>)}
+      {confirm && <div role="alertdialog" aria-label="Подтверждение очистки архива"><span>{
+        confirm.kind === 'clear-history' ? 'Удалить записи архива во всех перечисленных каталогах?'
+          : confirm.kind === 'clear-except-notes' ? 'Удалить записи без заметок во всех перечисленных каталогах? Записи с заметками сохранятся.'
+          : confirm.kind === 'clear-titles' ? 'Очистить индекс названий во всех перечисленных каталогах?'
+          : 'Очистить индекс итераций во всех перечисленных каталогах?'}</span>
+        <div>{confirm.scopeSummary.label}</div>
+        {confirm.kind === 'clear-except-notes' && confirm.scopeSummary.notesCount !== null
+          && <div>Сохранятся записи с заметками: {confirm.scopeSummary.notesCount}</div>}
+        <ul>{confirm.scopeSummary.cwds.map(cwd => <li key={cwd}>{cwd || 'Каталог не указан'}</li>)}</ul>
+        {confirm.kind.startsWith('clear-') && !['clear-history','clear-except-notes'].includes(confirm.kind)
+          && <div>Дата для запроса: {confirm.dateFrom || 'все даты'}</div>}
+        <button disabled={busy} onClick={() => void runClear(confirm)}>{clearAttempts.current.has(confirm.requestId) ? 'Повторить' : 'Подтвердить'}</button>
+        <button onClick={cancelConfirm}>Отмена</button></div>}
+      {serviceResult && <div role="status" style={{width:'100%',fontSize:12,color:'#a9cab5'}}>{
+        Array.isArray(serviceResult) ? serviceResult.map((value:any,index:number) => {
+          const stats = value.data || value;
+          return (serviceResult.length > 1 ? (index ? 'Итерации: ' : 'Названия: ') : '')
+            + (stats.total != null ? String(stats.indexed ?? stats.current ?? 0) + ' из ' + stats.total : 'Операция завершена');
+        }).join(' · ') : 'Обработано ' + (serviceResult.current || 0) + ' из ' + (serviceResult.total || 0)
+      }</div>}
+      {failure && <div role="alert">{failure}</div>}
+    </div>}
+    <div style={{flex:1,minHeight:0}}><GlobalTabArchive readArchive={readArchive} workflows={workflows} onRestore={restore} onOpenFavorite={openFavorite}
+      onDeleteHistory={action('delete-history')} onRemoveFavorite={action('remove-favorite')}
+      onAddFavorite={action('add-favorite')} onRename={action('rename-history')} onRefreshTitle={refreshTitle}
+      onUpdateNotes={action('update-notes')} renderPreview={(record,{entryUuid}) => <GlobalArchivePreview key={JSON.stringify([record.namespace,record.id])}
+        record={record} entryUuid={entryUuid}/>} searchArchive={searchArchive} onClose={closeArchive}/></div>
+  </div>;
+}
+
 
 // Single-center chrome survives pane workflow visits. Its tab-owned store
 // subscriptions remain authoritative, while identical props let React.memo
@@ -198,7 +468,8 @@ export default function Workspace({
     const projectId = selectFocusedProjectId(s);
     return projectId ? (s.openProjects.get(projectId)?.currentView || 'terminal') : 'terminal';
   });
-  const isInboxProject = isInboxProjectId(activeProjectId);
+  const organizationReady = useWorkspaceStore(state => state.organizationReady);
+  const isInboxProject = !organizationReady && isInboxProjectId(activeProjectId);
   const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
   const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
   const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
@@ -223,6 +494,7 @@ export default function Workspace({
 
   // Use selectors to avoid rerenders on unrelated UIStore changes
   const filePreview = useUIStore((s) => s.filePreview);
+  useTabLinkedFilePreviewBounds(filePreview);
   const openFilePreview = useUIStore((s) => s.openFilePreview);
   const closeFilePreview = useUIStore((s) => s.closeFilePreview);
   const notesPanelWidth = useUIStore((s) => s.notesPanelWidth);
@@ -808,6 +1080,11 @@ export default function Workspace({
   const splitActiveForPreview = useWorkspaceStore((s) => s.splitPanes.length > 0);
   useEffect(() => {
     if (!activeProjectId) return;
+
+    // Owner-card documents already use the existing reader surface. Their
+    // exact preview lease clears on navigation; do not require activating the
+    // visual file tab (or dismiss them merely because split mode is active).
+    if (useUIStore.getState().filePreview?.ownerTabId) return;
 
     if (!activeFileTabPath || !activeFileTab?.id || splitActiveForPreview) {
       const currentPreview = useUIStore.getState().filePreview;
@@ -1988,13 +2265,13 @@ export default function Workspace({
       {/* MAIN ROW: TabSidebar | Terminal. */}
       <div className="flex-1 flex min-h-0 relative">
       {/* LEFT COLUMN: vertical tab sidebar */}
-      <PersistentTabSidebarStack
+      {organizationReady ? <ConnectedWorkflowSidebar activity={sharedTabActivity} /> : <PersistentTabSidebarStack
         projectIds={persistentSidebarProjectIds}
         presentedProjectId={presentedSidebarProjectId}
         processStatus={processStatus}
         busyTabs={busyTabs}
         pasteBusyTabs={pasteBusyTabs}
-      />
+      />}
 
       {/* Menu owners for the OTHER projects currently visible in panes.
           Render nothing; each exists only to answer a context-menu request for
@@ -2004,7 +2281,7 @@ export default function Workspace({
           are cross-project, so the sidebar's single list cannot serve them all.
           A right click asks ABOUT a tab and must not navigate: the menu comes to
           the project, the project does not move to the menu. */}
-      {paneMenuOwnerProjectIds.map((pid) => (
+      {(organizationReady ? persistentSidebarProjectIds : paneMenuOwnerProjectIds).map((pid) => (
         <TabBar
           key={`menu-owner-${pid}`}
           projectId={pid}
@@ -2070,9 +2347,12 @@ export default function Workspace({
               открытая боковая панель ЛЕВОГО окна обязана лечь поверх бокового
               списка вкладок («он его тоже должен перекрывать»), и обрезка на
               этом контейнере резала её ровно по границе рабочей области. */}
-          <div className={splitActiveLayout
+          <div className={splitActiveLayout || (historyIsPrimary && floatingTerminalOpen)
             ? 'flex-1 relative min-w-0'
-            : 'flex-1 relative min-w-0 overflow-hidden'}>
+            : 'flex-1 relative min-w-0 overflow-hidden'}
+            style={!splitActiveLayout && historyIsPrimary && floatingTerminalOpen
+              ? { overflowX: 'visible', overflowY: 'clip' }
+              : undefined}>
             {/* Placement gates use the FROZEN placement (not the live flags):
                 during the stale deferred beat the node must stay where the
                 dying owner rendered it — see historyPlacementForRender. */}
@@ -2083,6 +2363,7 @@ export default function Workspace({
               tabName={singleCenterTab?.name || 'Terminal'}
               floating={historyIsPrimary}
               open={!historyIsPrimary || floatingTerminalOpen}
+              allowSideOverlayOverflow={splitActiveLayout}
               // Same pin switch as the transcript panel: one control for the
               // Cmd+] slot, whichever surface currently occupies it.
               pinned={sideTerminalPinned}
@@ -2290,11 +2571,8 @@ export default function Workspace({
 
         {/* Project Home - Overlay AFTER TabBar+TerminalArea to keep children indices stable */}
         {/* Uses absolute positioning so visual order is unaffected */}
-        {focusedProjectId && focusedCurrentView === 'home' && (
-          <div className="absolute inset-0 z-50 bg-bg-main border-r border-border-main">
-            <ProjectHome projectId={focusedProjectId} />
-          </div>
-        )}
+        {/* The global archive has its own Root owner. Legacy currentView=home
+            cannot resurrect the removed project surface. */}
       </div>
 
       </div>{/* /MAIN ROW */}

@@ -37,25 +37,31 @@ function classifyCodexCapacityRetryRecord(record) {
   return { type: 'progress', at, eventId: String(record.__byteOffset ?? p.id ?? p.call_id ?? record.timestamp) };
 }
 
-function createCodexCapacityRetryRuntime({ getSettings, loadState, saveState, isCurrent, send, notify, cancelSend, log = () => {} }) {
+function createCodexCapacityRetryRuntime({ getSettings, loadState, saveState, isCurrent, send, notify, cancelSend,
+  waiting = () => {}, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, log = () => {} }) {
   const entries = new Map();
   const scopeOf = owner => JSON.stringify([owner.tabId, owner.sessionId]);
   function entryFor(owner) {
     const scopeKey = scopeOf(owner);
     const previous = entries.get(owner.tabId);
     if (previous?.scopeKey === scopeKey && previous.owner.generation === owner.generation) return previous;
+    previous?.cancelWait?.();
     let state = loadState(owner.tabId);
     if (state?.scopeKey !== scopeKey) state = null;
     // A new live process is a new explicit launch after Stop. Pending effects
     // are never replayed on boot; only new typed errors can request a retry.
     if (state?.cancelled) state = null;
-    const entry = { scopeKey, owner, state };
+    // A persisted delay is diagnostic, not boot-time authority to replay an
+    // old error into a new process. A new typed live failure may arm again.
+    if (state?.pendingDelayUntil) state = { ...state, pendingDelayUntil: null, pendingEffectId: null };
+    const entry = { scopeKey, owner, state, cancelWait: null, waitingEffect: null };
     entries.set(owner.tabId, entry);
     return entry;
   }
   function cancel(tabId, reason = 'cancelled') {
     const entry = entries.get(tabId);
     if (!entry) return;
+    entry.cancelWait?.();
     if (entry.state?.pendingEffectId) cancelSend?.(tabId, entry.state.pendingEffectId, reason);
     entry.state = reduceCodexCapacityRetry(entry.state, { type: 'cancel', scopeKey: entry.scopeKey }).state;
     saveState(tabId, entry.state);
@@ -69,6 +75,7 @@ function createCodexCapacityRetryRuntime({ getSettings, loadState, saveState, is
     // Ordinary output has no disk-write hot path. Persist only a replenished
     // retry budget; this does not change anyone's transcript read cursor.
     if (result.state !== previous && (previous?.attempts || previous?.exhausted || previous?.pendingEffectId)) {
+      entry.cancelWait?.();
       if (previous.pendingEffectId) cancelSend?.(owner.tabId, previous.pendingEffectId, 'real-progress');
       saveState(owner.tabId, entry.state);
     }
@@ -80,6 +87,7 @@ function createCodexCapacityRetryRuntime({ getSettings, loadState, saveState, is
     const result = reduceCodexCapacityRetry(entry.state, { ...event, scopeKey: entry.scopeKey }, settings);
     entry.state = result.state;
     if (!result.effect) return { ignored: true };
+    entry.cancelWait?.();
     saveState(owner.tabId, entry.state); // reserve before any external effect
     const effect = result.effect;
     const stillCurrent = async () => isCurrent(owner)
@@ -90,6 +98,26 @@ function createCodexCapacityRetryRuntime({ getSettings, loadState, saveState, is
     if (effect.type === 'exhausted') {
       await notify(owner, effect);
       return { exhausted: true };
+    }
+    if (effect.delayMs > 0) {
+      const deadline = now() + effect.delayMs;
+      entry.state = { ...entry.state, pendingDelayUntil: deadline };
+      entry.waitingEffect = effect;
+      saveState(owner.tabId, entry.state);
+      waiting(owner, { ...effect, deadline });
+      const elapsed = await new Promise(resolve => {
+        const finish = value => {
+          if (!entry.cancelWait) return;
+          clearTimer(timer); entry.cancelWait = null; entry.waitingEffect = null;
+          entry.state = { ...entry.state, pendingDelayUntil: null };
+          saveState(owner.tabId, entry.state);
+          waiting(owner, null); resolve(value);
+        };
+        const timer = setTimer(() => finish(true), Math.max(1, deadline - now()));
+        timer?.unref?.();
+        entry.cancelWait = () => finish(false);
+      });
+      if (!elapsed || !await stillCurrent()) return { ignored: true, cancelled: true, submitted: false };
     }
     try {
       const result = await send(owner, effect, stillCurrent);
@@ -112,11 +140,25 @@ function createCodexCapacityRetryRuntime({ getSettings, loadState, saveState, is
   }
   function reset(owner, at) {
     const entry = entryFor(owner);
+    entry.cancelWait?.();
     if (entry.state?.pendingEffectId) cancelSend?.(owner.tabId, entry.state.pendingEffectId, 'new-user-request');
     entry.state = reduceCodexCapacityRetry(entry.state, { type: 'reset', scopeKey: entry.scopeKey, at }).state;
     saveState(owner.tabId, entry.state);
   }
-  return { capacity, progress, cancel, reset, snapshot: tabId => entries.get(tabId)?.state || null };
+  function activity(owner, at) {
+    const entry = entries.get(owner.tabId);
+    if (entry?.cancelWait && isCurrent(owner) && entry.scopeKey === scopeOf(owner)
+      && entry.owner.generation === owner.generation && at > entry.state.lastCapacityAt) reset(owner, at);
+  }
+  function settingsChanged(settings) {
+    for (const entry of entries.values()) if (entry.cancelWait
+      && !isCodexCapacityRetryEffectCurrent(entry.state, entry.waitingEffect, settings)) {
+      entry.cancelWait();
+      entry.state = { ...entry.state, pendingEffectId: null };
+      saveState(entry.owner.tabId, entry.state);
+    }
+  }
+  return { capacity, progress, cancel, reset, activity, settingsChanged, snapshot: tabId => entries.get(tabId)?.state || null };
 }
 
 module.exports = { classifyCodexCapacityRetryRecord, createCodexCapacityRetryRuntime };

@@ -9,6 +9,7 @@ import { focusedMcpCwd } from '../../utils/mcpCatalogPresentation.mjs';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import ClaudeUsageButton from './ClaudeUsageButton';
 import ResourceUsageButton from './ResourceUsageButton';
+import DiskCapacityWarning from './DiskCapacityWarning';
 import McpHubButton from './McpHubButton';
 import FocusedWorkspaceGitStatus from './FocusedWorkspaceGitStatus';
 import TimelineToolsButton from './TimelineToolsButton';
@@ -55,7 +56,7 @@ type ToolbarExternalRunMeta = {
   collapsed?: boolean;
 };
 
-export default function WorkspaceTitleBarTools() {
+export default function WorkspaceTitleBarTools({ dashboard = false }: { dashboard?: boolean }) {
   const showToast = useUIStore((state) => state.showToast);
   const centerProjectId = useWorkspaceStore((state) => state.activeProjectId);
   const mcpCwd = useWorkspaceStore(focusedMcpCwd);
@@ -218,7 +219,7 @@ export default function WorkspaceTitleBarTools() {
   }, [outlineTarget?.toolType, outlineTarget?.sessionId, loadTimelineOutline]);
 
   useEffect(() => {
-    if (!activeExternalRun) {
+    if (dashboard || !activeExternalRun) {
       setExternalSettingsOpen(false);
       return;
     }
@@ -230,7 +231,7 @@ export default function WorkspaceTitleBarTools() {
       : DEFAULT_EXTERNAL_AUTO_CLOSE_MS;
     setExternalStopSeconds(String(Math.max(0, Math.round(stopMs / 1000))));
     setExternalCloseMinutes(String(Math.max(1, Math.round(closeMs / 60_000))));
-  }, [activeExternalRun?.tabId, activeExternalRun?.runId, activeExternalRun?.autoStopMs, activeExternalRun?.autoCloseMs]);
+  }, [dashboard, activeExternalRun?.tabId, activeExternalRun?.runId, activeExternalRun?.autoStopMs, activeExternalRun?.autoCloseMs]);
 
   useEffect(() => {
     if (!externalSettingsOpen) return;
@@ -362,6 +363,7 @@ export default function WorkspaceTitleBarTools() {
         element.scrollLeft += delta;
       }}
     >
+      {!dashboard && <>
       <FocusedWorkspaceGitStatus />
       <Tooltip content="Переключить вкладку — список всех вкладок с поиском (⌘P / Ctrl+Tab)">
         <button
@@ -562,8 +564,10 @@ export default function WorkspaceTitleBarTools() {
         onToggleGlobalAuto={() => setSummaryGlobalAuto(!summaryGlobalAuto)}
       />
 
-      {/* Общие ресурсы приложения доступны из любого проекта, включая Inbox. */}
+      </>}
+      {/* Общие ресурсы приложения доступны также на Home. */}
       <ResourceUsageButton />
+      <DiskCapacityWarning />
 
       {/* Статус общего MCP-бэкенда: шесть серверов в одном хабе на все
           AI-вкладки; точка — здоровье, панель — аптайм и рестарты. */}

@@ -3,6 +3,7 @@ import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
 import { createHistoryMeasurementViewportSync } from '../../utils/historyMeasurementViewportSync.mjs';
 import { historyImageRuns } from '../../utils/historyImageRuns.mjs';
 import HistorySearchBar from './HistorySearchBar';
+import { CompositedTextShimmer } from '../UI/CompositedTextShimmer';
 import {HISTORY_SEARCH_PAGE_SIZE, searchHistoryEntries, historySearchEntryKeys} from '../../../shared/history-search.mjs';
 import {publishHistorySearchMarkers, clearHistorySearchMarkers, useHistorySearchMarkers, consumeHistorySearchRequest} from '../../utils/historySearchMarkers';
 import {setHistorySearchHighlights, clearHistorySearchHighlights} from '../../utils/historySearchHighlights.mjs';
@@ -343,6 +344,10 @@ import {
 } from '../../utils/historyBottomGeometry.mjs';
 import { isHistoryHydrationTargetStub } from '../../utils/historyHydrationTarget.mjs';
 import {
+  flashHistoryNavigationNode, historyToolNavigationNode, HISTORY_NAVIGATION_FLASH_CSS,
+  resolveHistoryToolNavigationTarget,
+} from '../../utils/historyToolNavigation.mjs';
+import {
   collectHistoryMaterializedWindowUuids,
   historyHydrationCenterForRange,
   retainHistoryMaterializedWindow,
@@ -400,7 +405,7 @@ import {
   projectHistoryServicePromptBody,
   resolveHistoryPromptSender,
 } from '../../utils/historyOrchestrationPromptPresentation.mjs';
-import { TabMessageSourceChip } from './TabMessageSourceChip';
+import { HistoryPromptSource } from './TabMessageSourceChip';
 import {
   formatHistoryResponseCompletedAt,
   historyResponseTailLabel,
@@ -721,7 +726,7 @@ interface FullHistoryEntry {
     bodyStart?: number;
     bodyEnd?: number;
     runKind?: string;
-    source?: 'loop' | 'system';
+    source?: 'loop' | 'system' | 'terminal-mcp';
     systemSource?: 'build-install-return' | 'codex-capacity-retry';
     auditSourceIdentity?: string;
   }>;
@@ -913,6 +918,9 @@ const captureHistoryScrollTraceDomSnapshot = (
 };
 
 interface HistoryVirtuosoContext {
+  // Opt in to the pinned Virtuoso build adapter's commit measurement. Read
+  // live ownership here: a retained hidden list must not acquire eager work.
+  historyMeasureBeforePaint?: () => boolean;
   terminalPreview: TerminalHistoryPreview | null;
   terminalPreviewCanonicalMaterialized: boolean;
   onHandoffDomCommit?: (node?: HTMLDivElement | null) => void;
@@ -1216,7 +1224,11 @@ const HistoryResponseTailTimer = memo(({ timing, placement = 'tail' }: {
           : 'Общее время завершённого ответа'}
       className="hp-history-response-tail"
     >
-      <span className="hp-history-response-tail-label">{label}</span>
+      {timing.state === 'running' ? (
+        <CompositedTextShimmer className="hp-history-response-tail-label" variant="working">{label}</CompositedTextShimmer>
+      ) : (
+        <span className="hp-history-response-tail-label">{label}</span>
+      )}
       {completedAtLabel && (
         <span className="hp-history-response-tail-completed-at" aria-hidden="true">
           | {completedAtLabel}
@@ -2542,6 +2554,7 @@ const useRehydratedPayload = (
 };
 
 const HistoryToolCallPart = memo(({
+  toolUseId,
   toolName,
   args,
   result,
@@ -2555,6 +2568,7 @@ const HistoryToolCallPart = memo(({
   mcpMethod,
   docsKind,
 }: {
+  toolUseId?: string;
   toolName: string;
   args: Record<string, any>;
   result?: string;
@@ -2598,6 +2612,7 @@ const HistoryToolCallPart = memo(({
   return (
     <div
       className="hp-tool-scroll-scope"
+      data-history-tool-use-id={toolUseId}
       data-history-tool-name={toolName}
       data-history-docs-kind={docsKind || undefined}
     >
@@ -5061,10 +5076,7 @@ const HistoryUserEntry = memo(({
       )}
     >
       {promptSender && (
-        <div data-history-tab-message-source style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0, marginBottom: 6 }}>
-          <span style={{ fontSize: 10, color: '#a3a3a3' }}>{orchestrationPrompt.phase === 'question' ? 'Вопрос' : orchestrationPrompt.phase === 'request' ? 'Запрос' : 'Ответ'}</span>
-          {promptSender.sourceTabId ? <TabMessageSourceChip source={promptSender} /> : <span style={{ fontSize: 11, color: '#c4b5fd' }}>{promptSender.label}</span>}
-        </div>
+        <HistoryPromptSource source={promptSender} phase={orchestrationPrompt.phase} />
       )}
       <HistoryUserPromptContent
         text={serviceBody.text}
@@ -5165,6 +5177,7 @@ const HistoryAssistantEntry = memo(({
           return (
             <div key={'raw' + index + ':' + toolName}>
               <HistoryToolCallPart
+                toolUseId={action.rawTool.toolUseId}
                 toolName={toolName}
                 args={action.rawTool.args || {}}
                 result={historyResult}
@@ -5499,15 +5512,7 @@ const historyContextUpdatePreviewId = (id: string) =>
 
 // Flash/search/component styles. Keep the existing node across HMR, but refresh
 // its contents: an "inject once" guard leaves stale CSS in a live dev renderer.
-const historyPanelStyleText = `@keyframes hp-flash {
-  0%   { background-color: transparent; }
-  20%  { background-color: rgba(91, 156, 245, 0.2); }
-  100% { background-color: transparent; }
-}
-@keyframes hp-history-working-shimmer {
-  from { background-position: 100% 50%; }
-  to { background-position: 0% 50%; }
-}
+const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
 /* Owner handoff loader. Two opposed arrows used to live here, but that shape
    now means "swap the primary surface" on its own button right next to this
    slot — a spinning ring keeps the transient loading state unambiguous. */
@@ -5542,12 +5547,6 @@ const historyPanelStyleText = `@keyframes hp-flash {
      поверхности и перелив подписи. */
   .hp-owner-transition-spin {
     animation: none;
-  }
-  .hp-history-response-tail[data-state="running"] .hp-history-response-tail-label {
-    animation: none;
-    background: none;
-    color: #96938d;
-    -webkit-text-fill-color: currentColor;
   }
 }
 /* Подсветка кнопки состояния под курсором.
@@ -6058,28 +6057,6 @@ const historyPanelStyleText = `@keyframes hp-flash {
   min-height: 18px;
   padding: 4px 0 0;
 }
-.hp-history-response-tail[data-state="running"] .hp-history-response-tail-label {
-  color: transparent;
-  background-image: linear-gradient(
-    90deg,
-    #8f8d88 0%,
-    #8f8d88 42%,
-    #b8b4ac 46%,
-    #d3cfc7 50%,
-    #b8b4ac 54%,
-    #8f8d88 58%,
-    #8f8d88 100%
-  );
-  /* One oversized, non-repeating gradient crosses the label at a constant
-     linear rate. The old repeating 260% background used out-of-range
-     positions (180% → -80%); its tile seam looked like a sudden extra pass. */
-  background-size: 250% 100%;
-  background-repeat: no-repeat;
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: hp-history-working-shimmer 1.65s linear infinite;
-}
 .hp-history-group-detail {
   display: flex;
   align-items: flex-start;
@@ -6485,12 +6462,11 @@ const prependPromptTextOnce = (base: string, addition: string,
 
 function HistorySpinner({ size = 14, flexShrink = 0 }: { size?: number; flexShrink?: number }) {
   return (
-    <svg
+    <span
       className="noted-infinite-animation"
-      width={size}
-      height={size}
-      viewBox="0 0 16 16"
       style={{
+        width: size,
+        height: size,
         animation: 'spinner-rotate 0.85s linear infinite',
         transformOrigin: '50% 50%',
         willChange: 'transform',
@@ -6498,8 +6474,10 @@ function HistorySpinner({ size = 14, flexShrink = 0 }: { size?: number; flexShri
         display: 'block',
       }}
     >
-      <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
-    </svg>
+      <svg width={size} height={size} viewBox="0 0 16 16" style={{ display: 'block' }}>
+        <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
+      </svg>
+    </span>
   );
 }
 
@@ -12638,6 +12616,8 @@ function HistoryPanel({
   });
   const requestedHistoryScrollUuid = useUIStore((s) => s.historyScrollToUuid);
   const historyScrollTargetTabId = useUIStore((s) => s.historyScrollTargetTabId);
+  const requestedHistoryToolTarget = useUIStore((s) => s.historyScrollToolTarget);
+  const historyScrollToolTarget = historyScrollTargetTabId === tabId ? requestedHistoryToolTarget : null;
   // Persistent panes all stay mounted. A process-global UUID therefore is not
   // a navigation request — it is an invitation for every hidden History to
   // consume it. Only the named tab may translate or clear this request.
@@ -13947,15 +13927,19 @@ function HistoryPanel({
     : null;
   const terminalPreviewCanonicalMaterialized = !!visibleTerminalPreview
     && terminalPreviewClearHandoff?.previewId === visibleTerminalPreview.previewId;
+  const historyMeasureBeforePaint = useCallback(() => historyOwnerKeyRef.current === historyOwnerKey
+    && historyPresentationProofRef.current.presented
+    && historyResizeRef.current?.active() !== true, [historyOwnerKey]);
   const historyVirtuosoContext = useMemo<HistoryVirtuosoContext>(
     () => ({
+      historyMeasureBeforePaint,
       terminalPreview: visibleTerminalPreview,
       terminalPreviewCanonicalMaterialized,
       onHandoffDomCommit: onHistoryHandoffRowMounted,
       responseTiming: responseTailTiming,
       seekUnitKeyAt,
     }),
-    [visibleTerminalPreview, terminalPreviewCanonicalMaterialized, responseTailTiming, seekUnitKeyAt, onHistoryHandoffRowMounted],
+    [historyMeasureBeforePaint, visibleTerminalPreview, terminalPreviewCanonicalMaterialized, responseTailTiming, seekUnitKeyAt, onHistoryHandoffRowMounted],
   );
   const visibleLiveToolResults = liveToolResultsRef.current.ownerKey === historyOwnerKey
     ? liveToolResults
@@ -14478,6 +14462,7 @@ function HistoryPanel({
     gen: number;
     startedAt: number;
     attempts: number;
+    requestId?: string;
   } | null>(null);
   const historyScrollSeekController = useMemo(
     () => createHistoryScrollSeekController({
@@ -15899,6 +15884,7 @@ function HistoryPanel({
         return;
       }
       if (dismissalPlan.mode !== 'verify-local-failure'
+        && dismissalPlan.reason !== 'durable-no-attempt-presentation'
         && currentHandoff && (!currentHandoff.sendOperationKey || !currentHandoff.sendAttemptId)) {
         await waitForHistoryPromptHandoffSendIdentity(tabId, handoffId);
       }
@@ -16232,7 +16218,9 @@ function HistoryPanel({
         recordByteOffset: carrierProof?.recordByteOffset,
       };
       const orchestrationHandoff = resolveHistoryOrchestrationHandoffPresentation(record);
-      const semanticTags: FullHistoryEntry['semanticTags'] = orchestrationHandoff
+      const semanticTags: FullHistoryEntry['semanticTags'] = orchestrationHandoff?.kind === 'terminal-mcp'
+        ? [{ kind: 'prompt-origin', source: 'terminal-mcp' }]
+        : orchestrationHandoff
         ? [{
             kind: 'orchestration',
             runId: orchestrationHandoff.runId,
@@ -19977,6 +19965,7 @@ function HistoryPanel({
   // setState on an unmounted component). NOT driven by the effect's cleanup —
   // the loop must survive the re-render caused by clearing historyScrollToUuid.
   const scrollGenRef = useRef(0);
+  const sourceCallFlashRef = useRef<Animation | null>(null);
   const scrollMountedRef = useRef(true);
   const lastProgrammaticHistoryScrollRef = useRef<{
     uuid: string;
@@ -20276,6 +20265,7 @@ function HistoryPanel({
       historyScrollInFlightRef.current = null;
       historyJumpHydrationActiveRef.current = false;
       scrollGenRef.current++;
+      sourceCallFlashRef.current?.cancel();
     };
   }, []);
 
@@ -20302,7 +20292,8 @@ function HistoryPanel({
       ' scrollTop=' + Math.round(scroller?.scrollTop || 0) +
       ' scrollHeight=' + Math.round(scroller?.scrollHeight || 0));
     window.dispatchEvent(
-      new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: inFlight.uuid, found: true, reason } }),
+      new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: inFlight.uuid,
+        requestId: inFlight.requestId, found: !inFlight.requestId, reason } }),
     );
     return true;
   }, [tabId]);
@@ -21500,16 +21491,26 @@ function HistoryPanel({
     if (!historyScrollToUuid) return;
     if (surfaceLoading || displayEntries.length === 0) return; // wait for entries; uuid stays in store
     const requestedTargetIdentity = historyScrollToUuid;
-    const resolvedNavigationTarget = resolveHistoryNavigationTarget(
+    const toolTarget = historyScrollToolTarget;
+    const requestGeneration = useUIStore.getState().historyScrollRequestGeneration;
+    if (toolTarget && toolTarget.readSessionId !== sessionId) {
+      setHistoryScrollToUuid(null);
+      window.dispatchEvent(new CustomEvent('history-panel:scrolled-to', { detail: {
+        tabId, uuid: requestedTargetIdentity, requestId: toolTarget.requestId, found: false, reason: 'source-session-changed',
+      } }));
+      return;
+    }
+    const resolvedNavigationTarget = resolveHistoryToolNavigationTarget(
       displayEntries,
       requestedTargetIdentity,
+      toolTarget,
     );
     let targetUuid = resolvedNavigationTarget?.uuid || requestedTargetIdentity;
     // Target hidden inside a collapsed series: expand SYNCHRONOUSLY first.
     // The state update re-runs this effect on the next commit against the
     // unrolled unit list; the store key is intentionally NOT consumed yet.
     if (expandGroupForUuid(targetUuid, 'timeline-jump')) return;
-    const idx = displayEntryIndexByUuid.get(targetUuid) ?? -1;
+    const idx = toolTarget && !resolvedNavigationTarget ? -1 : displayEntryIndexByUuid.get(targetUuid) ?? -1;
     // Consume the store key immediately. The convergence loop is driven by the
     // ref-generation guard, NOT by this effect's cleanup, so clearing the key
     // (which re-runs the effect → early-return above) does not abort the loop.
@@ -21522,7 +21523,8 @@ function HistoryPanel({
         ' reason=uuid-not-in-display');
       // entry doesn't exist in this session — acknowledge so the dot spinner clears
       window.dispatchEvent(
-        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: requestedTargetIdentity, targetUuid, found: false, reason: 'identity-not-in-display' } }),
+        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: requestedTargetIdentity, targetUuid,
+          requestId: toolTarget?.requestId, found: false, reason: 'identity-not-in-display' } }),
       );
       return;
     }
@@ -21541,13 +21543,16 @@ function HistoryPanel({
     // moving (Virtuoso has honored the scroll AND finished measuring), then
     // flash + emit the done-event. Stability is the signal.
     const myGen = ++scrollGenRef.current;
+    sourceCallFlashRef.current?.cancel();
     const startedAt = performance.now();
     let attempts = 0;
     let stable = 0;
     let lastTop: number | null = null;
     let sawNode = false;
     const MAX_ATTEMPTS = 240; // rAF bounded; long variable-height sessions may need many measurements
-    historyScrollInFlightRef.current = { uuid: targetUuid, gen: myGen, startedAt, attempts: 0 };
+    historyScrollInFlightRef.current = { uuid: targetUuid, gen: myGen, startedAt, attempts: 0, requestId: toolTarget?.requestId };
+    const userGeneration = historyUserGestureGenerationRef.current;
+    const ownerAtStart = historyOwnerKeyRef.current;
 
     const startScroller = virtuosoScrollerRef.current;
     const startScrollHeight = Math.round(startScroller?.scrollHeight || 0);
@@ -21592,12 +21597,18 @@ function HistoryPanel({
           userIntentLogged: false,
           scrollEventLogged: false,
         };
-        setFlashUuid(targetUuid);
+        if (toolTarget) {
+          const row = scroller?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`);
+          sourceCallFlashRef.current = flashHistoryNavigationNode(
+            historyToolNavigationNode(row, toolTarget.toolUseId), toolTarget.requestId,
+          );
+        } else setFlashUuid(targetUuid);
       }
       window.dispatchEvent(
-        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: requestedTargetIdentity, targetUuid, found, reason } }),
+        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: requestedTargetIdentity, targetUuid,
+          requestId: toolTarget?.requestId, toolUseId: toolTarget?.toolUseId, found, reason } }),
       );
-      if (!found) return;
+      if (!found || toolTarget) return;
       setTimeout(() => {
         if (scrollMountedRef.current && scrollGenRef.current === myGen) setFlashUuid(null);
       }, 600);
@@ -21617,12 +21628,28 @@ function HistoryPanel({
     let navigationEntries = displayEntries;
     const step = () => {
       if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return; // superseded / unmounted
+      if (toolTarget) {
+        if (useUIStore.getState().historyScrollRequestGeneration !== requestGeneration
+          || historyOwnerKeyRef.current !== ownerAtStart
+          || historyUserGestureGenerationRef.current !== userGeneration) {
+          finish(false, 'source-jump-cancelled'); return;
+        }
+        const scroller = virtuosoScrollerRef.current;
+        if (!historyPresentationProofRef.current.presented || !scroller?.clientHeight) {
+          if (performance.now() - startedAt > JUMP_STUB_HYDRATION_WAIT_MS) {
+            finish(false, 'source-surface-not-presented'); return;
+          }
+          stable = 0; lastTop = null;
+          requestAnimationFrame(step); return;
+        }
+      }
       // A live/local row can acquire its canonical UUID while this jump is
       // settling. Follow the requested exact identity in the current final
       // presentation, never the old UUID or a text match.
       if (entriesRef.current !== navigationEntries) {
         navigationEntries = entriesRef.current;
-        const currentTarget = resolveHistoryNavigationTarget(navigationEntries, requestedTargetIdentity);
+        const currentTarget = resolveHistoryToolNavigationTarget(navigationEntries, requestedTargetIdentity, toolTarget);
+        if (toolTarget && !currentTarget) { finish(false, 'source-tool-disappeared'); return; }
         if (currentTarget && currentTarget.uuid !== targetUuid) {
           targetUuid = currentTarget.uuid;
           stable = 0;
@@ -21669,7 +21696,22 @@ function HistoryPanel({
           ' stubWaitMs=' + Math.round(stubWaitTotalMs));
       }
       lastTargetWasStub = targetIsStub;
-      virtuosoRef.current?.scrollToIndex({ index: currentIdx, align: 'center', behavior: 'auto' });
+      const mountedRow = virtuosoScrollerRef.current?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`);
+      const mountedTool = toolTarget && historyToolNavigationNode(mountedRow, toolTarget.toolUseId);
+      let sourceToolMoved = false;
+      // Keep the existing jump's sole writer, but center the inner call rather
+      // than the whole (possibly very tall) assistant row once it materializes.
+      if (!mountedTool) virtuosoRef.current?.scrollToIndex({ index: currentIdx, align: 'center', behavior: 'auto' });
+      else {
+        const scroller = virtuosoScrollerRef.current!;
+        const targetRect = mountedTool.getBoundingClientRect(), viewport = scroller.getBoundingClientRect();
+        const delta = targetRect.top + targetRect.height / 2 - viewport.top - scroller.clientHeight / 2;
+        if (Math.abs(delta) >= 1) {
+          const before = scroller.scrollTop;
+          scroller.scrollTop += delta;
+          sourceToolMoved = Math.abs(scroller.scrollTop - before) >= 1;
+        }
+      }
       attempts++;
       if (historyScrollInFlightRef.current?.gen === myGen) {
         historyScrollInFlightRef.current.attempts = attempts;
@@ -21702,12 +21744,18 @@ function HistoryPanel({
         // Offset of the row relative to the scroller's own viewport — immune to
         // the panel's slide-in transform (both translate together), so this only
         // moves when the INTERNAL scroll position is still settling.
-        const top = node.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
-        if (!isShell && lastTop !== null && Math.abs(top - lastTop) < 1) stable++; else stable = 0;
-        lastTop = top;
+        const targetNode = toolTarget ? historyToolNavigationNode(node, toolTarget.toolUseId) : node;
+        const rect = targetNode?.getBoundingClientRect();
+        const top = rect ? rect.top - scroller.getBoundingClientRect().top : null;
+        const visible = !toolTarget || (!!rect && rect.height > 0 && top !== null
+          && top >= -1 && top + rect.height <= scroller.clientHeight + 1);
+        if (!sourceToolMoved && !isShell && visible && top !== null && lastTop !== null && Math.abs(top - lastTop) < 1) stable++; else stable = 0;
+        // A correcting write is not a stable presentation frame. Begin the
+        // tool's baseline on the next frame, after that scroll has rendered.
+        lastTop = sourceToolMoved ? null : top;
         // Mounted + position unchanged for 2 consecutive frames, after at least
         // a few scrollToIndex calls → Virtuoso has settled on the target row.
-        if (stable >= 2 && attempts >= 3) { finish(true, 'stable-mounted'); return; }
+        if (stable >= 2 && attempts >= 3) { finish(true, toolTarget ? 'stable-source-tool' : 'stable-mounted'); return; }
       }
       if (attempts >= MAX_ATTEMPTS && !targetIsStub) {
         // A row seen on an earlier frame is not proof that the final target is
@@ -21721,7 +21769,7 @@ function HistoryPanel({
       requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-  }, [displayEntryIndexByUuid, displayEntries, entries, expandGroupForUuid, historyScrollToUuid, pendingInitialHistoryIndex, requestHistoryHydrationAt, setHistoryScrollToUuid, surfaceLoading, tabId, toolType]);
+  }, [displayEntryIndexByUuid, displayEntries, entries, expandGroupForUuid, historyScrollToUuid, historyScrollToolTarget, pendingInitialHistoryIndex, requestHistoryHydrationAt, setHistoryScrollToUuid, surfaceLoading, tabId, toolType, sessionId]);
 
   // Native scroll handler — runs on the Virtuoso scroller element via a
   // direct addEventListener (Virtuoso doesn't pass an onScroll prop through

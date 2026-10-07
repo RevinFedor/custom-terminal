@@ -5,7 +5,6 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
 import {
-  buildSwitcherRows,
   initialCtrlIndex,
   resolveCtrlTabAnchor,
   selectableIndices,
@@ -41,7 +40,7 @@ import {
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { allPaneTabIds } from '../../utils/splitPanesModel.mjs';
 import { spacesWithLiveLayout } from '../../utils/workspaceSpaceRecovery.mjs';
-import { spaceTabIds, tabSpaceIndexMap } from '../../utils/workspaceSpacesModel.mjs';
+import { spaceTabIds } from '../../utils/workspaceSpacesModel.mjs';
 import {
   UNPLACED_WORKFLOW_ID,
   UNPLACED_WORKFLOW_NAME,
@@ -50,9 +49,11 @@ import {
   workflowInitial,
 } from '../../utils/workflowVisuals.mjs';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
+import { captureSwitcherInputs, selectSwitcherRows,
+  buildSwitcherWorkflowLookup as sharedSwitcherWorkflowLookup } from '../../utils/tabSwitcherSelector.mjs';
 
 // Ctrl+Tab (MRU hold-and-release) + Cmd+P (search) switcher over ALL open
-// projects. Projects render as non-selectable headers; tabs indent under
+// projects. Workflows render as non-selectable headers; tabs indent under
 // them and carry the full tab visual language: chrome tint, process bar
 // strip (+AI shimmer), session status marker, folder badge, file icon.
 //
@@ -249,27 +250,7 @@ type SwitcherWorkflowMeta = {
  * того же множества, которым workflow считает свои вкладки.
  */
 function buildSwitcherWorkflowLookup(ws: ReturnType<typeof useWorkspaceStore.getState>) {
-  const spaces = spacesWithLiveLayout(ws.spaces, ws.activeSpaceId, ws);
-  const indexes = tabSpaceIndexMap(spaces, allPaneTabIds, ws.activeSpaceId);
-  const projects = useProjectsStore.getState().projects as Record<string, { icon?: string | null }>;
-  return (tabId: string): SwitcherWorkflowMeta => {
-    const index = indexes.get(tabId);
-    const space = index === undefined ? null : spaces[index];
-    if (!space) {
-      return {
-        id: UNPLACED_WORKFLOW_ID,
-        name: UNPLACED_WORKFLOW_NAME,
-        icon: null,
-        unplaced: true,
-      };
-    }
-    return {
-      id: space.id,
-      name: space.name || 'Workflow',
-      icon: resolveWorkflowIcon(space, (projectId: string) => projects[projectId]?.icon || null),
-      unplaced: false,
-    };
-  };
+  return sharedSwitcherWorkflowLookup(ws, useProjectsStore.getState().projects);
 }
 
 type IterationWorkflowChip = SwitcherWorkflowMeta & { tabIds: string[] };
@@ -322,65 +303,9 @@ function buildIterationWorkflowChips(
 // currently visible EXCEPT the current one, which is pinned to row 1 as the
 // anchor (see the header note); the search list keeps everything, unpinned.
 function computeRowsFromStores(query: string, hideOnScreen = false): Row[] {
-  const ws = useWorkspaceStore.getState();
-  const workflowForTab = buildSwitcherWorkflowLookup(ws);
-  const projectsMeta = useProjectsStore.getState().projects as Record<string, { name?: string; icon?: string | null }>;
-  const recentFirst = [...ws.projectHistory].reverse();
-  const orderedIds = [
-    ...recentFirst.filter((id) => ws.openProjects.has(id)),
-    ...Array.from(ws.openProjects.keys()).filter((id) => !recentFirst.includes(id)),
-  ];
-  const centerTabId = ws.activeProjectId
-    ? ws.openProjects.get(ws.activeProjectId)?.activeTabId || null
-    : null;
-  const currentTabId = resolveCtrlTabAnchor({
-    panes: ws.splitPanes,
-    focusedIndex: ws.splitFocusedIndex,
-    centerTabId,
-  });
-  // The anchor: the tab you are ON. It is not a destination — it is the
-  // reference point row 2 is measured against ("here → there"), so it is exempt
-  // from EVERY filter below. One condition decides that, and the pin below
-  // decides where it lands; splitting the decision is how row 1 would end up
-  // meaning different things depending on what the user happens to be looking at.
-  const anchorTabId = hideOnScreen ? currentTabId : null;
-  // Same answer to "what is on screen" the visit rule uses, so the list and the
-  // history cannot disagree about which tabs count as visible.
-  const hidden = hideOnScreen
-    ? new Set(onScreenTabIds({ panes: ws.splitPanes, centerTabId: currentTabId }))
-    : null;
-  const blocks = orderedIds.map((projectId) => {
-    const workspace = ws.openProjects.get(projectId)!;
-    const projectName = projectsMeta[projectId]?.name
-      || (isInboxProjectId(projectId) ? INBOX_PROJECT_NAME : (workspace.projectPath?.split('/').filter(Boolean).pop() || 'Project'));
-    const tabs = (Array.from(workspace.tabs.values()) as any[])
-      // The anchor is exempt from the on-screen filter only. A sub-agent child
-      // is not a switcher row on any surface, so that filter stays universal —
-      // and if the current tab ever were one, the pin simply matches nothing.
-      .filter((t) => !t.parentTabId && (t.id === anchorTabId || !hidden || !hidden.has(t.id)))
-      .map((t) => {
-        const workflow = workflowForTab(t.id);
-        const tab = t.tabType === 'file' && isFileMissing(t.filePath)
-          ? { ...t, missing: true }
-          : t;
-        return {
-          ...tab,
-          workflowId: workflow.id,
-          workflowName: workflow.name,
-          workflowIcon: workflow.icon,
-          workflowUnplaced: workflow.unplaced,
-        };
-      }) as SwitcherTab[];
-    return { projectId, projectName, projectIcon: projectsMeta[projectId]?.icon || null, tabs };
-  }).filter((b) => b.tabs.length > 0);
-  return buildSwitcherRows({
-    projects: blocks,
-    globalMru: ws.globalTabMru,
-    query,
-    // Anchor only in ctrl mode. In search the list must stay a plain answer to
-    // the query — pinning the current tab above a match would read as a result.
-    pinnedFirstTabId: anchorTabId,
-  }) as Row[];
+  const input = captureSwitcherInputs(useWorkspaceStore.getState(), useProjectsStore.getState().projects,
+    { isFileMissing, inboxName: INBOX_PROJECT_NAME });
+  return selectSwitcherRows(input, { query, hideOnScreen }).rows as Row[];
 }
 
 const ITERATION_ACCENT = (toolType: string) => (toolType === 'codex' ? '#10A37F' : '#DA7756');
@@ -1183,10 +1108,10 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   // два: перейти на вкладку и прокрутить её переписку на этот промпт. Прокрутка
   // идёт тем же механизмом, что и переход из Timeline (`historyScrollToUuid`) —
   // второй путь к тому же месту разошёлся бы с ним в первом же особом случае.
-  const openIterationHit = useCallback((hit: IterationHit) => {
+  const openIterationHit = useCallback(async (hit: IterationHit) => {
     const target = resolveIterationTarget(hit);
-    if (!target.tabId || !target.projectId) return;
-    useWorkspaceStore.getState().activateCenterTab(target.projectId, target.tabId);
+    if (!target.tabId || !target.projectId) return false;
+    if (!(await useWorkspaceStore.getState().openTabById(target.tabId,{projectId:target.projectId,reason:'iteration-hit'}))) return false;
     // Переписка — та поверхность, где промпт вообще виден; без неё переход
     // привёл бы в терминал, где найденного текста может уже не быть на экране.
     useUIStore.getState().setHistoryPanelOpen(target.tabId, true);
@@ -1194,10 +1119,10 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       target.entryUuid,
       target.tabId,
     ));
+    return true;
   }, []);
 
-  const commitRow = useCallback((row: Row | undefined, addToFocusedWindow = false) => {
-    close();
+  const commitRow = useCallback(async (row: Row | undefined, addToFocusedWindow = false) => {
     if (!row) return;
     // A committed global navigation returns keyboard ownership to the window
     // that displays the chosen tab. Otherwise opening Ctrl+P from a sidebar-
@@ -1205,11 +1130,12 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     // visibly navigated into a pane.
     useUIStore.getState().setActiveArea('workspace');
     if (row.kind === 'iteration') {
-      openIterationHit(row.hit);
+      if (await openIterationHit(row.hit)) close();
       return;
     }
     if (row.kind !== 'tab') return;
     if (addToFocusedWindow) {
+      close();
       // Явное добавление: вкладка снимается со старого места и становится
       // последним чипом текущего окна. Цель считается в момент нажатия — окно в фокусе могло
       // смениться после отрисовки строки; за это отвечает сам резолвер внутри.
@@ -1220,7 +1146,8 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     // Обычный переход — тот же путь, что у клика в боковом списке: ведёт К
     // ВКЛАДКЕ. Разложенная в другом пространстве сначала переводит туда, потом
     // получает фокус своего окна; вкладка без места показывается в текущем.
-    useWorkspaceStore.getState().placeTab(row.projectId, row.tab.id);
+    if (!(await useWorkspaceStore.getState().openTabById(row.tab.id,{projectId:row.projectId,reason:'tab-switcher'}))) return;
+    close();
     requestTabPrimaryInputFocus(row.tab.id, 'tab-switcher-commit');
   }, [close, openIterationHit]);
 

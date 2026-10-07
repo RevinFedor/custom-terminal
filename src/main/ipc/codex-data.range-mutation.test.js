@@ -463,6 +463,31 @@ test('tail regression: two paired user turns plus compact remove exactly those t
   );
 });
 
+test('Rewind removes the physical suffix including orphan assistant/tools after compact, while range Delete does not grow to EOF', () => {
+  const sessionId = 'rewind-physical-eof';
+  const records = fixture(sessionId);
+  records.push(...userTurn('keep'), ...userTurn('rewind-here'));
+  records.push(rec('compacted', { summary: 'old future compact' }));
+  records.push(rec('response_item', { type: 'message', role: 'assistant',
+    content: [{ type: 'output_text', text: 'orphan-future-answer' }] }));
+  records.push(rec('response_item', { type: 'function_call', name: 'future-tool', call_id: 'future-call', arguments: '{}' }));
+  records.push(rec('response_item', { type: 'function_call_output', call_id: 'future-call', output: 'future-output' }));
+  const timeline = _api.buildCodexTimeline(records, sessionId);
+  const target = timeline.find(entry => entry.content === 'rewind-here');
+  const original = JSON.stringify(records);
+  const rewind = _api.planCodexRangeRewrite(records, sessionId, target.uuid, timeline.at(-1).uuid, null, { toPhysicalEnd: true });
+  assert.equal(rewind.success, true, rewind.error);
+  assert.equal(JSON.stringify(rewind.outputRecords).includes('orphan-future-answer'), false);
+  assert.equal(JSON.stringify(rewind.outputRecords).includes('future-call'), false);
+  assert.equal(rewind.suffixProof.retainedRecordCount, rewind.outputRecords.length);
+  assert.equal(rewind.suffixProof.retainedRecordCount + rewind.removedCount, records.length);
+  assert.deepEqual(timelineTexts(rewind.outputRecords, sessionId), [{ type: 'user', content: 'keep' }]);
+  assert.equal(JSON.stringify(records), original, 'the source remains unchanged');
+  const middle = _api.planCodexRangeRewrite(records, sessionId, target.uuid, target.uuid);
+  assert.equal(middle.success, true);
+  assert.equal(JSON.stringify(middle.outputRecords).includes('orphan-future-answer'), true);
+});
+
 for (const [label, options] of [
   ['response_item-only user carrier', { eventCarrier: false }],
   ['event_msg-only user carrier', { responseCarrier: false }],

@@ -1,4 +1,10 @@
 import { create } from 'zustand';
+import { createExecutionRevisionAcks } from '../utils/executionRevisionAcks.mjs';
+import { organizationProjection, organizationSnapshot, createOrganizationCommitter, archiveRestoreLeaseAddress, isExactGroupCloseGuard } from '../utils/workflowOrganizationClient.mjs';
+import { INBOX_WORKFLOW_ID, GLOBAL_EXECUTION_NAMESPACE } from '../utils/workflowMembership.mjs';
+import { organizationPlacementIntent } from '../utils/workflowPlacementMembership.mjs';
+import { removeLayoutTabs } from '../../shared/workflow-organization.cjs';
+import { tabNavigationLocation } from '../utils/tabNavigationLocation.mjs';
 import { getRestartAfterTriggerIds, getRestartAfterWorkflowIds, hasRestartAfterSubscription } from '../utils/restartAfterCommand.mjs';
 import { UNPLACED_WORKFLOW_ID } from '../utils/workflowVisuals.mjs';
 import { captureTabRestorePlacement, readTabRestorePlacement, restoreSidebarTab,
@@ -137,8 +143,10 @@ import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { reconcileWorkspaceDisplayPatch, revealHiddenWindow, splitWindowPane } from '../utils/windowDisplayLayouts.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
+import { collectTabLinkedFiles } from '../utils/tabLinkedFiles.mjs';
 import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
 import { resolveTabRangeSelection } from '../utils/tabRangeSelection.mjs';
+import { findOpenTabOwner, seedTabWorkflowMemory, resolveTabLinkNavigation } from '../utils/tabLinkNavigation.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -186,6 +194,14 @@ function notifyWindowChooserLaunch(slotId: string): void {
 }
 
 let tabGroupSaveSeq = 0;
+let ownedTabNavigation: string | null = null;
+const tabRuntimeAdmissions = new Map<string,Promise<boolean>>();
+const archiveRestoreOwners = new Map<string,{tabId:string;sourceTabId:string|null;tab:Tab}>();
+function withOwnedTabNavigation<T>(id:string,operation:() => T):T {
+  const previous = ownedTabNavigation;
+  ownedTabNavigation = id;
+  try {return operation();} finally {ownedTabNavigation = previous;}
+}
 const SIDEBAR_SCROLL_SAVE_INTERVAL_MS = 150;
 type SidebarScrollSaveState = {
   value: number;
@@ -750,6 +766,9 @@ export interface TabHistoryRestoreEntry {
   id: number;
   project_id: string;
   tab_id?: string | null;
+  restoreTargetTabId?: string;
+  execution_subject_version?: number;
+  attachmentManifest?: {version:1;hash:string;count:number};
   name: string;
   name_set_manually?: number | null;
   cwd: string;
@@ -796,6 +815,8 @@ export interface TabHistoryRestoreResult {
 }
 
 interface TabHistoryRestoreOptions {
+  navigationOwnerId?:string;
+  isNavigationCurrent?:()=>boolean;
   background?: boolean;
   restorePosition?: boolean;
   resumePolicy?: 'never' | 'always' | 'if-process-was-running';
@@ -1114,6 +1135,7 @@ export interface BgTask {
 interface ProjectWorkspace {
   projectId: string;
   projectPath: string;
+  recommendedCwd?: string;
   tabs: Map<string, Tab>;
   tabGroups: TabGroup[];
   activeTabId: string | null;
@@ -1274,7 +1296,7 @@ const resolveExistingTabGroupId = (workspace: ProjectWorkspace | undefined, rawG
 
 const reopenLastClosedQueues = new Map<string, Promise<TabHistoryRestoreResult>>();
 
-const buildHistoryPendingAction = (
+export const buildHistoryPendingAction = (
   entry: TabHistoryRestoreEntry,
   policy: TabHistoryRestoreOptions['resumePolicy'] = 'always'
 ): PendingAction | undefined => {
@@ -1828,6 +1850,9 @@ interface WorkspaceStore {
     name: string;
     /** Цветная SVG/PNG-иконка workflow. undefined бывает только у legacy-записи. */
     icon?: string | null;
+    kind?: 'user' | 'inbox';
+    organizationRevision?: number;
+    order?: number;
     /** Упорядоченные проекты workflow; первый — default для пустой раскладки. */
     projectIds: string[];
     layout: Record<string, any>;
@@ -1835,6 +1860,30 @@ interface WorkspaceStore {
   /** Вкладка, которую показывал центр этого пространства (проект + id). */
   activeSpaceTab: { projectId: string; tabId: string } | null;
   activeSpaceId: string;
+  tabLastWorkflowIds: Record<string, string>;
+  organizationReady: boolean;
+  organizationRevision: number;
+  organizationGeneration: number;
+  organizationError: string | null;
+  tabWorkflowMembership: Record<string, {tabId?: string; workflowId: string; revision: number}>;
+  pendingTabWorkflowMembership: Record<string, {workflowId: string; revision: number}>;
+  tabCatalog: Record<string, any>;
+  organizationMigrationScopes: Record<string, any>;
+  globalGroups: any;
+  workflowSidebarState: Record<string,{selectedTabIds?:string[];scrollTop?:number}>;
+  refreshOrganizationCatalog: () => Promise<void>;
+  activeTabNavigationIntent: {id:string;tabId:string} | null;
+  navigationKey: string | null;
+  navigationRevision: number;
+  navigationMutationOwner: string | null;
+  mutateWorkflowGroup: (kind: string, request: any) => Promise<any>;
+  runAfterWorkflowScopeVersions: Record<string, number>;
+  bootstrapOrganization: (options?: {fresh?: boolean}) => Promise<void>;
+  commitOrganization: () => Promise<any>;
+  ensureTabRuntime: (tabId: string) => Promise<boolean>;
+  createWorkflowTab: (options?: {workflowId?: string; cwd?: string; sourceTabId?: string; name?: string; tabOptions?: any}) => Promise<string>;
+  moveTabsToWorkflow: (tabIds:string[], workflowId:string) => Promise<boolean>;
+  openTabById: (tabId: string, options?: { projectId?: string | null; projectPath?: string | null; reason?: string }) => Promise<boolean>;
   addWorkspaceSpace: (options?: { activate?: boolean; name?: string }) => string | null;
   removeWorkspaceSpace: (id: string) => void;
   renameWorkspaceSpace: (id: string, name: string) => void;
@@ -1976,7 +2025,8 @@ interface WorkspaceStore {
   // Tab management
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
-  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
+  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean;
+    groupCloseGuard?: {mutationId:string;tabId:string;guardToken:string} }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string, options?: { targetPaneIndex?: number }) => Promise<TabHistoryRestoreResult>;
   switchTab: (projectId: string, tabId: string) => void;
@@ -2042,7 +2092,7 @@ interface WorkspaceStore {
   ) => void;
 
   // Update tab cwd
-  updateTabCwd: (projectId: string, tabId: string, newCwd: string) => Promise<boolean>;
+  updateTabCwd: (projectId: string, tabId: string, newCwd: string, commit?: any) => Promise<boolean>;
   syncAllTabsCwd: (projectId: string) => Promise<void>;
 
   // Claude session tracking
@@ -2180,21 +2230,12 @@ const normalizeGeneratedTabName = (name: string): string => {
 // Debounce timer for session saving
 let saveSessionTimer: NodeJS.Timeout | null = null;
 const projectTabSaveQueue = createProjectTabSaveQueue();
+const executionRevisionAcks = createExecutionRevisionAcks();
 export const isProjectTabSavePending = (projectId: string) => projectTabSaveQueue.pending(projectId);
 const projectTabCreationQueue = createProjectTabSaveQueue();
 const projectTabSaveRevisions = new Map<string, number>();
 
-// Helper to save tabs to database (immediate, no debounce)
-// forceCleanup: bypass safety guard when reduction is intentional (batch move/close)
-const saveTabs = (
-  projectId: string,
-  tabs: Map<string, Tab>,
-  forceCleanup = false,
-  expectedTabIds: string[] | null = null,
-) => {
-  const persistenceRevision = (projectTabSaveRevisions.get(projectId) || 0) + 1;
-  projectTabSaveRevisions.set(projectId, persistenceRevision);
-  const tabsArray = Array.from(tabs.values()).map((tab) => ({
+const serializeTabs = (tabs: Map<string, Tab>) => Array.from(tabs.values()).map((tab) => ({
     name: tab.name,
     cwd: tab.cwd,
     color: tab.color,
@@ -2250,21 +2291,47 @@ const saveTabs = (
     // here, so the database column was NULL on every row and the menu never
     // appeared: the whole safety net existed only until the next restart.
     claudeSessionHistory: tab.claudeSessionHistory,
+    ...((tab as any).executionSubject?.version === 2 ? {executionSubject:(tab as any).executionSubject,
+      executionStorageRevision:(tab as any).executionStorageRevision} : {}),
     tabId: tab.id
   }));
-  return projectTabSaveQueue.enqueue(projectId, () => (
+
+// Helper to save tabs to database (immediate, no debounce)
+// forceCleanup: bypass safety guard when reduction is intentional (batch move/close)
+const saveTabs = (
+  projectId: string,
+  tabs: Map<string, Tab>,
+  forceCleanup = false,
+  expectedTabIds: string[] | null = null,
+) => {
+  const persistenceRevision = (projectTabSaveRevisions.get(projectId) || 0) + 1;
+  projectTabSaveRevisions.set(projectId, persistenceRevision);
+  const tabsArray = serializeTabs(tabs);
+  const capturedTabs = new Map(tabs);
+  return projectTabSaveQueue.enqueue(projectId, () => {
+    // Preserve the queued metadata snapshot, but advance its CAS proof after
+    // an earlier save in this namespace has acknowledged the same subject.
+    executionRevisionAcks.prepare(projectId,tabsArray);
+    return (
     ipcRenderer.invoke('project:save-tabs', {
       projectId,
       tabs: tabsArray,
       forceCleanup,
       expectedTabIds,
     })
+      .then((result:any) => {
+        executionRevisionAcks.ack(projectId,tabsArray,result,tabId=>[
+          capturedTabs.get(tabId),useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId),
+        ]);
+        return result;
+      })
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         console.warn('[Store:saveTabs] failed project=' + dndShortId(projectId) + ' error=' + message);
         return { success: false, error: message };
       })
-  )).then((result: any) => ({ ...(result || {}), persistenceRevision }));
+    );
+  }).then((result: any) => ({ ...(result || {}), persistenceRevision }));
 };
 
 const notifyProjectLayoutChanged = (projectId: string, reason: string) => {
@@ -2301,6 +2368,34 @@ const saveTabsThenNotifyProjectLayoutChanged = (
 ) => {
   return saveTabs(projectId, tabs, forceCleanup, expectedTabIds).then((result: any) => {
     if (result?.success !== false) notifyProjectLayoutChanged(projectId, reason);
+    return result;
+  });
+};
+
+const saveTabsBatchThenNotifyProjectLayoutChanged = (
+  snapshots: Array<{ projectId: string; tabs: Map<string, Tab>; expectedTabIds: string[] }>,
+  reason: string,
+  groupFileCloseGuard?:{mutationId:string;tabId:string;guardToken:string},
+) => {
+  const tabSnapshots = snapshots.map(row => ({ ...row, tabs: serializeTabs(row.tabs) }));
+  for (const row of snapshots) {
+    projectTabSaveRevisions.set(row.projectId, (projectTabSaveRevisions.get(row.projectId) || 0) + 1);
+  }
+  return projectTabSaveQueue.enqueueMany(snapshots.map(row => row.projectId), () => {
+    for(const row of tabSnapshots)executionRevisionAcks.prepare(row.projectId,row.tabs);
+    return (
+    ipcRenderer.invoke('project:save-tabs', { tabSnapshots,...(groupFileCloseGuard?{groupFileCloseGuard}:{}) })
+      .then((result:any)=>{
+        for(const row of tabSnapshots)executionRevisionAcks.ack(row.projectId,row.tabs,result,tabId=>[
+          snapshots.find(snapshot=>snapshot.projectId===row.projectId)?.tabs.get(tabId),
+          useWorkspaceStore.getState().openProjects.get(row.projectId)?.tabs.get(tabId),
+        ]);
+        return result;
+      })
+      .catch((error: unknown) => ({ success: false,
+        error: error instanceof Error ? error.message : String(error) }))
+  );}).then((result: any) => {
+    if (result?.success === true) for (const row of snapshots) notifyProjectLayoutChanged(row.projectId, reason);
     return result;
   });
 };
@@ -2419,12 +2514,23 @@ const tabIdsOfPanesInLayout = (layout: any): Set<string> => {
   return ids;
 };
 
-export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
+export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
   const set: typeof baseSet = ((partial: any, replace?: boolean) => {
-    (baseSet as any)((state: WorkspaceStore) => reconcileWorkspaceDisplayPatch(
-      state, typeof partial === 'function' ? partial(state) : partial,
-    ), replace);
+    (baseSet as any)((state: WorkspaceStore) => {
+      const patch = reconcileWorkspaceDisplayPatch(state, typeof partial === 'function' ? partial(state) : partial);
+      if (!patch || patch === state) return patch;
+      const layoutChanged = ['spaces','splitPanes','centerStrips','activeSpaceTab','windowDisplayLayouts'].some(key => Object.hasOwn(patch,key));
+      const next = layoutChanged && !Object.hasOwn(patch,'tabWorkflowMembership')
+        ? {...patch,...organizationPlacementIntent(state,{...state,...patch})} : patch;
+      const navigationKey = tabNavigationLocation({...state,...next});
+      const navigationChanged = navigationKey !== (state.navigationKey || tabNavigationLocation(state));
+      return {...next,navigationKey,...(navigationChanged ? {navigationRevision:(state.navigationRevision || 0)+1,
+        navigationMutationOwner:ownedTabNavigation,...(!ownedTabNavigation ? {activeTabNavigationIntent:null} : {})} : {})};
+    }, replace);
   }) as typeof baseSet;
+  // DnD, display profiles and UI adapters use the public setter too. They must
+  // pass the same placement and navigation boundary as store actions.
+  api.setState = set;
   return ({
   workspaceDisplay: null,
   windowDisplayKey: null,
@@ -2788,6 +2894,168 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
   spaces: [{ id: 'space-1', name: 'main', icon: null, projectIds: [], layout: {} }],
   activeSpaceTab: null,
   activeSpaceId: 'space-1',
+  tabLastWorkflowIds: {},
+  organizationReady: false,
+  organizationRevision: 0,
+  organizationGeneration: 0,
+  organizationError: null,
+  tabWorkflowMembership: {},
+  pendingTabWorkflowMembership: {},
+  tabCatalog: {},
+  organizationMigrationScopes: {},
+  globalGroups: null,
+  workflowSidebarState:{},
+  refreshOrganizationCatalog: async () => {
+    const snapshot = await ipcRenderer.invoke('workflow:catalog');
+    const state = get();
+    if (snapshot.publication.revision < state.organizationRevision) return;
+    const openProjects = new Map(state.openProjects);
+    for (const data of snapshot.namespaces || []) {
+      let workspace = openProjects.get(data.id);
+      if (!workspace) {
+        workspace = {projectId:data.id,projectPath:data.path || '',recommendedCwd:data.recommendedCwd,tabs:new Map(),tabGroups:data.tabGroups || [],activeTabId:null,
+          activeGroupId:null,selectedTabIds:[],tabHistory:[],tabCounter:0,sidebarOpen:false,openFilePath:null,
+          sidebarExpandedDirs:null,sidebarScrollTop:0,tabListScrollTop:0,currentView:'terminal',viewingSubAgentTabId:null};
+        openProjects.set(data.id,workspace);
+      }
+      workspace.recommendedCwd = data.recommendedCwd;
+      for (const saved of data.tabs || []) {
+        if (!saved.tabId) continue;
+        const current = workspace.tabs.get(saved.tabId) as any;
+        if (!current) workspace.tabs.set(saved.tabId,{...saved,id:saved.tabId,
+          lazyRuntime:saved.tabType !== 'file' && saved.tabType !== 'claude-sdk'} as Tab);
+        else if (current.lazyRuntime && executionRevisionAcks.canHydrate(data.id,current,saved,projectTabSaveQueue.pending(data.id)))
+          Object.assign(current,saved,{id:saved.tabId,lazyRuntime:true});
+      }
+    }
+    const projection = organizationProjection(snapshot,state);
+    const inbox = projection.spaces.find(space => space.id === INBOX_WORKFLOW_ID && space.kind === 'inbox');
+    const spaces = inbox && !state.spaces.some(space => space.id === inbox.id) ? [...state.spaces,inbox] : state.spaces;
+    // A catalog refresh cannot replace a local layout or steal focus.
+    set({openProjects,spaces,tabCatalog:projection.tabCatalog,tabWorkflowMembership:projection.tabWorkflowMembership,
+      globalGroups:snapshot.globalGroups,organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
+  },
+  activeTabNavigationIntent:null,
+  navigationKey:null,
+  navigationRevision:0,
+  navigationMutationOwner:null,
+  mutateWorkflowGroup: async (kind,request) => {
+    const result = await ipcRenderer.invoke('workflow:group-mutate',{kind,request});
+    const globalGroups = await ipcRenderer.invoke('workflow:groups-read');
+    set({globalGroups});
+    return result;
+  },
+  runAfterWorkflowScopeVersions: {},
+
+  bootstrapOrganization: async (options) => {
+    const state = get();
+    await ipcRenderer.invoke('workflow:bootstrap', {workspace:options?.fresh ? {spaces:[],openProjects:[]} : buildSessionSnapshot(state),
+      migrationId:crypto.randomUUID(),mutationId:crypto.randomUUID()});
+    const snapshot = await ipcRenderer.invoke('workflow:catalog');
+    const openProjects = new Map(get().openProjects);
+    // Load the global catalog as metadata. Existing objects, providers, PTYs,
+    // drafts and scroll owners stay exactly where they are.
+    for (const data of snapshot.namespaces || []) {
+      let workspace = openProjects.get(data.id);
+      if (!workspace) {
+        workspace = {projectId:data.id,projectPath:data.path || '',recommendedCwd:data.recommendedCwd,tabs:new Map(),tabGroups:data.tabGroups || [],
+          activeTabId:null,activeGroupId:null,selectedTabIds:[],tabHistory:[],tabCounter:0,
+          sidebarOpen:false,openFilePath:data.openFilePath || null,sidebarExpandedDirs:data.sidebarExpandedDirs || null,
+          sidebarScrollTop:data.sidebarScrollTop || 0,tabListScrollTop:data.tabListScrollTop || 0,currentView:'terminal',viewingSubAgentTabId:null};
+        openProjects.set(data.id,workspace);
+      }
+      workspace.recommendedCwd = data.recommendedCwd;
+      for (const saved of data.tabs || []) {
+        if (!saved.tabId || workspace.tabs.has(saved.tabId)) continue;
+        workspace.tabs.set(saved.tabId,{...saved,id:saved.tabId,name:saved.name || 'tab',cwd:saved.cwd,
+          tabType:saved.tabType || 'terminal',lazyRuntime:saved.tabType !== 'file' && saved.tabType !== 'claude-sdk'} as Tab);
+        workspace.tabCounter++;
+      }
+    }
+    if (!openProjects.has(GLOBAL_EXECUTION_NAMESPACE)) openProjects.set(GLOBAL_EXECUTION_NAMESPACE,{projectId:GLOBAL_EXECUTION_NAMESPACE,
+      projectPath:'',tabs:new Map(),tabGroups:[],activeTabId:null,activeGroupId:null,selectedTabIds:[],tabHistory:[],tabCounter:0,
+      sidebarOpen:false,openFilePath:null,sidebarExpandedDirs:null,sidebarScrollTop:0,tabListScrollTop:0,currentView:'terminal',viewingSubAgentTabId:null});
+    const projection = organizationProjection(snapshot,get());
+    set({...projection,openProjects,pendingTabWorkflowMembership:{},
+      activeProjectId:projection.activeProjectId || GLOBAL_EXECUTION_NAMESPACE,
+      focusedProjectId:projection.focusedProjectId || projection.activeProjectId || GLOBAL_EXECUTION_NAMESPACE,
+      runAfterWorkflowScopeVersions:get().runAfterWorkflowScopeVersions || {}});
+    // Migration publishes policy in the SAME Main generation. A policy that
+    // hydrated earlier must adopt those preserved eligibility exceptions.
+    const raw = await ipcRenderer.invoke('app:getState','globalAutoCompact');
+    const {useAutoCompactStore} = await import('./useAutoCompactStore');
+    const {normalizeAutoCompactPolicy} = await import('../utils/autoCompactPolicy.mjs');
+    useAutoCompactStore.setState({policy:normalizeAutoCompactPolicy(typeof raw === 'string' ? JSON.parse(raw) : raw || {}),hydrated:true});
+  },
+
+  commitOrganization: () => {
+    if (!get().organizationReady || get().isRestoring) return Promise.resolve(null);
+    return organizationCommitter.commit(() => organizationSnapshot(get()));
+  },
+
+  ensureTabRuntime: async (tabId) => {
+    const inflight = tabRuntimeAdmissions.get(tabId);
+    if (inflight) return inflight;
+    const owner = findOpenTabOwner(get(),tabId);
+    if (!owner) return false;
+    if (!(owner.tab as any).lazyRuntime) return true;
+    const admission = (async () => {
+      const result = await ipcRenderer.invoke('terminal:create',{tabId,projectId:owner.projectId,cwd:owner.tab.cwd,rows:24,cols:80});
+      const current = findOpenTabOwner(get(),tabId);
+      if (!current || current.tab !== owner.tab || result?.success === false || !result) return false;
+      (current.tab as any).lazyRuntime = false;
+      current.tab.pid = result.pid;
+      set({openProjects:new Map(get().openProjects)});
+      return true;
+    })();
+    tabRuntimeAdmissions.set(tabId,admission);
+    try {return await admission;} finally {if (tabRuntimeAdmissions.get(tabId) === admission) tabRuntimeAdmissions.delete(tabId);}
+  },
+
+  createWorkflowTab: async (options = {}) => {
+    const admission = get();
+    const source = options.sourceTabId ? findOpenTabOwner(admission,options.sourceTabId) : null;
+    const pane = admission.splitPanes[admission.splitFocusedIndex];
+    const shown = pane?.tabId ? findOpenTabOwner(admission,pane.tabId)
+      : admission.activeSpaceTab?.tabId ? findOpenTabOwner(admission,admission.activeSpaceTab.tabId) : null;
+    const cwd = options.cwd || source?.tab.cwd || shown?.tab.cwd || resolveWorkspaceCwd('');
+    const workflowId = options.workflowId || (source && (admission.pendingTabWorkflowMembership[source.tab.id]
+      || admission.tabWorkflowMembership[source.tab.id])?.workflowId) || admission.activeSpaceId;
+    if (!get().openProjects.has(GLOBAL_EXECUTION_NAMESPACE)) {
+      const openProjects = new Map(get().openProjects);
+      openProjects.set(GLOBAL_EXECUTION_NAMESPACE,{projectId:GLOBAL_EXECUTION_NAMESPACE,projectPath:cwd,tabs:new Map(),tabGroups:[],
+        activeTabId:null,activeGroupId:null,selectedTabIds:[],tabHistory:[],tabCounter:0,sidebarOpen:false,openFilePath:null,
+        sidebarExpandedDirs:null,sidebarScrollTop:0,tabListScrollTop:0,currentView:'terminal',viewingSubAgentTabId:null});
+      set({openProjects});
+    }
+    return get().createTab(GLOBAL_EXECUTION_NAMESPACE,options.name,cwd,{...options.tabOptions,
+      workflowId,
+      sourceTabId:options.sourceTabId} as any);
+  },
+
+  moveTabsToWorkflow: async (tabIds,workflowId) => {
+    const state = get();
+    if (!state.organizationReady || !state.spaces.some(space => space.id === workflowId)) return false;
+    const ids = new Set(tabIds);
+    for (const id of ids) if (!state.tabWorkflowMembership[id] || !findOpenTabOwner(state,id)) return false;
+    let added = true;
+    while (added) {
+      added = false;
+      for (const workspace of state.openProjects.values()) for (const tab of workspace.tabs.values())
+        if (!ids.has(tab.id) && (ids.has(tab.parentTabId || '') || tab.tabType === 'file' && ids.has(tab.visualParentTabId || ''))) {
+          ids.add(tab.id);added = true;
+        }
+    }
+    const pending = {...state.pendingTabWorkflowMembership};
+    for (const id of ids) if (state.tabWorkflowMembership[id]) pending[id] = {...state.tabWorkflowMembership[id],workflowId};
+    const spaces = state.spaces.map(space => ({...space,layout:removeLayoutTabs(
+      space.id === state.activeSpaceId ? captureSpaceLayout(state) : space.layout,[...ids])}));
+    const live = spaces.find(space => space.id === state.activeSpaceId)!.layout;
+    set({spaces,...live,pendingTabWorkflowMembership:pending});
+    try {await get().commitOrganization(); get().saveSession();
+      return [...ids].every(id => get().tabWorkflowMembership[id]?.workflowId === workflowId);
+    } catch {return false;}
+  },
 
   addWorkspaceSpace: (options) => {
     const st = get();
@@ -2813,6 +3081,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     set({
       spaces: saved,
       activeSpaceId: res.activeSpaceId,
+      view:'workspace',
       // Новое пространство — ОДНО ПУСТОЕ ОКНО, а не «окон нет».
       //
       // Разница видна сразу: «окон нет» в этом приложении означает одиночный
@@ -2842,6 +3111,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
 
   removeWorkspaceSpace: (id) => {
     const st = get();
+    if (st.spaces.find(space => space.id === id)?.kind === 'inbox') return;
     const res = removeSpaceFromList(st.spaces, st.activeSpaceId, id);
     if (!res) return; // последнее не удаляется
     // Удаляют РАСКЛАДКУ: вкладки остаются в списке проекта, процессы живут.
@@ -2875,6 +3145,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
   },
 
   reorderWorkspaceSpaces: (orderedIds) => {
+    const inboxIds = get().spaces.filter(space => space.kind === 'inbox').map(space => space.id);
+    orderedIds = [...orderedIds.filter(id => !inboxIds.includes(id)),...inboxIds];
     const result = reorderSpacesInList(get().spaces, orderedIds);
     if (!result) return false;
     set({ spaces: result.spaces });
@@ -2948,8 +3220,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
   },
 
   switchWorkspaceSpace: (id) => {
+    if (!ownedTabNavigation) set({activeTabNavigationIntent:null});
     const switchStartedAt = performance.now();
     const st = get();
+    if (id === st.activeSpaceId) {
+      if (st.view !== 'workspace') { set({ view: 'workspace' }); get().saveSession(); }
+      return;
+    }
     const res = switchSpaceInList(st.spaces, st.activeSpaceId, id, captureSpaceLayout(st));
     if (!res) return;
     const previousSpaceId = st.activeSpaceId;
@@ -2997,7 +3274,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     }
     if (!tabAlive) layout.activeSpaceTab = null;
     const planDoneAt = performance.now();
-    set({ spaces: res.spaces, activeSpaceId: res.activeSpaceId, ...layout });
+    set({ spaces: res.spaces, activeSpaceId: res.activeSpaceId, ...layout, view: 'workspace' });
     const storeSetDoneAt = performance.now();
     // Возврат в пространство — это возврат и к вкладке, на которой человек
     // стоял: раскладка без неё показывала бы центр от соседнего пространства.
@@ -4232,6 +4509,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
   },
 
   activateCenterTab: (projectId, tabId) => {
+    if (get().organizationReady && !ownedTabNavigation) {
+      void get().openTabById(tabId,{projectId,reason:'center-tab-link'});
+      return;
+    }
+    if (!ownedTabNavigation) set({activeTabNavigationIntent:null});
     // Split rules live inside switchTab (the single activation choke point),
     // and so does the sidebar follow-through: switchTab writes BOTH pointers
     // via activationFollowPatch. showWorkspace (explicit project navigation,
@@ -4250,7 +4532,112 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     }
   },
 
+  openTabById: async (tabId, options = {}) => {
+    const intent = {id:crypto.randomUUID(),tabId};
+    set({activeTabNavigationIntent:intent});
+    try {
+    let owner = findOpenTabOwner(get(), tabId);
+    if ((!owner || (owner.tab as any).lazyRuntime) && get().organizationReady) {
+      await get().refreshOrganizationCatalog();
+      owner = findOpenTabOwner(get(),tabId);
+    }
+    if (!owner && get().organizationReady) return false;
+    if (!owner && options.projectId) {
+      const projectId = options.projectId;
+      let projectPath = options.projectPath || '';
+      if (!projectPath) {
+        const metadata = await ipcRenderer.invoke('project:getById', projectId).catch(() => null);
+        projectPath = metadata?.path || '';
+      }
+      if (projectPath && !get().openProjects.has(projectId)) {
+        await get().openProject(projectId, projectPath, { background: true });
+      }
+      owner = findOpenTabOwner(get(), tabId);
+    }
+    if (!owner || get().tabCatalog[tabId]?.active === false) return false;
+    if (get().activeTabNavigationIntent?.id !== intent.id) return false;
+    const presentationTabId = owner.tab.parentTabId || tabId;
+    let plan = resolveTabLinkNavigation(get(), presentationTabId);
+    if (!plan) return false;
+    if (plan.spaceId && plan.spaceId !== get().activeSpaceId) withOwnedTabNavigation(intent.id,() => get().switchWorkspaceSpace(plan.spaceId));
+    plan = resolveTabLinkNavigation(get(), presentationTabId);
+    if (!plan) return false;
+    // Re-read after restore/switch. A stale caller's project hint never selects
+    // an unrelated tab or changes the conversation's execution owner.
+    owner = findOpenTabOwner(get(), tabId);
+    if (!owner) return false;
+    const presentationOwner = findOpenTabOwner(get(), presentationTabId);
+    if (!presentationOwner) return false;
+    let presented = true;
+    withOwnedTabNavigation(intent.id,() => {
+      if (plan!.kind === 'reveal-profile') {
+        const saved = plan!.pane;
+        const storedEntries = saved?.tabs?.length ? saved.tabs : saved?.tabId
+          ? [{projectId:saved.projectId,tabId:saved.tabId}] : plan!.entries || [];
+        if (!storedEntries.some((entry:any) => entry.tabId === presentationTabId)) {presented=false;return;}
+        const windowId = saved?.windowId || 'profile-window:' + plan!.profileKey + ':' + presentationTabId;
+        const panes = get().splitPanes;
+        const existing = panes.findIndex(pane => pane.windowId === windowId);
+        const entries = storedEntries.flatMap((entry:any) => {
+          const current = findOpenTabOwner(get(),entry.tabId);
+          if (!current || get().tabCatalog[entry.tabId]?.active === false) return [];
+          const placed = resolveTabLinkNavigation(get(),entry.tabId);
+          if (placed?.kind === 'reveal' && (placed.spaceId !== get().activeSpaceId || placed.paneIndex !== existing)) return [];
+          return [{projectId:current.projectId,tabId:entry.tabId}];
+        });
+        if (!entries.some((entry:any) => entry.tabId === presentationTabId)) {presented=false;return;}
+        if (existing >= 0) {
+          const pane = panes[existing],before = pane.tabs?.length ? pane.tabs : pane.tabId ? [{projectId:pane.projectId,tabId:pane.tabId}] : [];
+          const held = new Set(before.map(entry => entry.tabId));
+          set({splitPanes:panes.map((pane,index) => index === existing ? {...pane,
+            tabs:[...before,...entries.filter((entry:any) => !held.has(entry.tabId))]} : pane)});
+        } else set({splitPanes:[...panes,{...saved,windowId,projectId:presentationOwner.projectId,
+          tabId:presentationTabId,tabs:entries,displayHidden:panes.some(pane => !pane.displayHidden)}]});
+        plan = resolveTabLinkNavigation(get(),presentationTabId);
+      }
+      const pane = plan!.kind === 'reveal' ? get().splitPanes[plan!.paneIndex] : null;
+      if (pane?.displayHidden && pane.windowId) {
+        const focused = get().splitPanes[get().splitFocusedIndex];
+        const target = focused && !focused.displayHidden ? get().splitFocusedIndex : get().splitPanes.findIndex(pane => !pane.displayHidden);
+        if (!get().showHiddenWindow(target,pane.windowId,{projectId:presentationOwner.projectId,tabId:presentationTabId})) {presented=false;return;}
+      }
+      if (plan!.kind === 'append') {
+        if (plan!.paneIndex !== null) set({splitFocusedIndex:plan!.paneIndex});
+        get().placeTab(presentationOwner.projectId,presentationTabId,{mode:PLACEMENT_ADD_HERE});
+      } else get().placeTab(presentationOwner.projectId,presentationTabId);
+    });
+    if (!presented) return false;
+    withOwnedTabNavigation(intent.id,() => get().setViewingSubAgent(owner!.tab.parentTabId ? tabId : null));
+    useUIStore.getState().setActiveArea('workspace');
+    if (!(await get().ensureTabRuntime(presentationTabId))) return false;
+    if (get().activeTabNavigationIntent?.id !== intent.id) return false;
+    // ACK belongs to the exact surviving objects and actual visible window.
+    const currentOwner = findOpenTabOwner(get(),tabId);
+    const currentPresentation = findOpenTabOwner(get(),presentationTabId);
+    if (currentOwner?.tab !== owner.tab || currentPresentation?.tab !== presentationOwner.tab) return false;
+    const state = get(),shown = state.splitPanes[state.splitFocusedIndex];
+    if (state.view !== 'workspace' || (state.splitPanes.length
+      ? !shown || shown.displayHidden || shown.tabId !== presentationTabId || shown.projectId !== currentPresentation.projectId
+      : state.activeSpaceTab?.tabId !== presentationTabId)) return false;
+    if (owner.tab.parentTabId && state.openProjects.get(state.activeProjectId || '')?.viewingSubAgentTabId !== tabId) return false;
+    console.log('[TabNavigation] source=' + (options.reason || 'link')
+      + ' tab=' + tabId.slice(-12) + ' kind=' + plan.kind + ' workflow=' + String(plan.spaceId).slice(-12));
+    return true;
+    } catch (error:any) {
+      if (get().activeTabNavigationIntent?.id === intent.id) set({activeTabNavigationIntent:null});
+      console.warn('[TabNavigation] failed source=' + (options.reason || 'link') + ' tab=' + tabId.slice(-12)
+        + ' error=' + (error?.message || String(error)));
+      return false;
+    }
+  },
+
   placeTab: (projectId, tabId, options) => {
+    // Compatibility callers (pickers, queued Rewind) share the Root resolver;
+    // explicit add-here/DnD retains its separate move semantics.
+    if (get().organizationReady && !ownedTabNavigation && options?.mode !== PLACEMENT_ADD_HERE) {
+      void get().openTabById(tabId,{projectId,reason:'legacy-tab-link'});
+      return;
+    }
     const st = get();
     if (!st.openProjects.get(projectId)?.tabs.has(tabId)) return;
     const mode = options?.mode === 'add-here' ? PLACEMENT_ADD_HERE : PLACEMENT_DEFAULT;
@@ -4388,6 +4775,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       // Read the state AT WRITE TIME, not at schedule time: 300ms of debounce
       // is exactly the window in which the layout can change again, and the
       // captured-early version would save the older one.
+      try { await get().commitOrganization(); }
+      catch { saveSessionTimer = null; return; }
       const sessionState = buildSessionSnapshot(get());
 
       // Save to database
@@ -4442,6 +4831,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         total: 1,
       });
       set({ isRestoring: false });
+      try { await get().bootstrapOrganization({fresh:true}); }
+      catch (error: any) { set({organizationError:error?.message || String(error)}); }
       return;
     }
 
@@ -4560,6 +4951,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
           );
           for (let i = 0; i < savedTabs.length; i++) {
             const savedTab = savedTabs[i];
+            if (Array.isArray((proj as any).runtimeTabIds) && !(proj as any).runtimeTabIds.includes(savedTab.tabId)) {
+              newWorkspace.tabs.set(savedTab.tabId,{...savedTab,id:savedTab.tabId,lazyRuntime:savedTab.tabType !== 'file' && savedTab.tabType !== 'claude-sdk'} as Tab);
+              continue;
+            }
             // Updating a global progress card is cheap but still wakes every
             // external-store subscriber. Show useful movement without adding
             // another 129-event burst to the restore we are diagnosing.
@@ -4802,12 +5197,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       set({
         spaces: restoredSpaces.spaces,
         activeSpaceId: restoredSpaces.activeSpaceId,
+        tabLastWorkflowIds: seedTabWorkflowMemory({ ...get(), spaces: restoredSpaces.spaces,
+          activeSpaceId: restoredSpaces.activeSpaceId, splitPanes: restoredSplit.panes,
+          splitFocusedIndex: restoredSplit.focusedIndex, centerStrips: restoredCenterStrips,
+          activeSpaceTab: restoredLayout.activeSpaceTab }, (sessionState as any).tabLastWorkflowIds),
         windowDisplayKey: restoredLayout.windowDisplayKey,
         windowDisplayLayouts: restoredLayout.windowDisplayLayouts,
         activeProjectId: restoredActiveId,
         focusedProjectId: restoredFocusedId,
         view: savedView === 'workspace' && restoredActiveId ? 'workspace' : 'dashboard',
-        isRestoring: false,
+        isRestoring: true,
         openProjects: new Map(openProjects),
         projectHistory: restoredHistory,
         globalTabMru: restoredGlobalMru,
@@ -4818,7 +5217,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         // that dimension reads as equal anyway, so store nothing for it).
         splitSizes: packSplitSizes(restoredSplit.panes, (sessionState as any).splitSizes ?? null),
         centerStrips: restoredCenterStrips,
+        runAfterWorkflowScopeVersions:(sessionState as any).runAfterWorkflowScopeVersions || {},
+        workflowSidebarState:(sessionState as any).workflowSidebarState || {},
       });
+      await get().bootstrapOrganization();
+      set({isRestoring:false});
       if (get().workspaceDisplay) {
         const shown = get().splitPanes[get().splitFocusedIndex];
         if (shown?.tabId && !shown.displayHidden) get().activateCenterTab(shown.projectId, shown.tabId);
@@ -4856,6 +5259,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
   },
 
   showDashboard: async () => {
+    set({activeTabNavigationIntent:null});
     const { activeProjectId, syncAllTabsCwd } = get();
 
     // Switch view IMMEDIATELY — don't block on sync
@@ -5225,7 +5629,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       return '';
     }
 
-    const tabId = (options as any)?.restoreId || `${projectId}-tab-${workspace.tabCounter}`;
+    const tabId = (options as any)?.restoreId || (get().organizationReady ? `tab-${crypto.randomUUID()}` : `${projectId}-tab-${workspace.tabCounter}`);
     log.tabs('createTab: tabId:', tabId, 'counter:', workspace.tabCounter, 'restored:', !!(options as any)?.restoreId);
     workspace.tabCounter++;
 
@@ -5240,10 +5644,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const tabName = name || getNextAvailableName('tab', existingNames);
     log.tabs('createTab: Using name:', tabName);
 
+    const creationState = get();
+    const sourceId = (options as any)?.sourceTabId || (options as any)?.afterTabId || (options as any)?.visualParentTabId;
+    const source = sourceId ? findOpenTabOwner(creationState,sourceId) : null;
+    const shownPane = creationState.splitPanes[creationState.splitFocusedIndex];
+    const shown = shownPane?.tabId ? findOpenTabOwner(creationState,shownPane.tabId)
+      : creationState.activeSpaceTab?.tabId ? findOpenTabOwner(creationState,creationState.activeSpaceTab.tabId) : null;
+    const creationCwd = creationState.organizationReady
+      ? cwd || source?.tab.cwd || shown?.tab.cwd || resolveWorkspaceCwd('')
+      : cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath);
     const newTab: Tab = {
       id: tabId,
       name: tabName,
-      cwd: resolveWorkspaceCwd(cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath)),
+      cwd: resolveWorkspaceCwd(creationCwd),
       color: options?.color,
       isUtility: false,
       commandType: options?.commandType,
@@ -5296,6 +5709,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       restartAfterArmed: (options as any)?.restartAfterArmed || undefined
     };
 
+    await allocateOrganizationTab(projectId,newTab,options);
     // Claude SDK and linked file tabs don't need a PTY process.
     if (newTab.tabType === 'claude-sdk' || newTab.tabType === 'file') {
       console.log('[Store] createTab: non-PTY tab, skipping terminal for:', tabId, 'type:', newTab.tabType);
@@ -5415,6 +5829,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     }
 
     console.log('[Store] createTab: Done, returning tabId:', tabId);
+    if (get().organizationReady && !isRestoring && !options?.background && !(options as any)?.onPublish && !(options as any)?.restoreId)
+      await get().openTabById(tabId,{reason:'new-tab'});
     return tabId;
   },
 
@@ -5425,7 +5841,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     if (!workspace) {
       return '';
     }
-    const tabId = (options as any)?.restoreId || `${projectId}-tab-${workspace.tabCounter}`;
+    const tabId = (options as any)?.restoreId || (get().organizationReady ? `tab-${crypto.randomUUID()}` : `${projectId}-tab-${workspace.tabCounter}`);
     workspace.tabCounter++;
 
     const uiState = useUIStore.getState();
@@ -5510,6 +5926,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       ? options.pendingAction.command
       : undefined;
 
+    await allocateOrganizationTab(projectId,newTab,options);
     // Claude SDK and linked file tabs don't need a PTY process — mirror createTab's guard.
     // Without it, non-terminal tabs spawn unused shells and enter process lifecycle by accident.
     if (newTab.tabType === 'claude-sdk' || newTab.tabType === 'file') {
@@ -5631,10 +6048,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       throw error;
     }
 
+    if (get().organizationReady && !get().isRestoring && !options?.background && !options?.onPublish && !(options as any)?.restoreId)
+      await get().openTabById(tabId,{reason:'new-tab-after-source'});
     return tabId;
   },
 
   closeTab: async (projectId, tabId, options) => {
+    const groupCloseGuard = options?.groupCloseGuard ? {...options.groupCloseGuard} : null;
+    if (groupCloseGuard && !isExactGroupCloseGuard(groupCloseGuard,tabId)) return false;
     const closeStartedAt = Date.now();
     const closeOrder = nextPaneCloseOrder(get().splitPanes);
     let closedPlacement: any = null;
@@ -5722,7 +6143,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       success: false,
       error: error instanceof Error ? error.message : String(error),
     }));
-    if (closePreflight?.success === false) {
+    if (closePreflight?.success !== true) {
       useUIStore.getState().showToast(
         'Вкладка не закрыта: список вкладок изменился, повторите действие',
         'error',
@@ -5768,7 +6189,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       // retry the History write — the exact sequence the user performed by
       // hand (right-click → Стоп → close). Confirmation stays as-is: it was
       // already asked above when the agent is mid-answer.
-      stopProcess: () => ipcRenderer.invoke('terminal:stop-ai-process', {
+      // A frozen group operation cannot stop a changed writer in order to
+      // make its old proof pass. Manual close retains the existing retry.
+      stopProcess: groupCloseGuard ? undefined : () => ipcRenderer.invoke('terminal:stop-ai-process', {
         tabId,
         toolType: effectiveCommandType,
         reason: 'close-tab-archive-retry',
@@ -5778,6 +6201,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         if (closedPlacement) closedPlacement = {...closedPlacement,closedOrder:closeOrder};
         return ipcRenderer.invoke('project:archive-tab', {
         projectId,
+        ...(groupCloseGuard ? {groupCloseGuard} : {}),
         tab: {
           tabId,
           name: tab.name,
@@ -5930,14 +6354,42 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         ' durMs=' + (Date.now() - closeStartedAt));
     }
     const closeCandidateTabs = tabsAfterClose(workspace.tabs, tabId, shouldArchiveToHistory);
-    const closeSnapshot = await saveTabsThenNotifyProjectLayoutChanged(
+    const closeCatalogs = new Map([[projectId, { workspace, tabs: closeCandidateTabs,
+      expectedTabIds: expectedTabIdsBeforeClose }]]);
+    const attachmentOwners = [tabId], seenOwners = new Set(attachmentOwners);
+    for (const ownerId of attachmentOwners) {
+      for (const file of collectTabLinkedFiles(get().openProjects, ownerId)) {
+        if (!seenOwners.has(file.id)) { seenOwners.add(file.id); attachmentOwners.push(file.id); }
+        if (file.projectId === projectId && !closeCandidateTabs.has(file.id)) continue;
+        const linkedWorkspace = get().openProjects.get(file.projectId);
+        if (!linkedWorkspace) continue;
+        const catalog = closeCatalogs.get(file.projectId) || { workspace: linkedWorkspace,
+          tabs: linkedWorkspace.tabs, expectedTabIds: Array.from(linkedWorkspace.tabs.keys()) };
+        catalog.tabs = tabsAfterClose(catalog.tabs, file.id, false);
+        closeCatalogs.set(file.projectId, catalog);
+      }
+    }
+    const closedTabs = Array.from(closeCatalogs, ([projectId, catalog]) => (
+      Array.from(catalog.workspace.tabs.keys()).filter(id => !catalog.tabs.has(id))
+        .map(tabId => ({ projectId, tabId, workspace: catalog.workspace }))
+    )).flat();
+    console.log('[CloseTab] cascade tab=' + tabId.slice(-12)
+      + ' closed=' + closedTabs.length + ' catalogs=' + closeCatalogs.size);
+    // The same group intent owns acknowledgments for all retained families,
+    // including when its current step closes a terminal with attached files.
+    const groupFileCloseGuard=groupCloseGuard || undefined;
+    const closeSnapshot = closeCatalogs.size > 1 || groupFileCloseGuard
+      ? await saveTabsBatchThenNotifyProjectLayoutChanged(
+        Array.from(closeCatalogs, ([projectId, catalog]) => ({ projectId, tabs: catalog.tabs,
+          expectedTabIds: catalog.expectedTabIds })), 'tab-closed',groupFileCloseGuard)
+      : await saveTabsThenNotifyProjectLayoutChanged(
       workspace.projectId,
       closeCandidateTabs,
       'tab-closed',
-      options?.forceCleanup || closeCandidateTabs.size === 0,
+      true,
       expectedTabIdsBeforeClose,
     );
-    if (closeSnapshot?.success === false) {
+    if (!isDurableSaveTabsAck(closeSnapshot)) {
       clearClosingLoader();
       const historyId = archiveCommit.result?.historyId;
       if (historyId !== null && historyId !== undefined) {
@@ -5953,153 +6405,166 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       return false;
     }
 
-    workspace.tabs = closeCandidateTabs;
-    // Capture the physical single-centre placement before its tab pointer and
-    // centre strip are cleaned below. If this exact shown tab is closing, the
-    // result must be an explicit vacant window — not an automatic LRU tab.
-    const singleCenterVacancy = (() => {
-      const placement = get();
-      if (placement.splitPanes.length > 0) return null;
-      const shownTabId = placement.activeSpaceTab?.tabId
-        || (placement.activeProjectId
-          ? placement.openProjects.get(placement.activeProjectId)?.activeTabId || null
-          : null);
-      if (shownTabId !== tabId) return null;
-      const matchingStrip = Object.entries(placement.centerStrips)
-        .find(([, strip]) => strip.some((entry) => entry.tabId === tabId));
-      const stripKey = matchingStrip?.[0] || placement.centerStripKey();
-      const strip = matchingStrip?.[1] || [{ projectId, tabId }];
-      return {
-        stripKey,
-        parked: removeFromStrip(strip, tabId),
-      };
-    })();
-    clearTerminalBuffer(tabId);
-    clearPendingAutoTabTitle(tabId, 'tab-closed');
-    autoTabTitleIntents.delete(tabId);
-    usePromptQueueStore.getState().cleanupClosedTab(tabId);
-    // Remove closed tab from history
-    workspace.tabHistory = workspace.tabHistory.filter(id => id !== tabId);
-    set({ globalTabMru: dropFromMru(get().globalTabMru, tabId) });
-    // …and from every pane's own visit history: a closed tab must not be
-    // offered as a step-back target, and a dead entry would survive into the
-    // saved session wasting the cap.
-    {
-      const purge = dropTabFromAllPaneHistories(get().splitPanes, tabId);
-      if (purge) set({ splitPanes: purge.panes });
-      const detachedPurge = dropTabFromAllPaneDetachedTabs(get().splitPanes, tabId);
-      if (detachedPurge) set({ splitPanes: detachedPurge.panes });
+    for (const catalog of closeCatalogs.values()) catalog.workspace.tabs = catalog.tabs;
+    const closedIds = new Set(closedTabs.map(row => row.tabId));
+    const ui = useUIStore.getState();
+    if (ui.filePreview?.source === 'tab'
+      && (closedIds.has(ui.filePreview.sourceTabId || '') || closedIds.has(ui.filePreview.ownerTabId || ''))) {
+      ui.closeFilePreview();
     }
-    // …и из окон ОСТАЛЬНЫХ пространств. Их раскладка лежит в снимках и обычными
-    // путями не правится вовсе: чип, указывающий на закрытую вкладку, дожил бы
-    // до возврата в то пространство и нарисовался бы там окном без разметки.
-    {
-      const st = get();
-      const purge = dropTabsFromOtherSpaces(
-        st.spaces,
-        st.activeSpaceId,
-        [tabId],
-        dropTabFromAllPaneStrips,
-        vacantPaneWithTabs,
-      );
-      if (purge) set({ spaces: purge.spaces });
-    }
-    // «Что показывало ЭТО пространство» — тоже размещение, и оно тоже переживало
-    // свою вкладку: запись оставалась на закрытой, и любой вопрос «где эта
-    // вкладка лежит» отвечал «здесь», хотя её уже нет.
-    if (get().activeSpaceTab?.tabId === tabId) set({ activeSpaceTab: null });
-    // Closing a TAB is not "remove this pane from the workspace": the slot the
-    // user built is not part of what they deleted. If the tab was shown, the
-    // pane stays vacant; parked chips remain but none is selected implicitly.
-    // The surviving pane inherits global focus AFTER the workspace cleanup
-    // below (otherwise this project's own LRU fallback would win and the
-    // user would land on a tab that is not even on screen).
     let splitSurvivor: SplitPane | null = null;
-    {
-      const { splitPanes, splitFocusedIndex } = get();
-      const splitRes = emptyPaneByClosedTab(splitPanes, splitFocusedIndex, tabId);
-      if (splitRes) {
-        // Same question as removeTabFromSplit — "which pane stayed on screen" —
-        // so it reads the same answer. This used to re-derive it locally by
-        // scanning for any pane that is not the closed one, which also matched
-        // an empty placeholder and then quietly activated nothing.
-        // A pane that just became a PLACEHOLDER is not a survivor: it has no
-        // tab to activate, and naming it would leave the centre on nothing.
-        // Closing the CONTENT of the focused window never transfers focus to a
-        // neighbour. The empty slot is still the keyboard/navigation target;
-        // only its own explicit close-window action may remove that slot.
-        const preserveFocusedEmptyPane = splitRes.emptiedIndex === splitRes.focusedIndex;
-        const focusedAfter = splitRes.panes[splitRes.focusedIndex];
-        splitSurvivor = preserveFocusedEmptyPane
-          ? null
-          : ((focusedAfter && focusedAfter.tabId ? focusedAfter : null)
-            || (splitRes as { survivor?: SplitPane | null }).survivor
-            || splitRes.panes.find((p) => p.tabId) || null);
-        set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex });
-        console.log('[Split] tab-closed tab=' + tabId.slice(-12)
-          + ' panes=' + splitRes.panes.length
-          + (splitRes.emptiedIndex !== undefined ? ' emptied=' + splitRes.emptiedIndex : ' collapsed')
-          + (preserveFocusedEmptyPane ? ' preserveFocus=1' : ''));
-      }
-      // …and out of any OTHER window that merely held its chip. The call above
-      // acts on the one window that was SHOWING it; a chip sitting unshown
-      // elsewhere would otherwise survive its own tab and restore as a row
-      // pointing at nothing.
-      const strips = dropTabFromAllPaneStrips(get().splitPanes, tabId);
-      if (strips) set({ splitPanes: strips.panes });
-      // Same for the single-mode centre's strips — ALL of them, not just this
-      // tab's own project: strips are cross-project, so a tab can sit as a chip
-      // in a strip belonging to a project it does not come from.
+    let preserveFocusedVacancy = false;
+    for (const { projectId, tabId, workspace } of closedTabs) {
+      // Capture the physical single-centre placement before its tab pointer and
+      // centre strip are cleaned below. If this exact shown tab is closing, the
+      // result must be an explicit vacant window — not an automatic LRU tab.
+      const singleCenterVacancy = (() => {
+        const placement = get();
+        if (placement.splitPanes.length > 0) return null;
+        const shownTabId = placement.activeSpaceTab?.tabId
+          || (placement.activeProjectId
+            ? placement.openProjects.get(placement.activeProjectId)?.activeTabId || null
+            : null);
+        if (shownTabId !== tabId) return null;
+        const matchingStrip = Object.entries(placement.centerStrips)
+          .find(([, strip]) => strip.some((entry) => entry.tabId === tabId));
+        const stripKey = matchingStrip?.[0] || placement.centerStripKey();
+        const strip = matchingStrip?.[1] || [{ projectId, tabId }];
+        return {
+          stripKey,
+          parked: removeFromStrip(strip, tabId),
+        };
+      })();
+      clearTerminalBuffer(tabId);
+      clearPendingAutoTabTitle(tabId, 'tab-closed');
+      autoTabTitleIntents.delete(tabId);
+      usePromptQueueStore.getState().cleanupClosedTab(tabId);
+      // Remove closed tab from history
+      workspace.tabHistory = workspace.tabHistory.filter(id => id !== tabId);
+      set({ globalTabMru: dropFromMru(get().globalTabMru, tabId) });
+      // …и из окон ОСТАЛЬНЫХ пространств. Их раскладка лежит в снимках и обычными
+      // путями не правится вовсе: чип, указывающий на закрытую вкладку, дожил бы
+      // до возврата в то пространство и нарисовался бы там окном без разметки.
       {
-        const before = get().centerStrips;
-        let changed = false;
-        const nextStrips: typeof before = {};
-        Object.entries(before).forEach(([key, strip]) => {
-          if (!strip.some((e) => e.tabId === tabId)) { nextStrips[key] = strip; return; }
-          changed = true;
-          const rest = removeFromStrip(strip, tabId);
-          if (singleCenterVacancy?.stripKey === key) return;
-          // One chip left is not a strip: the project goes back to behaving
-          // exactly as it did before a strip was ever built there.
-          if (rest.length > 1) nextStrips[key] = rest;
-        });
-        if (changed) set({ centerStrips: nextStrips });
+        const st = get();
+        const purge = dropTabsFromOtherSpaces(
+          st.spaces,
+          st.activeSpaceId,
+          [tabId],
+          (panes, closedId) => {
+            const strips = dropTabFromAllPaneStrips(panes, closedId);
+            const history = dropTabFromAllPaneHistories(strips?.panes || panes, closedId);
+            const detached = dropTabFromAllPaneDetachedTabs(history?.panes || strips?.panes || panes, closedId);
+            return detached || history || strips;
+          },
+          vacantPaneWithTabs,
+        );
+        if (purge) set({ spaces: purge.spaces });
       }
-      if (singleCenterVacancy) {
-        const currentStrips = { ...get().centerStrips };
-        if (singleCenterVacancy.stripKey) delete currentStrips[singleCenterVacancy.stripKey];
-        set({
-          centerStrips: currentStrips,
-          splitPanes: [vacantPaneWithTabs({}, singleCenterVacancy.parked)],
-          splitFocusedIndex: 0,
-          splitSizes: null,
-          activeSpaceTab: null,
-        });
-        console.log('[Split] tab-closed-center tab=' + tabId.slice(-12)
-          + ' parked=' + singleCenterVacancy.parked.length
-          + ' empty=1');
+      // «Что показывало ЭТО пространство» — тоже размещение, и оно тоже переживало
+      // свою вкладку: запись оставалась на закрытой, и любой вопрос «где эта
+      // вкладка лежит» отвечал «здесь», хотя её уже нет.
+      if (get().activeSpaceTab?.tabId === tabId) set({ activeSpaceTab: null });
+      // Closing a TAB is not "remove this pane from the workspace": the slot the
+      // user built is not part of what they deleted. If the tab was shown, the
+      // pane stays vacant; parked chips remain but none is selected implicitly.
+      // The surviving pane inherits global focus AFTER the workspace cleanup
+      // below (otherwise this project's own LRU fallback would win and the
+      // user would land on a tab that is not even on screen).
+      {
+        const { splitPanes, splitFocusedIndex } = get();
+        const splitRes = emptyPaneByClosedTab(splitPanes, splitFocusedIndex, tabId);
+        if (splitRes) {
+          // Same question as removeTabFromSplit — "which pane stayed on screen" —
+          // so it reads the same answer. This used to re-derive it locally by
+          // scanning for any pane that is not the closed one, which also matched
+          // an empty placeholder and then quietly activated nothing.
+          // A pane that just became a PLACEHOLDER is not a survivor: it has no
+          // tab to activate, and naming it would leave the centre on nothing.
+          // Closing the CONTENT of the focused window never transfers focus to a
+          // neighbour. The empty slot is still the keyboard/navigation target;
+          // only its own explicit close-window action may remove that slot.
+          const preserveFocusedEmptyPane = splitRes.emptiedIndex === splitRes.focusedIndex;
+          if (preserveFocusedEmptyPane) preserveFocusedVacancy = true;
+          const focusedAfter = splitRes.panes[splitRes.focusedIndex];
+          splitSurvivor = preserveFocusedEmptyPane
+            ? null
+            : ((focusedAfter && focusedAfter.tabId ? focusedAfter : null)
+              || (splitRes as { survivor?: SplitPane | null }).survivor
+              || splitRes.panes.find((p) => p.tabId) || null);
+          set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex });
+          console.log('[Split] tab-closed tab=' + tabId.slice(-12)
+            + ' panes=' + splitRes.panes.length
+            + (splitRes.emptiedIndex !== undefined ? ' emptied=' + splitRes.emptiedIndex : ' collapsed')
+            + (preserveFocusedEmptyPane ? ' preserveFocus=1' : ''));
+        }
+        // …and out of any OTHER window that merely held its chip. The call above
+        // acts on the one window that was SHOWING it; a chip sitting unshown
+        // elsewhere would otherwise survive its own tab and restore as a row
+        // pointing at nothing.
+        const strips = dropTabFromAllPaneStrips(get().splitPanes, tabId);
+        if (strips) set({ splitPanes: strips.panes });
+        // Removing the shown chip records its outgoing visit. Purge only after
+        // that transition, otherwise the closed tab is put back into history.
+        const history = dropTabFromAllPaneHistories(get().splitPanes, tabId);
+        if (history) set({ splitPanes: history.panes });
+        const detached = dropTabFromAllPaneDetachedTabs(get().splitPanes, tabId);
+        if (detached) set({ splitPanes: detached.panes });
+        // Same for the single-mode centre's strips — ALL of them, not just this
+        // tab's own project: strips are cross-project, so a tab can sit as a chip
+        // in a strip belonging to a project it does not come from.
+        {
+          const before = get().centerStrips;
+          let changed = false;
+          const nextStrips: typeof before = {};
+          Object.entries(before).forEach(([key, strip]) => {
+            if (!strip.some((e) => e.tabId === tabId)) { nextStrips[key] = strip; return; }
+            changed = true;
+            const rest = removeFromStrip(strip, tabId);
+            if (singleCenterVacancy?.stripKey === key) return;
+            // One chip left is not a strip: the project goes back to behaving
+            // exactly as it did before a strip was ever built there.
+            if (rest.length > 1) nextStrips[key] = rest;
+          });
+          if (changed) set({ centerStrips: nextStrips });
+        }
+        if (singleCenterVacancy) {
+          preserveFocusedVacancy = true;
+          const currentStrips = { ...get().centerStrips };
+          if (singleCenterVacancy.stripKey) delete currentStrips[singleCenterVacancy.stripKey];
+          set({
+            centerStrips: currentStrips,
+            splitPanes: [vacantPaneWithTabs({}, singleCenterVacancy.parked)],
+            splitFocusedIndex: 0,
+            splitSizes: null,
+            activeSpaceTab: null,
+          });
+          console.log('[Split] tab-closed-center tab=' + tabId.slice(-12)
+            + ' parked=' + singleCenterVacancy.parked.length
+            + ' empty=1');
+        }
       }
-    }
 
-    if (workspace.activeTabId === tabId) {
-      // Find next tab from history (LRU: last visited that still exists).
-      let nextTabId: string | null = null;
-      for (let i = workspace.tabHistory.length - 1; i >= 0; i--) {
-        const candidateId = workspace.tabHistory[i];
-        const candidate = workspace.tabs.get(candidateId);
-        if (candidate) {
-          nextTabId = candidateId;
-          break;
+      if (workspace.activeTabId === tabId) {
+        // Find next tab from history (LRU: last visited that still exists).
+        let nextTabId: string | null = null;
+        for (let i = workspace.tabHistory.length - 1; i >= 0; i--) {
+          const candidateId = workspace.tabHistory[i];
+          const candidate = workspace.tabs.get(candidateId);
+          if (candidate) {
+            nextTabId = candidateId;
+            break;
+          }
         }
-      }
-      // Fallback: last tab if history didn't help.
-      if (!nextTabId) {
-        const mainTabs = Array.from(workspace.tabs.values());
-        if (mainTabs.length > 0) {
-          nextTabId = mainTabs[mainTabs.length - 1].id;
+        // Fallback: last tab if history didn't help.
+        if (!nextTabId) {
+          const mainTabs = Array.from(workspace.tabs.values());
+          if (mainTabs.length > 0) {
+            nextTabId = mainTabs[mainTabs.length - 1].id;
+          }
         }
+        workspace.activeTabId = nextTabId;
       }
-      workspace.activeTabId = nextTabId;
     }
 
     // Use startTransition to prevent UI blocking
@@ -6111,26 +6576,36 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       + ' success=' + (closeSnapshot?.success !== false)
       + ' remaining=' + workspace.tabs.size
       + ' durMs=' + (Date.now() - closeStartedAt));
-    await ipcRenderer.invoke('orchestration:tab-closed', {
-      tabId,
-      projectId: workspace.projectId,
-    }).catch((error: any) => {
-      console.warn('[CloseTab] orchestration cleanup failed tab=' + tabId.slice(-12) + ': ' + (error?.message || error));
-    });
+    for (const closed of closedTabs) {
+      await ipcRenderer.invoke('orchestration:tab-closed', { tabId: closed.tabId, projectId: closed.projectId }).catch((error: any) => {
+        console.warn('[CloseTab] orchestration cleanup failed tab=' + closed.tabId.slice(-12) + ': ' + (error?.message || error));
+      });
+    }
     console.log('[CloseTab] state-updated tab=' + tabId.slice(-12) +
       ' remaining=' + workspace.tabs.size +
       ' active=' + (workspace.activeTabId ? workspace.activeTabId.slice(-12) : 'none') +
       ' durMs=' + (Date.now() - closeStartedAt));
     // Closing a background tab may re-affirm the pane that already owned focus;
     // a newly vacant focused pane never transfers ownership here.
-    if (splitSurvivor && get().openProjects.get(splitSurvivor.projectId)?.tabs.has(splitSurvivor.tabId)) {
+    if (!preserveFocusedVacancy && splitSurvivor && get().openProjects.get(splitSurvivor.projectId)?.tabs.has(splitSurvivor.tabId)) {
       get().activateCenterTab(splitSurvivor.projectId, splitSurvivor.tabId);
     }
     return true;
   },
 
   restoreTabHistoryEntry: async (projectId, historyId, options = {}) => {
-    const workspace = get().openProjects.get(projectId);
+    if (!get().openProjects.has(projectId) && get().organizationReady) await get().refreshOrganizationCatalog();
+    let workspace = get().openProjects.get(projectId);
+    if (!workspace && get().organizationReady) {
+      const metadata = await ipcRenderer.invoke('project:getById',projectId).catch(() => null);
+      if (metadata) {
+        const openProjects = new Map(get().openProjects);
+        workspace = {projectId,projectPath:metadata.path || '',tabs:new Map(),tabGroups:metadata.tabGroups || [],
+          activeTabId:null,activeGroupId:null,selectedTabIds:[],tabHistory:[],tabCounter:0,sidebarOpen:false,openFilePath:null,
+          sidebarExpandedDirs:null,sidebarScrollTop:0,tabListScrollTop:0,currentView:'terminal',viewingSubAgentTabId:null};
+        openProjects.set(projectId,workspace);set({openProjects});
+      }
+    }
     if (!workspace) {
       return { tabId: null, reason: 'error', message: 'Проект не открыт' };
     }
@@ -6140,6 +6615,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       lease = await ipcRenderer.invoke('project:begin-tab-history-restore', {
         projectId,
         id: historyId,
+        ...((options as any).archiveRequest ? {request:(options as any).archiveRequest} : {}),
       });
     } catch (error) {
       console.warn('[TabHistoryRestore] begin IPC failed', { projectId, historyId, error });
@@ -6161,6 +6637,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     }
 
     const entry = lease.entry as TabHistoryRestoreEntry;
+    const restoreKey = JSON.stringify([projectId,entry.id]);
     const restorePlacement = readTabRestorePlacement(entry.restore_placement);
     const finishLease = async (commit: boolean) => {
       try {
@@ -6183,19 +6660,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const expectedTabId = typeof options.expectedTabId === 'string'
       ? options.expectedTabId.trim()
       : '';
-    if (expectedTabId && entry.tab_id !== expectedTabId) {
+    let address;
+    try {address = archiveRestoreLeaseAddress(lease,projectId,expectedTabId);}
+    catch (error:any) {
       await finishLease(false);
       return {
         tabId: null,
         historyId: entry.id,
         reason: 'error',
-        message: 'Архивная запись не принадлежит запрошенной вкладке',
+        message:error?.code === 'archive_restore_source_changed' ? 'Архивная запись не принадлежит запрошенной вкладке'
+          : error?.message || 'Не подтверждён адрес восстановления',
       };
     }
+    const restoreTargetTabId = address.targetTabId;
+    const recoveredOwner = address.replacement ? findOpenTabOwner(get(),restoreTargetTabId) : null;
+    const previousRestore = (entry.execution_subject_version === 2 && !address.replacement ? null : archiveRestoreOwners.get(restoreKey))
+      || (recoveredOwner ? {tabId:restoreTargetTabId,sourceTabId:address.sourceTabId,tab:recoveredOwner.tab} : null);
+    const reusableRestore = previousRestore?.tabId === restoreTargetTabId && previousRestore.sourceTabId === address.sourceTabId
+      && findOpenTabOwner(get(),previousRestore.tabId)?.tab === previousRestore.tab ? previousRestore : null;
     // Reopen creates a new runtime tab, as before. Only the placement identity
     // survives: old PTY exit/cleanup must not target its replacement.
-    if ([...get().openProjects.values()].some(w =>
-      (expectedTabId && w.tabs.has(expectedTabId)) || (restorePlacement
+    if (!reusableRestore && entry.execution_subject_version !== 2 && [...get().openProjects.values()].some(w =>
+      w.tabs.has(restoreTargetTabId) || (restorePlacement
         && [...w.tabs.values()].some(t => tabPlacementId(t) === restorePlacement.id)))) {
       await finishLease(false);
       return {
@@ -6258,7 +6744,29 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
 
     let newTabId = '';
     try {
-      newTabId = await get().createTab(projectId, entry.name, restoreCwd.cwd, {
+      if (reusableRestore) {
+        newTabId = reusableRestore.tabId;
+        if (!(await get().ensureTabRuntime(newTabId))) throw new Error('execution_runtime_restore_unconfirmed');
+      }
+      else if ((entry as any).execution_subject_version === 2) {
+        const restored = await ipcRenderer.invoke('project:restore-execution-tab',{namespace:projectId,historyId:entry.id,
+          leaseToken:lease.token,cwd:restoreCwd.cwd});
+        if (!restored || restored.success === false || typeof restored.tabId !== 'string'
+          || restored.tabId !== restoreTargetTabId) throw new Error('execution_restore_unconfirmed');
+        newTabId = restored.tabId;
+        // The selected inactive snapshot may precede a later re-close. Adopt
+        // Main's restored metadata on the same object, retaining UI owners.
+        const current = findOpenTabOwner(get(),newTabId);
+        if (current && restored.tab) Object.assign(current.tab,restored.tab,{id:newTabId});
+        await get().refreshOrganizationCatalog();
+        const tab = findOpenTabOwner(get(),newTabId)?.tab;
+        if (!tab) throw new Error('execution_restore_owner_missing');
+        tab.pendingAction = buildHistoryPendingAction(entry,options.resumePolicy);
+        // Archive API restores storage only. Prepare Resume before runtime's
+        // publication wakes the existing renderer/provider launch path.
+        (tab as any).lazyRuntime = tab.tabType !== 'file' && tab.tabType !== 'claude-sdk';
+        if (!(await get().ensureTabRuntime(newTabId))) throw new Error('execution_runtime_restore_unconfirmed');
+      } else newTabId = await get().createTab(projectId, entry.name, restoreCwd.cwd, {
         color: (entry.color || undefined) as TabColor | undefined,
         notes: entry.notes || undefined,
         taskPlan: parseHistoryTaskPlan(entry.task_plan),
@@ -6293,9 +6801,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         groupId: restoredGroupId,
         windowScoped: entry.window_scoped === 1 || undefined,
         background: background || !!restorePlacement,
-        restoreId: expectedTabId || undefined,
+        restoreId: restoreTargetTabId,
       });
-      if (!newTabId) throw new Error('create_tab_returned_empty');
+      if (newTabId !== restoreTargetTabId) throw new Error('archive_restore_target_changed');
+      const restoredOwner = findOpenTabOwner(get(),newTabId);
+      if (!restoredOwner) throw new Error('restored_owner_missing');
+      archiveRestoreOwners.set(restoreKey,{tabId:newTabId,sourceTabId:address.sourceTabId,tab:restoredOwner.tab});
     } catch (error) {
       await finishLease(false);
       console.error('[TabHistoryRestore] create failed', {
@@ -6327,6 +6838,34 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         entries.splice(Math.min(targetIndex, entries.length), 0, newEntry);
         after.tabs = new Map(entries);
         set({ openProjects: new Map(currentState.openProjects) });
+      }
+    }
+
+    // Transfer the current archive metadata before consuming its version. A
+    // partial restore may outlive an archive edit; never erase newer live edits.
+    const metadataOwner=findOpenTabOwner(get(),newTabId)?.tab;
+    if(metadataOwner && get().organizationReady) {
+      const expectedLiveMetadata={name:metadataOwner.name,notes:metadataOwner.notes || '',nameSetManually:!!metadataOwner.nameSetManually};
+      try {
+        const metadataSaved=await saveTabs(projectId,get().openProjects.get(projectId)!.tabs);
+        if(!isDurableSaveTabsAck(metadataSaved))throw new Error('archive_metadata_persistence_unconfirmed');
+        const synced=await ipcRenderer.invoke('project:sync-restored-archive-metadata',{
+          namespace:projectId,historyId:entry.id,ownerTabId:newTabId,leaseToken:lease.token,expectedLiveMetadata});
+        if(synced?.success!==true || synced.ownerTabId!==newTabId || synced.historyId!==entry.id)throw new Error('archive_metadata_transfer_unconfirmed');
+        if(metadataOwner!==findOpenTabOwner(get(),newTabId)?.tab
+          || metadataOwner.name!==expectedLiveMetadata.name || (metadataOwner.notes || '')!==expectedLiveMetadata.notes
+          || !!metadataOwner.nameSetManually!==expectedLiveMetadata.nameSetManually)throw new Error('archive_live_metadata_changed');
+        Object.assign(metadataOwner,synced.metadata);
+        if(metadataOwner.executionSubject?.version===2)metadataOwner.executionStorageRevision=synced.executionStorageRevision;
+      } catch(error:any) {
+        await finishLease(false);
+        const detail=String(error?.message || '');
+        const message=detail.includes('archive_metadata_conflict')
+          ? 'Название или заметки изменены и в архиве, и в открытой вкладке. Обе версии сохранены; выберите нужный вариант перед восстановлением.'
+          : detail.includes('archive_live_metadata_changed')
+            ? 'Вкладка изменена во время восстановления. Изменения и архив сохранены; повторите действие.'
+            : 'Изменения архива не перенесены. Архивная запись сохранена; повторите восстановление.';
+        return {tabId:newTabId,historyId:entry.id,historyDeleteFailed:true,message};
       }
     }
 
@@ -6362,12 +6901,44 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const restoredWindow = options.restorePosition
       ? restoreArchivedTabWindow(get(), restorePlacement, projectId, newTabId) : null;
     if (restoredWindow) {
-      set(restoredWindow.patch);
+      if(options.navigationOwnerId && options.isNavigationCurrent?.())
+        withOwnedTabNavigation(options.navigationOwnerId,()=>set(restoredWindow.patch));
+      else set(restoredWindow.patch);
       get().saveSession();
     }
 
+    const manifest = (entry as any).attachmentManifest;
+    if (manifest) {
+      try {
+        const links = await ipcRenderer.invoke('project:restore-file-links',{namespace:projectId,historyId:entry.id,
+          ownerTabId:newTabId,manifestHash:manifest.hash || manifest.manifestHash,leaseToken:lease.token});
+        if (!links || links.success === false || !Array.isArray(links.restoredFileIds)
+          || manifest.count != null && links.restoredFileIds.length !== manifest.count) throw new Error('file_links_restore_unconfirmed');
+        await get().refreshOrganizationCatalog();
+        if (links.restoredFileIds.some((id:string) => findOpenTabOwner(get(),id)?.tab.tabType !== 'file')) throw new Error('file_links_publication_unconfirmed');
+      } catch (error:any) {
+        await finishLease(false);
+        return {tabId:newTabId,historyId:entry.id,cwd:restoreCwd.cwd,historyDeleteFailed:true,
+          message:error?.message || 'Файлы не восстановлены; запись архива оставлена'};
+      }
+    }
+    const targetWorkflowId = (options as any).targetWorkflowId;
+    if (get().organizationReady && targetWorkflowId) {
+      if (!(await get().moveTabsToWorkflow([newTabId],targetWorkflowId))) {
+        await finishLease(false);
+        return {tabId:newTabId,historyId:entry.id,historyDeleteFailed:true,message:'Размещение восстановления не подтверждено'};
+      }
+    }
     const committed = await finishLease(true);
     const historyDeleteFailed = !committed?.ok || committed?.committed !== true;
+    if (!historyDeleteFailed) {
+      archiveRestoreOwners.delete(restoreKey);
+      // Main registers a reserved legacy replacement and its group before
+      // consuming the source archive. Adopt that canonical publication too.
+      if (get().organizationReady) await get().refreshOrganizationCatalog().catch((error:any) => {
+        console.warn('[TabHistoryRestore] committed catalog refresh failed',error?.message || String(error));
+      });
+    }
     if (historyDeleteFailed) {
       console.warn('[TabHistoryRestore] replacement saved but history cleanup failed', {
         projectId,
@@ -6632,7 +7203,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         // surface — control bar, History, Timeline, hotkeys) and the sidebar
         // (the map the user navigates by). An explicit project click can still
         // park the sidebar elsewhere — until the next activation lands here.
-        set({ openProjects: new Map(openProjects), ...activationFollowPatch(get(), projectId) });
+        const current = get();
+        set({ openProjects: new Map(openProjects), ...activationFollowPatch(current, projectId),
+          ...((current.tabLastWorkflowIds || {})[tabId] === current.activeSpaceId ? {} : {
+            tabLastWorkflowIds: { ...current.tabLastWorkflowIds, [tabId]: current.activeSpaceId },
+          }) });
       });
       _finalSetMs = performance.now() - _phaseAt;
       const syncMs = performance.now() - _t0;
@@ -7059,6 +7634,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const workspace = state.openProjects.get(projectId);
     const tab = workspace?.tabs.get(tabId);
     if (!tab || !workspace) return;
+    set({runAfterWorkflowScopeVersions:{...state.runAfterWorkflowScopeVersions,[tabId]:2}});
     if (getRestartAfterWorkflowIds(tab).includes(workflowId)) {
       state.setTabRestartAfterTarget(projectId, tabId, null);
       return;
@@ -8091,13 +8667,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     notifyProjectLayoutChanged(workspace.projectId, 'tab-layout');
   },
 
-  updateTabCwd: async (projectId, tabId, newCwd) => {
+  updateTabCwd: async (projectId, tabId, newCwd, commit) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
     if (!workspace) return false;
     const tab = workspace.tabs.get(tabId);
     if (!tab) return false;
+    if(commit?.accepted===true && commit.persisted===true && commit.cwd===newCwd) {
+      const receipt=commit.executionReceipt;
+      if(receipt && (!executionRevisionAcks.matchesPoint(projectId,tab,receipt,newCwd)
+        || receipt.toRevision<executionRevisionAcks.revision(projectId,tab)))return false;
+      if(receipt) {
+        executionRevisionAcks.point(projectId,tab,receipt);
+        (tab as any).executionSubject=receipt.executionSubject;
+      }
+      tab.cwd=newCwd;set({openProjects:new Map(openProjects)});
+      return true; // The verified point write is already durable; do not rewrite unrelated tabs.
+    }
     if (tab.cwd !== newCwd) {
       tab.cwd = newCwd;
       set({ openProjects: new Map(openProjects) });
@@ -9111,6 +9698,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
 
   // Per-project view (Home vs Terminal)
   setProjectView: (projectId, view) => {
+    if (get().organizationReady && view === 'home') {
+      window.dispatchEvent(new CustomEvent('global-tab-archive:open'));
+      return;
+    }
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
     if (!workspace || workspace.currentView === view) return;
@@ -9219,6 +9810,55 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
   }
 });
 });
+
+const organizationCommitter = createOrganizationCommitter({
+  invoke:(channel:string,payload:any) => ipcRenderer.invoke(channel,payload),
+  getPublication:() => ({revision:useWorkspaceStore.getState().organizationRevision}),
+  applyPublication:async (result:any) => {
+    const snapshot = await ipcRenderer.invoke('workflow:read');
+    const state = useWorkspaceStore.getState();
+    if (snapshot.publication.revision < state.organizationRevision) return;
+    const projection = organizationProjection(snapshot,state);
+    const pending = {...state.pendingTabWorkflowMembership};
+    for (const [tabId,member] of Object.entries(projection.tabWorkflowMembership) as any) {
+      if (pending[tabId]?.workflowId === member.workflowId) delete pending[tabId];
+    }
+    useWorkspaceStore.setState({tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,
+      organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation,
+      pendingTabWorkflowMembership:pending,organizationError:null});
+  },
+  onError:(error:any) => {
+    useWorkspaceStore.setState({organizationError:error?.message || String(error)});
+    console.error('[WorkflowOrganization] commit failed',error);
+  },
+});
+
+async function allocateOrganizationTab(projectId:string, tab:Tab, options:any): Promise<void> {
+  const initial = useWorkspaceStore.getState();
+  if (!initial.organizationReady || options?.restoreId) return;
+  const ownerId = options?.sourceTabId || options?.visualParentTabId || options?.parentTabId;
+  const workflowId = options?.workflowId || (ownerId && initial.tabWorkflowMembership[ownerId]?.workflowId) || initial.activeSpaceId || INBOX_WORKFLOW_ID;
+  await organizationCommitter.runTask(async () => {
+    const request = {mutationId:crypto.randomUUID(),tabId:tab.id,
+      cwd:tab.cwd,workflowId,sourceTabId:ownerId,executionNamespace:projectId,record:tab,
+      expectedRevision:useWorkspaceStore.getState().organizationRevision};
+    let result;
+    try {result = await ipcRenderer.invoke('workflow:create-tab',request);}
+    catch (error) {
+      result = await ipcRenderer.invoke('workflow:mutation',request.mutationId).catch(() => null);
+      if (!result) throw error;
+    }
+    if (!result?.executionSubject || result.executionSubject.tabId !== tab.id || result.revision == null)
+      throw new Error('workflow_creation_unconfirmed');
+    (tab as any).executionSubject = result.executionSubject;
+    (tab as any).executionStorageRevision = 1;
+    const state = useWorkspaceStore.getState();
+    useWorkspaceStore.setState({organizationRevision:result.revision,organizationGeneration:result.generation,
+      tabWorkflowMembership:{...state.tabWorkflowMembership,[tab.id]:{tabId:tab.id,workflowId:result.workflowId,revision:result.membershipRevision}},
+      tabCatalog:{...state.tabCatalog,[tab.id]:{tabId:tab.id,namespace:projectId,subjectVersion:2,executionSubject:result.executionSubject,active:true}},
+      runAfterWorkflowScopeVersions:{...state.runAfterWorkflowScopeVersions,[tab.id]:2}});
+  });
+}
 
 const taskPlanUpdatedListener = (_event: unknown, payload: { tabId?: string; document?: TabTaskPlanDocument }) => {
   if (!payload?.tabId || !payload.document) return;

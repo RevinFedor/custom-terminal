@@ -12,7 +12,7 @@ export function createAutoCompactCoordinator(ports) {
       && target.sessionId === task.expectedResumedSessionId) task.target = target;
     return target?.provider === task.target.provider && target?.sessionId === task.target.sessionId;
   };
-  const publish = (task, phase, message) => ports.activity(task.tabId, { phase, message });
+  const publish = (task, phase, message) => ports.activity(task.tabId, { phase, message, handoffId: task.id });
   const finish = (task, result, release = true) => {
     if (tasks.get(task.tabId) !== task) return;
     tasks.delete(task.tabId);

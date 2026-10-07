@@ -34,6 +34,7 @@ import {
   isStandaloneAgentLocalCommand,
   normalizeAgentLocalCommand,
 } from '../utils/agentLocalCommand.mjs';
+import { shouldDisarmAfterTriggerClear } from '../utils/runAfterTriggerClear.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -118,6 +119,11 @@ export function isPromptQueueEditorLocked(tabId: string): boolean {
   return promptQueueEditorLocks.has(tabId);
 }
 
+export function getPromptQueueEditorLock(tabId: string): PromptQueueEditorLock | null {
+  const lock = promptQueueEditorLocks.get(tabId);
+  return lock ? { ...lock } : null;
+}
+
 export function subscribePromptQueueEditorLocks(
   listener: PromptQueueEditorLockListener,
 ): () => void {
@@ -145,7 +151,7 @@ type PersistedTabQueueSnapshot = Pick<TabQueue,
   'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds'
   | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptArmedAt'
   | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId' | 'firstDelayCountdownAt'
-  | 'workflowRestartPending' | 'loopRestartPending'
+  | 'workflowRestartPending' | 'loopRestartPending' | 'workflowOutcomeFloorAt'
 >;
 
 function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, PersistedTabQueueSnapshot> {
@@ -186,6 +192,7 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       loopPromptArmedAt: q.loopPromptArmedAt,
       runAfterTabId: q.runAfterTabId,
       workflowArmedAt: q.workflowArmedAt,
+      workflowOutcomeFloorAt: q.workflowOutcomeFloorAt,
       panelCollapsed: q.panelCollapsed,
       previewId: q.previewId,
     };
@@ -243,6 +250,20 @@ export function flushPromptQueueStoreSync(): void {
   }
 }
 
+// A strict remote mutation commits this SAME snapshot through Main together
+// with its operation receipt. Cancel the older debounce, not the persistence
+// owner. The separate shared Loop body is included only for that explicit edit.
+export function takePromptQueuePersistence(includeLoopText = false) {
+  if (!hasHydratedPromptQueueStore) throw new Error('run_after_not_hydrated');
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (includeLoopText && sharedLoopPromptSaveTimer) {
+    clearTimeout(sharedLoopPromptSaveTimer); sharedLoopPromptSaveTimer = null;
+  }
+  const state = usePromptQueueStore.getState();
+  return { promptQueueByTab: JSON.stringify(serializePromptQueueSnapshot(state.queues)),
+    ...(includeLoopText ? { loopPromptText: state.sharedLoopPromptText } : {}) };
+}
+
 // One queued prompt plus durable image references owned by Noted Terminal.
 // Main materializes Claude/Codex cache paths into userData/prompt-queue-assets
 // before the item becomes transferable; legacy paths are migrated on hydrate.
@@ -250,6 +271,7 @@ export type QueuedImageRef = {
   id: number;        // pasteId Claude assigned (matches the [Image #N] placeholder)
   path: string;      // stable absolute path in Noted Terminal's queue asset store
   assetId?: string;  // content-addressed filename; survives userData path changes
+  sourcePath?: string; // authored upload label; path above stays the owned byte source
   mediaType: string; // image/png|jpeg|...
   size: number;      // bytes at grab time (purely informational)
   availability?: 'available' | 'missing';
@@ -353,7 +375,7 @@ export type QueuedPrompt = {
 
 export type QueuedPromptExpectedFields = Partial<Pick<
   QueuedPrompt,
-  'text' | 'chips' | 'title' | 'titleManual' | 'enabled'
+  'text' | 'chips' | 'title' | 'titleManual' | 'enabled' | 'imagePaths' | 'metaAction' | 'trigger' | 'condition'
 >>;
 
 export type QueuedPromptMutationOptions = {
@@ -389,8 +411,8 @@ export function queuedPromptContextConditionMatches(
 ): boolean {
   const condition = normalizeQueuedPromptContextCondition(value);
   if (!condition) return true;
-  const pct = Number(contextUsedPct);
-  if (!Number.isFinite(pct) || pct < 0 || pct > 100) return false;
+  const pct = contextUsedPct;
+  if (typeof pct !== 'number' || !Number.isFinite(pct) || pct < 0 || pct > 100) return false;
   return condition.operator === 'gte'
     ? pct >= condition.percent
     : pct <= condition.percent;
@@ -581,12 +603,46 @@ export type TabQueue = {
   // promises with classified turn outcomes so an old failure cannot cancel a
   // newer manual retry. Null is the fail-closed legacy migration value.
   workflowArmedAt: number | null;
+  // Outcome freshness advances on Resume; the user's pending intent does not.
+  workflowOutcomeFloorAt: number | null;
   // A graceful app restart is not a user cancellation or successful result.
   // Ignore its old turn outcomes until fresh work starts; timers retain their
   // independent absolute deadline and may themselves start that fresh work.
   workflowRestartPending: boolean;
   loopRestartPending: boolean;
 };
+
+// The existing countdown slot belongs to the enabled head. Both the local
+// Pause button and a remote pause freeze that same duration, not a separate
+// legacy field when the head has its own timer.
+export function promptQueueOutcomeFloor(queue: Pick<TabQueue, 'workflowArmedAt' | 'workflowOutcomeFloorAt'>): number | null {
+  const values = [queue.workflowArmedAt, queue.workflowOutcomeFloorAt].filter(value => typeof value === 'number' && Number.isFinite(value));
+  return values.length ? Math.max(...values as number[]) : null;
+}
+
+export function freezePromptQueueCountdown(queue: TabQueue, now = Date.now()): TabQueue {
+  if (queue.firstDelayCountdownAt === null) return queue;
+  const head = queue.items.find(isQueuedPromptEnabled);
+  if (head?.trigger?.kind === 'timer') {
+    const seconds = getFirstDelayRemainingSeconds(head.trigger.seconds, queue.firstDelayCountdownAt, now);
+    return { ...queue, firstDelayCountdownAt: null,
+      items: queue.items.map(item => item.id === head.id
+        ? { ...item, trigger: { kind: 'timer' as const, seconds } } : item) };
+  }
+  return { ...queue, firstDelayCountdownAt: null,
+    firstDelaySeconds: getFirstDelayRemainingSeconds(queue.firstDelaySeconds, queue.firstDelayCountdownAt, now) };
+}
+
+export function readPromptQueueCountdown(queue: TabQueue, now = Date.now()) {
+  const head = queue.items.find(isQueuedPromptEnabled);
+  const seconds = head?.trigger?.kind === 'timer' ? head.trigger.seconds : queue.firstDelaySeconds;
+  const startedAt = queue.firstDelayCountdownAt;
+  const deadline = startedAt === null ? null : startedAt + seconds * 1000;
+  return { ownerItemId: head?.id || null, kind: head?.trigger?.kind === 'timer' ? 'timer' : 'legacy',
+    seconds, startedAt, deadlineAt: deadline !== null && Number.isSafeInteger(deadline) ? deadline : null,
+    remainingSeconds: startedAt === null ? seconds : getFirstDelayRemainingSeconds(seconds, startedAt, now),
+    observedAt: now };
+}
 
 interface PromptQueueStore {
   // Per-tab queues. Outside Claude tabs the overlay is hidden, but state survives tab switching.
@@ -604,6 +660,7 @@ interface PromptQueueStore {
     chips?: QueuedComposerChip[],
   ) => string;
   addMetaAction: (tabId: string, action: QueuedMetaAction, title?: string) => string;
+  updateMetaAction: (tabId: string, id: string, action: QueuedMetaAction, options?: QueuedPromptMutationOptions) => boolean;
   removePrompt: (
     tabId: string,
     id: string,
@@ -614,6 +671,7 @@ interface PromptQueueStore {
     id: string,
     patch: {
       text?: string;
+      images?: number;
       chips?: QueuedComposerChip[];
       imagePaths?: QueuedImageRef[];
       title?: string;
@@ -632,6 +690,7 @@ interface PromptQueueStore {
   ) => void;
   reorderPrompt: (tabId: string, fromIndex: number, toIndex: number) => void;
   setPromptTrigger: (tabId: string, promptId: string, trigger: QueuedPrompt['trigger'] | null) => void;
+  clearPromptTrigger: (tabId: string, promptId: string) => boolean;
   setPromptCondition: (tabId: string, promptId: string, condition: QueuedPrompt['condition'] | null) => void;
   // Move a currently deferred card behind every other card. Returns false when
   // the item vanished or was already last; one condition pass never scans an id
@@ -727,6 +786,7 @@ const EMPTY: TabQueue = {
   stopBeforeCloseArm: false,
   runAfterTabId: null,
   workflowArmedAt: null,
+  workflowOutcomeFloorAt: null,
 };
 
 function hasActiveQueueWorkflow(queue: Pick<TabQueue, 'autoRun' | 'stopAfter' | 'closeAfter'>): boolean {
@@ -755,6 +815,7 @@ type PreHydrateQueueField =
   | 'loopPromptArmedAt'
   | 'runAfterTabId'
   | 'workflowArmedAt'
+  | 'workflowOutcomeFloorAt'
   | 'firstDelayCountdownAt'
   | 'workflowRestartPending'
   | 'loopRestartPending'
@@ -803,6 +864,7 @@ function trackPreHydrateQueueChanges(before: Map<string, TabQueue>, after: Map<s
     if (baseline.loopPromptArmedAt !== current.loopPromptArmedAt) changed.add('loopPromptArmedAt');
     if (baseline.runAfterTabId !== current.runAfterTabId) changed.add('runAfterTabId');
     if (baseline.workflowArmedAt !== current.workflowArmedAt) changed.add('workflowArmedAt');
+    if (baseline.workflowOutcomeFloorAt !== current.workflowOutcomeFloorAt) changed.add('workflowOutcomeFloorAt');
     if (baseline.panelCollapsed !== current.panelCollapsed) changed.add('panelCollapsed');
     if (baseline.previewId !== current.previewId) changed.add('previewId');
     if (changed.size === 0) preHydrateQueueChanges.delete(tabId);
@@ -849,6 +911,7 @@ function mergeHydratedQueue(
   if (changed?.has('loopPromptArmedAt')) merged.loopPromptArmedAt = current.loopPromptArmedAt;
   if (changed?.has('runAfterTabId')) merged.runAfterTabId = current.runAfterTabId;
   if (changed?.has('workflowArmedAt')) merged.workflowArmedAt = current.workflowArmedAt;
+  if (changed?.has('workflowOutcomeFloorAt')) merged.workflowOutcomeFloorAt = current.workflowOutcomeFloorAt;
   if (changed?.has('panelCollapsed')) merged.panelCollapsed = current.panelCollapsed;
   if (changed?.has('previewId')) merged.previewId = current.previewId;
   if (merged.autoRun) merged.firstChipHintActive = false;
@@ -1059,6 +1122,10 @@ function queuedPromptMatchesExpected(
   if (Object.prototype.hasOwnProperty.call(expected, 'enabled') && item.enabled !== expected.enabled) {
     return false;
   }
+  for (const key of ['imagePaths', 'metaAction', 'trigger', 'condition'] as const) {
+    if (Object.prototype.hasOwnProperty.call(expected, key)
+      && JSON.stringify(item[key] ?? null) !== JSON.stringify(expected[key] ?? null)) return false;
+  }
   return true;
 }
 
@@ -1105,6 +1172,23 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
   return {
     queues: new Map(),
     sharedLoopPromptText: DEFAULT_SHARED_LOOP_PROMPT,
+
+    updateMetaAction: (tabId, id, action, options) => {
+      let applied = false;
+      setAndPersist(state => {
+        const cur = state.queues.get(tabId), item = cur?.items.find(value => value.id === id);
+        if (!cur || !item?.metaAction || !queuedPromptMatchesExpected(item, options?.expected)) return state;
+        const normalized = normalizePersistedQueuedPrompt({ ...item, metaAction: action });
+        if (!normalized?.metaAction) return state;
+        const title = item.title === queuedMetaActionDefaultTitle(item.metaAction)
+          ? queuedMetaActionDefaultTitle(normalized.metaAction) : item.title;
+        const next = new Map(state.queues);
+        next.set(tabId, { ...cur, items: cur.items.map(value => value.id === id
+          ? { ...value, metaAction: normalized.metaAction, title } : value) });
+        applied = true; return { queues: next };
+      });
+      return applied;
+    },
 
     addPrompt: (tabId, text, images, imagePaths, title, chips) => {
       const id = nextId();
@@ -1255,7 +1339,9 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
                   : p.imagePaths,
               };
           const text = normalized.text;
-          const images = typeof patch.text === 'string' || Array.isArray(patch.imagePaths)
+          const images = typeof patch.images === 'number'
+            ? Math.max(0, Math.floor(patch.images), countImages(text), normalized.imagePaths?.length ?? 0)
+            : typeof patch.text === 'string' || Array.isArray(patch.imagePaths)
             ? Math.max(
                 countImages(text),
                 normalized.imagePaths?.length ?? 0,
@@ -1267,10 +1353,8 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           const chips = Array.isArray(patch.chips)
             ? normalizeComposerChips(patch.chips) as QueuedComposerChip[]
             : (p.chips || []);
-          const defaultTitle = makeDefaultPromptTitle(serializeComposerDraft({
-            text,
-            chips,
-          }), images, chips.length);
+          const defaultTitle = p.metaAction ? queuedMetaActionDefaultTitle(p.metaAction)
+            : makeDefaultPromptTitle(serializeComposerDraft({ text, chips }), images, chips.length);
           let titleManual = !!p.titleManual;
           let title = p.title || defaultTitle;
           if (typeof patch.title === 'string') {
@@ -1446,6 +1530,28 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       });
     },
 
+    clearPromptTrigger: (tabId, promptId) => {
+      let applied = false;
+      setAndPersist(state => {
+        const cur = state.queues.get(tabId);
+        if (!cur?.items.some(item => item.id === promptId)) return state;
+        const items = cur.items.map(item => {
+          if (item.id !== promptId) return item;
+          const { trigger: _trigger, ...rest } = item; return rest;
+        });
+        const autoRun = shouldDisarmAfterTriggerClear({ runnableCount: countEnabledQueuedPrompts(items) }) ? false : cur.autoRun;
+        const headChanged = cur.items.find(isQueuedPromptEnabled)?.id === promptId;
+        const updated = { ...cur, items, autoRun,
+          firstDelayCountdownAt: headChanged || !autoRun ? null : cur.firstDelayCountdownAt,
+          workflowRestartPending: autoRun ? cur.workflowRestartPending : false };
+        const next = new Map(state.queues);
+        next.set(tabId, { ...updated, workflowArmedAt: retainedWorkflowArmedAt(cur, updated) });
+        if (!hasActiveQueueWorkflow(updated)) runtimeWorkflowArmTabs.delete(tabId);
+        applied = true; return { queues: next };
+      });
+      return applied;
+    },
+
     setPromptCondition: (tabId, promptId, condition) => {
       const normalized = normalizeQueuedPromptContextCondition(condition);
       setAndPersist((state) => {
@@ -1510,7 +1616,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         // Any user interaction with Run after acknowledges the hint — clear it
         // unconditionally. Re-arming only happens on the next 0→1 chip edge.
         const updated = {
-          ...cur,
+          ...(value ? cur : freezePromptQueueCountdown(cur)),
           autoRun: value,
           workflowRestartPending: value === cur.autoRun ? cur.workflowRestartPending : false,
           firstChipHintActive: false,
@@ -1670,12 +1776,8 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       setAndPersist((state) => {
         const cur = state.queues.get(tabId);
         if (!cur || cur.firstDelayCountdownAt === null) return state;
-        const remaining = getFirstDelayRemainingSeconds(
-          cur.firstDelaySeconds,
-          cur.firstDelayCountdownAt,
-        );
         const next = new Map(state.queues);
-        next.set(tabId, { ...cur, firstDelaySeconds: remaining, firstDelayCountdownAt: null });
+        next.set(tabId, freezePromptQueueCountdown(cur));
         return { queues: next };
       });
     },
@@ -1854,7 +1956,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           if (!workflow && !loop) continue;
           next.set(ownerTabId, { ...cur,
             ...(workflow ? { workflowRestartPending: false,
-              workflowArmedAt: Math.max(cur.workflowArmedAt || 0, rendererStartedAt) } : {}),
+              workflowOutcomeFloorAt: Math.max(cur.workflowOutcomeFloorAt || 0, rendererStartedAt) } : {}),
             ...(loop ? { loopRestartPending: false,
               loopPromptArmedAt: Math.max(cur.loopPromptArmedAt || 0, rendererStartedAt) } : {}),
           });
@@ -1900,9 +2002,10 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           // A user can deliberately re-arm after an old failure while restore is
           // still hydrating. Never let that stale outcome cancel the newer arm;
           // legacy queues without a timestamp remain fail-closed.
+          const outcomeFloor = promptQueueOutcomeFloor(cur);
           const disarmQueue = queueMatches && (
-            cur.workflowArmedAt === null
-            || (classifiedOutcomeTs !== null && cur.workflowArmedAt <= classifiedOutcomeTs)
+            outcomeFloor === null
+            || (classifiedOutcomeTs !== null && outcomeFloor <= classifiedOutcomeTs)
           );
           const disarmLoop = loopMatches && (
             cur.loopPromptArmedAt === null
@@ -2015,7 +2118,7 @@ const promptImageMaterializationInflight = new Map<string, Promise<{
   degraded?: boolean;
 }>>();
 
-async function materializeQueuedPromptRecord(item: QueuedPrompt): Promise<QueuedPrompt> {
+export async function materializeQueuedPromptRecord(item: QueuedPrompt): Promise<QueuedPrompt> {
   const normalized = normalizeQueuedPrompt(item);
   if (getQueuedPromptAttachmentState(normalized) === 'missing'
     && normalized.images > 0
@@ -2150,6 +2253,7 @@ type PersistedTabQueue = {
   loopPromptArmedAt?: number | null;
   runAfterTabId?: string | null;
   workflowArmedAt?: number | null;
+  workflowOutcomeFloorAt?: number | null;
   panelCollapsed?: boolean;
   previewId?: string | null;
 };
@@ -2169,6 +2273,7 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
           id,
           path: ref.path,
           assetId: typeof ref.assetId === 'string' ? ref.assetId : undefined,
+          sourcePath: typeof ref.sourcePath === 'string' ? ref.sourcePath : undefined,
           mediaType: typeof ref.mediaType === 'string' ? ref.mediaType : mediaTypeFromPath(ref.path),
           size: Number.isFinite(Number(ref.size)) ? Math.max(0, Number(ref.size)) : 0,
           availability,
@@ -2328,6 +2433,8 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     workflowArmedAt: entry.autoRun && typeof entry.workflowArmedAt === 'number' && Number.isFinite(entry.workflowArmedAt)
       ? Number(entry.workflowArmedAt)
       : null,
+    workflowOutcomeFloorAt: entry.autoRun && typeof entry.workflowOutcomeFloorAt === 'number' && Number.isFinite(entry.workflowOutcomeFloorAt)
+      ? entry.workflowOutcomeFloorAt : null,
     previewId,
   };
 }

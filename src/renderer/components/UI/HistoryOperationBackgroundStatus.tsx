@@ -34,9 +34,9 @@ export default function HistoryOperationBackgroundStatus() {
     const dismiss = () => dismissHistoryOperationActivity(view.id);
     return <BackgroundTabOperationChip key={view.id} label={label} tabName={view.tabName}
       pending={pending} failed={failed} details={view.message || view.phase}
-      onOpen={event => {
+      onOpen={async event => {
         event.stopPropagation();
-        if (openHistoryOperationOwner(useWorkspaceStore.getState(), view.tabId) && !pending) dismiss();
+        if (await openHistoryOperationOwner(useWorkspaceStore.getState(), view.tabId) && !pending) dismiss();
       }}
       onDismiss={!pending && jsonl.some(op => op.id === view.id) ? dismiss : undefined} />;
   })}</>;

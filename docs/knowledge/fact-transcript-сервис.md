@@ -160,7 +160,8 @@ read tickets всех файлов; frozen range обязан сохранить
 При restart+growth проверяется старый child prefix перед восстановлением cursor.
 Допись ancestor за замороженной границей не меняет логическую revision child.
 
-Удержание кэша ускорения ограничено2GiB на все sessions/версии, включая SQLite journals;
+С06.10 SOURCE удержание кэша ускорения ограничено20GiB на все sessions/версии,
+включая SQLite journals; единственный default — `history-cache-policy.js`.
 original JSONL не удаляется. Source/V8 schema, owner/cwd, inode/size/mtime/ctime,
 checksums и версии sidecars запрещают устаревший hit. Corruption/quota/недоступный
 cache → обычный canonical read в worker. После restart при выросшем источнике
@@ -171,6 +172,25 @@ cache → обычный canonical read в worker. После restart при в�
 quota-prune, не подтверждает сохранение. Кэш можно потерять без потери истории.
 Legacy payload caller без ожидаемого поколения всё равно проверяет текущий
 источник до RAM/SSD-hit; отсутствие этого аргумента не разрешает старый текст.
+
+Готовые rows, тяжёлые continuation/payload и компактные Timeline/source-proof
+хранятся тремя независимыми SQLite families одного owner. Prune сначала удаляет
+устаревшие схемы; среди тяжёлых файлов учитывает давность owner и защищает
+записываемый owner, у него checkpoint вытесняется перед rows. Compact Timeline
+и source certificate идут последними. Глобальное «все checkpoints первыми»
+оставляло бы старые страницы ценой постоянного rebuild рабочей сессии при append.
+Все tiers вместе ограничены20GiB; oversized/zero quota сохраняют canonical fallback.
+Invalidation источника отзывает все tiers owner, включая незавершённый async
+page-write. Corruption одной family не уничтожает независимую корректную family.
+Диагностика отдаёт cacheTier и отдельные obsolete/state/rows/timeline eviction counts.
+
+После удаления checkpoint неизменные History/Timeline могут прочитать готовые
+страницы без raw JSONL; новая допись при уже удалённом checkpoint законно
+потребует rebuild. При сохранённом checkpoint прежний suffix-only путь остаётся.
+Увеличение disk budget не увеличивает RAM budget и не резервирует20GiB сразу.
+Предупреждение о будущей нехватке — отдельный metadata-only сервис; оно не
+вызывает History, не запускает worker и не удаляет файлы. Формула/границы —
+[`fact-resource-usage-panel.md::Предупреждение о месте на диске`](fact-resource-usage-panel.md).
 
 Настроенный RAM-budget делится между read graphs, индексом (до32MiB) и прежним
 ускорителем mutation proof в main (до64MiB), а не выдаётся каждому второй раз.

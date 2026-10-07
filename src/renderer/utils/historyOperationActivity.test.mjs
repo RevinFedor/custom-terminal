@@ -38,7 +38,7 @@ test('operation survives owner unmount and completion never overwrites a newer o
   assert.equal(changes.length, 1);
 });
 
-test('background follows visible window contents, not focus, and navigation uses the operation owner', () => {
+test('background follows visible window contents, not focus, and navigation uses the operation owner', async () => {
   const state = workspaceState();
   assert.equal(historyOperationOwnerView(state, 'A').visible, false);
   state.splitPanes = [{ tabId: 'A' }, { tabId: 'B' }];
@@ -49,11 +49,28 @@ test('background follows visible window contents, not focus, and navigation uses
   state.splitPanes = [{ tabId: 'A' }];
   assert.equal(historyOperationOwnerView(state, 'A').visible, false);
   const calls = [];
-  for (const key of ['showWorkspace', 'setViewingSubAgent', 'placeTab', 'setProjectView']) {
-    state[key] = (...args) => calls.push([key, ...args]);
-  }
-  assert.equal(openHistoryOperationOwner(state, 'A'), true);
-  assert.deepEqual(calls, [['showWorkspace', 'P'], ['setViewingSubAgent', null],
-    ['placeTab', 'P', 'A'], ['setProjectView', 'P', 'terminal']]);
-  assert.equal(openHistoryOperationOwner(state, 'missing'), false);
+  state.openTabById = async (tabId, options) => {
+    calls.push([tabId, options]);
+    return tabId === 'A';
+  };
+  assert.equal(await openHistoryOperationOwner(state, 'A'), true);
+  assert.deepEqual(calls, [['A', { reason: 'history-operation-owner' }]]);
+  assert.equal(await openHistoryOperationOwner(state, 'missing'), false);
+});
+
+test('owner wrapper forwards legacy load hints and waits for the root result even without a local record', async () => {
+  let resolve;
+  const calls = [];
+  const state = { openTabById: (id, options) => {
+    calls.push([id, options]);
+    return new Promise(done => { resolve = done; });
+  } };
+  let finished = false;
+  const opening = openHistoryOperationOwner(state, 'unloaded', { projectId: 'legacy', reason: 'recording-owner' })
+    .then(result => { finished = true; return result; });
+  await Promise.resolve();
+  assert.equal(finished, false);
+  assert.deepEqual(calls, [['unloaded', { projectId: 'legacy', reason: 'recording-owner' }]]);
+  resolve(false);
+  assert.equal(await opening, false);
 });

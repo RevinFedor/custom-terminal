@@ -67,3 +67,36 @@ test('different projects do not block one another', async () => {
   hold.resolve();
   await a;
 });
+
+test('a multi-catalog close waits for earlier saves and reserves every touched catalog', async () => {
+  const queue = createProjectTabSaveQueue(), hold = deferred(), order = [];
+  const before = queue.enqueue('a', async () => { order.push('before'); await hold.promise; });
+  const close = queue.enqueueMany(['a', 'b'], async () => { order.push('close'); });
+  const after = queue.enqueue('b', async () => { order.push('after'); });
+  const unrelated = queue.enqueue('c', async () => { order.push('unrelated'); });
+  await unrelated;
+  assert.deepEqual(order, ['before', 'unrelated']);
+  assert.equal(queue.pending('a'), true); assert.equal(queue.pending('b'), true);
+  hold.resolve(); await Promise.all([before, close, after]);
+  assert.deepEqual(order, ['before', 'unrelated', 'close', 'after']);
+  assert.equal(queue.pending('a'), false); assert.equal(queue.pending('b'), false);
+});
+
+test('overlapping cohorts cannot overtake one another or deadlock, including a failure', async () => {
+  const queue = createProjectTabSaveQueue(), order = [];
+  const first = queue.enqueueMany(['b', 'a'], async () => { order.push('first'); throw Error('refused'); });
+  const second = queue.enqueueMany(['c', 'b'], async () => { order.push('second'); });
+  const third = queue.enqueue('a', async () => { order.push('third'); });
+  await assert.rejects(first, /refused/);
+  await Promise.all([second, third]);
+  assert.equal(order[0], 'first'); assert.ok(order.includes('second') && order.includes('third'));
+  assert.equal(queue.pending('a'), false); assert.equal(queue.pending('b'), false);
+});
+
+test('empty cohort is rejected; duplicate project identity does not reserve twice', async () => {
+  const queue = createProjectTabSaveQueue();
+  await assert.rejects(queue.enqueueMany([], () => {}), /projectId/);
+  let commits = 0;
+  await queue.enqueueMany(['a', 'a'], () => { commits++; });
+  assert.equal(commits, 1); assert.equal(queue.pending('a'), false);
+});

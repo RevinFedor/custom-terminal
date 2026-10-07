@@ -47,7 +47,7 @@ export default function WorkspaceNavigationRow({
         className="shrink-0 min-w-0"
         style={{ width: sidebarWidth }}
       >
-        {projectId && (
+        {projectId && !dashboard && (
           <SidebarToolsRow
             projectId={projectId}
             presentation={dashboard ? 'dashboard' : 'workspace'}

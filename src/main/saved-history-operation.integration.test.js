@@ -32,7 +32,7 @@ const richText = '<saved_prompt name="Rules" context-update-id="update-exact">Ke
   + '<context_file name="Design" path="/fixture/design.md" role="source" sha256="' + 'a'.repeat(64) + '" bytes="4">plan</context_file>\n'
   + '<pasted_content>' + 'pasted text '.repeat(100) + '</pasted_content>\nordinary [Image #1]';
 
-async function makeSource({ busy = false, onlyTurn = false } = {}) {
+async function makeSource({ busy = false, onlyTurn = false, afterCompactTail = false } = {}) {
   const sessionId = crypto.randomUUID();
   const dir = path.join(fixtureHome, 'sessions', '2026', '09', '13');
   await fs.promises.mkdir(dir, { recursive: true });
@@ -49,6 +49,10 @@ async function makeSource({ busy = false, onlyTurn = false } = {}) {
       { type: 'event_msg', payload: { type: 'task_complete' } });
   }
   if (busy) records.pop(); // Last task_started has no task_complete at Stop.
+  if (afterCompactTail) records.push({ type: 'compacted', payload: { summary: 'old future' } },
+    { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'orphan-future-final' }] } },
+    { type: 'response_item', payload: { type: 'function_call', name: 'future-tool', call_id: 'orphan-call', arguments: '{}' } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'orphan-call', output: 'orphan-output' } });
   records.forEach((record, index) => { record.timestamp = new Date(1789257600000 + index * 1000).toISOString(); });
   const filePath = path.join(dir, 'rollout-2026-09-13T00-00-00-' + sessionId + '.jsonl');
   await fs.promises.writeFile(filePath, records.map(r => JSON.stringify(r)).join('\n') + '\n');
@@ -75,7 +79,6 @@ test.before(async () => {
   const stubs = {
     '../store/useUIStore': 'export const useUIStore = {getState:()=>fixture.ui};',
     '../store/useWorkspaceStore': 'export const useWorkspaceStore = {getState:()=>fixture.workspace};',
-    './codexLaunch': 'export const getCodexHistoryMutationSettingsProof=()=>null; export const buildCodexRunPayload=x=>x; export const buildCodexHistoryMutationResumePayload=x=>x;',
     './claudePtyActions': 'export const stopClaudePtyProcess=()=>{throw Error("unexpected Claude");};',
   };
   const output = await esbuild.build({ entryPoints: [path.join(root, 'src/renderer/utils/historyRewriteRewind.ts')],
@@ -118,6 +121,7 @@ async function harness(options = {}) {
     return event;
   } });
   const events = [];
+  const executions = [];
   const rows = new Map();
   const db = { getAppState: key => rows.has(key) ? clone(rows.get(key)) : null,
     setAppState: (key, value) => rows.set(key, clone(value)), db: { transaction: fn => fn } };
@@ -146,11 +150,18 @@ async function harness(options = {}) {
   };
   const ui = { historyPromptDrafts: { 'tab-A': 'unrelated desktop draft' }, historyPromptDraftChips: {}, historyPromptDraftImages: {},
     setHistoryPromptDraft: (...args) => events.push(['desktop-draft-write', ...args]) };
-  const workspace = { setCodexSessionId: async (_tab, sessionId, _reason, settings) => {
+  const launchTab = {};
+  const workspace = { openProjects: new Map([['project', { tabs: new Map([['tab-A', launchTab]]) }]]),
+    setCodexSessionId: async (_tab, sessionId, _reason, settings) => {
     events.push(['adopt', sessionId, settings]);
     if (options.failAdopt) throw Error('binding transaction failed');
     if (settings.historyOperation) registry.commitCodexBinding({ ...settings.historyOperation, sessionId }, () => { state.sessionId = sessionId; });
     else state.sessionId = sessionId;
+    if (settings.codexSettingsProof) Object.assign(launchTab, {
+      codexModel: settings.codexSettingsProof.model, codexEffort: settings.codexSettingsProof.effort,
+      codexSettingsProofAt: settings.codexSettingsProof.proofAt,
+      codexSettingsProofSessionId: sessionId,
+    });
     return true;
   } };
   const ipc = { invoke: async (channel, args) => {
@@ -202,6 +213,7 @@ async function harness(options = {}) {
   dispatch: async (action, payload) => {
     events.push(['dispatch', action]);
     const execution = bridge(action, payload).finally(settled);
+    executions.push(execution);
     if (options.bridgeTimeout) {
       execution.catch(() => {});
       throw Object.assign(Error('simulated network reply lost'), { code: 'bridge_timeout' });
@@ -209,8 +221,10 @@ async function harness(options = {}) {
     return execution;
   }, deleteRange: async args => {
     if (options.beforeMutation) await options.beforeMutation(state, source);
-    return codex.deleteCodexRange(args);
-  }, buildTimeline: codex.buildCodexTimeline, broadcast: (_tab, data) => events.push(['receipt', data.operation.phase]) });
+    if (options.failRewrite) throw Error('controlled rewrite failure');
+    return codex.deleteCodexRange(options.legacySuffix ? { ...args, toPhysicalEnd: false } : args);
+  }, inspectRepair: codex.inspectCodexSavedRewindRepair, hashRecords: codex.codexRepairRecordsHash,
+    buildTimeline: codex.buildCodexTimeline, broadcast: (_tab, data) => events.push(['receipt', data.operation.phase]) });
 
   // The real HTTP route, readBody and sendJson, without starting Electron/API.
   const web = read('src/main/web-server.js');
@@ -254,7 +268,8 @@ async function harness(options = {}) {
     return { status: r.status, ...(await r.json()) };
   };
   const close = () => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); });
-  return { source, events, state, registry, request, post, done, close, db, transcript, forkEvents, inbox, inboxOptions,
+  return { source, events, state, registry, request, post, done, close, db, transcript, forkEvents, inbox, inboxOptions, launchTab, ui,
+    finish: () => executions.at(-1),
     get: async () => { const r = await fetch(base + '/' + request.operationId); return { status: r.status, ...(await r.json()) }; } };
 }
 
@@ -290,6 +305,212 @@ for(const negative of ['unconfirmedAudit','pendingNative','wrongTarget','ownerBe
     assert.equal(h.events.some(e=>e[0]==='launch-write'),false);
   }finally{await h.close();}
 });
+
+test('actual HTTP/executor/COW removes orphan future after compact and retains the full draft without submitting it', async () => {
+  const h = await harness({ afterCompactTail: true });
+  try {
+    assert.equal((await h.post()).status, 202);
+    await h.done;
+    const reply = await h.get();
+    assert.equal(reply.status, 200, JSON.stringify(reply));
+    assert.equal(reply.operation.suffixProof.kind, 'physical-suffix');
+    assert.equal(reply.operation.bindingCommitted, true);
+    assert.equal(reply.operation.resume.status, 'starting');
+    const bytes = await fs.promises.readFile((await codex.findCodexSessionFile(reply.operation.newSessionId, '/fixture')).filePath, 'utf8');
+    assert.equal(bytes.includes('orphan-future-final'), false);
+    assert.equal(bytes.includes('orphan-call'), false);
+    const child = await codex.loadSessionRecords(reply.operation.newSessionId, '/fixture');
+    assert.deepEqual(codex.buildCodexTimeline(child.records, reply.operation.newSessionId)
+      .filter(entry => entry.type === 'user').map(entry => entry.content), ['keep']);
+    assert.deepEqual(await fs.promises.readFile(h.source.filePath), h.source.bytes);
+    assert.equal(h.events.some(event => /paste|send-prompt|rewind-native/.test(event[0])), false);
+    assert.equal((await h.post()).operation.idempotent, true);
+    assert.equal(h.events.filter(event => event[0] === 'dispatch').length, 1);
+  } finally { await h.close(); }
+});
+
+test('repairOfOperationId repairs one legacy-shaped completed COW through the same executor without rewriting its receipt/source/child', async () => {
+  const options = { afterCompactTail: true, legacySuffix: true };
+  const h = await harness(options);
+  try {
+    assert.equal((await h.post()).status, 202);
+    await h.done;
+    const previous = h.registry.read('tab-A', h.request.operationId);
+    assert.equal(previous.state, 'completed');
+    const badChild = await codex.findCodexSessionFile(previous.newSessionId, '/fixture');
+    const badBytes = await fs.promises.readFile(badChild.filePath);
+    assert.equal(badBytes.toString().includes('orphan-future-final'), true);
+    const previousJson = JSON.stringify(previous);
+    options.legacySuffix = false;
+    h.state.isRunning = false;
+    h.state.launchId = null;
+    const repair = { ...h.request, operationId: 'repair-legacy-cow-v1', expectedSessionId: previous.newSessionId,
+      repairOfOperationId: previous.operationId };
+    const accepted = await h.post(repair);
+    assert.equal(accepted.status, 202, JSON.stringify(accepted));
+    await h.finish();
+    const result = h.registry.read('tab-A', repair.operationId);
+    assert.equal(result.state, 'completed', JSON.stringify(result));
+    assert.equal(result.repair.repairOfOperationId, previous.operationId);
+    const child = await codex.findCodexSessionFile(result.newSessionId, '/fixture');
+    const bytes = await fs.promises.readFile(child.filePath, 'utf8');
+    assert.equal(bytes.includes('orphan-future-final'), false);
+    assert.equal(bytes.includes('orphan-call'), false);
+    assert.deepEqual(await fs.promises.readFile(badChild.filePath), badBytes);
+    assert.deepEqual(await fs.promises.readFile(h.source.filePath), h.source.bytes);
+    assert.equal(JSON.stringify(h.registry.read('tab-A', previous.operationId)), previousJson);
+    assert.equal((await h.post(repair)).operation.idempotent, true);
+    assert.equal(h.events.filter(event => event[0] === 'dispatch').length, 2);
+    assert.equal(h.events.some(event => /paste|send-prompt|rewind-native/.test(event[0])), false);
+  } finally { await h.close(); }
+});
+
+test('failed repair after Stop resumes the incumbent child, not its mutation parent', async () => {
+  const options = { afterCompactTail: true, legacySuffix: true };
+  const h = await harness(options);
+  try {
+    await h.post(); await h.done;
+    const previous = h.registry.read('tab-A', h.request.operationId);
+    const oldChild = await codex.findCodexSessionFile(previous.newSessionId, '/fixture');
+    const bytes = await fs.promises.readFile(oldChild.filePath);
+    const priorReceipt = JSON.stringify(previous);
+    options.legacySuffix = false;
+    options.failRewrite = true;
+    h.state.isRunning = true;
+    h.state.launchId = 'incumbent-child-launch';
+    const begin = h.events.length;
+    const repair = { ...h.request, operationId: 'repair-write-failure',
+      expectedSessionId: previous.newSessionId, repairOfOperationId: previous.operationId };
+    assert.equal((await h.post(repair)).status, 202);
+    await h.finish();
+    const failed = h.registry.read('tab-A', repair.operationId);
+    assert.equal(failed.state, 'failed');
+    assert.equal(h.state.sessionId, previous.newSessionId);
+    assert.equal(h.state.isRunning, true);
+    assert.deepEqual(h.events.slice(begin).filter(e => e[0] === 'launch-write').map(e => e[1]), [previous.newSessionId]);
+    assert.deepEqual(await fs.promises.readFile(oldChild.filePath), bytes);
+    assert.equal(JSON.stringify(h.registry.read('tab-A', previous.operationId)), priorReceipt);
+    assert.equal(h.events.slice(begin).some(e => /paste|send-prompt/.test(e[0])), false);
+  } finally { await h.close(); }
+});
+
+for (const failRewrite of [false, true]) test('actual HTTP repair accepts equivalent native Resume append; child pair survives ' + (failRewrite ? 'failure Resume with stale UI' : 'COW/adoption'), async () => {
+  const options = { afterCompactTail: true, legacySuffix: true };
+  const h = await harness(options);
+  try {
+    await h.post(); await h.done;
+    const previous = h.registry.read('tab-A', h.request.operationId);
+    assert.equal(previous.resume.launchWritten, true);
+    const child = await codex.findCodexSessionFile(previous.newSessionId, '/fixture');
+    const snapshot = await fs.promises.readFile(child.filePath);
+    const priorReceipt = JSON.stringify(previous);
+    // Native provider bootstrap appends this fact without a user prompt.
+    const record = { type: 'event_msg', timestamp: new Date(Date.now() + 1000).toISOString(),
+      payload: { type: 'thread_settings_applied', thread_settings: {
+        model: 'gpt-5.6-luna', reasoning_effort: 'medium', cwd: '/fixture', thread_id: previous.newSessionId,
+      } } };
+    await fs.promises.appendFile(child.filePath, JSON.stringify(record) + '\n');
+    const childBytes = await fs.promises.readFile(child.filePath);
+    assert.equal(childBytes.length > snapshot.length, true);
+    options.legacySuffix = false; options.failRewrite = failRewrite;
+    h.state.isRunning = true; h.state.launchId = 'resume-bootstrap-child';
+    // Exercise the REAL codexLaunch helpers, with a stale/missing renderer
+    // proof and an unrelated global pair. Main's exact child proof wins.
+    delete h.launchTab.codexSettingsProofAt;
+    delete h.launchTab.codexModel; delete h.launchTab.codexEffort;
+    h.ui.defaultCodexModel = 'gpt-5.6-sol'; h.ui.defaultCodexEffort = 'high';
+    if (failRewrite) Object.assign(h.launchTab, {
+      codexModel: 'gpt-5.6-sol', codexEffort: 'high',
+      codexSettingsProofSessionId: previous.newSessionId, codexSettingsProofAt: previous.createdAt,
+    }); // A stale same-SID renderer proof is not stronger than the exact file.
+    const start = h.events.length;
+    const repair = { ...h.request, operationId: 'resume-settings-' + failRewrite,
+      expectedSessionId: previous.newSessionId, repairOfOperationId: previous.operationId };
+    assert.equal((await h.post(repair)).status, 202);
+    await h.finish();
+    const result = h.registry.read('tab-A', repair.operationId);
+    assert.equal(result.state, failRewrite ? 'failed' : 'completed', JSON.stringify(result));
+    const launches = h.events.slice(start).filter(e => e[0] === 'codex:run-command');
+    assert.equal(launches.length, 1);
+    assert.equal(launches[0][1].sessionId, failRewrite ? previous.newSessionId : result.newSessionId);
+    assert.equal(launches[0][1].model, 'gpt-5.6-luna');
+    assert.equal(launches[0][1].effort, 'medium');
+    if (!failRewrite) {
+      assert.equal(result.repair.resumeSettingsRecords, 1);
+      const fresh = await codex.loadSessionRecords(result.newSessionId, '/fixture');
+      assert.equal(fresh.records.some(r => JSON.stringify(r).includes('orphan-future-final')), false);
+      const pair = require('./codex-source-settings').resolveCodexSourceSettingsProof(fresh.records, result.newSessionId);
+      assert.equal(pair.model, 'gpt-5.6-luna'); assert.equal(pair.effort, 'medium');
+    }
+    assert.deepEqual(await fs.promises.readFile(child.filePath), childBytes);
+    assert.deepEqual(await fs.promises.readFile(h.source.filePath), h.source.bytes);
+    assert.equal(JSON.stringify(h.registry.read('tab-A', previous.operationId)), priorReceipt);
+    assert.equal(h.events.slice(start).some(e => /paste|send-prompt|rewind-native/.test(e[0])), false);
+  } finally { await h.close(); }
+});
+
+test('direct HTTP rejects a public ref with a conflicting nested revision before persistence or dispatch', async () => {
+  const h = await harness({ composite: true });
+  try {
+    const rejected = await h.post({ ...h.request,
+      targetEntryRef: { ...h.request.targetEntryRef, contentRevision: 'stale-nested-revision' } });
+    assert.equal(rejected.status, 409);
+    assert.equal(rejected.error, 'history_revision_invalid');
+    assert.equal(h.events.some(e => e[0] === 'dispatch'), false);
+    assert.equal(h.registry.read('tab-A', h.request.operationId), null);
+    assert.equal(h.state.isRunning, true);
+  } finally { await h.close(); }
+});
+
+for (const variant of ['foreign-receipt', 'child-new-user', 'source-prefix-edited', 'child-before-write', 'composite-missing-revision']) {
+  test('repairOfOperationId refuses unsafe state without losing source/child/draft: ' + variant, async () => {
+    const options = { afterCompactTail: true, legacySuffix: true };
+    const h = await harness(options);
+    try {
+      await h.post(); await h.done;
+      const previous = h.registry.read('tab-A', h.request.operationId);
+      const badChild = await codex.findCodexSessionFile(previous.newSessionId, '/fixture');
+      options.legacySuffix = false;
+      h.state.isRunning = false; h.state.launchId = null;
+      if (variant === 'composite-missing-revision') {
+        const read = h.transcript.getTimeline.bind(h.transcript);
+        h.transcript.getTimeline = async (...args) => ({ ...await read(...args), composite: true });
+      }
+      if (variant === 'child-new-user') await fs.promises.appendFile(badChild.filePath,
+        JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'new work must survive' } }) + '\n');
+      if (variant === 'source-prefix-edited') await fs.promises.writeFile(h.source.filePath,
+        (await fs.promises.readFile(h.source.filePath, 'utf8')).replace('"message":"keep"', '"message":"changed"'));
+      if (variant === 'child-before-write') options.beforeMutation = async () => {
+        await fs.promises.appendFile(badChild.filePath, JSON.stringify({ type: 'event_msg',
+          payload: { type: 'user_message', message: 'late work must survive' } }) + '\n');
+      };
+      const sourceBefore = await fs.promises.readFile(h.source.filePath);
+      const receiptBefore = JSON.stringify(previous);
+      const eventsBefore = h.events.length;
+      const repair = { ...h.request, operationId: 'unsafe-repair-' + variant, expectedSessionId: previous.newSessionId,
+        repairOfOperationId: variant === 'foreign-receipt' ? 'foreign-operation' : previous.operationId };
+      const response = await h.post(repair);
+      if (variant === 'foreign-receipt') assert.equal(response.status, 409);
+      else {
+        assert.equal(response.status, 202);
+        await h.finish();
+        const failed = h.registry.read('tab-A', repair.operationId);
+        assert.equal(failed.state, 'failed', JSON.stringify(failed));
+        assert.equal(failed.historyMutated, false);
+        assert.equal(failed.bindingCommitted, false);
+        if (variant === 'composite-missing-revision') assert.equal(failed.error, 'history_target_partial_identity');
+      }
+      assert.equal(h.state.sessionId, previous.newSessionId);
+      assert.deepEqual(await fs.promises.readFile(h.source.filePath), sourceBefore);
+      assert.equal(JSON.stringify(h.registry.read('tab-A', previous.operationId)), receiptBefore);
+      assert.deepEqual(h.events.slice(eventsBefore).filter(event => event[0] === 'launch-write').map(event => event[1]),
+        variant === 'child-before-write' ? [previous.newSessionId] : []);
+      if (variant === 'child-new-user' || variant === 'child-before-write') {
+        assert.equal((await fs.promises.readFile(badChild.filePath, 'utf8')).includes('work must survive'), true);
+      }
+    } finally { await h.close(); }
+  });
+}
 
 for (const initial of ['idle', 'busy', 'stopped']) {
   test('HTTP -> actual App bridge -> shared Rewind -> real JSONL writer: ' + initial, async () => {

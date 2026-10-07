@@ -194,7 +194,9 @@ export async function executeHistoryRewriteRewindScenario({
   let codexChildAdopted = false;
   let mutationSessionId = sessionId;
   let preparedMutationSessionId: string | null = null;
+  let preparedIncumbentSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
   let codexSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
+  let incumbentSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
   try {
     if (operation) {
       const prepared = await checkpoint('prepare');
@@ -204,6 +206,7 @@ export async function executeHistoryRewriteRewindScenario({
       target = prepared.target;
       cwd = prepared.cwd;
       preparedMutationSessionId = prepared.mutationSessionId || null;
+      preparedIncumbentSettingsProof = prepared.incumbentCodexSettingsProof || null;
     }
     const range = await resolveCurrentRange({
       tabId,
@@ -224,6 +227,7 @@ export async function executeHistoryRewriteRewindScenario({
       : null;
 
     if (toolType === 'codex') {
+      incumbentSettingsProof = preparedIncumbentSettingsProof || getCodexHistoryMutationSettingsProof(tabId, sessionId);
       codexSettingsProof = getCodexHistoryMutationSettingsProof(tabId, mutationSessionId);
       const preflight = await ipcRenderer.invoke('codex:delete-range', {
         sessionId: mutationSessionId,
@@ -231,15 +235,17 @@ export async function executeHistoryRewriteRewindScenario({
         startUuid: target.uuid,
         endUuid: range.endUuid,
         validateOnly: true,
+        toPhysicalEnd: rangeMode === 'tail',
         ...(codexSettingsProof ? { codexSettingsProof } : {}),
       });
       if (!preflight?.success) {
         throw new Error(preflight?.error || 'Codex Rewind validation failed');
       }
       codexSettingsProof = preflight.codexSettingsProof || codexSettingsProof;
+      if (mutationSessionId === sessionId) incumbentSettingsProof = codexSettingsProof;
       activity.setPhase('stopping');
       const stop = await checkpoint('stopping');
-      await stopCodexForHistoryRewrite(tabId, mutationSessionId, stop.authority);
+      await stopCodexForHistoryRewrite(tabId, sessionId, stop.authority);
     } else {
       activity.setPhase('stopping');
       const stop = await checkpoint('stopping');
@@ -259,7 +265,7 @@ export async function executeHistoryRewriteRewindScenario({
         'codex:reconcile-native-rewind-before-history-rewrite',
         {
           tabId,
-          sessionId: mutationSessionId,
+          sessionId,
         },
       );
       if (nativeRewindRecovery?.success !== true) {
@@ -282,6 +288,7 @@ export async function executeHistoryRewriteRewindScenario({
           cwd,
           startUuid: target.uuid,
           endUuid: range.endUuid,
+          ...(toolType === 'codex' ? { toPhysicalEnd: rangeMode === 'tail' } : {}),
           ...(toolType === 'codex' && codexSettingsProof ? { codexSettingsProof } : {}),
         });
     if (toolType === 'claude' && result?.committed === true) historyMutated = true;
@@ -417,10 +424,10 @@ export async function executeHistoryRewriteRewindScenario({
             {
               tabId,
               command: 'codex-c',
-              sessionId: mutationSessionId,
+              sessionId,
               cwd,
             },
-            codexSettingsProof,
+            incumbentSettingsProof,
           ), ...resumeScope });
           if (restored?.success === false || restored?.accepted === false) {
             throw new Error(restored?.error || restored?.reason || 'Codex source restart failed');

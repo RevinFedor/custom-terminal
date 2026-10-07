@@ -56,15 +56,6 @@ export function historyOperationOwnerView(state, tabId) {
   return { projectId, tabName: tab?.name || tabId, visible, exists: !!tab };
 }
 
-export function openHistoryOperationOwner(state, tabId) {
-  const owner = historyOperationOwnerView(state, tabId);
-  if (!owner.exists) return false;
-  state.showWorkspace(owner.projectId);
-  state.setViewingSubAgent(null);
-  // Placement is decided before the activation pointer changes. switchTab
-  // writes activeSpaceTab first, which can make a tab from another workflow
-  // look as though it already belongs to the current split window.
-  state.placeTab(owner.projectId, tabId);
-  state.setProjectView(owner.projectId, 'terminal');
-  return true;
+export async function openHistoryOperationOwner(state, tabId, options = {}) {
+  return await state.openTabById(tabId, { reason: 'history-operation-owner', ...options });
 }

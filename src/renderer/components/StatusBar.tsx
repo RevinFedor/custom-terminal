@@ -4,6 +4,7 @@ import { History, Pin, Settings } from 'lucide-react';
 import { useUIStore } from '../store/useUIStore';
 import { useUsageVisibilityStore } from '../store/useUsageVisibilityStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import { useProjectsStore } from '../store/useProjectsStore';
 import type { CodexModelOption } from '../constants/codexSettings';
 import {
   CODEX_EFFORT_LEVELS,
@@ -231,6 +232,10 @@ const MCP_ACTIVE_STATUSES = new Set(['running', 'creating', 'sending', 'pasting'
 function McpActivityChip() {
   const [events, setEvents] = useState<McpActivityEvent[]>([]);
   const [open, setOpen] = useState(false);
+  useWorkspaceStore(state => events.map(event => [targetLabel(event, state),
+    sourceLabel(event.sourceMeta, state)].join('\0')).join('\n'));
+  useProjectsStore(state => events.map(event => [targetLabel(event, useWorkspaceStore.getState(), state.projects),
+    sourceLabel(event.sourceMeta, useWorkspaceStore.getState(), state.projects)].join('\0')).join('\n'));
   const chipRef = useRef<HTMLButtonElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
 
@@ -262,9 +267,9 @@ function McpActivityChip() {
 
   const latest = events[0];
   const hasActive = events.some(e => MCP_ACTIVE_STATUSES.has(e.status));
-  const dotColor = hasActive ? '#f59e0b' : latest ? statusColor(latest.status) : '#444';
+  const dotColor = hasActive ? '#f59e0b' : '#777';
   const chipTitle = latest
-    ? `${actionLabel(latest.action)}: ${latest.status}`
+    ? `Журнал MCP · ${actionLabel(latest.action)} · ${timeLabel(latest.at)}`
     : 'Нет управляющих terminal MCP вызовов в этой сессии UI';
 
   return (
@@ -326,11 +331,11 @@ function McpActivityPopup({ chipRect, popupRef, events, onFocusTarget }: {
     >
       <div
         className="bg-[#1a1a1a] border border-[#444] rounded shadow-2xl"
-        style={{ width: 420, maxHeight: 360, overflow: 'hidden', boxShadow: '0 -8px 24px rgba(0,0,0,0.5)' }}
+        style={{ width: Math.min(420, window.innerWidth - 12), maxHeight: 360, overflow: 'hidden', boxShadow: '0 -8px 24px rgba(0,0,0,0.5)' }}
       >
         <div className="flex items-center justify-between border-b border-[#333]" style={{ padding: '8px 10px' }}>
-          <span style={{ color: '#ddd', fontWeight: 700, fontSize: 11, letterSpacing: 0.4 }}>TERMINAL MCP</span>
-          <span style={{ color: '#666', fontSize: 11 }}>{events.length ? `${events.length} events` : 'idle'}</span>
+          <span style={{ color: '#ddd', fontWeight: 700, fontSize: 11 }}>ЖУРНАЛ MCP</span>
+          <span style={{ color: '#666', fontSize: 11 }}>{events.length || ''}</span>
         </div>
         {events.length === 0 ? (
           <div style={{ padding: 12, color: '#777', fontSize: 12 }}>
@@ -357,27 +362,25 @@ function McpActivityPopup({ chipRect, popupRef, events, onFocusTarget }: {
                   }}
                 >
                   <div className="flex items-center justify-between" style={{ gap: 8 }}>
-                    <span style={{ color: statusColor(event.status), fontWeight: 700, fontSize: 12 }}>
-                      {actionLabel(event.action)} · {event.status}
+                    <span style={{ color: statusColor(event.status), fontWeight: 700, fontSize: 12, minWidth: 0,
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={event.error}>
+                      {actionLabel(event.action)} · {event.error || event.status}
                     </span>
                     <span style={{ color: '#666', fontSize: 10, fontVariantNumeric: 'tabular-nums' }}>{timeLabel(event.at)}</span>
                   </div>
-                  <div style={{ color: '#999', fontSize: 11, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  <div title={[event.targetProjectId, event.tabId, event.targetCwd].filter(Boolean).join('\n')}
+                    style={{ color: '#ddd', fontSize: 11, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {targetLabel(event)}
                   </div>
-                  <div style={{ color: '#666', fontSize: 11, marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    from {sourceLabel(event.sourceMeta)}
+                  <div title={[event.sourceMeta?.projectId, event.sourceMeta?.tabId, event.sourceMeta?.cwd].filter(Boolean).join('\n')}
+                    style={{ color: '#999', fontSize: 11, marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    Из {sourceLabel(event.sourceMeta)}
                     {event.engine ? ` · ${event.engine}` : ''}
                     {event.mode ? `/${event.mode}` : ''}
                     {typeof event.promptChars === 'number' ? ` · ${event.promptChars} chars` : ''}
                     {typeof event.stepCount === 'number' ? ` · ${event.stepCount} steps` : ''}
                     {event.commandPreview ? ` · ${event.commandPreview}` : ''}
                   </div>
-                  {event.error && (
-                    <div style={{ color: '#ef4444', fontSize: 11, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {event.error}
-                    </div>
-                  )}
                 </button>
               );
             })}
@@ -392,13 +395,11 @@ async function focusMcpTarget(event: McpActivityEvent) {
   const store = useWorkspaceStore.getState();
   let projectId = event.targetProjectId || '';
 
-  if (!projectId && event.tabId) {
-    for (const [pid, ws] of store.openProjects) {
-      if (ws.tabs.has(event.tabId)) {
-        projectId = pid;
-        break;
-      }
-    }
+  if (event.tabId) {
+    await store.openTabById(event.tabId, {
+      projectId: event.targetProjectId, projectPath: event.targetCwd, reason: 'mcp-activity-target',
+    });
+    return;
   }
 
   if (!projectId && event.targetCwd) {
@@ -418,13 +419,12 @@ async function focusMcpTarget(event: McpActivityEvent) {
   if (!projectId) return;
   const latest = useWorkspaceStore.getState();
   if (!latest.openProjects.has(projectId) && event.targetCwd) {
-    await Promise.resolve((latest.openProject as any)(projectId, event.targetCwd, { background: false }));
+    await latest.openProject(projectId, event.targetCwd, { background: false });
   } else {
     latest.showWorkspace(projectId);
   }
   const after = useWorkspaceStore.getState();
   after.setProjectView(projectId, 'terminal');
-  if (event.tabId) after.switchTab(projectId, event.tabId);
 }
 
 function actionLabel(action: string): string {
@@ -448,24 +448,30 @@ function statusColor(status: string): string {
   return '#888';
 }
 
-function targetLabel(event: McpActivityEvent): string {
-  const target = event.targetName || event.tabId || event.targetProjectId || event.targetCwd || 'unknown target';
-  const project = event.targetProjectId ? `project ${shortId(event.targetProjectId)}` : '';
-  const tab = event.tabId ? `tab ${shortId(event.tabId)}` : '';
-  return [target, project, tab].filter(Boolean).join(' · ');
+function mcpPartyLabel(tabId?: string, projectId?: string, cwd?: string, name?: string,
+  state = useWorkspaceStore.getState(), projects = useProjectsStore.getState().projects): string {
+  let tabName = name || '';
+  if (tabId) for (const [id, ws] of state.openProjects) {
+    const tab = ws.tabs.get(tabId);
+    if (!tab) continue;
+    projectId = id;
+    tabName = tab.name || tabName;
+    cwd = ws.projectPath || cwd;
+    break;
+  }
+  const projectName = (projectId && projects[projectId]?.name) || cwd?.split('/').filter(Boolean).at(-1) || '';
+  return [tabName || (tabId ? 'Вкладка' : ''), projectName].filter(Boolean).join(' · ');
 }
 
-function sourceLabel(source?: McpActivitySource | null): string {
-  if (!source) return 'unknown';
-  const mode = source.mode || 'unknown';
-  const tab = source.tabId ? ` tab ${shortId(source.tabId)}` : '';
-  const project = source.projectId ? ` project ${shortId(source.projectId)}` : '';
-  const cwd = source.cwd ? ` ${source.cwd}` : '';
-  return `${source.server || 'terminal'}:${mode}${project}${tab}${cwd}`;
+function targetLabel(event: McpActivityEvent, state = useWorkspaceStore.getState(),
+  projects = useProjectsStore.getState().projects): string {
+  return mcpPartyLabel(event.tabId, event.targetProjectId, event.targetCwd, event.targetName, state, projects) || 'Цель не указана';
 }
 
-function shortId(id: string): string {
-  return id.length > 8 ? id.slice(-8) : id;
+function sourceLabel(source?: McpActivitySource | null, state = useWorkspaceStore.getState(),
+  projects = useProjectsStore.getState().projects): string {
+  if (!source) return 'источник не указан';
+  return mcpPartyLabel(source.tabId, source.projectId, source.cwd, '', state, projects) || source.server || 'внешний MCP';
 }
 
 function timeLabel(ms: number): string {

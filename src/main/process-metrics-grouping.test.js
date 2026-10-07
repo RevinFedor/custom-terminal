@@ -3,9 +3,61 @@
 const assert = require('node:assert');
 const test = require('node:test');
 
-const { groupProcessMetrics, describeTool, describeAgent, describeCommand, isSharedService } = require('./process-metrics-grouping');
+const { groupProcessMetrics, describeTool, describeAgent, describeCommand, isSharedService, isToolProcess } = require('./process-metrics-grouping');
 
 const MB = 1024 * 1024;
+
+test('MCP launcher определяется по выполняемому пакету, не по uv/npx/python', () => {
+  const examples = [
+    ['uv tool uvx yandex-wiki-search-mcp@0.5.0', '/opt/homebrew/bin/uv'],
+    ['uvx yandex-wiki-search-mcp', '/opt/homebrew/bin/uv'],
+    ['uv tool run --from wiki-package yandex-wiki-search-mcp', '/opt/homebrew/bin/uv'],
+    ['npx -y example-mcp@1.2.3', '/usr/local/bin/npx'],
+    ['npm exec -- example-mcp', '/usr/local/bin/npm'],
+    ['pnpm dlx @example/example-mcp', '/usr/local/bin/pnpm'],
+    ['python -m yandex_wiki_search_mcp.server', '/usr/bin/python3.11'],
+  ];
+  for (const [commandLine, execPath] of examples) {
+    assert.equal(isToolProcess({ commandLine, execPath }), true, commandLine);
+  }
+  for (const [commandLine, execPath] of [
+    ['uv run worker.py', '/opt/homebrew/bin/uv'],
+    ['uv run --with mcp python worker.py', '/opt/homebrew/bin/uv'],
+    ['uv pip install example-mcp', '/opt/homebrew/bin/uv'],
+    ['npx -y vite', '/usr/local/bin/npx'],
+    ['npm run dev', '/usr/local/bin/npm'],
+    ['rg yandex-wiki-search-mcp source', '/usr/bin/rg'],
+    ['python -c "print(1)" example-mcp', '/usr/bin/python3.11'],
+  ]) assert.equal(isToolProcess({ commandLine, execPath }), false, commandLine);
+  assert.equal(describeTool({ commandLine: examples[0][0], execPath: examples[0][1] }), 'Yandex Wiki');
+  assert.equal(describeTool({ commandLine: 'node /Users/x/.codex/mcp/figma-console/node_modules/figma-console-mcp/dist/local.js' }), 'Figma Console');
+  assert.equal(describeCommand({ commandLine: 'uv run worker.py' }), 'uv run worker.py');
+  assert.equal(describeCommand({ commandLine: 'python /x/worker.py' }), 'worker.py');
+});
+
+test('повторные MCP с разными PID остаются своими строками, командный итог их не включает', () => {
+  const snapshot = snapshotOf([
+    procCmd(2400, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(2401, 2400, 100, '/usr/bin/codex'),
+    procCmd(2402, 2401, 4, 'uv tool uvx yandex-wiki-search-mcp', '/opt/homebrew/bin/uv'),
+    procCmd(2403, 2402, 84, 'python /cache/bin/yandex-wiki-search-mcp', '/usr/bin/python3.11'),
+    procCmd(2404, 2401, 54, 'node /x/figma-console-mcp/dist/local.js', '/usr/bin/node'),
+    procCmd(2405, 2401, 30, 'npm run dev'),
+    procCmd(2410, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(2411, 2410, 100, '/usr/bin/codex'),
+    procCmd(2412, 2411, 4, 'uvx yandex-wiki-search-mcp', '/opt/homebrew/bin/uv'),
+    procCmd(2413, 2412, 83, 'python /cache/bin/yandex-wiki-search-mcp', '/usr/bin/python3.11'),
+  ]);
+  const result = groupProcessMetrics({ snapshot, tabs: [{ tabId: 'a', pid: 2400, projectId: 'p1' },
+    { tabId: 'b', pid: 2410, projectId: 'p2' }], projectId: 'p1', cpuByPid: new Map(snapshot.processes.map(p=>[p.pid,1])) });
+  const a=result.projectTabs[0],b=result.otherTabs[0];
+  assert.deepEqual(a.tools.map(t=>[t.label,t.bytes]),[['Yandex Wiki',88*MB],['Figma Console',54*MB]]);
+  assert.equal(a.commandTotalBytes,30*MB);assert.equal(a.commandTotalCpu,1);
+  assert.equal(b.tools[0].label,'Yandex Wiki');assert.equal(b.tools[0].bytes,87*MB);
+  assert.notEqual(a.tools[0].pid,b.tools[0].pid);assert.equal(b.commandTotalBytes,0);
+  assert.equal(result.totals.allBytes,465*MB);
+  assert.equal(result.totals.commandBytes,30*MB);
+});
 
 test('deploy shell-скрипт учитывает полное поддерево как команду, sh -c остаётся обёрткой', () => {
   const snapshot = snapshotOf([

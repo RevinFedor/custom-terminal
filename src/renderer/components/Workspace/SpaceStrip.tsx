@@ -110,6 +110,7 @@ function SpaceChip({
   onRename: (id: string, name: string) => void;
 } & SpaceActivityProps) {
   const chipRef = useRef<HTMLSpanElement | null>(null);
+  const workspaceVisible = useWorkspaceStore((state) => state.view === 'workspace');
   const sendPendingTabs = useAgentSendPendingTabs();
   // Metadata подписана по одному workflow. Родитель держит только fingerprint
   // списка id, поэтому выбор большой data-URL иконки не заставляет всю полосу
@@ -207,7 +208,7 @@ function SpaceChip({
   }, [active]);
   const [draft, setDraft] = useState('');
   const renameInput = useInlineRenameInputRef(renaming);
-  const canDelete = useWorkspaceStore((s) => s.spaces.length > 1);
+  const canDelete = useWorkspaceStore((s) => s.spaces.length > 1 && s.spaces.find(space => space.id === id)?.kind !== 'inbox');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const navigationTarget = useTabDragNavigationSnapshot().target;
   const paneTabNavigationTarget = navigationTarget?.kind === 'workflow'
@@ -314,7 +315,7 @@ function SpaceChip({
           setPointerHeld(true);
           return;
         }
-        if (e.button !== 0 || renaming || active || switchQueuedRef.current) return;
+        if (e.button !== 0 || renaming || (active && workspaceVisible) || switchQueuedRef.current) return;
         // Pointerdown is the first trustworthy acknowledgement of the user's
         // intent. It normally precedes click by many frames, so the active-like
         // background is already painted by mouseup instead of waiting behind
@@ -337,11 +338,16 @@ function SpaceChip({
           selectWorkspaceWindowSwapTarget(id);
           return;
         }
-        if (renaming || active || switchQueuedRef.current) return;
+        if (renaming || (active && workspaceVisible) || switchQueuedRef.current) return;
         switchQueuedRef.current = true;
         if (!pending) setPending(true);
         const commitSwitch = () => {
           useWorkspaceStore.getState().switchWorkspaceSpace(id);
+          if (useWorkspaceStore.getState().activeSpaceId === id
+            && useWorkspaceStore.getState().view === 'workspace') {
+            switchQueuedRef.current = false;
+            setPending(false);
+          }
           useUIStore.getState().setActiveArea('workspace');
           requestFocusedWorkspacePrimaryInput('workflow-strip-click');
           // Fail-safe only: a successful switch clears this through `active`.
@@ -461,7 +467,7 @@ function SpaceChip({
             }}
             style={{ ...CONTEXT_MENU_ROW_STYLE, ...workflowMenuItemStyle }}
           >
-            Иконка и проекты…
+            Настройки workflow…
           </button>
           <button
             type="button"

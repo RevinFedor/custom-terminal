@@ -1,0 +1,53 @@
+.tab-linked-files-chip {
+  position: absolute; bottom: calc(var(--tab-linked-file-height, 15px) / -2); left: 6px; max-width: calc(100% - 12px);
+  height: var(--tab-linked-file-height, 15px); display: inline-flex; align-items: center; gap: 3px;
+  padding: 0 4px; border: 1px solid #55555e; border-radius: 4px;
+  background: #35353b; color: #b9b9c1; font: inherit; font-size: .72em;
+  line-height: 1; z-index: 9; cursor: pointer; white-space: nowrap;
+}
+.tab-linked-files-chip svg { flex-shrink: 0; }
+.tab-linked-files-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tab-linked-files-chip [data-linked-file-measure] { position: absolute; visibility: hidden; max-width: none; overflow: visible; pointer-events: none; }
+.tab-linked-files-chip [data-linked-file-compact-count] { display: none; }
+.tab-linked-files-chip[data-compact="1"] [data-linked-file-short-name] { display: none; }
+.tab-linked-files-chip[data-compact="1"] [data-linked-file-compact-count] { display: inline; }
+.tab-linked-files-chip:hover { background: #45454d; color: #eee; }
+.tab-linked-files-chip[data-file-selected="1"] { border-color: #b6a1e8; color: #e0d3ff; background: #494052; }
+.tab-linked-files-popup {
+  position: fixed; visibility: hidden; width: max-content; max-width: calc(100vw - 16px);
+  box-sizing: border-box; padding: 4px; overflow: auto; z-index: 100010;
+  background: #252528; border: 1px solid #49494f; border-radius: 6px;
+  box-shadow: 0 6px 20px #0008; color: #ccc; font-size: 13px;
+}
+.tab-linked-files-row {
+  display: block; width: 100%; min-width: 0; padding: 5px 8px;
+  border: 0; border-radius: 3px; background: transparent; color: inherit;
+  text-align: left; font: inherit; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; cursor: pointer;
+}
+.tab-linked-files-row:hover, .tab-linked-files-row:focus-visible { background: #ffffff16; }
+.tab-linked-files-row[data-file-selected="1"] { background: #a78bfa26; color: #decfff; }
+/* The existing FilePreview keeps its rendering/close controls; only a document
+   opened from a pane card opts into that pane's measured content rectangle. */
+[data-file-preview-root][data-linked-file-view] {
+  container-type: inline-size;
+  left: var(--linked-file-preview-left) !important;
+  top: var(--linked-file-preview-top) !important;
+  width: var(--linked-file-preview-width) !important;
+  height: var(--linked-file-preview-height) !important;
+  right: auto !important; bottom: auto !important;
+}
+@container (max-width: 480px) {
+  [data-file-preview-root][data-linked-file-view] > div:first-child {
+    height: auto; min-height: 40px; flex-wrap: wrap; gap: 4px; padding: 6px 8px;
+  }
+  [data-file-preview-root][data-linked-file-view] > div:first-child > div:first-child {
+    flex-basis: 100%;
+  }
+  [data-file-preview-root][data-linked-file-view] > div:first-child > div:first-child > span:first-child {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  [data-file-preview-root][data-linked-file-view] > div:first-child > div:last-child {
+    width: 100%; flex-wrap: wrap;
+  }
+}

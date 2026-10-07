@@ -62,6 +62,7 @@ const SETTLED_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_POLICY_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_ORCHESTRATION_SETTINGS = Object.freeze({
   ...DEFAULT_CODEX_CAPACITY_RETRY_SETTINGS,
+  codexCapacityRetryDelaysMs: Object.freeze([30 * 60_000, 60 * 60_000]),
   failureGraceMs: 5 * 60 * 1000,
   successAutoStopMs: 5 * 60 * 1000,
   reactToManualInterrupt: false,
@@ -757,7 +758,10 @@ function clampDelay(value, fallback) {
 
 function normalizeSettings(value = {}) {
   return {
-    ...normalizeCodexCapacityRetrySettings(value),
+    ...normalizeCodexCapacityRetrySettings({
+      codexCapacityRetryDelaysMs: DEFAULT_ORCHESTRATION_SETTINGS.codexCapacityRetryDelaysMs,
+      ...value,
+    }),
     failureGraceMs: clampDelay(value.failureGraceMs, DEFAULT_ORCHESTRATION_SETTINGS.failureGraceMs),
     successAutoStopMs: clampDelay(value.successAutoStopMs, DEFAULT_ORCHESTRATION_SETTINGS.successAutoStopMs),
     reactToManualInterrupt: value.reactToManualInterrupt === true,
@@ -2908,7 +2912,7 @@ class OrchestrationRunStore {
 
   async getSettings() {
     await this.initialize();
-    return { ...this.settings };
+    return { ...this.settings, codexCapacityRetryDelaysMs: [...this.settings.codexCapacityRetryDelaysMs] };
   }
 
   async updateSettings(patch = {}) {
@@ -2918,7 +2922,7 @@ class OrchestrationRunStore {
     );
     this.settings = normalizeSettings({ ...this.settings, ...definedPatch });
     this._schedulePersist();
-    return { ...this.settings };
+    return { ...this.settings, codexCapacityRetryDelaysMs: [...this.settings.codexCapacityRetryDelaysMs] };
   }
 
   async flush() {

@@ -11,6 +11,10 @@ function systemPromptSource(value) {
 
 function promptOriginTagForSource(source) {
   if (source === 'prompt-loop') return { kind: 'prompt-origin', source: 'loop' };
+  const ownedSource = String(source || '').replace(/^(?:claude|codex)-/, '');
+  if (ownedSource === 'terminal-mcp' || /^tab-message:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(ownedSource)) {
+    return { kind: 'prompt-origin', source: 'terminal-mcp' };
+  }
   const systemSource = systemPromptSource(source);
   return systemSource ? { kind: 'prompt-origin', source: 'system', systemSource } : null;
 }
@@ -23,8 +27,13 @@ function isSystemPromptEntry(entry) {
 }
 
 function isServicePromptEntry(entry) {
-  return isSystemPromptEntry(entry) || !!getTabMessageTag(entry) || (Array.isArray(entry?.semanticTags)
-    && entry.semanticTags.some(tag => tag?.kind === 'orchestration'));
+  return isSystemPromptEntry(entry) || !!getTerminalMcpTag(entry);
+}
+
+function getTerminalMcpTag(entry) {
+  const tags = Array.isArray(entry?.semanticTags) ? entry.semanticTags : [];
+  return getTabMessageTag(entry) || tags.find(tag => tag?.kind === 'orchestration')
+    || tags.find(tag => tag?.kind === 'prompt-origin' && tag.source === 'terminal-mcp') || null;
 }
 
 function getTabMessageTag(entry) {
@@ -52,5 +61,6 @@ module.exports = {
   isSystemPromptEntry,
   isServicePromptEntry,
   getTabMessageTag,
+  getTerminalMcpTag,
   withPromptOriginPresentation,
 };

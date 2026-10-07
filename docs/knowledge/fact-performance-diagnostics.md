@@ -180,6 +180,13 @@ invalidation — разные события. История удалений/в
 безопасную точку JS-source, без message/payload. Bootstrap cache outcomes тоже
 передаются; hit после RAM eviction отдельно доказывает SSD, а не новый raw parse.
 
+С06.10 split cache отдаёт `cacheTier=rows/state/timeline` и prune counts
+`obsoleteEvictedCount/stateEvictedCount/rowsEvictedCount/timelineEvictedCount`.
+20GiB — общий retention budget, не RAM/peak reservation. При повторном чтении
+сверять конкретный tier: отсутствие graph не означает отсутствие готовой
+Timeline или страниц. Полный raw fallback после настоящей дописи и отсутствия
+checkpoint отличается от лишнего raw-read неизменной Timeline.
+
 ## Как читать доказательства
 
 `[Perf:CpuWindow]` ведёт к серии CPU-окон; `[Perf:Incident]` — к конкретному
@@ -302,6 +309,48 @@ verificationBytes/cacheHit и elapsed ms адресного enrichment. Счёт
 trace одно время завершения чтения такой доли не доказывает.
 
 ### Когда JavaScript-профиль почти пуст, а интерфейс занят
+
+05.10 после пользовательского install Main worker выполнял повторные большие
+History/Timeline rebuilds после `disk-quota`; native renderer оставался занят
+и после спада Main. Sample14:42:11UTC, Electron28.3.3arm64: exact UUID Breakpad
+mapping дал181/266samples в paint lifecycle, а не шрифтовую/Node работу, которую
+подсказывали ближайшие stripped exports с огромными offsets. Вложенные51samples
+CollectAnnotatedRegions,44compositor artifact и26clear repaint flags не
+складываются с parent181. Hit-test1sample, AX-tree hot path не установлен.
+Точный component/animation trigger этим не назван. Исходный click14:32 имел
+5155ms input wait при продолжающихся rAF/timers и12.6ms handler; поздний sample
+не объясняет все эти5секунд. До install renderer уже≈109%CPU, RAM pressure1 и
+swapOut0 после install: нельзя объявлять новое изменение причиной всей нагрузки.
+Evidence/дальнейший discriminating A/B —
+`/private/tmp/noted-system-lag-20261005-ivk8wvsn/RESULT.md` и рабочая performance-карта.
+
+06.10 isolated actual indicators/CSS,62991DOM: serial same-tree controls за1.8s
+дали baseline109Paint/lifecycle, all-paused4, один process109, Working108.
+SVG HistorySpinner дал лишь2Paint, но109PrePaint/lifecycle: счётчик raster Paint
+сам по себе не измеряет этот loop. Hidden running0; full History/runtime не
+моделировались, installed initiator не доказан. Process transform prototype
+91→2Paint/8lifecycle не принят: контроль90настроек/фаз обнаружил другой рисунок
+блика. Повтор — `scripts/renderer-recurring-paint-regression.mjs`; evidence и
+границы в рабочей карте06.10. Ремонт обязан сохранить визуал/статусы и проверять
+каждый recurring owner; один process-bar не уберёт цикл активного Working.
+
+Поздний06.10 R04 SOURCE завершил эквивалентную замену process/Working/naming/
+spinner/rings/glow/hotkey, не перенос отвергнутого prototype.540compiledprocess+
+162text/spinner+294ring/glow visual pairs PASS; shared-RO устранил добавленную
+первым text prototype цену повторных geometry reads. Source/compiled same-tree
+~66kDOM:109Paint→1/2;109PrePaint/lifecycle→48, cost lifecycle~428→8ms вsourcepair.
+Оставшиеся28animationiteration вcompiled/source trace и1Hz clock не равны
+60Hz full paint. Колонки вложены, не складывать их суммы с ThreadTime.
+
+Actual History/CodeMirror trustedinput pair сохраняет ввод/DOM/draft; final
+наблюдаемые медианы finalbaseline24–32ms/product16–32ms, handler≤0.5ms. Ранее
+тот же product давал24–32ms медианы; серия не отбиралась по лучшему результату. EventTiming
+ниже16ms отсутствует, duration округлён8ms; группировать по interactionId,
+а не выдавать несколько DOM events одного нажатия за независимые действия.
+Пара не доказывает универсальный input speedup или причину исторического5.1s.
+Приёмка: `scripts/renderer-recurring-paint-regression.mjs`, text/ring-glow и
+`scripts/history-renderer-input-paint-regression.mjs`; точный RESULT/root —
+`/tmp/noted-r04-renderer-evidence-path`. Production не устанавливался.
 
 30.09 warm-switch trace показал другой класс browser работы: CSS pause-rule
 с descendant style/class substring selectors заставлял UpdateLayoutTree

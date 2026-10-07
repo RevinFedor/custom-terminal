@@ -25,6 +25,13 @@ function normalizeSavedHistoryRequest(tabId, body = {}) {
   }
   if (body.targetEntryRef?.viewOwnerSessionId
     && body.targetEntryRef.viewOwnerSessionId !== body.expectedSessionId) fail('history_operation_session_changed');
+  if (body.targetEntryRef?.contentRevision !== undefined
+    && (typeof body.targetEntryRef.contentRevision !== 'string'
+      || body.targetEntryRef.contentRevision !== body.expectedContentRevision)) fail('history_revision_invalid');
+  if (body.repairOfOperationId !== undefined && (!/^[A-Za-z0-9_.:-]{1,160}$/.test(text(body.repairOfOperationId))
+    || body.repairOfOperationId === body.operationId || body.kind !== 'rewind' || toolType !== 'codex')) {
+    fail('history_repair_selector_invalid');
+  }
   return { tabId, operationId: body.operationId, kind: body.kind, toolType,
     expectedSessionId: body.expectedSessionId, targetUuid: body.targetUuid,
     targetSourceIdentity: text(body.targetSourceIdentity) || null,
@@ -34,7 +41,8 @@ function normalizeSavedHistoryRequest(tabId, body = {}) {
       sourceIdentity: text(body.targetEntryRef.sourceIdentity) || null,
       segmentId: text(body.targetEntryRef.segmentId) || null,
     } : null,
-    expectedContentRevision: text(body.expectedContentRevision) || null };
+    expectedContentRevision: text(body.expectedContentRevision) || null,
+    ...(body.repairOfOperationId !== undefined ? { repairOfOperationId: body.repairOfOperationId } : {}) };
 }
 
 function selectSavedHistoryTarget(timeline, request, checkRevision = true) {
@@ -63,8 +71,8 @@ function targetSnapshot(entry) {
 }
 
 class SavedHistoryOperations {
-  constructor({ db, transcript, runtime, resolveSession, dispatch, deleteRange, buildTimeline, claude = null, broadcast = () => {} }) {
-    Object.assign(this, { db, transcript, runtime, resolveSession, dispatch, deleteRange, buildTimeline, claude, broadcast });
+  constructor({ db, transcript, runtime, resolveSession, dispatch, deleteRange, buildTimeline, inspectRepair = null, hashRecords = null, claude = null, broadcast = () => {} }) {
+    Object.assign(this, { db, transcript, runtime, resolveSession, dispatch, deleteRange, buildTimeline, inspectRepair, hashRecords, claude, broadcast });
     this.leases = new Map();
   }
 
@@ -123,6 +131,13 @@ class SavedHistoryOperations {
     if (existing) {
       if (hash(existing.request) !== hash(request) || hash(existing.origin || null) !== hash(origin)) fail('history_operation_request_mismatch');
       return { ...existing, idempotent: true };
+    }
+    if (request.repairOfOperationId) {
+      const previous = this.read(tabId, request.repairOfOperationId);
+      if (!this.inspectRepair || !this.hashRecords) fail('history_repair_unsupported');
+      if (previous?.state !== 'completed' || previous.newSessionId !== request.expectedSessionId
+        || previous.targetUuid !== request.targetUuid || previous.toolType !== 'codex' || previous.kind !== 'rewind'
+        || previous.historyMutated !== true || previous.bindingCommitted !== true) fail('history_repair_previous_operation_unproven');
     }
     const previousId = this.db.getAppState(this.lockKey(tabId));
     if (previousId && !terminal(this.read(tabId, previousId))) fail('history_operation_pending');
@@ -284,26 +299,48 @@ class SavedHistoryOperations {
         || lease.scope.stopping) fail('history_operation_owner_changed');
       const timeline = await this.transcript.getTimeline({ tabId: spec.tabId, toolType: spec.toolType, sessionId: spec.expectedSessionId, cwd: info.cwd });
       this.assertScope(lease);
-      lease.target = targetSnapshot(selectSavedHistoryTarget(timeline, spec));
+      let mutationSpec = spec;
+      if (spec.repairOfOperationId) {
+        if (timeline.composite && (!spec.targetEntryRef || !spec.expectedContentRevision)) fail('history_target_partial_identity');
+        const currentRevision = timeline.contentRevision?.token || timeline.contentRevision || timeline.revision?.token || null;
+        if (!timeline.success || spec.expectedContentRevision && spec.expectedContentRevision !== currentRevision) fail('stale_transcript_revision');
+        const previous = this.read(spec.tabId, spec.repairOfOperationId);
+        const repair = await this.inspectRepair({ previous, currentSessionId: spec.expectedSessionId, cwd: info.cwd });
+        this.assertScope(lease);
+        if (!repair.success) fail(repair.code || 'history_repair_unproven');
+        lease.repair = repair;
+        lease.mutationSessionId = repair.sourceSessionId;
+        mutationSpec = { ...previous.request, expectedContentRevision: null };
+        lease.mutationSpec = mutationSpec;
+        this.save(lease, { repair: repair.proof });
+      }
+      const sourceTimeline = spec.repairOfOperationId
+        ? { success: true, entries: this.buildTimeline(lease.repair.sourceRecords, lease.mutationSessionId) } : timeline;
+      lease.target = targetSnapshot(selectSavedHistoryTarget(sourceTimeline, mutationSpec, !spec.repairOfOperationId));
       if (spec.toolType === 'claude') {
         const physical = await this.claudeSource(lease, timeline, { initial: true });
         lease.claudeTargetRecord = physical.loaded.records.find(record => record?.uuid === spec.targetUuid);
       } else {
-        const raw = await this.transcript.loadCodexOperationSource({ sessionId: spec.expectedSessionId, cwd: info.cwd });
+        const raw = await this.transcript.loadCodexOperationSource({ sessionId: lease.mutationSessionId || spec.expectedSessionId, cwd: info.cwd });
         if (!raw?.success) fail(raw?.error || 'history_read_failed');
         this.assertScope(lease);
         lease.rawTargetHash = hash(targetSnapshot(selectSavedHistoryTarget({ success: true,
-          entries: this.buildTimeline(raw.records, spec.expectedSessionId) }, spec, false)));
+          entries: this.buildTimeline(raw.records, lease.mutationSessionId || spec.expectedSessionId) }, mutationSpec, false)));
       }
-      const history = await this.transcript.getHistory({ tabId: spec.tabId, toolType: spec.toolType,
-        sessionId: spec.expectedSessionId, cwd: info.cwd, bounds: { aroundUuid: spec.targetUuid, radius: 1 } });
+      const history = await this.transcript.getHistory({ ...(spec.repairOfOperationId ? {} : { tabId: spec.tabId }), toolType: spec.toolType,
+        sessionId: lease.mutationSessionId || spec.expectedSessionId, cwd: info.cwd, bounds: { aroundUuid: spec.targetUuid, radius: 1 } });
       this.assertScope(lease);
       if (!history?.success) fail(history?.lineageReason || history?.error || 'history_read_failed');
       const authors = (history.entries || []).filter(entry => (entry.role === 'user' || entry.type === 'user')
         && !entry.serviceCarrier && historyEntryHasExactIdentity(entry, spec.targetUuid));
       if (authors.length !== 1) fail('history_authoring_identity_unresolved');
+      if (spec.repairOfOperationId) {
+        const previous = this.read(spec.tabId, spec.repairOfOperationId);
+        const { endUuid: _previousEnd, ...previousTarget } = previous.target || {};
+        if (hash(targetSnapshot(authors[0])) !== hash(previousTarget)) fail('history_repair_original_target_changed');
+      }
       const draftTarget = { ...targetSnapshot(authors[0]), uuid: spec.targetUuid,
-        endUuid: spec.kind === 'delete' ? spec.targetUuid : timeline.entries.at(-1)?.uuid };
+        endUuid: spec.kind === 'delete' ? spec.targetUuid : sourceTimeline.entries.at(-1)?.uuid };
       if (spec.toolType === 'claude' && this.claude.materializeImages) {
         draftTarget.imagePaths = await this.claude.materializeImages(lease.claudeTargetRecord, draftTarget.imagePaths);
         this.assertScope(lease);
@@ -315,7 +352,8 @@ class SavedHistoryOperations {
       }
       this.save(lease, { phase: 'preparing', target: draftTarget, contentRevision: timeline.contentRevision || null });
       return { sessionId: spec.expectedSessionId, mutationSessionId: lease.mutationSessionId || spec.expectedSessionId,
-        toolType: spec.toolType, cwd: info.cwd, target: draftTarget };
+        toolType: spec.toolType, cwd: info.cwd, target: draftTarget,
+        ...(lease.repair ? { incumbentCodexSettingsProof: lease.repair.childSettingsProof } : {}) };
     }
     if (phase === 'stopping') {
       if (lease.record.phase !== 'preparing') fail('history_operation_phase_mismatch');
@@ -338,9 +376,19 @@ class SavedHistoryOperations {
       this.assertScope(lease, { afterStop: true });
       // The busy turn may have flushed before Stop. Resolve the tail again,
       // but never borrow another target or reinterpret a stale source prefix.
-      const timeline = await this.transcript.getTimeline({ tabId: spec.tabId, toolType: spec.toolType, sessionId: spec.expectedSessionId, cwd: lease.cwd });
+      if (lease.repair) {
+        const refreshed = await this.inspectRepair({ previous: this.read(spec.tabId, spec.repairOfOperationId),
+          currentSessionId: spec.expectedSessionId, cwd: lease.cwd });
+        this.assertScope(lease, { afterStop: true });
+        if (!refreshed.success) fail(refreshed.code || 'history_repair_child_changed');
+        if (refreshed.sourceHash !== lease.repair.sourceHash) fail('history_repair_source_changed');
+        lease.repair = refreshed;
+      }
+      const mutationSpec = lease.mutationSpec || spec;
+      const timeline = await this.transcript.getTimeline({ ...(lease.repair ? {} : { tabId: spec.tabId }), toolType: spec.toolType,
+        sessionId: lease.mutationSessionId || spec.expectedSessionId, cwd: lease.cwd });
       this.assertScope(lease, { afterStop: true });
-      const target = selectSavedHistoryTarget(timeline, spec, false);
+      const target = selectSavedHistoryTarget(timeline, mutationSpec, false);
       // Claude's exact raw record hash is checked by claudeSource below. Its
       // presentation may legitimately gain managed image refs during our own
       // preparation; those refs do not mean that the authored record changed.
@@ -365,20 +413,21 @@ class SavedHistoryOperations {
         if (!result?.success || result.committed !== true) fail(result?.code || result?.error || 'history_rewrite_unproven');
         return { ...result, mutationSessionId: sessionId };
       }
-      const result = await this.deleteRange({ sessionId: spec.expectedSessionId, cwd: lease.cwd,
-        startUuid: target.uuid, endUuid, codexSettingsProof: data.codexSettingsProof || null,
+      const result = await this.deleteRange({ sessionId: lease.mutationSessionId || spec.expectedSessionId, cwd: lease.cwd,
+        startUuid: target.uuid, endUuid, toPhysicalEnd: spec.kind === 'rewind', codexSettingsProof: data.codexSettingsProof || null,
         validateSource: loaded => {
           this.assertScope(lease, { afterStop: true });
-          const entries = this.buildTimeline(loaded.records, spec.expectedSessionId);
-          const actual = selectSavedHistoryTarget({ success: true, entries }, spec, false);
+          if (lease.repair && this.hashRecords(loaded.records) !== lease.repair.sourceHash) fail('history_repair_source_changed');
+          const entries = this.buildTimeline(loaded.records, lease.mutationSessionId || spec.expectedSessionId);
+          const actual = selectSavedHistoryTarget({ success: true, entries }, mutationSpec, false);
           if (hash(targetSnapshot(actual)) !== lease.rawTargetHash) fail('history_target_changed');
         },
-        beforeWrite: () => this.assertScope(lease, { afterStop: true }),
+        beforeWrite: () => { this.assertScope(lease, { afterStop: true }); lease.repair?.validateChild(); },
       });
       if (!result?.success) fail(result?.code || result?.error || 'history_rewrite_failed');
       lease.mutation = result;
       this.save(lease, { phase: 'rewritten', historyMutated: true, newSessionId: result.newSessionId,
-        removedCount: result.removedCount, removedUsers: result.removedUsers });
+        removedCount: result.removedCount, removedUsers: result.removedUsers, suffixProof: result.suffixProof || null });
       return result;
     }
     if (phase === 'adopting') {

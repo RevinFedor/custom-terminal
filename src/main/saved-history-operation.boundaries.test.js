@@ -48,6 +48,10 @@ test('actual Codex write callback revalidates the operation after awaited shell 
     const events = [];
     const context = { term: {}, tabId: 'real-tab', payload: { historyOperation: { tabId: 'forged-tab', operationId: 'op' } },
       sessionId: 'child', launchId: 'launch', launchRunSeq: 4, ownsMcpStartupRecoveryHandoff: false,
+      reserveReturn: null, normalizedCommand: 'codex-c', termCwd: '/private/test',
+      effectiveModel: 'fixture-model', effectiveEffort: 'high', sourceSettingsProof: {},
+      developerInstructions: '', profile: null, codexAuthProfileRoute: null,
+      buildCodexCommand: () => 'codex resume child',
       providerProxyBaseUrl: null, cmdLine: 'codex resume child', startedAt: 0,
       proveIdleShellForAgentLaunch: async () => { events.push('proof'); return { allowed: true }; },
       path, srcMainDir: __dirname, require: () => ({ validateSavedHistoryResume: (request, phase, detail) => {

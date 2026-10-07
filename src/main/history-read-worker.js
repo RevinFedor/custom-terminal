@@ -104,7 +104,7 @@ function phaseDiagnostic(event) {
     }
     const now = stamp();
     group = { phase, outcome, reason, exceptional, count: 0, firstAbs: now.abs, lastAbs: now.abs };
-    for (const field of ['layer', 'indexOutcome', 'indexReason', 'errorReason', 'causeOperation', 'cacheVersion', 'otherVersion', 'errorName', 'errorCode', 'errorModule']) {
+    for (const field of ['layer', 'cacheTier', 'indexOutcome', 'indexReason', 'errorReason', 'causeOperation', 'cacheVersion', 'otherVersion', 'errorName', 'errorCode', 'errorModule']) {
       if (typeof event[field] === 'string') group[field] = token(event[field]);
     }
     context.phases.set(key, group);
@@ -118,7 +118,8 @@ function phaseDiagnostic(event) {
     group.startAbs ??= started.abs; group.startPerf ??= started.perf;
     group.endAbs = now.abs; group.endPerf = now.perf;
   }
-  for (const field of ['durationMs', 'serializeMs', 'writeMs', 'bytes', 'rows', 'records', 'pageRows', 'indexBytes', 'evictedBytes', 'evictedCount']) {
+  for (const field of ['durationMs', 'serializeMs', 'writeMs', 'bytes', 'rows', 'records', 'pageRows', 'indexBytes', 'evictedBytes', 'evictedCount',
+    'obsoleteEvictedCount', 'stateEvictedCount', 'rowsEvictedCount', 'timelineEvictedCount']) {
     if (field === 'durationMs' && started) continue;
     if (Number.isFinite(event[field]) && event[field] >= 0) group[field] = Math.min(Number.MAX_SAFE_INTEGER, (group[field] || 0) + event[field]);
   }
@@ -136,7 +137,7 @@ startupCacheDiagnostics.length = 0;
 // Cache summaries are emitted inside these operations. Their elapsed times
 // include nested codec/I/O/prune work; do not subtract or sum them as CPU time.
 for (const operation of ['readPrepared', 'savePrepared', 'readTimeline', 'saveTimeline', 'readContinuation', 'saveContinuation',
-  'readSource', 'readSourceProof', 'readPayload', 'savePayload', 'savePayloads', 'readVirtualProjection', 'saveVirtualProjection',
+  'readSource', 'readSourceProof', 'saveSourceHeader', 'readPayload', 'savePayload', 'savePayloads', 'readVirtualProjection', 'saveVirtualProjection',
   'readVirtualState', 'saveVirtualState']) {
   const original = cache[operation];
   cache[operation] = function (...args) {
@@ -507,7 +508,7 @@ parentPort.on('message', message => {
       memory: { heapUsed: process.memoryUsage().heapUsed, rss: process.memoryUsage().rss } }, readProof: [] };
     if (method === 'releaseMemory') { api.invalidateCodexHistoryProjectors(); cache.clearMemory();
       service.codexVirtualTranscriptStore?.clear(); return { value: true, readProof: [] }; }
-    if (!['getHistory', 'getTimeline', 'getToolPayload', 'getMessages', 'searchHistory',
+    if (!['getHistory', 'getTimeline', 'getToolPayload', 'getTabMessageSourceLocation', 'getMessages', 'searchHistory',
       'resolveCodexPhysicalRow', 'copyCodexVirtualRange', 'exportCodexSession'].includes(method)) throw new Error('history_read_method');
     if (message.rewriteReceipt) receipts.set(payload.sessionId, message.rewriteReceipt);
     Object.assign(context, { payloads: new Map(), sources: new Set(), sourceEpochs: sourceEpochs.slice(), preparations: [], assets: new Map() });

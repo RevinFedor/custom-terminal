@@ -97,13 +97,13 @@ async function readCodexTurnAppend({
         if (event === 'task_started') {
           if (taskStartedSeen) turnSegment += 1;
           taskStartedSeen = true;
-        } else if (event === 'task_complete' || event === 'turn_aborted') {
+        } else if (['task_complete', 'turn_aborted', 'thread_rolled_back'].includes(event)) {
           turnSegment += 1; taskStartedSeen = false;
         }
         const userText = codexUserMessageAuditText(record);
         if (userText !== null && !isCodexTurnAbortedUserText(userText)) {
           stats.candidateTextBytes += Buffer.byteLength(userText);
-          candidates.push({ byteOffset, turnSegment, record: { type: record.type,
+          candidates.push({ byteOffset, turnSegment, taskStartedSeen, record: { type: record.type,
             payload: record.type === 'event_msg'
               ? { type: 'user_message', message: userText }
               : { type: 'message', role: 'user', text: userText } } });

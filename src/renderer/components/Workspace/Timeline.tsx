@@ -6,6 +6,8 @@ import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMe
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
 import { projectTimelineNoteAnchors } from '../../utils/timelineNoteIdentity.mjs';
+import { projectTimelineWorkingFileMarkers } from '../../utils/timelineWorkingFileMarkers.mjs';
+import { useTabWorkContext } from '../../utils/tabWorkContext';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -108,9 +110,10 @@ import {
 } from '../../utils/historyRewriteRewind';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
-import { isServicePromptEntry, isSystemPromptEntry } from '../../../shared/prompt-origin.mjs';
+import { getTerminalMcpTag, isServicePromptEntry, isSystemPromptEntry } from '../../../shared/prompt-origin.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
+const timelinePathApi = window.require('path');
 
 // ════════════════════════════════════════════════════════════
 // SECTION: HELPERS — module-level pure functions, types, module state
@@ -462,6 +465,7 @@ interface TimelineEntry {
   subAgentTaskId?: string;
   subAgents?: Array<{ key: string; label: string }>;
   docsEdited?: string[];
+  fileEdits?: string[];
   docsSearchQueries?: string[];
   hasPromptChip?: boolean;
   promptChipLabels?: string[];
@@ -491,7 +495,7 @@ interface TimelineEntry {
   } | {
     id?: string;
     kind: 'prompt-origin';
-    source: 'loop' | 'system';
+    source: 'loop' | 'system' | 'terminal-mcp';
     systemSource?: 'build-install-return' | 'codex-capacity-retry';
     auditSourceIdentity?: string;
   }>;
@@ -731,7 +735,7 @@ function getSearchLines(content: string): string[] {
 }
 
 function getOrchestrationTag(entry: TimelineEntry) {
-  return entry.semanticTags?.find(tag => tag.kind === 'orchestration') || null;
+  return getTerminalMcpTag(entry);
 }
 
 function getLoopPromptOriginTag(entry: TimelineEntry) {
@@ -1035,8 +1039,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
     dotColor = isHovered ? '#c4b5fd' : (isPromptVisible ? '#a78bfa' : '#725a9f');
     dotGlow = isHovered ? '0 0 10px rgba(167, 139, 250, 0.5)' : 'none';
   } else if (active) {
-    dotColor = '#60a5fa';
-    dotGlow = '0 0 6px rgba(96, 165, 250, 0.3)';
+    dotColor = entryIsOrchestration ? '#c084fc' : '#60a5fa';
+    dotGlow = entryIsOrchestration ? '0 0 6px rgba(192,132,252,0.3)' : '0 0 6px rgba(96, 165, 250, 0.3)';
   } else if (entryIsTimeout) {
     dotColor = isHovered ? '#ef4444' : (isPromptVisible ? '#e84040' : '#b33');
     dotGlow = isHovered ? '0 0 10px rgba(239, 68, 68, 0.5)' : (isPromptVisible ? '0 0 6px rgba(239, 68, 68, 0.2)' : 'none');
@@ -1173,7 +1177,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
             ? `auto ${Math.round(intrinsicPreviewFontSize * 1.3 * timelineLineClamp + 12)}px`
             : undefined,
           backgroundColor: active
-            ? 'rgba(59, 130, 246, 0.15)'
+            ? entryIsOrchestration ? 'rgba(124, 58, 237, 0.16)' : 'rgba(59, 130, 246, 0.15)'
             : isHovered && isExpandedLayout && !isGroupMeta
               ? 'rgba(255, 255, 255, 0.04)'
               // Red zones: chain-break (unreachable by Claude's backtrace, all
@@ -1183,7 +1187,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
                 ? 'rgba(239, 68, 68, 0.06)'
                 : (isOldHistory && !isGroupMeta && !historyTargetVisible && !isSdkTab
                     ? 'rgba(239, 68, 68, 0.06)'
-                    : 'transparent'),
+                    : isExpandedLayout && entryIsOrchestration ? 'rgba(124, 58, 237, 0.08)' : 'transparent'),
           cursor: (isContinued || isDocsEdit || isDocsSearch || (isOldHistory && !historyTargetVisible && !isSdkTab)) ? 'default' : 'pointer',
         } as React.CSSProperties}
       >
@@ -1436,6 +1440,7 @@ function Timeline({
   backgroundPrewarmAdmitted = false,
   onInitialSourceSignal,
 }: TimelineProps) {
+  const workingFiles = useTabWorkContext(tabId).files;
   const historySearchMarkers = useHistorySearchMarkers(state => state.byTab[tabId]);
   const historySearchMatches = useCallback((entry:any, current = false) => {
     if (!historySearchMarkers || historySearchMarkers.sessionId !== (sessionId || '')) return false;
@@ -1558,11 +1563,11 @@ function Timeline({
     ? liveUserSnapshot.entries
     : [];
   const entries = useMemo<TimelineEntry[]>(() => (
-    projectTimelineNoteAnchors(
+    projectTimelineWorkingFileMarkers(projectTimelineNoteAnchors(
       mergeTimelineEntriesWithSentHandoffs(durableEntries, sentHandoffEntries, liveUserEntries),
       noteAnchorSnapshot.ownerKey === timelineOwnerKey ? noteAnchorSnapshot.entries : [],
-    )
-  ), [durableEntries, liveUserEntries, sentHandoffEntries, noteAnchorSnapshot, timelineOwnerKey]);
+    ), workingFiles, cwd, timelinePathApi)
+  ), [durableEntries, liveUserEntries, sentHandoffEntries, noteAnchorSnapshot, timelineOwnerKey, workingFiles, cwd]);
   const [loadingOwnerKey, setLoadingOwnerKey] = useState<string | null>(
     sessionId ? timelineOwnerKey : null
   );
@@ -5437,13 +5442,9 @@ function Timeline({
             undefined,
             targetTabName,
             () => {
-              const store = useWorkspaceStore.getState();
-              if (targetProjectId && targetProjectId !== store.activeProjectId) {
-                store.showWorkspace(targetProjectId);
-              }
-              if (targetProjectId) {
-                store.switchTab(targetProjectId, targetTabId);
-              }
+              void useWorkspaceStore.getState().openTabById(targetTabId, {
+                projectId: targetProjectId, reason: 'rewind-ready-toast',
+              });
             }
           );
         } else {
@@ -9057,7 +9058,11 @@ function Timeline({
                     <div className="flex items-center gap-2">
                       <div style={{ width: '7px', height: '7px', borderRadius: '2px', backgroundColor: '#a855f7', transform: 'rotate(45deg)', flexShrink: 0 }} />
                       <span style={{ color: '#c084fc' }} className="font-medium text-[11px]">
-                        {getOrchestrationTag(currentActiveEntry)?.phase === 'request'
+                        {getOrchestrationTag(currentActiveEntry)?.kind === 'tab-message'
+                          ? getOrchestrationTag(currentActiveEntry)?.phase === 'reply' ? 'Terminal MCP reply' : 'Terminal MCP question'
+                          : getOrchestrationTag(currentActiveEntry)?.source === 'terminal-mcp'
+                            ? 'Terminal MCP prompt'
+                            : getOrchestrationTag(currentActiveEntry)?.phase === 'request'
                           ? 'Terminal MCP request'
                           : getOrchestrationTag(currentActiveEntry)?.phase === 'failure'
                             ? 'Terminal MCP failure'

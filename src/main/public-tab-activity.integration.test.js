@@ -70,6 +70,8 @@ async function harness(t) {
     onChanged: reason => context.scheduleProjectActivityBroadcast(reason) });
   const subscribers = new Map([['__project_activity__', new Set([{}])], ['T', new Set([{}])], ['stopped', new Set([{}])]]);
   const webContext = vm.createContext({ console: quiet, Map, Set, Date, JSON,
+    workspaceSwitcherWake: () => ({ version: 1, epoch: 'private-switcher', revision: 0, available: false }),
+    runAfterWake: () => ({ version: 1, epoch: null, sequence: 0, revalidate: true }),
     publicTabActivity: metadata, activityStyleOwner: null, projectCardSignals: null,
     projectManager: { db }, sdkSessions: new Map(), computeProjectActivity: () => runtime,
     PROJECT_ACTIVITY_TOPIC: '__project_activity__', subscribers,

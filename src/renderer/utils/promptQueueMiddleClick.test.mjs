@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import { consumePromptQueueMiddleClick } from './promptQueueMiddleClick.mjs';
 import { shouldDisarmAfterTriggerClear } from './runAfterTriggerClear.mjs';
 
@@ -93,38 +94,49 @@ test('hover highlights the entire row without replacing its state background', (
 });
 
 // Execute the actual shared callback, not a test-only copy of its safety rules.
-const clearBody = source.match(/const clearItemTrigger = useCallback\(\(id: string\) => \{([\s\S]*?)\n  \}, \[setPromptTrigger, setAutoRun, tabId\]\);/)?.[1];
+const clearBody = source.match(/const clearItemTrigger = useCallback\(\(id: string\) => \{([\s\S]*?)\n  \}, \[tabId\]\);/)?.[1];
 assert.ok(clearBody, 'canonical trigger clear callback must exist');
+const ts = createRequire(import.meta.url)('typescript');
+const storeSource = fs.readFileSync(new URL('../store/usePromptQueueStore.ts', import.meta.url), 'utf8');
+const ast = ts.createSourceFile('store.ts', storeSource, ts.ScriptTarget.Latest, true);
+let clearOwner;
+const visit = node => {
+  if (ts.isPropertyAssignment(node) && node.name.getText(ast) === 'clearPromptTrigger') clearOwner = node.initializer.getText(ast);
+  ts.forEachChild(node, visit);
+};
+visit(ast); assert.ok(clearOwner);
 
 function clearHarness({ items, autoRun = true, countdown = 100 }) {
-  const queue = { items, autoRun, firstDelayCountdownAt: countdown };
+  let queue = { items, autoRun, firstDelayCountdownAt: countdown };
   const calls = [];
   let tabDrafts = new Set(['item', 'other']);
   let timerDrafts = new Set(['item', 'other']);
-  const clear = new Function('tabId', 'setPromptTrigger', 'usePromptQueueStore', 'isQueuedPromptEnabled', 'shouldDisarmAfterTriggerClear', 'setAutoRun', 'setOnTabTriggerDraftIds', 'setTimerTriggerDraftIds', `return (id) => {${clearBody}};`)(
-    'owner',
-    (...args) => calls.push(['clear', ...args]),
-    { getState: () => ({ getQueue: () => queue, cancelFirstDelayCountdown: (tab) => calls.push(['cancel', tab]) }) },
-    (item) => item.enabled !== false,
-    shouldDisarmAfterTriggerClear,
-    (...args) => calls.push(['arm', ...args]),
+  const clearPromptTrigger = new Function('setAndPersist', 'shouldDisarmAfterTriggerClear', 'countEnabledQueuedPrompts', 'isQueuedPromptEnabled',
+    'retainedWorkflowArmedAt', 'hasActiveQueueWorkflow', 'runtimeWorkflowArmTabs',
+    `return (${clearOwner});`)(update => { queue = update({ queues: new Map([['owner', queue]]) }).queues.get('owner'); },
+      shouldDisarmAfterTriggerClear, rows => rows.filter(row => row.enabled !== false).length, row => row.enabled !== false,
+      current => current.workflowArmedAt, current => current.autoRun, new Set());
+  const clear = new Function('tabId', 'usePromptQueueStore', 'setOnTabTriggerDraftIds', 'setTimerTriggerDraftIds', `return (id) => {${clearBody}};`)(
+    'owner', { getState: () => ({ clearPromptTrigger: (...args) => { calls.push(args); return clearPromptTrigger(...args); } }) },
     (update) => { tabDrafts = update(tabDrafts); },
     (update) => { timerDrafts = update(timerDrafts); },
   );
-  return { clear, calls, drafts: () => [Array.from(tabDrafts), Array.from(timerDrafts)] };
+  return { clear, calls, state: () => queue, drafts: () => [Array.from(tabDrafts), Array.from(timerDrafts)] };
 }
 
 test('middle trigger removal preserves the single-runnable-item disarm rule and clears drafts', () => {
   const h = clearHarness({ items: [{ id: 'item' }, { id: 'disabled', enabled: false }] });
   consumePromptQueueMiddleClick(rowEvent(), () => h.clear('item'));
-  assert.deepEqual(h.calls, [['clear', 'owner', 'item', null], ['cancel', 'owner'], ['arm', 'owner', false]]);
+  assert.deepEqual(h.calls, [['owner', 'item']]);
+  assert.equal(h.state().autoRun, false); assert.equal(h.state().firstDelayCountdownAt, null);
   assert.deepEqual(h.drafts(), [['other'], ['other']]);
 });
 
 test('removing a trigger with multiple runnable items or paused queue keeps Play untouched', () => {
-  for (const options of [{ items: [{}, {}] }, { items: [{}], autoRun: false }]) {
+  for (const options of [{ items: [{id:'item'}, {id:'second'}] }, { items: [{id:'item'}], autoRun: false }]) {
     const h = clearHarness(options);
     h.clear('item');
-    assert.deepEqual(h.calls, [['clear', 'owner', 'item', null]]);
+    assert.deepEqual(h.calls, [['owner', 'item']]);
+    assert.equal(h.state().autoRun, options.autoRun ?? true);
   }
 });

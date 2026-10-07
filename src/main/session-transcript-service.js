@@ -5,6 +5,7 @@ const { createHash } = require('node:crypto');
 const { getCodexProcessActionOwnershipRevision } = require('./codex-process-action-ownership');
 const { performance } = require('node:perf_hooks');
 const { searchHistoryEntries, normalizeHistorySearchType } = require('../shared/history-search.cjs');
+const { findTabMessageSourceLocation } = require('./tab-message-source-location');
 const { describeCodexForkPrefixFailure } = require('./codex-fork-lineage-diagnostic');
 const { codexForkCopyPayload } = require('./codex-fork-copy-payload');
 const { ipcMain } = require('node:worker_threads').isMainThread ? require('electron') : {};
@@ -324,6 +325,14 @@ class SessionTranscriptService {
    * records make it cheap), a Claude miss re-reads the session chain. Exact
    * identity only — payloadId is deterministic per source record.
    */
+  async getTabMessageSourceLocation(payload = {}) {
+    const toolType = normalizeToolType(payload.toolType);
+    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getTabMessageSourceLocation', payload);
+    const history = await this.getHistory({ toolType, sessionId: payload.sessionId,
+      cwd: payload.cwd, tabId: payload.tabId, dehydrate: false });
+    return findTabMessageSourceLocation(payload.message, { ...history, toolType, sessionId: payload.sessionId });
+  }
+
   async getToolPayload(payload = {}) {
     const toolType = normalizeToolType(payload.toolType);
     if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getToolPayload', payload);

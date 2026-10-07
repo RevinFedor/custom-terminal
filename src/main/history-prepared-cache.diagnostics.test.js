@@ -35,12 +35,13 @@ function fixture(t, options = {}) {
     save: () => cache.savePrepared({ owner, source, context, entries }),
     read: extra => cache.readPrepared({ owner, filePath, stat, context, ...extra }),
     continuation: () => cache.saveContinuation(owner, source, { sourceProof: [secret], graph: secret }),
-    db: callback => { const db = new Database(cache.filename(owner)); try { return callback(db); } finally { db.close(); } },
+    db: (callback, tier = 'rows') => { const db = new Database(cache.filename(owner, tier)); try { return callback(db); } finally { db.close(); } },
   };
 }
 function replaceMeta(f, key, value) {
   const body = v8.serialize(value);
-  f.db(db => db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?,?)').run(key, body, checksum(body)));
+  f.db(db => db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?,?)').run(key, body, checksum(body)),
+    key.startsWith('continuation') ? 'state' : key.startsWith('view:') ? 'rows' : 'timeline');
 }
 function readers(f, cache = f.cache) {
   const descriptor = { eventKey: secret, manifest: { manifestDigest: secret }, payloadPolicy: secret };
@@ -120,11 +121,11 @@ test('each read identifies a cold missing file without scanning directories', t 
 test('quota eviction is reported by prune and the exact subsequent read; rewrite clears its remembered reason', async t => {
   const f = fixture(t); await f.save(); f.continuation();
   const originalBudget = f.cache.maxBytes;
-  const bytes = fs.statSync(f.cache.filename(f.owner)).size;
+  const bytes = f.cache.stats().diskBytes;
   f.events.length = 0; f.cache.maxBytes = 0; f.cache.prune();
   assert.equal(f.events.length, 1, 'a quota scan emits an aggregate, not one event per file');
   const eviction = last(f.events, 'prune');
-  assert.equal(eviction.reason, 'disk-quota'); assert.equal(eviction.evictedCount, 1);
+  assert.equal(eviction.reason, 'disk-quota'); assert.equal(eviction.evictedCount, 3);
   assert.equal(eviction.evictedBytes, bytes); assert.equal(eviction.budgetBytes, 0);
   assert.equal(f.read(), null); assert.equal(last(f.events, 'readPrepared').reason, 'disk-quota');
   assert.equal(f.cache.readContinuation(f.owner, f.filePath, f.stat), null);
@@ -147,16 +148,20 @@ test('targeted invalidation has a different miss reason and does not invalidate 
   f.cache.invalidate(f.filePath + '-different');
   assert.equal(last(f.events, 'invalidate').reason, 'no-matching-source'); assert.ok(f.read());
   f.cache.invalidate(f.filePath);
-  assert.equal(last(f.events, 'invalidate').removedCount, 1);
+  assert.equal(last(f.events, 'invalidate').removedCount, 2);
   assert.equal(f.read(), null); assert.equal(last(f.events, 'readPrepared').reason, 'invalidation');
 });
 
 test('missing continuation, continuation source, view and timeline remain distinct', async t => {
   const f = fixture(t); await f.save();
   assert.equal(f.cache.readContinuation(f.owner, f.filePath, f.stat), null);
+  assert.equal(last(f.events, 'readContinuation').reason, 'no-file');
+  f.continuation();
+  f.db(db => db.prepare('DELETE FROM meta WHERE key=?').run('continuationSource'), 'state');
+  assert.equal(f.cache.readContinuation(f.owner, f.filePath, f.stat), null);
   assert.equal(last(f.events, 'readContinuation').reason, 'missing-continuation-source');
   f.continuation();
-  f.db(db => db.prepare('DELETE FROM meta WHERE key=?').run('continuation'));
+  f.db(db => db.prepare('DELETE FROM meta WHERE key=?').run('continuation'), 'state');
   let restored = 0;
   assert.equal(f.cache.readContinuation(f.owner, f.filePath, f.stat, () => restored++), null);
   assert.equal(restored, 1, 'the existing onRestore call order is preserved');
@@ -220,24 +225,24 @@ test('previous schema observation explains a version miss without a new hot-read
 
 test('old-version hints and invalidation summaries remain bounded across many actual SQLite files', t => {
   const f = fixture(t, { schema: '1-aa' }); f.continuation();
-  for (let i = 0; i < 300; i++) fs.copyFileSync(f.cache.filename(f.owner), f.cache.filename({ sessionId: 'old-' + i }));
+  for (let i = 0; i < 300; i++) fs.copyFileSync(f.cache.filename(f.owner, 'timeline'), f.cache.filename({ sessionId: 'old-' + i }, 'timeline'));
   const events = [];
   const cache = new HistoryPreparedCache({ directory: f.directory, schema: '1-bb', onDiagnostic: event => events.push(event) });
   assert.equal(cache.otherVersions.size, 256); assert.equal(events.length, 1);
-  assert.equal(last(events, 'prune').fileCount, 301);
+  assert.equal(last(events, 'prune').fileCount, 302);
   f.events.length = 0; f.cache.invalidate();
-  assert.equal(f.events.length, 1); assert.equal(last(f.events, 'invalidate').removedCount, 301);
+  assert.equal(f.events.length, 1); assert.equal(last(f.events, 'invalidate').removedCount, 302);
   cache.prune(); assert.equal(cache.otherVersions.size, 0);
   assert.equal(cache.readSource(f.owner), null); assert.equal(last(events, 'readSource').reason, 'no-file');
 });
 
 for (const corrupt of ['checksum', 'sqlite', 'serialization-version', 'index']) test('actual corrupt cache falls back with reason: ' + corrupt, async t => {
   const f = fixture(t); await f.save(); f.continuation();
-  if (corrupt === 'checksum') f.db(db => db.prepare("UPDATE meta SET checksum='bad' WHERE key='continuation'").run());
-  else if (corrupt === 'sqlite') fs.writeFileSync(f.cache.filename(f.owner), secret.repeat(512));
+  if (corrupt === 'checksum') f.db(db => db.prepare("UPDATE meta SET checksum='bad' WHERE key='continuation'").run(), 'state');
+  else if (corrupt === 'sqlite') fs.writeFileSync(f.cache.filename(f.owner, 'state'), secret.repeat(512));
   else if (corrupt === 'serialization-version') {
     const body = Buffer.from([255, 255, 255, 255, 255]);
-    f.db(db => db.prepare("UPDATE meta SET body=?,checksum=? WHERE key='continuation'").run(body, checksum(body)));
+    f.db(db => db.prepare("UPDATE meta SET body=?,checksum=? WHERE key='continuation'").run(body, checksum(body)), 'state');
   } else {
     f.db(db => db.prepare("UPDATE rows SET index_hash='bad' WHERE pos=0").run()); f.cache.clearMemory();
   }
@@ -245,8 +250,8 @@ for (const corrupt of ['checksum', 'sqlite', 'serialization-version', 'index']) 
   assert.equal(corrupt === 'index' ? f.read() : f.cache.readContinuation(f.owner, f.filePath, f.stat), null);
   const expected = { checksum: 'checksum-mismatch', sqlite: 'sqlite-corrupt', 'serialization-version': 'serialization-version', index: 'index-corrupt' }[corrupt];
   assert.equal(last(f.events, operation).reason, expected); assert.equal(last(f.events, operation).outcome, 'error');
-  assert.equal(fs.existsSync(f.cache.filename(f.owner)), false);
-  assert.equal(f.cache.readSource(f.owner), null); assert.equal(last(f.events, 'readSource').reason, expected);
+  assert.equal(fs.existsSync(f.cache.filename(f.owner, corrupt === 'index' ? 'rows' : 'state')), false);
+  assert.deepEqual(f.cache.readSource(f.owner), f.source, 'independent source certificate is not discarded with a corrupt tier');
   assert.equal(fs.readFileSync(f.filePath, 'utf8'), 'synthetic source');
 });
 
@@ -313,7 +318,7 @@ test('hot disk hits do not add filesystem scans, and a nonce mismatch only reloa
 
 test('orphan sidecars, active-file quota exclusions and filesystem failures produce bounded summaries', t => {
   const f = fixture(t); f.continuation();
-  const filename = f.cache.filename(f.owner);
+  const filename = f.cache.filename(f.owner, 'timeline');
   const orphan = f.cache.filename({ sessionId: 'orphan' }); fs.writeFileSync(orphan + '-wal', 'synthetic sidecar');
   f.cache.prune(); assert.equal(last(f.events, 'prune').reason, 'orphan-sidecar');
   assert.equal(last(f.events, 'prune').removedCount, 1);
@@ -337,7 +342,7 @@ test('orphan sidecars, active-file quota exclusions and filesystem failures prod
 
 test('missing source/proof and corrupt async initialization are diagnosed without changing returned values', async t => {
   const f = fixture(t); f.continuation();
-  f.db(db => db.prepare("DELETE FROM meta WHERE key IN ('source','sourceProof')").run());
+  f.db(db => db.prepare("DELETE FROM meta WHERE key IN ('source','sourceProof')").run(), 'timeline');
   assert.equal(f.cache.readSource(f.owner), null); assert.equal(last(f.events, 'readSource').reason, 'missing-source');
   assert.equal(f.cache.readSourceProof(f.owner), null); assert.equal(last(f.events, 'readSourceProof').reason, 'missing-source-proof');
   fs.writeFileSync(f.cache.filename(f.owner), secret.repeat(512));
@@ -371,8 +376,8 @@ test('native SQLITE_FULL and invalidated async transactions diagnose the exact w
   assert.equal(f.cache.activeFiles.size, 0); assert.ok(!JSON.stringify(f.events).includes(secret));
 });
 
-test('unexpected cache exceptions retain a safe source location instead of only a generic miss', t => {
-  const f = fixture(t); f.continuation();
+test('unexpected cache exceptions retain a safe source location instead of only a generic miss', async t => {
+  const f = fixture(t); await f.save();
   const result = f.cache.withDb(f.owner, false, () => {
     const error = new TypeError(secret);
     error.stack = 'TypeError: ' + secret + '\n at read (/private/' + secret + '/history-reader.js:42:7)';
@@ -409,8 +414,8 @@ test('diagnostics have bounded scalar events/history, no bodies or full paths, a
   assert.equal(f.cache.readSource(unusualOwner), null);
   assert.match(last(f.events, 'readSource').sessionId, /^[a-f0-9]{64}$/);
   for (let i = 0; i < 300; i++) {
-    const filename = f.cache.filename({ sessionId: 'bounded-' + i });
-    fs.copyFileSync(f.cache.filename(f.owner), filename); f.cache.removeFile(filename, 'invalidation');
+    const filename = f.cache.filename({ sessionId: 'bounded-' + i }, 'timeline');
+    fs.copyFileSync(f.cache.filename(f.owner, 'timeline'), filename); f.cache.removeFile(filename, 'invalidation');
   }
   assert.equal(f.cache.recentRemovals.size, 256);
   assert.ok([...f.cache.recentRemovals.keys()].every(key => /^[a-f0-9]{64}$/.test(key)));
@@ -418,5 +423,5 @@ test('diagnostics have bounded scalar events/history, no bodies or full paths, a
   f.cache.readSource({ sessionId: 'bounded-299' }); assert.equal(last(f.events, 'readSource').reason, 'invalidation');
   const afterRestart = new HistoryPreparedCache({ directory: f.directory });
   assert.equal(afterRestart.recentRemovals.size, 0, 'removal history is never made durable');
-  assert.deepEqual(fs.readdirSync(f.cache.directory), [path.basename(f.cache.filename(f.owner))]);
+  assert.deepEqual(fs.readdirSync(f.cache.directory).sort(), ['rows', 'state', 'timeline'].map(tier => path.basename(f.cache.filename(f.owner, tier))).sort());
 });

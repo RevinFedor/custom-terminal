@@ -245,6 +245,9 @@ Claude receipt добавляет `mutationSessionId`, `fileDeleted` и
 
 `kind: delete` удаляет одну семантическую user-итерацию с её ответом/инструментами;
 `rewind` удаляет выбранную итерацию и будущее. Диапазон не вычисляется на iOS.
+У Codex конец такого диапазона — physical EOF, не последняя точка Timeline:
+assistant/tool записи после compact без нового user также являются удаляемым
+будущим. Generic Delete/Edit одной итерации этой suffix-семантики не получают.
 Rewind единственной итерации законно возвращает Timeline0 и History без user/
 assistant (служебные model/effort могут остаться). Exact app-materialized rewrite
 отличается от неизвестного thin native fork по сохранённому полному snapshot и
@@ -263,6 +266,16 @@ proof. Для physical истории достаточно exact UUID/session; �
 `GET /api/terminal-tabs/:tabId/history-operations/:operationId` возвращает202
 пока исход pending,200 для completed,409 для failed;404 означает неизвестный ID.
 `ok:true` означает, что квитанция прочитана, а не что операция удалась.
+Terminal MCP использует этот же вход через `rewind_history`, только `kind:rewind`,
+и reader `get_history_operation`; native/AI-summary Rewind через MCP не exposed.
+Reader сохраняет failed receipt из409 как `ok:true, operation.success:false`,
+а optional current `/status` возвращает отдельно. Контракт аргументов/ACK recovery:
+`fact-terminal-mcp.md::Saved-history Rewind через MCP`. UI native API не меняется.
+Новый MCP Codex POST требует `savedHistory.codexPhysicalSuffix:true`; один base
+version1 не доказывает исправленный executor. `repairOfOperationId` — отдельный
+authorized intent для exact старого completed COW/current child; он сверяет
+previous output и original target, не пересылает prompt и не правит old receipt.
+Точный контракт repair/entryRef и его capability — в том же terminal fact.
 Тот же ID+тот же запрос возвращает прежний receipt (`idempotent:true`), другой
 запрос с тем же ID —409. Стадии приходят по существующему tab SSE/WS как
 `saved-history-operation`; event несёт небольшой progress, полный draft читается GET.
@@ -612,6 +625,12 @@ Codex canonical History теперь возвращает role/serviceCarrier `p
   `active` в `unknown`; presentation failure логируется отдельно. Иначе server
   сам выпускает более новую ложную revision, которую native обязан принять.
 - Delivery receipt относится к одной отправке, а не к вкладке. `sent`, `queued`, `audit-pending`, `delivery-unknown` и exact refusal живут на конкретной user-row; read-only `/send-receipts` позволяет сверить прежний handoff после reconnect без повторного Enter.
+  Отдельный explicit POST `send-receipts/reconcile` с exact operationKey/attemptId
+  заново использует прежний Codex auditor; capability receiptReconciliation v1.
+  Reconciliation и receipt раздельны, отрицательный поиск не даёт no-write/abandon.
+  Только exact promotion может разбудить уже сохранённый follower; inputReady и
+  его доставка всё ещё проверяются отдельно. Контракт: fact-terminal-mcp.md,
+  «Адресный Повтор Audit Квитанции».
 - Transcript projection (`projection.transcript`, `entryId`, `kind`, `ephemeral`) говорит, можно ли событие класть в видимую историю и использовать для materialization/Timeline.
 
 Старый симптом смешения: iPhone получал `done/busy=false`, гасил thinking, но финальная assistant-строка появлялась только после следующего `/history`; пользователь видел пустой зазор между loader и ответом. Другой симптом — startup `/model` или `/effort` мелькал как user-row, а canonical `/history` тут же удалял его. Правило: UI-событие считается опубликованной историей только после transcript projection или canonical history reload; runtime `done` означает конец turn'а, а не то, что все display rows уже доставлены.
@@ -775,6 +794,14 @@ PTY-Claude и PTY-Codex табы). Четыре неочевидных факт�
   применяет его на штатной безопасной границе. Queued ACK не меняет effective
   model/effort. GET отдаёт фактически наблюдённую пару и requested/pending отдельно;
   fallback остаётся помеченным намерением, не proof. Fast — самостоятельный intent.
+  Standalone Codex legacy POST `/params` принимает raw `model`/`effort`, например
+  `{model:"gpt-6.1-sol"}` для model-only. `modelSelection` из create/send здесь
+  не разрешается: этот bridge читает только model/effort/thinking. Нельзя добавлять
+  `requestId` по общей capability без проверки operationProviders: receipt branch
+  сейчас Claude-only и Codex получает `settings_provider_unsupported`, тогда как
+  legacy POST сохраняет intent. Partial выбор наследует доказанную вторую половину
+  пары; при её неизвестности не подставлять global/default effort. Смена intent
+  не меняет модель уже исполняющегося provider request задним числом.
 - **Think — одна toggle-пилюля, не on/off-пара.** Mirror десктопной Think-кнопки:
   `Think ON`/`Think OFF`, тап флипает. Для PTY каждая смена шлёт
   `claude:toggle-thinking` с абсолютным желаемым состоянием. Main проверяет
@@ -822,7 +849,7 @@ physical остаток — `docs/tmp/claude-startup-failure-audit-2026-09-14.md
 Мобильная панель Run-after (иконка в правом верхнем углу хедера, рядом с timeline-бургером) — **зеркало** десктопного `PromptQueueOverlay`, не самостоятельная фича. Ключевой инвариант: **мобилка не владеет очередью**. Единственный источник правды — десктопный `usePromptQueueStore`, единственный движок исполнения — App-root синглтон `usePromptQueueRunner` (см. `fact-prompt-queue.md`). Мобилка только (1) читает live-core и (2) шлёт мутации; стрельбу промптов делает десктоп. Это тонкий remote, не второе хранилище; params, напротив, читают факты из main, а не из бывших effort/think window-карт.
 
 **Три канала (read / write / live), все через bridge:**
-- **Read:** `GET /queue` → bridge `getPromptQueue` → renderer сериализует `serializePromptQueueCore(getQueue(tabId))` + список sibling AI-табов (для pivot-пикера «on tab», тот же предикат что десктопный `RunAfterTabPicker`: SDK / PTY-claude+sessionId / gemini+sessionId, self исключён).
+- **Read:** `GET /queue` → bridge `getPromptQueue` → renderer сериализует `serializePromptQueueCore(getQueue(tabId))` + общий typed inventory для dependency-picker: Claude/Codex/Gemini, включая ещё не запущенные, и SDK. Self и provider child-subagents исключены; visual child — обычная вкладка. Session id нужен executor'у, а не для показа fresh target.
 - **Write:** любой контрол → `POST /queue {op,args}` → bridge `mutatePromptQueue` → вызывает **тот же store-метод** что десктопный оверлей (`addPrompt`/`updatePrompt(enabled)`/`setAutoRun`/`setStopAfter`/`setCloseAfter`/`setRunAfterTab`/`setFirstDelaySeconds`/`setPostPrompt*`/...). Все каскады (closeAfter⟹stopAfter, auto-disarm на manual empty-out по active-count, SQLite-persist, hint-arming) срабатывают идентично — мы **не реимплементим** логику очереди, только remote-invoke. Op-таблица `QueueOp` в `mobile-web/src/api.ts` — 1:1 с case-веткой в `App.tsx::mutatePromptQueue`.
 - **Live:** любое изменение store (десктоп ИЛИ телефон) → `usePromptQueueWebSync` (App-root, рядом с runner) диффает per-tab core-JSON → `web:broadcast-queue` IPC → main `_webBroadcast(type:'queue-update')` → SSE → телефон обновляет мирор. Поэтому successful Run after удаляет sent item и одноразовый `runAfterTabId` на desktop, native iOS и legacy Android/mobile-web одним store-commit; клиент не держит локальный статус, способный переиграть эту дельту. `webBroadcast` no-op'ит без подписчиков, поэтому на desktop-only пути это один `JSON.stringify`+Map-дифф на мутацию и ничего больше.
 
@@ -830,9 +857,25 @@ physical остаток — `docs/tmp/claude-startup-failure-audit-2026-09-14.md
 
 **Почему web-sync на App-root, не в панели:** идентично runner'у — панель unmount'ится как только юзер ушёл с Claude-таба, но телефон может смотреть **фоновый** таб. Gated-by-active-tab бродкастер замолчал бы ровно когда телефон ждёт дельту. См. `fact-prompt-queue.md::Auto-runner — singleton hook, не в overlay`.
 
-**UI-маппинг на десктопный оверлей (bottom-sheet, не right-panel — thumb-reach, как ParamsSheet/ActionSheet):** хедер-иконка = list-глиф + violet `[N]` когда armed; `[N]` считает только enabled items, как desktop. При открытой панели становится ✕ (закрывает и панель, и редактор). Две колонки настроек: левая — pivot «on tab» + delay-секунды; правая — Run after (violet) / Stop after split с power-иконкой Close-after (red) / Post split с карандашом. Список очереди (≈5 строк, потом скролл), тап по строке или «+ Add» → инлайн-редактор (Mirror Editing, ≈5 строк textarea, Save). Checkbox на строке шлёт `update(enabled)` и оставляет disabled item видимым с темно-малиновым фоном; это mirror skip-state, не mobile-only фильтр. `queue-update` SSE держит всё live без ре-фетча. Цвета — те же семантические роли что в `PromptQueueOverlay`: `#a78bfa` armed, `#8b5cf6` pivot-target, `#DA7756` stop/post, `#ef4444` close.
+**Legacy Android/mobile-web UI-маппинг (не описание нового native UI):** bottom-sheet, не right-panel — thumb-reach, как ParamsSheet/ActionSheet. Хедер-иконка = list-глиф + violet `[N]` когда armed; `[N]` считает только enabled items. Две колонки: pivot «on tab» + delay-секунды; Run after / старый Stop-after split / Post. Checkbox шлёт `update(enabled)` и оставляет disabled item видимым. Текущий desktop wire при этом уже хранит Stop/Close как `metaAction` cards; compatibility flags false нельзя читать как состояние этих действий. Native parity декодирует карточки и работает по capability ниже, не копирует старые flag-toggle или часовой UI-cap.
 
 **Prod требует `build:install`** — `App.tsx::handleWebBridge` (новые actions) и `web-server.js` (новые routes) живут в asar; mobile-web Vite-dev итерирует только фронт. См. «Stale prod-app → silent bridge timeout» ниже.
+
+### RunAfter v1: удалённое редактирование и квитанции
+
+*Телефон управляет прежним Root store/runner; новая квитанция описывает application mutation, не доставку provider prompt. Потерянный HTTP ACK не разрешает новую операцию.*
+
+Gate — `/me.capabilities.runAfter.version === 1`, не `sendQueue`. Опт-in GET прежнего tab route `?runAfter=1` возвращает прежние `queue/aiTabs` плюс `runAfter`: logical configuration scope, opaque Main+renderer epoch, authoring revision/order/guard, отдельный viewRevision, editor/countdown/runtime. `includeActions=1` возвращает общий desktop model/effort catalog; Think/Fast остаются live-настройками, не свойствами prompt. Reader соединяет данные с origin подключения; configuredSessionId не выдаётся за writer proof. MainScopeKey привязан к настоящему conversation owner. SSE `queue-update` несёт тот же block; `project-activity.runAfter` — coalesced wake, не копия prompt bodies. После reconnect/new epoch нужен свежий GET; меньшие revision/viewRevision и ответы старого запроса не откатывают состояние.
+
+Шрам06.10: advertised v1 и green isolated HTTP fixture не доказали запуск полного web service. Strict GET отдавал503 `projectManager is not defined`, legacy GET200: fixture внедрил отсутствующий production-global. Module-level scope/journal/commit теперь получают прежний project-manager singleton в своём lexical scope. Приёмка включает полный CommonJS module без такого global: strict GET, metadata scope, SQLite commit/receipt и same-ID recovery. Недоступный versioned reader нельзя заменять пустой очередью или считавшимся успешным legacy-ответом.
+
+POST `{op,args,runAfter:{version:1,operationId,expected:<guard>,editorToken?}}` сохраняет immutable request. Устаревшие order/revision/scope и editor lock отклоняются до изменения; без envelope остаётся legacy-путь без новых гарантий. `GET /api/run-after/operations/:operationId` возвращает historical `operation`, не текущую очередь. Applied значит подтверждённую application mutation; для `sendNow` проверяется отдельный `result.send`, для AutoCompact — `result.outcome`. Unknown/timeout/restart повторно не исполняются; клиент сохраняет body/ID и читает эту квитанцию, не обновляет guard под тем же ID. Fresh POST может отдельно вернуть `current`, historical replay его не подделывает. Main store snapshot и applied receipt коммитятся вместе; неполученный ACK/RAM-change не объявляется no-write.
+
+Per-item timer/onTab/app-restart, clear trigger, action update, editor begin/end и Compact50 вызывают прежние owners. Pause сохраняет остаток enabled-head timer либо legacy delay; native не пересчитывает его сам. Compact50 ставит create-only condition и auto-arm только по coherent current Main busy proof. Unknown runtime не запрещает staging Compact-карточки: результат сохраняет `ownerProof.known:false`, не выдумывает busy/off и не включает Run. Unknown context не равен нулю, неподдержанная model/effort пара не нормализуется в ближайшую.
+
+Rich `add/update` передают queue snapshot `text/images/imagePaths/chips`, включая сохранённые prompt/paste тела. Image bytes принадлежат прежнему asset store до committed ACK. `replay` сохраняет immutable draft и leases до удаления выбранной карточки, возвращает `draftMode:append,submitted:false`: native импортирует его один раз по operationId, без Enter и без очистки существующего draft. После сохранения/отказа от переноса явный `POST /api/run-after/operations/:id/release {tabId}` освобождает lease, не удаляет receipt. Unknown release запрещён. Owned preview — `POST /api/run-after/image-preview {assetId,variant?:thumbnail|detail}`, не произвольный путь. Отдельного документа/filePaths codec у RunAfter нет; ordinary Send images/files не отключаются.
+
+`GET /api/run-after` — общий metadata-only active/staged/dependency обзор, без N+1 History. `/api/run-after/auto-compact` читает/меняет прежний global policy, exclusions и activity. GET не включает правило и не выбирает scope; first-open workflow — лишь предложение. Explicit `requestNow`/`cancel` требуют `targetGuard` выбранной queue; `resume` по умолчанию false, true означает явный запуск выбранной stopped-сессии прежним coordinator. Cancel дополнительно требует текущий `activityId` (activity.handoffId); compacting/resuming не прерывается. После проверенного admission собственный Resume/Send вправе закончиться historical receipt при уже новом current owner; это не обход physical guard и не повтор. Автоматический eligibility/new-natural-answer/failure continuation неизменён.
 
 ## Native clients share the REST/SSE contract
 
@@ -1224,6 +1267,47 @@ compactStartConfirmed=true + localCommandProof=codex-compact-causal-task-started
 сохраняет прежнее восстановление. B5 от30.09 уже удовлетворяет legacy-признакам,
 поэтому исправление native merge не обязано ждать установки additive GET.
 
+### Компактный Ctrl+Tab: read-only порядок desktop, явный контекст клиента
+
+`/api/me.capabilities.workspaceSwitcher` с `version:1` **и** `iconCatalogVersion:1` открывает
+`GET /api/workspace/switcher?scope=desktop` либо `scope=native` с обязательными
+`anchorTabId` (пустая строка = null) и `visibleTabIds` (URL-encoded JSON array).
+Native anchor входит в visible; IDs проверяются против того же живого каталога.
+Неизвестный/закрытый/subagent ID даёт 409, а не подставленный Mac-контекст.
+`/api/workspace` остаётся placement API, его ответ не эквивалентен переключателю.
+
+Whitelist-ответ несёт version/epoch/revision/known, `scope`, `requestKey`, `view`,
+упорядоченные `rows` kind workflow/tab, `initialIndex` (с учётом заголовков) и
+`initialTabId`, `totalTabs`, `truncated:false`, `rendererOwner`. Строки содержат
+только названия/ID/иконки/type/provider/fileRef и availability/selectable/anchor,
+без полного Tab/draft/History. Workflow-заголовки повторяются по MRU; каталог не
+обрезается до пяти строк. Missing файл остаётся disabled, unknown не выдумывает
+missing: selectable следует тому же desktop predicate до точного file verdict.
+Иконки хранятся один раз в `icons:{iconId:exactString}`; header.iconId и
+tab.projectIconId — локальные ссылки внутри этого ответа, null = прежний fallback.
+Header.iconFallback даёт text/color из тех же workflowVisuals, у unplaced он null.
+Их нельзя кэшировать отдельно от snapshot. В промежуточной установленной сборке
+05.10 был version1 без iconCatalogVersion: там повторяющиеся icon/projectIcon
+раздули 111 вкладок до 654КБ. Один version1 не включает окончательный consumer;
+новый marker отличает проверенный компактный формат без N+1 загрузки иконок.
+
+Main lease меняет epoch при новом renderer/frame/HTTP-service restart.
+Внутри epoch revision растёт по MRU, фокусу, составу, placement, title/icon и
+file verdict; runtimeRevision и spacesFingerprint её не заменяют. Клиент
+связывает ответ с API-origin, своей connection generation и exact requestKey;
+revision сравнивается только внутри epoch. Wake в корне `project-activity`
+REST/SSE: `workspaceSwitcher:{version,epoch,revision,available,scopes}` — через
+прежний ~80ms scheduler, без строк/тел. Это глобальный список, не N+1 по проектам.
+После reconnect/new epoch сначала новая исходная metadata-проверка; старый GET
+не может выбирать эпоху заново. Ответ ниже уже принятого wake/GET игнорируется.
+
+400 означает неверный scope/query, 409 — stale context/superseded snapshot,
+503 — renderer/bridge/структурный restore unavailable, 502 — invalid snapshot.
+Ошибки возвращают known:false и текущий wake; это не известный пустой каталог.
+Нет DB/MRU fallback или фонового запуска: только existing store selector и один
+существующий batch existence probe для файлов. App не ждёт provider-ready для
+чтения каталога; HTTP bridge timeout 5s, поздний ответ не применяет навигацию.
+
 ### Общие владельцы состояния
 
 Внутренний coherent Main snapshot для common scenario admission сохраняет
@@ -1395,6 +1479,7 @@ GET  /api/terminal-tabs/:tabId/history              → JSON or NDJSON (Accept-d
                                                → Accept: application/x-ndjson → streamed line-by-line, Brotli-4
 POST /api/terminal-tabs/:tabId/truncate              → drop everything ≥ targetUuid (Edit/Repeat)
 GET  /api/terminal-tabs/:tabId/send-receipts        → read-only durable receipt list; optional `handoffId`, чтение никогда не повторяет send
+POST /api/terminal-tabs/:tabId/send-receipts/reconcile → exact `{operationKey,attemptId}` proof-read; прежний Codex scanner/CAS, без native input/retry или отрицательного settlement
 GET  /api/terminal-tabs/:tabId/timeline             → server-normalized Timeline; composite строки несут `entryRef` + `contentRevision`
 POST /api/terminal-tabs/:tabId/rewind               → общий agent scenario; exact tuple проходит до main write-boundary, stale/ambiguous target отклоняется до provider mutation
 GET  /api/terminal-tabs/:tabId/rewind-state         → read-only commit/unchanged/pending проекция prepared native branch
@@ -1410,6 +1495,7 @@ GET  /api/terminal-tabs/:tabId/pending-question      → текущий AskUserQ
 POST /api/terminal-tabs/:tabId/answer-question       → answerClaudeQuestion ({source, answers, stop})
 GET  /api/active-loaders                       → live loaders snapshot для external install preflight
 GET  /api/project-activity                     → full project activity snapshot для native project badges
+GET  /api/workspace/switcher?scope=desktop|native → exact compact Ctrl+Tab selector; native требует anchorTabId+visibleTabIds, без навигационных writes
 GET  /api/history-freshness?tabIds=<JSON array> → opt-in small read-source metadata, без History fanout; не outcome/provider status
 GET  /api/events?scope=projects                → SSE только project-activity, без tab transcript watcher'ов
 POST /api/mobile-attachments                   → upload iOS camera/gallery/file bytes в Mac temp, cap 25MB
@@ -1805,6 +1891,12 @@ Saved inactive tabs читают свои планы/count без Resume, а Fas
 
 Existing project-activity SSE/REST добавляет компактный wake
 `cardSignals:{version:1,epoch,revision,allProjects,projectIds:[...]}`.
+`epoch` принадлежит Main `appRuntimeIdentity`, не HTTP `service.instanceId`.
+Последний — отдельная identity web-service; равенство двух UUID не является
+контрактом. После connection/origin gap клиент получает producer baseline из
+нового `/api/project-activity.cardSignals`, затем сравнивает scoped `/tabs` с
+этим clock. Поздний GET не может сам сменить baseline. Отказ optional card clock
+оставляет cards stale/unknown, но не превращает успешный каталог `/tabs` в ошибку.
 Это invalidation, не значения Fast/плана. Изменения tier/owner runtime,
 плана, pending updates, layout/save и палитры используют прежний80ms debounce.
 Catalog/marker change ставит allProjects; metadata не добавляет fake busy/count

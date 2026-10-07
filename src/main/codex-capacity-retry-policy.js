@@ -4,6 +4,7 @@
 const DEFAULT_CODEX_CAPACITY_RETRY_SETTINGS = Object.freeze({
   codexCapacityRetryEnabled: true,
   codexCapacityRetryLimit: 1,
+  codexCapacityRetryDelaysMs: Object.freeze([]),
 });
 
 function normalizeCodexCapacityRetrySettings(value = {}) {
@@ -13,6 +14,11 @@ function normalizeCodexCapacityRetrySettings(value = {}) {
     codexCapacityRetryLimit: Number.isFinite(limit)
       ? Math.max(1, Math.min(10, Math.trunc(limit)))
       : DEFAULT_CODEX_CAPACITY_RETRY_SETTINGS.codexCapacityRetryLimit,
+    codexCapacityRetryDelaysMs: Array.isArray(value?.codexCapacityRetryDelaysMs)
+      ? value.codexCapacityRetryDelaysMs.slice(0, 10)
+        .filter(ms => typeof ms === 'number' && Number.isFinite(ms))
+        .map(ms => Math.max(60_000, Math.min(7 * 24 * 3600_000, Math.round(ms / 60_000) * 60_000)))
+      : [],
   };
 }
 
@@ -118,7 +124,9 @@ function reduceCodexCapacityRetry(previousState, event, settings = {}) {
       effect: null,
     };
   }
-  const canContinue = state.attempts < config.codexCapacityRetryLimit;
+  const delayIndex = state.attempts - config.codexCapacityRetryLimit;
+  const delayMs = delayIndex < 0 ? 0 : config.codexCapacityRetryDelaysMs[delayIndex];
+  const canContinue = state.attempts < config.codexCapacityRetryLimit || Number.isFinite(delayMs);
   const next = {
     ...state,
     attempts: state.attempts + (canContinue ? 1 : 0),
@@ -132,6 +140,10 @@ function reduceCodexCapacityRetry(previousState, event, settings = {}) {
   const effect = canContinue || !state.exhausted
     ? effectFor(canContinue ? 'continue' : 'exhausted', next, event)
     : null;
+  if (effect?.type === 'continue' && delayMs > 0) {
+    effect.delayMs = delayMs;
+    effect.delayIndex = delayIndex;
+  }
   next.pendingEffectId = effect?.handoffId
     || (!canContinue && state.exhausted ? state.pendingEffectId : null);
   return { state: next, effect };
@@ -146,7 +158,10 @@ function isCodexCapacityRetryEffectCurrent(state, effect, settings = {}) {
     || state.attempts !== effect.attempt) return false;
   if (effect.type === 'exhausted') return state.exhausted;
   return effect.type === 'continue' && !state.exhausted
-    && state.attempts <= config.codexCapacityRetryLimit;
+    && (effect.delayMs > 0
+      ? effect.delayIndex === state.attempts - config.codexCapacityRetryLimit - 1
+        && config.codexCapacityRetryDelaysMs[effect.delayIndex] === effect.delayMs
+      : state.attempts <= config.codexCapacityRetryLimit);
 }
 
 module.exports = {

@@ -10,6 +10,19 @@ import {
 
 const fingerprint = text => createHash('sha256').update(text, 'utf8').digest('hex');
 
+test('plain MCP prompts select the same purple presentation without invented run identity', () => {
+  const entry = { role: 'user', content: 'Continue source check', semanticTags: [{ kind: 'prompt-origin', source: 'terminal-mcp' }] };
+  assert.deepEqual(resolveHistoryOrchestrationPromptPresentation(entry), { kind: 'terminal-mcp', phase: 'prompt' });
+  assert.deepEqual(projectHistoryServicePromptBody(entry, fingerprint), { text: entry.content, projected: false });
+  assert.deepEqual(resolveHistoryOrchestrationHandoffPresentation({ handoffId: 'specific-send', source: 'codex-terminal-mcp' }),
+    { kind: 'terminal-mcp', phase: 'prompt' });
+  const id = 'tab-message:fd4156d7-3441-410a-bad3-534c2c8f005f';
+  assert.deepEqual(resolveHistoryOrchestrationHandoffPresentation({ handoffId: id, source: 'codex-' + id }),
+    { kind: 'terminal-mcp', phase: 'prompt' });
+  assert.equal(resolveHistoryOrchestrationHandoffPresentation({ handoffId: 'other', source: 'codex-' + id }), null);
+  assert.equal(resolveHistoryOrchestrationPromptPresentation({ ...entry, semanticTags: [], content: '[Tab message: reply] terminal-mcp' }), null);
+});
+
 test('audited Terminal MCP orchestration metadata selects the purple user treatment', () => {
   for (const phase of ['request', 'completion', 'failure']) {
     assert.deepEqual(resolveHistoryOrchestrationPromptPresentation({

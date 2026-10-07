@@ -12,6 +12,8 @@ const cache = new Map<string, boolean>(); // path -> exists
 const listeners = new Set<() => void>();
 let inFlight: Promise<void> | null = null;
 let lastProbeAt = 0;
+let probeSequence = 0;
+const latestProbeByPath = new Map<string, number>();
 const PROBE_TTL_MS = 5000;
 
 export function fileExistsVerdict(path: string | undefined | null): boolean | undefined {
@@ -32,22 +34,27 @@ export function subscribeMissingFiles(fn: () => void): () => void {
 // Probe the given paths (deduped, TTL-throttled). Safe to call from render
 // effects on every open/interaction; the actual IPC fires at most once per
 // TTL window unless `force`.
-export function probeFiles(paths: string[], force = false): void {
+export function probeFiles(paths: string[], force = false): Promise<void> {
   const unique = [...new Set(paths.filter(Boolean))];
-  if (unique.length === 0) return;
+  if (unique.length === 0) return Promise.resolve();
   const now = Date.now();
-  if (!force && inFlight) return;
-  if (!force && now - lastProbeAt < PROBE_TTL_MS && unique.every((p) => cache.has(p))) return;
+  if (!force && inFlight) return inFlight;
+  if (!force && now - lastProbeAt < PROBE_TTL_MS && unique.every((p) => cache.has(p))) return Promise.resolve();
   lastProbeAt = now;
-  inFlight = ipcRenderer.invoke('file:exists-batch', unique)
+  const sequence = ++probeSequence;
+  unique.forEach(path => latestProbeByPath.set(path, sequence));
+  const probe: Promise<void> = ipcRenderer.invoke('file:exists-batch', unique)
     .then((res: Record<string, boolean>) => {
       if (!res) return;
       let changed = false;
       for (const [p, exists] of Object.entries(res)) {
+        if (latestProbeByPath.get(p) !== sequence || typeof exists !== 'boolean') continue;
         if (cache.get(p) !== exists) { cache.set(p, exists); changed = true; }
       }
       if (changed) listeners.forEach((fn) => { try { fn(); } catch {} });
     })
     .catch(() => {})
-    .finally(() => { inFlight = null; });
+    .finally(() => { if (inFlight === probe) inFlight = null; });
+  inFlight = probe;
+  return probe;
 }

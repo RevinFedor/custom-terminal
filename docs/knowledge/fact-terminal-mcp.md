@@ -86,7 +86,7 @@ process lookups. Установка из собственной сессии —
 ### Один публичный MCP, несколько внутренних границ
 После унификации публичная AI-поверхность одна: `~/.claude/mcp/terminal-server.mjs`. Она не переносит бизнес-логику в MCP, а типизированно вызывает существующие main-process HTTP/API-сценарии:
 - live process control и shell output;
-- Project API для agent send/interrupt/rewind, долговечной оркестрации AI-вкладок и отслеживаемых browser-консультаций SC Desktop;
+- Project API для agent send/interrupt, saved-history Rewind, долговечной оркестрации AI-вкладок и отслеживаемых browser-консультаций SC Desktop;
 - `/overseer/*` как внутренний read/edit backend истории;
 - renderer bridge для persistent UI-state: план задач, имя вкладки и file-child.
 
@@ -127,6 +127,14 @@ Terminal MCP управляет **живым процессом**, а не ис�
 
 ### Готовность целевой вкладки и отправка prompt
 
+`close_tab` использует общий полный Close: вместе с владельцем закрываются
+связанные файловые вкладки и их размещения, но не disk files и не самостоятельные
+AI-child с их файлами. Возвращённый общим обработчиком отказ (например archive/save
+или неподтверждённый PTY Stop) передаётся caller, а не превращается в прежний
+безусловный `closed:true`. Внешняя схема метода не менялась;
+placement-only «Убрать» остаётся отдельным UI-действием. Подробности —
+`fact-tabs.md::Файловые вкладки как visual-child`.
+
 Явный `send_prompt` с `submit=true` является разрешением вернуть адресованную AI-вкладку в рабочее состояние. Остановленный процесс возобновляется общим send-сценарием; закрытая вкладка сначала восстанавливается в фоне из единственной архивной записи с тем же исходным `tabId`, после чего тот же сценарий поднимает прежнюю Claude/Codex-сессию и выполняет отправку. Архивная запись, рабочая папка и восстановленная вкладка проверяются до Enter. Удалённая запись, два архива с одним identity, другой тип вкладки или недоступная папка дают явную ошибку: создавать «похожую» новую сессию запрещено. Пассивный lifecycle/restart reconcile вкладку не открывает — закрытие пользователем сохраняет силу, пока не придёт новый явный send. `submit=false` остаётся операцией над уже живым composer и сам вкладку не восстанавливает.
 
 `start_ai` подтверждает не только запись launch-команды. Для Claude ответ
@@ -154,6 +162,9 @@ Cold Codex Send использует `startupWait` того же main-owned laun
 absolute deadline, terminal/run/lifecycle proof, не собственный ранний30s отказ.
 Новый wake срок не продлевает; смена launch, Stop, manual picker и startup failure
 завершают подготовку без paste. Обычный live-picker без launch сохраняет30s guard.
+Late join использует тот же абсолютный Main deadline, даже когда осталось менее
+30s; renderer не добавляет новый бюджет. Это граница ожидания, не запрет уже
+доказанной готовности: окончательный допуск записи остаётся у physical guards.
 Точный Stop до paste даёт cancelled receipt, не generic preflight failure;
 уже подтверждённая отправка сильнее поздней отмены. Старые failed receipts не replay.
 
@@ -415,6 +426,9 @@ Completion caller резервирует stable `history:<sourceTabId>:orchestra
 затем новый renderer повторно enqueue-ил того же caller и конфликтовал по fingerprint;
 просто уравнять хэш означало бы риск self-join. Guard сохранён, callback audit
 переносит точные operationKey/attemptId. Явно скрытые старые completions не оживляются.
+Completion больше не сравнивает pinned SID с ранним null snapshot до общего
+Send. Исходный pin сохраняется до прежнего provisional/final proof; другой
+запуск или подтверждённый чужой SID по-прежнему запрещают физическую отправку.
 
 Это не Run After: его future conditions и natural-turn completion прежние.
 Независимая orchestration по-прежнему требует idle/new turn; после ожидания
@@ -448,6 +462,72 @@ entered/unknown не повторяет отправку и держит сле�
 renderer-поверхности не отзывает готовность другого живого App renderer.
 Уже существовавшие legacy unknown receipts не переписываются этой миграцией.
 
+#### Адресный Повтор Audit Квитанции
+
+После restart старый provider-owned head может остаться delivery-unknown даже
+при idle/inputReady нового процесса. GET send-receipts лишь читает сохранённое
+startup-решение; он не запускает новый scan. Ожидающий follower нельзя оживлять
+новым Send, скрытием head или fake not-submitted. Поздний точный transcript-proof
+можно отдельно сверить существующим аудитором через Application API:
+`POST /api/terminal-tabs/:tabId/send-receipts/reconcile`, тело
+`{operationKey,attemptId}`. Требуется app capability
+`sendQueue.receiptReconciliation.version=1`; первичный endpoint поддерживает Codex.
+MCP `get_send_receipt` остаётся read-only, без нового implicit reconcile/retry.
+Адресный POST доступен также как `reconcile_send_receipt({tabId,operationKey,attemptId})`.
+
+API не принимает текст, SID, файл или готовый audit от caller. Main берёт exact
+receipt, участвует в прежнем tab-wide audit single-flight, передаёт scanner все
+конкурирующие physical boundaries и после await повторно проверяет attempt и
+immutable source identity. Глобальные audit references берутся из того же store
+без prompt/attachment bodies: подтверждение другого tab того же source не может
+стать подтверждением выбранного head. Only found proof проходит прежний
+publishAgentPromptAuditResult/promoteFromAudit CAS. Тот же canonical row не
+присваивается второй Codex операции. Already confirmed читается идемпотентно.
+SOURCE06.10 переносит запрет в общую transactional promotion-границу, включая
+startup и live, а не только этот POST. Claim содержит UUID/source aliases
+парных response/event carriers; metadata сохраняется и после receipt-prune.
+Ранний адрес может уточниться до canonical, но поздний дубликат не понижает его.
+Исторические competing owners не назначаются произвольно одному отправителю.
+
+Live audit переносит всю canonical identity event carrier, включая его физический
+offset/timestamp, даже при event→response порядке. Causal admission сравнивает
+boundary с первым carrier пары, в том числе не принадлежащим app receipt; поздний
+companion ручного сообщения не становится новым Send proof. Scanner отдельно восстанавливает
+структурный pairing context перед нижней границей attempt; late companion с
+первым carrier до неё не становится новым user proof. Context читается на том же
+FD, до terminal reset/предыдущего task_started, с повторной проверкой файла;
+assistant/tool bodies и image data URLs не сохраняются в metadata-кандидатах.
+Первый task_started допускает ранний response→event, повторный start разделяет
+turns; event до start не связывается с новым response после start. Presentation
+сохраняется только после принятой common promotion, до публикации её проекции.
+
+Ответ содержит `reconciliation` отдельно от прежнего `receipt`. `ok:true` здесь
+означает успешное proof-read, не успех доставки. Absent/unknown не записываются
+как not-submitted/provider-not-accepted и не освобождают FIFO. Ошибка публикации
+после durable promotion не отменяет уже принятую квитанцию. Этот POST сам не
+пишет в терминал, но exact promotion естественно будит прежний FIFO: только
+исходный waiting snapshot проходит прежние idle/readiness/target guards.
+Следующий run считается запущенным лишь после его собственного delivery proof.
+
+Новый HTTP ingress требует установленной app-сборки; одно обновление MCP его
+не добавляет. Повторный отрицательный proof сам не разрешает abandon.
+
+#### Явное Продолжение После Unknown Head
+
+По разрешению пользователя продолжить очередь несмотря на неизвестный исход
+одной старой записи существует отдельный `POST .../send-receipts/release`:
+`{operationKey,attemptId,requestId,acknowledgeDeliveryUnknown:true}`.
+MCP — `release_send_queue_head`; capability `sendQueue.explicitUnknownRelease.version=1`.
+Сначала прежний exact audit. Положительный proof завершает head обычным образом;
+иначе только exact текущий awaiting-receipt head получает `released-unknown`
+и durable release-marker. Delivery/submitted/frozen payload и доказательства
+остаются прежними; новый Enter этой записи запрещён. Это не no-write settlement.
+Нет глобального автоматического skip. Running executor, foreign attempt/owner
+и другой requestId отказывают; same-ID replay после restart не повторяет audit/input.
+Следующий сохранённый item проходит прежний idle/target/readiness допуск.
+Cancelled follower не оживляется. GET старого handoff показывает release отдельно
+от доставки; позднее настоящее подтверждение старой записи остаётся возможным.
+
 Ранний ACK — opt-in `POST /api/terminal-tabs/:tabId/send` с
 `applicationQueue:true`. Capability `sendQueue.version=1`, `durable:true`,
 `providerPendingLimit:1`, `optIn:'applicationQueue'`. HTTP202 возвращает
@@ -477,6 +557,13 @@ durable `sent`. Таймаут не понижает уже доказанный
 в [сценариях использования](../methodology/сценарии-использования.md).
 
 #### Квитанция после перезапуска и её показ в History
+
+Обычный `send_prompt` имеет происхождение `terminal-mcp` даже без run/message.
+History и Timeline используют его фиолетовый канал через presentation metadata,
+а не строку в тексте. Старое подтверждённое сообщение без этой пометки может
+получить её при startup из exact receipt/source/attempt/provider/session/hash,
+включая canonical carrier aliases; delivery-unknown и чужие proofs не backfill.
+Оформление не меняет receipt state, payload или право на следующий Enter.
 
 Обычная отправка из desktop History является ещё одним caller-ом той же
 квитанции, а не отдельным renderer-only исключением. Когда операция достигает
@@ -521,6 +608,15 @@ provider, audit-session и exact row identity; совпадение текста
 квитанция ждёт первого чтения канонической History, чтобы не появиться в хвосте
 на один кадр перед уже сохранённым ответом. ACK failure не скрывает
 каноническую строку; следующий remount повторяет exact reconciliation.
+
+Ручное скрытие локальной карточки — не этот canonical ACK. Durable admission
+может завершиться `not-submitted` ещё до создания physical attempt (например,
+ранний requestFingerprint conflict). Поэтому hide принимает явный `attemptId:null`
+как точную отсутствующую попытку вместе с operation/tab/handoff, но не как wildcard:
+смена на настоящий attempt отклоняет старую identity; пустое/пропущенное поле остаётся
+ошибкой. Меняется presentation marker, не delivery, settledAt или исходный prompt.
+Ожидать появления attempt у окончательно failed/cancelled карточки бессмысленно;
+Main читает существующую квитанцию сразу. Waiting FIFO cancellation остаётся отдельной.
 
 Для native краткая галочка «принято Mac» читает ту же durable квитанцию, не
 создаёт второй executor/ACK. Exact audit-pending+submitted, typed provider queue
@@ -663,9 +759,89 @@ context update и plain text не взаимозаменяемы; metadata-only 
 через session_stats.diagnosticsOnly. Контракт страниц/покрытия и примеры границ —
 fact-session-history.md::Фильтрованные пользовательские сообщения.
 Явный saved-history Rewind/Delete — другой контракт: Stop → copy-on-write →
-adopt → Resume; его tab HTTP-вход описан в fact-mobile-web.md. Он не меняет
-native поведение существующего `rewind_ai` и не превращает Terminal MCP в
-универсальный редактор provider-файлов.
+adopt → Resume; его tab HTTP-вход описан в fact-mobile-web.md. Terminal MCP
+предоставляет только saved-history `rewind_history`, не native Esc/menu и не
+AI-summary Rewind. Пользовательский native UI и прежний `/rewind` HTTP-вход
+сохраняются отдельно. MCP не становится универсальным редактором provider-файлов.
+
+#### Saved-history Rewind через MCP
+
+`rewind_history` отправляет ровно один existing
+`POST /api/terminal-tabs/:tabId/history-operations` с `kind:rewind`.
+Обязательны `tabId`, `operationId`, `expectedSessionId`, `targetUuid`;
+`toolType` по умолчанию Codex, также поддерживается Claude. `operationId`
+выбирает вызывающая модель до MCP-вызова: потеря всего MCP ACK/process не должна
+стирать единственный ключ восстановления. ID допускает1..160символов
+`[A-Za-z0-9_.:-]`. Same ID+same request идемпотентны на existing app receipt;
+изменённый запрос с этим ID отвергается. Неизвестный исход читается, не replay.
+
+Передавать `targetSourceIdentity`, когда она есть. Composite требует exact
+`targetEntryRef`/`expectedContentRevision` из публичной Timeline, не сырые offsets
+или номер MCP turn. Claude всегда требует revision. Для standalone Codex token
+optional, но переданный stale token не удаляется ради обхода guard. Nullable
+metadata публичной entryRef сохраняется; SID/UUID и обязательная composite revision
+не становятся optional. Nested `entryRef.contentRevision` допускается unchanged
+только при равенстве внешней expectedContentRevision; это проверяет также общий
+Main normalizer прямого HTTP POST, не только MCP whitelist. Capability проверяется через `/api/me`: savedHistory v1,
+rewind/providers/receipts/structuredDraft; неподдерживаемое приложение получает
+app-update-required до POST, без native/raw-file fallback.
+Новый Codex Rewind дополнительно требует `savedHistory.codexPhysicalSuffix:true`:
+последняя Timeline UUID не является EOF, после compact возможен неадресуемый
+assistant/tool хвост. Executor удаляет весь physical suffix выбранной итерации;
+generic Delete/Edit середины сохраняет прежнюю семантику. Старые receipts
+читаются и без этого флага, но не получают выдуманный clean-prefix proof.
+
+`repairOfOperationId` адресует только старый completed Codex COW Rewind с
+historyMutated/bindingCommitted и exact текущим child. Новый operationId хранит
+отдельную квитанцию; targetUuid берётся из прежней, а не ищется в child по тексту.
+App сверяет current child с exact прежним COW output и неизменный original target,
+повторяет proof после Stop/перед записью, затем использует тот же executor.
+Новая пользовательская работа в child запрещает repair; исходник, старый child
+и receipt не перезаписываются. Нужна `savedHistory.repairOfOperationId:true`.
+Служебный `thread_settings_applied` после Resume не становится новой работой
+только по своему type. Допуск основан на exact child/COW-префиксе и записанном
+owned Resume, полном settings-пакете той же пары model/effort и отсутствии
+чужого SID/cwd/authoring source. Timestamp — дополнительный guard, не proof
+позднего AutoResume после restart. Физический suffix проверяется тем же reader
+до EOF: повреждённая строка или незаконченный user не могут исчезнуть из parsed
+array и разрешить repair. Новые user/task/tool/rollback/compact, неполная,
+противоречивая или изменённая пара остаются запрещены, а не заменяются старой.
+Источник нового COW и текущий stopped child — разные роли. При отказе repair
+до принятой binding тот же executor восстанавливает incumbent child с его
+settings proof, не parent-источник. Resume guard по-прежнему требует исходный
+expectedSessionId; ошибка recovery не разрешает ослабить его или отправить prompt.
+Prepare отдаёт внутренний exact child settings proof для того же failure-Resume;
+он сильнее stale same-SID renderer proof и глобальной пары после reopen. Новый
+HTTP аргумент, writer scenario или proof по тексту не нужны.
+
+Старое `rewind_ai` отсутствует в tools/list, direct/cached calls получают
+`rewind_ai_removed`. Legacy `mode:native|ai`, text/index/menu/duplicate-count/range
+arguments и неизвестные поля нового метода дают явный отказ до HTTP. Старый
+AI-summary режим также не является saved-history и не сохранён как alias.
+
+`get_history_operation({tabId,operationId,includeStatus:true})` читает GET exact
+receipt и отдельно GET current `/status`; без includeStatus читает только receipt.
+`operation` сохраняет full draft, historyMutated, bindingCommitted/binding,
+newSessionId и resume. Неуспешная операция также читается успешно:
+`ok:true, operation.success:false`, не потеря квитанции. Transport/404/malformed
+или foreign identity — typed error с SAME operationId; status failure возвращает
+currentStatus:null/currentStatusError, не стирая receipt. Pending/outcome-unknown
+и отсутствие receipt не доказывают отсутствие мутации. `202`/completed не дают
+inputReady или доказательство чистого prefix. После проверки текущей History/
+Timeline и runtime отдельный authorized `send_prompt` отправляет оригинал один
+раз со stable handoffId; executor Rewind сам его не отправляет.
+
+```js
+rewind_history({tabId, operationId: "rewind-selected-v1",
+  expectedSessionId, targetUuid, toolType: "codex", targetSourceIdentity});
+get_history_operation({tabId, operationId: "rewind-selected-v1", includeStatus: true});
+```
+
+Проверка: actual stdio dispatcher → isolated HTTP → existing SavedHistoryOperations
+accept/read. Подтверждены idempotency, invalid/legacy pre-mutation refusal,
+lost HTTP/whole-MCP ACK и receipt-only recovery после MCP/app restart. Это не
+физическая приёмка provider prefix: executor/range и native writer проверяет
+профильный владелец отдельно.
 
 Для late saved-history receipt external consumer отдельно читает main
 applicability: следующий ввод того же SID/process снимает право применить старый
@@ -817,6 +993,8 @@ editable draft не должен неявно материализовать м�
 Mutating HTTP routes (`run_command`, `restart_process`, `run_chain`, `create_tab`, `kill_process`, `send_prompt`, `start_ai`, `stop_ai`) эмитят `terminal:mcp-activity` в renderer. Событие несёт `sourceMeta` (кто вызвал MCP), target project/tab, action и status (`running`/`sent`/`completed`/`error` и т.п.). StatusBar показывает это как глобальный `MCP` chip, потому что запрос может прийти из внешней локальной нейронки или соседней вкладки, не из текущего UI-контекста.
 
 Passive reads (`list_tabs`, `read_output`) намеренно молчат. Иначе каждый inspection-loop агента превращает StatusBar в шум, хотя пользовательского действия над вкладкой не было.
+
+Это журнал результата конкретного вызова, не live-status target и не полный аудит всех новых Project API routes. Старый Goal-required/error не доказывает, что уже восстановленный агент всё ещё остановлен. Переход existing-placement/append и human-name projection описаны в `fact-status-bar.md::MCP Activity chip`; authoritative delivery/result через журнал не подменяются.
 
 ## Soft Restart (Ctrl+C → re-run)
 

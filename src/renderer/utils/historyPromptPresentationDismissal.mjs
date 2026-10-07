@@ -19,6 +19,12 @@ export function planHistoryPromptPresentationDismissal({
   if (['preparing', 'sending', 'queued', 'audit-pending', 'delivery-unknown'].includes(queueStatus)) {
     return { allowed: true, mode: 'durable', reason: 'unsettled-local-presentation' };
   }
+  if (['failed', 'cancelled'].includes(queueStatus)
+    && !!String(sendOperationKey || '').trim() && !String(sendAttemptId || '').trim()) {
+    // Main resolves the current exact receipt. A physical attempt may never
+    // have existed; waiting for its identity adds no proof for this read.
+    return { allowed: true, mode: 'durable', reason: 'durable-no-attempt-presentation' };
+  }
   if (requiresAuditIdentity === false && !hasAnyDurableIdentity && !hasAcceptedProof) {
     return {
       allowed: true,

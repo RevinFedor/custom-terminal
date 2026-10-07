@@ -98,6 +98,7 @@ export function describeWorkspaceWindowTargets({
       id: space.id,
       name: space.name || 'Workflow',
       active: space.id === activeSpaceId,
+      ...(space.kind ? {kind:space.kind,organizationVersion:1} : {}),
       projectIds: Array.isArray(space.projectIds) ? space.projectIds.slice() : [],
       focusedWindowRef: windows.find((window) => window.focused)?.windowRef
         || windows[0]?.windowRef
@@ -236,9 +237,31 @@ export function resolveWorkspaceCreationContext({
   sourceTabId,
   tabInfo = () => null,
   projects = [],
+  organizationVersion,
+  fallbackCwd,
 } = {}) {
   const projectRows = (Array.isArray(projects) ? projects : []).filter((project) => project?.id);
   const byId = (projectId) => projectRows.find((project) => project.id === projectId) || null;
+  if (organizationVersion === 1 || targetSpace?.organizationVersion === 1 || targetSpace?.kind) {
+    let source = null;
+    if (sourceTabId) {
+      source = tabInfo(null,sourceTabId);
+      if (!source) for (const project of projectRows) {
+        const info = tabInfo(project.id,sourceTabId);
+        if (info) {source = {...info,projectId:project.id};break;}
+      }
+    }
+    const shown = targetWindow?.tabs?.find(entry => entry.tabId === targetWindow.shownTabId);
+    const shownInfo = shown && (tabInfo(shown.projectId,shown.tabId) || shown);
+    const explicit = explicitProjectId && byId(explicitProjectId);
+    if (explicitProjectId && !explicit && explicitProjectId !== '__tab_catalog_v2__')
+      return targetFailure('project_not_found',{projectId:explicitProjectId});
+    const cwd = explicitCwd || source?.cwd || shownInfo?.cwd || explicit?.path || fallbackCwd;
+    if (!cwd) return targetFailure('creation_context_unavailable');
+    return {ok:true,projectId:explicitProjectId || source?.projectId || shown?.projectId || '__tab_catalog_v2__',
+      cwd,workflowId:targetSpace?.id || source?.workflowId || '__noted_workflow_inbox__',
+      reason:explicitCwd ? 'explicit-cwd' : source?.cwd ? 'source-tab' : shownInfo?.cwd ? 'shown-window-tab' : 'independent-fallback'};
+  }
 
   if (explicitProjectId) {
     const project = byId(explicitProjectId);

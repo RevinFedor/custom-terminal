@@ -573,6 +573,35 @@ test('unconfirmed, inconsistent and ordinary user receipts cannot mint a system 
   }
 });
 
+test('MCP backfill follows the early carrier alias, keeps chips and never changes delivery truth', () => {
+  const store = createStore();
+  const record = confirmedSystemReceipt();
+  record.receipt.source = 'codex-terminal-mcp';
+  const before = JSON.stringify(record);
+  saveAuditedPromptPresentation(store, { toolType: 'codex', sessionId: record.sessionId,
+    auditTimestamp: record.auditIdentity.auditTimestamp, actualHash: record.auditIdentity.promptHash,
+    snapshot: { promptChips: [{ kind: 'prompt', text: 'rules', label: 'Rules' }] } });
+  assert.equal(backfillConfirmedSystemPromptPresentations(store, [record, record]), 1);
+  assert.equal(backfillConfirmedSystemPromptPresentations(store, [record]), 0);
+  const entries = [{ uuid: 'canonical-event', role: 'user', content: 'служебный возврат',
+    timestamp: record.auditIdentity.auditTimestamp, sourceIdentity: 'event-source',
+    sourceIdentityAliases: [record.auditIdentity.sourceIdentity] }];
+  const [entry] = decorateHistoryPromptPresentations(store, { toolType: 'codex', sessionId: record.sessionId, entries });
+  assert.equal(entry.semanticTags[0].source, 'terminal-mcp');
+  assert.equal(entry.semanticTags[0].runId, undefined);
+  assert.equal(entry.promptChips[0].label, 'Rules');
+  assert.equal(entry.content, entries[0].content);
+  assert.equal(JSON.stringify(record), before);
+  const quoted = { ...entries[0], uuid: 'quoted', sourceIdentity: 'foreign-source', sourceIdentityAliases: [] };
+  assert.equal(decorateHistoryPromptPresentations(store, { toolType: 'codex', sessionId: record.sessionId,
+    entries: [quoted] })[0], quoted, 'same body/timestamp without exact source proof cannot acquire the MCP origin');
+  for (const variant of [{ state: 'delivery-unknown' },
+    { auditIdentity: { ...record.auditIdentity, attemptId: 'foreign' } },
+    { receipt: { ...record.receipt, actualHash: 'wrong' } }]) {
+    assert.equal(backfillConfirmedSystemPromptPresentations(createStore(), [{ ...record, ...variant }]), 0);
+  }
+});
+
 test('new capacity retries persist through the same normalizer without becoming orchestration runs', () => {
   const store = createStore();
   assert.equal(saveAuditedPromptPresentation(store, {

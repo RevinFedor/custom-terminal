@@ -8,12 +8,15 @@ const here = dirname(fileURLToPath(import.meta.url));
 const overlay = readFileSync(join(here, 'TabSwitcherOverlay.tsx'), 'utf8');
 const rows = readFileSync(join(here, 'TabListRows.tsx'), 'utf8');
 const spaces = readFileSync(join(here, '../../utils/workspaceSpacesModel.mjs'), 'utf8');
+const selector = readFileSync(join(here, '../../utils/tabSwitcherSelector.mjs'), 'utf8');
 
 test('one placement index covers split, center strips and the single center', () => {
   assert.match(spaces, /spaceTabIds\(list\[index\], tabIdsOfPanes\)/);
   assert.match(spaces, /preferredSpaceId/);
   assert.match(overlay, /spacesWithLiveLayout\(ws\.spaces, ws\.activeSpaceId, ws\)/);
-  assert.match(overlay, /tabSpaceIndexMap\(spaces, allPaneTabIds, ws\.activeSpaceId\)/);
+  assert.match(selector, /tabSpaceIndexMap\(spaces, allPaneTabIds, ws\.activeSpaceId\)/);
+  assert.match(overlay, /return sharedSwitcherWorkflowLookup\(ws, useProjectsStore\.getState\(\)\.projects\)/);
+  assert.match(overlay, /selectSwitcherRows\(input, \{ query, hideOnScreen \}\)/);
 });
 
 test('Ctrl+Tab and Cmd+P group by colored workflow, project stays secondary', () => {

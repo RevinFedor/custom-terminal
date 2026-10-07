@@ -142,6 +142,187 @@ function completionHarness(t, { legacy = false } = {}) {
   return { ...h, run, content, prefix, reAdmissions: () => reAdmissions };
 }
 
+function manualRunAfterHarness(t) {
+  const h = harness(t, 'codex');
+  const source = fs.readFileSync(path.join(__dirname, '../renderer/utils/agentScenarios.ts'), 'utf8');
+  const sourceAst = ts.createSourceFile('agentScenarios.ts', source, ts.ScriptTarget.Latest, true);
+  const scenario = sourceAst.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'sendAgentPromptScenario');
+  const app = fs.readFileSync(path.join(__dirname, '../renderer/App.tsx'), 'utf8');
+  const appAst = ts.createSourceFile('App.tsx', app, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let branch;
+  const visit = node => {
+    if (ts.isIfStatement(node) && node.expression.getText(appAst) === "action === 'sendMessageAuto' || action === 'sendAgentPromptScenario'") branch = node;
+    ts.forEachChild(node, visit);
+  };
+  visit(appAst); assert.ok(branch);
+  const renderer = vm.createContext({
+    crypto: require('node:crypto'), isStandaloneAgentLocalCommand: () => false,
+    agentSendSettingsContractError: () => null,
+    ipcRenderer: { invoke: async (channel, input) => {
+      assert.equal(channel, 'agent:enqueue-prompt'); return h.context.enqueueDesktopAgentPrompt(input);
+    } },
+    enqueueAgentSendScenario: ({ run }) => run(), activateTabWorkContext: async () => {}, settleTabWorkContext: async () => {},
+    prepareTabWorkContext: async (_tab, _id, prompt) => ({ prompt }),
+    describeAgentTab: () => ({ tab: { cwd: '/private-fixture', tabType: 'terminal' }, toolType: 'codex', runtime: {}, sessionId: 'S' }),
+    runHistoryPromptHandoff: input => input.send(input.handoffId), createAgentSettingsIntent: () => ({ kind: 'none' }),
+    maybeAutoTitleAfterMobileSend() {},
+    reply: (ok, data, error) => { assert.equal(ok, true, error); return data; },
+    runAgentPromptScenario: async input => h.physicalBridge('sendAgentPromptScenario', input),
+  });
+  const compile = value => ts.transpileModule(value, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  vm.runInContext(compile(scenario.getText(sourceAst).replace(/^export /, '')), renderer);
+  vm.runInContext(compile('async function appDispatch(action, payload) {' + branch.getText(appAst) + '}'), renderer);
+  h.context.bridgeRequest = (action, payload) => renderer.appDispatch(action, payload);
+  return { ...h, renderer };
+}
+
+test('RunAfter explicit send-now survives actual renderer admission, durable FIFO, and App re-entry', async t => {
+  const h = manualRunAfterHarness(t);
+  const result = await h.renderer.sendAgentPromptScenario({ tabId: 'T', toolType: 'codex', sessionId: 'S',
+    prompt: 'manual body', handoffId: 'manual-now', source: 'prompt-queue', promptQueueAction: 'send-now',
+    queue: true, statusAtSend: 'busy', settingsIntent: { kind: 'none' } });
+  assert.equal(result.submitted, true);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].promptQueueAction, 'send-now');
+  const frozen = JSON.parse(h.queue.item('history:T:manual-now').request_json);
+  assert.equal(frozen.promptQueueAction, 'send-now');
+  assert.equal(frozen.source, 'prompt-queue');
+  assert.equal(frozen.prompt, 'manual body');
+});
+
+test('RunAfter automatic admission keeps the old absent-marker fingerprint and does not acquire manual privileges', async t => {
+  const h = manualRunAfterHarness(t);
+  await h.renderer.sendAgentPromptScenario({ tabId: 'T', toolType: 'codex', sessionId: 'S', prompt: 'automatic body',
+    handoffId: 'automatic', source: 'prompt-queue', queue: false, settingsIntent: { kind: 'none' } });
+  const item = h.queue.item('history:T:automatic');
+  const frozen = JSON.parse(item.request_json);
+  assert.equal(Object.hasOwn(frozen, 'promptQueueAction'), false);
+  assert.equal(Object.hasOwn(h.writes[0], 'promptQueueAction'), false);
+  assert.equal(item.request_hash, registry.fingerprintAgentSendRequest(frozen));
+  assert.equal(h.store.get('history:T:automatic').requestFingerprint, registry.fingerprintAgentSendRequest({
+    prompt: 'automatic body', model: null, effort: null, thinking: null, cwd: null,
+    source: 'prompt-queue', queue: false, ownership: 'project', expectedTarget: { toolType: 'codex', sessionId: 'S' },
+  }));
+});
+
+function automaticWaitHarness(t, { legacy = false } = {}) {
+  const h = harness(t, 'codex');
+  let ready = true, busy = true, cancelled = false, inputWrites = 0;
+  const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+  const tree = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
+  const handler = tree.statements.find(node => ts.isExpressionStatement(node)
+    && node.expression.expression?.getText(tree) === 'ipcMain.handle'
+    && node.expression.arguments?.[0]?.text === 'codex:send-command');
+  assert.ok(handler);
+  const ipc = new Map();
+  vm.runInNewContext(handler.getText(tree), {
+    ipcMain: { handle: (key, fn) => ipc.set(key, fn) }, path, srcMainDir: __dirname,
+    require: () => ({ certifyAutomaticReadinessWait: (...args) => h.queue.certifyAutomaticReadinessWait(...args),
+      readAutomaticSendAdmission: async () => ready }),
+    console: { log() {}, warn() {}, error() {} }, nodePerformance: { now: () => Date.now() },
+    terminals: new Map([['T', {}]]), terminalCommandState: new Map(),
+    isPromptQueueAutomationSource: require('./prompt-queue-source').isPromptQueueAutomationSource,
+    isCodexOperationalInputReady: () => true,
+    agentSendCancellations: { isCancelled: () => cancelled },
+    getCodexRuntimeSessionSnapshot: async () => ({ liveLifecycle: true, sessionStatus: busy ? 'busy' : 'active', inputReady: true, busy }),
+    agentSendRequestTargetFailure: () => null, CODEX_PASTE_AUDIT_TIMEOUT_MS: 100,
+    safePasteAndSubmit: async (_term, _command, options) => {
+      inputWrites++;
+      return h.physicalBridge('sendAgentPromptScenario', { ...options, tabId: 'T' });
+    },
+  });
+  h.context.bridgeRequest = (_action, payload) => ipc.get('codex:send-command')({ sender: {} }, 'T', payload.prompt, payload);
+  h.queue.admit = async () => ready;
+  Object.assign(h.context, require('../shared/prompt-queue-send-intent.cjs'));
+  h.context.hasCanonicalSendConsumption = require('./agent-send-queue').hasCanonicalSendConsumption;
+  vm.runInContext('var joinAutomaticAgentPrompt = ' + exported('joinAutomaticAgentPrompt'), h.context);
+  const promptQueueIntent = { version: 1, kind: 'queue', itemId: 'head', armedAt: 100,
+    triggerTabId: 'T', conditionKey: '', triggerKey: 'null' };
+  return { ...h, promptQueueIntent, inputWrites: () => inputWrites,
+    setReady: value => ready = value, setBusy: value => busy = value, setCancelled: value => cancelled = value,
+    start: () => h.send('auto-wait', { source: 'prompt-queue', ...(legacy ? {} : { promptQueueIntent }) }),
+  };
+}
+
+test('actual pre-paste busy gate parks the SAME new automatic intent, then one wake writes once', async t => {
+  const h = automaticWaitHarness(t);
+  let done = false;
+  const pending = h.start().then(result => { done = true; return result; });
+  await tick(); await tick();
+  const key = 'history:T:auto-wait', first = h.store.get(key);
+  assert.equal(first.state, 'not-submitted');
+  assert.equal(first.receipt.automaticReadinessWait, 1);
+  assert.equal(first.receipt.pasteWritten, false);
+  assert.equal(h.queue.item(key).state, 'waiting');
+  assert.equal(h.queue.projectRecord(first).applicationQueue.waitingBeforeInput, true);
+  assert.equal(done, false); assert.equal(h.inputWrites(), 0);
+  const immutable = h.queue.item(key).request_json;
+  h.setReady(false); h.queue.notifyRuntime('T'); await tick();
+  assert.equal(h.store.get(key).attemptId, first.attemptId);
+  const joined = h.context.joinAutomaticAgentPrompt({ tabId: 'T', handoffId: 'auto-wait',
+    prompt: 'not a write: a restored renderer has new context', promptQueueIntent: h.promptQueueIntent });
+  h.setBusy(false); h.setReady(true); h.queue.notifyRuntime('T');
+  const [result, read] = await Promise.all([pending, joined]);
+  assert.equal(result.submitted, true); assert.equal(read.receipt.submitted, true);
+  assert.notEqual(h.store.get(key).attemptId, first.attemptId);
+  assert.equal(h.queue.item(key).request_json, immutable);
+  assert.equal(h.inputWrites(), 1);
+});
+
+test('explicit cancellation parks no new input and preserves the last no-write physical receipt', async t => {
+  const h = automaticWaitHarness(t), pending = h.start();
+  await tick(); await tick();
+  const key = 'history:T:auto-wait', first = h.store.get(key);
+  assert.equal(h.queue.cancelWaiting('T', 'auto-wait').cancelled, true);
+  await pending;
+  assert.equal(h.queue.item(key).state, 'cancelled');
+  assert.equal(h.store.get(key).attemptId, first.attemptId);
+  assert.equal(h.store.get(key).receipt.submitted, false);
+  h.setBusy(false); h.queue.notifyRuntime('T'); await tick();
+  assert.equal(h.inputWrites(), 0);
+});
+
+test('legacy failed sends and an explicitly revoked attempt cannot acquire automatic wait permission', async t => {
+  for (const mode of ['legacy', 'revoked']) {
+    const h = automaticWaitHarness(t, { legacy: mode === 'legacy' });
+    if (mode === 'revoked') h.setCancelled(true);
+    const result = await h.start();
+    assert.equal(result.submitted, false);
+    assert.equal(h.queue.item('history:T:auto-wait').state, 'failed');
+    assert.equal(h.store.get('history:T:auto-wait').receipt.automaticReadinessWait, undefined);
+    h.setBusy(false); h.queue.notifyRuntime('T'); await tick();
+    assert.equal(h.inputWrites(), 0);
+  }
+});
+
+test('pre-dispatch automatic cancellation is accepted without an attempt or any provider write', async t => {
+  const h = automaticWaitHarness(t);
+  h.queue.admit = async () => ({ cancel: true });
+  const result = await h.start();
+  assert.equal(result.submitted, false);
+  assert.equal(h.store.get('history:T:auto-wait').attemptId, null);
+  assert.equal(h.queue.item('history:T:auto-wait').state, 'cancelled');
+  assert.equal(h.inputWrites(), 0);
+});
+
+test('a new explicit arm cannot bypass an old unknown and may pass only a proven untouched predecessor', async t => {
+  const h = automaticWaitHarness(t), base = 'old-queue-item';
+  await h.send(base, { source: 'prompt-queue' }); // legacy busy refusal: no input
+  const input = { tabId: 'T', handoffId: base + '-arm-200',
+    promptQueueIntent: { ...h.promptQueueIntent, baseHandoffId: base, armedAt: 200 } };
+  assert.equal((await h.context.joinAutomaticAgentPrompt(input)).found, false);
+  const old = h.store.get('history:T:' + base);
+  const retried = h.store.beginAttempt({ ...old });
+  assert.equal(retried.action, 'attempt-started');
+  h.store.settleAttempt(old.operationKey, retried.attemptId,
+    { success: null, submitted: null, deliveryUnknown: true, status: 'delivery-unknown' });
+  const blocked = await h.context.joinAutomaticAgentPrompt(input);
+  assert.equal(blocked.found, true);
+  assert.equal(blocked.receipt.code, 'automatic_previous_delivery_unresolved');
+  assert.equal(h.inputWrites(), 0);
+  assert.equal(h.queue.item('history:T:' + input.handoffId), null);
+});
+
 test('pre-fix completion reproduces the nested FIFO fingerprint conflict before provider writes', async t => {
   const h = completionHarness(t, { legacy: true });
   await h.context.sendOrchestrationCompletionNotification(h.run);
@@ -167,6 +348,27 @@ test('completion caller enters Main FIFO once before actual renderer re-entry, i
   Object.assign(run, { notificationStatus: 'failed', notificationSuppressed: true, parentConsumedAt: Date.now() });
   await h.context.sendOrchestrationCompletionNotification(run, { force: true });
   assert.equal(h.writes.length, 1, 'dismissed completions must stay suppressed');
+});
+
+test('completion reaches the common FIFO proof for an exact provisional launch without borrowing a saved writer', async t => {
+  const h = completionHarness(t);
+  h.setTarget(null);
+  h.context.readAgentRuntimeSnapshot = async () => ({ coherent: true, status: 'active', toolType: 'codex',
+    sendTarget: { toolType: 'codex', sessionId: null, terminalInstanceId: 'instance-I', launchId: 'launch-L' } });
+  await h.context.sendOrchestrationCompletionNotification(h.run);
+  assert.equal(h.run.notificationStatus, 'queued', h.run.notificationError);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].expectedTarget.sessionId, 'S', 'the original SID reaches final physical proof unchanged');
+  assert.equal(h.writes[0].sendOperationKey, 'history:T:orchestration-complete:completion-test');
+  assert.equal(h.reAdmissions(), 0);
+});
+
+test('completion for a replaced non-null source remains refused without provider input', async t => {
+  const h = completionHarness(t);
+  h.setTarget('foreign-session');
+  await h.context.sendOrchestrationCompletionNotification(h.run);
+  assert.equal(h.run.notificationStatus, 'failed');
+  assert.equal(h.writes.length, 0);
 });
 
 test('a pre-upgrade unknown completion cannot create a second operation or cross Enter', async t => {

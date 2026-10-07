@@ -260,7 +260,7 @@ for (const mode of ['source-change', 'corrupt']) test('actual cache rejection re
   else {
     const version = (await fs.readdir(f.config.cacheDirectory)).find(name => name.startsWith('v1-'));
     const cachePath = path.join(f.config.cacheDirectory, version);
-    const file = (await fs.readdir(cachePath)).find(name => name.endsWith('.sqlite'));
+    const file = (await fs.readdir(cachePath)).find(name => /^[a-f0-9]{64}\.sqlite$/.test(name));
     const db = new (require('better-sqlite3'))(path.join(cachePath, file));
     try { db.prepare('UPDATE rows SET stub=? WHERE pos=0').run('{"uuid":"corrupt"}'); } finally { db.close(); }
   }
@@ -269,7 +269,7 @@ for (const mode of ['source-change', 'corrupt']) test('actual cache rejection re
   if (mode === 'corrupt') assert.deepEqual(result, original);
   else assert.equal(result.entries[0].content, 'replacement0');
   const diagnostic = f.completed().at(-1);
-  assert.equal(diagnostic.source, 'raw-rebuild');
+  assert.equal(diagnostic.source, mode === 'corrupt' ? 'ssd' : 'raw-rebuild');
   assert.ok(diagnostic.phases.some(p => mode === 'corrupt' ? p.reason === 'index-corrupt' : p.reason.startsWith('source-')));
   assert.ok(diagnostic.cacheReasons[mode === 'corrupt' ? 'error' : 'sourceChange'] > 0);
   checkBounds(f);

@@ -187,13 +187,31 @@ elapsed rebuild, `CodexHistoryMetadata maxSliceMs`, `HistoryPrepare elapsedMs`
 input→paint: малиновый значок показывает работу, а не разрешение заморозить UI.
 Доказательство/ограничения — `fact-transcript-сервис.md::Ресурсная модель большой сессии`.
 
+05.10 установленный cold-start показал границу этого reuse: общий2GiB SSD prune
+удаляет whole SQLite family вместе с continuation/payload, base/view rows и
+лёгкой Timeline. После первого856MB History следующая Timeline получила
+`readTimeline/readContinuation=miss/disk-quota` и повторный raw rebuild15s;
+аналогичные751/279MB пары тоже подтверждены. Первичный version-mismatch после
+обновления и это позднее вытеснение — разные причины. Наличие prepared cache
+не гарантирует его сохранность между двумя потребителями. Диагноз/точные request
+IDs и границы в `../tmp/оптимизация-history.md::05.10,14:25–14:45UTC`; ремонта
+retention, повышения quota или отключения background по этому срезу не было.
+
+06.10 SOURCE по новому решению пользователя: общий disk budget20GiB и отдельные
+ready rows / checkpoint+payload / compact Timeline+certificate families.
+Тяжёлые данные вытесняются по owner LRU, checkpoint перед rows своего owner;
+Timeline последней. Проверен actual worker restart после quota eviction:
+неизменные готовые History/Timeline дают0raw bytes без восстановления graph;
+реальная допись по-прежнему обновляет обе проекции. Полный контракт/граница
+первого cold read после смены schema — `fact-transcript-сервис.md`.
+
 Симптом (прод 07.08 09:56): две codex-вкладки грузятся по 4с при каждом переключении, остальные летают. Причина — resume/fork копирует весь родительский транскрипт, поэтому гиганты приходят ПАРОЙ: два файла по ~730МБ не помещаются в бюджет распарсенных записей (768МБ), а две готовые проекции по ~150МБ не помещались в бюджет снапшотов renderer (240МБ). Каждое переключение = взаимное выселение из обоих кэшей: в логах пинг-понг `[CodexJsonlCache] evict … full …` каждые несколько секунд.
 
 Устройство (`codex-data.js`):
 
 - **Проекторы возобновляемые.** `createCodexHistoryProjector` / `createCodexTimelineProjector` — `feed(record)` по одной записи в порядке файла + `finalize()`, который НЕ потребляет состояние: in-flight хвост (карточки незавершённых вызовов) строится на копии, поэтому после finalize можно продолжать feed. Пре-проход спаривания compact-компаньонов свёрнут во встречный счётчик (его переходы всегда зависели только от уже увиденных записей) — предсканирования файла не осталось.
 - **Кэш — файловый курсор, а не массив записей.** Курсор хранит физический `dev:ino`, размер, mtime/ctime, число строк и недописанный хвост. Правила одинаковы у projector и raw cache: все признаки совпали → `unchanged`; вырос тот же физический файл → `append`; replacement/shrink/same-size rewrite → `rebuild`. Недописанная последняя строка переносится в `leftoverBuffer` — дозапись её завершает. In-place rewrite+growth не доказывается одними stat-полями: штатным write-путям всё ещё нужна явная invalidation, описанная ниже.
-- **Один курсор кормит обе проекции** (History + Timeline): одно чтение, два `feed`. Поэтому Timeline перестал перечитывать гигант (в т.ч. `codex:get-timeline`, который дёргается при генерации заголовка вкладки и AI-launch-финализации).
+- **Один курсор кормит обе проекции** (History + Timeline): одно чтение, два `feed`. Пока RAM или соответствующая SSD-проекция сохранена, Timeline не перечитывает гигант (в т.ч. `codex:get-timeline` при генерации заголовка вкладки и AI-launch-финализации). Одновременное вытеснение обоих уровней остаётся cold fallback; само наличие общего курсора его не отменяет.
 - **Сериализация на сессию** (`_codexProjectorChains`): параллельные вызовы (панель + Timeline + web) не кормят один проектор одновременно — второй ждёт и видит курсор неизменившимся.
 - **Ревизия строится из КУРСОРА, не из свежего stat**: файл мог вырасти, пока мы читали, и ревизия новее отданных строк заставила бы следующий ifRevision ложно ответить unchanged.
 - Поколение источника переживает eviction parser cache: обычный rebuild той же истории не становится поводом сбросить layout тёплой панели. Настоящий rewrite меняет namespace delta/payload caches; raw-копии сохраняют witness своего чтения после LRU. Invalidation во время I/O запрещает поздний republish, prepared rewrite не присваивает старым данным новую ctime. Полный контракт — `fact-transcript-сервис.md::Codex incremental cache`.
@@ -346,6 +364,59 @@ skipAnimationFrameInResizeObserver уже был включён. В private pain
 коррекция поверх Virtuoso и фиксация оценочной высоты неверны. Проверять native
 paint/pixels: rAF перед RO ещё может увидеть промежуточную геометрию, хотя до
 paint она исправится. Проба: scripts/history-tall-row-regression.mjs.
+
+### Новый диапазон коротких строк: измерение внутри commit
+
+Это другая граница, чем публикация уже изменённого scrollTop. В iOS chat06.10
+при обычном движении вверх вновь смонтированные короткие строки заменяли
+оценку120px; очередной диапазон успевал попасть в native кадр до принятия его
+размеров. Стабильные owner/visit и follow=0 исключили возврат к хвосту, но
+одних положительных scrollBy для диагноза недостаточно: большинство таких
+поправок правильно сохраняют место текста. На ограниченной API-копии этой
+истории paired native PNG подтвердили отдельные реальные обратные сдвиги.
+
+History передаёт размеры нового диапазона прежнему измерителю Virtuoso ещё
+в layout commit. Observer остаётся для последующих естественных изменений;
+прежний helper публикации viewport и единственный физический writer сохранены.
+Измеряется только смонтированный диапазон. Допуск читает текущие owner,
+presentation и resize; видимая нефокусная pane тоже допущена. Неизменный list
+state при обновлении Footer/context не запускает новую eager-проверку; нет
+покадрового таймера, заморозки оценочных высот или второго anchor-writer.
+
+Узкий build adapter привязан к проверенным bytes Virtuoso4.18.7 и включён
+только через History context. Node_modules не переписывается; upstream drift
+останавливает сборку с причиной. Standalone esbuild-проба обязана подключить
+тот же adapter: иначе новый History исходник проверяет старое поведение
+библиотеки. Vite dev исключает её из prebundle по той же причине.
+Повтор: scripts/history-upward-measurement-regression.mjs + native pixel flow.
+Физические PNG важнее промежуточного rAF; MutationObserver после commit уже
+может видеть измеренный размер. Cold197→18043 доказывается на itemSize-входе
+и прежнем scrollBy, а не требованием197 в позднем DOM-observer.
+
+## Recurring feedback без постоянной перерисовки History
+
+06.10 R04 SOURCE: process-band двигает уже нарисованный градиент; Working и
+`naming...` используют `CompositedTextShimmer` — настоящий шрифт страницы в
+неподвижной SVG-маске и движущийся HTML-градиент. HistorySpinner вращает HTML
+обёртку прежнего SVG. Shape/awaiting/workflow-ring сохраняют неподвижный контур,
+вращается текстура под ним. Glow/RunAfter hotkey смешивают цветовые поверхности
+без затухания текста. State/eligibility/1Hz timers/длительности/hidden pause не
+меняются; это не выключение feedback и не unmount retained-панелей.
+
+Маска не измеряется на каждом commit или каждом одинаковом по ширине tick.
+Один общий RO читает изменившиеся root/intrinsic text boxes, затем записывает
+только новые размеры/baseline до paint. Intrinsic box ловит уже загруженный
+font swap внутри фиксированной naming-коробки. Zero-size пропускается; cleanup
+снимает observers/tasks. Откладывать RO до следующего rAF нельзя: hour-rollover
+успевал нарисоваться в старой узкой маске. Font-load/non-resize работа батчится
+отдельно; постоянного JS-кадрового цикла нет.
+
+На~66k retained DOM source и compiledCSS pair убирают60Hz full-paint loop,
+но штатные clocks/animationiteration продолжают будить лёгкую часть lifecycle.
+Не судить только по Paint: SVG давал2Paint при109PrePaint/lifecycle. Actual
+History input проверен отдельно, EventTiming ниже16ms цензурирован и округлён
+до8ms. Уверенный общий input speedup и устранение исходного5.1s задержанного
+клика не заявлены. Полные traces/hashes/visual matrix — рабочая карта R04.
 
 ## Один физический низ
 

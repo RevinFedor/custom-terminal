@@ -2313,6 +2313,7 @@ test('orchestration settings persist and are snapshotted into new runs', async (
       autoStopCreatedTargets: true,
       codexCapacityRetryEnabled: true,
       codexCapacityRetryLimit: 1,
+      codexCapacityRetryDelaysMs: [1800000, 3600000],
     });
     const run = await second.get('run-1');
     assert.equal(run.failureGraceMs, 1234);
@@ -2328,6 +2329,10 @@ test('Codex capacity retry settings persist globally, normalize bounds, and pres
     const defaults = await store.getSettings();
     assert.equal(defaults.codexCapacityRetryEnabled, true);
     assert.equal(defaults.codexCapacityRetryLimit, 1);
+    assert.deepEqual(defaults.codexCapacityRetryDelaysMs, [1800000, 3600000]);
+    defaults.codexCapacityRetryDelaysMs.push(60000);
+    assert.deepEqual((await store.getSettings()).codexCapacityRetryDelaysMs, [1800000, 3600000], 'a read cannot mutate the store through an array alias');
+    await store.updateSettings({ codexCapacityRetryDelaysMs: [2700000, 5400000] });
     await store.updateSettings({ codexCapacityRetryEnabled: false, codexCapacityRetryLimit: 3.9 });
     await store.updateSettings({ failureGraceMs: 500, codexCapacityRetryEnabled: undefined });
     await store.flush();
@@ -2336,6 +2341,8 @@ test('Codex capacity retry settings persist globally, normalize bounds, and pres
     assert.equal(restored.codexCapacityRetryEnabled, false);
     assert.equal(restored.codexCapacityRetryLimit, 3);
     assert.equal(restored.failureGraceMs, 500);
+    assert.deepEqual(restored.codexCapacityRetryDelaysMs, [2700000, 5400000]);
+    assert.deepEqual((await store.updateSettings({ codexCapacityRetryDelaysMs: [] })).codexCapacityRetryDelaysMs, []);
     assert.equal((await store.updateSettings({ codexCapacityRetryLimit: 99 })).codexCapacityRetryLimit, 10);
     assert.equal((await store.updateSettings({ codexCapacityRetryLimit: -3 })).codexCapacityRetryLimit, 1);
     assert.equal((await store.updateSettings({ codexCapacityRetryLimit: 'invalid' })).codexCapacityRetryLimit, 1);

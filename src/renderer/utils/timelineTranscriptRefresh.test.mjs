@@ -48,6 +48,25 @@ function sentHandoff(overrides = {}) {
   };
 }
 
+test('plain MCP and addressed sends stay purple through exact canonical alias adoption, never text matching', () => {
+  for (const source of ['codex-terminal-mcp', 'codex-tab-message:fd4156d7-3441-410a-bad3-534c2c8f005f']) {
+    const handoff = sentHandoff({ source });
+    const projected = projectTimelineSentHandoff(handoff, { toolType: 'codex', sessionId: 'session-a' });
+    assert.equal(projected.semanticTags[0].source, 'terminal-mcp');
+    assert.equal(projected.semanticTags[0].runId, undefined);
+    const canonical = { uuid: 'event-user', type: 'user', content: handoff.text, sourceIdentity: 'event-source',
+      sourceIdentityAliases: [handoff.auditProof.sourceIdentity] };
+    const ordinary = { ...canonical, uuid: 'ordinary', sourceIdentity: 'other', sourceIdentityAliases: [] };
+    const merged = mergeTimelineEntriesWithSentHandoffs([ordinary, canonical], [projected]);
+    assert.equal(merged.length, 2);
+    assert.equal(merged[0], ordinary);
+    assert.equal(merged[1].semanticTags[0].source, 'terminal-mcp');
+    assert.equal(canonical.semanticTags, undefined);
+    assert.equal(projectTimelineSentHandoff({ ...handoff, queueStatus: 'delivery-unknown' },
+      { toolType: 'codex', sessionId: 'session-a' }), null);
+  }
+});
+
 test('hidden Timeline retains invalidation until Project Home closes', () => {
   const hidden = planTimelineTranscriptRefresh({
     invalidation: true,

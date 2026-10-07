@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const workspaceDir = path.join(here, '../components/Workspace');
 const overlaySource = fs.readFileSync(path.join(workspaceDir, 'PromptQueueOverlay.tsx'), 'utf8');
+const sendNowSource = fs.readFileSync(path.join(here, 'runAfterSendNow.ts'), 'utf8');
 const historySource = fs.readFileSync(path.join(workspaceDir, 'HistoryPanel.tsx'), 'utf8');
 const floatingFrameSource = fs.readFileSync(path.join(workspaceDir, 'FloatingTerminalFrame.tsx'), 'utf8');
 
@@ -56,9 +57,10 @@ test('Cmd+Replay submits through the shared scenario and exact History handoff',
   const end = overlaySource.indexOf('} else {', start);
   assert.ok(start >= 0 && end > start);
   const branch = overlaySource.slice(start, end);
-  assert.match(branch, /buildPromptQueueReceiptHandoffId\(\{/);
-  assert.match(branch, /runHistoryPromptHandoff\(\{/);
-  assert.match(branch, /sendAgentPromptScenario\(\{/);
-  assert.match(branch, /settingsIntent:\s*AGENT_SETTINGS_INTENT_NONE/);
-  assert.match(branch, /historySessionId:\s*sessionIdHint/);
+  assert.match(branch, /sendQueuedPromptNow\(tabId, validation\.item, sessionType\)/);
+  assert.match(sendNowSource, /buildPromptQueueReceiptHandoffId\(\{/);
+  assert.match(sendNowSource, /runHistoryPromptHandoff\(\{/);
+  assert.match(sendNowSource, /sendAgentPromptScenario\(\{/);
+  assert.match(sendNowSource, /settingsIntent:\s*AGENT_SETTINGS_INTENT_NONE/);
+  assert.match(sendNowSource, /historySessionId:\s*sessionIdHint/);
 });

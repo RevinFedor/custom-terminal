@@ -25,19 +25,46 @@ Source: `src/renderer/App.tsx::handleReopenLastClosedCapture`, `src/renderer/sto
 ### Восстановление visual-parent и детей
 
 Закрытие сохраняет visual-parent, отдельно от `parentTabId` служебных subagent.
-Прямые дети закрываемого родителя остаются доступными на верхнем уровне и
+Прямые самостоятельные AI/terminal-дети закрываемого родителя остаются доступными на верхнем уровне и
 помнят undo-связь в `closedVisualParentTabId`. При восстановлении она снова
 становится живым parent; дети и родитель могут закрываться/возвращаться в любом
 порядке, включая restart. Новое ручное переподчинение или перенос в другую
 группу/проект снимает прежнюю undo-связь. Циклы и чужие группы не создаются.
 
-`restorePlacementId` — только долговечная identity расположения. Обычный reopen
-по-прежнему создаёт НОВЫЙ runtime tabId/PTY: переиспользование закрывающегося id
+Файловые вкладки закрываются вместе со своим владельцем и не становятся отдельными
+сессионными строками `tab_history`; файлы сохранившегося AI-child остаются с ним.
+С workflow archive integration owner сохраняет typed file-only manifest,
+привязанный к exact historyId до удаления active catalog. Restore возвращает
+owner и его file links и проверяет их до consume архива. Native v2 сохраняет
+прежние PK/opaque ID/subject; legacy replacement получает зарезервированный id.
+AI-child и его файлы в этот manifest не входят. До этой интеграции узкий close
+касался только active rows и возвращал owner без file chips; это был предел
+close-only ремонта, а не продуктовый запрет на восстановление файлов.
+
+Сохранность disk files и атомарный save ACK не являются архивом их привязок.
+`tabSnapshots` не хранит close-batch ID/список прежних links; `sidebar.before/after`
+содержит соседей, а не attachment membership. Восстановление связей требует exact
+owner archive и сохранённых typed file relations, а не вывода из пути/времени или
+Markdown baselines. Независимые AI-child в такой набор не входят.
+
+`restorePlacementId` — только долговечная identity расположения. Legacy reopen
+создаёт НОВЫЙ runtime tabId/PTY: переиспользование закрывающегося id
 могло бы попасть в старый `terminal:create` reuse до завершения kill. Родство и
 соседи разрешаются через layout identity к текущему id. Явный external
 `expectedTabId` сохраняет свой прежний контракт; layout не доказывает lifecycle
 или доставку. Снимок Close клонирует изменяемых детей до durable ACK, поэтому
 ошибка сохранения больше не стирает родство в ещё живом исходном Map.
+
+Single Close/Unlink всегда передаёт intentional cleanup и захваченные IDs;
+обычная metadata omission остаётся недеструктивной. Иначе одиночный native file
+или последний v1 в mixed namespace возвращался в каталог после положительного ACK.
+Групповой Close фиксирует typed families. Следующие families могут принять только
+точный revision receipt своего предыдущего SQL шага; full retained snapshot
+не считается чужой правкой, а foreign revision/reparent/type/SID по-прежнему отказ.
+Для v1 сохраняется также exact own переход SQL PK: legacy snapshot пересоздаёт
+survivor без изменения opaque tabId, поэтому неизменный frozen PK блокировал
+вторую file family. Только receipt того же intent/transaction объясняет old→new
+PK; чужая замена с тем же именем/ID/подписью не становится разрешённым close.
 
 ### Восстановление в tab-группу
 Если вкладка закрывалась внутри group-row, `archiveTab` сохраняет её `group_id`. При Shift+Cmd+T и restore из Home это поле применяется только после проверки, что группа с таким id всё ещё существует в текущем `workspace.tabGroups`.

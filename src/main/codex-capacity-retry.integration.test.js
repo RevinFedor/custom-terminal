@@ -39,19 +39,20 @@ const failure = (turnId, offset) => ({
 });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-function liveHarness({ limit = 2, submitted = true, enabled = true } = {}) {
+function liveHarness({ limit = 2, submitted = true, enabled = true, delays = [], clock = {} } = {}) {
   const state = { tabId: 'T', sessionId: 'S', busy: true, offset: 100, currentTurnId: 'E1', capacityRetryLiveAfterOffset: 100 };
   const terminal = {};
   const calls = [];
   const persisted = new Map();
-  const config = { codexCapacityRetryEnabled: enabled, codexCapacityRetryLimit: limit };
+  const config = { codexCapacityRetryEnabled: enabled, codexCapacityRetryLimit: limit, codexCapacityRetryDelaysMs: delays };
+  const warnings = new Map();
   const ipcListeners = new Map();
   const context = vm.createContext({
     require: () => web,
     path,
     srcMainDir: __dirname,
     classifyCodexCapacityRetryRecord,
-    createCodexCapacityRetryRuntime,
+    createCodexCapacityRetryRuntime: options => createCodexCapacityRetryRuntime({ ...options, ...clock }),
     CODEX_MODEL_CAPACITY_MESSAGE,
     isTerminalStatus,
     isPausedRun,
@@ -74,7 +75,9 @@ function liveHarness({ limit = 2, submitted = true, enabled = true } = {}) {
     getTerminalLifecycleGeneration: () => 'G',
     aiStoppingTabs: new Map(),
     agentSendCancellations: { cancel: (...args) => calls.push({ type: 'cancel', args }) },
-    setCodexLifecycleWarning: (_tabId, warning) => calls.push({ type: 'warning', warning }),
+    codexLifecycleWarnings: warnings,
+    setCodexLifecycleWarning: (tabId, warning) => { warnings.set(tabId, warning); calls.push({ type: 'warning', warning }); },
+    clearCodexLifecycleWarning: tabId => warnings.delete(tabId),
     aiBoundaryTestGate: { enabled: true },
     ipcMain: {
       emit: (...args) => calls.push({ type: 'external-notification', args }),
@@ -126,6 +129,27 @@ test('actual main observer excludes old/suppressed JSONL and exact error replay 
     toolType: 'codex', sessionId: 'S', turnId: 'E1', lifecycleGeneration: 'G',
   });
   assert.equal(h.runtime().snapshot('T').lastCapacityAt, 102, 'byte order, not shared timestamp, is authoritative');
+});
+
+test('actual Main typed-error hook delays the same common continuation and a new user turn revokes waiting', async () => {
+  let now = 1000, key = 0;
+  const timers = new Map();
+  const h = liveHarness({ limit: 1, delays: [1800000, 3600000], clock: {
+    now: () => now, setTimer: (fn, ms) => { const id = ++key; timers.set(id, { fn, at: now + ms }); return id; },
+    clearTimer: id => timers.delete(id),
+  } });
+  h.observe(failure('E1', 110)); await tick(); assert.equal(h.sends().length, 1);
+  h.observe(failure('E2', 120)); await tick();
+  const warning = h.calls.find(call => call.warning?.code === 'codex_capacity_retry_waiting');
+  assert.equal(warning.warning.retryAt, 1801000); assert.equal(h.sends().length, 1);
+  now += 1800000; for (const timer of [...timers.values()]) if (timer.at <= now) timer.fn(); await tick();
+  assert.equal(h.sends().length, 2);
+  assert.equal(h.sends()[1].options.expectedTarget.turnId, 'E2');
+  assert.equal(h.sends()[1].options.requireLive, true);
+  h.observe(failure('E3', 130)); await tick(); assert.equal(timers.size, 1);
+  h.observe({ type: 'event_msg', timestamp, __byteOffset: 140, payload: { type: 'task_started', turn_id: 'user-new' } });
+  await tick(); assert.equal(timers.size, 0); assert.equal(h.sends().length, 2);
+  assert.equal(h.alerts().length, 0); assert.equal(h.calls.filter(x => x.type === 'external-notification').length, 0);
 });
 
 test('actual callers ignore untyped/quoted errors and unknown delivery never replays the same error', async () => {
@@ -444,6 +468,29 @@ test('actual lifecycle coordinator releases ordinary failure after disabled/exha
     assert.equal(h.settled.length, 1);
     assert.deepEqual(h.errors, []);
   }
+});
+
+test('actual delayed runtime keeps zero-grace failed fan-out behind the same coordinator until deadline', async t => {
+  const { store, proof, executionContext } = await capacityRunFixture(t, { reason: null, graceMs: 0 });
+  const h = coordinatedLifecycleFixture(store), owner = { tabId: 'T', sessionId: 'S', generation: 'G', turnId: 'E1' };
+  const settings = { codexCapacityRetryEnabled: true, codexCapacityRetryLimit: 1, codexCapacityRetryDelaysMs: [1800000] };
+  const { reduceCodexCapacityRetry } = require('./codex-capacity-retry-policy');
+  const prior = reduceCodexCapacityRetry(null, { type: 'capacity', scopeKey: JSON.stringify(['T', 'S']), errorId: 'prior', at: 1 }, settings).state;
+  let clock = 1000, timer, deliveries = 0;
+  const runtime = createCodexCapacityRetryRuntime({ getSettings: async () => settings, loadState: () => prior,
+    saveState() {}, isCurrent: () => true, now: () => clock,
+    setTimer: (fn, ms) => { timer = { fn, ms }; return 1; }, clearTimer() {}, notify() { assert.fail('not exhausted'); },
+    send: async (_owner, effect) => { deliveries++; await store.resolveRecovery('run', 'codex-capacity-retry', { ...proof, handoffId: effect.handoffId }); return { submitted: true }; },
+  });
+  const pending = h.context.coordinateCodexCapacityContinuation(owner,
+    () => runtime.capacity(owner, { type: 'capacity', errorId: 'E1', at: 10 }));
+  const done = h.context.processOrchestrationLifecycle('T', { type: 'done', reason: 'model_capacity', sessionId: 'S',
+    lifecycleGeneration: 'G', provider: 'codex', turnId: 'E1', processId: executionContext.processId, turnGeneration: 1, turnStartedAt: 1 });
+  await tick(); assert.equal(timer.ms, 1800000); assert.equal(deliveries, 0);
+  assert.equal((await store.get('run')).status, 'running'); assert.equal(h.settled.length, 0);
+  clock += timer.ms; timer.fn(); await Promise.all([pending, done]);
+  assert.equal(deliveries, 1); assert.equal((await store.get('run')).resumeAwaitingNewTurn, true);
+  assert.equal(h.settled.length, 0); assert.deepEqual(h.errors, []);
 });
 
 test('an earlier TUI capacity frame updates presentation but cannot start a source failure handoff', async t => {

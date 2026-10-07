@@ -48,7 +48,13 @@ function response(channel: string, payload: any) {
     emit('tab-messages:changed', { message: summary, reason: 'dismissed' });
     return { message: summary };
   }
-  if (channel === 'orchestration:list-for-tab') return payload === owner ? fixture.runs : [];
+  if (channel === 'orchestration:list-for-tab') {
+    const snapshot = structuredClone(payload === owner ? fixture.runs : []);
+    if (fixture.holdRunList && payload === owner) return new Promise(resolve => {
+      fixture.pendingRunReads.push(() => resolve(snapshot));
+    });
+    return snapshot;
+  }
   if (channel === 'orchestration:get-settings') return settings;
   if (channel === 'provider:get-status') return { type: 'codex' };
   if (channel === 'tab:get-context-pct') return { pct: 25 };
@@ -71,7 +77,7 @@ function response(channel: string, payload: any) {
 const ipc: any = {
   invoke(channel: string, ...args: any[]) {
     fixture.calls.push({ channel, args: structuredClone(args) });
-    return Promise.resolve().then(() => structuredClone(response(channel, args[0])));
+    return Promise.resolve().then(() => response(channel, args[0])).then(value => structuredClone(value));
   },
   send(channel: string, ...args: any[]) {
     fixture.calls.push({ channel, args: structuredClone(args) });
@@ -136,6 +142,10 @@ async function mount() {
     activeSpaceId: 'layout-workflow', spaces: [{ id: 'layout-workflow', name: 'Layout fixture',
       projectIds: [projectId, peerProjectId], layout }],
     showWorkspace: () => {}, setProjectView: () => {},
+    openTabById: async (tabId: string, options: any) => {
+      fixture.navigation.push({ kind: 'openTabById', tabId, options });
+      return true;
+    },
     placeTab: (id: string, tabId: string) => fixture.navigation.push({ kind: 'placeTab', projectId: id, tabId }),
     activateCenterTab: (id: string, tabId: string) => fixture.navigation.push({ kind: 'activateCenterTab', projectId: id, tabId }),
   } as any);
@@ -172,6 +182,29 @@ async function mount() {
     }]]) } as any);
     version += 1;
     render();
+  };
+  fixture.pendingRunReads = [];
+  fixture.beginRunHydration = () => {
+    fixture.holdRunList = true;
+    fixture.reset(fixture.width);
+    fixture.runs = [{ ...fixture.runs[0], status: 'sending', updatedAt: 10,
+      deliveryAcceptedAt: null, targetPromptProofAt: null, targetExecutionContext: null }];
+  };
+  fixture.publishRunCompletion = () => {
+    fixture.runs = [{ ...fixture.runs[0], status: 'completed', updatedAt: 20,
+      resultComplete: true, notificationStatus: 'sent', sourceFollowupPending: false,
+      completedAt: Date.now(), sourceFollowupStartedAt: Date.now() }];
+    emit('orchestration:changed', { run: fixture.runs[0] });
+  };
+  fixture.releaseRunRead = () => {
+    fixture.holdRunList = false;
+    for (const release of fixture.pendingRunReads.splice(0)) release();
+  };
+  fixture.showSending = () => {
+    fixture.runs = [{ ...fixture.runs[0], status: 'sending', updatedAt: 30,
+      completedAt: null, sourceFollowupStartedAt: null, resultComplete: false,
+      deliveryAcceptedAt: null, targetPromptProofAt: null, targetExecutionContext: null }];
+    emit('orchestration:changed', { run: fixture.runs[0] });
   };
   fixture.arrive = () => {
     const question = { messageId: 'layout-question', kind: 'question', sourceTabId: 'layout-peer',
@@ -224,6 +257,10 @@ async function mount() {
       { ...base, runId: 'details-different-errors', status: 'failed', outcome: 'failed',
         completionReason: 'future-specific-reason', label: 'Distinct error evidence', notificationStatus: 'unconfirmed',
         error: 'Synthetic execution failure', resultError: 'Synthetic result proof failure' },
+      { ...base, runId: 'details-manual-cancel', status: 'cancelled', outcome: 'interrupted',
+        completionReason: 'turn_aborted', label: 'Interrupted native task',
+        error: 'turn_aborted', resultError: null, notificationStatus: 'suppressed',
+        deliveryAcceptedAt: createdAt + 1000, targetPromptProofAt: createdAt + 1100 },
     ];
     version += 1;
     render();

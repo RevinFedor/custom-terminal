@@ -67,7 +67,7 @@ function mergeExactSourceAliases(canonical, companion) {
   return aliases;
 }
 
-function mergeCanonicalEventProjection(eventCarrier, responseCarrier) {
+function mergeCanonicalEventProjection(eventCarrier, responseCarrier, firstCarrier) {
   const canonical = eventCarrier.projection;
   const companion = responseCarrier.projection;
   const message = {
@@ -76,6 +76,10 @@ function mergeCanonicalEventProjection(eventCarrier, responseCarrier) {
   const aliases = mergeExactSourceAliases(canonical.message, companion.message);
   if (aliases.length > 0) message.sourceIdentityAliases = aliases;
   else delete message.sourceIdentityAliases;
+  const entryUuidAliases = [...new Set([companion.message?.uuid,
+    ...(canonical.message?.entryUuidAliases || []), ...(companion.message?.entryUuidAliases || [])])]
+    .map(exactString).filter(value => value && value !== canonical.message?.uuid);
+  if (entryUuidAliases.length) message.entryUuidAliases = entryUuidAliases;
   const imagePaths = mergeImagePaths(
     canonical.message?.imagePaths,
     companion.message?.imagePaths,
@@ -84,12 +88,14 @@ function mergeCanonicalEventProjection(eventCarrier, responseCarrier) {
   else delete message.imagePaths;
   return {
     ...canonical,
+    firstRecordByteOffset: firstCarrier.byteOffset,
+    firstRecordTimestamp: firstCarrier.projection?.timestamp,
     message,
     promptOwner: canonical.promptOwner || companion.promptOwner || null,
   };
 }
 
-function normalizeCarrier(input) {
+function normalizeCarrier(input, allowSourceOnly = false) {
   const kind = input?.kind;
   if (kind !== CARRIER_RESPONSE && kind !== CARRIER_EVENT) return null;
   const projection = input?.projection;
@@ -100,7 +106,7 @@ function normalizeCarrier(input) {
     || projection?.sessionId,
   );
   const text = String(input?.text || '');
-  if (!projection || !sourceIdentity || !uuid || !sessionId || !text) return null;
+  if (!projection || !sourceIdentity || (!uuid && !allowSourceOnly) || !sessionId || !text) return null;
   return {
     kind,
     text,
@@ -135,12 +141,14 @@ function carrierCanPair(left, right, textsMatch) {
  */
 function createCodexLiveUserCarrierPairer({
   textsMatch = codexUserCarrierTextsMatch,
+  allowSourceOnly = false,
 } = {}) {
   let pendingResponses = [];
   let pendingEvents = [];
+  let taskStartedSeen = false;
 
   const accept = (input = {}) => {
-    const carrier = normalizeCarrier(input);
+    const carrier = normalizeCarrier(input, allowSourceOnly);
     if (!carrier) {
       return {
         paired: false,
@@ -165,7 +173,7 @@ function createCodexLiveUserCarrierPairer({
         reason: 'exact-cross-carrier-pair',
         responseSourceIdentity: responseCarrier.sourceIdentity,
         eventSourceIdentity: eventCarrier.sourceIdentity,
-        projections: [mergeCanonicalEventProjection(eventCarrier, responseCarrier)],
+        projections: [mergeCanonicalEventProjection(eventCarrier, responseCarrier, companion)],
       };
     }
 
@@ -185,9 +193,12 @@ function createCodexLiveUserCarrierPairer({
       // to the current turn only. Response fallbacks may precede task_started
       // in real Codex rollouts, so they remain eligible for the event after it.
       pendingEvents = [];
+      if (taskStartedSeen) pendingResponses = [];
+      taskStartedSeen = true;
     } else if (CLEAR_ALL_BOUNDARIES.has(kind)) {
       pendingResponses = [];
       pendingEvents = [];
+      taskStartedSeen = false;
     }
   };
 

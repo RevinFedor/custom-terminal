@@ -91,6 +91,23 @@ test('event then response retains the event identity and adds the later response
   ]);
 });
 
+test('first task start can follow a response fallback, but the next start cannot borrow it', () => {
+  const beforeStart = createCodexLiveUserCarrierPairer();
+  accept(beforeStart, CARRIER_RESPONSE, 1);
+  beforeStart.observeBoundary('task_started');
+  assert.equal(accept(beforeStart, CARRIER_EVENT, 2).paired, true);
+
+  const consecutiveStarts = createCodexLiveUserCarrierPairer();
+  consecutiveStarts.observeBoundary('task_started');
+  accept(consecutiveStarts, CARRIER_RESPONSE, 1);
+  consecutiveStarts.observeBoundary('task_started');
+  assert.equal(accept(consecutiveStarts, CARRIER_EVENT, 2).paired, false);
+  consecutiveStarts.observeBoundary('task_complete');
+  accept(consecutiveStarts, CARRIER_RESPONSE, 3);
+  consecutiveStarts.observeBoundary('task_started');
+  assert.equal(accept(consecutiveStarts, CARRIER_EVENT, 4).paired, true);
+});
+
 test('two byte-identical sends pair FIFO and remain two canonical events', () => {
   const pairer = createCodexLiveUserCarrierPairer();
   accept(pairer, CARRIER_RESPONSE, 1);

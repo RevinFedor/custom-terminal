@@ -517,12 +517,16 @@ function addUniqueAttr(entry, key, value) {
   }
 }
 
-function addDocsEdited(entry, filePath) {
+function addDocsEdited(entry, filePath, cwd) {
+  if (typeof filePath === 'string' && filePath.trim()) {
+    const target = typeof cwd === 'string' && path.isAbsolute(cwd) ? path.resolve(cwd, filePath.trim()) : filePath.trim();
+    addUniqueAttr(entry, 'fileEdits', target);
+  }
   const shortName = shortKnowledgeDocsPath(filePath);
   if (shortName) addUniqueAttr(entry, 'docsEdited', shortName);
 }
 
-function addSemanticDocsEdits(entry, actions) {
+function addSemanticDocsEdits(entry, actions, cwd) {
   for (const action of Array.isArray(actions) ? actions : []) {
     const raw = action?.rawTool;
     if (!raw) continue;
@@ -535,6 +539,12 @@ function addSemanticDocsEdits(entry, actions) {
       mcpServer: raw.mcpServer,
       mcpMethod: raw.mcpMethod,
     });
+    if (presentation.fileEditTarget) {
+      const workdir = raw.args?.workdir || raw.args?.cwd || cwd;
+      const target = typeof workdir === 'string' && path.isAbsolute(workdir)
+        ? path.resolve(workdir, presentation.fileEditTarget) : presentation.fileEditTarget;
+      addUniqueAttr(entry, 'fileEdits', target);
+    }
     if (presentation.docsKind !== 'edit') continue;
     const docsPath = presentation.targetLabel || presentation.targetKey;
     if (docsPath) addUniqueAttr(entry, 'docsEdited', docsPath);
@@ -726,14 +736,14 @@ function extractExecDocsSearchQuery(argumentsText) {
   return decodeSimpleJsString(argumentsText, queryMatch.index + queryMatch[0].length);
 }
 
-function collectCodexExecDocsAttributes(currentUser, source) {
+function collectCodexExecDocsAttributes(currentUser, source, cwd) {
   if (!currentUser || typeof source !== 'string') return;
 
   for (const call of findJsToolCallArguments(source, 'tools.apply_patch')) {
     const patchText = resolveSimpleJsCallArgument(source, call, call.argumentsText);
     if (!patchText) continue;
     for (const filePath of extractPatchTouchedFiles(patchText)) {
-      addDocsEdited(currentUser, filePath);
+      addDocsEdited(currentUser, filePath, cwd);
     }
   }
 
@@ -1438,6 +1448,8 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
       args: {
         command: command || humanizeCodexToolName(qualifiedName),
         description: input.justification || '',
+        ...(typeof input.workdir === 'string' ? { workdir: input.workdir } : {}),
+        ...(typeof input.cwd === 'string' ? { cwd: input.cwd } : {}),
       },
     }];
   }
@@ -1673,7 +1685,7 @@ function parseToolArguments(payload) {
   return {};
 }
 
-function collectCodexDocsAttributes(currentUser, payload) {
+function collectCodexDocsAttributes(currentUser, payload, cwd) {
   if (!currentUser || !payload || typeof payload !== 'object') return;
   const toolName = payload.name || payload.tool_name || '';
   const namespace = payload.namespace || '';
@@ -1689,7 +1701,7 @@ function collectCodexDocsAttributes(currentUser, payload) {
       ? payload.input
       : (typeof payload.arguments === 'string' ? payload.arguments : '');
     for (const filePath of extractPatchTouchedFiles(patchText)) {
-      addDocsEdited(currentUser, filePath);
+      addDocsEdited(currentUser, filePath, cwd);
     }
   }
 
@@ -1697,15 +1709,15 @@ function collectCodexDocsAttributes(currentUser, payload) {
     const source = typeof payload.input === 'string'
       ? payload.input
       : (typeof payload.arguments === 'string' ? payload.arguments : '');
-    collectCodexExecDocsAttributes(currentUser, source);
+    collectCodexExecDocsAttributes(currentUser, source, cwd);
   }
 
   // Keep Timeline on the same semantic grammar as History. This covers
   // nested exec_command calls whose shell body writes docs via Python/cat/sed
   // instead of apply_patch — the transport tool name itself says only `exec`.
   // Do not run the full nested-call decoder for every search/read command in a
-  // giant rollout: History can only prove a docs edit when the literal target
-  // is present anyway, so this cheap gate preserves Timeline parse cost.
+  // giant rollout: skip exec snippets without a supported patch/command call.
+  // Classify commands with the shared grammar, not a second list of writers.
   const editCapableTransport = toolName === 'exec'
     || toolName === 'apply_patch'
     || toolName === 'exec_command'
@@ -1720,7 +1732,8 @@ function collectCodexDocsAttributes(currentUser, payload) {
   } catch {
     semanticSource = '';
   }
-  if (!editCapableTransport || !/(?:^|[\\/])docs[\\/]|\bCLAUDE\.md\b/i.test(semanticSource)) return;
+  if (!editCapableTransport || (toolName === 'exec'
+    && !/\b(?:apply_patch|exec_command|run_command)\s*\(/.test(semanticSource))) return;
   const callArgs = payload.arguments != null
     ? parseToolArguments(payload)
     : (typeof payload.input === 'string' ? { input: payload.input } : (payload.input || args));
@@ -1730,7 +1743,7 @@ function collectCodexDocsAttributes(currentUser, payload) {
     namespace,
     args: callArgs && typeof callArgs === 'object' ? callArgs : { value: callArgs },
   }, '', false);
-  addSemanticDocsEdits(currentUser, decoded.actions);
+  addSemanticDocsEdits(currentUser, decoded.actions, cwd);
 }
 
 function extractTextContent(content) {
@@ -3631,6 +3644,7 @@ const { codexProviderErrorEntry } = require('../codex-provider-error');
 function createCodexTimelineProjector(sessionId, seed = {}) {
   const entries = seed.entries ?? [];
   const pendingResponseUsers = seed.pendingResponseUsers ?? [];
+  const pendingFileEditCalls = seed.pendingFileEditCalls ?? new Map();
   let currentUser = seed.currentUser ?? null;
   let currentTurnIndex = seed.currentTurnIndex ?? -1;
   let latestModel = seed.latestModel ?? null;
@@ -3643,6 +3657,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
   let forkStartedAtMs = seed.forkStartedAtMs ?? NaN;
   let currentTurnCanonicalUserText = seed.currentTurnCanonicalUserText ?? null;
   let currentTurnCanonicalUserEntry = seed.currentTurnCanonicalUserEntry ?? null;
+  let sessionCwd = seed.sessionCwd ?? '';
 
   const attachSubagentLaunch = (entry, payload, record) => {
     if (!entry) return;
@@ -3682,6 +3697,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
     const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
 
     if (record.type === 'session_meta') {
+      if (payload.cwd) sessionCwd = payload.cwd;
       // A native full Fork can contain its own header followed by copied
       // ancestor headers in the SAME file. Physical provenance alone must not
       // let the later copy replace that file's identity. Virtual projections
@@ -3734,6 +3750,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
     }
 
     if (record.type === 'turn_context') {
+      if (payload.cwd) sessionCwd = payload.cwd;
       latestModel = payload.model || latestModel;
       latestEffort = payload.effort || latestEffort;
       if (currentUser) currentUser.responseModel = latestModel || currentUser.responseModel;
@@ -3741,6 +3758,13 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
     }
 
     if (record.type === 'event_msg') {
+      if (payload.type === 'patch_apply_end' && parseCodexPatchApplyChanges(payload)
+        && attachCodexPatchApplyEvent(pendingFileEditCalls, payload, sessionCwd)) {
+        for (const call of pendingFileEditCalls.values()) {
+          if (!call.patchApplyEvents.includes(payload) || !call.userOwner) continue;
+          addSemanticDocsEdits(call.userOwner, codexHistoryActionsForCall(call, undefined, false).actions, call.cwd);
+        }
+      }
       if (payload.type === 'task_started') {
         currentTurnCanonicalUserText = null;
         currentTurnCanonicalUserEntry = null;
@@ -3926,8 +3950,23 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
         return;
       }
       if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
-        collectCodexDocsAttributes(currentUser, payload);
+        collectCodexDocsAttributes(currentUser, payload, sessionCwd);
         attachSubagentLaunch(currentUser, payload, record);
+        const toolName = payload.name || payload.tool_name || '';
+        const args = payload.arguments != null ? parseToolArguments(payload)
+          : (typeof payload.input === 'string' ? { input: payload.input } : payload.input || {});
+        if (currentUser && (toolName === 'apply_patch' || toolName === 'exec'
+          && typeof args?.input === 'string'
+          && findCodexExecNestedCalls(args.input).some(call => call.toolName === 'apply_patch'))) {
+          const callId = payload.call_id || payload.id || stableUuidForRecord(sessionId, record, 'codex-call');
+          pendingFileEditCalls.set(callId, { callId, toolName, args,
+            cwd: sessionCwd, userOwner: currentUser,
+            turnId: String(payload.turn_id || payload.internal_chat_message_metadata_passthrough?.turn_id || ''),
+            patchApplyEvents: [] });
+        }
+      }
+      if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+        pendingFileEditCalls.delete(payload.call_id || payload.id);
       }
       if (payload.type === 'reasoning' && currentUser) {
         currentUser.responseHasThinking = true;
@@ -3965,10 +4004,10 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
     finalize,
     getSessionMeta,
     exportState: () => ({
-      entries, pendingResponseUsers, currentUser, currentTurnIndex, latestModel,
+      entries, pendingResponseUsers, pendingFileEditCalls, currentUser, currentTurnIndex, latestModel,
       latestEffort, latestTokenCountInfo, pendingCompactCompanions, metaRecord,
       metaRecordPhysicalSessionId, forkLiveStartLine, forkStartedAtMs,
-      currentTurnCanonicalUserText, currentTurnCanonicalUserEntry,
+      currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, sessionCwd,
     }),
     // Cost accounting reads the retained projector state directly; callers
     // still receive cloned rows through finalize().
@@ -6949,7 +6988,10 @@ function validateCodexRangeRewriteProjection({
   return { success: true, expectedCount: expected.length, actualCount: actual.length };
 }
 
-function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replacementText = null) {
+function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replacementText = null, { toPhysicalEnd = false } = {}) {
+  if (typeof toPhysicalEnd !== 'boolean' || toPhysicalEnd && replacementText != null) {
+    return { success: false, error: 'Physical suffix mode is only valid for Rewind deletion' };
+  }
   const timeline = buildCodexTimeline(records, sessionId);
   const startIndex = timeline.findIndex((entry) => entry.uuid === startUuid);
   const endIndex = timeline.findIndex((entry) => entry.uuid === endUuid);
@@ -6966,8 +7008,8 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     return { success: false, error: 'Timeline range not found' };
   }
 
-  const minIndex = Math.min(startIndex, endIndex);
-  let maxIndex = Math.max(startIndex, endIndex);
+  const minIndex = toPhysicalEnd ? startIndex : Math.min(startIndex, endIndex);
+  let maxIndex = toPhysicalEnd ? timeline.length - 1 : Math.max(startIndex, endIndex);
   // A rewrite from the first visible entry is a new root. Any compact snapshot
   // immediately following the selected prefix still describes that deleted
   // root and cannot lead the first retained user turn. Middle-range deletes do
@@ -7058,12 +7100,16 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     && !Number.isFinite(wrapper.turnKey)
     && isCodexTurnPreambleRecord(wrapper.record)
   );
+  const startCarrier = canonicalByUuid.get(startUuid);
+  const suffixStart = toPhysicalEnd && startCarrier?.kind === 'user' && Number.isFinite(startCarrier.turnKey)
+    ? wrappers.findIndex(wrapper => wrapper.turnKey === startCarrier.turnKey) : -1;
+  if (toPhysicalEnd && suffixStart < 0) return { success: false, error: 'Rewind suffix has no exact user-iteration boundary' };
   const shouldRemoveWrapper = (wrapper) => {
     if (Number.isFinite(wrapper.turnKey) && selectedTurnKeys.has(Number(wrapper.turnKey))) return true;
     if (wrapper.sourceUuid && selectedCompacts.has(wrapper.sourceUuid)) return true;
     return isSelectedCompactCompanion(wrapper) || isOrphanTurnPreamble(wrapper);
   };
-  const firstRemovalIndex = wrappers.findIndex(shouldRemoveWrapper);
+  const firstRemovalIndex = toPhysicalEnd ? suffixStart : wrappers.findIndex(shouldRemoveWrapper);
   if (firstRemovalIndex < 0) {
     return { success: false, error: 'Selected Codex turns were not found in visible rollout records' };
   }
@@ -7088,8 +7134,8 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
   let removedUsers = 0;
   const removedUserUuids = new Set();
 
-  for (const wrapper of wrappers) {
-    const shouldRemove = shouldRemoveWrapper(wrapper);
+  for (const [index, wrapper] of wrappers.entries()) {
+    const shouldRemove = toPhysicalEnd ? index >= suffixStart : shouldRemoveWrapper(wrapper);
     if (shouldRemove) {
       if (replacementRecords.length > 0 && !inserted) {
         for (const replacement of replacementRecords) outputRecords.push(replacement);
@@ -7140,6 +7186,9 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     selectedTurnKeys: Array.from(selectedTurnKeys),
     selectedCompacts: Array.from(selectedCompacts),
     expectedRemainingCount: projection.expectedCount,
+    ...(toPhysicalEnd ? { suffixProof: { kind: 'physical-suffix', startRecordIndex: suffixStart,
+      sourceRecordCount: wrappers.length, retainedRecordCount: outputRecords.length,
+      removedRecordCount: removedRecords } } : {}),
   };
 }
 
@@ -7349,6 +7398,136 @@ async function editCodexRange({
   };
 }
 
+function codexRepairRecordsHash(records) {
+  const digest = crypto.createHash('sha256');
+  for (const record of records) digest.update(JSON.stringify(cloneCodexRecordForWrite(record)) + '\n');
+  return digest.digest('hex');
+}
+
+function isCodexSavedRepairResumeSettings(record, { previous, currentSessionId, cwd, createdAt, baseline }) {
+  if (record?.type !== 'event_msg' || record.payload?.type !== 'thread_settings_applied'
+    || previous?.resume?.launchWritten !== true || typeof previous.resume.launchId !== 'string'
+    || !previous.resume.launchId.trim()) return false;
+  const candidate = extractCodexSettingsCandidate(record, 0);
+  if (!candidate?.complete || candidate.model !== baseline.model || candidate.effort !== baseline.effort) return false;
+  const timestamp = Date.parse(record.timestamp || '');
+  if (!Number.isFinite(timestamp) || !Number.isFinite(createdAt) || timestamp < createdAt) return false;
+  // This is an appended provider fact in the exact already-verified child,
+  // not an arbitrary event of the same type or a cold authoring transaction.
+  const payload = record.payload;
+  if (Object.hasOwn(payload, 'source') && !['cli', 'codex'].includes(payload.source)) return false;
+  if (record.__physicalSessionId && record.__physicalSessionId !== currentSessionId) return false;
+  for (const object of [record, payload, payload.thread_settings]) {
+    for (const key of ['session_id', 'sessionId', 'thread_id', 'threadId', 'source_session_id']) {
+      if (Object.hasOwn(object, key) && object[key] !== currentSessionId) return false;
+    }
+    if (Object.hasOwn(object, 'cwd') && (typeof object.cwd !== 'string'
+      || !path.isAbsolute(object.cwd) || path.resolve(object.cwd) !== path.resolve(cwd))) return false;
+    // A settings envelope must not smuggle an authored/tool action.
+    if (['message', 'prompt', 'input', 'call_id', 'arguments', 'error'].some(key => Object.hasOwn(object, key))) return false;
+  }
+  return true;
+}
+
+async function inspectCodexSavedRewindRepair({ previous, currentSessionId, cwd }) {
+  const request = previous?.request;
+  const sourceSessionId = request?.expectedSessionId;
+  const reject = code => ({ success: false, code, error: code });
+  if (previous?.state !== 'completed' || previous.toolType !== 'codex' || previous.kind !== 'rewind'
+    || previous.historyMutated !== true || previous.bindingCommitted !== true
+    || previous.newSessionId !== currentSessionId || !sourceSessionId || !previous.endUuid) {
+    return reject('history_repair_previous_operation_unproven');
+  }
+  const source = await loadCodexOperationSource(sourceSessionId, cwd, { forceFresh: true });
+  const child = await loadCodexOperationSource(currentSessionId, cwd, { forceFresh: true });
+  if (!source.success || !child.success) return reject('history_repair_source_unavailable');
+  const childMeta = getSessionMeta(child.records);
+  const childHeader = child.records.find(record => record.type === 'session_meta');
+  if (childMeta.id !== currentSessionId || childMeta.forked_from_id !== sourceSessionId
+    || childMeta.history_mode !== 'legacy' || path.resolve(childMeta.cwd || '') !== path.resolve(cwd || '')) {
+    return reject('history_repair_child_identity_changed');
+  }
+  const legacy = planCodexRangeRewrite(source.records, sourceSessionId, request.targetUuid, previous.endUuid);
+  if (!legacy.success) return reject('history_repair_original_target_changed');
+  const proof = resolveCodexHistoryMutationSettingsProof(source.records, sourceSessionId, null, source);
+  if (proof.status !== 'found') return reject('history_repair_source_settings_unproven');
+  const expected = legacy.outputRecords;
+  const timestamp = childHeader?.timestamp || childMeta.timestamp;
+  if (!timestamp) return reject('history_repair_child_identity_changed');
+  rewriteCodexEditedForkMetadata(source.records, sourceSessionId, cwd, expected, currentSessionId, timestamp);
+  const mutationSettings = child.records.find(record => record.type === 'event_msg'
+    && record.payload?.type === 'thread_settings_applied'
+    && record.payload?.source === 'noted-terminal-history-mutation' && record.timestamp === timestamp);
+  if (mutationSettings) {
+    if (mutationSettings.payload.source_session_id !== sourceSessionId
+      || !Number.isFinite(Number(mutationSettings.payload.proof_at))) return reject('history_repair_child_changed');
+    proof.proofAt = Number(mutationSettings.payload.proof_at);
+  }
+  const settings = ensureCodexEditedForkSettingsProof(expected, currentSessionId, proof, timestamp);
+  if (!settings.success || child.records.length < expected.length) return reject('history_repair_child_changed');
+  for (let index = 0; index < expected.length; index++) {
+    if (JSON.stringify(cloneCodexRecordForWrite(child.records[index])) !== JSON.stringify(expected[index])) {
+      return reject('history_repair_source_or_child_changed');
+    }
+  }
+  const baseline = resolveCodexSourceSettingsProof(expected, currentSessionId);
+  const childSettingsProof = resolveCodexHistoryMutationSettingsProof(child.records, currentSessionId, null, child);
+  if (baseline.status !== 'found' || childSettingsProof.status !== 'found'
+    || childSettingsProof.model !== baseline.model || childSettingsProof.effort !== baseline.effort) {
+    return reject('history_repair_child_has_new_work');
+  }
+  const classifySuffix = record => {
+    const payload = record?.payload || {};
+    const bootstrap = record?.type === 'session_meta' && payload.id === currentSessionId
+      && (payload.session_id === undefined || payload.session_id === currentSessionId)
+      && path.resolve(payload.cwd || '') === path.resolve(cwd || '');
+    const context = isCodexPreUserRecord(record)
+      && !isCodexResponseUserRecord(record)
+      && record?.type !== 'event_msg';
+    const count = record?.type === 'event_msg' && payload.type === 'token_count';
+    const resumeSettings = isCodexSavedRepairResumeSettings(record, {
+      previous, currentSessionId, cwd, createdAt: Date.parse(timestamp), baseline,
+    });
+    return resumeSettings ? 'resume-settings' : bootstrap || context || count ? 'context' : null;
+  };
+  // A parsed array can omit malformed rows or an unfinished next user. Prove
+  // completeness of just the physical suffix with the SAME canonical reader,
+  // on its exact inode/stat lease, rather than claiming absence from that array.
+  const lastPrefix = child.records[expected.length - 1];
+  const startByte = Number(lastPrefix?.__byteOffset);
+  if (!child.sourceSnapshot || !Number.isSafeInteger(startByte) || startByte < 0) return reject('history_repair_child_changed');
+  const sourceStat = await fs.promises.stat(child.filePath);
+  if (!codexSourceSnapshotMatchesStat(child.sourceSnapshot, sourceStat)) return reject('history_repair_child_changed');
+  let prefixSeen = false, suffixCount = 0, resumeSettingsRecords = 0, suffixUnproven = false;
+  const suffix = await readJsonlRange(child.filePath, startByte, sourceStat.size - 1, {
+    sourceStat, collectRecords: false,
+    onRecord: record => {
+      if (!prefixSeen) {
+        prefixSeen = true;
+        if (JSON.stringify(cloneCodexRecordForWrite(record)) !== JSON.stringify(cloneCodexRecordForWrite(lastPrefix))) suffixUnproven = true;
+        return;
+      }
+      suffixCount += 1;
+      const kind = classifySuffix(record);
+      if (!kind) suffixUnproven = true;
+      if (kind === 'resume-settings') resumeSettingsRecords += 1;
+    },
+  });
+  if (!prefixSeen || suffixUnproven || suffix.errors || suffix.leftoverBuffer?.length
+    || suffixCount !== child.records.length - expected.length) return reject('history_repair_child_has_new_work');
+  return { success: true, sourceSessionId, sourceRecords: source.records,
+    childSettingsProof,
+    sourceHash: codexRepairRecordsHash(source.records), childHash: codexRepairRecordsHash(child.records),
+    validateChild: () => {
+      if (!child.sourceSnapshot || !codexSourceSnapshotMatchesStat(child.sourceSnapshot, fs.statSync(child.filePath))) {
+        throw Object.assign(new Error('history_repair_child_changed'), { code: 'history_repair_child_changed' });
+      }
+    },
+    proof: { kind: 'exact-previous-cow-output', repairOfOperationId: previous.operationId,
+      previousChildSessionId: currentSessionId, sourceSessionId, retainedRecords: expected.length,
+      resumeSettingsRecords } };
+}
+
 async function deleteCodexRange({
   sessionId,
   cwd,
@@ -7358,6 +7537,7 @@ async function deleteCodexRange({
   validateOnly = false,
   validateSource = null,
   beforeWrite = null,
+  toPhysicalEnd = false,
 }) {
   if (!sessionId) return { success: false, error: 'sessionId required' };
   if (!startUuid || !endUuid) return { success: false, error: 'startUuid/endUuid required' };
@@ -7370,7 +7550,9 @@ async function deleteCodexRange({
     loaded.records,
     sessionId,
     startUuid,
-    endUuid
+    endUuid,
+    null,
+    { toPhysicalEnd },
   );
   if (!plan.success) return plan;
   const effectiveSettingsProof = resolveCodexHistoryMutationSettingsProof(
@@ -7405,6 +7587,7 @@ async function deleteCodexRange({
       selectedCompacts: plan.selectedCompacts,
       expectedRemainingCount: plan.expectedRemainingCount,
       codexSettingsProof: effectiveSettingsProof,
+      suffixProof: plan.suffixProof || null,
     };
   }
 
@@ -7474,6 +7657,7 @@ async function deleteCodexRange({
     settingsProofInjected: result.settingsProofInjected,
     expectedRemainingCount: plan.expectedRemainingCount,
     historyEventPersisted,
+    suffixProof: plan.suffixProof || null,
   };
 }
 
@@ -11488,6 +11672,8 @@ module.exports = {
     findCodexPromptExecutionContext,
     buildCodexVisibleRecordWrappers,
     planCodexRangeRewrite,
+    inspectCodexSavedRewindRepair,
+    codexRepairRecordsHash,
     validateCodexRangeRewriteProjection,
     planCodexForkFromLatestCompact,
     rewriteCodexEditedForkMetadata,

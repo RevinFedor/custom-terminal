@@ -137,6 +137,28 @@ test('normal HTTP end after response.completed is not an uncertain transport fai
   assert.equal(h.events.some(e => e.type === 'request_delivery_unknown'), false);
 });
 
+test('explicit foreign canonical item cannot adopt equal text before or after close1006', () => {
+  for (const closeFirst of [false, true]) {
+    const h = harness(), c = h.connection(); h.start(c);
+    h.done(c, 'actual-item', heldText, 'actual-response'); h.flush();
+    if (closeFirst) c.finishAll('client-close:1006');
+    assert.equal(h.canonical('foreign-item', heldText), false);
+    if (!closeFirst) c.finishAll('client-close:1006');
+    h.flush();
+    assert.equal(h.controller.get(tabId).text, heldText);
+    assert.equal(h.controller.get(tabId).responseSegments[0].deliveryState, 'unknown');
+    assert.equal(h.canonical('actual-item', heldText), true);
+    assert.equal(h.controller.get(tabId), null);
+  }
+});
+
+test('legacy canonical without an item ID can still adopt completed text before transport uncertainty', () => {
+  const h = harness(), c = h.connection(); h.start(c);
+  h.done(c, 'legacy-item', heldText, 'legacy-response'); h.flush();
+  assert.equal(h.canonical(null, heldText), true);
+  assert.equal(h.controller.get(tabId), null);
+});
+
 test('foreign responseId cannot become the current request and settled-turn bytes cannot revive it', () => {
   const h = harness(), c = h.connection(); h.start(c);
   h.done(c, 'held', heldText, 'completed-response'); h.flush();

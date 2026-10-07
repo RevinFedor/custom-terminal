@@ -4512,6 +4512,7 @@ function register({
           let responseModel;
           let responseHasThinking = false;
           const docsEditedSet = new Set();
+          const fileEditsSet = new Set();
           const docsSearchQueriesSet = new Set();
           const subAgentsByKey = new Map();
           const entryIdx = activeBranch.indexOf(entry);
@@ -4538,17 +4539,16 @@ function register({
                     || block.name === 'Write'
                     || block.name === 'MultiEdit'
                     || block.name === 'Update';
-                  const docsHint = String(
-                    block.input?.file_path
-                    || block.input?.path
-                    || block.input?.command
-                    || '',
-                  );
-                  if (editCapableTool && /(?:^|[\\/])docs[\\/]|\bCLAUDE\.md\b/i.test(docsHint)) {
+                  if (editCapableTool) {
                     const actionPresentation = historyActionPresentationMeta({
                       toolName: block.name,
                       args: block.input || {},
                     });
+                    if (actionPresentation.fileEditTarget) {
+                      const workdir = block.input?.workdir || block.input?.cwd;
+                      fileEditsSet.add(typeof workdir === 'string' && path.isAbsolute(workdir)
+                        ? path.resolve(workdir, actionPresentation.fileEditTarget) : actionPresentation.fileEditTarget);
+                    }
                     if (actionPresentation.docsKind === 'edit') {
                       const docsPath = actionPresentation.targetLabel
                         || actionPresentation.targetKey;
@@ -4605,6 +4605,7 @@ function register({
             // Attached to user-entry so timeline shows a single dot per prompt instead of
             // separate docs_edit/docs_search dots. Empty arrays omitted to keep entry shape clean.
             docsEdited: docsEditedSet.size > 0 ? Array.from(docsEditedSet) : undefined,
+            fileEdits: fileEditsSet.size > 0 ? Array.from(fileEditsSet) : undefined,
             docsSearchQueries: docsSearchQueriesSet.size > 0 ? Array.from(docsSearchQueriesSet) : undefined,
             subAgents: subAgentsByKey.size > 0 ? Array.from(subAgentsByKey.values()) : undefined,
           });
@@ -6549,7 +6550,15 @@ function register({
       const db = projectManager.db;
       const resolved = typeof resolveTimelineNoteAnchor === 'function'
         ? await resolveTimelineNoteAnchor(request) : { success: !String(entryUuid || '').startsWith('codex-live-'), entryUuid };
-      if (resolved.success !== true) return { success: false, error: resolved.error || 'timeline_note_source_unavailable' };
+      if (resolved.success !== true) {
+        // IDs/counts distinguish a stale live point, a filtered service row,
+        // and ambiguous identity. Never log the user's note or provider text.
+        console.warn('[TimelineNotes] save-rejected ' + JSON.stringify({
+          tabId, sessionId, entryUuid, sourceIdentity: request.sourceIdentity || null,
+          error: resolved.error || 'timeline_note_source_unavailable', diagnostic: resolved.diagnostic || null,
+        }));
+        return { success: false, error: resolved.error || 'timeline_note_source_unavailable' };
+      }
       if (request.previousEntryUuid) {
         const moved = db.moveTimelineNote({ ...request, entryUuid: resolved.entryUuid });
         return moved.success ? { ...resolved, success: true } : moved;

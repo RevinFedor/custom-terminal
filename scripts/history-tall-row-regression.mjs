@@ -17,6 +17,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { build } from 'esbuild';
 import { _electron as electron } from 'playwright';
+import { historyVirtuosoMeasurementEsbuildPlugin } from './lib/history-virtuoso-measurement.mjs';
 
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const arg = key => process.argv.find(a => a.startsWith('--' + key + '='))?.slice(key.length + 3);
@@ -168,7 +169,8 @@ try {
       afterSha256: createHash('sha256').update(changed).digest('hex'), replacements: 1 };
   }
   const bundled = await build({ entryPoints: [path.join(snapshot, 'scripts/fixtures/history-tall-row.tsx')], bundle: true,
-    outfile: path.join(artifact, 'bundle.js'), platform: 'browser', format: 'esm', target: 'chrome120', logLevel: 'silent',
+    outfile: path.join(artifact, 'bundle.js'), platform: 'browser', format: 'esm', target: 'chrome120', jsx: 'automatic', logLevel: 'silent',
+    plugins: [historyVirtuosoMeasurementEsbuildPlugin()],
     metafile: true, sourcemap: true, define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env': '{"DEV":false,"MODE":"test"}' },
     alias: { '@noted/claude-blocks': path.join(snapshot, 'packages/claude-blocks/src'),
       '@noted/structured-dnd': path.join(shared, 'structured-dnd/src'), '@noted/file-explorer': path.join(shared, 'file-explorer/src'),
@@ -337,9 +339,16 @@ try {
   result.wrongRaf = result.renderer.frames.filter(f => !f.tail || f.tail.top > f.client || f.tail.bottom < 0);
   result.measurement = { mounts: result.renderer.tallMounts,
     largestHeight: Math.max(0, ...result.renderer.frames.map(f => f.tall?.height || 0)),
+    firstMeasurements: logs.filter(line => line.includes('VIRTUOSO_ROW_HEIGHT_DELTA')
+      && line.includes('uuid=tall-user-6526 ') && line.includes('measurement=first-in-wrapper ')),
     largeCompensations: result.renderer.writers.filter(w => w.method === 'scrollBy' && Math.abs(w.args[0]?.top || 0) > 5000) };
+  // A MutationObserver runs AFTER the new layout-commit measurement. Its first
+  // DOM sighting now legitimately has the final known size. Prove the estimate
+  // at the actual itemSize boundary, and the existing physical compensation.
   check('large first measurement actually exercised', result.measurement.largestHeight > 8000
-    && result.measurement.mounts.some(m => m.phase === 'first-up' && Number(m.known) < 400), result.measurement);
+    && result.measurement.firstMeasurements.some(line => Number(line.match(/ known=([\d.]+)/)?.[1]) < 400
+      && Number(line.match(/ actual=([\d.]+)/)?.[1]) > 8000)
+    && result.measurement.largeCompensations.length > 0, result.measurement);
   check('ordinary path stays ready without seek/shell replacement', result.renderer.frames.every(f => f.ready && !f.seek && !f.shells));
   result.wrongPaints = result.main.paints.filter(p => (p.pixels.bright < 0.001 && p.pixels.dark > 0.995) || p.pixels.violet > .85);
   for (const paint of result.wrongPaints) paint.untilNextPaintMs = result.main.paints[paint.index + 1]?.abs - paint.abs;

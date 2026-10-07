@@ -13,16 +13,20 @@ const now=Date.now(), stamp=(i:number)=>new Date(now+i).toISOString();
 let history=Array.from({length:90},(_,i)=>({uuid:'base-'+i,role:i%2?'assistant':'user',sessionId,
  timestamp:stamp(i),content:'Existing row '+i+'\n\n'+(i%2?'Answer paragraph. '.repeat(30):'Earlier question.')}));
 let rail=history.filter(e=>e.role==='user').map(e=>({...e,type:e.role}));
+rail=rail.map(e=>({...e,...(e.uuid==='base-84'?{fileEdits:['work/status.md']}:
+  e.uuid==='base-86'?{fileEdits:['/other/work/status.md']}: {})}));
 const compact={uuid:'live-compact',role:'compact',sessionId,timestamp:stamp(100),
  sourceIdentity:'compact-source-100',compactEncrypted:true,content:'Conversation compacted'};
 const canonical={uuid:'canonical-user',role:'user',sessionId,timestamp:stamp(200),content:'EXACT NEW QUESTION',
  sourceIdentity:'canonical-source-200',sourceIdentityAliases:['carrier-source-190'],recordByteOffset:200};
-const state:any={reads:0,acks:[],scrolls:[],ready:false};
+const state:any={reads:0,timelineReads:0,acks:[],scrolls:[],ready:false,links:[],linkRevision:0};
 window.addEventListener('history-panel:scrolled-to',((e:CustomEvent)=>state.scrolls.push(e.detail)) as EventListener);
 const original=ipcRenderer.invoke.bind(ipcRenderer);
 ipcRenderer.invoke=async(channel:string,payload:any)=>{
  if(channel==='agent-transcript:get-history') {state.reads++;return {success:true,entries:history,payloadGeneration:'file:epoch',revision:{sources:[{sessionId,fileIdentity:'file',linkKind:'end'}]}};}
- if(channel==='agent-transcript:get-timeline')return {success:true,entries:rail};
+ if(channel==='agent-transcript:get-timeline'){state.timelineReads++;return {success:true,entries:rail};}
+ if(channel==='tab-work-context:get')return {success:true,context:{tabId,responsibility:'Private fixture',revision:state.linkRevision,
+   files:state.links,updates:[],pendingCount:0}};
  if(channel==='agent:acknowledge-send-receipt-presentation') {state.acks.push({...payload,rows:[...document.querySelectorAll('[data-uuid]')].map(e=>e.getAttribute('data-uuid'))});return {success:true,applied:true};}
  if(channel==='agent-session:get-availability-batch')return {success:true,results:(payload.sessions||[]).map(s=>({...s,state:'available',historyState:'available',checkedAt:Date.now()}))};
  if(channel==='agent-transcript:get-terminal-preview')return {success:true,preview:null};
@@ -35,6 +39,9 @@ useWorkspaceStore.setState({openProjects:new Map([[projectId,{projectId,projectP
  activeTabId:tabId,currentView:'terminal',tabGroups:[],selectedTabIds:[]}]]),activeProjectId:projectId} as any);
 const emit=(detail:any)=>ipcRenderer.emit('agent-transcript:live-message',{}, {tabId,toolType:'codex',sessionId,...detail});
 (window as any).fixture={state,tabId,sessionId,canonical,
+ links:(paths:string[])=>{state.links=paths.map(path=>({path}));state.linkRevision++;
+   ipcRenderer.emit('tab-work-context:changed',{}, {tabId,responsibility:'Private fixture',revision:state.linkRevision,
+     files:state.links,updates:[],pendingCount:0});},
  compact:()=>emit({type:'history_entry',timestamp:compact.timestamp,recordByteOffset:100,entry:compact}),
  prompt:()=>{
    beginHistoryPromptHandoff({tabId,handoffId:'h1',toolType:'codex',text:canonical.content,source:'history',statusAtSend:'active',

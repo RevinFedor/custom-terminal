@@ -8,6 +8,9 @@ import { choosePromptQueueContinuationForOutcome, isWorkflowOutcomeAtOrAfterArm,
 import { getHistoryAgentRuntime } from '../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario } from '../utils/agentScenarios';
 import { prepareTabWorkContext, settleTabWorkContext } from '../utils/tabWorkContext';
+import { promptQueueOutcomeFloor } from '../store/usePromptQueueStore';
+import { prepareAgentRuntimeForSend } from '../utils/agentSendPreparation';
+import { getAgentSendProviderContract } from '../utils/agentSendProviderContract';
 import { AGENT_SETTINGS_INTENT_NONE } from '../utils/agentSendSettingsContract';
 import {
   isStandaloneAgentLocalCommand,
@@ -87,8 +90,10 @@ export function requestAutoCompactNow(tabId: string, resume = false): Promise<an
     || Promise.resolve({ error: 'Автокомпакт ещё не готов' });
 }
 
-export function cancelPendingAutoCompact(tabId: string): void {
+export function cancelPendingAutoCompact(tabId: string): boolean {
+  const existed = autoCompactCoordinator?.has(tabId) === true;
   autoCompactCoordinator?.cancel(tabId);
+  return existed && autoCompactCoordinator?.has(tabId) !== true;
 }
 
 // Walk openProjects → find the project that owns a queued Close-tab action.
@@ -384,6 +389,8 @@ function sendQueueCommand(
   payload: string,
   handoff: {
     handoffId: string;
+    promptQueueIntent?: Record<string, unknown>;
+    expectedTarget?: import('../utils/historyAgentRuntimes').AgentSendTarget;
     presentationSnapshot: {
       historySessionId: string | null;
       imagePaths?: NonNullable<QueuedPrompt['imagePaths']>;
@@ -422,6 +429,8 @@ function sendQueueCommand(
     cwd: getTabCwd(tabId),
     prompt: payload,
     handoffId: handoff.handoffId,
+    ...(handoff.promptQueueIntent ? { promptQueueIntent: handoff.promptQueueIntent } : {}),
+    ...(handoff.expectedTarget ? { expectedTarget: handoff.expectedTarget } : {}),
     source,
     statusAtSend,
     queue: statusAtSend === 'busy',
@@ -595,6 +604,9 @@ type DeferredOwnerSend = {
   causeKey: string | null;
   conditionKey: string;
   triggerKey: string;
+  handoffId?: string;
+  payloadKey?: string;
+  expectedTarget?: import('../utils/historyAgentRuntimes').AgentSendTarget;
 };
 // A trigger can be fully satisfied while the queue owner is stopped. Keep that
 // result separate from `queueAwaitingBusyStart` (which means Enter was already
@@ -639,6 +651,8 @@ function continuationAttemptIsCurrent(
   if (!prompt || prompt.id !== attempt.headId) return false;
   if (queuedPromptContextConditionKey(prompt.condition) !== attempt.conditionKey) return false;
   if (JSON.stringify(prompt.trigger || null) !== attempt.triggerKey) return false;
+  if (attempt.payloadKey !== undefined
+    && withPostPrompt(ownerTabId, buildQueuedPromptPayload(prompt)) !== attempt.payloadKey) return false;
   if (continuationArmTimestamp(queue, attempt.kind) !== attempt.workflowArmedAt) return false;
   if (continuationTriggerTabId(ownerTabId, queue, attempt.kind) !== attempt.triggerTabId) return false;
   return attempt.kind === 'loop' ? isLoopPromptActive(queue) : queue.autoRun;
@@ -723,7 +737,13 @@ async function readQueueOwnerReadiness(ownerTabId: string): Promise<{
 
 function clearDeferredOwnerSend(ownerTabId: string, reason: string): void {
   queueReadinessWakePending.delete(ownerTabId);
+  const attempt = deferredOwnerSends.get(ownerTabId);
   if (!deferredOwnerSends.delete(ownerTabId)) return;
+  if (attempt?.handoffId && reason !== 'committed') {
+    // Revoke only this pending automatic input, never Stop the Goal/provider.
+    void ipcRenderer.invoke('agent:cancel-send', { tabId: ownerTabId, handoffId: attempt.handoffId })
+      .catch(error => console.warn('[PromptQueueRunner] revoke pending input: ' + String(error)));
+  }
   console.log('[PromptQueueRunner] deferred owner cleared owner=' + ownerTabId.slice(-8) + ' reason=' + reason);
   signalContinuationRelease(ownerTabId, 'deferred-cleared:' + reason);
 }
@@ -1073,8 +1093,12 @@ async function readExactQueueContextUsedPct(ownerTabId: string): Promise<{
       sessionId,
       requireExact: true,
     });
-    const pct = Number(result?.pct);
-    if (result?.exact !== true || !Number.isFinite(pct) || pct < 0 || pct > 100) {
+    const pct = result?.pct;
+    if (getPromptQueueAgent(ownerTabId) !== provider || getPromptQueueSessionId(ownerTabId, provider) !== sessionId) {
+      return { pct: null, reason: 'context-owner-changed' };
+    }
+    if (result?.exact !== true || result.provider !== provider || result.sessionId !== sessionId
+      || typeof pct !== 'number' || !Number.isFinite(pct) || pct < 0 || pct > 100) {
       return { pct: null, reason: String(result?.reason || 'exact-context-unavailable') };
     }
     return { pct, reason: 'exact-session-context' };
@@ -1227,6 +1251,7 @@ function beginValidatedQueueSend(
     return true;
   }
   queueSendInflight.add(ownerTabId);
+  const previousPreparation = deferredOwnerSends.get(ownerTabId);
   const attempt: DeferredOwnerSend = {
     kind,
     triggerTabId,
@@ -1237,6 +1262,8 @@ function beginValidatedQueueSend(
     causeKey,
     conditionKey: queuedPromptContextConditionKey(head.condition),
     triggerKey: JSON.stringify(head.trigger || null),
+    ...(previousPreparation && continuationAttemptIsCurrent(ownerTabId, queueAtStart, previousPreparation)
+      ? { expectedTarget: previousPreparation.expectedTarget } : {}),
   };
   deferredOwnerSends.set(ownerTabId, attempt);
   let attemptedHandoffId: string | null = null;
@@ -1246,10 +1273,36 @@ function beginValidatedQueueSend(
     + ' kind=' + kind + ' item=' + head.id.slice(-8));
 
   void (async () => {
-    const readiness = await readQueueOwnerReadiness(ownerTabId);
+    let readiness = await readQueueOwnerReadiness(ownerTabId);
     if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
       clearDeferredOwnerAttempt(ownerTabId, attempt, 'readiness-became-stale');
       return;
+    }
+    if (!readiness.ready && kind === 'queue'
+      && (['inactive', 'starting', 'active'].includes(readiness.status) || readiness.reason.startsWith('claude-startup-defaults-'))) {
+      const agent = getPromptQueueAgent(ownerTabId);
+      if (!agent) return;
+      const runtime = getHistoryAgentRuntime(agent), controller = new AbortController();
+      const revoke = () => { if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) controller.abort(); };
+      const unsubscribe = usePromptQueueStore.subscribe(revoke);
+      const unlock = subscribePromptQueueEditorLocks(tab => { if (tab === ownerTabId) revoke(); });
+      try {
+        // Reuse the common lifecycle/readiness preparer BEFORE admitting an
+        // ordinary message. A resumed Goal can already be doing the work.
+        const prepared = await prepareAgentRuntimeForSend({ tabId: ownerTabId, runtime,
+          providerContract: getAgentSendProviderContract(agent, runtime),
+          sessionId: getPromptQueueSessionId(ownerTabId, agent), cwd: getTabCwd(ownerTabId),
+          expectedTarget: attempt.expectedTarget,
+          requestedStatusAtSend: readiness.status as any, admissionSignal: controller.signal });
+        attempt.expectedTarget = prepared.expectedTarget;
+        readiness = { ready: prepared.submitCapability === 'direct', status: prepared.status,
+          inputReady: prepared.presence?.inputReady === true, reason: 'prepared-runtime' };
+      } finally { unsubscribe(); unlock(); }
+      if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) return;
+      if (!readiness.ready) {
+        console.log('[PromptQueueRunner] ' + label + ' prepared owner=' + ownerTabId.slice(-8) + ' → WAIT active work');
+        return;
+      }
     }
     const scenarioStatusAtSend = ['active', 'busy', 'inactive', 'starting', 'stopping', 'unknown']
       .includes(readiness.status)
@@ -1353,8 +1406,12 @@ function beginValidatedQueueSend(
       itemId: head.id,
       payload,
       causeKey: attempt.causeKey,
+      ...(kind === 'queue' ? { armedAt: attempt.workflowArmedAt } : {}),
     });
+    const baseHandoffId = buildPromptQueueReceiptHandoffId({ kind, itemId: head.id, payload, causeKey: attempt.causeKey });
     attemptedHandoffId = handoffId;
+    attempt.handoffId = handoffId;
+    if (kind === 'queue') attempt.payloadKey = payload;
     const contextPrepared = await prepareTabWorkContext(ownerTabId, handoffId, payload);
     payload = contextPrepared.prompt;
     presentationText = contextPrepared.prefix + presentationText;
@@ -1396,6 +1453,9 @@ function beginValidatedQueueSend(
     });
     const res: any = await sendQueueCommand(ownerTabId, payload, {
       handoffId,
+      ...(kind === 'queue' ? { promptQueueIntent: { version: 1, kind: 'queue', itemId: head.id,
+        baseHandoffId, armedAt: attempt.workflowArmedAt, triggerTabId, conditionKey: attempt.conditionKey, triggerKey: attempt.triggerKey },
+        expectedTarget: attempt.expectedTarget } : {}),
       presentationSnapshot: {
         historySessionId: sessionIdHint,
         promptChips,
@@ -1418,6 +1478,10 @@ function beginValidatedQueueSend(
     const ownershipTransferred = localCommandReceipt.handled
       ? localCommandReceipt.transferred === true
       : queueSendTransferredOwnership(res);
+    if (res?.alreadyConsumedHandoffId) {
+      queueAwaitingBusyStart.delete(ownerTabId);
+      retractHistoryPromptHandoff(ownerTabId, handoffId, 'original-item-already-consumed');
+    }
     if (!ownershipTransferred) {
       queueAwaitingBusyStart.delete(ownerTabId);
       if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
@@ -1717,7 +1781,7 @@ function workflowAcceptsNaturalOutcome(queue: TabQueue, outcomeTs: number | null
       || !Number.isFinite(queueAppRuntimeStartedAt)
       || Number(outcomeTs) < Number(queueAppRuntimeStartedAt)) return false;
   }
-  return !queue.workflowRestartPending && isWorkflowOutcomeAtOrAfterArm(queue.workflowArmedAt, outcomeTs);
+  return !queue.workflowRestartPending && isWorkflowOutcomeAtOrAfterArm(promptQueueOutcomeFloor(queue), outcomeTs);
 }
 
 function pivotTriggerHasFreshCompletion(queue: TabQueue, triggerTabId: string): boolean {
@@ -1740,6 +1804,8 @@ function markWorkflowRestoreReconciled(): void {
   if (workflowRestoreReconciled) return;
   workflowRestoreReconciled = true;
   for (const listener of workflowRestoreReconciliationListeners) listener();
+  // The FIFO may already be parked on this barrier without another busy edge.
+  void ipcRenderer.invoke('agent:send-queue-ready', true).catch(() => {});
 }
 
 function subscribeWorkflowRestoreReconciliation(listener: () => void): () => void {
@@ -1766,6 +1832,63 @@ export function isTabBusyNow(tabId: string): boolean {
 // focus, so seeding from it gives the picker the correct state at mount time.
 export function getBusyTabsSnapshot(): Map<string, boolean> {
   return new Map(prevBusyRef);
+}
+
+export function getPromptQueueRuntimeSnapshot(tabId: string) {
+  const q = usePromptQueueStore.getState().getQueue(tabId);
+  const head = enabledQueueHead(q), triggerTabId = getEffectiveQueueTrigger(tabId, q);
+  const pending = queueSendInflight.has(tabId) || queueAwaitingBusyStart.has(tabId)
+    || pendingAgentSendScenarioCount(tabId) > 0;
+  const phase = queueShutdownPending ? 'shutdown'
+    : queueSendInflight.has(tabId) ? 'executing'
+      : queueAwaitingBusyStart.has(tabId) ? 'awaiting-agent'
+        : deferredOwnerSends.has(tabId) ? 'waiting-readiness'
+          : queueConditionChecks.has(tabId) ? 'checking-condition'
+            : isPromptQueueEditorLocked(tabId) ? 'editing'
+              : q.firstDelayCountdownAt !== null ? 'countdown'
+                : q.autoRun && !queueItemTriggerCanFire(head) ? 'waiting-app-restart'
+                  : q.autoRun && triggerTabId !== tabId ? 'waiting-dependency'
+                    : q.autoRun ? 'armed' : 'paused';
+  const last = getHistoryPromptHandoffsSnapshot(tabId).filter(handoff => String(handoff.source || '').startsWith('prompt-queue'))
+    .reduce((latest, value) => !latest || value.submittedAt > latest.submittedAt ? value : latest, null as ReturnType<typeof getHistoryPromptHandoffsSnapshot>[number] | null);
+  return { pending, phase, ownBusy: prevBusyRef.has(tabId) ? prevBusyRef.get(tabId) : null,
+    inheritedBusy: useOrchestrationStore.getState().inheritedBusyTabIds.has(tabId), triggerTabId,
+    triggerBusy: prevBusyRef.has(triggerTabId) ? prevBusyRef.get(triggerTabId) : null,
+    appInstanceKnown: !!queueAppRuntimeInstanceId,
+    autoCompact: useAutoCompactStore.getState().activities[tabId] || null,
+    lastAttempt: last ? { handoffId: last.handoffId, operationKey: last.sendOperationKey, attemptId: last.sendAttemptId,
+      status: last.queueStatus, reason: last.statusReason, changedAt: last.statusChangedAt } : null };
+}
+
+// Read-only revalidation for Main's existing FIFO. It cannot create a trigger,
+// resume a provider or consume a card; the root runner has already admitted it.
+export function readPromptQueueSendAdmission(request: any) {
+  if (!canProcessWorkflowOutcomes()) return { ready: false };
+  const { tabId, intent } = request;
+  const queue = usePromptQueueStore.getState().getQueue(tabId);
+  const head = enabledQueueHead(queue);
+  const cancelled = () => ({ cancel: true, reason: 'automatic-intent-changed' });
+  if (intent?.version !== 1 || intent.kind !== 'queue' || !tabExists(tabId)
+    || !queue.autoRun || !head || head.metaAction || head.id !== intent.itemId
+    || queue.workflowArmedAt !== intent.armedAt
+    || queuedPromptContextConditionKey(head.condition) !== intent.conditionKey
+    || JSON.stringify(head.trigger || null) !== intent.triggerKey
+    || getEffectiveQueueTrigger(tabId, queue) !== intent.triggerTabId
+    || getPromptQueueAgent(tabId) !== request.provider
+    || (request.cwd && getTabCwd(tabId) !== request.cwd)) return cancelled();
+  const sessionId = getPromptQueueSessionId(tabId, request.provider);
+  if (request.expectedTarget?.sessionId && request.expectedTarget.sessionId !== sessionId) return cancelled();
+  const payload = withPostPrompt(tabId, buildQueuedPromptPayload(head));
+  if (buildPromptQueueReceiptHandoffId({ kind: 'queue', itemId: head.id, payload, causeKey: null,
+    ...(intent.baseHandoffId ? { armedAt: intent.armedAt } : {}) }) !== request.handoffId) return cancelled();
+  return { ready: !isPromptQueueEditorLocked(tabId) && queueItemTriggerCanFire(head)
+    && !dictationBlocksSend(head.text) && !isTabWorkflowBlocked(tabId)
+    && !isTabWorkflowBlocked(intent.triggerTabId) };
+}
+
+export function subscribePromptQueueRuntime(listener: (tabId: string, reason: string) => void) {
+  continuationReleaseListeners.add(listener);
+  return () => { continuationReleaseListeners.delete(listener); };
 }
 
 // Always-mounted auto-runner for the per-tab prompt queue. Mounted ONCE at app
@@ -1948,6 +2071,7 @@ export function usePromptQueueRunner() {
 
     const unsubscribeEditorLocks = subscribePromptQueueEditorLocks((ownerTabId, lock, options) => {
       if (lock) return;
+      void ipcRenderer.invoke('agent:send-queue-ready', true).catch(() => {});
       if (options.wakeAutoRun === false) {
         queueEditorBlockedOwners.delete(ownerTabId);
         return;
@@ -2206,7 +2330,7 @@ export function usePromptQueueRunner() {
       const continuationKind = choosePromptQueueContinuationForOutcome({
         queueActive: ownQueueBefore.autoRun && countEnabledQueuedPrompts(ownQueueBefore.items) > 0,
         queueTriggerIsOwner: queueTrigger === tabId,
-        queueArmedAt: ownQueueBefore.workflowArmedAt,
+        queueArmedAt: promptQueueOutcomeFloor(ownQueueBefore),
         loopActive: isLoopPromptActive(ownQueueBefore),
         loopArmedAt: ownQueueBefore.loopPromptArmedAt,
         explicitTaskComplete,
@@ -2973,8 +3097,16 @@ export function usePromptQueueRunner() {
           continue;
         }
 
-        // With no first delay, preserve the original cold-start readiness
-        // checks before attempting an immediate send.
+        // The new main lifetime already proves this item's trigger. It does
+        // not depend on an assistant outcome from the previous process. Enter
+        // the shared send path now so its exact readiness wait can join Resume
+        // and wake when the owner becomes ready.
+        if (restartTriggerReady) {
+          if (!isTabWorkflowBlocked(tabId)) fireHead(tabId, tabId);
+          continue;
+        }
+
+        // Ordinary own-tab arms still use the original Codex outcome check.
         if (verifyCodexTriggerIdleThenFire(tabId, tabId)) continue;
         const isBusy = isTabWorkflowBlocked(tabId);
         if (isBusy) continue;

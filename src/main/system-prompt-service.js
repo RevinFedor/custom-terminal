@@ -73,7 +73,7 @@ function createSystemPromptService({ projectManager, onChanged = () => {} }) {
     });
     emit([id]); return result;
   }
-  function update(id, input) {
+  function update(id, input, { emitChanged = true } = {}) {
     if (Object.keys(input).some(k => !['revision', ...FIELDS].includes(k))) throw error('system_prompt_invalid', 'unknown or read-only field');
     const result = transact(() => {
       const current = get(id); assertRevision(input.revision, current);
@@ -84,7 +84,7 @@ function createSystemPromptService({ projectManager, onChanged = () => {} }) {
       const next = { ...record(current), ...patch };
       validate(next); projectManager.saveAIPrompt(next); return get(id);
     });
-    emit([id]); return result;
+    if (emitChanged) emit([id]); return result;
   }
   function remove(id, expectedRevision) {
     transact(() => {
@@ -136,7 +136,10 @@ function createSystemPromptService({ projectManager, onChanged = () => {} }) {
       }
       return update(prompt.id, { ...fields, revision: prompt.revision || get(prompt.id).revision });
     },
-    saveContent(id, content) { return update(id, { content, revision: get(id).revision }); },
+    saveContent(id, content, options) { return update(id, { content, revision: get(id).revision }, options); },
+    // Paired callers may include this write in their own SQLite transaction;
+    // publish only after that outer transaction committed successfully.
+    publishChanges: emit,
   };
 }
 module.exports = { createSystemPromptService };

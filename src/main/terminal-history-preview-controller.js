@@ -462,7 +462,7 @@ function createTerminalHistoryPreviewController({
         matched += 1;
         continue;
       }
-      if (!item && state.provider !== 'claude' && allowTextFallback && receipt.text) {
+      if (!item && state.provider !== 'claude' && !receipt.itemId && allowTextFallback && receipt.text) {
         item = state.semanticItemOrder
           .map((itemId) => state.semanticItems.get(itemId))
           .find((candidate) => (
@@ -473,7 +473,7 @@ function createTerminalHistoryPreviewController({
             && candidate?.deliveryState !== 'unknown'
             && normalizedSemanticText(candidate.text) === receipt.text
           )) || null;
-        if (item) match = receipt.itemId ? 'exact-text-after-id-miss' : 'exact-text';
+        if (item) match = 'exact-text';
       }
       if (!item) {
         pending.push(receipt);

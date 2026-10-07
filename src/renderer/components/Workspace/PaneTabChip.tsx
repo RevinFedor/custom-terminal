@@ -26,6 +26,8 @@ import {
 import { bindPaneTabPointerDrag } from '../../utils/paneTabPointerGesture';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
+import { openTabLinkedFile } from '../../utils/tabLinkedFilePreview';
+import { useUIStore } from '../../store/useUIStore';
 
 export interface PaneTabChipProps {
   projectId: string;
@@ -158,6 +160,11 @@ export default function PaneTabChip({
       projectId={projectId} tabId={tabId} shown={shown} active={shown && paneFocused}
       pressed={pressed} showShownStripe={inStrip} truncate={!inStrip}
       interactiveStatus sharedActivity={sharedActivity}
+      onLinkedFileOpen={previewOnly ? undefined : file => {
+        void openTabLinkedFile(projectId, file, () => useWorkspaceStore.getState().openTabById(tabId, {
+          projectId, reason: 'linked-file',
+        }));
+      }}
       onTaskClick={(taskId, event) => {
         event.stopPropagation();
         useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
@@ -227,6 +234,8 @@ export default function PaneTabChip({
           return;
         }
         useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+        const preview = useUIStore.getState().filePreview;
+        if (preview?.ownerTabId) useUIStore.getState().closeFilePreview();
         requestTabPrimaryInputFocus(tabId, 'pane-tab-chip-click');
         if (shown) setPressed(false);
         else {

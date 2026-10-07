@@ -42,6 +42,25 @@ async function fixture(t, records, options = {}) {
   return f;
 }
 
+test('linked-file Timeline metadata survives prepared-cache reads and worker restart', async t => {
+  const file = '/private/linked-work/status.md';
+  const f = await fixture(t, [
+    { type: 'event_msg', payload: { type: 'user_message', message: 'Update working file' } },
+    { type: 'response_item', payload: { type: 'custom_tool_call', name: 'apply_patch',
+      input: '*** Begin Patch\n*** Update File: ' + file + '\n@@\n-old\n+new\n*** End Patch' } },
+  ]);
+  const timeline = await f.client.call('getTimeline', f.payload);
+  assert.equal(timeline.success, true, timeline.error);
+  assert.deepEqual(timeline.entries[0].fileEdits, [file]);
+  assert.equal(timeline.entries[0].docsEdited, undefined);
+  await f.restart();
+  const before = await f.client.call('stats');
+  const next = await f.client.call('getTimeline', f.payload);
+  const after = await f.client.call('stats');
+  assert.deepEqual(next.entries, timeline.entries);
+  assert.equal(after.sourceBytes, before.sourceBytes, 'warm metadata read does not rebuild raw transcript');
+});
+
 test('SSD seek after RAM release reads only requested row bodies, equal to canonical window', async t => {
   const records = Array.from({ length: 1200 }, (_, i) => message('ROW-' + i + ' ' + 'x'.repeat(1200), i));
   const f = await fixture(t, records);
@@ -59,6 +78,47 @@ test('SSD seek after RAM release reads only requested row bodies, equal to canon
   assert.equal(after.cache.pageRows - before.cache.pageRows, 11);
   assert.equal(after.cache.continuationBytes, before.cache.continuationBytes);
   assert.equal(result.payloadGeneration, full.payloadGeneration);
+});
+
+test('quota-evicted parser checkpoint does not force raw reads for ready History/Timeline after worker restart', async t => {
+  const f = await fixture(t, Array.from({ length: 100 }, (_, i) => [
+    { type: 'event_msg', timestamp: new Date(Date.UTC(2026, 8, 25) + i * 1000).toISOString(),
+      payload: { type: 'user_message', message: 'question ' + i } },
+    message('ready row ' + i + ' '.repeat(800), i),
+  ]).flat());
+  const original = await f.client.call('getHistory', f.payload);
+  const timeline = await f.client.call('getTimeline', f.payload);
+  assert.ok(timeline.entries.length >= 100);
+  await f.client.call('releaseMemory');
+  const schemaDir = (await fs.readdir(f.config.cacheDirectory)).find(name => name.startsWith('v1-'));
+  const dir = path.join(f.config.cacheDirectory, schemaDir);
+  const names = await fs.readdir(dir);
+  const stateFiles = names.filter(name => name.endsWith('.state.sqlite'));
+  assert.equal(stateFiles.length, 1);
+  let readyBytes = 0;
+  for (const name of names.filter(name => !name.endsWith('.state.sqlite'))) readyBytes += (await fs.stat(path.join(dir, name))).size;
+  const { HistoryPreparedCache } = require('./history-prepared-cache');
+  const pruner = new HistoryPreparedCache({ directory: f.config.cacheDirectory, schema: schemaDir.slice(1), maxBytes: readyBytes });
+  assert.ok(pruner.stats().diskBytes <= readyBytes);
+  await assert.rejects(fs.stat(path.join(dir, stateFiles[0])), { code: 'ENOENT' });
+  await f.restart();
+  const before = await f.client.call('stats');
+  const nextTimeline = await f.client.call('getTimeline', f.payload);
+  const nextHistory = await f.client.call('getHistory', f.payload);
+  const after = await f.client.call('stats');
+  assert.deepEqual(nextTimeline, timeline);
+  assert.deepEqual(nextHistory.entries, original.entries);
+  assert.equal(nextHistory.payloadGeneration, original.payloadGeneration);
+  assert.equal(after.sourceBytes, before.sourceBytes, 'unchanged prepared consumers read zero raw transcript bytes');
+  assert.equal(after.cache.continuationBytes, 0, 'no discarded graph restored');
+  assert.equal(after.projector.sessions, 0);
+  await fs.appendFile(f.filePath, encode([message('new real append', 101)]));
+  const appended = await f.client.call('getHistory', f.payload);
+  assert.equal(appended.entries.at(-1).content, 'new real append');
+  assert.equal(appended.payloadGeneration, original.payloadGeneration);
+  const warm = await f.client.call('stats');
+  await f.client.call('getTimeline', f.payload);
+  assert.equal((await f.client.call('stats')).sourceBytes, warm.sourceBytes, 'new prepared Timeline is shared after rebuild for changed source');
 });
 
 test('append after parser eviction restores continuation and reads only the suffix', async t => {
@@ -216,7 +276,7 @@ test('corrupt positional index falls back to canonical data without adopting wro
   const first = await f.client.call('getHistory', f.payload);
   await f.client.call('releaseMemory');
   const version = (await fs.readdir(f.config.cacheDirectory)).find(name => name.startsWith('v1-'));
-  const filename = (await fs.readdir(path.join(f.config.cacheDirectory, version))).find(name => name.endsWith('.sqlite'));
+  const filename = (await fs.readdir(path.join(f.config.cacheDirectory, version))).find(name => /^[a-f0-9]{64}\.sqlite$/.test(name));
   const corrupt = new SQLite(path.join(f.config.cacheDirectory, version, filename));
   corrupt.prepare('UPDATE rows SET stub=? WHERE pos=0').run('{"uuid":"wrong","rowStub":true}');
   corrupt.close();

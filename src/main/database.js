@@ -39,6 +39,7 @@ const getInboxProjectPath = () => process.env.NOTED_INBOX_CWD || process.env.HOM
 const CODEX_PENDING_WRITER_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:';
 const CODEX_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-receipt.v1:';
 const WORKSPACE_SESSION_APP_STATE_KEY = 'workspace-session';
+const workflowStorage = require('../shared/workflow-organization.cjs');
 const APP_STATE_REVISION_LIMIT = 100;
 
 function inspectCodexWriterHandoffValue(journalKey, rawValue) {
@@ -294,7 +295,8 @@ class DatabaseManager {
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.initTables();
-    this.ensureInboxProject();
+    // System Inbox organization is created by WorkflowOrganization. Legacy
+    // namespaces are resolved lazily; a fresh install needs no Project row.
     this.createDefaultPrompts();
     this.seedDefaultAIPrompts();
     this.ensureRewindPrompt();
@@ -1889,7 +1891,7 @@ class DatabaseManager {
       };
     }
     const tabRow = this.db.prepare(
-      'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+`SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
     ).get(projectId, tabId);
     if (!tabRow) {
       return { success: false, error: 'codex_tab_row_missing', retryable: true };
@@ -2054,9 +2056,334 @@ class DatabaseManager {
 
   // ========== PROJECTS ========== 
 
+  // Explicit, restartable v2 storage hook. Called by the organization service
+  // before its first capture, outside any organization transaction. Legacy
+  // methods keep their v1 project/cwd guards; v2 callers use the exact adapters
+  // below. No Project is manufactured for an execution namespace.
+  ensureWorkflowExecutionStorage({ fault = () => {} } = {}) {
+    if (this.db.inTransaction) workflowStorage.fail('execution_schema_transaction_active');
+    const marker = this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'").get();
+    if (marker) {
+      const version = this.db.prepare('SELECT version FROM workflow_execution_schema').get()?.version;
+      if (version !== 1) workflowStorage.fail('execution_schema_forward_version');
+      return;
+    }
+    const foreignKeys = this.db.pragma('foreign_keys', { simple: true });
+    const legacyAlterTable = this.db.pragma('legacy_alter_table', { simple: true });
+    if (this.db.pragma('foreign_key_check').length) workflowStorage.fail('execution_source_foreign_keys_invalid');
+    // SQLite cannot change NOT NULL in place. Disable enforcement only for
+    // this synchronous connection-local transaction: never rename the OLD
+    // parent (which would rewrite child FK addresses), never cascade-drop it.
+    // All original columns/DDL/indexes/triggers/sequence and inbound refs are
+    // retained. foreign_key_check must pass BEFORE commit and FK mode restored.
+    this.db.pragma('foreign_keys=OFF');
+    this.db.pragma('legacy_alter_table=ON');
+    try {
+      this.db.transaction(() => {
+        for (const table of ['tabs', 'tab_history', 'favorites', 'ai_sessions', 'gemini_history']) {
+          const original = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table);
+          if (!original) workflowStorage.fail('execution_source_table_missing', { table });
+          const columns = this.db.prepare(`PRAGMA table_xinfo("${table}")`).all();
+          if (columns.find(column => column.name === 'project_id')?.notnull) {
+            const temporary = '__workflow_nullable_' + table;
+            if (this.db.prepare('SELECT 1 FROM sqlite_master WHERE name=?').get(temporary)) workflowStorage.fail('execution_temporary_name_conflict');
+            const objects = this.db.prepare("SELECT sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name").all(table);
+            const sequence = this.db.prepare('SELECT seq FROM sqlite_sequence WHERE name=?').get(table)?.seq;
+            this.db.exec(workflowStorage.nullableProjectTableSql(original.sql, temporary));
+            const names = columns.filter(column => column.hidden === 0).map(column => '"' + column.name.replaceAll('"', '""') + '"').join(',');
+            this.db.exec(`INSERT INTO "${temporary}" (${names}) SELECT ${names} FROM "${table}"`);
+            fault('afterTableCopy', { table });
+            this.db.exec(`DROP TABLE "${table}"`);
+            this.db.exec(`ALTER TABLE "${temporary}" RENAME TO "${table}"`);
+            for (const object of objects) this.db.exec(object.sql);
+            if (sequence !== undefined) this.db.prepare('UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name=?').run(sequence, table);
+          }
+          const present = new Set(this.db.prepare(`PRAGMA table_info("${table}")`).all().map(column => column.name));
+          for (const [name, declaration] of Object.entries({ execution_subject_version: 'INTEGER NOT NULL DEFAULT 1',
+            execution_subject_id: 'TEXT', execution_namespace: 'TEXT', execution_storage_revision: 'INTEGER NOT NULL DEFAULT 1',
+            execution_snapshot_json: 'TEXT', workflow_context_json: 'TEXT' })) {
+            if (!present.has(name)) this.db.exec(`ALTER TABLE "${table}" ADD COLUMN "${name}" ${declaration}`);
+          }
+          this.db.exec(`CREATE TRIGGER IF NOT EXISTS "workflow_${table}_identity_immutable"
+            BEFORE UPDATE OF project_id,execution_subject_version,execution_subject_id,execution_namespace ON "${table}"
+            WHEN NEW.execution_subject_version IS NOT OLD.execution_subject_version OR
+              NEW.execution_subject_id IS NOT OLD.execution_subject_id OR NEW.execution_namespace IS NOT OLD.execution_namespace OR
+              (OLD.execution_subject_version=2 AND NEW.project_id IS NOT NULL)
+            BEGIN SELECT RAISE(ABORT,'execution_subject_immutable'); END`);
+          this.db.exec(`CREATE TRIGGER IF NOT EXISTS "workflow_${table}_subject_required"
+            BEFORE INSERT ON "${table}" WHEN
+              (NEW.execution_subject_version=1 AND NEW.project_id IS NULL) OR
+              (NEW.execution_subject_version=2 AND (NEW.project_id IS NOT NULL OR
+                COALESCE(NEW.execution_subject_id,'')='' OR COALESCE(NEW.execution_namespace,'')='')) OR
+              NEW.execution_subject_version NOT IN (1,2)
+            BEGIN SELECT RAISE(ABORT,'execution_subject_required'); END`);
+          this.db.exec(`CREATE INDEX IF NOT EXISTS "workflow_${table}_execution_namespace" ON "${table}"(execution_namespace,execution_subject_id)`);
+        }
+        this.db.exec(`ALTER TABLE tabs ADD COLUMN execution_archived INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE tabs ADD COLUMN execution_record_json TEXT NOT NULL DEFAULT '{}';
+          CREATE UNIQUE INDEX workflow_tabs_subject_unique ON tabs(execution_subject_id) WHERE execution_subject_version=2;
+          CREATE TRIGGER workflow_tabs_revision AFTER UPDATE ON tabs
+            WHEN NEW.execution_subject_version=2 AND NEW.execution_storage_revision=OLD.execution_storage_revision
+            BEGIN UPDATE tabs SET execution_storage_revision=OLD.execution_storage_revision+1 WHERE id=NEW.id; END;
+          CREATE TABLE workflow_execution_scopes(namespace TEXT PRIMARY KEY,revision INTEGER NOT NULL DEFAULT 1,
+            metadata_json TEXT NOT NULL DEFAULT '{}',groups_json TEXT NOT NULL DEFAULT '[]',roots_json TEXT NOT NULL DEFAULT '[]',notes TEXT NOT NULL DEFAULT '');
+          CREATE TABLE workflow_execution_mutations(mutation_id TEXT PRIMARY KEY,request_json TEXT NOT NULL,response_json TEXT NOT NULL);
+          CREATE TABLE workflow_execution_schema(version INTEGER NOT NULL);
+          INSERT INTO workflow_execution_schema VALUES(1);`);
+        fault('beforeExecutionSchemaCommit', {});
+        if (this.db.pragma('foreign_key_check').length) workflowStorage.fail('execution_migration_foreign_keys_invalid');
+      }).immediate();
+    } finally {
+      this.db.pragma('legacy_alter_table=' + (legacyAlterTable ? 'ON' : 'OFF'));
+      this.db.pragma('foreign_keys=' + (foreignKeys ? 'ON' : 'OFF'));
+    }
+  }
+
+  _executionTransaction(callback) {
+    if (this.db.prepare('SELECT version FROM workflow_execution_schema').get()?.version !== 1) workflowStorage.fail('execution_schema_forward_version');
+    return this.db.inTransaction ? callback() : this.db.transaction(callback).immediate();
+  }
+  _executionMutation(kind, request, callback) {
+    if (!workflowStorage.id(request.mutationId)) workflowStorage.fail('execution_mutation_id_required');
+    const serialized = workflowStorage.stableJson({ operation: kind, request });
+    return this._executionTransaction(() => {
+      const old = this.db.prepare('SELECT * FROM workflow_execution_mutations WHERE mutation_id=?').get(request.mutationId);
+      if (old) {
+        if (old.request_json !== serialized) workflowStorage.fail('execution_mutation_id_conflict');
+        return JSON.parse(old.response_json);
+      }
+      const result = callback();
+      this.db.prepare('INSERT INTO workflow_execution_mutations VALUES(?,?,?)').run(request.mutationId, serialized, workflowStorage.stableJson(result));
+      return result;
+    });
+  }
+  _executionInsert(table, values) {
+    const available = new Set(this.db.prepare(`PRAGMA table_xinfo("${table}")`).all().filter(column => !column.hidden).map(column => column.name));
+    const entries = Object.entries(values).filter(([name]) => available.has(name));
+    const names = entries.map(([name]) => '"' + name.replaceAll('"', '""') + '"');
+    return this.db.prepare(`INSERT INTO "${table}" (${names.join(',')}) VALUES(${entries.map(() => '?').join(',')})`).run(...entries.map(([, value]) => value));
+  }
+  _executionRecordColumns(record, { creating = false } = {}) {
+    const fields = { name: 'name', nameSetManually: 'name_set_manually', color: 'color', notes: 'notes',
+      tabType: 'tab_type', filePath: 'file_path', isCollapsed: 'is_collapsed', groupId: 'tab_group_id',
+      visualParentTabId: 'visual_parent_tab_id', windowScoped: 'window_scoped', position: 'position',
+      lastActivatedAt: 'last_activated_at', parentTabId: 'parent_tab_id', isUtility: 'is_utility',
+      taskPlan: 'task_plan', commandType: 'command_type', createdAt: 'created_at', activeView: 'active_view' };
+    Object.assign(fields,{restartAfterTabId:'restart_after_tab_id',restartAfterTabIds:'restart_after_tab_ids',
+      restartAfterWorkflowIds:'restart_after_workflow_ids',restartAfterCommand:'restart_after_command',
+      restartAfterPaused:'restart_after_paused',restartAfterPersistent:'restart_after_persistent',restartAfterArmed:'restart_after_armed',
+      closedVisualParentTabId:'closed_visual_parent_tab_id',completionNotificationPersistent:'completion_notification_persistent'});
+    if (creating) Object.assign(fields, { claudeSessionId: 'claude_session_id', geminiSessionId: 'gemini_session_id',
+      codexSessionId: 'codex_session_id', providerState: 'provider_state', externalRun: 'external_run',
+      claudeSessionHistory: 'claude_session_history', restartAfterTabIds: 'restart_after_tab_ids',
+      restartAfterWorkflowIds: 'restart_after_workflow_ids' });
+    if (creating) for (const field of ['codexModel','codexEffort','codexSettingsProofAt','codexSettingsProofSessionId',
+      'codexModelMigrationPending','codexModelMigrationRestoreDefaultModel','codexModelMigrationRestoreDefaultEffort',
+      'codexModelMigrationSourceModel','codexModelMigrationSourceEffort','codexModelMigrationTargetModel',
+      'codexModelMigrationConfigPath','codexModelMigrationConfigFingerprint','codexModelMigrationConfigAlreadyTarget'])
+      fields[field] = field.replace(/[A-Z]/g,letter => '_' + letter.toLowerCase());
+    const out = {};
+    for (const [field, column] of Object.entries(fields)) if (Object.hasOwn(record, field) && record[field] !== undefined) {
+      const value = record[field];
+      out[column] = value && typeof value === 'object' ? JSON.stringify(value) : typeof value === 'boolean' ? Number(value) : value;
+    }
+    return out;
+  }
+  createExecutionTabV2({ tabId, subjectId, executionNamespace = workflowStorage.GLOBAL_EXECUTION_NAMESPACE, cwd, record = {}, columns = {} }) {
+    for (const value of [tabId, subjectId, executionNamespace]) if (!workflowStorage.id(value)) workflowStorage.fail('execution_identity_required');
+    if (!path.isAbsolute(cwd || '')) workflowStorage.fail('execution_cwd_required');
+    return this._executionTransaction(() => {
+      if (this.db.prepare('SELECT 1 FROM tabs WHERE tab_id=?').get(tabId)) workflowStorage.fail('execution_tab_id_exists');
+      this._executionInsert('tabs', { ...columns, ...this._executionRecordColumns(record, { creating: true }), name: record.name || tabId,
+        tab_id: tabId, project_id: null, cwd, execution_subject_version: 2, execution_subject_id: subjectId,
+        execution_namespace: executionNamespace, execution_record_json: JSON.stringify(record) });
+      this.db.prepare('INSERT OR IGNORE INTO workflow_execution_scopes(namespace) VALUES(?)').run(executionNamespace);
+      return this.getExecutionTabV2({ executionNamespace, tabId, subjectId });
+    });
+  }
+  getExecutionTabV2({ executionNamespace, tabId, subjectId }) {
+    if (!workflowStorage.id(executionNamespace) || !workflowStorage.id(tabId)) workflowStorage.fail('execution_exact_address_required');
+    const row = this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND execution_namespace=? AND execution_subject_version=2').get(tabId, executionNamespace);
+    if (!row || (subjectId !== undefined && row.execution_subject_id !== subjectId)) return null;
+    const record = JSON.parse(row.execution_record_json);
+    const nativeFields = {};
+    const jsonFields = new Set(['provider_state','external_run','claude_session_history','restart_after_tab_ids',
+      'restart_after_workflow_ids','cache_stats']);
+    const flags = new Set(['name_set_manually','is_utility','is_collapsed','was_interrupted','overlay_dismissed','window_scoped',
+      'completion_notification_persistent','restart_after_paused','restart_after_armed','restart_after_persistent',
+      'codex_model_migration_pending','codex_model_migration_restore_default_model','codex_model_migration_restore_default_effort',
+      'codex_model_migration_config_already_target']);
+    for (const [column, value] of Object.entries(row)) {
+      if (column === 'id' || column === 'project_id' || column.startsWith('execution_') || column === 'workflow_context_json') continue;
+      const field = column === 'tab_group_id' ? 'groupId' : column.replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase());
+      let resolved = value;
+      if (jsonFields.has(column) && value) { try { resolved = JSON.parse(value); } catch { /* preserve malformed/future payload */ } }
+      // SQL NULL means no collection. Keep raw storage/provenance intact while
+      // giving the renderer the same optional-array shape as the legacy reader.
+      if(['restart_after_tab_ids','restart_after_workflow_ids','claude_session_history'].includes(column) && resolved===null)resolved=undefined;
+      if (flags.has(column)) resolved = value === 1;
+      nativeFields[field] = resolved;
+    }
+    const tab = { ...record, ...nativeFields, tabId: row.tab_id, name: row.name, cwd: row.cwd, notes: row.notes || '',
+      tabType: row.tab_type, filePath: row.file_path, groupId: row.tab_group_id, parentTabId: row.parent_tab_id,
+      isUtility: row.is_utility === 1, commandType: row.command_type, taskPlan: normalizeTaskPlan(row.task_plan),
+      claudeSessionId: row.claude_session_id, geminiSessionId: row.gemini_session_id, codexSessionId: row.codex_session_id,
+      executionSubject: workflowStorage.executionScopeForRow(row), executionStorageRevision: row.execution_storage_revision };
+    return { row, tab, executionSubject: tab.executionSubject, revision: row.execution_storage_revision, archived: row.execution_archived === 1 };
+  }
+  saveExecutionTabV2({ executionNamespace, tabId, subjectId, expectedRevision, columns = {}, record }) {
+    return this._executionTransaction(() => {
+      const current = this.getExecutionTabV2({ executionNamespace, tabId, subjectId });
+      if (!current || current.executionSubject.subjectId !== subjectId) workflowStorage.fail('execution_subject_changed');
+      if (!Number.isSafeInteger(expectedRevision) || current.revision !== expectedRevision) workflowStorage.fail('execution_storage_revision_changed',
+        {tabId,expectedRevision,actualRevision:current.revision});
+      const available = new Set(this.db.prepare('PRAGMA table_xinfo(tabs)').all().filter(column => !column.hidden).map(column => column.name));
+      const protectedFields = new Set(['id', 'tab_id', 'project_id', 'execution_subject_version', 'execution_subject_id',
+        'execution_namespace', 'execution_storage_revision', 'execution_record_json', 'execution_archived']);
+      for (const field of Object.keys(columns)) if (!available.has(field) || protectedFields.has(field)) workflowStorage.fail('execution_column_not_writable', { field });
+      if (Object.hasOwn(columns, 'cwd') && !path.isAbsolute(columns.cwd || '')) workflowStorage.fail('execution_cwd_required');
+      const values = { ...columns, ...(record ? this._executionRecordColumns(record) : {}) };
+      if (record) values.execution_record_json = JSON.stringify({ ...JSON.parse(current.row.execution_record_json), ...record });
+      const entries = Object.entries(values);
+      if (entries.length) this.db.prepare(`UPDATE tabs SET ${entries.map(([field]) => '"' + field.replaceAll('"', '""') + '"=?').join(',')},
+        execution_storage_revision=execution_storage_revision+1 WHERE id=? AND execution_storage_revision=?`)
+        .run(...entries.map(([, value]) => value), current.row.id, expectedRevision);
+      return this.getExecutionTabV2({ executionNamespace, tabId, subjectId });
+    });
+  }
+  saveExecutionTabs(executionNamespace, tabs) {
+    return this._executionTransaction(() => {
+      if (!Array.isArray(tabs)) workflowStorage.fail('execution_tabs_required');
+      for (const tab of tabs) this.saveExecutionTabV2({ executionNamespace, tabId: tab.tabId,
+        subjectId: tab.executionSubject?.subjectId, expectedRevision: tab.executionStorageRevision, record: tab });
+      // Omission is never deletion. Close/archive uses the exact mutation below.
+      return { success: true };
+    });
+  }
+  getExecutionNamespace(executionNamespace, { includeArchived = false } = {}) {
+    const read = () => {
+      const scope = this.db.prepare('SELECT * FROM workflow_execution_scopes WHERE namespace=?').get(executionNamespace);
+      if (!scope) return null;
+      return { namespace: executionNamespace, revision: scope.revision, metadata: JSON.parse(scope.metadata_json),
+      groups: JSON.parse(scope.groups_json), roots: JSON.parse(scope.roots_json), notes: scope.notes,
+      tabs: this.db.prepare('SELECT tab_id FROM tabs WHERE execution_subject_version=2 AND execution_namespace=? AND (? OR execution_archived=0) ORDER BY position,id')
+        .all(executionNamespace, Number(includeArchived)).map(row => this.getExecutionTabV2({ executionNamespace, tabId: row.tab_id }).tab) };
+    };
+    return this.db.inTransaction ? read() : this.db.transaction(read)();
+  }
+  saveExecutionNamespace({ executionNamespace, expectedRevision, metadata, groups, roots, notes }) {
+    return this._executionTransaction(() => {
+      const old = this.getExecutionNamespace(executionNamespace);
+      if (!old || old.revision !== expectedRevision) workflowStorage.fail('execution_namespace_revision_changed');
+      this.db.prepare('UPDATE workflow_execution_scopes SET revision=revision+1,metadata_json=?,groups_json=?,roots_json=?,notes=? WHERE namespace=?')
+        .run(JSON.stringify(metadata === undefined ? old.metadata : { ...old.metadata, ...metadata }),
+          JSON.stringify(groups === undefined ? old.groups : groups), JSON.stringify(roots === undefined ? old.roots : roots),
+          notes === undefined ? old.notes : notes, executionNamespace);
+      return this.getExecutionNamespace(executionNamespace);
+    });
+  }
+  archiveExecutionTabV2(request) {
+    return this._executionMutation('archive', request, () => {
+      const tab = this.getExecutionTabV2(request);
+      if (!tab || tab.executionSubject.subjectId !== request.subjectId || tab.revision !== request.expectedRevision) workflowStorage.fail('execution_storage_revision_changed');
+      const snapshot = JSON.stringify(tab.row);
+      const values = { ...tab.row, ...request.archiveColumns, id: undefined, closed_at: Math.floor(Date.now() / 1000),
+        group_id: tab.row.tab_group_id,
+        execution_snapshot_json: snapshot, workflow_context_json: JSON.stringify(request.workflowContext || {}) };
+      delete values.id;
+      const info = this._executionInsert('tab_history', values);
+      this.db.prepare('UPDATE tabs SET execution_archived=1 WHERE id=?').run(tab.row.id);
+      return { archiveId: Number(info.lastInsertRowid), tabId: tab.row.tab_id, executionSubject: tab.executionSubject,
+        archivedRevision: tab.revision + 1,
+        workflowContext: request.workflowContext || {} };
+    });
+  }
+  restoreExecutionTabV2(request) {
+    return this._executionMutation('restore', request, () => {
+      const archive = this.db.prepare('SELECT * FROM tab_history WHERE id=? AND execution_subject_version=2 AND execution_namespace=? AND execution_subject_id=?')
+        .get(request.archiveId, request.executionNamespace, request.subjectId);
+      if (!archive) workflowStorage.fail('execution_archive_not_found');
+      let tab = this.getExecutionTabV2({ executionNamespace: request.executionNamespace, tabId: archive.tab_id, subjectId: request.subjectId });
+      if (!tab) {
+        const snapshot = JSON.parse(archive.execution_snapshot_json, (_key, value) => value?.type === 'Buffer' && Array.isArray(value.data) ? Buffer.from(value.data) : value);
+        if (this.db.prepare('SELECT 1 FROM tabs WHERE tab_id=? OR id=?').get(snapshot.tab_id, snapshot.id)) workflowStorage.fail('execution_restore_identity_conflict');
+        this._executionInsert('tabs', { ...snapshot, execution_archived: 1, execution_storage_revision: archive.execution_storage_revision + 1 });
+        tab = this.getExecutionTabV2({ executionNamespace: request.executionNamespace, tabId: archive.tab_id, subjectId: request.subjectId });
+      }
+      if (!tab.archived || tab.revision !== request.expectedRevision) workflowStorage.fail('execution_storage_revision_changed');
+      const snapshot=JSON.parse(archive.execution_snapshot_json,(_key,value)=>value?.type==='Buffer' && Array.isArray(value.data)?Buffer.from(value.data):value);
+      const available=new Set(this.db.prepare('PRAGMA table_xinfo(tabs)').all().filter(column=>!column.hidden).map(column=>column.name));
+      const protectedFields=new Set(['id','tab_id','project_id','execution_subject_version','execution_subject_id','execution_namespace','execution_storage_revision']);
+      let record={};try{record=JSON.parse(snapshot.execution_record_json || '{}');}catch{workflowStorage.fail('execution_restore_record_invalid');}
+      const metadata={name:archive.name,notes:archive.notes ?? '',nameSetManually:archive.name_set_manually===1};
+      const values={...snapshot,name:metadata.name,notes:metadata.notes,name_set_manually:Number(metadata.nameSetManually),execution_archived:0,
+        execution_record_json:JSON.stringify({...record,...metadata,archiveRestoreOrigin:{version:1,historyId:archive.id,mutationId:request.mutationId,closedRevision:request.expectedRevision,metadata}}),
+        ...(request.cwd?{cwd:request.cwd}:{})};
+      if(!path.isAbsolute(values.cwd || ''))workflowStorage.fail('execution_cwd_required');
+      const entries=Object.entries(values).filter(([key])=>available.has(key) && !protectedFields.has(key));
+      this.db.prepare(`UPDATE tabs SET ${entries.map(([key])=>'"'+key.replaceAll('"','""')+'"=?').join(',')} WHERE id=?`)
+        .run(...entries.map(([,value])=>value),tab.row.id);
+      const restored=this.getExecutionTabV2({executionNamespace:request.executionNamespace,tabId:archive.tab_id,subjectId:request.subjectId});
+      return { tabId: restored.tab.tabId, executionSubject: restored.executionSubject, storageId: restored.row.id };
+    });
+  }
+  getExecutionArchive(executionNamespace) {
+    return this.db.prepare('SELECT * FROM tab_history WHERE execution_subject_version=2 AND execution_namespace=? ORDER BY id DESC').all(executionNamespace);
+  }
+  saveExecutionArtifactV2(request) {
+    return this._executionMutation('artifact', request, () => {
+      const table = { favorite: 'favorites', session: 'ai_sessions', geminiHistory: 'gemini_history' }[request.kind];
+      if (!table) workflowStorage.fail('execution_artifact_kind_required');
+      const tab = this.getExecutionTabV2(request);
+      if (!tab || tab.executionSubject.subjectId !== request.subjectId || tab.revision !== request.expectedRevision) workflowStorage.fail('execution_storage_revision_changed');
+      const values = { ...tab.row, ...request.columns, project_id: null, execution_subject_version: 2,
+        execution_subject_id: request.subjectId, execution_namespace: request.executionNamespace,
+        execution_snapshot_json: JSON.stringify(tab.row), workflow_context_json: JSON.stringify(request.workflowContext || {}) };
+      delete values.id;
+      const info = this._executionInsert(table, values);
+      return { kind: request.kind, id: Number(info.lastInsertRowid), tabId: tab.row.tab_id };
+    });
+  }
+  getExecutionArtifacts(executionNamespace, kind) {
+    const table = { favorite: 'favorites', session: 'ai_sessions', geminiHistory: 'gemini_history' }[kind];
+    if (!table) workflowStorage.fail('execution_artifact_kind_required');
+    return this.db.prepare(`SELECT * FROM "${table}" WHERE execution_subject_version=2 AND execution_namespace=? ORDER BY id`).all(executionNamespace);
+  }
+  _executionNamespaceColumn() {
+    const present = this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'").get();
+    return present ? 'COALESCE(project_id,execution_namespace)' : 'project_id';
+  }
+  _executionWireRow(row) {
+    return row?.execution_subject_version===2 ? {...row,project_id:row.execution_namespace,
+      executionSubject:workflowStorage.executionScopeForRow(row)} : row;
+  }
+  _independentArtifactAddress(namespace,kind) {
+    if(this.db.prepare('SELECT 1 FROM projects WHERE id=?').get(namespace))return null;
+    if(this._executionNamespaceColumn()==='project_id'
+      || !this.db.prepare('SELECT 1 FROM workflow_execution_scopes WHERE namespace=?').get(namespace))return null;
+    // Artifact identity addresses stored bytes only; Main resolves writers
+    // exclusively from tabs/runtime, never from an export/response subject.
+    return {project_id:null,execution_namespace:namespace,execution_subject_version:2,
+      execution_subject_id:'artifact:'+crypto.randomUUID(),workflow_context_json:JSON.stringify({version:1,kind})};
+  }
+  _saveVirtualNamespace(namespace,fields) {
+    if(this.db.prepare('SELECT 1 FROM projects WHERE id=?').get(namespace))return false;
+    if(this._executionNamespaceColumn()==='project_id')return false;
+    const scope=this.getExecutionNamespace(namespace);
+    if(!scope)return false;
+    this.saveExecutionNamespace({executionNamespace:namespace,expectedRevision:scope.revision,...fields});
+    return true;
+  }
+
   ensureInboxProject() {
     const inboxPath = getInboxProjectPath();
     const existing = this.db.prepare('SELECT id, path, name, description FROM projects WHERE id = ?').get(INBOX_PROJECT_ID);
+
+    if(!existing && this._executionNamespaceColumn()!=='project_id') {
+      this.db.prepare('INSERT OR IGNORE INTO workflow_execution_scopes(namespace,metadata_json) VALUES(?,?)')
+        .run(INBOX_PROJECT_ID,JSON.stringify({name:'Inbox',kind:'legacy-execution-alias',recommendedCwd:inboxPath}));
+      return;
+    }
 
     if (!existing) {
       this.db.prepare(`
@@ -2096,16 +2423,30 @@ class DatabaseManager {
 
   getProjectById(projectId) {
     const project = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-    if (!project) return null;
+    const v2 = !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'").get();
+    if (!project) {
+      if (!v2) return null;
+      const scope = this.getExecutionNamespace(projectId);
+      if (!scope) return null;
+      // Legacy wire shape for an exact execution bucket. This is not a Project
+      // row, cwd/default directory or workflow organization authority.
+      return { id: scope.namespace, executionNamespace: scope.namespace, executionScopeVersion: 2,
+        recommendedCwd:scope.metadata.recommendedCwd || null,
+        path: null, name: scope.metadata.name || scope.namespace, description: '', icon: scope.metadata.icon || null,
+        notesGlobal: scope.notes, tabGroups: scope.groups, quickActions:this.getGlobalCommands().map(command=>({name:command.name,command:command.command})),
+        sidebarOpen:scope.metadata.sidebarOpen || false,openFilePath:scope.metadata.openFilePath || null,
+        sidebarExpandedDirs:scope.metadata.sidebarExpandedDirs || null,sidebarScrollTop:scope.metadata.sidebarScrollTop || 0,
+        tabListScrollTop:scope.metadata.tabListScrollTop || 0,tabs: scope.tabs };
+    }
 
     // The removed Utils surface had its own position namespace. During the
     // one-way migration, preserve the old visible order: main tabs first,
     // then utility tabs, with a deterministic row-id tie-break.
     const tabs = this.db.prepare(`
       SELECT * FROM tabs
-      WHERE project_id = ?
+      WHERE ${v2 ? '(project_id = ? OR (execution_subject_version=2 AND execution_namespace=? AND execution_archived=0))' : 'project_id = ?'}
       ORDER BY is_utility ASC, position ASC, id ASC
-    `).all(project.id);
+    `).all(...(v2 ? [project.id, project.id] : [project.id]));
     const globalCommands = this.getGlobalCommands();
 
     return {
@@ -2141,6 +2482,10 @@ class DatabaseManager {
       updatedAt: project.updated_at,
       quickActions: globalCommands.map(gc => ({ name: gc.name, command: gc.command })),
       tabs: tabs.map(t => ({
+        ...(t.execution_subject_version === 2 ? {executionSubject:workflowStorage.executionScopeForRow(t),
+          executionStorageRevision:t.execution_storage_revision} : {}),
+        ...(t.execution_subject_version === 2 ? { ...JSON.parse(t.execution_record_json),
+          executionSubject: workflowStorage.executionScopeForRow(t), executionStorageRevision: t.execution_storage_revision } : {}),
         name: t.name,
         nameSetManually: t.name_set_manually === 1 || undefined,
         cwd: t.cwd,
@@ -2239,8 +2584,25 @@ class DatabaseManager {
   // but this closes the crash window between live-process proof and SQLite.
   updateTabCwd(tabId, cwd) {
     if (!tabId || typeof cwd !== 'string' || !path.isAbsolute(cwd)) return false;
-    const info = this.db.prepare('UPDATE tabs SET cwd = ? WHERE tab_id = ?').run(cwd, tabId);
+    const current=this.db.prepare('SELECT cwd FROM tabs WHERE tab_id=?').get(tabId);
+    if(!current)return false;
+    if(current.cwd===cwd)return true;
+    const info = this.db.prepare('UPDATE tabs SET cwd = ? WHERE tab_id = ? AND cwd IS NOT ?').run(cwd, tabId,cwd);
     return info.changes > 0;
+  }
+
+  updateProvenTabCwd(tabId,cwd) {
+    const run=()=>{
+      const before=this.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get(tabId);
+      const persisted=this.updateTabCwd(tabId,cwd);
+      const after=persisted && this.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get(tabId);
+      const executionReceipt=before?.execution_subject_version===2 && after?.execution_subject_id===before.execution_subject_id
+        ? {version:1,kind:'cwd',namespace:before.execution_namespace,tabId,subjectId:before.execution_subject_id,
+          fromRevision:before.execution_storage_revision,toRevision:after.execution_storage_revision,
+          executionSubject:workflowStorage.executionScopeForRow(after)} : undefined;
+      return {persisted,...(executionReceipt?{executionReceipt}:{})};
+    };
+    return this.db.inTransaction?run():this.db.transaction(run).immediate();
   }
 
   // Codex writer identity is committed point-wise by main after runtime proof.
@@ -2253,7 +2615,7 @@ class DatabaseManager {
   getTabClaudeSessionId(projectId, tabId) {
     if (arguments.length < 2 || !projectId || !tabId) return undefined;
     const row = this.db.prepare(
-      'SELECT claude_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      `SELECT claude_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
     ).get(projectId, tabId);
     if (!row) return undefined;
     return row.claude_session_id || null;
@@ -2262,7 +2624,7 @@ class DatabaseManager {
   getTabCodexSessionId(projectId, tabId) {
     if (arguments.length < 2 || !projectId || !tabId) return undefined;
     const row = this.db.prepare(
-      'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      `SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
     ).get(projectId, tabId);
     if (!row) return undefined;
     return row.codex_session_id || null;
@@ -2285,7 +2647,7 @@ class DatabaseManager {
              codex_model_migration_config_fingerprint,
              codex_model_migration_config_already_target
       FROM tabs
-      WHERE project_id = ? AND tab_id = ?
+      WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
       LIMIT 1
     `).get(projectId, tabId);
     if (!row) return undefined;
@@ -2314,7 +2676,7 @@ class DatabaseManager {
       ? sessionId.trim()
       : null;
     const info = this.db.prepare(
-      'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ?'
+      `UPDATE tabs SET codex_session_id = ? WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?`
     ).run(normalizedSessionId, projectId, tabId);
     return info.changes > 0;
   }
@@ -2366,7 +2728,7 @@ class DatabaseManager {
           codex_model_migration_config_path = NULL,
           codex_model_migration_config_fingerprint = NULL,
           codex_model_migration_config_already_target = 0
-      WHERE project_id = ? AND tab_id = ?
+      WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
     `).run(
       normalizedSessionId,
       normalizedModel,
@@ -2396,7 +2758,7 @@ class DatabaseManager {
       ? nextSessionId.trim()
       : null;
     const info = this.db.prepare(
-      'UPDATE tabs SET claude_session_id = ? WHERE project_id = ? AND tab_id = ? AND claude_session_id IS ?'
+      `UPDATE tabs SET claude_session_id = ? WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? AND claude_session_id IS ?`
     ).run(next, projectId, tabId, expected);
     return info.changes === 1;
   }
@@ -2410,7 +2772,7 @@ class DatabaseManager {
       ? nextSessionId.trim()
       : null;
     const info = this.db.prepare(
-      'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ? AND codex_session_id IS ?'
+`UPDATE tabs SET codex_session_id = ? WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? AND codex_session_id IS ?`
     ).run(next, projectId, tabId, expected);
     return info.changes === 1;
   }
@@ -2450,7 +2812,7 @@ class DatabaseManager {
           codex_model_migration_config_path = NULL,
           codex_model_migration_config_fingerprint = NULL,
           codex_model_migration_config_already_target = 0
-      WHERE project_id = ? AND tab_id = ?
+      WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
     `).run(
       normalizedModel,
       normalizedEffort,
@@ -2510,7 +2872,7 @@ class DatabaseManager {
                codex_model_migration_config_fingerprint,
                codex_model_migration_config_already_target
         FROM tabs
-        WHERE project_id = ? AND tab_id = ?
+        WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
         LIMIT 1
       `).get(projectId, tabId);
       if (!previousPending) {
@@ -2548,7 +2910,7 @@ class DatabaseManager {
             codex_model_migration_config_path = ?,
             codex_model_migration_config_fingerprint = ?,
             codex_model_migration_config_already_target = ?
-        WHERE project_id = ? AND tab_id = ? AND codex_model_migration_pending = 0
+        WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? AND codex_model_migration_pending = 0
       `).run(
         normalizedProofAt,
         normalizedSourceModel,
@@ -2592,7 +2954,7 @@ class DatabaseManager {
         UPDATE tabs
         SET codex_model_migration_restore_default_model = ?,
             codex_model_migration_restore_default_effort = ?
-        WHERE project_id = ? AND tab_id = ?
+        WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
       `).run(
         defaultModelInvalidated ? 1 : 0,
         defaultEffortInvalidated ? 1 : 0,
@@ -2640,7 +3002,7 @@ class DatabaseManager {
                codex_model_migration_pending,
                codex_settings_proof_at
         FROM tabs
-        WHERE project_id = ? AND tab_id = ?
+        WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
         LIMIT 1
       `).get(projectId, tabId);
       if (!pendingState) {
@@ -2665,7 +3027,7 @@ class DatabaseManager {
             codex_model_migration_config_path = NULL,
             codex_model_migration_config_fingerprint = NULL,
             codex_model_migration_config_already_target = 0
-        WHERE project_id = ? AND tab_id = ?
+        WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
           AND codex_model_migration_pending = 1
           AND codex_settings_proof_at = ?
       `).run(
@@ -2731,7 +3093,7 @@ class DatabaseManager {
                codex_model_migration_source_model,
                codex_model_migration_source_effort
         FROM tabs
-        WHERE project_id = ? AND tab_id = ?
+        WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
         LIMIT 1
       `).get(projectId, tabId);
       if (!pendingState) {
@@ -2767,7 +3129,7 @@ class DatabaseManager {
             codex_model_migration_config_path = NULL,
             codex_model_migration_config_fingerprint = NULL,
             codex_model_migration_config_already_target = 0
-        WHERE project_id = ? AND tab_id = ?
+        WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
           AND codex_model_migration_pending = 1
           AND codex_settings_proof_at = ?
       `).run(
@@ -2872,7 +3234,7 @@ class DatabaseManager {
         };
       }
       const tabRow = this.db.prepare(
-        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+        `SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
       ).get(projectId, tabId);
       if (!tabRow) {
         return { success: false, error: 'codex_tab_row_missing', retryable: true };
@@ -3030,7 +3392,7 @@ class DatabaseManager {
         };
       }
       const tabRow = this.db.prepare(
-        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+        `SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
       ).get(projectId, tabId);
       if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
       if ((tabRow.codex_session_id || null) !== sourceSessionId) {
@@ -3140,7 +3502,7 @@ class DatabaseManager {
         };
       }
       const tabRow = this.db.prepare(
-        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+        `SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
       ).get(projectId, tabId);
       if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
       if ((tabRow.codex_session_id || null) !== sourceSessionId) {
@@ -3238,7 +3600,7 @@ class DatabaseManager {
         return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
       }
       const tabRow = this.db.prepare(
-        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+        `SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
       ).get(projectId, tabId);
       if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
       if ((tabRow.codex_session_id || null) !== sourceSessionId) {
@@ -3414,7 +3776,7 @@ class DatabaseManager {
         }
       }
       const tabRow = this.db.prepare(
-        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+        `SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
       ).get(projectId, tabId);
       if (!tabRow) {
         return { success: false, error: 'codex_tab_row_missing', retryable: true };
@@ -3670,7 +4032,7 @@ class DatabaseManager {
       }
 
       const tabRow = this.db.prepare(
-        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+        `SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
       ).get(projectId, tabId);
       if (!tabRow) {
         return { success: false, error: 'codex_tab_row_missing', retryable: true };
@@ -3686,7 +4048,7 @@ class DatabaseManager {
       }
       if (currentSessionId === expectedBindingSessionId) {
         const updated = this.db.prepare(
-          'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ? AND codex_session_id IS ?'
+          `UPDATE tabs SET codex_session_id = ? WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? AND codex_session_id IS ?`
         ).run(nextSessionId, projectId, tabId, expectedBindingSessionId);
         if (updated.changes !== 1) {
           return { success: false, error: 'codex_handoff_compare_and_set_failed', retryable: true };
@@ -3835,7 +4197,7 @@ class DatabaseManager {
 
     const transaction = this.db.transaction(() => {
       const tabRow = this.db.prepare(
-        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+        `SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
       ).get(projectId, tabId);
       if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
       const currentSessionId = tabRow.codex_session_id || null;
@@ -3857,7 +4219,7 @@ class DatabaseManager {
         }
       } else if (currentSessionId !== next) {
         const updated = this.db.prepare(
-          'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ? AND codex_session_id IS ?'
+          `UPDATE tabs SET codex_session_id = ? WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? AND codex_session_id IS ?`
         ).run(next, projectId, tabId, expectedBinding);
         if (updated.changes !== 1) throw new Error('codex_writer_lineage_compare_and_set_failed');
       }
@@ -3952,7 +4314,7 @@ class DatabaseManager {
       }
       const expectedBindingSessionId = journal.expectedBindingSessionId || sourceSessionId;
       const tabRow = this.db.prepare(
-        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+        `SELECT codex_session_id FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ? LIMIT 1`
       ).get(projectId, tabId);
       if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
       const currentSessionId = tabRow.codex_session_id || null;
@@ -4115,7 +4477,7 @@ class DatabaseManager {
       WITH selected AS (
         SELECT tab_id, tab_type, command_type, task_plan,
           CASE WHEN json_valid(task_plan) THEN task_plan ELSE '{}' END AS plan
-        FROM tabs WHERE project_id = ? AND tab_id IN (SELECT value FROM json_each(?))
+        FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id IN (SELECT value FROM json_each(?))
       )
       SELECT tab_id AS tabId, tab_type AS tabType, command_type AS commandType,
         task_plan IS NULL OR (json_extract(plan, '$.version') = 1
@@ -4354,29 +4716,35 @@ class DatabaseManager {
   }
 
   updateProjectNotes(projectId, notes) {
+    if(this._saveVirtualNamespace(projectId,{notes}))return;
     this.db.prepare('UPDATE projects SET notes_global = ?, updated_at = strftime(\'%s\', \'now\') WHERE id = ?').run(notes, projectId);
   }
 
   updateProjectSidebarState(projectId, sidebarOpen, openFilePath) {
+    if(this._saveVirtualNamespace(projectId,{metadata:{sidebarOpen,openFilePath}}))return;
     this.db.prepare('UPDATE projects SET sidebar_open = ?, open_file_path = ? WHERE id = ?').run(sidebarOpen ? 1 : 0, openFilePath || null, projectId);
   }
 
   updateProjectSidebarExpandedDirs(projectId, expandedDirs) {
+    if(this._saveVirtualNamespace(projectId,{metadata:{sidebarExpandedDirs:expandedDirs}}))return;
     const json = expandedDirs ? JSON.stringify(expandedDirs) : null;
     this.db.prepare('UPDATE projects SET sidebar_expanded_dirs = ? WHERE id = ?').run(json, projectId);
   }
 
   updateProjectSidebarScrollTop(projectId, scrollTop) {
+    if(this._saveVirtualNamespace(projectId,{metadata:{sidebarScrollTop:scrollTop}}))return;
     const normalized = Number.isFinite(Number(scrollTop)) ? Math.max(0, Number(scrollTop)) : 0;
     this.db.prepare('UPDATE projects SET sidebar_scroll_top = ? WHERE id = ?').run(normalized, projectId);
   }
 
   updateProjectTabListScrollTop(projectId, scrollTop) {
+    if(this._saveVirtualNamespace(projectId,{metadata:{tabListScrollTop:scrollTop}}))return;
     const normalized = Number.isFinite(Number(scrollTop)) ? Math.max(0, Number(scrollTop)) : 0;
     this.db.prepare('UPDATE projects SET tab_list_scroll_top = ? WHERE id = ?').run(normalized, projectId);
   }
 
   updateProjectTabGroups(projectId, groups) {
+    if(this._saveVirtualNamespace(projectId,{groups}))return;
     const json = Array.isArray(groups) && groups.length > 0 ? JSON.stringify(groups) : null;
     this.db.prepare('UPDATE projects SET tab_groups = ?, updated_at = strftime(\'%s\', \'now\') WHERE id = ?').run(json, projectId);
   }
@@ -4390,28 +4758,57 @@ class DatabaseManager {
   // ========== TABS ========== 
 
   getProjectTabIds(projectId) {
-    return this.db.prepare(
-      'SELECT tab_id FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL ORDER BY tab_id'
-    ).all(projectId).map((row) => row.tab_id);
+    const column=this._executionNamespaceColumn();
+    return this.db.prepare(`SELECT tab_id${column==='project_id'?'':',execution_archived'} FROM tabs
+      WHERE ${column} = ? AND tab_id IS NOT NULL ORDER BY tab_id`).all(projectId)
+      .filter(row=>row.execution_archived!==1 || this._executionPendingArchiveIds?.has(row.tab_id)).map(row=>row.tab_id);
   }
 
   rollbackUnmaterializedCreatedTab(projectId, tabId) {
     const row = this.db.prepare(`
       SELECT claude_session_id, gemini_session_id, codex_session_id
       FROM tabs
-      WHERE project_id = ? AND tab_id = ?
+      WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?
     `).get(projectId, tabId);
     if (!row) return { success: true, deleted: false };
     if (row.claude_session_id || row.gemini_session_id || row.codex_session_id) {
       return { success: false, error: 'created_tab_already_materialized' };
     }
     const result = this.db.prepare(
-      'DELETE FROM tabs WHERE project_id = ? AND tab_id = ?'
+      `DELETE FROM tabs WHERE ${this._executionNamespaceColumn()} = ? AND tab_id = ?`
     ).run(projectId, tabId);
     return { success: true, deleted: result.changes === 1 };
   }
 
   saveTabs(projectId, tabs, forceCleanup = false, preserveInterrupted = false) {
+    const v2 = this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'").get();
+    if (!v2 || !Array.isArray(tabs)) return this._saveLegacyTabs(projectId, tabs, forceCleanup, preserveInterrupted);
+    const v2Ids = new Set(this.db.prepare('SELECT tab_id FROM tabs WHERE execution_subject_version=2 AND execution_namespace=?').all(projectId).map(row => row.tab_id));
+    if (!v2Ids.size) return this._saveLegacyTabs(projectId, tabs, forceCleanup, preserveInterrupted);
+    return this._executionTransaction(() => {
+      const independent = tabs.filter(tab => v2Ids.has(tab.tabId));
+      const legacy = tabs.filter(tab => !v2Ids.has(tab.tabId));
+      this.saveExecutionTabs(projectId, independent);
+      if(forceCleanup) {
+        const keep=new Set(independent.map(tab=>tab.tabId));
+        for(const tabId of v2Ids) if(!keep.has(tabId)) this.db.prepare('UPDATE tabs SET execution_archived=1 WHERE tab_id=? AND execution_archived=0').run(tabId);
+      }
+      for(const tabId of v2Ids)this._executionPendingArchiveIds?.delete(tabId);
+      const realProject = this.db.prepare('SELECT 1 FROM projects WHERE id=?').get(projectId);
+      if (!realProject) {
+        if (legacy.length) workflowStorage.fail('execution_exact_address_required');
+        return { success: true };
+      }
+      // The v1 implementation/guards stay intact. V2 rows are never subjected
+      // to its delete/reinsert/Project FK path.
+      if (!legacy.length && independent.length && !forceCleanup) return { success: true };
+      const result = this._saveLegacyTabs(projectId, legacy, forceCleanup, preserveInterrupted);
+      if (result?.success === false) workflowStorage.fail(result.error || 'execution_legacy_save_failed');
+      return result;
+    });
+  }
+
+  _saveLegacyTabs(projectId, tabs, forceCleanup = false, preserveInterrupted = false) {
     // Check if project exists to avoid FOREIGN KEY constraint error
     const projectExists = this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId);
     if (!projectExists) {
@@ -5004,7 +5401,47 @@ class DatabaseManager {
 
   // ========== TAB HISTORY (CLOSED TABS ARCHIVE) ==========
 
-  archiveTab(projectId, tab, {
+  archiveTab(projectId,tab,options={}) {
+    const run=() => {
+      const tabId=options.sourceTabId || tab?.tabId || tab?.id;
+      const present=this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'").get();
+      const native=present && tabId ? this.getExecutionTabV2({executionNamespace:projectId,tabId}) : null;
+      let historyId,replay=false;
+      if(native) {
+        const previous=native.archived && this.getExecutionArchive(projectId).find(row=>row.tab_id===tabId && row.execution_subject_id===native.executionSubject.subjectId);
+        if(previous){historyId=previous.id;replay=true;}
+        else {
+          if(options.codexWriterSessionId !== undefined && options.codexWriterSessionId !== null
+            && options.codexWriterSessionId!==native.row.codex_session_id)
+            this.updateTabCodexSessionId(projectId,tabId,options.codexWriterSessionId);
+          const before=this.getExecutionTabV2({executionNamespace:projectId,tabId});
+          this.saveExecutionTabV2({executionNamespace:projectId,tabId,subjectId:before.executionSubject.subjectId,
+            expectedRevision:before.revision,record:JSON.parse(JSON.stringify(tab || {}))});
+          const current=this.getExecutionTabV2({executionNamespace:projectId,tabId});
+          const archiveColumns={restore_placement:tab?.restorePlacement?.version===1?JSON.stringify(tab.restorePlacement):null,
+            process_was_running:tab?.processWasRunning?1:0,message_count:tab?.messageCount ?? null,
+            group_id:tab?.groupId || current.row.tab_group_id || null};
+          historyId=this.archiveExecutionTabV2({mutationId:options.mutationId || 'close:'+crypto.randomUUID(),
+            executionNamespace:projectId,tabId,subjectId:current.executionSubject.subjectId,expectedRevision:current.revision,
+            archiveColumns,
+            workflowContext:options.workflowContext || {restorePlacement:tab?.restorePlacement || null}}).archiveId;
+        }
+        this._executionPendingArchiveIds ||= new Set();this._executionPendingArchiveIds.add(tabId);
+      } else historyId=this._archiveLegacyTab(projectId,tab,options);
+      if(Number.isSafeInteger(historyId)) {
+        if(!replay)this.archivedFileLinks?.capture(historyId,projectId,tabId);
+        else {
+          const saved=this.archivedFileLinks?.read(historyId);
+          if(saved && (saved.ownerTabId!==tabId || saved.namespace!==projectId))workflowStorage.fail('file_manifest_owner_changed');
+        }
+      }
+      return historyId;
+    };
+    const schema=this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'").get();
+    return schema ? this._executionTransaction(run) : this.db.inTransaction ? run() : this.db.transaction(run).immediate();
+  }
+
+  _archiveLegacyTab(projectId, tab, {
     sourceTabId = null,
     codexWriterSessionId = null,
   } = {}) {
@@ -5138,9 +5575,9 @@ class DatabaseManager {
   // Restore is a two-phase operation: the caller must create the replacement
   // tab first and delete this row only after creation succeeds.
   getLatestTabHistory(projectId) {
-    return this.db.prepare(
-      "SELECT * FROM tab_history WHERE project_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT 1"
-    ).get(projectId);
+    return this._executionWireRow(this.db.prepare(
+      `SELECT * FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT 1`
+    ).get(projectId));
   }
 
   // Metadata-only candidate for one durable window. The ordinary project
@@ -5150,7 +5587,7 @@ class DatabaseManager {
     const projects = [...new Set(projectIds.filter(id => typeof id === 'string' && id))];
     if (!projects.length) return null;
     const row = this.db.prepare(`
-      SELECT * FROM (SELECT id, project_id, tab_id, closed_at,
+      SELECT * FROM (SELECT id, ${this._executionNamespaceColumn()} AS project_id, tab_id, closed_at,
         COALESCE(CASE WHEN json_valid(restore_placement) THEN
           CASE WHEN json_type(restore_placement,'$.closedOrder') IN ('integer','real')
             AND json_extract(restore_placement,'$.closedOrder') > 0
@@ -5158,7 +5595,7 @@ class DatabaseManager {
             THEN CAST(json_extract(restore_placement,'$.closedOrder') AS INTEGER) END
           END, ROUND((julianday(closed_at)-2440587.5)*86400000)) AS closedOrder
       FROM tab_history
-      WHERE project_id IN (${projects.map(() => '?').join(',')})
+      WHERE ${this._executionNamespaceColumn()} IN (${projects.map(() => '?').join(',')})
         AND (tab_type IS NULL OR tab_type != 'file')
         ${projectOnly ? '' : `AND CASE WHEN json_valid(restore_placement) THEN
           json_extract(restore_placement,'$.window.spaceId') = ? AND
@@ -5170,9 +5607,9 @@ class DatabaseManager {
   }
 
   getTabHistoryEntry(id, projectId) {
-    return this.db.prepare(
-      "SELECT * FROM tab_history WHERE id = ? AND project_id = ? AND (tab_type IS NULL OR tab_type != 'file') LIMIT 1"
-    ).get(id, projectId);
+    return this._executionWireRow(this.db.prepare(
+      `SELECT * FROM tab_history WHERE id = ? AND ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file') LIMIT 1`
+    ).get(id, projectId));
   }
 
   getTabHistoryEntriesByTabId(tabId, limit = 2) {
@@ -5181,33 +5618,33 @@ class DatabaseManager {
     const safeLimit = Math.max(1, Math.min(10, Number(limit) || 2));
     return this.db.prepare(
       "SELECT * FROM tab_history WHERE tab_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT ?"
-    ).all(cleanTabId, safeLimit);
+    ).all(cleanTabId, safeLimit).map(row=>this._executionWireRow(row));
   }
 
   getTabHistory(projectId, limit = 0) {
     if (limit && limit > 0) {
       return this.db.prepare(
-        "SELECT * FROM tab_history WHERE project_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT ?"
-      ).all(projectId, limit);
+        `SELECT * FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT ?`
+      ).all(projectId, limit).map(row=>this._executionWireRow(row));
     }
     return this.db.prepare(
-      "SELECT * FROM tab_history WHERE project_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC"
-    ).all(projectId);
+      `SELECT * FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC`
+    ).all(projectId).map(row=>this._executionWireRow(row));
   }
 
   getTabHistoryCount(projectId) {
     const row = this.db.prepare(
-      "SELECT COUNT(*) as count FROM tab_history WHERE project_id = ? AND (tab_type IS NULL OR tab_type != 'file')"
+      `SELECT COUNT(*) as count FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file')`
     ).get(projectId);
     return row ? row.count : 0;
   }
 
   clearTabHistory(projectId) {
-    this.db.prepare('DELETE FROM tab_history WHERE project_id = ?').run(projectId);
+    this.db.prepare(`DELETE FROM tab_history WHERE ${this._executionNamespaceColumn()} = ?`).run(projectId);
   }
 
   clearTabHistoryExceptNotes(projectId) {
-    this.db.prepare("DELETE FROM tab_history WHERE project_id = ? AND (notes IS NULL OR notes = '')").run(projectId);
+    this.db.prepare(`DELETE FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND (notes IS NULL OR notes = '')`).run(projectId);
   }
 
   deleteTabHistoryEntry(id) {
@@ -5234,6 +5671,11 @@ class DatabaseManager {
   // ========== FAVORITES ==========
 
   addFavorite(projectId, tab) {
+    const native=this._executionNamespaceColumn()!=='project_id' && tab.tabId
+      ? this.getExecutionTabV2({executionNamespace:projectId,tabId:tab.tabId}) : null;
+    if(native)return this.saveExecutionArtifactV2({mutationId:tab.favoriteMutationId || crypto.randomUUID(),kind:'favorite',
+      executionNamespace:projectId,tabId:tab.tabId,subjectId:native.executionSubject.subjectId,expectedRevision:native.revision,
+      workflowContext:tab.workflowContext || {}}).id;
     this.db.prepare(`
       INSERT INTO favorites (project_id, name, cwd, color, notes, command_type, tab_type, url, claude_session_id, gemini_session_id, codex_session_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -5254,8 +5696,8 @@ class DatabaseManager {
 
   getFavorites(projectId) {
     return this.db.prepare(
-      'SELECT * FROM favorites WHERE project_id = ? ORDER BY created_at DESC'
-    ).all(projectId);
+      `SELECT * FROM favorites WHERE ${this._executionNamespaceColumn()} = ? ORDER BY created_at DESC`
+    ).all(projectId).map(row=>this._executionWireRow(row));
   }
 
   deleteFavorite(id) {
@@ -5265,6 +5707,11 @@ class DatabaseManager {
   // ========== GEMINI HISTORY ==========
 
   saveGeminiHistory(projectId, selectedText, prompt, response) {
+    const independent=this._independentArtifactAddress(projectId,'gemini-response');
+    if(independent) {
+      const info=this._executionInsert('gemini_history',{...independent,selected_text:selectedText,prompt,response});
+      return {id:Number(info.lastInsertRowid),project_id:projectId,selected_text:selectedText,prompt,response,timestamp:Math.floor(Date.now()/1000)};
+    }
     const result = this.db.prepare(`
       INSERT INTO gemini_history (project_id, selected_text, prompt, response)
       VALUES (?, ?, ?, ?)
@@ -5274,7 +5721,8 @@ class DatabaseManager {
   }
 
   getGeminiHistory(projectId, limit = 50) {
-    return this.db.prepare('SELECT * FROM gemini_history WHERE project_id = ? ORDER BY timestamp DESC LIMIT ?').all(projectId, limit);
+    return this.db.prepare(`SELECT * FROM gemini_history WHERE ${this._executionNamespaceColumn()} = ? ORDER BY timestamp DESC LIMIT ?`).all(projectId, limit)
+      .map(row=>this._executionWireRow(row));
   }
 
   // ========== GLOBAL COMMANDS & PROMPTS ========== 
@@ -6568,18 +7016,21 @@ class DatabaseManager {
   // ========== AI SESSIONS ==========
 
   saveAISession(projectId, toolType, sessionKey, contentBlob, originalCwd, originalHash = null) {
-    const existing = this.db.prepare('SELECT id FROM ai_sessions WHERE project_id = ? AND tool_type = ? AND session_key = ?').get(projectId, toolType, sessionKey);
+    const existing = this.db.prepare(`SELECT id FROM ai_sessions WHERE ${this._executionNamespaceColumn()} = ? AND tool_type = ? AND session_key = ?`).get(projectId, toolType, sessionKey);
     if (existing) {
       this.db.prepare('UPDATE ai_sessions SET content_blob = ?, original_cwd = ?, original_hash = ?, updated_at = strftime(\'%s\', \'now\') WHERE id = ?').run(contentBlob, originalCwd, originalHash, existing.id);
       return existing.id;
     } else {
+      const independent=this._independentArtifactAddress(projectId,'session-export');
+      if(independent)return this._executionInsert('ai_sessions',{...independent,tool_type:toolType,session_key:sessionKey,
+        content_blob:contentBlob,original_cwd:originalCwd,original_hash:originalHash}).lastInsertRowid;
       return this.db.prepare('INSERT INTO ai_sessions (project_id, tool_type, session_key, content_blob, original_cwd, original_hash) VALUES (?, ?, ?, ?, ?, ?)').run(projectId, toolType, sessionKey, contentBlob, originalCwd, originalHash).lastInsertRowid;
     }
   }
 
   getAISessions(projectId, toolType = null) {
-    if (toolType) return this.db.prepare('SELECT * FROM ai_sessions WHERE project_id = ? AND tool_type = ? ORDER BY updated_at DESC').all(projectId, toolType);
-    return this.db.prepare('SELECT * FROM ai_sessions WHERE project_id = ? ORDER BY updated_at DESC').all(projectId);
+    if (toolType) return this.db.prepare(`SELECT * FROM ai_sessions WHERE ${this._executionNamespaceColumn()} = ? AND tool_type = ? ORDER BY updated_at DESC`).all(projectId, toolType).map(row=>this._executionWireRow(row));
+    return this.db.prepare(`SELECT * FROM ai_sessions WHERE ${this._executionNamespaceColumn()} = ? ORDER BY updated_at DESC`).all(projectId).map(row=>this._executionWireRow(row));
   }
 
   // ========== FORK MARKERS ==========

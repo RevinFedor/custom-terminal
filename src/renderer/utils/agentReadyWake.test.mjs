@@ -42,8 +42,8 @@ function harness(toolType = 'codex') {
     startupGateOwnsComposer: () => false, waitForStartupGate: async () => {},
   };
   return { ipcRenderer, timers, runtime,
-    start: () => api.prepareAgentRuntimeForSend({ tabId: 'T', runtime, providerContract,
-      sessionId: 'S', requestedStatusAtSend: 'active', coordinatedSendToken: 1 }),
+    start: (extra = {}) => api.prepareAgentRuntimeForSend({ tabId: 'T', runtime, providerContract,
+      sessionId: 'S', requestedStatusAtSend: 'active', coordinatedSendToken: 1, ...extra }),
     setState: value => { state = value; },
     advance: ms => { now += ms; },
     wakeAt: async time => { now = time; for (const timer of [...timers.values()]) timer.callback(); await tick(); },
@@ -53,9 +53,42 @@ function harness(toolType = 'codex') {
   };
 }
 
+test('RunAfter admission revocation cancels common readiness wait without any provider Stop/Resume', async () => {
+  const h = harness(), controller = new AbortController();
+  const pending = h.start({ coordinatedSendToken: null, admissionSignal: controller.signal });
+  await tick();
+  assert.ok(h.timers.size > 0);
+  controller.abort();
+  await assert.rejects(pending, error => error.cancelled === true && error.submitted === false);
+  assert.equal(h.resumes, 0); assert.equal(h.timers.size, 0);
+  assert.equal(h.ipcRenderer.eventNames().length, 0);
+});
+
 const startupSnapshot = (launchId = 'L') => ({ launchId, lifecycleGeneration: 'G',
   sendTarget: { toolType: 'codex', sessionId: 'S', launchId },
   startupWait: { launchId, lifecycleGeneration: 'G', startedAt: 1000, deadlineAt: 61000 } });
+
+for (const lateSnapshot of [false, true]) test('late join uses the absolute Main deadline, including a shorter deadline discovered after the first read: ' + lateSnapshot, async () => {
+  const h = harness();
+  h.advance(50000);
+  h.setState({ status: 'starting', inputReady: false, runtimeSnapshot: lateSnapshot ? null : startupSnapshot() });
+  if (lateSnapshot) {
+    const read = h.runtime.getPresence;
+    let reads = 0;
+    h.runtime.getPresence = async (...args) => {
+      if (++reads === 2) h.setState({ status: 'starting', inputReady: false, runtimeSnapshot: startupSnapshot() });
+      return read(...args);
+    };
+  }
+  const rejected = assert.rejects(h.start(), error => error.code === 'agent_send_readiness_timeout');
+  await tick();
+  assert.equal(h.timers.size, 1);
+  assert.equal([...h.timers.values()][0].ms, 11000, 'joining at50s does not allocate another30s');
+  await h.wakeAt(61001);
+  await rejected;
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.resumes, 0);
+});
 
 test('cold Codex Send survives the old 30s limit and sends frozen context once on the same launch ready', async () => {
   const h = harness();

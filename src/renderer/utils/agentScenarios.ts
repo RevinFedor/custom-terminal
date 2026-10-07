@@ -46,6 +46,7 @@ export interface SendAgentPromptScenarioArgs {
   sendOperationKey?: string | null;
   source?: string;
   promptQueueAction?: 'send-now';
+  promptQueueIntent?: Record<string, unknown>;
   statusAtSend?: string;
   queue?: boolean;
   requireLive?: boolean;
@@ -93,7 +94,7 @@ export interface SendAgentPromptScenarioArgs {
     } | {
       id?: string;
       kind: 'prompt-origin';
-      source: 'loop' | 'system';
+      source: 'loop' | 'system' | 'terminal-mcp';
       systemSource?: 'build-install-return' | 'codex-capacity-retry';
       auditSourceIdentity?: string;
     }>;
@@ -347,12 +348,21 @@ export function sendAgentPromptScenario(
       tabId: args.tabId, toolType: args.toolType, sessionId: args.sessionId,
       expectedTarget: args.expectedTarget, cwd: args.cwd, prompt: args.prompt,
       handoffId: args.handoffId, source: args.source, statusAtSend: args.statusAtSend,
+      ...(args.promptQueueAction === 'send-now' ? { promptQueueAction: 'send-now' } : {}),
+      ...(args.promptQueueIntent ? { promptQueueIntent: args.promptQueueIntent } : {}),
       queue: args.queue, requireLive: args.requireLive, settingsIntent: args.settingsIntent,
       workContextPrepared: args.workContextPrepared,
       returnDraftOnConflict: args.returnDraftOnConflict,
       presentationSnapshot: args.presentationSnapshot, authoringSnapshot: args.authoringSnapshot,
     };
     return (async () => { try {
+      if (args.promptQueueIntent) {
+        // A restored renderer observes the original immutable application item;
+        // it must not rebuild that item's process/presentation hints as a retry.
+        const joined = await ipcRenderer.invoke('agent:join-automatic-send', { tabId: args.tabId,
+          handoffId: args.handoffId, prompt: args.prompt, promptQueueIntent: args.promptQueueIntent });
+        if (joined?.found) return joined.receipt;
+      }
       return await ipcRenderer.invoke('agent:enqueue-prompt', request);
     } catch (error: any) {
       // A lost IPC response may follow a committed admission. Keep this exact

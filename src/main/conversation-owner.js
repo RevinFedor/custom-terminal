@@ -4,6 +4,7 @@
 // This small durable checkpoint follows the existing main input/launch owners;
 // it does not launch, stop, read transcripts, or execute a send.
 const crypto = require('node:crypto');
+const { sameExecutionScope } = require('../shared/workflow-organization.cjs');
 const clone = value => value == null ? value : JSON.parse(JSON.stringify(value));
 const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const fail = code => { throw Object.assign(new Error(code), { code, statusCode: 409,
@@ -87,7 +88,10 @@ class ConversationOwners {
       if (record.transition?.instanceId === this.instanceId) return this.public(record, false);
       const bindingChanged = record.binding?.provider && (now.provider !== record.binding.provider
         || (record.binding.sessionId || null) !== (now.sessionId || null));
-      const locationChanged = record.scope && (record.scope.projectId !== now.projectId || record.scope.cwd !== now.cwd);
+      const independent = record.scope?.executionScope?.version === 2 || now.executionScope?.version === 2;
+      const locationChanged = record.scope && (independent
+        ? !sameExecutionScope(record.scope.executionScope,now.executionScope)
+        : record.scope.projectId !== now.projectId || record.scope.cwd !== now.cwd);
       const foreignLaunch = !!now.launchId && !this.sameLaunch(record.scope, now);
       // Own Resume may discover a child writer. Main supplies this ONLY from
       // its existing exact current-launch/source proof, never lineage alone.

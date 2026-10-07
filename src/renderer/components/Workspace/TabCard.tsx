@@ -13,9 +13,8 @@ import { isErrorToast } from '../../utils/toastPlacement.mjs';
 import { useTabWorkContext } from '../../utils/tabWorkContext';
 import {
   TabProcessBar, TabStatusMarker, TabStatusMarkerButton, TabTopLeftSignals,
-  TabContextUpdateBadge, TabCompletionNotificationAlert, TabCompletionNotificationBadge,
+  TabContextUpdateBadge, TabCompletionNotificationBadge,
   TabSessionAvailabilityMarker, TabTaskMarker, useTabActivitySignals, useTabContextUsage,
-  useTabCompletionNotificationDismissing, resolveTabCompletionNotificationShadow,
   TAB_CONTEXT_UPDATE_INSET_PX,
   TAB_PROCESS_BAR_W_PX,
   TASK_MARKER_GAP_PX, TASK_MARKER_LANE_HEIGHT_PX, TASK_MARKER_DEFAULT_COLOR,
@@ -23,6 +22,8 @@ import {
   type SharedTabActivityMaps,
 } from './TabSignals';
 import TabPendingOperation, { resolveTabPendingOperationLabel } from './TabPendingOperation';
+import TabLinkedFiles, { useTabLinkedFiles, type LinkedFile } from './TabLinkedFiles';
+import { isLinkedFilePreview } from '../../utils/tabLinkedFiles.mjs';
 
 type Activity = { hasProcess: boolean; busy: boolean; inheritedBusy: boolean };
 export interface TabCardProps extends React.HTMLAttributes<HTMLElement> {
@@ -49,6 +50,8 @@ export interface TabCardProps extends React.HTMLAttributes<HTMLElement> {
   geometry?: { paddingY: number; paddingX: number; paddingLeft: number; borderRadius: number; gap?: number };
   fontSize?: number;
   onTaskClick?: (taskId: string, event: React.MouseEvent<HTMLButtonElement>) => void;
+  /** Opt-in only for placed pane cards; other consumers keep their own lanes. */
+  onLinkedFileOpen?: (file: LinkedFile) => void;
 }
 
 /** The visual card and its live signals; each surface owns navigation/drag/selection. */
@@ -57,9 +60,12 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   pressed = false, fullWidth = false, truncate = true, showShownStripe = false,
   showProjectIcon = false, showTaskMarkers = true, reserveSignalSpace = false, interactiveStatus = false, chooser = false,
   label, children, trailingActions, sharedActivity = null, activityOverride,
-  geometry, fontSize, onTaskClick, style, onMouseEnter, onMouseLeave, ...elementProps
+  geometry, fontSize, onTaskClick, onLinkedFileOpen, style, onMouseEnter, onMouseLeave, ...elementProps
 }, ref) {
   const [hovered, setHovered] = useState(false);
+  const linkedFiles = useTabLinkedFiles(tabId, !!onLinkedFileOpen);
+  const hasLinkedFiles = linkedFiles.length > 0;
+  const fileSelected = useUIStore(s => !!onLinkedFileOpen && isLinkedFilePreview(s.filePreview, tabId));
   // Primitive subscriptions also observe in-place rename/status updates.
   const tabName = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.name || '');
   const tabColor = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.color);
@@ -72,7 +78,11 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   const sdkAlive = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.sdkProcessAlive === true);
   const aiClosing = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.aiClosing === true);
   const pendingOperation = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.pendingOperation);
-  const statusId = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus);
+  const statusId = useWorkspaceStore(s => {
+    const own = s.openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus;
+    const id = s.globalGroups?.tabGroups?.[tabId];
+    return own || (id && s.globalGroups.groups.find((group:any) => group.id === id)?.sessionStatus) || undefined;
+  });
   const armed = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.completionNotificationArmed === true);
   const fired = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.completionNotificationFired === true);
   const persistent = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.completionNotificationPersistent === true);
@@ -107,12 +117,15 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     claudeSessionId, codexSessionId, geminiSessionId }));
   const muted = sessionDerivedSignalsStale(availability, sdkAlive || (activity.hasProcess
     && (commandType === 'claude' || commandType === 'codex' || commandType === 'gemini')));
-  const dismissing = useTabCompletionNotificationDismissing(fired);
   const contextPct = useTabContextUsage(tabId);
   const contextUpdate = useTabWorkContext(tabId).pendingCount > 0;
   const fastActive = resolveCodexFastModeState({ currentSessionId: settingsSessionId || tierSessionId || codexSessionId,
     serviceTierSessionId: tierSessionId, serviceTier }).active;
-  const chrome = getTabChromeColorConfig({ color: tabColor, tabType });
+  const groupColor = useWorkspaceStore(state => {
+    const id = state.globalGroups?.tabGroups?.[tabId];
+    return id ? state.globalGroups.groups.find((group:any) => group.id === id)?.color : undefined;
+  });
+  const chrome = getTabChromeColorConfig({ color: tabColor || groupColor, tabType });
   const metrics = resolveTabCardMetrics({ ...geo,
     paddingLeft: Math.max(geo.paddingLeft, contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 0),
   }, { fontSize: fontSize ?? configuredFontSize, showTaskLane: taskItems.length > 0, hasStatusMarker: !!status || contextUpdate,
@@ -123,12 +136,13 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     minPaddingRight: processBarPosition === 'right' ? TAB_PROCESS_BAR_W_PX : 0,
   });
   const pending = resolveTabPendingOperationLabel({ aiClosing, pendingOperation });
-  const shadows = [resolveTabCompletionNotificationShadow({ armed: armed && !fired, fired }),
-    showShownStripe && (shown || pressed) ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)' : null,
-    sessionAvailabilityRailShadow(availability)].filter(Boolean).join(', ') || undefined;
+  const linkedFileHeight = Math.max(15, Math.ceil(metrics.fontSize * .72) + 4);
+  const shadows = [showShownStripe && (shown || pressed) ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)' : null,
+    sessionAvailabilityRailShadow(availability), fileSelected ? 'inset 0 0 0 1px #b6a1e8' : null].filter(Boolean).join(', ') || undefined;
   const frameStyle: React.CSSProperties = {
     position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 4,
-    flexShrink: fullWidth ? 1 : 0, minWidth: 0, width: fullWidth ? '100%' : undefined,
+    flexShrink: fullWidth ? 1 : 0, minWidth: hasLinkedFiles ? Math.max(40, metrics.fontSize * 2.5)
+      + (contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX - 6 : 0) : 0, width: fullWidth ? '100%' : undefined,
     whiteSpace: 'nowrap', boxSizing: 'border-box', textAlign: 'left',
     fontSize: metrics.fontSize, lineHeight: TAB_CARD_LINE_HEIGHT,
     color: active || selected || shown || pressed || hovered ? '#e8e8e8' : '#9b9ba1',
@@ -137,14 +151,19 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     }, adjustRgbaAlpha)), backgroundImage: sessionAvailabilityBackgroundImage(availability), boxShadow: shadows,
     border: hiddenErrors > 0 ? '1px solid #f87171'
       : `1px solid ${/^#[\da-f]{6}$/i.test(chrome.borderColor) ? chrome.borderColor + '55' : '#6666'}`,
-    borderRadius: metrics.borderRadius, padding: metrics.padding,
+    borderRadius: metrics.borderRadius,
+    // A real reserved lane keeps task markers above the border-mounted chip.
+    // Its size is independent of menu visibility, so opening cannot rewrap.
+    padding: hasLinkedFiles ? metrics.padding.split(' ').map((value, index) => index === 2
+      ? `${parseFloat(value) + linkedFileHeight / 2 + (taskItems.length ? TASK_MARKER_LANE_HEIGHT_PX : 0)}px`
+      : value).join(' ') : metrics.padding,
+    ...(hasLinkedFiles ? { '--tab-linked-file-height': `${linkedFileHeight}px` } as React.CSSProperties : {}),
     marginTop: reserveSignalSpace ? Math.max(0, tabFastBadgeOutsidePx(geo.gap ?? 4) - 1) : undefined,
-    marginBottom: reserveSignalSpace ? Math.max(0, -metrics.laneBottomPx,
+    marginBottom: hasLinkedFiles || reserveSignalSpace ? Math.max(hasLinkedFiles ? linkedFileHeight / 2 + 2 : 0, -metrics.laneBottomPx,
       contextUpdate ? tabFastBadgeOutsidePx(geo.gap ?? 4) - 1 : 0) : undefined,
     transition: 'none', ...style,
   };
   const contents = <>
-    <TabCompletionNotificationAlert fired={fired} dismissing={dismissing} borderRadius={metrics.borderRadius} />
     {!chooser && <TabProcessBar {...activity} radius={metrics.borderRadius} zIndex={4} />}
     <TabTopLeftSignals fastActive={fastActive} contextPct={contextPct} minContextPct={50} zIndex={8} muted={muted} />
     <TabContextUpdateBadge active={contextUpdate} />
@@ -162,15 +181,18 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     <TabSessionAvailabilityMarker availability={availability} size={10} />
     {trailingActions}
     {taskItems.length > 0 && <span data-task-plan-tab-markers style={{ position: 'absolute',
-      left: contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 6, right: 6, bottom: metrics.laneBottomPx,
+      left: contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 6, right: 6, bottom: hasLinkedFiles ? linkedFileHeight / 2 : metrics.laneBottomPx,
       height: TASK_MARKER_LANE_HEIGHT_PX, display: 'flex', alignItems: 'flex-end', gap: TASK_MARKER_GAP_PX,
       overflow: 'hidden', pointerEvents: 'none', zIndex: 7 }}>
       {taskItems.map(task => <TabTaskMarker key={task.id} color={taskStatuses.find(s => s.id === task.statusId)?.color || TASK_MARKER_DEFAULT_COLOR}
         shape={taskShape} title={task.title} onClick={onTaskClick ? event => onTaskClick(task.id, event) : undefined} />)}
     </span>}
+    {onLinkedFileOpen && hasLinkedFiles && <TabLinkedFiles ownerTabId={tabId} files={linkedFiles} onOpen={onLinkedFileOpen}
+      insetLeft={contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 6} />}
   </>;
   return React.createElement(as, { ...elementProps, ref, ...(as === 'button' ? { type: 'button' } : {}),
-    'data-tab-card': tabId, 'data-tab-session-availability': availability.state === 'none' ? undefined : availability.state,
+    'data-tab-card': tabId, 'data-linked-file-owner-selected': fileSelected ? '1' : undefined,
+    'data-tab-session-availability': availability.state === 'none' ? undefined : availability.state,
     onMouseEnter: (event: React.MouseEvent<HTMLElement>) => { setHovered(true); onMouseEnter?.(event); },
     onMouseLeave: (event: React.MouseEvent<HTMLElement>) => { setHovered(false); onMouseLeave?.(event); },
     style: frameStyle }, contents);
@@ -182,7 +204,7 @@ const ChooserTabCard = forwardRef<HTMLElement, TabCardProps>(function ChooserTab
   projectId, tabId, as = 'span', shown, active, selected, pressed, fullWidth, truncate = true,
   showShownStripe, showProjectIcon, showTaskMarkers: _showTaskMarkers, reserveSignalSpace: _reserveSignalSpace, interactiveStatus: _interactiveStatus, chooser: _chooser,
   label, children, trailingActions, sharedActivity: _sharedActivity, activityOverride: _activity,
-  geometry, fontSize, onTaskClick: _onTaskClick, style, onMouseEnter, onMouseLeave, ...props
+  geometry, fontSize, onTaskClick: _onTaskClick, onLinkedFileOpen: _onLinkedFileOpen, style, onMouseEnter, onMouseLeave, ...props
 }, ref) {
   const configuredGeometry = useUIStore(s => s.tabGeometry);
   const configuredFont = useUIStore(s => s.tabsFontSize);

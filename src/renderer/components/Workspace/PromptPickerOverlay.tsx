@@ -1,7 +1,8 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Copy, ChevronLeft, ChevronRight, Link2, MessageSquareQuote } from 'lucide-react';
+import { Copy, ChevronLeft, ChevronRight, Link2, MessageSquareQuote, FolderPlus, Settings2 } from 'lucide-react';
+import { loadPickerPromptCatalog, promptCatalogChangeAffectsTarget, promptRootChoices, togglePromptRoot, tabPromptBindingRequest, validatePromptRootSnapshot } from './promptTabSourcesModel.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { buildPromptOutline } from '../UI/promptOutlineModel.mjs';
@@ -626,7 +627,16 @@ const PromptPickerOverlay: React.FC = () => {
     setGroups(library.groups);
   }), []);
   const [projectCatalog, setProjectCatalog] = useState<ProjectPromptCatalog | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const organizationReady = useWorkspaceStore(s => s.organizationReady);
+  const [catalogRevision, setCatalogRevision] = useState(0);
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [sourceSnapshot, setSourceSnapshot] = useState<any>(null);
+  const [sourceRootIds, setSourceRootIds] = useState<string[]>([]);
+  const [sourceBusy, setSourceBusy] = useState(false);
+  const [sourceError, setSourceError] = useState('');
+  const sourceOperationRef = useRef(false);
+  const [libraryLoaded, setLibraryLoaded] = useState(false);
+  const [catalogLoadedKey, setCatalogLoadedKey] = useState<string | null>(null);
   const [contextRequest, setContextRequest] = useState<HistoryInsertMenuRequest | null>(null);
   const [shortcutTarget, setShortcutTarget] = useState<InsertTarget | null>(null);
   const [shortcutAnchor, setShortcutAnchor] = useState<PickerAnchor | null>(null);
@@ -819,6 +829,9 @@ const PromptPickerOverlay: React.FC = () => {
   //                user-controlled offset (Settings → "Picker — отступ снизу").
   const anchor = contextRequest?.anchor || shortcutAnchor || DEFAULT_PICKER_ANCHOR;
   const pickerProjectId = contextRequest?.projectId || shortcutTarget?.projectId || null;
+  const pickerTabId = contextRequest?.tabId || shortcutTarget?.tabId || null;
+  const catalogTargetKey = JSON.stringify([organizationReady, pickerTabId, pickerProjectId, contextRequest?.requestId]);
+  const loaded = libraryLoaded && catalogLoadedKey === catalogTargetKey;
   const cascadeOpensLeft = anchor.mode === 'point' && openLeftRef.current;
   const cascadeDirection = useMemo(
     () => resolveCascadingMenuDirection(cascadeOpensLeft),
@@ -829,32 +842,143 @@ const PromptPickerOverlay: React.FC = () => {
     if (!open) return;
     let cancelled = false;
     const libraryGeneration = libraryReceiver.generation();
-    setLoaded(false);
+    setLibraryLoaded(false);
     (async () => {
       try {
-        const [pr, gr, projectResult] = await Promise.all([
+        const [pr, gr] = await Promise.all([
           ipcRenderer.invoke('prompts:get'),
           ipcRenderer.invoke('prompt-groups:get'),
-          pickerProjectId
-            ? ipcRenderer.invoke('project-prompts:list', pickerProjectId)
-            : Promise.resolve(null),
         ]);
         if (cancelled) return;
         const promptsArr: PromptRow[] = pr?.success ? (pr.data || []) : [];
         const groupsArr: PromptGroupRow[] = gr?.success ? (gr.data || []) : [];
         libraryReceiver.receiveLoad({ prompts: promptsArr, groups: groupsArr }, libraryGeneration);
-        setProjectCatalog(projectResult?.success ? projectResult.data : null);
-        setLoaded(true);
+        setLibraryLoaded(true);
       } catch (err) {
         if (cancelled) return;
         console.warn('[PromptPicker] load failed:', err);
         libraryReceiver.receiveLoad({ prompts: [], groups: [] }, libraryGeneration);
-        setProjectCatalog(null);
-        setLoaded(true);
+        setLibraryLoaded(true);
       }
     })();
     return () => { cancelled = true; };
-  }, [open, contextRequest?.requestId, pickerProjectId, libraryReceiver]);
+  }, [open, contextRequest?.requestId, libraryReceiver]);
+
+  useEffect(() => {
+    if (!open) { setCatalogLoadedKey(null); return; }
+    let cancelled = false;
+    if (catalogLoadedKey !== catalogTargetKey) setProjectCatalog(null);
+    // Filesystem refreshes keep the loaded library and editor in place.
+    void loadPickerPromptCatalog(ipcRenderer, { tabId: pickerTabId, projectId: pickerProjectId, organizationReady })
+      .then(catalog => {
+        if (cancelled) return;
+        setProjectCatalog(catalog);
+        setCatalogLoadedKey(catalogTargetKey);
+      }).catch(error => {
+        if (cancelled) return;
+        console.warn('[PromptPicker] tab catalog load failed:', error);
+        showToast(String(error.message || error), 'error');
+        setProjectCatalog(null);
+        setCatalogLoadedKey(catalogTargetKey);
+      });
+    return () => { cancelled = true; };
+  }, [open, catalogTargetKey, pickerProjectId, pickerTabId, organizationReady, catalogRevision, showToast]);
+
+  useEffect(() => {
+    if (!open) return;
+    const changed = (_event: unknown, change: any) => {
+      if (promptCatalogChangeAffectsTarget(change, { tabId: pickerTabId, projectId: pickerProjectId, organizationReady })) {
+        setCatalogRevision(value => value + 1);
+      }
+    };
+    ipcRenderer.on('project-prompts:changed', changed);
+    return () => {
+      ipcRenderer.removeListener('project-prompts:changed', changed);
+    };
+  }, [open, pickerTabId, pickerProjectId, organizationReady]);
+
+  useEffect(() => {
+    setSourcesOpen(false);
+    setSourceSnapshot(null);
+    setSourceError('');
+  }, [open, pickerTabId, contextRequest?.requestId]);
+
+  const openSourceEditor = useCallback(async () => {
+    if (!pickerTabId || sourceOperationRef.current) return;
+    const generation = activePickerGenerationRef.current;
+    sourceOperationRef.current = true;
+    setSourcesOpen(true);
+    setSourceSnapshot(null);
+    setSourceBusy(true);
+    setSourceError('');
+    try {
+      const snapshot = await ipcRenderer.invoke('workflow:tab-roots', pickerTabId);
+      if (!isCurrentPickerGeneration(activePickerGenerationRef.current, generation)) return;
+      validatePromptRootSnapshot(snapshot);
+      setSourceSnapshot(snapshot);
+      setSourceRootIds(snapshot.rootIds || []);
+    } catch (error) {
+      if (isCurrentPickerGeneration(activePickerGenerationRef.current, generation)) setSourceError(String(error));
+    } finally {
+      sourceOperationRef.current = false;
+      setSourceBusy(false);
+    }
+  }, [pickerTabId]);
+
+  const saveTabSources = useCallback(async () => {
+    if (!pickerTabId || !sourceSnapshot || sourceOperationRef.current) return;
+    const generation = activePickerGenerationRef.current;
+    sourceOperationRef.current = true;
+    setSourceBusy(true);
+    setSourceError('');
+    try {
+      const request = tabPromptBindingRequest(sourceSnapshot, pickerTabId, sourceRootIds, crypto.randomUUID());
+      const result = await ipcRenderer.invoke('project-prompts:set-tab-sources', request);
+      if (!result?.success) throw new Error(result?.error || 'Unable to save prompt sources');
+      if (!isCurrentPickerGeneration(activePickerGenerationRef.current, generation)) return;
+      setSourcesOpen(false);
+      setCatalogRevision(value => value + 1);
+    } catch (error) {
+      if (!isCurrentPickerGeneration(activePickerGenerationRef.current, generation)) return;
+      setSourceError(`${String(error)}. Нажмите «Обновить», чтобы загрузить актуальный список.`);
+    } finally {
+      sourceOperationRef.current = false;
+      setSourceBusy(false);
+    }
+  }, [pickerTabId, sourceSnapshot, sourceRootIds]);
+
+  const addPromptFolder = useCallback(async () => {
+    if (!pickerTabId || !sourceSnapshot || sourceOperationRef.current) return;
+    const generation = activePickerGenerationRef.current;
+    sourceOperationRef.current = true;
+    setSourceBusy(true);
+    setSourceError('');
+    try {
+      const folder = await ipcRenderer.invoke('app:select-directory');
+      if (!folder || !isCurrentPickerGeneration(activePickerGenerationRef.current, generation)) return;
+      const existing = (sourceSnapshot.roots || []).find((root: any) => root.path === folder);
+      if (existing) {
+        setSourceRootIds(current => togglePromptRoot(current, existing.id, true));
+        return;
+      }
+      const saved = await ipcRenderer.invoke('workflow:save-root', {
+        path: folder, kind: 'prompt-source', enabled: true,
+        mutationId: crypto.randomUUID(), expectedRevision: sourceSnapshot.revision,
+      });
+      const snapshot = await ipcRenderer.invoke('workflow:tab-roots', pickerTabId);
+      if (!isCurrentPickerGeneration(activePickerGenerationRef.current, generation)) return;
+      validatePromptRootSnapshot(snapshot);
+      if (!saved?.id) throw new Error('Unable to register prompt folder');
+      if (snapshot.revision !== saved.revision) throw new Error('Список источников изменился. Обновите его и повторите выбор. Папка уже добавлена в список.');
+      setSourceSnapshot(snapshot);
+      setSourceRootIds(current => togglePromptRoot(current, saved.id, true));
+    } catch (error) {
+      if (isCurrentPickerGeneration(activePickerGenerationRef.current, generation)) setSourceError(String(error));
+    } finally {
+      sourceOperationRef.current = false;
+      setSourceBusy(false);
+    }
+  }, [pickerTabId, sourceSnapshot]);
 
   useEffect(() => {
     if (!open) return;
@@ -1184,6 +1308,14 @@ const PromptPickerOverlay: React.FC = () => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       const k = e.key;
+      if (sourcesOpen) {
+        if (k === 'Escape') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          if (!sourceOperationRef.current) setSourcesOpen(false);
+        }
+        return;
+      }
       const navKey = k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft'
         || k === 'ArrowRight' || k === 'Enter' || k === 'Escape';
       if (!navKey) return;
@@ -1334,6 +1466,7 @@ const PromptPickerOverlay: React.FC = () => {
     selectedPromptIdx,
     selectedRoot,
     selectedScriptIdx,
+    sourcesOpen,
   ]);
 
   // Click-outside to close. No visual backdrop — just a listener.
@@ -1596,6 +1729,10 @@ const PromptPickerOverlay: React.FC = () => {
     selectedKey,
     selectedLeftItem,
     selectedRoot,
+    sourcesOpen,
+    sourceSnapshot,
+    sourceBusy,
+    sourceError,
   ]);
 
   if (!open) return null;
@@ -1812,6 +1949,15 @@ const PromptPickerOverlay: React.FC = () => {
     fontStyle: 'italic',
     userSelect: 'none',
   };
+  const sourceButtonStyle: React.CSSProperties = {
+    border: '1px solid rgba(167,139,250,0.28)',
+    background: '#24212e',
+    color: '#ddd6fe',
+    borderRadius: 4,
+    padding: '4px 7px',
+    fontSize: Math.max(10, fontSize - 1),
+    cursor: sourceBusy ? 'default' : 'pointer',
+  };
 
   // Right panel positioning style. Wrapper is `relative` (height matches left
   // panel via flex-stretch), inner panel is absolute so it can overflow above
@@ -1918,6 +2064,7 @@ const PromptPickerOverlay: React.FC = () => {
       data-prompt-picker
       data-prompt-picker-mode={contextMode ? 'history-context' : 'shortcut'}
       data-prompt-picker-target-tab-id={contextRequest?.tabId || shortcutTarget?.tabId || ''}
+      onKeyDown={sourcesOpen ? event => event.stopPropagation() : undefined}
     >
       {contextMode && (
         <div ref={rootPanelRef} style={{ ...panelStyle, width: ROOT_W }}>
@@ -1979,13 +2126,57 @@ const PromptPickerOverlay: React.FC = () => {
           onScroll={queueContextGeometryRefresh}
         >
           {renderPromptPanelResizeHandle('primary')}
-          {!loaded && (
+          {organizationReady && pickerTabId && (
+            <div style={{ padding: '3px 7px', borderBottom: '1px solid rgba(167,139,250,0.14)' }}>
+              <button
+                type="button"
+                data-prompt-tab-sources-action
+                onClick={() => { if (!sourceOperationRef.current) { if (sourcesOpen) setSourcesOpen(false); else void openSourceEditor(); } }}
+                style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', padding: '4px 0', border: 0, background: 'transparent', color: '#a78bfa', fontSize, cursor: 'pointer' }}
+              >
+                <Settings2 size={14} /> Источники вкладки
+              </button>
+            </div>
+          )}
+          {sourcesOpen && (
+            <div data-prompt-tab-sources-editor role="group" aria-label="Источники промптов вкладки" aria-busy={sourceBusy} style={{ padding: '7px', fontSize }}>
+              {!sourceSnapshot && sourceBusy && <div style={placeholderStyle}>Loading…</div>}
+              {sourceSnapshot && promptRootChoices(sourceSnapshot).map((root: any) => {
+                const checked = sourceRootIds.includes(root.id);
+                const status = root.removed ? 'Удалена из списка' : root.enabled === false ? 'Выключена' : root.exists === false ? 'Папка недоступна' : root.docsExists === false ? 'Нет docs' : '';
+                return (
+                  <label key={root.id} title={root.path} style={{ display: 'flex', gap: 7, padding: '5px 0', alignItems: 'flex-start', color: '#ddd', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={sourceBusy || (root.removed && !checked)}
+                      onChange={event => setSourceRootIds(current => togglePromptRoot(current, root.id, event.target.checked))}
+                      data-prompt-source-root-id={root.id}
+                    />
+                    <span style={{ minWidth: 0 }}>
+                      <span style={{ display: 'block', overflowWrap: 'anywhere' }}>{root.name || root.sourceName || root.path}</span>
+                      <span style={{ display: 'block', fontSize: Math.max(9, fontSize - 2), color: '#888', overflowWrap: 'anywhere' }}>{root.path}{status ? ` · ${status}` : ''}</span>
+                    </span>
+                  </label>
+                );
+              })}
+              {sourceError && <div role="alert" style={{ color: '#fca5a5', padding: '6px 0', overflowWrap: 'anywhere' }}>{sourceError}</div>}
+              <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', paddingTop: 7 }}>
+                <button type="button" disabled={sourceBusy || !sourceSnapshot} onClick={() => { void addPromptFolder(); }} style={{ ...sourceButtonStyle, display: 'flex', alignItems: 'center', gap: 5 }}><FolderPlus size={13} /> Папка…</button>
+                <button type="button" disabled={sourceBusy || !sourceSnapshot} onClick={() => { void saveTabSources(); }} style={sourceButtonStyle}>Сохранить</button>
+                <button type="button" disabled={sourceBusy} onClick={() => setSourcesOpen(false)} style={sourceButtonStyle}>Отмена</button>
+                {sourceError && <button type="button" disabled={sourceBusy} onClick={() => { void openSourceEditor(); }} style={sourceButtonStyle}>Обновить</button>}
+              </div>
+              {sourceBusy && sourceSnapshot && <div role="status" style={placeholderStyle}>Сохранение…</div>}
+            </div>
+          )}
+          {!sourcesOpen && !loaded && (
             <div style={placeholderStyle}>Loading…</div>
           )}
-          {loaded && flatLeft.length === 0 && (
+          {!sourcesOpen && loaded && flatLeft.length === 0 && (
             <div style={placeholderStyle}>No prompts</div>
           )}
-          {loaded && flatLeft.map((item) => {
+          {!sourcesOpen && loaded && flatLeft.map((item) => {
             if (item.kind === 'project') {
               const key = `project:${item.project.id}`;
               const isSelectedActive = selectedKey === key && pickerLevel === 'group';
@@ -2122,7 +2313,7 @@ const PromptPickerOverlay: React.FC = () => {
       )}
 
       {/* Context descendants are independent floating surfaces. */}
-      {promptLibraryVisible && contextMode && (selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
+      {promptLibraryVisible && !sourcesOpen && contextMode && (selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
           <div
             ref={rightPanelRef}
             style={{ ...panelStyle, width: RIGHT_W, ...contextRightPanelPositionStyle }}
@@ -2171,7 +2362,7 @@ const PromptPickerOverlay: React.FC = () => {
           and its History/composer anchor do not recenter or teleport. */}
       {promptLibraryVisible && !contextMode && (
         <div style={rightWrapperStyle}>
-          {(selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
+          {!sourcesOpen && (selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
             <div ref={rightPanelRef} style={{ ...panelStyle, ...rightPanelPositionStyle }}>
               {renderPromptPanelResizeHandle('secondary')}
               {rightPrompts.length > 0 && rightPrompts.map((p, i) => {

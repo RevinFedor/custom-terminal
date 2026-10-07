@@ -55,6 +55,21 @@ test('restore does not mutate the pre-close snapshot or take a manually reparent
   assert.equal(f.workspace.tabs.get('child').visualParentTabId, 'right');
 });
 
+test('a visual file subtree closes with its owner, but never traverses a surviving session', () => {
+  const original = new Map([
+    ['owner', tab('owner')],
+    ['file', { ...tab('file', 'owner'), tabType: 'file' }],
+    ['nested-file', { ...tab('nested-file', 'file'), tabType: 'file' }],
+    ['session', { ...tab('session', 'file'), tabType: 'terminal' }],
+    ['session-file', { ...tab('session-file', 'session'), tabType: 'file' }],
+  ]);
+  const next = tabsAfterClose(original, 'owner');
+  assert.deepEqual([...next.keys()], ['session', 'session-file']);
+  assert.equal(next.get('session').visualParentTabId, undefined);
+  assert.equal(next.get('session-file').visualParentTabId, 'session');
+  assert.equal(original.get('session').visualParentTabId, 'file');
+});
+
 test('removed group is not recreated; absent parent leaves the restored tab accessible', () => {
   const f = fixture(), p = close(f, 'child');
   close(f, 'parent'); f.workspace.tabGroups = [];

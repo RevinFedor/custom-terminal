@@ -44,6 +44,13 @@ side-terminal/overflow передана владельцу4196, не чинит�
 
 ## Второй Codex Rewind терял writer после успешного handoff
 
+Для lazy draft есть независимый same-source путь: exact следующий submit может
+продолжить прежний rollout без child. Incumbent остаётся защитой до durable
+task/first-user + исходного submit tuple, но не должен заслонять этот proof
+навсегда. Live и startup используют общий scanner/classifier/DB CAS; принятие
+continued source не утверждает rollback. См. `fact-codex.md::Продолжившийся source
+после возвращённого Rewind draft`; второй Rewind по-прежнему требует свежий writer.
+
 Пользовательский симптом: первый Rewind A→B проходил, но немедленный второй отвечал
 `Codex writer is not ready for Rewind`, хотя вкладка продолжала работать в B. Первый
 commit правильно менял SQLite binding и потреблял durable handoff journal, однако
@@ -277,6 +284,9 @@ length+transport hash, прежняя файловая граница и runSeq,
 binding и полном no-descendant scan. `submit-armed`, другой prompt/path/binding
 или неполная запись остаются fail-closed; journal удаляется атомарным
 compare-and-delete, а не отдельной очисткой.
+Полнота negative descendant proof не ограничивается первыми2минутами action:
+continued-source путь повторно сверяет текущий каталог после transcript IO.
+Успех scanner/receipt не подменяет исторический rollback или clean saved prefix.
 
 Для старых v2/v1 receipts без `originPhase` требуется совместимое чтение
 прежней stable-source формы, а не TTL-clear или синтез нового receipt. Полная

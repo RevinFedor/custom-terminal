@@ -58,23 +58,33 @@ test('actual global chip renders delete/native Rewind without mounting the owner
   assert.match(renderToStaticMarkup(React.createElement(Native)), /data-background-tab-operation="REWIND"/);
 });
 
-test('actual completed chip navigates to its owner and dismisses only that completed operation', () => {
+test('actual completed chip dismisses only after successful async owner navigation', async () => {
   const op = activity.beginHistoryOperationActivity({ tabId: 'A', kind: 'rewind' });
   op.finish();
   const state = stateFor();
   const calls = [];
-  for (const key of ['showWorkspace', 'setViewingSubAgent', 'placeTab', 'setProjectView']) {
-    state[key] = (...args) => calls.push([key, ...args]);
-  }
+  let resolve;
+  state.openTabById = (id, options) => {
+    calls.push([id, options]);
+    return new Promise(done => { resolve = done; });
+  };
   const hookless = { ...React, useSyncExternalStore: (_subscribe, get) => get(),
     useMemo: fn => fn(), useEffect() {} };
   const tree = component(state, {}, hookless)();
   const chips = React.Children.toArray(tree.props.children);
   assert.equal(chips[0].props.label, 'REWIND ГОТОВ');
   let stopped = false;
-  chips[0].props.onOpen({ stopPropagation() { stopped = true; } });
+  const open = () => chips[0].props.onOpen({ stopPropagation() { stopped = true; } });
+  const failed = open();
   assert.equal(stopped, true);
-  assert.deepEqual(calls[2], ['placeTab', 'P', 'A']);
+  assert.deepEqual(calls[0], ['A', { reason: 'history-operation-owner' }]);
+  assert.equal(activity.getHistoryOperationActivities().length, 1, 'pending Promise is not success');
+  resolve(false);
+  await failed;
+  assert.equal(activity.getHistoryOperationActivities().length, 1, 'missing owner remains dismissible');
+  const successful = open();
+  resolve(true);
+  await successful;
   assert.equal(activity.getHistoryOperationActivities().length, 0);
 });
 

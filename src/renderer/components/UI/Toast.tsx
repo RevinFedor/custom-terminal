@@ -188,13 +188,11 @@ function DictationBackgroundStatus() {
   };
   if (owner.visible) return null;
 
-  const goToOwnerTab = (e: React.MouseEvent) => {
+  const goToOwnerTab = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    const store = useWorkspaceStore.getState();
-    if (openHistoryOperationOwner(store, ownerTabId)) return;
-    // The tab record can be gone mid-restore while the recording session
-    // still remembers its project — at least bring that project up.
-    if (dictation.owner?.projectId) store.showWorkspace(dictation.owner.projectId);
+    await openHistoryOperationOwner(useWorkspaceStore.getState(), ownerTabId, {
+      projectId: dictation.owner?.projectId, reason: 'recording-owner',
+    });
   };
 
   const tabName = owner.exists ? owner.tabName : (dictation.owner?.tabName || 'tab');
@@ -253,9 +251,9 @@ function DictationChipBackgroundStatus() {
         : row.failed > 0
           ? (row.error || 'не распозналось — чип в композере предложит повторить')
           : 'диктовка добавлена'}
-      onOpen={(event) => {
+      onOpen={async (event) => {
         event.stopPropagation();
-        openHistoryOperationOwner(useWorkspaceStore.getState(), row.tabId);
+        await openHistoryOperationOwner(useWorkspaceStore.getState(), row.tabId, { reason: 'dictation-chip-owner' });
       }}
     />
   ))}</>;

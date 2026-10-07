@@ -82,7 +82,20 @@
 # Noted Terminal
 
 ## Обзор
-Noted Terminal — кастомный эмулятор терминала на базе Electron с глубокой интеграцией AI-агентов (Claude Code — PTY + Agent SDK, Codex CLI) и управлением проектами. Единый Terminal MCP управляет полноценными вкладками и даёт cross-session доступ к истории Claude/Codex поверх тех же JSONL-парсеров, что Timeline.
+Noted Terminal — кастомный эмулятор терминала на базе Electron с глубокой интеграцией AI-агентов (Claude Code — PTY + Agent SDK, Codex CLI) и организацией вкладок в workflow. Единый Terminal MCP управляет полноценными вкладками и даёт cross-session доступ к истории Claude/Codex поверх тех же JSONL-парсеров, что Timeline.
+
+Workflow владеет организацией и окнами, а cwd и execution identity принадлежат
+вкладке. Перенос/резерв/удаление workflow не являются Project transfer, Resume,
+сменой cwd или повтором frozen operation. Legacy `projectId` остаётся точным
+адресом исполнения; его нельзя переименовать в workflowId. Для новых вкладок
+нужен независимый subject без Project FK. Не создавать скрытый Everything Project.
+См. `docs/knowledge/fact-workspace.md::Workflow, вкладка и исполнение`.
+
+Вторичные ссылки (Rewind-ready, RECORDING, сообщения, MCP, ресурсы, файлы)
+вызывают общий async `openTabById`: существующее место раскрывается в своём
+workflow/окне, резерв добавляется в запомненный workflow и последнее фокусное
+окно без замены соседних chips. ACK — только `await true`; поздний результат
+не забирает фокус после ухода пользователя. Явный add-here/DnD — другие действия.
 
 Основной рабочий сценарий — разработка сложных фич в параллельных AI-сессиях.
 Внутри окна вкладки всегда переносятся на несколько строк: важнее видеть их
@@ -119,7 +132,7 @@ UI-разделение сначала возвращает существующ
 - **Project API / History / iOS / Inbox API / Terminal MCP = сценарии поверх терминала:** отправка во время streaming, Stop/interrupt с возвратом draft, stopped-session Rewind, AskUserQuestion и readiness должны идти через общий scenario layer, а не дублироваться в клиентах.
 - **Межвкладочное взаимодействие = Project API:** `/api/tab-messages` связывает вопрос и адресный reply во время работы, без run/descendant зависимости. `/api/orchestrations` быстро принимает самостоятельное поручение, а сохранённый run завершается по SSE/lifecycle и переживает restart. Terminal MCP типизированно оборачивает эти сценарии; новый completion обычно содержит полный ответ, `get_delegation_result` нужен при явном reference/старом уведомлении или восстановлении. Не держи POST открытым, не опрашивай transcript и не читай terminal output для ожидания.
 - **Project API и Inbox API отличаются ownership input:** project/tab-клиенты управляют конкретной вкладкой и не очищают чужой TUI draft; Inbox/внешний чат владеет своим composer и может получить `draftText` наружу для rollback.
-- **Принятые обычные Send — Main FIFO, не Run After:** SQLite сохраняет неизменные текст/чипы/images до раннего application ACK. Mobile upload bytes имеют отдельную проверенную границу `attachmentOwnership`: Main импортирует image/document refs прежним asset owner до ACK; legacy path-only receipt такой гарантии не получает. В одной вкладке одновременно лишь одна наша неподтверждённая provider-отправка; `QUEUED` не освобождает slot, exact canonical receipt освобождает без ожидания конца streaming. Остальные — `IN APP QUEUE`; timeout/unknown не разрешают следующий Enter. Исполняет прежний общий send scenario, не компонент History. Slash и record-without-reply сохраняют отдельные границы; raw TUI ввод прозрачен. Wire и восстановление — `fact-terminal-mcp.md::Main FIFO принятых Send`.
+- **Принятые обычные Send — Main FIFO, не Run After:** SQLite сохраняет неизменные текст/чипы/images до раннего application ACK. Mobile upload bytes имеют отдельную проверенную границу `attachmentOwnership`: Main импортирует image/document refs прежним asset owner до ACK; legacy path-only receipt такой гарантии не получает. В одной вкладке одновременно лишь одна наша неподтверждённая provider-отправка; `QUEUED` не освобождает slot, exact canonical receipt освобождает без ожидания конца streaming. Остальные — `IN APP QUEUE`; timeout/unknown сами не разрешают следующий Enter. Только отдельное разрешение пользователя продолжить несмотря на исход одной exact старой записи допускает app-owned re-audit/release её slot: unknown/submitted/payload остаются, cancelled follower не оживает; глобальный auto-skip запрещён. Исполняет прежний общий send scenario, не компонент History. Slash и record-without-reply сохраняют отдельные границы; raw TUI ввод прозрачен. Wire и восстановление — `fact-terminal-mcp.md::Main FIFO принятых Send`.
 - **Codex submit не имеет pre-Enter ACK:** hidden renderer и PTY render marker не доказывают, что paste принят composer'ом. Для Codex external submit используй ordered PTY paste+Enter; после Enter committed `Messages to be submitted after next tool call` с приростом matching prompt доказывает native очередь (`queued`). Для обрезанного preview пользователь разрешил совпадение видимого префикса до `…`, включая разные скрытые хвосты, только при causal ownership/frame/count guards; это не полный ACK. Durable `sent` по-прежнему требует exact rollout `user_message`. До paste допустим только guard от чужого draft.
 - **Одна публичная AI-поверхность = Terminal MCP.** Live-команды, долговечная оркестрация, история/контекст, безопасный Claude edit/fork, структурированный план задач и file-child находятся в одном MCP, но внутри остаются разными API/scenario boundaries. Отдельный Overseer MCP удалён; `/overseer/*` пока внутренний backend чтения истории.
 - **Полноценная сессия ≠ внутренний subagent.** Встроенные Agent/subagent-инструменты Claude/Codex используй для временной декомпозиции. Terminal MCP создаёт отдельные видимые долгоживущие вкладки, которые переживают restart и доступны пользователю.
@@ -149,6 +162,7 @@ MCP-инструмент `docs_search` — вызови перед работо�
 Запрос на английском, описывай что собираешься делать: `"Claude process lifecycle kill restart PTY"`, `"JSONL editing fork parentUuid chain"`, `"paste sync marker TUI automation"`.
 
 ## Anti-Patterns (обязательно к соблюдению)
+- **Минимализм компактных показателей.** Не дублируй цветной статус одной иконки словом и дополнительным warning-значком. В небольших popover связанные подписи/числа объединяй через `/` в одну строку; очевидные заголовки и поясняющие абзацы не добавляй. Unknown/stale обозначай коротко, сохраняя различие со свежим замером.
 - **Zustand: Не подписывайся на Map целиком:** Подписка на `openProjects` вызывает ре-рендер всего приложения при любом изменении в любой вкладке (из-за `new Map` ссылки). Используй гранулярные селекторы (Fingerprint Pattern). См. [`fix-performance-lags.md`](docs/knowledge/fix-performance-lags.md).
 - **Карточку вкладки переиспользуй целиком:** `Workspace/TabCard.tsx` владеет визуальным профилем и live-индикаторами шапки, Run After и HiddenWindowPicker. Родитель задаёт действие/размер/`showProjectIcon`, не копирует JSX процентов, loader, статуса и задач. Chooser не подписывается на несуществующую сессию; passive-индикатор внутри picker остаётся частью hit target своей вкладки. У workflow отдельный общий `Workspace/WorkflowChip.tsx`: navbar и scope/picker переиспользуют его иконку, цвета и геометрию, но каждый caller сохраняет своё действие/selection/counters; chooser не наследует navigation/delete/DnD.
 - **O(n²) Restore Cascade:** При восстановлении сессии (множественное создание табов) обязательно используй флаг `isRestoring`. `createTab` не должен триггерить `set()` и `saveTabs()` внутри цикла восстановления.
@@ -194,7 +208,7 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **AI-Optimized UI & Video Forensics:**
   - Статус-индикаторы (лоадеры, пульсация) ДОЛЖНЫ быть детектируемы AI на видеозаписях (артефакты H.264/JPEG).
   - ИЗБЕГАЙ чистой анимации прозрачности (`animate-pulse`) — кодеки часто "съедают" такие изменения на темном фоне.
-  - ИСПОЛЬЗУЙ плавное свечение (`animate-glow-*`), которое меняет `background-color` напрямую. Это создает высокую дельту пикселей в каждом кадре.
+  - ИСПОЛЬЗУЙ плавное свечение (`animate-glow-*`) с видимой сменой цвета/ореола. Реализация не обязана покадрово менять `background-color`: compositor смешивает заранее нарисованные цветовые состояния, сохраняя контраст и непрозрачный текст. Чистое затухание всего элемента не заменяет этот сигнал.
   - Желтые индикаторы должны использовать янтарные тона (`#d97706`) вместо ярко-желтых для читаемости на темной теме.
   - Сопровождай анимацию статичным текстовым лейблом в ВЕРХНЕМ РЕГИСТРЕ (например, "REWINDING...", "BUSY") для 100% надежности OCR.
   - Текстовые лейблы должны быть черно-белыми, статичными (без анимации) и рендериться через **React Portals** с высоким `z-index`, чтобы их не перекрывали терминалы или сайдбары. См. [`Timeline.tsx`](src/renderer/components/Workspace/Timeline.tsx).
@@ -252,6 +266,8 @@ awk -v t="$UTC_HHMM" '$1 >= t":00" && $1 <= t":59"' logs/dev.log | grep ...
 - **Объяснение производительности — через работу, которую видит пользователь.** Скажи, что уже было готово и где (SSD, объекты в RAM, DOM, нарисованный слой), какой этап всё же выполнялся и сколько занял, почему это нужно либо лишнее и что изменит ремонт. «Рендер дорогой» и «кэш есть» недостаточны. Готовые данные на SSD занимают диск и требуют чтения/декодирования; готовый DOM в RAM не исключает пересчёт стилей/layout/paint. Не перекладывай на пользователя расшифровку имён функций.
 
 ## Тестирование
+
+- **Диск и RAM — разные бюджеты.** History acceleration удерживает до20GiB на диске суммарно по вкладкам/схемам; RAM allocation прежний. Ready rows, parser/payload state и compact Timeline/source certificate вытесняются независимо с учётом активности owner. Чип места считает `free − max(0, limit − used) < 6GiB`, не читает History и не удаляет пользовательские данные; это прогноз сохраняемого кэша, не peak reservation и не предел будущих сборок/переписок. Контракт — `fact-transcript-сервис.md` и `fact-resource-usage-panel.md`.
 - **Home поверх прогретого workspace:** не переключай наследуемую `visibility` и не ставь native `inert` на общий retained-предок ради скрытия. Сохраняй compositor opacity/stacking и существующую focus quarantine: готовый DOM иначе снова платит обход тысяч потомков. Проверять надо и hidden input/hit targets, и native style cost.
 - **Методология:** глобальный skill `electron-e2e-testing` (`~/.claude/skills/electron-e2e-testing/SKILL.md`) — базовые правила. Custom-terminal-specific (CDP 9224, JSONL-side, TUI-side, `terminal:input` IPC, native `dialog.showMessageBox` quirks) — `references/custom-terminal.md` этого skill'а.
 - **Сценарии:** [`~/Desktop/electron-mcp/scenarios/`](../electron-mcp/scenarios/) — пошаговые markdown-сценарии (fork, edit-range, delete-range, timeline UI, claude resume), агент исполняет их живьём. Это **исполняемый код**, не документация.

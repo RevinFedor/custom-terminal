@@ -29,7 +29,7 @@ import { REQUEST_SUCCESS_VISIBLE_MS, nextRequestSuccessExpiry } from '../../util
 import { RequestTrackerRow, RequestTrackerStatus, requestRowActionStyle, requestRowLinkStyle } from './RequestTrackerRow';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import type { OrchestrationRun, OrchestrationStatus } from '../../store/useOrchestrationStore';
-import { isOrchestrationResultProofPending } from '../../utils/orchestrationRunProjection.mjs';
+import { isOrchestrationResultProofPending, mergeOrchestrationRuns } from '../../utils/orchestrationRunProjection.mjs';
 import { orchestrationRequestTime, orchestrationDetailRows } from '../../utils/orchestrationDetails.mjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -37,6 +37,7 @@ const { ipcRenderer } = window.require('electron');
 type OrchestrationSettings = {
   codexCapacityRetryEnabled: boolean;
   codexCapacityRetryLimit: number;
+  codexCapacityRetryDelaysMs?: number[];
   failureGraceMs: number;
   successAutoStopMs: number;
   reactToManualInterrupt: boolean;
@@ -188,6 +189,9 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   }
   if (run.status === 'completed') return { color: '#4ade80', icon: 'success', label: 'Готово', spinning: false };
   if (run.status === 'cancelled') return { color: '#737373', icon: 'cancelled', label: 'Закрыто', spinning: false };
+  if (run.status === 'sending') {
+    return { color: '#fbbf24', icon: 'waiting', label: 'Ожидает доставки', spinning: false };
+  }
   if (run.status === 'queued' || run.status === 'sent') {
     return {
       color: '#fbbf24',
@@ -206,7 +210,6 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
     label: STATUS_LABEL[run.status],
     spinning: run.status === 'running'
       || run.status === 'starting'
-      || run.status === 'sending'
       || run.status === 'waiting_descendants',
   };
 }
@@ -274,6 +277,9 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const [actionError, setActionError] = useState<Record<string, string>>({});
   const [now, setNow] = useState(Date.now());
   const rootRef = useRef<HTMLDivElement>(null);
+  const settingsSaveChain = useRef<Promise<unknown>>(Promise.resolve());
+  const settingsSaveSequence = useRef(0);
+  const [settingsSaveError, setSettingsSaveError] = useState(false);
   const messagePreviewRef = useRef<HTMLElement>(null);
   const messages = useTabMessages(tabId);
   const [selectedMessage, setSelectedMessage] = useState<MessageSelection | null>(null);
@@ -297,14 +303,6 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     setHistoryOpen(false);
     setSettingsOpen(false);
     setSelectedMessage(null);
-    void ipcRenderer.invoke('orchestration:list-for-tab', tabId)
-      .then((items: OrchestrationRun[]) => {
-        if (alive) {
-          setRuns(Array.isArray(items) ? items : []);
-          setNow(Date.now());
-        }
-      })
-      .catch(() => {});
     void ipcRenderer.invoke('orchestration:get-settings')
       .then((value: OrchestrationSettings) => {
         if (alive && value) setSettings(value);
@@ -314,14 +312,18 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     const onChanged = (_event: unknown, payload: { run?: OrchestrationRun }) => {
       const run = payload?.run;
       if (!run || (run.sourceTabId !== tabId && run.targetTabId !== tabId)) return;
-      setRuns((current) => {
-        const next = current.filter((item) => item.runId !== run.runId);
-        next.push(run);
-        return next;
-      });
+      setRuns((current) => mergeOrchestrationRuns(current, [run]));
       setNow(Date.now());
     };
     ipcRenderer.on('orchestration:changed', onChanged);
+    void ipcRenderer.invoke('orchestration:list-for-tab', tabId)
+      .then((items: OrchestrationRun[]) => {
+        if (alive) {
+          setRuns((current) => mergeOrchestrationRuns(items, current));
+          setNow(Date.now());
+        }
+      })
+      .catch(() => {});
     return () => {
       alive = false;
       ipcRenderer.removeListener('orchestration:changed', onChanged);
@@ -401,31 +403,14 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     const projectId = isSource ? run.targetProjectId : run.sourceProjectId;
     const projectPath = isSource ? run.targetProjectPath : run.sourceProjectPath;
     const linkedTabId = isSource ? run.targetTabId : run.sourceTabId;
-    if (!projectId || !linkedTabId) return;
+    if (!linkedTabId) return;
 
     setHistoryOpen(false);
     closeMessage();
-    const state = useWorkspaceStore.getState();
-    let resolvedPath = projectPath || '';
-    if (!state.openProjects.has(projectId) && !resolvedPath) {
-      const project = await ipcRenderer.invoke('project:getById', projectId).catch(() => null);
-      resolvedPath = project?.path || '';
-    }
-    if (!state.openProjects.has(projectId)) {
-      if (!resolvedPath) return;
-      await state.openProject(projectId, resolvedPath, { background: false });
-    } else {
-      state.showWorkspace(projectId);
-    }
-    const latest = useWorkspaceStore.getState();
-    latest.setProjectView(projectId, 'terminal');
-    // «Открыть связанную вкладку» — обычный переход, и он обязан вести К
-    // ВКЛАДКЕ: если у неё уже есть окно (пусть даже в другом рабочем
-    // пространстве), меню показывает её ТАМ. Прямой `switchTab` этого не знал и
-    // отдавал вкладку текущему окну — то есть разбирал раскладку, которую
-    // человек собрал, ради одного клика по уведомлению. Тот же путь, что у
-    // бокового списка и `Ctrl+Tab`.
-    latest.placeTab(projectId, linkedTabId);
+    const opened = await useWorkspaceStore.getState().openTabById(linkedTabId, {
+      projectId, projectPath, reason: 'orchestration-linked-tab',
+    });
+    if (!opened) return;
     void ipcRenderer.invoke('orchestration:acknowledge', { runId: run.runId, tabId }).catch(() => {});
   }, [tabId, closeMessage]);
 
@@ -464,9 +449,14 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   }, [tabId]);
 
   const saveSettings = useCallback(async (patch: Partial<OrchestrationSettings>) => {
+    const sequence = ++settingsSaveSequence.current;
+    setSettingsSaveError(false);
     setSettings((current) => current ? { ...current, ...patch } : current);
-    const updated = await ipcRenderer.invoke('orchestration:update-settings', patch).catch(() => null);
-    if (updated) setSettings(updated);
+    const pending = settingsSaveChain.current.catch(() => {}).then(() => ipcRenderer.invoke('orchestration:update-settings', patch));
+    settingsSaveChain.current = pending;
+    const updated = await pending.catch(() => null);
+    if (updated && sequence === settingsSaveSequence.current) setSettings(updated);
+    if (!updated && sequence === settingsSaveSequence.current) setSettingsSaveError(true);
   }, []);
 
   const actionButton = (
@@ -680,13 +670,14 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   ) : null;
 
   const settingsPanel = settingsOpen && settings ? (
-    <aside data-orchestration-settings-panel role="dialog" aria-label="Настройки запросов" style={panelStyle}>
-      <div style={{ height: 34, padding: '0 7px 0 9px', display: 'flex', alignItems: 'center', gap: 7, borderBottom: '1px solid #303030' }}>
+    <aside data-orchestration-settings-panel role="dialog" aria-label="Настройки запросов"
+      style={{ ...panelStyle, maxHeight: 'min(560px, calc(100vh - 110px))', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ height: 34, flexShrink: 0, padding: '0 7px 0 9px', display: 'flex', alignItems: 'center', gap: 7, borderBottom: '1px solid #303030' }}>
         <Settings2 size={14} color="#a3a3a3" />
         <span style={{ flex: 1, fontSize: 11, fontWeight: 650 }}>Настройки запросов</span>
         <button type="button" aria-label="Закрыть" onClick={() => setSettingsOpen(false)} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: 0, background: 'transparent', color: '#999', cursor: 'pointer' }}><X size={14} /></button>
       </div>
-      <div style={{ padding: 10, display: 'grid', gap: 9, fontSize: 11 }}>
+      <div data-orchestration-settings-body className="scrollbar-thin" style={{ padding: 10, minHeight: 0, overflowY: 'auto', display: 'grid', gap: 9, fontSize: 11 }}>
         <label style={{ display: 'grid', gridTemplateColumns: '1fr 64px', alignItems: 'center', gap: 8, color: '#aaa' }}>
           Передать ошибку через, мин
           <input type="number" min={0} max={10080} value={minutes(settings.failureGraceMs)} onChange={(event) => void saveSettings({ failureGraceMs: Number(event.target.value) * 60_000 })} style={{ width: 64, background: '#1d1d1d', color: '#ddd', border: '1px solid #3b3b3b', borderRadius: 4, padding: '4px 6px' }} />
@@ -707,6 +698,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           <input type="checkbox" data-codex-capacity-retry-enabled checked={settings.codexCapacityRetryEnabled} onChange={(event) => void saveSettings({ codexCapacityRetryEnabled: event.target.checked })} />
           Продолжать при перегрузке модели
         </label>
+        <div data-codex-capacity-retry-options style={{ marginLeft: 18, paddingLeft: 10, borderLeft: '1px solid #404040', display: 'grid', gap: 9 }}>
         <label style={{ display: 'grid', gridTemplateColumns: '1fr 64px', alignItems: 'center', gap: 8, color: '#aaa' }}>
           Повторов без прогресса
           <input type="number" data-codex-capacity-retry-limit min={1} max={10} step={1} value={settings.codexCapacityRetryLimit} disabled={!settings.codexCapacityRetryEnabled} onChange={(event) => {
@@ -714,7 +706,31 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
             if (Number.isFinite(value)) void saveSettings({ codexCapacityRetryLimit: Math.max(1, Math.min(10, Math.trunc(value))) });
           }} style={{ width: 64, background: '#1d1d1d', color: '#ddd', border: '1px solid #3b3b3b', borderRadius: 4, padding: '4px 6px' }} />
         </label>
+        <div style={{ color: '#999' }}>Если перегрузка повторяется:</div>
+        {(settings.codexCapacityRetryDelaysMs || []).map((delay, index, delays) => (
+          <div key={index} data-codex-capacity-delay-row style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#aaa' }}>
+            <label style={{ display: 'flex', flex: 1, alignItems: 'center', gap: 6 }}>
+              <span style={{ flex: 1 }}>Затем через</span>
+              <input type="number" aria-label={'Задержка повтора ' + (index + 1)} data-codex-capacity-delay min={1} max={10080} step={1}
+                value={delay / 60_000} disabled={!settings.codexCapacityRetryEnabled}
+                onChange={event => {
+                  const value = Number(event.target.value);
+                  if (Number.isFinite(value)) void saveSettings({ codexCapacityRetryDelaysMs: delays.map((ms, i) =>
+                    i === index ? Math.max(1, Math.min(10080, Math.trunc(value))) * 60_000 : ms) });
+                }} style={{ width: 54, background: '#1d1d1d', color: '#ddd', border: '1px solid #3b3b3b', borderRadius: 4, padding: '4px 6px' }} />
+              <span>мин</span>
+            </label>
+            <button type="button" aria-label={'Удалить повтор ' + (index + 1)} disabled={!settings.codexCapacityRetryEnabled}
+              onClick={() => void saveSettings({ codexCapacityRetryDelaysMs: delays.filter((_, i) => i !== index) })}
+              style={{ border: 0, background: 'transparent', color: '#999', cursor: 'pointer' }}><X size={13} /></button>
+          </div>
+        ))}
+        <button type="button" data-codex-capacity-add-delay disabled={!settings.codexCapacityRetryEnabled || (settings.codexCapacityRetryDelaysMs?.length || 0) >= 10}
+          onClick={() => void saveSettings({ codexCapacityRetryDelaysMs: [...(settings.codexCapacityRetryDelaysMs || []), 60 * 60_000] })}
+          style={{ justifySelf: 'start', color: '#c084fc', background: 'transparent', border: 0, padding: 0, cursor: 'pointer' }}>+ Добавить повтор</button>
         <div style={{ color: '#777', lineHeight: 1.4 }}>Для Codex: после ответа или вызова инструмента отсчёт начинается заново.</div>
+        </div>
+        {settingsSaveError && <div role="alert" style={{ color: '#f87171' }}>Настройки не сохранены. Измените значение, чтобы повторить сохранение.</div>}
       </div>
     </aside>
   ) : null;

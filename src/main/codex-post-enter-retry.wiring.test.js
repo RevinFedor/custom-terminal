@@ -65,7 +65,13 @@ test('a later manual user carrier replays durable unresolved receipts after memo
   assert.match(reconcile, /AGENT_SEND_DURABLE_STATES\.AUDIT_PENDING/);
   assert.match(reconcile, /AGENT_SEND_DURABLE_STATES\.DELIVERY_UNKNOWN/);
   assert.match(reconcile, /reconcileAgentSendStartupRecords\(unresolved, \{ allRecords \}\)/);
-  assert.match(reconcile, /publishAgentPromptAuditResult\(tabId, auditCarrier, \{[\s\S]{0,180}\.\.\.decision\.audit,[\s\S]{0,120}auditTimestamp,[\s\S]{0,80}\}, 'codex'\)/);
+  assert.match(reconcile, /publishDurableAgentSendReceiptAudit\(record, decision\.audit, 'durable-late-reconcile'\)/);
+  const publisherStart = mainSource.indexOf('function publishDurableAgentSendReceiptAudit');
+  const publisherEnd = mainSource.indexOf('\nlet exactAgentSendReceiptReconciler', publisherStart);
+  const publisher = mainSource.slice(publisherStart, publisherEnd);
+  assert.match(publisher, /sendOperationKey: record\.operationKey/);
+  assert.match(publisher, /sendAttemptId: record\.attemptId/);
+  assert.match(publisher, /publishAgentPromptAuditResult\(record\.tabId, carrier, \{ \.\.\.audit, auditTimestamp \}, record\.provider\)/);
 
   const processStart = reconcileEnd;
   const processEnd = mainSource.indexOf('\nfunction processCodexSourceAuditOnlyText', processStart);

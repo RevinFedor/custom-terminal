@@ -1,4 +1,5 @@
 import { UNPLACED_WORKFLOW_ID } from './workflowVisuals.mjs';
+import { workflowForTab, legacyAutomationScope } from './workflowMembership.mjs';
 
 // The picker and live Restart after subscriptions must describe the same tabs.
 export function aiKindForTab(tab) {
@@ -22,12 +23,12 @@ export function runAfterWorkflowByProject(spaces = []) {
 
 export function runAfterWorkflowTabIds(state, workflowIds, ownerTabId) {
   const selected = new Set(workflowIds);
-  const byProject = runAfterWorkflowByProject(state?.spaces);
   const ids = [];
   for (const [projectId, workspace] of state?.openProjects || []) {
-    if (!selected.has(byProject.get(projectId) || UNPLACED_WORKFLOW_ID)) continue;
     for (const tab of workspace.tabs.values()) {
-      if (tab.id !== ownerTabId && !tab.parentTabId && aiKindForTab(tab)) ids.push(tab.id);
+      const legacy = state?.organizationReady && state?.runAfterWorkflowScopeVersions?.[ownerTabId] !== 2;
+      const workflowId = legacy ? legacyAutomationScope(state,tab.id) : workflowForTab(state,tab.id,projectId);
+      if (selected.has(workflowId) && tab.id !== ownerTabId && !tab.parentTabId && aiKindForTab(tab)) ids.push(tab.id);
     }
   }
   return ids;

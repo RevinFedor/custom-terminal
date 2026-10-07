@@ -12,10 +12,12 @@ import { createServer } from 'node:http';
 import { build } from 'esbuild';
 import { _electron as electron } from 'playwright';
 import { runCanonicalPreviewCases } from './history-preview-canonical-cases.mjs';
+import { runHistoryMcpColorCases } from './history-mcp-color-cases.mjs';
 
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const canonicalHandoff = process.argv.includes('--canonical-handoff');
-const fixtureName = canonicalHandoff ? 'history-preview-canonical' : 'history-preview-delivery';
+const mcpColors = process.argv.includes('--mcp-colors');
+const fixtureName = mcpColors ? 'history-mcp-colors' : canonicalHandoff ? 'history-preview-canonical' : 'history-preview-delivery';
 const canonicalCase = process.argv.find(arg => arg.startsWith('--case='))?.slice(7) || 'hidden-rebind';
 const artifact = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-preview-delivery-'));
 const snapshot = path.join(artifact, 'source');
@@ -43,9 +45,10 @@ try {
   }
   result.sourceHash = createHash('sha256').update(await fs.readFile(path.join(snapshot,
     'src/renderer/components/Workspace/HistoryPanel.tsx'))).digest('hex');
-  await build({ entryPoints: [path.join(snapshot, 'scripts/fixtures', `${fixtureName}.tsx`)],
+  const compiled = await build({ entryPoints: [path.join(snapshot, 'scripts/fixtures', `${fixtureName}.tsx`)],
     bundle: true, outfile: path.join(artifact, 'bundle.js'), platform: 'browser', format: 'esm',
-    target: 'chrome120', logLevel: 'silent',
+    metafile: true,
+    target: 'chrome120', jsx: 'automatic', logLevel: 'silent',
     define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env': '{"DEV":false,"MODE":"test"}' },
     alias: { '@noted/claude-blocks': path.join(snapshot, 'packages/claude-blocks/src'),
       '@noted/structured-dnd': path.join(shared, 'structured-dnd/src'),
@@ -54,6 +57,25 @@ try {
     plugins: [{ name: 'electron-fixture', setup(b) { b.onResolve({ filter: /^electron$/ }, () => ({ path: 'electron', namespace: 'fixture' }));
       b.onLoad({ filter: /.*/, namespace: 'fixture' }, () => ({ contents: 'export const ipcRenderer=window.require("electron").ipcRenderer;' })); } }],
     loader: { '.ttf': 'file', '.woff2': 'file', '.svg': 'dataurl' } });
+  const inputs = [];
+  const snapshotRoot = await fs.realpath(snapshot);
+  const sharedRoot = await fs.realpath(shared);
+  for (const input of Object.keys(compiled.metafile.inputs)) {
+    if (input.startsWith('fixture:') || input.startsWith('<define:')) continue;
+    const file = await fs.realpath(path.resolve(repo, input));
+    if (!file.startsWith(snapshotRoot + path.sep) && !file.startsWith(sharedRoot + path.sep)) continue;
+    const content = await fs.readFile(file);
+    inputs.push({ path: file.startsWith(snapshotRoot + path.sep) ? path.relative(snapshotRoot, file)
+      : '../noted-shared/packages/' + path.relative(sharedRoot, file),
+      sha256: createHash('sha256').update(content).digest('hex'), bytes: content.length });
+  }
+  assert(inputs.some(input => input.path === 'src/renderer/components/Workspace/HistoryPanel.tsx'),
+    'manifest must include the actual bundled HistoryPanel, not just stylesheet metadata');
+  const css = await fs.readFile(path.join(snapshot, 'src/renderer/styles/globals.css'));
+  inputs.push({ path: 'src/renderer/styles/globals.css', sha256: createHash('sha256').update(css).digest('hex'), bytes: css.length });
+  result.inputManifest = path.join(artifact, 'build-inputs.json');
+  result.inputCount = inputs.length;
+  await fs.writeFile(result.inputManifest, JSON.stringify(inputs, null, 2));
   execFileSync(path.join(repo, 'node_modules/.bin/tailwindcss'), ['-i', path.join(snapshot,
     'src/renderer/styles/globals.css'), '-o', path.join(artifact, 'globals.css'), '--minify'], { cwd: snapshot, stdio: 'pipe' });
   await fs.writeFile(path.join(artifact, 'index.html'), '<meta charset="utf-8"><link rel="stylesheet" href="globals.css"><link rel="stylesheet" href="bundle.css"><style>html,body{margin:0;background:#1a1a1a;color:#ccc}</style><script type="module" src="bundle.js"></script>');
@@ -78,7 +100,9 @@ try {
   page.on('console', m => logs.push(m.text()));
   await page.screenshot({ path: path.join(artifact, 'initial.png') });
   await page.waitForFunction(() => window.fixture?.ready && !!document.querySelector('[data-history-viewport-ready="1"]'));
-  if (canonicalHandoff) {
+  if (mcpColors) {
+    await runHistoryMcpColorCases(page, app, { artifact, result });
+  } else if (canonicalHandoff) {
     await runCanonicalPreviewCases(page, { artifact, result, logs, scenario: canonicalCase });
   } else {
   await page.evaluate(() => window.fixture.held());

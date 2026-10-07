@@ -37,6 +37,9 @@ const historyPanelSource = fs.readFileSync(
   path.join(repoDir, 'src/renderer/components/Workspace/HistoryPanel.tsx'),
   'utf8',
 );
+const historyPresenceSource = fs.readFileSync(
+  path.join(repoDir, 'src/renderer/utils/historyPresenceProjection.mjs'), 'utf8',
+);
 const timelineSource = fs.readFileSync(
   path.join(repoDir, 'src/renderer/components/Workspace/Timeline.tsx'),
   'utf8',
@@ -383,11 +386,12 @@ test('native/middle-edit affordances consume runtime verdict while delete owns s
   assert.match(workspaceSource, /isTurnBusy: singleCenterTab\?\.aiBusy === true\s*\|\| agentPasteBusyByTab\.get\(singleCenterTab\?\.id \|\| ''\) === true/);
   assert.match(workspaceSource, /inputBusy=\{agentPasteBusyByTab\.get\(deferredHistoryOwner\.tabId\) === true\}/);
 
-  assert.match(historyPanelSource, /onRuntimeSnapshotChange\?\.\(presence\.runtimeSnapshot \|\| null\)/);
+  assert.match(historyPanelSource, /applyHistoryPresenceProjection\(\{[\s\S]{0,180}publishRuntimeSnapshot: onRuntimeSnapshotChange/);
+  assert.match(historyPresenceSource, /publishRuntimeSnapshot\?\.\(presence\?\.runtimeSnapshot \|\| null\)/);
   assert.match(historyPanelSource, /codexHistoryActions\?\.canNativeRewind !== true/);
   assert.match(historyPanelSource, /rewindLocked=\{historyRewindLocked\}/);
 
-  assert.match(timelineSource, /historyActionSnapshot\?\.canNativeRewind !== true/);
+  assert.match(timelineSource, /currentHistoryAction\?\.canNativeRewind !== true/);
   assert.match(timelineSource, /historyActionSnapshot\?\.canRewriteHistory !== true/);
   assert.doesNotMatch(timelineSource, /historyActionSnapshot\?\.canDeleteHistory !== true/);
   assert.match(timelineSource, /isTabAiBusy \|\| isTurnBusy \|\| lifecycleBlocksHistoryAction/);
@@ -398,8 +402,8 @@ test('native/middle-edit affordances consume runtime verdict while delete owns s
   );
   assert.match(timelineSource, /disabled=\{historyDeleteUiBlocked\}/);
   assert.match(timelineSource, /title=\{historyDeleteUiBlocked \? historyMutationBlockedMessage : undefined\}/);
-  assert.match(timelineSource, /const historyDeleteUiBlocked = deletingRange !== null[\s\S]{0,140}rewindAgentStatus === 'stopping'/);
-  assert.match(timelineSource, /const historicalSessionId = sessionIdRef\.current/);
+  assert.match(timelineSource, /const historyDeleteUiBlocked = activeJsonlOperation !== null[\s\S]{0,140}rewindAgentStatus === 'stopping'/);
+  assert.match(timelineSource, /const historicalSessionId = sessionId;/);
   assert.match(timelineSource, /terminal:stop-ai-process[\s\S]{0,700}return historicalSessionId/);
 });
 

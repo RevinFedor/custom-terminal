@@ -30,6 +30,7 @@ export function buildPromptQueueReceiptHandoffId({
   itemId,
   payload,
   causeKey = null,
+  armedAt = undefined,
 }) {
   const normalizedKind = kind === 'loop' ? 'loop' : 'queue';
   const exactItemId = requiredText(itemId, 'itemId');
@@ -39,7 +40,10 @@ export function buildPromptQueueReceiptHandoffId({
   const itemToken = encodeURIComponent(exactItemId);
   const payloadToken = exactPayload.length + '-' + shortStableFingerprint(exactPayload);
   if (normalizedKind === 'queue') {
-    return 'run-after-' + itemToken + '-' + payloadToken;
+    const base = 'run-after-' + itemToken + '-' + payloadToken;
+    // New automatic intents distinguish an explicit Pause→Play from an
+    // internal Resume. Legacy callers retain byte-for-byte operation keys.
+    return armedAt === undefined ? base : base + '-arm-' + (armedAt === null ? 'none' : String(armedAt));
   }
   const exactCauseKey = requiredText(causeKey, 'causeKey');
   return 'prompt-loop-' + itemToken + '-' + encodeURIComponent(exactCauseKey)

@@ -28,6 +28,10 @@ import {
   workspacePlacementsForTab,
 } from './utils/workspaceWindowTarget.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
+import { createWorkspaceSwitcherSnapshot } from './utils/workspaceSwitcherSnapshot.mjs';
+import { waitForOrganizationReady } from './utils/workflowOrganizationClient.mjs';
+import { INBOX_WORKFLOW_ID } from './utils/workflowMembership.mjs';
+import { fileExistsVerdict, probeFiles, subscribeMissingFiles } from './utils/missingFileTracker';
 import { resolveTabTerminalPrimary, syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
 import { installSurfaceFontShortcuts, subscribeDisplayContext } from './utils/displayProfiles.mjs';
 import { commitDisplayProfileChange } from './utils/displayProfileCommit.mjs';
@@ -40,7 +44,7 @@ import {
 } from './constants/projectHoverPreview';
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
-import Workspace from './components/Workspace/Workspace';
+import Workspace, {RootGlobalArchive} from './components/Workspace/Workspace';
 import WorkspacePresentationBoundary from './components/Workspace/WorkspacePresentationBoundary';
 import StatusBar from './components/StatusBar';
 import ToastContainer from './components/UI/Toast';
@@ -55,7 +59,6 @@ import PromptPickerOverlay from './components/Workspace/PromptPickerOverlay';
 import WorkspaceTitleBarTools from './components/Workspace/WorkspaceTitleBarTools';
 import WorkspaceNavigationRow from './components/Workspace/WorkspaceNavigationRow';
 import TabSwitcherOverlay from './components/Workspace/TabSwitcherOverlay';
-import ProjectSwitcherOverlay from './components/Workspace/ProjectSwitcherOverlay';
 import { getTabChromeColorConfig } from './components/Workspace/tabChrome';
 import {
   CONTEXT_MENU_COMPACT_ROW_STYLE,
@@ -97,7 +100,7 @@ import { tabAllowsShellActions } from './utils/emptyTab.mjs';
 
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
-import { signalPromptQueueDictationResolved, usePromptQueueRunner } from './hooks/usePromptQueueRunner';
+import { readPromptQueueSendAdmission, signalPromptQueueDictationResolved, usePromptQueueRunner } from './hooks/usePromptQueueRunner';
 import { useRestartAfterRunner } from './hooks/useRestartAfterRunner';
 import { openHistoryOperationOwner } from './utils/historyOperationActivity.mjs';
 import { useGitRunAfterRunner } from './hooks/useGitRunAfterRunner';
@@ -111,6 +114,8 @@ import {
 } from './utils/claudePtyActions';
 import { hydratePromptQueueStore, usePromptQueueStore, serializePromptQueueCore, flushPromptQueueStoreSync } from './store/usePromptQueueStore';
 import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
+import { handleRunAfterApplicationRead, handleRunAfterApplicationMutation } from './utils/runAfterApplicationBridge';
+import { runAfterTargetInventory } from './utils/runAfterInventory.mjs';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
 import {
   initializeOrchestrationStore,
@@ -1243,6 +1248,12 @@ function App() {
   const openProject = useWorkspaceStore((s) => s.openProject);
   const closeProject = useWorkspaceStore((s) => s.closeProject);
   const createTab = useWorkspaceStore((s) => s.createTab);
+  const [globalArchiveOpen,setGlobalArchiveOpen] = useState(false);
+  useEffect(() => {
+    const open = () => setGlobalArchiveOpen(true);
+    window.addEventListener('global-tab-archive:open',open);
+    return () => window.removeEventListener('global-tab-archive:open',open);
+  },[]);
   const createTabAfterCurrent = useWorkspaceStore((s) => s.createTabAfterCurrent);
   const closeTab = useWorkspaceStore((s) => s.closeTab);
   const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
@@ -1313,6 +1324,45 @@ function App() {
   // Base strip color + shimmer color/spacing/opacity are renderer-wide CSS vars; Settings
   // updates land in useUIStore and the visible TabBar picks them up immediately.
   const processBar = useUIStore((s) => s.processBar);
+  const workspaceSwitcherRef = useRef<ReturnType<typeof createWorkspaceSwitcherSnapshot> | null>(null);
+  useEffect(() => {
+    let disposed = false, sequence = 0;
+    let projection: ReturnType<typeof createWorkspaceSwitcherSnapshot> | null = null;
+    const refresh = () => projection?.refresh();
+    const register = async () => {
+      const own = ++sequence;
+      if (projection) ipcRenderer.send('workspace-switcher:unregister', { epoch: projection.epoch });
+      projection?.dispose(); projection = null; workspaceSwitcherRef.current = null;
+      try {
+        const lease = await ipcRenderer.invoke('workspace-switcher:register');
+        if (disposed || own !== sequence) {
+          ipcRenderer.send('workspace-switcher:unregister', lease); return;
+        }
+        projection = createWorkspaceSwitcherSnapshot({ epoch: lease.epoch,
+          readWorkspace: () => useWorkspaceStore.getState(), readProjects: () => useProjectsStore.getState().projects,
+          readReady: () => {
+            const progress = getStartupRestoreProgress();
+            return !progress.blocking || progress.phase === 'agents' || progress.phase === 'complete';
+          },
+          inboxName: INBOX_PROJECT_NAME,
+          fileVerdict: fileExistsVerdict, probeFiles: (paths: string[]) => probeFiles(paths, true),
+          onChanged: (clock: any) => ipcRenderer.send('workspace-switcher:changed', clock),
+        });
+        workspaceSwitcherRef.current = projection; refresh();
+      } catch (error: any) { console.warn('[WorkspaceSwitcher] register failed:', error?.message || error); }
+    };
+    const releases = [useWorkspaceStore.subscribe(refresh), useProjectsStore.subscribe(refresh),
+      subscribeMissingFiles(refresh), subscribeStartupRestoreProgress(refresh)];
+    ipcRenderer.on('workspace-switcher:register-request', register);
+    void register();
+    return () => {
+      disposed = true; sequence++; releases.forEach(release => release());
+      ipcRenderer.removeListener('workspace-switcher:register-request', register);
+      if (projection) ipcRenderer.send('workspace-switcher:unregister', { epoch: projection.epoch });
+      projection?.dispose();
+      if (workspaceSwitcherRef.current === projection) workspaceSwitcherRef.current = null;
+    };
+  }, []);
   useEffect(() => {
     ipcRenderer.send('tab-activity:process-bar', processBar);
     const root = document.documentElement;
@@ -1728,51 +1778,9 @@ function App() {
   };
 
   const handleCreateNewProject = async () => {
-    try {
-      // Remember where we are before switching
-      setPreviousProjectId(activeProjectId);
-
-      const newProject = await ipcRenderer.invoke('project:create-empty', { name: 'Новый проект' });
-      if (newProject) {
-        // 1. Reload projects in store to include the new one
-        await loadProjects();
-
-        // 2. Calculate new order: insert after current or at start
-        const currentOrder = Array.from(openProjects.keys());
-        let insertIndex = 0;
-
-        if (view === 'workspace' && activeProjectId) {
-          const currentIndex = currentOrder.indexOf(activeProjectId);
-          if (currentIndex !== -1) {
-            insertIndex = currentIndex + 1;
-          }
-        }
-
-        const newOrder = [...currentOrder];
-        newOrder.splice(insertIndex, 0, newProject.id);
-
-        // 3. Apply new order and open in draft mode (Home view, no terminal)
-        reorderProjects(newOrder);
-        openProject(newProject.id, newProject.path, { draft: true });
-
-        // 4. Set area focus
-        setActiveArea('projects');
-        // 5. Mark as draft — ProjectHome owns the input, title bar shows synced text
-        setLastCreatedProjectId(newProject.id);
-        setEditingProjectId(null);
-        setProjectEditValue(newProject.name);
-
-        // 6. Signal ProjectHome to enter draft mode (deferred so component is mounted)
-        setTimeout(() => {
-          window.dispatchEvent(new CustomEvent('project:draft-init', {
-            detail: { projectId: newProject.id, name: newProject.name }
-          }));
-        }, 50);
-      }
-    } catch (err) {
-      console.error('Failed to create project:', err);
-      showToast('Failed to create project', 'error');
-    }
+    const id = useWorkspaceStore.getState().addWorkspaceSpace({activate:true});
+    if (!id) showToast('Не удалось создать workflow','error');
+    else setActiveArea('workspace');
   };
 
   // Load projects, AI prompts, and restore session ONCE on mount
@@ -1803,7 +1811,7 @@ function App() {
       }
       if (!cancelled) {
         const state = useWorkspaceStore.getState();
-        if (!state.openProjects.has(INBOX_PROJECT_ID)) {
+        if (!state.organizationReady && !state.openProjects.has(INBOX_PROJECT_ID)) {
           await state.openProject(INBOX_PROJECT_ID, getInboxProjectPath(), { background: true });
         }
       }
@@ -2306,6 +2314,28 @@ function App() {
       };
       try {
         const state = useWorkspaceStore.getState();
+        if (action === 'readWorkspaceSwitcher') {
+          try {
+            if (!workspaceSwitcherRef.current) return reply(true, { error: 'switcher_renderer_unavailable', statusCode: 503 });
+            return reply(true, await workspaceSwitcherRef.current.read(payload || {}));
+          } catch (error: any) {
+            return reply(true, { error: error?.code || 'switcher_renderer_unavailable', statusCode: error?.statusCode || 503 });
+          }
+        }
+        if (action === 'readRunAfter' || action === 'mutateRunAfter') {
+          try {
+            return reply(true, action === 'readRunAfter'
+              ? await handleRunAfterApplicationRead(payload)
+              : await handleRunAfterApplicationMutation(payload));
+          } catch (error: any) {
+            return reply(false, { code: error?.code, statusCode: error?.statusCode,
+              mutationMayHaveApplied: error?.mutationMayHaveApplied === true }, error?.code || error?.message || 'run_after_unavailable');
+          }
+        }
+        if (action === 'previewRunAfterImage') {
+          const result = await ipcRenderer.invoke('prompt-queue:get-image-preview-data-url', { assetId: payload.assetId, variant: payload.variant });
+          return reply(true, result);
+        }
         const findTab = (tabId?: string, projectId?: string | null): any | null => {
           if (!tabId) return null;
           const currentState = useWorkspaceStore.getState();
@@ -2424,6 +2454,11 @@ function App() {
         };
         const ensureProjectWorkspace = async (projectId?: string) => {
           if (!projectId) return null;
+          if (useWorkspaceStore.getState().organizationReady) {
+            if (!useWorkspaceStore.getState().openProjects.has(projectId)) await useWorkspaceStore.getState().refreshOrganizationCatalog();
+            const known = useWorkspaceStore.getState().openProjects.get(projectId);
+            if (known) return known;
+          }
           let projectData: any = null;
           try {
             projectData = await ipcRenderer.invoke('project:getById', projectId);
@@ -2454,6 +2489,8 @@ function App() {
           return useWorkspaceStore.getState().openProjects.get(projectId) || null;
         };
         const resolveBridgeCreationTarget = async (payload: any = {}) => {
+          const admitted = useWorkspaceStore.getState();
+          const admittedFallbackCwd = resolveWorkspaceCwd('');
           const requestedProjectId = payload.projectId || payload.fallbackProjectId;
           if (requestedProjectId) await ensureProjectWorkspace(requestedProjectId);
           const state = useWorkspaceStore.getState();
@@ -2484,13 +2521,15 @@ function App() {
           if (windowDefaultProjectId) await ensureProjectWorkspace(windowDefaultProjectId);
           const contextState = useWorkspaceStore.getState();
           const contextTabInfo = (projectId: string, tabId: string) => {
-            const tab: any = contextState.openProjects.get(projectId)?.tabs.get(tabId);
-            return tab ? { name: tab.name, cwd: tab.cwd || null } : null;
+            const bucket = projectId ? contextState.openProjects.get(projectId) : [...contextState.openProjects.values()].find(workspace => workspace.tabs.has(tabId));
+            const tab: any = bucket?.tabs.get(tabId);
+            return tab ? {name:tab.name,cwd:tab.cwd || null,projectId:bucket.projectId,
+              workflowId:contextState.tabWorkflowMembership[tabId]?.workflowId} : null;
           };
 
           const projects = Array.from(contextState.openProjects, ([id, workspace]) => ({
             id,
-            path: workspace.projectPath,
+            path: workspace.projectPath || workspace.recommendedCwd,
           }));
           let creation = resolveWorkspaceCreationContext({
             explicitProjectId: payload.projectId || undefined,
@@ -2500,6 +2539,8 @@ function App() {
             sourceTabId: payload.sourceTabId || '',
             tabInfo: contextTabInfo,
             projects,
+            organizationVersion:contextState.organizationReady ? 1 : undefined,
+            fallbackCwd:(requestedProjectId && admitted.openProjects.get(requestedProjectId)?.recommendedCwd) || admittedFallbackCwd,
           });
           if (!creation.ok && payload.fallbackProjectId) {
             creation = resolveWorkspaceCreationContext({
@@ -2509,6 +2550,12 @@ function App() {
             });
           }
           if (!creation.ok) return creation;
+          if (contextState.organizationReady) creation = {...creation,
+            workflowId:payload.workflowId || windowTarget?.space?.id
+              || (payload.sourceTabId && (admitted.pendingTabWorkflowMembership[payload.sourceTabId]
+                || admitted.tabWorkflowMembership[payload.sourceTabId])?.workflowId)
+              || '__noted_workflow_inbox__',
+            cwd:payload.cwd || creation.cwd || admittedFallbackCwd};
           if (!creation.cwd) return { ok: false, reason: 'cwd_unavailable', projectId: creation.projectId };
           const cwdExists = await ipcRenderer.invoke('app:check-path-exists', creation.cwd).catch(() => false);
           if (!cwdExists) return { ok: false, reason: 'cwd_not_found', cwd: creation.cwd };
@@ -2861,22 +2908,16 @@ function App() {
           return reply(true, { streamerMode: !!useUIStore.getState().streamerMode });
         }
         if (action === 'ensureInboxProject') {
-          const projectsState = useProjectsStore.getState();
-          if (!projectsState.projects?.[INBOX_PROJECT_ID]) {
-            await projectsState.loadProjects();
-          }
-          const latest = useWorkspaceStore.getState();
-          if (!latest.openProjects.has(INBOX_PROJECT_ID)) {
-            await latest.openProject(
-              INBOX_PROJECT_ID,
-              projectsState.projects?.[INBOX_PROJECT_ID]?.path || getInboxProjectPath(),
-              { background: true }
-            );
-          }
+          await waitForOrganizationReady(useWorkspaceStore);
+          await useWorkspaceStore.getState().refreshOrganizationCatalog();
           const inbox = useWorkspaceStore.getState().openProjects.get(INBOX_PROJECT_ID);
+          if (!inbox || !useWorkspaceStore.getState().spaces.some(space => space.id === INBOX_WORKFLOW_ID && space.kind === 'inbox'))
+            return reply(false,null,'inbox_catalog_unavailable');
           return reply(true, {
             projectId: INBOX_PROJECT_ID,
-            path: inbox?.projectPath || getInboxProjectPath(),
+            path: inbox.recommendedCwd || inbox.projectPath || getInboxProjectPath(),
+            recommendedCwd:inbox.recommendedCwd || inbox.projectPath || getInboxProjectPath(),
+            workflowId:INBOX_WORKFLOW_ID,
             isOpen: !!inbox,
           });
         }
@@ -2980,7 +3021,7 @@ function App() {
         }
         if (action === 'dictationChipOpenOwner') {
           const tabId = String(payload?.tabId || '').trim();
-          const opened = !!tabId && openHistoryOperationOwner(useWorkspaceStore.getState(), tabId);
+          const opened = !!tabId && await openHistoryOperationOwner(useWorkspaceStore.getState(), tabId);
           console.log('[DictationChip] open-owner tab=' + tabId.slice(-12) + ' opened=' + opened);
           return reply(true, { opened });
         }
@@ -4004,57 +4045,12 @@ function App() {
           return reply(true, { tabId, ...partial });
         }
         const getPromptQueueAiTabs = (ownerTabId: string) => {
-          let ownerProjectId: string | null = null;
-          for (const [projectId, ws] of state.openProjects) {
-            if (ws.tabs.has(ownerTabId)) {
-              ownerProjectId = projectId;
-              break;
-            }
-          }
-
-          const projectLabel = (projectPath: string | undefined, projectId: string): string => {
-            const clean = (projectPath || '').replace(/[\\/]+$/, '');
-            return clean.split(/[\\/]/).filter(Boolean).pop() || projectId.slice(-8);
-          };
-
-          const aiTabs: Array<{
-            id: string;
-            name: string;
-            kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex';
-            projectId: string;
-            projectName: string;
-            isOwnerProject: boolean;
-          }> = [];
-
-          for (const [projectId, ws] of state.openProjects) {
-            for (const t of ws.tabs.values()) {
-              if (t.parentTabId) continue;
-              if (t.id === ownerTabId) continue;
-              const isSDK = t.tabType === 'claude-sdk';
-              const ptyOwner = resolvePtyAgentOwner(t);
-              const isClaudePTY = !isSDK && ptyOwner === 'claude' && !!t.claudeSessionId;
-              const isCodex = !isSDK && ptyOwner === 'codex' && !!t.codexSessionId;
-              const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
-              let kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex' | null = null;
-              if (isSDK) kind = 'claude-sdk';
-              else if (isClaudePTY) kind = 'claude-pty';
-              else if (isCodex) kind = 'codex';
-              else if (isGemini) kind = 'gemini';
-              if (!kind) continue;
-              aiTabs.push({
-                id: t.id,
-                name: t.name || t.id.slice(-6),
-                kind,
-                projectId,
-                projectName: projectLabel(ws.projectPath, projectId),
-                isOwnerProject: projectId === ownerProjectId,
-              });
-            }
-          }
-
-          return aiTabs;
+          return runAfterTargetInventory(useWorkspaceStore.getState(), useProjectsStore.getState().projects, ownerTabId);
         };
 
+        if (action === 'readPromptQueueSendAdmission') {
+          return reply(true, readPromptQueueSendAdmission(payload));
+        }
         if (action === 'getPromptQueue') {
           // Mobile mirror of the desktop Prompt Queue ("Run after"). Mobile does
           // NOT own a queue — it reads the live desktop store and pushes mutations
@@ -4116,6 +4112,7 @@ function App() {
                     targetText: a.targetText,
                     sourceSessionId: a.sourceSessionId,
                     toolType: a.toolType,
+                    ...(Number.isSafeInteger(a.targetIteration) && a.targetIteration > 0 ? { targetIteration: a.targetIteration } : {}),
                   }, typeof a.title === 'string' ? a.title : undefined);
                   break;
                 }
@@ -4281,10 +4278,11 @@ function App() {
           for (const [projectId, ws] of state.openProjects) {
             if (ws.tabs.has(tabId)) {
               // skipProcessCheck so phone-driven close doesn't trigger desktop confirm dialog
-              await state.closeTab(projectId, tabId, {
+              const closed = await state.closeTab(projectId, tabId, {
                 skipProcessCheck: true,
                 aiBusyOverride: typeof aiBusyOverride === 'boolean' ? aiBusyOverride : undefined
               });
+              if (!closed) return reply(false, { tabId, closed: false }, 'tab_close_not_committed');
               return reply(true, { tabId, closed: true });
             }
           }
@@ -4368,6 +4366,8 @@ function App() {
           const { rawCommand, pendingAction, commandType, sessionPatch } = parseTerminalCreateCommand(payload?.command);
           const openInBackground = payload?.background !== false;
           const tabId = await useWorkspaceStore.getState().createTab(projectId, payload?.name, cwd, {
+            workflowId:resolved.creation.workflowId,
+            sourceTabId:payload?.sourceTabId,
             commandType,
             color: (payload?.color || (commandType === 'codex'
               ? 'codex'
@@ -4633,6 +4633,7 @@ function App() {
             cwd: requestedCwd,
             sourceTabId,
             windowTarget,
+            workflowId:payload?.workflowId,
           });
           if (!resolved.ok) return reply(false, resolved, resolved.reason || 'creation context unresolved');
           const projectId = resolved.creation.projectId;
@@ -4666,6 +4667,8 @@ function App() {
           const shouldStartNow = !restoreWithoutLaunch && startNow === true;
           const explicitName = typeof name === 'string' && name.trim() ? name.trim() : undefined;
           const createOptions = {
+            workflowId:resolved.creation.workflowId,
+            sourceTabId,
             commandType: agent,
             color: agent,
             pendingAction: shouldStartNow || restoreWithoutLaunch ? undefined : pendingAction,
@@ -5302,6 +5305,7 @@ function App() {
                 sendAttemptId,
                 sendOperationKey,
                 source: promptSource,
+                ...(payload?.promptQueueAction === 'send-now' ? { promptQueueAction: 'send-now' as const } : {}),
                 statusAtSend,
                 queue,
                 settingsIntent: createAgentSettingsIntent({
@@ -6506,6 +6510,12 @@ function App() {
         }
 
         if (view === 'workspace' && keyboardTarget.kind === 'sidebar') {
+          const organization = useWorkspaceStore.getState();
+          if (organization.organizationReady) {
+            void organization.createWorkflowTab({workflowId:organization.activeSpaceId,sourceTabId:keyboardTarget.tabId || undefined,
+              tabOptions:{background:true}}).then(id => {if (id) useWorkspaceStore.setState({pendingEditTabId:id});});
+            return;
+          }
           const sidebarProjectId = keyboardTarget.projectId;
           if (!sidebarProjectId) return;
           const placementStore = useWorkspaceStore.getState();
@@ -7124,7 +7134,7 @@ function App() {
             whiteSpace: 'nowrap',
             flexWrap: 'nowrap',
           } as any}
-          onMouseDown={() => setActiveArea('projects')} // Focus projects when clicking this container
+          onMouseDown={() => setActiveArea('workspace')}
           onWheel={(event) => {
             const element = event.currentTarget;
             if (element.scrollWidth <= element.clientWidth) return;
@@ -7142,19 +7152,18 @@ function App() {
           }}
           onClick={(e) => {
             if (e.target === e.currentTarget) {
-              setActiveArea('projects');
+              setActiveArea('workspace');
             }
           }}
         >
           {/* Home / DEV indicator */}
-          <ControlHint label={view === 'dashboard' ? 'Вернуться в рабочий проект' : 'Открыть Dashboard'} side="bottom">
+          <ControlHint label={view === 'dashboard' ? 'Вернуться в workflow' : 'Открыть Home'} side="bottom">
               {/* Один компонент и одна геометрия для production Home и dev DEV.
                   Среда меняет только подпись/палитру: отдельная dev-ветка уже
                   успела разойтись с карточками по высоте и не работала у
                   built-renderer file:// launch. */}
               <button
                 data-workspace-navigation
-                data-project-navigation
                 data-app-home-button
                 data-runtime-environment={IS_DEVELOPMENT_RUNTIME ? 'development' : 'production'}
                 className="relative inline-flex items-center cursor-pointer transition-colors rounded-sm"
@@ -7186,7 +7195,9 @@ function App() {
                     e.currentTarget.style.backgroundColor = 'transparent';
                   }
                 }}
-                onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
+                onClick={() => view === 'dashboard'
+                  ? useWorkspaceStore.getState().switchWorkspaceSpace(useWorkspaceStore.getState().activeSpaceId)
+                  : showDashboard()}
               >
                 {view === 'dashboard' && (
                   <div
@@ -7201,112 +7212,19 @@ function App() {
               </button>
             </ControlHint>
 
-          {/* Pinned Inbox workspace */}
-          <ProjectTabItem
-            key={INBOX_PROJECT_ID}
-            projectId={INBOX_PROJECT_ID}
-            projectName={projects[INBOX_PROJECT_ID]?.name || INBOX_PROJECT_NAME}
-            projectIcon={projects[INBOX_PROJECT_ID]?.icon || null}
-            index={-1}
-            isActive={view === 'workspace' && focusedProjectId === INBOX_PROJECT_ID}
-            fontSize={projectTabsFontSize}
-            totalTabCount={inboxWorkspace?.tabs?.size || 0}
-            interruptedCount={inboxIndicators.interruptedCount}
-            isEditing={false}
-            editValue=""
-            onEditChange={() => {}}
-            onEditSubmit={() => {}}
-            onEditCancel={() => {}}
-            isPinnedSystem
-            onClick={() => {
-              openProject(INBOX_PROJECT_ID, projects[INBOX_PROJECT_ID]?.path || getInboxProjectPath());
-            }}
-            onDoubleClick={() => {}}
-            onContextMenu={() => {}}
-            onMiddleClick={() => {}}
-            onTabDrop={async (tabId, sourceProjectId, selectedTabIds) => {
-              const ids = selectedTabIds && selectedTabIds.length > 1 ? selectedTabIds : [tabId];
-              const moved = await moveTabsToProject(sourceProjectId, ids, INBOX_PROJECT_ID);
-              if (moved) {
-                openProject(INBOX_PROJECT_ID, projects[INBOX_PROJECT_ID]?.path || getInboxProjectPath());
-              }
-            }}
-          />
-
-          {/* Separator */}
-          {openProjectsList.length > 0 && (
-            <div className="h-5 w-px bg-[#444] mx-1" />
-          )}
-
-          {/* Open Projects (draggable) */}
-          {openProjectsList.map(([projectId, workspace], index) => {
-            const project = projects[projectId];
-            if (!project) return null;
-            
-            // Project is active only if:
-            // 1. We are in workspace view (not dashboard)
-            // 2. It matches the explicitly focused sidebar project
-            const isActive = view === 'workspace' && focusedProjectId === projectId;
-            const indicators = getProjectTabIndicators(projectId, workspace);
-
-            return (
-              <ProjectTabItem
-                key={projectId}
-                projectId={projectId}
-                projectName={lastCreatedProjectId === projectId ? projectEditValue : project.name}
-                projectIcon={project.icon}
-                hideProjectName={!!project.hideName}
-                index={index}
-                isActive={isActive}
-                fontSize={projectTabsFontSize}
-                totalTabCount={workspace.tabs.size}
-                interruptedCount={indicators.interruptedCount}
-                isEditing={editingProjectId === projectId}
-                editValue={projectEditValue}
-                onEditChange={setProjectEditValue}
-                onEditSubmit={handleSubmitProjectRename}
-                onEditCancel={handleCancelProjectRename}
-                onClick={() => {
-                  openProject(projectId, project.path);
-                }}
-                onDoubleClick={() => handleStartEditingProject(projectId, project.name)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setProjectContextMenu({ projectId, x: e.clientX, y: e.clientY });
-                }}
-                onMiddleClick={() => {
-                  // Only warn if there are running processes (not just open terminals)
-                  if (indicators.activeCount > 0) {
-                    if (confirm(`Close "${project.name}"?\n\n${indicators.activeCount} running process(es) will be terminated.`)) {
-                      closeProject(projectId);
-                    }
-                  } else {
-                    closeProject(projectId);
-                  }
-                }}
-                onTabDrop={async (tabId, sourceProjectId, selectedTabIds) => {
-                  const ids = selectedTabIds && selectedTabIds.length > 1 ? selectedTabIds : [tabId];
-                  const moved = await moveTabsToProject(sourceProjectId, ids, projectId);
-                  if (moved) openProject(projectId, project.path);
-                }}
-              />
-            );
-          })}
         </div>
 
         {/* Drag area + Empty drop zone for reordering */}
         <div className="flex flex-1 min-w-0 h-full items-center">
-          <ProjectEmptyDropZone
-            onMouseDown={() => setActiveArea('projects')}
-            onDoubleClick={handleCreateNewProject}
-          />
+          <div data-global-titlebar-spacer className="flex-1 h-full min-w-0" />
 
           {/* Кнопки рабочей области — переехали сюда из удалённой полосы под
               шапкой. Стоят перед областью перетаскивания: она остаётся крайней
-              справа, вместе со своей ручкой изменения ширины. На Dashboard
-              рабочей области нет, поэтому и кнопок нет — иначе они управляли бы
-              проектом, которого не видно. */}
-          {view === 'workspace' && <WorkspaceTitleBarTools />}
+              справа, вместе со своей ручкой изменения ширины. Общие чипы
+              ресурсов остаются доступны также на Home. */}
+          <WorkspaceTitleBarTools dashboard={view === 'dashboard'} />
+          <button data-global-archive-open aria-label="Общий архив" onClick={() => setGlobalArchiveOpen(true)}
+            style={{WebkitAppRegion:'no-drag',padding:'0 8px',height:'100%',color:'#aaa',flexShrink:0} as any}>Архив</button>
 
           {/* Resizable Window Drag Area */}
           <div className="relative h-full flex-shrink-0 flex" style={{ width: dragAreaWidth }}>
@@ -7413,7 +7331,7 @@ function App() {
       />
       <ShutdownOverlay />
       <ToastContainer />
-      <EditProjectModal />
+      {globalArchiveOpen && <RootGlobalArchive onClose={() => setGlobalArchiveOpen(false)} />}
       <SessionInputModal />
       <SettingsModal
         isOpen={settingsOpen}
@@ -7431,9 +7349,6 @@ function App() {
         pasteBusyTabs={pasteBusyTabs}
       />
 
-      {/* Ctrl+Q — переключение проекта боковой панели. Workflow и размещение
-          окон остаются неизменными: это тот же путь, что клик по проекту. */}
-      <ProjectSwitcherOverlay />
 
       {/* Project Context Menu */}
       {projectContextMenu && (

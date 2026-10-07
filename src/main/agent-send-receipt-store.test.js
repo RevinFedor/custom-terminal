@@ -108,6 +108,87 @@ function openMemoryHarness(t, options = {}) {
   return { db, store, getUuidCount: () => uuid };
 }
 
+test('global Codex audit ownership rejects another tab on every store promotion path and after reopen', (t) => {
+  const h = openMemoryHarness(t);
+  if (!h) return;
+  const requests = [identity(), identity({ operationKey: 'other-operation', tabId: 'other-tab', handoffId: 'other-handoff' })];
+  const attempts = requests.map(request => {
+    const attempt = h.store.beginAttempt(request);
+    h.store.settleAttempt(request.operationKey, attempt.attemptId, { submitted: true, auditPending: true });
+    return attempt;
+  });
+  const first = h.store.promoteFromAudit(exactAudit(attempts[0].attemptId));
+  assert.equal(first.promoted, true);
+  const reopened = createAgentSendReceiptStore(h.db);
+  const second = reopened.promoteFromAudit(exactAudit(attempts[1].attemptId, { operationKey: requests[1].operationKey }));
+  assert.equal(second.promoted, false);
+  assert.equal(second.reason, 'canonical-user-already-owned');
+  assert.equal(reopened.get(requests[1].operationKey).state, STORE_STATES.AUDIT_PENDING);
+  assert.equal(reopened.get(requests[0].operationKey).auditIdentity.entryUuid, 'entry-a');
+});
+
+test('paired carrier aliases claim one logical Codex user, but equal text in another physical row remains a new send', (t) => {
+  const h = openMemoryHarness(t);
+  if (!h) return;
+  const early = h.store.beginAttempt(identity());
+  h.store.settleAttempt(identity().operationKey, early.attemptId, { submitted: true, auditPending: true });
+  const earlyAudit = exactAudit(early.attemptId, { entryUuid: 'response-user', sourceIdentity: 'response-source' });
+  assert.equal(h.store.promoteFromAudit(earlyAudit).promoted, true);
+  const secondRequest = identity({ operationKey: 'second', tabId: 'another-tab', handoffId: 'second-handoff' });
+  const second = h.store.beginAttempt(secondRequest);
+  h.store.settleAttempt(secondRequest.operationKey, second.attemptId, { submitted: true, auditPending: true });
+  const paired = exactAudit(second.attemptId, { operationKey: secondRequest.operationKey,
+    entryUuid: 'event-user', sourceIdentity: 'event-source',
+    entryUuidAliases: ['response-user'], sourceIdentityAliases: ['response-source'] });
+  const rejected = h.store.promoteFromAudit(paired);
+  assert.equal(rejected.promoted, false);
+  assert.equal(rejected.reason, 'canonical-user-already-owned');
+  const independent = { ...paired, entryUuid: 'next-user', sourceIdentity: 'next-source',
+    entryUuidAliases: [], sourceIdentityAliases: [] };
+  assert.equal(h.store.promoteFromAudit(independent).promoted, true, 'matching body/hash alone never owns a different row');
+});
+
+test('canonical alias enrichment of the same attempt is monotonic and preserves its settlement timestamp', (t) => {
+  let now = 1000;
+  const h = openMemoryHarness(t, { now: () => now });
+  if (!h) return;
+  const request = identity();
+  const attempt = h.store.beginAttempt(request);
+  h.store.settleAttempt(request.operationKey, attempt.attemptId, { submitted: true, auditPending: true });
+  const early = exactAudit(attempt.attemptId, { entryUuid: 'response-user', sourceIdentity: 'response-source', recordByteOffset: 20 });
+  const first = h.store.promoteFromAudit(early);
+  now = 2000;
+  const canonical = h.store.promoteFromAudit(exactAudit(attempt.attemptId, {
+    entryUuid: 'event-user', sourceIdentity: 'event-source', recordByteOffset: 80,
+    entryUuidAliases: ['response-user'], sourceIdentityAliases: ['response-source'] }));
+  assert.equal(canonical.ok, true);
+  assert.equal(canonical.idempotent, true);
+  assert.equal(canonical.record.settledAt, first.record.settledAt);
+  const reopened = createAgentSendReceiptStore(h.db);
+  assert.ok(reopened.get(request.operationKey).receipt.sourceIdentityAliases.includes('response-source'));
+  assert.equal(reopened.promoteFromAudit(early).idempotent, true, 'an early duplicate cannot downgrade the canonical address');
+  assert.equal(reopened.get(request.operationKey).auditIdentity.sourceIdentity, 'event-source');
+});
+
+test('canonical claims survive receipt pruning and reject reuse including a reused operation key', (t) => {
+  let now = 1000;
+  const h = openMemoryHarness(t, { now: () => now, settledRetentionMs: 10 });
+  if (!h) return;
+  const request = identity();
+  const attempt = h.store.beginAttempt(request);
+  h.store.settleAttempt(request.operationKey, attempt.attemptId, { submitted: true, auditPending: true });
+  assert.equal(h.store.promoteFromAudit(exactAudit(attempt.attemptId)).promoted, true);
+  now = 2000;
+  h.store.prune(now);
+  assert.equal(h.store.get(request.operationKey), null);
+  const reopened = createAgentSendReceiptStore(h.db, { randomUUID: () => 'new-attempt' });
+  const next = reopened.beginAttempt(request);
+  reopened.settleAttempt(request.operationKey, next.attemptId, { submitted: true, auditPending: true });
+  const result = reopened.promoteFromAudit(exactAudit(next.attemptId));
+  assert.equal(result.promoted, false);
+  assert.equal(result.reason, 'canonical-user-already-owned');
+});
+
 test('source-only confirmed receipt learns canonical address without new settlement, survives reopen and rejects conflicts', (t) => {
   let now = 1000;
   const h = openMemoryHarness(t, { now: () => now });
@@ -1074,6 +1155,55 @@ test('History dismissal is durable without changing delivery truth or external s
   assert.equal(retry.action, 'replay');
   assert.equal(retry.retryable, false, 'hiding a warning must not authorize a blind resend');
   assert.equal(getUuidCount(), 1);
+});
+
+test('an exact refusal before any physical attempt can dismiss without inventing an attempt', t => {
+  const h = openMemoryHarness(t, { now: () => 125 });
+  if (!h) return;
+  const request = identity({ surface: 'desktop-history' });
+  h.store.reserveOrGet(request, { queuedAdmission: true });
+  h.store.stageQueuedRequest(request.operationKey, { promptText: 'private old completion' });
+  h.store.settleQueuedNoWrite(request.operationKey, {
+    code: 'agent_send_handoff_conflict', error: 'The same handoffId was already used for a different send request.',
+  });
+  const before = h.store.get(request.operationKey);
+  assert.equal(before.attemptId, null);
+  const input = { operationKey: request.operationKey, attemptId: null,
+    surface: 'desktop-history', tabId: request.tabId, handoffId: request.handoffId };
+  const dismissed = h.store.dismissPresentation(input);
+  assert.equal(dismissed.ok, true, JSON.stringify(dismissed));
+  assert.equal(dismissed.applied, true);
+  assert.equal(dismissed.record.attemptId, null);
+  assert.equal(h.getUuidCount(), 0);
+  assert.equal(dismissed.record.state, 'not-submitted');
+  assert.deepEqual(dismissed.record.receipt, { ...before.receipt,
+    presentationDismissedAt: 125, presentationDismissedSurface: 'desktop-history' });
+  assert.equal(dismissed.record.settledAt, before.settledAt);
+  assert.equal(h.store.dismissPresentation(input).idempotent, true);
+  const replacement = h.store.beginAttempt(request);
+  assert.ok(replacement.attemptId);
+  assert.equal(h.store.dismissPresentation(input).reason, 'stale-attempt', 'null is not a wildcard for a new attempt');
+});
+
+test('explicit null presentation identity remains exact across origins, states and failed inputs', t => {
+  const h = openMemoryHarness(t);
+  if (!h) return;
+  for (const surface of ['desktop-history', 'project-api', 'inbox']) {
+    const request = identity({ operationKey: surface + ':tab-a:handoff-a', surface });
+    h.store.reserveOrGet(request, { queuedAdmission: true });
+    const input = { operationKey: request.operationKey, attemptId: null,
+      surface: 'desktop-history', tabId: request.tabId, handoffId: request.handoffId };
+    for (const patch of [{tabId:'foreign'}, {handoffId:'foreign'}]) {
+      assert.equal(h.store.dismissPresentation({...input,...patch}).reason, 'presentation-identity-mismatch');
+    }
+    for (const attemptId of [undefined, '', 1, {}, false]) {
+      assert.equal(h.store.dismissPresentation({...input,attemptId}).reason, 'invalid-presentation-dismiss');
+    }
+    const hidden = h.store.dismissPresentation(input);
+    assert.equal(hidden.ok, true);
+    assert.equal(hidden.record.surface, surface);
+    assert.equal(hidden.record.state, 'reserved', 'presentation is not cancellation or a delivery outcome');
+  }
 });
 
 test('consuming a recovered pre-Enter draft hides only its presentation and keeps not-submitted truth', (t) => {

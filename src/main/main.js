@@ -588,6 +588,18 @@ const {
   createCodexContextSessionObserver,
 } = require(path.join(srcMainDir, 'codex-context-session-observer'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
+const { createWorkflowOrganizationApi, registerWorkflowOrganizationIpc } = require(path.join(srcMainDir, 'workflow-organization-api'));
+const workflowOrganization = createWorkflowOrganizationApi({ database: projectManager.db,
+  captureExecution: tabId => ({...captureConversationOwner(tabId),inputRevision:getTerminalInputRevision(tabId),
+    lifecycleGeneration:getTerminalLifecycleGeneration(tabId)}),
+  publish: publication => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send('workflow:changed', publication);
+    }
+  },
+});
+projectManager.workflowOrganization = workflowOrganization;
+registerWorkflowOrganizationIpc(ipcMain, workflowOrganization);
 const { createSavedPromptService } = require(path.join(srcMainDir, 'saved-prompt-service'));
 const { createSystemPromptService } = require(path.join(srcMainDir, 'system-prompt-service'));
 const systemPromptService = createSystemPromptService({
@@ -623,9 +635,14 @@ const { buildPromptMenuTemplate } = require(path.join(srcMainDir, 'prompt-menu-t
 const projectPromptsIpc = require(path.join(srcMainDir, 'ipc', 'project-prompts'));
 const projectPromptCatalog = new ProjectPromptCatalogService({
   db: projectManager.db,
+  rootRegistry: workflowOrganization.roots,
   layoutStore: sharedFileLayoutStore,
   onChanged: projectPromptsIpc.broadcastProjectPromptsChanged,
 });
+workflowOrganization.roots.onChanged=change=>{
+  projectPromptCatalog.invalidateTabs(change.tabIds || null,'root-bindings-changed');
+  projectPromptCatalog.refreshWatchers();
+};
 const { GtEditorTransferClient } = require(path.join(srcMainDir, 'gt-editor-transfer-client'));
 const gtEditorTransferClient = new GtEditorTransferClient({
   clipboard,
@@ -674,10 +691,10 @@ const { TabWorkContext } = require(path.join(srcMainDir, 'tab-work-context'));
 let projectCardSignals = null;
 const tabWorkContext = new TabWorkContext({
   db: projectManager.db.db,
-  listTabs: () => projectManager.db.db.prepare(`SELECT tab_id AS tabId, project_id AS projectId,
+  listTabs: () => projectManager.db.db.prepare(`SELECT tab_id AS tabId, COALESCE(project_id,execution_namespace) AS projectId,
     name, cwd, tab_type AS tabType, file_path AS filePath, visual_parent_tab_id AS visualParentTabId,
     command_type AS commandType, claude_session_id AS claudeSessionId, codex_session_id AS codexSessionId
-    FROM tabs WHERE tab_id IS NOT NULL`).all(),
+    FROM tabs WHERE tab_id IS NOT NULL AND execution_archived=0`).all(),
   archivedTab: (tabId) => {
     const rows = projectManager.db.getTabHistoryEntriesByTabId(tabId);
     if (rows.length !== 1) return null;
@@ -1051,7 +1068,7 @@ const {
   TerminalCwdChangeProofRegistry,
 } = require(path.join(srcMainDir, 'terminal-cwd-change'));
 const { TabHistoryRestoreLeases } = require(path.join(srcMainDir, 'tab-history-restore-leases'));
-const { runSaveTabsWithAck } = require(path.join(srcMainDir, 'save-tabs-ack'));
+const { runSaveTabsWithAck, runSaveTabsBatchWithAck } = require(path.join(srcMainDir, 'save-tabs-ack'));
 const { validateForceCleanupTabIds } = require(path.join(srcMainDir, 'save-tabs-precondition'));
 const {
   commitTabGroupProjectTransfer,
@@ -1238,6 +1255,7 @@ const tabHistoryRestoreLeases = new TabHistoryRestoreLeases({
   deleteById: (id) => projectManager.db.deleteTabHistoryEntry(id),
   token: () => crypto.randomBytes(18).toString('hex'),
 });
+workflowOrganization.archive.bindLeases(tabHistoryRestoreLeases);
 const codexImageTransport = new CodexImageTransport({
   // Codex recognizes a pasted local image path as an attachment, but its TUI
   // path detector does not accept the whitespace in macOS "Application Support".
@@ -1315,7 +1333,7 @@ function noteProjectCardSignalsChanged(projectId = null, tabId = null) {
   if (!projectCardSignals) return;
   try {
     if (!projectId && tabId) {
-      projectId = projectManager.db.db.prepare('SELECT project_id FROM tabs WHERE tab_id=? LIMIT 1').get(tabId)?.project_id;
+      projectId = projectManager.db.db.prepare('SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id=? LIMIT 1').get(tabId)?.project_id;
       if (!projectId) return;
     }
     projectCardSignals.invalidate(projectId);
@@ -8262,7 +8280,7 @@ function resolveActivityIdentity(tabId, engine) {
     if (projectManager?.db?.db) {
       try {
         row = projectManager.db.db.prepare(
-          'SELECT project_id, name, claude_session_id, gemini_session_id, codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+          'SELECT COALESCE(project_id,execution_namespace) AS project_id, name, claude_session_id, gemini_session_id, codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
         ).get(tabId);
       } catch {}
     }
@@ -8343,7 +8361,7 @@ function computeActiveLoaders() {
     if (projectManager?.db?.db) {
       try {
         row = projectManager.db.db.prepare(
-          'SELECT project_id, name, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id, restart_after_tab_id, restart_after_tab_ids, restart_after_workflow_ids, restart_after_command, restart_after_paused FROM tabs WHERE tab_id = ? LIMIT 1'
+          'SELECT COALESCE(project_id,execution_namespace) AS project_id, name, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id, restart_after_tab_id, restart_after_tab_ids, restart_after_workflow_ids, restart_after_command, restart_after_paused FROM tabs WHERE tab_id = ? LIMIT 1'
         ).get(tabId) || null;
       } catch {}
     }
@@ -8560,7 +8578,7 @@ function computeProjectActivity() {
     if (projectManager?.db?.db) {
       try {
         row = projectManager.db.db.prepare(
-          'SELECT project_id, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+          'SELECT COALESCE(project_id,execution_namespace) AS project_id, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
         ).get(tabId) || null;
       } catch {}
     }
@@ -8813,7 +8831,7 @@ function readPublicTabActivityState() {
     .map(tab => [tab.tabId, tab.turnBusy === true]));
   const pending = new Set(agentSendActivity.snapshot().pendingTabIds);
   const rows = projectManager.db.db.prepare(
-    'SELECT tab_id, project_id, command_type, tab_type FROM tabs',
+    'SELECT tab_id, COALESCE(project_id,execution_namespace) AS project_id, command_type, tab_type FROM tabs WHERE execution_archived=0',
   ).all();
   return { known: true, tabs: rows.filter(row => row.tab_type !== 'file').map(row => {
     const tabId = row.tab_id;
@@ -8830,6 +8848,24 @@ function readPublicTabActivityState() {
 ipcMain.on('tab-activity:process-bar', (event, value) => {
   if (!BrowserWindow.fromWebContents(event.sender) || event.sender.isDestroyed()) return;
   require(path.join(srcMainDir, 'web-server')).observeTabActivityStyle?.(value, undefined, event.sender);
+});
+
+ipcMain.handle('workspace-switcher:register', event =>
+  require(path.join(srcMainDir, 'web-server')).registerWorkspaceSwitcher(event));
+ipcMain.on('workspace-switcher:changed', (event, value) =>
+  require(path.join(srcMainDir, 'web-server')).noteWorkspaceSwitcherChanged(event, value));
+ipcMain.on('workspace-switcher:unregister', (event, value) =>
+  require(path.join(srcMainDir, 'web-server')).unregisterWorkspaceSwitcher(event, value));
+
+ipcMain.handle('run-after:main-epoch', () => require(path.join(srcMainDir, 'web-server')).runAfterMainEpoch());
+ipcMain.handle('run-after:validate-scope', (event, input) => require(path.join(srcMainDir, 'web-server')).validateRunAfterScope(event, input));
+ipcMain.on('run-after:metadata-wake', (event, input) => require(path.join(srcMainDir, 'web-server')).noteRunAfterWake(event, input));
+ipcMain.handle('run-after:stage', (event, input) => require(path.join(srcMainDir, 'web-server')).stageRunAfterOperation(event, input));
+ipcMain.handle('run-after:owner-busy-proof', (event, input) => require(path.join(srcMainDir, 'web-server')).runAfterOwnerBusyProof(event, input));
+ipcMain.handle('run-after:commit', (event, input) => {
+  const result = require(path.join(srcMainDir, 'web-server')).commitRunAfterOperation(event, input);
+  if (result.committed && input?.writes?.promptQueueByTab) schedulePromptQueueAssetGc(input.writes.promptQueueByTab, 'run-after-api');
+  return result;
 });
 
 function scheduleProjectActivityBroadcast(reason = 'event') {
@@ -8970,7 +9006,7 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
       + ' error=-');
     try {
       const persisted = projectManager?.db?.db?.prepare(
-        'SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1'
+        'SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id = ? LIMIT 1'
       ).get(tabId) || null;
       if (persisted?.project_id) scheduleProjectLayoutBroadcast(persisted.project_id, reason);
       else scheduleProjectActivityBroadcast(reason);
@@ -9048,7 +9084,7 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
   });
   try {
     const persisted = projectManager?.db?.db?.prepare(
-      'SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1'
+      'SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id = ? LIMIT 1'
     ).get(tabId) || null;
     if (persisted?.project_id) scheduleProjectLayoutBroadcast(persisted.project_id, reason);
     else scheduleProjectActivityBroadcast(reason);
@@ -9272,7 +9308,7 @@ async function readMainPublicRuntimeSnapshot(tabId) {
 
 function captureMainAgentParams(tabId) {
   const row = projectManager.db.db.prepare(
-    'SELECT tab_type, command_type, project_id, cwd, claude_session_id, codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1',
+    'SELECT tab_type, command_type, COALESCE(project_id,execution_namespace) AS project_id, cwd, claude_session_id, codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1',
   ).get(tabId);
   if (!row) return null;
   const physical = captureAiProcessLookupScope(tabId);
@@ -13728,7 +13764,7 @@ function clearCodexLifecycleWarning(
 function setCodexLifecycleWarning(tabId, warning, reason = 'detected', { publish = true } = {}) {
   if (!tabId || !warning?.type) return null;
   const previous = codexLifecycleWarnings.get(tabId);
-  if (['codex_capacity_retry_exhausted', 'codex_capacity_retry_not_submitted'].includes(previous?.code)
+  if (['codex_capacity_retry_exhausted', 'codex_capacity_retry_not_submitted', 'codex_capacity_retry_waiting'].includes(previous?.code)
     && warning.code === 'codex_model_at_capacity'
     && previous.turnId === warning.turnId
     && previous.terminalLifecycleGeneration === warning.terminalLifecycleGeneration) {
@@ -13837,6 +13873,20 @@ function getCodexCapacityRetryRuntime() {
       generation: owner.generation, handoffId: effect.handoffId, isCurrent,
     }),
     cancelSend: (tabId, handoffId, reason) => agentSendCancellations.cancel(tabId, handoffId, { reason }),
+    waiting: (owner, effect) => {
+      if (effect) setCodexLifecycleWarning(owner.tabId, {
+        type: 'model-capacity', code: 'codex_capacity_retry_waiting',
+        id: 'capacity-wait:' + effect.handoffId, retryAt: effect.deadline,
+        message: 'Перегрузка модели: ожидание повтора (пауза ' + Math.round(effect.delayMs / 60_000) + ' мин).',
+        terminalLifecycleGeneration: owner.generation, turnId: effect.errorId,
+      }, 'capacity-retry-waiting');
+      else {
+        const current = codexLifecycleWarnings.get(owner.tabId);
+        if (current?.code === 'codex_capacity_retry_waiting' && current.terminalLifecycleGeneration === owner.generation) {
+          clearCodexLifecycleWarning(owner.tabId, 'capacity-wait-ended', current.id);
+        }
+      }
+    },
     notify: async (owner, effect, failure = null, delivery = null) => {
       const projectId = resolveAuthoritativeTabProjectId(owner.tabId);
       if (!projectId) return;
@@ -13876,6 +13926,7 @@ ipcMain.on('codex-capacity-retry:settings-updated', (_event, settings = {}) => {
     else if (!codexCapacityRetryWasEnabled) codexCapacityRetryRuntime.reset(owner, Math.max(0, Number(owner.watcher.offset || 0) - 1));
   }
   codexCapacityRetryWasEnabled = enabled;
+  codexCapacityRetryRuntime?.settingsChanged(settings);
 });
 
 function observeCodexCapacityRetryRecord(state, record, suppressed) {
@@ -13883,6 +13934,10 @@ function observeCodexCapacityRetryRecord(state, record, suppressed) {
     || !Number.isFinite(record.__byteOffset)
     || record.__byteOffset < Number(state.capacityRetryLiveAfterOffset ?? Infinity)) return;
   const event = classifyCodexCapacityRetryRecord(record);
+  if (!event && record.type === 'event_msg' && ['task_started', 'user_message'].includes(record.payload?.type)) {
+    codexCapacityRetryRuntime?.activity({ tabId: state.tabId, sessionId: state.sessionId, watcher: state,
+      terminal: terminals.get(state.tabId), generation: getTerminalLifecycleGeneration(state.tabId) }, record.__byteOffset);
+  }
   if (!event || (event.type === 'progress' && !state.busy)) return;
   const owner = {
     tabId: state.tabId, sessionId: state.sessionId, watcher: state,
@@ -14627,7 +14682,7 @@ function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason, runtim
     let persisted = null;
     try {
       persisted = projectManager?.db?.db?.prepare(
-        'SELECT project_id, claude_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+        'SELECT COALESCE(project_id,execution_namespace) AS project_id, claude_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
       ).get(tabId) || null;
     } catch {}
     const materializationSessionId = persisted?.claude_session_id || bridgeKnownSessions.get(tabId) || null;
@@ -14655,7 +14710,7 @@ function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason, runtim
     let persisted = null;
     try {
       persisted = projectManager?.db?.db?.prepare(
-        'SELECT project_id, codex_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+        'SELECT COALESCE(project_id,execution_namespace) AS project_id, codex_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
       ).get(tabId) || null;
     } catch {}
     const writerProof = getCodexWriterProofSnapshot(tabId);
@@ -15091,7 +15146,7 @@ function captureStartupInterruptedAgentSnapshot() {
   try {
     startupInterruptedAgentSnapshot = resolveStartupInterruptedSnapshot({
       persistedSnapshot: projectManager.db.getAppState(SHUTDOWN_INTERRUPTED_SESSIONS_KEY),
-      projects: projectManager.db.getAllProjects(),
+      projects: workflowOrganization.ready() ? workflowOrganization.listNamespaces() : projectManager.db.getAllProjects(),
       resolvedAt: Date.now(),
     });
     startupInterruptedAgentSnapshot.targets = startupInterruptedAgentSnapshot.targets.filter(target => (
@@ -19598,7 +19653,8 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
   let promptGroups = [];
   let projectCatalog = null;
   try { promptGroups = projectManager.getPromptGroups(); } catch {}
-  try { if (projectId) projectCatalog = projectPromptCatalog.listProject(projectId); } catch (e) {
+  try { if (tabId && workflowOrganization.ready()) projectCatalog = projectPromptCatalog.listTab(tabId);
+    else if(projectId) projectCatalog = projectPromptCatalog.listProject(projectId); } catch (e) {
     console.warn('[ProjectPrompts] terminal menu load failed:', e.message);
   }
   const buildInsertData = (prompt) => ({
@@ -19748,7 +19804,8 @@ ipcMain.on('show-sdk-context-menu', (event, { tabId, projectId, hasSelection, fo
   template.push({ role: 'paste' });
 
   let projectCatalog = null;
-  try { if (projectId) projectCatalog = projectPromptCatalog.listProject(projectId); } catch (e) {
+  try { if (tabId && workflowOrganization.ready()) projectCatalog = projectPromptCatalog.listTab(tabId);
+    else if(projectId) projectCatalog = projectPromptCatalog.listProject(projectId); } catch (e) {
     console.warn('[ProjectPrompts] SDK menu load failed:', e.message);
   }
   const buildInsertData = (prompt) => ({
@@ -20328,7 +20385,7 @@ async function _loadSessionTurns(sessionId, cwd, options = {}) {
 function _historyReadBindings(sessionId) {
   const bindings = [];
   for (const table of ['tabs', 'tab_history']) {
-    const rows = projectManager.db.db.prepare(`SELECT tab_id, project_id, cwd, command_type,
+    const rows = projectManager.db.db.prepare(`SELECT tab_id, COALESCE(project_id,execution_namespace) AS project_id, cwd, command_type,
       claude_session_id, codex_session_id FROM ${table}
       WHERE claude_session_id = ? OR codex_session_id = ?`).all(sessionId, sessionId);
     for (const row of rows) for (const provider of ['claude', 'codex']) {
@@ -20388,10 +20445,10 @@ function _sessionHistoryAppRelations(sessionId) {
   if (!sessionId || !projectManager?.db?.db) return empty;
   try {
     const rows = projectManager.db.db.prepare(`
-      SELECT project_id, tab_id, name, command_type, visual_parent_tab_id,
+      SELECT COALESCE(project_id,execution_namespace) AS project_id, tab_id, name, command_type, visual_parent_tab_id,
              claude_session_id, codex_session_id, created_at
       FROM tabs
-      WHERE claude_session_id = ? OR codex_session_id = ?
+      WHERE execution_archived=0 AND (claude_session_id = ? OR codex_session_id = ?)
       ORDER BY created_at, id
     `).all(sessionId, sessionId);
     const openTabs = rows.map((row) => {
@@ -20399,7 +20456,7 @@ function _sessionHistoryAppRelations(sessionId) {
         ? projectManager.db.db.prepare(`
             SELECT tab_id, name, claude_session_id, codex_session_id
             FROM tabs
-            WHERE project_id = ? AND tab_id = ?
+            WHERE COALESCE(project_id,execution_namespace) = ? AND tab_id = ?
             LIMIT 1
           `).get(row.project_id, row.visual_parent_tab_id)
         : null;
@@ -20417,7 +20474,7 @@ function _sessionHistoryAppRelations(sessionId) {
       };
     });
     const archivedTabs = projectManager.db.db.prepare(`
-      SELECT id, project_id, tab_id, name, command_type, created_at, closed_at
+      SELECT id, COALESCE(project_id,execution_namespace) AS project_id, tab_id, name, command_type, created_at, closed_at
       FROM tab_history
       WHERE claude_session_id = ? OR codex_session_id = ?
       ORDER BY closed_at DESC, id DESC
@@ -21788,7 +21845,7 @@ async function handleOverseerRequest(rawUrl) {
              t.context_pct,
              t.created_at, p.path AS project_path, p.name AS project_title
       FROM tabs t LEFT JOIN projects p ON p.id = t.project_id
-      WHERE t.tab_id IS NOT NULL
+      WHERE t.tab_id IS NOT NULL AND t.execution_archived=0
         AND (
           t.claude_session_id IS NOT NULL
           OR t.codex_session_id IS NOT NULL
@@ -22624,12 +22681,12 @@ function startMcpHttpServer() {
       try {
         if (projectIdHint) {
           const row = projectManager.db.db.prepare(
-            'SELECT project_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+            'SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE COALESCE(project_id,execution_namespace) = ? AND tab_id = ? LIMIT 1'
           ).get(projectIdHint, tabId);
           return row?.project_id || null;
         }
         const rows = projectManager.db.db.prepare(
-          'SELECT DISTINCT project_id FROM tabs WHERE tab_id = ? ORDER BY project_id'
+          'SELECT DISTINCT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id = ? ORDER BY project_id'
         ).all(tabId);
         if (rows.length === 1) return rows[0].project_id || null;
       } catch {}
@@ -22657,7 +22714,7 @@ function startMcpHttpServer() {
         const projectId = resolveProjectForTab(tabId, projectIdHint);
         if (projectId) {
           row = projectManager.db.db.prepare(
-            'SELECT command_type, claude_session_id, gemini_session_id, codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+            'SELECT command_type, claude_session_id, gemini_session_id, codex_session_id FROM tabs WHERE COALESCE(project_id,execution_namespace) = ? AND tab_id = ? LIMIT 1'
           ).get(projectId, tabId);
         }
       } catch {}
@@ -22712,7 +22769,7 @@ function startMcpHttpServer() {
 
           // Get tabs from DB
           const dbTabs = projectManager.db.db.prepare(
-            'SELECT * FROM tabs WHERE project_id = ? ORDER BY position'
+            'SELECT *,COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE COALESCE(project_id,execution_namespace) = ? AND execution_archived=0 ORDER BY position'
           ).all(project.id);
           // A tab list is a passive projection, not a writer reconciliation.
           // Use the same event-owned batch as Project API: per-tab snapshots
@@ -22804,7 +22861,7 @@ function startMcpHttpServer() {
           return;
         }
         const row = projectManager.db.db.prepare(
-          'SELECT project_id, name, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+          'SELECT COALESCE(project_id,execution_namespace) AS project_id, name, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
         ).get(tabId);
         if (!row) {
           res.writeHead(404);
@@ -24384,6 +24441,7 @@ app.whenReady().then(async () => {
       e2eBoundaryTestGate: aiBoundaryTestGate,
       agentSendReceiptStore,
       agentSendReceiptStartupReady,
+      reconcileAgentSendReceipt: reconcileExactAgentSendReceipt,
       mobileAttachmentAssetStore: promptQueueAssetStore,
       cancelAgentSend: record => agentSendCancellations.cancel(record.tabId, record.handoffId,
         { attemptId: record.attemptId || null }),
@@ -24457,6 +24515,10 @@ app.whenReady().then(async () => {
     ipcMain.handle('tab-messages:get', async (_event, payload = {}) => {
       return payload.messageId ? webServer.getTabMessage(payload.messageId) : null;
     });
+    ipcMain.handle('tab-messages:source-location', async (_event, payload = {}) => {
+      return payload.messageId ? webServer.locateTabMessageSource(payload.messageId)
+        : { success: false, error: 'messageId required' };
+    });
     ipcMain.handle('tab-messages:dismiss', async (_event, payload = {}) => {
       return webServer.dismissTabMessage(payload.tabId, payload.messageId);
     });
@@ -24490,9 +24552,10 @@ app.whenReady().then(async () => {
     // root) fires this whenever a tab's queue core changes; we fan it out to any
     // phone subscribed to that tab as a `queue-update` SSE event. webBroadcast
     // no-ops when nobody's subscribed, so this is free on the desktop-only path.
-    ipcMain.on('web:broadcast-queue', (_e, { tabId, queue }) => {
+    ipcMain.on('web:broadcast-queue', (event, { tabId, queue, runAfter }) => {
       if (!tabId) return;
-      _webBroadcast(tabId, { type: 'queue-update', queue });
+      const metadata = webServer.projectRunAfterMetadata(event, { tabId, queue, runAfter });
+      _webBroadcast(tabId, { type: 'queue-update', queue, ...(metadata ? { runAfter: metadata } : {}) });
     });
     // Open the LAN URL in the user's default browser (the StatusBar chip uses
     // this so a single click works without the user having to copy+paste).
@@ -26607,14 +26670,14 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
         + ' expectedAttempt=' + String(durable?.attemptId || '-').slice(0, 12)
         + ' actualAttempt=' + String(audit.sendAttemptId || '-').slice(0, 12)
         + ' state=' + (durable?.state || 'missing'));
-      return;
+      return false;
     }
     if (result?.success === true) {
       const attachmentSourceRecord = durable.receipt?.ownedAttachmentProjection
         ? attachmentProjectionSourceRecord(durable) : durable;
       if (!attachmentSourceRecord) {
         console.warn('[AgentSendReceipt] owned attachment projection invalid operation=' + audit.sendOperationKey);
-        return;
+        return false;
       }
       if (toolType === 'claude' && attachmentSourceRecord.promptHash !== (result.expectedHash || audit.expectedHash)) {
         const projection = projectClaudePromptAuditToRequest({ tabId, record: durable, audit, result });
@@ -26657,7 +26720,7 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
         const projection = projectOwnedAttachmentAuditToRequest(durable, result);
         if (!projection.applied) {
           console.warn('[OwnedAttachmentAudit] rejected operation=' + audit.sendOperationKey + ' reason=' + projection.reason);
-          return;
+          return false;
         }
         result = { ...result, expectedHash: projection.requestHash, expectedLen: projection.requestLength,
           canonicalized: true, canonicalReason: projection.canonicalReason };
@@ -26675,6 +26738,8 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
         canonicalReason: result.canonicalReason || null,
         entryUuid: result.entryUuid || null,
         sourceIdentity: result.sourceIdentity || null,
+        entryUuidAliases: result.entryUuidAliases || [],
+        sourceIdentityAliases: result.sourceIdentityAliases || [],
         recordByteOffset: result.recordByteOffset ?? null,
         transcriptBoundary: result.transcriptBoundary || null,
         auditTimestamp: result.auditTimestamp || null,
@@ -26688,7 +26753,7 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
           + ' attempt=' + String(audit.sendAttemptId).slice(0, 12)
           + ' reason=' + (durablePromotion?.reason || 'unknown')
           + ' mismatches=' + (durablePromotion?.mismatchedFields || []).join(','));
-        return;
+        return false;
       }
       if (toolType === 'claude' || durable.receipt?.ownedAttachmentProjection) {
         try {
@@ -26706,6 +26771,18 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
           recordByteOffset: result.recordByteOffset ?? durablePromotion.record?.receipt?.recordByteOffset ?? null };
       }
       if (toolType === 'codex') enrichCodexAuditAddress(tabId, audit, result, durablePromotion.record);
+    }
+  }
+  if (toolType === 'codex' && result?.success === true && result.presentation) {
+    try {
+      result.presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
+        toolType, sessionId: result.sessionId, auditTimestamp: result.auditTimestamp,
+        actualText: result.presentation.text, actualHash: result.presentation.hash,
+        snapshot: result.presentation.snapshot,
+      });
+    } catch (error) {
+      console.warn('[CodexPasteAudit] presentation save failed tab=' + String(tabId).slice(-12)
+        + ' handoff=' + audit.handoffId + ' error=' + (error?.message || String(error)));
     }
   }
   const baseDetail = {
@@ -26775,9 +26852,10 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
     // exact task_started supplies the adopted writer/turn.
     routeAgentPromptAuditDetail(detail, { renderer: true, web: false });
     deferCodexPromptAuditExecutionContext(detail);
-    return;
+    return true;
   }
   routeAgentPromptAuditDetail(detail);
+  return true;
 }
 
 function holdPasteAuditCompletionForTest(toolType, tabId, audit, result, resume) {
@@ -27310,13 +27388,21 @@ function observeCodexQueuedMessageCommittedFrame(tabId, mirror, snapshot) {
 
 function finishCodexPasteAudit(tabId, audit, result, e2eBypass = false) {
   if (!audit || audit.finished === true) return;
+  if (result?.success === true && audit.sendOperationKey && audit.sendAttemptId
+    && agentSendReceiptStore.findConflictingAuditClaim({ ...result, provider: 'codex',
+      operationKey: audit.sendOperationKey, attemptId: audit.sendAttemptId })) {
+    console.warn('[CodexPasteAudit] canonical-user-already-owned tab=' + String(tabId).slice(-12));
+    return false;
+  }
   if (!e2eBypass && holdPasteAuditCompletionForTest(
     'codex',
     tabId,
     audit,
     result,
     () => finishCodexPasteAudit(tabId, audit, result, true),
-  )) return;
+  )) return true;
+  const published = publishAgentPromptAuditResult(tabId, audit, result, 'codex');
+  if (result?.success === true && published === false) return false;
   audit.finished = true;
   audit.result = result;
   if (audit.timer) clearTimeout(audit.timer);
@@ -27325,11 +27411,11 @@ function finishCodexPasteAudit(tabId, audit, result, e2eBypass = false) {
     releaseCodexProvisionalSourceAfterMatchedAudit(tabId, audit, result);
   }
   removePendingCodexPasteAudit(tabId, audit);
-  publishAgentPromptAuditResult(tabId, audit, result, 'codex');
   if (typeof audit.resolve === 'function') {
     audit.resolve(result);
     audit.resolve = null;
   }
+  return true;
 }
 
 function waitForCodexPasteAudit(tabId, audit, timeoutMs = CODEX_PASTE_AUDIT_TIMEOUT_MS) {
@@ -31771,6 +31857,8 @@ function resolveAgentSendCancellationAttempt(tabId, handoffId, requestedAttemptI
 
 ipcMain.handle('agent:enqueue-prompt', (_event, input) =>
   require(path.join(srcMainDir, 'web-server')).enqueueDesktopAgentPrompt(input));
+ipcMain.handle('agent:join-automatic-send', (_event, input) =>
+  require(path.join(srcMainDir, 'web-server')).joinAutomaticAgentPrompt(input));
 const sendQueueRendererObservers = new Set();
 ipcMain.handle('agent:send-queue-ready', (event, ready = true) => {
   const ownerId = event.sender.id;
@@ -31935,9 +32023,12 @@ ipcMain.handle('agent:dismiss-send-receipt-presentation', async (_event, input =
   console.warn('[AgentSendReceipt] presentation dismiss'
     + ' tab=' + tabId.slice(-12)
     + ' handoff=' + handoffId
+    + ' attempt=' + (record.attemptId || 'none')
+    + ' state=' + record.state
     + ' applied=' + (result.applied === true ? '1' : '0')
     + ' idempotent=' + (result.idempotent === true ? '1' : '0')
-    + ' reason=' + (result.reason || '-'));
+    + ' reason=' + (result.reason || '-')
+    + ' detail=' + (result.error || '-'));
   if (result.ok) require(path.join(srcMainDir, 'web-server')).releaseQueuedSendPresentation(record.operationKey);
   return {
     success: result.ok === true,
@@ -35241,13 +35332,13 @@ function commitCodexNativeSettingsIntent(tabId, observation) {
   let persistenceError = null;
   try {
     const db = projectManager?.db;
-    const row = db?.db?.prepare('SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
+    const row = db?.db?.prepare('SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
     if (!row?.project_id || !db?.updateTabProviderState) throw new Error('native-settings-tab-persistence-unavailable');
     const persist = () => {
       db.updateTabProviderState(tabId, next);
       // This legacy DB method logs and swallows write errors. Verify its exact
       // row inside the same transaction before claiming B survives a restart.
-      const stored = db.db.prepare('SELECT provider_state FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1')
+      const stored = db.db.prepare('SELECT provider_state FROM tabs WHERE COALESCE(project_id,execution_namespace) = ? AND tab_id = ? LIMIT 1')
         .get(row.project_id, tabId);
       if (stored?.provider_state !== JSON.stringify(next)) throw new Error('native-settings-intent-persistence-unconfirmed');
       if (!conversationOnly && db.updateTabCodexSettings(row.project_id, tabId, {
@@ -35305,7 +35396,7 @@ async function refreshCodexNativeConversationFallback(tabId, observation, expect
       || scope.runSeq !== observation.scope.runSeq || scope.lifecycleGeneration !== observation.scope.lifecycleGeneration
       || codexNativeSettingsIntentTracker.hasPending(tabId)
       || (fallback.codexSettingsProofSessionId && fallback.codexSettingsProofSessionId !== scope.ownerId)) return;
-    const row = projectManager?.db?.db?.prepare('SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
+    const row = projectManager?.db?.db?.prepare('SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
     if (!row?.project_id || projectManager.db.updateTabCodexSettings(row.project_id, tabId, {
       model: fallback.model, effort: fallback.effort, proofAt: Date.now(), proofSessionId: null,
     }) !== true) throw new Error('native-conversation-fallback-persistence-failed');
@@ -40350,8 +40441,10 @@ ipcMain.handle('terminal:updateCwd', async (event, { tabId, cwd } = {}) => {
   }
 
   let persisted = false;
+  let executionReceipt;
   try {
-    persisted = projectManager.db.updateTabCwd(tabId, result.cwd);
+    const commit=projectManager.db.updateProvenTabCwd(tabId,result.cwd);
+    persisted=commit.persisted;executionReceipt=commit.executionReceipt;
   } catch (error) {
     console.warn('[TerminalCwdProof] point-persist failed ' + JSON.stringify({
       tabId,
@@ -40376,7 +40469,7 @@ ipcMain.handle('terminal:updateCwd', async (event, { tabId, cwd } = {}) => {
     persisted,
     cwdChangeOperationId: cwdChangeProof.matched ? cwdChangeProof.operationId : null,
   }));
-  return { ...result, persisted };
+  return { ...result, persisted,...(executionReceipt?{executionReceipt}:{}) };
 });
 
 // Change only this tab's working directory. The command is written at the same
@@ -40729,7 +40822,7 @@ ipcMain.handle('terminal:get-last-project-command', async (event, request = {}) 
     if (terminalProjectIds.has(tabId)) return terminalProjectIds.get(tabId);
     try {
       return projectManager?.db?.db
-        ?.prepare('SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1')
+        ?.prepare('SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id = ? LIMIT 1')
         .get(tabId)?.project_id || null;
     } catch {
       return null;
@@ -41015,6 +41108,7 @@ async function garbageCollectPromptQueueAssets(queueState, reason = 'state-save'
     for (const assetId of historyPresentationAssets) referenced.add(assetId);
     for (const assetId of promptQueueAssetSessionLeases) referenced.add(assetId);
     for (const assetId of require(path.join(srcMainDir, 'agent-send-queue')).readQueuedSendAssetIds(projectManager.db.db)) referenced.add(assetId);
+    for (const assetId of require(path.join(srcMainDir, 'run-after-operation-journal')).readRunAfterAssetIds(projectManager.db.db)) referenced.add(assetId);
     const result = await promptQueueAssetStore.garbageCollect(referenced);
     require(path.join(srcMainDir, 'agent-send-queue')).forgetCollectedUploadAliases(projectManager.db.db, result.removed);
     if (result.removed.length > 0) {
@@ -41537,7 +41631,26 @@ ipcMain.handle('codex:reconcile-native-rewind-before-history-rewrite', async (_e
   });
 });
 
-ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, expectedTabIds }) => {
+ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, expectedTabIds, tabSnapshots,groupFileCloseGuard }) => {
+  if (tabSnapshots !== undefined) {
+    const result = runSaveTabsBatchWithAck({
+      snapshots: tabSnapshots,
+      transaction: operation => projectManager.db.db.transaction(operation),
+      getTabIds: id => projectManager.db.getProjectTabIds(id),
+      save: row => projectManager.saveProjectTabs(row.projectId, row.tabs, true, _gracefulShutdownInProgress),
+      ...(groupFileCloseGuard?{
+        beforeSave:snapshots=>workflowOrganization.groupActions.prepareClose(groupFileCloseGuard,snapshots),
+        afterSave:proof=>workflowOrganization.groupActions.finishClose(proof),
+      }:{}),
+    });
+    if (result.success === true && !_gracefulShutdownInProgress) {
+      for (const id of result.projectIds) noteProjectCardSignalsChanged(id);
+      void tabWorkContext.syncLinks().catch((error) => console.warn('[TabContext] close batch sync:', error.message));
+    }
+    console.log('[SaveTabs] close batch projects=' + (Array.isArray(tabSnapshots) ? tabSnapshots.length : 0)
+      + ' success=' + (result.success === true) + ' error=' + (result.error || '-'));
+    return result.success === true ? {...result,executionRevisions:result.projectIds.flatMap(id => workflowOrganization.storageRevisions(id))} : result;
+  }
   // During shutdown the renderer is still alive through the proxy-drain stall;
   // any save here would reinsert rows with was_interrupted=0 from the in-memory
   // tab and clobber before-quit's EARLY-MARK. preserveInterrupted=true makes
@@ -41558,6 +41671,7 @@ ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, exp
   const result = runSaveTabsWithAck(() => (
     projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress)
   ));
+  if (result.success === true) result.executionRevisions = workflowOrganization.storageRevisions(projectId);
   if (result.success === true && !_gracefulShutdownInProgress) {
     noteProjectCardSignalsChanged(projectId);
     void tabWorkContext.syncLinks().catch((error) => console.warn('[TabContext] save sync:', error.message));
@@ -41573,6 +41687,8 @@ ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, exp
   if (result.success !== true) {
     console.warn('[SaveTabs] not committed project=' + String(projectId || '').slice(-12) +
       ' error=' + result.error +
+      (result.revisionConflict ? ' tab=' + result.revisionConflict.tabId + ' expectedRevision=' + result.revisionConflict.expectedRevision
+        + ' actualRevision=' + result.revisionConflict.actualRevision : '') +
       ' durMs=' + durMs);
   }
   return result;
@@ -42415,7 +42531,9 @@ function getCodexArchiveGeneration(tabId) {
 function commitTabArchive(projectId, tab, {
   sourceTabId = null,
   codexWriterSessionId = null,
+  groupCloseGuard = null,
 } = {}) {
+  if(groupCloseGuard) workflowOrganization.groupActions.assertCloseGuard(groupCloseGuard);
   const started = Date.now();
   const tabType = tab?.tabType || tab?.tab_type || 'terminal';
   if (tabType === 'file') {
@@ -42457,7 +42575,7 @@ function commitTabArchive(projectId, tab, {
   };
 }
 
-ipcMain.handle('project:archive-tab', async (event, { projectId, tab }) => {
+ipcMain.handle('project:archive-tab', async (event, { projectId, tab, groupCloseGuard }) => {
   const sourceTabId = tab?.tabId || null;
   const resolvedToolType = sourceTabId
     ? resolveAiToolTypeForTab(sourceTabId, null)
@@ -42469,7 +42587,7 @@ ipcMain.handle('project:archive-tab', async (event, { projectId, tab }) => {
     ? { ...tab, commandType: resolvedToolType }
     : tab;
   if (resolvedToolType !== 'codex') {
-    return commitTabArchive(projectId, resolvedArchiveTab);
+    return commitTabArchive(projectId, resolvedArchiveTab,{groupCloseGuard});
   }
 
   if (!sourceTabId || !projectId) {
@@ -42554,6 +42672,7 @@ ipcMain.handle('project:archive-tab', async (event, { projectId, tab }) => {
     return commitTabArchive(projectId, archiveTab, {
       sourceTabId,
       codexWriterSessionId: snapshot.source === 'writer-proof' ? snapshot.codexSessionId : null,
+      groupCloseGuard,
     });
   });
 });
@@ -42573,13 +42692,15 @@ ipcMain.handle('project:get-tab-history-count', (event, { projectId }) => {
 });
 
 ipcMain.handle('project:clear-tab-history', (event, { projectId }) => {
-  projectManager.db.clearTabHistory(projectId);
-  return { success: true };
+  const scope=workflowOrganization.archive.clearScope(projectId);
+  return workflowOrganization.archive.clearNamespace({version:1,requestId:crypto.randomUUID(),namespace:projectId,
+    kind:'clear-history',historyIds:scope.historyIds,expectedRowsHash:scope.rowsHash});
 });
 
 ipcMain.handle('project:clear-tab-history-except-notes', (event, { projectId }) => {
-  projectManager.db.clearTabHistoryExceptNotes(projectId);
-  return { success: true };
+  const scope=workflowOrganization.archive.clearScope(projectId);
+  return workflowOrganization.archive.clearNamespace({version:1,requestId:crypto.randomUUID(),namespace:projectId,
+    kind:'clear-except-notes',historyIds:scope.historyIds,expectedRowsHash:scope.rowsHash});
 });
 
 ipcMain.handle('project:delete-tab-history-entry', (event, { id }) => {
@@ -42593,7 +42714,7 @@ ipcMain.handle('project:update-tab-history-title', (event, { id, name, nameSetMa
   let archivedIdentity = null;
   try {
     archivedIdentity = projectManager.db.db.prepare(
-      'SELECT tab_id, project_id FROM tab_history WHERE id = ? LIMIT 1'
+      'SELECT tab_id, COALESCE(project_id,execution_namespace) AS project_id FROM tab_history WHERE id = ? LIMIT 1'
     ).get(id) || null;
   } catch {}
   const success = projectManager.db.updateTabHistoryTitle(id, name, nameSetManually !== false);
@@ -42625,9 +42746,9 @@ ipcMain.handle('project:peek-window-tab-history', (_event, payload = {}) => ({
   entry: projectManager.db.getLatestWindowTabHistory(payload),
 }));
 
-ipcMain.handle('project:begin-tab-history-restore', (event, { projectId, id } = {}) => {
+ipcMain.handle('project:begin-tab-history-restore', (event, { projectId, id, request } = {}) => {
   const started = Date.now();
-  const result = tabHistoryRestoreLeases.begin({ projectId, id });
+  const result = workflowOrganization.archive.beginRestore({ projectId, id, request });
   console.log('[Archive:RestoreBegin] project=' + String(projectId || '').slice(-12) +
     ' id=' + (result.id ?? id ?? 'latest') +
     ' ok=' + result.ok +
@@ -42638,7 +42759,7 @@ ipcMain.handle('project:begin-tab-history-restore', (event, { projectId, id } = 
 
 ipcMain.handle('project:finish-tab-history-restore', (event, request = {}) => {
   const started = Date.now();
-  const result = tabHistoryRestoreLeases.finish(request);
+  const result = workflowOrganization.archive.finishRestore(request);
   console.log('[Archive:RestoreFinish] project=' + String(request.projectId || '').slice(-12) +
     ' id=' + (request.id ?? 'unknown') +
     ' commit=' + (request.commit === true) +
@@ -42693,6 +42814,7 @@ function parseLongPsLine(line) {
     cpu: match[3],
     mem: match[4],
     startTime: match[6].substring(0, 5),
+    processStartedAt:match[5].trim().replace(/\s+/g,' '),
     command: match[7].trim(),
   };
 }
@@ -42781,6 +42903,7 @@ async function listElectronDevProcesses() {
       cwd,
       name: projectName || 'Electron app',
       startTime: row.startTime,
+      processStartedAt:row.processStartedAt,
       command: row.command,
       cpu: row.cpu,
       mem: row.mem,
@@ -42991,8 +43114,8 @@ ipcMain.handle('system:get-electron-dev-processes', async () => {
   }
 });
 
-ipcMain.handle('system:kill-electron-dev-process', async (_event, pid) => {
-  const targetPid = Number(pid);
+ipcMain.handle('system:kill-electron-dev-process', async (_event, request) => {
+  const targetPid = Number(typeof request==='object'?request?.pid:request);
   if (!Number.isInteger(targetPid) || targetPid <= 1) {
     return { success: false, error: 'invalid pid' };
   }
@@ -43006,6 +43129,11 @@ ipcMain.handle('system:kill-electron-dev-process', async (_event, pid) => {
   const descendants = await findDescendantPids(targetPid);
   const pids = Array.from(new Set([targetPid, ...descendants, target.launcherPid].filter(Boolean)));
   const safePids = pids.filter(p => p !== process.pid && p !== process.ppid);
+  if(request?.expectedProcess) {
+    const observation=require(path.join(srcMainDir,'process-observation'));
+    if(!observation.matchesProcessObservation(observation.readProcessObservation(targetPid),request.expectedProcess))
+      return {success:false,error:'process observation changed'};
+  }
   console.log('[ElectronDev] stop pid=' + targetPid + ' name=' + target.name + ' pids=[' + safePids.join(',') + ']');
 
   for (const p of safePids) {
@@ -43211,8 +43339,9 @@ ipcMain.handle('system:get-codex-processes', async () => {
         pid: row.pid,
         ppid: row.ppid,
         cwd,
-        startTime: row.startTime,
-        command: row.command,
+      startTime: row.startTime,
+      processStartedAt:row.processStartedAt,
+      command: row.command,
         tabId,
         cpu: row.cpu,
         mem: row.mem,
@@ -43241,6 +43370,7 @@ async function buildDashboardElectronDevProcessesFromRows(rows) {
       cwd,
       name: projectName || 'Electron app',
       startTime: row.startTime,
+      processStartedAt:row.processStartedAt,
       command: row.command,
       cpu: row.cpu,
       mem: row.mem,
@@ -43281,6 +43411,7 @@ async function buildDashboardAiProcessesFromRows(rows, kind, ownershipSnapshot, 
       ppid: row.ppid,
       cwd,
       startTime: row.startTime,
+      processStartedAt:row.processStartedAt,
       command: row.command,
       tabId,
       cpu: row.cpu,
@@ -43330,6 +43461,7 @@ function buildDashboardMcpProcessesFromRows(rows, ownershipSnapshot) {
       cpu: row.cpu,
       mem: row.mem,
       startTime: row.startTime,
+      processStartedAt:row.processStartedAt,
       command: row.command,
       name,
       isAlive,
@@ -43751,8 +43883,8 @@ ipcMain.handle('system:get-mcp-processes', async () => {
   }
 });
 
-ipcMain.handle('system:kill-process', async (event, pid) => {
-  const targetPid = Number(pid);
+ipcMain.handle('system:kill-process', async (event, request) => {
+  const targetPid = Number(typeof request==='object'?request?.pid:request);
   if (!Number.isInteger(targetPid) || targetPid <= 1) {
     return { success: false, error: 'invalid pid' };
   }
@@ -43770,12 +43902,20 @@ ipcMain.handle('system:kill-process', async (event, pid) => {
     return { success: false, error: 'ownership check failed' };
   }
 
+  const isStillObserved=()=>{
+    if(!request?.expectedProcess)return true;
+    const observation=require(path.join(srcMainDir,'process-observation'));
+    return observation.matchesProcessObservation(observation.readProcessObservation(targetPid),request.expectedProcess);
+  };
+  if(!isStillObserved())return {success:false,error:'process observation changed'};
+
   try {
     await execAsync('kill ' + targetPid, 2000);
     return { success: true };
   } catch {
     // Try SIGKILL if graceful kill failed
     try {
+      if(!isStillObserved())return {success:false,error:'process observation changed'};
       await execAsync('kill -9 ' + targetPid, 2000);
       return { success: true };
     } catch {
@@ -44088,6 +44228,11 @@ ipcMain.handle('system:detect-project-ports', async (event, cwd) => {
 // ---------------------------------------------------------------------------
 
 require(path.join(srcMainDir, 'history-preparation-activity')).installHistoryPreparationIpc({ ipcMain });
+
+const disposeDiskCapacityIpc = require(path.join(srcMainDir, 'disk-capacity-service')).installDiskCapacityIpc({
+  ipcMain, cacheDirectory: path.join(app.getPath('userData'), 'history-prepared-cache'),
+});
+app.once('will-quit', disposeDiskCapacityIpc);
 
 /**
  * Процессы самого приложения: главный, вспомогательные (отрисовка, графика) и
@@ -45317,7 +45462,7 @@ function captureArchivedConversationOwner(tabId) {
   // Reuse the SAME exact archive identity as restore, without restoring or
   // launching anything. Never fall back to an archive for an open/ambiguous tab.
   if (terminals.has(tabId) || getLiveAiRuntimeOwners(tabId).length || sdkSessions.has(tabId)) return { known: false };
-  const openRows = projectManager.db.db.prepare('SELECT project_id FROM tabs WHERE tab_id = ?').all(tabId);
+  const openRows = projectManager.db.db.prepare('SELECT COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE tab_id = ? AND execution_archived=0').all(tabId);
   if (openRows.length) return { known: false };
   const entries = projectManager.db.getTabHistoryEntriesByTabId(tabId, 2);
   if (entries.length !== 1) return { known: false };
@@ -45335,7 +45480,7 @@ function captureConversationOwner(tabId) {
   const projectId = resolveAuthoritativeTabProjectId(tabId);
   if (!projectId) return captureArchivedConversationOwner(tabId);
   const persisted = projectManager.db.db.prepare(
-    'SELECT command_type, cwd, claude_session_id, codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ?'
+    'SELECT command_type, cwd, claude_session_id, codex_session_id, execution_subject_version, execution_subject_id, execution_namespace, tab_id FROM tabs WHERE COALESCE(project_id,execution_namespace) = ? AND tab_id = ?'
   ).get(projectId, tabId);
   if (!persisted) return captureArchivedConversationOwner(tabId);
   const provider = resolveAiToolOwner({ runtimeOwners: getLiveAiRuntimeOwners(tabId),
@@ -45346,6 +45491,9 @@ function captureConversationOwner(tabId) {
   if (sessionId === undefined) return { known: false };
   const actual = readAgentSendDestinationAtWriteBoundary(tabId, provider);
   return { known: true, provider, projectId, cwd: terminalProjects.get(tabId) || persisted.cwd || null,
+    ...(persisted.execution_subject_version === 2 ? {executionScope:{version:2,tabId,
+      subjectId:persisted.execution_subject_id,executionNamespace:persisted.execution_namespace,
+      cwd:terminalProjects.get(tabId) || persisted.cwd || null}} : {}),
     sessionId: sessionId || null, instanceId: conversationOwners.instanceId,
     terminalId: actual.terminalInstanceId, launchId: actual.launchId,
     runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
@@ -50992,10 +51140,35 @@ function releaseCodexProvisionalSourceAfterMatchedAudit(tabId, audit, result) {
   return true;
 }
 
+function publishDurableAgentSendReceiptAudit(record, audit, reason) {
+  const carrier = {
+    handoffId: record.handoffId, sendOperationKey: record.operationKey,
+    sendAttemptId: record.attemptId,
+    source: record.receipt?.source || reason,
+    expectedHash: record.promptHash, expectedLen: record.promptLength,
+    callerTimedOut: true, queuedAtSubmit: record.receipt?.queuedAtSubmit === true,
+  };
+  const auditTimestamp = Number.isFinite(Number(audit.auditTimestamp))
+    ? new Date(Number(audit.auditTimestamp)).toISOString() : audit.auditTimestamp;
+  publishAgentPromptAuditResult(record.tabId, carrier, { ...audit, auditTimestamp }, record.provider);
+}
+
+let exactAgentSendReceiptReconciler = null;
+function reconcileExactAgentSendReceipt(request) {
+  if (!exactAgentSendReceiptReconciler) {
+    exactAgentSendReceiptReconciler = require(path.join(srcMainDir, 'agent-send-receipt-reconcile'))
+      .createAgentSendReceiptReconciler({
+        store: agentSendReceiptStore, tabFlights: durableCodexAuditReconcileInflight,
+        publishAudit: (record, audit) => publishDurableAgentSendReceiptAudit(record, audit, 'explicit-receipt-reconcile'),
+      });
+  }
+  return exactAgentSendReceiptReconciler(request);
+}
+
 function reconcileDurableCodexPromptAuditsForTab(tabId, reason = 'live-user-carrier') {
   if (!tabId || durableCodexAuditReconcileInflight.has(tabId)) return false;
-  const allRecords = agentSendReceiptStore.list({ tabId });
-  const unresolved = allRecords.filter((record) => (
+  const allRecords = agentSendReceiptStore.listAuditReferences('codex');
+  const unresolved = agentSendReceiptStore.list({ tabId }).filter((record) => (
     record?.provider === 'codex'
     && (record.state === AGENT_SEND_DURABLE_STATES.AUDIT_PENDING
       || record.state === AGENT_SEND_DURABLE_STATES.DELIVERY_UNKNOWN)
@@ -51007,27 +51180,11 @@ function reconcileDurableCodexPromptAuditsForTab(tabId, reason = 'live-user-carr
         if (decision?.decision !== 'found' || !decision.audit) continue;
         const record = agentSendReceiptStore.get(decision.operationKey);
         if (!record?.handoffId || record.attemptId !== decision.attemptId) continue;
-        const auditCarrier = {
-          handoffId: record.handoffId,
-          sendOperationKey: record.operationKey,
-          sendAttemptId: record.attemptId,
-          source: record.receipt?.source || 'durable-late-reconcile',
-          expectedHash: record.promptHash,
-          expectedLen: record.promptLength,
-          callerTimedOut: true,
-          queuedAtSubmit: record.receipt?.queuedAtSubmit === true,
-        };
         console.warn('[CodexPasteAudit:DURABLE_MATCH] tab=' + String(tabId).slice(-12)
           + ' handoff=' + record.handoffId
           + ' reason=' + decision.reason
           + ' trigger=' + reason);
-        const auditTimestamp = Number.isFinite(Number(decision.audit.auditTimestamp))
-          ? new Date(Number(decision.audit.auditTimestamp)).toISOString()
-          : decision.audit.auditTimestamp;
-        publishAgentPromptAuditResult(tabId, auditCarrier, {
-          ...decision.audit,
-          auditTimestamp,
-        }, 'codex');
+        publishDurableAgentSendReceiptAudit(record, decision.audit, 'durable-late-reconcile');
       }
       return decisions;
     })
@@ -51047,6 +51204,30 @@ function reconcileDurableCodexPromptAuditsForTab(tabId, reason = 'live-user-carr
   return true;
 }
 
+function observeCodexPromptAuditCarrier(state, record) {
+  if (!state.promptAuditCarrierPairer) state.promptAuditCarrierPairer = createCodexLiveUserCarrierPairer({ allowSourceOnly: true });
+  if (record?.type === 'event_msg') state.promptAuditCarrierPairer.observeBoundary(record.payload?.type);
+  const kind = codexLiveUserCarrierKind(record);
+  if (!kind) return;
+  const sourceIdentity = codexLiveSourceIdentity(state, record, 'codex-user');
+  const uuid = codexDurableUserUuidFromLiveRecord(state, record) || record.uuid || record.id || null;
+  const paired = state.promptAuditCarrierPairer.accept({ kind, text: codexUserMessagePresentationText(record),
+    byteOffset: record.__byteOffset,
+    projection: { sessionId: state.sessionId, recordByteOffset: record.__byteOffset,
+      auditPresentationText: codexUserMessagePresentationText(record),
+      timestamp: record.timestamp, message: { sessionId: state.sessionId, uuid, sourceIdentity } },
+  });
+  const canonical = paired.projections[0];
+  const message = canonical?.message;
+  record.__auditCanonicalCarrier = { sourceIdentity: message?.sourceIdentity || sourceIdentity,
+    entryUuid: message?.uuid || uuid, recordByteOffset: canonical?.recordByteOffset ?? record.__byteOffset,
+    timestamp: canonical?.timestamp || record.timestamp, presentationText: canonical?.auditPresentationText,
+    firstByteOffset: canonical?.firstRecordByteOffset ?? canonical?.recordByteOffset ?? record.__byteOffset,
+    firstTimestamp: canonical?.firstRecordTimestamp || canonical?.timestamp || record.timestamp };
+  record.__auditSourceIdentityAliases = message?.sourceIdentityAliases || [];
+  record.__auditEntryUuidAliases = message?.entryUuidAliases || [];
+}
+
 function processCodexUserMessagePasteAudit(state, record) {
   const audits = getPendingCodexPasteAudits(state.tabId);
   if (audits.length === 0) {
@@ -51062,7 +51243,7 @@ function processCodexUserMessagePasteAudit(state, record) {
     if (actualText === null) return false;
     const actualLen = actualText.length;
     const actualHash = pasteAuditHash(actualText);
-    const presentationText = codexUserMessagePresentationText(record) || actualText;
+    const presentationText = record.__auditCanonicalCarrier?.presentationText || codexUserMessagePresentationText(record) || actualText;
     const presentationHash = pasteAuditHash(presentationText);
     const selection = selectCodexPendingPromptAudit(audits, {
       actualText,
@@ -51071,8 +51252,8 @@ function processCodexUserMessagePasteAudit(state, record) {
       actualIdentity: {
         sessionId: state.sessionId,
         filePath: state.filePath,
-        byteOffset: record.__byteOffset,
-        timestamp: record.timestamp,
+        byteOffset: record.__auditCanonicalCarrier?.firstByteOffset ?? record.__byteOffset,
+        timestamp: record.__auditCanonicalCarrier?.firstTimestamp || record.timestamp,
       },
     });
     if (!selection) {
@@ -51095,12 +51276,13 @@ function processCodexUserMessagePasteAudit(state, record) {
     const auditSessionId = state.sessionId
       || getCodexRuntimeSessionId(state.tabId)
       || matchedAudit.historySessionId;
-    const auditTimestamp = record.timestamp || new Date(matchedAudit.sentAt).toISOString();
-    const sourceIdentity = codexLiveSourceIdentity(state, record, 'codex-user');
-    const entryUuid = codexDurableUserUuidFromLiveRecord(state, record);
-    const recordByteOffset = Number.isSafeInteger(Number(record.__byteOffset))
-      && Number(record.__byteOffset) >= 0
-      ? Number(record.__byteOffset)
+    const auditTimestamp = record.__auditCanonicalCarrier?.timestamp || record.timestamp || new Date(matchedAudit.sentAt).toISOString();
+    const sourceIdentity = record.__auditCanonicalCarrier?.sourceIdentity || codexLiveSourceIdentity(state, record, 'codex-user');
+    const entryUuid = record.__auditCanonicalCarrier?.entryUuid || codexDurableUserUuidFromLiveRecord(state, record);
+    const canonicalOffset = record.__auditCanonicalCarrier?.recordByteOffset ?? record.__byteOffset;
+    const recordByteOffset = Number.isSafeInteger(Number(canonicalOffset))
+      && Number(canonicalOffset) >= 0
+      ? Number(canonicalOffset)
       : null;
     const activeExecutionContext = state.busy === true
       ? getActiveAgentExecutionContext(state.tabId)
@@ -51109,25 +51291,6 @@ function processCodexUserMessagePasteAudit(state, record) {
       toolType: 'codex',
       sessionId: auditSessionId,
     }, activeExecutionContext);
-    let presentationSaved = false;
-    try {
-      presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
-        toolType: 'codex',
-        sessionId: auditSessionId,
-        auditTimestamp,
-        // Delivery proof retains the raw provider envelope above, while the
-        // projector renders the normalized single-slot carrier. Persist the
-        // sidecar against that rendered identity so chips/images survive.
-        actualText: presentationText,
-        actualHash: presentationHash,
-        snapshot: matchedAudit.presentationSnapshot,
-      });
-    } catch (error) {
-      console.warn('[CodexPasteAudit] presentation save failed tab='
-        + String(state.tabId).slice(-12)
-        + ' handoff=' + (matchedAudit.handoffId || '-')
-        + ' error=' + (error?.message || String(error)));
-    }
     const matchLabel = canonicalMatch ? 'CANONICAL_MATCH' : 'MATCH';
     console.log('[CodexPasteAudit:' + matchLabel + '] tab=' + String(state.tabId).slice(-12)
       + ' handoff=' + (matchedAudit.handoffId || '-')
@@ -51139,7 +51302,7 @@ function processCodexUserMessagePasteAudit(state, record) {
       + ' actualHash=' + actualHash
       + ' pendingBefore=' + audits.length
       + ' sentAgeMs=' + (Date.now() - matchedAudit.sentAt));
-    finishCodexPasteAudit(state.tabId, matchedAudit, {
+    const finished = finishCodexPasteAudit(state.tabId, matchedAudit, {
       success: true,
       actualText,
       actualImagePaths: codexUserMessageImageRefs(record).map(ref => ref.path),
@@ -51151,16 +51314,19 @@ function processCodexUserMessagePasteAudit(state, record) {
       auditTimestamp,
       ...(entryUuid ? { entryUuid } : {}),
       sourceIdentity,
+      sourceIdentityAliases: record.__auditSourceIdentityAliases || [],
+      entryUuidAliases: record.__auditEntryUuidAliases || [],
       recordByteOffset,
       executionContext: executionContextVerdict.context,
       executionContextDiagnostic: executionContextVerdict.context
         ? null
         : executionContextVerdict.reason,
-      presentationSaved,
+      presentation: { text: presentationText, hash: presentationHash, snapshot: matchedAudit.presentationSnapshot },
       expectedLen: matchedAudit.expectedLen,
       expectedHash: matchedAudit.expectedHash,
       queuedAtSubmit: matchedAudit.queuedAtSubmit === true,
     });
+    if (finished === false) return false;
     const result = {
       matched: true,
       handoffId: matchedAudit.handoffId || null,
@@ -51197,6 +51363,11 @@ function processCodexSourceAuditOnlyText(state, text, incomingStartOffset, prefe
   });
   state.sourceAuditPartial = consumed.partial;
   state.sourceAuditPartialStartOffset = consumed.partialStartOffset;
+  for (const candidate of [...consumed.records, ...(consumed.boundaries || [])]
+    .sort((left, right) => left.byteOffset - right.byteOffset)) {
+    candidate.record.__byteOffset = candidate.byteOffset;
+    observeCodexPromptAuditCarrier(state, candidate.record);
+  }
   if (consumed.records.length > 0) {
     console.log('[CodexPasteAudit:SOURCE_SCAN] tab=' + String(state.tabId).slice(-12)
       + ' session=' + String(state.sessionId || '').slice(0, 8)
@@ -51860,6 +52031,7 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
   if (event && state.liveUserCarrierPairer) {
     state.liveUserCarrierPairer.observeBoundary(event);
   }
+  observeCodexPromptAuditCarrier(state, record);
   let userMessageAudit = null;
   let promptOwner = null;
   const preferredResponseUserCarrier = record?.type === 'response_item'
@@ -53050,6 +53222,12 @@ const ambiguousTabProjectLookupsLogged = new Set();
 function resolveAuthoritativeTabProjectId(tabId, projectIdHint = null) {
   if (!tabId || !projectManager?.db?.db) return null;
   const liveProjectId = terminalProjectIds.get(tabId) || null;
+  const independent = workflowOrganization.execution(tabId)?.scope;
+  if (independent?.version === 2) {
+    const namespace = independent.executionNamespace;
+    if (projectIdHint && projectIdHint !== namespace || liveProjectId && liveProjectId !== namespace) return null;
+    return namespace;
+  }
   if (projectIdHint) {
     if (liveProjectId && liveProjectId !== projectIdHint) return null;
     try {
@@ -53887,6 +54065,16 @@ async function recoverPendingCodexStableSourceFromTranscript({
     ].filter(Boolean),
     journal.sourceSessionId,
   );
+  // A candidate-correlation window cannot establish absence. Recheck the full
+  // descendant range after transcript IO before either negative settlement.
+  const descendantDiscovery = await codexDataModule._api.inspectCodexDescendantSessions({
+    sourceSessionId: journal.sourceSessionId,
+    cwd: journal.cwd,
+    sinceMs: Number(journal.actionStartedAtMs),
+  });
+  if (descendantDiscovery?.complete !== true || (descendantDiscovery.descendants || []).length) {
+    return { success: false, reason: 'stable-source-preconditions-missing', transcript, scanned, descendantDiscovery };
+  }
   const rollbackProof = classifyCodexStableSourceRollbackOutcome({
     journal,
     currentSessionId,
@@ -53922,7 +54110,7 @@ async function recoverPendingCodexStableSourceFromTranscript({
     ...transcript,
   });
   if (proof.proven !== true) {
-    return { success: false, reason: proof.reason, proof, transcript, scanned };
+    return { success: false, reason: proof.reason, proof, transcript, scanned, descendantDiscovery };
   }
   if (readOnly) return { success: true, reason: proof.reason, proof, transcript, scanned };
   const resolved = commitCodexStableSourceTranscriptRecovery(key, journal, proof, transcript);
@@ -54255,6 +54443,13 @@ async function recoverPendingCodexNativeRewindHandoffs({
     const recoverySelection = codexDataModule._api
       .selectSingleProvenCodexRewindRecoveryCandidate(evaluatedDescendants);
     if (recoverySelection.status !== 'selected') {
+      const negativeDiscovery = await codexDataModule._api.inspectCodexDescendantSessions({
+        sourceSessionId,
+        cwd: journal.cwd,
+        sinceMs: actionStartedAtMs,
+      });
+      discoveryComplete = negativeDiscovery?.complete === true;
+      discoveredDescendants = negativeDiscovery?.descendants || [];
       const stableSource = await recoverPendingCodexStableSourceFromTranscript({
         key,
         journal,
@@ -54262,6 +54457,10 @@ async function recoverPendingCodexNativeRewindHandoffs({
         discoveryComplete,
         descendants: discoveredDescendants,
       });
+      if (stableSource?.descendantDiscovery) {
+        discoveryComplete = stableSource.descendantDiscovery.complete === true;
+        discoveredDescendants = stableSource.descendantDiscovery.descendants || [];
+      }
       if (stableSource?.success === true) {
         stableSourceRecovered += 1;
         console.log('[CodexWriterHandoff:Recovery] stable source reconciled tab='
@@ -54289,6 +54488,11 @@ async function recoverPendingCodexNativeRewindHandoffs({
           };
         }
         if (processLookup?.status === AI_PROCESS_LOOKUP_STATUS.ABSENT) {
+          const finalDiscovery = await codexDataModule._api.inspectCodexDescendantSessions({
+            sourceSessionId, cwd: journal.cwd, sinceMs: actionStartedAtMs,
+          });
+          discoveryComplete = finalDiscovery?.complete === true;
+          discoveredDescendants = finalDiscovery?.descendants || [];
           const noMutationProof = classifyCodexNativeRewindNoMutationRecovery({
             journal,
             currentSessionId,
@@ -55564,11 +55768,13 @@ async function reconcileCodexNativeRewindSourceSubmit(tabId, owned, intent) {
   if (!scopeCurrent()) return { success: false, reason: 'source-submit-scope-changed' };
   const sourceStat = await fs.promises.stat(journal.submitProof.sourceFilePath);
   if (!scopeCurrent()) return { success: false, reason: 'source-submit-scope-changed' };
-  const descendants = await codexDataModule._api.inspectCodexDescendantSessions({
+  const descendantRequest = {
     sourceSessionId: journal.sourceSessionId, cwd: journal.cwd,
     sinceMs: journal.actionStartedAtMs,
-    untilMs: Number(journal.actionStartedAtMs) + CODEX_NATIVE_REWIND_CHILD_WINDOW_MS,
-  });
+  };
+  // Continued-source settlement needs absence in the current catalog, not
+  // just the first two minutes of a native action that may still be pending.
+  const descendants = await codexDataModule._api.inspectCodexDescendantSessions(descendantRequest);
   if (!scopeCurrent() || descendants?.complete !== true || descendants.descendants?.length) {
     return { success: false, reason: 'source-submit-descendants-unresolved' };
   }
@@ -55579,6 +55785,10 @@ async function reconcileCodexNativeRewindSourceSubmit(tabId, owned, intent) {
   if (!scopeCurrent() || recovery?.success !== true
     || recovery.proof?.reason !== 'stable-source-exact-submit-task-and-user-message') {
     return { success: false, reason: recovery?.reason || 'source-submit-proof-missing' };
+  }
+  const finalDescendants = await codexDataModule._api.inspectCodexDescendantSessions(descendantRequest);
+  if (!scopeCurrent() || finalDescendants?.complete !== true || finalDescendants.descendants?.length) {
+    return { success: false, reason: 'source-submit-descendants-unresolved' };
   }
   // Revalidate physical ownership after all async disk reads. The original
   // source descriptor or a saved SID cannot stand in for this fresh pass.
@@ -64981,6 +65191,15 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
   const sendOperationKey = options && typeof options.sendOperationKey === 'string' ? options.sendOperationKey : null;
   const source = options && typeof options.source === 'string' ? options.source : null;
   const isPromptQueueSend = isPromptQueueAutomationSource(source, options);
+  const deferAutomaticBeforeInput = () => {
+    const receipt = { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready',
+      submitted: false, pasteWritten: false, enterWritten: false };
+    if (!isPromptQueueSend || !sendOperationKey || !sendAttemptId
+      || agentSendCancellations.isCancelled(tabId, handoffId, sendAttemptId)) return receipt;
+    return require(path.join(srcMainDir, 'web-server')).certifyAutomaticReadinessWait({
+      tabId, handoffId, operationKey: sendOperationKey, attemptId: sendAttemptId,
+    }, receipt);
+  };
   const codexSource = source
     ? (source.startsWith('codex-') ? source : 'codex-' + source)
     : (shouldQueue ? 'codex-history-queue' : 'codex-history-send');
@@ -65023,7 +65242,7 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
     } catch (error) {
       console.warn('[codex:send-command] prompt queue admission unknown tab=' + String(tabId).slice(-12)
         + ' error=' + (error?.message || String(error)));
-      return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready', submitted: false, pasteWritten: false };
+      return deferAutomaticBeforeInput();
     }
     const queueInputReady = runtimeSnapshot?.liveLifecycle === true
       && runtimeSnapshot?.sessionStatus === 'active'
@@ -65035,10 +65254,18 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
         + ' live=' + String(runtimeSnapshot?.liveLifecycle)
         + ' inputReady=' + !!runtimeSnapshot?.inputReady
         + ' busy=' + !!runtimeSnapshot?.busy);
-      return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready', submitted: false, pasteWritten: false };
+      return deferAutomaticBeforeInput();
     }
   }
   try {
+    if (isPromptQueueSend && sendOperationKey && sendAttemptId) {
+      const admission = await require(path.join(srcMainDir, 'web-server')).readAutomaticSendAdmission({
+        tabId, handoffId, operationKey: sendOperationKey, attemptId: sendAttemptId,
+      });
+      if (admission?.cancel === true) return { success: false, accepted: false, cancelled: true,
+        submitted: false, pasteWritten: false, enterWritten: false, error: 'automatic-intent-changed' };
+      if (!admission) return deferAutomaticBeforeInput();
+    }
     const pasteOptions = {
       submit: true,
       ctrlCFirst: false,

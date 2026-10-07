@@ -25,7 +25,7 @@ function messageRuntimeIdentity(descriptor, snapshot) {
     sendTarget = { toolType: provider, terminalInstanceId: destination.terminalInstanceId,
       launchId: destination.launchId };
   } else throw identityUnavailable();
-  return { ...descriptor, provider, sessionId: sessionId || null, sendTarget,
+  return { ...descriptor, provider, sessionId: sessionId || null, sendTarget, runtimeTarget: destination || sendTarget,
     acceptedResumeSourceSessionId: destination?.acceptedResumeSourceSessionId || null };
 }
 

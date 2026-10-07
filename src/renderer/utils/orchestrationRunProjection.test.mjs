@@ -5,6 +5,7 @@ import {
   isOrchestrationInheritedActivity,
   isOrchestrationResultProofPending,
   shouldRetainOrchestrationRun,
+  mergeOrchestrationRuns,
 } from './orchestrationRunProjection.mjs';
 
 function run(patch = {}) {
@@ -17,6 +18,28 @@ function run(patch = {}) {
     ...patch,
   };
 }
+
+test('late run list cannot overwrite a newer lifecycle event or erase an event-only run', () => {
+  const old = run({ status: 'sending', updatedAt: 10 });
+  const completed = run({ status: 'completed', updatedAt: 20, resultComplete: true });
+  const other = run({ runId: 'event-only', status: 'running', updatedAt: 20 });
+  assert.deepEqual(mergeOrchestrationRuns([old], [completed, other]), [completed, other]);
+  assert.deepEqual(mergeOrchestrationRuns([], [completed]), [completed]);
+});
+
+test('newer list wins over an older event; equal timestamps prefer the accepted event', () => {
+  const latest = run({ status: 'completed', updatedAt: 30 });
+  const earlier = run({ status: 'running', updatedAt: 20 });
+  assert.deepEqual(mergeOrchestrationRuns([latest], [earlier]), [latest]);
+  const sameTick = run({ status: 'failed', updatedAt: 30 });
+  assert.deepEqual(mergeOrchestrationRuns([latest], [sameTick]), [sameTick]);
+});
+
+test('legacy runs without versions retain accepted events and malformed rows do not invent identities', () => {
+  const value = run({ status: 'queued' });
+  assert.deepEqual(mergeOrchestrationRuns([null, {}, value], [undefined, { runId: '' }]), [value]);
+  assert.deepEqual(mergeOrchestrationRuns(null, [value]), [value]);
+});
 
 test('F6: incomplete result proof remains visible, active, and completion-blocking', () => {
   const value = run({ resultComplete: false, sourceFollowupPending: false });
@@ -51,6 +74,17 @@ test('a prompt waiting to cross Enter blocks completion without inherited shimme
   assert.equal(shouldRetainOrchestrationRun(value), true);
   assert.equal(isOrchestrationCompletionBlocking(value), true);
   assert.equal(isOrchestrationInheritedActivity(value), false);
+});
+
+test('claimed sending before Enter is not executing activity; proof restores activity without changing the block', () => {
+  const sending = run({ status: 'sending', deliveryAcceptedAt: null, targetPromptProofAt: null });
+  assert.equal(isOrchestrationInheritedActivity(sending), false);
+  assert.equal(isOrchestrationCompletionBlocking(sending), true);
+  assert.equal(shouldRetainOrchestrationRun(sending), true);
+  for (const proof of [{ deliveryAcceptedAt: 1 }, { targetPromptProofAt: 1 }]) {
+    assert.equal(isOrchestrationInheritedActivity({ ...sending, ...proof }), true);
+    assert.equal(isOrchestrationCompletionBlocking({ ...sending, ...proof }), true);
+  }
 });
 
 test('audit-pending source handoff stays visible and blocking in renderer parity with main', () => {

@@ -3,6 +3,7 @@ import {
   isOrchestrationCompletionBlocking,
   isOrchestrationInheritedActivity,
   shouldRetainOrchestrationRun,
+  mergeOrchestrationRuns,
 } from '../utils/orchestrationRunProjection.mjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -75,6 +76,7 @@ export type OrchestrationRun = {
   status: OrchestrationStatus;
   outcome?: OrchestrationOutcome | null;
   createdAt: number;
+  updatedAt?: number;
   completedAt?: number | null;
   deliveryAcceptedAt?: number | null;
   deliveryDeferredReason?: string | null;
@@ -162,6 +164,8 @@ type OrchestrationStore = {
 };
 
 const runChangeListeners = new Set<(change: OrchestrationRunChange) => void>();
+// Completed events must survive the initial read even after removal from activeRuns.
+const hydrationEvents = new Map<string, OrchestrationRun>();
 
 function projections(runs: Iterable<OrchestrationRun>) {
   const inheritedBusyTabIds = new Set<string>();
@@ -200,16 +204,23 @@ export const useOrchestrationStore = create<OrchestrationStore>((set, get) => ({
   completionBlockedTabIds: new Set(),
   initialized: false,
   replaceActiveRuns: (runs) => {
+    const merged: OrchestrationRun[] = get().initialized ? runs : mergeOrchestrationRuns(runs, [...hydrationEvents.values()]);
     const activeRuns = new Map(
-      (Array.isArray(runs) ? runs : [])
+      (Array.isArray(merged) ? merged : [])
         .filter(shouldRetainOrchestrationRun)
         .map((run) => [run.runId, run]),
     );
     set({ activeRuns, ...projections(activeRuns.values()), initialized: true });
+    hydrationEvents.clear();
   },
   applyRun: (run) => {
     if (!run?.runId) return;
     const previousState = get();
+    if (!previousState.initialized) {
+      const latest = mergeOrchestrationRuns([hydrationEvents.get(run.runId)], [run])[0];
+      if (latest !== run) return;
+      hydrationEvents.set(run.runId, run);
+    }
     const previousRun = previousState.activeRuns.get(run.runId);
     const sourceTabId = run.sourceTabId || previousRun?.sourceTabId || '';
     const wasCompletionBlocked = sourceTabId

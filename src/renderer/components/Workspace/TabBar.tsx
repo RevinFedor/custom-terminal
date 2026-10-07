@@ -6,6 +6,7 @@ import { useWorkspaceStore, TabColor, TabGroup } from '../../store/useWorkspaceS
 import { useProjectsStore } from '../../store/useProjectsStore';
 import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
+import { CompositedTextShimmer } from '../UI/CompositedTextShimmer';
 import TabNotificationControls from './TabNotificationControls';
 import {
   CONTEXT_MENU_BLOCK_DIVIDER_STYLE,
@@ -40,8 +41,6 @@ import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import {
-  resolveTabCompletionNotificationShadow,
-  TabCompletionNotificationAlert,
   TabCompletionNotificationBadge,
   TabProcessBar,
   TabStatusMarkerButton,
@@ -49,7 +48,6 @@ import {
   TabTopLeftSignals,
   TabContextUpdateBadge,
   TAB_CONTEXT_UPDATE_INSET_PX,
-  useTabCompletionNotificationDismissing,
   useTabContextUsage,
 } from './TabSignals';
 import { useTabWorkContext } from '../../utils/tabWorkContext';
@@ -1623,13 +1621,6 @@ const TabItem = memo(({
   // — Тонкая полоса процесса 2px + маркер статуса 8px рисуются абсолютом, поэтому в padding
   //   достаточно резервировать ~20px слева.
   const dragLiftActive = isVerticalMode && (isPressing || isDragging || isDraggedRoot);
-  const completionNotificationWaiting = completionNotificationArmed && !completionNotificationFired;
-  const completionNotificationDismissing = useTabCompletionNotificationDismissing(completionNotificationFired);
-  const completionNotificationShadow = resolveTabCompletionNotificationShadow({
-    armed: completionNotificationWaiting,
-    fired: completionNotificationFired,
-    collapsed: isCollapsed,
-  });
   const sessionAvailability = useSessionAvailability(resolveTabSessionDescriptor(tab as any, tab.id));
   const sessionAvailabilityShadow = sessionAvailabilityRailShadow(sessionAvailability);
   const sessionAvailabilityRuntimeActive = sdkProcessAlive || (
@@ -1640,7 +1631,6 @@ const TabItem = memo(({
     sessionAvailabilityRuntimeActive,
   );
   const tabBoxShadow = [
-    completionNotificationShadow,
     sessionAvailabilityShadow,
     isAdoptTarget ? 'inset 0 0 0 1.5px rgba(99, 102, 241, 0.7)' : null,
     isDragBlockedTarget ? 'inset 0 0 0 1.5px rgba(248, 113, 113, 0.86)' : null,
@@ -2227,12 +2217,6 @@ const TabItem = memo(({
                   aria-hidden
                 />
               )}
-              <TabCompletionNotificationAlert
-                fired={completionNotificationFired}
-                dismissing={completionNotificationDismissing}
-                borderRadius={tabGeo.borderRadius}
-                horizontalBleedPx={2}
-              />
               {/* Status marker — shared with the other tab surfaces (TabSignals).
                   Левый отступ 5px: после 3px полоски процесса (z:5) + 2px зазор → 5px.
                   Вертикальный сдвиг компенсирует оптический baseline-шифт строчных
@@ -2519,7 +2503,7 @@ const TabItem = memo(({
               ) : isTitleNaming ? (
                 <span className="tab-title-naming-frame" title={tab.name}>
                   <span className="tab-title-naming-ghost">{tab.name}</span>
-                  <span className="tab-title-naming-text">naming...</span>
+                  <CompositedTextShimmer className="tab-title-naming-text" variant="naming">naming...</CompositedTextShimmer>
                 </span>
               ) : (
                 <>
@@ -3735,6 +3719,9 @@ function TabBar({
   const focusedSidebarProjectId = useWorkspaceStore((state) => state.focusedProjectId || state.activeProjectId);
   const pendingEditTabId = useWorkspaceStore((state) => state.pendingEditTabId);
   const createTab = useWorkspaceStore((state) => state.createTab);
+  const organizationReady = useWorkspaceStore(state => state.organizationReady);
+  const workflowTargets = useWorkspaceStore(state => state.spaces);
+  const globalGroups = useWorkspaceStore(state => state.globalGroups);
   const createTabAfterCurrent = useWorkspaceStore((state) => state.createTabAfterCurrent);
   const closeTab = useWorkspaceStore((state) => state.closeTab);
   const switchTab = useWorkspaceStore((state) => state.switchTab);
@@ -10949,6 +10936,30 @@ function TabBar({
               onDone={() => setContextMenu(null)}
             />
           )}
+          {organizationReady && contextMenu && <>
+            <details data-tab-context-action="move-to-workflow">
+              <summary style={CONTEXT_MENU_ROW_STYLE}>Перенести в workflow</summary>
+              {workflowTargets.map(workflow => <button key={workflow.id} className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10"
+                style={CONTEXT_MENU_ROW_STYLE} onClick={async () => {
+                  const ids = isContextMultiSelect ? [...selectedTabIds] : [contextMenu.tabId];
+                  setContextMenu(null);
+                  if (!(await useWorkspaceStore.getState().moveTabsToWorkflow(ids,workflow.id))) showToast('Перенос не подтверждён','warning');
+                }}>{workflow.name}</button>)}
+            </details>
+            <details data-tab-context-action="global-group">
+              <summary style={CONTEXT_MENU_ROW_STYLE}>Группа</summary>
+              {[{id:null,name:'Без группы'},...(globalGroups?.groups || [])].map(group => <button key={group.id || 'none'}
+                className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10" style={CONTEXT_MENU_ROW_STYLE}
+                onClick={async () => {
+                  const store = useWorkspaceStore.getState(),publication = store.globalGroups;
+                  const ids = isContextMultiSelect ? [...selectedTabIds] : [contextMenu.tabId];
+                  setContextMenu(null);
+                  try {await store.mutateWorkflowGroup('assign',{version:1,mutationId:crypto.randomUUID(),expectedRevision:publication.revision,
+                    groupId:group.id,tabIds:ids,expectedTabGroups:Object.fromEntries(ids.map(id => [id,publication.tabGroups[id] || null]))});}
+                  catch (error:any) {showToast(error?.message || 'Группа не сохранена','warning');}
+                }}>{group.name}</button>)}
+            </details>
+          </>}
 
           {/* Separator */}
           <div data-context-menu-divider style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
@@ -11237,14 +11248,14 @@ function TabBar({
                 <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
                   <FolderInput size={12} className="text-[#888]" />
                 </span>
-                <span>Move to Project</span>
+                <span>{organizationReady ? 'Перенести в workflow' : 'Move to Project'}</span>
                 <span className="text-[#666] ml-auto">{submenuArrow(submenuSide)}</span>
               </button>
               <div className={`absolute ${submenuSide === 'left'
                   ? 'right-full -mr-2 pr-2'
                   : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/group-project-move:block`}>
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-md shadow-2xl py-1 min-w-[190px]">
-                  {projectMoveTargetIds.map((targetProjectId) => (
+                  {(organizationReady ? workflowTargets.map(space => space.id) : projectMoveTargetIds).map((targetProjectId) => (
                       <button
                         key={targetProjectId}
                         data-context-menu-row="ordinary"
@@ -11253,15 +11264,22 @@ function TabBar({
                         onClick={async (event) => {
                           event.stopPropagation();
                           setGroupContextMenu(null);
-                          const moved = await moveTabGroupToProject(projectId, group.id, targetProjectId);
-                          if (moved) window.setTimeout(() => followMovedTabs(targetProjectId), 0);
+                          if (organizationReady) {
+                            const global = globalGroups?.groups.find((candidate:any) => candidate.id === group.id
+                              || candidate.legacyNamespace === projectId && candidate.legacyGroupId === group.id);
+                            const ids = global ? Object.entries(globalGroups.tabGroups).filter(([,id]) => id === global.id).map(([id]) => id) : getGroupTabIds(group.id);
+                            await useWorkspaceStore.getState().moveTabsToWorkflow(ids,targetProjectId);
+                          } else {
+                            const moved = await moveTabGroupToProject(projectId, group.id, targetProjectId);
+                            if (moved) window.setTimeout(() => followMovedTabs(targetProjectId), 0);
+                          }
                         }}
                       >
                         <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
                           <Folder size={12} className="text-[#777]" />
                         </span>
                         <span className="truncate max-w-[180px]">
-                          {projects[targetProjectId]?.name || targetProjectId}
+                          {organizationReady ? workflowTargets.find(space => space.id === targetProjectId)?.name : projects[targetProjectId]?.name || targetProjectId}
                         </span>
                       </button>
                     ))}

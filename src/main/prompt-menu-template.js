@@ -2,7 +2,7 @@ function buildProjectPromptRows(projectCatalog, onPick) {
   const rows = [];
   let previousSource = null;
   for (const prompt of projectCatalog?.prompts || []) {
-    const sourceName = String(prompt.sourceName || 'Project');
+    const sourceName = String(prompt.sourceName || 'Документы');
     if (sourceName !== previousSource) {
       if (rows.length > 0) rows.push({ type: 'separator' });
       rows.push({ label: sourceName, enabled: false });
@@ -44,9 +44,9 @@ function buildGlobalPromptRows(prompts, groups, onPick) {
 
 function buildPromptMenuTemplate({ prompts = [], groups = [], projectCatalog = null, onPick }) {
   const rows = [];
-  if (projectCatalog?.project && projectCatalog.prompts?.length > 0) {
+  if ((projectCatalog?.project || projectCatalog?.tabId) && projectCatalog.prompts?.length > 0) {
     rows.push({
-      label: projectCatalog.project.name,
+      label: projectCatalog.project?.name || 'Документы вкладки',
       submenu: buildProjectPromptRows(projectCatalog, onPick),
     });
   }

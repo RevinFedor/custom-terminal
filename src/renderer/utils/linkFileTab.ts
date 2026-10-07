@@ -40,6 +40,13 @@ export async function linkFileTab(filePath: string, targetTabId: string): Promis
   if (!isAiSessionTab(targetTab)) {
     throw new Error('target tab is not an AI session');
   }
+  if (targetTab.aiClosing) throw new Error('target tab is closing');
+
+  const canPublish = () => {
+    const current = useWorkspaceStore.getState().openProjects.get(targetProjectId!);
+    const owner = current?.tabs.get(targetTabId);
+    return current === targetWorkspace && isAiSessionTab(owner) && !owner?.aiClosing;
+  };
 
   for (const tab of targetWorkspace.tabs.values()) {
     if (tab.tabType !== 'file' || tab.visualParentTabId !== targetTabId || !tab.filePath) continue;
@@ -66,8 +73,10 @@ export async function linkFileTab(filePath: string, targetTabId: string): Promis
       afterTabId: targetTabId,
       visualParentTabId: targetTabId,
       groupId: targetTab.groupId,
+      canPublish,
     },
   );
+  if (!fileTabId) throw new Error('target tab changed before file link committed');
 
   return {
     projectId: targetProjectId,

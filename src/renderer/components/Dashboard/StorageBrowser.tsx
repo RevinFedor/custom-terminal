@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso } from 'react-virtuoso';
 import { Check, ChevronDown, ChevronRight, Database, HardDrive, RefreshCw, Shield, Trash2, X } from 'lucide-react';
 import ControlHint from '../UI/ControlHint';
+import './Home.css';
 import Tooltip from '../UI/Tooltip';
 import { useUIStore } from '../../store/useUIStore';
 import { storageCleanupIncident } from '../../utils/storageCleanupIncident.mjs';
@@ -453,8 +454,8 @@ export default function StorageBrowser() {
   const totalLabel = inventory ? formatStorageBytes(inventory.summary.totalBytes) : '—';
 
   return (
-    <section data-storage-browser className="my-5 max-w-[1120px] border-y border-[#292929] py-3">
-      <div className="flex min-h-8 items-center gap-2">
+    <section data-storage-browser className="home-storage border-y border-[#292929] py-3">
+      <div className="home-storage-heading flex min-h-8 flex-wrap items-center gap-2">
         <button
           type="button"
           data-storage-toggle
@@ -540,8 +541,8 @@ export default function StorageBrowser() {
                 <input
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
-                  placeholder="Search name, UUID, project or path"
-                  className="ml-auto h-7 min-w-[220px] flex-1 rounded-md border border-[#303030] bg-[#0d0d0d] px-2.5 text-xs text-[#ddd] outline-none focus:border-[#555]"
+                  placeholder="Search name, UUID or directory"
+                  className="ml-auto h-7 min-w-0 flex-1 basis-[220px] rounded-md border border-[#303030] bg-[#0d0d0d] px-2.5 text-xs text-[#ddd] outline-none focus:border-[#555]"
                 />
                 <select
                   value={`${sort}:${sortDirection}`}
@@ -629,8 +630,8 @@ export default function StorageBrowser() {
                 </div>
               )}
 
-              <div className="grid min-h-[430px]" style={{ gridTemplateColumns: '210px minmax(360px, 1fr) 310px' }}>
-                <aside className="border-r border-[#292929] bg-white/[0.008] py-2 pr-2">
+              <div className="home-storage-layout">
+                <aside data-storage-groups className="home-storage-groups bg-white/[0.008] py-2">
                   <button
                     type="button"
                     className={`mb-1 flex w-full items-center justify-between rounded-md px-2 py-2 text-left text-xs ${group === null ? 'bg-[#282016] text-[#efb36f]' : 'text-[#888] hover:bg-white/[0.03]'}`}
@@ -686,8 +687,8 @@ export default function StorageBrowser() {
                   })}
                 </aside>
 
-                <section className="min-w-0 bg-transparent">
-                  <div className="grid h-8 items-center gap-2 border-b border-[#292929] bg-white/[0.008] px-3 text-[9px] uppercase tracking-wide text-[#555]" style={{ gridTemplateColumns: '22px minmax(160px,1fr) 110px 74px 72px 18px' }}>
+                <section data-storage-items className="home-storage-items min-w-0 bg-transparent">
+                  <div className="home-storage-row grid h-8 items-center gap-2 border-b border-[#292929] bg-white/[0.008] px-3 text-[9px] uppercase tracking-wide text-[#555]" >
                     <input
                       ref={selectAllCheckboxRef}
                       data-storage-select-all-checkbox
@@ -741,8 +742,8 @@ export default function StorageBrowser() {
                             role="button"
                             tabIndex={0}
                             data-storage-row={item.id}
-                            className={`grid min-h-[49px] w-full items-center gap-2 border-b border-[#222] px-3 text-left text-xs ${isSelected ? 'bg-[#211a12] shadow-[inset_2px_0_#f09018]' : isChecked ? 'bg-[#1d1914]' : 'hover:bg-[#181818]'}`}
-                            style={{ gridTemplateColumns: '22px minmax(160px,1fr) 110px 74px 72px 18px' }}
+                            className={`home-storage-row grid min-h-[49px] w-full items-center gap-2 border-b border-[#222] px-3 text-left text-xs ${isSelected ? 'bg-[#211a12] shadow-[inset_2px_0_#f09018]' : isChecked ? 'bg-[#1d1914]' : 'hover:bg-[#181818]'}`}
+                            
                             onClick={() => {
                               confirmationPreparationSeqRef.current += 1;
                               setConfirmationPreparing(false);
@@ -788,7 +789,7 @@ export default function StorageBrowser() {
                   )}
                 </section>
 
-                <aside className="border-l border-[#292929] bg-white/[0.012] p-4">
+                <aside data-storage-details className="home-storage-details bg-white/[0.012] p-4">
                   {selected ? (
                     <>
                       <div className="truncate text-sm font-semibold text-[#ddd]">{selected.title}</div>
@@ -797,7 +798,7 @@ export default function StorageBrowser() {
                         <dt className="text-[#666]">Size</dt><dd className="text-[#ccc]">{formatStorageBytes(selected.sizeBytes)}</dd>
                         <dt className="text-[#666]">Provider</dt><dd className="capitalize text-[#ccc]">{selected.provider || '—'}</dd>
                         <dt className="text-[#666]">Source</dt><dd className="text-[#ccc]">{selected.group === 'development' ? 'Development Noted Terminal' : selected.notedTerminal ? 'Noted Terminal' : 'Outside Noted Terminal'}</dd>
-                        <dt className="text-[#666]">Project / CWD</dt><dd className="break-words text-[#ccc]">{selected.project || selected.cwd || '—'}</dd>
+                        <dt className="text-[#666]">Directory</dt><dd className="break-words text-[#ccc]">{selected.cwd || selected.project || '—'}</dd>
                         <dt className="text-[#666]">Iterations</dt>
                         <dd className="text-[#ccc]">{selected.iterations ?? selectedDetails?.totalIterations ?? (detailLoadingId === selected.id ? 'Loading…' : '—')}</dd>
                         <dt className="text-[#666]">Created by</dt><dd className="text-[#ccc]">{STORAGE_GROUPS[selected.group]?.label || selected.group}</dd>
@@ -831,7 +832,7 @@ export default function StorageBrowser() {
                 </aside>
               </div>
 
-              <div className="flex min-h-10 items-center gap-3 border-t border-[#292929] bg-white/[0.008] px-1 text-[10px] text-[#666]">
+              <div className="flex min-h-10 flex-wrap items-center gap-3 py-2 border-t border-[#292929] bg-white/[0.008] px-1 text-[10px] text-[#666]">
                 <span>All categories: {inventory.summary.totalItems} items · {formatStorageBytes(inventory.summary.totalBytes)}</span>
                 <span>{visibleItems.length} filtered</span>
                 {checkedItems.length > 0 && <span className="text-[#c98758]">{checkedItems.length} selected · {formatStorageBytes(checkedBytes)}</span>}
@@ -859,7 +860,7 @@ export default function StorageBrowser() {
       )}
 
       {confirmation && (
-        <div className="mt-2 flex items-center gap-3 rounded-md border border-red-500/25 bg-red-500/[0.06] px-3 py-2 text-xs text-[#bbb]">
+        <div data-storage-confirmation className="mt-2 flex flex-wrap items-center gap-3 rounded-md border border-red-500/25 bg-red-500/[0.06] px-3 py-2 text-xs text-[#bbb]">
           <Trash2 size={14} className="text-red-300" />
           <span>{deleting
             ? `Deleting ${deleteProgress?.completed || 0}/${deleteProgress?.total || confirmation.items} · removed ${deleteProgress?.removed || 0}${deleteProgress?.failed ? ` · failed ${deleteProgress.failed}` : ''}… keep Noted Terminal open`

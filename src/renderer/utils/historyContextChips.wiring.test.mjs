@@ -42,7 +42,8 @@ test('context update details render source tabs as real navigation targets', () 
   assert.match(contextChip, /data-context-update-summary/);
   assert.match(contextChip, /data-context-update-sources/);
   assert.match(contextChip, /data-context-source-tab=\{source\.tabId\}/);
-  assert.match(contextChip, /activateCenterTab\(projectId, source\.tabId\)/);
+  assert.match(contextChip, /await useWorkspaceStore\.getState\(\)\.openTabById\(source\.tabId,/);
+  assert.match(contextChip, /if \(!opened\) return;/);
   assert.match(contextChip, /requestTabPrimaryInputFocus\(source\.tabId/);
   assert.match(contextChip, /data-context-source-external/);
   assert.match(contextChip, /data-context-update-section-list/);

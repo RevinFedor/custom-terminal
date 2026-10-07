@@ -13,7 +13,8 @@ function createHarness(filePath, options = {}) {
   const main = fs.readFileSync(options.mainPath || path.join(root, 'src/main/main.js'), 'utf8');
   const ast = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   const names = ['codexEventType', 'summarizeCodexTurnChunk', 'processCodexTurnText',
-    'processCodexSourceAuditOnlyText', 'scanCodexTurnAppend'];
+    'processCodexSourceAuditOnlyText', 'scanCodexTurnAppend', 'observeCodexPromptAuditCarrier',
+    'codexLiveUserCarrierKind', 'codexLiveSourceIdentity', 'codexDurableUserUuidFromLiveRecord'];
   const code = ast.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text))
     .map(n => n.getText(ast)).join('\n');
   const state = { tabId: 'test-fork-child', sessionId: 'synthetic-child', filePath,
@@ -26,6 +27,9 @@ function createHarness(filePath, options = {}) {
   let compact = options.compact ? { operationId: 'compact-test' } : null;
   const context = vm.createContext({
     fs, Buffer, Date, setImmediate, ...audit,
+    createCodexLiveUserCarrierPairer: require(path.join(root, 'src/main/codex-live-user-carrier-pairing')).createCodexLiveUserCarrierPairer,
+    CODEX_LIVE_USER_EVENT_CARRIER: 'event_msg', CODEX_LIVE_USER_RESPONSE_CARRIER: 'response_item',
+    codexKnownSessions: new Map(),
     console: { log: s => result.logs.push(s), warn: s => result.warnings.push(s) },
     codexTurnWatchers: watchers,
     readCodexTurnAppend: async args => {

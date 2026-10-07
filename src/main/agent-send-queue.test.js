@@ -137,6 +137,31 @@ test('SQLite reopen keeps FIFO and unknown head; exact audit resumes one origina
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 });
 
+test('a certified automatic no-input wait survives SQLite reopen; later Root readiness releases the original body', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-automatic-wait-'));
+  const file = path.join(dir, 'queue.db'), h = harness(t, 'codex', file);
+  const req = h.request('automatic', { source: 'prompt-queue', promptQueueIntent: {
+    version: 1, kind: 'queue', itemId: 'head', armedAt: 1, triggerTabId: 'B', conditionKey: '', triggerKey: 'null' } });
+  h.queue.enqueue({ identity: h.identity(req), request: req, execute: async () => {
+    const begun = h.store.beginAttempt(h.identity(req));
+    return h.queue.certifyAutomaticReadinessWait({ tabId: 'T', handoffId: req.handoffId,
+      operationKey: req.sendOperationKey, attemptId: begun.attemptId }, {
+      success: false, deferred: true, error: 'codex_input_not_ready', submitted: false, pasteWritten: false, enterWritten: false });
+  } });
+  await tick(); const first = h.store.get(req.sendOperationKey);
+  assert.equal(h.queue.item(req.sendOperationKey).state, 'waiting');
+  h.queue.dispose();
+  const h2 = harness(t, 'codex', file); let ready = false;
+  h2.queue.admit = async () => ready;
+  h2.store.reconcileStartup(); h2.queue.resume(); await tick();
+  assert.equal(h2.sends.length, 0); assert.equal(h2.store.get(req.sendOperationKey).attemptId, first.attemptId);
+  ready = true; h2.queue.notifyRuntime('unrelated'); await tick(); assert.equal(h2.sends.length, 0);
+  h2.queue.notifyRuntime('B'); await tick(); assert.equal(h2.sends.length, 1);
+  assert.equal(h2.sends[0].prompt, req.prompt);
+  assert.notEqual(h2.store.get(req.sendOperationKey).attemptId, first.attemptId);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+});
+
 test('a completed audit cannot let the next scenario overlap the first bridge finally', async t => {
   const h = harness(t);
   let release;

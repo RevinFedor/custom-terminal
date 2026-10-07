@@ -4,7 +4,7 @@ import { createPortal } from 'react-dom';
 import { Markdown } from '@noted/claude-blocks';
 import { Check, ChevronRight, CircleAlert, CircleCheck, LoaderCircle, MessageSquare, MessageSquareReply, RotateCcw, SendHorizontal, Timer, X } from 'lucide-react';
 import { AttachmentPreviewToolbar } from './AIConversation/PastedContentPreview';
-import { TabMessageSourceChip } from './TabMessageSourceChip';
+import { HistoryPromptSource, TabMessageSourceChip } from './TabMessageSourceChip';
 import { tabMessageDelivery, tabMessageDismissed, tabMessagePeer, tabMessageReplyPresentation, tabMessagePresentation, tabMessageVisibleInTracker } from '../../utils/tabMessageProjection';
 import { RequestTrackerRow, RequestTrackerStatus, requestRowActionStyle } from './RequestTrackerRow';
 import type { MessagePresentation, TabMessage, TabMessageThread } from '../../utils/tabMessageProjection';
@@ -80,7 +80,7 @@ function MessageBody({ message, label, onNavigate }: { message: TabMessage; labe
     </summary>
     <div style={{ padding: '0 10px 10px', minWidth: 0 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 }}>
-        <div style={{ flex: 1, minWidth: 0 }}><TabMessageSourceChip source={message} onNavigate={onNavigate} /></div>
+        <div style={{ flex: 1, minWidth: 0 }}><HistoryPromptSource source={message} phase={message.kind} onNavigate={onNavigate} /></div>
         {typeof message.text === 'string' && <AttachmentPreviewToolbar text={message.text} />}
       </div>
       <div style={{ fontSize: 10, color: '#999', overflowWrap: 'anywhere', marginBottom: 6 }}>Кому: {message.targetTabName || message.targetTabId}</div>

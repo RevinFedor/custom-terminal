@@ -464,6 +464,7 @@ test('default clients keep the existing wait-for-provider response rather than g
 
 test('the actual capability producer advertises owned uploads only with the shared asset owner configured', async t => {
   const h = await fixture(t); let producer;
+  h.ctx.reconcileAgentSendReceipt = null; // unrelated optional recovery owner
   const visit = node => {
     if (ts.isPropertyAssignment(node) && node.name.getText(tree) === 'sendQueue') producer = node.initializer.getText(tree);
     ts.forEachChild(node, visit);

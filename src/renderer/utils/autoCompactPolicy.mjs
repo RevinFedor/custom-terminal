@@ -1,6 +1,7 @@
 export const UNPLACED_AUTOMATION_WORKFLOW = '__unplaced__';
 
 export function normalizeAutoCompactPolicy(value = {}) {
+  if (value.organizationVersion != null && value.organizationVersion !== 1) throw new Error('automation_forward_version');
   return {
     enabled: value.enabled === true,
     scopeInitialized: value.scopeInitialized === true,
@@ -12,6 +13,9 @@ export function normalizeAutoCompactPolicy(value = {}) {
     excludedTabIds: [...new Set(Array.isArray(value.excludedTabIds)
       ? value.excludedTabIds.filter((id) => typeof id === 'string' && id) : [])],
     armedAt: Number.isFinite(value.armedAt) ? value.armedAt : 0,
+    ...(value.organizationVersion === 1 ? { organizationVersion: 1,
+      migrationEligibility: value.migrationEligibility && typeof value.migrationEligibility === 'object'
+        && !Array.isArray(value.migrationEligibility) ? value.migrationEligibility : {} } : {}),
   };
 }
 
@@ -25,6 +29,9 @@ export function automationWorkflowForProject(spaces, projectId) {
 export function autoCompactIncludesTarget(policy, target) {
   if (!target || !['claude', 'codex'].includes(target.provider)) return false;
   if (policy.excludedTabIds.includes(target.tabId)) return false;
+  const migration = policy.migrationEligibility?.[target.tabId];
+  if (migration && migration.workflowId === target.workflowId
+    && migration.membershipRevision === target.membershipRevision) return migration.included === true;
   return target.workflowId === UNPLACED_AUTOMATION_WORKFLOW
     ? policy.includeUnplaced
     : policy.allWorkflows || policy.workflowIds.includes(target.workflowId);

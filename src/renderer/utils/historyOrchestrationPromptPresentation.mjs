@@ -1,4 +1,4 @@
-import { getTabMessageTag } from '../../shared/prompt-origin.mjs';
+import { getTabMessageTag, getTerminalMcpTag, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
 
 const ORCHESTRATION_PHASES = new Set(['request', 'completion', 'failure']);
 const PRESENTATION_FIELDS = ['envelopeStart', 'envelopeText', 'bodyStart', 'bodyEnd', 'bodyProjectionHash', 'sourceTabId', 'sourceTabName', 'sourceProjectId', 'targetTabId', 'targetTabName', 'targetProjectId', 'runKind'];
@@ -25,6 +25,9 @@ export function resolveHistoryOrchestrationPromptPresentation(entry) {
     targetProjectId: message.targetProjectId,
     ...presentationFields(message),
   };
+  if (getTerminalMcpTag(entry)?.source === 'terminal-mcp') {
+    return { kind: 'terminal-mcp', phase: 'prompt' };
+  }
   const tag = entry.semanticTags.find((candidate) => (
     candidate?.kind === 'orchestration'
     && typeof candidate.runId === 'string'
@@ -77,6 +80,7 @@ export function resolveHistoryPromptSender(presentation) {
   if (!sourceTabId) return null;
   return {
     sourceTabId,
+    ...(presentation.kind === 'tab-message' && presentation.messageId ? { messageId: presentation.messageId } : {}),
     sourceTabName: completion ? presentation.targetTabName : presentation.sourceTabName,
     sourceProjectId: completion ? presentation.targetProjectId : presentation.sourceProjectId,
   };
@@ -90,6 +94,11 @@ const normalizeOwnedHandoffSource = (value) =>
 export function resolveHistoryOrchestrationHandoffPresentation(handoff) {
   const handoffId = String(handoff?.handoffId || '');
   const source = normalizeOwnedHandoffSource(handoff?.source);
+  if (handoffId && promptOriginTagForSource(source)?.source === 'terminal-mcp') {
+    const messagePrefix = 'tab-message:';
+    if (source.startsWith(messagePrefix) && handoffId !== source) return null;
+    return { kind: 'terminal-mcp', phase: 'prompt' };
+  }
 
   const completionPrefix = 'orchestration-complete:';
   if (handoffId.startsWith(completionPrefix)) {

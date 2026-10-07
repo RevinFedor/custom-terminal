@@ -12,6 +12,21 @@ function errorPayload(error) {
 function register({ service }) {
   if (!service) throw new Error('project-prompts IPC requires service');
 
+  ipcMain.handle('project-prompts:list-tab', (_event, tabId) => {
+    try { return { success: true, data: service.listTab(tabId) }; }
+    catch (error) { return errorPayload(error); }
+  });
+
+  ipcMain.handle('project-prompts:get-tab-sources', (_event, tabId) => {
+    try { return { success: true, data: service.getTabSources(tabId) }; }
+    catch (error) { return errorPayload(error); }
+  });
+
+  ipcMain.handle('project-prompts:set-tab-sources', (_event, request) => {
+    try { return { success: true, data: service.setTabSources(request) }; }
+    catch (error) { return errorPayload(error); }
+  });
+
   ipcMain.handle('project-prompts:get-sources', (_event, projectId) => {
     try {
       return { success: true, data: service.getSources(projectId) };
@@ -47,6 +62,9 @@ function register({ service }) {
 
   return () => {
     for (const channel of [
+      'project-prompts:list-tab',
+      'project-prompts:get-tab-sources',
+      'project-prompts:set-tab-sources',
       'project-prompts:get-sources',
       'project-prompts:set-sources',
       'project-prompts:list',

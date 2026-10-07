@@ -27,6 +27,10 @@ const layoutFor = (ids: string[], cols: number[]) => ({
   splitSizes: { cols, rows: ids.map(() => [1]) },
 });
 const main = layoutFor(tabIds.slice(0, 2), [0.25, 0.75]);
+if ((window as any).fullViewFixture.singleOverlay) {
+  main.splitPanes = [];
+  (main as any).centerTabStrips = { [projectId]: tabIds.slice(0, 2) };
+}
 const other = layoutFor(tabIds.slice(2), [1]);
 useWorkspaceStore.setState({
   view: 'workspace', isRestoring: false, ...main, activeSpaceId: 'full-main',

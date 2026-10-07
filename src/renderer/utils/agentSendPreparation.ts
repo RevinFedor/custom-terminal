@@ -159,6 +159,7 @@ export async function prepareAgentRuntimeForSend({
   sendOperationKey,
   sendAttemptId,
   expectedTarget: pinnedTarget,
+  admissionSignal,
 }: {
   tabId: string;
   runtime: HistoryAgentRuntime;
@@ -172,6 +173,7 @@ export async function prepareAgentRuntimeForSend({
   sendOperationKey?: string | null;
   sendAttemptId?: string | null;
   expectedTarget?: AgentSendTarget;
+  admissionSignal?: AbortSignal;
 }) {
   let expectedTarget = pinnedTarget
     ? Object.freeze({ ...pinnedTarget })
@@ -193,6 +195,7 @@ export async function prepareAgentRuntimeForSend({
     { code: 'agent_send_cancelled', cancelled: true, submitted: false, pasteWritten: false, enterWritten: false },
   );
   const assertSendNotCancelled = () => {
+    if (admissionSignal?.aborted) throw cancelledBeforeSubmit();
     if (
       coordinatedSendToken
       && isCoordinatedAgentSendCancellationRequested(tabId, coordinatedSendToken)
@@ -326,7 +329,7 @@ export async function prepareAgentRuntimeForSend({
     // for every wake. An open picker without a launch keeps the ordinary bound.
     startupWait = window;
     expectedTarget = Object.freeze({ ...expectedTarget, launchId: expectedTarget.launchId || window.launchId });
-    deadline = Math.max(deadline, window.deadlineAt);
+    deadline = window.deadlineAt;
     console.log('[AgentScenario:send] startup-deadline tab=' + String(tabId).slice(-12)
       + ' launch=' + window.launchId + ' deadlineAt=' + deadline);
   };
@@ -347,6 +350,15 @@ export async function prepareAgentRuntimeForSend({
     followStartupDeadline();
     const remainingMs = deadline - Date.now();
     const readyWait = createAgentReadyWait(tabId, runtime, Math.max(1, remainingMs), 'send');
+    let removeAdmissionAbort = () => {};
+    const admissionAbort = new Promise<void>(resolve => {
+      if (!admissionSignal) return;
+      const wake = () => resolve();
+      if (admissionSignal.aborted) wake();
+      else admissionSignal.addEventListener('abort', wake, { once: true });
+      removeAdmissionAbort = () => admissionSignal.removeEventListener('abort', wake);
+    });
+    const readyOrRevoked = admissionSignal ? Promise.race([readyWait.promise, admissionAbort]) : readyWait.promise;
     const cancellationWait = coordinatedSendToken
       ? createCoordinatedAgentSendCancellationWait(tabId, coordinatedSendToken)
       : null;
@@ -355,7 +367,7 @@ export async function prepareAgentRuntimeForSend({
       assertSendNotCancelled();
       const previousDeadline = deadline;
       followStartupDeadline();
-      if (deadline > previousDeadline) continue;
+      if (deadline !== previousDeadline) continue;
       if (startupWait && presence?.status === 'inactive') throw cancelledBeforeSubmit();
       if (presence && ['active', 'busy', 'starting'].includes(presence.status)) {
         observePhysicalTarget();
@@ -380,12 +392,12 @@ export async function prepareAgentRuntimeForSend({
         if (remainingMs <= 0) throw readinessTimeout();
         if (cancellationWait) {
           const outcome = await Promise.race([
-            readyWait.promise.then(() => 'ready'),
+            readyOrRevoked.then(() => 'ready'),
             cancellationWait.promise.then(() => 'cancelled'),
           ]);
           if (outcome === 'cancelled') assertSendNotCancelled();
         } else {
-          await readyWait.promise;
+          await readyOrRevoked;
         }
         continue;
       }
@@ -420,15 +432,16 @@ export async function prepareAgentRuntimeForSend({
       if (remainingMs <= 0) throw readinessTimeout();
       if (cancellationWait) {
         const outcome = await Promise.race([
-          readyWait.promise.then(() => 'ready'),
+          readyOrRevoked.then(() => 'ready'),
           cancellationWait.promise.then(() => 'cancelled'),
         ]);
         if (outcome === 'cancelled') assertSendNotCancelled();
       } else {
-        await readyWait.promise;
+        await readyOrRevoked;
       }
     } finally {
       readyWait.cancel();
+      removeAdmissionAbort();
       cancellationWait?.cancel();
     }
   }

@@ -15,6 +15,8 @@ const { SessionTranscriptService } = require('./session-transcript-service');
 const { applyHistoryEntryWindow } = require('./history-entry-window');
 const { historyReadSession, historyReadOwnerFromProjection } = require('./history-read-session');
 const { completionNotificationCapability } = require('./tab-completion-notification-api');
+const { WORKSPACE_SWITCHER_CAPABILITY } = require('./workspace-switcher-api');
+const { RUN_AFTER_CAPABILITY } = require('../shared/run-after-api.cjs');
 const { normalizeHistoryResponseToolType, decorateHistoryResponseTimings, observeHistoryResponseTimingBindings } = require('./history-response-timings');
 const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
@@ -216,6 +218,11 @@ test('actual /api/me advertises the opt-in only with an available payload owner 
   const method = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'handleApi');
   const block = method.body.statements.find(node => ts.isIfStatement(node) && node.expression.getText(ast).includes("'/api/me'"));
   const scope = vm.createContext({ sendJson, checkAuth: req => req.headers.authorization === 'Bearer fixture',
+    WORKSPACE_SWITCHER_CAPABILITY,
+    RUN_AFTER_CAPABILITY,
+    // These are unrelated owners advertised by the same /me declaration;
+    // an absent organization must not turn this read-only VM into HTTP 500.
+    require: name => { assert.equal(name, './project-manager'); return { workflowOrganization: null }; },
     publicTabActivity: null, projectCardSignals: null, codexGoalActions: null,
     publicHistoryFreshness: null, agentSendQueue: null, systemPromptService: null, agentParamsService: null, completionNotificationCapability,
     getLanIp: () => '127.0.0.1', webServerServiceHealth: () => ({ instanceId: 'fixture' }), MAX_EVENT_TABS,
@@ -235,6 +242,7 @@ test('actual /api/me advertises the opt-in only with an available payload owner 
   assert.equal((await fetch(address)).status, 401);
   const allowed = await (await fetch(address, { headers: { authorization: 'Bearer fixture' } })).json();
   assert.deepEqual(allowed.capabilities.historyPayloads, historyPayloadCapability);
+  assert.equal(allowed.capabilities.tabMessages.sourceNavigation, true);
   assert.equal(allowed.capabilities.historyPayloads.headerVersion, 2);
   assert.deepEqual(allowed.capabilities.completionNotifications, completionNotificationCapability);
   assert.equal(allowed.capabilities.historyFreshness, undefined);

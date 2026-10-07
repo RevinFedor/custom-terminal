@@ -100,6 +100,78 @@ test('ignores a patch literal when exec never calls tools.apply_patch', () => {
   assert.equal(entry.docsEdited, undefined);
 });
 
+test('retains non-doc edit targets for linked working-file markers without inventing docs edits', () => {
+  const file = '/private/linked-work/recovery.md';
+  const patch = '*** Begin Patch\n*** Update File: ' + file + '\n@@\n-old\n+new\n*** End Patch';
+  for (const payload of [{ type: 'custom_tool_call', name: 'apply_patch', input: patch },
+    execPayload('await tools.apply_patch(' + JSON.stringify(patch) + ');')]) {
+    const entry = buildTimeline(payload);
+    assert.deepEqual(entry.fileEdits, [file]);
+    assert.equal(entry.docsEdited, undefined);
+  }
+  const read = buildTimeline(execPayload('await tools.exec_command({cmd:"cat /private/linked-work/recovery.md"});'));
+  assert.equal(read.fileEdits, undefined);
+});
+
+test('linked-file edit targets survive Timeline checkpoints and stay on their original iteration', () => {
+  const projector = _api.createCodexTimelineProjector('linked-file-checkpoint');
+  projector.feed({ __line: 1, type: 'event_msg', payload: { type: 'user_message', message: 'Edit the working file' } });
+  projector.feed({ __line: 2, type: 'response_item', payload: execPayload(
+    'await tools.exec_command({cmd:"cat >> work/status.md <<EOF\\nnew\\nEOF",workdir:"/fixture-project"});',
+  ) });
+  const resumed = _api.createCodexTimelineProjector('linked-file-checkpoint', projector.exportState());
+  resumed.feed({ __line: 3, type: 'event_msg', payload: { type: 'user_message', message: 'Only read now' } });
+  resumed.feed({ __line: 4, type: 'response_item', payload: execPayload(
+    'await tools.exec_command({cmd:"cat work/status.md",workdir:"/fixture-project"});',
+  ) });
+  const entries = resumed.finalize();
+  assert.deepEqual(entries[0].fileEdits, ['/fixture-project/work/status.md']);
+  assert.equal(entries[0].docsEdited, undefined);
+  assert.equal(entries[1].fileEdits, undefined);
+});
+
+test('linked-file markers use the existing shell edit grammar, not a docs-only command whitelist', () => {
+  for (const cmd of ['printf new > work/status.md', 'touch work/status.md', 'rm work/status.md']) {
+    const args = { cmd, workdir: '/fixture-project' };
+    for (const payload of [{ type: 'function_call', name: 'exec_command', arguments: JSON.stringify(args) },
+      execPayload('await tools.exec_command(' + JSON.stringify(args) + ');')]) {
+      assert.deepEqual(buildTimeline(payload).fileEdits, ['/fixture-project/work/status.md'], cmd);
+    }
+  }
+});
+
+test('computed patch markers use the actual apply result and original call owner across checkpoints', () => {
+  const projector = _api.createCodexTimelineProjector('computed-linked-file');
+  projector.feed({ __line: 0, type: 'session_meta', payload: { cwd: '/fixture-project' } });
+  projector.feed({ __line: 1, type: 'event_msg', payload: { type: 'user_message', message: 'Edit working file' } });
+  const input = 'const files = ["work/status.md"]; const patch = "*** Begin Patch\\n" + files.map(file => "*** Delete File: " + file + "\\n").join("") + "*** End Patch"; await tools.apply_patch(patch);';
+  projector.feed({ __line: 2, type: 'response_item', payload: { ...execPayload(input), call_id: 'patch-call' } });
+  assert.equal(projector.finalize()[0].fileEdits, undefined, 'computed source is not a path proof');
+  const resumed = _api.createCodexTimelineProjector('computed-linked-file', structuredClone(projector.exportState()));
+  resumed.feed({ __line: 3, type: 'event_msg', payload: { type: 'user_message', message: 'Another user' } });
+  resumed.feed({ __line: 4, type: 'event_msg', payload: { type: 'patch_apply_end', call_id: 'patch-call',
+    success: true, changes: { 'work/status.md': { type: 'delete' } } } });
+  const entries = resumed.finalize();
+  assert.deepEqual(entries[0].fileEdits, ['/fixture-project/work/status.md']);
+  assert.equal(entries[1].fileEdits, undefined);
+  resumed.feed({ __line: 5, type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'patch-call', output: 'done' } });
+  assert.equal(resumed.exportState().pendingFileEditCalls.size, 0);
+});
+
+test('failed or ambiguous computed patch results cannot mark an attached file', () => {
+  for (const ambiguous of [false, true]) {
+    const projector = _api.createCodexTimelineProjector('computed-linked-negative');
+    projector.feed({ __line: 1, type: 'event_msg', payload: { type: 'user_message', message: 'Edit working file' } });
+    const input = 'const patch = files.map(file => file).join(""); await tools.apply_patch(patch);';
+    for (const call_id of ambiguous ? ['A', 'B'] : ['A']) {
+      projector.feed({ type: 'response_item', payload: { ...execPayload(input), call_id } });
+    }
+    projector.feed({ type: 'event_msg', payload: { type: 'patch_apply_end', call_id: 'unmatched',
+      success: ambiguous, changes: { '/fixture-project/work/status.md': { type: 'delete' } } } });
+    assert.equal(projector.finalize()[0].fileEdits, undefined);
+  }
+});
+
 test('builds one-turn Codex evidence from exact call id and provider settings records', () => {
   const records = [
     {

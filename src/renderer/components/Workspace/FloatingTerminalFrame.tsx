@@ -28,6 +28,8 @@ interface FloatingTerminalFrameProps {
    * to only one of them made one gesture behave two ways.
    */
   pinned?: boolean;
+  /** Split panes clip their own content; an open side panel may cover the tab sidebar. */
+  allowSideOverlayOverflow?: boolean;
   onClose: () => void;
   searchNode?: React.ReactNode;
   children: React.ReactNode;
@@ -40,6 +42,7 @@ export default function FloatingTerminalFrame({
   open,
   bottomInset,
   pinned = false,
+  allowSideOverlayOverflow = false,
   onClose,
   searchNode,
   children,
@@ -271,7 +274,7 @@ export default function FloatingTerminalFrame({
         // Side panel opens ABOVE everything in the center — including the
         // Run after strip host (z 120) and orchestration chips — matching how
         // the History side panel covers them in terminal-primary.
-        zIndex: floating ? 130 : 0,
+        zIndex: floating ? 130 : (allowSideOverlayOverflow ? undefined : 0),
       }}
     >
       <div ref={slotRef} style={{ position: 'absolute', inset: 0 }} />
@@ -412,7 +415,9 @@ export default function FloatingTerminalFrame({
             inset: floating ? undefined : 0,
             flex: floating ? 1 : undefined,
             minHeight: 0,
-            overflow: 'hidden',
+            ...(!floating && allowSideOverlayOverflow
+              ? { overflowX: 'visible' as const, overflowY: 'clip' as const }
+              : { overflow: 'hidden' as const }),
             background: '#1a1a1a',
           }}
         >

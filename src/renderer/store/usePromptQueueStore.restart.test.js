@@ -13,6 +13,7 @@ test('restart preserves deadlines and dependency promises; old shutdown outcomes
     bundle: true, platform: 'node', format: 'cjs', target: 'node20', logLevel: 'silent' });
   const persisted = new Map();
   const ipcRenderer = {
+    on() {}, removeListener() {},
     invoke: async (channel, value) => {
       if (channel === 'ai-prompts:get') return { success: true, data: [{ id: 'run-after-loop', content: require('../../shared/prompt-loop.cjs').DEFAULT_LOOP_PROMPT }] };
       if (channel === 'ai-prompts:save-content') return { success: true };

@@ -7,7 +7,8 @@ import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
 import { useTimelineSummaryStore } from '../../store/useTimelineSummaryStore';
 import Tooltip from './Tooltip';
 import ControlHint from './ControlHint';
-import ProjectIconsSettings from './ProjectIconsSettings';
+import WorkflowSettings from './ProjectIconsSettings';
+import DirectoryRootsSettings from './DirectoryRootsSettings';
 import { TabProcessBar } from '../Workspace/TabSignals';
 import { HexColorPicker } from 'react-colorful';
 import { ChevronDown, ChevronRight, CircleX, GripVertical, Loader2, Pencil, Trash2, Plus } from 'lucide-react';
@@ -1546,8 +1547,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   useLayoutEffect(() => {
     if (isOpen && !prevIsOpenRef.current && initialTab) {
       const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai', 'projects'];
-      if (valid.includes(initialTab as SettingsTab)) {
-        setActiveTab(initialTab as SettingsTab);
+      const requested = initialTab === 'workflows' || initialTab === 'directories' ? 'projects' : initialTab;
+      if (valid.includes(requested as SettingsTab)) {
+        setActiveTab(requested as SettingsTab);
       }
     }
     prevIsOpenRef.current = isOpen;
@@ -1570,7 +1572,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setHistoryLetterSpacing = useUIStore((state) => state.setHistoryLetterSpacing);
   const [terminalFontSize, setTerminalFontSize] = useDisplayProfileSize('terminalFontSize', profileKey);
   const [tabsFontSize, setTabsFontSize] = useDisplayProfileSize('tabsFontSize', profileKey);
-  const [projectTabsFontSize, setProjectTabsFontSize] = useDisplayProfileSize('projectTabsFontSize', profileKey);
   const [sidebarFontSize, setSidebarFontSize] = useDisplayProfileSize('sidebarFontSize', profileKey);
   const [filePreviewFontSize, setFilePreviewFontSize] = useDisplayProfileSize('filePreviewFontSize', profileKey);
   const [promptPickerFontSize, setPromptPickerFontSize] = useDisplayProfileSize('promptPickerFontSize', profileKey);
@@ -1710,11 +1711,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
   const mirrorStatus = useMirrorStatusStore((s) => (activeProjectId ? s.byProject[activeProjectId] : undefined));
   const setSemanticIndexParallelism = useUIStore((s) => s.setSemanticIndexParallelism);
-  // Геометрия вкладок — Settings → Размеры → Вкладки → Рабочие вкладки/Проекты.
+  // Геометрия рабочих вкладок — Settings → Размеры → Вкладки.
   const tabGeometry = useUIStore((s) => s.tabGeometry);
   const setTabGeometry = useUIStore((s) => s.setTabGeometry);
-  const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
-  const setProjectTabGeometry = useUIStore((s) => s.setProjectTabGeometry);
   const { showToast, claudeDefaultPromptEnabled, setClaudeDefaultPromptEnabled } = useUIStore();
   const { prompts: aiPrompts, loadPrompts: loadAIPrompts, savePrompt: saveAIPrompt, deletePrompt: deleteAIPrompt, rewindPromptId, setRewindPromptId } = usePromptsStore();
 
@@ -3909,7 +3908,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             { id: 'fonts', label: 'Размеры' },
             { id: 'colors', label: 'Системные' },
             { id: 'shortcuts', label: 'Горячие клавиши' },
-            { id: 'projects', label: 'Проекты' }
+            { id: 'projects', label: 'Workflows' }
           ] as { id: SettingsTab; label: string }[]).map((tab) => (
             <button
               key={tab.id}
@@ -3994,7 +3993,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           )}
 
           {activeTab === 'projects' && (
-            <ProjectIconsSettings />
+            <>
+              <WorkflowSettings />
+              <DirectoryRootsSettings />
+            </>
           )}
 
           {activeTab === 'fonts' && (
@@ -4053,16 +4055,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Зазор" value={tabGeometry.gap} onChange={(v) => setTabGeometry({ gap: v })} min={0} max={16} />
                 <FontSizeSlider label="Ширина боковой панели" value={tabSidebarWidth} onChange={setTabSidebarWidth} min={140} max={400} />
                 <FontSizeSlider label="Шрифт" value={tabsFontSize} onChange={setTabsFontSize} min={10} max={20} />
-              </SettingsGrid4>
-
-              <SettingsSubSectionHeader title="Проекты" />
-              <SettingsGrid4>
-                <PaddingRow
-                  valueX={projectTabGeometry.paddingX} onChangeX={(v) => setProjectTabGeometry({ paddingX: v })}
-                  valueY={projectTabGeometry.paddingY} onChangeY={(v) => setProjectTabGeometry({ paddingY: v })}
-                  maxX={32} maxY={16}
-                />
-                <FontSizeSlider label="Шрифт" value={projectTabsFontSize} onChange={setProjectTabsFontSize} min={10} max={16} />
               </SettingsGrid4>
 
               <SettingsSubSectionHeader title="Статусы" />

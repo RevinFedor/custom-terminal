@@ -352,6 +352,12 @@ turn-level activity активной. `RESPONSE_END` закрывает лишь
 а loader снимают только rollout `task_complete`/`turn_aborted` или завершение
 самого process lifecycle.
 
+Текстовый fallback Codex допустим только для legacy canonical без itemId.
+Явный чужой itemId не принимает другой completed item по равной прозе, в том
+числе до transport close. Иначе canonical B перед close1006 удалял preview A,
+а обратный порядок оставлял его unknown. Exact A сохраняет обычное adoption;
+отсутствие подтверждения не фабрикуется ни в rejection, ни в durable receipt.
+
 ## Claude: сетевой ответ и точная запись
 
 `UserPromptSubmit` закрепляет semantic producer за terminal lifecycle и ходом.

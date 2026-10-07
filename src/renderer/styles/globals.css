@@ -224,6 +224,108 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
 .animate-glow-red { animation: glow-red 1.8s ease-in-out infinite; }
 .animate-glow-white { animation: glow-white 0.9s ease-in-out infinite; }
 
+/* Rasterize the two glow endpoints once. Only their opacity changes; the
+   opaque colour change (and the visible halo) still survives video encoding.
+   plus-lighter in this isolated group mixes premultiplied colour/alpha rather
+   than painting the transparent white endpoint over the bright endpoint.
+   Do not fade the whole indicator: labels/borders and hit targets stay fixed.
+   SVG has no generated boxes; its legacy rule above remains until its caller
+   supplies an HTML presentation host. */
+@keyframes noted-glow-light {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+@keyframes noted-glow-dark {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 1; }
+}
+.animate-glow-yellow,
+.animate-glow-purple,
+.animate-glow-green,
+.animate-glow-indigo,
+.animate-glow-blue,
+.animate-glow-red {
+  --noted-glow-duration: 1.8s;
+  --noted-glow-light-shadow: 0 0 4px var(--noted-glow-light);
+  --noted-glow-dark-shadow: 0 0 10px var(--noted-glow-light);
+}
+.animate-glow-yellow { --noted-glow-light: #d97706; --noted-glow-dark: #451a03; }
+.animate-glow-purple { --noted-glow-light: #9333ea; --noted-glow-dark: #3b0764; }
+.animate-glow-green { --noted-glow-light: #16a34a; --noted-glow-dark: #052e16; }
+.animate-glow-indigo { --noted-glow-light: #4f46e5; --noted-glow-dark: #1e1b4b; }
+.animate-glow-blue { --noted-glow-light: #2563eb; --noted-glow-dark: #172554; }
+.animate-glow-red { --noted-glow-light: #dc2626; --noted-glow-dark: #450a0a; }
+.animate-glow-white {
+  --noted-glow-light: rgba(255, 255, 255, 0.95);
+  --noted-glow-dark: rgba(255, 255, 255, 0.35);
+  --noted-glow-light-shadow: 0 0 6px rgba(255, 255, 255, 0.6);
+  --noted-glow-dark-shadow: 0 0 2px rgba(255, 255, 255, 0.15);
+  --noted-glow-duration: 0.9s;
+}
+.animate-glow-yellow:not(svg),
+.animate-glow-purple:not(svg),
+.animate-glow-green:not(svg),
+.animate-glow-indigo:not(svg),
+.animate-glow-blue:not(svg),
+.animate-glow-red:not(svg),
+.animate-glow-white:not(svg) {
+  isolation: isolate;
+  animation: none;
+  background-color: transparent !important;
+  box-shadow: none !important;
+  /* Keep the host's border widths/layout and its computed border colour for
+     inheritance, but paint that border once inside the two isolated rasters.
+     An additional host border would be added again by plus-lighter. */
+  border-image: linear-gradient(transparent, transparent) 1 !important;
+}
+/* Preserve absolute/fixed utility placement (Timeline range overlays). */
+.animate-glow-yellow:not(svg):not(.absolute):not(.fixed),
+.animate-glow-purple:not(svg):not(.absolute):not(.fixed),
+.animate-glow-green:not(svg):not(.absolute):not(.fixed),
+.animate-glow-indigo:not(svg):not(.absolute):not(.fixed),
+.animate-glow-blue:not(svg):not(.absolute):not(.fixed),
+.animate-glow-red:not(svg):not(.absolute):not(.fixed),
+.animate-glow-white:not(svg):not(.absolute):not(.fixed) { position: relative; }
+.animate-glow-yellow:not(svg)::before, .animate-glow-yellow:not(svg)::after,
+.animate-glow-purple:not(svg)::before, .animate-glow-purple:not(svg)::after,
+.animate-glow-green:not(svg)::before, .animate-glow-green:not(svg)::after,
+.animate-glow-indigo:not(svg)::before, .animate-glow-indigo:not(svg)::after,
+.animate-glow-blue:not(svg)::before, .animate-glow-blue:not(svg)::after,
+.animate-glow-red:not(svg)::before, .animate-glow-red:not(svg)::after,
+.animate-glow-white:not(svg)::before, .animate-glow-white:not(svg)::after {
+  content: '';
+  position: absolute;
+  inset: auto;
+  left: 50%;
+  top: 50%;
+  width: 100%;
+  height: 100%;
+  box-sizing: content-box;
+  border: inherit;
+  border-image: none !important;
+  border-radius: inherit;
+  transform: translate3d(-50%, -50%, 0);
+  pointer-events: none;
+  z-index: -1;
+  background: var(--noted-glow-light);
+  box-shadow: var(--noted-glow-light-shadow, 0 0 4px var(--noted-glow-light));
+  mix-blend-mode: plus-lighter;
+  will-change: opacity;
+  animation: noted-glow-light var(--noted-glow-duration, 1.8s) ease-in-out infinite;
+  animation-play-state: inherit;
+}
+.animate-glow-yellow:not(svg)::after,
+.animate-glow-purple:not(svg)::after,
+.animate-glow-green:not(svg)::after,
+.animate-glow-indigo:not(svg)::after,
+.animate-glow-blue:not(svg)::after,
+.animate-glow-red:not(svg)::after,
+.animate-glow-white:not(svg)::after {
+  background: var(--noted-glow-dark);
+  box-shadow: var(--noted-glow-dark-shadow, 0 0 10px var(--noted-glow-light));
+  animation-name: noted-glow-dark;
+}
+
 .animate-slide-in { animation: slide-in 0.3s ease-out forwards; }
 
 /* Reopen-tab pulse: subtle TabBar background flash fired synchronously on
@@ -243,21 +345,12 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
    inside two clipped halves; at the shared seam it read as a displaced grey
    line. A translucent surface wash keeps the real borders untouched and makes
    the whole target breathe uniformly. */
-@keyframes cb-run-after-hotkey-surface-orange {
-  0%, 100% { background-color: rgba(218, 119, 86, 0.02); }
-  50% { background-color: rgba(245, 158, 120, 0.24); }
-}
-
-@keyframes cb-run-after-hotkey-surface-violet {
-  0%, 100% { background-color: rgba(139, 92, 246, 0.02); }
-  50% { background-color: rgba(167, 139, 250, 0.26); }
-}
-
 .cb-run-after-hotkey-surface {
   position: absolute;
   inset: 0;
   border-radius: inherit;
   pointer-events: none;
+  isolation: isolate;
 }
 
 .cb-run-after-hotkey-surface ~ svg {
@@ -266,11 +359,31 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
 }
 
 .cb-run-after-hotkey-surface-orange {
-  animation: cb-run-after-hotkey-surface-orange 1.05s ease-in-out infinite;
+  --noted-hotkey-light: rgba(218, 119, 86, 0.02);
+  --noted-hotkey-dark: rgba(245, 158, 120, 0.24);
 }
 
 .cb-run-after-hotkey-surface-violet {
-  animation: cb-run-after-hotkey-surface-violet 1.05s ease-in-out infinite;
+  --noted-hotkey-light: rgba(139, 92, 246, 0.02);
+  --noted-hotkey-dark: rgba(167, 139, 250, 0.26);
+}
+
+.cb-run-after-hotkey-surface::before,
+.cb-run-after-hotkey-surface::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: var(--noted-hotkey-light);
+  mix-blend-mode: plus-lighter;
+  will-change: opacity;
+  animation: noted-glow-light 1.05s ease-in-out infinite;
+  animation-play-state: inherit;
+}
+.cb-run-after-hotkey-surface::after {
+  background: var(--noted-hotkey-dark);
+  animation-name: noted-glow-dark;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -278,6 +391,8 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
     animation: none;
     background-color: rgba(196, 181, 253, 0.18);
   }
+  .cb-run-after-hotkey-surface::before,
+  .cb-run-after-hotkey-surface::after { display: none; animation: none; }
 }
 
 @keyframes tab-dot-spin {
@@ -289,41 +404,54 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
 
    Прежний способ — вращать transform'ом рамку с одной окрашенной стороной —
    верен только для круга: круг совпадает сам с собой при любом повороте, а
-   повёрнутый овал НЕТ, и дуга на каждом кадре вылезала за контур («на овале
-   сбоит, потому что овал — это овал»). Здесь коробка не вращается вовсе:
-   крутится УГОЛ конического градиента, а полоса вырезана маской по границе
-   собственной формы элемента (кольцо = вся коробка минус content-box), поэтому
-   дуга обнимает контур на каждом кадре. Толщину задаёт padding.
+   повёрнутый овал НЕТ, и дуга вылезала за контур. Коробка/маска теперь
+   неподвижны; вращается только отдельная квадратная текстура внутри маски.
+   Не анимировать угол conic-gradient: это заново рисует retained document
+   каждый кадр. Размер текстуры через локальные container units покрывает
+   диагональ и широкого, и высокого кольца при любом угле. Толщина = padding.
 
    Настройки через переменные: --noted-ring-color (дуга), --noted-ring-track
    (остальное кольцо; по умолчанию прозрачное), --noted-ring-thickness.
 
    Под «Уменьшать движение» НЕ гасится: движение дуги — сам сигнал «идёт
    работа», а не украшение (см. инцидент с точкой периметра, 2026-08-18). */
-@property --noted-ring-angle {
-  syntax: '<angle>';
-  inherits: false;
-  initial-value: 0deg;
-}
 @keyframes noted-ring-sweep {
-  to { --noted-ring-angle: 360deg; }
+  from { transform: translate3d(-50%, -50%, 0) rotate(0deg); }
+  to { transform: translate3d(-50%, -50%, 0) rotate(360deg); }
 }
 .noted-shape-ring {
   position: absolute;
   pointer-events: none;
   border-radius: inherit;
   padding: var(--noted-ring-thickness, 1.5px);
-  background:
-    conic-gradient(
-      from var(--noted-ring-angle),
-      var(--noted-ring-color, #fbbf24) 0deg 86deg,
-      var(--noted-ring-track, transparent) 86deg 360deg
-    );
+  --noted-ring-padding: var(--noted-ring-thickness, 1.5px);
+  container-type: size;
+  overflow: hidden;
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
   mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   mask-composite: exclude;
+}
+.noted-shape-ring::before,
+.tab-awaiting-input::before,
+.tab-completion-notification-alert::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: max(calc(150cqw + 4 * var(--noted-ring-padding)), calc(150cqh + 4 * var(--noted-ring-padding)));
+  aspect-ratio: 1;
+  pointer-events: none;
+  will-change: transform;
   animation: noted-ring-sweep 0.9s linear infinite;
+  animation-play-state: inherit;
+}
+.noted-shape-ring::before {
+  background:
+    conic-gradient(
+      var(--noted-ring-color, #fbbf24) 0deg 86deg,
+      var(--noted-ring-track, transparent) 86deg 360deg
+    );
 }
 
 @keyframes tab-title-naming-sweep {
@@ -397,13 +525,17 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
    стримит» (claude/gemini/sdk busy-state) перенесённый с фона таба на саму
    полоску. Рендерится КАК ОВЕРЛЕЙ внутри полоски, а не вместо неё — базовая
    process-alive полоса и AI-busy блик могут идти одновременно.
-   Подход — `background-position-y` на full-bar overlay с **wrapping gradient**:
-   pattern (1 tile = 100% bar height) содержит ОДИН пик яркости в центре, но
-   яркая зона расширена до 60% pattern'а (10%-90% stops). Это значит на стыках
-   tile'ов (граница y=0/100% pattern repeat) яркость уже dim-но-не-ноль,
-   следующий tile подхватывает блик без чёрной паузы. background-position
-   ползёт от 0 0 до 0 100% за period — полный сдвиг на один tile, seamless по
-   построению (`background-repeat: repeat-y`). Раньше пробовали:
+   Raster the existing repeating gradient once and move its compositor layer.
+   For bar height H and spacing S, the old 0→100% background-position travelled
+   H−S*H (including zero at100% and reverse at200%). Preserve that exact travel,
+   rather than inventing a different "one tile" speed or resetting the pattern.
+   Raster height9H, top−4H and initial background offset4H cover the full20–200%
+   range without exposing an empty edge. Anchor the repeating gradient stops
+   at4H within that9H raster; the EXISTING spacing percentage still sets the
+   period, without JS observers or a second settings variable. Translate3d
+   also retains the same composited
+   raster at phase0; the 2D identity path sampled a different initial raster.
+   Раньше пробовали:
      1) translateY один overlay — гэп ~30% времени когда пик off-screen.
      2) Два overlay'я с фазой 50% — юзер видит ДВА блика одновременно в той
         части цикла когда верхний ещё не ушёл, нижний уже появился.
@@ -413,8 +545,8 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
    границах, gradient функционально непрерывен по всей полоске, blur эффект
    светится постоянно но смещается. */
 @keyframes tab-process-bar-ai-shimmer {
-  0%   { background-position: 0 0; }
-  100% { background-position: 0 100%; }
+  0%   { transform: translate3d(0, 0, 0); }
+  100% { transform: translate3d(0, calc((100% - var(--process-bar-shimmer-spacing, 50%)) / 9), 0); }
 }
 @keyframes timeline-summary-text-shimmer {
   0%   { background-position: 180% 0; }
@@ -422,27 +554,19 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
 }
 .tab-process-bar-ai-shimmer-overlay {
   position: absolute;
-  inset: 0;
+  inset: auto 0 auto;
+  top: -400%;
+  height: 900%;
   pointer-events: none;
-  /* Seamless tile pattern. `--process-bar-shimmer-spacing` = высота tile'а;
-     `background-repeat: repeat-y` повторяет паттерн без
-     ограничений (за пределами видимой зоны тоже tiles рендерятся, anim сдвигает
-     через них). Pattern: пик яркости в центре tile, alpha=.12 на 0% и 100%
-     этого tile — НЕ ноль, чтобы на стыках двух tile'ов яркость не падала в
-     темноту. background-position 0→100% per period (1.2s) сдвигает паттерн
-     ровно на ОДИН tile сверху вниз — пользователь видит непрерывный поток
-     светлых пиков. На стыке цикла (animation iteration boundary) позиция
-     `0 100%` визуально идентична `0 0` благодаря repeat-y → loop seamless. */
-  background-image: linear-gradient(
+  /* Keep exactly the former tile height and color/alpha interpolation. */
+  background-image: repeating-linear-gradient(
     to bottom,
-    rgba(var(--process-bar-shimmer-rgb, 255, 255, 255), var(--process-bar-shimmer-edge-alpha, 0.12))   0%,
-    rgba(var(--process-bar-shimmer-rgb, 255, 255, 255), var(--process-bar-shimmer-alpha, 0.55))  50%,
-    rgba(var(--process-bar-shimmer-rgb, 255, 255, 255), var(--process-bar-shimmer-edge-alpha, 0.12)) 100%
+    rgba(var(--process-bar-shimmer-rgb, 255, 255, 255), var(--process-bar-shimmer-edge-alpha, 0.12)) calc(400% / 9),
+    rgba(var(--process-bar-shimmer-rgb, 255, 255, 255), var(--process-bar-shimmer-alpha, 0.55)) calc((400% + var(--process-bar-shimmer-spacing, 50%) / 2) / 9),
+    rgba(var(--process-bar-shimmer-rgb, 255, 255, 255), var(--process-bar-shimmer-edge-alpha, 0.12)) calc((400% + var(--process-bar-shimmer-spacing, 50%)) / 9)
   );
-  background-size: 100% var(--process-bar-shimmer-spacing, 50%);
-  background-repeat: repeat-y;
   animation: tab-process-bar-ai-shimmer 1.2s linear infinite;
-  will-change: background-position;
+  will-change: transform;
 }
 
 .tab-process-bar-inherited-shimmer-overlay {
@@ -479,27 +603,16 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
    тонкая бегущая рамка 1.2px: яркий фиолетовый сегмент ходит по периметру таба
    поверх еле заметного постоянного кольца.
 
-   Техника traveling-border:
-   1. conic-gradient как background — яркая дуга ~90° на прозрачном фоне.
-   2. @property --awaiting-angle (<angle>) — даёт ПЛАВНУЮ интерполяцию угла в
-      keyframe (без @property conic-gradient прыгал бы рывками; Electron 28 =
-      Chromium 120, поддержка есть).
-   3. padding:1.2px + mask-exclude (content-box XOR border-box) — оставляет
-      только кольцо толщиной padding по border-radius элемента. box-sizing у
-      проекта border-box (Tailwind) — ring width ровно = padding.
+   Неподвижная mask-exclude рамка 1.2px; conic-текстура ::before вращается
+   compositor transform'ом. Отдельный background сохраняет постоянный track.
+   CSS containment локален абсолютной рамке с заданными inset, не вкладке
+   или retained History. Квадрат texture покрывает прямоугольник при любом
+   повороте; форма самой рамки никогда не вращается.
 
    background-color НЕ анимируется (фон прозрачный) — сигнал несёт движущийся
    яркий сегмент (высокая дельта пикселей по периметру → codec/AI-detectable,
    CLAUDE.md::AI-Optimized UI). border-radius наследуется от inline-стиля
    оверлея (tabGeo.borderRadius в TabBar, rounded-sm в App project-tab). */
-@property --awaiting-angle {
-  syntax: '<angle>';
-  initial-value: 0deg;
-  inherits: false;
-}
-@keyframes tab-awaiting-spin {
-  to { --awaiting-angle: 360deg; }
-}
 @keyframes tab-completion-notification-dismiss {
   from {
     opacity: 1;
@@ -512,16 +625,10 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
 }
 .tab-awaiting-input {
   padding: 1.2px; /* толщина бегущей рамки */
-  background:
-    /* яркий сегмент с хвостом, вращается через --awaiting-angle */
-    conic-gradient(from var(--awaiting-angle),
-      rgba(168, 85, 247, 0) 0deg,
-      rgba(168, 85, 247, 0) 240deg,
-      rgba(168, 85, 247, 0.85) 312deg,
-      rgba(216, 180, 254, 1) 348deg,
-      rgba(168, 85, 247, 0) 360deg),
-    /* еле заметное постоянное кольцо — рамка всегда «есть» */
-    rgba(147, 51, 234, 0.22);
+  --noted-ring-padding: 1.2px;
+  container-type: size;
+  overflow: hidden;
+  background: rgba(147, 51, 234, 0.22);
   -webkit-mask:
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
@@ -530,20 +637,24 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
   mask-composite: exclude;
-  animation: tab-awaiting-spin 1.6s linear infinite;
   pointer-events: none;
+}
+.tab-awaiting-input::before {
+  animation-duration: 1.6s;
+  background: conic-gradient(
+    rgba(168, 85, 247, 0) 0deg,
+    rgba(168, 85, 247, 0) 240deg,
+    rgba(168, 85, 247, 0.85) 312deg,
+    rgba(216, 180, 254, 1) 348deg,
+    rgba(168, 85, 247, 0) 360deg);
 }
 
 .tab-completion-notification-alert {
   padding: 1.2px;
-  background:
-    conic-gradient(from var(--awaiting-angle),
-      rgba(220, 38, 38, 0) 0deg,
-      rgba(220, 38, 38, 0) 240deg,
-      rgba(220, 38, 38, 0.88) 312deg,
-      rgba(254, 202, 202, 1) 348deg,
-      rgba(220, 38, 38, 0) 360deg),
-    rgba(185, 28, 28, 0.28);
+  --noted-ring-padding: 1.2px;
+  container-type: size;
+  overflow: hidden;
+  background: rgba(185, 28, 28, 0.28);
   -webkit-mask:
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
@@ -552,14 +663,23 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
   mask-composite: exclude;
-  animation: tab-awaiting-spin 1.6s linear infinite;
   pointer-events: none;
+}
+.tab-completion-notification-alert::before {
+  animation-duration: 1.6s;
+  background: conic-gradient(
+    rgba(220, 38, 38, 0) 0deg,
+    rgba(220, 38, 38, 0) 240deg,
+    rgba(220, 38, 38, 0.88) 312deg,
+    rgba(254, 202, 202, 1) 348deg,
+    rgba(220, 38, 38, 0) 360deg);
 }
 
 .tab-completion-notification-alert--dismiss {
-  animation:
-    tab-awaiting-spin 1.6s linear infinite,
-    tab-completion-notification-dismiss 420ms ease-out forwards;
+  /* Keep the existing presentation gate's paused,running slots: the first
+     (now empty) slot is also inherited by the recurring ::before texture;
+     the second owns finite dismissal and must still end while hidden. */
+  animation: none, tab-completion-notification-dismiss 420ms ease-out forwards;
   will-change: opacity, filter;
 }
 

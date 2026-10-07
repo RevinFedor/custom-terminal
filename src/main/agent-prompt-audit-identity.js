@@ -84,10 +84,28 @@ function agentPromptAuditMatchesHash(expectedOperationHash, input = {}) {
   };
 }
 
+function agentPromptAuditAddresses(input = {}) {
+  const collect = (primary, aliases) => [...new Set([primary,
+    ...(Array.isArray(aliases) ? aliases : [])].map(cleanString).filter(Boolean))];
+  return {
+    entryUuids: collect(input.entryUuid, input.entryUuidAliases),
+    sourceIdentities: collect(input.sourceIdentity, input.sourceIdentityAliases),
+  };
+}
+
+function agentPromptAuditAddressesOverlap(left, right) {
+  const a = agentPromptAuditAddresses(left);
+  const b = agentPromptAuditAddresses(right);
+  return a.entryUuids.some(value => b.entryUuids.includes(value))
+    || a.sourceIdentities.some(value => b.sourceIdentities.includes(value));
+}
+
 module.exports = {
   CLAUDE_CANONICAL_REASONS,
   CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON,
   CODEX_CANONICAL_REASONS,
   agentPromptAuditMatchesHash,
   classifyAgentPromptAuditIdentity,
+  agentPromptAuditAddresses,
+  agentPromptAuditAddressesOverlap,
 };

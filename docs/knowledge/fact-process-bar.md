@@ -82,7 +82,22 @@ reserved/preparing без выполняемого сценария сам по 
 
 **Эволюция подходов к continuous flow.** Сначала был один overlay translateY `-100% → 250%` — пик внутри полоски ~70% цикла, остальные 30% его не видно → юзер читает как «лоадер прыгает». Потом два overlay'я с `animation-delay: -0.6s` — на широких частях периода юзер видит **ДВА блика одновременно** (один уходит снизу, второй уже появился сверху), это уродует визуал в узкой 3px полоске. Потом repeat-y gradient с pattern 200% и пик на 50% — на стыках tile'ов 60% pattern имело alpha 0 подряд (хвост tile_n + начало tile_n+1), пик надолго пропадал.
 
-Текущий вариант — **seamless wrapping gradient**: один `.tab-process-bar-ai-shimmer-overlay`, `background-repeat: repeat-y`, `background-size: 100% var(--process-bar-shimmer-spacing)`, пик на 50% tile, edge-alpha = `shimmerOpacityPct * .22`. На стыках двух tile'ов alpha с обеих сторон одинаковая → нет тёмной паузы, есть мягкий valley между движущимися пиками. `background-position 0 → 100%` за 1.2s сдвигает на один tile, конец цикла визуально идентичен началу благодаря repeat-y. Юзер: *«прерывается на долю секунды во время лоудера когда заходит в конце и появляется в начале»* — этот шов теперь физически отсутствует.
+С06.10 R04 SOURCE один `.tab-process-bar-ai-shimmer-overlay` рисует прежний
+повторяющийся градиент один раз, затем двигает HTML-слой через `translate3d`.
+При высоте полосыH raster имеет9H/top−4H, stops привязаны к4H; прежний период
+`S*H`, цвета, alpha центра/края и1.2s сохранены. На всём20–200% диапазоне
+кромка не оголяется. Реальное прежнее `background-position 0→100%` двигалось
+на `H−S*H`, а не универсально на один tile: в100% сдвиг0, в200% отрицательный.
+Ремонт сохраняет эту существующую семантику настройки и границы цикла.
+
+Это замена графического механизма, не busy/process источников: геометрия3px,
+left/right, inherited фон и отдельный цвет блика прежние. CSS-переменные
+по-прежнему обновляют все instance без новых JS timers/ResizeObserver/props.
+Первый отвергнутый4H-прототип имел gap/другую фазу на крайних настройках и не
+перенесён. Новый вариант проверен90базовыми и540compiledCSS сравнениями:
+6spacing×3height×5phase×normal/inherited/both×left/right, geometry exact,
+средняя RGB ошибка≤2.657/255. Это bounded raster-equivalence, не bit-identical.
+Приёмка native/ввода и предел installed — рабочая performance-карта R04.
 
 Один overlay (`.tab-process-bar-ai-shimmer-overlay`), никаких secondary-инстансов. Если в будущем нужно убавить общий glow — снижать `shimmerOpacityPct`, не менять geometry.
 

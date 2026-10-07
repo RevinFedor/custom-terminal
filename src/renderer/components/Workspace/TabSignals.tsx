@@ -50,7 +50,7 @@ export const TAB_PROCESS_BAR_W_PX = 3;
 // exact square is clickable” before the user presses it.
 const TAB_MARKER_HOVER_SCALE = 1.32;
 
-/** One completion-bell visual contract for sidebar cards and pane chips. */
+/** Fade duration for the aggregate workflow completion frame. */
 export const TAB_COMPLETION_NOTIFICATION_DISMISS_MS = 420;
 
 export function TabCompletionNotificationIcon({ persistent = false, size = 13, color, viewportWidth = size }: {
@@ -66,7 +66,7 @@ export function TabCompletionNotificationIcon({ persistent = false, size = 13, c
     style={{ flexShrink: 0, overflow: viewportWidth < size ? 'visible' : undefined }} aria-hidden="true" />;
 }
 
-/** The bell names the enabled mode; the existing border still owns unread completion. */
+/** The bell is the only notification marker on an individual tab. */
 export function TabCompletionNotificationBadge({ armed, persistent, fired }: {
   armed: boolean;
   persistent: boolean;
@@ -98,25 +98,9 @@ export function TabCompletionNotificationBadge({ armed, persistent, fired }: {
   </span>;
 }
 
-export function resolveTabCompletionNotificationShadow({
-  armed,
-  fired,
-  collapsed = false,
-}: {
-  armed: boolean;
-  fired: boolean;
-  collapsed?: boolean;
-}): string | null {
-  if (collapsed) return null;
-  if (fired) return 'inset 0 0 0 1.5px rgba(239, 68, 68, 0.9), 0 0 12px rgba(239, 68, 68, 0.22)';
-  if (armed) return 'inset 0 0 0 1px rgba(248, 113, 113, 0.55)';
-  return null;
-}
-
 /**
- * Keep the fired ring alive briefly after acknowledgement so it fades instead
- * of disappearing between two frames. Each visible copy owns only this tiny
- * animation state; armed/fired remain canonical tab state in the workspace.
+ * Keep the aggregate workflow ring alive briefly after acknowledgement.
+ * Individual tabs use only the bell; fired remains canonical workspace state.
  */
 export function useTabCompletionNotificationDismissing(fired: boolean): boolean {
   const [dismissing, setDismissing] = useState(false);
@@ -147,39 +131,6 @@ export function useTabCompletionNotificationDismissing(fired: boolean): boolean 
   }, [fired]);
 
   return dismissing;
-}
-
-export function TabCompletionNotificationAlert({
-  fired,
-  dismissing,
-  borderRadius,
-  horizontalBleedPx = 0,
-}: {
-  fired: boolean;
-  dismissing: boolean;
-  borderRadius: number | string;
-  horizontalBleedPx?: number;
-}) {
-  if (!fired && !dismissing) return null;
-  return (
-    <span
-      data-tab-completion-notification-alert
-      className={`tab-completion-notification-alert ${dismissing && !fired
-        ? 'tab-completion-notification-alert--dismiss'
-        : ''}`}
-      style={{
-        position: 'absolute',
-        top: 0,
-        bottom: 0,
-        left: -horizontalBleedPx,
-        right: -horizontalBleedPx,
-        pointerEvents: 'none',
-        zIndex: 2,
-        borderRadius,
-      }}
-      aria-hidden
-    />
-  );
 }
 
 export interface TabProcessBarProps {

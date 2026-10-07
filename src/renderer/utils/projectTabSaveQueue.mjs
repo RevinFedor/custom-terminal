@@ -8,24 +8,26 @@
 export function createProjectTabSaveQueue() {
   const tails = new Map();
 
-  const enqueue = (projectId, operation) => {
-    if (!projectId) return Promise.reject(new TypeError('projectId is required'));
+  const enqueueMany = (projectIds, operation) => {
+    const ids = [...new Set(projectIds || [])];
+    if (ids.length === 0 || ids.some(id => !id)) return Promise.reject(new TypeError('projectId is required'));
     if (typeof operation !== 'function') {
       return Promise.reject(new TypeError('operation is required'));
     }
-    const previous = tails.get(projectId) || Promise.resolve();
+    const previous = Promise.all(ids.map(id => (tails.get(id) || Promise.resolve()).catch(() => undefined)));
     const queued = previous
       .catch(() => undefined)
       .then(operation);
     const tracked = queued.finally(() => {
-      if (tails.get(projectId) === tracked) tails.delete(projectId);
+      for (const id of ids) if (tails.get(id) === tracked) tails.delete(id);
     });
-    tails.set(projectId, tracked);
+    for (const id of ids) tails.set(id, tracked);
     return tracked;
   };
 
   return {
-    enqueue,
+    enqueue: (projectId, operation) => enqueueMany([projectId], operation),
+    enqueueMany,
     pending(projectId) {
       return tails.has(projectId);
     },

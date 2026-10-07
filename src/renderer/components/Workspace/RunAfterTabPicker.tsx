@@ -797,12 +797,11 @@ export function RunAfterTabPicker({
         ? 'rgba(255,255,255,0.07)'
         : 'transparent';
 
-  const navigateToSelectedTab = useCallback(() => {
+  const navigateToSelectedTab = useCallback(async () => {
     if (!selectedTab || !selectedTabProjectId) return;
-    setOpen(false);
     // Same placement-aware navigation as the sidebar / Ctrl+Tab surfaces. A
     // plain activation would show the tab in the wrong window or workspace.
-    useWorkspaceStore.getState().placeTab(selectedTabProjectId, selectedTab.id);
+    if (await useWorkspaceStore.getState().openTabById(selectedTab.id,{projectId:selectedTabProjectId,reason:'run-after-picker'})) setOpen(false);
   }, [selectedTab, selectedTabProjectId]);
 
   const renderPillTrigger = () => selectedTab ? (

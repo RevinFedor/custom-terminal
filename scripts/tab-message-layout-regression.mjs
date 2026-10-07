@@ -51,6 +51,14 @@ for (const name of ['src', 'packages/claude-blocks']) {
 }
 await fs.mkdir(path.join(snapshot, 'scripts/fixtures'), { recursive: true });
 await fs.copyFile(path.join(repo, 'scripts/fixtures/tab-message-layout.tsx'), path.join(snapshot, 'scripts/fixtures/tab-message-layout.tsx'));
+if (process.env.NOTED_AUDIT_CONTROL_STALE_RUNS === '1') {
+  const file = path.join(snapshot, 'src/renderer/components/Workspace/OrchestrationStatusChip.tsx');
+  const source = await fs.readFile(file, 'utf8');
+  const current = 'setRuns((current) => mergeOrchestrationRuns(items, current));';
+  assert.ok(source.includes(current));
+  await fs.writeFile(file, source.replace(current, 'setRuns(Array.isArray(items) ? items : []);'));
+  report.control = 'old-list-replaces-current-events';
+}
 await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
 for (const name of ['structured-dnd', 'file-explorer']) {
   await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(artifact, 'noted-shared/packages', name),
@@ -62,6 +70,7 @@ for (const name of ['PromptQueueOverlay', 'OrchestrationStatusChip', 'TabMessage
 }
 for (const file of ['src/renderer/hooks/useRequestDockLayout.ts', 'src/renderer/hooks/useTabMessages.ts',
   'src/renderer/utils/tabMessageProjection.ts', 'src/renderer/utils/requestTrackerVisibility.mjs',
+  'src/renderer/utils/orchestrationRunProjection.mjs',
   'src/renderer/utils/orchestrationDetails.mjs', 'src/renderer/styles/globals.css']) {
   report.source[file] = createHash('sha256').update(await fs.readFile(path.join(snapshot, file))).digest('hex');
 }
@@ -247,6 +256,19 @@ for (const width of widths) await suite.test(`actual tab-message layout at ${wid
     assert.match(differentText, /Synthetic result proof failure/);
     assert.match(differentText, /future-specific-reason/);
     assert.match(differentText, /Доставка уведомления не подтверждена/);
+    await differentHistoryRow.locator('button[aria-expanded]').click();
+    const manualCancel = historyPanel.locator('[data-orchestration-run-id="details-manual-cancel"]');
+    await manualCancel.locator('button[aria-expanded]').click();
+    const cancelledDetails = manualCancel.locator('[data-orchestration-run-details]');
+    const cancelledText = await cancelledDetails.innerText();
+    assert.match(cancelledText, /Остановлено вручную/);
+    assert.match(cancelledText, /Отправка отменена/);
+    assert.doesNotMatch(cancelledText, /turn_aborted|Ошибка/);
+    assert.equal(await cancelledDetails.evaluate(node => node.scrollWidth <= node.clientWidth), true);
+    await cancelledDetails.scrollIntoViewIfNeeded();
+    await settle();
+    await page.screenshot({ path: path.join(runDir, 'history-manual-cancel.png') });
+    await manualCancel.locator('button[aria-expanded]').click();
     const historyDateGeometry = await historyPanel.locator('[data-orchestration-request-time]').evaluateAll(nodes => nodes.map(node => {
       const date = node.getBoundingClientRect();
       const header = node.parentElement.getBoundingClientRect();
@@ -256,6 +278,7 @@ for (const width of widths) await suite.test(`actual tab-message layout at ${wid
     }));
     assert.ok(historyDateGeometry.every(item => !item.clipped && item.contained && !item.overlaps), 'request date overlaps or clips on a long status/title');
     result.checks.push('History: one error copy, combined outcome, notification distinct from execution, full minute dates, unknown evidence retained');
+    result.checks.push('manual cancellation is an outcome, not a duplicate error; suppressed delivery and timestamp retained');
     await page.keyboard.press('Escape');
     await historyPanel.waitFor({ state: 'hidden' });
 
@@ -363,8 +386,8 @@ for (const width of widths) await suite.test(`actual tab-message layout at ${wid
     result.checks.push('one opener with Send/Reply statuses, closed details, expandable bodies, Escape and close');
     await row.locator('[data-tab-message-source]').click();
     assert.equal((await state()).navigation.at(-1)?.tabId, 'layout-peer');
-    assert.equal((await state()).navigation.at(-1)?.projectId, 'layout-peer-project');
-    assert.equal((await state()).navigation.at(-1)?.kind, 'placeTab', 'message source navigation must preserve window placement');
+    assert.equal((await state()).navigation.at(-1)?.options.projectId, 'layout-peer-project');
+    assert.equal((await state()).navigation.at(-1)?.kind, 'openTabById', 'message source navigation must use the global resolver');
     assert.equal(await preview.count(), 0, 'source navigation also opened a preview');
     result.checks.push('source chip navigation is independent from preview');
 
@@ -416,7 +439,7 @@ for (const width of widths) await suite.test(`actual tab-message layout at ${wid
     }
     await native.getByRole('button', { name: '\u041e\u0442\u043a\u0440\u044b\u0442\u044c \u0441\u0432\u044f\u0437\u0430\u043d\u043d\u0443\u044e \u0432\u043a\u043b\u0430\u0434\u043a\u0443', exact: true }).click();
     assert.equal((await state()).navigation.at(-1)?.tabId, 'layout-target');
-    assert.equal((await state()).navigation.at(-1)?.kind, 'placeTab');
+    assert.equal((await state()).navigation.at(-1)?.kind, 'openTabById');
     await historyPanel.waitFor({ state: 'hidden' });
     await historyButton.click(); await historyPanel.waitFor();
     await historyButton.click(); await historyPanel.waitFor({ state: 'hidden' });
@@ -519,8 +542,8 @@ for (const width of widths) await suite.test(`actual tab-message layout at ${wid
       assert.equal(metrics.nativeOverflow, false);
       assert.equal(metrics.horizontalOverflow, false);
       await page.screenshot({ path: path.join(runDir, 'unified-rows-scrollbar.png') });
+      result.checks.push('1000px exact header/status/action metric matrix, indented Send/Reply child and thin scroller');
     }
-    result.checks.push('shared header/status/action metrics, one indented Send/Reply child, no duplicate checks/chevron, one thin scroller');
 
     const dismissCallsBefore = (await state()).calls.filter(call => call.channel === 'tab-messages:dismiss').length;
     await page.evaluate(() => window.tabMessageLayout.completePair());
@@ -548,6 +571,25 @@ for (const width of widths) await suite.test(`actual tab-message layout at ${wid
     assert.equal(await dock.locator('[data-tab-message-row="layout-question"]').count(), 0);
     assert.equal(await dock.locator('[data-tab-message-row="layout-outgoing"]').count(), 0);
     result.checks.push('success expiry advances without new events, retains History/open preview, keeps failure/waiting, survives remount without mutations');
+    await page.evaluate(() => window.tabMessageLayout.beginRunHydration());
+    await page.waitForFunction(() => window.tabMessageLayout.pendingRunReads.length > 0);
+    await historyButton.click();
+    await historyPanel.waitFor();
+    await page.evaluate(() => window.tabMessageLayout.publishRunCompletion());
+    const hydratedRun = historyPanel.locator('[data-orchestration-run-id="layout-native-run"]');
+    await hydratedRun.locator('[data-orchestration-status-icon="success"]').waitFor();
+    await page.evaluate(() => window.tabMessageLayout.releaseRunRead());
+    await settle();
+    assert.equal(await hydratedRun.locator('[data-orchestration-status-icon="success"]').count(), 1,
+      'late sending snapshot must not overwrite the already accepted completed event');
+    await page.screenshot({ path: path.join(runDir, 'run-hydration-event-before-list.png') });
+    await page.evaluate(() => window.tabMessageLayout.showSending());
+    await settle();
+    assert.equal(await hydratedRun.locator('[data-orchestration-status-icon="waiting"]').count(), 1);
+    assert.equal(await hydratedRun.locator('.animate-spin').count(), 0, 'delivery waiting is not model execution');
+    assert.match(await hydratedRun.innerText(), /Ожидает доставки/);
+    await page.screenshot({ path: path.join(runDir, 'run-waiting-delivery.png') });
+    result.checks.push('actual run event before stale list retains completion; sending without execution shows static delivery waiting');
     assert.deepEqual((await state()).violations, []);
     assert.deepEqual(await app.evaluate(() => global.blockedRequests), []);
     assert.deepEqual(result.errors, []);

@@ -20,16 +20,15 @@ const store = readFileSync(join(rendererDir, 'store/useWorkspaceStore.ts'), 'utf
 const css = readFileSync(join(rendererDir, 'styles/globals.css'), 'utf8');
 
 test('sidebar and pane chip render the same completion-bell visual contract', () => {
-  assert.match(signals, /export function resolveTabCompletionNotificationShadow/);
   assert.match(signals, /export function useTabCompletionNotificationDismissing/);
-  assert.match(signals, /export function TabCompletionNotificationAlert/);
   assert.match(signals, /export function TabCompletionNotificationBadge/);
+  assert.equal(/export function (?:resolveTabCompletionNotificationShadow|TabCompletionNotificationAlert)/.test(signals), false,
+    'tab notification frame helpers are removed');
 
   assert.match(pane, /<TabCard/);
   for (const source of [sidebar, card]) {
-    assert.match(source, /resolveTabCompletionNotificationShadow/);
-    assert.match(source, /useTabCompletionNotificationDismissing/);
-    assert.match(source, /<TabCompletionNotificationAlert/);
+    assert.equal(/resolveTabCompletionNotificationShadow|useTabCompletionNotificationDismissing|TabCompletionNotificationAlert/.test(source), false,
+      'enabled and fired notifications use the bell, not a tab frame or its fade timer');
     assert.match(source, /<TabCompletionNotificationBadge armed=\{(?:completionNotificationArmed|armed)\}/);
     assert.match(source, /persistent=\{(?:completionNotificationPersistent|persistent)\}/);
   }
@@ -40,6 +39,15 @@ test('sidebar and pane chip render the same completion-bell visual contract', ()
   assert.match(card, /showShownStripe && \(shown \|\| pressed\)/);
   assert.match(css, /\.tab-completion-notification-alert \{/);
   assert.match(css, /\.tab-completion-notification-alert--dismiss \{/);
+});
+
+test('removing notification frames preserves error, availability and selection visuals', () => {
+  assert.match(card, /border: hiddenErrors > 0 \? '1px solid #f87171'/);
+  assert.match(card, /sessionAvailabilityRailShadow\(availability\)/);
+  assert.match(sidebar, /sessionAvailabilityRailShadow\(sessionAvailability\)/);
+  assert.match(sidebar, /isDragBlockedTarget \? 'inset 0 0 0 1\.5px rgba\(248, 113, 113, 0\.86\)'/);
+  assert.match(sidebar, /if \(isSelected\)/);
+  assert.match(sidebar, /return '2px dashed rgba\(255,255,255,0\.3\)'/);
 });
 
 test('the two bells keep distinct one-shot and persistent semantics', () => {

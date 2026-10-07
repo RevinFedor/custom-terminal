@@ -81,15 +81,28 @@ export function chooseWindowCloseAction(detached, archived) {
     ? {kind:'detach',entry:detached} : {kind:'archive',entry:archived};
 }
 
-// Closing a parent promotes only its direct children. Keep a separate undo
-// relation, so they stay usable while it is closed, even across restart.
+// Linked documents share their owner's lifetime. Independent child sessions
+// stay usable and retain a separate undo relation across restart.
 export function tabsAfterClose(tabs, tabId, rememberParent = true) {
-  const parentId = tabs.has(tabId) ? tabPlacementId(tabs.get(tabId)) : tabId;
+  const closing = new Set([tabId]), owners = [tabId];
+  const filesByOwner = new Map();
+  for (const [id, tab] of tabs) {
+    if (tab.tabType !== 'file') continue;
+    const files = filesByOwner.get(tab.visualParentTabId) || [];
+    files.push(id); filesByOwner.set(tab.visualParentTabId, files);
+  }
+  for (const owner of owners) for (const id of filesByOwner.get(owner) || []) {
+    if (closing.has(id)) continue;
+    closing.add(id); owners.push(id);
+  }
   const next = new Map(tabs);
-  next.delete(tabId);
+  for (const id of closing) next.delete(id);
   for (const [id, tab] of next) {
-    if (tab.visualParentTabId === tabId) next.set(id, { ...tab, visualParentTabId: undefined,
-      closedVisualParentTabId: rememberParent ? parentId : undefined });
+    if (!closing.has(tab.visualParentTabId)) continue;
+    const parent = tabs.get(tab.visualParentTabId);
+    next.set(id, { ...tab, visualParentTabId: undefined,
+      closedVisualParentTabId: rememberParent && parent?.tabType !== 'file'
+        ? (parent ? tabPlacementId(parent) : tab.visualParentTabId) : undefined });
   }
   return next;
 }

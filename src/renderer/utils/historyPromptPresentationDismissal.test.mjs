@@ -30,6 +30,15 @@ test('ordinary or receipt-backed sends keep durable dismissal', () => {
   }).mode, 'durable');
 });
 
+test('a durable terminal pre-attempt failure is read by Main, not waiting for an attempt that never existed', () => {
+  for (const queueStatus of ['failed', 'cancelled']) {
+    const plan = planHistoryPromptPresentationDismissal({ isLocalPrompt: true, handoffId: 'old',
+      requiresAuditIdentity: true, sendOperationKey: 'history:T:old', sendAttemptId: null, queueStatus });
+    assert.equal(plan.mode, 'durable');
+    assert.equal(plan.reason, 'durable-no-attempt-presentation');
+  }
+});
+
 test('non-local or identity-less rows expose no dismiss plan', () => {
   assert.equal(planHistoryPromptPresentationDismissal({
     isLocalPrompt: false,

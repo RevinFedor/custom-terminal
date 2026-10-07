@@ -13,7 +13,7 @@ const LIST_COLUMNS = `messageId, kind, replyTo,
   targetTabId, targetTabName, targetProjectId, targetProjectName, targetProvider, targetSessionId,
   createdAt, updatedAt, deliveryState, error, code, replyMessageId, answeredAt,
   sourceDismissedAt, targetDismissedAt,
-  operationKey, handoffId, requestId`;
+  operationKey, handoffId, requestId, sourceAddressJson, targetAddressJson`;
 const hash = (text) => createHash('sha256').update(text).digest('hex');
 const now = () => new Date().toISOString();
 const updatedAfter = (previous) => new Date(Math.max(Date.now(), Date.parse(previous) + 1)).toISOString();
@@ -35,15 +35,40 @@ function required(value, name) {
   return value;
 }
 
+function launchAddress(value) {
+  if (!value || typeof value !== 'object' || typeof value.terminalInstanceId !== 'string' || !value.terminalInstanceId.trim()
+    || typeof value.launchId !== 'string' || !value.launchId.trim()
+    || !['claude', 'codex'].includes(value.toolType)) return null;
+  return { toolType: value.toolType, terminalInstanceId: value.terminalInstanceId, launchId: value.launchId };
+}
+
+function parsedAddress(value) {
+  try { return typeof value === 'string' ? JSON.parse(value) : value || null; } catch { return null; }
+}
+
+function sameLaunch(left, right) {
+  const a = launchAddress(left), b = launchAddress(right);
+  return !!a && !!b && a.toolType === b.toolType
+    && a.terminalInstanceId === b.terminalInstanceId && a.launchId === b.launchId;
+}
+
 function address(value) {
+  const provider = required(value.provider || value.toolType, 'provider');
+  const sessionId = typeof value.sessionId === 'string' && value.sessionId.trim() ? value.sessionId : null;
+  const pending = launchAddress(value.sendTarget);
+  if (!sessionId && (!pending || pending.toolType !== provider)) {
+    throw new TabMessageError('message_runtime_identity_unavailable', 'The conversation identity is not proven; no input was written.', 503);
+  }
   return {
     tabId: required(value?.tabId, 'tabId'),
     tabName: value.tabName || value.tabId,
     projectId: required(value.projectId, 'projectId'),
     projectName: value.projectName || value.projectId,
     cwd: value.cwd || null,
-    provider: required(value.provider || value.toolType, 'provider'),
-    sessionId: required(value.sessionId, 'sessionId'),
+    provider,
+    sessionId,
+    sendTarget: sessionId ? { toolType: provider, sessionId } : pending,
+    runtimeTarget: value.runtimeTarget || value.sendTarget || null,
   };
 }
 
@@ -52,16 +77,22 @@ function tabId(value) {
 }
 
 function identity(value) {
-  return [value.tabId, value.projectId, value.provider || value.toolType, value.sessionId];
+  return [value.tabId, value.projectId, value.provider || value.toolType, value.sessionId || null,
+    !value.sessionId ? launchAddress(value.sendTarget) : null];
 }
 
 function endpoint(message, side) {
-  return Object.fromEntries(['TabId', 'TabName', 'ProjectId', 'ProjectName', 'Cwd', 'Provider', 'SessionId']
-    .map((key) => [key[0].toLowerCase() + key.slice(1), message[side + key]]));
+  return { ...Object.fromEntries(['TabId', 'TabName', 'ProjectId', 'ProjectName', 'Cwd', 'Provider', 'SessionId']
+    .map((key) => [key[0].toLowerCase() + key.slice(1), message[side + key]])),
+    sendTarget: parsedAddress(message[side + 'AddressJson']) };
 }
 
 function fields(value, side) {
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [side + key[0].toUpperCase() + key.slice(1), item]));
+  const { sendTarget, runtimeTarget: _runtimeTarget, ...rest } = value;
+  return { ...Object.fromEntries(Object.entries(rest).map(([key, item]) =>
+    [side + key[0].toUpperCase() + key.slice(1), key === 'sessionId' ? item || '' : item])),
+    // Empty is the legacy SQL representation of absence, never an address.
+    [side + 'AddressJson']: rest.sessionId ? null : JSON.stringify(sendTarget) };
 }
 
 function label(value, max = 180) {
@@ -83,9 +114,11 @@ function publicMessage(row) {
   const {
     requestFingerprint, frozenPrompt, promptPrepared, attemptCount,
     retryAllowed, receiptAttempt, receiptUpdatedAt, deliverySessionId, sourceCwd, targetCwd,
-    ...message
+    sourceAddressJson, targetAddressJson, ...message
   } = row;
-  return message;
+  return { ...message, sourceSessionId: message.sourceSessionId || null, targetSessionId: message.targetSessionId || null,
+    ...(sourceAddressJson ? { sourceSendTarget: parsedAddress(sourceAddressJson) } : {}),
+    ...(targetAddressJson ? { targetSendTarget: parsedAddress(targetAddressJson) } : {}) };
 }
 
 function compactMessage(row) {
@@ -116,7 +149,7 @@ function receiptOutcome(record, message) {
         || receipt.status === 'waiting-for-input');
     return {
       deliveryState: draftBlocked ? 'waiting-for-input' : 'failed',
-      retryAllowed: classified === 'provider-not-accepted' ? 0 : 1,
+      retryAllowed: classified === 'provider-not-accepted' || code === 'agent_send_queue_cancelled' ? 0 : 1,
       code,
       error: draftBlocked ? 'The destination input is occupied; delivery is waiting.' : 'The transport did not accept the message.',
     };
@@ -178,7 +211,7 @@ class TabMessageService {
     CREATE INDEX IF NOT EXISTS tab_messages_source ON ${TABLE_NAME}(sourceTabId, createdAt);`);
     this.db.transaction(() => {
       const columns = new Set(this.db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all().map((column) => column.name));
-      for (const column of ['sourceDismissedAt', 'targetDismissedAt']) {
+      for (const column of ['sourceDismissedAt', 'targetDismissedAt', 'sourceAddressJson', 'targetAddressJson']) {
         if (!columns.has(column)) this.db.exec(`ALTER TABLE ${TABLE_NAME} ADD COLUMN ${column} TEXT`);
       }
     })();
@@ -231,7 +264,7 @@ class TabMessageService {
     return this.db.prepare(`SELECT ${LIST_COLUMNS}, substr(text, 1, 200) AS textPreview,
       length(text) AS textChars FROM ${TABLE_NAME} WHERE sourceTabId = ? OR targetTabId = ?
       ORDER BY createdAt DESC, rowid DESC LIMIT ?`).all(id, id, limit)
-      .map((message) => ({ ...message, textPreview: message.textPreview.slice(0, 200) }));
+      .map((message) => ({ ...publicMessage(message), textPreview: message.textPreview.slice(0, 200) }));
   }
 
   // Dismissal is per-tab presentation on the question, including for reply IDs.
@@ -267,11 +300,18 @@ class TabMessageService {
     const live = address(resolved);
     if (live.tabId !== id) throw new TabMessageError('tab_message_address_mismatch', 'The resolved tab does not match the address');
     if (typeof value === 'object') {
+      const pending = !value.sessionId && launchAddress(value.sendTarget);
+      if (pending && !sameLaunch(pending, resolved.runtimeTarget || resolved.sendTarget)) {
+        throw new TabMessageError('tab_message_address_changed', 'The originally addressed launch changed');
+      }
       for (const field of ['projectId', 'provider', 'sessionId']) {
         const expected = field === 'provider' ? value.provider || value.toolType : value[field];
         const resumed = field === 'sessionId' && allowResume && expected
           && resolved.acceptedResumeSourceSessionId === expected;
-        if (expected !== undefined && expected !== live[field] && !resumed) {
+        if (field === 'sessionId' && expected && !live.sessionId && !resumed) {
+          throw new TabMessageError('tab_message_identity_pending', 'The original conversation identity is still being proved', 503);
+        }
+        if (expected !== undefined && expected !== live[field] && !resumed && !(field === 'sessionId' && pending)) {
           throw new TabMessageError('tab_message_address_changed', 'The tab provider, session or project has changed');
         }
       }
@@ -337,12 +377,13 @@ class TabMessageService {
     if (question.kind !== 'question') throw new TabMessageError('tab_message_not_question', 'Replies cannot themselves be answered', 400);
     const from = await this._resolve(responder);
     const addressed = endpoint(question, 'target');
+    const provisionalResponder = !addressed.sessionId && sameLaunch(addressed.sendTarget, from.runtimeTarget);
     // A proven Resume may have changed the actual delivery session, never the
     // return address. Only that persisted delivery binding can answer as well.
     const deliveredResponder = question.deliverySessionId && question.attemptCount > 0
       && from.sessionId === question.deliverySessionId;
     if (JSON.stringify(identity(from)) !== JSON.stringify(identity({
-      ...addressed, sessionId: deliveredResponder ? question.deliverySessionId : addressed.sessionId,
+      ...addressed, sessionId: deliveredResponder ? question.deliverySessionId : provisionalResponder ? from.sessionId : addressed.sessionId,
     }))) {
       throw new TabMessageError('tab_message_foreign_responder', 'Only the original addressed tab and session may answer this question', 403);
     }
@@ -354,7 +395,8 @@ class TabMessageService {
         throw new TabMessageError('tab_message_already_answered', 'This question already has its explicit final answer');
       }
       const reserved = this._reserve({
-        kind: 'reply', source: { ...addressed, provider: from.provider, sessionId: from.sessionId }, target: endpoint(question, 'source'),
+        kind: 'reply', source: { ...addressed, provider: from.provider, sessionId: from.sessionId,
+          sendTarget: from.sendTarget, runtimeTarget: from.runtimeTarget }, target: endpoint(question, 'source'),
         text, requestId, fingerprint, question,
       });
       this.db.prepare(`UPDATE ${TABLE_NAME} SET replyMessageId = ?, answeredAt = ?, updatedAt = ? WHERE messageId = ?`)
@@ -465,14 +507,26 @@ class TabMessageService {
       receipt = operationKey;
       operationKey = receipt.operationKey;
     }
-    const row = this.db.prepare(`SELECT * FROM ${TABLE_NAME} WHERE operationKey = ?`).get(required(operationKey, 'operationKey'));
+    let row = this.db.prepare(`SELECT * FROM ${TABLE_NAME} WHERE operationKey = ?`).get(required(operationKey, 'operationKey'));
     if (!row) return null;
     if (receipt) {
+      let materializedSessionId = null;
       for (const [key, expected] of [['operationKey', row.operationKey], ['tabId', row.targetTabId],
         ['handoffId', row.handoffId], ['provider', row.targetProvider], ['sessionId', row.targetSessionId],
         ['promptHash', promptAuditFingerprint(row.frozenPrompt)], ['promptLength', row.frozenPrompt.length]]) {
+        const firstWriter = key === 'sessionId' && !row.targetSessionId && launchAddress(parsedAddress(row.targetAddressJson))
+          && receipt.state === 'confirmed' && receipt.auditIdentity?.sessionId === receipt[key]
+          && receipt.operationKey === row.operationKey && receipt.tabId === row.targetTabId && receipt.handoffId === row.handoffId
+          && receipt.provider === row.targetProvider && receipt.auditIdentity?.provider === row.targetProvider
+          && receipt.attemptId && receipt.attemptId === receipt.auditIdentity?.attemptId
+          && (receipt.auditIdentity?.entryUuid || receipt.auditIdentity?.sourceIdentity)
+          && receipt.promptHash === promptAuditFingerprint(row.frozenPrompt)
+          && sameLaunch(parsedAddress(row.targetAddressJson), receipt.receipt?.expectedTarget);
         const resumed = key === 'sessionId' && receipt[key] === row.deliverySessionId;
-        if (receipt[key] != null && receipt[key] !== expected && !resumed) {
+        if (firstWriter && typeof receipt[key] === 'string' && receipt[key]) {
+          materializedSessionId = receipt[key];
+        }
+        if (receipt[key] != null && receipt[key] !== expected && !resumed && !firstWriter) {
           this._diagnostic('tab-message-receipt-rejected', row, { mismatchedField: key });
           if (row.deliveryState === 'sent' || row.deliveryState === 'queued') return publicMessage(row);
           return publicMessage(this._transition(row.messageId, {
@@ -485,6 +539,18 @@ class TabMessageService {
       if (attempt && attempt < row.receiptAttempt) return publicMessage(row);
       if (receipt.updatedAt && row.receiptUpdatedAt && attempt <= row.receiptAttempt
         && receipt.updatedAt < row.receiptUpdatedAt) return publicMessage(row);
+      if (!row.targetSessionId && receipt.state === 'confirmed' && !materializedSessionId) {
+        return publicMessage(this._transition(row.messageId, {
+          deliveryState: 'unconfirmed', code: 'tab_message_receipt_identity_mismatch',
+          error: 'The first conversation identity requires an exact canonical receipt.',
+        }, 'receipt-rejected'));
+      }
+      if (materializedSessionId) {
+        this.db.prepare(`UPDATE ${TABLE_NAME} SET targetSessionId = ?, deliverySessionId = ?, targetAddressJson = NULL
+          WHERE messageId = ? AND targetSessionId = '' AND targetAddressJson IS ?`)
+          .run(materializedSessionId, materializedSessionId, row.messageId, row.targetAddressJson);
+        row = this._row(row.messageId);
+      }
     }
     const outcome = receiptOutcome(receipt, row);
     // Positive acceptance survives late ambiguous/negative send callbacks.
@@ -580,6 +646,7 @@ class TabMessageService {
         const row = this._row(snapshot.messageId);
         if (row.deliveryState === 'pending' || eligible.has(row.messageId) && row.retryAllowed) {
           await this._deliver(row, reason);
+          if (this._row(row.messageId)?.code === 'tab_message_identity_pending') break;
         }
       }
     }).catch((error) => {
@@ -597,9 +664,22 @@ class TabMessageService {
     }
     let target;
     try {
-      await this._resolve(endpoint(row, 'source'));
+      const source = await this._resolve(endpoint(row, 'source'));
       target = await this._resolve(endpoint(row, 'target'), true);
+      for (const [side, live] of [['source', source], ['target', target]]) {
+        if (!row[side + 'SessionId'] && live.sessionId) {
+          this.db.prepare(`UPDATE ${TABLE_NAME} SET ${side}SessionId = ?, ${side}AddressJson = NULL
+            WHERE messageId = ? AND ${side}SessionId = '' AND ${side}AddressJson IS ?`)
+            .run(live.sessionId, row.messageId, row[side + 'AddressJson']);
+        }
+      }
+      row = this._row(row.messageId);
     } catch (error) {
+      if (error?.code === 'tab_message_identity_pending') {
+        if (!this.disposed) this._transition(row.messageId, { deliveryState: 'pending', retryAllowed: 0,
+          code: error.code, error: 'Waiting for proof of the original conversation; no input was written.' }, 'identity-wait');
+        return;
+      }
       if (!this.disposed) this._transition(row.messageId, {
         deliveryState: 'failed', code: safeCode(error?.code, 'tab_message_address_unavailable'),
         error: 'The original tab address is no longer available. The message was not retargeted.',
@@ -611,7 +691,7 @@ class TabMessageService {
     if (!(current.deliveryState === 'pending' || current.retryAllowed)) return;
     const attemptCount = current.attemptCount + 1;
     const sending = this._transition(row.messageId, {
-      deliveryState: 'sending', attemptCount, deliverySessionId: target.sessionId,
+      deliveryState: 'sending', attemptCount, deliverySessionId: target.sessionId, code: null, error: null,
     }, safeCode(reason, 'dispatch'));
     this.preparing.add(row.messageId);
     try {

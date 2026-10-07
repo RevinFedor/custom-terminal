@@ -776,7 +776,7 @@ at capacity. Please try a different model.` и `turn_id`. Это отказ пр
 
 В существующих «Настройках запросов» есть общий переключатель
 «Продолжать при перегрузке модели» и «Повторов без прогресса» (1–10).
-По умолчанию включён один повтор. Main наблюдает только новые несупрессированные
+По умолчанию включён один быстрый повтор. Main наблюдает только новые несупрессированные
 записи текущего writer после границы подключения watcher; история при Resume
 не запускает старые повторы. Автоматическое сообщение — буквально `continue`,
 через общий Project API/send с сохранённым handoff, без смены model/effort.
@@ -787,10 +787,30 @@ at capacity. Please try a different model.` и `turn_id`. Это отказ пр
 Настройка N — число последовательных повторов без настоящей работы.
 Ответ assistant, непустое reasoning или вызов инструмента обновляют лимит;
 user/`continue`, task_started, token_count, Goal и служебный recap — нет.
-При N=2 первые две ошибки дают два `continue`, третья — одну красную отметку
+Без отложенных ступеней при N=2 первые две ошибки дают два `continue`, третья — одну красную отметку
 существующего колокольчика и уведомление через тот же Telegram/outbox/APNs.
 Повтор одного события не дублирует уведомление. Счётчик сохранён для точной
 сессии; Stop/отключение отменяет ещё ожидающую отправку.
+
+SOURCE06.10 добавляет вложенный изменяемый список пауз
+`codexCapacityRetryDelaysMs` в прежних orchestration settings. Начальный список
+30/60 минут: после исчерпания быстрых N новая typed capacity ставит паузу30,
+следующий новый отказ — паузу60; это интервалы между неудачей и повтором, не
+cron и не повтор по одному отсутствию ответа. Список можно очистить/изменить/
+добавить строку (до10, целые минуты1..10080). Обычные старые setters не стирают
+поле; настройки сохраняет тот же store/API. Pure legacy policy без поля сохраняет
+прежний немедленный N, Application settings добавляет новые defaults при чтении.
+
+Таймер принадлежит прежнему capacity runtime и exact owner/error effect;
+до deadline действует прежняя coordination barrier для failed-result fan-out.
+Истечение не является Send proof: current settings, session/turn/generation,
+draft и physical write guard проверяются снова. Настоящий progress, новый user/
+task во время паузы, Stop, отключение и смена владельца отменяют ожидание.
+Изменение уже ожидающей ступени отменяет её; новые значения действуют для новых
+сбоев. Перезапуск не проигрывает сохранённый pending effect: нужен новый typed
+live отказ. Unknown delivery и proven local not-submitted сами не заводят
+таймер повторного ввода. Lifecycle warning сообщает ожидание, не exhausted;
+после последней ступени остаётся прежнее одно уведомление об исчерпании.
 
 Для связанного orchestration-run retry атомарно перевооружает только точный
 failed turn на следующий будущий turn; старый done/final не завершает новую
@@ -1431,7 +1451,33 @@ destructive key. Только эта unwritten Rewind-операция дела�
 пользователя после отказа пошёл в PTY за9.7мс; долгий видимый интервал
 объяснялся нагрузкой/отрисовкой, не доказанной задержкой самой записи Enter.
 
-Возврат prompt в composer сам по себе не доказывает rollback. После Enter допустимы четыре исхода: exact child уже появился; source записал `thread_rolled_back` с ожидаемой depth; Codex показал точную `Failed to branch…` error-панель; либо Codex показал `You’re continuing from this point in a new conversation`, но child rollout материализуется только после следующего submit. Последний исход сохраняется как `branch-draft-restored`: исходная история ещё не считается откатанной, но один следующий физический Enter получает exact audit и атомарно принимает созданный child. До разрешения нового writer mounted History может показывать локальный preview, но публичное чтение честно возвращает `history_read_identity_unavailable`, а не пустую или угаданную ветку. Provider error очищает journal, оставляет историю без изменений и сохраняет возвращённый текст в terminal composer. При restart до следующего submit потерянный branch draft нельзя назвать выполненным rollback: full source History снова читается, авторский draft остаётся. Если startup ещё не получил полный proof отсутствия child, он сохраняет journal; следующий обычный Resume перед запуском повторяет точную no-mutation проверку и только после её успеха очищает journal. На скрытой128-МБ копии24.09 именно так восстановились History200/2894 и draft163; Resume затем снял старый journal без повторного Rewind/Enter и подтвердил прежний source writer.
+Возврат prompt в composer сам по себе не доказывает rollback. После Enter допустимы четыре исхода: exact child уже появился; source записал `thread_rolled_back` с ожидаемой depth; Codex показал точную `Failed to branch…` error-панель; либо Codex показал `You’re continuing from this point in a new conversation`, но child rollout материализуется только после следующего submit. Последний исход сохраняется как `branch-draft-restored`: исходная история ещё не считается откатанной. Следующий физический Enter получает exact audit; созданный child принимается атомарно, а продолжившийся source имеет отдельный proof ниже и не считается сохранённым rollback. До разрешения writer mounted History может показывать локальный preview, но публичное чтение честно возвращает `history_read_identity_unavailable`, а не пустую или угаданную ветку. Provider error очищает journal, оставляет историю без изменений и сохраняет возвращённый текст в terminal composer. При restart до следующего submit потерянный branch draft нельзя назвать выполненным rollback: full source History снова читается, авторский draft остаётся. Если startup ещё не получил полный proof отсутствия child, он сохраняет journal; следующий обычный Resume перед запуском повторяет точную no-mutation проверку и только после её успеха очищает journal. На скрытой128-МБ копии24.09 именно так восстановились History200/2894 и draft163; Resume затем снял старый journal без повторного Rewind/Enter и подтвердил прежний source writer.
+
+#### Продолжившийся source после возвращённого Rewind draft
+
+После lazy native Rewind следующий точный Send может оказаться в прежнем rollout.
+Delivery receipt доказывает этот prompt, но сам не завершает writer handoff.
+Incumbent guard нельзя ни отключать, ни оставлять вечным: live reconciliation
+использует тот же exact target/task/first-user scanner и durable submit tuple,
+что startup recovery, полный no-descendant proof и повторный физический owner.
+Terminal/lifecycle/run/input/launch/project/cwd, source inode и текущий journal
+перепроверяются после чтений и перед прежним DB compare-and-delete. Затем
+обычный process→rollout→binding publisher возвращает этот SID в History/Timeline;
+same-SID переход тоже публикуется. Ни ключей, ни нового prompt, ни source rewrite.
+SOURCE06.10 negative descendant proof проверяет текущий каталог от native action
+без прежнего верхнего двухминутного cutoff и повторяет scan после transcript IO.
+Child на+188s или появившийся во время proof не становится «отсутствующим» из-за
+окна. Это относится и к outer startup fallback: bounded positive-candidate
+список не используется для negative recovery. После transcript/process IO
+полный каталог перечитывается перед continued-source/no-mutation settlement;
+startup positive candidate correlation остаётся отдельной exact границей.
+Это снимок имеющихся descendants, не обещание о будущих forks или proof rollback.
+
+Это подтверждение **продолжившегося writer**, не retroactive `thread_rolled_back`
+или успешный Fork. Исторический результат `branch-draft-restored` не переписывается.
+Proof берётся из durable journal/transcript, а не только из временного pending audit:
+быстро подтверждённый Send и истечение его кэша не должны оставлять History пустой.
+Unknown/другой root writer/descendant/смена владельца сохраняют journal и отказ.
 
 Удаление pre-Enter журнала после успешного source→child commit не удаляет доказательство уже совершённой операции. В той же SQLite-транзакции создаётся точная commit-квитанция: operation/request token, action generation, исходный проект операции, текущие project+tab, source+child, PTY lifecycle/run, target/hash/depth. Поздний post-grab callback читает её без живого watcher/intent и принимает только при полном совпадении плюс всё ещё сохранённой привязке вкладки к exact child. После успешного ответа квитанция переводится в закрытое состояние; точный повтор остаётся идемпотентным, а новая операция вытесняет старую запись. При переносе вкладки меняется только текущий project квитанции и журнала, исходный project операции остаётся неизменным. Таймеры, recency и произвольный новый writer не являются proof.
 

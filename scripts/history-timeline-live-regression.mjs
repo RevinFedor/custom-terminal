@@ -7,6 +7,7 @@ import {execFileSync} from 'node:child_process';
 import {build} from 'esbuild';
 import {_electron as electron} from 'playwright';
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 const repo=fileURLToPath(new URL('..',import.meta.url));
 const artifact=await fs.mkdtemp(path.join(os.tmpdir(),'noted-history-timeline-live-'));
 const snapshot=path.join(artifact,'source');
@@ -42,12 +43,38 @@ app.whenReady().then(()=>{app.dock?.hide();const w=new BrowserWindow({show:false
 w.webContents.on('paint',()=>{});w.loadFile(${JSON.stringify(path.join(artifact,'index.html'))});});app.on('window-all-closed',()=>app.quit());`);
 const env={...process.env,NOTED_E2E_TEST:'true',NOTED_USER_DATA_DIR:path.join(artifact,'user-data')};delete env.ELECTRON_RUN_AS_NODE;
 const app=await electron.launch({args:[path.join(artifact,'main.cjs')],env,cwd:artifact});
-const result={artifact,steps:[],errors:[]};const logs=[];
+const ownedChild=app.process();
+const result={artifact,steps:[],errors:[],source:{}};const logs=[];
+for(const file of ['src/renderer/components/Workspace/Timeline.tsx','src/renderer/utils/timelineWorkingFileMarkers.mjs',
+ 'src/renderer/utils/tabWorkContext.ts','scripts/fixtures/history-timeline-live.tsx']){
+ result.source[file]=createHash('sha256').update(await fs.readFile(path.join(snapshot,file))).digest('hex');
+}
 try{
  const page=await app.firstWindow();page.setDefaultTimeout(12000);
  page.on('pageerror',e=>result.errors.push(e.message));page.on('console',m=>logs.push(m.text()));
  await page.waitForFunction(()=>window.fixture?.state.ready);
  await page.waitForSelector('[data-timeline-entry-uuid="base-88"]');
+ await page.waitForSelector('[data-uuid="base-88"]');
+ const edited='[data-timeline-entry-uuid="base-84"] [aria-label="docs-edit"]';
+ assert.equal(await page.locator(edited).count(),0,'unlinked edits do not receive a working-file marker');
+ await page.evaluate(()=>window.fixture.links(['/synthetic/work/status.md']));
+ await page.waitForSelector(edited);
+ assert.equal(await page.locator(edited).count(),1,'one existing pencil, not another iteration');
+ assert.equal(await page.locator('[data-timeline-entry-uuid="base-86"] [aria-label="docs-edit"]').count(),0,'foreign root is not linked');
+ assert.equal(await page.locator('[data-timeline-entry-uuid="base-88"] [aria-label="docs-edit"]').count(),0,'attachment alone is not an edit');
+ const reads=await page.evaluate(()=>window.fixture.state.timelineReads);
+ for(const width of [350,500,1100]){
+   await app.evaluate(({BrowserWindow},width)=>BrowserWindow.getAllWindows()[0].setSize(width,900),width);
+   await page.waitForFunction(width=>window.innerWidth===width,width);
+   const geometry=await page.locator(edited).evaluate(e=>{const r=e.getBoundingClientRect();return{left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:r.width,height:r.height,viewport:innerWidth};});
+   assert.ok(geometry.left>=0&&geometry.right<=width&&geometry.width>0&&geometry.height>0,'pencil remains on screen');
+   await page.screenshot({path:path.join(artifact,'linked-file-'+width+'.png')});
+   result.steps.push({phase:'linked-file-pencil',width,geometry});
+ }
+ await page.evaluate(()=>window.fixture.links([]));
+ await page.waitForFunction(()=>!document.querySelector('[data-timeline-entry-uuid="base-84"] [aria-label="docs-edit"]'));
+ assert.equal(await page.evaluate(()=>window.fixture.state.timelineReads),reads,'link changes reuse the same Timeline data');
+ result.steps.push({phase:'detached-no-rebuild',timelineReads:reads});
  await page.evaluate(()=>window.fixture.show(false));
  await page.evaluate(()=>window.fixture.compact());
  await page.waitForSelector('[data-timeline-entry-uuid="live-compact"]',{state:'attached'});
@@ -86,4 +113,13 @@ try{
  assert.ok(result.steps.at(-1).maxDrift<40,'no intermediate frame teleports the navigated row');
  assert.deepEqual(result.errors,[]);result.status='PASS';
 }catch(e){result.status='FAIL';result.error=e.stack;process.exitCode=1;await app.firstWindow().then(p=>p.screenshot({path:path.join(artifact,'failure.png')})).catch(()=>{});}
-finally{await app.close();await fs.writeFile(path.join(artifact,'result.json'),JSON.stringify(result,null,2));await fs.writeFile(path.join(artifact,'renderer.log'),logs.join('\n'));console.log(JSON.stringify(result));}
+finally{
+ let deadline;
+ try{await Promise.race([app.close(),new Promise((_,reject)=>{deadline=setTimeout(()=>reject(new Error('Private Electron close timed out')),5000);})]);}
+ catch(error){result.closeWarning=String(error);if(ownedChild.exitCode===null&&ownedChild.signalCode===null){ownedChild.kill('SIGKILL');}}
+ finally{clearTimeout(deadline);}
+ result.electron={pid:ownedChild.pid,exitCode:ownedChild.exitCode,signal:ownedChild.signalCode};
+ execFileSync('git',['worktree','remove','--force',snapshot],{cwd:repo,stdio:'pipe'});
+ result.cleanup=true;
+ await fs.writeFile(path.join(artifact,'result.json'),JSON.stringify(result,null,2));await fs.writeFile(path.join(artifact,'renderer.log'),logs.join('\n'));console.log(JSON.stringify(result));
+}

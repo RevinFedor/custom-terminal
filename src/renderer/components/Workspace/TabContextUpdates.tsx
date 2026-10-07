@@ -68,10 +68,12 @@ function ContextSourceTabChip({ source, onNavigate }: {
     hasColor,
     hovered,
   }, adjustRgbaAlpha));
-  const navigate = () => {
+  const navigate = async () => {
     if (!tabExists || !projectId) return;
-    useUIStore.getState().setActiveArea('workspace');
-    useWorkspaceStore.getState().activateCenterTab(projectId, source.tabId);
+    const opened = await useWorkspaceStore.getState().openTabById(source.tabId, {
+      projectId: source.projectId, reason: 'context-source-tab-click',
+    });
+    if (!opened) return;
     requestTabPrimaryInputFocus(source.tabId, 'context-source-tab-click');
     onNavigate();
   };

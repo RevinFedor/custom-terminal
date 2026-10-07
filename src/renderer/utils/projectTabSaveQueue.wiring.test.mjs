@@ -13,9 +13,11 @@ test('all full tab snapshots use one per-project queue', () => {
 });
 
 test('closeTab resolves only after its reduced snapshot commits', () => {
-  assert.match(
-    store,
-    /const closeSnapshot = await saveTabsThenNotifyProjectLayoutChanged\([\s\S]{0,260}'tab-closed'/,
-  );
+  const start = store.indexOf('const closeSnapshot = closeCatalogs.size > 1');
+  const end = store.indexOf('if (!isDurableSaveTabsAck(closeSnapshot))', start);
+  assert.ok(start >= 0 && end > start);
+  assert.match(store.slice(start, end), /await saveTabsBatchThenNotifyProjectLayoutChanged/);
+  assert.match(store.slice(start, end), /await saveTabsThenNotifyProjectLayoutChanged/);
+  assert.match(store.slice(start, end), /'tab-closed'/);
   assert.match(store, /\[CloseTab\] snapshot-committed/);
 });

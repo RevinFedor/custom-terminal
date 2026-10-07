@@ -35,11 +35,13 @@ export function buildSessionSnapshot(state) {
   return {
     openProjects: Array.from(openProjects.values()).map((workspace) => {
       const tabIds = Array.from(workspace.tabs.keys());
+      const tabs = Array.from(workspace.tabs.values());
       const activeTabIndex = workspace.activeTabId ? tabIds.indexOf(workspace.activeTabId) : 0;
       return {
         projectId: workspace.projectId,
         projectPath: workspace.projectPath,
         activeTabIndex: Math.max(0, activeTabIndex),
+        ...(tabs.some(tab => tab.lazyRuntime === true) ? {runtimeTabIds:tabs.filter(tab => tab.lazyRuntime !== true).map(tab => tab.id)} : {}),
       };
     }),
     activeProjectId: state.activeProjectId ?? null,
@@ -70,6 +72,11 @@ export function buildSessionSnapshot(state) {
         : space
     )),
     activeSpaceId: state.activeSpaceId ?? null,
+    tabLastWorkflowIds: state.tabLastWorkflowIds || {},
+    runAfterWorkflowScopeVersions:state.runAfterWorkflowScopeVersions || {},
+    workflowSidebarState:state.workflowSidebarState || {},
+    ...(state.organizationReady ? {organizationVersion:1,organizationRevision:state.organizationRevision,
+      organizationGeneration:state.organizationGeneration} : {}),
   };
 }
 
@@ -95,4 +102,7 @@ export const SESSION_SNAPSHOT_FIELDS = Object.freeze([
   'centerStrips',
   'spaces',
   'activeSpaceId',
+  'tabLastWorkflowIds',
+  'runAfterWorkflowScopeVersions',
+  'workflowSidebarState',
 ]);

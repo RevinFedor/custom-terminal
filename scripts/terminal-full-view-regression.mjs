@@ -21,6 +21,8 @@ const repo = fileURLToPath(new URL('..', import.meta.url));
 const artifact = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-terminal-full-view-'));
 const snapshot = path.join(artifact, 'source');
 const buildOnly = process.argv.includes('--build-only');
+const overlayOnly = process.argv.includes('--overlay-only');
+const singleOverlay = process.argv.includes('--single-overlay');
 const sideWidth = Number(process.argv.find(a => a.startsWith('--side-width='))?.split('=')[1] || 600);
 assert.ok(Number.isFinite(sideWidth) && sideWidth >= 360 && sideWidth <= 1200, 'side width must be 360..1200');
 const A = 'full-view-narrow', B = 'full-view-neighbor', C = 'full-view-other';
@@ -44,12 +46,12 @@ const logs = [];
 // Runs before the actual renderer bundle. All IPC lives in memory and every
 // launch/input side effect is rejected. Protocol reports are counted as input
 // too: Escape must produce zero terminal:input calls, not just zero commands.
-function installShim(sideWidth) {
+function installShim(sideWidth, singleOverlay) {
   const listeners = new Map(), rows = new Map(), saved = new Map(), sequences = new Map();
   const f = window.fullViewFixture = {
     calls: [], unknown: [], violations: [], writes: [], resizes: [], hydrates: {},
     listenerAdds: {}, listenerRemoves: {}, emitted: [], trustedEvents: [],
-    generation: 'full-view-fixed-generation', sideWidth,
+    generation: 'full-view-fixed-generation', sideWidth, singleOverlay,
   };
   const deny = (kind) => { f.violations.push(kind); throw Error('Fixture forbids ' + kind); };
   f.line = (id, n) => `${id.endsWith('narrow') ? 'A' : id.endsWith('neighbor') ? 'B' : 'C'} ${String(n).padStart(4, '0')} ${n === 0 ? 'TOP' : n === 419 ? 'BOTTOM' : 'numbered output'}${n >= 20 && n < 60 ? ' wrapped'.repeat(10) : ''}`;
@@ -224,11 +226,11 @@ try {
   await fs.writeFile(path.join(artifact, 'source-hashes.json'), JSON.stringify(hashes, null, 2));
   execFileSync(path.join(repo, 'node_modules/.bin/tailwindcss'), ['-i', path.join(snapshot, 'src/renderer/styles/globals.css'),
     '-o', path.join(artifact, 'globals.css'), '--minify'], { cwd: snapshot, stdio: 'pipe' });
-  await fs.writeFile(path.join(artifact, 'index.html'), `<meta charset="utf-8"><link rel="stylesheet" href="globals.css"><link rel="stylesheet" href="bundle.css"><style>html,body{margin:0;background:#1a1a1a;color:#ccc}</style><div id="root"></div><script>(${installShim.toString()})(${sideWidth})</script><script src="bundle.js"></script>`);
+  await fs.writeFile(path.join(artifact, 'index.html'), `<meta charset="utf-8"><link rel="stylesheet" href="globals.css"><link rel="stylesheet" href="bundle.css"><style>html,body{margin:0;background:#1a1a1a;color:#ccc}</style><div id="root"></div><script>(${installShim.toString()})(${sideWidth},${singleOverlay})</script><script src="bundle.js"></script>`);
   await fs.writeFile(path.join(artifact, 'main.cjs'), `const {app,BrowserWindow,session}=require('electron');
     app.setPath('userData',${JSON.stringify(path.join(artifact, 'user-data'))});app.setActivationPolicy?.('accessory');
     app.whenReady().then(()=>{app.dock?.hide();session.defaultSession.webRequest.onBeforeRequest((d,r)=>r({cancel:! /^(file:|data:|blob:)/.test(d.url)}));
-      const w=new BrowserWindow({show:false,focusable:false,width:1600,height:1000,webPreferences:{offscreen:true,nodeIntegration:false,contextIsolation:true,sandbox:true,backgroundThrottling:false}});
+      const w=new BrowserWindow({show:false,focusable:false,width:${singleOverlay ? 800 : 1600},height:1000,webPreferences:{offscreen:true,nodeIntegration:false,contextIsolation:true,sandbox:true,backgroundThrottling:false}});
       w.webContents.on('paint',()=>{});w.loadFile(${JSON.stringify(path.join(artifact, 'index.html'))});});app.on('window-all-closed',()=>app.quit());`);
   if (buildOnly) {
     result.checks.push('fixture bundles against current source; UI intentionally not run');
@@ -450,6 +452,41 @@ try {
       return seq;
     };
 
+    if (overlayOnly) {
+      await composer(A).waitFor(); await ready(A);
+      await page.locator(`[data-side-surface-toggle="terminal"]`).first().click();
+      await page.locator(`[data-floating-terminal-tab-id="${A}"][data-floating-terminal-open="1"]`).waitFor();
+      await frames(8);
+      result.overlay = await page.evaluate(id => {
+        const frame = document.querySelector(`[data-floating-terminal-tab-id="${id}"]`);
+        const sidebar = document.querySelector('[data-sidebar-presented="1"]');
+        const r = frame.getBoundingClientRect(), s = sidebar.getBoundingClientRect();
+        const left = Math.max(2, r.left, s.left), right = Math.min(r.right, s.right, innerWidth - 2);
+        const top = Math.max(r.top + 40, s.top + 40), bottom = Math.min(r.bottom, s.bottom, innerHeight - 2);
+        const samples = Array.from({length: 5}, (_, index) => {
+          const x = left + (right-left) * (index+0.5)/5, y = top + (bottom-top)*0.45;
+          const hit = document.elementFromPoint(x,y);
+          return {x,y,terminal:frame.contains(hit),hit:hit?.tagName,attributes:hit?.getAttributeNames()};
+        });
+        const parents = [];
+        for (let e=frame;e;e=e.parentElement) {
+          const css = getComputedStyle(e);
+          parents.push({tag:e.tagName,attributes:e.getAttributeNames(),z:css.zIndex,overflowX:css.overflowX,overflowY:css.overflowY,contain:css.contain});
+        }
+        return {overlap:right-left,height:bottom-top,samples,parents};
+      }, A);
+      await checkpoint('overlay-sidebar');
+      assert.ok(result.overlay.overlap > 20 && result.overlay.height > 20, 'side terminal really intersects sidebar');
+      assert.ok(result.overlay.samples.every(sample => sample.terminal), 'terminal covers sidebar and receives hits across overlap');
+      const before = await stats();
+      await page.mouse.click(result.overlay.samples[2].x,result.overlay.samples[2].y);
+      await frames();
+      assert.equal((await inspect(A)).focused,true,'click over sidebar belongs to existing terminal');
+      assert.deepEqual((await stats()).writes,before.writes);
+      assert.deepEqual((await stats()).violations,[]); assert.deepEqual(result.errors,[]);
+      result.checks.push('actual ordinary side terminal covers tab sidebar; trusted overlap click focuses xterm; zero input/provider calls');
+      result.pass = true;
+    } else {
     await composer(A).waitFor(); await composer(B).waitFor();
     await ready(A); await ready(B);
     await page.locator('[data-space-chip="full-other"]').click();
@@ -708,6 +745,7 @@ try {
     await checkpoint('10-final');
     result.checks.push('rapid return cancels deferred focus; same xterm/DOM/generation, fixed hydrate/subscription counts, zero provider/create/restart/input calls');
     result.pass = true;
+    }
   }
 } catch (error) {
   result.failure = error.stack || String(error); process.exitCode = 1;

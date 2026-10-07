@@ -1,5 +1,22 @@
 # Feature: проектные промпты из файлов
 
+## Независимые roots после workflow cutover
+
+Каталог остаётся производным от дисковых `.prompt.md`; пользовательские Projects
+больше не задают доступность. Реестр roots независим от живых вкладок/архива,
+а effective bindings принадлежат exact tabId. Миграция сохраняет порядок,
+provenance и прежнюю область, а не объединяет roots всех cwd внутри workflow.
+Source-child наследует точный набор; explicit empty binding остаётся пустым.
+Удалённый/отсутствующий root не исчезает после неудачного scan. Future opaque
+scope копируется с исходной version, без молчаливого downgrade.
+
+Настройки каталогов и per-tab prompt picker заменяют EditProjectModal. Opt+V
+фиксирует исходную вкладку до await, использует тот же каталог и watchers;
+обычная Insert Prompt library остаётся отдельной. Legacy project endpoints и
+project usage labels в GT Editor сохраняют wire compatibility как provenance,
+а не новую organizational authority. Legacy описание ниже не означает возвращение
+обязательного Project для создания вкладки.
+
 ## Модель данных
 
 Проект хранит не копии промптов, а упорядоченный список корневых директорий в

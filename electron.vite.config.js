@@ -6,6 +6,7 @@ import { codeInspectorPlugin } from 'code-inspector-plugin';
 import { resolve } from 'path';
 import { config } from 'dotenv';
 import { assertNotedShared } from '../noted-shared/build/assert-packages.mjs';
+import { historyVirtuosoMeasurementVitePlugin } from './scripts/lib/history-virtuoso-measurement.mjs';
 
 // Load .env so renderer can access env vars at build time
 const env = config({ path: resolve(__dirname, '.env') }).parsed || {};
@@ -73,6 +74,7 @@ renderer: {
       }
     },
     plugins: [
+      historyVirtuosoMeasurementVitePlugin(),
       {
         name: 'terminal-shared-contracts-dev',
         apply: 'serve',

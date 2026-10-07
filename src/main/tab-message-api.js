@@ -48,9 +48,9 @@ async function resolveMessageActor(body, resolveTab) {
 
 // The caller authenticates HTTP before entering this router. MCP's caller tab
 // is carried independently of the requested destination and cannot be overridden.
-async function handleTabMessageApi(req, res, parsed, { service, resolveTab, readBody, sendJson }) {
+async function handleTabMessageApi(req, res, parsed, { service, resolveTab, locateSource, readBody, sendJson }) {
   const root = parsed.pathname === '/api/tab-messages';
-  const selected = parsed.pathname.match(/^\/api\/tab-messages\/([^/]+)(\/replies|\/dismiss)?$/);
+  const selected = parsed.pathname.match(/^\/api\/tab-messages\/([^/]+)(\/replies|\/dismiss|\/source)?$/);
   const dismiss = selected?.[2] === '/dismiss';
   if (!root && !selected) return false;
   try {
@@ -60,6 +60,10 @@ async function handleTabMessageApi(req, res, parsed, { service, resolveTab, read
       const limit = Math.max(1, Math.min(200, Number(parsed.query.limit) || 100));
       const messages = await service.listForTab(tabId, { limit });
       sendJson(res, 200, { ok: true, messages: messages.map(compactTabMessage) });
+    } else if (selected?.[2] === '/source' && req.method === 'GET') {
+      if (typeof locateSource !== 'function') throw apiError('tab_message_source_navigation_unavailable', 503);
+      const result = await locateSource(decodeURIComponent(selected[1]));
+      sendJson(res, result?.success ? 200 : 409, result);
     } else if (selected && !selected[2] && req.method === 'GET') {
       const result = await service.getMessage(decodeURIComponent(selected[1]));
       if (!result) throw apiError('message_not_found', 404);
@@ -102,7 +106,7 @@ async function handleTabMessageApi(req, res, parsed, { service, resolveTab, read
       + ' path=' + String(parsed.pathname).slice(0, 180)
       + ' code=' + (error.code || 'tab_message_failed') + ' status=' + (Number(error.statusCode) || 500));
     sendJson(res, Number(error.statusCode) || 500, { ok: false,
-      ...(!dismiss && Number(error.statusCode) >= 400 && Number(error.statusCode) < 500
+      ...(!dismiss && selected?.[2] !== '/source' && Number(error.statusCode) >= 400 && Number(error.statusCode) < 500
         ? { accepted: false, submitted: false, deliveryState: 'not-submitted' } : {}),
       ...(error.messageId ? { messageId: error.messageId } : {}),
       code: error.code || 'tab_message_failed', error: error.message || String(error) });

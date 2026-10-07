@@ -61,6 +61,7 @@ test('provisional source still audits both carriers without public events and re
   const file = await fixture(t, content);
   const h = createHarness(file, { state: { sourceObservationLaunchId: 'launch-a' } }); await h.scan();
   const expected = selectCodexPreferredUserMessageAuditRecords(consumeCodexUserMessageAuditChunk({ chunk: content }).records).map(c => c.byteOffset);
+  assert.deepEqual(h.result.warnings, []);
   assert.deepEqual(h.result.sourceAudits, expected); assert.equal(h.result.records, 0);
   assert.equal(h.state.sourceWriterReplayOffset, 0); assert.equal(h.state.offset, Buffer.byteLength(content));
   assert.deepEqual(h.result.published, []);

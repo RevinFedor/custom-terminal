@@ -47,7 +47,8 @@ const http2 = require('http2');
 const url = require('url');
 const path = require('path');
 const srcMainDir = __dirname;
-const { AgentSendQueue } = require(path.join(srcMainDir, 'agent-send-queue'));
+const { AgentSendQueue, hasCanonicalSendConsumption } = require(path.join(srcMainDir, 'agent-send-queue'));
+const { isAutomaticPromptQueueRequest } = require(path.join(srcMainDir, '../shared/prompt-queue-send-intent.cjs'));
 const { importMobileUploads, uploadPathKey, createOwnedAttachmentSnapshot,
   bindOwnedAttachmentSnapshot, attachmentOwnershipReceipt } = require(path.join(srcMainDir, 'owned-mobile-attachments'));
 const { buildCodexImagePastePlan } = require(path.join(srcMainDir, 'codex-image-transport'));
@@ -57,6 +58,7 @@ const { codexGoalCapability, codexGoalActionRequest } = require(path.join(srcMai
 const { HistoryFreshness, historyFreshnessScopeKey } = require(path.join(srcMainDir, 'history-freshness'));
 const { isLocalSlashCommandPrompt } = require(path.join(srcMainDir, 'agent-history-send-receipt'));
 const { TabMessageService, formatTabMessagePrompt } = require(path.join(srcMainDir, 'tab-messages'));
+const { resolveTabMessageSourceLocation } = require(path.join(srcMainDir, 'tab-message-source-location'));
 const { compactTabMessage, handleTabMessageApi } = require(path.join(srcMainDir, 'tab-message-api'));
 const { messageRuntimeIdentity, scenarioDestination, identityUnavailable } = require(path.join(srcMainDir, 'agent-message-identity'));
 const { CompletionContentStore, buildOrchestrationCompletionContent,
@@ -207,6 +209,8 @@ const {
 } = require('./agent-context-files');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
+const { WORKFLOW_HTTP_CAPABILITY, createWorkflowOrganizationHttp, freezeWorkflowCreationContext,
+  legacyCreationContext, listExecutionNamespaces, executionNamespaceForRow } = require('./workflow-organization-http');
 // Lazy-require the helpers (loaded fresh each call so missing module just
 // disables the dependent endpoints, not the whole server).
 let findSessionFile = null;
@@ -485,6 +489,177 @@ let orchestrationRunStore = null;
 let publicTabActivity = null;
 let scheduleTabActivityBroadcast = null;
 let activityStyleOwner = null;
+let workspaceSwitcherApi = null;
+const { WorkspaceSwitcherReadProjection, WORKSPACE_SWITCHER_CAPABILITY, frameKey: switcherFrameKey } = require('./workspace-switcher-api');
+const { switcherRequestFromQuery } = require('../shared/workspace-switcher-contract.cjs');
+
+function getWorkspaceSwitcherApi() {
+  if (!workspaceSwitcherApi) workspaceSwitcherApi = new WorkspaceSwitcherReadProjection({
+    preferredRenderer: () => BrowserWindow.getAllWindows().find(win => !win.isDestroyed())?.webContents || null,
+    bridgeRead: payload => bridgeRequest('readWorkspaceSwitcher', payload, 5000),
+    onChanged: () => scheduleTabActivityBroadcast?.('workspace-switcher'),
+  });
+  return workspaceSwitcherApi;
+}
+function workspaceSwitcherWake() { return getWorkspaceSwitcherApi().wake(); }
+
+let runAfterApi = null;
+let runAfterWakeRevision = 0;
+const runAfterMetadataVersions = new Map();
+const { RunAfterApplicationAPI } = require('./run-after-api');
+const { RUN_AFTER_CAPABILITY, runAfterError } = require('../shared/run-after-api.cjs');
+
+function runAfterMainScope(target) {
+  if (target.startsWith('@')) return { target };
+  const projectManager = require('./project-manager');
+  const row = projectManager?.db?.db?.prepare('SELECT * FROM tabs WHERE tab_id=?').get(target);
+  return { tabId: target, projectId: executionNamespaceForRow(row), tabType: row?.tab_type || null,
+    commandType: row?.command_type || null, conversationOwner: conversationOwners?.current(target) || null,
+    loopTextHash: systemPromptService
+      ? fingerprintAgentSendRequest(systemPromptService.get('run-after-loop').content) : null };
+}
+
+async function prepareRunAfterAuthoring(args, ticket, journal) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw runAfterError('run_after_authoring_invalid', 400);
+  if (args.authoring != null) throw runAfterError('run_after_queue_snapshot_required', 400);
+  const refs = args.imagePaths;
+  if (refs === undefined) return args;
+  if (!Array.isArray(refs) || new Set(refs.map(ref => ref?.id)).size !== refs.length
+    || refs.some(ref => !ref || !Number.isSafeInteger(ref.id) || ref.id < 1 || typeof ref.path !== 'string'
+      || ref.assetId != null && require('./prompt-queue-assets').normalizeAssetId(ref.assetId) !== ref.assetId)) {
+    throw runAfterError('run_after_images_invalid', 400);
+  }
+  if (!mobileAttachmentAssetStore) throw runAfterError('run_after_asset_owner_unavailable', 503);
+  const retained = Array(refs.length), releases = [], uploads = [];
+  try {
+    for (const [index, ref] of refs.entries()) {
+      const managed = await mobileAttachmentAssetStore.existingManagedRef(ref);
+      if (managed) {
+        releases.push(await mobileAttachmentAssetStore.lease(managed.assetId));
+        await mobileAttachmentAssetStore.verifyOwnedRef({ ...managed, kind: 'image' }, { touch: true });
+        retained[index] = { ...managed, sourcePath: ref.sourcePath || ref.path };
+      } else {
+        uploads.push({ index, ref });
+      }
+    }
+    // One existing importer batch freezes repeated unversioned occurrences
+    // from the same upload together; managed assetId versions remain distinct.
+    if (uploads.length) {
+      const imported = await importMobileUploads({ rootDir: mobileAttachmentRoot(), assetStore: mobileAttachmentAssetStore,
+        attachments: uploads.map(({ ref }) => ({ path: ref.path, kind: 'image', name: path.basename(ref.path), mimeType: ref.mediaType,
+          ...(ref.assetId ? { assetId: ref.assetId } : {}) })), resolveRetained: findOwnedMobileUpload });
+      releases.push(imported.release);
+      for (const [at, { index, ref }] of uploads.entries()) {
+        const owned = imported.refs[at];
+        retained[index] = { id: ref.id, path: mobileAttachmentAssetStore.assetPath(owned.assetId), sourcePath: owned.sourcePath,
+          assetId: owned.assetId, mediaType: owned.mediaType, size: owned.size, availability: 'available' };
+      }
+    }
+    journal.holdAssets(ticket, retained.map(ref => ref.assetId));
+    return { ...args, imagePaths: retained };
+  } finally { for (const release of releases) release(); }
+}
+
+function getRunAfterApi() {
+  if (!runAfterApi) {
+    const projectManager = require('./project-manager');
+    if (!projectManager?.db?.db) throw runAfterError('run_after_store_unavailable', 503);
+    runAfterApi = new RunAfterApplicationAPI({ manager: projectManager.db,
+      frame: () => BrowserWindow.getAllWindows().find(win => !win.isDestroyed())?.webContents || null,
+      scope: runAfterMainScope, prepareAuthoring: prepareRunAfterAuthoring,
+      bridge: (action, payload) => bridgeRequest(action, payload, 5000),
+      commitState: (writes, record) => {
+        const request = JSON.parse(record.request_json).request;
+        if (!writes || Object.keys(writes).some(key => !['promptQueueByTab', 'loopPromptText', 'globalAutoCompact'].includes(key))) throw runAfterError('run_after_persistence_invalid', 400);
+        if (writes.promptQueueByTab !== undefined) {
+          if (record.target.startsWith('@') || typeof writes.promptQueueByTab !== 'string') throw runAfterError('run_after_persistence_invalid', 400);
+          JSON.parse(writes.promptQueueByTab);
+          projectManager.db.setAppState('promptQueueByTab', writes.promptQueueByTab);
+        }
+        if (writes.globalAutoCompact !== undefined) {
+          if (record.target !== '@auto-compact' || typeof writes.globalAutoCompact !== 'string') throw runAfterError('run_after_persistence_invalid', 400);
+          JSON.parse(writes.globalAutoCompact);
+          projectManager.db.setAppState('globalAutoCompact', writes.globalAutoCompact);
+        }
+        if (writes.loopPromptText !== undefined) {
+          if (request.op !== 'setLoopPromptText' || typeof writes.loopPromptText !== 'string' || !systemPromptService) throw runAfterError('run_after_loop_persistence_invalid', 400);
+          systemPromptService.saveContent('run-after-loop', writes.loopPromptText, { emitChanged: false });
+        }
+      },
+      afterCommit: writes => {
+        if (writes?.loopPromptText !== undefined) systemPromptService?.publishChanges(['run-after-loop']);
+      },
+    });
+  }
+  return runAfterApi;
+}
+
+async function runAfterOwnerBusyProof(event, { tabId, scope, ticket }) {
+  const api = getRunAfterApi(); api.validateScope(event, ticket);
+  if (tabId !== ticket.target || !['claude', 'codex'].includes(scope?.provider)) throw runAfterError('run_after_scope_changed');
+  const before = api.scopeKey(tabId), snapshot = await readAgentRuntimeSnapshot?.(tabId);
+  if (before !== api.scopeKey(tabId) || !snapshot?.coherent || snapshot.toolType !== scope.provider
+    || !['active', 'busy', 'inactive'].includes(snapshot.status) || snapshot.processStatus === 'unknown') {
+    return { known: false, error: 'run_after_owner_busy_unknown' };
+  }
+  if (snapshot.status !== 'inactive') {
+    const failure = require('../shared/agent-send-target-precondition.cjs').agentSendTargetPreconditionFailure(
+      { toolType: scope.provider, sessionId: scope.configuredSessionId }, snapshot.sendTarget);
+    if (failure) return { known: false, error: failure.code || 'run_after_owner_busy_unknown' };
+  }
+  return { known: true, busy: snapshot.status === 'busy', provider: scope.provider,
+    sessionId: snapshot.sendTarget?.sessionId || null, lifecycleGeneration: snapshot.lifecycleGeneration,
+    sendTarget: snapshot.sendTarget || null };
+}
+
+function runAfterReply(res, receipt) {
+  const status = receipt.phase === 'applied' ? 200 : receipt.phase === 'rejected' ? receipt.result?.statusCode || 409 : 202;
+  const { currentSnapshot, ...operation } = receipt;
+  return sendJson(res, status, { ok: receipt.phase === 'applied', operation, ...(currentSnapshot ? { current: currentSnapshot } : {}),
+    mutationOutcome: receipt.phase, retryable: false });
+}
+
+function runAfterFailure(res, failure) {
+  return sendJson(res, failure.statusCode || 503, { ok: false, error: failure.code || failure.message,
+    mutationOutcome: failure.mutationMayHaveApplied ? 'unknown' : 'not-started',
+    ...(failure.operationId ? { operationId: failure.operationId } : {}), retryable: false });
+}
+
+function runAfterWake() {
+  return { version: 1, epoch: runAfterApi?.journal.epoch || null,
+    sequence: runAfterWakeRevision, revalidate: true };
+}
+
+function projectRunAfterMetadata(event, { tabId, queue, runAfter }) {
+  const api = runAfterApi;
+  if (!api || !runAfter) return null;
+  let frame;
+  try { frame = api.frameSnapshot(); } catch { return null; }
+  if (event.sender.id !== frame.webContentsId || switcherFrameKey(event.senderFrame) !== frame.frame) return null;
+  let value;
+  if (runAfter.known !== true || !runAfter.epoch?.startsWith(api.journal.epoch + ':')) {
+    value = { version: 1, known: false, mainEpoch: api.journal.epoch, reason: 'run_after_revalidation_required' };
+  } else {
+    const scope = runAfterMainScope(tabId), mainScopeKey = api.scopeKey(tabId);
+    value = scope.loopTextHash && fingerprintAgentSendRequest(queue?.loopPromptText) !== scope.loopTextHash
+      ? { version: 1, known: false, mainEpoch: api.journal.epoch, reason: 'run_after_loop_sync_pending' }
+      : { ...runAfter, mainEpoch: api.journal.epoch, mainScopeKey, guard: { ...runAfter.guard, mainScopeKey } };
+  }
+  const signature = JSON.stringify([value.epoch, value.revision, value.viewRevision, value.mainScopeKey, value.reason]);
+  if (runAfterMetadataVersions.get(tabId) !== signature) {
+    runAfterMetadataVersions.set(tabId, signature); runAfterWakeRevision++;
+    scheduleTabActivityBroadcast?.('run-after');
+  }
+  return value;
+}
+
+function noteRunAfterWake(event, value) {
+  if (!runAfterApi || !value?.epoch?.startsWith(runAfterApi.journal.epoch + ':')) return false;
+  let frame;
+  try { frame = runAfterApi.frameSnapshot(); } catch { return false; }
+  if (event.sender.id !== frame.webContentsId || switcherFrameKey(event.senderFrame) !== frame.frame) return false;
+  runAfterWakeRevision++; scheduleTabActivityBroadcast?.('run-after'); return true;
+}
 
 function tabActivityProjection(scope = {}) {
   return publicTabActivity ? { tabActivity: publicTabActivity.capture(scope) } : {};
@@ -515,6 +690,7 @@ let externalResearchCoordinator = null;
 // in-memory registry below only joins concurrent callers and projects the
 // current-process waiter; it must never recreate retry authority after restart.
 let agentSendReceiptStore = null;
+let reconcileAgentSendReceipt = null;
 let agentSendQueue = null;
 let sendQueueRendererReady = false;
 const sendQueueRendererOwners = new Set();
@@ -766,6 +942,15 @@ function getTabMessageService() {
   return tabMessageService;
 }
 
+async function locateTabMessageSource(messageId) {
+  if (!transcriptService?.getTabMessageSourceLocation) return { success: false, error: 'tab_message_source_navigation_unavailable' };
+  return resolveTabMessageSourceLocation(messageId, {
+    getMessage: id => getTabMessageService().getMessage(id),
+    readOwner: id => resolveHistorySessionInfo(id),
+    readLocation: input => transcriptService.getTabMessageSourceLocation(input),
+  });
+}
+
 async function sendTabMessage(message) {
   await agentSendReceiptStartupReady;
   if (!agentSendReceiptStore) throw Object.assign(new Error('message_receipt_store_unavailable'), { submitted: false });
@@ -774,7 +959,7 @@ async function sendTabMessage(message) {
   agentSendReceiptStore.pinForOwner(message.operationKey, 'tab-message');
   const service = getTabMessageService();
   const status = await resolveAgentSessionInfo(message.targetTabId, 2000);
-  const expectedTarget = { toolType: message.targetProvider, sessionId: message.targetSessionId };
+  const expectedTarget = message.targetSendTarget || { toolType: message.targetProvider, sessionId: message.targetSessionId };
   const source = 'tab-message:' + message.messageId;
   const question = message.replyTo ? service.getMessage(message.replyTo)?.message : null;
   const rawPrompt = formatTabMessagePrompt(message, question);
@@ -2587,7 +2772,11 @@ function externalRunStatusFromDurableRecord(record) {
 }
 
 function durableAgentSendReplay(record, overrides = {}) {
-  const applicationQueued = typeof agentSendQueue !== 'undefined' && agentSendQueue?.receipt(record?.operationKey);
+  // A certified automatic wait retains its negative physical attempt. Do not
+  // feed a UI/application acceptance back into the physical receipt registry:
+  // that would cache success and suppress the later, actually permitted send.
+  const applicationQueued = !record?.attemptId && typeof agentSendQueue !== 'undefined'
+    && agentSendQueue?.receipt(record?.operationKey);
   if (applicationQueued) return { ...applicationQueued, ...overrides, replayed: true };
   const storedReceipt = record?.receipt && typeof record.receipt === 'object'
     ? record.receipt
@@ -2683,6 +2872,34 @@ function durableAgentSendReplay(record, overrides = {}) {
     ...overrides,
     replayed: true,
   };
+}
+
+async function reconcileAgentSendReceiptForApi(tabId, body) {
+  await agentSendReceiptStartupReady;
+  if (!agentSendReceiptStore || !reconcileAgentSendReceipt) {
+    throw Object.assign(new Error('send_receipt_reconciliation_unavailable'), { statusCode: 503 });
+  }
+  const request = require('./agent-send-receipt-reconcile').normalizeAgentSendReceiptReconcile(tabId, body);
+  const result = await reconcileAgentSendReceipt(request);
+  console.log('[AgentSendReceipt] explicit proof-read tab=' + String(tabId).slice(-12)
+    + ' operation=' + request.operationKey.slice(0, 90)
+    + ' attempt=' + request.attemptId.slice(0, 12)
+    + ' decision=' + result.reconciliation.decision + ' confirmed=' + result.reconciliation.confirmed);
+  return { ok: true, tabId, operationKey: request.operationKey, attemptId: request.attemptId,
+    reconciliation: result.reconciliation, receipt: publicAgentSendReceipt(result.record) };
+}
+
+async function releaseAgentSendQueueHeadForApi(tabId, body) {
+  await agentSendReceiptStartupReady;
+  if (!agentSendQueue) throw Object.assign(new Error('send_queue_release_unavailable'), { statusCode: 503 });
+  if (!body || Object.keys(body).some(key => !['operationKey', 'attemptId', 'requestId', 'acknowledgeDeliveryUnknown'].includes(key))) {
+    throw Object.assign(new Error('send_queue_release_identity_required'), { statusCode: 400 });
+  }
+  const result = await agentSendQueue.releaseUnknownHead({ ...body, tabId });
+  return { ok: true, tabId, operationKey: body.operationKey, attemptId: body.attemptId,
+    requestId: body.requestId,
+    released: result.released, idempotent: result.idempotent === true, confirmed: result.confirmed === true,
+    release: result.release || null, receipt: publicAgentSendReceipt(result.record) };
 }
 
 function publicAgentSendReceipt(record) {
@@ -2806,6 +3023,7 @@ async function runPreparedAgentSendScenario(args) {
   cwd,
   handoffId,
   source,
+  promptQueueAction,
   statusAtSend,
   queue,
   ownership,
@@ -2838,6 +3056,7 @@ async function runPreparedAgentSendScenario(args) {
     thinking: thinking || null,
     cwd: cwd || null,
     source: source || null,
+    ...(promptQueueAction === 'send-now' ? { promptQueueAction: 'send-now' } : {}),
     queue: queue === true,
     ownership: ownership || null,
     ...(authoringSnapshot ? { authoring: authoringSnapshot } : {}),
@@ -3056,6 +3275,7 @@ async function runPreparedAgentSendScenario(args) {
         sendOperationKey: sendOperationKey || null,
         sendAttemptId: durableAttemptId,
         source,
+        ...(promptQueueAction === 'send-now' ? { promptQueueAction: 'send-now' } : {}),
         statusAtSend,
         queue: queue === true,
         presentationSnapshot: withPromptOriginPresentation(presentationSnapshot, source),
@@ -3758,7 +3978,7 @@ function findOrchestrationTabDescriptor(tabId) {
   if (!tabId) return null;
   try {
     const projectManager = require('./project-manager');
-    for (const project of projectManager.db.getAllProjects()) {
+    for (const project of listExecutionNamespaces(projectManager)) {
       const tab = (project.tabs || []).find((item) => item.tabId === tabId);
       if (!tab) continue;
       const toolType = tab.tabType === 'claude-sdk'
@@ -3805,7 +4025,7 @@ function findRestorableAgentTabDescriptor(tabId) {
     const projectManager = require('./project-manager');
     const entries = projectManager.db.getTabHistoryEntriesByTabId(tabId, 2);
     const projectId = entries.length === 1
-      ? (entries[0].project_id || entries[0].projectId || null)
+      ? executionNamespaceForRow(entries[0])
       : null;
     const project = projectId ? projectManager.db.getProjectById(projectId) : null;
     return resolveRestorableAgentTab({ tabId, historyEntries: entries, project });
@@ -4457,11 +4677,9 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       sessionId: completionContent.metadata.sourceSessionId || current.notificationSourceSessionId
         || current.sourceExecutionContext?.sessionId || null,
     } : null;
-    if (completionTarget) {
-      const actual = await readScenarioDestination(current.sourceTabId);
-      const failure = agentSendTargetPreconditionFailure(completionTarget, actual);
-      if (failure) throw Object.assign(new Error(failure.error), failure);
-    }
+    // Keep the original target pin for the common FIFO/readiness/write proof.
+    // A provisional null writer is not a different conversation; checking it
+    // here would reject before that authoritative executor can resolve it.
     if (tabWorkContext && (!current.notificationPromptAuditHash
       || tabWorkContext.hasHandoff(current.sourceTabId, notificationHandoffId))) {
       notificationText = (await tabWorkContext.prepare(current.sourceTabId, notificationHandoffId, notificationText)).prompt;
@@ -4937,7 +5155,7 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
   if (!sessionId) {
     let projects = [];
     try {
-      projects = require('./project-manager').db.getAllProjects();
+      projects = listExecutionNamespaces(require('./project-manager'));
     } catch {}
     const legacy = await findUniqueLegacySourceFollowupProof({
       run: current,
@@ -6481,6 +6699,8 @@ function projectActivitySnapshot(reason = 'snapshot', activitySample = publicTab
       layoutChangedProjectIds: Array.isArray(snap.layoutChangedProjectIds) ? snap.layoutChangedProjectIds : [],
       projectOrderChanged: snap.projectOrderChanged === true,
       ...(snap.cardSignals ? { cardSignals: snap.cardSignals } : {}),
+      workspaceSwitcher: workspaceSwitcherWake(),
+      runAfter: runAfterWake(),
       ...(activitySample ? { tabActivity: activitySample() } : {}),
       ts: snap.ts || Date.now(),
       reason,
@@ -6514,7 +6734,7 @@ function readBody(req) {
 // a single reply. The renderer registers `web:bridge-reply` as the response
 // channel; here we just allocate a requestId and time out at 5s. Used for
 // state that only the live UI knows (current openProjects map, tab creation).
-function bridgeRequest(action, payload, timeoutMs = 5000, {
+async function bridgeRequest(action, payload, timeoutMs = 5000, {
   onLateReply = null,
   lateReplyRetentionMs = LATE_BRIDGE_REPLY_RETENTION_MS,
   requestId: ownedRequestId = null,
@@ -6524,6 +6744,12 @@ function bridgeRequest(action, payload, timeoutMs = 5000, {
   onAbort = null,
   onObservationExpired = null,
 } = {}) {
+  if(action==='createAgentTab' || action==='createTerminalTab') {
+    const manager=require('./project-manager');
+    if(manager.workflowOrganization?.ready()) {
+      payload=await freezeWorkflowCreationContext(manager,payload || {},payload?.workflowId);
+    }
+  }
   return new Promise((resolve, reject) => {
     const wins = BrowserWindow.getAllWindows();
     const win = wins[0];
@@ -6577,7 +6803,8 @@ function bridgeRequest(action, payload, timeoutMs = 5000, {
       captureReply,
       onAbort,
       dispose: null,
-      expectedSender: observationOnly || action === 'getStatusMarkerConfig' ? win.webContents : null,
+      expectedSender: observationOnly || ['getStatusMarkerConfig', 'readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(action) ? win.webContents : null,
+      expectedSwitcherFrame: ['readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(action) ? switcherFrameKey(win.webContents.mainFrame) : null,
     });
     console.log('[BridgeDiag] SEND action=' + action + label + ' rid=' + requestId + ' wins=' + wins.length);
     try {
@@ -6715,7 +6942,7 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500, { onLateStatus =
 
   try {
     const projectManager = require('./project-manager');
-    for (const p of projectManager.db.getAllProjects()) {
+    for (const p of listExecutionNamespaces(projectManager)) {
       const t = (p.tabs || []).find(x => x.tabId === tabId);
       if (!t) continue;
       const persistedOwner = resolveCurrentPtyAgentOwner(t);
@@ -6808,6 +7035,11 @@ function registerBridgeReplyHandler() {
       console.warn('[BridgeDiag] FOREIGN_REPLY action=' + pending.action + ' rid=' + requestId);
       return;
     }
+    if (['readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(pending.action)
+      && (!pending.expectedSwitcherFrame || switcherFrameKey(event?.senderFrame) !== pending.expectedSwitcherFrame)) {
+      console.warn('[BridgeDiag] FOREIGN_FRAME action=' + pending.action + ' rid=' + requestId);
+      return;
+    }
     const elapsed = Date.now() - pending.sentAt;
     console.log('[BridgeDiag] REPLY action=' + pending.action + (pending.label || '') + ' rid=' + requestId + ' ok=' + ok + ' elapsedMs=' + elapsed + ' err=' + (error || '-'));
     clearTimeout(pending.timer);
@@ -6886,6 +7118,38 @@ function logActiveLoadersSnapshot(snapshot, status = 200, error = null) {
 
 // ───────── REST handlers ─────────
 
+const workflowOrganizationHttp = createWorkflowOrganizationHttp({
+  getProjectManager: () => require('./project-manager'), checkAuth, readBody, sendJson,
+  sendCreationError: sendTerminalBridgeError,
+  createAgentTab: async body => {
+    const projectManager = require('./project-manager');
+    const toolType = resolveAgentProvider({ toolType: body.toolType, provider: body.provider, fallback: 'claude' });
+    const requestedModel = (await resolveProjectAgentModelRequest(projectManager, {
+      provider: toolType, model: cleanOptionalString(body.model || body.codexModel, ''), modelSelection: body.modelSelection,
+    })).model;
+    const placement = resolveNewAgentTabPlacement({ placement: body.placement,
+      parentTabId: cleanOptionalString(body.parentTabId, ''), targetProjectId: body.projectId });
+    if (placement.visualParentTabId) {
+      const parent = findOrchestrationTabDescriptor(placement.visualParentTabId);
+      if (!parent || parent.projectId !== body.projectId) throw Object.assign(new Error('parent tab must belong to the target execution namespace'), { statusCode: 409 });
+    }
+    return bridgeRequest('createAgentTab', {
+      projectId: body.projectId, workflowId: body.workflowId, executionNamespace: body.executionNamespace,
+      cwd: body.cwd, sourceTabId: body.sourceTabId, windowTarget: body.windowTarget,
+      toolType, startNow: true, name: cleanOptionalString(body.name, ''),
+      codexModel: requestedModel, codexEffort: cleanOptionalString(body.effort || body.codexEffort, ''),
+      placement: body.placement, visualParentTabId: placement.visualParentTabId,
+      afterTabId: placement.afterTabId, background: body.background !== false,
+    }, 60_000);
+  },
+  createTerminalTab: body => bridgeRequest('createTerminalTab', {
+    projectId: body.projectId, workflowId: body.workflowId, executionNamespace: body.executionNamespace,
+    cwd: body.cwd, sourceTabId: body.sourceTabId, windowTarget: body.windowTarget,
+    name: cleanOptionalString(body.name, '') || undefined, command: cleanOptionalString(body.command, '') || undefined,
+    color: cleanOptionalString(body.color, '') || undefined, background: body.background !== false,
+  }, 20_000),
+});
+
 async function handleApi(req, res, parsed, sdkSessions) {
   if (req.method === 'OPTIONS') {
     sendJson(res, 200, {});
@@ -6900,6 +7164,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
       lanIp: getLanIp(),
       service: webServerServiceHealth(),
       capabilities: {
+        workspaceSwitcher: WORKSPACE_SWITCHER_CAPABILITY,
+        ...(require('./project-manager').workflowOrganization?.ready() ? { workflowOrganization: WORKFLOW_HTTP_CAPABILITY } : {}),
+        runAfter: RUN_AFTER_CAPABILITY,
         ...(projectCardSignals ? { cardSignals: projectCardSignals.capability } : {}),
         ...(publicTabActivity ? { tabActivity: publicTabActivity.capability } : {}),
         ...(publicHistoryFreshness ? { historyFreshness: historyFreshnessCapability } : {}),
@@ -6910,7 +7177,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
             durableBeforeAck: true, images: true, files: true,
             structuredFiles: { version: 1, partField: 'uploadFiles', rangeUnit: 'utf16',
               endpoint: '/api/terminal-tabs/:tabId/send' } } } : {}),
-          receiptEndpoint: '/api/terminal-tabs/:tabId/send-receipts' } } : {}),
+          receiptEndpoint: '/api/terminal-tabs/:tabId/send-receipts',
+          ...(reconcileAgentSendReceipt ? { receiptReconciliation: { version: 1,
+            endpoint: '/api/terminal-tabs/:tabId/send-receipts/reconcile', providers: ['codex'], exactAttempt: true,
+            terminalInput: false, queueWakeOnExactProof: true, negativeSettlement: false },
+            explicitUnknownRelease: { version: 1, endpoint: '/api/terminal-tabs/:tabId/send-receipts/release',
+              requiresReAudit: true, exactAttempt: true, keepsDeliveryUnknown: true, automatic: false } } : {}) } } : {}),
         ...(systemPromptService ? { systemPrompts: { version: 1, revision: true, endpoint: '/api/system-prompts', settings: '/api/system-prompts/settings' } } : {}),
         historyRead: { version: 1, view: 'history', conditional: 'ifRevision', delta: true, deltaProviders: ['codex'], settingsBaselineVersion: 1 },
         ...(transcriptService?.getToolPayload ? { historyPayloads: historyPayloadCapability } : {}),
@@ -6927,7 +7199,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ...(readCodexAuthProfile ? { codexAuthProfile: { version: 1, mode: 'server-profile', readOnly: true, endpoint: '/api/codex-auth-profile' } } : {}),
         nativeRewind: { version: 2, escapeReady: 'committed-frame', wrappedSelection: 'display-rows', postEnterRecovery: 1 },
         ...(savedHistoryOperations ? { savedHistory: { version: 1, providers: savedHistoryOperations.claude ? ['codex', 'claude'] : ['codex'], operations: ['rewind', 'delete'],
-          receipts: true, structuredDraft: true, nativeRewindUnchanged: true } } : {}),
+          receipts: true, structuredDraft: true, nativeRewindUnchanged: true,
+          codexPhysicalSuffix: true, repairOfOperationId: !!savedHistoryOperations.inspectRepair } } : {}),
         ...(conversationOwners ? { conversationOwner: { version: 1, providers: ['codex', 'claude'],
           applicability: '/api/terminal-tabs/:tabId/history-operations/:operationId/applicability',
           strictKnownEmptySend: ['claude'], order: 'ownerOrder', receiptUnchanged: true } } : {}),
@@ -6956,7 +7229,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           kinds: ['catalog', 'custom'],
         },
         loopTaskCompletion: { version: 2, statuses: ['completed', 'blocked'] },
-        tabMessages: { version: 1, durable: true, replyTo: true, dismiss: true },
+        tabMessages: { version: 1, durable: true, replyTo: true, dismiss: true, sourceNavigation: true },
         orchestrationInlineResults: { version: 1 },
         externalResearchOrchestration: {
           version: 1,
@@ -7205,7 +7478,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 503, { error: 'project-activity unavailable', projects: [], ts: Date.now() });
     }
     try {
-      return sendJson(res, 200, { ...computeProjectActivity(), ...tabActivityProjection() });
+      return sendJson(res, 200, { ...computeProjectActivity(), ...tabActivityProjection(), workspaceSwitcher: workspaceSwitcherWake(), runAfter: runAfterWake() });
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message), projects: [], ts: Date.now() });
     }
@@ -7305,6 +7578,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+
+  if (await workflowOrganizationHttp(req, res, parsed)) return;
 
   if (parsed.pathname === '/api/history-freshness' && req.method === 'GET') {
     let ids;
@@ -7532,7 +7807,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   if (parsed.pathname === '/api/tab-messages' || parsed.pathname.startsWith('/api/tab-messages/')) {
     const handled = await handleTabMessageApi(req, res, parsed, { service: getTabMessageService(),
-      resolveTab: resolveTabMessageIdentity, readBody, sendJson });
+      resolveTab: resolveTabMessageIdentity, locateSource: locateTabMessageSource, readBody, sendJson });
     if (!handled) sendJson(res, 404, { ok: false, error: 'unknown_tab_message_route' });
     return;
   }
@@ -7673,6 +7948,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       autoStopCreatedTargets: typeof body.autoStopCreatedTargets === 'boolean' ? body.autoStopCreatedTargets : undefined,
       codexCapacityRetryEnabled: typeof body.codexCapacityRetryEnabled === 'boolean' ? body.codexCapacityRetryEnabled : undefined,
       codexCapacityRetryLimit: Object.prototype.hasOwnProperty.call(body, 'codexCapacityRetryLimit') ? body.codexCapacityRetryLimit : undefined,
+      codexCapacityRetryDelaysMs: Object.prototype.hasOwnProperty.call(body, 'codexCapacityRetryDelaysMs') ? body.codexCapacityRetryDelaysMs : undefined,
     });
     ipcMain.emit('codex-capacity-retry:settings-updated', null, settings);
     void scheduleOrchestrationPolicyTimer();
@@ -8337,7 +8613,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } catch {}
 
     const openOrder = new Map(openProjectIds.map((id, index) => [id, index]));
-    const all = projectManager.db.getAllProjects().map(p => {
+    const all = listExecutionNamespaces(projectManager).map(p => {
       const tabs = p.tabs || [];
       const sdkTabs = tabs.filter(t => t.tabType === 'claude-sdk');
       // Count how many SDK tabs are streaming RIGHT NOW (one entry in
@@ -8347,6 +8623,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         id: p.id,
         name: p.name,
         path: p.path,
+        ...(p.executionScopeVersion === 2 ? { executionScopeVersion: 2, executionNamespace: p.executionNamespace } : {}),
         icon: p.icon || null,
         tabCount: tabs.length,
         sdkTabCount: sdkTabs.length,
@@ -8827,6 +9104,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         commandType: persistedOwner || t.commandType,
         color: t.color || null,   // desktop TabColor — drives row bg (mobile mirrors desktop)
         cwd: t.cwd,
+        ...(t.executionSubject?.version === 2 ? { executionSubject: t.executionSubject,
+          executionStorageRevision: t.executionStorageRevision } : {}),
         filePath: t.filePath || null,
         claudeSessionId: isClaude ? (runtimeAgentSessionId || t.claudeSessionId || null) : t.claudeSessionId,
         codexSessionId,
@@ -9006,6 +9285,23 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } catch (e) {
       return sendJson(res, 409, { error: String(e.message) });
     }
+  }
+
+  // Explicit proof read; only the existing exact auditor may promote a receipt.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/send-receipts\/reconcile$/);
+  if (m && req.method === 'POST') {
+    try {
+      const result = await reconcileAgentSendReceiptForApi(decId(m[1]), await readBody(req));
+      return sendJson(res, 200, result);
+    } catch (error) {
+      return sendJson(res, error.statusCode || 500, { ok: false, error: error.code || error.message });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/send-receipts\/release$/);
+  if (m && req.method === 'POST') {
+    try { return sendJson(res, 200, await releaseAgentSendQueueHeadForApi(decId(m[1]), await readBody(req))); }
+    catch (error) { return sendJson(res, error.statusCode || 500, { ok: false, error: error.code || error.message }); }
   }
 
   // Durable delivery receipts for reconnect/cold-start clients. Reading this
@@ -9281,8 +9577,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/claude-tabs$/);
   if (m && req.method === 'POST') {
     try {
+      const legacyBody = legacyCreationContext(projectManager, decId(m[1]), await readBody(req));
+      const context = projectManager.workflowOrganization?.ready()
+        ? await freezeWorkflowCreationContext(projectManager, legacyBody) : legacyBody;
       const data = await bridgeRequest('createAgentTab', {
-        projectId: decId(m[1]),
+        projectId: context.projectId,
+        cwd: context.cwd,
+        workflowId: context.workflowId,
+        executionNamespace: context.executionNamespace,
         toolType: 'claude',
         startNow: true,
       }, 12_000);
@@ -10347,7 +10649,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const started = Date.now();
     const projectId = decId(m[1]);
     try {
-      const body = await readBody(req);
+      const legacyBody = legacyCreationContext(projectManager, projectId, await readBody(req));
+      const body = projectManager.workflowOrganization?.ready()
+        ? await freezeWorkflowCreationContext(projectManager, legacyBody) : legacyBody;
       const toolType = resolveAgentProvider({
         toolType: body.toolType,
         provider: body.provider,
@@ -10379,7 +10683,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         + ' effort=' + (cleanOptionalString(body.effort || body.codexEffort, '') || '-'));
       const data = await bridgeRequest('createAgentTab', {
         projectId,
-        cwd: cleanOptionalString(body.cwd, '') || undefined,
+        cwd: body.cwd,
+        workflowId: body.workflowId,
+        executionNamespace: body.executionNamespace,
         sourceTabId: cleanOptionalString(body.sourceTabId, '') || undefined,
         windowTarget: body.windowTarget && typeof body.windowTarget === 'object'
           ? body.windowTarget
@@ -10415,9 +10721,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   if (parsed.pathname === '/api/terminal-tabs' && req.method === 'POST') {
     try {
-      const body = await readBody(req);
+      const request = await readBody(req);
+      const body = projectManager.workflowOrganization?.ready()
+        && (request.workflowId || request.executionNamespace || request.cwd || request.sourceTabId)
+        ? await freezeWorkflowCreationContext(projectManager, request) : request;
       const data = await bridgeRequest('createTerminalTab', {
         projectId: cleanOptionalString(body.projectId, '') || undefined,
+        workflowId: body.workflowId,
+        executionNamespace: body.executionNamespace,
         fallbackProjectId: cleanOptionalString(body.fallbackProjectId, '') || undefined,
         cwd: cleanOptionalString(body.cwd, '') || undefined,
         sourceTabId: cleanOptionalString(body.sourceTabId, '') || undefined,
@@ -10438,7 +10749,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (parsed.pathname === '/api/agent-tabs' && req.method === 'POST') {
     const started = Date.now();
     try {
-      const body = await readBody(req);
+      const request = await readBody(req);
+      const body = projectManager.workflowOrganization?.ready()
+        && (request.workflowId || request.executionNamespace || request.cwd || request.sourceTabId)
+        ? await freezeWorkflowCreationContext(projectManager, request) : request;
       const toolType = resolveAgentProvider({
         toolType: body.toolType,
         provider: body.provider,
@@ -10451,6 +10765,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
       })).model;
       const data = await bridgeRequest('createAgentTab', {
         projectId: cleanOptionalString(body.projectId, '') || undefined,
+        workflowId: body.workflowId,
+        executionNamespace: body.executionNamespace,
         fallbackProjectId: cleanOptionalString(body.fallbackProjectId, '') || undefined,
         cwd: cleanOptionalString(body.cwd, '') || undefined,
         sourceTabId: cleanOptionalString(body.sourceTabId, '') || undefined,
@@ -10518,6 +10834,21 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   // ── Рабочая область: что на экране и как это переставить ────────────────
+  if (parsed.pathname === '/api/workspace/switcher' && req.method === 'GET') {
+    const started = Date.now();
+    try {
+      const request = switcherRequestFromQuery(parsed.query);
+      const data = await getWorkspaceSwitcherApi().read(request);
+      console.log('[WorkspaceSwitcher] read scope=' + request.scope + ' revision=' + data.revision
+        + ' rows=' + data.rows.length + ' ms=' + (Date.now() - started));
+      return sendJson(res, 200, data);
+    } catch (error) {
+      const code = error.code || 'switcher_renderer_unavailable';
+      console.warn('[WorkspaceSwitcher] read failed code=' + code + ' ms=' + (Date.now() - started));
+      return sendJson(res, Number(error.statusCode) || 503,
+        { ok: false, known: false, error: code, workspaceSwitcher: workspaceSwitcherWake() });
+    }
+  }
   //
   // The workspace had no API at all: a caller could create tabs but not say
   // WHERE they should appear, so «сделай форк и открой обе справа» was not
@@ -11567,16 +11898,57 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/queue$/);
   if (m && req.method === 'GET') {
     try {
+      if (parsed.query.runAfter === '1') return sendJson(res, 200,
+        await getRunAfterApi().read(decId(m[1]), 'queue', { includeActions: parsed.query.includeActions === '1' }));
       const data = await bridgeRequest('getPromptQueue', { tabId: decId(m[1]) });
       return sendJson(res, 200, data);
-    } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
+    } catch (e) { return parsed.query.runAfter === '1' ? runAfterFailure(res, e) : sendJson(res, 409, { error: String(e.message) }); }
   }
+  if (m && req.method === 'POST') {
+    let body;
+    try {
+      body = await readBody(req);
+      if (body.runAfter != null) return runAfterReply(res, await getRunAfterApi().mutate(decId(m[1]), body));
+      const data = await bridgeRequest('mutatePromptQueue', { tabId: decId(m[1]), op: body.op, args: body.args });
+      return sendJson(res, 200, data);
+    } catch (e) { return body?.runAfter != null ? runAfterFailure(res, e) : sendJson(res, 409, { error: String(e.message) }); }
+  }
+
+  if (parsed.pathname === '/api/run-after' && req.method === 'GET') {
+    try { return sendJson(res, 200, await getRunAfterApi().read('@overview', 'overview')); }
+    catch (e) { return runAfterFailure(res, e); }
+  }
+  if (parsed.pathname === '/api/run-after/image-preview' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const assetId = require('./prompt-queue-assets').normalizeAssetId(body.assetId);
+      if (!assetId || assetId !== body.assetId || Object.keys(body).some(key => !['assetId', 'variant'].includes(key))
+        || body.variant !== undefined && !['thumbnail', 'detail'].includes(body.variant)) {
+        throw runAfterError('run_after_image_id_invalid', 400);
+      }
+      const result = await bridgeRequest('previewRunAfterImage', { assetId, ...(body.variant ? { variant: body.variant } : {}) }, 5000);
+      return sendJson(res, result?.success ? 200 : 404, result);
+    } catch (e) { return runAfterFailure(res, e); }
+  }
+  if (parsed.pathname === '/api/run-after/auto-compact' && req.method === 'GET') {
+    try { return sendJson(res, 200, await getRunAfterApi().read('@auto-compact', 'auto-compact')); }
+    catch (e) { return runAfterFailure(res, e); }
+  }
+  if (parsed.pathname === '/api/run-after/auto-compact' && req.method === 'POST') {
+    try { return runAfterReply(res, await getRunAfterApi().mutate('@auto-compact', await readBody(req), 'auto-compact')); }
+    catch (e) { return runAfterFailure(res, e); }
+  }
+  m = parsed.pathname.match(/^\/api\/run-after\/operations\/([^/]+)$/);
+  if (m && req.method === 'GET') {
+    try { return sendJson(res, 200, { ok: true, operation: getRunAfterApi().receipt(decId(m[1])) }); }
+    catch (e) { return runAfterFailure(res, e); }
+  }
+  m = parsed.pathname.match(/^\/api\/run-after\/operations\/([^/]+)\/release$/);
   if (m && req.method === 'POST') {
     try {
       const body = await readBody(req);
-      const data = await bridgeRequest('mutatePromptQueue', { tabId: decId(m[1]), op: body.op, args: body.args });
-      return sendJson(res, 200, data);
-    } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
+      return sendJson(res, 200, { ok: true, operation: getRunAfterApi().journal.release(decId(m[1]), body.tabId) });
+    } catch (e) { return runAfterFailure(res, e); }
   }
 
   // Explicit task completion is scoped to the caller's current live turn. It
@@ -12250,6 +12622,7 @@ function releaseTranscriptSubscriptionsIfOrphan() {
 // gives a permanent causal trace for "server emitted → SSE wrote → iOS applied"
 // without dumping chat text or spamming desktop-only sessions with message drops.
 const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'tab-metadata', 'background-work', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity', 'orchestration-update']);
+const automaticQueueWakeSignatures = new Map();
 function webBroadcast(tabId, payload) {
   if (payload?.type === 'activity-timing-invalidated') {
     publishTabTiming(tabId, payload.reason); return;
@@ -12265,6 +12638,16 @@ function webBroadcast(tabId, payload) {
     webBroadcast(tabId, { type: 'history-freshness', historyFreshness });
   }
   if (['busy','done','snapshot','bridge-update'].includes(type)) agentSendQueue?.notifyRuntime(tabId);
+  if (type === 'queue-update') {
+    const signature = fingerprintAgentSendRequest(payload.queue);
+    if (automaticQueueWakeSignatures.get(tabId) !== signature) {
+      automaticQueueWakeSignatures.set(tabId, signature);
+      if (automaticQueueWakeSignatures.size > 4096) automaticQueueWakeSignatures.delete(automaticQueueWakeSignatures.keys().next().value);
+      agentSendQueue?.notifyRuntime(tabId);
+    }
+    // Receipt/countdown metadata is not a new readiness event. In particular
+    // publishing a parked negative attempt must not schedule its own retry.
+  }
   if (tabMessageService && ['busy', 'done', 'snapshot', 'bridge-update'].includes(type)) {
     void tabMessageService.wake(tabId, type).catch(error => {
       console.warn('[TabMessages] wake-failed tab=' + tabId + ' reason=' + type + ' error=' + error.message);
@@ -12676,6 +13059,7 @@ function start({
   sdkSessions,
   agentSendReceiptStore: agentSendReceiptStoreFn,
   agentSendReceiptStartupReady: agentSendReceiptStartupReadyFn,
+  reconcileAgentSendReceipt: reconcileAgentSendReceiptFn,
   cancelAgentSend: cancelAgentSendFn,
   computeActiveLoaders: computeFn,
   computeProjectActivity: computeProjectActivityFn,
@@ -12720,6 +13104,12 @@ function start({
   tabWorkContext = tabWorkContextInstance || null;
   projectCardSignals = projectCardSignalsInstance || null;
   scheduleTabActivityBroadcast = scheduleTabActivityBroadcastFn || null;
+  // If just the HTTP service was restarted, the still-mounted App must renew
+  // its metadata lease. Initial App mount independently registers too.
+  for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) {
+    win.webContents.send('workspace-switcher:register-request');
+    break;
+  }
   publicTabActivity = typeof readTabActivityState === 'function'
     ? require('./public-tab-activity').createPublicTabActivity({
       readState: readTabActivityState,
@@ -12728,21 +13118,14 @@ function start({
     }) : null;
   mobileAttachmentAssetStore = mobileAttachmentAssetStoreInstance || null;
   agentSendReceiptStore = agentSendReceiptStoreFn || null;
+  reconcileAgentSendReceipt = reconcileAgentSendReceiptFn || null;
   sendQueueRecoveryReady = false;
   if (agentSendReceiptStore?.subscribe) {
     agentSendQueue = new AgentSendQueue({ store: agentSendReceiptStore,
+      reconcile: reconcileAgentSendReceipt ? request => reconcileAgentSendReceipt(request) : null,
       ready: () => sendQueueRendererReady && sendQueueRecoveryReady,
       cancelAttempt: record => cancelAgentSendFn?.(record),
-      admit: async request => {
-        // Independent delegated runs still need their own turn. Ordinary
-        // prompts/notifications may steer streaming; a delayed delegation may
-        // not silently become steering just because it waited in this backlog.
-        if (request.sendSurface !== 'orchestration') return true;
-        const status = await resolveAgentSessionInfo(request.tabId, 2000, {
-          onLateStatus: () => agentSendQueue?.notifyRuntime(request.tabId),
-        });
-        return resolveOrchestrationDeliveryAdmission(status).canDispatch;
-      },
+      admit: admitQueuedAgentSend,
       execute: async (request, scope) => {
         const receipt = await runPreparedAgentSendScenario({ ...request, applicationQueueExecution: true,
           sendRequestFingerprint: scope.requestFingerprint,
@@ -12839,6 +13222,8 @@ function start({
         ...payload, targetProjectId: findOrchestrationTabDescriptor(payload.tabId)?.projectId || null,
       }, 180_000),
       deleteRange: params => codexDataApi.deleteCodexRange(params),
+      inspectRepair: params => codexDataApi.inspectCodexSavedRewindRepair(params),
+      hashRecords: codexDataApi.codexRepairRecordsHash,
       buildTimeline: buildCodexTimeline,
       broadcast: webBroadcast,
     });
@@ -13033,6 +13418,10 @@ function stop() {
   computeActiveLoaders = null;
   computeProjectActivity = null;
   publicTabActivity = null;
+  workspaceSwitcherApi?.retire(); workspaceSwitcherApi = null;
+  runAfterApi = null;
+  runAfterWakeRevision = 0; runAfterMetadataVersions.clear();
+  automaticQueueWakeSignatures.clear();
   scheduleTabActivityBroadcast = null;
   activityStyleOwner = null;
   startupInterruptedSnapshot = null;
@@ -13080,6 +13469,7 @@ function stop() {
   agentSendQueue = null;
   sendQueueRecoveryReady = false;
   agentSendReceiptStore = null;
+  reconcileAgentSendReceipt = null;
   agentSendReceiptStartupReady = Promise.resolve({ ready: true });
   tabMessageService?.dispose();
   tabMessageService = null;
@@ -13217,7 +13607,83 @@ async function sendCodexCapacityContinuation({ tabId, sessionId, turnId, generat
   });
 }
 
+async function admitQueuedAgentSend(request) {
+  if (isAutomaticPromptQueueRequest(request)) {
+    try {
+      const current = await bridgeRequest('readPromptQueueSendAdmission', {
+        tabId: request.tabId, handoffId: request.handoffId, provider: request.provider,
+        cwd: request.cwd, expectedTarget: request.expectedTarget, intent: request.promptQueueIntent,
+      }, 2000);
+      if (current?.cancel === true) return current;
+      if (current?.ready !== true) return false;
+      const status = await resolveAgentSessionInfo(request.tabId, 2000, {
+        onLateStatus: () => agentSendQueue?.notifyRuntime(request.tabId),
+      });
+      return status?.status === 'active' && status.inputReady === true
+        && status.busy !== true && status.isBusy !== true;
+    } catch { return false; } // a missing renderer is not permission to send
+  }
+  // Delegations need an independent turn. Ordinary/manual sends keep their
+  // steering capability; this must never become a global idle-only gate.
+  if (request.sendSurface !== 'orchestration') return true;
+  const status = await resolveAgentSessionInfo(request.tabId, 2000, {
+    onLateStatus: () => agentSendQueue?.notifyRuntime(request.tabId),
+  });
+  return resolveOrchestrationDeliveryAdmission(status).canDispatch;
+}
+
 module.exports = {
+  readAutomaticSendAdmission: async ({ tabId, handoffId, operationKey, attemptId }) => {
+    const item = agentSendQueue?.item(operationKey), record = agentSendReceiptStore?.get(operationKey);
+    if (!item || !isAutomaticPromptQueueRequest(JSON.parse(item.request_json))) return true;
+    if (record?.attemptId !== attemptId || record?.tabId !== tabId || record?.handoffId !== handoffId
+      || record.state !== 'in-flight' || item.state !== 'dispatching') return { cancel: true };
+    return admitQueuedAgentSend(JSON.parse(item.request_json));
+  },
+  certifyAutomaticReadinessWait: (identity, receipt) =>
+    agentSendQueue?.certifyAutomaticReadinessWait(identity, receipt) || receipt,
+  joinAutomaticAgentPrompt: async input => {
+    if (!input?.tabId || !input.handoffId || !agentSendQueue) return { found: false };
+    const refuse = code => ({ found: true, receipt: { success: false, accepted: false,
+      submitted: false, pasteWritten: false, enterWritten: false, code, error: code,
+      handoffId: input.handoffId } });
+    const key = `history:${input.tabId}:${input.handoffId}`;
+    const item = agentSendQueue.item(key);
+    if (!item) {
+      const base = input.promptQueueIntent?.baseHandoffId;
+      if (typeof base === 'string' && base && input.handoffId.startsWith(base + '-arm-')) {
+        // A new explicit arm is allowed only past a proven no-input predecessor.
+        // Neither changing the arm nor upgrading the key bypasses old unknowns.
+        const priors = agentSendQueue.db.prepare(`SELECT operation_key FROM agent_send_queue WHERE tab_id = ?
+          AND (operation_key = ? OR json_extract(request_json, '$.promptQueueIntent.baseHandoffId') = ?) ORDER BY id DESC`)
+          .all(input.tabId, `history:${input.tabId}:${base}`, base);
+        for (const prior of priors) {
+          const record = agentSendReceiptStore.get(prior.operation_key);
+          if (!record) return refuse('automatic_previous_delivery_unknown');
+          if (hasCanonicalSendConsumption(record)) return { found: true, receipt: {
+            ...durableAgentSendReplay(record, { operationKey: record.operationKey, attemptId: record.attemptId,
+              tabId: input.tabId, handoffId: record.handoffId }), alreadyConsumedHandoffId: record.handoffId,
+          } };
+          if (record.state !== 'not-submitted' || record.receipt?.submitted !== false
+            || record.receipt?.pasteWritten === true || record.receipt?.enterWritten === true) {
+            return refuse('automatic_previous_delivery_unresolved');
+          }
+        }
+      }
+      return { found: false };
+    }
+    const frozen = JSON.parse(item.request_json);
+    if (!isAutomaticPromptQueueRequest(frozen)
+      || fingerprintAgentSendRequest(frozen.promptQueueIntent) !== fingerprintAgentSendRequest(input.promptQueueIntent)) {
+      return refuse('agent_send_handoff_conflict');
+    }
+    // Read/join the original immutable body. A renderer restore may have new
+    // status hints or pending work-context; neither rewrites the frozen Send.
+    const record = await agentSendQueue.result(key);
+    return { found: true, receipt: durableAgentSendReplay(record, {
+      operationKey: key, attemptId: record?.attemptId || null, tabId: input.tabId, handoffId: input.handoffId,
+    }) };
+  },
   markSendQueueRendererReady: (ready = true, ownerId = 0) => {
     if (ready) sendQueueRendererOwners.add(ownerId); else sendQueueRendererOwners.delete(ownerId);
     sendQueueRendererReady = sendQueueRendererOwners.size > 0;
@@ -13257,6 +13723,7 @@ module.exports = {
   },
   listTabMessages: async (tabId) => (await getTabMessageService().listForTab(tabId)).map(compactTabMessage),
   getTabMessage: (messageId) => getTabMessageService().getMessage(messageId),
+  locateTabMessageSource,
   dismissTabMessage: (tabId, messageId) => {
     const result = getTabMessageService().dismissMessage({ tabId, messageId });
     return { ...result, message: compactTabMessage(result.message) };
@@ -13296,4 +13763,14 @@ module.exports = {
   },
   invalidateTabActivity,
   observeTabActivityStyle,
+  registerWorkspaceSwitcher: event => getWorkspaceSwitcherApi().register(event),
+  noteWorkspaceSwitcherChanged: (event, value) => workspaceSwitcherApi?.changed(event, value),
+  unregisterWorkspaceSwitcher: (event, value) => workspaceSwitcherApi?.unregister(event, value),
+  runAfterMainEpoch: () => ({ epoch: getRunAfterApi().journal.epoch }),
+  validateRunAfterScope: (event, value) => getRunAfterApi().validateScope(event, value.ticket),
+  commitRunAfterOperation: (event, value) => getRunAfterApi().commit(event, value),
+  stageRunAfterOperation: (event, value) => getRunAfterApi().stage(event, value),
+  runAfterOwnerBusyProof,
+  projectRunAfterMetadata,
+  noteRunAfterWake,
 };

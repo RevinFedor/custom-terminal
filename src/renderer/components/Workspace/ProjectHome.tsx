@@ -45,6 +45,7 @@ import {
 import { INBOX_PROJECT_NAME, isInboxProjectId } from '../../constants/systemProjects';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 import { focusAndSelectInlineName } from '../../utils/inlineRenameFocus.mjs';
+import { getTabChromeColorConfig } from './tabChrome';
 
 // Tooltip is still used for the small icon buttons in the project header
 // (Select/Change directory, Rename project). Cards themselves don't use it —
@@ -333,18 +334,13 @@ function makeHomePreviewTabId(projectId: string, historyId: number): string {
   return `home-preview:${projectId}:${historyId}`;
 }
 
-// Color configs matching TabBar
-const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
-  default: { bgColor: 'rgba(255,255,255,0.05)', borderColor: '#666' },
-  red: { bgColor: 'rgba(239, 68, 68, 0.2)', borderColor: 'rgb(239, 68, 68)' },
-  yellow: { bgColor: 'rgba(234, 179, 8, 0.2)', borderColor: 'rgb(234, 179, 8)' },
-  green: { bgColor: 'rgba(34, 197, 94, 0.2)', borderColor: 'rgb(34, 197, 94)' },
-  blue: { bgColor: 'rgba(59, 130, 246, 0.2)', borderColor: 'rgb(59, 130, 246)' },
-  purple: { bgColor: 'rgba(168, 85, 247, 0.2)', borderColor: 'rgb(168, 85, 247)' },
-  claude: { bgColor: 'rgba(218, 119, 86, 0.2)', borderColor: '#DA7756' },
-  gemini: { bgColor: 'rgba(78, 134, 248, 0.2)', borderColor: '#4E86F8' },
-  codex: { bgColor: 'rgba(16, 163, 127, 0.18)', borderColor: '#10A37F' },
-};
+// Archived color strings can outlive the palette. Resolve through the shared
+// registry; preserve Home's existing neutral card fill without changing or
+// discarding the saved color used by preview/restore.
+function homeCardColor(color: string | null | undefined) {
+  const config = getTabChromeColorConfig({ color: color ?? undefined });
+  return config.color === 'default' ? { ...config, bgColor: 'rgba(255,255,255,0.05)' } : config;
+}
 
 function withAlpha(color: string, alpha: number): string {
   const rgba = color.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
@@ -1964,8 +1960,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                       style={{ height: '100%' }}
                       data={displayedIterations}
                       itemContent={(index, entry) => {
-                        const color = (entry.color || 'default') as TabColor;
-                        const colorConfig = TAB_COLORS[color];
+                        const colorConfig = homeCardColor(entry.color);
                         const { date, time } = formatShortStamp(entry.closed_at);
                         const selected = selectedPreview?.entry.id === entry.id && selectedPreview?.targetUuid === entry.entryUuid;
                         const hoverKey = makeIterationHoverKey(entry);
@@ -2033,8 +2028,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                         : { startIndex: range.startIndex, endIndex: range.endIndex }
                     ))}
                     itemContent={(index, entry) => {
-                      const color = (entry.color || 'default') as TabColor;
-                      const colorConfig = TAB_COLORS[color];
+                      const colorConfig = homeCardColor(entry.color);
                       const meta = entry.session_status
                         ? sessionStatuses.find((s) => s.id === entry.session_status)
                         : null;
@@ -2430,7 +2424,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
               height,
               zIndex: 120,
               background: '#151515',
-              border: `1px solid ${withAlpha(TAB_COLORS[(hovered.color || 'default') as TabColor].borderColor, 0.55)}`,
+              border: `1px solid ${withAlpha(homeCardColor(hovered.color).borderColor, 0.55)}`,
               borderRadius: 6,
               boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
               padding: 10,

@@ -5,9 +5,46 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { adjustRgbaAlpha, flattenRgbaOnTabbarPanel, getTabChromeColorConfig } from './tabChrome';
 import { resolveTabCardBackground } from '../../utils/tabCardVisual.mjs';
 import { requestRowLinkStyle } from './RequestTrackerRow';
+import { cancelTabMessageSourceJump, jumpToTabMessageSource } from '../../utils/tabMessageSourceJump';
+import { useUIStore } from '../../store/useUIStore';
 
-type Source = { sourceTabId: string; sourceTabName?: string | null; sourceProjectId?: string | null };
-const { ipcRenderer } = window.require('electron');
+type Source = { sourceTabId: string; sourceTabName?: string | null; sourceProjectId?: string | null; messageId?: string };
+
+export function HistoryPromptSource({ source, phase, onNavigate }: {
+  source: Partial<Source> & { label?: string }; phase?: string; onNavigate?: () => void;
+}) {
+  const incoming = phase === 'question' || phase === 'request';
+  const response = phase === 'reply' || phase === 'completion' || phase === 'failure';
+  const Icon = incoming ? ArrowDownLeft : response ? ArrowUpRight : null;
+  const [jumping, setJumping] = useState(false);
+  const jump = async () => {
+    setJumping(true);
+    try {
+      if (await jumpToTabMessageSource(source)) onNavigate?.();
+    } catch (error) {
+      useUIStore.getState().showToast('Не удалось найти исходный вызов MCP', 'error', 4000,
+        false, undefined, undefined, undefined, undefined, undefined, error instanceof Error ? error.message : String(error));
+    } finally { setJumping(false); }
+  };
+  const direction = incoming ? 'incoming-request' : 'response';
+  const iconStyle = { display: 'grid', placeItems: 'center', width: 24, height: 24, flexShrink: 0, color: '#a3a3a3' };
+  return <div data-history-tab-message-source style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, marginBottom: 6 }}>
+    {Icon && (source.messageId && source.sourceTabId ? <button type="button"
+      data-history-source-direction={direction} data-tab-message-source-jump={source.messageId}
+      aria-label={`Перейти к вызову MCP: ${source.sourceTabName || source.sourceTabId}`} aria-busy={jumping}
+      title="Перейти к исходному вызову MCP" onMouseDown={event => event.stopPropagation()}
+      onClick={event => { event.stopPropagation(); void jump(); }}
+      style={{ ...iconStyle, padding: 0, border: 0, borderRadius: 4, background: 'transparent', cursor: 'pointer' }}>
+      <Icon size={14} strokeWidth={2.2} aria-hidden="true" />
+    </button> : <span data-history-source-direction={direction}
+      title={incoming ? 'Запрос к вам' : 'Ответ на ваш запрос'}
+      style={iconStyle}>
+      <Icon size={14} strokeWidth={2.2} aria-hidden="true" />
+    </span>)}
+    {source.sourceTabId ? <TabMessageSourceChip source={source as Source} onNavigate={onNavigate} />
+      : <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#c4b5fd' }}>{source.label}</span>}
+  </div>;
+}
 
 function findSourceProject(state: Pick<ReturnType<typeof useWorkspaceStore.getState>, 'openProjects'>, source: Source) {
   if (source.sourceProjectId && state.openProjects.get(source.sourceProjectId)?.tabs.has(source.sourceTabId)) {
@@ -37,21 +74,14 @@ export function TabMessageSourceChip({ source, onNavigate, variant = 'chip', inc
   const Icon = error ? CircleAlert : row ? incoming ? ArrowDownLeft : ArrowUpRight : SquareTerminal;
   const navigate = async () => {
     if (opening) return;
+    cancelTabMessageSourceJump();
     setError('');
     setOpening(true);
     try {
-      const state = useWorkspaceStore.getState();
-      const candidateProjectId = findSourceProject(state, source) || source.sourceProjectId;
-      if (!candidateProjectId) throw new Error('Проект источника недоступен');
-      if (!state.openProjects.has(candidateProjectId)) {
-        const project = await ipcRenderer.invoke('project:getById', candidateProjectId);
-        if (!project?.path) throw new Error('Проект источника не найден');
-        await state.openProject(candidateProjectId, project.path, { background: true });
-      }
-      const latest = useWorkspaceStore.getState();
-      const currentProjectId = findSourceProject(latest, source);
-      if (!currentProjectId) throw new Error('Вкладка источника закрыта');
-      latest.placeTab(currentProjectId, source.sourceTabId);
+      const opened = await useWorkspaceStore.getState().openTabById(source.sourceTabId, {
+        projectId: source.sourceProjectId, reason: 'tab-message-source',
+      });
+      if (!opened) throw new Error('Вкладка источника закрыта или недоступна');
       onNavigate?.();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));

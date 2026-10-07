@@ -69,6 +69,8 @@ async function harness(t) {
   const webCtx = vm.createContext({
     projectManager: { db: manager }, projectCardSignals: cards,
     publicTabActivity: null, observeTabActivityStyle: () => {}, tabActivityProjection: () => ({}),
+    workspaceSwitcherWake: () => ({ version: 1, epoch: 'private-switcher', revision: 0, available: false }),
+    runAfterWake: () => ({ version: 1, epoch: null, sequence: 0, revalidate: true }),
     console: ctx.console, Map, Date, JSON,
     decId: decodeURIComponent, sdkSessions: new Map(),
     bridgeRequest: async action => {

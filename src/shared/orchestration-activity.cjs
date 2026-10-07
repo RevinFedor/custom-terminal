@@ -18,7 +18,7 @@ function isSourceNotificationBlocked(run) {
 }
 function isOrchestrationInheritedActivity(run) {
   if (!isSeparateSourceRun(run) || run?.resumeAwaitingNewTurn === true) return false;
-  if (run?.status === 'queued' && !run.deliveryAcceptedAt && !run.targetPromptProofAt) return false;
+  if (['queued', 'sending'].includes(run?.status) && !run.deliveryAcceptedAt && !run.targetPromptProofAt) return false;
   return INHERITED_ACTIVE.has(run.status) || isOrchestrationResultProofPending(run) || isSourceFollowupPending(run);
 }
 function isOrchestrationCompletionBlocking(run) {

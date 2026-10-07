@@ -1,4 +1,32 @@
-# Feature: Project Home View
+# Feature: Общий архив, избранное и legacy Project Home
+
+## Общий вход после workflow cutover
+
+Home теперь отвечает за Storage и создание workflow. Закрытые вкладки и favorites
+доступны в общем архиве с фильтрами workflow/cwd/провайдера, read-only History/Timeline
+и явным Restore. Прежний ProjectHome UI ниже — историческая поверхность; его
+индексы и адресные archive records сохраняются в новом входе. Preview/search сами
+не запускают provider; favorite и history не дедуплицируются по имени.
+
+Архив адресуется exact namespace + historyId, не cwd или workflow. Restore
+сохраняет execution snapshot и накладывает актуальные редактируемые name/notes,
+включая пустую заметку. First claim хранит metadata baseline до materialization:
+lease release/restart перед первым sync не превращает последующую правку архива
+в уже перенесённую. Независимая более новая live-правка вызывает конфликт с
+сохранением обеих версий. Архив потребляется только после owner/files/metadata
+ACK; finish имеет durable same-ID receipt.
+
+Очистка показывает полный storage scope namespace: число и все cwd, включая
+file history rows, которые обычный список скрывает. Confirmation замораживает
+scope/IDs/hash и requestId; изменение selector не меняет подтверждаемое действие.
+Main проверяет полный состав/notes и активные restore leases до удаления.
+Except-notes сохраняет whitespace notes, удаляя только NULL/пустые. Unknown ACK
+повторяется с тем же запросом и receipt reader; новый ID не проверяет старый исход.
+
+## Legacy ProjectHome
+
+Следующие UI-описания относятся к ProjectHome до cutover. Они не определяют
+расположение общего архива или Favorites в новом shell.
 
 ## Intro
 Центральный экран управления текущим проектом, сейчас сфокусирован на истории закрытых вкладок и read-only предпросмотре содержимого. Home больше не пытается быть мини-дашбордом Active/Favorites/History: основной use case — быстро найти закрытую вкладку по названию или итерации, посмотреть History/Timeline без открытия терминала, затем явно восстановить её.
@@ -43,6 +71,22 @@ visual-parent/детей и место в прежнем существующе�
 Background restore вставляет чип без смены показанного содержимого и фокуса.
 Удалённые группы/окна не пересоздаются, архивы без метаданных расположения
 сохраняют прежний fallback. Resume-policy Home по-прежнему `always`.
+
+## Цвет сохранённой карточки не блокирует Home
+
+Закрытая запись хранит цвет строкой, и эта строка может пережить версию
+палитры. В инциденте05.10.2026 Home падал целиком при показе такой карточки:
+локальная таблица возвращала undefined, а Virtuoso `itemContent` читал
+`colorConfig.bgColor`. Installed stack указал именно history-row; прежний код
+в приватном Electron воспроизвёл тот же TypeError на неизвестном цвете.
+TypeScript `as TabColor` не проверяет пришедшую строку во время выполнения.
+
+History, iteration results и Cmd-hover iteration preview используют общий
+`getTabChromeColorConfig` через Home-boundary: неизвестный/пустой цвет рисуется
+нейтральным. Нейтральный Home-fill остаётся прежним; известные оттенки берутся
+из общего реестра, без второй палитры. Fallback меняет только отрисовку:
+запись не удаляется, исходный color не переписывается, поиск/выбор остаются
+доступны. Нельзя чинить этот сбой очисткой истории или скрытием всей карточки.
 
 ## Title Search
 

@@ -35,6 +35,12 @@ async function harness(t, { startupFailure = false, queued = false } = {}) {
     requestFingerprint: '', provider: 'codex', sessionId: null,
     promptHash: promptAuditFingerprint(body.prompt), promptLength: body.prompt.length };
   const context = {
+    // This fixture exercises pre-migration creation/late delivery. Migrated
+    // context resolution uses actual SQLite in workflow-organization-http.native.test.
+    require: name => {
+      if(name==='./project-manager')return {workflowOrganization:null};
+      throw new Error('Unexpected fixture dependency: '+name);
+    },
     ...receipts, AGENT_SEND_RECEIPT_STATES: receipts.RECEIPT_STATES,
     bindStructuredAuthoringPresentation: require('./structured-authoring').bindStructuredAuthoringPresentation,
     withPromptOriginPresentation: require('./history-prompt-presentations').withPromptOriginPresentation,

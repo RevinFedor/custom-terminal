@@ -293,16 +293,16 @@ function groupCodexPreferredUserMessageAuditRecords(candidates) {
   for (const candidate of source) {
     if (candidate?.record?.type !== 'response_item') continue;
     const text = codexUserMessageAuditText(candidate.record);
-    const responseOffset = codexUserCarrierCandidatePosition(candidate);
     const paired = events.find((event) => {
       if (event.claimed || !codexUserCarrierTextsMatch(text, event.text)) return false;
       if (candidate.turnSegment != null
         && event.candidate.turnSegment != null
         && candidate.turnSegment !== event.candidate.turnSegment) return false;
-      const eventOffset = codexUserCarrierCandidatePosition(event.candidate);
-      return !Number.isFinite(responseOffset)
-        || !Number.isFinite(eventOffset)
-        || eventOffset >= responseOffset;
+      // A first start can bridge response -> event, never an event from the
+      // preceding turn to a response after that start (the live grammar).
+      if (event.candidate.taskStartedSeen === false && candidate.taskStartedSeen === true
+        && codexUserCarrierCandidatePosition(event.candidate) < codexUserCarrierCandidatePosition(candidate)) return false;
+      return true;
     });
     if (paired) {
       paired.claimed = true;
@@ -509,6 +509,8 @@ function consumeCodexUserMessageAuditChunk({
   partial = '',
   partialStartOffset = null,
   preservePartialBytes = false,
+  initialTurnSegment = 0,
+  initialTaskStartedSeen = false,
 } = {}) {
   const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk || ''), 'utf8');
   const carried = Buffer.isBuffer(partial) ? partial : Buffer.from(String(partial || ''), 'utf8');
@@ -519,8 +521,9 @@ function consumeCodexUserMessageAuditChunk({
     ? Number(partialStartOffset)
     : Math.max(0, Number(incomingStartOffset) || 0);
   const records = [];
-  let turnSegment = 0;
-  let taskStartedSeen = false;
+  let turnSegment = initialTurnSegment;
+  const boundaries = [];
+  let taskStartedSeen = initialTaskStartedSeen;
   let lineStart = 0;
   let newlineIndex = combined.indexOf(0x0a, lineStart);
   while (newlineIndex >= 0) {
@@ -529,13 +532,16 @@ function consumeCodexUserMessageAuditChunk({
       try {
         const record = JSON.parse(text);
         const lifecycleType = record?.type === 'event_msg' ? record?.payload?.type : null;
+        if (['task_started', 'task_complete', 'turn_aborted', 'thread_rolled_back'].includes(lifecycleType)) {
+          boundaries.push({ record, byteOffset: combinedStartOffset + lineStart });
+        }
         if (lifecycleType === 'task_started') {
           // Codex may persist the user carrier immediately before its first
           // task_started. Keep that pair together, but a second start without a
           // terminal record is still a hard boundary to a new provider turn.
           if (taskStartedSeen) turnSegment += 1;
           taskStartedSeen = true;
-        } else if (lifecycleType === 'task_complete' || lifecycleType === 'turn_aborted') {
+        } else if (['task_complete', 'turn_aborted', 'thread_rolled_back'].includes(lifecycleType)) {
           turnSegment += 1;
           taskStartedSeen = false;
         }
@@ -547,6 +553,7 @@ function consumeCodexUserMessageAuditChunk({
             record,
             byteOffset: combinedStartOffset + lineStart,
             turnSegment,
+            taskStartedSeen,
           });
         }
       } catch {
@@ -561,6 +568,9 @@ function consumeCodexUserMessageAuditChunk({
   const remaining = combined.subarray(lineStart);
   return {
     records,
+    boundaries,
+    turnSegment,
+    taskStartedSeen,
     partial: preservePartialBytes ? Buffer.from(remaining) : remaining.toString('utf8'),
     partialStartOffset: combinedStartOffset + lineStart,
   };

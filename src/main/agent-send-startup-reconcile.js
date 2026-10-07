@@ -22,6 +22,7 @@ const {
   isCodexEnvironmentContextUserText,
   isCodexProjectInstructionsUserText,
   consumeCodexUserMessageAuditChunk,
+  groupCodexPreferredUserMessageAuditRecords,
   selectCodexPreferredUserMessageAuditRecords,
   selectCodexPendingPromptAudit,
 } = require('./codex-prompt-audit');
@@ -331,11 +332,72 @@ function validateCompleteJsonl(text) {
   return { ok: true };
 }
 
+async function readCodexPairingContext(handle, boundaryOffset) {
+  const chunkBytes = 256 * 1024;
+  let position = boundaryOffset, carry = Buffer.alloc(0), nearestStart = null, startOffset = 0, bytesRead = 0;
+  // Walk back only to a lifecycle reset (or the previous start). The first
+  // task_started can follow an early response carrier and is not a reset.
+  backward: while (position > 0) {
+    const length = Math.min(chunkBytes, position);
+    position -= length;
+    const read = await readFully(handle, position, length);
+    if (read.bytesRead !== length) return { ok: false, reason: 'transcript-changed-during-read' };
+    bytesRead += length;
+    const buffer = carry.length ? Buffer.concat([read.buffer, carry]) : read.buffer;
+    let end = buffer.length - 1;
+    while (end >= 0) {
+      const start = buffer.lastIndexOf(0x0a, end - 1) + 1;
+      if (start === 0 && position > 0) { carry = buffer.subarray(0, end + 1); break; }
+      const line = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(start, end)).trim();
+      if (line) {
+        const record = JSON.parse(line);
+        const type = record.type === 'event_msg' ? record.payload?.type : null;
+        if (['task_complete', 'turn_aborted', 'thread_rolled_back'].includes(type)) {
+          startOffset = position + end + 1;
+          break backward;
+        }
+        if (type === 'task_started') {
+          if (nearestStart !== null) { startOffset = nearestStart; break backward; }
+          nearestStart = position + start;
+        }
+      }
+      end = start - 1;
+      if (end < 0) carry = Buffer.alloc(0);
+    }
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const records = [];
+  let partial = Buffer.alloc(0), partialStartOffset = startOffset, turnSegment = 0, taskStartedSeen = false;
+  for (let offset = startOffset; offset < boundaryOffset;) {
+    const length = Math.min(chunkBytes, boundaryOffset - offset);
+    const read = await readFully(handle, offset, length);
+    if (read.bytesRead !== length) return { ok: false, reason: 'transcript-changed-during-read' };
+    bytesRead += length;
+    const consumed = consumeCodexUserMessageAuditChunk({ chunk: read.buffer, incomingStartOffset: offset,
+      partial, partialStartOffset, preservePartialBytes: true,
+      initialTurnSegment: turnSegment, initialTaskStartedSeen: taskStartedSeen });
+    for (const candidate of consumed.records) {
+      const record = candidate.record;
+      const text = codexUserMessageAuditText(record);
+      // No assistant/tool bodies or image data URLs survive the context scan.
+      records.push({ ...candidate, record: { type: record.type, uuid: record.uuid, id: record.id,
+        timestamp: record.timestamp, payload: record.type === 'event_msg'
+          ? { type: 'user_message', message: text } : { type: 'message', role: 'user', text } } });
+    }
+    ({ partial, partialStartOffset, turnSegment, taskStartedSeen } = consumed);
+    offset += length;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  if (partial.length) return { ok: false, reason: 'transcript-boundary-not-line-aligned' };
+  return { ok: true, records, turnSegment, taskStartedSeen, bytesRead, startOffset };
+}
+
 async function readBoundedCausalPrefix(
   transcriptPath,
   boundaryOffset,
   maxReadBytes,
   causalUpperBoundaryOffset = null,
+  codexPairingContext = false,
 ) {
   let handle = null;
   try {
@@ -414,11 +476,17 @@ async function readBoundedCausalPrefix(
     }
     const jsonl = validateCompleteJsonl(text);
     if (!jsonl.ok) return jsonl;
-    const after = await handle.stat();
+    const pairingContext = codexPairingContext ? await readCodexPairingContext(handle, boundaryOffset) : null;
+    if (pairingContext?.ok === false) return pairingContext;
+    const [after, pathAfter] = await Promise.all([handle.stat(), fs.promises.stat(transcriptPath)]);
     if (
       Number(after.size) !== fileSize
       || Number(after.mtimeMs) !== Number(before.mtimeMs)
       || Number(after.ino) !== Number(before.ino)
+      || Number(after.ctimeMs) !== Number(before.ctimeMs)
+      || pathAfter.dev !== before.dev || pathAfter.ino !== before.ino
+      || pathAfter.size !== before.size || pathAfter.mtimeMs !== before.mtimeMs
+      || pathAfter.ctimeMs !== before.ctimeMs
     ) {
       return { ok: false, reason: 'transcript-changed-during-read' };
     }
@@ -436,6 +504,7 @@ async function readBoundedCausalPrefix(
       causalUpperBoundaryOffset: requestedUpper,
       mtimeMs: Number(before.mtimeMs),
       ino: Number(before.ino),
+      ...(pairingContext ? { pairingContext } : {}),
     };
   } catch (error) {
     return {
@@ -500,6 +569,8 @@ function evidenceFor(boundary, snapshot, candidateCount, matchCount) {
       ? snapshot.bytesRead
       : snapshot.postBoundaryBytes,
     postBoundaryBytes: snapshot.postBoundaryBytes,
+    ...(snapshot.pairingContext ? { pairingContextStartOffset: snapshot.pairingContext.startOffset,
+      pairingContextBytesRead: snapshot.pairingContext.bytesRead } : {}),
     rangeComplete: snapshot.rangeComplete !== false,
     scanEndOffset: snapshot.scanEndOffset ?? snapshot.fileSize,
     causalUpperBoundaryOffset: snapshot.causalUpperBoundaryOffset ?? null,
@@ -895,6 +966,7 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     validated.fileSize,
     maxReadBytes,
     options.causalUpperBoundaryOffset,
+    true,
   );
   if (!snapshot.ok) return unknown(context.record, snapshot.reason, snapshot);
   if (snapshot.causalRangeBytes === 0) {
@@ -906,6 +978,8 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
   const consumed = consumeCodexUserMessageAuditChunk({
     chunk: snapshot.text,
     incomingStartOffset: validated.fileSize,
+    initialTurnSegment: snapshot.pairingContext?.turnSegment,
+    initialTaskStartedSeen: snapshot.pairingContext?.taskStartedSeen,
   });
   if (consumed.partial) {
     return unknown(context.record, 'transcript-post-boundary-partial-line');
@@ -926,7 +1000,10 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     preSubmitBoundary: context.boundary,
   };
   const matches = [];
-  const preferredCandidates = selectCodexPreferredUserMessageAuditRecords(consumed.records)
+  const carrierGroups = groupCodexPreferredUserMessageAuditRecords([
+    ...(snapshot.pairingContext?.records || []), ...consumed.records,
+  ]);
+  const preferredCandidates = carrierGroups.filter(group => group.firstIndex >= validated.fileSize).map(group => group.candidate)
     .filter(candidate => {
       // On cold launch Codex writes project/environment context as role=user
       // response_items before the actual user message. These same reserved
@@ -991,6 +1068,9 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     timestamp: match.candidate.record?.timestamp,
     canonicalReason: match.canonicalReason,
   });
+  const aliases = carrierGroups.find(group => group.candidate === match.candidate)?.aliases || [];
+  audit.entryUuidAliases = aliases.map(alias => alias.record?.uuid || alias.record?.id).filter(Boolean);
+  audit.sourceIdentityAliases = aliases.map(alias => `codex-user-source-${context.sessionId}-${alias.byteOffset}`);
   if (context.imageRequestProjection) {
     audit.transportExpectedHash = context.transportHash;
     audit.transportExpectedLen = context.transportLength;

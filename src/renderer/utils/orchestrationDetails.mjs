@@ -54,6 +54,7 @@ export function orchestrationOutcomeText(run) {
   const reason = text(run.completionReason);
   const label = Object.hasOwn(OUTCOMES, outcome) ? OUTCOMES[outcome] : outcome;
   if (!reason || reason === outcome) return label;
+  if (outcome === 'interrupted' && reason === 'turn_aborted') return label;
   if (outcome === 'success' && ['task_complete', 'turn-complete', 'external-research-done'].includes(reason)) return label;
   return [label, Object.hasOwn(REASONS, reason) ? REASONS[reason] : reason].filter(Boolean).join(': ');
 }
@@ -95,6 +96,8 @@ export function orchestrationDetailRows(run, tabId) {
     ['Связь с SC Desktop', run.externalResearchTransportError],
   ]) {
     const message = text(value);
+    if (['Выполнение', 'Результат'].includes(label) && message === 'turn_aborted'
+      && run.outcome === 'interrupted' && run.completionReason === 'turn_aborted') continue;
     if (!message || issues.has(message)) continue;
     issues.set(message, label);
   }

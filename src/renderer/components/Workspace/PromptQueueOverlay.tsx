@@ -17,14 +17,12 @@ import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQue
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { claudeEffortsForModel } from '../../constants/claudeLevels';
-import { CODEX_EFFORT_LEVELS, mergeCodexModelOptions } from '../../constants/codexSettings';
+import { runAfterActionModels } from '../../utils/runAfterActionModels';
+import { sendQueuedPromptNow } from '../../utils/runAfterSendNow';
 import { isTabBusyNow, signalPromptQueueDictationResolved } from '../../hooks/usePromptQueueRunner';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
 import { queueItemDependencyTarget } from '../../utils/runAfterDependencyLayout.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
-import { sendAgentPromptScenario } from '../../utils/agentScenarios';
-import { AGENT_SETTINGS_INTENT_NONE } from '../../utils/agentSendSettingsContract';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { generateTitleFromPromptWithConfig, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import {
@@ -68,18 +66,14 @@ import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlac
 import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
 import { pointInHoverCluster, pointInRect } from '../../utils/hoverBridge.mjs';
 import { captureQueueHoverReturn, createHoverReturnGate } from '../../utils/hoverReturnGate.mjs';
-import { shouldDisarmAfterTriggerClear } from '../../utils/runAfterTriggerClear.mjs';
 import { consumePromptQueueMiddleClick } from '../../utils/promptQueueMiddleClick.mjs';
 import { getAppRuntimeIdentity } from '../../utils/appRuntimeIdentity';
 import { shouldArmQueueForTrigger } from '../../utils/promptTriggerArm.mjs';
 import {
   getHistoryPromptHandoffsSnapshot,
-  historyPromptHandoffInitialStatus,
-  runHistoryPromptHandoff,
   subscribeHistoryPromptHandoffs,
 } from '../../utils/historyPromptHandoffs';
 import {
-  buildPromptQueueReceiptHandoffId,
   selectPromptQueueTransportProgress,
 } from '../../utils/promptQueueReceiptIdentity.mjs';
 import {
@@ -589,33 +583,10 @@ export function PromptQueueOverlay({
     };
   }, [sessionType, tabId]);
   const queuedModelEffortSupported = sessionType === 'codex' || queueProviderType === 'anthropic';
-  const queueSettingsModels = useMemo<QueueSettingsModel[]>(() => {
-    if (sessionType === 'claude') {
-      if (queueProviderType !== 'anthropic') return [];
-      return claudeCodeSettings.models
-        .filter((model) => model.visible !== false)
-        .map((model) => ({
-          id: model.id,
-          label: model.label || model.id,
-          efforts: claudeEffortsForModel(model),
-        }))
-        .filter((model) => model.id && model.efforts.length > 0);
-    }
-    return mergeCodexModelOptions(
-      liveCodexModels,
-      codexSettings.models,
-      codexSettings.removedModelIds,
-    )
-      .filter((model) => model.visible !== false)
-      .map((model) => ({
-        id: model.id,
-        label: model.label || model.id,
-        efforts: model.efforts?.filter(Boolean).length
-          ? model.efforts.filter(Boolean)
-          : [...CODEX_EFFORT_LEVELS],
-      }))
-      .filter((model) => model.id && model.efforts.length > 0);
-  }, [claudeCodeSettings.models, codexSettings.models, codexSettings.removedModelIds, liveCodexModels, queueProviderType, sessionType]);
+  const queueSettingsModels = useMemo<QueueSettingsModel[]>(() => runAfterActionModels({
+    provider: sessionType, providerType: queueProviderType,
+    claudeSettings: claudeCodeSettings, codexSettings, liveCodexModels,
+  }), [claudeCodeSettings.models, codexSettings.models, codexSettings.removedModelIds, liveCodexModels, queueProviderType, sessionType]);
   const metaSettingsModel = useMemo(
     () => queueSettingsModels.find((model) => model.id === metaSettingsModelId) ?? null,
     [metaSettingsModelId, queueSettingsModels],
@@ -961,18 +932,14 @@ export function PromptQueueOverlay({
     if (!live.autoRun) setAutoRun(tabId, true);
   }, [agentBusy, setAutoRun, tabId]);
 
-  const requestQueuedRewindTarget = useCallback(() => {
+  const requestQueuedRewindTarget = useCallback(async () => {
     const requestId = 'pq-rewind-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
     setRewindTargetRequestId(requestId);
     setMetaActionsMenu(null);
     if (embedded) {
-      const workspace = useWorkspaceStore.getState();
-      for (const [projectId, project] of workspace.openProjects) {
-        if (project.tabs.has(tabId)) {
-          workspace.placeTab(projectId, tabId);
-          useUIStore.getState().setActiveArea('workspace');
-          break;
-        }
+      if (!(await useWorkspaceStore.getState().openTabById(tabId,{reason:'queued-rewind'}))) {
+        setRewindTargetRequestId(current => current === requestId ? null : current);
+        return;
       }
     }
     publishQueuedRewindTarget(tabId, requestId);
@@ -1084,17 +1051,7 @@ export function PromptQueueOverlay({
   }, [removePrompt, removeHoverId, tabId]);
 
   const clearItemTrigger = useCallback((id: string) => {
-    setPromptTrigger(tabId, id, null);
-    // Clearing the only runnable item's trigger must not accidentally arm
-    // plain turn-end execution. Both the cross and middle click use this path.
-    const live = usePromptQueueStore.getState().getQueue(tabId);
-    const runnableCount = live.items.filter(isQueuedPromptEnabled).length;
-    if (live.autoRun && shouldDisarmAfterTriggerClear({ runnableCount })) {
-      if (live.firstDelayCountdownAt !== null) {
-        usePromptQueueStore.getState().cancelFirstDelayCountdown(tabId);
-      }
-      setAutoRun(tabId, false);
-    }
+    usePromptQueueStore.getState().clearPromptTrigger(tabId, id);
     setOnTabTriggerDraftIds((current) => {
       if (!current.has(id)) return current;
       const next = new Set(current);
@@ -1107,7 +1064,7 @@ export function PromptQueueOverlay({
       next.delete(id);
       return next;
     });
-  }, [setPromptTrigger, setAutoRun, tabId]);
+  }, [tabId]);
 
   const generateRunAfterTitle = useCallback((id: string, opts?: { force?: boolean }) => {
     const queuedItem = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === id);
@@ -2090,59 +2047,9 @@ export function PromptQueueOverlay({
       if (replaySurface === 'terminal') {
         focusActiveTerminal(submitNow ? 'replay-submit-before-ipc' : 'replay-before-ipc');
       }
-      const presentationText = serializeComposerDraft({
-        text: validation.item.text,
-        chips: validation.item.chips || [],
-      }).trim();
       let res: any;
       if (submitNow) {
-        const workspace = Array.from(useWorkspaceStore.getState().openProjects.values())
-          .find((candidate) => candidate.tabs.has(tabId));
-        const tab = workspace?.tabs.get(tabId);
-        const runtime = getHistoryAgentRuntime(sessionType);
-        const presence = await runtime.getPresence(tabId).catch(() => null);
-        const statusAtSend = presence?.status || 'unknown';
-        const sessionIdHint = sessionType === 'codex'
-          ? (tab?.codexSessionId || null)
-          : (tab?.claudeSessionId || null);
-        const handoffId = buildPromptQueueReceiptHandoffId({
-          kind: 'queue',
-          itemId: id,
-          payload,
-        });
-        res = await runHistoryPromptHandoff({
-          tabId,
-          handoffId,
-          toolType: sessionType,
-          sessionIdHint,
-          text: presentationText,
-          promptChips: validation.item.chips || [],
-          imagePaths: validation.item.imagePaths || [],
-          submittedAt: Date.now(),
-          source: 'prompt-queue',
-          statusAtSend,
-          initialStatus: historyPromptHandoffInitialStatus(statusAtSend),
-          send: (exactHandoffId) => sendAgentPromptScenario({
-            tabId,
-            toolType: sessionType,
-            runtime,
-            sessionId: sessionIdHint,
-            cwd: tab?.cwd,
-            prompt: payload,
-            handoffId: exactHandoffId,
-            source: 'prompt-queue',
-            promptQueueAction: 'send-now',
-            statusAtSend,
-            queue: statusAtSend === 'busy',
-            settingsIntent: AGENT_SETTINGS_INTENT_NONE,
-            returnDraftOnConflict: false,
-            presentationSnapshot: {
-              historySessionId: sessionIdHint,
-              promptChips: validation.item.chips || [],
-              imagePaths: validation.item.imagePaths || [],
-            },
-          }),
-        });
+        res = await sendQueuedPromptNow(tabId, validation.item, sessionType);
       } else {
         res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, payload, {
           submit: false,
@@ -2772,15 +2679,11 @@ export function PromptQueueOverlay({
   // Copy moved to InfoPanel — see Copy prompt button next to Copy Session.
 
   // Toggle Run-after. If user disarms while a first-delay countdown is running,
-  // freeze the remaining seconds back into firstDelaySeconds via the store so
-  // the input shows "what's left" (not the original value).
+  // the existing store freezes the enabled-head/legacy countdown atomically,
+  // so local and remote Pause cannot disagree about what remains.
   const toggleAutoRun = useCallback(() => {
     const next = !autoRun;
     if (next && activeItemCount === 0) return;
-    const q = usePromptQueueStore.getState().getQueue(tabId);
-    if (!next && q.firstDelayCountdownAt !== null) {
-      usePromptQueueStore.getState().cancelFirstDelayCountdown(tabId);
-    }
     setAutoRun(tabId, next);
     if (next) {
       setArmedFlash(true);
@@ -4338,7 +4241,7 @@ export function PromptQueueOverlay({
             {chipContextItem.trigger && (
               <button
                 onClick={() => {
-                  setPromptTrigger(tabId, chipContextItem.id, null);
+                  clearItemTrigger(chipContextItem.id);
                   setTimerTriggerDraftIds((current) => {
                     const next = new Set(current);
                     next.delete(chipContextItem.id);

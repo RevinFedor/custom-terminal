@@ -10,6 +10,7 @@ import * as spaces from '../utils/workspaceSpacesModel.mjs';
 import { dropFromMru } from '../utils/tabSwitcherModel.mjs';
 import { commitArchiveWithStopRetry, isDurableSaveTabsAck } from '../utils/tabPersistenceTransactions.mjs';
 import { stopAiBeforeTerminalKill } from '../utils/terminalCloseLifecycle.mjs';
+import { collectTabLinkedFiles } from '../utils/tabLinkedFiles.mjs';
 import ts from 'typescript';
 
 const appSource=fs.readFileSync(process.env.NOTED_REOPEN_BASELINE_APP || new URL('../App.tsx',import.meta.url),'utf8');
@@ -69,7 +70,7 @@ function fixture() {
   };
   const module = { exports: {} };
   vm.runInNewContext(code, { module, console: { log() {}, warn() {}, error() {} },
-    ...placement, ...panes, ...spaces, dropFromMru, commitArchiveWithStopRetry, isDurableSaveTabsAck, stopAiBeforeTerminalKill,
+    ...placement, ...panes, ...spaces, dropFromMru, collectTabLinkedFiles, commitArchiveWithStopRetry, isDurableSaveTabsAck, stopAiBeforeTerminalKill,
     get: () => state, set: patch => Object.assign(state, patch), startTransition: fn => fn(),
     saveTabs: persist, saveTabsThenNotifyProjectLayoutChanged: persist, notifyProjectLayoutChanged() {},
     clearPendingAutoTabTitle() {}, autoTabTitleIntents: new Map(),

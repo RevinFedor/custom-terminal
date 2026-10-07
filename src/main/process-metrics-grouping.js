@@ -53,8 +53,49 @@ function isSharedService(item) {
   return matchesAny(SHARED_SERVICE_PATTERNS, item.execPath) || matchesAny(SHARED_SERVICE_PATTERNS, item.commandLine);
 }
 
+/** MCP запущен через uvx/npx: роль задаёт целевой пакет, не имя launcher. */
+function launchedMcpTarget(item) {
+  const source = item.commandLine || '';
+  const executable = (item.execPath || item.name || source.trim().split(/\s+/)[0] || '').split('/').pop();
+  if (!/^(uv|uvx|npx|npm|pnpm|yarn|bunx|node|python(?:\d+(?:\.\d+)?)?)$/.test(executable)) return null;
+  const args = (source.match(/"[^"]*"|'[^']*'|\S+/g) || []).map(arg => arg.replace(/^(["'])(.*)\1$/, '$2'));
+  if (args.length < 2) return null;
+  const alias = args[0].split('/').pop();
+  let at = 1;
+  if (executable === 'uv' && alias !== 'uvx') {
+    if (args[at] === 'tool' && ['run', 'uvx'].includes(args[at + 1])) at += 2;
+    else if (args[at] === 'run') at += 1;
+    else return null;
+  } else if (executable === 'npm') {
+    if (args[at] !== 'exec') return null;
+    at += 1;
+  } else if (['pnpm', 'yarn'].includes(executable)) {
+    if (args[at] !== 'dlx') return null;
+    at += 1;
+  }
+  const valueOptions = new Set(['--from', '--with', '--with-editable', '--with-requirements',
+    '--directory', '--project', '--python', '--cache-dir', '--index', '--index-url',
+    '--extra-index-url', '--config-file', '--package', '--registry', '-p', '-C',
+    '--require', '-r', '--import', '-X', '-W']);
+  while (at < args.length) {
+    const arg = args[at];
+    if (arg === '--') { at += 1; break; }
+    if (['-c', '-e', '--eval', '--print'].includes(arg)) return null;
+    if (arg === '-p' && executable === 'node') return null;
+    if (arg === '-m' && executable.startsWith('python')) { at += 1; break; }
+    if (valueOptions.has(arg)) { at += 2; continue; }
+    if (arg.startsWith('-')) { at += 1; continue; }
+    break;
+  }
+  const target = args[at];
+  if (!target) return null;
+  const base = target.split('/').pop().replace(/(?:@|==)[^/]*$/, '').replace(/\.(?:py|mjs|cjs|js)$/, '');
+  return /(?:^mcp(?:[-_.]|$)|[-_]mcp(?:[-_.]|$))/.test(base) ? target : null;
+}
+
 function isToolProcess(item) {
-  return matchesAny(TOOL_PATTERNS, item.execPath) || matchesAny(TOOL_PATTERNS, item.commandLine);
+  return matchesAny(TOOL_PATTERNS, item.execPath) || matchesAny(TOOL_PATTERNS, item.commandLine)
+    || launchedMcpTarget(item) !== null;
 }
 
 /**
@@ -65,6 +106,8 @@ function describeTool(item) {
   const source = item.commandLine || item.execPath || item.name || '';
 
   const known = [
+    [/yandex[-_]wiki[-_]search[-_]mcp/, 'Yandex Wiki'],
+    [/figma-console-mcp/, 'Figma Console'],
     [/yougile-mcp/, 'yougile'],
     [/knowledge-server\.mjs/, 'knowledge'],
     [/terminal-server\.mjs/, 'terminal'],
@@ -77,6 +120,9 @@ function describeTool(item) {
   for (const [pattern, label] of known) {
     if (pattern.test(source)) return label;
   }
+
+  const target = launchedMcpTarget(item);
+  if (target) return target.split('/').pop().replace(/(?:@|==).*$/, '').replace(/\.(?:py|mjs|cjs|js)$/, '');
 
   const scriptMatch = source.match(/([^\\/\s]+)\.(?:mjs|cjs|js)(?:\s|$)/);
   if (scriptMatch) return scriptMatch[1];
@@ -142,7 +188,7 @@ const MIN_COMMAND_ROW_BYTES = 12 * 1024 * 1024;
 function describeCommand(item) {
   const source = item.commandLine || '';
 
-  const runner = source.match(/(?:^|[\\/\s])(npm|pnpm|yarn|bun|npx)(?:-cli\.c?js)?\s+(.+)$/);
+  const runner = source.match(/(?:^|[\\/\s])(npm|pnpm|yarn|bun|npx|uvx|uv)(?:-cli\.c?js)?\s+(.+)$/);
   if (runner) {
     const rest = runner[2].trim().split(/\s+/).slice(0, 2).join(' ');
     return (runner[1] + ' ' + rest).trim();
@@ -150,7 +196,7 @@ function describeCommand(item) {
 
   // Расширение — часть пользовательского смысла: `main` выглядит как
   // безымянный системный процесс, а `main.js` сразу читается как скрипт.
-  const script = source.match(/([^\\/\s]+\.(?:mjs|cjs|js|ts|sh))(?:\s|$)/);
+  const script = source.match(/([^\\/\s]+\.(?:mjs|cjs|js|ts|sh|py))(?:\s|$)/);
   if (script) return script[1];
 
   // `node /…/node_modules/.bin/vite` — бинарь без расширения: именем служит

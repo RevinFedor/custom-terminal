@@ -85,6 +85,40 @@ test('reason and outcome preserve unknown codes but collapse equivalent success 
   assert.equal(orchestrationOutcomeText({}), '');
 });
 
+test('manual turn cancellation is an outcome, not an extra delivery/execution error', () => {
+  const run = Object.freeze({ sourceTabId: 'source', createdAt, status: 'cancelled',
+    outcome: 'interrupted', completionReason: 'turn_aborted', error: 'turn_aborted',
+    resultError: 'turn_aborted', notificationStatus: 'suppressed' });
+  const rows = orchestrationDetailRows(run, 'source');
+  assert.equal(rows.find(row => row.key === 'outcome').value, 'Остановлено вручную');
+  assert.equal(rows.find(row => row.key === 'notification').value, 'Отправка отменена');
+  assert.equal(rows.some(row => row.key === 'error'), false);
+  assert.equal(run.error, 'turn_aborted');
+  assert.equal(run.status, 'cancelled');
+});
+
+test('manual cancellation does not hide independent result or notification failures', () => {
+  const run = { sourceTabId: 'source', createdAt, status: 'cancelled', outcome: 'interrupted',
+    completionReason: 'turn_aborted', error: 'turn_aborted', resultError: 'Missing saved result',
+    notificationStatus: 'failed', notificationError: 'Source writer changed' };
+  const issue = orchestrationDetailRows(run, 'source').find(row => row.key === 'error');
+  assert.equal(issue.value, 'Результат: Missing saved result\n\nУведомление: Source writer changed');
+  assert.equal(orchestrationDetailRows({ ...run, resultError: null, notificationError: 'turn_aborted' }, 'source')
+    .find(row => row.key === 'error').value, 'Уведомление: turn_aborted');
+  assert.equal(orchestrationDetailRows({ ...run, resultError: null, notificationError: null,
+    externalResearchTransportError: 'turn_aborted' }, 'source').find(row => row.key === 'error').value, 'turn_aborted');
+});
+
+test('an unknown or mismatched abort reason remains visible rather than guessed cancellation', () => {
+  for (const run of [
+    { outcome: 'failed', completionReason: 'turn_aborted', error: 'turn_aborted' },
+    { outcome: 'interrupted', completionReason: 'future-abort', error: 'turn_aborted' },
+    { outcome: 'interrupted', completionReason: 'turn_aborted', error: 'turn_aborted: unexpected provider failure' },
+  ]) {
+    assert.equal(orchestrationDetailRows({ createdAt, ...run }, 'source').find(row => row.key === 'error').value, run.error);
+  }
+});
+
 test('dates include day/month/year and minute precision in the system timezone, even across midnight', () => {
   const previous = process.env.TZ;
   try {

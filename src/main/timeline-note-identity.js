@@ -22,7 +22,17 @@ async function resolveTimelineNoteAnchor(request, readTimeline) {
     && historyEntryHasExactIdentity(entry, sourceIdentity)
     && !String(entry.uuid || '').startsWith('codex-live-')
   ));
-  if (matches.length !== 1) return { success: false, error: 'timeline_note_source_unresolved' };
+  if (matches.length !== 1) return { success: false, error: 'timeline_note_source_unresolved', diagnostic: {
+    reason: matches.length ? 'ambiguous-source' : 'source-not-in-timeline',
+    requestedUuid: entryUuid, requestedSourceIdentity: sourceIdentity,
+    timelineEntryCount: Array.isArray(result.entries) ? result.entries.length : 0,
+    exactIdentityCount: (result.entries || []).filter(entry => historyEntryHasExactIdentity(entry, sourceIdentity)).length,
+    matchedCount: matches.length,
+    revisionToken: result.revision?.token || null,
+    candidates: matches.slice(0, 3).map(entry => ({ uuid: entry.uuid, sourceIdentity: entry.sourceIdentity })),
+    identityCandidates: (result.entries || []).filter(entry => historyEntryHasExactIdentity(entry, sourceIdentity))
+      .slice(0, 3).map(entry => ({ uuid: entry.uuid, type: entry.type, role: entry.role, sourceIdentity: entry.sourceIdentity })),
+  } };
   const entry = matches[0];
   return { success: true, entryUuid: entry.uuid, anchor: {
     uuid: entry.uuid, sessionId, sourceIdentity: entry.sourceIdentity,

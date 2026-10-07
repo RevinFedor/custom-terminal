@@ -398,7 +398,12 @@ export default function SidebarToolsRow({ projectId, presentation = 'workspace',
           onMouseEnter={(e) => hover(e, false, isCompressing)}
           onMouseLeave={(e) => unhover(e, false, isCompressing)}
         >
-          <Minimize2 size={13} className={isCompressing ? 'text-indigo-400 animate-glow-indigo' : ''} />
+          <span
+            className={isCompressing ? 'animate-glow-indigo' : undefined}
+            style={{ display: 'inline-flex', width: 13, height: 13, flexShrink: 0 }}
+          >
+            <Minimize2 size={13} className={isCompressing ? 'text-indigo-400' : ''} />
+          </span>
         </button>
       </ControlHint>}
 

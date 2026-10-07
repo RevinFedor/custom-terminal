@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const test = require('node:test');
+const ts = require('typescript');
+const { createCodexLiveUserCarrierPairer } = require('./codex-live-user-carrier-pairing');
 const {
   createCodexResumeUserActivityProof,
   matchesCodexResumeUserActivityProof,
@@ -12,6 +14,7 @@ const {
 const { classifyCodexWriterAdoption } = require('./codex-writer-ownership');
 const {
   consumeCodexUserMessageAuditChunk,
+  codexUserMessagePresentationText,
   selectCodexPreferredUserMessageAuditRecords,
 } = require('./codex-prompt-audit');
 
@@ -98,16 +101,28 @@ test('live source scanner records activity even when its old send audit rejects 
   const to = main.indexOf('\nfunction armCodexManualWriterBindingConflict', from);
   assert.ok(from >= 0 && to > from);
   const auditResults = [];
+  const aliases = [];
   const context = vm.createContext({
     consumeCodexUserMessageAuditChunk,
     selectCodexPreferredUserMessageAuditRecords,
     createCodexResumeUserActivityProof,
+    createCodexLiveUserCarrierPairer,
+    codexUserMessagePresentationText,
+    CODEX_LIVE_USER_EVENT_CARRIER: 'event_msg',
+    CODEX_LIVE_USER_RESPONSE_CARRIER: 'response_item',
+    codexKnownSessions: new Map(),
     processCodexUserMessagePasteAudit: (_state, record) => {
       auditResults.push(record.payload.message === 'Unconfirmed old draft');
+      aliases.push({ sources: record.__auditSourceIdentityAliases, uuids: record.__auditEntryUuidAliases });
       return false;
     },
     console: { log() {} },
   });
+  const ast = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
+  const helpers = ['codexLiveUserCarrierKind', 'codexLiveSourceIdentity',
+    'codexDurableUserUuidFromLiveRecord', 'observeCodexPromptAuditCarrier'];
+  vm.runInContext(helpers.map(name => ast.statements.find(node =>
+    ts.isFunctionDeclaration(node) && node.name?.text === name).getText(ast)).join('\n'), context);
   vm.runInContext(main.slice(from, to), context);
   const state = {
     tabId: 'tab-a', sessionId: launch.sessionId, filePath: launch.filePath,
@@ -126,6 +141,15 @@ test('live source scanner records activity even when its old send audit rejects 
   context.processCodexSourceAuditOnlyText(state, text.slice(42), launch.startByte + Buffer.byteLength(first));
   assert.deepEqual(auditResults, [false]);
   assert.equal(matchesCodexResumeUserActivityProof(state.sourceLiveUserActivityProof, owner), true);
+  const responseOffset = launch.startByte + Buffer.byteLength(text);
+  const response = JSON.stringify({ uuid: 'response-user-exact', type: 'response_item',
+    payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'next paired prompt' }] } }) + '\n';
+  context.processCodexSourceAuditOnlyText(state, response, responseOffset);
+  const event = JSON.stringify({ uuid: 'event-user-exact', type: 'event_msg',
+    payload: { type: 'user_message', message: 'next paired prompt' } }) + '\n';
+  context.processCodexSourceAuditOnlyText(state, event, responseOffset + Buffer.byteLength(response));
+  assert.deepEqual(Array.from(aliases.at(-1).sources), ['codex-user-source-' + launch.sessionId + '-' + responseOffset]);
+  assert.deepEqual(Array.from(aliases.at(-1).uuids), ['response-user-exact']);
   assert.match(main, /processCodexSourceAuditOnlyText\(state, batch\.buffer, batch\.start, prepared\.preferredUserAuditOffsets\)/);
   assert.match(main, /if \(sourceAuditOnly\) requestCodexSourceWriterProof\(state\)/);
   assert.match(main, /sourceUserMessageProven && !candidateSubmitAuditProven/);

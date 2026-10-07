@@ -59,7 +59,7 @@ class TabHistoryRestoreLeases {
     };
   }
 
-  finish({ projectId, id, token, commit = false } = {}) {
+  validate({ projectId, id, token } = {}) {
     const lease = this.leases.get(id);
     if (!lease) return { ok: false, reason: 'not_leased' };
     if (this.now() - lease.createdAt >= this.leaseTtlMs) {
@@ -68,6 +68,14 @@ class TabHistoryRestoreLeases {
     }
     if (lease.projectId !== projectId) return { ok: false, reason: 'project_mismatch' };
     if (lease.token !== token) return { ok: false, reason: 'token_mismatch' };
+    const entry = this.getById(id, projectId);
+    if (!entry) return { ok: false, reason: 'not_found' };
+    return { ok: true, entry, lease };
+  }
+
+  finish({ projectId, id, token, commit = false } = {}) {
+    const validation = this.validate({ projectId, id, token });
+    if (!validation.ok) return validation;
 
     if (!commit) {
       this.leases.delete(id);

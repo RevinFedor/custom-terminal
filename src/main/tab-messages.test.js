@@ -58,6 +58,156 @@ async function drained(service) {
   while (service.lanes.size) await Promise.all([...service.lanes.values()]);
 }
 
+test('cancelled application FIFO message is terminal across wakes, retry and reopen', async t => {
+  const db = new Database(':memory:');
+  t.after(() => db.close());
+  let cancelled;
+  const h = await fixture(t, { db, send: async message => {
+    cancelled = { state: 'not-submitted', operationKey: message.operationKey,
+      receipt: { submitted: false, code: 'agent_send_queue_cancelled' } };
+    return cancelled;
+  }, getReceipt: () => cancelled });
+  const q = (await h.question()).message; await drained(h.service);
+  assert.equal(h.message(q.messageId).deliveryState, 'failed');
+  const frozen = h.db.prepare(`SELECT * FROM ${TABLE_NAME} WHERE messageId = ?`).get(q.messageId);
+  for (let i = 0; i < 3; i++) await h.service.wake('B');
+  await h.service.reconcile();
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.db.prepare(`SELECT retryAllowed FROM ${TABLE_NAME} WHERE messageId = ?`).get(q.messageId).retryAllowed, 0);
+  assert.equal(h.db.prepare(`SELECT frozenPrompt FROM ${TABLE_NAME} WHERE messageId = ?`).get(q.messageId).frozenPrompt, frozen.frozenPrompt);
+  h.service.dispose();
+  const reopened = await fixture(t, { db, getReceipt: () => cancelled });
+  await reopened.service.wake('B'); await drained(reopened.service);
+  assert.equal(reopened.calls.length, 0);
+});
+
+test('a provisional target is durably addressed by exact launch without inventing a SID, then one canonical receipt materializes it', async t => {
+  const pin = { toolType: 'codex', terminalInstanceId: 'I', launchId: 'L' };
+  const h = await fixture(t, { send: async message => ({ state: 'audit-pending', operationKey: message.operationKey,
+    receipt: { submitted: true, status: 'queued' } }) });
+  h.tabs.set('B', tab('B', { sessionId: null, sendTarget: pin, runtimeTarget: pin }));
+  const question = await h.question(); await drained(h.service);
+  assert.equal(question.message.targetSessionId, null);
+  assert.deepEqual(h.calls[0].targetSendTarget, pin);
+  const message = h.message(question.message.messageId);
+  const receipt = { state: 'confirmed', operationKey: message.operationKey, tabId: 'B', provider: 'codex',
+    handoffId: message.handoffId, attemptId: 'exact-attempt', sessionId: 'born-session',
+    promptHash: promptAuditFingerprint(h.calls[0].prompt),
+    receipt: { expectedTarget: pin }, auditIdentity: { provider: 'codex', sessionId: 'born-session',
+      attemptId: 'exact-attempt', entryUuid: 'canonical-user' } };
+  h.service.observeReceipt(message.operationKey, receipt);
+  assert.equal(h.message(message.messageId).targetSessionId, 'born-session');
+  assert.equal(h.message(message.messageId).deliveryState, 'sent');
+  assert.equal(h.message(message.messageId).targetSendTarget, undefined);
+  assert.equal(h.calls.length, 1);
+});
+
+test('same launch can adopt its first writer, but replacement/foreign receipts cannot retarget a provisional message', async t => {
+  const pin = { toolType: 'codex', terminalInstanceId: 'I', launchId: 'L' };
+  let entered;
+  const gate = deferred();
+  const h = await fixture(t, { send: async message => { entered = message; await gate.promise; return { state: 'audit-pending' }; } });
+  h.tabs.set('B', tab('B', { sessionId: null, sendTarget: pin, runtimeTarget: pin }));
+  const result = await h.question();
+  await Promise.resolve();
+  const id = result.message.messageId;
+  gate.resolve(); await drained(h.service);
+  h.service.observeReceipt(entered.operationKey, { state: 'confirmed', operationKey: entered.operationKey,
+    tabId: 'B', provider: 'codex', handoffId: entered.handoffId, sessionId: 'foreign', promptHash: 'wrong',
+    attemptId: 'A', auditIdentity: { provider: 'codex', sessionId: 'foreign', attemptId: 'A' },
+    receipt: { expectedTarget: { ...pin, launchId: 'foreign-launch' } } });
+  assert.equal(h.message(id).targetSessionId, null);
+  assert.equal(h.message(id).deliveryState, 'unconfirmed');
+  h.tabs.set('B', tab('B', { sessionId: 'born-session', runtimeTarget: { ...pin, sessionId: 'born-session' } }));
+  const reply = await h.service.replyToMessage({ responder: 'B', messageId: id, text: 'reply', requestId: 'R' });
+  assert.equal(reply.message.sourceSessionId, 'born-session');
+});
+
+test('a first writer needs the exact frozen hash and canonical address, not generic confirmed', async t => {
+  const pin = { toolType: 'codex', terminalInstanceId: 'I', launchId: 'L' };
+  const h = await fixture(t, { send: async () => ({ state: 'audit-pending', receipt: { submitted: true } }) });
+  h.tabs.set('B', tab('B', { sessionId: null, sendTarget: pin, runtimeTarget: pin }));
+  const q = (await h.question()).message; await drained(h.service);
+  const receipt = { state: 'confirmed', operationKey: q.operationKey, tabId: 'B', provider: 'codex',
+    handoffId: q.handoffId, attemptId: 'attempt', sessionId: 'born-session',
+    promptHash: promptAuditFingerprint(h.calls[0].prompt), receipt: { expectedTarget: pin },
+    auditIdentity: { provider: 'codex', attemptId: 'attempt', sessionId: 'born-session', entryUuid: 'canonical' } };
+  for (const invalid of [{ ...receipt, promptHash: 'wrong-hash' },
+    { ...receipt, auditIdentity: { ...receipt.auditIdentity, entryUuid: null } },
+    { state: 'confirmed', operationKey: q.operationKey }]) {
+    h.service.observeReceipt(q.operationKey, invalid);
+    assert.equal(h.message(q.messageId).targetSessionId, null);
+    assert.equal(h.message(q.messageId).deliveryState, 'unconfirmed');
+  }
+  h.service.observeReceipt(q.operationKey, receipt);
+  assert.equal(h.message(q.messageId).targetSessionId, 'born-session');
+  assert.equal(h.message(q.messageId).deliveryState, 'sent');
+  assert.equal(h.calls.length, 1);
+});
+
+test('a known conversation waits through a null writer snapshot and wakes once with the same frozen message', async t => {
+  const pin = { toolType: 'codex', terminalInstanceId: 'I', launchId: 'L' };
+  const h = await fixture(t);
+  const original = h.tabs.get('B');
+  const q = (await h.question()).message; await drained(h.service);
+  // Reuse a durable pre-input row to model preparation blocked by identity proof.
+  const pending = (await h.question('A', 'second exact body', 'q-2')).message;
+  h.tabs.set('B', { ...original, sessionId: null, sendTarget: pin, runtimeTarget: pin });
+  await drained(h.service);
+  assert.equal(h.message(pending.messageId).deliveryState, 'pending');
+  assert.equal(h.message(pending.messageId).code, 'tab_message_identity_pending');
+  assert.equal(h.calls.length, 1);
+  const before = h.db.prepare(`SELECT frozenPrompt FROM ${TABLE_NAME} WHERE messageId = ?`).get(pending.messageId);
+  h.tabs.set('B', { ...original, runtimeTarget: { ...pin, sessionId: original.sessionId } });
+  await h.service.wake('B'); await drained(h.service);
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.calls[1].messageId, pending.messageId);
+  assert.equal(h.calls[1].prompt, before.frozenPrompt);
+  assert.equal(h.message(pending.messageId).deliveryState, 'sent');
+  assert.equal(h.message(q.messageId).deliveryState, 'sent');
+});
+
+test('replacement of a pinned provisional launch during draft wait never gets the old message', async t => {
+  const pin = { toolType: 'codex', terminalInstanceId: 'I', launchId: 'L' };
+  const h = await fixture(t, { send: async () => ({ state: 'not-submitted', receipt: {
+    submitted: false, code: 'input_draft_conflict', status: 'waiting-for-input' } }) });
+  h.tabs.set('B', tab('B', { sessionId: null, sendTarget: pin, runtimeTarget: pin }));
+  const q = (await h.question()).message; await drained(h.service);
+  const before = h.db.prepare(`SELECT frozenPrompt, targetAddressJson FROM ${TABLE_NAME} WHERE messageId = ?`).get(q.messageId);
+  h.tabs.set('B', tab('B', { sessionId: null, sendTarget: { ...pin, launchId: 'replacement' },
+    runtimeTarget: { ...pin, launchId: 'replacement' } }));
+  await h.service.wake('B'); await drained(h.service);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.message(q.messageId).deliveryState, 'failed');
+  assert.equal(h.message(q.messageId).code, 'tab_message_address_changed');
+  assert.deepEqual(h.db.prepare(`SELECT frozenPrompt, targetAddressJson FROM ${TABLE_NAME} WHERE messageId = ?`).get(q.messageId), before);
+});
+
+test('provisional return address survives SQLite reopen and binds only the same source launch for the reply', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provisional-message-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'messages.sqlite');
+  const db = new Database(file);
+  const pin = { toolType: 'codex', terminalInstanceId: 'source-instance', launchId: 'source-launch' };
+  const h = await fixture(t, { db });
+  h.tabs.set('A', tab('A', { sessionId: null, sendTarget: pin, runtimeTarget: pin }));
+  const q = (await h.question()).message; await drained(h.service);
+  h.service.dispose(); db.close();
+  const reopenedDb = new Database(file);
+  t.after(() => reopenedDb.close());
+  const r = await fixture(t, { db: reopenedDb });
+  assert.deepEqual(r.message(q.messageId).sourceSendTarget, pin);
+  assert.equal(r.calls.length, 0, 'reopen must not replay the question');
+  r.tabs.set('A', tab('A', { sessionId: 'born-source', runtimeTarget: { ...pin, sessionId: 'born-source' } }));
+  const answer = (await r.service.replyToMessage({ responder: 'B', messageId: q.messageId, text: 'one final answer', requestId: 'reply-exact' })).message;
+  await drained(r.service);
+  assert.equal(r.calls.length, 1);
+  assert.equal(r.calls[0].messageId, answer.messageId);
+  assert.equal(r.message(answer.messageId).targetSessionId, 'born-source');
+  assert.equal(r.message(answer.messageId).deliveryState, 'sent');
+  assert.equal(r.message(q.messageId).sourceSessionId, null, 'the original captured address is preserved');
+});
+
 test('two callers reserve before a busy target finishes accepting, reply out of order, and never create task dependencies', async (t) => {
   const gate = deferred();
   const entered = deferred();
@@ -622,8 +772,9 @@ test('legacy table migration is additive and per-side dismissal survives SQLite 
   assert.equal(oldColumns.includes('targetDismissedAt'), false);
   const first = await fixture(t, { db });
   assert.deepEqual(db.prepare('SELECT * FROM tab_messages ORDER BY rowid').all(),
-    legacyRows.map((row) => ({ ...row, sourceDismissedAt: null, targetDismissedAt: null })));
-  assert.equal(db.prepare('PRAGMA table_info(tab_messages)').all().length, oldColumns.length + 2);
+    legacyRows.map((row) => ({ ...row, sourceDismissedAt: null, targetDismissedAt: null,
+      sourceAddressJson: null, targetAddressJson: null })));
+  assert.equal(db.prepare('PRAGMA table_info(tab_messages)').all().length, oldColumns.length + 4);
   assert.equal(first.calls.length, 0);
   assert.equal(first.changes.length, 0);
   const source = first.service.dismissMessage({ tabId: 'A', messageId: 'legacy-reply' }).message;
@@ -669,8 +820,8 @@ test('legacy table migration is additive and per-side dismissal survives SQLite 
   }
   assert.deepEqual(finalDb.prepare('SELECT * FROM tab_messages ORDER BY rowid').all(), [
     { ...legacyRows[0], sourceDismissedAt: target.sourceDismissedAt,
-      targetDismissedAt: target.targetDismissedAt, updatedAt: target.updatedAt },
-    { ...legacyRows[1], sourceDismissedAt: null, targetDismissedAt: null },
+      targetDismissedAt: target.targetDismissedAt, updatedAt: target.updatedAt, sourceAddressJson: null, targetAddressJson: null },
+    { ...legacyRows[1], sourceDismissedAt: null, targetDismissedAt: null, sourceAddressJson: null, targetAddressJson: null },
   ]);
   assert.equal(final.calls.length, 0);
   assert.equal(final.changes.length, 0);

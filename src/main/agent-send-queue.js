@@ -5,6 +5,7 @@
 // No timers, text matching, provider turn-completion heuristic or second Enter.
 const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
 const { attachmentOwnershipReceipt, validateOwnedAttachmentSnapshot } = require('./owned-mobile-attachments');
+const { isAutomaticPromptQueueRequest, isAutomaticNoWriteWait, isAutomaticReadinessWaitReceipt } = require('../shared/prompt-queue-send-intent.cjs');
 const OPEN = "('waiting','dispatching','awaiting-receipt')";
 const FAILED = new Set(['not-submitted', 'provider-not-accepted']);
 const consumed = record => record?.state === 'confirmed'
@@ -13,8 +14,10 @@ const consumed = record => record?.state === 'confirmed'
   && !!(record.auditIdentity?.entryUuid || record.auditIdentity?.sourceIdentity);
 
 function applicationQueueReceipt(record, item) {
+  const waitingBeforeInput = item?.state === 'waiting'
+    && isAutomaticNoWriteWait(record, JSON.parse(item.request_json));
   if (!record || !item || !['waiting','dispatching'].includes(item.state)
-    || record.attemptId || !['reserved','preparing'].includes(record.state)) return null;
+    || (!waitingBeforeInput && (record.attemptId || !['reserved','preparing'].includes(record.state)))) return null;
   return {
     success: true, accepted: true, submitted: false, pasteWritten: false, enterWritten: false,
     status: 'application-queued', queued: true, applicationQueued: true,
@@ -22,13 +25,14 @@ function applicationQueueReceipt(record, item) {
     handoffId: record.handoffId, tabId: record.tabId, operationKey: record.operationKey,
     sendOperationKey: record.operationKey, attemptId: null, sendAttemptId: null,
     receiptState: record.state,
-    applicationQueue: { version: 1, id: item.id, state: item.state, queuedAt: item.created_at },
+    applicationQueue: { version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
+      ...(waitingBeforeInput ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}) },
     ...(record.receipt?.ownedAttachments ? { attachmentOwnership: attachmentOwnershipReceipt(record.receipt.ownedAttachments) } : {}),
   };
 }
 
 class AgentSendQueue {
-  constructor({ store, execute, publish = () => {}, ready = () => true, cancelAttempt = () => {}, admit = null }) {
+  constructor({ store, execute, publish = () => {}, ready = () => true, cancelAttempt = () => {}, admit = null, reconcile = null }) {
     this.store = store;
     this.db = store.db;
     this.execute = execute;
@@ -36,6 +40,7 @@ class AgentSendQueue {
     this.ready = ready;
     this.cancelAttempt = cancelAttempt;
     this.admit = admit;
+    this.reconcile = reconcile;
     this.disposed = false;
     this.running = new Set();
     this.scheduled = new Set();
@@ -62,6 +67,7 @@ class AgentSendQueue {
     const columns = new Set(this.db.prepare('PRAGMA table_info(agent_send_queue)').all().map(row => row.name));
     if (!columns.has('asset_ids_json')) this.db.exec("ALTER TABLE agent_send_queue ADD COLUMN asset_ids_json TEXT NOT NULL DEFAULT '[]'");
     if (!columns.has('predecessor_key')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN predecessor_key TEXT');
+    if (!columns.has('release_json')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN release_json TEXT');
     this.unsubscribe = store.subscribe(record => this.observe(record));
   }
 
@@ -71,6 +77,63 @@ class AgentSendQueue {
 
   receipt(operationKey) {
     return applicationQueueReceipt(this.store.get(operationKey), this.item(operationKey));
+  }
+
+  // Main's pre-paste gate calls this only after proving that this invocation
+  // wrote nothing. Never infer this permission from a renderer error/timeout.
+  certifyAutomaticReadinessWait({ tabId, handoffId, operationKey, attemptId }, receipt) {
+    const item = this.item(operationKey), record = this.store.get(operationKey);
+    if (!item || item.state !== 'dispatching' || !this.running.has(tabId)
+      || record?.state !== 'in-flight' || record.provider !== 'codex' || !attemptId || record.attemptId !== attemptId
+      || record.tabId !== tabId || record.handoffId !== handoffId
+      || !isAutomaticPromptQueueRequest(JSON.parse(item.request_json))) return receipt;
+    const certified = { ...receipt, enterWritten: false, automaticReadinessWait: 1 };
+    if (!isAutomaticReadinessWaitReceipt(certified) || receipt.enterWritten === true) return receipt;
+    const settled = this.store.settleAttempt(operationKey, attemptId, certified);
+    return settled.applied ? certified : receipt;
+  }
+
+  async releaseUnknownHead(request) {
+    const fail = (code, statusCode = 409) => { throw Object.assign(new Error(code), { code, statusCode }); };
+    if (!request || Object.keys(request).some(key => !['tabId', 'operationKey', 'attemptId', 'requestId', 'acknowledgeDeliveryUnknown'].includes(key))
+      || ['tabId', 'operationKey', 'attemptId', 'requestId'].some(key => typeof request[key] !== 'string' || !request[key].trim())
+      || request.acknowledgeDeliveryUnknown !== true) fail('send_queue_release_identity_required', 400);
+    const replay = () => {
+      const item = this.item(request.operationKey);
+      const record = this.store.get(request.operationKey);
+      if (!item || item.tab_id !== request.tabId || record?.tabId !== request.tabId) fail('send_queue_release_not_found', 404);
+      if (record.attemptId !== request.attemptId) fail('send_queue_release_attempt_changed');
+      if (!item.release_json) return null;
+      const release = JSON.parse(item.release_json);
+      if (release.requestId !== request.requestId || release.attemptId !== request.attemptId) fail('send_queue_release_request_conflict');
+      return { released: true, idempotent: true, release, record };
+    };
+    const prior = replay();
+    if (prior) return prior;
+    if (this.disposed || typeof this.reconcile !== 'function') fail('send_queue_release_unavailable', 503);
+    await this.reconcile({ tabId: request.tabId, operationKey: request.operationKey, attemptId: request.attemptId });
+    const result = this.db.transaction(() => {
+      const repeated = replay();
+      if (repeated) return repeated;
+      const record = this.store.get(request.operationKey);
+      if (consumed(record)) return { released: false, confirmed: true, record };
+      if (record.state !== 'delivery-unknown') fail('send_queue_release_requires_unknown');
+      if (this.running.has(request.tabId)) fail('send_queue_release_executor_running');
+      const head = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ? AND state IN ${OPEN} ORDER BY id LIMIT 1`).get(request.tabId);
+      if (head?.operation_key !== request.operationKey || head.state !== 'awaiting-receipt') fail('send_queue_release_not_head');
+      const release = { requestId: request.requestId, operationKey: request.operationKey, attemptId: request.attemptId,
+        kind: 'continue-despite-delivery-unknown', releasedAt: Date.now(), deliveryState: record.state,
+        submitted: record.receipt?.submitted ?? null };
+      const changed = this.db.prepare(`UPDATE agent_send_queue SET state = 'released-unknown', release_json = ?, updated_at = ?
+        WHERE operation_key = ? AND state = 'awaiting-receipt' AND release_json IS NULL`)
+        .run(JSON.stringify(release), release.releasedAt, request.operationKey);
+      if (changed.changes !== 1) fail('send_queue_release_state_changed');
+      return { released: true, idempotent: false, release, record };
+    })();
+    this.resolveWaiters(request.operationKey);
+    this.publishRecord(result.record);
+    this.wake(request.tabId);
+    return result;
   }
 
   enqueue({ identity, request, execute }) {
@@ -88,6 +151,19 @@ class AgentSendQueue {
       if (existing) {
         if (existing.request_hash !== requestHash) return { ok: false, action: 'conflict', code: 'agent_send_handoff_conflict' };
         return { ok: true, item: existing, record: this.store.get(identity.operationKey), replayed: true };
+      }
+      if (isAutomaticPromptQueueRequest(snapshot) && snapshot.promptQueueIntent.baseHandoffId) {
+        const base = snapshot.promptQueueIntent.baseHandoffId;
+        const priors = this.db.prepare(`SELECT operation_key FROM agent_send_queue WHERE tab_id = ?
+          AND (operation_key = ? OR json_extract(request_json, '$.promptQueueIntent.baseHandoffId') = ?)`).all(
+          identity.tabId, `history:${identity.tabId}:${base}`, base);
+        for (const prior of priors) {
+          const receipt = this.store.get(prior.operation_key);
+          if (!receipt || receipt.state !== 'not-submitted' || receipt.receipt?.submitted !== false
+            || receipt.receipt?.pasteWritten === true || receipt.receipt?.enterWritten === true) {
+            return { ok: false, code: 'automatic_previous_delivery_unresolved' };
+          }
+        }
       }
       const reserved = this.store.reserveOrGet(identity, { queuedAdmission: true });
       if (!reserved.ok) return reserved;
@@ -159,6 +235,9 @@ class AgentSendQueue {
         attachmentOwnership: attachmentOwnershipReceipt(request.ownedAttachments) } : {}),
       source: request.source, ...(record.receipt || {}) }, applicationQueue: {
       version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
+      ...(item.state === 'waiting' && isAutomaticNoWriteWait(record, request)
+        ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}),
+      ...(item.release_json ? { release: JSON.parse(item.release_json) } : {}),
     } };
   }
 
@@ -166,6 +245,14 @@ class AgentSendQueue {
     if (!record || this.admitting > 0 || this.disposed) return;
     const item = this.item(record.operationKey);
     if (!item) return;
+    if (['waiting', 'dispatching'].includes(item.state)
+      && isAutomaticNoWriteWait(record, JSON.parse(item.request_json))) {
+      this.db.prepare("UPDATE agent_send_queue SET state = 'waiting', updated_at = ? WHERE operation_key = ?")
+        .run(Date.now(), item.operation_key);
+      this.parked.add(item.tab_id);
+      this.publishRecord(record);
+      return; // only a later runtime/queue wake can release this no-input wait
+    }
     // A receipt can complete before the bridge returns. Running still holds
     // the physical scenario until its finally, even after this exact promotion.
     if (consumed(record) || FAILED.has(record.state)) {
@@ -216,7 +303,14 @@ class AgentSendQueue {
     });
   }
 
-  notifyRuntime(tabId) { if (this.parked.has(tabId)) this.wake(tabId); }
+  notifyRuntime(tabId) {
+    for (const owner of this.parked) {
+      if (owner === tabId) { this.wake(owner); continue; }
+      const item = this.db.prepare(`SELECT request_json FROM agent_send_queue WHERE tab_id = ?
+        AND state IN ${OPEN} ORDER BY id LIMIT 1`).get(owner);
+      if (item && JSON.parse(item.request_json).promptQueueIntent?.triggerTabId === tabId) this.wake(owner);
+    }
+  }
 
   resume() {
     for (const row of this.db.prepare(`SELECT DISTINCT tab_id FROM agent_send_queue WHERE state IN ${OPEN}`).all()) {
@@ -231,15 +325,16 @@ class AgentSendQueue {
     if (!item) return;
     const record = this.store.get(item.operation_key);
     if (!record) return; // Losing a receipt is not proof that input was untouched.
-    if (consumed(record) || FAILED.has(record.state)) {
+    const request = JSON.parse(item.request_json);
+    const waitingBeforeInput = item.state === 'waiting' && isAutomaticNoWriteWait(record, request);
+    if (consumed(record) || (FAILED.has(record.state) && !waitingBeforeInput)) {
       this.observe(record);
       return;
     }
-    if (record.attemptId || !['reserved','preparing'].includes(record.state)) return;
+    if (!waitingBeforeInput && (record.attemptId || !['reserved','preparing'].includes(record.state))) return;
     // Claim synchronously before calling any asynchronous scenario. An event or
     // a second client cannot launch another physical sender in this tab.
     this.running.add(tabId);
-    const request = JSON.parse(item.request_json);
     const predecessor = item.predecessor_key ? this.store.get(item.predecessor_key) : null;
     const inheritedSession = !request.expectedTarget?.sessionId && consumed(predecessor)
       ? predecessor.auditIdentity.sessionId : null;
@@ -251,7 +346,9 @@ class AgentSendQueue {
     try {
       if (this.admit) {
         this.parked.add(tabId);
-        if (!await this.admit(request)) { parked = true; return; }
+        const admission = await this.admit(request);
+        if (admission?.cancel === true) { this.cancelWaiting(tabId, record.handoffId); return; }
+        if (!admission) { parked = true; return; }
         this.parked.delete(tabId);
       }
       if (this.disposed || !this.ready()) { parked = true; return; }
@@ -272,6 +369,11 @@ class AgentSendQueue {
           .run('awaiting-receipt', Date.now(), item.operation_key);
       }
       this.observe(this.store.get(item.operation_key));
+      if (this.item(item.operation_key)?.state === 'waiting'
+        && isAutomaticNoWriteWait(this.store.get(item.operation_key), request)) {
+        parked = true;
+        this.rerun.delete(tabId); // receipt publication is not readiness evidence
+      }
     } catch (error) {
       // No attempt was begun: the existing executor has not crossed its durable
       // write boundary. Otherwise retain the receipt's uncertainty, never retry.
@@ -296,14 +398,20 @@ class AgentSendQueue {
   cancelWaiting(tabId, handoffId = null, { dismiss = false } = {}) {
     const items = this.db.prepare(`SELECT q.* FROM agent_send_queue q
       JOIN agent_send_receipts r ON r.operation_key = q.operation_key
-      WHERE q.tab_id = ? AND q.state = 'waiting' AND r.attempt_id IS NULL`
-      + (handoffId ? ' AND r.handoff_id = ?' : '')).all(...(handoffId ? [tabId, handoffId] : [tabId]));
+      WHERE q.tab_id = ? AND q.state = 'waiting'`
+      + (handoffId ? ' AND r.handoff_id = ?' : '')).all(...(handoffId ? [tabId, handoffId] : [tabId]))
+      .filter(item => {
+        const record = this.store.get(item.operation_key);
+        return !record?.attemptId || isAutomaticNoWriteWait(record, JSON.parse(item.request_json));
+      });
     for (const item of items) {
       this.finish(item, 'cancelled');
-      this.store.settleQueuedNoWrite(item.operation_key, {
+      const record = this.store.get(item.operation_key);
+      if (!record.attemptId) this.store.settleQueuedNoWrite(item.operation_key, {
         code: 'agent_send_queue_cancelled', error: 'Queued send cancelled before terminal input', cancelled: true,
         ...(dismiss ? { presentationDismissedAt: Date.now(), presentationDismissedSurface: 'desktop-history' } : {}),
       });
+      else this.publishRecord(record); // retain the last physical no-write fact
       if (dismiss) this.releasePresentation(item.operation_key);
     }
     return { cancelled: items.length > 0, count: items.length };
@@ -385,4 +493,5 @@ function forgetCollectedUploadAliases(db, assetIds) {
   db.transaction(() => { for (const id of assetIds) remove.run(id); })();
 }
 
-module.exports = { AgentSendQueue, applicationQueueReceipt, readQueuedSendAssetIds, forgetCollectedUploadAliases };
+module.exports = { AgentSendQueue, applicationQueueReceipt, readQueuedSendAssetIds, forgetCollectedUploadAliases,
+  hasCanonicalSendConsumption: consumed };

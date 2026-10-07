@@ -42,8 +42,12 @@ test('delivery proof keeps raw provider identity while presentation uses one nor
     main.indexOf('function processCodexSourceAuditOnlyText'),
   );
   assert.match(audit, /preserveProviderImageMarkup: true/);
-  assert.match(audit, /const presentationText = codexUserMessagePresentationText\(record\) \|\| actualText/);
-  assert.match(audit, /actualText: presentationText,[\s\S]{0,80}actualHash: presentationHash/);
+  assert.match(audit, /const presentationText = record\.__auditCanonicalCarrier\?\.presentationText \|\| codexUserMessagePresentationText\(record\) \|\| actualText/);
+  assert.match(audit, /presentation: \{ text: presentationText, hash: presentationHash/);
+  const publisher = main.slice(main.indexOf('function publishAgentPromptAuditResult'),
+    main.indexOf('function holdPasteAuditCompletionForTest'));
+  assert.match(publisher, /actualText: result\.presentation\.text, actualHash: result\.presentation\.hash/);
+  assert.ok(publisher.indexOf('promoteFromAudit(') < publisher.indexOf('saveAuditedPromptPresentation('));
 });
 
 test('durable receipt preserves staged paths for exact restart reconciliation', () => {

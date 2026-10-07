@@ -9,14 +9,22 @@ const v8 = require('node:v8');
 const crypto = require('node:crypto');
 const Database = require('better-sqlite3');
 const { makeHistoryRowStub, historyRowCarriesLiveWork, historyRowWindowRange } = require('./history-entry-window');
+const { HISTORY_PREPARED_CACHE_DISK_BUDGET_BYTES } = require('./history-cache-policy');
 
 const SCHEMA = 1;
 const DIAGNOSTIC_HISTORY_LIMIT = 256;
 const DIAGNOSTIC_STRING_FIELDS = ['operation', 'outcome', 'reason', 'sessionId', 'cacheKey', 'cacheVersion', 'otherVersion',
-  'layer', 'kind', 'indexOutcome', 'indexReason', 'causeOperation', 'errorReason', 'errorName', 'errorCode', 'errorModule'];
+  'layer', 'kind', 'cacheTier', 'indexOutcome', 'indexReason', 'causeOperation', 'errorReason', 'errorName', 'errorCode', 'errorModule'];
 const DIAGNOSTIC_SCALAR_FIELDS = ['bytes', 'budgetBytes', 'snapshotBytes', 'sourceBytes', 'rows', 'pageRows', 'indexBytes',
   'indexMemoryBytes', 'indexBudgetBytes', 'evictedCount', 'evictedBytes', 'removedCount', 'deferredCount',
-  'errorCount', 'fileCount', 'activeCount', 'diskBytes', 'otherVersionObserved', 'indexRetained', 'errorLine', 'errorColumn'];
+  'errorCount', 'fileCount', 'activeCount', 'diskBytes', 'otherVersionObserved', 'indexRetained', 'errorLine', 'errorColumn',
+  'obsoleteEvictedCount', 'stateEvictedCount', 'rowsEvictedCount', 'timelineEvictedCount'];
+const CACHE_FILE = /^([a-f0-9]{64})(?:\.(state|timeline))?\.sqlite$/;
+const STATE_OPERATIONS = new Set(['saveContinuation', 'readContinuation', 'saveVirtualState', 'readVirtualState',
+  'savePayload', 'savePayloads', 'readPayload']);
+const TIMELINE_OPERATIONS = new Set(['saveTimeline', 'readTimeline', 'saveVirtualProjection', 'readVirtualProjection',
+  'saveSourceHeader', 'readSource', 'readSourceProof']);
+const operationTier = operation => STATE_OPERATIONS.has(operation) ? 'state' : TIMELINE_OPERATIONS.has(operation) ? 'timeline' : 'rows';
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const pack = value => v8.serialize(value);
 const encode = value => { const body = pack(value); return { body, checksum: hash(body) }; };
@@ -106,7 +114,7 @@ function canonicalPageRow(row) {
 }
 
 class HistoryPreparedCache {
-  constructor({ directory, maxBytes = 2 * 1024 ** 3, schema = SCHEMA, indexBudgetBytes = 32 * 1024 * 1024, onDiagnostic = null } = {}) {
+  constructor({ directory, maxBytes = HISTORY_PREPARED_CACHE_DISK_BUDGET_BYTES, schema = SCHEMA, indexBudgetBytes = 32 * 1024 * 1024, onDiagnostic = null } = {}) {
     if (!path.isAbsolute(directory || '')) throw new Error('history_cache_directory_required');
     if (!/^[a-z0-9-]+$/i.test(String(schema))) throw new Error('history_cache_schema');
     this.baseDirectory = directory;
@@ -130,11 +138,14 @@ class HistoryPreparedCache {
     }
   }
 
-  filename(owner) { return path.join(this.directory, hash(ownerKey(owner)) + '.sqlite'); }
+  filename(owner, tier = 'rows') {
+    if (!['rows', 'state', 'timeline'].includes(tier)) throw new Error('history_cache_tier');
+    return path.join(this.directory, hash(ownerKey(owner)) + (tier === 'rows' ? '' : '.' + tier) + '.sqlite');
+  }
   diagnostic(operation, owner, write = false) {
     return { operation, outcome: write ? 'stored' : 'hit', reason: write ? 'stored' : 'disk-hit',
       sessionId: owner?.sessionId, cacheKey: owner ? hash(ownerKey(owner)) : undefined,
-      layer: 'disk', cacheVersion: path.basename(this.directory), budgetBytes: this.maxBytes };
+      layer: 'disk', cacheTier: operationTier(operation), cacheVersion: path.basename(this.directory), budgetBytes: this.maxBytes };
   }
   diagnose(details) {
     if (typeof this.onDiagnostic !== 'function') return;
@@ -156,7 +167,8 @@ class HistoryPreparedCache {
   }
   missingFile(diagnostic, filename) {
     const removal = this.recentRemovals.get(hash(filename));
-    const otherVersion = this.otherVersions.get(path.basename(filename, '.sqlite'));
+    const key = path.basename(filename, '.sqlite');
+    const otherVersion = this.otherVersions.get(key) || this.otherVersions.get(key.replace(/\.(?:state|timeline)$/, ''));
     diagnostic.cacheVersion = path.basename(this.directory);
     if (otherVersion) { diagnostic.otherVersion = otherVersion; diagnostic.otherVersionObserved = true; }
     return rejectDiagnostic(diagnostic, removal || (otherVersion ? 'version-mismatch' : 'no-file'), 'miss');
@@ -208,7 +220,7 @@ class HistoryPreparedCache {
     const diagnostic = sharedDiagnostic || this.diagnostic(operation, owner, write);
     const report = () => { if (!sharedDiagnostic) this.diagnose(diagnostic); };
     if (!this.enabled) { rejectDiagnostic(diagnostic, 'disabled', 'disabled'); report(); return null; }
-    const filename = this.filename(owner);
+    const filename = this.filename(owner, operationTier(operation));
     if (!write && !fs.existsSync(filename)) { this.missingFile(diagnostic, filename); report(); return null; }
     let db, result = null;
     try {
@@ -302,12 +314,12 @@ class HistoryPreparedCache {
     this.otherVersions.clear();
     try {
       // Old parser/schema versions share the same quota rather than each
-      // silently acquiring another 2GiB after an application update.
+      // silently acquiring another full budget after an application update.
       const families = new Map();
       for (const entry of fs.readdirSync(this.baseDirectory, { withFileTypes: true })) {
         if (!entry.isDirectory() || !/^v\d+(?:-[a-f0-9]+)?$/.test(entry.name)) continue;
         const directory = path.join(this.baseDirectory, entry.name);
-        for (const name of fs.readdirSync(directory).filter(name => /^[a-f0-9]{64}\.sqlite(?:-(?:journal|wal|shm))?$/.test(name))) {
+        for (const name of fs.readdirSync(directory).filter(name => CACHE_FILE.test(name.replace(/-(?:journal|wal|shm)$/, '')))) {
           const file = path.join(directory, name);
           const base = file.replace(/-(?:journal|wal|shm)$/, '');
           try {
@@ -331,14 +343,29 @@ class HistoryPreparedCache {
         this.removeFile(item.file, 'orphan-sidecar', false); diagnostic.removedCount++; return false;
       });
       let size = files.reduce((n, f) => n + f.size, 0);
-      // Prefer retaining the just-written owner, but even a single oversized
-      // owner cannot turn this disposable cache into unbounded disk retention.
-      files.sort((a, b) => Number(a.file === protectedFile) - Number(b.file === protectedFile) || a.used - b.used);
+      // Obsolete schema first, compact Timeline last. Among heavy files, use
+      // OWNER LRU and discard its checkpoint before its ready rows. A global
+      // "all checkpoints first" would keep ancient rows while repeatedly
+      // evicting a working tab's new append checkpoint. Protect the whole
+      // just-written owner across its split files, still under one total cap.
+      const retentionTier = file => path.dirname(file) !== this.directory ? 0
+        : file.endsWith('.state.sqlite') ? 1 : file.endsWith('.timeline.sqlite') ? 3 : 2;
+      const ownerId = file => path.join(path.dirname(file), path.basename(file).split('.')[0]);
+      const ownerUsed = new Map();
+      for (const item of files) ownerUsed.set(ownerId(item.file), Math.max(ownerUsed.get(ownerId(item.file)) || 0, item.used));
+      const protectedOwner = protectedFile ? ownerId(protectedFile) : null;
+      const group = file => retentionTier(file) === 0 ? 0 : retentionTier(file) === 3 ? 2 : 1;
+      files.sort((a, b) => group(a.file) - group(b.file)
+        || Number(ownerId(a.file) === protectedOwner) - Number(ownerId(b.file) === protectedOwner)
+        || ownerUsed.get(ownerId(a.file)) - ownerUsed.get(ownerId(b.file))
+        || retentionTier(a.file) - retentionTier(b.file) || a.used - b.used);
       for (const item of files) {
         if (size <= this.maxBytes) break;
         if (this.activeFiles.has(item.file)) { diagnostic.activeCount++; continue; }
         this.removeFile(item.file, 'disk-quota', false); size -= item.size;
         diagnostic.evictedCount++; diagnostic.evictedBytes += item.size;
+        const counter = ['obsoleteEvictedCount', 'stateEvictedCount', 'rowsEvictedCount', 'timelineEvictedCount'][retentionTier(item.file)];
+        diagnostic[counter] = (diagnostic[counter] || 0) + 1;
       }
       this.diskBytes = size;
       diagnostic.diskBytes = size; diagnostic.fileCount = files.length;
@@ -361,26 +388,32 @@ class HistoryPreparedCache {
       diagnostic.outcome = deferred ? 'deferred' : 'removed'; diagnostic.reason = 'invalidation';
     };
     try {
-      for (const name of fs.readdirSync(this.directory).filter(name => /^[a-f0-9]{64}\.sqlite$/.test(name))) {
+      const names = fs.readdirSync(this.directory).filter(name => CACHE_FILE.test(name));
+      const owners = new Set();
+      // A committed tier identifies the owner even when another tier has an
+      // in-flight page transaction and no committed source header yet.
+      for (const name of names) {
         const file = path.join(this.directory, name);
         let db;
         try {
           db = new Database(file, { readonly: true });
           const source = this.getMeta(db, 'source');
           db.close(); db = null;
-          if (!filePath || source?.filePath === filePath) remove(file);
+          if (!filePath || source?.filePath === filePath) owners.add(CACHE_FILE.exec(name)[1]);
         } catch (error) {
           diagnostic.errorCount++; diagnostic.errorReason = cacheErrorReason(error);
           try { remove(file); } catch { diagnostic.errorCount++; }
         }
         finally { db?.close(); }
       }
+      for (const name of names) if (owners.has(CACHE_FILE.exec(name)[1])) remove(path.join(this.directory, name));
     } catch (error) {
       rejectDiagnostic(diagnostic, cacheErrorReason(error), 'error'); throw error;
     } finally { this.diagnose(diagnostic); }
   }
 
   saveContinuation(owner, snapshot, state, payloads = new Map()) {
+    this.saveSourceHeader(owner, snapshot, state.sourceProof || []);
     return this.withDb(owner, true, (db, diagnostic) => db.transaction(() => {
       diagnostic.snapshotBytes = snapshot?.size;
       const putPayload = db.prepare('INSERT OR REPLACE INTO payloads VALUES (?,?,?)');
@@ -398,7 +431,10 @@ class HistoryPreparedCache {
     })(), 'saveContinuation');
   }
   saveTimeline(owner, source, entries, sessionMeta) {
-    return this.withDb(owner, true, (db, diagnostic) => this.setMeta(db, 'timeline', { owner: ownerKey(owner), source, entries, sessionMeta }, diagnostic), 'saveTimeline');
+    return this.withDb(owner, true, (db, diagnostic) => db.transaction(() => {
+      this.setMeta(db, 'source', source, diagnostic);
+      this.setMeta(db, 'timeline', { owner: ownerKey(owner), source, entries, sessionMeta }, diagnostic);
+    })(), 'saveTimeline');
   }
   readTimeline(owner, filePath, stat) {
     return this.withDb(owner, false, (db, diagnostic) => {
@@ -412,7 +448,10 @@ class HistoryPreparedCache {
   }
   saveVirtualProjection(owner, projection) {
     const { historyEntries, ...metadata } = projection;
-    return this.withDb(owner, true, (db, diagnostic) => this.setMeta(db, 'virtual', { ...metadata, owner: ownerKey(owner) }, diagnostic), 'saveVirtualProjection');
+    return this.withDb(owner, true, (db, diagnostic) => db.transaction(() => {
+      this.setMeta(db, 'source', projection.childSnapshot || null, diagnostic);
+      this.setMeta(db, 'virtual', { ...metadata, owner: ownerKey(owner) }, diagnostic);
+    })(), 'saveVirtualProjection');
   }
   readVirtualProjection(owner, descriptor) {
     return this.withDb(owner, false, (db, diagnostic) => {
@@ -425,6 +464,7 @@ class HistoryPreparedCache {
     }, 'readVirtualProjection');
   }
   saveVirtualState(owner, state) {
+    this.saveSourceHeader(owner, state.childSnapshot, state.childProof || []);
     const payloads = this.pendingPayloads?.() || new Map();
     const saved = this.withDb(owner, true, (db, diagnostic) => db.transaction(() => {
       diagnostic.bytes = 0; diagnostic.snapshotBytes = state.childSnapshot?.size;
@@ -478,6 +518,7 @@ class HistoryPreparedCache {
   async savePrepared({ owner, source, context, entries, sessionMeta = null, kind = 'view' }) {
     this.onStage?.({ phase: kind + '-rows', sessionId: owner.sessionId });
     const started = performance.now();
+    this.saveSourceHeader(owner, source);
     const view = kind === 'base' ? 'base' : 'view:' + String(owner.tabId || '');
     const indexEntries = []; const liveRows = new Uint8Array(entries.length); let bytes = 0;
     const assets = new Map();
@@ -521,7 +562,9 @@ class HistoryPreparedCache {
       this.metrics.preparedWriteMs += performance.now() - started;
       return true;
     }, 'savePrepared');
-    if (saved) this.rememberIndex(this.filename(owner) + '\u0000' + view, { nonce: indexNonce, entries: indexEntries, liveRows, bytes }, 'savePrepared');
+    if (saved) {
+      this.rememberIndex(this.filename(owner) + '\u0000' + view, { nonce: indexNonce, entries: indexEntries, liveRows, bytes }, 'savePrepared');
+    }
     return saved;
   }
   readPrepared({ owner, filePath, stat, context, hydrate, kind = 'view' }) {
@@ -570,7 +613,12 @@ class HistoryPreparedCache {
     return result;
   }
   savePayload(owner, id, value) {
+    const source = this.readSource(owner);
     return this.withDb(owner, true, (db, diagnostic) => {
+      if (source) {
+        this.setMeta(db, 'owner', ownerKey(owner), diagnostic);
+        this.setMeta(db, 'source', source, diagnostic);
+      }
       const { body, checksum } = encode(value);
       diagnostic.bytes = body.length;
       db.prepare('INSERT OR REPLACE INTO payloads VALUES (?,?,?)').run(id, body, checksum);
@@ -578,8 +626,13 @@ class HistoryPreparedCache {
     }, 'savePayload');
   }
   savePayloads(owner, values) {
+    const source = this.readSource(owner);
     return this.withDb(owner, true, (db, diagnostic) => db.transaction(() => {
       diagnostic.bytes = 0;
+      if (source) {
+        this.setMeta(db, 'owner', ownerKey(owner), diagnostic);
+        this.setMeta(db, 'source', source, diagnostic);
+      }
       const put = db.prepare('INSERT OR REPLACE INTO payloads VALUES (?,?,?)');
       for (const [id, value] of values) {
         const { body, checksum } = encode(value); put.run(id, body, checksum); this.metrics.payloadWriteBytes += body.length;
@@ -616,6 +669,19 @@ class HistoryPreparedCache {
       diagnostic.bytes = row.body.length;
       return decode(row);
     }, 'readPayload');
+  }
+  saveSourceHeader(owner, source, proof) {
+    // Keep the small source/prefix certificate with Timeline when bulky state
+    // or ready rows are evicted; payload fallback must preserve generation proof.
+    return this.withDb(owner, true, (db, diagnostic) => db.transaction(() => {
+      const previous = this.getMeta(db, 'source');
+      this.setMeta(db, 'owner', ownerKey(owner), diagnostic);
+      this.setMeta(db, 'source', source, diagnostic);
+      if (proof !== undefined) this.setMeta(db, 'sourceProof', proof, diagnostic);
+      else if (['filePath', 'size', 'mtimeMs', 'ctimeMs', 'fileIdentity', 'sourceGeneration']
+        .some(key => previous?.[key] !== source?.[key])) db.prepare("DELETE FROM meta WHERE key='sourceProof'").run();
+      return true;
+    })(), 'saveSourceHeader');
   }
   stats() { return { ...this.metrics, diskBytes: this.diskBytes || 0, budgetBytes: this.maxBytes,
     indexMemoryBytes: this.indexMemoryBytes, indexMemoryBudget: this.indexMemoryBudget }; }

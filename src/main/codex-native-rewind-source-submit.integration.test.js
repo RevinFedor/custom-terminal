@@ -11,6 +11,13 @@ const source = fs.readFileSync(process.env.CODEX_REWIND_MAIN_SOURCE || path.join
 const ast = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, true);
 const quiet = { log() {}, warn() {}, error() {} };
 const noop = () => {};
+let sqliteAvailable = true;
+try { const db = new (require('better-sqlite3'))(':memory:'); db.close(); }
+catch (error) {
+  if (!/NODE_MODULE_VERSION|different Node\.js version/.test(String(error.message))) throw error;
+  sqliteAvailable = false;
+}
+const sqliteTest = (name, fn) => test(name, { skip: sqliteAvailable ? false : 'Electron Node18 SQLite ABI required' }, fn);
 
 function load(context, names) {
   vm.createContext(context);
@@ -44,6 +51,7 @@ function lineHarness({ statePatch = {}, offset = 9545463, foreignWatcher = false
     recordCodexLiveSubagentOwnership: noop, trackCodexTabSubagentActivity: noop,
     codexEventType: r => r.type === 'event_msg' ? r.payload?.type : null,
     processCodexUserMessagePasteAudit: () => ({ matched: true }),
+    observeCodexPromptAuditCarrier: noop,
     resolveCodexLivePromptOwner: () => null,
     codexLiveSourceIdentity: () => 'exact-source', observeCodexCapacityRetryRecord: noop,
     buildCodexLiveRawMessage: () => null, buildCodexHistoryLiveCompactEntry: () => null,
@@ -93,6 +101,8 @@ function sourceSubmitHarness(t, { large = false, journalPatch = {}, suffix, onSc
   // Production source proof stores the canonical lsof path. macOS tempdir is
   // a /var -> /private/var alias; use that same canonical authority in fixtures.
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'noted-native-source-submit-')));
+  let db;
+  t.after(() => { db?.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const sid = 'a296a580-02d4-4ae7-ad3f-021be29390ac';
   const tab = 'HH467';
   const key = 'codex.pending-writer-handoff.v1:' + tab;
@@ -130,7 +140,7 @@ function sourceSubmitHarness(t, { large = false, journalPatch = {}, suffix, onSc
       expectedLen: 57, expectedHash: audit.promptAuditFingerprint(prompt),
       sentAtMs: sentAt, submitWrittenAtMs: sentAt + 2, sourceFilePath: file, sourceFileSize: bytes, runSeq: 2 },
     ...journalPatch };
-  const db = new Database(':memory:');
+  db = new Database(':memory:');
   db.exec('CREATE TABLE app_state(key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);'
     + 'CREATE TABLE tabs(project_id TEXT, tab_id TEXT, codex_session_id TEXT);');
   const manager = new DatabaseManager({ existingConnection: db });
@@ -139,7 +149,6 @@ function sourceSubmitHarness(t, { large = false, journalPatch = {}, suffix, onSc
     operationId: original.operationId, historyDraftText: prompt, activeSessionId: sid });
   db.prepare('INSERT INTO app_state VALUES(?,?,?)').run('original-result', immutableReceipt, 1);
   db.prepare('INSERT INTO tabs VALUES(?,?,?)').run('P', tab, sid);
-  t.after(() => { db.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const terminal = { write() { assert.fail('no PTY writes'); } };
   const command = { runSeq: 2, isRunning: true };
   const intent = { sourceMode: 'writer-handoff', sourceSessionId: sid, launchId: generation,
@@ -159,7 +168,9 @@ function sourceSubmitHarness(t, { large = false, journalPatch = {}, suffix, onSc
     ...require('./codex-runtime-contract'),
     ...require('./codex-resume-user-activity'), ...require('./codex-prompt-audit'),
     pasteAuditHash: audit.promptAuditFingerprint,
-    CODEX_NATIVE_REWIND_CHILD_WINDOW_MS: 600000,
+    CODEX_NATIVE_REWIND_CHILD_WINDOW_MS: vm.runInNewContext(ast.statements
+      .filter(node => ts.isVariableStatement(node)).flatMap(node => [...node.declarationList.declarations])
+      .find(node => node.name.getText(ast) === 'CODEX_NATIVE_REWIND_CHILD_WINDOW_MS').initializer.getText(ast)),
     terminalProjects: new Map([[tab, root]]), terminalProjectIds: new Map([[tab, 'P']]),
     terminals: new Map([[tab, terminal]]), terminalCommandState: new Map([[tab, command]]),
     codexWatchers: new Map([[tab, observer]]), codexSessionDiscoveryIntents: new Map([[tab, intent]]),
@@ -222,7 +233,7 @@ function sourceSubmitHarness(t, { large = false, journalPatch = {}, suffix, onSc
     setObservation: x => { observation = x; }, setProcessStatus: x => { processStatus = x; } };
 }
 
-test('HH native draft -> exact continued-source Send -> same writer, without a second Enter', async t => {
+sqliteTest('HH native draft -> exact continued-source Send -> same writer, without a second Enter', async t => {
   const h = sourceSubmitHarness(t, { large: true });
   assert.ok(fs.statSync(h.file).size > 9_000_000);
   const result = await h.run();
@@ -238,6 +249,59 @@ test('HH native draft -> exact continued-source Send -> same writer, without a s
   assert.equal(h.events.filter(x => x === 'close-discovery').length, 1);
 });
 
+sqliteTest('a real descendant created188s after native action prevents a false no-descendant source settlement', async t => {
+  const h = sourceSubmitHarness(t);
+  const data = require('./ipc/codex-data')._api;
+  const childId = require('node:crypto').randomUUID();
+  fs.writeFileSync(path.join(h.root, 'rollout-' + childId + '.jsonl'), JSON.stringify({ type: 'session_meta',
+    payload: { id: childId, cwd: h.root, timestamp: new Date(h.original.actionStartedAtMs + 188000).toISOString(),
+      source: 'cli', thread_source: 'user', forked_from_id: h.sid } }) + '\n');
+  h.context.codexDataModule._api.inspectCodexDescendantSessions = args =>
+    data.inspectCodexDescendantSessions({ ...args, sessionsDir: h.root });
+  assert.equal(h.context.CODEX_NATIVE_REWIND_CHILD_WINDOW_MS, 120000, 'test uses the production window, not a longer mock');
+  assert.equal((await h.run()).status, 'incumbent-overlap-pending');
+  assert.equal(h.events.includes('publish-writer'), false);
+  assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present');
+});
+
+sqliteTest('a descendant appearing during transcript proof is rechecked before source settlement', async t => {
+  let h;
+  h = sourceSubmitHarness(t, { onScan: () => {
+    const childId = 'dc23b831-3a10-4941-8c77-7c57f21c4e26';
+    fs.writeFileSync(path.join(h.root, 'rollout-' + childId + '.jsonl'), JSON.stringify({ type: 'session_meta',
+      payload: { id: childId, cwd: h.root, timestamp: new Date(h.original.actionStartedAtMs + 188000).toISOString(),
+        source: 'cli', thread_source: 'user', forked_from_id: h.sid } }) + '\n');
+  } });
+  h.context.codexDataModule._api.inspectCodexDescendantSessions = args =>
+    require('./ipc/codex-data')._api.inspectCodexDescendantSessions({ ...args, sessionsDir: h.root });
+  assert.equal((await h.run()).status, 'incumbent-overlap-pending');
+  assert.equal(h.events.includes('publish-writer'), false);
+  assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present');
+});
+
+for (const arrival of ['before-startup', 'during-transcript']) sqliteTest('actual outer startup preserves delayed child and journal: ' + arrival, async t => {
+  let h;
+  const addChild = () => {
+    const childId = 'b0ad8d0d-7b18-4f99-99c3-df076336ff4b';
+    fs.writeFileSync(path.join(h.root, 'rollout-' + childId + '.jsonl'), JSON.stringify({ type: 'session_meta',
+      payload: { id: childId, cwd: h.root, timestamp: new Date(h.original.actionStartedAtMs + 188000).toISOString(),
+        source: 'cli', thread_source: 'user', forked_from_id: h.sid } }) + '\n');
+  };
+  h = sourceSubmitHarness(t, { onScan: arrival === 'during-transcript' ? addChild : undefined });
+  if (arrival === 'before-startup') addChild();
+  h.context.CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX = h.key;
+  h.context.proveCodexRecoveredRewindDescendantMatchesTarget = async () => ({ proven: false, reason: 'not-correlated' });
+  h.context.codexDataModule._api.inspectCodexDescendantSessions = args =>
+    require('./ipc/codex-data')._api.inspectCodexDescendantSessions({ ...args, sessionsDir: h.root });
+  load(h.context, ['recoverPendingCodexNativeRewindHandoffs']);
+  const result = await h.context.recoverPendingCodexNativeRewindHandoffs();
+  assert.equal(result.stableSourceRecovered, 0);
+  assert.equal(result.unresolved, 1);
+  assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present');
+  assert.equal(h.events.includes('publish-writer'), false);
+  assert.equal(h.db.prepare('SELECT value FROM app_state WHERE key=?').get('original-result').value, h.immutableReceipt);
+});
+
 for (const [name, patch] of [
   ['draft without submitted bytes', { phase: 'branch-draft-restored' }],
   ['different action generation', { actionGeneration: 'other' }],
@@ -245,7 +309,7 @@ for (const [name, patch] of [
   ['wrong target hash', { targetTextHash: '0'.repeat(64) }],
   ['wrong source lifecycle', { sourceLifecycleGeneration: 'pty:9' }],
   ['wrong run', { sourceRunSeq: 9 }],
-]) test('no source settlement: ' + name, async t => {
+]) sqliteTest('no source settlement: ' + name, async t => {
   const h = sourceSubmitHarness(t, { journalPatch: patch });
   assert.equal((await h.run()).status, 'incumbent-overlap-pending');
   assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present');
@@ -262,14 +326,14 @@ for (const [name, mutation] of [
   ['journal replaced', c => { const j = c.readPendingCodexNativeRewindHandoff();
     c.projectManager.db.db.prepare('UPDATE app_state SET value=? WHERE key=?')
       .run(JSON.stringify({ ...j, requestId: 'new-request' }), c.codexNativeRewindHandoffJournalKey()); }],
-]) test('async source proof cannot cross ' + name, async t => {
+]) sqliteTest('async source proof cannot cross ' + name, async t => {
   const h = sourceSubmitHarness(t, { onScan: mutation });
   assert.equal((await h.run()).status, 'incumbent-overlap-pending');
   assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present');
   assert.equal(h.events.includes('close-discovery'), false);
 });
 
-test('installed/pre-fix same-source path remains pending despite the exact durable submit', async t => {
+sqliteTest('installed/pre-fix same-source path remains pending despite the exact durable submit', async t => {
   // With CODEX_REWIND_MAIN_SOURCE this test also documents the original RED.
   const h = sourceSubmitHarness(t);
   const initial = h.context.reconcileCodexNativeRewindSourceSubmit;
@@ -283,7 +347,7 @@ test('installed/pre-fix same-source path remains pending despite the exact durab
 for (const [name, discovery] of [
   ['incomplete discovery', { complete: false, descendants: [] }],
   ['existing child', { complete: true, descendants: [{ sessionId: 'child' }] }],
-]) test('continued source does not erase ' + name, async t => {
+]) sqliteTest('continued source does not erase ' + name, async t => {
   const h = sourceSubmitHarness(t);
   h.context.codexDataModule._api.inspectCodexDescendantSessions = async () => discovery;
   assert.equal((await h.run()).status, 'incumbent-overlap-pending');
@@ -299,7 +363,7 @@ for (const [name, suffix] of [
   ['aborted slot then same text', ({ event, response, prompt, sentAt }) => [event('task_started', sentAt + 10),
     response('different', sentAt + 20), event('turn_aborted', sentAt + 21),
     event('user_message', sentAt + 30, { message: prompt })]],
-]) test('continued-source proof refuses ' + name, async t => {
+]) sqliteTest('continued-source proof refuses ' + name, async t => {
   const h = sourceSubmitHarness(t, { suffix });
   assert.equal((await h.run()).status, 'incumbent-overlap-pending');
   assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present');
@@ -312,7 +376,7 @@ for (const [name, mutate] of [
   ['changed persisted binding', h => { h.db.prepare('UPDATE tabs SET codex_session_id=?').run('other'); }],
   ['source inode replaced', h => { fs.renameSync(h.file, h.file + '.old'); fs.copyFileSync(h.file + '.old', h.file); }],
   ['source truncated', h => { fs.truncateSync(h.file, 5); }],
-]) test('final source commit rejects ' + name, async t => {
+]) sqliteTest('final source commit rejects ' + name, async t => {
   let h;
   let probes = 0;
   h = sourceSubmitHarness(t, { onRevalidate: () => { if (++probes === 2) mutate(h); } });
@@ -322,7 +386,7 @@ for (const [name, mutate] of [
   assert.equal(h.events.includes('publish-writer'), false);
 });
 
-test('SQLite settlement refusal preserves observer/journal/receipt and publishes no writer', async t => {
+sqliteTest('SQLite settlement refusal preserves observer/journal/receipt and publishes no writer', async t => {
   const h = sourceSubmitHarness(t);
   h.manager.resolvePendingCodexStableSourceFromTranscript = () => ({ success: false, error: 'fixture-CAS-refused' });
   assert.equal((await h.run()).status, 'incumbent-overlap-pending');
@@ -331,7 +395,7 @@ test('SQLite settlement refusal preserves observer/journal/receipt and publishes
   assert.equal(h.db.prepare('SELECT value FROM app_state WHERE key=?').get('original-result').value, h.immutableReceipt);
 });
 
-test('fresh physical unknown after exact settlement is not fabricated as adopted', async t => {
+sqliteTest('fresh physical unknown after exact settlement is not fabricated as adopted', async t => {
   const h = sourceSubmitHarness(t);
   h.setProcessStatus({ status: 'unknown', preserveWriterProof: true });
   assert.equal((await h.run()).status, 'unknown');
@@ -339,7 +403,7 @@ test('fresh physical unknown after exact settlement is not fabricated as adopted
   assert.equal(h.events.includes('publish-writer'), false);
 });
 
-test('restart uses the same original branch submit tuple and exact startup CAS', async t => {
+sqliteTest('restart uses the same original branch submit tuple and exact startup CAS', async t => {
   const h = sourceSubmitHarness(t);
   const result = await h.context.recoverPendingCodexStableSourceFromTranscript({ key: h.key,
     journal: h.original, currentSessionId: h.sid, discoveryComplete: true, descendants: [] });
@@ -350,7 +414,7 @@ test('restart uses the same original branch submit tuple and exact startup CAS',
   assert.equal(h.db.prepare('SELECT value FROM app_state WHERE key=?').get('original-result').value, h.immutableReceipt);
 });
 
-test('proof IO failure keeps the written journal pending, not a thrown public read', async t => {
+sqliteTest('proof IO failure keeps the written journal pending, not a thrown public read', async t => {
   const h = sourceSubmitHarness(t);
   h.context.codexDataModule._api.scanCodexStableSourceRewindProof = async () => { throw Error('fixture-read-failed'); };
   const result = await h.run();
@@ -359,14 +423,14 @@ test('proof IO failure keeps the written journal pending, not a thrown public re
   assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present');
 });
 
-test('explicit Stop during proof cannot clear the written journal', async t => {
+sqliteTest('explicit Stop during proof cannot clear the written journal', async t => {
   const h = sourceSubmitHarness(t, { onScan: c => { c.isCodexExitObserverCurrent = () => false; } });
   assert.equal((await h.run()).status, 'stale-exit-observer');
   assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present');
   assert.equal(h.events.includes('close-discovery'), false);
 });
 
-test('queued writer lock rejects a source replacement before the SQLite CAS', async t => {
+sqliteTest('queued writer lock rejects a source replacement before the SQLite CAS', async t => {
   const h = sourceSubmitHarness(t);
   h.context.runKeyedExclusive = async (_map, _key, run) => {
     fs.renameSync(h.file, h.file + '.old'); fs.copyFileSync(h.file + '.old', h.file);
@@ -376,7 +440,7 @@ test('queued writer lock rejects a source replacement before the SQLite CAS', as
   assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present');
 });
 
-test('real process FD/metadata inspection feeds exact source submit -> SQLite -> normal writer adoption', async t => {
+sqliteTest('real process FD/metadata inspection feeds exact source submit -> SQLite -> normal writer adoption', async t => {
   const cp = require('node:child_process');
   const util = require('node:util');
   const h = sourceSubmitHarness(t);
@@ -423,7 +487,7 @@ test('real process FD/metadata inspection feeds exact source submit -> SQLite ->
   assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'absent');
 });
 
-test('delayed child reads its own causal bytes, not an undefined Resume reservation', async t => {
+sqliteTest('delayed child reads its own causal bytes, not an undefined Resume reservation', async t => {
   const h = sourceSubmitHarness(t);
   const childId = 'fixture-delayed-child';
   const created = Number(h.original.submitProof.sentAtMs) + 10;
@@ -448,7 +512,7 @@ test('delayed child reads its own causal bytes, not an undefined Resume reservat
   assert.equal(h.manager.inspectPendingCodexWriterHandoff(h.key).status, 'present', 'read proof never commits');
 });
 
-test('same-SID recovery uses the actual publisher to refresh desktop and public writer state', async t => {
+sqliteTest('same-SID recovery uses the actual publisher to refresh desktop and public writer state', async t => {
   const h = sourceSubmitHarness(t);
   const sent = [];
   const snapshots = [];

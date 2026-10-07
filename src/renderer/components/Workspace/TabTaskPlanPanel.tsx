@@ -2029,6 +2029,10 @@ function TabTaskPlanPanel({
         }}
       >
         <style>{`
+          [data-tab-task-plan] > [data-tab-responsibility]:hover,
+          [data-tab-task-plan] > [data-task-plan-header]:hover {
+            box-shadow: inset 0 0 0 999px rgba(255,255,255,0.045);
+          }
           @keyframes noted-task-plan-flash {
             0% { background-color: rgba(167, 139, 250, 0.34); box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0.62); }
             100% { background-color: transparent; box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0); }

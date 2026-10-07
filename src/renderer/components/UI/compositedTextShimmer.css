@@ -1,0 +1,84 @@
+/* Text stays in normal layout. The mask and gradient never affect its size. */
+.noted-text-shimmer {
+  position: relative;
+  display: inline-block;
+}
+.noted-text-shimmer__source {
+  display: block;
+  /* The intrinsic text width also changes when an already-loaded font is
+     selected inside a fixed naming box. Observe this local box, not ancestors. */
+  width: max-content;
+  opacity: 0;
+  white-space: inherit;
+  overflow: inherit;
+  text-overflow: inherit;
+}
+.noted-text-shimmer__baseline {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  vertical-align: baseline;
+}
+.noted-text-shimmer__mask {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.noted-text-shimmer__definitions {
+  position: absolute;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  user-select: none;
+  font: inherit;
+  font-variant-numeric: inherit;
+  letter-spacing: inherit;
+}
+.noted-text-shimmer__raster {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  will-change: transform;
+}
+.hp-history-response-tail[data-state="running"] .noted-text-shimmer--working,
+.tab-title-naming-text.noted-text-shimmer--naming {
+  color: inherit;
+  -webkit-text-fill-color: currentColor;
+  background: none;
+  animation: none;
+  will-change: auto;
+}
+.tab-title-naming-text.noted-text-shimmer--naming {
+  position: absolute;
+  display: block;
+}
+.noted-text-shimmer--working .noted-text-shimmer__raster {
+  width: 250%;
+  background: linear-gradient(90deg, #8f8d88 0%, #8f8d88 42%, #b8b4ac 46%, #d3cfc7 50%, #b8b4ac 54%, #8f8d88 58%, #8f8d88 100%);
+  animation: noted-working-text-travel 1.65s linear infinite;
+}
+@keyframes noted-working-text-travel {
+  from { transform: translate3d(-60%, 0, 0); }
+  to { transform: translate3d(0, 0, 0); }
+}
+.noted-text-shimmer--naming .noted-text-shimmer__raster {
+  left: -260%;
+  width: 780%;
+  background-image: linear-gradient(90deg, rgba(148, 163, 184, .55) 0%, rgba(255, 255, 255, .95) 42%, rgba(129, 140, 248, .95) 50%, rgba(255, 255, 255, .95) 58%, rgba(148, 163, 184, .55) 100%);
+  background-size: calc(100% / 3) 100%;
+  animation: noted-naming-text-travel 1.35s linear infinite;
+}
+@keyframes noted-naming-text-travel {
+  from { transform: translate3d(-36.9230769231%, 0, 0); }
+  to { transform: translate3d(16.4102564103%, 0, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .noted-text-shimmer--working .noted-text-shimmer__mask { display: none; }
+  .noted-text-shimmer--working .noted-text-shimmer__raster { animation: none; }
+  .noted-text-shimmer--working .noted-text-shimmer__source { opacity: 1; color: #96938d; }
+}

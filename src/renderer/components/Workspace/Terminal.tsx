@@ -387,11 +387,11 @@ const getSetTabCommandType = () => useWorkspaceStore.getState().setTabCommandTyp
 
 // Get updateTabCwd for OSC 7 handler (shell reports cwd changes)
 const getUpdateTabCwd = () => {
-  return async (tabId: string, newCwd: string): Promise<boolean> => {
+  return async (tabId: string, newCwd: string, commit?: any): Promise<boolean> => {
     const state = useWorkspaceStore.getState();
     for (const [projectId, workspace] of state.openProjects) {
       if (workspace.tabs.has(tabId)) {
-        return state.updateTabCwd(projectId, tabId, newCwd);
+        return state.updateTabCwd(projectId, tabId, newCwd,commit);
       }
     }
     return false;
@@ -424,7 +424,7 @@ const submitOscCwdCandidate = (tabId: string, candidate: string): void => {
         try {
           const result = await ipcRenderer.invoke('terminal:updateCwd', { tabId, cwd: next });
           if (result?.accepted && typeof result.cwd === 'string') {
-            const rendererSaved = await getUpdateTabCwd()(tabId, result.cwd);
+            const rendererSaved = await getUpdateTabCwd()(tabId, result.cwd,result);
             if (!rendererSaved && result.persisted !== true) {
               console.warn('[Terminal:CwdProof] accepted cwd could not be persisted', {
                 tabId,

@@ -31,6 +31,7 @@ test('default policy is enabled and permits exactly one retry', () => {
   assert.deepEqual(normalizeCodexCapacityRetrySettings(), {
     codexCapacityRetryEnabled: true,
     codexCapacityRetryLimit: 1,
+    codexCapacityRetryDelaysMs: [],
   });
   const first = reduce(null, capacity('turn-1', 10));
   assert.equal(first.effect.type, 'continue');

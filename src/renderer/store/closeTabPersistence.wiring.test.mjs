@@ -15,9 +15,9 @@ test('close persists an exact candidate before removing it from renderer state',
   const expectedAt = closeTab.indexOf('const expectedTabIdsBeforeClose = Array.from(workspace.tabs.keys())');
   const preflightAt = closeTab.indexOf("ipcRenderer.invoke('project:validate-tab-snapshot'");
   const candidateAt = closeTab.indexOf('const closeCandidateTabs = tabsAfterClose(');
-  const persistAt = closeTab.indexOf('const closeSnapshot = await saveTabsThenNotifyProjectLayoutChanged(');
-  const rejectAt = closeTab.indexOf('if (closeSnapshot?.success === false)');
-  const publishAt = closeTab.indexOf('workspace.tabs = closeCandidateTabs');
+  const persistAt = closeTab.indexOf('const closeSnapshot = closeCatalogs.size > 1');
+  const rejectAt = closeTab.indexOf('if (!isDurableSaveTabsAck(closeSnapshot))');
+  const publishAt = closeTab.indexOf('for (const catalog of closeCatalogs.values()) catalog.workspace.tabs = catalog.tabs');
   const bufferCleanupAt = closeTab.indexOf('clearTerminalBuffer(tabId)');
 
   assert.ok(expectedAt >= 0);
@@ -28,5 +28,7 @@ test('close persists an exact candidate before removing it from renderer state',
   assert.ok(publishAt > rejectAt);
   assert.ok(bufferCleanupAt > publishAt, 'renderer buffer must survive until the close ACK');
   assert.match(closeTab.slice(persistAt, rejectAt), /expectedTabIdsBeforeClose/);
+  assert.match(closeTab.slice(persistAt, rejectAt), /await saveTabsBatchThenNotifyProjectLayoutChanged/);
+  assert.match(closeTab.slice(persistAt, rejectAt), /await saveTabsThenNotifyProjectLayoutChanged/);
   assert.doesNotMatch(closeTab.slice(0, persistAt), /workspace\.tabs\.delete\(tabId\)/);
 });
