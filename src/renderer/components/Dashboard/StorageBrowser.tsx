@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {createPortal} from 'react-dom';
 import { Virtuoso } from 'react-virtuoso';
 import { Check, ChevronDown, ChevronRight, Database, HardDrive, RefreshCw, Shield, Trash2, X } from 'lucide-react';
 import ControlHint from '../UI/ControlHint';
@@ -100,7 +101,7 @@ const sectionIcon = (section: StorageSection) => (
   section === 'sessions' ? <HardDrive size={14} /> : section === 'builds' ? <Database size={14} /> : <Database size={14} />
 );
 
-export default function StorageBrowser() {
+export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElement|null}={}) {
   const showToast = useUIStore((state) => state.showToast);
   const expanded = useUIStore((state) => state.storageBrowserExpanded);
   const setExpanded = useUIStore((state) => state.setStorageBrowserExpanded);
@@ -453,6 +454,48 @@ export default function StorageBrowser() {
 
   const totalLabel = inventory ? formatStorageBytes(inventory.summary.totalBytes) : '—';
 
+  const details = <aside data-storage-details className="home-storage-details bg-white/[0.012] p-4">
+                  {selected ? (
+                    <>
+                      <div className="truncate text-sm font-semibold text-[#ddd]">{selected.title}</div>
+                      <div className="mt-1 break-all font-mono text-[9px] text-[#666]">{selected.sessionId || selected.id}</div>
+                      <dl className="mt-4 grid grid-cols-[86px_minmax(0,1fr)] gap-x-2 gap-y-2 text-[11px]">
+                        <dt className="text-[#666]">Size</dt><dd className="text-[#ccc]">{formatStorageBytes(selected.sizeBytes)}</dd>
+                        <dt className="text-[#666]">Provider</dt><dd className="capitalize text-[#ccc]">{selected.provider || '—'}</dd>
+                        <dt className="text-[#666]">Source</dt><dd className="text-[#ccc]">{selected.group === 'development' ? 'Development Noted Terminal' : selected.notedTerminal ? 'Noted Terminal' : 'Outside Noted Terminal'}</dd>
+                        <dt className="text-[#666]">Directory</dt><dd className="break-words text-[#ccc]">{selected.cwd || selected.project || '—'}</dd>
+                        <dt className="text-[#666]">Iterations</dt>
+                        <dd className="text-[#ccc]">{selected.iterations ?? selectedDetails?.totalIterations ?? (detailLoadingId === selected.id ? 'Loading…' : '—')}</dd>
+                        <dt className="text-[#666]">Created by</dt><dd className="text-[#ccc]">{STORAGE_GROUPS[selected.group]?.label || selected.group}</dd>
+                        <dt className="text-[#666]">Parent</dt><dd className="break-all font-mono text-[9px] text-[#888]">{selected.parentSessionId || '—'}</dd>
+                        <dt className="text-[#666]">Modified</dt><dd className="text-[#ccc]">{formatStorageDate(selected.modifiedAt)}</dd>
+                        <dt className="text-[#666]">Retention</dt><dd className="text-[#ccc]">{selected.protected ? 'Never' : selected.section === 'builds' ? 'Manual cleanup' : formatDeleteCountdown(selected.deleteAfter)}</dd>
+                      </dl>
+                      <Tooltip content={selected.path} side="left">
+                        <div className="mt-3 max-h-16 overflow-hidden break-all rounded border border-[#292929] bg-[#101010] p-2 font-mono text-[9px] text-[#777]">{selected.path}</div>
+                      </Tooltip>
+                      <div className={`mt-3 border-l-2 p-2 text-[10px] ${selected.protected ? 'border-[#555] bg-[#111] text-[#888]' : 'border-[#794325] bg-[#1c130e] text-[#b98260]'}`}>
+                        {selected.protectedReason || (selected.section === 'builds' ? 'Can delete manually · no auto-delete' : `Deletable · ${formatDeleteCountdown(selected.deleteAfter)}`)}
+                        {(selected.affectedItems || 1) > 1 && <div className="mt-1">Deleting this Codex thread also affects {selected.affectedItems} files · {formatStorageBytes(selected.affectedBytes || 0)}.</div>}
+                      </div>
+                      <div className="mt-4 flex gap-2">
+                        <button type="button" className="h-7 rounded border border-[#333] px-2 text-[10px] text-[#aaa] hover:bg-white/[0.04]" onClick={() => void copyPath()}>Copy path</button>
+                        <button
+                          type="button"
+                          data-storage-delete-selected
+                          disabled={!selected.deletable || confirmationPreparing}
+                          className="ml-auto flex h-7 items-center gap-1 rounded border border-red-500/25 px-2 text-[10px] text-red-300 disabled:cursor-not-allowed disabled:opacity-30"
+                          onClick={confirmSelectedDelete}
+                        >
+                          {confirmationPreparing ? <RefreshCw size={11} className="animate-spin" /> : <Trash2 size={11} />} {confirmationPreparing ? 'Checking…' : 'Delete now'}
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="flex h-full items-center justify-center text-xs text-[#555]">Select an item</div>
+                  )}
+                </aside>;
+
   return (
     <section data-storage-browser className="home-storage border-y border-[#292929] py-3">
       <div className="home-storage-heading flex min-h-8 flex-wrap items-center gap-2">
@@ -789,47 +832,7 @@ export default function StorageBrowser() {
                   )}
                 </section>
 
-                <aside data-storage-details className="home-storage-details bg-white/[0.012] p-4">
-                  {selected ? (
-                    <>
-                      <div className="truncate text-sm font-semibold text-[#ddd]">{selected.title}</div>
-                      <div className="mt-1 break-all font-mono text-[9px] text-[#666]">{selected.sessionId || selected.id}</div>
-                      <dl className="mt-4 grid grid-cols-[86px_minmax(0,1fr)] gap-x-2 gap-y-2 text-[11px]">
-                        <dt className="text-[#666]">Size</dt><dd className="text-[#ccc]">{formatStorageBytes(selected.sizeBytes)}</dd>
-                        <dt className="text-[#666]">Provider</dt><dd className="capitalize text-[#ccc]">{selected.provider || '—'}</dd>
-                        <dt className="text-[#666]">Source</dt><dd className="text-[#ccc]">{selected.group === 'development' ? 'Development Noted Terminal' : selected.notedTerminal ? 'Noted Terminal' : 'Outside Noted Terminal'}</dd>
-                        <dt className="text-[#666]">Directory</dt><dd className="break-words text-[#ccc]">{selected.cwd || selected.project || '—'}</dd>
-                        <dt className="text-[#666]">Iterations</dt>
-                        <dd className="text-[#ccc]">{selected.iterations ?? selectedDetails?.totalIterations ?? (detailLoadingId === selected.id ? 'Loading…' : '—')}</dd>
-                        <dt className="text-[#666]">Created by</dt><dd className="text-[#ccc]">{STORAGE_GROUPS[selected.group]?.label || selected.group}</dd>
-                        <dt className="text-[#666]">Parent</dt><dd className="break-all font-mono text-[9px] text-[#888]">{selected.parentSessionId || '—'}</dd>
-                        <dt className="text-[#666]">Modified</dt><dd className="text-[#ccc]">{formatStorageDate(selected.modifiedAt)}</dd>
-                        <dt className="text-[#666]">Retention</dt><dd className="text-[#ccc]">{selected.protected ? 'Never' : selected.section === 'builds' ? 'Manual cleanup' : formatDeleteCountdown(selected.deleteAfter)}</dd>
-                      </dl>
-                      <Tooltip content={selected.path} side="left">
-                        <div className="mt-3 max-h-16 overflow-hidden break-all rounded border border-[#292929] bg-[#101010] p-2 font-mono text-[9px] text-[#777]">{selected.path}</div>
-                      </Tooltip>
-                      <div className={`mt-3 border-l-2 p-2 text-[10px] ${selected.protected ? 'border-[#555] bg-[#111] text-[#888]' : 'border-[#794325] bg-[#1c130e] text-[#b98260]'}`}>
-                        {selected.protectedReason || (selected.section === 'builds' ? 'Can delete manually · no auto-delete' : `Deletable · ${formatDeleteCountdown(selected.deleteAfter)}`)}
-                        {(selected.affectedItems || 1) > 1 && <div className="mt-1">Deleting this Codex thread also affects {selected.affectedItems} files · {formatStorageBytes(selected.affectedBytes || 0)}.</div>}
-                      </div>
-                      <div className="mt-4 flex gap-2">
-                        <button type="button" className="h-7 rounded border border-[#333] px-2 text-[10px] text-[#aaa] hover:bg-white/[0.04]" onClick={() => void copyPath()}>Copy path</button>
-                        <button
-                          type="button"
-                          data-storage-delete-selected
-                          disabled={!selected.deletable || confirmationPreparing}
-                          className="ml-auto flex h-7 items-center gap-1 rounded border border-red-500/25 px-2 text-[10px] text-red-300 disabled:cursor-not-allowed disabled:opacity-30"
-                          onClick={confirmSelectedDelete}
-                        >
-                          {confirmationPreparing ? <RefreshCw size={11} className="animate-spin" /> : <Trash2 size={11} />} {confirmationPreparing ? 'Checking…' : 'Delete now'}
-                        </button>
-                      </div>
-                    </>
-                  ) : (
-                    <div className="flex h-full items-center justify-center text-xs text-[#555]">Select an item</div>
-                  )}
-                </aside>
+                {detailsHost?createPortal(details,detailsHost):details}
               </div>
 
               <div className="flex min-h-10 flex-wrap items-center gap-3 py-2 border-t border-[#292929] bg-white/[0.008] px-1 text-[10px] text-[#666]">

@@ -2,6 +2,7 @@ const { ipcMain } = require('node:worker_threads').isMainThread ? require('elect
 const path = require('path');
 const fs = require('fs');
 const { historyImageCountFromProviderRecord } = require('../../shared/history-search.cjs');
+const { historyRecordTimeFromRecord } = require('../../shared/history-record-time.cjs');
 const os = require('os');
 const crypto = require('crypto');
 const { historyRewriteOperation } = require('../../shared/fork-operation.cjs');
@@ -1623,6 +1624,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
   if (!cellId && (rawOutput !== undefined || isError)) {
     assignCodexHistoryResults(callGroups, rawOutput, isError);
   }
+  const recordTime = historyRecordTimeFromRecord(call?.record, 'tool-call', call?.toolName === 'exec' ? 'container' : 'record');
   const actions = callGroups.flat().map((action, index) => {
     // A subagent card is already in its final shape — wrapping it as a raw
     // tool row would hide it from the background-chip strip, which recognises
@@ -1631,6 +1633,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
     if (action?.tool === 'Task') {
       return {
         ...action,
+        ...(recordTime ? { recordTime } : {}),
         ...(callId && !action.toolUseId ? { toolUseId: String(callId) } : {}),
         ...(action.result === undefined ? {} : { result: action.result }),
       };
@@ -1647,6 +1650,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
     return {
       tool: '__raw__',
       rawTool: {
+        ...(recordTime ? { recordTime } : {}),
         ...(callId ? { toolUseId: `${callId}:canonical:${index}` } : {}),
         toolName: action.toolName,
         args: action.args || {},
@@ -3528,6 +3532,7 @@ function pushAssistantEntry(
     role: 'assistant',
     timestamp: recordTimestamp(record),
     content: content || '',
+    ...(content && historyRecordTimeFromRecord(record) ? { recordTime: historyRecordTimeFromRecord(record) } : {}),
     thinking: thinking || undefined,
     actions: actions && actions.length > 0 ? actions : undefined,
     sessionId,
@@ -4182,6 +4187,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
           stableSourceIdentity(sessionId, record, 'codex-user'),
         );
         pending.entry.timestamp = recordTimestamp(record);
+        pending.entry.recordTime = historyRecordTimeFromRecord(record);
         pending.entry.sessionId = physicalSessionId;
       }
       return;
@@ -4192,6 +4198,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       role: 'user',
       timestamp: recordTimestamp(record),
       content: text,
+      recordTime: historyRecordTimeFromRecord(record),
       sessionId: physicalSessionId,
       turnIndex: currentTurnIndex + 1,
       serviceCarrier: 'project-instructions',
@@ -4321,6 +4328,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
           );
           promoteCodexPromptPresentationAuditIdentity(pending.entry, record, userText);
           pending.entry.timestamp = recordTimestamp(record);
+          pending.entry.recordTime = historyRecordTimeFromRecord(record);
           pending.entry.role = goalContinuation ? 'goal' : 'user';
           pending.entry.content = goalContinuation
             ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
@@ -4344,6 +4352,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
             role: goalContinuation ? 'goal' : 'user',
             imageCount: historyImageCountFromProviderRecord(record),
             timestamp: recordTimestamp(record),
+            recordTime: historyRecordTimeFromRecord(record),
             content: goalContinuation
               ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
               : userText,
@@ -4480,6 +4489,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
         promptPresentationTransportHash: promptAuditFingerprint(userText),
         role: goalContinuation ? 'goal' : 'user',
         timestamp: recordTimestamp(record),
+        recordTime: historyRecordTimeFromRecord(record),
         content: goalContinuation
           ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
           : userText,

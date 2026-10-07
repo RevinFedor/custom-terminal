@@ -10,6 +10,12 @@ const { mergeTabMessages: merge, tabMessageThreads: threads, tabMessageDelivery:
 const question = (patch = {}) => ({ messageId: 'q1', kind: 'question', sourceTabId: 'a', sourceProjectId: 'pa', sourceSessionId: 'sa', targetTabId: 'b', targetProjectId: 'pb', targetSessionId: 'sb', deliveryState: 'sent', createdAt: 10, updatedAt: 20, ...patch });
 const reply = (patch = {}) => question({ messageId: 'r1', kind: 'reply', replyTo: 'q1', sourceTabId: 'b', targetTabId: 'a', ...patch });
 
+test('normal waiting is gray, transport blue, confirmed green, attention yellow and failure red', () => {
+  const expected = { pending:'#a1a1aa',queued:'#a1a1aa',sending:'#60a5fa',sent:'#4ade80',
+    'waiting-for-input':'#fbbf24',unconfirmed:'#fbbf24',failed:'#f87171' };
+  for (const [deliveryState,color] of Object.entries(expected)) assert.equal(delivery(question({deliveryState})).color,color);
+});
+
 test('confirmed question and reply leave the live tracker after four seconds, not History', () => {
   const { tabMessageSuccessAt, tabMessageVisibleInTracker } = compiled.exports;
   const index = merge({}, [question(), reply({ updatedAt: 1000 })]);

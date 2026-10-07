@@ -15,7 +15,7 @@ INSERT INTO tabs (...)                  -- вставляет только то,
 
 **Причина:** Race condition или неполный Map на момент одного из вызовов `saveTabs` привёл к тому, что DELETE ALL снёс табы, которых не было в текущем снимке Map.
 
-## Решение: Safe 4-Step Pattern
+## Предыдущее решение: Safe 4-Step Pattern
 
 ```
 Step 1: DELETE FROM tabs WHERE tab_id = ?        -- удаляем ТОЛЬКО те, что перезаписываем
@@ -23,6 +23,16 @@ Step 2: DELETE FROM tabs WHERE tab_id IS NULL     -- чистим legacy-стр�
 Step 3: INSERT INTO tabs (...)                    -- вставляем все табы из Map
 Step 4: DELETE WHERE tab_id NOT IN (new_set)      -- ТОЛЬКО если count стабилен (diff <= 2)
 ```
+
+После workflow cutover07.10 обычное сохранение legacy metadata выявило другой
+шрам: существующий tabId оставался тем же, но PK менялся (private control A1→8).
+Это инвалидировало точный source frozen DnD, а удаление/вставка теряло колонки,
+не вошедшие в renderer snapshot, включая physical parent. Теперь существующая
+строка обновляется на месте по её namespace/tabId; INSERT нужен только для нового
+tabId. Cleanup строк без ID и Step4/safety guard сохранены. Историческую схему
+выше нельзя возвращать как оптимизацию текущего writer. Проверка — metadata-save
+между pickup и guarded commit, с сохранением PK/parent и независимых native rows;
+см. `src/main/workflow-drag.native.test.js`.
 
 ### Safety Guard (Step 4)
 Если количество табов в новом сохранении значительно меньше, чем в БД (разница > 2):

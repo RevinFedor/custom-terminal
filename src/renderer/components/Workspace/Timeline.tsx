@@ -4,7 +4,8 @@ import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, ChevronRight, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
+import scDesktopIcon from '../../assets/sc-desktop.png';
 import { projectTimelineNoteAnchors } from '../../utils/timelineNoteIdentity.mjs';
 import { projectTimelineWorkingFileMarkers } from '../../utils/timelineWorkingFileMarkers.mjs';
 import { useTabWorkContext } from '../../utils/tabWorkContext';
@@ -90,6 +91,7 @@ import {
   collectTimelineDocs,
   collectTimelinePromptLabels,
   isTimelineGroupExpanded,
+  timelineMarkerKind,
   timelineMarkerGeometry,
 } from '../../utils/timelineMarkerPresentation.mjs';
 import { mapTimelinePromptBoundaries } from '../../utils/timelinePromptBoundaryMap.mjs';
@@ -226,7 +228,8 @@ const TimelineCornerBadges: React.FC<{
   groupAccent: string;
   onAgentsClick?: () => void;
   agentsTitle?: string;
-}> = ({ items, isExpandedLayout, timelineFontSize, groupAccent, onAgentsClick, agentsTitle }) => {
+  flowLayout?: boolean;
+}> = ({ items, isExpandedLayout, timelineFontSize, groupAccent, onAgentsClick, agentsTitle, flowLayout = false }) => {
   const rightColumnCount = items.filter(item => item.slot.endsWith('right')).length;
   const dense = !isExpandedLayout && rightColumnCount >= 3;
 
@@ -235,7 +238,7 @@ const TimelineCornerBadges: React.FC<{
       const isLeft = badge.slot.endsWith('left');
       const isTop = badge.slot === 'top-right';
       const isBottom = badge.slot === 'bottom-right';
-      const positionStyle: React.CSSProperties = {
+      const positionStyle: React.CSSProperties = flowLayout ? { position: 'relative', zIndex: 2, flexShrink: 0 } : {
         position: 'absolute',
         zIndex: 2,
         ...(isLeft
@@ -344,6 +347,8 @@ const TimelineCornerBadges: React.FC<{
       );
     });
 
+  if (flowLayout) return <div data-timeline-badge-flow style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center',
+    alignItems: 'center', gap: 2, padding: '1px 2px', width: '100%', minWidth: 0 }}>{badges}</div>;
   if (isExpandedLayout) return <>{badges}</>;
 
   // Dots-only segments use flex-grow to distribute a sparse Timeline over the
@@ -476,6 +481,8 @@ interface TimelineEntry {
     kind: 'orchestration';
     runId: string;
     phase: 'request' | 'completion' | 'failure' | 'unknown';
+    runKind?: 'agent' | 'external-research';
+    targetTabName?: string;
     parentRunId?: string;
     sourceTabId?: string;
     targetTabId?: string;
@@ -988,6 +995,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   const entryIsTimeout = !!entry.isSubAgentTimeout;
   const orchestrationTag = getOrchestrationTag(entry);
   const entryIsOrchestration = !!orchestrationTag;
+  const markerKind = timelineMarkerKind(entry);
+  const entryIsExternalResearch = markerKind === 'sc-desktop';
   const entryIsSystem = isSystemPromptEntry(entry);
   const entryIsServicePrompt = isServicePromptEntry(entry);
   const orchestrationGroup = groupInfo?.groupKind === 'orchestration';
@@ -997,8 +1006,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   const isGroupCollapsed = !!(groupInfo?.isGroupHeader && !isGroupExpanded);
   const isGroupChild = !!(groupInfo?.isGroupChild && isGroupExpanded);
   const showAsChild = isGroupChild && !(groupInfo?.isGroupHeader && !isGroupExpanded);
-  const isExpandedHeader = !!(groupInfo?.isGroupHeader && isGroupExpanded);
-  const isGroupMeta = isGroupCollapsed || isExpandedHeader;
+  const isGroupMeta = isGroupCollapsed;
   const isPromptVisible = isInViewport && !isResponseOnly;
 
   const markerEdited = groupPresentation?.edited
@@ -1017,7 +1025,6 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
     docsEditedCount: markerEdited.length,
     docsSearchCount: markerSearched.length,
     subagentCount: entry.subAgents?.length || 0,
-    collapsedGroupSize: isGroupCollapsed ? groupInfo?.groupSize || 0 : 0,
     compactClusterSize: displaysAsCompact && !treeMode ? compactClusterCount : 0,
   });
   const hasDenseCornerBadges = cornerBadges.items
@@ -1098,29 +1105,46 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
 
   return (
     <React.Fragment>
-      {/* Phase 2: Expanded group toggle bar (collapse control) */}
-      {isExpandedHeader && (
-        <div
-          className="relative w-full flex items-center"
-          style={{ flex: '0 0 auto', height: '14px', cursor: 'pointer', justifyContent: 'center' }}
-          onClick={(e) => {
-            e.stopPropagation();
-            api.collapseGroup(groupInfo!.groupId);
-          }}
-        >
-          <div style={{ flex: 1, height: '1px', backgroundColor: `rgba(${groupAccentRgb}, 0.2)`, marginRight: '3px' }} />
-          <span className="pointer-events-none select-none shrink-0" style={{ fontSize: '9px', lineHeight: '1', color: groupAccent, fontFamily: 'monospace', fontWeight: 600 }}>
-            {groupInfo!.groupSize}
-          </span>
-          <div style={{ flex: 1, height: '1px', backgroundColor: `rgba(${groupAccentRgb}, 0.2)`, marginLeft: '3px' }} />
+      {isGroupCollapsed && hasNote && notePos === 'before' && noteStrip}
+      {groupInfo?.isGroupHeader && (
+        <div data-timeline-group-header={groupInfo.groupId}
+          data-timeline-entry-uuid={isGroupCollapsed ? entry.uuid : undefined}
+          data-segment={isGroupCollapsed ? '' : undefined}
+          ref={isGroupCollapsed ? el => api.setSegmentRef(index, el) : undefined}
+          onMouseEnter={isGroupCollapsed ? () => api.handleMouseEnterSegment(index) : undefined}
+          onMouseLeave={isGroupCollapsed ? api.handleMouseLeaveSegment : undefined}
+          onClick={event => { event.stopPropagation(); isGroupExpanded
+            ? api.collapseGroup(groupInfo.groupId) : api.expandGroup(groupInfo.groupId, groupInfo.groupKind); }}
+          style={{ flex: isGroupCollapsed && !isExpandedLayout ? '1 0 auto' : '0 0 auto', minWidth: 0,
+            width: '100%', position: 'relative', display: 'flex', flexDirection: 'column', justifyContent: 'center',
+            boxShadow: searchMatch ? dotGlow : undefined }}>
+          <button type="button" data-timeline-group-toggle={groupInfo.groupId}
+            data-timeline-group-collapse={isGroupExpanded ? groupInfo.groupId : undefined}
+            aria-expanded={isGroupExpanded}
+            aria-label={`${isGroupExpanded ? 'Свернуть' : 'Раскрыть'} группу: ${groupInfo.groupSize} записей`}
+            title={`${groupInfo.agentName}: ${groupInfo.groupSize} записей`}
+            style={{ width: '100%', minWidth: 0, height: 26, display: 'grid', gridTemplateRows: '14px 10px',
+              alignContent: 'center', justifyItems: 'center', padding: '0 2px', border: 0,
+              background: 'transparent', cursor: 'pointer', color: isGroupCollapsed ? dotColor : groupAccent }}
+            onClick={event => { event.stopPropagation(); isGroupExpanded
+              ? api.collapseGroup(groupInfo.groupId) : api.expandGroup(groupInfo.groupId, groupInfo.groupKind); }}>
+            {isGroupExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            <span data-timeline-group-count style={{ maxWidth: '100%', fontSize: 9, lineHeight: '10px',
+              fontFamily: 'monospace', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{groupInfo.groupSize}</span>
+          </button>
+          {isGroupCollapsed && <TimelineCornerBadges items={cornerBadges.items as TimelineCornerBadgeItem[]}
+            flowLayout isExpandedLayout={false} timelineFontSize={timelineFontSize} groupAccent={groupAccent}
+            onAgentsClick={() => api.openEntryAgents(entry)} agentsTitle={(entry.subAgents || []).map(agent => agent.label).join(', ')} />}
         </div>
       )}
+      {!isGroupCollapsed && <>
       {/* Note indicator strip — before dot */}
       {hasNote && notePos === 'before' && noteStrip}
       <div
         ref={(el) => api.setSegmentRef(index, el)}
         data-segment
         data-timeline-entry-uuid={entry.uuid}
+        data-timeline-marker-kind={markerKind}
         data-history-search-match={searchMatch ? 'true' : undefined}
         data-history-search-current={searchCurrent ? 'true' : undefined}
         {...(isUnreachable ? { 'data-unreachable': '' } : {})}
@@ -1147,15 +1171,16 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
           // dots-only/tree: original flex-grow distribution.
           flex: isExpandedLayout
             ? '0 0 auto'
-            : `1 0 ${hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')}`,
+            : `1 0 ${entryIsExternalResearch ? '32px' : hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')}`,
           minHeight: isExpandedLayout
             ? undefined
-            : (hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')),
+            : (entryIsExternalResearch ? '32px' : hasDenseCornerBadges ? '22px' : treeMode ? '22px' : (showAsChild ? '14px' : '20px')),
+          flexDirection: entryIsExternalResearch && !isExpandedLayout ? 'column' : undefined,
           alignItems: isExpandedLayout ? 'flex-start' : undefined,
           justifyContent: isExpandedLayout ? 'flex-start' : (treeMode ? 'flex-start' : 'center'),
           paddingLeft: isExpandedLayout
             ? '6px'
-            : (treeMode
+            : entryIsExternalResearch ? 0 : (treeMode
                 ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
                 : (showAsChild ? '4px' : undefined)),
           paddingRight: isExpandedLayout
@@ -1193,7 +1218,13 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
       >
         {/* Dot: hollow ring if unreachable, filled otherwise. pointer-events:
             auto so ПКМ на сам кружок ловится отдельно от полосы. */}
-        {isExpandedLayout ? (
+        {entryIsExternalResearch ? (
+          <img src={scDesktopIcon} alt="" data-timeline-sc-desktop
+            title={`SC Desktop · ${orchestrationTag.targetTabName || 'External Research'}`}
+            style={{ width: 14, height: 14, flexShrink: 0, objectFit: 'contain', borderRadius: 3,
+              opacity: isUnreachable ? 0.45 : 1, boxShadow: dotGlow,
+              outline: isRewindMarked || hasNote && notePos === 'dot' ? `1px solid ${dotColor}` : undefined }} />
+        ) : isExpandedLayout ? (
           (() => {
             const expSize = displaysAsCompact ? '8px' : (showAsChild ? '6px' : '8px');
             return (
@@ -1241,6 +1272,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
           groupAccent={groupAccent}
           onAgentsClick={() => api.openEntryAgents(entry)}
           agentsTitle={(entry.subAgents || []).map((agent) => agent.label).join(', ')}
+          flowLayout={entryIsExternalResearch && !isExpandedLayout}
         />
 
         {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
@@ -1341,6 +1373,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
       </div>
       {/* Note indicator strip — after dot */}
       {hasNote && notePos === 'after' && noteStrip}
+      </>}
+      {isGroupCollapsed && hasNote && notePos === 'after' && noteStrip}
       {/* Last boundary separator — "session starts below"; click → red X flash. */}
       {isLastBoundary && (
         <Tooltip content="Current session starts below">
@@ -7211,9 +7245,6 @@ function Timeline({
   rowApi.handleNoteStripLeave = handleNoteStripLeave;
   rowApi.flashStripFailed = flashStripFailed;
   rowApi.expandGroup = (groupId, groupKind) => {
-    if (groupKind === 'orchestration' && !isExpandedLayout) {
-      setTimelineTreeMode(tabId, true);
-    }
     setExpandedGroups(prev => {
       const next = new Set(prev);
       next.add(groupId);

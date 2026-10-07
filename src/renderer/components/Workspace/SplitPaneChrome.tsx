@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { ArrowLeftRight, BringToFront, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search } from 'lucide-react';
+import { ArrowLeftRight, BringToFront, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search, FolderInput } from 'lucide-react';
 import {requestHistorySearch} from '../../utils/historySearchMarkers';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
@@ -31,6 +31,7 @@ import {
   useWorkspaceWindowSwapPickerSnapshot,
 } from '../../utils/workspaceWindowSwapPicker.mjs';
 import HiddenWindowPicker from './HiddenWindowPicker';
+import TabMenuChoices from './TabMenuChoices';
 import type { SharedTabActivityMaps } from './TabSignals';
 import {
   CONTEXT_MENU_ICON_SLOT_STYLE,
@@ -222,6 +223,8 @@ export function SplitPaneAttachRow({
   // three columns full does not mean this column cannot still be stacked.
   const splitCan = windowSplitAvailability(splitPanes, paneIndex ?? null);
   const hasHiddenWindows = splitPanes.some(pane => pane.displayHidden);
+  const workflows = useWorkspaceStore(state=>state.spaces);
+  const sourceWindowId = paneIndex === null || paneIndex === undefined ? null : splitPanes[paneIndex]?.windowId || null;
   const inSplit = splitPanes.length > 0;
   const toggleStripMenuFromButton = (button: HTMLElement) => {
     if (ownsWorkspaceSwapPicker) {
@@ -854,6 +857,23 @@ export function SplitPaneAttachRow({
               style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',cursor:'pointer'}}>
               <Search size={13}/><span style={{flex:1,textAlign:'left'}}>Найти в чате</span><span style={{fontSize:10,color:'#999'}}>⌘F</span>
             </button>}
+            <button type="button" role="menuitem" data-split-strip-menu-item="show-window-alongside"
+              disabled={!splitCan.horizontal && !splitCan.vertical}
+              style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',textAlign:'left',cursor:'pointer'}}
+              onClick={()=>{
+                const store=useWorkspaceStore.getState();if(store.activeSpaceId!==activeSpaceId)return;
+                const currentIndex=sourceWindowId?store.splitPanes.findIndex(pane=>pane.windowId===sourceWindowId):null;
+                if(currentIndex===-1)return;
+                const accepted=splitCan.horizontal?store.addEmptySplitPane(currentIndex):store.addVerticalSplitPane(currentIndex,'below');
+                if(accepted)setStripMenu(null);
+              }}><Columns2 size={13}/>{hasHiddenWindows?'Показать скрытое окно рядом':'Добавить окно рядом'}</button>
+            <TabMenuChoices label="Перенести окно в workflow" icon={<FolderInput size={13}/>} action="move-window-to-workflow" side="left"
+              choices={workflows.filter(workflow=>workflow.id!==activeSpaceId).map(workflow=>({id:workflow.id,name:workflow.name}))}
+              onChoose={async target=>{
+                const moved=await useWorkspaceStore.getState().moveWorkspaceWindowToWorkflow(activeSpaceId,sourceWindowId,target);
+                if(moved)setStripMenu(null);
+                else useUIStore.getState().showToast('Перенос окна не подтверждён. Проверьте текущую раскладку.','warning');
+              }}/>
             <button
               ref={stripSwapMenuItemRef}
               type="button"

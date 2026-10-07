@@ -19264,7 +19264,12 @@ function createWindow() {
   // Show window when ready and force focus on macOS (Sequoia/Tahoe workaround)
   mainWindow.once('ready-to-show', () => {
     if (E2E_WINDOWED) {
-      console.log('[Window] ready-to-show, retained hidden for background CDP test');
+      if (process.env.NOTED_E2E_VISIBLE === '1') {
+        console.log('[Window] ready-to-show, showing private E2E window');
+        mainWindow.show();
+      } else {
+        console.log('[Window] ready-to-show, retained hidden for background CDP test');
+      }
       return;
     }
     console.log('[Window] ready-to-show fired, showing window...');
@@ -24518,6 +24523,10 @@ app.whenReady().then(async () => {
     ipcMain.handle('tab-messages:source-location', async (_event, payload = {}) => {
       return payload.messageId ? webServer.locateTabMessageSource(payload.messageId)
         : { success: false, error: 'messageId required' };
+    });
+    ipcMain.handle('orchestration:open-research-job', async (_event, payload = {}) => {
+      return payload.runId ? webServer.openExternalResearchJob(payload.runId)
+        : { success: false, error: 'runId required' };
     });
     ipcMain.handle('tab-messages:dismiss', async (_event, payload = {}) => {
       return webServer.dismissTabMessage(payload.tabId, payload.messageId);
@@ -31859,6 +31868,10 @@ ipcMain.handle('agent:enqueue-prompt', (_event, input) =>
   require(path.join(srcMainDir, 'web-server')).enqueueDesktopAgentPrompt(input));
 ipcMain.handle('agent:join-automatic-send', (_event, input) =>
   require(path.join(srcMainDir, 'web-server')).joinAutomaticAgentPrompt(input));
+ipcMain.handle('agent:merge-queued-send', (_event, input) =>
+  require(path.join(srcMainDir, 'web-server')).mergeQueuedAgentMessages(input));
+ipcMain.handle('agent:get-queued-merge', (_event, input) =>
+  require(path.join(srcMainDir, 'web-server')).readQueuedMessageMerge(input));
 const sendQueueRendererObservers = new Set();
 ipcMain.handle('agent:send-queue-ready', (event, ready = true) => {
   const ownerId = event.sender.id;
@@ -50555,6 +50568,7 @@ function buildCodexLiveCanonicalResultMessage(state, record, pending, decoded, s
 }
 
 function buildCodexLiveRawMessage(state, record) {
+  const { historyRecordTimeFromRecord } = require(path.join(srcMainDir, '..', 'shared', 'history-record-time.cjs'));
   const payload = record?.payload || {};
   const event = codexEventType(record);
   const sessionId = state.sessionId || codexKnownSessions.get(state.tabId) || null;
@@ -50580,6 +50594,7 @@ function buildCodexLiveRawMessage(state, record) {
       uuid,
       sourceIdentity: codexLiveSourceIdentity(state, record, 'codex-user'),
       sessionId,
+      recordTime: historyRecordTimeFromRecord(record),
       ...(serviceCarrier ? { serviceCarrier } : {}),
       ...(imagePaths.length > 0 ? { imagePaths } : {}),
       message: { role: 'user', content: [{ type: 'text', text }] },
@@ -50607,6 +50622,7 @@ function buildCodexLiveRawMessage(state, record) {
       uuid,
       sourceIdentity: codexLiveSourceIdentity(state, record, 'codex-user'),
       sessionId,
+      recordTime: historyRecordTimeFromRecord(record),
       ...(serviceCarrier ? { serviceCarrier } : {}),
       ...(imagePaths.length > 0 ? { imagePaths } : {}),
       message: { role: 'user', content: [{ type: 'text', text }] },
@@ -50644,6 +50660,7 @@ function buildCodexLiveRawMessage(state, record) {
       // provider item completion arrives a few milliseconds later.
       semanticItemId: typeof payload.id === 'string' ? payload.id : null,
       sessionId,
+      recordTime: historyRecordTimeFromRecord(record),
       message: {
         id: uuid,
         role: 'assistant',
@@ -50660,6 +50677,7 @@ function buildCodexLiveRawMessage(state, record) {
       namespace: payload.namespace || '',
       args: parseCodexLiveArgs(payload),
       byteOffset: record.__byteOffset,
+      recordTime: historyRecordTimeFromRecord(record, 'tool-call', payload.name === 'exec' ? 'container' : 'record'),
     };
     const projection = codexLiveProjectionState(state);
     const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
@@ -50719,6 +50737,7 @@ function buildCodexLiveRawMessage(state, record) {
           id: item.id,
           name: item.toolName,
           input: item.args,
+          recordTime: call.recordTime,
           // Subagent spawns travel with their card so the renderer rebuilds a
           // Task row instead of a generic tool row — that shape is what makes
           // a running agent visible in the background-chip strip.

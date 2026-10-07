@@ -951,6 +951,19 @@ async function locateTabMessageSource(messageId) {
   });
 }
 
+async function openExternalResearchJob(runId) {
+  const run = await getOrchestrationRunStore().get(runId);
+  if (run?.runKind !== 'external-research' || !run.externalResearchJobId) {
+    return { success: false, error: 'external_research_job_not_found' };
+  }
+  try {
+    const result = await getScExternalResearchClient().openJob(run.externalResearchJobId, { requestId: crypto.randomUUID() });
+    return { success: true, jobId: result.jobId };
+  } catch (error) {
+    return { success: false, error: error.message, code: error.code || 'external_research_navigation_failed' };
+  }
+}
+
 async function sendTabMessage(message) {
   await agentSendReceiptStartupReady;
   if (!agentSendReceiptStore) throw Object.assign(new Error('message_receipt_store_unavailable'), { submitted: false });
@@ -4028,7 +4041,12 @@ function findRestorableAgentTabDescriptor(tabId) {
       ? executionNamespaceForRow(entries[0])
       : null;
     const project = projectId ? projectManager.db.getProjectById(projectId) : null;
-    return resolveRestorableAgentTab({ tabId, historyEntries: entries, project });
+    const resolution = resolveRestorableAgentTab({ tabId, historyEntries: entries, project });
+    if (resolution.ok && projectManager.workflowOrganization?.archive) resolution.restoreAddress = {
+      namespace: resolution.projectId, historyId: resolution.historyId, sourceTabId: tabId,
+      archiveIdentity: projectManager.workflowOrganization.archive.identity(entries[0]),
+    };
+    return resolution;
   } catch (error) {
     return {
       ok: false,
@@ -4046,7 +4064,7 @@ function explicitAgentTargetError(resolution, fallbackCode = 'target_tab_restore
   return error;
 }
 
-async function ensureExplicitAgentTabOpen(tabId, restorable = null) {
+async function ensureExplicitAgentTabOpen(tabId, restorable = null, { acceptRestoredTarget = false } = {}) {
   const alreadyOpen = findOrchestrationTabDescriptor(tabId);
   if (alreadyOpen) return { descriptor: alreadyOpen, restored: false };
 
@@ -4055,13 +4073,15 @@ async function ensureExplicitAgentTabOpen(tabId, restorable = null) {
     : findRestorableAgentTabDescriptor(tabId);
   if (resolution?.ok !== true) throw explicitAgentTargetError(resolution);
 
-  return runSingleFlight(closedAgentRestoreInflight, tabId, async () => {
+  const result = await runSingleFlight(closedAgentRestoreInflight, tabId, async () => {
     const concurrentOpen = findOrchestrationTabDescriptor(tabId);
     if (concurrentOpen) return { descriptor: concurrentOpen, restored: false };
 
     let restored;
     try {
-      restored = await bridgeRequest('restoreClosedAgentTab', {
+      restored = resolution.committedRestoration
+        ? { tabId: resolution.committedRestoration.targetTabId, restoration: resolution.committedRestoration }
+        : await bridgeRequest('restoreClosedAgentTab', {
         projectId: resolution.projectId,
         historyId: resolution.historyId,
         expectedTabId: tabId,
@@ -4079,7 +4099,23 @@ async function ensureExplicitAgentTabOpen(tabId, restorable = null) {
         error: error?.bridgeData?.message || error?.message || 'target tab restore failed',
       });
     }
+    let restoration = null;
     if (restored?.tabId !== tabId) {
+      try {
+        restoration = require('./project-manager').workflowOrganization.archive.readCommittedRestoration(restored?.restoration || {});
+        if (restoration.sourceTabId !== tabId || restoration.targetTabId !== restored.tabId
+          || restoration.namespace !== resolution.projectId || restoration.historyId !== resolution.historyId
+          || resolution.restoreAddress && restoration.archiveIdentity !== resolution.restoreAddress.archiveIdentity) {
+          throw new Error('archive_restore_address_changed');
+        }
+      } catch (error) {
+        throw explicitAgentTargetError({ code: 'target_tab_restore_identity_mismatch', statusCode: 409,
+          error: 'restored target has no matching durable archive proof: ' + String(error?.message || error) });
+      }
+    } else if (restored?.restoration) {
+      restoration = require('./project-manager').workflowOrganization.archive.readCommittedRestoration(restored.restoration);
+    }
+    if (!restored?.tabId) {
       throw explicitAgentTargetError({
         code: 'target_tab_restore_identity_mismatch',
         statusCode: 409,
@@ -4087,16 +4123,34 @@ async function ensureExplicitAgentTabOpen(tabId, restorable = null) {
       });
     }
 
-    const descriptor = findOrchestrationTabDescriptor(tabId);
-    if (!descriptor || descriptor.projectId !== resolution.projectId) {
+    const descriptor = findOrchestrationTabDescriptor(restored.tabId);
+    if (!descriptor || descriptor.projectId !== resolution.projectId
+      || descriptor.toolType !== resolution.toolType
+      || descriptor.cwd !== resolution.cwd || (descriptor.sessionId || null) !== (resolution.sessionId || null)) {
       throw explicitAgentTargetError({
         code: 'target_tab_restore_not_persisted',
         statusCode: 409,
         error: 'restored target was not durably persisted under its original identity',
       });
     }
-    return { descriptor, restored: true };
+    return { descriptor, restored: true, restoration };
   });
+  if (result.descriptor?.tabId !== tabId && !acceptRestoredTarget) throw explicitAgentTargetError({
+    code: 'target_tab_restore_replacement_required', statusCode: 409,
+    error: 'target was restored under a new runtime identity; use the confirmed restored tabId',
+  });
+  return result;
+}
+
+async function adoptRestoredOrchestrationTarget(runId, restored) {
+  const store = getOrchestrationRunStore();
+  const current = await store.getInternal(runId);
+  if (!restored.restoration || restored.descriptor.tabId === current?.targetTabId) return current;
+  return store.adoptRestoredTarget(runId, restored, { prepareContext: prompt => {
+    require('./project-manager').workflowOrganization.archive.readCommittedRestoration(restored.restoration);
+    tabWorkContext?.rebindPreparedHandoff(restored.restoration.sourceTabId, restored.descriptor.tabId,
+      'orchestration:' + runId, prompt);
+  } });
 }
 
 function revealTerminalApplicationWindow(reason = 'external-open-tab') {
@@ -5930,6 +5984,23 @@ async function recoverMissingOrchestrationTarget(run, reason = 'startup-missing-
   const current = await store.getInternal(run.runId);
   if (!current || isTerminalStatus(current.status)) {
     return { handled: false, recovered: false, run: current };
+  }
+
+  if (current.targetRestoreAddress && current.deliveryIntent && !current.deliveryDispatchStartedAt) {
+    let proof;
+    try { proof = require('./project-manager').workflowOrganization.archive.readCommittedRestoration(current.targetRestoreAddress); }
+    catch { /* No committed restore: passive recovery must not reopen a closed target. */ }
+    if (proof) {
+      const restored = await ensureExplicitAgentTabOpen(current.targetTabId, {
+        ok: true, historyId: proof.historyId, projectId: proof.namespace, toolType: current.targetToolType,
+        cwd: current.targetCwd, sessionId: current.targetRestoreSessionId || null,
+        restoreAddress: current.targetRestoreAddress, committedRestoration: proof,
+      }, { acceptRestoredTarget: true });
+      await adoptRestoredOrchestrationTarget(current.runId, restored);
+      emitOrchestrationRun(await store.get(current.runId), reason + '-committed-restore-adopted');
+      await dispatchDeferredOrchestrationRun(current.runId, { reason: reason + '-committed-restore' });
+      return { handled: true, recovered: true, run: await store.get(current.runId) };
+    }
   }
 
   const canFinishReservedCreation = current.targetCreated === true
@@ -8040,6 +8111,20 @@ async function handleApi(req, res, parsed, sdkSessions) {
       let restorableTarget = null;
       let targetPlacement = null;
       if (targetTabId && !target) {
+        const previous = await getOrchestrationRunStore().getInternal(requestedRunId);
+        if (previous?.requestedTargetTabId === requestedTargetTabId && previous.sourceTabId === sourceTabId
+          && previous.targetRestoreAddress?.sourceTabId === requestedTargetTabId) {
+          // Resolve execution from the prior receipt, but fingerprint the
+          // unchanged caller's original target below. No new restore on replay.
+          targetTabId = previous.targetTabId;
+          target = findOrchestrationTabDescriptor(targetTabId) || {
+            tabId: targetTabId, tabName: previous.targetTabName, projectId: previous.targetProjectId,
+            projectName: previous.targetProjectName, projectPath: previous.targetProjectPath,
+            cwd: previous.targetCwd, toolType: previous.targetToolType,
+          };
+        }
+      }
+      if (targetTabId && !target) {
         restorableTarget = findRestorableAgentTabDescriptor(targetTabId);
         if (restorableTarget?.ok !== true) {
           return sendJson(res, Number(restorableTarget?.statusCode) || 404, {
@@ -8179,6 +8264,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         targetWindowTarget: windowTarget,
         targetToolType: target.toolType,
         targetCreated,
+        ...(targetNeedsRestore ? { targetRestoreAddress: restorableTarget.restoreAddress,
+          targetRestoreSessionId: restorableTarget.sessionId || null } : {}),
         targetPlacement: targetPlacement?.placement || null,
         targetParentTabId: targetPlacement?.visualParentTabId || null,
         forkFromTabId: forkFromTabId || null,
@@ -8256,8 +8343,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
       emitOrchestrationRun(run, 'reserved');
 
       if (targetNeedsRestore) {
-        const restored = await ensureExplicitAgentTabOpen(targetTabId, restorableTarget);
+        const restored = await ensureExplicitAgentTabOpen(targetTabId, restorableTarget, { acceptRestoredTarget: true });
+        await adoptRestoredOrchestrationTarget(run.runId, restored);
         target = restored.descriptor;
+        targetTabId = target.tabId;
         run = await getOrchestrationRunStore().patch(run.runId, {
           status: 'starting',
           targetMaterializedAt: Date.now(),
@@ -13126,6 +13215,24 @@ function start({
       ready: () => sendQueueRendererReady && sendQueueRecoveryReady,
       cancelAttempt: record => cancelAgentSendFn?.(record),
       admit: admitQueuedAgentSend,
+      transferMergedContext: ({ tabId, requests, request }) => {
+        if (tabWorkContext && tabWorkContext.db !== agentSendReceiptStore.db) throw new Error('send_queue_merge_context_owner_mismatch');
+        tabWorkContext?.mergeHandoffs(tabId, requests, request);
+      },
+      publishMerge: result => {
+        const packet = { ...result, record: { ...result.record, imagePresentation: imagePresentationFromReceipt(result.record) } };
+        for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+          win.webContents.send('agent:send-queue-merged', packet);
+        }
+        for (const operationKey of [...result.sourceOperationKeys, result.operationKey]) {
+          const receipt = publicAgentSendReceipt(agentSendReceiptStore.get(operationKey));
+          webBroadcast(result.tabId, { type: 'send-receipt', receipt: {
+            tabId: result.tabId, handoffId: receipt.handoffId, operationKey, status: receipt.status,
+            receiptState: receipt.state, applicationQueue: receipt.applicationQueue,
+            submitted: receipt.submitted, providerQueueAccepted: false, exactAuditConfirmed: false,
+          } });
+        }
+      },
       execute: async (request, scope) => {
         const receipt = await runPreparedAgentSendScenario({ ...request, applicationQueueExecution: true,
           sendRequestFingerprint: scope.requestFingerprint,
@@ -13633,6 +13740,12 @@ async function admitQueuedAgentSend(request) {
 }
 
 module.exports = {
+  mergeQueuedAgentMessages: async request => {
+    await agentSendReceiptStartupReady;
+    if (!agentSendQueue) return { success: false, disposition: 'not-applied', code: 'send_queue_merge_unavailable' };
+    return agentSendQueue.mergeWaiting(request);
+  },
+  readQueuedMessageMerge: ({ tabId, requestId }) => agentSendQueue?.readMerge(requestId, tabId) || null,
   readAutomaticSendAdmission: async ({ tabId, handoffId, operationKey, attemptId }) => {
     const item = agentSendQueue?.item(operationKey), record = agentSendReceiptStore?.get(operationKey);
     if (!item || !isAutomaticPromptQueueRequest(JSON.parse(item.request_json))) return true;
@@ -13697,8 +13810,7 @@ module.exports = {
   releaseQueuedSendPresentation: operationKey => agentSendQueue?.releasePresentation(operationKey),
   queuedSendAssetIds: () => agentSendQueue?.referencedAssetIds() || new Set(),
   applicationQueueInfo: operationKey => {
-    const item = agentSendQueue?.item(operationKey);
-    return item ? { version: 1, id: item.id, state: item.state, queuedAt: item.created_at } : null;
+    return agentSendQueue?.queueInfo(operationKey) || null;
   },
   projectQueuedSendReceipt: record => agentSendQueue?.projectRecord(record) || record,
   enqueueDesktopAgentPrompt: async input => {
@@ -13724,6 +13836,7 @@ module.exports = {
   listTabMessages: async (tabId) => (await getTabMessageService().listForTab(tabId)).map(compactTabMessage),
   getTabMessage: (messageId) => getTabMessageService().getMessage(messageId),
   locateTabMessageSource,
+  openExternalResearchJob,
   dismissTabMessage: (tabId, messageId) => {
     const result = getTabMessageService().dismissMessage({ tabId, messageId });
     return { ...result, message: compactTabMessage(result.message) };

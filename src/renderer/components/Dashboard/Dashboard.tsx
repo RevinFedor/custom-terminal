@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useLayoutEffect, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import StorageBrowser from './StorageBrowser';
@@ -13,6 +13,15 @@ export default function Dashboard() {
   const pendingRef = useRef(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const root=useRef<HTMLDivElement>(null);
+  const [detailsHost,setDetailsHost]=useState<HTMLElement|null>(null);
+  const [wide,setWide]=useState(false);
+  useLayoutEffect(()=>{
+    const element=root.current;if(!element)return;
+    const measure=()=>setWide(element.clientWidth>=1100);
+    measure();const observer=new ResizeObserver(measure);observer.observe(element);
+    return()=>observer.disconnect();
+  },[]);
 
   const createWorkflow = async () => {
     if (pendingRef.current) return;
@@ -31,7 +40,7 @@ export default function Dashboard() {
   };
 
   return (
-    <div data-dashboard-root className="home-dashboard">
+    <div ref={root} data-dashboard-root className="home-dashboard">
       <div className="home-content">
         <header className="home-welcome" data-home-empty={hasUserWorkflow ? 'false' : 'true'}>
           <div className="home-welcome-copy">
@@ -45,7 +54,8 @@ export default function Dashboard() {
           </button>
           {error && <p className="home-create-error" role="alert">{error}</p>}
         </header>
-        <StorageBrowser />
+        <StorageBrowser detailsHost={wide?detailsHost:null}/>
+        <aside ref={setDetailsHost} className="home-detail-host" aria-label="Сведения Storage"/>
       </div>
     </div>
   );

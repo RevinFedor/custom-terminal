@@ -5,7 +5,37 @@ import {
   collectTimelineDocs,
   isTimelineGroupExpanded,
   timelineMarkerGeometry,
+  timelineMarkerKind,
 } from './timelineMarkerPresentation.mjs';
+import { projectTimelineSentHandoff, mergeTimelineEntriesWithSentHandoffs } from './timelineTranscriptRefresh.mjs';
+
+test('SC channel comes only from an exact external research tag, not its model or quoted text', () => {
+  const tag = { kind: 'orchestration', runId: 'run', runKind: 'external-research', phase: 'completion' };
+  for (const targetTabName of ['ChatGPT - 6-astra', 'Another model', undefined]) {
+    assert.equal(timelineMarkerKind({ semanticTags: [{ ...tag, targetTabName }] }), 'sc-desktop');
+  }
+  assert.equal(timelineMarkerKind({ content: 'SC Desktop ChatGPT - 6-astra' }), 'ordinary');
+  assert.equal(timelineMarkerKind({ semanticTags: [{ ...tag, runKind: 'agent' }] }), 'terminal-mcp');
+  assert.equal(timelineMarkerKind({ semanticTags: [{ ...tag, runId: '' }] }), 'terminal-mcp');
+  assert.equal(timelineMarkerKind({ semanticTags: [{ kind: 'prompt-origin', source: 'terminal-mcp' }] }), 'terminal-mcp');
+});
+
+test('exact confirmed SC handoff retains its channel before canonical adoption without a duplicate', () => {
+  const tag = { kind: 'orchestration', runId: 'run', runKind: 'external-research', phase: 'completion', targetTabName: 'ChatGPT - 6-astra' };
+  const handoff = { handoffId: 'orchestration-complete:run', source: 'codex-orchestration-completion:run',
+    queueStatus: 'sent', toolType: 'codex', text: 'answer', submittedAt: 1000, semanticTags: [tag],
+    auditProof: { sessionId: 's', entryUuid: 'canonical', sourceIdentity: 'source', auditTimestamp: '2026-10-07T04:00:00.000Z' } };
+  const point = projectTimelineSentHandoff(handoff, { toolType: 'codex', sessionId: 's' });
+  assert.equal(timelineMarkerKind(point), 'sc-desktop');
+  assert.equal(point.semanticTags[0].targetTabName, tag.targetTabName);
+  for (const queueStatus of ['queued', 'audit-pending', 'delivery-unknown']) {
+    assert.equal(projectTimelineSentHandoff({ ...handoff, queueStatus }, { toolType: 'codex', sessionId: 's' }), null);
+  }
+  const canonical = { ...point, isSentHandoffProjection: false };
+  const merged = mergeTimelineEntriesWithSentHandoffs([canonical], [point]);
+  assert.equal(merged.length, 1);
+  assert.equal(timelineMarkerKind(merged[0]), 'sc-desktop');
+});
 
 test('collapsed orchestration group aggregates unique docs activity from every call', () => {
   assert.deepEqual(collectTimelineDocs([
@@ -17,9 +47,11 @@ test('collapsed orchestration group aggregates unique docs activity from every c
   });
 });
 
-test('group children cannot remain expanded in the narrow Timeline rail', () => {
-  assert.equal(isTimelineGroupExpanded(false, true), false);
+test('vertical group expansion is independent of narrow/wide Timeline layout', () => {
+  assert.equal(isTimelineGroupExpanded(false, true), true);
   assert.equal(isTimelineGroupExpanded(true, true), true);
+  assert.equal(isTimelineGroupExpanded(false, false), false);
+  assert.equal(isTimelineGroupExpanded(true, false), false);
 });
 
 test('orchestration marker remains a square before rotation in every rail state', () => {

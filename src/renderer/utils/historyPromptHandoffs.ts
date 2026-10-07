@@ -73,6 +73,11 @@ export interface HistoryPromptHandoffImageRef {
   error?: string;
 }
 
+export interface HistoryPromptHandoffSemanticTag {
+  kind: 'orchestration' | 'prompt-origin' | 'tab-message';
+  [key: string]: unknown;
+}
+
 export interface HistoryPromptHandoffAuditProof {
   auditTimestamp: string;
   actualHash: string;
@@ -97,8 +102,17 @@ export interface HistoryPromptHandoffProviderQueueProof {
   recordByteOffset?: number;
 }
 
+export interface QueuedMessageMergeGuard {
+  version: 1; tabId: string; operationKey: string; queueId: number; requestHash: string;
+  previousOperationKey: string; previousQueueId: number; previousRequestHash: string;
+}
+
 export interface HistoryPromptHandoff {
+  applicationQueuePosition?: number;
+  applicationQueuePresentationHandoffId?: string;
   applicationQueueId?: number | null;
+  applicationQueueMerge?: QueuedMessageMergeGuard | null;
+  applicationQueueReplacement?: boolean;
   tabId: string;
   handoffId: string;
   sendAttemptId: string | null;
@@ -108,6 +122,7 @@ export interface HistoryPromptHandoff {
   text: string;
   promptChips: readonly Readonly<HistoryPromptHandoffChip>[];
   imagePaths: readonly Readonly<HistoryPromptHandoffImageRef>[];
+  semanticTags?: readonly Readonly<HistoryPromptHandoffSemanticTag>[];
   authoringText: string;
   authoringChips: readonly Readonly<Record<string, any>>[];
   authoringImagePaths: readonly Readonly<HistoryPromptHandoffImageRef>[];
@@ -157,7 +172,11 @@ export function historyPromptHandoffPresentationIdentity(
 }
 
 export interface BeginHistoryPromptHandoffInput {
+  applicationQueuePosition?: number;
+  applicationQueuePresentationHandoffId?: string;
   applicationQueueId?: number | null;
+  applicationQueueMerge?: QueuedMessageMergeGuard | null;
+  applicationQueueReplacement?: boolean;
   tabId: string;
   handoffId: string;
   sendAttemptId?: string | null;
@@ -167,6 +186,7 @@ export interface BeginHistoryPromptHandoffInput {
   text: string;
   promptChips?: readonly HistoryPromptHandoffChip[];
   imagePaths?: readonly HistoryPromptHandoffImageRef[];
+  semanticTags?: readonly HistoryPromptHandoffSemanticTag[];
   authoringText?: string;
   authoringChips?: readonly Record<string, any>[];
   authoringImagePaths?: readonly HistoryPromptHandoffImageRef[];
@@ -202,7 +222,9 @@ export interface AdoptHistoryPromptHandoffCanonicalInput {
 }
 
 export interface BindHistoryPromptHandoffSendIdentityInput {
+  applicationQueuePosition?: number;
   applicationQueueId?: number | null;
+  applicationQueueMerge?: QueuedMessageMergeGuard | null;
   sendAttemptId?: string | null;
   sendOperationKey?: string | null;
 }
@@ -215,7 +237,8 @@ export interface AcceptHistoryPromptHandoffProviderQueueInput
 
 export interface DurableHistorySendReceiptRecord {
   applicationQueue?: { version: number; id: number; state: string; queuedAt: number;
-    waitingBeforeInput?: boolean; lastNoWriteAttemptId?: string } | null;
+    waitingBeforeInput?: boolean; lastNoWriteAttemptId?: string; mergePrevious?: QueuedMessageMergeGuard | null;
+    position?: number; merge?: { version: number; sourceOperationKeys: string[]; presentationHandoffId?: string } | null } | null;
   promptHash?: string | null;
   imagePresentation?: { version: number; operationKey: string; attemptId: string; requestHash: string;
     imagePaths: HistoryPromptHandoffImageRef[] } | null;
@@ -302,6 +325,9 @@ export type BindHistoryPromptHandoffSendIdentityResult =
  * timestamps are presentation data, never identity fallbacks.
  */
 export interface HistoryPromptHandoffProjectionRow {
+  semanticTags?: readonly Readonly<HistoryPromptHandoffSemanticTag>[];
+  applicationQueuePosition?: number;
+  applicationQueueMerge?: QueuedMessageMergeGuard | null;
   handoffId?: string | null;
   queueStatus?: HistoryPromptHandoffStatus;
   statusReason?: string;
@@ -487,6 +513,7 @@ const stringBytes = (value: unknown) => String(value ?? '').length * 2;
 
 function estimateHandoffBytes(value: HistoryPromptHandoff): number {
   let bytes = RECORD_OVERHEAD_BYTES
+    + stringBytes(value.applicationQueueMerge ? JSON.stringify(value.applicationQueueMerge) : '')
     + stringBytes(value.tabId)
     + stringBytes(value.handoffId)
     + stringBytes(value.sendAttemptId)
@@ -495,6 +522,7 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
     + stringBytes(value.sessionIdHint)
     + stringBytes(value.text)
     + stringBytes(value.authoringText)
+    + stringBytes(value.semanticTags ? JSON.stringify(value.semanticTags) : '')
     + stringBytes(value.source)
     + stringBytes(value.statusAtSend)
     + stringBytes(value.queueStatus)
@@ -708,8 +736,10 @@ function mergeCompatibleAuditProof(
 function freezeHandoff(value: HistoryPromptHandoff): Readonly<HistoryPromptHandoff> {
   return Object.freeze({
     ...value,
+    applicationQueueMerge: value.applicationQueueMerge ? Object.freeze({ ...value.applicationQueueMerge }) : null,
     promptChips: Object.freeze(value.promptChips.map(freezeChip)),
     imagePaths: Object.freeze(value.imagePaths.map(freezeImageRef)),
+    ...(value.semanticTags ? { semanticTags: Object.freeze(value.semanticTags.map(tag => Object.freeze({ ...tag }))) } : {}),
     authoringChips: Object.freeze(value.authoringChips.map((chip) => Object.freeze({ ...chip }))),
     authoringImagePaths: Object.freeze(value.authoringImagePaths.map(freezeImageRef)),
     auditProof: freezeProof(value.auditProof),
@@ -752,9 +782,13 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
   const auditEntryUuid = proof?.entryUuid || undefined;
   const sourceIdentity = proof?.sourceIdentity || queueProof?.sourceIdentity || undefined;
   const recordByteOffset = proof?.recordByteOffset ?? queueProof?.recordByteOffset;
+  const semanticTags = handoff.semanticTags?.length ? handoff.semanticTags : row.semanticTags;
 
   if (
     row.handoffId === handoff.handoffId
+    && JSON.stringify(row.semanticTags || []) === JSON.stringify(semanticTags || [])
+    && row.applicationQueuePosition === handoff.applicationQueuePosition
+    && JSON.stringify(row.applicationQueueMerge || null) === JSON.stringify(handoff.applicationQueueMerge || null)
     && row.queueStatus === handoff.queueStatus
     && row.statusReason === handoff.statusReason
     && row.statusChangedAt === handoff.statusChangedAt
@@ -775,7 +809,10 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
 
   return {
     ...row,
+    ...(semanticTags ? { semanticTags: semanticTags.map(tag => ({ ...tag })) } : {}),
     handoffId: handoff.handoffId,
+    applicationQueuePosition: handoff.applicationQueuePosition,
+    applicationQueueMerge: handoff.applicationQueueMerge,
     queueStatus: handoff.queueStatus,
     statusReason: handoff.statusReason,
     statusChangedAt: handoff.statusChangedAt,
@@ -972,6 +1009,29 @@ export class HistoryPromptHandoffStore {
     return true;
   }
 
+  hydrateSemanticPresentation(record: DurableHistorySendReceiptRecord): boolean {
+    // Late receipt metadata enriches only its existing immutable send owner.
+    const tab = this.tabs.get(String(record.tabId || ''));
+    const current = tab?.get(String(record.handoffId || ''));
+    const tags = record.receipt?.presentationSnapshot?.semanticTags;
+    if (!tab || !current || current.value.semanticTags?.length || !Array.isArray(tags) || !tags.length
+      || record.provider !== current.value.toolType
+      || record.receipt?.promptText !== current.value.text
+      || current.value.sendAttemptId !== (record.attemptId || null)
+      || current.value.sendOperationKey !== record.operationKey
+      || (current.value.sessionIdHint && current.value.sessionIdHint !== record.sessionId)) return false;
+    const next = freezeHandoff({ ...current.value, semanticTags: tags });
+    const approxBytes = estimateHandoffBytes(next);
+    if (approxBytes > this.limits.maxBytes) return false;
+    this.approxBytes += approxBytes - current.approxBytes;
+    tab.set(next.handoffId, { value: next, approxBytes });
+    this.promoteTab(next.tabId);
+    this.enforceLimits(next.tabId, next.handoffId);
+    if (!this.tabs.get(next.tabId)?.has(next.handoffId)) return false;
+    this.notify(next.tabId, { type: 'replay' });
+    return true;
+  }
+
   begin(input: BeginHistoryPromptHandoffInput): Readonly<HistoryPromptHandoff> | undefined {
     const tabId = requireKey(input.tabId, 'tabId');
     const handoffId = requireKey(input.handoffId, 'handoffId');
@@ -994,6 +1054,7 @@ export class HistoryPromptHandoffStore {
         const next = freezeHandoff({
           ...existing.value,
           applicationQueueId: existing.value.applicationQueueId || input.applicationQueueId || null,
+          applicationQueueMerge: input.applicationQueueMerge || null,
           sendAttemptId: nextAttemptId,
           sendOperationKey: typeof input.sendOperationKey === 'string'
             ? input.sendOperationKey.trim() || null
@@ -1003,6 +1064,7 @@ export class HistoryPromptHandoffStore {
             : existing.value.sessionIdHint,
           submittedAt,
           source: typeof input.source === 'string' ? input.source : existing.value.source,
+          semanticTags: input.semanticTags || existing.value.semanticTags,
           // null → first attempt only binds the existing click to its durable
           // receipt. Hydration has no new click-time observation (usually
           // 'unknown') and must not erase the known busy/active placement.
@@ -1030,6 +1092,8 @@ export class HistoryPromptHandoffStore {
       if (input.initialReceipt) {
         const bound = this.bindSendIdentity(tabId, handoffId, {
           applicationQueueId: input.applicationQueueId,
+          applicationQueuePosition: input.applicationQueuePosition,
+          applicationQueueMerge: input.applicationQueueMerge,
           sendAttemptId: input.sendAttemptId,
           sendOperationKey: input.sendOperationKey,
         });
@@ -1052,6 +1116,10 @@ export class HistoryPromptHandoffStore {
       tabId,
       handoffId,
       applicationQueueId: input.applicationQueueId || null,
+      applicationQueuePosition: input.applicationQueuePosition,
+      applicationQueuePresentationHandoffId: input.applicationQueuePresentationHandoffId,
+      applicationQueueMerge: input.applicationQueueMerge || null,
+      applicationQueueReplacement: input.applicationQueueReplacement === true,
       sendAttemptId: typeof input.sendAttemptId === 'string'
         ? input.sendAttemptId.trim() || null
         : null,
@@ -1063,6 +1131,7 @@ export class HistoryPromptHandoffStore {
       text: String(input.text || ''),
       promptChips: input.promptChips || [],
       imagePaths: input.imagePaths || [],
+      ...(input.semanticTags ? { semanticTags: input.semanticTags } : {}),
       authoringText: typeof input.authoringText === 'string' ? input.authoringText : String(input.text || ''),
       authoringChips: input.authoringChips || [],
       authoringImagePaths: input.authoringImagePaths || input.imagePaths || [],
@@ -1257,10 +1326,15 @@ export class HistoryPromptHandoffStore {
     const sendAttemptId = current.value.sendAttemptId || incomingAttemptId;
     const sendOperationKey = current.value.sendOperationKey || incomingOperationKey;
     const applicationQueueId = current.value.applicationQueueId || input.applicationQueueId || null;
+    const applicationQueuePosition = input.applicationQueuePosition ?? current.value.applicationQueuePosition;
+    const applicationQueueMerge = Object.hasOwn(input, 'applicationQueueMerge')
+      ? input.applicationQueueMerge || null : current.value.applicationQueueMerge || null;
     if (
       sendAttemptId === current.value.sendAttemptId
       && sendOperationKey === current.value.sendOperationKey
       && applicationQueueId === (current.value.applicationQueueId || null)
+      && applicationQueuePosition === current.value.applicationQueuePosition
+      && JSON.stringify(applicationQueueMerge) === JSON.stringify(current.value.applicationQueueMerge || null)
     ) {
       this.promoteTab(tabId);
       return { ok: true, changed: false, handoff: current.value };
@@ -1274,6 +1348,8 @@ export class HistoryPromptHandoffStore {
       sendAttemptId,
       sendOperationKey,
       applicationQueueId,
+      applicationQueuePosition,
+      applicationQueueMerge,
     });
     const approxBytes = estimateHandoffBytes(next);
     if (approxBytes > this.limits.maxBytes) return { ok: false, reason: 'bounds' };
@@ -1460,6 +1536,14 @@ export class HistoryPromptHandoffStore {
       type: 'consume',
       handoffId: requireKey(handoffId, 'handoffId'),
     });
+  }
+
+  consumeMergedSource(tabId: string, handoffId: string): void {
+    if (!this.consume(tabId, handoffId)) {
+      // A durable merge is an explicit removal proof even if the bounded
+      // handoff cache evicted the original while its History row stayed visible.
+      this.notify(requireKey(tabId, 'tabId'), { type: 'consume', handoffId: requireKey(handoffId, 'handoffId') });
+    }
   }
 
   getSnapshot(tabIdValue: string): readonly Readonly<HistoryPromptHandoff>[] {
@@ -2046,6 +2130,26 @@ export function durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(
     && entryOffset >= boundaryOffset;
 }
 
+export function applyHistoryQueuedMessageMerge(result: any): boolean {
+  const retired = result?.receiptRetired === true && result.record === null;
+  if (result?.success !== true || result.version !== 1 || (!retired && result.record?.tabId !== result.tabId)
+    || (!retired && result.record?.operationKey !== result.operationKey) || !Array.isArray(result.sourceHandoffIds)
+    || !Array.isArray(result.sourceOperationKeys) || result.sourceHandoffIds.length !== 2 || result.sourceOperationKeys.length !== 2
+    || (!retired && (result.record.applicationQueue?.merge?.version !== 1
+      || JSON.stringify(result.record.applicationQueue.merge.sourceOperationKeys) !== JSON.stringify(result.sourceOperationKeys)))) return false;
+  const originals = getHistoryPromptHandoffsSnapshot(result.tabId);
+  for (let index = 0; index < 2; index++) {
+    const handoffId = result.sourceHandoffIds[index], operationKey = result.sourceOperationKeys[index];
+    if (typeof handoffId !== 'string' || operationKey !== `history:${result.tabId}:${handoffId}`) return false;
+    const current = originals.find(value => value.handoffId === handoffId);
+    if (current && (current.sendAttemptId || current.auditProof || current.providerQueueProof
+      || current.sendOperationKey !== operationKey)) return false;
+  }
+  for (const handoffId of result.sourceHandoffIds) historyPromptHandoffStore.consumeMergedSource(result.tabId, handoffId);
+  if (!retired) hydrateHistoryPromptHandoffFromDurableReceipt(result.record);
+  return true;
+}
+
 export function hydrateHistoryPromptHandoffFromDurableReceipt(
   record: DurableHistorySendReceiptRecord,
 ): DurableHistorySendHydrationResult {
@@ -2081,6 +2185,10 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     Number.isFinite(Number(receipt.presentationDismissedAt))
     && receipt.presentationDismissedSurface === 'desktop-history'
   ) {
+    if (receipt.mergedIntoOperationKey && !attemptId) {
+      const current = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
+      if (current && !current.sendAttemptId && current.sendOperationKey === operationKey) consumeHistoryPromptHandoff(tabId, handoffId);
+    }
     return { hydrated: false, reason: 'durable-history-presentation-dismissed' };
   }
   if (record.state === 'not-submitted' && !applicationWaiting) {
@@ -2094,12 +2202,15 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
       const handoff = beginHistoryPromptHandoff({ tabId, handoffId, sendOperationKey: operationKey, sendAttemptId: attemptId,
         applicationQueueId: record.applicationQueue?.id,
         toolType, text: promptText, imagePaths: presentation.imagePaths || [],
+        semanticTags: presentation.semanticTags,
         promptChips: presentation.promptChips || [], authoringText: receipt.authoringSnapshot?.editorText,
         authoringChips: receipt.authoringSnapshot?.chips, authoringImagePaths: receipt.authoringSnapshot?.imagePaths,
         submittedAt: Number(record.createdAt), requiresAuditIdentity: true,
         initialReceipt: { queueStatus: receipt.cancelled || record.applicationQueue?.state === 'cancelled' ? 'cancelled' : 'failed',
           reason: receipt.code || 'application-queue-not-submitted' } });
-      return { hydrated: !!handoff, reason: 'application-queue-not-submitted', handoff };
+      historyPromptHandoffStore.hydrateSemanticPresentation(record);
+      return { hydrated: !!handoff, reason: 'application-queue-not-submitted',
+        handoff: getHistoryPromptHandoffsSnapshot(tabId).find(item => item.handoffId === handoffId) || handoff };
     }
     return {
       hydrated: false,
@@ -2253,6 +2364,10 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     : undefined;
   const begun = beginHistoryPromptHandoff({
     applicationQueueId: record.applicationQueue?.id,
+    applicationQueuePosition: record.applicationQueue?.position ?? record.applicationQueue?.id,
+    applicationQueuePresentationHandoffId: record.applicationQueue?.merge?.presentationHandoffId,
+    applicationQueueMerge: record.applicationQueue?.mergePrevious || null,
+    applicationQueueReplacement: record.applicationQueue?.merge?.version === 1,
     tabId,
     handoffId,
     sendAttemptId: attemptId,
@@ -2262,10 +2377,11 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     text: promptText,
     promptChips: Array.isArray(presentation.promptChips) ? presentation.promptChips : [],
     imagePaths: Array.isArray(presentation.imagePaths) ? presentation.imagePaths : [],
+    semanticTags: Array.isArray(presentation.semanticTags) ? presentation.semanticTags : undefined,
     authoringText: receipt.authoringSnapshot?.editorText,
     authoringChips: receipt.authoringSnapshot?.chips,
     authoringImagePaths: receipt.authoringSnapshot?.imagePaths,
-    submittedAt: Number(record.createdAt) || Date.now(),
+    submittedAt: Number(record.applicationQueue?.queuedAt) || Number(record.createdAt) || Date.now(),
     source: typeof receipt.source === 'string' ? receipt.source : 'history-panel',
     statusAtSend: 'unknown',
     requiresAuditIdentity: true,
@@ -2294,6 +2410,10 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   // Reuse the same strict Main presentation proof after the owner exists;
   // do not infer a path from marker text, nor change its delivery outcome.
   if (hydrateHistoryPromptHandoffImages(record)) {
+    hydratedHandoff = getHistoryPromptHandoffsSnapshot(tabId)
+      .find(item => item.handoffId === handoffId) || hydratedHandoff;
+  }
+  if (historyPromptHandoffStore.hydrateSemanticPresentation(record)) {
     hydratedHandoff = getHistoryPromptHandoffsSnapshot(tabId)
       .find(item => item.handoffId === handoffId) || hydratedHandoff;
   }

@@ -64,12 +64,18 @@ External Codex run metadata (`externalRun`) — не runtime-only. Она хра
 
 Restore обязан различать два случая. Если project row уже отсутствует и path из `workspace-session` тоже не существует — stale project пропускается и не попадает в `openProjects`. Если project row существует, но cwd таба умер — создаётся broken restored tab с `restoreError`, а не обрывается весь startup. Нельзя чинить это простым удалением всех missing-cwd tabs: пользователь должен увидеть, какая сохранённая рабочая папка пропала, если сам проект ещё реален.
 
-### Safe saveTabs — targeted DELETE + INSERT
-Метод `saveTabs` использует **точечный DELETE по `tab_id`** вместо `DELETE ALL + re-INSERT`. Защита от потери данных если in-memory Map неполный (race conditions, параллельные IPC). Для batch-операций (перенос 3+ табов, массовое закрытие) флаг `forceCleanup` обходит safety guard. Детали: [`fix-save-tabs-data-loss.md`](fix-save-tabs-data-loss.md).
+### Safe saveTabs — существующая строка сохраняет идентичность
+Legacy `saveTabs` обновляет существующую строку на месте, а новый tabId вставляет
+отдельно. Targeted DELETE+INSERT был предыдущим ремонтом потери соседних вкладок,
+но менял PK даже при обычном metadata-save; во время frozen DnD это выглядело как
+подмена exact source, а не безобидная смена названия. In-place update сохраняет PK,
+physical parent и неизвестные колонки. Safety guard удаления отсутствующих вкладок
+и explicit `forceCleanup` остаются отдельными контрактами. Детали —
+[`fix-save-tabs-data-loss.md`](fix-save-tabs-data-loss.md).
 
 Ответ сохранения является durability-контрактом, а не best effort: consumer принимает только явный строгий ACK. Отсутствующий project row, исключение или неявный/пустой ответ не разрешают удалять history-запись либо публиковать межпроектный перенос как завершённый.
 
-Targeted DELETE не решает порядок двух полных снимков. Все full snapshots
+Сохранение идентичности строки не решает порядок двух полных снимков. Все full snapshots
 одного проекта сериализуются общей per-project очередью: иначе два быстрых
 `closeTab` могут оба построить правильные состояния, но более старый IPC
 завершится последним и воскресит первую закрытую вкладку после restart.
@@ -84,6 +90,14 @@ safety guard и `forceCleanup`, а не ещё одно исключение к 
 и сохраняет все снимки в одной SQLite-транзакции; отрицательный ACK любой части
 откатывает весь набор. Обычный single-project wire остаётся прежним. Close и
 API bridge подтверждают успех только по строгому ACK, не по пустому ответу.
+
+Relation-only DnD использует ту же namespace save-lane и собственный exact ACK.
+Одного повышения revision старого queued snapshot недостаточно: parentA/7,
+поднятый до parentA/8 после принятого parentB, откатил бы связь. Только снимок,
+захваченный до собственного подтверждённого relation-write, согласует этот echo;
+его rename/прочие metadata сохраняются. Позднее явное unparent не переписывается
+старой квитанцией, foreign revision gap не объявляется собственным ACK. Cwd-point
+receipt и relation receipt имеют разные типы; оба не меняют SID/lifecycle.
 
 ### Main-owned Codex identity и ownership вкладки
 

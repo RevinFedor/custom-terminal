@@ -166,12 +166,44 @@ class WorkflowArchive {
       this.ensureRestoredCatalog(request.id,request.projectId,claim.target_tab_id);
       return this.inTransaction(()=>{
         const result=this.leases.finish(request);
-        if(result.ok && result.committed)this.db.prepare('INSERT INTO workflow_archive_finish_receipts VALUES(?,?,?,?,?)')
-          .run(request.id,request.projectId,request.token,claim.target_tab_id,JSON.stringify(result));
+        if(result.ok && result.committed) {
+          const currentOwner=this.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get(claim.target_tab_id);
+          result.restoration={version:1,namespace:request.projectId,historyId:request.id,leaseToken:request.token,
+            sourceTabId:entry.tab_id,targetTabId:claim.target_tab_id,archiveIdentity:claim.archive_identity,
+            ownerIdentity:this.restorationOwnerIdentity(currentOwner)};
+          this.db.prepare('INSERT INTO workflow_archive_finish_receipts VALUES(?,?,?,?,?)')
+            .run(request.id,request.projectId,request.token,claim.target_tab_id,JSON.stringify(result));
+        }
         return result;
       });
     }
     return this.leases.finish(request);
+  }
+  restorationOwnerIdentity(owner) {
+    const origin=owner.execution_subject_version===2
+      ? JSON.parse(owner.execution_record_json || '{}').archiveRestoreOrigin : null;
+    return fingerprint([owner.id,owner.created_at,namespaceOf(owner),owner.tab_id,owner.cwd,owner.command_type,
+      owner.claude_session_id || null,owner.codex_session_id || null,
+      owner.execution_subject_version || 1,owner.execution_subject_id || null,
+      origin?.historyId || null,origin?.closedRevision ?? null]);
+  }
+  readCommittedRestoration(address) {
+    this.writable();
+    if(typeof address?.namespace!=='string' || !Number.isSafeInteger(address.historyId) || address.historyId<1
+      || !Object.prototype.hasOwnProperty.call(address,'sourceTabId'))fail('archive_restore_address_invalid');
+    const row=this.db.prepare(`SELECT response_json FROM workflow_archive_finish_receipts
+      WHERE namespace=? AND history_id=?`+(address.leaseToken?' AND lease_token=?':'')+' ORDER BY rowid DESC LIMIT 1')
+      .get(...(address.leaseToken?[address.namespace,address.historyId,address.leaseToken]:[address.namespace,address.historyId]));
+    const response=row && JSON.parse(row.response_json),proof=response?.restoration;
+    if(response?.ok!==true || response.committed!==true || proof?.version!==1
+      || proof.namespace!==address.namespace || proof.historyId!==address.historyId || proof.sourceTabId!==address.sourceTabId
+      || address.targetTabId && proof.targetTabId!==address.targetTabId
+      || address.archiveIdentity && proof.archiveIdentity!==address.archiveIdentity
+      || address.ownerIdentity && proof.ownerIdentity!==address.ownerIdentity)fail('archive_restore_commit_unconfirmed');
+    const owner=this.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get(proof.targetTabId);
+    if(!owner || owner.execution_archived===1 || this.restorationOwnerIdentity(owner)!==proof.ownerIdentity)
+      fail('archive_restore_live_owner_changed');
+    return clean(proof);
   }
   metadata(row) {return {name:row.name,notes:row.notes ?? '',nameSetManually:row.name_set_manually===1};}
   synchronizeMetadata({namespace,historyId,ownerTabId,leaseToken,expectedLiveMetadata}) {

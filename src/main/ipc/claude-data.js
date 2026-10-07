@@ -9,6 +9,7 @@ const { claudeProjectsDir: getClaudeProjectsDir, assertClaudeDataPath } = requir
 const { readClaudeMutationFile, claudeMutationRevision, checkClaudeMutationRevision,
   assertClaudeMutationCurrent, callClaudeMutationGuard, commitClaudeHistoryMutation } = require('../claude-history-mutation');
 const { isVisibleAppFork } = require('../../shared/fork-operation.cjs');
+const { historyRecordTimeFromRecord } = require('../../shared/history-record-time.cjs');
 const { claudeHistoryFailureFromRecord } = require('../../shared/claude-provider-failure.cjs');
 const readline = require('node:readline');
 const { performance: nodePerformance } = require('node:perf_hooks');
@@ -5694,6 +5695,10 @@ function register({
         && !payload.bounds?.aroundUuid;
       let projectedEntryTotal = 0;
       const appendProjectedEntry = (value) => {
+        if (['user', 'assistant', 'queued'].includes(value.role)) {
+          const recordTime = historyRecordTimeFromRecord(recordMap.get(value.uuid));
+          if (recordTime) value.recordTime = recordTime;
+        }
         projectedEntryTotal += 1;
         entries.push(value);
         // The common cold-open request is `last=N`. Keep only that tail while
@@ -6249,6 +6254,8 @@ function register({
                       }
                     }
                   }
+                  const recordTime = historyRecordTimeFromRecord(entry, 'tool-call');
+                  if (recordTime) actionObj.recordTime = recordTime;
                   actions.push(actionObj);
                 } else {
                   // Raw tool carrier — full (untruncated) name+input+result for the
@@ -6271,6 +6278,7 @@ function register({
                       // for lazy rehydration of a dehydrated result.
                       toolUseId: block.id,
                       toolName: name,
+                      recordTime: historyRecordTimeFromRecord(entry, 'tool-call'),
                       args: input,
                       family: classified.family,
                       bashWord: classified.bashWord,

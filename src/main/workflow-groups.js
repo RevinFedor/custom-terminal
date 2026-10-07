@@ -270,6 +270,24 @@ class WorkflowGroups {
     if (!replay) { try { this.publish(copy(result)); } catch { /* committed; recover by read or exact retry */ } }
     return result;
   }
+
+  /** Internal primitive; the organization command owns transaction + receipt. */
+  applyDragAssignments(assignments) {
+    if (!this.db.inTransaction) fail('workflow_group_activation_transaction_required');
+    this.writable();
+    let changed = false;
+    for (const {tabId,groupId,expected} of assignments) {
+      const row=this.db.prepare('SELECT * FROM workflow_group_memberships WHERE tab_id=?').get(tabId);
+      if ((row?.group_id ?? null)!==expected.groupId || (row?.revision || 0)!==expected.groupRevision)
+        fail('workflow_group_membership_changed',{tabId});
+      if(groupId!==null)this.group(groupId);
+      if((row?.group_id ?? null)===groupId)continue;
+      this.db.prepare(`INSERT INTO workflow_group_memberships VALUES(?,?,1)
+        ON CONFLICT(tab_id) DO UPDATE SET group_id=excluded.group_id,revision=workflow_group_memberships.revision+1`).run(tabId,groupId);
+      changed=true;
+    }
+    if(changed)this.db.prepare('UPDATE workflow_group_meta SET revision=revision+1 WHERE singleton=1').run();
+  }
 }
 
 module.exports = { WorkflowGroups, legacyGroupId, WORKFLOW_GROUP_VERSION: VERSION };

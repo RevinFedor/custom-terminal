@@ -1,6 +1,6 @@
 import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { PanelsTopLeft } from 'lucide-react';
+import { PanelsTopLeft, Columns2 } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { paneSlots } from '../../utils/splitPanesModel.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
@@ -247,6 +247,13 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
     }
     setTarget(null);
   };
+  const showAlongside=(candidateId:string)=>{
+    if(!target)return;
+    const state=useWorkspaceStore.getState();
+    if(state.activeSpaceId!==target.spaceId || state.windowDisplayKey!==target.displayKey){setTarget(null);return;}
+    if(state.showHiddenWindowAlongside(target.spaceId,target.windowId,candidateId))setTarget(null);
+    else useUIStore.getState().showToast('Не удалось разместить окно рядом. Проверьте текущую раскладку.','warning');
+  };
   if (!windows.length) return null;
   return <>
     <button ref={button} type="button" data-hidden-window-picker-button data-split-button
@@ -289,6 +296,11 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
           width: '100%', minHeight: 28, boxSizing: 'border-box', textAlign: 'left', cursor: 'pointer', padding: 0,
           border: '1px solid #75658b', borderRadius: 7, margin: 0,
           transition: 'none' }}>
+        <button type="button" data-hidden-window-alongside={candidate.id}
+          onPointerDown={event=>event.stopPropagation()} onClick={event=>{event.stopPropagation();showAlongside(candidate.id);}}
+          title="Показать это окно рядом, сохранив текущее"
+          style={{display:'inline-flex',alignItems:'center',gap:5,border:0,borderRadius:4,padding:'3px 6px',
+            background:'#8b5cf626',color:'#c4b5fd',fontSize:11,cursor:'pointer'}}><Columns2 size={12}/>Показать рядом</button>
         {candidate.tabs.length === 0 && <span style={{ padding: '2px 6px', color: '#8f8f94' }}>Нет вкладки</span>}
         {candidate.tabs.map(tab => <TabCard key={tab.id} as={renaming?.tab.id === tab.id ? 'span' : 'button'} projectId={tab.projectId} tabId={tab.id}
           chooser={tab.chooser} label={tab.name} shown={tab.id === candidate.shownTabId} showShownStripe showProjectIcon reserveSignalSpace

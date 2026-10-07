@@ -1,4 +1,4 @@
-import React, { forwardRef, useMemo, useState } from 'react';
+import React, { forwardRef, useMemo, useRef, useState } from 'react';
 import { FileText, Folder, Plus } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -14,16 +14,16 @@ import { useTabWorkContext } from '../../utils/tabWorkContext';
 import {
   TabProcessBar, TabStatusMarker, TabStatusMarkerButton, TabTopLeftSignals,
   TabContextUpdateBadge, TabCompletionNotificationBadge,
-  TabSessionAvailabilityMarker, TabTaskMarker, useTabActivitySignals, useTabContextUsage,
+  TabSessionAvailabilityMarker, useTabActivitySignals, useTabContextUsage,
   TAB_CONTEXT_UPDATE_INSET_PX,
   TAB_PROCESS_BAR_W_PX,
-  TASK_MARKER_GAP_PX, TASK_MARKER_LANE_HEIGHT_PX, TASK_MARKER_DEFAULT_COLOR,
   tabFastBadgeOutsidePx,
   type SharedTabActivityMaps,
 } from './TabSignals';
 import TabPendingOperation, { resolveTabPendingOperationLabel } from './TabPendingOperation';
 import TabLinkedFiles, { useTabLinkedFiles, type LinkedFile } from './TabLinkedFiles';
 import { isLinkedFilePreview } from '../../utils/tabLinkedFiles.mjs';
+import { useLinkedTitleLayout } from '../../utils/tabCardTitleMetrics';
 
 type Activity = { hasProcess: boolean; busy: boolean; inheritedBusy: boolean };
 export interface TabCardProps extends React.HTMLAttributes<HTMLElement> {
@@ -58,11 +58,13 @@ export interface TabCardProps extends React.HTMLAttributes<HTMLElement> {
 const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   projectId, tabId, as = 'span', shown = false, active = false, selected = false,
   pressed = false, fullWidth = false, truncate = true, showShownStripe = false,
-  showProjectIcon = false, showTaskMarkers = true, reserveSignalSpace = false, interactiveStatus = false, chooser = false,
+  showProjectIcon = false, showTaskMarkers: _showTaskMarkers, reserveSignalSpace = false, interactiveStatus = false, chooser = false,
   label, children, trailingActions, sharedActivity = null, activityOverride,
-  geometry, fontSize, onTaskClick, onLinkedFileOpen, style, onMouseEnter, onMouseLeave, ...elementProps
+  geometry, fontSize, onTaskClick: _onTaskClick, onLinkedFileOpen, style, onMouseEnter, onMouseLeave, ...elementProps
 }, ref) {
   const [hovered, setHovered] = useState(false);
+  const [attachmentHovered, setAttachmentHovered] = useState(false);
+  const cardHovered = hovered && !attachmentHovered;
   const linkedFiles = useTabLinkedFiles(tabId, !!onLinkedFileOpen);
   const hasLinkedFiles = linkedFiles.length > 0;
   const fileSelected = useUIStore(s => !!onLinkedFileOpen && isLinkedFilePreview(s.filePreview, tabId));
@@ -89,21 +91,17 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   const serviceTier = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveServiceTier);
   const tierSessionId = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveServiceTierSessionId);
   const settingsSessionId = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveSettingsSessionId);
-  const taskPlan = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.taskPlan);
   const empty = useWorkspaceStore(s => {
     const tab = s.openProjects.get(projectId)?.tabs.get(tabId);
     return !!tab && isEmptyTab(tab);
   });
   const hiddenErrors = useUIStore(s => shown ? 0 : s.toasts.reduce((n, toast) => n + (toast.tabId === tabId && isErrorToast(toast) ? 1 : 0), 0));
   const status = useUIStore(s => s.sessionStatuses.find(x => x.id === statusId));
-  const taskStatuses = useUIStore(s => s.taskStatuses);
-  const taskShape = useUIStore(s => s.taskStatusMarker.shape);
   const configuredGeometry = useUIStore(s => s.tabGeometry);
   const configuredFontSize = useUIStore(s => s.tabsFontSize);
   const processBarPosition = useUIStore(s => s.processBar.position);
   const projectIcon = useProjectsStore(s => s.projects[projectId]?.icon || '');
   const projectName = useProjectsStore(s => s.projects[projectId]?.name || '');
-  const taskItems = showTaskMarkers ? taskPlan?.items || [] : [];
   const geo = geometry || configuredGeometry;
   // Run After already has an authoritative activity snapshot. Reuse it rather
   // than starting an extra process lookup for every row in its picker.
@@ -125,10 +123,11 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     const id = state.globalGroups?.tabGroups?.[tabId];
     return id ? state.globalGroups.groups.find((group:any) => group.id === id)?.color : undefined;
   });
-  const chrome = getTabChromeColorConfig({ color: tabColor || groupColor, tabType });
+  const effectiveColor = tabColor || groupColor;
+  const chrome = getTabChromeColorConfig({ color: effectiveColor, tabType });
   const metrics = resolveTabCardMetrics({ ...geo,
     paddingLeft: Math.max(geo.paddingLeft, contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 0),
-  }, { fontSize: fontSize ?? configuredFontSize, showTaskLane: taskItems.length > 0, hasStatusMarker: !!status || contextUpdate,
+  }, { fontSize: fontSize ?? configuredFontSize, hasStatusMarker: !!status || contextUpdate,
     // Reserve the rail even while idle so starting a process cannot rewrap the
     // strip. The bell overlays the corner without changing the configured
     // spacing; a separate paddingRight would overwrite this single writer.
@@ -137,42 +136,40 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   });
   const pending = resolveTabPendingOperationLabel({ aiClosing, pendingOperation });
   const linkedFileHeight = Math.max(15, Math.ceil(metrics.fontSize * .72) + 4);
+  const titleLineRef=useRef<HTMLSpanElement>(null);
+  const titleLayout=useLinkedTitleLayout(titleLineRef,hasLinkedFiles,{text:pending||(typeof label==='string'?label:tabName),fontSize:metrics.fontSize,
+    paddingY:parseFloat(metrics.padding),gap:Number(geo.gap??4),chipHeight:linkedFileHeight,
+    fontWeight:style?.fontWeight,fontFamily:style?.fontFamily});
   const shadows = [showShownStripe && (shown || pressed) ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)' : null,
     sessionAvailabilityRailShadow(availability), fileSelected ? 'inset 0 0 0 1px #b6a1e8' : null].filter(Boolean).join(', ') || undefined;
   const frameStyle: React.CSSProperties = {
     position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 4,
-    flexShrink: fullWidth ? 1 : 0, minWidth: hasLinkedFiles ? Math.max(40, metrics.fontSize * 2.5)
-      + (contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX - 6 : 0) : 0, width: fullWidth ? '100%' : undefined,
+    flexShrink: fullWidth ? 1 : 0, minWidth: 0, width: fullWidth ? '100%' : undefined,
     whiteSpace: 'nowrap', boxSizing: 'border-box', textAlign: 'left',
     fontSize: metrics.fontSize, lineHeight: TAB_CARD_LINE_HEIGHT,
-    color: active || selected || shown || pressed || hovered ? '#e8e8e8' : '#9b9ba1',
+    color: active || selected || shown || pressed || cardHovered ? '#e8e8e8' : '#9b9ba1',
     cursor: 'pointer', background: flattenRgbaOnTabbarPanel(resolveTabCardBackground({
-      bgColor: chrome.bgColor, hasColor: !!tabColor && tabColor !== 'default', active: active || pressed, selected, hovered,
+      bgColor: chrome.bgColor, hasColor: !!effectiveColor && effectiveColor !== 'default', active: active || pressed, selected, hovered: cardHovered,
     }, adjustRgbaAlpha)), backgroundImage: sessionAvailabilityBackgroundImage(availability), boxShadow: shadows,
     border: hiddenErrors > 0 ? '1px solid #f87171'
       : `1px solid ${/^#[\da-f]{6}$/i.test(chrome.borderColor) ? chrome.borderColor + '55' : '#6666'}`,
     borderRadius: metrics.borderRadius,
-    // A real reserved lane keeps task markers above the border-mounted chip.
-    // Its size is independent of menu visibility, so opening cannot rewrap.
-    padding: hasLinkedFiles ? metrics.padding.split(' ').map((value, index) => index === 2
-      ? `${parseFloat(value) + linkedFileHeight / 2 + (taskItems.length ? TASK_MARKER_LANE_HEIGHT_PX : 0)}px`
-      : value).join(' ') : metrics.padding,
-    ...(hasLinkedFiles ? { '--tab-linked-file-height': `${linkedFileHeight}px` } as React.CSSProperties : {}),
+    padding: metrics.padding,
+    // The file stays out of flow. Only the measured title/file minimum can
+    // raise the card height; count, hover and menus cannot change row spacing.
+    ...(hasLinkedFiles ? { '--tab-linked-file-height': `${linkedFileHeight}px`,
+      '--tab-linked-file-overhang': `${Math.max(3, Math.round(linkedFileHeight / 3))}px`,
+    } as React.CSSProperties : {}),
+    ...(titleLayout?{height:titleLayout.height,'--tab-linked-file-top':`${titleLayout.chipTop}px`,
+      '--tab-title-center':`${titleLayout.titleCenter}px`} as React.CSSProperties:{}),
     marginTop: reserveSignalSpace ? Math.max(0, tabFastBadgeOutsidePx(geo.gap ?? 4) - 1) : undefined,
-    marginBottom: hasLinkedFiles || reserveSignalSpace ? Math.max(hasLinkedFiles ? linkedFileHeight / 2 + 2 : 0, -metrics.laneBottomPx,
-      contextUpdate ? tabFastBadgeOutsidePx(geo.gap ?? 4) - 1 : 0) : undefined,
+    marginBottom: reserveSignalSpace && contextUpdate ? Math.max(0, tabFastBadgeOutsidePx(geo.gap ?? 4) - 1) : undefined,
     transition: 'none', ...style,
   };
-  const contents = <>
-    {!chooser && <TabProcessBar {...activity} radius={metrics.borderRadius} zIndex={4} />}
-    <TabTopLeftSignals fastActive={fastActive} contextPct={contextPct} minContextPct={50} zIndex={8} muted={muted} />
-    <TabContextUpdateBadge active={contextUpdate} />
-    <TabCompletionNotificationBadge armed={armed} persistent={persistent} fired={fired} />
-    {interactiveStatus ? <TabStatusMarkerButton projectId={projectId} tabId={tabId} color={status?.color} title={status?.label} />
-      : <TabStatusMarker color={status?.color} title={status?.label} />}
+  const titleContents = <>
     {showProjectIcon && projectIcon && <img data-tab-card-project-icon={projectId} src={projectIcon} title={projectName}
       alt="" draggable={false} style={{ width: 12, height: 12, flexShrink: 0, borderRadius: 2, objectFit: 'cover' }} />}
-    {chooser ? <Plus size={12} /> : tabType === 'file' ? <FileText size={10} style={{ color: '#a78bfa', flexShrink: 0 }} />
+    {chooser ? <Plus size={12} /> : tabType === 'file' ? <FileText size={14} style={{ color: '#a78bfa', flexShrink: 0 }} />
       : empty ? <Folder size={10} style={{ color: '#8a8a92', flexShrink: 0 }} /> : null}
     {pending ? <TabPendingOperation label={pending} tabName={tabName} /> : children || <span data-tab-card-label style={{
       minWidth: 0, flex: fullWidth ? 1 : undefined, whiteSpace: 'nowrap',
@@ -180,14 +177,19 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     }}>{label ?? (chooser ? 'Новая вкладка' : tabName)}</span>}
     <TabSessionAvailabilityMarker availability={availability} size={10} />
     {trailingActions}
-    {taskItems.length > 0 && <span data-task-plan-tab-markers style={{ position: 'absolute',
-      left: contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 6, right: 6, bottom: hasLinkedFiles ? linkedFileHeight / 2 : metrics.laneBottomPx,
-      height: TASK_MARKER_LANE_HEIGHT_PX, display: 'flex', alignItems: 'flex-end', gap: TASK_MARKER_GAP_PX,
-      overflow: 'hidden', pointerEvents: 'none', zIndex: 7 }}>
-      {taskItems.map(task => <TabTaskMarker key={task.id} color={taskStatuses.find(s => s.id === task.statusId)?.color || TASK_MARKER_DEFAULT_COLOR}
-        shape={taskShape} title={task.title} onClick={onTaskClick ? event => onTaskClick(task.id, event) : undefined} />)}
-    </span>}
+  </>;
+  const contents = <>
+    {!chooser && <TabProcessBar {...activity} radius={metrics.borderRadius} zIndex={4} />}
+    <TabTopLeftSignals fastActive={fastActive} contextPct={contextPct} minContextPct={50} zIndex={8} muted={muted} />
+    <TabContextUpdateBadge active={contextUpdate} />
+    <TabCompletionNotificationBadge armed={armed} persistent={persistent} fired={fired} />
+    {interactiveStatus ? <TabStatusMarkerButton projectId={projectId} tabId={tabId} color={status?.color} title={status?.label} topOffsetPx={titleLayout?0:undefined} />
+      : <TabStatusMarker color={status?.color} title={status?.label} topOffsetPx={titleLayout?0:undefined} />}
+    {hasLinkedFiles?<span ref={titleLineRef} data-tab-card-title-line style={{display:'inline-flex',alignItems:'center',gap:4,
+      minWidth:0,flex:fullWidth?'1 1 auto':undefined,transform:titleLayout?`translateY(${titleLayout.titleOffset}px)`:undefined}}>
+      {titleContents}</span>:titleContents}
     {onLinkedFileOpen && hasLinkedFiles && <TabLinkedFiles ownerTabId={tabId} files={linkedFiles} onOpen={onLinkedFileOpen}
+      fontSize={metrics.fontSize} geometry={geo} onHoverChange={setAttachmentHovered}
       insetLeft={contextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 6} />}
   </>;
   return React.createElement(as, { ...elementProps, ref, ...(as === 'button' ? { type: 'button' } : {}),

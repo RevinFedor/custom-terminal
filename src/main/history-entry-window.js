@@ -162,7 +162,7 @@ function applyHistoryEntryWindow(entries, bounds = null) {
 const HISTORY_ROW_STUB_FIELDS = [
   'settingsFact',
   'imageCount',
-  'uuid', 'role', 'timestamp', 'sessionId', 'messageId', 'textPhase',
+  'uuid', 'role', 'timestamp', 'recordTime', 'sessionId', 'messageId', 'textPhase',
   'preTokens', 'postTokens', 'compactEncrypted',
   'viewOwnerSessionId', 'physicalSessionId', 'transcriptSegmentId',
   'rawUuid', 'contentRevision', 'entryRef', 'recordByteOffset',
@@ -231,6 +231,7 @@ function stubActionSummary(actions) {
       summary.push({
         toolUseId: raw.toolUseId,
         toolName: raw.toolName,
+        recordTime: raw.recordTime,
         family: raw.family,
         bashWord: raw.bashWord,
         bashDetail: raw.bashDetail,
@@ -252,6 +253,7 @@ function stubActionSummary(actions) {
       summary.push({
         toolUseId: action.toolUseId,
         toolName: 'Task',
+        recordTime: action.recordTime,
         family: 'task',
         description: action.description,
         subagentStatus: action.subagentStatus,

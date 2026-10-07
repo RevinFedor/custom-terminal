@@ -66,6 +66,20 @@ Sources показываются по естественной алфавитн�
 - для ещё не разложенных элементов fallback — директории перед файлами и
   natural filename order.
 
+Чтение usage для GT Editor проходит все открытые и архивные tab bindings.
+Одна общая source-папка у сотен bindings не означает сотни отдельных обходов:
+внутри ОДНОГО синхронного запроса переиспользуются scan/exists/realpath/project
+metadata. Ключ scan включает исходный namespace, точное написание пути,
+display-name и manual layout; symlink alias не теряет свои ID/порядок. Каждая
+привязка всё равно проходит sourcesForTab и signature guard, tab catalog
+получает отдельные records/file_paths. После возврата request maps исчезают;
+это не новый долговечный кэш и не увеличение TTL. Natural sort использует один
+Collator с прежними locale/numeric/base rules, включая стабильные равные имена.
+Причина: GT poll2500ms превышал TTL1500ms, поэтому повторные scans и создание
+Collator на каждое сравнение синхронно тормозили общий Main даже при пустом
+ответе usage. Изменение свежести или удаление архивных bindings для ускорения
+не требуется. Точные измерения и границы — performance-карта07.10 lag754.
+
 Каталог кэшируется максимум на 1,5 секунды. `fs.watch` на `docs` (либо на root,
 пока `docs` не создана) инвалидирует его с debounce 180 мс и рассылает
 `project-prompts:changed` во все окна. Настройки, sidebar и picker не должны

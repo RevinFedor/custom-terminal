@@ -28,15 +28,18 @@ test('manual recovery shows a static yellow timer and warning together', () => {
   assert.match(rowSource, /width: 26, height: 14/);
 });
 
-test('yellow delivery and queued states use a static timer instead of a frozen loader', () => {
+test('unconfirmed delivery remains yellow; normal queued states are gray with a static timer', () => {
   const presentationStart = source.indexOf('function runPresentation');
   const presentationEnd = source.indexOf('function StatusIcon', presentationStart);
   const presentation = source.slice(presentationStart, presentationEnd);
 
-  assert.match(presentation, /run\.status === 'sent' && run\.deliveryAuditPendingAt && !run\.targetPromptProofAt/);
+  assert.match(presentation, /run\.status === 'sent' && !run\.targetPromptProofAt/);
+  assert.match(presentation, /run\.deliveryAuditPendingAt \|\| run\.requiresTargetPromptProof === true/);
   assert.match(presentation, /label: 'Проверка доставки'/);
   assert.match(presentation, /color: '#fbbf24'[\s\S]*?icon: 'waiting'[\s\S]*?spinning: false/);
   assert.match(presentation, /run\.status === 'queued' \|\| run\.status === 'sent'/);
+  assert.match(presentation, /run\.deliveryTransportUnknownAt \|\| run\.externalResearchTransportError/);
+  assert.match(presentation, /\? '#fbbf24' : '#a1a1aa'/);
   assert.match(source, /else if \(presentation\.icon === 'waiting'\) icon = <Timer/);
   assert.match(source, /queued: 'Ожидает отправки'/);
 });
@@ -118,6 +121,12 @@ test('deferred delivery to a busy target is waiting, not an error or an already 
   assert.equal(deferred.label, 'Ждёт занятую вкладку');
   assert.equal(deferred.icon, 'waiting');
   assert.equal(deferred.spinning, false);
+  assert.equal(deferred.color, '#a1a1aa');
+  assert.equal(presentation({status:'queued',externalResearchTransportError:'SC unavailable'},'source').color,'#fbbf24');
+  assert.equal(presentation({status:'queued',deliveryTransportUnknownAt:123},'source').color,'#fbbf24');
+  assert.equal(presentation({status:'sending'},'source').color,'#60a5fa');
+  assert.equal(presentation({status:'sent',requiresTargetPromptProof:true},'source').color,'#fbbf24');
+  assert.equal(presentation({status:'sent',targetPromptProofAt:123,requiresTargetPromptProof:true},'source').color,'#4ade80');
   assert.equal(presentation({ status: 'sent', deliveryDeferredReason: 'target-not-idle:busy' }, 'source').label, 'Доставлено');
   assert.equal(presentation({ status: 'cancelled', deliveryDeferredReason: 'target-not-idle:busy' }, 'source').label, 'Закрыто');
 });

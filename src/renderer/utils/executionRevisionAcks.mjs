@@ -23,6 +23,24 @@ export function createExecutionRevisionAcks() {
     && receipt.toRevision<=receipt.fromRevision+1;
   return {
     revision,advance,matchesPoint,
+    covers(namespace,tab,from,to) {
+      const range=ranges.get(key(namespace,tab));
+      return !!range && Number.isSafeInteger(from) && Number.isSafeInteger(to)
+        && range.from<=from && from<=to && to<=range.to;
+    },
+    relation(namespace,tab,receipt) {
+      const address=key(namespace,tab);
+      if(!address || receipt?.version!==1 || receipt.kind!=='visual-parent' || !receipt.mutationId
+        || receipt.namespace!==namespace || receipt.tabId!==(tab.tabId || tab.id)
+        || key(namespace,{tabId:receipt.tabId,executionSubject:receipt.executionSubject})!==address
+        || receipt.subjectId!==tab.executionSubject.subjectId
+        || receipt.executionSubject.cwd!==tab.executionSubject.cwd
+        || !Number.isSafeInteger(receipt.fromRevision) || receipt.toRevision!==receipt.fromRevision+1
+        || revision(namespace,tab)!==receipt.fromRevision)return false;
+      const old=ranges.get(address);
+      ranges.set(address,{from:old && old.to===receipt.fromRevision?old.from:receipt.fromRevision,to:receipt.toRevision});
+      advance(namespace,tab);return true;
+    },
     point(namespace,tab,receipt) {
       if(!matchesPoint(namespace,tab,receipt,receipt.executionSubject?.cwd) || revision(namespace,tab)!==receipt.fromRevision)return false;
       const address=key(namespace,tab),old=ranges.get(address);

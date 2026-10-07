@@ -1,5 +1,6 @@
 'use strict';
 const crypto = require('node:crypto');
+const { historyRecordTimeKey } = require('../shared/history-record-time.cjs');
 
 // History delta: ship only changed rows to a renderer that already holds the
 // previous projection.
@@ -107,6 +108,7 @@ function fingerprintAction(action) {
         )).join(',')
       : '-';
     return ['__raw__', raw.toolUseId || '', raw.toolName || '',
+      historyRecordTimeKey(raw.recordTime),
       sampleText(typeof raw.result === 'string' ? raw.result : sampleValue(raw.result)),
       raw.isError ? '1' : '0',
       raw.resultRef ? raw.resultRef.payloadId + ':' + raw.resultRef.totalChars + ':' + (raw.resultRef.recordLine ?? '') : '-',
@@ -117,6 +119,7 @@ function fingerprintAction(action) {
   }
   if (action.tool === 'Task') {
     return ['Task', action.toolUseId || '', action.description || '',
+      historyRecordTimeKey(action.recordTime),
       action.subagentStatus || '', taskResultWitness(action),
       action.agentSessionId || '', action.processGeneration || '',
       action.startedAt || '', action.completedAt || '', action.durationMs || '',
@@ -139,6 +142,7 @@ function fingerprintHistoryEntry(entry) {
   if (entry.rowStub === true) return cyrb53('stub' + SEP + JSON.stringify(entry));
   const parts = [
     entry.role || '', entry.timestamp || '', sampleText(entry.content || ''),
+    historyRecordTimeKey(entry.recordTime),
     entry.textPhase || '', String(entry.thinkingSeconds ?? ''),
     String(entry.postTokens ?? ''), entry.compactEncrypted ? '1' : '0',
     sampleText(entry.thinking || ''),

@@ -1,3 +1,4 @@
+import recordTimes from '../../shared/history-record-time.cjs';
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 const extractText = (value) => {
@@ -435,6 +436,7 @@ export function reduceClaudeHistoryPromptCarrier(
           : {}),
         role: 'user',
         timestamp: recordTimestamp(record, envelope),
+        ...recordTimes.historyRecordTimeFields(record.recordTime || envelope.recordTime),
         content: attachmentText,
         queueStatus: 'sent',
         ...promptImageFields(record, envelope, queueMatch.removed),
@@ -492,6 +494,7 @@ export function reduceClaudeHistoryPromptCarrier(
           : {}),
         timestamp: recordTimestamp(record, envelope),
         content: text,
+        ...recordTimes.historyRecordTimeFields(record.recordTime || envelope.recordTime),
         sessionId: recordSessionId(record, envelope),
         ...promptImageFields(record, envelope, queueMatch.removed),
         ...(recordByteOffsetFrom(envelope) !== null

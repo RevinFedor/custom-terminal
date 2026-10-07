@@ -5,6 +5,7 @@ const { createHash } = require('node:crypto');
 const { getCodexProcessActionOwnershipRevision } = require('./codex-process-action-ownership');
 const { performance } = require('node:perf_hooks');
 const { searchHistoryEntries, normalizeHistorySearchType } = require('../shared/history-search.cjs');
+const { historyRecordTimeFromRecord } = require('../shared/history-record-time.cjs');
 const { findTabMessageSourceLocation } = require('./tab-message-source-location');
 const { describeCodexForkPrefixFailure } = require('./codex-fork-lineage-diagnostic');
 const { codexForkCopyPayload } = require('./codex-fork-copy-payload');
@@ -174,6 +175,7 @@ function codexRecordToMobileMessage(record, sessionId) {
       type: 'user',
       uuid: getRecordUuid(record, sessionId, record.__line),
       timestamp: record.timestamp || null,
+      recordTime: historyRecordTimeFromRecord(record),
       ...(codexUserMessageImageRefs(record).length > 0 ? { imagePaths: codexUserMessageImageRefs(record) } : {}),
       message: {
         role: 'user',
@@ -187,6 +189,7 @@ function codexRecordToMobileMessage(record, sessionId) {
         type: 'assistant',
         uuid: getRecordUuid(record, sessionId, record.__line),
         timestamp: record.timestamp || null,
+        recordTime: historyRecordTimeFromRecord(record),
         message: {
           role: 'assistant',
           content: payload.content || [],
@@ -206,6 +209,7 @@ function codexRecordToMobileMessage(record, sessionId) {
             id: payload.call_id || payload.id || '',
             name: payload.name || payload.tool_name || payload.type,
             input: payload.arguments || payload.input || {},
+            recordTime: historyRecordTimeFromRecord(record, 'tool-call', payload.name === 'exec' ? 'container' : 'record'),
           }],
         },
       };
@@ -3363,6 +3367,7 @@ class SessionTranscriptService {
           tabId,
           toolType: 'claude',
           sessionId: state.sessionId,
+          recordTime: historyRecordTimeFromRecord(record),
           timestamp: record.timestamp || new Date().toISOString(),
           recordByteOffset,
           recordEndByteOffset,

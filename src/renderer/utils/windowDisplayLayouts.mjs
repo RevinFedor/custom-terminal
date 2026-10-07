@@ -28,13 +28,14 @@ export function windowSplitAvailability(panes, paneIndex) {
   return splitAvailability(visible, visible.indexOf(list[paneIndex ?? 0]));
 }
 
-export function splitWindowPane(panes, focusedIndex, current, anchorIndex = null, side = 'right') {
+export function splitWindowPane(panes, focusedIndex, current, anchorIndex = null, side = 'right', hiddenWindowId = null) {
   if (!Array.isArray(panes) || !['right', 'left', 'above', 'below'].includes(side)) return null;
   const list = ensureWindowIds(panes);
   const visible = list.filter(isWindowVisible);
   const anchor = list[anchorIndex ?? focusedIndex];
   if (list.length && !isWindowVisible(anchor)) return null;
-  const incoming = hiddenWindowForSplit(list);
+  const incoming = hiddenWindowId ? list.find(pane=>pane.windowId===hiddenWindowId && !isWindowVisible(pane)) : hiddenWindowForSplit(list);
+  if(hiddenWindowId && !incoming)return null;
   const placeholderIndex = list.findIndex(p => isWindowVisible(p) && isNewEmptyWindow(p));
   if (incoming && placeholderIndex >= 0) {
     // Recovery for a split made by older builds: fill its existing vacancy,

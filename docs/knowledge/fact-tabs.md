@@ -506,6 +506,55 @@ tabId и restart; это не попытка оживить старый PTY. А
 
 ### Structured outline DnD во вкладках
 
+В текущем workflow reserve pickup фиксирует нормализованные выбранные корни,
+полные поддеревья и исходные membership/relation/placement guards. Для каждой
+цели preview и сохранение используют одну проекцию этого snapshot: sidebar
+переносит forest, окно получает явно выбранные корни, сохраняя physical/file
+ownership. Изменение selection позже не расширяет набор. Несмежные корни
+сохраняют порядок и якорь зажатой строки.
+Multi-X остаётся запрещённым с явной стрелкой-запретом, single-X сохраняет прежнюю
+иерархию. Physical children и files не меняют владельца от изменения отступа.
+
+Вход из pane и смена workflow продолжают один gesture с одним final-release
+owner. Cmd-end сначала рисуется и только затем сохраняется; Escape/blur/outside
+не оставляют временные строки для следующего жеста. Main атомарно применяет
+показанные membership/group/parent/order/layout изменения. Его scoped проверка
+может принять несвязанную новую publication, но исходный request/hash и все
+guards сохраняются; общий commitWorkspace по-прежнему требует свой exact CAS.
+Обычные metadata saves не заменяют legacy row, а собственный relation ACK
+применяется только к старым queued snapshots. Поздний ACK не возвращает фокус
+после Home или away/back. Whole-app физическая проверка отделена от проверки
+общего hook, компонентного стенда и SQLite.
+
+Frozen выбор имеет разные заранее определённые проекции назначения. Резерв
+получает полный visual forest; окно показывает выбранные корни и переносит
+membership их physical/file family. Самостоятельные визуальные AI-потомки
+сохраняют прежний workflow и parent-связь: после cutover она может вести через
+границу workflow и не является orphan. При извлечении отдельного file/physical
+child из полного дерева admission сохраняет его exact parent как context,
+иначе корневая временная строка ошибочно выглядела бы командой unlink.
+Пустые группы участвуют в порядке корневых строк отдельно от порядка tabIds,
+поэтому release не возвращает такую группу в конец только из-за отсутствия детей.
+
+Window placement не переставляет оставшиеся containers по первому оставшемуся
+member. Старый sidebar показывал и размещённые вкладки, поэтому такое смещение
+появилось именно после reserve-фильтра. Pickup отдельно сохраняет видимый mixed
+root order (группы, одиночные вкладки, пустые группы). Оконный drop записывает
+этот порядок исходного workflow, сохраняя невидимые persisted ranks; destination
+не получает чужой порядок. `expectedReserveRootOrder` остаётся сырым baseline,
+включая `[]`, и чужое изменение после pickup даёт conflict. Явный внутренний
+Y/group reorder продолжает сохранять свой painted order.
+
+Post-drag click suppression относится только к click завершённого жеста.
+Следующий pointerdown снимает её, в том числе capture над metadata controls;
+keyboard click ей не блокируется. Иначе после pane→reserve первый быстрый
+Cmd-click selection пропадал из-за оставшегося500ms suppression, и следующий
+перенос неожиданно захватывал одну вкладку вместо двух.
+
+Обычный hook pointerup уступает bridge только при явном `releaseOwner:'bridge'`.
+Это сохраняет single-source/default поведение остальных consumers shared package;
+Noted reserve использует одного receiver, в том числе до первого painted frame.
+
 Single-source drag вкладки или group-row использует общий `@noted/structured-dnd/react`: host переводит `tabs + tabGroups + visualParentTabId` в outline, а пакет ведёт единственный in-tree source, переносит его транзитивное поддерево и отдаёт последний нарисованный semantic result. Группы остаются только root-контейнерами, вкладки допускают visual-depth до четырёх уровней. Вертикаль следует за курсором через безопасные границы и автоматически выбирает минимально совместимую глубину; только отдельный X-шаг меняет preferred parent. Закрытая группа не предоставляет скрытых child-slots, а `Cmd` замораживает текущий slot и циклически переключает только допустимые group headers. Собственная группа или ancestor source показывают blocked disclosure, а не зелёный loader.
 
 У `Cmd` появился host-выход, но общий смысл не переписан. Пока pointer остаётся в TabSidebar, это прежняя навигация/freeze по группам. Если pointer попал в явно объявленную шапку или тело окна, внешний target разрешается **раньше** folder-dwell: sidebar-source можно поставить в точный slot полосы либо в конец окна. Отпустили `Cmd` или ушли с оконной цели — обычный outline-контракт возобновляется. GT Editor/file explorer ничего об окнах не знают и потому продолжают возвращать `null`: их `Cmd`-поведение не изменилось.
@@ -514,7 +563,10 @@ Single-source drag вкладки или group-row использует общи
 
 Перетаскивание tab может пережить навигацию в другой workflow/project: hover меняет только видимое пространство, а owner вкладки не переписывается до конечного drop. Поэтому исходный drag остаётся тем же жестом и может закончиться в sidebar или окне уже открытого пространства.
 
-Верхние project tabs являются внешними целями того же pointer-жеста, а не отдельным `Cmd`-режимом. Вкладка переносится на другой открытый проект вместе со своим visual-subtree; group-row переносит сам контейнер, все его вкладки, metadata и внутренние parent-связи. Наведение на текущий проект показывает нейтральный blocked-state и не коммитит последний внутренний preview. ПКМ группы → `Move to Project` вызывает тот же transaction-path и служит точным fallback, а `Rename` остаётся первой командой меню. Из меню одиночной вкладки, включая file-tab, `Move to Project` убран26.09 по запросу пользователя: здесь достаточно внешнего DnD на project tab. Групповое меню сохраняет свой fallback. `Move to Group` намеренно отсутствует — внутри текущего проекта группировкой уже управляет прямой DnD. Submenu показывает только открытые проекты, которые всё ещё существуют в project catalog; stale workspace после удаления проекта не является допустимой целью атомарного переноса.
+Описания project-destination ниже относятся к legacy host до workflow cutover;
+новый reserve меняет canonical workflow membership без смены execution owner.
+
+В legacy Project UI верхние project tabs являются внешними целями того же pointer-жеста, а не отдельным `Cmd`-режимом. Вкладка переносится на другой открытый проект вместе со своим visual-subtree; group-row переносит сам контейнер, все его вкладки, metadata и внутренние parent-связи. Наведение на текущий проект показывает нейтральный blocked-state и не коммитит последний внутренний preview. ПКМ группы → `Move to Project` вызывает тот же transaction-path и служит точным fallback, а `Rename` остаётся первой командой меню. Из меню одиночной вкладки, включая file-tab, `Move to Project` убран26.09 по запросу пользователя: здесь достаточно внешнего DnD на project tab. Групповое меню сохраняет свой fallback. `Move to Group` намеренно отсутствует — внутри текущего проекта группировкой уже управляет прямой DnD. Submenu показывает только открытые проекты, которые всё ещё существуют в project catalog; stale workspace после удаления проекта не является допустимой целью атомарного переноса.
 
 Payload определяет **цель**, а не клавиша. Project/sidebar destination получает каждый явно выбранный visual-root вместе со всеми descendants. Если одновременно выбраны parent и его child, child второй раз не считается и не переносится: корень раскрывается в один pre-order блок, внутренние `visualParentTabId` сохраняются. Pane header/body получает только явно выбранные корни — descendants остаются обычными строками sidebar и не превращаются в оконные chips. При cross-project pane-drop оставшийся без перенесённого parent child становится самостоятельным root в исходном проекте, а не исчезает. `Cmd` только открывает оконные/navigation targets и не меняет состав payload. Preview использует тот же resolver: project chip и native multi-preview показывают `×N` полного project payload, target strip заранее показывает только pane-roots.
 
@@ -560,12 +612,24 @@ Preview обновляет только renderer-state; persistence выполн
 «Копировать сессию» и «Move to Project» из меню вкладки удалены по запросу26.09;
 перенос вкладки через DnD сохранён. Меню группы — отдельная поверхность.
 
-Полный ID — непрозрачный адрес, а не числовой индекс: `-tab-orchestration-`
-и `-tab-fork-` имеют непустой suffix, который не обязательно UUID. Numeric-only
-проверка на любой стороне Voice-транспорта даёт «Некорректный ID вкладки» для
-существующей вкладки, хотя Copy ID работает. Клиент, recording bridge и
-фиолетовая подсветка сохраняют весь ID; количество/длина, границы текста,
-запрет whitespace/control и exact recording ACK остаются отдельными guards.
+ID — непрозрачный адрес выбранной вкладки. С07.10 Voice-транспорт проверяет
+только непустую строку до1024chars без whitespace/control/format-символов,
+сохраняя весь адрес; форма не даёт оснований отказать. Ранее numeric-only,
+затем `-tab-` whitelist последовательно ломали реальные orchestration/restored
+вкладки, хотя Copy ID работал. Количество100 и exact recording ACK сохранены.
+
+| Источник | Форма/контракт |
+|---|---|
+| Legacy creator и миграция коллизий | `<project>-tab-<counter>`; project может быть base64 либо new_project |
+| Organization creator | `tab-<UUID>` |
+| Restore старого архива | `restored-<UUID>`; V2/exact restore может сохранять прежний ID |
+| Orchestration reservation | `<project>-tab-orchestration-<runId>`; runId непрозрачен |
+| Inbox reservation | `<inbox-project>-tab-external-<hash>` |
+| Fork/file/явный restoreId | Общий creator либо сохранённый адрес, без собственной гарантии префикса |
+
+Проверено по creator/archive/orchestration/Inbox коду и живому каталогу135вкладок.
+Это примеры существующих форм, не исчерпывающий whitelist транспорта. Фиолетовая
+подсветка известной формы также не доказывает наличие вкладки.
 См. [диктовку](fact-dictation.md#id-вкладки-в-живую-запись-voice-record).
 
 ## Правый слот контекстного меню: «Стоп» или «Запустить»

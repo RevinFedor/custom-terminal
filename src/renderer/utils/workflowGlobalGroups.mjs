@@ -6,6 +6,19 @@ const active = owner => {
   return tab.archived !== true && tab.isArchived !== true && !tab.archivedAt && tab.deleted !== true;
 };
 
+// Missing legacy definitions preserve archive provenance. They are not named
+// containers the user can choose for a new assignment. An explicit later
+// rename supplies a display name without destroying the original alias.
+export function workflowGroupIsPlaceholder(group) {
+  return group?.missingLegacyDefinition === true && (!group.name || group.name === group.legacyGroupId);
+}
+export function workflowGroupDisplayName(group) {
+  return workflowGroupIsPlaceholder(group) ? 'Группа без названия' : group?.name || 'Группа';
+}
+export function workflowGroupChoices(publication) {
+  return (publication?.groups || []).filter(group => !workflowGroupIsPlaceholder(group));
+}
+
 export function workflowGlobalGroupMembers(publication, groupId, catalog, { includeArchived = false } = {}) {
   const byId = new Map(entries(catalog));
   return Object.entries(publication?.tabGroups || {}).filter(([, id]) => id === groupId)

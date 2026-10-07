@@ -83,7 +83,11 @@ test('owner close/restore restores exact typed direct/file subtree, all bytes an
   assert.deepEqual(links.restoredFileIds.sort(),['file1','file2']);
   assert.deepEqual(f.db.prepare('SELECT future_file_blob FROM tabs WHERE tab_id=?').get('file1').future_file_blob,Buffer.from([255,0]));
   assert.equal(f.api.archive.restoreExecution(request).tabId,'owner','lost ACK repeats one native restore');
-  assert.equal(f.api.archive.finishRestore({projectId:NS,id:historyId,token:lease.token,commit:true}).committed,true);
+  const finished=f.api.archive.finishRestore({projectId:NS,id:historyId,token:lease.token,commit:true});
+  assert.equal(finished.committed,true);
+  assert.equal(finished.restoration.sourceTabId,'owner');
+  assert.equal(finished.restoration.targetTabId,'owner','native v2 identity is unchanged');
+  assert.deepEqual(f.api.archive.readCommittedRestoration(finished.restoration),finished.restoration);
   assert.equal(f.database.getTabHistoryEntry(historyId,NS),undefined);
   for(const id of ['ai','ai-file','file1','file2']) {
     assert.equal(f.database.getExecutionTabV2({executionNamespace:NS,tabId:id}).archived,false);
@@ -106,6 +110,27 @@ test('legacy close purges file row yet ordinary undo rebinds that exact file to 
   assert.equal(file.project_id,'Q');assert.equal(file.visual_parent_tab_id,newId);
   assert.equal(f.api.archive.finishRestore({projectId:'P',id:historyId,token:lease.token,commit:true}).committed,true);
   assert.deepEqual(fs.readFileSync(path.join(f.root,'legacy.bin')),Buffer.from([0,1,255]));
+});
+
+test('a native same-ID reclose/restore cannot reuse the prior committed owner generation',t=>{
+  const f=fixture(t);f.create('owner',{name:'Owner',commandType:'codex',codexSessionId:'S'});
+  const restore=()=>{
+    const historyId=f.database.archiveTab(NS,{tabId:'owner',name:'Owner'}, {sourceTabId:'owner',codexWriterSessionId:'S'});
+    f.database.saveTabs(NS,[],true);
+    const lease=f.api.archive.beginRestore({projectId:NS,id:historyId});
+    const request={namespace:NS,historyId,leaseToken:lease.token};
+    f.api.archive.restoreExecution(request);
+    f.api.archive.restoreFiles({...request,ownerTabId:'owner',manifestHash:lease.entry.attachmentManifest.hash});
+    return f.api.archive.finishRestore({projectId:NS,id:historyId,token:lease.token,commit:true}).restoration;
+  };
+  const before=restore();assert.deepEqual(f.api.archive.readCommittedRestoration(before),before);
+  const owner=f.database.getExecutionTabV2({executionNamespace:NS,tabId:'owner'});
+  f.database.saveExecutionTabV2({executionNamespace:NS,tabId:'owner',subjectId:owner.executionSubject.subjectId,
+    expectedRevision:owner.revision,columns:{notes:'Metadata edit on the same restored owner'}});
+  assert.deepEqual(f.api.archive.readCommittedRestoration(before),before,'metadata edits do not invent a different close generation');
+  const after=restore();assert.notEqual(before.ownerIdentity,after.ownerIdentity);
+  assert.throws(()=>f.api.archive.readCommittedRestoration(before),/archive_restore_live_owner_changed/);
+  assert.deepEqual(f.api.archive.readCommittedRestoration(after),after);
 });
 
 test('global archive actions keep exact pre-ID address, CAS and same-ID favorite creation',t=>{

@@ -6,7 +6,9 @@
 const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
 const { attachmentOwnershipReceipt, validateOwnedAttachmentSnapshot } = require('./owned-mobile-attachments');
 const { isAutomaticPromptQueueRequest, isAutomaticNoWriteWait, isAutomaticReadinessWaitReceipt } = require('../shared/prompt-queue-send-intent.cjs');
+const { mergeableQueuedSend, queuedSendMergeCompatible, composeQueuedSendMerge } = require('./queued-send-merge');
 const OPEN = "('waiting','dispatching','awaiting-receipt')";
+const ORDER = 'COALESCE(queue_position,id),id';
 const FAILED = new Set(['not-submitted', 'provider-not-accepted']);
 const consumed = record => record?.state === 'confirmed'
   && record.auditIdentity?.attemptId === record.attemptId
@@ -26,17 +28,21 @@ function applicationQueueReceipt(record, item) {
     sendOperationKey: record.operationKey, attemptId: null, sendAttemptId: null,
     receiptState: record.state,
     applicationQueue: { version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
+      position: item.queue_position ?? item.id,
       ...(waitingBeforeInput ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}) },
     ...(record.receipt?.ownedAttachments ? { attachmentOwnership: attachmentOwnershipReceipt(record.receipt.ownedAttachments) } : {}),
   };
 }
 
 class AgentSendQueue {
-  constructor({ store, execute, publish = () => {}, ready = () => true, cancelAttempt = () => {}, admit = null, reconcile = null }) {
+  constructor({ store, execute, publish = () => {}, publishMerge = null, transferMergedContext = null,
+    ready = () => true, cancelAttempt = () => {}, admit = null, reconcile = null }) {
     this.store = store;
     this.db = store.db;
     this.execute = execute;
     this.publish = publish;
+    this.publishMerge = publishMerge;
+    this.transferMergedContext = transferMergedContext;
     this.ready = ready;
     this.cancelAttempt = cancelAttempt;
     this.admit = admit;
@@ -68,6 +74,12 @@ class AgentSendQueue {
     if (!columns.has('asset_ids_json')) this.db.exec("ALTER TABLE agent_send_queue ADD COLUMN asset_ids_json TEXT NOT NULL DEFAULT '[]'");
     if (!columns.has('predecessor_key')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN predecessor_key TEXT');
     if (!columns.has('release_json')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN release_json TEXT');
+    if (!columns.has('queue_position')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN queue_position INTEGER');
+    if (!columns.has('merge_json')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN merge_json TEXT');
+    this.db.exec(`CREATE TABLE IF NOT EXISTS agent_send_queue_merges(request_id TEXT PRIMARY KEY,
+      request_hash TEXT NOT NULL,response_json TEXT NOT NULL);`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS agent_send_queue_merge_sources(operation_key TEXT PRIMARY KEY,
+      replacement_key TEXT NOT NULL,request_hash TEXT NOT NULL);`);
     this.unsubscribe = store.subscribe(record => this.observe(record));
   }
 
@@ -77,6 +89,136 @@ class AgentSendQueue {
 
   receipt(operationKey) {
     return applicationQueueReceipt(this.store.get(operationKey), this.item(operationKey));
+  }
+
+  queueInfo(operationKey) {
+    const item = this.item(operationKey), record = this.store.get(operationKey);
+    if (!item || !record) return null;
+    const waitingBeforeInput = item.state === 'waiting' && record.state === 'not-submitted'
+      && isAutomaticNoWriteWait(record, JSON.parse(item.request_json));
+    return { version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
+      position: item.queue_position ?? item.id, mergePrevious: this.mergeGuard(operationKey),
+      ...(waitingBeforeInput ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}),
+      ...(item.merge_json ? { merge: JSON.parse(item.merge_json) } : {}),
+      ...(item.release_json ? { release: JSON.parse(item.release_json) } : {}),
+    };
+  }
+
+  mergePair(operationKey) {
+    const item = this.item(operationKey), record = this.store.get(operationKey);
+    if (!item) return null;
+    const current = JSON.parse(item.request_json);
+    if (!mergeableQueuedSend(item, record, current)) return null;
+    const before = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id=? AND state IN ${OPEN}
+      AND (COALESCE(queue_position,id) < ? OR (COALESCE(queue_position,id)=? AND id<?))
+      ORDER BY COALESCE(queue_position,id) DESC,id DESC LIMIT 1`)
+      .get(item.tab_id, item.queue_position ?? item.id, item.queue_position ?? item.id, item.id);
+    const prior = before && this.store.get(before.operation_key);
+    const previous = before && JSON.parse(before.request_json);
+    if (!before || !mergeableQueuedSend(before, prior, previous) || prior.provider !== record.provider
+      || prior.sessionId !== record.sessionId || !queuedSendMergeCompatible(previous, current)) return null;
+    // The head may still be awaiting asynchronous admission with state=waiting.
+    // It is owned by the current pump even before beginAttempt.
+    const head = this.db.prepare(`SELECT operation_key FROM agent_send_queue WHERE tab_id=? AND state IN ${OPEN}
+      ORDER BY ${ORDER} LIMIT 1`).get(item.tab_id);
+    if (this.running.has(item.tab_id) && [item.operation_key, before.operation_key].includes(head?.operation_key)) return null;
+    return { item, before, record, prior, current, previous };
+  }
+
+  mergeGuard(operationKey) {
+    const pair = this.mergePair(operationKey);
+    return pair ? { version: 1, tabId: pair.item.tab_id,
+      operationKey: pair.item.operation_key, queueId: pair.item.id, requestHash: pair.item.request_hash,
+      previousOperationKey: pair.before.operation_key, previousQueueId: pair.before.id, previousRequestHash: pair.before.request_hash } : null;
+  }
+
+  readMerge(requestId, tabId) {
+    const row = this.db.prepare('SELECT response_json FROM agent_send_queue_merges WHERE request_id=?').get(requestId);
+    if (!row) return null;
+    const receipt = JSON.parse(row.response_json);
+    if (receipt.tabId !== tabId) return null;
+    const record = this.projectRecord(this.store.get(receipt.operationKey));
+    return { ...receipt, record: record || null, ...(!record ? { receiptRetired: true } : {}) };
+  }
+
+  async mergeWaiting(request) {
+    const reject = code => ({ success: false, disposition: 'not-applied', code, requestId: request?.requestId });
+    const allowed = ['version', 'requestId', 'tabId', 'operationKey', 'queueId', 'requestHash',
+      'previousOperationKey', 'previousQueueId', 'previousRequestHash'];
+    if (!request || request.version !== 1 || Object.keys(request).some(key => !allowed.includes(key))
+      || ['requestId', 'tabId', 'operationKey', 'requestHash', 'previousOperationKey', 'previousRequestHash']
+        .some(key => typeof request[key] !== 'string' || !request[key] || request[key].length > 8192)
+      || !Number.isSafeInteger(request.queueId) || !Number.isSafeInteger(request.previousQueueId)) return reject('send_queue_merge_identity_required');
+    const signature = fingerprintAgentSendRequest(request);
+    const replay = () => {
+      const old = this.db.prepare('SELECT * FROM agent_send_queue_merges WHERE request_id=?').get(request.requestId);
+      if (!old) return null;
+      return old.request_hash === signature ? this.readMerge(request.requestId, request.tabId)
+        : reject('send_queue_merge_request_conflict');
+    };
+    const saved = replay(); if (saved) return saved;
+    const matches = () => fingerprintAgentSendRequest(this.mergeGuard(request.operationKey))
+      === fingerprintAgentSendRequest(Object.fromEntries(allowed.filter(key => key !== 'requestId').map(key => [key, request[key]])));
+    if (this.disposed || !matches()) return reject('send_queue_merge_no_longer_waiting');
+    const pair = this.mergePair(request.operationKey);
+    let composed;
+    try { composed = await composeQueuedSendMerge({ left: pair.previous, right: pair.current,
+      leftRecord: pair.prior, rightRecord: pair.record, requestId: request.requestId }); }
+    catch (error) { return reject(error.code || 'send_queue_merge_authoring_unavailable'); }
+    let result;
+    this.admitting++;
+    try {
+      result = this.db.transaction(() => {
+        const existing = replay(); if (existing) return existing;
+        if (this.disposed || !matches()) return reject('send_queue_merge_no_longer_waiting');
+        const originalKeys = [pair.before.operation_key, pair.item.operation_key];
+        // Reserve the replacement at the predecessor's position. Originals
+        // keep their immutable requests and truthful no-input receipts.
+        this.db.prepare(`UPDATE agent_send_queue SET state='merged',updated_at=? WHERE operation_key IN (?,?)`)
+          .run(Date.now(), ...originalKeys);
+        const admitted = this.enqueue({ identity: composed.identity, request: composed.request });
+        if (!admitted.ok || !admitted.item) throw Object.assign(new Error('merge admission failed'), { code: admitted.code });
+        const key = composed.identity.operationKey;
+        this.db.prepare('UPDATE agent_send_queue SET queue_position=?,created_at=?,predecessor_key=?,merge_json=? WHERE operation_key=?')
+          .run(pair.before.queue_position ?? pair.before.id, pair.before.created_at, pair.before.predecessor_key,
+            JSON.stringify({ version: 1, requestId: request.requestId, sourceOperationKeys: originalKeys,
+              presentationHandoffId: pair.before.merge_json ? JSON.parse(pair.before.merge_json).presentationHandoffId : pair.prior.handoffId }), key);
+        if (admitted.item.predecessor_key) this.store.unpinForOwner(admitted.item.predecessor_key, 'send-queue-successor:' + key);
+        if (pair.before.predecessor_key) this.store.pinForOwner(pair.before.predecessor_key, 'send-queue-successor:' + key);
+        const followers = this.db.prepare(`SELECT * FROM agent_send_queue WHERE state IN ${OPEN} AND predecessor_key IN (?,?)`).all(...originalKeys);
+        for (const follower of followers) {
+          this.store.unpinForOwner(follower.predecessor_key, 'send-queue-successor:' + follower.operation_key);
+          this.store.pinForOwner(key, 'send-queue-successor:' + follower.operation_key);
+          this.db.prepare('UPDATE agent_send_queue SET predecessor_key=? WHERE operation_key=?').run(key, follower.operation_key);
+        }
+        this.transferMergedContext?.({ tabId: request.tabId, requests: [pair.previous, pair.current], request: composed.request });
+        for (const item of [pair.before, pair.item]) {
+          this.db.prepare('INSERT INTO agent_send_queue_merge_sources VALUES(?,?,?)')
+            .run(item.operation_key, key, item.request_hash);
+          const settled = this.store.settleQueuedNoWrite(item.operation_key, { cancelled: true,
+            code: 'send_queue_merged', mergedIntoOperationKey: key,
+            presentationDismissedAt: Date.now(), presentationDismissedSurface: 'desktop-history' });
+          if (!settled.ok) throw new Error('merge source changed');
+          if (item.predecessor_key) this.store.unpinForOwner(item.predecessor_key, 'send-queue-successor:' + item.operation_key);
+          this.releasePresentation(item.operation_key);
+        }
+        const receipt = { success: true, version: 1, requestId: request.requestId, tabId: request.tabId,
+          operationKey: key, handoffId: composed.identity.handoffId, sourceOperationKeys: originalKeys,
+          sourceHandoffIds: [pair.prior.handoffId, pair.record.handoffId] };
+        this.db.prepare('INSERT INTO agent_send_queue_merges VALUES(?,?,?)')
+          .run(request.requestId, signature, JSON.stringify(receipt));
+        return receipt;
+      })();
+    } catch (error) { result = reject(error.code || 'send_queue_merge_storage_failed'); }
+    finally { this.admitting--; }
+    if (!result.success) return result;
+    for (const key of result.sourceOperationKeys) { this.executors.delete(key); this.resolveWaiters(key); }
+    const full = this.readMerge(result.requestId, result.tabId);
+    if (this.publishMerge) this.publishMerge(full);
+    else { for (const key of result.sourceOperationKeys) this.publishRecord(this.store.get(key)); this.publishRecord(full.record); }
+    this.publishNextWaiting(this.item(result.operationKey));
+    this.wake(request.tabId);
+    return full;
   }
 
   // Main's pre-paste gate calls this only after proving that this invocation
@@ -119,7 +261,7 @@ class AgentSendQueue {
       if (consumed(record)) return { released: false, confirmed: true, record };
       if (record.state !== 'delivery-unknown') fail('send_queue_release_requires_unknown');
       if (this.running.has(request.tabId)) fail('send_queue_release_executor_running');
-      const head = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ? AND state IN ${OPEN} ORDER BY id LIMIT 1`).get(request.tabId);
+      const head = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ? AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(request.tabId);
       if (head?.operation_key !== request.operationKey || head.state !== 'awaiting-receipt') fail('send_queue_release_not_head');
       const release = { requestId: request.requestId, operationKey: request.operationKey, attemptId: request.attemptId,
         kind: 'continue-despite-delivery-unknown', releasedAt: Date.now(), deliveryState: record.state,
@@ -152,6 +294,9 @@ class AgentSendQueue {
         if (existing.request_hash !== requestHash) return { ok: false, action: 'conflict', code: 'agent_send_handoff_conflict' };
         return { ok: true, item: existing, record: this.store.get(identity.operationKey), replayed: true };
       }
+      const mergedSource = this.db.prepare('SELECT * FROM agent_send_queue_merge_sources WHERE operation_key=?').get(identity.operationKey);
+      if (mergedSource) return { ok: false, code: mergedSource.request_hash === requestHash
+        ? 'send_queue_merged' : 'agent_send_handoff_conflict', action: 'merged' };
       if (isAutomaticPromptQueueRequest(snapshot) && snapshot.promptQueueIntent.baseHandoffId) {
         const base = snapshot.promptQueueIntent.baseHandoffId;
         const priors = this.db.prepare(`SELECT operation_key FROM agent_send_queue WHERE tab_id = ?
@@ -184,7 +329,7 @@ class AgentSendQueue {
         ...(snapshot.authoringSnapshot?.imagePaths || []), ...(snapshot.ownedAttachments?.refs || [])]
         .map(image => image.assetId).filter(Boolean))];
       const predecessor = this.db.prepare(`SELECT operation_key FROM agent_send_queue
-        WHERE tab_id = ? AND state IN ${OPEN} ORDER BY id LIMIT 1`).get(identity.tabId);
+        WHERE tab_id = ? AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(identity.tabId);
       this.db.prepare(`INSERT INTO agent_send_queue
         (operation_key,tab_id,request_hash,request_json,asset_ids_json,predecessor_key,state,created_at,updated_at)
         VALUES (?,?,?,?,?,?, 'waiting',?,?)`).run(identity.operationKey, identity.tabId,
@@ -215,13 +360,23 @@ class AgentSendQueue {
     return { ...admitted, receipt: applicationQueueReceipt(admitted.record, admitted.item) };
   }
 
-  publishRecord(record) {
+  publishNextWaiting(item) {
+    if (!item) return;
+    const next = this.db.prepare(`SELECT operation_key FROM agent_send_queue WHERE tab_id=? AND state IN ${OPEN}
+      AND (COALESCE(queue_position,id)>? OR (COALESCE(queue_position,id)=? AND id>?)) ORDER BY ${ORDER} LIMIT 1`)
+      .get(item.tab_id, item.queue_position ?? item.id, item.queue_position ?? item.id, item.id);
+    if (next) this.publishRecord(this.store.get(next.operation_key), false);
+  }
+
+  publishRecord(record, includeNext = true) {
+    if (this.admitting > 0) return;
     const projection = this.projectRecord(record);
     if (projection?.applicationQueue) {
       try { this.publish(projection); }
       catch (error) { console.warn('[AgentSendQueue] publication failed operation='
         + record.operationKey.slice(0, 90) + ' error=' + error.message); }
     }
+    if (includeNext) this.publishNextWaiting(this.item(record.operationKey));
   }
 
   projectRecord(record) {
@@ -235,6 +390,8 @@ class AgentSendQueue {
         attachmentOwnership: attachmentOwnershipReceipt(request.ownedAttachments) } : {}),
       source: request.source, ...(record.receipt || {}) }, applicationQueue: {
       version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
+      position: item.queue_position ?? item.id, mergePrevious: this.mergeGuard(item.operation_key),
+      ...(item.merge_json ? { merge: JSON.parse(item.merge_json) } : {}),
       ...(item.state === 'waiting' && isAutomaticNoWriteWait(record, request)
         ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}),
       ...(item.release_json ? { release: JSON.parse(item.release_json) } : {}),
@@ -307,7 +464,7 @@ class AgentSendQueue {
     for (const owner of this.parked) {
       if (owner === tabId) { this.wake(owner); continue; }
       const item = this.db.prepare(`SELECT request_json FROM agent_send_queue WHERE tab_id = ?
-        AND state IN ${OPEN} ORDER BY id LIMIT 1`).get(owner);
+        AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(owner);
       if (item && JSON.parse(item.request_json).promptQueueIntent?.triggerTabId === tabId) this.wake(owner);
     }
   }
@@ -321,7 +478,7 @@ class AgentSendQueue {
   async pump(tabId) {
     if (this.disposed || this.running.has(tabId) || !this.ready()) return;
     const item = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
-      AND state IN ${OPEN} ORDER BY id LIMIT 1`).get(tabId);
+      AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(tabId);
     if (!item) return;
     const record = this.store.get(item.operation_key);
     if (!record) return; // Losing a receipt is not proof that input was untouched.
@@ -453,7 +610,7 @@ class AgentSendQueue {
   stop(tabId) {
     const result = this.cancelWaiting(tabId);
     const head = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
-      AND state IN ('dispatching','awaiting-receipt') ORDER BY id LIMIT 1`).get(tabId);
+      AND state IN ('dispatching','awaiting-receipt') ORDER BY ${ORDER} LIMIT 1`).get(tabId);
     if (head) {
       const record = this.store.get(head.operation_key);
       // Cancels future work in the existing executor; never reverses an Enter

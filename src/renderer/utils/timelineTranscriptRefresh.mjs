@@ -1,5 +1,5 @@
 import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
-import { resolveHistoryOrchestrationHandoffPresentation } from './historyOrchestrationPromptPresentation.mjs';
+import { resolveHistoryPromptHandoffSemanticTags } from './historyOrchestrationPromptPresentation.mjs';
 import { getTerminalMcpTag, isServicePromptEntry, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
 
 const TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS = 2048;
@@ -81,11 +81,7 @@ export function projectTimelineSentHandoff(handoff, {
   const timestamp = String(proof.auditTimestamp || '').trim()
     || new Date(Number.isFinite(submittedAt) ? submittedAt : Date.now()).toISOString();
   const promptOriginTag = promptOriginTagForSource(handoff.source);
-  const orchestration = resolveHistoryOrchestrationHandoffPresentation(handoff);
-  const semanticTags = [
-    ...(orchestration?.runId ? [{ kind: 'orchestration', ...orchestration }] : []),
-    ...(promptOriginTag ? [promptOriginTag] : []),
-  ];
+  const semanticTags = resolveHistoryPromptHandoffSemanticTags(handoff) || (promptOriginTag ? [promptOriginTag] : []);
   const promptChipLabels = [...new Set((Array.isArray(handoff.promptChips) ? handoff.promptChips : [])
     .filter((chip) => chip?.kind === 'prompt')
     .map((chip) => String(chip?.label || 'PROMPT').trim())

@@ -16,6 +16,7 @@
 const crypto = require('node:crypto');
 const { makeHistoryRowStub } = require('./history-entry-window');
 const { historyActionHeaderFacts } = require('../shared/history-action-header.cjs');
+const { normalizeHistoryRecordTime } = require('../shared/history-record-time.cjs');
 const HISTORY_PAYLOAD_ON_DEMAND = 'on-demand-v1';
 const HISTORY_PAYLOAD_HEADER_VERSION = 2;
 const HISTORY_PAYLOAD_LABEL_CHARS = 512;
@@ -115,6 +116,8 @@ function projectHistoryOnDemand({ toolType, sessionId, entries, stash = historyP
   const exactFields = new Set(['toolUseId', 'toolName', 'agentSessionId', 'agentId', 'processGeneration']);
   const header = object => {
     const result = {};
+    const recordTime = normalizeHistoryRecordTime(object?.recordTime);
+    if (recordTime) result.recordTime = recordTime;
     for (const field of ['toolUseId', 'toolName', 'family', 'bashWord', 'bashDetail', 'mcpServer', 'mcpMethod',
       'subject', 'aggregateKey', 'targetKey', 'targetLabel', 'operationLabel', 'docsKind', 'isError',
       'description', 'subagentStatus', 'agentSessionId', 'agentId', 'startedAt', 'completedAt', 'durationMs',

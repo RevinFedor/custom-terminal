@@ -34,6 +34,7 @@ function handoffs() {
   }).outputText,{exports,console:quiet,setTimeout,clearTimeout,require:id=>{
     if(id==='./historyPromptPresentation.mjs')return presentation;
     if(id==='./agentLocalCommand.mjs')return localCommand;
+    if(id.startsWith('.'))return require(path.resolve(__dirname,'../renderer/utils',id));
     return require(id);
   }});
   return exports;
@@ -87,8 +88,19 @@ async function harness(t,{provider='codex',surface='desktop-history',hydrated=fa
   });
   vm.runInContext(part(main,"ipcMain.handle('agent:dismiss-send-receipt-presentation'","ipcMain.handle('agent:record-history-context'"),context);
   vm.runInContext(part(main,"ipcMain.handle('agent:cancel-queued-send'","ipcMain.handle('agent:cancel-send'"),context);
+  // Only the actual dismissal functions belong to this fixture; intervening
+  // merge controls have independent useRef/IPC owners and tests.
+  const panelAst=ts.createSourceFile('HistoryPanel.tsx',panel,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
+  const variable=name=>{
+    let found;
+    const visit=node=>{
+      if(ts.isVariableDeclaration(node)&&node.name.getText(panelAst)===name)found='const '+node.getText(panelAst)+';';
+      ts.forEachChild(node,visit);
+    };
+    visit(panelAst);assert.ok(found,name);return found;
+  };
   vm.runInContext(compile(part(panel,'const isLocalPromptEntry =','const isLocalRewindEntry ='))
-    +compile(part(panel,'  const removeLocalPromptEntry = useCallback(','  const acknowledgeMaterializedHistoryReceipt ='))
+    +compile(variable('removeLocalPromptEntry'))+compile(variable('dismissPromptPresentation'))
     +'\nglobalThis.dismiss = dismissPromptPresentation;',context);
   t.after(async()=>{queue.dispose();await tick();db.close();fs.rmSync(root,{recursive:true,force:true})});
   return {context,module,queue,store,identity,before,sends,calls,notices,persisted,rows:()=>rows,

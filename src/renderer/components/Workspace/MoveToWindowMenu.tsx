@@ -11,7 +11,8 @@
 
 import React from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowLeftRight, Columns2 } from 'lucide-react';
+import { ArrowLeftRight, Columns2, FolderInput } from 'lucide-react';
+import {useWorkspaceOverlayTarget} from '../../hooks/useWorkspaceOverlayTarget';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import {
   describeWorkspace,
@@ -68,6 +69,9 @@ interface MoveToWindowMenuProps {
   sourcePaneIndex?: number | null;
   /** TabBar already chooses one side for all of its submenus. */
   preferredSide?: 'left' | 'right';
+  workflows?: {id:string;name:string}[];
+  onMoveToWorkflow?: (workflowId:string) => Promise<boolean> | boolean;
+  hideWindowPicker?: boolean;
   onDone: () => void;
 }
 
@@ -100,11 +104,16 @@ export default function MoveToWindowMenu({
   mode = 'move',
   sourcePaneIndex = null,
   preferredSide,
+  workflows,
+  onMoveToWorkflow,
+  hideWindowPicker = false,
   onDone,
 }: MoveToWindowMenuProps) {
   const triggerRef = React.useRef<HTMLButtonElement | null>(null);
   const flyoutRef = React.useRef<HTMLDivElement | null>(null);
+  const overlayTarget = useWorkspaceOverlayTarget();
   const [open, setOpen] = React.useState(false);
+  const [moving,setMoving] = React.useState(false);
   const [resolvedSide, setResolvedSide] = React.useState<'left' | 'right'>(preferredSide || 'right');
 
   const resolveSide = React.useCallback(() => {
@@ -167,7 +176,7 @@ export default function MoveToWindowMenu({
 
   const isSwap = mode === 'swap';
   const Icon = isSwap ? ArrowLeftRight : Columns2;
-  const label = isSwap ? 'Поменять местами' : 'Move to window';
+  const label = isSwap ? 'Поменять местами' : onMoveToWorkflow ? 'Переместить…' : 'Move to window';
 
   return (
     <div
@@ -182,7 +191,7 @@ export default function MoveToWindowMenu({
         type="button"
         role="menuitem"
         data-context-menu-row="ordinary"
-        data-tab-context-action={isSwap ? undefined : 'move-to-window'}
+        data-tab-context-action={isSwap ? undefined : onMoveToWorkflow ? 'move' : 'move-to-window'}
         data-split-swap-item={isSwap ? true : undefined}
         aria-haspopup="menu"
         aria-expanded={open}
@@ -217,15 +226,30 @@ export default function MoveToWindowMenu({
           onMouseDown={(event) => event.stopPropagation()}
           onClick={(event) => event.stopPropagation()}
         >
-          <WindowLayoutPicker
+          <div data-tab-context-menu={onMoveToWorkflow ? true : undefined}
+            style={onMoveToWorkflow ? {...CONTEXT_MENU_PANEL_STYLE,background:'#2a2a2a',border:'1px solid #444',
+              maxHeight:'calc(100vh - 24px)',overflowY:'auto'} : undefined}>
+          {onMoveToWorkflow && !hideWindowPicker && <div style={{padding:'5px 8px',fontSize:11,color:'#888'}}>Окно</div>}
+          {!hideWindowPicker && <WindowLayoutPicker
             projectId={projectId}
             tabId={tabId}
             mode={mode}
             sourcePaneIndex={sourcePaneIndex}
             onDone={finish}
-          />
+          />}
+          {onMoveToWorkflow && <>
+            <div style={{padding:'5px 8px',fontSize:11,color:'#888',borderTop:hideWindowPicker?undefined:'1px solid #444'}}>Workflow</div>
+            {(workflows || []).map(workflow=><button key={workflow.id} type="button" role="menuitem"
+              data-tab-context-action="move-to-workflow" data-workflow-target={workflow.id} disabled={moving}
+              className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 flex items-center gap-2"
+              style={CONTEXT_MENU_ROW_STYLE} onClick={async()=>{
+                if(moving)return;setMoving(true);
+                try {if(await onMoveToWorkflow(workflow.id))finish();} finally {setMoving(false);}
+              }}><span style={CONTEXT_MENU_ICON_SLOT_STYLE}><FolderInput size={12}/></span><span className="truncate min-w-0">{workflow.name}</span></button>)}
+          </>}
+          </div>
         </SideFlyout>,
-        document.body,
+        overlayTarget,
       )}
     </div>
   );

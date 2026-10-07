@@ -16,6 +16,8 @@ export type PaneTabDragSource = {
   sourceSpaceId?: string | null;
   pointerId?: number;
   input?: 'pointer' | 'native';
+  gestureId?: string;
+  workflowDrag?: any;
 };
 
 export type PaneTabDropDebug = {
@@ -79,19 +81,21 @@ export function beginPaneTabDrag(source: PaneTabDragSource) {
   const sameSource = snapshot.active
     && snapshot.source?.owner === source.owner
     && snapshot.source?.input === source.input
+    && (!source.gestureId || snapshot.source?.gestureId === source.gestureId)
     && snapshot.source?.rootTabId === source.rootTabId
     && snapshot.source?.sourcePaneKey === source.sourcePaneKey
     && snapshot.source?.sourceSpaceId === source.sourceSpaceId
     && snapshot.source.entries.map((entry) => entry.tabId).join('\u0000') === entries.map((entry) => entry.tabId).join('\u0000');
-  if (sameSource) return;
+  if (sameSource) return snapshot.source;
   stripGeometry.clear();
   dragSession += 1;
   publish({
     active: true,
     revision: snapshot.revision + 1,
-    source: { ...source, entries },
+    source: { ...source, entries, gestureId:source.gestureId || `pane-drag:${dragSession}` },
     target: null,
   });
+  return snapshot.source;
 }
 
 export function setPaneTabDragTarget(target: PaneTabDropTarget | null) {
@@ -127,9 +131,10 @@ export function claimPaneTabDragDrop(rootTabId?: string) {
   return { source: snapshot.source, target: snapshot.target, session: dragSession };
 }
 
-export function endPaneTabDrag(rootTabId?: string) {
+export function endPaneTabDrag(rootTabId?: string, gestureId?: string) {
   if (!snapshot.active) return;
   if (rootTabId && snapshot.source?.rootTabId !== rootTabId) return;
+  if (gestureId && snapshot.source?.gestureId !== gestureId) return;
   stripGeometry.clear();
   publish({ ...EMPTY, revision: snapshot.revision + 1 });
 }

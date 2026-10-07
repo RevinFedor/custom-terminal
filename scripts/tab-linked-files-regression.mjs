@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Focused snapshot build + private offscreen Electron. No Git, live app or OS input.
+// Focused snapshot build + private offscreen Electron. Read-only Git baseline;
+// no live application, provider, user-data mutations or global OS input.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -7,10 +8,13 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { build } from 'esbuild';
+import { historyVirtuosoMeasurementEsbuildPlugin } from './lib/history-virtuoso-measurement.mjs';
 import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const closeCascade = process.argv.includes('--close-cascade');
+const geometryOnly = process.argv.includes('--geometry');
+const buildOnly = process.argv.includes('--build-only');
 const artifact = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-tab-linked-files-'));
 const snapshot = path.join(artifact, 'source');
 const result = { artifact, pass: false, checks: [], errors: [], sources: {} };
@@ -21,10 +25,29 @@ try {
   await fs.mkdir(path.join(snapshot,'scripts/fixtures'),{recursive:true});
   await fs.copyFile(path.join(repo,'scripts/fixtures/tab-linked-files.tsx'),path.join(snapshot,'scripts/fixtures/tab-linked-files.tsx'));
   await fs.symlink(path.join(repo,'node_modules'),path.join(snapshot,'node_modules'));
+  const baselineCommit='f9b45cc89d56fecb5e8c535d1b6c1301486a498d';
+  const baselineModules=[
+    ['src/renderer/components/Workspace/TabCard.tsx','src/renderer/components/Workspace/TabCardBaseline.tsx'],
+    ['src/renderer/components/Workspace/TabSignals.tsx','src/renderer/components/Workspace/TabSignalsBaseline.tsx'],
+    ['src/renderer/components/Workspace/tabChrome.ts','src/renderer/components/Workspace/tabChromeBaseline.ts'],
+    ['src/renderer/utils/tabCardVisual.mjs','src/renderer/utils/tabCardVisualBaseline.mjs'],
+  ];
+  for(const [original,destination] of baselineModules) {
+    const originalText=execFileSync('git',['show',baselineCommit+':'+original],{cwd:repo,encoding:'utf8'});
+    const text=originalText.replaceAll("from './TabSignals'","from './TabSignalsBaseline'")
+      .replaceAll("from './tabChrome'","from './tabChromeBaseline'")
+      .replaceAll("from '../../utils/tabCardVisual.mjs'","from '../../utils/tabCardVisualBaseline.mjs'");
+    await fs.writeFile(path.join(snapshot,destination),text);
+    result.sources['baseline:f9b45cc:'+original]=createHash('sha256').update(originalText).digest('hex');
+  }
+  const baselinePath=path.join(snapshot,baselineModules[0][1]);
   const shared=path.join(artifact,'noted-shared/packages');
   for(const name of ['structured-dnd','file-explorer']) await fs.cp(path.join(repo,'../noted-shared/packages',name),path.join(shared,name),
     {recursive:true,filter:p=>!p.includes('/node_modules')});
   for(const file of ['src/renderer/components/Workspace/TabCard.tsx','src/renderer/components/Workspace/PaneTabChip.tsx',
+    'src/renderer/components/Workspace/TabSignals.tsx','src/renderer/components/Workspace/tabChrome.ts',
+    'src/renderer/utils/tabCardVisual.mjs','src/renderer/hooks/useWorkspaceOverlayTarget.ts',
+    'src/renderer/utils/tabCardTitleMetrics.ts',
     'src/renderer/components/Workspace/TabLinkedFiles.tsx','src/renderer/components/Workspace/TabLinkedFiles.css',
     'src/renderer/components/Workspace/FilePreview.tsx','src/renderer/components/Workspace/Workspace.tsx',
     'src/renderer/store/useUIStore.ts','src/renderer/store/useWorkspaceStore.ts',
@@ -36,7 +59,8 @@ try {
   await build({entryPoints:[path.join(snapshot,'scripts/fixtures/tab-linked-files.tsx')],bundle:true,sourcemap:true,
     outfile:path.join(artifact,'bundle.js'),platform:'browser',format:'iife',target:'chrome120',jsx:'automatic',logLevel:'silent',
     define:{'process.env.NODE_ENV':'"production"','import.meta.env':'{"DEV":false,"MODE":"test"}'},
-    alias:{'@noted/claude-blocks':path.join(snapshot,'packages/claude-blocks/src'),
+    plugins:[historyVirtuosoMeasurementEsbuildPlugin()],
+    alias:{'@visual-baseline/TabCard':baselinePath,'@noted/claude-blocks':path.join(snapshot,'packages/claude-blocks/src'),
       '@noted/structured-dnd':path.join(shared,'structured-dnd/src'),'@noted/file-explorer':path.join(shared,'file-explorer/src'),
       react:path.join(repo,'node_modules/react'),'react-dom':path.join(repo,'node_modules/react-dom')},
     loader:{'.ttf':'file','.woff2':'file','.svg':'dataurl'}});
@@ -123,7 +147,7 @@ try {
   execFileSync(path.join(repo,'node_modules/.bin/tailwindcss'),['-i',path.join(snapshot,'src/renderer/styles/globals.css'),
     '-o',path.join(artifact,'globals.css'),'--minify'],{cwd:snapshot,stdio:'pipe'});
   await fs.writeFile(path.join(artifact,'index.html'),`<meta charset="utf-8"><link rel="stylesheet" href="globals.css"><link rel="stylesheet" href="bundle.css"><style>
-    html,body{margin:0;background:#1a1a1a;color:#ccc;font-family:Arial}button{cursor:pointer}
+    html,body{margin:0;background:#1a1a1a;color:#ccc}button{cursor:pointer}
     .h-10{height:40px}.flex{display:flex}.items-center{align-items:center}.justify-between{justify-content:space-between}
     .flex-1{flex:1}.shrink-0{flex-shrink:0}.min-w-0{min-width:0}.px-4{padding:0 16px}.w-full{width:100%}
     .truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -133,6 +157,7 @@ try {
     app.whenReady().then(()=>{app.dock?.hide();session.defaultSession.webRequest.onBeforeRequest((d,r)=>r({cancel:!/^(file:|data:|blob:)/.test(d.url)}));
     const w=new BrowserWindow({show:false,focusable:false,width:800,height:560,webPreferences:{offscreen:true,nodeIntegration:false,contextIsolation:true,sandbox:true,backgroundThrottling:false}});
     w.webContents.on('paint',()=>{});w.loadFile(${JSON.stringify(path.join(artifact,'index.html'))});});app.on('window-all-closed',()=>app.quit());`);
+  if(buildOnly) {result.buildOnly=true;result.pass=true;} else {
   const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
   app=await electron.launch({args:[path.join(artifact,'main.cjs')],env,cwd:artifact});result.electronPid=app.process().pid;
   const page=await app.firstWindow();page.setDefaultTimeout(8000);page.on('pageerror',e=>result.errors.push(e.stack||e.message));
@@ -140,11 +165,102 @@ try {
   const check=name=>result.checks.push(name);
   const chip=id=>page.locator('[data-tab-linked-files="'+id+'"]');
   const popup=id=>page.locator('[data-tab-linked-files-popup="'+id+'"]');
+  await page.screenshot({path:path.join(artifact,'initial.png')});
+  await page.locator('[data-fixture-header]').waitFor();
+  if (geometryOnly) {
+    await page.evaluate(()=>window.linkedFixture.dense(true));
+    await page.locator('[data-dense-current]').waitFor();
+    result.limits=['Actual rendered current vs Git-before TabCard; synthetic IPC, no Main/lifecycle acceptance'];
+    result.comparisons=[];
+    for(const [font,padding,width] of [[14,3,1000],[28,3,1700],[28,7,1100],[28,3,580]]) {
+      await app.evaluate(({BrowserWindow},width)=>BrowserWindow.getAllWindows()[0].setSize(width,1000),width);
+      await page.setViewportSize({width,height:1000});
+      await page.evaluate(([font,padding])=>window.linkedFixture.geometry(font,padding),[font,padding]);await frames();
+      const comparison=await page.evaluate(()=>{
+        const box=n=>{const r=n.getBoundingClientRect();return{x:r.x,y:r.y,w:r.width,h:r.height};};
+        const read=selector=>{const root=document.querySelector(selector),r=box(root);
+          return [...root.querySelectorAll('[data-tab-card]')].map(n=>{const b=box(n);return{id:n.dataset.tabCard,x:b.x-r.x,y:b.y-r.y,w:b.w,h:b.h};});};
+        const ink=[...document.querySelectorAll('[data-dense-current] [data-tab-linked-files]')].map(file=>{
+          const card=file.closest('[data-tab-card]'),label=card.querySelector('[data-tab-card-label]');
+          const marker=document.createElement('span');Object.assign(marker.style,{display:'inline-block',height:'0px',width:'0px',verticalAlign:'baseline'});label.prepend(marker);
+          const context=document.createElement('canvas').getContext('2d');context.font=getComputedStyle(label).font;
+          const text=context.measureText('HРрgjpqy'+label.textContent);
+          const baseline=marker.getBoundingClientRect().top,b=card.getBoundingClientRect(),f=file.getBoundingClientRect();marker.remove();
+          const status=card.querySelector('[data-tab-status-marker]')?.getBoundingClientRect();
+          return{id:card.dataset.tabCard,topGap:baseline-text.actualBoundingBoxAscent-b.top-1,
+            fileGap:f.top-baseline-text.actualBoundingBoxDescent,overhang:f.bottom-b.bottom,
+            statusCenterError:status?status.top+status.height/2-(baseline+(text.actualBoundingBoxDescent-text.actualBoundingBoxAscent)/2):null,
+            height:b.height,inkHeight:text.actualBoundingBoxAscent+text.actualBoundingBoxDescent,chipHeight:f.height};
+        });
+        return{before:read('[data-dense-before]'),current:read('[data-dense-current]'),ink,
+          lowerMarkers:document.querySelectorAll('[data-dense-current] [data-task-plan-tab-markers]').length};
+      });
+      assert.equal(comparison.current.length,18);assert.equal(comparison.lowerMarkers,0);
+      const withFiles=new Set(comparison.ink.map(item=>item.id));
+      for(let i=0;i<18;i++) for(const metric of (withFiles.has(comparison.current[i].id)?['x','w']:['x','w','h']))
+        assert.ok(Math.abs(comparison.before[i][metric]-comparison.current[i][metric])<.1,
+          'Git-before '+metric+' differs at '+font+'/'+padding+'/'+width+' '+comparison.current[i].id);
+      for(const ink of comparison.ink){
+        assert.ok(Math.abs(ink.topGap-1)<.06,'highest glyph top clearance: '+JSON.stringify(ink));
+        assert.ok(Math.abs(ink.fileGap-1)<.06,'descender-to-file clearance: '+JSON.stringify(ink));
+        assert.ok(ink.overhang<=3.06,'file must leave 1px before next row: '+JSON.stringify(ink));
+        if(ink.statusCenterError!==null)assert.ok(Math.abs(ink.statusCenterError)<.06,'status stays opposite title glyphs: '+JSON.stringify(ink));
+        assert.ok(ink.height-ink.chipHeight-ink.overhang>=0);
+        const baseline=comparison.before.find(card=>card.id===ink.id);
+        assert.ok(ink.height<=Math.max(baseline.h,Math.ceil(ink.inkHeight+ink.chipHeight))+0.1,'only minimum necessary height');
+      }
+      const stem='dense-'+font+'-'+padding+'-'+width;
+      await page.locator('[data-dense-before]').screenshot({path:path.join(artifact,stem+'-before.png')});
+      await page.locator('[data-dense-current]').screenshot({path:path.join(artifact,stem+'-current.png')});
+      result.comparisons.push({font,padding,width,...comparison});
+      check('18 card widths/no-file heights preserved; measured 1px glyph gaps and minimum file height at '+font+'/'+padding+'/'+width);
+    }
+    await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(1700,1000));
+    await page.setViewportSize({width:1700,height:1000});
+    await page.evaluate(()=>window.linkedFixture.geometry(28,3));await frames();
+    const many=page.locator('[data-dense-current] [data-tab-linked-files="dense-1"]');
+    const single=page.locator('[data-dense-current] [data-tab-linked-files="dense-0"]');
+    assert.match(await many.innerText(),/query.md \+1/);
+    await page.mouse.move(1690,5);await frames();
+    const owner=page.locator('[data-dense-current] [data-tab-card="dense-1"]');
+    const paint=await owner.evaluate(n=>({background:getComputedStyle(n).backgroundColor,color:getComputedStyle(n).color}));
+    const before=await owner.boundingBox();
+    await many.hover();await popup('dense-1').waitFor();await frames();
+    assert.deepEqual(await owner.boundingBox(),before);
+    assert.deepEqual(await owner.evaluate(n=>({background:getComputedStyle(n).backgroundColor,color:getComputedStyle(n).color})),paint);
+    const geometry=await owner.evaluate(n=>{const label=n.querySelector('[data-tab-card-label]').getBoundingClientRect();
+      const file=n.querySelector('[data-tab-linked-files]').getBoundingClientRect();const card=n.getBoundingClientRect();
+      return{labelBottom:label.bottom,fileTop:file.top,fileBottom:file.bottom,cardBottom:card.bottom};});
+    assert.ok(geometry.cardBottom-geometry.fileTop>geometry.fileBottom-geometry.cardBottom);
+    assert.equal(await popup('dense-1').locator('button svg').count(),2);
+    await popup('dense-1').locator('button').first().hover();await frames();
+    assert.deepEqual(await owner.evaluate(n=>({background:getComputedStyle(n).backgroundColor,color:getComputedStyle(n).color})),paint);
+    await page.screenshot({path:path.join(artifact,'dense-popup.png')});
+    await page.mouse.move(1690,5);await frames();
+    assert.equal(await popup('dense-1').count(),0);
+    check('name +N, file icons, majority of absolute chip inside card, unchanged owner paint, closes by next paint');
+    await single.hover();await frames();assert.equal(await popup('dense-0').count(),0);
+    await single.click();await page.waitForFunction(()=>window.linkedFixture.preview()?.sourceTabId==='dense-0-file');
+    check('single file opens exact preview directly; no singleton menu');
+    await page.screenshot({path:path.join(artifact,'single-direct.png')});
+    await page.evaluate(()=>window.linkedFixture.close());
+  } else {
   await chip('one').waitFor();await frames();
   assert.equal(await chip('empty').count(),0);assert.equal(await page.locator('[data-not-pane] [data-tab-linked-files]').count(),0);
   assert.equal(await page.evaluate(()=>window.linkedFixture.reads),0);check('zero hides; pane-only opt-in; no body reads for counts');
-  assert.match(await chip('one').innerText(),/same.md/);assert.equal((await chip('many').innerText()).trim(),'3');
-  check('one filename; 3 direct files across catalogs incl JSON/PNG; descendant excluded');
+  assert.match(await chip('one').innerText(),/same.md/);assert.match(await chip('many').innerText(),/same\.md\s*\+2/);
+  check('filename +N when it fits; 3 direct files across catalogs incl JSON/PNG; descendant excluded');
+  await chip('one').hover();await frames();assert.equal(await popup('one').count(),0);
+  await chip('one').click();await page.waitForFunction(()=>window.linkedFixture.preview()?.sourceTabId==='one-md');
+  assert.equal(await popup('one').count(),0);
+  await chip('one').click({button:'right'});
+  const singleMenu=page.locator('[data-tab-context-menu]');await singleMenu.waitFor();
+  await singleMenu.locator('[data-tab-context-action="copy-file-path"]').click();
+  assert.equal(await page.evaluate(()=>window.linkedFixture.clipboard),'/same.md');
+  assert.equal((await page.evaluate(()=>window.linkedFixture.preview())).sourceTabId,'one-md');
+  await page.locator('[data-file-preview-root] button').filter({hasText:'×'}).click();
+  check('singleton opens exact file directly; overhanging chip stays clickable above preview and its menu addresses the file');
+  await page.evaluate(()=>window.linkedFixture.navigate('empty'));await frames();
   const boxes=()=>page.locator('[data-split-pane-tab-chip]').evaluateAll(nodes=>nodes.map(n=>{const r=n.getBoundingClientRect();return {id:n.dataset.tabId,x:r.x,y:r.y,w:r.width,h:r.height};}));
   const before=await boxes();await chip('many').hover();await popup('many').waitFor();await frames();
   assert.deepEqual(await popup('many').locator('button').allTextContents(),['same.md','config.json','diagram.png']);
@@ -158,10 +274,11 @@ try {
   const geometry=await page.locator('[data-tab-card="many"]').first().evaluate(card=>{
     const bounds=n=>{const r=n.getBoundingClientRect();return{x:r.x,y:r.y,right:r.right,bottom:r.bottom,w:r.width,h:r.height};};
     return{card:bounds(card),file:bounds(card.querySelector('[data-tab-linked-files]')),
-      tasks:bounds(card.querySelector('[data-task-plan-tab-markers]')),label:bounds(card.querySelector('[data-tab-card-label]'))};});
+      tasks:card.querySelectorAll('[data-task-plan-tab-markers]').length,label:bounds(card.querySelector('[data-tab-card-label]'))};});
   result.geometry=geometry;
-  assert.ok(geometry.tasks.bottom<=geometry.file.y);assert.ok(geometry.label.bottom<=geometry.tasks.y);
-  check('task marker row and label clear border-mounted chip');
+  assert.equal(geometry.tasks,0);assert.ok(geometry.card.bottom-geometry.file.y>geometry.file.bottom-geometry.card.bottom);
+  assert.ok(geometry.file.bottom<=geometry.card.bottom+3.06);
+  check('no lower task lane; chip sits mostly inside the bottom of the original card');
   const signals=await page.locator('[data-tab-card="many"]').first().evaluate(card=>{
     const file=card.querySelector('[data-tab-linked-files]').getBoundingClientRect(),
       context=card.querySelector('[data-tab-context-update-badge]').getBoundingClientRect(),
@@ -184,9 +301,12 @@ try {
   assert.equal(await row.getAttribute('data-file-selected'),'1');
   assert.equal(await chip('other').getAttribute('data-file-selected'),null);
   await page.locator('[data-file-preview-root]').waitFor();await frames();
-  const bounds=await page.evaluate(()=>({header:document.querySelector('[data-fixture-header]').getBoundingClientRect().bottom,
-    preview:document.querySelector('[data-file-preview-root]').getBoundingClientRect().top}));
-  assert.equal(bounds.preview,bounds.header);check('FilePreview starts below measured header, preserving chip access');
+  const bounds=await page.evaluate(()=>{
+    const header=document.querySelector('[data-fixture-header]');
+    return {header:Math.max(header.getBoundingClientRect().bottom,...[...header.querySelectorAll('[data-tab-linked-files]')].map(chip=>chip.getBoundingClientRect().bottom)),
+      preview:document.querySelector('[data-file-preview-root]').getBoundingClientRect().top};
+  });
+  assert.equal(bounds.preview,bounds.header);check('FilePreview starts below the visual header edge, preserving absolute-chip access');
   await page.screenshot({path:path.join(artifact,'selected.png')});check('exact owner+file selection and existing FilePreview; internal row does not pin');
   await page.locator('[data-file-preview-root] button').filter({hasText:'×'}).click();
   assert.equal(await page.evaluate(()=>window.linkedFixture.preview()),null);
@@ -221,13 +341,14 @@ try {
   await chip('many').click();await popup('many').locator('[data-linked-file-id="many-md"]').click({button:'right'});
   await menu.locator('[data-tab-context-action="unlink-file"]').click();
   await page.waitForFunction(()=>window.linkedFixture.preview()===null);
-  assert.equal((await chip('many').innerText()).trim(),'2');check('unlink updates count and closes exact preview; no disk deletion');
+  assert.match(await chip('many').innerText(),/config\.json\s*\+1/);check('unlink updates filename +N and closes exact preview; no disk deletion');
   await page.keyboard.press('Escape');await page.evaluate(()=>window.linkedFixture.split(true));await frames();
   await page.evaluate(()=>window.linkedFixture.open('many','many-json'));await frames();
   const paneBounds=await page.evaluate(()=>{
     const r=document.querySelector('[data-file-preview-root]').getBoundingClientRect(),
       header=document.querySelector('[data-fixture-header]').getBoundingClientRect();
-    return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,headerBottom:header.bottom};
+    const chipBottoms=[...document.querySelectorAll('[data-fixture-header] [data-tab-linked-files]')].map(chip=>chip.getBoundingClientRect().bottom);
+    return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,headerBottom:Math.max(header.bottom,...chipBottoms)};
   });
   assert.equal(paneBounds.left,100);assert.equal(paneBounds.right,430);assert.equal(paneBounds.bottom,460);
   assert.equal(paneBounds.top,paneBounds.headerBottom);result.paneBounds=paneBounds;
@@ -241,6 +362,13 @@ try {
   check('existing FilePreview toolbar wraps inside narrow owner pane without title overlap');
   await page.screenshot({path:path.join(artifact,'pane-preview.png')});check('reader stays inside exact owning pane below wrapped header');
   await page.evaluate(()=>{window.linkedFixture.close();window.linkedFixture.split(false);});await frames();
+  await chip('long').hover();await popup('long').waitFor();
+  await popup('long').locator('[data-linked-file-id="long-second"]').click();
+  await page.waitForFunction(()=>window.linkedFixture.preview()?.sourceTabId==='long-second');
+  await page.mouse.move(700,8);await frames();assert.equal(await popup('long').count(),0);
+  await chip('long').hover();await popup('long').waitFor();
+  check('a last-row chip remains reachable after its preview opens; strip layout height stays independent');
+  await page.evaluate(()=>window.linkedFixture.close());
   await page.keyboard.press('Escape');await page.evaluate(()=>window.linkedFixture.bottom(true));await frames();
   await chip('long').hover();await popup('long').waitFor();await frames();
   const long=await popup('long').evaluate(n=>{const r=n.getBoundingClientRect();return{left:r.left,right:r.right,top:r.top,bottom:r.bottom,flipped:n.dataset.flipped,width:r.width};});
@@ -249,10 +377,14 @@ try {
   await page.keyboard.press('Escape');await page.evaluate(()=>{window.linkedFixture.bottom(false);window.linkedFixture.geometry(22,7);});await frames();
   await chip('many').hover();await frames();assert.equal(await popup('many').evaluate(n=>getComputedStyle(n).fontSize),'22px');
   const lane=await page.locator('[data-tab-card="many"]').first().evaluate(n=>({
-    taskBottom:n.querySelector('[data-task-plan-tab-markers]').getBoundingClientRect().bottom,
+    taskCount:n.querySelectorAll('[data-task-plan-tab-markers]').length,
+    cardBottom:n.getBoundingClientRect().bottom,
+    fileBottom:n.querySelector('[data-tab-linked-files]').getBoundingClientRect().bottom,
     fileTop:n.querySelector('[data-tab-linked-files]').getBoundingClientRect().top,
     fileHeight:n.querySelector('[data-tab-linked-files]').getBoundingClientRect().height}));
-  assert.ok(lane.taskBottom<=lane.fileTop);assert.ok(lane.fileHeight>=20);result.largeFontLane=lane;
+  assert.equal(lane.taskCount,0);assert.ok(lane.cardBottom-lane.fileTop>lane.fileBottom-lane.cardBottom);
+  assert.ok(lane.fileBottom<=lane.cardBottom+3.06);
+  assert.ok(lane.fileHeight>=20);result.largeFontLane=lane;
   await page.screenshot({path:path.join(artifact,'large-font.png')});check('configured font and padding honored');
   if (closeCascade) for (const width of [350, 500, 1100]) {
     if (width !== 350) { await page.reload(); await chip('many').waitFor(); }
@@ -278,8 +410,10 @@ try {
     await page.screenshot({ path: path.join(artifact, 'closed-owner-' + width + '.png') });
     check('actual close owner clears linked cards/reader across catalogs at ' + width + '; independent child/files survive');
   }
+  }
   assert.deepEqual(await page.evaluate(()=>window.linkedFixture.violations),[]);
   assert.deepEqual(result.errors,[]);result.pass=true;
+  }
 } catch(error){result.errors.push(error.stack||String(error));process.exitCode=1;}
 finally{if(app)await app.close();await fs.rm(path.join(artifact,'user-data'),{recursive:true,force:true});result.privateProfileRemoved=true;
   if(result.electronPid){try{process.kill(result.electronPid,0);result.privatePidStopped=false;}catch{result.privatePidStopped=true;}}

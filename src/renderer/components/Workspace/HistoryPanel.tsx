@@ -343,6 +343,10 @@ import {
   isHistoryAtContentBottom,
 } from '../../utils/historyBottomGeometry.mjs';
 import { isHistoryHydrationTargetStub } from '../../utils/historyHydrationTarget.mjs';
+import { historyRecordTimeAttributes } from '../../utils/historyRecordTimePresentation.mjs';
+import recordTimes from '../../../shared/history-record-time.cjs';
+import { HistoryRecordTimeOverlay } from './HistoryRecordTimeOverlay';
+import type { HistoryRecordTime } from './ClaudeSDK/sdkHistoryParser';
 import {
   flashHistoryNavigationNode, historyToolNavigationNode, HISTORY_NAVIGATION_FLASH_CSS,
   resolveHistoryToolNavigationTarget,
@@ -362,6 +366,7 @@ import {
   beginHistoryPromptHandoff,
   bindHistoryPromptHandoffSendIdentity,
   consumeHistoryPromptHandoff,
+  applyHistoryQueuedMessageMerge,
   durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry,
   durableHistorySendReceiptMatchesCanonicalEntry,
   getHistoryPromptHandoffsSnapshot,
@@ -384,6 +389,7 @@ import {
   subscribeHistoryPromptHandoffs,
   waitForHistoryPromptHandoffSendIdentity,
   type HistoryPromptHandoffStatus,
+  type QueuedMessageMergeGuard,
 } from '../../utils/historyPromptHandoffs';
 import {
   isStandaloneAgentLocalCommand,
@@ -400,9 +406,9 @@ import {
 } from '../../utils/historyPromptPresentation.mjs';
 import { planHistoryPromptPresentationDismissal } from '../../utils/historyPromptPresentationDismissal.mjs';
 import {
-  resolveHistoryOrchestrationHandoffPresentation,
   resolveHistoryOrchestrationPromptPresentation,
   projectHistoryServicePromptBody,
+  resolveHistoryPromptHandoffSemanticTags,
   resolveHistoryPromptSender,
 } from '../../utils/historyOrchestrationPromptPresentation.mjs';
 import { HistoryPromptSource } from './TabMessageSourceChip';
@@ -586,6 +592,7 @@ interface TaskAction {
   tool: 'Task';
   description: string;
   toolUseId?: string;
+  recordTime?: HistoryRecordTime;
   result?: string;
   history?: Array<{ type: string; content?: string; tools?: string[] }>;
   // Codex in-process subagents (multi_agent_v1 / collaboration): live status
@@ -616,6 +623,7 @@ interface RawAction {
   tool: '__raw__';
   rawTool: {
     toolUseId?: string;
+    recordTime?: HistoryRecordTime;
     toolName: string;
     args: Record<string, any>;
     result?: string;
@@ -660,10 +668,13 @@ interface FullHistoryEntry {
   uuid: string;
   role: 'user' | 'assistant' | 'compact' | 'compact-error' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash' | 'interrupted' | 'usage-limit' | 'provider-error' | 'goal';
   timestamp: string;
+  recordTime?: HistoryRecordTime;
   content: string;
   queueStatus?: HistoryPromptHandoffStatus;
   deliveryStatus?: 'editable-last-prompt';
   handoffId?: string;
+  applicationQueueMerge?: QueuedMessageMergeGuard | null;
+  applicationQueuePosition?: number;
   statusReason?: string;
   statusChangedAt?: number;
   statusAtSend?: AgentPtyStatus;
@@ -1803,6 +1814,7 @@ const historyActionPresentationEqual = (left: Action, right: Action) => {
   if (left.tool !== right.tool) return false;
   if (isRawAction(left) && isRawAction(right)) {
     return left.rawTool.toolName === right.rawTool.toolName &&
+      recordTimes.historyRecordTimeEqual(left.rawTool.recordTime, right.rawTool.recordTime) &&
       left.rawTool.result === right.rawTool.result &&
       left.rawTool.resultRef?.payloadId === right.rawTool.resultRef?.payloadId &&
       left.rawTool.isError === right.rawTool.isError &&
@@ -1811,6 +1823,7 @@ const historyActionPresentationEqual = (left: Action, right: Action) => {
   }
   if (isTaskAction(left) && isTaskAction(right)) {
     return left.description === right.description &&
+      recordTimes.historyRecordTimeEqual(left.recordTime, right.recordTime) &&
       left.toolUseId === right.toolUseId &&
       left.result === right.result &&
       left.subagentStatus === right.subagentStatus &&
@@ -1847,10 +1860,13 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.uuid !== right.uuid ||
     left.role !== right.role ||
     left.timestamp !== right.timestamp ||
+    !recordTimes.historyRecordTimeEqual(left.recordTime, right.recordTime) ||
     left.content !== right.content ||
     left.queueStatus !== right.queueStatus ||
     left.deliveryStatus !== right.deliveryStatus ||
     left.handoffId !== right.handoffId ||
+    left.applicationQueuePosition !== right.applicationQueuePosition ||
+    JSON.stringify(left.applicationQueueMerge || null) !== JSON.stringify(right.applicationQueueMerge || null) ||
     left.statusReason !== right.statusReason ||
     left.statusChangedAt !== right.statusChangedAt ||
     left.statusAtSend !== right.statusAtSend ||
@@ -1877,6 +1893,7 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.preTokens !== right.preTokens ||
     left.postTokens !== right.postTokens ||
     left.compactEncrypted !== right.compactEncrypted ||
+    JSON.stringify(left.semanticTags || []) !== JSON.stringify(right.semanticTags || []) ||
     !haveSameComposerChips(left.promptChips || [], right.promptChips || []) ||
     !haveSamePromptImageRefs(left.imagePaths || [], right.imagePaths || [])
   ) return false;
@@ -2256,6 +2273,7 @@ const SubAgentBlock = memo(({
   return (
     <div
       data-history-agent-card={agentKey}
+      {...historyRecordTimeAttributes(action.recordTime, entryUuid + ':' + (action.toolUseId || agentKey), 'tool')}
       style={{ marginTop: 4, borderLeft: '3px solid ' + rowColor, paddingLeft: 8 }}
     >
       <button
@@ -2555,6 +2573,8 @@ const useRehydratedPayload = (
 
 const HistoryToolCallPart = memo(({
   toolUseId,
+  recordTime,
+  timeKey,
   toolName,
   args,
   result,
@@ -2569,6 +2589,8 @@ const HistoryToolCallPart = memo(({
   docsKind,
 }: {
   toolUseId?: string;
+  recordTime?: HistoryRecordTime;
+  timeKey?: string;
   toolName: string;
   args: Record<string, any>;
   result?: string;
@@ -2612,6 +2634,7 @@ const HistoryToolCallPart = memo(({
   return (
     <div
       className="hp-tool-scroll-scope"
+      {...historyRecordTimeAttributes(recordTime, timeKey || toolUseId, 'tool')}
       data-history-tool-use-id={toolUseId}
       data-history-tool-name={toolName}
       data-history-docs-kind={docsKind || undefined}
@@ -4656,6 +4679,7 @@ const HistoryUserEntry = memo(({
   onDeleteIteration,
   forceExpanded,
   onDismissPromptPresentation,
+  onMergeQueuedPrompt,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
@@ -4673,8 +4697,10 @@ const HistoryUserEntry = memo(({
   onDeleteIteration?: (entry: FullHistoryEntry) => void;
   forceExpanded?: boolean;
   onDismissPromptPresentation?: (entry: FullHistoryEntry) => void;
+  onMergeQueuedPrompt?: (entry: FullHistoryEntry) => Promise<void>;
 }) => {
   const [copied, setCopied] = useState(false);
+  const [mergePending, setMergePending] = useState(false);
   const [promptActionPopover, setPromptActionPopover] = useState<{
     kind: 'native-rewind' | 'delete-iteration';
     anchor: HTMLButtonElement;
@@ -4882,11 +4908,18 @@ const HistoryUserEntry = memo(({
     event.stopPropagation();
     if (canDismissPromptPresentation) onDismissPromptPresentation?.(entry);
   };
+  const mergeQueuedPrompt = async (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault(); event.stopPropagation();
+    if (mergePending || queueStatus !== 'application-queued' || !entry.applicationQueueMerge || !onMergeQueuedPrompt) return;
+    setMergePending(true);
+    try { await onMergeQueuedPrompt(entry); } finally { setMergePending(false); }
+  };
 
   return (
     <ConversationMessage
       layout="user"
       entryUuid={entry.uuid}
+      {...historyRecordTimeAttributes(entry.recordTime, entry.uuid + ':user', 'user')}
       className={orchestrationPrompt ? 'hp-history-user--orchestration' : undefined}
       data-history-orchestration-phase={orchestrationPrompt?.phase}
       data-history-tab-message-id={orchestrationPrompt?.messageId}
@@ -4898,6 +4931,15 @@ const HistoryUserEntry = memo(({
       ) : undefined}
       footer={queueStatusPresentation || isLocalPromptEntry(entry) ? (
         <span className="hp-user-message-status">
+          {queueStatus === 'application-queued' && entry.applicationQueueMerge?.version === 1 && onMergeQueuedPrompt && (
+            <Tooltip content="Добавить к предыдущему сообщению в очереди">
+              <button type="button" className="hp-user-message-status-dismiss" data-merge-queued-prompt
+                aria-label="Объединить с предыдущим сообщением в очереди" disabled={mergePending}
+                onMouseDown={stopActionPropagation} onClick={mergeQueuedPrompt}>
+                <ArrowUp size={10} />
+              </button>
+            </Tooltip>
+          )}
           {canDismissPromptPresentation && (
             <Tooltip content={queueStatus === 'application-queued' ? 'Отменить отправку из очереди' : 'Скрыть эту карточку'}>
               <button
@@ -5151,7 +5193,7 @@ const HistoryAssistantEntry = memo(({
       {entry.thinking && <HistoryThinkBlock text={entry.thinking} payloadRef={entry.thinkingRef} seconds={(entry as any).thinkingSeconds} />}
 
       {entry.content && (
-        <div style={{ fontSize: '1em' }}>
+        <div {...historyRecordTimeAttributes(entry.recordTime, entry.uuid + ':text', 'text')} style={{ fontSize: '1em' }}>
           <CBMarkdown text={entry.content} />
         </div>
       )}
@@ -5178,6 +5220,8 @@ const HistoryAssistantEntry = memo(({
             <div key={'raw' + index + ':' + toolName}>
               <HistoryToolCallPart
                 toolUseId={action.rawTool.toolUseId}
+                recordTime={action.rawTool.recordTime}
+                timeKey={entry.uuid + ':' + (action.rawTool.toolUseId || index)}
                 toolName={toolName}
                 args={action.rawTool.args || {}}
                 result={historyResult}
@@ -5316,6 +5360,7 @@ const HistoryEntry = memo(({
   forceExpanded,
   onDismissRewindPresentation,
   onDismissPromptPresentation,
+  onMergeQueuedPrompt,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
@@ -5334,6 +5379,7 @@ const HistoryEntry = memo(({
   forceExpanded?: boolean;
   onDismissRewindPresentation?: (entry: FullHistoryEntry) => void;
   onDismissPromptPresentation?: (entry: FullHistoryEntry) => void;
+  onMergeQueuedPrompt?: (entry: FullHistoryEntry) => Promise<void>;
 }) => {
   if (entry.role === 'compact') {
     return <CompactBlock entry={entry} />;
@@ -5380,6 +5426,7 @@ const HistoryEntry = memo(({
         deleteIterationUnavailableReason={deleteIterationUnavailableReason}
         forceExpanded={forceExpanded}
         onDismissPromptPresentation={onDismissPromptPresentation}
+        onMergeQueuedPrompt={onMergeQueuedPrompt}
       />
     );
   }
@@ -15548,7 +15595,7 @@ function HistoryPanel({
   const appendLocalPromptEntry = useCallback((
     text: string,
     queueStatus: Extract<HistoryPromptHandoffStatus,
-      'preparing' | 'sending' | 'queued' | 'audit-pending' | 'delivery-unknown' | 'sent'>,
+      'application-queued' | 'preparing' | 'sending' | 'queued' | 'audit-pending' | 'delivery-unknown' | 'sent'>,
     meta: {
       handoffId: string;
       statusAtSend: AgentPtyStatus;
@@ -15565,6 +15612,10 @@ function HistoryPanel({
       sessionId?: string;
       statusChangedAt?: number;
       semanticTags?: FullHistoryEntry['semanticTags'];
+      applicationQueueMerge?: QueuedMessageMergeGuard | null;
+      applicationQueuePosition?: number;
+      presentationHandoffId?: string;
+      preserveReadingPosition?: boolean;
     }
   ) => {
     const cleanContent = normalizeHistoryPromptText(text);
@@ -15579,11 +15630,13 @@ function HistoryPanel({
     const handoffId = meta.handoffId || createPromptHandoffId();
     const resolvedSessionId = meta.auditSessionId || meta.sessionId || sessionId;
     const entry: FullHistoryEntry = {
-      uuid: LOCAL_PROMPT_PREFIX + tabId + '-' + handoffId,
+      uuid: LOCAL_PROMPT_PREFIX + tabId + '-' + (meta.presentationHandoffId || handoffId),
       role: 'queued',
       queueStatus,
       statusAtSend: meta.statusAtSend,
       handoffId,
+      applicationQueueMerge: meta.applicationQueueMerge,
+      applicationQueuePosition: meta.applicationQueuePosition,
       statusReason: queueStatus === 'preparing'
         ? 'send-preparing'
         : queueStatus === 'sending'
@@ -15637,7 +15690,10 @@ function HistoryPanel({
     const isNewPromptPresentation = !presentationEntriesRef.current.some((candidate) =>
       isLocalPromptEntry(candidate) && candidate.handoffId === handoffId
     );
-    if (isNewPromptPresentation) keepHistoryTailPinnedAfterMutation('prompt-submitted', true);
+    if (isNewPromptPresentation) {
+      if (meta.preserveReadingPosition) keepHistoryTailPinnedAfterMutation('queued-message-merge', false);
+      else keepHistoryTailPinnedAfterMutation('prompt-submitted', true);
+    }
     promptHandoffMetaRef.current.set(handoffId, {
       text: cleanContent,
       submittedAt,
@@ -15660,12 +15716,14 @@ function HistoryPanel({
       const existingIndex = prev.findIndex((candidate) =>
         isLocalPromptEntry(candidate) && candidate.handoffId === handoffId
       );
-      const nextEntries = existingIndex < 0
+      let nextEntries = existingIndex < 0
         ? [...prev, entry]
         : prev.map((candidate, index) => index === existingIndex
           ? {
               ...candidate,
               queueStatus,
+              applicationQueueMerge: entry.applicationQueueMerge,
+              applicationQueuePosition: entry.applicationQueuePosition,
               statusAtSend: entry.statusAtSend,
               statusReason: entry.statusReason,
               statusChangedAt,
@@ -15682,6 +15740,14 @@ function HistoryPanel({
               sessionId: entry.sessionId,
             }
           : candidate);
+      if (meta.preserveReadingPosition && Number.isFinite(entry.applicationQueuePosition)) {
+        const mine = nextEntries.findIndex(row => row.handoffId === handoffId);
+        const ahead = nextEntries.findIndex(row => row.role === 'queued' && row.queueStatus === 'application-queued'
+          && row.applicationQueuePosition! > entry.applicationQueuePosition!);
+        if (ahead >= 0 && mine > ahead) {
+          nextEntries = [...nextEntries]; nextEntries.splice(mine, 1); nextEntries.splice(ahead, 0, entry);
+        }
+      }
       presentationEntriesRef.current = nextEntries;
       persistVolatileOverlay(historySnapshotOwner, nextEntries);
       return nextEntries;
@@ -15842,6 +15908,37 @@ function HistoryPanel({
       return nextEntries;
     });
   }, [historySnapshotOwner, persistVolatileOverlay, tabId]);
+
+  const queueMergeIntents = useRef(new Map<string, any>());
+  const queueMergeInflight = useRef(new Set<string>());
+  const mergeQueuedPrompt = useCallback(async (entry: FullHistoryEntry) => {
+    const handoffId = entry.handoffId || '';
+    const current = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
+    if (!current || current.queueStatus !== 'application-queued' || !current.applicationQueueMerge
+      || queueMergeInflight.current.has(handoffId)) return;
+    let request = queueMergeIntents.current.get(handoffId);
+    if (!request) {
+      request = Object.freeze({ ...current.applicationQueueMerge, requestId: crypto.randomUUID() });
+      queueMergeIntents.current.set(handoffId, request);
+    }
+    queueMergeInflight.current.add(handoffId);
+    try {
+      let result;
+      try { result = await ipcRenderer.invoke('agent:merge-queued-send', request); }
+      catch { result = await ipcRenderer.invoke('agent:get-queued-merge', { tabId, requestId: request.requestId }).catch(() => null); }
+      if (result?.success === true && result.requestId === request.requestId && result.tabId === tabId
+        && result.sourceOperationKeys?.[0] === request.previousOperationKey && result.sourceOperationKeys?.[1] === request.operationKey) {
+        applyHistoryQueuedMessageMerge(result);
+        queueMergeIntents.current.delete(handoffId);
+      } else {
+        if (result?.disposition === 'not-applied') queueMergeIntents.current.delete(handoffId);
+        useUIStore.getState().showToast(result?.code === 'send_queue_merge_too_large'
+          ? 'Сообщения слишком большие для объединения.'
+          : result?.disposition === 'not-applied' ? 'Сообщения уже нельзя объединить. Отправки сохранены.'
+            : 'Подтверждение объединения не получено. Повторный клик проверит тот же запрос.', 'error');
+      }
+    } finally { queueMergeInflight.current.delete(handoffId); }
+  }, [tabId]);
 
   const dismissPromptPresentation = useCallback(async (entry: FullHistoryEntry) => {
     const handoffId = typeof entry.handoffId === 'string' ? entry.handoffId.trim() : '';
@@ -16217,16 +16314,7 @@ function HistoryPanel({
         sourceIdentity: carrierProof?.sourceIdentity,
         recordByteOffset: carrierProof?.recordByteOffset,
       };
-      const orchestrationHandoff = resolveHistoryOrchestrationHandoffPresentation(record);
-      const semanticTags: FullHistoryEntry['semanticTags'] = orchestrationHandoff?.kind === 'terminal-mcp'
-        ? [{ kind: 'prompt-origin', source: 'terminal-mcp' }]
-        : orchestrationHandoff
-        ? [{
-            kind: 'orchestration',
-            runId: orchestrationHandoff.runId,
-            ...(orchestrationHandoff.phase === 'request' ? { phase: 'request' as const } : {}),
-          }]
-        : undefined;
+      const semanticTags: FullHistoryEntry['semanticTags'] = resolveHistoryPromptHandoffSemanticTags(record);
       if (identity.sourceIdentity && liveProjectionRef.current.ownerKey === historyOwnerKey) {
         const currentLive = liveProjectionRef.current.entries;
         const retainedLive = retireHistoryLivePromptByExactProof(currentLive, {
@@ -16242,7 +16330,8 @@ function HistoryPanel({
         }
       }
       if (
-        record.queueStatus === 'preparing'
+        record.queueStatus === 'application-queued'
+        || record.queueStatus === 'preparing'
         || record.queueStatus === 'sending'
         || record.queueStatus === 'queued'
         || record.queueStatus === 'audit-pending'
@@ -16254,6 +16343,10 @@ function HistoryPanel({
           statusAtSend: record.statusAtSend,
           submittedAt: record.submittedAt,
           statusChangedAt: record.statusChangedAt,
+          applicationQueueMerge: record.applicationQueueMerge,
+          applicationQueuePosition: record.applicationQueuePosition,
+          presentationHandoffId: record.applicationQueuePresentationHandoffId,
+          preserveReadingPosition: record.applicationQueueReplacement === true,
           promptChips,
           imagePaths,
           semanticTags,
@@ -18228,6 +18321,7 @@ function HistoryPanel({
           promptChips: normalizeComposerChips(handoff.promptChips)
             .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
           imagePaths: retainHistoryDraftImages(cleanContent, handoff.imagePaths),
+          semanticTags: resolveHistoryPromptHandoffSemanticTags(handoff),
           ...historyPromptHandoffPresentationIdentity(handoff),
         };
       },
@@ -23150,6 +23244,7 @@ function HistoryPanel({
                     deleteIterationUnavailableReason={historyRewriteRewindUnavailableReason}
                     onDeleteIteration={executeHistoryDeleteIteration}
                     onDismissPromptPresentation={dismissPromptPresentation}
+                    onMergeQueuedPrompt={!previewMode ? mergeQueuedPrompt : undefined}
                     onDismissRewindPresentation={dismissLocalRewindPresentation}
                     forceExpanded={
                       searchActive && matchingEntryUuids.has(entry.uuid)
@@ -23371,6 +23466,8 @@ function HistoryPanel({
       )}
 
       {composerNode && !composerPortalHostId && composerNode}
+      <HistoryRecordTimeOverlay panelRef={panelRef} scrollerRef={virtuosoScrollerRef} tabId={tabId}
+        ownerKey={historyOwnerDomId} enabled={(embedded ? (embeddedFill || slideIn) : isOpen) && !staleOwnerCurtain} />
     </div>
   );
 

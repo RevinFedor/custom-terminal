@@ -64,7 +64,7 @@ function GlobalArchivePreview({record,entryUuid}:{record:GlobalArchiveRecord;ent
     return () => {useUIStore.getState().setHistoryPanelOpen(tabId,false);};
   },[tabId,toolType,sessionId,entryUuid]);
   if (!toolType || !sessionId) return <div className="gta-metadata">{record.notes || 'У записи нет сохранённого диалога'}<br/>{record.cwd}</div>;
-  return <div data-global-archive-preview style={{display:'flex',height:450,minHeight:250,position:'relative'}}>
+  return <div data-global-archive-preview style={{display:'flex',height:'100%',minHeight:0,position:'relative'}}>
     <div style={{flex:1,minWidth:0}}><HistoryPanel tabId={tabId} sessionId={String(sessionId)} cwd={record.cwd || ''}
       width={420} notesPanelWidth={0} isOpen toolType={toolType} enableClaudePtyControls={false} embedded embeddedFill previewMode /></div>
     <div style={{width:33,flexShrink:0,position:'relative',overflow:'hidden'}}>
@@ -74,13 +74,13 @@ function GlobalArchivePreview({record,entryUuid}:{record:GlobalArchiveRecord;ent
   </div>;
 }
 
-export function RootGlobalArchive({onClose}:{onClose:()=>void}) {
+export function RootGlobalArchive({onClose,presented=true}:{onClose:()=>void;presented?:boolean}) {
   const workflows = useWorkspaceStore(state => state.spaces);
   const [snapshot,setSnapshot] = useState<any>(null),[service,setService] = useState(false);
   const [namespace,setNamespace] = useState(GLOBAL_EXECUTION_NAMESPACE),[serviceResult,setServiceResult] = useState<any>(null);
   const [busy,setBusy] = useState(false),[failure,setFailure] = useState('');
   const [confirm,setConfirm] = useState<ReturnType<typeof freezeArchiveClearIntent>|null>(null);
-  const [dateFrom,setDateFrom] = useState(''),[provider,setProvider] = useState('all');
+  const [dateFrom,setDateFrom] = useState('');
   const serviceLock = useRef(false), clearAttempts = useRef(new Set<string>());
   const confirmationRef = useRef(confirm);
   confirmationRef.current = confirm;
@@ -99,6 +99,7 @@ export function RootGlobalArchive({onClose}:{onClose:()=>void}) {
   },[]);
   const closeArchive = useCallback(() => {cancelNavigation();onClose();},[cancelNavigation,onClose]);
   useEffect(() => {alive.current = true;return cancelNavigation;},[cancelNavigation]);
+  useEffect(() => {if(presented)alive.current=true;},[presented]);
   const captureNavigation = (request:ArchiveRequest) => {
     let intent = navigationIntents.current.get(request.requestId);
     if (!intent) {
@@ -113,10 +114,10 @@ export function RootGlobalArchive({onClose}:{onClose:()=>void}) {
     return {intent,unsubscribe};
   };
   useEffect(() => {
-    if (!confirm) return;
+    if (!confirm || !presented) return;
     const cancel = (event:KeyboardEvent) => {if (event.key === 'Escape') {event.preventDefault();event.stopImmediatePropagation();cancelConfirm();}};
     window.addEventListener('keydown',cancel,true);return () => window.removeEventListener('keydown',cancel,true);
-  },[confirm,cancelConfirm]);
+  },[confirm,cancelConfirm,presented]);
   const readArchive = useCallback(async () => {
     const result = await ipcRenderer.invoke('workflow:archive-read');
     if (result?.version !== 1 || !Array.isArray(result.history) || !Array.isArray(result.favorites)) throw new Error('Архив недоступен');
@@ -190,7 +191,7 @@ export function RootGlobalArchive({onClose}:{onClose:()=>void}) {
       if (!result?.success) throw new Error(result?.error || 'Поиск архива не подтверждён');
       for (const hit of result.data || []) {
         const row = current.history.find((row:any) => row.namespace === scope && row.id === (hit.historyId ?? hit.tabHistoryId ?? hit.id));
-        if (row && (provider === 'all' || row.command_type === provider)) history.push({...hit,...row,
+        if (row && (!request.provider || request.provider === 'all' || row.command_type === request.provider)) history.push({...hit,...row,
           entryUuid:hit.entryUuid,score:hit.score,summary:hit.summary,__notedArchiveSourceV1:row});
       }
     }
@@ -261,13 +262,11 @@ export function RootGlobalArchive({onClose}:{onClose:()=>void}) {
     ipcRenderer.on('tab-title-index:progress',progress);ipcRenderer.on('tab-iteration-index:progress',progress);
     return () => {ipcRenderer.removeListener('tab-title-index:progress',progress);ipcRenderer.removeListener('tab-iteration-index:progress',progress);};
   },[namespace]);
-  return <div data-root-global-archive role="dialog" aria-label="Общий архив" style={{
-    position:'fixed',inset:0,zIndex:2147482100,background:'#171717',overflow:'hidden',color:'#ccc',display:'flex',flexDirection:'column'}}>
+  if(!presented)return null;
+  return <div data-root-global-archive aria-label="История вкладок" style={{
+    position:'absolute',inset:0,zIndex:160,background:'#171717',overflow:'hidden',color:'#ccc',display:'flex',flexDirection:'column'}}>
     <div className="global-tab-archive" style={{height:'auto',flexShrink:0,padding:8,display:'flex',flexDirection:'row',gap:8,flexWrap:'wrap'}}>
       <button onClick={() => setService(!service)}>Индексы и очистка</button>
-      <select aria-label="Провайдер поиска" value={provider} onChange={event => setProvider(event.target.value)}>
-        <option value="all">Все агенты</option><option value="claude">Claude</option><option value="codex">Codex</option><option value="gemini">Gemini</option>
-      </select>
     </div>
     {service && <div className="global-tab-archive" data-archive-services style={{height:'auto',flexShrink:0,padding:12,display:'flex',flexDirection:'row',gap:8,flexWrap:'wrap',maxHeight:240,overflow:'auto'}}>
       <select aria-label="Область архива" value={namespace} onChange={event => setNamespace(event.target.value)}>
@@ -2569,10 +2568,10 @@ export default function Workspace({
 
         </div>
 
-        {/* Project Home - Overlay AFTER TabBar+TerminalArea to keep children indices stable */}
-        {/* Uses absolute positioning so visual order is unaffected */}
-        {/* The global archive has its own Root owner. Legacy currentView=home
-            cannot resurrect the removed project surface. */}
+        {/* History occupies the same central surface as before the workflow
+            cutover. The global data owner does not cover workspace navigation. */}
+        {organizationReady && <RootGlobalArchive presented={focusedCurrentView === 'home' && workspaceView === 'workspace'}
+          onClose={() => {if (focusedProjectId) setProjectView(focusedProjectId,'terminal');}} />}
       </div>
 
       </div>{/* /MAIN ROW */}

@@ -92,6 +92,8 @@ export function organizationProjection(snapshot, current) {
     .map(tab => [tab.tabId,tab.membership]));
   const tabCatalog = Object.fromEntries(snapshot.tabs.map(tab => [tab.tabId,{tabId:tab.tabId,
     subjectVersion:tab.subjectVersion,executionSubject:tab.executionSubject,
+    storageId:(tab.nativeRow || tab.legacyRow)?.id ?? null,
+    physicalParentTabId:(tab.nativeRow || tab.legacyRow)?.parent_tab_id ?? null,
     namespace:tab.executionSubject?.executionNamespace || tab.executionSubject?.projectId || null,
     active:!!(tab.nativeRow || tab.legacyRow) && tab.nativeRow?.execution_archived !== 1,revision:tab.revision}]));
   const layout = {...emptySpaceLayout(),...(active?.layout || {})};
@@ -125,7 +127,7 @@ export function createOrganizationCommitter({invoke,getPublication,applyPublicat
     let result = operation.result;
     if (!result) {
       try {
-        result = await invoke('workflow:mutate',{kind:'commitWorkspace',request:operation.request});
+        result = await invoke('workflow:mutate',{kind:operation.kind || 'commitWorkspace',request:operation.request});
         if (!confirmed(result,operation.request)) throw Object.assign(new Error('workflow_commit_unconfirmed'),{
           disposition:result?.mutationId === operation.request.mutationId ? result.disposition : undefined,
         });
@@ -136,14 +138,14 @@ export function createOrganizationCommitter({invoke,getPublication,applyPublicat
           // These named Main validation errors prove the transaction rejected.
           // Transport errors and missing ACK keep owning the same request.
           if (original?.disposition === 'not-applied'
-            || /workflow_(revision_changed|membership_revision_changed|incomplete_membership_snapshot|membership_target_missing|space_identity_conflict|system_kind_reserved|id_exists|tab_unknown)/.test(String(original?.code || original?.message || original)))
+            || /workflow_(drag_|group_|revision_changed|membership_revision_changed|incomplete_membership_snapshot|membership_target_missing|space_identity_conflict|system_kind_reserved|id_exists|tab_unknown)/.test(String(original?.code || original?.message || original)))
             unresolved = null;
           throw original;
         }
       }
       operation.result = result;
     }
-    await applyPublication(result);
+    operation.publication = await applyPublication(result);
     if (unresolved === operation) unresolved = null;
     return result;
   };
@@ -167,5 +169,18 @@ export function createOrganizationCommitter({invoke,getPublication,applyPublicat
     tail = run.catch(error => onError(error)).finally(() => pending--);
     return run;
   };
-  return {commit,runTask,flush:() => tail,pending:() => pending};
+  const command = (kind,request,{isCurrent=()=>true}={}) => {
+    const frozen=structuredClone(request);
+    pending++;
+    const run=tail.then(async()=>{
+      if(unresolved)await apply(unresolved);
+      if(!isCurrent())throw Object.assign(new Error('workflow_drag_cancelled'),{disposition:'not-applied'});
+      const operation={kind,request:frozen,result:null};unresolved=operation;
+      const result=await apply(operation);
+      return {...result,snapshot:operation.publication};
+    });
+    tail=run.catch(error=>onError(error)).finally(()=>pending--);
+    return run;
+  };
+  return {commit,command,runTask,flush:() => tail,pending:() => pending};
 }

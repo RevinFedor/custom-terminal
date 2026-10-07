@@ -87,8 +87,8 @@ export function tabMessageDelivery(message: TabMessage): MessagePresentation {
   switch (message.deliveryState) {
     case 'sent': return { label: 'Доставлено', color: '#4ade80', icon: 'delivered', spinning: false };
     case 'sending': return { label: 'Отправка', color: '#60a5fa', icon: 'sending', spinning: true };
-    case 'pending': return { label: 'Ожидает отправки', color: '#fbbf24', icon: 'waiting', spinning: false };
-    case 'queued': return { label: 'В очереди', color: '#fbbf24', icon: 'waiting', spinning: false };
+    case 'pending': return { label: 'Ожидает отправки', color: '#a1a1aa', icon: 'waiting', spinning: false };
+    case 'queued': return { label: 'В очереди', color: '#a1a1aa', icon: 'waiting', spinning: false };
     case 'waiting-for-input': return { label: 'Доставка ждёт ввода', color: '#fbbf24', icon: 'error', spinning: false };
     case 'unconfirmed': return { label: 'Доставка не подтверждена', color: '#fbbf24', icon: 'error', spinning: false };
     case 'failed': return { label: 'Ошибка доставки', color: '#f87171', icon: 'error', spinning: false };

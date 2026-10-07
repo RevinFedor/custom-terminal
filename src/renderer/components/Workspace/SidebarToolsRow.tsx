@@ -370,12 +370,11 @@ export default function SidebarToolsRow({ projectId, presentation = 'workspace',
         </ControlHint>
       )}
 
-      {/* Кнопка открывает вид проекта, а он показывает историю вкладок:
-          закрытые сессии, поиск по ним, превью. */}
+      {/* History keeps the existing central page and navigation entry point. */}
       <ControlHint
         label={presentation === 'dashboard'
-          ? 'Открыть историю вкладок выбранного проекта'
-          : isHomeActive ? 'Вернуться в терминал' : 'Открыть историю вкладок проекта'}
+          ? 'Открыть историю вкладок'
+          : isHomeActive ? 'Вернуться в терминал' : 'Открыть историю вкладок'}
         side="bottom"
       >
         <button

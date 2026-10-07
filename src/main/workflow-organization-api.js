@@ -10,6 +10,7 @@ const { WorkflowGroups } = require('./workflow-groups');
 const { ArchivedFileLinks } = require('./archived-file-links');
 const { WorkflowArchive } = require('./workflow-archive');
 const { WorkflowGroupActions } = require('./workflow-group-actions');
+const { WorkflowDrag } = require('./workflow-drag');
 
 /** One Main publication serves the renderer, automation and external readers. */
 function createWorkflowOrganizationApi({ database, publish = () => {}, validateDirectory = cwd => fs.statSync(cwd).isDirectory(),captureExecution }) {
@@ -55,6 +56,7 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
     .run(GLOBAL_EXECUTION_NAMESPACE,JSON.stringify({name:'Вкладки',kind:'global-catalog',recommendedCwd:require('node:os').homedir()}));
   const archive = new WorkflowArchive({database,organization:service,fileLinks:archivedFileLinks,groups,roots});
   const groupActions = new WorkflowGroupActions({database,organization:service,groups,captureExecution});
+  const drag = new WorkflowDrag({organization:service,groups});
   const error = (code, statusCode = 409) => { throw Object.assign(new Error(code), { code, statusCode }); };
   const ready = () => service.getPublication().migrationVersion === 1;
   const read = () => service.read(() => ({...service.readState(),globalGroups:groups.read(),
@@ -111,6 +113,7 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
       aliases: [{ namespace: executionNamespace, tabId }] });
   };
   const mutate = (kind, request) => {
+    if (kind === 'commitDrag') return drag.commit(JSON.parse(JSON.stringify(request)));
     const allowed = new Set(['moveTab', 'detachTab', 'createWorkflow', 'saveLayout', 'deleteWorkflow', 'commitWorkspace']);
     if (!allowed.has(kind) || typeof service[kind] !== 'function') error('workflow_mutation_unknown', 400);
     return service[kind](JSON.parse(JSON.stringify(request)));

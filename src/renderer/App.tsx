@@ -44,7 +44,7 @@ import {
 } from './constants/projectHoverPreview';
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
-import Workspace, {RootGlobalArchive} from './components/Workspace/Workspace';
+import Workspace from './components/Workspace/Workspace';
 import WorkspacePresentationBoundary from './components/Workspace/WorkspacePresentationBoundary';
 import StatusBar from './components/StatusBar';
 import ToastContainer from './components/UI/Toast';
@@ -165,14 +165,14 @@ import {
   AGENT_SETTINGS_INTENT_NONE,
   createAgentSettingsIntent,
 } from './utils/agentSendSettingsContract';
-import { runHistoryPromptHandoff, hydrateHistoryPromptHandoffFromDurableReceipt } from './utils/historyPromptHandoffs';
+import { runHistoryPromptHandoff, hydrateHistoryPromptHandoffFromDurableReceipt, applyHistoryQueuedMessageMerge } from './utils/historyPromptHandoffs';
 import { executeHistoryRewriteRewindScenario, executeHistoryDeleteIterationScenario } from './utils/historyRewriteRewind';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { installTerminalInputFeedback } from './utils/terminalInputFeedback.mjs';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/claudeStartupDefaultsReady';
 import './utils/claudeStartupDefaultsGate';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
-import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
+import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId, resolveWorkspaceCwd } from './constants/systemProjects';
 import { PROJECT_CARD_MAX_H, TITLE_BAR_H } from './constants/layout';
 import { generateTabTitleFromSession } from './utils/generateTabTitle';
 import { startAutoTabTitleCoordinator } from './utils/autoTabTitleCoordinator';
@@ -1248,12 +1248,6 @@ function App() {
   const openProject = useWorkspaceStore((s) => s.openProject);
   const closeProject = useWorkspaceStore((s) => s.closeProject);
   const createTab = useWorkspaceStore((s) => s.createTab);
-  const [globalArchiveOpen,setGlobalArchiveOpen] = useState(false);
-  useEffect(() => {
-    const open = () => setGlobalArchiveOpen(true);
-    window.addEventListener('global-tab-archive:open',open);
-    return () => window.removeEventListener('global-tab-archive:open',open);
-  },[]);
   const createTabAfterCurrent = useWorkspaceStore((s) => s.createTabAfterCurrent);
   const closeTab = useWorkspaceStore((s) => s.closeTab);
   const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
@@ -4330,7 +4324,11 @@ function App() {
               requireExactCwd: true,
             },
           );
-          if (!restored.tabId || restored.tabId !== expectedTabId) {
+          const replacement = restored.restoration;
+          const exactReplacement = replacement?.version === 1 && replacement.namespace === projectId
+            && replacement.historyId === Number(historyId) && replacement.sourceTabId === expectedTabId
+            && replacement.targetTabId === restored.tabId;
+          if (!restored.tabId || restored.historyDeleteFailed || restored.tabId !== expectedTabId && !exactReplacement) {
             return reply(false, restored, restored.message || restored.reason || 'closed tab restore failed');
           }
           return reply(true, { ...restored, projectId, restored: true });
@@ -5282,6 +5280,7 @@ function App() {
               text: prompt,
               promptChips: presentationSnapshot?.promptChips || [],
               imagePaths: presentationSnapshot?.imagePaths || [],
+              semanticTags: presentationSnapshot?.semanticTags,
               ...(authoringSnapshot ? {
                 authoringText: authoringSnapshot.editorText,
                 authoringChips: authoringSnapshot.chips,
@@ -5662,6 +5661,8 @@ function App() {
       hydrateHistoryPromptHandoffFromDurableReceipt(record);
     };
     ipcRenderer.on('agent:send-queue-receipt', handleSendQueueReceipt);
+    const handleSendQueueMerge = (_event: any, result: any) => { applyHistoryQueuedMessageMerge(result); };
+    ipcRenderer.on('agent:send-queue-merged', handleSendQueueMerge);
     void ipcRenderer.invoke('agent:send-queue-ready', true).catch((error: any) =>
       console.warn('[AgentSendQueue] renderer readiness failed:', error?.message));
 
@@ -5934,6 +5935,7 @@ function App() {
       ipcRenderer.removeListener('codex:model-migration-settings-applied', handleCodexModelMigrationApplied);
       ipcRenderer.removeListener('web:bridge-request', handleWebBridge);
       ipcRenderer.removeListener('agent:send-queue-receipt', handleSendQueueReceipt);
+      ipcRenderer.removeListener('agent:send-queue-merged', handleSendQueueMerge);
       void ipcRenderer.invoke('agent:send-queue-ready', false).catch(() => {});
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
@@ -6513,7 +6515,8 @@ function App() {
           const organization = useWorkspaceStore.getState();
           if (organization.organizationReady) {
             void organization.createWorkflowTab({workflowId:organization.activeSpaceId,sourceTabId:keyboardTarget.tabId || undefined,
-              tabOptions:{background:true}}).then(id => {if (id) useWorkspaceStore.setState({pendingEditTabId:id});});
+              tabOptions:{background:true,groupId:organization.workflowSidebarState[organization.activeSpaceId]?.activeGroupId || undefined}})
+              .then(id => {if (id) useWorkspaceStore.setState({pendingEditTabId:id});});
             return;
           }
           const sidebarProjectId = keyboardTarget.projectId;
@@ -7223,8 +7226,6 @@ function App() {
               справа, вместе со своей ручкой изменения ширины. Общие чипы
               ресурсов остаются доступны также на Home. */}
           <WorkspaceTitleBarTools dashboard={view === 'dashboard'} />
-          <button data-global-archive-open aria-label="Общий архив" onClick={() => setGlobalArchiveOpen(true)}
-            style={{WebkitAppRegion:'no-drag',padding:'0 8px',height:'100%',color:'#aaa',flexShrink:0} as any}>Архив</button>
 
           {/* Resizable Window Drag Area */}
           <div className="relative h-full flex-shrink-0 flex" style={{ width: dragAreaWidth }}>
@@ -7331,7 +7332,6 @@ function App() {
       />
       <ShutdownOverlay />
       <ToastContainer />
-      {globalArchiveOpen && <RootGlobalArchive onClose={() => setGlobalArchiveOpen(false)} />}
       <SessionInputModal />
       <SettingsModal
         isOpen={settingsOpen}

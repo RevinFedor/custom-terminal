@@ -63,3 +63,27 @@ test('a silent SC endpoint has a physical deadline', async () => {
     (error) => error.code === 'sc_research_request_timeout',
   );
 });
+
+test('openJob uses only exact local navigation and accepts only the rendered matching job ACK', async () => {
+  const calls = [];
+  const client = new ScExternalResearchClient({ fetchImpl: async (url, init = {}) => {
+    calls.push({url,body:init.body?JSON.parse(init.body):null});
+    return response(200,url.endsWith('/research-capabilities') ? {navigation:{version:1,renderedAck:true}}
+      : {ok:true,opened:true,jobId:'noted_job',requestId:'nav'});
+  } });
+  assert.equal((await client.openJob('noted_job',{requestId:'nav'})).opened,true);
+  assert.equal(calls.length,2);assert.match(calls[1].url,/\/research-open$/);
+  assert.deepEqual(calls[1].body,{jobId:'noted_job',requestId:'nav'});
+  assert.ok(calls.every(call => !/research-start|open-url|research-stop/.test(call.url)));
+});
+test('old SC capabilities or an acceptance/foreign-job response cannot silently open a browser or claim success', async () => {
+  for (const result of [{ok:true,accepted:true},{ok:true,opened:true,jobId:'other',requestId:'nav'}]) {
+    const client=new ScExternalResearchClient({fetchImpl:async url=>response(200,url.endsWith('/research-capabilities')
+      ? {navigation:{version:1,renderedAck:true}}:result)});
+    await assert.rejects(client.openJob('job',{requestId:'nav'}),e=>e.code==='sc_research_navigation_not_confirmed');
+  }
+  let calls=0;
+  const client=new ScExternalResearchClient({fetchImpl:async () => {calls++;return response(200,{version:1});}});
+  await assert.rejects(client.openJob('job',{requestId:'nav'}),e=>e.code==='sc_research_navigation_unavailable');
+  assert.equal(calls,1);
+});

@@ -26,7 +26,7 @@ test('History selects orchestration colour only from audited semantic metadata',
 });
 
 test('the exact orchestration handoff gives the optimistic row the same colour before audit', () => {
-  assert.match(source, /resolveHistoryOrchestrationHandoffPresentation\(record\)/);
+  assert.match(source, /resolveHistoryPromptHandoffSemanticTags\(record\)/);
   assert.match(source, /semanticTags:\s*meta\.semanticTags/);
   assert.match(source, /semanticTags,\s*\n\s*sessionId: sessionRoute\.presentationSessionId/);
 });

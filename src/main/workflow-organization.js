@@ -168,7 +168,7 @@ class WorkflowOrganization {
       publishedGeneration: row.published_generation };
   }
 
-  mutate(kind, request, change, { migrating = false } = {}) {
+  mutate(kind, request, change, { migrating = false, validateScope } = {}) {
     requireId(request.mutationId);
     const requestJson = stableJson({ ...request, kind });
     const requestHash = fingerprint(parse(requestJson));
@@ -182,7 +182,16 @@ class WorkflowOrganization {
         replay = true;
         return parse(old.response_json);
       }
-      const meta = this.assertWritable(request.expectedRevision, { migrating });
+      let meta;
+      if (validateScope) {
+        // Only the explicit scoped command supplies this validator. Keep its
+        // original revision in the immutable request; it must prove its whole
+        // read/write footprint before accepting an unrelated publication.
+        meta = this.getPublication();
+        if (!Number.isSafeInteger(request.expectedRevision) || request.expectedRevision > meta.revision) fail('workflow_revision_changed');
+        this.assertWritable(meta.revision, { migrating });
+        syncValue(validateScope(meta));
+      } else meta = this.assertWritable(request.expectedRevision, { migrating });
       const generation = meta.generation + 1;
       const changed = change(generation, meta) || {};
       const result = { ...changed, mutationId: request.mutationId, version: ORGANIZATION_VERSION,

@@ -1,4 +1,5 @@
 import React, { memo, useMemo, useState } from 'react';
+import { historyRecordTimeAttributes } from '../../utils/historyRecordTimePresentation.mjs';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import {
   FAMILY_LABELS,
@@ -334,7 +335,8 @@ export const HistoryCollapsedGroupRow = memo(({
       {!expanded && (caption || digest) && (
         <div className="hp-history-group-detail">
           <span aria-hidden style={{ flexShrink: 0 }}>└</span>
-          <span>{caption || digest}</span>
+          <span {...(caption ? historyRecordTimeAttributes(group.captionEntry?.recordTime,
+            group.captionEntry?.uuid + ':caption', 'text') : {})}>{caption || digest}</span>
         </div>
       )}
     </div>

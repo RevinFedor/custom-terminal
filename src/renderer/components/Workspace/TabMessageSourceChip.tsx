@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ArrowDownLeft, ArrowUpRight, CircleAlert, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -7,16 +7,32 @@ import { resolveTabCardBackground } from '../../utils/tabCardVisual.mjs';
 import { requestRowLinkStyle } from './RequestTrackerRow';
 import { cancelTabMessageSourceJump, jumpToTabMessageSource } from '../../utils/tabMessageSourceJump';
 import { useUIStore } from '../../store/useUIStore';
+const { ipcRenderer } = window.require('electron');
 
 type Source = { sourceTabId: string; sourceTabName?: string | null; sourceProjectId?: string | null; messageId?: string };
 
 export function HistoryPromptSource({ source, phase, onNavigate }: {
-  source: Partial<Source> & { label?: string }; phase?: string; onNavigate?: () => void;
+  source: Partial<Source> & { label?: string; researchRunId?: string }; phase?: string; onNavigate?: () => void;
 }) {
   const incoming = phase === 'question' || phase === 'request';
   const response = phase === 'reply' || phase === 'completion' || phase === 'failure';
   const Icon = incoming ? ArrowDownLeft : response ? ArrowUpRight : null;
   const [jumping, setJumping] = useState(false);
+  const [openingResearch, setOpeningResearch] = useState(false);
+  const researchOpeningRef = useRef(false);
+  const openResearch = async () => {
+    if (researchOpeningRef.current) return;
+    researchOpeningRef.current = true;
+    cancelTabMessageSourceJump();
+    setOpeningResearch(true);
+    try {
+      const result = await ipcRenderer.invoke('orchestration:open-research-job', { runId: source.researchRunId });
+      if (result?.success !== true) throw new Error(result?.error || 'Не удалось открыть задачу в SC Desktop');
+      onNavigate?.();
+    } catch (error) {
+      useUIStore.getState().showToast(error instanceof Error ? error.message : String(error), 'error', 5000);
+    } finally { researchOpeningRef.current = false; setOpeningResearch(false); }
+  };
   const jump = async () => {
     setJumping(true);
     try {
@@ -42,6 +58,13 @@ export function HistoryPromptSource({ source, phase, onNavigate }: {
       <Icon size={14} strokeWidth={2.2} aria-hidden="true" />
     </span>)}
     {source.sourceTabId ? <TabMessageSourceChip source={source as Source} onNavigate={onNavigate} />
+      : source.researchRunId ? <button type="button" data-external-research-source={source.researchRunId}
+        title="Открыть задачу в SC Desktop" aria-label={`Открыть задачу в SC Desktop: ${source.label}`} disabled={openingResearch}
+        onMouseDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openResearch(); }}
+        style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11,
+          color: '#c4b5fd', background: 'transparent', border: 0, padding: '2px 0', cursor: openingResearch ? 'default' : 'pointer', textAlign: 'left' }}>
+        {source.label}
+      </button>
       : <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#c4b5fd' }}>{source.label}</span>}
   </div>;
 }

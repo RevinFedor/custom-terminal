@@ -523,6 +523,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
   const fakeWindow = {
     isDestroyed: () => false,
     webContents: {
+      isDestroyed: () => false,
       send(channel, message) {
         if (channel === 'orchestration:changed') {
           controller.orchestrationEvents.push(message);
@@ -586,6 +587,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     delete require.cache[require.resolve('./web-server')];
     webServer = require('./web-server');
     webServer.start(startOptions);
+    webServer.markSendQueueRendererReady(true, 1);
   } catch (error) {
     Module._load = originalLoad;
     throw error;
@@ -2452,6 +2454,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
   const restartWebServer = async () => {
     await webServer.stop();
     webServer.start(startOptions);
+    webServer.markSendQueueRendererReady(true, 1);
     await waitFor(async () => {
       try {
         const response = await api('/api/me');

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { selectWorkflowReserve, workflowPlacedTabIds, workflowReserveOutline, workflowGroupKey,
-  reservePaneEntries } from './workflowReserve.mjs';
+  reservePaneEntries,projectReservePaneSource } from './workflowReserve.mjs';
 
 function fixture() {
   const tabs = new Map(Array.from({ length: 6 }, (_, i) => [`t${i}`, { id: `t${i}`, name: `Tab ${i}`, groupId: 'g' }]));
@@ -11,6 +11,43 @@ function fixture() {
     activeSpaceId: 'w', splitPanes: [], centerStrips: {}, activeSpaceTab: null };
   return state;
 }
+test('empty local workflow group participates in the same outline and does not leak to another workflow', () => {
+  const state=fixture();
+  state.globalGroups={groups:[{id:'empty',name:'Empty',reserveWorkflowId:'w',collapsed:false},
+    {id:'foreign',name:'Foreign',reserveWorkflowId:'inbox'}],tabGroups:{}};
+  let tree=workflowReserveOutline(selectWorkflowReserve(state));
+  const empty=tree.find(node=>node.groupId==='empty');
+  assert.ok(empty);assert.equal(empty.collapsible,true);assert.deepEqual(empty.children,[]);
+  assert.equal(tree.some(node=>node.groupId==='foreign'),false);
+  state.globalGroups.tabGroups.t0='empty';
+  tree=workflowReserveOutline(selectWorkflowReserve(state));
+  assert.equal(tree.filter(node=>node.groupId==='empty').length,1);
+  assert.deepEqual(tree.find(node=>node.groupId==='empty').children.map(node=>node.tabId),['t0']);
+});
+test('cross-group parent remains a context reference without changing its relationship', () => {
+  const state=fixture(),tabs=state.openProjects.get('legacy').tabs;
+  tabs.get('t1').visualParentTabId='t0';tabs.get('t1').groupId='other';
+  state.openProjects.get('legacy').tabGroups.push({id:'other',name:'Other'});
+  const tree=workflowReserveOutline(selectWorkflowReserve(state));
+  const child=tree.find(node=>node.groupId==='other').children[0];
+  assert.equal(child.contextParent.tabId,'t0');
+  assert.equal(tabs.get('t1').visualParentTabId,'t0');
+});
+test('pane adoption projects the exact family without mutating placement or catalog',()=>{
+  const state=fixture(),tabs=state.openProjects.get('legacy').tabs;
+  tabs.get('t1').visualParentTabId='t0';
+  tabs.get('t2').tabType='file';tabs.get('t2').visualParentTabId='t0';
+  state.splitPanes=[{tabs:[{projectId:'legacy',tabId:'t0'}]}];
+  const before=structuredClone(state),model=selectWorkflowReserve(state),outline=workflowReserveOutline(model);
+  const projected=projectReservePaneSource(model,outline,{owner:'pane',rootTabId:'t0',entries:[{projectId:'legacy',tabId:'t0'}]});
+  assert.equal(projected.sourceId,'reserve-tab:t0');
+  const root=projected.outline.at(-1);
+  assert.deepEqual(root.children.map(node=>node.tabId),['t1','t2']);
+  assert.deepEqual(projected.metadata.familyIds,['t0','t1','t2']);
+  const ids=[];const walk=nodes=>nodes.forEach(node=>{if(node.tabId)ids.push(node.tabId);walk(node.children)});walk(projected.outline);
+  assert.equal(new Set(ids).size,ids.length);assert.deepEqual(state,before);
+  assert.equal(projectReservePaneSource(model,outline,{owner:'pane',rootTabId:'t0',entries:[{projectId:'foreign',tabId:'t0'}]}),null);
+});
 test('0/1/6 reserve uses canonical membership only and preserves manual order', () => {
   const state = fixture();
   assert.equal(selectWorkflowReserve(state).reserve.length, 6);

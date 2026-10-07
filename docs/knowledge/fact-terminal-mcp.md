@@ -412,6 +412,25 @@ snapshot запроса в SQLite `agent_send_queue`, связывая его с
 refs фиксируются при приёме; дальнейший input их не меняет. Очередь не зависит
 от смонтированной History. Ошибка сохранения не является ACK.
 
+Desktop History может явно объединить две соседние ручные `IN APP QUEUE`
+карточки через ↑ у нижней, только пока обе `waiting`, без physical attempt,
+с одинаковыми destination/settings. Main повторно проверяет эти условия после
+подготовки и внутри SQLite transaction. Новый snapshot имеет новый operationKey
+и текст `первое + "\n\n" + второе`, прежнюю FIFO-позицию/время первой карточки;
+original JSON/fingerprints не переписываются. Их no-input receipts становятся
+`not-submitted/merged`, а durable supersession markers запрещают оживить старые
+IDs даже после receipt-prune. Owned assets/occurrences и deferred-context IDs
+переходят новому handoff через прежних владельцев в том же commit; chips/images
+не flatten'ятся и одинаковые тексты сохраняются дважды. Исполняет прежний Send.
+Dispatch/cancel/смена owner/settings во время подготовки дают no-write отказ,
+обе исходные отправки сохраняются. Потерянный ACK проверяется exact requestId
+через read-only getter; новый merge/Enter не создаётся. Native `QUEUED`, unknown,
+Run After/MCP/orchestration/service messages не являются кандидатами. Контрол
+появляется только с Main-produced `applicationQueue.mergePrevious.version=1`;
+это additive desktop IPC, не новая публичная Send/RunAfter capability.
+SOURCE07.10 проверен real SQLite/actual IPC и private Electron UI, не installed
+или provider acceptance. Checked evidence: `/private/tmp/noted-queued-merge-20261007.cRlqbz/RESULT.md`.
+
 В каждый момент только head входит в прежний общий readiness/settings/draft/
 PTY scenario. Native acceptance (`QUEUED`) остаётся промежуточной границей:
 следующий item получает ход после exact canonical audit предыдущего, даже

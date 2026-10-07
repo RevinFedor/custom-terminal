@@ -127,6 +127,9 @@ ${suite === 'acceptance' ? "import{HistoryResponseTailTimer as LegacyTail,Histor
 import{TerminalActivityIcon}from'./TerminalActivityIcon';import{ConversationMessage}from'./ConversationMessage';
 const root=createRoot(document.getElementById('fixture'));
 const startTs=Date.now()-85000;
+let frameLoop=0;
+function requestMainThreadFrames(enabled){cancelAnimationFrame(frameLoop);frameLoop=0;
+ if(enabled){const next=()=>{frameLoop=requestAnimationFrame(next)};frameLoop=requestAnimationFrame(next)}}
 function Indicators({owner,legacy=false}){const Tail=legacy?LegacyTail:HistoryResponseTailTimer,Spin=legacy?LegacySpinner:HistorySpinner;return <div className="fixture-indicators">
  <div data-family="process" className="chip-row">{Array.from({length:12},(_,i)=><span key={i} className="chip" data-process-chip={i}>task {i+1}<TabProcessBar hasProcess busy inheritedBusy={i===2} radius={5}/></span>)}</div>
  <div className="indicator-line"><div data-family="tail"><Tail timing={{state:'running',startTs,intervalId:owner,endTs:null,durationMs:null}}/></div>
@@ -141,7 +144,7 @@ function BarGallery(){const cases=[20,37,50,73,100,200].flatMap(spacing=>[18,36,
  style={{height,width:180,boxSizing:'border-box','--process-bar-shimmer-spacing':spacing+'%','--process-bar-color-a':'#178257',...(${fullMatrix}?{'--process-bar-inherited-shimmer-rgb':'255, 255, 255'}:{})}}>{spacing}% · {height}px
  <TabProcessBar hasProcess busy={mode!=='inherited'} inheritedBusy={mode!=='normal'} radius={5} positionOverride={side}/></span>)}</div>}
 function App(){const[hidden,setHidden]=useState(false),[dense,setDense]=useState(true),[gallery,setGallery]=useState(0);
- window.fixture={setMode(mode){document.getElementById('control-style').textContent=mode==='baseline'?'':
+ window.fixture={requestMainThreadFrames,setMode(mode){document.getElementById('control-style').textContent=mode==='baseline'?'':
   mode==='paused'?'.fixture-indicators *, .fixture-indicators *::before,.fixture-indicators *::after{animation-play-state:paused!important}':
   '.fixture-indicators [data-family]:not([data-family="'+mode+'"]) , .fixture-indicators [data-family]:not([data-family="'+mode+'"]) *, .fixture-indicators [data-family]:not([data-family="'+mode+'"]) *::before,.fixture-indicators [data-family]:not([data-family="'+mode+'"]) *::after{animation-play-state:paused!important}';
   document.documentElement.dataset.mode=mode;},setArm(arm){document.documentElement.dataset.r04SelectedArm=arm},setDense(value){flushSync(()=>setDense(value))},setHidden(value){flushSync(()=>setHidden(value))},
@@ -244,7 +247,14 @@ win.on('focus',()=>focusEvents.push(Date.now()));win.webContents.on('paint',()=>
     result.samples.push(sample);await fs.writeFile(path.join(artifact,'result.json'),JSON.stringify(result,null,2));
     console.log(JSON.stringify({stage:'sample',name,nodes:state.nodes,cpuMs:delta.ThreadTime*1000,scriptMs:delta.ScriptDuration*1000,paint:totals.Paint,prepaint:totals.PrePaint,lifecycle:totals['LocalFrameView::RunPaintLifecyclePhase']}));
   };
-  if(suite==='acceptance'){
+  if(suite==='frame-loop'){
+    await measure('01-animation-alone','baseline');
+    await page.evaluate(()=>window.fixture.requestMainThreadFrames(true));
+    await measure('02-animation-with-frame-loop','baseline');
+    await measure('03-paused-with-frame-loop','paused');
+    await page.evaluate(()=>window.fixture.requestMainThreadFrames(false));
+    await measure('04-animation-alone-return','baseline');
+  }else if(suite==='acceptance'){
     await measure('legacy-all','baseline',{arm:'baseline'});
     await measure('product-paused','paused');
     await measure('product-all','baseline');

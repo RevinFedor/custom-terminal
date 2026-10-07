@@ -4800,7 +4800,7 @@ class DatabaseManager {
         return { success: true };
       }
       // The v1 implementation/guards stay intact. V2 rows are never subjected
-      // to its delete/reinsert/Project FK path.
+      // to its legacy Project FK path.
       if (!legacy.length && independent.length && !forceCleanup) return { success: true };
       const result = this._saveLegacyTabs(projectId, legacy, forceCleanup, preserveInterrupted);
       if (result?.success === false) workflowStorage.fail(result.error || 'execution_legacy_save_failed');
@@ -4990,23 +4990,23 @@ class DatabaseManager {
       }
     }
 
-    const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
+    const legacyColumns = ('project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_workflow_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats, last_activated_at, window_scoped, closed_visual_parent_tab_id, restore_placement_id').split(', ');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_workflow_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats, last_activated_at, window_scoped, closed_visual_parent_tab_id, restore_placement_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (id, ${legacyColumns.join(', ')})
+      VALUES (${Array(legacyColumns.length + 1).fill('?').join(', ')})
+      ON CONFLICT(id) DO UPDATE SET ${legacyColumns.map(column => `${column}=excluded.${column}`).join(', ')}
     `);
 
     const transaction = this.db.transaction((tabList) => {
-      // Step 1: Delete old rows for tabs we're about to re-insert (by tab_id)
-      tabList.forEach((tab) => {
-        if (tab.tabId) {
-          deleteByTabId.run(projectId, tab.tabId);
-        }
-      });
+      // Retained logical tabs keep their physical row. A metadata-only save
+      // must not look like a foreign replacement to a frozen drag/close proof,
+      // and must preserve Main-owned columns absent from renderer metadata.
+      const storageIds = new Map(this.db.prepare('SELECT tab_id,id FROM tabs WHERE project_id=? AND tab_id IS NOT NULL')
+        .all(projectId).map(row => [row.tab_id,row.id]));
       // Step 2: Delete orphan rows without tab_id (legacy tabs)
       this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id IS NULL').run(projectId);
 
-      // Step 3: Insert all tabs fresh
+      // Step 3: Update existing rows in place; allocate an ID only for new tabs.
       tabList.forEach((tab, index) => {
         const historyJson = (tab.claudeSessionHistory && tab.claudeSessionHistory.length > 0)
           ? JSON.stringify(tab.claudeSessionHistory)
@@ -5104,7 +5104,7 @@ class DatabaseManager {
           )
           ? persistedCodexSettings
           : incomingCodexSettings;
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, claudeSessionId, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, restartAfterWorkflowsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson, lastActivatedAt, tab.windowScoped ? 1 : 0, tab.closedVisualParentTabId || null, tab.restorePlacementId || null);
+        insert.run(storageIds.get(tab.tabId) ?? null, projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, claudeSessionId, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, restartAfterWorkflowsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson, lastActivatedAt, tab.windowScoped ? 1 : 0, tab.closedVisualParentTabId || null, tab.restorePlacementId || null);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set

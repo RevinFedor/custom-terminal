@@ -22,7 +22,7 @@ const EMPTY: PaneTabPointerSnapshot = Object.freeze({
 
 let snapshot: PaneTabPointerSnapshot = EMPTY;
 const moveListeners = new Set<() => void>();
-const dropListeners = new Set<(finalSnapshot: PaneTabPointerSnapshot) => void>();
+const dropListeners = new Set<(finalSnapshot: PaneTabPointerSnapshot) => boolean | void>();
 
 const notifyMove = () => moveListeners.forEach((listener) => listener());
 
@@ -50,12 +50,14 @@ export function updatePaneTabPointerMeta(metaKey: boolean) {
   notifyMove();
 }
 
-export function finishPaneTabPointer() {
-  if (!snapshot.active) return;
-  const finalSnapshot = snapshot;
-  dropListeners.forEach((listener) => listener(finalSnapshot));
+export function finishPaneTabPointer(point?:Partial<PaneTabPointerSnapshot>) {
+  if (!snapshot.active) return false;
+  const finalSnapshot = {...snapshot,...point};
+  let accepted=false;
+  for(const listener of dropListeners)if(listener(finalSnapshot)===true){accepted=true;break;}
   snapshot = { ...EMPTY, revision: snapshot.revision + 1 };
   notifyMove();
+  return accepted;
 }
 
 export function cancelPaneTabPointer() {
@@ -69,7 +71,7 @@ export const subscribePaneTabPointer = (listener: () => void) => {
   moveListeners.add(listener);
   return () => moveListeners.delete(listener);
 };
-export const subscribePaneTabPointerDrop = (listener: (snapshot: PaneTabPointerSnapshot) => void) => {
+export const subscribePaneTabPointerDrop = (listener: (snapshot: PaneTabPointerSnapshot) => boolean | void) => {
   dropListeners.add(listener);
   return () => dropListeners.delete(listener);
 };

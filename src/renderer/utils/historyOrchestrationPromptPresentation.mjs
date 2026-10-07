@@ -74,7 +74,8 @@ export function resolveHistoryPromptSender(presentation) {
   const completion = presentation.kind !== 'tab-message'
     && (presentation.phase === 'completion' || presentation.phase === 'failure');
   if (completion && presentation.runKind === 'external-research') {
-    return { label: presentation.targetTabName || 'Browser research' };
+    return { label: presentation.targetTabName || 'Browser research',
+      ...(presentation.runId ? { researchRunId: presentation.runId } : {}) };
   }
   const sourceTabId = completion ? presentation.targetTabId : presentation.sourceTabId;
   if (!sourceTabId) return null;
@@ -88,6 +89,16 @@ export function resolveHistoryPromptSender(presentation) {
 
 const normalizeOwnedHandoffSource = (value) =>
   String(value || '').replace(/^(?:claude|codex)-/, '');
+
+export function resolveHistoryPromptHandoffSemanticTags(handoff) {
+  if (Array.isArray(handoff?.semanticTags) && handoff.semanticTags.length) {
+    return handoff.semanticTags.map(tag => ({ ...tag }));
+  }
+  const presentation = resolveHistoryOrchestrationHandoffPresentation(handoff);
+  if (presentation?.kind === 'terminal-mcp') return [{ kind: 'prompt-origin', source: 'terminal-mcp' }];
+  return presentation ? [{ kind: 'orchestration', runId: presentation.runId,
+    phase: presentation.phase }] : undefined;
+}
 
 /** Exact app-owned source/handoff pairs let the optimistic row use the same
  * colour before its audited durable semantic tag arrives. */

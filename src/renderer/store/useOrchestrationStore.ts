@@ -112,6 +112,7 @@ export type OrchestrationRun = {
   externalResearchTransportError?: string | null;
   externalResearchRetryAt?: number | null;
   externalResearchDeliveryUnknown?: boolean;
+  deliveryTransportUnknownAt?: number | null;
   targetAcknowledgedAt?: number | null;
   targetAttentionDismissedAt?: number | null;
   parentRunId?: string | null;

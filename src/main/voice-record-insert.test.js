@@ -22,6 +22,9 @@ test('actual orchestration/fork IDs cross discovery and the single recording POS
     'project-tab-fork-9943cdb9-cb5d-4497-9c14-d8bb746ece32',
     'L1VzZXJzL2ZlZG9yL0Rlc2t0b3AvY3VzdG9tLXRlcm1pbmFs-tab-3951',
     'tab-8',
+    'restored-ac19d5db-b394-4b23-826f-43df8e6dad2a',
+    'tab-ac19d5db-b394-4b23-826f-43df8e6dad2a',
+    'arbitrary-future:address.42',
   ];
   const result = await insertTabIdsInVoiceRecord(ids, { ...f, fetchImpl: async (url, options) => {
     calls.push({ url, options });
@@ -35,7 +38,7 @@ test('actual orchestration/fork IDs cross discovery and the single recording POS
 });
 
 test('malformed or oversized IDs fail before discovery or a recording request', async () => {
-  for (const id of ['tab-1x', 'project-tab-', 'project-tab-a\nother', 'project-tab-a\n', 'project-tab-a\u2028', 'project-tab-a\0', 'project-tab-a b', 'project-tab-' + 'x'.repeat(1024)]) {
+  for (const id of ['', null, 42, 'project-tab-a\nother', 'project-tab-a\n', 'project-tab-a\u2028', 'project-tab-a\0', 'project-tab-a b', 'project-tab-' + 'x'.repeat(1024)]) {
     const result = await insertTabIdsInVoiceRecord([id], { directory: '/nonexistent-discovery', fetchImpl: () => assert.fail('no network') });
     assert.deepEqual(result, { ok: false, error: 'Некорректный ID вкладки' }, id);
   }

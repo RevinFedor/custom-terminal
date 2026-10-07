@@ -6,12 +6,12 @@ const crypto = require('crypto');
 const PROMPT_SUFFIX = '.prompt.md';
 const ROOT_PARENT = '__root__';
 const CACHE_TTL_MS = 1500;
+// Reuse the same natural-order rules across the whole catalog scan. Passing
+// options to localeCompare builds a collator for every pair in Array.sort.
+const naturalCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
 function naturalCompare(a, b) {
-  return String(a || '').localeCompare(String(b || ''), undefined, {
-    numeric: true,
-    sensitivity: 'base',
-  });
+  return naturalCollator.compare(String(a || ''), String(b || ''));
 }
 
 function expandHome(input) {
@@ -21,15 +21,17 @@ function expandHome(input) {
   return value;
 }
 
-function canonicalPath(input, fsImpl = fs) {
+function canonicalPath(input, fsImpl = fs, cache) {
   const resolved = path.resolve(expandHome(input));
+  if (cache?.has(resolved)) return cache.get(resolved);
+  let canonical = resolved;
   try {
-    return fsImpl.realpathSync.native
+    canonical = fsImpl.realpathSync.native
       ? fsImpl.realpathSync.native(resolved)
       : fsImpl.realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
+  } catch {}
+  cache?.set(resolved, canonical);
+  return canonical;
 }
 
 function resolvedSourcePath(input) {
@@ -152,12 +154,20 @@ function orderDirectoryEntries(entries, dirPath, rootPath, rawLayout) {
   return result;
 }
 
-function scanSource({ projectId, rootPath, sourceName, layout, fsImpl = fs }) {
+function sourceDirectoryState(rootPath, fsImpl, readContext) {
+  if (readContext?.directories.has(rootPath)) return readContext.directories.get(rootPath);
   const docsPath = path.join(rootPath, 'docs');
   let rootExists = false;
   let docsExists = false;
   try { rootExists = fsImpl.statSync(rootPath).isDirectory(); } catch {}
   try { docsExists = fsImpl.statSync(docsPath).isDirectory(); } catch {}
+  const value = { docsPath, exists: rootExists, docsExists };
+  readContext?.directories.set(rootPath, value);
+  return value;
+}
+
+function scanSource({ projectId, rootPath, sourceName, layout, fsImpl = fs, readContext }) {
+  const { docsPath, exists: rootExists, docsExists } = sourceDirectoryState(rootPath, fsImpl, readContext);
 
   const prompts = [];
   if (docsExists) {
@@ -205,6 +215,20 @@ function scanSource({ projectId, rootPath, sourceName, layout, fsImpl = fs }) {
   };
 }
 
+function catalogSource(input, readContext) {
+  if (!readContext) return scanSource(input);
+  // Prompt IDs include the namespace; labels/manual layout use the configured
+  // path, not its realpath. Share only exact equivalents during this one read.
+  const key = JSON.stringify([typeof input.projectId, input.projectId, input.rootPath, input.sourceName, input.layout]);
+  let value = readContext.scans.get(key);
+  if (!value) {
+    value = scanSource({ ...input, readContext });
+    readContext.scans.set(key, value);
+  }
+  // Each retained tab catalog still owns its records and attachment arrays.
+  return { ...value, prompts: value.prompts.map(prompt => ({ ...prompt, file_paths: [...prompt.file_paths] })) };
+}
+
 class ProjectPromptCatalogService {
   constructor({ db, layoutStore, rootRegistry = null, onChanged = null, fsImpl = fs, watch = true } = {}) {
     if (!db) throw new Error('ProjectPromptCatalogService requires db');
@@ -221,12 +245,12 @@ class ProjectPromptCatalogService {
     if (watch) this.refreshWatchers();
   }
 
-  getSources(projectId) {
+  getSources(projectId, readContext) {
     const rows = this.db.getProjectPromptSources(projectId);
-    return this.describeSources(rows);
+    return this.describeSources(rows, readContext);
   }
 
-  describeSources(rows) {
+  describeSources(rows, readContext) {
     // Preserve the configured spelling for the shared layout key. A symlinked
     // root and its real path are the same source identity, but the explorer's
     // manual order is intentionally keyed by the exact root the user opened.
@@ -234,11 +258,7 @@ class ProjectPromptCatalogService {
     const labels = sourceDisplayLabels(roots);
     return rows.map((row, index) => {
       const rootPath = roots[index];
-      const docsPath = path.join(rootPath, 'docs');
-      let exists = false;
-      let docsExists = false;
-      try { exists = this.fs.statSync(rootPath).isDirectory(); } catch {}
-      try { docsExists = this.fs.statSync(docsPath).isDirectory(); } catch {}
+      const { docsPath, exists, docsExists } = sourceDirectoryState(rootPath, this.fs, readContext);
       return {
         ...row,
         rootPath,
@@ -250,14 +270,14 @@ class ProjectPromptCatalogService {
     });
   }
 
-  getTabSources(tabId) {
+  getTabSources(tabId, readContext) {
     if (!this.rootRegistry) {
       throw Object.assign(new Error('root_registry_unavailable'), { code: 'root_registry_unavailable' });
     }
     if (typeof tabId !== 'string' || !tabId) {
       throw Object.assign(new Error('tab_id_required'), { code: 'tab_id_required' });
     }
-    return this.describeSources(this.rootRegistry.sourcesForTab(tabId));
+    return this.describeSources(this.rootRegistry.sourcesForTab(tabId), readContext);
   }
 
   setTabSources(request) {
@@ -282,8 +302,8 @@ class ProjectPromptCatalogService {
     return result;
   }
 
-  listTab(tabId, { force = false, refreshWatchers = true } = {}) {
-    const allSources = this.getTabSources(tabId);
+  listTab(tabId, { force = false, refreshWatchers = true, readContext } = {}) {
+    const allSources = this.getTabSources(tabId, readContext);
     const signature = JSON.stringify(allSources);
     const cached = this.tabCache.get(tabId);
     if (!force && cached?.signature === signature && Date.now() - cached.cachedAt < CACHE_TTL_MS) return cached.value;
@@ -291,14 +311,14 @@ class ProjectPromptCatalogService {
       .sort((a, b) => naturalCompare(a.sourceName, b.sourceName));
     const scannedSources = sources.map(source => ({
       ...source,
-      ...scanSource({
+      ...catalogSource({
         // The namespace of the ORIGINAL binding is part of the prompt id.
         projectId: source.projectId,
         rootPath: source.rootPath,
         sourceName: source.sourceName,
         layout: this.layoutStore?.get(source.rootPath)?.layout || null,
         fsImpl: this.fs,
-      }),
+      }, readContext),
     }));
     const value = {
       tabId,
@@ -320,7 +340,7 @@ class ProjectPromptCatalogService {
     return saved;
   }
 
-  listProject(projectId, { force = false } = {}) {
+  listProject(projectId, { force = false, readContext } = {}) {
     const cached = this.cache.get(projectId);
     if (!force && cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) return cached.value;
 
@@ -330,17 +350,17 @@ class ProjectPromptCatalogService {
       error.code = 'project_not_found';
       throw error;
     }
-    const sources = this.getSources(projectId)
+    const sources = this.getSources(projectId, readContext)
       .sort((a, b) => naturalCompare(a.sourceName, b.sourceName));
     const scannedSources = sources.map((source) => {
       const layout = this.layoutStore?.get(source.rootPath)?.layout || null;
-      return scanSource({
+      return catalogSource({
         projectId,
         rootPath: source.rootPath,
         sourceName: source.sourceName,
         layout,
         fsImpl: this.fs,
-      });
+      }, readContext);
     });
     const prompts = scannedSources.flatMap((source) => source.prompts);
     const value = {
@@ -362,16 +382,24 @@ class ProjectPromptCatalogService {
   }
 
   usageForRoot(rootPath) {
-    const canonicalRoot = canonicalPath(rootPath, this.fs);
+    // A usage request can include hundreds of open and archived tab bindings.
+    // Keep the exact per-tab checks/cache, but reuse identical synchronous reads
+    // inside this request. Nothing here survives into the next usage request.
+    const readContext = { directories: new Map(), scans: new Map(), canonicalPaths: new Map(), projects: new Map() };
+    const canonical = value => canonicalPath(value, this.fs, readContext.canonicalPaths);
+    const canonicalRoot = canonical(rootPath);
     const byPath = new Map();
     if (this.rootRegistry) {
       for (const scope of this.rootRegistry.listSourceScopes()) {
-        const catalog = this.listTab(scope.tabId, { refreshWatchers: false });
+        const catalog = this.listTab(scope.tabId, { refreshWatchers: false, readContext });
         for (const prompt of catalog.prompts) {
-          if (!isInside(canonicalRoot, canonicalPath(prompt.path, this.fs))) continue;
+          if (!isInside(canonicalRoot, canonical(prompt.path))) continue;
           const usage = byPath.get(prompt.path) || { projects: new Map(), tabs: new Map() };
           usage.tabs.set(scope.tabId, { id: scope.tabId, name: scope.name || scope.tabId });
-          const project = prompt.projectId && this.db.getProjectById(prompt.projectId);
+          if (prompt.projectId && !readContext.projects.has(prompt.projectId)) {
+            readContext.projects.set(prompt.projectId, this.db.getProjectById(prompt.projectId));
+          }
+          const project = readContext.projects.get(prompt.projectId);
           if (project) usage.projects.set(project.id, { id: project.id, name: project.name, icon: project.icon || null });
           byPath.set(prompt.path, usage);
         }
@@ -386,9 +414,9 @@ class ProjectPromptCatalogService {
     }
     for (const project of this.db.getProjectsWithPromptSources()) {
       let catalog;
-      try { catalog = this.listProject(project.id); } catch { continue; }
+      try { catalog = this.listProject(project.id, { readContext }); } catch { continue; }
       for (const prompt of catalog.prompts) {
-        if (!isInside(canonicalRoot, canonicalPath(prompt.path, this.fs))) continue;
+        if (!isInside(canonicalRoot, canonical(prompt.path))) continue;
         const existing = byPath.get(prompt.path) || [];
         existing.push({
           id: catalog.project.id,

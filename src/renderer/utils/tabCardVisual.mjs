@@ -116,7 +116,9 @@ export const SPLIT_ATTACH_ROW_MIN_H = 26;
 export const SPLIT_ATTACH_PATH_LINE_H = 13;
 
 /**
- * Rendered height of ONE tab card — the number the row height is predicted from.
+ * Baseline height of ONE tab card, before a measured attached-file minimum.
+ * The pane host publishes its actual header border box through ResizeObserver;
+ * a title + linked file can require more height than this baseline.
  *
  * Extracted from the row resolver below because a second surface now needs the
  * same answer: with the strip in WRAP mode the header's action buttons stand

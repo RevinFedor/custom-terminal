@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { HistoryPromptHandoffStore, hydrateHistoryPromptHandoffFromDurableReceipt,
   getHistoryPromptHandoffsSnapshot, consumeHistoryPromptHandoff, historyPromptHandoffStatusPresentation,
   runHistoryPromptHandoff } from './historyPromptHandoffs.ts';
+import { applyHistoryQueuedMessageMerge } from './historyPromptHandoffs.ts';
 
 function record(id: string): any {
   return { tabId: 'application-queue-test', handoffId: id, operationKey: 'history:application-queue-test:' + id,
@@ -115,4 +116,70 @@ test('a late no-input receipt cannot replace a newer physical attempt or confirm
   store.settle(r.tabId, r.handoffId, { queueStatus: 'application-queued', reason: 'automatic-readiness-wait',
     sendAttemptId: 'B', sendOperationKey: r.operationKey, noWriteAttemptId: 'B' });
   assert.equal(store.getSnapshot(r.tabId)[0].queueStatus, 'delivery-unknown');
+});
+
+test('merge consumes only exact unattempted originals and hydrates one replacement with previous display time', () => {
+  const a = record('merge-a'), b = record('merge-b');
+  const guard = { version: 1, tabId: a.tabId, operationKey: b.operationKey, queueId: 2, requestHash: 'B',
+    previousOperationKey: a.operationKey, previousQueueId: 1, previousRequestHash: 'A' };
+  b.applicationQueue = { ...b.applicationQueue, id: 2, position: 2, mergePrevious: guard };
+  hydrateHistoryPromptHandoffFromDurableReceipt(a); hydrateHistoryPromptHandoffFromDurableReceipt(b);
+  const source = getHistoryPromptHandoffsSnapshot(a.tabId);
+  assert.deepEqual(source.find(value => value.handoffId === b.handoffId)?.applicationQueueMerge, guard);
+  const merged = { ...record('merged'), createdAt: a.createdAt + 1000,
+    applicationQueue: { ...a.applicationQueue, id: 3, position: 1,
+      merge: { version: 1, sourceOperationKeys: [a.operationKey, b.operationKey], presentationHandoffId: a.handoffId } },
+    receipt: { promptText: 'first\n\nsecond', source: 'history-panel' } };
+  const packet = { success: true, version: 1, requestId: 'merge', tabId: a.tabId, operationKey: merged.operationKey,
+    sourceHandoffIds: [a.handoffId, b.handoffId], sourceOperationKeys: [a.operationKey, b.operationKey], record: merged };
+  assert.equal(applyHistoryQueuedMessageMerge(packet), true);
+  const rows = getHistoryPromptHandoffsSnapshot(a.tabId);
+  assert.equal(rows.length, 1); assert.equal(rows[0].text, 'first\n\nsecond');
+  assert.equal(rows[0].queueStatus, 'application-queued'); assert.equal(rows[0].sendAttemptId, null);
+  assert.equal(rows[0].submittedAt, a.createdAt); assert.equal(rows[0].applicationQueuePosition, 1);
+  assert.equal(rows[0].applicationQueuePresentationHandoffId, a.handoffId);
+  assert.equal(rows[0].applicationQueueReplacement, true);
+  assert.equal(applyHistoryQueuedMessageMerge(packet), true); assert.equal(getHistoryPromptHandoffsSnapshot(a.tabId).length, 1);
+  for (const old of [a, b]) hydrateHistoryPromptHandoffFromDurableReceipt({ ...old, state: 'not-submitted',
+    receipt: { ...old.receipt, mergedIntoOperationKey: merged.operationKey, presentationDismissedAt: Date.now(), presentationDismissedSurface: 'desktop-history' } });
+  assert.equal(getHistoryPromptHandoffsSnapshot(a.tabId).length, 1, 'late original receipts cannot resurrect merged cards');
+  consumeHistoryPromptHandoff(a.tabId, merged.handoffId);
+});
+
+test('a wrong merge packet cannot consume a physical or unrelated handoff', () => {
+  const a = record('physical-a'), b = record('waiting-b');
+  hydrateHistoryPromptHandoffFromDurableReceipt({ ...a, state: 'audit-pending', attemptId: 'A', applicationQueue: { ...a.applicationQueue, state: 'awaiting-receipt' } });
+  hydrateHistoryPromptHandoffFromDurableReceipt(b);
+  const merged = record('not-admitted');
+  assert.equal(applyHistoryQueuedMessageMerge({ success: true, version: 1, tabId: a.tabId, operationKey: merged.operationKey,
+    sourceHandoffIds: [a.handoffId, b.handoffId], sourceOperationKeys: [a.operationKey, b.operationKey], record: merged }), false);
+  assert.equal(getHistoryPromptHandoffsSnapshot(a.tabId).length, 2);
+  consumeHistoryPromptHandoff(a.tabId, a.handoffId); consumeHistoryPromptHandoff(a.tabId, b.handoffId);
+});
+
+test('a retired merge receipt removes its exact original cards without recreating a queued replacement', () => {
+  const a = record('retired-a'), b = record('retired-b');
+  hydrateHistoryPromptHandoffFromDurableReceipt(a); hydrateHistoryPromptHandoffFromDurableReceipt(b);
+  const packet = { success: true, version: 1, requestId: 'retired-merge', tabId: a.tabId,
+    operationKey: 'history:' + a.tabId + ':queued-merge:retired-merge',
+    sourceHandoffIds: [a.handoffId, b.handoffId], sourceOperationKeys: [a.operationKey, b.operationKey],
+    record: null, receiptRetired: true };
+  assert.equal(applyHistoryQueuedMessageMerge(packet), true);
+  assert.equal(getHistoryPromptHandoffsSnapshot(a.tabId).length, 0);
+  assert.equal(applyHistoryQueuedMessageMerge(packet), true);
+  assert.equal(getHistoryPromptHandoffsSnapshot(a.tabId).length, 0);
+});
+
+test('durable merge removal emits an explicit tombstone even when the bounded ledger lost the original', () => {
+  const store = new HistoryPromptHandoffStore({ maxTabs: 1, maxHandoffs: 1, maxBytes: 65536 });
+  const changes: any[] = [];
+  const unsubscribe = store.subscribe('T', (_rows, change) => changes.push(change));
+  store.begin({ tabId: 'T', handoffId: 'evicted-a', toolType: 'codex', text: 'first' });
+  store.begin({ tabId: 'T', handoffId: 'retained-b', toolType: 'codex', text: 'second' });
+  assert.deepEqual(store.getSnapshot('T').map(row => row.handoffId), ['retained-b']);
+  changes.length = 0;
+  store.consumeMergedSource('T', 'evicted-a');
+  assert.deepEqual(changes.map(change => [change.type, change.handoffId]), [['consume', 'evicted-a']]);
+  assert.deepEqual(store.getSnapshot('T').map(row => row.handoffId), ['retained-b']);
+  unsubscribe();
 });

@@ -69,6 +69,7 @@ function harness(t, provider) {
   vm.runInContext(['durableRecordHasProviderQueueAcceptance','durableAgentSendReplay','publicAgentSendReceipt',
     'durableAgentSendFailure','runPreparedAgentSendScenario','runAgentSendScenario','readScenarioDestination'].map(declaration).join('\n'), context);
   vm.runInContext('var enqueueDesktopAgentPrompt = ' + exported('enqueueDesktopAgentPrompt'), context);
+  vm.runInContext('var mergeQueuedAgentMessages = ' + exported('mergeQueuedAgentMessages'), context);
   const queue = new AgentSendQueue({ store, execute: request => context.runPreparedAgentSendScenario({
     ...request, applicationQueueExecution: true,
   }) });
@@ -79,7 +80,8 @@ function harness(t, provider) {
   const handlers = new Map();
   vm.runInNewContext(main.slice(start, end), {
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
-    require: () => ({ enqueueDesktopAgentPrompt: context.enqueueDesktopAgentPrompt }), path, srcMainDir: __dirname,
+    require: () => ({ enqueueDesktopAgentPrompt: context.enqueueDesktopAgentPrompt,
+      mergeQueuedAgentMessages: context.mergeQueuedAgentMessages }), path, srcMainDir: __dirname,
   });
   const send = (id, extra = {}) => handlers.get('agent:enqueue-prompt')(null, {
     tabId: 'T', toolType: provider, sessionId: 'S', prompt: 'test ' + id, handoffId: id,
@@ -93,6 +95,7 @@ function harness(t, provider) {
   };
   t.after(async () => { queue.dispose(); await tick(); db.close(); });
   return { context, queue, store, writes, contexts, send, confirm, physicalBridge: context.bridgeRequest,
+    merge: request => handlers.get('agent:merge-queued-send')(null, request),
     setTarget: value => { targetSession = value; } };
 }
 
@@ -188,6 +191,24 @@ test('RunAfter explicit send-now survives actual renderer admission, durable FIF
   assert.equal(frozen.promptQueueAction, 'send-now');
   assert.equal(frozen.source, 'prompt-queue');
   assert.equal(frozen.prompt, 'manual body');
+});
+
+test('actual Main merge IPC replaces two waiting History sends then dispatches one through the original web scenario', async t => {
+  const h = harness(t, 'codex'); h.queue.ready = () => false;
+  await h.send('a'); await h.send('b'); await h.send('c');
+  const original = ['a', 'b'].map(id => h.queue.item('history:T:' + id).request_json);
+  const request = { ...h.queue.mergeGuard('history:T:b'), requestId: 'actual-ipc-merge' };
+  const result = await h.merge(request); assert.equal(result.success, true);
+  assert.equal(result.record.receipt.promptText, 'test a\n\ntest b'); assert.equal(h.writes.length, 0);
+  assert.deepEqual(['a', 'b'].map(id => h.queue.item('history:T:' + id).request_json), original);
+  h.queue.execute = (request, scope) => h.context.runPreparedAgentSendScenario({ ...request,
+    applicationQueueExecution: true, sendRequestFingerprint: scope.requestFingerprint });
+  h.queue.ready = () => true; h.queue.resume(); await tick(); await tick();
+  assert.equal(h.writes.length, 1); assert.equal(h.writes[0].prompt, 'test a\n\ntest b');
+  assert.equal(h.writes[0].sendOperationKey, result.operationKey);
+  assert.ok(h.writes[0].sendAttemptId); assert.equal(h.writes[0].source, 'history-panel');
+  assert.equal((await h.merge(request)).operationKey, result.operationKey);
+  assert.equal(h.writes.length, 1, 'same merge request never creates a second physical input');
 });
 
 test('RunAfter automatic admission keeps the old absent-marker fingerprint and does not acquire manual privileges', async t => {

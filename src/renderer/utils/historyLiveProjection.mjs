@@ -11,6 +11,7 @@ import {
 } from '../../shared/history-action-grammar.mjs';
 import { claudeSettingsServiceDisplayFromRecord } from '../../shared/claude-slash-display.mjs';
 import claudeProviderFailure from '../../shared/claude-provider-failure.cjs';
+import recordTimes from '../../shared/history-record-time.cjs';
 
 const FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 
@@ -207,6 +208,7 @@ const mergeActions = (existing = [], incoming = []) => {
 };
 
 const projectAssistantEntry = (canonical, envelope, blocks) => {
+  const recordTime = recordTimes.normalizeHistoryRecordTime(canonical.recordTime || envelope.recordTime);
   const failure = claudeProviderFailure.claudeProviderFailureFromRecord(canonical);
   if (failure) return {
     uuid: canonical.uuid, role: failure.kind, content: failure.message, providerFailure: failure,
@@ -235,7 +237,8 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
       // row instead of a generic tool row, otherwise the background-chip strip
       // (which matches on `tool: 'Task'`) never sees the running agent.
       if (isObject(block.subagentCard) && block.subagentCard.tool === 'Task') {
-        return { ...block.subagentCard, toolUseId };
+        return { ...block.subagentCard, toolUseId,
+          ...recordTimes.historyRecordTimeFields(block.recordTime || (recordTime ? { ...recordTime, kind: 'tool-call' } : undefined)) };
       }
       // Claude has no such prepared card: its live record is the raw tool_use,
       // so the card must be rebuilt here from the spawn itself. Without this,
@@ -245,16 +248,20 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
       // Scar 2026-07-29: a 42-second synchronous agent produced zero chips
       // because every durable re-read was deferred with reason=turn-busy.
       const claudeSpawn = claudeSubagentSpawnCard(block, toolUseId);
-      if (claudeSpawn) return claudeSpawn;
+      if (claudeSpawn) return { ...claudeSpawn,
+        ...recordTimes.historyRecordTimeFields(block.recordTime || (recordTime ? { ...recordTime, kind: 'tool-call' } : undefined)) };
       const toolName = String(block.name || block.tool_name || 'Tool');
       const args = normalizeArgs(block.input ?? block.arguments);
       // Same grouping identity the durable parser stamps: a live row must
       // group exactly like its durable twin, or the series count would change
       // at the live→durable handoff.
       const classified = classifyHistoryAction({ toolName, args });
+      const toolTime = recordTimes.normalizeHistoryRecordTime(block.recordTime)
+        || (recordTime ? { ...recordTime, kind: 'tool-call' } : undefined);
       return {
         tool: '__raw__',
         rawTool: {
+          ...(toolTime ? { recordTime: toolTime } : {}),
           toolUseId,
           toolName,
           args,
@@ -279,6 +286,7 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
       ? { recordByteOffset: recordByteOffsetFrom(envelope) }
       : {}),
     role: 'assistant',
+    ...(recordTime ? { recordTime } : {}),
     timestamp: String(
       canonical.timestamp
       || canonical.message?.timestamp
@@ -293,6 +301,7 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
 };
 
 const projectUserEntry = (canonical, envelope, blocks) => {
+  const recordTime = recordTimes.normalizeHistoryRecordTime(canonical.recordTime || envelope.recordTime);
   const text = blocks
     .filter((block) => isObject(block) && block.type === 'text')
     .map((block) => extractText(block.text))
@@ -318,6 +327,7 @@ const projectUserEntry = (canonical, envelope, blocks) => {
       ? { recordByteOffset: recordByteOffsetFrom(envelope) }
       : {}),
     role: 'user',
+    ...(recordTime ? { recordTime } : {}),
     ...(canonical.serviceCarrier === 'project-instructions'
       ? { serviceCarrier: 'project-instructions' }
       : {}),

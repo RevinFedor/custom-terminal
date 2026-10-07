@@ -787,6 +787,8 @@ function publicRun(run) {
     targetPromptAuditHash: _targetPromptAuditHash,
     targetBusySeen: _targetBusySeen,
     waitingForPriorTurn: _waitingForPriorTurn,
+    targetRestoration: _targetRestoration,
+    targetRestoreAddress: _targetRestoreAddress,
     ...safe
   } = run;
   return { ...safe };
@@ -1014,6 +1016,31 @@ class OrchestrationRunStore {
     }
     this._syncSourceFollowupState(run);
     this._schedulePersist();
+    return publicRun(run);
+  }
+
+  async adoptRestoredTarget(runId, {descriptor,restoration}, {prepareContext} = {}) {
+    await this.initialize();
+    const run=this.runs.get(runId);
+    const refuse=()=>{throw Object.assign(new Error('orchestration_restore_target_changed'),{code:'orchestration_restore_target_changed'});};
+    if(!run || isTerminalStatus(run.status) || !run.deliveryIntent || run.deliveryDispatchStartedAt
+      || run.deliveryAcceptedAt || run.deliveryTransportUnknownAt || run.targetPromptProofAt || run.targetExecutionContext
+      || restoration?.version!==1 || restoration.sourceTabId!==run.targetTabId
+      || restoration.namespace!==run.targetProjectId || descriptor?.projectId!==run.targetProjectId
+      || descriptor.tabId!==restoration.targetTabId || descriptor.tabId===run.sourceTabId
+      || descriptor.toolType!==run.targetToolType || descriptor.cwd!==run.targetCwd)refuse();
+    if(run.targetRestoreSessionId!==undefined && (descriptor.sessionId || null)!==run.targetRestoreSessionId)refuse();
+    if(run.targetRestoreAddress && (restoration.historyId!==run.targetRestoreAddress.historyId
+      || restoration.archiveIdentity!==run.targetRestoreAddress.archiveIdentity))refuse();
+    prepareContext?.(run.deliveryIntent.prompt);
+    const earlier=new Set([...this.runs.keys()].slice(0,[...this.runs.keys()].indexOf(runId)));
+    const predecessor=this._deliveryPredecessorsForTarget(descriptor.tabId).filter(candidate=>earlier.has(candidate.runId)).at(-1);
+    Object.assign(run,{requestedTargetTabId:run.requestedTargetTabId || run.targetTabId,targetTabId:descriptor.tabId,
+      status:'queued',outcome:null,error:null,recoveryDeadlineAt:null,
+      targetMaterializedAt:Date.now(),sessionId:descriptor.sessionId || null,
+      predecessorRunId:run.predecessorRunId || predecessor?.runId || null,
+      targetTabName:descriptor.tabName || run.targetTabName,targetRestoration:restoration,updatedAt:Date.now()});
+    await this.persistStrict();
     return publicRun(run);
   }
 

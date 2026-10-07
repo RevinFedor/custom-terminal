@@ -157,6 +157,24 @@ class ScExternalResearchClient {
     }, this.stopTimeoutMs);
     return responseJson(response);
   }
+
+  async openJob(jobId, { requestId, signal } = {}) {
+    const capabilities = await this.capabilities({ signal });
+    if (capabilities?.navigation?.version !== 1 || capabilities.navigation.renderedAck !== true) {
+      throw new ScExternalResearchHttpError('Обновите SC Desktop: переход к research-задаче недоступен', {
+        code: 'sc_research_navigation_unavailable',
+      });
+    }
+    const response = await this._request(`${this.baseUrl}/research-open`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
+      body: JSON.stringify({ jobId, requestId }),
+    }, 20_000);
+    const result = await responseJson(response);
+    if (result?.ok !== true || result.opened !== true || result.jobId !== jobId || result.requestId !== requestId) {
+      throw new ScExternalResearchHttpError('SC Desktop не подтвердил открытие этой задачи', { code: 'sc_research_navigation_not_confirmed' });
+    }
+    return result;
+  }
 }
 
 function isScResearchNotFound(error) {

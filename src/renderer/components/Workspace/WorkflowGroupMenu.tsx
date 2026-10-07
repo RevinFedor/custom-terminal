@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState, type CSSProperties
 import { createPortal } from 'react-dom';
 import { Check, Folder, FolderInput, Pencil, Trash2, X } from 'lucide-react';
 import { TAB_COLORS } from './tabChrome';
+import {useWorkspaceOverlayTarget} from '../../hooks/useWorkspaceOverlayTarget';
 import { CONTEXT_MENU_METRICS, CONTEXT_MENU_METRICS_HOOK, CONTEXT_MENU_PANEL_STYLE,
   CONTEXT_MENU_ROW_STYLE, CONTEXT_MENU_ICON_SLOT_STYLE, CONTEXT_MENU_BOTTOM_DIVIDER_STYLE } from '../UI/contextMenuMetrics.mjs';
 
@@ -17,7 +18,7 @@ export type WorkflowGroupMenuProps = {
   revision: number;
   members: WorkflowGroupMember[];
   workflows: { id: string; name: string }[];
-  statuses?: { id: string; name: string; color?: string }[];
+  statuses?: { id: string; label?: string; name?: string; color?: string }[];
   position: { x: number; y: number };
   onMutate: (kind: 'rename' | 'color' | 'status' | 'collapse' | 'delete', request: WorkflowGroupMutation) => Promise<Outcome> | Outcome;
   // These are explicit organization/close callbacks owned by Parent. No
@@ -25,6 +26,7 @@ export type WorkflowGroupMenuProps = {
   onMoveMembers: (workflowId: string, members: WorkflowGroupMember[], group: WorkflowGlobalGroup, intent: WorkflowGroupMemberIntent) => Promise<Outcome> | Outcome;
   onCloseMembers: (members: WorkflowGroupMember[], group: WorkflowGlobalGroup, intent: WorkflowGroupMemberIntent) => Promise<Outcome> | Outcome;
   onDismiss: () => void;
+  onRenameInline?: () => void;
 };
 const ok = (result: Outcome) => result === true || (typeof result === 'object' && result?.success === true);
 const rowStyle = CONTEXT_MENU_ROW_STYLE as CSSProperties;
@@ -32,6 +34,7 @@ const iconStyle = CONTEXT_MENU_ICON_SLOT_STYLE as CSSProperties;
 
 export default function WorkflowGroupMenu(props: WorkflowGroupMenuProps) {
   const { group, revision, members, workflows, statuses = [], onDismiss } = props;
+  const overlayTarget = useWorkspaceOverlayTarget();
   const root = useRef<HTMLDivElement>(null), lock = useRef(false);
   const [screen, setScreen] = useState<'main' | 'rename' | 'color' | 'status' | 'move' | 'close'>('main');
   const [name, setName] = useState(group.name), [busy, setBusy] = useState(false), [error, setError] = useState('');
@@ -109,7 +112,10 @@ export default function WorkflowGroupMenu(props: WorkflowGroupMenuProps) {
       <span style={{ marginLeft: 'auto' }}>{activeMembers.length}</span>
     </div>
     {screen === 'main' && <>
-      {row('Переименовать', () => { setName(group.name); setScreen('rename'); }, <Pencil size={12} />)}
+      {row('Переименовать', () => {
+        if(props.onRenameInline) {props.onRenameInline();onDismiss();}
+        else {setName(group.name);setScreen('rename');}
+      }, <Pencil size={12} />)}
       {row('Цвет', () => setScreen('color'), <span style={{ width: 11, height: 11, borderRadius: 3, background: TAB_COLORS.find(c => c.color === group.color)?.borderColor || '#666' }} />)}
       {row('Статус', () => setScreen('status'), <span style={{ width: 8, height: 8, borderRadius: '50%', background: statuses.find(s => s.id === group.sessionStatus)?.color || '#888' }} />)}
       {row(group.collapsed ? 'Развернуть' : 'Свернуть', () => mutate('collapse', { collapsed: !group.collapsed }), <Folder size={12} />)}
@@ -129,7 +135,7 @@ export default function WorkflowGroupMenu(props: WorkflowGroupMenuProps) {
     {screen === 'color' && TAB_COLORS.map(color => row(color.label.replace(/^[^\wА-Яа-я]+\s*/, ''), () => mutate('color', { color: color.color }),
       <span style={{ width: 11, height: 11, borderRadius: 3, border: '1px solid ' + color.borderColor, background: color.bgColor }} />, (false), (group.color || 'default') === color.color))}
     {screen === 'status' && <>{row('Без статуса', () => mutate('status', { status: null }), null, false, !group.sessionStatus)}
-      {statuses.map(status => row(status.name, () => mutate('status', { status: status.id }), <span style={{ width: 8, height: 8, borderRadius: '50%', background: status.color || '#888' }} />, false, status.id === group.sessionStatus, 'status:' + status.id))}</>}
+      {statuses.map(status => row(status.label || status.name || '', () => mutate('status', { status: status.id }), <span style={{ width: 8, height: 8, borderRadius: '50%', background: status.color || '#888' }} />, false, status.id === group.sessionStatus, 'status:' + status.id))}</>}
     {screen === 'move' && <>{workflows.map(workflow => row(workflow.name, () => {
       const exact = structuredClone(activeMembers), current = structuredClone(group), callback = props.onMoveMembers;
       const intent: WorkflowGroupMemberIntent = { version: 1, mutationId: crypto.randomUUID(), expectedRevision: revision, expectedGroupRevision: group.revision };
@@ -147,5 +153,5 @@ export default function WorkflowGroupMenu(props: WorkflowGroupMenuProps) {
     {screen !== 'main' && row('Назад', back, null)}
     {error && <div role="alert" style={{ padding: 8, maxWidth: 250, overflowWrap: 'anywhere', fontSize: 12, color: '#fca5a5' }}>{error}</div>}
     {retry && <button className="workflow-group-action" style={{ ...rowStyle, width: '100%', border: 0, color: '#ccc', background: 'transparent' }} disabled={busy} onClick={() => void retry()}>Повторить запрос</button>}
-  </div>, document.body);
+  </div>, overlayTarget);
 }

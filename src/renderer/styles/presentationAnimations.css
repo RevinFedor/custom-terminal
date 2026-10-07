@@ -1,5 +1,7 @@
 /* Retained panes keep their DOM, data subscriptions and process state while
    opacity hides their pixels. Only recurring visual feedback pauses here.
+   The sidebar stack and whole-workspace Home boundary are owners too: their
+   children can remain locally presented while the outer surface is hidden.
    These attributes belong to the existing presentation owners, not focus:
    a visible unfocused split pane must continue animating. An outer hidden
    owner also wins over a nested surface whose local presented flag is true.
@@ -15,7 +17,9 @@
   [data-terminal-pane-wrapper][data-terminal-surface-presented="0"],
   [data-terminal-pane-chrome-host][aria-hidden="true"],
   [data-single-center-focus-boundary][aria-hidden="true"],
-  [data-history-owner][data-history-presented="0"]
+  [data-history-owner][data-history-presented="0"],
+  [data-tab-sidebar-layer][data-sidebar-presented="0"],
+  [data-workspace-presentation][aria-hidden="true"]
 ) :is(
   .noted-infinite-animation,
   .animate-spin,
@@ -47,7 +51,9 @@
   [data-terminal-pane-wrapper][data-terminal-surface-presented="0"],
   [data-terminal-pane-chrome-host][aria-hidden="true"],
   [data-single-center-focus-boundary][aria-hidden="true"],
-  [data-history-owner][data-history-presented="0"]
+  [data-history-owner][data-history-presented="0"],
+  [data-tab-sidebar-layer][data-sidebar-presented="0"],
+  [data-workspace-presentation][aria-hidden="true"]
 ) .cm-composer-token[data-composer-token-id^="dictation:"]::before {
   animation-play-state: paused !important;
 }
@@ -58,7 +64,9 @@
   [data-terminal-pane-wrapper][data-terminal-surface-presented="0"],
   [data-terminal-pane-chrome-host][aria-hidden="true"],
   [data-single-center-focus-boundary][aria-hidden="true"],
-  [data-history-owner][data-history-presented="0"]
+  [data-history-owner][data-history-presented="0"],
+  [data-tab-sidebar-layer][data-sidebar-presented="0"],
+  [data-workspace-presentation][aria-hidden="true"]
 ) .tab-completion-notification-alert.tab-completion-notification-alert--dismiss {
   animation-play-state: paused, running !important;
 }

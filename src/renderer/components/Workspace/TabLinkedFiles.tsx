@@ -4,6 +4,8 @@ import { FileText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { tabLinkedFilesSnapshot, isLinkedFilePreview, placeLinkedFilePopup } from '../../utils/tabLinkedFiles.mjs';
+import { TAB_CARD_LINE_HEIGHT } from '../../utils/tabCardVisual.mjs';
+import { useWorkspaceOverlayTarget } from '../../hooks/useWorkspaceOverlayTarget';
 import './TabLinkedFiles.css';
 
 export type LinkedFile = { projectId: string; id: string; ownerTabId: string; path: string; name: string };
@@ -14,20 +16,26 @@ export function useTabLinkedFiles(tabId: string, enabled = true): LinkedFile[] {
   return useMemo(() => JSON.parse(snapshot), [snapshot]);
 }
 
-export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 6 }: {
+export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 6, fontSize, geometry, onHoverChange }: {
   ownerTabId: string; files: LinkedFile[]; onOpen: (file: LinkedFile) => void; insetLeft?: number;
+  fontSize: number; geometry: { paddingX: number; paddingY: number; borderRadius: number };
+  onHoverChange?: (hovered: boolean) => void;
 }) {
   const trigger = useRef<HTMLButtonElement>(null), popup = useRef<HTMLDivElement>(null);
+  const overlayTarget = useWorkspaceOverlayTarget();
   const bridge = useRef<HTMLDivElement>(null);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const contextMenuActive = useRef(false);
   const [open, setOpen] = useState(false), [pinned, setPinned] = useState(false);
   const preview = useUIStore(s => s.filePreview);
-  const fontSize = useUIStore(s => s.tabsFontSize);
-  const clearTimer = () => { if (timer.current) clearTimeout(timer.current); timer.current = null; };
-  const close = () => { clearTimer(); setOpen(false); setPinned(false); };
-  const enter = () => { clearTimer(); setOpen(true); };
-  const leave = () => { clearTimer(); if (!pinned && !contextMenuActive.current) timer.current = setTimeout(() => setOpen(false), 180); };
+  const close = () => { setOpen(false); setPinned(false); onHoverChange?.(false); };
+  const contains = (target: EventTarget | null) => target instanceof Node &&
+    [trigger.current, popup.current, bridge.current].some(element => element?.contains(target));
+  const enter = () => { onHoverChange?.(true); if (files.length > 1) setOpen(true); };
+  const leave = (event: React.MouseEvent) => {
+    if (contains(event.relatedTarget)) return;
+    onHoverChange?.(false);
+    if (!pinned && !contextMenuActive.current) setOpen(false);
+  };
   useLayoutEffect(() => {
     const button = trigger.current, card = button?.parentElement;
     if (!button || !card) return;
@@ -39,8 +47,8 @@ export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 
     const observer = new ResizeObserver(fit); observer.observe(card);
     return () => observer.disconnect();
   }, [files, fontSize, insetLeft]);
-  useEffect(() => () => clearTimer(), []);
-  useEffect(() => { if (!files.length) close(); }, [files.length]);
+  useEffect(() => () => onHoverChange?.(false), [onHoverChange]);
+  useEffect(() => { if (files.length < 2) close(); }, [files.length]);
 
   useLayoutEffect(() => {
     if (!open || !trigger.current || !popup.current) return;
@@ -82,43 +90,46 @@ export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 
   }, [open]);
   if (!files.length) return null;
   const selected = isLinkedFilePreview(preview, ownerTabId);
-  const shortName = files.length === 1 && files[0].name.length <= 22;
+  const name = files[0].name + (files.length > 1 ? ` +${files.length - 1}` : '');
   const stop = (event: React.SyntheticEvent) => event.stopPropagation();
+  const openContextMenu = (event: React.MouseEvent, file: LinkedFile) => {
+    event.preventDefault(); stop(event);
+    contextMenuActive.current = true;
+    window.dispatchEvent(new CustomEvent('tab-context-menu:open', { detail: {
+      projectId: file.projectId, tabId: file.id, x: event.clientX, y: event.clientY,
+      singleTarget: true, isCurrent: () => !!trigger.current,
+      onClose: () => { contextMenuActive.current = false; if (!pinned) close(); },
+    } }));
+  };
   return <>
     <button ref={trigger} type="button" className="tab-linked-files-chip" data-tab-linked-files={ownerTabId}
       style={{ left: insetLeft, maxWidth: `calc(100% - ${insetLeft + 6}px)` }}
       data-file-selected={selected ? '1' : undefined} aria-label={`Linked files (${files.length})`}
-      aria-expanded={open} aria-haspopup="menu" onMouseEnter={enter} onMouseLeave={leave}
-      onPointerDown={stop} onMouseDown={stop} onDoubleClick={stop} onAuxClick={stop} onContextMenu={stop}
-      onClick={event => { stop(event); clearTimer(); if (pinned) close(); else { setOpen(true); setPinned(true); } }}>
-      <FileText size={10} aria-hidden="true" />{shortName ? <>
-        <span data-linked-file-short-name>{files[0].name}</span><span data-linked-file-compact-count>1</span>
-        <span data-linked-file-measure aria-hidden="true">{files[0].name}</span>
-      </> : <span>{files.length}</span>}
+      title={files.length === 1 ? files[0].name : undefined}
+      aria-expanded={files.length > 1 ? open : undefined} aria-haspopup={files.length > 1 ? 'menu' : undefined}
+      onMouseEnter={enter} onMouseLeave={leave}
+      onPointerDown={stop} onMouseDown={stop} onDoubleClick={stop} onAuxClick={stop}
+      onContextMenu={event => files.length === 1 ? openContextMenu(event, files[0]) : stop(event)}
+      onClick={event => { stop(event); if (files.length === 1) { onOpen(files[0]); return; }
+        if (pinned) close(); else { setOpen(true); setPinned(true); } }}>
+      <FileText size={10} aria-hidden="true" />
+      <span data-linked-file-short-name>{name}</span><span data-linked-file-compact-count>{files.length}</span>
+      <span data-linked-file-measure aria-hidden="true">{name}</span>
     </button>
     {open && createPortal(<><div ref={bridge} data-linked-files-hover-bridge aria-hidden="true"
       style={{ position: 'fixed', zIndex: 100009 }} onMouseEnter={enter} onMouseLeave={leave}
       onPointerDown={stop} onMouseDown={stop} onClick={stop} onDoubleClick={stop} onAuxClick={stop} />
-      <div ref={popup} className="tab-linked-files-popup" style={{ fontSize }} data-tab-linked-files-popup={ownerTabId}
+      <div ref={popup} className="tab-linked-files-popup" style={{ fontSize, lineHeight: TAB_CARD_LINE_HEIGHT,
+        '--linked-file-row-padding': `${geometry.paddingY}px ${geometry.paddingX}px`,
+        '--linked-file-row-radius': `${geometry.borderRadius}px`,
+      } as React.CSSProperties} data-tab-linked-files-popup={ownerTabId}
       data-pinned={pinned ? '1' : '0'} role="menu" aria-label="Linked files" onMouseEnter={enter} onMouseLeave={leave}
       onPointerDown={stop} onMouseDown={stop} onClick={stop} onDoubleClick={stop} onAuxClick={stop}>
       {files.map(file => <button type="button" role="menuitem" key={`${file.projectId}:${file.id}`}
         className="tab-linked-files-row" data-linked-file-id={file.id} title={file.path}
         data-file-selected={isLinkedFilePreview(preview, ownerTabId, file.id, file.projectId) ? '1' : undefined}
         onClick={event => { stop(event); onOpen(file); }}
-        onContextMenu={event => {
-          event.preventDefault(); stop(event); clearTimer();
-          // Keep the hover bridge alive while the existing context actions are
-          // used; internal interaction never pins the attachment popup.
-          contextMenuActive.current = true;
-          // Same public event as openTabContextMenuAt; avoid importing the
-          // entire TabBar into every TabCard consumer just for its opener.
-          window.dispatchEvent(new CustomEvent('tab-context-menu:open', { detail: {
-            projectId: file.projectId, tabId: file.id, x: event.clientX, y: event.clientY,
-            singleTarget: true, isCurrent: () => !!popup.current,
-            onClose: () => { contextMenuActive.current = false; if (!pinned) close(); },
-          } }));
-        }}>{file.name}</button>)}
-    </div></>, document.body)}
+        onContextMenu={event => openContextMenu(event, file)}><FileText size={14} aria-hidden="true" /><span>{file.name}</span></button>)}
+    </div></>, overlayTarget)}
   </>;
 }

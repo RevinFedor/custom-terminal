@@ -3,8 +3,16 @@
 ## Общий вход после workflow cutover
 
 Home теперь отвечает за Storage и создание workflow. Закрытые вкладки и favorites
-доступны в общем архиве с фильтрами workflow/cwd/провайдера, read-only History/Timeline
-и явным Restore. Прежний ProjectHome UI ниже — историческая поверхность; его
+доступны через прежнюю History-кнопку в центральной рабочей области: архив не
+перекрывает shell, Home или sidebar, отдельной кнопки Archive в titlebar нет.
+Список компактный и виртуализированный, с цветом/status, числом итераций и датой;
+wide preview отделён сохраняемым divider, narrow layout переходит в один поток.
+Фильтры workflow/cwd/провайдера, read-only History/Timeline и явный Restore
+сохранены. Query/выбор/ширина переживают закрытие страницы; кэш результатов
+повторно связывается со свежими exact archive records до любого действия.
+Iteration-hit выделяется по namespace/historyId/entryUuid, тогда как mutation
+адресуется записью. Смена provider отменяет результаты прежнего поиска.
+Прежний ProjectHome UI ниже — историческая поверхность; его
 индексы и адресные archive records сохраняются в новом входе. Preview/search сами
 не запускают provider; favorite и history не дедуплицируются по имени.
 

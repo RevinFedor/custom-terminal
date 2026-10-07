@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import { createExecutionRevisionAcks } from '../utils/executionRevisionAcks.mjs';
+import { createWorkflowRelationReceipts } from '../utils/workflowRelationReceipts.mjs';
+import { applyWorkflowDragLayout } from '../utils/workflowDragNavigation.mjs';
 import { organizationProjection, organizationSnapshot, createOrganizationCommitter, archiveRestoreLeaseAddress, isExactGroupCloseGuard } from '../utils/workflowOrganizationClient.mjs';
 import { INBOX_WORKFLOW_ID, GLOBAL_EXECUTION_NAMESPACE } from '../utils/workflowMembership.mjs';
 import { organizationPlacementIntent } from '../utils/workflowPlacementMembership.mjs';
@@ -141,6 +143,7 @@ import {
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { reconcileWorkspaceDisplayPatch, revealHiddenWindow, splitWindowPane } from '../utils/windowDisplayLayouts.mjs';
+import {moveWorkflowWindow} from '../utils/workflowWindowMove.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
 import { collectTabLinkedFiles } from '../utils/tabLinkedFiles.mjs';
@@ -805,6 +808,7 @@ export interface TabHistoryRestoreEntry {
 
 export interface TabHistoryRestoreResult {
   tabId: string | null;
+  restoration?: {version:1;namespace:string;historyId:number;leaseToken:string;sourceTabId:string|null;targetTabId:string;archiveIdentity:string;ownerIdentity:string};
   historyId?: number;
   reason?: 'empty' | 'busy' | 'cancelled' | 'error';
   message?: string;
@@ -1682,6 +1686,8 @@ interface WorkspaceStore {
   showHiddenWindow: (targetPaneIndex: number, windowId: string, selection?:
     | { projectId: string; tabId: string; slotId?: never }
     | { slotId: string; projectId?: never; tabId?: never }) => boolean;
+  showHiddenWindowAlongside: (sourceSpaceId:string,anchorWindowId:string,windowId:string,side?:'left'|'right'|'above'|'below') => boolean;
+  moveWorkspaceWindowToWorkflow: (sourceSpaceId:string,windowId:string|null,targetSpaceId:string) => Promise<boolean>;
   view: 'dashboard' | 'workspace';
   // Project of the CENTER tab. Follows every tab activation (sidebar click,
   // Ctrl+Tab, pane focus) so all tab-owned surfaces (control bar, History,
@@ -1870,7 +1876,7 @@ interface WorkspaceStore {
   tabCatalog: Record<string, any>;
   organizationMigrationScopes: Record<string, any>;
   globalGroups: any;
-  workflowSidebarState: Record<string,{selectedTabIds?:string[];scrollTop?:number}>;
+  workflowSidebarState: Record<string,{selectedTabIds?:string[];scrollTop?:number;activeGroupId?:string|null}>;
   refreshOrganizationCatalog: () => Promise<void>;
   activeTabNavigationIntent: {id:string;tabId:string} | null;
   navigationKey: string | null;
@@ -1880,6 +1886,7 @@ interface WorkspaceStore {
   runAfterWorkflowScopeVersions: Record<string, number>;
   bootstrapOrganization: (options?: {fresh?: boolean}) => Promise<void>;
   commitOrganization: () => Promise<any>;
+  commitWorkflowDrag: (request:any, options?:{isCurrent?:()=>boolean}) => Promise<boolean>;
   ensureTabRuntime: (tabId: string) => Promise<boolean>;
   createWorkflowTab: (options?: {workflowId?: string; cwd?: string; sourceTabId?: string; name?: string; tabOptions?: any}) => Promise<string>;
   moveTabsToWorkflow: (tabIds:string[], workflowId:string) => Promise<boolean>;
@@ -2231,6 +2238,7 @@ const normalizeGeneratedTabName = (name: string): string => {
 let saveSessionTimer: NodeJS.Timeout | null = null;
 const projectTabSaveQueue = createProjectTabSaveQueue();
 const executionRevisionAcks = createExecutionRevisionAcks();
+const workflowRelationReceipts = createWorkflowRelationReceipts();
 export const isProjectTabSavePending = (projectId: string) => projectTabSaveQueue.pending(projectId);
 const projectTabCreationQueue = createProjectTabSaveQueue();
 const projectTabSaveRevisions = new Map<string, number>();
@@ -2307,11 +2315,13 @@ const saveTabs = (
   const persistenceRevision = (projectTabSaveRevisions.get(projectId) || 0) + 1;
   projectTabSaveRevisions.set(projectId, persistenceRevision);
   const tabsArray = serializeTabs(tabs);
+  workflowRelationReceipts.capture(projectId,tabsArray);
   const capturedTabs = new Map(tabs);
   return projectTabSaveQueue.enqueue(projectId, () => {
     // Preserve the queued metadata snapshot, but advance its CAS proof after
     // an earlier save in this namespace has acknowledged the same subject.
     executionRevisionAcks.prepare(projectId,tabsArray);
+    workflowRelationReceipts.prepare(projectId,tabsArray,executionRevisionAcks);
     return (
     ipcRenderer.invoke('project:save-tabs', {
       projectId,
@@ -2378,11 +2388,15 @@ const saveTabsBatchThenNotifyProjectLayoutChanged = (
   groupFileCloseGuard?:{mutationId:string;tabId:string;guardToken:string},
 ) => {
   const tabSnapshots = snapshots.map(row => ({ ...row, tabs: serializeTabs(row.tabs) }));
+  for(const row of tabSnapshots)workflowRelationReceipts.capture(row.projectId,row.tabs);
   for (const row of snapshots) {
     projectTabSaveRevisions.set(row.projectId, (projectTabSaveRevisions.get(row.projectId) || 0) + 1);
   }
   return projectTabSaveQueue.enqueueMany(snapshots.map(row => row.projectId), () => {
-    for(const row of tabSnapshots)executionRevisionAcks.prepare(row.projectId,row.tabs);
+    for(const row of tabSnapshots) {
+      executionRevisionAcks.prepare(row.projectId,row.tabs);
+      workflowRelationReceipts.prepare(row.projectId,row.tabs,executionRevisionAcks);
+    }
     return (
     ipcRenderer.invoke('project:save-tabs', { tabSnapshots,...(groupFileCloseGuard?{groupFileCloseGuard}:{}) })
       .then((result:any)=>{
@@ -2560,6 +2574,48 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     if (pane?.tabId) get().activateCenterTab(pane.projectId, pane.tabId);
     get().saveSession();
     return true;
+  },
+  showHiddenWindowAlongside: (sourceSpaceId,anchorWindowId,windowId,side='right') => {
+    const state=get();
+    if(state.activeSpaceId!==sourceSpaceId)return false;
+    const anchor=state.splitPanes.findIndex(pane=>pane.windowId===anchorWindowId && !pane.displayHidden);
+    if(anchor<0)return false;
+    const result=splitWindowPane(state.splitPanes,state.splitFocusedIndex,null,anchor,side,windowId);
+    if(!result)return false;
+    const shown=result.panes[result.focusedIndex];
+    if(shown?.tabId && !state.openProjects.get(shown.projectId)?.tabs.has(shown.tabId))return false;
+    set({splitPanes:result.panes,splitFocusedIndex:result.focusedIndex,splitSizes:null});
+    useUIStore.getState().setActiveArea('workspace');
+    if(shown?.tabId)get().activateCenterTab(shown.projectId,shown.tabId);
+    console.info('[WorkspaceDisplay] show-alongside window='+windowId+' anchor='+anchorWindowId+' side='+side);
+    get().saveSession();return true;
+  },
+  moveWorkspaceWindowToWorkflow: async (sourceSpaceId,windowId,targetSpaceId) => {
+    const state=get();
+    if(!state.organizationReady || state.activeSpaceId!==sourceSpaceId || sourceSpaceId===targetSpaceId)return false;
+    const target=state.spaces.find(space=>space.id===targetSpaceId);
+    if(!target)return false;
+    const moved=moveWorkflowWindow({sourceLayout:captureSpaceLayout(state),targetLayout:{...emptySpaceLayout(),...(target.layout || {})},windowId,display:state.workspaceDisplay});
+    if(!moved || moved.entries.some(entry=>!state.openProjects.get(entry.projectId)?.tabs.has(entry.tabId)))return false;
+    const family=new Set<string>(moved.tabIds);
+    let added=true;
+    while(added){added=false;for(const workspace of state.openProjects.values())for(const tab of workspace.tabs.values()){
+      if(!family.has(tab.id) && (family.has((tab as any).parentTabId || '') || tab.tabType==='file' && family.has(tab.visualParentTabId || ''))){family.add(tab.id);added=true;}
+    }}
+    const pending={...state.pendingTabWorkflowMembership};
+    for(const id of family){const membership=state.tabWorkflowMembership[id];if(!membership)return false;pending[id]={...membership,workflowId:targetSpaceId};}
+    const spaces=state.spaces.map(space=>{
+      if(space.id===targetSpaceId)return{...space,layout:moved.targetLayout};
+      return{...space,layout:removeLayoutTabs(space.id===sourceSpaceId?moved.sourceLayout:space.layout,[...family])};
+    });
+    const source=spaces.find(space=>space.id===sourceSpaceId)!.layout;
+    set({spaces,...source,pendingTabWorkflowMembership:pending});
+    try {
+      await get().commitOrganization();get().saveSession();
+      const accepted=[...family].every(id=>get().tabWorkflowMembership[id]?.workflowId===targetSpaceId);
+      if(accepted)console.info('[Spaces] moveWindow window='+moved.windowId+' source='+sourceSpaceId+' target='+targetSpaceId);
+      return accepted;
+    } catch {return false;}
   },
   view: 'dashboard',
   activeProjectId: null,
@@ -2991,6 +3047,58 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
   commitOrganization: () => {
     if (!get().organizationReady || get().isRestoring) return Promise.resolve(null);
     return organizationCommitter.commit(() => organizationSnapshot(get()));
+  },
+
+  commitWorkflowDrag: async (request, {isCurrent=()=>true}={}) => {
+    if(!request || !get().organizationReady || !isCurrent())return false;
+    const navigationAtCommit=get().navigationRevision;
+    const frozen=JSON.parse(JSON.stringify(request));
+    try {
+      // Flush ordinary local state first. The drag's member/relation/placement
+      // guards stay exactly as captured; the command never samples new guards.
+      await get().commitOrganization();
+      const namespaces=[...new Set(frozen.tabs.map((tab:any)=>tab.expected.namespace))] as string[];
+      const commit=()=>organizationCommitter.command('commitDrag',frozen,{isCurrent});
+      const result=namespaces.length ? await projectTabSaveQueue.enqueueMany(namespaces,commit) : await commit();
+      const snapshot=result.snapshot;
+      if(!snapshot || result.success!==true)return false;
+      const state=get(),openProjects=new Map(state.openProjects);
+      const reveal=state.view==='workspace' && state.navigationRevision===navigationAtCommit && isCurrent();
+      for(const receipt of result.relationReceipts || []) {
+        workflowRelationReceipts.record(receipt);
+        const tab=openProjects.get(receipt.namespace)?.tabs.get(receipt.tabId);
+        if(tab) {
+          executionRevisionAcks.relation(receipt.namespace,tab,receipt);
+          // The relation write is confirmed even if a foreign storage revision
+          // gap prevents treating its revision as our own metadata-save ACK.
+          if((tab.visualParentTabId || null)===receipt.beforeParent || (tab.visualParentTabId || null)===receipt.afterParent) {
+            tab.visualParentTabId=receipt.afterParent || undefined;
+            tab.closedVisualParentTabId=undefined;
+          }
+        }
+      }
+      const projection=organizationProjection(snapshot,state);
+      const byId=new Map(frozen.workflows.map((workflow:any)=>[workflow.workflowId,workflow]));
+      const spaces=state.spaces.map(space=>{
+        const change:any=byId.get(space.id);if(!change)return space;
+        const currentLayout=space.id===state.activeSpaceId?captureSpaceLayout(state):space.layout;
+        return {...space,reserveOrder:change.reserveOrder,reserveRootOrder:change.reserveRootOrder,
+          layout:applyWorkflowDragLayout(currentLayout,change,{reveal})};
+      });
+      const live=byId.has(state.activeSpaceId)?spaces.find(space=>space.id===state.activeSpaceId)?.layout:{};
+      set({openProjects,spaces,...live,globalGroups:snapshot.globalGroups,
+        tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,
+        organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
+      if(frozen.destinationKind==='window' && state.activeSpaceId===frozen.targetWorkflowId
+        && reveal) {
+        const shown=get().activeSpaceTab;
+        if(shown)get().activateCenterTab(shown.projectId,shown.tabId);
+      }
+      get().saveSession();return true;
+    } catch(error:any) {
+      console.warn('[WorkflowReserveDnd:commit-rejected]',error?.message || error);
+      return false;
+    }
   },
 
   ensureTabRuntime: async (tabId) => {
@@ -6960,6 +7068,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       cwd: restoreCwd.cwd,
       fallbackFrom: restoreCwd.fallbackFrom,
       historyDeleteFailed,
+      restoration: historyDeleteFailed ? undefined : committed.restoration,
       restoredWindowSpaceId: restoredWindow?.spaceId,
       message: historyDeleteFailed
         ? 'Вкладка восстановлена, но запись истории не удалось удалить'
@@ -9698,10 +9807,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
 
   // Per-project view (Home vs Terminal)
   setProjectView: (projectId, view) => {
-    if (get().organizationReady && view === 'home') {
-      window.dispatchEvent(new CustomEvent('global-tab-archive:open'));
-      return;
-    }
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
     if (!workspace || workspace.currentView === view) return;
@@ -9826,6 +9931,7 @@ const organizationCommitter = createOrganizationCommitter({
     useWorkspaceStore.setState({tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,
       organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation,
       pendingTabWorkflowMembership:pending,organizationError:null});
+    return snapshot;
   },
   onError:(error:any) => {
     useWorkspaceStore.setState({organizationError:error?.message || String(error)});

@@ -1,3 +1,13 @@
+import { getTerminalMcpTag, isSystemPromptEntry } from '../../shared/prompt-origin.mjs';
+
+export function timelineMarkerKind(entry) {
+  const tag = getTerminalMcpTag(entry);
+  if (tag?.kind === 'orchestration' && tag.runKind === 'external-research'
+    && typeof tag.runId === 'string' && tag.runId.trim()) return 'sc-desktop';
+  if (tag) return 'terminal-mcp';
+  return isSystemPromptEntry(entry) ? 'system' : 'ordinary';
+}
+
 export function collectTimelineDocs(entries) {
   const edited = new Set();
   const searched = new Set();
@@ -43,8 +53,9 @@ export function collectTimelinePromptLabels(entries) {
   return labels.size > 0 ? [...labels] : hasPromptChip ? ['PROMPT'] : [];
 }
 
-export function isTimelineGroupExpanded(isExpandedLayout, requestedExpanded) {
-  return isExpandedLayout === true && requestedExpanded === true;
+export function isTimelineGroupExpanded(_isExpandedLayout, requestedExpanded) {
+  // Opening a vertical group does not choose the rail's horizontal layout.
+  return requestedExpanded === true;
 }
 
 const markerGeometryCache = new Map();

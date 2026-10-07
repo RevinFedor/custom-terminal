@@ -1,4 +1,20 @@
-# Fact: Test Infrastructure (auto/)
+# Fact: Test Infrastructure
+
+## Текущий порядок UI-проверок
+
+Короткие pixel-perfect, screenshot и локальные interaction-проверки выполняет
+родительский агент. Единственный смысл вынести тестирование в отдельную Luna —
+экономия основного контекста на действительно длинных сквозных сценариях.
+Для такой делегации пользователь выбрал **GPT-6-Luna / max**. Текущий порядок,
+контракт запуска и шаблон поручения находятся в
+[`делегирование-e2e-тестирования.prompt.md`](../prompts/делегирование-e2e-тестирования.prompt.md).
+
+Полный UI E2E проходит реальное приложение до backend/persistence и конечного
+видимого состояния. Синтетические данные допустимы, подменённый Main/store/IPC
+доказывает только границу компонента. Для визуальной приёмки Electron окно DEV
+видимо; CDP отдельно от native OS cursor/focus. Новый retake требует доказанного
+исполнения текущей сборки с отдельным attempt/PID/start/hash и артефактами фаз.
+Чтение старого отчёта не становится новым прогоном; отсутствие запуска — NOT RUN.
 
 ## Философия
 Несколько уровней тестирования ловят разные классы багов:
@@ -6,7 +22,11 @@
 - **E2E** (Playwright + Electron): реальный TUI. Headless может пройти 22/22, но пропустить баг — Gemini обрезает сообщения до ~137 символов, xterm рендерит иначе.
 - **Native iOS E2E** (Simulator + WebDriverAgent/Appium): реальный SwiftUI-клиент, accessibility tree, tap/swipe/type, screenshots и app logs. Ловит то, что API-тесты не видят: overlay съел tap, composer визуально активен при запрещённом send, keyboard перекрыл input, pull-to-refresh не дошёл до threshold, foreground вернул store без видимого loader.
 
-## Структура
+## Историческая структура auto/
+
+Схема ниже описывает прежний harness, а не команду запуска текущей проверки.
+Актуальные процедуры находятся в E2E-skills и их project references; для Noted
+также используются существующие `scripts/` runners и сценарии Electron MCP.
 ```
 auto/
 ├── context.md           # Entry point для AI-агентов
@@ -51,6 +71,6 @@ Haptic нельзя проверить сенсором через Simulator/WDA
 - **`ios_wda_habit_pull_refresh({page})`** — smoke pull-to-refresh для native Terminal projects/tabs. Для `page:"tabs"` helper обязан сначала оказаться на списке вкладок; если стартует из chat transcript, делает iOS edge-back и только потом pull.
 
 ## См. также
-- [`auto/context.md`](../../auto/context.md) — полная документация с шаблонами и troubleshooting
+- [`делегирование-e2e-тестирования.prompt.md`](../prompts/делегирование-e2e-тестирования.prompt.md) — текущая граница самостоятельных проверок и длинного E2E.
 - [`fact-claude-tui-mechanics.md`](fact-claude-tui-mechanics.md) — почему Ink TUI требует bracketed paste
 - Глобальный skill `ios-e2e-testing` (`~/.claude/skills/ios-e2e-testing/`) — процедура WDA/Appium, Simulator setup и HabitTracker-specific reference.

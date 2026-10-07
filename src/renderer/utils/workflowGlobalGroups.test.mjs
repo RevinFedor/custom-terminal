@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { selectWorkflowGlobalGroups, workflowGlobalGroupMembers, workflowLegacyGlobalGroup } from './workflowGlobalGroups.mjs';
+import { selectWorkflowGlobalGroups, workflowGlobalGroupMembers, workflowLegacyGlobalGroup, workflowGroupChoices,
+  workflowGroupDisplayName } from './workflowGlobalGroups.mjs';
 const publication = { version:1,revision:4,groups:[{id:'g',name:'Shared',collapsed:true,legacyNamespace:'P',legacyGroupId:'same',future:5},
   {id:'other',name:'Other',legacyNamespace:'Q',legacyGroupId:'same'}],tabGroups:{a:'g',b:'g',c:'g',archive:'g',file:'g',child:'other'} };
 const catalog = new Map(['a','b','c','archive','file','child'].map(id => [id,{tabId:id,projectId:id==='b'?'Q':'P',tab:{id,archived:id==='archive',
@@ -22,4 +23,14 @@ test('exact members never inherit parent group/file relationships and archive ex
   assert.equal(workflowGlobalGroupMembers(publication,'g',catalog,{includeArchived:true}).length,5);
   assert.equal(workflowLegacyGlobalGroup(publication,'Q','same').id,'other');
   assert.equal(workflowLegacyGlobalGroup(publication,'wrong','same'),null);
+});
+test('archival placeholders cannot become new assignment choices; explicit later names and provenance survive',()=>{
+  const placeholder={id:'global-placeholder',name:'legacy-opaque-id',legacyGroupId:'legacy-opaque-id',missingLegacyDefinition:true};
+  const renamed={...placeholder,id:'renamed',name:'Design'};
+  const input={...publication,groups:[...publication.groups,placeholder,renamed]};
+  const before=structuredClone(input);
+  assert.deepEqual(workflowGroupChoices(input).map(group=>group.id),['g','other','renamed']);
+  assert.equal(workflowGroupDisplayName(placeholder),'Группа без названия');
+  assert.equal(workflowGroupDisplayName(renamed),'Design');
+  assert.deepEqual(input,before);
 });

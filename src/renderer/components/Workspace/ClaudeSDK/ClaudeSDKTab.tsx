@@ -53,6 +53,7 @@ import { isElectronDictationClipboardPayload } from '../../../utils/electronComp
 import Tooltip from '../../UI/Tooltip';
 import ControlHint from '../../UI/ControlHint';
 import { consumePrefetched } from '../../../utils/sdkHistoryPrefetch';
+import recordTimes from '../../../../shared/history-record-time.cjs';
 import { BackgroundTasksBar } from './BackgroundTasksBar';
 import { TaskDetailPane } from './TaskDetailPane';
 import { WorkflowPanel } from './WorkflowPanel';
@@ -108,19 +109,21 @@ type ToolCallPart = {
   args: Record<string, any>;
   result?: any;
   status: 'running' | 'done' | 'error';
+  recordTime?: import('./sdkHistoryParser').HistoryRecordTime;
 };
 type AssistantPart =
-  | { type: 'text'; text: string }
-  | { type: 'thinking'; text: string }
+  | { type: 'text'; text: string; recordTime?: import('./sdkHistoryParser').HistoryRecordTime }
+  | { type: 'thinking'; text: string; recordTime?: import('./sdkHistoryParser').HistoryRecordTime }
   | ToolCallPart;
 interface SDKChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system' | 'compact-summary';
   parts?: AssistantPart[];
   text: string;
-  toolCalls: Array<{ id: string; name: string; args: Record<string, any>; result?: any; status: 'running' | 'done' | 'error' }>;
+  toolCalls: Array<{ id: string; name: string; args: Record<string, any>; result?: any; status: 'running' | 'done' | 'error'; recordTime?: import('./sdkHistoryParser').HistoryRecordTime }>;
   thinking: string | null;
   timestamp: number;
+  recordTime?: import('./sdkHistoryParser').HistoryRecordTime;
   // Set on compact-summary entries: метаданные сжатия с compact_boundary
   // (pre/post tokens + duration). Прикрепляются в loadHistory когда
   // compact_boundary запись встречается прямо перед summary в JSONL chain.
@@ -176,7 +179,7 @@ function assembleMessageFields(parts: AssistantPart[]): { text: string; thinking
   for (const p of parts) {
     if (p.type === 'text') textPieces.push(p.text);
     else if (p.type === 'thinking') thinkingPieces.push(p.text);
-    else if (p.type === 'tool') toolCalls.push({ id: p.id, name: p.name, args: p.args, result: p.result, status: p.status });
+    else if (p.type === 'tool') toolCalls.push({ id: p.id, name: p.name, args: p.args, result: p.result, status: p.status, recordTime: p.recordTime });
   }
   return {
     text: textPieces.join('\n'),
@@ -1032,6 +1035,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
           thinking: null,
           timestamp: Date.now() - (result.messages.length - i) * 1000,
           wasQueued: true,
+          recordTime: recordTimes.historyRecordTimeFromRecord(m),
         };
       }
       // Build ordered parts[] for assistant messages — preserving the exact
@@ -1044,9 +1048,9 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
         for (const b of contentArr) {
           if (!b) continue;
           if (b.type === 'text' && typeof b.text === 'string') {
-            parts.push({ type: 'text', text: b.text });
+            parts.push({ type: 'text', text: b.text, recordTime: recordTimes.historyRecordTimeFromRecord(m) });
           } else if (b.type === 'thinking' && typeof b.thinking === 'string') {
-            parts.push({ type: 'thinking', text: b.thinking });
+            parts.push({ type: 'thinking', text: b.thinking, recordTime: recordTimes.historyRecordTimeFromRecord(m) });
           } else if (b.type === 'tool_use') {
             const tid = b.id || 'tool-' + i;
             const tr = toolResults.get(tid);
@@ -1054,6 +1058,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
               type: 'tool',
               id: tid,
               name: b.name || 'unknown',
+              recordTime: recordTimes.historyRecordTimeFromRecord(m, 'tool-call'),
               args: typeof b.input === 'object' ? b.input : {},
               result: tr ? tr.result : undefined,
               status: tr ? (tr.isError ? 'error' : 'done') : 'done',
@@ -1064,7 +1069,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
         }
       } else if (typeof m.message?.content === 'string') {
         // Legacy string-shape message (rare for assistant; common for plain user).
-        parts.push({ type: 'text', text: m.message.content });
+        parts.push({ type: 'text', text: m.message.content, recordTime: recordTimes.historyRecordTimeFromRecord(m) });
       }
 
       const derived = assembleMessageFields(parts);
@@ -1171,6 +1176,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
         toolCalls: role === 'assistant' ? derived.toolCalls : [],
         thinking: role === 'assistant' ? derived.thinking : null,
         timestamp: Date.now() - (result.messages.length - i) * 1000,
+        recordTime: recordTimes.historyRecordTimeFromRecord(m),
       };
       if (role === 'assistant') {
         out.parts = parts;
@@ -1197,6 +1203,9 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
         const combined = [...(prev.parts || []), ...(m.parts || [])];
         const d = assembleMessageFields(combined);
         prev.parts = combined;
+        // The merged SDK turn spans source records; its individual parts
+        // retain their dates, but there is no one record date for the whole turn.
+        delete prev.recordTime;
         prev.text = d.text;
         prev.thinking = d.thinking;
         prev.toolCalls = d.toolCalls;

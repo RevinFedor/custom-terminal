@@ -1,4 +1,4 @@
-import { selectWorkflowGlobalGroups } from './workflowGlobalGroups.mjs';
+import { selectWorkflowGlobalGroups, workflowGroupDisplayName } from './workflowGlobalGroups.mjs';
 // Organization only. Legacy namespaces address cards/actions, never membership.
 const entries = value => value instanceof Map ? [...value] : Object.entries(value || {});
 const list = value => Array.isArray(value) ? value : [];
@@ -37,7 +37,9 @@ export function workflowTabCatalog(state) {
     for (const [key, tab] of entries(bucket?.tabs)) {
       const tabId = tab?.id || key;
       if (!tabId || catalog.has(tabId)) continue;
-      catalog.set(tabId, { projectId, tabId, tab, active:state.tabCatalog?.[tabId]?.active !== false });
+      const physicalParent=tab.parentTabId || state.tabCatalog?.[tabId]?.physicalParentTabId;
+      catalog.set(tabId, { projectId, tabId, tab:physicalParent && !tab.parentTabId ? {...tab,parentTabId:physicalParent}:tab,
+        active:state.tabCatalog?.[tabId]?.active !== false });
     }
   }
   return catalog;
@@ -77,8 +79,12 @@ export function selectWorkflowReserve(state, workflowId = state.activeSpaceId, o
     groups.clear(); visibleGroups.clear();
     for (const group of global.groups.values()) groups.set(workflowGroupKey('__tab_catalog_v2__',group.id),{...group,projectId:'__tab_catalog_v2__'});
     for (const group of global.visibleGroups.values()) visibleGroups.set(workflowGroupKey('__tab_catalog_v2__',group.id),{...group,projectId:'__tab_catalog_v2__'});
+    const assignedGroups = new Set(global.tabGroups.values());
+    for (const group of global.groups.values()) if (group.reserveWorkflowId === workflowId && !assignedGroups.has(group.id))
+      visibleGroups.set(workflowGroupKey('__tab_catalog_v2__',group.id),{...group,projectId:'__tab_catalog_v2__'});
   }
-  return { workflowId, catalog, members, reserve, placed, groups, visibleGroups, filesByOwner, globalTabGroups:global?.tabGroups };
+  const rootOrder=list(state.spaces).find(space=>space.id===workflowId)?.reserveRootOrder || [];
+  return { workflowId, catalog, members, reserve, placed, groups, visibleGroups, filesByOwner, globalTabGroups:global?.tabGroups,rootOrder };
 }
 
 /** Stable node IDs survive reorder, partial groups and workflows. No cloning
@@ -108,7 +114,7 @@ export function workflowReserveOutline(selection) {
   }
   const contextFor = owner => {
     const parentId = owner.tab.visualParentTabId || owner.tab.parentTabId;
-    const parent = !byId.has(parentId) && selection.catalog.get(parentId);
+    const parent = !parentOf.has(owner.tabId) && selection.catalog.get(parentId);
     return parent ? { projectId: parent.projectId, tabId: parent.tabId, name: parent.tab.name || '' } : null;
   };
   const nodes = new Map(selection.reserve.map(owner => [owner.tabId, {
@@ -125,11 +131,20 @@ export function workflowReserveOutline(selection) {
     if (!groupNodes.has(key)) {
       const group = selection.visibleGroups.get(key);
       const groupNode = { id: `reserve-group:${key}`, kind: 'group', entityType: 'group',
-        projectId: group.projectId, groupId: group.id, label: group.name,
+        projectId: group.projectId, groupId: group.id, label: workflowGroupDisplayName(group),
         collapsible: true, expanded: !group.collapsed, children: [] };
       groupNodes.set(key, groupNode); result.push(groupNode);
     }
     groupNodes.get(key).children.push(node);
+  }
+  for (const [key, group] of selection.visibleGroups) if (!groupNodes.has(key)) result.push({
+    id: `reserve-group:${key}`, kind: 'group', entityType: 'group',
+    projectId: group.projectId, groupId: group.id, label: workflowGroupDisplayName(group),
+    collapsible: true, expanded: !group.collapsed, children: [],
+  });
+  if(selection.rootOrder?.length) {
+    const rank=new Map(selection.rootOrder.map((id,index)=>[id,index]));
+    result.sort((a,b)=>(rank.get(a.id) ?? Infinity)-(rank.get(b.id) ?? Infinity));
   }
   return result;
 }
@@ -167,4 +182,60 @@ export function reservePaneEntries(selection, node, selectedTabIds = []) {
     if (owner) unique.set(owner.tabId, { projectId: owner.projectId, tabId: owner.tabId });
   }
   return [...unique.values()];
+}
+
+/** A placed source becomes a temporary outline row only. No catalog row,
+ * membership or placement is changed until the shared drag commits. */
+export function projectReservePaneSource(selection, outline, source) {
+  const admission=source?.workflowDrag;
+  if(admission) {
+    const existing=new Map();const index=nodes=>nodes.forEach(node=>{existing.set(node.id,node);index(node.children || []);});index(outline);
+    if(source.owner==='sidebar' && admission.sourceWorkflowId===selection.workflowId
+      && admission.sourceRootIds.every(id=>existing.has(id))) {
+      return {sourceId:admission.sourceId,sourceRootIds:admission.sourceRootIds,outline,metadata:admission};
+    }
+    const family=new Set(admission.familyIds),rootIds=new Set(admission.sourceRootIds);
+    // A global group may have unrelated members in the destination. Never
+    // turn that existing group into part of the transported selection.
+    for(const node of admission.sourceNodes)if(node.groupId && existing.has(node.id)
+      && reserveNodeEntries(existing.get(node.id)).some(entry=>!family.has(entry.tabId)))return null;
+    const strip=nodes=>nodes.filter(node=>!family.has(node.tabId) && !rootIds.has(node.id))
+      .map(node=>({...node,children:strip(node.children || [])}));
+    const metadata={entries:admission.paneEntries,familyIds:admission.familyIds,gestureId:admission.gestureId};
+    const incoming=admission.sourceNodes.map(node=>{
+      const guard=admission.guards[node.tabId],parentId=guard?.parentTabId || guard?.visualParentTabId;
+      const parent=parentId && selection.catalog.get(parentId);
+      const contextParent=guard?.parentTabId || guard?.tabType==='file'
+        ? node.contextParent || (parentId ? {tabId:parentId,projectId:admission.guards[parentId]?.namespace || parent?.projectId,
+          name:parent?.tab.name || ''}:null) : null;
+      return {...node,externalPaneSource:metadata,contextParent};
+    });
+    return {sourceId:admission.sourceId,sourceRootIds:admission.sourceRootIds,outline:[...strip(outline),...incoming],metadata};
+  }
+  if(source?.owner !== 'pane' || !source.entries?.length)return null;
+  const roots=source.entries.filter(entry=>selection.catalog.get(entry.tabId)?.projectId===entry.projectId);
+  if(roots.length !== source.entries.length)return null;
+  const family=new Set(roots.map(entry=>entry.tabId));
+  let added=true;
+  while(added) {
+    added=false;
+    for(const owner of selection.catalog.values()) {
+      const tab=owner.tab,parent=tab.parentTabId || tab.visualParentTabId;
+      if(!family.has(owner.tabId) && family.has(parent) && tab.archived!==true && tab.isArchived!==true && !tab.deleted) {
+        family.add(owner.tabId);added=true;
+      }
+    }
+  }
+  const forest=workflowReserveOutline({...selection,reserve:[...family].map(id=>selection.catalog.get(id)),
+    groups:new Map(),visibleGroups:new Map(),globalTabGroups:new Map()});
+  const sourceId=`reserve-tab:${source.rootTabId}`;
+  const root=forest.find(node=>node.id===sourceId);
+  if(!root)return null;
+  const strip=nodes=>nodes.filter(node=>!family.has(node.tabId)).map(node=>({...node,children:strip(node.children || [])}));
+  const metadata={entries:roots.map(entry=>({...entry})),familyIds:[...family]};
+  const incoming=forest.map(node=>({...node,
+    contextParent:selection.catalog.get(node.tabId)?.tab.parentTabId || selection.catalog.get(node.tabId)?.tab.tabType==='file'
+      ? node.contextParent:null,
+    externalPaneSource:metadata}));
+  return{sourceId,outline:[...strip(outline),...incoming],metadata};
 }

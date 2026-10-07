@@ -1705,7 +1705,7 @@ class TabWorkContext {
 
   confirm(tabId, handoffId, expectedHash) {
     const sent = this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
-    if (!sent || sent.payload_hash !== expectedHash || sent.status === 'delivered') return;
+    if (!sent || sent.payload_hash !== expectedHash || sent.status === 'delivered' || sent.status === 'merged') return;
     this.db.transaction(() => {
       for (const id of JSON.parse(sent.update_ids)) {
         this.db.prepare("UPDATE tab_context_updates SET status='delivered',before_text=NULL,after_text=NULL WHERE id=? AND tab_id=? AND status='sending'").run(id, tabId);
@@ -1717,7 +1717,7 @@ class TabWorkContext {
 
   activate(tabId, handoffId) {
     const sent = this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
-    if (!sent || sent.status === 'delivered') return;
+    if (!sent || sent.status === 'delivered' || sent.status === 'merged') return;
     let changed = 0;
     this.db.transaction(() => {
       for (const id of JSON.parse(sent.update_ids)) changed += this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND tab_id=? AND status='pending'").run(id, tabId).changes;
@@ -1728,6 +1728,49 @@ class TabWorkContext {
 
   hasHandoff(tabId, handoffId) {
     return !!this.db.prepare('SELECT 1 FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
+  }
+
+  rebindPreparedHandoff(sourceTabId, targetTabId, handoffId, prompt) {
+    if(sourceTabId===targetTabId)return;
+    this.db.transaction(()=>{
+      const source=this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(sourceTabId,handoffId);
+      const target=this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(targetTabId,handoffId);
+      const current=source || target;
+      if(!current)return;
+      if(current.prepared_prompt!==prompt || current.payload_hash!==promptAuditFingerprint(prompt)
+        || ['delivered','merged'].includes(current.status) || source && target
+        || (this.readReceipts?.(sourceTabId) || []).some(receipt=>receipt.handoffId===handoffId && receipt.attemptId))
+        throw Object.assign(fail('Prepared context restore changed',409),{code:'context_restore_handoff_changed'});
+      if(!source)return;
+      for(const id of JSON.parse(source.update_ids)) {
+        const update=this.db.prepare('SELECT tab_id,status FROM tab_context_updates WHERE id=?').get(id);
+        if(!update || update.tab_id!==sourceTabId || update.status!=='sending')
+          throw Object.assign(fail('Prepared context restore changed',409),{code:'context_restore_update_changed'});
+        this.db.prepare('UPDATE tab_context_updates SET tab_id=? WHERE id=?').run(targetTabId,id);
+      }
+      this.db.prepare('UPDATE tab_context_handoffs SET tab_id=? WHERE tab_id=? AND handoff_id=?').run(targetTabId,sourceTabId,handoffId);
+    })();
+  }
+
+  mergeHandoffs(tabId, originals, replacement) {
+    const sources = originals.map(request => ({ request, row: this.db.prepare(
+      'SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, request.handoffId) }));
+    if (!sources.some(source => source.row)) return;
+    for (const { row, request } of sources) if (row && (row.status === 'delivered' || row.status === 'merged'
+      || row.prepared_prompt !== request.prompt)) throw Object.assign(fail('Контекст ожидающего сообщения изменился.', 409), {
+      code: 'send_queue_merge_context_changed' });
+    const updateIds = [...new Set(sources.flatMap(source => source.row ? JSON.parse(source.row.update_ids) : []))];
+    const facts = [...new Set(sources.flatMap(source => source.row ? JSON.parse(source.row.continuation_facts || '[]') : []))];
+    this.db.transaction(() => {
+      this.db.prepare(`INSERT INTO tab_context_handoffs(tab_id,handoff_id,base_hash,prefix,prepared_prompt,
+        payload_hash,update_ids,created_at,continuation_facts) VALUES (?,?,?,'',?,?,?,?,?)`).run(tabId,
+        replacement.handoffId, hash(replacement.prompt), replacement.prompt, promptAuditFingerprint(replacement.prompt),
+        JSON.stringify(updateIds), Date.now(), JSON.stringify(facts));
+      for (const { row } of sources) if (row) this.db.prepare(
+        "UPDATE tab_context_handoffs SET status='merged' WHERE tab_id=? AND handoff_id=?").run(tabId, row.handoff_id);
+    })();
+    // Queue and context share the same SQLite commit. Cancellation of an old
+    // superseded handoff can no longer put the replacement's updates back.
   }
 
   assertContinuationScope(tabId, handoffId, { atWrite = false } = {}) {
@@ -1762,7 +1805,7 @@ class TabWorkContext {
 
   release(tabId, handoffId) {
     const sent = this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
-    if (!sent || sent.status === 'delivered') return;
+    if (!sent || sent.status === 'delivered' || sent.status === 'merged') return;
     this.db.transaction(() => {
       for (const id of JSON.parse(sent.update_ids)) this.db.prepare("UPDATE tab_context_updates SET status='pending' WHERE id=? AND tab_id=? AND status='sending'").run(id, tabId);
       this.db.prepare("UPDATE tab_context_handoffs SET status='failed' WHERE tab_id=? AND handoff_id=?").run(tabId, handoffId);

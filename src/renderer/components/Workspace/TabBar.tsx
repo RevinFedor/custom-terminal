@@ -30,13 +30,14 @@ import { cancelRestartAfterCommand, runRestartAfterCommand } from '../../hooks/u
 import { getRestartAfterTriggerIds, getRestartAfterWorkflowIds, hasRestartAfterSubscription, isAiLaunchCommand, isDevRestartCommand } from '../../utils/restartAfterCommand.mjs';
 import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexForkSourceSessionId, requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
-import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { TabPaneMap } from './PaneMap';
 import { TabIdActions } from './TabIdActions';
 import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
 import { tabContextSurface, tabContextPaneIndex } from '../../utils/tabContextSurface.mjs';
 import MoveToWindowMenu, { type WindowCell } from './MoveToWindowMenu';
 import NewTabMenuRows from './NewTabMenuRows';
+import TabMenuChoices from './TabMenuChoices';
+import { workflowGroupChoices } from '../../utils/workflowGlobalGroups.mjs';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
@@ -286,62 +287,6 @@ export function openTabContextMenuAt(
   window.dispatchEvent(new CustomEvent(TAB_CONTEXT_MENU_EVENT, {
     detail: { projectId, tabId, x, y, ...options },
   }));
-}
-
-// Маркеры реальных задач под названием вертикальной вкладки. Для ручной
-// визуальной настройки геометрии меняй только эти значения.
-const TASK_MARKER_PRIMARY_SIZE_PX = 9;
-const TASK_MARKER_SECONDARY_SIZE_PX = 8;
-const TASK_MARKER_SECONDARY_GAP_PX = 3;
-const TASK_MARKER_NEXT_TAB_CLEARANCE_PX = 1;
-const TASK_MARKER_HOVER_SCALE = 1.32;
-const TASK_MARKER_LANE_HEIGHT_PX = Math.ceil(TASK_MARKER_SECONDARY_SIZE_PX * TASK_MARKER_HOVER_SCALE);
-const TASK_MARKER_DEFAULT_COLOR = '#73737a';
-const TASK_ARCHIVE_COUNTER_SIZE_PX = 10;
-const TASK_ARCHIVE_RIGHT_INSET_PX = 5;
-
-function TaskLaneMarker({
-  color,
-  shape,
-  title,
-  onClick,
-}: {
-  color: string;
-  shape: 'dot' | 'square';
-  title: string;
-  onClick: (event: React.MouseEvent<HTMLButtonElement>) => void;
-}) {
-  const [hovered, setHovered] = useState(false);
-  return (
-    <button
-      type="button"
-      data-task-plan-tab-marker
-      title={title}
-      onPointerDown={(event) => event.stopPropagation()}
-      onDoubleClick={(event) => event.stopPropagation()}
-      onClick={onClick}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      style={{
-        display: 'block',
-        width: TASK_MARKER_SECONDARY_SIZE_PX,
-        height: TASK_MARKER_SECONDARY_SIZE_PX,
-        flex: `0 0 ${TASK_MARKER_SECONDARY_SIZE_PX}px`,
-        padding: 0,
-        borderRadius: shape === 'square' ? 1 : '50%',
-        backgroundColor: color,
-        border: '1px solid rgba(0,0,0,0.38)',
-        boxSizing: 'border-box',
-        pointerEvents: 'auto',
-        cursor: 'pointer',
-        outline: 'none',
-        transform: `scale(${hovered ? TASK_MARKER_HOVER_SCALE : 1})`,
-        transformOrigin: 'center bottom',
-        transition: 'transform 90ms ease, filter 90ms ease',
-        filter: hovered ? 'brightness(1.18)' : 'none',
-      }}
-    />
-  );
 }
 
 const formatRestartAfterCommandLabel = (command?: string | null) => {
@@ -1236,7 +1181,6 @@ const TabItem = memo(({
   const [isAdoptTarget, setIsAdoptTarget] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [isRestartButtonHovered, setIsRestartButtonHovered] = useState(false);
-  const [taskArchivePreviewOpen, setTaskArchivePreviewOpen] = useState(false);
   const isOrchestrationInheritedBusy = useOrchestrationStore((s) => s.inheritedBusyTabIds.has(tab.id));
   const isSendPending = useAgentSendPending(tab.id);
   const dragVisualLockRef = useRef(false);
@@ -1504,36 +1448,9 @@ const TabItem = memo(({
   // SDK явно светлее/жёлтее на одинаковом #252526 фоне.
   const isVerticalMode = !isHorizontal;
   const hasContextUpdate = useTabWorkContext(tab.id).pendingCount > 0;
-  const taskStatusMarkerShape = useUIStore((s) => s.taskStatusMarker.shape);
-  const taskStatuses = useUIStore((s) => s.taskStatuses);
-  const taskStatusById = useMemo(
-    () => new Map(taskStatuses.map((status) => [status.id, status])),
-    [taskStatuses],
-  );
-  const liveTaskPlan = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tab.id)?.taskPlan);
-  const taskPlan = liveTaskPlan || tab.taskPlan;
-  const activeTaskPlanItems = taskPlan?.items || [];
-  const archivedTaskPlanItems = taskPlan?.archivedItems || [];
-  const showTaskMarkerLane = isVerticalMode
-    && zone === 'main'
-    && !isCollapsed
-    && (activeTaskPlanItems.length > 0 || archivedTaskPlanItems.length > 0);
-  const verticalPaddingTop = showTaskMarkerLane ? Math.max(0, tabGeo.paddingY - 2) : tabGeo.paddingY;
-  const verticalPaddingBottom = showTaskMarkerLane ? tabGeo.paddingY + 2 : tabGeo.paddingY;
+  const verticalPaddingTop = tabGeo.paddingY;
+  const verticalPaddingBottom = tabGeo.paddingY;
   const contextSignalInset = hasContextUpdate ? TAB_CONTEXT_UPDATE_INSET_PX : 0;
-  const taskMarkerLaneLeft = Math.max(tabGeo.paddingLeft, contextSignalInset);
-  const taskMarkerLaneRight = archivedTaskPlanItems.length > 0
-    ? TASK_ARCHIVE_RIGHT_INSET_PX + TASK_ARCHIVE_COUNTER_SIZE_PX + TASK_MARKER_SECONDARY_GAP_PX
-    : tabGeo.paddingX;
-  const navigateFromTaskMarker = useCallback((
-    event: React.MouseEvent<HTMLButtonElement>,
-    view: 'active' | 'archive',
-    taskId?: string,
-  ) => {
-    event.stopPropagation();
-    onSwitch(event);
-    requestTaskPlanNavigation({ tabId: tab.id, taskId, view });
-  }, [onSwitch, tab.id]);
   const isVertActive = !isHorizontal && isActive;
   const isDraggedByMonitor = draggingGroupIds.includes(tab.id);
   const isDraggedRoot = draggingRootIds.includes(tab.id);
@@ -2217,143 +2134,13 @@ const TabItem = memo(({
                   aria-hidden
                 />
               )}
-              {/* Status marker — shared with the other tab surfaces (TabSignals).
-                  Левый отступ 5px: после 3px полоски процесса (z:5) + 2px зазор → 5px.
-                  Вертикальный сдвиг компенсирует оптический baseline-шифт строчных
-                  букв ('claude-03' без descender'ов выглядит чуть ниже
-                  геометрического центра карточки); при видимой полосе задач маркер
-                  поднимается, чтобы освободить нижний шов.
-                  Если полоска процесса справа — маркер всё равно слева (так лучше
-                  читается рядом с текстом названия таба). */}
-              {/* Кликабельный: открывает выбор статуса НА МЕСТЕ, не активируя
-                  вкладку (юзер: «никакого фокуса по вкладке, перехода нет»).
-                  Квадратики задач ниже НЕ кликабельны — они про заметки, и
-                  меняются там. */}
+              {/* The status belongs beside the title; task markers live in Notes. */}
               <TabStatusMarkerButton
                 projectId={projectId}
                 tabId={tab.id}
                 color={statusMeta?.color}
                 title={statusMeta?.label}
-                sizePx={showTaskMarkerLane ? TASK_MARKER_PRIMARY_SIZE_PX : undefined}
-                topOffsetPx={showTaskMarkerLane ? -1 : 1}
               />
-              {showTaskMarkerLane && activeTaskPlanItems.length > 0 && (
-                <span
-                  data-task-plan-tab-markers
-                  style={{
-                    position: 'absolute',
-                    left: `${taskMarkerLaneLeft}px`,
-                    right: `${taskMarkerLaneRight}px`,
-                    bottom: `${-Math.max(0, tabGeo.gap - TASK_MARKER_NEXT_TAB_CLEARANCE_PX)}px`,
-                    height: `${TASK_MARKER_LANE_HEIGHT_PX}px`,
-                    display: 'flex',
-                    alignItems: 'flex-end',
-                    gap: `${TASK_MARKER_SECONDARY_GAP_PX}px`,
-                    overflow: 'hidden',
-                    pointerEvents: 'none',
-                    zIndex: 7,
-                  }}
-                >
-                  {activeTaskPlanItems.map((task) => {
-                    const status = task.statusId ? taskStatusById.get(task.statusId) : undefined;
-                    return (
-                      <TaskLaneMarker
-                        key={task.id}
-                        color={status?.color || TASK_MARKER_DEFAULT_COLOR}
-                        shape={taskStatusMarkerShape}
-                        title={task.title}
-                        onClick={(event) => navigateFromTaskMarker(event, 'active', task.id)}
-                      />
-                    );
-                  })}
-                </span>
-              )}
-              {showTaskMarkerLane && archivedTaskPlanItems.length > 0 && (
-                <span
-                  data-task-plan-tab-archive
-                  onMouseEnter={() => setTaskArchivePreviewOpen(true)}
-                  onMouseLeave={() => setTaskArchivePreviewOpen(false)}
-                  style={{
-                    position: 'absolute',
-                    right: TASK_ARCHIVE_RIGHT_INSET_PX,
-                    bottom: `${-Math.max(0, tabGeo.gap - TASK_MARKER_NEXT_TAB_CLEARANCE_PX)}px`,
-                    width: TASK_ARCHIVE_COUNTER_SIZE_PX,
-                    height: TASK_ARCHIVE_COUNTER_SIZE_PX,
-                    pointerEvents: 'auto',
-                    zIndex: 10,
-                  }}
-                >
-                  {taskArchivePreviewOpen && (
-                    <span
-                      data-task-plan-tab-archive-preview
-                      style={{
-                        position: 'absolute',
-                        right: '100%',
-                        bottom: 0,
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: TASK_MARKER_SECONDARY_GAP_PX,
-                        maxWidth: 176,
-                        minHeight: TASK_ARCHIVE_COUNTER_SIZE_PX,
-                        padding: '1px 4px',
-                        overflow: 'hidden',
-                        borderRadius: '4px 0 0 4px',
-                        background: 'rgba(20,20,23,0.97)',
-                        border: '1px solid rgba(255,255,255,0.12)',
-                        borderRight: 0,
-                        boxShadow: '-6px 4px 14px rgba(0,0,0,0.34)',
-                        boxSizing: 'border-box',
-                        pointerEvents: 'auto',
-                      }}
-                    >
-                      {archivedTaskPlanItems.map((task) => {
-                        const status = task.statusId ? taskStatusById.get(task.statusId) : undefined;
-                        return (
-                          <TaskLaneMarker
-                            key={task.id}
-                            color={status?.color || TASK_MARKER_DEFAULT_COLOR}
-                            shape={taskStatusMarkerShape}
-                            title={task.title}
-                            onClick={(event) => navigateFromTaskMarker(event, 'archive', task.id)}
-                          />
-                        );
-                      })}
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    data-task-plan-tab-archive-count
-                    aria-label={`Архив задач: ${archivedTaskPlanItems.length}`}
-                    title={`Архив задач: ${archivedTaskPlanItems.length}`}
-                    onPointerDown={(event) => event.stopPropagation()}
-                    onDoubleClick={(event) => event.stopPropagation()}
-                    onClick={(event) => navigateFromTaskMarker(event, 'archive')}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      width: TASK_ARCHIVE_COUNTER_SIZE_PX,
-                      height: TASK_ARCHIVE_COUNTER_SIZE_PX,
-                      padding: 0,
-                      color: '#d4d4d8',
-                      background: '#3f3f46',
-                      border: '1px solid rgba(0,0,0,0.5)',
-                      borderRadius: 2,
-                      boxSizing: 'border-box',
-                      cursor: 'pointer',
-                      outline: 'none',
-                      fontSize: archivedTaskPlanItems.length < 10 ? 7 : archivedTaskPlanItems.length < 100 ? 6 : 5,
-                      fontWeight: 700,
-                      lineHeight: 1,
-                      transform: `scale(${taskArchivePreviewOpen ? TASK_MARKER_HOVER_SCALE : 1})`,
-                      transformOrigin: 'center bottom',
-                      transition: 'transform 90ms ease, background 90ms ease',
-                    }}
-                  >
-                    {archivedTaskPlanItems.length}
-                  </button>
-                </span>
-              )}
               {/* В вертикальном режиме middle-click по всей вкладке = close tab (стандартное
                   поведение TabItem root). Stop devServer живёт в правой restart-кнопке:
                   Cmd+hover показывает красный square, click отправляет stop без restart. */}
@@ -8087,7 +7874,9 @@ function TabBar({
 
   // Clear tab selection on click outside TabBar
   useEffect(() => {
-    if (selectedTabIds.length <= 1) return;
+    // The legacy instance only owns menus after workflow cutover. Its hidden
+    // list must not clear the selection owned by the visible reserve host.
+    if (menuOnlyForProject || selectedTabIds.length <= 1) return;
 
     const handleMouseDown = (e: MouseEvent) => {
       if (isDraggingTab) return;
@@ -8106,7 +7895,7 @@ function TabBar({
 
     document.addEventListener('mousedown', handleMouseDown);
     return () => document.removeEventListener('mousedown', handleMouseDown);
-  }, [selectedTabIds.length, isDraggingTab, projectId, clearSelection]);
+  }, [menuOnlyForProject, selectedTabIds.length, isDraggingTab, projectId, clearSelection]);
 
   // The host model contains more data than DnD needs (process state, title,
   // active status). Only structural fields participate in the controlled
@@ -8357,7 +8146,7 @@ function TabBar({
     sourceNode: TabOutlineNode;
     metaKey: boolean;
   }) => {
-    if (typeof document === 'undefined') return null;
+    if (menuOnlyForProject || getPaneTabDragSnapshot().source?.workflowDrag || typeof document === 'undefined') return null;
     const pointed = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
     const externalPaneSource = sourceNode?.externalPaneSource as {
       rootTabId?: string;
@@ -8454,7 +8243,7 @@ function TabBar({
     if (paneDrag.source?.owner === 'sidebar' && paneDrag.target) setPaneTabDragTarget(null);
 
     return null;
-  }, [openProjectIdSet, projectId]);
+  }, [menuOnlyForProject, openProjectIdSet, projectId]);
 
   const handleTabOutlineExternalCommit = useCallback(async ({
     sourceNode,
@@ -8741,6 +8530,9 @@ function TabBar({
 
   useEffect(() => {
     const navigationMode = tabOutlineDnd.dragState?.navigationMode === true;
+    // A retained menu owner is not the producer of the workflow gesture.
+    // In particular, its idle/Meta effect must not disable the live body zones.
+    if (menuOnlyForProject || getPaneTabDragSnapshot().source?.workflowDrag) return;
     const rootTabId = sharedOutlineRootTabIds[0] || sharedOutlineSourceTabIds[0] || '';
     const sourceProjectId = sidebarDragOrigin?.sourceProjectId || projectId;
     const entries = sharedOutlineRootTabIds.map((tabId) => ({ projectId: sourceProjectId, tabId }));
@@ -8768,12 +8560,16 @@ function TabBar({
     sharedOutlineSourceTabIds.join('\u0000'),
     structuredExternalTarget,
     tabOutlineDnd.dragState?.navigationMode,
+    menuOnlyForProject,
   ]);
 
-  useEffect(() => () => {
-    const current = getPaneTabDragSnapshot();
-    if (current.source?.owner === 'sidebar') endPaneTabDrag(current.source.rootTabId);
-  }, []);
+  useEffect(() => {
+    if (menuOnlyForProject) return;
+    return () => {
+      const current = getPaneTabDragSnapshot();
+      if (current.source?.owner === 'sidebar' && !current.source.workflowDrag) endPaneTabDrag(current.source.rootTabId);
+    };
+  }, [menuOnlyForProject]);
 
   useEffect(() => {
     if (!sharedOutlineDragActive) return;
@@ -10928,37 +10724,36 @@ function TabBar({
               MoveToWindowMenu. The split-button menu renders the same
               component in swap mode, so side selection, bridge, compact cards
               and scrolling cannot drift. */}
-          {!isContextMultiSelect && contextMenu && (
+          {(!isContextMultiSelect || organizationReady) && contextMenu && (
             <MoveToWindowMenu
               projectId={projectId}
               tabId={contextMenu.tabId}
               preferredSide={submenuSide}
+              hideWindowPicker={isContextMultiSelect}
+              workflows={organizationReady ? workflowTargets : undefined}
+              onMoveToWorkflow={organizationReady ? async workflowId => {
+                const ids = isContextMultiSelect ? [...selectedTabIds] : [contextMenu.tabId];
+                try {
+                  const moved = await useWorkspaceStore.getState().moveTabsToWorkflow(ids,workflowId);
+                  if(!moved)showToast('Перенос не подтверждён','warning');
+                  return moved;
+                } catch(error:any) {showToast(error?.message || 'Перенос не подтверждён','warning');return false;}
+              } : undefined}
               onDone={() => setContextMenu(null)}
             />
           )}
           {organizationReady && contextMenu && <>
-            <details data-tab-context-action="move-to-workflow">
-              <summary style={CONTEXT_MENU_ROW_STYLE}>Перенести в workflow</summary>
-              {workflowTargets.map(workflow => <button key={workflow.id} className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10"
-                style={CONTEXT_MENU_ROW_STYLE} onClick={async () => {
-                  const ids = isContextMultiSelect ? [...selectedTabIds] : [contextMenu.tabId];
-                  setContextMenu(null);
-                  if (!(await useWorkspaceStore.getState().moveTabsToWorkflow(ids,workflow.id))) showToast('Перенос не подтверждён','warning');
-                }}>{workflow.name}</button>)}
-            </details>
-            <details data-tab-context-action="global-group">
-              <summary style={CONTEXT_MENU_ROW_STYLE}>Группа</summary>
-              {[{id:null,name:'Без группы'},...(globalGroups?.groups || [])].map(group => <button key={group.id || 'none'}
-                className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10" style={CONTEXT_MENU_ROW_STYLE}
-                onClick={async () => {
-                  const store = useWorkspaceStore.getState(),publication = store.globalGroups;
-                  const ids = isContextMultiSelect ? [...selectedTabIds] : [contextMenu.tabId];
-                  setContextMenu(null);
-                  try {await store.mutateWorkflowGroup('assign',{version:1,mutationId:crypto.randomUUID(),expectedRevision:publication.revision,
-                    groupId:group.id,tabIds:ids,expectedTabGroups:Object.fromEntries(ids.map(id => [id,publication.tabGroups[id] || null]))});}
-                  catch (error:any) {showToast(error?.message || 'Группа не сохранена','warning');}
-                }}>{group.name}</button>)}
-            </details>
+            <TabMenuChoices label="Group" icon={<Folder size={12}/>} action="global-group" side={submenuSide}
+              choices={[{id:'',name:'Без группы'},...workflowGroupChoices(globalGroups)].map(group => ({...group,
+                selected:(globalGroups?.tabGroups[contextMenu.tabId] || '') === group.id}))}
+              onChoose={async groupId => {
+                const store = useWorkspaceStore.getState(),publication = store.globalGroups;
+                const ids = isContextMultiSelect ? [...selectedTabIds] : [contextMenu.tabId];
+                setContextMenu(null);
+                try {await store.mutateWorkflowGroup('assign',{version:1,mutationId:crypto.randomUUID(),expectedRevision:publication.revision,
+                  groupId:groupId || null,tabIds:ids,expectedTabGroups:Object.fromEntries(ids.map(id => [id,publication.tabGroups[id] || null]))});}
+                catch (error:any) {showToast(error?.message || 'Группа не сохранена','warning');}
+              }} />
           </>}
 
           {/* Separator */}

@@ -81,7 +81,10 @@ const STATUS_LABEL: Record<OrchestrationStatus, string> = {
 function statusColor(status: OrchestrationStatus): string {
   if (status === 'completed') return '#4ade80';
   if (status === 'failed') return '#f87171';
-  if (status === 'waiting_recovery' || status === 'queued' || status === 'sent') return '#fbbf24';
+  if (status === 'waiting_recovery') return '#fbbf24';
+  if (status === 'queued') return '#a1a1aa';
+  if (status === 'sent') return '#4ade80';
+  if (status === 'sending') return '#60a5fa';
   if (status === 'cancelled') return '#737373';
   return '#a78bfa';
 }
@@ -149,7 +152,8 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
       spinning: false,
     };
   }
-  if (run.status === 'sent' && run.deliveryAuditPendingAt && !run.targetPromptProofAt) {
+  if (run.status === 'sent' && !run.targetPromptProofAt
+    && (run.deliveryAuditPendingAt || run.requiresTargetPromptProof === true)) {
     return {
       color: '#fbbf24',
       icon: 'waiting',
@@ -160,7 +164,7 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   if (hasSourceNotificationError(run, tabId)) {
     const unconfirmed = run.notificationStatus === 'unconfirmed';
     return {
-      color: unconfirmed ? '#fbbf24' : '#f87171',
+      color: unconfirmed || run.notificationStatus === 'waiting-for-input' ? '#fbbf24' : '#f87171',
       icon: 'error',
       label: unconfirmed
         ? 'Доставка не подтверждена'
@@ -181,7 +185,7 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   }
   if (hasPendingSourceHandoff(run, tabId)) {
     return {
-      color: '#a78bfa',
+      color: run.notificationStatus === 'sent' ? '#4ade80' : run.notificationStatus === 'sending' ? '#60a5fa' : '#a1a1aa',
       icon: 'loading',
       label: run.notificationCancelRequestedAt ? 'Отмена передачи' : 'Передача результата',
       spinning: true,
@@ -190,11 +194,13 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   if (run.status === 'completed') return { color: '#4ade80', icon: 'success', label: 'Готово', spinning: false };
   if (run.status === 'cancelled') return { color: '#737373', icon: 'cancelled', label: 'Закрыто', spinning: false };
   if (run.status === 'sending') {
-    return { color: '#fbbf24', icon: 'waiting', label: 'Ожидает доставки', spinning: false };
+    return { color: '#60a5fa', icon: 'waiting', label: 'Ожидает доставки', spinning: false };
   }
   if (run.status === 'queued' || run.status === 'sent') {
     return {
-      color: '#fbbf24',
+      color: run.status === 'queued'
+        ? (run.deliveryTransportUnknownAt || run.externalResearchTransportError || run.externalResearchDeliveryUnknown ? '#fbbf24' : '#a1a1aa')
+        : '#4ade80',
       icon: 'waiting',
       label: run.status === 'queued' && run.deliveryDeferredReason === 'target-not-idle:busy'
         ? 'Ждёт занятую вкладку'
@@ -230,11 +236,18 @@ function StatusIcon({ presentation }: { presentation: RunPresentation }) {
     );
   } else {
     icon = (
-      <LoaderCircle
+      <span
         className={presentation.spinning ? 'animate-spin' : ''}
-        size={14}
-        strokeWidth={2.2}
-      />
+        style={{
+          display: 'block', width: 14, height: 14, flexShrink: 0,
+          // SVG transform animation rebuilds the retained document's
+          // compositor layers in Chromium 120. Rotate the same glyph on an
+          // HTML layer; the existing hidden-owner gate pauses this host.
+          willChange: presentation.spinning ? 'transform' : undefined,
+        }}
+      >
+        <LoaderCircle size={14} strokeWidth={2.2} style={{ display: 'block' }} />
+      </span>
     );
   }
   return (

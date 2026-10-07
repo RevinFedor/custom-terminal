@@ -56,15 +56,17 @@ Markdown baselines. Независимые AI-child в такой набор н�
 ошибка сохранения больше не стирает родство в ещё живом исходном Map.
 
 Single Close/Unlink всегда передаёт intentional cleanup и захваченные IDs;
-обычная metadata omission остаётся недеструктивной. Иначе одиночный native file
+native omission при обычном metadata save остаётся недеструктивной. Иначе одиночный native file
 или последний v1 в mixed namespace возвращался в каталог после положительного ACK.
 Групповой Close фиксирует typed families. Следующие families могут принять только
 точный revision receipt своего предыдущего SQL шага; full retained snapshot
 не считается чужой правкой, а foreign revision/reparent/type/SID по-прежнему отказ.
-Для v1 сохраняется также exact own переход SQL PK: legacy snapshot пересоздаёт
-survivor без изменения opaque tabId, поэтому неизменный frozen PK блокировал
-вторую file family. Только receipt того же intent/transaction объясняет old→new
-PK; чужая замена с тем же именем/ID/подписью не становится разрешённым close.
+Первоначально legacy snapshot пересоздавал survivor без изменения opaque tabId,
+поэтому frozen PK блокировал вторую file family. Для уже записанных close intents
+сохраняется exact own old→new PK receipt той же transaction. Обычный v1 save теперь
+обновляет существующую строку: metadata edit во время drag также не должен
+изображать подмену identity. Прежние metadata preservation и cleanup predicates
+сохранены; чужая замена с тем же именем/ID/подписью не становится разрешённым close.
 
 ### Восстановление в tab-группу
 Если вкладка закрывалась внутри group-row, `archiveTab` сохраняет её `group_id`. При Shift+Cmd+T и restore из Home это поле применяется только после проверки, что группа с таким id всё ещё существует в текущем `workspace.tabGroups`.
@@ -96,6 +98,12 @@ PK; чужая замена с тем же именем/ID/подписью не
 main признал, что не знает состояние процесса.
 
 Lease не даёт Home и хоткею одновременно восстановить одну строку, а очередь Shift+Cmd+T по окну (без pane — по проекту) превращает быстрые повторные нажатия в последовательный проход назад по истории. Если предыдущая queued-операция не consumed row из-за cancel/create/save/cleanup failure, следующий уже поставленный keypress останавливается: иначе он немедленно создал бы второй live-tab из той же latest-row. Lease ограничена по времени: renderer reload/crash без `finish` не делает строку навсегда занятой. Это исправляет старую ошибочную модель, где начало операции принималось за её успех и запись удалялась до `createTab`.
+
+Успешный finish сохраняет receipt source archive→materialized runtime до ответа
+renderer. Legacy restore вправе создать новый ID ради защиты от late exit старого
+PTY; native v2 оставляет ID, но меняет revision. MCP delegation читает этот
+durable proof и текущего owner, а не требует буквального совпадения двух разных
+адресов. Статус «restore failed» сам по себе не доказывает, что вкладка не создана.
 
 ### Layout-agnostic hotkey через `event.code`
 App-level capture listener: `e.metaKey && e.shiftKey && e.code === 'KeyT'` (см. `methodology/дизайн-принципы.md::Layout-agnostic shortcuts`). На QWERTY/Cyrillic/Dvorak — одна и та же физическая клавиша T. `e.preventDefault + stopPropagation + stopImmediatePropagation` глушит событие до того, как его подхватит xterm `attachCustomKeyEventHandler` или composer textarea в SDK-табах. Double-safety guard в обоих `attachCustomKeyEventHandler` в `Terminal.tsx` — на случай, если capture-flow пропустит событие, xterm всё равно вернёт `false` и литерал `T` не попадёт в Claude TUI.

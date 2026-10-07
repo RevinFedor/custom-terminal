@@ -4,10 +4,12 @@ import { createHorizontalRowDragPreview } from './horizontalRowDragPreview';
 import { historyForegroundPriority } from './historyForegroundPriority.mjs';
 import { beginPaneTabDrag, endPaneTabDrag, getPaneTabDragSnapshot,
   paneTabDropTargetContainsPoint, resolvePaneTabDropTarget, setPaneTabDragTarget,
+  claimPaneTabDragDrop,
   type PaneTabDragSource } from './paneTabDragBridge';
 import { cancelPaneTabPointer, finishPaneTabPointer, updatePaneTabPointer } from './paneTabPointerBridge';
 import { commitPaintedPaneTabDrop } from './paneTabDropCommit';
 import { clearTabDragNavigationTarget, setTabDragNavigationTarget } from './tabDragNavigationBridge';
+import { captureWorkflowDrag,workflowDragRequest,workflowDragSourceValid } from './workflowDragModel.mjs';
 
 type Point = { clientX: number; clientY: number; metaKey: boolean; pointerId: number };
 type Gesture = {
@@ -42,13 +44,21 @@ function finish(cancelled: boolean, reason: string) {
   const target = getPaneTabDragSnapshot().target;
   const inside = !cancelled && target && paneTabDropTargetContainsPoint(target, drag.point.clientX, drag.point.clientY);
   try {
-    const result = inside ? commitPaintedPaneTabDrop(drag.source.rootTabId) : null;
+    const adopted = !cancelled && finishPaneTabPointer(drag.point);
+    let result:any=null;
+    if(inside && !adopted) {
+      if(drag.source.workflowDrag) {
+        const claimed=claimPaneTabDragDrop(drag.source.rootTabId);
+        const request=claimed && workflowDragRequest(drag.source.workflowDrag,{workflowId:target.spaceId || useWorkspaceStore.getState().activeSpaceId,target});
+        if(request)void useWorkspaceStore.getState().commitWorkflowDrag(request).then(accepted=>
+          console.log('[PaneTabDnd:durable-release] gesture='+drag.source.gestureId+' committed='+Number(accepted)));
+      } else result=commitPaintedPaneTabDrop(drag.source.rootTabId);
+    }
     if (cancelled) cancelPaneTabPointer();
-    else finishPaneTabPointer();
     console.log('[PaneTabDnd:pointer-release] reason=' + reason + ' source=' + drag.source.rootTabId.slice(-12)
       + ' committed=' + Number(result?.committed || false) + ' at=' + (result?.target?.at ?? '-'));
   } finally {
-    endPaneTabDrag(drag.source.rootTabId);
+    endPaneTabDrag(drag.source.rootTabId,drag.source.gestureId);
     clearTabDragNavigationTarget('pane');
     drag.preview.remove();
     drag.releaseCursor();
@@ -63,13 +73,18 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
   cancelPaneTabPointerDrag('replaced');
   installClickGuard();
   const owner = `pane-pointer-drag:${source.rootTabId}`;
+  const gestureId=crypto.randomUUID(),state=useWorkspaceStore.getState();
+  const workflowDrag=state.organizationReady ? captureWorkflowDrag(state,{gestureId,origin:'pane',
+    sourceId:`reserve-tab:${source.rootTabId}`,entries:source.entries,sourcePaneKey:source.sourcePaneKey}) : null;
+  if(state.organizationReady && !workflowDrag)return;
   const drag: Gesture = {
-    source: { ...source, input: 'pointer', pointerId: point.pointerId }, point, frame: 0, owner,
+    source: { ...source, input: 'pointer', pointerId: point.pointerId,gestureId,workflowDrag }, point, frame: 0, owner,
     preview: createHorizontalRowDragPreview(sourceElement),
     releaseCursor: acquireInteractionCursor('grabbing', { target: sourceElement, pointerId: point.pointerId }),
     cleanup: () => {},
   };
   gesture = drag;
+  let metaHeld=point.metaKey;
   drag.preview.element.dataset.paneTabPointerDragPreview = '1';
   // Navigation progress remains visible above the centred floating chip.
   drag.preview.element.style.zIndex = '99999';
@@ -106,7 +121,7 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
     if (event.pointerId !== drag.point.pointerId) return;
     if (!(event.buttons & 1)) { finish(true, 'buttons-zero'); return; }
     event.preventDefault();
-    drag.point = { clientX: event.clientX, clientY: event.clientY, metaKey: event.metaKey, pointerId: event.pointerId };
+    drag.point = { clientX: event.clientX, clientY: event.clientY, metaKey: event.metaKey || metaHeld, pointerId: event.pointerId };
     updatePaneTabPointer(drag.source, drag.point);
     schedule();
   };
@@ -119,7 +134,8 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
   const key = (event: KeyboardEvent) => {
     if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); finish(true, 'escape'); return; }
     if (event.key !== 'Meta') return;
-    drag.point = { ...drag.point, metaKey: event.type === 'keydown' };
+    metaHeld=event.type==='keydown';
+    drag.point = { ...drag.point, metaKey: metaHeld };
     updatePaneTabPointer(drag.source, drag.point);
     schedule();
   };
@@ -129,6 +145,7 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
   // A projected sidebar row may take capture, and a reflow may replace the
   // original chip. Neither ends this renderer-wide physical gesture.
   const unsubscribe = useWorkspaceStore.subscribe(state => {
+    if(drag.source.workflowDrag && !workflowDragSourceValid(drag.source.workflowDrag,state)) {finish(true,'source-admission-changed');return;}
     if (!state.openProjects.get(drag.source.entries[0].projectId)?.tabs.has(drag.source.rootTabId)) finish(true, 'source-removed');
   });
   window.addEventListener('pointermove', move, { capture: true, passive: false });

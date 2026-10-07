@@ -15,6 +15,7 @@ const code = ts.transpileModule(node.getText(ast).replace(/^export /, ''), {
 }).outputText;
 const Header = vm.runInNewContext(code + '\nHistoryPromptSource', { React, ArrowDownLeft, ArrowUpRight,
   useState: React.useState,
+  useRef: React.useRef,
   TabMessageSourceChip: ({ source }) => React.createElement('button', { 'data-source-id': source.sourceTabId }, source.sourceTabName) });
 
 test('actual source header uses the request/response arrows, one sender name and no phase caption', () => {
@@ -49,4 +50,11 @@ test('unknown relationship does not invent an arrow; browser source retains its 
   const html = renderToStaticMarkup(React.createElement(Header, { source: { label: 'ChatGPT - Astra' }, phase: 'unknown' }));
   assert.match(html, /ChatGPT - Astra/);
   assert.doesNotMatch(html, /data-history-source-direction|data-source-id/);
+});
+
+test('external research completion has a job-navigation button, not a guessed terminal source or browser URL', () => {
+  const html=renderToStaticMarkup(React.createElement(Header,{source:{label:'ChatGPT · 6-astra',researchRunId:'exact-run'},phase:'completion'}));
+  assert.match(html,/<button[^>]+data-external-research-source="exact-run"/);
+  assert.match(html,/Открыть задачу в SC Desktop/);assert.match(html,/ChatGPT · 6-astra/);
+  assert.doesNotMatch(html,/data-source-id|href=|chatgpt\.com/);
 });

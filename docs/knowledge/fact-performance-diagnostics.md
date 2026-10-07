@@ -310,6 +310,40 @@ trace одно время завершения чтения такой доли 
 
 ### Когда JavaScript-профиль почти пуст, а интерфейс занят
 
+07.10 продолжение11:45 отделило frame cadence от дорогой layer construction.
+Actual perfFreezeProbe вызывает rAF постоянно: даже дешёвый control может иметь
+108–110PrePaint/lifecycle за1.8s. Поэтому считать нужно и стоимость `Layerize`,
+не только количество Paint/PrePaint. Пустой rAF и actual idle/busy-strip окна
+сами по себе не воспроизвели тяжёлый compositor; диагностика не отключалась.
+
+Actual OrchestrationStatusChip::StatusIcon вращал LoaderCircle SVG напрямую.
+В current Chromium120 SVG will-change/transform-box не устранили full Layerize.
+На одном frozen actual TerminalArea/History дереве30owners/75.7kDOM/798layers:
+oldSVG899.9ms, pausedcontrol0.63ms, productHTMLhost0.45ms, oldreturn886.4ms,
+productreturn0.43ms за1.8s. Frame count остаётся≈109; данные/дерево не прячутся.
+SOURCE вращает HTML14×14 с тем жеSVG/периодом/палитрой и прежним hidden gate;
+8состояний×6фаз×3zoom дают144slot comparisons, exact0pixel delta/geometry.
+Owner/draft/reading row/scroll сохранены, History reads30→30. Trusted input
+pair сохранил текст; median56ms в обеих arms, поэтому ускорение каждого ввода
+не заявляется. Повтор: `renderer-compositor-attribution.mjs` и
+`orchestration-spinner-regression.mjs`; full source/evidence — рабочая карта11:45.
+Прямое SVG вращение есть и вf9b45cc, и в6af5e44: весь commit diff не доказывает
+exclusive workflow causality. Production sample173/265 вcompositor не содержит
+точного JS/DOM initiator; ремонт установленного эпизода проверяется отдельно.
+
+07.10 проверка lag754 обнаружила отдельный пробел hidden gate: у retained
+sidebar и внешнего Workspace/Home уже были свои presentation attributes,
+но stylesheet учитывал только pane/History. Поэтому локально видимый потомок
+продолжал анимироваться под opacity0 родителя. Installed CSS не содержал этих
+двух selectors; прежняя UI inventory00:20 показывала три hidden sidebar shimmer
+running, при paused History. Это не точный DOM-снимок инцидента09:57.
+В gate добавлены точные sidebar/Home owners, без inherited visibility, обхода
+обычных DOM-узлов или изменения данных. Actual boundary+indicator private pair
+52kDOM: hidden running36→0, lifecycle49→20/1.8s; Home72→0 и40→0. Same owner,
+draft, scroll, visible unfocused feedback и finite dismiss сохранены. Повтор —
+`scripts/retained-feedback-boundaries-regression.mjs`. Это закрывает утечку
+feedback; не объясняет отдельно Main CPU stalls и весь production compositor.
+
 05.10 после пользовательского install Main worker выполнял повторные большие
 History/Timeline rebuilds после `disk-quota`; native renderer оставался занят
 и после спада Main. Sample14:42:11UTC, Electron28.3.3arm64: exact UUID Breakpad

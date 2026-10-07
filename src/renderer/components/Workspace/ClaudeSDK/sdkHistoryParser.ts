@@ -2,6 +2,9 @@
 // Used by ClaudeSDKTab.loadHistory (main thread) AND TaskDetailPane (subagent
 // mini-thread). Single source of truth keeps shape changes (block types, role
 // classification) in one place.
+import recordTimes from '../../../../shared/history-record-time.cjs';
+
+export type HistoryRecordTime = { version: 1; timestamp: string; kind: 'message' | 'tool-call'; scope: 'record' | 'container' };
 
 export type ToolCallPart = {
   type: 'tool';
@@ -10,10 +13,11 @@ export type ToolCallPart = {
   args: Record<string, any>;
   result?: any;
   status: 'running' | 'done' | 'error';
+  recordTime?: HistoryRecordTime;
 };
 export type AssistantPart =
-  | { type: 'text'; text: string }
-  | { type: 'thinking'; text: string }
+  | { type: 'text'; text: string; recordTime?: HistoryRecordTime }
+  | { type: 'thinking'; text: string; recordTime?: HistoryRecordTime }
   | ToolCallPart;
 
 export interface SDKChatMessage {
@@ -21,9 +25,10 @@ export interface SDKChatMessage {
   role: 'user' | 'assistant' | 'system' | 'compact-summary';
   parts?: AssistantPart[];
   text: string;
-  toolCalls: Array<{ id: string; name: string; args: Record<string, any>; result?: any; status: 'running' | 'done' | 'error' }>;
+  toolCalls: Array<{ id: string; name: string; args: Record<string, any>; result?: any; status: 'running' | 'done' | 'error'; recordTime?: HistoryRecordTime }>;
   thinking: string | null;
   timestamp: number;
+  recordTime?: HistoryRecordTime;
   compactMetrics?: { preTokens: number; postTokens: number; durationMs: number; trigger?: string };
 }
 
@@ -45,7 +50,7 @@ export function assembleMessageFields(parts: AssistantPart[]): { text: string; t
   for (const p of parts) {
     if (p.type === 'text') textPieces.push(p.text);
     else if (p.type === 'thinking') thinkingPieces.push(p.text);
-    else if (p.type === 'tool') toolCalls.push({ id: p.id, name: p.name, args: p.args, result: p.result, status: p.status });
+    else if (p.type === 'tool') toolCalls.push({ id: p.id, name: p.name, args: p.args, result: p.result, status: p.status, recordTime: p.recordTime });
   }
   return {
     text: textPieces.join('\n'),
@@ -84,9 +89,9 @@ export function parseSubagentMessages(rawMessages: any[]): SDKChatMessage[] {
       for (const b of contentArr) {
         if (!b) continue;
         if (b.type === 'text' && typeof b.text === 'string') {
-          parts.push({ type: 'text', text: b.text });
+          parts.push({ type: 'text', text: b.text, recordTime: recordTimes.historyRecordTimeFromRecord(m) });
         } else if (b.type === 'thinking' && typeof b.thinking === 'string') {
-          parts.push({ type: 'thinking', text: b.thinking });
+          parts.push({ type: 'thinking', text: b.thinking, recordTime: recordTimes.historyRecordTimeFromRecord(m) });
         } else if (b.type === 'tool_use') {
           const tid = b.id || 'tool-' + i;
           const tr = toolResults.get(tid);
@@ -94,6 +99,7 @@ export function parseSubagentMessages(rawMessages: any[]): SDKChatMessage[] {
             type: 'tool',
             id: tid,
             name: b.name || 'unknown',
+            recordTime: recordTimes.historyRecordTimeFromRecord(m, 'tool-call'),
             args: typeof b.input === 'object' ? b.input : {},
             result: tr ? tr.result : undefined,
             status: tr ? (tr.isError ? 'error' : 'done') : 'done',
@@ -101,7 +107,7 @@ export function parseSubagentMessages(rawMessages: any[]): SDKChatMessage[] {
         }
       }
     } else if (typeof m.message?.content === 'string') {
-      parts.push({ type: 'text', text: m.message.content });
+      parts.push({ type: 'text', text: m.message.content, recordTime: recordTimes.historyRecordTimeFromRecord(m) });
     }
 
     const derived = assembleMessageFields(parts);
@@ -126,6 +132,7 @@ export function parseSubagentMessages(rawMessages: any[]): SDKChatMessage[] {
       toolCalls: role === 'assistant' ? derived.toolCalls : [],
       thinking: role === 'assistant' ? derived.thinking : null,
       timestamp: Date.now() - (rawMessages.length - i) * 100,
+      recordTime: recordTimes.historyRecordTimeFromRecord(m),
     };
     if (role === 'assistant') out.parts = parts;
     return out;
@@ -143,6 +150,7 @@ export function parseSubagentMessages(rawMessages: any[]): SDKChatMessage[] {
       const combined = [...(prev.parts || []), ...(m.parts || [])];
       const d = assembleMessageFields(combined);
       prev.parts = combined;
+      delete prev.recordTime;
       prev.text = d.text;
       prev.thinking = d.thinking;
       prev.toolCalls = d.toolCalls;

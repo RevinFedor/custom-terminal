@@ -185,4 +185,6 @@ test('completion sender is executor, tab reply sender is explicit source, extern
   assert.deepEqual(resolveHistoryPromptSender({ phase: 'completion', ...fields }), { sourceTabId: 'executor', sourceTabName: 'Executor', sourceProjectId: 'pb' });
   assert.deepEqual(resolveHistoryPromptSender({ phase: 'completion', ...fields, targetTabId: null, runKind: 'external-research', targetTabName: 'ChatGPT' }), { label: 'ChatGPT' });
   assert.equal(resolveHistoryPromptSender({ phase: 'completion', sourceTabId: 'requester' }), null);
+  assert.deepEqual(resolveHistoryPromptSender({ phase:'completion',runKind:'external-research',runId:'exact-run',targetTabName:'ChatGPT' }),
+    {label:'ChatGPT',researchRunId:'exact-run'});
 });

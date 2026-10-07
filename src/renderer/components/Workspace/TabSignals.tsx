@@ -30,6 +30,7 @@ import { Archive, ArchiveX, Bell, RefreshCw } from 'lucide-react';
 import { WORK_CONTEXT_COLOR } from '../../utils/tabWorkContext';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import {useWorkspaceOverlayTarget} from '../../hooks/useWorkspaceOverlayTarget';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { contextUsageColor, contextUsageDisplayValue } from '../../utils/contextUsageMeter.mjs';
 import { isStaleAgainstPending } from '../../utils/pendingResume';
@@ -337,6 +338,14 @@ export function TabStatusMarkerButton({
   const shape = useUIStore((s) => s.statusMarker.shape);
   const settingsSize = useUIStore((s) => s.statusMarker.sizePx);
   const statuses = useUIStore((s) => s.sessionStatuses);
+  const overlayTarget = useWorkspaceOverlayTarget();
+  const ownStatusId = useWorkspaceStore(s=>s.openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus || '');
+  const groupStatusId = useWorkspaceStore(s=>{
+    const groupId=s.globalGroups?.tabGroups?.[tabId];
+    return groupId?s.globalGroups.groups.find((group:any)=>group.id===groupId)?.sessionStatus || '':'';
+  });
+  const effectiveStatusId = ownStatusId || groupStatusId;
+  const inheritedStatus = statuses.find(status=>status.id===groupStatusId);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [markerHovered, setMarkerHovered] = useState(false);
   const markerRef = useRef<HTMLSpanElement | null>(null);
@@ -362,8 +371,6 @@ export function TabStatusMarkerButton({
   }, [menu]);
   if (!color) return null;
   const size = sizePx ?? settingsSize;
-  const currentId = useWorkspaceStore.getState()
-    .openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus;
   return (
     <>
       <span
@@ -388,7 +395,7 @@ export function TabStatusMarkerButton({
         style={{
           position: 'absolute',
           left: `${left}px`,
-          top: `calc(50% + ${topOffsetPx}px)`,
+          top: `calc(var(--tab-title-center, 50%) + ${topOffsetPx}px)`,
           transform: `translateY(-50%) scale(${markerHovered ? TAB_MARKER_HOVER_SCALE : 1})`,
           transformOrigin: 'center',
           transition: 'transform 90ms ease, filter 90ms ease',
@@ -423,8 +430,13 @@ export function TabStatusMarkerButton({
             boxShadow: '0 14px 34px rgba(0,0,0,0.6)',
           }}
         >
+          {inheritedStatus && <button type="button" data-tab-status-inherit
+            onClick={event=>{event.stopPropagation();useWorkspaceStore.getState().setTabSessionStatus(projectId,tabId,null);setMenu(null);}}
+            style={{width:'100%',padding:'6px 7px',border:0,borderBottom:'1px solid #333',background:'transparent',color:'#aaa',textAlign:'left',fontSize:11}}>
+            Как у группы: {inheritedStatus.label}{!ownStatusId?' ✓':''}
+          </button>}
           {statuses.map((s) => {
-            const selected = currentId === s.id;
+            const selected = effectiveStatusId === s.id;
             return (
               <button
                 key={s.id}
@@ -433,7 +445,7 @@ export function TabStatusMarkerButton({
                   e.stopPropagation();
                   // Повторный клик на активный статус снимает его — как в
                   // контекстном меню вкладки (один жест, один смысл).
-                  useWorkspaceStore.getState()
+                  if(!selected || ownStatusId)useWorkspaceStore.getState()
                     .setTabSessionStatus(projectId, tabId, selected ? null : s.id);
                   setMenu(null);
                 }}
@@ -457,7 +469,7 @@ export function TabStatusMarkerButton({
             );
           })}
         </div>,
-        document.body,
+        overlayTarget,
       )}
     </>
   );
@@ -1002,7 +1014,7 @@ export function TabStatusMarker({
       style={{
         position: 'absolute',
         left: `${left}px`,
-        top: `calc(50% + ${topOffsetPx}px)`,
+        top: `calc(var(--tab-title-center, 50%) + ${topOffsetPx}px)`,
         transform: 'translateY(-50%)',
         width: `${size}px`,
         height: `${size}px`,
