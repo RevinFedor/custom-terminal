@@ -7,6 +7,17 @@ import {
   projectAgentLocalCommandSendResult,
 } from './agentLocalCommand.mjs';
 
+test('History can restore a never-entered retained control without lying about its physical paste', () => {
+  const result = { localSlashCommand: true, submitted: false, slashInserted: true, pasteWritten: true, enterWritten: false,
+    slashRollback: { serviceInputPending: true } };
+  assert.equal(projectAgentLocalCommandSendResult({ candidate: true, result }).restoreDraftSafe, true);
+  assert.equal(result.pasteWritten, true);
+  for (const changed of [{ ...result, localSlashCommand: false }, { ...result, enterWritten: undefined },
+    { ...result, submitted: true }, { ...result, slashRollback: {} }]) {
+    assert.notEqual(projectAgentLocalCommandSendResult({ candidate: true, result: changed }).restoreDraftSafe, true);
+  }
+});
+
 test('local command requires one unstructured line', () => {
   assert.equal(normalizeAgentLocalCommand('  /status  '), '/status');
   assert.equal(normalizeAgentLocalCommand('/compact now'), '/compact now');

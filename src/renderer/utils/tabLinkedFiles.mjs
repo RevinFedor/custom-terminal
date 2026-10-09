@@ -16,8 +16,57 @@ export function collectTabLinkedFiles(openProjects, ownerTabId) {
   return files;
 }
 
-export function tabLinkedFilesSnapshot(openProjects, ownerTabId) {
-  return JSON.stringify(collectTabLinkedFiles(openProjects, ownerTabId));
+// The menu follows only file edges. An independent AI child is a different
+// owner, even if that child also has files. reserveOrder is the saved common
+// ordering authority; Map insertion order is only the pre-order fallback.
+export function collectTabLinkedFileTree(openProjects, ownerTabId, orderedIds = []) {
+  const rank = new Map(orderedIds.map((id, index) => [id, index]));
+  const byParent = new Map();
+  for(const [projectId,workspace] of openProjects || []) for(const file of workspace.tabs?.values() || []) {
+    if(file.tabType!=='file' || !file.filePath || !file.visualParentTabId
+      || file.archived || file.isArchived || file.archivedAt || file.deleted)continue;
+    const children=byParent.get(file.visualParentTabId) || [];
+    children.push({projectId,id:file.id,ownerTabId,path:file.filePath,
+      name:file.filePath.split(/[\\/]/).pop() || file.name || file.filePath});
+    byParent.set(file.visualParentTabId,children);
+  }
+  const result = [], visited = new Set([ownerTabId]);
+  const visit = (parentId, depth) => {
+    const children = (byParent.get(parentId) || [])
+      .sort((a,b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity));
+    for (const file of children) {
+      if (visited.has(file.id)) continue;
+      visited.add(file.id);
+      result.push({...file, ownerTabId, parentTabId:parentId, depth});
+      visit(file.id, depth + 1);
+    }
+  };
+  if (ownerTabId) visit(ownerTabId, 0);
+  return result;
+}
+
+export function linkedFileOwner(openProjects, fileId) {
+  const catalog = new Map();
+  for (const [projectId, workspace] of openProjects || [])
+    for (const tab of workspace.tabs?.values() || []) catalog.set(tab.id, {projectId, tab});
+  let entry = catalog.get(fileId);
+  const seen = new Set();
+  while (entry?.tab.tabType === 'file') {
+    if (seen.has(entry.tab.id)) return null;
+    seen.add(entry.tab.id);
+    entry = catalog.get(entry.tab.visualParentTabId);
+  }
+  return entry && !entry.tab.archived && !entry.tab.isArchived && !entry.tab.archivedAt && !entry.tab.deleted
+    ? {projectId:entry.projectId, tabId:entry.tab.id} : null;
+}
+
+export function tabLinkedFilesSnapshot(openProjects, ownerTabId, orderedIds = []) {
+  return JSON.stringify(collectTabLinkedFileTree(openProjects, ownerTabId, orderedIds));
+}
+
+export function preferredLinkedFile(files, preview, ownerTabId, lastFileId) {
+  return files.find(file => isLinkedFilePreview(preview, ownerTabId, file.id, file.projectId))
+    || files.find(file => file.id === lastFileId) || files[0];
 }
 
 export function isLinkedFilePreview(preview, ownerTabId, fileId, projectId) {

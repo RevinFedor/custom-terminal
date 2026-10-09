@@ -7,19 +7,17 @@
 - `highlight.js` для подсветки кода в других файлах
 - Разные стили, разный UX, нет единообразия
 
-**Решение:** Всё заменено на `@anthropic/markdown-editor` в режиме `readOnly`.
+**Решение:** Всё заменено на общий `@gt-editor/markdown-editor` в режиме `readOnly`
+(прежнее имя локального пакета — `@anthropic/markdown-editor`).
 
 ## Критическая информация (что нельзя вывести из кода)
 
-### 1. Источник пакета `@anthropic/markdown-editor`
-
-```json
-"@anthropic/markdown-editor": "file:../gt-editor/packages/markdown-editor"
-```
+### 1. Источник пакета `@gt-editor/markdown-editor`
 
 **ВАЖНО:** Это **НЕ** публичный npm-пакет. Это локальный проект на рабочем столе:
 - Путь: `/Users/fedor/Desktop/gt-editor/packages/markdown-editor/`
-- Перед сборкой Noted Terminal нужно собрать gt-editor: `npm run build:editor` (см. package.json)
+- При изменении пакета перед сборкой Noted Terminal нужен `npm run build:markdown`:
+  он собирает GT package и синхронизирует dist в локальную копию consumer.
 - Если удалить папку `gt-editor` с десктопа — приложение сломается
 - При деплое нужно либо копировать gt-editor, либо опубликовать пакет в приватный registry
 
@@ -62,17 +60,15 @@ clipboard.writeText(filePreview.content);
 
 См. также: `docs/knowledge/fact-input-events.md` (раздел про Clipboard).
 
-### 5. Shared font-size (header stepper ↔ Settings)
+### 5. Шапка и общий размер шрифта
 
-`fontSize` берётся из `useUIStore.filePreviewFontSize`, который имеет два независимых UI-контрола:
-1. Inline stepper `[−] 13px [+]` в header'е FilePreview (рядом с Copy All / ×).
-2. Контрол «Превью файла» в Settings → Шрифты.
-
-Оба меняют **одно поле** в UIStore + один ключ `localStorage('noted-terminal-file-preview-font-size')`. Изменение в любом месте мгновенно отражается во втором — реактивно через Zustand-селектор.
-
-**Почему shared, а не два разных поля:** при двух полях получили бы рассинхрон между разными окнами/табами или между inline-stepper'ом и модалкой. Inline-stepper нужен для быстрого «ткнул и читаешь дальше», модалка — для редкой централизованной настройки; обе семантики управляют одним и тем же визуалом, поэтому одно поле.
-
-**Диапазон 10..24px** — задан и в `setFilePreviewFontSize` (clamp при записи), и в кнопках UI (`disabled` на границах). Одно место границ было бы лучше, но clamp в setter защищает от неконсистентного состояния если кто-то запишет в localStorage ручную нужное значение.
+По решению08.10 шапка оставляет имя файла, иконки GT Editor/Sublime, Copy All
+и закрытие. Полный путь остаётся в title, inline font stepper убран: длинный
+путь и вспомогательные настройки не должны вытеснять читаемое имя.
+`fontSize` по-прежнему берётся из `useUIStore.filePreviewFontSize`; контрол
+«Превью файла» находится в Settings → Размеры. Единое значение10..24px и прежняя
+память размеров сохраняются. Его изменение переконфигурирует тему живого
+EditorView, сохраняя selection/undo и scroller, к которому подписан host.
 
 ### 6. FoldStateKey — персистентное состояние фолдинга
 
@@ -88,11 +84,22 @@ foldStateKey={`file-preview:${filePreview.path}`}
 
 Позиция прокрутки хранится **по абсолютному пути файла**, а не по вкладке. Причина продуктовая: sidebar открывает preview вообще без вкладки, и пользователь ожидает вернуться туда, где читал, независимо от того, открыт файл из tab bar или из дерева. Ключ `noted-terminal-file-preview-scroll` зеркалится в SQLite общим localStorage-mirror'ом. Карта ограничена по размеру с вытеснением давно не открывавшихся: она растёт с каждым просмотренным файлом и сохраняется целиком. Позиция «в начале файла» хранится как отсутствие записи, а не как нулевое значение — иначе слот занят навсегда.
 
-**Ловушка нереализованных свойств редактора.** `MarkdownEditor` объявляет в `.d.ts` и `onEditorView`, и `initialScrollTop`, но поставленный build **не вызывает первый и игнорирует второй** — свойство деструктурируется из props и нигде не используется. TypeScript это не ловит. Поэтому scroll-контейнер (`.cm-scroller`) ищется в DOM внутри ref'нутого host-div'а, с повторами, пока редактор монтируется асинхронно. Не «восстанавливай» это на `onEditorView` при рефакторинге — сначала проверь, что версия пакета его реально дёргает.
+**Историческая ловушка версии пакета.** Старый build объявлял `onEditorView`/
+`initialScrollTop` без действующей реализации; поэтому host использует DOM-поиск
+scroller. На проверенном08.10 source и пересобранном dist callback действительно
+вызывается при create/destroy; исходник также применяет initialScrollTop.
+Прежнее безусловное утверждение об игнорировании props больше не актуально.
+Host lifecycle в этом ремонте не переписывался: при будущем переходе на callback
+нужно отдельно сохранить path/view ownership и отмену старого restore.
 
 **Восстановление повторяется, пока документ растёт.** CodeMirror рендерит длинный файл лениво, поэтому первое присвоение упирается в текущую (неполную) высоту, и позиция сползает вверх при каждом открытии. Восстановление повторяется несколькими проходами и закрывается по фиксированному сроку — недостижимая позиция (файл стал короче) осядет у нижней границы, а окно восстановления не останется открытым навсегда. Пока идёт восстановление, события прокрутки игнорируются как эхо собственной записи: без этого промежуточное неполное значение сохранялось поверх правильного и память деградировала при каждом открытии. Переносимый принцип — `methodology/дизайн-принципы.md::Восстановление позиции в лениво растущем контейнере`.
 
-**Статус:** восстановление позиции подтверждено живьём (после перезапуска preview открывался на 3538 и 3300). Запись новой позиции в durable-хранилище на момент написания **не доведена** — в хранилище остаётся ранее записанное значение. Не считать эту часть рабочей без повторной проверки.
+**Проверенная граница08.10:** Parent прогнал actual full app/Main/store/SQLite
+на пересобранном пакете в отдельном visible Electron: A→B→A, закрытие приложения,
+новый Main, повторное открытиеA и следующий wheel. ПозицииA3664/B900 сохранились,
+после restartA восстановилась3664 и новый wheel записал4764 вSQLite. Тем самым
+прежняя открытая граница записи новой позиции закрыта для private full app.
+Installed версия и полный пользовательский workspace этим не проверены.
 
 ### 6b. Файл из sidebar переживает переход между проектами
 
@@ -138,19 +145,54 @@ Fallback на LaunchServices нужен потому что у пользова�
 
 ## Build Process
 
-Custom-terminal зависит от `@gt-editor/markdown-editor` через npm `file:`-зависимость (локальный alias `@anthropic/markdown-editor`). При правке исходников пакета **трёх шагов** нужно сделать:
+В package.json consumer указан `@gt-editor/markdown-editor`; рабочий build-flow
+обновляет локальный GT dist явно. При правке исходников пакета нужны три шага:
 
 ```json
 "build:markdown": "cd ../gt-editor/packages/markdown-editor && npm run build && rsync -a --delete dist/ ../../../custom-terminal/node_modules/@gt-editor/markdown-editor/dist/ && rm -rf ../../../custom-terminal/node_modules/.vite"
 ```
 
 1. **Build** в gt-editor packages → обновляет `dist/index.cjs`.
-2. **Rsync** в `node_modules/@gt-editor/markdown-editor/dist/` — потому что npm `file:`-install скопировал dist при первом install, дальше копии живут независимо.
+2. **Rsync** в `node_modules/@gt-editor/markdown-editor/dist/` — копия consumer не обновляется от редактирования соседнего GT repo; исторический `file:`-install также оставлял независимую копию dist.
 3. **`rm -rf node_modules/.vite`** — Vite prebundle cache не инвалидируется при изменении `dist/` локально-разрабатываемого пакета. Без удаления кеша Vite на следующем `dev` start читает старый prebundle, и правки не подхватываются.
 
 После — обязателен перезапуск `npm run dev` (HMR **не** перебирает prebundle).
 
 См. `fix-vite-prebundle-cache.md` про root cause и попытки решить иначе.
+
+## Тяжёлое открытие и scroll длинного Markdown
+
+08.10 причинная проверка snapshot файла `окно-вкладок-и-переключатель-фичи.md`
+(6587строк,733176bytes,SHA256`cc433b7e…`) отделила общий редактор от host:
+baseline/candidate×standalone/actual FilePreview, одинаковые текст/шрифт/геометрия.
+В FilePreview first open2.41→0.18s, три wheel4.05→0.28s, B3.35→0.11s,
+возвратA12.43→0.14s. Чтение тем же handler≈4ms; на wheel native ThreadTime3524→54ms,
+layout≈7ms и paint≈1ms в обеих версиях. Это одиночный private offscreen прогон,
+не воспроизведение всего production renderer с retained workspace/живыми AI.
+Точный временной эпизод из речи пользователя с production-логом не сопоставлен.
+
+Источник — package `markdownSyntax`: document-wide `.some` на каждом символе
+multiline-прохода и полный повтор при viewportChanged. Новый индекс сохраняет
+overlap/полуоткрытые границы; успешный результат переиспользуется при scroll.
+Видимый DOM до/после совпал; полный текст, line numbers, wrapping, conceal и
+виртуализация сохранены. Три wheel не создают новый EditorView и не запускают
+syntax build. Диагностика медленного build — `[Perf:MarkdownSyntax]`.
+
+Отдельно устранён package-remount при смене fontSize/padding: прежний scroller
+уничтожался, а host с неизменным path продолжал слушать его. Reconfiguration
+сохраняет view, читаемый абзац и дальнейшую запись scroll. Header/read/scroll
+код Noted этим ремонтом не менялся. A→B→A/позиция0 новогоB, readOnly, fold,
+Copy All и обновление позиции проверены с изолированными stores/clipboard.
+Это само по себе не подтверждает durable SQLite после production restart.
+Последующая parent-проверка full app подтвердила SQLite/cold restart в private
+workspace (см.6a); обычная установленная версия остаётся отдельной границей.
+
+Source of truth ремонта/регрессий — GT Editor
+`docs/knowledge/fact-markdown-engine-intro.md`. `npm run build:markdown`
+обновил package dist и локальную копию Noted; Electron28/React19 и
+GT Electron34/React18 проверены отдельно. Installed app.asar остался прежним:
+для installed acceptance после разрешённой установки повторить исходный файл,
+два длинных файла, возврат к месту чтения и смену шрифта с последующим wheel.
 
 ## Связанные файлы
 

@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { clampTimelinePreviewResponseLines, loadTimelinePreviewResponseLines, TIMELINE_PREVIEW_RESPONSE_LINES_KEY } from '../utils/timelinePreviewSettings.mjs';
 import {
   DISPLAY_SIZE_KEYS, DISPLAY_SIZE_LIMITS, DISPLAY_PROFILES_STORAGE_KEY,
   applyDisplayContext, readDisplayProfileMemory, serializeDisplayProfileMemory,
@@ -470,6 +471,7 @@ interface UIStore {
   timelineSummaryFontSize: number; // Generated user-prompt summaries in expanded Timeline
   timelineWidth: number;       // Timeline width (px) when expanded (treeMode). Drag-resizable.
   timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
+  timelinePreviewResponseLines: number; // Answer lines in the Cmd-hover card; prompt remains one line.
   historyFontSize: number; // Primary History transcript font size (messages + tool blocks).
   historyComposerFontSize: number; // Primary History prompt textarea font size.
   aiSecondaryFontSize: number; // Secondary AI labels, statuses and composer chips.
@@ -504,6 +506,7 @@ interface UIStore {
   setTimelineSummaryFontSize: (size: number) => void;
   setTimelineWidth: (width: number) => void;
   setTimelineLineClamp: (lines: number) => void;
+  setTimelinePreviewResponseLines: (lines: number) => void;
   setHistoryFontSize: (size: number) => void;
   setHistoryComposerFontSize: (size: number) => void;
   setAiSecondaryFontSize: (size: number) => void;
@@ -577,6 +580,7 @@ interface UIStore {
 
   filePreview: FilePreview | null;
   filePreviewRevision: number;
+  lastLinkedFileByOwner: Record<string, string>;
 
   openFilePreview: (preview: FilePreview) => void;
 
@@ -703,6 +707,7 @@ interface UIStore {
   // Edit Project Modal
 
   editingProject: any | null;
+  workflowSettingsId: string | null;
 
   openEditModal: (project: any) => void;
 
@@ -1124,6 +1129,13 @@ const loadFilePreviewFontSize = (): number => {
 };
 
 const FILE_PREVIEW_SCROLL_KEY = 'noted-terminal-file-preview-scroll';
+const LINKED_FILE_LAST_KEY = 'noted-terminal-last-linked-file';
+const loadLastLinkedFiles = (): Record<string, string> => {
+  try {
+    const value = JSON.parse(localStorage.getItem(LINKED_FILE_LAST_KEY) || '{}');
+    return Object.fromEntries(Object.entries(value).filter(([id, file]) => id && typeof file === 'string')) as Record<string,string>;
+  } catch { return {}; }
+};
 
 const loadFilePreviewScrollMemory = (): FilePreviewScrollMemory => {
   try {
@@ -2742,6 +2754,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   promptPickerRightOffsetPx: loadPromptPickerRightOffsetPx(),
   timelineWidth: loadTimelineWidth(),
   timelineLineClamp: loadTimelineLineClamp(),
+  timelinePreviewResponseLines: loadTimelinePreviewResponseLines(typeof localStorage === 'undefined' ? null : localStorage),
   historyMarkdownCodeMaxLines: loadHistoryMarkdownCodeMaxLines(),
   historyComposerMinRows: initialHistoryComposerMinRows,
   historyComposerMaxRows: initialHistoryComposerMaxRows,
@@ -2791,6 +2804,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(1, Math.min(10, Math.round(lines)));
     set({ timelineLineClamp: clamped });
     try { localStorage.setItem('noted-terminal-timeline-line-clamp', String(clamped)); } catch {}
+  },
+  setTimelinePreviewResponseLines: (lines: number) => {
+    const value = clampTimelinePreviewResponseLines(lines);
+    set({ timelinePreviewResponseLines: value });
+    try { localStorage.setItem(TIMELINE_PREVIEW_RESPONSE_LINES_KEY, String(value)); } catch {}
   },
 
   setHistoryFontSize: (value) => get().setActiveDisplaySizes({ historyFontSize: value }),
@@ -2922,7 +2940,15 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // File Preview
   filePreview: null,
   filePreviewRevision: 0,
-  openFilePreview: (preview) => set(s => ({ filePreview: preview, filePreviewRevision: s.filePreviewRevision + 1 })),
+  lastLinkedFileByOwner: loadLastLinkedFiles(),
+  openFilePreview: (preview) => set(s => {
+    let lastLinkedFileByOwner = s.lastLinkedFileByOwner;
+    if (preview.ownerTabId && preview.sourceTabId) {
+      lastLinkedFileByOwner = {...lastLinkedFileByOwner, [preview.ownerTabId]:preview.sourceTabId};
+      try { localStorage.setItem(LINKED_FILE_LAST_KEY, JSON.stringify(lastLinkedFileByOwner)); } catch {}
+    }
+    return { filePreview: preview, filePreviewRevision: s.filePreviewRevision + 1, lastLinkedFileByOwner };
+  }),
   closeFilePreview: () => set(s => ({ filePreview: null, filePreviewRevision: s.filePreviewRevision + 1 })),
 
   // Reading position per file. Deliberately keyed by path rather than by tab:
@@ -3308,6 +3334,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Edit Project Modal
   editingProject: null,
+  workflowSettingsId: null,
   openEditModal: (project) => {
     console.log('[UIStore] openEditModal called with:', project?.name);
     set({ editingProject: project });

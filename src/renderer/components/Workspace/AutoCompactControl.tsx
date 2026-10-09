@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Check, FoldVertical, MoreHorizontal, Slash, X } from 'lucide-react';
 import { useAutoCompactStore } from '../../store/useAutoCompactStore';
@@ -6,6 +6,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { automationWorkflowForProject, autoCompactIncludesTarget } from '../../utils/autoCompactPolicy.mjs';
 import { cancelPendingAutoCompact } from '../../hooks/usePromptQueueRunner';
 import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
+import { markQueueChildDismiss, notifyQueueClickChildClosed } from '../../utils/hoverReturnGate.mjs';
 
 export function AutoCompactControl({ tabId, settings = false, global = false, compact = false, hoverOwner }: {
   tabId: string; settings?: boolean; global?: boolean; compact?: boolean; hoverOwner?: string;
@@ -20,19 +21,36 @@ export function AutoCompactControl({ tabId, settings = false, global = false, co
   const excluded = policy.excludedTabIds.includes(tabId);
   const applies = policy.enabled && autoCompactIncludesTarget(policy, { tabId, provider: 'codex', workflowId });
   const [open, setOpen] = useState(false);
+  const wasClickOpenRef = useRef(false);
+  const dismissRef = useRef<{ reason: string; point: { clientX: number; clientY: number } | null } | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
+  const visible = settings || applies || excluded || !!activity;
+  useLayoutEffect(() => {
+    const held = open && visible && !!hoverOwner;
+    if (wasClickOpenRef.current && !held) {
+      notifyQueueClickChildClosed(hoverOwner, dismissRef.current?.reason || 'selection', dismissRef.current?.point || null);
+    }
+    wasClickOpenRef.current = held;
+    if (held) dismissRef.current = null;
+  }, [open, visible, hoverOwner]);
   useEffect(() => {
     if (!open) return;
     const down = (e: MouseEvent) => {
-      if (!trigger.current?.contains(e.target as Node) && !menu.current?.contains(e.target as Node)) setOpen(false);
+      if (!trigger.current?.contains(e.target as Node) && !menu.current?.contains(e.target as Node)) {
+        dismissRef.current = { reason: 'outside', point: { clientX: e.clientX, clientY: e.clientY } };
+        markQueueChildDismiss(e, hoverOwner);
+        setOpen(false);
+      }
     };
-    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopImmediatePropagation(); setOpen(false); } };
+    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') {
+      e.stopImmediatePropagation(); dismissRef.current = { reason: 'escape', point: null }; setOpen(false);
+    } };
     window.addEventListener('mousedown', down);
     window.addEventListener('keydown', key);
     return () => { window.removeEventListener('mousedown', down); window.removeEventListener('keydown', key); };
   }, [open]);
-  if (!settings && !applies && !excluded && !activity) return null;
+  if (!visible) return null;
   const label = excluded ? 'Автокомпакт отключён для этой вкладки'
     : applies ? `Автокомпакт после ответа при контексте ≥ ${policy.percent}%`
       : 'Глобальный автокомпакт не применяется';
@@ -51,6 +69,8 @@ export function AutoCompactControl({ tabId, settings = false, global = false, co
     {open && createPortal(<CenteredUpwardPopover ref={menu} getAnchorRect={() => trigger.current?.getBoundingClientRect() || null}
       zIndex={global ? 15300 : 10000} data-run-after-satellite="true"
       data-run-after-hover-owner={hoverOwner}
+      data-run-after-click-open={hoverOwner ? 'true' : undefined}
+      data-run-after-auto-compact-menu={tabId}
       onMouseDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}
       style={{ width: 265, padding: 10, background: '#181818', border: '1px solid #444', borderRadius: 8, color: '#ccc', fontSize: 12 }}>
       <div style={{ marginBottom: 8 }}>Автокомпакт · эта вкладка</div>

@@ -1,12 +1,12 @@
 import {useLayoutEffect,useState,type RefObject} from 'react';
 
-// Use cap height and descenders even in a lowercase title. Accents/other scripts
-// in the actual name extend that envelope only when they really occur.
+// One cap/descender envelope per font: names and attachment counts must not
+// create different card heights within the same strip/sidebar.
 export const TAB_TITLE_GLYPHS='HРрgjpqy';
 type FontProfile={ascent:number;descent:number;baseline:number;lineHeight:number};
 const caches=new WeakMap<Document,Map<string,FontProfile>>();
 
-function fontProfile(element:HTMLElement,text:string):FontProfile|null {
+function fontProfile(element:HTMLElement):FontProfile|null {
   if(!element.isConnected)return null;
   const doc=element.ownerDocument,style=getComputedStyle(element);
   if(!(Number.parseFloat(style.fontSize)>0))return null;
@@ -16,7 +16,7 @@ function fontProfile(element:HTMLElement,text:string):FontProfile|null {
   if(!cache){cache=new Map();caches.set(doc,cache);doc.fonts?.addEventListener('loadingdone',()=>cache!.clear());}
   const canvas=doc.createElement('canvas'),context=canvas.getContext('2d');if(!context)return null;
   context.font=font;
-  const ink=context.measureText(TAB_TITLE_GLYPHS+text);
+  const ink=context.measureText(TAB_TITLE_GLYPHS);
   const saved=cache.get(key);if(saved)return {...saved,ascent:ink.actualBoundingBoxAscent,descent:ink.actualBoundingBoxDescent};
   // One tiny baseline probe per font profile, outside application layout.
   // No measurement is scheduled by hover, pointer movement or unrelated saves.
@@ -37,10 +37,12 @@ function fontProfile(element:HTMLElement,text:string):FontProfile|null {
 
 export function linkedTitleLayout(profile:FontProfile,{paddingY,gap,chipHeight}:{paddingY:number;gap:number;chipHeight:number}) {
   const inkHeight=profile.ascent+profile.descent;
-  // Border + 1px above the highest glyph; 1px below the lowest glyph.
-  const inkTop=2,chipTop=inkTop+inkHeight+1;
-  const overhang=Math.min(Math.max(0,gap-1),Math.floor(chipHeight/3));
-  const height=Math.max(profile.lineHeight+2*paddingY+2,Math.ceil(chipTop+chipHeight-overhang));
+  // The title moves 1px down from the previous 1px top inset. Let the chip
+  // paint above touching descenders, and use the WHOLE configured row gap.
+  // Its bottom stays exactly 1px before the next card, even with large padding.
+  const overhang=Math.max(0,gap)-1;
+  const height=Math.max(Math.ceil(profile.lineHeight+2*paddingY+2),Math.ceil(3+inkHeight+chipHeight-overhang));
+  const chipTop=height+overhang-chipHeight,inkTop=chipTop-inkHeight;
   return {height,chipTop:chipTop-1, // absolute positioning starts inside the border
     titleOffset:inkTop+profile.ascent-((height-profile.lineHeight)/2+profile.baseline),
     titleCenter:inkTop+inkHeight/2-1,inkHeight,overhang};
@@ -55,7 +57,7 @@ export function useLinkedTitleLayout(ref:RefObject<HTMLElement|null>,enabled:boo
     let alive=true;
     const measure=()=>{
       const element=ref.current;if(!alive||!element)return;
-      const profile=fontProfile(element,text);if(!profile)return;
+      const profile=fontProfile(element);if(!profile)return;
       const next=linkedTitleLayout(profile,{paddingY,gap,chipHeight});
       setLayout(previous=>previous&&(Object.keys(next) as Array<keyof typeof next>).every(key=>previous[key]===next[key])?previous:next);
     };

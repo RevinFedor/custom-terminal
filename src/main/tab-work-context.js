@@ -10,6 +10,7 @@ const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { isLocalSlashCommandPrompt } = require('../shared/agent-local-command.cjs');
 const { completionContextText } = require('./orchestration-source-context');
 const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
+const { computedPatchWriteIntents, computedPatchResultFailed, computedPatchResultYielded } = require('./codex-computed-patch-intent');
 const {
   classifyHistoryAction,
   historyActionHeadline,
@@ -396,6 +397,11 @@ function resolveReadAction(step, cwd) {
 }
 
 function resolveShellEditAction(step, cwd) {
+  if (step?.kind === 'tool' && step.tool === 'Patch' && step.args?.computedPatchIntent === true) {
+    const target = step.args.file_path;
+    return typeof target === 'string' && path.isAbsolute(target) && !target.includes('$')
+      ? { filePath: path.resolve(target) } : null;
+  }
   if (step?.kind !== 'tool' || step?.tool !== 'Bash') return null;
   const args = step.args || {};
   const classified = classifyHistoryAction({
@@ -959,6 +965,7 @@ class TabWorkContext {
     this.projectors = new Map();
     this.pendingEdits = new Map();
     this.shellEdits = new Map();
+    this.computedPatchCalls = new Map();
     this.fileTransitions = new Map();
     this.fileTransitionSequence = 0;
     this.fileTransitionBytes = 0;
@@ -2238,6 +2245,34 @@ class TabWorkContext {
     }
     if (!this.db.prepare('SELECT 1 FROM tab_context_files LIMIT 1').get()) return;
     const sourceTab = this.tab(sourceTabId);
+    const recordedAt = Date.parse(message?.timestamp || message?.payload?.timestamp || '');
+    if (toolType === 'codex' && message?.type === 'response_item') {
+      const payload = message.payload || {}, callId = payload.call_id || payload.id;
+      const callKey = sourceTabId + ':' + sessionId + ':' + callId;
+      if (callId && ['function_call', 'custom_tool_call'].includes(payload.type)) {
+        const intents = computedPatchWriteIntents(payload);
+        if (intents.length) {
+          const steps = intents.map(intent => ({ kind: 'tool', tool: 'Patch',
+            id: callId + ':computed-patch:' + intent.index,
+            args: { file_path: intent.filePath, computedPatchIntent: true } }));
+          this.computedPatchCalls.set(callKey, steps);
+          while (this.computedPatchCalls.size > MAX_SHELL_EDIT_PROOFS) this.computedPatchCalls.delete(this.computedPatchCalls.keys().next().value);
+          for (const step of steps) this.observeShellEditStep({ sourceTabId, sessionId, step, recordedAt, cwd: sourceTab?.cwd });
+        }
+      } else if (callId && ['function_call_output', 'custom_tool_call_output'].includes(payload.type)) {
+        const steps = this.computedPatchCalls.get(callKey);
+        if (steps) {
+          this.computedPatchCalls.delete(callKey);
+          const yielded = computedPatchResultYielded(payload);
+          const failed = computedPatchResultFailed(payload);
+          if (yielded || failed) console.log('[TabContext] computed patch retained tab=' + String(sourceTabId).slice(-12)
+            + ' operation=' + String(callId).slice(0, 24) + ' reason=' + (yielded ? 'yielded-exec' : 'failed-exec'));
+          for (const step of steps) this.observeShellEditStep({ sourceTabId, sessionId,
+            step: { ...step, result: payload.output, isError: yielded || failed },
+            recordedAt, cwd: sourceTab?.cwd });
+        }
+      }
+    }
     if (toolType === 'codex' && message?.type === 'event_msg') {
       for (const action of this.decodeCodexPatch?.(message.payload) || []) {
         const filePath = path.resolve(sourceTab?.cwd || '/', action.args?.file_path || '');
@@ -2269,7 +2304,6 @@ class TabWorkContext {
     const steps = toolType === 'codex'
       ? codexRecordToSteps(message, state, this.decodeCodexCall)
       : claudeRecordToSteps(message, state);
-    const recordedAt = Date.parse(message?.timestamp || message?.payload?.timestamp || '');
     for (const step of steps) {
       const readAction = resolveReadAction(step, sourceTab?.cwd || '/');
       if (readAction && step.result !== undefined && !step.isError) {

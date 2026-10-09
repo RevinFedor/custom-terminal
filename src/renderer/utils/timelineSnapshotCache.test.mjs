@@ -7,6 +7,7 @@ import vm from 'node:vm';
 import { createRequire } from 'node:module';
 import { transformSync } from 'esbuild';
 import { createTimelineSnapshotCache, createTimelineSnapshotOwner } from './timelineSnapshotCache.mjs';
+import { readHistoryThroughIpc } from './historyReadTransport.mjs';
 const require = createRequire(import.meta.url);
 const { SessionTranscriptService } = require('../../main/session-transcript-service');
 const fs = require('node:fs/promises');
@@ -69,6 +70,7 @@ async function harness(t) {
   let entries = { ownerKey: 'owner-a', entries: [] }, metadata = null;
   const ownerKey = { current: 'owner-a' }, generation = { current: 0 }, seenRequests = [];
   const run = vm.runInNewContext(callbackCode, {
+    readHistoryThroughIpc,
     useCallback: fn => fn, timelineOwnerKey: 'owner-a', timelineOwnerKeyRef: ownerKey,
     timelineSnapshotOwner: owner, timelineLoadGenerationRef: generation,
     isVisibleRef: { current: true }, historyPresentationGateOpenRef: { current: true },

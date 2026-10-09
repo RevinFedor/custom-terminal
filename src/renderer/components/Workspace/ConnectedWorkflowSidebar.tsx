@@ -5,6 +5,7 @@ import WorkflowGroupMenu from './WorkflowGroupMenu';
 import {useWorkspaceStore} from '../../store/useWorkspaceStore';
 import {useUIStore} from '../../store/useUIStore';
 import {openTabLinkedFile} from '../../utils/tabLinkedFilePreview';
+import {linkedFileOwner,collectTabLinkedFileTree} from '../../utils/tabLinkedFiles.mjs';
 import {workflowDragRequest} from '../../utils/workflowDragModel.mjs';
 import {workflowTabCatalog,workflowPlacedTabIds} from '../../utils/workflowReserve.mjs';
 import {workflowGlobalGroupMembers} from '../../utils/workflowGlobalGroups.mjs';
@@ -12,6 +13,8 @@ import {captureSpaceLayout} from '../../utils/workspaceSpacesModel.mjs';
 import {removeLayoutTabs} from '../../../shared/workflow-organization.cjs';
 import {isExactGroupCloseGuard} from '../../utils/workflowOrganizationClient.mjs';
 import type {SharedTabActivityMaps} from './TabSignals';
+import {TabLocationLine} from './TabLocationLine';
+import {paneChooserSlots} from '../../utils/splitPanesModel.mjs';
 
 const {ipcRenderer} = window.require('electron');
 
@@ -83,7 +86,10 @@ export default function ConnectedWorkflowSidebar({activity}:{activity:SharedTabA
         }
         return {success:true};
   };
-  const sourceTabId = state.openProjects.get(state.activeProjectId || '')?.activeTabId || undefined;
+  const pane=state.splitPanes[state.splitFocusedIndex];
+  const chooser=!pane?.tabId && pane?.selectedSlotId?paneChooserSlots(pane).find((slot:any)=>slot.slotId===pane.selectedSlotId):null;
+  const sourceTabId = chooser?undefined:pane?.tabId || state.activeSpaceTab?.tabId || state.openProjects.get(state.activeProjectId || '')?.activeTabId || undefined;
+  const sourceOwner=sourceTabId?workflowTabCatalog(state).get(sourceTabId):null;
   return <div style={{display:'contents'}}>
     <WorkflowTabSidebar state={presentation} sharedActivity={activity} orderedTabIds={current?.reserveOrder || []}
       selectedTabIds={view.selectedTabIds || []} onSelectionChange={setSelection}
@@ -123,14 +129,35 @@ export default function ConnectedWorkflowSidebar({activity}:{activity:SharedTabA
         groupCloseInFlight.current.set(id,operation);return operation;
       }}
       sourceTabId={sourceTabId} scrollTop={view.scrollTop || 0}
+      location={chooser?<TabLocationLine cwd={chooser.cwd || ''} onSelectDirectory={async()=>{
+        const selected=await ipcRenderer.invoke('app:select-directory',{defaultPath:chooser.cwd,buttonLabel:'Выбрать'});
+        if(selected)useWorkspaceStore.getState().setWindowTabChooserDirectory(chooser.slotId,selected);
+      }}/>:sourceOwner?<TabLocationLine projectId={sourceOwner.projectId} tabId={sourceOwner.tabId}/>:null}
       onScrollOffsetChange={(_id,top) => setView({scrollTop:top})}
-      onOpenTab={(_namespace,id) => useWorkspaceStore.getState().openTabById(id,{reason:'workflow-reserve'})}
+      onOpenTab={async (_namespace,id) => {
+        const store=useWorkspaceStore.getState();
+        const tab=store.openProjects.get(_namespace)?.tabs.get(id);
+        const owner=tab?.tabType==='file' ? linkedFileOwner(store.openProjects,id):null;
+        if(owner) {
+          const file=collectTabLinkedFileTree(store.openProjects,owner.tabId).find(file=>file.id===id);
+          if(!file)return false;
+          return openTabLinkedFile(owner.projectId,file,()=>useWorkspaceStore.getState().openTabById(owner.tabId,{reason:'linked-file'}));
+        }
+        return store.openTabById(id,{reason:'workflow-reserve'});
+      }}
       onOpenFile={(namespace,file) => void openTabLinkedFile(namespace,file,() => useWorkspaceStore.getState().openTabById(file.ownerTabId,{reason:'linked-file'}))}
       onCreateTab={async request => {
         const store = useWorkspaceStore.getState();
-        const id = await store.createWorkflowTab({...request,tabOptions:{background:true,skipInitialRename:true,groupId:view.activeGroupId || undefined}});
+        const id = await store.createWorkflowTab({...request,tabOptions:{background:true,skipInitialRename:true,groupId:view.activeGroupId || undefined,
+          ...(request.action && request.action!=='terminal'?{color:request.action,pendingAction:{type:request.action==='codex'?'codex-new':'claude-new'}}:{})}});
         if (!id) throw new Error('Не удалось создать вкладку');
-        await store.commitOrganization(); return id;
+        await store.commitOrganization();
+        if(request.windowId){
+          const current=useWorkspaceStore.getState(),index=current.splitPanes.findIndex(pane=>pane.windowId===request.windowId && !pane.displayHidden);
+          const owner=workflowTabCatalog(current).get(id);
+          if(current.activeSpaceId===request.workflowId && index>=0 && owner)current.addTabToSplitPaneStrip(index,owner.projectId,id);
+        }
+        return id;
       }}
       onCreateGroup={async workflowId => {
         const store = useWorkspaceStore.getState();

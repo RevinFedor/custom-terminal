@@ -59,10 +59,29 @@ External Codex run metadata (`externalRun`) — не runtime-only. Она хра
 
 **Emergency save**: на `beforeunload` используется `sendSync` вместо `invoke` — гарантия записи до закрытия окна, даже при ценой UI-блока на 50мс.
 
+У workflow-раскладки другой контракт: `mergeLayout` сохраняет пропущенные поля
+существующего окна по `windowId`, в том числе расширения неизвестного клиенту.
+Поэтому раскрытие должно передавать явные `displayHidden:false`/`displayRect:null`,
+а не удалять ключи. Иначе интерфейс уже показывает окно и файл, но SQLite ещё
+считает окно скрытым. Эта граница проверяется actual layout helpers → Main save →
+SQLite reopen (`workflow-organization.native.test.js`); общий merge не ослабляется.
+
 ### Startup restore и мёртвые project paths
 `workspace-session` может пережить удаление временной папки или строки проекта в SQLite: dev/E2E сценарий оставил открытый проект `/tmp/noted-git-panel-test`, затем папку удалили, а startup всё ещё пытался создать default terminal для stale project. Симптом для пользователя — запуск падает в restore с `working_directory_missing:<path>`, хотя реальных tabs/projects по этому пути уже нет.
 
 Restore обязан различать два случая. Если project row уже отсутствует и path из `workspace-session` тоже не существует — stale project пропускается и не попадает в `openProjects`. Если project row существует, но cwd таба умер — создаётся broken restored tab с `restoreError`, а не обрывается весь startup. Нельзя чинить это простым удалением всех missing-cwd tabs: пользователь должен увидеть, какая сохранённая рабочая папка пропала, если сам проект ещё реален.
+
+Cold restore v2 передаёт exact `executionSubject` и `executionStorageRevision`
+из saved DTO через `restoreTabOptions` и фабрику, включая non-PTY file/SDK и
+broken fallback. Физический parent тоже сохраняется. Новая allocation намеренно
+пропускается при `restoreId`, а последующая catalog hydration не заменяет уже
+существующую строку Map: она не восстановит потерянные здесь полномочия записи.
+Шрам07.10: файлы выглядели нормально после restart, но Trash был успешен, а
+последующий Close отказал `execution_subject_changed`. Аналогично терялись поля
+показанного терминала; lazy rows сохраняли их. Ремонт — передача исходных полей,
+не получение latest revision для обхода CAS. Mismatched tabId/namespace отклоняется;
+fallback metadata не доказывает живой writer. Проверки: `tab-restore-identity.native.test.js`
+и private full-app cold restart → Trash → Close → повторное чтение каталога.
 
 ### Safe saveTabs — существующая строка сохраняет идентичность
 Legacy `saveTabs` обновляет существующую строку на месте, а новый tabId вставляет
@@ -98,6 +117,31 @@ Relation-only DnD использует ту же namespace save-lane и собс
 его rename/прочие metadata сохраняются. Позднее явное unparent не переписывается
 старой квитанцией, foreign revision gap не объявляется собственным ACK. Cwd-point
 receipt и relation receipt имеют разные типы; оба не меняют SID/lifecycle.
+
+### Native metadata-save после точечной записи Main
+
+Ревизия v2 строки меняется и при Main-owned context%, writer/settings или
+provider-state. Это не версия приложения. После cold read такая запись раньше
+оставляла renderer со старой ревизией, а полный снимок блокировал создание даже
+другой вкладки. Own save ACK и CWD receipt не доказывали этот отдельный переход.
+
+Обычный `saveTabs` теперь допускает продвижение только по непрерывной SQL-квитанции
+`main-owned-fields`: изменились исключительно поля, которые generic renderer save
+не записывает. Квитанция привязана к PK/namespace/tab/subject, хранится одной строкой
+на tab и откатывается вместе с транзакцией. Name/notes/parent/cwd/archive, неизвестные
+колонки и побочные metadata-триггеры разрывают proof; сравнение текста побайтовое.
+Нельзя подставить прочитанную latest revision в старый payload. Без полной цепочки
+остаётся прежний конфликт; direct execution CAS и frozen DnD/operation guards не
+получают это исключение. Новые значения Main сохраняются в своих колонках.
+
+Строгий ACK возвращает proof диапазона и ревизию собственного metadata-commit;
+renderer обновляет captured и current same-subject objects до освобождения lane,
+не заменяя их локальные metadata/draft. Batch переносит те же квитанции только
+после общей успешной транзакции; его ACK фиксирует ревизии до publication callbacks,
+иначе их следующий point-write ошибочно попадёт в квитанцию прежнего commit.
+Публикация/отмена New и rollback непоказанного
+кандидата остаются прежними. Подробный private witness —
+`src/main/workflow-create-revision.native.test.mjs`; установленная приёмка отдельно.
 
 ### Main-owned Codex identity и ownership вкладки
 

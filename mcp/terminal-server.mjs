@@ -932,10 +932,11 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'arrange_windows',
   'fork_tab',
   'delegate_to_session',
+  'wait_for_tab_response',
   'start_external_research',
   'import_external_conversation',
   'continue_external_research',
-  'send_message', 'reply_to_message', 'get_message', 'get_send_receipt',
+  'send_message', 'reply_to_message', 'get_message', 'cancel_message', 'get_send_receipt',
   'reconcile_send_receipt', 'release_send_queue_head',
   'get_codex_goal', 'resolve_codex_goal',
   'rewind_history', 'get_history_operation', 'rewind_ai',
@@ -1216,6 +1217,20 @@ const TOOLS = [
         projectId: { type: 'string', description: 'Optional project id for external or cross-project calls.' },
       },
       required: ['path'],
+    },
+  },
+  {
+    name: 'wait_for_tab_response',
+    description: 'Observe work already running in another Claude/Codex tab and receive its completed response. Sends no prompt to that tab, does not start or stop it. If it is already idle, selects its latest saved response. The app durably pins the observed work and returns a runId immediately; finish this turn and use the later completion notification, never poll history or hold a tool call open. By default include the current causal child work and its follow-up; waitForDescendants=false selects only the current turn. Cancellation uses cancel_delegation with interrupt=false and affects only this observation. Choose runId before calling when possible; after lost ACK retain that same ID and unchanged arguments.' + ORCHESTRATION_COMPLETION_GUIDANCE,
+    inputSchema: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        tabId: { type: 'string', description: 'Exact existing target tab ID from the tab catalog.' },
+        runId: { type: 'string', description: 'Stable observation request ID. Generated before network access if omitted.' },
+        waitForDescendants: { type: 'boolean', description: 'Default true: include current child work and the target follow-up. False: observe only the selected current turn.' },
+        projectId: { type: 'string', description: 'Optional application instance routing hint.' },
+        cwd: { type: 'string', description: 'Optional application instance routing hint.' },
+      }, required: ['tabId'],
     },
   },
   {
@@ -1693,7 +1708,7 @@ const TOOLS = [
   },
   {
     name: 'send_message',
-    description: 'Ask a short question of a busy owner, with a durable messageId and server-owned return address. Both sessions may continue their current work; this creates no delegation/run dependency. The recipient should reply_to_message by messageId when the facts are ready, before its final answer. Accepted/queued means persistence or transport acceptance, not that the model has read or answered it. Do not poll; get_message is for explicit diagnosis/recovery. Source identity always comes from this full session. An omitted requestId is generated before network access and returned even on transport failure; retry only the identical text/target with that exact requestId, never a blind new ID. Requires the updated tabMessages API; no send_prompt fallback.',
+    description: 'Ask a short question of a busy owner, with a durable messageId and server-owned return address. Both sessions may continue their current work; this creates no delegation/run dependency. The recipient should reply_to_message by messageId when the facts are ready, before its final answer. Accepted/queued means persistence or transport acceptance. Only deliveryState=sent confirms delivery; otherwise report the returned pending/queued/error state, never claim delivery from accepted=true. Delivery does not prove the model has read or answered it. Do not poll; get_message is for explicit diagnosis/recovery. Source identity always comes from this full session. An omitted requestId is generated before network access and returned even on transport failure; retry only the identical text/target with that exact requestId, never a blind new ID. Requires the updated tabMessages API; no send_prompt fallback.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1707,7 +1722,7 @@ const TOOLS = [
   },
   {
     name: 'reply_to_message',
-    description: 'Reply to one exact incoming messageId when the facts are ready, before your final answer, then continue your current work. The server derives the recipient from the original message; never copy or override a return tab ID. A reply is durable before delivery; acceptance is not proof the requesting model has read it. No polling or automatic reply-to-reply acknowledgement. On transport failure retry only identical text/messageId with the returned exact requestId, never a new ID. Source identity comes only from this full session; requires the updated tabMessages API, with no send_prompt fallback.',
+    description: 'Reply to one exact incoming messageId when the facts are ready, before your final answer, then continue your current work. The server derives the recipient from the original message; never copy or override a return tab ID. A reply is durable before delivery. Only deliveryState=sent confirms delivery; accepted=true with pending/queued/error must be reported as that state, not as delivered. Acceptance and delivery do not prove the requesting model has read it. No polling or automatic reply-to-reply acknowledgement. On transport failure retry only identical text/messageId with the returned exact requestId, never a new ID. Source identity comes only from this full session; requires the updated tabMessages API, with no send_prompt fallback.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1728,6 +1743,12 @@ const TOOLS = [
       required: ['messageId'],
       additionalProperties: false,
     },
+  },
+  {
+    name: 'cancel_message',
+    description: 'Explicit user-authorized cancellation of one addressed question/reply thread. Stops further app delivery and reply forwarding, keeps history and exact delivery evidence. Does not stop the target agent or claim an already-forwarded message was withdrawn. A lost ACK is checked with get_message; only retry the identical messageId. Requires tabMessages.cancellation.version=1; never substitute presentation-only dismiss or a new Send.',
+    inputSchema: { type: 'object', properties: { messageId: { type: 'string', minLength: 1 } },
+      required: ['messageId'], additionalProperties: false },
   },
   {
     name: 'get_send_receipt',
@@ -2537,6 +2558,43 @@ async function callTool(name, args) {
       return JSON.stringify({ ok: true, ...result }, null, 2);
     }
 
+    case 'wait_for_tab_response': {
+      const runId = args.runId === undefined ? randomUUID() : requireNonemptyString(args.runId, 'runId');
+      const sourceTabId = PARENT_TAB_ID();
+      const tabId = typeof args.tabId === 'string' ? args.tabId.trim() : '';
+      const allowed = new Set(['tabId', 'runId', 'waitForDescendants', 'projectId', 'cwd']);
+      let mutationAttempted = false;
+      try {
+        if (!sourceTabId || !tabId || sourceTabId === tabId || Object.keys(args).some(key => !allowed.has(key))
+          || (args.waitForDescendants != null && typeof args.waitForDescendants !== 'boolean')) {
+          throw Object.assign(new Error('wait_for_tab_response requires another existing tab and a full source session'), {
+            code: 'invalid_response_observation_arguments',
+          });
+        }
+        const target = projectHint({ projectId: args.projectId || PARENT_PROJECT_ID(), cwd: args.cwd || PROJECT_CWD_() }, sourceTabId);
+        const me = await httpApiGet(target, '/api/me');
+        if (me?.capabilities?.responseObservations?.version !== 1) {
+          throw Object.assign(new Error('Noted Terminal requires an update for durable response observation'), { code: 'app_update_required' });
+        }
+        mutationAttempted = true;
+        const result = await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/response-observations', {
+          runId, sourceTabId, waitForDescendants: args.waitForDescendants !== false, sourceMeta: buildSourceMeta(),
+        });
+        if ((result?.runId || result?.run?.runId) !== runId || result?.accepted !== true) {
+          throw Object.assign(new Error('Response observation acceptance did not confirm its durable identity'), {
+            code: 'response_observation_acceptance_unknown',
+          });
+        }
+        return JSON.stringify({ ...result, runId }, null, 2);
+      } catch (cause) {
+        const recovery = 'Read get_delegation with this SAME runId for explicit recovery. Retry only unchanged arguments and this runId; do not send a task, create a tab, or poll its history.';
+        const error = new Error(String(cause?.message || cause) + ' ' + recovery);
+        error.toolDetails = { ...(cause?.toolDetails || {}), code: cause?.code || cause?.toolDetails?.code || 'response_observation_outcome_unknown',
+          runId, tabId, mutationAttempted, recovery };
+        throw error;
+      }
+    }
+
     case 'delegate_to_session': {
       const sourceTabId = args.sourceTabId || PARENT_TAB_ID();
       if (!sourceTabId) throw new Error('sourceTabId is required outside a parent Noted Terminal session');
@@ -2968,7 +3026,7 @@ async function callTool(name, args) {
           messageId,
           requestId,
           deliveryState: result.deliveryState || result.message?.deliveryState || 'unknown',
-          guidance: 'Acceptance/delivery is not proof the model has read or answered this message. Continue independent work; do not poll. Use get_message only for explicit diagnosis/recovery.',
+          guidance: 'accepted=true means the application stored this message. Only deliveryState=sent confirms delivery; pending/sending/queued/unconfirmed must not be reported as delivered. For failed/waiting-for-input report the returned error/state. Delivery is not proof the model has read or answered this message. Continue independent work; do not poll. Use get_message only for explicit diagnosis/recovery.',
         }, null, 2);
       } catch (cause) {
         const recovery = 'Retry only the identical ' + name + ' call with requestId=' + JSON.stringify(requestId) + '; never use a new ID or changed text to check status.';
@@ -2988,6 +3046,31 @@ async function callTool(name, args) {
       const messageId = requireNonemptyString(args.messageId, 'messageId');
       const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, PARENT_TAB_ID());
       return JSON.stringify(await httpApiGet(target, '/api/tab-messages/' + encodeURIComponent(messageId)), null, 2);
+    }
+
+    case 'cancel_message': {
+      const messageId = requireNonemptyString(args.messageId, 'messageId');
+      const sourceTabId = requireNonemptyString(PARENT_TAB_ID(), 'current caller tab');
+      const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, sourceTabId);
+      const info = await httpApiGet(target, '/api/me');
+      if (info?.capabilities?.tabMessages?.cancellation?.version !== 1) {
+        const error = new Error('Noted Terminal app update required for message cancellation; presentation-only dismiss is not cancellation.');
+        error.toolDetails = { code: 'app_update_required', messageId, mutationAttempted: false };
+        throw error;
+      }
+      try {
+        const result = await httpApiPost(target, '/api/tab-messages/' + encodeURIComponent(messageId) + '/cancel',
+          { tabId: sourceTabId, sourceMeta: buildSourceMeta() });
+        if (result?.ok !== true || result?.cancelled !== true || result.requestedMessageId !== messageId) {
+          throw new Error(result?.error || 'Exact cancellation was not confirmed');
+        }
+        return JSON.stringify({ ...result, guidance: 'Cancellation is durable intent, not proof of no prior delivery. History remains readable; no target Stop or retry was performed.' }, null, 2);
+      } catch (cause) {
+        const error = new Error(String(cause?.message || cause));
+        error.toolDetails = { code: cause?.code || 'message_cancellation_unknown', messageId,
+          mutationAttempted: true, recovery: 'Read get_message for cancelledAt; retry only cancel_message with the same messageId.' };
+        throw error;
+      }
     }
 
     case 'get_send_receipt': {

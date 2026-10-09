@@ -10,6 +10,8 @@ export function reset(options:any={}) {
   f.commits=[];f.attempts=[];f.holdCommit=false;f.releaseCommit=null;
   const rows=[['A',null],['Q',null],['B',null],['Z',null],['child','A']];
   const tabs=new Map(rows.map(([id,parent])=>[id,{id,name:id,cwd:'/fixture',tabType:'terminal',visualParentTabId:parent || undefined}]));
+  if(options.file)Object.assign(tabs.get('child')!,{tabType:'file',filePath:'/fixture/linked.md'});
+  if(options.physical)Object.assign(tabs.get('child')!,{parentTabId:'A',visualParentTabId:undefined});
   const layout={...emptySpaceLayout(),activeProjectId:'P',focusedProjectId:'P',
     splitPanes:[{windowId:'window-w1',projectId:'P',tabId:options.pane?'B':'',tabs:options.pane?['A','B'].map(tabId=>({projectId:'P',tabId})):[]}]};
   const other={...emptySpaceLayout(),activeProjectId:'P',focusedProjectId:'P',splitPanes:[{windowId:'window-w2',projectId:'P',tabId:'',tabs:[]}]};

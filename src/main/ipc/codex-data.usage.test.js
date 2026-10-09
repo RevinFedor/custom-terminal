@@ -585,6 +585,88 @@ test('classifies 429 and physically aborts a hung request', async () => {
   assert.equal(aborted, true);
 });
 
+test('the default budget accepts a nine-second response instead of aborting it at eight', async () => {
+  const auth = { accessToken: 'test-token', accountId: 'workspace-1', accountKey: 'account-key-1', email: 'person@example.com' };
+  let clock = 0;
+  let deadline;
+  let cleared = false;
+  let respond;
+  const request = _api.fetchCodexUsageFromOpenAI(auth, {
+    fetchImpl: () => new Promise(resolve => { respond = resolve; }),
+    now: () => clock,
+    setTimer: (fn, ms) => { deadline = { fn, at: clock + ms }; return deadline; },
+    clearTimer: timer => { assert.equal(timer, deadline); cleared = true; },
+  });
+  assert.equal(deadline.at, 15_000);
+  clock = 9_000;
+  assert.ok(clock < deadline.at);
+  respond({ ok: true, status: 200, headers: { get: () => null }, json: async () => whamPayload() });
+  const result = await request;
+  assert.equal(result.durationMs, 9_000);
+  assert.equal(result.account.usage.seven_day.utilization, 100);
+  assert.equal(cleared, true);
+});
+
+test('a headers timeout physically aborts and records the missing HTTP response', async () => {
+  let clock = 0;
+  let deadline;
+  let aborted = false;
+  let cleared = false;
+  const request = _api.fetchCodexUsageFromOpenAI({ accessToken: 'test-token', accountId: 'workspace-1', accountKey: 'account-key-1' }, {
+    fetchImpl: (_url, { signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => { aborted = true; reject(Object.assign(new Error('aborted'), { name: 'AbortError' })); });
+    }),
+    now: () => clock,
+    setTimer: (fn, ms) => { deadline = { fn, at: clock + ms }; return deadline; },
+    clearTimer: () => { cleared = true; },
+  });
+  clock = deadline.at;
+  deadline.fn();
+  await assert.rejects(request, error => {
+    assert.equal(error.code, 'timeout');
+    assert.equal(error.requestPhase, 'waiting-headers');
+    assert.equal(error.requestDurationMs, 15_000);
+    assert.equal(error.requestTimeoutMs, 15_000);
+    assert.equal(error.responseHeadersMs, null);
+    assert.equal(error.status, null);
+    return true;
+  });
+  assert.equal(aborted, true);
+  assert.equal(cleared, true);
+});
+
+test('a body timeout is distinguished from malformed JSON and retains the HTTP200 timing', async () => {
+  let clock = 0;
+  let deadline;
+  let ready;
+  let respond;
+  const reading = new Promise(resolve => { ready = resolve; });
+  const request = _api.fetchCodexUsageFromOpenAI({ accessToken: 'test-token', accountId: 'workspace-1', accountKey: 'account-key-1' }, {
+    fetchImpl: (_url, { signal }) => new Promise(resolve => { respond = () => resolve({ ok: true, status: 200,
+      json: () => new Promise((_resolve, reject) => { ready(); signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))); }),
+    }); }),
+    now: () => clock,
+    setTimer: (fn, ms) => { deadline = { fn, at: clock + ms }; return deadline; },
+    clearTimer: () => {},
+  });
+  clock = 120;
+  respond();
+  await reading;
+  clock = deadline.at;
+  deadline.fn();
+  await assert.rejects(request, error => {
+    assert.equal(error.code, 'timeout');
+    assert.equal(error.requestPhase, 'reading-body');
+    assert.equal(error.requestDurationMs, 15_000);
+    assert.equal(error.responseHeadersMs, 120);
+    assert.equal(error.status, 200);
+    return true;
+  });
+  await assert.rejects(_api.fetchCodexUsageFromOpenAI({ accessToken: 'test-token', accountId: 'workspace-1', accountKey: 'account-key-1' }, {
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('invalid JSON'); } }),
+  }), error => error.code === 'invalid_response' && error.requestPhase === 'reading-body');
+});
+
 test('classifies expired OAuth without replacing the previous value', async () => {
   await assert.rejects(
     _api.fetchCodexUsageFromOpenAI({

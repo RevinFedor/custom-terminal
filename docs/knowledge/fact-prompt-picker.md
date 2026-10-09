@@ -224,12 +224,50 @@ CRUD промптов проходит через `/api/prompts` и `/api/prompt
 
 Новая API-поверхность требует соответствующей версии приложения и Terminal MCP. Отсутствующий endpoint старой установки означает необходимость обновления; `saved_prompt_not_found` или `prompt_group_not_found` на новой API означает отсутствие конкретного объекта. Эти случаи не исправляются одинаковым советом перезапустить приложение. Граница source/установленной версии фиксируется в рабочем файле задачи, а не выводится из наличия обработчика в репозитории.
 
+### Каноническое дерево и раздельное чтение для native
+
+`/api/me.capabilities.promptLibrary` version1 объявляет `outlineProjection:"outline-v1"`
+и `resolvedProjection:"steps-v1"`. `GET /api/prompt-library?projection=outline-v1`
+добавляет `outline.roots`: общее дерево групп/промптов с children, collapse metadata,
+stable IDs/revisions и inheritance-depth/непосредственным родителем. Пустые группы
+не исчезают; смешанный root order и tie-order берутся из того же `prompt-outline.cjs`,
+который через прежний renderer facade обслуживает Settings/Picker. Native не сортирует
+заново и не чинит parent links. Orphan groups нормализуются только для показа;
+revision остаётся от исходной записи, invalid/cyclic parents — по desktop-правилам.
+
+`POST /api/prompt-library/read` с `{promptIds:[leafId],mode:"resolved",projection:"steps-v1"}`
+возвращает прежний `prompts[0].resolvedText` и `composition:{version:1,selectedPromptId,steps}`.
+В каждом step — `promptId`, `sourceKey:"prompt:<id>"`, `label`, `revision`, `text`
+(только собственное содержимое и собственные файлы), `inheritanceDepth`,
+`inheritanceParentPromptId/Label`. Порядок root→leaf, ключ предка одинаков при выборе
+разных детей. `files` сохраняет порядок прочитанных путей и статусы resolved/empty/
+unavailable; SHA256 относится к sanitized UTF-8 тексту, textLength — UTF-16 units.
+Тела файлов уже внутри step.text, читать их на телефоне или дописывать предков в
+сохранённый own content не нужно. Пустая ступень даёт409 `saved_prompt_empty` с
+`promptId/promptTitle`, без частичной composition. Недоступный файл при непустом
+own text сохраняет прежнее поведение resolver: отдельный unavailable, не пустой chip.
+
+Обе проекции возвращают `read:{version,readId,requestId,serviceInstanceId,libraryRevision}`;
+resolved также содержит selectedPromptId/selectedRevision. requestId — необязательный
+echo клиента (до200символов), не mutation receipt. Один SQLite read snapshot и detached
+копия библиотеки захватываются до file await. Опциональный expectedLibraryRevision из
+каталога отказывает409 `saved_prompt_library_stale` до файлов. После начала чтения
+изменение библиотеки не подмешивается в старый ответ: read evidence описывает исходный
+снимок. Это не snapshot файлов — их bytes читаются на момент разрешения; hash библиотеки
+не доказывает неизменность вложений. Клиент проверяет захваченные origin/config generation,
+собственный read/selection owner, serviceInstanceId, selected ID/revision перед вставкой.
+
+Без projection прежние own/resolved формы остаются; legacy `GET /api/prompts` по-прежнему
+отдаёт только OWN assembled payload каждого prompt, не наследуемую цепочку. Новый read
+не создаёт sender, prompt-store, UI writer или зависимость от видимого renderer.
+
 ## Path-зависимости
 
 | Файл | Что делает |
 |---|---|
 | `src/renderer/components/Workspace/PromptPickerOverlay.tsx` | Сам компонент. Mounted один раз в App.tsx. |
-| `src/renderer/components/UI/promptOutlineModel.mjs` | Общая валидированная иерархия Settings + picker. |
+| `src/shared/prompt-outline.cjs` + `src/renderer/components/UI/promptOutlineModel.mjs` | Один алгоритм дерева для Main/Settings/Picker; прежний renderer import сохранён. |
+| `src/main/saved-prompt-service.js`, `saved-prompt-resolution.js`, `web-server.js` | Snapshot/read projections, общий composition resolver и Main file sanitizer. |
 | `src/renderer/utils/composerChips.mjs` | Отдельные inherited chips, transport metadata и восстановление History. |
 | `src/renderer/App.tsx::handlePickerOpenCapture` | Window keydown capture для Opt+V. |
 | `src/renderer/store/useUIStore.ts` | `promptPickerOpen`, `promptPickerFontSize`, `promptPickerBottomOffsetPx`, `promptPickerLeftOffsetPx`, `promptPickerRightOffsetPx` + сеттеры. Все persist в localStorage. |

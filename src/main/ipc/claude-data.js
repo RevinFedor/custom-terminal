@@ -1,8 +1,11 @@
 const { ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { timelineResponsePreview } = require('../../shared/timeline-response-preview.cjs');
 const os = require('os');
 const crypto = require('crypto');
+const { proveClaudeNativeQuestionReply } = require('../../shared/native-question-reply.cjs');
+const questionReplyFingerprint = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 const { hashFileSegment } = require('../codex-virtual-transcript');
 const { historyPreparationActivity } = require('../history-preparation-activity');
 const { claudeProjectsDir: getClaudeProjectsDir, assertClaudeDataPath } = require('../claude-paths');
@@ -1862,15 +1865,24 @@ function buildClaudeTaskNotificationIndex(recordMap) {
 
 function buildClaudeToolResultRecordIndex(recordMap) {
   const index = new Map();
+  const questionCalls = new Map();
   for (const [, rec] of recordMap) {
+    if (rec?.type === 'assistant' && Array.isArray(rec.message?.content)) {
+      for (const part of rec.message.content) {
+        if (part?.type === 'tool_use' && part.name === 'AskUserQuestion' && part.id) {
+          questionCalls.set(part.id, (questionCalls.get(part.id) || 0) + 1);
+        }
+      }
+    }
     if (rec?.type !== 'user' || !Array.isArray(rec.message?.content)) continue;
     for (const part of rec.message.content) {
-      if (part?.type === 'tool_result' && part.tool_use_id
-        && !index.has(part.tool_use_id)) {
-        index.set(part.tool_use_id, { record: rec, block: part });
+      if (part?.type === 'tool_result' && part.tool_use_id) {
+        if (!index.has(part.tool_use_id)) index.set(part.tool_use_id, { record: rec, block: part });
+        else index.get(part.tool_use_id).ambiguous = true;
       }
     }
   }
+  for (const [id, found] of index) found.questionCallCount = questionCalls.get(id) || 0;
   return index;
 }
 
@@ -4101,7 +4113,7 @@ function register({
             dirMtime = (await fs.promises.stat(found.projectDir)).mtimeMs;
           } catch {}
         }
-        return { context: 'claude-timeline-v1:' + dirMtime, primaryFound: found };
+        return { context: 'claude-timeline-v2-final-preview:' + dirMtime, primaryFound: found };
       };
       if (ifRevision) {
         try {
@@ -4512,6 +4524,7 @@ function register({
           let responseTokens = 0;
           let responseModel;
           let responseHasThinking = false;
+          let responsePreview;
           const docsEditedSet = new Set();
           const fileEditsSet = new Set();
           const docsSearchQueriesSet = new Set();
@@ -4526,6 +4539,24 @@ function register({
               const mdl = next.message?.model;
               if (mdl && mdl !== '<synthetic>') responseModel = mdl;
               const content = next.message?.content;
+              // Match full History's text-block joining/trim exactly. Shared
+              // message.id is not the physical terminal TEXT record's UUID.
+              if (!next.isApiErrorMessage
+                  && next.message?.model !== '<synthetic>'
+                  && ['end_turn', 'stop_sequence'].includes(next.message?.stop_reason)
+                  && (!Array.isArray(content) || !content.some(block => block?.type === 'tool_use'))) {
+                  const text = typeof content === 'string' ? content.trim()
+                    : (Array.isArray(content) ? content.filter(block => block?.type === 'text' && block.text)
+                      .map(block => block.text).join('\n\n').trim() : '');
+                  const preview = timelineResponsePreview({
+                    uuid: next.uuid,
+                    sourceIdentity: next.sourceIdentity,
+                    timestamp: next.timestamp,
+                    sessionId: next.sessionId || next._fromFile,
+                    content: text,
+                  });
+                  if (preview) responsePreview = preview;
+              }
               if (Array.isArray(content)) {
                 if (content.some(c => c && c.type === 'thinking')) responseHasThinking = true;
                 for (const block of content) {
@@ -4603,6 +4634,7 @@ function register({
             responseTokens,
             responseModel,
             responseHasThinking: responseHasThinking || undefined,
+            ...(responsePreview ? { responsePreview } : {}),
             // Attached to user-entry so timeline shows a single dot per prompt instead of
             // separate docs_edit/docs_search dots. Empty arrays omitted to keep entry shape clean.
             docsEdited: docsEditedSet.size > 0 ? Array.from(docsEditedSet) : undefined,
@@ -6161,8 +6193,21 @@ function register({
                     resultEntry: found.record,
                     resultBlock: res,
                   });
+                  const resultBlocks = Array.isArray(found.record?.message?.content)
+                    ? found.record.message.content.filter(item => item?.type === 'tool_result') : [];
+                  const nativeData = found.record?.sourceToolAssistantUUID === entry.uuid
+                    && resultBlocks.length === 1 && resultBlocks[0] === res
+                    ? found.record.toolUseResult : undefined;
+                  const questionReplyProof = name === 'AskUserQuestion' ? proveClaudeNativeQuestionReply({
+                    toolName: name, callId: block.id, args: input, sourceIdentity: entry.uuid,
+                    unique: found.questionCallCount === 1
+                      && (!found.record.sourceToolAssistantUUID || found.record.sourceToolAssistantUUID === entry.uuid),
+                  }, { toolUseId: res.tool_use_id, content: text, isError: isClaudeToolResultError(res),
+                    unique: !found.ambiguous, sourceIdentity: found.record.uuid, data: nativeData,
+                  }, questionReplyFingerprint) : null;
                   return {
                     text,
+                    ...(questionReplyProof ? { questionReplyProof } : {}),
                     isError: isClaudeToolResultError(res),
                     completedAt: Date.parse(backgroundOutcome?.timestamp || found.record?.timestamp || '') || 0,
                     diffHunks: diffHunks || undefined,
@@ -6286,6 +6331,7 @@ function register({
                       mcpServer: classified.mcpServer,
                       mcpMethod: classified.mcpMethod,
                       result: rr ? rr.text : undefined,
+                      ...(rr?.questionReplyProof ? { questionReplyProof: rr.questionReplyProof } : {}),
                       isError: rr ? rr.isError : undefined,
                       diffHunks: rr ? rr.diffHunks : undefined,
                       backgroundStatus: rr ? rr.backgroundStatus : undefined,

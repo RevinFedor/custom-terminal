@@ -10,9 +10,11 @@ import { build } from 'esbuild';
 import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
 const repo = fileURLToPath(new URL('..', import.meta.url));
+const workflowScopeOnly=process.argv.includes('--workflow-scope');
+const alongsideOnly=process.argv.includes('--alongside');
 const artifact = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-hidden-window-picker-'));
 const snapshot = path.join(artifact, 'source');
-execFileSync('git', ['worktree', 'add', '--detach', snapshot, 'HEAD'], { cwd: repo, stdio: 'pipe' });
+await fs.mkdir(snapshot,{recursive:true});
 let app;
 const result = { artifact, samples: [], checks: [], errors: [], pass: false };
 const logs = [];
@@ -22,7 +24,7 @@ try {
   await fs.mkdir(path.join(snapshot, 'scripts/fixtures'), { recursive: true });
   await fs.copyFile(path.join(repo, 'scripts/fixtures/hidden-window-picker.tsx'), path.join(snapshot, 'scripts/fixtures/hidden-window-picker.tsx'));
   result.sources = {};
-  for (const file of ['TabCard.tsx', 'TabBar.tsx', 'TabSignals.tsx'].map(name=>'src/renderer/components/Workspace/'+name)
+  for (const file of ['HiddenWindowPicker.tsx', 'TabCard.tsx', 'TabBar.tsx', 'TabSignals.tsx'].map(name=>'src/renderer/components/Workspace/'+name)
     .concat('scripts/fixtures/hidden-window-picker.tsx')) {
     result.sources[file] = createHash('sha256').update(await fs.readFile(path.join(snapshot, file))).digest('hex');
   }
@@ -36,7 +38,7 @@ try {
     alias: { '@noted/claude-blocks': path.join(snapshot, 'packages/claude-blocks/src'),
       '@noted/structured-dnd': path.join(shared, 'structured-dnd/src'), '@noted/file-explorer': path.join(shared, 'file-explorer/src'),
       react: path.join(repo, 'node_modules/react'), 'react-dom': path.join(repo, 'node_modules/react-dom') },
-    loader: { '.ttf': 'file', '.woff2': 'file', '.svg': 'dataurl' } });
+    loader: { '.ttf': 'file', '.woff2': 'file', '.svg': 'dataurl', '.png':'dataurl', '.b64':'text' } });
   execFileSync(path.join(repo, 'node_modules/.bin/tailwindcss'), ['-i', path.join(snapshot, 'src/renderer/styles/globals.css'),
     '-o', path.join(artifact, 'globals.css'), '--minify'], { cwd: snapshot, stdio: 'pipe' });
   function installShim() {
@@ -116,7 +118,7 @@ try {
     app.setPath('userData',${JSON.stringify(path.join(artifact, 'user-data'))});app.setActivationPolicy?.('accessory');
     app.whenReady().then(()=>{app.dock?.hide();session.defaultSession.webRequest.onBeforeRequest((d,r)=>r({cancel:! /^(file:|data:|blob:)/.test(d.url)}));
       const w=new BrowserWindow({show:false,focusable:false,width:1000,height:650,webPreferences:{offscreen:true,nodeIntegration:false,contextIsolation:true,sandbox:true,backgroundThrottling:false}});
-      w.webContents.on('paint',()=>{});w.loadFile(${JSON.stringify(path.join(artifact, 'index.html'))});});app.on('window-all-closed',()=>app.quit());`);
+      w.webContents.on('paint',()=>{});w.loadFile(${JSON.stringify(path.join(artifact, 'index.html'))},${JSON.stringify(workflowScopeOnly?{query:{'workflow-scope':'1'}}:{})});});app.on('window-all-closed',()=>app.quit());`);
   const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
   app = await electron.launch({ args: [path.join(artifact, 'main.cjs')], env, cwd: artifact });
   result.electronPid = app.process().pid;
@@ -132,6 +134,70 @@ try {
   const card=tab=>popup.locator('[data-hidden-window-tab-id="'+tab+'"]');
   await trigger.waitFor();
   await open();
+  if(alongsideOnly){
+    const actions=popup.locator('[data-hidden-window-alongside]');
+    const list=popup.locator('[data-hidden-window-picker-list]');
+    await actions.first().waitFor();
+    await page.evaluate(()=>window.pickerFixture.geometry(22,4));await frames();
+    const geometry=()=>popup.evaluate(shell=>{
+      const rect=e=>{const r=e.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,right:r.right,bottom:r.bottom};};
+      const list=shell.querySelector('[data-hidden-window-picker-list]');
+      return {shell:rect(shell),list:rect(list),background:getComputedStyle(shell).backgroundColor,
+        rows:[...shell.querySelectorAll('[data-hidden-window-row]')].map(row=>({id:row.dataset.hiddenWindowRow,...rect(row)})),
+        actions:[...shell.querySelectorAll('[data-hidden-window-alongside]')].map(button=>({id:button.dataset.hiddenWindowAlongside,
+          ...rect(button),position:getComputedStyle(button).position,text:button.textContent,svg:button.querySelectorAll('svg').length}))};
+    });
+    result.externalGeometry=await geometry();
+    assert.equal(result.externalGeometry.background,'rgba(0, 0, 0, 0)');
+    for(const action of result.externalGeometry.actions){
+      assert.equal(action.position,'absolute');assert.equal(action.text,'');assert.equal(action.svg,1);
+      assert.ok(action.right<result.externalGeometry.list.x,'control is outside the painted list');
+      assert.ok(Math.abs(action.y-result.externalGeometry.rows.find(r=>r.id===action.id).y)<1);
+      assert.ok(action.x>=0 && action.bottom<=650);
+    }
+    await actions.evaluateAll(nodes=>nodes.forEach(node=>node.style.display='none'));await frames();
+    const removed=await geometry();
+    assert.deepEqual(removed.list,result.externalGeometry.list);
+    assert.deepEqual(removed.rows,result.externalGeometry.rows,'controls reserve no column or row height');
+    await actions.evaluateAll(nodes=>nodes.forEach(node=>node.style.display='inline-flex'));await frames();
+    await page.screenshot({path:path.join(artifact,'external-expand.png')});
+    result.checks.push('icon-only SVG outside painted list; removing every control changes no card/list geometry');
+    await page.keyboard.press('Escape');await page.mouse.move(950,610);await trigger.hover();await popup.waitFor();await frames();
+    const action=popup.locator('[data-hidden-window-alongside="hidden-many"]');
+    await action.hover();await frames();assert.equal(await popup.count(),1,'external control belongs to hover retention');
+    const b=await action.boundingBox();await page.mouse.move(b.x+b.width+2,b.y+12);await frames();
+    assert.equal(await popup.count(),1,'gap between control and card is a hover bridge');
+    await action.click();await frames();
+    let s=await state();assert.equal(s.panes.find(p=>p.id==='visible').hidden,false);
+    assert.equal(s.panes.find(p=>p.id==='hidden-many').hidden,false);
+    assert.equal(s.panes.find(p=>p.id==='hidden-single').hidden,true);
+    assert.deepEqual(s.panes.find(p=>p.id==='hidden-many').tabs,['b','c','d']);
+    assert.equal(await popup.count(),0);
+    result.checks.push('hover bridge/click reveal exact hidden window alongside, preserving the previous visible window');
+    await reset();await page.evaluate(()=>window.pickerFixture.manyHidden());await open();await frames();
+    assert.ok(await list.evaluate(e=>e.scrollHeight>e.clientHeight+200));
+    await list.evaluate(e=>e.scrollTop=180);await frames();
+    result.scrolledGeometry=await geometry();
+    assert.ok(!result.scrolledGeometry.actions.some(a=>a.id==='hidden-many'));
+    assert.ok(result.scrolledGeometry.actions.length>1);
+    for(const a of result.scrolledGeometry.actions){
+      const row=result.scrolledGeometry.rows.find(r=>r.id===a.id);
+      assert.ok(Math.abs(row.y-a.y)<1);assert.ok(a.y>=result.scrolledGeometry.list.y-1);
+      assert.ok(a.bottom<=result.scrolledGeometry.list.bottom+1);
+    }
+    await page.screenshot({path:path.join(artifact,'external-expand-scrolled.png')});
+    result.checks.push('scrolling list repositions only visible external actions; no clipping or stale row coordinates');
+    await reset();await trigger.evaluate(button=>Object.assign(button.parentElement.style,{position:'fixed',right:'4px',bottom:'4px',zIndex:'9000'}));
+    await open();await page.evaluate(()=>window.pickerFixture.geometry(22,0));await frames();
+    result.edgeGeometry=await geometry();
+    for(const r of [result.edgeGeometry.list,...result.edgeGeometry.actions])assert.ok(r.x>=0&&r.y>=0&&r.right<=1000&&r.bottom<=650);
+    await page.screenshot({path:path.join(artifact,'external-expand-edge.png')});
+    await page.keyboard.press('Escape');await frames();
+    assert.equal(await popup.count(),0,'Escape dismisses the picker');
+    await page.mouse.move(1,1);await trigger.hover();await popup.waitFor();
+    await page.mouse.click(1,1);await frames();assert.equal(await popup.count(),0,'outside click dismisses the picker');
+    result.checks.push('whole painted footprint stays inside viewport at bottom edge; Escape/outside dismissal retained');
+  }else{
   const labelGeometry=()=>page.locator('[data-hidden-window-tab-id], [data-card-reference] [data-tab-card]').evaluateAll(cards=>cards.map(card=>{
     const label=card.querySelector('[data-tab-card-label]'),bar=card.querySelector('[data-tab-process-bar]');
     const r=card.getBoundingClientRect(),l=label.getBoundingClientRect(),b=bar?.getBoundingClientRect();
@@ -164,6 +230,39 @@ try {
   }
   await page.screenshot({path:path.join(artifact,'tab-label-insets.png')});
   result.checks.push('shared pane/popup cards keep full labels outside the process rail on initial render, bell removal and zero-padding/large-font settings');
+  if(workflowScopeOnly){
+    await page.evaluate(()=>window.pickerFixture.canonicalScopes());await frames();
+    const initial=await page.evaluate(()=>window.pickerFixture.workflowState());
+    for(const host of ['data-run-after-host','data-restart-after-host']){
+      await page.locator('['+host+'] [data-run-after-tab-row]').click();
+      const menu=page.locator('[data-run-after-picker-menu]');await menu.waitFor();
+      const workflow=id=>menu.locator('[data-run-after-workflow-chip="'+id+'"]');
+      assert.deepEqual(await menu.locator('[data-run-after-workflow-chip]').evaluateAll(nodes=>nodes.map(n=>n.dataset.runAfterWorkflowChip)),
+        ['picker-space','second-workflow','__noted_workflow_inbox__']);
+      await workflow('second-workflow').click();await frames();
+      const ids=()=>menu.locator('[data-run-after-tab-row]').evaluateAll(nodes=>nodes.map(n=>n.dataset.runAfterTabRow));
+      assert.deepEqual(await ids(),['c','d']);
+      const strip=menu.locator('[data-run-after-workflow-chip]').first().locator('..');
+      const overflow=await strip.evaluate(n=>n.scrollWidth>n.clientWidth);assert.equal(overflow,true);
+      await strip.hover();await page.mouse.wheel(0,-1000);await frames();
+      const before=await strip.evaluate(n=>n.scrollLeft);await page.mouse.wheel(0,100);await frames();
+      assert.ok(await strip.evaluate(n=>n.scrollLeft)>before,'wheel scrolls workflow strip');
+      await workflow('__noted_workflow_inbox__').click();await frames();assert.deepEqual(await ids(),['e']);
+      assert.equal(await workflow('__noted_workflow_inbox__').locator('[data-workflow-inbox-icon]').count(),1);
+      await page.screenshot({path:path.join(artifact,host+'-workflow.png')});
+      await menu.locator('[data-run-after-tab-row="e"]').click();await frames();
+      assert.deepEqual(await page.evaluate(()=>window.pickerFixture.workflowState()),initial);
+      result.checks.push(host+': canonical workflow groups in one namespace, horizontal wheel, Inbox icon, exact selection without navigation');
+    }
+    await page.locator('[data-run-after-host] button').first().click();
+    const menu=page.locator('[data-run-after-picker-menu]');await menu.waitFor();
+    await menu.locator('[data-run-after-workflow-chip="picker-space"]').click();await frames();
+    assert.deepEqual(await menu.locator('[data-run-after-tab-row]').evaluateAll(nodes=>nodes.map(n=>n.dataset.runAfterTabRow)),['b']);
+    await page.evaluate(()=>window.pickerFixture.moveCanonical());await frames();
+    assert.deepEqual(await menu.locator('[data-run-after-tab-row]').evaluateAll(nodes=>nodes.map(n=>n.dataset.runAfterTabRow)),['b','c']);
+    result.checks.push('membership-only move updates open picker without resetting chosen workflow');
+    await page.keyboard.press('Escape');
+  }else{
   await reset();
   await page.evaluate(()=>window.pickerFixture.sidebar(true));
   await page.locator('[data-card-sidebar] [data-tab-item][data-tab-id="c"]').waitFor();
@@ -368,8 +467,8 @@ try {
   const paneMetrics=await metrics(page.locator('[data-card-reference] [data-tab-card="c"]'));
   const hiddenMetrics=await metrics(card('c'));assert.deepEqual(hiddenMetrics,paneMetrics);
   assert.equal(hiddenMetrics.percentage,'84');assert.equal(hiddenMetrics.marker,true);assert.equal(hiddenMetrics.tasks,1);
-  assert.equal(await card('c').locator('[data-tab-card-project-icon]').count(),1);
-  assert.equal(await page.locator('[data-card-reference] [data-tab-card-project-icon]').count(),0,'project icon can be hidden by the shared card caller');
+  assert.equal(await card('c').locator('[data-tab-card-project-icon]').count(),0,'directory icon is absent even for legacy callers requesting it');
+  assert.equal(await page.locator('[data-card-reference] [data-tab-card-project-icon]').count(),0,'workflow identity belongs to the container');
   assert.ok(await popup.evaluate(e=>e.scrollHeight<=e.clientHeight+1),'signal overhang must not create a spurious scrollbar');
   assert.ok(await card('c').locator('.tab-process-bar-ai-shimmer-overlay').count()>0);
   const normalBg=await card('c').evaluate(e=>getComputedStyle(e).backgroundColor);
@@ -425,14 +524,17 @@ try {
   const resized=await metrics(card('c'));assert.equal(resized.font,'22px');
   await page.screenshot({path:path.join(artifact,'hidden-windows-edge.png')});
   result.checks.push('font-size and zero-gap changes keep the popup within the viewport at the bottom edge');
+  }
+  }
   assert.deepEqual(result.errors,[]);
   result.state=await page.evaluate(()=>({violations:window.pickerFixture.violations,unknown:[...new Set(window.pickerFixture.unknown)]}));
   assert.deepEqual(result.state.violations,[]);result.pass=true;
-} catch (error) { result.failure = String(error); process.exitCode = 1; }
+} catch (error) { result.failure = error.stack || String(error); process.exitCode = 1; }
 finally {
   if (app) await app.close();
-  execFileSync('git', ['worktree', 'remove', '--force', snapshot], { cwd: repo, stdio: 'pipe' });
-  result.cleanup = { electronClosed: !!app, snapshotRemoved: true };
+  await fs.rm(snapshot,{recursive:true,force:true});
+  await fs.rm(path.join(artifact,'user-data'),{recursive:true,force:true});
+  result.cleanup = { electronClosed: !!app, snapshotRemoved: true, profileRemoved:true };
   await fs.writeFile(path.join(artifact, 'result.json'), JSON.stringify(result, null, 2));
   await fs.writeFile(path.join(artifact, 'renderer.log'), logs.join('\n'));
 }

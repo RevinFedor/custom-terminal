@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile, appendFile, stat, readFile } from 'node:fs/promises';
+import vm from 'node:vm';
+import ts from 'typescript';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +16,211 @@ const { SavedHistoryOperations } = require('../src/main/saved-history-operation.
 const { SessionTranscriptService } = require('../src/main/session-transcript-service.js');
 
 const terminalServerPath = fileURLToPath(new URL('./terminal-server.mjs', import.meta.url));
+
+test('cancel_message uses the exact thread and trusted calling tab, never Send/Stop/dismiss', async t => {
+  const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { tabMessages: { cancellation: { version: 1 } } } } }
+    : { status: 200, body: { ok: true, cancelled: true, messageId: 'question-1', requestedMessageId: 'question-1' } });
+  const result = await h.invoke({ messageId: 'question-1', tabId: 'untrusted-override' }, 'cancel_message');
+  assert.equal(result.result.isError, undefined);
+  assert.equal(result.result.structuredContent.cancelled, true);
+  assert.deepEqual(h.requests.map(r => [r.method, r.url]), [
+    ['GET', '/api/me'], ['POST', '/api/tab-messages/question-1/cancel'],
+  ]);
+  assert.equal(h.requests[1].body.tabId, 'test-source-tab');
+  assert.equal(h.requests[1].body.prompt, undefined);
+});
+
+test('cancel_message distinguishes old app and unknown ACK without a fallback mutation', async t => {
+  const old = await createHarness(t, () => ({ status: 200, body: { capabilities: {} } }));
+  const unsupported = await old.invoke({ messageId: 'q-old' }, 'cancel_message');
+  assert.equal(unsupported.result.structuredContent.code, 'app_update_required');
+  assert.equal(unsupported.result.structuredContent.mutationAttempted, false);
+  assert.deepEqual(old.requests.map(r => r.method), ['GET']);
+  const lost = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { tabMessages: { cancellation: { version: 1 } } } } }
+    : { disconnect: true });
+  const unknown = await lost.invoke({ messageId: 'q-exact' }, 'cancel_message');
+  assert.equal(unknown.result.isError, true);
+  assert.equal(unknown.result.structuredContent.messageId, 'q-exact');
+  assert.equal(unknown.result.structuredContent.mutationAttempted, true);
+  assert.equal(lost.requests.length, 2);
+});
+
+test('cancel_message is discoverable with no target/runtime/attempt override', async t => {
+  const h = await createHarness(t, () => assert.fail('tool catalog is local'));
+  const tool = (await h.rpc('tools/list')).result.tools.find(t => t.name === 'cancel_message');
+  assert.ok(tool);
+  assert.deepEqual(tool.inputSchema.required, ['messageId']);
+  assert.deepEqual(Object.keys(tool.inputSchema.properties), ['messageId']);
+});
+
+test('passive response observation uses one durable request without a target prompt', async t => {
+  const h = await createHarness(t, (body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { responseObservations: { version: 1 } } } }
+    : { status: 202, body: { accepted: true, runId: body.runId, run: { runKind: 'response-observation' } } });
+  const result = await h.invoke({ tabId: 'target', runId: 'observe-target', waitForDescendants: true }, 'wait_for_tab_response');
+  assert.equal(result.result.isError, undefined);
+  assert.equal(result.result.structuredContent.runId, 'observe-target');
+  const calls = h.requests.filter(request => request.method === 'POST');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/api/terminal-tabs/target/response-observations');
+  assert.equal(calls[0].body.sourceTabId, 'test-source-tab');
+  assert.equal(calls[0].body.waitForDescendants, true);
+  assert.equal(calls[0].body.prompt, undefined);
+});
+
+test('response observation fails clearly on an old app and retains its ID after lost ACK', async t => {
+  const old = await createHarness(t, () => ({ status: 200, body: { capabilities: {} } }));
+  const unsupported = await old.invoke({ tabId: 'target' }, 'wait_for_tab_response');
+  assert.equal(unsupported.result.structuredContent.code, 'app_update_required');
+  assert.equal(unsupported.result.structuredContent.mutationAttempted, false);
+  assert.ok(unsupported.result.structuredContent.runId);
+  assert.deepEqual(old.requests.map(request => request.method), ['GET']);
+  const lost = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { responseObservations: { version: 1 } } } }
+    : { disconnect: true });
+  const failed = await lost.invoke({ tabId: 'target' }, 'wait_for_tab_response');
+  assert.equal(failed.result.isError, true);
+  assert.equal(failed.result.structuredContent.runId, lost.requests[1].body.runId);
+  assert.equal(failed.result.structuredContent.mutationAttempted, true);
+  assert.equal(lost.requests.length, 2);
+});
+
+test('response observation crosses actual MCP/HTTP, durable registry, Codex bytes and source notification owner', async t => {
+  const Database = require('better-sqlite3');
+  let db;
+  try { db = new Database(':memory:'); }
+  catch (error) {
+    if (/NODE_MODULE_VERSION/.test(error.message)) { t.skip('Run with ELECTRON_RUN_AS_NODE=1 for native SQLite'); return; }
+    throw error;
+  }
+  const { OrchestrationRunStore, isTerminalStatus, isExternalResearchRun, isCompleteOrchestrationResult,
+    captureOrchestrationResultAttempt, orchestrationResultAttemptMatches, classifyAgentSendReceipt } = require('../src/main/orchestration-runs');
+  const { createResponseObservationApi } = require('../src/main/response-observation-api');
+  const { createResponseObservationService } = require('../src/main/response-observation-service');
+  const { ResponseObservationEvidenceStore } = require('../src/main/response-observation-evidence');
+  const { isResponseObservation } = require('../src/main/orchestration-response-observation');
+  const { createAgentResponseObservationReader } = require('../src/main/agent-response-observation-reader');
+  const contentModule = require('../src/main/orchestration-completion-content');
+  const { promptFingerprint } = require('../src/main/claude-prompt-carriers');
+  const { promptAuditFingerprint } = require('../src/main/prompt-audit-fingerprint');
+  const { _api } = require('../src/main/ipc/codex-data');
+  const root = await mkdtemp(join(tmpdir(), 'mcp-observed-response-'));
+  const file = join(root, 'rollout.jsonl');
+  const event = (type, values = {}) => ({ type: 'event_msg', payload: { type, ...values } });
+  const encode = rows => rows.map(row => JSON.stringify(row) + '\n').join('');
+  await writeFile(file, encode([event('task_started', { turn_id: 'T' }), event('user_message', { message: 'existing task' })]));
+  const execution = { provider: 'codex', sessionId: 'S', turnId: 'T', generation: 3 };
+  const resolveSource = async () => { const s = await stat(file); return { success: true, sessionId: 'S', revisionKey: file,
+    sourceSnapshot: { filePath: file, sessionId: 'S', size: s.size, mtimeMs: s.mtimeMs },
+    segments: [{ filePath: file, physicalSessionId: 'S', fromByte: 0, toByte: s.size, startLine: 0, frozen: false }] }; };
+  let busy = true;
+  const reader = createAgentResponseObservationReader({
+    captureState: () => ({ known: true, exists: true, toolType: 'codex', sessionId: 'S', cwd: root,
+      busy, revision: busy ? 'active' : 'done', backgroundWorkCount: 0,
+      executionContext: execution, turn: { ...execution, active: busy } }),
+    readLifecycle: async () => ({ processStatus: 'found', processName: 'codex', processPid: 42 }),
+    loadSessionTurns: async () => { throw Error('Pinned execution must not materialize full History'); },
+    readTurnResult: async () => { throw Error('Pinned execution must not use a guessed prompt'); },
+    readCodexExecution: request => _api.loadCodexObservedExecution({ ...request, resolveSource }),
+  });
+  const store = new OrchestrationRunStore(join(root, 'runs.json'));
+  await store.initialize();
+  const evidence = new ResponseObservationEvidenceStore(db), contents = new contentModule.CompletionContentStore({ db });
+  const writes = [], sourceReads = [];
+  let service;
+  const webSource = await readFile(new URL('../src/main/web-server.js', import.meta.url), 'utf8');
+  const ast = ts.createSourceFile('web-server.js', webSource, ts.ScriptTarget.Latest, true);
+  const functions = ['orchestrationNotificationText', 'orchestrationPresentationSnapshot',
+    'prepareOrchestrationCompletionContent', 'sendOrchestrationCompletionNotification'].map(name => {
+    const fn = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+    assert.ok(fn, name); return fn.getText(ast);
+  });
+  const context = vm.createContext({ console, crypto: require('node:crypto'), Set, Date,
+    resolvedPort: 1, orchestrationNotificationInflight: new Set(), tabWorkContext: null,
+    getOrchestrationRunStore: () => store, getCompletionContentStore: () => contents,
+    getResponseObservationService: () => service,
+    ...contentModule, captureOrchestrationResultAttempt, orchestrationResultAttemptMatches,
+    isTerminalStatus, isExternalResearchRun, isResponseObservation, isCompleteOrchestrationResult,
+    promptFingerprint, promptAuditFingerprint, classifyAgentSendReceipt,
+    AGENT_SEND_RECEIPT_STATES: require('../src/main/agent-send-receipt-registry').RECEIPT_STATES,
+    isAgentSendProviderQueueAccepted: () => false,
+    emitOrchestrationChanges() {}, finalizeSettledOrchestration: async () => {},
+    releaseOrchestrationSourceProof: async () => {}, armOrchestrationSourceProof: async () => ({ success: true }),
+    resolveAgentSessionInfo: async tabId => { sourceReads.push(tabId); assert.equal(tabId, 'test-source-tab');
+      return { toolType: 'codex', commandType: 'codex', sessionId: 'source-session', status: 'busy' }; },
+    resolveOrchestrationSourceNotificationSendOptions: () => ({ statusAtSend: 'busy', queue: true }),
+    runAgentSendScenario: async request => {
+      writes.push(request); assert.equal(request.tabId, 'test-source-tab');
+      return { success: true, submitted: true, receiptState: 'confirmed', codexAudit: {
+        success: true, actualHash: promptAuditFingerprint(request.prompt), expectedHash: promptAuditFingerprint(request.prompt),
+        sessionId: 'source-session', entryUuid: 'source-notification', sourceIdentity: 'source-notification-physical',
+        executionContext: { provider: 'codex', sessionId: 'source-session', turnId: 'source-followup', generation: 4 },
+      } };
+    },
+    notifyAgentPromptAuditResult: async detail => store.confirmSourceFollowup('observed', { ...detail,
+      kind: 'prompt-audit', sourceTabId: detail.tabId, userUuid: detail.entryUuid }),
+    reconcileOrchestrationSourceFollowup: async () => ({ confirmed: true }),
+  });
+  vm.runInContext(functions.join('\n'), context);
+  service = createResponseObservationService({ store, evidence,
+    readState: reader.getAgentResponseState, readResponse: reader.readAgentObservedResponse,
+    subscribe: async () => ({ success: true }), unsubscribe: async () => {},
+    onChanged() {}, onSettled: context.sendOrchestrationCompletionNotification,
+    log: { log() {}, warn() {} },
+  });
+  const api = createResponseObservationApi({ store,
+    descriptor: tabId => ({ tabId, tabName: tabId, projectId: 'test-project', projectPath: root, cwd: root, toolType: 'codex' }),
+    readState: reader.getAgentResponseState, sourceExecutionContext: () => null,
+    captureSourceTarget: async () => ({ toolType: 'codex', sessionId: 'source-session' }), onAccepted() {},
+  });
+  const handler = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'handleApi');
+  const matchDeclaration = handler.body.statements.find(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(declaration => declaration.name.getText(ast) === 'responseObservationMatch'));
+  const route = handler.body.statements.find(node => ts.isIfStatement(node)
+    && node.expression.getText(ast) === "responseObservationMatch && req.method === 'POST'");
+  assert.ok(matchDeclaration && route);
+  const routeContext = vm.createContext({ getResponseObservationApi: () => api,
+    decId: decodeURIComponent, withOrchestrationUrls: run => run,
+    readBody: async request => request.parsedBody,
+    sendJson: (_response, status, body) => ({ status, body }),
+  });
+  const actualRoute = vm.runInContext('(async (req,res,parsed) => {'
+    + matchDeclaration.getText(ast) + '\n' + route.getText(ast) + '})', routeContext);
+  t.after(async () => { await service.dispose(); await store.flush(); db.close(); await rm(root, { recursive: true, force: true }); });
+  const h = await createHarness(t, async (body, _i, req) => {
+    assert.equal(req.headers.authorization, 'Bearer test-token');
+    context.resolvedPort = Number(new URL('http://' + req.headers.host).port);
+    if (req.url === '/api/me') return { status: 200, body: { capabilities: { responseObservations: { version: 1 } } } };
+    assert.equal(req.url, '/api/terminal-tabs/target/response-observations');
+    req.parsedBody = body;
+    return actualRoute(req, null, { pathname: new URL(req.url, 'http://localhost').pathname });
+  });
+  const accepted = await h.invoke({ tabId: 'target', runId: 'observed', waitForDescendants: false }, 'wait_for_tab_response');
+  assert.equal(accepted.result.structuredContent.accepted, true);
+  await service.arm(await store.getInternal('observed'));
+  assert.equal(writes.length, 0);
+  assert.deepEqual(store.readInheritedActivity().sourceTabIds, ['test-source-tab']);
+  await appendFile(file, encode([{ type: 'response_item', payload: { type: 'message', role: 'assistant',
+    content: [{ type: 'output_text', text: 'EXACT OBSERVED FINAL' }] } }, event('task_complete', { turn_id: 'T', last_agent_message: 'EXACT OBSERVED FINAL' })]));
+  busy = false;
+  await service.handleLifecycle('target', { type: 'done', reason: 'task_complete', executionContext: execution });
+  await service.reconcile('observed', 'actual-private-completion');
+  assert.equal(writes.length, 1);
+  assert.match(writes[0].prompt, /EXACT OBSERVED FINAL/);
+  assert.equal(writes[0].handoffId, 'orchestration-complete:observed');
+  assert.equal(writes[0].sendOperationKey, 'history:test-source-tab:orchestration-complete:observed');
+  assert.equal(writes[0].expectedTarget.sessionId, 'source-session');
+  assert.equal(writes[0].presentationSnapshot.semanticTags[0].runKind, 'response-observation');
+  const run = await store.get('observed');
+  assert.equal(run.status, 'completed');
+  assert.equal(run.notificationStatus, 'sent');
+  assert.ok(run.sourceFollowupStartedAt);
+  assert.ok(sourceReads.every(id => id === 'test-source-tab'));
+  await service.reconcile('observed', 'duplicate-completion');
+  assert.equal(writes.length, 1);
+});
 
 test('exact receipt recovery methods forward only operation/attempt and explicit caller-owned release identity', async t => {
   const h = await createHarness(t, (body, _i, req) => req.url === '/api/me'

@@ -13,13 +13,14 @@ export function choosePromptQueueContinuationForOutcome({
   queueActive,
   queueTriggerIsOwner,
   queueArmedAt,
+  queueOwnLiveIdle = false,
   loopActive,
   loopArmedAt,
   explicitTaskComplete = false,
 }, outcomeTs) {
   if (queueActive
     && queueTriggerIsOwner
-    && isWorkflowOutcomeAtOrAfterArm(queueArmedAt, outcomeTs)) {
+    && (queueOwnLiveIdle || isWorkflowOutcomeAtOrAfterArm(queueArmedAt, outcomeTs))) {
     return 'queue';
   }
   if (explicitTaskComplete) return null;

@@ -710,6 +710,16 @@ function createProviderSemanticShadow({
         }
       }
       classifyCount(providerState, classification);
+      if (current && !current.finished) {
+        // A subsequent request is not proof that the prior one failed. Keep
+        // its items, but expose a missing terminal event without logging the
+        // request body or silently reclassifying an open response as complete.
+        record(tabId, 'codex', 'OPEN_REQUEST_ON_NEXT', {
+          request: short(current.requestId, 20), response: short(current.responseId, 20),
+          next: requestId, turn: short(current.turnId, 18),
+          items: current.itemOrder.length, interrupt: current.interruptRequested === true,
+        });
+      }
       current = {
         provider: 'codex',
         tabId,
@@ -744,6 +754,9 @@ function createProviderSemanticShadow({
           event: {
             type: 'turn_started',
             requestId,
+            requestKind: current.requestKind,
+            sessionId: current.sessionId,
+            observedAt: now(),
             threadId: current.threadId,
             turnId: current.turnId,
           },
@@ -873,6 +886,8 @@ function createProviderSemanticShadow({
             event: {
               type: 'request_failed',
               requestId: context.requestId,
+              requestKind: context.requestKind,
+              sessionId: context.sessionId,
               threadId: context.threadId,
               turnId: context.turnId,
               reason,
@@ -900,9 +915,13 @@ function createProviderSemanticShadow({
       );
       record(tabId, 'codex', 'RESPONSE_END', {
         request: short(context.requestId, 20),
+        response: short(context.responseId, 20),
         turn: short(context.turnId, 18),
         classification: context.classification,
         reason,
+        completedItems: responseItems.filter(item => item.completed === true).length,
+        openItems: responseItems.filter(item => item.completed !== true).length,
+        interrupt: context.interruptRequested === true,
         chars: responseChars,
         hash: responseTruncated ? 'truncated' : fullText ? textHash(fullText) : '-',
       });
@@ -914,6 +933,8 @@ function createProviderSemanticShadow({
           event: {
             type: 'turn_completed',
             requestId: context.requestId,
+            requestKind: context.requestKind,
+            sessionId: context.sessionId,
             threadId: context.threadId,
             turnId: context.turnId,
           },
@@ -925,7 +946,24 @@ function createProviderSemanticShadow({
     const observeClientFrame = (data, isBinary = false) => {
       if (isBinary) return false;
       const payload = parseJson(data);
-      if (!payload || payload.type !== 'response.create') return false;
+      if (!payload) return false;
+      if (payload.type === 'response.interrupt') {
+        const responseId = payload.response_id;
+        const context = findContext(payload);
+        if (!responseId || !context || context.responseId !== responseId || context.finished) return false;
+        if (context.interruptRequested !== true) {
+          context.interruptRequested = true;
+          record(tabId, 'codex', 'INTERRUPT_REQUEST', {
+            request: short(context.requestId, 20), response: short(responseId, 20),
+            turn: short(context.turnId, 18),
+            mode: payload.mode === 'discard_partial_items' ? 'discard_partial_items' : 'other',
+          });
+        }
+        // The CLI's interrupt intent alone cannot retract text: wait for the
+        // server's exact response.incomplete boundary, not a new request/timer.
+        return true;
+      }
+      if (payload.type !== 'response.create') return false;
       beginRequest(payload);
       return true;
     };
@@ -936,6 +974,28 @@ function createProviderSemanticShadow({
       if (!payload) return false;
       const type = String(payload.type || '');
       const context = findContext(payload);
+      if (type === 'response.incomplete') {
+        const responseId = payload.response_id || payload.response?.id;
+        const conflictingIds = payload.response_id && payload.response?.id
+          && payload.response_id !== payload.response.id;
+        if (conflictingIds || !responseId || !context || context.responseId !== responseId) {
+          record(tabId, 'codex', 'BOUNDARY_IGNORED', {
+            wireType: type, response: short(responseId, 20),
+            reason: conflictingIds ? 'conflicting-response-ids'
+              : responseId ? 'unknown-response-id' : 'missing-response-id',
+          });
+          return false;
+        }
+        const reason = payload.response?.incomplete_details?.reason;
+        const safeReason = typeof reason === 'string' && /^[a-z0-9_-]{1,64}$/i.test(reason)
+          ? reason : 'unknown';
+        // Native Codex steering uses response.interrupt/discard_partial_items
+        // followed by response.incomplete/interrupted on the SAME WebSocket.
+        // No socket close follows. Reuse the exact failed-segment policy:
+        // discard open partials, preserve completed unconfirmed items, and
+        // never recover incomplete output or close the authoritative turn.
+        return finishContext(context, 'response-incomplete:' + safeReason);
+      }
       if (!context || context.finished) return false;
       if (type === 'response.created' && context && payload.response?.id) {
         context.responseId = String(payload.response.id);

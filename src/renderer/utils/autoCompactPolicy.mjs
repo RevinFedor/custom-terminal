@@ -1,5 +1,28 @@
 export const UNPLACED_AUTOMATION_WORKFLOW = '__unplaced__';
 
+/** Selection is the desktop switch. Legacy/API disabled policies may retain
+ * remembered scope, but that memory is not an active checkmark or permission
+ * to enable other workflows when the user picks just one. */
+export function selectedAutoCompactScope(policy) {
+  return {
+    allWorkflows: policy.enabled === true && policy.allWorkflows === true,
+    workflowIds: policy.enabled === true ? [...policy.workflowIds] : [],
+    includeUnplaced: policy.enabled === true && policy.includeUnplaced === true,
+  };
+}
+
+export function toggleAutoCompactScope(policy, action) {
+  const scope = selectedAutoCompactScope(policy);
+  if (action.kind === 'all') scope.allWorkflows = !scope.allWorkflows;
+  else if (action.kind === 'unplaced') scope.includeUnplaced = !scope.includeUnplaced;
+  else if (action.kind === 'workflow' && typeof action.id === 'string' && action.id) {
+    scope.workflowIds = scope.workflowIds.includes(action.id)
+      ? scope.workflowIds.filter(id => id !== action.id) : [...scope.workflowIds, action.id];
+  } else throw new Error('auto_compact_scope_action_invalid');
+  return { ...scope, enabled: scope.allWorkflows || scope.includeUnplaced || scope.workflowIds.length > 0,
+    scopeInitialized: true };
+}
+
 export function normalizeAutoCompactPolicy(value = {}) {
   if (value.organizationVersion != null && value.organizationVersion !== 1) throw new Error('automation_forward_version');
   return {

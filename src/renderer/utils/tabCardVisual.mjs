@@ -96,6 +96,8 @@ export function resolveTabCardMetrics(geo, { fontSize, showTaskLane = false, has
 // font-dependent and the prediction drifts; the chip sets this value on itself
 // so the two cannot disagree.
 export const TAB_CARD_LINE_HEIGHT = 1.2;
+// Existing pane-strip row gutter; shared with the absolute file-chip layout.
+export const TAB_STRIP_ROW_GAP = 6;
 
 // The pane header was a hard 26px while the chip inside it obeys the user's
 // Settings → Размеры. Any setting that makes the chip taller than 26 made it

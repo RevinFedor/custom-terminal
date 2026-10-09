@@ -1,10 +1,21 @@
 const { ipcMain } = require('node:worker_threads').isMainThread ? require('electron') : {};
 const path = require('path');
 const fs = require('fs');
+const { causal: perfCausal } = require('../perf-causal-context');
+const { timelineResponsePreview } = require('../../shared/timeline-response-preview.cjs');
 const { historyImageCountFromProviderRecord } = require('../../shared/history-search.cjs');
 const { historyRecordTimeFromRecord } = require('../../shared/history-record-time.cjs');
+const { normalizeCodexTextPhase } = require('../../shared/history-text-phase.cjs');
 const os = require('os');
 const crypto = require('crypto');
+const { createCodexRawLiteralResolver } = require('../codex-exec-raw-literals');
+const { inspectCodexSettledEmission, matchCodexSettledResults } = require('../codex-exec-result-attribution');
+const {
+  codexNativeQuestionDefinition,
+  registerNativeQuestionDefinition,
+  proveCodexNativeQuestionReply,
+} = require('../../shared/native-question-reply.cjs');
+const questionReplyFingerprint = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 const { historyRewriteOperation } = require('../../shared/fork-operation.cjs');
 const { commitPreparedFork } = require('../fork-commit');
 const { cloneProjectionGraphAsync, measureProjectionGraphBytes, createProjectionIdentityMap, retainCheckpoint } = require('../codex-projection-checkpoint');
@@ -16,7 +27,10 @@ const {
 const { buildChildProcessEnv } = require('../child-process-env');
 const {
   createCodexSubagentTracker,
+  extractCodexSpawnIdentities,
+  normalizeCodexSubagentCall,
   isCodexSubagentControlCall,
+  isCodexSubagentNamespace,
   isCodexSubagentSpawnCall,
 } = require('../codex-subagent-cards');
 const {
@@ -91,7 +105,7 @@ const USAGE_ACCOUNTS_ERROR_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const CODEX_REMOTE_USAGE_CACHE_TTL_MS = 25 * 1000;
 const CODEX_REMOTE_USAGE_STALE_MS = 6 * 60 * 1000;
 const CODEX_REMOTE_USAGE_ERROR_COOLDOWN_MS = 60 * 1000;
-const CODEX_REMOTE_USAGE_TIMEOUT_MS = 8 * 1000;
+const CODEX_REMOTE_USAGE_TIMEOUT_MS = 15 * 1000;
 const CODEX_RESET_CREDITS_TIMEOUT_MS = 4 * 1000;
 const CODEX_USAGE_PERSISTENCE_KEY = 'codexUsageAccounts.v1';
 const CODEX_USAGE_PENDING_CONFIRM_MS = 30 * 1000;
@@ -897,9 +911,11 @@ function parseSimpleJsLiteralAt(source, start = 0, depth = 0) {
   return null;
 }
 
-function resolveSimpleJsCallValue(source, call) {
+function resolveSimpleJsCallValue(source, call, resolveRawLiteral) {
   const direct = parseSimpleJsLiteralAt(call.argumentsText || '', 0);
   if (direct) return direct.value;
+  const rawLiteral = resolveRawLiteral?.(call);
+  if (rawLiteral != null) return rawLiteral;
   const identifier = String(call.argumentsText || '').trim().match(/^([A-Za-z_$][\w$]*)$/)?.[1];
   if (!identifier) return null;
   const initializer = findLastJsVariableInitializer(source, identifier, call.start);
@@ -929,8 +945,17 @@ function findCodexExecNestedCalls(source) {
     const nameStart = index + 'tools.'.length;
     const nameMatch = /^[A-Za-z_$][\w$]*/.exec(source.slice(nameStart));
     if (!nameMatch) continue;
-    const toolName = nameMatch[0];
+    let toolName = nameMatch[0];
+    let namespace = '';
     let open = skipJsTrivia(source, nameStart + toolName.length);
+    if (source[open] === '.' && isCodexSubagentNamespace(toolName)) {
+      const memberStart = skipJsTrivia(source, open + 1);
+      const member = /^[A-Za-z_$][\w$]*/.exec(source.slice(memberStart));
+      if (!member) continue;
+      namespace = toolName;
+      toolName = member[0];
+      open = skipJsTrivia(source, memberStart + toolName.length);
+    }
     if (source[open] !== '(') continue;
 
     let depth = 1;
@@ -957,6 +982,7 @@ function findCodexExecNestedCalls(source) {
     if (depth !== 0) continue;
     calls.push({
       toolName,
+      ...(namespace ? { namespace } : {}),
       start: index,
       end: cursor + 1,
       argumentsText: source.slice(open + 1, cursor),
@@ -964,6 +990,19 @@ function findCodexExecNestedCalls(source) {
     index = cursor;
   }
   return calls;
+}
+
+function codexHistoryLogicalCalls(call) {
+  const source = call?.toolName === 'exec' && typeof call?.args?.input === 'string' ? call.args.input : '';
+  if (!source) return [normalizeCodexSubagentCall(call || {})];
+  const resolveRawLiteral = createCodexRawLiteralResolver(source);
+  return findCodexExecNestedCalls(source).map((nestedCall, index) => {
+    const parsed = resolveSimpleJsCallValue(source, nestedCall, resolveRawLiteral);
+    const args = parsed && typeof parsed === 'object' ? parsed
+      : typeof parsed === 'string' ? { input: parsed }
+        : { input: compactPreview(nestedCall.argumentsText, 1000) };
+    return { ...normalizeCodexSubagentCall({ ...nestedCall, args }), index };
+  });
 }
 
 function normalizeCodexHistoryTextPart(text) {
@@ -1037,8 +1076,16 @@ function codexHistoryOutputParts(rawOutput) {
  * normally; a false positive strands it forever.
  */
 function codexHistoryCellId(rawOutput) {
-  const text = codexHistoryOutputParts(rawOutput).join('\n');
+  // When a streaming cell already emitted output, the presentation splitter
+  // removes its machine header. Read that first block before splitting too.
+  const header = Array.isArray(rawOutput) && typeof rawOutput[0]?.text === 'string' ? rawOutput[0].text : '';
+  const text = [header, ...codexHistoryOutputParts(rawOutput)].join('\n');
   return /^\s*Script running with cell ID\s+(\d+)\s*$/m.exec(text)?.[1] || null;
+}
+
+function codexHistorySettledOutputParts(rawOutput) {
+  return codexHistoryOutputParts(rawOutput).filter(part =>
+    !/^Script running with cell ID\s+\d+\b[\s\S]*\nOutput:\n?$/.test(part));
 }
 
 function parseApplyPatchHunks(body) {
@@ -1416,7 +1463,9 @@ function firstCodexMcpDetail(args) {
 }
 
 function normalizeCodexHistoryCall(toolName, args, namespace = '') {
-  const name = String(toolName || 'tool');
+  const identity = normalizeCodexSubagentCall({ toolName: String(toolName || 'tool'), namespace });
+  const name = identity.toolName;
+  namespace = identity.namespace;
   const input = args && typeof args === 'object' ? args : { input: args };
   const qualifiedName = namespace && namespace.startsWith('mcp__')
     ? `${namespace}__${name}`
@@ -1525,7 +1574,13 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
       // finished is re-projected by the durable parser, which wins by source
       // identity and carries the terminal status.
       // toolUseId is stamped by the caller, which owns the call identity.
-      return [{ tool: 'Task', description, subagentStatus: 'running' }];
+      return [{ tool: 'Task', description, subagentStatus: 'running',
+        subagentSpawn: { namespace, args: {
+          ...(typeof input.task_name === 'string' ? { task_name: input.task_name } : {}),
+          ...(typeof input.agent_type === 'string' ? { agent_type: input.agent_type } : {}),
+          ...(typeof input.message === 'string' && !input.message.startsWith('gAAAA')
+            ? { message: input.message } : {}),
+        } } }];
     }
     if (qualifiedName === 'wait_agent') {
       return [{ toolName: 'Wait', args: { summary: 'Waiting for subagents' } }];
@@ -1534,8 +1589,33 @@ function normalizeCodexHistoryCall(toolName, args, namespace = '') {
   return [{ toolName: humanizeCodexToolName(qualifiedName), args: input }];
 }
 
-function assignCodexHistoryResults(callGroups, rawOutput, isError) {
+function assignCodexHistoryResults(callGroups, rawOutput, isError, { settledPlan = null, source = '', pending = false } = {}) {
   const parts = codexHistoryOutputParts(rawOutput);
+  if (settledPlan) {
+    const output = codexHistorySettledOutputParts(rawOutput);
+    const matched = matchCodexSettledResults(settledPlan, output, { allowPartial: pending });
+    for (let index = 0; index < callGroups.length; index += 1) {
+      const result = matched?.get(index);
+      for (const action of callGroups[index]) {
+        if (result) {
+          action.result = result.value === undefined ? '' : codexHistoryOutputParts(result.value).join('\n');
+          action.isError = !!isError || result.isError;
+        } else if (!pending) {
+          action.result = '';
+          action.isError = !!isError;
+        }
+      }
+    }
+    if (!matched && !pending) {
+      // The enclosing exec owns these bytes. Do not attach them to a guessed
+      // child; keep the actual script/output available as a separate card.
+      callGroups.push([{
+        toolName: 'Script', args: { command: source },
+        result: output.join('\n'), isError: !!isError,
+      }]);
+    }
+    return;
+  }
   const perCall = callGroups.length === parts.length
     ? parts
     : callGroups.length === 1
@@ -1555,12 +1635,14 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
     : '';
   const callId = call?.callId == null ? '' : String(call.callId);
   const nested = source ? findCodexExecNestedCalls(source) : [];
+  const settledPlan = nested.length ? inspectCodexSettledEmission(source, nested) : null;
+  const resolveRawLiteral = createCodexRawLiteralResolver(source);
   const callGroups = [];
   const usedPatchEventIndexes = new Set();
 
   if (nested.length > 0) {
     for (const nestedCall of nested) {
-      const parsed = resolveSimpleJsCallValue(source, nestedCall);
+      const parsed = resolveSimpleJsCallValue(source, nestedCall, resolveRawLiteral);
       const args = parsed && typeof parsed === 'object'
         ? parsed
         : (typeof parsed === 'string' ? { input: parsed } : { input: compactPreview(nestedCall.argumentsText, 1000) });
@@ -1588,7 +1670,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
           }
         }
       }
-      callGroups.push(canonicalPatchActions || normalizeCodexHistoryCall(nestedCall.toolName, args));
+      callGroups.push(canonicalPatchActions || normalizeCodexHistoryCall(nestedCall.toolName, args, nestedCall.namespace || ''));
     }
   } else if (call?.toolName === 'exec') {
     // An exec that calls no tool at all is a plain snippet Codex ran in its
@@ -1621,8 +1703,41 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
   // successful result. Keeping call-only actions pending is required by every
   // consumer that joins exact tool start/end evidence (including linked-file
   // own-edit suppression). An explicit empty string is still a real result.
-  if (!cellId && (rawOutput !== undefined || isError)) {
-    assignCodexHistoryResults(callGroups, rawOutput, isError);
+  if ((!cellId || settledPlan) && (rawOutput !== undefined || isError)) {
+    assignCodexHistoryResults(callGroups, rawOutput, isError, { settledPlan, source, pending: !!cellId });
+  }
+  // One syntactic spawn in an exec loop can return N actual native receipts.
+  // Their IDs, not source-code guesses about the loop, define cardinality.
+  const spawnGroups = callGroups.filter(group => group.some(action => action.subagentSpawn));
+  let canonicalIndex = 0;
+  for (const group of callGroups) for (const action of group) action.__canonicalIndex = canonicalIndex++;
+  const outputParts = rawOutput === undefined ? [] : codexHistoryOutputParts(rawOutput);
+  for (let groupIndex = 0; groupIndex < callGroups.length; groupIndex += 1) {
+    const group = callGroups[groupIndex];
+    const spawn = group.find(action => action.subagentSpawn);
+    if (!spawn) continue;
+    const scope = settledPlan ? group.map(action => action.result || '').join('\n')
+      : outputParts.length === callGroups.length ? outputParts[groupIndex]
+      : spawnGroups.length === 1 ? outputParts.join('\n') : '';
+    const identities = extractCodexSpawnIdentities(scope, spawn.subagentSpawn.namespace);
+    if (identities.length) {
+      callGroups[groupIndex] = identities.map(identity => {
+        const nativeKey = identity.agent_id || identity.task_name;
+        const base = spawn.description === 'Subagent' ? identity.nickname || identity.task_name || 'Subagent'
+          : spawn.description + (identity.nickname ? ' — ' + identity.nickname : '');
+        return { ...spawn, description: base, baseDescription: base,
+          toolUseId: source ? `${callId}:subagent:${nativeKey}` : callId, agentSessionId: identity.agent_id || undefined,
+          startedAt: Date.parse(call?.timestamp || '') || undefined,
+          subagentStatus: 'running',
+          subagentSpawn: { ...spawn.subagentSpawn, accepted: true, identity, parentCallId: callId },
+          result: undefined };
+      });
+    } else {
+      spawn.subagentSpawn = { ...spawn.subagentSpawn, accepted: rawOutput === undefined || cellId ? null : false,
+        parentCallId: callId };
+      spawn.toolUseId = `${callId}:spawn:${groupIndex}`;
+      if (isError) { spawn.spawnRejected = true; spawn.subagentStatus = 'interrupted'; }
+    }
   }
   const recordTime = historyRecordTimeFromRecord(call?.record, 'tool-call', call?.toolName === 'exec' ? 'container' : 'record');
   const actions = callGroups.flat().map((action, index) => {
@@ -1651,7 +1766,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
       tool: '__raw__',
       rawTool: {
         ...(recordTime ? { recordTime } : {}),
-        ...(callId ? { toolUseId: `${callId}:canonical:${index}` } : {}),
+        ...(callId ? { toolUseId: `${callId}:canonical:${action.__canonicalIndex ?? index}` } : {}),
         toolName: action.toolName,
         args: action.args || {},
         family: classified.family,
@@ -1666,7 +1781,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
       },
     };
   });
-  return { actions, cellId };
+  return { actions, cellId, ...(settledPlan ? { settledOutput: true } : {}) };
 }
 
 function fillPendingCodexHistoryActions(actions, rawOutput, isError, sourceRecordLine) {
@@ -1937,6 +2052,9 @@ async function inspectJsonlFiles(rootDir, maxFiles = 4000) {
 }
 
 async function parseJsonlFile(filePath, options = {}) {
+  return perfCausal.run('codex.raw-records', { fileIdentity: filePath,
+    caller: perfCausal.current()?.name || _describeJsonlReadCaller(),
+    mode: options.forceFresh === true ? 'force-fresh' : 'lookup' }, async () => {
   if (options.forceFresh === true) {
     // A task_complete append can land while another reader is still consuming
     // the previous file size. Await and discard that snapshot before the
@@ -1969,13 +2087,16 @@ async function parseJsonlFile(filePath, options = {}) {
       _codexJsonlInflight.delete(filePath);
     }
   }
+  });
 }
 
 function copyCodexRecordSnapshot(records) {
+  return perfCausal.run('codex.snapshot-copy', { snapshotRecords: records.length }, () => {
   const copy = records.slice();
   const snapshot = _codexRecordSnapshots.get(records);
   if (snapshot) _codexRecordSnapshots.set(copy, snapshot);
   return copy;
+  });
 }
 
 function codexRecordTypeFromPrefix(buffer) {
@@ -2597,6 +2718,8 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
     && !_codexSourceGenerations.get(filePath)?.rewritePending;
   if (sameFile && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs
     && cached.ctimeMs === stat.ctimeMs) {
+    perfCausal.update({ mode: 'memory-hit', sourceBytes: stat.size, deltaBytes: 0,
+      recordsBefore: cached.records.length, recordsAfter: cached.records.length });
     touchCodexJsonlCacheEntry(filePath, cached);
     return cached.records;
   }
@@ -2605,6 +2728,7 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
   // разобранному файлу (ветка ниже) под запрет не попадают: там читается
   // только новый хвост, а не весь файл.
   if (!sameFile && stat.size > CODEX_JSONL_PARSE_MAX_BYTES) {
+    perfCausal.update({ mode: 'size-refused', sourceBytes: stat.size, deltaBytes: null });
     console.warn('[CodexJsonlCache] refused file=' + path.basename(filePath)
       + ' sizeMB=' + Math.round(stat.size / (1024 * 1024))
       + ' maxMB=' + Math.round(CODEX_JSONL_PARSE_MAX_BYTES / (1024 * 1024))
@@ -2615,6 +2739,7 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
   if (sameFile && stat.size > cached.size) {
     const prevSize = cached.size;
     const prevLineCount = cached.lineCount || 0;
+    perfCausal.update({ mode: 'append', sourceBytes: stat.size, deltaBytes: stat.size - prevSize, recordsBefore: cached.records.length });
     const result = await readJsonlRange(filePath, prevSize, stat.size - 1, {
       sourceStat: stat,
       // Stage appended records separately. If the stream fails mid-read, the
@@ -2627,6 +2752,7 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
     });
     _codexReadFence.assertCurrent(ticket);
     const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket);
+    perfCausal.run('codex.raw-cache-publication', { mode: 'append', recordsAfter: cached.records.length + result.records.length }, () => {
     for (const record of result.records) {
       cached.records.push(record);
     }
@@ -2641,6 +2767,8 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
       leftoverBuffer: result.leftoverBuffer,
       records: cached.records,
     });
+    });
+    perfCausal.update({ recordsAfter: cached.records.length });
     console.log('[CodexJsonlCache] append file=' + path.basename(filePath) +
       ' bytes=' + (stat.size - prevSize) +
       ' parsed=' + result.parsed +
@@ -2653,10 +2781,13 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
   }
 
   const finishPreparation = historyPreparationActivity.begin({ kind: 'history', bytes: stat.size });
+  perfCausal.update({ mode: cached ? 'rewrite-or-shrink' : 'first-read', sourceBytes: stat.size,
+    deltaBytes: stat.size, recordsBefore: cached?.records.length ?? 0 });
   try {
     const result = await readJsonlRange(filePath, 0, stat.size - 1, { sourceStat: stat });
     _codexReadFence.assertCurrent(ticket);
     const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket);
+    perfCausal.run('codex.raw-cache-publication', { mode: 'full', recordsAfter: result.records.length }, () => {
     setCodexJsonlCacheEntry(filePath, {
       size: stat.size,
       mtimeMs: stat.mtimeMs,
@@ -2668,6 +2799,8 @@ async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
       leftoverBuffer: result.leftoverBuffer,
       records: result.records,
     });
+    });
+    perfCausal.update({ recordsAfter: result.records.length });
     console.log('[CodexJsonlCache] full file=' + path.basename(filePath) +
       ' sizeKB=' + Math.round(stat.size / 1024) +
       ' records=' + result.records.length +
@@ -2718,6 +2851,18 @@ function codexResultReader() {
 
 async function loadCodexProviderResult(request) {
   return codexResultReader().load(request);
+}
+
+async function loadCodexObservedExecution(request) {
+  return codexResultReader().loadObservedExecution(request);
+}
+
+async function loadLatestCodexObservedExecution(request) {
+  return codexResultReader().loadLatestObservedExecution(request);
+}
+
+async function loadCodexHistoricalObservedExecution(request) {
+  return codexResultReader().loadHistoricalObservedExecution(request);
 }
 
 function getSessionMeta(records) {
@@ -3537,11 +3682,8 @@ function pushAssistantEntry(
     actions: actions && actions.length > 0 ? actions : undefined,
     sessionId,
     turnIndex,
-    // Codex marks every assistant text with `phase`: 'commentary' (interim
-    // remark — the natural caption for the calls that follow) or
-    // 'final_answer' (the turn's real answer, 99.7% the last text of the
-    // turn). Claude has no equivalent; its caption linkage runs on
-    // messageId instead. The display grammar uses whichever exists.
+    // partial_answer is stable answer content even if tools follow it. Keep
+    // it separate from commentary without promoting it to a turn's final.
     textPhase: textPhase || undefined,
   });
 }
@@ -3646,10 +3788,33 @@ const { codexProviderErrorEntry } = require('../codex-provider-error');
  * Also tracks the session-meta head and the fork live-start boundary so
  * getTimelineSessionMeta no longer needs the records array.
  */
+function rememberCodexNativeQuestion(definitions, record, sessionId, turnIndex) {
+  const payload = record?.payload || {};
+  if (record?.type !== 'response_item' || payload.type !== 'function_call'
+    || !['request_user_input_async', 'functions.request_user_input_async'].includes(payload.name)
+    || !['', 'functions'].includes(payload.namespace || '')) return;
+  registerNativeQuestionDefinition(definitions, codexNativeQuestionDefinition({
+    toolName: payload.name, namespace: payload.namespace || '', callId: payload.call_id,
+    args: parseToolArguments(payload), turnIndex,
+    physicalSessionId: codexRecordPhysicalSessionId(record, sessionId),
+    sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-assistant'),
+  }, questionReplyFingerprint));
+}
+
+function attachCodexQuestionReplyProof(entry, definitions, physicalSessionId) {
+  const proof = proveCodexNativeQuestionReply(entry.content, definitions, physicalSessionId, questionReplyFingerprint);
+  if (proof) entry.questionReplyProof = proof;
+  else delete entry.questionReplyProof;
+}
+
 function createCodexTimelineProjector(sessionId, seed = {}) {
   const entries = seed.entries ?? [];
+  const questionDefinitions = seed.questionDefinitions ?? new Map();
   const pendingResponseUsers = seed.pendingResponseUsers ?? [];
   const pendingFileEditCalls = seed.pendingFileEditCalls ?? new Map();
+  const pendingSubagentCalls = seed.pendingSubagentCalls ?? new Map();
+  let pendingResponsePreview = seed.pendingResponsePreview ?? null;
+  let pendingResponsePreviewOwner = seed.pendingResponsePreviewOwner ?? null;
   let currentUser = seed.currentUser ?? null;
   let currentTurnIndex = seed.currentTurnIndex ?? -1;
   let latestModel = seed.latestModel ?? null;
@@ -3673,33 +3838,26 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
       namespace: payload.namespace || '',
       args: parseToolArguments(payload),
     };
-    const nestedSource = call.toolName === 'exec' && typeof call.args?.input === 'string'
-      ? call.args.input
-      : '';
-    if (!isCodexSubagentSpawnCall(call) && !/\bspawn_agent\s*\(/.test(nestedSource)) return;
+    if (!codexHistoryLogicalCalls(call).some(isCodexSubagentSpawnCall)) return;
     // Reuse the exact History decoder: current Codex often wraps
     // `collaboration.spawn_agent` inside one custom `exec` call, so checking
     // only the outer tool name would miss the launch marker on Timeline.
-    const decoded = codexHistoryActionsForCall(call, '', false);
-    const card = (decoded.actions || []).find((action) => action?.tool === 'Task');
-    if (!card) return;
-    const label = String(
-      card?.description
-      || call.args?.task_name
-      || call.args?.label
-      || call.args?.agent_type
-      || 'Agent',
-    ).replace(/\s+·\s+running\s*$/i, '');
-    const key = 'task:' + (card.toolUseId || callId);
     if (!Array.isArray(entry.subAgents)) entry.subAgents = [];
-    if (!entry.subAgents.some((agent) => agent?.key === key)) {
-      entry.subAgents.push({ key, label });
+    const keys = [];
+    for (const card of codexHistoryActionsForCall(call, undefined, false).actions || []) {
+      if (card.tool !== 'Task') continue;
+      const key = 'task:' + (card.toolUseId || callId);
+      const label = String(card.description || 'Agent').replace(/\s+·\s+running\s*$/i, '');
+      keys.push(key);
+      if (!entry.subAgents.some(agent => agent?.key === key)) entry.subAgents.push({ key, label });
     }
+    pendingSubagentCalls.set(callId, { call, userOwner: entry, keys });
   };
 
   const feed = (record) => {
     const payload = record.payload || {};
     const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+    rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
 
     if (record.type === 'session_meta') {
       if (payload.cwd) sessionCwd = payload.cwd;
@@ -3807,6 +3965,9 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
           pending.entry.sourceLine = record.__line;
           pending.entry.sessionId = physicalSessionId;
           pending.entry.hasImage = Array.isArray(payload.images) ? payload.images.length > 0 : false;
+          const imageRefs = mergeCodexUserMessageImageRefs(codexUserMessageImageRefs(record), pending.entry.imagePaths);
+          if (imageRefs.length > 0) pending.entry.imagePaths = imageRefs;
+          pending.entry.hasImage ||= imageRefs.length > 0;
           currentUser = pending.entry;
         } else {
           currentTurnIndex += 1;
@@ -3821,6 +3982,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
             isGoalContinuation: goalContinuation || undefined,
             sourceLine: record.__line,
             hasImage: Array.isArray(payload.images) ? payload.images.length > 0 : false,
+            ...(codexUserMessageImageRefs(record).length > 0 ? { imagePaths: codexUserMessageImageRefs(record) } : {}),
             sessionId: physicalSessionId,
             turnIndex: currentTurnIndex,
             responseModel: latestModel || undefined,
@@ -3828,14 +3990,22 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
           };
           entries.push(entry);
           currentUser = entry;
+          pendingResponsePreview = null;
+          pendingResponsePreviewOwner = null;
         }
         currentTurnCanonicalUserText = text;
         currentTurnCanonicalUserEntry = currentUser;
+        attachCodexQuestionReplyProof(currentUser, questionDefinitions, physicalSessionId);
       } else if (payload.type === 'thread_rolled_back') {
         const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
+        for (const [id, definition] of questionDefinitions) {
+          if (rollback.removedTurnIds.includes(definition.turnIndex)) questionDefinitions.delete(id);
+        }
         logCodexRollback('timeline', sessionId, record, rollback);
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
         currentUser = lastCodexTimelineUser(entries);
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
         currentTurnCanonicalUserEntry = currentUser;
         currentTurnCanonicalUserText = currentUser?.isGoalContinuation
           ? null
@@ -3890,7 +4060,15 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
         }
       } else if (payload.type === 'task_complete' && currentUser) {
         currentUser.responseComplete = true;
+        if (!payload.error && !currentUser.responsePreview && pendingResponsePreviewOwner === currentUser) {
+          currentUser.responsePreview = pendingResponsePreview || undefined;
+        }
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
         pendingResponseUsers.length = 0;
+      } else if (payload.type === 'turn_aborted') {
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
       } else if (isCompactPayload(payload)) {
         if (pendingCompactCompanions > 0) {
           pendingCompactCompanions -= 1;
@@ -3924,6 +4102,10 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
           || isCodexProjectInstructionsUserText(text)) return;
         if (currentTurnCanonicalUserText
           && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, text)) {
+          const imageRefs = mergeCodexUserMessageImageRefs(currentTurnCanonicalUserEntry?.imagePaths,
+            codexUserMessageImageRefs(record));
+          if (imageRefs.length > 0) currentTurnCanonicalUserEntry.imagePaths = imageRefs;
+          if (currentTurnCanonicalUserEntry) currentTurnCanonicalUserEntry.hasImage ||= imageRefs.length > 0;
           addStableSourceIdentityAlias(
             currentTurnCanonicalUserEntry,
             stableSourceIdentity(sessionId, record, 'codex-user'),
@@ -3948,13 +4130,20 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
           turnIndex: currentTurnIndex,
           responseModel: latestModel || undefined,
           responseEffort: latestEffort || undefined,
+          ...(codexUserMessageImageRefs(record).length > 0 ? { imagePaths: codexUserMessageImageRefs(record) } : {}),
         };
+        attachCodexQuestionReplyProof(entry, questionDefinitions, physicalSessionId);
         entries.push(entry);
         currentUser = entry;
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
         pendingResponseUsers.push({ entry, text });
         return;
       }
       if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+        // An untyped interim note before work is not a completed answer.
+        pendingResponsePreview = null;
+        pendingResponsePreviewOwner = null;
         collectCodexDocsAttributes(currentUser, payload, sessionCwd);
         attachSubagentLaunch(currentUser, payload, record);
         const toolName = payload.name || payload.tool_name || '';
@@ -3972,17 +4161,52 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
       }
       if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
         pendingFileEditCalls.delete(payload.call_id || payload.id);
+        const callId = payload.call_id || payload.id;
+        const pending = pendingSubagentCalls.get(callId);
+        pendingSubagentCalls.delete(callId);
+        if (pending) {
+          const cards = codexHistoryActionsForCall(pending.call, payload.output, !!payload.is_error).actions
+            .filter(action => action.tool === 'Task' && action.subagentSpawn?.accepted === true);
+          if (cards.length) {
+            pending.userOwner.subAgents = pending.userOwner.subAgents.filter(agent => !pending.keys.includes(agent.key));
+            for (const card of cards) {
+              const key = 'task:' + card.toolUseId;
+              if (!pending.userOwner.subAgents.some(agent => agent.key === key)) {
+                pending.userOwner.subAgents.push({ key, label: card.description });
+              }
+            }
+          }
+        }
       }
       if (payload.type === 'reasoning' && currentUser) {
         currentUser.responseHasThinking = true;
       } else if (payload.type === 'message' && payload.role === 'assistant' && currentUser) {
         currentUser.responseModel = payload.model || latestModel || currentUser.responseModel;
+        const preview = timelineResponsePreview({
+          uuid: stableUuidForRecord(sessionId, record, 'codex-assistant'),
+          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-assistant'),
+          sessionId: physicalSessionId,
+          timestamp: record.timestamp,
+          content: extractTextContent(payload.content),
+        });
+        if (payload.phase === 'final_answer' && preview) {
+          currentUser.responsePreview = preview;
+          pendingResponsePreview = null;
+          pendingResponsePreviewOwner = null;
+        } else if (!payload.phase && preview) {
+          pendingResponsePreview = preview;
+          pendingResponsePreviewOwner = currentUser;
+        }
       }
     }
   };
 
   const finalize = () => entries.map((entry) => ({
     ...entry,
+    ...(entry.questionReplyProof ? { questionReplyProof: { ...entry.questionReplyProof,
+      links: entry.questionReplyProof.links.map(link => ({ ...link })) } } : {}),
+    ...(entry.imagePaths ? { imagePaths: entry.imagePaths.map(ref => ({ ...ref })) } : {}),
+    ...(entry.responsePreview ? { responsePreview: { ...entry.responsePreview } } : {}),
     ...(Array.isArray(entry.subAgents)
       ? { subAgents: entry.subAgents.map((agent) => ({ ...agent })) }
       : {}),
@@ -4009,7 +4233,8 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
     finalize,
     getSessionMeta,
     exportState: () => ({
-      entries, pendingResponseUsers, pendingFileEditCalls, currentUser, currentTurnIndex, latestModel,
+      entries, questionDefinitions, pendingResponseUsers, pendingFileEditCalls, pendingSubagentCalls, currentUser, currentTurnIndex, latestModel,
+      pendingResponsePreview, pendingResponsePreviewOwner,
       latestEffort, latestTokenCountInfo, pendingCompactCompanions, metaRecord,
       metaRecordPhysicalSessionId, forkLiveStartLine, forkStartedAtMs,
       currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, sessionCwd,
@@ -4064,13 +4289,17 @@ function refreshCodexSubagentCards(cards, sessionId) {
     else delete card.processGeneration;
   }
   const tracked = cards.filter(card => card.subagentStatus === 'running'
-    || (card.subagentStatus === 'completed' && !Number(card.completedAt)));
+    || (card.subagentStatus === 'completed' && (!Number(card.completedAt)
+      || card.completionTimingSource === 'parent')));
   let resolved = 0;
   for (const card of tracked) {
     if (!card.agentSessionId) continue;
+    const timingKey = String(card.startedAt || 0) + ':' + String(card.completedAt || 0);
+    if (card.subagentStatus === 'completed' && card.completionTimingAttemptKey === timingKey) continue;
+    card.completionTimingAttemptKey = timingKey;
     const filePath = findCodexAgentFile({ agentSessionId: card.agentSessionId });
     if (!filePath) continue;
-    const completion = readAgentCompletionProof({ toolType: 'codex', filePath });
+    const completion = readAgentCompletionProof({ toolType: 'codex', filePath, notBefore: card.startedAt });
     if (!completion.finished) continue;
     if (card.subagentStatus === 'running') resolved++;
     card.subagentStatus = 'completed';
@@ -4078,6 +4307,7 @@ function refreshCodexSubagentCards(cards, sessionId) {
     if (!card.result) card.result = 'Агент завершил работу (по его собственной истории).';
     if (completion.completedAt > 0) {
       card.completedAt = completion.completedAt;
+      card.completionTimingSource = 'child';
       if (Number(card.startedAt) > 0) card.durationMs = Math.max(0, completion.completedAt - Number(card.startedAt));
     }
   }
@@ -4087,6 +4317,7 @@ function refreshCodexSubagentCards(cards, sessionId) {
 
 function createCodexHistoryProjector(sessionId, seed = {}) {
   const entries = seed.entries ?? [];
+  const questionDefinitions = seed.questionDefinitions ?? new Map();
   const pendingResponseUsers = seed.pendingResponseUsers ?? [];
   const pendingProjectInstructions = seed.pendingProjectInstructions ?? [];
   const pendingCalls = seed.pendingCalls ?? new Map();
@@ -4096,12 +4327,39 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     const card = subagents.registerSpawn(call);
     card.processOwnerSource = {
       sessionId: call?.physicalSessionId || sessionId,
-      callId: call?.callId,
+      callId: call?.parentCallId || call?.callId,
       sourceByteOffset: call?.byteOffset,
     };
     const processGeneration = getCodexProcessActionGeneration(card.processOwnerSource);
     if (processGeneration) card.processGeneration = processGeneration;
     return card;
+  };
+  const trackDecodedSubagents = (actions, call, observedAt) => actions.map(action => {
+    if (action.tool !== 'Task' || !action.subagentSpawn) return action;
+    const proof = action.subagentSpawn;
+    // An unprinted exec receipt is not an accepted child identity.
+    if (!proof.accepted) return action;
+    const id = action.toolUseId;
+    let card = subagents.getCard(id);
+    if (!card) {
+      card = registerSubagentSpawn({ ...call, callId: id, parentCallId: call.callId,
+        args: proof.args || {} });
+      subagents.attachSpawnOutput(id, proof.identity, observedAt);
+      card.baseDescription = action.baseDescription || action.description;
+      card.description = card.baseDescription;
+    }
+    return card;
+  });
+  const absorbNestedSubagentControls = (call, output, observedAt) => {
+    if (call.toolName !== 'exec') return;
+    const logical = codexHistoryLogicalCalls(call);
+    const parts = codexHistoryOutputParts(output);
+    const controls = logical.filter(isCodexSubagentControlCall);
+    for (const control of controls) {
+      const scoped = parts.length === logical.length ? parts[control.index]
+        : controls.length === 1 && logical.length === 1 ? parts.join('\n') : null;
+      if (scoped !== null) subagents.absorbControlOutput({ ...control, timestamp: call.timestamp }, scoped, observedAt);
+    }
   };
   let sessionCwd = seed.sessionCwd ?? '';
   let currentTurnIndex = seed.currentTurnIndex ?? -1;
@@ -4216,6 +4474,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     consumedRecords += 1;
     const payload = record.payload || {};
     const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+    rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
 
     if (record.type === 'session_meta') {
       if (!sessionCwd) sessionCwd = payload.cwd || '';
@@ -4365,6 +4624,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
           currentTurnCanonicalUserEntry = entry;
         }
         currentTurnCanonicalUserText = userText;
+        attachCodexQuestionReplyProof(currentTurnCanonicalUserEntry, questionDefinitions, physicalSessionId);
       } else if (payload.type === 'thread_rolled_back') {
         currentInterruptedNotice = null;
         pendingProjectInstructions.length = 0;
@@ -4372,6 +4632,9 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
         // Invalidate references once at rollback, not an O(history) membership
         // scan on every tool output. A later user can reuse the numeric index.
         const removedTurns = new Set(rollback.removedTurnIds);
+        for (const [id, definition] of questionDefinitions) {
+          if (removedTurns.has(definition.turnIndex)) questionDefinitions.delete(id);
+        }
         for (const owner of [...pendingCalls.values()].map((call) => call.userOwner)
           .concat([...unrenderedThinkingByUser.keys()], [pendingThinkingOwner])) {
           if (owner && removedTurns.has(owner.turnIndex)) discardedUserOwners.add(owner);
@@ -4499,6 +4762,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       };
       entries.push(entry);
       pendingResponseUsers.push({ entry, text: userText });
+      attachCodexQuestionReplyProof(entry, questionDefinitions, physicalSessionId);
       const imageRefs = codexUserMessageImageRefs(record);
       if (imageRefs.length > 0) entry.imagePaths = imageRefs;
       entry.imageCount = historyImageCountFromProviderRecord(record);
@@ -4516,9 +4780,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
 
     if (payload.type === 'message' && payload.role === 'assistant') {
       const text = extractTextContent(payload.content);
-      const textPhase = payload.phase === 'final_answer' || payload.phase === 'commentary'
-        ? payload.phase
-        : undefined;
+      const textPhase = normalizeCodexTextPhase(payload.phase);
       pushAssistantEntry(
         entries, physicalSessionId, record, currentTurnIndex, text, pendingThinking, null,
         record.__line, record.__byteOffset, textPhase,
@@ -4640,11 +4902,38 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
       const pendingCellActions = waitCellId ? pendingExecCells.get(waitCellId) : null;
       if (pendingCellActions) {
-        fillPendingCodexHistoryActions(pendingCellActions, payload.output, !!payload.is_error, record.__line);
-        pendingExecCells.delete(waitCellId);
+        if (pendingCellActions.call) {
+          const continuation = codexHistoryCellId(payload.output);
+          pendingCellActions.parts.push(...codexHistorySettledOutputParts(payload.output));
+          const combined = [
+            ...(continuation ? [{ type: 'input_text', text: `Script running with cell ID ${continuation}\nOutput:\n` }] : []),
+            ...pendingCellActions.parts.map(text => ({ type: 'input_text', text })),
+          ];
+          const decoded = codexHistoryActionsForCall(pendingCellActions.call, combined, !!payload.is_error);
+          const actions = trackDecodedSubagents(decoded.actions, pendingCellActions.call, recordTimestamp(record));
+          const previous = new Map(pendingCellActions.actions.filter(action => action.rawTool)
+            .map(action => [action.rawTool.toolUseId, action.rawTool]));
+          for (const action of actions) if (action.rawTool) {
+            const old = previous.get(action.rawTool.toolUseId);
+            action.rawTool.resultSourceLine = old && old.result === action.rawTool.result
+              ? old.resultSourceLine : record.__line;
+          }
+          pendingCellActions.actions.splice(0, pendingCellActions.actions.length, ...actions);
+          if (!continuation) {
+            pendingExecCells.delete(waitCellId);
+          } else if (continuation !== waitCellId) {
+            pendingExecCells.delete(waitCellId);
+            pendingExecCells.set(continuation, pendingCellActions);
+          }
+        } else {
+          fillPendingCodexHistoryActions(pendingCellActions, payload.output, !!payload.is_error, record.__line);
+          pendingExecCells.delete(waitCellId);
+        }
         pushAssistantEntry(entries, physicalSessionId, record, callTurnIndex, '', callThinking, null);
       } else {
         const decoded = codexHistoryActionsForCall(call, payload.output, !!payload.is_error);
+        decoded.actions = trackDecodedSubagents(decoded.actions, call, recordTimestamp(record));
+        absorbNestedSubagentControls(call, payload.output, recordTimestamp(record));
         // The call row owns the visible card identity. Completion enriches that
         // same card instead of replacing it with an output-line row, preserving
         // collapse state and Virtuoso measurement during streaming.
@@ -4659,7 +4948,13 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
           call.line,
           call.byteOffset,
         );
-        if (decoded.cellId) pendingExecCells.set(decoded.cellId, decoded.actions);
+        // Every async cell retains its original call, not just raw-tool cards.
+        // A normal exec can also contain Task cards without rawTool; its wait
+        // must re-decode exact outputs to bind child receipts and ordinary
+        // results without shifting their positions or changing card owners.
+        if (decoded.cellId) pendingExecCells.set(decoded.cellId, {
+          call, actions: decoded.actions, parts: codexHistorySettledOutputParts(payload.output),
+        });
       }
       if (callOwnsThinking) pendingThinking = '';
       pendingCalls.delete(callId);
@@ -4793,7 +5088,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     finalize,
     getConsumedRecords: () => consumedRecords,
     exportState: () => ({
-      entries, pendingResponseUsers, pendingProjectInstructions, pendingCalls,
+      entries, questionDefinitions, pendingResponseUsers, pendingProjectInstructions, pendingCalls,
       pendingExecCells, subagents: subagents.exportState(), sessionCwd, currentTurnIndex,
       pendingThinking, pendingThinkingOwner, unrenderedThinkingByUser, latestTokenCountInfo,
       lastDisplayedModel, lastDisplayedEffort, lastModelEntry, lastEffortEntry, pendingCompactCompanions, consumedRecords,
@@ -7105,11 +7400,30 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     if (!isCodexCompactRecord(wrapper.record)) return false;
     return selectedCompactCompanionRecords.has(wrapper.record);
   };
-  const isOrphanTurnPreamble = (wrapper) => (
-    selectedCompacts.size > 0
-    && !Number.isFinite(wrapper.turnKey)
-    && isCodexTurnPreambleRecord(wrapper.record)
-  );
+  // A compact clears turn ownership until the next canonical user. Only
+  // orphan preambles anchored to a removed compact belong to its cleanup;
+  // another retained compact starts an independent context/settings tail.
+  // A new root also discards its initial unowned preamble before the first
+  // selected compact, rather than carrying instructions from the old root.
+  const selectedOrphanPreambles = new Set();
+  let orphanCompactSelected = minIndex === 0 && selectedCompacts.size > 0;
+  let orphanPhysicalSessionId = wrappers[0]?.record?.__physicalSessionId || sessionId;
+  for (const wrapper of wrappers) {
+    const physicalSessionId = wrapper.record?.__physicalSessionId || sessionId;
+    if (physicalSessionId !== orphanPhysicalSessionId) {
+      orphanCompactSelected = false;
+      orphanPhysicalSessionId = physicalSessionId;
+    }
+    if (isCodexCompactRecord(wrapper.record)) {
+      orphanCompactSelected = selectedCompactRecords.has(wrapper.record)
+        || selectedCompactCompanionRecords.has(wrapper.record);
+    } else if (wrapper.kind === 'user') {
+      orphanCompactSelected = false;
+    } else if (orphanCompactSelected && !Number.isFinite(wrapper.turnKey)
+      && isCodexTurnPreambleRecord(wrapper.record)) {
+      selectedOrphanPreambles.add(wrapper);
+    }
+  }
   const startCarrier = canonicalByUuid.get(startUuid);
   const suffixStart = toPhysicalEnd && startCarrier?.kind === 'user' && Number.isFinite(startCarrier.turnKey)
     ? wrappers.findIndex(wrapper => wrapper.turnKey === startCarrier.turnKey) : -1;
@@ -7117,7 +7431,7 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
   const shouldRemoveWrapper = (wrapper) => {
     if (Number.isFinite(wrapper.turnKey) && selectedTurnKeys.has(Number(wrapper.turnKey))) return true;
     if (wrapper.sourceUuid && selectedCompacts.has(wrapper.sourceUuid)) return true;
-    return isSelectedCompactCompanion(wrapper) || isOrphanTurnPreamble(wrapper);
+    return isSelectedCompactCompanion(wrapper) || selectedOrphanPreambles.has(wrapper);
   };
   const firstRemovalIndex = toPhysicalEnd ? suffixStart : wrappers.findIndex(shouldRemoveWrapper);
   if (firstRemovalIndex < 0) {
@@ -8250,6 +8564,9 @@ function buildCodexProviderTurnAssistantResult(
   maxChars = 100000,
   options = {},
 ) {
+  // Private observation selection is independent of send/prompt proof.
+  const executionOnly = options.executionOnly === true;
+  const historicalExecutionOnly = executionOnly && options.historicalExecutionOnly === true;
   const executionContext = proof?.targetExecutionContext;
   const expectedTurnId = typeof executionContext?.turnId === 'string'
     ? executionContext.turnId.trim()
@@ -8283,7 +8600,10 @@ function buildCodexProviderTurnAssistantResult(
     && !hasExpectedGeneration
     && (typeof proof.promptUserUuid === 'string' && proof.promptUserUuid.trim()
       || typeof proof.promptSourceIdentity === 'string' && proof.promptSourceIdentity.trim());
-  if (!expectedTurnId || (!hasExpectedGeneration && !historicalGenerationUnknown)) {
+  if (!expectedTurnId || (!hasExpectedGeneration && !historicalGenerationUnknown && !historicalExecutionOnly)
+    || (executionOnly && (historicalExecutionOnly
+      ? executionContext.generation != null || executionContext.processId != null
+      : !Number.isSafeInteger(executionContext.generation) || executionContext.generation <= 0))) {
     return {
       success: false,
       errorCode: RESULT_PROOF_CODES.EXECUTION_IDENTITY_INCOMPLETE,
@@ -8318,6 +8638,10 @@ function buildCodexProviderTurnAssistantResult(
   }
 
   const startIndex = starts[0];
+  if (executionOnly && codexRecordPhysicalSessionId(rows[startIndex], sessionId) !== expectedSessionId) {
+    return { success: false, errorCode: RESULT_PROOF_CODES.SESSION_MISMATCH,
+      error: 'Codex provider turn belongs to a different physical session', proofDefinitive: true };
+  }
   let boundaryIndex = rows.length;
   let boundaryReason = 'transcript-end';
   let terminalIndex = -1;
@@ -8325,6 +8649,11 @@ function buildCodexProviderTurnAssistantResult(
   for (let index = startIndex + 1; index < rows.length; index += 1) {
     const record = rows[index];
     const payload = record?.payload || {};
+    if (executionOnly && codexRecordPhysicalSessionId(record, sessionId) !== expectedSessionId) {
+      boundaryIndex = index;
+      boundaryReason = 'physical-session-boundary';
+      break;
+    }
     if (record?.type !== 'event_msg') continue;
     if (payload.type === 'task_started') {
       boundaryIndex = index;
@@ -8372,7 +8701,7 @@ function buildCodexProviderTurnAssistantResult(
     : null;
   const timeOnly = options.allowTimeOnly === true && !exactUuid && !exactSourceIdentity
     && !expectedPromptHash && Number(proof?.resultAfterAt) > 0;
-  if (!exactUuid && !exactSourceIdentity && !expectedPromptHash && !timeOnly) {
+  if (!executionOnly && !exactUuid && !exactSourceIdentity && !expectedPromptHash && !timeOnly) {
     return {
       success: false,
       errorCode: RESULT_PROOF_CODES.PROMPT_IDENTITY_REQUIRED,
@@ -8384,7 +8713,7 @@ function buildCodexProviderTurnAssistantResult(
   }
 
   let carrierStartIndex = startIndex + 1;
-  if (exactUuid || exactSourceIdentity) {
+  if (exactUuid || exactSourceIdentity || executionOnly) {
     // Exact physical identity may precede task_started in a valid Codex turn.
     // Admit only the immediately preceding structural segment; hash-only legacy
     // proof remains post-start so copied history cannot become causal.
@@ -8413,10 +8742,23 @@ function buildCodexProviderTurnAssistantResult(
     const payload = record?.payload || {};
     if (record?.type === 'event_msg' && isCodexSubagentNotification(payload)) continue;
     if (codexUserMessageAuditText(record) === null) continue;
+    if (executionOnly) {
+      if (codexRecordPhysicalSessionId(record, sessionId) !== expectedSessionId) continue;
+      const text = codexUserMessagePresentationText(record);
+      if (!text.trim() || text.includes('<subagent_notification>')
+        || isCodexEnvironmentContextUserText(text) || isCodexProjectInstructionsUserText(text)
+        || isCodexTurnAbortedUserText(text) || isCodexGoalContinuationUserText(text)) continue;
+      if (index < startIndex) {
+        if (!Number.isSafeInteger(record.__line) || record.__line < 0) continue;
+        const attached = findCodexPromptExecutionContext(rows, sessionId, stableUuidForRecord(sessionId, record, 'codex-user'));
+        if (attached?.turnId !== expectedTurnId || attached.sessionId !== expectedSessionId) continue;
+      }
+    }
     carrierCandidates.push({
       record,
       index,
       byteOffset: record.__byteOffset,
+      ...(executionOnly ? { turnSegment: expectedTurnId, taskStartedSeen: index > startIndex } : {}),
     });
   }
   const promptCandidates = [];
@@ -8424,11 +8766,29 @@ function buildCodexProviderTurnAssistantResult(
   for (const group of carrierGroups) {
     const recordsWithAliases = [group.candidate, ...(group.aliases || [])];
     const userUuids = recordsWithAliases.map((candidate) => (
-      stableUuidForRecord(sessionId, candidate.record, 'codex-user')
+      executionOnly && (!Number.isSafeInteger(candidate.record.__line) || candidate.record.__line < 0)
+        ? null : stableUuidForRecord(sessionId, candidate.record, 'codex-user')
     ));
-    const sourceIdentities = recordsWithAliases.map((candidate) => (
-      stableSourceIdentity(sessionId, candidate.record, 'codex-user')
-    ));
+    const sourceIdentities = recordsWithAliases.map(({ record }) => {
+      if (!executionOnly) return stableSourceIdentity(sessionId, record, 'codex-user');
+      const hasOffset = Number.isSafeInteger(record.__byteOffset) && record.__byteOffset >= 0;
+      const hasLine = Number.isSafeInteger(record.__line) && record.__line >= 0;
+      return hasOffset || hasLine
+        ? stableSourceIdentity(sessionId, { ...record, __byteOffset: hasOffset ? record.__byteOffset : undefined }, 'codex-user')
+        : null;
+    });
+    if (executionOnly) {
+      // The shared grouping is ordered by first physical carrier, not text or
+      // timestamp. Clarifications remain inside this same provider execution.
+      promptCandidates.push({
+        index: Math.min(...recordsWithAliases.map((candidate) => candidate.index)),
+        record: group.candidate.record,
+        userUuid: userUuids[0], sourceIdentity: sourceIdentities[0],
+        sourceIdentityAliases: sourceIdentities.slice(1).filter(Boolean),
+        carrierKind: group.candidate.record.type === 'event_msg' ? 'event' : 'response',
+      });
+      break;
+    }
     const hasExactIdentity = Boolean(exactUuid || exactSourceIdentity);
     if (hasExactIdentity) {
       const uuidMatches = !exactUuid || userUuids.includes(exactUuid);
@@ -8468,7 +8828,7 @@ function buildCodexProviderTurnAssistantResult(
   // Recovery still names one exact provider execution. Within it preserve
   // the legacy latest-real-prompt selection after the accepted resume bound.
   if (timeOnly && promptCandidates.length > 1) promptCandidates.splice(0, promptCandidates.length - 1);
-  if (promptCandidates.length !== 1) {
+  if (!executionOnly && promptCandidates.length !== 1) {
     return {
       success: false,
       errorCode: promptCandidates.length === 0
@@ -8485,9 +8845,12 @@ function buildCodexProviderTurnAssistantResult(
     };
   }
 
-  const prompt = promptCandidates[0];
+  const prompt = promptCandidates[0] || null;
+  // An observation owns the exact provider bracket even before its user row
+  // is durable. Prompt metadata never widens that bracket into a prior turn.
+  const promptIndex = executionOnly ? startIndex : prompt.index;
   const assistantBlocks = [];
-  for (let index = prompt.index + 1; index < boundaryIndex; index += 1) {
+  for (let index = promptIndex + 1; index < boundaryIndex; index += 1) {
     const payload = rows[index]?.payload || {};
     if (rows[index]?.type !== 'response_item'
       || payload.type !== 'message'
@@ -8496,13 +8859,13 @@ function buildCodexProviderTurnAssistantResult(
     if (text) assistantBlocks.push(text);
   }
   let projected = typeof options.projectAssistant === 'function'
-    ? options.projectAssistant({ rows, promptIndex: prompt.index, boundaryIndex, terminalIndex, maxChars })
+    ? options.projectAssistant({ rows, promptIndex, boundaryIndex, terminalIndex, maxChars })
     : projectCodexAssistantContext(assistantBlocks, maxChars, 250000);
   if (!projected.assistantText && terminalOutcome?.hasFinalResult === true) {
     const terminalText = String(rows[terminalIndex]?.payload?.last_agent_message || '').trim();
     if (terminalText) projected = projectCodexAssistantContext([terminalText], maxChars, 250000);
   }
-  if (!projected.assistantText && !terminalOutcome) {
+  if (!executionOnly && !projected.assistantText && !terminalOutcome) {
     return {
       success: false,
       errorCode: RESULT_PROOF_CODES.ASSISTANT_NOT_MATERIALIZED,
@@ -8515,13 +8878,19 @@ function buildCodexProviderTurnAssistantResult(
       proofDefinitive: boundaryReason !== 'transcript-end',
     };
   }
-  const turnIndex = typeof options.getTurnIndex === 'function'
+  const turnIndex = !prompt?.userUuid ? null : typeof options.getTurnIndex === 'function'
     ? options.getTurnIndex(prompt.userUuid)
     : buildCodexTimeline(rows, sessionId)
       .find((entry) => entry.uuid === prompt.userUuid && typeof entry.turnIndex === 'number')?.turnIndex;
-  const proofDefinitive = terminalIndex < 0 && boundaryReason !== 'transcript-end';
+  const executionFailure = executionOnly && terminalOutcome && terminalOutcome.reason !== 'task_complete'
+    ? terminalEvent === 'turn_aborted' ? RESULT_PROOF_CODES.TURN_ABORTED
+      : terminalOutcome.reason === 'codex-no-final-result' ? RESULT_PROOF_CODES.NO_FINAL_RESULT
+        : terminalOutcome.reason
+    : null;
+  const proofDefinitive = !!executionFailure || (terminalIndex < 0 && boundaryReason !== 'transcript-end');
   return {
     success: true,
+    ...(executionOnly ? { executionContext: { ...executionContext }, anchorFound: true } : {}),
     // A terminal envelope is not necessarily a successful answer. Codex
     // writes `turn_aborted` after Stop/close and can leave assistant text
     // before that record. Treating any terminal event as `complete` lets that
@@ -8534,11 +8903,12 @@ function buildCodexProviderTurnAssistantResult(
     assistantMessageCount: assistantBlocks.length,
     assistantBlockCount: assistantBlocks.length,
     turnIndex: turnIndex ?? null,
-    userUuid: prompt.userUuid,
-    sourceIdentity: prompt.sourceIdentity,
-    sourceIdentityAliases: prompt.sourceIdentityAliases,
-    promptCarrierKind: prompt.carrierKind,
-    proofMode: historicalGenerationUnknown ? 'historical-provider-turn' : 'provider-turn-id',
+    userUuid: prompt?.userUuid || null,
+    sourceIdentity: prompt?.sourceIdentity || null,
+    sourceIdentityAliases: prompt?.sourceIdentityAliases || [],
+    promptCarrierKind: prompt?.carrierKind || null,
+    proofMode: historicalExecutionOnly ? 'historical-observed-execution'
+      : executionOnly ? 'observed-provider-execution' : historicalGenerationUnknown ? 'historical-provider-turn' : 'provider-turn-id',
     providerTurnId: expectedTurnId,
     providerGeneration: expectedGeneration,
     terminalEvent,
@@ -8546,8 +8916,8 @@ function buildCodexProviderTurnAssistantResult(
     hasFinalResult: terminalOutcome?.hasFinalResult === true,
     boundaryReason,
     proofDefinitive,
-    errorCode: proofDefinitive ? RESULT_PROOF_CODES.TURN_BOUNDARY_CLOSED : null,
-    error: proofDefinitive
+    errorCode: executionFailure || (proofDefinitive ? RESULT_PROOF_CODES.TURN_BOUNDARY_CLOSED : null),
+    error: executionFailure ? 'Codex provider execution ended without a successful final result: ' + executionFailure : proofDefinitive
       ? 'Codex provider turn closed before an exact terminal result'
       : null,
   };
@@ -9622,6 +9992,8 @@ async function fetchCodexUsageFromOpenAI(auth, {
   fetchImpl = global.fetch,
   timeoutMs = CODEX_REMOTE_USAGE_TIMEOUT_MS,
   now = Date.now,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
 } = {}) {
   if (!auth?.accessToken || !auth?.accountId || !auth?.accountKey) {
     throw new CodexUsageFetchError('auth_missing', 'Missing Codex ChatGPT OAuth credentials');
@@ -9631,8 +10003,11 @@ async function fetchCodexUsageFromOpenAI(auth, {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimer(() => controller.abort(), timeoutMs);
   const startedAt = now();
+  let phase = 'waiting-headers';
+  let headersAt = null;
+  let responseStatus = null;
   try {
     const response = await fetchImpl(CODEX_USAGE_API_URL, {
       method: 'GET',
@@ -9646,6 +10021,9 @@ async function fetchCodexUsageFromOpenAI(auth, {
         'User-Agent': 'Noted Terminal',
       },
     });
+    headersAt = now();
+    responseStatus = response.status;
+    phase = 'checking-status';
 
     if (response.status === 401 || response.status === 403) {
       throw new CodexUsageFetchError('unauthorized', 'Codex OAuth token is invalid', response.status);
@@ -9663,13 +10041,16 @@ async function fetchCodexUsageFromOpenAI(auth, {
       throw new CodexUsageFetchError('server_error', 'OpenAI usage endpoint failed', response.status);
     }
 
+    phase = 'reading-body';
     let payload;
     try {
       payload = await response.json();
-    } catch {
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
       throw new CodexUsageFetchError('invalid_response', 'OpenAI usage response is not JSON');
     }
 
+    phase = 'validating-response';
     const expectedEmail = String(auth.email || '').trim().toLowerCase();
     const responseEmail = String(payload?.email || '').trim().toLowerCase();
     if (expectedEmail && responseEmail && expectedEmail !== responseEmail) {
@@ -9698,13 +10079,19 @@ async function fetchCodexUsageFromOpenAI(auth, {
       durationMs: Math.max(0, now() - startedAt),
     };
   } catch (error) {
-    if (error?.name === 'AbortError') {
-      throw new CodexUsageFetchError('timeout', 'OpenAI usage request timed out');
-    }
-    if (error instanceof CodexUsageFetchError) throw error;
-    throw new CodexUsageFetchError('network_error', error?.message || String(error));
+    const failure = error?.name === 'AbortError'
+      ? new CodexUsageFetchError('timeout', 'OpenAI usage request timed out')
+      : error instanceof CodexUsageFetchError
+        ? error
+        : new CodexUsageFetchError('network_error', error?.message || String(error));
+    failure.status ??= responseStatus;
+    failure.requestPhase = phase;
+    failure.requestDurationMs = Math.max(0, now() - startedAt);
+    failure.responseHeadersMs = headersAt == null ? null : Math.max(0, headersAt - startedAt);
+    failure.requestTimeoutMs = timeoutMs;
+    throw failure;
   } finally {
-    clearTimeout(timeout);
+    clearTimer(timeout);
   }
 }
 
@@ -10085,7 +10472,11 @@ async function getCodexRemoteUsage({
     console.warn('[CodexData] remote usage failed account=' +
       (maskCodexEmail(latestAuth?.email || failedAuth.email) || shortCodexId(latestAuth?.accountId || failedAuth.accountId) || 'unknown') +
       ' code=' + (error?.code || 'network_error') +
-      ' status=' + (error?.status || 'none'));
+      ' status=' + (error?.status || 'none') +
+      ' phase=' + (error?.requestPhase || 'unknown') +
+      ' durationMs=' + (error?.requestDurationMs ?? 'unknown') +
+      ' headersMs=' + (error?.responseHeadersMs ?? 'none') +
+      ' timeoutMs=' + (error?.requestTimeoutMs ?? 'unknown'));
     return {
       accounts: listCodexRemoteUsageAccounts(errorAccountKey),
       currentAccountKey: errorAccountKey,
@@ -10875,6 +11266,8 @@ function listCodexModels() {
 }
 
 async function loadSessionRecords(sessionId, cwd, options = {}) {
+  return perfCausal.run('codex.loadSessionRecords', { sessionId,
+    caller: perfCausal.current()?.name || _describeJsonlReadCaller() }, async () => {
   const found = await findCodexSessionFile(sessionId, cwd,
     options.sessionsDir ? { sessionsDir: options.sessionsDir } : {});
   if (!found) return { success: false, error: 'Codex session file not found' };
@@ -10882,6 +11275,7 @@ async function loadSessionRecords(sessionId, cwd, options = {}) {
   const sourceSnapshot = getCodexJsonlSourceSnapshot(found.filePath, sessionId, records);
   // parseJsonlFile already copied membership and its matching cursor together.
   return { success: true, records, filePath: found.filePath, sourceSnapshot };
+  });
 }
 
 let _codexResumeSourceReader = null;
@@ -11675,6 +12069,9 @@ module.exports = {
     collectCodexTurnAssistantBlocks,
     buildCodexProviderTurnAssistantResult,
     loadCodexProviderResult,
+    loadCodexObservedExecution,
+    loadLatestCodexObservedExecution,
+    loadCodexHistoricalObservedExecution,
     getCodexResultReaderStats: () => codexResultReader().stats(),
     getCodexUserRecordIdentity,
     isCompactPayload,
@@ -11717,11 +12114,15 @@ module.exports = {
     estimateCodexProjectorCacheEntryBytes,
     buildCodexTimeline,
     findCodexExecNestedCalls,
+    codexHistoryLogicalCalls,
     resolveSimpleJsCallValue,
     parseApplyPatchHistoryActions,
     parseHistoryUnifiedDiffHunks,
     parseCodexPatchApplyChanges,
     codexHistoryActionsForCall,
+    codexHistoryOutputParts,
+    codexHistoryCellId,
+    codexHistorySettledOutputParts,
     getTimelineSessionMeta,
     latestCodexUsageInRecords,
     findLatestCodexUsage,

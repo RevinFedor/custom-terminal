@@ -12,6 +12,7 @@ import {
 import { claudeSettingsServiceDisplayFromRecord } from '../../shared/claude-slash-display.mjs';
 import claudeProviderFailure from '../../shared/claude-provider-failure.cjs';
 import recordTimes from '../../shared/history-record-time.cjs';
+import textPhases from '../../shared/history-text-phase.cjs';
 
 const FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 
@@ -265,6 +266,7 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
           toolUseId,
           toolName,
           args,
+          ...(Object.hasOwn(block, 'result') ? { result: block.result, isError: !!block.isError } : {}),
           family: classified.family,
           bashWord: classified.bashWord,
           mcpServer: classified.mcpServer,
@@ -276,6 +278,7 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
   if (!text && !thinking && actions.length === 0) return null;
   return {
     uuid: canonical.uuid,
+    ...(canonical.replaceCallActions === true ? { replaceCallActions: true } : {}),
     ...(typeof canonical.sourceIdentity === 'string'
       ? { sourceIdentity: canonical.sourceIdentity }
       : {}),
@@ -286,6 +289,8 @@ const projectAssistantEntry = (canonical, envelope, blocks) => {
       ? { recordByteOffset: recordByteOffsetFrom(envelope) }
       : {}),
     role: 'assistant',
+    ...(textPhases.normalizeCodexTextPhase(canonical.textPhase)
+      ? { textPhase: textPhases.normalizeCodexTextPhase(canonical.textPhase) } : {}),
     ...(recordTime ? { recordTime } : {}),
     timestamp: String(
       canonical.timestamp
@@ -328,6 +333,10 @@ const projectUserEntry = (canonical, envelope, blocks) => {
       : {}),
     role: 'user',
     ...(recordTime ? { recordTime } : {}),
+    ...(isObject(canonical.questionReplyProof) && Array.isArray(canonical.questionReplyProof.links)
+      ? { questionReplyProof: { ...canonical.questionReplyProof,
+          links: canonical.questionReplyProof.links.map(link => ({ ...link })) } }
+      : {}),
     ...(canonical.serviceCarrier === 'project-instructions'
       ? { serviceCarrier: 'project-instructions' }
       : {}),
@@ -378,7 +387,7 @@ const upsertEntry = (entries, incoming, { beforeFirstQueued = false } = {}) => {
         : {}),
     ...(
       incoming.actions || existing.actions
-        ? { actions: mergeActions(existing.actions, incoming.actions) }
+        ? { actions: incoming.replaceCallActions === true ? incoming.actions : mergeActions(existing.actions, incoming.actions) }
         : {}
     ),
   };

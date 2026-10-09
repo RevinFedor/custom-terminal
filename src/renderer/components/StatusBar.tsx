@@ -305,7 +305,7 @@ function McpActivityChip() {
           chipRect={chipRef.current.getBoundingClientRect()}
           popupRef={popupRef}
           events={events}
-          onFocusTarget={(event) => { focusMcpTarget(event); setOpen(false); }}
+          onFocusTarget={async (event) => { if (await focusMcpTarget(event)) setOpen(false); }}
         />,
         document.body
       )}
@@ -396,10 +396,9 @@ async function focusMcpTarget(event: McpActivityEvent) {
   let projectId = event.targetProjectId || '';
 
   if (event.tabId) {
-    await store.openTabById(event.tabId, {
+    return store.openTabById(event.tabId, {
       projectId: event.targetProjectId, projectPath: event.targetCwd, reason: 'mcp-activity-target',
     });
-    return;
   }
 
   if (!projectId && event.targetCwd) {
@@ -416,7 +415,7 @@ async function focusMcpTarget(event: McpActivityEvent) {
     }
   }
 
-  if (!projectId) return;
+  if (!projectId) return false;
   const latest = useWorkspaceStore.getState();
   if (!latest.openProjects.has(projectId) && event.targetCwd) {
     await latest.openProject(projectId, event.targetCwd, { background: false });
@@ -425,6 +424,7 @@ async function focusMcpTarget(event: McpActivityEvent) {
   }
   const after = useWorkspaceStore.getState();
   after.setProjectView(projectId, 'terminal');
+  return after.openProjects.has(projectId);
 }
 
 function actionLabel(action: string): string {

@@ -8,6 +8,7 @@ import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
 import { CompositedTextShimmer } from '../UI/CompositedTextShimmer';
 import TabNotificationControls from './TabNotificationControls';
+import TabFileDeleteAction from './TabFileDeleteAction';
 import {
   CONTEXT_MENU_BLOCK_DIVIDER_STYLE,
   CONTEXT_MENU_BOTTOM_DIVIDER_STYLE,
@@ -34,10 +35,8 @@ import { TabPaneMap } from './PaneMap';
 import { TabIdActions } from './TabIdActions';
 import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
 import { tabContextSurface, tabContextPaneIndex } from '../../utils/tabContextSurface.mjs';
-import MoveToWindowMenu, { type WindowCell } from './MoveToWindowMenu';
+import type { WindowCell } from './MoveToWindowMenu';
 import NewTabMenuRows from './NewTabMenuRows';
-import TabMenuChoices from './TabMenuChoices';
-import { workflowGroupChoices } from '../../utils/workflowGlobalGroups.mjs';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
@@ -3577,6 +3576,16 @@ function TabBar({
   // the moment Rename is clicked.
   const renameHostRef = useRef<string | null>(null);
   const externalContextMenuRef = useRef<ExternalTabContextMenu | null>(null);
+
+  useEffect(() => {
+    if (!contextMenu || useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(contextMenu.tabId)?.tabType !== 'file') return;
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault(); event.stopPropagation(); setContextMenu(null);
+    };
+    window.addEventListener('keydown', escape, true);
+    return () => window.removeEventListener('keydown', escape, true);
+  }, [contextMenu, projectId]);
 
   useLayoutEffect(() => {
     const owner = externalContextMenuRef.current;
@@ -10720,42 +10729,6 @@ function TabBar({
             </div>
           )}
 
-          {/* “Move to window” complete row + hover flyout lives in
-              MoveToWindowMenu. The split-button menu renders the same
-              component in swap mode, so side selection, bridge, compact cards
-              and scrolling cannot drift. */}
-          {(!isContextMultiSelect || organizationReady) && contextMenu && (
-            <MoveToWindowMenu
-              projectId={projectId}
-              tabId={contextMenu.tabId}
-              preferredSide={submenuSide}
-              hideWindowPicker={isContextMultiSelect}
-              workflows={organizationReady ? workflowTargets : undefined}
-              onMoveToWorkflow={organizationReady ? async workflowId => {
-                const ids = isContextMultiSelect ? [...selectedTabIds] : [contextMenu.tabId];
-                try {
-                  const moved = await useWorkspaceStore.getState().moveTabsToWorkflow(ids,workflowId);
-                  if(!moved)showToast('Перенос не подтверждён','warning');
-                  return moved;
-                } catch(error:any) {showToast(error?.message || 'Перенос не подтверждён','warning');return false;}
-              } : undefined}
-              onDone={() => setContextMenu(null)}
-            />
-          )}
-          {organizationReady && contextMenu && <>
-            <TabMenuChoices label="Group" icon={<Folder size={12}/>} action="global-group" side={submenuSide}
-              choices={[{id:'',name:'Без группы'},...workflowGroupChoices(globalGroups)].map(group => ({...group,
-                selected:(globalGroups?.tabGroups[contextMenu.tabId] || '') === group.id}))}
-              onChoose={async groupId => {
-                const store = useWorkspaceStore.getState(),publication = store.globalGroups;
-                const ids = isContextMultiSelect ? [...selectedTabIds] : [contextMenu.tabId];
-                setContextMenu(null);
-                try {await store.mutateWorkflowGroup('assign',{version:1,mutationId:crypto.randomUUID(),expectedRevision:publication.revision,
-                  groupId:groupId || null,tabIds:ids,expectedTabGroups:Object.fromEntries(ids.map(id => [id,publication.tabGroups[id] || null]))});}
-                catch (error:any) {showToast(error?.message || 'Группа не сохранена','warning');}
-              }} />
-          </>}
-
           {/* Separator */}
           <div data-context-menu-divider style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
 
@@ -10819,17 +10792,14 @@ function TabBar({
                 Copy Content
               </button>
               <div data-context-menu-divider style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
-              <button
-                data-context-menu-row="ordinary"
-                data-tab-context-action="unlink-file"
-                className="w-full text-left text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center"
-                style={CONTEXT_MENU_ROW_STYLE}
-                onClick={() => {
-                  handleContextClose();
-                }}
-              >
-                Unlink File
-              </button>
+              <TabFileDeleteAction key={`unlink:${contextMenu.tabId}:${contextMenu.x}:${contextMenu.y}`} unlink
+                projectId={projectId} tabId={contextMenu.tabId} style={CONTEXT_MENU_ROW_STYLE}
+                isCurrent={()=>!externalContextMenuRef.current?.isCurrent || externalContextMenuRef.current.isCurrent()}
+                onDone={()=>setContextMenu(null)}/>
+              <TabFileDeleteAction key={`${contextMenu.tabId}:${contextMenu.x}:${contextMenu.y}`}
+                projectId={projectId} tabId={contextMenu.tabId} style={CONTEXT_MENU_ROW_STYLE}
+                isCurrent={()=>!externalContextMenuRef.current?.isCurrent || externalContextMenuRef.current.isCurrent()}
+                onDone={()=>setContextMenu(null)}/>
             </>
           ) : (() => {
             const targetTabs = (isContextMultiSelect ? selectedTabIds : [contextMenu.tabId])

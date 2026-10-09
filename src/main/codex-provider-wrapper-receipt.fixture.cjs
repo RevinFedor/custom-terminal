@@ -132,6 +132,9 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     tabWorkContext: { assertContinuationScope() {} },
     conversationOwners: { assertNone() {}, noteInput() {} },
     isCodexTuiEffectivelyReady: () => ready,
+    // No native question editor in this receipt/target fixture. Its own
+    // controller suite covers open/close; preserve that existing caller port.
+    prepareCodexMainComposerForSend: async () => ({ success: true, changed: false }),
     // The writer/send evidence below is fixture state; the renderer-to-main
     // wrapper still executes main's real operational-input predicate. Only the
     // broader policy projection is fixture-owned here.

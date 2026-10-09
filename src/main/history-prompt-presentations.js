@@ -1033,6 +1033,7 @@ module.exports = {
   collectHistoryImagePathMarkersOutsidePastedContent,
   decorateHistoryPromptPresentations,
   normalizePromptPresentationSnapshot,
+  normalizeClaudeRequestPresentation,
   promptPresentationHistorySessionId,
   promptTransportHash,
   recoverManagedHistoryImageRefs,

@@ -15,7 +15,7 @@
 
 ### 2. Static Expanded Height (The Resize Jitter)
 **Problem:** In expanded mode, every pixel change in width causes text reflow, which changes the content height. Constant re-measurement triggered re-positioning of the wrapper, causing the tooltip to "jitter" or jump away from the mouse cursor.
-- **Solution:** In expanded mode, the wrapper uses a fixed height `60vh` (matching CSS `maxHeight`). 
+- **Historical solution:** expanded mode used a fixed `60vh` wrapper matching the old content height. SOURCE preview with a header/footer and one reading viewport now observes its own real height and clamps against viewport edges. Measurements are suppressed during width drag; they are not connected to History/composer geometry or scroll writers.
 - **Invisible Intent:** Avoiding measurement-based positioning during resize prevents the feedback loop where repositioning triggers an `onMouseLeave` event.
 
 ### 3. The Click-after-Resize Trap

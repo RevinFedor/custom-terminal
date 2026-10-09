@@ -36,6 +36,7 @@ function harness(t, provider) {
   const writes = [], contexts = [];
   let targetSession = 'S';
   const context = vm.createContext({
+    require, path, srcMainDir: __dirname,
     ...registry, agentSendReceiptStore: store, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,
     AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
@@ -244,6 +245,9 @@ function automaticWaitHarness(t, { legacy = false } = {}) {
     terminals: new Map([['T', {}]]), terminalCommandState: new Map(),
     isPromptQueueAutomationSource: require('./prompt-queue-source').isPromptQueueAutomationSource,
     isCodexOperationalInputReady: () => true,
+    // This fixture owns the automatic busy gate; the native-question editor
+    // controller is a separate port and its frame/keys are not exercised here.
+    prepareCodexMainComposerForSend: async () => ({ success: true }),
     agentSendCancellations: { isCancelled: () => cancelled },
     getCodexRuntimeSessionSnapshot: async () => ({ liveLifecycle: true, sessionStatus: busy ? 'busy' : 'active', inputReady: true, busy }),
     agentSendRequestTargetFailure: () => null, CODEX_PASTE_AUDIT_TIMEOUT_MS: 100,

@@ -184,7 +184,7 @@ function WorkflowNameEditor({
   );
 }
 
-export default function WorkflowSettings() {
+export default function WorkflowSettings({workflowId}:{workflowId?:string}={}) {
   const spaces = useWorkspaceStore((state) => state.spaces);
   const addWorkspaceSpace = useWorkspaceStore((state) => state.addWorkspaceSpace);
   const removeWorkspaceSpace = useWorkspaceStore((state) => state.removeWorkspaceSpace);
@@ -316,7 +316,7 @@ export default function WorkflowSettings() {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '8px' }}>
+      {!workflowId && <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '8px' }}>
         <div
           style={{
             minWidth: 0,
@@ -341,7 +341,7 @@ export default function WorkflowSettings() {
             + Workflow
           </button>
         </div>
-      </div>
+      </div>}
 
       {status && (
         <div
@@ -363,7 +363,7 @@ export default function WorkflowSettings() {
       )}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '7px' }}>
-        {[...spaces.filter((space: any) => space.kind !== 'inbox'), ...spaces.filter((space: any) => space.kind === 'inbox')].map((space) => {
+        {[...spaces.filter((space: any) => space.kind !== 'inbox'), ...spaces.filter((space: any) => space.kind === 'inbox')].filter(space=>!workflowId || space.id===workflowId).map((space) => {
           const workflowTarget: IconTarget = { kind: 'workflow', id: space.id };
           const workflowBusy = busyKey === targetKey(workflowTarget);
           const inbox = (space as any).kind === 'inbox';

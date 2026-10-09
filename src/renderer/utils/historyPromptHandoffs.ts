@@ -7,6 +7,7 @@ import {
   projectAgentLocalCommandSendResult,
 } from './agentLocalCommand.mjs';
 import { isAutomaticReadinessWaitReceipt } from '../../shared/prompt-queue-send-intent.cjs';
+import { hiddenSendPresentation, canProjectCurrentProviderQueue, retiredSendInputSlot, cancelledSendIntent } from '../../shared/agent-send-receipt-control.cjs';
 
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
 
@@ -236,6 +237,8 @@ export interface AcceptHistoryPromptHandoffProviderQueueInput
 }
 
 export interface DurableHistorySendReceiptRecord {
+  deliveryControl?: { version: number; cancelledAt?: number | null; presentationDismissed?: boolean } | null;
+  inputSlot?: { version: number; state: string; reason?: string | null; retiredAt?: number | null } | null;
   applicationQueue?: { version: number; id: number; state: string; queuedAt: number;
     waitingBeforeInput?: boolean; lastNoWriteAttemptId?: string; mergePrevious?: QueuedMessageMergeGuard | null;
     position?: number; merge?: { version: number; sourceOperationKeys: string[]; presentationHandoffId?: string } | null } | null;
@@ -967,8 +970,31 @@ export class HistoryPromptHandoffStore {
   private readonly limits: Readonly<HistoryPromptHandoffStoreLimits>;
   private readonly tabs = new Map<string, Map<string, StoredHandoff>>();
   private readonly listeners = new Map<string, Set<HistoryPromptHandoffListener>>();
+  private readonly deliveryControls = new Map<string, { attemptId: string | null; hidden: boolean; retired: boolean; cancelled: boolean }>();
   private handoffs = 0;
   private approxBytes = 0;
+
+  // Thin projection metadata outlives payload eviction. Main remains the
+  // durable owner; late receipt/list replies may not undo an observed control.
+  observeDeliveryControl(record: DurableHistorySendReceiptRecord) {
+    const key = JSON.stringify([record.tabId, record.handoffId, record.operationKey]);
+    const previous = this.deliveryControls.get(key);
+    const compatible = previous && (previous.cancelled || previous.attemptId === (record.attemptId || null));
+    const hidden = hiddenSendPresentation(record), retired = retiredSendInputSlot(record);
+    const cancelled = cancelledSendIntent(record);
+    if (hidden || retired || cancelled) {
+      const next = { attemptId: record.attemptId || null, hidden: hidden || !!(compatible && previous.hidden),
+        retired: retired || !!(compatible && previous.retired), cancelled: cancelled || !!(compatible && previous.cancelled) };
+      this.deliveryControls.delete(key); this.deliveryControls.set(key, next);
+      const cap = Math.min(8192, Math.max(256, this.limits.maxHandoffs * 4));
+      while (this.deliveryControls.size > cap) {
+        this.deliveryControls.delete(this.deliveryControls.keys().next().value!);
+        console.warn('[HistorySendControl] projection metadata evicted; durable Main remains authoritative');
+      }
+      return next;
+    }
+    return compatible ? previous : null;
+  }
 
   constructor(
     limits: HistoryPromptHandoffStoreLimits = DEFAULT_HISTORY_PROMPT_HANDOFF_LIMITS,
@@ -1246,6 +1272,9 @@ export class HistoryPromptHandoffStore {
     const tab = this.tabs.get(tabId);
     const current = tab?.get(handoffId);
     if (!tab || !current) return undefined;
+    const control = this.observeDeliveryControl({ tabId, handoffId, operationKey: current.value.sendOperationKey,
+      attemptId: current.value.sendAttemptId });
+    if (control?.retired || control?.cancelled) return current.value;
     if (!historyPromptHandoffAcceptsAuditIdentity(current.value, input)) {
       return current.value;
     }
@@ -1372,6 +1401,9 @@ export class HistoryPromptHandoffStore {
     const tab = this.tabs.get(tabId);
     const current = tab?.get(handoffId);
     if (!tab || !current) return undefined;
+    const control = this.observeDeliveryControl({ tabId, handoffId, operationKey: current.value.sendOperationKey,
+      attemptId: current.value.sendAttemptId });
+    if ((control?.retired || control?.cancelled) && input.queueStatus === 'queued') return current.value;
 
     if ((input.sendAttemptId || input.sendOperationKey)
       && (!historyPromptHandoffAcceptsAuditIdentity(current.value, input)
@@ -1421,6 +1453,7 @@ export class HistoryPromptHandoffStore {
       && current.value.statusReason === 'provider-queue-accepted';
     if (
       currentHasProviderQueueReceipt
+      && !control?.retired && !control?.cancelled
       && (input.queueStatus === 'audit-pending' || input.queueStatus === 'delivery-unknown')
     ) {
       // Claude's exact queue-operation is stronger than the caller timeout
@@ -2181,14 +2214,15 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     || !promptText) {
     return { hydrated: false, reason: 'durable-history-receipt-incomplete' };
   }
-  if (
-    Number.isFinite(Number(receipt.presentationDismissedAt))
-    && receipt.presentationDismissedSurface === 'desktop-history'
-  ) {
-    if (receipt.mergedIntoOperationKey && !attemptId) {
-      const current = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
-      if (current && !current.sendAttemptId && current.sendOperationKey === operationKey) consumeHistoryPromptHandoff(tabId, handoffId);
-    }
+  const controlOwner = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
+  if (controlOwner?.sendAttemptId && attemptId && controlOwner.sendAttemptId !== attemptId) {
+    return { hydrated: false, reason: 'durable-history-receipt-owner-mismatch' };
+  }
+  const deliveryControl = historyPromptHandoffStore.observeDeliveryControl(record);
+  if (hiddenSendPresentation(record) || deliveryControl?.hidden) {
+    const current = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
+    if (current && current.sendOperationKey === operationKey
+      && (!current.sendAttemptId || current.sendAttemptId === attemptId)) consumeHistoryPromptHandoff(tabId, handoffId);
     return { hydrated: false, reason: 'durable-history-presentation-dismissed' };
   }
   if (record.state === 'not-submitted' && !applicationWaiting) {
@@ -2252,6 +2286,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     || record.state === 'enter-armed'
     || record.state === 'delivery-unknown'
   )
+    && canProjectCurrentProviderQueue(record) && !deliveryControl?.retired && !deliveryControl?.cancelled
     && providerQueue.accepted === true
     && providerQueue.provider === toolType
     && providerQueue.operationKey === operationKey
@@ -2259,6 +2294,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   let queueStatus: SettledHistoryPromptHandoffStatus | null = null;
   if (applicationWaiting) queueStatus = 'application-queued';
   else if (record.state === 'confirmed') queueStatus = 'sent';
+  else if (deliveryControl?.retired || deliveryControl?.cancelled) queueStatus = 'delivery-unknown';
   else if (exactProviderQueueAccepted) queueStatus = 'queued';
   else if (record.state === 'audit-pending') queueStatus = 'audit-pending';
   else if (record.state === 'delivery-unknown' || record.state === 'enter-armed') {
@@ -2351,6 +2387,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
         ...(applicationWaiting && attemptId ? { noWriteAttemptId: attemptId } : {}),
         reason: queueStatus === 'sent'
           ? 'durable-audit-confirmed'
+          : deliveryControl?.retired ? 'durable-input-slot-retired'
           : applicationWaiting ? 'automatic-readiness-wait'
           : queueStatus === 'queued'
             ? 'durable-provider-queue-accepted'

@@ -271,6 +271,12 @@ class WorkflowGroups {
     return result;
   }
 
+  getMutation(mutationId) {
+    this.writable();
+    const row=this.db.prepare('SELECT response_json FROM workflow_group_mutations WHERE mutation_id=?').get(requireId(mutationId));
+    return row ? JSON.parse(row.response_json) : null;
+  }
+
   /** Internal primitive; the organization command owns transaction + receipt. */
   applyDragAssignments(assignments) {
     if (!this.db.inTransaction) fail('workflow_group_activation_transaction_required');
@@ -287,6 +293,19 @@ class WorkflowGroups {
       changed=true;
     }
     if(changed)this.db.prepare('UPDATE workflow_group_meta SET revision=revision+1 WHERE singleton=1').run();
+  }
+  applyDragEmptyGroups(moves) {
+    if(!this.db.inTransaction)fail('workflow_group_activation_transaction_required');
+    this.writable();
+    for(const move of moves) {
+      const group=this.group(move.groupId);
+      if(group.version!==undefined && group.version!==VERSION)fail('workflow_group_metadata_version_unsupported');
+      if(group.revision!==move.expectedGroupRevision
+        || this.db.prepare('SELECT 1 FROM workflow_group_memberships WHERE group_id=?').get(group.id))fail('workflow_drag_empty_group_changed');
+      this.db.prepare('UPDATE workflow_global_groups SET metadata_json=?,revision=revision+1 WHERE group_id=?')
+        .run(json({...group,reserveWorkflowId:move.workflowId}),group.id);
+    }
+    if(moves.length)this.db.prepare('UPDATE workflow_group_meta SET revision=revision+1 WHERE singleton=1').run();
   }
 }
 

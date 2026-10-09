@@ -43,3 +43,25 @@ test('cwd point ACK requires the exact subject, value, and contiguous known befo
  assert.equal(a.point('N',current,point),true);assert.equal(current.executionStorageRevision,3);
  const before=tab();a.prepare('N',[before]);assert.equal(before.executionStorageRevision,3);
 });
+
+test('Main point-field proof joins only this successful snapshot to its exact final revision',()=>{
+ const proof={version:1,kind:'main-owned-fields',namespace:'N',tabId:'T',subjectId:'S',fromRevision:1,toRevision:6};
+ const a=createExecutionRevisionAcks(),row=tab(),replacement={...tab(),name:'new local draft'};
+ a.ack('N',[row],ack(7,{executionReconciliations:[proof]}),()=>[replacement]);
+ assert.equal(replacement.executionStorageRevision,7);assert.equal(replacement.name,'new local draft');
+ const queued=tab();a.prepare('N',[queued]);assert.equal(queued.executionStorageRevision,7);assert.equal(queued.name,'frozen');
+ assert.equal(a.canHydrate('N',replacement,tab(6),false),false);
+});
+
+test('foreign, malformed, partial and failed Main point proofs cannot approve a revision jump',()=>{
+ const proof={version:1,kind:'main-owned-fields',namespace:'N',tabId:'T',subjectId:'S',fromRevision:1,toRevision:6};
+ for(const delta of [{namespace:'other'},{tabId:'other'},{subjectId:'other'},{fromRevision:2},{toRevision:5},
+  {toRevision:'6'},{version:2},{kind:'cwd'}]) {
+  const a=createExecutionRevisionAcks(),row=tab();
+  a.ack('N',[row],ack(7,{executionReconciliations:[{...proof,...delta}]}),()=>[row]);
+  assert.equal(row.executionStorageRevision,1);
+ }
+ for(const result of [ack(7,{success:false,executionReconciliations:[proof]}),ack(7,{executionReconciliations:{}})]) {
+  const a=createExecutionRevisionAcks(),row=tab();a.ack('N',[row],result,()=>[row]);assert.equal(row.executionStorageRevision,1);
+ }
+});

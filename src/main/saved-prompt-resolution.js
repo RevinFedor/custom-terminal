@@ -8,8 +8,12 @@ function sameGroup(left, right) {
 
 // Mirrors the valid parent relation used by promptOutlineModel: a missing,
 // cross-group, or cyclic parent is not inherited by the selected prompt.
-function resolveSavedPromptInheritanceChain(prompt, prompts = []) {
+function resolveSavedPromptInheritanceChain(prompt, prompts = [], { outline } = {}) {
   if (!prompt) return [];
+  if (outline) {
+    const { promptOutlineSelection } = require('../shared/prompt-outline.cjs');
+    return promptOutlineSelection(outline, prompt.id).map(node => node.rawPrompt);
+  }
   const byId = new Map((Array.isArray(prompts) ? prompts : []).map((item) => [promptId(item), item]));
   const leafId = promptId(prompt);
   if (leafId) byId.set(leafId, prompt);
@@ -29,12 +33,14 @@ function resolveSavedPromptInheritanceChain(prompt, prompts = []) {
   return chain;
 }
 
-async function resolveSavedPromptComposition(prompt, prompts, resolvePart) {
-  const chain = resolveSavedPromptInheritanceChain(prompt, prompts);
+async function resolveSavedPromptComposition(prompt, prompts, resolvePart, options) {
+  const chain = resolveSavedPromptInheritanceChain(prompt, prompts, options);
   const parts = [];
+  const steps = [];
   for (const item of chain) {
     const resolved = await resolvePart(item);
-    const itemParts = (Array.isArray(resolved) ? resolved : [resolved])
+    const values = Array.isArray(resolved?.parts) ? resolved.parts : resolved;
+    const itemParts = (Array.isArray(values) ? values : [values])
       .map((part) => typeof part === 'string' ? part.trim() : '')
       .filter(Boolean);
     if (itemParts.length === 0) {
@@ -42,11 +48,13 @@ async function resolveSavedPromptComposition(prompt, prompts, resolvePart) {
       error.statusCode = 409;
       error.code = 'saved_prompt_empty';
       error.promptId = promptId(item) || null;
+      error.promptTitle = item?.title || null;
       throw error;
     }
     parts.push(...itemParts);
+    steps.push({ prompt: item, parts: itemParts, files: Array.isArray(resolved?.files) ? resolved.files : [] });
   }
-  return { chain, parts };
+  return { chain, parts, steps };
 }
 
 module.exports = { resolveSavedPromptInheritanceChain, resolveSavedPromptComposition };

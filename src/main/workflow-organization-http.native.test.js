@@ -18,7 +18,7 @@ const { createWorkflowOrganizationHttp, WORKFLOW_HTTP_CAPABILITY, listExecutionN
 const { GLOBAL_EXECUTION_NAMESPACE: NS, INBOX_WORKFLOW_ID } = require('../shared/workflow-organization.cjs');
 const { resolveRestorableAgentTab } = require('./agent-tab-restore');
 
-async function fixture(t, { legacy = false, bootstrap = true } = {}) {
+async function fixture(t, { legacy = false, bootstrap = true, spaces = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-workflow-http-native-'));
   const db = new Database(path.join(root, 'owned.db')); db.pragma('foreign_keys=ON');
   const database = new DatabaseManager({ existingConnection: db }); database.initTables();
@@ -28,7 +28,7 @@ async function fixture(t, { legacy = false, bootstrap = true } = {}) {
   }
   const api = createWorkflowOrganizationApi({ database });
   if (bootstrap) api.bootstrap({ migrationId: 'fixture-migrate', mutationId: 'fixture-activate',
-    workspace: { activeSpaceId: 'work', spaces: [{ id: 'work', name: 'Work', projectIds: legacy ? ['legacy='] : [], layout: {} }] } });
+    workspace: { activeSpaceId: spaces?.[0]?.id || 'work', spaces: spaces || [{ id: 'work', name: 'Work', projectIds: legacy ? ['legacy='] : [], layout: {} }] } });
   const projectManager = { db: database, workflowOrganization: api };
   const calls = [];
   const create = kind => async body => {
@@ -242,4 +242,138 @@ test('unpublished/future organization rejects HTTP writes before renderer or roo
   const result = await f.call('/api/workflows', 'POST', { mutationId: 'future', expectedRevision: 1, workflow: { id: 'future' } });
   assert.equal(result.status, 409); assert.match(result.body.error, /forward_version/);
   assert.equal(f.calls.length, 0);
+});
+
+test('F7: creation without order and publication reorder agree in Main, renderer and phone', async t => {
+  const f=await fixture(t,{spaces:[{id:'a',name:'A',order:0,layout:{}},{id:'b',name:'B',order:1,layout:{}}]});
+  const {organizationProjection,reconcileWorkflowOrder}=await import('../renderer/utils/workflowOrganizationClient.mjs');
+  f.api.mutate('createWorkflow',{mutationId:'C',expectedRevision:f.api.read().publication.revision,workflow:{id:'c',name:'C'}});
+  let snapshot=f.api.read();
+  const current={activeSpaceId:'a'};
+  assert.deepEqual(snapshot.workflows.map(w=>w.id),['a','b','c',INBOX_WORKFLOW_ID]);
+  assert.deepEqual(organizationProjection(snapshot,current).spaces.map(w=>w.id),snapshot.workflows.map(w=>w.id));
+  const initial=organizationProjection(snapshot,current);
+  const originalA=initial.spaces[0];originalA.layout={ownedWindow:'untouched'};
+  const space=id=>{const w=snapshot.workflows.find(w=>w.id===id);return {...w.metadata,id,layout:w.layout};};
+  f.api.mutate('commitWorkspace',{mutationId:'order',expectedRevision:snapshot.publication.revision,
+    spaces:['b','a',INBOX_WORKFLOW_ID,'c'].map(space),tabWorkflowMembership:{}});
+  snapshot=f.api.read();
+  const projection=organizationProjection(snapshot,current),phone=await f.api.readCatalog();
+  assert.deepEqual(snapshot.workflows.map(w=>w.id),['b','a','c',INBOX_WORKFLOW_ID]);
+  assert.deepEqual(projection.spaces.map(w=>w.id),snapshot.workflows.map(w=>w.id));
+  assert.deepEqual(phone.workflows.map(w=>w.id),snapshot.workflows.map(w=>w.id));
+  const followed=reconcileWorkflowOrder(projection.spaces,initial.spaces,initial.organizationWorkflowOrder,'a');
+  assert.equal(followed[1],originalA);assert.deepEqual(originalA.layout,{ownedWindow:'untouched'});
+  const local=[initial.spaces[2],...initial.spaces.slice(0,2),initial.spaces[3]];
+  assert.equal(reconcileWorkflowOrder(projection.spaces,local,initial.organizationWorkflowOrder,'a'),local,'newer local drag owns its order');
+});
+
+test('catalog-v1: full active inventory and exact execution refs, coherent HTTP, no runtime bridge', async t => {
+  const f=await fixture(t,{legacy:true});
+  const add=(id,record={})=>f.api.createTab({mutationId:'new:'+id,tabId:id,cwd:f.root,workflowId:'work',record:{name:id,...record}});
+  add('owner',{commandType:'codex',codexSessionId:'saved-session'});
+  add('file',{tabType:'file',filePath:path.join(f.root,'synthetic.md'),visualParentTabId:'owner'});
+  add('physical',{parentTabId:'owner'});add('hidden');add('profile');add('stopped');add('archived');
+  f.db.prepare("UPDATE tabs SET execution_archived=1 WHERE tab_id='archived'").run();
+  f.api.mutate('createWorkflow',{mutationId:'second',expectedRevision:f.api.read().publication.revision,workflow:{id:'other',name:'Other'}});
+  f.api.createTab({mutationId:'other-member',tabId:'other-member',cwd:f.root,workflowId:'other',record:{name:'Other member'}});
+  const group=f.api.groups.mutate('create',{version:1,mutationId:'group',expectedRevision:f.api.groups.read().revision,
+    metadata:{name:'Spanning',reserveWorkflowId:'work'}}).groupId;
+  const empty=f.api.groups.mutate('create',{version:1,mutationId:'empty',expectedRevision:f.api.groups.read().revision,
+    metadata:{name:'Empty',reserveWorkflowId:'work'}}).groupId;
+  // Synthetic fixture setup only: actual group reader/HTTP project these rows.
+  for(const id of ['owner','file','other-member'])f.db.prepare('INSERT INTO workflow_group_memberships VALUES(?,?,1)').run(id,group);
+  f.db.prepare('UPDATE workflow_group_meta SET revision=revision+1').run();
+  const workflow=f.api.service.getWorkflow('work');
+  const memberRoot='reserve-tab:stopped',groupRoot='reserve-group:'+JSON.stringify([NS,group]);
+  const snapshot=f.api.read();
+  f.api.mutate('commitWorkspace',{mutationId:'placements',expectedRevision:snapshot.publication.revision,
+    spaces:snapshot.workflows.map(w=>({...w.metadata,id:w.id,
+      ...(w.id==='work'?{reserveOrder:['stopped','file','owner'],reserveRootOrder:[memberRoot,groupRoot]}:{}),
+      layout:w.id==='work'?{splitPanes:[{windowId:'shown',projectId:NS,tabId:'owner'},
+        {windowId:'hidden',projectId:NS,tabId:'hidden',displayHidden:true}],windowDisplayLayouts:{old:{splitPanes:[{projectId:NS,tabId:'profile'}]}}}:w.layout})),
+    tabWorkflowMembership:Object.fromEntries(snapshot.tabs.map(entry=>[entry.tabId,{...entry.membership,expectedMembershipRevision:entry.membership.revision}]))});
+  const baseline=f.db.prepare('SELECT * FROM tabs ORDER BY id').all();
+  const rawBefore=f.api.read();
+  assert.equal((await f.call('/api/workflow-organization?projection=catalog-v1','GET',undefined,false)).status,401);
+  assert.equal((await f.call('/api/workflow-organization?projection=unknown')).status,400);
+  const response=await f.call(WORKFLOW_HTTP_CAPABILITY.catalogProjection.endpoint);
+  assert.equal(response.status,200);
+  const dto=response.body,work=dto.workflows.find(w=>w.id==='work'),other=dto.workflows.find(w=>w.id==='other');
+  assert.deepEqual(new Set(work.memberTabIds),new Set(['source','owner','file','physical','hidden','profile','stopped']));
+  assert.deepEqual(work.rootIds.slice(0,2),[memberRoot,groupRoot]);
+  assert.ok(work.nodes.find(n=>n.tabId==='file').parentId.endsWith('owner'));
+  assert.equal(work.nodes.find(n=>n.tabId==='physical').contextParent.tabId,'owner','cross-group parent is context, physical relation remains');
+  assert.deepEqual(work.groups.find(g=>g.id===group).memberTabIds,['file','owner']);
+  assert.deepEqual(other.groups.find(g=>g.id===group).memberTabIds,['other-member']);
+  assert.deepEqual(work.groups.find(g=>g.id===empty).memberTabIds,[]);
+  assert.equal(dto.executionRefs.source.namespace,'legacy=');assert.equal(dto.executionRefs.source.subjectVersion,1);
+  assert.equal(dto.executionRefs.file.namespace,NS);assert.equal(dto.executionRefs.file.subjectVersion,2);
+  assert.ok(dto.executionRefs.file.aliases.some(alias=>alias.namespace===NS && alias.tabId==='file'));
+  assert.equal(dto.rows.file.filePath,path.join(f.root,'synthetic.md'));
+  assert.equal(dto.rows.physical.parentTabId,'owner');assert.equal(dto.rows.physical.visualParentTabId,null);
+  assert.equal(dto.rows.archived,undefined);assert.equal(dto.provenance.find(p=>p.tabId==='archived').reason,'archived');
+  assert.deepEqual(dto.excludedSignals,['runtime','cardSignals','history']);assert.equal(dto.sourceBindings,'tab');
+  assert.deepEqual(f.db.prepare('SELECT * FROM tabs ORDER BY id').all(),baseline);
+  assert.deepEqual(f.api.read(),rawBefore);assert.equal(f.calls.length,0);
+  if(process.env.NOTED_CATALOG_PROOF_DIR){
+    fs.writeFileSync(path.join(process.env.NOTED_CATALOG_PROOF_DIR,'catalog-example.json'),JSON.stringify(dto,null,2));
+    fs.writeFileSync(path.join(process.env.NOTED_CATALOG_PROOF_DIR,'catalog-example-source.json'),JSON.stringify(rawBefore,null,2));
+  }
+});
+
+test('catalog reads coalesce before capture and never reuse stale descriptor or order clocks', async t => {
+  const f=await fixture(t,{legacy:true});
+  f.api.createTab({mutationId:'v2',tabId:'v2',cwd:f.root,workflowId:'work',record:{name:'V2'}});
+  let reads=0;const original=f.api.service.readState.bind(f.api.service);
+  f.api.service.readState=()=>{reads++;return original();};
+  const first=f.api.readCatalog(),joined=f.api.readCatalog();assert.equal(first,joined);
+  f.db.prepare("UPDATE tabs SET name='latest before capture' WHERE tab_id='source'").run();
+  const a=await first;assert.equal(await joined,a);assert.equal(reads,1);assert.ok(Object.isFrozen(a.rows.source));
+  assert.equal(a.rows.source.name,'latest before capture');
+  f.db.prepare("UPDATE tabs SET cwd=?,name='new live name' WHERE tab_id='source'").run(f.root+'/new');
+  const b=await f.api.readCatalog();assert.equal(reads,2);
+  assert.equal(a.clocks.organization.revision,b.clocks.organization.revision);
+  assert.notEqual(a.clocks.descriptors.value,b.clocks.descriptors.value);
+  assert.equal(b.executionRefs.source.cwd,f.root+'/new');assert.equal(a.rows.source.name,'latest before capture');
+  f.database.setAppState('workspace-session',{openProjects:[{projectId:NS},{projectId:'legacy='}]});
+  const c=await f.api.readCatalog();assert.notEqual(c.clocks.tree.value,b.clocks.tree.value);
+  const previous=reads;
+  const concurrent=await Promise.all(Array.from({length:8},()=>f.call('/api/workflow-organization?projection=catalog-v1')));
+  assert.ok(concurrent.every(r=>r.status===200));
+  assert.ok(reads-previous<8,'overlapping HTTP requests share a scheduled capture');
+  assert.deepEqual(new Set(concurrent.map(r=>r.body.clocks.descriptors.value)),new Set([c.clocks.descriptors.value]));
+  f.db.prepare('UPDATE workflow_group_meta SET version=99').run();
+  await assert.rejects(f.api.readCatalog(),/groups_version_unsupported/);
+  f.db.prepare('UPDATE workflow_group_meta SET version=1').run();
+  assert.equal((await f.api.readCatalog()).version,1,'rejected flight does not poison future reads');
+});
+
+test('catalog fallback matches actual cold namespace/tab hydration and survives a fresh reader', async t => {
+  const f=await fixture(t,{legacy:true});
+  for(const [id,namespace,position,isUtility] of [['legacy-main','legacy=',8,false],['legacy-utility','legacy=',-1,true],['v2-last',NS,9,false],['v2-first',NS,1,true]])
+    f.api.createTab({mutationId:id,tabId:id,executionNamespace:namespace,cwd:f.root,workflowId:'work',record:{name:id,position,isUtility}});
+  f.database.setAppState('workspace-session',{openProjects:[{projectId:NS},{projectId:'legacy='}]});
+  const hydrated=f.api.listNamespaces(),ids=[NS,'legacy='].flatMap(ns=>hydrated.find(p=>p.id===ns).tabs.map(t=>t.tabId));
+  const before=await f.api.readCatalog();assert.deepEqual(before.workflows.find(w=>w.id==='work').memberTabIds,ids);
+  const nextConnection=new Database(path.join(f.root,'owned.db'));
+  try {
+    const nextManager=new DatabaseManager({existingConnection:nextConnection});
+    const next=createWorkflowOrganizationApi({database:nextManager});
+    assert.deepEqual(await next.readCatalog(),before);
+  } finally {nextConnection.close();}
+});
+
+test('workflow default directory applies to new creation only; explicit/source cwd keep priority', async t => {
+  const f=await fixture(t,{legacy:true});
+  const defaults=path.join(f.root,'workflow-default');fs.mkdirSync(defaults);
+  const s=f.api.read();
+  f.api.mutate('commitWorkspace',{mutationId:'default-directory',expectedRevision:s.publication.revision,
+    spaces:s.workflows.map(w=>({...w.metadata,id:w.id,...(w.id==='work'?{defaultCwd:defaults}:{})})),
+    tabWorkflowMembership:Object.fromEntries(s.tabs.map(tab=>[tab.tabId,{...tab.membership,expectedMembershipRevision:tab.membership.revision}]))});
+  assert.equal((await freezeWorkflowCreationContext(f.projectManager,{},'work')).cwd,defaults);
+  assert.equal((await freezeWorkflowCreationContext(f.projectManager,{sourceTabId:'source'},'work')).cwd,f.root);
+  assert.equal((await freezeWorkflowCreationContext(f.projectManager,{cwd:f.root},'work')).cwd,f.root);
+  assert.equal(f.db.prepare("SELECT cwd FROM tabs WHERE tab_id='source'").get().cwd,f.root);
+  assert.equal((await f.api.readCatalog()).workflows.find(w=>w.id==='work').defaultCwd,defaults);
 });

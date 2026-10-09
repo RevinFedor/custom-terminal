@@ -7,8 +7,6 @@ import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
 import { useTimelineSummaryStore } from '../../store/useTimelineSummaryStore';
 import Tooltip from './Tooltip';
 import ControlHint from './ControlHint';
-import WorkflowSettings from './ProjectIconsSettings';
-import DirectoryRootsSettings from './DirectoryRootsSettings';
 import { TabProcessBar } from '../Workspace/TabSignals';
 import { HexColorPicker } from 'react-colorful';
 import { ChevronDown, ChevronRight, CircleX, GripVertical, Loader2, Pencil, Trash2, Plus } from 'lucide-react';
@@ -92,7 +90,7 @@ type FlatPromptItem = { type: 'prompt'; origIdx: number; prompt: Prompt };
 type FlatGroupItem = { type: 'group'; group: PromptGroup };
 type FlatItem = FlatPromptItem | FlatGroupItem;
 
-type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai' | 'projects';
+type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai';
 type AISubTab = 'text' | 'system' | 'usage';
 type AIUsageRange = 'week' | 'month' | 'all';
 
@@ -1530,6 +1528,16 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     () => modelSettingsExpandedForSession,
   );
   const contentScrollRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  // Opening from a terminal shortcut must move keyboard ownership too.
+  // Otherwise xterm consumes Escape while Settings remains visibly open.
+  useLayoutEffect(() => {
+    if (!isOpen) return;
+    const previous = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus({preventScroll:true});
+    return () => { if (previous?.isConnected) previous.focus({preventScroll:true}); };
+  }, [isOpen]);
 
   // The top content node is reused while its tab changes, so the browser would
   // otherwise carry one tab's offset into another. Restore each tab's own
@@ -1546,8 +1554,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const prevIsOpenRef = useRef(isOpen);
   useLayoutEffect(() => {
     if (isOpen && !prevIsOpenRef.current && initialTab) {
-      const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai', 'projects'];
-      const requested = initialTab === 'workflows' || initialTab === 'directories' ? 'projects' : initialTab;
+      const valid: SettingsTab[] = ['shortcuts', 'fonts', 'colors', 'ai'];
+      const requested = initialTab;
       if (valid.includes(requested as SettingsTab)) {
         setActiveTab(requested as SettingsTab);
       }
@@ -1584,6 +1592,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [timelineFontSize, setTimelineFontSize] = useDisplayProfileSize('timelineFontSize', profileKey);
   const [timelineSummaryFontSize, setTimelineSummaryFontSize] = useDisplayProfileSize('timelineSummaryFontSize', profileKey);
   const timelineLineClamp = useUIStore((s) => s.timelineLineClamp);
+  const timelinePreviewResponseLines = useUIStore((s) => s.timelinePreviewResponseLines);
+  const setTimelinePreviewResponseLines = useUIStore((s) => s.setTimelinePreviewResponseLines);
   const setTimelineLineClamp = useUIStore((s) => s.setTimelineLineClamp);
   const [historyFontSize, setHistoryFontSize] = useDisplayProfileSize('historyFontSize', profileKey);
   const [historyComposerFontSize, setHistoryComposerFontSize] = useDisplayProfileSize('historyComposerFontSize', profileKey);
@@ -3852,8 +3862,14 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       onClick={(e) => { if (e.target === e.currentTarget && (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay === 'true') closeSettings(); (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay = ''; }}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Settings"
+        tabIndex={-1}
         style={{
           backgroundColor: '#1a1a1a',
+          outline: 'none',
           borderRadius: '16px',
           border: '1px solid #333',
           // Settings → Размеры сгруппированы по видимым областям приложения.
@@ -3907,8 +3923,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             { id: 'ai', label: 'AI' },
             { id: 'fonts', label: 'Размеры' },
             { id: 'colors', label: 'Системные' },
-            { id: 'shortcuts', label: 'Горячие клавиши' },
-            { id: 'projects', label: 'Workflows' }
+            { id: 'shortcuts', label: 'Горячие клавиши' }
           ] as { id: SettingsTab; label: string }[]).map((tab) => (
             <button
               key={tab.id}
@@ -3992,12 +4007,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             </div>
           )}
 
-          {activeTab === 'projects' && (
-            <>
-              <WorkflowSettings />
-              <DirectoryRootsSettings />
-            </>
-          )}
 
           {activeTab === 'fonts' && (
             <div key={profileKey || 'initial'}>
@@ -4106,7 +4115,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsGrid4>
                 <FontSizeSlider label="Шрифт" value={timelineFontSize} onChange={setTimelineFontSize} min={10} max={18} />
                 <FontSizeSlider label="Шрифт пересказа" value={timelineSummaryFontSize} onChange={setTimelineSummaryFontSize} min={10} max={22} />
-                <FontSizeSlider label="Строки" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
+                <FontSizeSlider label="Строки в ленте" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
+                <FontSizeSlider label="Строк ответа в превью" value={timelinePreviewResponseLines} onChange={setTimelinePreviewResponseLines} min={1} max={10} suffix="" />
               </SettingsGrid4>
 
               <SettingsSubSectionHeader title="Run after" />

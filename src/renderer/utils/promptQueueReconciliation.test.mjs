@@ -56,6 +56,15 @@ test('explicit task completion suppresses Loop but not an already queued prompt'
   );
 });
 
+test('a live idle publication may release an explicitly armed own queue, but cannot release a pivot or restored queue', () => {
+  const queue = { queueActive: true, queueTriggerIsOwner: true, queueArmedAt: 300,
+    queueOwnLiveIdle: true, loopActive: false, loopArmedAt: null };
+  assert.equal(choosePromptQueueContinuationForOutcome(queue, 200), 'queue');
+  assert.equal(choosePromptQueueContinuationForOutcome({ ...queue, queueTriggerIsOwner: false }, 200), null);
+  assert.equal(choosePromptQueueContinuationForOutcome({ ...queue, queueOwnLiveIdle: false }, 200), null);
+  assert.equal(choosePromptQueueContinuationForOutcome({ ...queue, queueActive: false }, 200), null);
+});
+
 test('restore applies all abnormal evidence before only the latest success per trigger', () => {
   const earlySuccess = { tabId: 'a', kind: 'natural', timestamp: 100, source: 'buffer' };
   const failure = { tabId: 'a', kind: 'abnormal', timestamp: 150, source: 'main' };

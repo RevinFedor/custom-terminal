@@ -89,7 +89,9 @@ test('passive renderer diagnostics never hit-test, read computed style or scan t
   const source = fs.readFileSync(path.join(__dirname, '../renderer/utils/perfFreezeProbe.ts'), 'utf8');
   assert.doesNotMatch(source, /document\.elementFromPoint\s*\(|window\.getComputedStyle\s*\(|querySelectorAll\(['"]:hover/);
   assert.match(source, /targetEvidence=event/);
-  assert.match(source, /writableLength > 16384/);
+  assert.match(source, /createPerfSocketWriter/);
+  const transport = fs.readFileSync(path.join(__dirname, '../renderer/utils/perfIncidentChannel.ts'), 'utf8');
+  assert.match(transport, /writableLength >= 16384/);
 });
 
 test('ambient CPU cannot consume the two responsiveness slots; skip reason and expiry are exact', () => {
@@ -108,4 +110,123 @@ test('system load without an Electron hotspot does not waste a background profil
   assert.equal(captureDecision([], Date.now(), 'sustained-cpu', pressure).reason, 'system-pressure-no-electron-hotspot');
   assert.equal(captureDecision([], Date.now(), 'ui-click', pressure).allowed, true);
   assert.equal(captureDecision([], Date.now(), 'sustained-cpu', { ...pressure, appCpu: 150 }).allowed, true);
+});
+
+function artifactFixture(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-artifacts-unit-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const store = createArtifactStore(directory), now = Date.now();
+  const sparse = (name, bytes, at) => {
+    const fd = store.openExclusive(name);
+    try { fs.ftruncateSync(fd, bytes); } finally { fs.closeSync(fd); }
+    fs.utimesSync(store.file(name), new Date(at), new Date(at));
+  };
+  return { directory, store, now, sparse };
+}
+
+test('artifact entries and bounded read/exclusive receipt API reject unknown paths and symlinks', t => {
+  const { directory, store } = artifactFixture(t);
+  const id = 'stall-1000-321-1';
+  for (const extension of ['.sample.txt', '.sample.json', '.sample-capture.json']) store.write(id + extension, 'evidence');
+  store.write('causal-2026100912.ndjson', '{}\n', true);
+  fs.writeFileSync(path.join(directory, 'user-data'), 'untouched');
+  fs.symlinkSync(path.join(directory, 'user-data'), store.file('stall-1000-321-2.sample.txt'));
+  fs.mkdirSync(store.file('stall-1000-321-3.sample.txt'));
+  assert.equal(store.entries().length, 4);
+  assert.equal(store.read(id + '.sample.txt'), 'evidence');
+  assert.throws(() => store.read(id + '.sample.txt', 2), /read/);
+  assert.throws(() => store.read('stall-1000-321-2.sample.txt'));
+  assert.throws(() => store.read('stall-1000-321-3.sample.txt'));
+  assert.throws(() => store.openExclusive('stall-1000-321-2.sample.txt'));
+  assert.throws(() => store.file('../stall-1000-321-1.sample.txt'));
+  assert.throws(() => store.file('user-data'));
+  store.writeExclusive('stall-1000-321-4.sample-capture.json', { version: 1 });
+  assert.throws(() => store.writeExclusive('stall-1000-321-4.sample-capture.json', 'replace'));
+  assert.deepEqual(JSON.parse(store.read('stall-1000-321-4.sample-capture.json')), { version: 1 });
+  store.prune(Date.now() + 8 * 86400000);
+  assert.equal(fs.readFileSync(path.join(directory, 'user-data'), 'utf8'), 'untouched');
+  assert.equal(fs.lstatSync(store.file('stall-1000-321-2.sample.txt')).isSymbolicLink(), true);
+  assert.equal(fs.lstatSync(store.file('stall-1000-321-3.sample.txt')).isDirectory(), true);
+});
+
+test('256MiB pruning evicts large artifacts without refunding either current quota', t => {
+  const { store, now, sparse } = artifactFixture(t), day = 86400000;
+  const receipt = 'stall-' + (now - 1000) + '-123-1.sample-capture.json';
+  // Even an old mtime cannot evict a newly named immutable native receipt.
+  sparse(receipt, 128, now - 8 * day);
+  for (let i = 0; i < 4; i++) sparse('incident-' + (now - 7200000 + i * 700000) + '-1.capture.json', 128, now - 7200000 + i * 700000);
+  sparse('stall-' + now + '-123-1.sample.txt', 260 * 1024 * 1024, now - 180000);
+  const pruned = store.prune(now);
+  assert.ok(pruned.bytes < 256 * 1024 * 1024);
+  assert.equal(fs.existsSync(store.file(receipt)), true);
+  assert.equal(store.entries().filter(e => e.name.endsWith('.capture.json')).length, 4);
+  assert.equal(createArtifactStore(store.directory).reserveCaptureDetails('incident-' + now + '-1', now).reason, 'rolling-quota-exhausted');
+});
+
+test('native receipts expire at 24h while sample metadata/full report retain the general 7-day policy', t => {
+  const { store, now, sparse } = artifactFixture(t), day = 86400000;
+  const id = 'stall-' + (now - day - 1) + '-123-1';
+  for (const extension of ['.sample.txt', '.sample.json', '.sample-capture.json']) sparse(id + extension, 100, now - day - 1);
+  store.prune(now);
+  assert.equal(fs.existsSync(store.file(id + '.sample-capture.json')), false);
+  assert.equal(fs.existsSync(store.file(id + '.sample.txt')), true);
+  assert.equal(fs.existsSync(store.file(id + '.sample.json')), true);
+  store.prune(now + 7 * day);
+  assert.deepEqual(store.entries(), []);
+});
+
+test('old incident metadata cannot erase every freshly captured native stack under the same global cap', t => {
+  const { store, now, sparse } = artifactFixture(t), miB = 1048576;
+  for (let i = 0; i < 66; i++) sparse('incident-' + (now - 4 * 3600000 - i) + '-1.json', 4 * miB, now - 4 * 3600000 - i);
+  const id = 'stall-' + (now - 180000) + '-123-1';
+  sparse(id + '.sample.txt', miB, now - 180000);
+  store.write(id + '.sample.json', { id, status: 'complete', output: { file: id + '.sample.txt', complete: true } });
+  const after = store.prune(now);
+  assert.ok(after.bytes <= 256 * miB);
+  assert.equal(fs.existsSync(store.file(id + '.sample.txt')), true, 'the recent stack remains useful beyond its two-minute write grace');
+});
+
+test('causal journals obey a separate 64MiB/48h cap including young buckets', t => {
+  const { store, now, sparse } = artifactFixture(t), hour = 3600000, miB = 1048576;
+  const bucket = at => 'causal-' + new Date(at).toISOString().slice(0, 13).replace(/\D/g, '') + '.ndjson';
+  const expired = bucket(now - 49 * hour), recent = bucket(now - 47 * hour);
+  sparse(expired, 1024, now - 49 * hour); sparse(recent, 1024, now - 47 * hour);
+  store.prune(now);
+  assert.equal(fs.existsSync(store.file(expired)), false); assert.equal(fs.existsSync(store.file(recent)), true);
+  fs.unlinkSync(store.file(recent));
+  const names = Array.from({ length: 17 }, (_, i) => bucket(now - i * hour));
+  // All mtimes are young: the former general two-minute exemption must not
+  // defeat causal's own disk cap. Sparse files avoid allocating benchmark I/O.
+  names.forEach((name, i) => sparse(name, 4 * miB, now - i * 1000));
+  const after = store.prune(now);
+  assert.equal(after.causalBytes, 64 * miB);
+  assert.equal(fs.existsSync(store.file(names.at(-1))), false);
+  assert.equal(fs.existsSync(store.file(names[0])), true);
+});
+
+test('native sample tier remains bounded and records payload eviction without rewriting capture outcome or quota', t => {
+  const { store, now, sparse } = artifactFixture(t), miB = 1048576;
+  const ids=Array.from({length:9},(_,i)=>'stall-'+(now-7200000-i*900000)+'-123-'+i);
+  for(const [i,id] of ids.entries()){
+    sparse(id+'.sample.txt',8*miB,now-7200000-i*900000);
+    store.write(id+'.sample.json',{id,status:'complete',output:{file:id+'.sample.txt',complete:true}});
+    store.writeExclusive(id+'.sample-capture.json',{version:1,id,requestedWallMs:now-7200000-i*900000});
+  }
+  const after=store.prune(now);
+  assert.equal(after.nativeSampleBytes,64*miB);
+  assert.equal(fs.existsSync(store.file(ids.at(-1)+'.sample.txt')),false);
+  const metadata=JSON.parse(store.read(ids.at(-1)+'.sample.json'));
+  assert.equal(metadata.status,'complete');assert.equal(metadata.output.retained,false);
+  assert.equal(metadata.output.removalReason,'native-sample-budget');
+  assert.equal(store.entries().filter(e=>e.name.endsWith('.sample-capture.json')).length,9);
+});
+
+test('causal append has an explicit hourly byte bound and preserves existing complete lines on overload', t => {
+  const { store, now } = artifactFixture(t);
+  const bucket = 'causal-' + new Date(now).toISOString().slice(0, 13).replace(/\D/g, '') + '.ndjson';
+  const body = 'x'.repeat(4 * 1024 * 1024 - 1) + '\n';
+  store.write(bucket, body, true);
+  assert.throws(() => store.write(bucket, '{}\n', true), /bucket full/);
+  assert.equal(fs.statSync(store.file(bucket)).size, Buffer.byteLength(body));
+  assert.throws(() => store.read(bucket), /read/);
 });

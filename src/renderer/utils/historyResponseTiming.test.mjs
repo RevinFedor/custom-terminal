@@ -5,10 +5,23 @@ import {
   formatHistoryResponseDuration,
   formatHistoryResponseCompletedAt,
   historyResponseTailLabel,
+  historyCompactTailTiming,
   latestCompletedHistoryResponseTiming,
   normalizeHistoryResponseDurationMs,
   resolveHistoryResponseTailTiming,
 } from './historyResponseTiming.mjs';
+
+test('native compact tail has its own phase clock without rewriting the response interval', () => {
+  const owner = { tabId: 'T', toolType: 'codex', sessionId: 'S' };
+  const response = { state: 'running', intervalId: 7, startTs: 1000 };
+  const op = { tabId: 'T', provider: 'codex', sessionId: 'S', active: true, phase: 'compacting', startedAt: 9000 };
+  const compact = historyCompactTailTiming(op, owner);
+  assert.equal(historyResponseTailLabel(compact, 21000), 'Compacting · 00:12');
+  assert.equal(historyResponseTailLabel(response, 21000), 'Working · 00:20');
+  for (const invalid of [{ ...op, active: false }, { ...op, sessionId: 'old' }, { ...op, tabId: 'other' },
+    { ...op, provider: 'claude' }, { ...op, startedAt: null }]) assert.equal(historyCompactTailTiming(invalid, owner), null);
+  assert.equal(response.intervalId, 7); assert.equal(response.startTs, 1000);
+});
 
 test('response duration formatter uses mm:ss below an hour and h:mm:ss afterwards', () => {
   assert.equal(formatHistoryResponseDuration(0), '00:00');

@@ -70,6 +70,8 @@ function fixture({ residual = false, guarded = false } = {}) {
   ctx.bridgeKnownSessions.set('T', 'S'); ctx.claudeTurnBusy.set('T', true); ctx.claudeCliActive = new Set(['T']);
   vm.runInContext(mainCode, ctx);
   const web = vm.createContext({ console: quiet, url, require: () => ({}), token: 'fixture', ...contract,
+    handleDictationClipboardHttp: async () => false,
+    workflowOrganizationHttp: async () => false,
     handleSystemPromptApi: async () => false, systemPromptService: null, readBody: async () => ({}),
     decId: decodeURIComponent,
     stopAgentProcess: request => ctx.stopAgentProcessScenarioInMain(request),

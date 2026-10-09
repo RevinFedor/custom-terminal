@@ -160,6 +160,7 @@ function applyHistoryEntryWindow(entries, bounds = null) {
  *     projection and "what just happened" all read the tail).
  */
 const HISTORY_ROW_STUB_FIELDS = [
+  'questionReplyProof',
   'settingsFact',
   'imageCount',
   'uuid', 'role', 'timestamp', 'recordTime', 'sessionId', 'messageId', 'textPhase',
@@ -263,6 +264,7 @@ function stubActionSummary(actions) {
         startedAt: action.startedAt,
         completedAt: action.completedAt,
         durationMs: action.durationMs,
+        ...(action.launchSettings ? { launchSettings: action.launchSettings } : {}),
       });
     }
   }

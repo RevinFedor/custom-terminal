@@ -118,3 +118,38 @@ test('Main rejects the old provider source after a Stop/replacement boundary bef
     assert.match(h.logs.join('\n'), /\[CodexProviderSemantic\] STALE/);
   }
 });
+
+test('native incomplete retracts only open response text through actual Main without ending the turn', () => {
+  const h = harness();
+  h.connection.beginRequest({ turn_id: 'fixture-turn', thread_id: 'fixture-thread' });
+  const frame = payload => h.connection.observeServerFrame(JSON.stringify(payload));
+  frame({ type: 'response.created', response: { id: 'steered-response' } });
+  frame({ type: 'response.output_text.delta', response_id: 'steered-response', item_id: 'partial',
+    delta: 'Скачок после сворачивания исправлен в исходнике:' }); h.flush();
+  assert.equal(h.controller.get(h.tabId).text.length, 48);
+  const activityBefore = h.activity.slice();
+  assert.equal(frame({ type: 'response.incomplete', response: { id: 'steered-response',
+    incomplete_details: { reason: 'interrupted' } } }), true); h.flush();
+  assert.equal(h.controller.get(h.tabId), null);
+  assert.deepEqual(h.activity, activityBefore);
+  assert.equal(h.owner.turnActive, true);
+  assert.equal(h.forwarded.at(-1).event.type, 'request_failed');
+  assert.equal(h.forwarded.at(-1).event.reason, 'response-incomplete:interrupted');
+});
+
+test('a late incomplete segment cannot cross Main replacement run or touch preview', () => {
+  const h = harness();
+  h.connection.beginRequest({ turn_id: 'fixture-turn', thread_id: 'fixture-thread' });
+  const frame = payload => h.connection.observeServerFrame(JSON.stringify(payload));
+  frame({ type: 'response.created', response: { id: 'old-response' } });
+  frame({ type: 'response.output_text.delta', response_id: 'old-response', item_id: 'partial', delta: 'old' });
+  h.flush();
+  const before = h.controller.get(h.tabId), forwarded = h.forwarded.length, activity = h.activity.length;
+  h.replaceOwner({ runSeq: 2 });
+  frame({ type: 'response.incomplete', response: { id: 'old-response', incomplete_details: { reason: 'interrupted' } } });
+  h.flush();
+  assert.deepEqual(h.controller.get(h.tabId), before);
+  assert.equal(h.forwarded.length, forwarded);
+  assert.equal(h.activity.length, activity);
+  assert.match(h.logs.join('\n'), /\[CodexProviderSemantic\] STALE/);
+});

@@ -57,7 +57,7 @@ export function captureWorkflowDrag(state,{gestureId,outline,sourceId,selectedTa
     multiSelected:requested.length>1,
     presentationRootOrder:origin==='sidebar' ? tree.map(node=>node.id):[],
     sourceRootIds,sourceNodes,rootTabIds,familyIds,paneEntries,paneFamilyIds,guards,workflows,
-    groupDefinitions:(state.globalGroups?.groups || []).map(group=>({id:group.id,revision:group.revision})),
+    groupDefinitions:(state.globalGroups?.groups || []).map(group=>({id:group.id,revision:group.revision,reserveWorkflowId:group.reserveWorkflowId || null})),
     groupMembers:Object.fromEntries((state.globalGroups?.groups || []).map(group=>[group.id,
       Object.entries(state.globalGroups?.tabGroups || {}).filter(([,id])=>id===group.id).map(([id])=>id)])),
     expectedRevision:state.organizationRevision}));
@@ -83,6 +83,11 @@ export function workflowDragRequest(admission,{workflowId,previewOutline,target=
   const moveMembership=target ? workflowId!==admission.sourceWorkflowId : incoming;
   const movingFamilyIds=target ? admission.paneFamilyIds : admission.familyIds;
   const guardedFamilyIds=[...new Set([...admission.familyIds,...(target ? admission.paneFamilyIds:[])])];
+  const emptyGroupMoves=!target && workflowId!==admission.sourceWorkflowId ? admission.sourceNodes
+    .filter(node=>node.groupId && !node.children?.length && !admission.groupMembers[node.groupId]?.length)
+    .map(node=>({groupId:node.groupId,sourceWorkflowId:admission.sourceWorkflowId,workflowId,
+      expectedGroupRevision:admission.groupDefinitions.find(group=>group.id===node.groupId)?.revision,
+      expectedReserveWorkflowId:admission.groupDefinitions.find(group=>group.id===node.groupId)?.reserveWorkflowId || null})) : [];
   const tabs=[],order=[];
   if(!target) visit(previewOutline,node=>{if(node.tabId)order.push(node.tabId);});
   const wanted=new Map();
@@ -95,11 +100,11 @@ export function workflowDragRequest(admission,{workflowId,previewOutline,target=
     const proposed=wanted.get(id);
     const moves=movingFamilyIds.includes(id);
     const parent=proposed ? proposed.parent:guard.visualParentTabId;
-    // A physical/file row is never reparented by an outline projection.
-    if((guard.parentTabId || guard.tabType==='file') && proposed && parent!==(guard.visualParentTabId || guard.parentTabId))return null;
+    // Physical execution ownership is immutable; a file's visual link is editable.
+    if(guard.parentTabId && proposed && parent!==(guard.visualParentTabId || guard.parentTabId))return null;
     tabs.push({tabId:id,expected:guard,workflowId:moves && moveMembership ? workflowId:guard.workflowId,
       groupId:proposed ? proposed.groupId:guard.groupId,
-      visualParentTabId:guard.parentTabId || guard.tabType==='file' ? guard.visualParentTabId:parent});
+      visualParentTabId:guard.parentTabId ? guard.visualParentTabId:parent});
   }
   const workflows=[];
   for(const [id,baseline] of Object.entries(admission.workflows)) {
@@ -143,7 +148,8 @@ export function workflowDragRequest(admission,{workflowId,previewOutline,target=
       rootOrder=rootOrder.map(id=>visible.has(id)?admission.presentationRootOrder[at++]:id);
       rootOrder.push(...admission.presentationRootOrder.slice(at));
     }
-    if(id===workflowId || preserveSourceOrder || stableJson(layout)!==stableJson(baseline.layout))workflows.push({workflowId:id,
+    if(id===workflowId || preserveSourceOrder || emptyGroupMoves.length && id===admission.sourceWorkflowId
+      || stableJson(layout)!==stableJson(baseline.layout))workflows.push({workflowId:id,
       expectedKind:baseline.kind,
       expectedPlacement:dragPlacement(baseline.layout),expectedReserveOrder:baseline.reserveOrder,
       expectedReserveRootOrder:baseline.reserveRootOrder,
@@ -161,5 +167,5 @@ export function workflowDragRequest(admission,{workflowId,previewOutline,target=
   return {version:1,mutationId:`workflow-drag:${admission.gestureId}`,expectedRevision:admission.expectedRevision,
     gestureId:admission.gestureId,sourceRootTabIds:admission.rootTabIds,sourceFamilyIds:admission.familyIds,
     paneRootTabIds:admission.paneEntries.map(entry=>entry.tabId),paneFamilyIds:admission.paneFamilyIds,guardedFamilyIds,movingFamilyIds,
-    tabs,workflows,groupScopes,sourcePlacements,targetWorkflowId:workflowId,destinationKind:target?'window':'reserve'};
+    tabs,workflows,groupScopes,sourcePlacements,emptyGroupMoves,targetWorkflowId:workflowId,destinationKind:target?'window':'reserve'};
 }

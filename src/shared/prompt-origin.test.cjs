@@ -2,6 +2,37 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const cjs = require('./prompt-origin.cjs');
 
+test('automatic Continue shares Loop presentation but keeps system provenance and literal/COR exclusions',async()=>{
+  const esm=await import('./prompt-origin.mjs');
+  for(const api of [cjs,esm]){
+    const entry={role:'user',type:'user',uuid:'exact-retry',content:'continue',semanticTags:[api.promptOriginTagForSource('codex-capacity-retry')]};
+    const before=JSON.stringify(entry);
+    assert.equal(api.getAutomaticContinuationKind(entry),'continue');
+    assert.equal(api.isSystemPromptEntry(entry),true);assert.equal(api.isServicePromptEntry(entry),true);
+    assert.equal(api.getAutomaticContinuationKind({content:'continue'}),null);
+    assert.equal(api.getAutomaticContinuationKind({...entry,type:'continued'}),null);
+    assert.equal(api.getAutomaticContinuationKind({semanticTags:[api.promptOriginTagForSource('build-install-return')]}),null);
+    assert.equal(api.getAutomaticContinuationKind({...entry,semanticTags:[...entry.semanticTags,{kind:'orchestration',runId:'mcp'}]}),null);
+    assert.equal(api.getAutomaticContinuationKind({semanticTags:[api.promptOriginTagForSource('prompt-loop')]}),'loop');
+    assert.equal(JSON.stringify(entry),before);
+  }
+});
+
+test('Loop display uses its owned origin without reclassifying a user record as MCP/service', async () => {
+  const esm = await import('./prompt-origin.mjs');
+  for (const api of [cjs, esm]) {
+    const tag = api.promptOriginTagForSource('prompt-loop');
+    const entry = { role:'user', uuid:'exact-loop-user', content:'Continue', semanticTags:[tag] };
+    const before = JSON.stringify(entry);
+    assert.equal(api.getLoopPromptOriginTag(entry), tag);
+    assert.equal(api.getLoopPromptOriginTag({ content:'Loop continuation Continue' }), null);
+    assert.equal(api.getLoopPromptOriginTag({ semanticTags:[{kind:'orchestration',source:'loop'}] }), null);
+    assert.equal(api.isServicePromptEntry(entry), false);
+    assert.equal(api.isSystemPromptEntry(entry), false);
+    assert.equal(JSON.stringify(entry), before);
+  }
+});
+
 test('service provenance uses owned send sources, never quoted message text', async () => {
   const esm = await import('./prompt-origin.mjs');
   for (const api of [cjs, esm]) {

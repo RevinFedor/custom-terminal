@@ -718,6 +718,10 @@ class SessionTranscriptService {
       entryRef: entry?.entryRef
         ? { ...entry.entryRef, contentRevision: token }
         : undefined,
+      ...(entry.responsePreview ? { responsePreview: { ...entry.responsePreview,
+        contentRevision: token,
+        ...(entry.responsePreview.entryRef ? { entryRef: { ...entry.responsePreview.entryRef, contentRevision: token } } : {}),
+      } } : {}),
     }));
   }
 
@@ -1989,6 +1993,8 @@ class SessionTranscriptService {
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
         : 'none';
       const revisionContext = JSON.stringify({
+        timelinePreviewSchema: 1,
+        questionReplySchema: 1,
         promptPresentationRevision: presentationRevision,
         ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
       });
@@ -2104,6 +2110,8 @@ class SessionTranscriptService {
         timelineSnapshots || (timelineSnapshot ? [timelineSnapshot] : []),
         {
           context: JSON.stringify({
+            timelinePreviewSchema: 1,
+            questionReplySchema: 1,
             promptPresentationRevision: finalPresentationRevision,
             ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
           }),
@@ -2440,6 +2448,9 @@ class SessionTranscriptService {
         await this.preparedHistoryStore.savePrepared({ owner: preparedOwner, source: projectedSnapshot,
           context: virtualProjected ? 'canonical:' + contentRevision.token : 'canonical', kind: 'base', entries, sessionMeta: projectedSessionMeta });
         finishPreparePhase('baseCache');
+        // The disposable cache may quietly refuse an invalidated write. Its
+        // successful commit also predates this awaited delivery boundary.
+        if (!sourceIsCurrent()) return refreshChangedSource();
       }
       const promptSnapshot = prepared ? { entries, revision: presentationRevision, stable: true }
         : decoratePromptSnapshot(this, { toolType, sessionId, entries });
@@ -2471,6 +2482,7 @@ class SessionTranscriptService {
         rowWindow = applyHistoryRowWindow(timedWindow.entries, rowWindowRequest);
       } else rowWindow = { ...rowWindow, entries: timedWindow.entries };
       if (persistPrepared) finishPreparePhase('preparedCache');
+      if (!sourceIsCurrent()) return refreshChangedSource();
       if (responseTimingBound && payload.tabId) {
         const mainWindow = this.getMainWindow?.();
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -2628,8 +2640,8 @@ class SessionTranscriptService {
           };
         }
       }
-      // No awaits occur in the stages above. Do not include the async rewrite
-      // baseline below in this synchronous CPU/lane observation.
+      // The remaining preparation stages after the cache writes do not await.
+      // Do not include the async rewrite baseline below in this observation.
       logPrepare('full');
       if (historyWindow.boundsApplied) {
         console.log('[TranscriptService:HistoryWindow] session=' + shortId(sessionId)
@@ -2652,6 +2664,9 @@ class SessionTranscriptService {
           toolType: 'codex', sessionId: rewriteReceipt.sourceSessionId, cwd, tabId: payload.tabId,
           dehydrate: true, hydrate: oldHydrate, rewriteBaselineOnly: true,
         });
+        // Baseline miss/mismatch falls through to a full response too; it may
+        // not publish the child cursor captured before this final await.
+        if (!sourceIsCurrent()) return refreshChangedSource();
         if (baseline.success && baseline.revision?.token === payload.rewriteFrom.revision.token) {
           const mapping = createProjectionIdentityMap(rewriteReceipt.sourceSessionId, sessionId, rewriteReceipt.records);
           const candidates = new Map();

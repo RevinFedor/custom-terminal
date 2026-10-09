@@ -43,13 +43,16 @@ function runSaveTabsBatchWithAck({ snapshots, transaction, getTabIds, save,befor
         expectedTabIds: row.expectedTabIds, actualTabIds: getTabIds(row.projectId) });
       if (!precondition.ok) throw new Error(precondition.error);
     }
+    const executionReconciliations = [];
     for (const row of snapshots) {
       const result = normalizeSaveTabsAck(save(row));
       if (result.success !== true) throw new Error(result.error);
+      if (Array.isArray(result.executionReconciliations)) executionReconciliations.push(...result.executionReconciliations);
     }
     const completion=afterSave?.(closeProof,snapshots);
     if(completion?.then)throw new Error('save_tabs_batch_sync_required');
-    return { success: true, projectIds: snapshots.map(row => row.projectId) };
+    return { success: true, projectIds: snapshots.map(row => row.projectId),
+      ...(executionReconciliations.length ? {executionReconciliations} : {}) };
   })());
 }
 

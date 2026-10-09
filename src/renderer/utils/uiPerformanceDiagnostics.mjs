@@ -1,43 +1,112 @@
 // Diagnostic data only: no store imports, layout reads, user text or retained DOM.
 const absNow = () => performance.timeOrigin + performance.now();
-const short = (value, limit = 140) => String(value || '').replace(/[\r\n\t]/g, ' ').slice(0, limit);
+// Never coerce objects (toString/toJSON can expose content), or copy a URL.
+const short = (value, limit = 140) => typeof value === 'string'
+  && !/\w+:\/\/|^(?:data|blob|javascript|mailto|tel):|^\/\/|www\./i.test(value.slice(0, limit))
+  ? value.slice(0, limit).replace(/[\r\n\t]/g, ' ') : '';
 const round = value => Math.round(value * 10) / 10;
+export const DIAGNOSTIC_COUNTER_LIMIT = 0xffffffff;
+const increment = value => Math.min(DIAGNOSTIC_COUNTER_LIMIT, value + 1);
+export const UI_ACTION_COVERAGE = 'temporal-overlap; frames-are-callbacks-not-pixel-proof';
+// Snapshots are data, unlike DOM/KeyboardEvent objects whose getters live on
+// their prototypes. Do not accept inherited fields or invoke snapshot getters.
+const own = (value, key) => value && Object.getOwnPropertyDescriptor(value, key)?.value;
+const finite = value => typeof value === 'number' && Number.isFinite(value) ? round(value) : null;
+const keyClass = key => {
+  switch (key) {
+    case 'Meta': case 'Control': case 'Alt': case 'Shift': case 'Escape': case 'Enter': case 'Tab': return key;
+    case 'ArrowUp': case 'ArrowDown': case 'ArrowLeft': case 'ArrowRight': case 'Arrow': return 'Arrow';
+    case ' ': case 'Space': return 'Space';
+    default: return 'Other';
+  }
+};
+
+export function describeDiagnosticKey(event) {
+  if (event?.type !== 'keydown' && event?.type !== 'keyup') return {};
+  // Read key only to classify it. Never retain key/code, or enumerate an event.
+  return { keyClass: keyClass(event.key), meta: event.metaKey === true, ctrl: event.ctrlKey === true,
+    alt: event.altKey === true, shift: event.shiftKey === true, repeat: event.repeat === true };
+}
+
+function keySnapshot(snapshot) {
+  const result = Object.create(null);
+  if (typeof own(snapshot, 'keyClass') !== 'string') return result;
+  result.keyClass = keyClass(own(snapshot, 'keyClass'));
+  for (const field of ['meta', 'ctrl', 'alt', 'shift', 'repeat']) result[field] = own(snapshot, field) === true;
+  return result;
+}
+
+function targetSnapshot(target) {
+  return Object.assign(Object.create(null), { tag: short(own(target, 'tag'), 40),
+    source: short(own(target, 'source'), 180), tab: short(own(target, 'tab'), 80),
+    historyOwner: short(own(target, 'historyOwner'), 80) });
+}
+
+// The direct watchdog gets a thin allowlisted record, never the phase/style
+// arrays or an Event/DOM reference. null means that boundary was not measured.
+export function summarizeUIAction(action, timing = {}) {
+  return Object.assign(Object.create(null), {
+    event: short(own(action, 'event') || own(timing, 'event'), 24),
+    target: targetSnapshot(own(action, 'target')),
+    ...keySnapshot(action),
+    inputDelayMs: finite(own(timing, 'inputDelayMs')),
+    handlerMs: finite(own(timing, 'handlerMs')),
+    presentationMs: finite(own(timing, 'presentationMs')),
+    browserInteractionId: finite(own(timing, 'browserInteractionId')),
+    coverage: UI_ACTION_COVERAGE,
+  });
+}
+
+export function formatDiagnosticKey(snapshot) {
+  const fields = keySnapshot(snapshot);
+  return fields.keyClass ? ' keyClass=' + fields.keyClass + ['meta', 'ctrl', 'alt', 'shift', 'repeat']
+    .map(field => ' ' + field + '=' + Number(fields[field])).join('') : '';
+}
 
 export function createUIActionDiagnostics({ now = absNow, emit = console.warn, notify = () => {}, max = 96 } = {}) {
   const boot = Math.floor(now()).toString(36);
-  let sequence = 0, current = null, dropped = 0;
+  let sequence = 0, current = null, dropped = 0, phasesDropped = 0;
+  max = Number.isFinite(max) ? Math.max(1, Math.min(96, Math.floor(max))) : 96;
   const actions = [];
-  const capture = (event, eventAbs, target = {}, frameProof = true) => {
+  const capture = (event, eventAbs, target = {}, frameProof = true, keys = {}) => {
     const action = { id: 'ui-' + boot + '-' + (++sequence).toString(36), event: short(event, 24),
-      startAbs: eventAbs, receivedAbs: now(), target: {
-        tag: short(target.tag, 40), source: short(target.source, 180), tab: short(target.tab, 80),
-        historyOwner: short(target.historyOwner, 80),
-      }, phases: [], phasesDropped: 0, frameProof, frames: 0, frame1Abs: null, frame2Abs: null };
-    actions.push(action); if (actions.length > max) { actions.shift(); dropped++; }
+      startAbs: eventAbs, receivedAbs: now(), target: targetSnapshot(target),
+      ...((event === 'keydown' || event === 'keyup') ? keySnapshot(keys) : {}),
+      phases: [], phasesDropped: 0, frameProof, frames: 0, frame1Abs: null, frame2Abs: null };
+    actions.push(action); if (actions.length > max) { actions.shift(); dropped = increment(dropped); }
     current = action;
     return action;
   };
   const phase = (name, values = {}) => {
     if (!current || now() - current.receivedAbs > 2000) return;
-    const fields = {};
-    for (const [key, value] of Object.entries(values).slice(0, 10)) {
+    const fields = Object.create(null);
+    for (const key of Object.keys(values).slice(0, 10)) {
+      if (['__proto__', 'prototype', 'constructor', 'toJSON'].includes(key)) continue;
+      const value = own(values, key);
       if (typeof value === 'number' && Number.isFinite(value)) fields[short(key, 32)] = round(value);
       else if (typeof value === 'boolean') fields[short(key, 32)] = value;
       else if (['tab', 'owner', 'reason'].includes(key)) fields[key] = short(value, 80);
     }
-    if (current.phases.length >= 32) { current.phases.splice(8, 1); current.phasesDropped++; }
+    if (current.phases.length >= 32) {
+      current.phases.splice(8, 1); current.phasesDropped = increment(current.phasesDropped);
+      phasesDropped = increment(phasesDropped);
+    }
     current.phases.push({ name: short(name, 140), at: round(now()), ...fields });
   };
   const matching = (event, eventAbs) => {
+    let nearest = null, distance = 2;
     for (let i = actions.length - 1; i >= 0; i--) {
-      if (actions[i].event === event && Math.abs(actions[i].startAbs - eventAbs) < 2) return actions[i];
+      const delta = Math.abs(actions[i].startAbs - eventAbs);
+      if (actions[i].event === event && delta < distance) { nearest = actions[i]; distance = delta; }
+      if (distance === 0) break;
     }
-    return null;
+    return nearest;
   };
   const report = (action, kind, durationMs, extra = {}) => {
-    const data = { ...action, kind, durationMs: round(durationMs), ...extra,
-      inputDelayMs: round(action.receivedAbs - action.startAbs), ringDropped: dropped,
-      coverage: 'temporal-overlap; frames-are-callbacks-not-pixel-proof' };
+    const data = { ...action, kind, durationMs: round(durationMs),
+      ...summarizeUIAction(action, extra),
+      inputDelayMs: finite(own(extra, 'inputDelayMs')) ?? round(action.receivedAbs - action.startAbs),
+      ringDropped: dropped };
     emit('[Perf:UIAction] ' + JSON.stringify(data));
     if (durationMs >= 100) notify({ id: action.id, event: action.event, startAbs: action.startAbs, durationMs });
   };
@@ -71,6 +140,7 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
     },
     currentId() { return current && now() - current.receivedAbs <= 2000 ? current.id : null; },
     pending() { return actions.some(a => a.frameProof && a.frames < 2); },
+    health() { return { actionRingEvicted: dropped, actionPhasesDropped: phasesDropped }; },
   };
 }
 
@@ -126,16 +196,21 @@ export function captureUIAction(event) {
     lastWheelCapturedAt = at;
   }
   const discrete = event.type === 'click' || event.type === 'pointerdown';
-  const navigation = event.type === 'keydown' && (event.metaKey || event.ctrlKey
-    || ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Escape', 'Enter', ' '].includes(event.key));
+  const keys = describeDiagnosticKey(event);
+  const navigation = (event.type === 'keydown' || event.type === 'keyup') && (keys.meta || keys.ctrl
+    || ['Meta', 'Control', 'Alt', 'Shift', 'Arrow', 'Escape', 'Enter', 'Space', 'Tab'].includes(keys.keyClass));
   return diagnostics.capture(event.type, performance.timeOrigin + event.timeStamp,
-    describeDiagnosticTarget(event.target), discrete || navigation || wheel);
+    describeDiagnosticTarget(event.target), discrete || navigation || wheel, keys);
 }
 export function uiPerformancePhase(name, values) { diagnostics?.phase(name, values); }
 export function currentUIActionId() { return diagnostics?.currentId() || null; }
+export function getUIActionDiagnosticHealth() {
+  return diagnostics?.health() || { actionRingEvicted: 0, actionPhasesDropped: 0 };
+}
 export function recordUIEventTiming(entry) {
   return diagnostics?.eventTiming(entry.name, performance.timeOrigin + entry.startTime, entry.duration, {
     browserInteractionId: entry.interactionId || 0,
+    inputDelayMs: round(entry.processingStart - entry.startTime),
     handlerMs: round(entry.processingEnd - entry.processingStart),
     presentationMs: round(entry.duration - (entry.processingEnd - entry.startTime)),
   });

@@ -47,6 +47,7 @@ export function createAutoCompactCoordinator(ports) {
         task.expectedResumedSessionId = resumed?.sessionId || task.target.sessionId;
         if (!ownerMatches(task)) { finish(task, { error: 'Сессия изменилась при запуске' }, false); return; }
         readiness = await ports.readiness(tabId);
+        if (tasks.get(tabId) !== task) return;
       }
       if (!readiness.ready) {
         if (readiness.status === 'inactive' && !task.resume) {
@@ -73,14 +74,18 @@ export function createAutoCompactCoordinator(ports) {
       task.submitting = true;
       publish(task, 'compacting', 'Автокомпакт выполняется');
       await ports.compact(task.target, task.id);
+      if (tasks.get(tabId) !== task) return;
       // This promise resolves only on the matching main-owned operation's
       // completed outcome, never on Enter, a timeout or an idle snapshot.
       task.completed = true;
       const after = await ports.readiness(tabId);
+      if (tasks.get(tabId) !== task) return;
       if (after.ready && !ports.blocked(tabId)) finish(task, { completed: true });
       else publish(task, 'waiting', 'Сжатие завершено, ждём готовности ввода');
     } catch (error) {
-      finish(task, { error: String(error?.message || error) }, false);
+      finish(task, error?.code === 'auto_compact_manual_stop'
+        ? { skipped: 'manual-stop' }
+        : { error: String(error?.message || error) }, false);
     } finally {
       task.executing = false;
       if (task.wakeAgain && tasks.get(tabId) === task) {
@@ -145,9 +150,20 @@ export function createAutoCompactCoordinator(ports) {
         else if (previousSession !== task.target.sessionId) void kick(task.tabId);
       }
     },
-    cancel(tabId, release = true) {
+    cancel(tabId, release = true, activityId = null) {
       const task = tasks.get(tabId);
-      if (task && !task.submitting) finish(task, { skipped: 'cancelled' }, release);
+      if (!task || task.submitting || activityId !== null && task.id !== activityId) return false;
+      finish(task, { skipped: 'cancelled' }, release);
+      return true;
+    },
+    // Main has already accepted Stop for the agent. Retire even a submitted
+    // observer without warning, continuation or changing the saved policy.
+    // This does not send Stop or claim that /compact completed successfully.
+    stop(tabId) {
+      const task = tasks.get(tabId);
+      if (!task) return false;
+      finish(task, { skipped: 'manual-stop' }, false);
+      return true;
     },
     dispose() {
       for (const task of tasks.values()) finish(task, { skipped: 'shutdown' }, false);

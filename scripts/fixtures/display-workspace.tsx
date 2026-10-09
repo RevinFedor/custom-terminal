@@ -32,6 +32,8 @@ const tabs = new Map(ids.flatMap(id => [1, 2].map(index => {
   }] as const;
 })));
 const dormantTabId = 'fixture-dormant-1';
+if(fixture.boot.windowControls)tabs.set('fixture-linked-note',{id:'fixture-linked-note',name:'Linked note.md',cwd,
+  tabType:'file',filePath:`${cwd}/fixture-linked-note.md`,visualParentTabId:tabId('c')} as any);
 tabs.set(dormantTabId, { id: dormantTabId, name: 'Dormant', cwd,
   tabType: 'file', filePath: `${cwd}/${dormantTabId}.md` });
 const initialPanes = ids.map((id, i) => ({
@@ -154,6 +156,7 @@ fixture.snapshot = () => {
     viewport: { width: innerWidth, height: innerHeight, visibility: document.visibilityState, frames: fixture.frames },
   });
 };
+fixture.preview=()=>useUIStore.getState().filePreview;
 fixture.serialize = () => {
   useWorkspaceStore.getState().saveSessionImmediate({ reason: 'fixture-restart' });
   return copy({

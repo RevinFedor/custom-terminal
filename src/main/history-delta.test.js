@@ -15,6 +15,22 @@ const userRow = (uuid, content) => ({
   sessionId: 'session-a',
 });
 
+test('native question reply certificate enrichment is a metadata-only delta, including tool carriers', () => {
+  const row = userRow('native-user', 'unchanged raw envelope');
+  const proof = { version: 1, provider: 'codex', transportHash: 'a'.repeat(64),
+    links: [{ callId: 'call', questionIndex: 0, questionHash: 'b'.repeat(64), callSourceIdentity: 'origin' }] };
+  assert.notEqual(fingerprintHistoryEntry(row), fingerprintHistoryEntry({ ...row, questionReplyProof: proof }));
+  const withProof = { ...row, questionReplyProof: proof }, before = fingerprintHistoryEntry(withProof);
+  proof.links[0].questionHash = 'c'.repeat(64);
+  assert.notEqual(fingerprintHistoryEntry(withProof), before);
+  const tool = { ...row, role: 'assistant', content: '', actions: [{ tool: '__raw__', rawTool: {
+    toolName: 'AskUserQuestion', toolUseId: 'toolu', args: {}, result: 'same raw result',
+  } }] };
+  const toolBefore = fingerprintHistoryEntry(tool);
+  tool.actions[0].rawTool.questionReplyProof = { ...proof, provider: 'claude' };
+  assert.notEqual(fingerprintHistoryEntry(tool), toolBefore);
+});
+
 test('rewrite dependency coordinates and mutable middle content cannot hide behind equal previews', () => {
   const row = { ...userRow('u1', ''), sourceRecordLine: 12, thinking: 'same preview',
     thinkingRef: { payloadId: 'thinking:u1', totalChars: 10000, recordLine: 12 } };

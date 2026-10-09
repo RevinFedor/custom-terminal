@@ -319,6 +319,59 @@ test('future layout/schema versions refuse writes; omitted unknown metadata surv
   assert.equal(f.service.getPublication().revision, before.revision);
 });
 
+for (const action of ['reveal', 'split', 'display']) test(action + ': revealing a window persists through Main merge and cold database reopen', async t => {
+  const { revealHiddenWindow, splitWindowPane, applyWindowDisplay } = await import('../renderer/utils/windowDisplayLayouts.mjs');
+  const f = fixture(t); migrate(f);
+  let workflow = f.service.getWorkflow('a');
+  const hidden = workflow.layout.splitPanes.find(pane => pane.windowId === 'hidden');
+  hidden.displayRect = { leftPct: 50, topPct: 0, widthPct: 50, heightPct: 100 };
+  hidden.futureWindow = { opaque: 'preserve' };
+  f.service.saveLayout(request(f, { workflowId: 'a', expectedWorkflowRevision: workflow.revision, layout: workflow.layout }));
+  workflow = f.service.getWorkflow('a');
+  const before = legacyManifest(f.db);
+  const layout = workflow.layout;
+  const liveIndex = layout.splitPanes.findIndex(pane => pane.windowId === 'live');
+  let next;
+  if (action === 'reveal') next = revealHiddenWindow(layout, liveIndex, 'hidden');
+  else if (action === 'display') next = applyWindowDisplay(layout, { key: 'modern', internal: false });
+  else {
+    const opened = splitWindowPane(layout.splitPanes, liveIndex, null, liveIndex, 'right', 'hidden');
+    assert.ok(opened);
+    next = { ...layout, splitPanes: opened.panes, splitFocusedIndex: opened.focusedIndex };
+  }
+  assert.ok(next);
+  assert.equal(next.splitPanes.find(pane => pane.windowId === 'hidden').displayHidden, false);
+  f.service.saveLayout(request(f, { workflowId: 'a', expectedWorkflowRevision: workflow.revision, layout: next }));
+  f.reopen();
+  const saved = f.service.getWorkflow('a').layout.splitPanes.find(pane => pane.windowId === 'hidden');
+  assert.equal(saved.displayHidden, false, 'omitting false would leave the previous true flag in Main');
+  assert.equal(saved.displayRect, null);
+  assert.equal(saved.tabId, 'H');
+  assert.deepEqual(saved.futureWindow, { opaque: 'preserve' });
+  assert.deepEqual(legacyManifest(f.db), before, 'window presentation cannot change tab identity, execution or bytes');
+});
+
+test('hidden navigation remembers its display position through canonical layout commit and database reopen',async t=>{
+  const {reconcileWindowDisplay,revealHiddenWindow,resolveHiddenWindowNavigationTarget}=await import('../renderer/utils/windowDisplayLayouts.mjs');
+  const f=fixture(t);migrate(f);
+  let workflow=f.service.getWorkflow('a');
+  const before=legacyManifest(f.db),display={key:'laptop',internal:true};
+  let layout={...workflow.layout,windowDisplayKey:display.key,splitFocusedIndex:0,splitSizes:null,
+    splitPanes:[{...workflow.layout.splitPanes.find(p=>p.windowId==='live'),column:0},
+      {windowId:'right',projectId:'',tabId:'',column:1,tabs:[{slotId:'right-chooser',projectId:'P'}],selectedSlotId:'right-chooser'},
+      {...workflow.layout.splitPanes.find(p=>p.windowId==='hidden'),column:2,displayHidden:true}]};
+  layout=reconcileWindowDisplay(layout,display);
+  const external=clone(layout.windowDisplayLayouts.modern);
+  layout=reconcileWindowDisplay(revealHiddenWindow(layout,1,'hidden'),display);
+  layout=reconcileWindowDisplay(revealHiddenWindow(layout,1,'right'),display);
+  layout.splitFocusedIndex=0;
+  f.service.saveLayout(request(f,{workflowId:'a',expectedWorkflowRevision:workflow.revision,layout}));
+  f.reopen();workflow=f.service.getWorkflow('a');
+  assert.deepEqual(resolveHiddenWindowNavigationTarget(workflow.layout,'hidden'),{paneIndex:1,reason:'remembered-position'});
+  assert.deepEqual(workflow.layout.windowDisplayLayouts.modern,external);
+  assert.deepEqual(legacyManifest(f.db),before,'navigation memory never changes tab execution, sessions, sources or file bytes');
+});
+
 for (const provider of ['claude', 'codex']) test(provider + ': actual DB/ConversationOwners checkpoint scope/token/epoch survives move/detach/delete/reopen', t => {
   const f = fixture(t);
   if (provider === 'claude') f.db.prepare("UPDATE tabs SET command_type='claude',claude_session_id='sid-T' WHERE tab_id='T'").run();

@@ -1,8 +1,19 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
 import { createHistoryMeasurementViewportSync } from '../../utils/historyMeasurementViewportSync.mjs';
-import { historyImageRuns } from '../../utils/historyImageRuns.mjs';
+import { createHistoryRevealTrace } from '../../utils/historyRevealTrace.mjs';
+import { createHistoryCardRevealAnchor } from '../../utils/historyCardRevealAnchor.mjs';
+import {
+  historyImageRuns,
+  historyImagePreviewPart,
+  historyImagePreviewStep,
+  bindHistoryImagePreviewKeys,
+} from '../../utils/historyImageRuns.mjs';
 import HistorySearchBar from './HistorySearchBar';
+import HistoryAgentLaunchParameters, { type SubagentLaunchSettings } from './HistoryAgentLaunchParameters';
+import CodexNativeQuestionMirror from './CodexNativeQuestionMirror';
+import { projectNativeQuestionReply } from '../../../shared/native-question-reply.mjs';
+import { getAutomaticContinuationKind } from '../../../shared/prompt-origin.mjs';
 import { CompositedTextShimmer } from '../UI/CompositedTextShimmer';
 import {HISTORY_SEARCH_PAGE_SIZE, searchHistoryEntries, historySearchEntryKeys} from '../../../shared/history-search.mjs';
 import {publishHistorySearchMarkers, clearHistorySearchMarkers, useHistorySearchMarkers, consumeHistorySearchRequest} from '../../utils/historySearchMarkers';
@@ -10,7 +21,7 @@ import {setHistorySearchHighlights, clearHistorySearchHighlights} from '../../ut
 import {currentUIActionId, uiPerformancePhase} from '../../utils/uiPerformanceDiagnostics.mjs';
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Repeat2, RefreshCw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { canInterruptHistoryTurn, requestHistoryTurnInterrupt } from '../../utils/historyTurnInterrupt.mjs';
@@ -415,6 +426,7 @@ import { HistoryPromptSource } from './TabMessageSourceChip';
 import {
   formatHistoryResponseCompletedAt,
   historyResponseTailLabel,
+  historyCompactTailTiming,
   resolveHistoryResponseTailTiming,
 } from '../../utils/historyResponseTiming.mjs';
 import { queueSendTransferredOwnership } from '../../store/usePromptQueueStore';
@@ -609,6 +621,7 @@ interface TaskAction {
   startedAt?: number;
   completedAt?: number;
   durationMs?: number;
+  launchSettings?: SubagentLaunchSettings;
 }
 // Raw tool carrier emitted by the main-process parser for every non-Task
 // tool_use — full name+input+result, rendered via the package ToolCallPart.
@@ -622,6 +635,7 @@ interface HistoryPayloadRef {
 interface RawAction {
   tool: '__raw__';
   rawTool: {
+    questionReplyProof?: any;
     toolUseId?: string;
     recordTime?: HistoryRecordTime;
     toolName: string;
@@ -661,6 +675,7 @@ const historyActionToolUseId = (action: Action) => {
 };
 
 interface FullHistoryEntry {
+  questionReplyProof?: any;
   settingsProjectionError?: string;
   settingsFact?: { version: number; provider: string; kind: string; value: string; source: string; live?: boolean };
   rewriteRenderKey?: string;
@@ -751,9 +766,9 @@ interface FullHistoryEntry {
   // Grouping identity (display-units projection). Claude: one model response
   // spans several records with one message id — text sharing it with tool
   // calls is a CAPTION, not a standalone reply. Codex: `textPhase` marks
-  // commentary (caption) vs final_answer (turn boundary).
+  // commentary (caption) vs partial/final answer (standalone presentation).
   messageId?: string;
-  textPhase?: 'commentary' | 'final_answer';
+  textPhase?: 'commentary' | 'partial_answer' | 'final_answer';
   // Row-window stub metadata (main ships identity + grouping facts only).
   rowStub?: boolean;
   hasContent?: boolean;
@@ -774,6 +789,7 @@ interface FullHistoryEntry {
     startedAt?: number;
     completedAt?: number;
     durationMs?: number;
+    launchSettings?: SubagentLaunchSettings;
   }>;
 }
 
@@ -789,6 +805,7 @@ interface HistoryActivityTiming {
 
 interface HistoryResponseTailTiming {
   state: 'running' | 'completed';
+  phase?: 'compacting';
   intervalId: number | null;
   startTs: number;
   endTs: number | null;
@@ -1225,11 +1242,12 @@ const HistoryResponseTailTimer = memo(({ timing, placement = 'tail' }: {
     <div
       data-history-tail-response-timer
       data-state={timing.state}
+      data-phase={timing.phase}
       data-placement={placement}
       aria-label={accessibleLabel || undefined}
       onMouseEnter={timing.state === 'completed' ? () => setClock(Date.now()) : undefined}
       title={timing.state === 'running'
-        ? 'Общее время текущего ответа'
+        ? timing.phase === 'compacting' ? 'Время текущего сжатия контекста' : 'Общее время текущего ответа'
         : placement === 'entry'
           ? 'Общее время этого завершённого ответа'
           : 'Общее время завершённого ответа'}
@@ -1814,6 +1832,7 @@ const historyActionPresentationEqual = (left: Action, right: Action) => {
   if (left.tool !== right.tool) return false;
   if (isRawAction(left) && isRawAction(right)) {
     return left.rawTool.toolName === right.rawTool.toolName &&
+      JSON.stringify(left.rawTool.questionReplyProof || null) === JSON.stringify(right.rawTool.questionReplyProof || null) &&
       recordTimes.historyRecordTimeEqual(left.rawTool.recordTime, right.rawTool.recordTime) &&
       left.rawTool.result === right.rawTool.result &&
       left.rawTool.resultRef?.payloadId === right.rawTool.resultRef?.payloadId &&
@@ -1893,6 +1912,7 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.preTokens !== right.preTokens ||
     left.postTokens !== right.postTokens ||
     left.compactEncrypted !== right.compactEncrypted ||
+    JSON.stringify(left.questionReplyProof || null) !== JSON.stringify(right.questionReplyProof || null) ||
     JSON.stringify(left.semanticTags || []) !== JSON.stringify(right.semanticTags || []) ||
     !haveSameComposerChips(left.promptChips || [], right.promptChips || []) ||
     !haveSamePromptImageRefs(left.imagePaths || [], right.imagePaths || [])
@@ -2027,6 +2047,8 @@ function findHistoryScrollParent(element: HTMLElement | null): HTMLElement | nul
 interface HistoryRevealScrollerOps {
   /** Turn off tail-following (the user is now reading, not following). */
   unpinTail(): void;
+  beginReveal?(anchor: HTMLElement | null, opening: boolean): ((() => void) & { finishAnchor?: (outcome: any) => void }) | null;
+  afterRevealCommit?(anchor: HTMLElement | null, opening: boolean, onFinish?: (outcome: any) => void): void;
 }
 const historyRevealOpsByScroller = new WeakMap<HTMLElement, HistoryRevealScrollerOps>();
 
@@ -2041,6 +2063,7 @@ function applyHistoryRevealUpdate(
     return;
   }
   const ops = historyRevealOpsByScroller.get(scroller) || null;
+  const committed = ops?.beginReveal?.(anchor, opening);
   // Toggling a row is READING, both directions — turn tail-following off
   // BEFORE the list changes size. A stale follow intent (pinned earlier,
   // then the list grew without a scroll event) otherwise fires on the very
@@ -2049,9 +2072,13 @@ function applyHistoryRevealUpdate(
   ops?.unpinTail();
   if (opening) {
     flushSync(update);
+    committed?.();
+    ops?.afterRevealCommit?.(anchor, opening, committed?.finishAnchor);
     return;
   }
   flushSync(update);
+  committed?.();
+  ops?.afterRevealCommit?.(anchor, opening, committed?.finishAnchor);
 }
 
 /**
@@ -2573,6 +2600,7 @@ const useRehydratedPayload = (
 
 const HistoryToolCallPart = memo(({
   toolUseId,
+  questionReplyProof,
   recordTime,
   timeKey,
   toolName,
@@ -2589,6 +2617,7 @@ const HistoryToolCallPart = memo(({
   docsKind,
 }: {
   toolUseId?: string;
+  questionReplyProof?: any;
   recordTime?: HistoryRecordTime;
   timeKey?: string;
   toolName: string;
@@ -2630,6 +2659,9 @@ const HistoryToolCallPart = memo(({
   const [copyWanted, setCopyWanted] = useState(false);
   const { text: presentedResult, pending, failed } = useRehydratedPayload(result, resultRef, open || copyWanted);
   const copyResult = useRehydratedCopy(result, resultRef, presentedResult, setCopyWanted);
+  const questionReply = useMemo(() => projectNativeQuestionReply({
+    content: presentedResult, toolName, toolUseId, args, isError, questionReplyProof,
+  }, historyServicePromptFingerprint), [presentedResult, toolName, toolUseId, args, isError, questionReplyProof]);
 
   return (
     <div
@@ -2641,6 +2673,7 @@ const HistoryToolCallPart = memo(({
     >
       <CBToolCallPart
         toolName={toolName}
+        questionReply={questionReply || undefined}
         args={args}
         result={presentedResult}
         isError={isError}
@@ -2690,6 +2723,7 @@ interface HistoryBackgroundChip {
   status?: 'running' | 'completed' | 'interrupted';
   completedAt?: number;
   durationMs?: number;
+  launchSettings?: SubagentLaunchSettings;
   // Detail-pane payload (workflow-style expansion above the bar).
   taskHistory?: Array<{ type: string; content?: string; tools?: string[] }>;
   taskResult?: string;
@@ -2716,6 +2750,9 @@ interface HistoryBackgroundAgentProof {
   sessionId?: string | null;
   generation?: string | null;
   startedAt?: number;
+  completedAt?: number;
+  launchSettings?: SubagentLaunchSettings;
+  status?: 'completed' | 'interrupted';
 }
 
 interface HistoryBackgroundTaskProof {
@@ -2736,6 +2773,7 @@ interface HistoryBackgroundWorkSnapshot {
   tabId: string;
   revision: number;
   agents: HistoryBackgroundAgentProof[];
+  terminalSubagents?: HistoryBackgroundAgentProof[];
   tasks: HistoryBackgroundTaskProof[];
   terminalBackgroundToolUseIds: string[];
 }
@@ -2880,6 +2918,7 @@ const collectHistoryBackgroundChips = (
           agentSessionId: exactActivity?.agentSessionId || action.agentSessionId,
           agentId: exactActivity?.agentId || action.agentId,
           taskPrompt: action.taskPrompt,
+          launchSettings: exactActivity?.launchSettings || action.launchSettings,
         });
       }
     }
@@ -2914,6 +2953,7 @@ const collectHistoryBackgroundChips = (
 const collectHistoryAgentChips = (
   entries: FullHistoryEntry[],
   liveChips: HistoryBackgroundChip[],
+  terminalFacts?: ReadonlyMap<string, HistoryBackgroundAgentProof>,
 ): HistoryAgentChip[] => {
   const liveByKey = new Map<string, HistoryAgentChip>(
     liveChips
@@ -2942,23 +2982,29 @@ const collectHistoryAgentChips = (
             startedAt: summary.startedAt,
             completedAt: summary.completedAt,
             durationMs: summary.durationMs,
+            launchSettings: summary.launchSettings,
           }))
       : [];
     for (const action of [...hydratedTasks, ...stubTasks]) {
       const key = historyAgentKey(action, entry.uuid);
       const live = liveByKey.get(key);
+      const terminal = terminalFacts?.get(historySubagentCallIdentity(action.toolUseId));
       const startedAt = Number(live?.startedAt)
+        || Number(terminal?.startedAt)
         || Number(action.startedAt)
         || Date.parse(entry.timestamp || '')
         || 0;
-      const completedAt = Number(action.completedAt) || 0;
-      const durationMs = Number(action.durationMs) > 0
+      const completedAt = Number(terminal?.completedAt) || Number(action.completedAt) || 0;
+      const durationMs = terminal?.completedAt && startedAt > 0
+        ? Math.max(0, terminal.completedAt - startedAt)
+        : Number(action.durationMs) > 0
         ? Number(action.durationMs)
         : completedAt > 0 && startedAt > 0
           ? Math.max(0, completedAt - startedAt)
           : 0;
       const status: HistoryAgentChip['status'] = live
         ? 'running'
+        : terminal?.status ? terminal.status
         : action.subagentStatus === 'interrupted'
           ? 'interrupted'
           : action.subagentStatus === 'completed' || action.result != null || completedAt > 0
@@ -2981,6 +3027,7 @@ const collectHistoryAgentChips = (
         agentSessionId: live?.agentSessionId || action.agentSessionId || previous?.agentSessionId,
         agentId: live?.agentId || action.agentId || previous?.agentId,
         taskPrompt: action.taskPrompt || previous?.taskPrompt,
+        launchSettings: live?.launchSettings || terminal?.launchSettings || action.launchSettings || previous?.launchSettings,
       };
       byKey.set(key, record);
       liveByKey.delete(key);
@@ -3046,9 +3093,15 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     || !!chip?.agentId
     || !!chip?.taskPrompt;
   const chipKey = chip?.kind === 'subagent' && canLocateTranscript ? chip.key : '';
+  const launchOwnerKey = [tabId, toolType, sessionId, chipKey,
+    chip?.agentSessionId || chip?.agentId || '', String(chip?.startedAt || '')].join('|');
+  const [launchSnapshot, setLaunchSnapshot] = useState<{
+    ownerKey: string; settings: SubagentLaunchSettings | null;
+  }>({ ownerKey: '', settings: null });
 
   useEffect(() => {
-    if (!chipKey) { setSteps([]); setPending(false); offsetRef.current = 0; return; }
+    if (!chipKey) { setSteps([]); setPending(false); offsetRef.current = 0;
+      setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null }); return; }
     let cancelled = false;
     let tickInFlight = false;
     let drainTimer: number | null = null;
@@ -3063,6 +3116,7 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     offsetRef.current = 0;
     setSteps([]);
     setPending(true);
+    setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null });
     // A LIVE Codex card has no thread id yet: the spawn is rendered when the
     // call appears, while the id arrives later (spawn output in v1, an activity
     // event in v2). The main-side watcher already knows it, so ask before the
@@ -3097,6 +3151,16 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
         });
         if (cancelled) return;
         if (res?.success && Array.isArray(res.steps)) {
+          const settings: SubagentLaunchSettings | null = res.launchSettings?.version === 1
+            && res.launchSettings.provider === toolType
+            && (toolType !== 'codex' || res.launchSettings.sessionId === resolvedThreadId)
+              ? res.launchSettings : null;
+          setLaunchSnapshot(previous => previous.ownerKey === launchOwnerKey
+            && previous.settings?.model === settings?.model
+            && previous.settings?.effort === settings?.effort
+            && previous.settings?.source === settings?.source
+            && previous.settings?.sessionId === settings?.sessionId
+            ? previous : { ownerKey: launchOwnerKey, settings });
           const nextOffset = Number(res.offset) || offsetRef.current;
           offsetRef.current = nextOffset;
           if (res.steps.length > 0) {
@@ -3148,7 +3212,7 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     };
   }, [chipKey, tabId, toolType, cwd, sessionId, chip?.agentId, chip?.agentSessionId, chip?.taskPrompt, chip?.label, chip?.startedAt, chip?.status]);
 
-  return { steps, pending };
+  return { steps, pending, launchSettings: launchSnapshot.ownerKey === launchOwnerKey ? launchSnapshot.settings : null };
 }
 
 // One docked inspector serves both live and completed agents. It is a sibling
@@ -3195,7 +3259,11 @@ const HistoryBackgroundDetailPane = memo(({
   const followBottomRef = useRef(true);
   const restoredScrollRef = useRef(false);
   const programmaticScrollRef = useRef(false);
-  const { steps: liveSteps, pending: stepsPending } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
+  const { steps: liveSteps, pending: stepsPending, launchSettings: ownLaunchSettings } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
+  const creationLaunchSettings = chip.launchSettings?.version === 1
+    && chip.launchSettings.provider === toolType
+    && (toolType !== 'codex' || chip.launchSettings.sessionId === chip.agentSessionId)
+      ? chip.launchSettings : null;
   const [answerCopied, setAnswerCopied] = useState(false);
   const answerCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
@@ -3369,7 +3437,9 @@ const HistoryBackgroundDetailPane = memo(({
           : chip.kind === 'bash'
             ? <TerminalSquare size={12} style={{ color: statusColor, flexShrink: 0 }} />
             : <Bot size={12} style={{ color: statusColor, flexShrink: 0 }} />}
-        <span className="truncate" style={{ flex: 1, fontFamily: 'monospace' }}>{chip.label}</span>
+        {chip.kind === 'subagent'
+          ? <HistoryAgentLaunchParameters settings={creationLaunchSettings || ownLaunchSettings} taskLabel={chip.label} />
+          : <span className="truncate" style={{ flex: 1, fontFamily: 'monospace' }}>{chip.label}</span>}
         <span style={{ color: statusColor, fontSize: '0.9em' }}>{statusLabel}</span>
         <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums', minWidth: 0 }}>
           {running
@@ -4460,14 +4530,22 @@ const HistoryUserPromptContent = ({
     if (node) revealAnchorsRef.current.set(partKey, node);
     else revealAnchorsRef.current.delete(partKey);
   }, []);
+  // Keep the portal anchored to the clicked chip while arrows change only the
+  // image being read. Navigating a hidden later attachment does not expand or
+  // measure the whole message and never moves its History/composer geometry.
+  const [imagePreviewPartKey, setImagePreviewPartKey] = useState<string | null>(null);
   const togglePopoverPart = useCallback((partKey: string, trigger?: HTMLElement) => {
     if (forceExpanded) return;
+    setImagePreviewPartKey(null);
     setExpandedPart((current) => {
       if (current === partKey) trigger?.blur();
       return current === partKey ? null : partKey;
     });
   }, [forceExpanded]);
-  const closePopover = useCallback(() => setExpandedPart(null), []);
+  const closePopover = useCallback(() => {
+    setExpandedPart(null);
+    setImagePreviewPartKey(null);
+  }, []);
   const presentation = useMemo(
     () => buildHistoryComposerPresentationParts({ text, chips: promptChips, imagePaths }),
     [imagePaths, promptChips, text],
@@ -4477,12 +4555,22 @@ const HistoryUserPromptContent = ({
   const imagePreviewUrls = useComposerImagePreviews(imagePaths);
   const expandedImagePart = useMemo(() => {
     if (!expandedPart?.startsWith('image:')) return null;
-    const index = Number(expandedPart.split(':')[1]);
-    const part = parts[index];
-    return part?.kind === 'image' ? part : null;
-  }, [expandedPart, parts]);
+    return historyImagePreviewPart(parts, imagePreviewPartKey || expandedPart);
+  }, [expandedPart, imagePreviewPartKey, parts]);
   const expandedImageRef = expandedImagePart?.ref as HistoryPromptDraftImageRef | undefined;
   const imageDetailPreview = useComposerImagePreview(expandedImageRef, 'detail');
+  useEffect(() => {
+    if (forceExpanded || !expandedPart?.startsWith('image:')) return;
+    const anchor = revealAnchorsRef.current.get(expandedPart);
+    if (!anchor) return;
+    return bindHistoryImagePreviewKeys({
+      target: window,
+      anchor,
+      navigate: (direction: number) => setImagePreviewPartKey((current) => (
+        historyImagePreviewStep(parts, current || expandedPart, direction)
+      )),
+    });
+  }, [expandedPart, forceExpanded, parts]);
 
   if (instructionAttachment) {
     return (
@@ -4606,6 +4694,9 @@ const HistoryUserPromptContent = ({
         const open = expandedPart === partKey;
         const imageError = part.error || composerImagePreviewError(ref)
           || (expandedImagePart === part ? imageDetailPreview.error : null);
+        const previewError = expandedImagePart?.error || composerImagePreviewError(expandedImageRef)
+          || imageDetailPreview.error
+          || (!expandedImageRef ? 'Image reference is unavailable in this History entry.' : null);
         return (
           <React.Fragment key={partKey}>
             <HistoryComposerToken
@@ -4622,15 +4713,14 @@ const HistoryUserPromptContent = ({
                 onClose={closePopover}
               >
                 <AIComposerImageAttachmentPreview
-                  src={expandedImagePart === part ? imageDetailPreview.url : undefined}
-                  loading={expandedImagePart === part && imageDetailPreview.loading}
-                  error={expandedImagePart === part
-                    ? imageError || (!ref ? 'Image reference is unavailable in this History entry.' : null)
-                    : null}
-                  path={ref?.path}
-                  assetId={ref?.assetId}
-                  size={ref?.size}
-                  alt={`Image attachment #${part.id}`}
+                  key={imagePreviewPartKey || partKey}
+                  src={imageDetailPreview.url}
+                  loading={imageDetailPreview.loading}
+                  error={previewError}
+                  path={expandedImageRef?.path}
+                  assetId={expandedImageRef?.assetId}
+                  size={expandedImageRef?.size}
+                  alt={`Image attachment #${expandedImagePart?.id ?? part.id}`}
                 />
               </HistoryChipPopover>
             )}
@@ -4742,13 +4832,15 @@ const HistoryUserEntry = memo(({
     && queueStatus !== 'sent'
     && !!onDismissPromptPresentation;
   const serviceBody = useMemo(() => projectHistoryServicePromptBody({
-    role: entry.role, content: entry.content, semanticTags: entry.semanticTags,
-  }, historyServicePromptFingerprint), [entry.role, entry.content, entry.semanticTags]);
-  const promptPresentation = useMemo(() => buildHistoryComposerPresentationParts({
+    role: entry.role, content: entry.content, semanticTags: entry.semanticTags, questionReplyProof: entry.questionReplyProof,
+  }, historyServicePromptFingerprint), [entry.role, entry.content, entry.semanticTags, entry.questionReplyProof]);
+  const promptPresentation = useMemo(() => serviceBody.questionReply ? {
+    parts: [{ kind: 'text', text: serviceBody.text }],
+  } : buildHistoryComposerPresentationParts({
     text: serviceBody.text,
     chips: entry.promptChips,
     imagePaths: entry.imagePaths,
-  }), [serviceBody.text, entry.imagePaths, entry.promptChips]);
+  }), [serviceBody.text, serviceBody.questionReply, entry.imagePaths, entry.promptChips]);
   const detachedPrompts = useMemo(() => (
     forceExpanded
       ? { promptParts: [] as HistoryPromptPresentationPart[], bodyParts: promptPresentation.parts as Array<any> }
@@ -4768,9 +4860,14 @@ const HistoryUserEntry = memo(({
     [entry],
   );
   const promptSender = resolveHistoryPromptSender(orchestrationPrompt);
+  const automaticContinuation = !orchestrationPrompt && !serviceBody.questionReply ? getAutomaticContinuationKind(entry) : null;
+  const loopPrompt = automaticContinuation === 'loop';
+  const continuePrompt = automaticContinuation === 'continue';
   const userBubbleClassName = [
     chipOnly ? 'hp-history-user-bubble--single-chip' : '',
     orchestrationPrompt ? 'hp-history-user-bubble--orchestration' : '',
+    loopPrompt ? 'hp-history-user-bubble--loop' : '',
+    continuePrompt ? 'hp-history-user-bubble--continue' : '',
   ].filter(Boolean).join(' ') || undefined;
 
   useEffect(() => () => {
@@ -4918,9 +5015,12 @@ const HistoryUserEntry = memo(({
   return (
     <ConversationMessage
       layout="user"
+      tone={serviceBody.questionReply ? 'info' : 'default'}
+      data-history-question-reply={serviceBody.questionReply?.provider}
       entryUuid={entry.uuid}
       {...historyRecordTimeAttributes(entry.recordTime, entry.uuid + ':user', 'user')}
-      className={orchestrationPrompt ? 'hp-history-user--orchestration' : undefined}
+      className={orchestrationPrompt ? 'hp-history-user--orchestration' : loopPrompt ? 'hp-history-user--loop' : continuePrompt ? 'hp-history-user--continue' : undefined}
+      data-history-prompt-origin={loopPrompt ? 'loop' : continuePrompt ? 'codex-capacity-retry' : undefined}
       data-history-orchestration-phase={orchestrationPrompt?.phase}
       data-history-tab-message-id={orchestrationPrompt?.messageId}
       emphasis={editableLastPrompt ? 'editable' : 'none'}
@@ -5120,16 +5220,21 @@ const HistoryUserEntry = memo(({
       {promptSender && (
         <HistoryPromptSource source={promptSender} phase={orchestrationPrompt.phase} />
       )}
+      {(loopPrompt || continuePrompt) && <div className="hp-history-loop-label" data-history-loop-label={loopPrompt || undefined}
+        data-history-continue-label={continuePrompt || undefined}>
+        {continuePrompt ? <RefreshCw size={12} aria-hidden="true" /> : <Repeat2 size={12} aria-hidden="true" />}
+        <span>{continuePrompt ? 'Continue' : 'Loop'}</span>
+      </div>}
       <HistoryUserPromptContent
         text={serviceBody.text}
         messageText={entry.content}
-        markdown={serviceBody.projected}
+        markdown={serviceBody.projected && !serviceBody.questionReply}
         tabId={tabId}
         promptChips={entry.promptChips}
         imagePaths={entry.imagePaths}
         toolType={toolType}
         forceExpanded={forceExpanded}
-        presentationParts={hasDetachedPromptBand ? detachedPrompts.bodyParts : undefined}
+        presentationParts={serviceBody.questionReply ? promptPresentation.parts : hasDetachedPromptBand ? detachedPrompts.bodyParts : undefined}
       />
     </ConversationMessage>
   );
@@ -5220,6 +5325,7 @@ const HistoryAssistantEntry = memo(({
             <div key={'raw' + index + ':' + toolName}>
               <HistoryToolCallPart
                 toolUseId={action.rawTool.toolUseId}
+                questionReplyProof={action.rawTool.questionReplyProof}
                 recordTime={action.rawTool.recordTime}
                 timeKey={entry.uuid + ':' + (action.rawTool.toolUseId || index)}
                 toolName={toolName}
@@ -5706,10 +5812,11 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   flex-direction: row;
   flex-wrap: nowrap;
   align-items: center;
-  /* Saved prompts and orange context updates share one natural left-to-right
-     row across the already-computed user-bubble width. The band must not
-     participate in the column's shrink-to-fit width calculation. */
-  justify-content: flex-start;
+  /* Attachment order stays left-to-right, but the band ends at the same
+     right edge as the user bubble, even when the body is long. Project
+     instructions keep their separate row; don't reverse chip/preview order
+     or let attachments alter the column's shrink-to-fit width. */
+  justify-content: flex-end;
   gap: 6px;
   width: 100%;
   align-self: stretch;
@@ -5725,7 +5832,9 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   display: inline-flex;
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 100%;
+  /* Cap the slot too: a long label must not reserve an invisible tail beyond
+     the chip's own cap and move the visible right edge back to the left. */
+  max-width: min(240px, 100%);
   vertical-align: middle;
 }
 .hp-history-user-prompt-chip-slot .cb-composer-chip {
@@ -5791,6 +5900,21 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   --cb-user-bubble-bg: rgba(124, 58, 237, 0.08);
   --cb-user-bubble-border: rgba(167, 139, 250, 0.20);
   --cb-user-bubble-bg-solid: #221d2b;
+}
+.hp-history-transcript .cb-user-bubble.hp-history-user-bubble--loop,
+.hp-history-transcript .cb-user-bubble.hp-history-user-bubble--continue {
+  --cb-user-bubble-bg: rgba(114, 90, 159, 0.08);
+  --cb-user-bubble-border: rgba(114, 90, 159, 0.22);
+  --cb-user-bubble-bg-solid: #201d26;
+  --cb-msg-text: #8f8d88;
+}
+.hp-history-loop-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #8f8d88;
+  font-size: .84em;
+  margin-bottom: 3px;
 }
 /* The top collapse control still occupies half of its 11px seam inside the
    bubble. Keep its established safe inset while ordinary user text adopts the
@@ -9627,7 +9751,7 @@ function AgentHistoryControls({
               unconfirmedStatus !== null
               || (result?.submitted === true && result?.success === false)
             );
-        sendRefusalPasteWritten = result?.pasteWritten === true;
+        sendRefusalPasteWritten = result?.pasteWritten === true && localSlashReceipt.restoreDraftSafe !== true;
         sendTransferredQueueStatus = resultQueueStatus;
         historyDiag('SEND_OWNERSHIP tab=' + tabId.slice(-12) +
           ' handoff=' + handoffId +
@@ -11699,10 +11823,10 @@ function AgentHistoryControls({
         minWidth: 0,
         maxHeight: historyComposerPromptBandLayout.maxHeight,
         boxSizing: 'border-box',
-        // Ряд растёт ВВЕРХ до трёх строк. Для больших наборов max-width одного
-        // чипа получает долю строки, достаточную для всех элементов: так они
-        // сжимаются только после использования доступных строк и не исчезают
-        // за overflow. Источники остаются в обычном row-major порядке.
+        // Небольшой набор сначала делит один ряд слева направо: длинный label
+        // сокращается, а не отправляет второй чип в отдельную строку.
+        // Большие наборы растут ВВЕРХ до трёх строк. Наследование — metadata
+        // чипа, не причина новой строки; порядок и источники не меняются.
         flexWrap: 'wrap',
         overflowX: 'hidden',
         overflowY: 'hidden',
@@ -12008,6 +12132,8 @@ function AgentHistoryControls({
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
+      {toolType === 'codex' && <CodexNativeQuestionMirror key={tabId} tabId={tabId}
+        onRecoverDraft={(text) => setPrompt(previous => previous ? previous + '\n\n' + text : text)} />}
       {pendingQuestion ? (
         <div className="hp-history-composer-frame" style={{ border: '1px solid #333', borderRadius: 12, padding: 8, background: '#0f0f0f' }}>
           <div className="cb-composer-topbar">
@@ -13430,6 +13556,7 @@ function HistoryPanel({
     tabId: '',
     revision: -1,
     agents: [],
+    terminalSubagents: [],
     tasks: [],
     terminalBackgroundToolUseIds: [],
   });
@@ -13450,6 +13577,7 @@ function HistoryPanel({
           sessionId: agent?.sessionId ? String(agent.sessionId) : null,
           generation: agent?.generation ? String(agent.generation) : null,
           startedAt: Number(agent?.startedAt) || 0,
+          ...(agent?.launchSettings?.version === 1 ? { launchSettings: agent.launchSettings } : {}),
         }))
         .filter((agent) => !!agent.toolUseId);
       const normalizedTasks: HistoryBackgroundTaskProof[] = tasks
@@ -13476,6 +13604,14 @@ function HistoryPanel({
           tabId,
           revision: nextRevision,
           agents: normalizedAgents,
+          terminalSubagents: (Array.isArray(detail?.terminalSubagents) ? detail.terminalSubagents : [])
+            .filter((agent: any) => agent?.provider === 'codex' && agent?.toolUseId && Number(agent.completedAt) > 0)
+            .map((agent: any): HistoryBackgroundAgentProof => ({ provider: 'codex',
+              toolUseId: String(agent.toolUseId), agentSessionId: String(agent.agentSessionId || ''),
+              sessionId: agent.sessionId || null, generation: agent.generation || null,
+              startedAt: Number(agent.startedAt) || 0, completedAt: Number(agent.completedAt),
+              ...(agent.launchSettings?.version === 1 ? { launchSettings: agent.launchSettings } : {}),
+              status: agent.status === 'interrupted' ? 'interrupted' : 'completed' })),
           tasks: normalizedTasks,
           terminalBackgroundToolUseIds,
         };
@@ -13649,9 +13785,12 @@ function HistoryPanel({
   }, [tabId, backgroundChipsDigest, backgroundHistoryChips.length, backgroundAgentChipCount, chipsOwnerSettled, chipsFreshOwnerKey, chipsLiveOwnerProven, historyOwnerKey, isTurnBusy, agentProcessAlive, agentProcessGeneration]);
   const historyAgentChips = useMemo(
     () => (chipsOwnerSettled
-      ? collectHistoryAgentChips(chipSourceEntries, backgroundHistoryChips)
+      ? collectHistoryAgentChips(chipSourceEntries, backgroundHistoryChips, mainBackgroundWork.tabId === tabId
+          ? new Map((mainBackgroundWork.terminalSubagents || []).filter(agent => agent.provider === toolType
+            && agent.sessionId === sessionId && agent.generation === agentProcessGeneration)
+            .map(agent => [historySubagentCallIdentity(agent.toolUseId), agent])) : undefined)
       : EMPTY_HISTORY_AGENTS),
-    [backgroundHistoryChips, chipSourceEntries, chipsOwnerSettled],
+    [backgroundHistoryChips, chipSourceEntries, chipsOwnerSettled, mainBackgroundWork, tabId, toolType, sessionId, agentProcessGeneration],
   );
   // The dock selection survives running → completed because both faces use
   // the same `task:<toolUseId>` key. It resets only when the selected action
@@ -13772,13 +13911,15 @@ function HistoryPanel({
   // timer in the Footer would duplicate it and would again make completion
   // look like metadata of only the latest iteration.
   const responseTailTiming = useMemo<HistoryResponseTailTiming | null>(() => {
+    const compactTiming = historyCompactTailTiming(compactOperationalPhase, { tabId, toolType, sessionId });
+    if (compactTiming) return compactTiming as HistoryResponseTailTiming;
     if (!liveResponseTailTiming) return null;
     if (liveResponseTailTiming.state !== 'completed') return liveResponseTailTiming;
     const intervalId = Number(liveResponseTailTiming.intervalId);
     const isBoundToVisibleResponse = Number.isFinite(intervalId)
       && displayEntries.some((entry) => Number(entry.responseTiming?.intervalId) === intervalId);
     return isBoundToVisibleResponse ? null : liveResponseTailTiming;
-  }, [displayEntries, liveResponseTailTiming]);
+  }, [displayEntries, liveResponseTailTiming, compactOperationalPhase, tabId, toolType, sessionId]);
   // ===== Display units: series collapsing (последняя ступень проекции) =====
   // Approved contract (docs/tmp/визуал-history.md::Вердикт): the unit list is
   // presentation-only; group keys are internal; everything that crosses this
@@ -14669,7 +14810,50 @@ function HistoryPanel({
   // which looks the ops up by scroller element (column mode mounts several
   // panels at once) — registered from the scrollerRef callback below so it
   // exists before the first possible click.
+  const historyRevealGeometryRef = useRef<any>(null);
+  const historyRevealTrace = useMemo(() => createHistoryRevealTrace({
+    getState: () => ({
+      owner: historyOwnerDigest(historyOwnerKeyRef.current), generation: historyOwnerGenerationRef.current,
+      visit: historyPresentationProofRef.current.visit, presented: historyPresentationProofRef.current.presented,
+      actionId: currentUIActionId(), gesture: historyUserGestureGenerationRef.current,
+      intentRevision: historyTailIntentRevisionRef.current, follow: isAtBottomRef.current,
+      followProp: historyFollowOutputEnabledRef.current, pointer: historyPointerScrollActiveRef.current,
+      pinPending: historyTailPinScheduler.isPending(), restore: historyRestoreInFlightRef.current !== 0,
+      jump: historyScrollInFlightRef.current !== null,
+    }),
+    log: (record: any) => historyDiag('REVEAL_TRANSACTION tab=' + historyTabIdRef.current.slice(-12)
+      + ' ' + JSON.stringify(record)),
+  }), [historyTailPinScheduler]);
+  useEffect(() => () => historyRevealTrace.cancel('owner-cleanup'), [historyRevealTrace, historyOwnerKey]);
+  const historyCardRevealAnchor = useMemo(() => createHistoryCardRevealAnchor({
+    getScroller: () => virtuosoScrollerRef.current,
+    getOwnerToken: historyScrollerOwnerToken,
+    getGestureGeneration: () => historyUserGestureGenerationRef.current,
+    isPointerGestureActive: () => historyPointerScrollActiveRef.current,
+    isPresented: () => historyPresentationProofRef.current.presented,
+    isSuppressed: () => historyResizeRef.current?.active() === true
+      || historyRestoreInFlightRef.current !== 0 || historyScrollInFlightRef.current !== null
+      || historyScrollSeekController.isActive(),
+  }), [historyScrollerOwnerToken, historyScrollSeekController]);
+  useEffect(() => () => historyCardRevealAnchor.cancel(), [historyCardRevealAnchor, historyOwnerKey]);
   const historyRevealOps = useMemo<HistoryRevealScrollerOps>(() => ({
+    afterRevealCommit: (anchor, opening, onFinish) => historyCardRevealAnchor.afterCommit(anchor, opening, onFinish),
+    beginReveal: (anchor, opening) => {
+      const scroller = virtuosoScrollerRef.current;
+      if (!scroller || !anchor) return null;
+      const row = anchor.closest<HTMLElement>('[data-history-unit-key]');
+      const card = row?.getAttribute('data-uuid') || row?.getAttribute('data-history-durable-source');
+      const cached = historyRevealGeometryRef.current;
+      const owned = cached?.scroller === scroller && cached.ownerToken === historyScrollerOwnerToken();
+      // Reuse an existing scroll-frame observation. Do not force a layout
+      // merely to fill this trace; absent/stale geometry stays explicit.
+      return historyRevealTrace.begin({ opening, unitKey: row?.getAttribute('data-history-unit-key'),
+        card, snapshotSource: owned ? 'last-existing-scroll-frame' : 'unavailable-no-extra-layout',
+        geometryAgeMs: owned ? performance.timeOrigin + performance.now() - cached.atAbs : null,
+        snapshot: owned ? { scrollTop: cached.snapshot.scrollTop, scrollHeight: cached.snapshot.scrollHeight,
+          clientHeight: cached.snapshot.clientHeight, unitTop: cached.snapshot.topUuid === card ? cached.snapshot.topPx : null,
+          unitHeight: cached.snapshot.topUuid === card ? cached.snapshot.topHeight : null } : null });
+    },
     unpinTail: () => {
       // Separate synchronous commit: Virtuoso must observe literal
       // followOutput=false BEFORE the following commit changes item count.
@@ -14681,7 +14865,7 @@ function HistoryPanel({
       historyUserScrollDirectionRef.current = null;
       historyTailPinScheduler.cancel();
     },
-  }), [historyTailPinScheduler, setHistoryTailFollowIntent]);
+  }), [historyTailPinScheduler, historyRevealTrace, historyCardRevealAnchor, historyScrollerOwnerToken, setHistoryTailFollowIntent]);
   // Correlated geometry proof for the reported first-toggle-only jerk. A group
   // click can coincide with tab activation, a cold display-unit signature,
   // Virtuoso remeasurement or a competing machine scroll. The old one-line
@@ -20413,6 +20597,8 @@ function HistoryPanel({
     if (!scroller?.isConnected) return;
     const now = performance.now();
     const snapshot = captureHistoryScrollTraceDomSnapshot(scroller);
+    historyRevealGeometryRef.current = { scroller, ownerToken: historyScrollerOwnerToken(),
+      atAbs: performance.timeOrigin + performance.now(), snapshot };
     const proof = historyPresentationProofRef.current;
     const roundTenth = (value: number | null) => value === null
       ? 'na'
@@ -20447,7 +20633,7 @@ function HistoryPanel({
       + ' gestureGen=' + historyUserGestureGenerationRef.current
       + ' presented=' + (proof.presented ? '1' : '0')
       + ' visit=' + proof.visit);
-  }, [historyScrollSeekController, tabId]);
+  }, [historyScrollSeekController, historyScrollerOwnerToken, tabId]);
 
   const finishHistoryScrollGestureTrace = useCallback((
     trace: HistoryScrollGestureTrace,
@@ -21289,10 +21475,13 @@ function HistoryPanel({
       || historyScrollSeekController.isActive()
       || historyWheelGeometryReleaseSettleCancelRef.current !== null
       || terminalPreviewAnchorSettleCancelRef.current !== null,
-    onSync: () => historyDiag('VIRTUOSO_MEASUREMENT_VIEWPORT_SYNC tab=' + historyTabIdRef.current.slice(-12)
-      + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current)
-      + ' visit=' + historyPresentationProofRef.current.visit),
-  }), [historyScrollerOwnerToken, historyScrollSeekController]);
+    onSync: (sample: any) => {
+      historyRevealTrace.viewportSync(sample);
+      historyDiag('VIRTUOSO_MEASUREMENT_VIEWPORT_SYNC tab=' + historyTabIdRef.current.slice(-12)
+        + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current)
+        + ' visit=' + historyPresentationProofRef.current.visit);
+    },
+  }), [historyScrollerOwnerToken, historyScrollSeekController, historyRevealTrace]);
   useEffect(() => () => historyMeasurementViewportSync.cancel(), [historyMeasurementViewportSync]);
 
   const measureHistoryVirtuosoItemSize = useCallback((element: HTMLElement, field: string) => {
@@ -21305,6 +21494,11 @@ function HistoryPanel({
     const sameMeasuredUnit = previousMeasurement?.key === unitKey;
     if (field === 'offsetHeight') {
       historyVirtuosoMeasurementRef.current.set(element, { key: unitKey, height: actualSize });
+      historyRevealTrace.measure(unitKey, () => {
+        const scroller = virtuosoScrollerRef.current;
+        return { scrollTop: scroller?.scrollTop, scrollHeight: scroller?.scrollHeight,
+          clientHeight: scroller?.clientHeight, unitTop: rect.top, unitHeight: actualSize };
+      });
       if (Number.isFinite(knownSize) && actualSize !== knownSize) {
         // Reuse this existing measurement, including one-pixel changes. No
         // extra layout read is needed to explain a later scroll writer.
@@ -21365,7 +21559,7 @@ function HistoryPanel({
       }
     }
     return actualSize;
-  }, [historyScrollSeekController, historyMeasurementViewportSync]);
+  }, [historyScrollSeekController, historyMeasurementViewportSync, historyRevealTrace]);
 
   const handleUserScrollIntent = useMemo(() => historyWheelDiagnostics.wrap('intent', (event: Event) => {
     if (!event.isTrusted || !historyPresentationProofRef.current.presented) return;
@@ -22692,9 +22886,12 @@ function HistoryPanel({
               }}
             >
               <AlertTriangle size={18} aria-hidden="true" />
-              <div>История временно не восстановлена</div>
+              <div>История не загружена</div>
               <div style={{ fontSize: 11, color: '#8f7a80', maxWidth: 420, lineHeight: 1.45 }}>
-                Сохранённая ветка существует, но её связь с предыдущей частью истории не доказана. Ничего не удалено; приложение не будет выдавать неполную ветку за пустой чат.
+                Приложение не смогло прочитать сохранённую историю. Ошибка чтения сама по себе не означает, что переписка удалена.
+              </div>
+              <div style={{ fontSize: 10, color: '#8f7a80', maxWidth: 420, overflowWrap: 'anywhere' }}>
+                {historyLoadError}
               </div>
             </div>
           ) : transcriptUnavailable ? (

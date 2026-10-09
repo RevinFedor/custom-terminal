@@ -2354,6 +2354,7 @@ test('Codex capacity retry settings persist globally, normalize bounds, and pres
 
 test('an orchestration-created target keeps auto-stop ownership when later runs reuse it', async () => {
   const { store, filePath, cleanup } = await makeStore();
+  let restored;
   try {
     const created = await store.create({
       ...baseRun('created-run', 'managed-target'),
@@ -2393,13 +2394,14 @@ test('an orchestration-created target keeps auto-stop ownership when later runs 
     const persisted = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
     assert.deepEqual(persisted.createdTargetTabIds, ['managed-target']);
 
-    const restored = new OrchestrationRunStore(filePath);
+    restored = new OrchestrationRunStore(filePath);
     const reusedAfterRestart = await restored.create({
       ...baseRun('reused-after-restart', 'managed-target'),
       targetCreated: false,
     });
     assert.equal(reusedAfterRestart.targetCreatedByOrchestration, true);
   } finally {
+    await restored?.flush();
     await cleanup();
   }
 });

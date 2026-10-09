@@ -73,7 +73,7 @@ test('real workflow badge displays preparation or provider activity and disappea
     const counts = resolveWorkflowActivityCounts([{ tabId: 'T', processAlive: true, ...frame }]);
     const html = renderToStaticMarkup(React.createElement(Badges, { ...counts, active: false }));
     assert.equal(html.includes('data-workflow-busy-count'), index < frames.length - 1);
-    assert.equal(html.includes('data-workflow-active-count'), true, 'process liveness stays separate');
+    assert.equal(html.includes('data-workflow-active-count'), index === frames.length - 1, 'green counts only idle live processes');
     const ids = new Set(frame.busy || frame.pasteBusy || frame.sendPending ? ['T'] : []);
     assert.equal(resolveDockBusyBadgeState(ids, new Set()).count, counts.busyCount);
   }

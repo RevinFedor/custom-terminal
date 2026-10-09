@@ -21,3 +21,10 @@ test('Run after incident report carries exact tab, session, time and lifecycle r
   assert.match(report, /^Time \(UTC\): 2026-08-30T10:07:48\.664Z$/m);
   assert.match(report, /^Log lookup: \[PromptQueueRunner\] tab=ect-tab-4553 reason=process-exited$/m);
 });
+
+test('manual Stop has no incident or paused report', () => {
+  const report = buildRunAfterIncidentReport({ tabId: 'tab-4412', triggerName: 'terminal mcp\\timeline',
+    reason: 'manual-stop', outcome: 'была остановлена', source: 'codex-live', occurredAt: 1791548904320,
+    ownerTabId: 'tab-4412', ownerName: 'terminal mcp\\timeline', remainingItems: 2 });
+  assert.equal(report, null);
+});

@@ -297,7 +297,7 @@ try {
   assert.ok(await page.locator('[data-test-adoption] [data-tab-id="b"]').count()>0);
   result.checks.push('same pointer gesture is adopted by actual TabBar; Cmd sidebar drop detaches placement and keeps the tab');
 
-  const grouping=await page.locator('[data-strip-project-start]').evaluateAll(nodes=>nodes.every(node=>{const icon=node.querySelector('[data-strip-project-icon]'),card=node.querySelector('[data-tab-card]');const a=icon.getBoundingClientRect(),b=card.getBoundingClientRect();return a.left<b.left&&a.top>=b.top&&a.bottom<=b.bottom;}));assert.equal(grouping,true);
+  assert.equal(await page.locator('[data-strip-project-icon]').count(),0,'execution namespace does not create a directory prefix');
   await page.screenshot({path:path.join(artifact,'wrapped-dnd.png')});
   assert.deepEqual(result.errors,[]);
   result.state=await page.evaluate(()=>({violations:window.pickerFixture.violations,unknown:[...new Set(window.pickerFixture.unknown)],gestures:window.pickerFixture.gestures}));

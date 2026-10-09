@@ -86,6 +86,13 @@ const stopBusyState = () => {
 if (reason === 'manual-stop') return;  // skip auto-run / stop-after
 ```
 
+Уточнение09.10: пропуск относится к самому событию Stop, не к выключению
+сохранённого Run After. Root не меняет Play/Loop/таймер/app-restart/onTab и не
+показывает warning/info; следующий настоящий trigger может использовать общий
+Resume. Отзывается только старая подготовка, пересечённая принятым Main Stop.
+Ошибка provider и явный Pause имеют собственные правила. Полный контракт —
+`fact-prompt-queue.md::Auto-run стреляет ТОЛЬКО на штатный конец turn'а`.
+
 `claudeHookLastEvent.set(tabId, {event: 'ManualStop', ...})` обязателен **независимо** от `wasBusy`. Без записи `system:dump-claude-state` показывал бы stale `UserPromptSubmit` часами после ручного Stop'а, и любой будущий debug подумал бы что Stop hook молча уронился (см. `fix-claude-hook-silent-dropouts.md::Observability`). Сам по себе факт пользовательского Stop'а полезен для диагностики, не только когда был busy.
 
 ### Local-command watcher тоже входит в busy cleanup (compact-cancel)

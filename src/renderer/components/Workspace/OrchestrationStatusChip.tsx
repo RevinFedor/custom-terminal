@@ -174,6 +174,8 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   }
   if (run.status === 'failed') return { color: '#f87171', icon: 'error', label: 'Ошибка', spinning: false };
   if (run.status === 'waiting_recovery') {
+    if (run.runKind === 'response-observation') return { color: '#fbbf24', icon: 'error',
+      label: 'Проверка недоступна', spinning: false };
     return {
       color: '#fbbf24',
       icon: 'recovery',
@@ -193,6 +195,10 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   }
   if (run.status === 'completed') return { color: '#4ade80', icon: 'success', label: 'Готово', spinning: false };
   if (run.status === 'cancelled') return { color: '#737373', icon: 'cancelled', label: 'Закрыто', spinning: false };
+  if (run.runKind === 'response-observation') {
+    return { color: '#a78bfa', icon: 'waiting', label: run.status === 'waiting_descendants'
+      ? 'Ждёт завершения работы' : 'Ждёт ответ', spinning: false };
+  }
   if (run.status === 'sending') {
     return { color: '#60a5fa', icon: 'waiting', label: 'Ожидает доставки', spinning: false };
   }
@@ -293,6 +299,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const settingsSaveChain = useRef<Promise<unknown>>(Promise.resolve());
   const settingsSaveSequence = useRef(0);
   const [settingsSaveError, setSettingsSaveError] = useState(false);
+  const openingLinkedRuns = useRef(new Set<string>());
+  const [openingLinkedRunIds, setOpeningLinkedRunIds] = useState<Set<string>>(() => new Set());
   const messagePreviewRef = useRef<HTMLElement>(null);
   const messages = useTabMessages(tabId);
   const [selectedMessage, setSelectedMessage] = useState<MessageSelection | null>(null);
@@ -303,8 +311,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     setSettingsOpen(false);
     setSelectedMessage(current => current?.messageId === selection.messageId ? null : selection);
   }, []);
-  const dismissMessage = async (messageId: string) => {
-    if (await messages.dismiss(messageId)) {
+  const cancelMessage = async (messageId: string) => {
+    if (await messages.cancel(messageId)) {
       setSelectedMessage(current => current?.messageId === messageId ? null : current);
     }
   };
@@ -411,20 +419,36 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const hasDockEntries = statusRuns.length > 0 || hasVisibleMessages || Boolean(messages.listError);
 
   const openLinkedTab = useCallback(async (run: OrchestrationRun) => {
+    if (openingLinkedRuns.current.has(run.runId)) return;
     const isSource = run.sourceTabId === tabId;
-    if (isSource && run.runKind === 'external-research') return;
+    const external = isSource && run.runKind === 'external-research';
     const projectId = isSource ? run.targetProjectId : run.sourceProjectId;
     const projectPath = isSource ? run.targetProjectPath : run.sourceProjectPath;
     const linkedTabId = isSource ? run.targetTabId : run.sourceTabId;
-    if (!linkedTabId) return;
-
-    setHistoryOpen(false);
-    closeMessage();
-    const opened = await useWorkspaceStore.getState().openTabById(linkedTabId, {
-      projectId, projectPath, reason: 'orchestration-linked-tab',
-    });
-    if (!opened) return;
-    void ipcRenderer.invoke('orchestration:acknowledge', { runId: run.runId, tabId }).catch(() => {});
+    if (!external && !linkedTabId) return;
+    openingLinkedRuns.current.add(run.runId);
+    setOpeningLinkedRunIds(new Set(openingLinkedRuns.current));
+    setActionError(current => ({ ...current, [run.runId]: '' }));
+    try {
+      if (external) {
+        const result = await ipcRenderer.invoke('orchestration:open-research-job', { runId: run.runId });
+        if (result?.success !== true) throw new Error(result?.error || 'Не удалось открыть задачу в SC Desktop');
+      } else {
+        const opened = await useWorkspaceStore.getState().openTabById(linkedTabId, {
+          projectId, projectPath, sourceTabId: tabId, reason: 'orchestration-linked-tab',
+        });
+        if (!opened) return;
+      }
+      setHistoryOpen(false);
+      closeMessage();
+      void ipcRenderer.invoke('orchestration:acknowledge', { runId: run.runId, tabId }).catch(() => {});
+    } catch (error) {
+      setActionError(current => ({ ...current,
+        [run.runId]: error instanceof Error ? error.message : String(error) }));
+    } finally {
+      openingLinkedRuns.current.delete(run.runId);
+      setOpeningLinkedRunIds(new Set(openingLinkedRuns.current));
+    }
   }, [tabId, closeMessage]);
 
   const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume') => {
@@ -433,15 +457,17 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
       && run.runKind !== 'external-research'
       && !isOrchestrationResultProofPending(run)) {
       const cancellingSourceHandoff = canCancelPendingSourceHandoff(run, tabId);
-      const cancellationTabId = cancellingSourceHandoff ? run.sourceTabId : run.targetTabId;
-      const cancellationHandoffId = cancellingSourceHandoff
-        ? (run.notificationHandoffId || `orchestration-complete:${run.runId}`)
-        : `orchestration:${run.runId}`;
-      const sendCancellation = await ipcRenderer.invoke('agent:cancel-send', {
-        tabId: cancellationTabId,
-        handoffId: cancellationHandoffId,
-      }).catch(() => null);
-      cancelSendAccepted = sendCancellation?.cancelled === true;
+      if (run.runKind !== 'response-observation' || cancellingSourceHandoff) {
+        const cancellationTabId = cancellingSourceHandoff ? run.sourceTabId : run.targetTabId;
+        const cancellationHandoffId = cancellingSourceHandoff
+          ? (run.notificationHandoffId || `orchestration-complete:${run.runId}`)
+          : `orchestration:${run.runId}`;
+        const sendCancellation = await ipcRenderer.invoke('agent:cancel-send', {
+          tabId: cancellationTabId,
+          handoffId: cancellationHandoffId,
+        }).catch(() => null);
+        cancelSendAccepted = sendCancellation?.cancelled === true;
+      }
     }
     const result = await ipcRenderer.invoke('orchestration:action', {
       runId: run.runId,
@@ -563,12 +589,12 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           {run.status === 'waiting_recovery' && !paused && actionButton(
             run,
             'retry',
-            run.outcome === 'interrupted' ? 'Восстановить связь вручную' : 'Восстановить связь',
+            run.runKind === 'response-observation' ? 'Повторить проверку' : run.outcome === 'interrupted' ? 'Восстановить связь вручную' : 'Восстановить связь',
             <RotateCcw size={13} />,
             '#fbbf24',
           )}
           {run.status === 'waiting_recovery' && !paused && run.outcome === 'interrupted' && run.recoveryDeadlineAt && actionButton(run, 'wait', 'Продолжить ожидание без таймера', <TimerOff size={13} />, '#fbbf24')}
-          {run.status === 'waiting_recovery' && !paused && actionButton(run, 'report', 'Передать ошибку родителю', <Send size={13} />, '#f87171')}
+          {run.status === 'waiting_recovery' && !paused && run.runKind !== 'response-observation' && actionButton(run, 'report', 'Передать ошибку родителю', <Send size={13} />, '#f87171')}
           {run.status === 'waiting_recovery' && actionButton(run, paused ? 'detach' : 'dismiss', paused ? 'Отвязать запрос' : 'Закрыть без сообщения', <X size={13} />, '#a3a3a3')}
           {canDismissAttention && actionButton(run, 'dismiss-attention', 'Закрыть уведомление об ошибке', <X size={13} />, '#a3a3a3')}
         </span>
@@ -609,7 +635,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         {historyEntries.map((entry) => {
           if (entry.kind === 'message') return <TabMessageRow key={entry.id} thread={entry.thread} tabId={tabId}
             history selected={selectedMessage?.messageId === entry.thread.question.messageId}
-            onOpen={openMessage} onDismiss={dismissMessage} error={messages.actionErrors[entry.thread.question.messageId]} />;
+            onOpen={openMessage} onDismiss={cancelMessage} error={messages.actionErrors[entry.thread.question.messageId]} />;
           const run = entry.run;
           const isSource = run.sourceTabId === tabId;
           const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
@@ -666,11 +692,13 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
                   <span />
                   <span style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
                     {renderTooltipActions(run, true)}
-                    {!(isSource && run.runKind === 'external-research') && (
-                      <button type="button" title="Открыть связанную вкладку" aria-label="Открыть связанную вкладку" onClick={() => void openLinkedTab(run)} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: '1px solid #333', borderRadius: 4, background: '#191919', color: '#aaa', cursor: 'pointer' }}>
+                      <button type="button"
+                        title={isSource && run.runKind === 'external-research' ? 'Открыть задачу в SC Desktop' : 'Открыть связанную вкладку'}
+                        aria-label={isSource && run.runKind === 'external-research' ? 'Открыть задачу в SC Desktop' : 'Открыть связанную вкладку'}
+                        aria-busy={openingLinkedRunIds.has(run.runId)}
+                        onClick={() => void openLinkedTab(run)} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: '1px solid #333', borderRadius: 4, background: '#191919', color: '#aaa', cursor: openingLinkedRunIds.has(run.runId) ? 'default' : 'pointer' }}>
                         {isSource ? <ArrowUpRight size={13} /> : <ArrowDownLeft size={13} />}
                       </button>
-                    )}
                   </span>
                   {actionError[run.runId] && <><span>Действие</span><span style={{ color: '#fca5a5' }}>{actionError[run.runId]}</span></>}
                 </div>
@@ -760,7 +788,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           border: '1px solid #444', borderRadius: 5, background: '#171717', boxSizing: 'border-box',
           boxShadow: '0 2px 10px rgba(0,0,0,0.22)',
           overflowY: 'auto', overflowX: 'hidden', pointerEvents: 'auto' }}>
-      <TabMessageTracker tabId={tabId} controller={messages} onOpen={openMessage} onDismiss={dismissMessage} selectedMessageId={selectedMessage?.messageId} now={visibilityNow} />
+      <TabMessageTracker tabId={tabId} controller={messages} onOpen={openMessage} onDismiss={cancelMessage} selectedMessageId={selectedMessage?.messageId} now={visibilityNow} />
       {statusRuns.length > 0 && (
         <div
           data-orchestration-active-list
@@ -813,26 +841,20 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
                         void runAction(run, canDetachResultProof || paused ? 'detach' : canDismissRecovery ? 'dismiss' : 'dismiss-attention');
                       }} style={requestRowActionStyle}><X size={13} /></button>
                   )}>
-                  {externalSourceRun ? (
-                    <div
-                      data-orchestration-external-target
-                      aria-label={`${linkedTabName || 'Browser research'} через SC Desktop`}
-                      style={{ ...requestRowLinkStyle, color: presentation.color, cursor: 'default' }}
-                    >
-                      {activeRunContent}
-                    </div>
-                  ) : (
                     <button
                       type="button"
+                      data-orchestration-external-target={externalSourceRun || undefined}
                       onClick={() => void openLinkedTab(run)}
-                      aria-label={`Открыть ${linkedTabName || 'связанную вкладку'}`}
+                      title={externalSourceRun ? 'Открыть задачу в SC Desktop' : 'Открыть связанную вкладку'}
+                      aria-label={externalSourceRun ? `Открыть задачу в SC Desktop: ${linkedTabName || 'Research'}` : `Открыть ${linkedTabName || 'связанную вкладку'}`}
+                      aria-busy={openingLinkedRunIds.has(run.runId)}
                       onMouseEnter={event => { event.currentTarget.style.background = '#303030'; }}
                       onMouseLeave={event => { event.currentTarget.style.background = 'transparent'; }}
-                      style={{ ...requestRowLinkStyle, color: presentation.color }}
+                      style={{ ...requestRowLinkStyle, color: presentation.color,
+                        cursor: openingLinkedRunIds.has(run.runId) ? 'default' : 'pointer' }}
                     >
                       {activeRunContent}
                     </button>
-                  )}
                 </RequestTrackerRow>
               </Tooltip>
             );

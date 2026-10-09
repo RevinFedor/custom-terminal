@@ -27,9 +27,11 @@ const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const { performance } = require('perf_hooks');
-const { execFile } = require('child_process');
 const { buildChildProcessEnv } = require('./child-process-env');
 const { createFlightRecorder } = require('./perf-flight-recorder');
+const { createCausalJournal } = require('./perf-causal-journal');
+const { createNativeStallSampler } = require('./perf-stall-sampler');
+const { captureNativeSnapshot } = require('./process-metrics-source');
 
 const MAIN_PID = parseInt(process.argv[2], 10) || 0;
 const LOG_PATH = process.argv[3] || '';
@@ -43,7 +45,6 @@ const THRESHOLDS = {
   main: { stallMs: 500 },
   renderer: { stallMs: 1500 },
 };
-const SAMPLE_BIN = '/usr/bin/sample';
 
 const bootAt = Date.now();
 let lastMainHeartbeatAt = performance.now();
@@ -68,20 +69,38 @@ function freezeSeverity(ms) {
   return 'minor';
 }
 
-const sampleSupported = process.platform === 'darwin' && fs.existsSync(SAMPLE_BIN);
-let sampleInFlight = false;
 let lameDuck = false;
 let mainContext = { appPids: [], tabs: [] };
 let mainContextAt = 0;
 let flight = null;
+let stallSampler = null;
+let stallSequence = 0;
+let causalJournal = null;
+let lastCausalHealthAt = 0;
+const causalSourceSequences = new Map();
+function nextCausalSourceSeq(pid) {
+  const next = (causalSourceSequences.get(pid) || 0) + 1;
+  causalSourceSequences.set(pid, next);
+  return next;
+}
+const watchdogAbs = () => performance.timeOrigin + performance.now();
 
 // procKey → heartbeat, visibility and connection ownership (not lifecycle state).
 const procs = new Map();
+function readProcessIdentity(pid) {
+  try {
+    const result = captureNativeSnapshot({ includeCommandLine: false });
+    if (!result.ok) return null;
+    const found = result.processes.find(row => row.pid === pid);
+    return found ? pid + ':' + found.startedAtTicks : null;
+  } catch { return null; }
+}
 
 function ensureProc(key, pid, label) {
   let p = procs.get(key);
   if (!p) {
-    p = { pid, label, lastHbAt: 0, lastOps: '', vis: 'visible', stalled: false };
+    p = { pid, label, lastHbAt: 0, lastOps: '', vis: 'visible', stalled: false,
+      processIdentity: readProcessIdentity(pid) };
     procs.set(key, p);
     wdLog('[Watchdog] tracking proc=' + label + ' pid=' + pid);
   }
@@ -92,8 +111,14 @@ function onHeartbeat(key, pid, label, payload) {
   const p = ensureProc(key, pid, label);
   const now = performance.now();
   if (p.stalled) {
+    stallSampler?.resumed({ stallId: p.stallId, pid: p.pid, processIdentity: p.processIdentity,
+      resumedWallMs: Date.now() });
     p.stalled = false;
+    p.nativeSampleDeferred = false;
     const silentMs = now - p.lastHbAt;
+    causalJournal?.record({ sourceBoot: bootId, sourceSeq: nextCausalSourceSeq(pid), emittedAbs: watchdogAbs(),
+      kind: 'resume', startAbs: p.stallStartedAbs, durationMs: silentMs,
+      reason: label + '-heartbeat-resumed' }, { pid, kind: label }, { critical: true });
     wdLog(
       '[Watchdog] RESUMED proc=' + label +
       ' pid=' + pid +
@@ -117,94 +142,69 @@ function onHeartbeat(key, pid, label, payload) {
     if (typeof payload.focused === 'boolean') p.focused = payload.focused;
     if (typeof payload.ops === 'string') p.lastOps = payload.ops.slice(0, 600);
     if (typeof payload.context === 'string') p.context = payload.context.slice(0, 800);
+    if (payload.causal && label === 'main') {
+      p.causal = payload.causal;
+      causalJournal?.reconcile(payload.causal, { pid, kind: label });
+    }
+    if (payload.diagnosticHealth && typeof payload.diagnosticHealth === 'object') p.diagnosticHealth = payload.diagnosticHealth;
   }
 }
 
-// Search hint only: this section includes waiting threads, and stripped
-// Electron symbols can be the nearest export with a megabyte-scale offset.
-// Neither the first line nor a symbol name proves the hot JS/C++ owner.
-function extractTopOfStack(text) {
-  const lines = text.split('\n');
-  const idx = lines.findIndex((l) => l.startsWith('Sort by top of stack'));
-  if (idx === -1) return '';
-  const picked = [];
-  for (let i = idx + 1; i < lines.length && picked.length < 4; i++) {
-    const l = lines[i].trim();
-    if (!l) { if (picked.length) break; continue; }
-    picked.push(l.replace(/\s+/g, ' ').slice(0, 180));
-  }
-  return picked.join(' || ');
-}
-
-function maybeSample(p, silentMs, id) {
-  if (!sampleSupported) {
-    wdLog('[Watchdog] SAMPLE-SKIP proc=' + p.label + ' pid=' + p.pid + ' reason=unsupported-platform');
-    return;
-  }
-  if (sampleInFlight) {
-    wdLog('[Watchdog] SAMPLE-SKIP proc=' + p.label + ' pid=' + p.pid + ' reason=sample-in-flight');
-    return;
-  }
-  sampleInFlight = true;
-  const out = flight.artifacts.file(id + '.sample.txt');
-  wdLog('[Watchdog] SAMPLING proc=' + p.label + ' pid=' + p.pid + ' silentMs=' + silentMs + ' file=' + out);
-  // 1 second at 1ms interval — short enough to land inside 1-2s stalls.
-  execFile(SAMPLE_BIN, [String(p.pid), '1', '1', '-file', out], {
-    timeout: 20000,
-    env: buildChildProcessEnv(),
-  }, (err) => {
-    sampleInFlight = false;
-    if (err) {
-      wdLog('[Watchdog] SAMPLE-FAILED proc=' + p.label + ' pid=' + p.pid + ' error=' + String(err.message || err).slice(0, 200));
-      return;
-    }
-    let top = '';
-    try {
-      top = extractTopOfStack(fs.readFileSync(out, 'utf8'));
-    } catch (e) {
-      top = 'parse-failed: ' + e.message;
-    }
-    wdLog('[Watchdog] SAMPLE-DONE proc=' + p.label + ' pid=' + p.pid + ' file=' + out + (top ? ' top="' + top + '"' : ''));
-    wdLog(
-      '[Perf:FreezeSummary] layer=watchdog' +
-      ' event=sample' +
-      ' kind=processSample' +
-      ' severity=major' +
-      ' proc=' + p.label +
-      ' pid=' + p.pid +
-      ' file=' + out +
-      (top ? ' top="' + top + '"' : '')
-    );
-  });
-}
 
 try {
   if (LOG_PATH) flight = createFlightRecorder({
     directory: path.join(path.dirname(LOG_PATH), 'perf-incidents'), mainPid: MAIN_PID, log: wdLog,
     context: () => ({ ...mainContext, contextAgeMs: mainContextAt ? Math.round(performance.now() - mainContextAt) : null,
+      causal: causalJournal?.snapshot() || null,
       observers: [...procs.values()].map(p => ({ pid: p.pid, label: p.label, focused: p.focused,
-        vis: p.vis, context: p.context, lastOps: p.lastOps, heartbeatAgeMs: Math.round(performance.now() - p.lastHbAt) })) }),
+        vis: p.vis, context: p.context, lastOps: p.lastOps, causal: p.causal,
+        diagnosticHealth: p.diagnosticHealth, heartbeatAgeMs: Math.round(performance.now() - p.lastHbAt) })) }),
     requestCapture: (request) => {
       // Main may be blocked: request/actual-start timestamps expose that gap.
       try { process.send?.({ t: 'capture', ...request }); } catch {}
-      const target = [...procs.values()].find(p => p.pid === request.pid) ||
-        [...procs.values()].find(p => p.label === 'renderer' && p.focused) || procs.get('main');
-      if (target) maybeSample(target, Math.round(performance.now() - target.lastHbAt), request.id);
+      // Live native stacks have their own bounded admission at the stall edge.
+      // Heavy quota affects only the CPU/trace request sent to Main above.
+    },
+  });
+  if (flight) causalJournal = createCausalJournal({ artifacts: flight.artifacts, now: watchdogAbs, log: wdLog });
+  if (flight) stallSampler = createNativeStallSampler({ artifacts: flight.artifacts, log: wdLog,
+    env: buildChildProcessEnv(), verifyTarget: metadata => {
+      const current = [...procs.values()].find(p => p.pid === metadata.pid && p.label === metadata.kind);
+      if (!current || !current.stalled || current.stallId !== metadata.stallId ||
+        (current.label === 'renderer' && (current.vis !== 'visible' || current.focused !== true))) return { state: 'unknown' };
+      const identity = readProcessIdentity(current.pid);
+      if (!identity) return { state: 'unknown' };
+      return { state: 'found', pid: current.pid, processIdentity: identity };
     },
   });
 } catch (err) { wdLog('[Perf:Incident] disabled error=' + String(err.message).slice(0, 160)); }
 
 let lastCheckAt = performance.now();
+function requestNativeStallSample(p, silentMs, stallMs) {
+  const observedWallMs = Date.now();
+  const decision = stallSampler?.request({ stallId: p.stallId, pid: p.pid, processIdentity: p.processIdentity,
+    kind: p.label, state: 'stalled', stalledMs: silentMs,
+    stallStartedWallMs: observedWallMs - silentMs, observedWallMs,
+    focused: p.focused, thresholdMs: stallMs });
+  p.nativeSampleDeferred = decision?.reason === 'native-reserved-for-critical-stall';
+}
+
 setInterval(() => {
   if (lameDuck) return;
   const now = performance.now();
   const observerGap = now - lastCheckAt;
   lastCheckAt = now;
+  causalJournal?.flush();
+  if (causalJournal && now - lastCausalHealthAt >= 30000) {
+    lastCausalHealthAt = now;
+    const { counts, limits, queued, flushLagMs } = causalJournal.snapshot();
+    wdLog('[Perf:CausalHealth] ' + JSON.stringify({ counts, limits, queued, flushLagMs }));
+  }
   // If the observer itself was descheduled/asleep, silence cannot prove that
   // every observed process froze independently. Re-arm on fresh heartbeats.
   if (observerGap > 2000) {
     wdLog('[Watchdog] observer-gap ms=' + observerGap.toFixed(1) + ' coverage=unknown');
-    for (const p of procs.values()) { p.lastHbAt = 0; p.stalled = false; }
+    for (const p of procs.values()) { p.lastHbAt = 0; p.stalled = false; p.nativeSampleDeferred = false; }
     return;
   }
   for (const p of procs.values()) {
@@ -214,12 +214,19 @@ setInterval(() => {
       // Hidden window: heartbeat interval is legitimately throttled — silence
       // here is not a freeze. Reset without a RESUMED log to avoid noise.
       p.stalled = false;
+      p.nativeSampleDeferred = false;
       continue;
     }
     const silentMs = now - p.lastHbAt;
     const stallMs = p.label === 'renderer' && p.focused ? 750 : thr.stallMs;
     if (!p.stalled && silentMs > stallMs) {
       p.stalled = true;
+      p.stallId = bootId + ':' + (++stallSequence);
+      p.stallStartedAbs = watchdogAbs() - silentMs;
+      causalJournal?.record({ sourceBoot: bootId, sourceSeq: nextCausalSourceSeq(p.pid), emittedAbs: watchdogAbs(),
+        kind: 'stall', startAbs: p.stallStartedAbs, durationMs: silentMs,
+        reason: p.label + '-heartbeat-silence' }, { pid: p.pid, kind: p.label }, { critical: true });
+      causalJournal?.flush(true);
       wdLog(
         '[Watchdog] STALL proc=' + p.label +
         ' pid=' + p.pid +
@@ -237,6 +244,11 @@ setInterval(() => {
         ' lastActiveOps=' + (p.lastOps || 'none')
       );
       flight?.incident('heartbeat-silence', { pid: p.pid, proc: p.label, durationMs: silentMs });
+      requestNativeStallSample(p, silentMs, stallMs);
+    } else if (p.stalled && p.nativeSampleDeferred && silentMs >= 1000) {
+      // Existing observer tick and same process/stall identity; no timer,
+      // quota reset, extra incident or sample after a fresh heartbeat.
+      requestNativeStallSample(p, silentMs, stallMs);
     }
   }
 }, CHECK_INTERVAL_MS);
@@ -244,6 +256,14 @@ setInterval(() => {
 // ── main heartbeat channel ──────────────────────────────────────────────────
 process.on('message', (m) => {
   if (!m || typeof m !== 'object') return;
+  if (m.t === 'causal') {
+    // Frequent minor-GC records must not consume the evidence allowance for a
+    // real Main freeze. Use the existing bounded critical lane, not more IO.
+    const critical = m.record?.kind === 'main-gap' && Number.isFinite(m.record.durationMs)
+      && m.record.durationMs >= 500;
+    causalJournal?.record(m.record, { pid: MAIN_PID, kind: 'main' }, { critical });
+    return;
+  }
   if (m.t === 'bye') {
     lameDuck = true;
     wdLog('[Watchdog] bye received — lame duck (no alarms during shutdown)');
@@ -255,7 +275,11 @@ process.on('message', (m) => {
       mainContext = { appPids: m.context.appPids.slice(0, 64), tabs: m.context.tabs.slice(0, 1024) };
       mainContextAt = performance.now();
     }
+    const first = !procs.has('main');
     onHeartbeat('main', MAIN_PID, 'main', m);
+    if (first) {
+      try { process.send?.({ t: 'watchdog-observed', proc: 'main', pid: MAIN_PID, schema: 2 }); } catch {}
+    }
   }
 });
 process.on('disconnect', () => {
@@ -266,6 +290,8 @@ process.on('SIGTERM', () => cleanupAndExit(0));
 process.on('SIGINT', () => cleanupAndExit(0));
 
 function cleanupAndExit(code) {
+  try { stallSampler?.stop(); } catch {}
+  try { causalJournal?.flush(true); } catch {}
   try { flight?.stop(); } catch {}
   try { if (SOCKET_PATH) fs.unlinkSync(SOCKET_PATH); } catch {}
   process.exit(code);
@@ -288,10 +314,16 @@ if (SOCKET_PATH) {
         let m;
         try { m = JSON.parse(line); } catch { continue; }
         if (!m || m.proc !== 'renderer' || !Number.isInteger(m.pid) || m.pid <= 0) continue;
+        // Heartbeats and incidents share the renderer sequence. Observe both,
+        // including filtered incidents, without persisting every heartbeat.
+        if (m.t === 'hb' || m.t === 'incident') causalJournal?.observeSequence(m, { pid: m.pid, kind: 'renderer' });
         if (m.t === 'incident') {
           const owner = procs.get('renderer-' + m.pid);
           const kind = String(m.kind || '').slice(0, 64);
           if (owner?.vis === 'visible' && Number.isFinite(m.durationMs) && m.durationMs >= (kind.startsWith('ui-') ? 120 : 250)) {
+            causalJournal?.record({ ...m, kind: 'ui-action', event: kind,
+              emittedAbs: Number.isFinite(m.emittedAbs) ? m.emittedAbs : watchdogAbs(),
+              sourceBoot: m.sourceBoot || 'legacy-renderer-' + m.pid }, { pid: m.pid, kind: 'renderer' });
             flight?.incident(kind, { pid: m.pid, startAbs: m.startAbs, durationMs: m.durationMs,
               actionId: /^ui-[a-z0-9-]{1,80}$/.test(m.actionId || '') ? m.actionId : undefined });
           }
@@ -331,7 +363,7 @@ setInterval(() => {
 
 wdLog(
   '[Watchdog] started mainPid=' + MAIN_PID +
-  ' sampleSupported=' + (sampleSupported ? '1' : '0') +
+  ' sampleSupported=' + (process.platform === 'darwin' && fs.existsSync('/usr/bin/sample') ? '1' : '0') +
   ' thresholds=main:500,renderer:750-focused/1500-background,ui:120 capture=4-per-rolling-day/background-max2' +
   ' log=' + LOG_PATH
 );

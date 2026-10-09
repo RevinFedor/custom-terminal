@@ -9,7 +9,8 @@ const source = fs.readFileSync(new URL('../hooks/usePromptQueueRunner.ts', impor
 const tree = ts.createSourceFile('runner.ts', source, ts.ScriptTarget.Latest, true);
 const names = ['getContinuationPrompt', 'continuationArmTimestamp', 'continuationTriggerTabId',
   'continuationAttemptIsCurrent', 'deferredOwnerAttemptIsCurrent', 'clearDeferredOwnerSend',
-  'clearDeferredOwnerAttempt', 'withPostPrompt', 'beginValidatedQueueSend', 'readPromptQueueSendAdmission'];
+  'clearDeferredOwnerAttempt', 'withPostPrompt', 'queuedActionExecutionKey', 'refreshQueueAttemptContext',
+  'beginValidatedQueueSend', 'readPromptQueueSendAdmission'];
 const code = ts.transpileModule(names.map(name => {
   const node = tree.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
   assert.ok(node, name); return node.getText(tree).replace(/^export /, '');
@@ -24,6 +25,7 @@ function harness() {
   const sends = [], cards = [], cancels = [], errors = [], subscribers = new Set();
   let pausedPrep, prepCount = 0, preparedBusy = true, status = 'inactive', hydrated = true, locked = false;
   const state = { getQueue: () => queue, setAutoRun: (_id, value) => { queue.autoRun = value; },
+    setPendingDelivery: (_id, value) => { queue.pendingDelivery = value; return true; },
     commitSentPrompt: () => { queue.items.shift(); return { removed: true, beforeCount: 1 }; } };
   const context = vm.createContext({ AbortController, console: { log() {}, warn() {}, error: (...args) => errors.push(args) },
     usePromptQueueStore: { getState: () => state, subscribe: fn => { subscribers.add(fn); return () => subscribers.delete(fn); } },
@@ -32,11 +34,13 @@ function harness() {
     queueReadinessWakePending: new Map(), queueEditorBlockedOwners: new Set(), queueSendAttemptSequence: 0,
     isTabWorkflowBlocked: id => busy.has(id), isPromptQueueEditorLocked: () => locked,
     isQueuedPromptEnabled: item => item.enabled !== false, getEffectiveQueueTrigger: () => 'T',
+    persistPromptQueueDeliveryPointer: async () => {}, reconcilePromptQueuePendingDelivery: async () => false,
+    queueSendOutcome: result => result.submitted === false ? 'not-submitted' : 'unknown',
     queuedPromptContextConditionKey: () => '', queueItemTriggerCanFire: () => true,
     dictationBlocksSend: () => false, readQueueOwnerReadiness: async () => ({ ready: status === 'active', status, inputReady: status === 'active', reason: 'fixture' }),
     getPromptQueueAgent: () => 'codex', getHistoryAgentRuntime: () => ({ toolType: 'codex' }),
     getAgentSendProviderContract: () => ({}), getPromptQueueSessionId: () => 'S', getTabCwd: () => '/private-fixture',
-    subscribePromptQueueEditorLocks: () => () => {}, signalContinuationRelease() {},
+    subscribePromptQueueEditorLocks: () => () => {}, signalContinuationRelease() {}, notifyPromptQueueRuntime() {},
     prepareAgentRuntimeForSend: async ({ admissionSignal }) => {
       prepCount++;
       if (pausedPrep) await pausedPrep;

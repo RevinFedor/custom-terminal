@@ -54,6 +54,30 @@ try {
   s=await snapshot();assert.equal(s.rows.find(row=>row.id==='reserve-tab:B').parent,'reserve-tab:Q');await end();
   assert.equal((await committed()).length,1);result.checks.push('single-X still reparents in painted preview');
 
+  await reset({file:true,selected:['child']});const fileSource=await pickup('child');
+  await page.mouse.move(fileSource.x-65,fileSource.y);await frames();s=await snapshot();
+  assert.equal(s.rows.find(row=>row.id==='reserve-tab:child').parent,'root');await end();
+  assert.equal((await committed())[0].request.tabs.find(tab=>tab.tabId==='child').visualParentTabId,null);
+  result.checks.push('linked file X-outdent uses ordinary visual hierarchy, preview matches committed parent');
+  await reset({physical:true,selected:['child']});const physicalSource=await pickup('child');
+  await page.mouse.move(physicalSource.x-65,physicalSource.y);await frames();
+  assert.equal(await page.locator('[data-outline-tab-feedback-blocked="true"]').count(),1);
+  await page.keyboard.press('Escape');await page.mouse.up();await frames();assert.equal((await committed()).length,0);
+  result.checks.push('physical AI child keeps execution parent and blocked feedback');
+
+  await reset({selected:['B']});await pickup('B');await page.mouse.move(480,210,{steps:12});await frames();
+  s=await snapshot();assert.equal(s.pane.target?.zone,'body');await end();commits=await committed();
+  assert.equal(commits.length,1);assert.equal(commits[0].request.destinationKind,'window');
+  assert.deepEqual(commits[0].request.paneRootTabIds,['B']);
+  result.checks.push('reserve to window body needs no Cmd; one painted canonical placement command');
+
+  await reset();await pickup('B');await page.locator('[data-space-chip="w2"]').hover();
+  await page.waitForFunction(()=>window.fixture.store.getState().activeSpaceId==='w2');
+  await page.mouse.move(120,250,{steps:6});await frames();await end();commits=await committed();
+  assert.equal(commits.length,1);assert.equal(commits[0].request.targetWorkflowId,'w2');
+  assert.deepEqual(commits[0].request.sourceRootTabIds,['A','B']);
+  result.checks.push('ordinary reserve drag navigates workflow without modifier and keeps frozen roots');
+
   await reset();await pickup('B');await page.keyboard.down('Meta');await page.locator('[data-space-chip="w2"]').hover();
   await page.waitForFunction(()=>window.fixture.store.getState().activeSpaceId==='w2');await page.mouse.move(120,220);await frames();
   await page.keyboard.up('Meta');await frames();s=await snapshot();assert.equal(s.pointer.source.workflowDrag.sourceWorkflowId,'w1');await end();

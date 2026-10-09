@@ -1,15 +1,14 @@
-// Wrapped tab chips in a window header. All places stay visible; the first
-// chip and project icon are one inline box. DnD owns only the preview/order.
+// Wrapped tab chips in a workflow window. Execution namespaces remain routing
+// metadata; they do not add directory badges or extra spacing to the strip.
 
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
 import { groupStripByProject, paneStripRenderItems } from '../../utils/paneStripLayout.mjs';
 import PaneTabChip from './PaneTabChip';
 import PaneChooserChip from './PaneChooserChip';
+import { TAB_STRIP_ROW_GAP } from '../../utils/tabCardVisual.mjs';
 import { moveEntriesToIndex } from '../../utils/horizontalReorder.mjs';
 import {
   beginPaneTabDrag,
@@ -33,51 +32,6 @@ import {
 import NewTabMenuRows from './NewTabMenuRows';
 
 export interface StripEntry { projectId: string; tabId: string }
-
-/** The project icon that labels a RUN of chips. Inert — it is a label. */
-function StripProjectIcon({ projectId }: { projectId: string }) {
-  const meta = useProjectsStore((s) => s.projects[projectId]);
-  const path = useWorkspaceStore((s) => s.openProjects.get(projectId)?.projectPath || '');
-  const name = meta?.name
-    || (isInboxProjectId(projectId) ? INBOX_PROJECT_NAME : null)
-    || path.split('/').filter(Boolean).pop()
-    || 'Project';
-  return (
-    <span
-      data-strip-project-icon={projectId}
-      title={name + (path ? `\n${path}` : '')}
-      // Иконка — подпись группы чипов, а не пустое место полосы: двойной клик по
-      // ней означал бы «ещё одну вкладку сюда», хотя человек целился в метку.
-      onDoubleClick={(e) => e.stopPropagation()}
-      style={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0 }}
-    >
-      {meta?.icon ? (
-        <img
-          data-project-icon={projectId}
-          src={meta.icon}
-          alt=""
-          draggable={false}
-          style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0 }}
-        />
-      ) : (
-        // No icon set (or Inbox): the same dashed placeholder square as the
-        // titlebar card, so the header never reads as "icon failed to load"
-        // and the chip's left edge does not shift between projects.
-        <span
-          aria-hidden
-          style={{
-            width: 12,
-            height: 12,
-            borderRadius: 2,
-            flexShrink: 0,
-            border: '1px dashed rgba(148,163,184,0.8)',
-            background: 'rgba(148,163,184,0.08)',
-          }}
-        />
-      )}
-    </span>
-  );
-}
 
 export interface PaneTabStripProps {
   entries: StripEntry[];
@@ -157,7 +111,7 @@ export default function PaneTabStrip({
   const indexOfTab = new Map(previewEntries.map((entry, i) => [entry.tabId, i]));
 
   // Empty header space is a real target too. Chip targets own their own exact
-  // edge; this parent handles project icons/gaps/trailing space and computes
+  // edge; this parent handles gaps/trailing space and computes
   // the same insertion index from committed chip rectangles.
   useEffect(() => {
     const element = stripRootRef.current;
@@ -318,7 +272,7 @@ export default function PaneTabStrip({
       // Открытие меню НЕ двигает фокус (см. onPointerDown ниже): рассматривать
       // окно — не то же, что перейти в него; фокусируется уже результат.
       onContextMenu={(e) => {
-        if ((e.target as HTMLElement | null)?.closest?.('[data-strip-item], [data-pane-chooser-chip], [data-strip-project-icon], button')) return;
+        if ((e.target as HTMLElement | null)?.closest?.('[data-strip-item], [data-pane-chooser-chip], button')) return;
         e.preventDefault();
         e.stopPropagation();
         setNewTabMenu({
@@ -363,7 +317,7 @@ export default function PaneTabStrip({
           <React.Fragment key={`chooser:${item.slotId}`}>
             {/* The chooser compensates its border with -1px margins. Keep its
                 physical top/bottom aligned with the adjacent full cards. */}
-            <span style={{ display: 'inline-flex', verticalAlign: 'top', padding: '1px 0', marginBottom: 6, wordSpacing: 'normal' }}>
+            <span style={{ display: 'inline-flex', verticalAlign: 'top', padding: '1px 0', marginBottom: TAB_STRIP_ROW_GAP, wordSpacing: 'normal' }}>
               <PaneChooserChip
                 slotId={item.slotId}
                 paneIndex={paneIndex}
@@ -380,16 +334,10 @@ export default function PaneTabStrip({
                   data-strip-item
                   data-strip-tab-id={tabId}
                   data-strip-project-start={tabIndex === 0 ? item.projectId : undefined}
-                  // The project label and its first tab are one inline box, so
-                  // wrapping cannot strand the icon on the preceding line.
-                  // Tight inner spacing and a wider run boundary make the icon
-                  // read as a prefix of the tabs to its right.
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 3,
-                    verticalAlign: 'top', marginBottom: 6, wordSpacing: 'normal',
-                    marginLeft: tabIndex === 0 && itemIndex > 0 ? 4 : undefined,
+                  style={{ display: 'inline-flex', alignItems: 'center',
+                    verticalAlign: 'top', marginBottom: TAB_STRIP_ROW_GAP, wordSpacing: 'normal',
                     flexShrink: 0, minWidth: 0 }}
                 >
-                  {tabIndex === 0 && <StripProjectIcon projectId={item.projectId} />}
                   <PaneTabChip
                     projectId={item.projectId}
                     tabId={tabId}

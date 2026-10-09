@@ -40,7 +40,7 @@ function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
   const term = { write(data) {
     writes.push(data);
     if (data === '\x01\x0b' && synchronousClear) frame('');
-    const slash = data.match(/\x1b\[200~(\/model|\/fast)\x1b\[201~/)?.[1];
+    const slash = data.match(/\x1b\[200~(\/model|\/fast|\/compact)\x1b\[201~/)?.[1];
     if (!frameTimedOut && slash) frame(slash);
   } };
   const ctx = vm.createContext({ ...picker, codexNativeDraftTransfer, observeAgentInput,
@@ -114,6 +114,33 @@ test('actual timeout retains its insertion; a late exact frame clears only /mode
   assert.equal(h.ctx.getCodexLiveInputControl('T'), null);
   assert.equal(h.wakes.length, 1, 'the existing intent owner wakes once, not the failed picker');
   assert.equal(h.mirror.synchronizedFrameWaiters.size, 0);
+});
+
+test('/compact uses committed owner frames, not a separate raw-output delta; timeout retains exact bytes and reports paste truth', async () => {
+  const h = harness();
+  const result = await h.expire('/compact');
+  assert.equal(result.submitted, false); assert.equal(result.pasteWritten, true); assert.equal(result.enterWritten, false);
+  assert.equal(result.slashRollback.serviceInputPending, true); assert.equal(h.receipt.command, '/compact');
+  h.frame('/compact'); await tick(); await tick();
+  assert.deepEqual(h.writes, ['\x01\x0b\x1b[200~/compact\x1b[201~', '\x01\x0b']);
+  assert.equal(h.receipt, null); assert.equal(h.wakes.length, 0); assert.equal(h.fastWakes.length, 0);
+});
+
+test('/compact committed frame can submit when raw-delta collector never responds; receipt ends before first Enter', async () => {
+  const h = harness({ frameTimedOut: false });
+  h.ctx.captureCodexFrame = () => assert.fail('must use shared committed headless observation');
+  let causalSubmit = 0;
+  h.ctx.submitCodexCompactSlashCommandWithProof = async args => {
+    assert.equal(h.receipt.command, '/compact'); args.beforeEnter();
+    assert.equal(h.receipt, null); h.term.write('\r'); causalSubmit++;
+    return { success: true, submitted: true, compactStartConfirmed: true };
+  };
+  const result = await h.ctx.withPtyWriteLock(h.term, () => h.ctx.sendCodexSlashCommand(h.term, '/compact', '[test]', {
+    tabId: 'T', compactOperationId: 'C', readDraftState: async () => ({ success: true, hasDraft: false }),
+  }));
+  assert.equal(result.submitted, true); assert.equal(result.pasteWritten, true); assert.equal(result.enterWritten, true);
+  assert.equal(causalSubmit, 1); assert.equal(h.writes.filter(x => x === '\r').length, 1);
+  h.frame('/compact'); await tick(); assert.equal(h.writes.length, 2, 'late frame cannot clear/resend');
 });
 
 test('production /fast timeout cannot release a stale empty composer to the next History Send', async () => {

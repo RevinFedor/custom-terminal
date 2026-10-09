@@ -28,7 +28,7 @@ function harness() {
 test('actual MCP target handler forwards exact tab and legacy hints without deciding placement', async () => {
   const h = harness();
   h.state.spaces = [{ id: 'other-space', layout: { splitPanes: [{ projectId: 'target', tabId: 'T' }] } }];
-  await h.focus({ tabId: 'T', targetProjectId: 'stale', targetCwd: '/stale' });
+  assert.equal(await h.focus({ tabId: 'T', targetProjectId: 'stale', targetCwd: '/stale' }),true);
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0].kind, 'open-tab');
   assert.equal(h.calls[0].tabId, 'T');
@@ -44,7 +44,7 @@ test('actual MCP target handler waits for root outcome without navigating a fall
   h.state.openTabById = () => new Promise(done => { resolve = done; });
   let finished = false;
   const opening = h.focus({ tabId: 'missing', targetProjectId: 'target', targetCwd: '/target' })
-    .then(() => { finished = true; });
+    .then(opened => { assert.equal(opened,false); finished = true; });
   await Promise.resolve();
   assert.equal(finished, false);
   resolve(false);

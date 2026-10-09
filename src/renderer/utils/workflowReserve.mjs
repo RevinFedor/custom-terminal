@@ -1,9 +1,9 @@
-import { selectWorkflowGlobalGroups, workflowGroupDisplayName } from './workflowGlobalGroups.mjs';
+import {selectWorkflowMembers,workflowMemberOutline,workflowGroupKey} from '../../shared/workflow-tree.cjs';
+export {workflowGroupKey};
 // Organization only. Legacy namespaces address cards/actions, never membership.
 const entries = value => value instanceof Map ? [...value] : Object.entries(value || {});
 const list = value => Array.isArray(value) ? value : [];
 const idOf = value => typeof value === 'string' ? value : value?.tabId;
-export const workflowGroupKey = (projectId, groupId) => JSON.stringify([projectId, groupId]);
 
 /** Current layout supersedes its stale saved projection; profiles still count.
  * Read only placement fields, never return history/detached tabs/chooser IDs.
@@ -47,14 +47,6 @@ export function workflowTabCatalog(state) {
 
 export function selectWorkflowReserve(state, workflowId = state.activeSpaceId, orderedTabIds = []) {
   const catalog = workflowTabCatalog(state), placed = workflowPlacedTabIds(state);
-  const rank = new Map(orderedTabIds.map((id, index) => [id, index]));
-  const members = [...catalog.values()].filter(owner => {
-    const tab = owner.tab;
-    return state.tabWorkflowMembership?.[owner.tabId]?.workflowId === workflowId
-      && owner.active && tab.archived !== true && tab.isArchived !== true && !tab.archivedAt && tab.deleted !== true;
-  });
-  if (rank.size) members.sort((a, b) => (rank.get(a.tabId) ?? Infinity) - (rank.get(b.tabId) ?? Infinity));
-  const reserve = members.filter(owner => !placed.has(owner.tabId));
   const groups = new Map();
   for (const [projectId, bucket] of entries(state.openProjects)) {
     for (const group of list(bucket?.tabGroups)) groups.set(workflowGroupKey(projectId, group.id), { ...group, projectId });
@@ -67,86 +59,14 @@ export function selectWorkflowReserve(state, workflowId = state.activeSpaceId, o
     files.push({ ...owner, path: file.filePath });
     filesByOwner.set(file.visualParentTabId, files);
   }
-  // Definitions remain global; only populated reserve group projections render.
-  const visibleGroups = new Map();
-  for (const owner of reserve) {
-    const key = workflowGroupKey(owner.projectId, owner.tab.groupId);
-    if (groups.has(key)) visibleGroups.set(key, groups.get(key));
-  }
-  const global = state.globalGroups && selectWorkflowGlobalGroups({publication:state.globalGroups,catalog,
-    membership:state.tabWorkflowMembership,workflowId,reserveTabIds:reserve.map(owner => owner.tabId),orderedTabIds});
-  if (global) {
-    groups.clear(); visibleGroups.clear();
-    for (const group of global.groups.values()) groups.set(workflowGroupKey('__tab_catalog_v2__',group.id),{...group,projectId:'__tab_catalog_v2__'});
-    for (const group of global.visibleGroups.values()) visibleGroups.set(workflowGroupKey('__tab_catalog_v2__',group.id),{...group,projectId:'__tab_catalog_v2__'});
-    const assignedGroups = new Set(global.tabGroups.values());
-    for (const group of global.groups.values()) if (group.reserveWorkflowId === workflowId && !assignedGroups.has(group.id))
-      visibleGroups.set(workflowGroupKey('__tab_catalog_v2__',group.id),{...group,projectId:'__tab_catalog_v2__'});
-  }
   const rootOrder=list(state.spaces).find(space=>space.id===workflowId)?.reserveRootOrder || [];
-  return { workflowId, catalog, members, reserve, placed, groups, visibleGroups, filesByOwner, globalTabGroups:global?.tabGroups,rootOrder };
+  const selection=selectWorkflowMembers({catalog,membership:state.tabWorkflowMembership,workflowId,orderedTabIds,
+    excludedTabIds:placed,legacyGroups:groups,globalGroups:state.globalGroups,rootOrder});
+  return {...selection,reserve:selection.items,placed,filesByOwner};
 }
 
-/** Stable node IDs survive reorder, partial groups and workflows. No cloning
- * or reparenting of the underlying catalog records occurs in this projection.
- */
 export function workflowReserveOutline(selection) {
-  const byId = new Map(selection.reserve.map(owner => [owner.tabId, owner]));
-  const parentOf = new Map();
-  const groupOf = owner => {
-    const globalId = selection.globalTabGroups?.get(owner.tabId);
-    const key = globalId ? workflowGroupKey('__tab_catalog_v2__',globalId) : workflowGroupKey(owner.projectId, owner.tab.groupId);
-    return selection.visibleGroups.has(key) ? key : null;
-  };
-  for (const owner of selection.reserve) {
-    const parentId = owner.tab.visualParentTabId || owner.tab.parentTabId;
-    const parent = byId.get(parentId);
-    if (!parent || parent === owner || groupOf(parent) !== groupOf(owner)) continue;
-    const visited = new Set([owner.tabId]);
-    let cursor = parentId, cyclic = false;
-    while (byId.has(cursor)) {
-      if (visited.has(cursor)) { cyclic = true; break; }
-      visited.add(cursor);
-      const tab = byId.get(cursor).tab;
-      cursor = tab.visualParentTabId || tab.parentTabId;
-    }
-    if (!cyclic) parentOf.set(owner.tabId, parentId);
-  }
-  const contextFor = owner => {
-    const parentId = owner.tab.visualParentTabId || owner.tab.parentTabId;
-    const parent = !parentOf.has(owner.tabId) && selection.catalog.get(parentId);
-    return parent ? { projectId: parent.projectId, tabId: parent.tabId, name: parent.tab.name || '' } : null;
-  };
-  const nodes = new Map(selection.reserve.map(owner => [owner.tabId, {
-    id: `reserve-tab:${owner.tabId}`, kind: 'tab', entityType: 'tab', label: owner.tab.name || '',
-    projectId: owner.projectId, tabId: owner.tabId, children: [], expanded: true,
-    contextParent: contextFor(owner),
-  }]));
-  const result = [], groupNodes = new Map();
-  for (const owner of selection.reserve) {
-    const node = nodes.get(owner.tabId), parent = nodes.get(parentOf.get(owner.tabId));
-    if (parent) { parent.children.push(node); continue; }
-    const key = groupOf(owner);
-    if (!key) { result.push(node); continue; }
-    if (!groupNodes.has(key)) {
-      const group = selection.visibleGroups.get(key);
-      const groupNode = { id: `reserve-group:${key}`, kind: 'group', entityType: 'group',
-        projectId: group.projectId, groupId: group.id, label: workflowGroupDisplayName(group),
-        collapsible: true, expanded: !group.collapsed, children: [] };
-      groupNodes.set(key, groupNode); result.push(groupNode);
-    }
-    groupNodes.get(key).children.push(node);
-  }
-  for (const [key, group] of selection.visibleGroups) if (!groupNodes.has(key)) result.push({
-    id: `reserve-group:${key}`, kind: 'group', entityType: 'group',
-    projectId: group.projectId, groupId: group.id, label: workflowGroupDisplayName(group),
-    collapsible: true, expanded: !group.collapsed, children: [],
-  });
-  if(selection.rootOrder?.length) {
-    const rank=new Map(selection.rootOrder.map((id,index)=>[id,index]));
-    result.sort((a,b)=>(rank.get(a.id) ?? Infinity)-(rank.get(b.id) ?? Infinity));
-  }
-  return result;
+  return workflowMemberOutline({...selection,items:selection.reserve});
 }
 
 export function reserveNodeEntries(node) {

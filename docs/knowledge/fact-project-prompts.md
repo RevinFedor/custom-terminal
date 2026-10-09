@@ -10,14 +10,19 @@ Source-child наследует точный набор; explicit empty binding 
 Удалённый/отсутствующий root не исчезает после неудачного scan. Future opaque
 scope копируется с исходной version, без молчаливого downgrade.
 
-Настройки каталогов и per-tab prompt picker заменяют EditProjectModal. Opt+V
+Workflow settings → Sources заменяет прежний редактор источников в prompt picker.
+Внутри явно выбирается target-вкладка; Save меняет только её bindings по прежним
+revision/CAS. Manage folders открывает тот же независимый registry, Add folder
+не связывает root автоматически со всеми вкладками workflow. Неизвестный ACK
+повторяется с тем же request, поздний read после смены target не перетирает выбор.
+Opt+V
 фиксирует исходную вкладку до await, использует тот же каталог и watchers;
 обычная Insert Prompt library остаётся отдельной. Legacy project endpoints и
 project usage labels в GT Editor сохраняют wire compatibility как provenance,
 а не новую organizational authority. Legacy описание ниже не означает возвращение
 обязательного Project для создания вкладки.
 
-## Модель данных
+## Legacy модель данных и совместимость
 
 Проект хранит не копии промптов, а упорядоченный список корневых директорий в
 SQLite-таблице `project_prompt_sources`. Каталог всегда производный от диска:
@@ -30,7 +35,7 @@ SQLite-таблице `project_prompt_sources`. Каталог всегда пр
 - обычные prompts/groups принадлежат Custom Terminal и управляются в Settings;
 - project prompts принадлежат рабочим репозиториям и следуют за файлами на диске.
 
-## Настройки проекта
+## Прежние настройки проекта
 
 Один `EditProjectModal` используется независимо от точки входа в настройки
 проекта. В секции «Промпты» root можно вставить абсолютным путём и подтвердить

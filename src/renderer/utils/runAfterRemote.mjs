@@ -259,7 +259,7 @@ export function createRunAfterRemote(ports) {
       case 'cancel':
         owner(a.tabId);
         if (typeof a.activityId !== 'string' || !a.activityId || auto().activities[a.tabId]?.handoffId !== a.activityId) throw error('run_after_activity_changed');
-        sideEffectStarted = true; result = { cancelled: ports.cancelAutoCompact(a.tabId) }; break;
+        sideEffectStarted = true; result = { cancelled: ports.cancelAutoCompact(a.tabId, a.activityId) }; break;
       case 'requestNow': {
         owner(a.tabId); const resume = a.resume === undefined ? false : bool(a.resume);
         sideEffectStarted = true; result = { outcome: await ports.requestAutoCompact(a.tabId, resume) }; break;

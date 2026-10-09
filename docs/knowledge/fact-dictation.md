@@ -139,6 +139,53 @@ Native-признак речи — `com.noted.voice-record.dictation`, резе�
 замена буфера, пробелы и CR/LF); запись item и совместимость со старым helper —
 voice-record `fact-native-helpers.md::Пометка речи и совместимость со старым cgpaste`.
 
+Для обычного xterm существует отдельная `dictationClipboardReceipt:1`:
+`dictationChipBegin` продолжает отвечать `accepted:false`, но возвращает точный
+tabId сфокусированной `.xterm-helper-textarea` из её terminal-layer host. Voice
+регистрирует requestId/PID/длину/SHA256 до native Paste; `terminal:input` подтверждает
+полный текст после существующего `term.write`, без нового Send и без вмешательства
+в lifecycle/queue/agent receipt. Сравнение сохраняет пробелы, нормализует только CR/LF
+и внешние xterm brackets. Квитанция принадлежит exact вкладке, повторное чтение
+идемпотентно; пустой/частичный ввод не означает успех. HTTP-регистрация/ожидание
+ограничены, release снимает незавершённое ожидание; тексты в receipt не хранятся.
+
+После capture Voice может запросить один scoped Return через прежний
+`handleTerminalInput`. Вкладка/weakwriter принадлежат captured receipt, не текущему
+фокусу ОС; новый writer после restart не принимает старый Return. `enterWritten`
+подтверждает прежнюю границу записи ввода, не provider acceptance. У потерянного
+ответа повтор читает originalreceipt; новый Enter автоматически не выполняется.
+
+Version2 добавляет обычные HTML input/textarea без отдельного списка компонентов.
+Гейт выдаёт exact-element token; native question textarea несёт семантический
+owner-key targetId/questionKey. До Paste renderer регистрирует ожидание через
+main IPC; capture принимается только от того же webContents/элемента/requestId.
+Наблюдение clipboard event проверяет полный текст, затем native/React value после
+редактирования. Совпадение только события без результата в поле не считается commit.
+Mismatch блокируется до default paste. Поле не заменяется textarea другой карточки;
+переход на следующий вопрос отзывает прежнюю принадлежность даже при том же DOM node.
+Native Enter направлен в прежний webContents, renderer проверяет поле, владельца,
+неизменённый после capture draft и пару keydown/keyup. Это обычный Enter поля, не
+новый control-native-question(answer) и не альтернативный provider Send.
+Pre-dispatch Cancel снимает listener lease; намеренный ручной Cmd+V после unknown
+может восстановить сохранённый текст без второго автоматического Paste.
+
+Причинаv2 — incident09.10 наtab367: live user04:52:47 содержал952chars прежнего
+clipboard вместо208chars речи, исправление user04:55:02 восстановило речь. Вv1
+`other-input-focused TEXTAREA xterm=false` обходил receipt. Сам installed909/f52
+был актуален: это не задача повторно установить прежний пакет. Rich contenteditable
+вне History сохраняет прежний путь; v2 не должен объявляться proof всех редакторов.
+
+Причина — инцидент08.10: буфер вернулся к изображению с пустым text за75мс до
+`terminal:input` с одними brackets. Native menu success был принят за доставку.
+Private Electron воспроизвёл гонку500мс restore против1000мс renderer; handshake
+прошёл при1000/1700мс.
+09.10 этот же путь вставил146символов прежнего текста вместо807символов речи:
+NT уже поддерживалreceipt1, но установленныйVoiceEEF ещё не запрашивал его.
+Capability получателя не доказывает включённость защиты у отправителя. Это proof потребления текста NT, не подтверждение отправки
+агенту. SDK/search/старый NT сохраняют свой clipboard-протокол; неизвестный исход
+не разрешает автоматический повтор Paste. Текущая установка и ограничения — Voice
+`docs/tmp/языковые-панели-и-словарь.md`.
+
 ## Диктовка Voice Record как чип в композере (dictation chips)
 
 Frontmost-proof принадлежит Voice Record и должен быть живым: совпадение PID с

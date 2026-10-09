@@ -12,7 +12,16 @@ const { collectSystemPressure, pressureDelta } = require('./perf-system-pressure
 const DAY = 86400000;
 const RETENTION_MS = 7 * DAY;
 const DISK_CAP = 256 * 1024 * 1024;
-const OWN_FILE = /^(?:cpu-\d{10}\.ndjson|incident-\d+-\d+(?:\.json|\.sample\.txt|\.main\.cpuprofile|\.cpuprofile|\.trace\.json|\.profile\.json|\.capture\.json|\.ui\.json))$/;
+const CAUSAL_RETENTION_MS = 2 * DAY;
+const CAUSAL_DISK_CAP = 64 * 1024 * 1024;
+// Preserve a bounded native-stack tier INSIDE the existing overall budget.
+// Otherwise old incident JSON can evict every new stack two minutes later.
+const NATIVE_SAMPLE_DISK_CAP = 64 * 1024 * 1024;
+const PAYLOAD_CAP = 4 * 1024 * 1024;
+const OWN_FILE = /^(?:(?:cpu|causal)-\d{10}\.ndjson|stall-\d+-\d+-\d+\.(?:sample\.txt|sample\.json|sample-capture\.json)|incident-\d+-\d+(?:\.json|\.sample\.txt|\.main\.cpuprofile|\.cpuprofile|\.trace\.json|\.profile\.json|\.capture\.json|\.ui\.json))$/;
+const NATIVE_RECEIPT = /^stall-(\d+)-\d+-\d+\.sample-capture\.json$/;
+const NATIVE_SAMPLE = /^stall-\d+-\d+-\d+\.sample\.txt$/;
+const HEAVY_RECEIPT = /^incident-\d+-\d+\.capture\.json$/;
 const round = (n) => Math.round(n * 10) / 10;
 const monoNow = () => performance.now();
 
@@ -115,7 +124,7 @@ function summarizeFrames(frames) {
       .map(({ sum, ms, peak, cpu, ...p }) => ({ ...p, observedMs: round(ms), meanCpu: round(sum / ms), peakCpu: peak })) };
 }
 
-function createArtifactStore(directory) {
+function createArtifactStore(directory, { log = () => {} } = {}) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const file = name => {
     if (!OWN_FILE.test(name)) throw new Error('invalid perf artifact name');
@@ -124,39 +133,115 @@ function createArtifactStore(directory) {
   const entries = () => fs.readdirSync(directory).filter(n => OWN_FILE.test(n)).flatMap(name => {
     try {
       const stat = fs.lstatSync(file(name));
-      return stat.isFile() && !stat.isSymbolicLink() ? [{ name, size: stat.size, at: stat.mtimeMs }] : [];
+      return stat.isFile() && !stat.isSymbolicLink()
+        ? [{ name, size: stat.size, at: stat.mtimeMs, dev: stat.dev, ino: stat.ino }] : [];
     } catch (err) { if (err.code === 'ENOENT') return []; throw err; }
   });
+  const read = (name, maxBytes = 16384) => {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > PAYLOAD_CAP) throw new Error('invalid perf read bound');
+    const fd = fs.openSync(file(name), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.size > maxBytes) throw new Error('invalid perf artifact read');
+      const buffer = Buffer.alloc(maxBytes + 1);
+      const size = fs.readSync(fd, buffer, 0, buffer.length, 0);
+      if (size > maxBytes) throw new Error('perf artifact grew beyond read bound');
+      return buffer.toString('utf8', 0, size);
+    } finally { fs.closeSync(fd); }
+  };
+  // Used by the sampler for a bounded stream. O_EXCL also rejects an existing
+  // symlink, and prevents a restart/sequence collision from replacing evidence.
+  const openExclusive = name => fs.openSync(file(name), fs.constants.O_CREAT | fs.constants.O_EXCL |
+    fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600);
+  const writeExclusive = (name, data) => {
+    const bytes = typeof data === 'string' ? data : JSON.stringify(data);
+    if (Buffer.byteLength(bytes) > 16384) throw new Error('perf receipt payload too large');
+    const fd = openExclusive(name);
+    try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    // File contents AND its new directory entry precede permission to spawn.
+    const directoryFd = fs.openSync(directory, fs.constants.O_RDONLY);
+    try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
+  };
   const write = (name, data, append = false) => {
     const bytes = typeof data === 'string' ? data : JSON.stringify(data);
-    if (Buffer.byteLength(bytes) > 4 * 1024 * 1024) throw new Error('perf artifact payload too large');
-    const fd = fs.openSync(file(name), (append ? fs.constants.O_APPEND : fs.constants.O_TRUNC) |
-      fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600);
-    try { fs.writeFileSync(fd, bytes); } finally { fs.closeSync(fd); }
+    const size = Buffer.byteLength(bytes);
+    if (size > PAYLOAD_CAP) throw new Error('perf artifact payload too large');
+    const causal = name.startsWith('causal-');
+    const fd = fs.openSync(file(name), (append ? fs.constants.O_APPEND : 0) |
+      fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.nlink !== 1) throw new Error('invalid perf artifact write');
+      // An active hour must not grow forever while exempt from age-based
+      // pruning. Parent records this explicit loss; never silently trim NDJSON.
+      if (causal && (append ? stat.size : 0) + size > PAYLOAD_CAP) throw new Error('causal artifact bucket full');
+      if (!append) fs.ftruncateSync(fd, 0);
+      fs.writeFileSync(fd, bytes);
+    } finally { fs.closeSync(fd); }
+    if (causal) prune();
   };
-  return { directory, file, write,
-    prune(now = Date.now()) {
+  function prune(now = Date.now()) {
       const all = entries().sort((a, b) => a.at - b.at);
       let bytes = all.reduce((sum, e) => sum + e.size, 0);
-      // Under disk pressure evict large profiles before the cheap historical
-      // CPU evidence the user may ask for days later. Quota receipts are tiny
-      // but must survive for their full day, otherwise eviction resets quota.
+      let causalBytes = all.filter(e => e.name.startsWith('causal-')).reduce((sum, e) => sum + e.size, 0);
+      let nativeSampleBytes = all.filter(e => NATIVE_SAMPLE.test(e.name)).reduce((sum, e) => sum + e.size, 0);
+      let removed = 0, removedNative = 0;
+      const nativeAt = e => Math.max(e.at, Number(NATIVE_RECEIPT.exec(e.name)?.[1]) || 0);
+      const expired = e => now - (NATIVE_RECEIPT.test(e.name) ? nativeAt(e) : e.at) >=
+        (NATIVE_RECEIPT.test(e.name) ? DAY : e.name.startsWith('causal-') ? CAUSAL_RETENTION_MS : RETENTION_MS);
+      // Heavy profiles remain lower-priority than historical CPU evidence.
+      // Independent native stacks have their own bounded tier; old metadata
+      // must make room instead of immediately destroying their diagnostic value.
       const ordered = [
-        ...all.filter(e => now - e.at > RETENTION_MS),
-        ...all.filter(e => now - e.at <= RETENTION_MS && /\.(?:cpuprofile|sample\.txt|trace\.json)$/.test(e.name)),
-        ...all.filter(e => now - e.at <= RETENTION_MS && !/\.(?:cpuprofile|sample\.txt|trace\.json)$/.test(e.name)),
+        ...all.filter(expired),
+        ...all.filter(e => !expired(e) && /\.(?:cpuprofile|sample\.txt|trace\.json)$/.test(e.name)),
+        ...all.filter(e => !expired(e) && !/\.(?:cpuprofile|sample\.txt|trace\.json)$/.test(e.name)),
       ];
       for (const e of ordered) {
-        // Never prune files still being captured (or the current hour bucket).
-        if (now - e.at < 120000) continue;
-        if (e.name.endsWith('.capture.json') && now - e.at < DAY) continue;
-        if (now - e.at <= RETENTION_MS && bytes <= DISK_CAP) continue;
-        fs.unlinkSync(file(e.name)); bytes -= e.size;
+        const causal = e.name.startsWith('causal-');
+        const nativeSample = NATIVE_SAMPLE.test(e.name);
+        // Native and heavy receipts are independent, small, and non-evictable
+        // during their quota window, even if their large artifacts are gone.
+        if (NATIVE_RECEIPT.test(e.name) && !expired(e)) continue;
+        if (HEAVY_RECEIPT.test(e.name) && now - e.at < DAY) continue;
+        if (!causal && now - e.at < 120000) continue;
+        if (nativeSample && !expired(e) && nativeSampleBytes <= NATIVE_SAMPLE_DISK_CAP) continue;
+        if (!expired(e) && bytes <= DISK_CAP && !(causal && causalBytes > CAUSAL_DISK_CAP)
+          && !(nativeSample && nativeSampleBytes > NATIVE_SAMPLE_DISK_CAP)) continue;
+        try {
+          const current = fs.lstatSync(file(e.name));
+          if (!current.isFile() || current.isSymbolicLink() || current.ino !== e.ino || current.dev !== e.dev ||
+            current.mtimeMs !== e.at || current.size !== e.size) continue;
+          fs.unlinkSync(file(e.name)); bytes -= e.size;
+          removed++;
+          if (causal) causalBytes -= e.size;
+          if (nativeSample) {
+            nativeSampleBytes -= e.size; removedNative++;
+            // Capture completion and later retention are separate facts.
+            // Keep the quota receipt untouched, and explain a removed payload.
+            try {
+              const metadataName = e.name.replace(/\.txt$/, '.json');
+              const metadata = JSON.parse(read(metadataName));
+              if (metadata?.id + '.sample.txt' === e.name && metadata.output?.file === e.name) {
+                const before = fs.statSync(file(metadataName)).size;
+                metadata.output.retained = false;
+                metadata.output.removedAt = now;
+                metadata.output.removalReason = expired(e) ? 'retention-expired' : 'native-sample-budget';
+                write(metadataName, metadata);
+                bytes += fs.statSync(file(metadataName)).size - before;
+              }
+            } catch { /* A missing/unreadable metadata file cannot block pruning. */ }
+          }
+        } catch (err) { if (err.code !== 'ENOENT') throw err; }
       }
-    },
+      if (removed) try { log('[Perf:ArtifactPrune] removed=' + removed + ' native=' + removedNative
+        + ' bytes=' + bytes + ' nativeBytes=' + nativeSampleBytes + ' causalBytes=' + causalBytes); } catch {}
+      return { bytes, causalBytes, nativeSampleBytes };
+  }
+  return { directory, file, write, entries, read, openExclusive, writeExclusive, prune,
     reserveCaptureDetails(id, now = Date.now(), kind = 'unknown', detail = {}) {
-      const recent = entries().filter(e => e.name.endsWith('.capture.json') && now - e.at < DAY).map(e => {
-        try { return { ...e, group: JSON.parse(fs.readFileSync(file(e.name), 'utf8')).group }; }
+      const recent = entries().filter(e => HEAVY_RECEIPT.test(e.name) && now - e.at < DAY).map(e => {
+        try { return { ...e, group: JSON.parse(read(e.name)).group }; }
         catch { return e; } // Legacy/unreadable receipt still consumes its slot.
       });
       const decision = captureDecision(recent, now, kind, detail);
@@ -171,7 +256,7 @@ function createArtifactStore(directory) {
 
 function createFlightRecorder({ directory, mainPid, log, requestCapture, context, snapshot = captureNativeSnapshot,
   pressure = collectSystemPressure }) {
-  const artifacts = createArtifactStore(directory);
+  const artifacts = createArtifactStore(directory, { log });
   artifacts.prune();
   let previous = null, previousCpus = null, previousAt = monoNow();
   const startedAt = previousAt;

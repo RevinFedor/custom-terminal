@@ -34,7 +34,7 @@ export function TabMessageRow({ thread, tabId, onOpen, onDismiss, error, history
   return <div data-tab-message-row={question.messageId} data-tab-message-history-row={history ? question.messageId : undefined}
     style={{ minWidth: 0, height: 48, flexShrink: 0, borderBottom: '1px solid #303030', boxSizing: 'border-box' }}>
     <RequestTrackerRow actions={onDismiss && !tabMessageDismissed(question, tabId) && <button type="button" data-tab-message-dismiss={question.messageId}
-      aria-label="Скрыть карточку переписки" title={error || 'Скрыть карточку; переписка останется в History'}
+      aria-label="Отменить переписку" title={error || 'Остановить дальнейшую доставку и ожидание ответа. Уже переданная часть может быть получена; History сохраняется.'}
       onClick={() => onDismiss(question.messageId)} style={{ ...requestRowActionStyle, color: error ? '#f87171' : '#999' }}>
       {error ? <CircleAlert size={13} /> : <X size={13} />}
     </button>}>

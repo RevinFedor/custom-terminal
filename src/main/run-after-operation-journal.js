@@ -17,17 +17,25 @@ class RunAfterOperationJournal {
     if (!db.prepare('PRAGMA table_info(run_after_operations)').all().some(column => column.name === 'execution_admitted_at')) {
       db.exec('ALTER TABLE run_after_operations ADD COLUMN execution_admitted_at INTEGER');
     }
+    if (!db.prepare('PRAGMA table_info(run_after_operations)').all().some(column => column.name === 'asset_owner_json')) {
+      db.exec('ALTER TABLE run_after_operations ADD COLUMN asset_owner_json TEXT');
+    }
     db.prepare("UPDATE run_after_operations SET phase='unknown', error='run_after_restart_unknown', updated_at=? WHERE phase='pending'").run(now());
   }
   record(operationId) { return this.db.prepare('SELECT * FROM run_after_operations WHERE operation_id=?').get(operationId) || null; }
   read(operationId, target) {
     const row = this.record(operationId);
     if (!row || target && row.target !== target) return null;
+    const saved = JSON.parse(row.request_json);
+    const lease = require('./replay-asset-ownership').assetLease(row, saved);
     return { version: 1, operationId: row.operation_id, target: row.target, phase: row.phase,
       committed: row.phase === 'applied', retryable: false, error: row.error,
       executionAdmittedAt: row.execution_admitted_at ?? null,
       result: row.result_json ? JSON.parse(row.result_json) : null,
-      createdAt: row.created_at, updatedAt: row.updated_at, released: row.released_at != null };
+      createdAt: row.created_at, updatedAt: row.updated_at, released: row.released_at != null,
+      ...(lease ? { assetLease: lease } : {}),
+      ...(['add', 'update'].includes(saved.request?.op) ? { assetOperationScope: {
+        mainEpoch: row.main_epoch, mainScopeKey: saved.scope?.scopeKey || null } } : {}) };
   }
   reserve(operationId, target, request, scope) {
     const hash = fingerprintAgentSendRequest({ target, request });
@@ -76,6 +84,7 @@ class RunAfterOperationJournal {
       const row = this.authorize(ticket), saved = JSON.parse(row.request_json);
       if (!rejected && row.execution_admitted_at == null && this.scopeCurrent && !this.scopeCurrent(row.target, saved.scope)) throw runAfterError('run_after_scope_changed');
       if (writes) this.commitState(writes, row);
+      if (!rejected && writes) require('./replay-asset-ownership').settleRunAfterItemAssetMutation(this.db, row, writes, this.now());
       this.db.prepare(`UPDATE run_after_operations SET phase=?,result_json=?,error=?,updated_at=?,
         assets_json=CASE WHEN ? THEN assets_json ELSE '[]' END WHERE operation_id=?`)
         .run(rejected ? 'rejected' : 'applied', result == null ? null : JSON.stringify(result), error,

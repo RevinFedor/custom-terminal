@@ -215,6 +215,12 @@ export function updateSpaceMetadata(spaces, id, updates) {
   const next = { ...current };
   let changed = false;
 
+  if (Object.prototype.hasOwnProperty.call(updates, 'defaultCwd')) {
+    const cwd=typeof updates.defaultCwd==='string' ? updates.defaultCwd.trim() : null;
+    if(cwd && !cwd.startsWith('/'))return null;
+    if((current.defaultCwd || null)!==(cwd || null)){next.defaultCwd=cwd || null;changed=true;}
+  }
+
   if (Object.prototype.hasOwnProperty.call(updates, 'icon')) {
     const icon = typeof updates.icon === 'string' ? updates.icon : null;
     if (current.icon !== icon) {

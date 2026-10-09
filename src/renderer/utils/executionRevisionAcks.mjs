@@ -1,6 +1,7 @@
 // A renderer-owned ACK can outlive the Tab object that submitted its snapshot.
-// Track only contiguous, exact writes; catalog reads/foreign revisions are not ACKs.
-export function createExecutionRevisionAcks() {
+// Track exact writes and Main's transactional proof of point-owned fields only;
+// catalog reads/foreign metadata revisions are not ACKs.
+export function createExecutionRevisionAcks({onReconciled=()=>{}} = {}) {
   const ranges=new Map();
   const key=(namespace,tab)=>{
     const scope=tab?.executionSubject,id=tab?.tabId || tab?.id;
@@ -57,10 +58,21 @@ export function createExecutionRevisionAcks() {
         if(!address || !Number.isSafeInteger(from))continue;
         const receipt=result.executionRevisions.find(entry=>entry.tabId===row.tabId && entry.subjectId===row.executionSubject.subjectId);
         const to=receipt?.revision;
-        if(!Number.isSafeInteger(to) || (to!==from && to!==from+1))continue;
+        if(!Number.isSafeInteger(to))continue;
+        let reconciliation=null;
+        if(to!==from && to!==from+1) {
+          const proof=Array.isArray(result.executionReconciliations) && result.executionReconciliations.find(entry=>entry?.version===1 && entry.kind==='main-owned-fields'
+            && entry.namespace===namespace && entry.tabId===row.tabId && entry.subjectId===row.executionSubject.subjectId
+            && entry.fromRevision===from && Number.isSafeInteger(entry.toRevision) && entry.toRevision>from
+            && entry.toRevision+1===to);
+          if(!proof)continue;
+          reconciliation=proof;
+        }
         const old=ranges.get(address);
         if(!old || to>old.to)ranges.set(address,{from:old && old.to===from ? old.from : from,to});
         for(const tab of targets(row.tabId) || [])advance(namespace,tab);
+        if(reconciliation && (!old || to>old.to))onReconciled({namespace,tabId:row.tabId,from,to,
+          proofThrough:reconciliation.toRevision,fields:reconciliation.fields || []});
       }
     },
     canHydrate(namespace,current,saved,pending) {

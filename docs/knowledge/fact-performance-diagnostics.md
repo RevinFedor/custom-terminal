@@ -64,7 +64,7 @@ memory pressure; page-in не называется swap-in, накопленно
 активное20с окно объединяет новые события и считает неуместившиеся. Обычные
 CPU/native/UI-измерения продолжаются между пакетами.
 
-Не более четырёх раз за скользящие сутки запускается native sample и короткий
+Не более четырёх раз за скользящие сутки запускается тяжёлый
 10-секундный профиль main/renderer JS плюс browser trace. Из четырёх слотов
 фоновой sustained-CPU нагрузке доступны максимум два; два остаются для
 responsiveness. Cooldown10минут считается по этой группе. Все причины
@@ -72,8 +72,9 @@ responsiveness. Cooldown10минут считается по этой групп
 `rolling-quota-exhausted`, merge/incident-window cooldown) и следующий доступный
 wall time идут в `[Perf:CaptureDecision]`; повторный skip имеет счётчик.
 Лимит переживает
-перезапуск и восстанавливается со временем: прежние десять sample на весь boot
-оставляли длинную рабочую сессию навсегда без стека. Первая минута startup не
+перезапуск и восстанавливается со временем. До09.10 этот же отказ ошибочно
+блокировал внешний native sample: у двух реальных Main stalls стек не сохранился.
+Первая минута startup не
 запускает тяжёлую запись. Trace ограничен буфером 8MiB, экспортом 16MiB;
 потеря данных, занятый DevTools, ошибка/опоздание захвата записываются явно.
 С30.09 JS sampling1мс; профиль пишет triggerStart/end, actual start,
@@ -85,6 +86,64 @@ peak buffer. Начатый после жеста профиль нельзя в
 payload. Дополнение 14.09 сохраняет ограниченные метаданные элементов, описанные
 ниже; это не постоянное сканирование страницы.
 
+### Независимый стек и цепочка операций Main
+
+С09.10 внешний watchdog отдельно допускает односекундный `/usr/bin/sample`
+при тишине Main от500мс либо focused renderer по его threshold. Квота тяжёлых
+профилей на него не влияет. Один sample одновременно, cooldown30с на точную
+identity PID, общие8/час и24/скользящие сутки; receipts переживают restart.
+Начальные тревоги менее1с используют максимум6часовых/18суточных слотов;
+остальные доступны продолжающейся паузе от1с. Если начальная заявка упёрлась в
+этот резерв, прежний watchdog tick один раз повторяет её для того же stall/PID
+после порога. Свежий heartbeat/hidden/observer-gap отменяет ожидание. Общие квоты,
+process cooldown и запрет перехвата чужого процесса не ослаблены.
+Перед spawn повторно проверяется принадлежность и поколение процесса. Отказ,
+таймаут20с, неполный вывод и превышение8MiB сохраняются отдельно; убивается
+только собственный дочерний sample. Видимый нефокусный renderer остаётся
+в дешёвых измерениях и прежней heavy policy, без нового native capture.
+
+`stall-*.sample.json` связывает heartbeat silence, spawn, окончание sampling,
+выход процесса и наблюдённое возобновление. macOS sample v7 часто не сообщает
+точный конец интервала: совпадение тогда доказуемо только если весь проверенный
+capture envelope лежит внутри silence; `actualBoundsKnown=false`, `overlapMs=null`.
+Начатый после возобновления стек не является стеком зависания; частичное или
+неизвестное перекрытие не превращается в success по одному exit0.
+
+Для native `.sample.txt` сохраняется отдельная доля до64MiB ВНУТРИ общих256MiB.
+Раньше старые incident JSON заполняли бюджет, а prune первым удалял каждый свежий
+стек сразу после2минутной write-grace. Теперь старые metadata уступают место этой
+ограниченной доле; native overflow удаляет старейшие стеки, прежние7суток и quota
+receipts сохраняются. В `.sample.json` позднее удаление отмечается отдельно
+`output.retained=false/removalReason/removedAt`; capture complete не означает
+бессрочное наличие файла. `[Perf:ArtifactPrune]` сохраняет счётчики удаления.
+
+Тот же artifact store принимает ограниченный causal journal:48ч/64MiB внутри
+общих256MiB, hourly bucket до4MiB, запись до2KiB,60обычных+12критических записей
+в минуту на источник. На Main/renderer нет файловой записи этого журнала.
+`sourceBoot/sourceSeq/emittedAbs/watchdogReceivedAbs` отделяют время события
+от поздней доставки; heartbeat учитывается в последовательности без записи
+каждого heartbeat на диск. Лимиты очереди/байтов/rate, транспортные потери,
+sequence gaps и flushLag видны явно. Heartbeat может подтвердить потерянный
+settle; отсутствие span в обрезанном snapshot означает unknown, не завершение.
+Main gap от500мс идёт в существующий critical allowance: поток коротких GC
+не должен занять его обычные60записей/мин и вытеснить thread CPU самого зависания.
+Лимит12critical/мин остаётся; это приоритет событий, а не безлимитное логирование.
+
+IPC wrapper разделяет `executing → sync-return/awaiting → settled`,
+`syncMs` и `lifetimeMs`. Возраст ожидающего Promise не означает работу CPU.
+Явные spans обрамляют Main raw JSONL consumer, loadSessionRecords, копирование
+кэша, группировку и проекцию History/Timeline; caller и parent/action/read IDs
+связывают операции. Full/append/memory-hit и размеры — metadata, без текста
+переписки и полных путей. Generic wrapper не измеряет каждую continuation после
+await; async CPU interval может содержать чужие задачи и не считается exclusive.
+
+Main gap сохраняет прежний process CPU и отдельное время вызывающего thread.
+В Electron28/Node18 нет `process.threadCpuUsage`: на macOS используется
+`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, недоступность остаётся null+reason.
+GC observer держит64события с абсолютным интервалом; late delivery сопоставляется
+по startAbs. Ноль наблюдённых GC не доказывает отсутствие ещё не доставленного
+события. Принудительный GC разрешён только в изолированном diagnostic canary.
+
 ## UI → native counters → запрос чтения
 
 С30.09 дешёвая цепочка не зависит от доступности тяжёлого capture. На capture
@@ -95,6 +154,11 @@ scroll-writer phases. `frameAbs` — доставка callback, исходный
 сохранён отдельно: после длинного handler он бывает раньше самого клика.
 Stylesheet identities показывают добавление/удаление даже вложенного `<style>`
 без чтения cssRules, текста, computed style или обхода всех потомков.
+
+С09.10 клавиши пишутся безопасным классом Meta/Control/Alt/Shift/Arrow/Escape/
+Enter/Space/Tab/Other и флагами modifiers/repeat, без печатной клавиши или input
+value. Slow summary идёт тем же actionId напрямую watchdog, health/drop counters
+попадают в heartbeat. Socket write означает enqueue, не подтверждение хранения.
 
 Кольцо96действий,32phases (первые8 и последние24),24stylesheet changes каждого
 вида; переполнение явно помечено. Wheel — максимум один sample за200мс,

@@ -2079,7 +2079,11 @@ export default function Workspace({
     }
   }, [activeProjectId, effectiveTab?.id, projectRootPath, rawExplorerPath]);
 
-  if (!activeProject || !activeProjectId || !currentProject) {
+  // A workflow may have no selected execution namespace (notably empty Inbox).
+  // Its sidebar/empty-window controls still exist, and TerminalArea owns ALL
+  // retained tab surfaces. Returning here would dispose every warmed terminal
+  // and History surface, then rebuild them on the next workflow switch.
+  if (!organizationReady && (!activeProject || !activeProjectId || !currentProject)) {
     console.warn('[Workspace:EARLY_RETURN] Empty workspace!', { activeProject: !!activeProject, activeProjectId, currentProject: !!currentProject });
     return <div className="flex-1 bg-bg-main" />;
   }
@@ -2375,7 +2379,7 @@ export default function Workspace({
               searchNode={terminalSearchNode}
             >
               <TerminalArea
-                projectId={activeProjectId}
+                projectId={activeProjectId || ''}
                 sharedActivity={sharedTabActivity}
                 terminalPresented={!historyIsPrimary || floatingTerminalOpen}
                 // ALWAYS portal the Run after strip out of the terminal layer,

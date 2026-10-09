@@ -40,6 +40,7 @@ const {
 const MAX_STEP_CHARS = 600;
 const MAX_STEPS_RETURNED = 400;
 const SUBAGENT_READ_CHUNK_BYTES = 4 * 1024 * 1024;
+const { codexOwnTurnLaunchSettings, claudeOwnAssistantLaunchSettings } = require('./subagent-launch-settings');
 
 function createSubagentStepProjectionState(options = {}) {
   const expectedCodexSessionId = String(options.codexSessionId || '');
@@ -68,6 +69,7 @@ function createSubagentStepProjectionState(options = {}) {
     pendingLinePrefix: Buffer.alloc(0),
     pendingLineStartOffset: 0,
     prefaceSteps: Array.isArray(options.prefaceSteps) ? [...options.prefaceSteps] : [],
+    launchSettings: null,
   };
 }
 
@@ -93,6 +95,7 @@ function resetSubagentStepProjectionState(state) {
   state.pendingLinePrefix = Buffer.alloc(0);
   state.pendingLineStartOffset = 0;
   state.prefaceSteps = [];
+  state.launchSettings = null;
   return state;
 }
 
@@ -435,7 +438,7 @@ function claudeProjectsDir() {
 }
 
 function codexSessionsDir() {
-  return path.join(os.homedir(), '.codex', 'sessions');
+  return path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
 }
 
 /** Text of the first user record — the task the agent was given. */
@@ -753,6 +756,7 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
  * by the earlier call, even when call/result arrive in different byte reads. */
 function claudeRecordToSteps(record, projectionState = null) {
   const state = projectionState || createSubagentStepProjectionState();
+  if (!state.launchSettings) state.launchSettings = claudeOwnAssistantLaunchSettings(record);
   const steps = [];
   const role = record?.type;
   const content = record?.message?.content;
@@ -970,6 +974,8 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
   if (state.codexNeedsNewTaskBoundary && !state.codexNewTaskBoundarySeen) {
     return [];
   }
+  if (!state.launchSettings) state.launchSettings = codexOwnTurnLaunchSettings(record,
+    state.codexExpectedSessionId, state.codexSessionId);
 
   if (record?.type === 'event_msg' && type === 'task_started') {
     state.codexCurrentCanonicalUserText = '';
@@ -1171,6 +1177,7 @@ function consumeAgentStepChunk({
       size,
       pending: false,
       reset,
+      launchSettings: state.launchSettings,
     };
   }
   let cursor = 0;
@@ -1266,6 +1273,7 @@ function consumeAgentStepChunk({
     size,
     pending: nextOffset < size,
     reset,
+    launchSettings: state.launchSettings,
   };
 }
 
@@ -1369,7 +1377,7 @@ async function readAgentStepsAsync({
  */
 const COMPLETION_TAIL_BYTES = 64 * 1024;
 
-function readAgentCompletionProof({ toolType, filePath }) {
+function readAgentCompletionProof({ toolType, filePath, notBefore = 0 }) {
   if (!filePath) return { finished: false, completedAt: 0 };
   let fd;
   try {
@@ -1387,21 +1395,31 @@ function readAgentCompletionProof({ toolType, filePath }) {
       let record;
       try { record = JSON.parse(line); } catch { continue; }
       const payload = record?.payload || record;
+      const timestamp = Date.parse(record?.timestamp || payload?.timestamp || '') || 0;
+      if (Number(notBefore) > 0 && timestamp > 0 && timestamp < Number(notBefore)) {
+        return { finished: false, completedAt: 0 };
+      }
+      if (toolType === 'codex' && payload?.type === 'task_started') {
+        return { finished: false, completedAt: 0 };
+      }
       const finished = toolType === 'codex'
         ? (payload?.type === 'task_complete'
-          || payload?.phase === 'final_answer')
+          || payload?.phase === 'final_answer' && payload?.delivery !== 'async')
         : (record?.stop_reason === 'end_turn'
           || record?.message?.stop_reason === 'end_turn');
       if (!finished) continue;
+      if (Number(notBefore) > 0 && (!timestamp || timestamp < Number(notBefore))) {
+        return { finished: false, completedAt: 0 };
+      }
       return {
         finished: true,
-        completedAt: Date.parse(record?.timestamp || payload?.timestamp || '') || 0,
+        completedAt: timestamp,
       };
     }
     // A single record can exceed the bounded tail and begin before our read
     // boundary. Regex still proves completion, but without a parseable record
     // there is deliberately no invented completion timestamp.
-    const finished = toolType === 'codex'
+    const finished = Number(notBefore) > 0 ? false : toolType === 'codex'
       ? /"type"\s*:\s*"task_complete"/.test(tail)
         || /"phase"\s*:\s*"final_answer"/.test(tail)
       : /"stop_reason"\s*:\s*"end_turn"/.test(tail);

@@ -19,7 +19,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { runAfterActionModels } from '../../utils/runAfterActionModels';
 import { sendQueuedPromptNow } from '../../utils/runAfterSendNow';
-import { isTabBusyNow, signalPromptQueueDictationResolved } from '../../hooks/usePromptQueueRunner';
+import { isTabBusyNow, signalPromptQueueDictationResolved, getPromptQueueRuntimeSnapshot, subscribePromptQueueRuntime } from '../../hooks/usePromptQueueRunner';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
 import { queueItemDependencyTarget } from '../../utils/runAfterDependencyLayout.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
@@ -65,7 +65,8 @@ import {
 import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlacement.mjs';
 import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
 import { pointInHoverCluster, pointInRect } from '../../utils/hoverBridge.mjs';
-import { captureQueueHoverReturn, createHoverReturnGate } from '../../utils/hoverReturnGate.mjs';
+import { captureQueueHoverReturn, createHoverReturnGate, hasOwnedClickPopup, markQueueChildDismiss,
+  notifyQueueClickChildClosed, queueOwnsPopup, QUEUE_CLICK_CHILD_CLOSED } from '../../utils/hoverReturnGate.mjs';
 import { consumePromptQueueMiddleClick } from '../../utils/promptQueueMiddleClick.mjs';
 import { getAppRuntimeIdentity } from '../../utils/appRuntimeIdentity';
 import { shouldArmQueueForTrigger } from '../../utils/promptTriggerArm.mjs';
@@ -75,6 +76,7 @@ import {
 } from '../../utils/historyPromptHandoffs';
 import {
   selectPromptQueueTransportProgress,
+  selectPromptQueuePreparationProgress,
 } from '../../utils/promptQueueReceiptIdentity.mjs';
 import {
   combineFirstDelayParts,
@@ -381,10 +383,18 @@ export function PromptQueueOverlay({
     tabId,
     (snapshot) => setPromptTransportHandoffs(snapshot),
   ), [tabId]);
+  const [preparationRuntime, setPreparationRuntime] = useState(() => ({ tabId, value: getPromptQueueRuntimeSnapshot(tabId) }));
+  useEffect(() => {
+    const refresh = () => setPreparationRuntime({ tabId, value: getPromptQueueRuntimeSnapshot(tabId) });
+    const unsubscribe = subscribePromptQueueRuntime(changedTabId => { if (changedTabId === tabId) refresh(); });
+    refresh();
+    return unsubscribe;
+  }, [tabId]);
   const promptTransportProgress = useMemo(() => selectPromptQueueTransportProgress(
     promptTransportHandoffs,
     items.map((item) => item.id),
-  ), [items, promptTransportHandoffs]);
+  ) || selectPromptQueuePreparationProgress(preparationRuntime.tabId === tabId ? preparationRuntime.value : null,
+    items.map(item => item.id)), [items, promptTransportHandoffs, preparationRuntime, tabId]);
   const promptTransportPending = !!promptTransportProgress;
   const activeItemCount = useMemo(() => countEnabledQueuedPrompts(items), [items]);
   const autoRun = queue?.autoRun ?? false;
@@ -768,6 +778,11 @@ export function PromptQueueOverlay({
   const cmdPressedRef = useRef(false);
   const previewPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
   const hoverReturnRef = useRef(createHoverReturnGate());
+  const wasClickEditorOpenRef = useRef(false);
+  const editorDismissPointRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const clickMenusRef = useRef({ action: false, item: false });
+  const actionMenuDismissRef = useRef<{ reason: string; point: { clientX: number; clientY: number } | null } | null>(null);
+  const itemMenuDismissRef = useRef<{ reason: string; point: { clientX: number; clientY: number } | null } | null>(null);
   const previewResizeActiveRef = useRef(false);
   const recheckQueueHoverRef = useRef<(point: { clientX: number; clientY: number } | null) => void>(() => {});
   const queueCountButtonRef = useRef<HTMLButtonElement>(null);
@@ -922,13 +937,18 @@ export function PromptQueueOverlay({
     setMetaSettingsModelId(null);
   }, [addMetaAction, markAppearing, sessionType, tabId]);
 
-  const armRunAfterForSchedulingIfBusy = useCallback((triggerTabId: string | null = null) => {
+  const armRunAfterForSchedulingIfBusy = useCallback((itemId: string, triggerTabId: string | null = null) => {
     // A timer/context condition waits on the owner turn, but `on tab` waits on
     // the selected tab. Checking the owner for both cases leaves a queue OFF
     // when an idle owner is deliberately scheduled after a busy neighbour.
-    const schedulingTabBusy = triggerTabId ? isTabBusyNow(triggerTabId) : agentBusy;
-    if (!schedulingTabBusy) return;
     const live = usePromptQueueStore.getState().getQueue(tabId);
+    const head = live.items.find(isQueuedPromptEnabled);
+    if (!head || head.id !== itemId) return;
+    // The chosen dependency arms only that enabled head, even while the
+    // dependency is idle. Its next natural completion remains the trigger.
+    if (triggerTabId) {
+      if (!shouldArmQueueForTrigger({ trigger: head.trigger, isHead: true })) return;
+    } else if (!agentBusy) return;
     if (!live.autoRun) setAutoRun(tabId, true);
   }, [agentBusy, setAutoRun, tabId]);
 
@@ -1004,10 +1024,15 @@ export function PromptQueueOverlay({
       if (!target) return;
       if (metaActionsMenuRef.current?.contains(target)) return;
       if (metaActionsButtonRef.current?.contains(target)) return;
+      actionMenuDismissRef.current = { reason: 'outside', point: { clientX: event.clientX, clientY: event.clientY } };
+      markQueueChildDismiss(event, editorLockTokenRef.current);
       setMetaActionsMenu(null);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setMetaActionsMenu(null);
+      if (event.key === 'Escape') {
+        actionMenuDismissRef.current = { reason: 'escape', point: null };
+        setMetaActionsMenu(null);
+      }
     };
     window.addEventListener('mousedown', onMouseDown, true);
     window.addEventListener('keydown', onKeyDown);
@@ -1745,9 +1770,16 @@ export function PromptQueueOverlay({
       setChipContextMenu(null);
       return;
     }
-    const onMouseDown = () => setChipContextMenu(null);
+    const onMouseDown = (event: MouseEvent) => {
+      itemMenuDismissRef.current = { reason: 'outside', point: { clientX: event.clientX, clientY: event.clientY } };
+      markQueueChildDismiss(event, editorLockTokenRef.current);
+      setChipContextMenu(null);
+    };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setChipContextMenu(null);
+      if (e.key === 'Escape') {
+        itemMenuDismissRef.current = { reason: 'escape', point: null };
+        setChipContextMenu(null);
+      }
     };
     window.addEventListener('mousedown', onMouseDown);
     window.addEventListener('keydown', onKeyDown);
@@ -1766,6 +1798,10 @@ export function PromptQueueOverlay({
       if (targetElement?.closest('[data-editor-trigger]')) return;
       if (editorRef.current?.contains(target)) return;
       if (editorPreviewRef.current?.contains(target)) return;
+      const satelliteOwner = targetElement?.closest<HTMLElement>('[data-run-after-hover-owner]')?.dataset.runAfterHoverOwner;
+      const dismissOwner = targetElement?.closest<HTMLElement>('[data-run-after-dismiss-owner]')?.dataset.runAfterDismissOwner;
+      if (satelliteOwner === editorLockTokenRef.current || dismissOwner === editorLockTokenRef.current) return;
+      if (editorPinned && hasOwnedClickPopup(panelRef.current, editorRef.current)) return;
       const replayButton = editingId ? replayButtonRefs.current.get(editingId) : null;
       if (replayButton?.contains(target)) return;
       const currentChip = editingId ? chipRefs.current.get(editingId) : null;
@@ -1779,11 +1815,9 @@ export function PromptQueueOverlay({
         commitEditor({ close: false });
         return;
       }
+      editorDismissPointRef.current = { clientX: e.clientX, clientY: e.clientY };
+      markQueueChildDismiss(e, editorLockTokenRef.current);
       commitEditor();
-      // Клик снаружи закрывает весь кластер целиком: модалку И карточки
-      // превью — «пока я не кликну в каком-то другом месте, чтобы они
-      // закрылись».
-      setQueueHoverPreviewOpen(false);
     };
     window.addEventListener('mousedown', onMouseDown, true);
     return () => window.removeEventListener('mousedown', onMouseDown, true);
@@ -2776,6 +2810,7 @@ export function PromptQueueOverlay({
   const recheckQueueHover = useCallback((point: { clientX: number; clientY: number } | null) => {
     if (!queueHoverPreviewOpen || dragIdRef.current || previewResizeActiveRef.current || rewindTargetRequestId) return;
     if (!point) { closeQueueHoverPreview(); return; }
+    if (hasOwnedClickPopup(panelRef.current)) return;
     const countRect = queueCountButtonRef.current?.getBoundingClientRect() ?? null;
     const railRect = railRef.current?.getBoundingClientRect() ?? null;
     const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect() ?? null;
@@ -2814,6 +2849,14 @@ export function PromptQueueOverlay({
   useEffect(() => {
     if (!queueHoverPreviewOpen) { hoverReturnRef.current.reset(); return; }
     const onChildClick = (event: MouseEvent) => captureQueueHoverReturn(event, panelRef.current, hoverReturnRef.current);
+    const onChildClosed = (event: Event) => {
+      const { owner, reason, point } = (event as CustomEvent).detail;
+      if (!queueOwnsPopup(panelRef.current, owner)) return;
+      if (point) previewPointerRef.current = point;
+      if (reason !== 'selection') hoverReturnRef.current.reset();
+      // Escape closes its own level; subsequent pointer movement resumes hover.
+      if (reason !== 'escape') recheckQueueHoverRef.current(previewPointerRef.current);
+    };
     const onMouseMove = (event: MouseEvent) => {
       previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
       recheckQueueHover(event);
@@ -2822,11 +2865,13 @@ export function PromptQueueOverlay({
     const onMouseOut = (event: MouseEvent) => { if (!event.relatedTarget) onExitWindow(); };
     recheckQueueHover(previewPointerRef.current);
     window.addEventListener('click', onChildClick, true);
+    window.addEventListener(QUEUE_CLICK_CHILD_CLOSED, onChildClosed);
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseout', onMouseOut);
     window.addEventListener('blur', onExitWindow);
     return () => {
       window.removeEventListener('click', onChildClick, true);
+      window.removeEventListener(QUEUE_CLICK_CHILD_CLOSED, onChildClosed);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseout', onMouseOut);
       window.removeEventListener('blur', onExitWindow);
@@ -2886,6 +2931,25 @@ export function PromptQueueOverlay({
   // витрина без действий: клик по строке открывает ту же боковую модалку
   // (юзер: «я кликаю на строку, у меня появляется сбоку модалка»).
   const editorSurfaceVisible = panelOpen || queueHoverPreviewVisible;
+  const clickEditorOpen = editorSurfaceVisible && editorOpen && editorPinned;
+  useLayoutEffect(() => {
+    if (wasClickEditorOpenRef.current && !clickEditorOpen) {
+      const point = editorDismissPointRef.current;
+      notifyQueueClickChildClosed(editorLockTokenRef.current, point ? 'outside' : 'selection', point);
+    }
+    wasClickEditorOpenRef.current = clickEditorOpen;
+    if (clickEditorOpen) editorDismissPointRef.current = null;
+  }, [clickEditorOpen]);
+  useLayoutEffect(() => {
+    const next = { action: !!metaActionsMenu, item: !!chipContextMenu };
+    for (const [kind, ref] of [['action', actionMenuDismissRef], ['item', itemMenuDismissRef]] as const) {
+      if (clickMenusRef.current[kind] && !next[kind]) {
+        notifyQueueClickChildClosed(editorLockTokenRef.current, ref.current?.reason || 'selection', ref.current?.point || null);
+      }
+      if (next[kind]) ref.current = null;
+    }
+    clickMenusRef.current = next;
+  }, [metaActionsMenu, chipContextMenu]);
   const railRunAppearance = resolveRunAfterPlayAppearance({
     autoRun,
     activeItemCount,
@@ -3488,7 +3552,7 @@ export function PromptQueueOverlay({
                     if (isMetaAction || isReplayBusy) return;
                     setReplayHoverId((cur) => cur === it.id ? null : cur);
                   }}
-                >{isMetaAction
+                >{isSendPending ? <span className="pq-spinner" /> : isMetaAction
                     ? (it.metaAction?.kind === 'rewind'
                       ? <RotateCcw size={12} strokeWidth={2} />
                       : it.metaAction?.kind === 'restart'
@@ -3646,7 +3710,7 @@ export function PromptQueueOverlay({
                           next.delete(it.id);
                           return next;
                         });
-                        armRunAfterForSchedulingIfBusy();
+                        // Timer commit edits a duration; Play is separate.
                       }}
                     />
                   ) : triggerKind === 'app-restart' ? (
@@ -3672,7 +3736,7 @@ export function PromptQueueOverlay({
                           if (targetTabId) {
                             if (legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, targetTabId);
                             else setPromptTrigger(tabId, it.id, { kind: 'onTab', tabId: targetTabId });
-                            armRunAfterForSchedulingIfBusy(targetTabId);
+                            armRunAfterForSchedulingIfBusy(it.id, targetTabId);
                           } else {
                             if (triggerKind === 'onTab' && legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, null);
                             else setPromptTrigger(tabId, it.id, null);
@@ -3828,7 +3892,7 @@ export function PromptQueueOverlay({
                 else collapsePanel();
               }}
               onMouseEnter={openQueueHoverPreview}
-              title={`Run after: ${activeItemCount} queued`}
+              title={`Run after: ${activeItemCount} queued${loopPromptEnabled ? ' · Loop' : ''}`}
               aria-label={`${collapsed ? 'Pin' : 'Close'} Run after queue, ${activeItemCount} queued`}
               aria-expanded={panelAttached}
               style={{
@@ -3839,7 +3903,9 @@ export function PromptQueueOverlay({
                 lineHeight: 1,
               }}
             >
-              {activeItemCount > 99 ? '99' : activeItemCount}
+              <span data-prompt-queue-count-label style={{ transform: loopPromptEnabled ? 'translateY(-3px)' : undefined }}>
+                {activeItemCount > 99 ? '99' : activeItemCount}
+              </span>
               {(postPromptEnabled || loopPromptEnabled) && (
                 <span
                   aria-hidden
@@ -3848,12 +3914,13 @@ export function PromptQueueOverlay({
                     right: 2,
                     bottom: 2,
                     display: 'inline-flex',
+                    alignItems: 'center',
                     gap: 1,
                     pointerEvents: 'none',
                   }}
                 >
                   {postPromptEnabled && <span style={{ width: 3, height: 3, borderRadius: 999, background: TINT }} />}
-                  {loopPromptEnabled && <span style={{ width: 3, height: 3, borderRadius: 999, background: TINT }} />}
+                  {loopPromptEnabled && <RefreshCw data-prompt-queue-loop-indicator size={8} strokeWidth={2.2} style={{ color: PULSE }} aria-hidden="true" />}
                 </span>
               )}
             </button>
@@ -3934,6 +4001,7 @@ export function PromptQueueOverlay({
           ref={metaActionsMenuRef}
           data-run-after-satellite="true"
           data-run-after-hover-owner={editorLockTokenRef.current}
+          data-run-after-click-open="true"
           data-prompt-queue-meta-actions
           onMouseDown={(event) => event.stopPropagation()}
           style={{
@@ -4120,6 +4188,7 @@ export function PromptQueueOverlay({
             data-prompt-queue-chip-menu
             data-run-after-satellite="true"
             data-run-after-hover-owner={editorLockTokenRef.current}
+            data-run-after-click-open="true"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             style={{
@@ -4201,7 +4270,7 @@ export function PromptQueueOverlay({
                     operator: 'gte',
                     percent: 50,
                   });
-                  armRunAfterForSchedulingIfBusy();
+                  armRunAfterForSchedulingIfBusy(chipContextItem.id);
                 }
                 setContextConditionFocusIds((current) => new Set(current).add(chipContextItem.id));
                 setChipContextMenu(null);
@@ -4377,6 +4446,7 @@ export function PromptQueueOverlay({
           ref={editorRef}
           data-run-after-satellite="true"
           data-run-after-hover-owner={editorLockTokenRef.current}
+          data-run-after-click-open={editorPinned ? 'true' : undefined}
           style={{
             position: 'fixed',
             top: editorAnchor.top,

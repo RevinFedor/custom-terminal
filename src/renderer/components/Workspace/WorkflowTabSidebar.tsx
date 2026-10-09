@@ -1,4 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {createPortal} from 'react-dom';
 import { Folder, ChevronDown, Plus, ArrowLeft, ArrowRight, CircleX, Pause } from 'lucide-react';
 import { useOutlineDnd, type OutlineDndNode, type OutlineDndCommitPayload, type OutlineDndFeedback } from '@noted/structured-dnd/react';
 import {projectForestToRootEnd} from '@noted/structured-dnd/core';
@@ -7,6 +8,7 @@ import { openTabContextMenuAt, TAB_RENAME_REQUEST_EVENT } from './TabBar';
 import type { LinkedFile } from './TabLinkedFiles';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
+import { openFileTabBeside } from '../../utils/openFileTabBeside';
 import { startTabSidebarResize } from '../../utils/tabSidebarResize';
 import { resolvePaneTabDropTarget,paneTabDropTargetContainsPoint,
   setPaneTabDragTarget, type PaneTabDropTarget, type PaneTabDragEntry } from '../../utils/paneTabDragBridge';
@@ -23,6 +25,11 @@ import { TAB_CARD_LINE_HEIGHT } from '../../utils/tabCardVisual.mjs';
 import {createWorkflowGroupExpansionQueue} from '../../utils/workflowGroupExpansion.mjs';
 import {useInlineRenameInputRef} from '../../hooks/useInlineRenameInput';
 import {paneTabs} from '../../utils/splitPanesModel.mjs';
+import NewTabMenuRows,{type NewTabAction} from './NewTabMenuRows';
+import {type WindowCell} from './MoveToWindowMenu';
+import {clampMenuToViewport} from '../../utils/menuViewportClamp.mjs';
+import {CONTEXT_MENU_PANEL_STYLE,CONTEXT_MENU_ROW_STYLE,CONTEXT_MENU_TOP_DIVIDER_STYLE} from '../UI/contextMenuMetrics.mjs';
+import {useWorkspaceOverlayTarget} from '../../hooks/useWorkspaceOverlayTarget';
 import './WorkflowTabSidebar.css';
 
 export type WorkflowReserveState = {
@@ -61,7 +68,7 @@ export interface WorkflowTabSidebarProps {
   onGroupClose?: (id:string) => Promise<boolean>;
   onOpenTab: (projectId: string, tabId: string) => Promise<boolean> | boolean;
   onOpenFile: (ownerProjectId: string, file: LinkedFile) => void;
-  onCreateTab: (request: { workflowId: string; sourceTabId?: string; cwd?: string; placement: 'reserve' }) => Promise<unknown>;
+  onCreateTab: (request: { workflowId: string; sourceTabId?: string; cwd?: string; placement: 'reserve'; action?:NewTabAction; windowId?:string }) => Promise<unknown>;
   onCreateGroup: (workflowId: string) => void | Promise<void>;
   onGroupContextMenu: (projectId: string, groupId: string, x: number, y: number) => void;
   /** Projected subset only! Parent merges into complete order/groups/links. */
@@ -71,6 +78,7 @@ export interface WorkflowTabSidebarProps {
     admission: any,options?:{isCurrent?:()=>boolean}) => Promise<boolean> | boolean;
   sourceTabId?: string;
   fallbackCwd?: string;
+  location?: React.ReactNode;
   sharedActivity?: SharedTabActivityMaps;
   scrollTop?: number;
   onScrollOffsetChange?: (workflowId: string, top: number) => void;
@@ -109,7 +117,7 @@ function ReserveCard({ node, rowProps, selected, activity, onClick, onMiddleClic
     sharedActivity={activity} selected={selected} interactiveStatus
     tabIndex={0} role="button" aria-label={liveName} aria-pressed={selected}
     data-workflow-reserve-tab={node.tabId} data-execution-namespace={node.projectId}
-    onLinkedFileOpen={onOpenFile} onClick={event => { if (draft === null) onClick(event); }}
+    onClick={event => { if (draft === null) onClick(event); }}
     onMouseDown={event=>{if(event.button===1)event.preventDefault();}}
     onAuxClick={event=>{if(event.button===1){event.preventDefault();event.stopPropagation();onMiddleClick();}}}
     onContextMenu={event => { event.preventDefault(); event.stopPropagation(); menu(event.clientX, event.clientY); }}
@@ -193,6 +201,9 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
   const width = useUIStore(ui => ui.tabSidebarWidth);
   const geometry = useUIStore(ui => ui.tabGeometry);
   const fontSize = useUIStore(ui => ui.tabsFontSize);
+  const sidebarGap=useUIStore(ui=>ui.tabSidebarGap ?? ui.tabGeometry.gap);
+  const overlayTarget=useWorkspaceOverlayTarget(),emptyMenuRef=useRef<HTMLDivElement>(null);
+  const [emptyMenu,setEmptyMenu]=useState<{x:number;y:number}|null>(null);
   const model = useMemo(() => selectWorkflowReserve(state, workflowId, props.orderedTabIds),
     [state, workflowId, props.orderedTabIds]);
   const outline = useMemo(() => workflowReserveOutline(model) as Node[], [model]);
@@ -253,24 +264,23 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
     canHorizontalMove: payload => {
       if(payload.sourceContext?.multiSelected)return {ok:false,reason:'multi-selection'};
       const { sourceNode } = payload;
-      // Physical subagents/files keep exact ownership. Organizational visual
+      // Physical subagents keep exact ownership. Files have organizational visual
       // parents may move through the existing structured hierarchy resolver.
       if (sourceNode.groupId) return false;
       const owner = model.catalog.get(sourceNode.tabId);
-      if (owner?.tab.parentTabId || owner?.tab.tabType === 'file') return false;
+      if (owner?.tab.parentTabId) return {ok:false,reason:'physical-parent'};
       return tabOutlineHorizontalPolicy(payload);
     },
     canUseVerticalSlot: payload => (payload.sourceNodes || [payload.sourceNode]).every(sourceNode=>{
       if (!tabOutlineVerticalSlotPolicy({...payload,sourceNode})) return false;
       const guard=payload.sourceContext?.guards[sourceNode.tabId!];
-      if (!guard?.parentTabId && guard?.tabType !== 'file') return true;
+      if (!guard?.parentTabId) return true;
       return outlineParent(controlledOutline, String(sourceNode.id)) === payload.slot.parentId;
     }),
     resolveExternalTarget: ({ clientX, clientY, sourceId,sourceNode,sourceRootIds,sourceContext,previewOutline,metaKey }) => {
       const pointed=document.elementFromPoint(clientX,clientY);
       if(sourceNode.externalPaneSource && metaKey && sidebar.current?.contains(pointed))return {id:`reserve-end:${workflowId}`,zone:'reserve-end',
         previewOutline:projectForestToRootEnd(previewOutline,sourceId,sourceRootIds)};
-      if(!metaKey && sourceContext?.origin!=='pane')return null;
       const target=resolvePaneTabDropTarget(pointed,clientX,(sourceContext?.paneEntries || []).map((entry:PaneTabDragEntry)=>entry.tabId),clientY);
       setPaneTabDragTarget(target);
       return target ? {...target,id:`${target.spaceId}:${target.paneKey}:${target.at}`} : null;
@@ -354,17 +364,35 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
     const owner = model.catalog.get(id);
     Promise.resolve(current.onOpenTab(owner.projectId, id)).catch(reason => setError(String(reason)));
   };
-  const create = async () => {
+  const create = async (action:NewTabAction='terminal',target?:WindowCell) => {
     if (creating) return;
     setCreating(true); setError('');
     const source = model.catalog.get(props.sourceTabId);
     try { await props.onCreateTab({ workflowId, sourceTabId: source?.tabId,
-      cwd: source?.tab.cwd || props.fallbackCwd, placement: 'reserve' }); }
+      cwd: source?.tab.cwd || props.fallbackCwd, placement: 'reserve',action,
+      windowId:target?useWorkspaceStore.getState().splitPanes[target.index]?.windowId:undefined }); }
     catch (reason) { setError(String(reason)); } finally { setCreating(false); }
   };
+  useEffect(()=>{setEmptyMenu(null);},[workflowId]);
+  useLayoutEffect(()=>{
+    if(!emptyMenu || !emptyMenuRef.current)return;
+    const rect=emptyMenuRef.current.getBoundingClientRect(),pos=clampMenuToViewport({x:emptyMenu.x,y:emptyMenu.y,
+      width:rect.width,height:rect.height,viewportWidth:innerWidth,viewportHeight:innerHeight});
+    Object.assign(emptyMenuRef.current.style,{left:`${pos.x}px`,top:`${pos.y}px`});
+  },[emptyMenu]);
+  useEffect(()=>{
+    if(!emptyMenu)return;
+    const outside=(event:PointerEvent)=>{
+      if(emptyMenuRef.current?.contains(event.target as Node) || (event.target as Element)?.closest?.('[data-new-tab-window-flyout]'))return;
+      setEmptyMenu(null);
+    };
+    const escape=(event:KeyboardEvent)=>{if(event.key==='Escape'){event.stopPropagation();setEmptyMenu(null);}};
+    window.addEventListener('pointerdown',outside,true);window.addEventListener('keydown',escape,true);
+    return()=>{window.removeEventListener('pointerdown',outside,true);window.removeEventListener('keydown',escape,true);};
+  },[emptyMenu]);
   return <div ref={sidebar} data-tab-sidebar data-workflow-tab-sidebar={workflowId}
     data-keyboard-focus-surface="sidebar" className="workflow-tab-sidebar" style={{width,zIndex:1,
-      '--reserve-gap':`${geometry.gap}px`, '--reserve-font-size':`${fontSize}px`,
+      '--reserve-gap':`${sidebarGap}px`, '--reserve-font-size':`${fontSize}px`,
       '--reserve-row-padding':`${geometry.paddingY}px ${geometry.paddingX}px`,
       '--reserve-row-radius':`${geometry.borderRadius}px`, '--reserve-line-height':TAB_CARD_LINE_HEIGHT,
     } as React.CSSProperties}
@@ -373,13 +401,15 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
         useUIStore.getState().setActiveArea('sidebar');
     }}>
     <SidebarTabDragCursorChip enabled />
-    <div className="workflow-reserve-toolbar"><span>Резерв <small>{model.reserve.length}</small></span>
-      <button aria-label="Создать группу" title="Создать группу" onClick={() => {Promise.resolve(props.onCreateGroup(workflowId)).catch(reason=>setError(String(reason)));}}><Folder size={14} /></button>
-      <button aria-label="Новая вкладка в резерве" title="Новая вкладка" disabled={creating} onClick={create}><Plus size={16} /></button>
-    </div>
+    {props.location && <div data-sidebar-location-line style={{padding:'3px 8px 4px',borderBottom:'1px solid #ffffff0f'}}>{props.location}</div>}
     {error && <div role="alert" className="workflow-reserve-error">{error}</div>}
     <div ref={element => { dnd.scrollerRef.current = element; }} data-workflow-reserve-scroll
       className="workflow-reserve-scroll" onWheel={() => { userScroll.current = true; }}
+      onContextMenu={event=>{
+        if((event.target as Element).closest('[data-outline-dnd-row]'))return;
+        event.preventDefault();event.stopPropagation();setEmptyMenu({x:event.clientX,y:event.clientY});
+      }}
+      onDoubleClick={event=>{if(!(event.target as Element).closest('[data-outline-dnd-row]'))void create();}}
       onPointerDown={() => { userScroll.current = true; }}
       onScroll={event => { if (userScroll.current) props.onScrollOffsetChange?.(workflowId, event.currentTarget.scrollTop); }}>
       <div className="workflow-reserve-outline">
@@ -410,10 +440,13 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
               onRenameEnd={()=>props.onGroupRenameEnd?.()} onClose={()=>{void props.onGroupClose?.(node.groupId!);}}
               onContextMenu={event=>{event.preventDefault();event.stopPropagation();props.onGroupContextMenu(node.projectId,node.groupId!,event.clientX,event.clientY);}}/>
 
-              : <><ReserveCard node={node} rowProps={rowProps} selected={props.selectedTabIds.includes(node.tabId!)}
+              : <ReserveCard node={node} rowProps={rowProps} selected={props.selectedTabIds.includes(node.tabId!)}
                 feedback={isSource ? dnd.dragState?.feedback : null} navigationPaused={isSource && dnd.dragState?.navigationMode}
                 activity={props.sharedActivity} onClick={event => select(node.tabId!, event)}
                 onMiddleClick={()=>{
+                  if(dnd.dragState)return;
+                  const fileTab=useWorkspaceStore.getState().openProjects.get(node.projectId)?.tabs.get(node.tabId!);
+                  if(fileTab?.tabType==='file'){void openFileTabBeside(node.projectId,node.tabId!);return;}
                   const store=useWorkspaceStore.getState(),index=store.splitPanes.length?store.splitFocusedIndex:null;
                   const entries=reservePaneEntries(model,node);
                   const at=index===null?(store.centerStrips[store.centerStripKey()] || []).length:paneTabs(store.splitPanes[index]).length;
@@ -423,14 +456,24 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
                     .then(accepted=>{if(!accepted)setError('Размещение вкладки не подтверждено');})
                     .catch(reason=>setError(String(reason)));
                 }}
-                onOpenFile={file => props.onOpenFile(node.projectId, file)} />
-                {!!node.contextParent && <div className="workflow-reserve-parent" title={node.contextParent.name}>↳ {node.contextParent.name}</div>}</>}
+                onOpenFile={file => props.onOpenFile(node.projectId, file)} />}
           </div>;
         })}
-        {!dnd.rows.length && <div className="workflow-reserve-empty">Все вкладки размещены в окнах</div>}
         <div {...dnd.scrollSpacerProps} />
       </div>
     </div>
+    {emptyMenu && createPortal(<div ref={emptyMenuRef} data-workflow-empty-context-menu data-tab-context-menu role="menu"
+      className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl overflow-hidden"
+      onPointerDown={event=>event.stopPropagation()} onMouseDown={event=>event.stopPropagation()} onClick={event=>event.stopPropagation()}
+      style={{...CONTEXT_MENU_PANEL_STYLE,position:'fixed',left:emptyMenu.x,top:emptyMenu.y,zIndex:100030}}>
+      <NewTabMenuRows rowAttributes={action=>({'data-tab-empty-context-action':`new-${action}`})}
+        onCreate={action=>{void create(action);setEmptyMenu(null);}}
+        onCreateInWindow={state.splitPanes?.length?(action,target)=>{void create(action,target);setEmptyMenu(null);}:undefined}/>
+      <div style={CONTEXT_MENU_TOP_DIVIDER_STYLE}/>
+      <button type="button" data-tab-empty-context-action="new-group" className="w-full text-left hover:bg-white/10"
+        style={{...CONTEXT_MENU_ROW_STYLE,display:'flex',alignItems:'center',gap:8,color:'#ccc',border:0,background:'transparent',cursor:'pointer'}}
+        onClick={()=>{setEmptyMenu(null);Promise.resolve(props.onCreateGroup(workflowId)).catch(reason=>setError(String(reason)));}}><Folder size={12}/>Group</button>
+    </div>,overlayTarget)}
     <div data-tab-sidebar-resize-handle onPointerDown={event => {
       if (event.button !== 0) return;
       stopResize.current?.(); stopResize.current = startTabSidebarResize(event, {

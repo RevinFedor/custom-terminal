@@ -11,6 +11,7 @@ import SpaceStrip from '../../src/renderer/components/Workspace/SpaceStrip';
 import TabNotificationControls from '../../src/renderer/components/Workspace/TabNotificationControls';
 import SidebarToolsRow from '../../src/renderer/components/Workspace/SidebarToolsRow';
 import { useAutoCompactStore } from '../../src/renderer/store/useAutoCompactStore';
+import { normalizeAutoCompactPolicy } from '../../src/renderer/utils/autoCompactPolicy.mjs';
 import { pendingQueuedRewindTarget, cancelQueuedRewindTarget } from '../../src/renderer/utils/queuedRewindTarget.mjs';
 import '../../packages/claude-blocks/src/blocks.css';
 
@@ -44,6 +45,8 @@ usePromptQueueStore.setState({ queues: new Map([['owner', { ...queue, panelColla
 const f = (window as any).hoverFixture;
 f.state = () => usePromptQueueStore.getState().getQueue('owner');
 f.scope = () => ({ policy: useAutoCompactStore.getState().policy, activeSpaceId: useWorkspaceStore.getState().activeSpaceId });
+f.compactPolicy = (patch: object) => useAutoCompactStore.setState({ policy:
+  normalizeAutoCompactPolicy({ ...useAutoCompactStore.getState().policy, ...patch }) });
 f.navigation = [];
 f.minor = () => {
   const current = usePromptQueueStore.getState();
@@ -128,14 +131,32 @@ f.legacy = () => {
     autoRun: true, loopPromptEnabled: true, loopPromptText: 'Legacy Loop' }]]) } as any);
 };
 useAutoCompactStore.setState({ hydrated: true, policy: { ...useAutoCompactStore.getState().policy,
-  scopeInitialized: true, workflowIds: ['hover-workflow'] } });
+  enabled: true, scopeInitialized: true, workflowIds: ['hover-workflow'] } });
 const activity = { processStatus: new Map(), busyTabs: new Map(), pasteBusyTabs: new Map(), inheritedBusyTabIds: new Set(), awaitingTabs: new Map() };
 function GlobalFixture() {
   const [toolbar, setToolbar] = React.useState(false);
+  const [revision, setRevision] = React.useState(0);
   const [width, setWidth] = React.useState(400);
   const [presentation, setPresentation] = React.useState<'workspace' | 'dashboard'>('workspace');
   f.header = (nextWidth: number, nextPresentation: 'workspace' | 'dashboard' = 'workspace') => {
     setWidth(nextWidth); setPresentation(nextPresentation);
+  };
+  f.routingExample = () => {
+    localStorage.setItem('noted-terminal-global-run-after-size', JSON.stringify({ width: 780, height: 740, resizeEnabled: false }));
+    const current = useWorkspaceStore.getState().openProjects.get(projectId)!;
+    const names = { owner: 'uav: ai-дэшборд', source: 'субтитры в браузере', alternative: 'проблемы с телеграм' };
+    useWorkspaceStore.setState({ openProjects: new Map([[projectId, { ...current,
+      tabs: new Map(tabs.map(tab => [tab.id, { ...tab, name: names[tab.id] }])) }]]) } as any);
+    const base = usePromptQueueStore.getState().getQueue('owner');
+    const step = (id: string, title: string) => ({ id, title, titleManual: true, text: title, images: 0, chips: [], imagePaths: [],
+      trigger: { kind: 'onTab', tabId: 'source' } });
+    usePromptQueueStore.setState({ queues: new Map([
+      ['owner', { ...base, autoRun: true, runAfterTabId: null, postPromptEnabled: false, loopPromptEnabled: false,
+        items: [step('roles', 'завершение системы ролей и тестов')] }],
+      ['alternative', { ...base, autoRun: true, runAfterTabId: null, postPromptEnabled: false, loopPromptEnabled: false,
+        items: [step('browser', 'возобновление работы с браузером mcp')] }],
+    ]) } as any);
+    setToolbar(false); setRevision(value => value + 1);
   };
   f.layoutAndRewind = () => {
     localStorage.setItem('noted-terminal-global-run-after-size', JSON.stringify({ width: 1100, height: 740, heightFixed: true }));
@@ -151,8 +172,8 @@ function GlobalFixture() {
     setToolbar(true);
   };
   return toolbar ? <div data-global-toolbar-fixture style={{ width }}>
-    <SidebarToolsRow projectId={projectId} presentation={presentation} trailingControls={<GlobalRunAfterControl />} />
-  </div> : <GlobalRunAfterControl />;
+    <SidebarToolsRow projectId={projectId} presentation={presentation} trailingControls={<GlobalRunAfterControl key={revision} />} />
+  </div> : <GlobalRunAfterControl key={revision} />;
 }
 function BellFixture() {
   const [open, setOpen] = React.useState(false);

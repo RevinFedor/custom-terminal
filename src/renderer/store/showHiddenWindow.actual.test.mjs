@@ -10,6 +10,11 @@ import * as displays from '../utils/windowDisplayLayouts.mjs';
 import * as spaces from '../utils/workspaceSpacesModel.mjs';
 import { touchMru } from '../utils/tabSwitcherModel.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
+import { organizationPlacementIntent } from '../utils/workflowPlacementMembership.mjs';
+import { tabNavigationLocation } from '../utils/tabNavigationLocation.mjs';
+import * as links from '../utils/tabLinkNavigation.mjs';
+import * as placement from '../utils/tabPlacementResolver.mjs';
+import { webcrypto } from 'node:crypto';
 
 // Run the actual store methods and its display-reconciliation boundary in
 // Zustand. Only persistence, UI and renderer instrumentation are local seams.
@@ -27,6 +32,8 @@ const names = [
   'showHiddenWindow', 'activateCenterTab', 'switchTab', 'touchGlobalTabMru',
   'getFocusedProjectId', 'requestTabListReveal', 'setProjectView', 'workspaceSpaceIndexOfTab',
   'addEmptySplitPane', 'addVerticalSplitPane',
+  'minimizeWorkspaceWindow',
+  'openTabById', 'placeTab', 'setViewingSubAgent',
 ];
 const methods = names.map(name => {
   const property = object.properties.find(candidate => candidate.name?.getText(ast) === name);
@@ -34,7 +41,9 @@ const methods = names.map(name => {
   return property.getText(ast);
 });
 assert.ok(setStatement);
-const code = transformSync(setStatement.getText(ast)
+const navigationOwner = ast.statements.find(statement => ts.isFunctionDeclaration(statement)
+  && statement.name?.text === 'withOwnedTabNavigation');
+const code = transformSync('let ownedTabNavigation = null;\n' + navigationOwner.getText(ast) + '\n' + setStatement.getText(ast)
   + '\nconst activationFollowPatch = ' + variable('activationFollowPatch').initializer.getText(ast)
   + ';\nmodule.exports = {' + methods.join(',\n') + '};', { loader: 'ts', format: 'cjs' }).code;
 const clone = value => JSON.parse(JSON.stringify(value));
@@ -85,13 +94,14 @@ function fixture({ chooser = false, vacant = false, customLayout = null } = {}) 
         splitPanes: [{ ...chip('target', 'q'), windowId: 'dormant-window' }], splitFocusedIndex: 0,
       }, small) },
     ],
-    tabListRevealRequest: null,
+    tabListRevealRequest: null, tabCatalog: {},
   };
   const effects = [], writes = [];
   const store = createStore((baseSet, get) => {
     const module = { exports: {} };
     vm.runInNewContext(code, {
-      module, baseSet, get, ...panes, ...displays, ...spaces, touchMru, isVisitWorthRecording,
+      module, baseSet, get, ...panes, ...displays, ...spaces, ...links, ...placement, touchMru, isVisitWorthRecording,
+      organizationPlacementIntent,tabNavigationLocation,crypto:webcrypto,
       performance, console: { log() {}, warn() {}, info() {} },
       startTransition: fn => fn(), requestAnimationFrame: fn => fn(), markRendererActivity: () => () => {},
       emitTabCompletionNotificationCleared: event => effects.push({ kind: 'notification', ...event }),
@@ -100,6 +110,7 @@ function fixture({ chooser = false, vacant = false, customLayout = null } = {}) 
     });
     return { ...initial, ...module.exports,
       saveSession: () => effects.push({ kind: 'save-session' }),
+      ensureTabRuntime: async () => true,
       switchWorkspaceSpace: () => assert.fail('reveal must stay in the current workflow'),
     };
   });
@@ -129,6 +140,91 @@ function oneVisibleWithHidden({ placeholder = false } = {}) {
     ],
   }, small);
 }
+
+test('manual minimize preserves the window and content, remembers only this display choice',()=>{
+  const f=fixture(),before=f.store.getState(),outgoing=before.splitPanes.find(p=>p.windowId==='outgoing');
+  const external=clone(before.windowDisplayLayouts.external);
+  assert.equal(before.minimizeWorkspaceWindow('main','outgoing'),true);
+  const next=f.store.getState(),hidden=next.splitPanes.find(p=>p.windowId==='outgoing');
+  assert.equal(hidden.displayHidden,true);assert.deepEqual(panes.paneSlots(hidden),panes.paneSlots(outgoing));
+  assert.deepEqual(hidden.history,outgoing.history);assert.deepEqual(hidden.detachedTabs,outgoing.detachedTabs);
+  assert.deepEqual(next.windowDisplayLayouts.external,external);assert.equal(next.activeSpaceTab.tabId,'a');
+  const roundTrip=displays.applyWindowDisplay(displays.applyWindowDisplay(next,big),small);
+  assert.equal(roundTrip.splitPanes.find(p=>p.windowId==='outgoing').displayHidden,true);
+  assert.equal(next.minimizeWorkspaceWindow('another-workflow','left'),false);
+  assert.equal(next.minimizeWorkspaceWindow('main','outgoing'),false);
+});
+
+test('secondary link returns a previously swapped hidden window to its second column, not the focused first',async()=>{
+  const f=fixture();
+  assert.equal(f.reveal(1,'incoming',chip('target','q')),true);
+  assert.equal(f.reveal(1,'outgoing',chip('b')),true);
+  f.store.getState().activateCenterTab('p','a');
+  assert.equal(f.store.getState().splitFocusedIndex,0);
+  const left=f.store.getState().splitPanes[0];
+  const strips=f.store.getState().splitPanes.map(pane=>[pane.windowId,clone(panes.paneSlots(pane))]);
+  assert.equal(await f.store.getState().openTabById('target',{reason:'orchestration-linked-tab'}),true);
+  const state=f.store.getState();
+  assert.equal(state.splitFocusedIndex,1);
+  assert.equal(state.splitPanes[0],left);
+  assert.equal(state.splitPanes[1].windowId,'incoming');
+  assert.equal(state.splitPanes[1].tabId,'target');
+  for(const [id,strip] of strips)assert.deepEqual(panes.paneSlots(state.splitPanes.find(p=>p.windowId===id)),strip);
+});
+
+test('secondary link without a position on this display uses the current visible window',async()=>{
+  const f=fixture();
+  assert.equal(await f.store.getState().openTabById('target'),true);
+  assert.equal(f.store.getState().splitPanes[0].windowId,'incoming');
+  assert.equal(f.store.getState().splitFocusedIndex,0);
+});
+
+test('portal link without remembered position uses its source window, not another global focus',async()=>{
+  const f=fixture(); f.store.getState().activateCenterTab('p','b');
+  assert.equal(f.store.getState().splitFocusedIndex,1);
+  assert.equal(await f.store.getState().openTabById('target',{sourceTabId:'a'}),true);
+  assert.equal(f.store.getState().splitPanes[0].windowId,'incoming');
+  assert.equal(f.store.getState().splitPanes[1].windowId,'outgoing');
+  assert.equal(f.store.getState().splitFocusedIndex,0);
+});
+
+test('remembered hidden destination survives another display and JSON reopen',async()=>{
+  const f=fixture();
+  f.reveal(1,'incoming',chip('target','q')); f.reveal(1,'outgoing',chip('b'));
+  const returned=displays.applyWindowDisplay(displays.applyWindowDisplay(f.store.getState(),big),small);
+  const reopened=fixture({customLayout:clone(spaces.captureSpaceLayout(returned))});
+  reopened.store.getState().activateCenterTab('p','a');
+  assert.equal(await reopened.store.getState().openTabById('target'),true);
+  assert.equal(reopened.store.getState().splitFocusedIndex,1);
+  assert.equal(reopened.store.getState().splitPanes[0].windowId,'left');
+});
+
+test('late runtime completion after hidden reveal cannot refocus the window or claim navigation success',async()=>{
+  const f=fixture(); f.reveal(1,'incoming',chip('target','q')); f.reveal(1,'outgoing',chip('b'));
+  f.store.getState().activateCenterTab('p','a');
+  let finish;
+  f.store.setState({ensureTabRuntime:id=>id==='target' ? new Promise(resolve=>{finish=resolve;}) : Promise.resolve(true)});
+  const opening=f.store.getState().openTabById('target');
+  assert.equal(f.store.getState().splitFocusedIndex,1);
+  assert.equal(await f.store.getState().openTabById('a'),true);
+  finish(true);assert.equal(await opening,false);
+  assert.equal(f.store.getState().splitFocusedIndex,0);
+  assert.equal(f.store.getState().activeSpaceTab.tabId,'a');
+});
+
+test('minimizing the last visible window keeps a picker access point without revealing a hidden tab',()=>{
+  const f=fixture({customLayout:oneVisibleWithHidden()}),state=f.store.getState(),mru=clone(state.globalTabMru);
+  assert.equal(state.minimizeWorkspaceWindow('main','left'),true);
+  const next=f.store.getState(),visible=next.splitPanes.filter(p=>!p.displayHidden);
+  assert.equal(visible.length,1);assert.equal(visible[0].tabId,'');assert.notEqual(visible[0].windowId,'left');
+  assert.equal(next.activeSpaceTab,null);assert.deepEqual(next.globalTabMru,mru);
+  assert.equal(next.splitPanes.find(p=>p.windowId==='left').displayHidden,true);
+  assert.equal(next.minimizeWorkspaceWindow('main',visible[0].windowId),false,'access placeholder cannot grow an endless hidden empty-window list');
+  assert.equal(f.store.getState().splitPanes.length,next.splitPanes.length);
+  assert.equal(next.showHiddenWindow(next.splitFocusedIndex,'left'),true);
+  assert.equal(f.store.getState().splitPanes.some(p=>p.windowId===visible[0].windowId),false);
+  assert.equal(f.store.getState().activeSpaceTab.tabId,'a');
+});
 
 for (const side of ['right', 'left', 'above', 'below']) {
   test(`actual ${side} split reveals the existing hidden window atomically instead of making a blank`, () => {

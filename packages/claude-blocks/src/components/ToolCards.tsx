@@ -10,6 +10,7 @@ import React from 'react';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { ToolCard } from './ToolCard';
+import { ConversationMessage } from './ConversationMessage';
 import { DiffView } from './DiffView';
 import { FileTextIcon, FileEditIcon, toolIcon } from '../icons';
 import {
@@ -558,6 +559,9 @@ export interface ToolCallProps {
   args: Record<string, any>;
   result?: any;
   isError?: boolean;
+  /** Verified host projection, not classification by tool label/body words.
+   * Original args/result still own Copy; this is presentation only. */
+  questionReply?: { kind: string; title: string; text: string; items: Array<{ answer: string }> };
   /** 1-based file line where an Edit's hunk begins — gives the diff gutter REAL
    *  line numbers. The host computes it (it knows where old_string matched);
    *  the package can't recover it after the edit. Omit → gutter is 1..N. */
@@ -584,7 +588,7 @@ export interface ToolCallProps {
   onCopy?: (text: string) => void;
 }
 
-export const ToolCallPart: React.FC<ToolCallProps> = ({ toolName, args, result, isError, startLine, diffHunks, awaitingApproval, family, headline, mcpServer, mcpMethod, collapse, onCopy }) => {
+export const ToolCallPart: React.FC<ToolCallProps> = ({ toolName, args, result, isError, questionReply, startLine, diffHunks, awaitingApproval, family, headline, mcpServer, mcpMethod, collapse, onCopy }) => {
   const status = toolStatusFrom(result, isError, awaitingApproval);
   // Built lazily: a collapsed row must not pay for a string nobody requested,
   // and a dehydrated result would be materialised for nothing.
@@ -592,6 +596,14 @@ export const ToolCallPart: React.FC<ToolCallProps> = ({ toolName, args, result, 
     ? { onCopy, getCopyText: () => toolCopyText(toolName, args, result, diffHunks) }
     : {};
   const inj = { ...(collapse || {}), ...copyInjection };
+  if (questionReply?.kind === 'question-reply') {
+    return <ConversationMessage layout="block" tone="info" className="cb-question-reply-tool">
+      <ToolCard status={status} icon={toolIcon(toolName)} label={questionReply.title}
+        preview={questionReply.items.map(item => item.answer).join(' / ')}
+        body={<div className="cb-msg-text" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{questionReply.text}</div>}
+        {...inj} />
+    </ConversationMessage>;
+  }
   if (toolName.startsWith('mcp__') || toolName === 'MCP' || family === 'mcp') {
     return (
       <McpToolCard

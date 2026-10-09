@@ -6,6 +6,48 @@ Codex поддержан как третий PTY-agent рядом с Claude и G
 
 Сводный шрам про ложную привязку, production-доказательства и принятый lifecycle-контракт: [`fix-codex-привязка-сессии.md`](fix-codex-привязка-сессии.md).
 
+## Версия CLI и полноэкранная история внутри терминала
+
+Глобальное `npm install -g @openai/codex` обновляет бинарь для следующих запусков,
+но не заменяет уже работающие процессы. Версию бинаря, версию конкретного процесса
+и tag локального source checkout нельзя смешивать: `packages/codex` не обновляется
+от npm. При сравнении брать exact прежний/новый tag, не HEAD checkout.
+
+В Codex fullscreen transcript появился опционально в0.156 и стал default в0.157;
+это не нововведение0.162. В нём Codex владеет скроллом, выделением, поиском и
+`Back to bottom`, а terminal emulator показывает текущий экран. Наш штатный
+launch сохраняет `--no-alt-screen`, поэтому обычный запуск в Terminal.app может
+выглядеть иначе. `/tui` сохраняет предпочтение для следующего запуска, не отменяет
+launch override; отдельный Ctrl+T viewer не равен постоянному fullscreen.
+Источник: [официальный changelog](https://learn.chatgpt.com/docs/changelog) и
+source0.162 `transcript_mode.rs`/`app/tui_mode_picker.rs`.
+
+`--no-alt-screen` появился уже в первой интеграции `cd938c5` от11.06.2026.
+Отдельный первоначальный мотив не восстановлен: объяснение обхода shell alias
+относилось к `command codex`, не к этому флагу. Позднее два Dashboard-reader
+стали узнавать наши Codex-процессы по наличию аргумента. Поэтому удаление флага
+только из launcher потеряет эти карточки; это не доказательство, что вся
+writer identity или xterm требуют inline-режима. Флаг не является доказанной
+оптимизацией ресурсов и при ремонте совместимости0.162 не менялся.
+
+Рисование ограничено viewport, но Codex сохраняет историю и кэш раскладки;
+это перенос части работы из scrollback эмулятора, не доказательство меньших
+суммарных CPU/RAM. В Noted дополнительно остаются headless mirror и собственная
+History. Сравнение Terminal.app и Noted само по себе не изолирует стоимость TUI.
+
+09.10 полный private DEV ABBA на750MiB/272turns показал более быстрый cold
+Send→request и меньше CPU на этот этап вfullscreen, но не устойчивую экономию
+RAM/idleCPU. Замер использовал одинаковый локальный model response через реальный
+Noted proxy и private readiness-прототип, не неизменённое production-приложение.
+Без прототипа Send блокировался: подmodel/effort стоит`? for shortcuts`, а reader
+ожидает model в последней непустой строке. При просмотре истории нижняястрока
+меняется на`Earlier messages available` и даже узкий prototype не выдаёт нового
+settings proof на сохранённом реальном кадре. Actual live proof model/effort/Fast
+на startup и fresh empty composer послеответа получены; полный scroll/streaming/
+draft/modelchange контракт этим не закрыт. Цифры/метод/границы —
+[`fact-terminal-rendering.md`](fact-terminal-rendering.md), «Codex0.162 fullscreen
+против inline». Default и продуктовый source в этом исследовании не менялись.
+
 ## Открытое ядро без TUI: граница возможной интеграции
 
 В upstream Codex 0.159.3 есть `codex-core-api` и `thread-manager-sample`:
@@ -314,6 +356,13 @@ Child rollout может скопировать сотни мегабайт sour
 Стартовые параметры Codex двухслойные. StatusBar хранит app-level defaults (`defaultCodexModel/defaultCodexEffort`); `none` означает «не добавлять CLI override, пусть Codex читает `~/.codex/config.toml`». На fresh-tab ControlBar может хранить per-tab `codexModel/codexEffort`, и tab-scoped значения выигрывают над StatusBar. Если итоговые значения не `none`, fresh `codex` получает `--model` и `-c 'model_reasoning_effort="..."'`.
 
 Fresh и restore/fork нельзя склеивать. Обычный `codex` действительно потребляет выбранную tab/global пару и только после принятого запуска сохраняет её как fallback вкладки. `codex-c` и `codex-f` обязаны восстановить точную пару из source rollout; renderer launch payload не сохраняется как будто он уже стал состоянием нового writer. Иначе между кликом и writer proof UI показывает чужую пару, а crash в этом окне делает ложь durable. Общий launch helper всё ещё обязателен для всех путей, но main различает fresh defaults и source settings; AutoResume/Resume All/Continue/Fork не повышают локальный UI-кэш до истины.
+
+Первый доказанный writer может иметь тот же SID, но всё равно требует атомарного
+сохранения перенесённых model/effort/proof. Нельзя убирать эту запись ради совпадения
+SID: пропадёт settings handoff. Для native v2 её storage revision согласуется с
+полным renderer snapshot по SQL-proof Main-owned полей; аналогичный путь нужен
+context% seed. Это не новый writer/runtime proof и не разрешение переписать чужие
+metadata — см. `fact-data-persistence.md::Native metadata-save после точечной записи Main`.
 
 С26.09 у обычного Resume есть узкое исключение для source `gpt-reserve`:
 доказанный прежний выбор той же сессии возвращается при свежем разрешении
@@ -784,6 +833,11 @@ at capacity. Please try a different model.` и `turn_id`. Это отказ пр
 второй Enter. До вставки проверяются tab/session/turn/process generation,
 чужой draft сохраняется, остановленная вкладка автоматически не запускается.
 
+SOURCE09.10 visual: доказанный system/codex-capacity-retry в History/Timeline
+оформляется как `Continue` — серый текст, блеклый фиолетовый фон и обычная круглая
+точка, не MCP-ромб. Общий presentation helper отличает его от Loop и literal
+continue человека; origin, retry policy/счётчик, audit и raw body не меняются.
+
 Настройка N — число последовательных повторов без настоящей работы.
 Ответ assistant, непустое reasoning или вызов инструмента обновляют лимит;
 user/`continue`, task_started, token_count, Goal и служебный recap — нет.
@@ -935,6 +989,13 @@ turn ID, до public projection. Live, suppressed и catch-up использую
 путь; History остаётся reader и не может поздним task_started включить старый
 ход. Завершение одного network segment не является завершением всего turn.
 
+При таком settle provider publisher обновляет activity/runtime, но не выпускает
+собственный `codex:busy-state` о конце turn: полный event принадлежит последующему
+`emitCodexBusy`, который уже применил точный TaskCompletion intent. Ранний
+metadata-free idle расходовал renderer busy→idle и оставлял Loop включённым после
+принятого `complete_task` (hh-tool507,09.10). Отключать сам settle нельзя — это
+вернуло бы описанный выше background busy. Подробности — `fact-prompt-queue::Loop`.
+
 Регрессии: `codex-tui-readiness.test.js`, `codex-resume-user-activity.test.js`,
 `codex-provider-terminal-outcome.test.js`,
 `codex-picker-lifecycle.test.js`. Physical proof — основной living-plan.
@@ -1057,6 +1118,42 @@ Rollout не является произвольным внешним API. Ра�
 
 ## Timeline и History
 
+### Частичный ответ и результаты по порядку завершения
+
+`partial_answer` в Codex0.162 — самостоятельный устойчивый фрагмент ответа,
+после которого допустимы tools. Он сохраняется через canonical и live reader,
+row stub и renderer: короткая длина не превращает его в caption либо часть
+свёрнутой группы edits. При этом он не выбирается как final Timeline preview,
+не получает completed response timing и не завершает turn. Старые commentary,
+final_answer и legacy rows без phase сохраняют свои правила.
+
+Новые `stream_settled`/`as_settled` выдают результаты по завершению, а `index`
+относится к входному массиву/Map, не порядку `tools.*` в исходнике. Сопоставление
+разрешает только доказанная статическая связь input→call плюс полный envelope;
+JS не исполняется. Alias, мутация, пропущенный/повторный индекс или вывод только
+`result.value` не дают права приклеивать соседний результат. В таком случае
+полный общий вывод остаётся у enclosing Script, а не у выдуманного child owner.
+Прежние последовательные/Promise.all/allSettled формы идут прежним путём.
+
+Связь должна переживать exec→несколько wait→completion и checkpoint/refresh.
+Machine header running-cell читается до отделения уже пришедшего output;
+иначе первый результат скрывает cell ID и последующий wait теряет владельца.
+Live и durable проекции обновляют каждую частичную порцию, сохраняя ранее
+доказанные child identities и допуская поздние соседние результаты. Проверка
+actual parser/Main methods с синтетическими records — `codex-data.compat162.test.js`;
+это не physical provider/UI acceptance и не изменение Send receipt.
+
+Обычный async exec тоже хранит исходный call и накопленные output parts до
+completion, не только индексированный settled exec. Среди его действий бывают
+Task-карточки без `rawTool`: присваивание всем `action.rawTool.result` ломало
+полное чтение сохранённой истории.09.10 tab4929: файл166MB существовал и дал
+14029records/errors0, но cold History/Timeline после cache-version mismatch
+падали с `Cannot set properties of undefined (setting 'result')`. Завершение
+через общий decoder сохраняет native child identity и позиции обычных результатов;
+просто пропустить Task нельзя. Регрессии: `codex-data.async-cell-task.test.js`.
+Generic History read error не доказывает ни удаление файла, ни lineage failure;
+эти причины различаются по availability/diagnostics, не по одному экрану ошибки.
+
 `event_msg/task_complete.error` является сохранённым отказом хода, даже если
 assistant-message вообще не появился. History выводит `usage-limit` для typed
 usage_limit_exceeded и `provider-error` для остальных отказов. Общий
@@ -1113,6 +1210,25 @@ canonical user-carrier. Иначе Timeline чеканит адресуемую 
 не по расстоянию в строках: между ними законно стоят `world_state`,
 `turn_context` и `token_count`.
 
+У preamble без `turnKey` есть другая граница: он принадлежит предыдущему
+compact до следующего canonical user/compact или смены physical source.
+Нельзя удалять все такие записи лишь потому, что в диапазон попал хотя бы один
+compact. Проверка 09.10 показала `success:true` при потере `developer` и
+`turn_context` после **сохранённого** последнего compact. Исправление связывает
+очистку с конкретным удаляемым compact; initial preamble нового root также
+удаляется, а инструкции/настройки сохранённого хвоста остаются. Восстановить
+только model/effort недостаточно: это не возвращает потерянную инструкцию.
+
+Prefix Delete намеренно захватывает следующие подряд compact. Для сохранения
+последних четырёх нужно оставить и canonical user перед первым из них, а не
+заканчивать выделение на этом user: иначе расширение удалит ещё один compact.
+При нескольких соседних compact сохраняется больший запас. Низкоуровневые
+HTTP `/delete-range` и `/edit-range` не имеют dry-run: `validateOnly`/`dryRun`
+в body не передаются исполнителю. Их POST нельзя использовать как пробу.
+Сокращение под прежним SID не заменяет COW: меняются физические номера строк,
+старые notes/rewind addresses и чужие frozen ranges требуют своего переноса.
+Граница реального освобождения original — [Storage](fact-хранилище-сессий.md).
+
 Остановка хода также имеет две разные проекции. Codex может записать
 provider-owned `response_item` с `role=user` и телом `<turn_aborted>…`, а затем
 структурный `event_msg.turn_aborted`. Это один lifecycle-факт, не новый prompt:
@@ -1149,6 +1265,18 @@ run» описывает чтение актуальных файлов, а не
 
 `codex:get-full-history` строит HistoryPanel из `response_item`: reasoning summary идёт в thinking, assistant message — в обычный ответ, `function_call` + `function_call_output` превращаются в raw tool carrier для общего `claude-blocks` renderer. Новый Codex tool surface записывает реальные вызовы верхнеуровневым `exec`, а их имена и аргументы оставляет внутри JavaScript source (`tools.exec_command(...)`, `tools.apply_patch(...)`, `tools.mcp__...(...)`). History обязан снять эту transport-оболочку до renderer: shell становится Bash-карточкой, `apply_patch` раскладывается по файлам в Edit/Write/MultiEdit, image/read — в Read, MCP — в компактную MCP-карточку. Парсер читает только вызовы вне строк и комментариев и разбирает безопасный literal-subset без `eval`; иначе пример `"tools.exec_command(...)"` или строка внутри самого patch создаст ложное действие. Симптом нарушения этой границы — строки `EXEC const r = await tools...` в History; это потеря семантики в rollout adapter, а не проблема CSS-пакета.
 
+Для явной shell-записи (включая Python `Path.write_text`) общий History grammar
+показывает Edit и имя файла, хотя transport carrier остаётся Bash. Шрам09.10,
+tab4929: `cmd:String.raw` терял command до этого классификатора, поэтому были
+и `Exec Command` в History, и ложное внешнее обновление собственного Markdown.
+Общий decoder теперь читает закрытый raw literal через AST без исполнения:
+сохраняет `\\n`/`\\t` буквально, не подставляет неизвестные выражения. Условный,
+не-awaited или изменяющий intrinsic скрипт не получает такого разрешения.
+Live, durable History и linked-file observer используют один результат; доказательство
+успешной записи остаётся отдельным call/result + file transition. Prepared worker
+cache включает source parser в hash, поэтому новая версия пересчитает старые карточки;
+provider transcript и уже отправленные context wrappers не переписываются.
+
 При response-first promotion сохраняется прежняя audit-пара timestamp/hash
 в `promptPresentationAuditAliases`, а не только source/UUID alias. Иначе
 подтверждённый по раннему carrier prompt теряет attached metadata в History:
@@ -1157,7 +1285,146 @@ run» описывает чтение актуальных файлов, а не
 исходников parser/preparation, поэтому новая сборка не переиспользует старую
 проекцию, потерявшую alias; ручная правка истории или очистка БД не нужна.
 
+### Native compact виден в TUI, но History остаётся Working
+
+У proxied Codex есть нетекстовый признак запроса `request_kind=compaction`.
+Он читается `provider-semantic-shadow.js` и попадает в REQUEST-диагностику
+с exact causal writer/session/turn. Шрам08–09.10: emit терял requestKind и
+передавал generic `turn_started`, поэтому Main публиковал `provider-response`,
+а History оставался Working до появления позднего compacted. Теперь typed
+requestKind/sessionId сохраняются; при совпадении живого writer, watcher и
+lifecycle Main включает прежний `agent:operational-phase`/compact registry.
+Observed source `provider-compaction` не притворяется командой: command/handoff/
+sendOperationKey/attempt остаются null. Уже существующий explicit `/compact`
+или pending intent не заменяется этим наблюдением и сохраняет causal start.
+
+Observed phase хранит exclusive rollout EOF перед запросом. Только новый
+compacted того же владельца на/после EOF завершает её; старый prefix и чужая
+generation не подходят. Она заканчивается на compacted, не ждёт конца обычного
+ответа, который может продолжиться. Whole-turn busy/outcome и Loop остаются у
+своих прежних владельцев. Request end не даёт success/idle; потеря source даёт
+unknown, app restart не восстанавливает фазу по старой истории. History временно
+показывает `Compacting · mm:ss` от startedAt операции, не переписывая исходный
+response interval/Worked. Screen parsing для этой индикации не требуется.
+
+Read-only witness754 / SID2e712969, 08.10.2026 UTC: request codex-8369 принят как
+compaction17:16:32.196, на следующей строке ACTIVITY phase=provider-response;
+response закончился17:19:20.267, compacted/Timeline point появился после этого.
+Начало этой фазы можно узнавать без чтения terminal screen. Конец HTTP-сегмента
+сам по себе не заменяет durable compact outcome и не завершает весь turn;
+native compaction нельзя выдавать за новый пользовательский `/compact` receipt.
+
+### Неблокирующие вопросы (`request_user_input_async`)
+
+На Codex0.159.2 подтверждён отдельный prompt stack для вопросов:
+`? 1 question · shift+← to answer` показан одновременно с `Working`.
+Это проверено08.10 через Terminal Output API на tab4929. Shift+← в этой
+подсказке открывает отложенный вопрос; старый source checkout0.147 использует
+тот же chord также для редактирования queued message и не объясняет новый flow.
+
+Версионная граница09.10: macOS source0.162 отображает модификаторы как `⇧`/`⌃`,
+а не `shift+`/`ctrl+`; physical chords прежние. Exact upstream snapshots с
+синтетическими style/committed-frame metadata воспроизвели потерю expanded и
+collapsed detection прежним mirror. SOURCE grammar теперь принимает оба набора
+подсказок; текст вопроса/options/draft не нормализуется, frame/style/owner guards
+не ослаблены. Проверка actual Main Send preparation узнаёт expanded и вызывает
+прежний возврат в main composer. Writer effects в ней controlled; прежняя
+native0.159.2 приёмка ниже не становится physical0.162 приёмкой от этого ремонта.
+
+Вызов `request_user_input_async` возвращает `{"accepted":true}` до ответа
+человека. Public turn evidence tab3607: exact call
+`call_9631290e43ca42309e6560732ab9dfc5`,08.10 04:35:04.039→04:35:04.431UTC,
+затем тот же turn продолжает tools. Вопросы имеют `title` и optional `options`
+из строк, а не прежнюю blocking-схему `question/header/id/options.description`.
+Schema generator того же установленного binary подтверждает `agentMessage`
+с optional `questions` и `delivery:"async"`; наличие схемы не означает, что
+PTY observer уже публикует эти поля. Нельзя переносить Claude clearing по
+произвольному `busy:false`: successful tool result не подтверждает человеческий
+ответ/пропуск, а доступность native формы — отдельный факт.
+
+**Live turn end закрывает native форму.** Whole visible DEV probe02 с настоящим
+Codex0.159.2 подтвердил ordinary UI Send→3questions+accepted→sleep25→task_complete:
+вопросы видны во время working, после конца хода Shift+← уже не открывает их.
+Это не proof answer/skip. Upstream того же tag (`ff6aec96948b70d94983af2641a6b67c94faeff5`)
+объясняет переход: `chatwidget/protocol.rs` на completed/interrupted/failed
+вызывает `take_question_drafts`, который очищает pending и возвращает набранные
+ответы в обычный composer. Native Ctrl+] пропускает только локальную карточку;
+`accepted:true` в прежнем tool result от этого не изменяется. Код задаёт также
+30s countdown collapsed вопросов и снимает его при раскрытии; countdown не
+следует превращать в наш guessed receipt либо таймер закрытия без native proof.
+
+**Точная идентичность ответа есть.** Native question ID — JSON.stringify
+`["request_user_input_async", messageId, questionIndex]`, где messageId=call_id.
+
+Диктовка в свободный ответ использует общий receiptv2 для input/textarea:
+owner-key включает текущий native targetId и questionKey. Это сохраняет draft,
+выделение и Undo обычного браузерного редактирования, но не даёт delayed Paste
+примениться к следующему вопросу на переиспользованном DOM-элементе. «Ответить»
+остаётся прежним control-native-question. Инцидент09.10/граница v1→v2 и проверки —
+`fact-dictation.md::Вставка из Voice Record через буфер обмена`.
+Официальный `context-fragments/answered_question.rs` формирует
+`<send_user_message_question_reply>` с JSON-массивом `questionItemId/question/answer`;
+TUI `async_question_reply.rs` понимает этот envelope в обычном user input.
+После исчезновения native формы сохранённый вопрос не становится снова native
+pending от чтения старого JSONL. Согласован native-only контракт: своя только
+presentation-карточка, исчезновение native вопроса удаляет её; DB/app-owned queue
+не нужна. Skip доступен до раскрытия и не останавливает turn, отдельный спокойный
+фиолетовый tab/workflow сигнал не меняет busy. Whole visible DEV retake04
+с настоящим Codex0.159.2 подтвердил options/free-answer и collapsed Skip во время
+busy parent: native count3→2→1→0, draft сохранён, оба ответа имеют exact canonical
+questionItemId/call link. Это не provider receipt для локального Skip. Обычный
+Send при открытом question editor сначала возвращает main composer ДО проверки
+draft/захвата paste revision через прежний write lock; в том же прогоне он дал
+обычный user_message без question-reply envelope. Сохранение pending после этого
+Send не гарантируется: Noted зеркалит native disappearance, не создаёт свою очередь.
+Проектный checkout0.147
+не переключался: новый tag прочитан через git object, без патча Codex binary.
+
+Saved wire подтверждён также живым canonical API: SID4a2ba840, hh-tool tab367,
+reply UUID10099/source58042212 от08.10 12:53:25.733UTC с полным reserved envelope
+ссылается на call4933db959b6f47068f54a5e02e8b7b3c/questionIndex0. Origin UUID9969
+имеет тот же exact title, два options и accepted:true. `:canonical:0` в toolUseId
+обозначает action index, не question index; их совпадение здесь не общее правило.
+Проверены bounded `/history?view=history&around=<uuid>&radius=2` и before/last,
+а не raw JSONL. Это доказательство сохранённой пары, не приёмка нового Noted UI
+answer/skip и не разрешение строить saved provenance из transient pending mirror.
+
+Saved reply presentation в Desktop SOURCE проверяет complete envelope и exact
+raw-call/index/title link, затем full body hash. Это тот же classifier для
+History и Timeline: синий readable Q/A, но canonical content/Copy/UUID/time/audit
+не переписываются. Unknown/quoted/malformed/ambiguous остаются literal; старый
+`accepted:true` не создаёт answer. Proof переживает оба carrier порядка и
+checkpoint, не требует N+1 чтения origin при hover. Native mirror/count/skip
+не являются его источником; см. `fact-история-как-основная-поверхность.md::Сохранённый ответ на native-вопрос`.
+
+Busy/idle не является gate синего ответа: достаточно уже доказанного exact link.
+Live producer держит bounded definition hashes на physical rollout observer,
+отдельно от `liveToolCalls`: accepted output удаляет обычный call раньше human
+reply. Это metadata для display proof, не pending queue/availability. Certificate
+формируется по final body после прежнего response/event pairing и проходит через
+live user projection; generic потеря поля откладывала readable вид до конца parent.
+Whole visible native retake06 подтвердил два настоящих UI answer во время busy,
+blue Q/A до task_complete, сохранённый draft и одинаковые sourceIdentity/call/index/
+full UTF-8 body hash в live и canonical. Generated live UUID может отличаться от
+durable line UUID: связывать их только exact sourceIdentity/aliases, не текстом
+или номером turn. Не форсировать full History во время такой приёмки: saved
+refresh скроет сломанный live путь.
+
 ### In-process субагенты (multi_agent_v1 / collaboration)
+
+Navbar раскрытого child показывает **параметры его запуска**, а не текущие
+настройки родителя: task name остаётся в chip, сверху model/effort. В0.162
+`sub_agent_activity(kind=started)` несёт resolved child snapshot model и
+reasoning_effort; только exact event_id+agent_thread_id дают creation metadata.
+`interacted` приходит с None и не стирает её, дальнейшая смена настроек не меняет
+исторический launch. Для старых записей fallback — первая собственная настройка
+после root-meta/exact NEW_TASK, не copied ancestor turn_context и не latest
+Resume settings. Недоказанное остаётся «Модель — / effort —», без parent/default.
+Метаданные проходят existing Task/stub/live snapshot, а fallback берётся при уже
+открытом child reader: нет отдельного N+1 full History по всем детям. Async512KiB
+boundary scan ограничивает RAM/chunk, но не total copied-prefix I/O. Изменение
+проверено focused reader/component/hook cases и private paired build; это SOURCE,
+не новая physical/provider приёмка0.162 или установленная версия.
 
 Codex-субагенты приходят в rollout **двумя поколениями инструментов**, и History рендерит оба одинаковыми Task-карточками (тот же вид, что субагенты Claude SDK), а не сырыми JSON-вызовами. v1 — namespace `multi_agent_v1`: `spawn_agent` output несёт `{agent_id, nickname}`, результат приходит в output `wait_agent`/`close_agent`. v2 — namespace `collaboration`: у `spawn_agent` в arguments вместо текста задачи лежит **зашифрованный** блоб (`gAAAA…`, та же Fernet-капсула, что compact) — его нельзя показывать как описание карточки; человекочитаемое имя берётся из `task_name` → `/root/<task_name>`. Привязка call→карточка в v2 идёт через `event_msg.sub_agent_activity` (`event_id` = call_id вызова, `agent_thread_id` = session id дочернего rollout), а финальный текст — через `agent_message` response_item с префиксом `FINAL_ANSWER` (эта запись НЕ обычный assistant-ответ и не должна попадать в transcript отдельной строкой).
 
@@ -1171,11 +1438,52 @@ Codex-субагенты приходят в rollout **двумя поколен
 
 **Родитель — ненадёжный свидетель завершения; агент авторитетен о себе.** `wait_agent` штатно вызывается БЕЗ цели («дождись хоть кого-нибудь»), и его вывод `{"message":"Wait completed."}` не называет никого. Агент реально закончил, а в родительском rollout терминального события для него нет вовсе — карточка висит `running` вечно и держит лоадер вкладки. Прод-шрам 2026-07-29 (вкладка `tab-1743`, 5465 записей): из 36 запусков 12 без единого терминального события, 11 из них при этом явно завершены в собственных файлах. Лечение — последний проход после разбора rollout: для каждой оставшейся `running`-карточки берётся её дочерний rollout по `agentSessionId` и проверяется хвост (64KB) на `task_complete` / `phase: final_answer`. Нечитаемый или отсутствующий файл НЕ закрывает карточку: отсутствие доказательства не равно доказательству завершения. Реализация — `src/main/subagent-transcript.js::isAgentFinishedByOwnTranscript`, потребитель — конец `buildCodexFullHistory`, лог `[CodexSubagents] closed by own transcript: N/M`.
 
+Cold History прохода недостаточно для активного parent: тяжёлая история в этот
+момент намеренно отложена. Main подписывается на собственный файл exact accepted
+child и снимает active lease по его положительному completion независимо от
+renderer/parent wait; чтение ограничено64KB, watchers остаются лишь для активных
+children. Root поиска принадлежит CODEX_HOME, не безусловному host ~/.codex.
+Старый completion до текущего startedAt и новый task_started не завершают resumed
+работу; неизвестный/нечитаемый источник ничего не закрывает. Историческая карточка
+остаётся, но время заканчивается на own completedAt child, не на позднем parent
+wait. Exact provider/SID/generation/toolId связывает terminal facts с UI-карточкой.
+
+08.10 native0.159.2 дал ещё две скрытые формы: flat `multi_agent_v1_spawn_agent`
+внутри exec-loop создаёт несколько реальных UUID на одном call site; batched wait
+приходит full JSON array с `fulfilled.value.status[UUID].completed`. Namespace
+нормализуется по закрытому набору aliases, Task разворачивается только по actual
+identity receipts, не числу циклов/упоминаниям. Main и History используют один
+structural batch decoder; arbitrary соседний output не является completion.
+Прежний top-level-only decoder и host-only child lookup вместе дали count2 при
+двух completed карточках и растущие минуты после away/back в private E2E03.
+Whole visible retake04 подтвердил two real Luna/max child2→1→0 до parent end,
+own end timestamps и неизменные исторические52s/1m36s после возврата на вкладку.
+
 **`close_agent` терминален в ОБЕИХ формах ответа.** Форма зависит от того, успел ли агент закончить сам: `{"previous_status":{"completed":"<текст>"}}` — успел, `{"previous_status":"running"}` — закрыт на ходу (обычно после `wait_agent` с `timed_out:true`). Вторая форма — простая строка, чтение `.completed` из неё даёт `undefined`, и карточка оставалась `running` навсегда: для закрытого агента никакое событие уже не придёт. В корпусе 4 закрытия из 32 приходят строкой; поймано на `explorer`-агентах (2 из 7 в одной сессии висели живыми). Закрытие без собственного результата → `interrupted` + суффикс ` · закрыт` + человекочитаемая причина; закрытие уже завершённого агента не понижает его статус.
 
 **Типы агентов (`agent_type`) — не только `default`.** Каталог: `explorer` (быстрый read-oriented), `worker` (правки файлов), `luna_e2e` (ограниченный E2E с фиксированной моделью), `default`. По реальным вызовам за последние 60 сессий: без указания типа 97, `explorer` 67, `default` 24, `luna_e2e` 6 (`worker` есть в каталоге, но в проде не встретился) — то есть **дефолтный тип самый редкий**, а больше половины запусков идут либо безымянными, либо как `explorer`. Проверять поведение карточек только на `default` бессмысленно; в этой сессии именно так и потерялся баг с закрытием на ходу — он вылез только на `explorer`. Важно: счёт вести по реальным `function_call`, а не по вхождению слова в файл — каталог инструментов перечисляет все типы в каждом рollout и даёт кратно завышенную статистику. Отдельного namespace «мини-агентов» нет: роль задаётся типом, lifecycle-события у всех общие (`spawn_agent`/`wait_agent`/`resume_agent`/`send_input`/`close_agent` в `multi_agent_v1`). Параметра фонового запуска у `spawn_agent` нет — фоновость (`run_in_background`) относится к инструментам внутри вкладки, а не к субагентам Codex.
 
-**Возобновление завершённого агента (`resume_agent`) возвращает карточку в работу.** Зеркало Claude-дыры с `SendMessage`, найдено в тот же день: `resume_agent {id}` → `{"status":"pending_init"}`, затем `send_input` даёт агенту следующую задачу, и следующий `wait_agent` снова его завершает. Имя было в списке control-вызовов, но не обрабатывалось — карточка оставалась `completed` весь возобновлённый прогон, чип не возвращался. Обработка стоит рядом с `wait_agent`/`close_agent` и намеренно обходит монотонность статусов (это единственный легальный переход `completed → running`); для неизвестного агента и для `spawnRejected` — no-op. Прод-последовательность 04:31:54→04:38:11 воспроизводится по срезам rollout: `completed → resume → running → wait → completed → send_input → running → финал completed`.
+**Возобновление завершённого агента (`resume_agent`) возвращает карточку в работу.** Зеркало Claude-дыры с `SendMessage`, найдено в тот же день: `resume_agent {id}` → `{"status":"pending_init"}`, затем `send_input` даёт агенту следующую задачу, и следующий `wait_agent` снова его завершает. Имя было в списке control-вызовов, но не обрабатывалось — карточка оставалась `completed` весь возобновлённый прогон, чип не возвращался. Обработка стоит рядом с `wait_agent`/`close_agent` и намеренно обходит монотонность статусов только для work-start controls (`resume_agent`, `send_input`, `followup_task`); для неизвестного агента и для `spawnRejected` — no-op. Прод-последовательность 04:31:54→04:38:11 воспроизводится по срезам rollout: `completed → resume → running → wait → completed → send_input → running → финал completed`.
+
+`collaboration.send_message` — другая операция: **QueueOnly mailbox**, не запуск
+idle child. Это проверено по exact tags0.159.2/0.162; `interacted` общий для mail
+и followup и сам не доказывает execution. Ни call, ни его успешный empty output,
+ни interacted не меняют done/unknown/paused/interrupted, startedAt/completedAt,
+duration или launch model/effort. Уже работающий child продолжает работать и
+завершается по прежнему own proof; настоящее followup/resume не отключается.
+Шрам09.10:3607 child ui_modifier_reveal_e2e завершился06:16:06.605UTC, затем
+send_message06:18:17.668 ошибочно воскресил его в Main и saved History. Count1
+блокировал4196→3607 при готовом parent result; renderer или потеря финала не
+были причиной. Mail больше не приобретает execution lease, общий orchestration
+zero-edge менять не требуется. Source/private actual-regressions и paired build
+прошли; это не установленная/новая provider acceptance. Parent done/таймаут
+никогда не обнуляют счётчик настоящих детей.
+
+Вложенный exec-control имеет отдельную ловушку: derived followup может создать
+новую live Map, пока outer handler держит старую пустую ссылку. После derived
+controls нужно принимать текущий registry owner, иначе outer delete теряет
+реальный lease. Подтверждено actual Main/decoder synthetic regression, не direct
+mail production witness. Нового reader, polling или History invalidation нет.
 
 **Liveness чипа субагента — process-scoped, не turn-scoped.** Codex-агент законно переживает свой ход (spawn в N, wait в N+2): busy=false родителя чип НЕ гасит. Гейт — собственный `subagentStatus === 'running'` + живость хост-процесса (`historyComposerAvailability.status ∈ active/busy/starting`): мёртвый codex не может держать in-process агентов, и терминальное rollout-событие для них уже не придёт → fail-safe от вечного чипа. Скан идёт по ВСЕЙ ленте, а не по последнему ходу: last-turn-only скан молча гасил чип, как только пользователь отправлял следующий prompt (agent в N, новый ход N+1 → карточка агента уже не в последнем ходу). Contrast: Claude Task без явного статуса — turn-scoped (Escape гасит весь ход, E2E PASS ≤1 render tick); Claude background Bash — наоборот process-scoped, см. `fact-история-как-основная-поверхность.md`. Наследуемый лоадер вкладки: `history-panel:background-work {tabId,count}` → TabBar shimmer (display-only). Control-вызовы (`wait_agent`, `list_agents`, `close_agent`) при живых карточках подавляются как отдельные строки — их output абсорбируется в карточку соответствующего агента. Полная работа субагента лежит в отдельном rollout-файле (`thread_source: subagent`, `parent_thread_id` — связь с родителем); карточка несёт его session id для перехода. Реализация: `src/main/codex-subagent-cards.js` (+ unit-тесты рядом), потребитель — `buildCodexFullHistory`.
 
@@ -1220,6 +1528,11 @@ App-created compact-fork отличается от generic `codex resume <source
 В отличие от Claude, Codex compact **не создаёт Old History Zone**. Pre-compact записи остаются доступны через rollout JSONL и `codex:get-full-history`, поэтому Timeline не должен выставлять `lastBoundaryIdx`, красный background или click gate для Codex. Оранжевый compact marker у Codex означает только «здесь Codex свёл контекст», а не «всё выше недоступно».
 
 `replacement_history` может быть очень большим и содержать вложенные content-parts. Regular `codex:get-timeline` отдаёт только короткий structural marker + token count, а Cmd-hover по Codex compact **не вызывает** `codex:get-full-history`: человекочитаемого summary там нет. ПКМ `Копировать compact` — отдельный explicit path через `codex:copy-range`: он разворачивает verbatim-часть одного выбранного compact и заменяет тяжёлые/нечитаемые parts (`input_image`, `image_url`, `data:image`, encrypted compaction state) короткими маркерами. Compatibility full History всё ещё eager материализует raw tool-output и compact snapshots; ленивый detail-endpoint по byte identity пока не реализован. См. [`fact-transcript-сервис.md`](fact-transcript-сервис.md).
+
+SOURCE metadata-only hover у compact теперь показывает одну
+`context compacted (encrypted)` и время самой compact-записи; postTokens — только
+если сохранены, без выдачи pre-context за размер выжимки. Summary/decrypt/Copy
+capsule не предлагаются. Это доступность превью маркера, не новый reader.
 
 Обрезка inline base64 внутри `compacted` действует только в parsed/UI-кэше.
 Fork/Edit/Delete не имеют права сериализовать этот объект обратно: буквальный

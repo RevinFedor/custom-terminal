@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { createExecutionRevisionAcks } from '../utils/executionRevisionAcks.mjs';
 import { createWorkflowRelationReceipts } from '../utils/workflowRelationReceipts.mjs';
 import { applyWorkflowDragLayout } from '../utils/workflowDragNavigation.mjs';
-import { organizationProjection, organizationSnapshot, createOrganizationCommitter, archiveRestoreLeaseAddress, isExactGroupCloseGuard } from '../utils/workflowOrganizationClient.mjs';
+import { organizationProjection, organizationSnapshot, reconcileWorkflowOrder, createOrganizationCommitter, archiveRestoreLeaseAddress, isExactGroupCloseGuard } from '../utils/workflowOrganizationClient.mjs';
 import { INBOX_WORKFLOW_ID, GLOBAL_EXECUTION_NAMESPACE } from '../utils/workflowMembership.mjs';
 import { organizationPlacementIntent } from '../utils/workflowPlacementMembership.mjs';
 import { removeLayoutTabs } from '../../shared/workflow-organization.cjs';
@@ -142,7 +142,7 @@ import {
 } from '../utils/workspaceWindowMutation.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
-import { reconcileWorkspaceDisplayPatch, revealHiddenWindow, splitWindowPane } from '../utils/windowDisplayLayouts.mjs';
+import { reconcileWorkspaceDisplayPatch, revealHiddenWindow, splitWindowPane, minimizeDisplayWindow, resolveHiddenWindowNavigationTarget } from '../utils/windowDisplayLayouts.mjs';
 import {moveWorkflowWindow} from '../utils/workflowWindowMove.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
@@ -1157,6 +1157,11 @@ interface ProjectWorkspace {
 }
 
 const restoreTabOptions = (savedTab: any) => ({
+  // Cold restore must carry the exact reader's authority through createTab.
+  // Catalog hydration skips rows that already exist in the renderer Map.
+  executionSubject: savedTab.executionSubject,
+  executionStorageRevision: savedTab.executionStorageRevision,
+  parentTabId: savedTab.parentTabId,
   color: savedTab.color,
   isUtility: false,
   commandType: savedTab.commandType,
@@ -1243,6 +1248,8 @@ const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err
   const tabId = savedTab.tabId || `${workspace.projectId}-tab-${workspace.tabCounter++}`;
   return {
     id: tabId,
+    ...{executionSubject:savedTab.executionSubject,executionStorageRevision:savedTab.executionStorageRevision},
+    parentTabId: savedTab.parentTabId,
     name: savedTab.name || 'Restore failed',
     cwd: savedTab.cwd || workspace.projectPath || '',
     color: savedTab.color,
@@ -1586,7 +1593,7 @@ export interface SplitPane {
   /** Stable content identity, independent of its screen slot. */
   windowId?: string;
   displayHidden?: boolean;
-  displayRect?: { leftPct: number; topPct: number; widthPct: number; heightPct: number };
+  displayRect?: { leftPct: number; topPct: number; widthPct: number; heightPct: number } | null;
   /** Project of the SHOWN tab. Follows `tabId` — see below. */
   projectId: string;
   /** The tab currently SHOWN here. One of `tabs`, when that list exists. */
@@ -1687,6 +1694,7 @@ interface WorkspaceStore {
     | { projectId: string; tabId: string; slotId?: never }
     | { slotId: string; projectId?: never; tabId?: never }) => boolean;
   showHiddenWindowAlongside: (sourceSpaceId:string,anchorWindowId:string,windowId:string,side?:'left'|'right'|'above'|'below') => boolean;
+  minimizeWorkspaceWindow: (sourceSpaceId:string,windowId:string) => boolean;
   moveWorkspaceWindowToWorkflow: (sourceSpaceId:string,windowId:string|null,targetSpaceId:string) => Promise<boolean>;
   view: 'dashboard' | 'workspace';
   // Project of the CENTER tab. Follows every tab activation (sidebar click,
@@ -1856,6 +1864,7 @@ interface WorkspaceStore {
     name: string;
     /** Цветная SVG/PNG-иконка workflow. undefined бывает только у legacy-записи. */
     icon?: string | null;
+    defaultCwd?: string | null;
     kind?: 'user' | 'inbox';
     organizationRevision?: number;
     order?: number;
@@ -1870,6 +1879,7 @@ interface WorkspaceStore {
   organizationReady: boolean;
   organizationRevision: number;
   organizationGeneration: number;
+  organizationWorkflowOrder: string[];
   organizationError: string | null;
   tabWorkflowMembership: Record<string, {tabId?: string; workflowId: string; revision: number}>;
   pendingTabWorkflowMembership: Record<string, {workflowId: string; revision: number}>;
@@ -1890,14 +1900,14 @@ interface WorkspaceStore {
   ensureTabRuntime: (tabId: string) => Promise<boolean>;
   createWorkflowTab: (options?: {workflowId?: string; cwd?: string; sourceTabId?: string; name?: string; tabOptions?: any}) => Promise<string>;
   moveTabsToWorkflow: (tabIds:string[], workflowId:string) => Promise<boolean>;
-  openTabById: (tabId: string, options?: { projectId?: string | null; projectPath?: string | null; reason?: string }) => Promise<boolean>;
+  openTabById: (tabId: string, options?: { projectId?: string | null; projectPath?: string | null; sourceTabId?: string; reason?: string }) => Promise<boolean>;
   addWorkspaceSpace: (options?: { activate?: boolean; name?: string }) => string | null;
   removeWorkspaceSpace: (id: string) => void;
   renameWorkspaceSpace: (id: string, name: string) => void;
   reorderWorkspaceSpaces: (orderedIds: string[]) => boolean;
   updateWorkspaceSpaceMetadata: (
     id: string,
-    updates: { icon?: string | null; projectIds?: string[] },
+    updates: { icon?: string | null; projectIds?: string[]; defaultCwd?: string | null },
   ) => boolean;
   switchWorkspaceSpace: (id: string) => void;
   /**
@@ -2030,8 +2040,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string; reservedTabId?: string; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string; reservedTabId?: string; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean;
     groupCloseGuard?: {mutationId:string;tabId:string;guardToken:string} }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
@@ -2237,7 +2247,10 @@ const normalizeGeneratedTabName = (name: string): string => {
 // Debounce timer for session saving
 let saveSessionTimer: NodeJS.Timeout | null = null;
 const projectTabSaveQueue = createProjectTabSaveQueue();
-const executionRevisionAcks = createExecutionRevisionAcks();
+const executionRevisionAcks = createExecutionRevisionAcks({onReconciled:({namespace,tabId,from,to,proofThrough}:any)=>{
+  console.log('[ExecutionRevision:R] namespace=' + namespace + ' tab=' + tabId
+    + ' expected=' + from + ' mainThrough=' + proofThrough + ' committed=' + to);
+}});
 const workflowRelationReceipts = createWorkflowRelationReceipts();
 export const isProjectTabSavePending = (projectId: string) => projectTabSaveQueue.pending(projectId);
 const projectTabCreationQueue = createProjectTabSaveQueue();
@@ -2588,6 +2601,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     useUIStore.getState().setActiveArea('workspace');
     if(shown?.tabId)get().activateCenterTab(shown.projectId,shown.tabId);
     console.info('[WorkspaceDisplay] show-alongside window='+windowId+' anchor='+anchorWindowId+' side='+side);
+    get().saveSession();return true;
+  },
+  minimizeWorkspaceWindow: (sourceSpaceId,windowId) => {
+    const state=get();if(state.activeSpaceId!==sourceSpaceId)return false;
+    const result=minimizeDisplayWindow(state,windowId);if(!result)return false;
+    const wasFocused=state.splitPanes[state.splitFocusedIndex]?.windowId===windowId;
+    const shown=result.splitPanes[result.splitFocusedIndex];
+    set({splitPanes:result.splitPanes,splitFocusedIndex:result.splitFocusedIndex,splitSizes:result.splitSizes,
+      ...(wasFocused?{activeSpaceTab:shown?.tabId?{projectId:shown.projectId,tabId:shown.tabId}:null}:{})});
+    if(wasFocused && shown?.tabId)get().activateCenterTab(shown.projectId,shown.tabId);
+    console.info('[WorkspaceDisplay] minimize window='+windowId+' visible='+result.splitPanes.filter(pane=>!pane.displayHidden).length);
     get().saveSession();return true;
   },
   moveWorkspaceWindowToWorkflow: async (sourceSpaceId,windowId,targetSpaceId) => {
@@ -2954,6 +2978,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
   organizationReady: false,
   organizationRevision: 0,
   organizationGeneration: 0,
+  organizationWorkflowOrder: [],
   organizationError: null,
   tabWorkflowMembership: {},
   pendingTabWorkflowMembership: {},
@@ -2986,9 +3011,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     }
     const projection = organizationProjection(snapshot,state);
     const inbox = projection.spaces.find(space => space.id === INBOX_WORKFLOW_ID && space.kind === 'inbox');
-    const spaces = inbox && !state.spaces.some(space => space.id === inbox.id) ? [...state.spaces,inbox] : state.spaces;
+    const ordered = reconcileWorkflowOrder(projection.spaces,state.spaces,state.organizationWorkflowOrder,state.activeSpaceId);
+    const spaces = inbox && !ordered.some(space => space.id === inbox.id) ? [...ordered,inbox] : ordered;
     // A catalog refresh cannot replace a local layout or steal focus.
-    set({openProjects,spaces,tabCatalog:projection.tabCatalog,tabWorkflowMembership:projection.tabWorkflowMembership,
+    set({openProjects,spaces,organizationWorkflowOrder:projection.organizationWorkflowOrder,tabCatalog:projection.tabCatalog,tabWorkflowMembership:projection.tabWorkflowMembership,
       globalGroups:snapshot.globalGroups,organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
   },
   activeTabNavigationIntent:null,
@@ -3126,9 +3152,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     const pane = admission.splitPanes[admission.splitFocusedIndex];
     const shown = pane?.tabId ? findOpenTabOwner(admission,pane.tabId)
       : admission.activeSpaceTab?.tabId ? findOpenTabOwner(admission,admission.activeSpaceTab.tabId) : null;
-    const cwd = options.cwd || source?.tab.cwd || shown?.tab.cwd || resolveWorkspaceCwd('');
     const workflowId = options.workflowId || (source && (admission.pendingTabWorkflowMembership[source.tab.id]
       || admission.tabWorkflowMembership[source.tab.id])?.workflowId) || admission.activeSpaceId;
+    const defaultCwd=admission.spaces.find(space=>space.id===workflowId)?.defaultCwd;
+    const cwd = options.cwd || source?.tab.cwd || defaultCwd
+      || (shown && admission.tabWorkflowMembership[shown.tab.id]?.workflowId===workflowId ? shown.tab.cwd:null) || resolveWorkspaceCwd('');
     if (!get().openProjects.has(GLOBAL_EXECUTION_NAMESPACE)) {
       const openProjects = new Map(get().openProjects);
       openProjects.set(GLOBAL_EXECUTION_NAMESPACE,{projectId:GLOBAL_EXECUTION_NAMESPACE,projectPath:cwd,tabs:new Map(),tabGroups:[],
@@ -3356,7 +3384,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     Object.entries(layout.centerStrips || {}).forEach(([pid, raw]) => {
       const kept = (Array.isArray(raw) ? raw : [])
         .filter((e: any) => e && e.tabId && alive(e.projectId, e.tabId));
-      if (kept.length > 1) strips[pid] = kept as Array<{ projectId: string; tabId: string }>;
+      if (kept.length > 0) strips[pid] = kept as Array<{ projectId: string; tabId: string }>;
     });
     layout.centerStrips = strips;
     // Вкладка пространства проверяется той же меркой, что и его окна: пока
@@ -3381,6 +3409,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       }
     }
     if (!tabAlive) layout.activeSpaceTab = null;
+    // The execution namespace can be shared by several workflows. Its last
+    // active tab is not a selection in an empty destination (notably Inbox).
+    // Startup already materializes this vacant window; switching must do so
+    // too, while keeping any parked chips without selecting one implicitly.
+    if (st.organizationReady && !layout.splitPanes.length && !layout.activeSpaceTab) {
+      const parked = Array.from(new Map(Object.values(strips).flat().map(entry => [entry.tabId, entry])).values());
+      layout.splitPanes = [vacantPaneWithTabs({windowId: id + ':initial'}, parked)];
+      layout.centerStrips = {};
+      layout.splitFocusedIndex = 0;
+      layout.splitSizes = null;
+    }
     const planDoneAt = performance.now();
     set({ spaces: res.spaces, activeSpaceId: res.activeSpaceId, ...layout, view: 'workspace' });
     const storeSetDoneAt = performance.now();
@@ -4641,6 +4680,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
   },
 
   openTabById: async (tabId, options = {}) => {
+    const origin = get();
+    const source = options.sourceTabId ? resolveTabLinkNavigation(origin,options.sourceTabId) : null;
+    const sourcePane = source?.kind === 'reveal' && source.spaceId === origin.activeSpaceId
+      && source.paneIndex !== null ? origin.splitPanes[source.paneIndex] : null;
+    const originWindowId = sourcePane && !sourcePane.displayHidden ? sourcePane.windowId
+      : origin.splitPanes[origin.splitFocusedIndex]?.windowId;
     const intent = {id:crypto.randomUUID(),tabId};
     set({activeTabNavigationIntent:intent});
     try {
@@ -4664,7 +4709,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     }
     if (!owner || get().tabCatalog[tabId]?.active === false) return false;
     if (get().activeTabNavigationIntent?.id !== intent.id) return false;
-    const presentationTabId = owner.tab.parentTabId || tabId;
+    // A placed file is its own reader. Physical AI children still use their
+    // parent's presentation; opening a file never activates that subagent path.
+    const presentationParentId = owner.tab.tabType === 'file' ? null : owner.tab.parentTabId;
+    const presentationTabId = presentationParentId || tabId;
     let plan = resolveTabLinkNavigation(get(), presentationTabId);
     if (!plan) return false;
     if (plan.spaceId && plan.spaceId !== get().activeSpaceId) withOwnedTabNavigation(intent.id,() => get().switchWorkspaceSpace(plan.spaceId));
@@ -4705,9 +4753,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       }
       const pane = plan!.kind === 'reveal' ? get().splitPanes[plan!.paneIndex] : null;
       if (pane?.displayHidden && pane.windowId) {
-        const focused = get().splitPanes[get().splitFocusedIndex];
-        const target = focused && !focused.displayHidden ? get().splitFocusedIndex : get().splitPanes.findIndex(pane => !pane.displayHidden);
-        if (!get().showHiddenWindow(target,pane.windowId,{projectId:presentationOwner.projectId,tabId:presentationTabId})) {presented=false;return;}
+        const target = resolveHiddenWindowNavigationTarget(get(),pane.windowId,
+          get().activeSpaceId === origin.activeSpaceId ? originWindowId : null);
+        if (!target || !get().showHiddenWindow(target.paneIndex,pane.windowId,{projectId:presentationOwner.projectId,tabId:presentationTabId})) {presented=false;return;}
+        console.info('[TabNavigation] hidden-window=' + pane.windowId + ' pane=' + target.paneIndex
+          + ' destination=' + target.reason + ' display=' + get().windowDisplayKey);
       }
       if (plan!.kind === 'append') {
         if (plan!.paneIndex !== null) set({splitFocusedIndex:plan!.paneIndex});
@@ -4715,7 +4765,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       } else get().placeTab(presentationOwner.projectId,presentationTabId);
     });
     if (!presented) return false;
-    withOwnedTabNavigation(intent.id,() => get().setViewingSubAgent(owner!.tab.parentTabId ? tabId : null));
+    withOwnedTabNavigation(intent.id,() => get().setViewingSubAgent(presentationParentId ? tabId : null));
     useUIStore.getState().setActiveArea('workspace');
     if (!(await get().ensureTabRuntime(presentationTabId))) return false;
     if (get().activeTabNavigationIntent?.id !== intent.id) return false;
@@ -4727,7 +4777,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     if (state.view !== 'workspace' || (state.splitPanes.length
       ? !shown || shown.displayHidden || shown.tabId !== presentationTabId || shown.projectId !== currentPresentation.projectId
       : state.activeSpaceTab?.tabId !== presentationTabId)) return false;
-    if (owner.tab.parentTabId && state.openProjects.get(state.activeProjectId || '')?.viewingSubAgentTabId !== tabId) return false;
+    if (presentationParentId && state.openProjects.get(state.activeProjectId || '')?.viewingSubAgentTabId !== tabId) return false;
     console.log('[TabNavigation] source=' + (options.reason || 'link')
       + ' tab=' + tabId.slice(-12) + ' kind=' + plan.kind + ' workflow=' + String(plan.spaceId).slice(-12));
     return true;
@@ -5737,7 +5787,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       return '';
     }
 
-    const tabId = (options as any)?.restoreId || (get().organizationReady ? `tab-${crypto.randomUUID()}` : `${projectId}-tab-${workspace.tabCounter}`);
+    if (options?.reservedTabId && options?.restoreId) throw new Error('tab_creation_identity_conflict');
+    const tabId = options?.restoreId || options?.reservedTabId || (get().organizationReady ? `tab-${crypto.randomUUID()}` : `${projectId}-tab-${workspace.tabCounter}`);
+    if (options?.reservedTabId && workspace.tabs.has(tabId)) throw new Error('reserved target tab already exists');
+    const restoredSubject=(options as any)?.restoreId && (options as any).executionSubject;
+    if(restoredSubject?.version===2 && (restoredSubject.tabId!==tabId || restoredSubject.executionNamespace!==projectId))
+      throw new Error('restore_execution_subject_changed');
     log.tabs('createTab: tabId:', tabId, 'counter:', workspace.tabCounter, 'restored:', !!(options as any)?.restoreId);
     workspace.tabCounter++;
 
@@ -5765,6 +5820,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       id: tabId,
       name: tabName,
       cwd: resolveWorkspaceCwd(creationCwd),
+      ...((options as any)?.restoreId ? {executionSubject:(options as any).executionSubject,
+        executionStorageRevision:(options as any).executionStorageRevision,parentTabId:(options as any).parentTabId} : {}),
       color: options?.color,
       isUtility: false,
       commandType: options?.commandType,
@@ -5949,7 +6006,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     if (!workspace) {
       return '';
     }
-    const tabId = (options as any)?.restoreId || (get().organizationReady ? `tab-${crypto.randomUUID()}` : `${projectId}-tab-${workspace.tabCounter}`);
+    if (options?.reservedTabId && options?.restoreId) throw new Error('tab_creation_identity_conflict');
+    const tabId = options?.restoreId || options?.reservedTabId || (get().organizationReady ? `tab-${crypto.randomUUID()}` : `${projectId}-tab-${workspace.tabCounter}`);
+    if (options?.reservedTabId && workspace.tabs.has(tabId)) throw new Error('reserved target tab already exists');
+    const restoredSubject=(options as any)?.restoreId && (options as any).executionSubject;
+    if(restoredSubject?.version===2 && (restoredSubject.tabId!==tabId || restoredSubject.executionNamespace!==projectId))
+      throw new Error('restore_execution_subject_changed');
     workspace.tabCounter++;
 
     const uiState = useUIStore.getState();
@@ -5988,6 +6050,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       id: tabId,
       name: tabName,
       cwd: resolveWorkspaceCwd(cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath)),
+      ...((options as any)?.restoreId ? {executionSubject:(options as any).executionSubject,
+        executionStorageRevision:(options as any).executionStorageRevision,parentTabId:(options as any).parentTabId} : {}),
       color: options?.color,
       isUtility: false,
       commandType: options?.commandType,
@@ -9929,6 +9993,8 @@ const organizationCommitter = createOrganizationCommitter({
       if (pending[tabId]?.workflowId === member.workflowId) delete pending[tabId];
     }
     useWorkspaceStore.setState({tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,
+      spaces:reconcileWorkflowOrder(projection.spaces,state.spaces,state.organizationWorkflowOrder,state.activeSpaceId),
+      organizationWorkflowOrder:projection.organizationWorkflowOrder,
       organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation,
       pendingTabWorkflowMembership:pending,organizationError:null});
     return snapshot;
@@ -9958,6 +10024,9 @@ async function allocateOrganizationTab(projectId:string, tab:Tab, options:any): 
       throw new Error('workflow_creation_unconfirmed');
     (tab as any).executionSubject = result.executionSubject;
     (tab as any).executionStorageRevision = 1;
+    console.info('[WorkflowCreation] allocated tab=' + tab.id + ' workflow=' + result.workflowId
+      + ' namespace=' + projectId + ' source=' + (ownerId || '-')
+      + ' identity=' + (options?.reservedTabId ? 'reserved-new' : 'new'));
     const state = useWorkspaceStore.getState();
     useWorkspaceStore.setState({organizationRevision:result.revision,organizationGeneration:result.generation,
       tabWorkflowMembership:{...state.tabWorkflowMembership,[tab.id]:{tabId:tab.id,workflowId:result.workflowId,revision:result.membershipRevision}},

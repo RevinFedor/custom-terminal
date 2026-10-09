@@ -29,10 +29,10 @@ export function useTabMessages(tabId: string) {
     return () => { alive = false; ipcRenderer.removeListener('tab-messages:changed', changed); };
   }, [tabId, merge, retry]);
 
-  const dismiss = useCallback(async (messageId: string) => {
+  const cancel = useCallback(async (messageId: string) => {
     try {
-      const result = await ipcRenderer.invoke('tab-messages:dismiss', { tabId, messageId });
-      if (result?.message?.messageId !== messageId) throw new Error('Не удалось скрыть карточку');
+      const result = await ipcRenderer.invoke('tab-messages:cancel', { tabId, messageId });
+      if (result?.message?.messageId !== messageId || result.cancelled !== true) throw new Error('Отмена сообщения не подтверждена');
       merge([result.message]);
       setActionErrors(current => ({ ...current, [messageId]: '' }));
       return true;
@@ -42,7 +42,7 @@ export function useTabMessages(tabId: string) {
     }
   }, [tabId, merge]);
   return { threads: useMemo(() => tabMessageThreads(messages, tabId), [messages, tabId]),
-    listError, actionErrors, merge, dismiss, reload: () => setRetry(value => value + 1) };
+    listError, actionErrors, merge, cancel, reload: () => setRetry(value => value + 1) };
 }
 
 export type TabMessagesController = ReturnType<typeof useTabMessages>;

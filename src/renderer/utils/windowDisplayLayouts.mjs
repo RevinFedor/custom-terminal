@@ -57,7 +57,7 @@ export function splitWindowPane(panes, focusedIndex, current, anchorIndex = null
   if (incoming) {
     const { displayHidden, displayRect, column, ...content } = incoming;
     const slot = next[opened.focusedIndex];
-    next[opened.focusedIndex] = { ...content,
+    next[opened.focusedIndex] = { ...content, displayHidden: false, displayRect: null,
       ...(slot.column !== undefined ? { column: slot.column } : {}) };
   }
   return { panes: [...next, ...list.filter(p => !isWindowVisible(p) && p !== incoming)],
@@ -81,7 +81,34 @@ export function ensureWindowIds(panes, _namespace = 'workspace') {
   return changed ? next : panes;
 }
 
-export function captureWindowDisplayLayout(layout) {
+const validPosition = position => position && typeof position.windowId === 'string'
+  && Number.isInteger(position.column) && position.column >= 0
+  && Number.isInteger(position.row) && position.row >= 0;
+
+function rememberedPositions(panes, ...lists) {
+  const ids = new Set(panes.map(pane => pane.windowId));
+  const byId = new Map();
+  for (const list of lists) for (const position of Array.isArray(list) ? list : []) {
+    if (validPosition(position) && ids.has(position.windowId)) byId.set(position.windowId, position);
+  }
+  return [...byId.values()];
+}
+
+function legacyWindowPositions(layout) {
+  const panes = layout.splitPanes || [];
+  const rects = paneGridRects(panes, layout.splitSizes);
+  const visible = paneColumns(panes).flatMap((rows, column) => rows.map(({pane,index},row) =>
+    ({windowId:pane.windowId,column,row,rect:rects[index]})));
+  const keys = ['leftPct', 'topPct', 'widthPct', 'heightPct'];
+  return panes.flatMap(pane => {
+    if (isWindowVisible(pane) || !pane.displayRect) return [];
+    const matches = visible.filter(position => position.rect && keys.every(key =>
+      Number.isFinite(pane.displayRect[key]) && Math.abs(pane.displayRect[key] - position.rect[key]) < .01));
+    return matches.length === 1 ? [{windowId:pane.windowId,column:matches[0].column,row:matches[0].row}] : [];
+  });
+}
+
+export function captureWindowDisplayLayout(layout, previous = layout.windowDisplayLayouts?.[layout.windowDisplayKey]) {
   const panes = layout.splitPanes || [];
   const positions = [];
   paneColumns(panes).forEach((rows, column) => rows.forEach(({ pane }, row) => {
@@ -89,6 +116,11 @@ export function captureWindowDisplayLayout(layout) {
   }));
   return {
     positions,
+    // Visibility is the current projection; navigation also remembers where
+    // an offscreen window was last shown on THIS display. No tab copies.
+    lastPositions: rememberedPositions(panes,
+      previous && !Array.isArray(previous.lastPositions) ? legacyWindowPositions(layout) : [],
+      previous?.lastPositions, previous?.positions, positions),
     sizes: packSplitSizes(panes, layout.splitSizes),
     focusedWindowId: panes[layout.splitFocusedIndex || 0]?.windowId || null,
   };
@@ -115,6 +147,8 @@ function cleanProfiles(profiles, panes) {
     ...profile,
     focusedWindowId: ids.has(profile?.focusedWindowId) ? profile.focusedWindowId : null,
     positions: (Array.isArray(profile?.positions) ? profile.positions : []).filter(p => p && ids.has(p.windowId)),
+    ...(Array.isArray(profile?.lastPositions)
+      ? { lastPositions: rememberedPositions(panes, profile.lastPositions) } : {}),
   }]));
 }
 
@@ -125,7 +159,7 @@ export function applyWindowDisplay(layout, display, namespace = 'workspace') {
   const profiles = cleanProfiles(layout.windowDisplayLayouts, panes);
   const previousKey = layout.windowDisplayKey;
   if (!profiles[INITIAL]?.positions?.length) profiles[INITIAL] = captureWindowDisplayLayout(current);
-  if (previousKey) profiles[previousKey] = captureWindowDisplayLayout(current);
+  if (previousKey) profiles[previousKey] = captureWindowDisplayLayout(current, profiles[previousKey]);
   const target = profiles[display.key] || (display.internal
     ? compactProfile(panes, layout.splitFocusedIndex || 0)
     : profiles[INITIAL]);
@@ -143,7 +177,9 @@ export function applyWindowDisplay(layout, display, namespace = 'workspace') {
   const rects = paneGridRects(panes, layout.splitSizes);
   const next = positions.map(pos => {
     const { displayHidden, displayRect, ...pane } = byId.get(pos.windowId);
-    return { ...pane, column: pos.column };
+    // Main preserves omitted extension fields. Visibility must be an explicit
+    // false write, otherwise a previously hidden window stays hidden in SQL.
+    return { ...pane, column: pos.column, displayHidden: false, displayRect: null };
   });
   panes.forEach((pane, index) => {
     if (seen.has(pane.windowId)) return;
@@ -161,7 +197,7 @@ export function applyWindowDisplay(layout, display, namespace = 'workspace') {
   const shown = next[out.splitFocusedIndex];
   out.activeSpaceTab = shown?.tabId ? { projectId: shown.projectId, tabId: shown.tabId } : null;
   if (shown?.tabId) out.activeProjectId = shown.projectId;
-  out.windowDisplayLayouts[display.key] = captureWindowDisplayLayout(out);
+  out.windowDisplayLayouts[display.key] = captureWindowDisplayLayout(out, target);
   return out;
 }
 
@@ -179,6 +215,56 @@ export function reconcileWindowDisplay(layout, display, namespace = 'workspace')
   out.windowDisplayLayouts = cleanProfiles(layout.windowDisplayLayouts, panes);
   out.windowDisplayLayouts[display.key] = captureWindowDisplayLayout(out);
   return out;
+}
+
+/** Hide one exact window in this display profile, retaining all its content. */
+export function canMinimizeDisplayWindow(panes,windowId) {
+  const pane=(panes || []).find(p=>p.windowId===windowId && isWindowVisible(p));
+  return !!pane && !(visibleWindowCount(panes)===1 && isNewEmptyWindow(pane));
+}
+export function minimizeDisplayWindow(layout, windowId) {
+  const panes=layout.splitPanes || [],index=panes.findIndex(p=>p.windowId===windowId && isWindowVisible(p));
+  if(!canMinimizeDisplayWindow(panes,windowId))return null;
+  const next=panes.map((pane,i)=>i===index
+    ? {...pane,displayHidden:true,displayRect:paneGridRects(panes,layout.splitSizes)[i] || pane.displayRect}:pane);
+  let focused=layout.splitFocusedIndex || 0;
+  if(!next.some(isWindowVisible)){
+    // Keep a visible access point to the hidden-window picker. Expanding into
+    // this new empty slot consumes it through the existing reveal contract.
+    next.unshift({projectId:panes[index].projectId || '',tabId:'',windowId:newId(),column:0});focused=0;
+  }else if(!isWindowVisible(next[focused])){
+    focused=next.findIndex(isWindowVisible);
+  }
+  return {...layout,splitPanes:next,splitFocusedIndex:focused,splitSizes:null};
+}
+
+/** Secondary links restore the last place; explicit picker clicks choose theirs. */
+export function resolveHiddenWindowNavigationTarget(layout, windowId, fallbackWindowId = null) {
+  const panes = layout.splitPanes || [];
+  const hidden = panes.find(pane => pane.windowId === windowId && !isWindowVisible(pane));
+  if (!hidden) return null;
+  const profile = layout.windowDisplayLayouts?.[layout.windowDisplayKey];
+  const remembered = rememberedPositions(panes, profile?.lastPositions, profile?.positions)
+    .find(position => position.windowId === windowId);
+  const columns = paneColumns(panes);
+  if (remembered && columns[remembered.column]?.length) {
+    const rows = columns[remembered.column];
+    const target = rows[Math.min(remembered.row, rows.length - 1)];
+    return { paneIndex: target.index, reason: 'remembered-position' };
+  }
+  // Pre-memory builds kept only the last painted rect. It is useful only if
+  // it names one exact place in today's grid, never as a raw hidden pane index
+  // or a best-guess column from another monitor. New profiles need no fallback.
+  if (!Array.isArray(profile?.lastPositions) && hidden.displayRect) {
+    const legacy = legacyWindowPositions(layout).find(position => position.windowId === windowId);
+    if (legacy) return { paneIndex: columns[legacy.column][legacy.row].index, reason: 'legacy-exact-position' };
+  }
+  const origin = panes.findIndex(pane => pane.windowId === fallbackWindowId && isWindowVisible(pane));
+  if (origin >= 0) return { paneIndex: origin, reason: 'origin-fallback' };
+  const focused = layout.splitFocusedIndex;
+  return isWindowVisible(panes[focused])
+    ? { paneIndex: focused, reason: 'focused-fallback' }
+    : { paneIndex: panes.findIndex(isWindowVisible), reason: 'first-visible-fallback' };
 }
 
 /** Reveal a whole window, optionally selecting one of its existing chips first. */
@@ -208,7 +294,7 @@ export function revealHiddenWindow(layout, targetIndex, hiddenWindowId, selectio
   const { displayHidden, displayRect, column, ...content } = incoming;
   const consumePlaceholder = isNewEmptyWindow(from);
   const next = panes.map((pane, index) => pane === from
-    ? { ...content, column: from.column ?? targetIndex }
+    ? { ...content, column: from.column ?? targetIndex, displayHidden: false, displayRect: null }
     : index === incomingIndex
       ? consumePlaceholder ? null : { ...from, displayHidden: true, displayRect: rects[targetIndex] }
       : pane).filter(Boolean);

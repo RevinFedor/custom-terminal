@@ -202,6 +202,28 @@ OAuth получили JSON200. Через `net.fetch` подтверждён т
 
 [Опубликованное письмо OpenAI29–30.09](https://www.reddit.com/r/OpenAI/comments/1wtlpx7/its_been_a_good_run/) описывает разовую выдачу существующим Pro200:62 500 credits с номинальной стоимостью$2 500, истекающие31.12.2026, в связи с переходом20×→10× Plus для Work/Codex с30.10. Старый allowance до29.10 подтверждён также [официальной страницей Pro tiers](https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers). Совпадение суммы/плана/даты с live-балансами — основание связать их с этой выдачей, но `wham/usage` не отдаёт происхождение или expiry credit grant. Не переносить дату этой акции на любые credits: купленные credits имеют собственный12-месячный срок. Даты в `Usage resets` принадлежат другим сущностям и не являются сроком `credits.balance`.
 
+### Понижение подписки и уже выданные промо-кредиты — research08.10
+
+Разделяй сохранение баланса, право расходовать его и доступ к моделям.
+Gift62 500 не является переносом Pro entitlements. По [официальной доступности
+моделей](https://learn.chatgpt.com/docs/models) GPT-6.1 Sol включён
+вPlus/Pro rollout, Free/Go не включены; [pricing](https://learn.chatgpt.com/docs/pricing)
+даётPlus Codex/credit overflow иAstra usage estimates, Free —Luna desktop.
+
+Raw Reddit08.10 даёт подтверждения сохранения именно этого grant:
+[автор процитировал письменный ответ Support02.10](https://www.reddit.com/r/ChatGPTPro/comments/1wvdhuu/has_anyone_kept_the_62500_promo_credits_after/pdg4w0i/): unused credits неотзываются приdowngrade, expiry31.12.2026 не продлевается привозврате.
+Это опубликованный пересказ поддержки, не независимо проверенное публичное
+условие акции. [Другой автор тоже сообщил ответ Support](https://www.reddit.com/r/codex/comments/1wu6j56/if_i_downgrade_from_pro_200_to_plus_do_i_keep_the/).
+[Реальный Plus case05.10](https://www.reddit.com/r/ChatGPTPro/comments/1wygfu0/sitting_on_62k_credits_downgrade_to_plus_or_jump/pe2hc8b/): автор сообщил списание$20 иAstra; просмотренный screenshot показываетPlus$20 и62 435 credits.
+[После отмены/возврата наPlus](https://www.reddit.com/r/codex/comments/1wy98fy/how_to_use_credits_after_cancelled_sub/pe11j93/) другой пользователь сообщил, чторасходование работает.
+
+[Free case07.10](https://www.reddit.com/r/codex/comments/1wzr38a/how_to_use_61_with_credit_on_free_planjust_cancel/) имеет screenshots62 500 balance иpicker6Luna/5.6Terra/5.6Luna без6.1Sol.
+Наличие денег наэкране само по себе не доказывает расходование наFree:
+рассказы расходятся постарым моделям/eligibility, полноценный Pro model set
+кредитами не открывается. ДляSol6.1/Astra практический путь —Plus иостаток
+gift послеincluded usage. Не выдавай единичное заявление обоставшемся Pro200
+allowance наPlus заправило: screenshot93%left не доказывает коэффициент20×.
+
 ### Точная дата кредитов: account-scoped remaining_balance
 
 Desktop читает `GET /backend-api/accounts/{account_id}/remaining_balance` через
@@ -227,7 +249,19 @@ account field desktop IPC; в persisted usage и публичный HTTP DTO н�
 гарантирован. Не объявлять ни автоматическую потерю20×, ни сохранение20× в таком
 будущем сценарии по одному `plan_type:pro` или наличию промо-кредитов.
 
-Network-path имеет физический `AbortController` deadline 8s, renderer-level IPC deadline 12s, один in-flight запрос на auth fingerprint и 25s success-cache. Force refresh обходит success-cache, но не account guard или серверный Retry-After и сам по себе не запускает тяжёлый локальный scan. Он также не ждёт другие профили: scope определяется requested/current account до сетевого шага. Auth перечитывается перед применением любого результата; если account/token сменился во время запроса, старый успех и старая ошибка не могут записаться в новый аккаунт, а запрос один раз повторяется с уже готовой новой auth snapshot. Сам Noted Terminal не расходует общий refresh token: при `401/403` без внешней rotation сохраняется последнее значение и показывается `Codex login expired`, чтобы не получить cross-process `refresh_token_reused` race с живым Codex CLI.
+Network-path имеет физический `AbortController` deadline15s, Codex renderer-level IPC deadline25s (SOURCE08.10), один in-flight запрос на auth fingerprint и25s success-cache. Внешний предел оставляет время на15s сеть, profile auth и3s branch verification; Claude/Activity сохраняют12s. Force refresh обходит success-cache, но не account guard или серверный Retry-After и сам по себе не запускает тяжёлый локальный scan. Он также не ждёт другие профили: scope определяется requested/current account до сетевого шага. Auth перечитывается перед применением любого результата; если account/token сменился во время запроса, старый успех и старая ошибка не могут записаться в новый аккаунт, а запрос один раз повторяется с уже готовой новой auth snapshot. Сам Noted Terminal не расходует общий refresh token: при `401/403` без внешней rotation сохраняется последнее значение и показывается `Codex login expired`, чтобы не получить cross-process `refresh_token_reused` race с живым Codex CLI.
+
+Причина расширения08.10: за10минут incident-window вproduction один аккаунт
+имел4timeout/8success с median успешного ответа4,1s и max7,1s; соседний —20success,
+median0,6s и без отказов. Полный обрыв интернета этим не подтверждается, но
+прежний8s предел мог обрывать медленные запросы.15s — терпимость к задержке,
+не доказанное устранение её первопричины;30s clock/60s cooldown не изменены.
+Вfailure-log добавлены phase/durationMs/headersMs/timeoutMs/HTTP status без
+секретов: waiting-headers не различает DNS/TLS/ожидание серверной обработки;
+reading-body соstatus200 доказывает, что HTTP-ответ уже начался. Abort во время
+response.json больше не подменяется invalid_response. Контролируемый реальный
+Node HTTP/Abort proof подтвердил оба этапа;9s success/default15s и внешний25s
+проверены actual-reader тестами. Production этой правкой не устанавливался.
 
 Прод-шрам 2026-07-10: `/backend-api/wham/usage` может для одного и того же `account_id` вернуть успешный HTTP 200 с нормальным расходом, через несколько секунд — почти `0% used` и сдвинутым reset, а следующим ответом снова вернуть исходную ветку. Это upstream-флап, а не смена аккаунта и не повод показать пользователю `99/100% left`. Кандидатом становится именно возвращение заметной части бюджета до наступления прежнего reset; движение будущего reset вперёд при неуменьшающемся used — нормальное свойство rolling-window и принимается сразу. Раньше reset-drift сам по себе считался сменой ветки: production держал shown `used=9%` при последовательных candidate `15/16%`, а затем прыгнул на `17%`. Фоновый по-настоящему подозрительный кандидат принимается только после второго совпавшего ответа той же ветки не раньше чем через 30s либо сразу после того, как предыдущий reset действительно наступил. Явный `Refresh` только для такого кандидата делает ещё два коротких запроса и принимает совпавшее большинство; обычный рост used остаётся одним запросом. Возврат прежней ветки снимает кандидата.
 
@@ -235,18 +269,26 @@ Network-path имеет физический `AbortController` deadline 8s, rend
 
 Renderer больше не опрашивает `refreshing=true` каждые 1.5s. Один `invoke` обязан закончиться success/error/timeout; старый результат отбрасывается generation/context guard'ом после смены аккаунта, вкладки или размонтирования. Во время запроса старые проценты остаются на экране, а иконка того же compact-face вращается без изменения ширины. После ошибки рядом показываются `Source`, возраст снимка и `stale`; spinner всегда прекращается.
 
-Неудачное обновление теперь даёт один короткий сигнал на том же контроле:
-круговые стрелки становятся красными примерно на1с и возвращаются к обычному
-цвету. В раскрытом меню это иконка `refresh`, при обновлении текущего аккаунта
-в шапке — временная замена иконки compact-face. Числа старого проверенного
-снимка остаются видимыми, подробная ошибка остаётся текстом. Сигнал привязан
-к аккаунту запроса: ошибка выбранного дополнительного профиля не красит чип
-текущего login; ошибка текущего login не приписывается другому выбранному
-detail. `success:true` IPC может содержать прежние проценты вместе с
-`lastError` выбранного аккаунта — это тоже неудачное обновление. Повторное
-чтение той же ошибки/attempt из cooldown-кэша не мигает снова, а новый отказ
-мигает. Успешное чтение с теми же процентами и anti-flap warning не считаются
-ошибкой запроса. Старый ответ прежнего account context не запускает сигнал.
+08.10 пользователь уточнил: ошибка последнего чтения должна быть состоянием
+самой `refresh`, а не отдельной строкой, растягивающей меню. Для обоих
+провайдеров кнопка в detail остаётся красной до успешного снимка выбранного
+аккаунта; полная причина доступна в title/aria. Повторная попытка вращает те же
+стрелки и показывает `updating`, сохраняя цвет прошлого отказа. Переключение
+на здоровый аккаунт показывает его обычную кнопку, а фоновый успех другого
+аккаунта не снимает ошибку выбранного. Последние проверенные числа остаются
+видимыми; Source, возраст и `stale` описывают их свежесть. `Connected · pro`
+означает подтверждённую авторизацию/план, не успешное чтение лимитов.
+
+В compact-face прежний короткий красный сигнал примерно на1с сохранён:
+он относится только к текущему CLI login, повтор той же ошибки/attempt из
+cooldown-кэша не мигает снова. `success:true` IPC может вернуть сохранённые
+проценты вместе с `lastError`: это успешно прочитанное состояние, а не
+успешное обновление; renderer log больше не пишет `refresh ok` для такого
+ответа. Успешное чтение с теми же процентами снимает красный detail; anti-flap
+warning не считается ошибкой запроса. Старый ответ прежнего account context
+не меняет новый экран. Причина задержки сети не устанавливается по одному
+сообщению timeout: оно доказывает превышение deadline (8s втомproduction
+инциденте), не потерю подписки.
 
 Мультиаккаунтность разделяет подключённые профили и исторические снимки. Каждый подключённый профиль обновляется через собственную доказанную авторизацию; неподключённый аккаунт показывает последний snapshot и помечается stale. Активная вкладка может обновить выбранный аккаунт только при совпавшем account key. Совпавший `sourceThreadId` допустим как fallback лишь когда identity активной сессии неизвестна; если identity известна и отличается, общий thread id не является доказательством принадлежности. Неизвестную identity запрещено приписывать основному `auth.json` только потому, что sample записан после login timestamp: старая вкладка аккаунта A продолжает писать после переключения на B.
 
@@ -259,6 +301,29 @@ detail. `success:true` IPC может содержать прежние проц
 Диагностика: main пишет `[CodexData] remote usage accepted|pending|confirmed|obsolete|failed account=... candidate=... shown=... durMs=...`; `candidate/shown` включают used и reset каждого окна. Итоговый `[CodexData] get-usage ...` показывает selected account/source, а `[CodexUsage:Stages]` — request reason, target scope и раздельные network/profile времена. Renderer пишет и отображаемый, и фактически обновлённый account. Сначала сверяй account/source/timestamp, а не Timeline: Timeline отвечает «какой snapshot был у хода», toolbar — «какой последний доказанный budget выбранного аккаунта».
 
 Не пересчитывать Codex лимит из `last_token_usage.total_tokens`. Локальные токены не равны провайдерскому quota%, потому что provider применяет собственную формулу и reset-бакеты. Конкретика Codex JSONL — [`fact-codex.md`](fact-codex.md).
+
+### Расход отдельной Codex-сессии — protocol proof09.10
+
+УстановленныйCLI0.159.2 имеет `account/usage/read({threadId})` иnullable
+`threadUsage` уже вобычной generated schema, не толькос--experimental.
+Это расширение [account token activity](https://learn.chatgpt.com/docs/app-server):
+estimatedUsageCreditsMicros (делитьна1e6), nullableUSD иgroups помодели,
+reasoningEffort/speed, input/cached/netNewInput/output/total tokens. Это оценка
+расхода сессии, не квитанция списания credits. Schema не отдаёт еёweekly quota
+percent ине имеет параметров временного диапазона; окно такойоценки отдельно
+нужно подтверждать. [/usage weekly](https://learn.chatgpt.com/docs/developer-commands)
+документирован какaccount token activity, не процент недельного лимита вкладки.
+
+Live read подfr***Pro: account-wide activity работает (summary+102daily buckets),
+ноcurrent canonicalSID и3fresh native IDs вернулиthreadUsage:null. Повтор
+послеmetadata-only thread/read подтвердилid==sessionId иоставилnull; никаких
+Resume/turn/input/login actions не было, собственныеhelpers закрыты. Причина
+отсутствия thread estimate не установлена; schema допускаетnull при отсутствии
+billing route. Не объявлять общий отказ API, rollout илинулевой расход.
+ВNotedэтотновыйметод пока не подключён. Если показыватьfuture per-tab cost,
+сохранятьestimate/null иexactaccount/session binding; не распределять общий
+quota% пропорциональноtokens/credits. Протокольный proof:
+`/private/tmp/noted-per-session-usage-20261009.qmutdrr2/`.
 
 ## Источник данных per-tab tokens: JSONL агрегирование (backend сохранён, UI скрыт)
 
@@ -350,7 +415,7 @@ Anthropic ротирует weekly-бакет раз в неделю. После 
 
 Обычный Claude-путь event-driven: новый statusLine снимок приходит после ответа Claude и через существующее событие инициирует чтение актуального account-state. Для OAuth-аккаунта сетевой снимок обновляется целиком после истечения cache; более частые statusLine-события лишь поддерживают отдельный резерв и не меняют время OAuth-снимка. Visibility refresh и редкий десятиминутный fallback обнаруживают внешний login/logout, но не превращают managed login в сетевой polling `/oauth/usage`. Для настоящего OAuth действуют cache, error cooldown и `Retry-After`; manual refresh не может пробить server backoff.
 
-Старые числа остаются на экране во время запроса. `Source`, возраст и `stale` показывают их качество, ошибка отображается отдельно. Загрузки лимитов и `Activity` имеют 12-секундный deadline; каждый новый контекст отменяет право старого ответа обновлять экран.
+Старые числа остаются на экране во время запроса. `Source`, возраст и `stale` показывают их качество; отказ usage обозначается красной `refresh` с причиной при наведении, без отдельной строки. Codex usage имеет25s IPC deadline, Claude usage/Activity —12s; каждый новый контекст отменяет право старого ответа обновлять экран.
 
 ## Baseline дня = последний snapshot предыдущего дня
 

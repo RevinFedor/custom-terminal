@@ -1,8 +1,9 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { attributeFreeze, recentRendererActivities } from './rendererActivityTrail';
-import { reportPerfIncident, setPerfIncidentWriter } from './perfIncidentChannel';
+import { reportPerfIncident, setPerfIncidentWriter, sendPerfHeartbeat, createPerfSocketWriter } from './perfIncidentChannel';
 import { getInteractionCursor } from './interactionCursor';
-import { installUIActionDiagnostics, captureUIAction, recordUIFrame, recordUIEventTiming } from './uiPerformanceDiagnostics.mjs';
+import { installUIActionDiagnostics, captureUIAction, recordUIFrame, recordUIEventTiming,
+  summarizeUIAction, formatDiagnosticKey } from './uiPerformanceDiagnostics.mjs';
 
 let installed = false;
 
@@ -108,7 +109,7 @@ function freezeSeverity(ms: number): string {
 // when the loop freezes, heartbeats stop and the watchdog samples THIS process
 // during the stall. `vis` rides along so the watchdog ignores silence from
 // hidden windows (background timer throttling is not a freeze).
-function installWatchdogHeartbeat() {
+export function installWatchdogHeartbeat() {
   try {
     const electronRequire = (window as any).require;
     if (!electronRequire) return;
@@ -125,10 +126,11 @@ function installWatchdogHeartbeat() {
       let timer: number | null = null;
       let retryDelayMs = 1000;
       let reconnectPending = false;
+      let reconnectTimer: number | null = null;
       let stopped = false;
       const teardownSock = () => {
         setPerfIncidentWriter(null);
-        if (timer !== null) { clearInterval(timer); timer = null; }
+        if (timer !== null) { window.clearInterval(timer); timer = null; }
         if (sock) {
           // Listeners off BEFORE destroy — destroy() re-fires 'close', which
           // would otherwise schedule a second reconnect per cycle and multiply
@@ -142,7 +144,9 @@ function installWatchdogHeartbeat() {
         reconnectPending = true;
         teardownSock();
         // Watchdog may restart with main; bounded backoff keeps us quiet if it's gone.
-        window.setTimeout(() => { reconnectPending = false; connect(); }, retryDelayMs);
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null; reconnectPending = false; connect();
+        }, retryDelayMs);
         retryDelayMs = Math.min(retryDelayMs * 2, 30000);
       };
       const connect = () => {
@@ -155,32 +159,25 @@ function installWatchdogHeartbeat() {
           scheduleReconnect();
           return;
         }
+        const connection = sock;
         sock.on('connect', () => {
+          if (stopped || sock !== connection) return;
           retryDelayMs = 1000;
-          setPerfIncidentWriter((incident) => {
-            if (!sock || sock.destroyed || sock.writableLength > 16384) return;
-            sock.write(JSON.stringify({ t: 'incident', proc: 'renderer', pid: proc.pid, ...incident }) + '\n');
-          });
+          setPerfIncidentWriter(createPerfSocketWriter(connection, proc.pid));
           timer = window.setInterval(() => {
-            if (!sock || sock.destroyed || sock.writableLength > 16384) return;
-            try {
-              sock.write(JSON.stringify({
-                t: 'hb',
-                proc: 'renderer',
-                pid: proc.pid,
-                abs: absNow(),
-                vis: document.visibilityState,
-                focused: document.hasFocus(),
-                context: getContext(),
-              }) + '\n');
-            } catch { /* close handler reconnects */ }
+            sendPerfHeartbeat({ abs: absNow(), vis: document.visibilityState,
+              focused: document.hasFocus(), context: getContext() });
           }, 250);
         });
         sock.on('error', scheduleReconnect);
         sock.on('close', scheduleReconnect);
       };
       connect();
-      window.addEventListener('beforeunload', () => { stopped = true; teardownSock(); });
+      window.addEventListener('beforeunload', () => {
+        stopped = true;
+        if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+        teardownSock();
+      });
       log('[Perf:Probe] watchdog-heartbeat armed sock=' + socketPath);
     }).catch((e: any) => {
       log('[Perf:Probe] watchdog-info-failed error=' + (e?.message || String(e)));
@@ -209,7 +206,7 @@ export function installPerfFreezeProbe() {
   installUIActionDiagnostics({ emit: log, notify: (action: any) => {
     try { diagnosticIpc?.send('perf:ui-summary', action); } catch {}
   } });
-  log('[Perf:Probe] actionSchema=1 targetSnapshot=1 stylesheetIdentity=1 nativeCounters=' + Number(!!diagnosticIpc));
+  log('[Perf:Probe] actionSchema=2 targetSnapshot=1 safeKeyClass=1 stylesheetIdentity=1 nativeCounters=' + Number(!!diagnosticIpc));
 
   const rafSamples: LoopSample[] = [];
   const timerSamples: LoopSample[] = [];
@@ -344,9 +341,6 @@ export function installPerfFreezeProbe() {
           const name = String(entry.name || '');
           if (!/^(click|pointerdown|mousedown|keydown|keyup)$/.test(name)) continue;
           const capturedAction = recordUIEventTiming(entry);
-          if (document.visibilityState === 'visible' && entry.duration >= 120) {
-            reportPerfIncident('ui-' + name, performance.timeOrigin + entry.startTime, entry.duration, capturedAction?.id);
-          }
           const inputDelay = typeof entry.processingStart === 'number'
             ? entry.processingStart - entry.startTime
             : NaN;
@@ -356,9 +350,17 @@ export function installPerfFreezeProbe() {
           const presentationDelay = typeof entry.processingEnd === 'number'
             ? entry.duration - (entry.processingEnd - entry.startTime)
             : NaN;
+          const summary = summarizeUIAction(capturedAction, { event: name, inputDelayMs: inputDelay,
+            handlerMs, presentationMs: presentationDelay, browserInteractionId: entry.interactionId });
+          if (document.visibilityState === 'visible' && entry.duration >= 120) {
+            reportPerfIncident('ui-' + name, performance.timeOrigin + entry.startTime, entry.duration, capturedAction?.id, summary);
+          }
+          const keyFields = formatDiagnosticKey(summary);
+          const target = capturedAction?.target.tag || cssPath(entry.target || null);
           log(
             '[Perf:EventTiming] event=' + name +
             ' actionId=' + (capturedAction?.id || 'uncaptured-or-evicted') +
+            keyFields +
             ' targetSource=' + (capturedAction?.target.source || 'unknown') +
             ' interactionId=' + (entry.interactionId || 0) +
             ' startAbs=' + (performance.timeOrigin + entry.startTime).toFixed(1) +
@@ -368,7 +370,7 @@ export function installPerfFreezeProbe() {
             ' inputDelayMs=' + (Number.isFinite(inputDelay) ? inputDelay.toFixed(1) : 'na') +
             ' handlerMs=' + (Number.isFinite(handlerMs) ? handlerMs.toFixed(1) : 'na') +
             ' presentationDelayMs=' + (Number.isFinite(presentationDelay) ? presentationDelay.toFixed(1) : 'na') +
-            ' target=' + cssPath(entry.target || null)
+            ' target=' + target
           );
           if (
             (Number.isFinite(inputDelay) && inputDelay >= 500) ||
@@ -379,13 +381,14 @@ export function installPerfFreezeProbe() {
               ' kind=eventTiming' +
               ' severity=' + freezeSeverity(Math.max(Number(entry.duration || 0), Number.isFinite(inputDelay) ? inputDelay : 0)) +
               ' event=' + name +
+              ' actionId=' + (capturedAction?.id || 'uncaptured-or-evicted') + keyFields +
               ' interactionId=' + (entry.interactionId || 0) +
               ' startAbs=' + (performance.timeOrigin + entry.startTime).toFixed(1) +
               ' processingStartAbs=' + (typeof entry.processingStart === 'number' ? (performance.timeOrigin + entry.processingStart).toFixed(1) : 'na') +
               ' durationMs=' + Number(entry.duration || 0).toFixed(1) +
               ' inputDelayMs=' + (Number.isFinite(inputDelay) ? inputDelay.toFixed(1) : 'na') +
               ' handlerMs=' + (Number.isFinite(handlerMs) ? handlerMs.toFixed(1) : 'na') +
-              ' target=' + cssPath(entry.target || null)
+              ' target=' + target
             );
           }
         }
@@ -466,7 +469,8 @@ export function installPerfFreezeProbe() {
   };
 
   const captureInput = (event: Event) => {
-    if (['click', 'pointerdown', 'mousedown', 'keydown', 'keyup', 'wheel'].includes(event.type)) captureUIAction(event);
+    const capturedAction = ['click', 'pointerdown', 'mousedown', 'keydown', 'keyup', 'wheel'].includes(event.type)
+      ? captureUIAction(event) : null;
     const pointer = event as PointerEvent | MouseEvent;
     const now = performance.now();
     if ('clientX' in pointer) {
@@ -479,11 +483,15 @@ export function installPerfFreezeProbe() {
     const inputDelayMs = receivedAbs - eventTimeAbs;
     const isPrimaryInput = event.type === 'click' || event.type === 'pointerdown' || event.type === 'mousedown';
     if (!isPrimaryInput && inputDelayMs <= 120) return;
+    // The console throttle must not hide an eligible direct-channel attempt
+    // (and thus its drop count) when EventTiming is unavailable or delayed.
+    reportPerfIncident('input-' + event.type, eventTimeAbs, inputDelayMs, capturedAction?.id,
+      summarizeUIAction(capturedAction, { event: event.type, inputDelayMs }));
     if (!isPrimaryInput && now - lastPointerLogAt < 250) return;
     lastPointerLogAt = now;
-    reportPerfIncident('input-' + event.type, eventTimeAbs, inputDelayMs);
     log(
       '[Perf:Input] event=' + event.type +
+      ' actionId=' + (capturedAction?.id || 'uncaptured-or-evicted') + formatDiagnosticKey(capturedAction) +
       ' eventTimeAbs=' + eventTimeAbs.toFixed(1) +
       ' receivedAbs=' + receivedAbs.toFixed(1) +
       ' inputDelayMs=' + inputDelayMs.toFixed(1) +

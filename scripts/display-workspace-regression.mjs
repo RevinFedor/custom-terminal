@@ -25,7 +25,8 @@ const displays = {
   big: { key: 'fixture-external', label: 'Fixture 32-inch', internal: false, width: 2560, height: 1440, scaleFactor: 1 },
   small: { key: 'fixture-laptop', label: 'Fixture laptop', internal: true, width: 1440, height: 900, scaleFactor: 2 },
 };
-const boot = { projectId: 'display-fixture-project', spaceId: 'display-fixture-space', cwd: path.join(dir, 'project'), displays };
+const windowControls=process.argv.includes('--window-controls');
+const boot = { projectId: 'display-fixture-project', spaceId: 'display-fixture-space', cwd: path.join(dir, 'project'), displays,windowControls };
 await fs.mkdir(boot.cwd);
 const report = {
   artifacts: dir, started: new Date().toISOString(), checks: [], errors: [], launches: [],
@@ -350,6 +351,51 @@ try {
   assert.ok(Object.keys(bundle.metafile.inputs).some(p => p.endsWith('store/useWorkspaceStore.ts')), 'actual store must be bundled');
   if (!process.argv.includes('--build-only')) {
     await launch();
+    if(windowControls){
+      const baseline=await snapshot('01-window-controls');
+      const windowOf=id=>baseline.panes.find(p=>p.tabs.includes(`fixture-${id}-1`)).windowId;
+      const menu=id=>`[data-terminal-pane-chrome-host="${boot.spaceId}:${id}"] [data-split-strip-menu-button]`;
+      await click('[data-fixture-display="small"]');
+      await check('minimize-second-item-retains-window',async()=>{
+        await click(menu(windowOf('a')));
+        const labels=await page.locator('[data-split-strip-menu] > button').allTextContents();
+        assert.match(labels[0],/Expand/);assert.equal(labels[1].trim(),'Minimize');
+        await click('[data-split-strip-menu-item="minimize-window"]');
+        const state=await snapshot('02-minimized');
+        assert.equal(state.panes.find(p=>p.windowId===windowOf('a')).hidden,true);
+        assert.deepEqual(state.panes.find(p=>p.windowId===windowOf('a')).tabs,['fixture-a-1','fixture-a-2']);
+        assert.deepEqual(visible(state).map(p=>p.windowId),[windowOf('b')]);
+      });
+      await check('expand-control-outside-card-area',async()=>{
+        await click(picker(windowOf('b')));
+        const action=await page.locator(`[data-hidden-window-alongside="${windowOf('a')}"]`).boundingBox();
+        const group=await page.locator(`[data-hidden-window-id="${windowOf('a')}"]`).boundingBox();
+        assert.ok(action.x+action.width<=group.x+.1);assert.ok(Math.abs(action.y-group.y)<.1);
+        await snapshot('03-expand-outside');await click(`[data-hidden-window-alongside="${windowOf('a')}"]`);
+        const state=await snapshot('04-expanded');assert.deepEqual(new Set(visible(state).map(p=>p.windowId)),new Set([windowOf('a'),windowOf('b')]));
+      });
+      await check('hidden-file-chip-click-reveals-owner-without-hover-menu',async()=>{
+        await click(picker(windowOf('b')));
+        const file=page.locator(`[data-hidden-window-id="${windowOf('c')}"] [data-tab-linked-files="fixture-c-1"]`);
+        await file.hover();await frames();
+        assert.equal(await page.locator('[data-tab-linked-files-popup]').count(),0);
+        assert.equal((await page.evaluate(()=>window.__displayFixture.snapshot())).panes.find(p=>p.windowId===windowOf('c')).hidden,true);
+        await file.locator('[data-linked-file-short-name]').click();
+        await page.waitForFunction(()=>window.__displayFixture.preview()?.sourceTabId==='fixture-linked-note');
+        const state=await snapshot('05-file-revealed');assert.equal(state.panes.find(p=>p.windowId===windowOf('c')).hidden,false);
+        assert.equal(state.panes.find(p=>p.windowId===windowOf('c')).shown,'fixture-c-1');
+      });
+      await check('last-window-minimize-keeps-restore-access',async()=>{
+        let state=await page.evaluate(()=>window.__displayFixture.snapshot());
+        const shownIds=visible(state).map(p=>p.windowId);
+        for(const id of shownIds){await click(menu(id));await click('[data-split-strip-menu-item="minimize-window"]');}
+        state=await snapshot('06-last-minimized');const vacant=visible(state);assert.equal(vacant.length,1);assert.equal(vacant[0].shown,'');
+        await click(`#fixture-workspace [data-terminal-pane-chrome-host^="vacant:"] [data-hidden-window-picker-button]`);
+        assert.equal(await page.locator('[data-hidden-window-id]').count(),4);
+        await click(`[data-hidden-window-id="${windowOf('a')}"] [data-hidden-window-tab-id="fixture-a-2"]`);
+        state=await snapshot('07-restored-selected');assert.equal(visible(state)[0].windowId,windowOf('a'));assert.equal(visible(state)[0].shown,'fixture-a-2');
+      });
+    }else{
     const baseline = await snapshot('01-big-baseline');
     const windows = Object.fromEntries(['a', 'b', 'c', 'd'].map(id => [
       id, baseline.panes.find(pane => pane.tabs.includes(`fixture-${id}-1`))?.windowId,
@@ -652,6 +698,7 @@ try {
         assert.deepEqual(previous.finalIsolation, { focused: false, visible: false, focusEvents: [], network: [] });
       }
     });
+    }
   }
 } catch (error) {
   report.errors.push({ phase: 'harness', error: error.stack || String(error), detail: error.errors });

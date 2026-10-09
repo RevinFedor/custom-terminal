@@ -31,4 +31,4 @@ function shouldRetainOrchestrationRun(run) {
     || isOrchestrationResultProofPending(run) || isSourceFollowupPending(run) || isSourceNotificationBlocked(run);
 }
 module.exports = { isOrchestrationInheritedActivity, isOrchestrationResultProofPending,
-  isOrchestrationCompletionBlocking, shouldRetainOrchestrationRun };
+  isOrchestrationCompletionBlocking, isSourceNotificationBlocked, shouldRetainOrchestrationRun };

@@ -396,7 +396,10 @@ Group-row — самостоятельная кликабельная строк
 
 Group-row поддерживает те же пользовательские visual metadata, что и обычная вкладка: `sessionStatus` рисуется тем же marker shape/size слева, `color` выбирает background/folder accent из `TAB_COLORS`. ПКМ по группе зеркалит tab-context menu для Status и Background: повторный клик по выбранному статусу снимает его, а пустой список статусов показывает тот же hint про Settings → Системные. Статусы групп живут в `tabGroups` JSON, а не в `tabs`/`tab_history`.
 
-Mobile/native клиенты не хранят свои группы. `/api/projects/:id/tabs` отдаёт тот же `tabGroups`
+Mobile/native клиенты не хранят свои группы. После workflow cutover native читает
+global groups и меняет их через отдельный canonical HTTP adapter; полный active
+drag использует общий capture/compiler/commit, включая placed/hidden участников.
+Legacy Project-клиенты до cutover: `/api/projects/:id/tabs` отдаёт тот же `tabGroups`
 JSON вместе со статусами и marker config, а `/api/projects/:id/tab-layout` принимает layout
 payload с `orderedIds`, `groupAssignments`, `groupAnchorAssignments`. Это защищает от двух
 разных sidebar-истин: desktop DnD, mobile reorder и project-activity layout reload должны
@@ -477,6 +480,12 @@ SQLite-транзакцией через `project:save-tabs {tabSnapshots}`. О�
 visit/detached history и всех workflow snapshots; показанное окно остаётся vacant.
 Owned `FilePreview` закрывается по owner/file ID, а не по совпадению пути.
 
+Его компактная шапка показывает имя файла, чтобы длинный путь не вытеснял
+название. Полный путь доступен в title. GT Editor и Sublime представлены иконками,
+Copy All и закрытие остаются явными действиями; локальный font stepper убран.
+GT Editor получает тот же дисковый путь через native open-file, не копию текста
+в untitled. Эти изменения шапки не означают ускорения чтения/рендера большого файла.
+
 Запоздавший `Link File` не может публиковать документ после закрытия владельца:
 `linkFileTab` передаёт существующей фабрике `canPublish` с проверкой exact tab ID,
 исходного workspace и `aiClosing`. Общий creation-commit повторяет её непосредственно
@@ -485,9 +494,53 @@ caller получает явный отказ вместо выдуманног�
 
 Тот же сценарий доступен внешним callers через `POST /api/terminal-tabs/:tabId/link-file` и `Terminal MCP::link_file`; отдельной MCP-модели вложений нет. Сервер принимает только существующий абсолютный файл и canonicalize'ит путь, renderer ищет target по всем открытым project workspace. Пара canonical path + `visualParentTabId` идемпотентна: повтор возвращает прежний file-tab. Внутри полноценной AI-сессии отсутствующий `tabId` берётся из `NOTED_PARENT_TAB_ID`, поэтому scratchpad может прикрепить себя без угадывания собственного ID; явный `tabId` адресует другую сессию.
 
-File-tab участвует в тех же механиках порядка, группировки, DnD и visual-child стрелок, что и обычные вкладки. При этом его контекстное меню урезано по смыслу: остаются `Copy Path`, `Open in Finder`, `Copy Content`, `Status` и `Unlink File`; `Обновить название`, Favorites, Stop/Restart и rename не показываются. `Open in Finder` делает OS reveal того же `filePath`, что был прикреплён из дерева: file-tab не должен требовать возвращаться в `Cmd+B` только чтобы найти файл в Finder. `Unlink File` закрывает вкладку/связь, но **не удаляет файл с диска** — destructive file operation остаётся в file tree. Background/color editing отключены, потому что фиолетовый фон — semantic marker “это файл”, а не пользовательская раскраска сессии. Header file-menu показывает имя файла в fixed-width меню через `truncate` + полный `title`: длинный linked markdown не должен растягивать context-menu шире обычной вкладки.
+File-tab участвует в тех же механиках порядка, группировки, DnD и visual-child стрелок, что и обычные вкладки. Его меню содержит `Copy Path`, `Open in Finder`, `Copy Content`, `Status`, `Unlink File` и отдельный `Delete File`; `Обновить название`, Favorites, Stop/Restart и rename не показываются. `Open in Finder` раскрывает тот же `filePath`, без возвращения в `Cmd+B`. `Unlink File` закрывает вкладку/связь и сохраняет байты. `Delete File` использует прежний file-tree ingress в системную корзину и закрывает связь только после строгого disk ACK; ошибка диска сохраняет связь. Если диск подтвердил удаление, но Close отвергнут, UI сообщает частичный результат, не объявляет связь удалённой. Меню фиксирует exact ID/path/parent/subject: устаревший или переподчинённый файл не наследует полномочия старого пункта; Escape отменяет меню до действия. Фиолетовый фон остаётся маркером файла, редактирование Background/color отключено. Длинное имя в header меню ограничено шириной, с ellipsis и полным `title`.
 
-Клик по file-tab открывает `FilePreview` справа поверх terminal area через тот же preview-surface, что Cmd+click/Sidebar file open. Повторный переход обратно должен возвращать пользователя к предыдущему рабочему табу/родителю, а не превращать file-tab в новый терминальный контекст. При правках этой зоны проверяй `Workspace` sync-effects: preview source `tab` не должен быть закрыт sidebar cleanup'ом, а sidebar source не должен переписать active file-tab preview.
+Клик по прикреплённому file-tab в reserve раскрывает его AI/terminal-владельца через общий async `openTabById`, затем открывает тот же `FilePreview` в его окне. Сам файл не добавляется в terminal strip; явный DnD placement остаётся отдельным действием. Поиск владельца проходит через файловых родителей и останавливается на первой самостоятельной AI/terminal-вкладке. Непривязанный файл сохраняет обычный preview flow. Повторный клик по тому же exact файлу закрывает reader, другой файл заменяет содержимое. Home, уход/возврат и закрытие во время async read отменяют поздний результат. `Workspace` sync-effects не должны переписать этот owned preview из sidebar-state.
+
+Файловое меню карточки — ограниченная проекция того же дерева, не отдельный порядок.
+Оно включает вложенные файлы, но не документы самостоятельного AI-child. Y/X меняют
+общие `reserveOrder`/visual relations одним canonical `commitDrag`; mixed roots,
+глобальные группы файлов и соседние AI-вкладки сохраняются. Группы в file-only
+проекции не показаны и этим жестом не переназначаются. Корень меню означает существующего
+владельца: top-level outdent не отсоединяет файл, выход указателя за меню отменяет
+жест. Frozen scope проверяет также полный состав файлов владельца, включая появление
+нового sibling после pickup. Временный `contextParent` при pane adoption не является
+запретом явной visual-перестановки файла; physical `parentTabId` остаётся защищённым.
+«Убрать из окна» возвращает владельца и это дерево в reserve с тем же порядком.
+
+Чип называет открытый файл, после закрытия reader — последний открытый у этого
+владельца, до первого открытия — первый в сохранённом порядке. Выбор проверяется
+по текущему дереву; удалённая/переподчинённая связь и известный missing path не
+подставляются из старой памяти. Имя открывает/закрывает reader, `+N` управляет меню.
+Hover открывает список и для единственного файла: иначе недоступно открытие
+его самостоятельной вкладки средним кликом. Число файлов определяет наличие `+N`, а не доступность меню;
+при переходе с двух файлов на один список остаётся, после последнего unlink исчезает.
+Повторный click закрытия не отменяется hover до нового входа. Passive chooser
+может включить `linkedFilesMode='navigate'`: левый клик в обоих сегментах вызывает exact
+file callback, без nested hover/menu/context-menu. Геометрия общего TabCard прежняя.
+
+Средний клик различает поверхность: по нижнему чипу закрывает owned reader и
+возвращает его вкладку через Root navigator, сохраняя файловую связь. По строке
+popup или file-tab в workflow sidebar открывает самостоятельное окно справа.
+Существующее место файла раскрывается через Root без копии; свободное окно,
+оставшееся после закрытия chip, переиспользуется. В оконной полосе middle снимает
+только placement. Unlink остаётся явным пунктом ПКМ, средний клик его не вызывает.
+В popup голубая inset-линия отмечает отдельное окно; показанный файл дополнительно
+подсвечен, parked/hidden/profile placement имеет приглушённую линию.
+Жест не всплывает в родительскую карточку и не закрывает её. Pending read того же
+владельца отменяется до await, чтобы старый reader не вернулся после открытия сбоку;
+очистка старого read не снимает guard нового. Popup проверяет exact path/parent/owner
+и не открывает окно внутри active drag. File с physical parent показывается как
+свой reader, не как AI subagent родителя; physical relationship не переписывается.
+
+У обычного file chip scale1.04 сохраняется при переходе по bridge внутрь popup;
+нижний край остаётся на месте благодаря origin:left bottom. Уход из всей зоны
+снимает scale, даже если меню закреплено. Popup имеет по1px внешнего/внутреннего
+отступа и зазор между строками1px. Сами строки переиспользуют целый TabCard:
+шрифт, высота и padding совпадают с sidebar при любых настройках. Ширина остаётся
+по содержимому, окружающий padding не суммируется в широкую пустую рамку. DnD feedback располагается внутри
+строки, без постоянной пустой колонки справа. Navigate-режим остаётся без scale.
 
 File-tab не архивируется в `tab_history` при закрытии и не участвует в Home, Shift+Cmd+T, title-search и iteration-search индексах. Фиолетовая linked-file строка в History выглядит как восстановимая сессия, хотя restore вернул бы только документ-превью без терминального состояния; поэтому фильтр должен идти по `tabType='file'`, а не по цвету `purple`, чтобы не заблокировать будущие обычные вкладки с пользовательским фиолетовым фоном. Старые polluted history-строки с `tab_type='file'` игнорируются на чтении/индексации.
 
@@ -513,7 +566,13 @@ tabId и restart; это не попытка оживить старый PTY. А
 ownership. Изменение selection позже не расширяет набор. Несмежные корни
 сохраняют порядок и якорь зажатой строки.
 Multi-X остаётся запрещённым с явной стрелкой-запретом, single-X сохраняет прежнюю
-иерархию. Physical children и files не меняют владельца от изменения отступа.
+иерархию. Physical AI children не меняют execution-parent от изменения отступа.
+Файл с parentTabId=null имеет обычную редактируемую visual-связь: X-outdent/indent
+и Y-перенос сохраняются через тот же canonical transaction. Прежний blanket
+file-lock в host/model/Main был регрессией, а не ограничением старого sidebar.
+Проверки subject/PK, исходной relation/revision, циклов и существования parent
+сохраняются. Это не отменяет file-family при переносе владельца и не превращает
+временное извлечение файла из pane-проекции в неявный unlink.
 
 Вход из pane и смена workflow продолжают один gesture с одним final-release
 owner. Cmd-end сначала рисуется и только затем сохраняется; Escape/blur/outside
@@ -521,6 +580,9 @@ owner. Cmd-end сначала рисуется и только затем сох
 показанные membership/group/parent/order/layout изменения. Его scoped проверка
 может принять несвязанную новую publication, но исходный request/hash и все
 guards сохраняются; общий commitWorkspace по-прежнему требует свой exact CAS.
+Пустой group-root при смене workflow также меняет reserveWorkflowId в этой
+транзакции с exact definition/composition guards. Один rootOrder назначения не
+переносит пустую группу: без anchor-изменения readback снова показывал её в source.
 Обычные metadata saves не заменяют legacy row, а собственный relation ACK
 применяется только к старым queued snapshots. Поздний ACK не возвращает фокус
 после Home или away/back. Whole-app физическая проверка отделена от проверки

@@ -147,6 +147,16 @@ function finiteOffset(value) {
   return Number.isFinite(value) ? Number(value) : null;
 }
 
+function isCodexCompactRecordAfterBoundary(operation, offset) {
+  if (!Number.isFinite(offset)) return false;
+  if (!Number.isFinite(operation?.sourceByteOffset)) return true;
+  // Observed provider requests capture the exclusive file EOF before the
+  // response. The next record can start exactly there. Explicit command
+  // operations keep their established strict post-command evidence rule.
+  return operation?.source === 'provider-compaction'
+    ? offset >= operation.sourceByteOffset : offset > operation.sourceByteOffset;
+}
+
 function sameOperationIdentity(left, right) {
   return !!left && !!right
     && left.tabId === right.tabId
@@ -205,10 +215,30 @@ class CompactOperationRegistry {
   }
 
   begin(input = {}) {
+    return this._begin(input, false);
+  }
+
+  observeProviderCompaction(input = {}) {
+    if (input.provider !== 'codex' || input.requestKind !== 'compaction'
+      || !optionalText(input.sessionId) || !optionalText(input.generation)
+      || !optionalText(input.providerSourceId) || !optionalText(input.providerRequestId)
+      || !Number.isSafeInteger(input.sourceByteOffset) || input.sourceByteOffset < 0) return null;
+    // A request inside an explicitly tracked /compact is not a second
+    // command, Send receipt or timer. Pending intent still needs its original
+    // causal task_started. Retries within one observed phase keep its start.
+    const existing = this.getActive(input.tabId, 'codex') || this.getPending(input.tabId, 'codex');
+    if (existing) return ownerMatches(existing, input) ? existing : null;
+    return this._begin({ ...input, command: null, handoffId: null,
+      sendOperationKey: null, sendAttemptId: null, source: 'provider-compaction',
+      operationId: 'codex:provider-compaction:' + input.providerSourceId + ':' + input.providerRequestId,
+    }, true);
+  }
+
+  _begin(input, providerObserved) {
     const tabId = requireText(input.tabId, 'tabId');
     const provider = requireText(input.provider, 'provider');
     if (!VALID_PROVIDERS.has(provider)) throw new TypeError('unsupported compact provider');
-    if (!isExactCompactCommand(input.command)) return null;
+    if (!providerObserved && !isExactCompactCommand(input.command)) return null;
 
     const sessionId = optionalText(input.sessionId);
     const generation = optionalText(input.generation);
@@ -221,7 +251,9 @@ class CompactOperationRegistry {
       active: true,
       tabId,
       provider,
-      command: '/compact',
+      command: providerObserved ? null : '/compact',
+      ...(providerObserved ? { providerSourceId: input.providerSourceId,
+        providerRequestId: input.providerRequestId } : {}),
       operationId,
       sessionId,
       generation,
@@ -428,7 +460,7 @@ class CompactOperationRegistry {
     // operation merely because tab/session/generation still match.
     if (Number.isFinite(input.completionByteOffset)
       && Number.isFinite(active.sourceByteOffset)
-      && Number(input.completionByteOffset) <= Number(active.sourceByteOffset)) {
+      && !isCodexCompactRecordAfterBoundary(active, Number(input.completionByteOffset))) {
       return null;
     }
     if (input.outcome === 'completed'
@@ -503,7 +535,7 @@ class CompactOperationRegistry {
     const offset = finiteOffset(input.rolloutOffset ?? input.completionByteOffset);
     const eventSequence = finiteOffset(input.eventSequence);
     if (active.provider !== 'codex' || !Number.isFinite(offset)) return null;
-    if (Number.isFinite(active.sourceByteOffset) && offset <= active.sourceByteOffset) return null;
+    if (!isCodexCompactRecordAfterBoundary(active, offset)) return null;
     if (Number.isFinite(active.codexCompactedOffset)
       && offset === active.codexCompactedOffset
       && input.kind === 'compacted') {
@@ -522,8 +554,9 @@ class CompactOperationRegistry {
       });
       this.activeByTab.set(tabId, updated);
       this.publish(updated);
-      if (Number.isFinite(updated.codexTaskCompleteOffset)
-        && offset < updated.codexTaskCompleteOffset) {
+      if (updated.source === 'provider-compaction'
+        || (Number.isFinite(updated.codexTaskCompleteOffset)
+        && offset < updated.codexTaskCompleteOffset)) {
         return this.finish({
           tabId,
           provider: 'codex',
@@ -627,6 +660,7 @@ module.exports = {
   codexCompactOutcomeFromReason,
   createCompactOperationRegistry,
   isExactCompactCommand,
+  isCodexCompactRecordAfterBoundary,
   normalizeCompactCommand,
   projectCodexCompactTurnOutcome,
 };

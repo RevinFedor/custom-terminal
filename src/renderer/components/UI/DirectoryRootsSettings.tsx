@@ -23,7 +23,7 @@ function validateRegistry(value: any): Registry {
   return value;
 }
 
-export default function DirectoryRootsSettings() {
+export default function DirectoryRootsSettings({compact=false}:{compact?:boolean}={}) {
   const [registry, setRegistry] = useState<Registry | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -110,23 +110,22 @@ export default function DirectoryRootsSettings() {
     finally { lock.current = false; if (mounted.current) setBusy(false); }
   };
 
-  return <section data-directory-roots style={{ marginTop: 24, borderTop: '1px solid #333', paddingTop: 16 }} aria-label="Директории">
+  return <section data-directory-roots style={{ marginTop: compact?6:24, borderTop: '1px solid #333', paddingTop: compact?4:16 }} aria-label="Директории">
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-      <h3 style={{ margin: 0, fontSize: 13, color: '#ddd' }}>Директории</h3>
+      <h3 style={{ margin: 0, fontSize: 13, color: '#ddd' }}>{compact?'Папки источников':'Директории'}</h3>
       <div style={{ display: 'flex', gap: 6 }}>
         <button style={control} aria-label="Обновить директории" disabled={busy || loading || Boolean(pending)} onClick={() => void load().catch(() => {})}><RefreshCw size={13} /></button>
         <button style={control} disabled={!editable} onClick={() => { setRemoving(null); setDraft(emptyDraft()); }}><Plus size={13} style={{ display: 'inline' }} /> Директория</button>
       </div>
     </div>
-    <p style={{ color: '#999', fontSize: 12 }}>Директория вкладки выбирается независимо от этого списка. Добавление директории не подключает её промпты к вкладкам автоматически.</p>
+    <p style={{ color: '#999', fontSize: 12,margin:compact?'4px 0':undefined }}>Добавление папки не подключает её промпты к вкладкам автоматически.</p>
     {loading && <div role="status" style={{ color: '#aaa', fontSize: 12 }}>Загрузка директорий…</div>}
     {error && <div role="alert" style={{ color: '#f87171', fontSize: 12, marginBottom: 8 }}>{error}
       {pending ? <button style={{ ...control, marginLeft: 8 }} disabled={busy} onClick={() => void mutate(pending)}>Повторить запрос</button>
         : <button style={{ ...control, marginLeft: 8 }} disabled={busy || loading} onClick={() => void load().catch(() => {})}>Прочитать заново</button>}
     </div>}
     {registry && <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      {registry.roots.map(root => <div key={root.id} data-directory-root={root.id} style={{ display: 'flex', gap: 8, alignItems: 'center', padding: 8, border: '1px solid #333', borderRadius: 7 }}>
-        {root.icon && <img src={root.icon} alt="" width={22} height={22} />}
+      {registry.roots.map(root => <div key={root.id} data-directory-root={root.id} style={{ display: 'flex', gap: 4, alignItems: 'center', padding: compact?2:8, border: '1px solid #333', borderRadius: 5 }}>
         <button style={{ ...control, textAlign: 'left', flex: 1, minWidth: 0 }} disabled={!editable} onClick={() => { setRemoving(null); setDraft({ id: root.id, path: root.path, name: root.name || '', enabled: root.enabled !== false }); }}>
           <span style={{ display: 'block', overflowWrap: 'anywhere' }}>{root.name || root.path}</span>
           {root.name && <span style={{ display: 'block', color: '#888', overflowWrap: 'anywhere' }}>{root.path}</span>}

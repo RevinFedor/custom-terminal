@@ -264,6 +264,68 @@ native cleanup. Новый AGY control/runtime в продукт не внедр
 
 ---
 
+## Codex0.162 fullscreen против inline: полный DEV ABBA,09.10.2026
+
+Четыре принятых R3 запуска A/B/B/A на одной копии реального длинного разговора:
+~750MiB,79883records,272unique turn IDs. В обоих вариантах настоящий Codex0.162,
+PTY/main mirror/Canvas/History/Electron28.3.3; окно1496×845/DPR2. Отличие режима:
+A — штатный`--no-alt-screen`, B — fullscreen/alternate buffer. Локальный Responses
+upstream выдаёт одинаковые200строк/5816bytes через реальный Noted ProviderProxy
+и semantic observer. Это не облачная модель и не сравнение качества/сети.
+
+| Метрика, диапазон двух запусков | Inline | Fullscreen |
+| --- | --- | --- |
+| Enter в History → первый main HTTP request, s | 8.381–13.906 | 6.086–6.677 |
+| CPU работа всего дерева за этот этап, CPU-s | 25.697–34.978 | 15.187–16.318 |
+| CPU работа за одинаковый controlled stream, CPU-s | 6.595–10.037 | 9.324–10.309 |
+| RAM со скрытым терминалом, медианы MiB | 1106.0–1178.0 | 1006.9–1180.3 |
+| RAM с открытым боковым терминалом, медианы MiB | 1043.3–1064.3 | 1006.9–1019.5 |
+| Idle CPU с открытым терминалом, % одного ядра | 12.2–13.3 | 13.9–14.2 |
+
+Фаза до HTTP была быстрее и дешевле по CPU вfullscreen; постоянной RAM/idleCPU
+экономии это не доказывает. Скрытая RAM перекрывается, видимая разница медиан
+~41MiB/~4%; сам Codex после ответа~72–83MiB, большая часть total — приложение.
+CPU-s суммируют работу ядер, не wall-time. Машина10cores/32GiB; процессные
+native footprint/CPU снимались каждые500ms сPID+birth без double count.
+Hidden окно строго+20…30s после response completion, visible —10s после показа
+панели; parent независимо перепроверил медианы/CPU и renderer handoff до окон.
+Всем arms предшествовал одинаковый raw History rebuild~18–23s из-заidentity
+нового клона. Это НЕ время холодного открытия всего Noted, не warm SSD hit и
+не cold filesystem cache. Два повтора не дают универсального процента ускорения;
+hostCPU в точности на каждом окне не измерялся, одинаковое E2E backgroundThrottling=false.
+
+**Тест требует private совместимости, не означает готовый product mode.**
+Без неё fullscreen рисует input, но обычный Send застревает на readiness:
+`parseCodexVerifiedComposerFooter` принимает последнюю непустую строку, тогда
+как подmodel/effort fullscreen выводит`? for shortcuts`. Actual captured frame
+далRED; private prototype пропускает одну точнуюhelp-строку, прежниеguards и
+38existing tests сохранены. Его использовали ОДИНАКОВО во всех4R3, продукт не правили.
+Main во всехR3 действительно опубликовал current-frame modelgpt-6-astra/effortmax/
+fast=false; послеответа liveIPC дал fresh empty-draft generation/writeSeq.
+
+Полный readback при scrolling не закрыт: real R3-B1 frame послеwheel содержит
+`Back to bottom` и нижнююстроку`Earlier messages available. enter/esc latest`.
+Повторное исполнение того же actual parser над сохранённым кадром возвращает
+null даже сprivate prototype. Это не доказательство сброса живого Main status,
+но отсутствие нового settings proof. Alternate scrollTop=0 не подтверждает
+возврат кbottom; положительный draft/modelchange/Fast=true и exact streaming
+readback отдельно не проверены. Следующий acceptance должен проследить PTY
+mouse input→TUI viewport→возврат→fresh composer/settings. Нельзя включать режим
+одним удалениемфлага: отдельно остаются Dashboard process-filters.
+
+Источник: рабочий `docs/tmp/исследование-терминалов-и-агентов.md`, раздел
+«Fullscreen Codex против штатного inline в полном DEV» — команды и границы.
+Артефакты `/var/folders/72/jx261489331_qw1xj740p5lc0000gn/T/noted-workflow-e2e-PGSeuA/`:
+`report.md`, `summary.json`, `parent-phase-summary.json`, `readiness-before/after.json`,
+`parent-captured-footer-check.json`, `attempts/R3-*/` samples/logs/PNG.
+R2 исключён: SSE fixture пропускалitem_id и дублировал semantic items; исправлен
+fixture и проверен настоящимshadow. Итоговый R3 handoff подтверждёнrenderer
+CLEAR/HANDOFF_DONE, не толькоtask_complete; отдельный DOMnode count не снимался.
+Original целиком совпал поSHA до/после, все процессы закрыты; disposableprofiles/
+caches удалены, проверенные archives сохраняют original/base fixture и baseline.
+Рекомендация: не менять default ради RAM/idleCPU; faster cold Send заслуживает
+отдельной полноценной совместимости. Benchmark завершён, rollout не выполнен.
+
 ## 1. Ink/TUI Render Tearing & Synchronized Output (Input Jitter)
 **Файл-источник:** `fix-ink-tui-render-tearing.md`, `fix-terminal-jitter.md`
 

@@ -15,6 +15,7 @@
 
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactDOM from 'react-dom';
+import {Copy, Square} from 'lucide-react';
 import { useAgentSendPendingTabs } from '../../hooks/useAgentSendActivity';
 import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -24,6 +25,7 @@ import { resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStrip
 import { SPACE_STRIP_H } from '../../constants/layout';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { resolveWorkflowActivityCounts } from '../../utils/workflowActivityCounts.mjs';
+import { useCodexNativeQuestionCounts } from '../../utils/codexNativeQuestions';
 import { allPaneTabIds } from '../../utils/splitPanesModel.mjs';
 import { tabSpaceIndexMap } from '../../utils/workspaceSpacesModel.mjs';
 import { spacesWithLiveLayout } from '../../utils/workspaceSpaceRecovery.mjs';
@@ -112,6 +114,7 @@ function SpaceChip({
   const chipRef = useRef<HTMLSpanElement | null>(null);
   const workspaceVisible = useWorkspaceStore((state) => state.view === 'workspace');
   const sendPendingTabs = useAgentSendPendingTabs();
+  const codexQuestionCounts = useCodexNativeQuestionCounts();
   // Metadata подписана по одному workflow. Родитель держит только fingerprint
   // списка id, поэтому выбор большой data-URL иконки не заставляет всю полосу
   // подписываться на массив `spaces` целиком.
@@ -185,9 +188,10 @@ function SpaceChip({
       sendPending: sendPendingTabs.has(tabId),
       inheritedBusy: inheritedBusyTabIds.has(tabId),
       awaiting: awaitingTabs.get(tabId) === true,
+      nonblockingQuestion: (codexQuestionCounts.get(tabId) || 0) > 0,
       completionNotificationFired,
     })));
-  }, [activityKey, processStatus, busyTabs, pasteBusyTabs, inheritedBusyTabIds, awaitingTabs, sendPendingTabs]);
+  }, [activityKey, processStatus, busyTabs, pasteBusyTabs, inheritedBusyTabIds, awaitingTabs, sendPendingTabs, codexQuestionCounts]);
   const [renaming, setRenaming] = useState(false);
   // Наведение подсвечивает чип: до этого единственным ответом на «я сейчас
   // попаду сюда» была форма курсора, и полоса читалась как неживая. Юзер:
@@ -209,7 +213,10 @@ function SpaceChip({
   const [draft, setDraft] = useState('');
   const renameInput = useInlineRenameInputRef(renaming);
   const canDelete = useWorkspaceStore((s) => s.spaces.length > 1 && s.spaces.find(space => space.id === id)?.kind !== 'inbox');
+  const defaultCwd = useWorkspaceStore(s=>{const cwd=s.spaces.find(space=>space.id===id)?.defaultCwd;return typeof cwd==='string'?cwd:'';});
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [stoppingSessions, setStoppingSessions] = useState(false);
+  const stopSessionsInFlight = useRef(false);
   const navigationTarget = useTabDragNavigationSnapshot().target;
   const paneTabNavigationTarget = navigationTarget?.kind === 'workflow'
     && navigationTarget.id === id && !navigationTarget.blocked;
@@ -284,6 +291,42 @@ function SpaceChip({
     const next = draft.trim();
     setRenaming(false);
     if (next && next !== name) onRename(id, next);
+  };
+
+  const stopSessions = async (mode: 'idle' | 'all') => {
+    if (stopSessionsInFlight.current) return;
+    stopSessionsInFlight.current = true;
+    setStoppingSessions(true);
+    setContextMenu(null);
+    const actionId = globalThis.crypto.randomUUID();
+    const startedAt = performance.now();
+    // Local preparation can precede Main Send admission. These IDs only
+    // EXCLUDE idle targets; they never grant Stop or identify an execution.
+    const busyTabIds = [...new Set([...sendPendingTabs, ...inheritedBusyTabIds,
+      ...[...busyTabs].filter(([, busy]) => busy).map(([tabId]) => tabId),
+      ...[...pasteBusyTabs].filter(([, busy]) => busy).map(([tabId]) => tabId)])];
+    console.log('[WorkflowStop] click action=' + actionId + ' workflow=' + id + ' mode=' + mode);
+    try {
+      const result = await window.require('electron').ipcRenderer.invoke('workflow:stop-sessions', {
+        actionId, workflowId: id, mode, ...(mode === 'idle' ? { busyTabIds } : {}),
+      });
+      console.log('[WorkflowStop] settled action=' + (result?.actionId || actionId) + ' workflow=' + id
+        + ' mode=' + mode + ' durMs=' + Math.round(performance.now() - startedAt));
+      if (!Array.isArray(result?.results) || result?.error) throw new Error(result?.error || 'stop_not_confirmed');
+      for (const target of result.results) if (target.kind === 'sdk' && target.success === true) {
+        window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId: target.tabId } }));
+      }
+      useUIStore.getState().showToast(
+        `Остановлено: ${result.stoppedCount || 0}${result.skippedCount ? ` · Пропущено: ${result.skippedCount}` : ''}${result.failedCount ? ` · Ошибок: ${result.failedCount}` : ''}`,
+        result.failedCount ? 'error' : result.stoppedCount ? 'success' : 'info',
+      );
+    } catch (error: any) {
+      console.warn('[WorkflowStop] failed action=' + actionId + ' workflow=' + id + ' mode=' + mode + ' error=' + String(error?.message || error));
+      useUIStore.getState().showToast(`Остановка не подтверждена: ${error?.message || error}`, 'error');
+    } finally {
+      stopSessionsInFlight.current = false;
+      setStoppingSessions(false);
+    }
   };
 
   return (
@@ -365,8 +408,8 @@ function SpaceChip({
         const point = clampMenuToViewport({
           x: e.clientX,
           y: e.clientY,
-          width: CONTEXT_MENU_METRICS.minWidth,
-          height: contextMenuEstimatedHeight({ rows: 3 }),
+          width: 248,
+          height: contextMenuEstimatedHeight({ rows: 5, dividers: 2 }),
           viewportWidth: window.innerWidth,
           viewportHeight: window.innerHeight,
         });
@@ -419,7 +462,9 @@ function SpaceChip({
       <WorkflowActivityBadges
         activeCount={activity.activeCount}
         busyCount={activity.busyCount}
+        inheritedBusyCount={activity.inheritedBusyCount}
         awaitingCount={activity.awaitingCount}
+        nonblockingQuestionCount={activity.nonblockingQuestionCount}
         completionNotificationCount={activity.completionNotificationCount}
         active={active}
       />
@@ -432,6 +477,7 @@ function SpaceChip({
           onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); }}
           style={{
             ...CONTEXT_MENU_PANEL_STYLE,
+            minWidth: 248,
             position: 'fixed',
             left: contextMenu.x,
             top: contextMenu.y,
@@ -463,12 +509,34 @@ function SpaceChip({
             className="hover:bg-white/10"
             onClick={() => {
               setContextMenu(null);
-              window.dispatchEvent(new CustomEvent('settings:open', { detail: { tab: 'projects' } }));
+              window.dispatchEvent(new CustomEvent('workflow-settings:open', { detail: { workflowId:id } }));
             }}
             style={{ ...CONTEXT_MENU_ROW_STYLE, ...workflowMenuItemStyle }}
           >
             Настройки workflow…
           </button>
+          <button type="button" data-context-menu-row="ordinary" data-workflow-context-action="copy-path"
+            disabled={!defaultCwd} title={defaultCwd || 'Выберите директорию в настройках workflow'}
+            className={defaultCwd?'hover:bg-white/10':''} style={{...CONTEXT_MENU_ROW_STYLE,...workflowMenuItemStyle,
+              display:'flex',alignItems:'center',gap:6,opacity:defaultCwd?1:.45,cursor:defaultCwd?'pointer':'default'}}
+            onClick={()=>{if(!defaultCwd)return;window.require('electron').clipboard.writeText(defaultCwd);setContextMenu(null);useUIStore.getState().showToast('Path copied','success');}}>
+            <Copy size={14}/><span style={{minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>Path: {defaultCwd.replace(/\/+$/,'').split('/').pop() || (defaultCwd?'/' :'—')}</span>
+          </button>
+          <div data-workflow-stop-controls data-context-menu-row="ordinary"
+            style={{ display: 'flex', borderTop: '1px solid #3a3a3a', borderBottom: '1px solid #3a3a3a' }}>
+            {([{ mode: 'idle', label: 'Стоп свободные', color: '#4ade80', title: 'Завершить свободные сессии workflow, без активной работы и ожидания MCP' },
+              { mode: 'all', label: 'Стоп все', color: '#f59e0b', title: 'Завершить все процессы workflow, включая работающие сессии' }] as const).map(action => (
+              <button key={action.mode} type="button" data-workflow-context-action={`stop-${action.mode}`}
+                title={action.title} aria-label={action.title} disabled={stoppingSessions}
+                className="hover:bg-white/10" onClick={() => { void stopSessions(action.mode); }}
+                style={{ ...CONTEXT_MENU_ROW_STYLE, ...workflowMenuItemStyle, width: 'auto', flex: action.mode === 'idle' ? '1.4' : '1',
+                  display: 'inline-flex', alignItems: 'center', gap: 5, color: action.color,
+                  borderRight: action.mode === 'idle' ? '1px solid #3a3a3a' : undefined,
+                  opacity: stoppingSessions ? .5 : 1, cursor: stoppingSessions ? 'default' : 'pointer' }}>
+                <Square size={12} style={{ flexShrink: 0 }}/>{action.label}
+              </button>
+            ))}
+          </div>
           <button
             type="button"
             data-context-menu-row="ordinary"
@@ -679,6 +747,9 @@ export default function SpaceStrip({
           overflowX: 'auto',
           overflowY: 'hidden',
           scrollbarWidth: 'none',
+          height: '100%',
+          boxSizing: 'border-box',
+          paddingTop: 2,
         }}
       >
         {displayedSpaceIds.map((spaceId, index) => (

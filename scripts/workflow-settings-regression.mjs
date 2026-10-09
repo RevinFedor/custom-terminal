@@ -32,7 +32,7 @@ try {
     platform: 'browser', format: 'iife', target: 'chrome120', jsx: 'automatic', logLevel: 'silent',
     define: { 'process.env.NODE_ENV': '"production"' },
     plugins: [{ name: 'private-stores', setup(builder) {
-      builder.onResolve({ filter: /\/store\/useWorkspaceStore$/ }, () => ({ path: stores }));
+      builder.onResolve({ filter: /\/store\/use(?:Workspace|UI)Store$/ }, () => ({ path: stores }));
     } }],
   });
   await fs.writeFile(path.join(artifact, 'bundle-inputs.json'), JSON.stringify(bundle.metafile, null, 2));
@@ -51,6 +51,7 @@ try {
   function installAdapters() {
     const f = window.settingsFixture = { calls: [], workflowCalls: [], violations: [], receipts: {}, revision: 5,
       icon: 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="#7355aa"/><circle cx="32" cy="32" r="19" fill="#ddd"/></svg>'),
+      tabBindings:{'source-a':['r1'],'source-b':[]},
       roots: [{ id: 'r1', name: 'Source', path: '/synthetic/source', enabled: true, kind: 'prompt', revision: 3, future: { retained: true }, icon: null },
         { id: 'missing', name: 'Missing root', path: '/synthetic/missing', enabled: false, kind: 'cwd', revision: 2, missing: true }],
     };
@@ -60,6 +61,11 @@ try {
         if (f.failRead) throw new Error('Root read failed');
         if (f.malformed) return { version: 1, roots: [] };
         return structuredClone({ version: 1, revision: f.revision, roots: f.roots, bindings: { immutable: ['tab-owner'] }, future: true });
+      }
+      if(channel==='workflow:tab-roots')return structuredClone({version:1,revision:f.revision,roots:f.roots,rootIds:f.tabBindings[payload] || [],sources:[]});
+      if(channel==='project-prompts:set-tab-sources'){
+        if(payload.expectedRevision!==f.revision)return {success:false,error:'root_revision_changed'};
+        f.tabBindings[payload.tabId]=[...payload.rootIds];return {success:true};
       }
       if (channel === 'app:select-directory') return f.cancelChooser ? null : '/synthetic/chosen';
       if (channel === 'workflow:save-root' || channel === 'workflow:remove-root') {
@@ -105,6 +111,29 @@ win.webContents.on('paint',()=>{});win.loadFile(${JSON.stringify(path.join(artif
   const workflow = name => page.getByRole('region', { name: 'Workflow ' + name, exact: true });
   await roots.getByText('Missing root', { exact: true }).waitFor();
   assert.equal(await page.getByText('Директория недоступна', { exact: true }).count(), 1);
+  await page.locator('[data-fixture-workflow-settings]').click({button:'right'});
+  const scoped=page.locator('[data-workflow-settings-modal="b"]');await scoped.waitFor();
+  assert.equal(await scoped.locator('section[aria-label^="Workflow "]').count(),1);
+  assert.equal(await scoped.locator('[data-directory-roots]').count(),0);
+  assert.equal(await scoped.getByRole('button',{name:'Создать workflow в фоне'}).count(),0);
+  const scopedName=scoped.locator('section[aria-label^="Workflow "] input');
+  await scopedName.fill('Scoped workflow');await scopedName.press('Enter');
+  assert.equal(await page.evaluate(()=>window.settingsFixture.getSpaces().find(x=>x.id==='b').name),'Scoped workflow');
+  assert.equal(await page.evaluate(()=>window.settingsFixture.getSpaces().find(x=>x.id==='a').name),'Development');
+  await page.screenshot({path:path.join(artifact,'workflow-scoped-modal.png')});
+  await scoped.getByRole('textbox',{name:'Workflow default directory'}).fill('/synthetic/workflow-b');
+  await scoped.getByRole('button',{name:'Save workflow directory'}).click();
+  assert.equal(await page.evaluate(()=>window.settingsFixture.getSpaces().find(x=>x.id==='b').defaultCwd),'/synthetic/workflow-b');
+  assert.equal(await page.evaluate(()=>window.settingsFixture.getSpaces().find(x=>x.id==='a').defaultCwd),undefined);
+  await scoped.getByRole('button',{name:'Sources',exact:true}).click();
+  await scoped.locator('[data-prompt-source-root-id="r1"]').check();
+  await scoped.getByRole('button',{name:'Save',exact:true}).click();
+  assert.deepEqual(await page.evaluate(()=>window.settingsFixture.tabBindings),{'source-a':['r1'],'source-b':['r1']});
+  await page.screenshot({path:path.join(artifact,'workflow-directory-sources.png')});
+  check('Workflow default directory is metadata; Sources binds the explicitly selected tab, not all workflow members');
+  await scopedName.fill('Inbox');await scopedName.press('Enter');
+  await scoped.getByRole('button',{name:'Close workflow settings'}).click();
+  check('Exact workflow modal edits the context target instead of active workflow; no other workflows/directories');
   assert.equal(await page.locator('select').count(), 0);
   assert.equal(await page.getByText('Проекты', { exact: true }).count(), 0);
   assert.equal(await workflow('Renamed system inbox').getByRole('button', { name: 'Системный Inbox нельзя удалить' }).isDisabled(), true);

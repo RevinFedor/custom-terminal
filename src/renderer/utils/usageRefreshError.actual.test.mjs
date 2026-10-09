@@ -51,6 +51,34 @@ function evaluate(body, scope, name = 'subject') {
   return scope[name];
 }
 
+test('the Codex IPC deadline leaves room for the15s physical read and branch verification', async () => {
+  let initializer;
+  const walk = node => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(ast) === 'CODEX_USAGE_IPC_DEADLINE_MS') initializer = node.initializer.getText(ast);
+    ts.forEachChild(node, walk);
+  };
+  walk(ast);
+  assert.ok(initializer);
+  let deadline;
+  let respond;
+  let cleared = false;
+  const scope = { USAGE_DETAILS_IPC_DEADLINE_MS: 12_000,
+    CODEX_USAGE_IPC_DEADLINE_MS: Number(initializer.replaceAll('_', '')),
+    setTimeout: (fn, ms) => { deadline = { fn, ms }; return deadline; },
+    clearTimeout: () => { cleared = true; },
+    ipcRenderer: { invoke: () => new Promise(resolve => { respond = resolve; }) },
+  };
+  scope.invokeIpcWithDeadline = evaluate(functionBody('invokeIpcWithDeadline'), scope);
+  const invoke = evaluate(functionBody('invokeCodexUsage'), scope);
+  const pending = invoke({ accountKey: 'a' });
+  assert.equal(deadline.ms, 25_000);
+  assert.ok(deadline.ms > 15_000 + 3_000, 'renderer does not report a failure before the request/verification finishes');
+  const response = { success: true };
+  respond(response);
+  assert.equal(await pending, response);
+  assert.equal(cleared, true);
+});
+
 test('error feedback belongs to the account that was requested', () => {
   const target = evaluate(functionBody('usageRefreshFlashTarget'), {});
   assert.equal(target('a', 'a', 'a'), 'both');
@@ -101,6 +129,8 @@ test('real Codex refresh callback flags a per-account error even with an IPC suc
     selectedAccountKey: 'account-a', currentAccountKey: 'account-a',
     error: account.lastError, source: 'openai-usage-api', stale: true };
   const flashes = [];
+  const shown = {};
+  const logs = [];
   const scope = {
     selectedAccountKey: 'account-a', currentAccountKey: 'account-a',
     activeCodexSessionId: null, activeCodexCwd: null,
@@ -112,22 +142,35 @@ test('real Codex refresh callback flags a per-account error even with an IPC suc
     flashRefreshFailure: (key, targetName) => flashes.push({ key, targetName }),
     invokeCodexUsage: async () => response,
     Date,
-    console: { log: () => {}, warn: () => {} },
+    console: { log: (line) => logs.push(line), warn: () => {} },
     storeCodexUsageAccountKey: () => {},
   };
   for (const key of ['setLoading', 'setCompactLoading', 'setAccounts', 'setProfiles',
     'setCurrentAccountKey', 'setSelectedAccountKey', 'setData', 'setError',
-    'setWarning', 'setSource', 'setStale', 'setLastSuccessAt']) scope[key] = () => {};
+    'setWarning', 'setSource', 'setStale', 'setLastSuccessAt']) scope[key] = (value) => { shown[key] = value; };
   const refresh = evaluate(usageRefreshBody('CodexUsageChip'), scope);
   await refresh(false, { reason: 'interval' });
   assert.equal(flashes.length, 1);
   assert.equal(flashes[0].targetName, 'both');
   assert.match(flashes[0].key, /account-a:123/);
+  assert.equal(shown.setError, account.lastError);
+  assert.equal(shown.setData, account.usage, 'the verified quota survives a failed refresh');
+  assert.equal(shown.setStale, true);
+  assert.equal(shown.setLoading, false, 'failure ends the active request');
+  assert.match(logs.at(-1), /refresh failed/, 'an IPC success with a provider error is not logged as a successful refresh');
+
+  const healthy = { accountKey: 'account-b', label: 'account B', usage: account.usage, lastError: null };
+  response = { ...response, accounts: [account, healthy], selectedAccountKey: 'account-b', error: null };
+  await refresh(false, { accountKey: 'account-b', preserveSelection: true, snapshotOnly: true });
+  assert.equal(shown.setError, account.lastError, 'a healthy background update of B cannot clear the selected account A failure');
 
   flashes.length = 0;
-  response = { ...response, accounts: [{ ...account, lastError: null }], error: null, stale: false };
+  response = { ...response, accounts: [{ ...account, lastError: null }], selectedAccountKey: 'account-a', error: null, stale: false };
   await refresh(false, { reason: 'interval' });
   assert.equal(flashes.length, 0, 'a successful read with unchanged percentages is not an error');
+  assert.equal(shown.setError, null, 'a successful snapshot clears the persistent error');
+  assert.equal(shown.setData, account.usage);
+  assert.match(logs.at(-1), /refresh ok/);
 
   response = { success: false, error: 'usage unavailable' };
   await refresh(false, { reason: 'interval' });
@@ -166,16 +209,26 @@ test('real Claude refresh callback also flags a failed account read that retaine
   assert.match(flashes[0].key, /claude-a:456/);
 });
 
-test('the actual refresh icon turns red while the failure pulse is active', () => {
+test('the actual refresh button retains failure feedback during retry and clears on success', () => {
   const row = evaluate(functionBody('UsageSourceRefreshRow'), {
     require,
     RefreshCw,
   });
-  const props = { sourceText: 'OpenAI · just now', loading: false, refreshDisabled: false,
-    refreshTitle: 'Refresh usage', onRefresh: () => {}, errorFlash: true };
+  const props = { sourceText: 'OpenAI · 1m ago · stale', loading: false, refreshDisabled: false,
+    refreshTitle: 'Refresh usage', onRefresh: () => {}, refreshError: 'OpenAI usage request timed out.' };
   const red = renderToStaticMarkup(row(props));
-  const normal = renderToStaticMarkup(row({ ...props, errorFlash: false }));
+  const retry = renderToStaticMarkup(row({ ...props, loading: true, refreshDisabled: true }));
+  const normal = renderToStaticMarkup(row({ ...props, refreshError: null }));
   assert.match(red, /color:#f87171/);
   assert.doesNotMatch(normal, /color:#f87171/);
   assert.match(red, /refresh/);
+  assert.match(red, /data-usage-refresh-state="error"/);
+  assert.match(red, /title="Refresh usage\. Последнее обновление не удалось: OpenAI usage request timed out\."/);
+  assert.doesNotMatch(red, />[^<]*OpenAI usage request timed out\./, 'the reason stays in title/aria, not a new text row');
+  assert.match(retry, /color:#f87171/);
+  assert.match(retry, /aria-busy="true"/);
+  assert.match(retry, /spin 1s linear infinite/);
+  assert.match(retry, /updating/);
+  assert.match(normal, /data-usage-refresh-state="idle"/);
+  assert.doesNotMatch(normal, /timed out/);
 });

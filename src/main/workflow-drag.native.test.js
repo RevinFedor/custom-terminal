@@ -19,8 +19,10 @@ const {prepareDrag,projectVerticalMove,projectForestToRootEnd}=bundled('../../..
 const {createWorkflowRelationReceipts}=bundled('../renderer/utils/workflowRelationReceipts.mjs');
 const {createProjectTabSaveQueue}=bundled('../renderer/utils/projectTabSaveQueue.mjs');
 const {createExecutionRevisionAcks}=bundled('../renderer/utils/executionRevisionAcks.mjs');
+const {linkedFileOutline,captureLinkedFileDrag,linkedFileDragRequest}=bundled('../renderer/utils/tabLinkedFileTree.mjs');
+const {collectTabLinkedFileTree}=bundled('../renderer/utils/tabLinkedFiles.mjs');
 
-function fixture(t) {
+function fixture(t,{files=false}={}) {
   const db=new Database(':memory:');db.pragma('foreign_keys=ON');
   t.after(()=>{db.close();assert.equal(db.open,false);});
   const manager=new DatabaseManager({existingConnection:db});manager.initTables();
@@ -29,6 +31,11 @@ function fixture(t) {
     VALUES('P',?,?,'/private-fixture','codex',? ,?,?,?)`);
   for(const [id,type,parent,visual] of [['A','terminal',null,null],['Q','terminal',null,null],['B','terminal',null,null],
     ['child','terminal',null,'A'],['physical','terminal','A',null],['file','file',null,'A']])insert.run(id,id,'sid-'+id,type,parent,visual);
+  db.prepare("UPDATE tabs SET file_path='/private-fixture/linked.md' WHERE tab_id='file'").run();
+  if(files)for(const [id,parent] of [['file2','A'],['file3','A'],['nested','file2'],['ai-file','child']]) {
+    insert.run(id,id,'sid-'+id,'file',null,parent);
+    db.prepare('UPDATE tabs SET file_path=? WHERE tab_id=?').run('/private-fixture/'+id+'.md',id);
+  }
   const api=createWorkflowOrganizationApi({database:manager,validateDirectory:()=>true});
   api.bootstrap({migrationId:'M',mutationId:'M:publish',workspace:{activeSpaceId:'w1',
     splitPanes:[{windowId:'w1-initial',projectId:'P',tabId:'',tabs:[]}],activeSpaceTab:null,
@@ -52,6 +59,49 @@ function fixture(t) {
   return {db,manager,api,state,outline,admission,plan,mutate,rows};
 }
 const rejects=(fn,pattern)=>assert.throws(fn,error=>pattern.test(error.code || error.message));
+
+test('file menu reorders and reparents via canonical SQLite, preserving owner, mixed roots and independent AI files',t=>{
+  const f=fixture(t,{files:true}),s=f.state();
+  const files=collectTabLinkedFileTree(s.openProjects,'A'),outline=linkedFileOutline(files);
+  assert.deepEqual(files.map(file=>file.id),['file','file2','nested','file3']);
+  const a=captureLinkedFileDrag(s,'A',{sessionId:'menu-last-first',sourceId:'reserve-tab:file3',outline});
+  const reordered=[outline[2],outline[0],outline[1]],before=f.rows();
+  const request=linkedFileDragRequest(a,reordered);assert.ok(request);
+  f.api.mutate('commitDrag',request);
+  assert.deepEqual(f.rows(),before);
+  assert.deepEqual(f.api.service.getWorkflow('w1').metadata.reserveRootOrder,[]);
+  assert.deepEqual(f.api.service.getWorkflow('w1').metadata.reserveOrder,['file3','file','file2','nested']);
+  const s2=f.state(),tree=linkedFileOutline(collectTabLinkedFileTree(s2.openProjects,'A',s2.spaces.find(s=>s.id==='w1').reserveOrder));
+  const b=captureLinkedFileDrag(s2,'A',{sessionId:'menu-indent',sourceId:'reserve-tab:file',outline:tree});
+  const nested=[{...tree[0],children:[tree[1]]},tree[2]];
+  f.api.mutate('commitDrag',linkedFileDragRequest(b,nested));
+  assert.equal(f.db.prepare("SELECT visual_parent_tab_id FROM tabs WHERE tab_id='file'").get().visual_parent_tab_id,'file3');
+  assert.equal(f.db.prepare("SELECT visual_parent_tab_id FROM tabs WHERE tab_id='ai-file'").get().visual_parent_tab_id,'child');
+  const s3=f.state(),c=captureLinkedFileDrag(s3,'A',{sessionId:'menu-outdent',sourceId:'reserve-tab:file',outline:nested});
+  f.api.mutate('commitDrag',linkedFileDragRequest(c,reordered));
+  assert.equal(f.db.prepare("SELECT visual_parent_tab_id FROM tabs WHERE tab_id='file'").get().visual_parent_tab_id,'A');
+});
+
+test('file menu frozen owner scope rejects a new sibling and root detach; no partial writes',t=>{
+  const f=fixture(t,{files:true}),s=f.state(),outline=linkedFileOutline(collectTabLinkedFileTree(s.openProjects,'A'));
+  const a=captureLinkedFileDrag(s,'A',{sessionId:'menu-scope',sourceId:'reserve-tab:file',outline});
+  const request=linkedFileDragRequest(a,outline);
+  const detach=structuredClone(request);detach.tabs.find(tab=>tab.tabId==='file').visualParentTabId=null;
+  rejects(()=>f.api.mutate('commitDrag',detach),/file_owner_locked/);
+  f.db.prepare("UPDATE tabs SET visual_parent_tab_id='A' WHERE tab_id='ai-file'").run();
+  const before=f.rows();rejects(()=>f.api.mutate('commitDrag',request),/file_tree_changed/);assert.deepEqual(f.rows(),before);
+});
+
+test('file-only popup preserves global group assignments it does not display',t=>{
+  const f=fixture(t,{files:true});
+  const group=f.api.groups.mutate('create',{version:1,mutationId:'file-group',expectedRevision:f.api.groups.meta().revision,metadata:{name:'Separate'}}).groupId;
+  f.api.groups.mutate('assign',{version:1,mutationId:'file-assign',expectedRevision:f.api.groups.meta().revision,groupId:group,tabIds:['file2'],expectedTabGroups:{file2:null}});
+  const s=f.state(),outline=linkedFileOutline(collectTabLinkedFileTree(s.openProjects,'A'));
+  const a=captureLinkedFileDrag(s,'A',{sessionId:'menu-groups',sourceId:'reserve-tab:file3',outline});
+  f.api.mutate('commitDrag',linkedFileDragRequest(a,[outline[2],outline[0],outline[1]]));
+  assert.equal(f.api.groups.read().tabGroups.file2,group);
+  assert.equal(f.api.groups.read().tabGroups.A,undefined);
+});
 
 test('frozen A+child+B uses one forest, original order, and a single replayable durable command',t=>{
   const f=fixture(t),s=f.state(),a=f.admission({selectedTabIds:['B','child','A']});
@@ -137,12 +187,28 @@ test('group assignments, relation and reserve order roll back together on a fail
   assert.equal(f.db.prepare("SELECT visual_parent_tab_id FROM tabs WHERE tab_id='B'").get().visual_parent_tab_id,'Q');
   assert.equal(f.api.groups.read().tabGroups.B,g);
 });
-test('canonical writer refuses physical/file reparenting and parent cycles',t=>{
+test('canonical writer refuses physical execution reparenting and parent cycles',t=>{
   const f=fixture(t),plan=f.plan();
-  const changed=structuredClone(plan);changed.tabs.find(tab=>tab.tabId==='file').visualParentTabId='B';
+  const changed=structuredClone(plan);changed.tabs.find(tab=>tab.tabId==='physical').visualParentTabId='B';
   rejects(()=>f.api.mutate('commitDrag',changed),/physical_parent_locked/);
   const cyclic=structuredClone(plan);cyclic.tabs.find(tab=>tab.tabId==='A').visualParentTabId='child';
   rejects(()=>f.api.mutate('commitDrag',cyclic),/parent_cycle/);
+});
+test('file visual outdent and reattach preserve identity, path and physical ownership',t=>{
+  const f=fixture(t),before=f.rows().find(row=>row.tab_id==='file');
+  for(const parentId of [null,'B']){
+    const s=f.state(),tree=f.outline(s),a=captureWorkflowDrag(s,{gestureId:'file-relation-'+parentId,
+      outline:tree,sourceId:'reserve-tab:file',selectedTabIds:['file']});
+    let file;
+    const extract=nodes=>nodes.filter(node=>{if(node.tabId==='file'){file=node;return false;}return true;})
+      .map(node=>({...node,children:extract(node.children || [])}));
+    const preview=extract(tree);file={...file,contextParent:null};
+    if(parentId)preview.find(node=>node.tabId===parentId).children.push(file);else preview.push(file);
+    const plan=workflowDragRequest(a,{workflowId:'w1',previewOutline:preview});assert.ok(plan);
+    const result=f.api.mutate('commitDrag',plan),after=f.rows().find(row=>row.tab_id==='file');
+    assert.equal(after.visual_parent_tab_id,parentId);assert.equal(result.relationReceipts[0].afterParent,parentId);
+    for(const key of ['id','file_path','cwd','parent_tab_id','codex_session_id'])assert.equal(after[key],before[key]);
+  }
 });
 test('an empty group keeps its painted position through the canonical workflow order',t=>{
   const f=fixture(t),group=f.api.groups.mutate('create',{version:1,mutationId:'empty',expectedRevision:f.api.groups.meta().revision,

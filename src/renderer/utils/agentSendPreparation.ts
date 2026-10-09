@@ -222,9 +222,27 @@ export async function prepareAgentRuntimeForSend({
     return null;
   });
   assertSendNotCancelled();
+  const prepareMainComposer = async () => {
+    if (!runtime.prepareMainComposerForSend || !presence
+      || !['active', 'busy', 'starting'].includes(presence.status)) return;
+    observePhysicalTarget();
+    const prepared = await runtime.prepareMainComposerForSend(tabId, {
+      expectedTarget, sendOperationKey, sendAttemptId,
+    });
+    assertSendNotCancelled();
+    if (prepared?.success !== true) throw Object.assign(
+      new Error(prepared?.error || 'Main composer could not be confirmed'), prepared,
+      { submitted: false, pasteWritten: false, enterWritten: false });
+    if (prepared.inputWritten) {
+      presence = await runtime.getPresence(tabId).catch(() => null);
+      assertSendNotCancelled();
+      if (presence && ['active', 'busy', 'starting'].includes(presence.status)) observePhysicalTarget();
+    }
+  };
   if (presence && ['active', 'busy', 'starting'].includes(presence.status)) {
     observePhysicalTarget();
   }
+  await prepareMainComposer();
   const resolved = (
     status: Extract<AgentPtyStatus, 'active' | 'busy'>,
     submitCapability: 'direct' | 'queue',
@@ -372,6 +390,7 @@ export async function prepareAgentRuntimeForSend({
       if (presence && ['active', 'busy', 'starting'].includes(presence.status)) {
         observePhysicalTarget();
       }
+      await prepareMainComposer();
       if (pass > 0) {
         console.log('[AgentScenario:send] presence after wait tool=' + runtime.toolType
           + ' tab=' + String(tabId).slice(-12)

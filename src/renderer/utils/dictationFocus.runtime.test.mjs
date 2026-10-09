@@ -31,6 +31,8 @@ function fixture(kind = 'body', activeTab = 'A', extraSettle) {
   }
   const nodes = { body: new Element('BODY'), xterm: new Element('TEXTAREA'), sdk: new Element('DIV'),
     search: new Element('INPUT'), A: new Element('DIV', 'A'), B: new Element('DIV', 'B') };
+  nodes.xterm.closest = selector => selector === '[data-terminal-layer-tab-id]'
+    ? { getAttribute: () => 'restored-ac19d5db-b394-4b23-826f-43df8e6dad2a' } : null;
   const doc = { activeElement: nodes[kind], querySelector: selector => hosts.get(selector.match(/="(.*?)"/)?.[1]) || null };
   const state = { view: 'workspace', activeProjectId: 'P', splitPanes: [],
     openProjects: new Map([['P', { currentView: 'terminal', activeTabId: activeTab, tabs: new Map([['A', { name: 'A' }], ['B', { name: 'B' }]]) }]]) };
@@ -45,6 +47,7 @@ function fixture(kind = 'body', activeTab = 'A', extraSettle) {
   const context = vm.createContext({ ...registry, Element, HTMLElement: Element, document: doc, window,
     CSS: { escape: value => value }, CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init.detail; } },
     clearTimeout: id => timers.delete(id), queueMicrotask, resolveFocusedTerminalSelection,
+    editableDictation: { offer: node => ['INPUT','TEXTAREA'].includes(node.tagName) ? { version: 2, surface: 'editable', tabId: 'field-test', targetId: 'field-test' } : null },
     useWorkspaceStore: { getState: () => state }, reply: (_ok, value) => { result = value; return value; },
     console: { log: (...args) => logs.push(args.join(' ')) },
   });
@@ -63,6 +66,16 @@ for (const kind of ['xterm', 'sdk', 'search']) test(`already focused ${kind} cho
   assert.equal(h.result?.reason, 'other-input-focused');
   assert.equal(h.timers.size, 0);
   assert.deepEqual(h.inserted, []);
+});
+
+test('focused xterm and native fields offer their own receipt protocol without routing rich editors through a textarea', async () => {
+  for (const kind of ['xterm','sdk','search']) {
+    const h = fixture(kind); await h.begin();
+    assert.equal(h.result?.accepted, false);
+    assert.equal(h.result?.clipboardReceipt?.version, kind === 'xterm' ? 1 : kind === 'search' ? 2 : undefined);
+    assert.equal(h.result?.clipboardReceipt?.tabId, kind === 'xterm'
+      ? 'restored-ac19d5db-b394-4b23-826f-43df8e6dad2a' : kind === 'search' ? 'field-test' : undefined);
+  }
 });
 
 test('no selected input still waits and inserts on a later History focus', async () => {

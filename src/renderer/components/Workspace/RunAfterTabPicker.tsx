@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode, RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { ChevronDown, Folder, Hourglass, LoaderCircle, Pencil, Play, X } from 'lucide-react';
@@ -9,6 +9,7 @@ import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { resolveRunAfterTabStatus } from '../../utils/runAfterTabStatus.mjs';
 import { aiKindForTab, runAfterWorkflowByProject } from '../../utils/runAfterTabScope.mjs';
+import { canonicalRunAfterPickerInventory } from '../../utils/runAfterPickerInventory.mjs';
 import { getRestartAfterTriggerIds } from '../../utils/restartAfterCommand.mjs';
 import { resolveAgentBusyPresentation } from '../../utils/agentBusyPresentation.mjs';
 import {
@@ -21,6 +22,7 @@ import TabCard from './TabCard';
 import WorkflowChipPresentation from './WorkflowChip';
 import { CONTEXT_MENU_ICON_SLOT_STYLE, CONTEXT_MENU_ROW_STYLE } from '../UI/contextMenuMetrics.mjs';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
+import { markQueueChildDismiss, notifyQueueClickChildClosed } from '../../utils/hoverReturnGate.mjs';
 import {
   TabProcessBar,
   TabStatusMarker,
@@ -333,7 +335,7 @@ export function RunAfterTabPicker({
 
   const fingerprint = useWorkspaceStore((state) => {
     let ownerProjectId: string | null = null;
-    const parts: string[] = ['owner:'];
+    const parts: string[] = ['owner:',`organization:${state.organizationReady}:${state.globalGroups?.revision ?? ''}:${state.runAfterWorkflowScopeVersions?.[tabId] ?? ''}`];
     for (const [pid, ws] of state.openProjects) {
       if (ws.tabs.has(tabId) || pid === ownerProjectIdProp) ownerProjectId = pid;
       const projectBits: string[] = [pid, ws.projectPath || ''];
@@ -367,6 +369,9 @@ export function RunAfterTabPicker({
           t.claudeSessionId || '',
           t.codexSessionId || '',
           t.geminiSessionId || '',
+          state.tabWorkflowMembership?.[t.id]?.workflowId || '',
+          state.tabWorkflowMembership?.[t.id]?.revision ?? '',
+          state.tabCatalog?.[t.id]?.active===false ? 'inactive' : '',
         ].join(':'));
       }
       parts.push(projectBits.join('~'));
@@ -377,6 +382,8 @@ export function RunAfterTabPicker({
         space.id,
         space.name || '',
         space.icon || '',
+        JSON.stringify((space as any).reserveOrder || []),
+        JSON.stringify((space as any).reserveRootOrder || []),
         ...(Array.isArray(space.projectIds) ? space.projectIds : []),
       ].join(':'));
     }
@@ -398,6 +405,8 @@ export function RunAfterTabPicker({
     if (!fingerprint) return { groups: [], ownerWorkflowId: null, selectedTargetWorkflowId: null };
     const state = useWorkspaceStore.getState();
     const projects = useProjectsStore.getState().projects;
+    if(state.organizationReady)return canonicalRunAfterPickerInventory(state,{
+      ownerTabId:tabId,selectedTabIds:selectedInputIds,selectedWorkflowIds:runAfterWorkflowIds,projects});
     const allTabsById = new Map<string, AiTab>();
     const allTabsByProject = new Map<string, AiTab[]>();
     const tabGroupsByProject = new Map<string, TabGroup[]>();
@@ -539,6 +548,16 @@ export function RunAfterTabPicker({
   }, []);
 
   const [open, setOpen] = useState(false);
+  const wasClickOpenRef = useRef(false);
+  const dismissRef = useRef<{ reason: string; point: { clientX: number; clientY: number } | null } | null>(null);
+  useLayoutEffect(() => {
+    const held = open && !openOnHover && !!hoverOwner;
+    if (wasClickOpenRef.current && !held) {
+      notifyQueueClickChildClosed(hoverOwner, dismissRef.current?.reason || 'selection', dismissRef.current?.point || null);
+    }
+    wasClickOpenRef.current = held;
+    if (held) dismissRef.current = null;
+  }, [open, openOnHover, hoverOwner]);
   // The persisted storage key keeps its legacy "Project" name for migration;
   // its value is a workflow id from this version onward.
   const persistedPickerWorkflowId = useUIStore((state) => state.runAfterPickerProjectId);
@@ -580,7 +599,9 @@ export function RunAfterTabPicker({
     // that is still open stays selected — that is the whole contract.
     const exists = selectedWorkflowId && inventory.groups.some((g) => g.workflowId === selectedWorkflowId);
     if (exists) return;
-    setSelectedWorkflowId(inventory.selectedTargetWorkflowId ?? inventory.ownerWorkflowId ?? inventory.groups[0]?.workflowId ?? null);
+    const preferred=[inventory.selectedTargetWorkflowId,inventory.ownerWorkflowId]
+      .find(id=>id && inventory.groups.some(group=>group.workflowId===id));
+    setSelectedWorkflowId(preferred ?? inventory.groups[0]?.workflowId ?? null);
   }, [inventory.groups, inventory.ownerWorkflowId, inventory.selectedTargetWorkflowId, selectedWorkflowId, setSelectedWorkflowId]);
 
   useEffect(() => {
@@ -589,10 +610,15 @@ export function RunAfterTabPicker({
       const t = e.target as Node;
       if (triggerRef.current?.contains(t)) return;
       if (menuRef.current?.contains(t)) return;
+      dismissRef.current = { reason: 'outside', point: { clientX: e.clientX, clientY: e.clientY } };
+      markQueueChildDismiss(e, hoverOwner);
       setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
+      if (e.key === 'Escape') {
+        dismissRef.current = { reason: 'escape', point: null };
+        setOpen(false);
+      }
     };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
@@ -643,11 +669,13 @@ export function RunAfterTabPicker({
       top,
       maxHeight: Math.max(180, window.innerHeight - top - 8),
     };
-    if (side === 'right') {
-      nextAnchor.left = Math.max(8, Math.min(window.innerWidth - menuWidth - 8, horizontalRect.right + 6));
-    } else {
-      nextAnchor.right = window.innerWidth - horizontalRect.left + 6;
-    }
+    const leftSide = horizontalRect.left - menuWidth - 6;
+    const rightSide = horizontalRect.right + 6;
+    const maxLeft = Math.max(8, window.innerWidth - menuWidth - 8);
+    let left = side === 'right' ? rightSide : leftSide;
+    if (side === 'left' && leftSide < 8) left = rightSide;
+    if (side === 'right' && rightSide > maxLeft && leftSide >= 8) left = leftSide;
+    nextAnchor.left = Math.max(8, Math.min(maxLeft, left));
     setAnchor({
       ...nextAnchor,
     });
@@ -1094,6 +1122,7 @@ export function RunAfterTabPicker({
             {modalOverlay && (
               <div
                 data-run-after-picker-overlay
+                data-run-after-dismiss-owner={hoverOwner}
                 onMouseDown={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
@@ -1101,6 +1130,7 @@ export function RunAfterTabPicker({
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                  dismissRef.current = { reason: 'outside', point: { clientX: e.clientX, clientY: e.clientY } };
                   setOpen(false);
                 }}
                 style={{
@@ -1116,11 +1146,13 @@ export function RunAfterTabPicker({
               data-run-after-picker-menu
               data-tab-context-menu-host={panelRef?.current?.getAttribute('data-tab-context-menu-host') || undefined}
               data-run-after-hover-owner={hoverOwner}
+              data-run-after-click-open={!openOnHover && hoverOwner ? 'true' : undefined}
               style={{
                 position: 'fixed',
                 top: anchor.top,
                 ...(anchor.left !== undefined ? { left: anchor.left } : { right: anchor.right }),
                 width: menuWidth,
+                maxWidth: 'calc(100vw - 16px)',
                 maxHeight: anchor.maxHeight,
                 background: TABBAR_PANEL_BG,
                 border: `1px solid ${BORDER}`,
@@ -1270,7 +1302,15 @@ export function RunAfterTabPicker({
                     sessionStatuses={sessionStatuses}
                     tabGeo={tabGeo}
                     fontSize={tabsFontSize}
-                    onToggle={() => toggleTabGroupCollapsed(row.projectId, row.group.id)}
+                    onToggle={() => {
+                      const state=useWorkspaceStore.getState();
+                      if(!state.organizationReady){toggleTabGroupCollapsed(row.projectId,row.group.id);return;}
+                      const publication=state.globalGroups,group=publication?.groups.find((g:any)=>g.id===row.group.id);
+                      if(!group)return;
+                      void state.mutateWorkflowGroup('collapse',{version:1,mutationId:crypto.randomUUID(),
+                        expectedRevision:publication.revision,groupId:group.id,expectedGroupRevision:group.revision,
+                        collapsed:!group.collapsed}).catch(error=>useUIStore.getState().showToast(String(error?.message || error),'error'));
+                    }}
                     onSelect={(targetId, isSelected) => {
                       setRunAfterTab(tabId, multiSelect ? targetId : (isSelected ? null : targetId));
                       if (closeOnSelect) setOpen(false);

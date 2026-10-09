@@ -10,8 +10,20 @@ const WORKFLOW_HTTP_CAPABILITY = Object.freeze({ version: 1, executionSubjectVer
   mutationRead: '/api/workflow-organization/mutations/:mutationId',
   createAgentTab: '/api/workflows/:workflowId/agent-tabs',
   createTerminalTab: '/api/workflows/:workflowId/terminal-tabs',
+  catalogProjection: Object.freeze({version:1,endpoint:'/api/workflow-organization?projection=catalog-v1',
+    inventory:'active-membership',treeVersion:1,executionRefs:true,sourceBindings:'tab',
+    runtime:false,cardSignals:false,history:false,descriptorClock:'content-hash'}),
+  groupActions:Object.freeze({version:1,read:'/api/workflow-organization/groups',
+    mutate:'/api/workflow-organization/groups/mutations',receipt:'/api/workflow-organization/groups/mutations/:mutationId',
+    actions:['create','assign','rename','color','status','collapse','delete'],collapse:'explicit-boolean',delete:'ungroup-members'}),
+  nativeDrag:Object.freeze({version:1,status:'/api/workflow-organization/drag',
+    capture:'/api/workflow-organization/drag/capture',preview:'/api/workflow-organization/drag/preview',
+    commit:'/api/workflow-organization/drag/commit',release:'/api/workflow-organization/drag/:captureId',
+    receipt:'/api/workflow-organization/mutations/:mutationId',inventory:'active-membership',
+    actions:['reorder','indent','outdent'],destinations:'workflow-tree',compiler:'desktop-shared',windowPlacement:'preserve-unless-workflow-transfer'}),
+  defaultCwd:true,
   independentCwd: true, legacyExecutionAliases: true, revision: true,
-  durableMutationId: ['organization', 'directory-registry'], tabCreation: 'renderer-scenario' });
+  durableMutationId: ['organization', 'directory-registry','global-groups','workflow-drag'], tabCreation: 'renderer-scenario' });
 const fail = (code, statusCode = 409) => { throw Object.assign(new Error(code), { code, statusCode }); };
 const copy = value => JSON.parse(JSON.stringify(value));
 const text = value => typeof value === 'string' ? value.trim() : '';
@@ -42,7 +54,8 @@ async function freezeWorkflowCreationContext(projectManager, raw, workflowId) {
   }
   const targetWorkflowId = workflowId || text(request.workflowId) || source?.membership?.workflowId || INBOX_WORKFLOW_ID;
   if (request.workflowId && request.workflowId !== targetWorkflowId) fail('workflow_route_identity_conflict', 400);
-  if (!snapshot.workflows.some(workflow => workflow.id === targetWorkflowId)) fail('workflow_not_found', 404);
+  const targetWorkflow=snapshot.workflows.find(workflow => workflow.id === targetWorkflowId);
+  if (!targetWorkflow) fail('workflow_not_found', 404);
   const sourceNamespace = source?.executionSubject?.version === 2
     ? source.executionSubject.executionNamespace : source?.executionSubject?.projectId;
   const executionNamespace = text(request.executionNamespace || request.projectId) || sourceNamespace
@@ -55,6 +68,7 @@ async function freezeWorkflowCreationContext(projectManager, raw, workflowId) {
     fail('execution_namespace_unknown', 404);
   }
   const cwd = text(request.cwd) || source?.executionSubject?.cwd
+    || text(targetWorkflow.metadata?.defaultCwd)
     || projectManager.db.getProjectById(executionNamespace)?.path
     || (request.projectId || request.executionNamespace || request.fallbackProjectId
       ? projectManager.db.getProjectById(executionNamespace)?.recommendedCwd : null);
@@ -94,7 +108,23 @@ function createWorkflowOrganizationHttp({ getProjectManager, checkAuth, readBody
       const pathname = parsed.pathname;
       const method = req.method;
       let result;
-      if (pathname === '/api/workflow-organization' && method === 'GET') result = api.read();
+      if (pathname === '/api/workflow-organization/groups' && method === 'GET') result=api.groups.read();
+      else if (pathname === '/api/workflow-organization/groups/mutations' && method === 'POST') {
+        const body=await readBody(req);result=api.groups.mutate(body.kind,body.request);
+      } else if (/^\/api\/workflow-organization\/groups\/mutations\/[^/]+$/.test(pathname) && method === 'GET') {
+        result=api.groups.getMutation(decodeURIComponent(pathname.split('/').pop()));
+        if(!result)fail('workflow_group_mutation_not_found',404);
+      } else if (pathname === '/api/workflow-organization/drag' && method === 'GET') result=api.nativeDrag.status();
+      else if (/^\/api\/workflow-organization\/drag\/(capture|preview|commit)$/.test(pathname) && method === 'POST')
+        result=await api.nativeDrag[pathname.split('/').pop()](await readBody(req));
+      else if (/^\/api\/workflow-organization\/drag\/[^/]+$/.test(pathname) && method === 'DELETE')
+        result=api.nativeDrag.release(decodeURIComponent(pathname.split('/').pop()));
+      else if (pathname === '/api/workflow-organization' && method === 'GET') {
+        const projection = parsed.query?.projection;
+        if (projection === undefined) result = api.read();
+        else if (projection === 'catalog-v1') result = await api.readCatalog();
+        else fail('workflow_projection_unsupported',400);
+      }
       else if (pathname === '/api/workflows' && method === 'GET') {
         const { publication, workflows } = api.read(); result = { publication, workflows };
       } else if (pathname === '/api/tab-catalog' && method === 'GET') {

@@ -636,6 +636,7 @@ function createTerminalHistoryPreviewController({
     if (type === 'turn_started') {
       authority.turnId = event.turnId || null;
       authority.threadId = event.threadId || null;
+      authority.requestId = event.requestId ? String(event.requestId) : null;
       authority.gap = gap === true;
       return true;
     }
@@ -665,7 +666,11 @@ function createTerminalHistoryPreviewController({
         state.semanticItems.delete(itemId);
         return false;
       });
-      if (type === 'request_failed') {
+      // An exact late end may retract an older request's own open item, but
+      // it cannot certify that a newer response stream has no missing bytes.
+      // Legacy producers without request-start IDs keep their existing rule.
+      const currentRequest = !authority.requestId || authority.requestId === requestId;
+      if (type === 'request_failed' && currentRequest) {
         state.semanticGap = false;
         authority.gap = false;
       }
@@ -678,6 +683,7 @@ function createTerminalHistoryPreviewController({
         request: short(requestId, 20),
         removed: before - state.semanticItemOrder.length,
         retained,
+        gapHeld: state.semanticGap === true,
         reason: String(event.reason || 'provider-request-failed'),
       });
       return changed || metadataChanged || before !== state.semanticItemOrder.length;

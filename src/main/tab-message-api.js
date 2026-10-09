@@ -50,8 +50,9 @@ async function resolveMessageActor(body, resolveTab) {
 // is carried independently of the requested destination and cannot be overridden.
 async function handleTabMessageApi(req, res, parsed, { service, resolveTab, locateSource, readBody, sendJson }) {
   const root = parsed.pathname === '/api/tab-messages';
-  const selected = parsed.pathname.match(/^\/api\/tab-messages\/([^/]+)(\/replies|\/dismiss|\/source)?$/);
+  const selected = parsed.pathname.match(/^\/api\/tab-messages\/([^/]+)(\/replies|\/dismiss|\/cancel|\/source)?$/);
   const dismiss = selected?.[2] === '/dismiss';
+  const cancel = selected?.[2] === '/cancel';
   if (!root && !selected) return false;
   try {
     if (root && req.method === 'GET') {
@@ -68,13 +69,14 @@ async function handleTabMessageApi(req, res, parsed, { service, resolveTab, loca
       const result = await service.getMessage(decodeURIComponent(selected[1]));
       if (!result) throw apiError('message_not_found', 404);
       sendJson(res, 200, { ok: true, ...result });
-    } else if (dismiss && req.method === 'POST') {
+    } else if ((dismiss || cancel) && req.method === 'POST') {
       const body = await readBody(req);
       const tabId = typeof body?.tabId === 'string' ? body.tabId.trim() : '';
       if (!tabId) throw apiError('message_tab_required');
       messageActorId({ sourceTabId: tabId, sourceMeta: body.sourceMeta });
-      const result = await service.dismissMessage({ tabId, messageId: decodeURIComponent(selected[1]) });
+      const result = await service[cancel ? 'cancelMessage' : 'dismissMessage']({ tabId, messageId: decodeURIComponent(selected[1]) });
       sendJson(res, 200, { ok: true, messageId: result.message.messageId,
+        ...(cancel ? { cancelled: result.cancelled === true, requestedMessageId: decodeURIComponent(selected[1]) } : {}),
         deduplicated: result.deduplicated === true, message: compactTabMessage(result.message) });
     } else if (req.method === 'POST' && (root || selected?.[2] === '/replies')) {
       const body = await readBody(req);
@@ -106,7 +108,7 @@ async function handleTabMessageApi(req, res, parsed, { service, resolveTab, loca
       + ' path=' + String(parsed.pathname).slice(0, 180)
       + ' code=' + (error.code || 'tab_message_failed') + ' status=' + (Number(error.statusCode) || 500));
     sendJson(res, Number(error.statusCode) || 500, { ok: false,
-      ...(!dismiss && selected?.[2] !== '/source' && Number(error.statusCode) >= 400 && Number(error.statusCode) < 500
+      ...(!dismiss && !cancel && selected?.[2] !== '/source' && Number(error.statusCode) >= 400 && Number(error.statusCode) < 500
         ? { accepted: false, submitted: false, deliveryState: 'not-submitted' } : {}),
       ...(error.messageId ? { messageId: error.messageId } : {}),
       code: error.code || 'tab_message_failed', error: error.message || String(error) });

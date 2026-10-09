@@ -191,6 +191,9 @@ async function fixture(t) {
   vm.runInNewContext(previewNode.getText(mainAst),{ipcMain:{handle:(_name,handler)=>previewHandler=handler},promptQueueAssetStore:assetStore,
     nativeImage:{createFromPath:file=>({isEmpty:()=>false,getSize:()=>({width:1,height:1}),toDataURL:()=> 'data:image/png;base64,'+fs.readFileSync(file).toString('base64')})},
     require:()=>({readMobileAttachmentPreview:()=>{throw Error('unowned image cannot fall back to an arbitrary path')}}),path,srcMainDir:__dirname,console:quiet});
+  // Keep the production lexical import. The old extracted fixture omitted it
+  // and failed before reaching its cases; no invented namespace resolver.
+  vm.runInContext("const { executionNamespaceForRow } = require('./workflow-organization-http');", webContext);
   for (const name of ['runAfterMainScope', 'prepareRunAfterAuthoring', 'getRunAfterApi', 'runAfterReply', 'runAfterFailure']) vm.runInContext(declaration(webTree, name), webContext);
   api = webContext.getRunAfterApi();
   const start = web.indexOf('  // Prompt-queue ("Run after")'), end = web.indexOf('  // Explicit task completion', start);
@@ -231,7 +234,8 @@ test('the whole CommonJS web service reads and commits through its lazy project 
   const electron = {
     app: { isPackaged: false, getPath: () => path.dirname(f.db.db.name) },
     BrowserWindow: { getAllWindows: () => [{ isDestroyed: () => false, webContents: f.sender }] },
-    ipcMain: { on: (channel, callback) => callbacks.set(channel, callback), emit() {} },
+    ipcMain: { on: (channel, callback) => callbacks.set(channel, callback), emit() {},
+      removeListener: (channel, callback) => { if (callbacks.get(channel) === callback) callbacks.delete(channel); } },
   };
   const nativeRequire = createRequire(path.join(__dirname, 'web-server.js'));
   const cjs = { exports: {} };
@@ -277,6 +281,11 @@ test('the whole CommonJS web service reads and commits through its lazy project 
   };
   const initial = await request('/api/terminal-tabs/T/queue?runAfter=1');
   assert.equal(initial.status, 200, JSON.stringify(initial.value));
+  const handshake = await request('/api/me');
+  assert.equal(handshake.status, 200);
+  assert.equal(handshake.value.capabilities.runAfter.mainEpoch, api.journal.epoch);
+  assert.equal(initial.value.runAfter.mainEpoch, api.journal.epoch);
+  assert.notEqual(handshake.value.service.instanceId, api.journal.epoch);
   assert.equal(api.scope('T').projectId, f.project.id);
   const body = { op: 'add', args: { text: 'whole service persisted item' }, runAfter: { version: 1,
     operationId: 'whole-service-add', expected: initial.value.runAfter.guard } };
@@ -331,6 +340,17 @@ test('the whole CommonJS web service reads and commits through its lazy project 
   const removed = await request('/api/orchestrations/settings', { codexCapacityRetryDelaysMs: [] });
   assert.deepEqual(removed.value.settings.codexCapacityRetryDelaysMs, []);
   await capacityStore.flush();
+  const pending = api.journal.reserve('old-journal-ticket', 'T', { op: 'add', args: { text: 'pending' } }, api.scope('T')).ticket;
+  assert.equal(api.journal.authorize(pending).phase, 'pending');
+  whole.setQueue(null);
+  await cjs.exports.stop();
+  const nextHandshake = await request('/api/me');
+  assert.equal(nextHandshake.status, 200);
+  assert.equal(nextHandshake.value.service.instanceId, handshake.value.service.instanceId);
+  assert.notEqual(nextHandshake.value.capabilities.runAfter.mainEpoch, handshake.value.capabilities.runAfter.mainEpoch);
+  assert.equal(nextHandshake.value.capabilities.runAfter.mainEpoch, whole.api().journal.epoch);
+  assert.throws(() => whole.api().journal.authorize(pending), /run_after_operation_stale/);
+  assert.equal(whole.api().journal.read(pending.operationId).phase, 'unknown');
 });
 
 test('unenveloped legacy GET/POST still use the actual App owner, including preserved remote pause and Rewind ordinal',async t=>{

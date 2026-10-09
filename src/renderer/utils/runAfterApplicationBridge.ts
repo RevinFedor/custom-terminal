@@ -123,10 +123,12 @@ const remote = createRunAfterRemote({ queue: usePromptQueueStore, autoCompact: u
     if (response?.error && response?.committed !== true) throw failure(response.error, response.statusCode || 503);
     return response;
   },
-  cancelAutoCompact: (tabId: string) => {
-    const phase = useAutoCompactStore.getState().activities[tabId]?.phase;
+  cancelAutoCompact: (tabId: string, activityId: string) => {
+    const activity = useAutoCompactStore.getState().activities[tabId];
+    const phase = activity?.phase;
+    if (activity?.handoffId !== activityId) return false;
     if (phase === 'compacting' || phase === 'resuming') return false;
-    return cancelPendingAutoCompact(tabId);
+    return cancelPendingAutoCompact(tabId, activityId);
   },
   requestAutoCompact: requestAutoCompactNow,
 });

@@ -49,13 +49,56 @@ app capability — fact-terminal-mcp.md::Адресный Повтор Audit К�
 
 Большой ответ не дублируется в JSON orchestration-store. Store хранит точный UUID принятого target-prompt, размер и fingerprint, а результат извлекается из канонического Claude/Codex transcript. UUID является первичным proof: два одинаковых текста обязаны вернуть ответы своих разных ходов. Hash используется только для старых run без UUID, внутри сохранённых временных границ; несколько совпадений означают неоднозначность и не разрешают результат. Для новой содержательной доставки отдельная SQLite `orchestration_completion_content` фиксирует immutable notification snapshot до Send: retry не перечитывает изменившийся ответ. Это сохранённые bytes доставки, не второй lifecycle-run или замена transcript proof.
 
+## Наблюдение уже выполняющейся работы
+
+`runKind=response-observation` сохраняется в прежнем registry, но не владеет
+исполнением target: нет prompt, delivery intent, predecessor, восстановления
+закрытой вкладки, Stop или auto-stop. Наблюдение не усыновляет чужих исполнителей
+и не отменяет уже законный auto-stop другого run. Собственный source может ждать
+его как обычную причинную зависимость; при регистрации циклическое ожидание отклоняется.
+
+Обычный `wait_for_tab_response` ждёт подтверждённого idle, внутренних background
+задач и исходящих completion-blockers target. Новая работа до выбора результата
+продлевает ожидание. Child delivery-error остаётся требующим внимания, не успехом.
+С `waitForDescendants:false` busy admission фиксирует текущий точный ход;
+завершение successor не подменяет его. При отсутствии current-turn identity
+такой режим отклоняется до регистрации. Смена owner/SID или закрытие target
+дают ошибку чтения, не автоматическую перепривязку/Resume.
+
+Main читает результат через существующие parser/source-proof owners.
+Codex выбирает последнюю physical `task_started` execution, включая Goal-ход без
+новой обычной user-записи. Latest incomplete/abort/error не разрешает вернуть
+старый успешный ответ. Историческая execution не получает выдуманное поколение
+процесса; у COW read-view SID и physical SID остаются разными. Для живого Claude
+сохраняется admitted Stop/StopFailure по точным prompt_id/PID/generation; prompt_id
+не выдаётся за JSONL UUID. Saved idle-read использует точную запись прежнего parser.
+Готовность composer не доказывает idle; ошибка process lookup не равна absent.
+
+Один immutable выбранный результат/ошибка сохраняется в SQLite до публикации
+terminal-state. Restart восстанавливает JSON-проекцию и доставку без повторного
+выбора позднего ответа. Содержимое не попадает в общий SSE/runtime status.
+Cancellation/suppression подтверждаются только после долговечной записи; позднее
+чтение не оживляет отменённый run. Неизвестный/нечитаемый registry не разрешает
+удалять сохранённые ответы. Ограниченный result сохраняет `assistantChars/truncated`;
+лимит текста и обычная source-handoff защита прежние.
+
+Ожидание event-driven: busy/child wait не читает transcript на каждый append;
+после completion подписка на прежний transcript-owner закрывает окно flush.
+Перед выбором latest повторно проверяются owner, runtime revision и child gate.
+UI показывает статичный timer, unknown/child attention отдельно; отмена снимает
+только ожидание. Детали API и версий — fact-terminal-mcp::Статус доставки и
+получение результата. Это новый read-flow, не изменение прав обычной делегации.
+
 ## Browser-консультация как второй тип target
 
 `runKind=external-research` использует тот же durable store, причинное дерево,
 inherited activity, History tracker и source-handoff, но не создаёт фиктивную
 Claude/Codex-вкладку. Внешний target отображается как `SC Desktop / provider`,
 поэтому у run законно нет `targetTabId`; UI не предлагает открыть или
-Pause/Resume несуществующий terminal runtime.
+Pause/Resume несуществующий terminal runtime. Имя в live tracker и раскрытом
+History run является кнопкой: тот же `orchestration:open-research-job` открывает
+сохранённый SC Research detail по полному jobId, не браузер и не новый запрос.
+Успех ждёт rendered ACK; repeated click coalesces, ошибка видна в прежних деталях.
 
 Публичный вход — `POST /api/external-research/orchestrations`, typed wrappers —
 `start_external_research`, `continue_external_research` и
@@ -147,6 +190,16 @@ run. Следующий обычный user-turn или queued-запись по
 ## Авторитетный lifecycle
 
 Готовность определяется структурными событиями агента: `task_started`/`task_complete`/`turn_aborted` для Codex и эквивалентным busy/done-контуром Claude. Но событие применяется только к сохранённому контексту исполнения: provider, session, turn, поколению writer и, для Claude, PID процесса. Стабильность текста, совпавший `tabId`, возврат prompt-глифа и terminal output не являются completion-proof.
+
+Внутренний Codex background count — только execution lease, не mailbox count.
+`collaboration.send_message`/interacted не запускают idle child, а настоящие
+followup/resume продолжают удерживать gate до собственного terminal proof.
+09.10 задержка4196→3607 была вызвана ошибочным mail→running у child producer,
+не потерей508char финала и не заменой pinned turn следующим ручным запросом.
+При правильном count0 существующий task_complete/zero-edge закрывает run;
+unknown snapshot не превращается в0. Исправление находится у subagent owner,
+orchestration guards не ослаблены; recovery старого run отдельно сохранила
+cancelled/suppressed, не переписала его задним числом в completed.
 
 `queue:true` означает только разрешение поставить сообщение за уже идущей работой. Это не доказательство, что предыдущий turn существует. Ожидание чужого completion включается только по реальному baseline `busy` или по сохранённому predecessor-run на том же target. Иначе собственный `task_complete` ошибочно поглощается как окончание несуществующей предыдущей задачи, а run навсегда остаётся `queued`.
 

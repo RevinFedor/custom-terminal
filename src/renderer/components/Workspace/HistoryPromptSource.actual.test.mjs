@@ -46,6 +46,23 @@ test('addressed messages have a separate arrow button; only their name opens wit
   assert.doesNotMatch(native, /data-tab-message-source-jump/);
 });
 
+test('only actionable source arrows have their own fixed-size interaction surface', () => {
+  for (const phase of ['question', 'request', 'reply', 'completion', 'failure']) {
+    const html = renderToStaticMarkup(React.createElement(Header, {
+      source: { messageId: 'exact-message', sourceTabId: 'exact-tab', sourceTabName: 'Source' }, phase,
+    }));
+    const button = html.match(/<button[^>]+data-tab-message-source-jump="exact-message"[^>]*>/)?.[0];
+    assert.ok(button);
+    assert.match(button, /class="history-message-source-jump"/);
+    assert.match(button, /width:24px;height:24px/);
+    assert.doesNotMatch(button, /background:transparent|color:#a3a3a3/);
+  }
+  const passive = renderToStaticMarkup(React.createElement(Header, {
+    source: { sourceTabId: 'worker', sourceTabName: 'Worker' }, phase: 'completion',
+  }));
+  assert.doesNotMatch(passive, /history-message-source-jump/);
+});
+
 test('unknown relationship does not invent an arrow; browser source retains its label', () => {
   const html = renderToStaticMarkup(React.createElement(Header, { source: { label: 'ChatGPT - Astra' }, phase: 'unknown' }));
   assert.match(html, /ChatGPT - Astra/);

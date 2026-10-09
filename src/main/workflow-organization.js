@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { orderedWorkflows } = require('../shared/workflow-order.cjs');
 const {
   ORGANIZATION_VERSION, EXECUTION_SUBJECT_VERSION, INBOX_WORKFLOW_ID,
   clone, fail, id, stableJson, supported, supportedLayout, mergeLayout, layoutReferences, removeLayoutTabs, planMigration,
@@ -273,11 +274,9 @@ class WorkflowOrganization {
   }
   listWorkflows({ includeDeleted = false } = {}) {
     return this.read(() => {
-      const order = this.getPublication().metadata.workflowOrder || [];
       const workflows = this.db.prepare('SELECT workflow_id FROM workflow_org_workflows ORDER BY rowid').all()
         .map(row => this.getWorkflow(row.workflow_id, { includeDeleted })).filter(Boolean);
-      const position = workflow => order.includes(workflow.id) ? order.indexOf(workflow.id) : order.length;
-      return workflows.sort((a, b) => position(a) - position(b));
+      return orderedWorkflows(workflows, this.getPublication());
     });
   }
   getMembership(tabId) {

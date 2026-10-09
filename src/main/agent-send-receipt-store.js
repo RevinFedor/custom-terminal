@@ -176,6 +176,8 @@ function rowToRecord(row) {
     state: row.state,
     attempt: row.attempt,
     attemptId: row.attempt_id,
+    deliveryControl: decodeJson(row.delivery_control_json),
+    inputLease: decodeJson(row.input_lease_json),
     receipt,
     inboxSetup: decodeJson(row.inbox_setup_json),
     transcriptBoundary: decodeJson(row.transcript_boundary_json),
@@ -331,6 +333,10 @@ class AgentSendReceiptStore {
         owner TEXT NOT NULL,
         PRIMARY KEY (operation_key, owner)
       );
+      CREATE TABLE IF NOT EXISTS agent_send_cancelled_intents (
+        operation_key TEXT PRIMARY KEY, request_fingerprint TEXT NOT NULL,
+        tab_id TEXT NOT NULL, handoff_id TEXT NOT NULL, control_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS agent_send_audit_claims (
         provider TEXT NOT NULL,
         session_id TEXT NOT NULL,
@@ -345,6 +351,8 @@ class AgentSendReceiptStore {
       this.db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all().map((row) => row.name),
     );
     const additiveColumns = [
+      ['delivery_control_json', 'TEXT'],
+      ['input_lease_json', 'TEXT'],
       ['inbox_setup_json', 'TEXT'],
       ['audit_source_identity', 'TEXT'],
       ['audit_timestamp', 'TEXT'],
@@ -396,6 +404,7 @@ class AgentSendReceiptStore {
             attempt = attempt + 1,
             attempt_id = @attemptId,
             receipt_json = NULL,
+            input_lease_json = NULL,
             transcript_boundary_json = NULL,
             audit_attempt_id = NULL,
             audit_provider = NULL,
@@ -635,6 +644,11 @@ class AgentSendReceiptStore {
   }
 
   _reserveOrGet(identity, options = {}) {
+    const cancelled = this.db.prepare('SELECT * FROM agent_send_cancelled_intents WHERE operation_key = ?')
+      .get(identity.operationKey);
+    if (cancelled?.request_fingerprint && cancelled.request_fingerprint !== identity.requestFingerprint) {
+      return { ok: false, action: 'conflict', code: 'agent_send_handoff_conflict', record: this._record(identity.operationKey) };
+    }
     const existing = this._record(identity.operationKey);
     if (existing) {
       const mismatchedFields = identityMismatches(existing, identity, {
@@ -646,11 +660,14 @@ class AgentSendReceiptStore {
         action: 'replay',
         created: false,
         replayed: true,
-        retryable: RESUMABLE_STATES.has(existing.state)
+        retryable: !existing.deliveryControl?.cancelledAt && RESUMABLE_STATES.has(existing.state)
           && (!existing.inboxSetup || existing.inboxSetup.creationState === 'created'),
         record: existing,
       };
     }
+
+    if (cancelled) return { ok: false, action: 'cancelled', code: 'agent_send_cancelled',
+      deliveryControl: decodeJson(cancelled.control_json), record: null };
 
     if (identity.runId) {
       const sameRun = rowToRecord(this.statements.getSurfaceRun.get(identity.surface, identity.runId));
@@ -741,13 +758,78 @@ class AgentSendReceiptStore {
     return () => this.listeners.delete(listener);
   }
 
+  // Cancelling future input is not a statement about an earlier Enter. Keep
+  // this tombstone outside receipt_json so late transport/audit callbacks can
+  // enrich delivery evidence without resurrecting the user's intent.
+  cancelDelivery(input = {}) {
+    const operationKey = requiredString(input.operationKey, 'operationKey');
+    const result = this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record && input.allowUnreserved === true) {
+        const tabId = requiredString(input.tabId, 'tabId'), handoffId = requiredString(input.handoffId, 'handoffId');
+        const previous = this.db.prepare('SELECT * FROM agent_send_cancelled_intents WHERE operation_key = ?').get(operationKey);
+        if (previous && (previous.tab_id !== tabId || previous.handoff_id !== handoffId)) {
+          return { ok: false, reason: 'cancel-identity-mismatch', record: null };
+        }
+        const control = previous ? decodeJson(previous.control_json) : { version: 1,
+          cancelledAt: this.now(), attemptId: null, reason: optionalString(input.reason) || 'user-cancel',
+          presentationDismissed: input.presentationDismissed === true };
+        this.db.prepare(`INSERT OR IGNORE INTO agent_send_cancelled_intents
+          (operation_key,request_fingerprint,tab_id,handoff_id,control_json) VALUES(?,'',?,?,?)`)
+          .run(operationKey, tabId, handoffId, encodeJson(control));
+        return { ok: true, applied: !previous, idempotent: !!previous, control, record: null };
+      }
+      if (!record || record.tabId !== input.tabId || record.handoffId !== input.handoffId) {
+        return { ok: false, applied: false, reason: 'cancel-identity-mismatch', record };
+      }
+      if (input.attemptId !== record.attemptId) {
+        return { ok: false, applied: false, reason: 'stale-attempt', record };
+      }
+      if (record.deliveryControl?.cancelledAt) {
+        if (input.presentationDismissed === true && record.deliveryControl.presentationDismissed !== true) {
+          const control = { ...record.deliveryControl, presentationDismissed: true };
+          this.db.prepare(`UPDATE ${TABLE_NAME} SET delivery_control_json = ? WHERE operation_key = ?`)
+            .run(encodeJson(control), operationKey);
+          this.db.prepare('UPDATE agent_send_cancelled_intents SET control_json = ? WHERE operation_key = ?')
+            .run(encodeJson(control), operationKey);
+          return { ok: true, applied: true, record: this._record(operationKey) };
+        }
+        return { ok: true, applied: false, idempotent: true, record };
+      }
+      const control = { version: 1, cancelledAt: this.now(), attemptId: record.attemptId,
+        reason: optionalString(input.reason) || 'user-cancel',
+        presentationDismissed: input.presentationDismissed === true };
+      // Like audit claims, this small immutable marker outlives payload pruning.
+      // Repeating a cancelled handoff must not reserve a fresh physical attempt.
+      this.db.prepare(`INSERT OR IGNORE INTO agent_send_cancelled_intents
+        (operation_key,request_fingerprint,tab_id,handoff_id,control_json) VALUES(?,?,?,?,?)`)
+        .run(operationKey, record.requestFingerprint, record.tabId, record.handoffId, encodeJson(control));
+      this.db.prepare(`UPDATE ${TABLE_NAME} SET delivery_control_json = ?
+        WHERE operation_key = ? AND attempt_id IS ? AND delivery_control_json IS NULL`)
+        .run(encodeJson(control), operationKey, record.attemptId);
+      return { ok: true, applied: true, record: this._record(operationKey) };
+    })();
+    return input.notify === false ? result : this._observeChange(result);
+  }
+
+  isDeliveryCancelled(operationKey, attemptId = null) {
+    if (!operationKey) return false;
+    // This is also a pre-write guard: never decode the prompt/payload here.
+    const row = this.db.prepare(`SELECT attempt_id,delivery_control_json FROM ${TABLE_NAME} WHERE operation_key = ?`).get(operationKey);
+    if (row) return !!decodeJson(row.delivery_control_json)?.cancelledAt
+      && (attemptId === null || row.attempt_id === attemptId);
+    const marker = this.db.prepare('SELECT control_json FROM agent_send_cancelled_intents WHERE operation_key = ?').get(operationKey);
+    const control = decodeJson(marker?.control_json);
+    return !!control?.cancelledAt && (attemptId === null || control.attemptId === attemptId);
+  }
+
   beginAttempt(identityInput) {
     const identity = normalizeIdentity(identityInput);
     return this._observeChange(this.db.transaction(() => {
       const reservation = this._reserveOrGet(identity);
       if (!reservation.ok) return reservation;
       const record = reservation.record;
-      if (!RESUMABLE_STATES.has(record.state)
+      if (record.deliveryControl?.cancelledAt || !RESUMABLE_STATES.has(record.state)
         || record.inboxSetup && record.inboxSetup.creationState !== 'created') {
         return {
           ok: true,
@@ -845,7 +927,9 @@ class AgentSendReceiptStore {
       if (record.inboxSetup) {
         return { ok: record.inboxSetup.executionId === input.executionId
           && record.inboxSetup.conversationKey === optionalString(input.conversationKey)
-          && record.inboxSetup.source === optionalString(input.source),
+          && record.inboxSetup.source === optionalString(input.source)
+          && (!record.inboxSetup.sourceRequestFingerprint
+            || record.inboxSetup.sourceRequestFingerprint === input.sourceRequestFingerprint),
           applied: false, reason: 'inbox-setup-already-owned', record };
       }
       const setup = { version: 1, operationKey, runId: record.runId, handoffId: record.handoffId,
@@ -853,6 +937,9 @@ class AgentSendReceiptStore {
         executionId: requiredString(input.executionId, 'executionId'),
         conversationKey: optionalString(input.conversationKey), source: optionalString(input.source),
         creationRequestId: null, creationState: 'pending', dispatched: false, observedExpired: false };
+      if (typeof input.sourceRequestFingerprint === 'string' && input.sourceRequestFingerprint) {
+        setup.sourceRequestFingerprint = input.sourceRequestFingerprint;
+      }
       this.statements.inboxSetup.run({ operationKey, setupJson: encodeJson(setup), updatedAt: this.now() });
       return { ok: true, applied: true, record: this._record(operationKey) };
     })());
@@ -915,7 +1002,7 @@ class AgentSendReceiptStore {
     })());
   }
 
-  markAttemptState(operationKeyInput, attemptIdInput, state) {
+  markAttemptState(operationKeyInput, attemptIdInput, state, options = {}) {
     const operationKey = requiredString(operationKeyInput, 'operationKey');
     const attemptId = requiredString(attemptIdInput, 'attemptId');
     if (!ACTIVE_ATTEMPT_STATES.has(state)) {
@@ -926,6 +1013,26 @@ class AgentSendReceiptStore {
       if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
       if (record.attemptId !== attemptId) {
         return { ok: false, applied: false, stale: true, reason: 'stale-attempt', record };
+      }
+      if (record.deliveryControl?.cancelledAt) {
+        return { ok: false, applied: false, reason: 'delivery-cancelled', record };
+      }
+      if (!ACTIVE_ATTEMPT_STATES.has(record.state)) {
+        return { ok: false, applied: false, reason: 'attempt-not-active', record };
+      }
+      if (options.inputLease) {
+        const lease = options.inputLease;
+        if (lease.version !== 1 || lease.tabId !== record.tabId || lease.provider !== record.provider
+          || typeof lease.lifecycleGeneration !== 'string' || !lease.lifecycleGeneration
+          || !Number.isSafeInteger(lease.runSeq) || lease.runSeq <= 0) {
+          return { ok: false, applied: false, reason: 'input-lease-invalid', record };
+        }
+        if (record.inputLease && encodeJson(record.inputLease) !== encodeJson(lease)) {
+          return { ok: false, applied: false, reason: 'input-lease-changed', record };
+        }
+        this.db.prepare(`UPDATE ${TABLE_NAME} SET input_lease_json = ?
+          WHERE operation_key = ? AND attempt_id = ? AND input_lease_json IS NULL`)
+          .run(encodeJson(lease), operationKey, attemptId);
       }
       if (record.state === state) {
         return { ok: true, applied: false, idempotent: true, record };

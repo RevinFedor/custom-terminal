@@ -11,6 +11,8 @@ const { ArchivedFileLinks } = require('./archived-file-links');
 const { WorkflowArchive } = require('./workflow-archive');
 const { WorkflowGroupActions } = require('./workflow-group-actions');
 const { WorkflowDrag } = require('./workflow-drag');
+const { projectWorkflowCatalog } = require('../shared/workflow-catalog-projection.cjs');
+const {WorkflowNativeDrag}=require('./workflow-native-drag');
 
 /** One Main publication serves the renderer, automation and external readers. */
 function createWorkflowOrganizationApi({ database, publish = () => {}, validateDirectory = cwd => fs.statSync(cwd).isDirectory(),captureExecution }) {
@@ -61,6 +63,49 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
   const ready = () => service.getPublication().migrationVersion === 1;
   const read = () => service.read(() => ({...service.readState(),globalGroups:groups.read(),
     migrationScopes:database.getAppState('workflow-organization-migration-scopes.v1')?.scopes || {}}));
+  const legacyNamespaceIds = () => db.prepare('SELECT id FROM projects ORDER BY updated_at DESC').all().map(row=>row.id);
+  const namespaceIds = (tabs, legacy = legacyNamespaceIds()) => {
+    const ids = new Set(legacy);
+    for (const row of db.prepare('SELECT namespace FROM workflow_execution_scopes').all()) ids.add(row.namespace);
+    for (const tab of tabs) {
+      const id = tab.executionSubject?.executionNamespace || tab.executionSubject?.projectId;
+      if (id) ids.add(id);
+    }
+    return [...ids];
+  };
+  let catalogFlight = null;
+  const readCapture = () => {
+    if (catalogFlight) return catalogFlight;
+    // Join only before capture. No settled cache, timer or publication-only key:
+    // legacy metadata can change without advancing the organization revision.
+    const flight = new Promise((resolve,reject) => setImmediate(() => {
+      try {
+        const captured = service.read(() => {
+          const snapshot = read();
+          const saved = database.getAppState('workspace-session');
+          const legacyNamespaces = legacyNamespaceIds();
+          const namespaceOrder = [...(Array.isArray(saved?.openProjects) ? saved.openProjects : []).map(project=>project.projectId),
+            ...namespaceIds(snapshot.tabs,legacyNamespaces)];
+          const aliases = db.prepare('SELECT namespace,tab_id AS tabId,global_tab_id AS globalTabId FROM workflow_org_aliases ORDER BY rowid').all();
+          const dto = projectWorkflowCatalog({snapshot,namespaceOrder,legacyNamespaces,aliases});
+          dto.clocks.descriptors = {kind:'content-hash',value:fingerprint({rows:dto.rows,executionRefs:dto.executionRefs,provenance:dto.provenance})};
+          dto.clocks.tree = {kind:'content-hash',value:fingerprint(dto.workflows.map(({id,memberTabIds,rootIds,nodes})=>({id,memberTabIds,rootIds,nodes})))};
+          const freeze = value => {if(value && typeof value==='object' && !Object.isFrozen(value)){Object.values(value).forEach(freeze);Object.freeze(value);}return value;};
+          return freeze({snapshot,dto,namespaceOrder,legacyNamespaces,aliases});
+        });
+        resolve(captured);
+      } catch (error) {reject(error);
+      } finally {if (catalogFlight===flight) catalogFlight=null;}
+    }));
+    catalogFlight=flight;
+    return flight;
+  };
+  const catalogProjections=new WeakMap();
+  const readCatalog=()=>{
+    const captured=readCapture();
+    if(!catalogProjections.has(captured))catalogProjections.set(captured,captured.then(value=>value.dto));
+    return catalogProjections.get(captured);
+  };
   const bootstrap = request => {
     if (!ready()) {
       if (!request?.workspace || typeof request.workspace !== 'object') error('workflow_bootstrap_workspace_required');
@@ -123,17 +168,16 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
     return row ? JSON.parse(row.response_json) : null;
   };
   const listNamespaces = () => {
-    const ids = new Set(database.getAllProjects().map(project => project.id));
-    for(const row of db.prepare('SELECT namespace FROM workflow_execution_scopes').all())ids.add(row.namespace);
-    if (ready()) for (const tab of service.listGlobalTabs()) {
-      const id = tab.executionSubject?.executionNamespace || tab.executionSubject?.projectId;
-      if (id) ids.add(id);
-    }
-    return [...ids].map(id => database.getProjectById(id)).filter(Boolean);
+    return namespaceIds(ready() ? service.listGlobalTabs() : []).map(id => database.getProjectById(id)).filter(Boolean);
   };
   const storageRevisions = executionNamespace => db.prepare(`SELECT tab_id AS tabId,execution_subject_id AS subjectId,
     execution_storage_revision AS revision FROM tabs WHERE execution_subject_version=2 AND execution_namespace=?`).all(executionNamespace);
-  return { service, roots, groups, archive, groupActions, archivedFileLinks,ready, read, bootstrap, execution, namespace, createTab, mutate, getMutation, listNamespaces,storageRevisions };
+  const nativeDrag=new WorkflowNativeDrag({readCapture,mutate,
+    readCommand:mutationId=>{
+      const row=db.prepare('SELECT request_json FROM workflow_org_mutations WHERE mutation_id=?').get(mutationId);
+      return row ? JSON.parse(row.request_json) : null;
+    }});
+  return { service, roots, groups, archive, groupActions, archivedFileLinks,ready, read, readCatalog, bootstrap, execution, namespace, createTab, mutate, getMutation, listNamespaces,storageRevisions,nativeDrag };
 }
 
 function registerWorkflowOrganizationIpc(ipcMain, api) {

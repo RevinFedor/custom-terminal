@@ -291,6 +291,9 @@ test('actual /me advertises both explicit scopes, no navigation capability or av
   const api=webTree.statements.find(n=>ts.isFunctionDeclaration(n)&&n.name?.text==='handleApi');
   const route=api.body.statements.find(n=>ts.isIfStatement(n)&&n.expression.getText(webTree).includes("'/api/me'"));
   const context=vm.createContext({WORKSPACE_SWITCHER_CAPABILITY,RUN_AFTER_CAPABILITY:require('../shared/run-after-api.cjs').RUN_AFTER_CAPABILITY,checkAuth:()=>true,getLanIp:()=>null,
+    require:name=>{assert.equal(name,'./project-manager');return {workflowOrganization:{ready:()=>false}}},
+    getRunAfterApi:()=>({journal:{epoch:'private-run-after-epoch'}}),savedPromptService:null,
+    getAgentResponseState:null,readAgentObservedResponse:null,
     webServerServiceHealth:()=>({instanceId:'private-instance'}),sendJson:(_res,status,value)=>({status,value}),
     projectCardSignals:null,publicTabActivity:null,publicHistoryFreshness:null,completionNotificationCapability:{version:1},
     agentSendQueue:null,systemPromptService:null,transcriptService:null,MAX_EVENT_TABS:128,readAgentTabTiming:null,
@@ -308,6 +311,62 @@ test('actual /me advertises both explicit scopes, no navigation capability or av
   assert.equal(result.value.capabilities.runAfter.perPromptThinkingFast,false);
 });
 
+test('blocked external navigation keeps the live switcher and its pending HTTP read',async t=>{
+  const h=await harness(t),before=h.broker.wake(),opened=[];
+  const handler=find(mainTree,node=>ts.isCallExpression(node)
+    &&node.expression.getText(mainTree)==='mainWindow.webContents.on'
+    &&node.arguments[0]?.text==='will-navigate');
+  const ctx=vm.createContext({console:quiet,isRendererUrl:()=>false,shell:{openExternal:url=>opened.push(url)}});
+  vm.runInContext('globalThis.blockNavigation='+handler.arguments[1].getText(mainTree),ctx);
+  const hold=h.holdReply(),pending=h.get({scope:'desktop'});await h.readEntered;
+  const event={defaultPrevented:false,preventDefault(){this.defaultPrevented=true}};
+  const url='https://external.invalid/example';
+  // The installed log records this order: did-start-navigation, then the
+  // existing will-navigate policy cancels it. The App/document never remounts.
+  h.sender.emit('did-start-navigation',{},url,false,true);
+  ctx.blockNavigation(event,url);
+  assert.equal(event.defaultPrevented,true);assert.deepEqual(opened,[url]);
+  hold.resolve();const result=await pending;
+  assert.equal((await h.get({scope:'desktop'})).status,200,'reopening after cancellation must not stay unavailable');
+  assert.equal(result.status,200,'cancelled navigation must not retire the still-live App');
+  assert.equal(result.value.epoch,before.epoch);
+  h.ws.openProjects.get('P').tabs.get('b').name='updated after external link';h.refresh();
+  const next=await h.get({scope:'desktop'});
+  assert.equal(next.status,200);assert.ok(next.value.revision>before.revision);
+  assert.equal(next.value.rows.find(row=>row.tabId==='b').title,'updated after external link');
+  assert.ok(h.sideEffects.every(action=>action==='readWorkspaceSwitcher'));
+});
+
+test('committed main navigation rejects a pending old read even when frame IDs are reused',async t=>{
+  const h=await harness(t),old=h.broker.wake(),hold=h.holdReply();
+  const pending=h.get({scope:'desktop'});await h.readEntered;
+  h.sender.emit('did-start-navigation',{},'file:///private-fixture/reload.html',false,true);
+  h.sender.emit('did-navigate',{},'file:///private-fixture/reload.html',-1,'');
+  hold.resolve();const stale=await pending;
+  assert.equal(stale.status,409);assert.equal(stale.value.error,'switcher_snapshot_superseded');
+  assert.notEqual(h.broker.wake().epoch,old.epoch);assert.equal(h.broker.wake().available,false);
+  assert.equal(h.broker.changed(h.event(),{...old,revision:old.revision+1,available:true}),false);
+  h.register();
+  assert.equal((await h.get({scope:'desktop'})).status,200);
+  h.broker.unregister(h.event(),old);assert.equal(h.broker.wake().available,true);
+  h.broker.retire();
+  for(const name of ['did-start-navigation','did-navigate','render-process-gone','destroyed'])
+    assert.equal(h.sender.listenerCount(name),0,'retired listener: '+name);
+});
+
+test('uncommitted failure, in-page and subframe navigation preserve the document; process loss does not',async t=>{
+  const h=await harness(t),before=h.broker.wake();
+  h.sender.emit('did-start-navigation',{},'http://private.invalid/failed',false,true);
+  h.sender.emit('did-fail-provisional-load',{},-3,'ERR_ABORTED','http://private.invalid/failed',true,1,1);
+  h.sender.emit('did-start-navigation',{},'http://private.invalid/#anchor',true,true);
+  h.sender.emit('did-navigate-in-page',{},'http://private.invalid/#anchor',true,1,1);
+  h.sender.emit('did-start-navigation',{},'http://private.invalid/child',false,false);
+  h.sender.emit('did-frame-navigate',{},'http://private.invalid/child',200,'OK',false,2,2);
+  assert.deepEqual(h.broker.wake(),before);assert.equal((await h.get({scope:'desktop'})).status,200);
+  h.sender.emit('render-process-gone',{}, {reason:'crashed'});
+  assert.equal(h.broker.wake().available,false);assert.equal((await h.get({scope:'desktop'})).status,503);
+});
+
 test('Main retirement/navigation, stale unregister and invalid replies cannot revive a lease',async t=>{
   const h=await harness(t),old=h.broker.wake();
   h.register();h.broker.unregister(h.event(),old);assert.equal(h.broker.wake().available,true);
@@ -316,6 +375,8 @@ test('Main retirement/navigation, stale unregister and invalid replies cannot re
   const current=h.broker.wake();h.sender.emit('did-start-navigation',{},'http://private',true,true);
   assert.equal(h.broker.wake().epoch,current.epoch,'same-document navigation preserves owner');
   h.sender.emit('did-start-navigation',{},'http://private/new',false,true);
+  assert.equal(h.broker.wake().epoch,current.epoch,'a navigation attempt is not document replacement');
+  h.sender.emit('did-navigate',{},'http://private/new',200,'OK');
   assert.notEqual(h.broker.wake().epoch,current.epoch);assert.equal(h.broker.wake().available,false);
   h.register();
   for(const bad of [{},{version:1,known:true,epoch:old.epoch,rows:[],revision:999},

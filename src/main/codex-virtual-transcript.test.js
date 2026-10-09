@@ -121,6 +121,11 @@ test('exact production fork IDs project frozen source plus one incremental child
   assert.equal(first.timelineEntries.every((entry) => entry.physicalSessionId === SOURCE), true);
   assert.equal(new Set(first.timelineEntries.map((entry) => entry.uuid)).size, first.timelineEntries.length,
     'duplicate text remains two exact physical rows');
+  for (const entry of first.timelineEntries.filter(entry => entry.type === 'user')) {
+    const final = first.historyEntries.find(row => row.uuid === entry.responsePreview?.uuid);
+    assert.ok(final, 'inherited final has the same exact History locator');
+    assert.deepEqual(entry.responsePreview.entryRef, final.entryRef);
+  }
 
   await fs.promises.appendFile(childPath, jsonl(turn('duplicate prompt', 3)));
   const appended = await store.project(descriptor(CHILD, `fork:codex:${SOURCE}:${CHILD}`, manifest), dir);

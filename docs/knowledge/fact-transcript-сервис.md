@@ -98,6 +98,11 @@ event не очищается старым HTTP reply. Неизменившее�
 дополнительного выбранного чтения. Pending/unknown не превращаются в fresh по
 deadline. Wire и правила сравнения — `fact-mobile-web.md::Ранняя свежесть кэша`.
 
+Read ticket проверяет exact-tab event и после последнего awaited context, перед
+remember/known. Иначе событие в этом промежутке выдавало старым rows новый known
+sequence. Новое событие оставляет окно unverified/unknown даже при совпавшем stat;
+событие другой вкладки не отзывает его proof. Runtime idle это правило не заменяет.
+
 В Claude устранён prerequisite-дефект: equal size раньше позволял прикрепить
 новые stat к старому recordMap после replacement/rewrite. Теперь совпадает
 физический witness; timestamp-only touch сохраняет прежний graph лишь после
@@ -153,6 +158,15 @@ rows, не восстанавливая parser. Provider-wide prompt revision н
 процесса не является действующим правом после restart. При физическом копировании
 ветки пересчитывается и этот byte offset. Composite contentRevision живёт в
 header и накладывается при выдаче; его смена не переписывает тела всех ancestor rows.
+
+Успех/quiet refusal awaited prepared write — не решение о свежести прочитанных
+rows. После base/view save и rewrite baseline, включая mismatch fallthrough,
+сервис повторно проверяет logical source generation и использует прежние bounded3
+attempts. При invalidation SQLite owner может вернуть null без throw; без внешнего
+source fence direct service принимал g1 после g2. Полный worker/client уже имел
+source-epoch throwing fence и защищал проверенные cold/base/view случаи до этого
+ремонта. Append намеренно сохраняет logical generation; его физические/epoch
+witnesses и прежние независимые cache tiers не заменяются этим guard.
 
 Virtual continuation сохраняет обе проекции, frozen witnesses и child cursor.
 Замена parent/child, ctime-only rewrite и explicit invalidation проверяются

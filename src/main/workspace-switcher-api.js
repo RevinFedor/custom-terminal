@@ -22,9 +22,11 @@ class WorkspaceSwitcherReadProjection {
         && frameKey(sender.mainFrame) === source.frame;
     } catch { return false; }
   }
-  retire(source = this.source) {
+  retire(source = this.source, reason = 'retired') {
     if (source !== this.source) return;
     source?.cleanup?.(); this.source = null; this.epoch = this.uuid(); this.revision = 0;
+    if (source) console.log('[WorkspaceSwitcher] lease-retired reason=' + reason
+      + ' wc=' + source.sender.id + ' frame=' + source.frame + ' epoch=' + source.epoch + ' nextEpoch=' + this.epoch);
     this.onChanged();
   }
   register(event) {
@@ -34,11 +36,17 @@ class WorkspaceSwitcherReadProjection {
     this.source?.cleanup?.();
     const source = { sender, frame: frameKey(event.senderFrame), epoch: this.uuid(), revision: 0, available: false };
     this.source = source; this.epoch = source.epoch; this.revision = 0;
-    const lost = () => this.retire(source);
-    const navigate = (_event, _url, inPlace, isMainFrame) => { if (isMainFrame && !inPlace) lost(); };
-    sender.on('destroyed', lost); sender.on('render-process-gone', lost); sender.on('did-start-navigation', navigate);
-    source.cleanup = () => { sender.removeListener('destroyed', lost); sender.removeListener('render-process-gone', lost);
-      sender.removeListener('did-start-navigation', navigate); };
+    const destroyed = () => this.retire(source, 'destroyed');
+    const processGone = () => this.retire(source, 'render-process-gone');
+    // A navigation attempt can be cancelled by the window's will-navigate
+    // policy (external links). That leaves the same App mounted, with no new
+    // registration. Retire only after main-document navigation commits;
+    // current() still rejects a replaced frame before an async read publishes.
+    const navigate = () => this.retire(source, 'main-document-navigated');
+    sender.on('destroyed', destroyed); sender.on('render-process-gone', processGone); sender.on('did-navigate', navigate);
+    source.cleanup = () => { sender.removeListener('destroyed', destroyed); sender.removeListener('render-process-gone', processGone);
+      sender.removeListener('did-navigate', navigate); };
+    console.log('[WorkspaceSwitcher] lease-registered wc=' + sender.id + ' frame=' + source.frame + ' epoch=' + source.epoch);
     this.onChanged(); return { version: 1, epoch: source.epoch };
   }
   changed(event, value) {
@@ -46,13 +54,15 @@ class WorkspaceSwitcherReadProjection {
     if (!this.current(source) || event.sender !== source.sender || frameKey(event.senderFrame) !== source.frame
       || value?.version !== 1 || value.epoch !== source.epoch
       || !Number.isSafeInteger(value.revision) || value.revision <= source.revision || typeof value.available !== 'boolean') return false;
+    if (source.available !== value.available) console.log('[WorkspaceSwitcher] availability wc=' + source.sender.id
+      + ' epoch=' + source.epoch + ' revision=' + value.revision + ' available=' + value.available);
     source.revision = value.revision; source.available = value.available;
     this.revision = source.revision; this.onChanged(); return true;
   }
   unregister(event, value) {
     const source = this.source;
     if (this.current(source) && source.sender === event.sender && source.frame === frameKey(event.senderFrame)
-      && source.epoch === value?.epoch) this.retire();
+      && source.epoch === value?.epoch) this.retire(source, 'renderer-unregister');
   }
   wake() {
     return { version: 1, epoch: this.epoch, revision: this.revision,

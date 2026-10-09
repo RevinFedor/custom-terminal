@@ -112,3 +112,9 @@ export function selectPromptQueueTransportProgress(handoffs, itemIds = []) {
   }
   return latest;
 }
+
+export function selectPromptQueuePreparationProgress(runtime, itemIds = []) {
+  const itemId = runtime?.preparingItemId;
+  return runtime?.pending === true && typeof itemId === 'string' && itemIds.includes(itemId)
+    ? { itemId, queueStatus: 'preparing' } : null;
+}

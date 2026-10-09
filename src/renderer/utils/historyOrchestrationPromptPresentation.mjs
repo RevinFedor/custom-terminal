@@ -1,4 +1,5 @@
 import { getTabMessageTag, getTerminalMcpTag, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
+import { projectNativeQuestionReply } from '../../shared/native-question-reply.mjs';
 
 const ORCHESTRATION_PHASES = new Set(['request', 'completion', 'failure']);
 const PRESENTATION_FIELDS = ['envelopeStart', 'envelopeText', 'bodyStart', 'bodyEnd', 'bodyProjectionHash', 'sourceTabId', 'sourceTabName', 'sourceProjectId', 'targetTabId', 'targetTabName', 'targetProjectId', 'runKind'];
@@ -47,6 +48,8 @@ export function resolveHistoryOrchestrationPromptPresentation(entry) {
  * that Copy, Rewind and exact receipt/context lookups still need. */
 export function projectHistoryServicePromptBody(entry, fingerprint) {
   const text = typeof entry?.content === 'string' ? entry.content : '';
+  const questionReply = projectNativeQuestionReply(entry, fingerprint);
+  if (questionReply) return { text: questionReply.text, projected: true, questionReply };
   const tag = resolveHistoryOrchestrationPromptPresentation(entry);
   const { envelopeStart, envelopeText, bodyStart, bodyEnd, bodyProjectionHash } = tag || {};
   // Generated bodies are suffixes. Canonical TAB/CRLF transforms may shift

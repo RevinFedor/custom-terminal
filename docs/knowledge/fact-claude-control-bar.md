@@ -122,11 +122,15 @@ Bar ложится **под** контентом Terminal-колонки, но �
 анимированным loader. Это не отдельный lock: ввод и background History сохраняют
 свои прежние правила.
 
-«History composer показывает фазу» не означает, что slash-команду вводят в его
-textarea. Сырой draft, начинающийся с `/`, по общему контракту остаётся там с
-подсказкой `← Terminal only`; ручной `/compact` вводится в живой xterm. History —
-наблюдающая поверхность операции. E2E, который нажал Enter в History textarea,
-проверил guard поверхности, а не compact lifecycle.
+History поддерживает standalone slash-команды по принятому17.08 контракту;
+старый `← Terminal only` больше не действует. Доставка команды и фактический
+старт compact проверяются отдельно, через прежний общий scenario.
+
+Codex native/automatic compaction также видна по typed provider request при
+точном live writer/lifecycle, без чтения текста TUI. Она использует тот же
+операционный индикатор и отдельное время Compacting в History, но не создаёт
+ручной command receipt. Whole-turn timer/Worked не переписывается. См.
+`fact-codex.md::Native compact виден в TUI, но History остаётся Working`.
 
 Фаза начинается только после доказанного PTY submit точной команды в текущем
 Claude owner (terminal + session + launch generation + input revision). Завершение

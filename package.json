@@ -66,6 +66,7 @@
     "@atlaskit/pragmatic-drag-and-drop": "^1.7.7",
     "@atlaskit/pragmatic-drag-and-drop-auto-scroll": "^2.1.5",
     "@atlaskit/pragmatic-drag-and-drop-hitbox": "^1.1.0",
+    "@babel/parser": "7.29.3",
     "@google/genai": "^1.38.0",
     "@gt-editor/markdown-editor": "^0.1.1",
     "@modelcontextprotocol/sdk": "^1.27.1",

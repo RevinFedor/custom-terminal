@@ -1,4 +1,15 @@
 const crypto = require('crypto');
+const { buildPromptOutline } = require('../shared/prompt-outline.cjs');
+const { resolveSavedPromptComposition } = require('./saved-prompt-resolution');
+
+const PROMPT_LIBRARY_READ_CAPABILITY = Object.freeze({
+  version: 1, readOnly: true,
+  catalogEndpoint: '/api/prompt-library', outlineProjection: 'outline-v1',
+  readEndpoint: '/api/prompt-library/read', resolvedProjection: 'steps-v1',
+  resolvedMode: 'resolved', selectedPromptLimit: 1,
+  coherentLibrarySnapshot: true, expectedLibraryRevision: true,
+  fileSnapshot: 'read-time', sourceKey: 'prompt:<id>',
+});
 
 function fail(message, statusCode, code, extra = {}) {
   return Object.assign(new Error(message), { statusCode, code, ...extra });
@@ -30,6 +41,51 @@ const cleanPaths = (value) => {
   }
   return [...value];
 };
+
+function compactCatalog(state) {
+  return {
+    groups: state.groups.map(publicGroup),
+    prompts: state.prompts.map(prompt => ({
+      id: prompt.id, title: prompt.title, group_id: prompt.group_id ?? null,
+      visual_parent_id: prompt.visual_parent_id ?? null, position: prompt.position ?? null,
+      fileCount: Array.isArray(prompt.file_paths) ? prompt.file_paths.length : 0,
+      ownTextLength: String(prompt.content || '').length, revision: revisionFor(prompt),
+    })),
+  };
+}
+
+function readEvidence(state, requestId) {
+  if (requestId != null && (typeof requestId !== 'string' || !requestId || requestId.length > 200)) {
+    throw fail('requestId must be a non-empty string of at most 200 characters', 400, 'saved_prompt_read_id_invalid');
+  }
+  // Array order is significant for the canonical stable tie order. Revisions
+  // cover the definitions/paths, NOT a claim that attached file bytes are frozen.
+  const libraryRevision = crypto.createHash('sha256').update(JSON.stringify({
+    prompts: state.prompts.map(prompt => [prompt.id, revisionFor(prompt)]),
+    groups: state.groups.map(group => [group.id, groupRevisionFor(group)]),
+  })).digest('hex');
+  return { version: 1, readId: crypto.randomUUID(), requestId: requestId ?? null, libraryRevision };
+}
+
+function presentOutline(nodes, revisions, promptDepth = 0, parentPrompt = null) {
+  return nodes.map(node => {
+    const isPrompt = node.entityType === 'prompt';
+    return {
+      id: node.id, kind: node.kind, label: node.label,
+      collapsible: node.collapsible, expanded: node.expanded,
+      hasChildren: node.children.length > 0,
+      ...(isPrompt ? {
+        promptId: node.promptId, sourceKey: `prompt:${node.promptId}`,
+        revision: revisions.get(node.promptId),
+        groupId: node.rawPrompt.group_id ?? null,
+        inheritanceDepth: promptDepth,
+        inheritanceParentPromptId: parentPrompt?.promptId ?? null,
+        inheritanceParentLabel: parentPrompt?.label ?? null,
+      } : { groupId: node.groupId, revision: groupRevisionFor(node.rawGroup) }),
+      children: presentOutline(node.children, revisions, isPrompt ? promptDepth + 1 : 0, isPrompt ? node : null),
+    };
+  });
+}
 
 function validateLibrary(state) {
   const groups = new Set(state.groups.map((group) => String(group.id)));
@@ -82,6 +138,7 @@ function validateLibrary(state) {
 function createSavedPromptService({ projectManager, onUpdated, onChanged } = {}) {
   if (!projectManager) throw new Error('saved prompt service requires projectManager');
   const library = () => projectManager.getPromptLibrary();
+  const readSnapshot = () => structuredClone(library());
   const findPrompt = (state, stableId) => {
     const id = asId(stableId);
     const prompt = state.prompts.find((item) => asId(item.id) === id);
@@ -208,26 +265,52 @@ function createSavedPromptService({ projectManager, onUpdated, onChanged } = {})
   return {
     get: read,
     list() { return library().prompts.map(publicPrompt); },
-    catalog() {
-      const state = library();
-      return {
-        groups: state.groups.map(publicGroup),
-        prompts: state.prompts.map((prompt) => ({
-          id: prompt.id, title: prompt.title, group_id: prompt.group_id ?? null,
-          visual_parent_id: prompt.visual_parent_id ?? null, position: prompt.position ?? null,
-          fileCount: Array.isArray(prompt.file_paths) ? prompt.file_paths.length : 0,
-          ownTextLength: String(prompt.content || '').length,
-          revision: revisionFor(prompt),
-        })),
-      };
+    catalog({ projection, requestId } = {}) {
+      if (projection != null && projection !== 'outline-v1') throw fail('unsupported prompt outline projection', 400, 'saved_prompt_projection_invalid');
+      const state = readSnapshot(), result = compactCatalog(state);
+      if (!projection) return result;
+      return { ...result, read: readEvidence(state, requestId),
+        outline: { version: 1, roots: presentOutline(buildPromptOutline(state.prompts, state.groups),
+          new Map(state.prompts.map(prompt => [prompt.id, revisionFor(prompt)]))) } };
     },
     async readMany({ promptIds, mode = 'own', resolveText } = {}) {
       if (!Array.isArray(promptIds) || promptIds.length === 0) throw fail('promptIds must be a non-empty array', 400, 'saved_prompt_ids_required');
       if (!['own', 'resolved'].includes(mode)) throw fail('mode must be own or resolved', 400, 'saved_prompt_read_mode_invalid');
-      const selected = promptIds.map((id) => findPrompt(library(), id));
+      const state = readSnapshot();
+      const selected = promptIds.map((id) => findPrompt(state, id));
       if (mode !== 'resolved') return selected.map(publicPrompt);
       if (typeof resolveText !== 'function') throw fail('resolved prompt reader unavailable', 503, 'saved_prompt_resolver_unavailable');
-      return Promise.all(selected.map(async (prompt) => ({ ...publicPrompt(prompt), resolvedText: await resolveText(prompt) })));
+      return Promise.all(selected.map(async (prompt) => ({ ...publicPrompt(prompt), resolvedText: await resolveText(prompt, state.prompts) })));
+    },
+    async readResolvedSteps({ promptIds, mode, projection, requestId, expectedLibraryRevision, resolvePart } = {}) {
+      if (projection !== 'steps-v1' || mode !== 'resolved') throw fail('steps-v1 requires resolved mode', 400, 'saved_prompt_projection_invalid');
+      if (!Array.isArray(promptIds) || promptIds.length !== 1) throw fail('steps-v1 requires exactly one selected prompt', 400, 'saved_prompt_selection_invalid');
+      if (expectedLibraryRevision != null && (typeof expectedLibraryRevision !== 'string' || !/^[a-f0-9]{64}$/.test(expectedLibraryRevision))) {
+        throw fail('invalid library revision', 400, 'saved_prompt_library_revision_invalid');
+      }
+      const state = readSnapshot(), read = readEvidence(state, requestId);
+      const selected = findPrompt(state, promptIds[0]);
+      read.selectedPromptId = selected.id; read.selectedRevision = revisionFor(selected);
+      if (expectedLibraryRevision != null && expectedLibraryRevision !== read.libraryRevision) {
+        throw fail('prompt library changed since the outline read', 409, 'saved_prompt_library_stale', { read });
+      }
+      if (typeof resolvePart !== 'function') throw fail('resolved prompt reader unavailable', 503, 'saved_prompt_resolver_unavailable', { read });
+      const outline = buildPromptOutline(state.prompts, state.groups);
+      try {
+        const composed = await resolveSavedPromptComposition(selected, state.prompts, resolvePart, { outline });
+        const steps = composed.steps.map(({ prompt, parts, files }, depth) => ({
+          promptId: prompt.id, sourceKey: `prompt:${prompt.id}`, label: prompt.title,
+          // Keep the stored definition revision, even if the outline normalized
+          // an orphan group for presentation. No repaired relation is persisted.
+          revision: revisionFor(findPrompt(state, prompt.id)),
+          text: parts.join('\n\n'), files,
+          inheritanceDepth: depth,
+          inheritanceParentPromptId: depth ? composed.chain[depth - 1].id : null,
+          inheritanceParentLabel: depth ? composed.chain[depth - 1].title : null,
+        }));
+        return { read, prompts: [{ ...publicPrompt(selected), resolvedText: composed.parts.join('\n\n') }],
+          composition: { version: 1, selectedPromptId: selected.id, steps } };
+      } catch (error) { error.read = read; throw error; }
     },
     createPrompt({ stableId, title, text = '', filePaths = [], groupId = null, parentPromptId = null, position = 0 } = {}) {
       const id = asId(stableId) || `prompt-${crypto.randomUUID()}`;
@@ -324,4 +407,4 @@ function createSavedPromptService({ projectManager, onUpdated, onChanged } = {})
   };
 }
 
-module.exports = { createSavedPromptService, revisionFor, groupRevisionFor };
+module.exports = { createSavedPromptService, revisionFor, groupRevisionFor, PROMPT_LIBRARY_READ_CAPABILITY };

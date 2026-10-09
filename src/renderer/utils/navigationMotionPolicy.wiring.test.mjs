@@ -58,6 +58,7 @@ test('pending operation is a static orange fact, not a frozen spinner', () => {
   assert.match(pendingOperation, /background: '#f59e0b'/);
   assert.match(pendingOperation, /animation: 'none'/);
   assert.doesNotMatch(pendingOperation, /tab-dot-spin|borderTopColor/);
-  assert.match(workflowBadges, /boxShadow: 'inset 0 0 0 1\.5px #f59e0b'/);
+  assert.match(workflowBadges, /data-workflow-busy-count/);
+  assert.match(workflowBadges, /fontSize: 'max\(10px, 0\.9em\)'/);
   assert.doesNotMatch(workflowBadges, /noted-shape-ring/);
 });

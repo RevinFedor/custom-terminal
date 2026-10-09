@@ -114,6 +114,7 @@ function fingerprintAction(action) {
       raw.resultRef ? raw.resultRef.payloadId + ':' + raw.resultRef.totalChars + ':' + (raw.resultRef.recordLine ?? '') : '-',
       String(raw.resultSourceLine ?? ''),
       raw.backgroundStatus || '-',
+      sampleValue(raw.questionReplyProof),
       hunks, argsWitness(raw.args),
     ].join(SEP);
   }
@@ -162,6 +163,7 @@ function fingerprintHistoryEntry(entry) {
       : '-',
     Array.isArray(entry.promptChips) ? sampleValue(entry.promptChips) : '-',
     Array.isArray(entry.semanticTags) ? sampleValue(entry.semanticTags) : '-',
+    sampleValue(entry.questionReplyProof),
     Array.isArray(entry.imagePaths) ? sampleValue(entry.imagePaths) : '-',
   ];
   const actions = Array.isArray(entry.actions) ? entry.actions : [];

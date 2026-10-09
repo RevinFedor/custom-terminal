@@ -27,6 +27,8 @@ export type TabMessage = {
   answeredAt?: TabMessageTimestamp | null;
   sourceDismissedAt?: TabMessageTimestamp | null;
   targetDismissedAt?: TabMessageTimestamp | null;
+  cancelledAt?: TabMessageTimestamp | null;
+  cancelledByTabId?: string | null;
 };
 
 export type TabMessageIndex = Record<string, TabMessage>;
@@ -60,6 +62,8 @@ export function mergeTabMessages(current: TabMessageIndex, incoming: TabMessage[
         : message.answeredAt ? { answeredAt: message.answeredAt } : {}),
       ...(previous?.sourceDismissedAt ? { sourceDismissedAt: previous.sourceDismissedAt } : {}),
       ...(previous?.targetDismissedAt ? { targetDismissedAt: previous.targetDismissedAt } : {}),
+      ...(previous?.cancelledAt ? { cancelledAt: previous.cancelledAt, cancelledByTabId: previous.cancelledByTabId }
+        : message.cancelledAt ? { cancelledAt: message.cancelledAt, cancelledByTabId: message.cancelledByTabId } : {}),
       ...(typeof previous?.text === 'string' ? { text: previous.text }
         : typeof message.text === 'string' ? { text: message.text } : {}),
     } as TabMessage;
@@ -84,6 +88,11 @@ export function tabMessageThreads(messages: TabMessageIndex, tabId: string) {
 }
 
 export function tabMessageDelivery(message: TabMessage): MessagePresentation {
+  if (message.cancelledAt && message.deliveryState !== 'sent') return {
+    label: message.deliveryState === 'queued' || message.deliveryState === 'unconfirmed' || message.deliveryState === 'sending'
+      ? 'Отменено · прежняя доставка не подтверждена' : 'Отменено',
+    color: '#a1a1aa', icon: 'waiting', spinning: false,
+  };
   switch (message.deliveryState) {
     case 'sent': return { label: 'Доставлено', color: '#4ade80', icon: 'delivered', spinning: false };
     case 'sending': return { label: 'Отправка', color: '#60a5fa', icon: 'sending', spinning: true };
@@ -97,11 +106,11 @@ export function tabMessageDelivery(message: TabMessage): MessagePresentation {
 
 export function tabMessageQuestionLabel(question: TabMessage, answerAvailable: boolean): string {
   if (question.deliveryState !== 'sent') return tabMessageDelivery(question).label;
-  return answerAvailable ? 'Доставлено' : 'Доставлено · ждёт ответа';
+  return answerAvailable || question.cancelledAt ? 'Доставлено' : 'Доставлено · ждёт ответа';
 }
 
 export function tabMessageDismissed(question: TabMessage, tabId: string): boolean {
-  return Boolean(question.sourceTabId === tabId ? question.sourceDismissedAt : question.targetDismissedAt);
+  return Boolean(question.cancelledAt || (question.sourceTabId === tabId ? question.sourceDismissedAt : question.targetDismissedAt));
 }
 
 export function tabMessagePeer(thread: TabMessageThread) {
@@ -114,6 +123,7 @@ export function tabMessagePeer(thread: TabMessageThread) {
 
 export function tabMessageReplyPresentation(thread: TabMessageThread): MessagePresentation {
   if (thread.reply) return tabMessageDelivery(thread.reply);
+  if (thread.question.cancelledAt) return { label: 'Ожидание отменено', color: '#a1a1aa', icon: 'waiting', spinning: false };
   return { label: thread.answerAvailable ? 'Ответ сохранён; доставка уточняется' : 'Ожидает ответа',
     color: '#999', icon: 'waiting', spinning: false };
 }

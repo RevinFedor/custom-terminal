@@ -11,6 +11,7 @@ const { CompletionContentStore, buildOrchestrationCompletionContent, MAX_INLINE_
 const { captureOrchestrationResultAttempt, orchestrationResultAttemptMatches, isCompleteOrchestrationResult } = require('./orchestration-runs');
 const { formatTabMessagePrompt } = require('./tab-messages');
 const { isDesktopHistorySendReceiptEligible } = require('./agent-history-send-receipt');
+const { isResponseObservation } = require('./orchestration-response-observation');
 const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const ast = ts.createSourceFile('web-server.js', source, ts.ScriptTarget.Latest, true);
 const declaration = name => {
@@ -56,7 +57,8 @@ test('actual message adapter pins the recipient, prepares context once and passe
     handoffId: 'tab-message:m', operationKey: 'tab-message:m' };
   message.prompt = formatTabMessagePrompt(message);
   const prefix = '<saved_prompt name="state" context-update-id="c">Updated file</saved_prompt>\n\n';
-  const service = { updateFrozenPrompt: (...args) => frozen.push(args), reconcileReceipts() {} };
+  const service = { updateFrozenPrompt: (...args) => frozen.push(args), reconcileReceipts() {},
+    assertDeliveryActive: id => assert.equal(id, message.messageId) };
   const context = vm.createContext({
     crypto: require('node:crypto'),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendReceiptStore: { pinForOwner() {} }, getTabMessageService: () => service,
@@ -99,7 +101,7 @@ test('actual completion preparation freezes verified native/browser content and 
     getCompletionContentStore: () => snapshots, getOrchestrationRunStore: () => ({ getInternal: async () => run }),
     captureOrchestrationResultAttempt, orchestrationResultAttemptMatches, isCompleteOrchestrationResult,
     buildOrchestrationCompletionContent, MAX_INLINE_ASSISTANT_CHARS,
-    isExternalResearchRun: run => run.runKind === 'external-research', resolvedPort: 7988,
+    isResponseObservation, isExternalResearchRun: run => run.runKind === 'external-research', resolvedPort: 7988,
     probeOrchestrationResult: async () => { reads++; return { found: true, sourceVerified: true, complete: true,
       resultComplete: true, assistantText: '## Verified result\n\nFull **Markdown** answer', assistantChars: 43 }; },
     readExternalResearchResult: async () => { reads++; return { statusCode: 200, body: { ready: true, success: true,
@@ -137,7 +139,7 @@ test('completion read that races cancellation never freezes or sends the answer'
   const context = vm.createContext({ getCompletionContentStore: () => store,
     getOrchestrationRunStore: () => ({ getInternal: async () => ({ ...run, notificationSuppressed: true }) }),
     captureOrchestrationResultAttempt, orchestrationResultAttemptMatches, isCompleteOrchestrationResult,
-    buildOrchestrationCompletionContent, MAX_INLINE_ASSISTANT_CHARS, isExternalResearchRun: () => false,
+    buildOrchestrationCompletionContent, MAX_INLINE_ASSISTANT_CHARS, isResponseObservation, isExternalResearchRun: () => false,
     probeOrchestrationResult: async () => ({ found: true, sourceVerified: true, complete: true, resultComplete: true, assistantText: 'Answer' }),
   });
   vm.runInContext(declaration('prepareOrchestrationCompletionContent') + '\nthis.prepare = prepareOrchestrationCompletionContent;', context);

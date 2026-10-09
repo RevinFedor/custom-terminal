@@ -34,7 +34,6 @@
 .workflow-reserve-connector.continuation{top:calc(-1 * var(--reserve-gap,4px));bottom:calc(-1 * var(--reserve-gap,4px))}
 .workflow-reserve-connector.elbow{top:50%;height:1px;width:8px}
 .workflow-reserve-row input{min-width:0;width:100%;background:#171717;color:#ddd;border:1px solid #8b5cf6;border-radius:3px;outline:none;font:inherit}
-.workflow-reserve-parent{font-size:11px;color:#777;padding:2px 10px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .workflow-reserve-empty{font-size:12px;line-height:1.5;color:#777;padding:12px 5px}
 .workflow-reserve-error{font-size:12px;color:#e4a293;padding:5px 10px}
 .workflow-tab-sidebar>[data-tab-sidebar-resize-handle]{position:absolute;right:-3px;top:0;bottom:0;width:6px;cursor:col-resize;touch-action:none;user-select:none;z-index:30}

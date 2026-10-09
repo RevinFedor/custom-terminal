@@ -17,7 +17,8 @@ import { stopAiBeforeTerminalKill } from '../utils/terminalCloseLifecycle.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
 import {createExecutionRevisionAcks} from '../utils/executionRevisionAcks.mjs';
 import { collectTabLinkedFiles } from '../utils/tabLinkedFiles.mjs';
-import { isExactGroupCloseGuard,organizationProjection } from '../utils/workflowOrganizationClient.mjs';
+import { createWorkflowRelationReceipts } from '../utils/workflowRelationReceipts.mjs';
+import { isExactGroupCloseGuard,organizationProjection,reconcileWorkflowOrder } from '../utils/workflowOrganizationClient.mjs';
 
 const require = createRequire(import.meta.url);
 const SQLite = require('better-sqlite3');
@@ -51,7 +52,11 @@ assert.ok(closeNode);
 const sidebarTree=ts.createSourceFile('sidebar.tsx',read('../components/Workspace/ConnectedWorkflowSidebar.tsx'),ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
 const closeMembersNode=walk(sidebarTree,node=>ts.isJsxAttribute(node)&&node.name.text==='onCloseMembers');
 assert.ok(closeMembersNode?.initializer?.expression);
-const persistenceCode = ['executionRevisionAcks','serializeTabs', 'saveTabs', 'notifyProjectLayoutChanged',
+const closeMembersExpression=ts.isIdentifier(closeMembersNode.initializer.expression)
+  ? walk(sidebarTree,node=>ts.isVariableDeclaration(node)&&node.name.getText(sidebarTree)===closeMembersNode.initializer.expression.text)?.initializer
+  : closeMembersNode.initializer.expression;
+assert.ok(closeMembersExpression);
+const persistenceCode = ['executionRevisionAcks','workflowRelationReceipts','serializeTabs', 'saveTabs', 'notifyProjectLayoutChanged',
   'saveTabsThenNotifyProjectLayoutChanged', 'saveTabsBatchThenNotifyProjectLayoutChanged']
   .map(name => variable(name)).filter(Boolean).map(node => 'const ' + node.getText(storeTree) + ';').join('\n');
 const mainSave = walk(mainTree, node => ts.isCallExpression(node) && node.expression.getText(mainTree) === 'ipcMain.handle'
@@ -125,10 +130,10 @@ function fixture(t, { foreign = false, count = 2 } = {}) {
     throw Error('unexpected IPC: ' + channel);
   } };
   const context = vm.createContext({ ...placement, ...panes, ...spaces, ...persistence, collectTabLinkedFiles,isExactGroupCloseGuard,
-    dropFromMru, stopAiBeforeTerminalKill, createProjectTabSaveQueue,createExecutionRevisionAcks,
+    dropFromMru, stopAiBeforeTerminalKill, createProjectTabSaveQueue,createExecutionRevisionAcks,createWorkflowRelationReceipts,
     projectTabSaveQueue: createProjectTabSaveQueue(), projectTabSaveRevisions: new Map(),
     get: () => state, set: patch => Object.assign(state, patch), startTransition: fn => fn(),
-    useWorkspaceStore:{getState:()=>state},organizationProjection,INBOX_WORKFLOW_ID:'__noted_workflow_inbox__',
+    useWorkspaceStore:{getState:()=>state},organizationProjection,reconcileWorkflowOrder,INBOX_WORKFLOW_ID:'__noted_workflow_inbox__',
     ipcRenderer: ipc, Date, console: { log() {}, warn() {} },
     resolvePtyAgentOwner: () => null, isAiRuntimeTab: () => false, isAiBusyTab: () => false,
     clearPendingAutoTabTitle() {}, autoTabTitleIntents: new Map(),
@@ -137,7 +142,7 @@ function fixture(t, { foreign = false, count = 2 } = {}) {
   vm.runInContext(compile(persistenceCode + '\nmodule.exports = {closeTab:'+closeNode.initializer.getText(storeTree)
     +',saveTabs,refresh:'+refreshNode.initializer.getText(storeTree)+',updateCwd:'+cwdNode.initializer.getText(storeTree)+'};'), context);
   const actual=context.module.exports;state.closeTab=actual.closeTab;
-  const closeMembers=vm.runInNewContext(compile('module.exports = '+closeMembersNode.initializer.expression.getText(sidebarTree)),{
+  const closeMembers=vm.runInNewContext(compile('module.exports = '+closeMembersExpression.getText(sidebarTree)),{
     module:{exports:{}},isExactGroupCloseGuard,useWorkspaceStore:{getState:()=>state},
     ipcRenderer:{invoke:async(channel,args)=>{
       if(channel==='workflow:group-action')return api.groupActions.begin(args);

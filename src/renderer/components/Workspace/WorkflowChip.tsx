@@ -1,6 +1,8 @@
 import React, { forwardRef, useState, type HTMLAttributes, type ReactNode } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { PROJECT_CARD_MAX_H } from '../../constants/layout';
+import { Inbox } from 'lucide-react';
+import { INBOX_WORKFLOW_ID } from '../../utils/workflowMembership.mjs';
 
 type Props = Omit<HTMLAttributes<HTMLElement>, 'children'> & {
   as?: 'button' | 'span';
@@ -30,10 +32,12 @@ export default forwardRef<HTMLElement, Props>(function WorkflowChip({
   const fontSize = useUIStore(s => s.projectTabsFontSize);
   const hover = !disabled && (hovered ?? localHover);
   const active = selected || pending;
+  const inbox = workflowId === INBOX_WORKFLOW_ID;
   const Element = as;
   return <Element {...props} ref={ref as React.Ref<HTMLButtonElement & HTMLSpanElement>}
     {...(as === 'button' ? { type: 'button' as const, disabled, 'aria-pressed': selected } : {})}
     data-workflow-chip={workflowId}
+    data-workflow-inbox={inbox ? '1' : undefined}
     onMouseEnter={event => { setLocalHover(true); onMouseEnter?.(event); }}
     onMouseLeave={event => { setLocalHover(false); onMouseLeave?.(event); }}
     style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 5,
@@ -46,9 +50,14 @@ export default forwardRef<HTMLElement, Props>(function WorkflowChip({
         : navigationTarget ? 'rgba(139,92,246,0.14)' : hover ? 'rgba(255,255,255,0.055)' : 'transparent',
       border: '1px solid ' + (swapTarget ? 'rgba(167,139,250,0.95)' : active ? 'rgba(255,255,255,0.22)'
         : navigationTarget ? 'rgba(167,139,250,0.9)' : hover ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.08)'),
+      ...(inbox && !swapTarget && !navigationTarget ? {
+        color:active ? '#ffd9a7' : '#dfb078',
+        background:active ? 'rgba(240,144,24,0.2)' : hover ? 'rgba(240,144,24,0.14)' : 'rgba(240,144,24,0.06)',
+        borderColor:active ? 'rgba(240,144,24,0.65)' : 'rgba(240,144,24,0.28)',
+      }:{}),
       transform: pointerHeld ? 'scale(0.985)' : undefined, opacity: disabled ? 0.52 : 1, transition: 'none', ...style }}>
     {showIdentity && <>
-      {icon ? <img data-workflow-icon={workflowId} src={icon} alt="" draggable={false}
+      {inbox ? <Inbox data-workflow-inbox-icon aria-hidden size={16} style={{flexShrink:0,color:'#f0a34a'}}/> : icon ? <img data-workflow-icon={workflowId} src={icon} alt="" draggable={false}
         style={{ width: 16, height: 16, borderRadius: 4, objectFit: 'cover', flexShrink: 0 }} />
         : <span data-workflow-fallback-icon={workflowId} aria-hidden style={{ width: 16, height: 16, borderRadius: 4,
           display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,

@@ -62,7 +62,8 @@ export function latestCompletedHistoryResponseTiming(entries) {
   const source = Array.isArray(entries) ? entries : [];
   for (let index = source.length - 1; index >= 0; index -= 1) {
     const entry = source[index];
-    if (entry?.role !== 'assistant' || entry?.textPhase === 'commentary') continue;
+    if (entry?.role !== 'assistant' || entry?.textPhase === 'commentary'
+      || entry?.textPhase === 'partial_answer') continue;
     const hasFinalText = !!String(entry?.content || '').trim() || entry?.hasContent === true;
     if (!hasFinalText) continue;
     const timing = entry?.responseTiming;
@@ -118,12 +119,23 @@ export function resolveHistoryResponseTailTiming(activityTiming, entries) {
   return latestCompletedHistoryResponseTiming(entries);
 }
 
+// Presentation-only override. Never rewrites the underlying response interval
+// or attaches compact duration to a completed assistant response.
+export function historyCompactTailTiming(operation, { tabId, toolType, sessionId } = {}) {
+  if (operation?.active !== true || operation.phase !== 'compacting'
+    || operation.tabId !== tabId || operation.provider !== toolType
+    || (sessionId && operation.sessionId && operation.sessionId !== sessionId)
+    || typeof operation.startedAt !== 'number' || !Number.isFinite(operation.startedAt)) return null;
+  return { state: 'running', phase: 'compacting', intervalId: null,
+    startTs: operation.startedAt, endTs: null, durationMs: null };
+}
+
 export function historyResponseTailLabel(timing, now = Date.now()) {
   if (!timing) return null;
   const duration = formatHistoryResponseDuration(
     elapsedHistoryResponseDurationMs(timing, now),
   );
   return timing.state === 'running'
-    ? `Working · ${duration}`
+    ? `${timing.phase === 'compacting' ? 'Compacting' : 'Working'} · ${duration}`
     : `Worked · ${duration}`;
 }

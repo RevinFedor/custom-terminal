@@ -197,6 +197,12 @@ stream помечается gap и не засчитывается как parity
 не завершает весь turn и не меняет wire forwarding. Точный контракт —
 `fact-живой-ответ-в-history.md::Завершённый ответ без подтверждения после разрыва соединения`.
 
+Native steering может закончить Responses-сегмент `response.incomplete`,
+не закрывая WebSocket и не завершая весь ход. Client `response.interrupt` —
+только intent; отзыв незавершённого partial требует exact server response-id.
+Completed unconfirmed текст сохраняется. Шрам48 после672 и предел доказательства
+описаны в `fact-живой-ответ-в-history.md::Незавершённый фрагмент после native steering`.
+
 Port fallback имеет собственную гонку: неуспешный listen на занятом production
 порту раньше оставлял `listening` callback и после успешного retry мог объявить
 оба порта, отдав новой вкладке адрес чужого процесса. Каждая попытка теперь

@@ -4,13 +4,16 @@ import { useTabCompletionNotificationDismissing } from './TabSignals';
 export default function WorkflowActivityBadges({
   activeCount,
   busyCount,
+  inheritedBusyCount = 0,
   awaitingCount,
+  nonblockingQuestionCount = 0,
   completionNotificationCount,
-  active,
 }: {
   activeCount: number;
   busyCount: number;
+  inheritedBusyCount?: number;
   awaitingCount: number;
+  nonblockingQuestionCount?: number;
   completionNotificationCount: number;
   active: boolean;
 }) {
@@ -18,6 +21,10 @@ export default function WorkflowActivityBadges({
   const completionDismissing = useTabCompletionNotificationDismissing(hasCompletionNotification);
   return (
     <>
+      {nonblockingQuestionCount > 0 && awaitingCount === 0 && <span
+        data-workflow-codex-question-ring aria-hidden
+        className="tab-codex-question-ring noted-infinite-animation" style={{ zIndex: 3 }}/>
+      }
       {awaitingCount > 0 && (
         <span
           data-workflow-awaiting-ring
@@ -29,6 +36,8 @@ export default function WorkflowActivityBadges({
       {(hasCompletionNotification || completionDismissing) && (
         <span
           data-workflow-completion-ring
+          data-workflow-completion-count={completionNotificationCount || undefined}
+          title={`Готовых уведомлений: ${completionNotificationCount}`}
           className={`tab-completion-notification-alert absolute inset-0 rounded ${
             completionDismissing && !hasCompletionNotification
               ? 'tab-completion-notification-alert--dismiss'
@@ -38,68 +47,20 @@ export default function WorkflowActivityBadges({
           aria-hidden
         />
       )}
-      {activeCount > 0 && (
-        <span
-          data-workflow-active-count
-          title={`Запущено вкладок: ${activeCount}`}
-          className="relative flex items-center justify-center text-[10px] font-semibold rounded-full"
-          style={{
-            flexShrink: 0,
-            minWidth: 16,
-            height: 16,
-            padding: '0 4px',
-            borderRadius: 999,
-            backgroundColor: active ? 'rgba(74, 222, 128, 0.30)' : 'rgba(74, 222, 128, 0.20)',
-            color: active ? '#86efac' : '#4ade80',
-            boxSizing: 'border-box',
-            fontVariantNumeric: 'tabular-nums',
-          }}
-        >
-          {activeCount}
-        </span>
-      )}
-      {busyCount > 0 && (
-        <span
-          data-workflow-busy-count
-          title={`Сейчас работают: ${busyCount}`}
-          className="relative flex items-center justify-center text-[10px] font-semibold rounded-full"
-          style={{
-            flexShrink: 0,
-            minWidth: 16,
-            height: 16,
-            padding: '0 4px',
-            borderRadius: 999,
-            backgroundColor: active ? 'rgba(245, 158, 11, 0.28)' : 'rgba(245, 158, 11, 0.18)',
-            color: active ? '#fbbf24' : '#f59e0b',
-            boxShadow: 'inset 0 0 0 1.5px #f59e0b',
-            boxSizing: 'border-box',
-            fontVariantNumeric: 'tabular-nums',
-          }}
-        >
-          {busyCount}
-        </span>
-      )}
-      {completionNotificationCount > 0 && (
-        <span
-          data-workflow-completion-count
-          title={`Готовых уведомлений: ${completionNotificationCount}`}
-          className="relative flex items-center justify-center text-[10px] font-semibold rounded-full"
-          style={{
-            zIndex: 5,
-            flexShrink: 0,
-            minWidth: 16,
-            height: 16,
-            padding: '0 4px',
-            borderRadius: 999,
-            backgroundColor: active ? 'rgba(239, 68, 68, 0.30)' : 'rgba(239, 68, 68, 0.20)',
-            color: active ? '#fecaca' : '#f87171',
-            boxSizing: 'border-box',
-            fontVariantNumeric: 'tabular-nums',
-          }}
-        >
-          {completionNotificationCount}
-        </span>
-      )}
+      {(activeCount > 0 || inheritedBusyCount > 0 || busyCount > 0) && <span
+        data-workflow-activity-counts
+        style={{ position: 'absolute', top: 0, right: 0, transform: 'translateY(-50%)',
+          display: 'inline-flex', alignItems: 'center', gap: 2, zIndex: 5,
+          fontSize: 'max(10px, 0.9em)', lineHeight: 1, fontWeight: 500, fontVariantNumeric: 'tabular-nums',
+          // Text alone straddles the grey/black boundary; no pill or border.
+          textShadow: '0 1px 1px rgba(0,0,0,0.75)' }}>
+        {activeCount > 0 && <span data-workflow-active-count title={`Свободные запущенные вкладки: ${activeCount}`}
+          style={{ color: '#4ade80' }}>{activeCount}</span>}
+        {inheritedBusyCount > 0 && <span data-workflow-inherited-count title={`Ожидают дочерних исполнителей: ${inheritedBusyCount}`}
+          style={{ color: '#9b6dff' }}>{inheritedBusyCount}</span>}
+        {busyCount > 0 && <span data-workflow-busy-count title={`Сейчас работают: ${busyCount}`}
+          style={{ color: '#f59e0b' }}>{busyCount}</span>}
+      </span>}
     </>
   );
 }

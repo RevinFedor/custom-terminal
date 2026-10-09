@@ -192,6 +192,10 @@ committed кадру того же интерактивного меню пос�
 идут разными путями. `send_message`/`reply_to_message` сохраняют адресную связь
 вопроса и ответа, не ожидая final занятого владельца; `get_message` читает одну
 пару для диагностики. Контракт — `fact-tab-messages.md`.
+`accepted:true` подтверждает сохранение сообщения приложением; о доставке можно
+отчитываться только при `deliveryState:sent`. Pending/queued/error сохраняют
+свой смысл в финальном отчёте агента. Reply может быть записан и доступен через
+`get_message`, хотя обратный ввод в остановленную сессию не произошёл.
 Низкоуровневый `send_prompt` пользуется provider queue общего send-сценария
 и сам не создаёт отношения «вопрос → адресный ответ». В `delegate_to_session`
 `queue:true` означает долговечное ожидание освобождения target в приложении:
@@ -212,6 +216,23 @@ benchmark. Обе exact квитанции confirmed; runId у них отсут
 с вручную вписанным return-tab.
 
 `send_prompt` / `Status: sent` — это delivery-only сигнал. Для остановленной или восстановленной вкладки он включает ожидание запуска; завершения ответа не ждёт. Pending/unknown проверяются через get_send_receipt, не новым Send. Для ручной инспекции уже открытой сессии history-tools того же Terminal MCP читают `list_open_sessions` → `busy/status` → targeted turn/text. Для долгой делегации этот цикл запрещён: `delegate_to_session` создаёт persistent run, после чего текущий assistant-turn заканчивается. Новый completion обычно уже содержит полный проверенный ответ: его используют напрямую. `get_delegation_result` нужен при явном omitted/reference, старом техническом уведомлении либо адресном восстановлении. Чтение result/status/transcript циклом до уведомления не доказывает штатный flow. Так 30-минутный turn не держит HTTP/MCP-вызов и переживает restart.
+
+`wait_for_tab_response({tabId,runId?,waitForDescendants?})` наблюдает уже идущую
+работу существующей Claude/Codex PTY-вкладки, не отправляя ей prompt и не
+запуская её. Source берётся из полной MCP-сессии, не из текста модели. Вызов
+типизированно оборачивает `POST /api/terminal-tabs/:tabId/response-observations`
+с `sourceTabId/runId`; до ACK приложение сохраняет `runKind=response-observation`.
+По умолчанию ждёт подтверждённого idle и окончания связанной работы, затем
+выбирает последний ответ. `waitForDescendants:false` у busy target закрепляет
+точный текущий provider-turn, не следующий. Уже idle target читается без нового
+запуска. После accepted модель заканчивает ход; ответ приходит обычным completion,
+а `get_delegation_result` нужен только для явного reference/восстановления.
+`cancel_delegation({runId,interrupt:false})` отменяет только наблюдение;
+`interrupt:true` для него отклоняется. Требуются live tool и
+`/api/me.capabilities.responseObservations.version=1`; старый app отвечает
+update-required без Send/polling fallback. После потери ACK сохраняются тот же
+runId и неизменные аргументы. Точное чтение, ошибки и persistence описаны в
+fact-оркестрация-вкладок::Наблюдение уже выполняющейся работы.
 
 При явном восстановлении после Build Install проверяется весь обмен, а не только
 запуск CLI или доставка нового «продолжай» родителю. Shutdown snapshot перечисляет
@@ -953,6 +974,15 @@ project. Явный same-project `projectId` служит routing hint и не �
 
 `placement:child|root` по-прежнему означает visual hierarchy в sidebar.
 `windowTarget` означает геометрию workspace. Эти оси независимы.
+
+В workflow-режиме отсутствие `windowTarget` оставляет нового исполнителя в
+резерве workflow источника; execution namespace не задаёт эту принадлежность.
+`reservedTabId` — заранее выбранный ID НОВОЙ вкладки, а не основание для restore:
+до provider launch он проходит обычное создание subject и membership. Шрам09.10:
+подстановка reservation в `restoreId` пропускала эту запись; сессия запускалась,
+но workflow-sidebar её не видел. Настоящий cold/archive restore сохраняет свой
+прежний durable subject и не создаёт ещё один. Ремонт новых созданий сам по себе
+не регистрирует ранее возникшие legacy-вкладки без membership.
 
 ## Контекстные файлы без чтения вызывающим агентом
 

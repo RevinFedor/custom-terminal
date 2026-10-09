@@ -9,6 +9,14 @@ import {
 } from './timelineMarkerPresentation.mjs';
 import { projectTimelineSentHandoff, mergeTimelineEntriesWithSentHandoffs } from './timelineTranscriptRefresh.mjs';
 
+test('Continue and Loop have ordinary non-diamond marker semantics, not fake MCP or context recovery',()=>{
+  const retry={type:'user',content:'continue',semanticTags:[{kind:'prompt-origin',source:'system',systemSource:'codex-capacity-retry'}]};
+  assert.equal(timelineMarkerKind(retry),'continue');
+  assert.equal(timelineMarkerKind({semanticTags:[{kind:'prompt-origin',source:'loop'}]}),'loop');
+  assert.equal(timelineMarkerKind({type:'user',content:'continue'}),'ordinary');
+  assert.equal(timelineMarkerKind({...retry,semanticTags:[{kind:'prompt-origin',source:'system',systemSource:'build-install-return'}]}),'system');
+});
+
 test('SC channel comes only from an exact external research tag, not its model or quoted text', () => {
   const tag = { kind: 'orchestration', runId: 'run', runKind: 'external-research', phase: 'completion' };
   for (const targetTabName of ['ChatGPT - 6-astra', 'Another model', undefined]) {

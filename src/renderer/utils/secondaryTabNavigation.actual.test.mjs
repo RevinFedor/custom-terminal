@@ -39,7 +39,8 @@ function boundary() {
     calls.push({ tabId, options });
     return new Promise(done => { resolve = done; });
   } };
-  return { calls, useWorkspaceStore: { getState: () => store }, finish: value => resolve(value) };
+  return { calls, useWorkspaceStore: { getState: () => store }, finish: value => resolve(value),
+    openingLinkedRuns:{current:new Set()},setOpeningLinkedRunIds(){},setActionError(){} };
 }
 
 test('actual orchestration link awaits successful navigation before ACK and passes both legacy hints', async () => {
@@ -55,11 +56,54 @@ test('actual orchestration link awaits successful navigation before ACK and pass
     assert.equal(h.calls[0].tabId, 'target');
     assert.equal(h.calls[0].options.projectId, 'stale');
     assert.equal(h.calls[0].options.projectPath, '/legacy');
+    assert.equal(h.calls[0].options.sourceTabId, 'source');
     assert.deepEqual(acknowledgements, []);
     h.finish(result);
     await pending;
     assert.equal(acknowledgements.length, result ? 1 : 0);
     if (result) assert.equal(acknowledgements[0][0], 'orchestration:acknowledge');
+  }
+});
+
+test('actual global Run After node waits for root navigation before changing input focus',async()=>{
+  for(const result of [false,true]) {
+    const h=boundary(),effects=[];
+    const navigate=callback('../components/Workspace/GlobalRunAfterControl.tsx','navigate',{
+      ...h,tab:{id:'target',projectId:'namespace'},
+      useUIStore:{getState:()=>({setActiveArea:area=>effects.push(area)})},
+      requestTabPrimaryInputFocus:(...args)=>effects.push(args),
+    });
+    const pending=navigate();
+    assert.equal(h.calls[0].tabId,'target');assert.equal(h.calls[0].options.reason,'global-run-after-tab');
+    assert.deepEqual(effects,[]);h.finish(result);await pending;
+    assert.deepEqual(effects,result?['workspace',['target','global-run-after-tab']]:[]);
+  }
+});
+
+test('actual file session chip uses root navigation without eagerly switching the namespace or tab',async()=>{
+  const ast=parse('../components/Workspace/Sidebar.jsx');
+  const element=find(ast,n=>ts.isJsxOpeningElement(n) && n.attributes.properties.some(prop=>
+    ts.isJsxAttribute(prop) && prop.name.getText(ast)==='data-file-session-chip'));
+  const click=element.attributes.properties.find(prop=>prop.name?.getText(ast)==='onClick').initializer.expression;
+  for(const result of [false,true]) {
+    const h=boundary();let stopped=0;
+    const navigate=evaluate(click.getText(ast),{...h,linkOwnerProjectId:'namespace',chip:{sessionTabId:'target'}});
+    const pending=navigate({stopPropagation(){stopped++;}});
+    assert.equal(stopped,1);assert.equal(h.calls[0].tabId,'target');
+    assert.equal(h.calls[0].options.reason,'file-session-chip');h.finish(result);await pending;
+  }
+});
+
+test('actual MCP popup stays open on failed navigation and closes only after success',async()=>{
+  const ast=parse('../components/StatusBar.tsx');
+  const prop=find(ast,n=>ts.isJsxAttribute(n) && n.name.getText(ast)==='onFocusTarget');
+  for(const result of [false,true]) {
+    const changes=[];let resolve;
+    const handler=evaluate(prop.initializer.expression.getText(ast),{
+      focusMcpTarget:()=>new Promise(done=>{resolve=done;}),setOpen:value=>changes.push(value),
+    });
+    const pending=handler({tabId:'target'});assert.deepEqual(changes,[]);
+    resolve(result);await pending;assert.deepEqual(changes,result?[false]:[]);
   }
 });
 

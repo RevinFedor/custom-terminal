@@ -5,14 +5,15 @@ export const HISTORY_COMPOSER_PROMPT_CHIP_MAX_WIDTH_PX = 168;
 const compactNumber = (value) => String(Number(value.toFixed(6)));
 
 /**
- * Flex-wrap keeps the user's row-major left-to-right order. Limiting every
- * item to one `columns` share guarantees that all items fit in at most three
- * rows, while naturally short chips can still let more neighbours share a row.
+ * Small sets first share one left-to-right row, shortening long labels rather
+ * than putting two independent prompts in a vertical stack. Larger sets keep
+ * the existing three-row bound; naturally short chips can share more slots.
  */
 export function resolveHistoryComposerPromptBandLayout(rawCount) {
   const itemCount = Math.max(0, Math.floor(Number(rawCount) || 0));
   const columns = Math.max(
     1,
+    Math.min(itemCount, 3),
     Math.ceil(itemCount / HISTORY_COMPOSER_PROMPT_BAND_MAX_ROWS),
   );
   const widthPercent = 100 / columns;
@@ -27,4 +28,3 @@ export function resolveHistoryComposerPromptBandLayout(rawCount) {
     maxHeight: `calc(${compactNumber(HISTORY_COMPOSER_PROMPT_BAND_MAX_ROWS * 1.2)}em + ${HISTORY_COMPOSER_PROMPT_BAND_MAX_ROWS * 4 + (HISTORY_COMPOSER_PROMPT_BAND_MAX_ROWS - 1) * HISTORY_COMPOSER_PROMPT_BAND_GAP_PX}px)`,
   };
 }
-

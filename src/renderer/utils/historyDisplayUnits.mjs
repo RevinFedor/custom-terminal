@@ -32,6 +32,7 @@ import {
   historyActionPresentationMeta,
   historyDisplayPath,
 } from '../../shared/history-action-grammar.mjs';
+import textPhases from '../../shared/history-text-phase.cjs';
 
 /** Short digest subject for a hydrated action — mirrors main's stubActionSubject. */
 function hydratedSubject(raw, presentation = null) {
@@ -242,6 +243,8 @@ export function groupThinkingSeconds(entries) {
   return total;
 }
 
+const isStandaloneAnswer = (entry) => textPhases.isStandaloneHistoryAnswerPhase(entry?.textPhase);
+
 const entryHasText = (entry) => {
   if (entry?.hasContent === true) return true;
   return typeof entry?.content === 'string' && entry.content.trim().length > 0;
@@ -274,8 +277,8 @@ export function isCaptionForNext(entry, nextEntry) {
   if (contentLength(entry) > HISTORY_CAPTION_MAX_CHARS) return false;
   if (!isObject(nextEntry) || nextEntry.role !== 'assistant') return false;
   if (entryActionFacts(nextEntry).length === 0) return false;
-  // Codex's final answer is the one text that must NEVER glue to what follows.
-  if (entry.textPhase === 'final_answer') return false;
+  // Stable answer fragments stay readable independently even when tools follow.
+  if (isStandaloneAnswer(entry)) return false;
   // Everything else: a short text immediately before a call IS that call's
   // headline. Earlier this also demanded structural proof (shared messageId /
   // commentary phase), and rows without it — Claude splits text and tool_use
@@ -296,7 +299,7 @@ function latestHistoryGroupCaptionEntry(entries, fallback = null) {
   let latest = fallback;
   for (const entry of (Array.isArray(entries) ? entries : [])) {
     if (!isObject(entry) || entry.role !== 'assistant') continue;
-    if (!entryHasText(entry) || entry.textPhase === 'final_answer') continue;
+    if (!entryHasText(entry) || isStandaloneAnswer(entry)) continue;
     if (contentLength(entry) > HISTORY_CAPTION_MAX_CHARS) continue;
     latest = entry;
   }
@@ -632,7 +635,7 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
             && entryActionFacts(pocketRow).length === 0
             && entryHasText(pocketRow)
             && contentLength(pocketRow) <= HISTORY_CAPTION_MAX_CHARS
-            && pocketRow.textPhase !== 'final_answer'
+            && !isStandaloneAnswer(pocketRow)
           ) {
             probe += 1;
             continue;
@@ -846,7 +849,7 @@ function isGroupingConnectorRow(entry) {
     && entryHasText(entry)
     && entryActionFacts(entry).length === 0
     && contentLength(entry) <= HISTORY_CAPTION_MAX_CHARS
-    && entry.textPhase !== 'final_answer';
+    && !isStandaloneAnswer(entry);
 }
 
 /**

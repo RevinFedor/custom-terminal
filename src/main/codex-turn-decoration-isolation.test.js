@@ -114,7 +114,7 @@ test('the tab timer is closed by the same signal that clears busy', () => {
 test('parallel v2 children bind by the spawn event id, never by first empty slot', () => {
   const body = functionBody('trackCodexTabSubagentActivity');
   assert.ok(body.includes("const eventId = String(payload.event_id || '')"));
-  assert.ok(body.includes('live.has(eventId)'));
+  assert.ok(body.includes('known.has(eventId)'));
   assert.equal(
     body.includes('value.taskName === agentPath || !value.threadId'),
     false,
@@ -129,10 +129,9 @@ test('main publishes exact active-agent identities with the background count', (
 
 test('a spawn attempt becomes live only after provider identity proof', () => {
   const body = functionBody('trackCodexTabSubagentActivity');
-  const spawnBranch = body.slice(
-    body.indexOf("type === 'function_call' && payload.name === 'spawn_agent'"),
-    body.indexOf("type === 'function_call_output'"),
-  );
+  const start = body.indexOf("type === 'function_call' && nativeName === 'spawn_agent'");
+  assert.ok(start >= 0, 'find the normalized spawn branch, not an unrelated outer output');
+  const spawnBranch = body.slice(start, body.indexOf("} else if (type === 'function_call_output'", start));
   assert.ok(spawnBranch.includes('known.set(key, descriptor)'));
   assert.equal(spawnBranch.includes('live.set(key, descriptor)'), false);
   assert.ok(body.includes('live.set(callId, entry)'));

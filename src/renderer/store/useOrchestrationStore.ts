@@ -71,7 +71,7 @@ export type OrchestrationResultErrorCode =
 
 export type OrchestrationRun = {
   runId: string;
-  runKind?: 'agent' | 'external-research';
+  runKind?: 'agent' | 'external-research' | 'response-observation';
   label?: string;
   status: OrchestrationStatus;
   outcome?: OrchestrationOutcome | null;

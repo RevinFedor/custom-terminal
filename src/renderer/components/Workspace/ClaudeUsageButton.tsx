@@ -288,7 +288,8 @@ function storeClaudeUsageAccountKey(value: string | null) {
   storeUsageAccountKey(CLAUDE_USAGE_ACCOUNT_STORAGE_KEY, value);
 }
 
-const CODEX_USAGE_IPC_DEADLINE_MS = 12_000;
+// Leave room for the physical15s request, profile auth and3s branch proof.
+const CODEX_USAGE_IPC_DEADLINE_MS = 25_000;
 const CLAUDE_USAGE_IPC_DEADLINE_MS = 12_000;
 const USAGE_DETAILS_IPC_DEADLINE_MS = 12_000;
 const CODEX_USAGE_POLL_INTERVAL_MS = 30_000;
@@ -698,7 +699,7 @@ function UsagePopoverTopRow({
 function UsageSourceRefreshRow({
   sourceText,
   loading,
-  errorFlash,
+  refreshError,
   refreshDisabled,
   refreshTitle,
   onRefresh,
@@ -706,12 +707,16 @@ function UsageSourceRefreshRow({
 }: {
   sourceText: string;
   loading: boolean;
-  errorFlash: boolean;
+  refreshError: string | null;
   refreshDisabled: boolean;
   refreshTitle: string;
   onRefresh: () => void;
   actions?: ReactNode;
 }) {
+  const failed = !!refreshError;
+  const title = refreshError
+    ? `${refreshTitle}. Последнее обновление не удалось: ${refreshError}`
+    : refreshTitle;
   return (
     <div style={{
       minHeight: 36,
@@ -742,11 +747,14 @@ function UsageSourceRefreshRow({
             onRefresh();
           }}
           disabled={refreshDisabled}
-          title={refreshTitle}
+          title={title}
+          aria-label={title}
+          aria-busy={loading}
+          data-usage-refresh-state={failed ? 'error' : loading ? 'loading' : 'idle'}
           style={{
             background: 'transparent',
             border: 'none',
-            color: refreshDisabled ? '#555' : '#888',
+            color: failed ? '#f87171' : refreshDisabled ? '#555' : '#888',
             cursor: refreshDisabled ? 'default' : 'pointer',
             padding: 2,
             display: 'inline-flex',
@@ -758,9 +766,6 @@ function UsageSourceRefreshRow({
         >
           <RefreshCw size={11} className="noted-infinite-animation" style={{
             animation: loading ? 'spin 1s linear infinite' : 'none',
-            color: errorFlash && !loading ? '#f87171' : undefined,
-            filter: errorFlash && !loading ? 'drop-shadow(0 0 3px rgba(248,113,113,0.5))' : 'none',
-            transition: 'color 0.15s ease-out, filter 0.15s ease-out',
           }} />
           {loading ? 'updating' : 'refresh'}
         </button>
@@ -1187,7 +1192,6 @@ function ClaudeUsageChip({
   // Timestamp последней live-попытки (от backend). Banner показывает «Xs ago»,
   // чтобы юзер видел, что force-refresh реально стрельнул, даже если та же
   // ошибка вернулась.
-  const [lastAttemptAt, setLastAttemptAt] = useState<number | null>(null);
   const { target: refreshFailureTarget, clear: clearRefreshFailureFlash,
     flash: flashRefreshFailure } = useUsageRefreshFailureFlash();
   const refreshSeqRef = useRef(0);
@@ -1250,9 +1254,6 @@ function ClaudeUsageChip({
         setNotice(selected?.notice || (selectedMatchesResponse ? res?.notice : null) || null);
         flashRefreshFailure(failureKey, flashTarget);
       }
-      const selectedAttemptAt = selected?.lastAttemptAt
-        || (selectedMatchesResponse ? res?.lastAttemptAt : null);
-      if (typeof selectedAttemptAt === 'number') setLastAttemptAt(selectedAttemptAt);
       const weekly = selectedUsage?.seven_day?.utilization ?? null;
       const fiveHour = selectedUsage?.five_hour?.utilization ?? null;
       const fable = selectedUsage?.model_scoped?.find(
@@ -1369,7 +1370,7 @@ function ClaudeUsageChip({
   const hasCurrentAccount = !!currentAccountKey
     && accounts.some((account) => account.accountKey === currentAccountKey);
   const canRetryMissingCurrentAccount = !!currentAccountKey && !hasCurrentAccount;
-  const selectedStale = selectedAccount?.stale ?? stale;
+  const selectedStale = !!error || (selectedAccount?.stale ?? stale);
   const compactStale = compactAccount?.stale ?? selectedStale;
   const selectedSource = selectedAccount?.source || source;
   const snapshotTimestamp = selectedAccount?.timestamp || lastSuccessAt || null;
@@ -1519,7 +1520,7 @@ function ClaudeUsageChip({
           <UsageSourceRefreshRow
             sourceText={claudeSourceText}
             loading={loading}
-            errorFlash={refreshFailureTarget === 'detail' || refreshFailureTarget === 'both'}
+            refreshError={error}
             refreshDisabled={refreshDisabled}
             refreshTitle={selectedAccount && !selectedIsCurrent
               ? (canRetryMissingCurrentAccount
@@ -1528,17 +1529,6 @@ function ClaudeUsageChip({
               : 'Refresh Claude usage'}
             onRefresh={() => refresh(true)}
           />
-
-          {error && !detailData && (
-            <div style={{ padding: '12px', fontSize: 11, color: '#f87171' }}>
-              {error}
-              <div style={{ marginTop: 6, color: '#666' }}>
-                {isApiPlatformAccount
-                  ? 'Check the Claude API key stored by Claude Code.'
-                  : <>Sign in via <code>claude</code> CLI first.</>}
-              </div>
-            </div>
-          )}
 
           {isApiPlatformAccount && !detailData && !error && (
             <div style={{
@@ -1660,33 +1650,6 @@ function ClaudeUsageChip({
             </>
           )}
 
-          {error && detailData && (() => {
-            const ageMs = lastAttemptAt ? Date.now() - lastAttemptAt : null;
-            const ageLabel = ageMs == null
-              ? null
-              : ageMs < 5_000
-                ? 'just now'
-                : ageMs < 60_000
-                  ? `${Math.round(ageMs / 1000)}s ago`
-                  : `${Math.round(ageMs / 60_000)}m ago`;
-            const fresh = ageMs != null && ageMs < 2000;
-            return (
-              <div
-                key={lastAttemptAt ?? 0}
-                style={{
-                  padding: '6px 12px',
-                  fontSize: 10,
-                  color: '#f87171',
-                  borderTop: '1px solid rgba(255,255,255,0.07)',
-                  animation: fresh ? 'flash-fail 0.45s ease-out' : 'none',
-                }}
-              >
-                <span style={{ color: '#888' }}>Last attempt {ageLabel || '—'}:</span>{' '}
-                <span>{error}</span>
-              </div>
-            );
-          })()}
-
         </>,
         popoverHost
       )}
@@ -1707,10 +1670,6 @@ function ClaudeUsageChip({
         .usage-provider-trigger:not([aria-expanded="true"]):hover {
           background: rgba(255,255,255,0.10) !important;
           border-color: rgba(255,255,255,0.22) !important;
-        }
-        @keyframes flash-fail {
-          0%   { background: rgba(248,113,113,0.22); }
-          100% { background: transparent; }
         }
         @media (max-width: 1100px) {
           .usage-provider-reset {
@@ -2065,7 +2024,7 @@ function CodexUsageChip({
         const weeklyPct = usage?.seven_day?.utilization ?? null;
         const fiveHourPct = usage?.five_hour?.utilization ?? null;
         console.log(
-          `[CodexUsage] refresh ok source=${selected?.source || res.source || 'unknown'} account=${selected?.label || 'latest'} fetched=${responseSelected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} refreshing=0 stale=${(selected?.stale ?? res.stale) ? 1 : 0} force=${force} reason=${request.reason || 'default'} session=${activeCodexSessionId ? activeCodexSessionId.slice(0, 8) : 'none'}`
+          `[CodexUsage] refresh ${responseError ? 'failed' : 'ok'} source=${selected?.source || res.source || 'unknown'} account=${selected?.label || 'latest'} fetched=${responseSelected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} refreshing=0 stale=${(selected?.stale ?? res.stale) ? 1 : 0} force=${force} reason=${request.reason || 'default'} session=${activeCodexSessionId ? activeCodexSessionId.slice(0, 8) : 'none'}`
         );
       } else {
         setError(res?.error || 'Failed to read Codex usage');
@@ -2291,7 +2250,7 @@ function CodexUsageChip({
   const resetTextColor = '#bbb';
   const compactAccountLabel = compactAccount?.label || null;
   const selectedSource = selectedAccount?.source || source;
-  const selectedStale = selectedAccount?.stale ?? stale;
+  const selectedStale = !!error || (selectedAccount?.stale ?? stale);
   const compactStale = compactAccount?.stale ?? selectedStale;
   const selectedIsCurrent = !!selectedAccount?.accountKey
     && (selectedAccount.isCurrent || selectedAccount.accountKey === currentAccountKey);
@@ -2614,7 +2573,7 @@ function CodexUsageChip({
           <UsageSourceRefreshRow
             sourceText={codexSourceText}
             loading={refreshVisualLoading}
-            errorFlash={refreshFailureTarget === 'detail' || refreshFailureTarget === 'both'}
+            refreshError={error}
             refreshDisabled={refreshDisabled}
             refreshTitle={selectedAccount && !selectedIsConnected
               ? (canRetryMissingCurrentAccount
@@ -2632,9 +2591,9 @@ function CodexUsageChip({
             onCancelLogin={cancelProfileLogin}
           />
 
-          {(error || warning) && (
-            <div style={{ padding: '8px 12px', fontSize: 11, color: error ? '#f87171' : '#d6a34a' }}>
-              {error || warning}
+          {warning && (
+            <div style={{ padding: '8px 12px', fontSize: 11, color: '#d6a34a' }}>
+              {warning}
             </div>
           )}
 
@@ -2660,11 +2619,11 @@ function CodexUsageChip({
               )}
               <CodexCreditBalanceRow credits={usageData.credits} expiration={selectedAccount?.credit_expiration} />
             </>
-          ) : !error ? (
+          ) : (
             <div style={{ padding: '12px', fontSize: 11, color: '#666' }}>
               No Codex limit sample yet.
             </div>
-          ) : null}
+          )}
 
           <CodexResetCreditsSection snapshot={resetCredits} connected={selectedIsConnected} />
 

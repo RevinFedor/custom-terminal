@@ -598,6 +598,21 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
    tab-ai-busy-pulse, --ai-pulse-* vars) was removed: the loader is the
    переливающаяся полоска у края. See fact-process-bar.md::AIPulse removed. */
 
+/* Optional Codex input never replaces the working signal. The opaque base
+   ring remains visible; only its glow plate varies, not the tab/text opacity. */
+.tab-codex-question-ring {
+  position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  box-shadow: inset 0 0 0 1px rgba(167,139,250,.38);
+}
+.tab-codex-question-ring::after {
+  content: ''; position: absolute; inset: 0; border-radius: inherit;
+  box-shadow: inset 0 0 0 1px rgba(192,159,255,.48), inset 0 0 5px rgba(139,92,246,.15);
+  animation: codex-question-glow 2.6s ease-in-out infinite;
+  animation-play-state: inherit;
+}
+@keyframes codex-question-glow { 0%,100% { opacity:.18; } 50% { opacity:1; } }
+@media (prefers-reduced-motion: reduce) { .tab-codex-question-ring::after { animation:none; opacity:.5; } }
+
 /* Awaiting-user-input (AskUserQuestion) — Claude задал вопрос и ЖДЁТ ответа.
    НЕ заливаем фон (это читалось как «AI думает» и слепило). Вместо этого —
    тонкая бегущая рамка 1.2px: яркий фиолетовый сегмент ходит по периметру таба

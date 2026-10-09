@@ -129,7 +129,11 @@ class HistoryFreshness {
         // on both sides, and the producer must remain alive through validation.
         const withoutReader = value => { const { reader: _reader, ...rest } = value; return rest; };
         const stable = equal(withoutReader(ticket.context), withoutReader(context)) && equal(context, after) && readerMatches
-          && validation.unchanged && directoryMatches;
+          && validation.unchanged && directoryMatches
+          // A watcher may invalidate after the source stat, while the final
+          // context is still awaiting delivery. That older page is not proof
+          // for the newer event, even when its metadata remains identical.
+          && ticket.event === (this.events.get(scope.tabId) || 0);
         this.remember(scope, sources, after, stable, dirNow);
         if (!stable) return unknown('changed-during-read');
         return this.known(scope, sources, after, dirNow);

@@ -7,6 +7,7 @@ import { resolveTabCardBackground } from '../../utils/tabCardVisual.mjs';
 import { requestRowLinkStyle } from './RequestTrackerRow';
 import { cancelTabMessageSourceJump, jumpToTabMessageSource } from '../../utils/tabMessageSourceJump';
 import { useUIStore } from '../../store/useUIStore';
+import './TabMessageSourceChip.css';
 const { ipcRenderer } = window.require('electron');
 
 type Source = { sourceTabId: string; sourceTabName?: string | null; sourceProjectId?: string | null; messageId?: string };
@@ -43,18 +44,18 @@ export function HistoryPromptSource({ source, phase, onNavigate }: {
     } finally { setJumping(false); }
   };
   const direction = incoming ? 'incoming-request' : 'response';
-  const iconStyle = { display: 'grid', placeItems: 'center', width: 24, height: 24, flexShrink: 0, color: '#a3a3a3' };
+  const iconStyle = { display: 'grid', placeItems: 'center', width: 24, height: 24, flexShrink: 0 };
   return <div data-history-tab-message-source style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, marginBottom: 6 }}>
-    {Icon && (source.messageId && source.sourceTabId ? <button type="button"
+    {Icon && (source.messageId && source.sourceTabId ? <button type="button" className="history-message-source-jump"
       data-history-source-direction={direction} data-tab-message-source-jump={source.messageId}
       aria-label={`Перейти к вызову MCP: ${source.sourceTabName || source.sourceTabId}`} aria-busy={jumping}
       title="Перейти к исходному вызову MCP" onMouseDown={event => event.stopPropagation()}
       onClick={event => { event.stopPropagation(); void jump(); }}
-      style={{ ...iconStyle, padding: 0, border: 0, borderRadius: 4, background: 'transparent', cursor: 'pointer' }}>
+      style={{ ...iconStyle, padding: 0, border: 0, borderRadius: 4, cursor: 'pointer' }}>
       <Icon size={14} strokeWidth={2.2} aria-hidden="true" />
     </button> : <span data-history-source-direction={direction}
       title={incoming ? 'Запрос к вам' : 'Ответ на ваш запрос'}
-      style={iconStyle}>
+      style={{ ...iconStyle, color: '#a3a3a3' }}>
       <Icon size={14} strokeWidth={2.2} aria-hidden="true" />
     </span>)}
     {source.sourceTabId ? <TabMessageSourceChip source={source as Source} onNavigate={onNavigate} />

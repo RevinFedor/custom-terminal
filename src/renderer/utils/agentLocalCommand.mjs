@@ -26,6 +26,12 @@ export function projectAgentLocalCommandSendResult({
       requiresAuditIdentity: false,
       queueStatus: null,
       deliveryUnconfirmed: false,
+      // An exact Main-owned, never-entered control insertion stays guarded
+      // until clear/takeover. Restoring the author's History copy does not
+      // grant Enter or let another send append to that retained native input.
+      ...(result.enterWritten === false && result.slashInserted === true
+        && (result.slashRollback?.cleared === true || result.slashRollback?.serviceInputPending === true)
+        ? { restoreDraftSafe: true } : {}),
     };
   }
   if (result?.success === true) {

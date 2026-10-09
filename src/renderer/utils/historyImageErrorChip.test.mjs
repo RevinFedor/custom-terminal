@@ -24,6 +24,13 @@ test('the actual History token keeps the chip and marks an unavailable image red
   assert.match(html, /hp-history-attachment-chip/);
   assert.match(html, /color:#f87171/);
   assert.match(html, /image #1/);
-  const imageBranch = source.slice(source.indexOf('const partKey = `image:${index}:${part.id}`'));
-  assert.match(imageBranch, /AIComposerImageAttachmentPreview[\s\S]*?error=\{expandedImagePart === part[\s\S]*?imageError/);
+  const imageStart = source.indexOf('const partKey = `image:${index}:${part.id}`');
+  const imageBranch = source.slice(imageStart, source.indexOf('const HistoryUserEntry = memo', imageStart));
+  assert.match(imageBranch, /HistoryComposerToken[\s\S]*?error=\{!!imageError\}/);
+  // The chip still owns its own error; the stable gallery portal owns the
+  // selected image's error, including after arrows change its source.
+  assert.match(imageBranch, /const previewError = expandedImagePart\?\.error \|\| composerImagePreviewError\(expandedImageRef\)/);
+  assert.match(imageBranch, /\|\| imageDetailPreview\.error[\s\S]*?!expandedImageRef/);
+  assert.match(imageBranch, /AIComposerImageAttachmentPreview[\s\S]*?error=\{previewError\}/);
+  assert.match(imageBranch, /path=\{expandedImageRef\?\.path\}[\s\S]*?assetId=\{expandedImageRef\?\.assetId\}/);
 });

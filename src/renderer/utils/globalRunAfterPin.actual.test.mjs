@@ -46,6 +46,7 @@ function fixture() {
     pagesRef: { current: null }, globalRunAfterMinimumWidth: () => 300,
     PANEL_MARGIN: 8, PANEL_MIN_W: 300, clamp: (v, lo, hi) => Math.max(lo, Math.min(hi, v)),
     pointInHoverCluster, pointInRect, queueHoverSatelliteRects: () => [], startResizeGesture: (_e, options) => { ctx.gesture = options; },
+    hasOwnedClickPopup: () => ctx.childOpen === true,
     setPanelSize: (size) => { ctx.panelSize = size; calls.push('size'); },
     setEditorGestureActive: (active) => { ctx.editorGestureActive = active; calls.push('gesture:' + active); },
     setEditorState: (state) => { ctx.editorState = state; calls.push('editor'); },
@@ -203,4 +204,16 @@ test('viewport backdrops are not part of hover geometry', () => {
   const recheckSource = source.slice(source.indexOf('const recheckPreviewHover'), source.indexOf('const recheckPreviewHoverRef'));
   assert.doesNotMatch(recheckSource, /data-run-after-picker-overlay/);
   assert.match(source, /owners\.has\(element\.dataset\.runAfterHoverOwner\)/);
+});
+
+test('a click-open owned child holds the preview by state and releases back to normal hover', () => {
+  const { ctx } = fixture(); ctx.childOpen = true;
+  ctx.recheckPreviewHover({ clientX: 900, clientY: 700 });
+  assert.equal(ctx.mode, 'preview');
+  ctx.recheckPreviewHover({ clientX: 400, clientY: 300 });
+  ctx.recheckPreviewHover({ clientX: 900, clientY: 700 });
+  assert.equal(ctx.mode, 'preview', 're-entry does not turn a click-open child into hover-open');
+  ctx.childOpen = false;
+  ctx.recheckPreviewHover({ clientX: 900, clientY: 700 });
+  assert.equal(ctx.mode, 'hidden');
 });

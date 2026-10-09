@@ -1,8 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ExternalLink, Loader2 } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
-import ControlHint from '../UI/ControlHint';
+import FilePreviewHeader from './FilePreviewHeader';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
@@ -20,7 +19,6 @@ const FILE_PREVIEW_SCROLL_KEYS = new Set([
 export default function FilePreview({ topOffset = 0 }: { topOffset?: number }) {
   const { filePreview, closeFilePreview, showToast } = useUIStore();
   const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
-  const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
   const { activeProjectId, getSidebarState, setOpenFilePath, switchTab, setProjectView } = useWorkspaceStore();
   const { sidebarOpen } = activeProjectId ? getSidebarState(activeProjectId) : { sidebarOpen: false };
   const [copied, setCopied] = useState(false);
@@ -244,9 +242,6 @@ export default function FilePreview({ topOffset = 0 }: { topOffset?: number }) {
     }
   };
 
-  // Get filename from path
-  const fileName = filePreview?.path.split('/').pop() || '';
-
   if (!filePreview) return null;
 
   const tabbarRect = document.querySelector('[data-tabbar-vertical]')?.getBoundingClientRect();
@@ -273,67 +268,8 @@ export default function FilePreview({ topOffset = 0 }: { topOffset?: number }) {
         border: '1px solid #333'
       }}
     >
-      {/* Header */}
-      <div className="h-10 bg-tab border-b border-border-main flex items-center justify-between px-4 shrink-0">
-        <div className="flex items-center gap-3 min-w-0 flex-1">
-          <span className="text-sm font-bold text-white">{fileName}</span>
-          <span className="text-[10px] text-[#555] truncate">{filePreview.path}</span>
-        </div>
-        <div className="flex items-center gap-2">
-          {/* Inline font-size stepper. Mirrors the SettingsModal stepper so the user
-              can adjust font size without leaving the preview; both edit the same
-              filePreviewFontSize key in UIStore (persisted to localStorage). */}
-          <div className="flex items-center gap-1 mr-1">
-            <ControlHint label="Уменьшить шрифт">
-            <button
-              className="w-6 h-6 flex items-center justify-center rounded text-[#888] hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
-              disabled={filePreviewFontSize <= 10}
-              onClick={() => setFilePreviewFontSize(filePreviewFontSize - 1)}
-            >−</button>
-            </ControlHint>
-            <span className="text-[10px] text-[#888] font-mono tabular-nums min-w-[26px] text-center">{filePreviewFontSize}px</span>
-            <ControlHint label="Увеличить шрифт">
-            <button
-              className="w-6 h-6 flex items-center justify-center rounded text-[#888] hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
-              disabled={filePreviewFontSize >= 24}
-              onClick={() => setFilePreviewFontSize(filePreviewFontSize + 1)}
-            >+</button>
-            </ControlHint>
-          </div>
-          <ControlHint label="Открыть в Sublime Text">
-          <button
-            className="h-7 px-2 flex items-center gap-1.5 rounded text-xs text-[#666] hover:text-accent hover:bg-white/5 disabled:opacity-60 disabled:cursor-default transition-colors"
-            disabled={openingSublime}
-            onClick={handleOpenInSublime}
-          >
-            {openingSublime ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <ExternalLink className="w-3.5 h-3.5" />
-            )}
-            <span>Sublime</span>
-          </button>
-          </ControlHint>
-          <button
-            className={`text-xs px-2 py-1 rounded transition-colors ${
-              copied
-                ? 'text-accent bg-accent/10'
-                : 'text-[#666] hover:text-accent hover:bg-white/5'
-            }`}
-            onClick={handleCopyContent}
-          >
-            {copied ? '✓ Copied' : 'Copy All'}
-          </button>
-          <ControlHint label="Закрыть превью">
-            <button
-              className="text-[#999] hover:text-white text-2xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-white/10"
-              onClick={handleClose}
-            >
-              ×
-            </button>
-          </ControlHint>
-        </div>
-      </div>
+      <FilePreviewHeader key={filePreview.path} path={filePreview.path} copied={copied}
+        openingSublime={openingSublime} onCopy={handleCopyContent} onOpenSublime={handleOpenInSublime} onClose={handleClose}/>
 
       {/* Content — MarkdownEditor in readOnly mode for all files */}
       <div ref={previewHostRef} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', backgroundColor: '#1e1e2e' }}>

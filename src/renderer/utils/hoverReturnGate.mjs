@@ -39,3 +39,35 @@ export function captureQueueHoverReturn(event, root, gate) {
     requestAnimationFrame(() => gate.settle(satellite));
   }
 }
+
+export const QUEUE_CLICK_CHILD_CLOSED = 'run-after:click-child-closed';
+const childDismissEvents = new WeakMap();
+
+export function queueOwnsPopup(root, owner) {
+  if (!root || !owner) return false;
+  return root.dataset?.promptQueueHoverOwner === owner
+    || Array.from(root.querySelectorAll('[data-prompt-queue-hover-owner]'))
+      .some(element => element.dataset?.promptQueueHoverOwner === owner);
+}
+
+// A click-open child holds its owner by state, not by the cursor's location.
+// The backdrop is deliberately not tagged as hover territory.
+export function hasOwnedClickPopup(root, except = null) {
+  if (!root?.ownerDocument) return false;
+  return Array.from(root.ownerDocument.querySelectorAll('[data-run-after-click-open="true"]'))
+    .some(element => element !== except && queueOwnsPopup(root, element.dataset.runAfterHoverOwner));
+}
+
+export function markQueueChildDismiss(event, owner) {
+  if (event && owner) childDismissEvents.set(event, owner);
+}
+
+export function isOwnedQueueChildDismiss(root, event) {
+  return queueOwnsPopup(root, childDismissEvents.get(event));
+}
+
+export function notifyQueueClickChildClosed(owner, reason, point = null) {
+  if (owner) window.dispatchEvent(new CustomEvent(QUEUE_CLICK_CHILD_CLOSED, {
+    detail: { owner, reason, point },
+  }));
+}

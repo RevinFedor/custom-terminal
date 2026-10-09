@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { applyWindowDisplay, reconcileWindowDisplay, revealHiddenWindow, reconcileWorkspaceDisplayPatch,
-  splitWindowPane, windowSplitAvailability } from './windowDisplayLayouts.mjs';
+  splitWindowPane, windowSplitAvailability, resolveHiddenWindowNavigationTarget } from './windowDisplayLayouts.mjs';
 import { paneGridRects, paneColumns, paneTabs, paneSlots, selectChooserSlot, dropTabFromAllPaneStrips, sanitizePanes, removePaneAt, addTabToPane } from './splitPanesModel.mjs';
 import { buildSessionSnapshot } from './sessionSnapshot.mjs';
 import { captureSpaceLayout, restoreSpaces } from './workspaceSpacesModel.mjs';
@@ -17,6 +17,45 @@ const original = () => ({ splitPanes: ['a', 'b', 'c', 'd'].map((id, i) => ({
 })), splitFocusedIndex: 0, splitSizes: { cols: [.3, .3, .4], rows: [[1], [1], [.6, .4]] } });
 const visible = layout => layout.splitPanes.filter(p => !p.displayHidden).map(p => p.tabId);
 const idOf = (layout, tab) => layout.splitPanes.find(p => p.tabId === tab).windowId;
+
+test('hidden navigation uses a remembered row within its column and falls back when that column is gone',()=>{
+  const layout={windowDisplayKey:'builtin',splitFocusedIndex:0,splitPanes:[
+    {windowId:'left',column:0},{windowId:'right-top',column:1},{windowId:'right-bottom',column:1},
+    {windowId:'hidden',column:99,displayHidden:true}],
+    windowDisplayLayouts:{builtin:{lastPositions:[{windowId:'hidden',column:1,row:1}]}}};
+  assert.deepEqual(resolveHiddenWindowNavigationTarget(layout,'hidden'),{paneIndex:2,reason:'remembered-position'});
+  const shorter={...layout,splitPanes:layout.splitPanes.filter(p=>p.windowId!=='right-bottom')};
+  assert.equal(resolveHiddenWindowNavigationTarget(shorter,'hidden').paneIndex,1);
+  const noRight={...layout,splitPanes:layout.splitPanes.filter(p=>p.column!==1)};
+  assert.deepEqual(resolveHiddenWindowNavigationTarget(noRight,'hidden'),{paneIndex:0,reason:'focused-fallback'});
+  assert.equal(resolveHiddenWindowNavigationTarget(layout,'left'),null);
+});
+
+test('legacy hidden rect is accepted only for one exact current place and survives first profile capture',()=>{
+  const layout={windowDisplayKey:'builtin',splitFocusedIndex:0,splitSizes:null,splitPanes:[
+    {windowId:'left',column:0},{windowId:'right',column:1},{windowId:'hidden',column:9,displayHidden:true,
+      displayRect:{leftPct:50,topPct:0,widthPct:50,heightPct:100}}],
+    windowDisplayLayouts:{builtin:{positions:[{windowId:'left',column:0,row:0},{windowId:'right',column:1,row:0}]}}};
+  assert.deepEqual(resolveHiddenWindowNavigationTarget(layout,'hidden'),{paneIndex:1,reason:'legacy-exact-position'});
+  const upgraded=reconcileWindowDisplay(layout,small);
+  assert.deepEqual(resolveHiddenWindowNavigationTarget(upgraded,'hidden'),{paneIndex:1,reason:'remembered-position'});
+  const foreign=structuredClone(layout);foreign.splitPanes[2].displayRect.widthPct=33;
+  assert.equal(resolveHiddenWindowNavigationTarget(foreign,'hidden').paneIndex,0);
+  foreign.splitPanes[2].displayRect.widthPct=NaN;
+  assert.equal(resolveHiddenWindowNavigationTarget(foreign,'hidden').paneIndex,0);
+});
+
+test('current display memory neither inherits another display address nor retains a deleted window',()=>{
+  let layout=applyWindowDisplay(applyWindowDisplay(original(),big),small);
+  const target=idOf(layout,'c');
+  assert.equal(resolveHiddenWindowNavigationTarget(layout,target).paneIndex,0,'external column is not laptop placement');
+  layout=reconcileWindowDisplay(revealHiddenWindow(layout,1,target),small);
+  layout=reconcileWindowDisplay({...layout,splitPanes:layout.splitPanes.filter(p=>p.windowId!==target)},small);
+  for(const profile of Object.values(layout.windowDisplayLayouts)) {
+    assert.ok(!profile.positions.some(p=>p.windowId===target));
+    assert.ok(!(profile.lastPositions || []).some(p=>p.windowId===target));
+  }
+});
 
 const hiddenSplitFixture = () => ({ windowDisplayKey: 'builtin', windowDisplayLayouts: {},
   splitFocusedIndex: 0, splitSizes: null, splitPanes: [
@@ -100,7 +139,7 @@ test('a hidden empty window cannot disable a visible split and a stale hidden an
   const next = splitWindowPane(panes, 0, null, 0);
   assert.equal(next.panes.length, 2);
   assert.equal(next.panes[1].windowId, 'hidden-blank');
-  assert.equal(next.panes[1].displayHidden, undefined);
+  assert.equal(next.panes[1].displayHidden, false);
 });
 
 test('hidden source remains an exact MCP target; sidebar switcher can still offer its tabs', () => {
@@ -288,7 +327,8 @@ test('default reveal and explicit current-tab reveal preserve the prior selectio
   for (const selection of [undefined, { projectId: 'p', tabId: 'c' }]) {
     const next = revealHiddenWindow(layout, 1, 'window-c', selection);
     const { displayHidden, displayRect, column, ...content } = layout.splitPanes[2];
-    assert.deepEqual(next.splitPanes[1], { ...content, column: layout.splitPanes[1].column });
+    assert.deepEqual(next.splitPanes[1], { ...content, column: layout.splitPanes[1].column,
+      displayHidden: false, displayRect: null });
   }
 });
 

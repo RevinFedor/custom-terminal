@@ -27,6 +27,20 @@ const part = (source, first, next) => {
 const compile = source => ts.transpileModule(source.replace(/\bexport /g, ''), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText;
+function declaration(source, name, variable = false) {
+  const ast = ts.createSourceFile('source.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let found;
+  const visit = node => {
+    if ((variable ? ts.isVariableDeclaration(node) : ts.isFunctionDeclaration(node)) && node.name?.getText(ast) === name) found = node;
+    ts.forEachChild(node, visit);
+  };
+  visit(ast); assert.ok(found, name);
+  return variable ? 'const ' + found.getText(ast) + ';' : found.getText(ast);
+}
+const queueClassifier = {};
+vm.runInNewContext(compile(['queueSendOutcome', 'queueSendTransferredOwnership']
+  .map(name => declaration(read('../store/usePromptQueueStore.ts'), name)).join('\n')) +
+  '\nglobalThis.transferred=queueSendTransferredOwnership;', queueClassifier);
 function handoffModule() {
   const exports = {};
   // The real renderer dependencies are ESM. Electron 28's Node 18 cannot
@@ -75,7 +89,7 @@ function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}
     usePromptQueueStore: { getState: () => ({ setAutoRun: (tabId, value) => paused.push({tabId,value}) }) },
     showToast: message => notices.push(message),
     removePrompt: (_tabId, id) => removed.push(id),
-    queueSendTransferredOwnership: result => result.submitted === true,
+    queueSendTransferredOwnership: queueClassifier.transferred,
     AGENT_SETTINGS_INTENT_NONE: { kind: 'none' },
     runAgentSendFlow, enqueueAgentSendScenario, normalizeAgentSendOutcome,
     agentSendSettingsContractError: () => null,
@@ -358,7 +372,7 @@ function dismissalHarness({ handoffPatch = {}, entryPatch = {}, durableRows = []
   vm.createContext(context);
   vm.runInContext(part(main, "ipcMain.handle('agent:dismiss-send-receipt-presentation'", "ipcMain.handle('agent:record-history-context'"), context);
   vm.runInContext(compile(part(history, 'const isLocalPromptEntry =', 'const isLocalRewindEntry ='))
-    + compile(part(history, '  const removeLocalPromptEntry = useCallback(', '  const acknowledgeMaterializedHistoryReceipt ='))
+    + compile(declaration(history, 'removeLocalPromptEntry', true) + '\n' + declaration(history, 'dismissPromptPresentation', true))
     + '\nglobalThis.dismissPromptPresentation = dismissPromptPresentation;', context);
   return { context, handoffs, calls, notices, releaseReceipt,
     rows: () => rows, dismiss: () => context.dismissPromptPresentation(rows[0]),

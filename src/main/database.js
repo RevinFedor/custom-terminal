@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const {ensureMainFieldReceipts,reconcileMainFieldRevision} = require('./execution-main-field-receipts');
 const { app } = require('node:worker_threads').isMainThread ? require('electron') : {};
 const { normalizeForkOperation, historyRewriteOperation, resolveForkOperation } = require('../shared/fork-operation.cjs');
 const { selectDirectForkMarker } = require('../shared/fork-marker-boundary.cjs');
@@ -2066,6 +2067,7 @@ class DatabaseManager {
     if (marker) {
       const version = this.db.prepare('SELECT version FROM workflow_execution_schema').get()?.version;
       if (version !== 1) workflowStorage.fail('execution_schema_forward_version');
+      ensureMainFieldReceipts(this.db);
       return;
     }
     const foreignKeys = this.db.pragma('foreign_keys', { simple: true });
@@ -2137,6 +2139,7 @@ class DatabaseManager {
       this.db.pragma('legacy_alter_table=' + (legacyAlterTable ? 'ON' : 'OFF'));
       this.db.pragma('foreign_keys=' + (foreignKeys ? 'ON' : 'OFF'));
     }
+    ensureMainFieldReceipts(this.db);
   }
 
   _executionTransaction(callback) {
@@ -2231,12 +2234,15 @@ class DatabaseManager {
       executionSubject: workflowStorage.executionScopeForRow(row), executionStorageRevision: row.execution_storage_revision };
     return { row, tab, executionSubject: tab.executionSubject, revision: row.execution_storage_revision, archived: row.execution_archived === 1 };
   }
-  saveExecutionTabV2({ executionNamespace, tabId, subjectId, expectedRevision, columns = {}, record }) {
+  saveExecutionTabV2({ executionNamespace, tabId, subjectId, expectedRevision, columns = {}, record, reconcileMainFields = false }) {
     return this._executionTransaction(() => {
       const current = this.getExecutionTabV2({ executionNamespace, tabId, subjectId });
       if (!current || current.executionSubject.subjectId !== subjectId) workflowStorage.fail('execution_subject_changed');
-      if (!Number.isSafeInteger(expectedRevision) || current.revision !== expectedRevision) workflowStorage.fail('execution_storage_revision_changed',
+      const reconciliation = reconcileMainFields && Object.keys(columns).length === 0 && current.revision !== expectedRevision
+        ? reconcileMainFieldRevision(this.db,current,expectedRevision,record) : null;
+      if (!Number.isSafeInteger(expectedRevision) || current.revision !== expectedRevision && !reconciliation) workflowStorage.fail('execution_storage_revision_changed',
         {tabId,expectedRevision,actualRevision:current.revision});
+      const writeRevision = reconciliation ? reconciliation.toRevision : expectedRevision;
       const available = new Set(this.db.prepare('PRAGMA table_xinfo(tabs)').all().filter(column => !column.hidden).map(column => column.name));
       const protectedFields = new Set(['id', 'tab_id', 'project_id', 'execution_subject_version', 'execution_subject_id',
         'execution_namespace', 'execution_storage_revision', 'execution_record_json', 'execution_archived']);
@@ -2247,17 +2253,23 @@ class DatabaseManager {
       const entries = Object.entries(values);
       if (entries.length) this.db.prepare(`UPDATE tabs SET ${entries.map(([field]) => '"' + field.replaceAll('"', '""') + '"=?').join(',')},
         execution_storage_revision=execution_storage_revision+1 WHERE id=? AND execution_storage_revision=?`)
-        .run(...entries.map(([, value]) => value), current.row.id, expectedRevision);
-      return this.getExecutionTabV2({ executionNamespace, tabId, subjectId });
+        .run(...entries.map(([, value]) => value), current.row.id, writeRevision);
+      const saved = this.getExecutionTabV2({ executionNamespace, tabId, subjectId });
+      return reconciliation ? {...saved,reconciliation} : saved;
     });
   }
   saveExecutionTabs(executionNamespace, tabs) {
     return this._executionTransaction(() => {
       if (!Array.isArray(tabs)) workflowStorage.fail('execution_tabs_required');
-      for (const tab of tabs) this.saveExecutionTabV2({ executionNamespace, tabId: tab.tabId,
-        subjectId: tab.executionSubject?.subjectId, expectedRevision: tab.executionStorageRevision, record: tab });
+      const executionReconciliations = [];
+      for (const tab of tabs) {
+        const saved = this.saveExecutionTabV2({ executionNamespace, tabId: tab.tabId,
+          subjectId: tab.executionSubject?.subjectId, expectedRevision: tab.executionStorageRevision,
+          record: tab, reconcileMainFields: true });
+        if (saved.reconciliation) executionReconciliations.push(saved.reconciliation);
+      }
       // Omission is never deletion. Close/archive uses the exact mutation below.
-      return { success: true };
+      return { success: true, ...(executionReconciliations.length ? {executionReconciliations} : {}) };
     });
   }
   getExecutionNamespace(executionNamespace, { includeArchived = false } = {}) {
@@ -4788,7 +4800,7 @@ class DatabaseManager {
     return this._executionTransaction(() => {
       const independent = tabs.filter(tab => v2Ids.has(tab.tabId));
       const legacy = tabs.filter(tab => !v2Ids.has(tab.tabId));
-      this.saveExecutionTabs(projectId, independent);
+      const nativeResult = this.saveExecutionTabs(projectId, independent);
       if(forceCleanup) {
         const keep=new Set(independent.map(tab=>tab.tabId));
         for(const tabId of v2Ids) if(!keep.has(tabId)) this.db.prepare('UPDATE tabs SET execution_archived=1 WHERE tab_id=? AND execution_archived=0').run(tabId);
@@ -4797,14 +4809,14 @@ class DatabaseManager {
       const realProject = this.db.prepare('SELECT 1 FROM projects WHERE id=?').get(projectId);
       if (!realProject) {
         if (legacy.length) workflowStorage.fail('execution_exact_address_required');
-        return { success: true };
+        return nativeResult;
       }
       // The v1 implementation/guards stay intact. V2 rows are never subjected
       // to its legacy Project FK path.
-      if (!legacy.length && independent.length && !forceCleanup) return { success: true };
+      if (!legacy.length && independent.length && !forceCleanup) return nativeResult;
       const result = this._saveLegacyTabs(projectId, legacy, forceCleanup, preserveInterrupted);
       if (result?.success === false) workflowStorage.fail(result.error || 'execution_legacy_save_failed');
-      return result;
+      return {...result,...(nativeResult.executionReconciliations ? {executionReconciliations:nativeResult.executionReconciliations} : {})};
     });
   }
 
@@ -5825,10 +5837,12 @@ class DatabaseManager {
     return result.changes === 1 ? this.getPromptByStableId(stableId) : null;
   }
   getPromptLibrary() {
-    return {
+    // One SQLite read snapshot for the definition graph, including writers on
+    // another connection. Nested mutation callers use SQLite's savepoint path.
+    return this.db.transaction(() => ({
       prompts: this.getPrompts(),
       groups: this.getPromptGroups(),
-    };
+    }))();
   }
   mutatePromptLibrary(mutator) {
     if (typeof mutator !== 'function') throw new Error('prompt library mutator required');

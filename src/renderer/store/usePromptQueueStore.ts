@@ -152,6 +152,7 @@ type PersistedTabQueueSnapshot = Pick<TabQueue,
   | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptArmedAt'
   | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId' | 'firstDelayCountdownAt'
   | 'workflowRestartPending' | 'loopRestartPending' | 'workflowOutcomeFloorAt'
+  | 'pendingDelivery'
 >;
 
 function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, PersistedTabQueueSnapshot> {
@@ -175,7 +176,7 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       // deliberate choice worth keeping is the OPPOSITE one. Both sides of this
       // pair live in promptQueuePanelDefault.mjs precisely so they cannot drift.
       !panelCollapsedIsWorthPersisting(q.panelCollapsed) &&
-      !q.previewId
+      !q.previewId && !q.pendingDelivery
     ) continue;
     out[tabId] = {
       items: q.items,
@@ -193,6 +194,7 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       runAfterTabId: q.runAfterTabId,
       workflowArmedAt: q.workflowArmedAt,
       workflowOutcomeFloorAt: q.workflowOutcomeFloorAt,
+      pendingDelivery: q.pendingDelivery || null,
       panelCollapsed: q.panelCollapsed,
       previewId: q.previewId,
     };
@@ -248,6 +250,19 @@ export function flushPromptQueueStoreSync(): void {
   } catch (e) {
     console.warn('[PromptQueue] sync save failed:', e);
   }
+}
+
+// This is only the queue's durable pointer to the existing Main Send owner,
+// never another receipt/executor. Await the existing app-state ACK before a
+// physical-send-capable call so a lost IPC result/restart retains the same ID.
+export async function persistPromptQueueDeliveryPointer(): Promise<void> {
+  if (!hasHydratedPromptQueueStore) throw new Error('prompt_queue_not_hydrated');
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  const result = await ipcRenderer.invoke('app:setState', {
+    key: APP_STATE_KEY_QUEUE,
+    value: JSON.stringify(serializePromptQueueSnapshot(usePromptQueueStore.getState().queues)),
+  });
+  if (result?.success !== true) throw new Error('prompt_queue_delivery_pointer_not_saved');
 }
 
 // A strict remote mutation commits this SAME snapshot through Main together
@@ -505,8 +520,23 @@ export function getQueuedPromptAttachmentState(
   return getPromptImageAttachmentState(item) as QueuedPromptAttachmentState;
 }
 
+export type PromptQueuePendingDelivery = {
+  version: 1;
+  kind: 'queue' | 'loop';
+  itemId: string;
+  handoffId: string;
+  baseHandoffId: string;
+  operationKey: string;
+  triggerTabId: string;
+  triggerKey: string;
+  conditionKey: string;
+  causeKey: string | null;
+  createdAt: number;
+};
+
 export type TabQueue = {
   items: QueuedPrompt[];
+  pendingDelivery?: PromptQueuePendingDelivery | null;
   // When true, as soon as the current Claude turn ends (Stop hook fires) the next item
   // is shifted off and sent via claude:send-command. After the last item runs, autoRun stays
   // true — user must explicitly disarm. This is fine because with no items the loop is a no-op.
@@ -699,6 +729,7 @@ interface PromptQueueStore {
   clearQueue: (tabId: string) => void;
 
   setAutoRun: (tabId: string, value: boolean) => void;
+  setPendingDelivery: (tabId: string, value: PromptQueuePendingDelivery | null, expectedHandoffId?: string) => boolean;
   setStopAfter: (tabId: string, value: boolean) => void;
   setCloseAfter: (tabId: string, value: boolean) => void;
   // Set the target tab whose busy→idle transition should trigger the auto-run.
@@ -787,6 +818,7 @@ const EMPTY: TabQueue = {
   runAfterTabId: null,
   workflowArmedAt: null,
   workflowOutcomeFloorAt: null,
+  pendingDelivery: null,
 };
 
 function hasActiveQueueWorkflow(queue: Pick<TabQueue, 'autoRun' | 'stopAfter' | 'closeAfter'>): boolean {
@@ -821,6 +853,7 @@ type PreHydrateQueueField =
   | 'loopRestartPending'
   | 'panelCollapsed'
   | 'previewId'
+  | 'pendingDelivery'
   | 'deleted';
 
 const preHydrateQueueChanges = new Map<string, Set<PreHydrateQueueField>>();
@@ -867,6 +900,7 @@ function trackPreHydrateQueueChanges(before: Map<string, TabQueue>, after: Map<s
     if (baseline.workflowOutcomeFloorAt !== current.workflowOutcomeFloorAt) changed.add('workflowOutcomeFloorAt');
     if (baseline.panelCollapsed !== current.panelCollapsed) changed.add('panelCollapsed');
     if (baseline.previewId !== current.previewId) changed.add('previewId');
+    if (baseline.pendingDelivery !== current.pendingDelivery) changed.add('pendingDelivery');
     if (changed.size === 0) preHydrateQueueChanges.delete(tabId);
   }
 }
@@ -914,6 +948,7 @@ function mergeHydratedQueue(
   if (changed?.has('workflowOutcomeFloorAt')) merged.workflowOutcomeFloorAt = current.workflowOutcomeFloorAt;
   if (changed?.has('panelCollapsed')) merged.panelCollapsed = current.panelCollapsed;
   if (changed?.has('previewId')) merged.previewId = current.previewId;
+  if (changed?.has('pendingDelivery')) merged.pendingDelivery = current.pendingDelivery;
   if (merged.autoRun) merged.firstChipHintActive = false;
   return merged;
 }
@@ -1018,9 +1053,9 @@ export function countEnabledQueuedPrompts(items: QueuedPrompt[]): number {
 }
 
 export function hasPendingPromptQueueContinuation(
-  queue: Pick<TabQueue, 'autoRun' | 'items' | 'loopPromptEnabled' | 'loopPromptText'>,
+  queue: Pick<TabQueue, 'autoRun' | 'items' | 'loopPromptEnabled' | 'loopPromptText' | 'pendingDelivery'>,
 ): boolean {
-  return (queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0)
+  return !!queue.pendingDelivery || (queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0)
     || isLoopPromptActive(queue);
 }
 
@@ -1047,16 +1082,22 @@ function wouldCreateRunAfterCycle(
   return false;
 }
 
-// Once Enter was written, the queue no longer owns this prompt. A late
-// history/JSONL audit can time out after the agent has already started; keeping
-// the item in that case would make a retry duplicate the submission.
+// Successful admission or a proven Enter transfers ownership. Unknown is NOT
+// the same as refusal: its item and exact operation must survive reconciliation.
+export function queueSendOutcome(result: unknown): 'transferred' | 'not-submitted' | 'unknown' {
+  if (!result || typeof result !== 'object') return 'unknown';
+  const value = result as any;
+  if (value.submitted === true) return 'transferred';
+  if (value.deliveryUnknown === true || value.status === 'delivery-unknown' || value.status === 'delivery_unknown') return 'unknown';
+  if (value.success === true) return 'transferred';
+  if (value.success === false && value.submitted === false && value.deliveryUnknown !== true
+    && value.pasteWritten !== true && value.enterWritten !== true
+    && value.status !== 'delivery-unknown' && value.status !== 'audit-pending') return 'not-submitted';
+  return 'unknown';
+}
+
 export function queueSendTransferredOwnership(result: unknown): boolean {
-  // A void/malformed transport return proves nothing about delivery. Treating
-  // it as "transferred" would settle the row as sent with zero audit proof —
-  // fail closed instead (ownership stays with the queue/composer).
-  if (!result || typeof result !== 'object') return false;
-  const sendResult = result as { success?: boolean; submitted?: boolean };
-  return sendResult.success !== false || sendResult.submitted === true;
+  return queueSendOutcome(result) === 'transferred';
 }
 
 function getInitialQueuedPromptAttachmentState(
@@ -1604,9 +1645,25 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       automaticRunAfterTargetClearTabs.delete(tabId);
       setAndPersist((state) => {
         const next = new Map(state.queues);
-        next.delete(tabId);
+        const pendingDelivery = next.get(tabId)?.pendingDelivery;
+        if (pendingDelivery) next.set(tabId, { ...EMPTY, pendingDelivery });
+        else next.delete(tabId);
         return { queues: next };
       });
+    },
+
+    setPendingDelivery: (tabId, value, expectedHandoffId) => {
+      let applied = false;
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId) ?? EMPTY;
+        if (expectedHandoffId && cur.pendingDelivery?.handoffId !== expectedHandoffId) return {};
+        if (value && cur.pendingDelivery && cur.pendingDelivery.handoffId !== value.handoffId) return {};
+        const next = new Map(state.queues);
+        next.set(tabId, { ...cur, pendingDelivery: value });
+        applied = true;
+        return { queues: next };
+      });
+      return applied;
     },
 
     setAutoRun: (tabId, value) => {
@@ -1617,12 +1674,14 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         // unconditionally. Re-arming only happens on the next 0→1 chip edge.
         const updated = {
           ...(value ? cur : freezePromptQueueCountdown(cur)),
-          autoRun: value,
+          // Play on an unresolved operation requests its receipt read, not a
+          // new arm/key. The root owner observes this state publication.
+          autoRun: value && !cur.pendingDelivery,
           workflowRestartPending: value === cur.autoRun ? cur.workflowRestartPending : false,
           firstChipHintActive: false,
           firstDelayCountdownAt: value ? cur.firstDelayCountdownAt : null,
         };
-        const explicitArm = value && !cur.autoRun;
+        const explicitArm = value && !cur.autoRun && !cur.pendingDelivery;
         if (explicitArm) markRuntimeWorkflowArm(tabId);
         next.set(tabId, {
           ...updated,
@@ -2256,7 +2315,22 @@ type PersistedTabQueue = {
   workflowOutcomeFloorAt?: number | null;
   panelCollapsed?: boolean;
   previewId?: string | null;
+  pendingDelivery?: unknown;
 };
+
+function normalizePendingDelivery(value: unknown): PromptQueuePendingDelivery | null {
+  if (!value || typeof value !== 'object') return null;
+  const v = value as PromptQueuePendingDelivery;
+  if (v.version !== 1 || (v.kind !== 'queue' && v.kind !== 'loop')
+    || !['itemId', 'handoffId', 'baseHandoffId', 'operationKey', 'triggerTabId'].every(key =>
+      typeof (v as any)[key] === 'string' && (v as any)[key].length > 0)
+    || typeof v.triggerKey !== 'string' || typeof v.conditionKey !== 'string'
+    || !(v.causeKey === null || typeof v.causeKey === 'string')
+    || typeof v.createdAt !== 'number' || !Number.isFinite(v.createdAt)) return null;
+  return { version: 1, kind: v.kind, itemId: v.itemId, handoffId: v.handoffId,
+    baseHandoffId: v.baseHandoffId, operationKey: v.operationKey, triggerTabId: v.triggerTabId,
+    triggerKey: v.triggerKey, conditionKey: v.conditionKey, causeKey: v.causeKey, createdAt: v.createdAt };
+}
 
 function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
   if (!value || typeof value !== 'object') return null;
@@ -2360,6 +2434,7 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
 }
 
 function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
+  const pendingDelivery = normalizePendingDelivery(entry.pendingDelivery);
   let items = Array.isArray(entry.items)
     ? entry.items.map(normalizePersistedQueuedPrompt).filter((item): item is QueuedPrompt => item !== null)
     : [];
@@ -2398,8 +2473,9 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     firstDelaySeconds = 0;
     console.log('[PromptQueue] migrated global trigger to first item');
   }
-  return {
+  const hydrated: TabQueue = {
     items,
+    pendingDelivery,
     autoRun: !!entry.autoRun,
     workflowRestartPending: !!entry.autoRun && entry.workflowRestartPending === true,
     loopRestartPending: !!entry.loopPromptEnabled && entry.loopRestartPending === true,
@@ -2437,6 +2513,11 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
       ? entry.workflowOutcomeFloorAt : null,
     previewId,
   };
+  // A missing ACK/restart is not a no-submit proof. Keep the same operation
+  // paused until the existing Main receipt is read; never invent a new arm.
+  return entry.pendingDelivery ? { ...freezePromptQueueCountdown(hydrated),
+    autoRun: false, loopPromptEnabled: false, workflowRestartPending: false,
+    loopRestartPending: false } : hydrated;
 }
 
 // Restore metadata immediately, then validate/copy image bytes in the background.

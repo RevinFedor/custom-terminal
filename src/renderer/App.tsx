@@ -1,4 +1,9 @@
 import { usePointerGesture } from './hooks/usePointerGesture';
+import { createEditableDictationClipboard } from './utils/dictationEditableClipboard.mjs';
+const editableDictation = createEditableDictationClipboard({ document, ipc: window.require('electron').ipcRenderer,
+  randomId: () => window.require('crypto').randomUUID(),
+  hashText: text => window.require('crypto').createHash('sha256').update(text).digest('hex') });
+if (import.meta.hot) import.meta.hot.dispose(() => editableDictation.dispose());
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import { startAgentSendActivity, useAgentSendPendingTabs } from './hooks/useAgentSendActivity';
 import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId, isProjectTabSavePending } from './store/useWorkspaceStore';
@@ -52,6 +57,7 @@ import ShutdownOverlay from './components/UI/ShutdownOverlay';
 import EditProjectModal from './components/UI/EditProjectModal';
 import SessionInputModal from './components/UI/SessionInputModal';
 import SettingsModal from './components/UI/SettingsModal';
+import WorkflowSettingsModal,{openWorkflowSettings} from './components/UI/WorkflowSettingsModal';
 import HelpModal from './components/UI/HelpModal';
 import ControlHint from './components/UI/ControlHint';
 import Tooltip from './components/UI/Tooltip';
@@ -1475,6 +1481,10 @@ function App() {
     const onSettingsOpen = (e: Event) => {
       const ce = e as CustomEvent<{ tab?: string }>;
       const tab = ce.detail?.tab || null;
+      if(tab==='projects' || tab==='workflows'){
+        setSettingsOpen(false);openWorkflowSettings(useWorkspaceStore.getState().activeSpaceId);return;
+      }
+      useUIStore.setState({workflowSettingsId:null});
       setSettingsInitialTab(tab);
       setSettingsOpen(true);
       window.dispatchEvent(new CustomEvent('settings:opened'));
@@ -2718,7 +2728,7 @@ function App() {
             nameSetManually: true,
             skipInitialRename: true,
             background: options.background !== false,
-            restoreId: reservedTabId,
+            reservedTabId,
             appendToEnd: true,
             afterTabId: String(options.afterTabId || requestedParentId),
             visualParentTabId: requestedParentId,
@@ -3019,6 +3029,9 @@ function App() {
           console.log('[DictationChip] open-owner tab=' + tabId.slice(-12) + ' opened=' + opened);
           return reply(true, { opened });
         }
+        if (action === 'dictationClipboardArm') return reply(true, await editableDictation.arm(payload));
+        if (action === 'dictationClipboardEnter') return reply(true, await editableDictation.enter(payload));
+        if (action === 'dictationClipboardRelease') return reply(true, editableDictation.release(payload));
         if (action === 'dictationChipBegin') {
           // Voice Record finished a global take while (it believes) our
           // composer is focused. Two jobs in one round-trip:
@@ -3055,7 +3068,13 @@ function App() {
             if (otherInput) {
               console.log('[DictationChip] bypass chip=' + chipId + ' reason=other-input-focused'
                 + ' tag=' + active.tagName + ' xterm=' + active.classList.contains('xterm-helper-textarea'));
-              return { accepted: false, reason: 'other-input-focused' };
+              const xtermTabId = active.classList.contains('xterm-helper-textarea')
+                ? active.closest('[data-terminal-layer-tab-id]')?.getAttribute('data-terminal-layer-tab-id') : null;
+              return { accepted: false, reason: 'other-input-focused',
+                ...(xtermTabId ? { clipboardReceipt: { version: 1, tabId: xtermTabId } }
+                  : { clipboardReceipt: editableDictation.offer(active,
+                    active.closest('[data-codex-native-question-bar]')?.getAttribute('data-codex-native-question-bar')
+                    || resolveFocusedTerminalSelection(liveState)?.selection?.tabId || null) }) };
             }
             const focused = requestedTabId || activeTabId ? null : resolveFocusedTerminalSelection(liveState);
             const tabId = requestedTabId || activeTabId || focused?.selection?.tabId || null;
@@ -4681,7 +4700,9 @@ function App() {
             codexSessionId: requestedResumeSessionId || undefined,
             externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
             background: resolved.windowTarget ? true : background === true,
-            restoreId: requestedReservedTabId,
+            // A reserved NEW identity still needs canonical subject/membership
+            // allocation; restoreId is exclusively an existing durable tab.
+            reservedTabId: requestedReservedTabId,
             // Project API sessions keep their visual parent, but must not
             // displace tabs the user has already ordered near that parent.
             appendToEnd: true,
@@ -5895,6 +5916,7 @@ function App() {
     // navigation gesture, so History and SDK composers participate alongside
     // xterm and retained hidden panes cannot claim keyboard ownership.
     const handleWindowRefocus = () => {
+      if(useUIStore.getState().workflowSettingsId)return;
       // Restore the surface the user explicitly owned before leaving the app.
       // Refocusing a terminal while the sidebar owns keyboard commands makes
       // the visual focus and the real DOM focus contradict each other.
@@ -5917,6 +5939,7 @@ function App() {
     const handlePasteRefocus = (e: KeyboardEvent) => {
       if (!e.metaKey || e.shiftKey || e.altKey || e.ctrlKey) return;
       if (e.code !== 'KeyV' && e.key !== 'v' && e.key !== 'V') return;
+      if(useUIStore.getState().workflowSettingsId)return;
       const t = e.target as HTMLElement | null;
       if (t) {
         const tag = t.tagName;
@@ -6418,7 +6441,7 @@ function App() {
       activeArea: ui.activeArea,
       tabId: focused?.tabId || null,
       fallbackSurface,
-      blocked: settingsOpen,
+      blocked: settingsOpen || !!ui.workflowSettingsId,
     };
   }, (surface, delta) => useUIStore.getState().adjustSurfaceFontSizes(surface, delta)), [settingsOpen]);
 
@@ -6461,6 +6484,7 @@ function App() {
 
     // Global Hotkeys
     const handleKeyDown = (e: KeyboardEvent) => {
+      if(useUIStore.getState().workflowSettingsId)return;
       // Debug: log all Cmd+key combinations
       if (e.metaKey) {
         console.log('[Hotkey] Cmd +', e.code, e.key, 'view:', view);
@@ -6805,6 +6829,7 @@ function App() {
     // Cmd+E больше НЕ открывает picker — слот перенесён на toggle slide-out
     // заметок (Workspace.tsx, см. fact-notes.md). Раньше Cmd+E был алиасом.
     const handlePickerOpenCapture = (e: KeyboardEvent) => {
+      if(useUIStore.getState().workflowSettingsId)return;
       if (view !== 'workspace') return;
       const isOptV = e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey && e.code === 'KeyV';
       if (!isOptV) return;
@@ -6824,6 +6849,7 @@ function App() {
     // xterm's customKeyEventHandler sees it (otherwise the literal `T` would
     // land in the active terminal's PTY).
     const handleReopenLastClosedCapture = (e: KeyboardEvent) => {
+      if(useUIStore.getState().workflowSettingsId)return;
       if (view !== 'workspace') return;
       if (!(e.metaKey && e.shiftKey && !e.altKey && !e.ctrlKey && e.code === 'KeyT')) return;
       e.preventDefault();
@@ -7338,6 +7364,7 @@ function App() {
         onClose={() => { setSettingsOpen(false); setSettingsInitialTab(null); }}
         initialTab={settingsInitialTab}
       />
+      <WorkflowSettingsModal />
       <HelpModal isOpen={helpOpen} onClose={() => setHelpOpen(false)} />
       <PromptPickerOverlay />
       {/* Ctrl+Tab / Cmd+P cross-project tab switcher. Busy/process maps are the

@@ -26,20 +26,113 @@ const CODEX_SUBAGENT_CONTROL_NAMES = new Set([
   'wait_agent', 'send_input', 'resume_agent', 'close_agent',
   'send_message', 'followup_task', 'interrupt_agent', 'list_agents',
 ]);
+const CODEX_SUBAGENT_WORK_START_NAMES = new Set(['resume_agent', 'send_input', 'followup_task']);
 const CODEX_SUBAGENT_NAMESPACES = new Set(['multi_agent_v1', 'collaboration']);
+const CODEX_SUBAGENT_CALL_NAMES = new Set([...CODEX_SUBAGENT_SPAWN_NAMES, ...CODEX_SUBAGENT_CONTROL_NAMES]);
+const { codexStartedLaunchSettings } = require('./subagent-launch-settings');
+
+// Programmatic exec exposes namespace tools as flat callable identifiers.
+// Keep a closed identity dictionary: an MCP suffix, quoted example or prose
+// mentioning spawn_agent is not a native subagent call.
+function normalizeCodexSubagentCall(call = {}) {
+  const name = String(call.toolName || call.name || '');
+  const namespace = String(call.namespace || '');
+  const names = CODEX_SUBAGENT_CALL_NAMES;
+  if (CODEX_SUBAGENT_NAMESPACES.has(namespace) && names.has(name)) return call;
+  if (namespace && !CODEX_SUBAGENT_NAMESPACES.has(namespace)) return call;
+  for (const candidate of CODEX_SUBAGENT_NAMESPACES) {
+    for (const separator of ['__', '_', '.']) {
+      const prefix = candidate + separator;
+      if (name.startsWith(prefix) && names.has(name.slice(prefix.length))) {
+        return { ...call, toolName: name.slice(prefix.length), namespace: candidate };
+      }
+    }
+  }
+  return call;
+}
+
+// The outer exec can print several real spawn receipts from one loop. Accept
+// complete JSON values/JSON lines only, never substring matches in tool prose.
+function extractCodexSpawnIdentities(value, namespace = 'multi_agent_v1') {
+  const found = new Map();
+  const visit = (candidate) => {
+    if (Array.isArray(candidate)) { candidate.forEach(visit); return; }
+    if (!candidate || typeof candidate !== 'object') return;
+    const agentId = typeof candidate.agent_id === 'string' ? candidate.agent_id.trim() : '';
+    const taskName = typeof candidate.task_name === 'string' ? candidate.task_name.trim() : '';
+    const nickname = typeof candidate.nickname === 'string' ? candidate.nickname.trim() : '';
+    if (namespace === 'multi_agent_v1'
+      && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(agentId)) return;
+    if (namespace === 'collaboration' && !agentId && !taskName.startsWith('/root/')) return;
+    if (!agentId && !taskName) return;
+    const key = agentId || taskName;
+    if (!found.has(key)) found.set(key, { agent_id: agentId, task_name: taskName, nickname });
+  };
+  if (typeof value === 'string') {
+    try { visit(JSON.parse(value)); }
+    catch { for (const line of value.split('\n')) { try { visit(JSON.parse(line.trim())); } catch {} } }
+  } else visit(value);
+  return [...found.values()];
+}
 
 function isCodexSubagentNamespace(namespace) {
   return CODEX_SUBAGENT_NAMESPACES.has(String(namespace || ''));
 }
 
 function isCodexSubagentSpawnCall(call) {
-  return isCodexSubagentNamespace(call?.namespace)
-    && CODEX_SUBAGENT_SPAWN_NAMES.has(String(call?.toolName || ''));
+  const normalized = normalizeCodexSubagentCall(call);
+  return isCodexSubagentNamespace(normalized?.namespace)
+    && CODEX_SUBAGENT_SPAWN_NAMES.has(String(normalized?.toolName || ''));
 }
 
 function isCodexSubagentControlCall(call) {
-  return isCodexSubagentNamespace(call?.namespace)
-    && CODEX_SUBAGENT_CONTROL_NAMES.has(String(call?.toolName || ''));
+  const normalized = normalizeCodexSubagentCall(call);
+  return isCodexSubagentNamespace(normalized?.namespace)
+    && CODEX_SUBAGENT_CONTROL_NAMES.has(String(normalized?.toolName || ''));
+}
+
+function isCodexSubagentWorkStartingCall(call) {
+  const normalized = normalizeCodexSubagentCall(call);
+  // collaboration.send_message is QueueOnly in both 0.159.2 and 0.162:
+  // successful mailbox delivery does NOT wake an idle child. Only explicit
+  // work-start controls may reopen its completed lease/clock.
+  return isCodexSubagentControlCall(normalized)
+    && CODEX_SUBAGENT_WORK_START_NAMES.has(normalized.toolName);
+}
+
+function codexSubagentTerminalOutcomes(call, outputPayload) {
+  call = normalizeCodexSubagentCall(call);
+  if (!isCodexSubagentControlCall(call)) return [];
+  const output = parseMaybeJson(outputPayload);
+  if (!output || typeof output !== 'object') return [];
+  const outcomes = [];
+  const add = (key, status) => {
+    if (!key || !status || typeof status !== 'object') return;
+    if (typeof status.completed === 'string') outcomes.push({ key, status: 'completed', result: status.completed });
+    else if (status.interrupted !== undefined || status.errored !== undefined
+      || status.shutdown !== undefined) outcomes.push({ key, status: 'interrupted' });
+  };
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== 'object' || depth > 4) return;
+    if (Array.isArray(value)) { value.forEach(item => visit(item, depth + 1)); return; }
+    // Exact Promise.allSettled transport, not an arbitrary recursive search.
+    if (value.status === 'fulfilled' && Object.hasOwn(value, 'value')) {
+      visit(value.value, depth + 1); return;
+    }
+    if (value.status === 'rejected') return;
+    if (call.toolName === 'wait_agent' && value.status && typeof value.status === 'object') {
+      for (const [key, status] of Object.entries(value.status)) add(key, status);
+    } else if (call.toolName === 'list_agents' && Array.isArray(value.agents)) {
+      for (const agent of value.agents) add(agent.agent_id || agent.agent_name, agent.agent_status || agent.status);
+    } else if (call.toolName === 'close_agent' && Object.hasOwn(value, 'previous_status')) {
+      const key = String(call.args?.target || call.args?.id || call.args?.agent_id || '');
+      const before = outcomes.length;
+      add(key, value.previous_status);
+      if (key && outcomes.length === before) outcomes.push({ key, status: 'interrupted' });
+    }
+  };
+  visit(output);
+  return outcomes;
 }
 
 function describeSubagentSpawn(args = {}) {
@@ -77,9 +170,11 @@ function createCodexSubagentTracker(seed = {}) {
   const cardByAgentKey = seed.cardByAgentKey || new Map();
 
   const stampTerminalTiming = (card, observedAt) => {
+    if (card.completionTimingSource === 'child') return;
     const completedAt = timestampMs(observedAt);
     if (!completedAt) return;
     card.completedAt = completedAt;
+    card.completionTimingSource = 'parent';
     if (Number(card.startedAt) > 0) {
       card.durationMs = Math.max(0, completedAt - Number(card.startedAt));
     }
@@ -108,6 +203,7 @@ function createCodexSubagentTracker(seed = {}) {
 
   return {
     exportState: () => ({ cardByCallId, cardByAgentKey }),
+    getCard: (callId) => cardByCallId.get(String(callId || '')) || null,
     /** Register a spawn_agent function_call → returns the TaskAction card. */
     registerSpawn(call) {
       const baseDescription = describeSubagentSpawn(call?.args || {});
@@ -192,12 +288,19 @@ function createCodexSubagentTracker(seed = {}) {
       let card = eventId ? cardByCallId.get(eventId) : null;
       if (!card && agentPath) card = cardByAgentKey.get(agentPath) || null;
       if (!card) return;
+      if (!card.launchSettings && eventId === card.toolUseId
+        && (!card.agentSessionId || card.agentSessionId === threadId)) {
+        const settings = codexStartedLaunchSettings(payload, card.toolUseId, threadId, observedAt);
+        if (settings) card.launchSettings = settings;
+      }
       if (agentPath) cardByAgentKey.set(agentPath, card);
       if (threadId && !card.agentSessionId) {
         card.agentSessionId = threadId;
         cardByAgentKey.set(threadId, card);
       }
-      if (kind === 'started' || kind === 'interacted') setStatus(card, 'running');
+      // Interacted is shared by QueueOnly mail and real followup. The latter
+      // is handled by its control output; interaction alone proves no turn.
+      if (kind === 'started') setStatus(card, 'running');
       else if (kind === 'interrupted') setStatus(card, 'interrupted', observedAt);
     },
 
@@ -290,12 +393,17 @@ function createCodexSubagentTracker(seed = {}) {
      * needed for the control call).
      */
     absorbControlOutput(call, outputPayload, observedAt = null) {
+      call = normalizeCodexSubagentCall(call);
       if (!isCodexSubagentControlCall(call)) return false;
       const name = String(call?.toolName || '');
       const output = parseMaybeJson(outputPayload);
       let absorbed = false;
-      if (name === 'resume_agent' || name === 'send_input' || name === 'send_message'
-        || name === 'followup_task') {
+      if (name === 'send_message') {
+        const target = String(call?.args?.target || call?.args?.id || call?.args?.agent_id || '').trim();
+        // Absorb mailbox control noise without changing terminal state,
+        // completedAt, duration or launch metadata (3607/4196, 09.10).
+        absorbed = !!(target && cardByAgentKey.get(target));
+      } else if (isCodexSubagentWorkStartingCall(call)) {
         // A FINISHED agent can be put back to work: `resume_agent {id}` →
         // {"status":"pending_init"}, then send_input hands it the next task.
         // Without this the card stays "completed" for the whole resumed run
@@ -313,23 +421,20 @@ function createCodexSubagentTracker(seed = {}) {
           card.startedAt = timestampMs(call?.timestamp) || timestampMs(observedAt) || card.startedAt;
           delete card.completedAt;
           delete card.durationMs;
+          delete card.completionTimingSource;
           absorbed = true;
         }
       } else if (name === 'wait_agent') {
-        const status = output?.status;
-        if (status && typeof status === 'object') {
-          for (const [agentKey, agentStatus] of Object.entries(status)) {
-            const card = cardByAgentKey.get(String(agentKey));
-            const completed = typeof agentStatus?.completed === 'string'
-              ? agentStatus.completed
-              : null;
-            if (card && completed !== null) {
-              card.result = completed;
+        for (const outcome of codexSubagentTerminalOutcomes(call, outputPayload)) {
+            const card = cardByAgentKey.get(outcome.key);
+            if (card && outcome.status === 'completed') {
+              card.result = outcome.result;
               card.subagentStatus = 'completed';
               card.description = card.baseDescription;
               stampTerminalTiming(card, observedAt);
+            } else if (card) {
+              setStatus(card, 'interrupted', observedAt);
             }
-          }
         }
         // v2 wait output is content-free; v1 carries results — both are
         // control-plane noise once cards exist.
@@ -347,7 +452,7 @@ function createCodexSubagentTracker(seed = {}) {
         // permanent live chips (4 of 32 closes in the corpus).
         const previous = output?.previous_status;
         const completed = typeof previous?.completed === 'string' ? previous.completed : null;
-        const target = String(call?.args?.target || '').trim();
+        const target = String(call?.args?.target || call?.args?.id || call?.args?.agent_id || '').trim();
         const card = target ? cardByAgentKey.get(target) : null;
         if (card) {
           if (completed !== null) {
@@ -424,9 +529,13 @@ module.exports = {
   CODEX_SUBAGENT_CONTROL_NAMES,
   CODEX_SUBAGENT_SPAWN_NAMES,
   createCodexSubagentTracker,
+  codexSubagentTerminalOutcomes,
   describeSubagentSpawn,
   extractCollabFinalAnswer,
+  extractCodexSpawnIdentities,
+  normalizeCodexSubagentCall,
   isCodexSubagentControlCall,
+  isCodexSubagentWorkStartingCall,
   isCodexSubagentNamespace,
   isCodexSubagentSpawnCall,
 };

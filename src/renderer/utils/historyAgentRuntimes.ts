@@ -219,6 +219,11 @@ export interface HistoryAgentRuntime {
     projectId?: string | null,
     context?: AgentPresenceRequestContext,
   ) => Promise<AgentPtyPresence>;
+  prepareMainComposerForSend?: (tabId: string, options: {
+    expectedTarget: AgentSendTarget;
+    sendOperationKey?: string | null;
+    sendAttemptId?: string | null;
+  }) => Promise<{ success: boolean; inputWritten?: boolean; error?: string; code?: string }>;
   startFresh?: (args: {
     tabId: string;
     cwd?: string;
@@ -886,6 +891,8 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   optimisticBusyOnSend: false,
   optimisticActiveOnInterrupt: false,
   getPresence: getCodexPtyPresence,
+  prepareMainComposerForSend: (tabId, options) => ipcRenderer.invoke(
+    'codex:prepare-main-composer-for-send', { tabId, ...options }),
   startFresh: startFreshCodexSession,
   resume: resumeCodexSession,
   sendPrompt: sendCodexPrompt,

@@ -884,6 +884,15 @@
 }
 .cb-message--accent .cb-message-event-card { border-left-color: var(--cb-accent); }
 .cb-message--info .cb-message-event-card { border-left-color: var(--cb-message-info); }
+.cb-message--info > .cb-user-col > .cb-user-bubble {
+  background-color: rgba(59, 130, 246, 0.12);
+  border-color: rgba(96, 165, 250, 0.35);
+}
+.cb-question-reply-tool {
+  background-color: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  border-radius: 6px;
+}
 .cb-message--success .cb-message-event-card { border-left-color: var(--cb-message-success); }
 .cb-message--warning .cb-message-event-card { border-left-color: var(--cb-message-warning); }
 .cb-message--danger .cb-message-event-card {

@@ -6,16 +6,19 @@ import {
   resolveHistoryComposerPromptBandLayout,
 } from './historyComposerPromptBandLayout.mjs';
 
-test('prompt chips retain their natural width until three rows need a tighter share', () => {
+test('small prompt sets share the first left-to-right row before growing upward', () => {
   assert.deepEqual(resolveHistoryComposerPromptBandLayout(3), {
     itemCount: 3,
-    columns: 1,
+    columns: 3,
     gapPx: 5,
     maxRows: 3,
-    itemMaxWidth: 'min(168px, calc(100% - 0px))',
+    itemMaxWidth: 'min(168px, calc(33.333333% - 3.333333px))',
     maxHeight: 'calc(3.6em + 22px)',
   });
   assert.equal(HISTORY_COMPOSER_PROMPT_CHIP_MAX_WIDTH_PX, 168);
+  assert.equal(resolveHistoryComposerPromptBandLayout(1).columns, 1);
+  assert.equal(resolveHistoryComposerPromptBandLayout(2).itemMaxWidth,
+    'min(168px, calc(50% - 2.5px))');
 });
 
 test('the width share guarantees no more than three row-major rows', () => {
@@ -24,8 +27,7 @@ test('the width share guarantees no more than three row-major rows', () => {
     assert.ok(Math.ceil(count / layout.columns) <= HISTORY_COMPOSER_PROMPT_BAND_MAX_ROWS);
   }
   assert.equal(resolveHistoryComposerPromptBandLayout(4).itemMaxWidth,
-    'min(168px, calc(50% - 2.5px))');
+    'min(168px, calc(33.333333% - 3.333333px))');
   assert.equal(resolveHistoryComposerPromptBandLayout(7).itemMaxWidth,
     'min(168px, calc(33.333333% - 3.333333px))');
 });
-

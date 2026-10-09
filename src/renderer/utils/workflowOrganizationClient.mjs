@@ -1,5 +1,6 @@
 import { captureSpaceLayout, emptySpaceLayout } from './workspaceSpacesModel.mjs';
 import { INBOX_WORKFLOW_ID } from './workflowMembership.mjs';
+import { orderedWorkflows } from '../../shared/workflow-order.cjs';
 
 export function isExactGroupCloseGuard(guard, tabId, mutationId) {
   return !!guard && guard.tabId === tabId && typeof guard.mutationId === 'string' && !!guard.mutationId.trim()
@@ -81,10 +82,8 @@ export function createArchiveTitleRefresher({generateTitle,renameHistory}) {
 
 export function organizationProjection(snapshot, current) {
   if (snapshot?.publication?.version !== 1 || snapshot.publication.migrationVersion !== 1) throw new Error('workflow_publication_unavailable');
-  const spaces = snapshot.workflows.map(workflow => ({...workflow.metadata,id:workflow.id,kind:workflow.kind,
+  const spaces = orderedWorkflows(snapshot.workflows,snapshot.publication).map(workflow => ({...workflow.metadata,id:workflow.id,kind:workflow.kind,
     organizationRevision:workflow.revision,projectIds:[],layout:workflow.layout}));
-  spaces.sort((left,right) => (left.kind === 'inbox') - (right.kind === 'inbox')
-    || (Number(left.order) || 0) - (Number(right.order) || 0));
   const activeSpaceId = spaces.some(space => space.id === current.activeSpaceId) ? current.activeSpaceId
     : (spaces.find(space => space.kind !== 'inbox')?.id || INBOX_WORKFLOW_ID);
   const active = spaces.find(space => space.id === activeSpaceId);
@@ -98,10 +97,22 @@ export function organizationProjection(snapshot, current) {
     active:!!(tab.nativeRow || tab.legacyRow) && tab.nativeRow?.execution_archived !== 1,revision:tab.revision}]));
   const layout = {...emptySpaceLayout(),...(active?.layout || {})};
   if (!layout.splitPanes.length && !layout.activeSpaceTab) layout.splitPanes = [{windowId:activeSpaceId + ':initial',projectId:'__tab_catalog_v2__',tabId:''}];
-  return {spaces,activeSpaceId,...layout,tabWorkflowMembership,tabCatalog,
+  return {spaces,organizationWorkflowOrder:spaces.map(space=>space.id),activeSpaceId,...layout,tabWorkflowMembership,tabCatalog,
     organizationReady:true,organizationRevision:snapshot.publication.revision,
     organizationGeneration:snapshot.publication.generation,organizationError:null,
     organizationMigrationScopes:snapshot.migrationScopes || {},globalGroups:snapshot.globalGroups};
+}
+
+/** Follow a publication's order only if the local order still equals the last
+ * accepted publication. A late read/ACK cannot erase a newer local drag. Keep
+ * existing space objects (layouts, metadata drafts and MRU remain their own). */
+export function reconcileWorkflowOrder(published, current, previousOrder, activeSpaceId) {
+  const ids = current.map(space=>space.id);
+  if (!Array.isArray(previousOrder) || JSON.stringify(ids)!==JSON.stringify(previousOrder)
+    || activeSpaceId && !published.some(space=>space.id===activeSpaceId)) return current;
+  const existing=new Map(current.map(space=>[space.id,space]));
+  const ordered=published.map(space=>existing.get(space.id) || space);
+  return ordered.length===current.length && ordered.every((space,index)=>space===current[index]) ? current : ordered;
 }
 
 export function organizationSnapshot(state) {

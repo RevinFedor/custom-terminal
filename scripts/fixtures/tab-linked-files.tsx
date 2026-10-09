@@ -13,6 +13,7 @@ import { emptySpaceLayout } from '../../src/renderer/utils/workspaceSpacesModel.
 import { openTabLinkedFile } from '../../src/renderer/utils/tabLinkedFilePreview';
 import { collectTabLinkedFiles } from '../../src/renderer/utils/tabLinkedFiles.mjs';
 import { useTabLinkedFilePreviewBounds } from '../../src/renderer/utils/tabLinkedFilePreviewBounds';
+import { TAB_STRIP_ROW_GAP } from '../../src/renderer/utils/tabCardVisual.mjs';
 
 const f = (window as any).linkedFixture, p = 'links', cwd = '/synthetic-links';
 const owners = ['empty', 'one', 'many', 'other', 'long'].map(id => ({ id, name: id === 'many' ? 'Agent with tasks' : id === 'one' ? 'Single file owner' : id,
@@ -47,8 +48,8 @@ useUIStore.setState({ tabsFontSize: 14, filePreview: null, taskStatuses: [],
   tabGeometry: { paddingX: 6, paddingY: 3, paddingLeft: 16, borderRadius: 6, gap: 4 } } as any);
 f.navigate = (id: string) => useWorkspaceStore.getState().activateCenterTab(p, id);
 f.close = () => useUIStore.getState().closeFilePreview();
-f.geometry = (fontSize: number, paddingY: number) => useUIStore.setState(s => ({ tabsFontSize: fontSize,
-  tabGeometry: { ...s.tabGeometry, paddingY } }));
+f.geometry = (fontSize: number, paddingY: number, gap = 4) => useUIStore.setState(s => ({ tabsFontSize: fontSize,
+  tabGeometry: { ...s.tabGeometry, paddingY, gap } }));
 f.open = (owner: string, id: string) => {
   const file = collectTabLinkedFiles(useWorkspaceStore.getState().openProjects, owner).find((x:any) => x.id === id);
   return openTabLinkedFile(p, file, () => f.navigate(owner));
@@ -76,6 +77,7 @@ function Fixture() {
   useTabLinkedFilePreviewBounds(preview);
   const active = useWorkspaceStore(s => s.openProjects.get(p)?.activeTabId), header = useRef<HTMLDivElement>(null);
   const [dense,setDense]=useState(false);f.dense=setDense;
+  const [navigateMode,setNavigateMode]=useState(false);f.navigateMode=setNavigateMode;
   const [offset, setOffset] = useState(140), [bottom, setBottom] = useState(false), [split, setSplit] = useState(false);
   useEffect(() => {
     const ro = new ResizeObserver(() => setOffset((header.current?.getBoundingClientRect().bottom || 130) + 12));
@@ -83,11 +85,15 @@ function Fixture() {
   }, []);
   f.bottom = (value: boolean) => setBottom(value);
   f.split = (value: boolean) => setSplit(value);
+  if(navigateMode)return <div style={{padding:30}} data-navigate-fixture>
+    <TabCard projectId={p} tabId="many" linkedFilesMode="navigate" onClick={()=>{f.ownerClicks=(f.ownerClicks || 0)+1;}}
+      onLinkedFileOpen={file=>{f.navigateFile=file;}}/>
+  </div>;
   if(dense) return <><div style={{padding:20}}>
     {[true,false].map(before=><section key={String(before)}>
       <h2 style={{fontSize:14,margin:'10px 0'}}> {before?'Git f9b45cc — before':'Current — measured title and file clearances'} </h2>
       <div {...(before?{'data-dense-before':true}:{'data-dense-current':true})}
-        style={{display:'flex',flexWrap:'wrap',gap:4,alignItems:'flex-start',paddingBottom:30}}>
+        style={{display:'flex',flexWrap:'wrap',columnGap:4,rowGap:TAB_STRIP_ROW_GAP,alignItems:'flex-start',paddingBottom:30}}>
         {denseOwners.map(owner=>before?<BaselineTabCard key={owner.id} projectId={p} tabId={owner.id}/>
           :<AttachedAfterChild key={owner.id}><TabCard projectId={p} tabId={owner.id} onLinkedFileOpen={file=>void f.open(owner.id,file.id)}/></AttachedAfterChild>)}</div>
     </section>)}
@@ -97,7 +103,7 @@ function Fixture() {
     <div data-terminal-pane-chrome-host={split ? 'fixture-pane' : undefined}
       style={split ? { position: 'absolute', left: 100, top: 100, width: 330, height: 360 } : { display: 'contents' }}>
     <div ref={header} data-fixture-header data-split-attach-row style={{ position: 'absolute', left: 20, top: bottom ? 470 : 30, width: split ? 280 : 430,
-      display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'flex-start' }}>
+      display: 'flex', flexWrap: 'wrap', columnGap:5, rowGap:TAB_STRIP_ROW_GAP, alignItems: 'flex-start' }}>
       {owners.map((owner, index) => <PaneTabChip key={owner.id} projectId={p} tabId={owner.id} shown={active === owner.id}
         paneFocused paneIndex={null} inSplit={false} inStrip index={index}
         sharedActivity={{ processStatus: new Map([['many', true]]), busyTabs: new Map([['many', false]]) }} />)}

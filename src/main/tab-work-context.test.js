@@ -943,6 +943,43 @@ test('an own pathlib write removes only the file transition inside its successfu
   );
 });
 
+test('String.raw own Python write clears its pending diff and keeps the next prompt unchanged', async (t) => {
+  const harness = await openHarness(t, 'working\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\np=Path('${filePath}')\np.write_text('checked\\n')\nPY`;
+  const input = 'text(await tools.exec_command({cmd:String.raw`' + command + '`}));';
+  context.observeRecord(codexCall('raw-python-own', 'exec', { input }, { timestamp: new Date().toISOString() }));
+  assert.equal(context.shellEdits.size, 1);
+  fs.writeFileSync(filePath, 'checked\n');
+  await context.readFile(filePath);
+  assert.equal(context.get(owner.tabId).updates.length, 1, 'wait for the actual successful result');
+  context.observeRecord(codexResult('raw-python-own', {
+    timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(),
+    output: '{"exit_code":0}',
+  }));
+  await waitFor(() => context.get(owner.tabId).updates.length === 0, 'own raw command remained external');
+  assert.equal((await context.prepare(owner.tabId, 'after-raw-python', 'Next question')).prompt, 'Next question');
+});
+
+test('a failed String.raw Python write cannot consume an external update', async (t) => {
+  const harness = await openHarness(t, 'before\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\nPath('${filePath}').write_text('intended\\n')\nPY`;
+  const input = 'text(await tools.exec_command({cmd:String.raw`' + command + '`}));';
+  context.observeRecord(codexCall('raw-python-failed', 'exec', { input }, { timestamp: new Date().toISOString() }));
+  fs.writeFileSync(filePath, 'external\n');
+  await context.readFile(filePath);
+  context.observeRecord(codexResult('raw-python-failed', {
+    timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(),
+    output: '{"exit_code":1}',
+  }));
+  await Promise.allSettled([...context.reads.values()]);
+  assert.equal(context.get(owner.tabId).updates.length, 1);
+  assert.equal(context.get(owner.tabId).updates[0].hasUnknownSource, true);
+});
+
 test('a pathlib write from another tab attributes the exact file transition to that tab', async (t) => {
   let source;
   const harness = await openHarness(t, 'before\n', {
@@ -979,6 +1016,73 @@ test('a pathlib write from another tab attributes the exact file transition to t
   const update = context.get(owner.tabId).updates[0];
   assert.match(update.text, /^Sources: Python worker$/m);
   assert.equal(update.hasUnknownSource, false);
+});
+
+function computedPatchCall(callId, filePath, source = {}) {
+  return codexCall(callId, 'exec', { input: 'const path=' + JSON.stringify(filePath)
+    + '; const old=await tools.exec_command({cmd:"read working section"});\n'
+    + 'text(await tools.apply_patch(`*** Begin Patch\n*** Update File: ${path}\n@@\n${old}\n*** End Patch`));' }, source);
+}
+
+test('own computed patch uses the existing exact transition proof and does not attach its diff to the next prompt', async t => {
+  const h = await openHarness(t, 'old section\n'); if (!h) return;
+  const { context, owner, filePath } = h;
+  const identity = { tabId: owner.tabId, sessionId: owner.codexSessionId, timestamp: new Date().toISOString() };
+  context.observeRecord(computedPatchCall('computed-own', filePath, identity));
+  fs.writeFileSync(filePath, 'finished section\n'); await context.readFile(filePath);
+  assert.equal(context.get(owner.tabId).updates.length, 1);
+  context.observeRecord(codexResult('computed-own', { ...identity,
+    timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(), output: '' }));
+  await waitFor(() => context.get(owner.tabId).updates.length === 0, 'own computed patch remained external');
+  const prepared = await context.prepare(owner.tabId, 'next-real-message', 'Next question');
+  assert.equal(prepared.prompt, 'Next question');
+});
+
+test('computed own write removes its suffix while keeping the earlier external version', async t => {
+  const h = await openHarness(t, 'original\n'); if (!h) return;
+  const { context, owner, filePath } = h;
+  fs.writeFileSync(filePath, 'external\n');
+  const externalTime = new Date(Date.now() - 1000);
+  fs.utimesSync(filePath, externalTime, externalTime);
+  await context.readFile(filePath);
+  const identity = { tabId: owner.tabId, sessionId: owner.codexSessionId, timestamp: new Date().toISOString() };
+  context.observeRecord(computedPatchCall('computed-after-foreign', filePath, identity));
+  fs.writeFileSync(filePath, 'owned final\n'); await context.readFile(filePath);
+  context.observeRecord(codexResult('computed-after-foreign', { ...identity,
+    timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(), output: '' }));
+  await waitFor(() => {
+    const text = context.get(owner.tabId).updates[0]?.text || '';
+    return text.includes('external') && !text.includes('owned final');
+  }, 'external prefix was lost');
+  const update = context.get(owner.tabId).updates[0];
+  assert.equal(update.hasUnknownSource, true);
+  assert.equal(update.text.includes('owned final'), false);
+});
+
+test('failed computed call never consumes a file update even if that file changed in its interval', async t => {
+  const h = await openHarness(t, 'before\n'); if (!h) return;
+  const { context, owner, filePath } = h;
+  const identity = { tabId: owner.tabId, sessionId: owner.codexSessionId, timestamp: new Date().toISOString() };
+  context.observeRecord(computedPatchCall('computed-failed', filePath, identity));
+  fs.writeFileSync(filePath, 'external during failure\n'); await context.readFile(filePath);
+  context.observeRecord(codexResult('computed-failed', { ...identity,
+    timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(), output: 'Script error: patch failed' }));
+  await Promise.allSettled([...context.reads.values()]);
+  assert.equal(context.get(owner.tabId).updates.length, 1);
+});
+
+test('two computed calls to the same path do not claim an ambiguous physical transition', async t => {
+  const h = await openHarness(t, 'before\n'); if (!h) return;
+  const { context, owner, filePath } = h;
+  const identity = { tabId: owner.tabId, sessionId: owner.codexSessionId, timestamp: new Date().toISOString() };
+  context.observeRecord(computedPatchCall('computed-first', filePath, identity));
+  context.observeRecord(computedPatchCall('computed-second', filePath, identity));
+  fs.writeFileSync(filePath, 'ambiguous\n'); await context.readFile(filePath);
+  const timestamp = new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString();
+  context.observeRecord(codexResult('computed-first', { ...identity, timestamp, output: '' }));
+  context.observeRecord(codexResult('computed-second', { ...identity, timestamp, output: '' }));
+  await Promise.allSettled([...context.reads.values()]);
+  assert.equal(context.get(owner.tabId).updates.length, 1);
 });
 
 test('Claude assignment-prefixed cat and io.open writes use the own-transition proof', async (t) => {

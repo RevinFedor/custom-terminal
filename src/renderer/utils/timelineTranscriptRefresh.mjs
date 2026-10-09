@@ -1,6 +1,7 @@
 import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
 import { resolveHistoryPromptHandoffSemanticTags } from './historyOrchestrationPromptPresentation.mjs';
 import { getTerminalMcpTag, isServicePromptEntry, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
+import { projectNativeQuestionReply } from '../../shared/native-question-reply.mjs';
 
 const TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS = 2048;
 
@@ -129,6 +130,7 @@ function timelineLiveUserText(message) {
 export function projectTimelineLiveUserMessage(detail, {
   toolType,
   sessionId,
+  fingerprint,
 } = {}) {
   if (!detail || detail.toolType !== toolType) return null;
   const exactSessionId = String(detail.sessionId || '').trim();
@@ -148,8 +150,17 @@ export function projectTimelineLiveUserMessage(detail, {
   const timestamp = String(detail.timestamp || '').trim();
   if (!timestamp || !Number.isFinite(Date.parse(timestamp))) return null;
   const content = timelineLiveUserText(message);
+  // The native certificate addresses the entire original wire body. Validate
+  // with History's shared projection before any trim/budget; only that proven
+  // reply keeps the full body needed by Q/A display, Expand and Copy.
+  const rawContent = !message.questionReplyProof ? null : typeof message.message?.content === 'string' ? message.message.content
+    : (Array.isArray(message.message?.content) ? message.message.content : [])
+      .filter(block => block?.type === 'text' && typeof block.text === 'string')
+      .map(block => block.text).filter(Boolean).join('\n');
+  const nativeReply = message.questionReplyProof
+    && projectNativeQuestionReply({ ...message, role: 'user', content: rawContent }, fingerprint);
   const imagePaths = Array.isArray(message.imagePaths) ? message.imagePaths : [];
-  if (!content && imagePaths.length === 0) return null;
+  if (!content && !nativeReply && imagePaths.length === 0) return null;
   const sourceIdentityAliases = Array.isArray(message.sourceIdentityAliases)
     ? message.sourceIdentityAliases.map(String).filter(Boolean)
     : [];
@@ -158,7 +169,9 @@ export function projectTimelineLiveUserMessage(detail, {
     uuid,
     type: 'user',
     timestamp,
-    content: timelineSentHandoffPreview(content),
+    content: nativeReply ? rawContent : timelineSentHandoffPreview(content),
+    ...(nativeReply ? { questionReplyProof: { ...message.questionReplyProof,
+      links: message.questionReplyProof.links.map(link => ({ ...link })) } } : {}),
     sessionId: exactSessionId,
     hasImage: imagePaths.length > 0,
     handoffId: 'live-user:' + liveIdentity,

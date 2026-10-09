@@ -7,6 +7,9 @@ const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry')
 const { attachmentOwnershipReceipt, validateOwnedAttachmentSnapshot } = require('./owned-mobile-attachments');
 const { isAutomaticPromptQueueRequest, isAutomaticNoWriteWait, isAutomaticReadinessWaitReceipt } = require('../shared/prompt-queue-send-intent.cjs');
 const { mergeableQueuedSend, queuedSendMergeCompatible, composeQueuedSendMerge } = require('./queued-send-merge');
+const { protectQueueAssets, releaseQueueTransferPin, adoptCompletedQueueTransfers, adoptRunAfterItemAssets } = require('./replay-asset-ownership');
+const { classifyInputSlotRetirement, sendInputSlot } = require('./agent-send-input-slot');
+const { hiddenSendPresentation } = require('../shared/agent-send-receipt-control.cjs');
 const OPEN = "('waiting','dispatching','awaiting-receipt')";
 const ORDER = 'COALESCE(queue_position,id),id';
 const FAILED = new Set(['not-submitted', 'provider-not-accepted']);
@@ -16,6 +19,7 @@ const consumed = record => record?.state === 'confirmed'
   && !!(record.auditIdentity?.entryUuid || record.auditIdentity?.sourceIdentity);
 
 function applicationQueueReceipt(record, item) {
+  if (record?.deliveryControl?.cancelledAt) return null;
   const waitingBeforeInput = item?.state === 'waiting'
     && isAutomaticNoWriteWait(record, JSON.parse(item.request_json));
   if (!record || !item || !['waiting','dispatching'].includes(item.state)
@@ -36,7 +40,8 @@ function applicationQueueReceipt(record, item) {
 
 class AgentSendQueue {
   constructor({ store, execute, publish = () => {}, publishMerge = null, transferMergedContext = null,
-    ready = () => true, cancelAttempt = () => {}, admit = null, reconcile = null }) {
+    ready = () => true, cancelAttempt = () => {}, admit = null, reconcile = null,
+    readInputSlot = null, projectPresentation = null }) {
     this.store = store;
     this.db = store.db;
     this.execute = execute;
@@ -47,6 +52,11 @@ class AgentSendQueue {
     this.cancelAttempt = cancelAttempt;
     this.admit = admit;
     this.reconcile = reconcile;
+    this.readInputSlot = readInputSlot;
+    this.projectPresentation = projectPresentation;
+    this.slotObservations = new Map();
+    this.slotWakeSignatures = new Map();
+    this.slotDirty = new Set();
     this.disposed = false;
     this.running = new Set();
     this.scheduled = new Set();
@@ -74,8 +84,10 @@ class AgentSendQueue {
     if (!columns.has('asset_ids_json')) this.db.exec("ALTER TABLE agent_send_queue ADD COLUMN asset_ids_json TEXT NOT NULL DEFAULT '[]'");
     if (!columns.has('predecessor_key')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN predecessor_key TEXT');
     if (!columns.has('release_json')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN release_json TEXT');
+    if (!columns.has('slot_release_json')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN slot_release_json TEXT');
     if (!columns.has('queue_position')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN queue_position INTEGER');
     if (!columns.has('merge_json')) this.db.exec('ALTER TABLE agent_send_queue ADD COLUMN merge_json TEXT');
+    if (!columns.has('asset_transfer_ids_json')) this.db.exec("ALTER TABLE agent_send_queue ADD COLUMN asset_transfer_ids_json TEXT NOT NULL DEFAULT '[]'");
     this.db.exec(`CREATE TABLE IF NOT EXISTS agent_send_queue_merges(request_id TEXT PRIMARY KEY,
       request_hash TEXT NOT NULL,response_json TEXT NOT NULL);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS agent_send_queue_merge_sources(operation_key TEXT PRIMARY KEY,
@@ -97,6 +109,7 @@ class AgentSendQueue {
     const waitingBeforeInput = item.state === 'waiting' && record.state === 'not-submitted'
       && isAutomaticNoWriteWait(record, JSON.parse(item.request_json));
     return { version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
+      inputSlot: sendInputSlot(record, item),
       position: item.queue_position ?? item.id, mergePrevious: this.mergeGuard(operationKey),
       ...(waitingBeforeInput ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}),
       ...(item.merge_json ? { merge: JSON.parse(item.merge_json) } : {}),
@@ -179,6 +192,10 @@ class AgentSendQueue {
         const admitted = this.enqueue({ identity: composed.identity, request: composed.request });
         if (!admitted.ok || !admitted.item) throw Object.assign(new Error('merge admission failed'), { code: admitted.code });
         const key = composed.identity.operationKey;
+        // The replacement owns these bytes before either old presentation is
+        // dismissed. Keep the same atomic FIFO/immutable merge boundary.
+        protectQueueAssets(this.db, key, [...new Set([pair.before, pair.item]
+          .flatMap(item => JSON.parse(item.asset_transfer_ids_json || '[]')))]);
         this.db.prepare('UPDATE agent_send_queue SET queue_position=?,created_at=?,predecessor_key=?,merge_json=? WHERE operation_key=?')
           .run(pair.before.queue_position ?? pair.before.id, pair.before.created_at, pair.before.predecessor_key,
             JSON.stringify({ version: 1, requestId: request.requestId, sourceOperationKeys: originalKeys,
@@ -321,7 +338,7 @@ class AgentSendQueue {
       // receipt retires. They do not pin bytes; the asset owner's GC removes
       // unreferenced bytes and then retires these read-only aliases.
       // An already crossed operation is a receipt replay, never a new queue item.
-      if (reserved.record.attemptId || !['reserved','preparing'].includes(reserved.record.state)) {
+      if (reserved.record.deliveryControl?.cancelledAt || reserved.record.attemptId || !['reserved','preparing'].includes(reserved.record.state)) {
         return { ok: true, record: reserved.record, replayed: true, item: null };
       }
       const now = Date.now();
@@ -346,6 +363,7 @@ class AgentSendQueue {
         authoringSnapshot: snapshot.authoringSnapshot || null,
         ...(snapshot.ownedAttachments ? { ownedAttachments: snapshot.ownedAttachments } : {}),
       });
+      adoptRunAfterItemAssets(this.db, identity, snapshot);
       return { ok: true, item: this.item(identity.operationKey), record: this.store.get(identity.operationKey) };
     })(); } catch (error) {
       throw Object.assign(new Error('Application send queue could not persist admission'), {
@@ -384,11 +402,11 @@ class AgentSendQueue {
     const item = this.item(record.operationKey);
     if (!item) return record;
     const request = JSON.parse(item.request_json);
-    return { ...record, receipt: { promptText: request.prompt,
+    return { ...record, inputSlot: sendInputSlot(record, item), receipt: { promptText: request.prompt,
       presentationSnapshot: request.presentationSnapshot, authoringSnapshot: request.authoringSnapshot,
       ...(request.ownedAttachments ? { ownedAttachments: request.ownedAttachments,
         attachmentOwnership: attachmentOwnershipReceipt(request.ownedAttachments) } : {}),
-      source: request.source, ...(record.receipt || {}) }, applicationQueue: {
+      source: request.source, ...(record.receipt || {}), ...(this.projectPresentation?.(record) || {}) }, applicationQueue: {
       version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
       position: item.queue_position ?? item.id, mergePrevious: this.mergeGuard(item.operation_key),
       ...(item.merge_json ? { merge: JSON.parse(item.merge_json) } : {}),
@@ -402,7 +420,7 @@ class AgentSendQueue {
     if (!record || this.admitting > 0 || this.disposed) return;
     const item = this.item(record.operationKey);
     if (!item) return;
-    if (['waiting', 'dispatching'].includes(item.state)
+    if (!record.deliveryControl?.cancelledAt && ['waiting', 'dispatching'].includes(item.state)
       && isAutomaticNoWriteWait(record, JSON.parse(item.request_json))) {
       this.db.prepare("UPDATE agent_send_queue SET state = 'waiting', updated_at = ? WHERE operation_key = ?")
         .run(Date.now(), item.operation_key);
@@ -413,7 +431,7 @@ class AgentSendQueue {
     // A receipt can complete before the bridge returns. Running still holds
     // the physical scenario until its finally, even after this exact promotion.
     if (consumed(record) || FAILED.has(record.state)) {
-      this.finish(item, consumed(record) ? 'completed' : 'failed');
+      this.finish(item, consumed(record) ? 'completed' : record.deliveryControl?.cancelledAt ? 'cancelled' : 'failed');
     }
     this.publishRecord(record);
     this.wake(item.tab_id);
@@ -440,12 +458,15 @@ class AgentSendQueue {
 
   finish(item, state) {
     this.db.prepare(`UPDATE agent_send_queue SET state = ?, updated_at = ? WHERE operation_key = ?
-      AND state IN ${OPEN}`).run(state, Date.now(), item.operation_key);
+      AND (state IN ${OPEN}${state === 'completed' ? " OR state = 'released-unknown'" : ''})`)
+      .run(state, Date.now(), item.operation_key);
     this.executors.delete(item.operation_key);
     // Failed/Stop-cancelled drafts remain recoverable until explicit dismissal.
     if (state === 'completed') this.store.unpinForOwner(item.operation_key, 'application-send-queue');
+    if (state === 'completed') adoptCompletedQueueTransfers(this.db, item.operation_key);
     if (item.predecessor_key) this.store.unpinForOwner(item.predecessor_key, 'send-queue-successor:' + item.operation_key);
     const record = this.store.get(item.operation_key);
+    if (hiddenSendPresentation(record)) this.releasePresentation(item.operation_key);
     if (consumed(record) || FAILED.has(record?.state)) this.resolveWaiters(item.operation_key);
   }
 
@@ -460,7 +481,73 @@ class AgentSendQueue {
     });
   }
 
-  notifyRuntime(tabId) {
+  retireObsoleteInputSlot(tabId) {
+    if (this.disposed || this.running.has(tabId)) return Promise.resolve(false);
+    const existing = this.slotObservations.get(tabId);
+    if (existing) return existing;
+    const item = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
+      AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(tabId);
+    const record = item && this.store.get(item.operation_key);
+    if (!record?.attemptId || !['dispatching', 'awaiting-receipt'].includes(item.state)
+      || (!record.deliveryControl?.cancelledAt && typeof this.readInputSlot !== 'function')) return Promise.resolve(false);
+    let retired = false;
+    const work = Promise.resolve().then(async () => {
+      const observation = record.deliveryControl?.cancelledAt ? null : await this.readInputSlot(record);
+      if (this.disposed || this.running.has(tabId)) return false;
+      const result = this.db.transaction(() => {
+        const current = this.store.get(item.operation_key);
+        const head = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
+          AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(tabId);
+        if (head?.operation_key !== item.operation_key || current?.attemptId !== record.attemptId
+          || consumed(current) || this.running.has(tabId)) return false;
+        if (!current.deliveryControl?.cancelledAt
+          && (typeof observation?.isCurrent !== 'function' || observation.isCurrent() !== true)) return false;
+        const decision = classifyInputSlotRetirement(current, observation);
+        if (!decision.retire) return false;
+        const release = { version: 1, kind: 'input-slot-retired', reason: decision.reason,
+          operationKey: current.operationKey, attemptId: current.attemptId, retiredAt: Date.now(),
+          deliveryState: current.state, submitted: current.receipt?.submitted ?? null,
+          observedOwner: observation?.owner || null, processStatus: observation?.processStatus || null };
+        const changed = this.db.prepare(`UPDATE agent_send_queue SET state='released-unknown',
+          slot_release_json=?,updated_at=? WHERE operation_key=? AND state IN ${OPEN}`)
+          .run(JSON.stringify(release), release.retiredAt, item.operation_key);
+        return changed.changes === 1 ? current : false;
+      })();
+      if (!result) return false;
+      retired = true;
+      this.executors.delete(item.operation_key);
+      this.resolveWaiters(item.operation_key);
+      this.publishRecord(result);
+      console.log('[AgentSendQueue] input-slot retired tab=' + String(tabId).slice(-12)
+        + ' operation=' + item.operation_key.slice(0, 90) + ' delivery=' + result.state
+        + ' reason=' + JSON.parse(this.item(item.operation_key).slot_release_json).reason);
+      return true;
+    }).catch(error => {
+      console.warn('[AgentSendQueue] input-slot observation unknown tab=' + String(tabId).slice(-12)
+        + ' operation=' + item.operation_key.slice(0, 90) + ' error=' + error.message);
+      return false;
+    }).finally(() => {
+      if (this.slotObservations.get(tabId) === work) this.slotObservations.delete(tabId);
+      const changedWhileReading = this.slotDirty.delete(tabId);
+      if (retired) this.slotWakeSignatures.delete(tabId);
+      if ((retired || changedWhileReading) && !this.disposed) this.wake(tabId);
+    });
+    this.slotObservations.set(tabId, work);
+    return work;
+  }
+
+  notifyRuntime(tabId, slotSignature = null) {
+    // Only tabs with an unresolved physical head require this bounded read.
+    // It is event driven and coalesced; runtime events never retry old input.
+    const changed = slotSignature === null || this.slotWakeSignatures.get(tabId) !== slotSignature;
+    if (changed) {
+      if (slotSignature !== null) {
+        this.slotWakeSignatures.set(tabId, slotSignature);
+        if (this.slotWakeSignatures.size > 4096) this.slotWakeSignatures.delete(this.slotWakeSignatures.keys().next().value);
+      }
+      if (this.slotObservations.has(tabId)) this.slotDirty.add(tabId);
+      else void this.retireObsoleteInputSlot(tabId);
+    }
     for (const owner of this.parked) {
       if (owner === tabId) { this.wake(owner); continue; }
       const item = this.db.prepare(`SELECT request_json FROM agent_send_queue WHERE tab_id = ?
@@ -482,13 +569,24 @@ class AgentSendQueue {
     if (!item) return;
     const record = this.store.get(item.operation_key);
     if (!record) return; // Losing a receipt is not proof that input was untouched.
+    if (record.deliveryControl?.cancelledAt && !record.attemptId) {
+      this.finish(item, 'cancelled');
+      this.store.settleQueuedNoWrite(item.operation_key, { cancelled: true,
+        code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
+      this.wake(tabId);
+      return;
+    }
     const request = JSON.parse(item.request_json);
-    const waitingBeforeInput = item.state === 'waiting' && isAutomaticNoWriteWait(record, request);
+    const waitingBeforeInput = !record.deliveryControl?.cancelledAt
+      && item.state === 'waiting' && isAutomaticNoWriteWait(record, request);
     if (consumed(record) || (FAILED.has(record.state) && !waitingBeforeInput)) {
       this.observe(record);
       return;
     }
-    if (!waitingBeforeInput && (record.attemptId || !['reserved','preparing'].includes(record.state))) return;
+    if (!waitingBeforeInput && (record.attemptId || !['reserved','preparing'].includes(record.state))) {
+      await this.retireObsoleteInputSlot(tabId);
+      return;
+    }
     // Claim synchronously before calling any asynchronous scenario. An event or
     // a second client cannot launch another physical sender in this tab.
     this.running.add(tabId);
@@ -562,6 +660,9 @@ class AgentSendQueue {
         return !record?.attemptId || isAutomaticNoWriteWait(record, JSON.parse(item.request_json));
       });
     for (const item of items) {
+      const original = this.store.get(item.operation_key);
+      this.store.cancelDelivery({ operationKey: item.operation_key, tabId, handoffId: original.handoffId,
+        attemptId: original.attemptId, presentationDismissed: dismiss, reason: 'user-cancel' });
       this.finish(item, 'cancelled');
       const record = this.store.get(item.operation_key);
       if (!record.attemptId) this.store.settleQueuedNoWrite(item.operation_key, {
@@ -572,6 +673,44 @@ class AgentSendQueue {
       if (dismiss) this.releasePresentation(item.operation_key);
     }
     return { cancelled: items.length > 0, count: items.length };
+  }
+
+  // One user cancellation boundary for queued and already-started sends. It
+  // revokes future writes, but cannot rewrite an earlier Enter as not-submitted.
+  cancelDelivery(tabId, handoffId, { dismiss = true, reason = 'user-cancel' } = {}) {
+    const item = this.db.prepare(`SELECT q.* FROM agent_send_queue q
+      JOIN agent_send_receipts r ON r.operation_key=q.operation_key
+      WHERE q.tab_id=? AND r.handoff_id=?`).get(tabId, handoffId);
+    if (!item) return { cancelled: false, reason: 'queue-item-not-found' };
+    const before = this.store.get(item.operation_key);
+    let result;
+    this.admitting += 1;
+    try {
+      result = this.db.transaction(() => {
+        const cancelled = this.store.cancelDelivery({ operationKey: item.operation_key,
+          tabId, handoffId, attemptId: before.attemptId, reason, presentationDismissed: dismiss });
+        if (!cancelled.ok) return { cancelled: false, reason: cancelled.reason };
+        if (!before.attemptId) {
+          this.finish(item, 'cancelled');
+          this.store.settleQueuedNoWrite(item.operation_key, { cancelled: true,
+            code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
+        } else if (FAILED.has(before.state)) this.finish(item, 'cancelled');
+        return { cancelled: true, deliveryCancelled: !before.attemptId || FAILED.has(before.state),
+          deliveryOutcome: before.attemptId ? before.state : 'not-submitted',
+          operationKey: item.operation_key, attemptId: before.attemptId,
+          idempotent: cancelled.idempotent === true };
+      })();
+    } finally { this.admitting -= 1; }
+    if (result.cancelled) {
+      // Memory revocation runs in the same JS turn as the durable tombstone.
+      // A concurrent pre-write arm independently checks the durable marker.
+      this.cancelAttempt(this.store.get(item.operation_key));
+      if (dismiss) this.releasePresentation(item.operation_key);
+      this.publishRecord(this.store.get(item.operation_key));
+      this.resolveWaiters(item.operation_key);
+      this.wake(tabId);
+    }
+    return result;
   }
 
   dismissUnwritten(tabId, handoffId) {
@@ -588,9 +727,11 @@ class AgentSendQueue {
   releasePresentation(operationKey) {
     const record = this.store.get(operationKey);
     if (!record || (!consumed(record) && !FAILED.has(record.state))
-      || (!record.presentation && !record.receipt?.presentationDismissedAt)) return;
+      || (!record.presentation && !hiddenSendPresentation(record))) return;
     this.store.unpinForOwner(operationKey, 'application-send-queue');
     this.db.prepare("UPDATE agent_send_queue SET asset_ids_json = '[]' WHERE operation_key = ?").run(operationKey);
+    if (!consumed(record)) releaseQueueTransferPin(this.db, operationKey); // explicit dismissal of a failed/cancelled draft
+    else adoptCompletedQueueTransfers(this.db, operationKey); // canonical ACK alone is not a bytes owner
   }
 
   referencedAssetIds() {
@@ -615,7 +756,7 @@ class AgentSendQueue {
       const record = this.store.get(head.operation_key);
       // Cancels future work in the existing executor; never reverses an Enter
       // or reports the provider-owned item as an untouched application item.
-      if (record) this.cancelAttempt(record);
+      if (record) this.cancelDelivery(tabId, record.handoffId, { dismiss: false, reason: 'manual-stop' });
       if (!record?.attemptId) {
         this.finish(head, 'cancelled');
         this.store.settleQueuedNoWrite(head.operation_key,
@@ -636,8 +777,11 @@ class AgentSendQueue {
 function readQueuedSendAssetIds(db) {
   const result = new Set();
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_send_queue'").get()) return result;
-  for (const row of db.prepare("SELECT asset_ids_json FROM agent_send_queue WHERE state != 'completed'").iterate()) {
-    for (const id of JSON.parse(row.asset_ids_json)) result.add(id);
+  const protectedColumn = db.prepare('PRAGMA table_info(agent_send_queue)').all().some(column => column.name === 'asset_transfer_ids_json');
+  for (const row of db.prepare("SELECT state,asset_ids_json" + (protectedColumn ? ',asset_transfer_ids_json' : '')
+    + " FROM agent_send_queue WHERE state != 'completed'" + (protectedColumn ? " OR asset_transfer_ids_json!='[]'" : '')).iterate()) {
+    if (row.state !== 'completed') for (const id of JSON.parse(row.asset_ids_json)) result.add(id);
+    for (const id of JSON.parse(row.asset_transfer_ids_json || '[]')) result.add(id);
   }
   return result;
 }

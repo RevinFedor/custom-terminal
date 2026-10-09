@@ -26,7 +26,10 @@ assert.ok(sdkStart > 0 && sdkEnd > sdkStart);
 const cwdStart = store.indexOf('      const projectPath = workspace.projectPath &&', store.indexOf('createTabForWindowChooser:'));
 const cwdEnd = store.indexOf('      // Форки:', cwdStart);
 assert.ok(cwdStart > 0 && cwdEnd > cwdStart);
-const creation = transformSync('module.exports = {' + store.slice(start, end)
+const allocationStart = store.indexOf('async function allocateOrganizationTab(');
+const allocationEnd = store.indexOf('\nconst taskPlanUpdatedListener',allocationStart);
+assert.ok(allocationStart > 0 && allocationEnd > allocationStart);
+const creation = transformSync(store.slice(allocationStart,allocationEnd)+'\nmodule.exports = {' + store.slice(start, end)
   + store.slice(sdkStart, sdkEnd) + '};\nmodule.exports.chooserCwd = (context) => {const workspace=get().openProjects.get("project");'
   + store.slice(cwdStart, cwdEnd) + 'return cwd;};', { loader: 'ts', format: 'cjs' }).code;
 const main = fs.readFileSync(path.join(root, 'src/main/main.js'), 'utf8');
@@ -60,12 +63,14 @@ async function fixture(t, projectPath = '~') {
     process: { env: {} }, path, fs, os: { homedir: () => home }, resolveWorkingDirectory, validated,
   });
   const workspace = { projectId: 'project', projectPath, tabs: new Map(), tabCounter: 1, tabGroups: [], tabHistory: [] };
-  const state = { openProjects: new Map([['project', workspace]]), isRestoring: false,
+  const state = { openProjects: new Map([['project', workspace]]), isRestoring: false,organizationReady:false,
+    splitPanes:[],splitFocusedIndex:0,spaces:[],
     touchGlobalTabMru() {}, clearTerminalBuffer() {} };
   const ui = { newTabPrimarySurface: 'history', terminalIsPrimaryTabs: {}, setTabTerminalIsPrimary() {}, showToast() {} };
   const module = { exports: {} };
   vm.runInNewContext(creation, { module, console: quiet, log: { tabs() {} },
     get: () => state, set: next => Object.assign(state, next), useUIStore: { getState: () => ui },
+    useWorkspaceStore:{getState:()=>state},
     resolveWorkspaceCwd: systems.resolveWorkspaceCwd, restoreShortId: value => String(value || ''),
     resolveExistingTabGroupId: () => undefined, getNextAvailableName: () => 'tab',
     ipcRenderer: { invoke: async (channel, request) => {

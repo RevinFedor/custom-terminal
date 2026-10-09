@@ -1,6 +1,12 @@
 import { create } from 'zustand';
 const f = (window as any).settingsFixture;
+export const useUIStore=create<any>(()=>({workflowSettingsId:null}));
 export const useWorkspaceStore = create<any>((set, get) => ({
+  activeSpaceId:'a',
+  organizationReady:true,
+  openProjects:new Map([['N',{tabs:new Map([['source-a',{id:'source-a',name:'Tab A'}],['source-b',{id:'source-b',name:'Tab B'}]])}]]),
+  tabWorkflowMembership:{'source-a':{workflowId:'a',revision:1},'source-b':{workflowId:'b',revision:1}},
+  commitOrganization:async()=>{f.workflowCalls.push({type:'commit'});return {revision:1};},
   spaces: [
     { id: 'a', kind: 'ordinary', name: 'Development', icon: f.icon, future: { preserved: true } },
     { id: 'b', kind: 'ordinary', name: 'Inbox', icon: null },

@@ -18,7 +18,6 @@ import {
   GitBranch,
   Percent,
   PanelRightDashed,
-  Power,
 } from 'lucide-react';
 import {
   hasPendingPromptQueueContinuation,
@@ -35,13 +34,14 @@ import {
   type AutomationTab,
 } from '../../hooks/useAutomationInventory';
 import { cancelPendingAutoCompact, requestAutoCompactNow } from '../../hooks/usePromptQueueRunner';
-import { autoCompactIncludesTarget, UNPLACED_AUTOMATION_WORKFLOW } from '../../utils/autoCompactPolicy.mjs';
+import { autoCompactIncludesTarget, selectedAutoCompactScope, toggleAutoCompactScope, UNPLACED_AUTOMATION_WORKFLOW } from '../../utils/autoCompactPolicy.mjs';
 import { summarizeRunningAutoCompacts } from '../../utils/autoCompactActivityPresentation.mjs';
 import WorkflowChip from './WorkflowChip';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { pointInHoverCluster, pointInRect } from '../../utils/hoverBridge.mjs';
-import { captureQueueHoverReturn, createHoverReturnGate } from '../../utils/hoverReturnGate.mjs';
-import { layoutRunAfterCards, retainRunAfterGroups, RUN_AFTER_GROUP_INSET, RUN_AFTER_DEPTH_INSET } from '../../utils/runAfterDependencyLayout.mjs';
+import { captureQueueHoverReturn, createHoverReturnGate, hasOwnedClickPopup, isOwnedQueueChildDismiss,
+  queueOwnsPopup, QUEUE_CLICK_CHILD_CLOSED } from '../../utils/hoverReturnGate.mjs';
+import { layoutRunAfterCards, routeRunAfterEdges, retainRunAfterGroups, RUN_AFTER_GROUP_INSET, RUN_AFTER_DEPTH_INSET } from '../../utils/runAfterDependencyLayout.mjs';
 import { selectRunAfterOverview } from '../../utils/runAfterInventory.mjs';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 import { retainPanelPosition, scrollMovesAnchor } from '../../utils/anchoredPanelPosition.mjs';
@@ -58,6 +58,7 @@ const PANEL_MIN_W = 240;
 const PANEL_DEFAULT_W = 760;
 const PANEL_DEFAULT_H = 600;
 const GLOBAL_PANEL_SIZE_KEY = 'noted-terminal-global-run-after-size';
+const AUTO_COMPACT_ACTIVE_COLOR = '#a78bfa';
 
 type GlobalPanelSize = { width: number; height: number; resizeEnabled: boolean };
 type QueueCloseRef = { current: (reason?: 'outside') => boolean };
@@ -115,7 +116,8 @@ function globalRunAfterMinimumWidth(panel: HTMLElement | null, pages: HTMLElemen
     const canvas = control.closest<HTMLElement>('[data-global-run-after-graph]');
     if (!node || !canvas || !panel) return 0;
     const inset = panel.getBoundingClientRect().width - canvas.clientWidth;
-    const indent = RUN_AFTER_GROUP_INSET + (Number(node.dataset.globalRunAfterDepth) || 0) * RUN_AFTER_DEPTH_INSET;
+    const indent = Math.max(Number(canvas.dataset.raMinimumInset) || 0,
+      RUN_AFTER_GROUP_INSET + (Number(node.dataset.globalRunAfterDepth) || 0) * RUN_AFTER_DEPTH_INSET);
     return control.getBoundingClientRect().right - node.getBoundingClientRect().left + indent + inset + 1;
   })));
 }
@@ -129,8 +131,11 @@ function QueueTabNode({ tab, queue, busy, awaited }: {
   const active = useWorkspaceStore(state => state.activeProjectId === tab.projectId
     && state.openProjects.get(tab.projectId)?.activeTabId === tab.id);
   const hasCondition = queue?.items.some(item => isQueuedPromptEnabled(item) && item.condition);
-  const navigate = () => {
-    useWorkspaceStore.getState().placeTab(tab.projectId, tab.id);
+  const navigate = async () => {
+    const opened = await useWorkspaceStore.getState().openTabById(tab.id, {
+      projectId: tab.projectId, reason: 'global-run-after-tab',
+    });
+    if (!opened) return;
     useUIStore.getState().setActiveArea('workspace');
     requestTabPrimaryInputFocus(tab.id, 'global-run-after-tab');
   };
@@ -276,17 +281,16 @@ function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContent
   const cancelled = useRef(false);
   const update = useAutoCompactStore.getState().updatePolicy;
 
-  useEffect(() => {
-    if (!hydrated || policy.scopeInitialized) return;
-    const current = useWorkspaceStore.getState().activeSpaceId;
-    update({ workflowIds: current ? [current] : [], scopeInitialized: true });
-  }, [hydrated, policy.scopeInitialized, update]);
+  const scope = selectedAutoCompactScope(policy);
+  const toggleScope = (action: { kind: 'all' | 'unplaced' } | { kind: 'workflow'; id: string }) => {
+    update(toggleAutoCompactScope(useAutoCompactStore.getState().policy, action));
+  };
 
   const selectedWorkflowNames = inventory.groups
-    .filter((group: any) => group.id !== UNPLACED_AUTOMATION_WORKFLOW && policy.workflowIds.includes(group.id))
+    .filter((group: any) => group.id !== UNPLACED_AUTOMATION_WORKFLOW && scope.workflowIds.includes(group.id))
     .map((group: any) => group.name);
-  const scopeLabel = policy.allWorkflows ? 'Все workflow' : selectedWorkflowNames.join(', ');
-  const scopeText = [scopeLabel, policy.includeUnplaced ? 'Без workflow' : ''].filter(Boolean).join(' + ');
+  const scopeLabel = scope.allWorkflows ? 'Все workflow' : selectedWorkflowNames.join(', ');
+  const scopeText = [scopeLabel, scope.includeUnplaced ? 'Без workflow' : ''].filter(Boolean).join(' + ');
 
   const inspect = async () => {
     setLoading(true); setError(''); setSelected([]); setResults({});
@@ -333,16 +337,9 @@ function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContent
       <div style={{ position: 'relative', border: '1px solid #343434', borderRadius: 8, padding: '19px 10px 10px' }}>
         <div style={{ position: 'absolute', top: 0, left: 10, transform: 'translateY(-50%)', display: 'inline-flex',
           alignItems: 'center', gap: 4, padding: '0 4px', background: '#181818' }}>
-          <button type="button" className="gra-control" disabled={!hydrated || !scopeText} aria-pressed={policy.enabled}
-            onClick={() => update({ enabled: !policy.enabled })} title={scopeText ? `Область: ${scopeText}` : 'Сначала выберите workflow'}
-            style={{ ...button, height: 25, padding: '0 8px', display: 'inline-flex', alignItems: 'center', gap: 5,
-              color: policy.enabled ? '#e7bb8d' : '#999', borderColor: policy.enabled ? '#8a5f39' : '#383838',
-              background: policy.enabled ? 'rgba(147,88,42,0.20)' : '#1e1e1e', opacity: !hydrated || !scopeText ? 0.55 : 1 }}>
-            <Power size={12} /> Автокомпакт
-          </button>
           <label title="Порог использованного контекста" style={{ height: 25, display: 'inline-flex', alignItems: 'center',
             gap: 3, padding: '0 6px', border: '1px solid #383838', borderRadius: 6, background: '#1e1e1e',
-            color: '#a9d8ba', boxSizing: 'border-box' }}>
+            color: policy.enabled ? AUTO_COMPACT_ACTIVE_COLOR : '#999', boxSizing: 'border-box' }}>
             ≥
             <input aria-label="Порог автокомпакта" className="gra-number" type="number" min={1} max={100} value={policy.percent}
               disabled={!hydrated} onChange={(event) => update({ percent: Number(event.target.value) })}
@@ -354,24 +351,19 @@ function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContent
           После новых завершённых ответов · область: {scopeText || 'не выбрана'}
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-          <ChoiceChip selected={policy.allWorkflows} disabled={!hydrated} onClick={() => update({ allWorkflows: !policy.allWorkflows })}>
+          <ChoiceChip selected={scope.allWorkflows} disabled={!hydrated} onClick={() => toggleScope({ kind: 'all' })}>
             Все workflow
           </ChoiceChip>
           {inventory.groups.map((group: any) => {
             const unplaced = group.id === UNPLACED_AUTOMATION_WORKFLOW;
-            const selectedGroup = unplaced ? policy.includeUnplaced : policy.allWorkflows || policy.workflowIds.includes(group.id);
+            const selectedGroup = unplaced ? scope.includeUnplaced : scope.allWorkflows || scope.workflowIds.includes(group.id);
             const runningCount = running.workflowCounts.get(group.id) || 0;
             return (
               <WorkflowChip key={group.id} workflowId={group.id} label={group.name} icon={group.icon}
                 data-auto-compact-workflow-chip={group.id} unplaced={unplaced}
-                selected={selectedGroup} disabled={!hydrated || (!unplaced && policy.allWorkflows)}
+                selected={selectedGroup} disabled={!hydrated || (!unplaced && scope.allWorkflows)}
                 title={group.projectNames.length ? group.projectNames.join(', ') : undefined}
-                onClick={() => {
-                  if (unplaced) update({ includeUnplaced: !policy.includeUnplaced });
-                  else update({ workflowIds: policy.workflowIds.includes(group.id)
-                    ? policy.workflowIds.filter((id: string) => id !== group.id)
-                    : [...policy.workflowIds, group.id] });
-                }}>
+                onClick={() => toggleScope(unplaced ? { kind: 'unplaced' } : { kind: 'workflow', id: group.id })}>
                 {selectedGroup && <Check aria-hidden size={11} strokeWidth={2.5} style={{ flexShrink: 0 }} />}
                 {runningCount > 0 && <AutoCompactRunningIndicator count={runningCount} scope={group.id} />}
               </WorkflowChip>
@@ -479,7 +471,7 @@ function QueueOverview({ inventory, queues, busy, beforeCloseRef, layoutMemoryRe
       // the frame feeds back into packing and prevents later content growth.
       const availableWidth = Math.max(1, resizeEnabled ? canvas.clientWidth : widthLimit - inset);
       canvas.style.setProperty('--ra-layout-width', availableWidth + 'px');
-      const maximum = Math.max(180, Math.min(320, availableWidth - 32));
+      const maximum = Math.max(180, Math.min(320, availableWidth - Math.max(32, (Number(canvas.dataset.raMinimumInset) || 0) + 2)));
       const cssWidth = maximum + 'px';
       if (canvas.style.getPropertyValue('--ra-card-max-width') !== cssWidth) canvas.style.setProperty('--ra-card-max-width', cssWidth);
       const elements = Array.from(canvas.querySelectorAll<HTMLElement>('[data-global-run-after-node]'));
@@ -496,22 +488,32 @@ function QueueOverview({ inventory, queues, busy, beforeCloseRef, layoutMemoryRe
         }));
         const loopRect = element.querySelector<HTMLElement>('[data-prompt-queue-loop-toggle]')?.getBoundingClientRect() || controlsRect;
         stepAnchors.set('queue-target', { x: loopRect.left - rect.left - 3, y: loopRect.top - rect.top + loopRect.height / 2 });
-        return { id: element.dataset.globalRunAfterNode!, element, editor, width: rect.width, height: rect.height,
+        const topOutset = Math.max(0, ...Array.from(header.querySelectorAll<HTMLElement>(
+          '[data-global-run-after-condition-mark], [data-tab-fast-badge], [data-tab-completion-notification-badge]'))
+          .map(signal => rect.top - signal.getBoundingClientRect().top));
+        return { id: element.dataset.globalRunAfterNode!, element, editor, width: rect.width, height: rect.height, topOutset,
           stepAnchors,
           headerY: headerRect.top - rect.top + headerRect.height / 2,
           // The whole header starts with the project icon. No path crosses it.
           headerX: headerRect.left - rect.left,
           overlapAdjustment: chipRect.bottom - 2 - controlsRect.top };
       });
-      const sizes = snapshots.map(({ id, width, height }) => ({ id, width, height }));
+      const sizes = snapshots.map(({ id, width, height, topOutset }) => ({ id, width, height, topOutset }));
       layoutMemoryRef.current.primary = retainRunAfterGroups(layoutMemoryRef.current.primary, { nodeIds: [...primary], edges: visibleEdges });
-      const main = layoutRunAfterCards({ nodeIds: [...primary], edges: visibleEdges, sizes, availableWidth, groups: layoutMemoryRef.current.primary });
       const shelfHeight = shelfRef.current?.getBoundingClientRect().height || 0;
-      const shelfTop = main.height ? main.height + 12 : 26;
-      const secondaryTop = shelfTop + (shelfHeight ? shelfHeight + 10 : 0);
       layoutMemoryRef.current.secondary = retainRunAfterGroups(layoutMemoryRef.current.secondary, { nodeIds: [...secondary], edges: visibleEdges });
-      const extra = layoutRunAfterCards({ nodeIds: [...secondary], edges: visibleEdges, sizes, availableWidth, groups: layoutMemoryRef.current.secondary });
-      const positions = new Map([...main.nodes, ...extra.nodes.map(node => ({ ...node, y: node.y + secondaryTop }))].map(node => [node.id, node]));
+      const firstSecondary = layoutMemoryRef.current.secondary[0]?.nodes[0]?.id;
+      const layout = layoutRunAfterCards({ nodeIds: [...primary, ...secondary], edges: visibleEdges, sizes, availableWidth,
+        groups: [...layoutMemoryRef.current.primary, ...layoutMemoryRef.current.secondary],
+        breakBefore: new Map(firstSecondary ? [[firstSecondary, shelfHeight + 22 + (primary.size ? 0 : 26)]] : []) });
+      const minimumInset = String(layout.minimumInset || RUN_AFTER_GROUP_INSET);
+      if (canvas.dataset.raMinimumInset !== minimumInset) {
+        canvas.dataset.raMinimumInset = minimumInset;
+        schedule();
+      }
+      const shelfTop = firstSecondary ? layout.separators.get(firstSecondary)! + (primary.size ? 12 : 38)
+        : layout.height ? layout.height + 12 : 26;
+      const positions = new Map(layout.nodes.map(node => [node.id, node]));
       for (const item of snapshots) {
         const position = positions.get(item.id);
         if (!position) continue;
@@ -519,6 +521,8 @@ function QueueOverview({ inventory, queues, busy, beforeCloseRef, layoutMemoryRe
         if (item.element.style.transform !== transform) item.element.style.transform = transform;
         item.element.dataset.globalRunAfterDepth = String(position.depth);
         item.element.dataset.globalRunAfterLane = String(position.lane);
+        item.element.dataset.globalRunAfterRow = String(position.row);
+        item.element.dataset.globalRunAfterColumn = String(position.column);
         // Only a scoped margin changes; the shared TabCard's padding remains its owner's.
         if (Math.abs(item.overlapAdjustment) > 0.1) {
           item.editor.style.marginTop = (parseFloat(item.editor.style.marginTop || '0') + item.overlapAdjustment) + 'px';
@@ -526,27 +530,22 @@ function QueueOverview({ inventory, queues, busy, beforeCloseRef, layoutMemoryRe
       }
       const shelfTransform = `translate(0px, ${shelfTop}px)`;
       if (shelfRef.current && shelfRef.current.style.transform !== shelfTransform) shelfRef.current.style.transform = shelfTransform;
-      const totalHeight = extra.nodes.length ? secondaryTop + extra.height : shelfHeight ? shelfTop + shelfHeight : main.height;
+      const totalHeight = firstSecondary ? layout.height : shelfHeight ? shelfTop + shelfHeight : layout.height;
       const emptyBounds = canvas.querySelector('[data-global-run-after-empty]')?.getBoundingClientRect();
       const height = Math.max(totalHeight, emptyBounds?.height || 0) + 'px';
       if (canvas.style.height !== height) canvas.style.height = height;
       const shelfWidth = shelfRef.current?.querySelector('button')?.getBoundingClientRect().width || 0;
       const emptyWidth = emptyBounds?.width || 0;
-      onContentWidth(Math.max(main.width, extra.width, shelfWidth, emptyWidth + 8) + inset);
+      onContentWidth(Math.max(layout.width, shelfWidth + RUN_AFTER_GROUP_INSET, emptyWidth + 8) + inset);
       const headerMap = new Map(snapshots.map(item => [item.id, item]));
+      const connections = new Map(routeRunAfterEdges({ ...layout, edges: visibleEdges, anchors: headerMap })
+        .map(edge => [edge.source + ':' + edge.itemId, edge]));
       for (const path of svgRef.current?.querySelectorAll<SVGPathElement>('[data-run-after-edge-item]') || []) {
-        const source = positions.get(path.dataset.runAfterEdgeOwner!), target = positions.get(path.dataset.runAfterEdgeTarget!);
-        const sourceHeader = headerMap.get(path.dataset.runAfterEdgeOwner!), targetHeader = headerMap.get(path.dataset.runAfterEdgeTarget!);
-        if (!source || !target || !sourceHeader || !targetHeader) continue;
-        const origin = sourceHeader.stepAnchors.get(path.dataset.runAfterEdgeItem!);
-        if (!origin) { path.setAttribute('d', ''); continue; }
-        const sx = source.x + origin.x, sy = source.y + origin.y;
-        const tx = target.x + targetHeader.headerX - 3, ty = target.y + targetHeader.headerY;
-        const lane = Math.min(source.lane, target.lane), r = 4, down = ty >= sy ? 1 : -1;
-        const d = `M ${sx} ${sy} H ${lane + r} Q ${lane} ${sy} ${lane} ${sy + down * r} V ${ty - down * r} Q ${lane} ${ty} ${lane + r} ${ty} H ${tx}`;
-        if (path.getAttribute('d') !== d) path.setAttribute('d', d);
+        const edge = connections.get(path.dataset.runAfterEdgeOwner + ':' + path.dataset.runAfterEdgeItem);
+        if (path.getAttribute('d') !== (edge?.d || '')) path.setAttribute('d', edge?.d || '');
         const dot = path.nextElementSibling;
-        dot?.setAttribute('cx', String(sx)); dot?.setAttribute('cy', String(sy));
+        dot?.setAttribute('visibility', edge ? 'visible' : 'hidden');
+        if (edge) { dot?.setAttribute('cx', String(edge.start.x)); dot?.setAttribute('cy', String(edge.start.y)); }
       }
     };
     const schedule = () => { if (!frame) frame = requestAnimationFrame(measure); };
@@ -569,7 +568,7 @@ function QueueOverview({ inventory, queues, busy, beforeCloseRef, layoutMemoryRe
       style={{ position: 'absolute', left: 0, top: 0, width: '100%', borderTop: '1px solid #2e2e2e', paddingTop: 7 }}>
       <button type="button" className="gra-control" aria-expanded={showDisabled}
         onClick={() => { if (!showDisabled || beforeCloseRef.current()) setShowDisabled(value => !value); }}
-        style={{ ...button, height: 25, display: 'inline-flex', alignItems: 'center', gap: 5, color: '#8f8f95' }}>
+        style={{ ...button, height: 25, marginLeft: RUN_AFTER_GROUP_INSET, display: 'inline-flex', alignItems: 'center', gap: 5, color: '#8f8f95' }}>
         {showDisabled ? <EyeOff size={12} /> : <Eye size={12} />} Выключенные · {disabled.size}
       </button>
     </div>}
@@ -616,6 +615,7 @@ export function GlobalRunAfterControl() {
   const editorGestureActiveRef = useRef(false);
   const previewPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
   const hoverReturnRef = useRef(createHoverReturnGate());
+  const backdropChildDismissRef = useRef(false);
   const handleEditorGesture = useCallback((active: boolean, point: { clientX: number; clientY: number } | null) => {
     // Captured pointermove/native drag can suppress compatibility mousemove.
     // Forward actual gesture coordinates; never recover with a delayed close.
@@ -703,6 +703,7 @@ export function GlobalRunAfterControl() {
   const recheckPreviewHover = useCallback((point: { clientX: number; clientY: number } | null) => {
     if (mode !== 'preview' || pickingRewind || editorGestureActive || resizeActiveRef.current) return;
     if (!point) { closePanel(); return; }
+    if (hasOwnedClickPopup(panelRef.current)) return;
     const panelRect = panelRef.current?.getBoundingClientRect() || null;
     const satelliteRects = [triggerRef.current?.getBoundingClientRect() || null,
       ...Array.from(panelRef.current?.querySelectorAll<HTMLElement>(
@@ -719,6 +720,13 @@ export function GlobalRunAfterControl() {
   useEffect(() => {
     if (mode !== 'preview') { hoverReturnRef.current.reset(); return; }
     const onChildClick = (event: MouseEvent) => captureQueueHoverReturn(event, panelRef.current, hoverReturnRef.current);
+    const onChildClosed = (event: Event) => {
+      const { owner, reason, point } = (event as CustomEvent).detail;
+      if (!queueOwnsPopup(panelRef.current, owner)) return;
+      if (point) previewPointerRef.current = point;
+      if (reason !== 'selection') hoverReturnRef.current.reset();
+      if (reason !== 'escape') recheckPreviewHoverRef.current(previewPointerRef.current);
+    };
     const onMove = (event: MouseEvent) => {
       previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
       recheckPreviewHover(event);
@@ -729,11 +737,13 @@ export function GlobalRunAfterControl() {
     // selection ends, recheck the real last pointer even without a new move.
     recheckPreviewHover(previewPointerRef.current);
     window.addEventListener('click', onChildClick, true);
+    window.addEventListener(QUEUE_CLICK_CHILD_CLOSED, onChildClosed);
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseout', onMouseOut);
     window.addEventListener('blur', onExitWindow);
     return () => {
       window.removeEventListener('click', onChildClick, true);
+      window.removeEventListener(QUEUE_CLICK_CHILD_CLOSED, onChildClosed);
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseout', onMouseOut);
       window.removeEventListener('blur', onExitWindow);
@@ -861,7 +871,8 @@ export function GlobalRunAfterControl() {
             willChange: 'transform' }} />
         </span>}
         <GitBranch size={13} aria-hidden="true" /> {activeCount}
-        {policy.enabled && <Percent size={11} color="#d9a76f" aria-label={`Автокомпакт включён при ${policy.percent}%`} />}
+        {policy.enabled && <Percent size={11} style={{ color: AUTO_COMPACT_ACTIVE_COLOR }}
+          data-global-run-after-auto-compact-percent aria-label={`Автокомпакт включён при ${policy.percent}%`} />}
       </button>
 
       {visible && createPortal(
@@ -871,11 +882,19 @@ export function GlobalRunAfterControl() {
               data-global-run-after-overlay
               onMouseDown={(event) => {
                 event.preventDefault();
-                event.stopPropagation();
+                backdropChildDismissRef.current = hasOwnedClickPopup(panelRef.current)
+                  || isOwnedQueueChildDismiss(panelRef.current, event.nativeEvent);
+                // Let the child's outside handler receive this gesture. Its
+                // close notification will recheck hover; this backdrop must
+                // not swallow the child's dismissal or dismiss both levels.
+                if (!backdropChildDismissRef.current) event.stopPropagation();
               }}
               onClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
+                const childDismiss = backdropChildDismissRef.current;
+                backdropChildDismissRef.current = false;
+                if (childDismiss) return;
                 closePanel('outside');
               }}
               style={{ position: 'fixed', inset: 0, zIndex: 14999, background: 'transparent' }}
@@ -898,7 +917,9 @@ export function GlobalRunAfterControl() {
             style={{ ...button, height: 28, padding: '0 9px', display: 'inline-flex', alignItems: 'center', gap: 5,
               color: page === 'compact' ? '#e6bb8b' : '#929297',
               borderColor: page === 'compact' ? '#79583b' : '#363636' }}>
-            <span>Автокомпакт{policy.enabled ? ` · ≥${policy.percent}%` : ''}</span>
+            <span>Автокомпакт</span>
+            {policy.enabled && <span data-global-run-after-auto-compact-threshold
+              style={{ color: AUTO_COMPACT_ACTIVE_COLOR }}>· ≥{policy.percent}%</span>}
             {runningCompacts.total > 0 && <AutoCompactRunningIndicator count={runningCompacts.total} scope="global" />}
           </button>
           <button type="button" className="gra-page" data-global-run-after-resize-toggle

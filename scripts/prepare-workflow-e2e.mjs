@@ -11,10 +11,14 @@ const lease=await fs.mkdtemp(path.join(os.tmpdir(),'noted-workflow-e2e-'));
 const source=path.join(lease,'source');
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 const hashes={};
+const lean=process.argv.includes('--lean');
+const runtimeRoots=new Set(['src','scripts','packages','build','build-resources','resources','public','index.html','package.json','electron.vite.config.js','tsconfig.json']);
 const excluded=new Set(['node_modules','.git','dist','release','logs','target','.DS_Store']);
 async function snapshot(from,to,prefix='') {
   await fs.mkdir(to,{recursive:true});
   for(const entry of await fs.readdir(from,{withFileTypes:true})) {
+    if(lean && prefix==='' && !runtimeRoots.has(entry.name))continue;
+    if(lean && prefix==='packages/' && entry.name!=='claude-blocks')continue;
     if(excluded.has(entry.name) || entry.name==='.env' || entry.name.startsWith('.env.')
       || /\.(?:sqlite|db|log)(?:$|-)/.test(entry.name) || prefix==='packages/' && entry.name==='codex')continue;
     const src=path.join(from,entry.name),dest=path.join(to,entry.name),relative=prefix+entry.name;
@@ -31,7 +35,7 @@ await fs.symlink(path.join(project,'node_modules'),path.join(source,'node_module
 const shared=path.join(lease,'noted-shared');
 await snapshot(path.resolve(project,'../noted-shared'),shared,'../noted-shared/');
 await fs.symlink(path.resolve(project,'../noted-shared/node_modules'),path.join(shared,'node_modules'));
-const env={NODE_ENV:'development',NOTED_E2E_TEST:'true',NOTED_E2E_WINDOWED:'1',NOTED_E2E_USE_BUILT_RENDERER:'true',
+const env={NODE_ENV:'development',NOTED_E2E_TEST:'true',NOTED_E2E_WINDOWED:'1',NOTED_E2E_VISIBLE:'1',NOTED_E2E_USE_BUILT_RENDERER:'true',
   NOTED_E2E_FILE_LOG:'1',NOTED_E2E_CLI_ISOLATION_ROOT:lease,NOTED_USER_DATA_DIR:path.join(lease,'user-data'),
   NOTED_DISCOVERY_DIR:path.join(lease,'discovery'),CODEX_HOME:path.join(lease,'codex-profile'),CLAUDE_CONFIG_DIR:path.join(lease,'claude-profile'),
   NOTED_CDP_PORT:'9347',NOTED_WEB_PORT:'7994',NOTED_RENDERER_PORT:'5197'};

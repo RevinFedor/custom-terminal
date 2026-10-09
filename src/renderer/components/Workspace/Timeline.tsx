@@ -2,6 +2,9 @@ import {useHistorySearchMarkers} from '../../utils/historySearchMarkers';
 import {historySearchEntryKeys} from '../../../shared/history-search.mjs';
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
+import { resolveTimelineFullResponse, resolveTimelinePromptImages, timelineFinalNavigationIdentity } from '../../utils/timelineEntryPreview.mjs';
+import { TimelineEntryPreview } from './TimelineEntryPreview';
+import { useOrchestrationStore, subscribeOrchestrationRunChanges } from '../../store/useOrchestrationStore';
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, ChevronRight, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
@@ -112,7 +115,7 @@ import {
 } from '../../utils/historyRewriteRewind';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
-import { getTerminalMcpTag, isServicePromptEntry, isSystemPromptEntry } from '../../../shared/prompt-origin.mjs';
+import { getLoopPromptOriginTag, getTerminalMcpTag, isServicePromptEntry } from '../../../shared/prompt-origin.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 const timelinePathApi = window.require('path');
@@ -438,6 +441,7 @@ const StatusLabelPortal: React.FC<{
 };
 
 interface TimelineEntry {
+  questionReplyProof?: any;
   uuid: string;
   type: 'user' | 'compact' | 'continued' | 'docs_edit' | 'docs_search';
   timestamp: string;
@@ -509,6 +513,9 @@ interface TimelineEntry {
   responseTokens?: number;
   responseModel?: string;          // last assistant.message.model for this turn (e.g. 'deepseek-v4-flash', 'claude-opus-4-7')
   responseHasThinking?: boolean;   // any assistant content block of type 'thinking' in this turn
+  responseEffort?: string;
+  responsePreview?: { version: number; uuid: string; sourceIdentity?: string; sessionId?: string;
+    timestamp?: string; content: string; contentLength: number; truncated: boolean; contentRevision?: string; entryRef?: any };
   sourceLine?: number;
   sourceIdentity?: string;
   sourceIdentityAliases?: string[];
@@ -745,10 +752,6 @@ function getOrchestrationTag(entry: TimelineEntry) {
   return getTerminalMcpTag(entry);
 }
 
-function getLoopPromptOriginTag(entry: TimelineEntry) {
-  return entry.semanticTags?.find(tag => tag.kind === 'prompt-origin' && tag.source === 'loop') || null;
-}
-
 // Build grouping map for consecutive built-in sub-agent or durable Terminal MCP
 // turns. The structural sidecar tag is the only orchestration classifier; text
 // such as "[Оркестрация]" is intentionally ignored.
@@ -926,7 +929,9 @@ interface TimelineSegmentRowProps {
   isLastBoundary: boolean;
   failedFlashKind: 'fork' | 'plan' | 'boundary' | 'compact-strip' | null;
   isForkActive: boolean;
-  isCmdHeld: boolean;
+  // Only fork strips use Cmd for their cursor. Ordinary markers must not
+  // receive the global modifier as a changing memo prop.
+  forkCmdHeld: boolean;
   // Shared scalars.
   isExpandedLayout: boolean;
   treeMode: boolean;
@@ -972,7 +977,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   isLastBoundary,
   failedFlashKind,
   isForkActive,
-  isCmdHeld,
+  forkCmdHeld,
   isExpandedLayout,
   treeMode,
   isCodex,
@@ -995,9 +1000,14 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   const entryIsTimeout = !!entry.isSubAgentTimeout;
   const orchestrationTag = getOrchestrationTag(entry);
   const entryIsOrchestration = !!orchestrationTag;
-  const markerKind = timelineMarkerKind(entry);
+  const markerKind = timelineMarkerKind(entry, entry.questionReplyProof
+    ? (text: string) => window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex')
+    : undefined);
+  const entryIsQuestionReply = markerKind === 'question-reply';
   const entryIsExternalResearch = markerKind === 'sc-desktop';
-  const entryIsSystem = isSystemPromptEntry(entry);
+  const entryIsAutomaticContinuation = markerKind === 'continue' || markerKind === 'loop';
+  const entryIsSystem = markerKind === 'system';
+  const entryUsesDiamond = markerKind === 'system' || markerKind === 'terminal-mcp';
   const entryIsServicePrompt = isServicePromptEntry(entry);
   const orchestrationGroup = groupInfo?.groupKind === 'orchestration';
   const groupAccent = orchestrationGroup ? '#a855f7' : '#818cf8';
@@ -1008,6 +1018,11 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   const showAsChild = isGroupChild && !(groupInfo?.isGroupHeader && !isGroupExpanded);
   const isGroupMeta = isGroupCollapsed;
   const isPromptVisible = isInViewport && !isResponseOnly;
+  // Compact children sit 2px LEFT of the ordinary axis, not 2px right.
+  // Preserve the full-width hit target and leave room for the passive guide
+  // even when a MCP diamond / SC icon grows to its hovered visible bounds.
+  const compactGroupPaddingRight = showAsChild && !isExpandedLayout && !treeMode ? '4px' : undefined;
+  const compactGroupStripShift = compactGroupPaddingRight ? 'translateX(-2px)' : undefined;
 
   const markerEdited = groupPresentation?.edited
     || entry.docsEdited
@@ -1042,9 +1057,15 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   } else if (isPlan) {
     dotColor = isHovered ? '#5eada3' : '#3d7a72';
     dotGlow = isHovered ? '0 0 10px rgba(94, 173, 163, 0.5)' : 'none';
+  } else if (entryIsAutomaticContinuation) {
+    dotColor = isHovered ? '#c4b5fd' : (isPromptVisible ? '#9b85bc' : '#725a9f');
+    dotGlow = isHovered ? '0 0 6px rgba(114, 90, 159, 0.3)' : 'none';
   } else if (isGoalContinuation) {
     dotColor = isHovered ? '#c4b5fd' : (isPromptVisible ? '#a78bfa' : '#725a9f');
     dotGlow = isHovered ? '0 0 10px rgba(167, 139, 250, 0.5)' : 'none';
+  } else if (entryIsQuestionReply) {
+    dotColor = isHovered ? '#93c5fd' : (isPromptVisible ? '#60a5fa' : '#3b82f6');
+    dotGlow = isHovered ? '0 0 6px rgba(96, 165, 250, 0.3)' : 'none';
   } else if (active) {
     dotColor = entryIsOrchestration ? '#c084fc' : '#60a5fa';
     dotGlow = entryIsOrchestration ? '0 0 6px rgba(192,132,252,0.3)' : '0 0 6px rgba(96, 165, 250, 0.3)';
@@ -1069,6 +1090,10 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
     isHovered,
     isInViewport,
   });
+  // Match the rotated diamond's visible bounds, not its unrotated square.
+  const scDesktopIconSize = Math.SQRT2 * (isExpandedLayout
+    ? (showAsChild ? 6 : 8)
+    : Number.parseFloat(dotGeometry.width));
   if (isGroupMeta) {
     dotColor = isHovered ? groupAccent : groupAccentDim;
     dotGlow = isHovered ? `0 0 10px rgba(${groupAccentRgb}, 0.5)` : `0 0 6px rgba(${groupAccentRgb}, 0.2)`;
@@ -1083,13 +1108,19 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   }
 
   if (searchMatch) dotGlow = searchCurrent ? '0 0 0 3px #facc15, 0 0 8px #eab308' : '0 0 0 2px #ca8a04';
+  const groupGuide = showAsChild && !isExpandedLayout ? (
+    <div data-timeline-group-guide={groupInfo?.groupId} aria-hidden="true"
+      style={{ position: 'absolute', left: treeMode ? 6 : 4, top: 0, bottom: 0, width: 1,
+        backgroundColor: `rgba(${groupAccentRgb}, 0.35)`, pointerEvents: 'none' }} />
+  ) : null;
   const noteStrip = (
     <div
-      className="flex-shrink-0 w-full flex items-center justify-center"
-      style={{ height: '6px', cursor: 'pointer' }}
+      className="relative flex-shrink-0 w-full flex items-center justify-center"
+      style={{ height: '6px', cursor: 'pointer', paddingRight: compactGroupPaddingRight }}
       onMouseEnter={() => api.handleNoteStripEnter(index)}
       onMouseLeave={api.handleNoteStripLeave}
     >
+      {groupGuide}
       <div
         style={{
           width: noteHovered ? '18px' : '14px',
@@ -1123,18 +1154,17 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
             aria-expanded={isGroupExpanded}
             aria-label={`${isGroupExpanded ? 'Свернуть' : 'Раскрыть'} группу: ${groupInfo.groupSize} записей`}
             title={`${groupInfo.agentName}: ${groupInfo.groupSize} записей`}
-            style={{ width: '100%', minWidth: 0, height: 26, display: 'grid', gridTemplateRows: '14px 10px',
-              alignContent: 'center', justifyItems: 'center', padding: '0 2px', border: 0,
+            style={{ width: '100%', minWidth: 0, height: 20, display: 'flex', gap: 2,
+              alignItems: 'center', justifyContent: 'center', padding: '0 1px', border: 0,
+              boxSizing: 'border-box',
               background: 'transparent', cursor: 'pointer', color: isGroupCollapsed ? dotColor : groupAccent }}
             onClick={event => { event.stopPropagation(); isGroupExpanded
               ? api.collapseGroup(groupInfo.groupId) : api.expandGroup(groupInfo.groupId, groupInfo.groupKind); }}>
-            {isGroupExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-            <span data-timeline-group-count style={{ maxWidth: '100%', fontSize: 9, lineHeight: '10px',
+            {isGroupExpanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+            <span data-timeline-group-count style={{ maxWidth: '100%', fontSize: Math.min(8, 28 / String(groupInfo.groupSize).length),
+              lineHeight: '14px', whiteSpace: 'nowrap',
               fontFamily: 'monospace', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{groupInfo.groupSize}</span>
           </button>
-          {isGroupCollapsed && <TimelineCornerBadges items={cornerBadges.items as TimelineCornerBadgeItem[]}
-            flowLayout isExpandedLayout={false} timelineFontSize={timelineFontSize} groupAccent={groupAccent}
-            onAgentsClick={() => api.openEntryAgents(entry)} agentsTitle={(entry.subAgents || []).map(agent => agent.label).join(', ')} />}
         </div>
       )}
       {!isGroupCollapsed && <>
@@ -1145,14 +1175,14 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
         data-segment
         data-timeline-entry-uuid={entry.uuid}
         data-timeline-marker-kind={markerKind}
+        data-timeline-group-child={showAsChild ? groupInfo?.groupId : undefined}
         data-history-search-match={searchMatch ? 'true' : undefined}
         data-history-search-current={searchCurrent ? 'true' : undefined}
         {...(isUnreachable ? { 'data-unreachable': '' } : {})}
         className="relative w-full flex items-center"
         onMouseEnter={() => {
-          // Codex compact bodies are not available to the client; the
-          // count marker intentionally has no misleading Cmd tooltip.
-          if (!(isCodex && isCompacted)) api.handleMouseEnterSegment(index);
+          // Encrypted compact has an honest metadata-only preview too.
+          api.handleMouseEnterSegment(index);
         }}
         onMouseLeave={(e) => api.handleMouseLeaveSegment(e)}
         onClick={(e) => {
@@ -1180,14 +1210,14 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
           justifyContent: isExpandedLayout ? 'flex-start' : (treeMode ? 'flex-start' : 'center'),
           paddingLeft: isExpandedLayout
             ? '6px'
-            : entryIsExternalResearch ? 0 : (treeMode
+            : (treeMode
                 ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
-                : (showAsChild ? '4px' : undefined)),
+                : undefined),
           paddingRight: isExpandedLayout
             ? (cornerBadges.items.length > 0
                 ? (cornerBadges.items.some((item: TimelineCornerBadgeItem) => item.slot.endsWith('inner')) ? '34px' : '22px')
                 : '8px')
-            : undefined,
+            : compactGroupPaddingRight,
           paddingTop: isExpandedLayout ? '6px' : undefined,
           paddingBottom: isExpandedLayout ? '6px' : undefined,
           gap: isExpandedLayout ? '6px' : undefined,
@@ -1202,7 +1232,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
             ? `auto ${Math.round(intrinsicPreviewFontSize * 1.3 * timelineLineClamp + 12)}px`
             : undefined,
           backgroundColor: active
-            ? entryIsOrchestration ? 'rgba(124, 58, 237, 0.16)' : 'rgba(59, 130, 246, 0.15)'
+            ? entryIsAutomaticContinuation ? 'rgba(114, 90, 159, 0.12)'
+              : entryIsOrchestration ? 'rgba(124, 58, 237, 0.16)' : 'rgba(59, 130, 246, 0.15)'
             : isHovered && isExpandedLayout && !isGroupMeta
               ? 'rgba(255, 255, 255, 0.04)'
               // Red zones: chain-break (unreachable by Claude's backtrace, all
@@ -1212,18 +1243,24 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
                 ? 'rgba(239, 68, 68, 0.06)'
                 : (isOldHistory && !isGroupMeta && !historyTargetVisible && !isSdkTab
                     ? 'rgba(239, 68, 68, 0.06)'
-                    : isExpandedLayout && entryIsOrchestration ? 'rgba(124, 58, 237, 0.08)' : 'transparent'),
+                    : isExpandedLayout && entryIsAutomaticContinuation ? 'rgba(114, 90, 159, 0.08)'
+                      : isExpandedLayout && entryIsOrchestration ? 'rgba(124, 58, 237, 0.08)' : 'transparent'),
           cursor: (isContinued || isDocsEdit || isDocsSearch || (isOldHistory && !historyTargetVisible && !isSdkTab)) ? 'default' : 'pointer',
         } as React.CSSProperties}
       >
+        {groupGuide}
         {/* Dot: hollow ring if unreachable, filled otherwise. pointer-events:
             auto so ПКМ на сам кружок ловится отдельно от полосы. */}
         {entryIsExternalResearch ? (
-          <img src={scDesktopIcon} alt="" data-timeline-sc-desktop
-            title={`SC Desktop · ${orchestrationTag.targetTabName || 'External Research'}`}
-            style={{ width: 14, height: 14, flexShrink: 0, objectFit: 'contain', borderRadius: 3,
-              opacity: isUnreachable ? 0.45 : 1, boxShadow: dotGlow,
-              outline: isRewindMarked || hasNote && notePos === 'dot' ? `1px solid ${dotColor}` : undefined }} />
+          <span className="flex items-center justify-center shrink-0" data-timeline-sc-icon-slot
+            style={{ width: 14, height: isExpandedLayout ? undefined : 14,
+              alignSelf: isExpandedLayout ? 'stretch' : undefined }}>
+            <img src={scDesktopIcon} alt="" data-timeline-sc-desktop
+              title={`SC Desktop · ${orchestrationTag.targetTabName || 'External Research'}`}
+              style={{ width: scDesktopIconSize, height: scDesktopIconSize, maxWidth: 'none', flexShrink: 0, objectFit: 'contain', borderRadius: 3,
+                opacity: isUnreachable ? 0.45 : 1, boxShadow: dotGlow,
+                outline: isRewindMarked || hasNote && notePos === 'dot' ? `1px solid ${dotColor}` : undefined }} />
+          </span>
         ) : isExpandedLayout ? (
           (() => {
             const expSize = displaysAsCompact ? '8px' : (showAsChild ? '6px' : '8px');
@@ -1234,12 +1271,12 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
                   style={{
                     width: expSize,
                     height: expSize,
-                    borderRadius: entryIsServicePrompt ? '2px' : '50%',
+                    borderRadius: entryUsesDiamond ? '2px' : '50%',
                     backgroundColor: isUnreachable && !displaysAsCompact ? 'transparent' : dotColor,
                     border: isUnreachable && !displaysAsCompact ? `1px solid ${isRewindMarked ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
                     boxShadow: dotGlow,
                     boxSizing: 'border-box',
-                    transform: entryIsServicePrompt ? 'rotate(45deg)' : undefined,
+                    transform: entryUsesDiamond ? 'rotate(45deg)' : undefined,
                     pointerEvents: 'auto',
                     transition: 'background-color 0.2s, box-shadow 0.2s',
                   }}
@@ -1253,12 +1290,12 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
             style={{
               width: dotGeometry.width,
               height: dotGeometry.height,
-              borderRadius: entryIsServicePrompt ? '2px' : dotGeometry.radius,
+              borderRadius: entryUsesDiamond ? '2px' : dotGeometry.radius,
               backgroundColor: isUnreachable && !isHovered && !displaysAsCompact ? 'transparent' : dotColor,
               border: isUnreachable && !isHovered && !displaysAsCompact ? `1px solid ${isRewindMarked ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
               boxShadow: dotGlow,
               boxSizing: 'border-box',
-              transform: entryIsServicePrompt ? 'rotate(45deg)' : undefined,
+              transform: entryUsesDiamond ? 'rotate(45deg)' : undefined,
               pointerEvents: 'auto',
               transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
             }}
@@ -1286,7 +1323,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
             : metaPromptTitle
               ? `META · ${metaPromptTitle}`
               : rawEntryContent;
-          let previewColor = 'rgba(255, 255, 255, 0.85)';
+          let previewColor = entryIsAutomaticContinuation ? '#8f8d88' : 'rgba(255, 255, 255, 0.85)';
           let previewStyle: React.CSSProperties = {};
           let isSummaryPreview = false;
           if (metaPromptTitle) {
@@ -1347,7 +1384,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
               <div className="animate-glow-white" style={{ width: 10, height: 3, borderRadius: 1 }} />
             </div>
           ) : (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none"
+              style={{ paddingRight: compactGroupPaddingRight }}>
               <div className="animate-glow-white" style={{ width: 10, height: 3, borderRadius: 1 }} />
             </div>
           )
@@ -1362,7 +1400,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
               </svg>
             </div>
           ) : (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none"
+              style={{ paddingRight: compactGroupPaddingRight }}>
               <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.7 }}>
                 <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
                 <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
@@ -1383,9 +1422,11 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
           style={{ height: '8px', cursor: 'default' }}
           onClick={(e) => { e.stopPropagation(); api.flashStripFailed(index, 'boundary'); }}
         >
+          {groupGuide}
           <div style={{ width: '100%', height: '1px', backgroundColor: 'rgba(255, 255, 255, 0.2)' }} />
           {failedFlashKind === 'boundary' && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none"
+              style={{ paddingRight: compactGroupPaddingRight }}>
               <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
                 <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
                 <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
@@ -1400,11 +1441,12 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
         <div
           data-timeline-fork-marker="boundary"
           className="flex-shrink-0 w-full flex items-center justify-center relative"
-          style={{ height: '8px', cursor: isCmdHeld ? 'pointer' : 'default', padding: '6px 0', boxSizing: 'content-box' }}
+          style={{ height: '8px', cursor: forkCmdHeld ? 'pointer' : 'default', padding: '6px 0', boxSizing: 'content-box' }}
           onClick={(e) => { e.stopPropagation(); api.flashStripFailed(index, 'fork'); }}
           onMouseEnter={() => api.onForkMarkerEnter(index)}
           onMouseLeave={(e) => api.onForkMarkerLeave(e, index)}
         >
+          {groupGuide}
           <div
             style={{
               width: isForkActive ? '14px' : isInViewport ? '10px' : '12px',
@@ -1412,11 +1454,13 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
               borderRadius: '1px',
               backgroundColor: isForkActive ? '#93c5fd' : isInViewport ? '#60a5fa' : '#3b82f6',
               boxShadow: isForkActive ? '0 0 8px rgba(59, 130, 246, 0.5)' : isInViewport ? '0 0 6px rgba(59, 130, 246, 0.25)' : 'none',
+              transform: compactGroupStripShift,
               transition: 'all 0.2s',
             }}
           />
           {failedFlashKind === 'fork' && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none"
+              style={{ paddingRight: compactGroupPaddingRight }}>
               <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
                 <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
                 <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
@@ -1433,6 +1477,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
           style={{ height: '8px', cursor: 'default' }}
           onClick={(e) => { e.stopPropagation(); api.flashStripFailed(index, 'plan'); }}
         >
+          {groupGuide}
           <div
             style={{
               width: isInViewport ? '10px' : '12px',
@@ -1440,11 +1485,13 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
               borderRadius: '1px',
               backgroundColor: isInViewport ? '#5eada3' : '#48968c',
               boxShadow: isInViewport ? '0 0 6px rgba(72, 150, 140, 0.25)' : 'none',
+              transform: compactGroupStripShift,
               transition: 'background-color 0.2s, box-shadow 0.2s',
             }}
           />
           {failedFlashKind === 'plan' && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none"
+              style={{ paddingRight: compactGroupPaddingRight }}>
               <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.85 }}>
                 <line x1="2" y1="2" x2="8" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
                 <line x1="8" y1="2" x2="2" y2="8" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
@@ -1631,11 +1678,6 @@ function Timeline({
   const deferredTranscriptRefreshRef = useRef(false);
   const deferredTranscriptReasonRef = useRef<'turn-busy' | 'surface-hidden' | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
-  const [tooltipCopied, setTooltipCopied] = useState(false);
-  // Per-entry collapsed/expanded state for docs blocks in tooltip. Key = entry uuid.
-  // Default collapsed (compact one-liner) — click on the line to expand and see full paths/queries.
-  const [expandedDocsEdit, setExpandedDocsEdit] = useState<Set<string>>(new Set());
-  const [expandedDocsSearch, setExpandedDocsSearch] = useState<Set<string>>(new Set());
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const selectionStartIdRef = useRef<string | null>(null);
   const selectionContentRevisionRef = useRef<string | null>(null);
@@ -2476,6 +2518,7 @@ function Timeline({
   const timelineFontSize = useUIStore(state => state.timelineFontSize);
   const timelineSummaryFontSize = useUIStore(state => state.timelineSummaryFontSize);
   const timelineLineClamp = useUIStore(state => state.timelineLineClamp);
+  const timelinePreviewResponseLines = useUIStore(state => state.timelinePreviewResponseLines);
   // treeMode IS the expanded layout (chip + preview text). Old 160px tree-with-labels
   // visualisation is replaced. Width drag-resizable in expanded mode.
   const isExpandedLayout = readOnly ? false : treeMode;
@@ -2756,6 +2799,13 @@ function Timeline({
   // CMD key state for tooltip activation
   const [isCmdHeld, setIsCmdHeld] = useState(false);
   const isCmdHeldRef = useRef(false);
+  const cmdInteractionRelevantRef = useRef(false);
+  const projectedCmdHeldRef = useRef(false);
+  const projectCmdHeld = useCallback((held: boolean) => {
+    if (projectedCmdHeldRef.current === held) return;
+    projectedCmdHeldRef.current = held;
+    setIsCmdHeld(held);
+  }, []);
   // CMD+Shift lock — закрепляет ОТКРЫТЫЙ tooltip (entry / note / fork) на месте,
   // как `freezeCmdPopups` из StatusBar, но локально и привязано к жесту.
   // Условия закрытия от ухода курсора/отпускания CMD не срабатывают пока locked=true.
@@ -3134,10 +3184,9 @@ function Timeline({
     return centerY - height / 2;
   };
 
-  // effect: activeTooltipIndex changes → reset isExpanded + tooltipCopied (each new tooltip starts collapsed/un-copied)
+  // Each new tooltip starts collapsed; its component owns Copy feedback.
   useEffect(() => {
     setIsExpanded(false);
-    setTooltipCopied(false);
   }, [activeTooltipIndex]);
 
   useEffect(() => {
@@ -3156,10 +3205,12 @@ function Timeline({
     if (Object.prototype.hasOwnProperty.call(compactSummaryCache, entry.uuid)) return;
 
     let cancelled = false;
-    const channel = 'claude:get-full-history';
     (async () => {
       try {
-        const result = await ipcRenderer.invoke(channel, { sessionId, cwd, tabId });
+        const result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-history', {
+          toolType: 'claude', sessionId, cwd, tabId, dehydrate: false,
+          bounds: { aroundUuid: entry.uuid, radius: 1 }, source: 'Timeline.preview', reason: 'compact-summary',
+        });
         if (cancelled) return;
         const fullEntry = Array.isArray(result?.entries)
           ? result.entries.find((item: any) => item?.uuid === entry.uuid)
@@ -3213,23 +3264,29 @@ function Timeline({
   // SECTION: CMD-HOLD SYNC — global keydown/keyup tracks Meta; tooltip/note/fork tooltip visibility derives from isCmdHeld+hover state
   // ════════════════════════════════════════════════════════════
 
-  // effect: window keydown/keyup/blur for Meta → isCmdHeld + isCmdHeldRef (tooltip only opens while CMD held)
+  // Every retained owner knows the physical modifier, but only an owner with
+  // hover/popup feedback publishes it into React. Cmd shortcuts in a composer
+  // must not render/map every hidden Timeline merely to update a cursor.
   useEffect(() => {
+    const sync = (held: boolean) => {
+      isCmdHeldRef.current = held;
+      const presented = isVisibleRef.current && historyPresentationGateOpenRef.current;
+      if ((presented && cmdInteractionRelevantRef.current) || projectedCmdHeldRef.current) {
+        projectCmdHeld(held && presented);
+      }
+    };
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Meta') {
-        isCmdHeldRef.current = true;
-        setIsCmdHeld(true);
+        sync(true);
       }
     };
     const handleKeyUp = (e: KeyboardEvent) => {
       if (e.key === 'Meta') {
-        isCmdHeldRef.current = false;
-        setIsCmdHeld(false);
+        sync(false);
       }
     };
     const handleBlur = () => {
-      isCmdHeldRef.current = false;
-      setIsCmdHeld(false);
+      sync(false);
     };
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
@@ -3239,7 +3296,11 @@ function Timeline({
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);
     };
-  }, []);
+  }, [projectCmdHeld]);
+
+  useEffect(() => {
+    if (!isVisible || !historyPresentationGateOpen) projectCmdHeld(false);
+  }, [isVisible, historyPresentationGateOpen, projectCmdHeld]);
 
   // effect: isCmdHeld/hoveredIndex/isExpanded → setActiveTooltipIndex (CMD+hover opens; release closes unless expanded/cursor-in-tooltip/resizing/frozen)
   useEffect(() => {
@@ -3274,6 +3335,10 @@ function Timeline({
   // Fork marker tooltip: sync with CMD key — same pattern as notes
   const [hoveredForkMarkerIndex, setHoveredForkMarkerIndex] = useState<number | null>(null);
   const [activeForkMarkerIndex, setActiveForkMarkerIndex] = useState<number | null>(null);
+  cmdInteractionRelevantRef.current = hoveredIndex !== null || hoveredNoteIndex !== null
+    || hoveredForkMarkerIndex !== null || hoveredSemanticGroupId !== null
+    || activeTooltipIndex !== null || activeNoteIndex !== null
+    || activeForkMarkerIndex !== null || activeSemanticGroupId !== null;
   // effect: isCmdHeld/hoveredForkMarkerIndex/activeForkMarkerIndex → setActiveForkMarkerIndex (CMD+hover opens fork tooltip + hides entry tooltip; release closes unless cursor-in-tooltip)
   useEffect(() => {
     if (isCmdHeld && hoveredForkMarkerIndex !== null) {
@@ -3422,7 +3487,9 @@ function Timeline({
       if (detail?.tabId !== tabId) return;
       const projected = (projectTimelineLiveUserMessage(
         detail,
-        { toolType, sessionId },
+        { toolType, sessionId, fingerprint: detail?.message?.questionReplyProof
+          ? (text: string) => window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex')
+          : undefined },
       ) || projectTimelineLiveCompactEntry(detail, { toolType, sessionId })) as TimelineEntry | null;
       if (!projected) return;
       setLiveUserSnapshot((current) => {
@@ -3433,7 +3500,8 @@ function Timeline({
         ));
         if (existing
           && existing.timestamp === projected.timestamp
-          && existing.content === projected.content) {
+          && existing.content === projected.content
+          && JSON.stringify(existing.questionReplyProof || null) === JSON.stringify(projected.questionReplyProof || null)) {
           return current;
         }
         const nextEntries = upsertTimelineLiveUserEntries(
@@ -3446,6 +3514,7 @@ function Timeline({
           + ' tab=' + tabId.slice(-8)
           + ' session=' + sessionId.substring(0, 8)
           + ' uuid=' + projected.uuid.slice(-18)
+          + ' replyProof=' + (projected.questionReplyProof?.provider || 'none')
           + ' busy=' + (isTurnBusyRef.current ? '1' : '0'),
         );
         return { ownerKey: timelineOwnerKey, entries: nextEntries };
@@ -4900,20 +4969,28 @@ function Timeline({
   // SECTION: TOOLTIP HANDLERS — measurement, dismiss-on-mousedown, enter/leave for entry tooltip + tooltip area
   // ════════════════════════════════════════════════════════════
 
-  // effect: activeTooltipIndex/isExpanded/timelineTooltipWidth → measure tooltipContentRef height before paint → setTooltipMeasuredH (skipped during resize so wrapper doesn't reposition under cursor)
+  // Observe only this popup, including lazy text/attachments/fonts. Never
+  // connect it to History/composer measurements or their scroll writers.
   useLayoutEffect(() => {
-    if (isResizingTooltipRef.current) return;
-    if (tooltipContentRef.current && activeTooltipIndex !== null) {
-      const h = tooltipContentRef.current.getBoundingClientRect().height;
+    const content = tooltipContentRef.current;
+    const measure = () => {
+      if (!content || isResizingTooltipRef.current) return;
+      const h = content.getBoundingClientRect().height;
       if (Math.abs(h - tooltipMeasuredRef.current) > 1) {
         tooltipMeasuredRef.current = h;
         setTooltipMeasuredH(h);
       }
+    };
+    if (content && activeTooltipIndex !== null) {
+      measure();
+      const observer = new ResizeObserver(measure);
+      observer.observe(content);
+      return () => observer.disconnect();
     } else if (activeTooltipIndex === null && tooltipMeasuredRef.current !== 0) {
       tooltipMeasuredRef.current = 0;
       setTooltipMeasuredH(0);
     }
-  }, [activeTooltipIndex, isExpanded, timelineTooltipWidth]);
+  }, [activeTooltipIndex, isExpanded, timelineTooltipWidth, timelineSummaryFontSize]);
 
   // effect: activeTooltipIndex open → window mousedown listener closes tooltip when click is outside tooltipContentRef (handles dead-zone clicks, scrollbar grabs)
   useEffect(() => {
@@ -4928,6 +5005,8 @@ function Timeline({
   }, [activeTooltipIndex]);
 
   const handleMouseEnterSegment = (index: number) => {
+    cmdInteractionRelevantRef.current = true;
+    projectCmdHeld(isCmdHeldRef.current);
     setHoveredIndex(index);
     // Tooltip only appears when CMD is held (synced via useEffect)
     if (isCmdHeldRef.current) {
@@ -4992,6 +5071,49 @@ function Timeline({
     }
     return historyNavigationIdentityForTimelineEntry(entry);
   }, [entries]);
+
+  // Preview text is navigation, never a range/Rewind selection or terminal
+  // search. Both destinations use the existing exact History seek/ACK owner.
+  const navigatePreviewRecord = (identity: string | null) => {
+    if (!identity || activeTooltipIndex === null) return;
+    const index = activeTooltipIndex;
+    if (!historyTargetVisible) setHistoryPanelOpen(tabId, true);
+    setHistoryScrollToUuid(identity, tabId);
+    setClickedState({ index, status: 'loading' });
+    pendingHistoryScrollRef.current = { uuid: identity, index };
+    setActiveTooltipIndex(null); setHoveredIndex(null); setIsExpanded(false);
+    if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
+    historyClickTimeoutRef.current = setTimeout(() => {
+      pendingHistoryScrollRef.current = null;
+      setClickedState(current => current?.index === index ? null : current);
+    }, HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
+    console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12)
+      + ' uuid=' + identity.slice(-12) + ' mode=preview-body');
+  };
+
+  const loadPreviewResponse = useCallback(async (preview: any): Promise<string> => {
+    const identity = timelineFinalNavigationIdentity(preview);
+    if (!sessionId || !identity || !['claude', 'codex'].includes(toolType)) throw new Error('Полный ответ недоступен');
+    const result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-history', {
+      toolType, tabId, sessionId, cwd, dehydrate: false, bounds: { aroundUuid: identity, radius: 1 },
+      source: 'Timeline.preview', reason: 'expand-final', visible: true,
+    });
+    if (!result?.success) throw new Error('Не удалось прочитать полный ответ');
+    const content = resolveTimelineFullResponse(result.entries, preview,
+      text => window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex'));
+    if (content === null) throw new Error('Исходный ответ изменился или больше недоступен');
+    return content;
+  }, [toolType, tabId, sessionId, cwd]);
+
+  const loadPreviewImages = useCallback(async (prompt: any) => {
+    const identity = prompt?.sourceIdentity || prompt?.uuid;
+    if (!sessionId || !identity || !['claude', 'codex'].includes(toolType)) return [];
+    const result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-history', {
+      toolType, tabId, sessionId, cwd, dehydrate: false, bounds: { aroundUuid: identity, radius: 1 },
+      source: 'Timeline.preview', reason: 'expand-images', visible: true,
+    });
+    return result?.success ? resolveTimelinePromptImages(result.entries, prompt) : [];
+  }, [toolType, tabId, sessionId, cwd]);
 
   // ════════════════════════════════════════════════════════════
   // SECTION: CLICK DISPATCH — single/double/right-click + range-selection start; routes to terminal scroll, history-panel scroll, or range action menu
@@ -7169,6 +7291,8 @@ function Timeline({
   };
 
   const handleNoteStripEnter = (index: number) => {
+    cmdInteractionRelevantRef.current = true;
+    projectCmdHeld(isCmdHeldRef.current);
     setHoveredNoteIndex(index);
     if (isCmdHeldRef.current && !isNoteEditing) {
       setActiveNoteIndex(index);
@@ -7260,6 +7384,8 @@ function Timeline({
   };
   rowApi.setSegmentRef = (index, el) => { segmentRefs.current[index] = el; };
   rowApi.onForkMarkerEnter = (index) => {
+    cmdInteractionRelevantRef.current = true;
+    projectCmdHeld(isCmdHeldRef.current);
     setHoveredForkMarkerIndex(index);
     if (isCmdHeldRef.current) {
       setActiveForkMarkerIndex(index);
@@ -7286,8 +7412,6 @@ function Timeline({
       setActiveForkMarkerIndex(null);
     }
   };
-
-  if (!sessionId) return null;
 
   // ════════════════════════════════════════════════════════════
   // SECTION: RENDER GEOMETRY — derive current tooltip/note/fork-tooltip positions from segmentRefs before JSX
@@ -7318,99 +7442,55 @@ function Timeline({
         )
       : [currentActiveEntry]
     : [];
-  const currentActiveDocs = collectTimelineDocs(currentActivePresentationEntries);
-  const currentActivePromptLabels = collectTimelinePromptLabels(currentActivePresentationEntries);
   const currentActiveDocsKey = currentActiveGroupInfo?.isGroupHeader && !currentActiveGroupExpanded
     ? `timeline-group:${currentActiveGroupInfo.groupId}`
     : currentActiveEntry?.uuid || 'timeline-entry';
 
-  const renderAttachedTurnActivity = (
-    files: string[],
-    queries: string[],
-    promptLabels: string[],
-    expansionKey: string,
-  ) => (
-    <>
-      {files.length > 0 && (() => {
-        const open = expandedDocsEdit.has(expansionKey);
-        return (
-          <div className={`pb-1.5 mb-1.5 border-b ${DOCS_TIMELINE_COLORS.edited.borderClass} shrink-0`}>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setExpandedDocsEdit(prev => {
-                  const next = new Set(prev);
-                  if (next.has(expansionKey)) next.delete(expansionKey); else next.add(expansionKey);
-                  return next;
-                });
-              }}
-              className={`w-full text-left flex items-center gap-1.5 ${DOCS_TIMELINE_COLORS.edited.hoverClass} rounded px-0.5 py-0.5 cursor-pointer`}
-              style={{ color: DOCS_TIMELINE_COLORS.edited.tooltip }}
-            >
-              <Pencil size={10} className="shrink-0" style={{ color: DOCS_TIMELINE_COLORS.edited.visible }} />
-              <span className="leading-snug font-mono text-[10px] flex-1 font-medium">
-                Docs updated ({files.length})
-              </span>
-            </button>
-            {open && (
-              <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: DOCS_TIMELINE_COLORS.edited.tooltipMuted }}>
-                {files.map((file, index) => (
-                  <div key={`${file}:${index}`} className="break-all" style={{ opacity: 0.85 }}>{file}</div>
-                ))}
-              </div>
-            )}
-          </div>
-        );
-      })()}
-      {queries.length > 0 && (() => {
-        const open = expandedDocsSearch.has(expansionKey);
-        return (
-          <div className={`pb-1.5 mb-1.5 border-b ${DOCS_TIMELINE_COLORS.search.borderClass} shrink-0`}>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setExpandedDocsSearch(prev => {
-                  const next = new Set(prev);
-                  if (next.has(expansionKey)) next.delete(expansionKey); else next.add(expansionKey);
-                  return next;
-                });
-              }}
-              className={`w-full text-left flex items-start gap-1.5 ${DOCS_TIMELINE_COLORS.search.hoverClass} rounded px-0.5 py-0.5 cursor-pointer`}
-              style={{ color: DOCS_TIMELINE_COLORS.search.tooltip }}
-            >
-              <Search size={10} className="shrink-0 mt-0.5" style={{ color: DOCS_TIMELINE_COLORS.search.visible }} />
-              <span className="leading-snug font-mono text-[10px] flex-1 font-medium">
-                Docs search ({queries.length})
-              </span>
-            </button>
-            {open && (
-              <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: DOCS_TIMELINE_COLORS.search.tooltipMuted }}>
-                {queries.map((query, index) => (
-                  <div key={`${query}:${index}`} className="break-words" style={{ opacity: 0.85 }}>«{query}»</div>
-                ))}
-              </div>
-            )}
-          </div>
-        );
-      })()}
-      {promptLabels.length > 0 && (
-        <div className="pb-1.5 mb-1.5 border-b border-violet-500/15 shrink-0">
-          <div
-            className="w-full flex items-center gap-1.5 rounded px-0.5 py-0.5"
-            style={{ color: 'var(--cb-composer-chip-prompt, #c4b5fd)' }}
-            title={promptLabels.join(', ')}
-          >
-            <AppliedPromptIcon size={10} strokeWidth={2.2} className="shrink-0" />
-            <span className="leading-snug font-mono text-[10px] flex-1 font-medium truncate">
-              {promptLabels.length === 1 && promptLabels[0] === 'PROMPT'
-                ? 'Prompt'
-                : `${promptLabels.length > 1 ? 'Prompts' : 'Prompt'} · ${promptLabels.join(', ')}`}
-            </span>
-          </div>
-        </div>
-      )}
-    </>
-  );
+  const activeResearchTag = currentActiveEntry && getOrchestrationTag(currentActiveEntry);
+  const activeResearchRunId = activeResearchTag?.runKind === 'external-research' ? activeResearchTag.runId : null;
+  const liveResearchRun = useOrchestrationStore(state => activeResearchRunId ? state.activeRuns.get(activeResearchRunId) : undefined);
+  const researchOwnerKey = tabId + ':' + (sessionId || '');
+  const [researchModels, setResearchModels] = useState<{ owner: string; values: Record<string, any> } | null>(null);
+  const researchCatalogRef = useRef<{ owner: string; promise: Promise<Record<string, any>> } | null>(null);
+  useEffect(() => {
+    if (!activeResearchRunId) return;
+    let cancelled = false;
+    // One owner-scoped catalog read, not SC/browser traffic per marker. Store
+    // only the saved request choices; body/result/jobs are not retained here.
+    if (researchCatalogRef.current?.owner !== researchOwnerKey) researchCatalogRef.current = {
+      owner: researchOwnerKey, promise: ipcRenderer.invoke('orchestration:list-for-tab', tabId).then((runs: any[]) => {
+        const values: Record<string, any> = {};
+        for (const run of Array.isArray(runs) ? runs : []) if (run.runKind === 'external-research') {
+          values[run.runId] = { model: run.externalResearchModel, mode: run.externalResearchMode, effort: run.externalResearchEffort };
+        }
+        return values;
+      }).catch(() => { console.warn('[Timeline:Preview] saved research parameters unavailable'); return {}; }),
+    };
+    void researchCatalogRef.current.promise.then(values => {
+      if (!cancelled) setResearchModels(current => ({ owner: researchOwnerKey,
+        values: { ...values, ...(current?.owner === researchOwnerKey ? current.values : {}) } }));
+    });
+    return () => { cancelled = true; };
+  }, [activeResearchRunId, researchOwnerKey, tabId]);
+  useEffect(() => subscribeOrchestrationRunChanges(({ run }) => {
+    if (run.runKind !== 'external-research' || run.sourceTabId !== tabId) return;
+    setResearchModels(current => ({ owner: researchOwnerKey, values: {
+      ...(current?.owner === researchOwnerKey ? current.values : {}),
+      [run.runId]: { model: run.externalResearchModel, mode: run.externalResearchMode, effort: run.externalResearchEffort },
+    } }));
+  }), [tabId, researchOwnerKey]);
+  const activeResearchModel = liveResearchRun ? { model: liveResearchRun.externalResearchModel,
+    mode: liveResearchRun.externalResearchMode, effort: liveResearchRun.externalResearchEffort }
+    : researchModels?.owner === researchOwnerKey ? researchModels.values[activeResearchRunId || ''] : null;
+
+  // Owner changes (including retained hidden windows) cannot keep an old
+  // popup or late lazy-response read on screen.
+  useEffect(() => {
+    setActiveTooltipIndex(null); setHoveredIndex(null); setIsExpanded(false);
+    isMouseInTooltipRef.current = false;
+  }, [tabId, sessionId, toolType, isVisible]);
+
+  if (!sessionId) return null;
 
   const getCodexUsageTotal = (entry: TimelineEntry): number | null => {
     const u = entry.codexUsage;
@@ -7661,11 +7741,10 @@ function Timeline({
   const tooltipPos = activeTooltipIndex !== null ? (() => {
     const eCenterY = getElementCenterY(activeTooltipIndex);
     const approxH = isExpanded ? 400 : 200;
-    // Expanded: use fixed 60vh (matches maxHeight) — avoids measurement-based jumps during resize
-    // Collapsed: use measured height for precise positioning
-    const h = isExpanded
-      ? Math.round(window.innerHeight * 0.6)
-      : (tooltipMeasuredH > 0 ? tooltipMeasuredH : approxH);
+    // Disclosure height now includes header/footer and one scroll viewport.
+    // The popup observer is paused during drag, so measured height works for
+    // both states without moving the resize handle under the pointer.
+    const h = tooltipMeasuredH > 0 ? tooltipMeasuredH : approxH;
 
     // Determine alignment based on estimate (stable — doesn't flicker with measurement)
     const idealTop = eCenterY - approxH / 2;
@@ -7683,7 +7762,7 @@ function Timeline({
     } else if (vAlign === 'flex-end') {
       clampedTop = Math.max(40, window.innerHeight - h - 10);
     } else {
-      clampedTop = eCenterY - h / 2;
+      clampedTop = Math.max(40, Math.min(window.innerHeight - h - 10, eCenterY - h / 2));
     }
 
     // Wrapper spans from tooltip to entry (bridge fills the gap)
@@ -7784,6 +7863,8 @@ function Timeline({
         });
       }}
       onMouseEnter={() => {
+        cmdInteractionRelevantRef.current = true;
+        projectCmdHeld(isCmdHeldRef.current);
         setHoveredSemanticGroupId(group.id);
         if (isCmdHeldRef.current) {
           setActiveSemanticGroupId(group.id);
@@ -8126,6 +8207,7 @@ function Timeline({
               ? Array.from({ length: groupInfo!.groupSize }, (_, offset) => index + offset).some(idx => visibleEntryIndices.has(idx))
               : visibleEntryIndices.has(index);
             const isOldHistory = !isCodex && lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
+            const forkMarkerVisible = !!forkMarker && !isOldHistory;
             const groupPresentation = isGroupCollapsed && groupInfo
               ? collapsedGroupPresentation.get(groupInfo.groupId)
               : undefined;
@@ -8154,7 +8236,7 @@ function Timeline({
                   summaryLoading={summaryEligible && promptSummaryLoadingKeys.has(summaryKey)}
                   isGroupExpanded={isGroupExpanded}
                   active={isSelected(entry, index) || contextSelectedEntryId === entry.uuid}
-                  forkMarkerVisible={!!forkMarker && !isOldHistory}
+                  forkMarkerVisible={forkMarkerVisible}
                   isPlanModeBoundary={isPlanModeBoundary && !isOldHistory}
                   isInViewport={isInViewport}
                   isResponseOnly={isGroupCollapsed ? false : responseOnlyIndices.has(index)}
@@ -8170,7 +8252,7 @@ function Timeline({
                   isLastBoundary={index === lastBoundaryIndex}
                   failedFlashKind={failedStripFlash?.index === index ? failedStripFlash.kind : null}
                   isForkActive={activeForkMarkerIndex === index}
-                  isCmdHeld={isCmdHeld}
+                  forkCmdHeld={forkMarkerVisible && isCmdHeld}
                   isExpandedLayout={isExpandedLayout}
                   treeMode={treeMode}
                   isCodex={isCodex}
@@ -8907,10 +8989,10 @@ function Timeline({
                   backdropFilter: 'blur(12px)',
                   border: isLockedTooltip ? '1px solid #fff' : '1px solid rgba(255, 255, 255, 0.1)',
                   borderRadius: '6px 0 0 6px',
-                  padding: '10px 14px',
+                  padding: '9px',
                   fontSize: '12px',
                   color: 'white',
-                  width: `${timelineTooltipWidth}px`,
+                  width: `${Math.max(140, Math.min(timelineTooltipWidth, window.innerWidth - popupRightPx - 8))}px`,
                   maxHeight: isExpanded ? '78vh' : '260px',
                   boxShadow: '-8px 8px 30px rgba(255,255,255,0.08), -2px 2px 8px rgba(255,255,255,0.05)',
                   display: 'flex',
@@ -8951,359 +9033,37 @@ function Timeline({
                     document.addEventListener('mouseup', onUp);
                   }}
                 />
-                {currentActiveEntryDisplaysAsCompact ? (() => {
-                  const cached = currentActiveEntry.type === 'compact'
-                    ? compactSummaryCache[currentActiveEntry.uuid]
-                    : undefined;
-                  const compactText = currentActiveEntryIsCompactSummary
-                    ? currentActiveEntry.content
-                    : (currentActiveEntry.compactSummary || cached || '');
-                  const isLoadingCompact = currentActiveEntry.type === 'compact'
-                    && !currentActiveEntry.compactSummary
-                    && cached === undefined;
-                  const compactEncrypted = isCodex
-                    || currentActiveCompactBoundaryEntry?.compactEncrypted === true
-                    || currentActiveEntry.compactEncrypted === true;
-                  const displayText = compactText || (compactEncrypted
-                    ? 'Compact state is encrypted.'
-                    : isLoadingCompact
-                      ? 'Загружаю compact summary...'
-                      : 'Compact summary не найден');
-                  const canCopyCompact = !!compactText;
-                  const compactPostTokens = currentActiveCompactBoundaryEntry?.postTokens || currentActiveEntry.postTokens;
-                  const compactMetric = compactPostTokens
-                    ? ` (${compactPostTokens >= 1000 ? Math.round(compactPostTokens / 1000) + 'k' : compactPostTokens} tokens)`
-                    : compactEncrypted
-                      ? ' (encrypted)'
-                      : '';
-                  return (
-                    <>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#f59e0b', flexShrink: 0 }} />
-                        <span className="text-amber-400 font-medium text-[11px]">
-                          History Compacted{compactMetric}
-                        </span>
-                      </div>
-                      <div
-                        className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin"
-                        style={{
-                          maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px',
-                          overflowY: 'auto',
-                          overflowX: 'hidden',
-                          whiteSpace: 'pre-wrap',
-                        }}
-                      >
-                        {isLoadingCompact ? (
-                          <span className="flex items-center gap-2 py-2" role="status" aria-live="polite" aria-label="Loading compact summary">
-                            <RefreshCw size={14} className="animate-spin shrink-0" />
-                            <span>{displayText}</span>
-                          </span>
-                        ) : displayText}
-                      </div>
-                      <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
-                        <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                        <div className="flex-1" />
-                        <button
-                          disabled={!canCopyCompact}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (!canCopyCompact) return;
-                            clipboard.writeText(compactText);
-                            setTooltipCopied(true);
-                            setTimeout(() => setTooltipCopied(false), 1200);
-                          }}
-                          className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors disabled:opacity-40 disabled:cursor-default cursor-pointer"
-                          style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
-                        >
-                          {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
-                          {tooltipCopied ? 'Скопировано' : isLoadingCompact ? 'Загрузка' : 'Копировать'}
-                        </button>
-                        {(displayText.length > 200 || isExpanded) && (
-                          <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                            className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
-                          >
-                            {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
-                          </button>
-                          </Tooltip>
-                        )}
-                      </div>
-                    </>
-                  );
-                })() : currentActiveEntry.type === 'continued' ? (
-                  <>
-                    <span className="text-amber-400 font-medium shrink-0">Context Overflow Recovery</span>
-                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
-                      {currentActiveEntry.content}
-                    </div>
-                    <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
-                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <div className="flex-1" />
-                      {(currentActiveEntry.content.length > 200 || isExpanded) && (
-                        <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                          className="px-1 py-0.5 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0"
-                        >
-                          {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
-                        </button>
-                        </Tooltip>
-                      )}
-                    </div>
-                  </>
-                ) : currentActiveEntry.type === 'docs_edit' ? (
-                  <>
-                    <div className="flex items-center gap-2">
-                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: DOCS_TIMELINE_COLORS.edited.visible, flexShrink: 0 }} />
-                      <span style={{ color: DOCS_TIMELINE_COLORS.edited.visible }} className="font-medium text-[11px]">Docs Updated</span>
-                    </div>
-                    <div className="text-white/70 leading-snug font-mono text-[11px]" style={{ whiteSpace: 'pre-wrap' }}>
-                      {(currentActiveEntry.docsEdited || [currentActiveEntry.content]).map((f: string, i: number) => (
-                        <div key={i} className="flex items-center gap-1.5 py-0.5">
-                          <Pencil size={10} className="shrink-0" style={{ color: DOCS_TIMELINE_COLORS.edited.tooltipMuted }} />
-                          <span>{f}</span>
-                        </div>
-                      ))}
-                    </div>
-                    <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                  </>
-                ) : currentActiveEntry.type === 'docs_search' ? (
-                  <>
-                    <div className="flex items-center gap-2">
-                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: DOCS_TIMELINE_COLORS.search.visible, flexShrink: 0 }} />
-                      <span style={{ color: DOCS_TIMELINE_COLORS.search.visible }} className="font-medium text-[11px]">Docs Search</span>
-                    </div>
-                    <div className="text-white/70 leading-snug font-mono text-[11px]" style={{ whiteSpace: 'pre-wrap' }}>
-                      {(currentActiveEntry.docsSearchQueries || [currentActiveEntry.content]).map((q: string, i: number) => (
-                        <div key={i} className="flex items-center gap-1.5 py-0.5">
-                          <Search size={10} className="shrink-0" style={{ color: DOCS_TIMELINE_COLORS.search.tooltipMuted }} />
-                          <span>{q}</span>
-                        </div>
-                      ))}
-                    </div>
-                    <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                  </>
-                ) : getOrchestrationTag(currentActiveEntry) ? (
-                  <>
-                    <div className="flex items-center gap-2">
-                      <div style={{ width: '7px', height: '7px', borderRadius: '2px', backgroundColor: '#a855f7', transform: 'rotate(45deg)', flexShrink: 0 }} />
-                      <span style={{ color: '#c084fc' }} className="font-medium text-[11px]">
-                        {getOrchestrationTag(currentActiveEntry)?.kind === 'tab-message'
-                          ? getOrchestrationTag(currentActiveEntry)?.phase === 'reply' ? 'Terminal MCP reply' : 'Terminal MCP question'
-                          : getOrchestrationTag(currentActiveEntry)?.source === 'terminal-mcp'
-                            ? 'Terminal MCP prompt'
-                            : getOrchestrationTag(currentActiveEntry)?.phase === 'request'
-                          ? 'Terminal MCP request'
-                          : getOrchestrationTag(currentActiveEntry)?.phase === 'failure'
-                            ? 'Terminal MCP failure'
-                            : 'Terminal MCP result'}
-                      </span>
-                    </div>
-                    {(() => {
-                      const gi = groupMap.get(activeTooltipIndex!);
-                      if (gi?.isGroupHeader && !isTimelineGroupExpanded(isExpandedLayout, expandedGroups.has(gi.groupId))) {
-                        return <span className="text-[10px] text-white/40">{gi.groupSize} calls</span>;
-                      }
-                      return null;
-                    })()}
-                    {renderAttachedTurnActivity(
-                      currentActiveDocs.edited,
-                      currentActiveDocs.searched,
-                      currentActivePromptLabels,
-                      currentActiveDocsKey,
-                    )}
-                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
-                      {currentActiveEntry.content}
-                    </div>
-                    <div className="flex items-center gap-2 mt-0 pt-1 border-t border-white/5 shrink-0">
-                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <span className="text-[9px] text-white/25 font-mono truncate">{getOrchestrationTag(currentActiveEntry)?.runId}</span>
-                    </div>
-                  </>
-                ) : (currentActiveEntry.isSubAgent || currentActiveEntry.isSubAgentTimeout) ? (
-                  <>
-                    {renderAttachedTurnActivity(
-                      currentActiveDocs.edited,
-                      currentActiveDocs.searched,
-                      currentActivePromptLabels,
-                      currentActiveDocsKey,
-                    )}
-                    <div className="flex items-center gap-2">
-                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: currentActiveEntry.isSubAgentTimeout ? '#ef4444' : '#818cf8', flexShrink: 0 }} />
-                      <span style={{ color: currentActiveEntry.isSubAgentTimeout ? '#ef4444' : '#818cf8' }} className="font-medium text-[11px]">
-                        {currentActiveEntry.isSubAgentTimeout ? 'Timeout' : (currentActiveEntry.subAgentName || 'Claude Sub-Agent')}
-                      </span>
-                    </div>
-                    {(() => {
-                      const gi = groupMap.get(activeTooltipIndex!);
-                      if (gi?.isGroupHeader && !isTimelineGroupExpanded(isExpandedLayout, expandedGroups.has(gi.groupId))) {
-                        return (
-                          <span className="text-[10px] text-white/40">
-                            {gi.groupSize} agents{gi.hasTimeout ? ' (with timeout)' : ''}
-                          </span>
-                        );
-                      }
-                      return null;
-                    })()}
-                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
-                      {currentActiveEntry.content}
-                    </div>
-                    <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
-                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      {renderSingleTokenChip(currentActiveEntry)}
-                      <div className="flex-1" />
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          clipboard.writeText(currentActiveEntry.content);
-                          setTooltipCopied(true);
-                          setTimeout(() => setTooltipCopied(false), 1200);
-                        }}
-                        className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
-                        style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
-                      >
-                        {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
-                        {tooltipCopied ? 'Скопировано' : 'Copy'}
-                      </button>
-                      {(currentActiveEntry.content.length > 200 || isExpanded) && (
-                        <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                          className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
-                        >
-                          {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
-                        </button>
-                        </Tooltip>
-                      )}
-                    </div>
-                  </>
-                ) : currentActiveEntry.isPlan ? (
-                  <>
-                    {renderAttachedTurnActivity(
-                      currentActiveDocs.edited,
-                      currentActiveDocs.searched,
-                      currentActivePromptLabels,
-                      currentActiveDocsKey,
-                    )}
-                    <span style={{ color: '#48968c' }} className="font-medium shrink-0">Plan Mode (auto-submitted)</span>
-                    <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
-                      {currentActiveEntry.content}
-                    </div>
-                    <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
-                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      {renderSingleTokenChip(currentActiveEntry)}
-                      <div className="flex-1" />
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          clipboard.writeText(currentActiveEntry.content);
-                          setTooltipCopied(true);
-                          setTimeout(() => setTooltipCopied(false), 1200);
-                        }}
-                        className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
-                        style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
-                      >
-                        {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
-                        {tooltipCopied ? 'Скопировано' : 'Копировать'}
-                      </button>
-                      {(currentActiveEntry.content.length > 200 || isExpanded) && (
-                        <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                          className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
-                        >
-                          {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
-                        </button>
-                        </Tooltip>
-                      )}
-                    </div>
-                    {(() => {
-                      const md = describeModel(currentActiveEntry.responseModel);
-                      if (!md) return null;
-                      return (
-                        <Tooltip content={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
-                        <div className="flex items-center mt-0 text-[10px] shrink-0">
-                          <span style={{ color: md.color }}>{md.provider} · {md.short}</span>
-                          {currentActiveEntry.responseHasThinking && <span className="ml-1.5" style={{ color: '#b4b9f9' }}>· think</span>}
-                        </div>
-                        </Tooltip>
-                      );
-                    })()}
-                  </>
-                ) : (
-                  <>
-                    {/* Inline note preview when note is on dot */}
-                    {notes[currentActiveEntry.uuid] && (notePositions[currentActiveEntry.uuid] || 'before') === 'dot' && (
-                      <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-purple-500/15 shrink-0">
-                        <StickyNote size={10} className="shrink-0 mt-0.5" style={{ color: '#0891b2' }} />
-                        <div className="text-purple-300/80 leading-snug font-mono text-[10px] line-clamp-2 flex-1" style={{ whiteSpace: 'pre-wrap' }}>
-                          {notes[currentActiveEntry.uuid]}
-                        </div>
-                        <Tooltip content="Редактировать заметку">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleAddNote(currentActiveEntry);
-                          }}
-                          className="p-0.5 rounded hover:bg-purple-500/20 text-purple-400/60 hover:text-purple-300 transition-colors cursor-pointer shrink-0"
-                        >
+                <TimelineEntryPreview
+                  key={tabId + ':' + (sessionId || '') + ':' + currentActiveEntry.uuid + ':' + currentActiveDocsKey}
+                  entry={currentActiveEntry} toolType={toolType} expanded={isExpanded}
+                  responseLines={timelinePreviewResponseLines} fontSize={timelineSummaryFontSize}
+                  group={currentActiveGroupInfo?.isGroupHeader && !currentActiveGroupExpanded
+                    ? { kind: currentActiveGroupInfo.groupKind, entries: currentActivePresentationEntries } : undefined}
+                  compact={currentActiveEntryDisplaysAsCompact ? {
+                    text: currentActiveEntryIsCompactSummary ? currentActiveEntry.content
+                      : currentActiveEntry.compactSummary || compactSummaryCache[currentActiveEntry.uuid] || '',
+                    encrypted: isCodex || currentActiveCompactBoundaryEntry?.compactEncrypted === true,
+                    loading: !isCodex && currentActiveEntry.type === 'compact'
+                      && !currentActiveEntry.compactSummary && compactSummaryCache[currentActiveEntry.uuid] === undefined,
+                    postTokens: currentActiveCompactBoundaryEntry?.postTokens || currentActiveEntry.postTokens,
+                  } : undefined}
+                  researchModel={activeResearchModel}
+                  tokenChip={currentActiveEntry.type === 'user' && !currentActiveEntry.isCompactSummary ? renderSingleTokenChip(currentActiveEntry) : undefined}
+                  note={notes[currentActiveEntry.uuid] && (notePositions[currentActiveEntry.uuid] || 'before') === 'dot'
+                    ? <div className="flex items-start gap-1.5 pb-1 text-[10px] text-cyan-600">
+                        <StickyNote size={10} /><span className="flex-1">{notes[currentActiveEntry.uuid]}</span>
+                        <button type="button" title="Редактировать заметку" onClick={() => handleAddNote(currentActiveEntry)}>
                           <Pencil size={10} />
                         </button>
-                        </Tooltip>
-                      </div>
-                    )}
-                    {renderAttachedTurnActivity(
-                      currentActiveDocs.edited,
-                      currentActiveDocs.searched,
-                      currentActivePromptLabels,
-                      currentActiveDocsKey,
-                    )}
-                    <div className="text-white/90 leading-snug font-mono scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
-                      {currentActiveEntry.content}
-                    </div>
-                    <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
-                      <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      {renderSingleTokenChip(currentActiveEntry)}
-                      <div className="flex-1" />
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          clipboard.writeText(currentActiveEntry.content);
-                          setTooltipCopied(true);
-                          setTimeout(() => setTooltipCopied(false), 1200);
-                        }}
-                        className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors cursor-pointer"
-                        style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
-                      >
-                        {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
-                        {tooltipCopied ? 'Скопировано' : 'Копировать'}
-                      </button>
-                      {(currentActiveEntry.content.length > 200 || isExpanded) && (
-                        <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
-                          className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
-                        >
-                          {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
-                        </button>
-                        </Tooltip>
-                      )}
-                    </div>
-                    {(() => {
-                      const md = describeModel(currentActiveEntry.responseModel);
-                      if (!md) return null;
-                      return (
-                        <Tooltip content={'Provider: ' + md.provider + ' · Model: ' + currentActiveEntry.responseModel + (currentActiveEntry.responseHasThinking ? ' · thinking' : '')}>
-                        <div className="flex items-center mt-0 text-[10px] shrink-0">
-                          <span style={{ color: md.color }}>{md.provider} · {md.short}</span>
-                          {currentActiveEntry.responseHasThinking && <span className="ml-1.5" style={{ color: '#b4b9f9' }}>· think</span>}
-                        </div>
-                        </Tooltip>
-                      );
-                    })()}
-                  </>
-                )}
+                      </div> : undefined}
+                  onExpand={() => setIsExpanded(value => !value)}
+                  onNavigatePrompt={() => navigatePreviewRecord(getHistoryPanelTargetUuid(currentActiveEntry, currentActiveEntryIndex))}
+                  onNavigateAnswer={() => navigatePreviewRecord(timelineFinalNavigationIdentity(currentActiveEntry.responsePreview))}
+                  onSourceNavigate={() => { setActiveTooltipIndex(null); setHoveredIndex(null); setIsExpanded(false); }}
+                  onCopy={text => clipboard.writeText(text)}
+                  loadResponse={loadPreviewResponse}
+                  loadImages={loadPreviewImages}
+                />
               </div>
               {/* CSS Bridge removed — Timeline now docks against the popup at popupRightPx=0,
                   so the wrapper itself IS contiguous with the strip. An extra 8px child

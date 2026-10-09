@@ -36,7 +36,7 @@ export function beginReserveDragTransport(admission:any,point:Point,sourceNode:a
   const paint=()=>{
     drag.frame=0;if(active!==drag)return;
     const p=drag.point,element=document.elementFromPoint(p.clientX,p.clientY);
-    const workflowId=p.metaKey && sourceNode.entityType==='tab'
+    const workflowId=sourceNode.entityType==='tab'
       ? element?.closest<HTMLElement>('[data-space-chip]')?.dataset.spaceChip:null;
     if(workflowId)setTabDragNavigationTarget('sidebar',{kind:'workflow',id:workflowId,...p,
       blocked:workflowId===useWorkspaceStore.getState().activeSpaceId});

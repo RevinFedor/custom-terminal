@@ -6,6 +6,7 @@ import { codeInspectorPlugin } from 'code-inspector-plugin';
 import { resolve } from 'path';
 import { config } from 'dotenv';
 import { assertNotedShared } from '../noted-shared/build/assert-packages.mjs';
+import { buildWorkflowNativeDrag } from './build/workflow-native-drag.mjs';
 import { historyVirtuosoMeasurementVitePlugin } from './scripts/lib/history-virtuoso-measurement.mjs';
 
 // Load .env so renderer can access env vars at build time
@@ -24,6 +25,8 @@ assertNotedShared({
   packages: ['structured-dnd', 'file-explorer'],
   expectedVersion: '0.2.0',
 });
+
+buildWorkflowNativeDrag();
 
 export default defineConfig({
   main: {

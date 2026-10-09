@@ -42,8 +42,11 @@ compact boundary старый carrier команды может уйти за г
 - Статус доставки сообщения и текущая операция сжатия — разные сущности.
 - Живая фаза хранится только в main process как неперсистентная операция
   `compact/compacting`. Она не восстанавливается из History/JSONL.
-- Старт разрешён только после принятия точной команды `/compact` владельцем
-  текущей session/generation. Упоминание или цитата `/compact` не подходит.
+- Для explicit command старт разрешён только после принятия точной команды
+  `/compact` владельцем текущей session/generation. Упоминание или цитата не
+  подходит. Native/automatic compaction имеет отдельный typed provider-request
+  source в том же registry, без выдуманного command/Send receipt; его scope и
+  completion описаны в `fact-codex.md::Native compact виден в TUI, но History остаётся Working`.
 - Claude стартует после доказанного Enter в PTY; завершает фазу только ручной
   `compact_boundary`, парный `isCompactSummary`, точный stdout результата либо
   причинное прерывание/ошибка того же владельца.
@@ -129,7 +132,59 @@ catch-up границы собственного record и публикует te
 чужими session/generation не подходит. Таймеров и polling для решения исхода
 нет; `context_compacted` по-прежнему только telemetry.
 
+#### Шрам: автокомпакт дольше180s получил ложную ошибку
+
+09.10.2026 production4505: автоматическая попытка началась07:36:46.840UTC,
+causal slash start подтверждён07:36:47.483. Renderer сообщил «Нет подтверждения»
+07:39:46.987, хотя тот же Main operation завершился07:41:37.799 с
+`rollout-compacted-before-task-complete`. У4009 такой же порядок: старт07:29:34,
+ложный отказ07:32:34, exact completed07:33:32. Это не отказ provider и не потеря
+Main completion: трёхминутный таймер `executeAutoCompact` ставился ещё до send await.
+Его reject удалял coordinator task, ставил error и снимал operational listener;
+поздний completed уже не мог завершить прежнее ожидание.
+
+Таймер результата удалён, не увеличен. Observer остаётся подписанным до exact
+handoff/provider/session settlement; listener устанавливается до send и читает
+прежний settled ledger после него, поэтому быстрый completion/subscribe-GET race
+сохраняются. Только completed разрешает проверку прежней input readiness и
+однократное продолжение. Aborted/failed/unknown сохраняют свои реальные причины;
+длительность, idle или новый чужой compact не завершают ожидание и не разрешают
+повтор. Поздний результат disposed task не восстанавливает его continuation.
+Это ремонт AutoCompact runtime, не соседнего orchestration-pre-task
+`App::compactAgentTab` или внешнего bridge deadline.
+
+Регрессия использует настоящий renderer runtime, coordinator и Main registry,
+виртуальный ход времени и заменённые provider/send/IPC ports: исходный код дал
+3RED, после ремонта поздний результат>180s и readiness проходят. Read-only
+production witness не является новым live-provider replay. Проверка и границы —
+`../tmp/глобальные-очереди-и-автокомпакт.md`.
+
 ### Codex local slash: causal start без `user_message`
+
+#### После Resume вставка состоялась, а отдельный delta-reader молчал
+
+09.10 tab4412: после Resume History вставил `/compact`, но capture нового сырого
+PTY-хвоста вернул0B/timeout. Последующий exact draft proof уже видел `/compact`;
+rollback не подтвердил очистку. `slashInserted:true` терялось в presentation,
+поэтому incident ошибочно сообщал pasteWritten:false. Это не доказательство
+отказа Codex compact: Enter этой попытки ещё не был записан.
+
+`/compact` теперь использует тот же retained short-control input owner и
+committed headless-frame observation, что `/model`/`/fast`. Нужен точный свежий
+composer после write с прежними input/terminal/run/mirror guards, не случайный
+sync-marker. Timeout не отпускает вставку: existing owner ждёт событий и очищает
+только свой неизменённый текст editing keys, без Escape/Stop. Первый Enter
+освобождает retained insertion до записи; последующая causal task_started и
+ровно один proof-based second Enter сохраняются прежними. Late frame не запускает
+команду повторно. Отчёт различает pasteWritten:true и enterWritten:false.
+
+History может вернуть свою копию не-entered slash, если Main подтвердил очистку
+либо продолжает точно владеть вставкой и блокировать следующий paste до её
+разрешения. Run After сохраняет карточку и выключает эту попытку, не создаёт
+ложный unknown Send pointer без receipt. Обычный unknown Send/Enter-armed путь
+этой специальной проверкой не ослаблен. Почему конкретно raw onData не пришёл
+в production-окне, сам timeout не доказывает; ремонт убирает зависимость от этого
+второго collector, не объявляет доказанной причину задержки CLI redraw.
 
 #### Native reconnect: завершённый compact остался SENT (30.09.2026)
 

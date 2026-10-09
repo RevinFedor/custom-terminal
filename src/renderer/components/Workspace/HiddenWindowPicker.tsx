@@ -1,6 +1,6 @@
 import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { PanelsTopLeft, Columns2 } from 'lucide-react';
+import { PanelsTopLeft, Maximize2 } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { paneSlots } from '../../utils/splitPanesModel.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
@@ -11,15 +11,23 @@ import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 import TabCard from './TabCard';
 import { useUIStore } from '../../store/useUIStore';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
+import { openTabLinkedFile } from '../../utils/tabLinkedFilePreview';
+import { TAB_STRIP_ROW_GAP } from '../../utils/tabCardVisual.mjs';
 
 type PreviewTab = { id: string; projectId: string; name: string; chooser?: boolean };
 type MenuLease = { host: string; windowId: string; tab: PreviewTab };
 type Rename = { tab: PreviewTab; windowId: string; draft: string };
+const ALONGSIDE_SIZE = 24;
+const ALONGSIDE_GUTTER = ALONGSIDE_SIZE + 4;
 
 /** Background chooses the window's current selection; a card chooses its exact tab. */
 export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: number; spaceId: string }) {
   const button = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
+  const popupList = useRef<HTMLDivElement>(null);
+  const rowNodes = useRef(new Map<string, HTMLDivElement>());
+  const actionNodes = useRef(new Map<string, HTMLButtonElement>());
+  const [actionTops, setActionTops] = useState<Record<string, number>>({});
   const instanceId = useId();
   const menuLease = useRef<MenuLease | null>(null);
   const [renaming, setRenaming] = useState<Rename | null>(null);
@@ -27,6 +35,7 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
   renameRef.current = renaming;
   const renameInput = useInlineRenameInputRef(!!renaming);
   const pointer = useRef<{ x: number; y: number } | null>(null);
+  const dismissedHover = useRef(false);
   const recheckHover = useRef<() => void>(() => {});
   const [target, setTarget] = useState<{ windowId: string; spaceId: string; displayKey: string | null } | null>(null);
   const [position, setPosition] = useState({ left: 0, top: 0 });
@@ -75,6 +84,16 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
     setTarget(null);
   }
   useEffect(() => { setTarget(null); }, [activeSpaceId, displayKey]);
+  useEffect(() => {
+    const releaseHoverDismissal = (event: MouseEvent) => {
+      if (!dismissedHover.current) return;
+      const rect = button.current?.getBoundingClientRect();
+      if (!rect || event.clientX < rect.left || event.clientX > rect.right
+        || event.clientY < rect.top || event.clientY > rect.bottom) dismissedHover.current = false;
+    };
+    window.addEventListener('mousemove', releaseHoverDismissal, true);
+    return () => window.removeEventListener('mousemove', releaseHoverDismissal, true);
+  }, []);
   useEffect(() => {
     if (!target) return;
     const state = useWorkspaceStore.getState();
@@ -125,6 +144,9 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
       event.preventDefault(); event.stopPropagation();
       if (renameRef.current) { finishRename(false); return; }
       if (menuLease.current) { closeContextMenu(); recheckHover.current(); return; }
+      // At the viewport edge the popup can cover its trigger. Removing it
+      // produces a synthetic mouse-enter under a stationary pointer.
+      dismissedHover.current = true;
       setTarget(null); button.current?.focus();
     };
     document.addEventListener('pointerdown', dismiss, true);
@@ -140,10 +162,13 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
       if (!button.current || !popup.current) return;
       const anchor = button.current.getBoundingClientRect();
       const rect = popup.current.getBoundingClientRect();
-      const next = clampMenuToViewport({ x: anchor.right - rect.width, y: anchor.bottom + 4,
-        width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight });
-      setPosition(previous => previous.left === next.x && previous.top === next.y
-        ? previous : { left: next.x, top: next.y });
+      // Clamp the painted external controls too, without reserving a column
+      // in the list or extending its background/border.
+      const next = clampMenuToViewport({ x: anchor.right - rect.width - ALONGSIDE_GUTTER, y: anchor.bottom + 4,
+        width: rect.width + ALONGSIDE_GUTTER, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight });
+      const left = next.x + ALONGSIDE_GUTTER;
+      setPosition(previous => previous.left === left && previous.top === next.y
+        ? previous : { left, top: next.y });
     };
     place();
     const observer = new ResizeObserver(place);
@@ -152,12 +177,39 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
     window.addEventListener('resize', place);
     return () => { observer.disconnect(); window.removeEventListener('resize', place); };
   }, [target, key]);
+  useLayoutEffect(() => {
+    const list = popupList.current, shell = popup.current;
+    if (!target || !list || !shell) return;
+    const measure = () => {
+      const bounds = shell.getBoundingClientRect(), clip = list.getBoundingClientRect();
+      const next: Record<string, number> = {};
+      for (const [id, node] of rowNodes.current) {
+        const rect = node.getBoundingClientRect();
+        // Same visibility as an ordinary button at the top of the scrolling
+        // row. Controls are siblings of the clipping list, not clipped children.
+        if (rect.top >= clip.top - 1 && rect.top + ALONGSIDE_SIZE <= clip.bottom + 1) next[id] = rect.top - bounds.top;
+      }
+      setActionTops(previous => Object.keys(previous).length === Object.keys(next).length
+        && Object.keys(next).every(id => previous[id] === next[id]) ? previous : next);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(list);
+    for (const node of rowNodes.current.values()) observer.observe(node);
+    list.addEventListener('scroll', measure, { passive: true });
+    return () => { observer.disconnect(); list.removeEventListener('scroll', measure); };
+  }, [target, key, position.left, position.top]);
   useEffect(() => {
     if (!target || openMode !== 'hover') return;
     let frame = 0;
     const check = () => {
       if (menuLease.current || renameRef.current || !pointer.current) return;
       const trigger = button.current;
+      for (const action of actionNodes.current.values()) {
+        const rect = action.getBoundingClientRect();
+        if (pointer.current.x >= rect.left - 2 && pointer.current.x <= rect.right + 6
+          && pointer.current.y >= rect.top - 2 && pointer.current.y <= rect.bottom + 2) return;
+      }
       if (hiddenWindowHoverContains({
         popup: popup.current?.getBoundingClientRect() || null,
         button: trigger?.getBoundingClientRect() || null,
@@ -188,6 +240,7 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
     };
   }, [target, openMode]);
   const openPicker = (mode: 'hover' | 'pinned') => {
+    if (mode === 'hover' && dismissedHover.current) return;
     if (target) {
       if (mode === 'pinned') setOpenMode('pinned');
       return;
@@ -229,41 +282,44 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
     state.clearTabFromSplitPane(tabId);
     return true;
   };
-  const chooseWindow = (candidateId: string, tab?: PreviewTab) => {
-    if (!target) return;
+  const chooseWindow = (candidateId: string, tab?: PreviewTab, focusInput = true) => {
+    if (!target) return false;
     const state = useWorkspaceStore.getState();
     const index = state.splitPanes.findIndex(p => p.windowId === target.windowId && !p.displayHidden);
     if (state.activeSpaceId !== target.spaceId || state.windowDisplayKey !== target.displayKey || index < 0) {
       setTarget(null);
-      return;
+      return false;
     }
     let selected: Parameters<typeof state.showHiddenWindow>[2];
     if (tab?.chooser) selected = { slotId: tab.id };
     else if (tab) selected = { projectId: tab.projectId, tabId: tab.id };
-    if (state.showHiddenWindow(index, candidateId, selected)) {
+    const accepted=state.showHiddenWindow(index, candidateId, selected);
+    if (accepted && focusInput) {
       const after = useWorkspaceStore.getState();
       const shown = after.splitPanes[after.splitFocusedIndex];
       if (shown?.tabId && !shown.selectedSlotId) requestTabPrimaryInputFocus(shown.tabId, 'hidden-window-picker');
     }
     setTarget(null);
+    return accepted;
   };
   const showAlongside=(candidateId:string)=>{
     if(!target)return;
     const state=useWorkspaceStore.getState();
     if(state.activeSpaceId!==target.spaceId || state.windowDisplayKey!==target.displayKey){setTarget(null);return;}
     if(state.showHiddenWindowAlongside(target.spaceId,target.windowId,candidateId))setTarget(null);
-    else useUIStore.getState().showToast('Не удалось разместить окно рядом. Проверьте текущую раскладку.','warning');
+    else useUIStore.getState().showToast('Could not expand this window.','warning');
   };
   if (!windows.length) return null;
   return <>
     <button ref={button} type="button" data-hidden-window-picker-button data-split-button
-      aria-label={`Скрытые окна: ${windows.length}`} aria-expanded={!!target} aria-haspopup="dialog"
-      title={`Показать другое окно · скрытых ${windows.length}`}
+      aria-label={`Hidden windows: ${windows.length}`} aria-expanded={!!target} aria-haspopup="dialog"
+      title={`Hidden: ${windows.length}`}
       onPointerDown={event => event.stopPropagation()}
       onMouseEnter={() => openPicker('hover')}
       onFocus={() => openPicker('pinned')}
       onClick={event => {
         event.stopPropagation();
+        dismissedHover.current = false;
         // A click pins the list until an outside click or Escape; it never
         // toggles the hover-opened popup closed on the same activation.
         openPicker('pinned');
@@ -273,14 +329,18 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
         background: target ? '#34343a' : 'transparent', color: '#b8b8c2' }}>
       <PanelsTopLeft size={14} /><span>{windows.length}</span>
     </button>
-    {target && createPortal(<div ref={popup} role="dialog" aria-label="Скрытые окна"
+    {target && createPortal(<div ref={popup} role="dialog" aria-label="Hidden windows"
       data-hidden-window-picker style={{ position: 'fixed', ...position, zIndex: 100020,
-        width: 'min(420px, calc(100vw - 16px))', maxHeight: 'min(560px, calc(100vh - 16px))',
+        width: `min(500px, calc(100vw - ${16 + ALONGSIDE_GUTTER}px))`, overflow: 'visible' }}>
+      <div ref={popupList} data-hidden-window-picker-list style={{ maxHeight: 'min(560px, calc(100vh - 16px))',
         display: 'flex', flexDirection: 'column', gap: Math.max(4, tabGap),
         overflowY: 'auto', padding: 0, background: '#242427', border: '1px solid #444', borderRadius: 7,
         boxShadow: '0 8px 24px #0008' }}>
-      {windows.map(candidate => <div key={candidate.id} role="button" tabIndex={0} data-hidden-window-id={candidate.id}
-        aria-label={`Показать окно: ${candidate.tabs.map(tab => tab.name).join(', ') || 'Пустое окно'}`}
+      {windows.map(candidate => <div key={candidate.id} data-hidden-window-row={candidate.id}
+        ref={node => { if (node) rowNodes.current.set(candidate.id, node); else rowNodes.current.delete(candidate.id); }}
+        style={{minWidth:0,flexShrink:0}}>
+        <div role="button" tabIndex={0} data-hidden-window-id={candidate.id}
+        aria-label={`Show: ${candidate.tabs.map(tab => tab.name).join(', ') || 'Empty'}`}
         // A nested card is still inside this window. CSS keeps the whole
         // surface highlighted without resetting it on descendant mouseover.
         className="hover:bg-white/10 focus-visible:bg-white/10"
@@ -292,21 +352,18 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
           if (event.target !== event.currentTarget || !['Enter', ' '].includes(event.key)) return;
           event.preventDefault(); event.stopPropagation(); chooseWindow(candidate.id);
         }}
-        style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: tabGap,
-          width: '100%', minHeight: 28, boxSizing: 'border-box', textAlign: 'left', cursor: 'pointer', padding: 0,
+        style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: tabGap,rowGap:TAB_STRIP_ROW_GAP,
+          flex:'1 1 auto',minWidth:0, minHeight: 28, boxSizing: 'border-box', textAlign: 'left', cursor: 'pointer', padding: `0 0 ${TAB_STRIP_ROW_GAP-1}px`,
           border: '1px solid #75658b', borderRadius: 7, margin: 0,
           transition: 'none' }}>
-        <button type="button" data-hidden-window-alongside={candidate.id}
-          onPointerDown={event=>event.stopPropagation()} onClick={event=>{event.stopPropagation();showAlongside(candidate.id);}}
-          title="Показать это окно рядом, сохранив текущее"
-          style={{display:'inline-flex',alignItems:'center',gap:5,border:0,borderRadius:4,padding:'3px 6px',
-            background:'#8b5cf626',color:'#c4b5fd',fontSize:11,cursor:'pointer'}}><Columns2 size={12}/>Показать рядом</button>
-        {candidate.tabs.length === 0 && <span style={{ padding: '2px 6px', color: '#8f8f94' }}>Нет вкладки</span>}
-        {candidate.tabs.map(tab => <TabCard key={tab.id} as={renaming?.tab.id === tab.id ? 'span' : 'button'} projectId={tab.projectId} tabId={tab.id}
+        {candidate.tabs.length === 0 && <span style={{ padding: '2px 6px', color: '#8f8f94' }}>Empty</span>}
+        {candidate.tabs.map(tab => <TabCard key={tab.id} as="span" role="button" tabIndex={0} projectId={tab.projectId} tabId={tab.id}
           chooser={tab.chooser} label={tab.name} shown={tab.id === candidate.shownTabId} showShownStripe showProjectIcon reserveSignalSpace
+          linkedFilesMode="navigate"
+          onLinkedFileOpen={tab.chooser?undefined:file=>{void openTabLinkedFile(tab.projectId,file,()=>chooseWindow(candidate.id,tab,false));}}
           data-hidden-window-tab-id={tab.chooser ? undefined : tab.id}
           data-hidden-window-slot-id={tab.chooser ? tab.id : undefined}
-          title={tab.chooser ? tab.name : `${tab.name}\nCmd+клик или средний клик — убрать из окна`}
+          title={tab.chooser ? tab.name : `${tab.name}\nCmd/middle click: remove`}
           style={{ maxWidth: '100%' }}
           onPointerDown={event => { event.stopPropagation(); if (event.button !== 0) event.preventDefault(); }}
           onContextMenu={event => openTabMenu(event, candidate.id, tab)}
@@ -316,6 +373,10 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
               event.preventDefault(); removeHiddenChip(candidate.id, tab.id); return;
             }
             chooseWindow(candidate.id, tab);
+          }}
+          onKeyDown={event=>{
+            if(event.target!==event.currentTarget || !['Enter',' '].includes(event.key))return;
+            event.preventDefault();event.stopPropagation();chooseWindow(candidate.id,tab);
           }}
           onAuxClick={event => {
             if (event.button !== 1 || tab.chooser) return;
@@ -340,7 +401,19 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
               boxShadow: 'inset 0 0 0 1px var(--color-accent)', color: '#fff', font: 'inherit' }}
           /> : undefined}
         </TabCard>)}
-      </div>)}
+      </div></div>)}
+      </div>
+      {windows.map(candidate => actionTops[candidate.id] !== undefined && <button key={candidate.id}
+        ref={node => { if (node) actionNodes.current.set(candidate.id, node); else actionNodes.current.delete(candidate.id); }}
+        type="button" data-hidden-window-alongside={candidate.id}
+        title="Показать окно рядом" aria-label="Показать окно рядом"
+        onPointerDown={event => event.stopPropagation()}
+        onClick={event => { event.stopPropagation(); showAlongside(candidate.id); }}
+        style={{ position: 'absolute', left: -ALONGSIDE_GUTTER, top: actionTops[candidate.id],
+          width: ALONGSIDE_SIZE, height: ALONGSIDE_SIZE, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          padding: 0, border: 0, borderRadius: 4, background: '#242427', color: '#c4b5fd', cursor: 'pointer' }}>
+        <Maximize2 size={14} aria-hidden="true" />
+      </button>)}
     </div>, document.body)}
   </>;
 }

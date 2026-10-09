@@ -62,7 +62,7 @@
     - **Response-Only Indicator:** Если вьюпорт пересекает диапазон entry, но позиция самого промпта (`markerRow`) находится **выше** верхней границы вьюпорта — значит пользователь видит только ответ AI. В этом случае черточка отображается приглушённым серым (`rgba(255,255,255,0.35)`) без glow, вместо яркого белого (`rgba(255,255,255,0.75)` + glow). Размер черточки одинаковый (10px). Определение: `blockStart < viewport.top`. Работает для обоих движков (Claude OSC markers, Gemini text positions).
     - **Invisible Intent (Психология фокуса):** Приглушение индикатора необходимо, чтобы пользователь мгновенно понимал: на экране сейчас только результат работы ИИ, а сам вопрос находится выше. Это снижает когническую нагрузку при быстром скролле длинных диалогов.
     - **Shield Logic:** Маркеры сжатия (`compact`) служат приоритетной границей. Если сразу после сжатия происходит техническая смена ID сессии, система блокирует создание ложного `FORK` маркера. См. [`fix-compact-logic.md`](fix-compact-logic.md).
-    - **Compact self-tooltip:** Оранжевая compact-полоска/граница и оранжевая compact-точка — два визуальных входа в один смысловой compact, даже если в Claude он представлен парой JSONL-записей (`compact_boundary` + `isCompactSummary`). Для Claude Cmd-hover открывает self-tooltip с preview, Copy и full content. Codex — другой класс: его читаемая часть `replacement_history` состоит из verbatim-сообщений, а настоящая выжимка зашифрована. Поэтому Codex compact не дёргает full History по Cmd-hover и остаётся структурным marker'ом. Явное `Копировать compact` может развернуть verbatim snapshot; это отдельное намеренное действие, а не hover-preview. См. [`fact-codex.md::Timeline и History`](fact-codex.md) и [`fact-группировка-таймлайна.md`](fact-группировка-таймлайна.md).
+    - **Compact self-tooltip:** Оранжевая полоска/граница и точка — два входа в один compact, даже когда Claude записал пару `compact_boundary` + `isCompactSummary`. Readable Claude показывает свой summary/Copy/full content; недостающий текст читается bounded вокруг exact compact. SOURCE Codex hover тоже доступен, но только как metadata: одна `context compacted (encrypted)`, время записи и postTokens при наличии. Он не запрашивает/расшифровывает capsule и не выдаёт verbatim `replacement_history` за summary. ПКМ `Копировать compact` остаётся отдельным explicit verbatim path. См. [`fact-codex.md::Timeline и History`](fact-codex.md) и [`fact-группировка-таймлайна.md`](fact-группировка-таймлайна.md).
     - **Claude compact + summary визуально схлопываются:** Claude часто пишет один смысловой compact двумя JSONL-записями подряд: `system/compact_boundary`, затем `user` с `isCompactSummary: true`. В данных это остаются две записи: boundary нужна для цепочки, токенов и old-history границы, summary-запись нужна как реальный текст compact'а. В правой Timeline техническая boundary-точка подавляется, если сразу за ней идёт `isCompactSummary`; видимой точкой становится summary-запись, но она рисуется и копируется как `compact` независимо от того, классифицирована она как `continued` или обычный `user`. Old-history линия/красная зона переносятся на эту видимую summary-точку. В HistoryPanel summary не рендерится вторым user-блоком: compact-блок остаётся на boundary UUID и встраивает summary внутрь; клик по summary-точке из Timeline скроллит именно к этому compact-блоку. Standalone `continued` без соседнего compact продолжает отображаться отдельным marker'ом Context Overflow Recovery.
     - **Граница актуальности (Old History Zone):** Для Claude область истории до последнего сжатия (Compact) или сброса контекста (Plan Mode) визуально отделяется от активного диалога.
         - **Визуал:** Вся зона получает приглушённый красный фон (`rgba(239, 68, 68, 0.06)`). Compact entry внутри этой зоны тоже остаётся на красном segment-фоне: оранжевая точка и оранжевая горизонтальная полоска это foreground-маркеры, а не исключение из Old History background.
@@ -119,10 +119,16 @@
 - **Terminal MCP как структурный turn-атрибут.** Durable request/completion/failure получает `semanticTags[]` из SQLite presentation-sidecar только после точного post-Enter audit. Текст `[Оркестрация]`, имя вкладки и наличие `runId` в body не являются classifier'ом: пользователь может отредактировать текст, а обычный prompt может содержать похожую строку. Provider JSONL не меняется.
     - Фиолетовый канал относится также к адресным вопросу/reply (`kind:tab-message`) и обычному `send_prompt` (`prompt-origin/source=terminal-mcp`), не только к делегации. Они используют общий metadata classifier для History background, Timeline ромба и MCP-группы; не получают фиктивный `runId` и не создают зависимость. Выделенная MCP-итерация сохраняет фиолетовый оттенок вместо общего синего; предупреждения о недоступной истории остаются отдельными. Старый generic MCP origin восстанавливается тем же startup-pass из exact confirmed receipt по источнику `terminal-mcp`/provider-prefix, с attempt/provider/session/hash и source/alias guard. Цитаты и одинаковый текст не дают происхождение. Copy/Rewind продолжают читать полный неизменённый prompt.
     - Внутри History сообщение и preview используют один source-header со стрелкой роли и именем отправителя вместо повторяющейся phase-подписи. Имя адресного сообщения открывает вкладку; отдельная стрелка ведёт к exact исходному MCP call, раскрывает группу и подсвечивает строку после стабилизации прокрутки. Источник — metadata; цвета, стрелка и найденный вызов не доказывают доставку/исполнение. Контракт направления и перехода — `fact-tab-messages.md::UI и инструкции`.
-    - Последовательные tagged turns собираются в служебную группу; встроенные Claude Agent/Task subagents остаются отдельной indigo-группой. У группы собственная шапка `ChevronRight/ChevronDown` и один общий счётчик записей, не уникальных задач или запусков. Шапка только раскрывает/сворачивает строки; первая реальная итерация не дублируется. Узкая рельса остаётся 32px, широкий режим включается отдельным действием. Счётчик и вторичные badges размещены в границах шапки, а не поверх её стрелки; UUID-навигация детей сохраняется. Раскрытие не расширяет панель и не перекрывает читаемый текст.
-    - External research отличается от межвкладочного MCP по exact `orchestration/runKind=external-research`: его точка использует bundled SC Desktop icon14px. Модель, provider label и слова в body не являются classifier; старый tag без runKind не угадывается. Межвкладочный MCP сохраняет ромб, а SC-точка — тот же канал provenance, не успех или работа браузера. Подтверждённый временный handoff переносит полный immutable tag, поэтому до canonical adoption источник не меняется на generic MCP. Docs/prompt/agent badges у SC рисуются отдельным компактным рядом, не поверх значка. SC-marker навигирует к исходному History UUID; открытие задачи SC Desktop остаётся отдельным действием существующего source-header.
+    - Последовательные tagged turns собираются в служебную группу; встроенные Claude Agent/Task subagents остаются отдельной indigo-группой. У группы собственная шапка `ChevronRight/ChevronDown` и один общий счётчик записей, не уникальных задач или запусков. Стрелка и число стоят на одной горизонтальной строке; шапка не рисует вторичные badges детей. Шапка только раскрывает/сворачивает строки; первая реальная итерация не дублируется. Узкая рельса остаётся 32px, широкий режим включается отдельным действием. В раскрытой узкой группе все дети, включая SC, имеют одинаковый небольшой отступ; пассивная вертикальная линия слева связывает их и продолжается через note/fork/boundary strips. Линия исчезает при collapse, не захватывает клики и не требует DOM-замеров. Значки файлов/промптов остаются у исходных итераций, агрегированные сведения доступны в групповом Cmd-hover. UUID-навигация и отдельные note strips сохраняются. Проверка ширины сама по себе не доказывает однострочность: нужно сравнивать вертикальные центры стрелки/числа и отсутствие пересечений, включая длинные счётчики. Раскрытие не расширяет панель и не перекрывает читаемый текст.
+    - Колонка детей раскрытой узкой группы расположена на2px левее обычной оси:
+      в32px rail центр14px вместо прежних18px. Full-row hit target остаётся32px;
+      right-padding4px меняет только внутреннее выравнивание. Пассивная guide
+      стоит в4px от левого края, отдельно от центральной оси16px; увеличенный
+      hover-ромб/SC glyph не касается её. Note/loading/error/fork/plan indicators
+      следуют той же детской колонке. Collapsed header и wide preview не смещаются.
+    - External research отличается от межвкладочного MCP по exact `orchestration/runKind=external-research`: его точка использует bundled SC Desktop icon. Видимый размер совпадает с ромбом в том же child/viewport/hover состоянии, а не задан отдельными14px: квадратная сторона ромба после поворота45° даёт границу `side × sqrt(2)` (обычный child около10px). Постоянный14px slot сохраняет отступы и высоту строки; у самой картинки снят `max-width:100%`, иначе hover-диагональ зажималась по ширине. Модель, provider label и слова в body не являются classifier; старый tag без runKind не угадывается. Межвкладочный MCP сохраняет ромб, а SC-точка — тот же канал provenance, не успех или работа браузера. Подтверждённый временный handoff переносит полный immutable tag, поэтому до canonical adoption источник не меняется на generic MCP. Docs/prompt/agent badges у SC рисуются отдельным компактным рядом, не поверх значка. SC-marker навигирует к исходному History UUID; открытие задачи SC Desktop остаётся отдельным действием существующего source-header.
     - Orchestration-turn не участвует в AI prompt summary, auto-title и ручной semantic outline: его устойчивый смысл уже задан tag'ом и `runId`, а пересказ служебного уведомления создавал бы второй, менее точный label.
-    - Возврат после `build:install` и автоматический повтор после Codex capacity используют общий `prompt-origin/source=system` с `systemSource=build-install-return|codex-capacity-retry`. Они получают тот же фиолетовый ромб, но не являются orchestration run: не входят в его группы и не открывают несуществующий run. Такие сообщения не участвуют в auto-title, prompt summary, semantic outline и счётчике новых запросов человека. Источник задаётся send-сценарием, а не выводится из body.
+    - Возврат после `build:install` и автоматический повтор после Codex capacity используют общий `prompt-origin/source=system` с `systemSource=build-install-return|codex-capacity-retry`. Возврат сохраняет фиолетовый ромб; по уточнению09.10 автоматический `Continue` получает обычную круглую точку приглушённого фиолетового цвета, как Loop, без поворота45°. Это presentation subtype, а не изменение system/service происхождения: такие записи по-прежнему не участвуют в auto-title, prompt summary, semantic outline и счётчике новых запросов человека. Они не являются orchestration run, не входят в MCP-группу и не открывают несуществующий run. Источник задаётся send-сценарием, не словом continue в body.
     - Старые system-уведомления восстанавливаются один раз при startup из `confirmed` receipt с exact audit той же attempt/provider/session/hash. Если receipt ещё не знает canonical UUID, pending sidecar хранит точную `auditSourceIdentity`; привязка разрешена только при совпадении с source identity/alias канонической записи. Совпавших текста и времени недостаточно, JSONL не меняется. После привязки sidecar переживает restart и обычную доказанную Codex child projection.
     - Legacy backfill за ограниченный период может распознать точный служебный prefix, но записывает только sidecar и идемпотентно пропускает уже размеченные identity. Это миграционная процедура, не runtime-эвристика.
 - **Transcript refresh:** Timeline больше не владеет постоянным 2s polling'ом JSONL/rollout. Для Claude/Codex он подписывается на main-process `SessionTranscriptService` и обновляется по `agent-transcript:changed`; visibility-resume делает reconciliation refresh, но это страховка от пропущенного события, а не clock системы. Старый `isVisible` guard защищал только renderer, но не решал проблему нескольких readers одного большого файла. Подробности — `fact-transcript-сервис.md`.
@@ -289,9 +295,15 @@ Global `all` auto — это политика **с этого момента**, 
 - **Ловушка: несколько assistant entries за ход.** Claude пишет отдельный assistant entry на каждый шаг (thinking → tool_use → text). Каждый имеет свой `message.usage`. Нужно **суммировать** `output_tokens` по всем assistant entries до следующего user.
 - **Ловушка: `input_tokens` ≠ размер сообщения.** Поле `input_tokens` в usage — только uncached часть контекста. Полный контекст = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` (может быть 50K+ для длинных сессий). В API-mode popover'а Input = сумма всех трёх полей (каждое только если присутствует, без zero-fill).
 
-### Provider+Model+think badge в footer assistant tooltip
+### Модель и effort в footer превью
 
-Под основной строкой футера (time / tokens / Копировать) рендерится **отдельный** ряд с post-factum индикацией реального провайдера: `DeepSeek · V4F · think` (зелёный), `Anthropic · Opus · think` (оранжевый), `Zen · MM2.7` (синий).
+В SOURCE-превью модель находится справа в общей нижней строке time/tokens:
+белый raw model label, сохранённый effort либо think и прозрачная SVG Claude/Codex.
+`Custom` не является моделью и не добавляется. Copy и раскрытие вынесены наверх,
+поэтому нижняя строка не конкурирует с двумя кнопками; длинный label сокращается,
+полное значение остаётся в hint. Это изменение оформления, не источника model.
+SVG обозначает Claude/Codex runner, raw label — upstream model: DeepSeek/Zen
+через Claude proxy не превращают glyph в неизвестного провайдера.
 
 **Источник правды — `message.model` из JSONL**, не локальный UI-state. Это поле Claude Code пишет из SSE `message_start` событий, которые приходят от **реального** upstream (DeepSeek/Zen возвращают свой model в формате Anthropic SSE). Бейдж в Timeline — единственное место в UI где видно правду пост-фактум, потому что bridge.sh и Model row показывают Claude TUI выбор, не реальный target (см. `fact-provider-proxy.md::Bridge врёт`).
 
@@ -303,15 +315,13 @@ Global `all` auto — это политика **с этого момента**, 
 
 **Почему look-ahead, а не первый assistant:** один user-turn может породить N assistants (thinking → tool_use → text → еще tool_use → text). Если брать первый — для tool-heavy turns пропустится модель финального ответа. Берём последний.
 
-**`<synthetic>` model = API error:** когда proxy вернул не Anthropic-SSE (или Anthropic вернул ошибку до streaming), Claude Code пишет placeholder с `msg.model: '<synthetic>'`, `msg.id: UUID-v4` (не Anthropic msg_), `usage` все нули, `stop_reason: 'stop_sequence'`. В тексте — `"API Error: ..."`. Бейдж для таких записей **не показывается** (helper `describeModel` возвращает null).
+**`<synthetic>` model = API error:** когда proxy вернул не Anthropic-SSE (или Anthropic вернул ошибку до streaming), Claude Code пишет placeholder с `msg.model: '<synthetic>'`, `msg.id: UUID-v4` (не Anthropic msg_), `usage` все нули, `stop_reason: 'stop_sequence'`. В тексте — `"API Error: ..."`. Ни model badge, ни final-answer preview из этой записи не создаются.
 
-**Color map:**
-- Anthropic — `#DA7756` (Claude orange)
-- DeepSeek — `#4ade80` (green)
-- Zen / minimax / kimi / glm — `#6B8AFF` (blue)
-- Прочие unknown model — `#a78bfa` (purple) с прямым raw model string
-
-**Почему отдельной строкой, а не inline:** в одной строке (time + tokens + бейдж + Копировать) при узком tooltip'е бейдж рвался на две визуальных строки рядом с кнопкой («DeepSeek ·» на одной, «V4F think» на второй у самой кнопки). Отдельный ряд под основным footer держит layout стабильным.
+SC — другой источник: короткие model/mode/effort берутся из сохранённого запроса
+того же exact run, без ChatGPT/GPT-prefix и current defaults. Это выбор запроса,
+не независимый proof применения параметров в SC UI. Old/pruned run не получает
+выдуманную модель. Для открытия сохранённого local Research detail остаётся
+прежний source-header; новый research или браузер по label не запускаются.
 
 ### Auto-Scroll при продолжении сессии, возврате на вкладку и новых записях
 При нажатии «Продолжить» (claude-c / gemini-c) Timeline автоматически прокручивается к последним entries. **Также при каждом приземлении на вкладку/сессию** — переключился на другой таб и вернулся → скролл всегда внизу, **независимо** от того запущен ли Claude/Gemini/SDK или процесс мёртв (прямой запрос юзера: *«если я переключился на другую вкладку и переключился обратно, у меня скролл внизу, всегда внизу… даже если внутри терминала не активен, или SDK не активен»*). Дополнительный desktop-контракт: если transcript получил новую Timeline-запись (`entries.length` вырос), Timeline всегда мгновенно прыгает вниз. При раскрытии expanded Timeline через `Cmd+\` скролл тоже принудительно ставится вниз после layout-пересчёта: раскрытие меняет высоты entries, и старый `scrollTop` может фактически означать начало списка. Это не smooth-follow и не sticky-scroll по пикселям: metadata-only refresh с той же длиной не трогает ручной скролл, но новая запись и явное раскрытие имеют приоритет над ручным положением.
@@ -390,10 +400,68 @@ Desktop сначала делает `validateOnly` по ещё живой вкл
 - **CMD+hover tooltip:** Fork marker поддерживает CMD+наведение (паттерн заметок). Показывает session ID источника + кнопку "Удалить маркер". Позиционирование: midpoint между `segmentRefs[N].bottom` и `segmentRefs[N+1].top` (fork strip рендерится МЕЖДУ entries, а не на entry).
 
 ### Smart Tooltip
-- При наведении на точку появляется превью сообщения.
-- **Layout:** Текст промпта (центральный блок) + нижний бар `[Expand]  timestamp  ............  [Copy]`.
-- **Scrolling:** Текст промпта имеет собственный скролл-контейнер с `scrollbar-thin` (3px). Сообщения не обрезаются (`line-clamp` удалён), полный текст всегда доступен через скролл даже в свёрнутом виде.
-- **Copy Animation:** Кнопка копирования меняет текст на «Скопировано» и иконку на галочку при успехе (на 1.2с).
+- Cmd остаётся общим сигналом hover/pin/notes/fork, но не изменяемым prop каждой
+  memo-строки. С09.10 SOURCE в `TimelineSegmentRow` передаётся только
+  `forkCmdHeld = forkMarkerVisible && isCmdHeld`: обычные точки не получают
+  массовый повторный render лишь из-за клавиши; видимая fork-полоска сохраняет
+  cursor на press/release. Parent map и открытие конкретного popup остаются.
+  Это не исправление независимых многосекундных Main stalls.
+- Второй этап09.10 убрал и лишний parent-render: физический Cmd хранится в ref
+  каждого retained owner, а React-state публикует только видимый Timeline с
+  наведением/открытым popup либо владелец, которому нужно обработать отпускание.
+  Cmd в composer не перерисовывает остальные rails. Hover синхронно подхватывает
+  уже зажатый Cmd; hover→Cmd, Cmd→hover, Cmd+Shift pin, release/blur и hide/show
+  сохраняются. Проверка должна считать сами Timeline parents на нескольких
+  удерживаемых владельцах, не только изменённые memo-props строк.
+- Cmd+hover открывает SOURCE-превью: одна строка prompt с ellipsis и по умолчанию
+  три строки начала **собственного финального ответа**. Это два отдельных
+  клика к exact user/final History identity, не поиск похожего текста.
+- Финальный адрес/короткий текст готовятся тем же canonical parser. Codex требует
+  `final_answer` (legacy untyped — completed, не failed/aborted); Claude — terminal
+  text `end_turn/stop_sequence`, не tool_use, thinking или API error. Последний
+  `message.id` не заменяет physical text UUID. Нет своего final — нет чужого
+  предыдущего ответа. Clock/Worked-end не выбирают ответ.
+  Codex `partial_answer` тоже не final: в History это отдельный видимый фрагмент,
+  но не замена target/preview завершённого ответа.
+- Header содержит свой тип/источник, две pencil/count метрики docs и icon-only
+  Copy/Expand. Copy сохраняет прежний полный исходный prompt/transport; галочка
+  на 1.2с — только feedback, не новый источник clipboard ownership.
+- Обычный user header называется `User mess.`. Доказанный native reply получает
+  отдельный синий чип «Ответ на вопрос» и читаемые «Вопрос / Ответ» через тот же
+  `projectNativeQuestionReply`, что History. Похожий reserved tag без сертификата
+  либо с изменённым full hash остаётся обычным literal; роль/UUID не меняются.
+  В hover цвет типа остаётся на чипе: содержимое прозрачно поверх единого тёмного
+  фона popup. Дополнительная синяя панель внутри чёрной рамки выглядела как
+  отдельная вложенная карточка без смысла. Это не отменяет синий тон sent History.
+- Continue после capacity и Run After Loop имеют один блеклый фиолетовый фон
+  `rgba(114,90,159,.08)` и серый текст `#8f8d88`, как caption History. Header
+  различает `RefreshCw · Continue` / `Repeat2 · Loop`; raw text, Copy и UUID
+  прежние. Общий `getAutomaticContinuationKind` требует сохранённого origin:
+  system/codex-capacity-retry или loop. Ordinary literal continue и структурный
+  `Context Overflow Recovery` не перекрашиваются. Реальный MCP и доказанный
+  native blue имеют более точное оформление; Loop не становится service/run.
+- Live Timeline-точка переносит `questionReplyProof` до окончания busy-turn.
+  Сертификат проверяется на исходном полном body до trim/2048-char бюджета;
+  только доказанный native reply сохраняет полный transport для Expand/Copy.
+  Остальные лёгкие точки остаются bounded. При позднем proof одинаковые body и
+  timestamp не означают «ничего не изменилось»: точка обновляет свой тип без
+  дубля, polling или полного History refresh.
+- В expanded режиме весь prompt, final и раскрываемые вложения читаются в одном
+  вертикальном viewport; текст selectable, body-click не навигирует. Pasted
+  Content раскрывается inline на исходном месте, без второй модалки/scroll.
+  Граница prompt/answer отмечена линией и пассивной риской у scrollbar.
+- Длинный final хранится в Timeline bounded-prefix с exact locator/длиной/hash;
+  полный текст читается только по explicit Expand через общий bounded History.
+  Поздний ответ другого owner либо изменённая запись не подставляются.
+- Image refs берутся тем же parser/pairing, что Full History: один `hasImage`
+  без пути не даёт права рисовать «недоступно», если canonical record уже знает
+  asset. Для missing legacy/Claude refs explicit Expand читает bounded exact
+  user-record; соседние сообщения и похожие имена файлов не являются fallback.
+- «Строк ответа в превью» — отдельная настройка default3; «Строки в ленте»
+  сохраняют прежний clamp expanded Timeline, не становятся настройкой popup.
+- Group hover — одна строка counters, без first message, общей даты, model и
+  Copy. Это обзор нескольких записей с разными интервалами; тело/время принадлежат
+  конкретной точке. Обычный ответ серый как caption History, prompt светлее.
 - **Resize:** Пользователь может изменять ширину тултипа, потянув за левую границу. Ширина сохраняется в рамках сессии. См. [`fix-timeline-tooltip-stability.md`](fix-timeline-tooltip-stability.md).
 - Использует "Invisible Bridge" для плавного наведения (см. `methodology/дизайн-принципы.md::Invisible Bridge` и `methodology/сценарии-багов-design.md::2. Hover-bridge`).
 - Для сообщений типа `continued` тултип показывает статус "Context Overflow Recovery".

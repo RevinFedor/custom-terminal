@@ -19,9 +19,52 @@ class WorkflowDrag {
       if(!Array.isArray(request.guardedFamilyIds) || request.guardedFamilyIds.some(id=>!request.tabs.some(tab=>tab.tabId===id)))fail('workflow_drag_plan_incomplete');
       const records=Object.fromEntries(catalog.filter(tab=>tab.nativeRow && tab.nativeRow.execution_archived!==1)
         .map(tab=>[tab.tabId,tab.nativeRow]));
+      if(request.fileTreeScope) {
+        const {ownerTabId,tabIds}=request.fileTreeScope;
+        if(!records[ownerTabId] || records[ownerTabId].tab_type==='file'
+          || !request.tabs.some(tab=>tab.tabId===ownerTabId))fail('workflow_drag_file_owner_changed');
+        const family=new Set([ownerTabId]);let added=true;
+        while(added) {added=false;for(const [id,row] of Object.entries(records))
+          if(row.tab_type==='file' && family.has(row.visual_parent_tab_id) && !family.has(id)){family.add(id);added=true;}}
+        family.delete(ownerTabId);
+        if(!Array.isArray(tabIds) || !same([...family].sort(),[...tabIds].sort()))fail('workflow_drag_file_tree_changed');
+        // This bounded surface can edit file relations only inside its owner.
+        for(const tab of request.tabs)if(tabIds.includes(tab.tabId)
+          && tab.visualParentTabId!==ownerTabId && !family.has(tab.visualParentTabId))fail('workflow_drag_file_owner_locked');
+      }
       if(!same(dragFamily(records,request.sourceRootTabIds).sort(),[...request.sourceFamilyIds].sort()))fail('workflow_drag_family_changed');
       if(!same(dragFamily(records,request.paneRootTabIds,{physicalOnly:true}).sort(),[...request.paneFamilyIds].sort()))fail('workflow_drag_family_changed');
       const globalGroups=this.groups.read();
+      if(request.emptyGroupMoves!==undefined && !Array.isArray(request.emptyGroupMoves))fail('workflow_drag_empty_group_changed');
+      for(const move of request.emptyGroupMoves || []) {
+        const group=this.groups.group(move.groupId);
+        if(request.destinationKind!=='reserve' || move.workflowId!==request.targetWorkflowId
+          || group.revision!==move.expectedGroupRevision || (group.reserveWorkflowId || null)!==move.expectedReserveWorkflowId
+          || group.reserveWorkflowId!==move.sourceWorkflowId || !Array.isArray(request.groupScopes?.[move.groupId])
+          || request.groupScopes[move.groupId].length || Object.values(globalGroups.tabGroups).includes(move.groupId)
+          || !request.workflows.some(workflow=>workflow.workflowId===move.sourceWorkflowId)
+          || !request.workflows.some(workflow=>workflow.workflowId===move.workflowId))fail('workflow_drag_empty_group_changed');
+      }
+      if(request.nativeScope) {
+        const scope=request.nativeScope;
+        if(scope.version!==1 || !same(Object.keys(scope.subjects || {}).sort(),request.tabs.map(tab=>tab.tabId).sort())
+          || !same(Object.keys(scope.groupDefinitions || {}).sort(),Object.keys(request.groupScopes || {}).sort()))fail('workflow_drag_native_scope_invalid');
+        if(!scope.treeScopes || !Object.hasOwn(scope.treeScopes,request.targetWorkflowId))fail('workflow_drag_native_scope_invalid');
+        const active=catalog.filter(tab=>tab.executionResolved && tab.nativeRow && tab.nativeRow.execution_archived!==1);
+        const activeIds=new Set(active.map(tab=>tab.tabId));
+        const populatedGroups=new Set(Object.entries(globalGroups.tabGroups).filter(([id])=>activeIds.has(id)).map(([,id])=>id));
+        for(const [workflowId,expected] of Object.entries(scope.treeScopes)) {
+          const ids=active.filter(tab=>tab.membership?.workflowId===workflowId).map(tab=>tab.tabId).sort();
+          const empty=globalGroups.groups.filter(group=>group.reserveWorkflowId===workflowId && !populatedGroups.has(group.id)).map(group=>group.id).sort();
+          if(!same(ids,expected.activeTabIds) || !same(empty,expected.emptyGroupIds))fail('workflow_drag_inventory_changed',{workflowId});
+        }
+        for(const [id,subject] of Object.entries(scope.subjects)) {
+          const row=byId.get(id)?.nativeRow;
+          if(!row || !same(executionScopeForRow(row),subject))fail('workflow_drag_subject_changed',{tabId:id});
+        }
+        for(const [id,revision] of Object.entries(scope.groupDefinitions))
+          if(this.groups.group(id).revision!==revision)fail('workflow_drag_group_definition_changed',{groupId:id});
+      }
       for(const [groupId,expectedIds] of Object.entries(request.groupScopes || {})) {
         this.groups.group(groupId);
         const ids=Object.entries(globalGroups.tabGroups).filter(([,id])=>id===groupId).map(([id])=>id).sort();
@@ -46,7 +89,7 @@ class WorkflowDrag {
           || (globalGroups.membershipRevisions[tab.tabId] || 0)!==guard.groupRevision)fail('workflow_group_membership_changed',{tabId:tab.tabId});
         this.org.workflowRequired(tab.workflowId);
         if(tab.groupId!==null)this.groups.group(tab.groupId);
-        if((row.parent_tab_id || row.tab_type==='file') && (row.visual_parent_tab_id || null)!==tab.visualParentTabId)
+        if(row.parent_tab_id && (row.visual_parent_tab_id || null)!==tab.visualParentTabId)
           fail('workflow_drag_physical_parent_locked',{tabId:tab.tabId});
         return {proposal:tab,current,row,subject,namespace};
       });
@@ -92,6 +135,7 @@ class WorkflowDrag {
         }
       }
       this.groups.applyDragAssignments(request.tabs);
+      this.groups.applyDragEmptyGroups(request.emptyGroupMoves || []);
       for(const {proposal,old,layout} of workflows) {
         this.org.validateLayout(old.id,layout);
         const metadata={...old.metadata,reserveOrder:proposal.reserveOrder,reserveRootOrder:proposal.reserveRootOrder};
@@ -102,7 +146,8 @@ class WorkflowDrag {
       this.org.journal(generation,{reason:'painted-forest-drag',gestureId:request.gestureId,
         sourceRoots:request.sourceRootTabIds,sourceFamily:request.sourceFamilyIds,admissionRevision:request.expectedRevision,baseRevision});
       return {success:true,baseRevision,relationReceipts,tabIds:request.movingFamilyIds,
-        workflowIds:workflows.map(({old})=>old.id),targetWorkflowId:request.targetWorkflowId};
+        workflowIds:workflows.map(({old})=>old.id),targetWorkflowId:request.targetWorkflowId,
+        ...(request.nativeCommit ? {nativePreview:{captureId:request.nativeCommit.captureId,previewId:request.nativeCommit.previewId}}:{})};
     },{validateScope});
   }
 }

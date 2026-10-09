@@ -36,7 +36,7 @@ const layout = { ...emptySpaceLayout(), activeProjectId: p, focusedProjectId: p,
   activeSpaceTab: { projectId: p, tabId: 'a' }, splitPanes: initialPanes, splitFocusedIndex: 0,
   splitSizes: { cols: [1], rows: [[1]] } };
 function reset() {
-  useWorkspaceStore.setState({ view: 'workspace', isRestoring: false, ...layout,
+  useWorkspaceStore.setState({ view: 'workspace', isRestoring: false, organizationReady:false, ...layout,
     openProjects: new Map([[p, { projectId: p, projectPath: cwd, tabs: new Map(tabs.map(t => [t.id, { ...t }])),
       activeTabId: 'a', currentView: 'terminal', tabGroups: [], tabHistory: [], selectedTabIds: [], sidebarOpen: false }]]),
     activeSpaceId: 'picker-space', spaces: [{ id: 'picker-space', name: 'Picker workflow', projectIds: [p], layout }],
@@ -53,6 +53,30 @@ function reset() {
 useProjectsStore.setState({ projects: { [p]: { id: p, name: 'Synthetic project', path: cwd, icon } } });
 reset();
 f.reset = reset;
+f.manyHidden = () => useWorkspaceStore.setState(s => {
+  const openProjects = new Map(s.openProjects), workspace = openProjects.get(p)!;
+  const nextTabs = new Map(workspace.tabs), extra = Array.from({length:24}, (_, i) => {
+    const id = 'scroll-' + i;
+    nextTabs.set(id, {...tabs[4],id,name:'Окно прокрутки '+i,codexSessionId:undefined,commandType:'generic'} as any);
+    return {projectId:p,tabId:id,windowId:id,column:i+3,displayHidden:true,tabs:[{projectId:p,tabId:id}]};
+  });
+  openProjects.set(p,{...workspace,tabs:nextTabs});
+  return {openProjects,splitPanes:[...initialPanes,...extra]};
+});
+f.canonicalScopes=()=>{
+  reset();
+  useWorkspaceStore.setState({organizationReady:true,
+    spaces:[{id:'picker-space',name:'Current workflow with sessions',kind:'user',projectIds:[],layout},
+      {id:'second-workflow',name:'Another workflow with sessions',kind:'user',projectIds:[],layout:emptySpaceLayout()},
+      {id:'__noted_workflow_inbox__',name:'Inbox',kind:'inbox',projectIds:[],layout:emptySpaceLayout()}],
+    tabWorkflowMembership:Object.fromEntries([['a','picker-space'],['b','picker-space'],['c','second-workflow'],['d','second-workflow'],['e','__noted_workflow_inbox__']]
+      .map(([id,workflowId])=>[id,{workflowId,revision:1}])),
+    globalGroups:{version:1,revision:1,groups:[],tabGroups:{},membershipRevisions:{}},
+    tabCatalog:Object.fromEntries(tabs.map(tab=>[tab.id,{active:true,namespace:p}])),
+  } as any);
+};
+f.moveCanonical=()=>useWorkspaceStore.setState(s=>({tabWorkflowMembership:{...s.tabWorkflowMembership,c:{workflowId:'picker-space',revision:2}}}));
+f.workflowState=()=>({workflow:useWorkspaceStore.getState().activeSpaceId,panes:useWorkspaceStore.getState().splitPanes});
 f.state = () => {
   const s = useWorkspaceStore.getState();
   return { panes: s.splitPanes.map(pane => ({ id: pane.windowId, shown: pane.tabId, slot: pane.selectedSlotId,
@@ -141,6 +165,10 @@ function Fixture() {
         panelRef={panel} showAllTabsOnOpen menuWidth={350}
         setRunAfterTab={(_source,target)=>{f.selected=target;setDependency(target);}} />
     </div>
+    {new URLSearchParams(location.search).has('workflow-scope') && <div data-restart-after-host style={{position:'absolute',left:540,top:250,width:270}}>
+      <RunAfterTabPicker tabId="a" ownerProjectId={p} autoRun={false} runAfterTabId={dependency} title="Restart after - pick a tab"
+        panelRef={panel} showAllTabsOnOpen menuWidth={350} setRunAfterTab={(_source,target)=>{f.selected=target;setDependency(target);}}/>
+    </div>}
     <div data-actual-workspace style={{position:'absolute',left:30,top:190,width:470,height:320}}>
       <TerminalArea projectId={p} />
     </div>

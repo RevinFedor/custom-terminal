@@ -129,15 +129,71 @@ test('deferred delivery to a busy target is waiting, not an error or an already 
   assert.equal(presentation({status:'sent',targetPromptProofAt:123,requiresTargetPromptProof:true},'source').color,'#4ade80');
   assert.equal(presentation({ status: 'sent', deliveryDeferredReason: 'target-not-idle:busy' }, 'source').label, 'Доставлено');
   assert.equal(presentation({ status: 'cancelled', deliveryDeferredReason: 'target-not-idle:busy' }, 'source').label, 'Закрыто');
+  for (const status of ['running', 'waiting_descendants']) {
+    const observed = presentation({ status, runKind: 'response-observation' }, 'source');
+    assert.equal(observed.icon, 'waiting');
+    assert.equal(observed.spinning, false);
+  }
+  assert.equal(presentation({ status: 'waiting_recovery', runKind: 'response-observation' }, 'source').label, 'Проверка недоступна');
 });
 
-test('external research uses the same tracker without a fake linked tab action', () => {
+test('detaching an observer never asks the target to cancel Send; exact source handoff remains independently cancellable', async () => {
+  const start = source.indexOf('  const runAction = useCallback');
+  const end = source.indexOf('  const saveSettings =', start);
+  const calls = [];
+  const action = vm.runInNewContext(transformSync(source.slice(start, end), { loader: 'ts' }).code + '\nrunAction', {
+    useCallback: fn => fn, tabId: 'source', isOrchestrationResultProofPending: () => false,
+    canCancelPendingSourceHandoff: run => run.sourceFollowupPending === true,
+    setRuns: () => {}, setActionError: () => {},
+    ipcRenderer: { invoke: async (channel, args) => { calls.push({ channel, args }); return { ok: true, cancelled: true }; } },
+  });
+  const run = { runId: 'observer', runKind: 'response-observation', sourceTabId: 'source', targetTabId: 'target' };
+  await action(run, 'detach');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].channel, 'orchestration:action');
+  assert.equal(calls[0].args.cancelSendAccepted, false);
+  calls.length = 0;
+  await action({ ...run, sourceFollowupPending: true }, 'detach');
+  assert.equal(calls[0].channel, 'agent:cancel-send');
+  assert.equal(calls[0].args.tabId, 'source');
+  assert.equal(calls[0].args.handoffId, 'orchestration-complete:observer');
+});
+
+test('external research opens its saved SC task from the same tracker', () => {
   assert.match(source, /if \(run\.runKind === 'external-research'\) return false/);
   assert.match(source, /deliveryDeferredReason === 'external-research-transport'[\s\S]*?'Ждёт SC Desktop'/);
   assert.match(source, /data-orchestration-external-target/);
-  assert.match(source, /!\(isSource && run\.runKind === 'external-research'\)[\s\S]*?Открыть связанную вкладку/);
+  assert.match(source, /ipcRenderer\.invoke\('orchestration:open-research-job', \{ runId: run\.runId \}\)/);
+  assert.match(source, /data-orchestration-external-target=\{externalSourceRun \|\| undefined\}/);
   assert.match(source, /run\.runKind !== 'external-research'[\s\S]*?!isOrchestrationResultProofPending\(run\)/);
   assert.match(source, /run\.externalResearchJobId[\s\S]*?<span>jobId<\/span>/);
   assert.match(source, /orchestrationDetailRows\(run, tabId\)/);
   assert.equal((source.match(/<RunDetailFields run=\{run\} tabId=\{tabId\}/g) || []).length, 2);
+});
+
+test('SC tracker navigation uses exact run identity, waits for commit and coalesces repeated clicks', async () => {
+  const start = source.indexOf('  const openLinkedTab = useCallback');
+  const end = source.indexOf('  const runAction =', start);
+  const calls = [], errors = [];
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const callback = vm.runInNewContext(transformSync(source.slice(start, end), { loader: 'ts' }).code + '\nopenLinkedTab', {
+    useCallback: fn => fn, tabId: 'source', openingLinkedRuns: { current: new Set() },
+    setOpeningLinkedRunIds: () => {}, setActionError: fn => errors.push(fn({})),
+    setHistoryOpen: value => calls.push(['history', value]), closeMessage: () => calls.push(['close']),
+    useWorkspaceStore: { getState: () => ({ openTabById: () => { throw Error('No terminal target for external research'); } }) },
+    ipcRenderer: { invoke: async (channel, args) => {
+      calls.push([channel, args.runId]);
+      return channel === 'orchestration:open-research-job' ? pending : {};
+    } },
+  });
+  const run = { runId: 'exact-run', sourceTabId: 'source', targetTabId: null, runKind: 'external-research' };
+  const opened = callback(run);
+  await callback(run);
+  assert.deepEqual(calls, [['orchestration:open-research-job', 'exact-run']]);
+  release({ success: true });
+  await opened;
+  assert.deepEqual(calls, [['orchestration:open-research-job', 'exact-run'], ['history', false], ['close'],
+    ['orchestration:acknowledge', 'exact-run']]);
+  assert.equal(errors.at(-1)['exact-run'], '');
 });

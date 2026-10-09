@@ -1,10 +1,14 @@
-import { getTerminalMcpTag, isSystemPromptEntry } from '../../shared/prompt-origin.mjs';
+import { getAutomaticContinuationKind, getTerminalMcpTag, isSystemPromptEntry } from '../../shared/prompt-origin.mjs';
+import { projectNativeQuestionReply } from '../../shared/native-question-reply.mjs';
 
-export function timelineMarkerKind(entry) {
+export function timelineMarkerKind(entry, fingerprint) {
+  if (entry?.questionReplyProof && projectNativeQuestionReply(entry, fingerprint)) return 'question-reply';
   const tag = getTerminalMcpTag(entry);
   if (tag?.kind === 'orchestration' && tag.runKind === 'external-research'
     && typeof tag.runId === 'string' && tag.runId.trim()) return 'sc-desktop';
   if (tag) return 'terminal-mcp';
+  const continuation = getAutomaticContinuationKind(entry);
+  if (continuation) return continuation;
   return isSystemPromptEntry(entry) ? 'system' : 'ordinary';
 }
 

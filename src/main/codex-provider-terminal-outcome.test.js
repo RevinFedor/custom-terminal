@@ -9,6 +9,7 @@ const predicates = require('./codex-provider-preview');
 const { projectCodexPublicRuntimeProjection } = require('./codex-runtime-contract');
 const { shouldCreateHistoryResponseTiming } = require('./history-response-timings');
 const { createProviderSemanticShadow } = require('./provider-semantic-shadow');
+const { TaskCompletionIntentRegistry, taskCompletionOutcomeMeta } = require('./task-completion-intent');
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const part = name => {
@@ -45,7 +46,7 @@ function harness({ suppressed = false } = {}) {
     compactOperations: { getPending: () => null },
     isCodexStartupLifecycleFresh: () => false,
     getCodexWriterProofSnapshot: () => null,
-    terminalHistoryPreviewController: { observeSemanticEvent: detail => previews.push(detail) },
+    terminalHistoryPreviewController: { observeSemanticEvent: detail => previews.push(detail), finish() {} },
     currentCodexProviderSemanticOwnerContext: () => current,
     codexOutcomeTimestampMs: value => Date.parse(value),
     applyCodexWatcherAbnormalOutcome() {},
@@ -56,9 +57,16 @@ function harness({ suppressed = false } = {}) {
       liveLifecycle: true, turnBusy: watcher.busy || owner.turnActive, tuiInputReady: true,
     })),
     mainWindow: { isDestroyed: () => false, webContents: { send: (...args) => events.push(args) } },
+    taskCompletionIntents: new TaskCompletionIntentRegistry(), taskCompletionOutcomeMeta,
+    codexRuntimePolicies: null, getTerminalLifecycleGeneration: () => 'terminal:1',
+    replayDeferredCodexPromptAuditExecutionContext() {}, discardDeferredCodexPromptAuditExecutionContexts() {},
+    clearCodexMcpStartupWatchdog() {}, emitAgentReadinessChanged() {},
+    getCodexPublicRuntimeProjection: () => ({ sessionStatus: 'active', inputReady: true }),
+    getCodexRuntimeSessionId: () => 'S', getCombinedTabBackgroundWorkCount: () => 0,
+    getCodexPublicWriterFields: () => ({}), _webBroadcast() {},
     console: { log() {}, warn() {} },
   };
-  const names = ['publishCodexProviderTurnActivity', 'settleCodexProviderActivityFromWatcherOutcome', 'applyCodexWatcherOutcome', 'observeCodexProviderPreviewRawRecord', 'codexProviderRequestCausalTurnSnapshot', 'authorizeCodexProviderMainRequest', 'handleCodexProviderSemanticEvent'];
+  const names = ['publishCodexProviderTurnActivity', 'settleCodexProviderActivityFromWatcherOutcome', 'applyCodexWatcherOutcome', 'emitCodexBusy', 'observeCodexProviderPreviewRawRecord', 'codexProviderRequestCausalTurnSnapshot', 'authorizeCodexProviderMainRequest', 'handleCodexProviderSemanticEvent'];
   const functions = vm.runInNewContext(names.map(part).join('\n') + '\n({' + names.join(',') + '})', context);
   return { ...functions, owner, watcher, current, projections, events, timings, previews, prompts };
 }
@@ -124,6 +132,9 @@ test('compact completion releases provider busy but cannot attach compact durati
     reason: 'task_complete', hasFinalResult: false, completionKind: 'compact' },
   '2026-09-10T09:34:05.312Z', 'B', null);
   assert.equal(h.owner.turnActive, false);
+  assert.equal(h.events.length, 0, 'activity settlement leaves the complete terminal event to its owner');
+  h.emitCodexBusy('T', false, 'task_complete', { turnId: 'B', timestamp: '2026-09-10T09:34:05.312Z',
+    outcome: { event: 'task_complete', reason: 'task_complete', busy: false, hasFinalResult: false, completionKind: 'compact' } });
   assert.equal(h.events[0][1].reason, 'task_complete');
   assert.equal(h.watcher.lastOutcomeHasFinalResult, false);
   assert.equal(h.timings.at(-1)[3].responseTimingEligible, false);
@@ -139,11 +150,15 @@ test('live and suppressed/catch-up typed outcomes settle provider activity witho
     assert.equal(h.watcher.busy, false);
     assert.equal(h.watcher.outcomeKnown, true);
     assert.deepEqual(h.projections, [{ sessionStatus: 'active', busy: false, inputReady: true }]);
-    assert.equal(h.events.length, 1);
-    assert.equal(h.events[0][1].reason, 'task_complete');
+    assert.equal(h.events.length, 0, 'settle cannot publish an incomplete busy edge, including suppressed catch-up');
+    if (!suppressed) {
+      h.emitCodexBusy('T', false, 'task_complete', { turnId: 'B', timestamp: '2026-09-05T01:12:26.837Z',
+        outcome: { event: 'task_complete', busy: false, reason: 'task_complete', hasFinalResult: true } });
+      assert.equal(h.events[0][1].reason, 'task_complete');
+    }
     h.applyCodexWatcherOutcome(h.watcher, { event: 'task_complete', busy: false },
       '2026-09-05T01:12:26.837Z', 'B', null);
-    assert.equal(h.events.length, 1, 'the same outcome does not settle the activity twice');
+    assert.equal(h.events.length, suppressed ? 0 : 1, 'the same outcome does not settle the activity twice');
   }
 });
 
@@ -158,6 +173,9 @@ test('Run After receives semantic watcher outcomes, not a producer label or gene
     const h = harness();
     h.applyCodexWatcherOutcome(h.watcher, { event, reason, busy: false, hasFinalResult: natural },
       '2026-09-06T23:16:30.657Z', 'B', null);
+    assert.equal(h.events.length, 0);
+    h.emitCodexBusy('T', false, reason, { turnId: 'B', timestamp: '2026-09-06T23:16:30.657Z',
+      outcome: { event, reason, busy: false, hasFinalResult: natural } });
     const delivered = h.events[0]?.[1];
     assert.equal(delivered.reason, reason);
     assert.equal(isNaturalAgentTurnEndReason(delivered.reason), natural);

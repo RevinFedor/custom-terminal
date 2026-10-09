@@ -2,6 +2,7 @@
 
 const { randomUUID, createHash } = require('node:crypto');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { canProjectCurrentProviderQueue } = require('../shared/agent-send-receipt-control.cjs');
 const {
   classifyAgentSendRegistryReceipt,
   isAgentSendProviderQueueAccepted,
@@ -12,7 +13,7 @@ const LIST_COLUMNS = `messageId, kind, replyTo,
   sourceTabId, sourceTabName, sourceProjectId, sourceProjectName, sourceProvider, sourceSessionId,
   targetTabId, targetTabName, targetProjectId, targetProjectName, targetProvider, targetSessionId,
   createdAt, updatedAt, deliveryState, error, code, replyMessageId, answeredAt,
-  sourceDismissedAt, targetDismissedAt,
+  sourceDismissedAt, targetDismissedAt, cancelledAt, cancelledByTabId,
   operationKey, handoffId, requestId, sourceAddressJson, targetAddressJson`;
 const hash = (text) => createHash('sha256').update(text).digest('hex');
 const now = () => new Date().toISOString();
@@ -134,6 +135,11 @@ function receiptOutcome(record, message) {
   const receipt = record?.receipt || record || {};
   const state = record?.state;
   if (state === 'confirmed') return { deliveryState: 'sent' };
+  if (!canProjectCurrentProviderQueue(record)) {
+    return { deliveryState: !record.attemptId || ['not-submitted', 'provider-not-accepted'].includes(state) ? 'failed' : 'unconfirmed',
+      retryAllowed: 0, code: record.deliveryControl?.cancelledAt ? 'tab_message_cancelled' : 'tab_message_input_slot_retired',
+      error: 'This operation no longer owns the input; its delivery evidence is preserved.' };
+  }
   if (!['not-submitted', 'provider-not-accepted'].includes(state)
     && (state === 'queued' || receipt.status === 'queued' && receipt.submitted === true
     || isAgentSendProviderQueueAccepted(receipt, {
@@ -168,11 +174,11 @@ function receiptOutcome(record, message) {
  */
 class TabMessageService {
   constructor({ db, resolveTab, send, getReceipt = () => null, onChanged = () => {}, log = () => {},
-    receiptRequiredBeforeSend = false, releaseReceipt = null }) {
+    receiptRequiredBeforeSend = false, releaseReceipt = null, cancelDelivery = null }) {
     if (!db?.prepare || !db?.transaction) throw new TypeError('A raw better-sqlite3 database is required');
     if (typeof resolveTab !== 'function' || typeof send !== 'function') throw new TypeError('resolveTab and send are required');
     if (releaseReceipt != null && typeof releaseReceipt !== 'function') throw new TypeError('releaseReceipt must be a function');
-    Object.assign(this, { db, resolveTab, send, getReceipt, onChanged, log, releaseReceipt });
+    Object.assign(this, { db, resolveTab, send, getReceipt, onChanged, log, releaseReceipt, cancelDelivery });
     // Only opt in when every physical send reserves a durable receipt and
     // unresolved messages keep that receipt. Absence then proves no input.
     this.receiptRequiredBeforeSend = receiptRequiredBeforeSend === true;
@@ -211,7 +217,7 @@ class TabMessageService {
     CREATE INDEX IF NOT EXISTS tab_messages_source ON ${TABLE_NAME}(sourceTabId, createdAt);`);
     this.db.transaction(() => {
       const columns = new Set(this.db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all().map((column) => column.name));
-      for (const column of ['sourceDismissedAt', 'targetDismissedAt', 'sourceAddressJson', 'targetAddressJson']) {
+      for (const column of ['sourceDismissedAt', 'targetDismissedAt', 'sourceAddressJson', 'targetAddressJson', 'cancelledAt', 'cancelledByTabId']) {
         if (!columns.has(column)) this.db.exec(`ALTER TABLE ${TABLE_NAME} ADD COLUMN ${column} TEXT`);
       }
     })();
@@ -290,6 +296,70 @@ class TabMessageService {
     })();
     if (!result.deduplicated) this._changed(result.row, 'dismissed');
     return { message: publicMessage(result.row), deduplicated: result.deduplicated };
+  }
+
+  // Explicit cancellation is thread intent, distinct from the legacy per-side
+  // hide action. Physical delivery facts may still arrive after cancellation.
+  cancelMessage({ tabId: id, messageId }) {
+    this._assertReady(); required(id, 'tabId'); required(messageId, 'messageId');
+    if (typeof this.cancelDelivery !== 'function') {
+      throw new TabMessageError('tab_message_cancel_unavailable', 'Durable delivery cancellation is unavailable', 503);
+    }
+    const effects = [];
+    const result = this.db.transaction(() => {
+      let question = this._row(messageId);
+      if (question?.kind === 'reply') question = this._row(question.replyTo);
+      if (!question) throw new TabMessageError('tab_message_not_found', 'The question does not exist', 404);
+      if (question.sourceTabId !== id && question.targetTabId !== id) {
+        throw new TabMessageError('tab_message_foreign_participant', 'Only an involved tab may cancel this question', 403);
+      }
+      const timestamp = question.cancelledAt || updatedAfter(question.updatedAt);
+      const rows = [question, question.replyMessageId && this._row(question.replyMessageId)].filter(Boolean);
+      for (const row of rows) {
+        if (!row.cancelledAt) this.db.prepare(`UPDATE ${TABLE_NAME} SET cancelledAt=COALESCE(cancelledAt,?),
+          cancelledByTabId=COALESCE(cancelledByTabId,?),retryAllowed=0,updatedAt=? WHERE messageId=?`)
+          .run(timestamp, id, updatedAfter(row.updatedAt), row.messageId);
+        if (this.cancelDelivery) {
+          const cancellation = this.cancelDelivery(this._row(row.messageId));
+          if (cancellation?.then || cancellation?.ok !== true) {
+            throw new TabMessageError('tab_message_cancel_not_committed', 'Cancellation was not durably recorded', 503);
+          }
+          if (typeof cancellation?.afterCommit === 'function') effects.push(cancellation.afterCommit);
+        }
+      }
+      return { rows: rows.map(row => this._row(row.messageId)), deduplicated: !!question.cancelledAt };
+    })();
+    for (const effect of effects) {
+      try { effect(); } catch (error) {
+        this._diagnostic('tab-message-cancel-effects-pending', result.rows[0], { code: safeCode(error?.code, 'cancel_effects_failed') });
+      }
+    }
+    for (const row of result.rows) this._changed(row, 'cancelled');
+    return { message: publicMessage(result.rows[0]), cancelled: true, deduplicated: result.deduplicated };
+  }
+
+  assertDeliveryActive(messageId) {
+    this._assertReady();
+    const row = this._row(messageId);
+    if (!row || row.cancelledAt || row.replyTo && this._row(row.replyTo)?.cancelledAt) {
+      const error = new TabMessageError('tab_message_cancelled', 'Delivery was cancelled by the user');
+      error.submitted = false;
+      throw error;
+    }
+    return row;
+  }
+
+  receiptPresentation(operationKey, tabId) {
+    if (!this.initialized || this.disposed) return null;
+    const row = this.db.prepare(`SELECT messageId,replyTo,sourceTabId,targetTabId,sourceDismissedAt,
+      targetDismissedAt,cancelledAt FROM ${TABLE_NAME} WHERE operationKey=?`).get(operationKey);
+    if (!row || row.targetTabId !== tabId) return null;
+    const question = row.replyTo ? this.db.prepare(`SELECT sourceTabId,targetTabId,sourceDismissedAt,
+      targetDismissedAt,cancelledAt FROM ${TABLE_NAME} WHERE messageId=?`).get(row.replyTo) : row;
+    if (!question || ![question.sourceTabId, question.targetTabId].includes(tabId)) return null;
+    const hidden = question.cancelledAt || (question.sourceTabId === tabId
+      ? question.sourceDismissedAt : question.targetDismissedAt);
+    return hidden ? { presentationDismissedAt: Date.parse(hidden), presentationDismissedSurface: 'desktop-history' } : null;
   }
 
   async _resolve(value, allowResume = false) {
@@ -397,7 +467,7 @@ class TabMessageService {
       const reserved = this._reserve({
         kind: 'reply', source: { ...addressed, provider: from.provider, sessionId: from.sessionId,
           sendTarget: from.sendTarget, runtimeTarget: from.runtimeTarget }, target: endpoint(question, 'source'),
-        text, requestId, fingerprint, question,
+        text, requestId, fingerprint, question: this._row(messageId),
       });
       this.db.prepare(`UPDATE ${TABLE_NAME} SET replyMessageId = ?, answeredAt = ?, updatedAt = ? WHERE messageId = ?`)
         .run(reserved.message.messageId, reserved.message.createdAt, updatedAfter(this._row(messageId).updatedAt), messageId);
@@ -416,9 +486,12 @@ class TabMessageService {
       ...fields(source, 'source'), ...fields(target, 'target'), text,
       createdAt: timestamp, updatedAt: timestamp, deliveryState: 'pending',
       error: null, code: null, replyMessageId: null, answeredAt: null,
+      cancelledAt: question?.cancelledAt || null, cancelledByTabId: question?.cancelledByTabId || null,
       operationKey: `tab-message:${messageId}`, handoffId: `tab-message:${messageId}`,
       requestId, requestFingerprint: fingerprint,
     };
+    if (row.cancelledAt) Object.assign(row, { deliveryState: 'failed', code: 'tab_message_cancelled',
+      error: 'The request was cancelled; this reply is saved without delivery.' });
     row.frozenPrompt = formatTabMessagePrompt(row, question);
     const keys = Object.keys(row);
     this.db.prepare(`INSERT INTO ${TABLE_NAME} (${keys.join(',')}) VALUES (${keys.map((key) => '@' + key).join(',')})`).run(row);
@@ -471,6 +544,7 @@ class TabMessageService {
     const row = this._row(messageId);
     if (!row || row.deliveryState === 'sent') return row;
     const patch = { error: null, code: null, retryAllowed: 0, ...next };
+    if (row.cancelledAt) patch.retryAllowed = 0;
     if (Object.entries(patch).every(([key, value]) => row[key] === value)) return row;
     patch.updatedAt = updatedAfter(row.updatedAt);
     const keys = Object.keys(patch);
@@ -486,6 +560,7 @@ class TabMessageService {
   // transport operation. Retries always use those exact persisted bytes.
   updateFrozenPrompt(messageId, prompt) {
     this._assertReady();
+    this.assertDeliveryActive(messageId);
     required(prompt, 'prompt');
     const row = this._row(required(messageId, 'messageId'));
     if (!row) throw new TabMessageError('tab_message_not_found', 'The message does not exist', 404);
@@ -556,7 +631,8 @@ class TabMessageService {
     // Positive acceptance survives late ambiguous/negative send callbacks.
     const queueReturned = receipt?.state === 'provider-not-accepted'
       || classifyAgentSendRegistryReceipt(receipt?.receipt || receipt || {}) === 'provider-not-accepted';
-    if (row.deliveryState === 'queued' && outcome.deliveryState !== 'sent' && !queueReturned) return publicMessage(row);
+    if (row.deliveryState === 'queued' && outcome.deliveryState !== 'sent' && !queueReturned
+      && canProjectCurrentProviderQueue(receipt)) return publicMessage(row);
     return publicMessage(this._transition(row.messageId, {
       ...outcome,
       receiptAttempt: Math.max(row.receiptAttempt, Number(receipt?.attempt) || 0),
@@ -630,7 +706,7 @@ class TabMessageService {
     }
     if (this.disposed) return;
     const retryIds = this.db.prepare(`SELECT messageId FROM ${TABLE_NAME}
-      WHERE targetTabId = ? AND retryAllowed = 1`).all(id).map((row) => row.messageId);
+      WHERE targetTabId = ? AND retryAllowed = 1 AND cancelledAt IS NULL`).all(id).map((row) => row.messageId);
     return this._enqueue(id, retryIds, reason);
   }
 
@@ -640,11 +716,11 @@ class TabMessageService {
       if (this.disposed) return;
       const eligible = new Set(retryIds);
       const rows = this.db.prepare(`SELECT * FROM ${TABLE_NAME} WHERE targetTabId = ?
-        AND (deliveryState = 'pending' OR retryAllowed = 1) ORDER BY rowid`).all(id);
+        AND cancelledAt IS NULL AND (deliveryState = 'pending' OR retryAllowed = 1) ORDER BY rowid`).all(id);
       for (const snapshot of rows) {
         if (this.disposed) return;
         const row = this._row(snapshot.messageId);
-        if (row.deliveryState === 'pending' || eligible.has(row.messageId) && row.retryAllowed) {
+        if (!row.cancelledAt && (row.deliveryState === 'pending' || eligible.has(row.messageId) && row.retryAllowed)) {
           await this._deliver(row, reason);
           if (this._row(row.messageId)?.code === 'tab_message_identity_pending') break;
         }
@@ -658,6 +734,7 @@ class TabMessageService {
   }
 
   async _deliver(row, reason) {
+    if (this._row(row.messageId)?.cancelledAt) return;
     if (row.attemptCount > 0) {
       await this._reconcileOne(row, 'retry-reconcile');
       if (this.disposed || !this._row(row.messageId).retryAllowed) return;
@@ -688,7 +765,7 @@ class TabMessageService {
     }
     if (this.disposed) return;
     const current = this._row(row.messageId);
-    if (!(current.deliveryState === 'pending' || current.retryAllowed)) return;
+    if (current.cancelledAt || !(current.deliveryState === 'pending' || current.retryAllowed)) return;
     const attemptCount = current.attemptCount + 1;
     const sending = this._transition(row.messageId, {
       deliveryState: 'sending', attemptCount, deliverySessionId: target.sessionId, code: null, error: null,

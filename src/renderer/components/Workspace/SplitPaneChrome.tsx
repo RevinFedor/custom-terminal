@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { ArrowLeftRight, BringToFront, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search, FolderInput } from 'lucide-react';
+import { ArrowLeftRight, BringToFront, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search, FolderInput, Minimize2 } from 'lucide-react';
 import {requestHistorySearch} from '../../utils/historySearchMarkers';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
@@ -21,7 +21,7 @@ import {
   resizeFractions,
   splitDividerDescriptors, splitCornerDescriptors,
 } from '../../utils/splitPanesModel.mjs';
-import { windowSplitAvailability } from '../../utils/windowDisplayLayouts.mjs';
+import { windowSplitAvailability,canMinimizeDisplayWindow } from '../../utils/windowDisplayLayouts.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import PaneTabStrip from './PaneTabStrip';
 import MoveToWindowMenu, { WorkspaceWindowSwapPicker } from './MoveToWindowMenu';
@@ -847,16 +847,6 @@ export function SplitPaneAttachRow({
                 the pointer through the rest of the application. The ellipsis
                 suffix promises a second explicit choice instead of a hover
                 chevron. */}
-            {!vacant && canSearchHistory && <button type="button" role="menuitem" data-split-strip-menu-item="search-history"
-              onClick={(event)=>{
-                event.stopPropagation();setStripMenu(null);
-                useUIStore.getState().setHistoryPanelOpen(tabId,true);
-                useUIStore.getState().setSideTerminalOpen(tabId,false);
-                requestHistorySearch(tabId);
-              }}
-              style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',cursor:'pointer'}}>
-              <Search size={13}/><span style={{flex:1,textAlign:'left'}}>Найти в чате</span><span style={{fontSize:10,color:'#999'}}>⌘F</span>
-            </button>}
             <button type="button" role="menuitem" data-split-strip-menu-item="show-window-alongside"
               disabled={!splitCan.horizontal && !splitCan.vertical}
               style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',textAlign:'left',cursor:'pointer'}}
@@ -866,8 +856,24 @@ export function SplitPaneAttachRow({
                 if(currentIndex===-1)return;
                 const accepted=splitCan.horizontal?store.addEmptySplitPane(currentIndex):store.addVerticalSplitPane(currentIndex,'below');
                 if(accepted)setStripMenu(null);
-              }}><Columns2 size={13}/>{hasHiddenWindows?'Показать скрытое окно рядом':'Добавить окно рядом'}</button>
-            <TabMenuChoices label="Перенести окно в workflow" icon={<FolderInput size={13}/>} action="move-window-to-workflow" side="left"
+              }}><Columns2 size={13}/>{hasHiddenWindows?'Expand':'Split'}</button>
+            <button type="button" role="menuitem" data-split-strip-menu-item="minimize-window"
+              disabled={!canMinimizeDisplayWindow(splitPanes,sourceWindowId)} title="Minimize window"
+              style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',textAlign:'left',cursor:'pointer'}}
+              onClick={()=>{if(sourceWindowId && useWorkspaceStore.getState().minimizeWorkspaceWindow(activeSpaceId,sourceWindowId))setStripMenu(null);}}>
+              <Minimize2 size={13}/>Minimize
+            </button>
+            {!vacant && canSearchHistory && <button type="button" role="menuitem" data-split-strip-menu-item="search-history"
+              onClick={(event)=>{
+                event.stopPropagation();setStripMenu(null);
+                useUIStore.getState().setHistoryPanelOpen(tabId,true);
+                useUIStore.getState().setSideTerminalOpen(tabId,false);
+                requestHistorySearch(tabId);
+              }}
+              style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',cursor:'pointer'}}>
+              <Search size={13}/><span style={{flex:1,textAlign:'left'}}>Search</span><span style={{fontSize:10,color:'#999'}}>⌘F</span>
+            </button>}
+            <TabMenuChoices label="Move" icon={<FolderInput size={13}/>} action="move-window-to-workflow" side="left"
               choices={workflows.filter(workflow=>workflow.id!==activeSpaceId).map(workflow=>({id:workflow.id,name:workflow.name}))}
               onChoose={async target=>{
                 const moved=await useWorkspaceStore.getState().moveWorkspaceWindowToWorkflow(activeSpaceId,sourceWindowId,target);
@@ -917,7 +923,7 @@ export function SplitPaneAttachRow({
                 <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
                   <ArrowLeftRight size={13} style={{ color: '#9a9aa0' }} />
                 </span>
-                <span style={{ whiteSpace: 'nowrap' }}>Поменять местами</span>
+                <span style={{ whiteSpace: 'nowrap' }}>Swap</span>
               </span>
               <span aria-hidden style={{ color: '#777', paddingLeft: 8 }}>…</span>
             </button>

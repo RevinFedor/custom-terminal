@@ -1,0 +1,19 @@
+.history-message-source-jump {
+  color: #a3a3a3;
+  background: rgba(167, 139, 250, 0.1);
+}
+
+.history-message-source-jump:hover,
+.history-message-source-jump:focus-visible {
+  color: #ede9fe;
+  background: rgba(167, 139, 250, 0.28);
+}
+
+.history-message-source-jump:active {
+  background: rgba(167, 139, 250, 0.38);
+}
+
+.history-message-source-jump:focus-visible {
+  outline: 1px solid #c4b5fd;
+  outline-offset: 1px;
+}

@@ -260,6 +260,33 @@ canonical строку, без дубля/remount и с bottom-gap0.
 close после completed. Непринятие245 самим CLI остаётся недоказанным;
 подделывать durable запись ради исчезновения плашки нельзя.
 
+### Незавершённый фрагмент после native steering
+
+09.10 History4196 удерживала48символов после полного сохранённого ответа672.
+Diagnostic038c48a2 подтвердил одинаковый settled-текст в Main и renderer:
+старый item оставался `completed=false`, следующий exact item уже materialized.
+Это не renderer handoff и не ещё генерируемый ответ. Между partial и следующим
+request того же turn был принят межвкладочный вопрос; до capture07:13 старый
+`RESPONSE_END` в production.log отсутствовал. Лишь в07:33 старый observer закрыл
+этот request по `upstream-close:1012`. Сам ранний wire-кадр не сохранялся, поэтому
+конкретный `response.incomplete` этого инцидента — вывод, не прямой trace-proof.
+
+В native Codex `rust-v0.159.2` уточнение во время генерации может идти через
+`response.interrupt` с `mode=discard_partial_items`, затем сервер отвечает
+`response.incomplete` с `reason=interrupted` на том же соединении. CLI продолжает
+тот же turn, socket close не обязателен. Перехватчик раньше игнорировал этот
+конец сегмента; контролируемая последовательность повторила оставшийся partial.
+Теперь только exact server response-id разрешает прежнему failed-segment пути
+отозвать открытый partial. Completed unconfirmed items сохраняются; содержимое
+incomplete output не превращается в завершённое или canonical.
+
+Client intent, следующий request, canonical sibling и `task_complete` сами по
+себе такого права не дают. Поздний конец старого request также не снимает gap
+нового потока. `INTERRUPT_REQUEST`, `OPEN_REQUEST_ON_NEXT`, `BOUNDARY_IGNORED`
+и `RESPONSE_END` различают intent, отсутствие конца и exact terminal boundary
+без raw body. Проверки producer/controller/actual Main используют искусственные
+wire-events; это не replay инцидента и не proof физического принятия48 либо245.
+
 ### Долгий busy: ответы отдельно от полосы отправок
 
 Шрам14.09: desktop History iOS-вкладки показывала подряд уведомления и

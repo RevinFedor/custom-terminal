@@ -10,6 +10,7 @@ const { TaskCompletionIntentRegistry, loopTaskCompletionEligibility } = require(
 const { selectUniqueClaudePromptSubmitAudit } = require('./claude-prompt-audit');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { claudeProviderFailureFromHook } = require('../shared/claude-provider-failure.cjs');
+const { createAgentResponseObservationReader } = require('./agent-response-observation-reader');
 
 // Execute the real socket handler, not a second lifecycle reducer. Only external
 // boundaries are fixtures; no installed socket, PTY, transcript or provider is used.
@@ -20,6 +21,7 @@ const serverSource = parsed.statements.find(node => ts.isFunctionDeclaration(nod
 function fixture({ fresh = false } = {}) {
   const ipc = [], web = [], activity = [], preview = [], logs = [], semantic = [], accessOutcomes = [];
   const holds = new Map();
+  let responseReader;
   const context = vm.createContext({
     console: { log: (...args) => logs.push(args.join(' ')), warn: (...args) => logs.push(args.join(' ')), error() {} },
     Date, Map, Set, Number, String, JSON, clearTimeout, process: { pid: 999 },
@@ -38,6 +40,7 @@ function fixture({ fresh = false } = {}) {
     claudeLaunchGenerationByTab: new Map([['T', { generation: 'launch-1', pid: 28777 }]]),
     admitClaudeMainHook, resolveClaudeHookTab,
     taskCompletionIntents: new TaskCompletionIntentRegistry(), loopTaskCompletionEligibility,
+    getAgentResponseObservationReader: () => responseReader,
     taskCompletionOutcomeMeta: require('./task-completion-intent').taskCompletionOutcomeMeta,
     claudeHookLastEvent: new Map(), claudeTurnBusy: new Map(), claudeSpinnerBusy: new Map(),
     claudeSpinnerLastSeenAt: new Map(), claudeSpinnerIdleTimer: new Map(),
@@ -75,6 +78,18 @@ function fixture({ fresh = false } = {}) {
     shouldCreateHistoryResponseTiming: ({ event }) => event === 'Stop',
     startInterruptWatcher() {}, stopInterruptWatcher() {}, scheduleClaudeTurnWatchdog() {},
   });
+  responseReader = createAgentResponseObservationReader({
+    captureState: () => {
+      const turn = context.taskCompletionIntents.getTurn('T');
+      return { known: true, tabId: 'T', toolType: 'claude', sessionId: 'S', cwd: '/fixture',
+        busy: context.claudeTurnBusy.get('T') === true, revision: 'fixture-owner', turn,
+        executionContext: turn ? { provider: 'claude', sessionId: 'S', turnId: 'claude:' + turn.generation,
+          processId: turn.processId, generation: turn.generation, startedAt: turn.startedAt } : null };
+    },
+    readLifecycle: async () => ({ processStatus: 'found', processPid: 28777, processName: 'claude' }),
+    loadSessionTurns() { throw new Error('hook observation must not select a JSONL prompt'); },
+    readTurnResult() { throw new Error('prompt_id must not be used as a JSONL UUID'); },
+  });
   vm.runInContext(serverSource + '\nstartClaudeHookServer();', context);
   function hook(event, extra = {}) {
     const socket = new EventEmitter();
@@ -86,8 +101,115 @@ function fixture({ fresh = false } = {}) {
       prompt_id: 'P-current', prompt: 'new user request', ...extra }) + '\n');
     assert.equal(ack, 'ok\n', 'ignored events are acknowledged without forcing a resend');
   }
-  return { context, hook, ipc, web, activity, preview, semantic, logs, holds, accessOutcomes };
+  return { context, hook, ipc, web, activity, preview, semantic, logs, holds, accessOutcomes, responseReader };
 }
+
+test('actual admitted hook captures an exact current subject and privately delivers bounded final before lifecycle wake', async () => {
+  const h = fixture();
+  h.hook('UserPromptSubmit');
+  const before = await h.responseReader.getAgentResponseState('T');
+  const subject = before.currentSubject;
+  assert.equal(subject.kind, 'claude-hook');
+  assert.equal(subject.providerPromptId, 'P-current');
+  assert.equal(subject.promptUserUuid, undefined);
+  const delivered = [];
+  h.responseReader.onAgentResponseCompletion(value => {
+    assert.equal(h.web.some(event => event.type === 'done'), false);
+    delivered.push(value);
+  });
+  const final = 'START ' + 'x'.repeat(300000) + ' END';
+  h.hook('Stop', { last_assistant_message: final });
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].result.sourceVerified, true);
+  assert.equal(delivered[0].result.assistantChars, final.length);
+  assert.equal(delivered[0].result.truncated, true);
+  assert.ok(delivered[0].result.assistantText.length <= 250000);
+  assert.equal(JSON.stringify(h.web).includes('START'), false);
+  assert.equal(h.logs.some(line => line.includes('START')), false);
+  h.hook('UserPromptSubmit', { prompt_id: 'next' });
+  const read = await h.responseReader.readAgentObservedResponse({ tabId: 'T', expectedSessionId: 'S', subject, maxChars: 500 });
+  assert.equal(read.result.complete, true);
+  assert.equal(read.result.assistantChars, final.length);
+  assert.ok(read.result.assistantText.startsWith('START '));
+  assert.ok(read.result.assistantText.endsWith(' END'));
+  assert.ok(read.result.assistantText.length <= 500);
+  assert.notEqual((await h.responseReader.getAgentResponseState('T')).revision, before.revision);
+});
+
+test('actual hook observation rejects foreign/subagent/stale/duplicate final and preserves exact StopFailure', async () => {
+  const h = fixture();
+  h.hook('UserPromptSubmit');
+  const subject = (await h.responseReader.getAgentResponseState('T')).currentSubject;
+  for (const extra of [{ agent_id: 'child' }, { agent_transcript_path: '/fixture/child' },
+    { ppid: 999 }, { prompt_id: 'foreign' }, { session_id: 'foreign' }]) {
+    h.hook('Stop', { ...extra, last_assistant_message: 'foreign final' });
+  }
+  assert.equal(h.responseReader.stats().hookEntries, 0);
+  h.hook('StopFailure', { error: 'rate_limit', error_details: 'fixture refusal' });
+  h.hook('Stop', { last_assistant_message: 'late duplicate success' });
+  const read = await h.responseReader.readAgentObservedResponse({ tabId: 'T', expectedSessionId: 'S', subject });
+  assert.equal(read.result.complete, false);
+  assert.equal(read.result.sourceVerified, true);
+  assert.equal(read.result.terminalEvent, 'provider_error');
+  assert.equal(read.result.proofDefinitive, true);
+  assert.ok(read.result.errorCode);
+  assert.equal(h.responseReader.stats().hookEntries, 1);
+});
+
+test('legacy/missing Claude hook identity never invents a canonical prompt or final proof', async () => {
+  for (const extra of [{ prompt_id: undefined }, { ppid: undefined }]) {
+    const h = fixture();
+    h.hook('UserPromptSubmit', extra);
+    const state = await h.responseReader.getAgentResponseState('T');
+    assert.equal(state.currentSubject, undefined);
+    if ('prompt_id' in extra) {
+      assert.equal(state.executionContext.turnId, 'claude:1');
+      assert.equal(state.executionContext.generation, 1);
+      assert.equal(state.executionContext.processId, '28777');
+      assert.equal(state.executionContext.promptUserUuid, undefined);
+    } else assert.equal(state.executionContext, null);
+    h.hook('Stop', { ...extra, last_assistant_message: 'unbound' });
+    assert.equal(h.responseReader.stats().hookEntries, 0);
+  }
+  const h = fixture();
+  h.hook('UserPromptSubmit');
+  const subject = (await h.responseReader.getAgentResponseState('T')).currentSubject;
+  h.hook('Stop', { prompt_id: undefined, last_assistant_message: 'unproven' });
+  const read = await h.responseReader.readAgentObservedResponse({ tabId: 'T', expectedSessionId: 'S', subject });
+  assert.equal(read.pending, true);
+  assert.equal(read.code, 'response_hook_evidence_unavailable');
+});
+
+test('admitted exact Stop without final text retains a definitive missing-result error', async () => {
+  const h = fixture();
+  h.hook('UserPromptSubmit');
+  const subject = (await h.responseReader.getAgentResponseState('T')).currentSubject;
+  h.hook('Stop');
+  const read = await h.responseReader.readAgentObservedResponse({ tabId: 'T', expectedSessionId: 'S', subject });
+  assert.equal(read.result.found, true);
+  assert.equal(read.result.complete, false);
+  assert.equal(read.result.sourceVerified, true);
+  assert.equal(read.result.proofDefinitive, true);
+  assert.equal(read.code, 'no_final_result');
+});
+
+test('actual partial Claude Stop includes Main internal background count without claiming whole-work idle', async () => {
+  const h = fixture();
+  h.context.getCombinedTabBackgroundWorkCount = () => 2;
+  const delivered = [];
+  const dispose = h.responseReader.onAgentResponseCompletion(value => delivered.push(value));
+  h.hook('UserPromptSubmit');
+  const subject = (await h.responseReader.getAgentResponseState('T')).currentSubject;
+  h.hook('Stop', { last_assistant_message: 'partial physical turn final' });
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].backgroundWorkCount, 2);
+  assert.equal(delivered[0].result.complete, true, 'physical turn completion is distinct from descendants');
+  assert.equal((await h.responseReader.readAgentObservedResponse({ tabId: 'T', expectedSessionId: 'S', subject })).result.complete, true);
+  dispose();
+  h.hook('UserPromptSubmit', { prompt_id: 'next' });
+  h.hook('Stop', { prompt_id: 'next', last_assistant_message: 'next final' });
+  assert.equal(delivered.length, 1, 'completion subscription has an effective disposer');
+});
 
 test('actual hook counts only distinct owned terminal 403 outcomes, not foreign/subagent/duplicate events', () => {
   const { reduceClaudeAccessFailure } = require('./claude-access-failure-stop');

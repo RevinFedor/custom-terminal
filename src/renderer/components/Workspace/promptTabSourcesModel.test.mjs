@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { transformSync } from 'esbuild';
-import { isCurrentPickerGeneration } from '../../utils/promptInsertMenuModel.mjs';
 import { loadPickerPromptCatalog, promptCatalogChangeAffectsTarget, promptRootChoices, togglePromptRoot, tabPromptBindingRequest, validatePromptRootSnapshot } from './promptTabSourcesModel.mjs';
 
 test('migrated picker reads the captured opaque target, never its common execution namespace', async () => {
@@ -59,15 +58,16 @@ test('editor retains disabled/missing/removed bindings and sends ordered explici
   assert.throws(() => tabPromptBindingRequest({ version: 2, revision: 1 }, 'opaque', [], 'uuid'), /version/);
 });
 
-test('picker wiring uses captured targets and inline source controls while retaining existing insertion callbacks', () => {
+test('picker keeps captured insertion targets while source controls live in workflow settings', () => {
   const picker = fs.readFileSync(new URL('./PromptPickerOverlay.tsx', import.meta.url), 'utf8');
   assert.match(picker, /const pickerTabId = contextRequest\?\.tabId \|\| shortcutTarget\?\.tabId/);
   assert.match(picker, /loadPickerPromptCatalog\(ipcRenderer, \{ tabId: pickerTabId/);
-  assert.match(picker, /ipcRenderer\.invoke\('workflow:tab-roots', pickerTabId\)/);
-  assert.match(picker, /ipcRenderer\.invoke\('project-prompts:set-tab-sources', request\)/);
-  assert.match(picker, /ipcRenderer\.invoke\('app:select-directory'\)/);
-  assert.match(picker, /ipcRenderer\.invoke\('workflow:save-root'/);
-  assert.match(picker, /data-prompt-tab-sources-editor/);
+  const settings = fs.readFileSync(new URL('../UI/WorkflowSourcesSettings.tsx', import.meta.url), 'utf8');
+  assert.doesNotMatch(picker, /data-prompt-tab-sources-action/);
+  assert.match(settings, /workflow:tab-roots/);
+  assert.match(settings, /project-prompts:set-tab-sources/);
+  assert.match(settings, /app:select-directory/);
+  assert.match(settings, /workflow:save-root/);
   assert.match(picker, /handleSelectPrompt\(p, event\.metaKey\)/);
   assert.match(picker, /handleCopyPrompt\(event, p\)/);
   assert.match(picker, /subscribeSavedPromptLibraryChanges/);
@@ -75,29 +75,21 @@ test('picker wiring uses captured targets and inline source controls while retai
 });
 
 function actualSourceActions(invoke, extra = {}) {
-  const picker = fs.readFileSync(new URL('./PromptPickerOverlay.tsx', import.meta.url), 'utf8');
-  const start = picker.indexOf('  const openSourceEditor = useCallback');
-  const marker = '  }, [pickerTabId, sourceSnapshot]);';
-  const end = picker.indexOf(marker, start) + marker.length;
+  const source = fs.readFileSync(new URL('../UI/WorkflowSourcesSettings.tsx', import.meta.url), 'utf8');
+  const start = source.indexOf('  const current=()=>'),end = source.indexOf('  return <div',start);
   assert.ok(start > 0 && end > start);
-  const state = { open: false, busy: false, error: '', rootIds: ['old'], snapshot: null, revision: 0 };
-  const generation = { current: 1 };
-  const operation = { current: false };
-  const sourceSnapshot = { version: 1, revision: 8, roots: [], rootIds: ['old'], sources: [] };
-  const set = key => value => { state[key] = typeof value === 'function' ? value(state[key]) : value; };
-  const context = {
-    useCallback: callback => callback,
-    pickerTabId: 'captured-target', sourceSnapshot, sourceRootIds: ['old'],
-    activePickerGenerationRef: generation, sourceOperationRef: operation,
-    ipcRenderer: { invoke }, crypto: { randomUUID: () => 'generated-uuid' },
-    setSourcesOpen: set('open'), setSourceBusy: set('busy'), setSourceError: set('error'),
-    setSourceSnapshot: set('snapshot'), setSourceRootIds: set('rootIds'), setCatalogRevision: set('revision'),
-    isCurrentPickerGeneration, tabPromptBindingRequest, togglePromptRoot, validatePromptRootSnapshot,
-    ...extra,
-  };
-  const script = transformSync(picker.slice(start, end) + '\nglobalThis.actions = { openSourceEditor, saveTabSources, addPromptFolder };', { loader: 'ts' }).code;
-  vm.runInNewContext(script, context);
-  return { actions: context.actions, state, generation, operation };
+  const state = {open:true,busy:false,error:'',rootIds:['old'],snapshot:null,revision:0,pending:null};
+  const generation={current:0},operation={current:false},alive={current:true};
+  const snapshot=extra.sourceSnapshot || {version:1,revision:8,roots:[],rootIds:['old'],sources:[]};
+  const context={useCallback:callback=>callback,useEffect:()=>{},tabId:'captured-target',workflowId:'W',snapshot,ids:['old'],pending:null,
+    generation,lock:operation,alive,ipc:()=>({invoke}),crypto:{randomUUID:()=> 'generated-uuid'},
+    useWorkspaceStore:{getState:()=>({tabWorkflowMembership:{'captured-target':{workflowId:'W'}}})},
+    tabPromptBindingRequest,togglePromptRoot,validatePromptRootSnapshot};
+  const set=(key,variable=key)=>value=>{state[key]=typeof value==='function'?value(state[key]):value;context[variable]=state[key];};
+  Object.assign(context,{setBusy:set('busy'),setError:set('error'),setSnapshot:set('snapshot'),setIds:set('rootIds','ids'),setPending:set('pending')});
+  const script=transformSync(source.slice(start,end)+'\nglobalThis.actions={openSourceEditor:load,saveTabSources:save,addPromptFolder:add};',{loader:'ts'}).code;
+  vm.runInNewContext(script,context);
+  return {actions:context.actions,state,generation,operation,alive};
 }
 
 test('actual editor handlers snapshot the captured tab and ignore late results after a different picker opens', async () => {

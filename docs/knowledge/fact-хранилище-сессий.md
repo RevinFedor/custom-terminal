@@ -79,9 +79,13 @@ Session groups также пользовательские, а не внутре
 
 `Open now` означает сохранённые открытые вкладки, включая stopped agents,
 а также защищённые родительские файлы и subagents. Сумма не является размером
-только работающих процессов. Codex parent может быть защищён даже при
-self-contained child: provider delete родителя способен удалить открытого
-потомка. `Forks` показывает закрытые ветки; открытые уже входят в `Open now`.
+только работающих процессов. Текущий локальный pre-filter консервативно
+объединяет `parent_thread_id` и `forked_from_id`, поэтому может удерживать и
+источник самостоятельной копии. Это не доказательство физической зависимости.
+У Codex 0.147 каскад `thread/delete` идёт по spawn-графу субагентов; одно
+происхождение fork не делает копию частью этого каскада. Отдельный `history_base`
+или manifest действительно требует сохранения источника.
+`Forks` показывает закрытые ветки; открытые уже входят в `Open now`.
 
 Суммы имеют явные подписи `total / can delete / protected`; `Can delete only`
 убирает protected rows из списка, сохраняя общий размер категории. Это ответ
@@ -201,6 +205,22 @@ DB открыта read-only; отсутствие этой authority возвр�
 `storage_production_authority_unavailable` до scan/provider mutation. E2E
 runtime не получает destructive authority даже при доступной production DB.
 
+После перехода к workflow размер текущих разговоров считают по canonical
+bindings, включая reserve: `catalog-v1.executionRefs[*].savedSessions.codex`
+и живые `sessionId/savedSessionId`. `tab-catalog.nativeRow.codex_session_id`
+перекрывает serialized snapshot при restore, в том числе для V2. Старый SID
+в `record.records`/`record.codexSessionId` может быть прежним снимком той же
+вкладки; `archived:false` там описывает момент миграции, не свежесть сегодня.
+Это различие объясняет лишние гигабайты в union всех aliases, но не заменяет
+проверку физических зависимостей и живых операций перед удалением.
+
+`thread.historyMode="paginated"` обозначает формат хранения, а не наличие
+заимствованного префикса. Полная независимая ветка тоже может иметь этот mode.
+Защищать всю цепочку `forkedFromId` только по этому полю — значит удерживать
+уже ненужные копии. Обратное также неверно: отсутствие fork в лёгком diagnostics
+не доказывает независимость, если актуальный manifest ещё не восстановлен.
+Нужны canonical source segments и отдельная проверка native references ниже.
+
 ## Удаление и retention
 
 - Claude primary/recovery JSONL удаляется exact unlink после main preflight;
@@ -211,6 +231,15 @@ runtime не получает destructive authority даже при доступ
   `ancestorThreadId`, сопоставляет каждый ID с runtime и production/dev DB и
   отказывает, если root либо любой потомок защищён. Старый local rollout graph
   остаётся только presentation/pre-filter и не является delete authority.
+- Для `ancestorThreadId` не передавать `sourceKinds:[]`: в 0.147 отсутствие
+  фильтра с relation-query включает spawned descendants, а явный пустой список
+  возвращает default interactive sources и скрывает субагентов. Проверка на
+  одном живом parent дала 9 descendants без поля и 0 с пустым массивом.
+- Spawn-leaf ещё может быть источником чужого `history_base`. Provider отдельно
+  сканирует rollout references и отказывает `forked history still references it`
+  **до** удаления history rows/файлов. Такой отказ не обходить raw unlink.
+  Native dependency может продолжаться за непосредственным physical segment
+  Noted manifest; проверка одной UI-проекции не доказывает весь native resume.
 - Automatic retention удаляет только provider-доказанный leaf. Ручная операция
   сначала вызывает `storage:prepare-delete`: main получает exact closure,
   пересчитывает count/bytes и возвращает короткоживущий подписанный token.

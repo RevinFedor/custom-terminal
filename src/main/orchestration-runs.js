@@ -21,6 +21,12 @@ const {
   DEFAULT_CODEX_CAPACITY_RETRY_SETTINGS,
   normalizeCodexCapacityRetrySettings,
 } = require('./codex-capacity-retry-policy');
+const {
+  RESPONSE_OBSERVATION_KIND,
+  isResponseObservation,
+  normalizeResponseSubject,
+  assertResponseObservationAcyclic,
+} = require('./orchestration-response-observation');
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const ACTIVE_STATUSES = new Set([
@@ -90,7 +96,7 @@ function isPausedRun(run) {
 }
 
 function ownsTargetExecution(run) {
-  return TARGET_EXECUTION_STATUSES.has(run?.status);
+  return !isResponseObservation(run) && TARGET_EXECUTION_STATUSES.has(run?.status);
 }
 
 function normalizeExecutionContext(value) {
@@ -292,6 +298,16 @@ function resolveCausalSourceExecutionContext({ sourceTabId, sourceMeta, getExecu
 }
 
 function buildOrchestrationResultLookup(run) {
+  if (isResponseObservation(run)) {
+    const subject = run.observationSubject;
+    return subject ? {
+      promptUserUuid: subject.promptUserUuid || undefined,
+      promptSourceIdentity: subject.promptSourceIdentity || undefined,
+      requestedAt: subject.requestedAt || undefined,
+      resultBeforeAt: subject.resultBeforeAt || undefined,
+      ...(subject.targetExecutionContext ? { targetExecutionContext: subject.targetExecutionContext } : {}),
+    } : {};
+  }
   const continuationByPrompt = Boolean(run?.resultPromptHash);
   const continuationByTime = !continuationByPrompt && Number(run?.resultAfterAt) > 0;
   const lookup = {
@@ -494,7 +510,7 @@ function isCompleteOrchestrationResult(result) {
 }
 
 function shouldScheduleCreatedTargetAutoStop(run) {
-  return run?.status === 'completed'
+  return !isResponseObservation(run) && run?.status === 'completed'
     && run.resultComplete === true
     && run.targetCreatedByOrchestration === true
     && run.autoStopCreatedTargets !== false
@@ -696,7 +712,7 @@ function hasNewerTargetRun(runs, scheduledRun) {
   if (!scheduledRun?.runId || !scheduledRun?.targetTabId) return false;
   const completedAt = Number(scheduledRun.completedAt);
   return (Array.isArray(runs) ? runs : []).some((candidate) => {
-    if (!candidate || candidate.runId === scheduledRun.runId) return false;
+    if (!candidate || isResponseObservation(candidate) || candidate.runId === scheduledRun.runId) return false;
     if (candidate.targetTabId !== scheduledRun.targetTabId) return false;
     if (isActiveStatus(candidate.status)) return true;
     if (!Number.isFinite(completedAt)) return false;
@@ -799,6 +815,7 @@ class OrchestrationRunStore {
     this.filePath = filePath;
     this.onActivityChanged = onActivityChanged;
     this.activityReadError = null;
+    this.loadedFromDisk = false;
     this.runs = new Map();
     this.createdTargetTabIds = new Set();
     this.targetActivityByTab = new Map();
@@ -816,6 +833,7 @@ class OrchestrationRunStore {
       try {
         const raw = await fs.promises.readFile(this.filePath, 'utf8');
         const parsed = JSON.parse(raw);
+        this.loadedFromDisk = Array.isArray(parsed?.runs);
         this.settings = normalizeSettings(parsed?.settings);
         const storedRuns = Array.isArray(parsed?.runs) ? parsed.runs : [];
         for (const tabId of Array.isArray(parsed?.createdTargetTabIds) ? parsed.createdTargetTabIds : []) {
@@ -847,8 +865,8 @@ class OrchestrationRunStore {
             autoStopCreatedTargets: stored.autoStopCreatedTargets !== false,
             ...stored,
           };
-          run.targetCreatedByOrchestration = stored.targetCreatedByOrchestration === true
-            || this.createdTargetTabIds.has(stored.targetTabId);
+          run.targetCreatedByOrchestration = !isResponseObservation(stored)
+            && (stored.targetCreatedByOrchestration === true || this.createdTargetTabIds.has(stored.targetTabId));
           if (stored.targetCreatedByOrchestration !== run.targetCreatedByOrchestration) {
             migrationNeeded = true;
           }
@@ -890,7 +908,12 @@ class OrchestrationRunStore {
     await this.initialize();
     if (!input?.runId) throw new Error('runId required');
     if (this.runs.has(input.runId)) throw new Error('runId already exists');
-    const predecessor = isExternalResearchRun(input)
+    const observing = isResponseObservation(input);
+    if (observing) {
+      assertResponseObservationAcyclic([...this.runs.values()], input,
+        require('../shared/orchestration-activity.cjs').isOrchestrationCompletionBlocking);
+    }
+    const predecessor = isExternalResearchRun(input) || observing
       ? null
       : (this._deliveryPredecessorsForTarget(input.targetTabId).at(-1) || null);
     const explicitParentRunId = typeof input.parentRunId === 'string' ? input.parentRunId.trim() : '';
@@ -898,14 +921,14 @@ class OrchestrationRunStore {
     const parentRunId = explicitParentRunId
       || this._inferParentRunId(input.sourceTabId, sourceExecutionContext);
     if (parentRunId) this._validateParent(parentRunId, input);
-    if (input.targetCreated === true && input.targetTabId) {
+    if (!observing && input.targetCreated === true && input.targetTabId) {
       this.createdTargetTabIds.add(input.targetTabId);
     }
     const now = Date.now();
     const run = {
       ...input,
-      runKind: isExternalResearchRun(input) ? 'external-research' : 'agent',
-      targetCreatedByOrchestration: this.createdTargetTabIds.has(input.targetTabId),
+      runKind: observing ? RESPONSE_OBSERVATION_KIND : isExternalResearchRun(input) ? 'external-research' : 'agent',
+      targetCreatedByOrchestration: !observing && this.createdTargetTabIds.has(input.targetTabId),
       status: 'creating',
       createdAt: now,
       updatedAt: now,
@@ -921,7 +944,7 @@ class OrchestrationRunStore {
       reactToManualInterrupt: typeof input.reactToManualInterrupt === 'boolean'
         ? input.reactToManualInterrupt
         : this.settings.reactToManualInterrupt,
-      autoStopCreatedTargets: typeof input.autoStopCreatedTargets === 'boolean'
+      autoStopCreatedTargets: observing ? false : typeof input.autoStopCreatedTargets === 'boolean'
         ? input.autoStopCreatedTargets
         : this.settings.autoStopCreatedTargets,
       targetBusySeen: false,
@@ -947,6 +970,7 @@ class OrchestrationRunStore {
       sourceExecutionContext,
       targetExecutionContext: normalizeExecutionContext(input.targetExecutionContext),
       targetContinuationExecutionContext: null,
+      ...(observing ? { observationRevision: 0, status: 'running', targetCreated: false } : {}),
     };
     this.runs.set(run.runId, run);
     if (options.persistStrict === true) {
@@ -1017,6 +1041,101 @@ class OrchestrationRunStore {
     this._syncSourceFollowupState(run);
     this._schedulePersist();
     return publicRun(run);
+  }
+
+  async bindResponseObservationSubject(runId, value) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!isResponseObservation(run) || isTerminalStatus(run.status)) return null;
+    const subject = normalizeResponseSubject(value);
+    if (run.observationSubject) {
+      if (!isDeepStrictEqual(run.observationInitialSubject, subject)) {
+        throw Object.assign(new Error('An existing observation cannot select another response'), {
+          code: 'response_observation_subject_conflict',
+        });
+      }
+      return publicRun(run);
+    }
+    const before = { ...run };
+    Object.assign(run, {
+      observationSubject: subject,
+      observationInitialSubject: subject,
+      observationRevision: Number(run.observationRevision || 0) + 1,
+      sessionId: subject.sessionId,
+      targetToolType: subject.toolType,
+      targetExecutionContext: subject.targetExecutionContext,
+      status: 'running', startedAt: Date.now(), updatedAt: Date.now(),
+    });
+    try { await this.persistStrict(); }
+    catch (error) {
+      if (this.runs.get(runId) === run && run.status === 'running' && run.observationSubject === subject) {
+        this.runs.set(runId, before);
+        this._notifyActivityChanged();
+      }
+      throw error;
+    }
+    return publicRun(run);
+  }
+
+  responseObservationsForTarget(tabId) {
+    return [...this.runs.values()].filter(run => isResponseObservation(run)
+      && run.targetTabId === tabId && !isTerminalStatus(run.status)).map(publicRun);
+  }
+
+  async setResponseObservationWait(runId, { expectedRevision, status, waitingOnRunIds, observationWaitReason, error }) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!isResponseObservation(run) || isTerminalStatus(run.status) || run.observationRevision !== expectedRevision) return null;
+    Object.assign(run, { status, waitingOnRunIds, observationWaitReason, error,
+      outcome: status === 'waiting_recovery' ? 'unknown' : null,
+      recoveryDeadlineAt: null, updatedAt: Date.now() });
+    this._schedulePersist();
+    return publicRun(run);
+  }
+
+  recordResponseObservationContext(runId, value) {
+    const run = this.runs.get(runId), context = normalizeExecutionContext(value);
+    if (!isResponseObservation(run) || isTerminalStatus(run.status) || run.observationSubject || !context
+      || context.provider !== run.observationTarget?.toolType || context.sessionId !== run.observationTarget?.sessionId
+      || (run.waitForDescendants === false && run.observationLiveContext)
+      || isDeepStrictEqual(run.observationLiveContext, context)) return false;
+    run.observationLiveContext = context;
+    run.observationRevision = Number(run.observationRevision || 0) + 1;
+    this._schedulePersist();
+    return true;
+  }
+
+  async settleResponseObservation(runId, { expectedRevision, result, error, code, evidenceCommitted } = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!isResponseObservation(run) || isTerminalStatus(run.status)
+      || run.observationRevision !== expectedRevision) {
+      return { resolved: false, run: publicRun(run), changed: [], settled: [] };
+    }
+    if (evidenceCommitted !== true || (!error && (result?.sourceVerified !== true || result?.found !== true || result?.complete !== true))) {
+      return { resolved: false, run: publicRun(run), changed: [], settled: [],
+        reason: 'response-result-unproven' };
+    }
+    const changed = [], settled = [], now = Date.now();
+    Object.assign(run, {
+      status: error ? 'failed' : 'completed',
+      outcome: error ? 'failed' : 'success',
+      error: error || null, resultErrorCode: code || null,
+      resultComplete: !error, resultAvailable: !error && !!result?.assistantText,
+      resultTurnIndex: result?.turnIndex ?? null,
+      resultUserUuid: result?.userUuid || null,
+      resultSourceIdentity: result?.sourceIdentity || null,
+      resultProofStatus: error ? 'failed' : 'complete',
+      ownCompletedAt: now, completedAt: now, updatedAt: now,
+      waitingOnRunIds: [], recoveryDeadlineAt: null,
+    });
+    this._pushChanged(changed, run);
+    settled.push(publicRun(run));
+    this._refreshAncestors(run.parentRunId, changed, settled, now);
+    // The immutable SQLite result/error is committed before this projection.
+    // Startup can recover completion even if the JSON metadata write is lost.
+    this._schedulePersist();
+    return { resolved: true, run: publicRun(run), changed, settled };
   }
 
   async adoptRestoredTarget(runId, {descriptor,restoration}, {prepareContext} = {}) {
@@ -1808,7 +1927,8 @@ class OrchestrationRunStore {
     this._pushChanged(changed, run);
     const settled = [];
     this._refreshAncestors(run.parentRunId, changed, settled, Date.now());
-    this._schedulePersist();
+    if (isResponseObservation(run) && status === 'suppressed') await this.persistStrict();
+    else this._schedulePersist();
     return { run: publicRun(run), changed, settled };
   }
 
@@ -2780,6 +2900,9 @@ class OrchestrationRunStore {
     await this.initialize();
     const run = this.runs.get(runId);
     if (!run || (isTerminalStatus(run.status) && !isResultProofPending(run))) {
+      if (isResponseObservation(run) && (run.status === 'cancelled' || run.notificationSuppressed === true)) {
+        await this.persistStrict();
+      }
       return { run: publicRun(run), changed: [], settled: [] };
     }
     const now = Date.now();
@@ -2801,7 +2924,8 @@ class OrchestrationRunStore {
     this._pushChanged(changed, run);
     settled.push(publicRun(run));
     this._refreshAncestors(run.parentRunId, changed, settled, now);
-    this._schedulePersist();
+    if (isResponseObservation(run)) await this.persistStrict();
+    else this._schedulePersist();
     return { run: publicRun(run), changed, settled };
   }
 
@@ -2900,7 +3024,8 @@ class OrchestrationRunStore {
     run.updatedAt = now;
     this._pushChanged(changed, run);
     this._refreshAncestors(run.parentRunId, changed, settled, now);
-    this._schedulePersist();
+    if (isResponseObservation(run) && run.notificationSuppressed === true) await this.persistStrict();
+    else this._schedulePersist();
     return { run: publicRun(run), changed, settled, dismissed: true };
   }
 
@@ -2962,7 +3087,7 @@ class OrchestrationRunStore {
 
   _activeForTarget(tabId) {
     return Array.from(this.runs.values())
-      .filter((run) => run.targetTabId === tabId && isActiveStatus(run.status))
+      .filter((run) => !isResponseObservation(run) && run.targetTabId === tabId && isActiveStatus(run.status))
       .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   }
 
@@ -2975,6 +3100,7 @@ class OrchestrationRunStore {
   _deliveryPredecessorsForTarget(tabId) {
     return Array.from(this.runs.values())
       .filter((run) => run.targetTabId === tabId
+        && !isResponseObservation(run)
         && (ownsTargetExecution(run) || isResultProofPending(run)))
       .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   }
@@ -3104,7 +3230,7 @@ class OrchestrationRunStore {
   _inferParentRunId(sourceTabId, sourceExecutionContext) {
     if (!sourceTabId || !sourceExecutionContext) return null;
     const matches = Array.from(this.runs.values()).filter((run) => (
-      run.targetTabId === sourceTabId
+      !isResponseObservation(run) && run.targetTabId === sourceTabId
       && !isTerminalStatus(run.status)
       && !isPausedRun(run)
       && run.resumeAwaitingNewTurn !== true
@@ -3116,6 +3242,7 @@ class OrchestrationRunStore {
 
   _adoptExactOrphanChildren(parent, changed, now = Date.now()) {
     if (!parent
+      || isResponseObservation(parent)
       || isTerminalStatus(parent.status)
       || isPausedRun(parent)
       || parent.resumeAwaitingNewTurn === true
@@ -3139,6 +3266,7 @@ class OrchestrationRunStore {
   _validateParent(parentRunId, input) {
     const parent = this.runs.get(parentRunId);
     if (!parent) throw new Error('parent run not found');
+    if (isResponseObservation(parent)) throw new Error('an observation cannot own target execution children');
     if (parent.runId === input.runId) throw new Error('run cannot parent itself');
     if (isTerminalStatus(parent.status)) throw new Error('parent run is already settled');
     if (isPausedRun(parent) || parent.resumeAwaitingNewTurn === true) {
@@ -3345,4 +3473,6 @@ module.exports = {
   classifyAgentSendReceipt,
   orchestrationSendFailureRecoveryPolicy,
   resolveCausalSourceExecutionContext,
+  lifecycleExecutionContext,
+  executionContextsMatch,
 };

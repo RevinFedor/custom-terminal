@@ -79,6 +79,9 @@ function decorateVirtualEntries(entries, viewOwnerSessionId, segmentBySession) {
       transcriptSegmentId: entryRef.segmentId,
       rawUuid: entryRef.rawUuid,
       entryRef,
+      ...(entry.responsePreview ? { responsePreview: { ...entry.responsePreview,
+        entryRef: virtualEntryRef(viewOwnerSessionId, entry.responsePreview, segmentBySession),
+      } } : {}),
     };
   });
 }

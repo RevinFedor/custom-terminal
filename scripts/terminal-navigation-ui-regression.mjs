@@ -6,6 +6,7 @@ import {fileURLToPath} from 'node:url';import {execFileSync} from 'node:child_pr
 import {once} from 'node:events';import assert from 'node:assert/strict';import {createHash} from 'node:crypto';
 import {build as bundle} from 'esbuild';import {_electron as electron} from 'playwright';import ts from 'typescript';
 const noted=fileURLToPath(new URL('..',import.meta.url)),sc='/Users/fedor/Desktop/sc-desktop';
+const trackerOnly=process.argv.includes('--tracker-only');
 const artifact=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'noted-terminal-navigation-ui-')));
 const report={artifact,checks:[],errors:[],console:[],source:{},pass:false,boundary:'Actual Noted Timeline/header/message rows, SC navigation binding/store/detail; private synthetic IO, actual HTTP/controller. No provider/production/OS input. Not whole app initialization.'};
 let app;
@@ -16,7 +17,7 @@ function main(config){
   const {app,BrowserWindow,ipcMain,session}=require('electron'),http=require('node:http'),vm=require('node:vm');
   const {createResearchNavigation}=require(config.scController),{ScExternalResearchClient}=require(config.notedClient);
   app.setPath('userData',config.profile);app.setActivationPolicy?.('accessory');
-  const state=global.navState={calls:[],unknown:[],forbidden:[],focus:[],holdDetails:true,reads:[],acks:[]};
+  const state=global.navState={calls:[],unknown:[],forbidden:[],focus:[],holdDetails:true,reads:[],acks:[],navigationResults:[]};
   const jobId='noted_exact-job';
   const jobs=[{jobId,kind:'research',provider:'chatgpt',modelId:'6-astra',mode:'Chat',status:'done',stage:'done',updatedAt:10,
     fullPrompt:'Review the exact source.',responseText:'EXACT SAVED REVIEW\n\n'+'Reviewed source. '.repeat(80),
@@ -48,7 +49,10 @@ function main(config){
   });
   ipcMain.handle('fixture:invoke',async(_event,{channel,args})=>{
     state.calls.push('noted:'+channel);
-    if(channel==='orchestration:open-research-job')return global.openRun(args[0].runId);
+    if(channel==='orchestration:open-research-job'){
+      const result=await global.openRun(args[0].runId);
+      state.navigationResults.push({runId:args[0].runId,...result});return result;
+    }
     if(/^(agent:(send|stop)|codex:(send|run)|terminal:(create|kill|restart|input|paste))/.test(channel)){
       state.forbidden.push(channel);throw Error('Forbidden private transport '+channel);
     }
@@ -81,11 +85,9 @@ function main(config){
       const done=error=>{clearTimeout(timer);win.webContents.removeListener('paint',paint);error?reject(error):resolve(true)};
       const paint=(_e,_dirty,image)=>{
         const png=image.toPNG();
-        if(kind==='sc'){
-          const hash=require('crypto').createHash('sha256').update(png).digest('hex');
-          stable=hash===lastHash?stable+1:0;lastHash=hash;attempts++;
-          if(stable<2){if(attempts>=8)return done(Error('Native detail paints did not stabilize'));win.webContents.invalidate();return}
-        }
+        const hash=require('crypto').createHash('sha256').update(png).digest('hex');
+        stable=hash===lastHash?stable+1:0;lastHash=hash;attempts++;
+        if(stable<2){if(attempts>=8)return done(Error('Native paints did not stabilize: '+kind));win.webContents.invalidate();return}
         require('fs').writeFileSync(file,png);done();
       };
       timer=setTimeout(()=>done(Error('Native paint deadline')),3000);win.webContents.on('paint',paint);win.webContents.invalidate();
@@ -101,6 +103,11 @@ try{
     [sc,scSnap,['src','electron/research-navigation.js','scripts/fixtures/research-navigation-ui.jsx','vite.config.js']]]){
     for(const file of files)await fs.cp(path.join(repo,file),path.join(snapshot,file),{recursive:true,filter:p=>!p.includes('/node_modules')&&!p.includes('/.git')});
     await fs.symlink(path.join(repo,'node_modules'),path.join(snapshot,'node_modules'));
+  }
+  for(const file of ['src/renderer/components/Workspace/Timeline.tsx','src/renderer/components/Workspace/TabMessageSourceChip.tsx',
+    'src/renderer/components/Workspace/TabMessageSourceChip.css','src/renderer/components/Workspace/OrchestrationStatusChip.tsx',
+    'scripts/fixtures/terminal-navigation-ui.tsx']){
+    report.source[file]=createHash('sha256').update(await fs.readFile(path.join(notedSnap,file))).digest('hex');
   }
   const shared=path.join(artifact,'noted-shared/packages');
   for(const name of ['structured-dnd','file-explorer'])await fs.cp(path.join(noted,'../noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')});
@@ -132,30 +139,126 @@ try{
   if(!notedPage){notedPage=await app.waitForEvent('window');notedPage.setDefaultTimeout(10000)}
   await notedPage.waitForFunction(()=>window.navigationFixture?.ready);
   await notedPage.locator('[data-timeline-entry-uuid="entry-2"]').waitFor();
-  const capture=(kind,label)=>app.evaluate((_e,{kind,file})=>global.captureNav(kind,file),{kind,file:path.join(artifact,label+'.png')});
+  const capture=async(kind,label)=>{
+    await (kind==='noted'?notedPage:scPage).evaluate(()=>new Promise((resolve,reject)=>{
+      let first,second;const timer=setTimeout(()=>{cancelAnimationFrame(first);cancelAnimationFrame(second);reject(Error('Frame deadline'))},2000);
+      first=requestAnimationFrame(()=>{second=requestAnimationFrame(()=>{clearTimeout(timer);resolve(true)})});
+    }));
+    return app.evaluate((_e,{kind,file})=>global.captureNav(kind,file),{kind,file:path.join(artifact,label+'.png')});
+  };
   const colors=['rgb(161, 161, 170)','rgb(96, 165, 250)','rgb(74, 222, 128)','rgb(251, 191, 36)','rgb(248, 113, 113)'];
-  for(const width of [350,500,1100]){
+  for(const width of (trackerOnly?[]:[350,500,1100])){
     await app.evaluate((_e,width)=>global.navWindows.noted.setSize(width,900),width);
     await notedPage.waitForFunction(width=>innerWidth===width,width);
+    for(const phase of ['question','reply']){
+      const source=notedPage.locator('[data-source-hover-case="'+phase+'"]');
+      const arrow=source.locator('[data-tab-message-source-jump]'),name=source.locator('[data-tab-message-source]');
+      const presentation=()=>source.evaluate(e=>{
+        const arrow=e.querySelector('[data-tab-message-source-jump]'),name=e.querySelector('[data-tab-message-source]');
+        const css=getComputedStyle(arrow);
+        return{background:css.backgroundColor,color:css.color,outline:css.outlineStyle,
+          focused:document.activeElement===arrow,nameBackground:getComputedStyle(name).backgroundColor,
+          trustedPress:arrow.dataset.fixtureTrustedPress==='1',
+          rects:[e,arrow,name].map(n=>n.getBoundingClientRect().toJSON())};
+      });
+      await notedPage.mouse.move(100,880);
+      const rest=await presentation();
+      check(width+' '+phase+' arrow has its own resting background',rest.background==='rgba(167, 139, 250, 0.1)'
+        &&rest.rects[1].width===24&&rest.rects[1].height===24,rest);
+      await capture('noted','source-rest-'+phase+'-'+width);
+      await arrow.hover();
+      const hovered=await presentation();
+      check(width+' '+phase+' arrow hover visibly changes only its surface',hovered.background==='rgba(167, 139, 250, 0.28)'
+        &&hovered.color!==rest.color&&hovered.nameBackground===rest.nameBackground
+        &&JSON.stringify(hovered.rects)===JSON.stringify(rest.rects),{rest,hovered});
+      await capture('noted','source-hover-'+phase+'-'+width);
+      await arrow.evaluate(e=>e.addEventListener('mousedown',event=>{
+        e.dataset.fixtureTrustedPress=event.isTrusted&&event.buttons===1?'1':'0';
+      },{once:true}));
+      await notedPage.mouse.down();
+      const pressed=await presentation();
+      check(width+' '+phase+' pressed arrow remains in its fixed slot',pressed.trustedPress&&pressed.background==='rgba(167, 139, 250, 0.38)'
+        &&JSON.stringify(pressed.rects)===JSON.stringify(rest.rects),pressed);
+      await notedPage.mouse.move(100,880);await notedPage.mouse.up();
+      await name.focus();await notedPage.keyboard.press('Shift+Tab');
+      const focused=await presentation();
+      check(width+' '+phase+' keyboard focus has its own non-shifting highlight',focused.focused&&focused.outline==='solid'
+        &&focused.background==='rgba(167, 139, 250, 0.28)'&&JSON.stringify(focused.rects)===JSON.stringify(rest.rects),focused);
+      await notedPage.keyboard.press('Tab');
+      check(width+' '+phase+' leaving the arrow restores its background',(await presentation()).background===rest.background);
+      await name.evaluate(e=>e.blur());
+    }
     const header=notedPage.locator('[data-timeline-entry-uuid="entry-2"]');
     const rail=header.locator('xpath=ancestor::*[@data-timeline-root]').first();
     const widthBefore=await header.evaluate(e=>e.getBoundingClientRect().width);
     check(width+' collapsed group hides children',await notedPage.locator('[data-timeline-entry-uuid="entry-3"]').count()===0);
-    for(const count of [9,10,100,1000,10000]){
-      const geometry=await notedPage.locator('[data-timeline-group-count]').first().evaluate((e,count)=>{
-        e.textContent=String(count);const r=e.getBoundingClientRect(),p=e.parentElement.getBoundingClientRect();
-        return{left:r.left,right:r.right,parentLeft:p.left,parentRight:p.right,scrollWidth:e.scrollWidth,width:r.width};
-      },count);
-      check(width+' count typography boundary '+count,geometry.left>=geometry.parentLeft&&geometry.right<=geometry.parentRight&&geometry.scrollWidth<=geometry.width+1,geometry);
+    for(const count of [2,9,10,100,1000,10000]){
+      await notedPage.evaluate(count=>window.navigationFixture.setGroupSize(count),count);
+      await notedPage.waitForFunction(count=>document.querySelector('[data-timeline-group-count]')?.textContent===String(count),count);
+      const geometry=await notedPage.locator('[data-timeline-group-count]').first().evaluate(e=>{
+        const r=e.getBoundingClientRect(),p=e.parentElement.getBoundingClientRect(),a=e.parentElement.querySelector('svg').getBoundingClientRect();
+        return{left:r.left,right:r.right,parentLeft:p.left,parentRight:p.right,scrollWidth:e.scrollWidth,width:r.width,
+          arrowRight:a.right,arrowCenter:a.top+a.height/2,countCenter:r.top+r.height/2};
+      });
+      check(width+' count and arrow share one line inside the rail '+count,geometry.left>=geometry.parentLeft&&geometry.right<=geometry.parentRight
+        &&geometry.scrollWidth<=geometry.width+1&&geometry.arrowRight<=geometry.left&&Math.abs(geometry.arrowCenter-geometry.countCenter)<1,geometry);
+      check(width+' group header has no child badges '+count,await notedPage.locator('[data-timeline-group-header] [data-timeline-badge-flow]').count()===0
+        &&await notedPage.locator('[data-timeline-group-header] svg').count()===1);
+      if(count===2){
+        await capture('noted','group-two-'+width);
+        await notedPage.screenshot({path:path.join(artifact,'group-two-'+width+'-cdp.png')});
+        check(width+' exact two-entry header survives native capture',await notedPage.locator('[data-timeline-group-count]').first().textContent()==='2');
+      }
     }
-    await notedPage.locator('[data-timeline-group-count]').first().evaluate(e=>{e.textContent='10'});
+    await notedPage.evaluate(()=>window.navigationFixture.setGroupSize(10));
+    await notedPage.waitForFunction(()=>document.querySelector('[data-timeline-group-count]')?.textContent==='10');
     await header.click();await notedPage.locator('[data-timeline-entry-uuid="entry-11"]').waitFor();
     const rows=await notedPage.locator('[data-timeline-entry-uuid^="entry-"]').evaluateAll(nodes=>nodes.filter(n=>/entry-(?:[2-9]|10|11)$/.test(n.getAttribute('data-timeline-entry-uuid'))).map(n=>({id:n.getAttribute('data-timeline-entry-uuid'),...n.getBoundingClientRect().toJSON()})));
     check(width+' group unrolls down with unchanged rail width',rows.length===10&&rows.every(r=>Math.abs(r.width-widthBefore)<1)&&rows.slice(1).every((r,i)=>r.top>rows[i].top),rows);
     check(width+' group click does not set wide mode',await notedPage.evaluate(()=>window.navigationFixture.tree())===false);
     check(width+' group header is separate from its first real iteration',await notedPage.locator('[data-timeline-group-toggle][aria-expanded="true"]').count()===1
       &&await notedPage.locator('[data-timeline-entry-uuid="entry-2"]').count()===1);
-    check(width+' SC leaf is a loaded app icon rather than a diamond',await notedPage.locator('[data-timeline-entry-uuid="entry-3"] [data-timeline-sc-desktop]').evaluate(e=>e.complete&&e.naturalWidth===32&&e.getBoundingClientRect().width===14));
+    const guides=await notedPage.locator('[data-timeline-group-guide]').evaluateAll(nodes=>nodes.map(e=>({...e.getBoundingClientRect().toJSON(),pointerEvents:getComputedStyle(e).pointerEvents})));
+    check(width+' child guide is continuous including the note strip',guides.length===11&&guides.every(g=>g.width===1&&g.height>0&&g.pointerEvents==='none')
+      &&guides.slice(1).every((g,i)=>Math.abs(g.top-guides[i].bottom)<1&&g.left===guides[i].left),guides);
+    const centers=await notedPage.locator('[data-timeline-group-child]').evaluateAll(nodes=>nodes.map(e=>{
+      const marker=e.querySelector('[data-timeline-sc-desktop]')||e.querySelector(':scope > .shrink-0'),r=marker.getBoundingClientRect();
+      return r.left+r.width/2;
+    }));
+    const ordinaryCenter=await notedPage.locator('[data-timeline-entry-uuid="entry-1"] > .shrink-0').evaluate(e=>{const r=e.getBoundingClientRect();return r.left+r.width/2});
+    check(width+' MCP and SC children share the same left-of-axis column',centers.length===10&&centers.every(x=>Math.abs(x-ordinaryCenter+2)<1),{centers,ordinaryCenter});
+    const openRow=await notedPage.locator('[data-timeline-group-toggle]').evaluate(e=>{
+      const a=e.querySelector('svg').getBoundingClientRect(),c=e.querySelector('[data-timeline-group-count]').getBoundingClientRect();
+      return{arrow:a.toJSON(),count:c.toJSON()};
+    });
+    check(width+' expanded disclosure remains one row',Math.abs(openRow.arrow.top+openRow.arrow.height/2-openRow.count.top-openRow.count.height/2)<1,openRow);
+    check(width+' SC leaf is a loaded app icon rather than a diamond',await notedPage.locator('[data-timeline-entry-uuid="entry-3"] [data-timeline-sc-desktop]').evaluate(e=>e.complete&&e.naturalWidth===32));
+    const scGlyph=notedPage.locator('[data-timeline-entry-uuid="entry-3"] [data-timeline-sc-desktop]');
+    const mcpGlyph=notedPage.locator('[data-timeline-entry-uuid="entry-4"] > .shrink-0');
+    const sameSize=async()=>{
+      const s=await scGlyph.boundingBox(),d=await mcpGlyph.boundingBox();
+      return{same:Math.abs(s.width-d.width)<0.03&&Math.abs(s.height-d.height)<0.03,sc:s,diamond:d};
+    };
+    const resting=await sameSize();check(width+' resting SC glyph matches the rotated diamond size',resting.same,resting);
+    const rowBefore=await scGlyph.locator('xpath=..').evaluate(e=>({slot:e.getBoundingClientRect().toJSON(),row:e.parentElement.getBoundingClientRect().toJSON()}));
+    await notedPage.locator('[data-timeline-entry-uuid="entry-3"]').hover();
+    await notedPage.waitForFunction(()=>Math.abs(document.querySelector('[data-timeline-sc-desktop]').getBoundingClientRect().width-10*Math.SQRT2)<0.03);
+    const hoveredSc=await scGlyph.boundingBox();
+    await capture('noted','sc-hover-'+width);
+    await notedPage.locator('[data-timeline-entry-uuid="entry-4"]').hover();
+    await notedPage.waitForFunction(()=>{
+      const e=document.querySelector('[data-timeline-entry-uuid="entry-4"] > .shrink-0');
+      return e&&Math.abs(e.getBoundingClientRect().width-10*Math.SQRT2)<0.03;
+    });
+    const hoveredDiamond=await mcpGlyph.boundingBox();
+    check(width+' SC hover glyph matches diamond hover size',Math.abs(hoveredSc.width-hoveredDiamond.width)<0.03&&Math.abs(hoveredSc.height-hoveredDiamond.height)<0.03,{sc:hoveredSc,diamond:hoveredDiamond});
+    const rowAfter=await scGlyph.locator('xpath=..').evaluate(e=>({slot:e.getBoundingClientRect().toJSON(),row:e.parentElement.getBoundingClientRect().toJSON()}));
+    check(width+' SC glyph resizing keeps its slot and row stable',JSON.stringify(rowBefore)===JSON.stringify(rowAfter),{before:rowBefore,after:rowAfter});
+    await notedPage.mouse.move(100,10);
+    await notedPage.waitForFunction(()=>{
+      const s=document.querySelector('[data-timeline-sc-desktop]'),d=document.querySelector('[data-timeline-entry-uuid="entry-4"] > .shrink-0');
+      return s&&d&&Math.abs(s.getBoundingClientRect().width-d.getBoundingClientRect().width)<0.25;
+    });
     check(width+' normal MCP leaf retains its own type',await notedPage.locator('[data-timeline-entry-uuid="entry-4"]').getAttribute('data-timeline-marker-kind')==='terminal-mcp');
     const iconBox=await notedPage.locator('[data-timeline-sc-desktop]').first().boundingBox();
     const extras=await notedPage.locator('[data-timeline-entry-uuid="entry-3"] [data-timeline-badge-flow] svg').evaluateAll(nodes=>nodes.map(e=>e.getBoundingClientRect().toJSON()));
@@ -164,6 +267,7 @@ try{
     await notedPage.locator('[data-timeline-group-collapse]').click();
     await notedPage.waitForFunction(()=>!document.querySelector('[data-timeline-entry-uuid="entry-3"]'));
     check(width+' collapse preserves narrow mode',await notedPage.evaluate(()=>window.navigationFixture.tree())===false);
+    check(width+' collapse removes only the child guide',await notedPage.locator('[data-timeline-group-guide]').count()===0);
     for(let i=0;i<5;i++)check(width+' delivery palette '+i,await notedPage.locator('[data-tab-message-row="message-'+i+'"] [data-tab-message-stage="send"]').evaluate(e=>getComputedStyle(e).color)===colors[i]);
     await capture('noted','palette-'+width);
   }
@@ -187,7 +291,65 @@ try{
   await scPage.screenshot({path:path.join(artifact,'research-job-cdp.png')});
   check('full prompt and answer survive the native capture',(await scPage.locator('body').innerText()).includes('EXACT SAVED REVIEW')
     && (await scPage.locator('body').innerText()).includes('Review the exact source.'));
+  await notedPage.evaluate(()=>window.navigationFixture.showTracker());
+  // Freeze only the existing spinner for deterministic still captures.
+  await notedPage.addStyleTag({content:'[data-orchestration-status] .noted-infinite-animation { animation-play-state: paused !important; }'});
+  for(const width of [350,500,1100]){
+    await app.evaluate((_e,width)=>global.navWindows.noted.setSize(width,900),width);
+    await notedPage.waitForFunction(width=>innerWidth===width,width);
+    const chip=notedPage.locator('button[data-orchestration-external-target]');
+    await chip.waitFor({state:'visible'});
+    const box=await chip.boundingBox();
+    check(width+' running SC tracker is a bounded navigation button',box.width>0&&box.x>=0&&box.x+box.width<=width
+      &&(await chip.getAttribute('aria-label')).includes('SC Desktop'),box);
+    const beforeAck=await app.evaluate(()=>global.navState.navigationResults.length);
+    const beforeOpen=await notedPage.evaluate(()=>window.navigationFixture.calls.filter(c=>c==='orchestration:open-research-job').length);
+    await chip.click();
+    await notedPage.waitForFunction(n=>window.navigationFixture.calls.filter(c=>c==='orchestration:open-research-job').length===n+1
+      &&document.querySelector('[data-orchestration-external-target]')?.getAttribute('aria-busy')==='false',beforeOpen);
+    const afterOpen=await app.evaluate(()=>global.navState);report.state=afterOpen;
+    check(width+' tracker click opens and commits the same saved SC task',afterOpen.navigationResults.length===beforeAck+1
+      &&afterOpen.navigationResults.at(-1).jobId==='noted_exact-job'&&afterOpen.navigationResults.at(-1).success===true,
+      {acks:afterOpen.acks,navigationResults:afterOpen.navigationResults});
+    await capture('noted','sc-tracker-'+width);
+    await notedPage.locator('[data-orchestration-history-button]').click();
+    const disclosure=notedPage.locator('[data-orchestration-run-id="exact-run"] button[aria-expanded]');
+    if(await disclosure.getAttribute('aria-expanded')!=='true')await disclosure.click();
+    const detail=notedPage.locator('[data-orchestration-run-details="exact-run"]');
+    const detailAck=await app.evaluate(()=>global.navState.navigationResults.length);
+    const receiptBefore=await notedPage.evaluate(()=>window.navigationFixture.calls.filter(c=>c==='orchestration:acknowledge').length);
+    await detail.getByRole('button',{name:'Открыть задачу в SC Desktop',exact:true}).click();
+    await notedPage.waitForFunction(n=>window.navigationFixture.calls.filter(c=>c==='orchestration:acknowledge').length===n+1,receiptBefore);
+    await detail.waitFor({state:'hidden'});
+    const detailState=await app.evaluate(()=>global.navState);report.state=detailState;
+    check(width+' request history detail also opens the exact SC task',detailState.navigationResults.length===detailAck+1
+      &&detailState.navigationResults.at(-1).jobId==='noted_exact-job'&&detailState.navigationResults.at(-1).success===true,
+      detailState.navigationResults);
+  }
+  for(const width of [350,500,1100]){
+    await app.evaluate((_e,width)=>global.navWindows.noted.setSize(width,900),width);
+    await notedPage.waitForFunction(width=>innerWidth===width,width);
+    await notedPage.evaluate(()=>window.navigationFixture.showObserver());
+    const row=notedPage.locator('[data-orchestration-active-run="observed-run"]');
+    await row.waitFor({state:'visible'});
+    const bounds=await row.boundingBox();
+    check(width+' passive wait has a static indicator within the request strip',bounds.x>=0&&bounds.x+bounds.width<=width
+      &&await row.locator('.noted-infinite-animation').count()===0,bounds);
+    await capture('noted','response-wait-'+width);
+    const before=await notedPage.evaluate(()=>window.navigationFixture.actions.length);
+    await row.hover();
+    await notedPage.locator('[data-orchestration-action="detach"][data-orchestration-run-id="observed-run"]').click();
+    await row.waitFor({state:'hidden'});
+    const actions=await notedPage.evaluate(()=>window.navigationFixture.actions);
+    check(width+' cancel detaches only the wait',actions.length===before+1&&actions.at(-1).runId==='observed-run'
+      &&actions.at(-1).action==='detach'&&actions.at(-1).cancelSendAccepted===false,actions.at(-1));
+  }
+  const finalNav=await app.evaluate(()=>global.navState);
+  check('tracker navigation does not create jobs or send provider input',finalNav.forbidden.length===0&&finalNav.unknown.length===0,finalNav.unknown);
   check('no private renderer errors',report.errors.length===0&&report.console.length===0,{errors:report.errors,console:report.console});
+  for(const [file,hash]of Object.entries(report.source)){
+    check('frozen source still matches '+file,createHash('sha256').update(await fs.readFile(path.join(noted,file))).digest('hex')===hash);
+  }
   report.pass=true;
 }catch(error){report.error=error.stack||String(error);throw error}
 finally{

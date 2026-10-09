@@ -7,8 +7,9 @@ const { RUN_AFTER_CAPABILITY, QUEUE_OPS, AUTO_COMPACT_OPS, validateRunAfterEnvel
 const copy = value => value == null ? value : JSON.parse(JSON.stringify(value));
 
 class RunAfterApplicationAPI {
-  constructor({ manager, bridge, frame, scope, commitState, afterCommit = () => {}, prepareAuthoring = async value => value }) {
-    Object.assign(this, { manager, bridge, frame, scope, afterCommit, prepareAuthoring });
+  constructor({ manager, bridge, frame, scope, commitState, afterCommit = () => {}, prepareAuthoring = async value => value,
+    assetStore = () => null }) {
+    Object.assign(this, { manager, bridge, frame, scope, afterCommit, prepareAuthoring, assetStore });
     this.journal = new RunAfterOperationJournal({ db: manager.db, commitState,
       scopeCurrent: (target, saved) => this.scopeIsCurrent(target, saved) });
     this.capability = RUN_AFTER_CAPABILITY;
@@ -136,6 +137,10 @@ class RunAfterApplicationAPI {
     const result = this.journal.read(operationId);
     if (!result) throw error('run_after_operation_missing', 404);
     return result;
+  }
+  disposeAssets(sourceOperationId, input) {
+    return require('./replay-asset-ownership').disposeReplayAssets(
+      this.journal, this.manager, this.assetStore(), sourceOperationId, input);
   }
 }
 module.exports = { RunAfterApplicationAPI };

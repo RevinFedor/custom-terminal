@@ -15,17 +15,17 @@ visit(ast);
 assert.ok(callback, 'Actual requested-settings effect must exist');
 const compiled = ts.transpileModule(`(${callback})()`, { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
 
-for (const initialTab of ['projects', 'workflows', 'directories', 'ai', 'fonts', 'colors', 'shortcuts']) {
+for (const initialTab of ['ai', 'fonts', 'colors', 'shortcuts']) {
   test(`Actual open effect preserves settings address ${initialTab}`, () => {
     const accepted = [];
     const context = { isOpen: true, initialTab, prevIsOpenRef: { current: false }, setActiveTab: value => accepted.push(value) };
     vm.runInNewContext(compiled, context);
-    assert.deepEqual(accepted, [initialTab === 'workflows' || initialTab === 'directories' ? 'projects' : initialTab]);
+    assert.deepEqual(accepted, [initialTab]);
     vm.runInNewContext(compiled, context);
     assert.equal(accepted.length, 1, 'Open effect does not override manual navigation while already open');
   });
 }
-test('Unknown address cannot select nonexistent settings panel', () => {
-  const context = { isOpen: true, initialTab: 'foreign', prevIsOpenRef: { current: false }, setActiveTab: () => assert.fail('Unknown panel selected') };
+test('Removed Directories address cannot select a nonexistent settings panel', () => {
+  const context = { isOpen: true, initialTab: 'directories', prevIsOpenRef: { current: false }, setActiveTab: () => assert.fail('Unknown panel selected') };
   vm.runInNewContext(compiled, context);
 });

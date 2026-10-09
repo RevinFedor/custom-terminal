@@ -6,6 +6,96 @@
 
 Authenticated `GET /api/me` — ещё и точный process/listener proof. Поле `service` содержит `name:"noted-terminal"`, PID/instance, `state/listening`, preferred/resolved port, timestamps, bind conflicts и последний API request; capability — `mobileDiagnostics.version=1`. `getInfo().running` означает именно `httpServer.listening`, а не просто созданный JS-объект сервера. Это позволяет внешней диагностике отличить закрытый app, сорванный listen и port-walk; UI-процесс или старый discovery-файл не заменяют этот proof.
 
+## Каталог workflow для native
+
+Additive `capabilities.workflowOrganization.catalogProjection.version=1`
+объявляет `GET /api/workflow-organization?projection=catalog-v1`. Это один
+согласованный read всех workflow, не fan-out по прежним subset routes. Query без
+projection сохраняет старый wire; неизвестная projection получает400. Поддержку
+проверяют у установленного `/api/me`, наличие нового source её не доказывает.
+
+DTO version1 содержит ordered `workflows` с name/icon, full-active `memberTabIds`,
+mixed `rootIds`, flat preorder `nodes` (parentId/childIds/depth/expanded/contextParent)
+и group intersections. `rows` — текущие сохранённые descriptors, `executionRefs`
+отдельно несут subject/version, namespace/tabId/cwd, storage identity/revision,
+aliases и savedSessions. Глобальные definitions в `groups` не клонируются по
+workflow; настоящая empty group показывается в её reserveWorkflowId. Archived
+и unresolved записи находятся только в `provenance`. File остаётся file.
+Header также может содержать nullable `defaultCwd`: это подсказка создания,
+не cwd участников и не execution address. Workflow New выбирает explicit request
+cwd, затем source-tab cwd, затем workflow default, затем прежний namespace/
+recommended fallback. Сохранённые executionRefs и их guards от default не меняются.
+Иерархия использует тот же shared builder, что sidebar, без его placement filter;
+группа/цикл/родитель вне текущего дерева дают context reference, не новый parent.
+
+Организация и groups имеют свои revision; descriptors и tree — отдельные opaque
+content hashes. Они нужны для равенства, не для сравнения «больше/новее». Изменение
+legacy имени/cwd/позиции может не менять organization revision. Клиент сохраняет
+свой read-generation/selection fence и прежних runtime/cardSignals/History owners:
+эти сигналы здесь явно excluded, savedSessions не доказывает живой writer.
+Все части снимаются в одной синхронной SQLite read transaction, без renderer IPC.
+Совпадающие запросы до capture объединяются на одном setImmediate; settled-кэша
+и TTL нет, после capture следующий запрос получает новый read. Поздний результат
+не получает новую runtime revision из этого endpoint.
+
+`namespace` остаётся адресом legacy `/projects/...` исполнения, workflowId —
+только организацией. Нативный adapter меняет источник списка и row execution ref,
+сохраняя tabId/history/draft/actions и ownership frozen operations. Source/prompt
+bindings остаются tab-owned. Source проверки — actual HTTP/SQLite + pure tree и
+renderer callbacks; native UIKit, Simulator и installed acceptance отдельные.
+
+### Канонические действия групп и native drag
+
+`catalogProjection` подтверждает только read. Отдельные capabilities
+`workflowOrganization.groupActions.version=1` и `nativeDrag.version=1` объявляют
+новые authenticated adapters; наличие source не доказывает installed support.
+Legacy `/projects/:namespace/tab_groups`/`tab-layout` не являются обходом для wg2.
+
+`GET /api/workflow-organization/groups` возвращает прежнюю global publication.
+`POST …/groups/mutations {kind,request}` вызывает WorkflowGroups.mutate;
+`GET …/groups/mutations/:mutationId` читает его durable receipt. Kind:
+create/assign/rename/color/status/collapse/delete. Request содержит version1,
+mutationId, expectedRevision; для definition actions также groupId и
+expectedGroupRevision. Collapse передаёт explicit boolean, не toggle. Delete
+удаляет определение и снимает membership, не закрывает вкладки. Assign сохраняет
+exact previous groups по tabIds, включая участников разных workflow. Тот же ID
+с тем же телом возвращает прежний ACK; другое тело — conflict. Group revision
+отдельна от organization/runtime clocks, status не переписывает tab execution.
+
+Под `/api/workflow-organization/drag`: GET корня даёт process-local epoch,
+serverTime/leaseMs и лимиты; POST capture фиксирует full-active snapshot по
+gestureId/sourceId/workflowId/selectedTabIds и expected org/group/tree clocks.
+startedAt берётся из serverTime, lease5min. Exact concurrent capture/read каталога
+coalesce до capture, settled snapshot не переиспользуется следующим новым чтением.
+Для старого gesture не выполняется latest-state rebase; expired/released/сменивший
+epoch capture получает явный отказ. DELETE `…/drag/:captureId` освобождает данные.
+
+POST `…/drag/preview` совмещает prepare и preview: destination содержит workflowId
+и до64 последовательных actions (reorder по parentId/index после удаления source
+roots, indent/outdent). Main запускает тот же bundled workflowDragModel и pure
+outline/policies. Swift не сортирует дерево и не превращает DTO rootIds в write.
+Ответ содержит tree, canonical proposal и готовое commit-тело с previewId.
+POST `…/drag/commit` принимает именно это тело, повторно компилирует из pickup
+и проверяет preview hash; пишет прежний атомарный commitDrag. Org receipt route
+восстанавливает исход, а exact повтор commit после нового API epoch читает прежний
+journal command. Неизвестный ответ не разрешает новый mutationId.
+
+Same-workflow reorder сохраняет окна/hidden/profile размещения; transfer меняет
+membership и снимает прежние family placements без смены execution namespace/cwd.
+Physical parent защищён, visual file link редактируется, multi-X/cycles/depth
+проходят прежние policies. Scoped subject/PK, membership, relation, global group
+definition/composition, raw reserve arrays и placement guards сохраняются.
+Несвязанная publication/новая геометрия не заменяет исходный request: commit может
+пройти с прежними guards, сохранив новый resize/focus. Пустая группа переносит
+reserveWorkflowId в той же транзакции, иначе API readback расходился бы с preview.
+
+New agent/terminal, workflow Rename и Link File остаются у прежних владельцев.
+New использует explicit/source/defaultCwd; provider/model/effort/windowTarget/
+background передаются renderer scenario. Эти create routes не получают обещание
+durable replay от group/drag capabilities: bridge timeout остаётся unknown.
+Rename идёт через commitWorkspace с полным snapshot/CAS; Link File связывает
+существующий путь с owner tab. Отдельного создания файловых bytes этот API не вводит.
+
 ## Почему НЕ cloud-хостинг
 
 `query()` из `@anthropic-ai/claude-agent-sdk` запускает Claude Code subprocess **локально** с `cwd: project.path`, читает файлы пользователя, пишет JSONL в `~/.claude/projects/<slug>/`. На удалённой машине этот процесс не имеет доступа к локальной FS пользователя — а это и есть главный value (работа с реальными проектами с телефона). Поэтому сервер обязан быть локально, на том же устройстве где запущено приложение. Trade-off: ПК должен быть включён и в той же Wi-Fi что телефон.
@@ -144,6 +234,14 @@ commit, затем продолжается одна исходная опера
 или ухода клиента в background. GET не запускает ничего. После restart pending
 creator без живого continuation публикуется unknown; новый POST того же run не
 повторяет создание/отправку. Confirmed/queued сохраняют прежний proof/result path.
+
+Повторный POST exact runId сначала читает original run/receipt, до проверки
+исчезнувшего upload и повторной materialization. Иначе missing temp превращал
+старый delivery-unknown в ложное submitted:false. Additive caller-body fingerprint
+отделён от frozen materialized fingerprint; другой body даёт409 с прежней delivery
+truth, не новый Send. Legacy без caller fingerprint возвращает historical receipt
+с `requestIdentityVerified:false`, не утверждая совпадение нового body. Только
+прежний доказанный no-write сохраняет retry-authority; ошибка чтения не missing.
 
 `not-submitted` требует exact main-owned no-write settlement ДО Send либо
 точного pre-write attempt receipt: `submissionProof.kind=no-submit`, тот же
@@ -599,6 +697,15 @@ Busy-send и Stop во время streaming имеют ещё один пром�
 
 ## Project Terminal API: action response, runtime и transcript projection
 
+Пассивный `/tabs` не получает право обновить runtime clock после задержки palette/
+notification metadata. Codex batch наблюдается синхронно после последнего metadata
+await; более новый Claude event сохраняет исходные revision/observedAt/session,
+а не restamp старого busy как нового. Независимые metadata IPC стартуют вместе;
+после disconnect не начинается лишняя materialization/runtime tail. Старый Claude
+SID не читается до проверки текущего provider. Это read-only правило, не abort для
+эффектных Send/Stop/creation. Приватные timings этих стадий не локализуют прежний
+внешний first-byte stall Incident22:45 в tunnel/network.
+
 После provider failure три разных факта сохраняются раздельно: send receipt
 может быть confirmed, runtime active/inputReady, а результат хода — error.
 Codex canonical History теперь возвращает role/serviceCarrier `provider-error`
@@ -699,6 +806,16 @@ immutable request/inventory. `count/images/files` описывают приня�
 `*Occurrences` — фактические spans; byte-dedup не удаляет повторные occurrences.
 Это file ownership, не provider delivery/успешное выполнение. Старые receipts
 без этого поля, в том числе4944, не backfill'ятся и такой гарантии не получают.
+
+Это manifest только admitted mobile-upload refs, не всех image assetIds любого
+Replay. Managed queue/cache path вне upload-root не входит в его proof; отсутствие
+refs нельзя компенсировать count/accepted/submitted/imagePresentation. `durable:true`
+остаётся историческим admission фактом и после release/completed; это не current
+GC-pin set. Для Replay используется отдельный conditional assetDisposition (см.
+RunAfter ниже), а не blanket interpretation mobile receipt. Queue pins
+читаются отдельно от History sidecar retention, aliases сами bytes не удерживают.
+Поэтому original Replay lease нельзя отпускать по одному Send receipt/JSON refs,
+если phone draft продолжает ссылаться на bytes и replacement полноты не доказан.
 
 Явный structured `imagePaths[].assetId` проходит в importer вместе с sourcePath:
 если запросил A, текущий temp B не заменяет его. Retained A выбирается только по
@@ -867,13 +984,64 @@ physical остаток — `docs/tmp/claude-startup-failure-audit-2026-09-14.md
 
 Gate — `/me.capabilities.runAfter.version === 1`, не `sendQueue`. Опт-in GET прежнего tab route `?runAfter=1` возвращает прежние `queue/aiTabs` плюс `runAfter`: logical configuration scope, opaque Main+renderer epoch, authoring revision/order/guard, отдельный viewRevision, editor/countdown/runtime. `includeActions=1` возвращает общий desktop model/effort catalog; Think/Fast остаются live-настройками, не свойствами prompt. Reader соединяет данные с origin подключения; configuredSessionId не выдаётся за writer proof. MainScopeKey привязан к настоящему conversation owner. SSE `queue-update` несёт тот же block; `project-activity.runAfter` — coalesced wake, не копия prompt bodies. После reconnect/new epoch нужен свежий GET; меньшие revision/viewRevision и ответы старого запроса не откатывают состояние.
 
+Handshake явно публикует `/me.capabilities.runAfter.mainEpoch` текущего operation
+journal; он равен strict queue `runAfter.mainEpoch`, но НЕ `service.instanceId`.
+При stop/replacement journal меняется даже при том же service UUID. Старые tickets/
+GET/SSE clocks не получают новый допуск; historical receipts читаются отдельно.
+Missing explicit epoch не заменяется service UUID или epoch из случайного queue GET.
+MainScopeKey после organization publication также включает actual membership/revision
+вкладки; cwd/execution namespace остаются самостоятельными адресами.
+
 Шрам06.10: advertised v1 и green isolated HTTP fixture не доказали запуск полного web service. Strict GET отдавал503 `projectManager is not defined`, legacy GET200: fixture внедрил отсутствующий production-global. Module-level scope/journal/commit теперь получают прежний project-manager singleton в своём lexical scope. Приёмка включает полный CommonJS module без такого global: strict GET, metadata scope, SQLite commit/receipt и same-ID recovery. Недоступный versioned reader нельзя заменять пустой очередью или считавшимся успешным legacy-ответом.
 
 POST `{op,args,runAfter:{version:1,operationId,expected:<guard>,editorToken?}}` сохраняет immutable request. Устаревшие order/revision/scope и editor lock отклоняются до изменения; без envelope остаётся legacy-путь без новых гарантий. `GET /api/run-after/operations/:operationId` возвращает historical `operation`, не текущую очередь. Applied значит подтверждённую application mutation; для `sendNow` проверяется отдельный `result.send`, для AutoCompact — `result.outcome`. Unknown/timeout/restart повторно не исполняются; клиент сохраняет body/ID и читает эту квитанцию, не обновляет guard под тем же ID. Fresh POST может отдельно вернуть `current`, historical replay его не подделывает. Main store snapshot и applied receipt коммитятся вместе; неполученный ACK/RAM-change не объявляется no-write.
 
 Per-item timer/onTab/app-restart, clear trigger, action update, editor begin/end и Compact50 вызывают прежние owners. Pause сохраняет остаток enabled-head timer либо legacy delay; native не пересчитывает его сам. Compact50 ставит create-only condition и auto-arm только по coherent current Main busy proof. Unknown runtime не запрещает staging Compact-карточки: результат сохраняет `ownerProof.known:false`, не выдумывает busy/off и не включает Run. Unknown context не равен нулю, неподдержанная model/effort пара не нормализуется в ближайшую.
 
-Rich `add/update` передают queue snapshot `text/images/imagePaths/chips`, включая сохранённые prompt/paste тела. Image bytes принадлежат прежнему asset store до committed ACK. `replay` сохраняет immutable draft и leases до удаления выбранной карточки, возвращает `draftMode:append,submitted:false`: native импортирует его один раз по operationId, без Enter и без очистки существующего draft. После сохранения/отказа от переноса явный `POST /api/run-after/operations/:id/release {tabId}` освобождает lease, не удаляет receipt. Unknown release запрещён. Owned preview — `POST /api/run-after/image-preview {assetId,variant?:thumbnail|detail}`, не произвольный путь. Отдельного документа/filePaths codec у RunAfter нет; ordinary Send images/files не отключаются.
+Rich `add/update` передают queue snapshot `text/images/imagePaths/chips`, включая сохранённые prompt/paste тела. Image bytes принадлежат прежнему asset store до committed ACK. `replay` сохраняет immutable draft и leases до удаления выбранной карточки, возвращает `draftMode:append,submitted:false`: native импортирует его один раз по operationId, без Enter и без очистки существующего draft. JSON refs/UserDefaults/UIImage preview сами не становятся durable bytes owner: исходный lease нужен всё время, пока draft ссылается на его bytes, до conditional передачи либо явного удаления refs. Legacy `POST /api/run-after/operations/:id/release {tabId}` — совместимый полный explicit discard, не transfer certificate; receipt сохраняется, unknown source operation не отпускается. Owned preview — `POST /api/run-after/image-preview {assetId,variant?:thumbnail|detail}`, не произвольный путь. Отдельного документа/filePaths codec у RunAfter нет; ordinary Send images/files не отключаются.
+
+#### Replay: условная передача bytes без второго владельца
+
+Native gate — `runAfter.assetDisposition.version:1`. Source receipt даёт
+`assetLease:{sourceOperationId,tabId,mainEpoch,mainScopeKey,assetIds,released}`.
+Это scope первоначальной durable операции, не новый service/session/frame ID.
+`POST /api/run-after/operations/:sourceId/assets` принимает version1/requestId/tabId,
+source `{mainEpoch,mainScopeKey}`, полный `expectedAssetIds` (CAS), отдельные
+`discardAssetIds/transferAssetIds` и optional replacement. Все списки — уникальные
+явные content-addressed IDs; paths/counts/UIImage и порядок occurrences не являются
+доказательством покрытия. Остаток продолжает принадлежать старому lease.
+
+Replacement `project-send` связывает exact tab/handoff/`project:<tab>:<handoff>`/
+provider/attemptId (явный null только до attempt). Проверяются immutable FIFO request
+и текущий inventory либо exact canonical History sidecar, не historical mobile
+manifest. При source-only audit same-time/hash недостаточно: нужен прежний trusted
+sidecar с exact operation/attempt/source binding. Waiting/unknown/failed/cancelled
+не теряют bytes. Transferred FIFO pins живут через completion/presentation ACK до
+actual sidecar adoption; explicit failed/cancelled dismissal сохраняет своё право
+удаления. Sidecar остаётся обычным History owner, включая последующее удаление.
+
+Replacement `run-after-item` связывает applied add/update operationId/mainEpoch/
+mainScopeKey/itemId/target с текущим persisted item и всеми передаваемыми IDs.
+Точный historical epoch/scope add/update возвращается в receipt.assetOperationScope;
+он не заменяет handshake текущего journal и не вычисляется из нового session ID.
+Тот же mutation journal удерживает bytes до exact automatic item→FIFO admission
+или следующей disposition. Typed remote remove/clear/edited refs освобождают только
+свой item, Replay переносит held refs в новый Replay journal в authoring transaction.
+Одна произвольная state omission/unknown Send не является discard: pin сохраняется
+до exact admission либо explicit disposition. Overlay/новый runner для этого не нужны.
+
+Проверка replacement и снятие source pin коммитятся одной immediate SQLite
+transaction; filesystem await защищён прежним asset-store lease/revision/unlink
+механизмом. First request body сохраняется ДО await. Partial/foreign/stale/absent
+proof даёт durable rejected/retained, не submitted:false. Ответ содержит
+`disposition:released|partial|retained`, sourceReleased, transferred/discarded/
+retained IDs, replacement и committedAt; это historical receipt выполненной передачи,
+не вечный current pin сертификат. GET прежнего operation route по requestId
+восстанавливает результат; изменённый body под тем же ID —409. Только этот byte-only
+atomic subtype может восстановить SAME frozen request после restart/unknown: ни Send,
+ни обычная RunAfter unknown mutation не получают retry-разрешение. При отсутствующей
+capability original lease остаётся до явного discard. SOURCE/private verification
+не означает installed/native acceptance.
 
 `GET /api/run-after` — общий metadata-only active/staged/dependency обзор, без N+1 History. `/api/run-after/auto-compact` читает/меняет прежний global policy, exclusions и activity. GET не включает правило и не выбирает scope; first-open workflow — лишь предложение. Explicit `requestNow`/`cancel` требуют `targetGuard` выбранной queue; `resume` по умолчанию false, true означает явный запуск выбранной stopped-сессии прежним coordinator. Cancel дополнительно требует текущий `activityId` (activity.handoffId); compacting/resuming не прерывается. После проверенного admission собственный Resume/Send вправе закончиться historical receipt при уже новом current owner; это не обход physical guard и не повтор. Автоматический eligibility/new-natural-answer/failure continuation неизменён.
 
@@ -1292,6 +1460,9 @@ Header.iconFallback даёт text/color из тех же workflowVisuals, у unp
 новый marker отличает проверенный компактный формат без N+1 загрузки иконок.
 
 Main lease меняет epoch при новом renderer/frame/HTTP-service restart.
+Отменённый `will-navigate` внешней ссылки не меняет владельца: отзывать lease
+по одному `did-start-navigation` нельзя. Иначе живой App больше не регистрируется,
+а native GET навсегда получает503/revision0. См. `fact-переключатель-вкладок.md`.
 Внутри epoch revision растёт по MRU, фокусу, составу, placement, title/icon и
 file verdict; runtimeRevision и spacesFingerprint её не заменяют. Клиент
 связывает ответ с API-origin, своей connection generation и exact requestKey;

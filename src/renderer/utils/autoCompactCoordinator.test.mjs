@@ -55,6 +55,37 @@ test('new completion reserves owner before async check and continues only after 
   assert.equal(h.events.filter((s) => s === 'continue').length, 1);
   assert.equal(h.run(), false, 'repeated outcome must not send twice');
 });
+
+test('accepted process Stop retires a submitted compact observer quietly without continuing Run After', async () => {
+  for (const outcome of ['completed', 'aborted']) {
+    let resolve, reject;
+    const h = harness({ compact: () => new Promise((yes, no) => { resolve = yes; reject = no; }) });
+    h.run(); await tick();
+    assert.equal(h.coordinator.cancel('A'), false, 'ordinary Cancel still cannot cancel submitted compact');
+    assert.equal(h.coordinator.stop('A'), true);
+    assert.equal(h.coordinator.has('A'), false);
+    h.readiness({ ready: false, status: 'inactive' });
+    const before = [...h.events];
+    if (outcome === 'completed') resolve(); else reject(new Error('manual-stop'));
+    await tick();
+    assert.deepEqual(h.events, before, 'late exact outcome cannot publish activity/error or release old continuation');
+    assert.equal(h.events.includes('continue'), false);
+    assert.equal(h.events.includes('release'), false);
+    assert.equal(h.run({ at: 350 }), true, 'future eligible turn retains the existing policy');
+    h.coordinator.dispose();
+  }
+});
+
+test('accepted process Stop during AutoCompact Resume cannot later send compact', async () => {
+  let finishResume;
+  const h = harness({ resume: () => new Promise(resolve => { finishResume = resolve; }) });
+  h.readiness({ ready: false, status: 'inactive' });
+  const result = h.coordinator.request('A', { resume: true }); await tick();
+  h.coordinator.stop('A'); h.readiness({ ready: true, status: 'active' });
+  const before = [...h.events]; finishResume({ sessionId: 'S' }); await tick();
+  assert.deepEqual(await result, { skipped: 'manual-stop' });
+  assert.deepEqual(h.events, before);
+});
 test('a low percentage releases the original continuation without sending', async () => {
   const h = harness(); h.snapshot({ pct: 49 }); h.run(); await tick();
   assert.equal(h.events.includes('compact'), false); assert.equal(h.events.includes('continue'), true);

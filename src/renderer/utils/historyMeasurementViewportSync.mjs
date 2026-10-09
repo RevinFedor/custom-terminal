@@ -27,12 +27,13 @@ export function createHistoryMeasurementViewportSync({
         pending = null;
         if (!scroller.isConnected || getScroller() !== scroller
           || getOwnerToken() !== ownerToken || isSuppressed()) return;
-        if (scroller.scrollTop === ticket.scrollTop) return;
+        const currentTop = scroller.scrollTop;
+        if (currentTop === ticket.scrollTop) return;
         const ScrollEvent = scroller.ownerDocument?.defaultView?.Event || Event;
         // A real row may already have left overscan after its measurement.
         // The same live scroller/owner still needs the viewport publication.
         scroller.dispatchEvent(new ScrollEvent('scroll'));
-        onSync?.();
+        onSync?.({ before: ticket.scrollTop, after: currentTop });
       });
       return true;
     },

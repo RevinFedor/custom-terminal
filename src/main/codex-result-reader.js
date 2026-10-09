@@ -13,6 +13,7 @@ const { promptFingerprint } = require('./claude-prompt-carriers');
 const { summarizeResultText, projectResultText, MAX_RESULT_CHARS } = require('./codex-result-text');
 const { selectCodexResultBootstrap } = require('./codex-result-bootstrap');
 const { materializeCodexLegacyResult } = require('./codex-legacy-result-adapter');
+const { RESULT_PROOF_CODES } = require('./orchestration-result-proof');
 
 function statKey(stat) {
   return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
@@ -240,8 +241,51 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
     return projectResultText(samples, maxChars, MAX_RESULT_CHARS);
   }
 
-  async function materialize(entry, sessionId, proof, maxChars, { historical = false } = {}) {
-    if (!proof.targetExecutionContext?.turnId) {
+  function historicalContext(record, sessionId) {
+    const seconds = record?.payload?.started_at;
+    const numericSeconds = (typeof seconds === 'number' || typeof seconds === 'string' && seconds.trim())
+      ? Number(seconds) : NaN;
+    const timestamp = Date.parse(String(record?.timestamp || record?.time || record?.created_at || ''));
+    return { provider: 'codex', sessionId: record?.__physicalSessionId || sessionId,
+      turnId: record ? turnId(record) : null, processId: null, generation: null,
+      startedAt: Number.isFinite(numericSeconds * 1000) ? Math.round(numericSeconds * 1000)
+        : Number.isFinite(timestamp) ? timestamp : null };
+  }
+
+  async function materialize(entry, sessionId, proof, maxChars, { historical = false, executionOnly = false,
+    historicalExecution = false, latestExecution = false } = {}) {
+    if (historicalExecution) {
+      let context = proof.targetExecutionContext;
+      if (latestExecution) {
+        if (entry.parts.some(part => part.leftoverBuffer.length > 0)) {
+          return { success: false, error: 'latest-execution-tail-incomplete', proofDefinitive: false,
+            proofMode: 'historical-observed-execution', providerGeneration: null };
+        }
+        let latestStart;
+        for (let index = entry.boundaries.length - 1; index >= 0; index--) {
+          const record = entry.rows[entry.boundaries[index]].record;
+          if (record.payload?.type === 'task_started') { latestStart = record; break; }
+        }
+        const lastBoundary = entry.rows[entry.boundaries.at(-1)]?.record;
+        if (!latestStart || lastBoundary && (turnId(lastBoundary) !== turnId(latestStart)
+          || lastBoundary.__physicalSessionId !== latestStart.__physicalSessionId)) {
+          return { success: false, errorCode: RESULT_PROOF_CODES.TASK_STARTED_NOT_FOUND,
+            error: 'Latest Codex boundary has no matching provider task_started',
+            proofDefinitive: !!lastBoundary, proofMode: 'historical-observed-execution',
+            providerTurnId: lastBoundary ? turnId(lastBoundary) || null : null, providerGeneration: null };
+        }
+        context = historicalContext(latestStart, sessionId);
+      } else if (context) {
+        const starts = entry.starts.get(String(context.turnId || '').trim()) || [];
+        context = { ...context, processId: context.processId ?? null, generation: context.generation ?? null,
+          startedAt: starts.length === 1 ? historicalContext(entry.rows[starts[0]].record, sessionId).startedAt : null };
+      }
+      // A virtual view can end in a frozen ancestor execution. Its physical
+      // session is read authority only; the outer descriptor still owns the view.
+      sessionId = context?.sessionId || sessionId;
+      proof = { targetExecutionContext: context };
+    }
+    if (!executionOnly && !proof.targetExecutionContext?.turnId) {
       const selected = await selectCodexResultBootstrap({ rows: entry.rows,
         coordinates: entry.coordinates.peekEntries(), sessionId, proof, readBody, findExecutionContext });
       if (!selected.selectedPrompt) return { success: false, error: selected.reason || 'bootstrap-prompt-not-found', proofDefinitive: false };
@@ -281,6 +325,8 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
     const options = {
       allowTimeOnly: true,
       allowHistoricalGenerationUnknown: historical,
+      executionOnly,
+      historicalExecutionOnly: historicalExecution,
       getTurnIndex: uuid => coordinates().find(item => item.type === 'user' && item.uuid === uuid)?.turnIndex,
       projectAssistant: range => {
         selectedTextRange = range;
@@ -294,7 +340,7 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
     if (!blocks.length && terminalIndex >= 0 && selected[terminalIndex]?.length > 0) blocks = [selected[terminalIndex]];
     const projection = await projectRows(blocks, maxChars);
     // Reuse the SAME outcome/matcher after body availability is known. In
-    // particular an empty open turn remains ASSISTANT_NOT_MATERIALIZED.
+    // particular an empty open prompt-proof turn remains ASSISTANT_NOT_MATERIALIZED.
     return buildResult(rows, sessionId, proof, maxChars, { ...options, projectAssistant: () => projection });
   }
 
@@ -348,7 +394,9 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
   }
 
   async function loadInner({ sessionId, cwd, proof, maxChars, resolveSource, forceFresh = false,
-    resultReadMode = 'authoritative' }) {
+    resultReadMode = 'authoritative' }, selectionMode) {
+    const executionOnly = selectionMode !== 'prompt';
+    const historicalExecution = selectionMode === 'historical-execution' || selectionMode === 'latest-execution';
     const started = performance.now();
     let readBytes = 0, verifyBytes = 0, sourceVerifyBytes = 0;
     const countSourceVerification = source => {
@@ -382,10 +430,15 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
       const beginEpoch = epoch;
       try {
         try { await sync(entry, source); } finally { readBytes += entry.lastReadBytes; }
-        const resultKey = JSON.stringify([proof, maxChars]);
+        // An unfinished new start has no indexed row yet, but invalidates a
+        // cached assertion that the previous completed execution is latest.
+        const latestTailIncomplete = selectionMode === 'latest-execution'
+          && entry.parts.some(part => part.leftoverBuffer.length > 0);
+        const resultKey = JSON.stringify([proof, maxChars, selectionMode, latestTailIncomplete]);
         let result = entry.results.get(resultKey);
         if (!result) {
-          result = await materialize(entry, sessionId, proof, maxChars); entry.results.set(resultKey, result);
+          result = await materialize(entry, sessionId, proof, maxChars, { executionOnly, historicalExecution,
+            latestExecution: selectionMode === 'latest-execution' }); entry.results.set(resultKey, result);
           while (entry.results.size > 8) entry.results.delete(entry.results.keys().next().value);
         }
         // A cheap observation has NO authority to settle or recover a run.
@@ -393,6 +446,7 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
         // Verify negative terminals too: abort / empty final can trigger
         // recovery even though the provider classifier says complete=false.
         const sourceVerified = resultReadMode !== 'observe' && (resultReadMode === 'source-proof'
+          || historicalExecution
           || canDecideResult(result)
           // Source notification handoff proves prompt receipt before its
           // answer finishes. That explicit caller also needs byte authority.
@@ -418,11 +472,18 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
         }
         log.log?.('[CodexResultReader] session=' + sessionId.slice(0, 12)
           + ' mode=' + (readMode === 'bootstrap' ? readMode : entry.lastReadBytes ? 'append' : 'unchanged')
+          + ' selection=' + selectionMode
           + ' records=' + entry.rows.length + ' readBytes=' + readBytes + ' verifyBytes=' + verifyBytes
           + ' sourceVerifyBytes=' + sourceVerifyBytes + ' authority=' + Number(sourceVerified)
           + ' elapsedMs=' + (performance.now() - started).toFixed(1)
           + ' complete=' + Number(result.complete === true));
-        return { ...result, sourceSnapshot: entry.sourceSnapshot, sourceVerified };
+        return { ...result,
+          ...(historicalExecution ? { viewOwnerSessionId: sessionId, proofMode: 'historical-observed-execution', providerGeneration: null } : {}),
+          ...(executionOnly && result.executionContext ? {
+            executionContext: { ...result.executionContext },
+            sourceIdentityAliases: [...(result.sourceIdentityAliases || [])],
+          } : {}),
+          sourceSnapshot: entry.sourceSnapshot, sourceVerified };
       } catch (error) {
         if (attempt === 0 && error.message === 'result-source-advanced' && epoch === beginEpoch) {
           views.set(key, entry);
@@ -431,7 +492,8 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
         views.delete(key); texts.clear(); textBytes = 0;
         if (attempt === 0 && error.message === 'result-source-reset') continue;
         log.warn?.('[CodexResultReader] session=' + sessionId.slice(0, 12)
-          + ' mode=failed readBytes=' + readBytes + ' verifyBytes=' + verifyBytes
+          + ' mode=failed selection=' + selectionMode
+          + ' readBytes=' + readBytes + ' verifyBytes=' + verifyBytes
           + ' sourceVerifyBytes=' + sourceVerifyBytes + ' authority=0'
           + ' elapsedMs=' + (performance.now() - started).toFixed(1) + ' error=' + error.message);
         return { success: false, error: error.message, proofDefinitive: false, sourceVerified: false,
@@ -439,15 +501,32 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
       }
     }
   }
-  function load(request) {
+  function enqueue(request, selectionMode) {
     const key = request.sessionId + ':' + (request.cwd || '');
     const previous = flights.get(key) || Promise.resolve();
-    const next = previous.catch(() => {}).then(() => loadInner(request));
+    const next = previous.catch(() => {}).then(() => loadInner(request, selectionMode));
     flights.set(key, next);
     next.finally(() => { if (flights.get(key) === next) flights.delete(key); }).catch(() => {});
     return next;
   }
-  return { load, invalidate, stats: () => ({ ...stats, views: views.size, textBytes,
+  function loadObservedExecution({ sessionId, cwd, targetExecutionContext, resolveSource,
+    resultReadMode = 'authoritative', maxChars = 100000 } = {}) {
+    // Freeze the caller's captured identity before queued I/O. This reader
+    // proves source bytes, not the registry's live generation ownership.
+    return enqueue({ sessionId, cwd, resolveSource, resultReadMode, maxChars,
+      proof: { targetExecutionContext: targetExecutionContext ? { ...targetExecutionContext } : null } }, 'execution');
+  }
+  function loadLatestObservedExecution({ sessionId, cwd, resolveSource,
+    resultReadMode = 'authoritative', maxChars = 100000 } = {}) {
+    return enqueue({ sessionId, cwd, resolveSource, resultReadMode, maxChars, proof: {} }, 'latest-execution');
+  }
+  function loadHistoricalObservedExecution({ sessionId, cwd, targetExecutionContext, resolveSource,
+    resultReadMode = 'authoritative', maxChars = 100000 } = {}) {
+    return enqueue({ sessionId, cwd, resolveSource, resultReadMode, maxChars,
+      proof: { targetExecutionContext: targetExecutionContext ? { ...targetExecutionContext } : null } }, 'historical-execution');
+  }
+  return { load: request => enqueue(request, 'prompt'), loadObservedExecution,
+    loadLatestObservedExecution, loadHistoricalObservedExecution, invalidate, stats: () => ({ ...stats, views: views.size, textBytes,
     indexBytes: [...views.values()].reduce((sum, value) => sum + value.indexBytes, 0) }) };
 }
 

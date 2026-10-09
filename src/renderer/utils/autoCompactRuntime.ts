@@ -7,6 +7,7 @@ export type AutoCompactTarget = {
   tabId: string;
   projectId: string;
   workflowId: string;
+  membershipRevision?: number;
   provider: 'claude' | 'codex';
   sessionId: string;
   cwd?: string;
@@ -15,7 +16,7 @@ export type AutoCompactTarget = {
 export async function executeAutoCompact(target: AutoCompactTarget, handoffId: string): Promise<void> {
   let settle: (operation: any) => void = () => {};
   let rejectProof: (error: Error) => void = () => {};
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let manualStopError: Error | null = null;
   const proof = new Promise<void>((resolve, reject) => {
     rejectProof = reject;
     settle = (operation) => {
@@ -23,10 +24,19 @@ export async function executeAutoCompact(target: AutoCompactTarget, handoffId: s
         || operation.sessionId !== target.sessionId || operation.handoffId !== handoffId
         || operation.active !== false) return;
       if (operation.outcome === 'completed') resolve();
-      else reject(new Error('Автокомпакт не завершён: ' + (operation.reason || operation.outcome || 'неизвестный исход')));
+      else {
+        const error = new Error('Автокомпакт не завершён: ' + (operation.reason || operation.outcome || 'неизвестный исход'));
+        // Exact Main operation proof can precede agent:stopping-state. Keep it
+        // typed: the coordinator must not infer user intent from error text.
+        if (operation.outcome === 'aborted' && operation.reason === 'manual-stop') {
+          manualStopError = Object.assign(error, { code: 'auto_compact_manual_stop' });
+        }
+        reject(manualStopError || error);
+      }
     };
-    // A deadline is an unknown outcome, never proof of completion or a retry.
-    timer = setTimeout(() => reject(new Error('Нет подтверждения завершения автокомпакта. Проверьте сессию перед повтором.')), 180_000);
+    // Completion belongs to the exact Main operation, not elapsed time.
+    // A long-running compact must retain its observer and continuation until
+    // that owner publishes completed/aborted/failed/unknown, without a retry.
   });
   // The provider can finish while its submission IPC is still resolving.
   // Attach immediately and retain that exact outcome through the send await.
@@ -54,10 +64,10 @@ export async function executeAutoCompact(target: AutoCompactTarget, handoffId: s
     for (const operation of snapshot?.settled || []) settle(operation);
     await proof;
   } catch (error) {
-    rejectProof(error instanceof Error ? error : new Error(String(error)));
-    throw error;
+    const resultError = manualStopError || error;
+    rejectProof(resultError instanceof Error ? resultError : new Error(String(resultError)));
+    throw resultError;
   } finally {
-    if (timer) clearTimeout(timer);
     ipcRenderer.removeListener('agent:operational-phase', handler);
   }
 }

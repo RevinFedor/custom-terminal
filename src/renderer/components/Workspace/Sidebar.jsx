@@ -1569,12 +1569,13 @@ function Sidebar({
                 ['--file-session-chip-bg']: `${accent}33`,
                 ['--file-session-chip-bg-hover']: `${accent}55`,
               }}
-              onClick={event => {
+              onClick={async event => {
                 event.stopPropagation()
                 if (!linkOwnerProjectId) return
-                const state = useWorkspaceStore.getState()
-                state.setProjectView(linkOwnerProjectId, 'terminal')
-                state.switchTab(linkOwnerProjectId, chip.sessionTabId)
+                const opened = await useWorkspaceStore.getState().openTabById(chip.sessionTabId, {
+                  projectId: linkOwnerProjectId, reason: 'file-session-chip',
+                })
+                if (!opened) return
               }}
             >
               {chip.sessionName}
