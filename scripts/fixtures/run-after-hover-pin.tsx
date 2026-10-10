@@ -10,6 +10,7 @@ import { emptySpaceLayout } from '../../src/renderer/utils/workspaceSpacesModel.
 import SpaceStrip from '../../src/renderer/components/Workspace/SpaceStrip';
 import TabNotificationControls from '../../src/renderer/components/Workspace/TabNotificationControls';
 import SidebarToolsRow from '../../src/renderer/components/Workspace/SidebarToolsRow';
+import { SplitPaneAttachRow } from '../../src/renderer/components/Workspace/SplitPaneChrome';
 import { useAutoCompactStore } from '../../src/renderer/store/useAutoCompactStore';
 import { normalizeAutoCompactPolicy } from '../../src/renderer/utils/autoCompactPolicy.mjs';
 import { pendingQueuedRewindTarget, cancelQueuedRewindTarget } from '../../src/renderer/utils/queuedRewindTarget.mjs';
@@ -44,6 +45,12 @@ usePromptQueueStore.setState({ queues: new Map([['owner', { ...queue, panelColla
 
 const f = (window as any).hoverFixture;
 f.state = () => usePromptQueueStore.getState().getQueue('owner');
+f.completeDependency = (target: string) => usePromptQueueStore.getState().completePromptTabDependency(
+  'owner', 'synthetic-card', target, Date.now() + 100);
+f.restoreDependencies = () => {
+  const s = usePromptQueueStore.getState(), cur = s.getQueue('owner');
+  usePromptQueueStore.setState({ queues: new Map([['owner', JSON.parse(JSON.stringify(cur))]]) } as any);
+};
 f.scope = () => ({ policy: useAutoCompactStore.getState().policy, activeSpaceId: useWorkspaceStore.getState().activeSpaceId });
 f.compactPolicy = (patch: object) => useAutoCompactStore.setState({ policy:
   normalizeAutoCompactPolicy({ ...useAutoCompactStore.getState().policy, ...patch }) });
@@ -95,8 +102,14 @@ f.reorderDesign = () => {
   usePromptQueueStore.setState({ queues: new Map([['owner', { ...queue, items: [queue.items[1], queue.items[0], queue.items[2]] }]]) } as any);
 };
 f.addDisabled = () => {
+  // The former source now remains a prerequisite under AND semantics. Add an
+  // independent disabled queue so this shelf test still tests the shelf.
+  const ws = useWorkspaceStore.getState().openProjects.get(projectId)!;
+  const nextTabs = new Map(ws.tabs);
+  nextTabs.set('disabled-late', { ...tabs[0], id: 'disabled-late', name: 'Late disabled', codexSessionId: 'fixture-disabled-late' } as any);
+  useWorkspaceStore.setState({ openProjects: new Map([[projectId, { ...ws, tabs: nextTabs }]]) } as any);
   const state = usePromptQueueStore.getState();
-  usePromptQueueStore.setState({ queues: new Map([...state.queues, ['source', { ...state.getQueue('source'), autoRun: false,
+  usePromptQueueStore.setState({ queues: new Map([...state.queues, ['disabled-late', { ...state.getQueue('disabled-late'), autoRun: false,
     items: [{ id: 'late-disabled', text: '/compact', title: '/compact', images: 0, chips: [], imagePaths: [] }] }]]) } as any);
 };
 const placeTab = useWorkspaceStore.getState().placeTab;
@@ -189,6 +202,9 @@ createRoot(document.getElementById('root')!).render(<>
   <div data-global-fixture style={{ position: 'absolute', top: 20, left: 40 }}><GlobalFixture /></div>
   <div data-workflow-reference style={{ position: 'absolute', top: 70, left: 40, width: 1000 }}><SpaceStrip {...activity} /></div>
   <BellFixture />
+  {f.automationTest && <div data-chrome-fixture style={{ position: 'absolute', left: 650, top: 170, width: 420 }}>
+    <SplitPaneAttachRow projectId={projectId} tabId="owner" focused paneIndex={0} spaceId="hover-workflow" />
+  </div>}
   <div data-local-fixture style={{ position: 'absolute', top: 300, left: 80, width: 1000, height: 450,
     border: '1px solid #414141', background: '#202020' }}>
     <div style={{ padding: 14 }}>Synthetic History surface — hover / click ownership only</div>

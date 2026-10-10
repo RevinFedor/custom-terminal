@@ -42,6 +42,7 @@ import {
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { freezePaneContentsForResize } from '../../utils/splitResizeFreeze.mjs';
 import { beginHistoryResize } from '../../utils/historyResizeAnchor.mjs';
+import { IdleSessionStopCountdown } from './IdleSessionStopCountdown';
 import { acquireInteractionCursor } from '../../utils/interactionCursor';
 import { reportPerfIncident } from '../../utils/perfIncidentChannel';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
@@ -940,10 +941,10 @@ export function SplitPaneAttachRow({
                 setStripMenu(null);
               }}
               style={{
+                ...CONTEXT_MENU_ROW_STYLE,
                 display: 'flex',
                 alignItems: 'center',
                 gap: 8,
-                padding: '5px 12px',
                 cursor: 'pointer',
                 whiteSpace: 'nowrap',
                 background: timelineTreeMode ? STRIP_MENU_ACTIVE_BACKGROUND : 'transparent',
@@ -965,6 +966,7 @@ export function SplitPaneAttachRow({
                 : <PanelRightOpen size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />}
               Timeline
             </div>}
+            {!vacant && <IdleSessionStopCountdown tabId={tabId} />}
           </div>
         </>,
         document.body,

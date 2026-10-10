@@ -72,9 +72,10 @@ test.before(async () => {
             workflowRestoreReconciled = true;
             const coordinator = { intercept: () => false, wake() {}, cancel() {} };
             ${['findOwnersWaitingOn', 'fireQueueOwner', 'fireLoopOwner', 'getReadyTriggerForOwner'].map(name => actualRunnerDeclaration(source, name)).join('\n')}
+            ${actualRunnerDeclaration(source, 'releaseDeferredPivotOwners')}
             ${actualRunnerDeclaration(source, 'processSuccessfulWorkflowOutcome')}
             ${actualRunnerDeclaration(source, 'handleBusyState')}
-            return handleBusyState(channel);
+            return Object.assign(handleBusyState(channel), { release: releaseDeferredPivotOwners });
           }
           export function testColdScheduler() {
             workflowRestoreReconciled = true;
@@ -179,6 +180,129 @@ function findArrow(property, predicate) {
   };
   visit(overlayTree); assert.ok(arrow, property); return arrow;
 }
+
+async function dependencyFixture(t, ids = ['U', 'V']) {
+  const f = await fixture(t), tabs = f.ports.workspace.openProjects.get('P').tabs;
+  for (const id of [...ids, 'W']) tabs.set(id, { id, name: id, commandType: 'codex', codexSessionId: 'A' });
+  const s = f.state();
+  for (const id of ids) assert.equal(s.addPromptTabDependency('T', f.id, id), true);
+  const receive = f.actual.testLiveHandler();
+  return { ...f, receive, pending: () => f.item()?.trigger.dependencies.filter(x => x.completedAt === undefined).map(x => x.tabId),
+    finish: async (id, patch = {}) => {
+      receive(null, { tabId: id, busy: true, reason: 'task_started' });
+      receive(null, { tabId: id, busy: false, reason: 'task_complete', outcomeTs: Date.now() + 100, ...patch });
+      await f.settle();
+    } };
+}
+
+test('AND dependencies retire separately: busy U finishes, idle V still requires its own future turn', async t => {
+  const f = await dependencyFixture(t);
+  f.receive(null, { tabId: 'U', busy: true, reason: 'task_started' });
+  f.receive(null, { tabId: 'V', busy: false, reason: 'spinner' });
+  assert.deepEqual(Array.from(f.pending()), ['U', 'V']);
+  await f.finish('U'); assert.deepEqual(Array.from(f.pending()), ['V']); assert.equal(f.sends.length, 0);
+  f.receive(null, { tabId: 'U', busy: true, reason: 'task_started' });
+  assert.deepEqual(Array.from(f.pending()), ['V'], 'a new U turn does not restore a completed dependency');
+  await f.finish('V'); assert.equal(f.sends.length, 1); assert.equal(f.sends[0].tabId, 'T');
+  assert.equal(f.item(), undefined);
+  await f.finish('V'); assert.equal(f.sends.length, 1, 'duplicate/next outcome cannot send the consumed item again');
+});
+
+test('both busy dependencies can finish in either order; manual Stop, old outcome and duplicates do not satisfy them', async t => {
+  for (const order of [['U', 'V'], ['V', 'U']]) {
+    const f = await dependencyFixture(t);
+    for (const id of order) f.receive(null, { tabId: id, busy: true, reason: 'task_started' });
+    f.receive(null, { tabId: order[0], busy: false, reason: 'manual-stop', outcomeTs: Date.now() });
+    assert.equal(f.state().getQueue('T').autoRun, true); assert.equal(f.pending().length, 2);
+    await f.finish(order[0], { outcomeTs: 1 }); assert.equal(f.pending().length, 2, 'pre-selection completion stays ignored');
+    await f.finish(order[0]); assert.equal(f.pending().length, 1); assert.equal(f.sends.length, 0);
+    await f.finish(order[1]); assert.equal(f.sends.length, 1);
+  }
+});
+
+test('adding W after U completed retains progress and requires V plus the newly selected W', async t => {
+  const f = await dependencyFixture(t);
+  await f.finish('U');
+  assert.equal(f.state().addPromptTabDependency('T', f.id, 'W'), true);
+  assert.equal(f.state().addPromptTabDependency('T', f.id, 'V'), true);
+  assert.deepEqual(Array.from(f.pending()), ['V', 'W'], 'duplicates are not additional waits');
+  await f.finish('V'); assert.equal(f.sends.length, 0);
+  await f.finish('W'); assert.equal(f.sends.length, 1);
+});
+
+test('partial AND progress survives hydrate and a completed source starting again', async t => {
+  const first = await dependencyFixture(t); await first.finish('U');
+  const restored = await fixture(t, JSON.parse(JSON.stringify(first.state().getQueue('T'))));
+  const tabs = restored.ports.workspace.openProjects.get('P').tabs;
+  for (const id of ['U', 'V']) tabs.set(id, { id, commandType: 'codex', codexSessionId: 'A' });
+  const receive = restored.actual.testLiveHandler();
+  assert.equal(restored.item().trigger.dependencies[0].completedAt !== undefined, true);
+  receive(null, { tabId: 'U', busy: true, reason: 'task_started' });
+  receive(null, { tabId: 'V', busy: true, reason: 'task_started' });
+  receive(null, { tabId: 'V', busy: false, reason: 'task_complete', outcomeTs: Date.now() + 200 });
+  await restored.settle(); assert.equal(restored.sends.length, 1);
+});
+
+test('finished AND condition waits for a busy receiver, then ignores a new turn in the already completed source', async t => {
+  const f = await dependencyFixture(t);
+  f.receive(null, { tabId: 'T', busy: true, reason: 'task_started' });
+  await f.finish('U'); await f.finish('V');
+  assert.deepEqual(Array.from(f.pending()), []); assert.equal(f.sends.length, 0);
+  f.receive(null, { tabId: 'V', busy: true, reason: 'task_started' });
+  f.receive(null, { tabId: 'T', busy: false, reason: 'task_complete', outcomeTs: Date.now() + 200 });
+  await f.settle(); assert.equal(f.sends.length, 1);
+});
+
+test('AND dependency waits for source Loop to release the whole workflow; later/disabled cards do not consume it', async t => {
+  const f = await dependencyFixture(t);
+  f.state().setLoopPromptEnabled('U', true);
+  await f.finish('U'); assert.equal(f.pending().length, 2);
+  f.receive(null, { tabId: 'U', busy: true, reason: 'task_started' });
+  f.state().setLoopPromptEnabled('U', false);
+  await f.finish('U', { outcomeTs: Date.now() + 200 });
+  assert.deepEqual(Array.from(f.pending()), ['V']);
+  const later = f.state().addPrompt('T', 'LATER', 0);
+  f.state().addPromptTabDependency('T', later, 'V');
+  await f.finish('V');
+  assert.equal(f.state().getQueue('T').items.find(x => x.id === later).trigger.dependencies[0].completedAt, undefined);
+});
+
+test('AND dependencies reject cycles/self, remove only selected card and preserve saved progress in the remaining cards', async t => {
+  const f = await dependencyFixture(t);
+  assert.equal(f.state().addPromptTabDependency('T', f.id, 'T'), false);
+  const u = f.state().addPrompt('U', 'U AFTER T', 0);
+  assert.equal(f.state().addPromptTabDependency('U', u, 'T'), false);
+  f.state().removePromptTabDependency('T', f.id, 'U');
+  assert.deepEqual(Array.from(f.pending()), ['V']);
+  await f.finish('V'); assert.equal(f.sends.length, 1);
+});
+
+test('a completed source may Stop while the receiver is preparing without revoking its fulfilled AND condition', async t => {
+  const f = await dependencyFixture(t); await f.finish('U');
+  const hold = f.hold('work-context');
+  f.receive(null, { tabId: 'V', busy: true, reason: 'task_started' });
+  f.receive(null, { tabId: 'V', busy: false, reason: 'task_complete', outcomeTs: Date.now() + 100 });
+  await hold.entered.promise;
+  f.receive(null, { tabId: 'V', busy: false, reason: 'manual-stop', outcomeTs: Date.now() + 200 });
+  hold.release.resolve(); await f.settle(); assert.equal(f.sends.length, 1);
+});
+
+test('Pause does not consume dependency completions; Claude and Gemini share the same AND rule', async t => {
+  const f = await dependencyFixture(t); f.state().setAutoRun('T', false);
+  await f.finish('U'); assert.equal(f.pending().length, 2); assert.equal(f.sends.length, 0);
+  f.state().setAutoRun('T', true);
+  const tabs = f.ports.workspace.openProjects.get('P').tabs;
+  delete tabs.get('U').codexSessionId; delete tabs.get('V').codexSessionId;
+  tabs.get('U').commandType = 'claude'; tabs.get('U').claudeSessionId = 'A';
+  tabs.get('V').commandType = 'gemini';
+  for (const [id, provider] of [['U', 'claude'], ['V', 'gemini']]) {
+    const receive = f.actual.testLiveHandler(provider);
+    receive(null, { tabId: id, busy: true });
+    receive(null, { tabId: id, busy: false, outcomeTs: Date.now() + 200 });
+    await f.settle();
+  }
+  assert.equal(f.sends.length, 1); assert.equal(f.sends[0].tabId, 'T');
+});
 
 test('actual Run After preparation publishes exact item progress before the first readiness await and retires it on completion', async t => {
   const f = await fixture(t), hold = f.hold('readiness'), events = [];

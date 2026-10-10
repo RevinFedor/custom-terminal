@@ -70,6 +70,13 @@ chooser; это не директория workflow. Создание Terminal/Cl
 доступно прежним общим меню по ПКМ на пустом месте; double-click создаёт вкладку,
 правая зона строки меню выбирает окно. Настроенный sidebar gap сохраняется.
 
+Левый клик по обычной вкладке в desktop reserve заменяет показанный chip
+фокусного окна: прежняя вкладка остаётся живой в reserve, припаркованные соседи
+сохраняются. Средний клик добавляет выбранную вкладку последним chip того же окна.
+Различие задаётся явно через `openTabById(...,{unplacedMode:'replace-shown'})`
+только для левого клика в sidebar; уже существующее размещение раскрывается
+по прежнему адресу. Файлы сохраняют свой reader/middle-open-beside контракт.
+
 Любая вторичная ссылка к tabId открывает существующее точное окно/workflow.
 Скрытое окно возвращается в последнюю колонку/строку, где его показывали на
 текущем дисплее этого workflow; занимающее место окно целиком скрывается.
@@ -201,7 +208,7 @@ Hover и движение указателя не являются поводо�
    - **Instant Tooltip:** При наведении на сокращенный путь мгновенно всплывает полный адрес.
 3. **Файлы:** Пользователь открывает Sidebar (`Cmd+B`) — общий Noted file explorer, не компонент GT Editor.
    - Проводник открывается поверх терминала через React Portal (см. `methodology/сценарии-багов-design.md::6.3. UI поверх canvas: Portal или Layering Pattern`).
-   - Поддержка: общий structured DnD файлов и иерархии, rename, create, delete, context menu, multi-select (Cmd/Shift+Click).
+   - Поддержка: общий structured DnD файлов и иерархии, rename, create, delete, context menu, multi-select (Cmd/Shift+Click). Terminal включает обычный Y/перенос и folder-hover без Cmd; Cmd разрешает только X-вложенность. У общего файлового renderer это host opt-in, не смена default GT Editor.
    - Ширина sidebar ресайзится drag handle (min 180px, max 500px), сохраняется в localStorage глобально.
    - Пользователь делает `Cmd+Click` по пути файла в терминале -> файл открывается в **File Preview**.
 4. **Заметки:** Пользователь открывает заметку текущей вкладки в slide-out (`Cmd+E` или иконка `StickyNote` справа в активной вкладке TabSidebar). Подробнее: [`knowledge/fact-notes.md`](notes.md).

@@ -307,6 +307,10 @@ export interface StatusMarkerSettings {
   sizePx: number;     // 4..16, 1px step
 }
 
+export interface TaskStatusMarkerSettings extends StatusMarkerSettings {
+  showTitles: boolean;
+}
+
 const DEFAULT_STATUS_MARKER: StatusMarkerSettings = { shape: 'dot', sizePx: 8 };
 
 function loadStatusMarker(): StatusMarkerSettings {
@@ -449,8 +453,8 @@ interface UIStore {
      sizePx — длина стороны (для круга = диаметр). Clamp 4..16. */
   statusMarker: StatusMarkerSettings;
   setStatusMarker: (patch: Partial<StatusMarkerSettings>) => void;
-  taskStatusMarker: StatusMarkerSettings;
-  setTaskStatusMarker: (patch: Partial<StatusMarkerSettings>) => void;
+  taskStatusMarker: TaskStatusMarkerSettings;
+  setTaskStatusMarker: (patch: Partial<TaskStatusMarkerSettings>) => void;
 
   /* Tab geometry — рабочие вкладки в TabSidebar (vertical mode). Все поля px.
      Раньше — три константы TAB_VERTICAL_PADDING_* в TabBar.tsx, юзер не мог менять
@@ -2704,17 +2708,19 @@ export const useUIStore = create<UIStore>((set, get) => ({
         const parsed = JSON.parse(raw);
         return {
           shape: parsed?.shape === 'square' ? 'square' : 'dot',
+          showTitles: parsed?.showTitles !== false,
           sizePx: typeof parsed?.sizePx === 'number'
             ? Math.max(4, Math.min(16, Math.round(parsed.sizePx)))
             : DEFAULT_STATUS_MARKER.sizePx,
-        } as StatusMarkerSettings;
+        } as TaskStatusMarkerSettings;
       }
     } catch {}
-    return loadStatusMarker();
+    return { ...loadStatusMarker(), showTitles: true };
   })(),
   setTaskStatusMarker: (patch) => {
     const cur = get().taskStatusMarker;
-    const next: StatusMarkerSettings = {
+    const next: TaskStatusMarkerSettings = {
+      showTitles: typeof patch.showTitles === 'boolean' ? patch.showTitles : cur.showTitles !== false,
       shape: patch.shape === 'square' || patch.shape === 'dot' ? patch.shape : cur.shape,
       sizePx: typeof patch.sizePx === 'number'
         ? Math.max(4, Math.min(16, Math.round(patch.sizePx)))

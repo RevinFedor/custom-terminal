@@ -1210,6 +1210,14 @@ canonical user-carrier. Иначе Timeline чеканит адресуемую 
 не по расстоянию в строках: между ними законно стоят `world_state`,
 `turn_context` и `token_count`.
 
+Два соседних chip с одинаковыми `AGENTS.md + scope` не обязательно дубль:
+в сохранённой ветке может остаться предыдущая редакция инструкций, а Resume
+добавляет новую перед реальным prompt. Label не содержит версию/дату. Для
+диагноза сравнивать exact History UUID/sourceIdentity, timestamp и полный body,
+а не имя chip. Разные редакции нельзя склеивать как paired response/event
+carrier. Проверенный случай10.10: retained блок08.10 и новый09.10 имели разные
+тексты; исходный пользовательский Send вообще не содержал AGENTS envelope.
+
 У preamble без `turnKey` есть другая граница: он принадлежит предыдущему
 compact до следующего canonical user/compact или смены physical source.
 Нельзя удалять все такие записи лишь потому, что в диапазон попал хотя бы один

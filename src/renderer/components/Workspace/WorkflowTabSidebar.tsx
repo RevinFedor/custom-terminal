@@ -2,7 +2,7 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 're
 import {createPortal} from 'react-dom';
 import { Folder, ChevronDown, Plus, ArrowLeft, ArrowRight, CircleX, Pause } from 'lucide-react';
 import { useOutlineDnd, type OutlineDndNode, type OutlineDndCommitPayload, type OutlineDndFeedback } from '@noted/structured-dnd/react';
-import {projectForestToRootEnd} from '@noted/structured-dnd/core';
+import {useCommandHierarchyHint} from '../../hooks/useCommandHierarchyHint';
 import TabCard from './TabCard';
 import { openTabContextMenuAt, TAB_RENAME_REQUEST_EVENT } from './TabBar';
 import type { LinkedFile } from './TabLinkedFiles';
@@ -151,8 +151,9 @@ function ReserveCard({ node, rowProps, selected, activity, onClick, onMiddleClic
   </TabCard>;
 }
 
-function ReserveGroupHeader({node,group,expanded,editing,focused,dragging,onExpand,onFocus,onRename,onRenameEnd,onClose,onContextMenu}: {
+function ReserveGroupHeader({node,group,expanded,editing,focused,dragging,dwell,onExpand,onFocus,onRename,onRenameEnd,onClose,onContextMenu}: {
   node:Node;group:any;expanded:boolean;editing:boolean;focused:boolean;dragging:boolean;
+  dwell?:{progress:number;blocked?:boolean;pending?:boolean}|null;
   onExpand:()=>void;onFocus:()=>void;onRename:(name:string)=>Promise<boolean>;onRenameEnd:()=>void;
   onClose:()=>void;onContextMenu:(event:React.MouseEvent)=>void;
 }) {
@@ -184,6 +185,13 @@ function ReserveGroupHeader({node,group,expanded,editing,focused,dragging,onExpa
     <button className="workflow-reserve-folder" aria-label={`${expanded?'Свернуть':'Раскрыть'} группу ${node.label}`}
       onClick={event=>{event.stopPropagation();onFocus();onExpand();}}>
       <Folder size={14}/><ChevronDown size={9} className="workflow-reserve-folder-chevron" style={{transform:expanded?undefined:'rotate(-90deg)'}}/>
+      {dwell && <svg data-dnd-navigation-loader data-dnd-navigation-phase={dwell.blocked?'blocked':dwell.pending?'loading':'waiting'}
+        aria-hidden width="20" height="20" viewBox="0 0 20 20" style={{position:'absolute',inset:0,pointerEvents:'none'}}>
+        <circle cx="10" cy="10" r="9" fill="none" stroke="#a78bfa33" strokeWidth="2"/>
+        <circle cx="10" cy="10" r="9" fill="none" stroke={dwell.blocked?'#a1a1aa':'#c4b5fd'} strokeWidth="2"
+          strokeDasharray={Math.PI*18} strokeDashoffset={Math.PI*18*(1-Math.max(0,Math.min(1,dwell.progress)))}
+          transform="rotate(-90 10 10)"/>
+      </svg>}
     </button>
     {status && <span title={status.label} style={{flexShrink:0,width:marker.sizePx,height:marker.sizePx,background:status.color,borderRadius:marker.shape==='square'?2:'50%'}}/>}
     {editing?<input ref={input.ref} data-no-drag aria-label="Название группы" value={draft}
@@ -229,6 +237,7 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
   const membershipOf=(admission:any)=>Object.fromEntries(Object.entries(admission?.guards || {}).map(([id,guard]:any)=>[id,
     {workflowId:guard.workflowId,revision:guard.membershipRevision}]));
   const dnd = useOutlineDnd<Node>({ outline:controlledOutline,
+    hierarchyModifier:'meta',
     ...({externalDrag} as any),
     scopeKey:workflowId,
     getDragSource: input=>{
@@ -277,17 +286,13 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
       if (!guard?.parentTabId) return true;
       return outlineParent(controlledOutline, String(sourceNode.id)) === payload.slot.parentId;
     }),
-    resolveExternalTarget: ({ clientX, clientY, sourceId,sourceNode,sourceRootIds,sourceContext,previewOutline,metaKey }) => {
+    resolveExternalTarget: ({ clientX, clientY, sourceContext }) => {
       const pointed=document.elementFromPoint(clientX,clientY);
-      if(sourceNode.externalPaneSource && metaKey && sidebar.current?.contains(pointed))return {id:`reserve-end:${workflowId}`,zone:'reserve-end',
-        previewOutline:projectForestToRootEnd(previewOutline,sourceId,sourceRootIds)};
       const target=resolvePaneTabDropTarget(pointed,clientX,(sourceContext?.paneEntries || []).map((entry:PaneTabDragEntry)=>entry.tabId),clientY);
       setPaneTabDragTarget(target);
       return target ? {...target,id:`${target.spaceId}:${target.paneKey}:${target.at}`} : null;
     },
     onExternalCommit: payload => !payload.sourceContext ? false
-      : (payload.externalTarget as any)?.zone==='reserve-end'
-      ? latest.current.onCommitOutline({workflowId,expectedMembership:membershipOf(payload.sourceContext),payload})
       : latest.current.onPlaceTabs(payload.sourceContext.paneEntries,
         payload.externalTarget as PaneTabDropTarget,payload.sourceContext,{isCurrent:payload.isCurrent}),
     onLog:event=>{
@@ -301,6 +306,7 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
   });
   const dndRef=useRef(dnd);dndRef.current=dnd;
   useOutlineDragCursor(dnd.dragState,dnd.scrollerRef);
+  useCommandHierarchyHint(dnd.scrollerRef);
   const nodes = indexNodes(dnd.previewOutline);
   // Adopt the existing pointer while inside this host. Coordinates do not
   // rerender the owner: the shared hook receives the actual pointer events.
@@ -323,7 +329,7 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
       if(drag.externalOwnerKey!==ownerKey)return false;
       const rect=host.getBoundingClientRect(),target=drag.externalTarget as PaneTabDropTarget | null;
       const inside=pointer.clientX>=rect.left && pointer.clientX<=rect.right && pointer.clientY>=rect.top && pointer.clientY<=rect.bottom;
-      const corridor=source.owner==='sidebar' && !pointer.metaKey && pointer.clientY>=rect.top && pointer.clientY<=rect.bottom;
+      const corridor=source.owner==='sidebar' && pointer.clientY>=rect.top && pointer.clientY<=rect.bottom;
       const pane=source.owner==='sidebar' && target && ['body','strip'].includes(target.zone)
         && paneTabDropTargetContainsPoint(target,pointer.clientX,pointer.clientY);
       console.log(`[WorkflowReserveDnd:release] workflow=${currentWorkflow} source=${drag.sourceId} state=${JSON.stringify({
@@ -433,6 +439,7 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
               <span className="workflow-reserve-connector elbow" data-visual-connector-elbow />
             </span>}
             {node.groupId ? <ReserveGroupHeader node={node} group={group} expanded={row.expanded}
+              dwell={dnd.dragState?.navigationDwell?.targetId===row.id ? dnd.dragState.navigationDwell : null}
               editing={props.editingGroupId===node.groupId} focused={props.activeGroupId===node.groupId}
               dragging={!!dnd.dragState} onExpand={()=>{void dnd.requestExpansion(row.id,!row.expanded);}}
               onFocus={()=>props.onGroupFocus?.(node.groupId!)}

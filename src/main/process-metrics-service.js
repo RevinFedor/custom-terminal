@@ -14,13 +14,15 @@
  * Цена замера измерена и не зависит от числа вкладок: один проход по ~600
  * процессам системы стоит ~3 мс на снимок и ~1 мс на раскладку, пути и
  * аргументы процессов читаются один раз на номер и кэшируются. При шаге 5 с
- * это меньше сотой доли процента ядра, поэтому фоновый опрос безопасен. А вот
+ * это около 0.08% времени одного потока; реальный CPU считают по native delta. А вот
  * гонять при этом по IPC все 5+ КБ раскладки смысла нет: в фоне уходит только
  * два итога без строк процессов, полная раскладка — пока панель открыта.
  */
 
 const { captureNativeSnapshot, computeCpuPercent, loadNative } = require('./process-metrics-source');
 const { groupProcessMetrics } = require('./process-metrics-grouping');
+const { groupApplications } = require('./process-metrics-applications');
+const { captureSystemMemory } = require('./system-memory-source');
 
 const DEFAULT_INTERVAL_MS = 2000;
 const DEFAULT_AMBIENT_INTERVAL_MS = 5000;
@@ -47,6 +49,8 @@ function createProcessMetricsService({
   capture = captureNativeSnapshot,
   computeCpu = computeCpuPercent,
   group = groupProcessMetrics,
+  groupApps = groupApplications,
+  captureSystem = captureSystemMemory,
   collectContext,
   onUpdate,
   onAmbientUpdate,
@@ -65,10 +69,34 @@ function createProcessMetricsService({
   let ambientTimer = null;
   let ambientEnabled = false;
   const subscribers = new Set();
+  const views = new Map();
+  let panelSnapshot = null;
+  let panelCpu = null;
+  let panelPayload = null;
+  let applications = null;
+
+  function wantsApplications() {
+    return [...views.values()].some(view => view === 'system');
+  }
+
+  function withApplications(payload) {
+    if (!wantsApplications() || !panelSnapshot || !payload?.ok) return payload;
+    // The same process snapshot is reused on a view switch; no new PID scan.
+    if (!applications) {
+      try {
+        applications = { ...groupApps({ snapshot: panelSnapshot, cpuByPid: panelCpu }), memory: captureSystem() };
+      } catch (error) {
+        log.warn('[ProcessMetrics] application grouping failed: ' + (error?.message || error));
+        applications = { available: false, reason: 'application-grouping-failed', scannedAt: panelSnapshot.scannedAt };
+      }
+    }
+    return { ...payload, applications };
+  }
 
   function measure() {
     const snapshot = capture();
     if (!snapshot || !snapshot.ok) {
+      panelSnapshot = panelCpu = panelPayload = applications = null;
       return {
         ok: false,
         reason: (snapshot && snapshot.reason) || 'capture-failed',
@@ -90,7 +118,15 @@ function createProcessMetricsService({
       projectId: context.projectId || null,
     });
 
-    return { ok: true, ...grouped };
+    const payload = { ok: true, ...grouped };
+    if (subscribers.size > 0) {
+      panelSnapshot = snapshot;
+      panelCpu = cpuByPid;
+      panelPayload = payload;
+      applications = null;
+      return withApplications(payload);
+    }
+    return payload;
   }
 
   /**
@@ -102,6 +138,7 @@ function createProcessMetricsService({
     try {
       return measure();
     } catch (error) {
+      panelSnapshot = panelCpu = panelPayload = applications = null;
       log.warn('[ProcessMetrics] measure failed: ' + (error && error.message));
       return { ok: false, reason: 'measure-threw' };
     }
@@ -139,6 +176,10 @@ function createProcessMetricsService({
     // получасовой давности бессмысленно — «загрузка» размажется по интервалу
     // простоя и покажет почти ноль для активного процесса.
     previousSnapshot = null;
+    panelSnapshot = null;
+    panelCpu = null;
+    panelPayload = null;
+    applications = null;
     if (ambientEnabled) startAmbientTimer();
   }
 
@@ -158,14 +199,24 @@ function createProcessMetricsService({
     /** Разовый замер — для первого показа панели, без ожидания следующего тика. */
     measureOnce: measureSafely,
 
-    subscribe(subscriberId) {
+    subscribe(subscriberId, { view = 'noted' } = {}) {
       subscribers.add(subscriberId);
+      views.set(subscriberId, view === 'system' ? 'system' : 'noted');
       start();
       return measureSafely();
     },
 
+    setView(subscriberId, view) {
+      if (!subscribers.has(subscriberId)) return { ok: false, reason: 'not-subscribed' };
+      views.set(subscriberId, view === 'system' ? 'system' : 'noted');
+      if (!wantsApplications()) applications = null;
+      return panelPayload ? withApplications(panelPayload) : { ok: false, reason: 'snapshot-unavailable' };
+    },
+
     unsubscribe(subscriberId) {
       subscribers.delete(subscriberId);
+      views.delete(subscriberId);
+      if (!wantsApplications()) applications = null;
       if (subscribers.size === 0) stop();
     },
 

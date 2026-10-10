@@ -591,10 +591,12 @@ const {
 } = require(path.join(srcMainDir, 'codex-context-session-observer'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const { createWorkflowOrganizationApi, registerWorkflowOrganizationIpc } = require(path.join(srcMainDir, 'workflow-organization-api'));
+let idleSessionStopService = null;
 const workflowOrganization = createWorkflowOrganizationApi({ database: projectManager.db,
   captureExecution: tabId => ({...captureConversationOwner(tabId),inputRevision:getTerminalInputRevision(tabId),
     lifecycleGeneration:getTerminalLifecycleGeneration(tabId)}),
   publish: publication => {
+    idleSessionStopService?.refresh();
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) window.webContents.send('workflow:changed', publication);
     }
@@ -1182,8 +1184,10 @@ const {
   normalizeAgentLaunchSource,
   normalizeAiLifecycleIdentity,
 } = require(path.join(srcMainDir, 'ai-lifecycle-authority'));
-const { createWorkflowSessionStop, createSdkStopObservation, observeSdkStopMessage }
+const { createWorkflowSessionStop, createSdkStopObservation, observeSdkStopMessage,
+  activeWorkflowSessionMember, workflowSessionScopeKey }
   = require(path.join(srcMainDir, 'workflow-session-stop'));
+const { createIdleSessionStop } = require(path.join(srcMainDir, 'idle-session-stop'));
 const {
   clearClaudeQuestionStateOnProcessExit,
 } = require(path.join(srcMainDir, 'claude-question-lifecycle'));
@@ -9048,6 +9052,7 @@ function scheduleProjectActivityBroadcast(reason = 'event') {
   if (projectActivityBroadcastTimer) return;
   projectActivityBroadcastTimer = setTimeout(() => {
     projectActivityBroadcastTimer = null;
+    idleSessionStopService?.refresh();
     try {
       require(path.join(srcMainDir, 'web-server')).broadcastProjectActivity(reason);
     } catch {}
@@ -19828,25 +19833,30 @@ ipcMain.on('show-markdown-link-context-menu', (event, payload = {}) => {
 
   const template = [];
   if (target.kind === 'file') {
+    const finderAction = {
+      label: 'Открыть в Finder',
+      click: () => shell.showItemInFolder(target.filePath),
+    };
+    const gtEditorAction = {
+      label: 'Открыть в GT Editor',
+      click: () => openMarkdownFileInGtEditor(target.filePath, false),
+    };
+    const sublimeAction = {
+      label: 'Открыть в Sublime Text',
+      click: () => {
+        void openFileInSublime(target.filePath).then((result) => {
+          if (!result?.success) {
+            console.warn('[MarkdownLink] Sublime open failed:', result?.error || 'unknown error');
+          }
+        });
+      },
+    };
     template.push(
-      {
-        label: 'Открыть в Finder',
-        click: () => shell.showItemInFolder(target.filePath),
-      },
-      {
-        label: 'Открыть в GT Editor',
-        click: () => openMarkdownFileInGtEditor(target.filePath, false),
-      },
-      {
-        label: 'Открыть в Sublime Text',
-        click: () => {
-          void openFileInSublime(target.filePath).then((result) => {
-            if (!result?.success) {
-              console.warn('[MarkdownLink] Sublime open failed:', result?.error || 'unknown error');
-            }
-          });
-        },
-      },
+      // Only History action rows request editor-first. Ordinary Markdown
+      // links retain their existing Finder-first menu and open helpers.
+      ...(payload.editorFirst === true
+        ? [gtEditorAction, sublimeAction, finderAction]
+        : [finderAction, gtEditorAction, sublimeAction]),
       { type: 'separator' },
       { label: 'Копировать путь', click: () => clipboard.writeText(target.filePath) },
     );
@@ -19870,6 +19880,8 @@ ipcMain.on('show-markdown-link-context-menu', (event, payload = {}) => {
   }
 
   const menu = Menu.buildFromTemplate(template);
+  console.log('[MarkdownLink] MENU kind=' + target.kind
+    + ' editorFirst=' + (payload.editorFirst === true ? '1' : '0'));
   menu.popup({ window: BrowserWindow.fromWebContents(event.sender) });
 });
 
@@ -32288,11 +32300,17 @@ ipcMain.handle('agent:cancel-queued-send', (_event, { tabId, handoffId } = {}) =
 });
 
 ipcMain.handle('agent:cancel-send', (_event, { tabId, handoffId, sendAttemptId = null } = {}) => {
-  const queued = tabId && handoffId
+  const resolved = resolveAgentSendCancellationAttempt(tabId, handoffId, sendAttemptId);
+  // Validate a supplied physical attempt before the waiting-item fast path.
+  // A late old callback must not cancel a newer retry/no-attempt reservation.
+  if (typeof sendAttemptId === 'string' && sendAttemptId.trim() && resolved.durableRecords.length
+    && resolved.durableRecords.filter(record => record.attemptId === resolved.attemptId).length !== 1) {
+    return { cancelled: false, reason: 'stale-or-ambiguous-attempt' };
+  }
+  const queued = tabId && handoffId && resolved.durableRecords.length <= 1
     ? require(path.join(srcMainDir, 'web-server')).cancelQueuedAgentSends(tabId, handoffId)
     : { cancelled: false };
   if (queued.cancelled) return { ...queued, reason: 'application-queue-cancelled' };
-  const resolved = resolveAgentSendCancellationAttempt(tabId, handoffId, sendAttemptId);
   const durableAttemptId = resolved.attemptId;
   if (!resolved.accepted) {
     console.warn('[AgentSendCancel] reject ambiguous durable cancellation tab='
@@ -44750,7 +44768,7 @@ ipcMain.handle('system:process-metrics-ambient-stop', () => {
 ipcMain.handle('system:process-metrics-subscribe', (event, options = {}) => {
   processMetricsProjectId = (options && options.projectId) || null;
   const subscriberId = event.sender.id;
-  const payload = processMetricsService.subscribe(subscriberId);
+  const payload = processMetricsService.subscribe(subscriberId, { view: options?.view });
 
   // Renderer может перезагрузиться или закрыться, не отписавшись. Без этого
   // замер продолжал бы крутиться на несуществующего слушателя.
@@ -44764,6 +44782,10 @@ ipcMain.handle('system:process-metrics-subscribe', (event, options = {}) => {
 ipcMain.handle('system:process-metrics-unsubscribe', (event) => {
   processMetricsService.unsubscribe(event.sender.id);
   return { success: true };
+});
+
+ipcMain.handle('system:process-metrics-set-view', (event, options = {}) => {
+  return processMetricsService.setView(event.sender.id, options?.view);
 });
 
 // Kill whatever holds the given ports. Returns per-port outcome.
@@ -46104,10 +46126,10 @@ function sameWorkflowSessionOwner(expected, current) {
       && JSON.stringify(current.identity) === JSON.stringify(expected.identity)));
 }
 
-function readWorkflowSessionBusy(tabId, owner) {
-  const inherited = require(path.join(srcMainDir, 'web-server')).readInheritedTabActivity();
+function readWorkflowSessionBusy(tabId, owner, captured = null) {
+  const inherited = captured?.inherited || require(path.join(srcMainDir, 'web-server')).readInheritedTabActivity();
   if (inherited?.known !== true) return { known: false };
-  if (inherited.sourceTabIds.includes(tabId) || agentSendActivity.snapshot().pendingTabIds.includes(tabId)) {
+  if (inherited.sourceTabIds.includes(tabId) || (captured?.pending || agentSendActivity.snapshot().pendingTabIds).includes(tabId)) {
     return { known: true, busy: true };
   }
   if (owner.kind === 'sdk') {
@@ -46117,7 +46139,8 @@ function readWorkflowSessionBusy(tabId, owner) {
       || owner.token.channel.pendingCount() > 0 };
   }
   if (owner.kind === 'terminal') return { known: true, busy: aiStoppingTabs.has(tabId) };
-  const activity = computeProjectActivity().projects.flatMap(project => project.tabs).find(tab => tab.tabId === tabId);
+  const activity = captured ? captured.activities.get(tabId)
+    : computeProjectActivity().projects.flatMap(project => project.tabs).find(tab => tab.tabId === tabId);
   if (!activity) return { known: false };
   return { known: true, busy: !!(activity.turnBusy === true || activity.status !== 'active'
     || aiStoppingTabs.has(tabId) || activity.manualActionRequired === true
@@ -46155,6 +46178,69 @@ const stopWorkflowSessions = createWorkflowSessionStop({ organization: workflowO
   readBusy: readWorkflowSessionBusy, observe: observeWorkflowSessionProcess, stop: stopWorkflowSessionTarget,
   log: (phase, data) => console.log('[WorkflowStop] ' + phase + ' ' + JSON.stringify(data)) });
 ipcMain.handle('workflow:stop-sessions', (_event, request) => stopWorkflowSessions(request));
+
+function captureIdleSessionStopTargets(tabId = null) {
+  if (!workflowOrganization.ready()) return [];
+  const policy = idleSessionStopService?.snapshot().policy;
+  if (policy && !policy.allWorkflows && !policy.workflowIds.length) return [];
+  const web = require(path.join(srcMainDir, 'web-server'));
+  const captured = { inherited: web.readInheritedTabActivity(), pending: agentSendActivity.snapshot().pendingTabIds,
+    activities: new Map(computeProjectActivity().projects.flatMap(project => project.tabs).map(tab => [tab.tabId, tab])) };
+  const rows = tabId ? [workflowOrganization.service.getTab(tabId)].filter(Boolean)
+    : workflowOrganization.service.listWorkflows().filter(workflow => !policy || policy.allWorkflows || policy.workflowIds.includes(workflow.id))
+      .flatMap(workflow => workflowOrganization.service.listMembers(workflow.id));
+  return rows.flatMap(row => {
+    if (!activeWorkflowSessionMember(row, row.membership?.workflowId)) return [];
+    const owner = captureWorkflowSessionOwner(row);
+    if (owner.kind === 'terminal') return [];
+    const busy = readWorkflowSessionBusy(row.tabId, owner, captured);
+    const ready = owner.kind === 'sdk' || captured.activities.get(row.tabId)?.inputReady === true;
+    const working = captured.activities.get(row.tabId)?.turnBusy === true
+      || captured.pending.includes(row.tabId) || captured.inherited?.sourceTabIds?.includes(row.tabId) === true
+      || owner.kind === 'sdk' && !!(owner.token.stopObservation?.busy || owner.token.stopObservation?.operational
+        || owner.token.stopObservation?.tasks.size);
+    const codex = codexTurnWatchers.get(row.tabId), claude = claudeHookLastEvent.get(row.tabId);
+    const lastCompletion = owner.kind === 'sdk' ? owner.token.stopObservation?.completedAt || 0
+      : owner.toolType === 'codex' ? codex?.lastOutcomeTs || 0
+        : owner.toolType === 'claude' && ['Stop', 'StopFailure'].includes(claude?.event) ? claude.ts : 0;
+    const launchedAt = owner.kind === 'sdk' ? 0 : owner.toolType === 'codex'
+      ? codexLastRunCommandPayload.get(row.tabId)?.startedAt || 0 : claudeLaunchGenerationByTab.get(row.tabId)?.at || 0;
+    // A resumed CLI may replay the previous process's completed response. Give
+    // the newly ready process its own idle interval instead of stopping it now.
+    const completedAt = lastCompletion >= launchedAt ? lastCompletion : 0;
+    return [{ tabId: row.tabId, workflowId: row.membership.workflowId, scope: workflowSessionScopeKey(row), owner,
+      known: busy.known === true, idle: busy.busy === false && ready, working, completedAt,
+      activityKey: web.idleStopQueueActivityKey(row.tabId) }];
+  });
+}
+async function observeIdleSessionStop(tabId, owner) {
+  const proof = await observeWorkflowSessionProcess(tabId, owner);
+  if (proof.known !== true || owner.kind !== 'ai') return proof;
+  if (['claude', 'codex'].includes(owner.toolType)) {
+    const queue = await require(path.join(srcMainDir, 'web-server')).readIdleStopQueueGuard(tabId);
+    if (queue.known !== true || queue.busy) return { known: false, error: 'idle_stop_continuation_pending' };
+    const draft = inspectSavedHistoryDraft(tabId);
+    if (draft?.success !== true || draft.hasDraft !== false) return { known: false, error: 'idle_stop_draft_pending' };
+  }
+  return proof;
+}
+idleSessionStopService = createIdleSessionStop({
+  readPolicy: () => projectManager.db.getAppState('globalIdleSessionStop'),
+  savePolicy: policy => {
+    const result = projectManager.db.setAppState('globalIdleSessionStop', JSON.stringify(policy));
+    if (result?.success === false) throw new Error(result.error || 'idle_stop_save_failed');
+  },
+  capture: captureIdleSessionStopTargets, sameOwner: sameWorkflowSessionOwner,
+  observe: observeIdleSessionStop, stop: stopWorkflowSessionTarget,
+  publish: value => { for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('idle-session-stop:changed', value);
+  } },
+  log: (phase, data) => console.log('[IdleSessionStop] ' + phase + ' ' + JSON.stringify(data)),
+});
+ipcMain.handle('idle-session-stop:get', () => idleSessionStopService.refresh());
+ipcMain.handle('idle-session-stop:update', (_event, patch) => idleSessionStopService.update(patch || {}));
+app.whenReady().then(() => idleSessionStopService.refresh());
+app.on('will-quit', () => idleSessionStopService.dispose());
 
 // Native macOS confirmation. `window.confirm` in the renderer blocks the whole
 // renderer thread while it is open, so terminal output, loaders and the tab
@@ -68889,10 +68975,12 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
     push(text) {
       session.stopObservation.inputRevision++;
       session.stopObservation.busy = true;
+      scheduleProjectActivityBroadcast('sdk-input');
       channel.push(buildUserMessage(text, 'next'));
     },
   };
   sdkSessions.set(tabId, session);
+  scheduleProjectActivityBroadcast('sdk-session-created');
 
   // If we already know the sessionId (resume path), arm the JSONL watcher
   // now — we won't get a fresh `sessionId captured` event since session.sessionId
@@ -68941,7 +69029,7 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
     try {
       let staleResumeRetry = null; // { reason, originalSessionId } if recovery needed
       for await (const message of q) {
-        observeSdkStopMessage(session.stopObservation, message);
+        if (observeSdkStopMessage(session.stopObservation, message, !session.userInterrupted)) scheduleProjectActivityBroadcast('sdk-stop-observation');
         const win = BrowserWindow.getAllWindows()[0];
         if (!win || win.isDestroyed()) break;
 

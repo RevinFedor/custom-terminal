@@ -31,16 +31,12 @@ test('left sidebar is an explicit keyboard-focus surface with visible ownership'
     /data-keyboard-focus-owner="sidebar" \[data-split-pane-focus-actions\] \{[\s\S]{0,180}display: none/,
     'sidebar focus may dim pane actions but must not change strip width',
   );
-  assert.match(paneChip, /data-chip-active=\{visuallyActive \? '1' : '0'\}/);
-  assert.match(
-    css,
-    /\[data-chip-shown="1"\]:not\(\[data-chip-active="1"\]\)/,
-    'sidebar focus may quiet other panes but must preserve the placed tab active marker',
-  );
+  assert.match(paneChip, /data-chip-active=\{shown && paneFocused \? '1' : '0'\}/);
+  assert.match(paneChip, /active=\{shown\}/);
   assert.doesNotMatch(
     css,
-    /\[data-chip-shown="1"\]\s*\{/,
-    'a broad shown-chip override erases active feedback after sidebar replacement',
+    /\[data-split-pane-tab-chip\]\[data-chip-shown="1"\]/,
+    'keyboard focus must not dim the selected chip in any window',
   );
 });
 

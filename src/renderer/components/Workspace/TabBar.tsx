@@ -8,6 +8,7 @@ import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
 import { CompositedTextShimmer } from '../UI/CompositedTextShimmer';
 import TabNotificationControls from './TabNotificationControls';
+import { IdleSessionStopCountdown } from './IdleSessionStopCountdown';
 import TabFileDeleteAction from './TabFileDeleteAction';
 import {
   CONTEXT_MENU_BLOCK_DIVIDER_STYLE,
@@ -128,6 +129,7 @@ import {
   visualHierarchySubtreeItems,
 } from '@noted/structured-dnd';
 import { useOutlineDnd } from '@noted/structured-dnd/react';
+import { useCommandHierarchyHint } from '../../hooks/useCommandHierarchyHint';
 import { useOutlineDragCursor } from '../../hooks/useOutlineDragCursor';
 import {
   buildTabOutline,
@@ -450,16 +452,9 @@ type TabNavigationExternalTarget = {
   blocked: boolean;
 };
 
-type TabSidebarEndExternalTarget = {
-  id: string;
-  zone: 'sidebar-end';
-  projectId: string;
-};
-
 type TabExternalTarget = TabProjectExternalTarget
   | TabPaneExternalTarget
-  | TabNavigationExternalTarget
-  | TabSidebarEndExternalTarget;
+  | TabNavigationExternalTarget;
 
 const indexTabOutlineNodes = (nodes: TabOutlineNode[], result = new Map<string, TabOutlineNode>()) => {
   for (const node of nodes) {
@@ -8147,7 +8142,6 @@ function TabBar({
     clientY,
     sourceIds,
     sourceNode,
-    metaKey,
   }: {
     clientX: number;
     clientY: number;
@@ -8157,25 +8151,7 @@ function TabBar({
   }) => {
     if (menuOnlyForProject || getPaneTabDragSnapshot().source?.workflowDrag || typeof document === 'undefined') return null;
     const pointed = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
-    const externalPaneSource = sourceNode?.externalPaneSource as {
-      rootTabId?: string;
-    } | undefined;
-    const externalSidebarSource = sourceNode?.externalSidebarSource as {
-      rootTabId?: string;
-    } | undefined;
-
-    // Cmd over the destination sidebar means «put at the end». Releasing Cmd
-    // removes this external target and the same adopted outline drag resumes
-    // exact hierarchy positioning without a second pickup.
-    if (metaKey && (externalPaneSource || externalSidebarSource) && pointed?.closest('[data-tabbar-vertical]')) {
-      return {
-        id: `sidebar-end:${projectId}`,
-        zone: 'sidebar-end',
-        projectId,
-      } satisfies TabSidebarEndExternalTarget;
-    }
-
-    if (metaKey && sourceNode?.entityType === 'tab') {
+    if (sourceNode?.entityType === 'tab') {
       const workflowTarget = pointed?.closest<HTMLElement>('[data-space-chip]');
       const workflowId = workflowTarget?.dataset.spaceChip;
       if (workflowId) {
@@ -8193,7 +8169,7 @@ function TabBar({
     const projectTarget = pointed?.closest<HTMLElement>('[data-structured-project-drop-target]');
     const targetProjectId = projectTarget?.dataset.projectId;
     if (targetProjectId && openProjectIdSet.has(targetProjectId)) {
-      if (metaKey && sourceNode?.entityType === 'tab') {
+      if (sourceNode?.entityType === 'tab') {
         return {
           id: `project-navigation:${targetProjectId}`,
           zone: 'project-navigation',
@@ -8212,11 +8188,9 @@ function TabBar({
       } satisfies TabProjectExternalTarget;
     }
 
-    // Sidebar hierarchy keeps its normal Y/X contract. Cmd freezes that
-    // hierarchy and turns only explicit pane chrome/body regions into window
-    // placement targets; file/prompt outline hosts keep their original Cmd
-    // navigation because they never return these product-specific targets.
-    if (metaKey) {
+    // Explicit window targets accept an ordinary drag. The shared outline
+    // alone owns Cmd-X hierarchy; navigation and placement need no modifier.
+    {
       const paneTarget = resolvePaneTabDropTarget(
         pointed,
         clientX,
@@ -8267,12 +8241,6 @@ function TabBar({
       externalTarget?.zone === 'workflow-navigation'
       || externalTarget?.zone === 'project-navigation'
     ) return false;
-    if (externalTarget?.zone === 'sidebar-end') {
-      return commitTabOutlineLayout({
-        sourceNode,
-        previewOutline: moveTabOutlineNodeToRootEnd(previewOutline, sourceNode.id, sourceNode),
-      });
-    }
     if (externalTarget?.zone === 'strip' || externalTarget?.zone === 'body') {
       const paneRootTabIds = resolveOutlineTabDragPayload(sourceNode).rootIds;
       if (paneRootTabIds.length === 0) return false;
@@ -8331,6 +8299,7 @@ function TabBar({
 
   const tabOutlineDnd = useOutlineDnd<TabOutlineNode>({
     outline: controlledTabOutlineForDnd,
+    hierarchyModifier: 'meta',
     disabled: menuOnlyForProject || !isVerticalLayout || isMultiSelect || editingTabId !== null || editingGroupId !== null,
     onCommit: handleTabOutlineCommit,
     onExternalCommit: handleTabOutlineExternalCommit,
@@ -8365,6 +8334,7 @@ function TabBar({
       );
     },
   });
+  useCommandHierarchyHint(tabOutlineDnd.scrollerRef, !menuOnlyForProject && isVerticalLayout);
   const tabOutlineDndExternalRef = useRef(tabOutlineDnd as typeof tabOutlineDnd & {
     commitExternalDrag?: (reason?: string) => boolean;
   });
@@ -8427,12 +8397,12 @@ function TabBar({
       pointerId: drag.pointerId,
       clientX: drag.pointerX,
       clientY: drag.pointerY,
-      metaKey: drag.navigationMode === true,
+      metaKey: drag.hierarchyMode === true,
     });
   }, [
     menuOnlyForProject,
     projectId,
-    tabOutlineDnd.dragState?.navigationMode,
+    tabOutlineDnd.dragState?.hierarchyMode,
     tabOutlineDnd.dragState?.phase,
     tabOutlineDnd.dragState?.pointerId,
     tabOutlineDnd.dragState?.pointerX,
@@ -8466,7 +8436,6 @@ function TabBar({
     || structuredExternalTarget?.zone === 'project-navigation'
     ? structuredExternalTarget
     : null;
-  const paneSidebarAppendActive = structuredExternalTarget?.zone === 'sidebar-end';
 
   useEffect(() => {
     if (menuOnlyForProject) return;
@@ -8883,7 +8852,6 @@ function TabBar({
   const verticalBody = menuOnlyForProject ? null : (
     <div
       data-tabbar-vertical
-      data-pane-tab-sidebar-append={paneSidebarAppendActive ? '1' : undefined}
       data-tab-range-preview-count={shiftRangePreviewActive ? shiftRangePreviewIds.length : undefined}
       className="h-full w-full bg-panel flex flex-col overflow-hidden relative"
       onMouseOverCapture={trackShiftRangeTarget}
@@ -8895,29 +8863,6 @@ function TabBar({
     >
       {reopenPulseActive && (
         <div className="absolute inset-0 pointer-events-none animate-reopen-pulse" aria-hidden />
-      )}
-      {paneSidebarAppendActive && (
-        <div
-          data-pane-tab-sidebar-append-zone
-          aria-hidden
-          style={{
-            position: 'absolute',
-            inset: 5,
-            zIndex: 80,
-            pointerEvents: 'none',
-            border: '2px dashed #a78bfa',
-            borderRadius: 8,
-            background: 'rgba(124,58,237,0.10)',
-            color: '#ddd6fe',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            fontSize: 12,
-            fontWeight: 650,
-          }}
-        >
-          В конец проекта
-        </div>
       )}
 
       {/* Main zone — scrolls vertically */}
@@ -10954,6 +10899,7 @@ function TabBar({
             );
           })()}
 
+          {!isContextMultiSelect && contextMenu && !isContextFileTab && <IdleSessionStopCountdown tabId={contextMenu.tabId} />}
         </div>
       )}
 

@@ -94,6 +94,7 @@ function harness(t, { outcome = 'queued', provider = 'codex', scopeLoss = 'termi
     };
   }
   const context = vm.createContext({
+    require, path, srcMainDir: __dirname,
     compactSendReceiptPresentation,
     ...registryModule,
     AGENT_SEND_RECEIPT_STATES: registryModule.RECEIPT_STATES,
@@ -226,6 +227,18 @@ function harness(t, { outcome = 'queued', provider = 'codex', scopeLoss = 'termi
   };
 }
 
+test('cancel control cannot downgrade proven no-input or provider refusal into unknown', t => {
+  const h = harness(t); if (!h) return;
+  for (const state of ['not-submitted', 'provider-not-accepted']) {
+    const result = h.context.durableAgentSendReplay({ state, tabId: 'T', operationKey: 'O', attemptId: 'A',
+      deliveryControl: { version: 1, cancelledAt: 1 },
+      receipt: { submitted: state === 'provider-not-accepted', status: state } });
+    assert.equal(result.status, state);
+    assert.equal(result.submitted, state === 'provider-not-accepted');
+    assert.notEqual(result.deliveryUnknown, true);
+  }
+});
+
 for (const provider of ['codex', 'claude']) {
   test(provider + ' queued first response and replay preserve pending canonical receipt without another send', async t => {
     const h = harness(t, { provider });
@@ -344,6 +357,7 @@ test('a slow Codex audit keeps orchestration waiting without delivery failure re
   Object.assign(h.context, {
     getOrchestrationRunStore: () => ({
       getInternal: async () => current, get: async () => current,
+      patch: async (_runId, input) => (current = { ...current, ...input }),
       markDelivery: async (_runId, input) => {
         deliveries.push(input); current = { ...current, ...input }; return current;
       },
@@ -386,6 +400,7 @@ test('queued pending audit still accepts orchestration delivery immediately', as
     getOrchestrationRunStore: () => ({
       getInternal: async () => current,
       get: async () => current,
+      patch: async (_runId, input) => (current = { ...current, ...input }),
       markDelivery: async (_runId, input) => {
         deliveries.push(input);
         current = { ...current, status: 'sent', ...input };

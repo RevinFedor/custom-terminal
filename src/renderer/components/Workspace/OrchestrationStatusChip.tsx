@@ -226,7 +226,8 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   };
 }
 
-function StatusIcon({ presentation }: { presentation: RunPresentation }) {
+function StatusIcon({ presentation, compact = false }: { presentation: RunPresentation; compact?: boolean }) {
+  if (compact && presentation.icon === 'loading') return null;
   let icon: ReactNode;
   if (presentation.icon === 'success') icon = <CircleCheck size={14} strokeWidth={2.2} />;
   else if (presentation.icon === 'error') icon = <CircleAlert size={14} strokeWidth={2.2} />;
@@ -814,7 +815,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
             const externalSourceRun = isSource && run.runKind === 'external-research';
             const activeRunContent = (
               <>
-                <StatusIcon presentation={presentation} />
+                <StatusIcon presentation={presentation} compact />
                 {isSource ? <ArrowUpRight size={12} strokeWidth={2.2} /> : <ArrowDownLeft size={12} strokeWidth={2.2} />}
                 <span style={{ color: '#d4d4d4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left', fontSize: 10 }}>{linkedTabName || 'Запрос'}</span>
                 {run.status === 'waiting_recovery' && countdown(run.recoveryDeadlineAt, now) && <span style={{ fontSize: 9, fontVariantNumeric: 'tabular-nums' }}>{countdown(run.recoveryDeadlineAt, now)}</span>}

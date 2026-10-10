@@ -111,6 +111,12 @@ FilePreview остаётся read-only поверх `MarkdownEditor`; кнопк
 
 Fallback на LaunchServices нужен потому что у пользователя Sublime может быть установлен как `.app`, но `subl` не добавлен в shell PATH. Обратная ситуация тоже частая: CLI есть через Homebrew, а app path отличается. Логи `[FileOps:Sublime]` намеренно пишут и failed candidates, и successful method — если кнопка «ничего не делает» в production, сначала смотреть эти строки, а не FilePreview/MarkdownEditor. Общий принцип PATH — `methodology/дизайн-принципы.md::Production Electron на macOS наследует launchd PATH`.
 
+Файловые action rows History переиспользуют тот же Sublime executor через нативное
+меню Markdown links. Только этот caller просит GT Editor/Sublime первыми; меню
+обычных ссылок остаётся Finder-first. GT в этом маршруте получает каталог+файл
+через существующий URL protocol, а не просто `openPath`; причина и границы —
+`fact-история-как-основная-поверхность.md::Файлы в действиях инструментов: ПКМ`.
+
 ## Архитектурное решение
 
 **Файл:** `src/renderer/components/Workspace/FilePreview.tsx`

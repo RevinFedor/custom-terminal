@@ -4,6 +4,7 @@ import {useOutlineDnd} from '@noted/structured-dnd/react';
 import {useWorkspaceStore} from '../../store/useWorkspaceStore';
 import {useUIStore} from '../../store/useUIStore';
 import {useOutlineDragCursor} from '../../hooks/useOutlineDragCursor';
+import {useCommandHierarchyHint} from '../../hooks/useCommandHierarchyHint';
 import {linkedFileOutline,captureLinkedFileDrag,linkedFileDragValid,linkedFileDragRequest} from '../../utils/tabLinkedFileTree.mjs';
 import {tabOutlineHorizontalPolicy,tabOutlineVerticalSlotPolicy} from './tabOutlineModel.mjs';
 import {isLinkedFilePreview} from '../../utils/tabLinkedFiles.mjs';
@@ -23,6 +24,7 @@ export default function TabLinkedFileTree({ownerTabId,files,onOpen,onContextMenu
   const windowSnapshot=useWorkspaceStore(s=>linkedFileWindowSnapshot(s,files));
   const windowStates=useMemo(()=>new Map<string,string|null>(JSON.parse(windowSnapshot)),[windowSnapshot]);
   const dnd=useOutlineDnd({outline,scopeKey:`file-tree:${space}:${view}:${ownerTabId}`,
+    hierarchyModifier:'meta',
     outsidePointerPolicy:'cancel',ignoreSelector:'input,[data-no-drag]',
     layoutAnimation:{duration:120,easing:'cubic-bezier(0.2, 0, 0, 1)',respectReducedMotion:false,
       maxAnimatedRows:14,minRetargetInterval:72,animateDuringScroll:false},
@@ -38,6 +40,7 @@ export default function TabLinkedFileTree({ownerTabId,files,onOpen,onContextMenu
       console.log(`[LinkedFileDnd:${event.type}] owner=${ownerTabId} session=${event.sessionId} source=${event.sourceId} detail=${JSON.stringify(event.detail)}`);},
   });
   useOutlineDragCursor(dnd.dragState,dnd.scrollerRef);
+  useCommandHierarchyHint(dnd.scrollerRef);
   const active=!!dnd.dragState;
   useLayoutEffect(()=>{onDraggingChange(active);return()=>onDraggingChange(false);},[active,onDraggingChange]);
   const nodes=new Map<string,any>();

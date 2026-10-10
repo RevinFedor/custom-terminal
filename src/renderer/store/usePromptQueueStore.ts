@@ -35,6 +35,8 @@ import {
   normalizeAgentLocalCommand,
 } from '../utils/agentLocalCommand.mjs';
 import { shouldDisarmAfterTriggerClear } from '../utils/runAfterTriggerClear.mjs';
+import { appendPromptTabDependency, completePromptTabDependency, createsPromptQueueCycle, normalizePromptTabTrigger,
+  pendingPromptTabIds, promptTabTriggerMatches, removePromptTabDependency } from '../utils/promptQueueDependencies.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -357,7 +359,7 @@ export type QueuedPrompt = {
   // Optional one-shot scheduling rule for this queue item. Only the enabled
   // head can consume the queue's single runtime countdown slot.
   trigger?: { kind: 'timer'; seconds: number }
-    | { kind: 'onTab'; tabId: string }
+    | { kind: 'onTab'; tabId: string; dependencies?: { tabId: string; armedAt: number; completedAt?: number }[] }
     | { kind: 'app-restart'; armedInstanceId: string };
   // Independent eligibility gate. `trigger` answers WHEN to inspect the item;
   // this condition answers WHETHER it may run at that moment. Keeping them
@@ -720,6 +722,9 @@ interface PromptQueueStore {
   ) => void;
   reorderPrompt: (tabId: string, fromIndex: number, toIndex: number) => void;
   setPromptTrigger: (tabId: string, promptId: string, trigger: QueuedPrompt['trigger'] | null) => void;
+  addPromptTabDependency: (tabId: string, promptId: string, targetTabId: string) => boolean;
+  removePromptTabDependency: (tabId: string, promptId: string, targetTabId: string) => void;
+  completePromptTabDependency: (tabId: string, promptId: string, targetTabId: string, outcomeTs: number) => boolean;
   clearPromptTrigger: (tabId: string, promptId: string) => boolean;
   setPromptCondition: (tabId: string, promptId: string, condition: QueuedPrompt['condition'] | null) => void;
   // Move a currently deferred card behind every other card. Returns false when
@@ -1065,21 +1070,12 @@ export function isLoopPromptActive(
   return queue.loopPromptEnabled && queue.loopPromptText.trim().length > 0;
 }
 
-function wouldCreateRunAfterCycle(
+export function wouldCreateRunAfterCycle(
   queues: Map<string, TabQueue>,
   ownerTabId: string,
   targetTabId: string,
 ): boolean {
-  const visited = new Set<string>();
-  let currentTabId: string | null = targetTabId;
-
-  while (currentTabId) {
-    if (currentTabId === ownerTabId || visited.has(currentTabId)) return true;
-    visited.add(currentTabId);
-    currentTabId = queues.get(currentTabId)?.runAfterTabId ?? null;
-  }
-
-  return false;
+  return createsPromptQueueCycle(queues, ownerTabId, targetTabId);
 }
 
 // Successful admission or a proven Enter transfers ownership. Unknown is NOT
@@ -1548,7 +1544,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const normalized = trigger?.kind === 'timer'
           ? { kind: 'timer' as const, seconds: normalizeFirstDelaySeconds(trigger.seconds) }
           : trigger?.kind === 'onTab' && trigger.tabId
-            ? { kind: 'onTab' as const, tabId: trigger.tabId }
+            ? normalizePromptTabTrigger(trigger)
             : normalizeAppRestartTrigger(trigger) || undefined;
         const items = cur.items.map((item) => {
           if (item.id !== promptId) return item;
@@ -1569,6 +1565,41 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         });
         return { queues: next };
       });
+    },
+
+    addPromptTabDependency: (tabId, promptId, targetTabId) => {
+      if (!targetTabId || targetTabId === tabId || wouldCreateRunAfterCycle(get().queues, tabId, targetTabId)) return false;
+      const cur = get().getQueue(tabId), item = cur.items.find(item => item.id === promptId);
+      if (!item) return false;
+      const trigger = appendPromptTabDependency(item.trigger, targetTabId, Date.now(), cur.workflowArmedAt ?? item.createdAt);
+      get().setPromptTrigger(tabId, promptId, trigger);
+      return true;
+    },
+
+    removePromptTabDependency: (tabId, promptId, targetTabId) => {
+      const item = get().getQueue(tabId).items.find(item => item.id === promptId);
+      if (!item) return;
+      const trigger = removePromptTabDependency(item.trigger, targetTabId);
+      if (trigger) get().setPromptTrigger(tabId, promptId, trigger);
+      else get().clearPromptTrigger(tabId, promptId);
+    },
+
+    completePromptTabDependency: (tabId, promptId, targetTabId, outcomeTs) => {
+      let completed = false;
+      setAndPersist(state => {
+        const cur = state.queues.get(tabId);
+        if (!cur?.autoRun || cur.items.find(isQueuedPromptEnabled)?.id !== promptId) return state;
+        const items = cur.items.map(item => {
+          if (item.id !== promptId) return item;
+          const trigger = completePromptTabDependency(item.trigger, targetTabId, outcomeTs);
+          if (trigger === item.trigger) return item;
+          completed = true; return { ...item, trigger };
+        });
+        if (!completed) return state;
+        const next = new Map(state.queues); next.set(tabId, { ...cur, items });
+        return { queues: next };
+      });
+      return completed;
     },
 
     clearPromptTrigger: (tabId, promptId) => {
@@ -2008,9 +2039,9 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         let changed = false;
         for (const [ownerTabId, cur] of state.queues) {
           const head = cur.items.find(isQueuedPromptEnabled);
-          const trigger = head?.trigger?.kind === 'onTab'
-            ? head.trigger.tabId : (cur.runAfterTabId || ownerTabId);
-          const workflow = cur.workflowRestartPending && trigger === triggerTabId;
+          const matchesTrigger = head?.trigger?.kind === 'onTab'
+            ? promptTabTriggerMatches(head.trigger, triggerTabId) : (cur.runAfterTabId || ownerTabId) === triggerTabId;
+          const workflow = cur.workflowRestartPending && matchesTrigger;
           const loop = cur.loopRestartPending && ownerTabId === triggerTabId;
           if (!workflow && !loop) continue;
           next.set(ownerTabId, { ...cur,
@@ -2046,7 +2077,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           const restartTriggerBlocksOutcome = head?.trigger?.kind === 'app-restart'
             && (!appRestartSatisfied || !outcomeAfterCurrentAppStart);
           const waitsOnTrigger = head?.trigger?.kind === 'onTab'
-            ? head.trigger.tabId === triggerTabId
+            ? promptTabTriggerMatches(head.trigger, triggerTabId)
             : cur.runAfterTabId === triggerTabId;
           const hasQueuePromise = cur.autoRun || cur.stopAfter || cur.closeAfter || cur.firstDelayCountdownAt !== null;
           const queueMatches = hasQueuePromise
@@ -2118,7 +2149,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         for (const [ownerTabId, queue] of next) {
           const hasGlobalTarget = queue.runAfterTabId === closedTabId;
           const hasItemTarget = queue.items.some((item) => (
-            item.trigger?.kind === 'onTab' && item.trigger.tabId === closedTabId
+            item.trigger?.kind === 'onTab' && promptTabTriggerMatches(item.trigger, closedTabId)
           ));
           if (!hasGlobalTarget && !hasItemTarget) continue;
           if (hasGlobalTarget) automaticRunAfterTargetClearTabs.add(ownerTabId);
@@ -2127,9 +2158,10 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             runAfterTabId: hasGlobalTarget ? null : queue.runAfterTabId,
             items: hasItemTarget
               ? queue.items.map((item) => {
-                  if (item.trigger?.kind !== 'onTab' || item.trigger.tabId !== closedTabId) return item;
-                  const { trigger: _trigger, ...rest } = item;
-                  return rest;
+                  if (item.trigger?.kind !== 'onTab' || !promptTabTriggerMatches(item.trigger, closedTabId)) return item;
+                  const trigger = removePromptTabDependency(item.trigger, closedTabId);
+                  if (trigger) return { ...item, trigger };
+                  const { trigger: _trigger, ...rest } = item; return rest;
                 })
               : queue.items,
           });
@@ -2361,7 +2393,7 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
   const trigger = item.trigger?.kind === 'timer' && Number.isFinite(Number(item.trigger.seconds))
     ? { kind: 'timer' as const, seconds: normalizeFirstDelaySeconds(Number(item.trigger.seconds)) }
     : item.trigger?.kind === 'onTab' && typeof item.trigger.tabId === 'string' && item.trigger.tabId.length > 0
-      ? { kind: 'onTab' as const, tabId: item.trigger.tabId }
+      ? normalizePromptTabTrigger(item.trigger)
       : normalizeAppRestartTrigger(item.trigger) || undefined;
   const condition = normalizeQueuedPromptContextCondition(item.condition);
   const metaAction: QueuedMetaAction | undefined = item.metaAction?.kind === 'restart'

@@ -59,6 +59,7 @@ import { dictationBlocksSend } from '../utils/dictationChips.mjs';
 import { classifyQueuedCodexSettingsIntent } from '../utils/promptQueueCodexSettingsIntent.mjs';
 import { getAppRuntimeIdentity } from '../utils/appRuntimeIdentity';
 import { appRestartTriggerIsSatisfied } from '../utils/promptQueueAppRestart.mjs';
+import { pendingPromptTabIds, promptTabTriggerMatches, promptTabTriggerReady } from '../utils/promptQueueDependencies.mjs';
 
 const { ipcRenderer } = window.require('electron');
 // A planned process shutdown pauses automation; its synthetic Ctrl+C outcomes
@@ -448,6 +449,7 @@ function enabledQueueHead(queue: TabQueue): QueuedPrompt | null {
 }
 
 function queueItemTriggerCanFire(item: QueuedPrompt | null): boolean {
+  if (item?.trigger?.kind === 'onTab' && item.trigger.dependencies) return promptTabTriggerReady(item.trigger);
   if (!item || item.trigger?.kind !== 'app-restart') return true;
   return appRestartTriggerIsSatisfied(item.trigger, queueAppRuntimeInstanceId);
 }
@@ -489,12 +491,14 @@ function getEffectiveQueueTrigger(ownerTabId: string, queue: TabQueue, options: 
   const head = enabledQueueHead(queue);
   if (head?.trigger?.kind === 'onTab') {
     const targetTabId = head.trigger.tabId;
+    if (head.trigger.dependencies && promptTabTriggerReady(head.trigger)) return targetTabId;
     if (!canValidateQueueTabs()) return targetTabId;
     if (tabCanTriggerQueue(ownerTabId, targetTabId)) return targetTabId;
     if (options.clearStaleTarget) {
       console.warn('[PromptQueueRunner] item onTab trigger ' + targetTabId.slice(-8)
         + ' is no longer valid, clearing → owner=' + ownerTabId.slice(-8));
-      usePromptQueueStore.getState().setPromptTrigger(ownerTabId, head.id, null);
+      if (head.trigger.dependencies) usePromptQueueStore.getState().removePromptTabDependency(ownerTabId, head.id, targetTabId);
+      else usePromptQueueStore.getState().setPromptTrigger(ownerTabId, head.id, null);
       return getEffectiveQueueTrigger(
         ownerTabId,
         usePromptQueueStore.getState().getQueue(ownerTabId),
@@ -575,7 +579,9 @@ function withPostPrompt(tabId: string, body: string): string {
 const prevBusyRef = new Map<string, boolean>();
 const queueManualStopping = new Set<string>();
 
-function isTabWorkflowBlocked(tabId: string): boolean {
+function isTabWorkflowBlocked(tabId: string, waitingItem?: QueuedPrompt | null): boolean {
+  if (waitingItem?.trigger?.kind === 'onTab' && waitingItem.trigger.dependencies
+    && promptTabTriggerReady(waitingItem.trigger)) return false;
   return queueShutdownPending || queueManualStopping.has(tabId) || autoCompactCoordinator?.has(tabId) === true
     || prevBusyRef.get(tabId) === true || isOrchestrationCompletionBlocked(tabId);
 }
@@ -733,6 +739,13 @@ function signalQueueOwnerReadiness(ownerTabId: string, source: string): void {
   void reconcilePromptQueuePendingDelivery(ownerTabId);
   autoCompactCoordinator?.wake(ownerTabId);
   retryDeferredOwnerSend(ownerTabId, source);
+  const queue = usePromptQueueStore.getState().getQueue(ownerTabId), head = enabledQueueHead(queue);
+  if (queue.autoRun && head?.trigger?.kind === 'onTab' && head.trigger.dependencies
+    && promptTabTriggerReady(head.trigger) && !deferredOwnerSends.has(ownerTabId)
+    && !queueSendInflight.has(ownerTabId) && !queueAwaitingBusyStart.has(ownerTabId)
+    && !isTabWorkflowBlocked(ownerTabId) && pivotTriggerHasFreshCompletion(queue, head.trigger.tabId)) {
+    beginConditionAwareQueueSend(ownerTabId, head.trigger.tabId, head, 'turn-end');
+  }
   for (const listener of queueDeadlineWakeListeners) listener(ownerTabId);
 }
 
@@ -831,21 +844,29 @@ function cancelPreparationsForManualStop(tabId: string): void {
   processedNaturalOutcomes.delete(tabId);
   latestLoopCauseByOwner.delete(tabId);
   queueAwaitingBusyStart.delete(tabId);
+  const completedBatch = (ownerTabId: string) => {
+    const trigger = enabledQueueHead(usePromptQueueStore.getState().getQueue(ownerTabId))?.trigger;
+    return ownerTabId !== tabId && trigger?.kind === 'onTab' && trigger.dependencies && promptTabTriggerReady(trigger);
+  };
   for (const [ownerTabId, attempt] of deferredOwnerSends) {
     if (ownerTabId !== tabId && attempt.triggerTabId !== tabId) continue;
+    if (completedBatch(ownerTabId)) continue;
     attempt.cancelledByManualStop = true;
     attempt.preparationController?.abort();
     clearDeferredOwnerSend(ownerTabId, 'manual-stop', false);
   }
   for (const [ownerTabId, attempt] of deferredDictationSends) {
+    if (completedBatch(ownerTabId)) continue;
     if (ownerTabId === tabId || attempt.triggerTabId === tabId) deferredDictationSends.delete(ownerTabId);
   }
   for (const [ownerTabId, check] of queueConditionChecks) {
     if (ownerTabId !== tabId && check.triggerTabId !== tabId) continue;
+    if (completedBatch(ownerTabId)) continue;
     queueConditionChecks.delete(ownerTabId);
     notifyPromptQueueRuntime(ownerTabId, 'condition-check-cancelled:manual-stop');
   }
   for (const ownerTabId of queueEditorBlockedOwners) {
+    if (completedBatch(ownerTabId)) continue;
     if (ownerTabId === tabId
       || getEffectiveQueueTrigger(ownerTabId, usePromptQueueStore.getState().getQueue(ownerTabId)) === tabId) {
       queueEditorBlockedOwners.delete(ownerTabId);
@@ -993,7 +1014,7 @@ function beginValidatedQueueMetaAction(
   contextProof?: QueueContextProof,
 ): boolean {
   if (!head.metaAction || queueSendInflight.has(ownerTabId) || !queueItemTriggerCanFire(head)) return false;
-  if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) return false;
+  if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId, head)) return false;
   const queueAtStart = usePromptQueueStore.getState().getQueue(ownerTabId);
   if (queueAtStart.pendingDelivery) {
     void reconcilePromptQueuePendingDelivery(ownerTabId);
@@ -1374,7 +1395,7 @@ function beginValidatedQueueSend(
     return beginValidatedQueueMetaAction(ownerTabId, triggerTabId, head, label, contextProof);
   }
   if (queueSendInflight.has(ownerTabId)) return false;
-  if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) return false;
+  if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId, head)) return false;
   if (isPromptQueueEditorLocked(ownerTabId)) {
     queueEditorBlockedOwners.add(ownerTabId);
     console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8)
@@ -1548,7 +1569,7 @@ function beginValidatedQueueSend(
     }
     const latestQueue = usePromptQueueStore.getState().getQueue(ownerTabId);
     const latestHead = getContinuationPrompt(latestQueue, kind);
-    if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) {
+    if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId, head)) {
       console.log('[PromptQueueRunner] ' + label + ' validation became stale owner=' + ownerTabId.slice(-8)
         + ' expected=' + head.id.slice(-8) + ' actual=' + (latestHead?.id.slice(-8) || '-'));
       return;
@@ -1612,7 +1633,7 @@ function beginValidatedQueueSend(
       clearDeferredOwnerAttempt(ownerTabId, attempt, 'send-boundary-became-stale');
       return;
     }
-    if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) {
+    if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId, head)) {
       queueAwaitingBusyStart.delete(ownerTabId);
       console.log('[PromptQueueRunner] ' + label + ' workflow became blocked before send owner='
         + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8));
@@ -2043,6 +2064,8 @@ function workflowAcceptsNaturalOutcome(queue: TabQueue, outcomeTs: number | null
 }
 
 function pivotTriggerHasFreshCompletion(queue: TabQueue, triggerTabId: string): boolean {
+  const trigger = enabledQueueHead(queue)?.trigger;
+  if (trigger?.kind === 'onTab' && trigger.dependencies) return promptTabTriggerReady(trigger);
   const latestOutcome = processedNaturalOutcomes.get(triggerTabId)?.latestTs;
   return Number.isFinite(latestOutcome)
     && workflowAcceptsNaturalOutcome(queue, Number(latestOutcome))
@@ -2105,8 +2128,9 @@ export function getPromptQueueRuntimeSnapshot(tabId: string) {
           : queueConditionChecks.has(tabId) ? 'checking-condition'
             : isPromptQueueEditorLocked(tabId) ? 'editing'
               : q.firstDelayCountdownAt !== null ? 'countdown'
-                : q.autoRun && !queueItemTriggerCanFire(head) ? 'waiting-app-restart'
-                  : q.autoRun && triggerTabId !== tabId ? 'waiting-dependency'
+                : q.autoRun && head?.trigger?.kind === 'app-restart' && !queueItemTriggerCanFire(head) ? 'waiting-app-restart'
+                  : q.autoRun && triggerTabId !== tabId
+                    && !(head?.trigger?.kind === 'onTab' && head.trigger.dependencies && promptTabTriggerReady(head.trigger)) ? 'waiting-dependency'
                     : q.autoRun ? 'armed' : 'paused';
   const last = getHistoryPromptHandoffsSnapshot(tabId).filter(handoff => String(handoff.source || '').startsWith('prompt-queue'))
     .reduce((latest, value) => !latest || value.submittedAt > latest.submittedAt ? value : latest, null as ReturnType<typeof getHistoryPromptHandoffsSnapshot>[number] | null);
@@ -2150,7 +2174,7 @@ export function readPromptQueueSendAdmission(request: any) {
     ...(intent.baseHandoffId ? { armedAt: intent.armedAt } : {}) }) !== request.handoffId) return cancelled();
   return { ready: !isPromptQueueEditorLocked(tabId) && queueItemTriggerCanFire(head)
     && !dictationBlocksSend(head.text) && !isTabWorkflowBlocked(tabId)
-    && !isTabWorkflowBlocked(intent.triggerTabId) };
+    && !isTabWorkflowBlocked(intent.triggerTabId, head) };
 }
 
 export function subscribePromptQueueRuntime(listener: (tabId: string, reason: string) => void) {
@@ -2253,13 +2277,23 @@ export function usePromptQueueRunner() {
     // ownerTabId = which queue's head to pop (always the queue-owner, never the
     // trigger tab). triggerTabId is only used for diagnostics in logs.
     const fireQueueOwner = (ownerTabId: string, triggerTabId: string): boolean => {
-      const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+      let queue = usePromptQueueStore.getState().getQueue(ownerTabId);
       if (queue.pendingDelivery) { void reconcilePromptQueuePendingDelivery(ownerTabId); return false; }
       const beforePop = countEnabledQueuedPrompts(queue.items);
       if (!queue.autoRun || beforePop === 0) return false;
+      const waitingHead = enabledQueueHead(queue);
+      const outcomeTs = processedNaturalOutcomes.get(triggerTabId)?.latestTs;
+      if (waitingHead?.trigger?.kind === 'onTab' && waitingHead.trigger.dependencies
+        && Number.isFinite(outcomeTs) && !queueOwnerHasPendingContinuation(triggerTabId)) {
+        const retired = usePromptQueueStore.getState().completePromptTabDependency(ownerTabId, waitingHead.id, triggerTabId, Number(outcomeTs));
+        queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+        if (retired) console.log('[PromptQueueRunner] dependency completed owner=' + shortQueueTabId(ownerTabId)
+          + ' item=' + waitingHead.id + ' target=' + shortQueueTabId(triggerTabId)
+          + ' outcomeTs=' + outcomeTs + ' remaining=' + pendingPromptTabIds(enabledQueueHead(queue)?.trigger).length);
+      }
       if (queue.firstDelayCountdownAt !== null) return false;
       if (queueSendInflight.has(ownerTabId)) return false;
-      if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) {
+      if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId, enabledQueueHead(queue))) {
         console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8) + ' workflow is busy → wait before firing trigger=' + triggerTabId.slice(-8));
         return false;
       }
@@ -2296,7 +2330,10 @@ export function usePromptQueueRunner() {
         const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
         if (!queue.autoRun || countEnabledQueuedPrompts(queue.items) === 0) continue;
         if (!workflowAcceptsNaturalOutcome(queue, deferred.outcomeTs)) continue;
-        if (getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true }) !== triggerTabId) continue;
+        const trigger = enabledQueueHead(queue)?.trigger;
+        if (trigger?.kind === 'onTab' && trigger.dependencies
+          ? !promptTabTriggerMatches(trigger, triggerTabId)
+          : getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true }) !== triggerTabId) continue;
         fireQueueOwner(ownerTabId, triggerTabId);
       }
       console.log('[PromptQueueRunner] tab=' + triggerTabId.slice(-12)
@@ -2335,7 +2372,7 @@ export function usePromptQueueRunner() {
       // Pivoted queue can only fire after a successful target outcome newer than
       // this arm. An idle snapshot alone never grants readiness.
       if (!prevBusyRef.has(effectiveTrigger)) return null;
-      if (isTabWorkflowBlocked(effectiveTrigger)) return null;
+      if (isTabWorkflowBlocked(effectiveTrigger, enabledQueueHead(queue))) return null;
       if (!pivotTriggerHasFreshCompletion(queue, effectiveTrigger)) return null;
       return effectiveTrigger;
     };
@@ -2516,7 +2553,10 @@ export function usePromptQueueRunner() {
         // self-clear and fall through to default own-tab behaviour. This is
         // the lazy validation promised in the store schema comment.
         const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, q, { clearStaleTarget: true });
-        if (effectiveTrigger === triggerTabId) owners.push(ownerTabId);
+        const trigger = enabledQueueHead(q)?.trigger;
+        if (trigger?.kind === 'onTab' && trigger.dependencies
+          ? promptTabTriggerMatches(trigger, triggerTabId)
+          : effectiveTrigger === triggerTabId) owners.push(ownerTabId);
       }
       return owners;
     };
@@ -2871,7 +2911,10 @@ export function usePromptQueueRunner() {
           }
           if (isLoopPromptActive(queue)) triggers.add(ownerTabId);
           if (queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0) {
-            triggers.add(getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true }));
+            const trigger = enabledQueueHead(queue)?.trigger;
+            const pending = trigger?.kind === 'onTab' && trigger.dependencies ? pendingPromptTabIds(trigger) : [];
+            if (pending.length) pending.forEach(tabId => triggers.add(tabId));
+            else triggers.add(getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true }));
           }
         }
 
@@ -3383,6 +3426,12 @@ export function usePromptQueueRunner() {
         // own-tab default).
         const effectiveTrigger = getEffectiveQueueTrigger(tabId, q, { clearStaleTarget: true });
 
+        const headTrigger = enabledQueueHead(q)?.trigger;
+        if (headTrigger?.kind === 'onTab' && headTrigger.dependencies && promptTabTriggerReady(headTrigger)) {
+          signalQueueOwnerReadiness(tabId, 'completed-dependency-arm');
+          continue;
+        }
+
         if (effectiveTrigger !== tabId) {
           seedBusySnapshotFromWorkspace(effectiveTrigger, { replace: true });
           console.log('[PromptQueueRunner] pivot armed owner=' + tabId.slice(-8)
@@ -3444,6 +3493,10 @@ export function usePromptQueueRunner() {
     const unsubscribeReconciliation = subscribeWorkflowRestoreReconciliation(() => {
       const current = usePromptQueueStore.getState();
       resumePersistedTimers();
+      for (const [ownerTabId, queue] of current.queues) {
+        if (enabledQueueHead(queue)?.trigger?.kind === 'onTab'
+          && enabledQueueHead(queue)?.trigger?.dependencies) signalQueueOwnerReadiness(ownerTabId, 'restored-dependencies');
+      }
       // Revisit only workflows explicitly armed in this renderer. Persisted
       // queues were already correlated against main-process outcomes above and
       // must never be synthesized as fresh 0→N / false→true edges.

@@ -986,15 +986,6 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.20) !important;
 }
 
-[data-keyboard-focus-owner="sidebar"]
-  [data-split-pane-tab-chip][data-chip-shown="1"]:not([data-chip-active="1"]) {
-  /* Sidebar owns Cmd+T/Cmd+W, but the focused pane still owns one displayed
-     tab. Quiet only shown tabs in the OTHER panes: dimming the active one made
-     a successful sidebar replacement look as if no tab had been selected. */
-  opacity: 0.78 !important;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
-}
-
 /* Действия панели — обычные СОСЕДИ полосы чипов. Внешний ряд и `⋮` живут
    всегда; внутренний Git+split существует в layout только у focus-owner.
 

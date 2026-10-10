@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback, useSyncExtern
 import { createPortal } from 'react-dom';
 import { Activity, ChevronRight, ChevronDown, Folder, Server, SquareTerminal } from 'lucide-react';
 import GlobalProcessControls from './GlobalProcessControls';
+import ResourceApplicationsView, { type ApplicationMetrics } from './ResourceApplicationsView';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -68,6 +69,7 @@ type MetricsPayload = {
   orphans?: { count: number; totalBytes: number; rows: ToolRow[] };
   sharedServices?: ToolRow[];
   totals?: { projectBytes: number; otherBytes: number; allBytes?: number; commandBytes?: number; commandCpu?: number | null };
+  applications?: ApplicationMetrics;
 };
 
 /** Итог для чипа: то же число, что в подписи панели, но без разбора по строкам. */
@@ -81,6 +83,7 @@ type AmbientPayload = {
 };
 
 type Mode = 'memory' | 'cpu';
+type ResourceView = 'noted' | 'system';
 
 // Ширина числа больше не резервируется под «99.99 ГБ». Резерв был виден не сам
 // по себе, а той дырой, которую оставлял между значком и числом: под «6.5 ГБ»
@@ -169,9 +172,13 @@ function commandTotals(groups: TabGroup[], hasCpu: boolean) {
 const ResourceUsageButton: React.FC = () => {
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<Mode>('memory');
+  const [view, setView] = useState<ResourceView>('noted');
+  const viewRef = useRef<ResourceView>('noted');
+  const panelVisit = useRef(0);
   const [metrics, setMetrics] = useState<MetricsPayload | null>(null);
   const [ambient, setAmbient] = useState<AmbientPayload | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [expandedApplications, setExpandedApplications] = useState<Set<string>>(new Set());
   const cmdPressed = useCmdKey();
   const buttonRef = useRef<HTMLButtonElement>(null);
   const preparationStore = historyPreparationStatus();
@@ -274,27 +281,74 @@ const ResourceUsageButton: React.FC = () => {
     };
   }, []);
 
+  useEffect(() => {
+    if (!open) return;
+    const closeResourcePanel = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      setOpen(false);
+    };
+    window.addEventListener('keydown', closeResourcePanel, true);
+    return () => window.removeEventListener('keydown', closeResourcePanel, true);
+  }, [open]);
+
   // Полная раскладка — только пока панель открыта: построчный разбор нужен
   // ровно тому, кто на него смотрит.
+  const acceptMetrics = useCallback((payload: MetricsPayload) => {
+    setMetrics(previous => {
+      if (previous?.scannedAt && payload.scannedAt && previous.scannedAt > payload.scannedAt) return previous;
+      if (previous?.scannedAt === payload.scannedAt && previous?.applications && !payload.applications
+        && viewRef.current === 'system') return previous;
+      return payload;
+    });
+  }, []);
+
   useEffect(() => {
     if (!open) return;
 
     let cancelled = false;
+    panelVisit.current++;
     const onUpdate = (_event: unknown, payload: MetricsPayload) => {
-      if (!cancelled) setMetrics(payload);
+      if (!cancelled) acceptMetrics(payload);
     };
 
     ipcRenderer.on('system:process-metrics', onUpdate);
-    ipcRenderer.invoke('system:process-metrics-subscribe', { projectId: activeProjectId })
-      .then((payload: MetricsPayload) => { if (!cancelled) setMetrics(payload); })
+    ipcRenderer.invoke('system:process-metrics-subscribe', { projectId: activeProjectId, view: viewRef.current })
+      .then((payload: MetricsPayload) => { if (!cancelled) acceptMetrics(payload); })
       .catch(() => { if (!cancelled) setMetrics({ ok: false, reason: 'subscribe-failed' }); });
 
     return () => {
       cancelled = true;
+      panelVisit.current++;
       ipcRenderer.removeListener('system:process-metrics', onUpdate);
       ipcRenderer.invoke('system:process-metrics-unsubscribe').catch(() => {});
     };
-  }, [open, activeProjectId]);
+  }, [open, activeProjectId, acceptMetrics]);
+
+  const changeView = useCallback((next: ResourceView) => {
+    viewRef.current = next;
+    setView(next);
+    const visit = panelVisit.current;
+    // Changes presentation only. The Main service projects its cached snapshot
+    // without restarting the subscription or capturing another process list.
+    ipcRenderer.invoke('system:process-metrics-set-view', { view: next })
+      .then((payload: MetricsPayload) => {
+        if (panelVisit.current === visit && viewRef.current === next && payload.ok) acceptMetrics(payload);
+      })
+      .catch(() => {
+        if (panelVisit.current === visit && viewRef.current === next && next === 'system')
+          setMetrics(previous => previous ? { ...previous, applications: { available: false, reason: 'view-unavailable' } } : previous);
+      });
+  }, [acceptMetrics]);
+
+  const toggleApplication = useCallback((id: string) => {
+    setExpandedApplications(previous => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
 
   const toggleExpanded = useCallback((tabId: string) => {
     setExpanded(previous => {
@@ -477,6 +531,7 @@ const ResourceUsageButton: React.FC = () => {
               style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'transparent' }}
             />
             <div
+              id="noted-resource-usage-panel"
               data-resource-usage-panel
               onClick={event => event.stopPropagation()}
               onMouseDown={event => event.stopPropagation()}
@@ -496,8 +551,13 @@ const ResourceUsageButton: React.FC = () => {
             >
               {/* Шапка: итог и переключатель колонок */}
               <div style={{ padding: '8px 10px', borderBottom: '1px solid #2a2a2a', display: 'flex', alignItems: 'center', gap: 8 }}>
-                <div style={{ fontSize: 9, textTransform: 'uppercase', fontWeight: 700, color: '#777', letterSpacing: '0.05em', flex: 1 }}>
-                  Ресурсы
+                <div role="group" aria-label="Область ресурсов" style={{ display: 'flex', gap: 2, flex: 1 }}>
+                  {(['noted', 'system'] as ResourceView[]).map(item => <button key={item}
+                    data-resource-view={item} aria-pressed={view === item} onClick={() => changeView(item)}
+                    style={{ height: 20, padding: '0 6px', borderRadius: 5, border: '1px solid ' + (view === item ? 'rgba(56,189,248,0.3)' : 'transparent'),
+                      background: view === item ? 'rgba(56,189,248,0.14)' : 'rgba(255,255,255,0.04)', color: view === item ? '#bae6fd' : '#888', fontSize: 10, fontWeight: 700, cursor: 'pointer' }}>
+                    {item === 'noted' ? 'Noted Terminal' : 'Весь ПК'}
+                  </button>)}
                 </div>
                 <div style={{ display: 'flex', gap: 2 }}>
                   {(['memory', 'cpu'] as Mode[]).map(item => (
@@ -534,7 +594,8 @@ const ResourceUsageButton: React.FC = () => {
                 )}
 
                 {metrics && metrics.ok && (
-                  <>
+                  view === 'system' ? <ResourceApplicationsView data={metrics.applications} mode={mode}
+                    expanded={expandedApplications} onToggle={toggleApplication} bytes={formatBytes} value={valueOf} /> : <>
                     {/* Учёт брошенного остаётся в ресурсах. Подтверждение и
                         перечитывание точных MCP PID — в меню MCP-хаба. */}
                     {orphanCount > 0 && (
@@ -798,13 +859,15 @@ const ResourceUsageButton: React.FC = () => {
                   fontVariantNumeric: 'tabular-nums',
                 }}>
                   <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 4 }}>
-                    всего <ResourceValues total={formatBytes(totalBytes)} commands={
+                    {view === 'system' ? 'приложения ' : 'всего '}<ResourceValues total={view === 'system'
+                      ? metrics.applications?.available ? valueOf(metrics.applications.totalBytes, metrics.applications.totalCpu) : '—'
+                      : formatBytes(totalBytes)} commands={view === 'system' ? null :
                       (metrics.totals?.commandBytes ?? projectsCommands.bytes) === 0 ? null
                         : typeof metrics.totals?.commandBytes === 'number'
                           ? formatBytes(metrics.totals.commandBytes) : projectsCommands.bytes == null ? '—' : formatBytes(projectsCommands.bytes)} />
                   </span>
                   {mode === 'cpu' && !metrics.hasCpu && <span>замеряю нагрузку…</span>}
-                  {metrics.durationMs !== undefined && <span>{metrics.durationMs.toFixed(0)} мс</span>}
+                  {metrics.durationMs !== undefined && <span>{(metrics.durationMs + (view === 'system' ? metrics.applications?.durationMs || 0 : 0)).toFixed(0)} мс</span>}
                 </div>
               )}
             </div>

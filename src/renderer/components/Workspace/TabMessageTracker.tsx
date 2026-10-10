@@ -39,7 +39,7 @@ export function TabMessageRow({ thread, tabId, onOpen, onDismiss, error, history
       {error ? <CircleAlert size={13} /> : <X size={13} />}
     </button>}>
       <TabMessageSourceChip source={tabMessagePeer(thread)} variant="row" incoming={thread.incoming} rowColor={presentation.color}
-        leadingIcon={<RequestTrackerStatus data-tab-message-status-icon={presentation.icon} title={presentation.label}>
+        leadingIcon={!history && presentation.icon === 'sending' ? undefined : <RequestTrackerStatus data-tab-message-status-icon={presentation.icon} title={presentation.label}>
           <DeliveryIcon presentation={presentation} header />
         </RequestTrackerStatus>} />
       {history && <time style={{ color: '#777', fontSize: 9, flexShrink: 0, padding: '0 4px' }}>

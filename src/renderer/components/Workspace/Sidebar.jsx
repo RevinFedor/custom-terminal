@@ -27,6 +27,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore'
 import { useUIStore } from '../../store/useUIStore'
 import { getValue, setValue } from '../../utils/storage'
 import { linkedFileSessionChipSnapshot } from '../../utils/linkedFileSessionChips.mjs'
+import { useCommandHierarchyHint } from '../../hooks/useCommandHierarchyHint'
 
 const CUSTOM_TERMINAL_ICON_IMPORT_KEY = import.meta.env.DEV
   ? 'customTerminalDevelopment'
@@ -436,6 +437,7 @@ function Sidebar({
   const [focusedId, setFocusedId] = useState(null) // ID of node with focus border (VS Code style)
   const [localSidebarFocused, setLocalSidebarFocused] = useState(false)
   const sidebarRef = useRef(null)
+  useCommandHierarchyHint(sidebarRef)
   const effectiveSidebarFocused = sidebarFocused || localSidebarFocused
   const [multiSelected, setMultiSelected] = useState(new Set()) // Multi-selection (Cmd+Click, Shift+Click)
   const lastClickedRef = useRef(null) // Anchor for Shift+Click range selection
@@ -1846,6 +1848,7 @@ function Sidebar({
       >
         {treeData.length > 0 && (
           <FileOutlineExplorer
+             hierarchyModifier="meta"
              key={folderPath}
              treeData={treeData}
              folderPath={folderPath}

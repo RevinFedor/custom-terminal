@@ -18,7 +18,7 @@ try {
       b.onLoad({filter:/.*/,namespace:'fixture'},args=>({loader:'tsx',resolveDir:repo,contents:args.path==='TabCard'
         ? `import React from 'react';export default React.forwardRef(({children,projectId,tabId,fullWidth,sharedActivity,selected,interactiveStatus,onLinkedFileOpen,as,...props},ref)=><span {...props} ref={ref} data-tab-card style={{display:'flex',alignItems:'center',boxSizing:'border-box',height:tabId==='Q'?52:32,padding:'4px 8px',background:selected?'#36574c':'#292e30',border:'1px solid #788',borderRadius:5,color:'#ddd'}}>{children}</span>);`
         : args.path==='TabBar' ? `export const TAB_RENAME_REQUEST_EVENT='fixture-rename';export const openTabContextMenuAt=()=>{};`
-          : args.path==='tabLinkedFilePreview' ? `export const openTabLinkedFile=()=>{};` : `export default function(){return null;}`}));
+          : args.path==='tabLinkedFilePreview' ? `export const openTabLinkedFile=()=>{};export const dismissTabLinkedFile=()=>{};` : `export default function(){return null;}`}));
     }}]});
   await fs.writeFile(path.join(artifact,'index.html'),`<html><head><link rel="stylesheet" href="bundle.css"></head><body style="margin:0;background:#171717;color:#ccc;font-family:Arial"><div id="root"></div><script>${shim}</script><script src="bundle.js"></script></body></html>`);
   await fs.writeFile(path.join(artifact,'main.cjs'),`const {app,BrowserWindow}=require('electron');app.setPath('userData',${JSON.stringify(path.join(artifact,'profile'))});app.whenReady().then(()=>{const win=new BrowserWindow({show:false,focusable:false,width:900,height:650,webPreferences:{nodeIntegration:true,contextIsolation:false,backgroundThrottling:false,offscreen:true}});win.loadFile(${JSON.stringify(path.join(artifact,'index.html'))});});`);
@@ -32,7 +32,7 @@ try {
   await page.screenshot({path:path.join(artifact,'initial.png')});
   const frames=()=>page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   const snapshot=()=>page.evaluate(()=>window.fixture.snapshot());
-  const reset=async options=>{await page.evaluate(options=>window.fixture.reset(options),options || {});await frames();};
+  const reset=async options=>{await page.keyboard.up('Meta');await page.evaluate(options=>window.fixture.reset(options),options || {});await frames();};
   const point=async id=>{const row=await page.locator(`[data-node-id="reserve-tab:${id}"]`).boundingBox();assert.ok(row);return{x:row.x+90,y:row.y+row.height/2};};
   const pickup=async id=>{const p=await point(id);await page.mouse.move(p.x,p.y);await page.mouse.down();await page.mouse.move(p.x+5,p.y);await frames();return p;};
   const end=async()=>{await page.mouse.up();await frames();};
@@ -46,20 +46,20 @@ try {
   assert.deepEqual(commits[0].request.workflows.find(row=>row.workflowId==='w1').reserveOrder,s.rows.map(row=>row.id.replace('reserve-tab:','')));
   result.checks.push('A,Q,B pickup B: original pickup, frozen full forest, painted Y=commit once');
 
-  await reset();const p=await pickup('B');await page.mouse.move(p.x+55,p.y);await frames();
+  await reset();const p=await pickup('B');await page.keyboard.down('Meta');await page.mouse.move(p.x+55,p.y);await frames();
   assert.equal(await page.locator('[data-outline-tab-feedback-blocked="true"]').count(),1);await page.keyboard.press('Escape');await page.mouse.up();await frames();
   assert.equal((await committed()).length,0);result.checks.push('multi-X blocked; Escape cancels transport and projection');
 
-  await reset({selected:['B']});const single=await pickup('B');await page.mouse.move(single.x+55,single.y);await frames();
+  await reset({selected:['B']});const single=await pickup('B');await page.keyboard.down('Meta');await page.mouse.move(single.x+55,single.y);await frames();
   s=await snapshot();assert.equal(s.rows.find(row=>row.id==='reserve-tab:B').parent,'reserve-tab:Q');await end();
   assert.equal((await committed()).length,1);result.checks.push('single-X still reparents in painted preview');
 
-  await reset({file:true,selected:['child']});const fileSource=await pickup('child');
+  await reset({file:true,selected:['child']});const fileSource=await pickup('child');await page.keyboard.down('Meta');
   await page.mouse.move(fileSource.x-65,fileSource.y);await frames();s=await snapshot();
   assert.equal(s.rows.find(row=>row.id==='reserve-tab:child').parent,'root');await end();
   assert.equal((await committed())[0].request.tabs.find(tab=>tab.tabId==='child').visualParentTabId,null);
   result.checks.push('linked file X-outdent uses ordinary visual hierarchy, preview matches committed parent');
-  await reset({physical:true,selected:['child']});const physicalSource=await pickup('child');
+  await reset({physical:true,selected:['child']});const physicalSource=await pickup('child');await page.keyboard.down('Meta');
   await page.mouse.move(physicalSource.x-65,physicalSource.y);await frames();
   assert.equal(await page.locator('[data-outline-tab-feedback-blocked="true"]').count(),1);
   await page.keyboard.press('Escape');await page.mouse.up();await frames();assert.equal((await committed()).length,0);
@@ -91,7 +91,7 @@ try {
   s=await snapshot();assert.deepEqual(s.rows.filter(row=>row.source==='true').map(row=>row.id),['reserve-tab:A','reserve-tab:child','reserve-tab:B']);
   await end();await page.keyboard.up('Meta');commits=await committed();assert.equal(commits.length,1);
   assert.deepEqual(commits[0].request.workflows.find(row=>row.workflowId==='w2').reserveOrder,s.rows.map(row=>row.id.replace('reserve-tab:','')));
-  result.checks.push('several pane roots -> workflow -> painted Cmd-end, exactly one release');
+  result.checks.push('several pane roots -> workflow -> normal bottom slot with Cmd, exactly one painted release');
 
   await reset({pane:true,destination:true});
   await page.mouse.move(source.x+20,source.y+15);await page.mouse.down();await page.mouse.move(source.x+27,source.y+15);await frames();
@@ -101,7 +101,7 @@ try {
   commits=await committed();assert.equal(commits.length,1);assert.deepEqual(commits[0].request.sourceRootTabIds,['A','B']);
   assert.deepEqual(commits[0].request.workflows.find(row=>row.workflowId==='w2').reserveOrder,s.rows.map(row=>row.id.replace('reserve-tab:','')));
   assert.ok(s.rows.findIndex(row=>row.id==='reserve-tab:A')<s.rows.findIndex(row=>row.id==='reserve-tab:Q'));
-  result.checks.push('pane Cmd-up resumes exact Y positioning of whole forest among destination rows');
+  result.checks.push('pane modifier changes preserve exact Y positioning of whole forest among destination rows');
 
   await reset();await pickup('B');
   await page.evaluate(()=>window.fixture.store.setState({workflowSidebarState:{w1:{selectedTabIds:['Q']}}}));

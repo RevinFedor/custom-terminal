@@ -456,10 +456,36 @@ SOURCE07.10 проверен real SQLite/actual IPC и private Electron UI, не
 PTY scenario. Native acceptance (`QUEUED`) остаётся промежуточной границей:
 следующий item получает ход после exact canonical audit предыдущего, даже
 если ответ ещё streaming. Generic success, очередь TUI, timeout, чужой audit и
-потеря ответа не освобождают slot. Доказанный отказ завершает свою попытку без
+потеря ответа сами не освобождают slot того же физического input. Доказанный отказ завершает свою попытку без
 повторного Enter, но не отменяет проверки чужого composer у следующей.
 Повтор handoff читает прежнюю операцию; другой payload с тем же ID — конфликт,
 одинаковый текст с разными ID — разные items.
+
+Delivery evidence, отмена намерения и право держать input — разные оси. Main
+сохраняет exact physical lease при durable Enter-arm. После окончания текущего
+executor отменённое пользователем намерение, успешный process lookup `absent`
+либо доказанный новый ready owner снимают только старый slot. Перед commit
+сверяются тот же head/attempt, generation/run/input revision и current owner.
+Ошибка lookup — unknown; idle/пустой composer того же живого owner не достаточны.
+Старый payload/attempt/submitted/audit не переписывается, старый Enter не повторяется;
+следующий исходный snapshot проходит прежний общий Send. Runtime-события будят
+один coalesced read, не polling; same-live-owner fast path не читает History.
+SDK не получает выдуманный PTY-proof. Cancel и canonical receipt действуют через
+общих владельцев, а автоматический physical-owner retirement ограничен PTY.
+
+`deliveryControl` хранится отдельно от изменяемой квитанции; компактный marker
+отменённого operation ID переживает receipt-prune, без повторного prompt body.
+Pre-write guard читает durable отмену даже после потери process-local callback.
+Старый attempt ID проверяется ДО waiting-cancel, иначе поздний Stop отменяет
+уже новую ожидающую попытку. `inputSlot:{version:1,state:'retired'}`/legacy
+`applicationQueue.state:'released-unknown'` — disposition, не delivery result.
+Историческое `providerQueueAccepted` не проецируется в текущий `QUEUED` после
+retirement/cancel; эти поля проходят и live packet, и list/remount/HTTP.
+Поздний exact audit всё ещё может подтвердить старую доставку и закрыть её asset
+ownership, но не возобновляет отменённое намерение. Unknown bytes удерживаются.
+Шрам507: старый скрытый MCP head пережил restart, держал новые sends, а после
+ручного release снова появился как QUEUED без нового Enter. Одного скрытия
+или фикса busy недостаточно; источник ошибки — смешение этих осей.
 
 Completion caller резервирует stable `history:<sourceTabId>:orchestration-complete:<runId>`
 до первого входа в FIFO/renderer. Вход без operationKey регистрировался в memory,
@@ -498,14 +524,15 @@ snapshot до temp/context read; original body не меняется, unknown н
 
 После restart сначала reconcile прежних receipts, затем подключение App bridge
 разрешает dispatch. Waiting без physical attempt продолжает прежний snapshot;
-entered/unknown не повторяет отправку и держит следующих. Закрытие одной
+entered/unknown не повторяет отправку; его slot переоценивается отдельно по
+описанному Main physical-owner proof, не по отрицательному audit. Закрытие одной
 renderer-поверхности не отзывает готовность другого живого App renderer.
 Уже существовавшие legacy unknown receipts не переписываются этой миграцией.
 
 #### Адресный Повтор Audit Квитанции
 
-После restart старый provider-owned head может остаться delivery-unknown даже
-при idle/inputReady нового процесса. GET send-receipts лишь читает сохранённое
+После restart старый provider-owned receipt может остаться delivery-unknown даже
+после освобождения slot для нового процесса. GET send-receipts лишь читает сохранённое
 startup-решение; он не запускает новый scan. Ожидающий follower нельзя оживлять
 новым Send, скрытием head или fake not-submitted. Поздний точный transcript-proof
 можно отдельно сверить существующим аудитором через Application API:

@@ -26,6 +26,7 @@ import {
   type TabQueue,
 } from '../../store/usePromptQueueStore';
 import { useAutoCompactStore } from '../../store/useAutoCompactStore';
+import { hydrateIdleSessionStopStore, updateIdleSessionStopPolicy, useIdleSessionStopStore } from '../../store/useIdleSessionStopStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -34,14 +35,14 @@ import {
   type AutomationTab,
 } from '../../hooks/useAutomationInventory';
 import { cancelPendingAutoCompact, requestAutoCompactNow } from '../../hooks/usePromptQueueRunner';
-import { autoCompactIncludesTarget, selectedAutoCompactScope, toggleAutoCompactScope, UNPLACED_AUTOMATION_WORKFLOW } from '../../utils/autoCompactPolicy.mjs';
+import { autoCompactIncludesTarget, selectedAutoCompactScope, UNPLACED_AUTOMATION_WORKFLOW } from '../../utils/autoCompactPolicy.mjs';
 import { summarizeRunningAutoCompacts } from '../../utils/autoCompactActivityPresentation.mjs';
-import WorkflowChip from './WorkflowChip';
+import { AutomationWorkflowSelect } from './AutomationWorkflowSelect';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { pointInHoverCluster, pointInRect } from '../../utils/hoverBridge.mjs';
 import { captureQueueHoverReturn, createHoverReturnGate, hasOwnedClickPopup, isOwnedQueueChildDismiss,
   queueOwnsPopup, QUEUE_CLICK_CHILD_CLOSED } from '../../utils/hoverReturnGate.mjs';
-import { layoutRunAfterCards, routeRunAfterEdges, retainRunAfterGroups, RUN_AFTER_GROUP_INSET, RUN_AFTER_DEPTH_INSET } from '../../utils/runAfterDependencyLayout.mjs';
+import { layoutRunAfterCards, routeRunAfterEdges, retainRunAfterGroups, runAfterEdgeKey, RUN_AFTER_GROUP_INSET, RUN_AFTER_DEPTH_INSET } from '../../utils/runAfterDependencyLayout.mjs';
 import { selectRunAfterOverview } from '../../utils/runAfterInventory.mjs';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 import { retainPanelPosition, scrollMovesAnchor } from '../../utils/anchoredPanelPosition.mjs';
@@ -243,7 +244,7 @@ function AutoCompactRunningIndicator({ count, scope }: { count: number; scope: s
 
 type Candidate = { tab: AutomationTab; percent: number; stopped: boolean };
 
-function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContentWidth }: {
+function AutomationSettingsPage({ inventory, busy, widthLimit, resizeEnabled, onContentWidth }: {
   inventory: ReturnType<typeof useAutomationInventory>;
   busy: Map<string, boolean>;
   widthLimit: number;
@@ -251,6 +252,21 @@ function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContent
   onContentWidth: (width: number) => void;
 }) {
   const contentRef = useRef<HTMLDivElement>(null);
+  const settingsOwner = useId();
+  const idlePolicy = useIdleSessionStopStore(state => state.policy);
+  const idleHydrated = useIdleSessionStopStore(state => state.hydrated);
+  const idleError = useIdleSessionStopStore(state => state.error);
+  const idleMinutesInput = useRef<HTMLInputElement>(null);
+  const [idleMinutes, setIdleMinutes] = useState(String(idlePolicy.minutes));
+  useEffect(() => { void hydrateIdleSessionStopStore(); }, []);
+  useEffect(() => {
+    if (document.activeElement !== idleMinutesInput.current) setIdleMinutes(String(idlePolicy.minutes));
+  }, [idlePolicy.minutes]);
+  const saveIdleMinutes = () => {
+    const minutes = Math.max(1, Math.min(10080, Math.round(Number(idleMinutes) || idlePolicy.minutes)));
+    setIdleMinutes(String(minutes));
+    if (minutes !== idlePolicy.minutes) void updateIdleSessionStopPolicy({ minutes });
+  };
   useLayoutEffect(() => {
     const content = contentRef.current;
     if (!content) return;
@@ -282,10 +298,6 @@ function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContent
   const update = useAutoCompactStore.getState().updatePolicy;
 
   const scope = selectedAutoCompactScope(policy);
-  const toggleScope = (action: { kind: 'all' | 'unplaced' } | { kind: 'workflow'; id: string }) => {
-    update(toggleAutoCompactScope(useAutoCompactStore.getState().policy, action));
-  };
-
   const selectedWorkflowNames = inventory.groups
     .filter((group: any) => group.id !== UNPLACED_AUTOMATION_WORKFLOW && scope.workflowIds.includes(group.id))
     .map((group: any) => group.name);
@@ -332,11 +344,13 @@ function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContent
   };
 
   return (
-    <div ref={contentRef} data-global-auto-compact style={{ padding: '10px 2px 4px', width: 'max-content',
+    <div ref={contentRef} data-global-auto-compact data-prompt-queue-hover-owner={settingsOwner}
+      style={{ padding: '10px 2px 4px', width: 'max-content',
       maxWidth: Math.max(1, widthLimit - 28), boxSizing: 'border-box' }}>
       <div style={{ position: 'relative', border: '1px solid #343434', borderRadius: 8, padding: '19px 10px 10px' }}>
         <div style={{ position: 'absolute', top: 0, left: 10, transform: 'translateY(-50%)', display: 'inline-flex',
           alignItems: 'center', gap: 4, padding: '0 4px', background: '#181818' }}>
+          <span style={{ marginRight: 4, color: '#bbb' }}>Auto-compact</span>
           <label title="Порог использованного контекста" style={{ height: 25, display: 'inline-flex', alignItems: 'center',
             gap: 3, padding: '0 6px', border: '1px solid #383838', borderRadius: 6, background: '#1e1e1e',
             color: policy.enabled ? AUTO_COMPACT_ACTIVE_COLOR : '#999', boxSizing: 'border-box' }}>
@@ -347,28 +361,15 @@ function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContent
           </label>
         </div>
 
-        <div style={{ color: '#8c8c92', fontSize: 10.5, marginBottom: 7 }}>
-          После новых завершённых ответов · область: {scopeText || 'не выбрана'}
-        </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-          <ChoiceChip selected={scope.allWorkflows} disabled={!hydrated} onClick={() => toggleScope({ kind: 'all' })}>
-            Все workflow
-          </ChoiceChip>
-          {inventory.groups.map((group: any) => {
-            const unplaced = group.id === UNPLACED_AUTOMATION_WORKFLOW;
-            const selectedGroup = unplaced ? scope.includeUnplaced : scope.allWorkflows || scope.workflowIds.includes(group.id);
-            const runningCount = running.workflowCounts.get(group.id) || 0;
-            return (
-              <WorkflowChip key={group.id} workflowId={group.id} label={group.name} icon={group.icon}
-                data-auto-compact-workflow-chip={group.id} unplaced={unplaced}
-                selected={selectedGroup} disabled={!hydrated || (!unplaced && scope.allWorkflows)}
-                title={group.projectNames.length ? group.projectNames.join(', ') : undefined}
-                onClick={() => toggleScope(unplaced ? { kind: 'unplaced' } : { kind: 'workflow', id: group.id })}>
-                {selectedGroup && <Check aria-hidden size={11} strokeWidth={2.5} style={{ flexShrink: 0 }} />}
-                {runningCount > 0 && <AutoCompactRunningIndicator count={runningCount} scope={group.id} />}
-              </WorkflowChip>
-            );
-          })}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <AutomationWorkflowSelect name="Auto-compact" owner={settingsOwner} groups={inventory.groups}
+            disabled={!hydrated} all={scope.allWorkflows}
+            selectedIds={[...scope.workflowIds, ...(scope.includeUnplaced ? [UNPLACED_AUTOMATION_WORKFLOW] : [])]}
+            onChange={(ids, all) => update({ enabled: all || ids.length > 0, scopeInitialized: true, allWorkflows: all,
+              workflowIds: ids.filter(id => id !== UNPLACED_AUTOMATION_WORKFLOW), includeUnplaced: ids.includes(UNPLACED_AUTOMATION_WORKFLOW) })}
+            trailing={id => { const count = running.workflowCounts.get(id) || 0;
+              return count > 0 ? <AutoCompactRunningIndicator count={count} scope={id} /> : null; }} />
+          <span style={{ color: '#8c8c92', fontSize: 10.5 }}>После ответа</span>
         </div>
       </div>
 
@@ -419,6 +420,30 @@ function AutoCompactPage({ inventory, busy, widthLimit, resizeEnabled, onContent
           }} style={button}>Отменить ожидание</button>}
         </div>}
       </div>}
+      <div data-global-idle-stop style={{ position: 'relative', marginTop: 23, border: '1px solid #343434',
+        borderRadius: 8, padding: '19px 10px 10px' }}>
+        <div style={{ position: 'absolute', top: 0, left: 10, transform: 'translateY(-50%)', background: '#181818',
+          display: 'inline-flex', alignItems: 'center', gap: 7, padding: '0 4px', color: '#bbb' }}>
+          <span>Auto-stop</span>
+          <label style={{ height: 25, display: 'inline-flex', alignItems: 'center', gap: 4, padding: '0 6px',
+            border: '1px solid #383838', borderRadius: 6, background: '#1e1e1e', color: '#c4b5fd' }}>
+            <input ref={idleMinutesInput} aria-label="Время до автоостановки, минут" className="gra-number" type="number" min={1} max={10080}
+              value={idleMinutes} disabled={!idleHydrated} onChange={event => setIdleMinutes(event.target.value)}
+              onBlur={saveIdleMinutes} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}
+              style={{ width: 36, padding: 0, border: 0, outline: 0, background: 'transparent', color: 'inherit', font: 'inherit', textAlign: 'right' }} />min
+          </label>
+        </div>
+        <AutomationWorkflowSelect name="Auto-stop" owner={settingsOwner} groups={inventory.groups.filter(group => group.id !== UNPLACED_AUTOMATION_WORKFLOW)}
+          disabled={!idleHydrated} all={idlePolicy.allWorkflows} selectedIds={idlePolicy.workflowIds}
+          onChange={(workflowIds, allWorkflows) => void updateIdleSessionStopPolicy({ workflowIds, allWorkflows })} />
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 7, color: '#999', fontSize: 11 }}>
+          <input type="checkbox" checked={idlePolicy.includeAlreadyIdle} disabled={!idleHydrated}
+            onChange={event => void updateIdleSessionStopPolicy({ includeAlreadyIdle: event.target.checked })}
+            style={{ margin: 0, accentColor: '#a78bfa' }} />Включая уже простаивающие
+        </label>
+        <div style={{ color: '#777', fontSize: 10.5, marginTop: 5 }}>Процесс остановится; вкладка и история останутся.</div>
+        {idleError && <div role="alert" style={{ color: '#d8a174', fontSize: 11, marginTop: 5 }}>Настройка не сохранена: {idleError}</div>}
+      </div>
     </div>
   );
 }
@@ -539,9 +564,10 @@ function QueueOverview({ inventory, queues, busy, beforeCloseRef, layoutMemoryRe
       onContentWidth(Math.max(layout.width, shelfWidth + RUN_AFTER_GROUP_INSET, emptyWidth + 8) + inset);
       const headerMap = new Map(snapshots.map(item => [item.id, item]));
       const connections = new Map(routeRunAfterEdges({ ...layout, edges: visibleEdges, anchors: headerMap })
-        .map(edge => [edge.source + ':' + edge.itemId, edge]));
+        .map(edge => [runAfterEdgeKey(edge), edge]));
       for (const path of svgRef.current?.querySelectorAll<SVGPathElement>('[data-run-after-edge-item]') || []) {
-        const edge = connections.get(path.dataset.runAfterEdgeOwner + ':' + path.dataset.runAfterEdgeItem);
+        const edge = connections.get(runAfterEdgeKey({ source: path.dataset.runAfterEdgeOwner,
+          itemId: path.dataset.runAfterEdgeItem, target: path.dataset.runAfterEdgeTarget }));
         if (path.getAttribute('d') !== (edge?.d || '')) path.setAttribute('d', edge?.d || '');
         const dot = path.nextElementSibling;
         dot?.setAttribute('visibility', edge ? 'visible' : 'hidden');
@@ -577,7 +603,7 @@ function QueueOverview({ inventory, queues, busy, beforeCloseRef, layoutMemoryRe
       <defs><marker id={markerId} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
         <path d="M 0 0 L 8 4 L 0 8 z" fill="#9b83e3" />
       </marker></defs>
-      {visibleEdges.map(edge => <g key={edge.source + ':' + edge.itemId}><path data-run-after-edge={edge.kind}
+      {visibleEdges.map(edge => <g key={runAfterEdgeKey(edge)}><path data-run-after-edge={edge.kind}
         data-run-after-edge-owner={edge.source} data-run-after-edge-target={edge.target} data-run-after-edge-item={edge.itemId}
         fill="none" stroke={edge.kind === 'current' ? '#9b83e3' : '#676072'} strokeWidth={1.2}
         strokeDasharray={edge.kind === 'current' ? undefined : '3 3'} markerEnd={`url(#${markerId})`} />
@@ -912,15 +938,12 @@ export function GlobalRunAfterControl() {
           display: 'inline-flex', gap: 4, alignItems: 'center', padding: '0 4px', background: '#181818', zIndex: 3 }}>
           <button type="button" className="gra-page" onClick={() => switchPage('queues')} aria-pressed={page === 'queues'}
             style={{ ...button, height: 28, padding: '0 9px', color: page === 'queues' ? '#e6bb8b' : '#929297',
-              borderColor: page === 'queues' ? '#79583b' : '#363636' }}>Очереди · {activeCount}</button>
+              borderColor: page === 'queues' ? '#79583b' : '#363636' }}>Queues · {activeCount}</button>
           <button type="button" className="gra-page" onClick={() => switchPage('compact')} aria-pressed={page === 'compact'}
             style={{ ...button, height: 28, padding: '0 9px', display: 'inline-flex', alignItems: 'center', gap: 5,
               color: page === 'compact' ? '#e6bb8b' : '#929297',
               borderColor: page === 'compact' ? '#79583b' : '#363636' }}>
-            <span>Автокомпакт</span>
-            {policy.enabled && <span data-global-run-after-auto-compact-threshold
-              style={{ color: AUTO_COMPACT_ACTIVE_COLOR }}>· ≥{policy.percent}%</span>}
-            {runningCompacts.total > 0 && <AutoCompactRunningIndicator count={runningCompacts.total} scope="global" />}
+            <span>Settings</span>
           </button>
           <button type="button" className="gra-page" data-global-run-after-resize-toggle
             aria-label="Настроить размер" aria-pressed={panelSize.resizeEnabled}
@@ -937,7 +960,7 @@ export function GlobalRunAfterControl() {
         <div ref={panelContentRef} data-global-run-after-content style={{ flex: panelSize.resizeEnabled ? 1 : '0 1 auto', minHeight: 0,
           maxHeight: panelSize.resizeEnabled ? 'none' : Math.max(0, position.height - 28),
           overflow: 'auto', scrollbarGutter: 'stable' }}>
-          {page === 'compact' ? <AutoCompactPage inventory={inventory} busy={busy} widthLimit={position.width}
+          {page === 'compact' ? <AutomationSettingsPage inventory={inventory} busy={busy} widthLimit={position.width}
             resizeEnabled={panelSize.resizeEnabled} onContentWidth={onContentWidth} /> :
             <QueueOverview inventory={inventory} queues={queues} busy={busy} beforeCloseRef={beforeCloseRef}
               layoutMemoryRef={layoutMemoryRef} widthLimit={position.width} resizeEnabled={panelSize.resizeEnabled} onContentWidth={onContentWidth}

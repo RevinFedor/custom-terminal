@@ -21,7 +21,7 @@ function finish(cancelled:boolean,reason='release') {
   clearTabDragNavigationTarget('sidebar');
 }
 
-/** Physical ownership outlives a reserve host replaced by Cmd navigation. */
+/** Physical ownership outlives a reserve host replaced by workflow hover. */
 export function beginReserveDragTransport(admission:any,point:Point,sourceNode:any) {
   finish(true,'new-gesture');
   const source:PaneTabDragSource={owner:'sidebar',input:'pointer',gestureId:admission.gestureId,

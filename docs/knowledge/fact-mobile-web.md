@@ -982,6 +982,13 @@ physical остаток — `docs/tmp/claude-startup-failure-audit-2026-09-14.md
 
 *Телефон управляет прежним Root store/runner; новая квитанция описывает application mutation, не доставку provider prompt. Потерянный HTTP ACK не разрешает новую операцию.*
 
+С10.10 desktop onTab может содержать `dependencies[{tabId,armedAt,completedAt?}]`
+для ожидания всех выбранных вкладок. GET/SSE и прежний SQLite owner сохраняют
+частичный прогресс. `setTrigger` валидирует всю группу и сам ставит время выбора;
+присланные клиентом completedAt не становятся proof. Legacy `onTab.tabId`
+поддерживается. Это расширение общего scheduling/metadata, не новая native UI
+приёмка: форма массового выбора в iOS этим этапом не добавлялась.
+
 Gate — `/me.capabilities.runAfter.version === 1`, не `sendQueue`. Опт-in GET прежнего tab route `?runAfter=1` возвращает прежние `queue/aiTabs` плюс `runAfter`: logical configuration scope, opaque Main+renderer epoch, authoring revision/order/guard, отдельный viewRevision, editor/countdown/runtime. `includeActions=1` возвращает общий desktop model/effort catalog; Think/Fast остаются live-настройками, не свойствами prompt. Reader соединяет данные с origin подключения; configuredSessionId не выдаётся за writer proof. MainScopeKey привязан к настоящему conversation owner. SSE `queue-update` несёт тот же block; `project-activity.runAfter` — coalesced wake, не копия prompt bodies. После reconnect/new epoch нужен свежий GET; меньшие revision/viewRevision и ответы старого запроса не откатывают состояние.
 
 Handshake явно публикует `/me.capabilities.runAfter.mainEpoch` текущего operation

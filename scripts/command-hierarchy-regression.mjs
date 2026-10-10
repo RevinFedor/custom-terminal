@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';import path from 'node:path';import os from 'n
 import {fileURLToPath} from 'node:url';import assert from 'node:assert/strict';
 import {build} from 'esbuild';import {_electron as electron} from 'playwright';
 const repo=fileURLToPath(new URL('..',import.meta.url)),artifact=await fs.mkdtemp(path.join(os.tmpdir(),'noted-command-hierarchy-'));
-const result={artifact,checks:[],errors:[],pass:false};let app;
+const result={artifact,checks:[],errors:[],pass:false};let app,page;
 try {
   await build({entryPoints:[path.join(repo,'scripts/fixtures/command-hierarchy.tsx')],outfile:path.join(artifact,'bundle.js'),
     bundle:true,platform:'browser',format:'iife',jsx:'automatic',target:'chrome120',logLevel:'silent',
@@ -17,7 +17,7 @@ try {
     const w=new BrowserWindow({show:false,width:1000,height:600,webPreferences:{offscreen:true,backgroundThrottling:false}});w.webContents.on('paint',()=>{});w.loadFile(${JSON.stringify(path.join(artifact,'index.html'))});});app.on('window-all-closed',()=>app.quit());`);
   const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
   app=await electron.launch({args:[path.join(artifact,'main.cjs')],cwd:artifact,env});result.pid=app.process().pid;
-  const page=await app.firstWindow();page.on('pageerror',e=>result.errors.push(e.message));page.setDefaultTimeout(5000);
+  page=await app.firstWindow();page.on('pageerror',e=>result.errors.push(e.message));page.setDefaultTimeout(5000);
   const frames=()=>page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   const row=(id,panel='terminal')=>page.locator(`[data-panel="${panel}"] [data-node-id="${id}"]`);
   const reset=async()=>{await page.keyboard.up('Meta');await page.keyboard.press('Escape');await page.mouse.up();await page.evaluate(()=>{window.fixture.panels.terminal.reset();window.fixture.panels.legacy.reset();window.fixture.commits=[];});await frames();};
@@ -40,15 +40,19 @@ try {
   await reset();const old=await pickup('b','legacy');await page.mouse.move(old.x+55,old.y);await frames();assert.equal(await row('b','legacy').getAttribute('data-parent-id'),'a');
   await page.keyboard.press('Escape');await page.mouse.up();await frames();assert.equal(await row('b','legacy').getAttribute('data-depth'),'0');
   result.checks.push('default legacy client retains plain X and cancel');
-  await reset();const nav=await pickup('c');await page.keyboard.down('Meta');await row('folder').hover();
+  await reset();const nav=await pickup('c');const folder=await row('folder').boundingBox();
+  await page.mouse.move(folder.x+70,folder.y+folder.height/2,{steps:20});
   await page.waitForSelector('[data-panel="terminal"] [data-node-id="child"]');await page.keyboard.press('Escape');await page.mouse.up();await page.keyboard.up('Meta');await frames();
-  assert.equal(await row('child').count(),0);result.checks.push('Cmd foreign-folder dwell remains, Escape restores temporary expansion');
+  assert.equal(await row('child').count(),0);result.checks.push('plain foreign-folder hover expands without Cmd, Escape restores temporary expansion');
   const file=row('/fixture/two.md','file-explorer'),fr=await file.boundingBox();await page.mouse.move(fr.x+55,fr.y+14);await page.mouse.down();
   await page.mouse.move(fr.x+61,fr.y+14);await frames();await page.mouse.move(fr.x+115,fr.y+14);await frames();assert.equal(await file.getAttribute('data-depth'),'0');
   await page.keyboard.down('Meta');await page.mouse.move(fr.x+166,fr.y+14);await frames();assert.equal(await file.getAttribute('data-depth'),'1');
   await page.keyboard.press('Escape');await page.mouse.up();await page.keyboard.up('Meta');await frames();assert.equal(await file.getAttribute('data-depth'),'0');
   result.checks.push('actual FileOutlineExplorer opts in; plain X stable, Cmd X visual nesting, cancel has no filesystem side effect');
   assert.deepEqual(result.errors,[]);result.pass=true;
-}catch(error){result.errors.push(error.stack||String(error));process.exitCode=1;}
+}catch(error){result.errors.push(error.stack||String(error));process.exitCode=1;
+  if(page){result.failure=await page.evaluate(()=>({logs:window.fixture.logs,drag:window.fixture.panels.terminal.state(),
+    rows:[...document.querySelectorAll('[data-node-id]')].map(el=>({id:el.dataset.nodeId,parent:el.dataset.parentId,rect:el.getBoundingClientRect().toJSON()}))}));
+    await page.screenshot({path:path.join(artifact,'failure.png')});}}
 finally{if(app){await app.close();try{process.kill(result.pid,0);result.pidStopped=false;}catch(error){result.pidStopped=error.code==='ESRCH';}}
   await fs.writeFile(path.join(artifact,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));}

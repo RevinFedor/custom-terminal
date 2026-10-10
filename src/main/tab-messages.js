@@ -223,10 +223,11 @@ class TabMessageService {
     })();
     this.initialized = true;
     this.initialization = (async () => {
-      // A crash can leave the receipt pinned after the sent row was committed.
+      // A crash can leave the receipt pinned after sent/cancel intent committed.
       // Sweep keys only; already-delivered bodies and UI events are not replayed.
       if (this.releaseReceipt) {
-        const sent = this.db.prepare(`SELECT operationKey FROM ${TABLE_NAME} WHERE deliveryState = 'sent'`).all();
+        const sent = this.db.prepare(`SELECT operationKey FROM ${TABLE_NAME}
+          WHERE deliveryState = 'sent' OR cancelledAt IS NOT NULL`).all();
         for (const { operationKey } of sent) {
           if (this.disposed) return this;
           await this._releaseReceipt(operationKey);
@@ -334,7 +335,12 @@ class TabMessageService {
         this._diagnostic('tab-message-cancel-effects-pending', result.rows[0], { code: safeCode(error?.code, 'cancel_effects_failed') });
       }
     }
-    for (const row of result.rows) this._changed(row, 'cancelled');
+    for (const row of result.rows) {
+      // The durable intent marker now forbids a new attempt after receipt TTL.
+      // Unknown delivery and queue/asset pins keep their independent owners.
+      void this._releaseReceipt(row.operationKey);
+      this._changed(row, 'cancelled');
+    }
     return { message: publicMessage(result.rows[0]), cancelled: true, deduplicated: result.deduplicated };
   }
 

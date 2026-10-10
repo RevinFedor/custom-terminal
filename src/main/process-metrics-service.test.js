@@ -210,3 +210,50 @@ test('сбой замера приходит в чип как явная неу�
   assert.equal(payload.reason, 'koffi-load-failed');
   assert.equal(payload.totalBytes, undefined);
 });
+
+test('whole-PC view reuses the snapshot and timer; ambient never builds or carries its rows',()=>{
+  let apps=0, system=0;
+  const h=makeHarness({ groupApps:({snapshot})=>{apps++;return {available:true,totalBytes:snapshot.scannedAt,apps:[{id:'A'}]};},
+    captureSystem:()=>{system++;return {available:true,totalBytes:32};} });
+  h.service.enableAmbient(); h.timers.at(-1).fn();
+  assert.equal(apps,0); assert.equal(system,0);
+  h.service.subscribe('panel');
+  const captures=h.getCaptureCount(), timers=h.timers.length;
+  const pc=h.service.setView('panel','system');
+  assert.equal(pc.applications.available,true);
+  assert.equal(h.getCaptureCount(),captures); assert.equal(h.timers.length,timers);
+  h.service.setView('panel','system');
+  assert.equal(apps,1); assert.equal(system,1,'same snapshot has one application projection');
+  h.timers.at(-1).fn();
+  assert.equal(h.getCaptureCount(),captures+1); assert.equal(apps,2);
+  assert.equal('applications' in h.ambientUpdates.at(-1),false);
+  h.service.setView('panel','noted'); h.timers.at(-1).fn();
+  assert.equal(apps,2); assert.equal(system,2);
+  h.service.unsubscribe('panel'); h.timers.at(-1).fn();
+  assert.equal(apps,2); assert.equal(system,2);
+  assert.equal(h.service.isAmbientRunning(),true);
+});
+
+test('opening remembered whole-PC scope still captures once and closing removes it',()=>{
+  let apps=0;
+  const h=makeHarness({groupApps:()=>{apps++;return {available:true};},captureSystem:()=>({})});
+  h.service.enableAmbient(); const before=h.getCaptureCount();
+  const p=h.service.subscribe('panel',{view:'system'});
+  assert.equal(h.getCaptureCount(),before+1); assert.equal(apps,1);
+  assert.equal(p.applications.available,true);
+  h.service.unsubscribe('panel');
+  assert.equal(h.service.setView('panel','system').reason,'not-subscribed');
+  assert.equal(h.getCaptureCount(),before+1);
+});
+
+test('application failure leaves Noted totals usable; source failure cannot revive old apps on switch',()=>{
+  let fail=false;
+  const h=makeHarness({capture:()=>fail?{ok:false,reason:'lost'}:{ok:true,scannedAt:1000,processes:[]},
+    groupApps:()=>{throw Error('projection');}, captureSystem:()=>({})});
+  h.service.subscribe('panel');
+  const r=h.service.setView('panel','system');
+  assert.equal(r.ok,true); assert.equal(r.applications.available,false);
+  assert.equal(r.totals.allBytes,140);
+  fail=true; h.timers.at(-1).fn();
+  assert.equal(h.service.setView('panel','system').reason,'snapshot-unavailable');
+});

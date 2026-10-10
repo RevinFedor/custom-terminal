@@ -1900,7 +1900,7 @@ interface WorkspaceStore {
   ensureTabRuntime: (tabId: string) => Promise<boolean>;
   createWorkflowTab: (options?: {workflowId?: string; cwd?: string; sourceTabId?: string; name?: string; tabOptions?: any}) => Promise<string>;
   moveTabsToWorkflow: (tabIds:string[], workflowId:string) => Promise<boolean>;
-  openTabById: (tabId: string, options?: { projectId?: string | null; projectPath?: string | null; sourceTabId?: string; reason?: string }) => Promise<boolean>;
+  openTabById: (tabId: string, options?: { projectId?: string | null; projectPath?: string | null; sourceTabId?: string; reason?: string; unplacedMode?: 'append' | 'replace-shown' }) => Promise<boolean>;
   addWorkspaceSpace: (options?: { activate?: boolean; name?: string }) => string | null;
   removeWorkspaceSpace: (id: string) => void;
   renameWorkspaceSpace: (id: string, name: string) => void;
@@ -4761,7 +4761,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       }
       if (plan!.kind === 'append') {
         if (plan!.paneIndex !== null) set({splitFocusedIndex:plan!.paneIndex});
-        get().placeTab(presentationOwner.projectId,presentationTabId,{mode:PLACEMENT_ADD_HERE});
+        // A reserve-row click replaces the shown chip; secondary links append.
+        // Existing placements above still reveal their exact window.
+        get().placeTab(presentationOwner.projectId,presentationTabId,
+          options.unplacedMode === 'replace-shown' ? undefined : {mode:PLACEMENT_ADD_HERE});
       } else get().placeTab(presentationOwner.projectId,presentationTabId);
     });
     if (!presented) return false;
@@ -4779,7 +4782,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       : state.activeSpaceTab?.tabId !== presentationTabId)) return false;
     if (presentationParentId && state.openProjects.get(state.activeProjectId || '')?.viewingSubAgentTabId !== tabId) return false;
     console.log('[TabNavigation] source=' + (options.reason || 'link')
-      + ' tab=' + tabId.slice(-12) + ' kind=' + plan.kind + ' workflow=' + String(plan.spaceId).slice(-12));
+      + ' tab=' + tabId.slice(-12) + ' kind=' + (plan.kind === 'append' && options.unplacedMode === 'replace-shown' ? 'replace-shown' : plan.kind)
+      + ' workflow=' + String(plan.spaceId).slice(-12));
     return true;
     } catch (error:any) {
       if (get().activeTabNavigationIntent?.id === intent.id) set({activeTabNavigationIntent:null});

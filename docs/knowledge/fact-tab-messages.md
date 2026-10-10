@@ -17,7 +17,8 @@ linked Markdown/`publish_context_update`. Иначе уточняющий воп
 ## API и identity
 
 - MCP: `send_message({tabId,text,requestId?})`,
-  `reply_to_message({messageId,text,requestId?})`, `get_message({messageId})`.
+  `reply_to_message({messageId,text,requestId?})`, `get_message({messageId})`,
+  явный `cancel_message({messageId})`.
 - REST: `POST /api/tab-messages`, `POST /api/tab-messages/:id/replies`,
   `GET /api/tab-messages/:id`, `GET /api/tab-messages?tabId=...`.
 - `tabMessages:{version:1,durable:true,replyTo:true}` в `/api/me` проверяется
@@ -90,16 +91,21 @@ Enter. Только доказанный этап до отправки разр
 callback сверяют ту же квитанцию, но не возвращают отменённое сообщение в
 dispatch. Frozen prompt и failed presentation остаются доступными; скрытие
 строки не является доказательством доставки или разрешением нового Enter.
-Receipt pin сохраняется до durable sent сообщения: без него TTL квитанции
+Receipt pin сохраняется до durable sent либо durable cancel intent сообщения: без него TTL квитанции
 мог бы уничтожить proof между выполнением и восстановлением. После записи sent
-pin снимается; startup освобождает остаток crash между этими двумя записями.
+pin снимается; отмена имеет отдельный компактный marker против нового attempt,
+не снимая queue/unknown-asset owners. Startup освобождает остаток crash между записями.
 Wake идёт от событий lifecycle/input, модель не поллит историю или статус.
 
 ## UI и инструкции
 
 Вопросы используют существующую поверхность tracker без фиктивных runs. Основная
-строка26px общая с поручением: одинаковые status SVG, направление, название и
-зарезервированное место24px для действия. Отдельный hover/click названия ведёт
+строка26px общая с поручением: направление, название, статические status SVG и
+зарезервированное место24px для действия. В компактном live tracker вращающийся
+индикатор работы/передачи убран вместе со своим слотом: цвет стрелки уже сообщает
+состояние, подробная подпись доступна при наведении. Ошибка, ожидание и завершение
+сохраняют статические значки; History и детали сохраняют полный набор статусов.
+Отдельный hover/click названия ведёт
 во вкладку, рядом X. У переписки есть один дочерний ряд с отступом: одна кнопка
 открытия содержит `Send` и `Reply`, каждый со своей SVG и цветом состояния, без
 дополнительных галочек и правой стрелки. Полный message-item48px включает этот
@@ -197,15 +203,30 @@ run и сообщений: второй успех исчезает и без н
 не автоматический dismiss/ack и не доказательство смыслового прочтения моделью.
 После remount старые успешные карточки не возвращаются.
 
-X скрывает только карточку этого участника. `sourceDismissedAt/targetDismissedAt`
-на question сохраняются additive SQLite migration и не меняют delivery, текст,
-replyTo или очередь. Поздний reply/event и restart не возвращают скрытое;
-переписка остаётся в History. `dismissMessage({tabId,messageId})`, IPC
-`tab-messages:dismiss` и `POST /api/tab-messages/:id/dismiss` (`{tabId}`) проверяют
-участника; reply ID адресует его вопрос. Повтор идемпотентен, нет cancel/Send
-side effects. UI/HTTP получают compact metadata; `tabMessages.dismiss=true`
-в `/api/me` отличает поддержку от исходного messaging-v1. Native run X имеет
-другой смысл и не переиспользуется для сообщений.
+X переписки означает отмену будущей доставки и ожидания ответа, а не hide.
+По уточнению Fedor09.10 закрытый MCP-вопрос не должен неожиданно отправляться
+после следующего ручного сообщения. `cancelledAt/cancelledByTabId` записываются
+атомарно с delivery-control question и уже сохранённого reply. До Enter отмена
+запрещает ввод, после него сохраняет неизвестный/подтверждённый исход; уже
+переданное нельзя обещать отозвать. Процесс адресата не останавливается.
+Поздний ответ сохраняется читаемым, но не пересылается; restart, callbacks и
+повтор того же ID не оживляют dispatch. History и immutable текст не удаляются.
+IPC `tab-messages:cancel`, REST `POST /api/tab-messages/:id/cancel` (`{tabId}`)
+и MCP `cancel_message` сходятся в один owner. Участник проверяется по thread,
+reply ID адресует вопрос. Capability `tabMessages.cancellation.version=1`
+отличает новую отмену от старого приложения; потерянный ACK читается по
+`get_message.cancelledAt`, повтор допускается лишь с тем же ID. HTTP также
+возвращает `requestedMessageId`, отдельно от корневого question ID.
+
+Legacy `dismissMessage`, IPC `tab-messages:dismiss` и `/dismiss` сохранены как
+per-side hide (`sourceDismissedAt/targetDismissedAt`), без изменения доставки.
+Старые hides не мигрируют в отмену задним числом. UI теперь вызывает cancel;
+ошибка не скрывает строку оптимистично. Native run X остаётся отдельным owner.
+Новая cancellation metadata сливается монотонно даже если более поздний delivery
+event пришёл раньше её ACK. Старый participant-hide и новая отмена проецируются
+в тот же exact History handoff: late queued receipt/list не возвращает ghost.
+Это не удаление настоящей canonical user-строки. Физический slot и сохранённые
+delivery facts различаются по `fact-terminal-mcp.md::Main FIFO принятых Send`.
 
 History/Timeline получают durable tag `kind:tab-message`; текстовые цитаты
 сервисной разметки сами по себе тег не создают. По требованию Fedor вопрос и reply

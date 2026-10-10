@@ -130,8 +130,8 @@ test('чип отвечает за себя сам', () => {
   assert.match(chip, /data-chip-active=\{shown && paneFocused \? '1' : '0'\}/);
   assert.match(
     chip,
-    /active=\{shown && paneFocused\}/,
-    'показанная вкладка активна только в сфокусированном окне, включая одинокий чип',
+    /active=\{shown\}/,
+    'каждое окно подсвечивает свою показанную вкладку независимо от фокуса',
   );
   assert.doesNotMatch(chip, /active: shown[,}]/);
   assert.match(strip, /paneFocused=\{focused\}/);

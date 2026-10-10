@@ -37,7 +37,7 @@ export interface PaneTabStripProps {
   entries: StripEntry[];
   /** The tab filling the window — exactly one of `entries`. */
   shownTabId: string;
-  /** Exactly one split pane owns the active-card background. */
+  /** Keyboard focus; each window highlights its own shown tab independently. */
   focused: boolean;
   paneIndex: number | null;
   inSplit: boolean;

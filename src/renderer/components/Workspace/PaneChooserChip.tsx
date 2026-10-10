@@ -37,14 +37,14 @@ export interface PaneChooserChipProps {
 }
 
 export default function PaneChooserChip({
-  slotId, paneIndex, selected, paneFocused,
+  slotId, paneIndex, selected,
 }: PaneChooserChipProps) {
   const [hovered, setHovered] = React.useState(false);
   const tabGeo = useUIStore((s) => s.tabGeometry);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
   const metrics = resolveTabCardMetrics(tabGeo, { fontSize: tabsFontSize });
 
-  const active = selected && paneFocused;
+  const active = selected;
   const border = active
     ? 'rgba(255,255,255,0.55)'
     : (hovered ? 'rgba(255,255,255,0.34)' : 'rgba(255,255,255,0.20)');

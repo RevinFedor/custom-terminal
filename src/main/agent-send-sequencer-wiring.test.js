@@ -66,9 +66,11 @@ test('shared History/API/Queue prompt callers enter the tab-scoped intent sequen
 });
 
 test('Cmd+Replay uses the shared driver while launch bootstrap remains a scoped exception', () => {
-  assert.match(promptQueueOverlay, /if \(submitNow\)[\s\S]*runHistoryPromptHandoff\(\{/);
-  assert.match(promptQueueOverlay, /send:\s*\(exactHandoffId\) => sendAgentPromptScenario\(\{/);
-  assert.match(promptQueueOverlay, /settingsIntent:\s*AGENT_SETTINGS_INTENT_NONE/);
+  const sendNow = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'utils', 'runAfterSendNow.ts'), 'utf8');
+  assert.match(promptQueueOverlay, /if \(submitNow\)[\s\S]*sendQueuedPromptNow\(tabId, validation\.item, sessionType\)/);
+  assert.match(sendNow, /runHistoryPromptHandoff\(\{/);
+  assert.match(sendNow, /send:\s*exactHandoffId => sendAgentPromptScenario\(\{/);
+  assert.match(sendNow, /settingsIntent:\s*AGENT_SETTINGS_INTENT_NONE/);
   assert.match(
     promptQueueOverlay,
     /else \{[\s\S]*ipcRenderer\.invoke\(sessionType \+ ':append-input'[\s\S]*submit:\s*false/,

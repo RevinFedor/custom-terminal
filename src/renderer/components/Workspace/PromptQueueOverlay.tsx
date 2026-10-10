@@ -85,6 +85,7 @@ import {
   splitFirstDelaySeconds,
 } from '../../utils/promptQueueDelay';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
+import { pendingPromptTabIds } from '../../utils/promptQueueDependencies.mjs';
 import { OrchestrationStatusChip } from './OrchestrationStatusChip';
 import { AIComposerImagePreview } from './AIConversation/AIComposerSurface';
 import ControlHint from '../UI/ControlHint';
@@ -510,6 +511,10 @@ export function PromptQueueOverlay({
   // is used because the picker consumes the key by value change.
   const [onTabTriggerOpenKeys, setOnTabTriggerOpenKeys] = useState<Map<string, number>>(() => new Map());
   const onTabTriggerOpenSeqRef = useRef(0);
+  const dismissOnTabTriggerDraft = useCallback((id: string) => {
+    setOnTabTriggerDraftIds(current => { const next = new Set(current); next.delete(id); return next; });
+    setOnTabTriggerOpenKeys(current => { const next = new Map(current); next.delete(id); return next; });
+  }, []);
   const [timerTriggerDraftIds, setTimerTriggerDraftIds] = useState<Set<string>>(() => new Set());
   const [contextConditionFocusIds, setContextConditionFocusIds] = useState<Set<string>>(() => new Set());
   const [metaActionsMenu, setMetaActionsMenu] = useState<{ left: number; top: number } | null>(null);
@@ -2818,6 +2823,10 @@ export function PromptQueueOverlay({
       ...Array.from(queueHoverPreviewPanelRef.current?.querySelectorAll<HTMLElement>('[data-prompt-queue-edge-controls]') || [])
         .map(el => el.getBoundingClientRect())];
     if (hoverReturnRef.current.holds(point, parentRects.some(rect => pointInRect(rect, point.clientX, point.clientY, 2)))) return;
+    // MouseEvent rounds coordinates while a split/zoomed button can sit at a
+    // fractional pixel. Honour its padded rect before excluding the rail:
+    // otherwise a real enter at the left edge immediately closes the preview.
+    if (pointInRect(countRect, point.clientX, point.clientY, HOVER_CLUSTER_PAD)) return;
     // Only the orange count owns hover. The wide bridge can cover sibling
     // controls, but the thin rail border directly below the count remains a
     // path into the panel rather than an accidental close strip.
@@ -3373,7 +3382,8 @@ export function PromptQueueOverlay({
             const editingTimerTrigger = timerTriggerDraftIds.has(it.id);
             const dependencyTarget = overview ? queueItemDependencyTarget(queue, it) : null;
             const legacyDependency = overview && !!dependencyTarget && it.trigger?.kind !== 'onTab';
-            const graphDependency = !!dependencyTarget && graphTargets?.has(dependencyTarget);
+            const waitingTargets = it.trigger?.kind === 'onTab' ? pendingPromptTabIds(it.trigger) : [];
+            const graphDependency = waitingTargets.length <= 1 && !!dependencyTarget && graphTargets?.has(dependencyTarget);
             const showOnTabTrigger = editingOnTabTrigger || (!editingTimerTrigger && it.trigger?.kind === 'onTab');
             const showTimerTrigger = editingTimerTrigger || (!editingOnTabTrigger && it.trigger?.kind === 'timer');
             const showAppRestartTrigger = !editingOnTabTrigger && !editingTimerTrigger
@@ -3658,10 +3668,13 @@ export function PromptQueueOverlay({
                 ><Trash2 size={13} strokeWidth={1.9} /></button>
                 </ControlHint>
               </div>
-              {triggerRows.map(triggerKind => (
+              {triggerRows.flatMap(triggerKind => triggerKind === 'onTab'
+                ? (waitingTargets.length ? waitingTargets : legacyDependency ? [dependencyTarget] : []).concat(editingOnTabTrigger ? [null] : [])
+                  .map(rowTarget => ({ triggerKind, rowTarget }))
+                : [{ triggerKind, rowTarget: null }]).map(({ triggerKind, rowTarget }) => (
                 <div
                   className="pq-middle-delete-target"
-                  key={triggerKind}
+                  key={triggerKind + ':' + (rowTarget || 'draft')}
                   data-prompt-trigger-row={it.id}
                   data-prompt-trigger-kind={triggerKind}
                   style={{
@@ -3691,7 +3704,9 @@ export function PromptQueueOverlay({
                   onAuxClickCapture={(event) => {
                     if (overview && triggerKind === 'onTab' && (event.target as HTMLElement).closest('[data-tab-card]')) return;
                     consumePromptQueueMiddleClick(event, () => {
-                      if (triggerKind === 'onTab' && legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, null);
+                      if (triggerKind === 'onTab' && !rowTarget && editingOnTabTrigger) dismissOnTabTriggerDraft(it.id);
+                      else if (triggerKind === 'onTab' && rowTarget && !legacyDependency) usePromptQueueStore.getState().removePromptTabDependency(tabId, it.id, rowTarget);
+                      else if (triggerKind === 'onTab' && legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, null);
                       else clearItemTrigger(it.id);
                     });
                   }}
@@ -3722,7 +3737,7 @@ export function PromptQueueOverlay({
                   ) : (
                     <>
                     <div style={{ minWidth: 0, flex: 1 }}
-                      data-prompt-queue-dependency-target={overview ? dependencyTarget : undefined}
+                      data-prompt-queue-dependency-target={overview ? rowTarget : undefined}
                       data-prompt-queue-dependency-item={overview ? it.id : undefined}>
                       <RunAfterTabPicker
                         showTaskMarkers={false}
@@ -3730,16 +3745,16 @@ export function PromptQueueOverlay({
                         zIndex={FLOATING_OVERLAY_Z_INDEX + 20}
                         tabId={tabId}
                         autoRun={autoRun}
-                        runAfterTabId={it.trigger?.kind === 'onTab' ? it.trigger.tabId : dependencyTarget}
-                        hideTrigger={graphDependency}
+                        runAfterTabId={rowTarget}
+                        hideTrigger={overview && !!rowTarget && graphTargets?.has(rowTarget)}
                         setRunAfterTab={(_ownerTabId, targetTabId) => {
                           if (targetTabId) {
                             if (legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, targetTabId);
-                            else setPromptTrigger(tabId, it.id, { kind: 'onTab', tabId: targetTabId });
+                            else if (!usePromptQueueStore.getState().addPromptTabDependency(tabId, it.id, targetTabId)) return;
                             armRunAfterForSchedulingIfBusy(it.id, targetTabId);
                           } else {
                             if (triggerKind === 'onTab' && legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, null);
-                            else setPromptTrigger(tabId, it.id, null);
+                            else if (rowTarget) usePromptQueueStore.getState().removePromptTabDependency(tabId, it.id, rowTarget);
                           }
                           setOnTabTriggerDraftIds((current) => {
                             const next = new Set(current);
@@ -3757,7 +3772,7 @@ export function PromptQueueOverlay({
                         // клика по пустой строке. Ключ ставится один раз на момент
                         // создания черновика (см. onTabTriggerOpenKeys) — иначе
                         // список переоткрывался бы на каждом ре-рендере строки.
-                        openRequestKey={onTabTriggerOpenKeys.get(it.id) ?? 0}
+                        openRequestKey={!rowTarget ? onTabTriggerOpenKeys.get(it.id) ?? 0 : 0}
                         onOpenRequestConsumed={(consumedKey) => {
                           setOnTabTriggerOpenKeys((current) => {
                             if (current.get(it.id) !== consumedKey) return current;
@@ -3784,7 +3799,9 @@ export function PromptQueueOverlay({
                     aria-label="Clear trigger"
                     title="Clear trigger"
                     onClick={() => {
-                      if (triggerKind === 'onTab' && legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, null);
+                      if (triggerKind === 'onTab' && !rowTarget && editingOnTabTrigger) dismissOnTabTriggerDraft(it.id);
+                      else if (triggerKind === 'onTab' && rowTarget && !legacyDependency) usePromptQueueStore.getState().removePromptTabDependency(tabId, it.id, rowTarget);
+                      else if (triggerKind === 'onTab' && legacyDependency) usePromptQueueStore.getState().setRunAfterTab(tabId, null);
                       else clearItemTrigger(it.id);
                     }}
                     style={{ width: 17, height: 17, flex: '0 0 17px', display: 'grid', placeItems: 'center', padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: TEXT_DIM, cursor: 'pointer' }}

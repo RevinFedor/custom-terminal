@@ -1,5 +1,6 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
+import { dispatchHistoryFileActionContextMenu } from '../../utils/historyFileActionContextMenu.mjs';
 import { createHistoryMeasurementViewportSync } from '../../utils/historyMeasurementViewportSync.mjs';
 import { createHistoryRevealTrace } from '../../utils/historyRevealTrace.mjs';
 import { createHistoryCardRevealAnchor } from '../../utils/historyCardRevealAnchor.mjs';
@@ -2184,6 +2185,7 @@ function useHistoryRevealToggle(
 
 // Edit/Write — purple border, collapsible, no emoji
 const FileActionBlock = memo(({ action }: { action: FileAction }) => {
+  const fileContext = React.useContext(HistoryPayloadContext);
   const [open, setOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement>(null);
   const toggleOpen = useHistoryRevealToggle(anchorRef, open, setOpen);
@@ -2192,6 +2194,8 @@ const FileActionBlock = memo(({ action }: { action: FileAction }) => {
     <div ref={anchorRef} style={{ marginTop: 4, borderLeft: '3px solid #c084fc', paddingLeft: 8 }}>
       <button
         onClick={toggleOpen}
+        onContextMenu={(event) => openHistoryFileActionContextMenu(event,
+          { toolName: action.tool, args: { file_path: action.filePath } }, fileContext?.cwd)}
         style={{
           background: 'none', border: 'none', color: '#c084fc',
           cursor: 'pointer', fontSize: '0.85em', display: 'flex',
@@ -2232,11 +2236,14 @@ const FileActionBlock = memo(({ action }: { action: FileAction }) => {
 });
 
 // Read — orange border, not collapsible, no emoji
-const ReadActionBlock = ({ filePath }: { filePath: string }) => (
-  <div style={{ marginTop: 4, borderLeft: '3px solid #f59e0b', paddingLeft: 8 }}>
-    <span style={{ fontSize: '0.85em', color: '#f59e0b' }}>{shortPath(filePath)}</span>
-  </div>
-);
+const ReadActionBlock = ({ filePath }: { filePath: string }) => {
+  const fileContext = React.useContext(HistoryPayloadContext);
+  return <div style={{ marginTop: 4, borderLeft: '3px solid #f59e0b', paddingLeft: 8 }}>
+    <span onContextMenu={(event) => openHistoryFileActionContextMenu(event,
+      { toolName: 'Read', args: { file_path: filePath } }, fileContext?.cwd)}
+      style={{ fontSize: '0.85em', color: '#f59e0b' }}>{shortPath(filePath)}</span>
+  </div>;
+};
 
 // Sub-agent (Task) — blue border, collapsible result and history
 const formatSubagentDuration = (durationMs: number) => {
@@ -2518,6 +2525,16 @@ const HistoryPayloadContext = React.createContext<{
   payloadGeneration?: string;
 } | null>(null);
 
+function openHistoryFileActionContextMenu(event: React.MouseEvent, action: any, cwd?: string) {
+  return dispatchHistoryFileActionContextMenu(event, action, cwd, {
+    // Resolve only on the user's context-menu gesture, never on mount/scroll.
+    path: window.require('node:path'),
+    pathToFileURL: window.require('node:url').pathToFileURL,
+    homeDir: window.require('node:os').homedir(),
+    send: (channel: string, payload: any) => ipcRenderer.send(channel, payload),
+  });
+}
+
 // In-flight and resolved payloads for the current renderer lifetime. Resolved
 // texts are kept per payloadId so re-expanding a card is instant; bounded by
 // count — payloads are display-sized after the render cap.
@@ -2640,6 +2657,7 @@ const HistoryToolCallPart = memo(({
   mcpMethod?: string;
   docsKind?: string;
 }) => {
+  const fileContext = React.useContext(HistoryPayloadContext);
   const anchorRef = useRef<HTMLDivElement>(null);
   // Every card starts collapsed — including Edit/Write/MultiEdit, which used
   // to be the ONLY default-open type. Open diff bodies meant DiffView rows
@@ -2670,6 +2688,13 @@ const HistoryToolCallPart = memo(({
       data-history-tool-use-id={toolUseId}
       data-history-tool-name={toolName}
       data-history-docs-kind={docsKind || undefined}
+      onContextMenu={(event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        const fileSurface = target?.closest('.cb-tool-head-inner, .cb-edit-path');
+        if (!fileSurface || !event.currentTarget.contains(fileSurface)) return;
+        openHistoryFileActionContextMenu(event,
+          { toolName, args, family, bashWord, bashDetail, mcpServer, mcpMethod }, fileContext?.cwd);
+      }}
     >
       <CBToolCallPart
         toolName={toolName}
@@ -15646,6 +15671,10 @@ function HistoryPanel({
         setTimeout(() => searchInputRef.current?.focus(), 50);
       }
       if (e.key === 'Escape' && searchOpen) {
+        // The resource popup is above History and owns this Escape. Window
+        // capture handlers may run before its close handler, so order alone
+        // cannot preserve the underlying search.
+        if (document.getElementById('noted-resource-usage-panel')) return;
         // A local composer search owns Escape as well. Run after is rendered
         // through a portal, so React ancestry cannot establish ownership.
         if (isComposerKeyboardTarget(e.target)) return;

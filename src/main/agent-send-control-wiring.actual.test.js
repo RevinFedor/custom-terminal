@@ -89,6 +89,15 @@ test('actual cancel IPC persists exact intent; clearing process-local wait canno
   assert.equal(h.store.markAttemptState(input.operationKey, start.attemptId, 'enter-armed').ok, false);
 });
 
+test('late explicit attempt cancellation cannot cancel a current waiting item before identity validation', t => {
+  const h = ipcHarness(t);
+  h.queue.enqueue({ identity: input, request: { tabId: 'T', handoffId: 'H', provider: 'codex', prompt: 'prompt' } });
+  assert.equal(h.call('agent:cancel-send', { tabId: 'T', handoffId: 'H', sendAttemptId: 'old-attempt' }).cancelled, false);
+  assert.equal(h.queue.item(input.operationKey).state, 'waiting');
+  assert.equal(h.store.isDeliveryCancelled(input.operationKey), false);
+  assert.equal(h.call('agent:cancel-send', { tabId: 'T', handoffId: 'H' }).cancelled, true);
+});
+
 test('actual bounded list IPC preserves control and retired-slot fields through remount', async t => {
   const h = ipcHarness(t);
   h.queue.ready = () => true;

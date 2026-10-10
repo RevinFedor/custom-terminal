@@ -36,6 +36,7 @@ import {
   orderVisualHierarchyItems,
 } from '@noted/structured-dnd';
 import { useOutlineDnd } from '@noted/structured-dnd/react';
+import { useCommandHierarchyHint } from '../../hooks/useCommandHierarchyHint';
 import {
   applyPromptOutline,
   buildPromptOutline,
@@ -1127,9 +1128,10 @@ type StatusColumnProps = {
   updateStatus: (id: string, patch: { label?: string; color?: string; description?: string }) => void;
   removeStatus: (id: string) => void;
   setMarker: (patch: { shape?: 'dot' | 'square'; sizePx?: number }) => void;
+  extraControl?: React.ReactNode;
 };
 
-function StatusColumnEditor({ title, markerLabel, statuses, marker, addStatus, updateStatus, removeStatus, setMarker }: StatusColumnProps) {
+function StatusColumnEditor({ title, markerLabel, statuses, marker, addStatus, updateStatus, removeStatus, setMarker, extraControl }: StatusColumnProps) {
   const [pickerOpenId, setPickerOpenId] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const [hexDrafts, setHexDrafts] = useState<Record<string, string>>({});
@@ -1185,6 +1187,7 @@ function StatusColumnEditor({ title, markerLabel, statuses, marker, addStatus, u
         />
       </div>
 
+      {extraControl}
       {statuses.length === 0 && (
         <div style={{ fontSize: 12, color: '#666', fontStyle: 'italic', padding: '8px 2px' }}>Пусто. Добавьте первый статус.</div>
       )}
@@ -1282,7 +1285,12 @@ function SessionStatusesEditor() {
   return (
     <div style={{ paddingLeft: 12, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 12, alignItems: 'start' }}>
       <StatusColumnEditor title="Вкладки" markerLabel="Маркер вкладки" statuses={sessionStatuses} marker={statusMarker} addStatus={addSessionStatus} updateStatus={updateSessionStatus} removeStatus={removeSessionStatus} setMarker={setStatusMarker} />
-      <StatusColumnEditor title="Задачи" markerLabel="Маркер задачи" statuses={taskStatuses} marker={taskStatusMarker} addStatus={addTaskStatus} updateStatus={updateTaskStatus} removeStatus={removeTaskStatus} setMarker={setTaskStatusMarker} />
+      <StatusColumnEditor title="Задачи" markerLabel="Маркер задачи" statuses={taskStatuses} marker={taskStatusMarker} addStatus={addTaskStatus} updateStatus={updateTaskStatus} removeStatus={removeTaskStatus} setMarker={setTaskStatusMarker}
+        extraControl={<label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, fontSize: 12, color: '#aaa', cursor: 'pointer' }}>
+          <input type="checkbox" checked={taskStatusMarker.showTitles !== false}
+            onChange={(event) => setTaskStatusMarker({ showTitles: event.target.checked })} />
+          Показывать названия задач
+        </label>} />
     </div>
   );
 }
@@ -2205,6 +2213,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
   const promptDnd = useOutlineDnd({
     outline: promptOutline,
+    hierarchyModifier: 'meta',
     disabled: promptTreeRename !== null,
     onCommit: commitPromptOutline,
     onExpansionRequest: handlePromptExpansion,
@@ -2221,6 +2230,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     },
   });
 
+  useCommandHierarchyHint(promptDnd.scrollerRef);
   const promptOutlineNodeById = useMemo(() => {
     const nodes = new Map<string, any>();
     const visit = (items: any[]) => items.forEach((node) => {

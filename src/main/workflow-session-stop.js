@@ -101,16 +101,18 @@ function createWorkflowSessionStop({ organization, captureOwner, sameOwner, read
 function createSdkStopObservation(warm) {
   return { busy: !warm, operational: false, inputRevision: 0, tasks: new Set() };
 }
-function observeSdkStopMessage(state, message) {
-  if (!state || !message) return;
-  if (message.type === 'result') state.busy = false;
+function observeSdkStopMessage(state, message, recordCompletion = true) {
+  if (!state || !message) return false;
+  const busy = state.busy, operational = state.operational, tasks = state.tasks.size, completedAt = state.completedAt;
+  if (message.type === 'result') { state.busy = false; if (recordCompletion) state.completedAt = Date.now(); }
   if (message.type === 'assistant' || message.type === 'stream_event' || message.type === 'user') state.busy = true;
-  if (message.type !== 'system') return;
-  if (message.subtype === 'status' && message.status === 'compacting') state.operational = true;
-  if (message.subtype === 'compact_boundary' || (message.subtype === 'status' && message.compact_result)) state.operational = false;
-  if (message.subtype === 'task_started' && message.task_id) state.tasks.add(message.task_id);
-  if (message.subtype === 'task_notification' && message.task_id
+  if (message.type === 'system' && message.subtype === 'status' && message.status === 'compacting') state.operational = true;
+  if (message.type === 'system' && (message.subtype === 'compact_boundary' || (message.subtype === 'status' && message.compact_result))) state.operational = false;
+  if (message.type === 'system' && message.subtype === 'task_started' && message.task_id) state.tasks.add(message.task_id);
+  if (message.type === 'system' && message.subtype === 'task_notification' && message.task_id
     && ['completed', 'failed', 'stopped'].includes(message.status)) state.tasks.delete(message.task_id);
+  return busy !== state.busy || operational !== state.operational || tasks !== state.tasks.size || completedAt !== state.completedAt;
 }
 
-module.exports = { createWorkflowSessionStop, createSdkStopObservation, observeSdkStopMessage };
+module.exports = { createWorkflowSessionStop, createSdkStopObservation, observeSdkStopMessage,
+  activeWorkflowSessionMember: activeMember, workflowSessionScopeKey: scopeKey };

@@ -33,7 +33,8 @@ const names = [
   'getFocusedProjectId', 'requestTabListReveal', 'setProjectView', 'workspaceSpaceIndexOfTab',
   'addEmptySplitPane', 'addVerticalSplitPane',
   'minimizeWorkspaceWindow',
-  'openTabById', 'placeTab', 'setViewingSubAgent',
+  'openTabById', 'placeTab', 'setViewingSubAgent', 'addTabToSplitPaneStrip',
+  'centerStripKey', 'addTabToCenterStrip',
 ];
 const methods = names.map(name => {
   const property = object.properties.find(candidate => candidate.name?.getText(ast) === name);
@@ -82,7 +83,7 @@ function fixture({ chooser = false, vacant = false, customLayout = null } = {}) 
   const initial = {
     ...layout, workspaceDisplay: small, isRestoring: false,
     activeSpaceId: 'main', activeSpaceTab: chip('a'), activeProjectId: 'p', focusedProjectId: 'p',
-    view: 'workspace', centerStrips: {}, projectHistory: ['p', 'q'],
+    view: 'workspace', centerStrips: layout.centerStrips || {}, projectHistory: ['p', 'q'],
     globalTabMru: [chip('a'), chip('old'), chip('q-other', 'q')],
     openProjects: new Map([
       ['p', workspace('p', ['a', 'b', 'old', 'd', 'unplaced'], 'a')],
@@ -178,6 +179,57 @@ test('secondary link without a position on this display uses the current visible
   assert.equal(f.store.getState().splitPanes[0].windowId,'incoming');
   assert.equal(f.store.getState().splitFocusedIndex,0);
 });
+
+for (const replace of [false, true]) {
+  test(`unplaced tab ${replace ? 'sidebar click replaces the shown chip' : 'secondary link appends without replacing'}`, async () => {
+    const f = fixture();
+    f.store.setState({organizationReady:true,tabWorkflowMembership:{unplaced:{workflowId:'main',revision:1}}});
+    const before = f.store.getState();
+    const left = before.splitPanes[0], right = before.splitPanes[1];
+    before.activateCenterTab('p','b');
+    const oldTab = before.openProjects.get('p').tabs.get('b');
+    oldTab.cwd = '/kept'; oldTab.codexSessionId = 'saved-writer';
+    const oldData = clone(oldTab);
+    const options = replace ? {reason:'workflow-reserve',unplacedMode:'replace-shown'} : {reason:'orchestration-linked-tab'};
+    assert.equal(await f.store.getState().openTabById('unplaced', options), true);
+    const next = f.store.getState(), shown = next.splitPanes[1];
+    assert.equal(next.splitFocusedIndex,1);
+    assert.equal(next.splitPanes[0],left);
+    assert.equal(shown.windowId,right.windowId);
+    assert.equal(shown.tabId,'unplaced');
+    assert.deepEqual(panes.paneSlots(shown), replace
+      ? [chip('unplaced'),...panes.paneSlots(right).slice(1)]
+      : [...panes.paneSlots(right),chip('unplaced')]);
+    assert.equal(next.openProjects.get('p').tabs.get('b'),oldTab);
+    assert.deepEqual(clone(oldTab),oldData);
+    assert.equal(next.activeSpaceId,'main');
+  });
+}
+
+test('replace-unplaced option still reveals an existing hidden placement in its own column',async()=>{
+  const f=fixture();
+  f.reveal(1,'incoming',chip('target','q')); f.reveal(1,'outgoing',chip('b'));
+  f.store.getState().activateCenterTab('p','a');
+  const left=f.store.getState().splitPanes[0];
+  assert.equal(await f.store.getState().openTabById('target',{reason:'workflow-reserve',unplacedMode:'replace-shown'}),true);
+  assert.equal(f.store.getState().splitPanes[0],left);
+  assert.equal(f.store.getState().splitFocusedIndex,1);
+  assert.equal(f.store.getState().splitPanes[1].windowId,'incoming');
+});
+
+for (const replace of [false,true]) {
+  test(`single-window strip ${replace ? 'replaces only the shown chip' : 'appends a secondary link'}`,async()=>{
+    const f=fixture({customLayout:{splitPanes:[],splitFocusedIndex:0,centerStrips:{p:[chip('a'),chip('b')]}}});
+    f.store.setState({organizationReady:true,tabWorkflowMembership:{unplaced:{workflowId:'main',revision:1}}});
+    assert.equal(await f.store.getState().openTabById('unplaced',replace?{unplacedMode:'replace-shown'}:{}),true);
+    const state=f.store.getState();
+    assert.deepEqual(state.centerStrips.p,replace
+      ? [chip('unplaced'),chip('b')] : [chip('a'),chip('b'),chip('unplaced')]);
+    assert.equal(state.activeSpaceTab.tabId,'unplaced');
+    assert.ok(state.openProjects.get('p').tabs.has('a'));
+    assert.equal(state.splitPanes.length,0);
+  });
+}
 
 test('portal link without remembered position uses its source window, not another global focus',async()=>{
   const f=fixture(); f.store.getState().activateCenterTab('p','b');

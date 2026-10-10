@@ -3,6 +3,7 @@ import { resolvePtyAgentOwner } from './ptyAgentOwner.mjs';
 import { runAfterTargetInventory, automationInventory, selectRunAfterOverview, queueIsConfigured } from './runAfterInventory.mjs';
 import { autoCompactIncludesTarget, UNPLACED_AUTOMATION_WORKFLOW } from './autoCompactPolicy.mjs';
 import { collectQueueRelations } from './runAfterDependencyLayout.mjs';
+import { createsPromptQueueCycle } from './promptQueueDependencies.mjs';
 const { runAfterError: error, validateRunAfterEnvelope, AUTO_COMPACT_OPS } = contract;
 const clone = value => value == null ? value : JSON.parse(JSON.stringify(value));
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -133,7 +134,16 @@ export function createRunAfterRemote(ports) {
       if (op === 'setTrigger') {
         const value = a.trigger;
         if (value?.kind === 'timer' && typeof value.seconds === 'number' && Number.isFinite(value.seconds) && value.seconds >= 0) trigger = value;
-        else if (value?.kind === 'onTab' && initial.aiTabs.some(target => target.id === value.tabId)) trigger = value;
+        else if (value?.kind === 'onTab' && initial.aiTabs.some(target => target.id === value.tabId)) {
+          if (Array.isArray(value.dependencies)) {
+            const ids = value.dependencies.map(dep => dep?.tabId);
+            if (!ids.length || ids.some(id => id === tabId || !initial.aiTabs.some(target => target.id === id))
+              || new Set(ids).size !== ids.length) throw error('run_after_trigger_invalid', 400);
+            if (ids.some(id => createsPromptQueueCycle(queue().queues, tabId, id))) throw error('run_after_dependency_cycle');
+            // Clients select targets; only the Root runner records completion.
+            trigger = { kind: 'onTab', tabId: ids[0], dependencies: ids.map(tabId => ({ tabId, armedAt: Date.now() })) };
+          } else trigger = { kind: 'onTab', tabId: value.tabId };
+        }
         else if (value?.kind === 'app-restart') trigger = { kind: 'app-restart', armedInstanceId: await ports.mainInstanceId() };
         else throw error('run_after_trigger_invalid', 400);
       }

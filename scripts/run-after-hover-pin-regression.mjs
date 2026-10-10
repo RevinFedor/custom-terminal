@@ -36,10 +36,22 @@ try {
   function installShim() {
     const listeners = new Map(), saved = new Map();
     const f = window.hoverFixture = { calls: [], unknown: [], violations: [] };
+    f.idleProjection = { revision: 0, sequence: 0, policy: { workflowIds: [], allWorkflows: false,
+      minutes: 10, includeAlreadyIdle: true, armedAt: 0 }, states: {} };
+    f.setIdleState = (state) => {
+      f.idleProjection = { ...f.idleProjection, sequence: f.idleProjection.sequence + 1, states: { owner: state } };
+      f.ipc.emit('idle-session-stop:changed', {}, structuredClone(f.idleProjection));
+    };
     f.dragEvents = [];
     for (const name of ['dragstart', 'dragend']) document.addEventListener(name, e => f.dragEvents.push({ name, trusted: e.isTrusted }));
     const deny = kind => { f.violations.push(kind); throw Error('Hover fixture forbids ' + kind); };
     const response = (channel, payload) => {
+      if (channel === 'idle-session-stop:get') return f.idleProjection;
+      if (channel === 'idle-session-stop:update') {
+        f.idleProjection = { ...f.idleProjection, revision: f.idleProjection.revision + 1,
+          sequence: f.idleProjection.sequence + 1, policy: { ...f.idleProjection.policy, ...payload } };
+        return f.idleProjection;
+      }
       if (channel === 'app:getState') return saved.get(payload) ?? null;
       if (channel === 'app:setState' || channel === 'app:setStateSync') { saved.set(payload.key, payload.value); return { success: true }; }
       if (channel === 'provider:get-status') return { type: 'codex' };
@@ -89,7 +101,7 @@ try {
     window.WebSocket = class { constructor() { deny('WebSocket'); } };
     window.EventSource = class { constructor() { deny('EventSource'); } };
   }
-  await fs.writeFile(path.join(artifact, 'index.html'), `<meta charset="utf-8"><link rel="stylesheet" href="globals.css"><link rel="stylesheet" href="bundle.css"><style>html,body{margin:0;background:#1a1a1a;color:#ccc;font-family:Arial,sans-serif}*{box-sizing:border-box}</style><div id="root"></div><script>(${installShim.toString()})()</script><script src="bundle.js"></script>`);
+  await fs.writeFile(path.join(artifact, 'index.html'), `<meta charset="utf-8"><link rel="stylesheet" href="globals.css"><link rel="stylesheet" href="bundle.css"><style>html,body{margin:0;background:#1a1a1a;color:#ccc;font-family:Arial,sans-serif}*{box-sizing:border-box}</style><div id="root"></div><script>(${installShim.toString()})();window.hoverFixture.automationTest=${process.env.NOTED_AUTOMATION_SETTINGS_ONLY === '1'}</script><script src="bundle.js"></script>`);
   await fs.writeFile(path.join(artifact, 'main.cjs'), `const {app,BrowserWindow,session}=require('electron');
     app.setPath('userData',${JSON.stringify(path.join(artifact, 'user-data'))});app.setActivationPolicy?.('accessory');
     app.whenReady().then(()=>{app.dock?.hide();session.defaultSession.webRequest.onBeforeRequest((d,r)=>r({cancel:! /^(file:|data:|blob:)/.test(d.url)}));
@@ -116,6 +128,189 @@ try {
   const state = () => page.evaluate(() => window.hoverFixture.state());
   const assertPreview = async () => { assert.equal(await local.getAttribute('data-prompt-queue-panel-mode'), 'preview'); assert.equal((await state()).panelCollapsed, true); };
   const openLocal = async () => { await far(); await count.hover(); await local.waitFor(); await frames(); await assertPreview(); };
+  if (process.env.NOTED_AUTOMATION_SETTINGS_ONLY === '1') {
+    await globalTrigger.hover(); await global.waitFor();
+    await global.getByRole('button', { name: 'Settings', exact: true }).click(); await frames();
+    assert.equal(await global.getByRole('button', { name: /^Queues/ }).count(), 1);
+    assert.equal(await global.locator('[data-global-run-after-auto-compact-threshold]').count(), 0);
+    const compactSelect = global.getByRole('button', { name: 'Auto-compact: workflows' });
+    const stopSelect = global.getByRole('button', { name: 'Auto-stop: workflows' });
+    await compactSelect.hover(); await frames(); assert.equal(await page.locator('[data-automation-workflow-menu]').count(), 0);
+    await compactSelect.click();
+    const picker = page.locator('[data-automation-workflow-menu="Auto-compact"]'); await picker.waitFor();
+    await far(); assert.equal(await picker.count(), 1); assert.equal(await global.count(), 1);
+    const option = picker.locator('[data-automation-workflow-option="legacy-workflow"]');
+    await option.click(); await frames(); assert.equal(await option.getAttribute('aria-checked'), 'true');
+    const checkboxBeforeLabel = await option.evaluate(el => el.children[0].getBoundingClientRect().right <= el.children[1].getBoundingClientRect().left);
+    assert.ok(checkboxBeforeLabel);
+    assert.equal((await page.evaluate(() => window.hoverFixture.scope())).activeSpaceId, 'hover-workflow');
+    await picker.getByRole('button', { name: 'Select all', exact: true }).click(); await frames();
+    assert.equal(await picker.locator('[role="menuitemcheckbox"][aria-checked="false"]').count(), 0);
+    await option.click(); await frames(); assert.equal(await option.getAttribute('aria-checked'), 'false');
+    await picker.getByRole('button', { name: 'Clear all', exact: true }).click(); await frames();
+    assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, false);
+    await option.click(); await frames(); assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, true);
+    await page.keyboard.press('Escape'); await frames(); assert.equal(await picker.count(), 0);
+    await global.screenshot({ path: path.join(artifact, 'settings-two-policies.png') });
+    result.checks.push('Settings/Queues labels; compact workflow click picker holds its hover parent, left checkboxes, All/None and independent uncheck without navigation');
+
+    await stopSelect.click();
+    const stopPicker = page.locator('[data-automation-workflow-menu="Auto-stop"]'); await stopPicker.waitFor();
+    await stopPicker.locator('[data-automation-workflow-option="hover-workflow"]').click(); await frames();
+    assert.deepEqual((await page.evaluate(() => window.hoverFixture.idleProjection)).policy.workflowIds, ['hover-workflow']);
+    assert.deepEqual((await page.evaluate(() => window.hoverFixture.scope())).policy.workflowIds, ['legacy-workflow']);
+    await stopPicker.screenshot({ path: path.join(artifact, 'workflow-checkbox-picker.png') });
+    await page.keyboard.press('Escape');
+    await global.getByLabel('Время до автоостановки, минут').fill('3');
+    assert.equal((await page.evaluate(() => window.hoverFixture.idleProjection)).policy.minutes, 10, 'partial timer edits do not stop idle processes before commit');
+    await global.getByLabel('Включая уже простаивающие').uncheck(); await frames();
+    const policy = (await page.evaluate(() => window.hoverFixture.idleProjection)).policy;
+    assert.equal(policy.minutes, 3); assert.equal(policy.includeAlreadyIdle, false);
+    await stopSelect.click(); await stopPicker.waitFor(); await page.mouse.click(15, 825); await frames();
+    assert.equal(await stopPicker.count(), 0); assert.equal(await global.count(), 0);
+    result.checks.push('Auto-stop has independent workflows, editable minutes and already-idle choice; outside close releases the hover parent');
+
+    await page.evaluate(() => window.hoverFixture.setIdleState({ phase: 'scheduled', deadline: Date.now() + 125_000, idleSince: Date.now() - 55_000 }));
+    const chrome = page.locator('[data-chrome-fixture]');
+    await chrome.locator('[data-split-strip-menu-button]').click();
+    const menu = page.locator('[data-split-strip-menu]'); await menu.waitFor();
+    const timeline = menu.locator('[data-split-strip-menu-item="timeline"]');
+    const split = menu.locator('[data-split-strip-menu-item="show-window-alongside"]');
+    const left = locator => locator.evaluate(el => ({ left: el.querySelector('svg').getBoundingClientRect().left, padding: getComputedStyle(el).paddingLeft }));
+    assert.deepEqual(await left(timeline), await left(split));
+    const countdown = menu.locator('[data-idle-stop-countdown="owner"]');
+    assert.match(await countdown.innerText(), /2:0[45]/);
+    await menu.screenshot({ path: path.join(artifact, 'window-menu-countdown.png') });
+    await page.evaluate(() => window.hoverFixture.setIdleState({ phase: 'busy', deadline: null, idleSince: null })); await frames();
+    assert.match(await countdown.innerText(), /после ответа/);
+    await page.mouse.click(15, 825);
+    await chrome.locator('[data-split-strip-menu-button]').click({ button: 'right' }); await menu.waitFor();
+    assert.match(await menu.locator('[data-idle-stop-countdown="owner"]').innerText(), /после ответа/);
+    result.checks.push('actual window menu has aligned Timeline and per-tab countdown; busy projection replaces the clock; ellipsis and right-click share the row');
+  } else if (process.env.NOTED_RAIL_HOVER_ONLY === '1') {
+    await page.evaluate(() => {
+      window.hoverFixture.compactPolicy({ enabled: false });
+      window.hoverFixture.pointerTrace = [];
+      for (const type of ['mouseover', 'mouseout', 'mousemove']) window.addEventListener(type, event => {
+        const count = document.querySelector('[data-local-fixture] .pq-rail-count');
+        const rect = count?.getBoundingClientRect();
+        const trace = window.hoverFixture.pointerTrace;
+        trace.push({ type, x: event.clientX, y: event.clientY,
+          target: event.target?.outerHTML?.slice(0, 130), related: event.relatedTarget?.outerHTML?.slice(0, 130),
+          open: count?.getAttribute('aria-expanded'), rect: rect && { x: rect.x, y: rect.y, width: rect.width, height: rect.height } });
+        if (trace.length > 100) trace.shift();
+      }, true);
+    });
+    await frames();
+    const history = page.locator('[data-local-fixture] [data-orchestration-history-button]');
+    const settings = page.locator('[data-local-fixture] [data-orchestration-settings-button]');
+    const pause = page.locator('[data-local-fixture] .pq-rail-run');
+    const points = {};
+    for (const [name, locator] of Object.entries({ history, settings, count, pause })) {
+      const r = await locator.boundingBox(); points[name] = { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    }
+    result.railPoints = points;
+    const move = async name => page.mouse.move(points[name].x, points[name].y);
+    const routes = [ ['count', 'settings', 'count'], ['count', 'pause', 'count'],
+      ['history', 'settings', 'count'], ['count', 'settings', 'history', 'settings', 'count'] ];
+    for (let round = 0; round < 30; round++) {
+      for (const route of routes) {
+        for (const name of route) await move(name);
+        await frames();
+        if (await local.count() !== 1) {
+          result.pointerTrace = await page.evaluate(() => window.hoverFixture.pointerTrace);
+          assert.fail('hover did not reopen: ' + JSON.stringify({ round, route }));
+        }
+        await assertPreview();
+      }
+    }
+    await page.screenshot({ path: path.join(artifact, 'rail-fast-return.png') });
+    result.checks.push('120 fast History/settings/count/Pause return paths reopen the unpinned queue');
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+    for (let round = 0; round < 20; round++) {
+      for (const route of routes) {
+        await Promise.all(route.map(name => cdp.send('Input.dispatchMouseEvent', {
+          type: 'mouseMoved', x: points[name].x, y: points[name].y,
+        })));
+        await frames();
+        if (await local.count() !== 1) {
+          result.pointerTrace = await page.evaluate(() => window.hoverFixture.pointerTrace);
+          assert.fail('burst hover did not reopen: ' + JSON.stringify({ round, route }));
+        }
+      }
+    }
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 });
+    result.checks.push('80 ordered native event bursts with CPU slowdown retain the final hover');
+    const countRect = await count.boundingBox();
+    for (const inset of [0.25, 1, 2, 4, 13, 24.5, 25.5]) {
+      for (const from of ['settings', 'pause']) {
+        await move(from);
+        await page.mouse.move(countRect.x + inset, points.count.y);
+        await frames();
+        if (await local.count() !== 1) {
+          result.pointerTrace = await page.evaluate(() => window.hoverFixture.pointerTrace);
+          assert.fail('edge hover did not reopen: ' + JSON.stringify({ from, inset }));
+        }
+      }
+    }
+    result.checks.push('left/right count edges reopen from both adjacent buttons');
+    await page.evaluate(() => { document.querySelector('[data-local-fixture]').style.transform = 'translateX(0.5px)'; });
+    await frames();
+    const fractionalRect = await count.boundingBox();
+    await move('settings');
+    await page.mouse.move(fractionalRect.x + 0.25, points.count.y);
+    await frames();
+    result.fractionalHit = await count.evaluate(el => ({ hovered: el.matches(':hover'), rect: el.getBoundingClientRect().toJSON() }));
+    if (await local.count() !== 1) {
+      result.pointerTrace = await page.evaluate(() => window.hoverFixture.pointerTrace);
+      assert.fail('fractional left edge hover did not reopen');
+    }
+    result.checks.push('fractional count geometry reopens from the settings side');
+  } else if (process.env.NOTED_MULTI_DEPENDENCY_ONLY === '1') {
+    await openLocal();
+    const rows = local.locator('[data-prompt-trigger-kind="onTab"]');
+    assert.equal(await rows.count(), 1);
+    await rows.first().click({ button: 'right', position: { x: 90, y: 10 } });
+    const picker = page.locator('[data-run-after-picker-menu]'); await picker.waitFor();
+    await picker.locator('[data-run-after-tab-row="alternative"]').click(); await frames();
+    assert.equal(await rows.count(), 2);
+    const labels = await rows.allTextContents();
+    assert.ok(labels[0].includes('source')); assert.ok(labels[1].includes('alternative'));
+    const rects = await rows.evaluateAll(nodes => nodes.map(n => { const r = n.getBoundingClientRect(); return { y: r.y, bottom: r.bottom }; }));
+    assert.ok(rects[1].y >= rects[0].bottom, 'cards stack without overlap');
+    await local.screenshot({ path: path.join(artifact, 'multi-two-cards.png') });
+    result.checks.push('trusted right-click and existing picker append a second card below the first');
+
+    await rows.first().click({ button: 'right', position: { x: 90, y: 10 } }); await picker.waitFor();
+    await picker.locator('[data-run-after-tab-row="alternative"]').click(); await frames();
+    assert.equal(await rows.count(), 2, 'reselecting another existing target is deduplicated');
+    await rows.first().click({ button: 'right', position: { x: 90, y: 10 } }); await picker.waitFor();
+    await page.keyboard.press('Escape'); await frames(); assert.equal(await rows.count(), 2);
+    result.checks.push('duplicate selection and Escape keep the selected wait set');
+
+    await local.locator('[data-prompt-queue-item="synthetic-card"]').click({ button: 'right' });
+    const context = page.locator('[data-prompt-queue-chip-menu]'); await context.waitFor();
+    await context.getByText('on tab', { exact: true }).click(); await picker.waitFor();
+    await page.keyboard.press('Escape'); await frames();
+    const draft = rows.filter({ hasText: 'выбрать вкладку' }); await draft.locator('[data-chip-action="remove-trigger"]').click();
+    await frames(); assert.equal(await rows.count(), 2, 'cancelling an Add draft does not clear the existing cards');
+    result.checks.push('cancelled context-menu Add draft preserves both existing conditions');
+
+    await globalTrigger.click(); await global.waitFor(); await frames();
+    assert.equal(await global.locator('path[data-run-after-edge-item="synthetic-card"]').count(), 2);
+    await global.screenshot({ path: path.join(artifact, 'multi-global-arrows.png') });
+    await globalTrigger.click(); await frames();
+    await page.evaluate(() => window.hoverFixture.completeDependency('source')); await frames();
+    await openLocal(); assert.equal(await rows.count(), 1); assert.ok((await rows.first().innerText()).includes('alternative'));
+    await local.screenshot({ path: path.join(artifact, 'multi-one-remaining.png') });
+    await page.evaluate(() => window.hoverFixture.restoreDependencies()); await frames();
+    assert.equal(await rows.count(), 1, 'saved completed card does not return after data reload');
+    await page.evaluate(() => window.hoverFixture.completeDependency('alternative')); await frames();
+    assert.equal(await rows.count(), 0);
+    assert.equal(await local.locator('[data-prompt-queue-item="synthetic-card"]').count(), 1, 'view-only proof does not fake a Send');
+    result.checks.push('completion retires only the matching card; saved progress stays retired; both done leaves no wait card');
+  } else {
   const reference = id => page.locator('[data-workflow-reference] [data-workflow-chip="' + id + '"]');
   const profile = locator => locator.evaluate(el => { const s = getComputedStyle(el), img = el.querySelector('img'); return {
     height: s.height, padding: s.padding, fontSize: s.fontSize, radius: s.borderRadius, color: s.color,
@@ -177,7 +372,7 @@ try {
   assert.equal(await picker.count(), 0, 'local return trip is not held by a still-open picker');
   await page.screenshot({ path: path.join(artifact, 'local-on-tab-return.png') });
   await local.getByRole('button', { name: 'Post', exact: true }).hover(); await frames();
-  assert.equal((await state()).items[0].trigger.tabId, 'alternative');
+  assert.deepEqual((await state()).items[0].trigger.dependencies.map(dep => dep.tabId), ['source', 'alternative']);
   await far(); assert.equal(await local.count(), 0); result.checks.push('context menu → on tab → target selection never pins the queue');
 
   for (const target of ['source', 'alternative']) {
@@ -255,33 +450,39 @@ try {
 
   await globalTrigger.hover(); await global.waitFor();
   assert.equal(await global.getAttribute('data-global-run-after-mode'), 'preview');
-  await global.getByRole('button', { name: /^Автокомпакт/ }).click();
+  await global.getByRole('button', { name: /^Settings/ }).click();
   assert.equal(await global.getAttribute('data-global-run-after-mode'), 'preview');
-  const scopeChip = id => global.locator('[data-auto-compact-workflow-chip="' + id + '"]');
+  const compactSelect = global.getByRole('button', { name: 'Auto-compact: workflows' });
+  await compactSelect.click();
+  const workflowMenu = page.locator('[data-automation-workflow-menu="Auto-compact"]');
+  const scopeOption = id => workflowMenu.locator('[data-automation-workflow-option="' + id + '"]');
+  const scopeChip = id => scopeOption(id).locator('[data-workflow-chip]');
   assert.deepEqual(await profile(scopeChip('hover-workflow')), originalSelected);
   assert.deepEqual(await profile(scopeChip('legacy-workflow')), originalLegacy);
   assert.deepEqual(await profile(scopeChip('cleared-workflow')), originalCleared);
   assert.notEqual(originalSelected.icon, originalLegacy.icon);
   assert.equal(originalCleared.fallback, true); assert.equal(originalCleared.icon, null);
-  await scopeChip('legacy-workflow').click(); await frames();
+  await scopeOption('legacy-workflow').click(); await frames();
   const selectedScope = await page.evaluate(() => window.hoverFixture.scope());
   assert.ok(selectedScope.policy.workflowIds.includes('legacy-workflow')); assert.equal(selectedScope.activeSpaceId, 'hover-workflow');
   const toggled = await profile(scopeChip('legacy-workflow'));
   assert.equal(toggled.background, originalSelected.background); assert.equal(toggled.color, originalSelected.color);
-  assert.equal(await scopeChip('legacy-workflow').getAttribute('aria-pressed'), 'true');
+  assert.equal(await scopeOption('legacy-workflow').getAttribute('aria-checked'), 'true');
   await page.screenshot({ path: path.join(artifact, 'workflow-scope.png') });
-  await scopeChip('legacy-workflow').click();
+  await scopeOption('legacy-workflow').click();
   await page.evaluate(() => window.hoverFixture.font(17)); await frames();
   assert.equal((await profile(scopeChip('legacy-workflow'))).fontSize, (await profile(reference('legacy-workflow'))).fontSize);
   await page.evaluate(() => window.hoverFixture.icon()); await frames();
   assert.equal((await profile(scopeChip('legacy-workflow'))).icon, (await profile(reference('legacy-workflow'))).icon);
   assert.notEqual((await profile(scopeChip('legacy-workflow'))).icon, originalLegacy.icon);
   await page.evaluate(() => window.hoverFixture.font(14)); await frames();
-  await global.getByRole('button', { name: 'Все workflow', exact: true }).click(); await frames();
-  assert.equal(await scopeChip('legacy-workflow').isDisabled(), true);
-  await global.getByRole('button', { name: 'Все workflow', exact: true }).click();
-  await frames();
-  const compactThreshold = global.locator('[data-global-run-after-auto-compact-threshold]');
+  await workflowMenu.getByRole('button', { name: 'Select all', exact: true }).click(); await frames();
+  assert.equal(await scopeOption('legacy-workflow').isDisabled(), false);
+  await scopeOption('legacy-workflow').click(); await frames();
+  assert.equal(await scopeOption('legacy-workflow').getAttribute('aria-checked'), 'false');
+  await workflowMenu.getByRole('button', { name: 'Clear all', exact: true }).click();
+  await scopeOption('hover-workflow').click(); await frames();
+  const compactThreshold = global.getByLabel('Порог автокомпакта');
   const compactPercent = globalTrigger.locator('[data-global-run-after-auto-compact-percent]');
   const compactColor = node => node.evaluate(el => getComputedStyle(el).color);
   assert.equal(await compactColor(compactThreshold), 'rgb(167, 139, 250)');
@@ -290,50 +491,47 @@ try {
   await page.evaluate(() => window.hoverFixture.compactPolicy({ enabled: false, scopeInitialized: false,
     workflowIds: ['hover-workflow', 'legacy-workflow'], allWorkflows: false, includeUnplaced: false,
     excludedTabIds: ['source'] })); await frames();
-  assert.equal(await scopeChip('hover-workflow').getAttribute('aria-pressed'), 'false');
-  assert.equal(await scopeChip('legacy-workflow').getAttribute('aria-pressed'), 'false');
-  assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, false, 'opening the page must not arm the remembered scope');
-  assert.equal(await compactThreshold.count(), 0); assert.equal(await compactPercent.count(), 0);
-  assert.equal(await global.getByLabel('Порог автокомпакта').evaluate(el => getComputedStyle(el).color), 'rgb(153, 153, 153)');
-  await scopeChip('legacy-workflow').click(); await frames();
+  assert.equal(await scopeOption('hover-workflow').getAttribute('aria-checked'), 'false');
+  assert.equal(await scopeOption('legacy-workflow').getAttribute('aria-checked'), 'false');
+  assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, false);
+  assert.equal(await compactPercent.count(), 0);
+  assert.equal(await compactColor(compactThreshold), 'rgb(153, 153, 153)');
+  await scopeOption('legacy-workflow').click(); await frames();
   const firstSelection = await page.evaluate(() => window.hoverFixture.scope());
   assert.equal(firstSelection.policy.enabled, true); assert.deepEqual(firstSelection.policy.workflowIds, ['legacy-workflow']);
   assert.deepEqual(firstSelection.policy.excludedTabIds, ['source']); assert.equal(firstSelection.activeSpaceId, 'hover-workflow');
   assert.equal(await compactColor(compactThreshold), 'rgb(167, 139, 250)');
-  await global.getByLabel('Порог автокомпакта').fill('60'); await frames();
-  assert.equal(await compactThreshold.innerText(), '· ≥60%');
+  await page.keyboard.press('Escape');
+  await compactThreshold.fill('60'); await frames();
   assert.equal(await compactPercent.getAttribute('aria-label'), 'Автокомпакт включён при 60%');
   await page.screenshot({ path: path.join(artifact, 'auto-compact-scope-enabled.png') });
-  await global.getByRole('button', { name: /^Очереди/ }).click(); await frames();
-  assert.equal(await global.getByRole('button', { name: /^Автокомпакт/ }).evaluate(el => getComputedStyle(el).color), 'rgb(146, 146, 151)');
-  assert.equal(await compactColor(compactThreshold), 'rgb(167, 139, 250)', 'active threshold remains violet on the inactive grey page button');
-  await page.screenshot({ path: path.join(artifact, 'auto-compact-threshold-inactive-tab.png') });
-  await global.getByRole('button', { name: /^Автокомпакт/ }).click(); await frames();
-  await scopeChip('hover-workflow').click(); await scopeChip('legacy-workflow').click(); await frames();
-  assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, true, 'another selected workflow still enables the policy');
-  await scopeChip('hover-workflow').click(); await frames();
+  await global.getByRole('button', { name: /^Queues/ }).click(); await frames();
+  assert.equal(await global.getByRole('button', { name: /^Settings/ }).evaluate(el => getComputedStyle(el).color), 'rgb(146, 146, 151)');
+  assert.equal(await global.locator('[data-global-run-after-auto-compact-threshold]').count(), 0, 'Settings header is only its label');
+  await global.getByRole('button', { name: /^Settings/ }).click(); await frames();
+  await compactSelect.click();
+  await scopeOption('hover-workflow').click(); await scopeOption('legacy-workflow').click(); await frames();
+  assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, true);
+  await scopeOption('hover-workflow').click(); await frames();
   const lastCleared = await page.evaluate(() => window.hoverFixture.scope());
   assert.equal(lastCleared.policy.enabled, false); assert.deepEqual(lastCleared.policy.workflowIds, []);
-  assert.equal(await compactPercent.count(), 0); assert.equal(await compactThreshold.count(), 0);
-  await global.getByRole('button', { name: 'Все workflow', exact: true }).click(); await frames();
+  assert.equal(await compactPercent.count(), 0);
+  await workflowMenu.getByRole('button', { name: 'Select all', exact: true }).click(); await frames();
   assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, true);
-  await global.getByRole('button', { name: 'Все workflow', exact: true }).click(); await frames();
+  await workflowMenu.getByRole('button', { name: 'Clear all', exact: true }).click(); await frames();
   assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, false);
-  await scopeChip('__unplaced__').click(); await frames();
+  await scopeOption('__unplaced__').click(); await frames();
   assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.includeUnplaced, true);
   assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, true);
-  await global.getByRole('button', { name: 'Все workflow', exact: true }).click();
-  await global.getByRole('button', { name: 'Все workflow', exact: true }).click(); await frames();
-  assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, true, 'unplaced survives clearing All');
-  await scopeChip('__unplaced__').click(); await frames();
+  await scopeOption('__unplaced__').click(); await page.keyboard.press('Escape'); await frames();
   assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, false);
   await page.screenshot({ path: path.join(artifact, 'auto-compact-scope-disabled.png') });
-  result.checks.push('workflow selection directly enables AutoCompact, clearing the last choice disables it; old disabled memory stays inactive, exclusions persist, active threshold/percent are violet and there is no power toggle');
+  result.checks.push('workflow checkbox selection enables AutoCompact; All allows individual removal; Clear/last-off disable; old disabled memory stays inactive, exclusions and violet threshold/percent persist');
   result.checks.push('workflow scope mirrors navbar icon/colors/metrics; explicit/legacy/cleared icons and live font/icon changes; selection never navigates');
   await far(); assert.equal(await global.count(), 0);
   result.checks.push('global page clicks remain preview and leave closes without delay');
 
-  await globalTrigger.hover(); await global.waitFor(); await global.getByRole('button', { name: /^Очереди/ }).click();
+  await globalTrigger.hover(); await global.waitFor(); await global.getByRole('button', { name: /^Queues/ }).click();
   const embedded = global.locator('[data-global-run-after-inline-editor="owner"]');
   await embedded.waitFor();
   assert.equal(await page.locator('[data-global-run-after-editor-trigger]').count(), 0);
@@ -417,7 +615,7 @@ try {
     assert.ok(metric.width < 300);
   }
   await page.screenshot({ path: path.join(artifact, 'inline-queue.png') });
-  const edge = global.locator('[data-run-after-edge-item="synthetic-card"]');
+  const edge = global.locator('[data-run-after-edge-item="synthetic-card"][data-run-after-edge-target="alternative"]');
   await edge.waitFor();
   assert.equal(await edge.getAttribute('data-run-after-edge-owner'), 'owner');
   assert.equal(await edge.getAttribute('data-run-after-edge-target'), 'alternative');
@@ -441,7 +639,8 @@ try {
   await context.waitFor(); await context.getByText('on tab', { exact: true }).click();
   await picker.waitFor(); await picker.locator('[data-run-after-tab-row="source"]').click(); await frames();
   assert.equal((await state()).items[0].trigger.tabId, 'source');
-  assert.equal(await edge.getAttribute('data-run-after-edge-target'), 'source');
+  assert.equal(await edge.getAttribute('data-run-after-edge-target'), 'alternative', 'adding/reselecting source keeps the other dependency');
+  assert.equal(await global.locator('[data-run-after-edge-item="synthetic-card"][data-run-after-edge-target="source"]').count(), 1);
   const sourceNode = global.locator('[data-global-run-after-node="source"]');
   await sourceNode.locator('[data-global-run-after-tab-chip]').click();
   assert.equal(await page.evaluate(() => window.hoverFixture.navigation.at(-1)[1]), 'source');
@@ -450,9 +649,9 @@ try {
   assert.equal((await state()).items[0].trigger.tabId, 'source', 'navigation must not remove the condition');
   await embedded.getByText('Edited title', { exact: true }).click();
   const globalTitle = page.locator('[data-run-after-satellite] input').first();
-  await globalTitle.fill('Inline edited'); await global.getByRole('button', { name: /^Автокомпакт/ }).click(); await frames();
+  await globalTitle.fill('Inline edited'); await global.getByRole('button', { name: /^Settings/ }).click(); await frames();
   assert.equal((await state()).items[0].title, 'Inline edited');
-  await global.getByRole('button', { name: /^Очереди/ }).click(); await embedded.waitFor();
+  await global.getByRole('button', { name: /^Queues/ }).click(); await embedded.waitFor();
   assert.equal(await embedded.getByText('Inline edited', { exact: true }).count(), 1);
   result.checks.push('full dependency node owns its toolbar and Play; no counter/after text/pencil; chip navigation and step-context target editing remain distinct');
   await globalTrigger.click(); await frames(); assert.equal(await global.count(), 0);
@@ -785,7 +984,7 @@ try {
   await globalTrigger.click(); await globalTrigger.click(); await global.waitFor(); await frames();
   assert.equal(await global.getAttribute('data-global-run-after-sizing'), 'content');
   const reopened = await global.boundingBox(); assert.equal(reopened.width, trimmed.width); assert.equal(reopened.height, trimmed.height);
-  await global.getByRole('button', { name: /^Автокомпакт/ }).click(); await frames();
+  await global.getByRole('button', { name: /^Settings/ }).click(); await frames();
   const compactBounds = await global.boundingBox(); assert.ok(compactBounds.height < 350);
   assert.equal(await global.locator('[data-global-run-after-resize]').count(), 0);
   await globalTrigger.click();
@@ -807,6 +1006,7 @@ try {
   assert.equal((await geometry()).columns, 1); await assertGraphRoutes('one column');
   await panelScreenshot('shared-prerequisite-one-column.png');
   result.checks.push('reported dashboard/Telegram/shared subtitles case is row-major at two columns; one/three-column trusted resize keeps every route outside cards and anchored to its iteration');
+  }
   const safety = await page.evaluate(() => ({ violations: window.hoverFixture.violations, unknown: [...new Set(window.hoverFixture.unknown)] }));
   result.safety = safety;
   assert.deepEqual(safety.violations, []); assert.deepEqual(safety.unknown, []); assert.deepEqual(result.errors, []);

@@ -856,9 +856,9 @@ export function RunAfterTabPicker({
         event.preventDefault(); event.stopPropagation();
         useWorkspaceStore.getState().placeTab(selectedTab.projectId, selectedTab.id, { mode: 'add-here' });
       } : undefined}
-      onContextMenu={navigateOnPillClick ? event => {
+      onContextMenu={event => {
         event.preventDefault(); event.stopPropagation(); handleOpen();
-      } : undefined}
+      }}
       titleText={
         (autoRun
           ? `Run after ${selectedSummaryText} finishes`

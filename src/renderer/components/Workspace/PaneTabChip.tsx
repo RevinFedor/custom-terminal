@@ -157,7 +157,7 @@ export default function PaneTabChip({
   return (
     <TabCard
       ref={chipRef}
-      projectId={projectId} tabId={tabId} shown={shown} active={shown && paneFocused}
+      projectId={projectId} tabId={tabId} shown={shown} active={shown}
       pressed={pressed} showShownStripe={inStrip} truncate={!inStrip}
       interactiveStatus sharedActivity={sharedActivity}
       onLinkedFileOpen={previewOnly ? undefined : file => {
@@ -176,10 +176,8 @@ export default function PaneTabChip({
       data-split-pane-tab-chip
       data-tab-id={tabId}
       data-chip-shown={shown ? '1' : '0'}
-      // `shown` answers what every window displays; `active` answers which
-      // displayed tab belongs to the focused window. Keep both facts in the
-      // DOM: sidebar keyboard ownership may quiet the other windows, but must
-      // never erase the active marker from the tab it just placed.
+      // Selection stays bright in every window. This separate DOM flag records
+      // keyboard focus for diagnostics; it must not dim another window's chip.
       data-chip-active={shown && paneFocused ? '1' : '0'}
       data-chip-pressed={pressed ? '1' : '0'}
       data-chip-index={index}

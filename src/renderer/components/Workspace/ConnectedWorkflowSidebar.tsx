@@ -143,7 +143,7 @@ export default function ConnectedWorkflowSidebar({activity}:{activity:SharedTabA
           if(!file)return false;
           return openTabLinkedFile(owner.projectId,file,()=>useWorkspaceStore.getState().openTabById(owner.tabId,{reason:'linked-file'}));
         }
-        return store.openTabById(id,{reason:'workflow-reserve'});
+        return store.openTabById(id,{reason:'workflow-reserve',unplacedMode:'replace-shown'});
       }}
       onOpenFile={(namespace,file) => void openTabLinkedFile(namespace,file,() => useWorkspaceStore.getState().openTabById(file.ownerTabId,{reason:'linked-file'}))}
       onCreateTab={async request => {

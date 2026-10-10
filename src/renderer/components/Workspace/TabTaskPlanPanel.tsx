@@ -1,22 +1,23 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom';
 import {
   Archive,
   ArchiveRestore,
   Check,
   CheckSquare,
+  ClipboardList,
   CornerDownRight,
   ListChecks,
   ListPlus,
   PanelRightDashed,
   Plus,
-  Redo2,
   Square,
   TextCursorInput,
   Trash2,
-  Undo2,
+  X,
 } from 'lucide-react';
+import TaskPlanPopover, { TaskPlanPopupOwner } from './TaskPlanPopover';
 import {
   useWorkspaceStore,
   type CommandType,
@@ -334,6 +335,7 @@ function PlanTitleField({
   onDraftChange: (fieldId: string, draft: string | null) => void;
   onAutoFocusConsumed: () => void;
 }) {
+  const popupOwner = useContext(TaskPlanPopupOwner);
   const [editing, setEditing] = useState(autoFocus);
   const [draft, setDraft] = useState(value);
   const [pendingCommit, setPendingCommit] = useState<string | null>(null);
@@ -370,7 +372,7 @@ function PlanTitleField({
     if (!editing) return;
     const editor = inputRef.current;
     if (!editor) return;
-    editor.focus();
+    editor.focus({ preventScroll: true });
     editor.setSelectionRange(editor.value.length, editor.value.length);
   }, [editing]);
 
@@ -405,6 +407,18 @@ function PlanTitleField({
     const query = suffix.trim().toLocaleLowerCase();
     return files.filter((file) => !query || file.name.toLocaleLowerCase().includes(query)).slice(0, 10);
   }, [files, suffix, wantsFiles]);
+
+  useEffect(() => {
+    if (!popupOwner || !wantsFiles || !matches.length) return;
+    const closePicker = (event: MouseEvent) => {
+      if (event.target instanceof Node && inputRef.current?.contains(event.target)) return;
+      if (event.target instanceof Element
+        && event.target.closest('[data-task-plan-file-picker]')?.getAttribute('data-task-plan-popup-owner') === popupOwner) return;
+      setPickerDismissed(true);
+    };
+    window.addEventListener('mousedown', closePicker);
+    return () => window.removeEventListener('mousedown', closePicker);
+  }, [matches.length, popupOwner, wantsFiles]);
 
   useLayoutEffect(() => {
     if (!wantsFiles || matches.length === 0) {
@@ -491,7 +505,7 @@ function PlanTitleField({
           display: '-webkit-box', width: '100%', minWidth: 0, padding: '3px 5px',
           textAlign: 'left', color: '#d2d2d2', background: 'transparent', border: '1px solid transparent',
           borderRadius: 5, cursor: 'text', overflow: 'hidden', whiteSpace: 'normal',
-          WebkitBoxOrient: 'vertical', WebkitLineClamp: 2,
+          WebkitBoxOrient: 'vertical', WebkitLineClamp: popupOwner ? undefined : 2,
           fontSize: 12, lineHeight: 1.3, overflowWrap: 'anywhere', outline: 'none',
         }}
         onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(255,255,255,0.045)'; event.currentTarget.style.borderColor = 'rgba(255,255,255,0.06)'; }}
@@ -511,6 +525,7 @@ function PlanTitleField({
   const picker = anchorRect && matches.length > 0 ? ReactDOM.createPortal(
     <div
       data-task-plan-file-picker
+      data-task-plan-popup-owner={popupOwner}
       style={{
         position: 'fixed',
         left: Math.max(8, Math.min(anchorRect.left, window.innerWidth - 328)),
@@ -569,6 +584,7 @@ function PlanTitleField({
         <textarea
           ref={inputRef}
           className="task-plan-title-editor"
+          data-task-plan-autofocus={autoFocus || undefined}
           spellCheck={false}
           rows={1}
           wrap="soft"
@@ -615,6 +631,7 @@ function PlanTitleField({
               inputRef.current?.blur();
             } else if (event.key === 'Escape') {
               event.preventDefault();
+              event.stopPropagation();
               if (wantsFiles && !pickerDismissed) setPickerDismissed(true);
               else finish(false);
             }
@@ -633,10 +650,10 @@ function PlanTitleField({
   );
 }
 
-function StatusMarker({ status, size, shape }: { status: SessionStatusDef; size: number; shape: 'dot' | 'square' }) {
+function StatusMarker({ status, size, shape, hint = true }: { status: SessionStatusDef; size: number; shape: 'dot' | 'square'; hint?: boolean }) {
   return (
     <span
-      title={status.description ? `${status.label} — ${status.description}` : status.label}
+      title={hint ? (status.description ? `${status.label} — ${status.description}` : status.label) : undefined}
       style={{
         display: 'inline-block', width: size, height: size, flexShrink: 0,
         borderRadius: shape === 'dot' ? '50%' : Math.max(1, Math.round(size * 0.22)),
@@ -656,6 +673,73 @@ type TaskMenuState = {
   | { kind: 'selection' }
 );
 
+function CompactTaskStrip({ items, marker, statuses, onOpen, onHover, onContextMenu }: {
+  items: TabTaskPlanItem[];
+  marker: { sizePx: number; shape: 'dot' | 'square'; showTitles?: boolean };
+  statuses: Map<string, SessionStatusDef>;
+  onOpen: (task: TabTaskPlanItem, element: HTMLElement) => void;
+  onHover: (task: TabTaskPlanItem, element: HTMLElement) => void;
+  onContextMenu: (event: React.MouseEvent, task: TabTaskPlanItem, archived: boolean) => void;
+}) {
+  const root = useRef<HTMLDivElement>(null), viewport = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const [overflow, setOverflow] = useState({ before: 0, after: 0 });
+  useLayoutEffect(() => {
+    const outer = root.current, view = viewport.current, row = content.current;
+    if (!outer || !view || !row) return;
+    const measure = () => {
+      const children = Array.from(row.children) as HTMLElement[];
+      const needsScroll = row.scrollWidth > outer.clientWidth + 1;
+      const before = needsScroll ? children.filter(n => n.offsetLeft < view.scrollLeft - 1).length : 0;
+      const after = needsScroll ? children.filter(n => n.offsetLeft + n.offsetWidth > view.scrollLeft + view.clientWidth + 1).length : 0;
+      setOverflow(old => old.before === before && old.after === after ? old : { before, after });
+    };
+    const wheel = (event: WheelEvent) => {
+      if (event.ctrlKey || event.shiftKey || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+      const next = Math.max(0, Math.min(view.scrollWidth - view.clientWidth, view.scrollLeft + event.deltaY));
+      if (next === view.scrollLeft) return;
+      event.preventDefault(); event.stopPropagation(); view.scrollLeft = next;
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(outer); observer.observe(view); observer.observe(row);
+    measure(); view.addEventListener('scroll', measure); view.addEventListener('wheel', wheel, { passive: false });
+    return () => { observer.disconnect(); view.removeEventListener('scroll', measure); view.removeEventListener('wheel', wheel); };
+  }, [items, marker.showTitles, marker.sizePx]);
+  const hidden = overflow.after || overflow.before;
+  return <div ref={root} data-task-plan-compact-summary style={{ display: 'flex', alignItems: 'center', flex: 1, minWidth: 0 }}>
+    <div ref={viewport} data-task-plan-topic-strip style={{ minWidth: 0, flex: 1, overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'none' }}>
+      <div ref={content} style={{ position: 'relative', display: 'flex', width: 'max-content', alignItems: 'center', gap: 4 }}>
+        {items.map(task => {
+          const status = task.statusId ? statuses.get(task.statusId) : undefined;
+          return <button key={task.id} type="button" data-task-plan-topic={task.id} aria-label={task.title}
+            onClick={event => { event.stopPropagation(); onOpen(task, event.currentTarget); }}
+            onMouseEnter={event => onHover(task, event.currentTarget)}
+            onFocus={event => onHover(task, event.currentTarget)}
+            onContextMenu={event => onContextMenu(event, task, false)}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexShrink: 0, maxWidth: 112,
+              padding: '3px 2px', border: 0, borderRadius: 3, background: 'transparent', color: '#b8b8be',
+              fontSize: 11, lineHeight: '16px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
+            {status ? <StatusMarker status={status} size={marker.sizePx} shape={marker.shape} hint={false} />
+              : <span style={{ width: marker.sizePx, height: marker.sizePx, flexShrink: 0, background: '#73737a', borderRadius: marker.shape === 'dot' ? '50%' : 2 }} />}
+            {marker.showTitles !== false && <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{task.title}</span>}
+            {task.subtasks.length > 0 && <span style={{ color: '#777', fontSize: 9 }}>×{task.subtasks.length}</span>}
+          </button>;
+        })}
+      </div>
+    </div>
+    {hidden > 0 && <button type="button" data-task-plan-overflow
+      aria-label={`Ещё ${hidden} задач ${overflow.after ? 'справа' : 'слева'}`}
+      onClick={event => {
+        event.stopPropagation();
+        const view = viewport.current;
+        if (!view) return;
+        view.scrollBy({ left: (overflow.after ? 1 : -1) * Math.max(60, view.clientWidth - 20), behavior: 'auto' });
+      }} style={{ flexShrink: 0, padding: '2px 3px', color: '#a78bfa', fontSize: 10, border: 0, background: 'transparent', cursor: 'pointer' }}>
+      +{hidden}
+    </button>}
+  </div>;
+}
+
 function TabTaskPlanPanel({
   tabId,
   projectPath,
@@ -667,8 +751,13 @@ function TabTaskPlanPanel({
   inputSurface: TaskPlanInputSurface;
   commandType: CommandType | null;
 }) {
+  const popupOwner = useId();
   const workingContext = useTabWorkContext(tabId);
   const [descriptionExpanded, setDescriptionExpanded] = useState(false);
+  const responsibilityTrigger = useRef<HTMLButtonElement>(null);
+  const [taskEditor, setTaskEditor] = useState<{ id: string; anchor: HTMLElement } | null>(null);
+  const [taskPreview, setTaskPreview] = useState<{ id: string; anchor: HTMLElement } | null>(null);
+  const closingEditor = useRef(false);
   useEffect(() => setDescriptionExpanded(false), [tabId]);
   const plan = useWorkspaceStore((state) => {
     for (const workspace of state.openProjects.values()) {
@@ -729,6 +818,8 @@ function TabTaskPlanPanel({
     setAnimatedArchiveTabId(null);
     setAnimatedWidthTabId(null);
     setDraftTitles({});
+    setTaskEditor(null);
+    setTaskPreview(null);
   }, [tabId]);
 
   useLayoutEffect(() => {
@@ -806,6 +897,8 @@ function TabTaskPlanPanel({
   useEffect(() => {
     const clearPanelFocus = (event?: Event) => {
       if (event?.target instanceof Node && panelRef.current?.contains(event.target)) return;
+      if (event?.target instanceof Element
+        && event.target.closest('[data-task-plan-popup-owner]')?.getAttribute('data-task-plan-popup-owner') === popupOwner) return;
       const active = document.activeElement;
       if (active instanceof HTMLElement && panelRef.current?.contains(active)) active.blur();
       setPanelFocused(false);
@@ -816,7 +909,7 @@ function TabTaskPlanPanel({
       window.removeEventListener('mousedown', clearPanelFocus);
       window.removeEventListener('blur', clearPanelFocus);
     };
-  }, []);
+  }, [popupOwner]);
 
   const archivedItems = plan.archivedItems || EMPTY_PLAN.archivedItems;
   const visibleItems = useMemo(
@@ -880,21 +973,64 @@ function TabTaskPlanPanel({
     return applyOperations(tabId, operations);
   }, [applyOperations, tabId]);
 
+  const editorTask = taskEditor
+    ? [...plan.items, ...archivedItems].find(task => task.id === taskEditor.id) : null;
+  const editorArchived = !!editorTask && archivedItems.some(task => task.id === editorTask.id);
+  const previewTask = taskPreview ? plan.items.find(task => task.id === taskPreview.id) : null;
+  const closeTaskEditor = useCallback(async () => {
+    if (closingEditor.current) return;
+    const opening = taskEditor;
+    if (!opening) return;
+    closingEditor.current = true;
+    try {
+      const task = plan.items.find(item => item.id === opening.id);
+      const operations: TabTaskPlanOperation[] = [];
+      if (task) {
+        const title = draftTitles[task.id]?.trim();
+        if (title && title !== task.title) operations.push({ type: 'update_task', taskId: task.id, title });
+        for (const child of task.subtasks) {
+          const draft = draftTitles[child.id]?.trim();
+          if (draft && draft !== child.title) operations.push({ type: 'update_subtask', taskId: task.id, subtaskId: child.id, title: draft });
+        }
+      }
+      if (operations.length && !(await apply(operations))) {
+        showToast('Не удалось сохранить задачу. Текст остался в редакторе.', 'error', 3500);
+        return;
+      }
+      setTaskEditor(current => current === opening ? null : current);
+    } finally { closingEditor.current = false; }
+  }, [apply, draftTitles, plan.items, showToast, taskEditor]);
+
+  const openTaskEditor = useCallback((task: TabTaskPlanItem, anchor: HTMLElement) => {
+    setTaskPreview(null); setDescriptionExpanded(false);
+    if (taskEditor?.id === task.id) { void closeTaskEditor(); return; }
+    setTaskEditor({ id: task.id, anchor });
+  }, [closeTaskEditor, taskEditor]);
+  useEffect(() => {
+    if (taskEditor && !editorTask) setTaskEditor(null);
+    if (taskPreview && !previewTask) setTaskPreview(null);
+  }, [editorTask, previewTask, taskEditor, taskPreview]);
+
   const addRoot = useCallback(async () => {
     setShowArchive(false);
     const document = await apply([{ type: 'add_task', title: 'Новая задача' }]);
     const created = document?.items[document.items.length - 1];
     if (created) {
-      setPanelExpanded(true);
+      setTaskPreview(null); setDescriptionExpanded(false);
+      if (panelRef.current) setTaskEditor({ id: created.id, anchor: panelRef.current });
       setAutoEditId(created.id);
     }
-  }, [apply, setPanelExpanded]);
+  }, [apply]);
 
   const addSubtask = useCallback(async (task: TabTaskPlanItem) => {
     const document = await apply([{ type: 'add_subtask', taskId: task.id, title: 'Новая подзадача' }]);
     const updated = document?.items.find((item) => item.id === task.id);
     const created = updated?.subtasks[updated.subtasks.length - 1];
-    if (created) setAutoEditId(created.id);
+    if (created) {
+      setTaskPreview(null);
+      if (panelRef.current) setTaskEditor({ id: task.id, anchor: panelRef.current });
+      setAutoEditId(created.id);
+    }
   }, [apply]);
 
   const inputTarget = useMemo(
@@ -1223,10 +1359,6 @@ function TabTaskPlanPanel({
     }
   }, [findRedoInputTransaction, redo, showToast, tabId]);
 
-  const focusPlanPanel = useCallback(() => {
-    panelRef.current?.focus({ preventScroll: true });
-  }, []);
-
   const handlePanelKeyDown = useCallback((event: React.KeyboardEvent<HTMLElement>) => {
     if (!event.metaKey || event.altKey || isTextEditingElement(event.target)) return;
     const key = event.key.toLocaleLowerCase();
@@ -1313,6 +1445,8 @@ function TabTaskPlanPanel({
     };
     const finish = () => {
       setIsResizing(false);
+      setCollapsedWidth(latestWidth);
+      saveCollapsedWidth(tabId, latestWidth);
       setPanelLayout((current) => {
         const next = { ...current, reserveWidth: latestWidth };
         savePanelLayout(next);
@@ -1321,7 +1455,7 @@ function TabTaskPlanPanel({
     };
 
     startPlanResize(event, { cursor: 'ew-resize', onMove: move, onEnd: finish });
-  }, [panelLayout.reserveWidth, panelLayout.resizeEnabled, startPlanResize]);
+  }, [panelLayout.reserveWidth, panelLayout.resizeEnabled, startPlanResize, tabId]);
 
   const toggleResize = useCallback(() => {
     setResizeHovered(false);
@@ -1351,7 +1485,8 @@ function TabTaskPlanPanel({
         boxShadow: '0 14px 34px rgba(0,0,0,0.6)',
       }}
       onContextMenu={(event) => event.preventDefault()}
-      onMouseDown={(event) => event.preventDefault()}
+      onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); }}
+      onClick={(event) => event.stopPropagation()}
     >
       <button
         type="button"
@@ -1586,7 +1721,8 @@ function TabTaskPlanPanel({
           boxShadow: '0 14px 34px rgba(0,0,0,0.6)',
         }}
         onContextMenu={(event) => event.preventDefault()}
-        onMouseDown={(event) => event.preventDefault()}
+        onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); }}
+        onClick={(event) => event.stopPropagation()}
       >
         {taskMenuContent}
       </div>
@@ -1602,9 +1738,8 @@ function TabTaskPlanPanel({
     availableWidth,
     contentDisplayedWidth + selectionLaneWidth,
   );
-  const displayedWidth = !workingContext.responsibility && !expanded && collapsedWidth !== null
-    ? Math.min(availableWidth, collapsedWidth)
-    : expandedDisplayWidth;
+  const displayedWidth = expanded ? expandedDisplayWidth
+    : Math.min(availableWidth, panelLayout.resizeEnabled ? reserveDisplayWidth : (collapsedWidth ?? reserveDisplayWidth));
   const hostDisplayWidth = Math.min(
     availableWidth,
     Math.max(reserveDisplayWidth, displayedWidth),
@@ -1746,24 +1881,14 @@ function TabTaskPlanPanel({
           )}
 
           <div style={{ flex: 1, minWidth: 0 }}>
-            {expanded && !archived && !selectionMode ? (
-              <PlanTitleField
-                fieldId={task.id}
-                value={task.title}
-                projectPath={projectPath}
-                autoFocus={autoEditId === task.id}
-                onDraftChange={handleDraftChange}
-                onAutoFocusConsumed={() => setAutoEditId(null)}
-                onCommit={(title) => apply([{ type: 'update_task', taskId: task.id, title }])}
-              />
-            ) : (
               <button
                 type="button"
+                data-task-plan-open={task.id}
                 tabIndex={canSelect ? -1 : 0}
                 onClick={(event) => {
                   event.stopPropagation();
                   if (canSelect) toggleTaskSelection(task);
-                  else if (!expanded) setPanelExpanded(true);
+                  else openTaskEditor(task, event.currentTarget);
                 }}
                 title={task.title}
                 style={{
@@ -1776,7 +1901,7 @@ function TabTaskPlanPanel({
                   background: 'transparent',
                   border: 0,
                   borderRadius: 5,
-                  cursor: canSelect || !expanded ? 'pointer' : 'default',
+                  cursor: 'pointer',
                   overflow: 'hidden',
                   whiteSpace: 'normal',
                   WebkitBoxOrient: 'vertical',
@@ -1789,7 +1914,6 @@ function TabTaskPlanPanel({
               >
                 {renderTitle(task.title)}
               </button>
-            )}
           </div>
 
           {canSelect && selectionControlsVisible && (
@@ -1845,9 +1969,12 @@ function TabTaskPlanPanel({
                   key={subtask.id}
                   data-task-plan-task-id={subtask.id}
                   onClick={(event) => {
-                    if (!canSelect) return;
                     event.stopPropagation();
-                    toggleSubtaskSelection(subtask.id);
+                    if (canSelect) toggleSubtaskSelection(subtask.id);
+                    else {
+                      openTaskEditor(task, event.currentTarget);
+                      if (!archived) setAutoEditId(subtask.id);
+                    }
                   }}
                   onContextMenu={(event) => {
                     if (archived) openTaskMenu(event, task, true);
@@ -1897,22 +2024,6 @@ function TabTaskPlanPanel({
                     style={{ flexShrink: 0 }}
                   />
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    {!archived && !selectionMode ? (
-                      <PlanTitleField
-                        fieldId={subtask.id}
-                        value={subtask.title}
-                        projectPath={projectPath}
-                        autoFocus={autoEditId === subtask.id}
-                        onDraftChange={handleDraftChange}
-                        onAutoFocusConsumed={() => setAutoEditId(null)}
-                        onCommit={(title) => apply([{
-                          type: 'update_subtask',
-                          taskId: task.id,
-                          subtaskId: subtask.id,
-                          title,
-                        }])}
-                      />
-                    ) : (
                       <div
                         style={{
                           padding: '3px 5px',
@@ -1924,7 +2035,6 @@ function TabTaskPlanPanel({
                       >
                         {renderTitle(subtask.title)}
                       </div>
-                    )}
                   </div>
                   {canSelect && selectionControlsVisible && (
                     <button
@@ -2029,6 +2139,8 @@ function TabTaskPlanPanel({
         }}
       >
         <style>{`
+          [data-task-plan-topic-strip]::-webkit-scrollbar { display: none; }
+          [data-task-plan-topic]:hover { background: rgba(255,255,255,0.06) !important; }
           [data-tab-task-plan] > [data-tab-responsibility]:hover,
           [data-tab-task-plan] > [data-task-plan-header]:hover {
             box-shadow: inset 0 0 0 999px rgba(255,255,255,0.045);
@@ -2065,20 +2177,6 @@ function TabTaskPlanPanel({
           />
         )}
 
-        {workingContext.responsibility && <button
-          type="button"
-          data-tab-responsibility
-          aria-expanded={descriptionExpanded}
-          title="Область ответственности"
-          onClick={() => setDescriptionExpanded((value) => !value)}
-          style={{ display: 'block', width: '100%', boxSizing: 'border-box', padding: '5px 8px',
-            border: 0, borderBottom: '1px solid #303036', background: 'transparent', color: '#b9b9c1',
-            textAlign: 'left', fontSize: 12, lineHeight: 1.5, cursor: 'pointer',
-            whiteSpace: descriptionExpanded ? 'pre-wrap' : 'nowrap', overflow: 'hidden',
-            overflowWrap: 'anywhere', textOverflow: 'ellipsis', maxHeight: descriptionExpanded ? '40vh' : 29,
-            overflowY: descriptionExpanded ? 'auto' : 'hidden' }}>
-          {workingContext.responsibility}
-        </button>}
         <div
           data-task-plan-header
           role="button"
@@ -2105,6 +2203,17 @@ function TabTaskPlanPanel({
             overflow: 'hidden',
           }}
         >
+          {workingContext.responsibility && <button
+            ref={responsibilityTrigger} type="button" data-tab-responsibility aria-expanded={descriptionExpanded}
+            aria-label={`Область ответственности · ${workingContext.responsibility.length} символов`}
+            title="Область ответственности"
+            onClick={event => { event.stopPropagation(); setTaskPreview(null); setTaskEditor(null); setDescriptionExpanded(value => !value); }}
+            style={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0, gap: 3, padding: '2px 3px',
+              border: 0, borderRight: '1px solid #38383c', borderRadius: 0, background: 'transparent',
+              color: '#88888e', fontSize: 10, cursor: 'pointer' }}>
+            <ClipboardList size={12} />
+            {Intl.NumberFormat('ru', { notation: 'compact', maximumFractionDigits: 1 }).format(workingContext.responsibility.length)}
+          </button>}
           <button
             type="button"
             onClick={(event) => {
@@ -2132,56 +2241,10 @@ function TabTaskPlanPanel({
             <Plus size={11} />
             <span>New</span>
           </button>
-          {!expanded && (
-            <span
-              data-task-plan-compact-summary
-              aria-hidden
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-                minWidth: 0,
-                overflow: 'hidden',
-                flexShrink: 1,
-                pointerEvents: 'none',
-              }}
-            >
-              {plan.items.map((task) => {
-                const compactStatus = task.statusId ? statusById.get(task.statusId) : undefined;
-                return (
-                  <span
-                    key={task.id}
-                    style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 2,
-                      flexShrink: 0,
-                      color: '#77777d',
-                      fontSize: 9,
-                      lineHeight: 1,
-                    }}
-                  >
-                    {compactStatus ? (
-                      <StatusMarker status={compactStatus} size={marker.sizePx} shape={marker.shape} />
-                    ) : (
-                      <span
-                        style={{
-                          width: marker.sizePx,
-                          height: marker.sizePx,
-                          background: '#73737a',
-                          border: '1px solid rgba(0,0,0,0.38)',
-                          borderRadius: marker.shape === 'dot' ? '50%' : 2,
-                          boxSizing: 'border-box',
-                        }}
-                      />
-                    )}
-                    {task.subtasks.length > 0 && <span>×{task.subtasks.length}</span>}
-                  </span>
-                );
-              })}
-            </span>
-          )}
-          <span aria-hidden style={{ flex: 1, minWidth: 4 }} />
+          <CompactTaskStrip items={plan.items} marker={marker} statuses={statusById}
+            onOpen={openTaskEditor}
+            onHover={(task, anchor) => { if (!taskEditor && !descriptionExpanded && !taskMenu && !statusMenu) setTaskPreview({ id: task.id, anchor }); }}
+            onContextMenu={(event, task, archived) => { setTaskPreview(null); openTaskMenu(event, task, archived); }} />
           <button
             type="button"
             aria-pressed={selectionMode}
@@ -2330,71 +2393,6 @@ function TabTaskPlanPanel({
         </div>
 
         <div
-          style={{
-            display: 'grid',
-            gridTemplateRows: expanded ? '1fr' : '0fr',
-            opacity: expanded ? 1 : 0,
-            transition: animateExpansion
-              ? 'grid-template-rows 170ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 110ms ease'
-              : 'none',
-          }}
-        >
-          <div style={{ minHeight: 0, overflow: 'hidden' }}>
-            <div
-              data-task-plan-footer
-              onMouseDown={(event) => {
-                if (event.target === event.currentTarget) focusPlanPanel();
-              }}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                height: 22,
-                padding: '1px 3px',
-                borderTop: '1px solid #28282d',
-              }}
-            >
-              <span aria-hidden style={{ flex: 1, minWidth: 6 }} />
-              <button
-                type="button"
-                disabled={plan.history.past.length === 0}
-                onClick={() => void runPlanUndo()}
-                title="Назад · Cmd+Z"
-                style={{
-                  display: 'inline-flex',
-                  padding: 2,
-                  color: plan.history.past.length ? '#aaa' : '#444',
-                  background: 'transparent',
-                  border: 0,
-                  borderRadius: 3,
-                  cursor: plan.history.past.length ? 'pointer' : 'default',
-                  outline: 'none',
-                }}
-              >
-                <Undo2 size={12} />
-              </button>
-              <button
-                type="button"
-                disabled={plan.history.future.length === 0}
-                onClick={() => void runPlanRedo()}
-                title="Вперёд · Cmd+Y"
-                style={{
-                  display: 'inline-flex',
-                  padding: 2,
-                  color: plan.history.future.length ? '#aaa' : '#444',
-                  background: 'transparent',
-                  border: 0,
-                  borderRadius: 3,
-                  cursor: plan.history.future.length ? 'pointer' : 'default',
-                  outline: 'none',
-                }}
-              >
-                <Redo2 size={12} />
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div
           ref={titleMeasureRef}
           aria-hidden
           style={{
@@ -2479,6 +2477,50 @@ function TabTaskPlanPanel({
       )}
       {statusMenuNode}
       {taskMenuNode}
+      {taskPreview && previewTask && !taskEditor && panelRef.current && <TaskPlanPopover
+        owner={popupOwner} tabId={tabId} mode="preview" anchor={taskPreview.anchor} panel={panelRef.current}
+        onClose={() => setTaskPreview(null)}>
+        {renderTitle(previewTask.title)}
+      </TaskPlanPopover>}
+      {descriptionExpanded && responsibilityTrigger.current && panelRef.current && <TaskPlanPopover
+        owner={popupOwner} tabId={tabId} mode="editor" anchor={responsibilityTrigger.current} panel={panelRef.current}
+        onClose={() => setDescriptionExpanded(false)}>
+        <div style={{ display: 'flex', alignItems: 'start', gap: 4 }}>
+          <div style={{ flex: 1, whiteSpace: 'pre-wrap', padding: 3 }}>{workingContext.responsibility}</div>
+          <button type="button" aria-label="Закрыть область ответственности" onClick={() => setDescriptionExpanded(false)}
+            style={{ display: 'inline-flex', padding: 2, background: 'transparent', border: 0, color: '#888', cursor: 'pointer' }}><X size={13} /></button>
+        </div>
+      </TaskPlanPopover>}
+      {taskEditor && editorTask && panelRef.current && <TaskPlanPopover
+        key={editorTask.id} owner={popupOwner} tabId={tabId} mode="editor" anchor={taskEditor.anchor} panel={panelRef.current}
+        childrenOpen={!!statusMenu || !!taskMenu} onClose={() => { void closeTaskEditor(); }}>
+        <div data-task-plan-editor={editorTask.id} onKeyDown={handlePanelKeyDown}
+          onContextMenu={event => openTaskMenu(event, editorTask, editorArchived)}>
+          <div style={{ display: 'flex', alignItems: 'start', gap: 4 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              {editorArchived ? <div style={{ padding: '3px 5px' }}>{renderTitle(editorTask.title)}</div> : <PlanTitleField
+                fieldId={editorTask.id} value={editorTask.title} projectPath={projectPath}
+                autoFocus={autoEditId === editorTask.id} onDraftChange={handleDraftChange}
+                onAutoFocusConsumed={() => setAutoEditId(null)}
+                onCommit={title => apply([{ type: 'update_task', taskId: editorTask.id, title }])} />}
+            </div>
+            <button type="button" aria-label="Закрыть задачу" onMouseDown={event => event.preventDefault()}
+              onClick={() => { void closeTaskEditor(); }}
+              style={{ display: 'inline-flex', padding: 2, background: 'transparent', border: 0, color: '#888', cursor: 'pointer' }}><X size={13} /></button>
+          </div>
+          {editorTask.subtasks.map(child => <div key={child.id} style={{ display: 'flex', gap: 4, alignItems: 'start', marginTop: 2 }}
+            onContextMenu={event => { if (editorArchived) openTaskMenu(event, editorTask, true); else openSubtaskMenu(event, editorTask.id, child.id); }}>
+            <CornerDownRight size={11} style={{ flexShrink: 0, marginTop: 6, color: '#777' }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              {editorArchived ? <div style={{ padding: '3px 5px' }}>{renderTitle(child.title)}</div> : <PlanTitleField
+                fieldId={child.id} value={child.title} projectPath={projectPath}
+                autoFocus={autoEditId === child.id} onDraftChange={handleDraftChange}
+                onAutoFocusConsumed={() => setAutoEditId(null)}
+                onCommit={title => apply([{ type: 'update_subtask', taskId: editorTask.id, subtaskId: child.id, title }])} />}
+            </div>
+          </div>)}
+        </div>
+      </TaskPlanPopover>}
     </div>
   );
 }

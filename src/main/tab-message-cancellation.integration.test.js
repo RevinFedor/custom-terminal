@@ -50,8 +50,10 @@ async function fixture(t, options = {}) {
       return { tabId: id, projectId: 'P', provider: 'codex', sessionId: 'session-' + id };
     },
     getReceipt: key => queue.projectRecord(store.get(key)), receiptRequiredBeforeSend: true,
+    releaseReceipt: key => store.unpinForOwner(key, 'tab-message'),
     cancelDelivery: message => prepareTabMessageDeliveryCancellation({ store, queue, db }, message),
     send: async message => {
+      store.pinForOwner(message.operationKey, 'tab-message');
       await options.beforePrepare?.(message);
       service.assertDeliveryActive(message.messageId);
       const req = { tabId: message.targetTabId, handoffId: message.handoffId,
@@ -108,6 +110,8 @@ test('cancel after provider queue acceptance retires the quiescent input slot, n
   assert.equal(h.store.get(q.operationKey).state, old.state);
   assert.deepEqual(h.store.get(q.operationKey).receipt, old.receipt);
   assert.equal(h.queue.queueInfo(q.operationKey).inputSlot.state, 'retired');
+  assert.equal(h.db.prepare("SELECT 1 FROM agent_send_receipt_pins WHERE operation_key=? AND owner='tab-message'").get(q.operationKey), undefined);
+  assert.ok(h.db.prepare("SELECT 1 FROM agent_send_receipt_pins WHERE operation_key=? AND owner='application-send-queue'").get(q.operationKey));
   assert.ok(h.queue.projectRecord(h.store.get(q.operationKey)).receipt.presentationDismissedAt);
   const later = { tabId: 'B', handoffId: 'later', sendOperationKey: 'history:B:later', prompt: 'new user input', surface: 'desktop-history' };
   h.queue.enqueue({ identity: h.identity(later), request: later }); await tick(); await tick();

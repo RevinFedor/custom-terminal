@@ -403,6 +403,31 @@ test('timer pause and per-item trigger/condition edits use the same owners; no f
   assert.equal(f.state().getQueue('T').items[0].trigger.armedInstanceId, 'application-A');
 });
 
+test('multi-tab wait roundtrips through the existing API; clients cannot submit fabricated completion progress', async t => {
+  const f = await fixture(t), added = await f.mutate('add', { text: 'WAIT ALL' });
+  const id = added.value.operation.result.itemId;
+  const set = await f.mutate('setTrigger', { id, trigger: { kind: 'onTab', tabId: 'fresh',
+    dependencies: [{ tabId: 'fresh', armedAt: 0, completedAt: 99999 }, { tabId: 'claude', armedAt: 0, completedAt: 99999 }] } });
+  assert.equal(set.status, 200, JSON.stringify(set.value));
+  const stored = f.state().getQueue('T').items[0].trigger;
+  assert.equal(stored.dependencies.length, 2);
+  assert.equal(stored.dependencies.some(dep => dep.completedAt !== undefined), false);
+  assert.equal(f.state().getQueue('T').autoRun, true);
+  const seen = (await f.read()).value.queue.items[0].trigger;
+  assert.equal(seen.dependencies.length, 2);
+  const invalid = await f.mutate('setTrigger', { id, trigger: { kind: 'onTab', tabId: 'fresh', dependencies: [{ tabId: 'missing' }] } });
+  assert.equal(invalid.status, 400);
+  assert.equal(f.state().getQueue('T').items[0].trigger.dependencies.length, 2);
+  f.state().completePromptTabDependency('T', id, 'fresh', stored.dependencies[0].armedAt + 1);
+  const partial = (await f.read()).value.queue.items[0].trigger;
+  assert.equal(partial.dependencies[0].completedAt !== undefined, true);
+  assert.equal(partial.dependencies[1].completedAt, undefined);
+  await f.owners.persistPromptQueueDeliveryPointer();
+  assert.equal(f.db.getAppState('promptQueueByTab').T.items[0].trigger.dependencies[0].completedAt,
+    partial.dependencies[0].completedAt, 'partial progress belongs to the existing SQLite queue owner');
+  assert.equal(f.dispatched.length, 0);
+});
+
 test('existing editor lock blocks another writer, paired action update preserves ordering/title and rewind ordinal', async t => {
   const f = await fixture(t);
   const added = await f.mutate('addAction', { kind: 'restart' }); const id = added.value.operation.result.itemId;

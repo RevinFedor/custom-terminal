@@ -680,6 +680,20 @@ function noteRunAfterWake(event, value) {
   runAfterWakeRevision++; scheduleTabActivityBroadcast?.('run-after'); return true;
 }
 
+function idleStopQueueActivityKey(tabId) {
+  // A tab with no saved queue has no per-tab publication yet. Root readiness
+  // still wakes its first failed observation after renderer/bridge startup.
+  return runAfterMetadataVersions.get(tabId) || 'root-wake:' + runAfterWakeRevision;
+}
+async function readIdleStopQueueGuard(tabId) {
+  const value = await getRunAfterApi().read(tabId);
+  const runtime = value.runAfter.runtime;
+  return { known: !!runtime && value.runAfter.known === true && runtime.appInstanceKnown === true,
+    busy: !runtime || runtime.pending || runtime.ownBusy === true || runtime.inheritedBusy === true
+      || ['shutdown', 'executing', 'awaiting-agent', 'waiting-readiness', 'checking-condition', 'editing', 'delivery-unknown'].includes(runtime.phase)
+      || ['waiting', 'checking', 'resuming', 'compacting'].includes(runtime.autoCompact?.phase) };
+}
+
 function tabActivityProjection(scope = {}) {
   return publicTabActivity ? { tabActivity: publicTabActivity.capture(scope) } : {};
 }
@@ -2916,7 +2930,8 @@ function durableAgentSendReplay(record, overrides = {}) {
     deliveryControl, inputSlot, replayed: true,
   };
   if (!require(path.join(srcMainDir, '../shared/agent-send-receipt-control.cjs'))
-    .canProjectCurrentProviderQueue({ ...record, inputSlot }) && state !== 'confirmed') return {
+    .canProjectCurrentProviderQueue({ ...record, inputSlot })
+    && !['confirmed', 'not-submitted', 'provider-not-accepted'].includes(state)) return {
     ...receipt, ...overrides, success: null, accepted: true,
     submitted: receipt.submitted === true ? true : null, status: 'delivery-unknown',
     queued: false, deliveryUnknown: true, providerQueueCurrent: false,
@@ -14229,6 +14244,8 @@ module.exports = {
   commitRunAfterOperation: (event, value) => getRunAfterApi().commit(event, value),
   stageRunAfterOperation: (event, value) => getRunAfterApi().stage(event, value),
   runAfterOwnerBusyProof,
+  idleStopQueueActivityKey,
+  readIdleStopQueueGuard,
   projectRunAfterMetadata,
   noteRunAfterWake,
 };

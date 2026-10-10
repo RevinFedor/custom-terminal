@@ -27,7 +27,10 @@ const ownershipNode = queueAst.statements.find(item => ts.isFunctionDeclaration(
   && item.name?.text === 'queueSendTransferredOwnership');
 assert.ok(ownershipNode, 'actual History/queue ownership classifier');
 const ownershipContext = vm.createContext({});
-vm.runInContext(ts.transpileModule(ownershipNode.getText(queueAst).replace(/^export /, ''), {
+const outcomeNode = queueAst.statements.find(item => ts.isFunctionDeclaration(item)
+  && item.name?.text === 'queueSendOutcome');
+assert.ok(outcomeNode, 'actual shared three-state ownership classifier');
+vm.runInContext(ts.transpileModule([outcomeNode, ownershipNode].map(node => node.getText(queueAst).replace(/^export /, '')).join('\n'), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText, ownershipContext);
 const ownershipTransferred = result => ownershipContext.queueSendTransferredOwnership(result);
@@ -395,7 +398,7 @@ test('actual History PTY send converts post-Enter SQLite failure to same-attempt
   const replay = await h.send();
   assert.equal(replay.status, 'delivery-unknown');
   assert.equal(replay.sendAttemptId, record.attemptId);
-  assert.equal(ownershipTransferred(replay), true, 'replay preserves the same pending History row');
+  assert.equal(ownershipContext.queueSendOutcome(replay), 'unknown', 'uncertain replay keeps the same row, not a fresh no-submit retry');
   assert.equal(h.writes.filter(value => value === '\r').length, 1,
     'same handoff replays its receipt without a second Enter');
 
@@ -427,7 +430,7 @@ test('actual safePaste Enter attempt that throws is unknown, not pre-submit; sta
     'Enter write was attempted once; result=' + JSON.stringify(result));
   assert.equal(result.success, null);
   assert.equal(result.submitted, null, 'throwing write has unknown physical completion');
-  assert.equal(ownershipTransferred(result), true, 'unknown physical write is not a fresh retry');
+  assert.equal(ownershipContext.queueSendOutcome(result), 'unknown', 'unknown physical write is not a no-submit retry');
   assert.equal(result.status, 'delivery-unknown');
   assert.equal(record.state, STORE_STATES.ENTER_ARMED);
   assert.equal(h.auditFinalizations.length, 0,

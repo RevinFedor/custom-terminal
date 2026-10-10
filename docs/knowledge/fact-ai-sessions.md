@@ -42,6 +42,12 @@ Noted Terminal обеспечивает глубокую интеграцию с
 
 ## Остановка сессий workflow
 
+Автоматический вариант10.10 — Run After → Settings → Auto-stop. Отдельный Main
+deadline-owner переиспользует нижеприведённые exact scope/owner и Stop primitives,
+но допускает только положительно подтверждённый простой AI. Политика, уже-idle,
+Root/draft guards и countdown — `fact-prompt-queue.md::Автоостановка простаивающих процессов`.
+Ни открытие меню, ни истечение числа секунд сами по себе не разрешают сигнал.
+
 Desktop `SpaceStrip` вызывает `workflow:stop-sessions` с явными workflowId и
 mode `idle`/`all`. Main берёт полное canonical active membership и сохраняет
 точный execution subject/namespace каждой цели. Вкладки без живого процесса,

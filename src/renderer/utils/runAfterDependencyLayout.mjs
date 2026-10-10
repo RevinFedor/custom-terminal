@@ -1,8 +1,10 @@
 /** Presentation only: an edge reads "owner waits for target", per queue item. */
+import { pendingPromptTabIds } from './promptQueueDependencies.mjs';
 export const RUN_AFTER_GROUP_INSET = 14;
 export const RUN_AFTER_DEPTH_INSET = 16;
+export const runAfterEdgeKey = edge => JSON.stringify([edge.source, edge.itemId, edge.target]);
 export function queueItemDependencyTarget(queue, item) {
-  if (item?.trigger?.kind === 'onTab') return item.trigger.tabId || null;
+  if (item?.trigger?.kind === 'onTab') return pendingPromptTabIds(item.trigger)[0] || null;
   const head = queue?.items?.find(candidate => candidate.enabled !== false);
   return item && head && item.id === head.id ? queue.runAfterTabId || null : null;
 }
@@ -10,10 +12,10 @@ export function queueItemDependencyTarget(queue, item) {
 export function collectQueueRelations(ownerId, queue) {
   const head = queue?.items?.find(item => item.enabled !== false);
   const edges = (queue?.items || []).flatMap(item => {
-    const target = queueItemDependencyTarget(queue, item);
-    return target ? [{ source: ownerId, target, itemId: item.id,
+    const targets = item.trigger?.kind === 'onTab' ? pendingPromptTabIds(item.trigger) : [queueItemDependencyTarget(queue, item)].filter(Boolean);
+    return targets.map(target => ({ source: ownerId, target, itemId: item.id,
       kind: item.enabled !== false && item.id === head?.id ? 'current' : 'future',
-      enabled: item.enabled !== false }] : [];
+      enabled: item.enabled !== false }));
   });
   if (!head && queue?.runAfterTabId) edges.push({ source: ownerId, target: queue.runAfterTabId,
     itemId: 'queue-target', kind: 'current', enabled: true });
@@ -172,12 +174,12 @@ export function layoutRunAfterCards({ nodeIds, edges, sizes, availableWidth, gap
       left += grid.widths[node.column] + gap;
     }
   }
-  const corridors = new Map(crossings.map(edge => [edge.source + ':' + edge.itemId, edge]));
+  const corridors = new Map(crossings.map(edge => [runAfterEdgeKey(edge), edge]));
   const oneColumn = columns === 1 ? grid : measureColumns(1);
   return { nodes: grid.rows.flatMap(row => row.nodes), rows: grid.rows, columns, separators,
     minimumInset: Math.max(...oneColumn.rows.flatMap(row => row.nodes).map(node => node.inset)),
     routes: grid.connections.map(edge => {
-      const crossing = corridors.get(edge.source + ':' + edge.itemId);
+      const crossing = corridors.get(runAfterEdgeKey(edge));
       return { ...edge, sourceLane: byId.get(edge.source).lane + edge.sourceTrack * 5,
         targetLane: byId.get(edge.target).lane + edge.targetTrack * 5,
         ...(crossing ? { row: crossing.row, viaY: grid.rows[crossing.row].y - grid.rows[crossing.row].topOutset - 6 - crossing.track * 5 } : {}) };
@@ -206,7 +208,7 @@ function roundedOrthogonalPath(points) {
  * corridor above a row; the source/target gutters stay outside every card. */
 export function routeRunAfterEdges({ nodes, edges, routes, anchors }) {
   const positions = new Map(nodes.map(node => [node.id, node]));
-  const corridors = new Map(routes.map(route => [route.source + ':' + route.itemId, route]));
+  const corridors = new Map(routes.map(route => [runAfterEdgeKey(route), route]));
   return edges.flatMap(edge => {
     const source = positions.get(edge.source), target = positions.get(edge.target);
     const sourceAnchor = anchors.get(edge.source), targetAnchor = anchors.get(edge.target);
@@ -214,7 +216,7 @@ export function routeRunAfterEdges({ nodes, edges, routes, anchors }) {
     if (!source || !target || !origin || !targetAnchor) return [];
     const start = { x: source.x + origin.x, y: source.y + origin.y };
     const end = { x: target.x + targetAnchor.headerX - 3, y: target.y + targetAnchor.headerY };
-    const corridor = corridors.get(edge.source + ':' + edge.itemId);
+    const corridor = corridors.get(runAfterEdgeKey(edge));
     const points = [start, { x: corridor.sourceLane, y: start.y }];
     if (source.column !== target.column) {
       points.push({ x: corridor.sourceLane, y: corridor.viaY }, { x: corridor.targetLane, y: corridor.viaY });

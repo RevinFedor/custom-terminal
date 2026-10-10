@@ -156,6 +156,11 @@ tabId сфокусированной `.xterm-helper-textarea` из её terminal
 ответа повтор читает originalreceipt; новый Enter автоматически не выполняется.
 
 Version2 добавляет обычные HTML input/textarea без отдельного списка компонентов.
+Старый Voice с фильтром только version1 отбрасывает такой offer даже при новом NT:
+он продолжает legacy paste/restore. Шрам09.10 18:18UTC —782символа в ответ Codex,
+restore520мс без field receipt при задержке ввода. При проверке совместимости нужны
+не только `/api/me` NT и готовый gate, но и настоящий клиентский begin→field offer;
+обновление одного получателя не обновляет отправителя.
 Гейт выдаёт exact-element token; native question textarea несёт семантический
 owner-key targetId/questionKey. До Paste renderer регистрирует ожидание через
 main IPC; capture принимается только от того же webContents/элемента/requestId.
