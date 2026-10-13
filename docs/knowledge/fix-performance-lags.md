@@ -231,6 +231,28 @@ const ids = useStore(useShallow(s => s.items.filter(i => i.active).map(i => i.id
 
 Контринтуитивный шрам: parsed/UI object нельзя использовать как payload для Fork/Edit/Delete. Первая версия записала `[image omitted]` в child и сделала его не-resumable. Write-path теперь потоково возвращает точный raw data URL по byte range + SHA-256 и fail-closed при source-CAS mismatch. Экономия памяти разрешена presentation-слою, но не переписывает durable source. См. `fact-codex.md::Timeline и History`.
 
+### OOM при подготовке catalog search
+
+Отдельные11.10 OOM имели разные стеки:10:57UTC — Main `JSON.parse`,13:39 —
+GC worker/ConsString. Конкретные fatal files/callers не установлены. При этом
+catalog search доказанно загружал полные Codex records в Main до проверки
+внешнего turns-cache; `includeRecords:false` не исключал physical raw branch.
+LRU вытеснял старые файлы после разбора нового и не ограничивал transient peak.
+Адресный SOURCE-ремонт — query-проекция в worker, не увеличение RAM/SSD лимитов
+или остановка вкладок; контракт и пределы — `fact-session-history.md`.
+Следующий отдельный SOURCE-ремонт допускает уже готовый physical Main turns
+graph до raw read по доказательству его исходного чтения и текущего binding.
+В малом контроле eviction только raw LRU больше не вызывал повторный parse или
+History/Timeline build; annotations оставались свежими. Простая перестановка
+`stat/cache if` неверна: она могла бы удостоверить старый graph свежим stat
+или вернуть неизменный A после переназначения SID на B. Virtual/cold пути и
+общий лимит transient heap этим не заменены.
+Отдельный контрпример дал настоящий resolver: задержанный cold scan записывает
+B в memo, пока старый lookup ждёт `access(A)` и затем возвращает захваченный A.
+Stat/generation A при этом могут остаться прежними. Поэтому финальный synchronous
+guard проверяет и live memo binding; это не изменение алгоритма выбора файлов.
+Другие full-preparation consumers и оба production incident этим не объявлены закрытыми.
+
 ### Падение main после Fork во время переименования
 
 28.09,16:06BKK: child2941 успела создаться, затем main68878 завершился
@@ -382,13 +404,53 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab
 Целевой ремонт не подбирает меньшие задержки:
 
 - workflow commit выполняется прямо из click; pressed/pending — статичный state, не обязательный «кадр перед работой»;
-- focus intent ждёт не время, а exact mutation `data-terminal-surface-presented=1`; один `MutationObserver` coalesce'ит rapid navigation и выпускает target в том же presentation commit. Selectable History/Timeline text намеренно сохраняет browser selection и не auto-focus'ит composer; background/chip/keyboard paths фокусируют его;
+- focus intent ждёт не время, а exact mutation `data-terminal-surface-presented=1`; один `MutationObserver` coalesce'ит rapid navigation и выпускает target в том же presentation commit. Body press ждёт matching pointerup: drag и существующее browser Selection сохраняются, обычный click без выделения возвращает primary input. Chip/keyboard paths сохраняют свой прямой focus intent;
+- С11.10 readiness lookup берёт свежий `terminal-pane-wrapper:<tabId>` через
+  getElementById вместо глобального перебора wrappers. TerminalArea задаёт ID и
+  dataset из одного keyed tabId; connected/dataset/presented/isolation/aria-hidden
+  и текущий store-owner проверяются по-прежнему. Node не кэшируется: replacement
+  читается заново; pending очищается до dispatch, чтобы синхронный новый intent
+  не был стёрт старым. Уникальный ID — invariant producer, не самостоятельное
+  разрешение focus. Отдельного registry, таймера или scroll writer не добавлено;
 - focus quarantine обрабатывает boundaries по одной background `scheduler.postTask` (`MessageChannel` capability fallback), без rAF/setTimeout в navigation contract;
+- С11.10 повторный discovery известных pane/center/workspace boundaries не
+  обходит retained descendants в каждом sync/deferred task. Manager хранит DOM
+  identities; structural/marker MutationObserver обновляет только изменённые
+  поддеревья, а takeRecords перед использованием закрывает окно до доставки
+  callback. Flags читаются заново, DOM order/restore-first/version cancellation/
+  authored tabindex/capture guards сохраняются. Неизвестные caller selectors
+  остаются на свежем query path. Это новый inventory observer, не отсутствие
+  работы: цена теперь зависит от boundaries и изменённых поддеревьев.
+  Общая фаза `pane-focus-boundaries` отделяет discovery; прежнее deferred `ms`
+  остаётся isolate/restore, рядом `discoveryMs/prepareMs/totalMs` покрывают
+  остальной callback. Малое старое ms не доказывает дешёвый весь focus handoff.
 - Timeline visibility обновляет отдельный host через transition после внешнего opacity commit, чтобы не reconcile'ить History/Virtuoso и не продлевать urgent first paint;
 - active/focus/hover truth меняется без CSS transition. Workflow DnD сохраняет тот же X-only resolver, preview и durable commit, но background и positional preview snap'ятся без FLIP; project row может сохранять FLIP;
 - workflow busy и tab pending operation используют статичный оранжевый marker. Статика не умеет появиться внутри уже начавшегося LongTask — ничего не умеет, пока renderer не рисует, — но перестаёт изображать frozen animation как второй дефект.
 
 Единственный временной предел в этом пути — error fail-safe, который снимает pending при несостоявшемся switch; он не управляет happy path. Для остаточного tab-switch CPU добавлены подфазы `[Perf:TabSwitchStart] notifyMs/activePointerMs/mruMs/spaceRouteMs/placementMs/finalSetMs`: следующий production-инцидент должен показать, какой store-step владел `syncMs=105`, вместо очередной гипотезы по общей метке. Source-проверка: 130 focused tests, targeted transpile и diff-check; physical production proof новой дельты остаётся отдельным шагом.
+
+11.10,17:23UTC: нажатия при выделении текста4412 девять раз запускали switch
+4412→4412; sync46.5–51.4мс внутри pointerdown144.6–162.2мс. SOURCE reuse
+согласованной pane activation сокращает публикации store4→1, сохраняя явный
+sidebar reveal и отмену прежнего async navigation. Недостаточно одинакового
+paneIndex: parked sidebar, selected set, новая notification, MRU/missing visit,
+Home, lazy runtime и иной owner требуют прежнего пути. Gesture Selection
+guards остаются прежними. Это устранение повторной работы, не объяснение всего
+input delay: тот же инцидент содержит native renderer CPU без exact stack;
+source controls не являются latency A/B.
+Первый pointerdown1576мс в этом интервале — настоящий переход3314→4412
+(switch99.6мс), а не один из этих девяти повторов. Reuse его намеренно не
+пропускает; ускорение этого первого перехода данным ремонтом не доказано.
+
+Контроль inventory11.10 — `scripts/pane-focus-inventory-regression.mjs`:
+actual helper/native DOM/MO,53boundaries+53000synthetic rows, пять warm sync
+дают0full-root queries вместо5; late add/marker, same-ID replacement, finalDOM
+order/remove+reinsert, restore-first/stale tasks, nested exclusion иdispose
+проверены. Scheduler/input контролируемы; offscreen focusin доставляется
+явным synthetic event, это не OS-focus/whole-app latency proof. CPU инцидента
+Main↔FlowTab00:24 показывал liveBoundaries19–22ms внутри handler, но эта сумма
+не обещает такую же экономию latency: React/inclusive callbacks перекрываются.
 
 29.09,17:56–17:57BKK: семь возвратов в warm `main` показали click EventTiming
 288–432мс при store sync10.0–20.6мс.53 retained tab hosts и16chrome reused,
@@ -441,6 +503,15 @@ RecalcStyle255–389мс; trace UpdateLayoutTree обошёл60 093элемен�
 закрывает каждый; cost regression ловит сам факт динамической вставки правил
 на пустом поиске. Малый прежний функциональный тест правильно проверял поиск,
 но не стоимость глобальной CSS-инвалидации при большом persistent DOM.
+
+13.10 private replay работающей модели обнаружил похожую границу у Run After:
+workflow click256мс добавлял два одинаковых overlay stylesheet. Вызов `fontProfile`
+совпал с UpdateLayoutTree13.327мс, поэтому его sampled self13.541мс нельзя целиком
+называть стоимостью canvas. Источник поля `styles.source` — ближайший размеченный
+DOM-предок: SplitPaneSurface здесь обозначал portal-host, а правила принадлежали
+PromptQueueOverlay. Их неизменный template перенесён в один Document-owned sheet,
+без изменения фокуса, layout-формул и queue actions. Chromium-контроль сравнил
+CSSOM/геометрию/фазы анимаций; это не измеренный выигрыш самого workflow click.
 
 ---
 
@@ -519,11 +590,46 @@ background output и отказ скрытого Home принимать surface
 
 ## 8. Observability Toolkit (для будущих регрессий)
 
+12.10 installed-репорт после restore показал одновременно renderer input waits
+и Main CPU. Сохранённый профиль указал `findCodexLinkedLiveBoundary` (декодирование
+посторонних тел), bulk organization reads (повторная подготовка SQL), а в renderer
+`tabLinkedFilesSnapshot` у retained владельцев. Адресные source-ремонты: bytes
+predicate до UTF8; prepared statements только на один SQLite snapshot; общий
+file index по опубликованному Zustand state, а не mutable openProjects. Контракты
+в `fact-codex`, `fact-workspace`, `fact-tabs`. Локальные RED→GREEN и уменьшение
+счётчиков не объявляют весь lag исправленным: captured trace был обрезан, а
+прежний18History E2E не соответствовал production topology/restore wave.
+
+Следующий private replay с текущей topology и тремя точными History воспроизвёл
+click296ms уже после prewarm. Полный trace и CPU покрывают сам переход: повторные
+canvas allocation, sidebar projections/ancestor traversals в renderer, doc-body
+hashing и SQL PREPARE в Main. Source-ремонт переиспользует только эти вычисления
+в пределах Document, опубликованного STATE, структуры строк, watch или batch.
+Живые ink/данные/guards остаются свежими; счётчики RED→GREEN не заменяют retake.
+
+Поздний post-install профиль12.10 обнаружил оставшуюся повторную работу у HTTP
+`project-prompt-usage`: root-registry готовил одинаковые SELECT для каждого live
+и archive-only binding, а watcher-pass повторял stat общих папок. Это запрос
+внешнего файлового дерева, поэтому активная History сама не локализует Main работу.
+Ремонт разделяет prepared statements и свежие результаты, сохраняя оба прохода;
+файловая memo каждого прохода отдельная. На24 bindings PREPARE192→4 при прежних
+192 executions, stat54→6. Этот профиль снят после trigger, а не на wheel17:18:
+счётчики доказывают устранение лишних операций, не ускорение того жеста.
+Границы свежести и retirement debounce — [каталог промптов](fact-project-prompts.md).
+
+Название кнопки не локализует зависание. В сохранённом installed Copy сначала
+pointerdown занял236.3ms и содержал работу переключения панели; поздний click
+ждал218.2ms, его собственный handler занял13.4ms. Это разные перекрывающиеся
+интервалы одного жеста, их нельзя складывать. Текст там855символов/0chips:
+данный пример не доказывает стоимость большого сообщения со вставками. Для Copy
+сверяй focus/publication до click, сборку полного payload, native clipboard и
+последующий UI; проверка одного codec без OS/React не закрывает общий сценарий.
+
 После рефакторинга 2026-04-21 в коде расставлены лог-теги, которые **не должны** появляться часто в нормальной работе. Каждый из них — сигнал конкретной регрессии.
 
 Для freeze-разборов логи разных процессов должны сравниваться по абсолютным timestamp'ам, а не по локальному `performance.now()`: renderer пишет `performance.timeOrigin + now`, main — `nodePerformance.timeOrigin + now`. Если пользователь говорит «кликнул и 5 секунд ничего», сначала выровняй `[Perf:InputDelayContext]`, `[Perf:ProjectView/HomeAction]`, `[Perf:TabSwitchFrame2]`, `[Perf:MainLoopGap]` и `[RestoreSession]` по `*Abs` полям. Без этой корреляции легко перепутать позднюю доставку input event, React render freeze, main-process блокировку и обычный долгий IPC.
 
-Для beachball/freeze недостаточно только in-process probe'ов: `[Perf:MainLoopGap]` и renderer EventTiming логируются **после** того как loop разморозился. Поэтому внешний `perf-watchdog.js` работает отдельным plain-node процессом: main шлёт heartbeat по fork IPC, renderer — напрямую в unix socket, чтобы замёрзший main не мог имитировать renderer-stall. Watchdog может начать native sample ещё во время зависания; с 11.09 source сохраняет также CPU-предысторию и ограниченный incident-profile для разбора через несколько дней. Фактическое начало sample/profile, budget/ошибки и coverage проверяются отдельно: наличие STALL не гарантирует захвата стека. Контракт и чтение артефактов — [отложенная диагностика](fact-performance-diagnostics.md).
+Для beachball/freeze недостаточно только in-process probe'ов: `[Perf:MainLoopGap]` и renderer EventTiming логируются **после** того как loop разморозился. Поэтому внешний `perf-watchdog.js` работает отдельным plain-node процессом: main шлёт heartbeat по fork IPC, renderer — напрямую в unix socket, чтобы замёрзший main не мог имитировать renderer-stall. Watchdog может начать native sample ещё во время зависания; с 11.09 source сохраняет также CPU-предысторию и ограниченный incident-profile для разбора через несколько дней. Фактическое начало sample/profile, budget/ошибки и coverage проверяются отдельно: наличие STALL не гарантирует захвата стека. Контракт и чтение артефактов — [отложенная диагностика](логирование-оптимизации.md).
 
 `activeOps=0` в `[Perf:MainLoopGap]` больше не означает “ничего не работало”. Смотри рядом `recentOps5s=` и `ipcAgg5s=`: sync IPC может закончиться в тот же тик, когда gap-таймер наконец получил управление, поэтому активных операций уже нет, но агрегат показывает виновный канал (`search:stats:n=1:sum=4102:max=4102`). Для per-keystroke каналов (`terminal:input`, `log:renderer`, `terminal:resize`) подробный recent-ring намеренно не заполняется, иначе они вытесняют редкие тяжёлые операции; их видно через aggregate.
 

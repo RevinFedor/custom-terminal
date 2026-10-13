@@ -1,5 +1,7 @@
 'use strict';
 
+const { codexGoalWorkForOutcome } = require('./codex-goal-work');
+
 const COMPACT_OPERATION_PHASE = 'compacting';
 const COMPACT_OPERATION_KIND = 'compact';
 const VALID_PROVIDERS = new Set(['claude', 'codex']);
@@ -124,8 +126,10 @@ function projectCodexCompactTurnOutcome({ outcome, operation, record, state,
     || !Number.isSafeInteger(record.__byteOffset)
     || operation.codexCompactedOffset <= operation.sourceByteOffset
     || operation.codexCompactedOffset >= record.__byteOffset) return outcome;
-  return { ...outcome, reason: 'task_complete', hasFinalResult: false,
+  const projected = { ...outcome, reason: 'task_complete', hasFinalResult: false,
     completionKind: 'compact', compactOperationId: operation.operationId };
+  const goalWork = codexGoalWorkForOutcome(state, projected);
+  return goalWork ? { ...projected, goalWork } : projected;
 }
 
 function requireText(value, label) {

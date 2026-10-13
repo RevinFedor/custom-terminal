@@ -16,10 +16,13 @@ export function createDiskCapacityStore({ ipc, now = Date.now,
       ? { ...EMPTY_DISK_CAPACITY, status: 'error', errorCode: 'invalid-measurement' }
       : { ...value, status: state === 'stale' ? 'stale' : value?.status || 'unknown',
         ...(state === 'stale' ? { warning: null } : {}) });
-    if (value?.status === 'ready' && value.expiresAt > now()) {
+    const expiry = value?.status === 'ready' ? value.expiresAt : value?.ram?.expiresAt;
+    if (expiry > now()) {
       timer = setTimeoutFn(() => { timer = null;
-        if (generation === owner && listeners.size) publish({ ...snapshot, status: 'stale', warning: null });
-      }, value.expiresAt - now());
+        if (generation === owner && listeners.size) publish({ ...snapshot,
+          status: snapshot.status === 'error' ? 'error' : 'stale', warning: null,
+          ...(snapshot.ram ? { ram: { ...snapshot.ram, status: 'stale' } } : {}) });
+      }, expiry - now());
     }
   };
   const start = () => {

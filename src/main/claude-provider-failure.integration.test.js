@@ -158,6 +158,7 @@ test('typed failure after tools is recovered through actual main result and web 
   const notifications = [];
   vm.runInContext(reconcile.getText(webAst), Object.assign(context, {
     captureOrchestrationResultAttempt: require('./orchestration-runs').captureOrchestrationResultAttempt,
+    isResponseObservation: require('./orchestration-response-observation').isResponseObservation,
     getOrchestrationRunStore: () => store, isActiveStatus: () => true, isPausedRun: () => false,
     resolveAgentSessionInfo: async () => ({ sessionId: 'S', status: 'active' }),
     probeOrchestrationResult: async () => ({ ...probe, resultComplete: false }),

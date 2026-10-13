@@ -17,6 +17,92 @@ const { SessionTranscriptService } = require('../src/main/session-transcript-ser
 
 const terminalServerPath = fileURLToPath(new URL('./terminal-server.mjs', import.meta.url));
 
+test('continue_delegation is one app-owned action, keeps the original recipient and does not replay a task', async t => {
+  const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { orchestrationContinuation: { version: 1 } } } }
+    : { status: 200, body: { ok: true, pending: true, run: { runId: 'old-run', sourceTabId: 'original-source' } } });
+  const response = await h.invoke({ runId: 'old-run' }, 'continue_delegation');
+  assert.equal(response.result.isError, undefined);
+  assert.deepEqual(h.requests.map(r => [r.method, r.url]), [['GET', '/api/me'], ['POST', '/api/orchestrations/old-run/action']]);
+  assert.equal(h.requests[1].body.action, 'continue'); assert.equal(h.requests[1].body.prompt, undefined);
+});
+
+test('continue_delegation rejects an old Main before any mutation', async t => {
+  const h = await createHarness(t, () => ({ status: 200, body: { capabilities: {} } }));
+  const response = await h.invoke({ runId: 'old-run' }, 'continue_delegation');
+  assert.equal(response.result.isError, true); assert.equal(h.requests.length, 1);
+});
+
+const userNotifyCapability = { userNotifications: { version: 1, telegramOnly: true } };
+function userNotifyReceipt(body, extra = {}) {
+  const sentAt = Date.now() - 2000;
+  return { ok: true, accepted: true, durable: true, requestId: body.requestId, tabId: 'test-source-tab',
+    channel: 'telegram', deliveryState: 'sent', sentAt, messageId: 101,
+    waitSeconds: body.waitSeconds || 0, waitUntil: sentAt + (body.waitSeconds || 0) * 1000, ...extra };
+}
+
+test('notify_user exposes Telegram-only warning and waits after the exact sent receipt', async t => {
+  const h = await createHarness(t, (body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: userNotifyCapability } }
+    : (() => { const sentAt = Date.now(); return { status: 200,
+      body: userNotifyReceipt(body, { sentAt, waitUntil: sentAt + 1000 }) }; })());
+  const started = Date.now();
+  const response = await h.invoke({ text: 'Cursor warning', waitSeconds: 1 }, 'notify_user');
+  assert.equal(response.result.isError, undefined);
+  assert.equal(response.result.structuredContent.waitCompleted, true);
+  assert.ok(Date.now() - started >= 1000);
+  assert.deepEqual(h.requests.map(r => [r.method, r.url]), [
+    ['GET', '/api/me'], ['POST', '/api/terminal-tabs/test-source-tab/notifications'],
+  ]);
+  assert.equal(h.requests[1].body.sourceMeta.tabId, 'test-source-tab');
+  assert.equal(h.requests[1].body.sourceMeta.projectId, 'test-project');
+});
+
+test('notify_user pending is not delivery and never starts its requested wait', async t => {
+  const h = await createHarness(t, (body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: userNotifyCapability } }
+    : { status: 202, body: userNotifyReceipt(body, { deliveryState: 'pending', sentAt: null, waitUntil: null, messageId: null }) });
+  const response = await h.invoke({ text: 'warning', waitSeconds: 30 }, 'notify_user');
+  assert.equal(response.result.structuredContent.waitCompleted, false);
+  assert.equal(response.result.structuredContent.deliveryState, 'pending');
+  assert.equal(h.requests.length, 2);
+});
+
+test('notify_user rejects old app and keeps a generated ID after lost ACK', async t => {
+  const old = await createHarness(t, () => ({ status: 200, body: { capabilities: {} } }));
+  const rejected = await old.invoke({ text: 'warning' }, 'notify_user');
+  assert.equal(rejected.result.structuredContent.code, 'app_update_required');
+  assert.equal(rejected.result.structuredContent.mutationAttempted, false);
+  assert.equal(old.requests.length, 1);
+  const lost = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: userNotifyCapability } } : { disconnect: true });
+  const unknown = await lost.invoke({ text: 'warning' }, 'notify_user');
+  assert.equal(unknown.result.structuredContent.deliveryState, 'unknown');
+  assert.equal(unknown.result.structuredContent.requestId, lost.requests[1].body.requestId);
+  assert.equal(lost.requests.length, 2);
+});
+
+test('get_user_notification is exact/passive and preserves the original wait deadline', async t => {
+  const receipt = userNotifyReceipt({ requestId: 'original', waitSeconds: 20 });
+  const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: userNotifyCapability } } : { status: 200, body: receipt });
+  const response = await h.invoke({ requestId: 'original' }, 'get_user_notification');
+  assert.equal(response.result.structuredContent.waitUntil, receipt.waitUntil);
+  assert.equal(response.result.structuredContent.waitCompleted, false);
+  assert.deepEqual(h.requests.map(r => r.method), ['GET', 'GET']);
+  assert.equal(h.requests[1].url, '/api/terminal-tabs/test-source-tab/notifications?requestId=original');
+});
+
+test('notify_user forbids source/target overrides before network and is discoverable', async t => {
+  const h = await createHarness(t, () => assert.fail('invalid input must not reach HTTP'));
+  const response = await h.invoke({ text: 'warning', tabId: 'foreign' }, 'notify_user');
+  assert.equal(response.result.isError, true);
+  assert.equal(h.requests.length, 0);
+  const tool = (await h.rpc('tools/list')).result.tools.find(tool => tool.name === 'notify_user');
+  assert.deepEqual(tool.inputSchema.required, ['text']);
+  assert.deepEqual(Object.keys(tool.inputSchema.properties), ['text', 'waitSeconds', 'requestId']);
+});
+
 test('cancel_message uses the exact thread and trusted calling tab, never Send/Stop/dismiss', async t => {
   const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
     ? { status: 200, body: { capabilities: { tabMessages: { cancellation: { version: 1 } } } } }
@@ -139,6 +225,7 @@ test('response observation crosses actual MCP/HTTP, durable registry, Codex byte
   });
   const context = vm.createContext({ console, crypto: require('node:crypto'), Set, Date,
     resolvedPort: 1, orchestrationNotificationInflight: new Set(), tabWorkContext: null,
+    agentSendReceiptStartupReady: Promise.resolve(), agentSendReceiptStore: null,
     getOrchestrationRunStore: () => store, getCompletionContentStore: () => contents,
     getResponseObservationService: () => service,
     ...contentModule, captureOrchestrationResultAttempt, orchestrationResultAttemptMatches,

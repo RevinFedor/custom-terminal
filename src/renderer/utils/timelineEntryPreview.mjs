@@ -1,4 +1,6 @@
 import { buildHistoryComposerPresentationParts } from './composerChips.mjs';
+import { codexGoalPresentation } from './codexGoalPresentation.mjs';
+import { researchReplyFromProjection } from './researchResultPresentation.mjs';
 import { collectTimelineDocs } from './timelineMarkerPresentation.mjs';
 import { getAutomaticContinuationKind, getTerminalMcpTag, isSystemPromptEntry, systemPromptSource } from '../../shared/prompt-origin.mjs';
 import { historyEntryHasExactIdentity } from '../../shared/history-entry-identity.mjs';
@@ -47,14 +49,17 @@ export function resolveTimelineFullResponse(entries, preview, fingerprint) {
 export function timelinePromptPreview(entry, fingerprint) {
   const record = { ...entry, role: entry?.type === 'user' ? 'user' : entry?.role };
   const service = resolveHistoryOrchestrationPromptPresentation(record);
-  const projected = projectHistoryServicePromptBody(record, fingerprint);
-  const parts = projected.questionReply ? [{ kind: 'text', text: projected.text }]
+  const goal = codexGoalPresentation(record);
+  const projected = goal ? { text: goal.text, projected: true }
+    : projectHistoryServicePromptBody(record, fingerprint);
+  const research = researchReplyFromProjection(record, service, projected);
+  const parts = research ? research.parts : projected.questionReply ? [{ kind: 'text', text: projected.text }]
     : buildHistoryComposerPresentationParts({ text: projected.text,
       chips: entry?.promptChips, imagePaths: entry?.imagePaths }).parts;
-  const text = parts.filter(part => part.kind === 'text').map(part => part.text).join('')
+  const text = research ? research.previewText : parts.filter(part => part.kind === 'text').map(part => part.text).join('')
     .replace(/\s+/g, ' ').trim();
   return { service, source: resolveHistoryPromptSender(service), parts, text,
-    projected: projected.projected, questionReply: projected.questionReply || null };
+    projected: projected.projected, questionReply: projected.questionReply || null, goal, research };
 }
 
 export function timelineGroupPreview(entries, kind) {

@@ -8,6 +8,7 @@ const round = value => Math.round(value * 10) / 10;
 export const DIAGNOSTIC_COUNTER_LIMIT = 0xffffffff;
 const increment = value => Math.min(DIAGNOSTIC_COUNTER_LIMIT, value + 1);
 export const UI_ACTION_COVERAGE = 'temporal-overlap; frames-are-callbacks-not-pixel-proof';
+const shortcuts = new Set(['Copy', 'Cut', 'Paste', 'SelectAll', 'DeleteToStart', 'Undo', 'Redo']);
 // Snapshots are data, unlike DOM/KeyboardEvent objects whose getters live on
 // their prototypes. Do not accept inherited fields or invoke snapshot getters.
 const own = (value, key) => value && Object.getOwnPropertyDescriptor(value, key)?.value;
@@ -23,15 +24,25 @@ const keyClass = key => {
 
 export function describeDiagnosticKey(event) {
   if (event?.type !== 'keydown' && event?.type !== 'keyup') return {};
-  // Read key only to classify it. Never retain key/code, or enumerate an event.
-  return { keyClass: keyClass(event.key), meta: event.metaKey === true, ctrl: event.ctrlKey === true,
+  // Read key/code only to classify them. Never retain either or enumerate an event.
+  const fields = { keyClass: keyClass(event.key), meta: event.metaKey === true, ctrl: event.ctrlKey === true,
     alt: event.altKey === true, shift: event.shiftKey === true, repeat: event.repeat === true };
+  if ((fields.meta || fields.ctrl) && !fields.alt) {
+    // Physical code is classified, never retained. Plain typing remains Other.
+    let code;
+    try { code = event.code; } catch { /* An unavailable accessor keeps the ordinary key evidence. */ }
+    const shortcut = typeof code === 'string' ? { KeyC: 'Copy', KeyX: 'Cut', KeyV: 'Paste', KeyA: 'SelectAll',
+      Backspace: fields.meta ? 'DeleteToStart' : null, KeyZ: fields.shift ? 'Redo' : 'Undo' }[code] : null;
+    if (shortcuts.has(shortcut)) fields.shortcutClass = shortcut;
+  }
+  return fields;
 }
 
 function keySnapshot(snapshot) {
   const result = Object.create(null);
   if (typeof own(snapshot, 'keyClass') !== 'string') return result;
   result.keyClass = keyClass(own(snapshot, 'keyClass'));
+  if (shortcuts.has(own(snapshot, 'shortcutClass'))) result.shortcutClass = own(snapshot, 'shortcutClass');
   for (const field of ['meta', 'ctrl', 'alt', 'shift', 'repeat']) result[field] = own(snapshot, field) === true;
   return result;
 }
@@ -42,6 +53,84 @@ function targetSnapshot(target) {
     historyOwner: short(own(target, 'historyOwner'), 80) });
 }
 
+function clipboardSnapshot(value) {
+  const result = Object.create(null);
+  for(const key of ['rangeCount','selectedChars']) result[key] = finite(own(value,key));
+  for(const key of ['collapsed','sameTextNode','defaultPreventedAtCapture','finalDefaultPrevented','trusted']) {
+    const field = own(value,key);
+    result[key] = typeof field === 'boolean' ? field : null;
+  }
+  for(const key of ['anchorTab','focusTab','anchorEntry','focusEntry']) result[key] = short(own(value,key),80);
+  return result;
+}
+
+export function describeDiagnosticClipboard(event) {
+  if (!['copy','cut','paste'].includes(event?.type)) return null;
+  const result = {defaultPreventedAtCapture:event.defaultPrevented === true,
+    finalDefaultPrevented:null,trusted:event.isTrusted === true};
+  try {
+    const doc = event.target?.ownerDocument || globalThis.document;
+    const selection = doc?.getSelection?.();
+    if (!selection) return clipboardSnapshot(result);
+    result.rangeCount=selection.rangeCount;result.collapsed=selection.isCollapsed;
+    result.sameTextNode=!!selection.anchorNode && selection.anchorNode===selection.focusNode && selection.anchorNode.nodeType===3;
+    result.selectedChars=result.sameTextNode ? Math.abs(selection.focusOffset-selection.anchorOffset) : null;
+    for(const [prefix,node] of [['anchor',selection.anchorNode],['focus',selection.focusNode]]) {
+      const element=node?.nodeType===3 ? node.parentElement : node;
+      result[prefix+'Tab']=element?.closest?.('[data-tab-id]')?.getAttribute('data-tab-id') || '';
+      result[prefix+'Entry']=element?.closest?.('[data-entry-uuid]')?.getAttribute('data-entry-uuid') || '';
+    }
+  } catch { /* Missing selection stays unknown. Never read its text for diagnosis. */ }
+  return clipboardSnapshot(result);
+}
+
+export function recordUIClipboardOutcome(action, event) {
+  if (!action?.clipboardState) return;
+  action.clipboardState.finalDefaultPrevented=event ? event.defaultPrevented === true : null;
+}
+
+export function createUIClipboardOutcomeQueue({emit=console.warn,postTask,now=absNow,max=32}={}) {
+  const pending=[];
+  let channel=null,scheduled=false,disposed=false,dropped=0;
+  max=Math.max(1,Math.min(32,Number.isSafeInteger(max)?max:32));
+  const report=(action,event,reason)=>{
+    try { recordUIClipboardOutcome(action,event); }
+    catch {
+      action.clipboardState.finalDefaultPrevented=null;
+      reason='event-unavailable';dropped=increment(dropped);
+    }
+    try {
+      emit('[Perf:ClipboardOutcome] '+JSON.stringify({actionId:action.id,observedAbs:round(now()),
+        finalDefaultPrevented:action.clipboardState.finalDefaultPrevented,reason,dropped}));
+    } catch { dropped=increment(dropped); /* Never interfere with the native clipboard command. */ }
+  };
+  const flush=()=>{
+    scheduled=false;
+    for(const entry of pending.splice(0)){
+      const event=entry.event.deref();
+      report(entry.action,event,event?'post-dispatch-task':'event-unavailable');
+    }
+  };
+  const schedule=()=>{
+    if(postTask)return postTask(flush);
+    channel ||= new MessageChannel();
+    channel.port1.onmessage=flush;
+    channel.port2.postMessage(0);
+  };
+  return {
+    enqueue(action,event){
+      if(!action?.clipboardState || disposed)return;
+      if(pending.length>=max){dropped=increment(dropped);report(action,null,'queue-overflow');return;}
+      pending.push({action,event:new WeakRef(event)});
+      if(scheduled)return;
+      scheduled=true;
+      try {schedule();} catch {scheduled=false;for(const entry of pending.splice(0))report(entry.action,null,'task-unavailable');}
+    },
+    dispose(){disposed=true;pending.length=0;channel?.port1.close();channel?.port2.close();},
+    health(){return {clipboardOutcomeDropped:dropped,pendingClipboardOutcomes:pending.length};},
+  };
+}
+
 // The direct watchdog gets a thin allowlisted record, never the phase/style
 // arrays or an Event/DOM reference. null means that boundary was not measured.
 export function summarizeUIAction(action, timing = {}) {
@@ -49,6 +138,7 @@ export function summarizeUIAction(action, timing = {}) {
     event: short(own(action, 'event') || own(timing, 'event'), 24),
     target: targetSnapshot(own(action, 'target')),
     ...keySnapshot(action),
+    ...(own(action,'clipboardState') ? {clipboardState:clipboardSnapshot(own(action,'clipboardState'))} : {}),
     inputDelayMs: finite(own(timing, 'inputDelayMs')),
     handlerMs: finite(own(timing, 'handlerMs')),
     presentationMs: finite(own(timing, 'presentationMs')),
@@ -60,10 +150,11 @@ export function summarizeUIAction(action, timing = {}) {
 export function formatDiagnosticKey(snapshot) {
   const fields = keySnapshot(snapshot);
   return fields.keyClass ? ' keyClass=' + fields.keyClass + ['meta', 'ctrl', 'alt', 'shift', 'repeat']
-    .map(field => ' ' + field + '=' + Number(fields[field])).join('') : '';
+    .map(field => ' ' + field + '=' + Number(fields[field])).join('')
+    + (fields.shortcutClass ? ' shortcutClass=' + fields.shortcutClass : '') : '';
 }
 
-export function createUIActionDiagnostics({ now = absNow, emit = console.warn, notify = () => {}, max = 96 } = {}) {
+export function createUIActionDiagnostics({ now = absNow, emit = console.warn, notify = () => {}, onPendingFrame = () => {}, max = 96 } = {}) {
   const boot = Math.floor(now()).toString(36);
   let sequence = 0, current = null, dropped = 0, phasesDropped = 0;
   max = Number.isFinite(max) ? Math.max(1, Math.min(96, Math.floor(max))) : 96;
@@ -75,10 +166,10 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
       phases: [], phasesDropped: 0, frameProof, frames: 0, frame1Abs: null, frame2Abs: null };
     actions.push(action); if (actions.length > max) { actions.shift(); dropped = increment(dropped); }
     current = action;
+    if (frameProof) onPendingFrame();
     return action;
   };
-  const phase = (name, values = {}) => {
-    if (!current || now() - current.receivedAbs > 2000) return;
+  const appendPhase = (action, name, values = {}) => {
     const fields = Object.create(null);
     for (const key of Object.keys(values).slice(0, 10)) {
       if (['__proto__', 'prototype', 'constructor', 'toJSON'].includes(key)) continue;
@@ -87,11 +178,14 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
       else if (typeof value === 'boolean') fields[short(key, 32)] = value;
       else if (['tab', 'owner', 'reason'].includes(key)) fields[key] = short(value, 80);
     }
-    if (current.phases.length >= 32) {
-      current.phases.splice(8, 1); current.phasesDropped = increment(current.phasesDropped);
+    if (action.phases.length >= 32) {
+      action.phases.splice(8, 1); action.phasesDropped = increment(action.phasesDropped);
       phasesDropped = increment(phasesDropped);
     }
-    current.phases.push({ name: short(name, 140), at: round(now()), ...fields });
+    action.phases.push({ name: short(name, 140), at: round(now()), ...fields });
+  };
+  const phase = (name,values={})=>{
+    if(current && now()-current.receivedAbs<=2000)appendPhase(current,name,values);
   };
   const matching = (event, eventAbs) => {
     let nearest = null, distance = 2;
@@ -112,14 +206,20 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
   };
   return {
     capture, phase, matching,
+    phaseForAction(id,name,values={}){
+      const action=actions.find(action=>action.id===id);
+      if(!action)return false;
+      appendPhase(action,name,values);return true;
+    },
     eventTiming(event, eventAbs, durationMs, extra = {}) {
       const action = matching(event, eventAbs);
       if (action) report(action, 'event-timing', durationMs, extra);
       return action;
     },
     frame(at, styles = null, rafTimestampAbs = at) {
-      for (const action of actions) {
-        if (!action.frameProof || action.frames >= 2 || action.receivedAbs > at) continue;
+      // Snapshot: an action captured reentrantly starts on the next callback.
+      for (const action of [...actions]) {
+        if (!Number.isFinite(action.receivedAbs) || !action.frameProof || action.frames >= 2 || action.receivedAbs > at) continue;
         if (styles) {
           action.styles ||= { added: [], removed: [], omitted: 0 };
           for (const key of ['added', 'removed']) {
@@ -139,9 +239,41 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
       }
     },
     currentId() { return current && now() - current.receivedAbs <= 2000 ? current.id : null; },
-    pending() { return actions.some(a => a.frameProof && a.frames < 2); },
+    pending() { const at = now(); return actions.some(a => a.frameProof && a.frames < 2
+      && Number.isFinite(a.receivedAbs) && a.receivedAbs <= at); },
     health() { return { actionRingEvicted: dropped, actionPhasesDropped: phasesDropped }; },
   };
+}
+
+// One owned request for all actions. No timers, DOM reads or continuous sampling.
+// A ticket is installed before requesting so reentrant wakes cannot duplicate it.
+export function createUIFrameScheduler({ request, cancel, hasPending, onFrame, onIdle = () => {} }) {
+  let ticket = null, running = false, disposed = false;
+  const wake = () => {
+    if (disposed || running || ticket || !hasPending()) return;
+    const own = { id: null };
+    ticket = own;
+    own.id = request(timestamp => {
+      if (disposed || ticket !== own) return;
+      ticket = null;
+      running = true;
+      try { onFrame(timestamp); }
+      finally {
+        running = false;
+        if (!disposed && hasPending()) wake();
+        else onIdle();
+      }
+    });
+    // Disposal can occur reentrantly inside the request adapter before its ID returns.
+    if (disposed || ticket !== own) cancel(own.id);
+  };
+  return { wake, dispose() {
+    if (disposed) return;
+    disposed = true;
+    if (ticket) cancel(ticket.id);
+    ticket = null;
+    onIdle();
+  } };
 }
 
 export function describeDiagnosticTarget(target) {
@@ -199,10 +331,14 @@ export function captureUIAction(event) {
   const keys = describeDiagnosticKey(event);
   const navigation = (event.type === 'keydown' || event.type === 'keyup') && (keys.meta || keys.ctrl
     || ['Meta', 'Control', 'Alt', 'Shift', 'Arrow', 'Escape', 'Enter', 'Space', 'Tab'].includes(keys.keyClass));
-  return diagnostics.capture(event.type, performance.timeOrigin + event.timeStamp,
-    describeDiagnosticTarget(event.target), discrete || navigation || wheel, keys);
+  const clipboardState=describeDiagnosticClipboard(event);
+  const action=diagnostics.capture(event.type, performance.timeOrigin + event.timeStamp,
+    describeDiagnosticTarget(event.target), discrete || navigation || wheel || !!clipboardState, keys);
+  if(clipboardState)action.clipboardState=clipboardState;
+  return action;
 }
 export function uiPerformancePhase(name, values) { diagnostics?.phase(name, values); }
+export function uiPerformancePhaseForAction(id,name,values) { return diagnostics?.phaseForAction(id,name,values) || false; }
 export function currentUIActionId() { return diagnostics?.currentId() || null; }
 export function getUIActionDiagnosticHealth() {
   return diagnostics?.health() || { actionRingEvicted: 0, actionPhasesDropped: 0 };

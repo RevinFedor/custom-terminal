@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   version: SETTINGS_VERSION,
   enabled: true,
   provider: 'all',
+  gracePeriodHours: 24,
   retentionDays: DEFAULT_RETENTION_DAYS,
 });
 
@@ -63,6 +64,9 @@ function normalizeStorageRetentionSettings(value) {
     version: SETTINGS_VERSION,
     enabled: source.enabled !== false,
     provider: ['all', 'codex', 'claude'].includes(source.provider) ? source.provider : 'all',
+    gracePeriodHours: Number.isFinite(Number(source.gracePeriodHours)) && source.gracePeriodHours != null
+      ? Math.max(1, Math.min(87600, Math.round(Number(source.gracePeriodHours))))
+      : DEFAULT_SETTINGS.gracePeriodHours,
     retentionDays,
   };
 }
@@ -380,7 +384,9 @@ function retentionForItem(settings, item) {
   if (item.protected) return null;
   if (item.section === 'builds') return settings.retentionDays.build;
   if (item.group === 'app-backup') return settings.retentionDays.appBackup;
-  return settings.retentionDays[item.group] ?? settings.retentionDays.regular;
+  return Object.hasOwn(settings.retentionDays, item.group)
+    ? settings.retentionDays[item.group]
+    : settings.retentionDays.regular;
 }
 
 function classifySessionItem(item, relation, forkEvent) {

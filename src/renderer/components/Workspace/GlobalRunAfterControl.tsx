@@ -9,7 +9,7 @@ import {
   useState,
   type CSSProperties,
 } from 'react';
-import { createPortal } from 'react-dom';
+import { createPortal, flushSync } from 'react-dom';
 import {
   Ban,
   Check,
@@ -666,14 +666,18 @@ export function GlobalRunAfterControl() {
   );
   const visible = mode !== 'hidden';
   const fittedWidth = Math.min(position.width, Math.max(minimumWidth, contentWidth ?? position.width));
-  const closePanel = useCallback((reason?: 'outside') => {
+  const closePanel = useCallback((reason?: 'outside', immediate = false) => {
     // Hover dismissal is an editor exit too. Blur fields before unmount so
     // threshold/timer edits take the same save path as an ordinary blur.
     const active = document.activeElement;
     if (active instanceof HTMLElement && panelRef.current?.contains(active)) active.blur();
     if (!beforeCloseRef.current(reason)) return false;
     hoverReturnRef.current.reset();
-    setMode('hidden');
+    // Native mousemove is continuous-priority in React. Once geometry has
+    // rejected the hover, commit its dismissal in that event, not a later
+    // frame. Effect/child-cleanup rechecks must not flush during a commit.
+    if (immediate) flushSync(() => setMode('hidden'));
+    else setMode('hidden');
     return true;
   }, []);
   const lastPositionWarningRef = useRef(0);
@@ -726,9 +730,9 @@ export function GlobalRunAfterControl() {
     };
   }, [panelSize, sidebarWidth, visible, contentWidth]);
 
-  const recheckPreviewHover = useCallback((point: { clientX: number; clientY: number } | null) => {
+  const recheckPreviewHover = useCallback((point: { clientX: number; clientY: number } | null, immediate = false) => {
     if (mode !== 'preview' || pickingRewind || editorGestureActive || resizeActiveRef.current) return;
-    if (!point) { closePanel(); return; }
+    if (!point) { closePanel(undefined, immediate); return; }
     if (hasOwnedClickPopup(panelRef.current)) return;
     const panelRect = panelRef.current?.getBoundingClientRect() || null;
     const satelliteRects = [triggerRef.current?.getBoundingClientRect() || null,
@@ -739,7 +743,7 @@ export function GlobalRunAfterControl() {
     if (hoverReturnRef.current.holds(point, insideParent)) return;
     satelliteRects.push(...queueHoverSatelliteRects(panelRef.current));
     if (pointInHoverCluster({ hub: panelRect, satellites: satelliteRects, x: point.clientX, y: point.clientY, pad: 2 })) return;
-    closePanel();
+    closePanel(undefined, immediate);
   }, [closePanel, editorGestureActive, mode, pickingRewind]);
   const recheckPreviewHoverRef = useRef(recheckPreviewHover);
   recheckPreviewHoverRef.current = recheckPreviewHover;
@@ -750,14 +754,15 @@ export function GlobalRunAfterControl() {
       const { owner, reason, point } = (event as CustomEvent).detail;
       if (!queueOwnsPopup(panelRef.current, owner)) return;
       if (point) previewPointerRef.current = point;
-      if (reason !== 'selection') hoverReturnRef.current.reset();
+      if (reason === 'save') hoverReturnRef.current.retain();
+      else if (reason !== 'selection') hoverReturnRef.current.reset();
       if (reason !== 'escape') recheckPreviewHoverRef.current(previewPointerRef.current);
     };
     const onMove = (event: MouseEvent) => {
       previewPointerRef.current = { clientX: event.clientX, clientY: event.clientY };
-      recheckPreviewHover(event);
+      recheckPreviewHover(event, true);
     };
-    const onExitWindow = () => { previewPointerRef.current = null; recheckPreviewHover(null); };
+    const onExitWindow = () => { previewPointerRef.current = null; recheckPreviewHover(null, true); };
     const onMouseOut = (event: MouseEvent) => { if (!event.relatedTarget) onExitWindow(); };
     // Rewind temporarily hides the surface, not its ownership. Once target
     // selection ends, recheck the real last pointer even without a new move.

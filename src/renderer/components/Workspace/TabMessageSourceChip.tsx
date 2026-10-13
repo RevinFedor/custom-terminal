@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { ArrowDownLeft, ArrowUpRight, CircleAlert, SquareTerminal } from 'lucide-react';
+import { ArrowDownLeft, ArrowUpRight, CircleAlert, Globe, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { adjustRgbaAlpha, flattenRgbaOnTabbarPanel, getTabChromeColorConfig } from './tabChrome';
 import { resolveTabCardBackground } from '../../utils/tabCardVisual.mjs';
@@ -8,32 +8,72 @@ import { requestRowLinkStyle } from './RequestTrackerRow';
 import { cancelTabMessageSourceJump, jumpToTabMessageSource } from '../../utils/tabMessageSourceJump';
 import { useUIStore } from '../../store/useUIStore';
 import './TabMessageSourceChip.css';
+import scDesktopIcon from '../../assets/sc-desktop.png';
+import { currentUIActionId, uiPerformancePhaseForAction } from '../../utils/uiPerformanceDiagnostics.mjs';
 const { ipcRenderer } = window.require('electron');
 
 type Source = { sourceTabId: string; sourceTabName?: string | null; sourceProjectId?: string | null; messageId?: string };
 
-export function HistoryPromptSource({ source, phase, onNavigate }: {
+/** The existing saved-job jump, shared by History's arrow and Timeline's label. */
+export function ResearchSourceAction({ runId, label, iconOnly = false, researchIcon = false, onNavigate, destination = 'desktop' }: {
+  runId: string; label?: string; iconOnly?: boolean; researchIcon?: boolean; onNavigate?: () => void;
+  destination?: 'desktop' | 'browser';
+}) {
+  const [navigation, setNavigation] = useState<{ runId: string; state: 'idle' | 'opening' | 'opened' | 'failed'; jobId?: string }>({ runId, state: 'idle' });
+  const opening = navigation.runId === runId && navigation.state === 'opening';
+  const openingRef = useRef(false);
+  const browser = destination === 'browser';
+  const actionPhase = browser ? 'history-research-browser-open' : 'history-research-open';
+  const open = async () => {
+    if (openingRef.current) return;
+    openingRef.current = true;
+    const actionId = currentUIActionId(), started = performance.now();
+    cancelTabMessageSourceJump();
+    setNavigation({ runId, state: 'opening' });
+    uiPerformancePhaseForAction(actionId, actionPhase, { run: runId, stage: 'begin' });
+    try {
+      const result = await ipcRenderer.invoke(browser ? 'orchestration:open-research-browser' : 'orchestration:open-research-job',
+        { runId, ...(browser ? { actionId } : {}) });
+      if (result?.success !== true || typeof result.jobId !== 'string'
+        || (browser && (!Number.isInteger(result.tabId) || result.tabId < 0))) throw new Error(result?.error
+        || (browser ? 'Не удалось открыть разговор в браузере' : 'Не удалось открыть задачу в SC Desktop'));
+      setNavigation({ runId, state: 'opened', jobId: result.jobId });
+      uiPerformancePhaseForAction(actionId, actionPhase, { run: runId, stage: 'opened', ms: performance.now() - started });
+      onNavigate?.();
+    } catch (error) {
+      setNavigation({ runId, state: 'failed' });
+      uiPerformancePhaseForAction(actionId, actionPhase, { run: runId, stage: 'failed', ms: performance.now() - started });
+      useUIStore.getState().showToast(error instanceof Error ? error.message : String(error), 'error', 5000);
+    } finally { openingRef.current = false; }
+  };
+  return <button type="button" data-external-research-source={runId}
+    data-external-research-open-state={navigation.runId === runId ? navigation.state : 'idle'}
+    data-external-research-opened-job={navigation.runId === runId ? navigation.jobId : undefined}
+    data-external-research-destination={destination}
+    title={browser ? 'Открыть разговор в браузере' : iconOnly ? 'Open saved task in SC Desktop' : 'Открыть задачу в SC Desktop'}
+    aria-label={browser ? 'Открыть разговор в браузере' : iconOnly ? `Open in SC Desktop${label ? ': ' + label : ''}` : `Открыть задачу в SC Desktop: ${label}`}
+    aria-busy={opening} disabled={opening}
+    onMouseDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void open(); }}
+    className={iconOnly ? 'hp-research-source-action' : 'history-research-source'}
+    style={iconOnly ? undefined : { display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0,
+      maxWidth: '100%', overflow: 'hidden', whiteSpace: 'nowrap', fontSize: 11, color: '#eee',
+      background: 'transparent', border: 0, padding: '2px 3px', borderRadius: 4,
+      cursor: opening ? 'default' : 'pointer', textAlign: 'left' }}>
+    {iconOnly ? browser ? <Globe size={14} aria-hidden="true" /> : <ArrowUpRight size={14} aria-hidden="true" /> : <>
+      {researchIcon && <img src={scDesktopIcon} alt="SC Desktop" width={16} height={16} style={{ flexShrink: 0 }} />}
+      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+    </>}
+  </button>;
+}
+
+export function HistoryPromptSource({ source, phase, onNavigate, researchIcon = false }: {
   source: Partial<Source> & { label?: string; researchRunId?: string }; phase?: string; onNavigate?: () => void;
+  researchIcon?: boolean;
 }) {
   const incoming = phase === 'question' || phase === 'request';
   const response = phase === 'reply' || phase === 'completion' || phase === 'failure';
   const Icon = incoming ? ArrowDownLeft : response ? ArrowUpRight : null;
   const [jumping, setJumping] = useState(false);
-  const [openingResearch, setOpeningResearch] = useState(false);
-  const researchOpeningRef = useRef(false);
-  const openResearch = async () => {
-    if (researchOpeningRef.current) return;
-    researchOpeningRef.current = true;
-    cancelTabMessageSourceJump();
-    setOpeningResearch(true);
-    try {
-      const result = await ipcRenderer.invoke('orchestration:open-research-job', { runId: source.researchRunId });
-      if (result?.success !== true) throw new Error(result?.error || 'Не удалось открыть задачу в SC Desktop');
-      onNavigate?.();
-    } catch (error) {
-      useUIStore.getState().showToast(error instanceof Error ? error.message : String(error), 'error', 5000);
-    } finally { researchOpeningRef.current = false; setOpeningResearch(false); }
-  };
   const jump = async () => {
     setJumping(true);
     try {
@@ -59,13 +99,8 @@ export function HistoryPromptSource({ source, phase, onNavigate }: {
       <Icon size={14} strokeWidth={2.2} aria-hidden="true" />
     </span>)}
     {source.sourceTabId ? <TabMessageSourceChip source={source as Source} onNavigate={onNavigate} />
-      : source.researchRunId ? <button type="button" data-external-research-source={source.researchRunId}
-        title="Открыть задачу в SC Desktop" aria-label={`Открыть задачу в SC Desktop: ${source.label}`} disabled={openingResearch}
-        onMouseDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); void openResearch(); }}
-        style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11,
-          color: '#c4b5fd', background: 'transparent', border: 0, padding: '2px 0', cursor: openingResearch ? 'default' : 'pointer', textAlign: 'left' }}>
-        {source.label}
-      </button>
+      : source.researchRunId ? <ResearchSourceAction runId={source.researchRunId} label={source.label}
+        researchIcon={researchIcon} onNavigate={onNavigate} />
       : <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#c4b5fd' }}>{source.label}</span>}
   </div>;
 }

@@ -11,6 +11,7 @@ import GlobalTabArchive, {type ArchiveRequest,type GlobalArchiveRecord} from './
 import TerminalArea, { type AgentLifecycleSummary } from './TerminalArea';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
 import Timeline from './Timeline';
+import ForkPendingTimeline from './ForkPendingTimeline';
 import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
@@ -22,6 +23,7 @@ import HistoryPanel, { HISTORY_SURFACE_PRESENTATION_EVENT } from './HistoryPanel
 import ClaudeControlBar from './ClaudeControlBar';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from '../../constants/systemProjects';
 import { linkFileTab } from '../../utils/linkFileTab';
+import { openFilePathTab } from '../../utils/openFilePathTab';
 import { resolvePaneSurfaceHotkeyTabId } from '../../utils/paneSurfaceHotkeyTarget.mjs';
 import { paneTabs } from '../../utils/splitPanesModel.mjs';
 import { probeFiles } from '../../utils/missingFileTracker';
@@ -2342,7 +2344,7 @@ export default function Workspace({
               full width, exactly as when the panel overlays. A pinned panel
               should reserve horizontal space from the terminal, never from the
               input the user is typing into. */}
-          <div data-single-center-resize-content={!splitActiveLayout ? '' : undefined} className="flex-1 flex min-w-0 relative">
+          <div data-history-composer-boundary data-single-center-resize-content={!splitActiveLayout ? '' : undefined} className="flex-1 flex min-w-0 relative">
           {/* Terminal content. В одиночном режиме overflow hidden обрезает
               слайд боковой переписки (закрытая панель прячется сдвигом за
               край). В разделённом виде та обрезка живёт у каждого окна своя
@@ -2350,7 +2352,7 @@ export default function Workspace({
               открытая боковая панель ЛЕВОГО окна обязана лечь поверх бокового
               списка вкладок («он его тоже должен перекрывать»), и обрезка на
               этом контейнере резала её ровно по границе рабочей области. */}
-          <div className={splitActiveLayout || (historyIsPrimary && floatingTerminalOpen)
+          <div data-history-composer-boundary className={splitActiveLayout || (historyIsPrimary && floatingTerminalOpen)
             ? 'flex-1 relative min-w-0'
             : 'flex-1 relative min-w-0 overflow-hidden'}
             style={!splitActiveLayout && historyIsPrimary && floatingTerminalOpen
@@ -2447,6 +2449,7 @@ export default function Workspace({
                 style={!singleCenterPresented ? { display: 'none' } : { display: 'contents' }}
               >
                 <TabTaskPlanPanel
+                  bottomInset={historyIsPrimary || historyIsAgentSidePanel ? historyControlsHeight : 0}
                   tabId={singleCenterTab.id}
                   projectPath={singleCenterTab.projectPath}
                   inputSurface={singleCenterAgentSurfacePairAvailable && (singleHistoryIsPrimary || singleCenterHistoryOpen)
@@ -2521,6 +2524,8 @@ export default function Workspace({
           </div>
 
           {/* Timeline — inside terminal row so it only spans terminal height */}
+          {singleCenterTab && singleCenterAgentPresented && <ForkPendingTimeline
+            projectId={singleCenterTab.projectId} tabId={singleCenterTab.id} hasSession={showTimeline} />}
           {deferredTimelineOwner && (
             <div
               data-timeline-owner-boundary
@@ -2606,36 +2611,9 @@ export default function Workspace({
               onScrollChange={handleSidebarScrollChange}
               linkOwnerProjectId={activeProjectId}
               onLinkFile={handleLinkFileToTab}
+              onFileWindowAction={(filePath:string,action:'beside'|'replace-shown')=>void openFilePathTab(filePath,action)}
               onFileSelect={(filePath: string, isDir: boolean) => {
-                console.warn('[SidebarFileOpen] select', {
-                  filePath,
-                  isDir,
-                  previewPath: filePreview?.path || null,
-                  previewSource: filePreview?.source || null,
-                });
-                if (!isDir) {
-                  if (filePreview?.path === filePath && filePreview?.source !== 'tab') {
-                    console.warn('[SidebarFileOpen] close-current-preview', { filePath });
-                    useUIStore.getState().closeFilePreview();
-                    setOpenFilePath(activeProjectId, null);
-                  } else {
-                    const ipc = window.require('electron').ipcRenderer;
-                    console.warn('[SidebarFileOpen] read-start', { filePath });
-                    ipc.invoke('file:read', filePath).then((result: any) => {
-                      console.warn('[SidebarFileOpen] read-result', {
-                        filePath,
-                        success: !!result?.success,
-                        error: result?.error || null,
-                        length: typeof result?.content === 'string' ? result.content.length : null,
-                      });
-                      if (result?.success) {
-                        const language = detectLanguage(path.extname(filePath).toLowerCase());
-                        openFilePreview({ path: filePath, content: result.content, language, source: 'sidebar' });
-                        setOpenFilePath(activeProjectId, filePath);
-                      }
-                    });
-                  }
-                }
+                if (!isDir) void openFilePathTab(filePath);
               }}
             />
             {/* Resize handle */}

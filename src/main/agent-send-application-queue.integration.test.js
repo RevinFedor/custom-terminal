@@ -110,6 +110,7 @@ function completionHarness(t, { legacy = false } = {}) {
     orchestrationNotificationInflight: new Set(), isTerminalStatus: () => true,
     getOrchestrationRunStore: () => ({ getInternal: async () => run,
       markNotification: async (_id, status, extra = {}) => { Object.assign(run, extra, { notificationStatus: status }); notificationStates.push(status); return { changed: [run] }; },
+      persistStrict: async () => {},
       bindNotificationSourceSession: async () => {} }),
     orchestrationNotificationText: () => content.prompt, prepareOrchestrationCompletionContent: async () => content,
     resolveAgentSessionInfo: async () => ({ sessionId: 'S', toolType: 'codex' }),

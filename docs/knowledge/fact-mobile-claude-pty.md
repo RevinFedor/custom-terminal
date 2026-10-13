@@ -163,6 +163,13 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 
 ## Mobile UI: header pill, Stop, Resume
 
+Историческое описание UI ниже относится к legacy mobile-web. Native разделяет
+короткий busy Interrupt и process Stop, в том числе во время запуска. Source11.10
+`pendingSends` companion отменяет будущий ввод независимо от `processStop` и не
+превращает unknown прошлой доставки в no-Enter. Полный wire/границы —
+`fact-terminal-mcp.md::Main FIFO принятых Send`; native/поставка этим чтением
+исходников не проверены.
+
 В header чата для CLAUDE-PTY-табов появляются те же контролы что у SDK:
 - **Pill «model · effort»** в центре — `SDKParamsButton` переиспользован. `canParams` open только когда status=active/busy (slash-commands нужен живой prompt).
 - **Stop ■** справа от ☰ — красная, видна только когда status=active/busy/starting. Под капотом `Api.stop` который роутит через `stopClaudeTab` bridge → `terminal:stop-ai-process` (SIGTERM по PID, тот же путь что desktop Stop). После клика status становится `stopping`; кнопка и composer блокируются до `inactive`.

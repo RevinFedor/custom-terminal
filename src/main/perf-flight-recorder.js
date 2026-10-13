@@ -11,17 +11,19 @@ const { collectSystemPressure, pressureDelta } = require('./perf-system-pressure
 
 const DAY = 86400000;
 const RETENTION_MS = 7 * DAY;
-const DISK_CAP = 256 * 1024 * 1024;
-const CAUSAL_RETENTION_MS = 2 * DAY;
-const CAUSAL_DISK_CAP = 64 * 1024 * 1024;
-// Preserve a bounded native-stack tier INSIDE the existing overall budget.
-// Otherwise old incident JSON can evict every new stack two minutes later.
-const NATIVE_SAMPLE_DISK_CAP = 64 * 1024 * 1024;
+const DISK_CAP = 5 * 1024 * 1024 * 1024;
+const HEAVY_RETENTION_MS = DAY;
+const HEAVY_BYTES = 8 * 1024 * 1024;
+// These are protected shares, not smaller deletion caps. Ordinary evidence can
+// use the whole shared budget until age or total disk pressure requires pruning.
+const CAUSAL_PROTECTED_BYTES = 64 * 1024 * 1024;
+const NATIVE_SAMPLE_PROTECTED_BYTES = 64 * 1024 * 1024;
 const PAYLOAD_CAP = 4 * 1024 * 1024;
 const OWN_FILE = /^(?:(?:cpu|causal)-\d{10}\.ndjson|stall-\d+-\d+-\d+\.(?:sample\.txt|sample\.json|sample-capture\.json)|incident-\d+-\d+(?:\.json|\.sample\.txt|\.main\.cpuprofile|\.cpuprofile|\.trace\.json|\.profile\.json|\.capture\.json|\.ui\.json))$/;
 const NATIVE_RECEIPT = /^stall-(\d+)-\d+-\d+\.sample-capture\.json$/;
 const NATIVE_SAMPLE = /^stall-\d+-\d+-\d+\.sample\.txt$/;
 const HEAVY_RECEIPT = /^incident-\d+-\d+\.capture\.json$/;
+const HEAVY_PROFILE = /\.(?:cpuprofile|trace\.json)$/;
 const round = (n) => Math.round(n * 10) / 10;
 const monoNow = () => performance.now();
 
@@ -185,17 +187,19 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
       let bytes = all.reduce((sum, e) => sum + e.size, 0);
       let causalBytes = all.filter(e => e.name.startsWith('causal-')).reduce((sum, e) => sum + e.size, 0);
       let nativeSampleBytes = all.filter(e => NATIVE_SAMPLE.test(e.name)).reduce((sum, e) => sum + e.size, 0);
-      let removed = 0, removedNative = 0;
+      let removed = 0, removedNative = 0, removedExpired = 0, removedHeavyExpired = 0, removedBudget = 0;
       const nativeAt = e => Math.max(e.at, Number(NATIVE_RECEIPT.exec(e.name)?.[1]) || 0);
-      const expired = e => now - (NATIVE_RECEIPT.test(e.name) ? nativeAt(e) : e.at) >=
-        (NATIVE_RECEIPT.test(e.name) ? DAY : e.name.startsWith('causal-') ? CAUSAL_RETENTION_MS : RETENTION_MS);
+      const heavy = e => HEAVY_PROFILE.test(e.name) || e.size >= HEAVY_BYTES;
+      const retention = e => NATIVE_RECEIPT.test(e.name) || HEAVY_RECEIPT.test(e.name)
+        || heavy(e) ? HEAVY_RETENTION_MS : RETENTION_MS;
+      const expired = e => now - (NATIVE_RECEIPT.test(e.name) ? nativeAt(e) : e.at) >= retention(e);
       // Heavy profiles remain lower-priority than historical CPU evidence.
       // Independent native stacks have their own bounded tier; old metadata
       // must make room instead of immediately destroying their diagnostic value.
       const ordered = [
         ...all.filter(expired),
-        ...all.filter(e => !expired(e) && /\.(?:cpuprofile|sample\.txt|trace\.json)$/.test(e.name)),
-        ...all.filter(e => !expired(e) && !/\.(?:cpuprofile|sample\.txt|trace\.json)$/.test(e.name)),
+        ...all.filter(e => !expired(e) && heavy(e)),
+        ...all.filter(e => !expired(e) && !heavy(e)),
       ];
       for (const e of ordered) {
         const causal = e.name.startsWith('causal-');
@@ -205,15 +209,20 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
         if (NATIVE_RECEIPT.test(e.name) && !expired(e)) continue;
         if (HEAVY_RECEIPT.test(e.name) && now - e.at < DAY) continue;
         if (!causal && now - e.at < 120000) continue;
-        if (nativeSample && !expired(e) && nativeSampleBytes <= NATIVE_SAMPLE_DISK_CAP) continue;
-        if (!expired(e) && bytes <= DISK_CAP && !(causal && causalBytes > CAUSAL_DISK_CAP)
-          && !(nativeSample && nativeSampleBytes > NATIVE_SAMPLE_DISK_CAP)) continue;
+        if (!expired(e) && bytes <= DISK_CAP) continue;
+        if (nativeSample && !expired(e) && e.size <= DISK_CAP && nativeSampleBytes - e.size < NATIVE_SAMPLE_PROTECTED_BYTES) continue;
+        if (causal && !expired(e) && e.size <= DISK_CAP && causalBytes - e.size < CAUSAL_PROTECTED_BYTES) continue;
         try {
           const current = fs.lstatSync(file(e.name));
           if (!current.isFile() || current.isSymbolicLink() || current.ino !== e.ino || current.dev !== e.dev ||
             current.mtimeMs !== e.at || current.size !== e.size) continue;
           fs.unlinkSync(file(e.name)); bytes -= e.size;
           removed++;
+          const removalReason = expired(e)
+            ? heavy(e) ? 'heavy-retention-expired' : 'retention-expired' : 'artifact-budget';
+          if (removalReason === 'heavy-retention-expired') removedHeavyExpired++;
+          else if (removalReason === 'retention-expired') removedExpired++;
+          else removedBudget++;
           if (causal) causalBytes -= e.size;
           if (nativeSample) {
             nativeSampleBytes -= e.size; removedNative++;
@@ -226,15 +235,29 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
                 const before = fs.statSync(file(metadataName)).size;
                 metadata.output.retained = false;
                 metadata.output.removedAt = now;
-                metadata.output.removalReason = expired(e) ? 'retention-expired' : 'native-sample-budget';
+                metadata.output.removalReason = removalReason;
                 write(metadataName, metadata);
                 bytes += fs.statSync(file(metadataName)).size - before;
               }
             } catch { /* A missing/unreadable metadata file cannot block pruning. */ }
           }
+          if (HEAVY_PROFILE.test(e.name) || /^incident-\d+-\d+\.sample\.txt$/.test(e.name)) {
+            try {
+              const metadataName = e.name.replace(/\.(?:main\.cpuprofile|cpuprofile|trace\.json|sample\.txt)$/, '.profile.json');
+              const metadata = JSON.parse(read(metadataName, 65536));
+              if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+                const before = fs.statSync(file(metadataName)).size;
+                metadata.artifactRetention ||= {};
+                metadata.artifactRetention[e.name] = { retained: false, removedAt: now, removalReason };
+                write(metadataName, metadata);
+                bytes += fs.statSync(file(metadataName)).size - before;
+              }
+            } catch { /* Legacy/missing metadata cannot prevent bounded pruning. */ }
+          }
         } catch (err) { if (err.code !== 'ENOENT') throw err; }
       }
       if (removed) try { log('[Perf:ArtifactPrune] removed=' + removed + ' native=' + removedNative
+        + ' weekExpired=' + removedExpired + ' heavyExpired=' + removedHeavyExpired + ' budgetEvicted=' + removedBudget
         + ' bytes=' + bytes + ' nativeBytes=' + nativeSampleBytes + ' causalBytes=' + causalBytes); } catch {}
       return { bytes, causalBytes, nativeSampleBytes };
   }

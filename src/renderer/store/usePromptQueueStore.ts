@@ -60,6 +60,16 @@ let hasHydratedPromptQueueStore = false;
 let hydratePromptQueuePromise: Promise<void> | null = null;
 const promptQueueHydrationListeners = new Set<() => void>();
 const runtimeWorkflowArmTabs = new Set<string>();
+// Runtime-only proof for this immutable queue snapshot. Editing/rearming or
+// restoring creates a new snapshot; a new turn explicitly invalidates it.
+const skippedContextQueues = new WeakSet<object>();
+export function promptQueueContextWasSkipped(queue: object): boolean {
+  return skippedContextQueues.has(queue);
+}
+export function setPromptQueueContextSkipped(queue: object, skipped: boolean): void {
+  if (skipped) skippedContextQueues.add(queue);
+  else skippedContextQueues.delete(queue);
+}
 const automaticRunAfterTargetClearTabs = new Set<string>();
 type PromptQueueEditorLock = { token: string; itemId: string | null };
 type PromptQueueEditorLockListener = (
@@ -1060,7 +1070,8 @@ export function countEnabledQueuedPrompts(items: QueuedPrompt[]): number {
 export function hasPendingPromptQueueContinuation(
   queue: Pick<TabQueue, 'autoRun' | 'items' | 'loopPromptEnabled' | 'loopPromptText' | 'pendingDelivery'>,
 ): boolean {
-  return !!queue.pendingDelivery || (queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0)
+  return !!queue.pendingDelivery || (queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0
+    && !promptQueueContextWasSkipped(queue))
     || isLoopPromptActive(queue);
 }
 

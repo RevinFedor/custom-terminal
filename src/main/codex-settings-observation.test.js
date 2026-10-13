@@ -90,3 +90,30 @@ test('actual main picker late return cannot poison subsequent actual settings+Se
   assert.equal(h.events.filter(event => event.kind === 'settings').length, 2);
   assert.equal(h.events.find(event => event.kind === 'prompt').model, 'requested-model');
 });
+
+test('4410: own second picker waits for current chosen pair instead of failing on delayed first-picker footer', async () => {
+  const filename = path.join(__dirname, 'codex-settings-send.integration.test.js');
+  const text = fs.readFileSync(filename, 'utf8');
+  const fixture = new Module(filename, module);
+  fixture.filename = filename; fixture.paths = Module._nodeModulePaths(path.dirname(filename));
+  fixture._compile(text.slice(0, text.indexOf("test('actual picker measures")) + '\nmodule.exports=harness;', filename);
+  const h = await fixture.exports();
+  const observer = createCodexLiveSettingsObserver({
+    capture: () => ({ terminal: h.terminals.get('tab'), runSeq: 2, lifecycleGeneration: 'generation',
+      live: true, ownerId: 'writer', sessionId: 'writer' }), publish() {},
+  });
+  h.context.codexLiveSettingsObserver = observer;
+  observer.observe('tab', { valid: true, seq: 1,
+    text: '› Ask Codex to do anything\ngpt-6.1-sol xhigh · Context 42% used' });
+  h.set({ model: 'gpt-6-astra', effort: 'max', afterSelection: () => {
+    // The first selection's footer reaches its observer during the second
+    // selection. Actual current frame in the reader already has the new pair.
+    observer.observe('tab', { valid: true, seq: 2,
+      text: '› Ask Codex to do anything\ngpt-6-astra max · Context 42% used' });
+  } });
+  const result = await h.direct({ model: 'gpt-6.1-sol', effort: 'max' });
+  assert.equal(result.submitted, true, JSON.stringify(result));
+  assert.equal(h.events.filter(event => event.kind === 'prompt').length, 1);
+  assert.equal(h.events.find(event => event.kind === 'prompt').model, 'gpt-6.1-sol');
+  assert.equal(observer.read('tab').model, 'gpt-6.1-sol');
+});

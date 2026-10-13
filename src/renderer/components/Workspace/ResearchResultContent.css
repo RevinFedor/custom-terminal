@@ -1,0 +1,27 @@
+.hp-research-result { min-width: 0; white-space: normal; }
+.hp-research-result-header { display: flex; align-items: stretch; width: 100%; min-width: 0; min-height: 24px; border-radius: 4px; white-space: nowrap; }
+.hp-research-result-toggle { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; padding: 2px 4px; border: 0; background: transparent; color: var(--cb-label, #bcbab5); font: inherit; line-height: 1.4; text-align: left; cursor: pointer; border-radius: 4px; white-space: nowrap; overflow: hidden; }
+.hp-research-result-toggle:disabled { cursor: default; }
+.hp-research-result-toggle:hover:not(:disabled), .hp-research-result-actions button:hover { background: var(--cb-hover, rgba(255,255,255,.04)); }
+.hp-research-result-toggle:focus-visible, .hp-research-result-actions button:focus-visible { outline: 1px solid #777; outline-offset: -1px; }
+.hp-research-result-icon { color: #a78bfa; flex: 0 0 auto; }
+.hp-research-result[data-research-failed="true"] .hp-research-result-icon { color: var(--cb-error, #f87171); }
+.hp-research-result-label { flex: 0 0 auto; white-space: nowrap; }
+.hp-research-result-flex { flex: 1 1 0; }
+.hp-research-result-model { flex: 0 1 auto; font-size: var(--cb-fs-small, .77em); color: var(--cb-muted, #8f8d88); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hp-research-result-actions { display: flex; flex: 0 0 auto; align-items: center; }
+.hp-research-result-actions button { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 4px; color: #8f8d88; background: transparent; cursor: pointer; }
+.hp-research-result-actions button:disabled { cursor: default; opacity: .6; }
+.hp-research-result-preview { padding-bottom: 2px; }
+.hp-research-result-excerpt { flex: 1; min-width: 0; white-space: normal; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; max-height: 1.4em; }
+/* Compact prose keeps the shared Markdown semantics; only its block layout
+   becomes one reading line. Full answer paragraphs retain their normal shape. */
+.hp-research-result-excerpt .cb-prose { color: inherit; font: inherit; line-height: inherit; }
+.hp-research-result-excerpt .cb-prose :is(h1,h2,h3,h4,h5,h6,p,ul,ol,li,blockquote) { display: inline; margin: 0; padding: 0; font-size: inherit; line-height: inherit; }
+.hp-research-result-excerpt .cb-prose :is(h1,h2,h3,h4,h5,h6) + p::before { content: ' — '; font-weight: 400; }
+.hp-research-result-body { box-sizing: border-box; margin: 4px 4px 6px 26px; padding: 6px 8px; max-height: 180px; overflow-y: auto; overflow-x: hidden; scrollbar-gutter: stable; border: 1px solid var(--cb-code-border, rgba(255,255,255,.06)); border-radius: 4px; background: var(--cb-code-bg, #0d0d0d); color: var(--cb-label, #bcbab5); }
+.hp-research-result-format { font-family: var(--cb-font-mono); font-size: var(--cb-fs-small, .77em); color: var(--cb-muted, #8f8d88); padding: 0 0 4px; }
+.hp-research-result-code.cb-generic-out { max-height: none; overflow: visible; padding: 0; margin: 0; }
+.hp-research-result-body .cb-prose { color: inherit; font-size: var(--cb-fs-content, .92em); }
+.hp-research-result-body .cb-code-scroll { max-height: none !important; overflow: visible !important; }
+.hp-research-result-body .cb-code-block { margin-top: 4px; margin-bottom: 4px; }

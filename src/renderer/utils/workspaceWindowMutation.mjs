@@ -8,6 +8,9 @@ import {
   moveTabsToPane,
   paneChooserSlots,
   paneTabs,
+  replacePaneShownTab,
+  replaceInStrip,
+  removeTabFromPane,
   splitAvailability,
   vacantPaneWithTabs,
 } from './splitPanesModel.mjs';
@@ -77,6 +80,7 @@ export function applyWorkspaceWindowMutation({
   show = false,
   focus = false,
   createEmptyWindow = false,
+  replaceShown = false,
 } = {}) {
   if (!target?.ok) return mutationFailure(target?.reason || 'target_unresolved');
   const layout = { ...emptySpaceLayout(), ...(rawLayout || {}) };
@@ -98,6 +102,34 @@ export function applyWorkspaceWindowMutation({
     delete promotedCenterStrips[sourceStripKey];
   }
   const targetPaneIndex = target.paneIndex;
+
+  // Explicit replacement is a placement operation, never Close Tab. Keep the
+  // outgoing tab alive and every unrelated chip/chooser in its exact slot.
+  if (replaceShown) {
+    if (target.mode !== 'same-window' || entries.length !== 1 || !show)
+      return mutationFailure('replace_requires_one_visible_tab');
+    const entry = entries[0];
+    if (panes.length) {
+      if (!Number.isInteger(targetPaneIndex) || !panes[targetPaneIndex] || panes[targetPaneIndex].displayHidden)
+        return mutationFailure('target_pane_missing');
+      let detached = dropTabFromAllPaneStrips(panes,entry.tabId,{keepPaneIndex:targetPaneIndex})?.panes || panes;
+      if (detached[targetPaneIndex].tabId !== entry.tabId)
+        detached = removeTabFromPane(detached,targetPaneIndex,entry.tabId)?.panes || detached;
+      const replaced = replacePaneShownTab(detached,targetPaneIndex,entry.projectId,entry.tabId);
+      return {ok:true,layout:{...layout,splitPanes:replaced?.panes || detached,
+        splitFocusedIndex:focus?targetPaneIndex:layout.splitFocusedIndex,
+        activeSpaceTab:entry,activeProjectId:entry.projectId,focusedProjectId:entry.projectId},
+        paneIndex:targetPaneIndex,shownTabId:entry.tabId};
+    }
+    const strip = sourceCenterStrip.length ? sourceCenterStrip : current ? [current] : [];
+    const next = replaceInStrip(current?.tabId===entry.tabId?strip:strip.filter(tab=>tab.tabId!==entry.tabId),
+      current?.tabId || '',entry.projectId,entry.tabId);
+    const centerStrips = {...layout.centerStrips};
+    if (sourceStripKey) delete centerStrips[sourceStripKey];
+    if (next.length > 1) centerStrips[entry.projectId] = next;
+    return {ok:true,layout:{...layout,centerStrips,activeSpaceTab:entry,
+      activeProjectId:entry.projectId,focusedProjectId:entry.projectId},paneIndex:null,shownTabId:entry.tabId};
+  }
 
   // A background source still has a real window when its monitor hides it.
   // Resolve "below/right of source" in a profile where that window is placed,

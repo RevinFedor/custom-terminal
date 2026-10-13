@@ -22,7 +22,9 @@ export default function CodexNativeQuestionMirror({ tabId, onRecoverDraft }: {
     if (currentKey.current) drafts.current.set(currentKey.current, { ...field.current });
     currentKey.current = questionKey;
     const saved = drafts.current.get(questionKey) || { draft: state.draft || '',
-      selected: state.draft ? null : state.options.length ? state.optionIndex ?? 0 : null,
+      selected: state.draft ? null : state.options.length
+        ? Number(state.optionIndex ?? 0) < state.options.length ? state.optionIndex ?? 0 : null
+        : null,
       baseDraft: state.draft || '' };
     field.current = { ...saved }; setDraft(saved.draft); setSelected(saved.selected);
   }, [questionKey, state?.expanded]);
@@ -42,9 +44,18 @@ export default function CodexNativeQuestionMirror({ tabId, onRecoverDraft }: {
     const answer = draft.trim() || (selected !== null ? state.options[selected] || '' : '');
     try {
       const result = await controlCodexNativeQuestion(tabId, action, action === 'answer'
-        ? { answer, baseDraft: field.current.baseDraft } : {});
+        ? { answer, baseDraft: field.current.baseDraft,
+          ...(!draft.trim() && selected !== null ? { optionIndex: selected } : {}) } : {});
       if (!result?.success) {
-        useUIStore.getState().showToast('Вопрос Codex: ' + (result?.error || 'операция не подтверждена'),
+        const reason = result?.error;
+        const text = reason === 'semantic-frame-timeout'
+          ? 'Не удалось подтвердить действие с вопросом. Проверь терминал: команда могла уже сработать.'
+          : reason === 'question_not_actionable'
+            ? 'Форма вопроса не распознана. Повторная команда не отправлена — проверь терминал.'
+            : reason === 'question_state_changed' || reason === 'question_owner_changed'
+              ? 'Вопрос изменился или уже закрыт. Команда не подтверждена.'
+              : 'Вопрос Codex: ' + (reason || 'операция не подтверждена');
+        useUIStore.getState().showToast(text,
           'error', 5000, false, undefined, undefined, undefined, tabId);
       } else if (action === 'skip' || action === 'answer') {
         drafts.current.delete(key);

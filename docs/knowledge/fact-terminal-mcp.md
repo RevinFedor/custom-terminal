@@ -104,6 +104,16 @@ process lookups. Установка из собственной сессии —
 - **SQLite** (renderer → save-tabs): name, color, command_type, cwd, tab_id — снимок на момент последнего save
 - **Main process Maps** (live): terminals (PTY alive?), terminalCommandState (isRunning), terminalInitialCommand, pid
 
+С11.10 exact `parentProjectId` разрешается и как legacy Project, и как v2
+execution namespace из `workflow_execution_scopes`, до fallback по legacy cwd.
+Наличие Project row не является условием существования standalone вкладки.
+Known empty namespace возвращает пустой свой список, а не вкладки совпавшего
+по cwd Project. Активные rows/цвет/порядок и один passive Codex runtime batch
+сохранены; saved SID не превращается в writer/ready. Шрам: в full DEV с0Projects
+`current_context` имел правильные work-context/placement, но `tab:null` из-за
+раннего Project-only return. Это дефект списка Main, не подтверждение потери
+MCP transport и не основание убрать проверку actual tab.
+
 ### План задач вкладки
 
 Public native cards читают компактную проекцию того же плана в `/api/projects/:id/tabs`
@@ -120,6 +130,46 @@ Terminal MCP публикует две отдельные команды стр�
 Если `tabId` не передан, сервер использует `NOTED_PARENT_TAB_ID`, то есть вкладку, которой принадлежит текущая AI-сессия. Это важнее активной вкладки интерфейса: пользователь может в момент фоновой правки смотреть другой проект.
 
 Команда записи намеренно не принимает свободный Markdown. Контракт ограничен операциями над двумя уровнями структуры и архивом корневых задач (`archive_task` / `restore_task`); один вызов образует одну точку общей истории undo/redo. Инструкция инструмента и `docs/prompts/план-задач-вкладки.prompt.md` требуют до вызова показать точную дельту и дождаться явного подтверждения пользователя. Подробнее: [`fact-tab-task-plan.md`](fact-tab-task-plan.md).
+
+## Уведомление пользователя в Telegram
+
+`notify_user({text,waitSeconds?,requestId?})` отправляет уведомление человеку от
+собственной полноценной вкладки. Это отдельный Telegram-only сценарий, а не
+`send_message` другой нейронке и не взведение completion bell. Он не меняет
+armed/persistent/fired, unread, красный workflow-alert, звук или APNs.
+При просьбе «уведоми, когда закончишь» агент вызывает его после нужной работы,
+а не после каждого промежуточного ответа.
+
+Main принимает запрос через `POST /api/terminal-tabs/:tabId/notifications`,
+сохраняет текст и паузу до отправки и использует прежний outbox-класс в отдельной
+FIFO. Имя/адрес источника берутся из каталога вкладок; MCP не принимает source/
+target override. Это чтение метаданных, без загрузки History, запуска агента или
+зависимости orchestration. Требуется `capabilities.userNotifications.version:1`
+у `/api/me` и обновлённый receiver SC Desktop
+`/notifications/terminal-user`; у старого Noted нет bell/direct-Telegram fallback.
+
+`requestId` создаётся MCP до сети и возвращается при неизвестном исходе. Один
+ID внутри вкладки сохраняет исходные текст/паузу и время отправки; изменённый
+payload конфликтует. `get_user_notification({requestId})` — пассивный reader той
+же квитанции. Missing/pruned/ошибка чтения не разрешают новый ID или resend.
+Квитанции ограничены24часами/2048записями, receiver dedupe —24часами/512записями;
+не обещать вечную exactly-once доставку после потери/вытеснения доказательств.
+
+Для уже разрешённого перехвата курсора агент может передать заданные пользователем
+20–30секунд в `waitSeconds` (0–60, default0). MCP ждёт этот интервал только после
+точного Telegram message ID и `sentAt`; повтор не начинает его заново. Успешное
+предупреждение — `deliveryState:sent` вместе с `waitCompleted:true`. Accepted,
+pending/unknown/failed или прерванный вызов не завершают предупреждение: агент
+не должен начинать перехват. Команда сама не управляет мышью и не выдаёт права
+ввода; Telegram ACK также не доказывает прочтение человеком.
+
+Прямой HTTP-вызов этого же POST не требует MCP или перезапуска AI-сессии.
+Он возвращает квитанцию после первой попытки, не удерживает HTTP-запрос на время
+паузы: direct client сам ждёт до `waitUntil` после `deliveryState:sent` и не
+перехватывает курсор при другом исходе. Авторизация — прежний Noted bearer;
+`sourceMeta:{server:"terminal",tabId,projectId}` сверяется с адресом и каталогом.
+GET той же `/notifications?requestId=...` только читает квитанцию. В старом Main
+нового маршрута нет: обход MCP не заменяет обновление desktop-приложений.
 
 ## AI live control
 
@@ -141,6 +191,10 @@ placement-only «Убрать» остаётся отдельным UI-дейс�
 `ready:true/inputReady:true` возможен после TUI prompt **и** ready startup-gate
 для `/model`/`/effort`; для Codex — после доказанной готовности composer и
 проверки запрошенной next-launch пары. Первый TUI edge лишь будит проверку.
+Ожидание закрепляет identity принятого launch до самого первого runtime read:
+готовый replacement не может завершить чужой start_ai. Claude сохраняет
+собственный первый OSC-B под launch token, Codex — также lifecycle pin.
+Отсутствующий owner в результате запуска не подменяется текущим runtime.
 Для Claude он также только открывает транзакцию: первый settings-paste ждёт
 устойчивого composer-frame после последней startup-перерисовки. Если запуск сразу
 получил пользовательский prompt, тот ждёт доказанных model/effort и не может
@@ -223,7 +277,10 @@ benchmark. Обе exact квитанции confirmed; runId у них отсут
 типизированно оборачивает `POST /api/terminal-tabs/:tabId/response-observations`
 с `sourceTabId/runId`; до ACK приложение сохраняет `runKind=response-observation`.
 По умолчанию ждёт подтверждённого idle и окончания связанной работы, затем
-выбирает последний ответ. `waitForDescendants:false` у busy target закрепляет
+выбирает последний ответ. Main `goalWork` от структурированного Codex outcome
+удерживает это ожидание между Goal-ходами: проверяется до/после чтения и до
+быстрой фиксации результата. Это не child count и не новый provider request.
+`waitForDescendants:false` у busy target закрепляет
 точный текущий provider-turn, не следующий. Уже idle target читается без нового
 запуска. После accepted модель заканчивает ход; ответ приходит обычным completion,
 а `get_delegation_result` нужен только для явного reference/восстановления.
@@ -297,7 +354,29 @@ browser-tab registry. Только доказанное отсутствие р�
 
 Вложенная делегация сохраняет ту же модель. Terminal MCP передаёт Project API точный контекст текущего source-turn; только его совпадение с конкретным исполняемым входящим run разрешает автоматический `parentRunId`. Само наличие A→B не делает независимый ручной B→C его ребёнком. `waitForDescendants` по умолчанию не даёт target отчитаться наверх, пока его дочерняя ветка не закончена и её completion не принят по точному source-handoff. Новый provider-turn не обязателен: текущий store поддерживает exact `same-active-turn` и recovery `same-settled-turn`; отдельное app-owned user-message остаётся обязательным. Это доказательство доставки, не семантического использования текста. Зависимость принадлежит durable run, а не visual-child вкладки и не встроенному Claude/Codex subagent. Ранний отчёт разрешается только явным `waitForDescendants:false`; progress/status polling не заменяет этот параметр.
 
+Если ответ уже вошёл в source, а Noted завершился до сохранения run-проекции,
+startup сначала проверяет точную durable квитанцию общего History/FIFO owner.
+Canonical audit хранит context именно этой row/session/attempt и явный queue flag;
+его соединение с run не запускает target, новый research или повтор input.
+Недостаточная legacy-квитанция использует прежний targeted transcript proof,
+не latest turn вкладки. Pin квитанции снимается после strict run confirmation;
+отменённый handoff от позднего proof не оживает. Подробнее —
+`fact-оркестрация-вкладок.md::Persistence и восстановление`.
+
 Входящий run получает этот контекст не от generic `busy` по `tabId`, а вместе с exact post-Enter proof собственного prompt. Это закрывает порядок, где `UserPromptSubmit` уже создал новый ход, а Project API ещё не успел отметить transport acceptance. Совпадение provider/session обязательно; повтор одного proof идемпотентно дополняет отсутствующий контекст и никогда не заменяет уже доказанный соседним turn. У Codex audit и `task_started` допустимы в обоих порядках: ранний audit дожидается start-события, а ранний start прикрепляется к следующей exact `user_message` записи того же хода. Polling и угадывание по `tabId` не используются; неоднозначность остаётся root с diagnostic.
+
+Явное восстановление прежнего interrupted agent-run — `continue_delegation({runId})`
+или фиолетовый Play `Продолжить запрос` в жёлтой MCP-карточке. Это thin POST
+`/api/orchestrations/:runId/action {action:"continue"}`, capability
+`orchestrationContinuation.version:1`. App сохраняет отдельный durable continuation,
+проверяет обе истории, использует общий Resume/Send, и лишь точный новый prompt/turn
+становится источником result. Sender/caller не заменяет прежнего получателя.
+Pending/unknown не разрешают ещё один Continue; GET прежнего run показывает фазу.
+Ready/already-active work не получает новый input; cancelled/terminal/changed branch
+требует явно нового поручения, не воскресшего старого ID. Новая отправка исходного
+snapshot — отдельное user action `new-request`, с новым run и обычной очередью.
+Старый Main отвергается до POST; вручную имитировать этот flow несколькими tool
+Send/Resume/read-latest нельзя. Browser jobs и read-only observations не перезапускаются.
 
 Request и PTY transport могут иметь разные hashes после доказанного codec.
 Target и source-followup conduits сохраняют основание преобразования
@@ -433,6 +512,14 @@ snapshot запроса в SQLite `agent_send_queue`, связывая его с
 refs фиксируются при приёме; дальнейший input их не меняет. Очередь не зависит
 от смонтированной History. Ошибка сохранения не является ACK.
 
+Run After входит в этот же FIFO с отдельным automatic admission: согласие Root
+сверяется с coherent Main runtime и для Codex с текущим завершённым headless
+кадром. Resume может быть input-ready во время перерисовки старой переписки:
+такой кадр паркует исходный item до attempt, а flush только будит повторный
+допуск. Это не новый executor и не право повторить неизвестный Send; обычная
+ручная отправка во время streaming этим idle/frame gate не ограничивается.
+Подробнее — `fact-prompt-queue.md`, тонкости Resume input-ready.
+
 Desktop History может явно объединить две соседние ручные `IN APP QUEUE`
 карточки через ↑ у нижней, только пока обе `waiting`, без physical attempt,
 с одинаковыми destination/settings. Main повторно проверяет эти условия после
@@ -503,13 +590,41 @@ Main повторно использует её существующий admissi
 Standalone slash и record-without-reply остаются в своих доказательных flows.
 
 Waiting item можно отменить до начала attempt; race с dispatch не объявляется
-успешной отменой. Явный process Stop/закрытие вкладки снимает принятый backlog и
+доказательством отсутствия прошлой отправки. Явный process Stop/закрытие вкладки снимает принятый backlog и
 отзывает текущую подготовку через прежний cancellation registry. Interrupt
 по-прежнему относится к текущему turn и не превращается в process Stop.
 Непереданные failed/cancelled snapshots не пропадают по15s UI-таймеру или общей
 receipt-retention: остаются pinned до явного скрытия, image asset IDs входят в
 прежний GC inventory. Зависимые cold items удерживают exact proof начального
 provider writer, а не подставляют текущий SID в момент исполнения.
+
+SOURCE11.10: ранний native process Stop расширяет прежний `/stop` через
+`sendIntentCancellation` v1. `pendingSends` содержит immutable project
+operationKey/handoffId/provider; отсутствующий attempt выбирает Main из того же
+handoff, явно переданный attempt обязан совпасть. Весь список проверяется ДО
+tab-wide cancellation; ошибочный tuple не отменяет соседей. Marker создаётся
+даже до первой HTTP admission и переживает потерю receipt, но тогда прошлый
+Enter остаётся unknown. Это не remote process-owner CAS: process Stop по-прежнему
+tab-scoped. Пустой legacy запрос сохраняет прежний контракт.
+
+Ответ разделяет `processStop.stopped` и `sendCancellation.complete/results`;
+сбой сохранения cancellation после остановки процесса возвращает non-2xx с
+обоими фактами. Native обязан прочитать тело и не повторять POST автоматически.
+Late ACK, memory replay и canonical audit не снимают durable отмену; positive
+audit может уточнить прошлую доставку, но не оживить этот handoff. Проверка у
+launch и непосредственно перед PTY write читает прежний receipt owner; один
+ошибочный launch invocation не может выдумать отрицательную Send-квитанцию.
+
+Standalone Start/Resume использует существующую terminal-instance/Stop revision,
+захваченную до async подготовки/очереди. Native `/start` и `/resume` передают её
+через bridge; это launch fence, не новый Send. Записанная shell-команда — уже
+иная граница: отсутствие AI-child не равно её отмене. Shell owner хранит witness
+до парных command start/finish либо подтверждённого process Stop; текущий Stop
+ждёт структурные события через bounded observation. Deadline сообщает unknown,
+не success и не разрешение повторить ввод. Полностью задержанный первый HTTP
+Start, ещё не виденный Main до Stop, не имеет immutable launch ID и этим fence
+не покрыт. Source review не является compile/runtime acceptance; поставка и
+проверки остаются отдельным этапом в рабочем плане AI-состояний.
 
 Очередь сама не читает/копирует bytes: inventory содержит только materialized
 managed assets. SOURCE05.10 добавляет импорт подтверждённых mobile image/document
@@ -1011,6 +1126,16 @@ project. Явный same-project `projectId` служит routing hint и не �
 прежний durable subject и не создаёт ещё один. Ремонт новых созданий сам по себе
 не регистрирует ранее возникшие legacy-вкладки без membership.
 
+При жалобе «появилась в sidebar лишь после открытия/закрытия» проверять отдельно
+создание, renderer-публикацию и выбранный workflow. `WorkflowCreation` пишет
+подтверждённую allocation через `console.log`: renderer `console.info` не
+пересылался в файл. `WorkflowCreation:visibility` связывает тот же tabId с
+отсутствующим renderer record, фильтром/размещением, другим workflow, outline,
+строкой и DOM. Наблюдение ограничено32 новыми вкладками, без таймеров/подписок/
+layout reads; вытеснение явно отмечается. `dom-mounted` подтверждает наличие
+строки, но не её попадание в прокрученный viewport. Текущий API membership и
+успешное создание не доказывают историческую видимость строки.
+
 ## Контекстные файлы без чтения вызывающим агентом
 
 `send_prompt` и `delegate_to_session` принимают `files:[{path,role,label?}]`.
@@ -1059,6 +1184,16 @@ editable draft не должен неявно материализовать м�
 Блок в левом верхнем углу вкладки — структурированный план задач: `get_tab_plan` читает его, а `apply_tab_plan_changes` атомарно применяет только заранее показанный и подтверждённый пользователем пакет операций. Старое поле `tab.notes` остаётся совместимостью удалённой Markdown-поверхности и не выставляется как новый публичный метод. `list_notes` — третья, независимая сущность: пользовательские якоря Timeline.
 
 `link_file` не создаёт новую иерархию. Он вызывает тот же renderer-сценарий, что desktop Link File/DnD: `tabType='file'`, `visualParentTabId=<AI tab>`, inherited `groupId`, background creation. Путь сначала canonicalize/проверяется сервером; повтор той же пары canonical file + parent возвращает существующий file-tab. Без `tabId` файл прикрепляется к родительской полноценной сессии, с явным `tabId` — к другой открытой AI-вкладке, в том числе другого проекта.
+
+Сохранённый на диске документ ещё не подтверждает прикрепление: связь проверяется
+через `get_tab_context`. Шрам13.10: `link_file` у507 получал409
+`execution_storage_revision_changed` из-за чужой строки в полном snapshot,
+а не из-за отсутствия файла или ошибки Codex. Новая native file-вкладка проходит
+общий scoped creation commit только своей строкой; CAS самого ребёнка и отмена
+до публикации остаются строгими. Legacy/restore и сохранение самой конфликтующей
+вкладки не получают исключения. Детали — `fact-data-persistence.md::Создание
+native-вкладки не сохраняет соседей`. Обновление MCP не устанавливает этот
+renderer-ремонт, ранее отказавшиеся связи автоматически не создаются.
 
 Полноценные AI-сессии используют ту же визуальную связь, но остаются самостоятельными процессами. `create_tab` и `delegate_to_session` по умолчанию создают связанную новую сессию как visual-child вызывающей вкладки, когда обе находятся в одном проекте; `placement='root'` оставляет независимую работу на верхнем уровне. Новая фоновая сессия добавляется последней в уже заданном порядке: связь с родителем не даёт API права вставить её перед вручную расставленными вкладками или сделать первым ребёнком. Для другого проекта без явно переданного `parentTabId` безопасный default — root, а делегация в уже существующий target никогда не меняет его место в иерархии.
 

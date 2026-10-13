@@ -110,6 +110,39 @@ test('whole-work wait includes the existing child gate and internal background a
   assert.equal(h.notifications[0].body, 'TARGET FINAL');
 });
 
+test('Goal gap and fast completion cannot freeze an intermediate response', async t => {
+  const h = await fixture(t);
+  await h.start();
+  const goalWork = { version: 1, pending: true, status: 'active', phase: 'continuing' };
+  h.setState({ busy: false, revision: 'goal-between-turns', goalWork });
+  h.service.recordCompletion({ tabId: 'target', subject: subject(), result: answer('INTERMEDIATE'),
+    backgroundWorkCount: 0, goalWork });
+  await h.service.reconcile('observe', 'intermediate-goal-final');
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.notifications.length, 0);
+  assert.equal((await h.store.getInternal('observe')).observationSubject, undefined);
+  h.setState({ busy: true, revision: 'next-goal-turn', goalWork: null });
+  await h.service.reconcile('observe');
+  h.setRead(async () => ({ subject: subject('goal-final'), result: answer('WHOLE GOAL FINAL') }));
+  h.setState({ busy: false, revision: 'goal-complete', goalWork: { version: 1, pending: false, status: 'complete' } });
+  await h.service.reconcile('observe');
+  assert.equal(h.notifications.length, 1);
+  assert.equal(h.notifications[0].body, 'WHOLE GOAL FINAL');
+});
+
+test('Goal evidence arriving during the read discards the unbound old candidate', async t => {
+  const h = await fixture(t);
+  await h.start();
+  h.setState({ busy: false, revision: 'before-goal' });
+  h.setRead(async () => {
+    h.setState({ goalWork: { version: 1, pending: true, status: 'active' }, revision: 'goal-advanced' });
+    return { subject: subject(), result: answer('OLD') };
+  });
+  await h.service.reconcile('observe');
+  assert.equal(h.notifications.length, 0);
+  assert.equal((await h.store.getInternal('observe')).observationSubject, undefined);
+});
+
 test('a new turn during latest-response read discards the earlier candidate', async t => {
   const h = await fixture(t), gate = deferred(), entered = deferred();
   await h.start();
@@ -183,7 +216,7 @@ test('current-turn-only mode keeps its subject while an unrelated successor is b
   });
   await h.start({ waitForDescendants: false });
   assert.equal(h.notifications.length, 0);
-  h.setState({ revision: 'successor', currentSubject: { ...currentSubject,
+  h.setState({ revision: 'successor', goalWork: { version: 1, pending: true, status: 'active' }, currentSubject: { ...currentSubject,
     targetExecutionContext: { ...currentSubject.targetExecutionContext, turnId: 'turn-b', generation: 5 } } });
   await h.service.reconcile('observe');
   assert.equal(h.notifications[0].body, 'A FINAL');
@@ -296,6 +329,8 @@ test('actual startup reconciliation hands a saved unattempted observer notificat
   const notifications = [];
   const reconcile = await webBoundary('reconcileActiveOrchestrations', {
     getOrchestrationRunStore: () => h.store, getResponseObservationService: () => h.service,
+    reconcileOrchestrationSourceReceiptPins: async () => {},
+    agentSendReceiptStore: null,
     finalizeSettledOrchestration: async run => {
       notifications.push(h.service.readResult(run).assistantText);
       await h.store.patch(run.runId, { sourceFollowupStartedAt: Date.now(), notificationStatus: 'sent' });

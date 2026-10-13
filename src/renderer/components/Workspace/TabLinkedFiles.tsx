@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { FileText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
-import { tabLinkedFilesSnapshot, isLinkedFilePreview, placeLinkedFilePopup,preferredLinkedFile } from '../../utils/tabLinkedFiles.mjs';
+import { publishedTabLinkedFilesSnapshot, isLinkedFilePreview, placeLinkedFilePopup,preferredLinkedFile } from '../../utils/tabLinkedFiles.mjs';
 import {isFileMissing,probeFiles,subscribeMissingFiles} from '../../utils/missingFileTracker';
 import {closeTabLinkedFile} from '../../utils/tabLinkedFilePreview';
 import TabLinkedFileTree from './TabLinkedFileTree';
@@ -15,8 +15,7 @@ export type LinkedFile = { projectId: string; id: string; ownerTabId: string; pa
 export function useTabLinkedFiles(tabId: string, enabled = true): LinkedFile[] {
   // A value snapshot avoids allocating new selector results or reacting to
   // unrelated activity updates. No file bodies or MD-only context inventory.
-  const snapshot = useWorkspaceStore(s => enabled ? tabLinkedFilesSnapshot(s.openProjects, tabId,
-    s.spaces.find(space=>space.id===s.tabWorkflowMembership?.[tabId]?.workflowId)?.reserveOrder || []) : '[]');
+  const snapshot = useWorkspaceStore(s => enabled ? publishedTabLinkedFilesSnapshot(s, tabId) : '[]');
   return useMemo(() => JSON.parse(snapshot), [snapshot]);
 }
 

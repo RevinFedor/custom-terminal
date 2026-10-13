@@ -30,7 +30,7 @@ function actualRunnerDeclaration(source, name) {
 const barrier = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const turn = async () => { for (let i = 0; i < 90; i++) await Promise.resolve(); };
 const modules = {
-  useWorkspaceStore: 'export const useWorkspaceStore={getState:()=>globalThis.ports.workspace,subscribe:()=>()=>{}};',
+  useWorkspaceStore: 'export const useWorkspaceStore={getState:()=>globalThis.ports.workspace,subscribe:fn=>{globalThis.ports.workspaceSubscribers.add(fn);return()=>globalThis.ports.workspaceSubscribers.delete(fn);}};',
   useUIStore: 'export const useUIStore={getState:()=>globalThis.ports.ui};',
   useOrchestrationStore: `export const useOrchestrationStore={getState:()=>({hydrated:true,initialized:true,inheritedBusyTabIds:new Set(),runs:new Map()}),subscribe:()=>()=>{}};
     export const initializeOrchestrationStore=async()=>{};
@@ -54,6 +54,7 @@ test.before(async () => {
     export * from './store/usePromptQueueStore';
     export * from './hooks/usePromptQueueRunner';
     export { shouldArmQueueForTrigger } from './utils/promptTriggerArm.mjs';
+    export { rememberAgentLaunchFence } from './utils/agentLaunchFence.mjs';
   `, resolveDir: root, loader: 'ts' }, platform: 'node', bundle: true, write: false,
     format: 'cjs', target: 'node18', logLevel: 'silent', plugins: [{ name: 'controlled-runtime-ports', setup(build) {
       build.onLoad({ filter: /\.(ts|tsx)$/ }, args => {
@@ -83,7 +84,13 @@ test.before(async () => {
             const pendingTimers = new Map();
             ${['clearTimer', 'fireHead', 'scheduleFirstDelayTimer', 'startFirstDelayCountdown',
               'verifyCodexTriggerIdleThenFire', 'evaluateQueues'].map(name => actualRunnerDeclaration(source, name)).join('\n')}
-            return Object.assign(() => {const s=usePromptQueueStore.getState();evaluateQueues(s,s,{forceRuntimeArms:true,forceAppRestartTriggers:true});}, {deadline: scheduleFirstDelayTimer});
+            return Object.assign(() => {const s=usePromptQueueStore.getState();evaluateQueues(s,s,{forceRuntimeArms:true,forceAppRestartTriggers:true});}, {
+              deadline: scheduleFirstDelayTimer,
+              subscribe: () => {
+                ${actualRunnerDeclaration(source, 'unsubscribeQueue')}
+                return unsubscribeQueue;
+              },
+            });
           }
         `, loader: 'ts' };
         }
@@ -94,9 +101,11 @@ test.before(async () => {
 
 async function fixture(t, initialQueue = null) {
   const events = new EventEmitter(), timers = new Map(), saved = [], sends = [], reads = [], cancelled = [], contextSettles = [], rewinds = [], stops = [], toasts = [], preparations = [];
+  const launchIntents = [], launchCancellations = [], workspaceSubscribers = new Set();
   let n = 0, sid = 'A', contextPct = 90, receipt = null, sendResult = { success: true, submitted: true }, hold = null;
   const tab = { id: 'T', tabType: 'terminal', commandType: 'codex', codexSessionId: sid, cwd: '/private-fixture' };
   const ports = {
+    workspaceSubscribers,
     workspace: { isRestoring: false, openProjects: new Map([['P', { projectPath: '/private-fixture', tabs: new Map([['T', tab]]) }]]) },
     ui: { showToast: (...args) => toasts.push(args), codexSettings: { models: [] }, claudeCodeSettings: { models: [] } },
     runtime: { toolType: 'codex', getPresence: async () => {
@@ -105,12 +114,14 @@ async function fixture(t, initialQueue = null) {
     } },
     prepareRuntime: async input => {
       preparations.push(input);
+      input.assertAdmissionCurrent?.();
       if (hold?.kind === 'prepare-runtime') {
         hold.entered.resolve();
         await Promise.race([hold.release.promise, new Promise((_, reject) => {
           input.admissionSignal.addEventListener('abort', () => reject(new Error('controlled preparation aborted')), { once: true });
         })]);
       }
+      input.assertAdmissionCurrent?.();
       return { status: 'active', submitCapability: 'direct', presence: { inputReady: true } };
     },
     workContext: async (_tab, _id, prompt) => {
@@ -119,6 +130,7 @@ async function fixture(t, initialQueue = null) {
     },
     settleContext: async (...a) => contextSettles.push(a),
     rewind: async value => { rewinds.push(value); return value; },
+    materializeRefs: refs => refs,
   };
   const ipc = { on: (...a) => events.on(...a), removeListener: (...a) => events.removeListener(...a), sendSync() {},
     invoke: async (channel, input) => {
@@ -131,12 +143,30 @@ async function fixture(t, initialQueue = null) {
       }
       if (channel === 'ai-prompts:get') return { success: true, data: [] };
       if (channel === 'tab:get-context-pct') {
-        if (hold?.kind === 'context') { hold.entered.resolve(); await hold.release.promise; }
+        if (hold?.kind === 'context' || (hold?.kind === 'post-prepare-context' && preparations.length > 0)) {
+          hold.entered.resolve(); await hold.release.promise;
+        }
         reads.push({ ...input });
         return { exact: true, provider: input.provider, sessionId: input.sessionId, pct: input.sessionId === sid ? contextPct : null };
       }
       if (channel === 'agent:join-automatic-send') return { found: false };
-      if (channel === 'agent:enqueue-prompt') { sends.push(input); if (sendResult instanceof Error) throw sendResult; return sendResult; }
+      if (channel === 'agent:begin-launch-intent') {
+        launchIntents.push(input);
+        return { success: true, protocolVersion: 1, launchIntent: { ...input, token: 'controlled-' + launchIntents.length,
+          launchFence: { terminalInstanceId: 'controlled-terminal', stopRevision: 0 } } };
+      }
+      if (channel === 'agent:cancel-launch-intent') { launchCancellations.push(input); return { success: true }; }
+      if (channel === 'agent:inspect-launch-intent') {
+        launchCancellations.push({ ...input, intentId: input.launchIntent?.intentId });
+        return { success: false, protocolVersion: 1, launchIntent: input.launchIntent, joined: false };
+      }
+      if (channel === 'agent:finish-launch-intent') return { success: true };
+      if (channel === 'agent:enqueue-prompt') {
+        sends.push(input);
+        if (hold?.kind === 'send-response') { hold.entered.resolve(); await hold.release.promise; }
+        if (sendResult instanceof Error) throw sendResult;
+        return sendResult;
+      }
       if (channel === 'agent:list-send-receipts') return { success: true, records: receipt ? [receipt] : [] };
       if (channel === 'agent:cancel-send') { cancelled.push(input); return { cancelled: false }; }
       if (channel === 'codex:get-turn-state') return { busy: false, outcomeKnown: true };
@@ -145,15 +175,21 @@ async function fixture(t, initialQueue = null) {
         if (hold?.kind === 'stop') { hold.entered.resolve(); await hold.release.promise; }
         return { success: true };
       }
-      if (channel === 'prompt-queue:materialize-image-refs') return { refs: input.refs };
+      if (channel === 'prompt-queue:materialize-image-refs') {
+        if (hold?.kind === 'images' && preparations.length > 0) { hold.entered.resolve(); await hold.release.promise; }
+        return { refs: ports.materializeRefs(input.refs) };
+      }
       throw new Error('unexpected controlled IPC ' + channel);
     } };
   const module = { exports: {} }, window = { require: () => ({ ipcRenderer: ipc }), addEventListener() {}, removeEventListener() {} };
   const context = vm.createContext({ module, exports: module.exports, require, console: quiet, process, ports,
-    window, document: {}, Buffer, AbortController, crypto: { randomUUID: () => 'private-' + (++n) },
+    window, document: {}, Buffer, AbortController, structuredClone, crypto: { randomUUID: () => 'private-' + (++n) },
     setTimeout: fn => { const id = Symbol(); timers.set(id, fn); return id; }, clearTimeout: id => timers.delete(id) });
   vm.runInContext(bundle, context);
   const actual = module.exports;
+  // Controlled terminal:create transport, through the real fence consumer.
+  // Actual Main producer/authority races are covered in prebegin.actual.test.
+  actual.rememberAgentLaunchFence('T', { terminalInstanceId: 'controlled-terminal', stopRevision: 0, order: 1 });
   await actual.hydratePromptQueueStore();
   const state = () => actual.usePromptQueueStore.getState();
   const id = initialQueue ? state().getQueue('T').items[0]?.id : state().addPrompt('T', 'FIRST', 0);
@@ -161,10 +197,22 @@ async function fixture(t, initialQueue = null) {
   if (!initialQueue) state().setAutoRun('T', true);
   t.after(() => timers.clear());
   return { actual, context, ports, state, id, item, sends, reads, saved, cancelled, contextSettles, rewinds, stops, toasts, preparations,
+    launchIntents, launchCancellations,
     fire: () => actual.beginConditionAwareQueueSend('T', 'T', item(), 'cold-start'),
     setResult: value => sendResult = value,
     setReceipt: value => receipt = value,
-    owner: (value, pct) => { sid = value; tab.codexSessionId = value; contextPct = pct; },
+    owner: (value, pct) => { sid = value; tab.codexSessionId = value; contextPct = pct; for (const fn of workspaceSubscribers) fn(); },
+    cwd: value => { tab.cwd = value; for (const fn of workspaceSubscribers) fn(); },
+    provider: value => {
+      // A command label alone is not a provider change while the old session
+      // binding owns the tab. Exercise the actual owner contract instead.
+      tab.commandType = value;
+      tab.codexSessionId = value === 'codex' ? sid : null;
+      tab.claudeSessionId = value === 'claude' ? 'CLAUDE-A' : null;
+      for (const fn of workspaceSubscribers) fn();
+    },
+    project: value => { const ws = ports.workspace.openProjects.values().next().value;
+      ports.workspace.openProjects = new Map([[value, ws]]); for (const fn of workspaceSubscribers) fn(); },
     hold: kind => { hold = { kind, entered: barrier(), release: barrier() }; return hold; },
     async settle() { await turn(); assert.equal(actual.testAwait(), true, 'all selected async boundaries settled'); },
   };
@@ -180,6 +228,73 @@ function findArrow(property, predicate) {
   };
   visit(overlayTree); assert.ok(arrow, property); return arrow;
 }
+
+for (const result of [
+  { success: true, submitted: true, status: 'sent' },
+  { success: true, submitted: true, queued: true, status: 'queued' },
+  { success: false, submitted: true, deliveryUnknown: true, status: 'delivery-unknown' },
+]) test('successful source consumption never cancels the transferred exact Send: ' + result.status, async t => {
+  const f = await fixture(t);
+  // Mount the actual Root Store subscription, including synchronous pruning
+  // and scheduling. React is not mounted; IPC/runtime remain controlled ports.
+  t.after(f.actual.testColdScheduler().subscribe());
+  const successor = f.state().addPrompt('T', 'SECOND', 0);
+  f.setResult(result);
+  f.fire(); await f.settle();
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.item(), undefined);
+  assert.ok(f.state().getQueue('T').items.some(item => item.id === successor));
+  assert.equal(f.cancelled.length, 0, 'own commit is not a user cancellation or input-slot release');
+});
+
+test('Pause before the transfer response still cancels exactly the original pending handoff', async t => {
+  const f = await fixture(t), hold = f.hold('send-response');
+  t.after(f.actual.testColdScheduler().subscribe());
+  f.fire(); await hold.entered.promise;
+  f.state().setAutoRun('T', false);
+  assert.equal(f.cancelled.length, 1);
+  assert.equal(f.cancelled[0].handoffId, f.sends[0].handoffId);
+  hold.release.resolve(); await f.settle();
+  assert.equal(f.cancelled.length, 1, 'late successful transfer cannot cancel twice or revive the source');
+  assert.equal(f.state().getQueue('T').autoRun, false);
+});
+
+test('late successful Send preserves a newer body/Post/condition/trigger under the same queue id', async t => {
+  for (const kind of ['body', 'post', 'condition', 'trigger']) {
+    const f = await fixture(t), pending = f.hold('send-response');
+    t.after(f.actual.testColdScheduler().subscribe());
+    f.fire(); await pending.entered.promise;
+    const s = f.state();
+    if (kind === 'body') s.updatePrompt('T', f.id, { text: 'NEW BODY' });
+    if (kind === 'post') { s.setPostPromptText('T', 'NEW POST'); s.setPostPromptEnabled('T', true); }
+    if (kind === 'condition') s.setPromptCondition('T', f.id, { kind: 'context-used', operator: 'gte', percent: 50 });
+    if (kind === 'trigger') s.setPromptTrigger('T', f.id, { kind: 'app-restart', armedInstanceId: 'new-main' });
+    const edited = JSON.stringify(f.item());
+    pending.release.resolve(); await f.settle();
+    assert.ok(f.item(), kind + ': accepted old Send must not remove new authoring');
+    assert.equal(JSON.stringify(f.item()), edited, kind);
+    assert.equal(f.sends.length, 1);
+  }
+});
+
+test('late success still consumes unchanged delivered source after Pause/title/disable/reorder, without consuming a deleted source successor', async t => {
+  for (const kind of ['pause', 'title', 'disable', 'reorder', 'delete']) {
+    const f = await fixture(t), pending = f.hold('send-response');
+    t.after(f.actual.testColdScheduler().subscribe());
+    const second = f.state().addPrompt('T', 'SECOND', 0);
+    f.fire(); await pending.entered.promise;
+    const s = f.state();
+    if (kind === 'pause') s.setAutoRun('T', false);
+    if (kind === 'title') s.updatePrompt('T', f.id, { title: 'renamed', titleManual: true });
+    if (kind === 'disable') s.updatePrompt('T', f.id, { enabled: false });
+    if (kind === 'reorder') s.deferPromptToEnd('T', f.id);
+    if (kind === 'delete') s.removePrompt('T', f.id);
+    pending.release.resolve(); await f.settle();
+    assert.equal(f.item(), undefined, kind);
+    assert.ok(f.state().getQueue('T').items.some(x => x.id === second), kind + ': successor retained');
+    assert.equal(f.sends.length, 1);
+  }
+});
 
 async function dependencyFixture(t, ids = ['U', 'V']) {
   const f = await fixture(t), tabs = f.ports.workspace.openProjects.get('P').tabs;
@@ -586,6 +701,96 @@ test('F3 A90→B80 uses B proof in the actual agentScenarios enqueue request', a
   assert.equal(f.sends[0].sessionId, 'B');
   assert.equal(f.sends[0].promptQueueIntent.contextProof.sessionId, 'B');
   assert.equal(f.sends[0].promptQueueIntent.contextProof.pct, 80);
+  assert.equal(f.state().getQueue('T').items.length, 0);
+});
+
+test('Run After captures launch intent before the first readiness await and revokes it while Pause is pending', async t => {
+  const f = await fixture(t), hold = f.hold('readiness');
+  f.fire(); await hold.entered.promise;
+  assert.equal(f.launchIntents.length, 1);
+  f.state().setAutoRun('T', false);
+  await turn();
+  assert.equal(f.launchCancellations[0].intentId, f.launchIntents[0].intentId);
+  hold.release.resolve(); await f.settle();
+  assert.equal(f.sends.length, 0); assert.equal(f.preparations.length, 0);
+  assert.equal(f.state().getQueue('T').pendingDelivery, null);
+});
+
+for (const kind of ['body', 'post', 'cwd', 'session', 'provider', 'project']) test('Run After ' + kind + ' edit revokes pending launch through its actual source subscription', async t => {
+  const f = await fixture(t), hold = f.hold('prepare-runtime');
+  f.ports.runtime.getPresence = async () => ({ status: 'inactive', inputReady: false, sessionId: 'A' });
+  f.fire(); await hold.entered.promise;
+  if (kind === 'body') f.state().updatePrompt('T', f.id, { text: 'NEW BODY' });
+  if (kind === 'post') { f.state().setPostPromptText('T', 'NEW POST'); f.state().setPostPromptEnabled('T', true); }
+  if (kind === 'cwd') f.cwd('/different-cwd');
+  if (kind === 'session') f.owner('B', 80);
+  if (kind === 'provider') f.provider('claude');
+  if (kind === 'project') f.project('Q');
+  await turn();
+  assert.equal(f.preparations[0].admissionSignal.aborted, true);
+  assert.ok(f.launchCancellations.some(c => c.intentId === f.launchIntents[0].intentId));
+  hold.release.resolve(); await f.settle();
+  assert.equal(f.sends.length, 0); assert.ok(f.item());
+  assert.equal(f.state().getQueue('T').pendingDelivery, null);
+  assert.equal(f.state().getQueue('T').autoRun, true);
+});
+
+test('own Resume rereads exact context after preparation even when the canonical session id stayed the same', async t => {
+  const f = await fixture(t);
+  f.state().setPromptCondition('T', f.id, { kind: 'context-used', operator: 'gte', percent: 50 });
+  f.ports.runtime.getPresence = async () => ({ status: 'inactive', inputReady: false, sessionId: 'A' });
+  const prepare = f.ports.prepareRuntime;
+  f.ports.prepareRuntime = async input => { const result = await prepare(input); f.owner('A', 20); return result; };
+  f.fire(); await f.settle();
+  assert.equal(f.preparations.length, 1); assert.equal(f.sends.length, 0);
+  assert.equal(f.reads.filter(r => r.sessionId === 'A').length, 2);
+  assert.ok(f.item()); assert.equal(f.state().getQueue('T').pendingDelivery, null);
+});
+
+for (const boundary of ['post-prepare-context', 'images', 'work-context', 'persistence']) {
+  for (const kind of ['body', 'post', 'cwd', 'session', 'provider', 'project']) {
+    test('own preparation source remains pinned through ' + boundary + ' await: ' + kind, { timeout: 3000 }, async t => {
+      const f = await fixture(t);
+      if (boundary === 'post-prepare-context') {
+        f.state().setPromptCondition('T', f.id, { kind: 'context-used', operator: 'gte', percent: 50 });
+      }
+      if (boundary === 'images') f.state().updatePrompt('T', f.id, {
+        text: 'FIRST [Image #1]', images: 1,
+        imagePaths: [{ id: 1, path: '/private-fixture/image.png', assetId: 'fixture-image',
+          availability: 'available', mediaType: 'image/png' }],
+      });
+      f.ports.runtime.getPresence = async () => ({ status: 'inactive', inputReady: false, sessionId: 'A' });
+      const hold = f.hold(boundary); f.fire(); await hold.entered.promise;
+      if (kind === 'body') f.state().updatePrompt('T', f.id, { text: 'NEW BODY' });
+      if (kind === 'post') { f.state().setPostPromptText('T', 'NEW POST'); f.state().setPostPromptEnabled('T', true); }
+      if (kind === 'cwd') f.cwd('/different-cwd');
+      if (kind === 'session') f.owner('B', 80);
+      if (kind === 'provider') f.provider('claude');
+      if (kind === 'project') f.project('Q');
+      hold.release.resolve(); await f.settle();
+      assert.equal(f.preparations.length, 1); assert.equal(f.sends.length, 0); assert.ok(f.item());
+      assert.equal(f.state().getQueue('T').autoRun, true);
+      assert.equal(f.state().getQueue('T').pendingDelivery, null);
+    });
+  }
+}
+
+for (const available of [true, false]) test('own materialized image projection and service prefix preserve Send: ' + available, async t => {
+  const f = await fixture(t);
+  f.state().updatePrompt('T', f.id, { text: 'FIRST [Image #1]', images: 1,
+    imagePaths: [{ id: 1, path: '/private-fixture/image.png', assetId: 'fixture-image',
+      availability: 'available', mediaType: 'image/png' }],
+  });
+  f.ports.runtime.getPresence = async () => ({ status: 'inactive', inputReady: false, sessionId: 'A' });
+  f.ports.materializeRefs = refs => refs.map(ref => ({ ...ref,
+    path: available ? '/private-fixture/current.png' : '',
+    availability: available ? 'available' : 'missing',
+  }));
+  f.ports.workContext = async (_tab, _handoff, prompt) => ({ prompt: 'SERVICE\n' + prompt, prefix: 'SERVICE\n' });
+  f.fire(); await f.settle();
+  assert.equal(f.preparations.length, 1); assert.equal(f.sends.length, 1);
+  assert.match(f.sends[0].prompt, /^SERVICE\nFIRST /);
+  if (!available) assert.match(f.sends[0].prompt, /\[imageError(?:\s*:|\])/i);
   assert.equal(f.state().getQueue('T').items.length, 0);
 });
 

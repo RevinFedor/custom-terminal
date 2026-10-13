@@ -342,6 +342,15 @@ Click-outside и Esc — два независимых пути. Esc нужен 
 
 ### 4.6. mousedown bubble'ит раньше click — `stopPropagation` нужен на оба
 
+В смешанной React/CodeMirror обработке microtask из capture не доказывает, что
+поздний native target-handler уже создал меню: Chromium может выполнить её
+между обработчиками того же события. Для adoption снимай before в capture,
+а after — после исходного обработчика на том же contentDOM. Если click-outside
+удаляет дочерний DOM в capture, сохраняй native event+instance owner в WeakMap:
+когда родитель проверит backdrop в bubble, пустой DOM уже не означает новый
+внешний клик. Проверено task-theme body `Cmd+/`/ПКМ и overlay/Escape в private
+Electron; это не основание добавить timer ожидания или fullscreen hover zone.
+
 Когда родительский popup закрывается по `window.addEventListener('mousedown', closeIfOutside)` (а не по `click`), а внутри него живёт вложенный popover-portal с своими кнопками — `e.stopPropagation()` только на `onClick` **не работает**. Mousedown проходит first, родитель уже сбросил state до того как handler кнопки выстрелит. Симптом — *«кнопка тупо не работает»*: визуально нажимается, но эффект не виден, потому что родитель закрыл popover в момент mousedown, и `onClick` (если успевает) обновляет state уже несуществующего UI.
 
 Применимо ко всем nested popover'ам внутри другого click-outside-aware popup'а. Правило: на корневом div'е popover'а **обе** проп'ы:
@@ -362,6 +371,13 @@ Popover с двумя уровнями pin'а (light = клик-закреп к 
 Симметричная ошибка pin-ownership — parent `onPointerDownCapture` превращает любой внутренний click в закреп, хотя pin принадлежит отдельному чипу. То же нарушение может прятаться в early-return `editorOpen/pinned/focusWithin`: parent-state формально preview, но уход курсора уже не закрывает его. Проверять страницы, controls, навигацию, выбор on-tab, дочерние portal-editors и resize: preview после них остаётся временным, а pin дочернего окна не передаётся родителю. Белая рамка принадлежит явному pin-trigger, не фокусу/embedded-layout. Захваченный жест/выбор внешней цели удерживают окно только до своего завершения; hover-close проходит save guard перед unmount. Конкретный контракт — `knowledge/fact-prompt-queue.md::Глобальный обзор очередей и редактор` и локальная rail-панель того же fact.
 
 ### 4.8. Backdrop click после drag внутри модалки
+
+Соседний случай создания с autosave: после первого сохранения форма обязана
+синхронно принять ID созданной записи. Само окно может оставаться в режиме
+«создание через +», но следующий blur/overlay/shortcut — update того же ID.
+Не заменять idempotency задержкой подавления повторного клика. Отложенный blur
+при смене формы проверяет identity открытия, а Undo сохраняется при принятии ID.
+Пример/приёмка: `fact-prompt-queue.md::Editor surface: hover-preview + blur-save`.
 
 **Симптом.** Cropper/resize-модалка закрывается, когда пользователь начал жест внутри контента, потащил мышь и отпустил над backdrop. Для пользователя это не click-outside, а продолжение drag-жеста; потеря модалки читается как случайное закрытие и может выбросить незавершённое кадрирование.
 

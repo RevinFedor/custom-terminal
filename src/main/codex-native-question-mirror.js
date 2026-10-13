@@ -9,9 +9,11 @@ const digest = value => crypto.createHash('sha256').update(JSON.stringify(value)
 const normalize = text => String(text || '').replace(/\s+/g, ' ').trim();
 // Codex 0.162 displays macOS modifier glyphs for the same physical chords.
 // Match only control hints; never normalize question/option/draft content.
-const QUESTION_SKIP_HINT_RE = /(?:ctrl\+|⌃)\]\s+skip/u;
+const QUESTION_SKIP_HINT_RE = /(?:ctrl\+|⌃|\^)\]\s+skip/u;
 const QUESTION_MAIN_PROMPT_HINT_RE = /(?:shift\+|⇧)→\s+main prompt/u;
 const QUESTION_ANSWER_HINT_RE = /(?:shift\+|⇧)←\s+to answer/u;
+const QUESTION_OPTION_RE = /^\s*([›❯>]?)\s*(\d+)\.\s+(.*)$/u;
+const nativeRowSeparator = row => row?.wrapped ? '' : ' ';
 
 // Current committed screen only. Never search scrollback/raw PTY history for
 // a question, and never let an ordinary quoted help example own keyboard input.
@@ -23,7 +25,7 @@ function inspectCodexNativeQuestions(frame) {
   const text = lines.join('\n');
   let lastPrompt = -1, footer = -1;
   for (let i=0;i<lines.length;i++) {
-    if (/^\s*[›❯]/u.test(lines[i]) && !/^\s*[›❯]\s*\d+\.\s/u.test(lines[i])) lastPrompt=i;
+    if (/^\s*[›❯]/u.test(lines[i]) && !QUESTION_OPTION_RE.test(lines[i])) lastPrompt=i;
     if (QUESTION_SKIP_HINT_RE.test(lines[i])) {
       for(let start=Math.max(0,i-2);start<=i;start++) {
         if (/(?:enter|tab)\s+submit/.test(lines[start])) { footer=start;break; }
@@ -47,10 +49,17 @@ function inspectCodexNativeQuestions(frame) {
     const choices=[];
     let optionIndex=null, firstChoice=footer, editorRow=-1;
     const titleRows=[];
+    let optionBlock=false;
     for (let i=Math.max(0,progress+1);i<footer;i++) {
-      if (rows[i]?.hasNonDefaultBg && /(?:^|,)bold(?:,|$)/.test(String(rows[i]?.firstTextStyle || ''))
-        && !/^\s*[›❯]?\s*\d+\.\s/.test(lines[i])) titleRows.push(i);
-      const match=/^\s*([›❯]?)\s*(\d+)\.\s+(.*)$/.exec(lines[i]);
+      if(!lines[i].trim())optionBlock=false;
+      const match=QUESTION_OPTION_RE.exec(lines[i]);
+      if(match)optionBlock=true;
+      // Native accent_style().bold() can set foreground only. A selected
+      // numbered option is also bold/on a surface, but is never the title.
+      if ((rows[i]?.hasNonDefaultBg || rows[i]?.hasNonDefaultFg)
+        && /(?:^|,)bold(?:,|$)/.test(String(rows[i]?.firstTextStyle || ''))
+        && !/(?:^|,)dim(?:,|$)/.test(String(rows[i]?.firstTextStyle || ''))
+        && !optionBlock) titleRows.push(i);
       if (match) {
         firstChoice=Math.min(firstChoice,i);
         const item={number:Number(match[2]),label:match[3],row:i,lineCount:1};
@@ -58,7 +67,7 @@ function inspectCodexNativeQuestions(frame) {
         if (match[1]) optionIndex=item.number-1;
       } else if (/^\s*[›❯]\s*/u.test(lines[i])) editorRow=i;
       else if (choices.length && lines[i].trim()) {
-        choices[choices.length-1].label+=' '+lines[i].trim();
+        choices[choices.length-1].label+=nativeRowSeparator(rows[i])+lines[i].trim();
         choices[choices.length-1].lineCount++;
       }
     }
@@ -68,8 +77,14 @@ function inspectCodexNativeQuestions(frame) {
     const titleLast=titleRows[titleRows.length-1];
     let titleFirst=titleLast;
     while(titleRows.includes(titleFirst-1))titleFirst--;
-    const title=lines.slice(titleFirst,titleLast+1).map(line=>line.trim()).join(' ');
-    const totalMatch=/option\s+\d+\/(\d+)/.exec(text);
+    const title=lines.slice(titleFirst,titleLast+1).reduce((value,line,index)=>value
+      +(index ? nativeRowSeparator(rows[titleFirst+index]) : '')+line.trim(),'');
+    // Ignore numbered transcript rows above the last native accent block.
+    const ownChoices=choices.filter(item=>item.row>titleLast);
+    choices.splice(0,choices.length,...ownChoices);
+    optionIndex=choices.find(item=>QUESTION_OPTION_RE.exec(lines[item.row])?.[1])?.number-1;
+    if (!Number.isInteger(optionIndex)) optionIndex=null;
+    const totalMatch=/option\s+\d+\/(\d+)/.exec(lines.slice(footer,footer+4).join(' '));
     const optionCount=totalMatch ? Number(totalMatch[1]) : choices.reduce((n,item)=>Math.max(n,item.number),0);
     const selected=choices.find(item=>item.number-1===optionIndex);
     const otherSelected=!!selected && selected.number===optionCount;
@@ -250,6 +265,10 @@ function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames
               writer.write(keys);inputWritten=true;if(submitting)submitWritten=true;
             },
           });
+          log('frame-result',tabId,{requestId,action,ready:observed.ready===true,
+            reason:observed.reason,frames:observed.observedFrames,elapsedMs:observed.elapsedMs,
+            kind:observed.lastInspection?.kind || 'unknown',writeSeq:observed.lastSnapshot?.writeSeq ?? null,
+            count:observed.lastInspection?.count ?? null});
           if(!observed.ready)throw new Error(observed.reason || 'question_frame_unconfirmed');
           refresh(tabId,observed.lastSnapshot);
           return observed.lastInspection;
@@ -283,6 +302,26 @@ function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames
         if(!answer.trim())throw new Error('question_answer_empty');
         if(native.draftUncertain)throw new Error('question_draft_not_fully_readable');
         if(native.draft && native.draft!==String(args.baseDraft || '') && native.draft!==answer)throw new Error('question_draft_changed');
+        if(args.optionIndex!=null) {
+          const index=args.optionIndex, currentQuestion=refresh(tabId);
+          if(!Number.isInteger(index) || index<0 || currentQuestion?.expanded!==true
+            || currentQuestion.options[index]!==answer)throw new Error('question_option_changed');
+          const choice=native.choices.find(item=>item.number===index+1);
+          if(!choice || normalize(choice.label)!==normalize(answer)
+            || !Number.isInteger(native.optionIndex))throw new Error('question_option_not_fully_readable');
+          // The native last/Other entry is a text editor, not a selectable
+          // answer. Do not submit its placeholder as a fabricated choice.
+          if(index===native.optionCount-1)throw new Error('question_option_requires_text');
+          while(native.optionIndex!==index) {
+            const old=native, delta=index>native.optionIndex ? 1 : -1;
+            native=await step(delta>0 ? KEYS.down : KEYS.up,next=>sameQuestion(target,next)
+              && next.optionIndex===old.optionIndex+delta);
+          }
+          await step(KEYS.enter,next=>next.kind==='none'
+            || (next.count===target.count-1 && (next.kind==='collapsed' || next.kind==='expanded')),true);
+          log('answer-native-choice',tabId,{requestId,optionIndex:index});
+          return {success:true,requestId,inputWritten,handledLocally:true,providerConfirmed:null};
+        }
         if(native.optionCount && !native.otherSelected) {
           for(let i=native.optionIndex ?? 0;i<native.optionCount-1;i++) {
             const old=native;

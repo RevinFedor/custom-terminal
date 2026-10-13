@@ -168,6 +168,13 @@ Process Stop16.09 больше не требует renderer store: paired Projec
 Renderer stop action/aliases остаются совместимостью старых isolated hosts.
 Потеря HTTP-ответа не отменяет main Stop, runtime SSE продолжается без нового POST.
 
+SOURCE11.10 добавляет capability-gated `pendingSends` к прежнему `/stop`:
+отмена будущей доставки и исход остановки процесса возвращаются раздельно,
+включая non-2xx. Отсутствие сохранённой квитанции не означает no-Enter.
+Совместимость native и legacy, late admission/launch fence и ограничения
+описаны в `fact-terminal-mcp.md::Main FIFO принятых Send`. Это Source review,
+не утверждение о проверенной/установленной паре Mac+iOS; remote Stop CAS нет.
+
 **Критично:** bridge нужен ТОЛЬКО для actions, требующих store. Чисто-серверные operations (timeline parse через `parseTimelineEntries`, projects list из SQLite через `projectManager.db.getAllProjects()`) идут напрямую без bridge — это и быстрее, и работает даже если renderer mounted с задержкой.
 
 Transcript operations теперь отдельный pure-server слой: Timeline/History snapshots и Codex mobile messages идут через `SessionTranscriptService`, а не через renderer bridge и не через per-client polling. Bridge остаётся для tab/store actions; durable transcript read/invalidation принадлежит main process, потому что тем же данным пользуются desktop Timeline, Cmd+] HistoryPanel, Project Terminal API и native iOS. См. `fact-transcript-сервис.md`.

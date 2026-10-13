@@ -585,6 +585,7 @@ interface UIStore {
   filePreview: FilePreview | null;
   filePreviewRevision: number;
   lastLinkedFileByOwner: Record<string, string>;
+  rememberLinkedFile: (ownerTabId:string,fileTabId:string) => void;
 
   openFilePreview: (preview: FilePreview) => void;
 
@@ -1134,6 +1135,12 @@ const loadFilePreviewFontSize = (): number => {
 
 const FILE_PREVIEW_SCROLL_KEY = 'noted-terminal-file-preview-scroll';
 const LINKED_FILE_LAST_KEY = 'noted-terminal-last-linked-file';
+const rememberLinkedFile = (previous:Record<string,string>,ownerTabId:string,fileTabId:string) => {
+  if(previous[ownerTabId]===fileTabId)return previous;
+  const next={...previous,[ownerTabId]:fileTabId};
+  try {localStorage.setItem(LINKED_FILE_LAST_KEY,JSON.stringify(next));} catch {}
+  return next;
+};
 const loadLastLinkedFiles = (): Record<string, string> => {
   try {
     const value = JSON.parse(localStorage.getItem(LINKED_FILE_LAST_KEY) || '{}');
@@ -2947,11 +2954,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   filePreview: null,
   filePreviewRevision: 0,
   lastLinkedFileByOwner: loadLastLinkedFiles(),
+  rememberLinkedFile:(ownerTabId,fileTabId)=>set(s=>({lastLinkedFileByOwner:rememberLinkedFile(s.lastLinkedFileByOwner,ownerTabId,fileTabId)})),
   openFilePreview: (preview) => set(s => {
     let lastLinkedFileByOwner = s.lastLinkedFileByOwner;
     if (preview.ownerTabId && preview.sourceTabId) {
-      lastLinkedFileByOwner = {...lastLinkedFileByOwner, [preview.ownerTabId]:preview.sourceTabId};
-      try { localStorage.setItem(LINKED_FILE_LAST_KEY, JSON.stringify(lastLinkedFileByOwner)); } catch {}
+      lastLinkedFileByOwner = rememberLinkedFile(lastLinkedFileByOwner,preview.ownerTabId,preview.sourceTabId);
     }
     return { filePreview: preview, filePreviewRevision: s.filePreviewRevision + 1, lastLinkedFileByOwner };
   }),

@@ -76,19 +76,35 @@ class WorkflowRootRegistry {
     this.copyBindings('tab:'+tabId,sourceScope);
   }
   sourcesForTab(tabId) {
+    return this.readTabSources(tabId,sql=>this.db.prepare(sql));
+  }
+  createSourcesReader() {
+    // One synchronous caller owns these four compiled queries. Every invocation
+    // still reads current rows/versions; no binding result or CAS proof is cached.
+    const statements=new Map();
+    const prepare=sql=>{
+      if(!statements.has(sql))statements.set(sql,this.db.prepare(sql));
+      return statements.get(sql);
+    };
+    return tabId=>this.readTabSources(tabId,prepare);
+  }
+  readTabSources(tabId,prepare) {
     const scope='tab:'+tabId;
-    const row=this.db.prepare('SELECT project_id,execution_namespace FROM tabs WHERE tab_id=?').get(tabId);
-    const catalog=this.db.prepare('SELECT execution_json FROM workflow_org_tabs WHERE tab_id=?').get(tabId);
+    const row=prepare('SELECT project_id,execution_namespace FROM tabs WHERE tab_id=?').get(tabId);
+    const catalog=prepare('SELECT execution_json FROM workflow_org_tabs WHERE tab_id=?').get(tabId);
     const execution=catalog?.execution_json ? JSON.parse(catalog.execution_json) : null;
     const namespace=row?.execution_namespace || row?.project_id || execution?.executionNamespace || execution?.projectId || null;
-    const registered=this.db.prepare('SELECT * FROM workflow_root_scope_meta WHERE scope=?').get(scope);
+    const registered=prepare('SELECT * FROM workflow_root_scope_meta WHERE scope=?').get(scope);
     if(registered && registered.version!==1)this.fail('root_binding_forward_version');
     const sourceScope=registered?scope:'prompts:'+namespace;
-    return this.db.prepare(`SELECT r.*,b.position,b.metadata_json AS binding_json FROM workflow_root_bindings b
+    return prepare(`SELECT r.*,b.position,b.metadata_json AS binding_json FROM workflow_root_bindings b
       JOIN workflow_roots r ON r.id=b.root_id WHERE b.scope=? ORDER BY b.position,r.id`).all(sourceScope)
-      .map(root=>({...JSON.parse(root.metadata_json),...JSON.parse(root.binding_json),id:root.id,rootId:root.id,
-        rootPath:root.path,projectId:JSON.parse(root.binding_json).project_id || namespace,position:root.position,
-        removed:root.removed===1,enabled:root.removed!==1 && JSON.parse(root.metadata_json).enabled!==false}));
+      .map(root=>{
+        const metadata=JSON.parse(root.metadata_json),binding=JSON.parse(root.binding_json);
+        return {...metadata,...binding,id:root.id,rootId:root.id,
+          rootPath:root.path,projectId:binding.project_id || namespace,position:root.position,
+          removed:root.removed===1,enabled:root.removed!==1 && metadata.enabled!==false};
+      });
   }
   listSourceScopes() {
     return this.db.prepare("SELECT scope FROM workflow_root_scope_meta WHERE scope LIKE 'tab:%' ORDER BY scope").all()

@@ -49,7 +49,12 @@ export function isTransientInterruptedRestoreAdmission(result) {
   const error = String(result?.error || '');
   const reason = String(result?.reason || result?.detail || '');
   const lookupStatus = String(result?.lookupStatus || '');
-  return result?.accepted !== true && (
+  return result?.success === false && result?.accepted === false && result?.launchWritten === false
+    && result?.acceptancePending !== true && result?.joined !== true
+    && result?.suppressed !== true
+    && result?.cancelled !== true && result?.deliveryUnknown !== true
+    && result?.sendReceipt?.deliveryUnknown !== true && result?.status !== 'delivery-unknown'
+    && result?.launchOutcomeUnknown !== true && (
     error === 'process_lookup_failed'
     || reason === 'process_lookup_unknown'
     || lookupStatus === 'unknown'

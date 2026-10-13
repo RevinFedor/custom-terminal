@@ -209,10 +209,11 @@ test('actual Main adapter routes SDK/PTY/script to their existing owners and gua
 });
 
 test('actual Main idle/owner capture distinguishes SDK warm idle, pending channel, child/own work and replacement', () => {
-  let inherited = [], own = false, pending = [], revision = 2;
+  let inherited = [], own = false, pending = [], revision = 2, goalPending = false;
   const context = vm.createContext({ console: quiet, path, srcMainDir: __dirname,
     sdkSessions: new Map(), terminals: new Map([['T', {}]]), terminalCommandState: new Map([['T', { isRunning: true }]]),
     resolveAiToolTypeForTab: () => 'codex', getLiveAiRuntimeOwners: () => ['codex'],
+    getCodexPublicRuntimeProjection: () => ({ goalWork: { pending: goalPending } }),
     currentAiLifecycleIdentity: () => ({ terminalLifecycleGeneration: 'G', terminalRunSeq: 1, inputRevision: revision }),
     codexLastRunCommandPayload: new Map([['T', { launchId: 'launch' }]]), claudeLaunchGenerationByTab: new Map(),
     require: () => ({ readInheritedTabActivity: () => ({ known: true, sourceTabIds: inherited }) }),
@@ -222,6 +223,7 @@ test('actual Main idle/owner capture distinguishes SDK warm idle, pending channe
   vm.runInContext(actualFunctions(['captureWorkflowSessionOwner', 'sameWorkflowSessionOwner', 'readWorkflowSessionBusy']), context);
   const capture = () => context.captureWorkflowSessionOwner({ tabId: 'T' });
   const first = capture(); assert.equal(context.readWorkflowSessionBusy('T', first).busy, false);
+  goalPending = true; assert.equal(context.readWorkflowSessionBusy('T', first).busy, true); goalPending = false;
   own = true; assert.equal(context.readWorkflowSessionBusy('T', first).busy, true); own = false;
   inherited = ['T']; assert.equal(context.readWorkflowSessionBusy('T', first).busy, true); inherited = [];
   pending = ['T']; assert.equal(context.readWorkflowSessionBusy('T', first).busy, true); pending = [];

@@ -56,7 +56,10 @@ function harness() {
     setTimeout: (fn, ms) => { timeouts.set(++timerSeq, { fn, ms }); return timerSeq; },
     clearTimeout: id => timeouts.delete(id),
     requestAnimationFrame: () => {},
-    addEventListener: (type, callback, options) => { listeners.set(type, { callback, options }); },
+    addEventListener: (type, callback, options) => {
+      const previous = listeners.get(type)?.callback;
+      listeners.set(type, { callback: previous ? (...args) => { previous(...args); callback(...args); } : callback, options });
+    },
   };
   const globals = { window, document, performance, Element, PerformanceObserver,
     MutationObserver: class { observe() {} }, console: { warn: message => logs.push(message) } };
@@ -131,7 +134,7 @@ test('actual probe emits safe Meta down/up, printable-key and slow-input summari
   assert.equal(h.listeners.get('keyup').options.passive, true);
 });
 
-test('actual heartbeat reconnect retains identity and health, creates one timer and cancels pending reconnect on unload', async () => {
+test('actual heartbeat reconnect retains identity and health, creates one timer and cancels pending reconnect on final pagehide', async () => {
   const h = harness(); h.probe.installWatchdogHeartbeat();
   await Promise.resolve();
   const first = h.sockets[0];
@@ -156,6 +159,6 @@ test('actual heartbeat reconnect retains identity and health, creates one timer 
   assert.equal(hb.sourceSeq, 4); assert.equal(hb.emittedAbs, 102000);
   assert.deepEqual(hb.diagnosticHealth.drops, { noConnection: 1, rateLimit: 0, backpressure: 1, writeThrow: 0 });
   next.emit('close'); assert.equal(h.timeouts.size, 1);
-  h.listeners.get('beforeunload').callback();
+  h.listeners.get('pagehide').callback({ persisted: false });
   assert.equal(h.timeouts.size, 0); assert.equal(h.intervals.size, 0);
 });

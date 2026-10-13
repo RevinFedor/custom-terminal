@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Check, Folder, FolderInput, Pencil, Trash2, X } from 'lucide-react';
 import { TAB_COLORS } from './tabChrome';
 import {useWorkspaceOverlayTarget} from '../../hooks/useWorkspaceOverlayTarget';
+import {reportWorkflowActionError} from '../../utils/workflowActionError';
 import { CONTEXT_MENU_METRICS, CONTEXT_MENU_METRICS_HOOK, CONTEXT_MENU_PANEL_STYLE,
   CONTEXT_MENU_ROW_STYLE, CONTEXT_MENU_ICON_SLOT_STYLE, CONTEXT_MENU_BOTTOM_DIVIDER_STYLE } from '../UI/contextMenuMetrics.mjs';
 
@@ -14,6 +15,8 @@ export type WorkflowGroupMutation = { version: 1; mutationId: string; expectedRe
 export type WorkflowGroupMemberIntent = { version: 1; mutationId: string; expectedRevision: number; expectedGroupRevision: number };
 type Outcome = boolean | { success: boolean; error?: string };
 export type WorkflowGroupMenuProps = {
+  workflowId?: string;
+  workflowName?: string;
   group: WorkflowGlobalGroup;
   revision: number;
   members: WorkflowGroupMember[];
@@ -37,7 +40,7 @@ export default function WorkflowGroupMenu(props: WorkflowGroupMenuProps) {
   const overlayTarget = useWorkspaceOverlayTarget();
   const root = useRef<HTMLDivElement>(null), lock = useRef(false);
   const [screen, setScreen] = useState<'main' | 'rename' | 'color' | 'status' | 'move' | 'close'>('main');
-  const [name, setName] = useState(group.name), [busy, setBusy] = useState(false), [error, setError] = useState('');
+  const [name, setName] = useState(group.name), [busy, setBusy] = useState(false);
   const [retry, setRetry] = useState<null | (() => Promise<void>)>(null);
   const [position, setPosition] = useState(props.position);
   const [closing, setClosing] = useState<null | { members: WorkflowGroupMember[]; group: WorkflowGlobalGroup; intent: WorkflowGroupMemberIntent }>(null);
@@ -60,31 +63,33 @@ export default function WorkflowGroupMenu(props: WorkflowGroupMenuProps) {
     const escape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || lock.current) return;
       event.preventDefault(); event.stopPropagation();
-      if (screen !== 'main' && !retry) { setScreen('main'); setError(''); setName(group.name); } else onDismiss();
+      if (screen !== 'main' && !retry) { setScreen('main'); setName(group.name); } else onDismiss();
     };
     document.addEventListener('pointerdown', outside); document.addEventListener('keydown', escape, true);
     return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', escape, true); };
   }, [onDismiss, screen, retry, group.name]);
 
-  const execute = async (action: () => Promise<Outcome> | Outcome) => {
+  const execute = async (action: () => Promise<Outcome> | Outcome, operation:Record<string,unknown>={}) => {
     if (lock.current) return;
-    lock.current = true; setBusy(true); setError(''); setRetry(null);
+    lock.current = true; setBusy(true); setRetry(null);
+    const context={workflowId:props.workflowId,workflowName:props.workflowName,action:'Group '+String(operation.kind || screen),
+      groupId:group.id,groupName:group.name,expectedRevision:revision,expectedGroupRevision:group.revision,...operation};
     try {
       const result = await action();
       if (ok(result)) onDismiss();
-      else setError(typeof result === 'object' && result.error ? result.error : 'Изменение не принято. Обновите данные группы.');
+      else reportWorkflowActionError(typeof result === 'object' && result.error ? result.error : 'Изменение не принято. Обновите данные группы.',context);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Не удалось получить ответ.');
+      reportWorkflowActionError(caught,context);
       // Reuse the exact frozen action/request. A lost reply is not permission
       // to create another mutation ID or close a different member set.
-      setRetry(() => () => execute(action));
+      if((caught as any)?.disposition!=='not-applied')setRetry(() => () => execute(action,context));
     } finally { lock.current = false; setBusy(false); }
   };
   const mutate = (kind: Parameters<WorkflowGroupMenuProps['onMutate']>[0], patch: Record<string, unknown>) => {
     const request: WorkflowGroupMutation = { ...patch, version: 1, mutationId: crypto.randomUUID(),
       expectedRevision: revision, groupId: group.id, expectedGroupRevision: group.revision };
     const callback = props.onMutate;
-    void execute(() => callback(kind, request));
+    void execute(() => callback(kind, request),{kind,...request});
   };
   const disabled = busy || !!retry;
   const row = (label: string, action: () => void, icon: React.ReactNode, danger = false, selected = false, identity = label) => (
@@ -95,7 +100,7 @@ export default function WorkflowGroupMenu(props: WorkflowGroupMenuProps) {
       {selected && <Check size={12} style={{ marginLeft: 'auto', flexShrink: 0 }} />}
     </button>
   );
-  const back = () => { setScreen('main'); setError(''); };
+  const back = () => { setScreen('main'); };
   return createPortal(<div ref={root} role="menu" aria-label={'Группа ' + group.name} data-workflow-group-menu
     data-context-menu-metrics={CONTEXT_MENU_METRICS_HOOK} aria-busy={busy}
     style={{ ...CONTEXT_MENU_PANEL_STYLE as CSSProperties, position: 'fixed', left: position.x, top: position.y,
@@ -139,7 +144,8 @@ export default function WorkflowGroupMenu(props: WorkflowGroupMenuProps) {
     {screen === 'move' && <>{workflows.map(workflow => row(workflow.name, () => {
       const exact = structuredClone(activeMembers), current = structuredClone(group), callback = props.onMoveMembers;
       const intent: WorkflowGroupMemberIntent = { version: 1, mutationId: crypto.randomUUID(), expectedRevision: revision, expectedGroupRevision: group.revision };
-      void execute(() => callback(workflow.id, exact, current, intent));
+      void execute(() => callback(workflow.id, exact, current, intent),{kind:'move',...intent,targetWorkflowId:workflow.id,
+        members:exact.map(({tabId,namespace,projectId})=>({tabId,namespace,projectId}))});
     }, <FolderInput size={12} />, false, false, 'workflow:' + workflow.id))}
       {workflows.length === 0 && <div style={{ padding: 8, fontSize: 12 }}>Нет workflow</div>}</>}
     {screen === 'close' && <>
@@ -147,11 +153,11 @@ export default function WorkflowGroupMenu(props: WorkflowGroupMenuProps) {
       {row('Подтвердить закрытие', () => {
         if (!closing) return;
         const { members: exact, group: current, intent } = closing, callback = props.onCloseMembers;
-        void execute(() => callback(exact, current, intent));
+        void execute(() => callback(exact, current, intent),{kind:'close',...intent,
+          members:exact.map(({tabId,namespace,projectId})=>({tabId,namespace,projectId}))});
       }, <X size={12} />, true)}
     </>}
     {screen !== 'main' && row('Назад', back, null)}
-    {error && <div role="alert" style={{ padding: 8, maxWidth: 250, overflowWrap: 'anywhere', fontSize: 12, color: '#fca5a5' }}>{error}</div>}
     {retry && <button className="workflow-group-action" style={{ ...rowStyle, width: '100%', border: 0, color: '#ccc', background: 'transparent' }} disabled={busy} onClick={() => void retry()}>Повторить запрос</button>}
   </div>, overlayTarget);
 }

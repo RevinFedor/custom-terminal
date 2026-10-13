@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Server, RotateCw, Cloud, Terminal, Puzzle, Loader2 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
-import GlobalProcessControls from './GlobalProcessControls';
 import { externalMcpServers, mcpCatalogErrorMessage } from '../../utils/mcpCatalogPresentation.mjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -321,7 +320,6 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
                 Активные подключения вкладки: /mcp
               </div>
             </section>
-            <GlobalProcessControls scope="mcp" />
           </div>
         </Portal>
       )}

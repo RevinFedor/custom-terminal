@@ -109,6 +109,36 @@ function migrate(f, migrationId = 'migration') {
 }
 function request(f, extra) { return { mutationId: cryptoId(), expectedRevision: f.service.getPublication().revision, ...extra }; }
 function cryptoId() { return require('node:crypto').randomUUID(); }
+
+test('bulk catalog at production tab count shares prepared reads without retaining stale rows', (t) => {
+  const f=fixture(t,{extensions:false});migrate(f);
+  const count=658;
+  const base=f.db.prepare('SELECT * FROM workflow_org_tabs WHERE tab_id=?').get('T');
+  const insert=f.db.prepare('INSERT INTO workflow_org_tabs(tab_id,subject_version,execution_json,record_json,revision) VALUES(?,?,?,?,?)');
+  const member=f.db.prepare('INSERT INTO workflow_org_memberships(tab_id,workflow_id,revision) VALUES(?,?,1)');
+  f.db.transaction(()=>{for(let i=0;i<count;i++){
+    const id='catalog-'+i;
+    insert.run(id,base.subject_version,base.execution_json,base.record_json,1);
+    member.run(id,'a');
+  }})();
+  const expected=f.service.read(()=>f.db.prepare('SELECT tab_id FROM workflow_org_tabs ORDER BY rowid').all()
+    .map(row=>f.service.getTab(row.tab_id)));
+  const oldPrepare=f.db.prepare;let prepares=0;
+  f.db.prepare=function(...args){prepares++;return oldPrepare.apply(this,args);};
+  let all,members,allPrepares,memberPrepares;
+  try { all=f.service.listGlobalTabs();allPrepares=prepares;prepares=0;members=f.service.listMembers('a');memberPrepares=prepares; }
+  finally { f.db.prepare=oldPrepare; }
+  assert.deepEqual(all,expected);
+  assert.deepEqual(members,expected.filter(row=>row.membership?.workflowId==='a'));
+  assert.ok(allPrepares<=6,`bulk catalog prepared ${allPrepares} SQL statements for ${all.length} rows`);
+  assert.ok(memberPrepares<=6,`member catalog prepared ${memberPrepares} SQL statements`);
+  t.diagnostic(`actual SQLite rows=${all.length} catalogPrepares=${allPrepares} memberPrepares=${memberPrepares}; exact parity with individual getTab reads`);
+  f.db.prepare('UPDATE tabs SET name=?,cwd=? WHERE tab_id=?').run('fresh name','/fresh-cwd','T');
+  f.db.prepare('UPDATE workflow_org_memberships SET workflow_id=?,revision=revision+1 WHERE tab_id=?').run('b','T');
+  const fresh=f.service.listGlobalTabs().find(row=>row.tabId==='T');
+  assert.equal(fresh.nativeRow.name,'fresh name');assert.equal(fresh.executionSubject.cwd,'/fresh-cwd');assert.equal(fresh.membership.workflowId,'b');
+  assert.equal(all.find(row=>row.tabId==='T').membership.workflowId,'a');
+});
 function legacyManifest(db) {
   const schema = db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'workflow_org_%' ORDER BY type,name").all();
   const tables = {};
@@ -219,6 +249,21 @@ test('same mutation ID replays after reopen; changed payload and cross-operation
   assert.throws(() => f.service.moveTab({ ...move, workflowId: 'a' }), /mutation_id_conflict/);
   assert.throws(() => f.service.detachTab(move), /mutation_id_conflict/);
   assert.equal(f.service.getPublication().generation, 2);
+});
+
+test('independent disk file creation persists its path and no AI relationship through reopen',t=>{
+  const f=fixture(t);migrate(f);const filename=path.join(f.root,'document.md');
+  fs.writeFileSync(filename,'# Fixture document');
+  const before=f.db.prepare('SELECT * FROM tabs ORDER BY id').all();
+  const result=f.service.createTab(request(f,{tabId:'disk-file',workflowId:'a',
+    executionSubject:{version:2,cwd:f.root,executionNamespace:GLOBAL_EXECUTION_NAMESPACE},
+    record:{name:'document.md',tabType:'file',filePath:filename,color:'purple'}}));
+  assert.equal(result.executionSubject.tabId,'disk-file');
+  assert.equal(f.service.getTab('disk-file').record.filePath,filename);
+  assert.equal(f.service.getTab('disk-file').record.visualParentTabId ?? null,null);
+  assert.deepEqual(f.db.prepare("SELECT * FROM tabs WHERE tab_id <> 'disk-file' ORDER BY id").all(),before);
+  f.reopen();assert.equal(f.service.getTab('disk-file').record.filePath,filename);
+  assert.equal(fs.readFileSync(filename,'utf8'),'# Fixture document');
 });
 
 test('project-free v2 creation persists all metadata and explicit exact aliases; duplicate/alias-conflict rollback', t => {

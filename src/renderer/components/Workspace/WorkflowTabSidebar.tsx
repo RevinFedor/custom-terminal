@@ -1,4 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {retainWorkflowOutline} from '../../utils/workflowOutlineRetention.mjs';
+import {workflowGroupDisplayName} from '../../../shared/workflow-groups-projection.cjs';
 import {createPortal} from 'react-dom';
 import { Folder, ChevronDown, Plus, ArrowLeft, ArrowRight, CircleX, Pause } from 'lucide-react';
 import { useOutlineDnd, type OutlineDndNode, type OutlineDndCommitPayload, type OutlineDndFeedback } from '@noted/structured-dnd/react';
@@ -23,8 +25,10 @@ import SidebarTabDragCursorChip from './SidebarTabDragCursorChip';
 import type { SharedTabActivityMaps } from './TabSignals';
 import { TAB_CARD_LINE_HEIGHT } from '../../utils/tabCardVisual.mjs';
 import {createWorkflowGroupExpansionQueue} from '../../utils/workflowGroupExpansion.mjs';
+import {reportWorkflowActionError} from '../../utils/workflowActionError';
 import {useInlineRenameInputRef} from '../../hooks/useInlineRenameInput';
 import {paneTabs} from '../../utils/splitPanesModel.mjs';
+import {workflowCreationVisibility} from '../../utils/workflowCreationVisibility.mjs';
 import NewTabMenuRows,{type NewTabAction} from './NewTabMenuRows';
 import {type WindowCell} from './MoveToWindowMenu';
 import {clampMenuToViewport} from '../../utils/menuViewportClamp.mjs';
@@ -151,30 +155,32 @@ function ReserveCard({ node, rowProps, selected, activity, onClick, onMiddleClic
   </TabCard>;
 }
 
-function ReserveGroupHeader({node,group,expanded,editing,focused,dragging,dwell,onExpand,onFocus,onRename,onRenameEnd,onClose,onContextMenu}: {
+function ReserveGroupHeader({node,group,displayName,expanded,editing,focused,dragging,dwell,onExpand,onFocus,onRename,onRenameEnd,onClose,onContextMenu,onError}: {
   node:Node;group:any;expanded:boolean;editing:boolean;focused:boolean;dragging:boolean;
+  displayName:string;
   dwell?:{progress:number;blocked?:boolean;pending?:boolean}|null;
   onExpand:()=>void;onFocus:()=>void;onRename:(name:string)=>Promise<boolean>;onRenameEnd:()=>void;
   onClose:()=>void;onContextMenu:(event:React.MouseEvent)=>void;
+  onError:(reason:unknown)=>void;
 }) {
-  const [draft,setDraft]=useState(node.label || ''),[hovered,setHovered]=useState(false),[error,setError]=useState('');
+  const [draft,setDraft]=useState(displayName),[hovered,setHovered]=useState(false);
   const input=useInlineRenameInputRef(editing),saving=useRef(false);
   const status=useUIStore(state=>state.sessionStatuses.find(status=>status.id===group?.sessionStatus));
   const marker=useUIStore(state=>state.statusMarker);
-  useEffect(()=>{if(editing){setDraft(node.label || '');setError('');}},[editing]);
+  useEffect(()=>{if(editing)setDraft(displayName);},[editing]);
   const rename=async()=>{
     if(saving.current)return;
-    const name=draft.trim();if(!name || name===node.label){onRenameEnd();return;}
+    const name=draft.trim();if(!name || name===displayName){onRenameEnd();return;}
     saving.current=true;
-    try {if(await onRename(name))onRenameEnd();else setError('Название не сохранено');}
-    catch(error:any){setError(error?.message || 'Название не сохранено');}
+    try {if(await onRename(name))onRenameEnd();else onError('Название не сохранено');}
+    catch(error){onError(error);}
     finally{saving.current=false;}
   };
   const color=group?.color && group.color!=='default' ? getTabChromeColorConfig(group):null;
   const highlighted=(hovered&&!dragging)||focused;
   return <div className="workflow-reserve-group" data-reserve-group-id={node.groupId} data-group-focused={focused?'true':undefined}
     data-execution-namespace={node.projectId} style={color?{background:adjustRgbaAlpha(color.bgColor,highlighted ? .1 : expanded ? -.06 : .04),borderColor:color.borderColor}:undefined}
-    role="button" tabIndex={0} aria-expanded={expanded} aria-label={`Группа ${node.label}`}
+    role="button" tabIndex={0} aria-expanded={expanded} aria-label={`Группа ${displayName}`}
     onMouseEnter={()=>setHovered(true)} onMouseLeave={()=>setHovered(false)} onClick={onFocus}
     onMouseDown={event=>{if(event.button===1)event.preventDefault();}}
     onAuxClick={event=>{if(event.button===1){event.preventDefault();event.stopPropagation();onClose();}}}
@@ -182,7 +188,7 @@ function ReserveGroupHeader({node,group,expanded,editing,focused,dragging,dwell,
       if(event.target!==event.currentTarget)return;
       if(['Enter',' '].includes(event.key)){event.preventDefault();onFocus();onExpand();}
     }}>
-    <button className="workflow-reserve-folder" aria-label={`${expanded?'Свернуть':'Раскрыть'} группу ${node.label}`}
+    <button className="workflow-reserve-folder" aria-label={`${expanded?'Свернуть':'Раскрыть'} группу ${displayName}`}
       onClick={event=>{event.stopPropagation();onFocus();onExpand();}}>
       <Folder size={14}/><ChevronDown size={9} className="workflow-reserve-folder-chevron" style={{transform:expanded?undefined:'rotate(-90deg)'}}/>
       {dwell && <svg data-dnd-navigation-loader data-dnd-navigation-phase={dwell.blocked?'blocked':dwell.pending?'loading':'waiting'}
@@ -198,8 +204,8 @@ function ReserveGroupHeader({node,group,expanded,editing,focused,dragging,dwell,
       style={{padding:'0 4px',border:0,boxShadow:'inset 0 0 0 1px #8b5cf6'}}
       onChange={event=>setDraft(event.target.value)} onBlur={()=>void rename()} onClick={event=>event.stopPropagation()}
       onKeyDown={event=>{event.stopPropagation();if(event.key==='Enter')void rename();if(event.key==='Escape'){event.preventDefault();onRenameEnd();}}}/>
-      :<span className="workflow-reserve-group-name">{node.label}</span>}
-    <small>{reserveNodeEntries(node).length}</small>{error && <span role="alert" title={error}>!</span>}
+      :<span className="workflow-reserve-group-name">{displayName}</span>}
+    <small>{reserveNodeEntries(node).length}</small>
   </div>;
 }
 
@@ -214,30 +220,49 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
   const [emptyMenu,setEmptyMenu]=useState<{x:number;y:number}|null>(null);
   const model = useMemo(() => selectWorkflowReserve(state, workflowId, props.orderedTabIds),
     [state, workflowId, props.orderedTabIds]);
-  const outline = useMemo(() => workflowReserveOutline(model) as Node[], [model]);
+  const baseCandidate = useMemo(() => workflowReserveOutline(model) as Node[], [model]);
+  const baseOutline = useRef<any>(null),projectedOutline = useRef<any>(null);
+  baseOutline.current=retainWorkflowOutline(baseOutline.current,workflowId,baseCandidate);
+  const outline=baseOutline.current.outline as Node[];
   const sidebar = useRef<HTMLDivElement>(null), latest = useRef(props), anchor = useRef('');
   latest.current = props;
   const stopResize = useRef<(() => void) | null>(null);
   const [expandGroup] = useState(() => createWorkflowGroupExpansionQueue({
     read:()=>useWorkspaceStore.getState().globalGroups,
+    refresh:()=>useWorkspaceStore.getState().refreshWorkflowGroups(),
     mutate:(request:any)=>useWorkspaceStore.getState().mutateWorkflowGroup('collapse',request),
   }));
-  const [creating, setCreating] = useState(false), [error, setError] = useState('');
+  const [creating, setCreating] = useState(false);
+  const reportError = (reason:unknown, action='Не удалось выполнить действие', operation:Record<string,unknown>={}) => {
+    const name=state.spaces.find(space=>space.id===workflowId)?.name || workflowId;
+    reportWorkflowActionError(reason,{workflowId,workflowName:name,action,...operation});
+  };
   const [externalPointer,setExternalPointer] = useState<PaneTabPointerSnapshot|null>(null);
   const externalProjection = useMemo(()=>projectReservePaneSource(model,outline,externalPointer?.source),
     [model,outline,externalPointer?.source]);
-  const controlledOutline = (externalProjection?.outline || outline) as Node[];
+  const projectionKey=JSON.stringify([workflowId,externalPointer?.source?.gestureId || null,externalProjection?.sourceId || null]);
+  projectedOutline.current=retainWorkflowOutline(projectedOutline.current,projectionKey,externalProjection?.outline || outline);
+  const controlledOutline = projectedOutline.current.outline as Node[];
   const externalDrag = externalPointer && externalProjection ? {active:true,
     releaseOwner:'bridge',
     ownerKey:reserveReleaseOwner(workflowId,externalPointer.source!),
     sourceId:externalProjection.sourceId,pointerId:externalPointer.pointerId,pointerType:'mouse',
     sourceRootIds:externalProjection.sourceRootIds,sourceContext:externalPointer.source!.workflowDrag,
+    gestureId:externalPointer.source!.gestureId,
+    readCurrentInput:()=>{
+      const pointer=getPaneTabPointerSnapshot(),source=externalPointer.source;
+      if(!pointer.active || pointer.source!==source || pointer.pointerId!==externalPointer.pointerId
+        || latest.current.state.activeSpaceId!==workflowId)return null;
+      return Object.freeze({active:true,ownerKey:reserveReleaseOwner(workflowId,source!),gestureId:source!.gestureId!,
+        pointerId:pointer.pointerId,clientX:pointer.clientX,clientY:pointer.clientY,metaKey:pointer.metaKey});
+    },
     rollbackOutline:outline,
     clientX:externalPointer.clientX,clientY:externalPointer.clientY,metaKey:externalPointer.metaKey} : null;
   const membershipOf=(admission:any)=>Object.fromEntries(Object.entries(admission?.guards || {}).map(([id,guard]:any)=>[id,
     {workflowId:guard.workflowId,revision:guard.membershipRevision}]));
   const dnd = useOutlineDnd<Node>({ outline:controlledOutline,
     hierarchyModifier:'meta',
+    pointerPublication:externalPointer?.source?.owner==='pane' && projectedOutline.current.immutable ? 'semantic':'frame',
     ...({externalDrag} as any),
     scopeKey:workflowId,
     getDragSource: input=>{
@@ -260,8 +285,13 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
       const globalGroupId=node?.groupId || state.globalGroups?.groups?.find((group:any)=>
         `reserve-group:${workflowGroupKey('__tab_catalog_v2__',group.id)}`===nodeId)?.id;
       if (globalGroupId && state.globalGroups) {
-        try {return await expandGroup(globalGroupId,expanded);}
-        catch (error) { setError(String(error)); return false; }
+        const operation={groupId:globalGroupId,groupName:state.globalGroups.groups.find((group:any)=>group.id===globalGroupId)?.name,expanded};
+        try {
+          const accepted=await expandGroup(globalGroupId,expanded);
+          if(!accepted)reportError('Изменение группы не подтверждено','Не удалось изменить раскрытие группы',operation);
+          return accepted;
+        }
+        catch (error) { reportError(error,'Не удалось изменить раскрытие группы',operation); return false; }
       } else if (node?.groupId) {
         const workspace = useWorkspaceStore.getState().openProjects.get(node.projectId);
         const group = workspace?.tabGroups?.find(group => group.id === node.groupId);
@@ -308,6 +338,12 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
   useOutlineDragCursor(dnd.dragState,dnd.scrollerRef);
   useCommandHierarchyHint(dnd.scrollerRef);
   const nodes = indexNodes(dnd.previewOutline);
+  useLayoutEffect(() => {
+    if (!workflowCreationVisibility.hasPending()) return;
+    workflowCreationVisibility.observe({state,model,element:sidebar.current,dragPhase:dnd.dragState?.phase,
+      outlineIds:new Set([...nodes.values()].map(node=>node.tabId).filter(Boolean)),
+      rowIds:new Set(dnd.rows.map(row=>nodes.get(String(row.id))?.tabId).filter(Boolean))});
+  },[state,model,dnd.previewOutline,dnd.rows,dnd.dragState?.phase]);
   // Adopt the existing pointer while inside this host. Coordinates do not
   // rerender the owner: the shared hook receives the actual pointer events.
   useEffect(() => {
@@ -323,11 +359,12 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
     };
     sync();const unsubscribe=subscribePaneTabPointer(sync);
     const release=subscribePaneTabPointerDrop(pointer=>{
-      const source=pointer.source,drag=dndRef.current.dragState,host=dndRef.current.scrollerRef.current;
-      if(!source?.workflowDrag || !drag || drag.sourceContext?.gestureId!==source.gestureId || drag.pointerId!==pointer.pointerId || !host)return false;
+      const source=pointer.source,snapshot=dndRef.current.getDragSnapshot(),drag=snapshot.current,host=dndRef.current.scrollerRef.current;
+      if(!source?.workflowDrag || !drag || drag.phase!=='dragging' || drag.gestureId!==source.gestureId
+        || drag.ownerEpoch!==snapshot.ownerEpoch || drag.pointerId!==pointer.pointerId || !host)return false;
       const currentWorkflow=latest.current.state.activeSpaceId,ownerKey=reserveReleaseOwner(currentWorkflow,source);
       if(drag.externalOwnerKey!==ownerKey)return false;
-      const rect=host.getBoundingClientRect(),target=drag.externalTarget as PaneTabDropTarget | null;
+      const rect=host.getBoundingClientRect(),target=snapshot.painted?.drag.externalTarget as PaneTabDropTarget | null;
       const inside=pointer.clientX>=rect.left && pointer.clientX<=rect.right && pointer.clientY>=rect.top && pointer.clientY<=rect.bottom;
       const corridor=source.owner==='sidebar' && pointer.clientY>=rect.top && pointer.clientY<=rect.bottom;
       const pane=source.owner==='sidebar' && target && ['body','strip'].includes(target.zone)
@@ -338,7 +375,8 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
           navigationMode:drag.navigationMode},inside,corridor,pane:!!pane,
       })}`);
       if(!inside && !corridor && !pane){dndRef.current.cancel('release-outside-host');return false;}
-      return dndRef.current.commitExternalDrag('pane-tab-pointerup',{ownerKey,pointerId:pointer.pointerId});
+      return dndRef.current.commitExternalDrag('pane-tab-pointerup',{ownerKey,pointerId:pointer.pointerId,
+        releasePoint:{clientX:pointer.clientX,clientY:pointer.clientY}});
     });
     return () => { unsubscribe();release(); };
   }, []);
@@ -368,16 +406,17 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
     }
     current.onSelectionChange([id]);
     const owner = model.catalog.get(id);
-    Promise.resolve(current.onOpenTab(owner.projectId, id)).catch(reason => setError(String(reason)));
+    Promise.resolve(current.onOpenTab(owner.projectId, id)).catch(reason => reportError(reason,'Не удалось открыть вкладку',{namespace:owner.projectId,tabId:id}));
   };
   const create = async (action:NewTabAction='terminal',target?:WindowCell) => {
     if (creating) return;
-    setCreating(true); setError('');
+    setCreating(true);
     const source = model.catalog.get(props.sourceTabId);
-    try { await props.onCreateTab({ workflowId, sourceTabId: source?.tabId,
-      cwd: source?.tab.cwd || props.fallbackCwd, placement: 'reserve',action,
-      windowId:target?useWorkspaceStore.getState().splitPanes[target.index]?.windowId:undefined }); }
-    catch (reason) { setError(String(reason)); } finally { setCreating(false); }
+    const request={ workflowId, sourceTabId: source?.tabId,
+      cwd: props.fallbackCwd || source?.tab.cwd, placement: 'reserve',action,
+      windowId:target?useWorkspaceStore.getState().splitPanes[target.index]?.windowId:undefined } as const;
+    try { await props.onCreateTab(request); }
+    catch (reason) { reportError(reason,'Не удалось создать вкладку',{...request,action:'Create '+action}); } finally { setCreating(false); }
   };
   useEffect(()=>{setEmptyMenu(null);},[workflowId]);
   useLayoutEffect(()=>{
@@ -408,7 +447,6 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
     }}>
     <SidebarTabDragCursorChip enabled />
     {props.location && <div data-sidebar-location-line style={{padding:'3px 8px 4px',borderBottom:'1px solid #ffffff0f'}}>{props.location}</div>}
-    {error && <div role="alert" className="workflow-reserve-error">{error}</div>}
     <div ref={element => { dnd.scrollerRef.current = element; }} data-workflow-reserve-scroll
       className="workflow-reserve-scroll" onWheel={() => { userScroll.current = true; }}
       onContextMenu={event=>{
@@ -422,7 +460,9 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
         {dnd.rows.map(row => {
           const node = nodes.get(String(row.id))!;
           const rowProps = dnd.getRowProps(row);
-          const group = node.groupId && model.visibleGroups.get(workflowGroupKey(node.projectId, node.groupId));
+          const group = node.groupId && (model.visibleGroups.get(workflowGroupKey(node.projectId, node.groupId))
+            || state.globalGroups?.groups?.find((group:any)=>group.id===node.groupId)
+            || state.openProjects.get(node.projectId)?.tabGroups?.find(group=>group.id===node.groupId));
           const isSource = String(dnd.dragState?.sourceId) === String(row.id);
           const ancestors = row.path.slice(0,-1).map(id => nodes.get(String(id))).filter(Boolean);
           const groupDepth = ancestors.some(node => node?.groupId) ? 1 : 0;
@@ -438,12 +478,13 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
               {row.hasNextSibling && <span className="workflow-reserve-connector bottom" data-visual-connector-bottom />}
               <span className="workflow-reserve-connector elbow" data-visual-connector-elbow />
             </span>}
-            {node.groupId ? <ReserveGroupHeader node={node} group={group} expanded={row.expanded}
+            {node.groupId ? <ReserveGroupHeader node={node} group={group} displayName={group?workflowGroupDisplayName(group):node.label || ''} expanded={row.expanded}
               dwell={dnd.dragState?.navigationDwell?.targetId===row.id ? dnd.dragState.navigationDwell : null}
               editing={props.editingGroupId===node.groupId} focused={props.activeGroupId===node.groupId}
               dragging={!!dnd.dragState} onExpand={()=>{void dnd.requestExpansion(row.id,!row.expanded);}}
               onFocus={()=>props.onGroupFocus?.(node.groupId!)}
               onRename={name=>props.onGroupRename?.(node.groupId!,name) || Promise.resolve(false)}
+              onError={reason=>reportError(reason,'Не удалось переименовать группу',{groupId:node.groupId,groupName:group?workflowGroupDisplayName(group):node.label})}
               onRenameEnd={()=>props.onGroupRenameEnd?.()} onClose={()=>{void props.onGroupClose?.(node.groupId!);}}
               onContextMenu={event=>{event.preventDefault();event.stopPropagation();props.onGroupContextMenu(node.projectId,node.groupId!,event.clientX,event.clientY);}}/>
 
@@ -460,8 +501,8 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
                   const admission=captureWorkflowDrag(store,{gestureId:crypto.randomUUID(),outline,sourceId:node.id});
                   Promise.resolve(props.onPlaceTabs(entries,{zone:'body',paneKey:index===null?'center':`pane:${index}`,
                     paneIndex:index,spaceId:workflowId,at},admission))
-                    .then(accepted=>{if(!accepted)setError('Размещение вкладки не подтверждено');})
-                    .catch(reason=>setError(String(reason)));
+                    .then(accepted=>{if(!accepted)reportError('Размещение вкладки не подтверждено');})
+                    .catch(reason=>reportError(reason));
                 }}
                 onOpenFile={file => props.onOpenFile(node.projectId, file)} />}
           </div>;
@@ -479,7 +520,7 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
       <div style={CONTEXT_MENU_TOP_DIVIDER_STYLE}/>
       <button type="button" data-tab-empty-context-action="new-group" className="w-full text-left hover:bg-white/10"
         style={{...CONTEXT_MENU_ROW_STYLE,display:'flex',alignItems:'center',gap:8,color:'#ccc',border:0,background:'transparent',cursor:'pointer'}}
-        onClick={()=>{setEmptyMenu(null);Promise.resolve(props.onCreateGroup(workflowId)).catch(reason=>setError(String(reason)));}}><Folder size={12}/>Group</button>
+        onClick={()=>{setEmptyMenu(null);Promise.resolve(props.onCreateGroup(workflowId)).catch(reason=>reportError(reason,'Не удалось создать группу'));}}><Folder size={12}/>Group</button>
     </div>,overlayTarget)}
     <div data-tab-sidebar-resize-handle onPointerDown={event => {
       if (event.button !== 0) return;

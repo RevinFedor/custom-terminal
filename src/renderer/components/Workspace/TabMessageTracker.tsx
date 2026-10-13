@@ -98,11 +98,11 @@ function MessageBody({ message, label, onNavigate }: { message: TabMessage; labe
   </details>;
 }
 
-export function TabMessageTracker({ tabId, controller, onOpen, onDismiss, selectedMessageId, now = Date.now() }: {
+export function TabMessageTracker({ tabId, controller, onOpen, onDismiss, selectedMessageId }: {
   tabId: string; controller: TabMessagesController; onOpen: (selection: MessageSelection) => void;
-  onDismiss: (messageId: string) => void; selectedMessageId?: string; now?: number;
+  onDismiss: (messageId: string) => void; selectedMessageId?: string;
 }) {
-  const visible = controller.threads.filter(thread => tabMessageVisibleInTracker(thread, tabId, now));
+  const visible = controller.threads.filter(thread => tabMessageVisibleInTracker(thread, tabId));
   if (!visible.length && !controller.listError) return null;
   return <div data-tab-message-tracker style={{ width: '100%', minWidth: 0, flexShrink: 0, color: '#d4d4d4' }}>
     {controller.listError && <div role="alert" style={{ display: 'flex', alignItems: 'center', gap: 4, padding: 5, fontSize: 10, color: '#fbbf24' }}>

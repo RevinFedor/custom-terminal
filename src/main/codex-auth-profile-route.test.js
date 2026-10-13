@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { createCodexAuthProfileRoute, ROUTE_ENV } = require('./codex-auth-profile-route');
 const key = 'aaaaaaaaaaaaaaaa';
 function fixture() {
-  let current = { terminal: {}, launchId: 'L1', cwd: '/fixture/project' };
+  let current = { terminal: {}, launchId: 'L1', cwd: '/fixture/project', lifecycleGeneration: 'G1', runSeq: 1, commandRunning: true };
   let auth = { accountKey: key, accountId: 'provider-account-fixture', accessToken: 'fixture-secret', accessExpiresAtMs: 2000, email: 'aa@example.test' };
   const route = createCodexAuthProfileRoute({ configuration: { homePath: '/authorized/profile', accountKey: key, fixtureCwd: '/fixture/project' },
     readAuth: home => { assert.equal(home, '/authorized/profile'); return auth; }, captureTab: () => current, now: () => 1000 });
@@ -42,4 +42,14 @@ test('an old connection URL cannot borrow a replacement launch or clear its bind
   assert.throws(() => h.route.authorizeRequest('T', '/_noted_profile/L1/responses', h.headers()), /owner_changed/);
   const current = h.route.authorizeRequest('T', '/_noted_profile/L2/responses?fixture=1', h.headers());
   assert.equal(current.forwardUrl, '/responses?fixture=1'); assert.equal(current.launchId, 'L2');
+});
+test('consumed startup metadata keeps only the original physical command authorized', () => {
+  const h=fixture();h.route.bind('T');h.change({launchId:null});
+  assert.equal(h.route.authorize('T',h.headers(),'L1').authorization,'Bearer fixture-secret');
+  h.change({runSeq:2});assert.throws(()=>h.route.authorize('T',h.headers(),'L1'),e=>e.reason==='command-run-changed');
+});
+for(const changed of [{lifecycleGeneration:'G2'},{runSeq:0},{commandRunning:false},{launchId:undefined},{launchId:''}])
+test('missing startup metadata cannot hide an unknown/replaced owner '+JSON.stringify(changed),()=>{
+  const h=fixture();h.route.bind('T');h.change({launchId:null,...changed});
+  assert.throws(()=>h.route.authorize('T',h.headers(),'L1'),e=>e.code==='codex_auth_route_owner_changed');
 });

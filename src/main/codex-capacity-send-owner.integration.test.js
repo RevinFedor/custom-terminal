@@ -104,6 +104,7 @@ function sendFixture(t, options = {}) {
   const store = createAgentSendReceiptStore(db, { randomUUID: () => 'attempt-' + ++attempts });
   const writes = [];
   const context = vm.createContext({
+    require, path, srcMainDir: __dirname,
     ...registry, AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
     agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(), agentSendReceiptStore: store,
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,

@@ -797,16 +797,19 @@ function formatResetDateTime(iso: string | null | undefined): string {
   }).format(d);
 }
 
-function formatCodexResetCreditExpiry(iso: string): string {
+function formatCodexResetCreditExpiry(iso: string, withWeekday = false): string {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return '—';
-  return new Intl.DateTimeFormat(undefined, {
+  const date = new Intl.DateTimeFormat(undefined, {
     year: 'numeric',
     month: 'short',
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
   }).format(d);
+  return withWeekday
+    ? `${date} — ${new Intl.DateTimeFormat('ru-RU', { weekday: 'short' }).format(d)}`
+    : date;
 }
 
 // Ultra-compact reset countdown for the CHIP itself (always visible, must be
@@ -935,7 +938,7 @@ function CodexCreditBalanceRow({ credits, expiration }: {
           <span data-codex-credit-expiry style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: '#888', fontSize: 10 }}>
             <CalendarDays size={11} aria-hidden />
             {expiry
-              ? `${expiry.allCredits ? '' : `${formatCodexCreditBalance({ balance: expiry.amount })} `}expires ${formatCodexResetCreditExpiry(expiry.expiresAt)}`
+              ? `${expiry.allCredits ? '' : `${formatCodexCreditBalance({ balance: expiry.amount })} `}expires ${formatCodexResetCreditExpiry(expiry.expiresAt, true)}`
               : 'expiry unavailable'}
           </span>
         )}

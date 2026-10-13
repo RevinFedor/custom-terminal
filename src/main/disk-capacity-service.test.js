@@ -10,6 +10,16 @@ const { capacityProjection, readCacheDiskBytes, readFreeDiskBytes, createDiskCap
 const GiB = 1024 ** 3;
 const projection = (free, used) => capacityProjection(free * GiB, used * GiB, 20 * GiB, 6 * GiB);
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+test('RAM counters ride the existing sample and remain independent of disk scan failure', async () => {
+  let calls = 0;
+  const service = createDiskCapacityService({ cacheDirectory: '/cache', budgetBytes: 32 * GiB,
+    readUsage: async () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); },
+    getRamUsage: () => { calls++; return { status: 'ready', approxBytes: GiB, budgetBytes: 2 * GiB }; } });
+  const value = await service.sample();
+  assert.equal(value.status, 'error'); assert.equal(value.cacheBytes, null);
+  assert.equal(value.ram.approxBytes, GiB); assert.equal(value.ram.budgetBytes, 2 * GiB);
+  assert.equal(value.budgetBytes, 32 * GiB); assert.equal(calls, 1); service.destroy();
+});
 function timers() {
   let i = 0; const pending = new Map();
   return { pending, setTimeoutFn(fn, ms) { pending.set(++i, { fn, ms }); return i; },

@@ -208,7 +208,7 @@ test('Stop cancels a head still preparing and its waiters get a durable negative
   assert.equal(h.queue.receipt(a.sendOperationKey).status, 'application-queued');
   h.queue.stop('T');
   assert.equal((await waiting).state, 'not-submitted');
-  assert.deepEqual(signals, [a.sendOperationKey]);
+  assert.deepEqual([...signals].sort(), [a.sendOperationKey, 'history:T:b'].sort());
   release(); await tick();
   assert.equal(h.sends.length, 0);
   assert.equal(h.store.get(a.sendOperationKey).receipt.enterWritten, false);

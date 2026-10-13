@@ -8,6 +8,21 @@
 
 ## Кто держит центр — выбор пользователя
 
+Настройка числа строк задаёт желаемые границы редактора, но длинный черновик
+не должен обнулять область чтения в низкой панели. `AgentHistoryControls`
+ограничивает редактор измеренной высотой своей History/докнутой сцены за вычетом
+остального composer chrome и бюджета двух высот строк (минимум48px). Это резерв
+вне controls, не обещание двух полностью видимых строк при любых overlays/dock.
+Для single/terminal-primary граница стоит на общей строке terminal content и
+соседнего docked composer host. Marker только внутри content не является предком
+портального editor; marker на самом composer даёт зависимый от него же бюджет.
+Полный текст
+остаётся во внутреннем скролле редактора; store/draft/selection не заменяются.
+Тот же локальный ResizeObserver отслеживает ширину редактора, высоту сцены и
+chrome, публикуя только изменившийся предел. После вопроса, временно заменяющего
+редактор, наблюдение привязывается заново. Измеренная высота ввода ограничивает
+доступную высоту плана задач, поэтому его раскрытый список не перехватывает Send.
+
 Вкладка Claude/Codex владеет ПАРОЙ поверхностей (History + xterm), а какая из них занимает центр — переключаемая настройка `terminalIsPrimary`, **принадлежащая конкретной вкладке** и переживающая перезапуск. Обе раскладки рендерят ТОТ ЖЕ `HistoryPanel` (тот же owner, кэш, позиция чтения, draft, очередь, rewind preview) и ТОТ ЖЕ единственный xterm. Второй AI-чат, второй `TerminalArea` или «панельная копия» истории запрещены — это была бы вторая точка правды.
 
 Прежняя глобальная настройка сохранена только как источник миграции. Пер-вкладочная модель нужна ровно для того, чтобы одна вкладка читалась как переписка, а соседняя — как терминал; в сплите это единственный способ показать в одной колонке терминал, в другой транскрипт (`fact-рабочая-область.md::Каждая панель — свой центр`). Значение для НОВЫХ вкладок задаётся в `Settings → Системные → Режим новых вкладок` (по умолчанию History) и фиксируется в момент создания вкладки: иначе более поздняя смена умолчания задним числом переписала бы режим у всех вкладок, которые пользователь ещё не трогал, а текст настройки «уже открытые вкладки не меняются» стал бы ложью.
@@ -75,6 +90,23 @@ Portal обслуживает текущий History owner; он не участ
 composer, его floating status, prompt/preview chips, agent dock и Run After.
 Отпускание Cmd, уход, blur и смена владельца убирают её; скрытая History не
 показывает дату. Измеряется наведённый блок, chrome кэшируется по событиям.
+Resize/control/presentation callbacks только помечают chrome dirty. Обход и
+геометрия выполняются после проверки точного видимого timed target при Cmd;
+без Cmd-hover и у hidden owner нет предварительного сбора chrome на mount,
+resize или global Meta. Оба порядка Cmd→hover/hover→Cmd сохраняются. Если Cmd
+остаётся удержанным при возврате, visibility/ready wake восстанавливает подпись
+по сохранённой точке без обязательного нового mousemove. Новое нажатие Meta,
+новый timed target и вход после leave помечают envelope dirty: следующий
+допущенный hover снова собирает chrome, даже если между жестами изменилась
+только позиция ненаблюдаемого предка или появился внешний chrome node.
+Отпускание/blur/hidden не измеряют геометрию. Обновление timestamp/caption на
+том же DOM element берёт текущие key/at, не дату предыдущего выбранного row.
+Фаза `history-record-time-chrome` измеряет только уже необходимый сбор у этого
+owner; его время не равно всей задержке переключения. Контроль admission —
+`historyRecordTimeActivity.actual.test.mjs`; DOM/RO с32owners проверен отдельно
+при controlled timestamps/chrome и synthetic input, включая position-only
+collision RED→GREEN между Meta-жестами, stationary show, caption иblur.
+Это не full group/hydration либо installed latency proof.
 
 Cmd читает уже опубликованные `data-history-time-*` и геометрию DOM, не
 запрашивает JSONL, payload инструмента или сервер. Поэтому loader чтения здесь
@@ -367,6 +399,159 @@ attempt/operation, статусы, длину prompt и количества ima
 раскрываемым/копируемым; это не Copy пользовательского сообщения из History.
 Для расследования тело читается отдельно по exact operation, не из тоста.
 
+## Переключение текстов свёрнутой служебной группы
+
+Под `└` у подписи — одно нейтральное число, не стрелки и не навигация к другой
+строке. Оно показывает индекс выбранного комментария; по умолчанию это последний
+из N. Нажатие выбирает предыдущий, после первого возвращается к последнему.
+Меняется только подпись: группа остаётся свёрнутой, raw rows/Copy/порядок прежние.
+Hover даёт pointer и лёгкий фон. English tooltip `Text 2 of 7 · Click for previous
+text` сообщает и общее число. При единственной подписи число и его tooltip
+отсутствуют: это переключатель, а не декоративный счётчик. Ранее disabled `1`
+показывалась намеренно, но пользователь отклонил её 11.10 как бессмысленную.
+Digest инструментов, thinking, tool outputs и standalone final/partial ответы
+не становятся комментариями и не входят в этот счётчик. Считаются исходные блоки,
+не физические строки и не одинаковые фразы; повтор одного UUID не удваивает число.
+Предпросмотр сохраняет исходные переводы строк и пустые строки между абзацами;
+перенос по ширине панели не должен склеивать следующий абзац в предыдущий.
+Первый разряд номера выровнен под вертикальным штрихом `└`, независимо от
+пользовательского размера шрифта; колонка текста остаётся на прежнем месте.
+
+Manual choice адресуется exact source identity/UUID, переживает append и
+canonical aliases. Первоначальный newest-default продолжает следить за хвостом.
+При смене владельца view hints и локальный выбор очищаются, включая A→B→A;
+виртуализация внутри того же owner может восстановить выбор из небольшого
+Map (до256 групп, без тел). Время у подписи принадлежит выбранной raw-записи.
+
+Смена текста проходит прежний `applyHistoryRevealUpdate`, не новый scroll writer
+или раскрытие группы. Stub count основан на structural contentLength/hasContent;
+выбранный stub догружается по точному UUID прежним hydration requester и до этого
+показывает `Loading text…`, не соседний текст. Явный видимый выбор приоритетен
+перед автоматическим warming. Materialized-window сохраняет именно его тело
+только по прежнему physical-revision proof и в прежнем row budget. Research
+counter-only группы и underlying Timeline addressing этим не меняются.
+
+## Компактный ответ External Research
+
+11.10 пользователь принял tool-подобную модель без фиолетового фона: новый
+источник ответа не должен менять привычные клики, плотность и типографику
+инструментов. Прежние purple bubbles, fit-content→full-width при раскрытии,
+JSON/число строк вместо смысла, правая rail и неограниченный код отклонены.
+SOURCE и компонентные проверки обновлены; отдельная full DEV приёмка нового
+контракта ведётся в `docs/tmp/визуал-history.md`. Старые full DEV результаты
+не подтверждают новый визуал и не означают установленную версию.
+
+Доказанные `external-research/completion` и `failure` остаются справа прозрачными
+служебными строками. Шапка в одну строку: фиолетовый SVG, Research, сохранённые
+model/effort, отдельные SC-стрелка/браузер/Copy и правый chevron. Техническое имя research
+job не занимает видимую шапку; оно сохраняется у aria/source-action и в каталоге.
+Весь заголовок, включая
+пустое место, раскрывает ответ; SC-стрелка открывает сохранённую задачу и не toggle.
+Browser SVG справа от стрелки открывает разговор той же задачи через отдельный
+`orchestration:open-research-browser`. RunId разрешается Main в полный saved jobId;
+SC читает только metadata link, не полный ответ. Prefer exact system/tracked tab,
+затем другая exact conversation tab; закрытый обычный разговор открывается по
+чистому `/c/id`, без research/import/compose markers. Закрытый temporary/startup
+без conversation URL не становится новым пустым чатом. Unknown ACK/старый SC
+показывают отказ, не fallback к произвольному браузеру. Copy и disclosure прежние.
+Название и параметры читает один same-owner каталог `orchestration:list-for-tab`,
+общий с Timeline. Unknown/pruned не получает current defaults или выдуманную
+модель из label. Сохранённый выбор запроса не является proof фактического picker
+или runtime. Ошибка определяется typed phase: красная иконка failure не выводится
+из отрицательного `verdict` в ответе. Полученный отрицательный вывод — не сбой
+доставки; постоянный зелёный «успех» не нужен.
+
+У retained History `presented` prop — только начальный seed. Чтение каталога
+разрешает лёгкий model-provider по действующему exact presentation channel/ref;
+иначе prewarmed скрытая вкладка после показа навсегда оставляла `Research`.
+Новый отображаемый runId, которого прежнее чтение ещё не покрывало, вызывает
+одно обновление общего каталога. Проверенный pruned/unknown не опрашивается
+повторно при каждом показе; поздний ответ старого owner и новые events сохраняют
+свои guards. Phase `history-research-models` содержит только owner/count/timing.
+
+Под каждым закрытым ответом — его компактный excerpt в одну физическую строку,
+не общий комментарий группы и не headline «JSON · N строк». У JSON/JSONL это
+текстовое summary/reason/message первого record, если оно есть, иначе короткое
+начало кода; это не AI-summary и не классификатор успешности. У прозы — начало
+текста. History рендерит прозаический preview тем же shared Markdown, что полный
+ответ: headings/strong/inline code не становятся видимыми `##`/`**`/backticks.
+Его block-маргины схлопнуты в одну читаемую строку, без пустого ряда после heading;
+JSON excerpt остаётся буквальным значением, не переинтерпретируется как Markdown.
+Превью ограничено до рендера; скрытый полный Markdown/JSON DOM и прежний локальный
+overflow ResizeObserver не нужны. Ordinary group captions сохраняют свой полный
+текст/исходные абзацы: этот однострочный контракт относится только к Research.
+
+Любой непустой ответ доступен через whole-header или правый chevron. Прежний
+`useHistoryRevealToggle` сохраняет внешний reading owner, а открытое тело имеет
+собственный предел180px и вертикальную прокрутку, как MCP output. Тело имеет
+тёмную нейтральную подложку из общего code-surface token, тогда как шапка/группа
+остаются прозрачными; прежний запрет purple bubble не запрещает фон читаемого
+раскрытого output. JSON/code
+использует его меньший нейтральный monospace; формат/число строк остаются только
+вторичной строкой внутри раскрытого тела. Вложенные code blocks не создают ещё
+один вертикальный scroller. Для CSS overflow нужно согласовать обе оси:
+`overflow-y:visible` при оставшемся `overflow-x:auto` вычисляется как auto.
+Markdown в открытом теле сам задаёт абзацы, без унаследованного raw pre-wrap.
+
+Literal цельная `<CodeBlock language="json" editable={false}>…</CodeBlock>` —
+текст ответа, а не вложение или выполняемый JSX. Display-only projection
+показывает его как read-only code (History — MCP-типографика, Timeline — общий
+Markdown renderer своего popup). Сырой transport,
+audit hash, UUID/source aliases и JSON values не переписываются. Whole Copy
+берёт точный исходный transport. Clipboard snapshot восстанавливает реальные
+вложения только из prefix перед envelope, а весь generated envelope+answer
+сохраняет opaque text. Иначе строковый JSON value с `<pasted_content>` создавал
+fake chip и менял plain Copy — прежний generic prompt builder здесь не подходит.
+Для обычных user prompts/реальных вставок тот builder остаётся прежним.
+Служебные offsets/hash обязаны пройти прежнюю проверку до преобразования;
+quoted/in-text/malformed/неподтверждённые записи остаются literal. Контекст
+перед envelope сохраняет чипы, а похожие строки внутри JSON не становятся
+prompt/paste attachments. Нового result GET, импорта или model request нет.
+Цельный `<escape>…</escape>` тоже раскрывается как code, только если внутренний
+текст — валидный JSON/JSONL; quoted/malformed/обычный текст остаётся literal.
+Prefix делится на внешнюю prompt-band и остаток ровно один раз. `promptParts`
+содержит `{part,sourceIndex}`, поэтому сравнение `includes(rawPart)` дублировало
+chip внутри bubble; Research теперь рендерит готовые `bodyParts` prefix.
+
+В primary History начальный Virtuoso Header резервирует32px под постоянную
+верхнюю полосу:26px button +2px border +4px gap, из общего `promptQueueChrome`.
+Размер раскрытой PQ-панели не меняет этот резерв. Header не является entry;
+inset включён в measured-layout keys, старый offset0 snapshot не считается
+совпавшей геометрией. Scroll/reveal/follow остаются у прежнего владельца.
+
+Проверенный SOURCE witness10.10: public History754/SID3d52c5a0 user7451,
+run8b56db4d, `throw` из screenshot24f90. JSON внутри содержит75 строк;
+transport/envelope/CodeBlock строки не входят в этот счётчик. Component proof
+не означает installed/provider/OS clipboard или full virtualizer acceptance.
+
+### Несколько Research-ответов подряд
+
+Два и более строго соседних доказанных `external-research/completion|failure`
+сворачиваются справа в прозрачную шапку `Research ×N`; при ошибках виден красный
+`N failed` ещё до раскрытия. Обычное сообщение, assistant/tool, compact, вопрос,
+request, другой служебный источник или ещё не SENT input прерывают серию.
+Произвольный JSON или одинаковый runId не proof. Шапка не показывает первый
+ответ, общую caption/дату/модель или общий Copy. Нажатие отправки research само
+по себе не создаёт такую строку: это отображение уже доставленного итога,
+а request/выполнение остаются у прежнего tracker.
+
+Раскрытие сохраняет шапку и возвращает отдельные строки в тот же плоский
+Virtuoso. У каждой свои source/model, raw Copy, excerpt и раскрытие тела;
+общая rail/foot слева сворачивает серию через существующий group/reveal owner.
+Closed/open header занимает одну и ту же user-side ширину и не съезжает влево.
+Children выровнены внутри неё с общим отступом rail, независимо от JSON/prose.
+Это стабильная CSS-геометрия, не обход карточек и подбор максимальной ширины DOM.
+Переход Timeline/search к скрытому raw UUID сначала раскрывает его группу.
+Ключ берётся из первой точной row identity (SENT audit UUID при local→canonical),
+не из runId; append растит тот же счётчик. Provider records/очередь не сливаются.
+
+Группировка и число ошибок читают только структурные tags. Actual Main stubs сохраняют их
+короткие typed поля без envelope/body/chips, поэтому hydration не меняет состав.
+Свёрнутая counter-only шапка не требует загрузки скрытых тел; раскрытый child
+гидрируется как обычная UUID-строка. Прежний полный private DEV проверял сохранность
+копий public user15650/3761–3777, но старые purple-card screenshots не являются
+новой приёмкой. Актуальное покрытие и границы — в `docs/tmp/визуал-history.md`.
+
 ## Автоматические Continue/Loop в истории
 
 Run After продолжение с сохранённым `prompt-origin/source=loop` и capacity
@@ -377,6 +562,26 @@ Run After продолжение с сохранённым `prompt-origin/source
 raw transport/Copy/UUID либо исполнения. Continue остаётся system/service,
 Loop — user-origin. Текущий toggle и похожее слово в теле не дают происхождение;
 Context Overflow Recovery остаётся другим типом. Более точный native reply синий.
+
+## Native Goal: служебные отметки, не user-баблы
+
+Codex сохраняет ручную смену Goal как целый reserved envelope
+`codex_internal_context source="user_goal"` с точным `User set goal status`.
+Подтверждённые `paused`/`active` показываются компактными фиолетовыми строками
+`Goal paused` / `Goal active` в том же shell, что `Goal continued`, без XML,
+пузыря и действий Rewind/Delete отдельного user prompt. `active` означает
+сохранённый статус Goal, не proof текущего busy, Resume или доставки сообщения.
+
+Класс общий для History и Timeline preview, но по прямому решению пользователя
+ни Goal continuation, ни его смена статуса не рисуются точками Timeline. Это
+renderer display-фильтр после merge/notes/working-file проекций; исходные records,
+UUID/source aliases/turnIndex, копирование и native runtime остаются прежними.
+Поздний live user carrier фильтруется до сокращения текста. Карточка Goal
+оставлена для возможного будущего использования, её type-chip фиолетовый;
+оранжевый user-chip не обозначает внутренний Goal. Цитаты, неполные/unknown
+envelopes и обычное «продолжай работу» остаются literal user content; MCP/native
+question proof не подменяется похожим текстом. Не расширять delivery/result
+predicate `isCodexGoalContinuationUserText` ради этой локальной display-задачи.
 
 ## Сохранённый ответ на native-вопрос
 
@@ -462,6 +667,17 @@ Highlight загружены статически; наборы Range храня
 все retained окна: это сотни миллисекунд сверх дешёвого поиска. Причина и
 контрольный замер — `fix-performance-lags.md::7b. Пустой поиск чата инвалидировал стили всех окон`.
 
+## Строка субагента — переключатель панели
+
+Клик по Task/SubAgent row вызывает существующий `toggleHistoryDetail`:
+тот же exact key повторно закрывает Agent Inspector, другой key переключает
+на другого ребёнка. Оранжевая/indigo левая status-черта строки убрана;
+status glyph, цвет текста, время, identity и живость не меняются. Серая rail
+целой раскрытой группы — другой элемент и сохраняется. Внешний
+`history-panel:open-agent` и выбор в навигации используют прежний idempotent
+open, не toggle: повторный адресный переход не закрывает уже открытого агента.
+Это presentation-only закрытие панели, не Stop/Cancel child или parent turn.
+
 ## Быстрый возврат и раскрытие блоков
 
 **Сворачивание длинной карточки сохраняет законную post-clamp позицию.** Сначала
@@ -534,6 +750,16 @@ prompt сохраняет `<pasted_content>`-чипы. Предыдущее оп
 заглушки выше — шрам до этого reader-слоя, а не текущий контракт.
 
 **Актуальный владелец child transcript — единый Agent Inspector над composer.** Карточка Task/Agent в основной Virtuoso-ленте больше не вставляет внутрь себя вторую прокручиваемую History: клик выбирает `task:<toolUseId>` и открывает один docked inspector. Live-chip, завершённая карточка и bot-marker на Timeline ведут в этот же selection. Переход `running → completed` не закрывает открытую панель; меняются только статус и frozen duration. Кнопка `Agents` открывает один roster `Running / Completed / Interrupted`; он не рисует сразу все child transcripts. В normal flow остаётся только компактный chip-row; roster/Inspector абсолютно открываются над ним и не изменяют высоту History viewport. Верхняя грань resize'ит высоту; при смене selection панель сохраняет точный прямоугольник и показывает loader внутри. Имя и связь хранятся в durable Task-записи; row-window stub сохраняет малые agent identity/status/locator fields, чтобы глобальный roster не зависел от текущего hydration-window.
+
+Chip-row над composer сохраняет нативную горизонтальную прокрутку, но не рисует
+нижний scrollbar: он расходовал высоту и выглядел как ещё один ряд. Компактные
+SVG-стрелки абсолютно стоят на краях и показываются только в сторону скрытого
+содержимого. Обычное колесо без Shift переводится в горизонтальное движение
+только над этой строкой, включая сами стрелки; native horizontal/Shift работает
+тоже. Граница/resize/изменение состава обновляют доступные направления, без polling
+и общего обхода DOM. Inspector/roster находятся вне этого scroll-host и сохраняют
+свою вертикальную прокрутку. Ни стрелки, ни скрытый scrollbar не меняют selection,
+activity count или process lifetime.
 
 **Живость чипа определяется владельцем работы, а не текущим ходом.** Два класса:
 - *Turn-scoped* — Claude Task без явного live-статуса: Escape убивает весь ход вместе с субагентами, поэтому busy=false терминален; ищется только в последнем ходу (историческая лента полна карточек без результата от прерванных ходов — именно они давали доски вечных «1236m»).

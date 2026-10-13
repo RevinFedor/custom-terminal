@@ -1,12 +1,29 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { useUIStore } from '../store/useUIStore';
-import { collectTabLinkedFileTree, isLinkedFilePreview } from './tabLinkedFiles.mjs';
+import { collectTabLinkedFileTree, isLinkedFilePreview, linkedFileOwner } from './tabLinkedFiles.mjs';
 import type { LinkedFile } from '../components/Workspace/TabLinkedFiles';
 import { tabNavigationLocation } from './tabNavigationLocation.mjs';
 
 let request = 0;
 let pendingRead: { id: number; ownerTabId: string } | null = null;
 const location = tabNavigationLocation;
+
+/** A linked sidebar row is the same owner reader as its attachment chip/menu.
+ * null means this is not a linked file; a broken link fails without routing
+ * the file's independent placement (which may belong to another workflow).
+ */
+export function openSidebarLinkedFile(projectId:string,tabId:string):Promise<boolean>|null {
+  const state=useWorkspaceStore.getState();
+  const tab=state.openProjects.get(projectId)?.tabs.get(tabId);
+  if(tab?.tabType!=='file' || !tab.visualParentTabId)return null;
+  const owner=linkedFileOwner(state.openProjects,tabId);
+  const file=owner && collectTabLinkedFileTree(state.openProjects,owner.tabId)
+    .find(link=>link.projectId===projectId && link.id===tabId && link.path===tab.filePath);
+  if(!owner || !file)return Promise.resolve(false);
+  return openTabLinkedFile(owner.projectId,file,()=>useWorkspaceStore.getState().openTabById(owner.tabId,{
+    projectId:owner.projectId,reason:'linked-file',
+  }));
+}
 
 /** Middle-click dismisses this owner's reader, including a late pending read.
  * Link lifetime stays with Unlink; navigation stays with the Root owner.

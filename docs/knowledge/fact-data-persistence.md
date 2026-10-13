@@ -143,6 +143,32 @@ renderer обновляет captured и current same-subject objects до осв
 кандидата остаются прежними. Подробный private witness —
 `src/main/workflow-create-revision.native.test.mjs`; установленная приёмка отдельно.
 
+Внутри одного `saveExecutionTabs` одинаковый SQL переиспользует подготовленный
+statement. Каждые schema/row reads, UPDATE и readback всё равно выполняются:
+результаты строк/PRAGMA не кэшируются, CAS и revision proof остаются прежними.
+Следующий batch, вложенный batch и одиночный save получают собственную подготовку;
+занятый statement не сбрасывается — для такого вызова создаётся другой. Контроль
+`database.execution-bulk-prepare.native.test.js` проверяет rollback, свежую схему,
+триггеры и вложенность на настоящем SQLite, отдельно от UI-приёмки.
+
+### Создание native-вкладки не сохраняет соседей
+
+Новый v2 subject уже выделен canonical workflow factory. Его публикация
+сохраняет только exact новую строку через прежнюю namespace save-lane/ACK/CAS;
+полный candidate Map нужен для размещения. Поэтому New/Fork/file-child не
+записывает несохранённые metadata соседей и не отказывает из-за их старой
+ревизии. Legacy и cold restore сохраняют прежний full-snapshot контракт.
+Своя ревизия ребёнка, unmaterialized rollback, cancellation и ручное имя
+не обходятся. Это не новая authority для повторного старого snapshot.
+
+Шрам13.10: MCP Start сначала записал command_type и условный автоцвет соседней
+вкладки, затем уведомил renderer без revision ACK. Эти поля renderer тоже может
+менять, поэтому main-owned-fields proof правильно разорвался5→6. Старый Fork
+сохранял ВСЕХ соседей и отказал до копирования истории. Нельзя чинить это latest
+revision или расширением Main-only allowlist: чужое настоящее изменение notes/
+name должно и дальше запрещать запись этой строки. Ограничение создания своей
+строкой устраняет ненужный чужой write; полные saves и direct CAS остаются strict.
+
 ### Main-owned Codex identity и ownership вкладки
 
 Текущая живая Codex-сессия определяется в main по process-to-writable-rollout proof и сохраняется там же точечной записью. Общий renderer snapshot может ещё содержать Resume source, поэтому `saveTabs` сохраняет уже лежащий в SQLite `codex_session_id` для существующей строки, а не перезаписывает его менее свежей копией интерфейса. После остановки это поле снова является durable точкой Resume; во время живого процесса оно не заменяет writer proof.

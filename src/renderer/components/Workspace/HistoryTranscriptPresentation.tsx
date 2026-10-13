@@ -1,4 +1,5 @@
-import React, { memo, useMemo, useState } from 'react';
+import React, { memo, useMemo, useRef, useState } from 'react';
+import { historyGroupCaptionIdentity, resolveHistoryGroupCaption, previousHistoryGroupCaption } from '../../utils/historyGroupCaption.mjs';
 import { historyRecordTimeAttributes } from '../../utils/historyRecordTimePresentation.mjs';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import {
@@ -11,10 +12,12 @@ import {
   buildHistoryDisplayUnits,
   groupFamilyBreakdown,
   isGroupUnit,
+  historyGroupCaptionEntries,
 } from '../../utils/historyDisplayUnits.mjs';
 import {
   BrainIcon,
   ChatMessage,
+  ConversationMessage,
   ColoredToolIcon,
   ComposerChip,
   defaultOpenForTool,
@@ -48,6 +51,7 @@ export interface HistoryPresentationGroup {
   docsKind?: string;
   entries: Array<any>;
   captionEntry?: any | null;
+  captionEntries?: any[];
   facts: HistoryPresentationFact[];
   errorCount: number;
   thinkingSeconds?: number;
@@ -256,6 +260,9 @@ export const HistoryCollapsedGroupRow = memo(({
   liveBackgroundUuids = new Set<string>(),
   isTurnBusy = false,
   onToggle,
+  captionOwnerKey = '',
+  captionIdentity = null,
+  onCaptionChange,
 }: {
   group: HistoryPresentationGroup;
   expanded: boolean;
@@ -263,7 +270,41 @@ export const HistoryCollapsedGroupRow = memo(({
   isTurnBusy?: boolean;
   isLastUnit?: boolean;
   onToggle: () => void;
+  captionOwnerKey?: string;
+  captionIdentity?: string | null;
+  onCaptionChange?: (groupKey: string, next: any, previous: any, anchor: HTMLElement | null, commit: () => void) => void;
 }) => {
+  const captionScope = captionOwnerKey + '|' + group.key;
+  const [captionChoice, setCaptionChoice] = useState<{ scope: string; identity: string | null } | null>(null);
+  const captionAnchor = useRef<HTMLDivElement>(null);
+  const captions = useMemo(() => group.familyKey === 'research' ? []
+    : group.captionEntries || historyGroupCaptionEntries(group.entries, group.captionEntry), [group]);
+  // Do not leave an old owner's local choice dormant so A→B→A can resurrect
+  // it after the primary owner has already cleared its view/hydration hints.
+  if (captionChoice && captionChoice.scope !== captionScope) setCaptionChoice(null);
+  const choice = captionChoice?.scope === captionScope ? captionChoice.identity : captionIdentity;
+  const selected = resolveHistoryGroupCaption(captions, choice);
+  const cycleCaption = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault(); event.stopPropagation();
+    if (selected.count < 2) return;
+    const next = previousHistoryGroupCaption(captions, choice);
+    const commit = () => setCaptionChoice({ scope: captionScope, identity: historyGroupCaptionIdentity(next.entry) });
+    if (onCaptionChange) onCaptionChange(group.key, next.entry, selected.entry, captionAnchor.current, commit);
+    else commit();
+  };
+  if (group.familyKey === 'research') return <ConversationMessage layout="user"
+    className="hp-history-research-group" data-history-research-group-expanded={expanded ? '1' : undefined}
+    contentClassName="hp-history-research-group-bubble">
+    <button type="button" className="hp-history-research-group-toggle" aria-expanded={expanded}
+      aria-label={`${expanded ? 'Collapse' : 'Expand'} Research group: ${group.entries.length} results${group.errorCount ? ', ' + group.errorCount + ' failed' : ''}`}
+      onClick={onToggle}>
+      <span className="hp-history-research-group-icon">{toolIcon('Bash', 14, 'group')}</span>
+      <span>Research <span className="hp-history-research-group-count">×{group.entries.length}</span></span>
+      {group.errorCount > 0 && <span className="hp-history-research-group-errors">· {group.errorCount} failed</span>}
+      <span className="hp-history-research-group-flex" />
+      {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+    </button>
+  </ConversationMessage>;
   const live = (isTurnBusy && group.facts.some((fact) => fact.inFlight === true))
     || group.entries.some((entry) => liveBackgroundUuids.has(entry.uuid));
   const inner = group.level === 2;
@@ -271,8 +312,10 @@ export const HistoryCollapsedGroupRow = memo(({
     ? historyInnerGroupHeaderData(group)
     : historyGroupHeaderData(group);
   const headerText = historyGroupHeaderText(segments);
-  const caption = group.captionEntry && typeof group.captionEntry.content === 'string'
-    ? group.captionEntry.content.trim()
+  const captionEntry = selected.entry;
+  const captionPending = captionEntry?.rowStub === true;
+  const caption = captionEntry && typeof captionEntry.content === 'string'
+    ? captionEntry.content.trim()
     : '';
   return (
     <div
@@ -332,11 +375,19 @@ export const HistoryCollapsedGroupRow = memo(({
             : <ChevronRight size={11} style={{ color: '#6f6d68', flexShrink: 0 }} />}
         </div>
       </div>
-      {!expanded && (caption || digest) && (
-        <div className="hp-history-group-detail">
-          <span aria-hidden style={{ flexShrink: 0 }}>└</span>
-          <span {...(caption ? historyRecordTimeAttributes(group.captionEntry?.recordTime,
-            group.captionEntry?.uuid + ':caption', 'text') : {})}>{caption || digest}</span>
+      {!expanded && (caption || captionPending || digest) && (
+        <div className="hp-history-group-detail" ref={captionAnchor} data-history-caption-uuid={captionEntry?.uuid}>
+          <span className="hp-history-caption-gutter" style={{ width: selected.count > 1 ? Math.max(2, String(selected.count).length) + 'ch' : undefined }}>
+            <span aria-hidden>└</span>
+            {selected.count > 1 && <button type="button" className="hp-history-caption-number"
+              title={`Text ${selected.index + 1} of ${selected.count} · Click for previous text`}
+              aria-label={`Text ${selected.index + 1} of ${selected.count}. Show previous text`}
+              onMouseDown={event => event.stopPropagation()} onClick={cycleCaption}>
+              {selected.index + 1}
+            </button>}
+          </span>
+          <span className="hp-history-caption-text" {...(caption ? historyRecordTimeAttributes(captionEntry?.recordTime,
+            captionEntry?.uuid + ':caption', 'text') : {})}>{captionPending ? 'Loading text…' : caption || digest}</span>
         </div>
       )}
     </div>
@@ -967,7 +1018,7 @@ export const HistoryTranscriptPresentation = memo(({
         return (
           <div
             key={entry.uuid}
-            className="hp-history-group-member"
+            className={`hp-history-group-member${expandedGroup.familyKey === 'research' ? ' hp-history-group-member--research' : ''}`}
             data-history-group-member={expandedGroup.key}
             data-history-group-last={expandedGroup.last ? '1' : undefined}
           >

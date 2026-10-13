@@ -191,8 +191,8 @@ send или paste; фиолетовое — ожидание связанног�
 не прибавляются к зелёному. Это presentation-проекция, не изменение runtime,
 Stop, queue admission или Dock.
 
-Workflow menu Stop — отдельная Main-операция: `Стоп свободные` оставляет own/
-inherited/operational busy, `Стоп все` завершает и работающие сессии. Она берёт
+Workflow menu Stop — отдельная Main-операция: `Stop idle` оставляет own/
+inherited/operational busy, `Stop all` завершает и работающие сессии. Она берёт
 полное active membership, включая reserve, а не превращает этот визуальный
 счётчик или старый `!busy` в разрешение сигналить процесс. Перед Stop Main снова
 проверяет точного владельца и idle. См. `fact-ai-sessions.md::Остановка сессий workflow`.

@@ -13,7 +13,9 @@ import assert from 'node:assert/strict';
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const artifact = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-timeline-modifier-'));
 const snapshot = path.join(artifact, 'source');
-const result = {artifact, status:'running', errors:[], cases:[]}; let app;
+const result = {artifact, status:'running', errors:[], cases:[],
+  boundary:'Actual Timeline with one private render counter, synthetic store/data/IPC, owned offscreen Electron. Functional projection and diagnostic proof; concurrent peer native work may affect timings.'}; let app;
+const logs=[];
 try {
   for(const name of ['src','packages/claude-blocks']) await fs.cp(path.join(repo,name),path.join(snapshot,name),
     {recursive:true,filter:p=>!p.includes('/node_modules')&&!p.includes('/.git')});
@@ -67,6 +69,7 @@ try {
   const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
   app=await electron.launch({args:[path.join(artifact,'main.cjs')],env,cwd:artifact});result.pid=app.process().pid;
   const page=await app.firstWindow();page.setDefaultTimeout(12000);page.on('pageerror',e=>result.errors.push(e.stack));
+  page.on('console',message=>logs.push(message.text()));
   await page.waitForFunction(()=>document.querySelectorAll('[data-modifier-owner]').length===12
     && [...document.querySelectorAll('[data-modifier-owner]')].every(owner=>owner.querySelectorAll('[data-timeline-entry-uuid]').length===600));
   const frames=()=>page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
@@ -75,10 +78,17 @@ try {
   await page.locator('[data-modifier-input]').focus();await frames();
   for(const phase of ['down','up']){
     const before=await page.evaluate(()=>({...window.modifierFixture.renders})),nativeBefore=await metrics();
+    const summaryPromise=page.waitForEvent('console',{predicate:message=>message.text().startsWith('[Perf:ModifierOwners]')});
     const start=Date.now();await page.keyboard[phase]('Meta');await frames();
+    const summaryLine=(await summaryPromise).text();
+    const summary=JSON.parse(summaryLine.slice(summaryLine.indexOf('{')));
+    assert.equal(summary.owners,12);assert.equal(summary.presentedRelevant,0);
+    assert.equal(summary.truePublications+summary.falsePublications,0);
+    const exactAction=await page.evaluate(id=>window.modifierFixture.actions.find(action=>action?.id===id),summary.actionId);
+    assert.equal(exactAction.keyClass,'Meta');assert.equal(exactAction.event,phase==='down'?'keydown':'keyup');
     const after=await page.evaluate(()=>({...window.modifierFixture.renders})),nativeAfter=await metrics();
     result.cases.push({phase,wallMs:Date.now()-start,changedOwners:Object.keys(after).filter(k=>after[k]!==before[k]),
-      renders:Object.fromEntries(Object.keys(after).map(k=>[k,after[k]-(before[k]||0)])),
+      summary,renders:Object.fromEntries(Object.keys(after).map(k=>[k,after[k]-(before[k]||0)])),
       metrics:Object.fromEntries(['TaskDuration','ScriptDuration','LayoutDuration','RecalcStyleDuration','ThreadTime'].map(k=>[k,(nativeAfter[k]-nativeBefore[k])*1000]))});
   }
   if(!process.argv.includes('--baseline'))for(const item of result.cases)assert.deepEqual(item.changedOwners,[],
@@ -111,5 +121,12 @@ try {
   assert.equal(result.state.draft,'unchanged draft');assert.deepEqual(result.state.violations,[]);assert.deepEqual(result.errors,[]);
   result.status='pass';
 }catch(error){result.status='fail';result.error=error.stack;process.exitCode=1;}
-finally{if(app)await app.close();await fs.rm(snapshot,{recursive:true,force:true});await fs.rm(path.join(artifact,'profile'),{recursive:true,force:true});result.cleanup=true;await fs.writeFile(path.join(artifact,'result.json'),JSON.stringify(result,null,2));}
+finally{
+  if(app)await app.close();
+  if(result.pid){try{process.kill(result.pid,0);result.processExited=false;}catch{result.processExited=true;}}
+  await fs.rm(snapshot,{recursive:true,force:true});await fs.rm(path.join(artifact,'profile'),{recursive:true,force:true});
+  await fs.rm(path.join(artifact,'noted-shared'),{recursive:true,force:true});
+  await fs.writeFile(path.join(artifact,'renderer.log'),logs.join('\n'));result.cleanup=true;
+  await fs.writeFile(path.join(artifact,'result.json'),JSON.stringify(result,null,2));
+}
 console.log(JSON.stringify(result));

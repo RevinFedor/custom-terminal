@@ -4,6 +4,7 @@ import { useWorkspaceOverlayTarget } from '../../hooks/useWorkspaceOverlayTarget
 import { placeLinkedFilePopup } from '../../utils/tabLinkedFiles.mjs';
 import { PANE_LAYER_PRESENTATION_EVENT } from '../../utils/paneLayerPresentation.mjs';
 import { uiPerformancePhase } from '../../utils/uiPerformanceDiagnostics.mjs';
+import { isTaskPlanChildDismissal } from '../../utils/taskPlanPopupDismissal.mjs';
 
 export const TaskPlanPopupOwner = createContext<string | undefined>(undefined);
 
@@ -27,7 +28,7 @@ export default function TaskPlanPopover({
   const latest = useRef({ childrenOpen, onClose });
   latest.current = { childrenOpen, onClose };
   const hasChild = () => latest.current.childrenOpen || !!document.querySelector(
-    `[data-task-plan-file-picker][data-task-plan-popup-owner="${CSS.escape(owner)}"]`,
+    `:is([data-task-plan-file-picker],[data-task-plan-editor-menu])[data-task-plan-popup-owner="${CSS.escape(owner)}"]`,
   );
 
   useLayoutEffect(() => {
@@ -48,12 +49,14 @@ export default function TaskPlanPopover({
         latest.current.onClose();
         return;
       }
-      const width = Math.max(0, Math.min(
+      const widthLimit = Math.max(0, Math.min(
         mode === 'preview' ? root.width - 12 : 380,
         innerWidth - 16,
       ));
-      node.style.width = `${width}px`;
+      node.style.maxWidth = `${widthLimit}px`;
+      node.style.width = mode === 'preview' ? 'max-content' : `${widthLimit}px`;
       node.style.maxHeight = `${Math.max(0, innerHeight - 16)}px`;
+      const width = node.getBoundingClientRect().width;
       const height = Math.min(node.scrollHeight + 2, innerHeight - 16);
       if (mode === 'preview') {
         const placement = placeLinkedFilePopup(
@@ -91,6 +94,7 @@ export default function TaskPlanPopover({
     const ownedChild = (element: EventTarget | null) => element instanceof Element
       && element.closest('[data-task-plan-popup-owner]')?.getAttribute('data-task-plan-popup-owner') === owner;
     const outside = (event: MouseEvent) => {
+      if (isTaskPlanChildDismissal(event, owner)) return;
       if (hasChild() || ownedChild(event.target)) return;
       if (event.target instanceof Node && (node.contains(event.target) || panel.contains(event.target))) return;
       // Preserve the input until the parent has committed its draft. An outside
@@ -146,7 +150,7 @@ export default function TaskPlanPopover({
       {mode === 'editor' && [0, 1, 2, 3].map(i => <div key={i} ref={node => { backdrops.current[i] = node; }}
         data-task-plan-popup-backdrop style={{ position: 'fixed', zIndex: 2147482399, pointerEvents: 'auto' }}
         onMouseDown={event => {
-          event.preventDefault(); childDismiss.current = hasChild();
+          event.preventDefault(); childDismiss.current = hasChild() || isTaskPlanChildDismissal(event.nativeEvent, owner);
           if (!childDismiss.current) event.stopPropagation();
         }}
         onClick={event => {

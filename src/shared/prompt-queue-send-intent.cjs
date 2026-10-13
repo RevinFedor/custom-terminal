@@ -1,5 +1,20 @@
 'use strict';
 
+// The queue store serializes absence as '-', not an empty string. Empty is
+// retained for legacy intents. Neither requires a context percentage proof.
+// Unknown nonempty keys still require proof; do not fail open on malformed data.
+function hasPromptQueueContextConditionKey(key) {
+  return typeof key === 'string' && key !== '' && key !== '-';
+}
+
+// Compare persisted absence representations without rewriting the immutable
+// request. Real and unknown nonempty conditions retain exact key equality.
+function promptQueueContextConditionKeysEqual(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  return left === right
+    || ((left === '' || left === '-') && (right === '' || right === '-'));
+}
+
 // A persisted application intent, not permission to write to a provider. The
 // existing queue runner owns these fields; Main still proves every write.
 function isAutomaticPromptQueueRequest(request) {
@@ -27,4 +42,4 @@ function isAutomaticNoWriteWait(record, request) {
     && isAutomaticReadinessWaitReceipt(record.receipt);
 }
 
-module.exports = { isAutomaticPromptQueueRequest, isAutomaticReadinessWaitReceipt, isAutomaticNoWriteWait };
+module.exports = { hasPromptQueueContextConditionKey, promptQueueContextConditionKeysEqual, isAutomaticPromptQueueRequest, isAutomaticReadinessWaitReceipt, isAutomaticNoWriteWait };

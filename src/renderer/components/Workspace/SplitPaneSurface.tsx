@@ -8,6 +8,7 @@ import HistoryPanel, {
 import TabTaskPlanPanel from './TabTaskPlanPanel';
 import { type TimelineInitialSourceSignal } from './Timeline';
 import PersistentPaneTimeline from './PersistentPaneTimeline';
+import ForkPendingTimeline from './ForkPendingTimeline';
 import ClaudeControlBar from './ClaudeControlBar';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
 import { useAgentLifecycle } from './useAgentLifecycle';
@@ -693,7 +694,7 @@ export default function SplitPaneSurface({
             границу узкого окна поверх соседнего; вертикальная остаётся, чтобы
             сдвинутая композером сцена не вылезала над верхней кромкой
             (см. sideOverlayOpen выше). */}
-        <div style={{ flex: 1, minHeight: 0, position: 'relative', ...(sideOverlayOpen ? { overflowX: 'visible' as const, overflowY: 'clip' as const } : { overflow: 'hidden' as const }) }}>
+        <div data-history-composer-boundary style={{ flex: 1, minHeight: 0, position: 'relative', ...(sideOverlayOpen ? { overflowX: 'visible' as const, overflowY: 'clip' as const } : { overflow: 'hidden' as const }) }}>
           {/* Transcript as the pane's MAIN surface. Mounted in EVERY pane that
               selected it — focus only gates global hotkeys, never content. */}
           {historySelected && historyHeavyAwake && (
@@ -827,6 +828,7 @@ export default function SplitPaneSurface({
           />
 
           {surfacesAwake && <TabTaskPlanPanel
+            bottomInset={historyControlsHeight}
             tabId={tabId}
             projectPath={projectPath}
             inputSurface={isAgentTab && (historySelected || sideHistoryOpen)
@@ -876,6 +878,7 @@ export default function SplitPaneSurface({
       </div>
 
       {/* ── The pane's own Timeline column at its right edge ── */}
+      <ForkPendingTimeline projectId={projectId} tabId={tabId} hasSession={showTimeline} />
       {showTimeline && timelineHeavyAwake && (
         <div style={{ pointerEvents: 'auto', height: '100%', flexShrink: 0, display: 'flex' }}>
           <PersistentPaneTimeline

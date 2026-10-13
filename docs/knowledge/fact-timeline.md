@@ -323,6 +323,31 @@ SC — другой источник: короткие model/mode/effort бер�
 выдуманную модель. Для открытия сохранённого local Research detail остаётся
 прежний source-header; новый research или браузер по label не запускаются.
 
+Превью доказанного SC completion/failure использует ту же безопасную JSON/JSONL/code
+проекцию и literal excerpt, что History (`fact-история-как-основная-поверхность::Компактный ответ
+External Research`). Цельный literal CodeBlock и whole escape с валидным JSON/
+JSONL отображаются как read-only code, не исполняются. В раскрытом popup остаётся один scroll-owner. Shared каталог
+model/effort coalesces только identical tab/session reads; late old-owner данные
+не применяются новому owner, неизменившиеся operational events не публикуют
+новую React model-проекцию. Сохранённый task label не выводит модель из текста.
+Body/result SC по marker не читается. Tool-подобная прозрачная строка History
+не заменяет собственную popup-композицию Timeline: его source-header по-прежнему
+открывает SC, а в History это отдельная стрелка справа. Однострочный rendered
+Markdown excerpt и нейтральный фон раскрытого тела — текущий контракт History;
+Timeline продолжает использовать своё превью/полный Markdown внутри popup.
+При появлении exact runId вне покрытия прежнего каталога тот же single-flight
+дочитывает metadata один раз; проверенный unknown/pruned не становится polling.
+
+Правые серии соседних Research-ответов сворачиваются только в History. Timeline
+сохраняет отдельные исходные SC-точки/UUID: переход к скрытому члену раскрывает
+его History-группу прежним адресным resolver, не навигирует к synthetic group key.
+
+Live/SENT сохраняют полный wire только после того же exact service-body
+offset/header/hash proof и `external-research/completion`, до обычного2048-char
+preview budget. Late proof обновляет ту же точку даже при прежнем body/time;
+canonical adoption остаётся identity-only. Обычные/unproved сообщения по-прежнему
+ограничены, native question-reply certificate и Goal filtering сохраняются.
+
 ### Auto-Scroll при продолжении сессии, возврате на вкладку и новых записях
 При нажатии «Продолжить» (claude-c / gemini-c) Timeline автоматически прокручивается к последним entries. **Также при каждом приземлении на вкладку/сессию** — переключился на другой таб и вернулся → скролл всегда внизу, **независимо** от того запущен ли Claude/Gemini/SDK или процесс мёртв (прямой запрос юзера: *«если я переключился на другую вкладку и переключился обратно, у меня скролл внизу, всегда внизу… даже если внутри терминала не активен, или SDK не активен»*). Дополнительный desktop-контракт: если transcript получил новую Timeline-запись (`entries.length` вырос), Timeline всегда мгновенно прыгает вниз. При раскрытии expanded Timeline через `Cmd+\` скролл тоже принудительно ставится вниз после layout-пересчёта: раскрытие меняет высоты entries, и старый `scrollTop` может фактически означать начало списка. Это не smooth-follow и не sticky-scroll по пикселям: metadata-only refresh с той же длиной не трогает ручной скролл, но новая запись и явное раскрытие имеют приоритет над ручным положением.
 - **Invisible Intent:** Без auto-scroll пользователь при продолжении длинной сессии (или просто вернувшись на таб) видит верх Timeline с красными (unreachable) entries, хотя актуальные записи внизу.
@@ -557,15 +582,24 @@ carrier / wrong kind / missing turn key. Один текст ошибки без
 для восстановления выбранного диапазона; обходить этот guard нельзя.
 
 Шрам05.10: в одном provider turn перед response/event-парой нового prompt
-может стоять отдельный response-only `Goal continued`. Timeline уже сохраняет
-его physical UUID, поэтому range rewrite обязан сохранить тот же адрес при
+может стоять отдельный response-only `Goal continued`. Canonical Timeline map
+сохраняет его physical UUID, поэтому range rewrite обязан сохранить тот же адрес при
 разборе pending-prefix. Нельзя прикреплять весь prefix к предыдущему ходу или
 считать только первый response-only input: это теряет видимые точки и даёт
 `canonical-carrier-missing` на неповреждённом rollout. Каждая такая запись
-остаётся отдельной адресуемой точкой; event/response alias следующего prompt
+остаётся отдельным физическим адресом; event/response alias следующего prompt
 по-прежнему одна точка. Общий turn ID и одинаковый текст не объединяют адреса.
 Это правило сохранённой истории, не delivery proof пользовательского Send и
 не разрешение native Rewind адресовать служебный Goal вместо реального prompt.
+
+Решение10.10 меняет только видимый rail: Goal continuation и точные native
+`user_goal` paused/active скрыты после canonical/live/handoff merge, notes и
+working-file проекций. Underlying map и turnIndex не удаляются/не перенумеровываются,
+поэтому диапазон через эту физическую запись сохраняет прежние rewrite guards.
+Live Goal не создаёт временную orange user point. Preview-компонент сохранён,
+но dormant; фиолетовый Target/type-chip не выдаёт Goal за user-message.
+History показывает компактные служебные строки; подробнее —
+`fact-история-как-основная-поверхность.md::Native Goal: служебные отметки, не user-баблы`.
 
 **Auto-extend на границу: только внутри delete-confirm, не на стадии выделения.** «Граница» здесь означает **реальный cross-file bridge** — `type === 'compact'` (compact_boundary) или `type === 'continued'` (Context Overflow Recovery). **Разница `sessionId` сама по себе границей не считается**: после `claude --resume` Claude CLI создаёт новый JSONL и переносит туда parent transcript с оригинальными sessionId — внутри одного файла остаётся целая parentUuid chain, разрезать её безопасно. См. CLAUDE.md anti-pattern «Разница sessionId в одном JSONL ≠ bridge». Если в выделение попадает bridge entry, сам range остаётся таким каким юзер его выделил — Copy и Edit-кнопки доступны как обычно. Backend `claude:copy-range` через `resolveSessionChain` корректно склеивает диапазон через границу для копирования; Edit сам валидирует и показывает toast если выбран несовместимый диапазон. Расширение `startIndex → 0` применяется **только** внутри delete-confirm popup'а: при клике на «Удалить историю» открывается красное подтверждение, текст разбит на две строки (`В выделении граница (compact / Plan Mode).\nУдалить N записей до самого начала?`), и effRange/effStartUuid пересчитываются на старте 0 перед вызовом `executeDeleteRange`. Мотивация: попытка вырезать «среднюю» часть через файл-граничный bridge сломала бы parentUuid цепочку между файлами и `resolveSessionChain` (см. `fix-claude-plan-mode-chain.md`) — для разрушительной операции это «всё или ничего». Для копирования и редактирования такого ограничения нет, и блокировать Copy/Edit ради защиты от Delete = ложный позитив (юзер хотел копию, получал предупреждение про удаление и не мог скопировать). **Что было до:** `range.startIndex = 0` ставился сразу при втором клике формирования range, в popup Copy/Edit прятались, оставался только warning + «Удалить историю». Реакция юзера на это поведение: *«я хочу выделить текст для копирования, блять»* — Copy-кнопки нет, выделение визуально расширено в начало timeline'а, юзер не понимает как скопировать выбранное. Фикс: «детект границы» (boolean) отделён от «применение границы» (extension до 0), второе срабатывает только в delete-confirm.
 

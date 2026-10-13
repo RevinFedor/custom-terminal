@@ -15,7 +15,7 @@
 
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactDOM from 'react-dom';
-import {Copy, Square} from 'lucide-react';
+import {Copy, Square, Pencil, Settings, Trash2} from 'lucide-react';
 import { useAgentSendPendingTabs } from '../../hooks/useAgentSendActivity';
 import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -408,7 +408,7 @@ function SpaceChip({
         const point = clampMenuToViewport({
           x: e.clientX,
           y: e.clientY,
-          width: 248,
+          width: 190,
           height: contextMenuEstimatedHeight({ rows: 5, dividers: 2 }),
           viewportWidth: window.innerWidth,
           viewportHeight: window.innerHeight,
@@ -477,7 +477,8 @@ function SpaceChip({
           onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); }}
           style={{
             ...CONTEXT_MENU_PANEL_STYLE,
-            minWidth: 248,
+            minWidth: 190,
+            width: 190,
             position: 'fixed',
             left: contextMenu.x,
             top: contextMenu.y,
@@ -500,7 +501,7 @@ function SpaceChip({
             }}
             style={{ ...CONTEXT_MENU_ROW_STYLE, ...workflowMenuItemStyle }}
           >
-            Переименовать
+            <Pencil size={14}/>Rename
           </button>
           <button
             type="button"
@@ -513,10 +514,10 @@ function SpaceChip({
             }}
             style={{ ...CONTEXT_MENU_ROW_STYLE, ...workflowMenuItemStyle }}
           >
-            Настройки workflow…
+            <Settings size={14}/>Settings
           </button>
           <button type="button" data-context-menu-row="ordinary" data-workflow-context-action="copy-path"
-            disabled={!defaultCwd} title={defaultCwd || 'Выберите директорию в настройках workflow'}
+            disabled={!defaultCwd} title={defaultCwd || 'Choose a directory in Settings'}
             className={defaultCwd?'hover:bg-white/10':''} style={{...CONTEXT_MENU_ROW_STYLE,...workflowMenuItemStyle,
               display:'flex',alignItems:'center',gap:6,opacity:defaultCwd?1:.45,cursor:defaultCwd?'pointer':'default'}}
             onClick={()=>{if(!defaultCwd)return;window.require('electron').clipboard.writeText(defaultCwd);setContextMenu(null);useUIStore.getState().showToast('Path copied','success');}}>
@@ -524,12 +525,12 @@ function SpaceChip({
           </button>
           <div data-workflow-stop-controls data-context-menu-row="ordinary"
             style={{ display: 'flex', borderTop: '1px solid #3a3a3a', borderBottom: '1px solid #3a3a3a' }}>
-            {([{ mode: 'idle', label: 'Стоп свободные', color: '#4ade80', title: 'Завершить свободные сессии workflow, без активной работы и ожидания MCP' },
-              { mode: 'all', label: 'Стоп все', color: '#f59e0b', title: 'Завершить все процессы workflow, включая работающие сессии' }] as const).map(action => (
+            {([{ mode: 'idle', label: 'Stop idle', color: '#4ade80', title: 'Stop idle sessions; keep active work and MCP waits' },
+              { mode: 'all', label: 'Stop all', color: '#f59e0b', title: 'Stop all workflow sessions, including active work' }] as const).map(action => (
               <button key={action.mode} type="button" data-workflow-context-action={`stop-${action.mode}`}
                 title={action.title} aria-label={action.title} disabled={stoppingSessions}
                 className="hover:bg-white/10" onClick={() => { void stopSessions(action.mode); }}
-                style={{ ...CONTEXT_MENU_ROW_STYLE, ...workflowMenuItemStyle, width: 'auto', flex: action.mode === 'idle' ? '1.4' : '1',
+                style={{ ...CONTEXT_MENU_ROW_STYLE, ...workflowMenuItemStyle, width: 'auto', flex: '1',
                   display: 'inline-flex', alignItems: 'center', gap: 5, color: action.color,
                   borderRight: action.mode === 'idle' ? '1px solid #3a3a3a' : undefined,
                   opacity: stoppingSessions ? .5 : 1, cursor: stoppingSessions ? 'default' : 'pointer' }}>
@@ -555,7 +556,7 @@ function SpaceChip({
               cursor: canDelete ? 'pointer' : 'not-allowed',
             }}
           >
-            Удалить workflow
+            <Trash2 size={14}/>Delete
           </button>
         </div>,
         document.body,
@@ -568,6 +569,7 @@ const workflowMenuItemStyle: React.CSSProperties = {
   width: '100%',
   display: 'flex',
   alignItems: 'center',
+  gap: 6,
   border: 'none',
   background: 'transparent',
   color: '#d6d6d6',

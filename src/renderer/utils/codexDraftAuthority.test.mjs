@@ -7,6 +7,21 @@ import {
 import { createRequire } from 'node:module';
 const { mergeCodexDraftAuthority } = createRequire(import.meta.url)('../../main/codex-draft-authority.js');
 
+test('Main and renderer keep unknown when only the positive screen is proven older', () => {
+  const main = { success: true, hasDraft: null, source: 'main-redraw', frameBlocker: 'synchronized-output-open',
+    frameIdentity: { generation: 'G', writeSeq: 5132 } };
+  const visual = { success: true, hasDraft: true, preview: 'Working context changed', source: 'cursor:5051',
+    frameIdentity: { generation: 'G', writeSeq: 5031 } };
+  for (const resolve of [mergeCodexDraftAuthority, resolveCodexDraftAuthority]) {
+    const value = resolve(main, visual);
+    assert.equal(value.success, false);
+    assert.equal(value.hasDraft, null);
+    assert.equal(value.frameBlocker, main.frameBlocker);
+    assert.equal(value.rendererPositiveIgnored, 'renderer-frame-behind');
+    assert.equal(resolve(main, { ...visual, frameIdentity: { generation: 'G', writeSeq: 5132 } }).hasDraft, true);
+  }
+});
+
 test('headless empty proof remains authoritative when floating terminal is hidden', () => {
   assert.deepEqual(
     resolveCodexDraftAuthority(

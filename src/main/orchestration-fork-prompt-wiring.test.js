@@ -16,7 +16,8 @@ test('existing Terminal MCP send and delegation tools accept server-resolved pro
   assert.match(mcp, /name: 'send_prompt'[\s\S]*?prompts:/);
   assert.match(web, /resolveSendPromptPresentation\(projectManager, body, taskPrompt\)/);
   assert.match(web, /deliveryIntent:\s*\{[\s\S]*?promptChips:/);
-  assert.match(web, /presentationSnapshot: promptPresentation\.promptChips\.length/);
+  assert.match(web, /let sendPresentation = structured\?\.presentationSnapshot \|\| \(promptPresentation\.promptChips\.length > 0/);
+  assert.match(web, /presentationSnapshot: sendPresentation/);
 });
 
 test('existing delegation targets keep their provider instead of inheriting the new-tab default', () => {
@@ -46,7 +47,7 @@ test('delegation errors and receipts remain structured across the MCP transport'
   );
   assert.match(
     transport,
-    /STRUCTURED_JSON_TOOLS\.has\(name\)[\s\S]*toolResult\.structuredContent = \{ ok: false, error: err\.message \}/,
+    /STRUCTURED_JSON_TOOLS\.has\(name\)[\s\S]*toolResult\.structuredContent = \{ \.\.\.err\.toolDetails, ok: false, error: err\.message \}/,
   );
   assert.match(mcp, /const STRUCTURED_JSON_TOOLS = new Set\([\s\S]*'delegate_to_session'/);
 });

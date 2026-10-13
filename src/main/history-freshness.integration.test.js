@@ -12,6 +12,7 @@ const url = require('node:url');
 const ts = require('typescript');
 const SQLite = require('better-sqlite3');
 const DatabaseManager = require('./database');
+const { createWorkflowOrganizationApi } = require('./workflow-organization-api');
 const { SessionTranscriptService } = require('./session-transcript-service');
 const codexData = require('./ipc/codex-data');
 const { HistoryReadClient } = require('./history-read-client');
@@ -36,7 +37,7 @@ const answer = text => ({ type: 'response_item', timestamp: '2026-10-04T00:00:02
   payload: { type: 'message', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text }] } });
 const encode = rows => rows.map(row => JSON.stringify(row)).join('\n') + '\n';
 
-async function harness(t, { provider = 'codex', worker = false } = {}) {
+async function harness(t, { provider = 'codex', worker = false, standalone = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshness-api-'));
   const db = new DatabaseManager({ existingConnection: new SQLite(path.join(dir, 'app.db')) }); db.initTables();
   db.db.pragma('journal_mode = WAL');
@@ -63,9 +64,20 @@ async function harness(t, { provider = 'codex', worker = false } = {}) {
     fs.writeFileSync(file, encode([{ type: 'session_meta', payload: { id: SID, cwd: dir } },
       { type: 'event_msg', timestamp: '2026-10-04T00:00:01Z', payload: { type: 'user_message', message: 'hello' } }, answer('answer')]));
   }
-  db.db.prepare('INSERT INTO projects(id,name,path) VALUES(?,?,?)').run('P', 'private', dir);
-  db.db.prepare(`INSERT INTO tabs(project_id,tab_id,name,cwd,tab_type,command_type,claude_session_id,codex_session_id)
-    VALUES('P','T','private',?,'terminal',?,?,?)`).run(dir, provider, provider === 'claude' ? SID : null, provider === 'codex' ? SID : null);
+  if (standalone) {
+    const workflow = createWorkflowOrganizationApi({ database: db });
+    workflow.bootstrap({ migrationId: 'fixture-migrate', mutationId: 'fixture-activate',
+      workspace: { activeSpaceId: 'work', spaces: [{ id: 'work', name: 'Work', projectIds: [], layout: {} }] } });
+    workflow.createTab({ mutationId: 'fixture-tab', tabId: 'T', cwd: dir, workflowId: 'work',
+      record: { name: 'private', tabType: 'terminal', commandType: provider,
+        claudeSessionId: provider === 'claude' ? SID : null, codexSessionId: provider === 'codex' ? SID : null } });
+    assert.equal(db.db.prepare('SELECT count(*) AS n FROM projects').get().n, 0,
+      'standalone read must not require a synthetic legacy Project');
+  } else {
+    db.db.prepare('INSERT INTO projects(id,name,path) VALUES(?,?,?)').run('P', 'private', dir);
+    db.db.prepare(`INSERT INTO tabs(project_id,tab_id,name,cwd,tab_type,command_type,claude_session_id,codex_session_id)
+      VALUES('P','T','private',?,'terminal',?,?,?)`).run(dir, provider, provider === 'claude' ? SID : null, provider === 'codex' ? SID : null);
+  }
   const client = worker ? new HistoryReadClient({ databasePath: db.db.name, cacheDirectory: path.join(dir, 'cache'), sessionsDir: dir, memoryBudgetMb: 64 }) : null;
   const api = codexData._api;
   const service = new SessionTranscriptService({ getMainWindow: () => null, webBroadcast: null,
@@ -128,8 +140,9 @@ async function harness(t, { provider = 'codex', worker = false } = {}) {
   };
 }
 
-for (const options of [{ provider: 'codex' }, { provider: 'codex', worker: true }, { provider: 'claude' }]) {
-  test(`${options.provider}/${options.worker ? 'worker' : 'direct'} actual HTTP metadata and unchanged bypass heavy History`, async t => {
+for (const options of [{ provider: 'codex' }, { provider: 'codex', worker: true }, { provider: 'claude' },
+  { provider: 'codex', standalone: true }, { provider: 'claude', standalone: true }]) {
+  test(`${options.provider}/${options.worker ? 'worker' : 'direct'}/${options.standalone ? 'standalone' : 'legacy'} actual HTTP metadata and unchanged bypass heavy History`, async t => {
     const h = await harness(t, options);
     const initial = await h.batch(); assert.equal(initial.status, 200, JSON.stringify(initial.data)); assert.equal(initial.data.snapshots[0].state, 'unknown');
     assert.equal(h.reads(), 0);

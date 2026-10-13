@@ -114,6 +114,10 @@ export const getSessionStartingPresentation = (state: SessionStartingState) => {
   }
 
   if (state.launchPreparing) {
+    if (state.launchPreparationPhase === 'forking-history') return {
+      isError: false, title: 'СОЗДАНИЕ ФОРКА…',
+      subtitle: 'Подготовка истории новой вкладки', detail: null,
+    };
     const repairingHistory = state.launchPreparationPhase === 'repairing-history';
     return {
       isError: false,
@@ -264,6 +268,8 @@ export function useAgentLifecycle({
   enabled: boolean;
 }): AgentLifecycleSummary | null {
   const target = useAgentLifecycleTarget(projectId, tabId);
+  const creatingFork = useWorkspaceStore(s => !!tabId
+    && s.openProjects.get(projectId)?.tabs.get(tabId)?.pendingOperation === 'Создание форка…');
   // «Прерванная сессия» (`wasInterrupted`) больше НЕ имеет собственной
   // lifecycle-презентации. Раньше она рисовала плашку «SESSION INTERRUPTED» и
   // красила статус-иконку терминала в янтарный — юзер (2026-09-11): прерванность
@@ -778,6 +784,8 @@ export function useAgentLifecycle({
         onRetry: canRetryStartupSettings ? handleRetry : undefined,
       };
     }
+    if (creatingFork) return { tabId, engine: target?.engine, kind: 'starting',
+      title: 'СОЗДАНИЕ ФОРКА…', description: 'Подготовка истории новой вкладки', spinner: true };
     return null;
-  }, [agentStopping, enabled, handleDismiss, handleRetry, sessionStarting, tabId]);
+  }, [agentStopping, creatingFork, enabled, handleDismiss, handleRetry, sessionStarting, tabId, target?.engine]);
 }

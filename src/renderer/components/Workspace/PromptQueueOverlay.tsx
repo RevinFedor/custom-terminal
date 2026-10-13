@@ -7,8 +7,8 @@ import { createPortal } from 'react-dom';
 import { AppWindow, ArrowDown, CheckSquare, ChevronLeft, ChevronRight, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Percent, Play, Plus, RefreshCw, RotateCcw, RotateCw, SlidersHorizontal, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import { AttachmentPreviewToolbar } from './AIConversation/PastedContentPreview';
+import { ComposerEditor } from '../ComposerEditor';
 import {
-  ComposerEditor,
   type ComposerEditorHandle,
   type ComposerInlineToken,
 } from '@gt-editor/markdown-editor';
@@ -21,6 +21,7 @@ import { runAfterActionModels } from '../../utils/runAfterActionModels';
 import { sendQueuedPromptNow } from '../../utils/runAfterSendNow';
 import { isTabBusyNow, signalPromptQueueDictationResolved, getPromptQueueRuntimeSnapshot, subscribePromptQueueRuntime } from '../../hooks/usePromptQueueRunner';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
+import { PROMPT_QUEUE_BUTTON_SIZE, PROMPT_QUEUE_RAIL_BORDER } from '../../utils/promptQueueChrome.mjs';
 import { queueItemDependencyTarget } from '../../utils/runAfterDependencyLayout.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -158,6 +159,245 @@ const DISABLED_PROMPT_BG = 'rgba(82, 18, 48, 0.48)';
 const DISABLED_PROMPT_BG_HOVER = 'rgba(104, 24, 60, 0.56)';
 const DISABLED_PROMPT_TEXT = '#d8c5cf';
 const OVERLAY_Z_INDEX = 120;           // above HistoryPanel (z:101)
+
+// This CSS is identical for every queue. Keep one document-owned sheet across
+// pane switches: mounting a queue must not invalidate all retained History styles.
+// As with HistoryPanel's sheet, a hot module replacement updates only changed text.
+const promptQueueStyleText = `
+        /* One hover target per removable row, including child controls and
+           their gaps. Layer the highlight over the state-owned background;
+           no React hover state or page-wide style changes are needed. */
+        .pq-middle-delete-target:hover {
+          background-image: linear-gradient(rgba(255,255,255,0.06), rgba(255,255,255,0.06));
+        }
+        @keyframes pq-run-armed-once {
+          0%, 100% { filter: brightness(1); }
+          38%      { filter: brightness(1.34); }
+        }
+        .pq-run-armed-once {
+          animation: pq-run-armed-once 1.2s ease-out 1;
+        }
+        /* First-chip hint blink: one red ring grows outward and fades. The
+           low-red resting state remains until the user arms Run after or
+           manually empties the queue. */
+        @keyframes pq-hint-blink {
+          0%   { box-shadow: 0 0 0 0    ${HINT_RED}cc; background: ${HINT_RED}33; }
+          70%  { box-shadow: 0 0 0 5px  ${HINT_RED}00; background: ${HINT_RED}11; }
+          100% { box-shadow: 0 0 0 0    ${HINT_RED}00; background: transparent; }
+        }
+        .pq-no-spin::-webkit-inner-spin-button,
+        .pq-no-spin::-webkit-outer-spin-button {
+          -webkit-appearance: none;
+          margin: 0;
+        }
+        .pq-no-spin {
+          -moz-appearance: textfield;
+          appearance: textfield;
+        }
+        .pq-image-marker-textarea::selection {
+          background: rgba(96, 165, 250, 0.30);
+        }
+        /* Replay button spinner — rotating ring shown while claude:append-input
+           IPC roundtrip is in flight (~400-800ms). Plain CSS rotation, no GPU
+           hit because the SVG is 10×10 — but background-color of the chip body
+           does NOT change, so the spinner stays detectable on video forensics. */
+        @keyframes pq-spin {
+          to { transform: rotate(360deg); }
+        }
+        .pq-spinner {
+          width: 10px; height: 10px; border-radius: 50%;
+          border: 1.5px solid currentColor;
+          border-right-color: transparent;
+          animation: pq-spin 1.35s linear infinite;
+          display: inline-block;
+        }
+        .pq-spin-icon {
+          animation: pq-spin 1.35s linear infinite;
+        }
+        .pq-rail-top-row {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 4px;
+        }
+        .pq-rail-button {
+          border: 1px solid #8a4a37;
+          background: #2a1a14;
+          color: ${TINT};
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          box-sizing: border-box;
+          width: ${PROMPT_QUEUE_BUTTON_SIZE}px;
+          min-width: ${PROMPT_QUEUE_BUTTON_SIZE}px;
+          max-width: ${PROMPT_QUEUE_BUTTON_SIZE}px;
+          height: ${PROMPT_QUEUE_BUTTON_SIZE}px;
+          min-height: ${PROMPT_QUEUE_BUTTON_SIZE}px;
+          max-height: ${PROMPT_QUEUE_BUTTON_SIZE}px;
+          flex: 0 0 ${PROMPT_QUEUE_BUTTON_SIZE}px;
+          /* Squares (was 999px circles): the rail is now a horizontal row
+             above the panel — square buttons read as one compact toolbar.
+             21 → 26px вместе с удалением отступов рейла: полоска занимает
+             столько же места, сколько занимала, но всё это место теперь —
+             кнопки, а не воздух вокруг них. */
+          border-radius: 5px;
+          padding: 0;
+          line-height: 1;
+          appearance: none;
+          transition: none;
+        }
+        /* Count owns only panel visibility: dim orange while the list is
+           hidden, full orange while it is visibly open (including hover
+           preview). Purple is reserved for the neighbouring Run button's
+           armed/executing state. Keep these selectors count-specific so a
+           future shared active class cannot repaint it purple again. */
+        .pq-rail-count.pq-rail-count-closed {
+          background: #211915;
+          border-color: #654236;
+          color: #a96852;
+        }
+        .pq-rail-count.pq-rail-count-open,
+        .pq-rail-count.pq-rail-count-closed:hover {
+          background: #3a241b;
+          border-color: ${TINT};
+          color: #f3d0c2;
+        }
+        .pq-rail-count.pq-rail-count-open:hover {
+          background: #43291f;
+          border-color: #e98b69;
+          color: #ffe1d5;
+        }
+        .pq-rail-run.pq-rail-active {
+          background: #2b2340;
+          border-color: #8b75d9;
+          color: #c4b5fd;
+        }
+        .pq-rail-button:hover {
+          background: #3a241b;
+          border-color: ${TINT};
+          color: #f3d0c2;
+        }
+        .pq-rail-run.pq-rail-active:hover {
+          background: #342a52;
+          border-color: #a78bfa;
+          color: #ddd6fe;
+        }
+        .pq-rail-button:focus {
+          outline: none;
+        }
+        .pq-rail-button:focus-visible {
+          outline: none;
+          box-shadow: 0 0 0 2px rgba(231, 106, 75, 0.38);
+        }
+        .pq-rail-button:active {
+          transform: translateY(1px);
+        }
+        /* Every border-mounted control owns a visible hover surface. Cursor
+           alone was ambiguous because Post / pencil / Loop / pencil shared one
+           tiny frame and only changed to pointer without showing the hit area. */
+        .pq-edge-action {
+          transition: none;
+        }
+        .pq-edge-action:hover {
+          box-shadow: inset 0 0 0 999px rgba(255,255,255,0.09);
+          filter: brightness(1.18);
+        }
+        .pq-edge-action:focus {
+          outline: none;
+        }
+        .pq-edge-action:focus-visible {
+          box-shadow: 0 0 0 2px rgba(167,139,250,0.36), inset 0 0 0 999px rgba(255,255,255,0.07);
+        }
+        .pq-editor-resize-handle {
+          background: transparent;
+          transition: none;
+        }
+        .pq-editor-resize-handle:hover {
+          background: ${TINT}18;
+        }
+        .pq-editor-resize-corner::after {
+          content: '';
+          position: absolute;
+          left: 3px;
+          bottom: 3px;
+          width: 6px;
+          height: 6px;
+          border-left: 1px solid rgba(255,255,255,0.22);
+          border-bottom: 1px solid rgba(255,255,255,0.22);
+          pointer-events: none;
+        }
+        .pq-chip::before {
+          content: '';
+          position: absolute;
+          inset: 0;
+          border-radius: inherit;
+          pointer-events: none;
+          opacity: 0;
+          transform: scaleX(0);
+          z-index: 0;
+        }
+        .pq-chip > * {
+          position: relative;
+          z-index: 1;
+        }
+        .pq-chip-enter {
+          animation: pq-chip-enter 520ms ease-out both;
+        }
+        .pq-chip-enter::before {
+          background: ${SAVE_GREEN}2e;
+          transform-origin: left center;
+          animation: pq-chip-green-wipe 520ms ease-out both;
+        }
+        .pq-chip-saved::before {
+          background: ${SAVE_GREEN}38;
+          transform-origin: left center;
+          animation: pq-chip-save-flash 520ms ease-out both;
+        }
+        .pq-chip-removing {
+          pointer-events: none;
+          will-change: clip-path, opacity, transform;
+          animation: pq-chip-remove 260ms ease-in forwards;
+        }
+        .pq-chip-removing::before {
+          background: ${DELETE_RED}32;
+          transform-origin: right center;
+          animation: pq-chip-delete-wipe 260ms ease-in forwards;
+        }
+        @keyframes pq-chip-enter {
+          0% { opacity: 0; transform: translateX(-10px); }
+          100% { opacity: 1; transform: translateX(0); }
+        }
+        @keyframes pq-chip-green-wipe {
+          0% { opacity: 1; transform: scaleX(0); }
+          55% { opacity: 1; transform: scaleX(1); }
+          100% { opacity: 0; transform: scaleX(1); }
+        }
+        @keyframes pq-chip-save-flash {
+          0% { opacity: 0; transform: scaleX(0); }
+          35% { opacity: 1; transform: scaleX(1); }
+          100% { opacity: 0; transform: scaleX(1); }
+        }
+        @keyframes pq-chip-delete-wipe {
+          0% { opacity: 0; transform: scaleX(0); }
+          40% { opacity: 1; transform: scaleX(1); }
+          100% { opacity: 0.15; transform: scaleX(1); }
+        }
+        @keyframes pq-chip-remove {
+          0% { opacity: 1; transform: translateX(0); clip-path: inset(0 0 0 0); }
+          100% { opacity: 0; transform: translateX(-10px); clip-path: inset(0 100% 0 0); }
+        }
+      `;
+let promptQueueStyle = document.getElementById('noted-prompt-queue-style') as HTMLStyleElement | null;
+if (!promptQueueStyle) {
+  promptQueueStyle = document.createElement('style');
+  promptQueueStyle.id = 'noted-prompt-queue-style';
+}
+if (promptQueueStyle.textContent !== promptQueueStyleText) {
+  promptQueueStyle.textContent = promptQueueStyleText;
+}
+if (!promptQueueStyle.isConnected) document.head.appendChild(promptQueueStyle);
+
 const FLOATING_OVERLAY_Z_INDEX = 130;  // editor/dropdowns above the rail/panel
 const INSERT_PROMPT_TITLE_MATCH_CHARS = 50;
 
@@ -475,6 +715,11 @@ export function PromptQueueOverlay({
   const [editorChipPreviewId, setEditorChipPreviewId] = useState<string | null>(null);
   const [editorTitle, setEditorTitle] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
+  // A new-draft window remains owned by + even after its first blur-save has
+  // materialized one queue item. Data identity and entry point are separate.
+  const [creatingPrompt, setCreatingPrompt] = useState(false);
+  const editorSessionRef = useRef(0);
+  const editorSavedToQueueRef = useRef(false);
   type SpecialPromptMode = 'post' | 'loop';
   // Special prompts reuse the queue editor surface but never become queue
   // chips. The explicit mode keeps blur-save ownership deterministic.
@@ -544,7 +789,6 @@ export function PromptQueueOverlay({
     id: string | null;
     specialMode: SpecialPromptMode | null;
     text: string;
-    images: number;
     chips: QueuedComposerChip[];
     imagePaths: QueuedImageRef[];
   } | null>(null);
@@ -561,6 +805,7 @@ export function PromptQueueOverlay({
     id: string | null;
     specialMode: SpecialPromptMode | null;
     text: string;
+    images: number;
     chips: QueuedComposerChip[];
     imagePaths: QueuedImageRef[];
     title: string;
@@ -829,6 +1074,7 @@ export function PromptQueueOverlay({
   }, [tabId]);
 
   const resetEditor = useCallback((options: { wakeAutoRun?: boolean } = {}) => {
+    editorSessionRef.current += 1;
     releaseEditorPayloadLock(options.wakeAutoRun !== false);
     if (editingId) setPreviewId(tabId, null);
     setEditorOpen(false);
@@ -838,6 +1084,7 @@ export function PromptQueueOverlay({
     setEditorChipPreviewId(null);
     setEditorTitle('');
     setEditingId(null);
+    setCreatingPrompt(false);
     setSpecialPromptMode(null);
     setEditorAutoFocus(false);
     setEditorFocusWithin(false);
@@ -1406,6 +1653,17 @@ export function PromptQueueOverlay({
           normalizedTitle,
           editorChips,
         );
+        // Pin the new editor to the created record synchronously, before
+        // another blur/outside callback can commit. Without adoption every
+        // close:false save kept id=null and inserted the same draft again.
+        const created = usePromptQueueStore.getState().getQueue(tabId).items.find(item => item.id === id);
+        if (!created) return false;
+        editorInitialRef.current = { id, specialMode: null, text: created.text,
+          images: created.images, chips: created.chips || [], imagePaths: created.imagePaths || [],
+          title: created.title, titleManual: !!created.titleManual };
+        editorLastWrittenRef.current = { id, specialMode: null, text: created.text,
+          chips: created.chips || [], imagePaths: created.imagePaths || [] };
+        setEditingId(id);
         const titleWillGenerate = !normalizedTitle && generateRunAfterTitle(id);
         if (!titleWillGenerate) markAppearing(id);
         changed = true;
@@ -1423,9 +1681,15 @@ export function PromptQueueOverlay({
         };
         releaseEditorPayloadLock(opts?.wakeAutoRun !== false);
       }
-      window.setTimeout(() => { committingRef.current = false; }, 0);
+      committingRef.current = false;
     }
   }, [addPrompt, editorChips, editorImagePaths, editorOpen, editorText, editorTitle, generateRunAfterTitle, markAppearing, markSaved, releaseEditorPayloadLock, removePrompt, resetEditor, tabId, updatePrompt, writeThroughEditorPayload]);
+
+  const saveEditorAndReturn = useCallback(() => {
+    if (!editorInitialRef.current) return;
+    commitEditor();
+    if (!editorInitialRef.current) editorSavedToQueueRef.current = true;
+  }, [commitEditor]);
 
   const prepareQueueClose = useCallback((reason?: 'outside') => {
     // Pointer dismissal is an editor exit, not a pin. Keep pending attachments
@@ -1620,11 +1884,11 @@ export function PromptQueueOverlay({
         });
         return;
       }
-      if (!id && !editingId) {
+      if (!id && creatingPrompt) {
         if (mode === 'pin') {
           if (editorPinned) {
             setPreviewId(tabId, null);
-            commitEditor();
+            saveEditorAndReturn();
             blurActiveElement();
             return;
           }
@@ -1645,6 +1909,8 @@ export function PromptQueueOverlay({
     }
     const anchor = anchorEditor(id, id ? 'list' : 'list-end');
     if (!anchor) return;
+    editorSessionRef.current += 1;
+    setCreatingPrompt(!id);
     editorDirtyFieldsRef.current = {
       text: false,
       chips: false,
@@ -1711,7 +1977,7 @@ export function PromptQueueOverlay({
     setEditorPinned(mode !== 'hover');
     setEditorAnchor(anchor);
     setEditorOpen(true);
-  }, [anchorEditor, blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isChipReopenSuppressed, isSpecialPromptMode, setPreviewId, suppressChipReopen, tabId]);
+  }, [anchorEditor, blurActiveElement, commitEditor, creatingPrompt, editingId, editorOpen, editorPinned, isChipReopenSuppressed, isSpecialPromptMode, saveEditorAndReturn, setPreviewId, suppressChipReopen, tabId]);
 
   // Same editor surface as queue items, but with a distinct durable owner.
   const openSpecialPromptEditor = useCallback((mode: SpecialPromptMode) => {
@@ -1722,6 +1988,8 @@ export function PromptQueueOverlay({
     if (editorOpen) commitEditor();
     const anchor = anchorEditor(undefined, 'panel');
     if (!anchor) return;
+    editorSessionRef.current += 1;
+    setCreatingPrompt(false);
     editorDirtyFieldsRef.current = {
       text: false,
       chips: false,
@@ -2862,7 +3130,8 @@ export function PromptQueueOverlay({
       const { owner, reason, point } = (event as CustomEvent).detail;
       if (!queueOwnsPopup(panelRef.current, owner)) return;
       if (point) previewPointerRef.current = point;
-      if (reason !== 'selection') hoverReturnRef.current.reset();
+      if (reason === 'save') hoverReturnRef.current.retain();
+      else if (reason !== 'selection') hoverReturnRef.current.reset();
       // Escape closes its own level; subsequent pointer movement resumes hover.
       if (reason !== 'escape') recheckQueueHoverRef.current(previewPointerRef.current);
     };
@@ -2944,10 +3213,11 @@ export function PromptQueueOverlay({
   useLayoutEffect(() => {
     if (wasClickEditorOpenRef.current && !clickEditorOpen) {
       const point = editorDismissPointRef.current;
-      notifyQueueClickChildClosed(editorLockTokenRef.current, point ? 'outside' : 'selection', point);
+      notifyQueueClickChildClosed(editorLockTokenRef.current,
+        editorSavedToQueueRef.current ? 'save' : point ? 'outside' : 'selection', point);
     }
     wasClickEditorOpenRef.current = clickEditorOpen;
-    if (clickEditorOpen) editorDismissPointRef.current = null;
+    if (clickEditorOpen) { editorDismissPointRef.current = null; editorSavedToQueueRef.current = false; }
   }, [clickEditorOpen]);
   useLayoutEffect(() => {
     const next = { action: !!metaActionsMenu, item: !!chipContextMenu };
@@ -3257,13 +3527,15 @@ export function PromptQueueOverlay({
             </ControlHint>
           </div>
 
-          <ControlHint label="Добавить prompt; ПКМ — Compact и другие действия" side="left">
+          <ControlHint label={editorOpen && creatingPrompt ? 'Сохранить prompt · ⌘Enter' : 'Добавить prompt; ПКМ — Compact и другие действия'} side="left">
             <button
               ref={metaActionsButtonRef}
               type="button"
               className="pq-edge-action"
               data-editor-trigger="add"
               aria-label="Добавить prompt вручную"
+              aria-pressed={editorOpen && creatingPrompt}
+              title={editorOpen && creatingPrompt ? 'Сохранить prompt · ⌘Enter' : 'Добавить prompt'}
               onClick={() => {
                 openEditor();
               }}
@@ -3276,9 +3548,9 @@ export function PromptQueueOverlay({
                 height: overview ? 20 : 22,
                 padding: 0,
                 borderRadius: 6,
-                border: `1px solid ${BORDER}`,
-                background: PANEL_BG,
-                color: TEXT_MUTED,
+                border: `1px solid ${editorOpen && creatingPrompt ? '#756394' : BORDER}`,
+                background: editorOpen && creatingPrompt ? '#30263e' : PANEL_BG,
+                color: editorOpen && creatingPrompt ? '#f1edf8' : TEXT_MUTED,
                 cursor: 'pointer',
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -3325,6 +3597,7 @@ export function PromptQueueOverlay({
               <div data-prompt-queue-dependency-target={runAfterTabId} data-prompt-queue-dependency-item="queue-target"
                 style={{ flex: 1, minWidth: 0 }}>
                 <RunAfterTabPicker tabId={tabId} autoRun={autoRun} runAfterTabId={runAfterTabId}
+                  workflowIconsOnly
                   showTaskMarkers={false}
                   setRunAfterTab={usePromptQueueStore.getState().setRunAfterTab}
                   hideTrigger={graphTargets?.has(runAfterTabId)}
@@ -3740,6 +4013,7 @@ export function PromptQueueOverlay({
                       data-prompt-queue-dependency-target={overview ? rowTarget : undefined}
                       data-prompt-queue-dependency-item={overview ? it.id : undefined}>
                       <RunAfterTabPicker
+                        workflowIconsOnly
                         showTaskMarkers={false}
                         hoverOwner={editorLockTokenRef.current}
                         zIndex={FLOATING_OVERLAY_Z_INDEX + 20}
@@ -3880,7 +4154,7 @@ export function PromptQueueOverlay({
             padding: 0,
             boxSizing: 'border-box',
             background: '#151515',
-            border: '1px solid #303030',
+            border: `${PROMPT_QUEUE_RAIL_BORDER}px solid #303030`,
             borderRadius: 8,
             display: 'flex',
             flexDirection: 'row',
@@ -4017,6 +4291,7 @@ export function PromptQueueOverlay({
         <div
           ref={metaActionsMenuRef}
           data-run-after-satellite="true"
+          data-dictation-owner-key={`run-after:${tabId}:${editorSessionRef.current}:${specialPromptMode || editingId || 'new'}`}
           data-run-after-hover-owner={editorLockTokenRef.current}
           data-run-after-click-open="true"
           data-prompt-queue-meta-actions
@@ -4495,7 +4770,11 @@ export function PromptQueueOverlay({
             const next = e.relatedTarget as Node | null;
             if (next && e.currentTarget.contains(next)) return;
             setEditorFocusWithin(false);
+            const session = editorSessionRef.current;
             window.setTimeout(() => {
+              // A delayed blur from the previous popup cannot save a newly
+              // opened item's draft using the old closure's body/title.
+              if (session !== editorSessionRef.current) return;
               const active = document.activeElement;
               if (active && editorRef.current?.contains(active)) return;
               commitEditor(editorPinned ? { close: false } : undefined);
@@ -4506,13 +4785,16 @@ export function PromptQueueOverlay({
             <>
               <input
                 ref={editorTitleInputRef}
-                autoFocus={editorAutoFocus}
+                autoFocus={editorAutoFocus && !creatingPrompt}
+                aria-label="Название prompt"
+                placeholder={creatingPrompt ? 'Title will be generated automatically' : undefined}
                 value={editorTitle}
                 onChange={(e) => {
                   editorDirtyFieldsRef.current.title = true;
                   setEditorTitle(e.target.value);
                 }}
                 onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.metaKey) { e.preventDefault(); e.stopPropagation(); saveEditorAndReturn(); return; }
                   if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
                   if (e.key === 'Escape') resetEditor();
                 }}
@@ -4668,11 +4950,11 @@ export function PromptQueueOverlay({
             <ComposerEditor
               ref={editorTextareaRef}
               className="pq-image-marker-textarea"
-              autoFocus={editorAutoFocus && isSpecialPromptMode}
+              autoFocus={editorAutoFocus && (isSpecialPromptMode || creatingPrompt)}
               value={editorText}
               tokens={editorComposerTokens}
               historyPayload={editorHistoryPayload}
-              historyOwnerKey={`run-after:${tabId}:${specialPromptMode || editingId || 'new'}`}
+              historyOwnerKey={`run-after:${tabId}:${specialPromptMode || (creatingPrompt ? 'new' : editingId) || 'new'}`}
               deriveHistoryPayload={deriveEditorHistoryPayload}
               historyPayloadEqual={runAfterComposerAggregateEqual}
               fontSize={promptQueueEditorFontSize}
@@ -4709,7 +4991,7 @@ export function PromptQueueOverlay({
                   ...editorDictationMarkerRanges,
                 ])) return;
                 if (e.key === 'Escape') resetEditor();
-                if (e.key === 'Enter' && e.metaKey) commitEditor();
+                if (e.key === 'Enter' && e.metaKey) { e.preventDefault(); e.stopPropagation(); saveEditorAndReturn(); }
               }}
               onAuxClickCapture={(event) => {
                 if (event.button !== 1 || !(event.target instanceof Element)) return;
@@ -4810,234 +5092,7 @@ export function PromptQueueOverlay({
         document.body,
       )}
 
-      {/* Pulse animation keyframes + hide number-input spinner.
-          The spinner adds ~16px to the right of the input which shifted layout
-          when the input narrowed under flex pressure (Run/after wrap bug). */}
-      <style>{`
-        /* One hover target per removable row, including child controls and
-           their gaps. Layer the highlight over the state-owned background;
-           no React hover state or page-wide style changes are needed. */
-        .pq-middle-delete-target:hover {
-          background-image: linear-gradient(rgba(255,255,255,0.06), rgba(255,255,255,0.06));
-        }
-        @keyframes pq-run-armed-once {
-          0%, 100% { filter: brightness(1); }
-          38%      { filter: brightness(1.34); }
-        }
-        .pq-run-armed-once {
-          animation: pq-run-armed-once 1.2s ease-out 1;
-        }
-        /* First-chip hint blink: one red ring grows outward and fades. The
-           low-red resting state remains until the user arms Run after or
-           manually empties the queue. */
-        @keyframes pq-hint-blink {
-          0%   { box-shadow: 0 0 0 0    ${HINT_RED}cc; background: ${HINT_RED}33; }
-          70%  { box-shadow: 0 0 0 5px  ${HINT_RED}00; background: ${HINT_RED}11; }
-          100% { box-shadow: 0 0 0 0    ${HINT_RED}00; background: transparent; }
-        }
-        .pq-no-spin::-webkit-inner-spin-button,
-        .pq-no-spin::-webkit-outer-spin-button {
-          -webkit-appearance: none;
-          margin: 0;
-        }
-        .pq-no-spin {
-          -moz-appearance: textfield;
-          appearance: textfield;
-        }
-        .pq-image-marker-textarea::selection {
-          background: rgba(96, 165, 250, 0.30);
-        }
-        /* Replay button spinner — rotating ring shown while claude:append-input
-           IPC roundtrip is in flight (~400-800ms). Plain CSS rotation, no GPU
-           hit because the SVG is 10×10 — but background-color of the chip body
-           does NOT change, so the spinner stays detectable on video forensics. */
-        @keyframes pq-spin {
-          to { transform: rotate(360deg); }
-        }
-        .pq-spinner {
-          width: 10px; height: 10px; border-radius: 50%;
-          border: 1.5px solid currentColor;
-          border-right-color: transparent;
-          animation: pq-spin 1.35s linear infinite;
-          display: inline-block;
-        }
-        .pq-spin-icon {
-          animation: pq-spin 1.35s linear infinite;
-        }
-        .pq-rail-top-row {
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 4px;
-        }
-        .pq-rail-button {
-          border: 1px solid #8a4a37;
-          background: #2a1a14;
-          color: ${TINT};
-          cursor: pointer;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          box-sizing: border-box;
-          width: 26px;
-          min-width: 26px;
-          max-width: 26px;
-          height: 26px;
-          min-height: 26px;
-          max-height: 26px;
-          flex: 0 0 26px;
-          /* Squares (was 999px circles): the rail is now a horizontal row
-             above the panel — square buttons read as one compact toolbar.
-             21 → 26px вместе с удалением отступов рейла: полоска занимает
-             столько же места, сколько занимала, но всё это место теперь —
-             кнопки, а не воздух вокруг них. */
-          border-radius: 5px;
-          padding: 0;
-          line-height: 1;
-          appearance: none;
-          transition: none;
-        }
-        /* Count owns only panel visibility: dim orange while the list is
-           hidden, full orange while it is visibly open (including hover
-           preview). Purple is reserved for the neighbouring Run button's
-           armed/executing state. Keep these selectors count-specific so a
-           future shared active class cannot repaint it purple again. */
-        .pq-rail-count.pq-rail-count-closed {
-          background: #211915;
-          border-color: #654236;
-          color: #a96852;
-        }
-        .pq-rail-count.pq-rail-count-open,
-        .pq-rail-count.pq-rail-count-closed:hover {
-          background: #3a241b;
-          border-color: ${TINT};
-          color: #f3d0c2;
-        }
-        .pq-rail-count.pq-rail-count-open:hover {
-          background: #43291f;
-          border-color: #e98b69;
-          color: #ffe1d5;
-        }
-        .pq-rail-run.pq-rail-active {
-          background: #2b2340;
-          border-color: #8b75d9;
-          color: #c4b5fd;
-        }
-        .pq-rail-button:hover {
-          background: #3a241b;
-          border-color: ${TINT};
-          color: #f3d0c2;
-        }
-        .pq-rail-run.pq-rail-active:hover {
-          background: #342a52;
-          border-color: #a78bfa;
-          color: #ddd6fe;
-        }
-        .pq-rail-button:focus {
-          outline: none;
-        }
-        .pq-rail-button:focus-visible {
-          outline: none;
-          box-shadow: 0 0 0 2px rgba(231, 106, 75, 0.38);
-        }
-        .pq-rail-button:active {
-          transform: translateY(1px);
-        }
-        /* Every border-mounted control owns a visible hover surface. Cursor
-           alone was ambiguous because Post / pencil / Loop / pencil shared one
-           tiny frame and only changed to pointer without showing the hit area. */
-        .pq-edge-action {
-          transition: none;
-        }
-        .pq-edge-action:hover {
-          box-shadow: inset 0 0 0 999px rgba(255,255,255,0.09);
-          filter: brightness(1.18);
-        }
-        .pq-edge-action:focus {
-          outline: none;
-        }
-        .pq-edge-action:focus-visible {
-          box-shadow: 0 0 0 2px rgba(167,139,250,0.36), inset 0 0 0 999px rgba(255,255,255,0.07);
-        }
-        .pq-editor-resize-handle {
-          background: transparent;
-          transition: none;
-        }
-        .pq-editor-resize-handle:hover {
-          background: ${TINT}18;
-        }
-        .pq-editor-resize-corner::after {
-          content: '';
-          position: absolute;
-          left: 3px;
-          bottom: 3px;
-          width: 6px;
-          height: 6px;
-          border-left: 1px solid rgba(255,255,255,0.22);
-          border-bottom: 1px solid rgba(255,255,255,0.22);
-          pointer-events: none;
-        }
-        .pq-chip::before {
-          content: '';
-          position: absolute;
-          inset: 0;
-          border-radius: inherit;
-          pointer-events: none;
-          opacity: 0;
-          transform: scaleX(0);
-          z-index: 0;
-        }
-        .pq-chip > * {
-          position: relative;
-          z-index: 1;
-        }
-        .pq-chip-enter {
-          animation: pq-chip-enter 520ms ease-out both;
-        }
-        .pq-chip-enter::before {
-          background: ${SAVE_GREEN}2e;
-          transform-origin: left center;
-          animation: pq-chip-green-wipe 520ms ease-out both;
-        }
-        .pq-chip-saved::before {
-          background: ${SAVE_GREEN}38;
-          transform-origin: left center;
-          animation: pq-chip-save-flash 520ms ease-out both;
-        }
-        .pq-chip-removing {
-          pointer-events: none;
-          will-change: clip-path, opacity, transform;
-          animation: pq-chip-remove 260ms ease-in forwards;
-        }
-        .pq-chip-removing::before {
-          background: ${DELETE_RED}32;
-          transform-origin: right center;
-          animation: pq-chip-delete-wipe 260ms ease-in forwards;
-        }
-        @keyframes pq-chip-enter {
-          0% { opacity: 0; transform: translateX(-10px); }
-          100% { opacity: 1; transform: translateX(0); }
-        }
-        @keyframes pq-chip-green-wipe {
-          0% { opacity: 1; transform: scaleX(0); }
-          55% { opacity: 1; transform: scaleX(1); }
-          100% { opacity: 0; transform: scaleX(1); }
-        }
-        @keyframes pq-chip-save-flash {
-          0% { opacity: 0; transform: scaleX(0); }
-          35% { opacity: 1; transform: scaleX(1); }
-          100% { opacity: 0; transform: scaleX(1); }
-        }
-        @keyframes pq-chip-delete-wipe {
-          0% { opacity: 0; transform: scaleX(0); }
-          40% { opacity: 1; transform: scaleX(1); }
-          100% { opacity: 0.15; transform: scaleX(1); }
-        }
-        @keyframes pq-chip-remove {
-          0% { opacity: 1; transform: translateX(0); clip-path: inset(0 0 0 0); }
-          100% { opacity: 0; transform: translateX(-10px); clip-path: inset(0 100% 0 0); }
-        }
-      `}</style>
+
     </>
   );
 }

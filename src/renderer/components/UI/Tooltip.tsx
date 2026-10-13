@@ -8,6 +8,9 @@ interface TooltipProps {
   children: React.ReactElement;
   side?: Side;
   align?: 'center' | 'start';
+  // Opt-in collision bounds from the trigger's nearest matching ancestor.
+  // Other callers retain the viewport boundary.
+  boundarySelector?: string;
   // Optional delay in ms (default 0 = instant — the whole point of this component).
   delay?: number;
   // Allow disabling without removing call sites; falsy content also disables.
@@ -43,14 +46,15 @@ if (typeof window !== 'undefined') {
   });
 }
 
-function useCmdHeld(): boolean {
-  const [v, setV] = useState(cmdHeld);
-  useEffect(() => {
+function useCmdHeld(relevant: boolean): boolean {
+  const [v, setV] = useState(false);
+  useLayoutEffect(() => {
+    setV(relevant && cmdHeld);
+    if (!relevant) return;
     cmdSubscribers.add(setV);
-    setV(cmdHeld);
     return () => { cmdSubscribers.delete(setV); };
-  }, []);
-  return v;
+  }, [relevant]);
+  return relevant && v;
 }
 
 const PADDING = 6; // viewport edge padding
@@ -79,6 +83,7 @@ export default function Tooltip({
   children,
   side = 'top',
   align = 'center',
+  boundarySelector,
   delay = 0,
   disabled = false,
   always = false,
@@ -103,9 +108,10 @@ export default function Tooltip({
   // Tiny delay before hiding when leaving the trigger — lets the cursor cross
   // the GAP onto the tooltip without it disappearing under the pointer.
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const cmd = useCmdHeld();
-
   const isInactive = disabled || !content;
+  // Only the pointed/open tooltip consumes the physical key in React. Hidden
+  // retained controls must not all render merely to keep their tooltip closed.
+  const cmd = useCmdHeld(!always && !isInactive && (hovering || inTip || visible));
   // Gate: by default tooltip only appears while Cmd is held. `always` opts out.
   const allowedToShow = always || cmd;
 
@@ -204,12 +210,18 @@ export default function Tooltip({
   // Measure & position once the tip mounts. Re-measure on scroll/resize while visible.
   useLayoutEffect(() => {
     if (!visible || !triggerRef.current || !tipRef.current) { setPos(null); return; }
+    const boundary = boundarySelector ? triggerRef.current.closest(boundarySelector) : null;
 
     const measure = () => {
       const t = triggerRef.current?.getBoundingClientRect();
       const p = tipRef.current?.getBoundingClientRect();
       if (!t || !p) return;
       const vw = window.innerWidth, vh = window.innerHeight;
+      const bounds = boundary?.getBoundingClientRect();
+      const leftBound = Math.max(PADDING, (bounds?.left ?? 0) + PADDING);
+      const rightBound = Math.min(vw - PADDING, (bounds?.right ?? vw) - PADDING);
+      const topBound = Math.max(PADDING, (bounds?.top ?? 0) + PADDING);
+      const bottomBound = Math.min(vh - PADDING, (bounds?.bottom ?? vh) - PADDING);
 
       const trySide = (s: Side): { left: number; top: number; ok: boolean } => {
         let left = 0, top = 0, ok = true;
@@ -217,29 +229,29 @@ export default function Tooltip({
           case 'top':
             left = t.left + t.width / 2 - p.width / 2;
             top = t.top - p.height - GAP;
-            if (top < PADDING) ok = false;
+            if (top < topBound) ok = false;
             break;
           case 'bottom':
             left = t.left + t.width / 2 - p.width / 2;
             top = t.bottom + GAP;
-            if (top + p.height > vh - PADDING) ok = false;
+            if (top + p.height > bottomBound) ok = false;
             break;
           case 'left':
             left = t.left - p.width - GAP;
             top = align === 'start' ? t.top : t.top + t.height / 2 - p.height / 2;
-            if (left < PADDING) ok = false;
+            if (left < leftBound) ok = false;
             break;
           case 'right':
             left = t.right + GAP;
             top = align === 'start' ? t.top : t.top + t.height / 2 - p.height / 2;
-            if (left + p.width > vw - PADDING) ok = false;
+            if (left + p.width > rightBound) ok = false;
             break;
           default:
             break;
         }
         // Clamp horizontal/vertical bounds.
-        left = Math.max(PADDING, Math.min(left, vw - p.width - PADDING));
-        top = Math.max(PADDING, Math.min(top, vh - p.height - PADDING));
+        left = Math.max(leftBound, Math.min(left, rightBound - p.width));
+        top = Math.max(topBound, Math.min(top, bottomBound - p.height));
         return { left, top, ok };
       };
 
@@ -272,13 +284,16 @@ export default function Tooltip({
     };
 
     measure();
+    const observer = boundary ? new ResizeObserver(measure) : null;
+    if (boundary) observer?.observe(boundary);
     window.addEventListener('scroll', measure, true);
     window.addEventListener('resize', measure);
     return () => {
+      observer?.disconnect();
       window.removeEventListener('scroll', measure, true);
       window.removeEventListener('resize', measure);
     };
-  }, [visible, side, align, content]);
+  }, [visible, side, align, content, boundarySelector]);
 
   // Compose handlers with the child's existing ones so we don't override them.
   const child = children as React.ReactElement<any>;

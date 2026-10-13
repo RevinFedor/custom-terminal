@@ -470,6 +470,40 @@ async function virtualFixture(t, parentExtra = []) {
     entryUuids: [], snapshotComplete: true, isDirect: true, origin: 'app', lineageManifest: manifest });
   return { ...f, get client() { return f.client; }, parentFile, parentRecords, childRecords, manifest };
 }
+for (const warm of [false, true]) test('catalog query uses the real persisted frozen ancestor and preserves a failed lineage reason, warm=' + warm, async t => {
+  const f = await virtualFixture(t);
+  let history;
+  if (warm) history = await f.client.call('getHistory', f.payload);
+  else assert.equal(f.client.worker, undefined, 'catalog must be the first RPC of a new worker');
+  const query = { ...f.payload, query: 'PARENT ANSWER', matchesPerSession: 3 };
+  const result = await f.client.call('searchCatalogCandidate', query);
+  assert.equal(result.success, true);
+  assert.equal(result.totalIterations, 1);
+  assert.equal(result.bestMatches.length, 1);
+  history ||= await f.client.call('getHistory', f.payload);
+  assert.equal(result.bestMatches[0].entryUuid, history.entries.find(row => row.role === 'user').uuid);
+  assert.equal(result.bestMatches[0].turnIndex, 0);
+  const before = f.client.diagnosticCounters.retries;
+  await fs.writeFile(f.parentFile, encode(f.parentRecords).replace('PARENT-BEFORE', 'PARENT-BROKEN'));
+  await assert.rejects(f.client.call('searchCatalogCandidate', query), error => {
+    assert.equal(error.code, 'history_lineage_unresolved');
+    assert.ok(error.lineageReason, 'typed lineage error survives worker transport');
+    return true;
+  });
+  assert.equal(f.client.diagnosticCounters.retries, before);
+});
+
+test('catalog retains the operation-source refusal for an unfinished virtual child tail', async t => {
+  const f = await virtualFixture(t);
+  await fs.appendFile(f.filePath, '{"type":"response_item","payload":');
+  await assert.rejects(f.client.call('searchCatalogCandidate', { ...f.payload, query: 'PARENT' }), error => {
+    assert.equal(error.code, 'history_lineage_unresolved');
+    assert.equal(error.lineageReason, 'child-tail-incomplete');
+    return true;
+  });
+  assert.equal(f.client.diagnosticCounters.retries, 0);
+});
+
 for (const change of ['replace', 'ctime', 'explicit-growth']) test('warm virtual prefix rejects changed parent: ' + change, async t => {
   const f = await virtualFixture(t);
   const first = await f.client.call('getHistory', f.payload);

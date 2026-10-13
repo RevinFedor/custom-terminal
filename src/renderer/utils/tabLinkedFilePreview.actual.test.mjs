@@ -30,7 +30,7 @@ function fixture(){
       const id=path.includes('/a.md')?'a':'b',read=reads.get(id);read.arrived.resolve();return read.reply.promise;}}})}});
   const open=id=>module.exports.openTabLinkedFile('p',linked.collectTabLinkedFileTree(ws.getState().openProjects,id)[0],()=>ws.getState().openTabById(id));
   const release=id=>reads.get(id).reply.resolve({success:true,content:'# Synthetic '+id});
-  return {ws,ui,calls,reads,open,release,close:module.exports.closeTabLinkedFile};
+  return {ws,ui,calls,reads,open,release,close:module.exports.closeTabLinkedFile,openSidebar:module.exports.openSidebarLinkedFile};
 }
 
 test('middle close returns the exact owner while retaining its file link',async()=>{
@@ -55,4 +55,35 @@ test('old read cleanup cannot clear the newer owner cancellation guard',async()=
   const f=fixture(),a=f.open('a');await f.reads.get('a').arrived.promise;
   const b=f.open('b');await f.reads.get('b').arrived.promise;f.release('a');assert.equal(await a,false);
   assert.equal(await f.close('b'),true);f.release('b');assert.equal(await b,false);assert.equal(f.ui.getState().filePreview,null);
+});
+test('linked file placed in Inbox still previews in its owner window without moving either placement',async()=>{
+  const f=fixture(),layout=[{windowId:'main-window',projectId:'p',tabId:'a',tabs:[{projectId:'p',tabId:'a'},{projectId:'p',tabId:'b'}]}];
+  const spaces=[{id:'one',layout:{splitPanes:layout}},
+    {id:'inbox',layout:{splitPanes:[{windowId:'inbox-window',projectId:'p',tabId:'file-a',tabs:[{projectId:'p',tabId:'file-a'}]}]}}];
+  const members={a:{workflowId:'one',revision:1},'file-a':{workflowId:'inbox',revision:2}};
+  f.ws.setState({splitPanes:layout,spaces,tabWorkflowMembership:members});
+  const before=structuredClone({spaces,layout,members});
+  const opened=f.openSidebar('p','file-a');await f.reads.get('a').arrived.promise;f.release('a');
+  assert.equal(await opened,true);assert.equal(f.ws.getState().activeSpaceId,'one');
+  assert.deepEqual(f.calls.filter(c=>c[0]==='navigate'),[['navigate','a']]);
+  assert.equal(f.ui.getState().filePreview.ownerTabId,'a');assert.equal(f.ui.getState().filePreview.sourceTabId,'file-a');
+  assert.deepEqual({spaces:f.ws.getState().spaces,layout:f.ws.getState().splitPanes,members:f.ws.getState().tabWorkflowMembership},before);
+  const count=f.calls.length;assert.equal(await f.openSidebar('p','file-a'),true);
+  assert.equal(f.ui.getState().filePreview,null);assert.equal(f.calls.length,count);
+});
+test('nested linked file resolves its AI owner; a vanished owner cannot become standalone navigation',async()=>{
+  const f=fixture(),tabs=f.ws.getState().openProjects.get('p').tabs;
+  tabs.set('nested',{id:'nested',tabType:'file',visualParentTabId:'file-a',filePath:'/fixture/a.md'});
+  const opened=f.openSidebar('p','nested');await f.reads.get('a').arrived.promise;f.release('a');assert.equal(await opened,true);
+  assert.equal(f.ui.getState().filePreview.ownerTabId,'a');assert.equal(f.ui.getState().filePreview.sourceTabId,'nested');
+  tabs.delete('a');const count=f.calls.length;assert.equal(await f.openSidebar('p','nested'),false);assert.equal(f.calls.length,count);
+  assert.equal(f.openSidebar('p','b'),null);
+});
+test('owner unlink or navigation during file read cannot publish a late preview',async()=>{
+  for(const change of ['unlink','navigate']) {
+    const f=fixture(),opened=f.openSidebar('p','file-a');await f.reads.get('a').arrived.promise;
+    if(change==='unlink')f.ws.getState().openProjects.get('p').tabs.get('file-a').visualParentTabId='b';
+    else f.ws.setState({activeSpaceId:'elsewhere'});
+    f.release('a');assert.equal(await opened,false);assert.equal(f.ui.getState().filePreview,null);
+  }
 });

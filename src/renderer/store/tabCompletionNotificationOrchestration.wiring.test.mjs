@@ -19,7 +19,7 @@ function block(source, start, end) {
 test('tab completion bell waits when own loader ends before orchestration completion', () => {
   const setAiBusy = block(
     workspaceStore,
-    'setAiBusy: (tabId, busy, reason) => {',
+    'setAiBusy: (tabId, busy, reason, goalWork) => {',
     '\n\n  setSdkProcessAlive:',
   );
   const blockedAt = setAiBusy.indexOf('tabCompletionDeferralReason(tabId, successful)');
@@ -46,7 +46,7 @@ test('an armed Run after silences the bell until the queue owes nothing', () => 
 
   const setAiBusy = block(
     workspaceStore,
-    'setAiBusy: (tabId, busy, reason) => {',
+    'setAiBusy: (tabId, busy, reason, goalWork) => {',
     '\n\n  setSdkProcessAlive:',
   );
   // Deferring must return early WITHOUT settling — settling would delete the

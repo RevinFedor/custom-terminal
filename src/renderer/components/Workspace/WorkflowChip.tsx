@@ -4,6 +4,8 @@ import { PROJECT_CARD_MAX_H } from '../../constants/layout';
 import { Inbox } from 'lucide-react';
 import { INBOX_WORKFLOW_ID } from '../../utils/workflowMembership.mjs';
 
+export const WORKFLOW_ICON_CHIP_WIDTH = PROJECT_CARD_MAX_H;
+
 type Props = Omit<HTMLAttributes<HTMLElement>, 'children'> & {
   as?: 'button' | 'span';
   workflowId: string;
@@ -18,6 +20,7 @@ type Props = Omit<HTMLAttributes<HTMLElement>, 'children'> & {
   disabled?: boolean;
   unplaced?: boolean;
   showIdentity?: boolean;
+  iconOnly?: boolean;
   children?: ReactNode;
 };
 
@@ -26,7 +29,7 @@ type Props = Omit<HTMLAttributes<HTMLElement>, 'children'> & {
 export default forwardRef<HTMLElement, Props>(function WorkflowChip({
   as = 'button', workflowId, label, icon, selected, pending = false, hovered,
   pointerHeld = false, swapTarget = false, navigationTarget = false, disabled = false,
-  unplaced = false, showIdentity = true, children, style, onMouseEnter, onMouseLeave, ...props
+  unplaced = false, showIdentity = true, iconOnly = false, children, style, onMouseEnter, onMouseLeave, ...props
 }, ref) {
   const [localHover, setLocalHover] = useState(false);
   const fontSize = useUIStore(s => s.projectTabsFontSize);
@@ -35,6 +38,7 @@ export default forwardRef<HTMLElement, Props>(function WorkflowChip({
   const inbox = workflowId === INBOX_WORKFLOW_ID;
   const Element = as;
   return <Element {...props} ref={ref as React.Ref<HTMLButtonElement & HTMLSpanElement>}
+    aria-label={props['aria-label'] || (iconOnly ? label : undefined)}
     {...(as === 'button' ? { type: 'button' as const, disabled, 'aria-pressed': selected } : {})}
     data-workflow-chip={workflowId}
     data-workflow-inbox={inbox ? '1' : undefined}
@@ -55,6 +59,7 @@ export default forwardRef<HTMLElement, Props>(function WorkflowChip({
         background:active ? 'rgba(240,144,24,0.2)' : hover ? 'rgba(240,144,24,0.14)' : 'rgba(240,144,24,0.06)',
         borderColor:active ? 'rgba(240,144,24,0.65)' : 'rgba(240,144,24,0.28)',
       }:{}),
+      ...(iconOnly ? { width: WORKFLOW_ICON_CHIP_WIDTH, padding: 0, justifyContent: 'center' } : {}),
       transform: pointerHeld ? 'scale(0.985)' : undefined, opacity: disabled ? 0.52 : 1, transition: 'none', ...style }}>
     {showIdentity && <>
       {inbox ? <Inbox data-workflow-inbox-icon aria-hidden size={16} style={{flexShrink:0,color:'#f0a34a'}}/> : icon ? <img data-workflow-icon={workflowId} src={icon} alt="" draggable={false}
@@ -65,7 +70,7 @@ export default forwardRef<HTMLElement, Props>(function WorkflowChip({
           background: 'rgba(255,255,255,0.06)', color: '#9b9ba1', fontSize: 9, fontWeight: 700 }}>
           {unplaced ? '' : label.trim().slice(0, 1).toUpperCase() || 'W'}
         </span>}
-      <span data-workflow-chip-label style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+      {!iconOnly && <span data-workflow-chip-label style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>}
     </>}
     {children}
   </Element>;

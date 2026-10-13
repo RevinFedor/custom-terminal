@@ -78,6 +78,7 @@ function harness(t, { holdInner = null } = {}) {
     terminals: new Map([[tabId, term]]),
     terminalCommandState: new Map([[tabId, { runSeq: 7, isRunning: false }]]),
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-epoch']]),
+    getTerminalStopRevision: () => 0,
     terminalProjects: new Map([[tabId, request.cwd]]),
     aiStoppingTabs: new Set(), codexLastRunCommandPayload: new Map(),
     codexLaunchAcceptancePending: new Map(), codexKnownSessions: new Map(),
@@ -101,6 +102,7 @@ function harness(t, { holdInner = null } = {}) {
     },
   });
   vm.runInContext([
+    'captureAgentLaunchFence', 'withAgentLaunchFence', 'assertAgentSendLaunchCurrent', 'returnAgentSendLaunchRefusal',
     'getTerminalLifecycleGeneration', 'getCodexWriterProofSnapshot',
     'getCodexResumeSourceLeaseForTab', 'getCodexResumeReadIdentityLeaseForTab',
     'currentCodexAcceptedResumeSourceProof', 'admitAiLifecycleLaunch',
@@ -210,8 +212,8 @@ test('an owner replaced during awaited admission cannot reuse the pre-await proo
   gate.resolve();
   const result = await resultPromise;
   assert.equal(result.joined, undefined);
-  assert.equal(result.error, 'shell_not_idle');
-  assert.equal(h.innerCalls.length, 1);
+  assert.equal(result.error, 'agent_launch_cancelled');
+  assert.equal(h.innerCalls.length, 0, 'the existing terminal/Stop fence now rejects before the shell executor');
   assert.equal(h.writes.length, 0);
 });
 

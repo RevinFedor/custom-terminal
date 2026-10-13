@@ -12,6 +12,8 @@ function cloneTask(task, subtasks = task.subtasks || []) {
     subtasks: subtasks.map(cloneSubtask),
   };
   if (typeof task.statusId === 'string' && task.statusId) next.statusId = task.statusId;
+  if (typeof task.shortTitle === 'string') next.shortTitle = task.shortTitle;
+  if (typeof task.body === 'string') next.body = task.body;
   return next;
 }
 
@@ -74,6 +76,7 @@ export function formatTaskPlanTransfer(items) {
   return (Array.isArray(items) ? items : [])
     .flatMap((task) => [
       `- ${String(task.title || '').trim()}`,
+      ...(task.body ? [task.body] : []),
       ...(Array.isArray(task.subtasks)
         ? task.subtasks.map((subtask) => `  - ${String(subtask.title || '').trim()}`)
         : []),

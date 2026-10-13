@@ -3,9 +3,13 @@ import { createRoot } from 'react-dom/client';
 import Timeline from '../../src/renderer/components/Workspace/Timeline';
 import { useWorkspaceStore } from '../../src/renderer/store/useWorkspaceStore';
 import { useUIStore } from '../../src/renderer/store/useUIStore';
+import { installUIActionDiagnostics, captureUIAction } from '../../src/renderer/utils/uiPerformanceDiagnostics.mjs';
 import '../../packages/claude-blocks/src/blocks.css';
 
 const fixture = (window as any).modifierFixture;
+installUIActionDiagnostics({emit() {},notify() {}});
+fixture.actions=[];
+for(const type of ['keydown','keyup'])window.addEventListener(type,event=>fixture.actions.push(captureUIAction(event)),true);
 const owners = 12, count = 600, projectId = 'private-modifier', cwd = '/synthetic-modifier';
 const tabs = Array.from({ length: owners }, (_, index) => ({ id: 'owner-' + index,
   name: 'Owner ' + index, cwd, commandType: 'codex', tabType: 'file', codexSessionId: 'session-' + index }));

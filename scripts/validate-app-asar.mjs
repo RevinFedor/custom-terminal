@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { validatePackagedNodePty } from './node-pty-binary.mjs';
 
 const require = createRequire(import.meta.url);
 const asar = require('@electron/asar');
@@ -11,7 +12,7 @@ const asar = require('@electron/asar');
 // Code signing authenticates the archive as a blob, not its file table.
 // If a source grows between the packer's stat and stream passes, later
 // offsets can point into the previous file even in a valid signed bundle.
-export async function validateAsarArchive(archivePath) {
+export async function validateAsarArchive(archivePath, { requirePatchedNodePty = true } = {}) {
   const { header, headerSize } = asar.getRawHeader(archivePath);
   const archive = await stat(archivePath);
   const payloadStart = 8 + headerSize;
@@ -80,11 +81,15 @@ export async function validateAsarArchive(archivePath) {
       }
     }
   }
-  return { checked, bytes };
+  // Enabled by default in both `build` and the installer's release/stage checks,
+  // before host quit. Generic integrity test fixtures explicitly opt out.
+  const nodePty = requirePatchedNodePty ? validatePackagedNodePty(asar, archivePath, packedFiles) : undefined;
+  return { checked, bytes, nodePty };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (!process.argv[2]) throw new Error('Usage: validate-app-asar.mjs <app.asar>');
   const result = await validateAsarArchive(path.resolve(process.argv[2]));
   console.log('[NotedInstall:asar] verified files=' + result.checked + ' bytes=' + result.bytes);
+  console.log('[NotedInstall:node-pty] compiled fix marker verified arch=' + result.nodePty.arch + ' sha256=' + result.nodePty.sha256);
 }

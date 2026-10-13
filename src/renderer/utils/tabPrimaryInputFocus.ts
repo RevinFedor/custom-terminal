@@ -40,14 +40,13 @@ let pendingPrimaryInputFocus: PendingPrimaryInputFocus | null = null;
 let pendingPresentationObserver: MutationObserver | null = null;
 
 function tabPresentationReady(tabId: string): boolean {
-  const wrappers = document.querySelectorAll<HTMLElement>('[data-terminal-pane-wrapper]');
-  for (const wrapper of wrappers) {
-    if (wrapper.dataset.terminalPaneWrapper !== tabId) continue;
-    return wrapper.dataset.terminalSurfacePresented === '1'
-      && wrapper.dataset.paneFocusIsolated !== '1'
-      && wrapper.getAttribute('aria-hidden') !== 'true';
-  }
-  return false;
+  // TerminalArea owns this stable per-tab ID. Read the current node on every
+  // check, including pending wakes after a retained wrapper is replaced.
+  const wrapper = document.getElementById(`terminal-pane-wrapper:${tabId}`);
+  if (!wrapper?.isConnected || wrapper.dataset.terminalPaneWrapper !== tabId) return false;
+  return wrapper.dataset.terminalSurfacePresented === '1'
+    && wrapper.dataset.paneFocusIsolated !== '1'
+    && wrapper.getAttribute('aria-hidden') !== 'true';
 }
 
 function clearPendingPresentationFocus(): void {

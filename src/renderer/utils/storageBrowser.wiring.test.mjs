@@ -11,18 +11,14 @@ const browser = fs.readFileSync(path.join(renderer, 'components', 'Dashboard', '
 const uiStore = fs.readFileSync(path.join(renderer, 'store', 'useUIStore.ts'), 'utf8');
 const main = fs.readFileSync(path.join(renderer, '..', 'main', 'main.js'), 'utf8');
 
-test('Storage is mounted after MCP servers and before active AI process cards', () => {
+test('workflow Home keeps one Storage view with the existing details host', () => {
   assert.match(dashboard, /import StorageBrowser from '\.\/StorageBrowser'/);
-  const render = dashboard.slice(dashboard.indexOf('const mcpOrphans'));
-  const mcp = render.indexOf('data-mcp-processes');
-  const storage = render.indexOf('<StorageBrowser />', mcp);
-  const ai = render.indexOf('data-ai-processes', storage);
-  assert.ok(mcp >= 0 && storage > mcp && ai > storage);
+  assert.equal((dashboard.match(/<StorageBrowser\b/g) || []).length, 1);
+  assert.match(dashboard, /<StorageBrowser detailsHost=\{wide\?detailsHost:null\}/);
+  assert.match(dashboard, /data-dashboard-root/);
+  assert.match(dashboard, /data-home-create-workflow/);
+  assert.match(dashboard, /className="home-detail-host"/);
   assert.doesNotMatch(dashboard, /!isProcessesLoading\s*&&\s*<StorageBrowser/);
-  assert.match(dashboard, /data-mcp-processes[\s\S]*?border-y border-\[#292929\]/);
-  assert.match(dashboard, /data-ai-processes[\s\S]*?border-y border-\[#292929\]/);
-  assert.match(dashboard, /MCP servers detected on this computer/);
-  assert.match(dashboard, /Claude processes detected on this computer/);
 });
 
 test('Home storage uses global tooltips, provider filter, retention and opaque delete IPC', () => {

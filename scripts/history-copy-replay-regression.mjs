@@ -51,6 +51,21 @@ function privatePreload() {
     availableFormats: () => Object.keys(item).map(type => 'text/' + (type === 'text' ? 'plain' : type)) };
   const realRequire = window.require;
   window.require = name => name === 'electron' ? { ...electron, clipboard } : realRequire(name);
+  // Native CodeMirror copy uses ClipboardEvent, whereas our paste keymap uses
+  // the injected Electron adapter. Join both paths into this one memory sink;
+  // prevent the native event from writing the user's OS clipboard.
+  window.copyReplayNativeCopies = 0;
+  window.addEventListener('copy', event => {
+    window.copyReplayNativeCopies++;
+    if (Array.from(event.clipboardData?.types || []).includes('text/plain')) {
+      clipboard.writeText(event.clipboardData.getData('text/plain'));
+    } else if (!event.defaultPrevented) {
+      // Model Blink's ordinary selected-text copy at its native clipboard seam.
+      // This selection belongs only to the synthetic private fixture.
+      clipboard.writeText(window.getSelection()?.toString() || '');
+    }
+    event.preventDefault();
+  });
 }
 
 try {
@@ -118,6 +133,83 @@ try {
   await page.waitForFunction(() => window.copyReplayFixture.snapshot().text === 'ordinary paste');
   assert.equal(await band.count(), 3);
   result.checks.push('ordinary short plain-text paste preserves existing chips');
+  for (const value of ['abc', '111', 'xyz', '111']) {
+    await page.keyboard.press('Meta+a'); await page.keyboard.insertText(value);
+    await page.keyboard.press('Meta+a');
+    const nativeBefore = await page.evaluate(() => window.copyReplayNativeCopies);
+    await page.keyboard.press('Meta+c');
+    if (await page.evaluate(() => window.copyReplayNativeCopies) === nativeBefore) {
+      // Offscreen CDP keys do not run the platform menu command. Execute that
+      // native edit command in this exact owned webContents; the memory sink
+      // above still receives the real CodeMirror ClipboardEvent.
+      await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.copy());
+    }
+    await page.keyboard.press('Meta+v');
+    assert.equal(await editor.innerText(), value);
+    assert.equal(await page.evaluate(() => window.require('electron').clipboard.readText()), value);
+  }
+  result.checks.push('rapid SelectAll/Copy/Paste uses the latest three-character selection four times');
+  await page.evaluate(() => window.copyReplayFixture.reset('empty'));
+  await editor.click();
+  await page.evaluate(() => window.copyReplayFixture.bitmapPaste());
+  await page.waitForFunction(() => window.copyReplayFixture.imageRequestPending === true);
+  await page.waitForFunction(() => window.copyReplayFixture.snapshot().text.includes('[Image saving…]'));
+  await editor.getByText('[Image saving…]', {exact:true}).waitFor({state:'visible'});
+  const phases = await page.evaluate(() => window.copyReplayFixture.actions.filter(Boolean).flatMap(action => action.phases));
+  assert.ok(phases.some(phase => phase.name === 'history-image-pending-applied' && phase.applied === true));
+  assert.ok(phases.some(phase => phase.name === 'composer-clipboard-read-text' && phase.chars === 3));
+  const shortcuts = await page.evaluate(() => window.copyReplayFixture.actions.filter(Boolean).map(action => action.shortcutClass));
+  assert.ok(shortcuts.includes('Copy') && shortcuts.includes('Paste') && shortcuts.includes('SelectAll'));
+  await page.screenshot({path:path.join(artifact,'image-pending.png')});
+  await page.evaluate(() => window.copyReplayFixture.finishImage());
+  await page.waitForFunction(() => !window.copyReplayFixture.snapshot().text.includes('[Image saving…]'));
+  result.checks.push('image pending DOM precedes IPC completion; classified paste and clipboard phases survive');
+  const answer = page.locator('[data-entry-uuid="previous-answer"]').first();
+  await answer.click();
+  await answer.evaluate(node => {
+    const walker=document.createTreeWalker(node,NodeFilter.SHOW_TEXT);
+    let text;
+    while((text=walker.nextNode()))if(text.textContent?.includes('Previous response.')){
+      const start=text.textContent.indexOf('Previous response.');
+      const range=document.createRange();range.setStart(text,start);range.setEnd(text,start+8);
+      const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);return;
+    }
+    throw Error('private answer text node missing');
+  });
+  await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].webContents.copy());
+  assert.equal(await page.evaluate(()=>window.require('electron').clipboard.readText()),'Previous');
+  await editor.click();await page.keyboard.press('Meta+a');await page.keyboard.press('Meta+v');
+  assert.equal(await editor.innerText(),'Previous');
+  const selectedCopy=await page.evaluate(()=>window.copyReplayFixture.actions.filter(action=>action?.event==='copy').at(-1));
+  assert.equal(selectedCopy.clipboardState.selectedChars,8);
+  assert.equal(selectedCopy.clipboardState.trusted,true);
+  await page.waitForFunction(id=>window.copyReplayFixture.outcomes.some(record=>record.actionId===id&&record.finalDefaultPrevented===true),selectedCopy.id);
+  for(const [step,value] of ['abc','111'].entries()) {
+    await answer.click();
+    await answer.evaluate((node,value)=>{
+      const walker=document.createTreeWalker(node,NodeFilter.SHOW_TEXT);let text;
+      while((text=walker.nextNode()))if(text.textContent?.includes('Previous response.')){
+        const start=text.textContent.indexOf(value);const range=document.createRange();
+        range.setStart(text,start);range.setEnd(text,start+value.length);
+        const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);return;
+      }
+      throw Error('private same-length History selection missing');
+    },value);
+    await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].webContents.copy());
+    await editor.click();await page.keyboard.press('Meta+a');
+    await page.evaluate(step=>window.copyReplayFixture.armOracle(step),step);
+    await page.keyboard.press('Meta+v');
+    assert.equal(await editor.innerText(),value);
+    const action=await page.evaluate(()=>window.copyReplayFixture.actions.filter(action=>action?.event==='copy').at(-1));
+    assert.equal(action.clipboardState.selectedChars,3);assert.equal(action.clipboardState.trusted,true);
+    await page.waitForFunction(id=>window.copyReplayFixture.outcomes.some(record=>record.actionId===id&&record.finalDefaultPrevented===true),action.id);
+  }
+  const oracle=logs.filter(line=>line.startsWith('[Perf:ClipboardOracle]')).map(line=>JSON.parse(line.slice(line.indexOf('{'))));
+  assert.equal(oracle.length,2);assert.ok(oracle.every(record=>record.matchesExpected===true));
+  assert.equal(oracle[1].matchesPrevious,false);
+  result.oracle=oracle;
+  result.clipboardOutcomes=await page.evaluate(()=>window.copyReplayFixture.outcomes);
+  result.checks.push('native selected History copy and two distinct same-length selections reach the existing paste read; final outcomes use the original action ID');
   const trusted = await page.evaluate(() => window.copyReplayFixture.trusted);
   assert.ok(trusted.some(event => event.type === 'keydown' && event.key === 'v' && event.trusted));
   assert.ok(trusted.some(event => event.type === 'click' && event.trusted));
@@ -127,6 +219,8 @@ try {
   result.status = 'PASS';
 } catch (error) {
   result.status = 'FAIL'; result.error = error.stack; process.exitCode = 1;
+  result.failedDiagnostics = await page?.evaluate(() => ({ actions:window.copyReplayFixture?.actions,
+    nativeCopies:window.copyReplayNativeCopies, calls:window.copyReplayFixture?.calls })).catch(() => null);
   await page?.screenshot({ path: path.join(artifact, 'failure.png') }).catch(() => {});
 } finally {
   if (app) {

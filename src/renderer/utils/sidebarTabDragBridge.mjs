@@ -201,7 +201,7 @@ export const getSidebarTabDragProjectionKey = (value = snapshot) => {
   ]);
 };
 export const getSidebarTabDragCursorChip = (value = snapshot) => {
-  if (!value?.active || value.metaKey !== true || !value.sourceNode) return null;
+  if (!value?.active || !value.sourceNode) return null;
   return {
     sessionId: value.sessionId,
     rootTabId: value.rootTabId,
@@ -210,6 +210,17 @@ export const getSidebarTabDragCursorChip = (value = snapshot) => {
     clientX: Number(value.clientX) || 0,
     clientY: Number(value.clientY) || 0,
   };
+};
+// Cmd changes hierarchy, not the representation of a drag. The outline owns
+// local Y/X preview; only a matching external receiver needs a cursor payload.
+export const sidebarTabDragUsesCursorChip = (value, pane, navigation, hostExternalTarget) => {
+  if (!value?.active) return false;
+  if (typeof hostExternalTarget === 'boolean') return hostExternalTarget;
+  const source = pane?.source;
+  const sameSource = pane?.active && source?.owner === 'sidebar'
+    && source.rootTabId === value.rootTabId
+    && (!source.gestureId || source.gestureId === value.sessionId);
+  return !!(sameSource && (pane.target || (navigation?.source === 'sidebar' && navigation.target)));
 };
 export const subscribeSidebarTabDrag = (listener) => {
   listeners.add(listener);

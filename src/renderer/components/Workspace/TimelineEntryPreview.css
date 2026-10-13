@@ -6,6 +6,7 @@
 .timeline-preview-kind--compact, .timeline-preview-kind--continued { color: #dfaa55; background: #a67c0018; }
 .timeline-preview-kind--mcp { color: #c084fc; background: #a78bfa18; }
 .timeline-preview-kind--system { color: #c084fc; background: #a78bfa18; }
+.timeline-preview-kind--goal, .timeline-preview-kind--goal-status { color: #a78bfa; background: #a78bfa18; }
 .timeline-preview-kind--loop, .timeline-preview-kind--continue { color: #8f8d88; background: rgba(114, 90, 159, 0.10); }
 .timeline-entry-preview--loop, .timeline-entry-preview--continue { background-color: rgba(114, 90, 159, 0.08); border-radius: 4px; }
 .timeline-preview-kind--agent { color: #a5b4fc; background: #818cf818; }
@@ -29,6 +30,7 @@
 .timeline-preview-viewport--expanded { overflow-y: auto; overflow-x: hidden; max-height: min(62vh, 640px); scrollbar-width: thin; scrollbar-gutter: stable; margin-right: -5px; padding-right: 5px; }
 .timeline-preview-contents { position: relative; min-width: 0; overflow-wrap: anywhere; }
 .timeline-preview-prompt-collapsed { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #e5e5e5; }
+.timeline-preview-research-collapsed { white-space: pre-wrap; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .timeline-preview-prompt-collapsed[role=button]:hover { color: #fff; }
 .timeline-entry-preview--loop .timeline-preview-prompt-collapsed,
 .timeline-entry-preview--continue .timeline-preview-prompt-collapsed,

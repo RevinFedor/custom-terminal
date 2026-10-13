@@ -137,6 +137,14 @@ function mergeCodexDraftAuthority(headlessState, rendererState, {
   }
 
   if (hasDefinitiveDraftState(rendererState) && rendererState.hasDraft === true) {
+    // Unknown current Main input is NOT empty. But a proven older screen is
+    // not current positive evidence either (4196: transcript row5031 vs5132).
+    // Keep unknown + the existing frame wake/deadline; never authorize paste
+    // or trigger an unnecessary exact grab solely from this stale hint.
+    if (rendererDraftFrameRejection(headlessState, rendererState) === 'renderer-frame-behind') {
+      return { ...headlessState, success: false, hasDraft: null, preview: '',
+        authority: 'unknown', rendererPositiveIgnored: 'renderer-frame-behind' };
+    }
     return {
       ...rendererState,
       success: true,

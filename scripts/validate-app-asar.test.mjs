@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import asar from '@electron/asar';
-import { validateAsarArchive } from './validate-app-asar.mjs';
+import { validateAsarArchive as validateNotedArchive } from './validate-app-asar.mjs';
+
+// These fixtures exercise generic ASAR integrity, not a packaged Noted app.
+const validateAsarArchive = archive => validateNotedArchive(archive, { requirePatchedNodePty: false });
 
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'noted-asar-integrity-'));

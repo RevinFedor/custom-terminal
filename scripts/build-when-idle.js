@@ -5,8 +5,9 @@
 // Polls the PRODUCTION app's local web API (GET /api/active-loaders) and waits
 // until every tab across every project has gone idle — no live Claude (PTY or
 // SDK), no busy Gemini, no restart-after-owned shell process. Then it runs
-// `npm run build:install`, which gracefully quits the app, rebuilds, reinstalls
-// and reopens it.
+// `npm run build:install` prepares the candidate first. A second fresh idle
+// observation approves its existing control-channel gate immediately before
+// Quit, replacement and reopening.
 //
 // "Active" merges the exact main-process runtime Maps with the durable
 // orchestration store. This includes inherited child work and an exact
@@ -24,12 +25,13 @@
 //   IDLE_CONFIRM=2         consecutive idle polls required before building
 //                          (smooths short runtime-signal transitions)
 //   NO_BUILD=1             just watch + report, never trigger the build
-//   PORT=7878              skip discovery, force this port (127.0.0.1)
+//   PORT=7878              select this verified production port (127.0.0.1)
 
 const http = require('http');
 const { spawn } = require('child_process');
+const { randomUUID } = require('crypto');
 const {
-  findProdServer: findDiscoveredProdServer,
+  inspectProdServer: inspectDiscoveredProdServer,
   readToken,
 } = require('./noted-prod-api');
 
@@ -49,9 +51,10 @@ function now() { return new Date().toTimeString().slice(0, 8); }
 // hundreds of stale web-server-<pid>.json files (the app never deletes them on
 // crash) — so we filter to: PID still alive AND its process command points at
 // the installed /Applications app (excludes electron-vite dev instances on
-// 7979). Newest updatedAt wins if somehow more than one prod copy runs.
-function findProdServer() {
-  return findDiscoveredProdServer({ forcePort: FORCE_PORT });
+// 7979). Discovery/ps errors remain unknown. Newest updatedAt wins if somehow
+// more than one verified prod copy runs; PORT must still match that prod.
+function inspectProdServer() {
+  return inspectDiscoveredProdServer({ forcePort: FORCE_PORT });
 }
 
 // A dedicated sentinel for "this running build predates the feature": the old
@@ -71,6 +74,7 @@ function getActiveLoaders(port, token) {
       res.on('end', () => {
         if (res.statusCode === 401) return reject(new Error('unauthorized (token mismatch)'));
         if (res.statusCode === 404) return reject(new EndpointMissingError('endpoint missing'));
+        if (res.statusCode >= 400) return reject(new Error('active-loaders HTTP ' + res.statusCode));
         let parsed = null;
         try { parsed = JSON.parse(buf); } catch {
           return reject(new Error('bad JSON (HTTP ' + res.statusCode + '): ' + buf.slice(0, 80)));
@@ -145,105 +149,131 @@ function printActiveList(snap) {
   for (const l of snap.loaders) feed('  ' + dot(l.status) + ' ' + loaderLabel(l));
 }
 
-function runBuild() {
-  process.stdout.write('\n' + C.green + C.bold + '▶ all idle — running `npm run build:install`' + C.reset + '\n\n');
-  const child = spawn('npm', ['run', 'build:install'], { stdio: 'inherit', cwd: process.cwd() });
-  child.on('exit', (code) => process.exit(code == null ? 1 : code));
-  child.on('error', (e) => { console.error(C.red + 'failed to start build: ' + e.message + C.reset); process.exit(1); });
+function cancelledError() { return Object.assign(new Error('observer cancelled'), { code: 'INSTALL_CANCELLED' }); }
+
+function waitForIdle(token, { inspect = inspectProdServer, read = getActiveLoaders,
+  pollMs = POLL_MS, idleConfirm = IDLE_CONFIRM, report = feed, progress = () => {}, signal,
+  setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  return new Promise((resolve, reject) => {
+    let previous = new Map(), first = true, streak = 0, lastError = null, serverKey = null, timer, settled = false;
+    const finish = (error, proof) => {
+      if (settled) return; settled = true; clearTimer(timer); signal?.removeEventListener('abort', abort);
+      error ? reject(error) : resolve(proof);
+    };
+    const abort = () => finish(cancelledError());
+    signal?.addEventListener('abort', abort, { once: true });
+    const retry = () => { if (!settled) timer = setTimer(() => tick().catch(error => finish(error)), pollMs); };
+    const unknown = reason => {
+      streak = 0;
+      if (reason !== lastError) report(C.yellow + '⚠ ' + now() + ' poll: ' + reason + ' (retrying)' + C.reset);
+      lastError = reason; progress({ status: 'unknown', reason }); retry();
+    };
+    const tick = async () => {
+      if (settled || signal?.aborted) return abort();
+      let observed;
+      try { observed = inspect(); } catch { return unknown('process discovery failed'); }
+      if (observed?.status === 'absent') {
+        report(C.yellow + 'Noted Terminal (prod) is not running — nothing to wait for.' + C.reset);
+        return finish(null, { status: 'absent' });
+      }
+      if (observed?.status !== 'found' || !observed.server) return unknown(observed?.reason || 'process state unknown');
+      const server = observed.server;
+      const key = String(server.pid) + ':' + server.port;
+      if (serverKey !== key) { streak = 0; serverKey = key; }
+      let snap;
+      try { snap = await read(server.port, token); }
+      catch (error) {
+        if (settled || signal?.aborted) return abort();
+        if (error instanceof EndpointMissingError) return finish(Object.assign(error, { exitCode: 2 }));
+        return unknown(error.message);
+      }
+      if (settled || signal?.aborted) return abort();
+      if (snap?.error) return unknown('active-loaders unavailable');
+      snap = projectBuildInstallBlockers(snap);
+      if (!snap || typeof snap.idle !== 'boolean' || !Array.isArray(snap.loaders)) return unknown('active-loaders unavailable');
+      lastError = null;
+      const current = new Map(snap.loaders.map(loader => [loader.tabId, loaderLabel(loader)]));
+      if (first) {
+        first = false; report(C.gray + 'Connected — ' + (server.pid ? 'pid ' + server.pid : server.cmd) + ' · port ' + server.port + C.reset);
+        if (snap.idle) report(C.green + '✓ no install blockers' + C.reset);
+        else { report(C.bold + String(snap.count) + ' active' + C.reset + C.gray + ' — build waits until 0:' + C.reset);
+          for (const loader of snap.loaders) report('  ' + dot(loader.status) + ' ' + loaderLabel(loader)); }
+      } else {
+        for (const [id, label] of current) if (!previous.has(id)) report(C.yellow + '＋ ' + now() + '  active  ' + C.reset + label);
+        for (const [id, label] of previous) if (!current.has(id)) report(C.green + '✓ ' + now() + '  idle    ' + C.reset + label);
+      }
+      previous = current;
+      streak = snap.idle === true ? streak + 1 : 0;
+      progress({ status: snap.idle ? 'idle' : 'busy', pid: server.pid, count: snap.count });
+      if (streak >= idleConfirm) return finish(null, { status: 'idle', pid: server.pid, port: server.port });
+      retry();
+    };
+    void tick().catch(error => finish(error));
+  });
+}
+
+function runBuild(token, { spawnBuild = spawn, observe = waitForIdle, report = feed,
+  stdout = process.stdout, stderr = process.stderr, signal, nonce = 'build-i-obs-' + randomUUID(), cwd = process.cwd(), env = process.env } = {}) {
+  report('▶ initial idle confirmed — preparing `npm run build:install`; neighbours are checked again before Quit');
+  return new Promise((resolve, reject) => {
+    const child = spawnBuild('npm', ['run', 'build:install'], {
+      stdio: ['pipe', 'pipe', 'pipe'], cwd, env: { ...env, NOTED_INSTALL_IDLE_ACK_ID: nonce },
+    });
+    let buffer = '', prepared = false, completed = false;
+    const stage = new AbortController();
+    const abort = () => {
+      stage.abort();
+      child.stdin?.end('cancel ' + nonce + '\n');
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    child.stdin?.on('error', error => { stage.abort(); report('Install control channel failed: ' + error.message); });
+    child.stderr?.on('data', chunk => stderr.write(chunk));
+    child.stdout?.on('data', chunk => {
+      stdout.write(chunk); buffer += chunk.toString();
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).replace(/\r$/, ''); buffer = buffer.slice(newline + 1);
+        if (line !== '[NotedInstall:ready-to-quit] ' + nonce || prepared || completed || signal?.aborted) continue;
+        prepared = true;
+        report('▶ candidate ready — rechecking active sessions before Quit');
+        void observe(token, { signal: stage.signal, progress: () => {
+          if (!completed && !stage.signal.aborted && !child.stdin?.destroyed) child.stdin.write('waiting ' + nonce + '\n');
+        } }).then(proof => {
+          if (completed || stage.signal.aborted || child.stdin?.destroyed) return;
+          if (!['idle', 'absent'].includes(proof?.status)) throw new Error('idle not confirmed');
+          report('▶ final install approval: ' + proof.status + (proof.pid ? ' · pid ' + proof.pid : ''));
+          child.stdin.write('install ' + nonce + '\n');
+        }).catch(error => {
+          report('Install not approved: ' + error.message); child.stdin?.end();
+        });
+      }
+      if (buffer.length > 16384) buffer = buffer.slice(-16384);
+    });
+    child.once('error', error => { completed = true; stage.abort(); signal?.removeEventListener('abort', abort); reject(error); });
+    child.once('exit', code => { completed = true; stage.abort(); signal?.removeEventListener('abort', abort); resolve(code == null ? 1 : code); });
+  });
 }
 
 async function main() {
   const token = readToken();
-  if (!token) {
-    console.error(C.red + 'No Noted Terminal web token found.' + C.reset);
-    console.error(C.gray + 'Is Noted Terminal installed and launched at least once?' + C.reset);
-    process.exit(1);
+  if (!token) throw new Error('No Noted Terminal web token found.');
+  const controller = new AbortController();
+  const cancel = () => { controller.abort(); feed('cancellation requested'); };
+  process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
+  try {
+    feed(C.bold + C.green + 'build:i-obs' + C.reset + ' — waiting for running work (Ctrl+C to cancel)');
+    await waitForIdle(token, { signal: controller.signal });
+    if (NO_BUILD) { feed('idle confirmed (NO_BUILD=1 — not building)'); return; }
+    process.exitCode = await runBuild(token, { signal: controller.signal });
+  } catch (error) {
+    if (error instanceof EndpointMissingError) console.error('Installed app lacks /api/active-loaders. A one-time explicit build:install is required.');
+    else if (error.code !== 'INSTALL_CANCELLED') console.error(String(error.stack || error));
+    process.exitCode = error.code === 'INSTALL_CANCELLED' ? 130 : error.exitCode || 1;
+  } finally {
+    process.off('SIGINT', cancel); process.off('SIGTERM', cancel);
   }
-
-  let prevActive = new Map(); // tabId → loaderLabel (to diff appeared vs idle)
-  let firstSnap = true;
-  let idleStreak = 0;
-  let lastErrShown = null;    // de-dupe repeated transient poll errors
-
-  feed(C.bold + C.green + 'build:i-obs' + C.reset + C.gray + ' — waiting for Noted Terminal to go idle, then `npm run build:install`' + C.reset);
-  if (NO_BUILD) feed(C.gray + 'NO_BUILD=1 — will report idle and exit without building.' + C.reset);
-  feed(C.gray + 'Discovering production Noted Terminal…  (Ctrl+C to cancel)' + C.reset);
-
-  const tick = async () => {
-    const server = findProdServer();
-    if (!server) {
-      // No live prod instance. If it was running and is now gone, or never ran,
-      // there is nothing left to wait for → idle by definition.
-      feed(C.yellow + 'Noted Terminal (prod) is not running — nothing to wait for.' + C.reset);
-      if (NO_BUILD) { feed(C.gray + 'NO_BUILD=1 — exiting.' + C.reset); process.exit(0); }
-      return runBuild();
-    }
-
-    let snap = null, lastErr = null;
-    try { snap = await getActiveLoaders(server.port, token); }
-    catch (e) {
-      if (e instanceof EndpointMissingError) {
-        // The installed app is older than this feature. Bootstrap it once.
-        feed(C.yellow + 'The installed Noted Terminal predates /api/active-loaders.' + C.reset);
-        feed(C.gray + 'Run a one-time ' + C.reset + C.bold + 'npm run build:install' + C.reset + C.gray + ' to ship the endpoint,' + C.reset);
-        feed(C.gray + 'then ' + C.reset + C.bold + 'npm run build:i-obs' + C.reset + C.gray + ' will work on every later rebuild.' + C.reset);
-        process.exit(2);
-      }
-      lastErr = e.message;
-    }
-
-    if (lastErr) {
-      // Transient (timeout / app reloading). Don't spam — print once per change.
-      if (lastErr !== lastErrShown) { feed(C.yellow + '⚠ ' + now() + ' poll: ' + lastErr + ' (retrying)' + C.reset); lastErrShown = lastErr; }
-      idleStreak = 0;              // a failed poll is NEVER idle — keep waiting
-      return setTimeout(tick, POLL_MS);
-    }
-    lastErrShown = null;
-    snap = projectBuildInstallBlockers(snap);
-
-    // First successful snapshot: print the full active list once as the baseline.
-    if (firstSnap) {
-      firstSnap = false;
-      const pidStr = server.pid ? 'pid ' + server.pid : server.cmd;
-      feed(C.gray + 'Connected — ' + pidStr + ' · port ' + server.port + C.reset);
-      if (snap.idle) feed(C.green + '✓ no install blockers' + C.reset);
-      else printActiveList(snap);
-    } else {
-      // Delta announcements against the previous poll.
-      const cur = new Map(snap.loaders.map((l) => [l.tabId, loaderLabel(l)]));
-      for (const [tid, label] of cur) {
-        if (!prevActive.has(tid)) feed(C.cyan + '＋ ' + now() + '  active  ' + C.reset + label); // a new loader appeared
-      }
-      for (const [tid, label] of prevActive) {
-        if (!cur.has(tid)) feed(C.green + '✓ ' + now() + '  idle    ' + C.reset + label);        // went idle / closed
-      }
-      // When everything just cleared, say so explicitly (the moment the user
-      // closes the last tab) — separate from the confirm/build step below.
-      if (snap.idle && prevActive.size > 0) feed(C.green + C.bold + '✓ ' + now() + '  all tabs idle' + C.reset);
-    }
-    prevActive = new Map(snap.loaders.map((l) => [l.tabId, loaderLabel(l)]));
-
-    // Build only after IDLE_CONFIRM consecutive confirmed-idle polls. This
-    // smooths short runtime signal transitions. A passive Run after promise is
-    // deliberately not part of this decision; once it fires, the resulting
-    // live turn resets the streak like every other runtime blocker.
-    if (snap.idle === true) idleStreak += 1;
-    else idleStreak = 0;
-
-    if (idleStreak >= IDLE_CONFIRM) {
-      if (NO_BUILD) { feed(C.green + '✓ idle confirmed (NO_BUILD=1 — not building)' + C.reset); process.exit(0); }
-      return runBuild();
-    }
-
-    setTimeout(tick, POLL_MS);
-  };
-
-  tick();
 }
 
-process.on('SIGINT', () => {
-  process.stdout.write('\n' + C.gray + 'cancelled — no build triggered.' + C.reset + '\n');
-  process.exit(130);
-});
-
-main().catch((e) => { console.error(C.red + String(e && e.stack || e) + C.reset); process.exit(1); });
+module.exports = { waitForIdle, runBuild, projectBuildInstallBlockers, EndpointMissingError };
+if (require.main === module) void main();

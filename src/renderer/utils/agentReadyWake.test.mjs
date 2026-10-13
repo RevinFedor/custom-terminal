@@ -1,57 +1,75 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import { EventEmitter } from 'node:events';
 import { stripTypeScriptTypes } from 'node:module';
 import test from 'node:test';
 import sendTargetContract from '../../shared/agent-send-target-precondition.cjs';
 import manualActionContract from '../../shared/agent-manual-action.cjs';
 import { runAgentSendFlow } from './agentSendFlow.mjs';
+import { createAgentLaunchAdmission } from './agentLaunchAdmission.mjs';
+import { createLaunchFixture, assertOnlyFenceObservers } from './agentLaunchFixture.mjs';
 
 const preparation = fs.readFileSync(new URL('./agentSendPreparation.ts', import.meta.url), 'utf8');
-const history = fs.readFileSync(new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url), 'utf8');
 const main = fs.readFileSync(new URL('../../main/main.js', import.meta.url), 'utf8');
-const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+// Drain the real admission helper as well as the readiness pass; a fixed
+// microtask count races its acquire/run/finish continuations.
+const tick = () => new Promise(resolve => setImmediate(resolve));
 
 function harness(toolType = 'codex') {
-  const ipcRenderer = new EventEmitter();
+  const { ipcRenderer, calls } = createLaunchFixture();
   const timers = new Map();
   let now = 0, serial = 0, resumes = 0, reads = 0, cancelled = false;
-  let cancelWake;
+  const cancellationWaits = new Set();
   let state = { status: 'active', inputReady: false };
   const runtime = { toolType, label: toolType, readyEvent: toolType + ':tui-ready',
     getPresence: async () => { reads++; return { ...state }; },
-    resume: async () => { resumes++; return { success: true }; },
+    resume: async ({ launchAdmission }) => {
+      resumes++;
+      return launchAdmission.run(toolType + ':run-command', { tabId: 'T', command: toolType + '-c', sessionId: 'S' });
+    },
   };
   const body = preparation.slice(preparation.indexOf('export function createAgentReadyWait('),
     preparation.indexOf('export async function proveAgentComposerForSend('));
   const api = vm.runInNewContext(stripTypeScriptTypes(body.replace(/\bexport /g, ''))
     + '\n({ createAgentReadyWait, prepareAgentRuntimeForSend })', {
     ...sendTargetContract, manualActionContract,
-    ipcRenderer, Date: { now: () => now }, console: { log() {}, warn() {} },
+    ipcRenderer, AbortController, createAgentLaunchAdmission, Date: { now: () => now }, console: { log() {}, warn() {} },
     setTimeout: (callback, ms) => { const id = ++serial; timers.set(id, { callback, ms }); return id; },
     clearTimeout: id => timers.delete(id),
     terminalRegistry: { get: () => ({}) },
     isCoordinatedAgentSendCancellationRequested: () => cancelled,
-    createCoordinatedAgentSendCancellationWait: () => ({
-      promise: new Promise(resolve => { cancelWake = resolve; }), cancel() {},
-    }),
+    createCoordinatedAgentSendCancellationWait: () => {
+      let wake;
+      const promise = new Promise(resolve => { wake = resolve; cancellationWaits.add(wake); });
+      return { promise, cancel: () => cancellationWaits.delete(wake) };
+    },
   });
   const providerContract = {
     classifySubmitCapability: p => p?.status === 'busy' ? 'queue' : p?.inputReady ? 'direct' : 'blocked',
     startupGateOwnsComposer: () => false, waitForStartupGate: async () => {},
   };
-  return { ipcRenderer, timers, runtime,
+  return { ipcRenderer, calls, timers, runtime,
     start: (extra = {}) => api.prepareAgentRuntimeForSend({ tabId: 'T', runtime, providerContract,
-      sessionId: 'S', requestedStatusAtSend: 'active', coordinatedSendToken: 1, ...extra }),
+      sessionId: 'S', cwd: '/fixture', requestedStatusAtSend: 'active', coordinatedSendToken: 1, ...extra }),
     setState: value => { state = value; },
     advance: ms => { now += ms; },
     wakeAt: async time => { now = time; for (const timer of [...timers.values()]) timer.callback(); await tick(); },
-    cancel: () => { cancelled = true; cancelWake(); },
+    cancel: () => { cancelled = true; for (const wake of cancellationWaits) wake(); },
     expire: async () => { now = 30001; for (const timer of [...timers.values()]) timer.callback(); await tick(); },
     get reads() { return reads; }, get resumes() { return resumes; },
   };
 }
+
+test('common cold Send preserves structured Main no-launch refusal instead of dropping it into a bare Error', async () => {
+  const h = harness(); h.setState({ status: 'inactive', inputReady: false });
+  const refusal = { success: false, accepted: false, error: 'shell_not_idle',
+    reason: 'process_lookup_unknown', lookupUnknown: true, launchWritten: false };
+  h.runtime.resume = async () => refusal;
+  await assert.rejects(h.start(), error => error.message === 'shell_not_idle'
+    && error.reason === 'process_lookup_unknown' && error.lookupUnknown === true
+    && error.launchWritten === false && error.submitted === undefined);
+  assert.equal(h.timers.size, 0, 'this patch preserves the refusal; it does not add blind retry');
+});
 
 test('RunAfter admission revocation cancels common readiness wait without any provider Stop/Resume', async () => {
   const h = harness(), controller = new AbortController();
@@ -61,7 +79,9 @@ test('RunAfter admission revocation cancels common readiness wait without any pr
   controller.abort();
   await assert.rejects(pending, error => error.cancelled === true && error.submitted === false);
   assert.equal(h.resumes, 0); assert.equal(h.timers.size, 0);
-  assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assert.equal(h.calls.filter(call => call.channel === 'agent:cancel-launch-intent').length, 1,
+    'pre-FIFO preparation revocation reaches Main through the real scope');
+  assertOnlyFenceObservers(h.ipcRenderer);
 });
 
 const startupSnapshot = (launchId = 'L') => ({ launchId, lifecycleGeneration: 'G',
@@ -110,7 +130,7 @@ test('cold Codex Send survives the old 30s limit and sends frozen context once o
   h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
   await pending;
   assert.equal(writes, 1); assert.equal(prepared, 1); assert.equal(h.resumes, 0);
-  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assert.equal(h.timers.size, 0); assertOnlyFenceObservers(h.ipcRenderer);
 });
 
 for (const status of ['stopping', 'inactive']) test('Stop during startup cancels without waiting for ready: ' + status, async () => {
@@ -123,7 +143,7 @@ for (const status of ['stopping', 'inactive']) test('Stop during startup cancels
   await tick(); h.setState({ status, inputReady: false });
   h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
   await rejected;
-  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assert.equal(h.timers.size, 0); assertOnlyFenceObservers(h.ipcRenderer);
 });
 
 test('main launch failure ends preparation immediately, while a missing ready edge remains finitely bounded', async () => {
@@ -138,7 +158,7 @@ test('main launch failure ends preparation immediately, while a missing ready ed
       h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
     } else await h.wakeAt(61001);
     await rejected;
-    assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+    assert.equal(h.timers.size, 0); assertOnlyFenceObservers(h.ipcRenderer);
   }
 });
 
@@ -152,7 +172,7 @@ test('a replacement launch cannot extend or submit the previous startup send', a
       runtimeSnapshot: { ...startupSnapshot('OTHER'), ...(ready ? { startupWait: null } : {}) } });
     h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
     await rejected;
-    assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+    assert.equal(h.timers.size, 0); assertOnlyFenceObservers(h.ipcRenderer);
   }
 });
 
@@ -174,7 +194,7 @@ for (const tool of ['codex', 'claude']) {
     h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: tool });
     assert.equal((await result).submitCapability, 'direct');
     assert.equal(h.resumes, 0);
-    assert.equal(h.ipcRenderer.eventNames().length, 0);
+    assertOnlyFenceObservers(h.ipcRenderer);
     assert.equal(h.timers.size, 0);
   });
 }
@@ -230,7 +250,7 @@ for (const tool of ['codex', 'claude']) for (const cold of [false, true]) {
     assert.equal(preparations, 1, 'readiness cannot rebuild the context or add newer chips');
     assert.equal(h.resumes, cold ? 1 : 0);
     assert.equal(h.timers.size, 0);
-    assert.equal(h.ipcRenderer.eventNames().length, 0);
+    assertOnlyFenceObservers(h.ipcRenderer);
   });
 }
 
@@ -249,7 +269,7 @@ test('ready -> picker still expires with a no-write receipt; no event or second 
   await inspection;
   await h.expire(); await rejected;
   assert.equal(writes, 0); assert.equal(h.resumes, 0);
-  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assert.equal(h.timers.size, 0); assertOnlyFenceObservers(h.ipcRenderer);
 });
 
 test('cancelling after ready -> picker retires the same attempt and every listener', async () => {
@@ -258,7 +278,7 @@ test('cancelling after ready -> picker retires the same attempt and every listen
   await regressReadyDuringFinalRead(h);
   h.cancel(); await rejected;
   assert.equal(h.resumes, 0);
-  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assert.equal(h.timers.size, 0); assertOnlyFenceObservers(h.ipcRenderer);
 });
 
 test('another blocked wake keeps the original absolute deadline, not a new 30s budget', async () => {
@@ -281,7 +301,7 @@ test('readiness recovered by another conversation cannot submit the old handoff'
   h.setState({ status: 'active', inputReady: true, sessionId: 'OTHER' });
   h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
   await rejected;
-  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assert.equal(h.timers.size, 0); assertOnlyFenceObservers(h.ipcRenderer);
   assert.equal(h.resumes, 0);
 });
 
@@ -301,11 +321,11 @@ test('a still-open menu times out with no launch or input; cancellation cleans a
   await tick(); await h.expire(); await result;
   assert.equal(h.resumes, 0);
   assert.equal(h.timers.size, 0);
-  assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assertOnlyFenceObservers(h.ipcRenderer);
   const c = harness();
   const cancelled = assert.rejects(c.start(), /cancelled/);
   await tick(); c.cancel(); await cancelled;
-  assert.equal(c.ipcRenderer.eventNames().length, 0);
+  assertOnlyFenceObservers(c.ipcRenderer);
   assert.equal(c.timers.size, 0);
 });
 
@@ -332,7 +352,7 @@ for (const cold of [false, true]) test('known Goal choice ends unwritten Send, n
   });
   assert.equal(h.resumes, cold ? 1 : 0);
   assert.equal(h.timers.size, 0);
-  assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assertOnlyFenceObservers(h.ipcRenderer);
   h.setState({ status: 'active', inputReady: true });
   h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex' });
   await tick(); assert.equal(pasteCalls, 0, 'a later user choice cannot resume the cancelled send');
@@ -344,10 +364,11 @@ test('Goal policy manual transition wakes the same pending Send and releases lis
   await tick(); h.setState(manualGoal);
   h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex', source: 'runtime-policy' });
   await rejected;
-  assert.equal(h.timers.size, 0); assert.equal(h.ipcRenderer.eventNames().length, 0);
+  assert.equal(h.timers.size, 0); assertOnlyFenceObservers(h.ipcRenderer);
 });
 
 test('normal History Send leaves draft proof after readiness in the common scenario', () => {
+  const history = fs.readFileSync(new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url), 'utf8');
   const match = history.match(/if \(([^\n]+)\) \{\s*const terminalDraft = await readTerminalDraft\('send-preflight'\)/);
   assert.ok(match, 'known early draft-read boundary');
   const shouldReadEarly = new Function('statusAtSend', 'recordWithoutReply', 'return ' + match[1]);

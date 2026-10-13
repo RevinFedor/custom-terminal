@@ -241,7 +241,8 @@ test('the whole CommonJS web service reads and commits through its lazy project 
   const cjs = { exports: {} };
   const wrapper = vm.runInNewContext('(function(require,module,exports,__dirname,__filename){' + web + `
     return { api: getRunAfterApi, route: handleApi, admit: admitQueuedAgentSend,
-      setStatus(value) { resolveAgentSessionInfo = async () => value; },
+      setStatus(value) { readAgentRuntimeSnapshot = async () => ({...value,toolType:'codex'});
+        readAutomaticSendFrame = () => ({ready:true}); },
       setQueue(value) { agentSendQueue = value; },
       setCapacityStore(value) { getOrchestrationRunStore = () => value; scheduleOrchestrationPolicyTimer = async () => {}; },
       initialize(service) { token = 'private-token'; systemPromptService = service; registerBridgeReplyHandler(); } };
@@ -677,7 +678,7 @@ test('actual metadata IPC and existing 80ms Main scheduler coalesce into one lig
     vm.runInContext(declaration(webTree,name),f.webContext);
   }
   const mainSource=fs.readFileSync(path.join(__dirname,'main.js'),'utf8'),mainTree=tree('main.js',mainSource);
-  const main=vm.createContext({path,srcMainDir:__dirname,projectActivityBroadcastTimer:null,projectLayoutChangedIds:new Set(),projectOrderChanged:false,projectCardSignals:null,
+  const main=vm.createContext({path,srcMainDir:__dirname,projectActivityBroadcastTimer:null,projectLayoutChangedIds:new Set(),projectOrderChanged:false,projectCardSignals:null,idleSessionStopService:null,
     setTimeout:(callback,ms)=>{assert.equal(ms,80);timers.push(callback);return callback},require:()=>({invalidateTabActivity(){},
       broadcastProjectActivity:reason=>frames.push(f.webContext.projectActivitySnapshot(reason))})});
   vm.runInContext(declaration(mainTree,'scheduleProjectActivityBroadcast'),main);

@@ -121,7 +121,9 @@ test('tab, project and workflow menus consume the shared metrics and expose hook
 
   const tabMenu = between(tabBar, '{/* Context Menu - styled like terminal context menu */}', '{/* Group context menu */}');
   assert.match(tabMenu, /data-tab-context-menu/);
-  assert.match(tabMenu, /data-tab-context-action="add"/);
+  assert.match(tabMenu, /TabWindowActionButton[\s\S]*action="beside"/);
+  assert.match(tabMenu, /action="replace-shown"/);
+  assert.doesNotMatch(tabMenu, /data-tab-context-action="add"/);
   assert.match(tabMenu, /data-tab-context-action="rename"/);
   assert.doesNotMatch(tabMenu, /data-tab-context-action="(?:move-to-project|copy-session)"/);
   assert.doesNotMatch(tabMenu, /w-\[240px\]|\bpy-1\.5\b|h-\[51px\]|51px/);

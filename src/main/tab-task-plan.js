@@ -53,6 +53,8 @@ function normalizeRootTask(value, used) {
     title,
     subtasks: normalizeSubtasks(value?.subtasks, used),
   };
+  if (typeof value?.shortTitle === 'string') task.shortTitle = cleanTitle(value.shortTitle);
+  if (typeof value?.body === 'string') task.body = value.body;
   if (typeof value?.statusId === 'string' && value.statusId.trim()) {
     task.statusId = value.statusId.trim().slice(0, 160);
   }
@@ -200,7 +202,12 @@ function applyTaskPlanOperations(rawDocument, rawOperations, source = 'unknown')
     const type = operation?.type;
     if (type === 'replace_plan') {
       const used = new Set(archivedItems.flatMap((item) => [item.id, ...item.subtasks.map((subtask) => subtask.id)]));
-      items = normalizeItems(operation.tasks, used);
+      // Older clients replace the title/status tree without knowing the new
+      // topic fields. Omitted metadata stays with its exact stable root ID.
+      items = normalizeItems(Array.isArray(operation.tasks) ? operation.tasks.map(value => {
+        const previous = items.find(item => item.id === value?.id);
+        return { ...(previous && { shortTitle: previous.shortTitle, body: previous.body }), ...value };
+      }) : operation.tasks, used);
       continue;
     }
 
@@ -216,6 +223,8 @@ function applyTaskPlanOperations(rawDocument, rawOperations, source = 'unknown')
         title,
         statusId: operation.statusId,
         subtasks: operation.subtasks,
+        shortTitle: operation.shortTitle,
+        body: operation.body,
       }], used)[0];
       if (!next) throw new Error('task_title_required');
       const afterIndex = typeof operation.afterTaskId === 'string'
@@ -228,10 +237,19 @@ function applyTaskPlanOperations(rawDocument, rawOperations, source = 'unknown')
 
     if (type === 'update_task') {
       const task = getTask(items, operation.taskId);
+      if (operation.ifMatches && ['title', 'shortTitle', 'body'].some(key =>
+        String(task[key] || '') !== String(operation.ifMatches[key] || ''))) {
+        throw new Error(`task_content_changed:${operation.taskId}`);
+      }
       if (Object.prototype.hasOwnProperty.call(operation, 'title')) {
         const title = cleanTitle(operation.title);
         if (!title) throw new Error('task_title_required');
         task.title = title;
+      }
+      if (Object.prototype.hasOwnProperty.call(operation, 'shortTitle')) task.shortTitle = cleanTitle(operation.shortTitle);
+      if (Object.prototype.hasOwnProperty.call(operation, 'body')) {
+        if (typeof operation.body !== 'string') throw new Error('task_body_must_be_text');
+        task.body = operation.body;
       }
       if (Object.prototype.hasOwnProperty.call(operation, 'statusId')) {
         if (typeof operation.statusId === 'string' && operation.statusId.trim()) {

@@ -598,20 +598,39 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
    tab-ai-busy-pulse, --ai-pulse-* vars) was removed: the loader is the
    переливающаяся полоска у края. See fact-process-bar.md::AIPulse removed. */
 
-/* Optional Codex input never replaces the working signal. The opaque base
-   ring remains visible; only its glow plate varies, not the tab/text opacity. */
+/* Optional Codex input never replaces the working signal. Keep a blue track
+   visible between pulses, with stronger contrast on the exact tab than on its
+   workflow. Only the pre-rasterized glow plate changes opacity, never the text,
+   border geometry or box-shadow. The existing hidden-owner pause still wins. */
 .tab-codex-question-ring {
+  --codex-question-ring-width: 2px;
+  --codex-question-ring-track: rgba(59,130,246,.70);
+  --codex-question-ring-peak: rgba(147,197,253,.98);
+  --codex-question-ring-glow: rgba(59,130,246,.28);
   position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
-  box-shadow: inset 0 0 0 1px rgba(167,139,250,.38);
+  box-shadow: inset 0 0 0 var(--codex-question-ring-width) var(--codex-question-ring-track);
+}
+.tab-codex-question-ring[data-workflow-codex-question-ring] {
+  --codex-question-ring-width: 1.5px;
+  --codex-question-ring-track: rgba(59,130,246,.58);
+  --codex-question-ring-peak: rgba(96,165,250,.90);
+  --codex-question-ring-glow: rgba(59,130,246,.20);
 }
 .tab-codex-question-ring::after {
-  content: ''; position: absolute; inset: 0; border-radius: inherit;
-  box-shadow: inset 0 0 0 1px rgba(192,159,255,.48), inset 0 0 5px rgba(139,92,246,.15);
-  animation: codex-question-glow 2.6s ease-in-out infinite;
+  content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  box-shadow: inset 0 0 0 var(--codex-question-ring-width) var(--codex-question-ring-peak),
+    inset 0 0 6px var(--codex-question-ring-glow);
+  animation: codex-question-glow 2.2s ease-in-out infinite;
   animation-play-state: inherit;
+  will-change: opacity;
 }
-@keyframes codex-question-glow { 0%,100% { opacity:.18; } 50% { opacity:1; } }
-@media (prefers-reduced-motion: reduce) { .tab-codex-question-ring::after { animation:none; opacity:.5; } }
+@keyframes codex-question-glow {
+  0%,100% { opacity:.16; }
+  45%,55% { opacity:1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tab-codex-question-ring::after { animation:none; opacity:.75; will-change:auto; }
+}
 
 /* Awaiting-user-input (AskUserQuestion) — Claude задал вопрос и ЖДЁТ ответа.
    НЕ заливаем фон (это читалось как «AI думает» и слепило). Вместо этого —

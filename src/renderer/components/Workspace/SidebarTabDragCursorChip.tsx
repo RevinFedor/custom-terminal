@@ -2,11 +2,13 @@ import React, { memo, useLayoutEffect, useRef, useSyncExternalStore } from 'reac
 import { createPortal } from 'react-dom';
 import {
   getSidebarTabDragCursorChip, getSidebarTabDragSnapshot,
-  getSidebarTabDragSessionSnapshot, subscribeSidebarTabDrag, subscribeSidebarTabDragSession,
+  getSidebarTabDragSessionSnapshot, subscribeSidebarTabDrag, subscribeSidebarTabDragSession, sidebarTabDragUsesCursorChip,
 } from '../../utils/sidebarTabDragBridge.mjs';
+import {getPaneTabDragSnapshot,subscribePaneTabDrag} from '../../utils/paneTabDragBridge';
+import {getTabDragNavigationSnapshot,subscribeTabDragNavigation} from '../../utils/tabDragNavigationBridge';
 
 // Geometry belongs to this small overlay, never to the retained TabBar tree.
-export default memo(function SidebarTabDragCursorChip({ enabled }: { enabled: boolean }) {
+export default memo(function SidebarTabDragCursorChip({ enabled, externalTarget }: { enabled: boolean; externalTarget?: boolean }) {
   const session = useSyncExternalStore(subscribeSidebarTabDragSession, getSidebarTabDragSessionSnapshot, getSidebarTabDragSessionSnapshot);
   const sidebarDragCursorChip = getSidebarTabDragCursorChip(session);
   const chipRef = useRef<HTMLDivElement>(null);
@@ -18,16 +20,19 @@ export default memo(function SidebarTabDragCursorChip({ enabled }: { enabled: bo
       const point = getSidebarTabDragSnapshot();
       const chip = chipRef.current;
       if (!chip || !point.active) return;
+      chip.style.visibility = sidebarTabDragUsesCursorChip(point,getPaneTabDragSnapshot(),getTabDragNavigationSnapshot(),externalTarget) ? 'visible' : 'hidden';
       const right = point.clientX + 14;
       const below = point.clientY + 14;
       const left = right + 240 <= window.innerWidth - 8 ? right : Math.max(8, point.clientX - 254);
       const top = below + 34 <= window.innerHeight - 8 ? below : Math.max(8, point.clientY - 48);
       chip.style.transform = `translate3d(${left}px, ${top}px, 0)`;
     };
-    const unsubscribe = subscribeSidebarTabDrag(() => { if (!frame) frame = requestAnimationFrame(paint); });
+    const schedule = () => { if (!frame) frame = requestAnimationFrame(paint); };
+    const unsubscribe = subscribeSidebarTabDrag(schedule);
+    const stopPane = subscribePaneTabDrag(schedule),stopNavigation = subscribeTabDragNavigation(schedule);
     paint();
-    return () => { unsubscribe(); cancelAnimationFrame(frame); };
-  }, [enabled, session.active, session.metaKey, session.sessionId]);
+    return () => { unsubscribe();stopPane();stopNavigation();cancelAnimationFrame(frame); };
+  }, [enabled, externalTarget, session.active, session.sessionId]);
   return (<>
       {sidebarDragCursorChip && enabled && typeof document !== 'undefined'
         ? createPortal(
@@ -40,6 +45,7 @@ export default memo(function SidebarTabDragCursorChip({ enabled }: { enabled: bo
               data-tab-count={sidebarDragCursorChip.count}
               style={{
                 position: 'fixed',
+                visibility: 'hidden',
                 left: 0,
                 top: 0,
                 zIndex: 100080,

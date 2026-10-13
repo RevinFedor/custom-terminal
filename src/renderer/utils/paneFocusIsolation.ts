@@ -1,3 +1,5 @@
+import { uiPerformancePhase } from './uiPerformanceDiagnostics.mjs';
+
 const PANE_BOUNDARY_SELECTOR = [
   '[data-terminal-pane-wrapper][data-pane-focus-isolated]',
   '[data-terminal-pane-chrome-host][data-pane-focus-isolated]',
@@ -190,10 +192,76 @@ export function createPaneFocusIsolationManager(
   };
 
   const boundarySelector = options.boundarySelector || PANE_BOUNDARY_SELECTOR;
-  const liveBoundaries = () => [
+  const queryBoundaries = () => [
     ...(root.matches(boundarySelector) ? [root] : []),
     ...root.querySelectorAll<HTMLElement>(boundarySelector),
   ];
+  // These selectors depend only on each element's own marker attributes.
+  // Arbitrary caller selectors retain their existing query semantics.
+  const inventoryAttributes = boundarySelector === PANE_BOUNDARY_SELECTOR
+    ? ['data-terminal-pane-wrapper', 'data-terminal-pane-chrome-host', 'data-pane-focus-isolated']
+    : boundarySelector === '[data-single-center-focus-boundary][data-pane-focus-isolated]'
+      ? ['data-single-center-focus-boundary', 'data-pane-focus-isolated']
+      : boundarySelector === '[data-workspace-presentation]' ? ['data-workspace-presentation'] : null;
+  const inventory = new Set<HTMLElement>();
+  let orderedInventory: HTMLElement[] = [];
+  let orderDirty = true;
+  let inventoryRecords = 0;
+
+  const updateBoundary = (element: Element, moved = false) => {
+    const boundary = element as HTMLElement;
+    if ((element === root || root.contains(element)) && element.matches(boundarySelector)) {
+      if (!inventory.has(boundary)) { inventory.add(boundary); orderDirty = true; }
+      if (moved) orderDirty = true;
+    } else if (inventory.delete(boundary)) orderDirty = true;
+  };
+  const updateInventory = (records: MutationRecord[]) => {
+    inventoryRecords += records.length;
+    const added = new Set<Element>();
+    let structureChanged = false;
+    for (const record of records) {
+      if (record.type === 'attributes' && record.target instanceof Element) updateBoundary(record.target);
+      if (record.type !== 'childList') continue;
+      structureChanged = true;
+      for (const node of record.addedNodes) if (node instanceof Element && root.contains(node)) added.add(node);
+    }
+    // Scan only final added subtree roots, once. A remove+reinsert in this batch
+    // keeps the same boundary/state and its original authored tabindex values.
+    for (const node of added) {
+      let parent = node.parentElement;
+      while (parent && !added.has(parent)) parent = parent.parentElement;
+      if (parent) continue;
+      updateBoundary(node, true);
+      node.querySelectorAll<HTMLElement>(boundarySelector).forEach(element => updateBoundary(element, true));
+    }
+    if (structureChanged) for (const boundary of inventory) {
+      if (boundary !== root && !root.contains(boundary)) { inventory.delete(boundary); orderDirty = true; }
+    }
+  };
+  const inventoryObserver = inventoryAttributes ? new MutationObserver(updateInventory) : null;
+  if (inventoryObserver) {
+    inventoryObserver.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: inventoryAttributes! });
+    for (const boundary of queryBoundaries()) inventory.add(boundary);
+  }
+  const liveBoundaries = () => {
+    const startedAt = performance.now();
+    let result: HTMLElement[];
+    if (inventoryObserver) {
+      // A layout effect may run before MutationObserver delivery. Consume the
+      // pending records now; never use a previous DOM node or desired flag.
+      updateInventory(inventoryObserver.takeRecords());
+      if (orderDirty) {
+        orderedInventory = [...inventory].sort((a, b) => a === b ? 0
+          : a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+        orderDirty = false;
+      }
+      result = orderedInventory;
+    } else result = queryBoundaries();
+    uiPerformancePhase('pane-focus-boundaries', { source: inventoryObserver ? 'inventory' : 'query',
+      count: result.length, records: inventoryRecords, ms: performance.now() - startedAt });
+    inventoryRecords = 0;
+    return result;
+  };
 
   const cleanupDetachedStates = (live: Set<HTMLElement>) => {
     for (const [boundary, state] of states) {
@@ -245,7 +313,9 @@ export function createPaneFocusIsolationManager(
 
   function flushOneBoundary(version: number) {
     if (disposed || version !== presentationVersion) return;
+    const callbackStartedAt = performance.now();
     const liveList = liveBoundaries();
+    const discoveredAt = performance.now();
     const live = new Set(liveList);
     cleanupDetachedStates(live);
     const entries = liveList.map((boundary) => ({
@@ -277,7 +347,10 @@ export function createPaneFocusIsolationManager(
       + ' action=' + (operation.desiredIsolated ? 'isolate' : 'restore')
       + ' tab=' + tabIdOfBoundary(operation.boundary).slice(-12)
       + ' remaining=' + Math.max(0, pendingCount - 1)
-      + ' ms=' + elapsed.toFixed(1));
+      + ' ms=' + elapsed.toFixed(1)
+      + ' discoveryMs=' + (discoveredAt - callbackStartedAt).toFixed(1)
+      + ' prepareMs=' + (startedAt - discoveredAt).toFixed(1)
+      + ' totalMs=' + (performance.now() - callbackStartedAt).toFixed(1));
 
     scheduleDeferredBoundary(version);
   }
@@ -357,6 +430,9 @@ export function createPaneFocusIsolationManager(
       disposed = true;
       presentationVersion += 1;
       cancelDeferred();
+      inventoryObserver?.disconnect();
+      inventory.clear();
+      orderedInventory = [];
       root.removeEventListener('focusin', onFocusIn, true);
       root.removeEventListener('keydown', onHiddenInput, true);
       root.removeEventListener('beforeinput', onHiddenInput, true);

@@ -8,6 +8,7 @@ const USES = {
   research: ['research'], compact: ['compact'], description: ['description'], adopt: ['adopt-summary'],
   'tab-title': ['tab-title'], 'run-after-title': ['run-after-title'], 'prompt-summary': ['prompt-summary'],
   'timeline-grouping': ['timeline-grouping'], 'git-commit': ['git-commit'],
+  'task-theme': ['task-theme'],
   [RUN_AFTER_LOOP_PROMPT_ID]: ['run-after-loop'],
 };
 function error(code, message, statusCode = 400, extra = {}) {

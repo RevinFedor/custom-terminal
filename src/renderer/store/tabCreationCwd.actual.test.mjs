@@ -8,6 +8,7 @@ import { createRequire } from 'node:module';
 import { buildSync, transformSync } from 'esbuild';
 import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
+import { rememberAgentLaunchFence } from '../utils/agentLaunchFence.mjs';
 import { resolveSiblingInsertionIndex, resolveTabInsertionIndex } from '../utils/tabInsertionModel.mjs';
 const require = createRequire(import.meta.url);
 const { resolveWorkingDirectory } = require('../../shared/working-directory.cjs');
@@ -30,7 +31,7 @@ const allocationStart = store.indexOf('async function allocateOrganizationTab(')
 const allocationEnd = store.indexOf('\nconst taskPlanUpdatedListener',allocationStart);
 assert.ok(allocationStart > 0 && allocationEnd > allocationStart);
 const creation = transformSync(store.slice(allocationStart,allocationEnd)+'\nmodule.exports = {' + store.slice(start, end)
-  + store.slice(sdkStart, sdkEnd) + '};\nmodule.exports.chooserCwd = (context) => {const workspace=get().openProjects.get("project");'
+  + store.slice(sdkStart, sdkEnd) + '};\nmodule.exports.chooserCwd = (context) => {const before=get(),targetWorkflowId=before.activeSpaceId;const workspace=before.openProjects.get("project");'
   + store.slice(cwdStart, cwdEnd) + 'return cwd;};', { loader: 'ts', format: 'cjs' }).code;
 const main = fs.readFileSync(path.join(root, 'src/main/main.js'), 'utf8');
 const mainStart = main.indexOf("ipcMain.handle('terminal:create', async");
@@ -76,7 +77,7 @@ async function fixture(t, projectPath = '~') {
     ipcRenderer: { invoke: async (channel, request) => {
       assert.equal(channel, 'terminal:create'); return createPty({}, request);
     }, send() { throw new Error('unexpected kill'); } },
-    commitCreatedTabSnapshot, projectTabCreationQueue: createProjectTabSaveQueue(), projectTabSaveRevisions: new Map(),
+    commitCreatedTabSnapshot, rememberAgentLaunchFence, projectTabCreationQueue: createProjectTabSaveQueue(), projectTabSaveRevisions: new Map(),
     saveTabsThenNotifyProjectLayoutChanged: async (project, tabs) => {
       persisted.push([...tabs.values()].map(tab => ({ ...tab }))); return { success: true };
     }, resolveSiblingInsertionIndex, resolveTabInsertionIndex,
@@ -128,6 +129,17 @@ test('home expansion supports Windows paths without rewriting ordinary directory
   assert.equal(resolveWorkingDirectory('~/project', 'C:\\Users\\fixture', path.win32), 'C:\\Users\\fixture\\project');
   assert.equal(resolveWorkingDirectory('/project/~literal', '/home/fixture', path.posix), '/project/~literal');
   assert.equal(resolveWorkingDirectory('~another-user', '/home/fixture', path.posix), '~another-user');
+});
+
+test('the actual file-tab factory persists an independent document without a PTY or parent',async t=>{
+  const f=await fixture(t),file=path.join(f.home,'project','document.md');
+  await fs.promises.writeFile(file,'# Synthetic document');
+  const id=await f.methods.createTab('project','document.md',path.dirname(file),{
+    tabType:'file',filePath:file,background:true,nameSetManually:true,skipInitialRename:true});
+  assert.equal(f.workspace.tabs.get(id).tabType,'file');assert.equal(f.workspace.tabs.get(id).filePath,file);
+  assert.equal(f.workspace.tabs.get(id).visualParentTabId,undefined);assert.deepEqual(f.validated,[]);
+  assert.equal(f.persisted.at(-1).at(-1).filePath,file);
+  assert.equal(await fs.promises.readFile(file,'utf8'),'# Synthetic document');
 });
 
 test('chooser captures normalized cwd before fork IPC, while an unset project still requires selection', async t => {

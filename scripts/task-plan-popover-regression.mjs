@@ -20,16 +20,21 @@ try {
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
   const shared = path.join(artifact, 'noted-shared/packages');
   for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name), { recursive: true, filter: p => !p.includes('/node_modules') });
-  for (const name of ['src/renderer/components/Workspace/TabTaskPlanPanel.tsx', 'src/renderer/components/Workspace/TaskPlanPopover.tsx', 'src/renderer/store/useUIStore.ts', 'src/renderer/store/useWorkspaceStore.ts', 'src/main/tab-task-plan.js'])
+  for (const name of ['src/renderer/components/Workspace/TabTaskPlanPanel.tsx', 'src/renderer/components/Workspace/TaskPlanPopover.tsx', 'src/renderer/components/Workspace/TaskThemeEditor.tsx', 'src/renderer/hooks/useTaskEditorFloatingSurfaces.ts', 'src/renderer/utils/taskPlanPopupDismissal.mjs', 'src/renderer/utils/generateTaskTheme.ts', 'src/shared/task-theme-prompt.cjs', 'src/renderer/store/usePromptsStore.ts', 'src/renderer/store/useUIStore.ts', 'src/renderer/store/useWorkspaceStore.ts', 'src/main/tab-task-plan.js'])
     result.sources[name] = createHash('sha256').update(await fs.readFile(path.join(snapshot, name))).digest('hex');
   await build({ entryPoints: [path.join(snapshot, 'scripts/fixtures/task-plan-popover.tsx')], bundle: true, sourcemap: true,
     outfile: path.join(artifact, 'bundle.js'), platform: 'browser', format: 'iife', target: 'chrome120', jsx: 'automatic', logLevel: 'silent', external: ['crypto'],
-    define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env': '{"DEV":false,"MODE":"test"}' },
+    define: { 'process.env.NODE_ENV': '"production"', 'process.env.GEMINI_API_KEY': '"private-fixture-key"', 'import.meta.env': '{"DEV":false,"MODE":"test"}' },
     alias: { '@noted/claude-blocks': path.join(snapshot, 'packages/claude-blocks/src'), '@noted/structured-dnd': path.join(shared, 'structured-dnd/src'), '@noted/file-explorer': path.join(shared, 'file-explorer/src'), react: path.join(repo, 'node_modules/react'), 'react-dom': path.join(repo, 'node_modules/react-dom') },
     loader: { '.ttf': 'file', '.woff2': 'file', '.svg': 'dataurl' } });
   function shim() {
     const listeners = new Map(), saved = new Map();
     const f = window.taskFixture = { calls: [], unknown: [], violations: [], underlayClicks: 0 };
+    const docListeners = { click: new Set(), keydown: new Set() };
+    const addDocumentListener = document.addEventListener.bind(document), removeDocumentListener = document.removeEventListener.bind(document);
+    document.addEventListener = (type, listener, options) => { docListeners[type]?.add(listener); return addDocumentListener(type, listener, options); };
+    document.removeEventListener = (type, listener, options) => { docListeners[type]?.delete(listener); return removeDocumentListener(type, listener, options); };
+    f.documentListeners = () => Object.fromEntries(Object.entries(docListeners).map(([type, values]) => [type, values.size]));
     const deny = value => { f.violations.push(value); throw Error('Fixture forbids ' + value); };
     const response = (c, p) => {
       if (c === 'app:getState') return saved.get(p) ?? null;
@@ -37,18 +42,21 @@ try {
       if (c === 'tab-work-context:get') return { success: true, context: { tabId: p.tabId, responsibility: 'Область задач и редактора. '.repeat(30), revision: 1, files: [], updates: [], pendingCount: 0 } };
       if (/^tab-task-plan:(apply|undo|redo)$/.test(c)) return f.operation(c, p);
       if (c === 'file:read-directory') return [{ name: 'план.md', path: '/fixture/docs/tmp/план.md', isDirectory: false }];
+      if (c === 'ai-prompts:get') return { success: true, data: [{ id: 'task-theme', name: 'Тема задачи',
+        content: 'Private configured task theme', model: 'gemini-3.1-flash-lite', thinkingLevel: 'NONE', filePaths: [] }] };
+      if (c === 'ai-prompts:log-call') { f.aiUsage = p; return { success: true }; }
       if (/^(terminal:(input|paste|create|kill)|codex:|claude:|agent:|shell:)/.test(c)) return deny(c);
       if (/^(tab:|project:|log:|renderer:|perf:)/.test(c)) return { success: true };
       if (/list|catalog|get-models|get-prompts|prompts:get/.test(c)) return [];
       f.unknown.push(c); return null;
     };
-    const ipc = { invoke: (c, ...a) => { f.calls.push(c); return Promise.resolve().then(() => structuredClone(response(c, a[0]))); },
+    const ipc = { invoke: (c, ...a) => { f.calls.push(c); return Promise.resolve().then(async () => structuredClone(await response(c, a[0]))); },
       send: (c, ...a) => response(c, a[0]), sendSync: (c, ...a) => response(c, a[0]),
       on(c, cb) { if (!listeners.has(c)) listeners.set(c, new Set()); listeners.get(c).add(cb); return ipc; },
       once(c, cb) { const fn = (...a) => { ipc.off(c, fn); cb(...a); }; return ipc.on(c, fn); },
       off(c, cb) { listeners.get(c)?.delete(cb); return ipc; }, removeListener(c, cb) { return ipc.off(c, cb); }, removeAllListeners(c) { listeners.delete(c); } };
     window.require = name => {
-      if (name === 'electron') return { ipcRenderer: ipc, clipboard: { readText: () => '', availableFormats: () => [], writeText: () => deny('clipboard') }, shell: { openExternal: () => deny('shell') }, webFrame: { getZoomFactor: () => 1 } };
+      if (name === 'electron') return { ipcRenderer: ipc, clipboard: { readText: () => f.clipboardText || '', availableFormats: () => [], writeText: () => deny('clipboard') }, shell: { openExternal: () => deny('shell') }, webFrame: { getZoomFactor: () => 1 } };
       if (name === 'crypto') return { randomUUID: () => crypto.randomUUID() };
       if (name === 'path') return { sep: '/', join: (...s) => s.join('/').replace(/\/+/g, '/'), basename: s => s.split('/').pop(), dirname: s => s.slice(0, s.lastIndexOf('/')), extname: s => s.includes('.') ? '.' + s.split('.').pop() : '', isAbsolute: s => s.startsWith('/'), resolve: (...s) => s.join('/') };
       if (name === 'node:v8') return { deserialize: v => v };
@@ -58,7 +66,14 @@ try {
       return deny('require:' + name);
     };
     window.process = window.require('process');
-    window.fetch = () => Promise.reject(Error('Fixture network denied'));
+    window.fetch = async (url, options) => {
+      if (!url.startsWith('https://generativelanguage.googleapis.com/')) return deny('network:' + url);
+      f.aiRequest = JSON.parse(options.body);
+      const finish = () => f.aiFail ? { error: { message: 'Private AI refusal' } }
+        : { candidates: [{ content: { parts: [{ text: JSON.stringify({ shortTitle: 'Отступы', title: 'Подогнать расположение элементов без запроса к AI' }) }] } }] };
+      if (f.aiBlocked) await new Promise(resolve => { f.releaseAI = resolve; });
+      return { json: async () => finish() };
+    };
     window.WebSocket = class { constructor() { deny('WebSocket'); } };
     window.EventSource = class { constructor() { deny('EventSource'); } };
   }
@@ -84,17 +99,30 @@ try {
   assert.ok(await owner.locator('[data-task-plan-overflow]').isVisible());
   const stripY = await owner.locator('[data-task-plan-topic]').evaluateAll(ns => ns.map(n=>n.getBoundingClientRect().y));
   assert.equal(new Set(stripY).size,1); result.checks.push('responsibility/New/topics/controls share one line; overflow count visible; no wrapping');
+  const topicBaseWidth = await topic(0).evaluate(n => n.offsetWidth);
   await topic(0).hover(); await preview.waitFor(); await frames();
   assert.match(await preview.innerText(), /Отступы/);
-  const pv=await preview.boundingBox(), root=await owner.boundingBox();assert.ok(pv.width < root.width);assert.ok(pv.y >= root.y+root.height-2);
+  const pv=await preview.boundingBox(), root=await owner.boundingBox();assert.ok(pv.width < root.width * .5);assert.ok(pv.y >= root.y+root.height-2);
+  const scale = await topic(0).evaluate(n=>({layout:n.offsetWidth,visible:n.getBoundingClientRect().width,transform:getComputedStyle(n).transform}));
+  assert.equal(scale.layout,topicBaseWidth);assert.ok(scale.visible>scale.layout*1.03);assert.match(scale.transform,/1\.04/);
+  await preview.hover();await frames();assert.equal(await preview.count(),1);assert.match(await topic(0).evaluate(n=>getComputedStyle(n).transform),/1\.04/);
   await preview.screenshot({ path:path.join(artifact,'hover.png') });
   await page.mouse.move(20,660);await frames();assert.equal(await preview.count(),0);
-  result.checks.push('hover preview below strip is narrower than panel and closes on leave');
+  assert.equal(await topic(0).evaluate(n=>getComputedStyle(n).transform),'none');
+  result.checks.push('short hover preview hugs text; chip scales without changing layout and holds feedback inside preview');
+  await page.evaluate(()=>window.taskFixture.renameOutside('Очень длинное описание задачи '.repeat(12)));await topic(0).hover();await preview.waitFor();await frames();
+  const longPreview=await preview.boundingBox();assert.ok(longPreview.width<=root.width-12+1);assert.ok(longPreview.height>pv.height);
+  await preview.screenshot({path:path.join(artifact,'long-hover.png')});
+  await page.mouse.move(20,660);await page.evaluate(()=>window.taskFixture.renameOutside('Отступы'));await frames();
+  result.checks.push('long hover text wraps at inherited panel maximum, short text does not fill that maximum');
   await topic(0).click();await editor.waitFor();await page.mouse.move(20,660);await frames();assert.equal(await editor.count(),1);
+  assert.equal(await topic(0).getAttribute('data-task-plan-current'),'true');
+  assert.match(await topic(0).evaluate(n=>getComputedStyle(n).backgroundColor),/139, 92, 246/);
   assert.equal(await editor.locator('button[title="Назад · Cmd+Z"]').count(),0);
   await editor.getByTitle('Редактировать').first().click();await page.keyboard.press('Meta+A');await page.keyboard.insertText('Отступы изменены');
   await editor.getByRole('button',{name:'Закрыть задачу',exact:true}).click();await frames();
   assert.equal(await editor.count(),0);assert.equal(await page.evaluate(()=>window.taskFixture.state().items[0].title),'Отступы изменены');
+  assert.equal(await topic(0).getAttribute('data-task-plan-current'),null);
   assert.equal(await page.evaluate(()=>window.taskFixture.state('other').items[0].title),'Отступы');
   result.checks.push('click editor survives roaming; X commits exact task, other owner unchanged');
   await topic(0).click();await editor.waitFor();await editor.getByTitle('Редактировать').first().click();await page.keyboard.press('Meta+A');await page.keyboard.insertText('Сохранение с отказом');
@@ -114,32 +142,59 @@ try {
   await owner.locator('[data-task-plan-overflow]').click();await frames();
   const moved=await owner.locator('[data-task-plan-topic-strip]').evaluate(n=>n.scrollLeft);assert.ok(moved>0);
   await page.evaluate(()=>window.taskFixture.titles(false));await frames();
-  assert.equal(await owner.locator('[data-task-plan-topic]').first().innerText(),'×1');
+  assert.equal(await owner.locator('[data-task-plan-topic]').first().innerText(),'');
   assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('noted-terminal-task-status-marker')).showTitles),false);
   await topic(0).hover();await preview.waitFor();assert.match(await preview.innerText(),/Сохранение с отказом/);
+  assert.match(await topic(0).evaluate(n=>getComputedStyle(n).transform),/1\.16/);
+  await topic(0).click();await editor.waitFor();await page.mouse.move(20,660);await frames();
+  assert.equal(await topic(0).getAttribute('data-task-plan-current'),'true');
+  assert.match(await topic(0).evaluate(n=>getComputedStyle(n).backgroundColor),/139, 92, 246/);
+  await editor.getByRole('button',{name:'Закрыть задачу',exact:true}).click();await frames();
+  assert.equal(await topic(0).getAttribute('data-task-plan-current'),null);
   result.checks.push('overflow action scrolls; manual marker-only preference persists and preserves hover access');
   await page.mouse.move(20,660);await page.evaluate(()=>window.taskFixture.titles(true));await frames();
   const other=page.locator('[data-other-fixture] [data-task-plan-topic="task-0"]');await other.click();await editor.waitFor();await frames();
   const edge=await editor.boundingBox();assert.ok(edge.x>=8&&edge.x+edge.width<=1092);await editor.screenshot({path:path.join(artifact,'right-edge-editor.png')});
   await page.keyboard.press('Escape');await frames();
-  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();await editor.locator('textarea').waitFor();
-  assert.equal(await editor.locator('textarea').evaluate(n=>document.activeElement===n),true);
+  const beforeNew=await page.evaluate(()=>({document:window.taskFixture.state(),calls:window.taskFixture.calls.filter(c=>c==='tab-task-plan:apply').length}));
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();await editor.getByRole('textbox',{name:'Короткое название'}).waitFor();await frames();
+  assert.equal(await editor.getByRole('textbox',{name:'Короткое название'}).inputValue(),'');assert.equal(await owner.locator('[data-task-plan-topic]').count(),beforeNew.document.items.length);
+  await owner.getByTitle('Новая задача',{exact:true}).click();await frames();assert.equal(await editor.count(),1);assert.equal(await editor.getByRole('textbox',{name:'Короткое название'}).inputValue(),'');
+  await editor.screenshot({path:path.join(artifact,'new-empty.png')});
+  await outside();await frames();assert.equal(await editor.count(),0);
+  assert.deepEqual(await page.evaluate(()=>window.taskFixture.state()),beforeNew.document);
+  assert.equal(await page.evaluate(()=>window.taskFixture.calls.filter(c=>c==='tab-task-plan:apply').length),beforeNew.calls);
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();await editor.getByRole('textbox',{name:'Короткое название'}).waitFor();await page.keyboard.insertText('   ');await outside();await frames();
+  assert.equal(await editor.count(),0);assert.deepEqual(await page.evaluate(()=>window.taskFixture.state()),beforeNew.document);
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();await page.keyboard.press('Enter');await frames();assert.equal(await editor.count(),0);
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();await page.keyboard.insertText('Отменённая мысль');await page.keyboard.press('Escape');await frames();
+  assert.equal(await editor.count(),0);assert.deepEqual(await page.evaluate(()=>window.taskFixture.state()),beforeNew.document);
+  result.checks.push('New is blank and unsaved; repeated New, empty/whitespace overlay, empty Enter and Escape leave plan/revision/undo untouched');
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();await editor.getByRole('textbox',{name:'Короткое название'}).waitFor();
+  assert.equal(await editor.getByRole('textbox',{name:'Короткое название'}).evaluate(n=>document.activeElement===n),true);
   await page.keyboard.press('Meta+A');await page.keyboard.insertText('Новая мысль');await page.keyboard.press('Enter');await frames();
   assert.equal(await page.evaluate(()=>window.taskFixture.state().items.at(-1).title),'Новая мысль');
   await editor.getByRole('button',{name:'Закрыть задачу',exact:true}).click();await frames();
   result.checks.push('right-edge placement stays in viewport; New opens editor directly and saves through original plan operations');
   await owner.locator('[data-task-plan-header]').focus();await page.keyboard.press('Meta+z');await frames();
-  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.at(-1).title),'Новая задача');
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.length),beforeNew.document.items.length);
   await page.keyboard.press('Meta+Shift+z');await frames();
   assert.equal(await page.evaluate(()=>window.taskFixture.state().items.at(-1).title),'Новая мысль');
   assert.equal(await owner.locator('[data-task-plan-footer]').count(),0);
   result.checks.push('removed footer preserves keyboard undo/redo on the plan');
-  await topic(0).click();await editor.waitFor();await editor.locator('[data-task-plan-editor]').click({button:'right'});
+  await topic(0).click();await editor.waitFor();await editor.getByRole('textbox',{name:'Короткое название'}).click({button:'right'});
   const actions=page.locator('[data-task-plan-action-menu]');await actions.waitFor();await page.keyboard.press('Escape');await frames();
   assert.equal(await actions.count(),0);assert.equal(await editor.count(),1);
   await topic(0).click();await frames();assert.equal(await editor.count(),0);
   result.checks.push('context-menu Escape is top-only; repeated topic trigger closes its editor');
   await owner.locator('[data-task-plan-header]').focus();await page.keyboard.press('Enter');await frames();
+  await owner.locator('[data-task-plan-open="task-0"]').click();await editor.waitFor();await page.mouse.move(20,660);await frames();
+  assert.equal(await owner.locator('[data-task-plan-task-id="task-0"]').getAttribute('data-task-plan-current'),'true');
+  const expandedBackground = await owner.locator('[data-task-plan-task-id="task-0"] > div').first().evaluate(n=>getComputedStyle(n).backgroundColor);
+  assert.match(expandedBackground,/139, 92, 246/);
+  await editor.getByRole('button',{name:'Закрыть задачу',exact:true}).click();await frames();
+  assert.equal(await owner.locator('[data-task-plan-task-id="task-0"]').getAttribute('data-task-plan-current'),null);
+  result.checks.push('opened task retains background in marker-only, titled and expanded views; dismissal clears it');
   await owner.locator('[data-task-plan-open="task-0"]').click({button:'right'});await actions.waitFor();
   await actions.getByText('Отметить выполненной',{exact:true}).click();await frames();
   assert.equal(await page.evaluate(()=>window.taskFixture.state().archivedItems[0].id),'task-0');
@@ -148,10 +203,126 @@ try {
   await actions.getByText('Вернуть в активное',{exact:true}).click();await frames();
   assert.ok(await page.evaluate(()=>window.taskFixture.state().items.some(t=>t.id==='task-0')));
   result.checks.push('expanded list, archive and restoration remain available through existing actions');
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();await editor.getByRole('textbox',{name:'Короткое название'}).waitFor();
+  const beforePending=await page.evaluate(()=>({count:window.taskFixture.state().items.length,calls:window.taskFixture.calls.filter(c=>c==='tab-task-plan:apply').length}));
+  await page.evaluate(()=>window.taskFixture.blockCreation=true);await page.keyboard.insertText('Одна отложенная запись');await page.keyboard.press('Enter');await frames();
+  assert.equal(await page.evaluate(()=>typeof window.taskFixture.releaseCreation),'function');
+  await outside();await owner.getByTitle('Новая задача',{exact:true}).click();await frames();
+  assert.equal(await page.evaluate(()=>window.taskFixture.calls.filter(c=>c==='tab-task-plan:apply').length),beforePending.calls+1);
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.length),beforePending.count);
+  await page.evaluate(()=>window.taskFixture.releaseCreation());await frames();
+  assert.equal(await editor.count(),0);assert.equal(await page.evaluate(()=>window.taskFixture.state().items.length),beforePending.count+1);
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.filter(t=>t.title==='Одна отложенная запись').length),1);
+  result.checks.push('Enter/overlay/repeated New share one pending creation; closing does not reopen the acknowledged task');
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();await editor.getByRole('textbox',{name:'Короткое название'}).waitFor();
+  await page.evaluate(()=>window.taskFixture.failNext=true);await page.keyboard.insertText('Сохранить после отказа');await page.keyboard.press('Enter');await frames();
+  assert.equal(await editor.getByRole('textbox',{name:'Короткое название'}).inputValue(),'Сохранить после отказа');
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.some(t=>t.title==='Сохранить после отказа')),false);
+  await outside();await frames();assert.equal(await editor.count(),0);
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.filter(t=>t.title==='Сохранить после отказа').length),1);
+  result.checks.push('refused creation retains typed draft; later explicit overlay commit creates one task');
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();await editor.getByRole('textbox',{name:'Короткое название'}).waitFor();
+  await page.evaluate(()=>window.taskFixture.blockCreation=true);await page.keyboard.insertText('Сохранить без смены редактора');await page.keyboard.press('Enter');await frames();
+  await topic(0).click();await frames();assert.equal(await editor.locator('[data-task-plan-editor]').getAttribute('data-task-plan-editor'),'task-0');
+  await page.evaluate(()=>window.taskFixture.releaseCreation());await frames();
+  assert.equal(await editor.locator('[data-task-plan-editor]').getAttribute('data-task-plan-editor'),'task-0');
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.filter(t=>t.title==='Сохранить без смены редактора').length),1);
+  await editor.getByRole('button',{name:'Закрыть задачу',exact:true}).click();await frames();
+  result.checks.push('late creation saves its exact task and leaves a subsequently opened editor in place');
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();
+  await editor.getByRole('textbox',{name:'Короткое название'}).fill('/ai');await outside();await frames();
+  assert.equal(await editor.locator('[data-task-plan-command-menu]').count(),0);assert.equal(await editor.count(),1);
+  await outside();await frames();assert.equal(await editor.count(),0);
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.some(t=>t.title==='/ai')),false);
+  result.checks.push('header command menu outside-cancel consumes the gesture; /ai never becomes a task');
+  const pasteBody='Хочу немного сдвинуть иконки вкладки и файловый чип влево.\n\n**Точный исходный текст**\n\tНе сокращать.  \n';
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();
+  await editor.getByRole('textbox',{name:'Короткое название'}).fill('/ai');
+  await editor.getByRole('menuitem',{name:'AI Paste'}).click();
+  await page.evaluate(body=>{window.taskFixture.clipboardText=body;},pasteBody);await page.keyboard.press('Meta+v');
+  await page.waitForFunction(()=>window.taskFixture.state().items.at(-1).shortTitle==='Отступы');await frames();
+  const generated=await page.evaluate(()=>({task:window.taskFixture.state().items.at(-1),request:window.taskFixture.aiRequest,usage:window.taskFixture.aiUsage}));
+  assert.equal(generated.task.body,pasteBody);assert.equal(generated.task.title,'Подогнать расположение элементов без запроса к AI');
+  assert.equal(generated.request.systemInstruction.parts[0].text,'Private configured task theme');assert.equal(generated.usage.promptId,'task-theme');
+  assert.equal(await editor.getByRole('textbox',{name:'Короткое название'}).inputValue(),'Отступы');
+  assert.equal(await owner.locator(`[data-task-plan-topic="${generated.task.id}"]`).innerText(),'Отступы');
+  await editor.screenshot({path:path.join(artifact,'ai-task.png')});
+  result.checks.push('New /ai -> AI Paste -> native paste creates three fields; original body exact, configured dedicated prompt/model used');
+  const markdown=editor.locator('[data-task-theme-body] .cm-content');await markdown.click();await page.keyboard.press('Meta+/');
+  const gtPalette=page.locator('[data-command-palette]');await gtPalette.waitFor();await frames();
+  assert.equal(await gtPalette.getAttribute('data-task-plan-editor-menu'),'true');
+  assert.ok(await gtPalette.evaluate(n=>Number(getComputedStyle(n).zIndex)>2147482400));
+  await gtPalette.hover();await frames();assert.equal(await editor.count(),1);await page.keyboard.press('Escape');await frames();
+  assert.equal(await gtPalette.count(),0);assert.equal(await editor.count(),1);
+  await markdown.click();await page.keyboard.press('Meta+/');await gtPalette.waitFor();await frames();await outside();await frames();
+  assert.equal(await gtPalette.count(),0);assert.equal(await editor.count(),1);
+  const beforeContextListeners=await page.evaluate(()=>window.taskFixture.documentListeners());
+  await markdown.click({button:'right'});const gtContext=page.locator('[data-context-menu]');await gtContext.waitFor();await frames();
+  assert.equal(await gtContext.getAttribute('data-task-plan-editor-menu'),'true');
+  await page.keyboard.press('Escape');await frames();assert.equal(await gtContext.count(),0);assert.equal(await editor.count(),1);
+  assert.deepEqual(await page.evaluate(()=>window.taskFixture.documentListeners()),beforeContextListeners);
+  await markdown.click({button:'right'});await gtContext.waitFor();await frames();
+  await outside();await frames();assert.equal(await gtContext.count(),0);assert.equal(await editor.count(),1);
+  assert.deepEqual(await page.evaluate(()=>window.taskFixture.documentListeners()),beforeContextListeners);
+  await outside();await frames();assert.equal(await editor.count(),0);
+  result.checks.push('actual GT body palette/context menus render above parent, have exact ownership and dismiss one level without closing task');
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();
+  await editor.getByRole('textbox',{name:'Короткое название'}).focus();await page.keyboard.press('Meta+/');
+  await editor.getByRole('menuitem',{name:'AI Paste'}).click();
+  await page.evaluate(()=>{window.taskFixture.aiBlocked=true;window.taskFixture.releaseAI=null;});await page.keyboard.press('Meta+v');
+  await page.waitForFunction(()=>typeof window.taskFixture.releaseAI==='function');
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.at(-1).body),pasteBody);
+  await editor.getByRole('textbox',{name:'Короткое название'}).fill('Ручное имя');
+  await page.evaluate(()=>{window.taskFixture.aiBlocked=false;window.taskFixture.releaseAI();});await frames();await frames();
+  assert.equal(await editor.getByRole('textbox',{name:'Короткое название'}).inputValue(),'Ручное имя');
+  await editor.getByRole('button',{name:'Закрыть задачу',exact:true}).click();await frames();
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.at(-1).shortTitle),'Ручное имя');
+  result.checks.push('body is saved before AI; a late answer cannot overwrite a manual microtitle');
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();
+  await editor.getByRole('textbox',{name:'Короткое название'}).fill('/ai');await editor.getByRole('menuitem',{name:'AI Paste'}).click();
+  await page.evaluate(()=>{window.taskFixture.aiFail=true;});await page.keyboard.press('Meta+v');
+  await page.waitForFunction(()=>!document.querySelector('[data-task-theme-editor] [role="status"]'));
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.at(-1).body),pasteBody);
+  await page.evaluate(()=>{window.taskFixture.aiFail=false;});await editor.getByRole('button',{name:'Сформировать названия с AI'}).click();
+  await page.waitForFunction(()=>window.taskFixture.state().items.at(-1).shortTitle==='Отступы');await frames();
+  assert.equal(await page.evaluate(()=>window.taskFixture.state().items.at(-1).body),pasteBody);
+  await editor.getByRole('button',{name:'Закрыть задачу',exact:true}).click();await frames();
+  result.checks.push('AI failure leaves full source stored; explicit retry updates only metadata');
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();
+  await editor.getByRole('textbox',{name:'Короткое название'}).fill('/ai');await editor.getByRole('menuitem',{name:'AI Paste'}).click();
+  await page.evaluate(()=>{window.taskFixture.aiBlocked=true;window.taskFixture.releaseAI=null;});await page.keyboard.press('Meta+v');
+  await page.waitForFunction(()=>typeof window.taskFixture.releaseAI==='function');
+  const beforeLate=await page.evaluate(()=>window.taskFixture.state().items.at(-1));
+  await topic(0).click();await editor.waitFor();await frames();
+  await page.evaluate(()=>{window.taskFixture.aiBlocked=false;window.taskFixture.releaseAI();});await frames();await frames();
+  assert.equal(await editor.locator('[data-task-plan-editor]').getAttribute('data-task-plan-editor'),'task-0');
+  await page.waitForFunction(id=>window.taskFixture.state().items.find(t=>t.id===id)?.shortTitle==='Отступы',beforeLate.id);
+  assert.equal(await page.evaluate(id=>window.taskFixture.state().items.find(t=>t.id===id).body,beforeLate.id),beforeLate.body);
+  await editor.getByRole('button',{name:'Закрыть задачу',exact:true}).click();await frames();
+  result.checks.push('closing/switching presentation does not cancel AI; exact unchanged task gets metadata, other editor/focus and source body stay unchanged');
+  await owner.getByTitle('Новая задача',{exact:true}).click();await editor.waitFor();
+  await editor.getByRole('textbox',{name:'Короткое название'}).fill('/ai');await editor.getByRole('menuitem',{name:'AI Paste'}).click();
+  await page.evaluate(()=>{window.taskFixture.dropThemeFields=true;window.taskFixture.aiRequest=null;});await page.keyboard.press('Meta+v');await frames();await frames();
+  assert.equal(await page.evaluate(()=>window.taskFixture.aiRequest),null);
+  assert.match(await editor.locator('[data-task-theme-body]').innerText(),/Точный исходный текст/);
+  const partialId=await editor.locator('[data-task-plan-editor]').getAttribute('data-task-plan-editor');
+  await outside();await frames();assert.equal(await editor.count(),1);
+  await page.evaluate(()=>{window.taskFixture.dropThemeFields=false;});await editor.getByRole('button',{name:'Сформировать названия с AI'}).click();
+  await page.waitForFunction(id=>window.taskFixture.state().items.find(t=>t.id===id)?.shortTitle==='Отступы',partialId);
+  assert.equal(await page.evaluate(id=>window.taskFixture.state().items.find(t=>t.id===id)?.body,partialId),pasteBody);
+  assert.equal(await page.evaluate(id=>window.taskFixture.state().items.filter(t=>t.id===id).length,partialId),1);
+  await editor.getByRole('button',{name:'Закрыть задачу',exact:true}).click();await frames();
+  result.checks.push('legacy/skewed Main partial ACK cannot erase the body or trigger AI; explicit retry updates the same real task after upgrade');
   await page.screenshot({path:path.join(artifact,'final.png')});
   const safety=await page.evaluate(()=>({unknown:window.taskFixture.unknown,violations:window.taskFixture.violations}));
   assert.deepEqual(safety.violations,[]);assert.deepEqual(safety.unknown,[]);assert.deepEqual(result.errors,[]);
   result.pass=true;
-} catch(error) { result.error=error.stack||String(error); }
+} catch(error) {
+  result.error=error.stack||String(error);
+  if(app)try{const p=await app.firstWindow();result.menuDiagnostic=await p.evaluate(()=>({
+    editors:[...document.querySelectorAll('.cm-editor')].map(n=>({owner:n.dataset.taskPlanEditorViewOwner,gesture:n.dataset.taskPlanMenuGesture,before:n.dataset.taskPlanMenuBefore,probe:n.dataset.taskPlanMenuProbe})),
+    menus:[...document.querySelectorAll('[data-command-palette],[data-context-menu]')].map(n=>({owner:n.dataset.taskPlanPopupOwner,z:n.style.zIndex})),
+  }));await p.screenshot({path:path.join(artifact,'failed.png')});}catch{}
+}
 finally { if(app)try{await app.close();result.closed=true;}catch{} await fs.writeFile(path.join(artifact,'RESULT.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2)); }
 if(!result.pass)process.exitCode=1;

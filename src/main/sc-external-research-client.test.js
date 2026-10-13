@@ -87,3 +87,27 @@ test('old SC capabilities or an acceptance/foreign-job response cannot silently 
   await assert.rejects(client.openJob('job',{requestId:'nav'}),e=>e.code==='sc_research_navigation_unavailable');
   assert.equal(calls,1);
 });
+
+test('browser navigation is exact-job only and rejects legacy, queued or foreign ACKs', async () => {
+  const capability = { browserNavigation: { version: 1, exactJob: true, confirmedTab: true } };
+  for (const result of [{ ok: true, queued: true }, { ok: true, opened: true, jobId: 'other', requestId: 'nav', tabId: 7 },
+    { ok: true, opened: true, jobId: 'job', requestId: 'other', tabId: 7 },
+    { ok: true, opened: true, jobId: 'job', requestId: 'nav', tabId: -1 }]) {
+    const client = new ScExternalResearchClient({ fetchImpl: async url => response(200,
+      url.endsWith('/research-capabilities') ? capability : result) });
+    await assert.rejects(client.openBrowser('job', { requestId: 'nav' }), e => e.code === 'sc_research_browser_navigation_not_confirmed');
+  }
+  const calls = [];
+  const client = new ScExternalResearchClient({ fetchImpl: async (url, init) => {
+    calls.push([url, init.body ? JSON.parse(init.body) : null]);
+    return response(200, url.endsWith('/research-capabilities') ? capability
+      : { ok: true, opened: true, jobId: 'job', requestId: 'nav', tabId: 7 });
+  } });
+  await client.openBrowser('job', { requestId: 'nav' });
+  assert.deepEqual(calls[1][1], { jobId: 'job', requestId: 'nav' });
+  assert.match(calls[1][0], /\/research-open-browser$/);
+  let oldCalls = 0;
+  const old = new ScExternalResearchClient({ fetchImpl: async () => { oldCalls++; return response(200, {}); } });
+  await assert.rejects(old.openBrowser('job', { requestId: 'nav' }), e => e.code === 'sc_research_browser_navigation_unavailable');
+  assert.equal(oldCalls, 1);
+});

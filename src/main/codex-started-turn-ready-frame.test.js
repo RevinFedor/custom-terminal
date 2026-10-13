@@ -35,7 +35,12 @@ test('a Goal-started turn wakes the existing verifier from the assembled frame, 
   assert.equal(calls.length, 1, 'old composer without a live turn does not authorize startup');
 });
 
-test('idle Resume with animated composer wakes readiness before any submitted turn', async () => {
+for (const [name, composer] of [
+  ['animated', ['⠁ ⠄ ⢀', '⠐ ›⠁Ask Codex to do anything', '⠈ ⠂ ⡀ gpt-6-astra max']],
+  ['d10d3862 warning', ['» Ask Codex to do anything', ' ',
+    '  GPT-6-Astra ultra                                ⚠ 1 warning · f2 to view']],
+]) {
+test(`idle Resume with ${name} composer wakes readiness before any submitted turn`, async () => {
   const mirror = {}, calls = [];
   const launches = new Map([['T', { launchId: 'L', startedAt: 100 }]]);
   const command = new Map([['T', { isRunning: true }]]);
@@ -52,10 +57,9 @@ test('idle Resume with animated composer wakes readiness before any submitted tu
   };
   paint(['Resuming session…', '› Ask Codex to do anything', '? for shortcuts']);
   assert.equal(calls.length, 0, 'StartupDraft still cannot submit');
-  const animated = ['⠁ ⠄ ⢀', '⠐ ›⠁Ask Codex to do anything', '⠈ ⠂ ⡀ gpt-6-astra max'];
-  paint(animated, { liveSynchronizedOutputOpen: true });
+  paint(composer, { liveSynchronizedOutputOpen: true });
   assert.equal(calls.length, 0, 'open redraw never grants ready');
-  const frame = paint(animated);
+  const frame = paint(composer);
   assert.equal(calls.length, 1);
   await new Promise(resolve => setImmediate(resolve));
   command.set('T', { isRunning: false });
@@ -65,3 +69,4 @@ test('idle Resume with animated composer wakes readiness before any submitted tu
   observe('T', mirror, frame);
   assert.equal(calls.length, 1, 'no current launch or turn, no startup wake');
 });
+}

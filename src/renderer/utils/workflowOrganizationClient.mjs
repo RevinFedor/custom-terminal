@@ -1,6 +1,7 @@
 import { captureSpaceLayout, emptySpaceLayout } from './workspaceSpacesModel.mjs';
 import { INBOX_WORKFLOW_ID } from './workflowMembership.mjs';
 import { orderedWorkflows } from '../../shared/workflow-order.cjs';
+import {newerWorkflowGroups} from './workflowGroupClient.mjs';
 
 export function isExactGroupCloseGuard(guard, tabId, mutationId) {
   return !!guard && guard.tabId === tabId && typeof guard.mutationId === 'string' && !!guard.mutationId.trim()
@@ -100,7 +101,7 @@ export function organizationProjection(snapshot, current) {
   return {spaces,organizationWorkflowOrder:spaces.map(space=>space.id),activeSpaceId,...layout,tabWorkflowMembership,tabCatalog,
     organizationReady:true,organizationRevision:snapshot.publication.revision,
     organizationGeneration:snapshot.publication.generation,organizationError:null,
-    organizationMigrationScopes:snapshot.migrationScopes || {},globalGroups:snapshot.globalGroups};
+    organizationMigrationScopes:snapshot.migrationScopes || {},globalGroups:newerWorkflowGroups(current.globalGroups,snapshot.globalGroups)};
 }
 
 /** Follow a publication's order only if the local order still equals the last

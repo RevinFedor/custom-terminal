@@ -60,6 +60,40 @@ function fixture(t,{files=false}={}) {
 }
 const rejects=(fn,pattern)=>assert.throws(fn,error=>pattern.test(error.code || error.message));
 
+test('renderer stationary admission rejects exact identity replacement and a newly attached hidden descendant',t=>{
+  const f=fixture(t),a=f.admission({selectedTabIds:['B']});
+  assert.equal(workflowDragSourceValid(a,f.state()),true);
+  const identity=f.state();identity.tabCatalog.B={...identity.tabCatalog.B,storageId:999999};
+  assert.equal(workflowDragSourceValid(a,identity),false);
+  const subject=f.state();subject.tabCatalog.B={...subject.tabCatalog.B,
+    executionSubject:{...subject.tabCatalog.B.executionSubject,subjectId:'foreign-subject'}};
+  assert.equal(workflowDragSourceValid(a,subject),false);
+  f.db.prepare("UPDATE tabs SET visual_parent_tab_id='B' WHERE tab_id='child'").run();
+  assert.equal(workflowDragSourceValid(a,f.state()),false);
+});
+
+test('renderer admission protects hidden placement while allowing focus, resize and unrelated metadata',t=>{
+  const f=fixture(t),a=f.admission({selectedTabIds:['B']}),s=f.state();
+  s.splitFocusedIndex=8;s.splitPanes[0].height=800;s.openProjects.get('P').tabs.get('B').name='Live title';
+  assert.equal(workflowDragSourceValid(a,s),true);
+  const hidden=f.state();hidden.spaces.find(space=>space.id==='w2').layout.windowDisplayLayouts={hidden:{
+    splitPanes:[{windowId:'hidden',displayHidden:true,projectId:'P',tabId:'B',tabs:[{projectId:'P',tabId:'B'}]}]}};
+  assert.equal(workflowDragSourceValid(a,hidden),false);
+});
+
+test('renderer empty-group admission is not vacuously valid after ownership or membership change',t=>{
+  const f=fixture(t),group=f.api.groups.mutate('create',{version:1,mutationId:'guard-empty',
+    expectedRevision:f.api.groups.meta().revision,metadata:{name:'Empty',reserveWorkflowId:'w1'}}).groupId;
+  const s=f.state(),tree=f.outline(s),node=tree.find(node=>node.groupId===group);assert.ok(node);
+  const a=f.admission({sourceId:node.id,selectedTabIds:[]});assert.equal(a.familyIds.length,0);
+  assert.equal(workflowDragSourceValid(a,s),true);
+  const changed=f.state();changed.globalGroups.groups.find(row=>row.id===group).reserveWorkflowId='w2';
+  assert.equal(workflowDragSourceValid(a,changed),false);
+  f.api.groups.mutate('assign',{version:1,mutationId:'guard-member',expectedRevision:f.api.groups.meta().revision,
+    groupId:group,tabIds:['Q'],expectedTabGroups:{Q:null}});
+  assert.equal(workflowDragSourceValid(a,f.state()),false);
+});
+
 test('file menu reorders and reparents via canonical SQLite, preserving owner, mixed roots and independent AI files',t=>{
   const f=fixture(t,{files:true}),s=f.state();
   const files=collectTabLinkedFileTree(s.openProjects,'A'),outline=linkedFileOutline(files);

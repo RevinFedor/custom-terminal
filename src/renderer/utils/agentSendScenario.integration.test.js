@@ -33,6 +33,7 @@ async function buildBundle() {
         allowSendWhileBusy: true,
         optimisticBusyOnSend: false,
         optimisticActiveOnInterrupt: false,
+        hasPendingForkLaunch: () => options.pendingFork === true,
         getPresence: async () => {
           state.reads += 1;
           if (state.reads <= Number(options.presenceFailureReads || 0)) {
@@ -197,6 +198,14 @@ test('inactive Run After uses the shared scenario to Resume then submit once', a
   assert.deepEqual(events.filter((event) => event[0] === 'send'), [[
     'send', 'integration prompt', false, 'prompt-queue',
   ]]);
+  assert.equal(result.deliveryOutcome, 'confirmed');
+});
+
+for (const toolType of ['claude', 'codex']) test(`${toolType}: first Send waits for the pending Fork instead of creating a fresh conversation`, async () => {
+  const { result, events } = await bundle.run({ toolType, source: 'history-panel', status: 'inactive',
+    statusAtSend: 'inactive', pendingFork: true, becomeActiveOnSecondRead: true });
+  assert.equal(events.some(event => event[0] === 'startFresh' || event[0] === 'resume'), false);
+  assert.equal(events.filter(event => event[0] === 'send').length, 1);
   assert.equal(result.deliveryOutcome, 'confirmed');
 });
 

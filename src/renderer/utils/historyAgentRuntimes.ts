@@ -15,6 +15,8 @@ import {
   planCodexLaunchSettingsPersistence,
 } from './codexEffectiveSettings.mjs';
 import { terminalRegistry } from './terminalRegistry';
+import { resolvePtyAgentOwner } from './ptyAgentOwner.mjs';
+import { createAgentLaunchAdmission, withAgentLaunchAdmission } from './agentLaunchAdmission.mjs';
 import {
   answerClaudeQuestion,
   copyClaudePtyDraft,
@@ -118,6 +120,18 @@ export interface AgentSendTarget {
   launchId?: string | null;
 }
 
+// These fields belong to the existing Main Send attempt. The callback stays
+// local to the renderer and is never serialized into an IPC payload.
+export interface AgentSendLaunchContext {
+  sendOperationKey?: string | null;
+  sendAttemptId?: string | null;
+  expectedTarget?: AgentSendTarget;
+  assertNotCancelled?: () => void;
+  launchFence?: { terminalInstanceId: string; stopRevision: number } | null;
+  launchAdmission?: ReturnType<typeof createAgentLaunchAdmission>;
+  acceptPreparedSession?: (sessionId: string) => void;
+}
+
 export interface AgentSendPromptOptions {
   handoffId?: string;
   sendAttemptId?: string;
@@ -219,6 +233,9 @@ export interface HistoryAgentRuntime {
     projectId?: string | null,
     context?: AgentPresenceRequestContext,
   ) => Promise<AgentPtyPresence>;
+  // Local creation intent, not provider presence/readiness. Send may wait for
+  // this already-requested Fork, but must not start a different fresh session.
+  hasPendingForkLaunch?: (tabId: string) => boolean;
   prepareMainComposerForSend?: (tabId: string, options: {
     expectedTarget: AgentSendTarget;
     sendOperationKey?: string | null;
@@ -228,15 +245,13 @@ export interface HistoryAgentRuntime {
     tabId: string;
     cwd?: string;
     developerInstructions?: string;
-    sendOperationKey?: string | null;
-    sendAttemptId?: string | null;
-  }) => Promise<AgentResumeResult>;
+  } & AgentSendLaunchContext) => Promise<AgentResumeResult>;
   resume: (args: {
     tabId: string;
     sessionId: string;
     cwd?: string;
     resumePausedGoal?: boolean;
-  }) => Promise<AgentResumeResult>;
+  } & AgentSendLaunchContext) => Promise<AgentResumeResult>;
   sendPrompt: (tabId: string, prompt: string, options?: AgentSendPromptOptions) => Promise<any>;
   recordHistoryContext: (
     tabId: string,
@@ -317,26 +332,53 @@ const findTabRuntimeContext = (
 
 async function startFreshClaudePtySession({
   tabId,
+  cwd,
   sendOperationKey,
   sendAttemptId,
+  expectedTarget,
+  assertNotCancelled,
+  launchFence,
+  launchAdmission,
 }: {
   tabId: string;
   cwd?: string;
-  sendOperationKey?: string | null;
-  sendAttemptId?: string | null;
-}): Promise<AgentResumeResult> {
+} & AgentSendLaunchContext): Promise<AgentResumeResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
+  const projectId = findTabRuntimeContext(tabId)?.projectId;
+  const readUi = () => projectId ? useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId) : null;
+  const before = readUi();
+  const presentation = before && { sessionId: before.claudeSessionId || null, cwd: before.cwd,
+    interrupted: !!before.wasInterrupted, dismissed: !!before.overlayDismissed };
+  return withAgentLaunchAdmission({ launchAdmission,
+    invoke: ipcRenderer.invoke.bind(ipcRenderer), events: ipcRenderer, tabId, toolType: 'claude', cwd,
+    launchFence, sendOperationKey, sendAttemptId, expectedTarget, assertCurrent: assertNotCancelled,
+  }, async admission => {
   const store = useWorkspaceStore.getState();
   store.setTabCommandType(tabId, 'claude');
   store.markAiLaunchAutoTitle(tabId, 'claude');
   console.log('[ClaudePtyActions:startFresh] start tab=' + shortTab(tabId));
-  const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude', sendOperationKey, sendAttemptId })
-    .catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+  assertNotCancelled?.();
+  const runResult = await admission.run('claude:run-command', {
+    tabId, command: 'claude', sendOperationKey, sendAttemptId, expectedTarget, launchFence,
+  });
   if (runResult?.success === false) {
     return { ...runResult, success: false, error: runResult.error || runResult.reason || 'Claude start failed' };
   }
-  store.clearInterruptedState?.(tabId);
+  const observed = runResult.observedLaunchFence, original = runResult.launchFence;
+  const matchesUi = (id: string | null) => {
+    const current = readUi();
+    return !!presentation && !!current && current.cwd === presentation.cwd
+      && resolvePtyAgentOwner(current) === 'claude' && (current.claudeSessionId || null) === id
+      && !!current.wasInterrupted === presentation.interrupted && !!current.overlayDismissed === presentation.dismissed;
+  };
+  const currentSessionId = readUi()?.claudeSessionId || null;
+  if (matchesUi(currentSessionId)
+    && (observed === undefined || !!observed && observed.terminalInstanceId === original?.terminalInstanceId
+      && observed.stopRevision === original?.stopRevision)
+    && (currentSessionId === presentation?.sessionId || !!currentSessionId && await admission.reconcileSession(currentSessionId))
+    && matchesUi(currentSessionId)) store.clearInterruptedState?.(tabId);
   return { ...runResult, success: true, status: 'starting' };
+  });
 }
 
 async function getCodexPtyPresence(
@@ -368,46 +410,114 @@ async function getCodexPtyPresence(
   return presence;
 }
 
+function hasPendingContextForkLaunch(tabId: string): boolean {
+  const tab = findTabRuntimeContext(tabId)?.tab;
+  return !!tab?.pendingAction?.contextFork && !tab.claudeSessionId && !tab.codexSessionId;
+}
+
 async function resumeCodexSession({
   tabId,
   sessionId,
   cwd,
   resumePausedGoal,
+  sendOperationKey,
+  sendAttemptId,
+  expectedTarget,
+  assertNotCancelled,
+  launchFence,
+  launchAdmission,
 }: {
   tabId: string;
   sessionId: string;
   cwd?: string;
   resumePausedGoal?: boolean;
-}): Promise<AgentResumeResult> {
+} & AgentSendLaunchContext): Promise<AgentResumeResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
   if (!sessionId) return { success: false, error: 'sessionId required' };
+  const projectId = findTabRuntimeContext(tabId)?.projectId;
+  const readUi = () => projectId ? useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId) : null;
+  const before = readUi();
+  const presentation = before && { sessionId: before.codexSessionId, cwd: before.cwd,
+    interrupted: before.wasInterrupted, dismissed: before.overlayDismissed };
+  return withAgentLaunchAdmission({ launchAdmission,
+    invoke: ipcRenderer.invoke.bind(ipcRenderer), events: ipcRenderer, tabId, toolType: 'codex', sessionId, cwd,
+    launchFence, sendOperationKey, sendAttemptId, expectedTarget, assertCurrent: assertNotCancelled,
+  }, async admission => {
   const store = useWorkspaceStore.getState();
   store.setTabCommandType(tabId, 'codex');
   console.log('[CodexHistoryActions:resume] start tab=' + shortTab(tabId) + ' sid=' + sessionId.slice(0, 8));
-  const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
-    tabId,
-    command: 'codex-c',
-    sessionId,
-    cwd,
-    ...(typeof resumePausedGoal === 'boolean' ? { resumePausedGoal } : {}),
-  })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
-  if (runResult?.success === false || runResult?.accepted === false) {
-    return { success: false, error: runResult.error || 'Codex resume failed' };
+  assertNotCancelled?.();
+  const runResult = await admission.run('codex:run-command', {
+    ...buildCodexRunPayload({
+      tabId,
+      command: 'codex-c',
+      sessionId,
+      cwd,
+      ...(typeof resumePausedGoal === 'boolean' ? { resumePausedGoal } : {}),
+    }),
+    sendOperationKey, sendAttemptId, expectedTarget, launchFence,
+  });
+  if (runResult?.success === false || (runResult?.accepted === false
+    && runResult?.acceptancePending !== true && runResult?.joined !== true)) {
+    return { ...runResult, success: false, error: runResult.error || 'Codex resume failed' };
   }
-  store.clearInterruptedState?.(tabId);
+  const observed = runResult.observedLaunchFence, original = runResult.launchFence;
+  const matchesUi = (id: string) => {
+    const current = readUi();
+    return !!presentation && !!current && current.cwd === presentation.cwd
+      && resolvePtyAgentOwner(current) === 'codex' && current.codexSessionId === id
+      && current.wasInterrupted === presentation.interrupted && current.overlayDismissed === presentation.dismissed;
+  };
+  const currentSessionId = readUi()?.codexSessionId;
+  if (currentSessionId && matchesUi(currentSessionId)
+    && (observed === undefined || !!observed && observed.terminalInstanceId === original?.terminalInstanceId
+      && observed.stopRevision === original?.stopRevision)
+    && (currentSessionId === presentation?.sessionId || await admission.reconcileSession(currentSessionId))
+    && matchesUi(currentSessionId)) store.clearInterruptedState?.(tabId);
   return { ...runResult, success: true, sessionId };
+  });
 }
 
 export async function startFreshCodexSession({
   tabId,
   cwd,
   developerInstructions,
+  sendOperationKey,
+  sendAttemptId,
+  expectedTarget,
+  assertNotCancelled,
+  launchFence: requestedLaunchFence,
+  launchAdmission,
+  acceptPreparedSession,
 }: {
   tabId: string;
   cwd?: string;
   developerInstructions?: string;
-}): Promise<AgentResumeResult> {
+} & AgentSendLaunchContext): Promise<AgentResumeResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
+  // Start may reuse an already-bound metadata-only UUID. Capture its source
+  // before begin; Main still proves that exact row and owns materialization.
+  let originalSessionId: string | null = null;
+  let originalProjectId: string | null = null;
+  let originalCwd: string | undefined;
+  const settingsKeys = ['codexModel', 'codexEffort', 'codexSettingsProofAt', 'codexSettingsIntentRevision'] as const;
+  let originalSettings: unknown[] = [];
+  for (const [projectId, workspace] of useWorkspaceStore.getState().openProjects) {
+    const tab = workspace.tabs.get(tabId);
+    if (tab) {
+      originalSessionId = tab.codexSessionId || null;
+      originalProjectId = projectId;
+      originalCwd = tab.cwd;
+      originalSettings = settingsKeys.map(key => tab[key]);
+      break;
+    }
+  }
+  return withAgentLaunchAdmission({ launchAdmission,
+    invoke: ipcRenderer.invoke.bind(ipcRenderer), events: ipcRenderer, tabId, toolType: 'codex',
+    sessionId: originalSessionId, cwd,
+    launchFence: requestedLaunchFence, sendOperationKey, sendAttemptId, expectedTarget,
+    assertCurrent: assertNotCancelled,
+  }, async admission => {
   const store = useWorkspaceStore.getState();
   store.setTabCommandType(tabId, 'codex');
   store.markAiLaunchAutoTitle(tabId, 'codex');
@@ -425,25 +535,55 @@ export async function startFreshCodexSession({
     break;
   }
   if (!projectId || !tabCwd) {
-    return { success: false, error: 'Codex tab project/cwd is unavailable' };
+    return { ...admission.snapshot(), success: false, code: 'agent_launch_source_unavailable',
+      reason: 'agent_launch_source_unavailable', error: 'Codex tab project/cwd is unavailable' };
   }
   console.log('[CodexHistoryActions:startFresh] materialize tab=' + shortTab(tabId));
-  const materialized = await ipcRenderer.invoke('codex:materialize-empty-session', {
+  assertNotCancelled?.();
+  const { launchFence } = await admission.ready();
+  assertNotCancelled?.();
+  const materialized = await admission.materialize({
     projectId,
     tabId,
     cwd: tabCwd,
-  }).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+    sendOperationKey, sendAttemptId, expectedTarget, launchFence,
+  });
   if (materialized?.success !== true || !materialized?.sessionId) {
-    return { success: false, error: materialized?.error || 'Codex session materialization failed' };
+    return { ...materialized, success: false, error: materialized?.error || 'Codex session materialization failed' };
   }
+  assertNotCancelled?.();
+  if (materialized.materializedSessionId !== materialized.sessionId) {
+    return { ...materialized, success: false, code: 'agent_launch_materialization_proof_missing',
+      reason: 'agent_launch_materialization_proof_missing', error: 'agent_launch_materialization_proof_missing',
+      accepted: false, launchWritten: false };
+  }
+  const readSourceTab = () => originalProjectId
+    ? useWorkspaceStore.getState().openProjects.get(originalProjectId)?.tabs.get(tabId) : null;
+  const sourceStillCurrent = (beforeBinding: boolean, expectedSessionId = materialized.sessionId) => {
+    const tab = readSourceTab();
+    const currentSessionId = tab?.codexSessionId || null;
+    return !!tab && tab.cwd === originalCwd && resolvePtyAgentOwner(tab) === 'codex'
+      && (currentSessionId === expectedSessionId || beforeBinding && currentSessionId === originalSessionId);
+  };
+  const bindingChanged = () => ({ ...materialized, success: false,
+    code: 'agent_launch_binding_changed', reason: 'agent_launch_binding_changed',
+    error: 'Codex target changed while materialization was pending' });
+  // Main's CAS owns the durable file, but its delayed ACK cannot overwrite a
+  // newer renderer binding. The actual non-history Store setter mutates before
+  // yielding; check again after its promise before clearing launch UI state.
+  if (!sourceStillCurrent(true)) return bindingChanged();
+  acceptPreparedSession?.(materialized.sessionId);
   const bound = await store.setCodexSessionId(
     tabId,
     materialized.sessionId,
     'detected',
   );
   if (!bound) {
-    return { success: false, error: 'Codex materialized session could not bind to the tab' };
+    return { ...admission.snapshot(), success: false, code: 'agent_launch_binding_changed',
+      reason: 'agent_launch_binding_changed', error: 'Codex materialized session could not bind to the tab' };
   }
+  if (!sourceStillCurrent(false)) return bindingChanged();
+  assertNotCancelled?.();
   // The durable UUID now belongs to the tab even if the following PTY launch
   // is rejected. Do not let a stale pre-materialization rollback restore the
   // old bash identity or erase this resumable metadata-only session.
@@ -456,6 +596,7 @@ export async function startFreshCodexSession({
     materializedFresh: materialized.metadataOnly === true,
     developerInstructions,
     ...launchOptions,
+    sendOperationKey, sendAttemptId, expectedTarget, launchFence,
   };
   console.log('[CodexHistoryActions:startFresh] resume tab=' + shortTab(tabId)
     + ' sid=' + String(materialized.sessionId).slice(0, 8)
@@ -463,18 +604,42 @@ export async function startFreshCodexSession({
     + ' effort=' + (runPayload.effort || '-')
     + ' modelSource=' + (runPayload.modelSource || '-')
     + ' effortSource=' + (runPayload.effortSource || '-'));
-  const runResult = await ipcRenderer.invoke('codex:run-command', runPayload)
-    .catch((err: any) => ({ success: false, error: String(err?.message || err) }));
-  if (runResult?.success === false || runResult?.accepted === false) {
-    return { success: false, error: runResult.error || 'Codex start failed' };
+  const beforeLaunchUi = readSourceTab();
+  const interruptedBeforeLaunch = beforeLaunchUi?.wasInterrupted;
+  const dismissedBeforeLaunch = beforeLaunchUi?.overlayDismissed;
+  const runResult = await admission.run('codex:run-command', runPayload);
+  if (runResult?.success === false || (runResult?.accepted === false
+    && runResult?.acceptancePending !== true && runResult?.joined !== true)) {
+    return { ...runResult, success: false, error: runResult.error || 'Codex start failed' };
   }
   const persisted = planCodexLaunchSettingsPersistence({
     command: 'codex-c',
     result: runResult,
     payload: runPayload,
   });
-  if (persisted) store.updateCodexState(tabId, persisted);
-  store.clearInterruptedState?.(tabId);
+  // The ACK describes a historical launch. It cannot project its old settings
+  // or interruption state onto a newer source or a newer settings choice.
+  const observed = runResult.observedLaunchFence;
+  let mayProject = observed === undefined || !!observed
+    && observed.terminalInstanceId === launchFence.terminalInstanceId
+    && observed.stopRevision === launchFence.stopRevision;
+  let projectionSessionId = materialized.sessionId;
+  if (mayProject && !sourceStillCurrent(false)) {
+    const child = readSourceTab()?.codexSessionId;
+    mayProject = !!child && sourceStillCurrent(false, child)
+      && await admission.reconcileSession(child);
+    if (mayProject) projectionSessionId = child!;
+  }
+  if (mayProject && sourceStillCurrent(false, projectionSessionId)) {
+    const tab = readSourceTab();
+    if (persisted && settingsKeys.every((key, index) => tab?.[key] === originalSettings[index])) {
+      store.updateCodexState(tabId, persisted);
+    }
+    const current = readSourceTab();
+    if (sourceStillCurrent(false, projectionSessionId)
+      && current?.wasInterrupted === interruptedBeforeLaunch
+      && current?.overlayDismissed === dismissedBeforeLaunch) store.clearInterruptedState?.(tabId);
+  }
   return {
     ...runResult,
     success: true,
@@ -482,6 +647,7 @@ export async function startFreshCodexSession({
     sessionId: materialized.sessionId,
     conversationMaterialized: false,
   };
+  });
 }
 
 async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSendPromptOptions = {}): Promise<any> {
@@ -858,6 +1024,7 @@ const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   optimisticBusyOnSend: false,
   optimisticActiveOnInterrupt: true,
   getPresence: getClaudePtyPresence,
+  hasPendingForkLaunch: hasPendingContextForkLaunch,
   startFresh: startFreshClaudePtySession,
   resume: resumeClaudePtySession,
   sendPrompt: sendClaudePtyPrompt,
@@ -891,6 +1058,7 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   optimisticBusyOnSend: false,
   optimisticActiveOnInterrupt: false,
   getPresence: getCodexPtyPresence,
+  hasPendingForkLaunch: hasPendingContextForkLaunch,
   prepareMainComposerForSend: (tabId, options) => ipcRenderer.invoke(
     'codex:prepare-main-composer-for-send', { tabId, ...options }),
   startFresh: startFreshCodexSession,

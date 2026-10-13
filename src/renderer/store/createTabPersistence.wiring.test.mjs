@@ -26,7 +26,7 @@ test('new tab promises resolve only after their durable project snapshot commits
     const rejectAt = implementation.indexOf('if (creationSnapshot?.success === false)');
     const rollbackAt = implementation.indexOf('rollbackUnmaterializedCreatedTab(projectId, tabId)');
     const killAt = implementation.indexOf("ipcRenderer.send('terminal:kill', tabId)");
-    const errorAt = implementation.indexOf("error.code = 'tab_persistence_failed'");
+    const errorAt = implementation.indexOf('error.code =');
     const returnAt = implementation.lastIndexOf('return tabId;');
     assert.ok(queueAt >= 0, 'same-project tab creation must use one commit lane');
     assert.ok(candidateAt > queueAt, 'the candidate Map must be built inside the commit lane');
@@ -36,6 +36,7 @@ test('new tab promises resolve only after their durable project snapshot commits
     assert.ok(rollbackAt > rejectAt, 'a failed create must remove its exact unmaterialized DB row');
     assert.ok(killAt > rollbackAt, 'PTY cleanup must wait for exact DB rollback');
     assert.ok(errorAt > rejectAt, 'the caller must receive an explicit persistence failure');
+    assert.match(implementation.slice(errorAt, returnAt), /tab_persistence_failed/);
     assert.ok(returnAt > errorAt, 'tabId must not escape after a negative persistence ACK');
   }
 });

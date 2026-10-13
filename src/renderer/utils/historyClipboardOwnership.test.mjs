@@ -14,6 +14,7 @@ import * as cmCommands from '@codemirror/commands';
 import * as persistence from './composerDraftPersistence.mjs';
 import { mergeFailedHistoryAuthoringSnapshots } from './historyDraftOwnership.mjs';
 import { recoverAgentDraftTransferToHistory } from './agentDraftTransfer.mjs';
+import { measureComposerClipboardCall } from './composerClipboardDiagnostics.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(directory, '../components/Workspace/HistoryPanel.tsx'), 'utf8');
@@ -142,7 +143,8 @@ function harness() {
     availableFormats: () => Object.keys(clipboardItem).map(type => 'text/' + (type === 'text' ? 'plain' : type)),
   };
   const adapter = vm.createContext({ exports: {}, Buffer, console: { log() {}, warn() {} },
-    require: name => name.includes('composerClipboard') ? clipboard : chips,
+    require: name => name.includes('composerClipboardDiagnostics') ? { measureComposerClipboardCall }
+      : name.includes('composerClipboard') ? clipboard : chips,
     window: { require: () => ({ clipboard: fakeClipboard }) },
   });
   vm.runInContext(compile(adapterSource), adapter);
@@ -158,6 +160,7 @@ function harness() {
     };
     const context = vm.createContext({
       ...chips, ...images, ...clipboard, ...ownership, useUIStore: api,
+      performance, currentUIActionId: () => 'ui-copy-test', uiPerformancePhase() {},
       tabId, tabIdRef: { current: tabId }, promptTextareaRef: { current: element }, promptCaretRef: { current: { start: 0, end: 0 } },
       dismissedContextUpdatesRef: { current: [] },
       getTabWorkContextSnapshot: id => ({ updates: contexts[id] || [] }),

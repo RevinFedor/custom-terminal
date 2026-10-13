@@ -1,3 +1,5 @@
+import {currentUIActionId,uiPerformancePhaseForAction} from './uiPerformanceDiagnostics.mjs';
+
 // A single, passive pointer presentation owner. No React/store broadcast on
 // Meta: only the hovered outline's small out-of-flow badge changes.
 const roots = new Set<HTMLElement>();
@@ -5,14 +7,16 @@ let stop: (()=>void) | null = null;
 let refresh: (()=>void) | null = null;
 
 function install() {
-  let held=false,point:{x:number;y:number}|null=null,badge:HTMLDivElement|null=null;
-  const hide=()=>{badge?.remove();badge=null;};
+  let held=false,point:{x:number;y:number}|null=null,badge:HTMLDivElement|null=null,ownerId='';
+  const hide=()=>{badge?.remove();badge=null;ownerId='';};
   const paint=()=>{
     if(!held || !point){hide();return;}
+    const hitStart=performance.now();
     const hit=document.elementFromPoint(point.x,point.y);
+    const hitTestMs=performance.now()-hitStart;
     const row=hit?.closest<HTMLElement>('[data-outline-hierarchy-modifier="meta"]');
     if(!row || ![...roots].some(root=>root.isConnected&&root.contains(row))
-      || hit?.closest('input,textarea,select,[contenteditable="true"],[data-no-drag],[data-tab-linked-files],button:not([data-tab-card])')){hide();return;}
+      || hit?.closest('input,textarea,select,[contenteditable="true"],[data-no-drag],[data-tab-linked-files],button:not([data-tab-card])')){hide();return hitTestMs;}
     if(!badge){
       badge=document.createElement('div');badge.dataset.commandHierarchyHint='true';badge.setAttribute('aria-hidden','true');
       badge.textContent='⌘ ↔ ⤷';badge.title='Изменить вложенность';
@@ -21,14 +25,19 @@ function install() {
         whiteSpace:'nowrap',boxShadow:'0 1px 4px #0008',contain:'layout paint style'});
       document.body.appendChild(badge);
     }
-    badge.dataset.owner=row.dataset.nodeId || '';
+    ownerId=row.dataset.nodeId || '';badge.dataset.owner=ownerId;
     badge.style.transform=`translate3d(${Math.max(0,Math.min(innerWidth-70,point.x+14))}px,${Math.max(0,Math.min(innerHeight-24,point.y+16))}px,0)`;
+    return hitTestMs;
   };
   const move=(event:PointerEvent)=>{
     point={x:event.clientX,y:event.clientY};
     held=event.metaKey || held;paint();
   };
-  const key=(event:KeyboardEvent)=>{if(event.key==='Meta'){held=event.type==='keydown';paint();}};
+  const key=(event:KeyboardEvent)=>{if(event.key==='Meta'){
+    const actionId=currentUIActionId(),started=performance.now();
+    held=event.type==='keydown';const hitTestMs=paint() || 0;
+    uiPerformancePhaseForAction(actionId,'command-hierarchy-feedback',{held,shown:!!badge,ownerId,hitTestMs,ms:performance.now()-started});
+  }};
   const blur=()=>{held=false;point=null;hide();};
   const leave=(event:PointerEvent)=>{if(!event.relatedTarget){point=null;hide();}};
   window.addEventListener('pointermove',move,true);

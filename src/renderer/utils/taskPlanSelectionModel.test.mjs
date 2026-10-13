@@ -8,6 +8,15 @@ import {
   formatTaskPlanTransfer,
 } from './taskPlanSelectionModel.mjs';
 
+test('topic body and short name survive extraction; transfer includes the full original body', () => {
+  const body = '  Исходный Markdown\r\n\t**полностью**\n\n';
+  const item = { id: 'topic', title: 'Развёрнутый заголовок', shortTitle: 'Тема', body, subtasks: [] };
+  assert.deepEqual(buildTaskPlanSelectionExtraction([item], []).nextItems, [item]);
+  const moved = buildTaskPlanSelectionExtraction([item], ['topic']);
+  assert.deepEqual(moved.transferItems, [item]); assert.deepEqual(moved.nextItems, []);
+  assert.ok(formatTaskPlanTransfer(moved.transferItems).includes(body));
+});
+
 const source = [
   {
     id: 'root-a',

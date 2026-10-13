@@ -937,6 +937,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'import_external_conversation',
   'continue_external_research',
   'send_message', 'reply_to_message', 'get_message', 'cancel_message', 'get_send_receipt',
+  'notify_user', 'get_user_notification',
   'reconcile_send_receipt', 'release_send_queue_head',
   'get_codex_goal', 'resolve_codex_goal',
   'rewind_history', 'get_history_operation', 'rewind_ai',
@@ -1354,6 +1355,13 @@ const TOOLS = [
     },
   },
   {
+    name: 'continue_delegation',
+    description: 'USER-REQUESTED recovery of one interrupted AI-tab delegation. The app checks the original source/target history, resumes the stopped executor through the common send scenario and submits ONE durable continue bound to that run. Already-working or ready results do not receive another prompt. Unknown delivery is checked, never replayed; changed/deleted/cancelled histories require a new explicit delegation. Does not restart browser research or change the original result recipient. After acceptance the original source receives the completion; do not poll or resubmit the old task.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {
+      runId: { type: 'string', minLength: 1 }, cwd: { type: 'string' },
+    }, required: ['runId'] },
+  },
+  {
     name: 'get_delegation_result',
     description: 'Recover the final answer or terminal failure for a full-session delegation or tracked external research run in one request. External research also returns jobId, conversationUrl and its structured SC result. A 202 response means the result is not ready; wait for the source completion notification instead of polling in a loop.' + ORCHESTRATION_COMPLETION_GUIDANCE,
     inputSchema: {
@@ -1707,8 +1715,25 @@ const TOOLS = [
     },
   },
   {
+    name: 'notify_user',
+    description: 'When the user asks to notify them, send their requested plain-text notification to Telegram from this full Noted Terminal session. Telegram only: no alarm, red tab/project highlight, sound, APNs or completion-bell setting. Optional waitSeconds (0..60) pauses this call only AFTER confirmed Telegram send; use the user-specified 20..30 second warning before an already-authorized cursor takeover. Only deliveryState=sent with waitCompleted=true completes that warning; accepted/pending/unknown does not. This does not grant cursor permission. A requestId is generated before network access; after lost ACK use get_user_notification or retry the identical text/waitSeconds with the SAME ID, never blind resend. Requires userNotifications version 1 in the running app.',
+    inputSchema: {
+      type: 'object', properties: {
+        text: { type: 'string', minLength: 1, maxLength: 2000, description: 'Notification text for the user, e.g. cursor takeover warning.' },
+        waitSeconds: { type: 'integer', minimum: 0, maximum: 60, description: 'User-requested pause after confirmed Telegram send; default 0.' },
+        requestId: { type: 'string', minLength: 1, maxLength: 128, description: 'Stable identity for an unchanged notification and wait. Generated when omitted.' },
+      }, required: ['text'], additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_user_notification',
+    description: 'Read the exact Telegram-only notification receipt from this calling session after a lost ACK. No send/retry, cursor action or polling. A sent receipt proves Telegram accepted the message, not that the user read it. Missing receipt is not permission to send under a new ID.',
+    inputSchema: { type: 'object', properties: { requestId: { type: 'string', minLength: 1, maxLength: 128 } },
+      required: ['requestId'], additionalProperties: false },
+  },
+  {
     name: 'send_message',
-    description: 'Ask a short question of a busy owner, with a durable messageId and server-owned return address. Both sessions may continue their current work; this creates no delegation/run dependency. The recipient should reply_to_message by messageId when the facts are ready, before its final answer. Accepted/queued means persistence or transport acceptance. Only deliveryState=sent confirms delivery; otherwise report the returned pending/queued/error state, never claim delivery from accepted=true. Delivery does not prove the model has read or answered it. Do not poll; get_message is for explicit diagnosis/recovery. Source identity always comes from this full session. An omitted requestId is generated before network access and returned even on transport failure; retry only the identical text/target with that exact requestId, never a blind new ID. Requires the updated tabMessages API; no send_prompt fallback.',
+    description: 'Ask a short question of a busy owner, with a durable messageId and server-owned return address. Both sessions may continue their current work; this creates no delegation/run dependency and does not revive an interrupted delegation. A reply saying continuing is only a status update; no later task final is forwarded automatically. To receive the final of work already confirmed resumed, use wait_for_tab_response; use delegate_to_session for a new tracked assignment. The recipient should reply_to_message by messageId when the facts are ready, before its final answer. Accepted/queued means persistence or transport acceptance. Only deliveryState=sent confirms delivery; otherwise report the returned pending/queued/error state, never claim delivery from accepted=true. Delivery does not prove the model has read or answered it. Do not poll; get_message is for explicit diagnosis/recovery. Source identity always comes from this full session. An omitted requestId is generated before network access and returned even on transport failure; retry only the identical text/target with that exact requestId, never a blind new ID. Requires the updated tabMessages API; no send_prompt fallback.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2693,6 +2718,17 @@ async function callTool(name, args) {
       return JSON.stringify({ ...result, runId, jobId }, null, 2);
     }
 
+    case 'continue_delegation': {
+      if (typeof args.runId !== 'string' || !args.runId.trim()) throw new Error('runId required');
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD_() });
+      const me = await httpApiGet(target, '/api/me');
+      if (me?.capabilities?.orchestrationContinuation?.version !== 1) {
+        throw Object.assign(new Error('Update Noted Terminal for durable Continue request. No Send, Resume or replay fallback was attempted.'), { code: 'app_update_required' });
+      }
+      const result = await httpApiPost(target, '/api/orchestrations/' + encodeURIComponent(args.runId) + '/action', { action: 'continue' });
+      return JSON.stringify({ ...result, guidance: 'Accepted continuation is not final completion. The original source receives its verified result. Unknown delivery never permits another continue or a replay of the original task.' }, null, 2);
+    }
+
     case 'get_delegation': {
       const target = projectHint({ cwd: args.cwd || PROJECT_CWD_() });
       const result = await httpApiGet(
@@ -2988,6 +3024,70 @@ async function callTool(name, args) {
       return 'Command sent to tab ' + args.tabId + ': ' + args.command;
     }
 
+    case 'notify_user':
+    case 'get_user_notification': {
+      const sourceTabId = requireNonemptyString(PARENT_TAB_ID(), 'current caller tab');
+      const isRead = name === 'get_user_notification';
+      const requestId = args.requestId === undefined && !isRead ? randomUUID()
+        : requireNonemptyString(args.requestId, 'requestId');
+      let mutationAttempted = false;
+      try {
+        const allowed = new Set(isRead ? ['requestId'] : ['requestId', 'text', 'waitSeconds']);
+        if (Object.keys(args).some(key => !allowed.has(key)) || requestId.length > 128
+          || /[\u0000-\u001f\u007f]/.test(requestId)) throw new Error('Invalid notification arguments');
+        const waitSeconds = args.waitSeconds ?? 0;
+        let text;
+        if (!isRead) {
+          text = requireNonemptyString(args.text, 'text');
+          if (text.length > 2000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)
+            || !Number.isInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 60) {
+            throw new Error('Notification text is limited to 2000 characters; waitSeconds must be an integer from 0 to 60');
+          }
+        }
+        const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, sourceTabId);
+        const me = await httpApiGet(target, '/api/me');
+        if (me?.capabilities?.userNotifications?.version !== 1
+          || me.capabilities.userNotifications.telegramOnly !== true) {
+          throw Object.assign(new Error('Update Noted Terminal for Telegram-only notify_user; no completion-bell or direct Telegram fallback was attempted.'), { code: 'app_update_required' });
+        }
+        const endpoint = '/api/terminal-tabs/' + encodeURIComponent(sourceTabId) + '/notifications';
+        let result;
+        if (isRead) result = await httpApiGet(target, endpoint + '?requestId=' + encodeURIComponent(requestId));
+        else {
+          mutationAttempted = true;
+          result = await httpApiPost(target, endpoint, { text, requestId, waitSeconds, sourceMeta: buildSourceMeta() });
+        }
+        if (result?.ok !== true || result.tabId !== sourceTabId || result.requestId !== requestId
+          || !['sent', 'pending', 'unknown', 'failed'].includes(result.deliveryState)
+          || result.channel !== 'telegram'
+          || !isRead && result.waitSeconds !== waitSeconds
+          || result.deliveryState === 'sent' && (result.accepted !== true
+            || !Number.isSafeInteger(result.sentAt) || result.sentAt <= 0
+            || !Number.isSafeInteger(result.messageId) || result.messageId <= 0
+            || !Number.isInteger(result.waitSeconds) || result.waitSeconds < 0 || result.waitSeconds > 60
+            || result.waitUntil !== result.sentAt + result.waitSeconds * 1000)) {
+          throw Object.assign(new Error('No matching Telegram delivery receipt was returned'), { code: 'notification_receipt_mismatch' });
+        }
+        if (!isRead && result.deliveryState === 'sent') {
+          const remaining = Math.max(0, result.waitUntil - Date.now());
+          if (remaining) await new Promise(resolve => setTimeout(resolve, remaining));
+        }
+        return JSON.stringify({ ...result,
+          waitCompleted: result.deliveryState === 'sent' && Date.now() >= result.waitUntil,
+          guidance: 'sent confirms Telegram accepted this message, not that the user read it. The requested warning is complete only when sent and waitCompleted=true; pending/unknown/failed must not start a cursor takeover. This notification does not grant permission to control input. No polling or new requestId; get_user_notification is for exact recovery.',
+        }, null, 2);
+      } catch (cause) {
+        const recovery = 'Read get_user_notification({requestId:' + JSON.stringify(requestId)
+          + '}) for exact recovery, or retry only the unchanged notify_user text/waitSeconds with this SAME requestId. Never resend under a new ID.';
+        const error = new Error(String(cause?.message || cause) + ' ' + recovery);
+        error.toolDetails = { code: cause?.code || (isRead ? 'notification_receipt_read_failed'
+          : mutationAttempted ? 'notification_delivery_unknown' : 'notification_preflight_failed'),
+          requestId, tabId: sourceTabId, mutationAttempted,
+          deliveryState: cause?.deliveryState || (isRead || mutationAttempted ? 'unknown' : 'not-submitted'), recovery };
+        throw error;
+      }
+    }
+
     case 'send_message':
     case 'reply_to_message': {
       const sourceTabId = PARENT_TAB_ID();
@@ -3026,7 +3126,7 @@ async function callTool(name, args) {
           messageId,
           requestId,
           deliveryState: result.deliveryState || result.message?.deliveryState || 'unknown',
-          guidance: 'accepted=true means the application stored this message. Only deliveryState=sent confirms delivery; pending/sending/queued/unconfirmed must not be reported as delivered. For failed/waiting-for-input report the returned error/state. Delivery is not proof the model has read or answered this message. Continue independent work; do not poll. Use get_message only for explicit diagnosis/recovery.',
+          guidance: 'accepted=true means the application stored this message. Only deliveryState=sent confirms delivery; pending/sending/queued/unconfirmed must not be reported as delivered. For failed/waiting-for-input report the returned error/state. Delivery is not proof the model has read or answered this message. This exchange does not revive an interrupted delegation or automatically forward a later task final. For work already confirmed resumed, wait_for_tab_response can track its result without another prompt; a pending message ACK is not proof work resumed. Continue independent work; do not poll. Use get_message only for explicit diagnosis/recovery.',
         }, null, 2);
       } catch (cause) {
         const recovery = 'Retry only the identical ' + name + ' call with requestId=' + JSON.stringify(requestId) + '; never use a new ID or changed text to check status.';

@@ -179,6 +179,14 @@ Paired main/renderer build PASS; source ещё не установлен. Арт
 
 ### Внешний MCP в Codex не становится ребёнком хаба
 
+10.10 по прямому запросу Fedor удалена общая таблица `MCP processes` со всеми
+systemPID/owner/Stop/Stop-orphans, не сама панель хаба или native config.
+Не возвращать её как диагностику обычной вкладки: shared6servers и их health/
+restart обслуживают все сессии; дополнительныеstdio подключения имеют другого
+владельца/транспорт. Отдельные Appium и browserbridge не завершаются по закрытию
+произвольной AI-вкладки. Списки владельцев/OS-liveness не смешивать; proof и
+границы false-orphan — `fact-resource-usage-panel.md::Брошенное против служебного`.
+
 Список хаба задан `defaultServerDefs()` и содержит шесть наших stdio-серверов; он не импортирует произвольные записи из Codex/Claude config. `6/6` подтверждает здоровье этого хаба, а внешние регистрации source-панель показывает отдельно из Codex (раздел UI выше). Например, `codex mcp add figma --url https://mcp.figma.com/mcp` добавляет прямое HTTP/OAuth-подключение в глобальный конфиг Codex. Отдельный локальный процесс Figma не нужен, а её native OAuth остаётся у Codex.
 
 Это объяснение относится к remote Figma HTTP/OAuth, не к Figma Console.

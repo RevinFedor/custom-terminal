@@ -6,17 +6,22 @@ const read = (path) => fs.readFileSync(new URL(path, import.meta.url), 'utf8');
 
 test('every renderer fresh Codex entrypoint materializes one UUID then resumes it', () => {
   const runtime = read('./historyAgentRuntimes.ts');
-  const controlBar = read('../components/Workspace/ClaudeControlBar.tsx');
-  const terminal = read('../components/Workspace/Terminal.tsx');
+  const admission = read('./agentLaunchAdmission.mjs');
   const app = read('../App.tsx');
 
   const start = runtime.match(/export async function startFreshCodexSession[\s\S]*?async function sendCodexPrompt/)?.[0] || '';
-  assert.match(start, /codex:materialize-empty-session/);
+  assert.match(start, /await admission\.materialize\(/);
+  assert.match(admission, /call\('codex:materialize-empty-session', frozen, 0\)/);
+  assert.match(start, /await admission\.run\('codex:run-command', runPayload\)/);
+  assert.ok(start.indexOf('getCodexLaunchOptions(tabId)') < start.indexOf('await admission.ready()'));
+  assert.ok(start.indexOf('await admission.materialize(') < start.indexOf('await admission.run('));
   assert.match(start, /setCodexSessionId[\s\S]*?'detected'/);
   assert.match(start, /command: 'codex-c'/);
   assert.match(start, /materializedFresh: materialized\.metadataOnly === true/);
   assert.doesNotMatch(start, /command: 'codex'/);
 
+  const controlBar = read('../components/Workspace/ClaudeControlBar.tsx');
+  const terminal = read('../components/Workspace/Terminal.tsx');
   assert.doesNotMatch(controlBar, /runCodexCommand\(\{ tabId, command: 'codex'/);
   assert.match(controlBar, /startFreshCodexSession\(\{ tabId, cwd: launchCwd \}\)/);
   assert.doesNotMatch(terminal, /buildCodexRunPayload\(\{ tabId, command: 'codex'/);

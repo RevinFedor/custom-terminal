@@ -16,6 +16,10 @@ function createCodexAuthProfileRoute({ configuration, readAuth, captureTab, now 
     || !/^[a-f0-9]{16}$/.test(accountKey || '')) throw fail('codex_auth_profile_configuration_invalid');
   const bindings = new Map();
   const routeToken = randomBytes(32).toString('hex');
+  const physicalOwnerKnown = current => !!current?.terminal
+    && typeof current.lifecycleGeneration === 'string' && current.lifecycleGeneration.length > 0
+    && Number.isSafeInteger(current.runSeq) && current.runSeq > 0
+    && current.commandRunning === true;
 
   function readCurrentAuth() {
     const auth = readAuth(homePath);
@@ -26,18 +30,29 @@ function createCodexAuthProfileRoute({ configuration, readAuth, captureTab, now 
   }
   function currentBinding(tabId, launchId) {
     const binding = bindings.get(tabId), current = captureTab(tabId);
-    if (!binding || !current?.terminal || current.cwd !== fixtureCwd
-      || current.terminal !== binding.terminal || current.launchId !== binding.launchId
-      || launchId !== binding.launchId) {
-      throw fail('codex_auth_route_owner_changed');
-    }
+    const reason = !binding ? 'binding-missing'
+      : !current?.terminal ? 'terminal-missing'
+      : current.cwd !== fixtureCwd ? 'cwd-changed'
+      : current.terminal !== binding.terminal ? 'terminal-replaced'
+      : !physicalOwnerKnown(current) ? 'physical-command-unavailable'
+      : current.lifecycleGeneration !== binding.lifecycleGeneration ? 'physical-generation-changed'
+      : current.runSeq !== binding.runSeq ? 'command-run-changed'
+      : launchId !== binding.launchId ? 'request-launch-changed'
+      // null means the actual Main startup map no longer has this payload.
+      // Only the ORIGINAL bound physical command can keep using that route.
+      // undefined/empty/conflicting launch records do not authorize a fallback.
+      : current.launchId !== null && current.launchId !== binding.launchId ? 'current-launch-changed'
+      : null;
+    if (reason) throw Object.assign(fail('codex_auth_route_owner_changed'), { reason });
     return binding;
   }
   function bind(tabId) {
     const current = captureTab(tabId);
-    if (!current?.terminal || !current.launchId || current.cwd !== fixtureCwd) throw fail('codex_auth_route_scope_mismatch');
+    if (!physicalOwnerKnown(current) || typeof current.launchId !== 'string'
+      || !current.launchId.trim() || current.cwd !== fixtureCwd) throw fail('codex_auth_route_scope_mismatch');
     readCurrentAuth();
-    bindings.set(tabId, { terminal: current.terminal, launchId: current.launchId });
+    bindings.set(tabId, Object.freeze({ terminal: current.terminal, launchId: current.launchId,
+      lifecycleGeneration: current.lifecycleGeneration, runSeq: current.runSeq }));
   }
   function authorize(tabId, headers, launchId) {
     currentBinding(tabId, launchId);

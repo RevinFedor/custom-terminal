@@ -51,6 +51,20 @@ unknown→renderer await→empty и БЕЗ `mergeRendererPositive`, не тол�
 History, Project API, Inbox, Terminal MCP, оркестраций и Run After. Защита
 input revision и независимые проверки native picker/Rewind не снимаются.
 Нет timer-success, повторного Enter или ожидания клика/переключения вкладки.
+
+10.10/4196 уточнил positive-only fallback: при ещё неизвестном текущем Main
+старый renderer-positive тоже не становится текущим черновиком. Main передаёт
+applied boundary даже во время незаконченного frame, сохраняя hasDraft=null.
+Обе стороны merge отбрасывают только доказанно более старую same-generation
+подсказку в unknown; прежний frame wake/deadline ждёт актуальный composer.
+Это не отрицательное доказательство для paste. Same/newer и отсутствие
+сопоставимых границ сохраняют консервативную защиту текста.
+Incident показал renderer5031 против Main5132 и строку рабочего контекста вместо
+ввода; Ctrl+G подтвердил empty, исходный Send затем получил exact SENT. Поэтому
+«exact empty input confirmed» — восстановленная preflight-проверка, не ошибка
+доставки и не основание повторять сообщение. Replay scheduling в тесте controlled,
+не физический повтор4196; остальные неожиданные противоречия не скрываются.
+
 Последующие вложенные чтения используют остаток одного main deadline, не
 получают новый бюджет. Шрам4412 empty→renderer await→partial привёл к общей
 read-транзакции для обоих провайдеров; см.

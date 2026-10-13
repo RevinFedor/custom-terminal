@@ -286,30 +286,60 @@ class WorkflowOrganization {
   getTab(tabId) {
     return this.read(() => this.readTab(tabId));
   }
-  readTab(tabId) {
-    const row = this.db.prepare('SELECT * FROM workflow_org_tabs WHERE tab_id=?').get(requireId(tabId));
+  prepareTabRead() {
+    const hasTabs = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tabs'").get();
+    return {
+      hasTabs: !!hasTabs,
+      row: this.db.prepare('SELECT * FROM workflow_org_tabs WHERE tab_id=?'),
+      membership: this.db.prepare('SELECT * FROM workflow_org_memberships WHERE tab_id=?'),
+      legacy: null,
+      native: null,
+    };
+  }
+  readTab(tabId, prepared = null, capturedRow = undefined) {
+    requireId(tabId);
+    const row = capturedRow === undefined
+      ? (prepared?.row || this.db.prepare('SELECT * FROM workflow_org_tabs WHERE tab_id=?')).get(tabId)
+      : capturedRow;
     if (!row) return null;
     const saved = parse(row.record_json);
     let executionSubject = row.execution_json ? parse(row.execution_json) : null;
     // Legacy runtime fields are read from the current source row, never from
     // stale migration data. An archived/missing row retains exact provenance.
-    const hasTabs = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tabs'").get();
+    const hasTabs = prepared ? prepared.hasTabs
+      : this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tabs'").get();
     const legacyRow = row.subject_version === 1 && hasTabs
-      ? this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND project_id=?').get(tabId, executionSubject.projectId) || null : null;
+      ? (prepared ? (prepared.legacy ||= this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND project_id=?'))
+        : this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND project_id=?')).get(tabId, executionSubject.projectId) || null : null;
     const nativeRow = row.subject_version === 2 && hasTabs
-      ? this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND execution_subject_id=? AND execution_namespace=? AND execution_subject_version=2')
+      ? (prepared ? (prepared.native ||= this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND execution_subject_id=? AND execution_namespace=? AND execution_subject_version=2'))
+        : this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND execution_subject_id=? AND execution_namespace=? AND execution_subject_version=2'))
         .get(tabId, executionSubject.subjectId, executionSubject.executionNamespace) || null : legacyRow;
     if (nativeRow) executionSubject = { ...executionSubject, ...executionScopeForRow(nativeRow) };
+    const membershipRow = prepared?.membership.get(tabId);
+    const membership = prepared ? (membershipRow ? {tabId: membershipRow.tab_id,
+      workflowId: membershipRow.workflow_id, revision: membershipRow.revision} : null) : this.getMembership(tabId);
     return { tabId, revision: row.revision, subjectVersion: row.subject_version, executionSubject,
-      record: saved, legacyRow, nativeRow, membership: this.getMembership(tabId),
+      record: saved, legacyRow, nativeRow, membership,
       executionResolved: !!nativeRow };
   }
   listGlobalTabs() {
-    return this.read(() => this.db.prepare('SELECT tab_id FROM workflow_org_tabs ORDER BY rowid').all().map(row => this.getTab(row.tab_id)));
+    return this.read(() => {
+      const rows = this.db.prepare('SELECT * FROM workflow_org_tabs ORDER BY rowid').all();
+      if (!rows.length) return [];
+      // Statement reuse belongs to THIS SQLite snapshot, not a cross-call row
+      // cache. Current native metadata/membership is still read on every call.
+      const prepared = this.prepareTabRead();
+      return rows.map(row => this.readTab(row.tab_id, prepared, row));
+    });
   }
   listMembers(workflowId) {
-    return this.read(() => this.db.prepare('SELECT tab_id FROM workflow_org_memberships WHERE workflow_id=? ORDER BY rowid')
-      .all(requireId(workflowId)).map(row => this.getTab(row.tab_id)));
+    return this.read(() => {
+      const rows = this.db.prepare('SELECT tab_id FROM workflow_org_memberships WHERE workflow_id=? ORDER BY rowid').all(requireId(workflowId));
+      if (!rows.length) return [];
+      const prepared = this.prepareTabRead();
+      return rows.map(row => this.readTab(row.tab_id, prepared));
+    });
   }
   resolveLegacyAlias({ namespace, tabId }) {
     return this.read(() => {

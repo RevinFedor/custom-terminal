@@ -25,18 +25,57 @@ const REINDEX_PROGRESS_MARKER = '__KNOWLEDGE_REINDEX_PROGRESS__';
 
 // projectId → {
 //   projectPath, watchers: fs.FSWatcher[], debounceTimer,
+//   docHashes: Map<absolutePath, { version, hash }>,  // this watch lifetime only
 //   isRebuilding, rebuildProc,
 //   rebuildProgress: { outdatedTotal, outdatedCompleted, currentFile }   // snapshot of latest progress
 // }
 const watchedProjects = new Map();
 
-function shaFile(filePath) {
+function docVersion(fileOrFd) {
   try {
-    const buf = fs.readFileSync(filePath);
-    return crypto.createHash('sha256').update(buf).digest('hex');
+    const stat = typeof fileOrFd === 'number'
+      ? fs.fstatSync(fileOrFd, { bigint: true })
+      : fs.statSync(fileOrFd, { bigint: true });
+    // ctime catches same-size writes even when a writer restores mtime. Keep
+    // nanoseconds/identity exact; atime changes on our own reads and is excluded.
+    if (!stat.isFile() || typeof stat.mtimeNs !== 'bigint' || typeof stat.ctimeNs !== 'bigint') return null;
+    return [stat.dev, stat.ino, stat.mode, stat.uid, stat.gid, stat.nlink,
+      stat.size, stat.mtimeNs, stat.ctimeNs, stat.birthtimeNs].join(':');
   } catch {
     return null;
   }
+}
+
+function shaFile(filePath, docHashes) {
+  const version = docVersion(filePath);
+  const cached = docHashes.get(filePath);
+  if (version !== null && cached?.version === version) return cached.hash;
+  docHashes.delete(filePath);
+
+  let fd;
+  let hash = null;
+  let canCache = false;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const openedVersion = docVersion(fd);
+    const buf = fs.readFileSync(fd);
+    hash = crypto.createHash('sha256').update(buf).digest('hex');
+    // Bind the digest to the file actually read, not just a pathname which could
+    // have been replaced between stat/open/read. Races and stat errors keep the
+    // ordinary read result but never certify it for reuse on a later request.
+    canCache = version !== null && version === openedVersion
+      && version === docVersion(fd) && version === docVersion(filePath);
+  } catch {
+    hash = null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { hash = null; }
+    }
+  }
+  // Like readFileSync(path), a failed close makes the entire read fail. Publish
+  // only after close succeeds; never retry close on a potentially reused fd.
+  if (hash !== null && canCache) docHashes.set(filePath, { version, hash });
+  return hash;
 }
 
 function listDocsFiles(projectPath) {
@@ -73,7 +112,8 @@ function isManagedDocIndexPath(relPath) {
   return path.basename(relPath) !== '_intro.md';
 }
 
-function computeStatus(projectPath) {
+function computeStatus(state) {
+  const { projectPath, docHashes } = state;
   const indexPath = path.join(projectPath, INDEX_FILE_NAME);
   let indexedByPath = new Map();
 
@@ -92,6 +132,10 @@ function computeStatus(projectPath) {
   }
 
   const docsFiles = listDocsFiles(projectPath);
+  const currentFiles = new Set(docsFiles);
+  for (const fullPath of docHashes.keys()) {
+    if (!currentFiles.has(fullPath)) docHashes.delete(fullPath);
+  }
   let fresh = 0;
   let stale = 0;
   let neu = 0;
@@ -100,7 +144,7 @@ function computeStatus(projectPath) {
   for (const fullPath of docsFiles) {
     const relPath = path.relative(projectPath, fullPath);
     currentDocPaths.add(relPath);
-    const onDiskHash = shaFile(fullPath);
+    const onDiskHash = shaFile(fullPath, docHashes);
     if (!onDiskHash) continue;
 
     const indexedHash = indexedByPath.get(relPath);
@@ -137,22 +181,25 @@ function pushStatus(mainWindow, projectId, status) {
 }
 
 function scheduleRecompute(state, mainWindow, projectId) {
+  if (watchedProjects.get(projectId) !== state) return;
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
   state.debounceTimer = setTimeout(() => {
     state.debounceTimer = null;
-    const status = computeStatus(state.projectPath);
+    if (watchedProjects.get(projectId) !== state) return;
+    const status = computeStatus(state);
     pushStatus(mainWindow, projectId, status);
   }, 300);
 }
 
 function startWatching(projectId, projectPath, mainWindow) {
-  // Already watching — ignore.
+  // Already watching — ignore. Changing the path requires unwatch first.
   if (watchedProjects.has(projectId)) return;
 
   const state = {
     projectPath,
     watchers: [],
     debounceTimer: null,
+    docHashes: new Map(),
     isRebuilding: false,
     rebuildProc: null,
     rebuildProgress: null,
@@ -199,13 +246,15 @@ function startWatching(projectId, projectPath, mainWindow) {
   console.log('[SemanticIndexStatus] Watching project:', projectId, 'at', projectPath, '(' + state.watchers.length + ' watchers)');
 
   // Initial push so renderer doesn't show stale numbers
-  const initial = computeStatus(projectPath);
+  const initial = computeStatus(state);
   pushStatus(mainWindow, projectId, initial);
 }
 
 function stopWatching(projectId) {
   const state = watchedProjects.get(projectId);
   if (!state) return;
+  watchedProjects.delete(projectId);
+  state.docHashes.clear();
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
   for (const w of state.watchers) {
     try { w.close(); } catch {}
@@ -213,7 +262,6 @@ function stopWatching(projectId) {
   if (state.rebuildProc) {
     try { state.rebuildProc.kill('SIGTERM'); } catch {}
   }
-  watchedProjects.delete(projectId);
   console.log('[SemanticIndexStatus] Stopped watching:', projectId);
 }
 
@@ -403,7 +451,7 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
   const rawN = Number(opts.parallelism);
   const parallelism = Number.isFinite(rawN) ? Math.max(1, Math.min(20, Math.round(rawN))) : 10;
 
-  const preStatus = computeStatus(state.projectPath);
+  const preStatus = computeStatus(state);
   const outdatedAtStart = (preStatus.stale || 0) + (preStatus.new || 0) + (preStatus.removed || 0);
   const displayParallelism = outdatedAtStart > 0 ? Math.min(parallelism, outdatedAtStart) : parallelism;
   const initialParallelism = outdatedAtStart > 0 ? 1 : Math.min(1, parallelism);
@@ -413,6 +461,7 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
   let outdatedCompleted = 0;
 
   const send = (event, payload) => {
+    if (watchedProjects.get(projectId) !== state) return;
     // Persist a snapshot of the latest progress on the state so that a renderer
     // mounting *after* progress started (e.g. user switched away and back to this
     // project) can reconstruct the running indicator without waiting for the next
@@ -598,7 +647,7 @@ function register({ getMainWindow }) {
     if (!state) return { success: false, error: 'Not watching' };
     return {
       success: true,
-      status: computeStatus(state.projectPath),
+      status: computeStatus(state),
       // Include current rebuild state so a renderer mounting / switching tabs
       // mid-rebuild can restore the spinner + counter without waiting for the
       // next stdout event.

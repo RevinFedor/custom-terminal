@@ -80,6 +80,22 @@ test('закрытием предпросмотра владеет только 
   );
 });
 
+test('global hover departure commits only an admitted native-event close synchronously', () => {
+  const global = fs.readFileSync(path.resolve(here, '../components/Workspace/GlobalRunAfterControl.tsx'), 'utf8');
+  const close = global.slice(global.indexOf('const closePanel ='), global.indexOf('const lastPositionWarningRef ='));
+  const hover = global.slice(global.indexOf('const recheckPreviewHover ='), global.indexOf('const { start: startResizeGesture }'));
+  assert.match(close, /if \(!beforeCloseRef\.current\(reason\)\) return false;/);
+  assert.match(close, /if \(immediate\) flushSync\(\(\) => setMode\('hidden'\)\);/);
+  assert.doesNotMatch(close + hover, /setTimeout|setInterval|requestAnimationFrame/);
+  assert.match(hover, /recheckPreviewHover\(event, true\)/);
+  assert.match(hover, /recheckPreviewHover\(null, true\)/);
+  assert.match(hover, /hasOwnedClickPopup\(panelRef\.current\)/);
+  // These calls can run inside React effects/child cleanup. Only native
+  // departure is urgent; flushing an effect reentrantly is not safe.
+  assert.match(hover, /recheckPreviewHover\(previewPointerRef\.current\);/);
+  assert.doesNotMatch(hover, /recheckPreviewHoverRef\.current\(previewPointerRef\.current, true\)/);
+});
+
 test('клик по строке закрепляет только её редактор, не родительское hover-меню', () => {
   const hover = source.slice(source.indexOf('const recheckQueueHover ='), source.indexOf('// ─── drag-and-drop reorder'));
   assert.doesNotMatch(hover, /if \(editorOpen/);
@@ -89,7 +105,10 @@ test('клик по строке закрепляет только её реда
   assert.match(source, /const editorSurfaceVisible = panelOpen \|\| queueHoverPreviewVisible;/);
   assert.match(source, /\{editorSurfaceVisible && editorOpen && editorAnchor && createPortal\(/);
   // Outside click remains an editor exit; hover leave now is also an exit.
-  assert.match(source, /commitEditor\(\);[\s\S]{0,300}setQueueHoverPreviewOpen\(false\);/);
+  const closeGuard = source.slice(source.indexOf('const prepareQueueClose ='), source.indexOf('const suppressChipReopen ='));
+  assert.match(closeGuard, /commitEditor\(\);/);
+  const closeHover = source.slice(source.indexOf('const closeQueueHoverPreview ='), source.indexOf('const recheckQueueHover ='));
+  assert.match(closeHover, /if \(!prepareQueueClose\('outside'\)\) return;[\s\S]*setQueueHoverPreviewOpen\(false\);/);
   // Internal controls still work and do not count as an outside click.
   assert.match(source, /previewPanel\?\.contains\(target\)\) return;/);
   assert.match(source, /previewPanel && queueCountButtonRef\.current\?\.contains\(target\)/);

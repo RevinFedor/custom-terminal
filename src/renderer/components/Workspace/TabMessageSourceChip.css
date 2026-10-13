@@ -17,3 +17,6 @@
   outline: 1px solid #c4b5fd;
   outline-offset: 1px;
 }
+.history-research-source:hover, .history-research-source:focus-visible { background: rgba(167,139,250,.14) !important; color: #fff !important; }
+.history-research-source:focus-visible { outline: 1px solid #a78bfa; outline-offset: 1px; }
+.history-research-source:active { background: rgba(167,139,250,.25) !important; }

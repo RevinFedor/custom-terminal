@@ -1,4 +1,5 @@
 import { isNaturalAgentTurnEndReason } from './agentCompletionOutcome.mjs';
+import { hasPendingAgentGoalWork } from '../../shared/agent-work-completion.mjs';
 
 /** One app-wide owner, independent of TabBar instances and UI focus. */
 export function createRestartAfterCoordinator(deps) {
@@ -95,6 +96,8 @@ export function createRestartAfterCoordinator(deps) {
     }
     const wasBusy = state.busy;
     state.busy = false;
+    state.goalPending = hasPendingAgentGoalWork(data);
+    if (state.goalPending) { state.deferred = null; return; }
     if (!isNaturalAgentTurnEndReason(data.reason)) { state.deferred = null; return; }
     if (!wasBusy) return;
     const identity = data.outcomeTs ?? data.turnId ?? ('cycle-' + state.cycle);
@@ -108,7 +111,7 @@ export function createRestartAfterCoordinator(deps) {
     if (!change.releaseKind) return;
     const state = sources.get(change.sourceTabId);
     if (change.releaseKind !== 'success') { if (state) state.deferred = null; return; }
-    if (state?.busy || deps.blocked?.(change.sourceTabId)) return;
+    if (state?.busy || state?.goalPending || deps.blocked?.(change.sourceTabId)) return;
     const runId = change.run?.runId;
     if (!runId) return;
     const runIdentity = 'run-' + runId;

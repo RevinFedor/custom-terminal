@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
 const test = require('node:test');
@@ -167,6 +168,110 @@ function harness({ hasTurn = true, provisional = false, failFirstAttach = false 
     tabId, sessionId, term, observe, drainDiscovery, compact };
 }
 
+// Real filesystem aliases plus the actual watcher/reconciliation/release bodies.
+// Process/SQLite/readiness remain the explicit controlled ports of harness();
+// timers and fs notifications are inert, so only the requested event is run.
+function pathAliasHarness(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-watcher-alias-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const realDir = path.join(root, 'physical');
+  const aliasDir = path.join(root, 'alias');
+  fs.mkdirSync(realDir);
+  fs.symlinkSync(realDir, aliasDir, 'dir');
+  const aliasFile = path.join(aliasDir, 'rollout.jsonl');
+  const physicalFile = path.join(realDir, 'rollout.jsonl');
+  fs.writeFileSync(physicalFile, '{"type":"session_meta"}\n');
+  const canonicalFile = fs.realpathSync(physicalFile);
+  const h = harness({ hasTurn: false, provisional: true });
+  h.candidate.filePath = canonicalFile;
+  const callbacks = [];
+  Object.assign(h.context, require('./codex-turn-outcome'), {
+    fs: { ...fs, watch: () => ({ close() {} }) }, path, require, srcMainDir: __dirname,
+    createCodexLiveUserCarrierPairer: require('./codex-live-user-carrier-pairing').createCodexLiveUserCarrierPairer,
+    setInterval: () => 1, clearInterval() {}, clearTimeout() {},
+    setImmediate: fn => { callbacks.push(fn); },
+    CODEX_WATCHER_SCAN_MS: 1000,
+    pendingCodexPasteAudit: new Map(), codexInputLineBuffers: new Map(),
+    codexCompactTuiFeedbackBuffers: new Map(), codexPromptGeneration: new Map(),
+    clearCodexPromptInFlight() {}, emitCodexBusy() {}, emitCodexTurnStateResolved() {},
+    publishCodexSuppressedCatchUpRelease: (_tab, _state, release) => {
+      if (release?.released) h.events.push('source-release');
+    },
+    catchUpCodexTurnState: async () => {}, scanCodexTurnAppend: async () => {},
+  });
+  h.context.compactOperations.getActive = () => null;
+  for (const name of ['startCodexTurnWatcher', 'closeCodexTurnWatcher',
+    'releaseCodexSourceObservationAfterWriterProof', 'closeCodexWatcher']) {
+    const node = ast.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);
+    assert.ok(node, name);
+    vm.runInContext(node.getText(ast), h.context);
+  }
+  h.context.startCodexSessionWatcher(null, { tabId: h.tabId, sourceSessionId: h.sessionId,
+    sourceMode: 'resume', launchId: h.launch.launchId, startedAt: h.launch.startedAt });
+  const start = filePath => h.context.startCodexTurnWatcher({ tabId: h.tabId,
+    sessionId: h.sessionId, filePath, sourceObservationLaunchId: h.launch.launchId,
+    suppressBusyCatchUp: true, suppressPublicCatchUp: true });
+  assert.equal(start(aliasFile), true);
+  return { ...h, root, realDir, aliasDir, aliasFile, canonicalFile, start, callbacks };
+}
+
+test('physical source alias cannot replace the launch observer and strand the first ready Send', async t => {
+  const h = pathAliasHarness(t);
+  const original = h.context.codexTurnWatchers.get(h.tabId);
+  const offset = original.offset;
+  assert.equal((await h.context.reconcileCodexWriterFromProcessInner(h.tabId, {
+    reason: 'source-rollout-appended',
+  })).status, 'adopted');
+  const firstSend = await h.observe('send-target-revalidation');
+  assert.equal(firstSend.available, true, JSON.stringify(firstSend));
+  assert.strictEqual(h.context.codexTurnWatchers.get(h.tabId), original,
+    'the same physical rollout retains its observer, offsets and launch-scoped release');
+  assert.equal(original.filePath, h.canonicalFile);
+  assert.equal(original.offset, offset);
+  assert.equal(h.context.codexSessionDiscoveryIntents.size, 0);
+  assert.equal(h.context.codexWatchers.size, 0);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId)?.valid, true);
+});
+
+test('source alias preserves an in-flight scan and defers proof release on that same observer', async t => {
+  const h = pathAliasHarness(t), original = h.context.codexTurnWatchers.get(h.tabId);
+  original.scanning = true;
+  const offset = original.offset;
+  assert.equal((await h.context.reconcileCodexWriterFromProcessInner(h.tabId, {
+    reason: 'source-rollout-appended',
+  })).status, 'adopted');
+  assert.strictEqual(h.context.codexTurnWatchers.get(h.tabId), original);
+  assert.equal(original.offset, offset);
+  assert.equal(original.sourceObservationLaunchId, h.launch.launchId);
+  assert.equal(original.sourceWriterProofReleasePending.launchId, h.launch.launchId);
+  original.scanning = false;
+  const pending = h.context.takeCodexSourceProofReleaseAtScanBoundary(original);
+  h.context.releaseCodexSourceObservationAfterWriterProof(h.tabId, pending.sessionId, pending.reason);
+  assert.equal(h.context.codexSessionDiscoveryIntents.size, 0);
+  assert.equal((await h.observe('send-target-revalidation')).available, true);
+});
+
+test('same SID at a different physical path still replaces the observer; a missing file preserves it', t => {
+  const h = pathAliasHarness(t), original = h.context.codexTurnWatchers.get(h.tabId);
+  assert.equal(h.start(path.join(h.root, 'missing.jsonl')), false);
+  assert.strictEqual(h.context.codexTurnWatchers.get(h.tabId), original);
+  const other = path.join(h.root, 'other.jsonl');
+  fs.writeFileSync(other, '{}\n');
+  assert.equal(h.start(other), true);
+  assert.notStrictEqual(h.context.codexTurnWatchers.get(h.tabId), original);
+  assert.equal(h.context.codexTurnWatchers.get(h.tabId).filePath, fs.realpathSync(other));
+});
+
+test('retargeted symlink is resolved again instead of reusing a cached string identity', t => {
+  const h = pathAliasHarness(t), original = h.context.codexTurnWatchers.get(h.tabId);
+  const otherDir = path.join(h.root, 'replacement');
+  fs.mkdirSync(otherDir); fs.writeFileSync(path.join(otherDir, 'rollout.jsonl'), '{}\n');
+  fs.unlinkSync(h.aliasDir); fs.symlinkSync(otherDir, h.aliasDir, 'dir');
+  assert.equal(h.start(h.aliasFile), true);
+  assert.notStrictEqual(h.context.codexTurnWatchers.get(h.tabId), original);
+  assert.equal(h.context.codexTurnWatchers.get(h.tabId).filePath, fs.realpathSync(h.aliasFile));
+});
+
 function projectLocalHarness(t, { beforeBridge, currentTarget } = {}) {
   const h = harness({ provisional: true });
   const Database = require('better-sqlite3');
@@ -183,6 +288,7 @@ function projectLocalHarness(t, { beforeBridge, currentTarget } = {}) {
   h.context.compactOperations.armPending = request => ({ ...request, kind: 'compact' });
   let bridgeCalls = 0;
   const webContext = vm.createContext({
+    require, path, srcMainDir: __dirname,
     ...registry, AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
     agentSendReceiptStore: store, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,

@@ -1,7 +1,7 @@
 # Fact: `build:i-obs` — ребилд, ждущий пока приложение освободится
 
 ## Задача
-`npm run build:install` собирает, подписывает и проверяет кандидат до закрытия приложения. Перед заменой `graceful-quit.sh` запрашивает штатный выход; предыдущий bundle остаётся для отката. Если в момент выхода в проде идёт активная AI-работа или shell-команда, запущенная через `Restart after`, установка прервёт её. Команда **из стороннего терминала** (не внутри Noted Terminal) ждёт, пока такие blocker'ы во всех проектах не станут idle, показывает прогресс и запускает `build:install`. AI-hop через Voice Record дополнительно перепроверяет idle перед Quit уже собранного кандидата: ошибка сборки не должна останавливать работающие сессии.
+`npm run build:install` собирает, подписывает и проверяет кандидат до закрытия приложения. Перед заменой `graceful-quit.sh` запрашивает штатный выход; предыдущий bundle остаётся для отката. Если в момент выхода в проде идёт активная AI-работа или shell-команда, запущенная через `Restart after`, установка прервёт её. Команда **из стороннего терминала** (не внутри Noted Terminal) ждёт, пока такие blocker'ы во всех проектах не станут idle, показывает прогресс и запускает подготовку `build:install`. С11.10 wrapper и AI-hop оба отдельно перепроверяют idle перед Quit уже собранного кандидата: исходное idle не разрешает закрыть приложение после длительной сборки, если появились новые занятые сессии. Raw `build:install` без observer/owner-ACK не получил нового режима ожидания.
 
 `graceful-quit.sh` отличает штатный выход от нового macOS crash-report по
 снимку **имён** `.ips`, сделанному до запроса Quit. На `mtime` полагаться нельзя:
@@ -172,6 +172,15 @@ GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token
 2. `ps -p <pid> -o command=` содержит `/Applications/Noted Terminal.app` — отсекает dev-инстансы (electron-vite, порт **7979**) и реюзнутые соседом PID'ы
 3. Свежайший `updatedAt` если вдруг >1 прод-копии
 
+С11.10 destructive wrapper использует отдельный `found/absent/unknown` reader,
+один aggregate `ps` snapshot и точный prefix основного installed executable.
+`PORT` тоже должен совпасть с подтверждённым installedMain, не разрешает наблюдать
+idledev/test вместо закрываемого production. Timeout/пустой или нечитабельный snapshot, read-error discovery, живой прод без
+пригодной metadata —unknown, не«прод выключен». Helper/hub и аргумент другого
+процесса с упоминанием пути приложения не дают production owner. Только успешный
+system snapshot без main-процесса даёт absent/bootstrap. Nullable legacy reader
+других недеструктивных callers оставлен отдельно, его null не является новым proof.
+
 Прод = порт **7878**, dev = **7979** (`package.json::dev` ставит `NOTED_WEB_PORT=7979`).
 
 ### Append-only feed (НЕ self-clearing dashboard)
@@ -201,6 +210,29 @@ notification при том же ID не создаёт новую строку, 
 - **Failed poll ≠ idle**: таймаут/сетевой блип сбрасывает `idleStreak=0`, не считается за idle.
 - **Старый билд без эндпоинта** (404): печатает «predates /api/active-loaders», просит разовый `build:install` для бутстрапа, exit 2. НЕ строит вслепую.
 - **Прод не запущен**: нечего ждать → строит сразу (или exit при `NO_BUILD=1`).
+
+11.10 incident00:06BKK(10.10 17:06UTC): пользователь подтвердил `build:i-obs`.
+Main17:04:47 публиковал6Codexbusy+orchestration1(ещё5passivequeues),17:06:04
+начал новый turn,17:06:21вошёл вshutdown с10живымиCodex. Среди сохранённых
+ActiveLoaders-ответов этого boot не найдено0реальных blockers. AutoResume потом
+подтвердилready10/10, не выполнение прерванных задач. Первичный installerstdout
+недоступен: точный прежний skip-path не доказан. Найдены две допустимые дыры:
+`pidCommand` timeout превращался впустуюстроку→null→немедленныйrunBuild;
+после подготовки package wrapper вообще не проверял соседей снова.
+
+SOURCE исправил обе без новых Main/Voice/lifecycle policies: unknown удерживает
+стрик, смена prodPID/порта сбрасывает его; после `ready-to-quit` отдельный observer
+ждёт заново и через прежний nonce/control-channel даёт canonicaldriver разрешение
+`install` только поidle/absent. В процессе ожидания посылает `waiting`, чтобы
+owner channel не протух из-за долгого чужогоturn;cancel/EOF/error не даютQuit.
+Childexit прекращает ожидающийobserver;дубликатready не запускает второй.
+Граница прежняя observational, не атомарная reservation всех будущих Send.
+
+57scopedtestsPASS, включая actualcanonicalstagedinstaller на ownedtempApps с
+подменёнными build/sign/quit командами, сценарииbusy-after-prepare/cancel/invalidproof.
+Live GET-only observer увидел installedPID32057/7878 и9blockers, затем намеренно
+отменён;реальныйinstall/закрытие пользователя не выполнялись. Evidence:
+`/private/tmp/noted-build-cache-20261011.eWevI4/HANDOFF.md`.
 
 ### Observe-фаза в Voice Record endpoint (НЕ wrapper-скрипт)
 `build:i-obs` (wrapper `scripts/build-when-idle.js`) — команда для внешнего ручного запуска
@@ -309,10 +341,11 @@ requested same Resume, второй получил agent_lifecycle_claimed. Об
 
 ### Env-кнобы
 
-`POLL_MS=1000`, `IDLE_CONFIRM=2`, `NO_BUILD=1` (только наблюдать), `PORT=7878` (форсить порт, минуя discovery — для теста).
+`POLL_MS=1000`, `IDLE_CONFIRM=2`, `NO_BUILD=1` (только наблюдать), `PORT=7878`
+(выбрать подтверждённый productionport; не обход discovery для dev/test).
 
 ## Тестирование без ребилда
-`web-server.js` требует electron (`ipcMain`/`app`/`BrowserWindow`). Для headless-харнесса замокать через `Module._load` shim (`require('electron')` → fake), `start({sdkSessions:new Map(), computeActiveLoaders: ()=>mockState})`, дёргать скрипт с `PORT=<mockport>`. Runtime-логика тестируется с mock-Map'ами; orchestration merge покрыт отдельно: source+target активного run, recovery без shimmer, `result-proof`, completion-handoff до exact proof, исчезновение после proof и дедуп с runtime-loader. Отдельная регрессия обязана проверять, что incomplete result переживает restart/retention, блокирует install и не запускает auto-stop. В DEV live endpoint вернул stale `tab-2142` как `kind:"orchestration", status:"completion-handoff"`, тогда как run с уже подтверждённым exact follow-up в список не попал. Сам build/install в E2E не запускается.
+`web-server.js` требует electron (`ipcMain`/`app`/`BrowserWindow`). Для headless-харнесса замокать через `Module._load` shim (`require('electron')` → fake), `start({sdkSessions:new Map(), computeActiveLoaders: ()=>mockState})`. Observer тестируется через экспортированный`waitForIdle` с контролируемымиinspect/read, не запуском destructiveCLI против`PORT=<mockport>`: с11.10порт должен принадлежать реальному installedMain. Runtime-логика тестируется с mock-Map'ами; orchestration merge покрыт отдельно: source+target активного run, recovery без shimmer, `result-proof`, completion-handoff до exact proof, исчезновение после proof и дедуп с runtime-loader. Отдельная регрессия обязана проверять, что incomplete result переживает restart/retention, блокирует install и не запускает auto-stop. В DEV live endpoint вернул stale `tab-2142` как `kind:"orchestration", status:"completion-handoff"`, тогда как run с уже подтверждённым exact follow-up в список не попал. Реальная установка/пользовательскийQuit в E2E не выполняются;canonicaldriver gate проверяетсянаownedtempFS сmockbuild/sign/quit.
 
 ## Целостность пакета до закрытия приложения
 

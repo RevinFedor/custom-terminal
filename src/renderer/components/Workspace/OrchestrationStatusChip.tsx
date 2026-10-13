@@ -24,8 +24,8 @@ import { TabMessagePreview, TabMessageRow, TabMessageTracker } from './TabMessag
 import type { MessageSelection } from './TabMessageTracker';
 import { useTabMessages } from '../../hooks/useTabMessages';
 import { useRequestDockLayout } from '../../hooks/useRequestDockLayout';
-import { tabMessageSuccessAt, tabMessageTimestamp, tabMessageVisibleInTracker } from '../../utils/tabMessageProjection';
-import { REQUEST_SUCCESS_VISIBLE_MS, nextRequestSuccessExpiry } from '../../utils/requestTrackerVisibility.mjs';
+import { tabMessageTimestamp, tabMessageVisibleInTracker } from '../../utils/tabMessageProjection';
+import { isRequestSuccessPresentation } from '../../utils/requestTrackerVisibility.mjs';
 import { RequestTrackerRow, RequestTrackerStatus, requestRowActionStyle, requestRowLinkStyle } from './RequestTrackerRow';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import type { OrchestrationRun, OrchestrationStatus } from '../../store/useOrchestrationStore';
@@ -139,10 +139,6 @@ function attentionDismissedForTab(run: OrchestrationRun, tabId: string): boolean
   return false;
 }
 
-function successVisibleAt(run: OrchestrationRun): number | null {
-  return run.sourceFollowupStartedAt || run.completedAt || null;
-}
-
 function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation {
   if (isOrchestrationResultProofPending(run)) {
     return {
@@ -179,9 +175,12 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
     return {
       color: '#fbbf24',
       icon: 'recovery',
-      label: isPaused(run)
+      label: run.continuation && ['prepared', 'sending', 'unconfirmed', 'blocked'].includes(run.continuation.state)
+        ? run.continuation.state === 'unconfirmed' ? 'Проверка продолжения'
+          : run.continuation.state === 'blocked' ? 'Продолжение не отправлено' : 'Подготовка продолжения'
+        : isPaused(run)
         ? 'На паузе'
-        : run.outcome === 'interrupted' ? 'Остановлено вручную' : 'Связь прервана',
+        : run.outcome === 'interrupted' ? 'Работа прервана' : 'Связь прервана',
       spinning: false,
     };
   }
@@ -224,6 +223,15 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
       || run.status === 'starting'
       || run.status === 'waiting_descendants',
   };
+}
+
+function runVisibleInTracker(run: OrchestrationRun, tabId: string): boolean {
+  const presentation = runPresentation(run, tabId);
+  if (isRequestSuccessPresentation(presentation)) return false;
+  if (ACTIVE.has(run.status) || isOrchestrationResultProofPending(run)
+    || hasPendingSourceHandoff(run, tabId)) return true;
+  return presentation.icon === 'error'
+    && Boolean(run.attentionRequiredAt) && !attentionDismissedForTab(run, tabId);
 }
 
 function StatusIcon({ presentation, compact = false }: { presentation: RunPresentation; compact?: boolean }) {
@@ -393,30 +401,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     ...messages.threads.map(thread => ({ kind: 'message' as const, thread,
       at: tabMessageTimestamp(thread.question.createdAt), id: 'message:' + thread.question.messageId })),
   ].sort((a, b) => b.at - a.at || a.id.localeCompare(b.id)), [orderedRuns, messages.threads]);
-  const visibilityNow = Math.max(now, Date.now());
-  const nextSuccessExpiry = nextRequestSuccessExpiry([
-    ...orderedRuns.map(run => runPresentation(run, tabId).icon === 'success' ? successVisibleAt(run) : null),
-    ...messages.threads.map(tabMessageSuccessAt),
-  ], visibilityNow);
-  useEffect(() => {
-    if (!nextSuccessExpiry) return;
-    const timer = window.setTimeout(() => setNow(Date.now()), Math.max(0, nextSuccessExpiry - Date.now()) + 20);
-    return () => window.clearTimeout(timer);
-  }, [nextSuccessExpiry]);
-
-  const statusRuns = useMemo(() => orderedRuns.filter((run) => {
-    if (ACTIVE.has(run.status)
-      || isOrchestrationResultProofPending(run)
-      || hasPendingSourceHandoff(run, tabId)) return true;
-    const presentation = runPresentation(run, tabId);
-    if (presentation.icon === 'error') {
-      return Boolean(run.attentionRequiredAt) && !attentionDismissedForTab(run, tabId);
-    }
-    return presentation.icon === 'success'
-      && Boolean(successVisibleAt(run))
-      && Number(successVisibleAt(run)) + REQUEST_SUCCESS_VISIBLE_MS > visibilityNow;
-  }), [visibilityNow, orderedRuns, tabId]);
-  const hasVisibleMessages = messages.threads.some(thread => tabMessageVisibleInTracker(thread, tabId, visibilityNow));
+  const statusRuns = useMemo(() => orderedRuns.filter(run => runVisibleInTracker(run, tabId)), [orderedRuns, tabId]);
+  const hasVisibleMessages = messages.threads.some(thread => tabMessageVisibleInTracker(thread, tabId));
   const hasDockEntries = statusRuns.length > 0 || hasVisibleMessages || Boolean(messages.listError);
 
   const openLinkedTab = useCallback(async (run: OrchestrationRun) => {
@@ -452,7 +438,17 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     }
   }, [tabId, closeMessage]);
 
-  const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume') => {
+  const actionInflight = useRef(new Set<string>());
+  const cancellationInflight = useRef(new Set<string>());
+  const [actionPending, setActionPending] = useState(new Set<string>());
+  const [newRequestAvailable, setNewRequestAvailable] = useState(new Set<string>());
+  const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume' | 'continue' | 'new-request') => {
+    const cancelling = ['detach', 'dismiss', 'report'].includes(action);
+    const guard = cancelling ? cancellationInflight.current : actionInflight.current;
+    if (guard.has(run.runId)) return;
+    guard.add(run.runId);
+    if (!cancelling) setActionPending(new Set(actionInflight.current));
+    try {
     let cancelSendAccepted = false;
     if (action === 'detach'
       && run.runKind !== 'external-research'
@@ -460,7 +456,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
       const cancellingSourceHandoff = canCancelPendingSourceHandoff(run, tabId);
       if (run.runKind !== 'response-observation' || cancellingSourceHandoff) {
         const cancellationTabId = cancellingSourceHandoff ? run.sourceTabId : run.targetTabId;
-        const cancellationHandoffId = cancellingSourceHandoff
+        const cancellationHandoffId = !cancellingSourceHandoff && run.continuation && run.continuation.state !== 'bound'
+          ? run.continuation.handoffId : cancellingSourceHandoff
           ? (run.notificationHandoffId || `orchestration-complete:${run.runId}`)
           : `orchestration:${run.runId}`;
         const sendCancellation = await ipcRenderer.invoke('agent:cancel-send', {
@@ -482,10 +479,15 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
     if (result?.run) {
       setRuns((current) => [...current.filter((item) => item.runId !== result.run.runId), result.run]);
     }
+    if (result?.canCreateNewRequest) setNewRequestAvailable(current => new Set(current).add(run.runId));
     setActionError((current) => ({
       ...current,
       [run.runId]: result?.ok === false ? (result.error || 'Действие не выполнено') : '',
     }));
+    } finally {
+      guard.delete(run.runId);
+      if (!cancelling) setActionPending(new Set(actionInflight.current));
+    }
   }, [tabId]);
 
   const saveSettings = useCallback(async (patch: Partial<OrchestrationSettings>) => {
@@ -501,7 +503,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
 
   const actionButton = (
     run: OrchestrationRun,
-    action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume',
+    action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume' | 'continue' | 'new-request',
     label: string,
     icon: ReactNode,
     color: string,
@@ -512,6 +514,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
       data-orchestration-run-id={run.runId}
       title={label}
       aria-label={label}
+      disabled={actionPending.has(run.runId) && !['detach', 'dismiss', 'report'].includes(action)}
       onClick={(event) => {
         event.stopPropagation();
         void runAction(run, action);
@@ -525,7 +528,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         borderRadius: 4,
         background: '#1c1c1c',
         color,
-        cursor: 'pointer',
+        cursor: actionPending.has(run.runId) && !['detach', 'dismiss', 'report'].includes(action) ? 'default' : 'pointer',
+        opacity: actionPending.has(run.runId) && !['detach', 'dismiss', 'report'].includes(action) ? 0.6 : 1,
       }}
     >
       {icon}
@@ -548,6 +552,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           <span>Проект</span><span style={{ color: '#e5e7eb' }}>{linkedProjectName || '—'}</span>
           <span>{run.runKind === 'external-research' && isSource ? 'Исполнитель' : 'Вкладка'}</span><span style={{ color: '#e5e7eb' }}>{linkedTabName || '—'}</span>
           <RunDetailFields run={run} tabId={tabId} />
+          {run.continuation?.error && <><span>Продолжение</span><span style={{ color: '#fbbf24' }}>{run.continuation.error}</span></>}
           <span>runId</span><span style={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.runId}</span>
           {run.externalResearchJobId && <><span>jobId</span><span style={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.externalResearchJobId}</span></>}
         </div>
@@ -587,7 +592,12 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           {pauseAvailable && actionButton(run, 'pause', 'Поставить связь на паузу', <Pause size={13} />, '#fbbf24')}
           {paused && actionButton(run, 'resume', 'Продолжить связь со следующего нового хода', <Play size={13} />, '#fbbf24')}
           {canRetryNotification && actionButton(run, 'retry', 'Повторить доставку результата', <RotateCcw size={13} />, '#fbbf24')}
-          {run.status === 'waiting_recovery' && !paused && actionButton(
+          {run.status === 'waiting_recovery' && !paused && run.runKind !== 'external-research' && run.runKind !== 'response-observation'
+            && actionButton(run, 'continue', run.continuation?.state === 'unconfirmed' ? 'Проверить продолжение' : 'Продолжить запрос', <Play size={13} />, '#a78bfa')}
+          {run.runKind !== 'external-research' && run.runKind !== 'response-observation'
+            && (newRequestAvailable.has(run.runId) || run.replacementRunId || run.status === 'failed' || run.status === 'cancelled')
+            && actionButton(run, 'new-request', 'Создать новое поручение в текущих историях; старый запрос сохраняется', <ArrowUpRight size={13} />, '#a78bfa')}
+          {run.status === 'waiting_recovery' && !paused && !run.continuation && actionButton(
             run,
             'retry',
             run.runKind === 'response-observation' ? 'Повторить проверку' : run.outcome === 'interrupted' ? 'Восстановить связь вручную' : 'Восстановить связь',
@@ -789,7 +799,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
           border: '1px solid #444', borderRadius: 5, background: '#171717', boxSizing: 'border-box',
           boxShadow: '0 2px 10px rgba(0,0,0,0.22)',
           overflowY: 'auto', overflowX: 'hidden', pointerEvents: 'auto' }}>
-      <TabMessageTracker tabId={tabId} controller={messages} onOpen={openMessage} onDismiss={cancelMessage} selectedMessageId={selectedMessage?.messageId} now={visibilityNow} />
+      <TabMessageTracker tabId={tabId} controller={messages} onOpen={openMessage} onDismiss={cancelMessage} selectedMessageId={selectedMessage?.messageId} />
       {statusRuns.length > 0 && (
         <div
           data-orchestration-active-list
@@ -828,6 +838,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
                 actionBar={renderTooltipActions(run)}
                 side="left"
                 align="start"
+                boundarySelector="[data-split-pane-queue-host], [data-workspace-prompt-queue-host]"
                 disabled={!dock.visible || historyOpen || settingsOpen || Boolean(selectedMessage)}
                 always
               >

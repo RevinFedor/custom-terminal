@@ -41,6 +41,7 @@ test('temporary process lookup failure is retried without admitting another laun
         return {
           success: false,
           accepted: false,
+          launchWritten: false,
           error: 'process_lookup_failed',
           reason: 'process_lookup_unknown',
         };
@@ -84,6 +85,7 @@ test('persistent unknown lookup is reported only after the bounded retry budget'
     return {
       success: false,
       accepted: false,
+      launchWritten: false,
       error: 'process_lookup_failed',
       lookupStatus: 'unknown',
     };
@@ -156,13 +158,16 @@ test('parallel restore setting defaults to two and is bounded to one through thr
   assert.equal(normalizeInterruptedRestoreParallelism(99), 3);
 });
 
-test('bounded restore serializes admission while overlapping at most two warmups', async () => {
+test('bounded restore serializes admission while overlapping at most two warmups', { timeout: 5000 }, async () => {
   let inFlight = 0;
   let maxInFlight = 0;
   let admissions = 0;
   let maxAdmissions = 0;
   const events = [];
-  const results = await restoreInterruptedSessionsWithConcurrency(
+  const signal = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+  const entered = new Map(['a', 'b', 'c'].map(id => [id, signal()]));
+  const warmed = new Map(['a', 'b', 'c'].map(id => [id, signal()]));
+  const pending = restoreInterruptedSessionsWithConcurrency(
     [{ tabId: 'a' }, { tabId: 'b' }, { tabId: 'c' }],
     async (item, _index, { releaseAdmission }) => {
       inFlight += 1;
@@ -174,7 +179,8 @@ test('bounded restore serializes admission while overlapping at most two warmups
       admissions -= 1;
       releaseAdmission();
       events.push('warming:' + item.tabId);
-      await new Promise((resolve) => setTimeout(resolve, item.tabId === 'a' ? 8 : 2));
+      entered.get(item.tabId).resolve();
+      await warmed.get(item.tabId).promise;
       events.push('ready:' + item.tabId);
       inFlight -= 1;
       return { success: true, accepted: true, ready: true, settled: true };
@@ -182,6 +188,16 @@ test('bounded restore serializes admission while overlapping at most two warmups
     { parallelism: 2 },
   );
 
+  // Prove the capacity/order using explicit events, not relative 8ms/2ms
+  // timers which may both expire while another parallel suite occupies CPU.
+  await entered.get('b').promise;
+  assert.equal(inFlight, 2);
+  assert.equal(events.includes('admission:c'), false);
+  warmed.get('b').resolve();
+  await entered.get('c').promise;
+  warmed.get('a').resolve();
+  warmed.get('c').resolve();
+  const results = await pending;
   assert.equal(maxAdmissions, 1);
   assert.equal(maxInFlight, 2);
   assert.equal(results.length, 3);

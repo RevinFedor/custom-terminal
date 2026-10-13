@@ -27,6 +27,19 @@ test('ten copies of the same completion admit exactly one command, even as repea
   assert.equal(f.writes.length, 1); assert.equal(f.runtime.snapshot()[0].pending, false);
 });
 
+test('Goal intermediate completion and orchestration release cannot restart; final can', async () => {
+  const f = fixture();
+  f.runtime.busy({ tabId: 'source', busy: true });
+  f.runtime.busy({ tabId: 'source', busy: false, reason: 'task_complete', outcomeTs: 10,
+    goalWork: { version: 1, pending: true } });
+  f.runtime.orchestration({ sourceTabId: 'source', releaseKind: 'success', run: { runId: 'child' } });
+  await settle();
+  assert.equal(f.writes.length, 0);
+  f.complete(20);
+  await settle();
+  assert.equal(f.writes.length, 1);
+});
+
 test('many genuinely new completions during a finite script collapse to one latest repeat', async () => {
   const f = fixture(); f.complete(1); await settle();
   for (let i = 2; i <= 12; i++) f.complete(i, 'source-' + i);

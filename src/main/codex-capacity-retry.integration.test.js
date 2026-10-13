@@ -39,7 +39,7 @@ const failure = (turnId, offset) => ({
 });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-function liveHarness({ limit = 2, submitted = true, enabled = true, delays = [], clock = {} } = {}) {
+function liveHarness({ limit = 2, submitted = true, sendError = null, enabled = true, delays = [], clock = {} } = {}) {
   const state = { tabId: 'T', sessionId: 'S', busy: true, offset: 100, currentTurnId: 'E1', capacityRetryLiveAfterOffset: 100 };
   const terminal = {};
   const calls = [];
@@ -61,7 +61,7 @@ function liveHarness({ limit = 2, submitted = true, enabled = true, delays = [],
     runAgentSendScenario: async options => {
       await options.prepareSend();
       calls.push({ type: 'send', options });
-      return { submitted, deliveryUnknown: submitted === null };
+      return { submitted, deliveryUnknown: submitted === null, ...(sendError ? { error: sendError } : {}) };
     },
     performOrchestrationAction: () => assert.fail('untracked tabs do not need orchestration actions'),
     projectManager: { db: {
@@ -84,7 +84,7 @@ function liveHarness({ limit = 2, submitted = true, enabled = true, delays = [],
       on: (name, listener) => ipcListeners.set(name, listener),
     },
     mainWindow: { webContents: { send: (...args) => calls.push({ type: 'renderer', args }) } },
-    console: { warn() {}, log() {} },
+    console: { warn: text => calls.push({ type: 'log', text }), log() {} },
   });
   vm.runInContext('const codexCapacityContinuations = new Map();\n'
     + part(webSource, 'coordinateCodexCapacityContinuation') + '\n'
@@ -224,6 +224,19 @@ test('a rejected continuation publishes not-submitted, not exhausted; later real
   h.observe(failure('E2', 130));
   await tick();
   assert.equal(h.sends().length, 2);
+});
+
+test('an error-only refusal is logged with exact identity even when notification routing is unavailable', async () => {
+  const h = liveHarness({ submitted: false, limit: 1, sendError: 'capacity-recovery-owner-changed' });
+  h.context.resolveAuthoritativeTabProjectId = () => null;
+  h.observe(failure('E1', 110)); await tick();
+  const logs = h.calls.filter(call => call.type === 'log').map(call => call.text);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /code="capacity-recovery-owner-changed"/);
+  assert.match(logs[0], /tab=T session=S turn=E1 generation=G handoff=/);
+  assert.match(logs[0], /attempts=1/);
+  assert.doesNotMatch(logs[0], /code="capacity_retry_not_submitted"/);
+  assert.equal(h.alerts().length, 0, 'the local decision log does not depend on a notification');
 });
 
 test('physical write precondition rejects a newer turn and lifecycle generation before paste', () => {
@@ -400,6 +413,7 @@ function coordinatedLifecycleFixture(store) {
   const errors = [];
   const context = vm.createContext({
     getOrchestrationRunStore: () => store,
+    responseObservationService: null,
     emitOrchestrationChanges() {},
     finalizeSettledOrchestrations: async runs => settled.push(...runs),
     shouldRetryWaitingNotificationForSourceLifecycle: () => false,

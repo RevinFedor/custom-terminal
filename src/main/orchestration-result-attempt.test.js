@@ -9,6 +9,7 @@ const vm = require('node:vm');
 const ts = require('typescript');
 const runs = require('./orchestration-runs');
 const proof = require('./orchestration-result-proof');
+const { isResponseObservation } = require('./orchestration-response-observation');
 const { runOrchestrationCompletionFlow } = require('./orchestration-completion-flow');
 
 // Execute the production HTTP orchestration functions without starting Electron,
@@ -51,7 +52,7 @@ async function fixture(t, options = {}) {
   const counts = { persist: 0 };
   const enqueue = store._enqueuePersist.bind(store);
   store._enqueuePersist = strict => { counts.persist++; return enqueue(strict); };
-  const context = vm.createContext({ ...runs, ...proof, runOrchestrationCompletionFlow,
+  const context = vm.createContext({ ...runs, ...proof, isResponseObservation, runOrchestrationCompletionFlow,
     console: { log() {}, warn() {} },
     getOrchestrationRunStore: () => store,
     resolveAgentSessionInfo: options.resolveSession || (async () => ({

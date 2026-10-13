@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, ChevronRight, ChevronDown, Folder, Server, SquareTerminal } from 'lucide-react';
-import GlobalProcessControls from './GlobalProcessControls';
 import ResourceApplicationsView, { type ApplicationMetrics } from './ResourceApplicationsView';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -457,7 +456,6 @@ const ResourceUsageButton: React.FC = () => {
     ? { ok: true, totalBytes, commandBytes: metrics.totals?.commandBytes ?? projectsCommands.bytes,
       orphanCount: metrics?.orphans?.count || 0 }
     : ambient;
-  const orphanCount = (open ? (metrics?.orphans?.count || 0) : (ambient?.orphanCount || 0));
   const chipValue = chipSource?.ok ? formatBytes(chipSource.totalBytes || 0) : '—';
   const chipCommands = chipSource?.ok && typeof chipSource.commandBytes === 'number'
     ? chipSource.commandBytes === 0 ? null : formatBytes(chipSource.commandBytes) : '—';
@@ -516,9 +514,6 @@ const ResourceUsageButton: React.FC = () => {
           >
             <ResourceValues total={chipValue} commands={chipCommands} />
           </span>
-          {orphanCount > 0 && (
-            <span style={{ color: '#fca5a5' }}>·{orphanCount}</span>
-          )}
         </button>
       </Tooltip>
 
@@ -596,31 +591,6 @@ const ResourceUsageButton: React.FC = () => {
                 {metrics && metrics.ok && (
                   view === 'system' ? <ResourceApplicationsView data={metrics.applications} mode={mode}
                     expanded={expandedApplications} onToggle={toggleApplication} bytes={formatBytes} value={valueOf} /> : <>
-                    {/* Учёт брошенного остаётся в ресурсах. Подтверждение и
-                        перечитывание точных MCP PID — в меню MCP-хаба. */}
-                    {orphanCount > 0 && (
-                      <div style={{
-                        margin: '0 8px 6px',
-                        padding: '7px 8px',
-                        borderRadius: 6,
-                        border: '1px solid rgba(248,113,113,0.25)',
-                        background: 'rgba(248,113,113,0.07)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 8,
-                      }}>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontSize: 11, color: '#fca5a5', fontWeight: 600 }}>
-                            Брошенные инструменты
-                          </div>
-                          <div style={{ fontSize: 10, color: '#9a6a6a', fontVariantNumeric: 'tabular-nums' }}>
-                            {orphanCount} шт · {formatBytes(metrics.orphans!.totalBytes)}
-                          </div>
-                        </div>
-                        <span style={{ fontSize: 10, color: '#999' }}>Управление в меню MCP</span>
-                      </div>
-                    )}
-
                     {/* Проекты подряд, текущий первым. Заголовок проекта —
                         он же переключатель раскрытия: раньше чужие проекты
                         были тупиковой строкой «вкладок: 77». */}
@@ -845,7 +815,6 @@ const ResourceUsageButton: React.FC = () => {
 
                   </>
                 )}
-                <GlobalProcessControls />
               </div>
 
               {metrics?.ok && (

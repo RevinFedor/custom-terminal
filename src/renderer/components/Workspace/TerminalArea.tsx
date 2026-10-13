@@ -1112,6 +1112,7 @@ function TerminalArea({
           <div
             key={`pane:${tab.id}`}
             ref={tabLayerRefFor(tab.id)}
+            id={`terminal-pane-wrapper:${tab.id}`}
             data-terminal-pane-wrapper={tab.id}
             data-terminal-retained-presentation={retainCanvasPixels ? '1' : undefined}
             data-terminal-surface-presented={terminalSurfacePresented ? '1' : '0'}

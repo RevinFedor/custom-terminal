@@ -20,7 +20,7 @@ assert.ok(handler, 'actual Fork caller exists');
 const compiled = ts.transpile(`const action = ${handler}; action;`, { target: ts.ScriptTarget.ES2022 });
 
 function fixture({ resolveSource = async () => 'source-session', invoke = async () => ({ success: true, newSessionId: 'compact-session' }) } = {}) {
-  const renderedTab = { id: 'source-tab', name: 'source', cwd: '/fixture' };
+  const renderedTab = { id: 'source-tab', name: 'source', cwd: '/fixture', codexSessionId: 'source-session' };
   const liveTab = { ...renderedTab };
   const events = [];
   const store = {
@@ -29,7 +29,7 @@ function fixture({ resolveSource = async () => 'source-session', invoke = async 
       liveTab.pendingOperation = label || undefined;
       events.push({ type: 'label', label });
     },
-    async createTabAfterCurrent(...args) { events.push({ type: 'create', args }); return 'child-tab'; },
+    async createTabAfterCurrent(...args) { events.push({ type: 'create', args }); await resolveSource(); return 'child-tab'; },
   };
   const context = {
     contextMenu: { tabId: liveTab.id },
@@ -46,47 +46,45 @@ function fixture({ resolveSource = async () => 'source-session', invoke = async 
   return { action: vm.runInNewContext(compiled, context), liveTab, store, events };
 }
 
-test('first click shows source Fork progress before proof and a second surface cannot duplicate the pending request', async () => {
+test('first click allocates the child before history work and a second surface cannot duplicate the pending request', async () => {
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   const f = fixture({ resolveSource: () => gate });
   const pending = f.action(false);
   assert.equal(f.liveTab.pendingOperation, 'делается форк...');
   assert.equal(f.events[0].type, 'label');
-  assert.equal(f.events.filter(event => event.type === 'proof').length, 1);
+  assert.equal(f.events.filter(event => event.type === 'proof').length, 0);
   await f.action(false);
-  assert.equal(f.events.filter(event => event.type === 'proof').length, 1, 'the claim is shared, not a stale render flag');
-  assert.equal(f.events.filter(event => event.type === 'create').length, 0);
+  assert.equal(f.events.filter(event => event.type === 'proof').length, 0);
+  assert.equal(f.events.filter(event => event.type === 'create').length, 1, 'claim precedes allocation, proof belongs to Main');
   release('source-session');
   await pending;
   const created = f.events.filter(event => event.type === 'create');
   assert.equal(created.length, 1);
   assert.equal(created[0].args[3].pendingAction.sessionId, 'source-session');
+  assert.equal(created[0].args[3].pendingAction.contextFork.sourceTabId, 'source-tab');
+  assert.equal(created[0].args[3].nameSetManually, false);
+  assert.equal(created[0].args[3].codexSessionId, undefined, 'parent is not the target History identity');
   assert.equal(created[0].args[3].background, true, 'existing placement/focus contract is preserved');
   assert.equal(f.liveTab.pendingOperation, undefined);
   await f.action(false);
   assert.equal(f.events.filter(event => event.type === 'create').length, 2, 'a later independent Fork remains available');
 });
 
-test('proof refusal and errors before tab creation always release the Fork label', async () => {
-  for (const resolveSource of [async () => null, async () => { throw new Error('proof failed'); }]) {
-    const f = fixture({ resolveSource });
-    await f.action(false);
-    assert.equal(f.liveTab.pendingOperation, undefined);
-    assert.equal(f.events.some(event => event.type === 'create'), false);
-  }
-  const f = fixture({ invoke: async () => { throw new Error('compact read failed'); } });
+test('allocation failure always releases the source label without a ready announcement', async () => {
+  const f = fixture({ resolveSource: async () => { throw new Error('allocation failed'); } });
   await f.action(true);
-  assert.equal(f.liveTab.pendingOperation, undefined, 'compact IPC throws before the former try/finally boundary');
-  assert.equal(f.events.some(event => event.type === 'create'), false);
+  assert.equal(f.liveTab.pendingOperation, undefined);
+  assert.equal(f.events.some(event => event.type === 'place'), false);
   assert.equal(f.events.filter(event => event.type === 'toast').length, 1);
 });
 
-test('compact refusal keeps its original informational outcome and stale cleanup leaves another operation label alone', async () => {
-  const compact = fixture({ invoke: async () => ({ success: false, reason: 'no-compact' }) });
+test('compact copy is deferred to target launch; stale cleanup leaves a newer source label alone', async () => {
+  const compact = fixture({ invoke: async () => { throw Error('copy must not precede target'); } });
   await compact.action(true);
   assert.equal(compact.liveTab.pendingOperation, undefined);
-  assert.equal(compact.events.find(event => event.type === 'toast').args[1], 'info');
+  assert.equal(compact.events.some(event => event.type === 'toast'), false);
+  assert.equal(compact.events.find(event => event.type === 'create').args[3].pendingAction.contextFork.fromLatestCompact, true);
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   const f = fixture({ resolveSource: () => gate });

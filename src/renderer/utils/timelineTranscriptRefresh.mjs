@@ -1,7 +1,9 @@
 import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
-import { resolveHistoryPromptHandoffSemanticTags } from './historyOrchestrationPromptPresentation.mjs';
+import { resolveHistoryPromptHandoffSemanticTags, resolveHistoryOrchestrationPromptPresentation,
+  projectHistoryServicePromptBody } from './historyOrchestrationPromptPresentation.mjs';
 import { getTerminalMcpTag, isServicePromptEntry, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
 import { projectNativeQuestionReply } from '../../shared/native-question-reply.mjs';
+import { codexGoalPresentation } from './codexGoalPresentation.mjs';
 
 const TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS = 2048;
 
@@ -41,6 +43,13 @@ function timelineSentHandoffPreview(value) {
   return text.slice(0, TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS).trimEnd() + '\n…';
 }
 
+function provenResearchReply(record, fingerprint) {
+  const service = resolveHistoryOrchestrationPromptPresentation(record);
+  if (service?.runKind !== 'external-research' || service.phase !== 'completion') return false;
+  const projected = projectHistoryServicePromptBody(record, fingerprint);
+  return projected.projected && !projected.questionReply;
+}
+
 function timelineEntryMatchesSentHandoff(entry, handoffEntry) {
   const candidateIdentities = [
     handoffEntry?.uuid,
@@ -63,6 +72,7 @@ function timelineEntryMatchesSentHandoff(entry, handoffEntry) {
 export function projectTimelineSentHandoff(handoff, {
   toolType,
   sessionId,
+  fingerprint,
 } = {}) {
   if (!handoff || handoff.queueStatus !== 'sent') return null;
   if (handoff.toolType !== toolType) return null;
@@ -83,6 +93,8 @@ export function projectTimelineSentHandoff(handoff, {
     || new Date(Number.isFinite(submittedAt) ? submittedAt : Date.now()).toISOString();
   const promptOriginTag = promptOriginTagForSource(handoff.source);
   const semanticTags = resolveHistoryPromptHandoffSemanticTags(handoff) || (promptOriginTag ? [promptOriginTag] : []);
+  const rawContent = String(handoff.text || '');
+  const researchReply = provenResearchReply({ role: 'user', content: rawContent, semanticTags }, fingerprint);
   const promptChipLabels = [...new Set((Array.isArray(handoff.promptChips) ? handoff.promptChips : [])
     .filter((chip) => chip?.kind === 'prompt')
     .map((chip) => String(chip?.label || 'PROMPT').trim())
@@ -92,7 +104,7 @@ export function projectTimelineSentHandoff(handoff, {
     uuid: entryUuid,
     type: 'user',
     timestamp,
-    content: timelineSentHandoffPreview(handoff.text),
+    content: researchReply ? rawContent : timelineSentHandoffPreview(handoff.text),
     sessionId: exactSessionId,
     hasImage: Array.isArray(handoff.imagePaths) && handoff.imagePaths.length > 0,
     hasPromptChip: promptChipLabels.length > 0,
@@ -150,17 +162,19 @@ export function projectTimelineLiveUserMessage(detail, {
   const timestamp = String(detail.timestamp || '').trim();
   if (!timestamp || !Number.isFinite(Date.parse(timestamp))) return null;
   const content = timelineLiveUserText(message);
+  if (codexGoalPresentation({ ...message, role: 'user', content }, toolType)) return null;
   // The native certificate addresses the entire original wire body. Validate
-  // with History's shared projection before any trim/budget; only that proven
-  // reply keeps the full body needed by Q/A display, Expand and Copy.
-  const rawContent = !message.questionReplyProof ? null : typeof message.message?.content === 'string' ? message.message.content
+  // with History's shared projection before any trim/budget. Proven native
+  // Q/A and audited SC completion keep the full wire for display/Expand/Copy.
+  const rawContent = typeof message.message?.content === 'string' ? message.message.content
     : (Array.isArray(message.message?.content) ? message.message.content : [])
       .filter(block => block?.type === 'text' && typeof block.text === 'string')
       .map(block => block.text).filter(Boolean).join('\n');
   const nativeReply = message.questionReplyProof
     && projectNativeQuestionReply({ ...message, role: 'user', content: rawContent }, fingerprint);
+  const researchReply = !nativeReply && provenResearchReply({ ...message, role: 'user', content: rawContent }, fingerprint);
   const imagePaths = Array.isArray(message.imagePaths) ? message.imagePaths : [];
-  if (!content && !nativeReply && imagePaths.length === 0) return null;
+  if (!content && !nativeReply && !researchReply && imagePaths.length === 0) return null;
   const sourceIdentityAliases = Array.isArray(message.sourceIdentityAliases)
     ? message.sourceIdentityAliases.map(String).filter(Boolean)
     : [];
@@ -169,19 +183,20 @@ export function projectTimelineLiveUserMessage(detail, {
     uuid,
     type: 'user',
     timestamp,
-    content: nativeReply ? rawContent : timelineSentHandoffPreview(content),
+    content: nativeReply || researchReply ? rawContent : timelineSentHandoffPreview(content),
     ...(nativeReply ? { questionReplyProof: { ...message.questionReplyProof,
       links: message.questionReplyProof.links.map(link => ({ ...link })) } } : {}),
     sessionId: exactSessionId,
     hasImage: imagePaths.length > 0,
     handoffId: 'live-user:' + liveIdentity,
-    // This is an exact addressable point, but its text is intentionally
-    // bounded. Keep expensive AI-derived actions disabled until the complete
+    // Ordinary live text is bounded; exact Q/A/SC proofs retain their wire.
+    // Keep expensive AI-derived actions disabled until the complete
     // durable Timeline row adopts it after task_complete.
     isSentHandoffProjection: true,
     isLiveUserProjection: true,
     ...(sourceIdentity ? { sourceIdentity } : {}),
     ...(sourceIdentityAliases.length > 0 ? { sourceIdentityAliases } : {}),
+    ...(researchReply ? { semanticTags: message.semanticTags.map(tag => ({ ...tag })) } : {}),
   };
 }
 

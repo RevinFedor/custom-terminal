@@ -10,6 +10,7 @@ const { selectDirectForkMarker } = require('../shared/fork-marker-boundary.cjs')
 const { normalizePromptPresentationSnapshot } = require('./history-prompt-presentations');
 const { RUN_AFTER_LOOP_PROMPT_ID, migrateLoopPromptContent } = require('../shared/prompt-loop.cjs');
 const { DEFAULT_TAB_TITLE_PROMPT, LEGACY_TAB_TITLE_PROMPT } = require('../shared/tab-title-prompt.cjs');
+const { TASK_THEME_PROMPT_ID, DEFAULT_TASK_THEME_PROMPT } = require('../shared/task-theme-prompt.cjs');
 const { rebindHistoryAuthoringProjection } = require('./history-authoring-projection');
 const {
   emptyTaskPlan,
@@ -304,6 +305,7 @@ class DatabaseManager {
     this.ensureAdoptPrompt();
     this.ensureTabTitlePrompt();
     this.ensureRunAfterTitlePrompt();
+    this.ensureTaskThemePrompt();
     this.ensureRunAfterLoopPrompt();
     this.ensurePromptSummaryPrompt();
     this.ensureTimelineGroupingPrompt();
@@ -2142,8 +2144,8 @@ class DatabaseManager {
     ensureMainFieldReceipts(this.db);
   }
 
-  _executionTransaction(callback) {
-    if (this.db.prepare('SELECT version FROM workflow_execution_schema').get()?.version !== 1) workflowStorage.fail('execution_schema_forward_version');
+  _executionTransaction(callback, prepare = sql => this.db.prepare(sql)) {
+    if (prepare('SELECT version FROM workflow_execution_schema').get()?.version !== 1) workflowStorage.fail('execution_schema_forward_version');
     return this.db.inTransaction ? callback() : this.db.transaction(callback).immediate();
   }
   _executionMutation(kind, request, callback) {
@@ -2204,9 +2206,9 @@ class DatabaseManager {
       return this.getExecutionTabV2({ executionNamespace, tabId, subjectId });
     });
   }
-  getExecutionTabV2({ executionNamespace, tabId, subjectId }) {
+  getExecutionTabV2({ executionNamespace, tabId, subjectId }, prepare = sql => this.db.prepare(sql)) {
     if (!workflowStorage.id(executionNamespace) || !workflowStorage.id(tabId)) workflowStorage.fail('execution_exact_address_required');
-    const row = this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND execution_namespace=? AND execution_subject_version=2').get(tabId, executionNamespace);
+    const row = prepare('SELECT * FROM tabs WHERE tab_id=? AND execution_namespace=? AND execution_subject_version=2').get(tabId, executionNamespace);
     if (!row || (subjectId !== undefined && row.execution_subject_id !== subjectId)) return null;
     const record = JSON.parse(row.execution_record_json);
     const nativeFields = {};
@@ -2234,16 +2236,16 @@ class DatabaseManager {
       executionSubject: workflowStorage.executionScopeForRow(row), executionStorageRevision: row.execution_storage_revision };
     return { row, tab, executionSubject: tab.executionSubject, revision: row.execution_storage_revision, archived: row.execution_archived === 1 };
   }
-  saveExecutionTabV2({ executionNamespace, tabId, subjectId, expectedRevision, columns = {}, record, reconcileMainFields = false }) {
+  saveExecutionTabV2({ executionNamespace, tabId, subjectId, expectedRevision, columns = {}, record, reconcileMainFields = false }, prepare = sql => this.db.prepare(sql)) {
     return this._executionTransaction(() => {
-      const current = this.getExecutionTabV2({ executionNamespace, tabId, subjectId });
+      const current = this.getExecutionTabV2({ executionNamespace, tabId, subjectId }, prepare);
       if (!current || current.executionSubject.subjectId !== subjectId) workflowStorage.fail('execution_subject_changed');
       const reconciliation = reconcileMainFields && Object.keys(columns).length === 0 && current.revision !== expectedRevision
         ? reconcileMainFieldRevision(this.db,current,expectedRevision,record) : null;
       if (!Number.isSafeInteger(expectedRevision) || current.revision !== expectedRevision && !reconciliation) workflowStorage.fail('execution_storage_revision_changed',
         {tabId,expectedRevision,actualRevision:current.revision});
       const writeRevision = reconciliation ? reconciliation.toRevision : expectedRevision;
-      const available = new Set(this.db.prepare('PRAGMA table_xinfo(tabs)').all().filter(column => !column.hidden).map(column => column.name));
+      const available = new Set(prepare('PRAGMA table_xinfo(tabs)').all().filter(column => !column.hidden).map(column => column.name));
       const protectedFields = new Set(['id', 'tab_id', 'project_id', 'execution_subject_version', 'execution_subject_id',
         'execution_namespace', 'execution_storage_revision', 'execution_record_json', 'execution_archived']);
       for (const field of Object.keys(columns)) if (!available.has(field) || protectedFields.has(field)) workflowStorage.fail('execution_column_not_writable', { field });
@@ -2251,21 +2253,33 @@ class DatabaseManager {
       const values = { ...columns, ...(record ? this._executionRecordColumns(record) : {}) };
       if (record) values.execution_record_json = JSON.stringify({ ...JSON.parse(current.row.execution_record_json), ...record });
       const entries = Object.entries(values);
-      if (entries.length) this.db.prepare(`UPDATE tabs SET ${entries.map(([field]) => '"' + field.replaceAll('"', '""') + '"=?').join(',')},
+      if (entries.length) prepare(`UPDATE tabs SET ${entries.map(([field]) => '"' + field.replaceAll('"', '""') + '"=?').join(',')},
         execution_storage_revision=execution_storage_revision+1 WHERE id=? AND execution_storage_revision=?`)
         .run(...entries.map(([, value]) => value), current.row.id, writeRevision);
-      const saved = this.getExecutionTabV2({ executionNamespace, tabId, subjectId });
+      const saved = this.getExecutionTabV2({ executionNamespace, tabId, subjectId }, prepare);
       return reconciliation ? {...saved,reconciliation} : saved;
-    });
+    }, prepare);
   }
   saveExecutionTabs(executionNamespace, tabs) {
     return this._executionTransaction(() => {
       if (!Array.isArray(tabs)) workflowStorage.fail('execution_tabs_required');
+      // Reuse only preparation within this synchronous bulk call. Every get/all/run
+      // still executes; SQLite can reprepare after DDL. Explicit scope keeps nested
+      // bulk calls and direct singleton paths independent, including on rollback.
+      const statements = new Map();
+      const prepare = sql => {
+        const cached = statements.get(sql);
+        if (cached && !cached.busy) return cached;
+        const statement = this.db.prepare(sql);
+        // A reentrant reader may still own its cursor; do not reset or replace it.
+        if (!cached) statements.set(sql, statement);
+        return statement;
+      };
       const executionReconciliations = [];
       for (const tab of tabs) {
         const saved = this.saveExecutionTabV2({ executionNamespace, tabId: tab.tabId,
           subjectId: tab.executionSubject?.subjectId, expectedRevision: tab.executionStorageRevision,
-          record: tab, reconcileMainFields: true });
+          record: tab, reconcileMainFields: true }, prepare);
         if (saved.reconciliation) executionReconciliations.push(saved.reconciliation);
       }
       // Omission is never deletion. Close/archive uses the exact mutation below.
@@ -6937,6 +6951,21 @@ class DatabaseManager {
     }
   }
 
+  ensureTaskThemePrompt() {
+    // An API-created row in the old running app keeps all user-editable fields.
+    // Only register the new fixed execution role; never replace its content/model.
+    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get(TASK_THEME_PROMPT_ID);
+    if (exists) {
+      this.db.prepare('UPDATE ai_prompts SET is_built_in = 1 WHERE id = ? AND is_built_in = 0').run(TASK_THEME_PROMPT_ID);
+      return;
+    }
+    const position = this.db.prepare('SELECT COALESCE(MAX(position), -1) + 1 AS n FROM ai_prompts').get().n;
+    this.saveAIPrompt({ id: TASK_THEME_PROMPT_ID, name: 'Тема задачи', content: DEFAULT_TASK_THEME_PROMPT,
+      model: 'gemini-3.5-flash-lite', thinkingLevel: 'NONE', color: '#a78bfa',
+      isBuiltIn: true, showInContextMenu: false, position, filePaths: [] });
+    console.log('[DB] Migrated: added task-theme prompt');
+  }
+
   // Ensure built-in prompt for Timeline user-message summaries exists.
   // Names/content/model stay user-editable; only missing row is inserted.
   ensurePromptSummaryPrompt() {
@@ -8346,11 +8375,13 @@ class DatabaseManager {
 
   getHistoryReadTabDescriptors(tabIds) {
     if (!Array.isArray(tabIds) || !tabIds.length || tabIds.length > 32) return [];
+    // Standalone workflow tabs own their cwd without a legacy Project row.
+    // Project is only the cwd fallback, not an admission requirement for reads.
     return this.db.prepare(`SELECT t.tab_id AS tabId, t.project_id AS projectId,
       t.tab_type AS tabType, t.command_type AS commandType, t.color,
       COALESCE(NULLIF(t.cwd,''),p.path) AS cwd,
       t.claude_session_id AS claudeSessionId, t.codex_session_id AS codexSessionId
-      FROM tabs t JOIN projects p ON p.id=t.project_id
+      FROM tabs t LEFT JOIN projects p ON p.id=t.project_id
       WHERE t.tab_id IN (${tabIds.map(() => '?').join(',')})`).all(...tabIds);
   }
 

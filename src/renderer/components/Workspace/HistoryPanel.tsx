@@ -1,6 +1,15 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
 import { dispatchHistoryFileActionContextMenu } from '../../utils/historyFileActionContextMenu.mjs';
+import { codexGoalPresentation } from '../../utils/codexGoalPresentation.mjs';
+import { researchReplyFromProjection } from '../../utils/researchResultPresentation.mjs';
+import { buildResearchReplyClipboardPayload } from '../../utils/researchReplyClipboard.mjs';
+import { historyGroupCaptionIdentity, rememberHistoryGroupCaption } from '../../utils/historyGroupCaption.mjs';
+import { useResearchRunModels, type SavedResearchModels } from '../../utils/useResearchRunModels';
+import { timelineResearchModelLabel } from '../../utils/timelineEntryPreview.mjs';
+import { ResearchResultContent } from './ResearchResultContent';
+import { HistoryBackgroundScrollStrip } from './HistoryBackgroundScrollStrip';
+import { HISTORY_TOP_CHROME_INSET } from '../../utils/promptQueueChrome.mjs';
 import { createHistoryMeasurementViewportSync } from '../../utils/historyMeasurementViewportSync.mjs';
 import { createHistoryRevealTrace } from '../../utils/historyRevealTrace.mjs';
 import { createHistoryCardRevealAnchor } from '../../utils/historyCardRevealAnchor.mjs';
@@ -26,8 +35,8 @@ import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLi
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { canInterruptHistoryTurn, requestHistoryTurnInterrupt } from '../../utils/historyTurnInterrupt.mjs';
+import { ComposerEditor } from '../ComposerEditor';
 import {
-  ComposerEditor,
   type ComposerEditorHandle,
   type ComposerInlineToken,
 } from '@gt-editor/markdown-editor';
@@ -243,6 +252,7 @@ import {
 import { retryVoiceRecordDictation } from '../../utils/voiceRecordClient.mjs';
 import { resolveOrderedPreviewNavigation } from '../../utils/composerPromptPreviewNavigation.mjs';
 import { resolveHistoryComposerPromptBandLayout } from '../../utils/historyComposerPromptBandLayout.mjs';
+import { observeHistoryComposerHeight } from '../../utils/historyComposerHeightBudget.mjs';
 import {
   HISTORY_IMAGE_PENDING_MARKER,
   deriveHistoryComposerAggregate,
@@ -423,7 +433,7 @@ import {
   resolveHistoryPromptHandoffSemanticTags,
   resolveHistoryPromptSender,
 } from '../../utils/historyOrchestrationPromptPresentation.mjs';
-import { HistoryPromptSource } from './TabMessageSourceChip';
+import { HistoryPromptSource, ResearchSourceAction } from './TabMessageSourceChip';
 import {
   formatHistoryResponseCompletedAt,
   historyResponseTailLabel,
@@ -947,6 +957,7 @@ const captureHistoryScrollTraceDomSnapshot = (
 };
 
 interface HistoryVirtuosoContext {
+  topChromeInset: number;
   // Opt in to the pinned Virtuoso build adapter's commit measurement. Read
   // live ownership here: a retained hidden list must not acquire eager work.
   historyMeasureBeforePaint?: () => boolean;
@@ -2245,7 +2256,7 @@ const ReadActionBlock = ({ filePath }: { filePath: string }) => {
   </div>;
 };
 
-// Sub-agent (Task) — blue border, collapsible result and history
+// Sub-agent (Task) — status-coloured row addressing the shared Inspector.
 const formatSubagentDuration = (durationMs: number) => {
   const seconds = Math.max(0, Math.floor(durationMs / 1000));
   if (seconds < 60) return seconds + 's';
@@ -2261,11 +2272,13 @@ const historyAgentKey = (action: TaskAction, entryUuid: string) => (
 interface HistoryAgentInspectorController {
   selectedKey: string | null;
   openAgent: (agentKey: string) => void;
+  toggleAgent: (agentKey: string) => void;
 }
 
 const HistoryAgentInspectorContext = React.createContext<HistoryAgentInspectorController>({
   selectedKey: null,
   openAgent: () => {},
+  toggleAgent: () => {},
 });
 
 // A Task row is an address into the single docked Agent Inspector. Its own
@@ -2308,11 +2321,11 @@ const SubAgentBlock = memo(({
     <div
       data-history-agent-card={agentKey}
       {...historyRecordTimeAttributes(action.recordTime, entryUuid + ':' + (action.toolUseId || agentKey), 'tool')}
-      style={{ marginTop: 4, borderLeft: '3px solid ' + rowColor, paddingLeft: 8 }}
+      style={{ marginTop: 4, paddingLeft: 8 }}
     >
       <button
         type="button"
-        onClick={() => inspector.openAgent(agentKey)}
+        onClick={() => inspector.toggleAgent(agentKey)}
         className="group"
         aria-expanded={selected}
         style={{
@@ -2321,7 +2334,7 @@ const SubAgentBlock = memo(({
           background: selected ? 'rgba(129, 140, 248, 0.08)' : 'transparent',
           color: rowColor, cursor: 'pointer', fontSize: '0.85em', textAlign: 'left',
         }}
-        title="Открыть агента"
+        title={selected ? 'Закрыть панель агента' : 'Открыть панель агента'}
       >
         {subagentRunning && (
           <Loader2 className="noted-infinite-animation" size={11} strokeWidth={2.5} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
@@ -3796,18 +3809,7 @@ const HistoryBackgroundTasksBar = memo(({
           )}
         </div>
       )}
-      <div
-        data-history-background-tasks
-        className="inline-flex items-stretch overflow-x-auto shrink-0"
-        style={{
-          display: 'inline-flex',
-          width: 'max-content',
-          maxWidth: '100%',
-          borderTop: '1px solid #2a2a2a',
-          borderRight: '1px solid #2a2a2a',
-          background: '#141414',
-        }}
-      >
+      <HistoryBackgroundScrollStrip>
         {agents.length > 0 && (
           <button
             type="button"
@@ -3867,7 +3869,7 @@ const HistoryBackgroundTasksBar = memo(({
             </React.Fragment>
           );
         })}
-      </div>
+      </HistoryBackgroundScrollStrip>
     </div>
   );
 });
@@ -4777,6 +4779,60 @@ const HistoryUserPromptContent = ({
   );
 };
 
+const HistoryResearchModelsContext = React.createContext<SavedResearchModels | null>(null);
+function HistoryResearchModelsProvider({ tabId, sessionId, enabled, entries, children,
+  presented = true, presentationChannel, presentationRef }: {
+  tabId: string; sessionId?: string | null; enabled: boolean; entries: FullHistoryEntry[]; children: React.ReactNode;
+  presented?: boolean; presentationChannel?: string;
+  presentationRef?: React.RefObject<{ presented: boolean }>;
+}) {
+  // Retained History's prop is only its mount-time seed. React must react to
+  // presentation here, in the small metadata consumer, not in the whole panel.
+  const [visibility, setVisibility] = useState(() => ({ channel: presentationChannel,
+    presented: presentationRef?.current.presented ?? presented }));
+  useLayoutEffect(() => {
+    if (!presentationChannel) return;
+    setVisibility({ channel: presentationChannel, presented: presentationRef?.current.presented ?? presented });
+    const onPresentation = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (detail?.channel !== presentationChannel || typeof detail.presented !== 'boolean') return;
+      setVisibility(previous => previous.channel === presentationChannel && previous.presented === detail.presented
+        ? previous : { channel: presentationChannel, presented: detail.presented });
+    };
+    window.addEventListener(HISTORY_SURFACE_PRESENTATION_EVENT, onPresentation);
+    return () => window.removeEventListener(HISTORY_SURFACE_PRESENTATION_EVENT, onPresentation);
+  }, [presentationChannel, presentationRef, presented]);
+  const researchRunIds = useMemo(() => [...new Set(entries.flatMap(entry => (entry.semanticTags || [])
+    .filter(tag => tag.runKind === 'external-research' && ['completion', 'failure'].includes(tag.phase) && typeof tag.runId === 'string')
+    .map(tag => tag.runId as string)))], [entries]);
+  const visible = presentationChannel
+    ? visibility.channel === presentationChannel ? visibility.presented : presentationRef?.current.presented === true
+    : presented;
+  const values = useResearchRunModels(tabId, sessionId, enabled && visible && researchRunIds.length > 0, researchRunIds);
+  return <HistoryResearchModelsContext.Provider value={values}>{children}</HistoryResearchModelsContext.Provider>;
+}
+
+const HistoryResearchReply = ({ result, source, phase, copied, onCopy, forceExpanded }: {
+  result: any; source: any; phase?: string; copied: boolean;
+  onCopy: (event: React.MouseEvent<HTMLButtonElement>) => void; forceExpanded?: boolean;
+}) => {
+  const [expanded, setExpanded] = useState(false);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const onToggle = useHistoryRevealToggle(anchorRef, expanded, setExpanded);
+  const models = React.useContext(HistoryResearchModelsContext);
+  const saved = models?.[source?.researchRunId];
+  const label = timelineResearchModelLabel(saved);
+  return <div ref={anchorRef}>
+    <ResearchResultContent result={result} open={!!forceExpanded || expanded}
+      onToggle={onToggle} forceExpanded={forceExpanded} copied={copied} onCopy={onCopy}
+      title={saved?.label} model={label}
+      sourceAction={source?.researchRunId ? <ResearchSourceAction runId={source.researchRunId}
+        label={saved?.label || label || 'Research'} iconOnly /> : undefined}
+      browserAction={source?.researchRunId ? <ResearchSourceAction runId={source.researchRunId}
+        label={saved?.label || label || 'Research'} iconOnly destination="browser" /> : undefined} />
+  </div>;
+};
+
 const HistoryUserEntry = memo(({
   entry,
   tabId,
@@ -4859,18 +4915,23 @@ const HistoryUserEntry = memo(({
   const serviceBody = useMemo(() => projectHistoryServicePromptBody({
     role: entry.role, content: entry.content, semanticTags: entry.semanticTags, questionReplyProof: entry.questionReplyProof,
   }, historyServicePromptFingerprint), [entry.role, entry.content, entry.semanticTags, entry.questionReplyProof]);
-  const promptPresentation = useMemo(() => serviceBody.questionReply ? {
+  const researchReply = useMemo(() => researchReplyFromProjection(entry,
+    resolveHistoryOrchestrationPromptPresentation(entry), serviceBody), [entry, serviceBody]);
+  const promptPresentation = useMemo(() => researchReply ? { parts: researchReply.parts } : serviceBody.questionReply ? {
     parts: [{ kind: 'text', text: serviceBody.text }],
   } : buildHistoryComposerPresentationParts({
     text: serviceBody.text,
     chips: entry.promptChips,
     imagePaths: entry.imagePaths,
-  }), [serviceBody.text, serviceBody.questionReply, entry.imagePaths, entry.promptChips]);
-  const detachedPrompts = useMemo(() => (
-    forceExpanded
-      ? { promptParts: [] as HistoryPromptPresentationPart[], bodyParts: promptPresentation.parts as Array<any> }
-      : splitLeadingHistoryPromptParts(promptPresentation.parts as Array<any>)
-  ), [forceExpanded, promptPresentation.parts]);
+  }), [researchReply, serviceBody.text, serviceBody.questionReply, entry.imagePaths, entry.promptChips]);
+  const detachedPrompts = useMemo(() => {
+    // Research owns its answer body. Split only its attachment prefix here;
+    // promptParts contains { part, sourceIndex }, not the original parts.
+    const parts = (researchReply ? researchReply.prefixParts : promptPresentation.parts) as Array<any>;
+    return forceExpanded
+      ? { promptParts: [] as HistoryPromptPresentationPart[], bodyParts: parts }
+      : splitLeadingHistoryPromptParts(parts);
+  }, [forceExpanded, promptPresentation.parts, researchReply]);
   const hasDetachedPromptBand = detachedPrompts.promptParts.length > 0;
   const chipOnly = useMemo(() => (
     !forceExpanded && historyUserPromptIsChipOnly({
@@ -4891,6 +4952,7 @@ const HistoryUserEntry = memo(({
   const userBubbleClassName = [
     chipOnly ? 'hp-history-user-bubble--single-chip' : '',
     orchestrationPrompt ? 'hp-history-user-bubble--orchestration' : '',
+    researchReply ? 'hp-history-user-bubble--research' : '',
     loopPrompt ? 'hp-history-user-bubble--loop' : '',
     continuePrompt ? 'hp-history-user-bubble--continue' : '',
   ].filter(Boolean).join(' ') || undefined;
@@ -4929,7 +4991,7 @@ const HistoryUserEntry = memo(({
   const copyPrompt = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     event.stopPropagation();
-    const copiedMessage = buildHistoryMessageClipboardPayload({
+    const copiedMessage = researchReply ? buildResearchReplyClipboardPayload(entry, orchestrationPrompt) : buildHistoryMessageClipboardPayload({
       text: entry.content,
       chips: entry.promptChips,
       imagePaths: entry.imagePaths,
@@ -5044,7 +5106,7 @@ const HistoryUserEntry = memo(({
       data-history-question-reply={serviceBody.questionReply?.provider}
       entryUuid={entry.uuid}
       {...historyRecordTimeAttributes(entry.recordTime, entry.uuid + ':user', 'user')}
-      className={orchestrationPrompt ? 'hp-history-user--orchestration' : loopPrompt ? 'hp-history-user--loop' : continuePrompt ? 'hp-history-user--continue' : undefined}
+      className={researchReply ? 'hp-history-user--orchestration hp-history-research-entry' : orchestrationPrompt ? 'hp-history-user--orchestration' : loopPrompt ? 'hp-history-user--loop' : continuePrompt ? 'hp-history-user--continue' : undefined}
       data-history-prompt-origin={loopPrompt ? 'loop' : continuePrompt ? 'codex-capacity-retry' : undefined}
       data-history-orchestration-phase={orchestrationPrompt?.phase}
       data-history-tab-message-id={orchestrationPrompt?.messageId}
@@ -5100,7 +5162,7 @@ const HistoryUserEntry = memo(({
             aria-label="Prompt actions"
             style={promptActionPopover ? { opacity: 1, pointerEvents: 'auto' } : undefined}
           >
-            <Tooltip content={copied ? 'Скопировано' : 'Копировать prompt'}>
+            {!researchReply && <Tooltip content={copied ? 'Скопировано' : 'Копировать prompt'}>
               <MessageActionButton
                 aria-label="Copy prompt"
                 onMouseDown={stopActionPropagation}
@@ -5112,7 +5174,7 @@ const HistoryUserEntry = memo(({
               >
                 {copied ? <Check size={11} /> : <Copy size={11} />}
               </MessageActionButton>
-            </Tooltip>
+            </Tooltip>}
             {!instructionAttachment && (allowHistoryRewriteRewind || allowDeleteIteration) && (
               <span
                 data-history-rewind-action-stack
@@ -5242,7 +5304,7 @@ const HistoryUserEntry = memo(({
         </>
       )}
     >
-      {promptSender && (
+      {promptSender && !researchReply && (
         <HistoryPromptSource source={promptSender} phase={orchestrationPrompt.phase} />
       )}
       {(loopPrompt || continuePrompt) && <div className="hp-history-loop-label" data-history-loop-label={loopPrompt || undefined}
@@ -5250,7 +5312,14 @@ const HistoryUserEntry = memo(({
         {continuePrompt ? <RefreshCw size={12} aria-hidden="true" /> : <Repeat2 size={12} aria-hidden="true" />}
         <span>{continuePrompt ? 'Continue' : 'Loop'}</span>
       </div>}
-      <HistoryUserPromptContent
+      {researchReply ? <>
+        {detachedPrompts.bodyParts.length > 0 && <HistoryUserPromptContent
+          text={detachedPrompts.bodyParts.filter((part: any) => part.kind === 'text').map((part: any) => part.text).join('')}
+          messageText={entry.content} tabId={tabId} imagePaths={entry.imagePaths} toolType={toolType} forceExpanded={forceExpanded}
+          presentationParts={detachedPrompts.bodyParts} />}
+        <HistoryResearchReply result={researchReply} source={promptSender} phase={orchestrationPrompt?.phase}
+          copied={copied} onCopy={copyPrompt} forceExpanded={forceExpanded} />
+      </> : <HistoryUserPromptContent
         text={serviceBody.text}
         messageText={entry.content}
         markdown={serviceBody.projected && !serviceBody.questionReply}
@@ -5260,7 +5329,7 @@ const HistoryUserEntry = memo(({
         toolType={toolType}
         forceExpanded={forceExpanded}
         presentationParts={serviceBody.questionReply ? promptPresentation.parts : hasDetachedPromptBand ? detachedPrompts.bodyParts : undefined}
-      />
+      />}
     </ConversationMessage>
   );
 });
@@ -5463,11 +5532,14 @@ const HistoryInterruptedRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
   </ConversationMessage>
 ));
 
-const HistoryGoalRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
+const HistoryGoalRow = memo(({ entry, presentation }: { entry: FullHistoryEntry; presentation?: any }) => (
   <ConversationMessage layout="block" entryUuid={entry.uuid} className="hp-assistant-tool-only">
-    <div className="hp-history-slash hp-history-goal">
+    <div className="hp-history-slash hp-history-goal"
+      data-history-goal-kind={presentation?.kind || 'continuation'}
+      data-history-goal-status={presentation?.status}
+      {...historyRecordTimeAttributes(entry.recordTime, entry.uuid, 'user')}>
       <Target size={12} className="hp-history-slash-ic hp-history-goal-ic" />
-      <span className="hp-history-slash-cmd">{entry.content}</span>
+      <span className="hp-history-slash-cmd">{presentation?.text || entry.content}</span>
     </div>
   </ConversationMessage>
 ));
@@ -5609,8 +5681,9 @@ const HistoryEntry = memo(({
     return <HistoryInterruptedRow entry={entry} />;
   }
 
-  if (entry.role === 'goal') {
-    return <HistoryGoalRow entry={entry} />;
+  const goalPresentation = codexGoalPresentation(entry, toolType);
+  if (goalPresentation || entry.role === 'goal') {
+    return <HistoryGoalRow entry={entry} presentation={goalPresentation} />;
   }
 
   if (entry.role === 'user') {
@@ -5926,6 +5999,45 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   --cb-user-bubble-border: rgba(167, 139, 250, 0.20);
   --cb-user-bubble-bg-solid: #221d2b;
 }
+.hp-history-transcript .cb-user-bubble.hp-history-user-bubble--research {
+  --cb-user-bubble-bg: transparent;
+  --cb-user-bubble-border: transparent;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.hp-history-transcript {
+  --hp-research-leading-space: calc(var(--cb-message-action-size, 1.54em) + var(--cb-message-action-size, 1.54em) + 16px);
+}
+/* One right-side lane in BOTH disclosure states. Content below the header
+   may grow, but neither the header width nor its glyph/click target moves. */
+.hp-history-research-group > .cb-user-col,
+.hp-history-research-entry > .cb-user-col {
+  width: 100%;
+  min-width: 0;
+}
+.hp-history-group-member--research .cb-user-col { max-width: 100%; }
+.hp-history-research-group.cb-row-user, .hp-history-research-entry.cb-row-user { padding-top: 2px; padding-bottom: 2px; }
+.hp-history-transcript .cb-user-bubble.hp-history-research-group-bubble {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+.hp-history-research-group-toggle { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; min-height: 24px; padding: 2px 4px; border: 0; border-radius: 4px; background: transparent; color: #bcbab5; cursor: pointer; font: inherit; font-size: .9em; text-align: left; }
+.hp-history-research-group-toggle:hover, .hp-history-research-group-toggle:focus-visible { background: var(--cb-hover, rgba(255,255,255,.04)); }
+.hp-history-research-group-toggle:focus-visible { outline: 1px solid #777; outline-offset: 2px; }
+.hp-history-research-group-toggle svg { flex-shrink: 0; }
+.hp-history-research-group-icon { color: #a78bfa; display: inline-flex; flex-shrink: 0; }
+.hp-history-research-group-flex { flex: 1; }
+.hp-history-research-group-count { color: #8f8d88; }
+.hp-history-research-group-errors { color: #f87171; }
 .hp-history-transcript .cb-user-bubble.hp-history-user-bubble--loop,
 .hp-history-transcript .cb-user-bubble.hp-history-user-bubble--continue {
   --cb-user-bubble-bg: rgba(114, 90, 159, 0.08);
@@ -6268,6 +6380,12 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   overflow-wrap: anywhere;
   line-height: 1.4;
 }
+.hp-history-caption-gutter { display: flex; flex-direction: column; align-items: center; flex: 0 0 auto; }
+.hp-history-caption-text { flex: 1; min-width: 0; white-space: pre-wrap; }
+.hp-history-caption-number { align-self: stretch; min-width: 14px; min-height: 14px; height: 1.15em; padding: 0 2px; border: 0; border-radius: 3px; background: transparent; color: #8f8d88; font: inherit; font-size: .9em; line-height: 1; font-variant-numeric: tabular-nums; cursor: pointer; translate: .25ch 0; }
+.hp-history-caption-number:hover:not(:disabled), .hp-history-caption-number:focus-visible { background: rgba(255,255,255,.08); color: #ddd; }
+.hp-history-caption-number:focus-visible { outline: 1px solid #777; outline-offset: 1px; }
+.hp-history-caption-number:disabled { color: #6f6d68; cursor: default; }
 /* Expanded members: shared left rail marks the group extent; contents are the
    ordinary collapsed cards. Heavy bodies still require each card's own click. */
 .hp-history-group-member {
@@ -6357,6 +6475,12 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
    (user feedback). A MIXED group is the opposite case: the verb is the only
    thing telling one member from the next, so it stays. */
 .hp-history-group-member[data-history-group-uniform="1"] > .cb-row .cb-tool-label { display: none; }
+/* Left rail hangs from the group glyph: user action reserve + row padding4
+   + header padding4 + half a14px glyph. Keep the existing rail/foot owner. */
+.hp-history-group-member--research { margin-left: calc(var(--hp-research-leading-space) + 15px); padding-left: 5px; margin-right: 0; padding-right: 0; border-right: 0; }
+.hp-history-group-member--research:has(> .hp-history-group-rail-control:hover),
+.hp-history-group-member--research:has(> .hp-history-group-rail-control:focus-visible),
+.hp-history-group-member--research[data-history-group-rail-hot="1"] { border-left-color: rgba(255,255,255,.30); }
 /* Rhythm INSIDE a container is tighter than the rhythm BETWEEN containers.
    A group is one thing the eye takes in at once — its members are a list, not
    a sequence of separate steps — so they tile without any air of their own
@@ -7449,6 +7573,7 @@ function AgentHistoryControls({
   const historyComposerLineHeightPx = historyComposerFontSize * 1.35;
   const historyComposerMinHeight = Math.ceil(historyComposerLineHeightPx * historyComposerMinRows + 16);
   const historyComposerMaxHeight = Math.ceil(historyComposerLineHeightPx * historyComposerMaxRows + 16);
+  const historyComposerHeightBoundsRef = useRef({minHeight: historyComposerMinHeight, maxHeight: historyComposerMaxHeight});
   // Zustand/React store snapshots must be referentially stable. Returning `[]`
   // here when the tab has no images creates a new snapshot on every read and
   // can crash History with React #185 when AgentHistoryControls mounts.
@@ -7733,12 +7858,13 @@ function AgentHistoryControls({
     element.measureNaturalHeight((measuredHeight) => {
       if (promptTextareaRef.current !== element) return;
       const contentHeight = measuredHeight + 2;
+      const limits = historyComposerHeightBoundsRef.current;
       const nextHeight = Math.min(
-        Math.max(contentHeight, historyComposerMinHeight),
-        historyComposerMaxHeight,
+        Math.max(contentHeight, limits.minHeight),
+        limits.maxHeight,
       );
       element.style.height = nextHeight + 'px';
-      element.style.overflowY = contentHeight > historyComposerMaxHeight ? 'auto' : 'hidden';
+      element.style.overflowY = contentHeight > limits.maxHeight ? 'auto' : 'hidden';
     });
   }, [historyComposerMaxHeight, historyComposerMinHeight]);
 
@@ -7818,20 +7944,26 @@ function AgentHistoryControls({
     return () => window.removeEventListener('beforeunload', persistBeforeClose);
   }, [captureHistoryComposerView]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = promptTextareaRef.current;
-    if (!element || typeof ResizeObserver === 'undefined') return;
-    let lastWidth = element.getBoundingClientRect().width;
-    const observer = new ResizeObserver(() => {
-      const nextWidth = element.getBoundingClientRect().width;
-      if (Math.abs(nextWidth - lastWidth) < 0.5) return;
-      lastWidth = nextWidth;
-      syncPromptTextareaHeight();
+    if (!element) return;
+    return observeHistoryComposerHeight({
+      editor: element, controls: controlsRef.current,
+      minHeight: historyComposerMinHeight, maxHeight: historyComposerMaxHeight,
+      transcriptLineHeight: historyTranscriptFontSize * 1.4,
+      onMeasure: (limits: {minHeight: number; maxHeight: number}) => {
+        if (promptTextareaRef.current !== element) return;
+        const previous = historyComposerHeightBoundsRef.current;
+        historyComposerHeightBoundsRef.current = limits;
+        element.style.minHeight = limits.minHeight + 'px';
+        element.style.maxHeight = limits.maxHeight + 'px';
+        if (previous.minHeight !== limits.minHeight || previous.maxHeight !== limits.maxHeight) {
+          uiPerformancePhase('composer-height-budget', {tab: tabId, minHeight: limits.minHeight, maxHeight: limits.maxHeight});
+        }
+        syncPromptTextareaHeight();
+      },
     });
-    if (!element.dom) return;
-    observer.observe(element.dom);
-    return () => observer.disconnect();
-  }, [syncPromptTextareaHeight]);
+  }, [syncPromptTextareaHeight, historyComposerMinHeight, historyComposerMaxHeight, historyTranscriptFontSize, tabId, !!pendingQuestion]);
 
   useEffect(() => {
     const focusComposer = (event: Event) => {
@@ -10917,6 +11049,7 @@ function AgentHistoryControls({
     const element = event.currentTarget;
     const start = element.selectionStart ?? 0;
     const end = element.selectionEnd ?? 0;
+    uiPerformancePhase('history-composer-' + event.type, { selectionChars: Math.max(0, end - start), owner: tabId });
     if (start === end) return;
     const result = buildComposerClipboardText({
       text: element.value,
@@ -10925,6 +11058,7 @@ function AgentHistoryControls({
       chips: draftChips,
       imagePaths: draftImages,
     });
+    uiPerformancePhase('history-composer-copy-route', { handled: result.handled, chars: result.text.length });
     if (!result.handled) return;
     event.preventDefault();
     if (event.type === 'cut' && !(isCancellingTurn || rewindLocked || effectiveStopping)) {
@@ -10966,6 +11100,9 @@ function AgentHistoryControls({
   }, [applyHistoryComposerSnapshot, draftChips, draftImages, effectiveStopping, isCancellingTurn, rewindLocked, runtime.logPrefix, tabId]);
 
   const handleComposerImagePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const pasteStartedAt = performance.now();
+    const pasteActionId = currentUIActionId();
+    uiPerformancePhase('history-composer-paste-received', { owner: tabId });
     // A full History snapshot wins over an incidental native bitmap flavor:
     // it owns the copied message's text, chips and all its image references.
     const structuredSnapshot = normalizeHistoryMessageComposerSnapshot(
@@ -10976,6 +11113,8 @@ function AgentHistoryControls({
     const pastedText = event.clipboardData?.getData('text/plain') || '';
     const portableMarkers = !structuredSnapshot && !hasImageItem
       ? collectPortableImagePathMarkers(pastedText) : [];
+    uiPerformancePhase('history-composer-paste-classified', { ms: performance.now() - pasteStartedAt,
+      snapshot: !!structuredSnapshot, bitmap: hasImageItem, pathMarkers: portableMarkers.length, chars: pastedText.length });
     // Pure Voice Record text bypasses long-paste collapse. A composed take
     // that also carries portable image paths must still enter the image import
     // branch; otherwise the marker would be inserted as visible raw text.
@@ -11051,11 +11190,13 @@ function AgentHistoryControls({
       ownerTabId: actionTabId, text: current, images: currentImages,
       chips: currentChips, pendingImages, start, end,
     });
-    applyHistoryComposerSnapshot({
+    const pendingApplied = applyHistoryComposerSnapshot({
       ownerTabId: actionTabId, text: pending.text, images: pending.images,
       chips: pending.chips, pendingImages: pending.pendingImages,
       selectionStart: pending.caret, history: 'add', userEvent: 'input.paste',
     });
+    uiPerformancePhase('history-image-pending-applied', { ms: performance.now() - pasteStartedAt,
+      owner: actionTabId, pending: pending.pendingImages.length, applied: pendingApplied !== false });
     setDraftWarning(null);
     focusAt(pending.caret);
     const operation = pending.operation;
@@ -11070,15 +11211,19 @@ function AgentHistoryControls({
         : portableMarkers.length > 0 ? 'Could not import the image paths. Missing paths were replaced with imageError.'
           : 'Could not save the clipboard image. Copy it again and retry.',
     };
-    console.log('[' + runtime.logPrefix + ':images] ' + kind + ' start tab=' + actionTabId.slice(-12));
+    const diagnosticAddress = ' action=' + (pasteActionId || 'unknown') + ' import=' + operation.id;
+    console.log('[' + runtime.logPrefix + ':images] ' + kind + ' start tab=' + actionTabId.slice(-12)
+      + diagnosticAddress + ' pendingAppliedMs=' + (performance.now() - pasteStartedAt).toFixed(1));
     const complete = (outcome: NonNullable<Parameters<typeof finishHistoryImageImport>[1]>) => {
       finishHistoryImageImport(operation, outcome);
-      console.log('[' + runtime.logPrefix + ':images] ' + kind + ' complete tab=' + actionTabId.slice(-12));
+      console.log('[' + runtime.logPrefix + ':images] ' + kind + ' complete tab=' + actionTabId.slice(-12)
+        + diagnosticAddress + ' elapsedMs=' + (performance.now() - pasteStartedAt).toFixed(1));
     };
     const fail = (cause: any) => {
       finishHistoryImageImport(operation, failure);
       console.warn('[' + runtime.logPrefix + ':images] ' + kind + ' failed tab='
-        + actionTabId.slice(-12) + ' error=' + String(cause?.message || cause));
+        + actionTabId.slice(-12) + diagnosticAddress + ' elapsedMs=' + (performance.now() - pasteStartedAt).toFixed(1)
+        + ' error=' + String(cause?.message || cause));
     };
     try {
       if (structuredSnapshot) {
@@ -12581,7 +12726,13 @@ function AgentHistoryControls({
   );
 }
 
+const HistoryTopChromeReserve = memo(({ context }: { context?: HistoryVirtuosoContext }) => (
+  context?.topChromeInset ? <div data-history-top-chrome-reserve aria-hidden="true"
+    style={{ height: context.topChromeInset, pointerEvents: 'none' }} /> : null
+));
+
 const HISTORY_VIRTUOSO_COMPONENTS = {
+  Header: HistoryTopChromeReserve,
   Footer: HistoryTerminalPreviewFooter,
   ScrollSeekPlaceholder: HistoryScrollSeekPlaceholder,
 };
@@ -13848,7 +13999,8 @@ function HistoryPanel({
   const agentInspectorController = useMemo<HistoryAgentInspectorController>(() => ({
     selectedKey: expandedBackgroundChipKey,
     openAgent: openHistoryAgent,
-  }), [expandedBackgroundChipKey, openHistoryAgent]);
+    toggleAgent: toggleHistoryDetail,
+  }), [expandedBackgroundChipKey, openHistoryAgent, toggleHistoryDetail]);
   useEffect(() => {
     const onOpenAgent = (event: Event) => {
       const detail = (event as CustomEvent).detail || {};
@@ -13952,6 +14104,12 @@ function HistoryPanel({
   // translated to unit indices HERE. Kill switch: historyGroupActionsEnabled.
   const historyGroupActionsEnabled = useUIStore((s) => (s as any).historyGroupActionsEnabled !== false);
   const [expandedGroupKeys, setExpandedGroupKeys] = useState<ReadonlySet<string>>(() => new Set());
+  const groupCaptionSelectionsRef = useRef(new Map<string, string>());
+  const groupCaptionOwnerRef = useRef(historyOwnerKey);
+  if (groupCaptionOwnerRef.current !== historyOwnerKey) {
+    groupCaptionOwnerRef.current = historyOwnerKey;
+    groupCaptionSelectionsRef.current.clear();
+  }
   // Expansion state belongs to the owner (scar: state surviving an owner
   // switch was read by the wrong tab). Reset on owner change.
   const expandedGroupOwnerRef = useRef(historyOwnerKey);
@@ -14066,9 +14224,13 @@ function HistoryPanel({
     (index: number) => displayUnitItemKeysRef.current[index] || '',
     [],
   );
+  const topChromeInset = mainSurface && enableClaudePtyControls && !previewMode ? HISTORY_TOP_CHROME_INSET : 0;
   const displayUnitLayoutKeys = useMemo(
-    () => displayUnits.map((unit) => historyMeasuredUnitKey(unit)),
-    [displayUnits],
+    // The added Header changes physical offsets, but never display-unit IDs.
+    // Reject an old zero-header snapshot through the existing shape guard;
+    // semantic reading anchors still restore through their normal owner.
+    () => displayUnits.map((unit) => (topChromeInset ? `chrome:${topChromeInset}|` : '') + historyMeasuredUnitKey(unit)),
+    [displayUnits, topChromeInset],
   );
   const displayUnitLayoutKeysRef = useRef(displayUnitLayoutKeys);
   displayUnitLayoutKeysRef.current = displayUnitLayoutKeys;
@@ -14079,6 +14241,7 @@ function HistoryPanel({
     const protectedUuids = collectHistoryMaterializedWindowUuids(
       displayUnitsRef.current,
       visibleRangeRef.current,
+      { captionSelections: groupCaptionSelectionsRef.current },
     );
     const retained = retainHistoryMaterializedWindow(
       presentationEntriesRef.current,
@@ -14146,13 +14309,14 @@ function HistoryPanel({
   const historyVirtuosoContext = useMemo<HistoryVirtuosoContext>(
     () => ({
       historyMeasureBeforePaint,
+      topChromeInset,
       terminalPreview: visibleTerminalPreview,
       terminalPreviewCanonicalMaterialized,
       onHandoffDomCommit: onHistoryHandoffRowMounted,
       responseTiming: responseTailTiming,
       seekUnitKeyAt,
     }),
-    [historyMeasureBeforePaint, visibleTerminalPreview, terminalPreviewCanonicalMaterialized, responseTailTiming, seekUnitKeyAt, onHistoryHandoffRowMounted],
+    [historyMeasureBeforePaint, topChromeInset, visibleTerminalPreview, terminalPreviewCanonicalMaterialized, responseTailTiming, seekUnitKeyAt, onHistoryHandoffRowMounted],
   );
   const visibleLiveToolResults = liveToolResultsRef.current.ownerKey === historyOwnerKey
     ? liveToolResults
@@ -15392,6 +15556,20 @@ function HistoryPanel({
     reason: string,
     extra = '',
   ) => requestHistoryHydrationAtRef.current(centerUuid, reason, extra), []);
+  const cycleHistoryGroupCaption = useCallback((
+    groupKey: string, next: any, previous: any, anchor: HTMLElement | null, commit: () => void,
+  ) => {
+    if (historyOwnerKeyRef.current !== historyOwnerKey || !historyPresentationProofRef.current.presented) return;
+    rememberHistoryGroupCaption(groupCaptionSelectionsRef.current, groupKey, historyGroupCaptionIdentity(next));
+    // A caption replacement can shrink or grow its one row. Reuse the same
+    // reading/anchor transaction; never expand the group or jump to a UUID.
+    applyHistoryRevealUpdate(anchor, false, commit);
+    uiPerformancePhase('history-group-caption-cycle', { pending: next?.rowStub === true });
+    historyDiag('GROUP_CAPTION_CYCLE tab=' + tabId.slice(-12) + ' key=' + groupKey.slice(0,24)
+      + ' from=' + String(previous?.uuid || '').slice(-16) + ' to=' + String(next?.uuid || '').slice(-16)
+      + ' stub=' + (next?.rowStub ? '1' : '0'));
+    if (next?.rowStub) requestHistoryHydrationAt(next.uuid, 'group-caption');
+  }, [historyOwnerKey, requestHistoryHydrationAt, tabId]);
   // Latest entries length — let stable callbacks (scrollToBottom) read it
   // without depending on `entries` (which would invalidate downstream effects
   // on every refresh).
@@ -17716,10 +17894,11 @@ function HistoryPanel({
       displayUnitsRef.current,
       range,
       HISTORY_HYDRATION_REFETCH_MARGIN_ROWS,
+      groupCaptionSelectionsRef.current,
     );
     if (!found) return;
     const stubEntry = found.entry as FullHistoryEntry;
-    const centerUuid = historyHydrationCenterForRange(
+    const centerUuid = found.caption === true ? stubEntry.uuid : historyHydrationCenterForRange(
       displayUnitsRef.current,
       range,
       stubEntry.uuid || null,
@@ -22885,6 +23064,9 @@ function HistoryPanel({
           </div>
         )}
         <HistoryPayloadContext.Provider value={historyPayloadContextValue}>
+        <HistoryResearchModelsProvider tabId={tabId} sessionId={sessionId} entries={transcriptEntries}
+          enabled={isOpen} presented={presented} presentationRef={historyPresentationProofRef}
+          presentationChannel={presentationExternallyManaged ? presentationChannel : undefined}>
         <HistoryBackgroundLiveContext.Provider value={liveBackgroundUuids}>
         <HistoryBackgroundTaskCallContext.Provider value={liveBackgroundTaskCalls}>
         <HistoryAgentInspectorContext.Provider value={agentInspectorController}>
@@ -23312,6 +23494,9 @@ function HistoryPanel({
                   >
                     <HistoryCollapsedGroupRow
                       group={group}
+                      captionOwnerKey={historyOwnerKey}
+                      captionIdentity={groupCaptionSelectionsRef.current.get(group.key) || null}
+                      onCaptionChange={cycleHistoryGroupCaption}
                       expanded={groupExpanded}
                       liveBackgroundUuids={liveBackgroundUuids}
                       isTurnBusy={isTurnBusy}
@@ -23508,7 +23693,7 @@ function HistoryPanel({
                     // along this member's rail (the foot is its final glyph),
                     // so a long block never requires scrolling back to its top.
                     <div
-                      className="hp-history-group-member"
+                      className={`hp-history-group-member${expandedGroup.familyKey === 'research' ? ' hp-history-group-member--research' : ''}`}
                       data-history-group-member={expandedGroup.key}
                       data-history-group-uniform={expandedGroup.uniform ? '1' : undefined}
                       data-history-group-last={expandedGroup.last ? '1' : undefined}
@@ -23600,6 +23785,7 @@ function HistoryPanel({
         </HistoryAgentInspectorContext.Provider>
         </HistoryBackgroundTaskCallContext.Provider>
         </HistoryBackgroundLiveContext.Provider>
+        </HistoryResearchModelsProvider>
         </HistoryPayloadContext.Provider>
         {/* «Выдвинуть вторую поверхность» — вплотную над полем ввода, у правого
             края. Стоит ВСЕГДА, в отличие от стрелки слева от него: это орган

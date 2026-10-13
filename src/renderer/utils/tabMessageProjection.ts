@@ -1,4 +1,4 @@
-import { REQUEST_SUCCESS_VISIBLE_MS } from './requestTrackerVisibility.mjs';
+import { isRequestSuccessPresentation } from './requestTrackerVisibility.mjs';
 
 export type TabMessageDelivery = 'pending' | 'sending' | 'queued' | 'sent' | 'waiting-for-input' | 'unconfirmed' | 'failed';
 export type TabMessageTimestamp = string | number;
@@ -137,12 +137,11 @@ export function tabMessagePresentation(thread: TabMessageThread): MessagePresent
 export function tabMessageSuccessAt(thread: TabMessageThread): number | null {
   if (thread.question.deliveryState !== 'sent' || thread.reply?.deliveryState !== 'sent') return null;
   // A reply's sent timestamp is frozen by the service. Question.updatedAt also
-  // changes when either participant dismisses, so it must not renew visibility.
+  // changes when either participant dismisses, so it is not the reply time.
   return tabMessageTimestamp(thread.reply.updatedAt) || tabMessageTimestamp(thread.reply.createdAt) || null;
 }
 
-export function tabMessageVisibleInTracker(thread: TabMessageThread, tabId: string, now: number): boolean {
+export function tabMessageVisibleInTracker(thread: TabMessageThread, tabId: string): boolean {
   if (tabMessageDismissed(thread.question, tabId)) return false;
-  const completedAt = tabMessageSuccessAt(thread);
-  return completedAt === null || completedAt + REQUEST_SUCCESS_VISIBLE_MS > now;
+  return !isRequestSuccessPresentation(tabMessagePresentation(thread));
 }

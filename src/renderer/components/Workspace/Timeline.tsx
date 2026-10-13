@@ -1,10 +1,14 @@
 import {useHistorySearchMarkers} from '../../utils/historySearchMarkers';
 import {historySearchEntryKeys} from '../../../shared/history-search.mjs';
 import { usePointerGesture } from '../../hooks/usePointerGesture';
+import { recordTimelineModifierOwner } from '../../utils/timelineModifierDiagnostics.mjs';
+import { uiPerformancePhase } from '../../utils/uiPerformanceDiagnostics.mjs';
 import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
 import { resolveTimelineFullResponse, resolveTimelinePromptImages, timelineFinalNavigationIdentity } from '../../utils/timelineEntryPreview.mjs';
 import { TimelineEntryPreview } from './TimelineEntryPreview';
-import { useOrchestrationStore, subscribeOrchestrationRunChanges } from '../../store/useOrchestrationStore';
+import { filterTimelineGoalPresentation } from '../../utils/codexGoalPresentation.mjs';
+import { useOrchestrationStore } from '../../store/useOrchestrationStore';
+import { useResearchRunModels } from '../../utils/useResearchRunModels';
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, ChevronRight, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
@@ -1644,11 +1648,11 @@ function Timeline({
     ? liveUserSnapshot.entries
     : [];
   const entries = useMemo<TimelineEntry[]>(() => (
-    projectTimelineWorkingFileMarkers(projectTimelineNoteAnchors(
+    filterTimelineGoalPresentation(projectTimelineWorkingFileMarkers(projectTimelineNoteAnchors(
       mergeTimelineEntriesWithSentHandoffs(durableEntries, sentHandoffEntries, liveUserEntries),
       noteAnchorSnapshot.ownerKey === timelineOwnerKey ? noteAnchorSnapshot.entries : [],
-    ), workingFiles, cwd, timelinePathApi)
-  ), [durableEntries, liveUserEntries, sentHandoffEntries, noteAnchorSnapshot, timelineOwnerKey, workingFiles, cwd]);
+    ), workingFiles, cwd, timelinePathApi), toolType)
+  ), [durableEntries, liveUserEntries, sentHandoffEntries, noteAnchorSnapshot, timelineOwnerKey, workingFiles, cwd, toolType]);
   const [loadingOwnerKey, setLoadingOwnerKey] = useState<string | null>(
     sessionId ? timelineOwnerKey : null
   );
@@ -2800,6 +2804,7 @@ function Timeline({
   const [isCmdHeld, setIsCmdHeld] = useState(false);
   const isCmdHeldRef = useRef(false);
   const cmdInteractionRelevantRef = useRef(false);
+  const cmdInteractionReasonMaskRef = useRef(0);
   const projectedCmdHeldRef = useRef(false);
   const projectCmdHeld = useCallback((held: boolean) => {
     if (projectedCmdHeldRef.current === held) return;
@@ -3243,7 +3248,9 @@ function Timeline({
     const el = containerRef.current;
     if (!el) return;
     const measure = () => {
+      const measureStarted = performance.now();
       const rect = el.getBoundingClientRect();
+      uiPerformancePhase('timeline-popup-existing-measure',{ms:performance.now()-measureStarted});
       // Popup's right edge sits exactly at Timeline's left edge (no gap, no overlap).
       // In expanded mode user wants tight join, in compact mode same — single rule.
       const next = Math.max(0, Math.round(window.innerWidth - rect.left));
@@ -3268,21 +3275,25 @@ function Timeline({
   // hover/popup feedback publishes it into React. Cmd shortcuts in a composer
   // must not render/map every hidden Timeline merely to update a cursor.
   useEffect(() => {
-    const sync = (held: boolean) => {
+    const sync = (held: boolean, event?: KeyboardEvent) => {
+      const started = performance.now();
+      const before = projectedCmdHeldRef.current;
       isCmdHeldRef.current = held;
       const presented = isVisibleRef.current && historyPresentationGateOpenRef.current;
       if ((presented && cmdInteractionRelevantRef.current) || projectedCmdHeldRef.current) {
         projectCmdHeld(held && presented);
       }
+      if(event)recordTimelineModifierOwner(event,{presented,relevant:cmdInteractionRelevantRef.current,
+        before,after:projectedCmdHeldRef.current,reasonMask:cmdInteractionReasonMaskRef.current,started});
     };
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Meta') {
-        sync(true);
+        sync(true,e);
       }
     };
     const handleKeyUp = (e: KeyboardEvent) => {
       if (e.key === 'Meta') {
-        sync(false);
+        sync(false,e);
       }
     };
     const handleBlur = () => {
@@ -3335,10 +3346,11 @@ function Timeline({
   // Fork marker tooltip: sync with CMD key — same pattern as notes
   const [hoveredForkMarkerIndex, setHoveredForkMarkerIndex] = useState<number | null>(null);
   const [activeForkMarkerIndex, setActiveForkMarkerIndex] = useState<number | null>(null);
-  cmdInteractionRelevantRef.current = hoveredIndex !== null || hoveredNoteIndex !== null
-    || hoveredForkMarkerIndex !== null || hoveredSemanticGroupId !== null
-    || activeTooltipIndex !== null || activeNoteIndex !== null
-    || activeForkMarkerIndex !== null || activeSemanticGroupId !== null;
+  cmdInteractionReasonMaskRef.current = Number(hoveredIndex !== null) | (Number(hoveredNoteIndex !== null)<<1)
+    | (Number(hoveredForkMarkerIndex !== null)<<2) | (Number(hoveredSemanticGroupId !== null)<<3)
+    | (Number(activeTooltipIndex !== null)<<4) | (Number(activeNoteIndex !== null)<<5)
+    | (Number(activeForkMarkerIndex !== null)<<6) | (Number(activeSemanticGroupId !== null)<<7);
+  cmdInteractionRelevantRef.current = cmdInteractionReasonMaskRef.current !== 0;
   // effect: isCmdHeld/hoveredForkMarkerIndex/activeForkMarkerIndex → setActiveForkMarkerIndex (CMD+hover opens fork tooltip + hides entry tooltip; release closes unless cursor-in-tooltip)
   useEffect(() => {
     if (isCmdHeld && hoveredForkMarkerIndex !== null) {
@@ -3447,7 +3459,7 @@ function Timeline({
       }
       const projected = projectTimelineSentHandoffs(
         snapshot,
-        { toolType, sessionId },
+        { toolType, sessionId, fingerprint: (text: string) => window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex') },
       ) as TimelineEntry[];
       if (projected.length === 0) return;
       setSentHandoffSnapshot((current) => {
@@ -3456,7 +3468,9 @@ function Timeline({
           const existing = currentEntries.find((entry) => entry.handoffId === candidate.handoffId);
           return !existing
             || existing.uuid !== candidate.uuid
-            || existing.sourceIdentity !== candidate.sourceIdentity;
+            || existing.sourceIdentity !== candidate.sourceIdentity
+            || existing.content !== candidate.content
+            || JSON.stringify(existing.semanticTags || []) !== JSON.stringify(candidate.semanticTags || []);
         });
         if (!changed && current.ownerKey === timelineOwnerKey) return current;
         const nextEntries = upsertTimelineSentHandoffEntries(
@@ -3487,9 +3501,7 @@ function Timeline({
       if (detail?.tabId !== tabId) return;
       const projected = (projectTimelineLiveUserMessage(
         detail,
-        { toolType, sessionId, fingerprint: detail?.message?.questionReplyProof
-          ? (text: string) => window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex')
-          : undefined },
+        { toolType, sessionId, fingerprint: (text: string) => window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex') },
       ) || projectTimelineLiveCompactEntry(detail, { toolType, sessionId })) as TimelineEntry | null;
       if (!projected) return;
       setLiveUserSnapshot((current) => {
@@ -3501,7 +3513,8 @@ function Timeline({
         if (existing
           && existing.timestamp === projected.timestamp
           && existing.content === projected.content
-          && JSON.stringify(existing.questionReplyProof || null) === JSON.stringify(projected.questionReplyProof || null)) {
+          && JSON.stringify(existing.questionReplyProof || null) === JSON.stringify(projected.questionReplyProof || null)
+          && JSON.stringify(existing.semanticTags || []) === JSON.stringify(projected.semanticTags || [])) {
           return current;
         }
         const nextEntries = upsertTimelineLiveUserEntries(
@@ -3515,6 +3528,7 @@ function Timeline({
           + ' session=' + sessionId.substring(0, 8)
           + ' uuid=' + projected.uuid.slice(-18)
           + ' replyProof=' + (projected.questionReplyProof?.provider || 'none')
+          + ' researchProof=' + (projected.semanticTags?.some(tag => tag.runKind === 'external-research') ? '1' : '0')
           + ' busy=' + (isTurnBusyRef.current ? '1' : '0'),
         );
         return { ownerKey: timelineOwnerKey, entries: nextEntries };
@@ -7449,39 +7463,11 @@ function Timeline({
   const activeResearchTag = currentActiveEntry && getOrchestrationTag(currentActiveEntry);
   const activeResearchRunId = activeResearchTag?.runKind === 'external-research' ? activeResearchTag.runId : null;
   const liveResearchRun = useOrchestrationStore(state => activeResearchRunId ? state.activeRuns.get(activeResearchRunId) : undefined);
-  const researchOwnerKey = tabId + ':' + (sessionId || '');
-  const [researchModels, setResearchModels] = useState<{ owner: string; values: Record<string, any> } | null>(null);
-  const researchCatalogRef = useRef<{ owner: string; promise: Promise<Record<string, any>> } | null>(null);
-  useEffect(() => {
-    if (!activeResearchRunId) return;
-    let cancelled = false;
-    // One owner-scoped catalog read, not SC/browser traffic per marker. Store
-    // only the saved request choices; body/result/jobs are not retained here.
-    if (researchCatalogRef.current?.owner !== researchOwnerKey) researchCatalogRef.current = {
-      owner: researchOwnerKey, promise: ipcRenderer.invoke('orchestration:list-for-tab', tabId).then((runs: any[]) => {
-        const values: Record<string, any> = {};
-        for (const run of Array.isArray(runs) ? runs : []) if (run.runKind === 'external-research') {
-          values[run.runId] = { model: run.externalResearchModel, mode: run.externalResearchMode, effort: run.externalResearchEffort };
-        }
-        return values;
-      }).catch(() => { console.warn('[Timeline:Preview] saved research parameters unavailable'); return {}; }),
-    };
-    void researchCatalogRef.current.promise.then(values => {
-      if (!cancelled) setResearchModels(current => ({ owner: researchOwnerKey,
-        values: { ...values, ...(current?.owner === researchOwnerKey ? current.values : {}) } }));
-    });
-    return () => { cancelled = true; };
-  }, [activeResearchRunId, researchOwnerKey, tabId]);
-  useEffect(() => subscribeOrchestrationRunChanges(({ run }) => {
-    if (run.runKind !== 'external-research' || run.sourceTabId !== tabId) return;
-    setResearchModels(current => ({ owner: researchOwnerKey, values: {
-      ...(current?.owner === researchOwnerKey ? current.values : {}),
-      [run.runId]: { model: run.externalResearchModel, mode: run.externalResearchMode, effort: run.externalResearchEffort },
-    } }));
-  }), [tabId, researchOwnerKey]);
+  const researchModels = useResearchRunModels(tabId, sessionId, !!activeResearchRunId && isVisible,
+    activeResearchRunId ? [activeResearchRunId] : []);
   const activeResearchModel = liveResearchRun ? { model: liveResearchRun.externalResearchModel,
     mode: liveResearchRun.externalResearchMode, effort: liveResearchRun.externalResearchEffort }
-    : researchModels?.owner === researchOwnerKey ? researchModels.values[activeResearchRunId || ''] : null;
+    : researchModels?.[activeResearchRunId || ''] || null;
 
   // Owner changes (including retained hidden windows) cannot keep an old
   // popup or late lazy-response read on screen.

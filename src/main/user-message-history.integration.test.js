@@ -43,6 +43,9 @@ async function fixture(t) {
   const availability = new AgentSessionAvailabilityService({ claudeProjectsDir, codexHome });
   let codexReads = 0;
   const context = vm.createContext({ require, URL, Object, Map, Set, fs, path, srcMainDir: __dirname,
+    perfCausal: require('./perf-causal-context').createCausalContext(),
+    perfCallerToken: require('./perf-causal-context').boundedCallerToken,
+    beginHistoryReadDiagnostic: require('./history-read-memory-diagnostics').beginHistoryReadDiagnostic,
     console: { log() {}, warn() {} }, userMessageHistory: null,
     extractClaudePromptCarrier, claudeInternalAgentContinuationKindFromEntry,
     getAgentSessionAvailabilityService: () => availability,

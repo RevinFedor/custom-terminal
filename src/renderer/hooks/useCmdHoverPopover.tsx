@@ -1,38 +1,46 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 
 // ─── useCmdKey ───────────────────────────────────────────────
 // Tracks CMD (Meta) key state. One instance per component.
 
-export function useCmdKey(): boolean {
+export function useCmdKey(enabled = true): boolean {
   const [pressed, setPressed] = useState(false);
+  const physical = useRef(false), projected = useRef(false), relevant = useRef(enabled);
+  relevant.current = enabled;
+  const sync = useCallback((held: boolean) => {
+    physical.current = held;
+    const next = held && relevant.current;
+    if (next === projected.current) return;
+    projected.current = next;setPressed(next);
+  }, []);
+  // A retained owner remembers the physical key without rendering. Entering
+  // its hover surface while Cmd is already held reveals feedback in this frame.
+  useLayoutEffect(() => { sync(physical.current); }, [enabled, sync]);
 
   useEffect(() => {
-    const down = (e: KeyboardEvent) => { if (e.key === 'Meta') setPressed(true); };
-    const up   = (e: KeyboardEvent) => { if (e.key === 'Meta') setPressed(false); };
-    const blur = () => setPressed(false);
+    const down = (e: KeyboardEvent) => { if (e.key === 'Meta') sync(true); };
+    const up   = (e: KeyboardEvent) => { if (e.key === 'Meta') sync(false); };
+    const blur = () => sync(false);
     // Самокоррекция по фактическому состоянию клавиши. keyup по Meta теряется,
     // когда отпускание случилось «не здесь»: во время системного шортката,
     // нативного меню, перетаскивания или пока фокус был у другого окна (blur
     // ловит не все такие пути). Залипший флаг рисовал ⌘-подсказки без зажатого
     // ⌘ («плашка "добавить в это окно", а CMD уже отпущен»). Каждое движение
-    // мыши несёт правду в e.metaKey — сверяемся с ней; setState с тем же
-    // значением React не рендерит, так что это бесплатно.
-    const sync = (e: MouseEvent) => {
-      const actual = e.metaKey === true;
-      setPressed((prev) => (prev === actual ? prev : actual));
-    };
+    // мыши несёт правду в e.metaKey. Не вызываем setState вообще, если
+    // проекция не менялась: скрытые владельцы остаются вне React hot path.
+    const move = (e: MouseEvent) => sync(e.metaKey === true);
 
     window.addEventListener('keydown', down);
     window.addEventListener('keyup', up);
     window.addEventListener('blur', blur);
-    window.addEventListener('mousemove', sync, true);
+    window.addEventListener('mousemove', move, true);
     return () => {
       window.removeEventListener('keydown', down);
       window.removeEventListener('keyup', up);
       window.removeEventListener('blur', blur);
-      window.removeEventListener('mousemove', sync, true);
+      window.removeEventListener('mousemove', move, true);
     };
-  }, []);
+  }, [sync]);
 
   return pressed;
 }

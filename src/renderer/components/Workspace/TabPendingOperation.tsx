@@ -3,11 +3,16 @@ import React from 'react';
 export function resolveTabPendingOperationLabel({
   aiClosing,
   pendingOperation,
+  nameSetManually,
+  name,
 }: {
   aiClosing?: boolean;
   pendingOperation?: string;
+  nameSetManually?: boolean;
+  name?: string;
 }): string | null {
   if (aiClosing) return 'остановка сессии...';
+  if (pendingOperation === 'Создание форка…' && nameSetManually && name) return name;
   return pendingOperation || null;
 }
 

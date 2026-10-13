@@ -88,7 +88,7 @@ function createDiskCapacityService({ cacheDirectory, budgetBytes = HISTORY_PREPA
   reserveBytes = DISK_CAPACITY_RESERVE_BYTES, intervalMs = INTERVAL_MS, freshMs = FRESH_MS,
   fsApi = fs, now = Date.now, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout,
   readUsage = readCacheDiskBytes, readFree = readFreeDiskBytes, epoch = randomUUID(),
-  log = console, slowSampleMs = SLOW_SAMPLE_MS } = {}) {
+  log = console, slowSampleMs = SLOW_SAMPLE_MS, getRamUsage } = {}) {
   if (!path.isAbsolute(cacheDirectory || '')) throw new TypeError('absolute cacheDirectory required');
   capacityProjection(0, 0, budgetBytes, reserveBytes);
   let destroyed = false, timer = null, inFlight = null, revision = 0;
@@ -101,13 +101,17 @@ function createDiskCapacityService({ cacheDirectory, budgetBytes = HISTORY_PREPA
   const logMeasurement = (value, durMs) => {
     const state = value.status === 'ready' ? value.warning ? 'ready-warning' : 'ready-healthy' : value.status;
     const errorCode = value.errorCode || null;
-    const transition = state !== loggedState || errorCode !== loggedErrorCode;
-    loggedState = state; loggedErrorCode = errorCode;
+    const stateKey = state + ':' + (value.ram?.status || 'unknown');
+    const transition = stateKey !== loggedState || errorCode !== loggedErrorCode;
+    loggedState = stateKey; loggedErrorCode = errorCode;
     if (!transition && durMs < slowSampleMs) return;
     const record = { state, transition, slow: durMs >= slowSampleMs, durMs,
       source: 'statfs+cache-file-metadata', budgetBytes, reserveBytes, freeBytes: value.freeBytes,
       cacheBytes: value.cacheBytes, remainingGrowthBytes: value.remainingGrowthBytes,
       projectedFreeBytes: value.projectedFreeBytes, errorCode,
+      ramStatus: value.ram?.status || 'unknown', ramApproxBytes: value.ram?.approxBytes ?? null,
+      ramBudgetBytes: value.ram?.budgetBytes ?? null,
+      ramReason: value.ram?.reason || 'unavailable', ramWorkerGeneration: value.ram?.workerGeneration ?? null,
       ...(value.scanDiagnostic ? { scanDiagnostic: value.scanDiagnostic } : {}) };
     try { (state === 'error' || record.slow ? log.warn : log.log)?.call(log, '[DiskCapacity] ' + JSON.stringify(record)); } catch {}
   };
@@ -142,6 +146,20 @@ function createDiskCapacityService({ cacheDirectory, budgetBytes = HISTORY_PREPA
           }
         }
       }
+      let ram = { status: 'unknown', approxBytes: null, budgetBytes: null, approximate: true, reason: 'unavailable' };
+      try {
+        const value = getRamUsage?.();
+        const valid = key => Number.isSafeInteger(value?.[key]) && value[key] >= 0;
+        ram.budgetBytes = valid('budgetBytes') ? value.budgetBytes : null;
+        if (['not-started', 'worker-starting', 'cache-counters', 'invalid-counters', 'worker-unavailable', 'client-closed'].includes(value?.reason)) ram.reason = value.reason;
+        if (valid('workerGeneration')) ram.workerGeneration = value.workerGeneration;
+        if (value?.status === 'ready' && valid('approxBytes') && valid('budgetBytes')) {
+          const measuredAt = now();
+          ram = { ...ram, status: 'ready', approxBytes: value.approxBytes,
+            measuredAt, expiresAt: measuredAt + freshMs };
+        }
+      } catch { ram.reason = 'counter-error'; /* Cannot erase a valid disk measurement. */ }
+      result = { ...result, ram };
       if (destroyed) return { ...empty('unknown'), errorCode: 'destroyed' };
       snapshot = Object.freeze({ ...result, revision: ++revision });
       logMeasurement(snapshot, Math.max(0, Math.round(now() - startedAt)));

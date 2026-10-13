@@ -73,6 +73,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   const fileSelected = useUIStore(s => !!onLinkedFileOpen && isLinkedFilePreview(s.filePreview, tabId));
   // Primitive subscriptions also observe in-place rename/status updates.
   const tabName = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.name || '');
+  const nameSetManually = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.nameSetManually === true);
   const tabColor = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.color);
   const tabType = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
   const commandType = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.commandType);
@@ -135,7 +136,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     minPaddingLeft: processBarPosition === 'left' ? TAB_PROCESS_BAR_W_PX : 0,
     minPaddingRight: processBarPosition === 'right' ? TAB_PROCESS_BAR_W_PX : 0,
   });
-  const pending = resolveTabPendingOperationLabel({ aiClosing, pendingOperation });
+  const pending = resolveTabPendingOperationLabel({ aiClosing, pendingOperation, nameSetManually, name: tabName });
   const linkedFileHeight = Math.max(15, Math.ceil(metrics.fontSize * .72) + 4);
   const titleLineRef=useRef<HTMLSpanElement>(null);
   const titleLayout=useLinkedTitleLayout(titleLineRef,true,{text:pending||(typeof label==='string'?label:tabName),fontSize:metrics.fontSize,
@@ -170,10 +171,10 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   const titleContents = <>
     {chooser ? <Plus size={12} /> : tabType === 'file' ? <FileText size={14} style={{ color: '#a78bfa', flexShrink: 0 }} />
       : empty ? <Folder size={10} style={{ color: '#8a8a92', flexShrink: 0 }} /> : null}
-    {pending ? <TabPendingOperation label={pending} tabName={tabName} /> : children || <span data-tab-card-label style={{
+    {children || (pending ? <TabPendingOperation label={pending} tabName={tabName} /> : <span data-tab-card-label style={{
       minWidth: 0, flex: fullWidth ? 1 : undefined, whiteSpace: 'nowrap',
       overflow: truncate ? 'hidden' : undefined, textOverflow: truncate ? 'ellipsis' : undefined,
-    }}>{label ?? (chooser ? 'Новая вкладка' : tabName)}</span>}
+    }}>{label ?? (chooser ? 'Новая вкладка' : tabName)}</span>)}
     <TabSessionAvailabilityMarker availability={availability} size={10} />
     {trailingActions}
   </>;

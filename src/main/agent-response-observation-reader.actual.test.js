@@ -60,6 +60,11 @@ function fixture(t, { provider = 'claude', rows = [] } = {}) {
   };
   const context = vm.createContext({
     ...carriers, ...materializers, require, path, fs, srcMainDir: __dirname,
+    // The actual Main reader now includes the shared diagnostic wrapper.
+    // Use that owner (disabled by default), not a second projection or reader.
+    perfCausal: require('./perf-causal-context').createCausalContext(),
+    perfCallerToken: require('./perf-causal-context').boundedCallerToken,
+    beginHistoryReadDiagnostic: require('./history-read-memory-diagnostics').beginHistoryReadDiagnostic,
     console: { log() {}, warn() {} },
     projectManager: { db: { db: { prepare: sql => {
       assert.match(sql, /^SELECT tab_id FROM tabs WHERE tab_id = \? AND execution_archived = 0 LIMIT 1$/);

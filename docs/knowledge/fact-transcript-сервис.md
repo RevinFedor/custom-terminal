@@ -79,6 +79,10 @@ Discovery файла сессии (`findCodexSessionFile` — полный walk 
 прежнего reader с фактически прочитанными physical witnesses и metadata;
 лёгкий `/api/history-freshness` сравнивает их без parse/lineage/worker admission.
 Сохранённый read SID допустим для остановленной вкладки, но не становится writer.
+После workflow cutover это включает standalone tabs без legacy Project row. Metadata
+descriptor lookup использует собственный cwd вкладки и необязательный project fallback;
+обязательный JOIN Projects давал `read-owner-unavailable` при уже известной прямой History.
+Не чинить такой разрыв созданием фиктивного Project или допуском unknown как fresh.
 
 Это bounded набор сертификатов зависимостей **от реального reader**, не второй
 кэш содержимого. До первого подтверждённого чтения, после eviction/restart или
@@ -132,6 +136,21 @@ History могла оставаться тёплой в renderer, а Timeline п
 
 ### Подготовленная история на SSD и отдельный владелец чтения
 
+С11.10 SOURCE положительный proof уже материализованного app compact-fork
+удерживается отдельно от six-file raw LRU: максимум64 digest-пары без тел истории.
+Иначе eviction raw мог повторно прочитать весь rollout перед корректным SSD
+Timeline hit. Ключ связывает child SID/cwd, физический snapshot/epoch, весь
+fork-event и свежую bounded metadata. SSD hit или один header не создаёт proof:
+на miss остаётся прежняя canonical проверка records/Timeline. После restart
+малый proof cache пуст; размеры дискового и parser-кэша не меняются.
+
+Последняя source-проверка и свежий lineage определяют право вернуть результат,
+а не только право запомнить certificate. Отказ fence либо замена/мутация fork-event
+во время await дают прежний `CODEX_SOURCE_READ_INVALIDATED`: caller повторяет
+чтение текущих входов в своём bounded retry. Нельзя продолжать с захваченным старым
+event или вернуть success, лишь отказавшись от cache admission. Unknown fast-path
+guard сохраняет canonical fallback, ошибки не превращаются в negative cache.
+
 25.09 SOURCE: desktop Codex больше не связывает просмотр старого участка с
 наличием полного parser graph в RAM. Read-сервис исполняется в Node worker:
 History/Timeline/payload, совместимые messages, поиск, копирование и экспорт.
@@ -174,8 +193,10 @@ read tickets всех файлов; frozen range обязан сохранить
 При restart+growth проверяется старый child prefix перед восстановлением cursor.
 Допись ancestor за замороженной границей не меняет логическую revision child.
 
-С06.10 SOURCE удержание кэша ускорения ограничено20GiB на все sessions/версии,
-включая SQLite journals; единственный default — `history-cache-policy.js`.
+С06.10 SOURCE удержание кэша ускорения имеет default20GiB на все sessions/версии,
+включая SQLite journals. С10.10 SSD-поле Settings меняет общий лимит после restart;
+boot передаёт одно значение worker и capacity service. Default/нормализация
+общие через `history-cache-settings.cjs`/`history-cache-policy.js`.
 original JSONL не удаляется. Source/V8 schema, owner/cwd, inode/size/mtime/ctime,
 checksums и версии sidecars запрещают устаревший hit. Corruption/quota/недоступный
 cache → обычный canonical read в worker. После restart при выросшем источнике
@@ -193,7 +214,7 @@ Legacy payload caller без ожидаемого поколения всё ра
 записываемый owner, у него checkpoint вытесняется перед rows. Compact Timeline
 и source certificate идут последними. Глобальное «все checkpoints первыми»
 оставляло бы старые страницы ценой постоянного rebuild рабочей сессии при append.
-Все tiers вместе ограничены20GiB; oversized/zero quota сохраняют canonical fallback.
+Все tiers вместе ограничены общим quota (default20GiB); oversized/zero quota сохраняют canonical fallback.
 Invalidation источника отзывает все tiers owner, включая незавершённый async
 page-write. Corruption одной family не уничтожает независимую корректную family.
 Диагностика отдаёт cacheTier и отдельные obsolete/state/rows/timeline eviction counts.
@@ -201,7 +222,7 @@ page-write. Corruption одной family не уничтожает незави�
 После удаления checkpoint неизменные History/Timeline могут прочитать готовые
 страницы без raw JSONL; новая допись при уже удалённом checkpoint законно
 потребует rebuild. При сохранённом checkpoint прежний suffix-only путь остаётся.
-Увеличение disk budget не увеличивает RAM budget и не резервирует20GiB сразу.
+Увеличение disk budget не увеличивает RAM budget и не резервирует весь лимит сразу.
 Предупреждение о будущей нехватке — отдельный metadata-only сервис; оно не
 вызывает History, не запускает worker и не удаляет файлы. Формула/границы —
 [`fact-resource-usage-panel.md::Предупреждение о месте на диске`](fact-resource-usage-panel.md).
@@ -243,7 +264,7 @@ generation. Они удаляются перед service, не становят�
 read proof. `[HistoryRead]` отделяет очередь своей сессии, cold admission,
 cache/read/preparation, serialization и main delivery; renderer отдельно пишет
 decode. Причина SSD miss и RAM eviction различается, поздний отказ не теряется
-за успешными фазами. Точный словарь/пределы — `fact-performance-diagnostics.md`.
+за успешными фазами. Точный словарь/пределы — `логирование-оптимизации.md`.
 Source fingerprint кэша сохранён: изменение реализации, включая этот этап,
 создаёт новую версию disposable cache; первый read после установки может быть
 cold. Это не потеря исходной истории и не разрешение ослаблять проверку версии.
@@ -442,6 +463,15 @@ event-loop max62.4→19.1мс, cold678→892мс; unchanged0байт. Это о�
 
 - адресное Codex audit-enrichment не материализует raw history ради `__line`: bounded LF scan + metadata projection и один canonical record. На661216194bytes/64002rows isolated ElectronNode18: peak JS637.35→5.57MiB, cold address821→129мс, parsed64002→1, raw-cache0bytes у нового пути. Неизменный повтор читает130bytes; изменённый source всё ещё требует подсчёта prefix bytes (123мс в том же прогоне). Это не обещание убрать cold чтение после настоящего projector eviction и не замер production wheel. Exact address/revision guards — `fact-codex.md::Адрес принятого prompt`;
 - discovery и full parsing разделены, full cache bounded;
+- Codex catalog search использует отдельную query-проекцию в том же History
+  worker: Main не получает raw-массив и full turn graph. Это не перенос общего
+  `_loadSessionTurns`: другие MCP readers пока могут готовить весь источник.
+  Сохранность координат/lineage и пределы временных payload — `fact-session-history.md`;
+- готовый physical turns graph общего Main reader может пережить независимое
+  вытеснение raw records: graph-owned read proof допускает RAM hit до raw read,
+  со свежими annotations и последней проверкой текущего resolver/source/lineage.
+  Virtual ancestry и cold miss сохраняют полную canonical подготовку; текущий
+  stat старого файла не заменяет provenance graph и binding запроса;
 - Timeline, History и Codex presence держат один request в полёте и максимум одну trailing reconciliation. Invalidation, пришедшая во время активного чтения, не считается уже покрытой первым snapshot: watcher запоминает её и запускает ровно одно дополнительное чтение после завершения первого. То же правило действует при смене presence-generation во время IPC: текущий flight сам взводит повторное чтение, иначе спокойная остановленная вкладка навсегда остаётся в `Checking` до remount. Read-only presence берётся из main-owned event projection; тяжёлое process/materialization observation не является UI-refresh endpoint. Удалить trailing или молча отбросить такое событие значит оставить последний append или lifecycle edge невидимым до следующего внешнего изменения;
 - History не держит вторую полную server-entry copy только ради Rewind convergence; для membership достаточен UUID set;
 - повторное открытие History сначала показывает renderer snapshot, а read-сервис проверяет durable revision до parse/projection; unchanged-ответ не переносит полный массив через IPC. Для Codex read-сервис и SSD pages принадлежат worker, для Claude сохраняется прежний main-путь;
@@ -452,6 +482,12 @@ event-loop max62.4→19.1мс, cold678→892мс; unchanged0байт. Это о�
 Renderer snapshot ключуется всей identity `tab + tool + session + cwd` и ограничен одновременно 64 MiB, 40 тысячами rows и восемью owners. Вытесняется целый least-recent owner, а не хвост отдельной истории: молчаливое усечение внутри session изменило бы смысл History. Snapshot сохраняет уже построенные сырые server rows без второй глубокой копии.
 
 Текущая row-window модель desktop не является возвращением удалённых display-only окон. Позиционный массив всегда полный; вне читаемого диапазона тяжёлый payload заменён identity-stub, поэтому UUID-порядок, scrollbar, restore и Timeline addressing не меняются. Tail и незавершённая фоновая работа остаются полными, а перемещение окна проходит обычной delta. Группировка обязана быть структурно одинаковой на stubs и full rows.
+
+Для правых Research-серий stub сохраняет короткие string-поля semanticTags:
+kind/runId/runKind/phase и tab-message/origin coordinates для прежнего приоритета
+classifier. Envelope, offsets/hash и chips не переносятся. Старая потеря tags
+распадала новую серию при перемещении hydration span; actual stub/full regression
+обязательна. Наличие tag не делает stub прочитанным телом или viewport proof.
 
 Подготовка stubs тоже может блокировать main, даже при маленьком append и
 уже показанной History. Старый путь при каждом refresh повторно классифицировал

@@ -10,6 +10,15 @@ test('plain finished turn with nothing pending rings', () => {
   );
 });
 
+test('a native Goal final only rings after the whole Goal is complete', () => {
+  for (const phase of ['continuing', 'attention']) {
+    assert.equal(shouldDeferTabCompletionNotification({ successful: true,
+      goalWork: { version: 1, pending: true, phase } }), 'native-goal-' + phase);
+  }
+  assert.equal(shouldDeferTabCompletionNotification({ successful: true,
+    goalWork: { version: 1, pending: false, phase: 'complete' } }), null);
+});
+
 test('turn that ends while Run after still owes prompts stays silent', () => {
   assert.equal(
     shouldDeferTabCompletionNotification({ successful: true, queueContinuationPending: true }),

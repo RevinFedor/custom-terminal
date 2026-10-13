@@ -2202,7 +2202,7 @@ function ClaudeControlBar({
     firstChipArmedHint: runAfterFirstChipHint,
     hovered: runAfterPlayHovered,
   }), [runAfterActiveItemCount, runAfterAutoRun, runAfterFirstChipHint, runAfterPlayHovered]);
-  const isCmdPressed = useCmdKey();
+  const isCmdPressed = useCmdKey(quickPresetHover);
   // The selected agent type is promoted from the live agent process.  Keep one
   // quick-switch affordance: an untouched Anthropic provider default must not
   // create a second Claude button while the same PTY is running Codex.

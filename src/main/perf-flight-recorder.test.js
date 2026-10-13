@@ -149,15 +149,15 @@ test('artifact entries and bounded read/exclusive receipt API reject unknown pat
   assert.equal(fs.lstatSync(store.file('stall-1000-321-3.sample.txt')).isDirectory(), true);
 });
 
-test('256MiB pruning evicts large artifacts without refunding either current quota', t => {
+test('5GiB pruning evicts large artifacts without refunding either current quota', t => {
   const { store, now, sparse } = artifactFixture(t), day = 86400000;
   const receipt = 'stall-' + (now - 1000) + '-123-1.sample-capture.json';
   // Even an old mtime cannot evict a newly named immutable native receipt.
   sparse(receipt, 128, now - 8 * day);
   for (let i = 0; i < 4; i++) sparse('incident-' + (now - 7200000 + i * 700000) + '-1.capture.json', 128, now - 7200000 + i * 700000);
-  sparse('stall-' + now + '-123-1.sample.txt', 260 * 1024 * 1024, now - 180000);
+  sparse('stall-' + now + '-123-1.sample.txt', 6 * 1024 * 1024 * 1024, now - 180000);
   const pruned = store.prune(now);
-  assert.ok(pruned.bytes < 256 * 1024 * 1024);
+  assert.ok(pruned.bytes < 5 * 1024 * 1024 * 1024);
   assert.equal(fs.existsSync(store.file(receipt)), true);
   assert.equal(store.entries().filter(e => e.name.endsWith('.capture.json')).length, 4);
   assert.equal(createArtifactStore(store.directory).reserveCaptureDetails('incident-' + now + '-1', now).reason, 'rolling-quota-exhausted');
@@ -177,34 +177,34 @@ test('native receipts expire at 24h while sample metadata/full report retain the
 
 test('old incident metadata cannot erase every freshly captured native stack under the same global cap', t => {
   const { store, now, sparse } = artifactFixture(t), miB = 1048576;
-  for (let i = 0; i < 66; i++) sparse('incident-' + (now - 4 * 3600000 - i) + '-1.json', 4 * miB, now - 4 * 3600000 - i);
+  for (let i = 0; i < 1281; i++) sparse('incident-' + (now - 4 * 3600000 - i) + '-1.json', 4 * miB, now - 4 * 3600000 - i);
   const id = 'stall-' + (now - 180000) + '-123-1';
   sparse(id + '.sample.txt', miB, now - 180000);
   store.write(id + '.sample.json', { id, status: 'complete', output: { file: id + '.sample.txt', complete: true } });
   const after = store.prune(now);
-  assert.ok(after.bytes <= 256 * miB);
+  assert.ok(after.bytes <= 5 * 1024 * miB);
   assert.equal(fs.existsSync(store.file(id + '.sample.txt')), true, 'the recent stack remains useful beyond its two-minute write grace');
 });
 
-test('causal journals obey a separate 64MiB/48h cap including young buckets', t => {
+test('causal journals retain one week and may borrow unused space beyond their protected share', t => {
   const { store, now, sparse } = artifactFixture(t), hour = 3600000, miB = 1048576;
   const bucket = at => 'causal-' + new Date(at).toISOString().slice(0, 13).replace(/\D/g, '') + '.ndjson';
-  const expired = bucket(now - 49 * hour), recent = bucket(now - 47 * hour);
-  sparse(expired, 1024, now - 49 * hour); sparse(recent, 1024, now - 47 * hour);
+  const expired = bucket(now - 169 * hour), recent = bucket(now - 167 * hour);
+  sparse(expired, 1024, now - 169 * hour); sparse(recent, 1024, now - 167 * hour);
   store.prune(now);
   assert.equal(fs.existsSync(store.file(expired)), false); assert.equal(fs.existsSync(store.file(recent)), true);
   fs.unlinkSync(store.file(recent));
   const names = Array.from({ length: 17 }, (_, i) => bucket(now - i * hour));
-  // All mtimes are young: the former general two-minute exemption must not
-  // defeat causal's own disk cap. Sparse files avoid allocating benchmark I/O.
+  // These journals use the shared 5GiB budget rather than being deleted at
+  // 64MiB while the rest of that budget is empty. Sparse files allocate no data.
   names.forEach((name, i) => sparse(name, 4 * miB, now - i * 1000));
   const after = store.prune(now);
-  assert.equal(after.causalBytes, 64 * miB);
-  assert.equal(fs.existsSync(store.file(names.at(-1))), false);
+  assert.equal(after.causalBytes, 68 * miB);
+  assert.equal(fs.existsSync(store.file(names.at(-1))), true);
   assert.equal(fs.existsSync(store.file(names[0])), true);
 });
 
-test('native sample tier remains bounded and records payload eviction without rewriting capture outcome or quota', t => {
+test('native reports may borrow the shared budget; heavy expiry records loss without refunding quota', t => {
   const { store, now, sparse } = artifactFixture(t), miB = 1048576;
   const ids=Array.from({length:9},(_,i)=>'stall-'+(now-7200000-i*900000)+'-123-'+i);
   for(const [i,id] of ids.entries()){
@@ -213,12 +213,35 @@ test('native sample tier remains bounded and records payload eviction without re
     store.writeExclusive(id+'.sample-capture.json',{version:1,id,requestedWallMs:now-7200000-i*900000});
   }
   const after=store.prune(now);
-  assert.equal(after.nativeSampleBytes,64*miB);
-  assert.equal(fs.existsSync(store.file(ids.at(-1)+'.sample.txt')),false);
+  assert.equal(after.nativeSampleBytes,72*miB);
+  assert.equal(fs.existsSync(store.file(ids.at(-1)+'.sample.txt')),true);
+  const old=new Date(now-86400000-1);
+  fs.utimesSync(store.file(ids.at(-1)+'.sample.txt'),old,old);
+  store.prune(now);
   const metadata=JSON.parse(store.read(ids.at(-1)+'.sample.json'));
   assert.equal(metadata.status,'complete');assert.equal(metadata.output.retained,false);
-  assert.equal(metadata.output.removalReason,'native-sample-budget');
+  assert.equal(metadata.output.removalReason,'heavy-retention-expired');
   assert.equal(store.entries().filter(e=>e.name.endsWith('.sample-capture.json')).length,9);
+});
+
+test('CPU profiles, traces and oversized files expire at 24h; small reports and metadata retain one week', t => {
+  const { store, now, sparse } = artifactFixture(t), day = 86400000;
+  const profiles=['incident-1000-1.main.cpuprofile','incident-1000-1.cpuprofile','incident-1000-1.trace.json'];
+  store.write('incident-1000-1.profile.json',{traceComplete:true,mainStoppedWallMs:now-day-1});
+  for(const name of profiles)sparse(name,100,now-day-1);
+  sparse('incident-1001-1.ui.json',8*1048576,now-day-1);
+  sparse('incident-1002-1.main.cpuprofile',100,now-day+1);
+  sparse('stall-1000-1-1.sample.txt',100,now-day-1);
+  sparse('incident-1000-1.json',100,now-7*day-1);
+  store.prune(now);
+  for(const name of profiles)assert.equal(fs.existsSync(store.file(name)),false);
+  assert.equal(fs.existsSync(store.file('incident-1001-1.ui.json')),false);
+  for(const name of ['incident-1002-1.main.cpuprofile','incident-1000-1.profile.json','stall-1000-1-1.sample.txt'])
+    assert.equal(fs.existsSync(store.file(name)),true);
+  const metadata=JSON.parse(store.read('incident-1000-1.profile.json'));
+  assert.equal(metadata.traceComplete,true);
+  for(const name of profiles)assert.equal(metadata.artifactRetention[name].removalReason,'heavy-retention-expired');
+  assert.equal(fs.existsSync(store.file('incident-1000-1.json')),false);
 });
 
 test('causal append has an explicit hourly byte bound and preserves existing complete lines on overload', t => {
@@ -229,4 +252,17 @@ test('causal append has an explicit hourly byte bound and preserves existing com
   assert.throws(() => store.write(bucket, '{}\n', true), /bucket full/);
   assert.equal(fs.statSync(store.file(bucket)).size, Buffer.byteLength(body));
   assert.throws(() => store.read(bucket), /read/);
+});
+
+for(const pool of ['causal','native'])test(pool+' 65MiB pool cannot fall to 61MiB when ordinary metadata can satisfy pressure', t=>{
+  const {store,now,sparse}=artifactFixture(t),miB=1048576;
+  for(let i=0;i<17;i++){
+    const name=pool==='native'?'stall-'+(now-14400000-i)+'-123-'+i+'.sample.txt'
+      :'causal-202610'+String(i+1).padStart(2,'0')+'00.ndjson';
+    sparse(name,(i===16?1:4)*miB,i===16?now-3600000:now-14400000-i);
+  }
+  for(let i=0;i<1264;i++)sparse('incident-'+(now-7200000-i)+'-1.json',4*miB,now-7200000-i);
+  const result=store.prune(now);
+  assert.equal(pool==='native'?result.nativeSampleBytes:result.causalBytes,65*miB);
+  assert.ok(result.bytes<=5*1024*miB);
 });

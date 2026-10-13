@@ -194,6 +194,7 @@ function registerWorkflowOrganizationIpc(ipcMain, api) {
     rootIds:api.roots.sourcesForTab(tabId).map(source=>source.rootId)}));
   ipcMain.handle('workflow:set-tab-roots', (_event, request) => api.roots.setTabSources(request));
   ipcMain.handle('workflow:groups-read', () => api.groups.read());
+  ipcMain.handle('workflow:group-mutation', (_event, mutationId) => api.groups.getMutation(mutationId));
   ipcMain.handle('workflow:group-mutate', (_event, {kind,request}) => api.groups.mutate(kind,request));
   ipcMain.handle('workflow:group-action', (_event, request) => api.groupActions.begin(request));
   ipcMain.handle('workflow:group-close-step', (_event, request) => api.groupActions.step(request));

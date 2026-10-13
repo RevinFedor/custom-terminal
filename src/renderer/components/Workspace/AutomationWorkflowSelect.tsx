@@ -13,6 +13,7 @@ export function AutomationWorkflowSelect({ groups, selectedIds, all, disabled, o
   const trigger = useRef<HTMLButtonElement>(null), menu = useRef<HTMLDivElement>(null), wasOpen = useRef(false);
   const dismissal = useRef({ reason: 'selection', point: null as { clientX: number; clientY: number } | null });
   const selected = all ? groups.map(group => group.id) : selectedIds;
+  const allSelected = all || (groups.length > 0 && groups.every(group => selected.includes(group.id)));
   const close = (reason: string, point: { clientX: number; clientY: number } | null = null) => { dismissal.current = { reason, point }; setOpen(false); };
   useLayoutEffect(() => {
     if (wasOpen.current && !open) notifyQueueClickChildClosed(owner, dismissal.current.reason, dismissal.current.point);
@@ -59,10 +60,10 @@ export function AutomationWorkflowSelect({ groups, selectedIds, all, disabled, o
         overflowY: 'auto', padding: 4, background: '#202022', border: '1px solid #444', borderRadius: 6,
         boxShadow: '0 8px 24px #0008', color: '#ccc', fontSize: 12 }}>
       <div style={{ display: 'flex', gap: 4, paddingBottom: 4, borderBottom: '1px solid #343434', marginBottom: 4 }}>
-        {[['Select all', true], ['Clear all', false]].map(([label, checked]) => <button key={String(label)} type="button"
-          onClick={() => onChange(checked ? groups.map(group => group.id) : [], checked === true)}
+        <button type="button"
+          onClick={() => onChange(allSelected ? [] : groups.map(group => group.id), !allSelected)}
           style={{ padding: '3px 6px', background: '#29292b', border: '1px solid #3e3e42', borderRadius: 4,
-            color: '#bbb', font: 'inherit', cursor: 'pointer' }}>{label}</button>)}
+            color: '#bbb', font: 'inherit', cursor: 'pointer' }}>{allSelected ? 'Clear all' : 'Select all'}</button>
       </div>
       {groups.map(group => {
         const checked = selected.includes(group.id);

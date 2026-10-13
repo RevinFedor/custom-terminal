@@ -1,3 +1,5 @@
+import { resolveHistoryGroupCaption } from './historyGroupCaption.mjs';
+
 const exactRevisionToken = (entry) => {
   if (!entry || typeof entry !== 'object') return '';
   const entryRef = entry.entryRef;
@@ -70,12 +72,13 @@ export function retainHistoryMaterializedWindow(previous, incoming, protectedUui
   return { entries, retained, rejected };
 }
 
-const unitPresentationUuids = (unit) => {
+const unitPresentationUuids = (unit, captionSelections = null) => {
   if (!unit) return [];
   if (unit.kind !== 'group') return unit.entry?.uuid ? [unit.entry.uuid] : [];
   // A collapsed group's expensive members are not DOM rows. Its height only
   // depends on stub-safe header facts plus the optional caption text.
-  const captionUuid = unit.captionEntry?.uuid;
+  const choice = captionSelections?.get(unit.key);
+  const captionUuid = (choice ? resolveHistoryGroupCaption(unit.captionEntries, choice).entry : unit.captionEntry)?.uuid;
   return captionUuid ? [captionUuid] : [];
 };
 
@@ -83,7 +86,7 @@ const unitPresentationUuids = (unit) => {
 export function collectHistoryMaterializedWindowUuids(
   units,
   range,
-  { overscanUnits = 8, maxUuids = 512 } = {},
+  { overscanUnits = 8, maxUuids = 512, captionSelections = null } = {},
 ) {
   if (!Array.isArray(units) || units.length === 0) return new Set();
   const start = Math.max(0, Math.min(units.length - 1, Number(range?.start) || 0));
@@ -95,7 +98,7 @@ export function collectHistoryMaterializedWindowUuids(
   const indices = Array.from({ length: to - from + 1 }, (_, offset) => from + offset)
     .sort((left, right) => Math.abs(left - centre) - Math.abs(right - centre));
   for (const index of indices) {
-    for (const uuid of unitPresentationUuids(units[index])) {
+    for (const uuid of unitPresentationUuids(units[index], captionSelections)) {
       if (!uuid) continue;
       result.add(uuid);
       if (result.size >= maxUuids) return result;

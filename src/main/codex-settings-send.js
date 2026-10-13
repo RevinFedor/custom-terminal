@@ -1,6 +1,7 @@
 'use strict';
 
 const { classifyCodexSettingsWriterTransition } = require('./codex-settings-writer-transition');
+const { createAgentInputObservation, observeAgentInput } = require('./agent-input-observation');
 const clean = value => typeof value === 'string' && value.trim() !== 'none' ? value.trim() : '';
 
 function codexSettingsSendNotSubmitted(result = {}) {
@@ -47,6 +48,28 @@ function codexSettingsObservationCurrent(
   return !!observedModel && !!requestedModel
     && observedModel === requestedModel
     && observedEffort === requestedEffort;
+}
+
+// A config/picker ACK is an application receipt, not a current composer frame.
+// Wait for the existing reader to prove the chosen pair. This never repeats
+// /model, input or Send, and elapsed time can only produce an unconfirmed result.
+async function observeCodexSettingsApplication({
+  model, effort, readFrame, isCurrent, subscribe, resolveModelIdentity = value => value,
+  timeoutMs = 3000,
+}) {
+  const expectedModel = clean(resolveModelIdentity(model));
+  const expectedEffort = clean(effort).toLowerCase();
+  const matches = frame => frame?.valid === true && !!expectedModel && !!expectedEffort
+    && clean(resolveModelIdentity(frame.model)) === expectedModel
+    && clean(frame.effort).toLowerCase() === expectedEffort;
+  const observation = createAgentInputObservation({ timeoutMs, isCurrent, subscribe });
+  const report = await observeAgentInput({ observation, probe: readFrame,
+    isSettled: matches, shouldWait: frame => !matches(frame) });
+  return report.value && matches(report.value)
+    ? { success: true, frame: report.value, observation: report.observation, checks: report.checks }
+    : { success: false, code: report.reason === 'owner-changed'
+        ? 'codex_settings_application_owner_changed' : 'codex_settings_observation_changed',
+      observation: report.observation, checks: report.checks, reason: report.reason || 'current-pair-unconfirmed' };
 }
 
 // No serializer lives here: settings and the associated prompt use the existing
@@ -224,4 +247,4 @@ function createCodexSettingsSendRuntime({
 }
 
 module.exports = { createCodexSettingsSendRuntime, codexSettingsSendScopeCurrent,
-  codexSettingsSendNotSubmitted, codexSettingsObservationCurrent };
+  codexSettingsSendNotSubmitted, codexSettingsObservationCurrent, observeCodexSettingsApplication };

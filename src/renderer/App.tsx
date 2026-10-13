@@ -1,4 +1,5 @@
 import { usePointerGesture } from './hooks/usePointerGesture';
+import { rememberAgentLaunchFence } from './utils/agentLaunchFence.mjs';
 import { createEditableDictationClipboard } from './utils/dictationEditableClipboard.mjs';
 const editableDictation = createEditableDictationClipboard({ document, ipc: window.require('electron').ipcRenderer,
   randomId: () => window.require('crypto').randomUUID(),
@@ -1955,7 +1956,7 @@ function App() {
           if (update.engine === 'claude') {
             applyClaudeVisualBusy(update.tabId, update.busy, update.reason);
           } else {
-            useWorkspaceStore.getState().setAiBusy(update.tabId, update.busy, update.reason);
+            useWorkspaceStore.getState().setAiBusy(update.tabId, update.busy, update.reason, update.goalWork || null);
             setBusyTabs(prev => {
               const next = new Map(prev);
               if (update.busy) next.set(update.tabId, true);
@@ -2091,7 +2092,7 @@ function App() {
         rows: 24,
         cols: 80,
         initialCommand: data.initialCommand || undefined,
-      });
+      }).then(result => rememberAgentLaunchFence(data.tabId, result?.launchFence));
     };
 
     // Terminal MCP: create a new tab with optional command
@@ -4884,7 +4885,8 @@ function App() {
 	          }
 	          console.log('[MobResume:Bridge] resumeAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' sid=' + String(resumeSessionId).slice(0, 8));
           try {
-            const result = await runtime.resume({ tabId, sessionId: resumeSessionId, cwd: tab.cwd });
+            const result = await runtime.resume({ tabId, sessionId: resumeSessionId, cwd: tab.cwd,
+              launchFence: payload?.launchFence });
             console.log('[MobResume:Bridge] resumeAgentTab done tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result));
             return reply(!!result.success, { tabId, toolType, sessionId: resumeSessionId, ...result }, result.error);
           } catch (e: any) {
@@ -4984,13 +4986,15 @@ function App() {
               const runResult = await startFreshCodexSession({
                 tabId,
                 cwd: tab.cwd,
+                launchFence: payload?.launchFence,
               }).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
               if (runResult?.success === false || runResult?.accepted === false) {
                 return reply(false, null, runResult.error || 'Codex start failed');
               }
               launchAccepted = runResult;
             } else {
-              const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude' })
+              const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude',
+                launchFence: payload?.launchFence })
                 .catch((err: any) => ({ success: false, accepted: false, error: String(err?.message || err) }));
               if (runResult?.success === false || runResult?.accepted === false) {
                 return reply(false, null, runResult?.error || runResult?.reason || 'Claude start failed');
@@ -5664,10 +5668,10 @@ function App() {
         return reply(false, null, 'unknown action: ' + action);
       } catch (err: any) {
         if ((action === 'sendMessageAuto' || action === 'sendAgentPromptScenario')
-          && err?.sendReceipt?.submitted === false) {
+          && (err?.sendReceipt?.submitted === false || err?.sendReceipt?.deliveryUnknown === true)) {
           // The bridge did return. Transport success carries the explicit
-          // domain refusal; otherwise main mistakes it for a lost reply and
-          // locks the handoff forever as delivery-unknown.
+          // domain receipt, including a launch refusal with unknown past
+          // delivery. Do not discard it or invent a negative Enter proof.
           return reply(true, {
             ...err.sendReceipt,
             tabId: payload?.tabId,
@@ -5703,9 +5707,9 @@ function App() {
     // Codex busy-state must feed the same project-level signal as the per-tab
     // process strip. Otherwise Codex can shimmer in the sidebar while the project
     // tab stays visually idle.
-    const handleCodexBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+    const handleCodexBusy = (_: any, { tabId, busy, reason, goalWork }: { tabId: string; busy: boolean; reason?: string; goalWork?: any }) => {
       authoritativeBusyEventsSeen.add(tabId);
-      useWorkspaceStore.getState().setAiBusy(tabId, busy, reason);
+      useWorkspaceStore.getState().setAiBusy(tabId, busy, reason, goalWork || null);
       setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
     };
     ipcRenderer.on('codex:busy-state', handleCodexBusy);
@@ -6093,6 +6097,7 @@ function App() {
                 projectId: item.projectId,
                 sessionId: item.sessionId,
                 engine: item.engine,
+                cwd: useWorkspaceStore.getState().openProjects.get(item.projectId)?.tabs.get(item.tabId)?.cwd,
                 clearInterruptedState: s.clearInterruptedState,
                 focusTerminal: false,
                 launchSource: 'auto-resume',

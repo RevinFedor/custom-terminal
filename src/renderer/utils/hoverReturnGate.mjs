@@ -11,6 +11,7 @@ export function createHoverReturnGate() {
       clicked = null;
     },
     reset() { clicked = null; returning = false; },
+    retain() { clicked = null; returning = true; },
     holds(point, insideParent) {
       if (!point || insideParent) { this.reset(); return false; }
       if (clicked && !clicked.isConnected) { clicked = null; returning = true; }

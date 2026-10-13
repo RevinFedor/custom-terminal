@@ -44,6 +44,9 @@ import {
   promptOutlineVerticalSlotPolicy,
 } from './promptOutlineModel.mjs';
 import { normalizeInterruptedRestoreParallelism } from '../../utils/interruptedAutoRestore.mjs';
+import { HISTORY_DISK_BUDGET_KEY, DEFAULT_HISTORY_DISK_BUDGET_GIB,
+  MIN_HISTORY_DISK_BUDGET_GIB, MAX_HISTORY_DISK_BUDGET_GIB,
+  normalizeHistoryDiskBudgetGiB } from '../../../shared/history-cache-settings.cjs';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 import { mergeSystemPromptDraft } from '../../utils/systemPromptDraft.mjs';
 import {
@@ -161,6 +164,7 @@ function FontSizeSlider({
   max,
   suffix = 'px',
   step = 1,
+  inputWidth = 40,
   disabled = false,
 }: {
   label: string;
@@ -171,6 +175,7 @@ function FontSizeSlider({
   max: number;
   suffix?: string;
   step?: number;
+  inputWidth?: number;
   // disabled — показываем значение read-only, без +/− и без редактирования.
   // Используется когда величина задаётся в другом месте (напр. resize-ручкой),
   // а здесь только отражается по факту.
@@ -274,7 +279,7 @@ function FontSizeSlider({
             else if (e.key === 'Escape') { setDraft(String(value)); (e.target as HTMLInputElement).blur(); }
           }}
           style={{
-            width: '40px',
+            width: inputWidth,
             textAlign: 'center',
             fontSize: '11px',
             color: '#fff',
@@ -778,15 +783,14 @@ function LineNumbersToggle({
   checked: boolean;
   onChange: (v: boolean) => void;
   label: string;
-  description: string;
-  tooltip: string;
+  description?: string;
+  tooltip?: string;
 }) {
-  return (
-    <Tooltip content={tooltip}>
+  const control = (
       <label className="flex items-start gap-3 cursor-pointer select-none">
-        <div
+        <button type="button" role="switch" aria-label={label} aria-checked={checked}
           className="relative w-8 h-4 rounded-full transition-colors mt-0.5 shrink-0"
-          style={{ backgroundColor: checked ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
+          style={{ padding: 0, border: 0, cursor: 'pointer', backgroundColor: checked ? 'rgba(74, 222, 128, 0.4)' : 'rgba(255,255,255,0.1)' }}
           onClick={() => onChange(!checked)}
         >
           <div
@@ -796,14 +800,14 @@ function LineNumbersToggle({
               backgroundColor: checked ? '#4ade80' : '#666',
             }}
           />
-        </div>
+        </button>
         <div>
           <div style={{ fontSize: '13px', color: '#ccc' }}>{label}</div>
-          <div style={{ fontSize: '11px', color: '#666' }}>{description}</div>
+          {description && <div style={{ fontSize: '11px', color: '#666' }}>{description}</div>}
         </div>
       </label>
-    </Tooltip>
   );
+  return tooltip ? <Tooltip content={tooltip}>{control}</Tooltip> : control;
 }
 
 // Общий hex-normalizer для всех color input'ов. Принимает 'fff' / '#fff' / 'ffffff' /
@@ -1286,11 +1290,11 @@ function SessionStatusesEditor() {
     <div style={{ paddingLeft: 12, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 12, alignItems: 'start' }}>
       <StatusColumnEditor title="Вкладки" markerLabel="Маркер вкладки" statuses={sessionStatuses} marker={statusMarker} addStatus={addSessionStatus} updateStatus={updateSessionStatus} removeStatus={removeSessionStatus} setMarker={setStatusMarker} />
       <StatusColumnEditor title="Задачи" markerLabel="Маркер задачи" statuses={taskStatuses} marker={taskStatusMarker} addStatus={addTaskStatus} updateStatus={updateTaskStatus} removeStatus={removeTaskStatus} setMarker={setTaskStatusMarker}
-        extraControl={<label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, fontSize: 12, color: '#aaa', cursor: 'pointer' }}>
-          <input type="checkbox" checked={taskStatusMarker.showTitles !== false}
-            onChange={(event) => setTaskStatusMarker({ showTitles: event.target.checked })} />
-          Показывать названия задач
-        </label>} />
+        extraControl={<div style={{ marginBottom: 8 }}><LineNumbersToggle
+          checked={taskStatusMarker.showTitles !== false}
+          onChange={(showTitles) => setTaskStatusMarker({ showTitles })}
+          label="Показывать названия задач"
+        /></div>} />
     </div>
   );
 }
@@ -1742,6 +1746,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   // next to the control).
   const [historyProjectorBudgetMbState, setHistoryProjectorBudgetMbState] = useState(400);
   const historyProjectorBudgetMb = historyProjectorBudgetMbState;
+  const [historyDiskBudgetGiB, setHistoryDiskBudgetGiBState] = useState(DEFAULT_HISTORY_DISK_BUDGET_GIB);
+  const setHistoryDiskBudgetGiB = useCallback((value: number) => {
+    const normalized = normalizeHistoryDiskBudgetGiB(value);
+    setHistoryDiskBudgetGiBState(normalized);
+    ipcRenderer.invoke('app:setState', { key: HISTORY_DISK_BUDGET_KEY, value: String(normalized) });
+  }, []);
   const setHistoryProjectorBudgetMb = useCallback((value: number) => {
     const clamped = Math.max(64, Math.min(2048, Math.round(value)));
     setHistoryProjectorBudgetMbState(clamped);
@@ -1866,6 +1876,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       });
 
       // History projector memory budget (main process reads this at startup).
+      ipcRenderer.invoke('app:getState', HISTORY_DISK_BUDGET_KEY).then((value: any) => {
+        setHistoryDiskBudgetGiBState(normalizeHistoryDiskBudgetGiB(value));
+      });
       ipcRenderer.invoke('app:getState', 'historyProjectorBudgetMb').then((value: any) => {
         const parsed = Math.floor(Number(value));
         // Load must NOT write back — setHistoryProjectorBudgetMb persists, and
@@ -4191,25 +4204,33 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 activeProjectId={activeProjectId}
               />
 
-              {/* Память под разобранные истории (главный процесс). Вынесено в
-                  настройки, потому что правильное значение зависит от машины:
-                  на 16GB запас в 400MB щедрый, на 64GB — можно втрое больше и
-                  держать тёплыми десятки вкладок. Применяется при старте —
-                  подпись об этом обязательна, иначе юзер решит, что настройка
-                  не работает. */}
+              {/* Бюджет RAM для разобранных данных, разделённый между main и
+                  History reader. Независим от дискового prepared cache.
+                  Main читает сохранённое значение при старте приложения. */}
               <div data-settings-section="history-memory" style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
                 <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase', marginBottom: '10px' }}>
                   Память истории
                 </div>
                 <SettingsGrid4>
                   <FontSizeSlider
-                    label="Кэш разобранных сессий"
-                    description="Больше — реже полная перезагрузка при возврате на вкладку"
+                    label="Кэш истории в RAM"
+                    description="Разобранные данные в оперативной памяти"
                     value={historyProjectorBudgetMb}
                     onChange={setHistoryProjectorBudgetMb}
                     min={64}
                     max={2048}
                     suffix=" МБ"
+                    inputWidth={60}
+                  />
+                  <FontSizeSlider
+                    label="Кэш истории на SSD"
+                    description="Готовые данные на диске; исходная история сохраняется"
+                    value={historyDiskBudgetGiB}
+                    onChange={setHistoryDiskBudgetGiB}
+                    min={MIN_HISTORY_DISK_BUDGET_GIB}
+                    max={MAX_HISTORY_DISK_BUDGET_GIB}
+                    suffix=" ГиБ"
+                    inputWidth={60}
                   />
                   <FontSizeSlider
                     label="Параллельное восстановление"
@@ -4223,8 +4244,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 </SettingsGrid4>
                 <div style={{ fontSize: '10px', color: '#8a6d3b', marginTop: '8px', lineHeight: 1.5 }}>
                   Настройки применятся после перезапуска приложения.
-                  {' '}Сессия занимает примерно 10–30 МБ; при нехватке бюджета самая
-                  давняя выгружается и её история читается заново.
+                  {' '}RAM и SSD — независимые бюджеты кэша.
+                  При вытеснении из RAM пригодные готовые данные читаются с SSD;
+                  недостающие восстанавливаются из исходной истории.
                 </div>
               </div>
 
@@ -4252,7 +4274,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   >
                     {modelSettingsExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                     <span style={{ fontSize: '11px', fontWeight: '600', color: '#777', textTransform: 'uppercase' }}>
-                      Настройки моделей
+                      Настройки model/f
                     </span>
                     {!modelSettingsExpanded && (
                       <span style={{ fontSize: 10, color: '#555', textTransform: 'none' }}>
@@ -4407,60 +4429,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                     <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6, marginTop: 10 }}>
                       <span
                         style={{ color: '#777', fontSize: 10, whiteSpace: 'nowrap' }}
-                        title="Эта пара применяется к каждому новому запуску Codex, если конкретная вкладка или внешний клиент не выбрали свою."
-                      >
-                        По умолчанию
-                      </span>
-                      <select
-                        value={defaultCodexModel === 'none' ? '' : defaultCodexModel}
-                        onChange={(e) => setSettingsDefaultCodexModel(e.currentTarget.value)}
-                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}
-                        title="Модель для новых запусков Codex"
-                      >
-                        <option value="">не задана</option>
-                        {codexModelsForSettings.map((model) => (
-                          <option key={model.id} value={model.id}>{model.label}</option>
-                        ))}
-                      </select>
-                      <select
-                        value={defaultCodexEfforts.includes(defaultCodexEffort) ? defaultCodexEffort : ''}
-                        disabled={!selectedDefaultCodexModel}
-                        onChange={(e) => setDefaultCodexEffort(e.currentTarget.value || 'none')}
-                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: selectedDefaultCodexModel ? 'pointer' : 'not-allowed', opacity: selectedDefaultCodexModel ? 1 : 0.45 }}
-                        title="Уровень усилий для новых запусков Codex"
-                      >
-                        <option value="">не задан</option>
-                        {defaultCodexEfforts.map((effort) => (
-                          <option key={effort} value={effort}>{compactEffortLabel(effortLabel(codexEffortOptions, effort))}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <label style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 8, marginTop: 10 }}>
-                      <span style={{ color: '#888', fontSize: 11 }}>При восстановлении сессии</span>
-                      <select
-                        data-testid="codex-resume-goal-policy"
-                        value={codexResumePausedGoal ? 'resume' : 'paused'}
-                        onChange={(e) => setCodexResumePausedGoal(e.currentTarget.value === 'resume')}
-                        title="Что автоматически выбрать, если Codex покажет «Resume paused goal?»"
-                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}
-                      >
-                        <option value="resume">Возобновлять Goal</option>
-                        <option value="paused">Оставлять Goal на паузе</option>
-                      </select>
-                    </label>
-                    <label style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 8, marginTop: 10 }}>
-                      <span style={{ color: '#888', fontSize: 11 }}>Когда исчерпан лимит Codex</span>
-                      <select data-testid="codex-usage-exhaustion-policy" value={codexUsageExhaustionPolicy}
-                        onChange={(e) => setCodexUsageExhaustionPolicy(e.currentTarget.value === 'stop-all' ? 'stop-all' : 'continue')}
-                        title="Отдельно от перегрузки модели. Остановка завершит все работающие Codex-вкладки обычным Stop."
-                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}>
-                        <option value="continue">Продолжать через Luna Reserve</option>
-                        <option value="stop-all">Остановить все Codex-вкладки</option>
-                      </select>
-                    </label>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6, marginTop: 10 }}>
-                      <span
-                        style={{ color: '#777', fontSize: 10, whiteSpace: 'nowrap' }}
                         title="Маленькая кнопка слева от Model в живом Codex переключает на эту пару и повторным кликом возвращает прежнюю."
                       >
                         Быстрый переход
@@ -4491,6 +4459,73 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   </div>
                 </div>
                 )}
+              </div>
+
+              <div
+                data-settings-section="model-behavior"
+                style={{ order: -1, padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}
+              >
+                <div style={{ fontSize: '11px', fontWeight: '600', color: '#777', textTransform: 'uppercase', marginBottom: '10px' }}>
+                  Настройки моделей
+                </div>
+                <div style={{ display: 'grid', gap: 8, maxWidth: 560 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6 }}>
+                    <span
+                      style={{ color: '#888', fontSize: 11, whiteSpace: 'nowrap' }}
+                      title="Эта пара применяется к каждому новому запуску Codex, если конкретная вкладка или внешний клиент не выбрали свою."
+                    >
+                      По умолчанию (Codex)
+                    </span>
+                    <select
+                      data-testid="codex-default-model"
+                      value={defaultCodexModel === 'none' ? '' : defaultCodexModel}
+                      onChange={(e) => setSettingsDefaultCodexModel(e.currentTarget.value)}
+                      style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}
+                      title="Модель для новых запусков Codex"
+                    >
+                      <option value="">не задана</option>
+                      {codexModelsForSettings.map((model) => (
+                        <option key={model.id} value={model.id}>{model.label}</option>
+                      ))}
+                    </select>
+                    <select
+                      data-testid="codex-default-effort"
+                      value={defaultCodexEfforts.includes(defaultCodexEffort) ? defaultCodexEffort : ''}
+                      disabled={!selectedDefaultCodexModel}
+                      onChange={(e) => setDefaultCodexEffort(e.currentTarget.value || 'none')}
+                      style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: selectedDefaultCodexModel ? 'pointer' : 'not-allowed', opacity: selectedDefaultCodexModel ? 1 : 0.45 }}
+                      title="Уровень усилий для новых запусков Codex"
+                    >
+                      <option value="">не задан</option>
+                      {defaultCodexEfforts.map((effort) => (
+                        <option key={effort} value={effort}>{compactEffortLabel(effortLabel(codexEffortOptions, effort))}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <label style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 8 }}>
+                    <span style={{ color: '#888', fontSize: 11 }}>При восстановлении сессии</span>
+                    <select
+                      data-testid="codex-resume-goal-policy"
+                      value={codexResumePausedGoal ? 'resume' : 'paused'}
+                      onChange={(e) => setCodexResumePausedGoal(e.currentTarget.value === 'resume')}
+                      title="Что автоматически выбрать, если Codex покажет «Resume paused goal?»"
+                      style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}
+                    >
+                      <option value="resume">Возобновлять Goal</option>
+                      <option value="paused">Оставлять Goal на паузе</option>
+                    </select>
+                  </label>
+                  <label style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 8 }}>
+                    <span style={{ color: '#888', fontSize: 11 }}>Когда исчерпан лимит Codex</span>
+                    <select data-testid="codex-usage-exhaustion-policy" value={codexUsageExhaustionPolicy}
+                      onChange={(e) => setCodexUsageExhaustionPolicy(e.currentTarget.value === 'stop-all' ? 'stop-all' : 'continue')}
+                      title="Отдельно от перегрузки модели. Остановка завершит все работающие Codex-вкладки обычным Stop."
+                      style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}>
+                      <option value="continue">Продолжать через Luna Reserve</option>
+                      <option value="stop-all">Остановить все Codex-вкладки</option>
+                    </select>
+                  </label>
+                </div>
               </div>
 
               {/* Семантическая индексация — единственная честно «системная» настройка

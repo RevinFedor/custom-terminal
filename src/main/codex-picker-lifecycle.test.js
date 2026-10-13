@@ -29,9 +29,9 @@ const pickerText = [
   'Press enter to confirm or esc to go back',
 ];
 
-function harness() {
+function harness({ frameLines = pickerText } = {}) {
   let generation = 'PTY-A:1';
-  let currentFrame = { success: true, lines: pickerText.map(text => ({ text })) };
+  let currentFrame = { success: true, lines: frameLines.map(text => ({ text })) };
   const ready = new Set(['T']);
   const meta = new Map([['T', { initializedLifecycleGeneration: generation }]]);
   const command = new Map([['T', { isRunning: true }]]);
@@ -87,6 +87,24 @@ test('a native model menu closes external input without turning an established p
   assert.equal(h.ready.has('T'), false, 'old composer proof is still invalidated');
   assert.deepEqual(h.projection(), { sessionStatus: 'active', busy: false, inputReady: false });
   assert.deepEqual(h.projection(true), { sessionStatus: 'busy', busy: true, inputReady: false });
+  h.composer();
+  assert.deepEqual(h.projection(), { sessionStatus: 'active', busy: false, inputReady: true });
+});
+
+for (const selected of [1, 2]) test('actual Main writes promotion choice once through picker control, not generic prompt bookkeeping: ' + selected, () => {
+  const h = harness({ frameLines: ['Meet GPT-6 Luna',
+    `${selected === 1 ? '›' : ' '} 1. Try new model`,
+    `${selected === 2 ? '›' : ' '} 2. Use existing model`, 'enter/esc confirm · ⌃c quit'] });
+  const writes = [];
+  const result = h.tryHandleManualCodexActivePickerEnter('T', { write: data => writes.push(data) }, '\r', 'manual-enter-write-boundary');
+  assert.equal(result.handled, true, 'the actual terminal:input caller returns before beginCodexPromptInFlight');
+  assert.equal(result.pickerKind, 'model-promotion');
+  assert.deepEqual(writes, ['\r']);
+  assert.equal(h.ready.has('T'), false, 'wait for a new actual composer frame');
+  const from = source.indexOf("const pickerEnter = tryHandleManualCodexActivePickerEnter(", source.indexOf("const manualOperation = {\n      kind: 'manual-codex-enter'"));
+  const until = source.indexOf("const promptInFlight = manualCompactIntentPending", from);
+  assert.ok(from > 0 && until > from);
+  assert.match(source.slice(from, until), /if \(pickerEnter\.handled\) return;/);
   h.composer();
   assert.deepEqual(h.projection(), { sessionStatus: 'active', busy: false, inputReady: true });
 });

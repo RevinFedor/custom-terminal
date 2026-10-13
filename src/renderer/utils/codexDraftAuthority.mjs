@@ -69,6 +69,12 @@ export function resolveCodexDraftAuthority(mainState, visualState) {
   // draft-preserving path. Visual "empty" alone is insufficient because a
   // hidden/unmounted renderer is not the owner of PTY state.
   if (visual.hasDraft === true) {
+    const frameRejection = rendererDraftFrameRejection(mainState, visual);
+    if (frameRejection === 'renderer-frame-behind') {
+      return { ...mainState, success: false, hasDraft: null, preview: '', authority: 'unknown',
+        rendererPositiveIgnored: frameRejection, visualHasDraft: true,
+        visualSource: visual.source, visualPreview: visual.preview, visualDebug: visual.debug };
+    }
     return {
       ...(mainState || {}),
       success: true,

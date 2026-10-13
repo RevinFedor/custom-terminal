@@ -10,7 +10,12 @@ const {
   normalizeStorageRetentionSettings,
   scanStorageInventory,
   storageItemDeletionRevision,
+  summarizeInventory,
 } = require('./storage-inventory');
+const {
+  HOUR_MS, MemoryStorageGraceStore, SqliteStorageGraceStore,
+  graceApplies, graceFingerprint, reconcileStorageGrace,
+} = require('./storage-retention-grace');
 const { CodexStorageDeletionProvider, uniqueSessionIds } = require('./codex-storage-deletion-provider');
 const { StorageDeletionAudit } = require('./storage-deletion-audit');
 
@@ -49,6 +54,7 @@ class StorageCleanupService {
     getRuntimeProtectedSessionIds = () => [],
     getMutationAuthority = () => ({ allowed: true, reason: 'default-authority' }),
     scanInventory = scanStorageInventory,
+    graceStore = null,
     deleteCodexSession = null,
     createCodexDeletionProvider = null,
     audit = null,
@@ -72,6 +78,7 @@ class StorageCleanupService {
     this.getRuntimeProtectedSessionIds = getRuntimeProtectedSessionIds;
     this.getMutationAuthority = getMutationAuthority;
     this.scanInventory = scanInventory;
+    this.graceStore = graceStore;
     this.unlinkFile = unlinkFile;
     this.removeDirectory = removeDirectory;
     this.now = now;
@@ -119,9 +126,19 @@ class StorageCleanupService {
       settings: this.getSettings(),
       nowMs,
     }).then((result) => {
+      if (result.success !== true) throw deletionError('storage_inventory_failed', 'Storage inventory is unavailable');
+      const settings = normalizeStorageRetentionSettings(result.settings);
+      // Read the clock after asynchronous I/O and reconcile inside one DB
+      // transaction: a binding committed during the scan cannot restore an
+      // earlier eligible clock from an in-memory snapshot.
+      const items = this._getGraceStore().reconcile((previous) => (
+        reconcileStorageGrace(result.items, settings, this.now(), previous)
+      ));
       const snapshot = {
         ...result,
-        items: result.items.map((item) => ({
+        settings,
+        summary: summarizeInventory(items),
+        items: items.map((item) => ({
           ...item,
           deletionRevision: storageItemDeletionRevision(item),
         })),
@@ -132,6 +149,31 @@ class StorageCleanupService {
       this.scanInflight = null;
     });
     return this.scanInflight;
+  }
+
+  _getGraceStore() {
+    this.graceStore ||= typeof this.sqlite?.exec === 'function'
+      ? new SqliteStorageGraceStore(this.sqlite) : new MemoryStorageGraceStore();
+    return this.graceStore;
+  }
+
+  _assertRetentionReady(item) {
+    const settings = this.getSettings();
+    const days = item.section === 'builds' ? settings.retentionDays.build
+      : item.group === 'app-backup' ? settings.retentionDays.appBackup
+        : Object.hasOwn(settings.retentionDays, item.group)
+          ? settings.retentionDays[item.group] : settings.retentionDays.regular;
+    const clock = this._getGraceStore().get(item.id);
+    const baseAt = item.closedAt || item.modifiedAt || item.createdAt || this.now();
+    const readyAt = Math.max(
+      baseAt + Number(days) * 24 * HOUR_MS,
+      Number(clock?.since) + settings.gracePeriodHours * HOUR_MS,
+    );
+    if (!graceApplies(item) || settings.enabled !== true || days == null
+      || item.eligible !== true || !clock || clock.fingerprint !== graceFingerprint(item)
+      || !Number.isFinite(readyAt) || readyAt > this.now()) {
+      throw deletionError('storage_retention_waiting', 'Session protection changed or its full waiting period has not elapsed');
+    }
   }
 
   _assertAllowedPath(item) {
@@ -479,7 +521,7 @@ class StorageCleanupService {
     }));
   }
 
-  async _deleteOne(item, { codexProvider = null, closureSessionIds = [] } = {}) {
+  async _deleteOne(item, { codexProvider = null, closureSessionIds = [], source = 'manual' } = {}) {
     if (!item || item.deletable !== true || item.protected === true) {
       throw deletionError('storage_item_protected', item?.protectedReason || 'Storage item is protected');
     }
@@ -494,6 +536,14 @@ class StorageCleanupService {
         });
       }
       finalClosureSessionIds = latestClosure;
+    }
+    if (source === 'retention') {
+      const stat = await fs.promises.stat(item.path);
+      if ((item.modifiedAt && stat.mtimeMs !== item.modifiedAt)
+        || (item.fileIdentity && `${stat.dev}:${stat.ino}` !== item.fileIdentity)) {
+        throw deletionError('storage_retention_source_changed', 'Storage file changed during automatic cleanup');
+      }
+      this._assertRetentionReady(item);
     }
     const currentReference = this._sessionStillReferenced(item, finalClosureSessionIds);
     if (currentReference) {
@@ -642,7 +692,7 @@ class StorageCleanupService {
           });
           await this._recordAudit(attempt, { required: true });
           this._logItem(attempt);
-          const deletion = await this._deleteOne(item, { codexProvider, closureSessionIds });
+          const deletion = await this._deleteOne(item, { codexProvider, closureSessionIds, source });
           const deletedSessionIds = Array.isArray(deletion?.deletedSessionIds)
             ? uniqueSessionIds(deletion.deletedSessionIds)
             : closureSessionIds;

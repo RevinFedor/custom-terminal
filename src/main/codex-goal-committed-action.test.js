@@ -22,7 +22,8 @@ function harness({ configured, override, screen = menu, usagePolicy } = {}) {
     if (value === '\x1b[B' || value === '\x1b[A') {
       const selected = runtimePolicies.inspectCodexPolicyDialog(runtime.screen).selectedIndex;
       const next = selected + (value === '\x1b[B' ? 1 : -1);
-      runtime.screen = runtime.screen.replace('› ', '  ').replace(new RegExp('  ' + next + '\\.'), '› ' + next + '.');
+      runtime.screen = runtime.screen.replace(/^[\t ]*›[\t ]+(?=\d+\.)/m, '  ')
+        .replace(new RegExp('  ' + next + '\\.'), '› ' + next + '.');
     }
   } };
   const mirror = { lastCommittedVisibleSnapshot: null, complete: true, writeSeq: 0, flushedSeq: 0 };
@@ -106,6 +107,29 @@ test('29Sep footer uses the same committed policy and preserves both saved choic
     h.frame(h.runtime.screen); await h.drain();
     assert.deepEqual(h.writes, configured ? ['\r'] : ['\x1b[B', '\r'], 'no second Enter for an unchanged modal');
   }
+});
+
+test('0.162 prefixed Goal uses actual Main selection and confirmation for both saved policies', async () => {
+  const prefixed = menu.replace('\nGoal:', '\n› Goal:')
+    .replace('Press enter to confirm or esc to go back', 'enter select · esc back');
+  for (const configured of [true, false]) {
+    const h = harness({ configured, screen: prefixed });
+    h.frame(prefixed, false); await h.drain();
+    assert.deepEqual(h.writes, [], 'an unfinished frame cannot authorize selection');
+    h.frame(prefixed); await h.drain();
+    const expected = configured ? ['\r'] : ['\x1b[B', '\r'];
+    assert.deepEqual(h.writes, expected);
+    assert.equal(h.policy().phase, 'confirming');
+    h.frame(h.runtime.screen); await h.drain();
+    assert.deepEqual(h.writes, expected, 'no duplicate Enter while waiting for the native result');
+    h.runtime.screen = '› Ask Codex to do anything\ngpt-6-astra max · Context 42% used';
+    h.frame(h.runtime.screen); await h.drain();
+    assert.equal(h.policy(), null, 'only the subsequent committed composer settles the action');
+  }
+  const changed = harness({ screen: prefixed });
+  changed.frame(prefixed); changed.runtime.input++; await changed.drain();
+  assert.deepEqual(changed.writes, []);
+  assert.equal(changed.policy().reason, 'input-owner-changed');
 });
 
 test('actual main adapter selects only quota fallback through its real PTY lock, or delegates Stop-all without keys', async () => {

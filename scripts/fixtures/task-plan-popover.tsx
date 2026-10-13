@@ -14,10 +14,19 @@ useWorkspaceStore.setState({ openProjects: new Map([['fixture', { projectId: 'fi
 useUIStore.setState({ taskStatuses: [{ id: 'dev', label: 'Разработка', color: '#d9b350' }], taskStatusMarker: { sizePx: 8, shape: 'square', showTitles: true } } as any);
 f.operation = (channel: string, payload: any) => {
   if (f.failNext) { f.failNext = false; return { success: false, error: 'private save failure' }; }
-  const current = useWorkspaceStore.getState().openProjects.get('fixture')!.tabs.get(payload.tabId)!.taskPlan;
-  const next = channel.endsWith('apply') ? applyTaskPlanOperations(current, payload.operations, 'user')
-    : channel.endsWith('undo') ? undoTaskPlan(current, 'user') : redoTaskPlan(current, 'user');
-  return { success: true, document: next.document };
+  const finish = () => {
+    const current = useWorkspaceStore.getState().openProjects.get('fixture')!.tabs.get(payload.tabId)!.taskPlan;
+    const operations = f.dropThemeFields ? payload.operations?.map((operation: any) => {
+      const legacy = { ...operation }; delete legacy.shortTitle; delete legacy.body; return legacy;
+    }) : payload.operations;
+    const next = channel.endsWith('apply') ? applyTaskPlanOperations(current, operations, 'user')
+      : channel.endsWith('undo') ? undoTaskPlan(current, 'user') : redoTaskPlan(current, 'user');
+    return { success: true, document: next.document };
+  };
+  if (f.blockCreation && payload.operations?.some((op: any) => op.type === 'add_task')) {
+    return new Promise(resolve => { f.releaseCreation = () => { f.blockCreation = false; f.releaseCreation = null; resolve(finish()); }; });
+  }
+  return finish();
 };
 f.state = (id = 'owner') => useWorkspaceStore.getState().openProjects.get('fixture')!.tabs.get(id)!.taskPlan;
 f.titles = (showTitles: boolean) => useUIStore.getState().setTaskStatusMarker({ showTitles });

@@ -150,6 +150,14 @@ keys. Для append допустим доказанный неизменный p
 могут принадлежать другим строкам. Legacy count-only snapshot не мигрирует в
 новую схему.
 
+Primary History Header под постоянный Run after rail входит в физическую
+геометрию Virtuoso и в measured-layout keys. Новые32px нельзя прибавить к старому
+snapshot как будто offset не изменился; при несовпадении остаётся прежний
+semantic anchor restore. Это не display-unit/дополнительный scroll writer.
+Research model-provider реагирует на exact presentation channel локально:
+mount-time `presented=false` не блокирует позднее показанный retained owner и
+не требует вернуть visibility-state всей тяжёлой History в React.
+
 ## Main-процесс: «не изменилось» обязан отвечать статами файлов
 
 Правило подсистемы: любой ответ «ничего не поменялось» стоит O(stat), не O(чтение). Свидетель — identity+mtime+size каждого файла цепочки (+ mtime папки проекта: resume/fork-ребёнок появляется НОВЫМ файлом, не меняя существующие — без dir-свидетеля latestSessionId «замерзает»). Четыре кэша одного паттерна: probe полной истории, unchanged-путь `claude:get-timeline` (ifRevision), confirmed model/effort (см. `fact-claude-control-bar.md`), материализация сессии в get-presence (см. `fix-performance-lags.md::1e`). Эти проверки держат быстрые witnesses в RAM. Для Codex потеря RAM теперь отдельно покрывается подготовленным SSD-кэшем; она не означает обязательный полный JSONL parse после каждого restart (см. ниже). Claude и остальные перечисленные проверки сохраняют прежний путь.
@@ -248,7 +256,7 @@ Main lease живёт до конца подготовки metadata, finally у�
 Проверка: `codex-history-progress.test.js`, `historyPreparationStatus.test.mjs`,
 изолированный `scripts/history-loading-progress-regression.mjs`. Реальные
 пользовательские данные не входят в synthetic fixture. Фазовые границы и трактовка
-времён — `fact-performance-diagnostics.md`, текущий эпизод — `tmp/оптимизация-history.md`.
+времён — `логирование-оптимизации.md`, текущий эпизод — `tmp/оптимизация-history.md`.
 
 ## Оконная выдача истории
 
@@ -259,6 +267,13 @@ Main lease живёт до конца подготовки metadata, finally у�
 Desktop History намеренно НЕ укорачивает позиционный список и не переводит всю scroll-механику на `firstItemIndex`. `applyHistoryRowWindow` сохраняет полный порядок и число строк, а вне читаемого диапазона оставляет identity-stub: UUID, физический источник, роль/время и ровно те структурные поля, которые нужны группировке. Полный хвост и строки с незавершённой фоновой работой всегда гидрированы. Поэтому scrollbar, measured-геометрия, restore-якорь, Timeline index и mount wave продолжают адресовать одну полную проекцию; меняется payload строки, не её место.
 
 Главный инвариант: `grouping(stubbed projection) === grouping(full projection)`. Display-группировка имеет право читать только поля, существующие и у stub, и у полной строки. Центр гидрации задаётся UUID записи, а не индексом display-unit: одна свёрнутая серия представляет несколько raw rows, и смешение этих координат уже давало «прыжок → skeleton → второй прыжок». Производная карта групп кэшируется по данным сессии и переживает сон панели; результат append также записывается в кэш. Срок жизни производного совпадает со сроком жизни snapshot'а, а не React-компонента, который его показывает.
+
+View-only cycling подписи не пересобирает топологию и не открывает группу.
+Caption candidates — ссылки на те же короткие raw rows, выбор — bounded owner
+metadata. Explicit selected caption задаёт прежний hydration UUID и заменяет
+default caption в materialized-window protection, не увеличивая512-row budget
+или отменяя physical-revision guard. Число/commentary phase одинаковы на actual
+Main stubs и полных строках; выбор не читает/хэширует скрытые тела.
 
 `hasContent` недостаточно для этого инварианта: короткая подпись перед вызовом
 входит в группу, длинный ответ остаётся границей. Stub хранит точную длину

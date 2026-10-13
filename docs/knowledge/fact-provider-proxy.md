@@ -130,6 +130,19 @@ Node не вынимает уже уничтоженный queued request из `
 бы границу той же ошибки; правильная модель — отсутствие proxy-owned deadline
 для model response при сохранённом exact downstream cancellation.
 
+На событии HTTP `upgrade` Node снимает свой socket error handler, а `ws` получает
+локальный socket только после успешного внешнего handshake. В этом промежутке
+proxy сам владеет `error`: сброс закрывает точное локальное соединение, прежний
+close-path завершает его upstream. После `handleUpgrade` временный listener
+снимается, и ошибки снова принадлежат `ws`. Ранние route/auth отказы покрываются
+тем же guard. Не заменять это глобальным подавлением uncaughtException.
+Шрам12.10: из установленного обработчика на Node18 реальный local TCP reset
+воспроизвёл `read ECONNRESET`/onStreamRead217:20; до handoff было0error listeners.
+Приложенный `provider-proxy-upgrade.actual.test.js` проверяет actual callback,
+реальные HTTP/TCP и ws handoff; внешний provider заменён pending-объектом.
+Это доказанный дефект пути, но без исторической uncaught-квитанции он не определяет
+однозначно канал пользовательской модалки и не объясняет все Main freezes.
+
 Трасса `[ProviderProxy:HTTP]` обязана проходить `accepted → socket-assigned →
 response-headers → completed` либо заканчиваться `terminated` с request id,
 tab/path и `active/free/queued`. Увеличение `maxSockets`, отключение keepAlive и

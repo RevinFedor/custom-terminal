@@ -1,9 +1,12 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { createHash } = require('crypto');
 
 const SC_DESKTOP_TERMINAL_COMPLETION_URL =
   'http://127.0.0.1:53127/notifications/terminal-completion';
+const SC_DESKTOP_TERMINAL_USER_URL =
+  'http://127.0.0.1:53127/notifications/terminal-user';
 const SC_DESKTOP_NOTIFICATION_TIMEOUT_MS = 8_000;
 const DEFAULT_SC_DESKTOP_NOTIFICATION_TOKEN_PATH = path.join(
   os.homedir(),
@@ -45,6 +48,41 @@ function buildTerminalCompletionEnvelope(detail = {}) {
     mode: detail.persistent === true ? 'persistent' : 'oneshot',
     unread: detail.fired === true,
   };
+}
+
+function terminalUserNotificationId(tabId, requestId) {
+  return 'terminal-user:' + createHash('sha256').update(JSON.stringify([tabId, requestId])).digest('hex');
+}
+
+function buildTerminalUserEnvelope(detail = {}) {
+  const string = (value, field, limit) => {
+    if (typeof value !== 'string' || !value.trim() || value.trim().length > limit
+      || (field === 'text' ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/
+        : /[\u0000-\u001f\u007f]/).test(value)) {
+      throw new Error(field + ' must be a non-empty string of at most ' + limit + ' characters');
+    }
+    return value.trim();
+  };
+  const tabId = string(detail.tabId, 'tabId', 512);
+  const requestId = string(detail.requestId, 'requestId', 128);
+  const createdAt = Number(detail.createdAt);
+  const waitSeconds = detail.waitSeconds ?? 0;
+  if (!Number.isSafeInteger(createdAt) || createdAt <= 0) throw new Error('createdAt required');
+  if (!Number.isInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 60) {
+    throw new Error('waitSeconds must be an integer from 0 to 60');
+  }
+  return {
+    kind: 'terminal-user', eventId: terminalUserNotificationId(tabId, requestId),
+    projectId: string(detail.projectId, 'projectId', 512), tabId, requestId,
+    tabName: string(String(detail.tabName || 'Terminal').replace(/\s+/g, ' ').trim().slice(0, 160)
+      || 'Terminal', 'tabName', 160),
+    text: string(detail.text, 'text', 2000), createdAt, waitSeconds,
+  };
+}
+
+function sameUserNotification(a, b) {
+  return a.kind === b.kind && a.tabId === b.tabId && a.projectId === b.projectId
+    && a.requestId === b.requestId && a.text === b.text && a.waitSeconds === b.waitSeconds;
 }
 
 function resolveNotificationTokenPath(explicitPath) {
@@ -99,7 +137,7 @@ function parseRetryAfterMs(value) {
 async function postTerminalCompletionToScDesktop(
   envelope,
   {
-    endpoint = SC_DESKTOP_TERMINAL_COMPLETION_URL,
+    endpoint,
     timeoutMs = SC_DESKTOP_NOTIFICATION_TIMEOUT_MS,
     tokenPath,
     fetchImpl = globalThis.fetch,
@@ -116,7 +154,8 @@ async function postTerminalCompletionToScDesktop(
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   timeout.unref?.();
   try {
-    const response = await fetchImpl(endpoint, {
+    const response = await fetchImpl(endpoint || (envelope.kind === 'terminal-user'
+      ? SC_DESKTOP_TERMINAL_USER_URL : SC_DESKTOP_TERMINAL_COMPLETION_URL), {
       method: 'POST',
       headers: {
         Accept: 'application/json',
@@ -134,6 +173,8 @@ async function postTerminalCompletionToScDesktop(
         status: response.status,
         retryAfterMs: parseRetryAfterMs(response.headers?.get?.('retry-after')),
         error: payload?.error || payload?.message || null,
+        code: payload?.code || (envelope.kind === 'terminal-user' && response.status === 404
+          ? 'sc_desktop_update_required' : null),
       };
     }
     if (payload?.ok !== true) {
@@ -144,12 +185,19 @@ async function postTerminalCompletionToScDesktop(
         error: payload?.error || payload?.message || null,
       };
     }
+    const messageId = payload.deliveries?.[0]?.message_id ?? null;
+    if (envelope.kind === 'terminal-user' && (payload.eventId !== envelope.eventId
+      || !Number.isSafeInteger(messageId) || messageId <= 0
+      || !Number.isSafeInteger(payload.sentAt) || payload.sentAt <= 0)) {
+      return { ok: false, reason: 'invalid_delivery_receipt', status: response.status };
+    }
     return {
       ok: true,
       status: response.status,
       duplicate: payload.duplicate === true,
       deliveryCount: Array.isArray(payload.deliveries) ? payload.deliveries.length : 0,
-      messageId: payload.deliveries?.[0]?.message_id ?? null,
+      messageId,
+      ...(envelope.kind === 'terminal-user' ? { sentAt: payload.sentAt } : {}),
     };
   } catch (error) {
     const timedOut = error?.name === 'AbortError' || controller.signal.aborted;
@@ -173,6 +221,12 @@ function retryDelayMs(attemptCount, initialRetryMs, maxRetryMs) {
 }
 
 function normalizeStoredEnvelope(value) {
+  if (value?.kind === 'terminal-user') {
+    try {
+      const normalized = buildTerminalUserEnvelope(value);
+      return normalized.eventId === value.eventId ? normalized : null;
+    } catch { return null; }
+  }
   if (!value || value.kind !== 'terminal-completion') return null;
   const eventId = String(value.eventId || '').trim();
   const projectId = String(value.projectId || '').trim();
@@ -204,6 +258,7 @@ class ScDesktopNotificationOutbox {
     initialRetryMs = OUTBOX_INITIAL_RETRY_MS,
     maxRetryMs = OUTBOX_MAX_RETRY_MS,
     maxPending = OUTBOX_MAX_PENDING,
+    strictLoad = false,
   } = {}) {
     if (!storagePath) throw new Error('storagePath required');
     this.storagePath = storagePath;
@@ -212,8 +267,14 @@ class ScDesktopNotificationOutbox {
     this.initialRetryMs = Math.max(100, Number(initialRetryMs) || OUTBOX_INITIAL_RETRY_MS);
     this.maxRetryMs = Math.max(this.initialRetryMs, Number(maxRetryMs) || OUTBOX_MAX_RETRY_MS);
     this.maxPending = Math.max(1, Number(maxPending) || OUTBOX_MAX_PENDING);
+    this.strictLoad = strictLoad;
+    this.loadError = null;
     this.pending = new Map();
     this.settled = new Map();
+    this.userReceipts = new Map();
+    this.admissions = new Map();
+    this.attemptPromise = null;
+    this.attemptEventId = null;
     this.inFlight = false;
     this.retryTimer = null;
     this.immediateScheduled = false;
@@ -222,7 +283,9 @@ class ScDesktopNotificationOutbox {
     this.persistChain = Promise.resolve();
     this.initialized = false;
     this.ready = this.load().catch((error) => {
-      this.warn('load failed; continuing with an empty in-memory queue error=' + String(error?.message || error));
+      this.loadError = error;
+      this.warn('load failed; ' + (strictLoad ? 'delivery held' : 'continuing with an empty in-memory queue')
+        + ' error=' + String(error?.message || error));
     }).finally(() => {
       this.initialized = true;
       this.schedule();
@@ -241,12 +304,14 @@ class ScDesktopNotificationOutbox {
     for (const [eventId, settledAt] of this.settled) {
       if (!Number.isFinite(settledAt) || now - settledAt > OUTBOX_SETTLED_TTL_MS) {
         this.settled.delete(eventId);
+        this.userReceipts.delete(eventId);
       }
     }
     if (this.settled.size <= OUTBOX_MAX_SETTLED) return;
     const oldest = [...this.settled.entries()].sort((a, b) => a[1] - b[1]);
     for (const [eventId] of oldest.slice(0, this.settled.size - OUTBOX_MAX_SETTLED)) {
       this.settled.delete(eventId);
+      this.userReceipts.delete(eventId);
     }
   }
 
@@ -258,25 +323,46 @@ class ScDesktopNotificationOutbox {
       if (error?.code === 'ENOENT') return;
       throw error;
     }
-    if (!parsed || parsed.version !== OUTBOX_VERSION) return;
+    if (!parsed || parsed.version !== OUTBOX_VERSION) {
+      if (this.strictLoad) throw new Error('unsupported user notification outbox version');
+      return;
+    }
+    if (this.strictLoad && (!Array.isArray(parsed.pending) || !Array.isArray(parsed.settled))) {
+      throw new Error('invalid user notification outbox');
+    }
 
     const settledEntries = Array.isArray(parsed.settled) ? parsed.settled : [];
     for (const value of settledEntries) {
       const eventId = String(value?.eventId || '').trim();
       const settledAt = Number(value?.settledAt);
-      if (eventId && Number.isFinite(settledAt)) this.settled.set(eventId, settledAt);
+      if (eventId && Number.isFinite(settledAt)) {
+        this.settled.set(eventId, settledAt);
+        const receipt = value.userReceipt;
+        const envelope = normalizeStoredEnvelope(receipt?.envelope);
+        if (envelope?.kind === 'terminal-user' && envelope.eventId === eventId
+          && ['sent', 'failed'].includes(receipt.deliveryState)
+          && (receipt.deliveryState !== 'sent' || Number.isSafeInteger(receipt.sentAt) && receipt.sentAt > 0
+            && Number.isSafeInteger(receipt.messageId) && receipt.messageId > 0)) {
+          this.userReceipts.set(eventId, { ...receipt, envelope, receiptDurable: true });
+        }
+      }
     }
     this.pruneSettled();
 
     const pendingEntries = Array.isArray(parsed.pending) ? parsed.pending : [];
     for (const value of pendingEntries.slice(0, this.maxPending)) {
       const envelope = normalizeStoredEnvelope(value?.envelope);
+      if (this.strictLoad && envelope?.kind !== 'terminal-user') throw new Error('invalid saved user notification');
       if (!envelope || this.pending.has(envelope.eventId) || this.settled.has(envelope.eventId)) continue;
       this.pending.set(envelope.eventId, {
         envelope,
         enqueuedAt: Number(value.enqueuedAt) || Date.now(),
         attemptCount: Math.max(0, Number(value.attemptCount) || 0),
         nextAttemptAt: Math.max(0, Number(value.nextAttemptAt) || 0),
+        ...(envelope.kind === 'terminal-user' ? { durable: true,
+          deliveryState: value.deliveryState === 'unknown' ? 'unknown' : 'pending',
+          ...(value.lastError ? { lastError: { code: String(value.lastError.code || '').slice(0, 80),
+            message: String(value.lastError.message || '').slice(0, 240) } } : {}) } : {}),
       });
     }
     if (this.pending.size) this.info('restored pending=' + this.pending.size);
@@ -287,7 +373,8 @@ class ScDesktopNotificationOutbox {
     const snapshot = JSON.stringify({
       version: OUTBOX_VERSION,
       pending: [...this.pending.values()],
-      settled: [...this.settled.entries()].map(([eventId, settledAt]) => ({ eventId, settledAt })),
+      settled: [...this.settled.entries()].map(([eventId, settledAt]) => ({ eventId, settledAt,
+        ...(this.userReceipts.has(eventId) ? { userReceipt: this.userReceipts.get(eventId) } : {}) })),
     });
     const sequence = ++this.persistSequence;
     const operation = async () => {
@@ -318,8 +405,17 @@ class ScDesktopNotificationOutbox {
 
   async enqueue(envelope) {
     await this.ready;
+    if (this.strictLoad && this.loadError) return { ok: false, reason: 'storage_unavailable' };
     const normalized = normalizeStoredEnvelope(envelope);
     if (!normalized) return { ok: false, reason: 'invalid_envelope' };
+    if (normalized.kind === 'terminal-user') {
+      const existing = this.pending.get(normalized.eventId)?.envelope
+        || this.userReceipts.get(normalized.eventId)?.envelope;
+      if (existing && !sameUserNotification(existing, normalized)) return { ok: false, reason: 'request_id_conflict' };
+      if (this.admissions.has(normalized.eventId)) return this.admissions.get(normalized.eventId);
+      const record = this.pending.get(normalized.eventId);
+      if (record && record.durable !== true) return this.admitUserRecord(record);
+    }
     if (this.pending.has(normalized.eventId)) {
       return { ok: true, queued: false, duplicate: true, state: 'pending' };
     }
@@ -331,20 +427,69 @@ class ScDesktopNotificationOutbox {
       return { ok: false, reason: 'queue_full' };
     }
 
-    this.pending.set(normalized.eventId, {
+    const record = {
       envelope: normalized,
       enqueuedAt: Date.now(),
       attemptCount: 0,
       nextAttemptAt: 0,
-    });
+      ...(normalized.kind === 'terminal-user' ? { durable: false, deliveryState: 'pending' } : {}),
+    };
+    this.pending.set(normalized.eventId, record);
+    if (normalized.kind === 'terminal-user') return this.admitUserRecord(record);
     const durable = await this.persistSafely('enqueue');
     this.schedule();
     return { ok: true, queued: true, duplicate: false, durable };
   }
 
+  async admitUserRecord(record) {
+    const eventId = record.envelope.eventId;
+    const admission = this.persistSafely('user-enqueue').then(durable => {
+      record.durable = durable;
+      if (durable) this.schedule();
+      return { ok: durable, queued: durable, duplicate: false, durable,
+        ...(!durable ? { reason: 'persistence_failed' } : {}) };
+    });
+    this.admissions.set(eventId, admission);
+    try { return await admission; }
+    finally { this.admissions.delete(eventId); }
+  }
+
+  async readUserNotification(tabId, requestId) {
+    await this.ready;
+    if (this.strictLoad && this.loadError) throw new Error('user notification storage unavailable');
+    this.pruneSettled();
+    const eventId = terminalUserNotificationId(tabId, requestId);
+    const pending = this.pending.get(eventId);
+    const receipt = this.userReceipts.get(eventId);
+    const envelope = pending?.envelope || receipt?.envelope;
+    if (envelope?.kind !== 'terminal-user') return null;
+    const sentAt = receipt?.deliveryState === 'sent' ? receipt.sentAt : null;
+    return { requestId, eventId, tabId, channel: 'telegram',
+      accepted: pending ? pending.durable === true : true,
+      durable: pending ? pending.durable === true : true,
+      receiptDurable: pending ? pending.durable === true : receipt.receiptDurable === true,
+      deliveryState: receipt?.deliveryState || pending.deliveryState,
+      createdAt: envelope.createdAt, waitSeconds: envelope.waitSeconds,
+      sentAt, messageId: receipt?.messageId ?? null,
+      waitUntil: sentAt ? sentAt + envelope.waitSeconds * 1000 : null,
+      error: receipt?.error || pending?.lastError?.message || null,
+      errorCode: receipt?.errorCode || pending?.lastError?.code || null };
+  }
+
+  async attemptUserNotification(eventId) {
+    await this.ready;
+    if (this.inFlight) {
+      if (this.attemptEventId === eventId) await this.attemptPromise;
+      return;
+    }
+    const next = this.nextRecord();
+    if (next?.envelope.eventId === eventId && next.nextAttemptAt <= Date.now()) await this.drain();
+  }
+
   nextRecord() {
     let next = null;
     for (const record of this.pending.values()) {
+      if (record.envelope.kind === 'terminal-user' && record.durable !== true) continue;
       if (!next || record.enqueuedAt < next.enqueuedAt) {
         next = record;
       }
@@ -353,7 +498,7 @@ class ScDesktopNotificationOutbox {
   }
 
   schedule() {
-    if (!this.initialized || this.stopped || this.inFlight) return;
+    if (!this.initialized || this.stopped || this.inFlight || this.strictLoad && this.loadError) return;
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
@@ -378,7 +523,8 @@ class ScDesktopNotificationOutbox {
   }
 
   async drain() {
-    if (this.stopped || this.inFlight) return;
+    if (this.stopped || this.strictLoad && this.loadError) return;
+    if (this.inFlight) return this.attemptPromise;
     const record = this.nextRecord();
     if (!record) return;
     if (record.nextAttemptAt > Date.now()) {
@@ -387,17 +533,39 @@ class ScDesktopNotificationOutbox {
     }
 
     this.inFlight = true;
+    this.attemptEventId = record.envelope.eventId;
+    this.attemptPromise = this.deliverRecord(record);
+    try { await this.attemptPromise; }
+    finally {
+      this.inFlight = false;
+      this.attemptEventId = null;
+      this.attemptPromise = null;
+      this.schedule();
+    }
+  }
+
+  async deliverRecord(record) {
     let result;
     try {
       result = await this.transport(record.envelope);
     } catch (error) {
       result = { ok: false, reason: 'transport_rejected', error: String(error?.message || error) };
     }
+    if (record.envelope.kind === 'terminal-user' && result?.ok === true
+      && (!Number.isSafeInteger(result.sentAt) || result.sentAt <= 0
+        || !Number.isSafeInteger(result.messageId) || result.messageId <= 0)) {
+      result = { ok: false, reason: 'invalid_delivery_receipt' };
+    }
 
     if (result?.ok === true) {
       this.pending.delete(record.envelope.eventId);
       this.settled.set(record.envelope.eventId, Date.now());
-      await this.persistSafely('delivered');
+      if (record.envelope.kind === 'terminal-user') this.userReceipts.set(record.envelope.eventId, {
+        envelope: record.envelope, deliveryState: 'sent', sentAt: result.sentAt,
+        messageId: result.messageId,
+      });
+      const receiptDurable = await this.persistSafely('delivered');
+      if (record.envelope.kind === 'terminal-user') this.userReceipts.get(record.envelope.eventId).receiptDurable = receiptDurable;
       this.info('delivered eventId=' + record.envelope.eventId
         + ' status=' + (result.status || '-')
         + ' duplicate=' + (result.duplicate === true)
@@ -406,12 +574,22 @@ class ScDesktopNotificationOutbox {
     } else if (isPermanentDeliveryFailure(result)) {
       this.pending.delete(record.envelope.eventId);
       this.settled.set(record.envelope.eventId, Date.now());
-      await this.persistSafely('permanent-failure');
+      if (record.envelope.kind === 'terminal-user') this.userReceipts.set(record.envelope.eventId, {
+        envelope: record.envelope, deliveryState: 'failed', error: result.error || result.reason || 'delivery_failed',
+        errorCode: result.code || result.reason || 'delivery_failed',
+      });
+      const receiptDurable = await this.persistSafely('permanent-failure');
+      if (record.envelope.kind === 'terminal-user') this.userReceipts.get(record.envelope.eventId).receiptDurable = receiptDurable;
       this.warn('dropped permanent eventId=' + record.envelope.eventId
         + ' status=' + result.status
         + ' reason=' + (result.reason || '-'));
     } else {
       record.attemptCount += 1;
+      if (record.envelope.kind === 'terminal-user') {
+        record.deliveryState = 'unknown';
+        record.lastError = { code: result?.code || result?.reason || 'delivery_unknown',
+          message: String(result?.error || result?.reason || 'delivery_unknown').slice(0, 240) };
+      }
       const exponentialDelay = retryDelayMs(record.attemptCount, this.initialRetryMs, this.maxRetryMs);
       const requestedDelay = Number(result?.retryAfterMs);
       const delay = Math.min(
@@ -428,8 +606,6 @@ class ScDesktopNotificationOutbox {
         + ' errorCode=' + (result?.errorCode || '-'));
     }
 
-    this.inFlight = false;
-    this.schedule();
   }
 
   stop() {
@@ -448,6 +624,8 @@ module.exports = {
   SC_DESKTOP_NOTIFICATION_TIMEOUT_MS,
   DEFAULT_SC_DESKTOP_NOTIFICATION_TOKEN_PATH,
   buildTerminalCompletionEnvelope,
+  buildTerminalUserEnvelope,
+  terminalUserNotificationId,
   postTerminalCompletionToScDesktop,
   createScDesktopNotificationOutbox,
 };

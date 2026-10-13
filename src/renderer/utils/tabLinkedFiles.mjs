@@ -20,19 +20,27 @@ export function collectTabLinkedFiles(openProjects, ownerTabId) {
 // owner, even if that child also has files. reserveOrder is the saved common
 // ordering authority; Map insertion order is only the pre-order fallback.
 export function collectTabLinkedFileTree(openProjects, ownerTabId, orderedIds = []) {
-  const rank = new Map(orderedIds.map((id, index) => [id, index]));
+  return collectLinkedFileIndex(buildLinkedFileIndex(openProjects), ownerTabId,
+    new Map(orderedIds.map((id, index) => [id, index])));
+}
+
+function buildLinkedFileIndex(openProjects) {
   const byParent = new Map();
   for(const [projectId,workspace] of openProjects || []) for(const file of workspace.tabs?.values() || []) {
     if(file.tabType!=='file' || !file.filePath || !file.visualParentTabId
       || file.archived || file.isArchived || file.archivedAt || file.deleted)continue;
     const children=byParent.get(file.visualParentTabId) || [];
-    children.push({projectId,id:file.id,ownerTabId,path:file.filePath,
+    children.push({projectId,id:file.id,ownerTabId:undefined,path:file.filePath,
       name:file.filePath.split(/[\\/]/).pop() || file.name || file.filePath});
     byParent.set(file.visualParentTabId,children);
   }
+  return byParent;
+}
+
+function collectLinkedFileIndex(byParent, ownerTabId, rank) {
   const result = [], visited = new Set([ownerTabId]);
   const visit = (parentId, depth) => {
-    const children = (byParent.get(parentId) || [])
+    const children = (byParent.get(parentId) || []).slice()
       .sort((a,b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity));
     for (const file of children) {
       if (visited.has(file.id)) continue;
@@ -43,6 +51,31 @@ export function collectTabLinkedFileTree(openProjects, ownerTabId, orderedIds = 
   };
   if (ownerTabId) visit(ownerTabId, 0);
   return result;
+}
+
+const publicationIndexes = new WeakMap();
+// Presentation selectors share one scan of the published Zustand state. The
+// state object changes on every publication even when producers mutate tabs
+// before set(). Do not key this by openProjects: its nested tabs may be mutable.
+// Mutation/drag admission readers above deliberately keep their fresh scan.
+export function publishedTabLinkedFilesSnapshot(state, ownerTabId) {
+  let publication = publicationIndexes.get(state);
+  if (!publication) {
+    const workflows = new Map();
+    for (const space of state.spaces || []) if (!workflows.has(space.id)) workflows.set(space.id, space);
+    publication = { byParent: buildLinkedFileIndex(state.openProjects), owners: new Map(), workflows, ranks: new Map() };
+    publicationIndexes.set(state, publication);
+  }
+  if (publication.owners.has(ownerTabId)) return publication.owners.get(ownerTabId);
+  const workflowId = state.tabWorkflowMembership?.[ownerTabId]?.workflowId;
+  let rank = publication.ranks.get(workflowId);
+  if (!rank) {
+    rank = new Map((publication.workflows.get(workflowId)?.reserveOrder || []).map((id, index) => [id, index]));
+    publication.ranks.set(workflowId, rank);
+  }
+  const snapshot = JSON.stringify(collectLinkedFileIndex(publication.byParent, ownerTabId, rank));
+  publication.owners.set(ownerTabId, snapshot);
+  return snapshot;
 }
 
 export function linkedFileOwner(openProjects, fileId) {

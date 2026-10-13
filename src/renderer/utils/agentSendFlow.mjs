@@ -108,7 +108,11 @@ export async function runAgentSendFlow({
       // A readiness/composer failure happens before this invocation can call
       // the provider adapter. Keep that negative receipt across the bridge;
       // absence of a renderer reply is a different, genuinely unknown case.
-      if (snapshot.phase === 'ensuring-ready' || snapshot.phase === 'proving-composer') {
+      // A Main launch refusal can concern an already-used attempt. Preserve
+      // its explicit receipt instead of inferring past writes from this
+      // renderer invocation's preflight phase.
+      if ((snapshot.phase === 'ensuring-ready' || snapshot.phase === 'proving-composer')
+        && !error.sendReceipt) {
         error.sendReceipt = {
           success: false,
           accepted: false,

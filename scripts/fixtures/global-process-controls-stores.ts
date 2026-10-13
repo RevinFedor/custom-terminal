@@ -10,3 +10,9 @@ export const useWorkspaceStore = create<any>(() => ({
 }));
 export const useProjectsStore = create<any>(() => ({ projects: { 'fixture-project': { name: 'Fixture directory', path: '/synthetic' } } }));
 fixture.workspaceStore = useWorkspaceStore;
+export function useDiskCapacity() {
+  return { status: 'ready', measuredAt: Date.now(), expiresAt: Date.now() + 60000,
+    freeBytes: Math.round(62.78 * 1024 ** 3), cacheBytes: 20 * 1024 ** 3, budgetBytes: 20 * 1024 ** 3,
+    reserveBytes: 6 * 1024 ** 3, remainingGrowthBytes: 0, projectedFreeBytes: Math.round(62.78 * 1024 ** 3), warning: false,
+    ram: {status:'ready', approxBytes:Math.round(1.61 * 1024 ** 3),budgetBytes:2 * 1024 ** 3} };
+}

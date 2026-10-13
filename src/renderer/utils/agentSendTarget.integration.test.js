@@ -31,7 +31,7 @@ const compile = source => ts.transpileModule(source, { compilerOptions: {
 async function harness({ toolType = 'codex', status = 'active', sessionId = 'A', liveSessionId = 'A',
   acceptedResumeSourceSessionId = null, afterStartupGate = null, afterReady = null,
   resumeTo = null, joinStarting = false, fresh = false, materializationSessionId = null,
-  hidden = false, expectedTarget = undefined, liveTarget = null } = {}) {
+  hidden = false, expectedTarget = undefined, liveTarget = null, pendingFork = false } = {}) {
   let current = { toolType, sessionId: liveSessionId, acceptedResumeSourceSessionId,
     lifecycleGeneration: 'generation-a', terminalInstanceId: 'terminal-instance', launchId: 'launch-a',
     ...liveTarget };
@@ -43,8 +43,10 @@ async function harness({ toolType = 'codex', status = 'active', sessionId = 'A',
   const draft = { text: 'original authoring text', untouched: true };
   const runtime = {
     toolType, label: toolType, readyEvent: toolType + ':ready',
+    hasPendingForkLaunch: () => pendingFork,
     getPresence: async () => {
       reads++;
+      if (pendingFork && reads > 1) { phase = 'active'; current = { ...current, sessionId: 'fork-child' }; }
       if (joinStarting && reads > 1) {
         phase = 'busy';
         current = { ...current, sessionId: 'B', acceptedResumeSourceSessionId: 'A',
@@ -194,6 +196,14 @@ test('fresh launch and hidden unchanged composer remain supported', async () => 
   const hidden = await harness({ hidden: true });
   assert.equal((await hidden.send()).success, true);
   assert.equal(hidden.sendOptions[0].expectedTarget.sessionId, 'A');
+});
+
+test('first pending-Fork Send adopts the same physical target only after its child is ready', async () => {
+  const h = await harness({ status: 'inactive', sessionId: null, liveSessionId: null, pendingFork: true });
+  assert.equal((await h.send()).success, true);
+  assert.equal(h.events.some(event => event[0] === 'resume' || event[0] === 'startFresh'), false);
+  assert.equal(h.events.filter(event => event[0] === 'paste').length, 1);
+  assert.equal(h.sendOptions[0].expectedTarget.sessionId, 'fork-child');
 });
 
 test('unresolved public writer identity reaches the main admission without a false startup refusal', async () => {

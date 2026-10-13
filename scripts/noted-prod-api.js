@@ -58,6 +58,46 @@ function findProdServer({ forcePort = null } = {}) {
   return candidates[0] || null;
 }
 
+// Installation may quit the app. Failure to read discovery/ps is not proof
+// that it is absent. Keep the legacy nullable reader for non-destructive
+// callers; the observed installer uses this explicit three-state result.
+function inspectProdServer({ forcePort = null, fileSystem = fs, discoveryDir = DISCOVERY_DIR,
+  processSnapshot = () => execSync('ps -axo pid=,command=', { encoding: 'utf8', timeout: 1500 }) } = {}) {
+  let files, snapshot;
+  try {
+    files = fileSystem.readdirSync(discoveryDir).filter(name => /^web-server-\d+\.json$/.test(name));
+  } catch (error) {
+    return { status: 'unknown', server: null, reason: 'discovery_read_failed' };
+  }
+  try { snapshot = processSnapshot(); }
+  catch { return { status: 'unknown', server: null, reason: 'process_snapshot_failed' }; }
+  const commands = new Map();
+  for (const line of String(snapshot).split('\n')) {
+    const match = line.trim().match(/^(\d+)\s+(.+)$/);
+    if (match) commands.set(Number(match[1]), match[2]);
+  }
+  if (!commands.size) return { status: 'unknown', server: null, reason: 'empty_process_snapshot' };
+  const mainMarker = PROD_APP_MARKER + '/Contents/MacOS/Noted Terminal';
+  const prodPids = [...commands].filter(([, command]) => (command === mainMarker || command.startsWith(mainMarker + ' '))
+    && !command.includes(' --type=') && !command.includes('mcp-hub.js')).map(([pid]) => pid);
+  if (!prodPids.length) return { status: 'absent', server: null };
+  const candidates = [];
+  for (const file of files) {
+    const pid = Number(file.match(/\d+/)[0]);
+    if (!prodPids.includes(pid)) continue;
+    let record;
+    try { record = JSON.parse(fileSystem.readFileSync(path.join(discoveryDir, file), 'utf8')); }
+    catch { continue; }
+    if (Number(record?.pid) !== pid || !Number.isInteger(Number(record?.port))
+      || Number(record.port) <= 0 || Number(record.port) > 65535) continue;
+    if (forcePort && Number(record.port) !== Number(forcePort)) continue;
+    candidates.push({ port: Number(record.port), pid, updatedAt: Number(record.updatedAt) || 0, cmd: commands.get(pid) });
+  }
+  candidates.sort((a, b) => b.updatedAt - a.updatedAt);
+  return candidates.length ? { status: 'found', server: candidates[0] }
+    : { status: 'unknown', server: null, reason: forcePort ? 'forced_port_not_live_prod' : 'live_prod_discovery_unavailable' };
+}
+
 function requestJson({
   port,
   token,
@@ -143,6 +183,7 @@ module.exports = {
   DISCOVERY_DIR,
   TOKEN_PATH,
   findProdServer,
+  inspectProdServer,
   readToken,
   requestJson,
   sleep,

@@ -15,6 +15,8 @@ const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { resolveOrchestrationSourceNotificationSendOptions, buildDelegationResultTarget } = require('./orchestration-request-plan');
 const { findUniqueLegacySourceFollowupProof } = require('./orchestration-source-reconcile');
 const { runOrchestrationCompletionFlow } = require('./orchestration-completion-flow');
+const { isResponseObservation } = require('./orchestration-response-observation');
+const { agentPromptAuditMatchesHash } = require('./agent-prompt-audit-identity');
 
 // Execute the real web functions and durable store. Only the provider reader,
 // watcher transport and notification transport are fake; no app/server starts.
@@ -22,7 +24,7 @@ const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const parsed = ts.createSourceFile('web-server.js', source, ts.ScriptTarget.Latest, true);
 const functions = ['probeOrchestrationResult', 'reconcileOrchestrationRun',
   'finalizeSettledOrchestration', 'finalizeSettledOrchestrations',
-  'finalizeClosedTargetResultProof', 'sendOrchestrationCompletionNotification'];
+  'finalizeClosedTargetResultProof', 'sendOrchestrationCompletionNotification', 'orchestrationSourceReceiptProof'];
 const declarations = functions.map(name => {
   const node = parsed.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);
   assert.ok(node, name);
@@ -69,7 +71,8 @@ async function fixture(t, { read, busy = true, run = {}, sourceInfo, sourceProje
   const requests = [], effects = [], notifications = [];
   const context = vm.createContext({ ...runs, ...proof, ...receipts,
     AGENT_SEND_RECEIPT_STATES: receipts.RECEIPT_STATES,
-    runOrchestrationCompletionFlow, promptFingerprint, promptAuditFingerprint,
+    runOrchestrationCompletionFlow, promptFingerprint, promptAuditFingerprint, isResponseObservation,
+    agentSendReceiptStore: null, agentSendReceiptStartupReady: Promise.resolve({ ready: true }), agentPromptAuditMatchesHash,
     resolveOrchestrationSourceNotificationSendOptions,
     console: { log() {}, warn() {} },
     getOrchestrationRunStore: () => store,
@@ -94,6 +97,7 @@ async function fixture(t, { read, busy = true, run = {}, sourceInfo, sourceProje
     scheduleOrchestrationPolicyTimer: async () => {},
     findOrchestrationTabDescriptor: () => null,
     findUniqueLegacySourceFollowupProof,
+    listExecutionNamespaces: () => sourceProjects,
     require: name => {
       assert.equal(name, './project-manager');
       return { db: { getAllProjects: () => sourceProjects } };
@@ -101,6 +105,7 @@ async function fixture(t, { read, busy = true, run = {}, sourceInfo, sourceProje
     shortId: value => String(value || '').slice(0, 12),
     orchestrationNotificationInflight: new Set(),
     orchestrationNotificationText: current => `result ${current.runId} ${current.status}`,
+    prepareOrchestrationCompletionContent: async () => null,
     orchestrationPresentationSnapshot: () => null,
     tabWorkContext: null,
     armOrchestrationSourceProof: async () => ({ success: true }),
@@ -610,6 +615,11 @@ async function getResult(h) {
     checkAuth: () => true, decId: decodeURIComponent,
     withOrchestrationUrls: current => current,
     buildDelegationResultTarget,
+    handleDictationClipboardHttp: async () => false,
+    readBody: async () => { throw new Error('GET fixture must not read a body'); },
+    workflowOrganizationHttp: async () => false,
+    handleSystemPromptApi: async () => false,
+    systemPromptService: null,
     sendJson: (res, status, body) => { res.status = status; res.body = body; },
   });
   vm.runInContext(handler.getText(parsed), h.context);

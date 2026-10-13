@@ -1,4 +1,5 @@
 'use strict';
+const { hasPendingAgentGoalWork } = require('../shared/agent-work-completion.cjs');
 
 const { createOrchestrationProofCoordinator } = require('./orchestration-proof-coordinator');
 const { isOrchestrationCompletionBlocking, isSourceNotificationBlocked } = require('../shared/orchestration-activity.cjs');
@@ -103,10 +104,11 @@ function createResponseObservationService({ store, readState, readResponse, evid
       const ownTurnStillBusy = currentTurnOnly && state.busy === true
         && executionContextsMatch(observedExecution, liveExecution)
         && observedExecution.generation === liveExecution.generation;
-      if (ownTurnStillBusy || (!subject && !currentTurnOnly && (state.busy === true || backgroundBusy || children.length))) {
+      if (ownTurnStillBusy || (!subject && !currentTurnOnly && (state.busy === true || backgroundBusy || children.length || hasPendingAgentGoalWork(state)))) {
         await coordinator.release(runId, 'waiting-lifecycle');
         return wait(run, children, !state.busy && children.some(child => child.status === 'waiting_recovery' || isSourceNotificationBlocked(child))
-          ? 'child-attention' : state.busy ? 'target-busy' : 'target-child-work');
+          ? 'child-attention' : state.busy ? 'target-busy'
+            : hasPendingAgentGoalWork(state) ? 'target-goal-' + (state.goalWork.phase || 'pending') : 'target-child-work');
       }
       const watched = await coordinator.arm({ runId, toolType: target.toolType, sessionId: target.sessionId,
         cwd: run.targetCwd || run.targetProjectPath });
@@ -131,7 +133,7 @@ function createResponseObservationService({ store, readState, readResponse, evid
         if (current.sessionId !== target.sessionId || current.toolType !== target.toolType) {
           return settle(run, null, { code: 'response_target_changed', error: 'Сессия изменилась во время чтения ответа' });
         }
-        if (current.busy || (run.waitForDescendants !== false && Number(current.backgroundWorkCount) > 0)
+        if (current.busy || hasPendingAgentGoalWork(current) || (run.waitForDescendants !== false && Number(current.backgroundWorkCount) > 0)
           || current.revision !== state.revision || childRevision(children) !== childRevision(currentChildren)) {
           trailing.add(runId);
           return wait(run, currentChildren, 'target-changed-during-read');
@@ -233,7 +235,7 @@ function createResponseObservationService({ store, readState, readResponse, evid
     for (const run of runs) if (isResponseObservation(run) && !terminal(run)) await arm(run);
   }
 
-  function recordCompletion({ tabId, subject, result, backgroundWorkCount } = {}) {
+  function recordCompletion({ tabId, subject, result, backgroundWorkCount, goalWork } = {}) {
     if (stopped || !tabId || !subject || result?.sourceVerified !== true) return;
     const verdict = classifyOrchestrationResultProbe(result, { authoritativeCompletion: true });
     if (verdict.kind === 'pending') return;
@@ -244,6 +246,13 @@ function createResponseObservationService({ store, readState, readResponse, evid
       if (run.waitForDescendants === false) {
         if (!run.observationCurrentTurnSubject
           || responseObservationSubjectKey(run.observationCurrentTurnSubject) !== responseObservationSubjectKey(subject)) continue;
+      } else if (subject.toolType === 'codex' && verdict.kind !== 'terminal-failure'
+        && (goalWork?.version !== 1 || goalWork.pending !== false)) {
+        // An exact turn final is still valid evidence for explicit current-turn
+        // reads. Default whole-work selection needs the Main Goal proof too;
+        // without it, use the existing guarded readState/pass, not this freeze.
+        void reconcile(run.runId, 'goal-proof-required');
+        continue;
       } else if (verdict.kind !== 'terminal-failure'
         && (backgroundWorkCount !== 0 || childRuns(runs, tabId).length)) continue;
       try {

@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { flushSync } from 'react-dom'
-import { MessageSquareQuote } from 'lucide-react'
+import { MessageSquareQuote, Columns2 } from 'lucide-react'
 import {
   applySidebarLayout,
   DEFAULT_FILE_ICON_PROFILE,
   emptySidebarLayout,
   FileExplorerContextMenu,
+  FileMenuItem,
   FileOutlineExplorer,
   flattenTree,
   hasSidebarLayoutEntries,
@@ -362,6 +363,7 @@ function Sidebar({
   onChangeDirectory,
   directoryChangeState = 'idle',
   onFileSelect,
+  onFileWindowAction,
   selectedPaths = [],
   setSelectedPaths,
   setLastSelectedPath,
@@ -1920,6 +1922,9 @@ function Sidebar({
             revealInFinder: node => window.require('electron').shell.showItemInFolder(node.id),
           }}
           extensions={{
+            afterIdentity: ({node,close}) => !node.isDirectory && onFileWindowAction ? <>
+              <FileMenuItem icon={<Columns2 size={13}/>} onSelect={()=>{onFileWindowAction(node.id,'beside');close();}}>Open beside</FileMenuItem>
+            </> : null,
             afterCopy: ({ node, close, menuRef }) => (
               !node.isDirectory && onLinkFile ? (
                 <RunAfterTabPicker

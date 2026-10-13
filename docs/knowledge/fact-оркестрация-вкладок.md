@@ -43,11 +43,28 @@ app capability — fact-terminal-mcp.md::Адресный Повтор Audit К�
 
 Контекст target-turn закрепляется на точной границе принятого prompt, а не на ближайшем `busy` той же вкладки. У Claude `UserPromptSubmit` создаёт identity хода раньше, чем транспорт успевает записать `deliveryAcceptedAt`; такой ранний `busy` сам по себе ничего не привязывает. Когда post-Enter audit доказывает конкретный handoff/UUID, он атомарно сохраняет контекст именно того же события. Provider и session audit должны совпасть с контекстом; противоречие оставляет контекст непривязанным и попадает в diagnostic. Повтор того же proof может безопасно дополнить ранее недоступный контекст, но не заменить уже сохранённый другим turn. У Codex `user_message` и `task_started` могут появиться в любом порядке: ранний audit дожидается структурного start-события, а при раннем `task_started` выбранная exact `user_message` запись сразу получает уже активный контекст того же session/turn. При неоднозначности связь не угадывается. Благодаря этому B→C внутри A→B наследует родителя даже при порядке `busy → delivery acceptance`, а независимый B→C по-прежнему остаётся root.
 
+Физическое поколение Codex — отдельная координата, не `executionContext.generation`
+счётчика turn. Если canonical target audit опередил transport ACK, пустой
+`targetLifecycleGeneration` дополняется в том же confirmation из сохранённого
+Enter lease exact `orchestration-target:<run>` и принятого audit той же attempt/
+session/turn. Не разрешать восстановление по generic текущей вкладке. Known
+generation/attempt не перезаписываются; поздний original audit после Resume не
+меняет новый turn. `targetLifecycleProof` — сохранённая provenance этой привязки,
+не readiness и не новая квитанция доставки. Без exact lease прежний unknown
+guard остаётся; это важно для capacity recovery до следующего Enter.
+
 Для Claude точный turn становится доступен audit только потому, что repo-owned `UserPromptSubmit` hook переносит принятый prompt в локальный socket-envelope. Полный текст не логируется и не сохраняется как новый source of truth: он сравнивается с in-memory hash+length уже отправленных audit. Связь разрешена только при одном совпадении; два одинаковых pending prompt оставляются непривязанными с diagnostic, тогда как durable JSONL-записи продолжают подтверждаться своим отдельным oldest-first алгоритмом. Это защищает causal parent от cross-bind без ослабления доставки одинаковых сообщений.
 
 `202 Accepted` означает принятие run приложением, но не готовность ответа и не обязательно физическую отправку prompt: `queued` может ещё ждать занятую target-вкладку. Независимые задачи допускаются в освободившийся target отдельно, а не смешиваются в native queue одного provider-turn. Состояние дальше приходит как `orchestration-update` через SSE; статус и результат адресуются стабильным `runId`. Клиент не держит исходный POST открытым и не опрашивает transcript. Новый completion обычно уже содержит полный ответ; `get_delegation_result`/HTTP GET нужны при явном reference, старом уведомлении или адресном восстановлении.
 
 Большой ответ не дублируется в JSON orchestration-store. Store хранит точный UUID принятого target-prompt, размер и fingerprint, а результат извлекается из канонического Claude/Codex transcript. UUID является первичным proof: два одинаковых текста обязаны вернуть ответы своих разных ходов. Hash используется только для старых run без UUID, внутри сохранённых временных границ; несколько совпадений означают неоднозначность и не разрешают результат. Для новой содержательной доставки отдельная SQLite `orchestration_completion_content` фиксирует immutable notification snapshot до Send: retry не перечитывает изменившийся ответ. Это сохранённые bytes доставки, не второй lifecycle-run или замена transcript proof.
+
+Шрам10.10/v10 iOS: после app restart прежний target turn получил `turn_aborted`.
+Родитель передал «продолжай» через `send_message`; статусный reply пришёл, затем
+ребёнок закончил новый ход. Старый run всё ещё описывал прерванную execution,
+поэтому новый final не стал его completion. Одинаковый SID и текст продолжения
+не разрешают такую перепривязку. Для уже продолженной работы подходит отдельное
+`wait_for_tab_response`; это чтение нового результата, не повтор старого задания.
 
 ## Наблюдение уже выполняющейся работы
 
@@ -99,6 +116,21 @@ Pause/Resume несуществующий terminal runtime. Имя в live track
 History run является кнопкой: тот же `orchestration:open-research-job` открывает
 сохранённый SC Research detail по полному jobId, не браузер и не новый запрос.
 Успех ждёт rendered ACK; repeated click coalesces, ошибка видна в прежних деталях.
+
+В Research-строке History справа от SC-стрелки есть отдельная browser SVG,
+затем прежние Copy/chevron. Новый `orchestration:open-research-browser` связывает
+run с сохранённым jobId и вызывает SC `/research-open-browser({jobId,requestId})`.
+Нужна `research-capabilities.browserNavigation.version=1` с exactJob/confirmedTab;
+старый SC не получает blind `/open-url` fallback. SC выбирает сначала same-job
+system tab с текущим URL proof, потом другой system/обычный tab того же conversation.
+`pendingUrl` учитывается как текущий адрес назначения, stale tabId/URL-prefix не
+доказывают соответствие. При потере markers у startup проверяется exact job в
+`window.name`; это только чтение, без инъекции watcher/Send. Результат остаётся
+на прежнем run: переход не создаёт research/import, не подтверждает delivery/final.
+Закрытый сохранённый conversation открывается чистым URL; temporary без URL
+не превращается в новый чат. Отдельные navigation hints удерживают ещё неизвестный
+created tab, не присваивая ему research execution. Native/live приёмка и установка
+не следуют из component/HTTP/SQLite проверок.
 
 Публичный вход — `POST /api/external-research/orchestrations`, typed wrappers —
 `start_external_research`, `continue_external_research` и
@@ -221,6 +253,24 @@ failure, а не ждёт recovery deadline с неподвижным индик
 Fresh Claude требует отдельной причинной границы: до первого prompt у вкладки ещё нет JSONL-пути и `sessionId`, хотя процесс и composer уже готовы. Непосредственно перед Enter main доказывает Claude PID под точным PTY, чтобы `UserPromptSubmit` привязал появившуюся запись к staged send. Только для этого unresolved-transcript случая допустимо сравнение timestamp записи с моментом отправки; ошибка чтения уже известного JSONL не превращается в такое доказательство. Иначе одно физическое уведомление отображается в History дважды: как временная строка handoff и как durable user-запись.
 
 ## Завершение и уведомление источника
+
+History/Timeline SOURCE компактно показывают доказанный External Research итог
+через display-only projection. History11.10 использует прозрачные tool-строки:
+однострочный Markdown excerpt под каждым ответом, Research/saved model без
+технического имени job в шапке, whole-header toggle, ограниченное тело с тёмной
+нейтральной подложкой и отдельную SC-стрелку. Timeline сохраняет свой popup.
+Это не новый формат notification/result и не преобразование сохранённого JSON.
+Все transport/Copy/provenance/UUID/hash остаются прежними; reader не вызывается
+на каждую строку. Строго соседние Research completion/failure от двух штук имеют
+общую правую History-шапку с левой rail и видимым числом typed failures, но остаются
+разными уведомлениями/records и Timeline-точками. Отрицательный verdict внутри
+JSON не является delivery failure; отправленный request не увеличивает этот счёт.
+Модель берётся из сохранённых options exact run через прежний локальный каталог;
+дополнительный metadata read разрешается новому непокрытому runId, без result GET.
+Показ prewarmed History использует текущий presentation channel, не начальный
+React seed видимости. Это renderer admission, не изменение run/delivery authority.
+Подробности — `fact-история-как-основная-поверхность::Компактный
+ответ External Research`.
 
 Completion входит в общий Main FIFO с stable desktop-history operationKey уже
 до renderer. Шрам04.10: без key первый memory-registry waiter ждал renderer,
@@ -405,6 +455,42 @@ serialization-lane и уведомляет source. Draft не очищается
 
 Во время grace-периода ручного interrupt пользователь может снять таймер и ждать следующего сообщения без срока, вручную восстановить выбранную связь, передать ошибку родителю сейчас или закрыть связь без сообщения. Ручное восстановление остаётся запасным путём для неоднозначного случая с несколькими ожидающими run; обычный единственный run продолжится автоматически. Для закрытого/ошибочного target восстановление всегда явное: это либо действие Retry/Resume, либо новый адресный `send_prompt`/`delegate_to_session`, но не фоновое наблюдение. Закрытие вкладки проходит через общий `closeTab` и сообщает store сразу, поэтому все связанные активные run получают исход вместо вечного `queued`.
 
+`Продолжить запрос` в hover-карточке — отдельное app-owned действие `continue`,
+а не прежний Retry исходного текста и не обычный ControlBar Resume. Оно проверяет
+source/target history и исходный/последний выбранный prompt, строго сохраняет
+continuationIntent и отдельный H `orchestration-continue:<runId>:<ordinal>` до FIFO.
+Общий sender возобновляет остановленный target и отправляет ровно один `continue`;
+повторное нажатие присоединяется к операции. Каноническая квитанция именно этого H
+с exact new execution context привязывает result-reader к новому UUID/turn,
+не переписывая original request fingerprint/hash/адреса. Generic busy старого либо
+чужого хода не потребляет continuation. Пока proof не получен, карточка жёлтая,
+а не фиктивно running; после binding действуют обычные inherited/result gates.
+
+Проверки повторяются в preparation общего FIFO, в том числе после восстановления
+сохранённой очереди; неизменного SID недостаточно при другом последнем поручении.
+Goal/background work, unknown process lookup, draft/readiness и Main physical-owner
+guards не обходятся. Ready original result восстанавливает outcome без нового
+input, только после свежих ownership/work checks. Claude original reader использует
+существующий verified transcript callback, не объявляет legacy stat source proof.
+Пауза остаётся link-only: поздняя Continue-квитанция хранит delivery proof, но не
+снимает Pause; Resume не принимает turn, начавшийся раньше его собственной границы.
+
+`new-request` — явное новое поручение в текущих историях: копируется сохранённый
+original snapshot text, получается новый стабильный runId и обычный queued intent.
+Прежняя связь закрывается без Stop процесса и сохраняется в History. Valid прежний
+causal parent сохраняется при той же source history, другая ветка не получает
+старую связь по одному tabId. Replay созданного replacement восстанавливает его
+dispatcher, не создаёт второй run. При удалённом адресате/несохранённом тексте
+приложение не угадывает получателя: новый запрос создаётся явно из нужной вкладки.
+External research и response-observation не получают physical Continue.
+
+Отмена из карточки и `/api/orchestrations/:runId/cancel` сначала сохраняет exact
+continuation cancellation у прежнего FIFO/receipt owner, затем closure до ACK.
+Это не отрицательная квитанция прошлой доставки. Canonical audit может уточнить
+исторический Enter, но cancelled run не оживает. Подтверждённый receipt удерживается
+pin до strict projection; после restart неизвестный Enter re-audit/reconcile,
+не новый prompt. Для одной target-вкладки competing accepted request не обходится.
+
 Pause относится к связи run, а не к процессу target. Исполнитель продолжает жить, пользователь может отправлять ему сообщения, но ходы, начатые до Resume, не возвращаются source и не создают новых причинных потомков приостановленного run. Resume не перечитывает «последний доступный ответ»: он сохраняет новую временную границу и принимает только точный provider/session/turn, реально начавшийся после неё. Запоздалый audit исходного prompt и завершение хода из периода паузы эту границу не обходят. Пауза переживает restart, остаётся жёлтым completion-блокером для Run After и Build Install, но не включает фиолетовый inherited shimmer. После Resume до точного старта нового хода сохраняется та же жёлтая блокировка без фиолетовой анимации; фиолетовая активность возвращается только по этому старту. После начала source-handoff ставить связь на паузу уже поздно; остаются действия доставки или отвязки.
 
 Deadline и настройки хранятся вместе с run-store, а main ждёт ближайшую дату одним scheduler'ом. Renderer только показывает обратный отсчёт. По истечении recovery deadline ошибка становится конечной и доставляется source; после успешного одноразового run отдельный deadline может остановить созданный orchestration target, но только после `resultComplete=true`. Старое намерение auto-stop навсегда теряет право на действие, если после завершения его run тот же target принял или начал более новую работу — даже когда новая работа уже успела завершиться к deadline. Проверять только текущие active run недостаточно: такой guard останавливал вкладку под уже выполненным следующим заданием. Вкладка не удаляется, а переиспользованный пользовательский target автоматически не останавливается.
@@ -437,7 +523,33 @@ orchestration/Codex usage-limit suites сохранены. Это source/integra
 
 ## Persistence и восстановление
 
-Run-метаданные, точный target-prompt UUID, контекст исполнения, дерево зависимостей, recovery/auto-stop deadlines и настройки пишутся атомарно вне renderer-state и переживают Electron restart. При старте tracked-записи сверяются с transcript и текущим состоянием вкладки: exact UUID восстанавливает `running`, `waiting_descendants` или результат; bounded hash-fallback разрешён только для legacy-записи без UUID. `completed + resultComplete=false` остаётся tracked, заново вооружает доказательство transcript и не разрешает auto-stop. Для уже доставленного completion-handoff отдельно ищется exact сохранённый prompt hash в transcript source-вкладки. Совпадение завершает handoff; отсутствие совпадения переводит старое `sent/queued` в `unconfirmed`, сохраняет возможность позднего exact proof, но убирает ложный spinner и требует Retry либо явного закрытия. Renderer нужен для отображения, countdown и переходов, но не является владельцем lifecycle. После authoritative target completion UI немедленно меняет running-spinner на отдельную статичную фазу проверки результата; жёлтый timer относится только к реальному recovery.
+Run-метаданные, точный target-prompt UUID, контекст исполнения, дерево зависимостей, recovery/auto-stop deadlines и настройки пишутся атомарно вне renderer-state и переживают Electron restart. При старте tracked-записи сверяются с transcript и текущим состоянием вкладки: exact UUID восстанавливает `running`, `waiting_descendants` или результат; bounded hash-fallback разрешён только для legacy-записи без UUID. `completed + resultComplete=false` остаётся tracked, заново вооружает доказательство transcript и не разрешает auto-stop. Для source completion сначала проверяется точная durable History-квитанция того же handoff; при недостаточном proof используется прежний exact сохранённый prompt hash в transcript source-вкладки. Совпадение завершает handoff; отсутствие обоих доказательств переводит старое `sent/queued` в `unconfirmed`, сохраняет возможность позднего exact proof, но убирает ложный spinner и требует Retry либо явного закрытия. Renderer нужен для отображения, countdown и переходов, но не является владельцем lifecycle. После authoritative target completion UI немедленно меняет running-spinner на отдельную статичную фазу проверки результата; жёлтый timer относится только к реальному recovery.
+
+CompletionContentStore замораживает неизменный пакет до доставки; inline-пакет
+содержит полный ответ в пределах прежнего лимита, oversized reference не становится
+вторым хранилищем полного provider/SC результата. До Main FIFO строго сохраняются
+handoff, hashes и source session. Ошибка этого checkpoint не допускает ввода.
+Квитанция `history:<sourceTabId>:orchestration-complete:<runId>` удерживается pin
+`orchestration-source-followup` до durable confirmation. Atomic canonical audit
+дополнительно сохраняет `receipt.auditExecutionContext` той же row/session/attempt
+и только явный boolean `auditQueuedAtSubmit`. Legacy absence остаётся unknown;
+повторный audit лишь дополняет неизвестные поля, не заменяет конфликтующий context.
+
+Startup сначала соединяет canonical receipt с run, без нового Send и без
+вооружения transcript reader при достаточном proof. Проверяются operation/attempt,
+source tab/handoff, provider/session, canonical user address и request-to-provider
+hash proof; `historyOnly`, transport-only и неизвестная доставка не подходят.
+Причинный parent по-прежнему требует exact execution context и прежние
+same-active/same-settled guards. Подтверждение, включая повтор после write failure,
+дожидается strict persistence до освобождения pin; startup убирает лишь pins
+своего owner для уже подтверждённых, suppressed либо удалённых run. Cancellation
+остаётся отдельной осью: поздний receipt уточняет прошлую доставку, но не оживляет
+отменённый source handoff. Отсутствие proof не разрешает blind resend.
+
+Source/private проверки включают реальную SQLite/RunStore, actual Main/web функции
+и SIGKILL отдельного тестового writer после canonical commit до run projection.
+Provider/PTY/SC и watcher transport в этих проверках контролируемые; это не
+принудительный restart работающего платного research и не installed acceptance.
 
 История ограничена по числу и возрасту завершённых записей; run с незавершённым result-proof, source-handoff, recovery или ошибкой доставки не удаляется этим лимитом, даже если target уже имеет terminal-status. Idempotent client-supplied `runId` защищает повтор POST после сетевой ошибки от создания второго исполнителя.
 
@@ -455,8 +567,8 @@ Live tracker сообщений и run находится в отдельном 
 pinned queue и выступающие edge-controls в своей pane. На узкой pane список
 доступен через постоянную кнопку History. Она объединяет run и question-thread
 по времени; детали сохраняют native pause/retry/detach действия. Сообщения не
-превращаются в run ради общего списка; их X означает только per-tab UI hide,
-не описанные ниже lifecycle-действия native run.
+превращаются в run ради общего списка; их X отменяет будущую доставку и ожидание
+через message owner, не Stop адресата и не удаление сохранённой пары.
 Одна кнопка со статусами Send/Reply открывает боковую пару вопрос/ответ,
 не закрывая и не прокручивая History. Escape сначала закрывает эту дочернюю
 поверхность; native run по-прежнему раскрывается внутри списка.
@@ -464,15 +576,27 @@ pinned queue и выступающие edge-controls в своей pane. На у
 slot и крестик; Send/Reply является одним визуально вложенным рядом, не другой
 геометрией header. Общий scrollbar3px принадлежит dock, внутреннего второго
 скролла run нет. Такое вложение не создаёт причинную parent/child зависимость.
-Успех обоих видов скрывается через4секунды; message success требует sent обеих
-сторон. Timer переходит к следующей границе даже без нового события. Ошибка,
-recovery и незавершённый proof не скрываются этим сроком. History и открытый
-preview сохраняются; детали message-контракта в `fact-tab-messages.md::UI и инструкции`.
+По уточнению Fedor12.10 compact dock слева от History показывает только ожидания,
+работу и требующее действия внимание, без зелёных карточек. Текущий зелёный
+presentation скрывается сразу: и success, и `sent`/передача результата с зелёным
+статусом, даже если backend handoff ещё ожидает своего proof. Runtime, receipts,
+inherited/completion gates и доставка при этом не меняются. Message success требует
+sent обеих сторон; ожидание ответа, ошибка, recovery и незавершённый result-proof
+остаются. Прежняя4секундная задержка и success-expiry timer удалены. History,
+его счётчик и открытый preview сохраняются; детали message-контракта в
+`fact-tab-messages.md::UI и инструкции`.
 
 Начальное чтение списка подписывается после установки event-listener, а поздний
 list сливается с уже принятыми events по runId/updatedAt; равный timestamp
 сохраняет live update. Иначе completed event мог снова стать active после
-возврата старой hydration. `sending` без target execution context показывается
+возврата старой hydration. У source completion время audit/user-record и свежесть
+run — разные оси: `sourceFollowupStartedAt` сохраняет точное историческое время
+записи, но `updatedAt` подтверждения и изменённых causal parents публикуется по
+времени применения и строго позже прежней версии. Иначе queued snapshot может
+оказаться новее фактически принятого sent и live tracker навсегда останется серым.
+`OrchestrationPublication` различает proofAt/previous/published после strict save;
+source identity/hash/causal execution и lifecycle timestamps не меняются.
+`sending` без target execution context показывается
 статичным таймером «Ожидает доставки», не спиннером выполняющегося агента.
 Run остаётся в ожидании, не скрывается для косметического устранения loader.
 Тот же merge действует в глобальном store: во время hydration сохранены и
@@ -532,13 +656,16 @@ reader находит уже сохранённый presentation sidecar. Alias 
 receipt/разговора; renderer снова получает тот же trusted tag и проверяет полный
 body hash перед скрытием оболочки. Литеральная цитата не становится оркестрацией.
 
-Фиолетовый user-message использует те же правила collapse, что обычный:
+Не-Research фиолетовый user-message использует те же правила collapse, что обычный:
 HistoryCollapsiblePrompt для текста и общий mixed-message toggle для вставок.
 Markdown не обходит порог600/preview400; в закрытом состоянии обычное текстовое
 preview, при раскрытии полный Markdown с верхним и нижним «Свернуть».
 forceExpanded для поиска сохраняет полный ответ без toggles. Это только
 видимая проекция: скрытый хвост остаётся доступен Copy/Rewind. Неподтверждённый
 body hash по-прежнему показывает исходный transport через обычный collapse.
+Для доказанного Research completion/failure действует отдельное компактное JSON/code/
+Markdown-представление выше; оно переиспользует прежний reveal-owner, не порог
+обычного prompt и не формат сохранённого уведомления.
 
 ## Проекция в Timeline
 

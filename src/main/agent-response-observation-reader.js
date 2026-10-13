@@ -125,7 +125,7 @@ function createAgentResponseObservationReader({
   function capture(tabId) {
     const raw = captureState(tabId);
     return { ...raw, revision: JSON.stringify([raw.revision, raw.known, raw.exists, raw.toolType,
-      raw.sessionId, raw.cwd, raw.busy, raw.transitioning, raw.backgroundWorkCount, revision(tabId)]) };
+      raw.sessionId, raw.cwd, raw.busy, raw.transitioning, raw.backgroundWorkCount, raw.goalWork, revision(tabId)]) };
   }
 
   async function getAgentResponseState(tabId) {
@@ -135,6 +135,7 @@ function createAgentResponseObservationReader({
       const base = { known: before.known === true, tabId, toolType: before.toolType || null,
         sessionId: before.sessionId || null, cwd: before.cwd || null, busy: null, revision: before.revision,
         backgroundWorkCount: before.backgroundWorkCount ?? 0, executionContext: null, processStatus: 'unknown' };
+      if (before.goalWork) base.goalWork = before.goalWork;
       if (before.exists === false && base.known) return { ...base, exists: false,
         code: 'tab_not_found', error: before.error || 'Target tab no longer exists' };
       if (before.exists === true) base.exists = true;

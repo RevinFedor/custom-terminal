@@ -159,6 +159,52 @@ test('verified launch card proves the fresh launch settings without accepting pr
   ), null);
 });
 
+const promotionFrame = (selected = 2, title = true) => [
+  ...(title ? ['Meet GPT-6 Luna', 'Our latest Luna is significantly more efficient.'] : []),
+  `${selected === 1 ? '›' : ' '} 1. Try new model`,
+  `${selected === 2 ? '›' : ' '} 2. Use existing model`,
+  'enter/esc confirm · ⌃c quit',
+].join('\n');
+
+for (const selected of [1, 2]) for (const title of [true, false]) {
+  test('current model promotion is manual picker input, never a prompt or automatic migration: ' + selected + '/' + title, () => {
+    const frame = promotionFrame(selected, title);
+    assert.deepEqual(classifyCodexManualEnterFrame(frame), {
+      action: 'picker-control', kind: 'model-promotion', reason: 'model-promotion-picker',
+    });
+    assert.equal(isCodexActivePickerFrame(frame), true);
+    assert.equal(inspectCodexModelMigrationPrompt(frame).canAutoEnter, false);
+    assert.equal(decideCodexModelMigrationAutoEnter({ sameTerminal: true, sameRunSeq: true,
+      sameInputRevision: true, screenAvailable: true, cleanText: frame,
+      expectedSourceModel: 'gpt-5.6-luna', expectedTargetModel: 'gpt-6-luna' }).allowed, false);
+  });
+}
+
+for (const [name, frame] of [
+  ['missing footer', promotionFrame().replace('enter/esc confirm · ⌃c quit', '')],
+  ['missing second action', promotionFrame().replace('› 2. Use existing model', '')],
+  ['no selected action', promotionFrame(0)],
+  ['ambiguous selection', promotionFrame(1).replace('  2. Use existing model', '› 2. Use existing model')],
+  ['newer composer', promotionFrame() + '\n› send this ordinary prompt\ngpt-5.6-luna medium · Full Access'],
+  ['later output', promotionFrame() + '\nThe menu above is an example.'],
+  ['different action', promotionFrame().replace('Use existing model', 'Delete existing model')],
+]) test('model promotion evidence does not claim another surface: ' + name, () => {
+  assert.notEqual(classifyCodexManualEnterFrame(frame).kind, 'model-promotion');
+});
+
+test('a latest promotion menu cannot borrow old migration metadata or change its automatic policy', () => {
+  const old = ['Codex now uses GPT-5.6 Luna in place of GPT-5.4 Mini.',
+    'Switch to GPT-5.6 Luna to continue.', "Choose how you'd like Codex to proceed.",
+    '› 1. Try new model', '  2. Use existing model', 'Use ↑/↓ to move, press enter to confirm'].join('\n');
+  assert.equal(inspectCodexModelMigrationPrompt(old).canAutoEnter, true);
+  const current = old + '\n' + promotionFrame(1);
+  assert.equal(classifyCodexManualEnterFrame(current).kind, 'model-promotion');
+  assert.equal(inspectCodexModelMigrationPrompt(current).visible, false);
+  assert.equal(decideCodexModelMigrationAutoEnter({ sameTerminal: true, sameRunSeq: true,
+    sameInputRevision: true, screenAvailable: true, cleanText: current,
+    expectedSourceModel: 'gpt-5.4-mini', expectedTargetModel: 'gpt-5.6-luna' }).allowed, false);
+});
+
 test('Codex model migration prompt accepts only the selected Try new model action', () => {
   const frame = [
     'Codex now uses GPT-5.6 Luna in place of GPT-5.4 Mini.',

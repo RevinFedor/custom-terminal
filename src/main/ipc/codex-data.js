@@ -252,6 +252,27 @@ async function assertCodexSourceRead(read) {
     throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
   }
 }
+// Final Main admission must also check the actual ticket after synchronous
+// application callbacks; awaiting another stat alone leaves a reentrancy gap.
+function assertCodexSourceReadCurrent(read, resolverBinding = null) {
+  _codexReadFence.assertCurrent(read.ticket);
+  if (!isCodexSourceSnapshotCurrent(read.snapshot)) {
+    throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+  }
+  // A late cold scan can retarget this SID's memo while an older memo hit
+  // awaits access(A). Unchanged A bytes cannot prove the now-current binding.
+  // Only turns admission supplies this optional binding; ordinary source
+  // readers retain their existing physical fence contract and lookup policy.
+  if (resolverBinding) {
+    const sessionsDir = resolverBinding.sessionsDir ?? CODEX_SESSIONS_DIR;
+    const memoKey = resolverBinding.sessionId + ':' + (sessionsDir || '');
+    if (resolverBinding.sessionId !== read.snapshot.sessionId
+      || resolverBinding.filePath !== read.snapshot.filePath
+      || codexSessionFilePathMemo.get(memoKey) !== resolverBinding.filePath) {
+      throw Object.assign(new Error('Codex resolver binding changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+    }
+  }
+}
 const _codexHistoryContextInflight = new Map();
 
 function deleteCodexJsonlCacheEntry(filePath) {
@@ -2923,6 +2944,11 @@ async function findCodexLinkedLiveBoundary(filePath, options = {}) {
 
   const inspectLine = (lineBuffer, byteOffset) => {
     scannedLines += 1;
+    // The legacy predicate searches these exact ASCII JSON tokens. Check the
+    // bytes before UTF8 conversion: tool/message bodies can be many MiB and
+    // have no role in locating a task boundary. Candidate parsing, offsets,
+    // malformed-line tolerance and the final partial-tail boundary stay exact.
+    if (!lineBuffer.includes('"task_started"') || !lineBuffer.includes('"event_msg"')) return null;
     const line = lineBuffer.toString('utf8').trim();
     if (!line.includes('"task_started"') || !line.includes('"event_msg"')) return null;
     let record;
@@ -4315,7 +4341,20 @@ function refreshCodexSubagentCards(cards, sessionId) {
     + '/' + tracked.length + ' session=' + String(sessionId).slice(0, 8));
 }
 
-function createCodexHistoryProjector(sessionId, seed = {}) {
+function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {}) {
+  // Opt-in catalog projection: ownership, row placement and rollback still
+  // belong to this reducer. The sink detaches payloads, never reduces turns.
+  const retainUserText = (text, record) => catalogSink?.retainUserText?.(text, record) ?? text;
+  const userTextsMatch = (left, right) => catalogSink?.userTextsMatch
+    ? catalogSink.userTextsMatch(left, right) : codexUserCarrierTextsMatch(left, right);
+  const retainUserEntry = (entry, record) => catalogSink?.onUserEntry?.(entry, record);
+  const pushProjectedAssistantEntry = (...args) => {
+    const target = args[0], before = target.length;
+    pushAssistantEntry(...args);
+    for (let index = before; index < target.length; index++) {
+      catalogSink?.onAssistantEntry?.(target[index], args[2]);
+    }
+  };
   const entries = seed.entries ?? [];
   const questionDefinitions = seed.questionDefinitions ?? new Map();
   const pendingResponseUsers = seed.pendingResponseUsers ?? [];
@@ -4427,10 +4466,28 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     if (entry) entries.push(entry);
   };
 
+  // Both feed and the optional async catalog preparation use this exact
+  // classification. Only a carrier which actually compares aliases may
+  // request the corresponding old texts from the sink.
+  const userCarrierKind = (record, text) => {
+    if (text.includes('<subagent_notification>')) return 'subagent';
+    if (isCodexTurnAbortedUserText(text)) return 'interrupted';
+    if ((record.type === 'response_item' && !text) || isCodexEnvironmentContextUserText(text)) return 'ignored';
+    if (isCodexProjectInstructionsUserText(text)) return 'instructions';
+    return 'user';
+  };
+  const userMatchCandidates = (record, text) => {
+    const kind = userCarrierKind(record, text);
+    if (kind === 'instructions') return pendingProjectInstructions.map(item => item.text);
+    if (kind !== 'user') return [];
+    return record.type === 'event_msg' ? pendingResponseUsers.map(item => item.text)
+      : currentTurnCanonicalUserText ? [currentTurnCanonicalUserText] : [];
+  };
+
   const queueProjectInstructions = (record, text) => {
     const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
     const existingIndex = pendingProjectInstructions.findIndex((candidate) => (
-      codexUserCarrierTextsMatch(candidate.text, text)
+      userTextsMatch(candidate.text, text)
     ));
     if (existingIndex >= 0) {
       // Prefer event_msg when a protocol generation emits both carriers. The
@@ -4438,7 +4495,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       // structural coordinate.
       if (record?.type === 'event_msg') {
         const pending = pendingProjectInstructions[existingIndex];
-        pending.record = record;
+        pending.record = catalogSink ? null : record;
         pending.entry.uuid = stableUuidForRecord(sessionId, record, 'codex-user');
         promoteStableSourceIdentity(
           pending.entry,
@@ -4462,7 +4519,8 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       serviceCarrier: 'project-instructions',
     };
     entries.push(entry);
-    pendingProjectInstructions.push({ record, text, entry });
+    retainUserEntry(entry, record);
+    pendingProjectInstructions.push({ record: catalogSink ? null : record, text: retainUserText(text, record), entry });
   };
 
   const flushProjectInstructions = (turnIndex) => {
@@ -4474,7 +4532,9 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     consumedRecords += 1;
     const payload = record.payload || {};
     const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
-    rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
+    if (catalogSink?.questionMetadata !== false) {
+      rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
+    }
 
     if (record.type === 'session_meta') {
       if (!sessionCwd) sessionCwd = payload.cwd || '';
@@ -4551,22 +4611,23 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       } else if (payload.type === 'user_message') {
         const userText = codexUserMessagePresentationText(record);
         const goalContinuation = isCodexGoalContinuationUserText(userText);
+        const carrierKind = userCarrierKind(record, userText);
         // Third subagent completion path: a fire-and-forget child announces
         // its outcome via <subagent_notification> INSIDE a user message —
         // no wait_agent output, no agent_message FINAL_ANSWER ever arrives
         // (E2E-proven zombie: card climbed 4m+ as running). Feed the tracker
         // and keep the service record out of the transcript, like Claude's
         // <task-notification> filter.
-        if (userText.includes('<subagent_notification>')) {
+        if (carrierKind === 'subagent') {
           subagents.onSubagentNotification(userText, recordTimestamp(record));
           return;
         }
-        if (isCodexTurnAbortedUserText(userText)) {
+        if (carrierKind === 'interrupted') {
           pushInterruptedNotice(record);
           return;
         }
-        if (isCodexEnvironmentContextUserText(userText)) return;
-        if (isCodexProjectInstructionsUserText(userText)) {
+        if (carrierKind === 'ignored') return;
+        if (carrierKind === 'instructions') {
           queueProjectInstructions(record, userText);
           return;
         }
@@ -4575,7 +4636,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
         // Codex service carriers above do not create transcript boundaries.
         pendingCompactCompanions = 0;
         const pendingIndex = pendingResponseUsers.findIndex((candidate) => (
-          codexUserCarrierTextsMatch(candidate.text, userText)
+          userTextsMatch(candidate.text, userText)
         ));
         if (pendingIndex >= 0) {
           const pending = pendingResponseUsers.splice(pendingIndex, 1)[0];
@@ -4623,8 +4684,9 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
           entries.push(entry);
           currentTurnCanonicalUserEntry = entry;
         }
-        currentTurnCanonicalUserText = userText;
-        attachCodexQuestionReplyProof(currentTurnCanonicalUserEntry, questionDefinitions, physicalSessionId);
+        currentTurnCanonicalUserText = retainUserText(userText, record);
+        retainUserEntry(currentTurnCanonicalUserEntry, record);
+        if (catalogSink?.questionMetadata !== false) attachCodexQuestionReplyProof(currentTurnCanonicalUserEntry, questionDefinitions, physicalSessionId);
       } else if (payload.type === 'thread_rolled_back') {
         currentInterruptedNotice = null;
         pendingProjectInstructions.length = 0;
@@ -4640,7 +4702,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
           if (owner && removedTurns.has(owner.turnIndex)) discardedUserOwners.add(owner);
         }
         cachedUserOwner = null;
-        logCodexRollback('full-history', sessionId, record, rollback);
+        if (!catalogSink) logCodexRollback('full-history', sessionId, record, rollback);
         // The last rendered setting may have belonged to the removed turn.
         // Do not attach a later provider observation to that detached row.
         lastModelEntry = null;
@@ -4657,7 +4719,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
         )) || null;
         currentTurnCanonicalUserText = currentTurnCanonicalUserEntry?.role === 'goal'
           ? null
-          : currentTurnCanonicalUserEntry?.content || null;
+          : (catalogSink?.userTextForEntry?.(currentTurnCanonicalUserEntry) ?? currentTurnCanonicalUserEntry?.content) || null;
         for (let index = pendingResponseUsers.length - 1; index >= 0; index -= 1) {
           if (!entries.includes(pendingResponseUsers[index].entry)) pendingResponseUsers.splice(index, 1);
         }
@@ -4703,6 +4765,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     if (payload.type === 'message' && payload.role === 'user') {
       const userText = codexUserMessagePresentationText(record);
       const goalContinuation = isCodexGoalContinuationUserText(userText);
+      const carrierKind = userCarrierKind(record, userText);
       // Codex currently persists fire-and-forget subagent completion in two
       // legitimate carrier shapes. Older rollouts used event_msg
       // user_message; newer/mixed protocol runs can write only a
@@ -4711,22 +4774,22 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       // fallback visible user carrier when this Codex protocol run omits the
       // paired event_msg; the block below upgrades it in place if that event
       // eventually arrives.
-      if (userText.includes('<subagent_notification>')) {
+      if (carrierKind === 'subagent') {
         subagents.onSubagentNotification(userText, recordTimestamp(record));
         return;
       }
-      if (isCodexTurnAbortedUserText(userText)) {
+      if (carrierKind === 'interrupted') {
         pushInterruptedNotice(record);
         return;
       }
-      if (!userText || isCodexEnvironmentContextUserText(userText)) return;
-      if (isCodexProjectInstructionsUserText(userText)) {
+      if (carrierKind === 'ignored') return;
+      if (carrierKind === 'instructions') {
         queueProjectInstructions(record, userText);
         return;
       }
       currentInterruptedNotice = null;
       if (currentTurnCanonicalUserText
-        && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, userText)) {
+        && userTextsMatch(currentTurnCanonicalUserText, userText)) {
         const imageRefs = mergeCodexUserMessageImageRefs(currentTurnCanonicalUserEntry?.imagePaths,
           codexUserMessageImageRefs(record));
         if (imageRefs.length > 0) currentTurnCanonicalUserEntry.imagePaths = imageRefs;
@@ -4761,8 +4824,9 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
         turnIndex: currentTurnIndex,
       };
       entries.push(entry);
-      pendingResponseUsers.push({ entry, text: userText });
-      attachCodexQuestionReplyProof(entry, questionDefinitions, physicalSessionId);
+      retainUserEntry(entry, record);
+      pendingResponseUsers.push({ entry, text: retainUserText(userText, record) });
+      if (catalogSink?.questionMetadata !== false) attachCodexQuestionReplyProof(entry, questionDefinitions, physicalSessionId);
       const imageRefs = codexUserMessageImageRefs(record);
       if (imageRefs.length > 0) entry.imagePaths = imageRefs;
       entry.imageCount = historyImageCountFromProviderRecord(record);
@@ -4772,7 +4836,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     if (payload.type === 'reasoning') {
       const text = extractReasoning(payload.summary);
       if (text) {
-        pendingThinking = pendingThinking ? `${pendingThinking}\n${text}` : text;
+        pendingThinking = catalogSink ? 'x' : pendingThinking ? `${pendingThinking}\n${text}` : text;
         pendingThinkingOwner = currentUserOwner();
       }
       return;
@@ -4781,7 +4845,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     if (payload.type === 'message' && payload.role === 'assistant') {
       const text = extractTextContent(payload.content);
       const textPhase = normalizeCodexTextPhase(payload.phase);
-      pushAssistantEntry(
+      pushProjectedAssistantEntry(
         entries, physicalSessionId, record, currentTurnIndex, text, pendingThinking, null,
         record.__line, record.__byteOffset, textPhase,
       );
@@ -4871,7 +4935,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       if (isCodexSubagentSpawnCall(call)) {
         const card = call.subagentCard || registerSubagentSpawn(call);
         subagents.attachSpawnOutput(call.callId, payload.output, recordTimestamp(record));
-        pushAssistantEntry(
+        pushProjectedAssistantEntry(
           entries,
           call.physicalSessionId || physicalSessionId,
           record,
@@ -4893,7 +4957,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
           recordTimestamp(record),
         );
         if (absorbed) {
-          pushAssistantEntry(entries, physicalSessionId, record, callTurnIndex, '', callThinking, null);
+          pushProjectedAssistantEntry(entries, physicalSessionId, record, callTurnIndex, '', callThinking, null);
           if (callOwnsThinking) pendingThinking = '';
           pendingCalls.delete(callId);
           return;
@@ -4929,7 +4993,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
           fillPendingCodexHistoryActions(pendingCellActions, payload.output, !!payload.is_error, record.__line);
           pendingExecCells.delete(waitCellId);
         }
-        pushAssistantEntry(entries, physicalSessionId, record, callTurnIndex, '', callThinking, null);
+        pushProjectedAssistantEntry(entries, physicalSessionId, record, callTurnIndex, '', callThinking, null);
       } else {
         const decoded = codexHistoryActionsForCall(call, payload.output, !!payload.is_error);
         decoded.actions = trackDecodedSubagents(decoded.actions, call, recordTimestamp(record));
@@ -4937,7 +5001,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
         // The call row owns the visible card identity. Completion enriches that
         // same card instead of replacing it with an output-line row, preserving
         // collapse state and Virtuoso measurement during streaming.
-        pushAssistantEntry(
+        pushProjectedAssistantEntry(
           entries,
           call.physicalSessionId || physicalSessionId,
           record,
@@ -4960,6 +5024,24 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       pendingCalls.delete(callId);
     }
   };
+
+  let catalogPendingPlan = null;
+  // Canonical finalization decides eligibility before any asynchronous sink
+  // restores arguments. This also preserves seed/spawn registration order:
+  // a later wait_agent sees the same cards as the ordinary finalizer.
+  function* pendingCallFinalizations() {
+    for (const call of pendingCalls.values()) {
+      if (call.userOwner && discardedUserOwners.has(call.userOwner)) continue;
+      const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
+      if (waitCellId && pendingExecCells.has(waitCellId)) continue;
+      if (isCodexSubagentSpawnCall(call)) {
+        if (!call.subagentCard) call.subagentCard = registerSubagentSpawn(call);
+        yield { call, kind: 'spawn' };
+      } else if (!(isCodexSubagentControlCall(call) && call.toolName === 'wait_agent' && subagents.hasCards())) {
+        yield { call, kind: 'decode' };
+      }
+    }
+  }
 
   const finalize = (options = {}) => {
     // A transcript-changed notification is emitted as soon as Codex appends
@@ -4984,21 +5066,17 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       }
     };
     let tailThinking = pendingThinking;
-    for (const call of pendingCalls.values()) {
-      if (call.userOwner && discardedUserOwners.has(call.userOwner)) continue;
+    for (const { call, kind } of catalogPendingPlan || pendingCallFinalizations()) {
       const callTurnIndex = call.userOwner?.turnIndex ?? call.turnIndexAtCall;
       const callOwnsThinking = pendingThinkingOwner === call.userOwner;
       const callThinking = callOwnsThinking ? tailThinking : '';
-      const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
-      if (waitCellId && pendingExecCells.has(waitCellId)) continue;
       // In-flight spawn (no output yet): show a running Task card, not raw
       // JSON. The card is cached on the call so repeated finalizes reuse ONE
       // tracker identity instead of re-registering a fresh card (which would
       // orphan the accumulated status of the previous one).
-      if (isCodexSubagentSpawnCall(call)) {
-        if (!call.subagentCard) call.subagentCard = registerSubagentSpawn(call);
+      if (kind === 'spawn') {
         const beforeLength = tail.length;
-        pushAssistantEntry(
+        pushProjectedAssistantEntry(
           tail,
           call.physicalSessionId || sessionId,
           call.record || { __line: call.line, timestamp: call.timestamp },
@@ -5011,14 +5089,9 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
         if (callOwnsThinking) tailThinking = '';
         continue;
       }
-      // An in-flight wait_agent while subagent cards exist is control-plane
-      // noise — the cards already carry the live status.
-      if (isCodexSubagentControlCall(call) && call.toolName === 'wait_agent' && subagents.hasCards()) {
-        continue;
-      }
-      const decoded = codexHistoryActionsForCall(call, undefined, false);
+      const decoded = catalogSink?.pendingActionsForCall?.(call) ?? codexHistoryActionsForCall(call, undefined, false);
       const beforeLength = tail.length;
-      pushAssistantEntry(
+      pushProjectedAssistantEntry(
         tail,
         call.physicalSessionId || sessionId,
         call.record || { __line: call.line, timestamp: call.timestamp },
@@ -5041,7 +5114,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     // agent is checked against its OWN transcript, which is authoritative
     // about itself. Card mutation here is monotone — an explicit resume
     // record arriving later through `feed` reopens it, same as a fresh pass.
-    refreshCodexSubagentCards(subagents.allCards(), sessionId);
+    if (!catalogSink) refreshCodexSubagentCards(subagents.allCards(), sessionId);
 
     // Pending calls are presentation rows, but not necessarily TAIL rows. A
     // current in-flight call naturally anchors at entries.length; an old call
@@ -5084,7 +5157,26 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
   };
 
   return {
-    feed,
+    feed: catalogSink ? record => {
+      catalogPendingPlan = null;
+      feed(record);
+      catalogSink.afterFeed?.({ entries, pendingCalls, pendingExecCells,
+        pendingResponseUsers, pendingProjectInstructions, subagents: subagents.exportState(),
+        currentTurnCanonicalUserText });
+    } : feed,
+    // Only the opt-in sink needs these live control references, without the
+    // full checkpoint's O(history) user-metadata traversal on every record.
+    ...(catalogSink ? { catalogState: () => ({ pendingCalls, pendingExecCells,
+      pendingResponseUsers, pendingProjectInstructions, currentTurnCanonicalUserText }),
+      userMatchCandidates,
+      *pendingCallsForDecode() {
+        // The iterator registers missing spawn cards. Freeze its decisions
+        // once, otherwise a second pass could suppress an earlier seeded
+        // wait_agent after seeing a later spawn. Any feed starts a new plan.
+        catalogPendingPlan ||= [...pendingCallFinalizations()];
+        for (const { call, kind } of catalogPendingPlan) if (kind === 'decode') yield call;
+      },
+    } : {}),
     finalize,
     getConsumedRecords: () => consumedRecords,
     exportState: () => ({
@@ -12037,6 +12129,7 @@ module.exports = {
     isCodexSourceSnapshotCurrent,
     beginCodexSourceRead,
     assertCodexSourceRead,
+    assertCodexSourceReadCurrent,
     finishCodexSourceRead: read => _codexReadFence.finish(read.ticket),
     getCodexJsonlSourceSnapshot,
     setCodexOperationSourceResolver,

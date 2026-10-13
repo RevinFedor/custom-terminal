@@ -100,7 +100,7 @@ for (const form of Object.keys(formats)) {
   });
   test(`${form}: footer words without native title style cannot prove an expanded panel`, () => {
     const f = frame(wrappedOther[form]);
-    f.lines.forEach(line => { line.hasNonDefaultBg = false; });
+    f.lines.forEach(line => { line.hasNonDefaultBg = false; line.hasNonDefaultFg = false; });
     assert.equal(inspectCodexNativeQuestions(f).kind, 'unknown');
   });
   test(`${form}: dim prose summary lacks the native mixed-style header`, () => {

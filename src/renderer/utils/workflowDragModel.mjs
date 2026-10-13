@@ -66,14 +66,40 @@ export function captureWorkflowDrag(state,{gestureId,outline,sourceId,selectedTa
 export function workflowDragSourceValid(admission,state) {
   if(!admission)return false;
   const catalog=workflowTabCatalog(state);
-  return admission.familyIds.every(id=>{
+  const source=state.spaces.find(space=>space.id===admission.sourceWorkflowId);
+  if(!source || (source.kind || 'user')!==admission.workflows[admission.sourceWorkflowId]?.kind)return false;
+  const active=owner=>owner.active && !owner.tab.archived && !owner.tab.isArchived && !owner.tab.archivedAt && !owner.tab.deleted;
+  const records=Object.fromEntries([...catalog].filter(([,owner])=>active(owner)).map(([id,owner])=>[id,owner.tab]));
+  const sameIds=(a,b)=>stableJson([...a].sort())===stableJson([...b].sort());
+  if(!sameIds(dragFamily(records,admission.rootTabIds),admission.familyIds)
+    || !sameIds(dragFamily(records,admission.paneEntries.map(entry=>entry.tabId),{physicalOnly:true}),admission.paneFamilyIds))return false;
+  if(!admission.familyIds.every(id=>{
     const owner=catalog.get(id),expected=admission.guards[id],member=state.tabWorkflowMembership[id];
-    return owner?.active && !owner.tab.archived && !owner.tab.isArchived && !owner.tab.archivedAt && !owner.tab.deleted
+    return owner && active(owner)
       && member?.revision===expected?.membershipRevision && member?.workflowId===expected.workflowId
       && owner.projectId===expected.namespace && stableJson(dragRelation(owner.tab))===stableJson(dragRelation(expected))
+      && (state.tabCatalog?.[id]?.storageId ?? state.tabCatalog?.[id]?.executionSubject?.legacyStorageId ?? null)===expected.storageId
+      && (state.tabCatalog?.[id]?.executionSubject?.subjectId || null)===expected.subjectId
       && (state.globalGroups?.tabGroups[id] || null)===expected.groupId
       && (state.globalGroups?.membershipRevisions?.[id] || 0)===expected.groupRevision;
-  });
+  }))return false;
+  for(const node of admission.sourceNodes)if(node.groupId) {
+    const expected=admission.groupDefinitions.find(group=>group.id===node.groupId);
+    const group=state.globalGroups?.groups.find(group=>group.id===node.groupId);
+    const members=Object.entries(state.globalGroups?.tabGroups || {}).filter(([,id])=>id===node.groupId).map(([id])=>id);
+    if(!group || !expected || !sameIds(members,admission.groupMembers[node.groupId] || []))return false;
+    if(!admission.groupMembers[node.groupId]?.length && (group.revision!==expected.revision
+      || (group.reserveWorkflowId || null)!==expected.reserveWorkflowId))return false;
+  }
+  const family=new Set([...admission.familyIds,...admission.paneFamilyIds]);
+  const liveSpaces=new Map(state.spaces.map(space=>[space.id,space]));
+  for(const id of new Set([...Object.keys(admission.workflows),...liveSpaces.keys()])) {
+    const space=liveSpaces.get(id),before=admission.workflows[id]?.layout || {};
+    const current=id===state.activeSpaceId ? captureSpaceLayout(state):space?.layout || {};
+    if([...layoutReferences(before),...layoutReferences(current)].some(ref=>family.has(ref.tabId))
+      && stableJson(dragPlacement(current))!==stableJson(dragPlacement(before)))return false;
+  }
+  return true;
 }
 
 /** Compile one painted command without reading selection or changing the store. */

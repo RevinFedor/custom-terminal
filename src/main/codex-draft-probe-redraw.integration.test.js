@@ -4,6 +4,28 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createCodexDraftRequestHarness, drainMicrotasks } = require('./fixtures/codex-draft-request-observation.cjs');
 
+test('4196 frame-order control: stale transcript row waits for current composer without becoming empty proof', async () => {
+  let complete = false;
+  const h = createCodexDraftRequestHarness({ getDraft: () => ({ success: true,
+    hasDraft: complete ? false : null, preview: '', source: 'headless-main',
+    frameBlocker: complete ? null : 'synchronized-output-open',
+    frameIdentity: { generation: 'G1', writeSeq: complete ? 5133 : 5132 } }) });
+  let finished = false;
+  const pending = h.read('4196-ordered-control', { waitFor: false, waitOnUnknownOnly: true })
+    .then(result => { finished = true; return result; });
+  await drainMicrotasks();
+  h.replyRenderer({ hasDraft: true, preview: 'Working context changed',
+    source: 'cursor:5051:multiline-draft-row-5054', frameIdentity: { generation: 'G1', writeSeq: 5031 } });
+  await drainMicrotasks();
+  assert.equal(finished, false, 'stale positive cannot finish current unknown observation');
+  complete = true;
+  h.notifyFrame();
+  const result = await pending;
+  assert.equal(result.hasDraft, false);
+  assert.equal(result.rendererPositiveIgnored, 'renderer-frame-behind');
+  assert.equal(h.reports.length, 0, 'explained same-generation catch-up is not a heavy incident');
+});
+
 async function drainUntil(predicate, message) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await drainMicrotasks(20);

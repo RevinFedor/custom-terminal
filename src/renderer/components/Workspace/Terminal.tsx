@@ -540,6 +540,16 @@ const launchPendingAgentAction = async (
     }
   } finally {
     pendingAgentActionLaunches.delete(tabId);
+    if (payload.contextFork) {
+      const store = useWorkspaceStore.getState();
+      for (const [projectId, workspace] of store.openProjects) {
+        const tab = workspace.tabs.get(tabId);
+        if (tab?.pendingOperation === 'Создание форка…'
+          && (!tab.pendingAction || tab.pendingAction.contextFork === payload.contextFork)) {
+          store.setTabPendingOperation(projectId, tabId, null);
+        }
+      }
+    }
   }
 };
 
@@ -556,7 +566,9 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
         void launchPendingAgentAction(tabId, pendingAction.type, 'claude:run-command', {
           tabId,
           command: 'claude-f',
-          forkSessionId: pendingAction.sessionId
+          forkSessionId: pendingAction.sessionId,
+          contextFork: pendingAction.contextFork,
+          ...(pendingAction.contextFork ? { launchFence: pendingAction.launchFence ?? null } : {}),
         });
       } else {
         clearTabPendingAction(tabId);
@@ -652,12 +664,13 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
         useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'codex', pendingAction.sessionId);
         const cwd = getTabCwd(tabId);
         console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-f" }');
-        void launchPendingAgentAction(tabId, pendingAction.type, 'codex:run-command', buildCodexRunPayload({
+        void launchPendingAgentAction(tabId, pendingAction.type, 'codex:run-command', { ...buildCodexRunPayload({
           tabId,
           command: 'codex-f',
           sessionId: pendingAction.sessionId,
           cwd
-        }));
+        }), contextFork: pendingAction.contextFork,
+          ...(pendingAction.contextFork ? { launchFence: pendingAction.launchFence ?? null } : {}) });
       } else {
         clearTabPendingAction(tabId);
       }
@@ -785,8 +798,38 @@ const invokePtyAgentLaunch = async (
   const attemptSeq = (ptyAgentLaunchAttemptSeq.get(tabId) || 0) + 1;
   ptyAgentLaunchAttemptSeq.set(tabId, attemptSeq);
   const isCurrentAttempt = () => ptyAgentLaunchAttemptSeq.get(tabId) === attemptSeq;
+  const reportFailure = (message: string, code?: string) => {
+    if (payload.contextFork && code === 'agent_launch_cancelled') return; // explicit Stop, not a failed user task
+    const copyText = payload.contextFork ? [
+      'Noted Terminal Fork diagnostic', `Time UTC: ${new Date().toISOString()}`,
+      `Tab ID: ${tabId}`, `Provider: ${attemptedToolType}`,
+      `Source tab: ${payload.contextFork.sourceTabId}`,
+      `Source session: ${payload.contextFork.sourceSessionId}`,
+      `Mode: ${payload.contextFork.fromLatestCompact ? 'compact' : 'full'}`,
+      `Code: ${code || 'launch-refused'}`, `Error: ${message}`,
+    ].join('\n') : undefined;
+    useUIStore.getState().showToast(
+      `${attemptedToolType === 'codex' ? 'Codex' : 'Claude'} не запущен: ${message}`,
+      'error', 8000, !!copyText, copyText,
+    );
+  };
   try {
     const result = await ipcRenderer.invoke(channel, payload);
+    // A committed compact child is read identity, never live-writer proof.
+    // A late reply cannot replace a newer binding or resurrect a closed tab.
+    const binding = result?.contextForkBinding;
+    if (isCurrentAttempt() && binding?.committed === true && binding.tabId === tabId
+      && binding.toolType === attemptedToolType
+      && binding.sourceSessionId === payload.contextFork?.sourceSessionId) {
+      const store = useWorkspaceStore.getState();
+      const owner = Array.from(store.openProjects.values()).find(ws => ws.tabs.has(tabId));
+      const tab = owner?.tabs.get(tabId);
+      const current = attemptedToolType === 'codex' ? tab?.codexSessionId : tab?.claudeSessionId;
+      if (tab && tab.pendingAction?.contextFork === payload.contextFork && !current) {
+        if (attemptedToolType === 'codex') await store.setCodexSessionId(tabId, binding.sessionId, 'unknown');
+        else store.setClaudeSessionId(tabId, binding.sessionId, 'unknown');
+      }
+    }
     if (result?.success === false || result?.accepted === false) {
       if (pendingClaudeSessionId) clearPendingResume(payload?.tabId);
       const message = result?.error || result?.reason || 'launch rejected';
@@ -800,10 +843,7 @@ const invokePtyAgentLaunch = async (
       console.warn('[Terminal:AgentLaunch] rejected channel=' + channel
         + ' tab=' + String(payload?.tabId || '').slice(-12)
         + ' error=' + message);
-      useUIStore.getState().showToast(
-        `${channel.startsWith('codex') ? 'Codex' : 'Claude'} не запущен: ${message}`,
-        'error',
-      );
+      reportFailure(message, result.code);
     }
     return result;
   } catch (error: any) {
@@ -819,10 +859,7 @@ const invokePtyAgentLaunch = async (
     console.warn('[Terminal:AgentLaunch] invoke failed channel=' + channel
       + ' tab=' + String(payload?.tabId || '').slice(-12)
       + ' error=' + message);
-    useUIStore.getState().showToast(
-      `${channel.startsWith('codex') ? 'Codex' : 'Claude'} не запущен: ${message}`,
-      'error',
-    );
+    reportFailure(message, error?.code);
     return { success: false, accepted: false, error: message };
   } finally {
     if (isCurrentAttempt()) ptyAgentLaunchAttemptSeq.delete(tabId);

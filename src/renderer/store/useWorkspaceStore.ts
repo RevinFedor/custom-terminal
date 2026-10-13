@@ -1,8 +1,10 @@
 import { create } from 'zustand';
+import { rememberAgentLaunchFence, observeAgentLaunchFences } from '../utils/agentLaunchFence.mjs';
 import { createExecutionRevisionAcks } from '../utils/executionRevisionAcks.mjs';
 import { createWorkflowRelationReceipts } from '../utils/workflowRelationReceipts.mjs';
 import { applyWorkflowDragLayout } from '../utils/workflowDragNavigation.mjs';
 import { organizationProjection, organizationSnapshot, reconcileWorkflowOrder, createOrganizationCommitter, archiveRestoreLeaseAddress, isExactGroupCloseGuard } from '../utils/workflowOrganizationClient.mjs';
+import {createWorkflowGroupClient,newerWorkflowGroups} from '../utils/workflowGroupClient.mjs';
 import { INBOX_WORKFLOW_ID, GLOBAL_EXECUTION_NAMESPACE } from '../utils/workflowMembership.mjs';
 import { organizationPlacementIntent } from '../utils/workflowPlacementMembership.mjs';
 import { removeLayoutTabs } from '../../shared/workflow-organization.cjs';
@@ -53,6 +55,7 @@ import {
   restorePanePreviousTab,
   addPane,
   isEmptyPane,
+  isBareEmptyPane,
   removePaneAt,
   removePaneByTab,
   removePanesByProject,
@@ -146,12 +149,14 @@ import { reconcileWorkspaceDisplayPatch, revealHiddenWindow, splitWindowPane, mi
 import {moveWorkflowWindow} from '../utils/workflowWindowMove.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
-import { collectTabLinkedFiles } from '../utils/tabLinkedFiles.mjs';
+import { collectTabLinkedFiles, linkedFileOwner } from '../utils/tabLinkedFiles.mjs';
 import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
+import { workflowCreationVisibility } from '../utils/workflowCreationVisibility.mjs';
 import { resolveTabRangeSelection } from '../utils/tabRangeSelection.mjs';
 import { findOpenTabOwner, seedTabWorkflowMemory, resolveTabLinkNavigation } from '../utils/tabLinkNavigation.mjs';
 
 const { ipcRenderer } = window.require('electron');
+observeAgentLaunchFences(ipcRenderer);
 
 /**
  * Запуски «Новой вкладки», которые сейчас идут, по id МЕСТА.
@@ -322,6 +327,8 @@ export interface TabTaskPlanSubtask {
 export interface TabTaskPlanItem {
   id: string;
   title: string;
+  shortTitle?: string;
+  body?: string;
   statusId?: string;
   subtasks: TabTaskPlanSubtask[];
 }
@@ -352,8 +359,8 @@ export interface TabTaskPlanDocument {
 
 export type TabTaskPlanOperation =
   | { type: 'replace_plan'; tasks: Array<Partial<TabTaskPlanItem> & { title: string }> }
-  | { type: 'add_task'; id?: string; title: string; statusId?: string | null; subtasks?: Array<Partial<TabTaskPlanSubtask> & { title: string }>; afterTaskId?: string }
-  | { type: 'update_task'; taskId: string; title?: string; statusId?: string | null }
+  | { type: 'add_task'; id?: string; title: string; shortTitle?: string; body?: string; statusId?: string | null; subtasks?: Array<Partial<TabTaskPlanSubtask> & { title: string }>; afterTaskId?: string }
+  | { type: 'update_task'; taskId: string; title?: string; shortTitle?: string; body?: string; statusId?: string | null; ifMatches?: { title: string; shortTitle?: string; body?: string } }
   | { type: 'remove_task'; taskId: string }
   | { type: 'archive_task'; taskId: string }
   | { type: 'restore_task'; taskId: string }
@@ -672,6 +679,12 @@ const maybeArmPendingAutoTabTitle = (
   reason: string
 ): void => {
   if (!shouldAttemptAutoTabTitleArmForSessionWrite(reason)) return;
+  if (tabNameSetManually) {
+    clearPendingAutoTabTitle(tabId, 'manual-name');
+    autoTabTitleIntents.delete(tabId);
+    logAutoTabTitleArmSkip(tabId, toolType, prevSessionId, nextSessionId, 'manual-name-current:' + reason);
+    return;
+  }
 
   const snapshot = aiLaunchSnapshots.get(tabId);
   const intent = getAutoTabTitleIntent(tabId, toolType);
@@ -761,6 +774,8 @@ export interface PendingAction {
   type: 'claude-fork' | 'claude-compact-fork' | 'claude-continue' | 'claude-new' | 'gemini-fork' | 'gemini-continue' | 'gemini-new' | 'codex-fork' | 'codex-compact-fork' | 'codex-continue' | 'codex-new' | 'shell-command';
   sessionId?: string;    // For AI fork/continue actions
   sourceSessionId?: string; // Original branch for pre-created compact forks
+  contextFork?: { sourceTabId: string; sourceSessionId: string; fromLatestCompact: boolean };
+  launchFence?: { terminalInstanceId: string; stopRevision: number } | null;
   command?: string;      // For shell-command
   developerInstructions?: string; // Codex external-run launch config
 }
@@ -854,6 +869,7 @@ interface Tab {
   codexModel?: string; // Per-tab Codex model selection for ControlBar launches
   codexEffort?: string; // Per-tab Codex reasoning effort selection for ControlBar launches
   codexLiveModel?: string; // Transient current-conversation model; never persisted
+  codexGoalWork?: { version: number; pending: boolean; phase: string; sessionId: string; turnId: string } | null;
   codexLiveEffort?: string; // Ultra is conversation-only and lives here
   codexLiveSettingsSessionId?: string; // Exact writer that owns the transient pair
   codexLiveSettingsProofAt?: number; // Time of that observation, not the time History was reloaded
@@ -972,9 +988,8 @@ interface Tab {
    * ничего видимого: юзер: *«до момента появления новой вкладки нужен лоадер…
    * название заменять на надпись, типа „делается форк"»*.
    *
-   * Хранится на ИСХОДНОЙ вкладке: новой ещё нет, а спрашивают именно с той, по
-   * которой кликнули. Не сохраняется в базу — операция короче жизни приложения,
-   * и восстановленная «делается форк» была бы ложью.
+   * При allocation относится к source; подготовка Fork уже принадлежит новой
+   * вкладке. Не сохраняется: после restart незавершённое действие не replay'ится.
    */
   pendingOperation?: string;
   // Claude SDK tab state
@@ -1516,7 +1531,13 @@ const tabCompletionDeferralReason = (tabId: string, successful: boolean): string
     successful,
     orchestrationBlocked: isOrchestrationCompletionBlocked(tabId),
     queueContinuationPending: tabHasPendingQueueContinuation(tabId),
+    goalWork: [...useWorkspaceStore.getState().openProjects.values()]
+      .find(workspace => workspace.tabs.has(tabId))?.tabs.get(tabId)?.codexGoalWork,
   });
+
+// Retry only a previously received successful turn, never manufacture a new
+// busy/idle edge when its conditional queue finishes checking asynchronously.
+const deferredTabCompletionReasons = new WeakMap<Tab, string | undefined>();
 
 const settleTabCompletionNotification = ({
   tab,
@@ -1531,6 +1552,7 @@ const settleTabCompletionNotification = ({
   tabId: string;
   successful: boolean;
 }): { changed: boolean; detail: TabCompletionNotificationDetail | null } => {
+  deferredTabCompletionReasons.delete(tab);
   if (!tab.completionNotificationArmed && !tab.completionNotificationPersistent) {
     return { changed: false, detail: null };
   }
@@ -1893,6 +1915,7 @@ interface WorkspaceStore {
   navigationRevision: number;
   navigationMutationOwner: string | null;
   mutateWorkflowGroup: (kind: string, request: any) => Promise<any>;
+  refreshWorkflowGroups: () => Promise<any>;
   runAfterWorkflowScopeVersions: Record<string, number>;
   bootstrapOrganization: (options?: {fresh?: boolean}) => Promise<void>;
   commitOrganization: () => Promise<any>;
@@ -1900,7 +1923,7 @@ interface WorkspaceStore {
   ensureTabRuntime: (tabId: string) => Promise<boolean>;
   createWorkflowTab: (options?: {workflowId?: string; cwd?: string; sourceTabId?: string; name?: string; tabOptions?: any}) => Promise<string>;
   moveTabsToWorkflow: (tabIds:string[], workflowId:string) => Promise<boolean>;
-  openTabById: (tabId: string, options?: { projectId?: string | null; projectPath?: string | null; sourceTabId?: string; reason?: string; unplacedMode?: 'append' | 'replace-shown' }) => Promise<boolean>;
+  openTabById: (tabId: string, options?: { projectId?: string | null; projectPath?: string | null; sourceTabId?: string; reason?: string; unplacedMode?: 'append' | 'replace-shown'; windowAction?: 'beside' | 'replace-shown' }) => Promise<boolean>;
   addWorkspaceSpace: (options?: { activate?: boolean; name?: string }) => string | null;
   removeWorkspaceSpace: (id: string) => void;
   renameWorkspaceSpace: (id: string, name: string) => void;
@@ -1978,6 +2001,7 @@ interface WorkspaceStore {
     reveal?: boolean;
     createEmptyWindow?: boolean;
     moveExisting?: boolean;
+    replaceShown?: boolean;
   }) => Record<string, any>;
   // ✕ / Escape on an empty placeholder pane (real panes close by tabId).
   removeEmptySplitPane: (paneIndex: number) => void;
@@ -2137,7 +2161,8 @@ interface WorkspaceStore {
 
   setClaudeActive: (tabId: string, alive: boolean) => void;
   setClaudeBusy: (tabId: string, busy: boolean) => void;
-  setAiBusy: (tabId: string, busy: boolean, reason?: string) => void;
+  setAiBusy: (tabId: string, busy: boolean, reason?: string, goalWork?: Tab['codexGoalWork']) => void;
+  retryTabCompletionNotification: (tabId: string) => void;
   setSdkProcessAlive: (tabId: string, alive: boolean) => void;
 
   setViewingSubAgent: (tabId: string | null) => void;
@@ -2170,7 +2195,7 @@ interface WorkspaceStore {
   reorderProjects: (orderedProjectIds: string[]) => void;
 
   // Claude SDK tabs
-  createSDKTab: (projectId: string, name?: string, options?: { cwd?: string; afterTabId?: string; afterVisualSubtree?: boolean; groupId?: string; visualParentTabId?: string; background?: boolean; windowScoped?: boolean; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
+  createSDKTab: (projectId: string, name?: string, options?: { cwd?: string; workflowId?: string; afterTabId?: string; afterVisualSubtree?: boolean; groupId?: string; visualParentTabId?: string; background?: boolean; windowScoped?: boolean; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
   updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking' | 'sdkMidstreamPending' | 'sdkComposerChips'>>) => void;
   // Merge a partial BgTask patch by taskId. Creates the entry if missing.
@@ -2521,6 +2546,32 @@ const activationFollowPatch = (
     ? {}
     : { activeProjectId: projectId, focusedProjectId: projectId }
 );
+
+// A body press in the already-focused pane must not replay tab activation.
+// Keep all observable activation effects as guards: a parked sidebar, new
+// selection, unread notification, missing visit or lazy runtime still takes
+// the original route. Explicit sidebar reveal is published by the caller.
+const focusedPaneActivationBlockReason = (st: WorkspaceStore, paneIndex: number): string | null => {
+  const pane = st.splitPanes[paneIndex];
+  if (!pane?.tabId || pane.displayHidden || st.splitFocusedIndex !== paneIndex) return 'pane-not-focused';
+  if (st.isRestoring || st.view !== 'workspace') return 'workspace-view';
+  if (st.activeProjectId !== pane.projectId || st.focusedProjectId !== pane.projectId) return 'project-pointers';
+  if (st.activeSpaceTab?.projectId !== pane.projectId || st.activeSpaceTab?.tabId !== pane.tabId) return 'shown-tab';
+  const workspace = st.openProjects.get(pane.projectId);
+  const tab = workspace?.tabs.get(pane.tabId);
+  if (!workspace || !tab || st.tabCatalog[pane.tabId]?.active === false) return 'tab-unavailable';
+  if (st.tabCatalog[pane.tabId]?.namespace !== pane.projectId) return 'tab-owner-unproven';
+  if ((tab as any).lazyRuntime) return 'lazy-runtime';
+  if (tab.tabType === 'file' || tab.parentTabId) return 'linked-presentation';
+  if (workspace.activeTabId !== pane.tabId || workspace.currentView !== 'terminal') return 'project-view';
+  if (workspace.activeGroupId || workspace.viewingSubAgentTabId) return 'group-or-subagent';
+  if (workspace.selectedTabIds.length !== 1 || workspace.selectedTabIds[0] !== pane.tabId) return 'selected-set';
+  if (workspace.tabHistory.at(-1) !== pane.tabId || st.globalTabMru[0]?.tabId !== pane.tabId
+    || st.globalTabMru[0]?.projectId !== pane.projectId || !tab.lastActivatedAt) return 'visit-order';
+  if (tab.completionNotificationFired) return 'notification';
+  if (st.tabLastWorkflowIds?.[pane.tabId] !== st.activeSpaceId) return 'workflow-memory';
+  return null;
+};
 
 // Selector helper for project-owned surfaces (sidebar, toolbar, titlebar,
 // git, project home): the explicitly chosen project, falling back to the
@@ -3015,18 +3066,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     const spaces = inbox && !ordered.some(space => space.id === inbox.id) ? [...ordered,inbox] : ordered;
     // A catalog refresh cannot replace a local layout or steal focus.
     set({openProjects,spaces,organizationWorkflowOrder:projection.organizationWorkflowOrder,tabCatalog:projection.tabCatalog,tabWorkflowMembership:projection.tabWorkflowMembership,
-      globalGroups:snapshot.globalGroups,organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
+      globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
   },
   activeTabNavigationIntent:null,
   navigationKey:null,
   navigationRevision:0,
   navigationMutationOwner:null,
-  mutateWorkflowGroup: async (kind,request) => {
-    const result = await ipcRenderer.invoke('workflow:group-mutate',{kind,request});
-    const globalGroups = await ipcRenderer.invoke('workflow:groups-read');
-    set({globalGroups});
-    return result;
-  },
+  mutateWorkflowGroup: (kind,request) => workflowGroupClient.mutate(kind,request),
+  refreshWorkflowGroups: () => workflowGroupClient.refresh(),
   runAfterWorkflowScopeVersions: {},
 
   bootstrapOrganization: async (options) => {
@@ -3112,7 +3159,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           layout:applyWorkflowDragLayout(currentLayout,change,{reveal})};
       });
       const live=byId.has(state.activeSpaceId)?spaces.find(space=>space.id===state.activeSpaceId)?.layout:{};
-      set({openProjects,spaces,...live,globalGroups:snapshot.globalGroups,
+      set({openProjects,spaces,...live,globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),
         tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,
         organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
       if(frozen.destinationKind==='window' && state.activeSpaceId===frozen.targetWorkflowId
@@ -3135,6 +3182,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     if (!(owner.tab as any).lazyRuntime) return true;
     const admission = (async () => {
       const result = await ipcRenderer.invoke('terminal:create',{tabId,projectId:owner.projectId,cwd:owner.tab.cwd,rows:24,cols:80});
+      rememberAgentLaunchFence(tabId, result?.launchFence);
       const current = findOpenTabOwner(get(),tabId);
       if (!current || current.tab !== owner.tab || result?.success === false || !result) return false;
       (current.tab as any).lazyRuntime = false;
@@ -3796,6 +3844,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       show: request?.show === true || request?.reveal === true,
       focus: request?.focus === true || request?.reveal === true,
       createEmptyWindow: request?.createEmptyWindow === true,
+      replaceShown: request?.replaceShown === true,
     });
     if (!mutation.ok) return mutation;
 
@@ -3910,6 +3959,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       const value = st.openProjects.get(projectId)?.projectPath || '';
       return value && !value.startsWith('__unset__') ? value : '';
     };
+    const belongsHere = (tabId?:string) => !!tabId &&
+      (st.pendingTabWorkflowMembership[tabId] || st.tabWorkflowMembership[tabId])?.workflowId===st.activeSpaceId;
+    const initialContext = (projectId:string, tabId?:string) => {
+      if (!st.organizationReady) return {projectId,cwd:projectRoot(projectId)};
+      const defaultCwd=st.spaces.find(space=>space.id===st.activeSpaceId)?.defaultCwd;
+      const source=belongsHere(tabId)?findOpenTabOwner(st,tabId!):null;
+      return {projectId:GLOBAL_EXECUTION_NAMESPACE,
+        cwd:defaultCwd || source?.tab.cwd || resolveWorkspaceCwd('')};
+    };
     const slotId = nextChooserSlotId([
       ...allPaneSlotIds(st.splitPanes),
       ...st.spaces.flatMap((space: any) => allPaneSlotIds(space.layout?.splitPanes || [])),
@@ -3922,27 +3980,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     // собранные человеком, никуда не делись.
     if (paneIndex === null || paneIndex === undefined || st.splitPanes.length === 0) {
       const key = st.centerStripKey();
-      const shownTabId = st.activeProjectId
-        ? st.openProjects.get(st.activeProjectId)?.activeTabId || ''
-        : '';
-      const stored = (key && st.centerStrips[key]) || [];
+      const shownTabId = st.organizationReady
+        ? (belongsHere(st.activeSpaceTab?.tabId)?st.activeSpaceTab!.tabId:'')
+        : st.activeProjectId?st.openProjects.get(st.activeProjectId)?.activeTabId || '':'';
+      const shownProjectId = st.organizationReady
+        ? (shownTabId?findOpenTabOwner(st,shownTabId)?.projectId:'') || ''
+        : st.activeProjectId || '';
+      const stored = ((key && st.centerStrips[key]) || []).filter(entry=>!st.organizationReady || belongsHere(entry.tabId));
       const strip = stored.length > 0
         ? stored
-        : (shownTabId && st.activeProjectId ? [{ projectId: st.activeProjectId, tabId: shownTabId }] : []);
+        : (shownTabId && shownProjectId ? [{ projectId: shownProjectId, tabId: shownTabId }] : []);
       const centerStrips = { ...st.centerStrips };
       if (key) delete centerStrips[key];
       const pane = strip.length > 0
         ? { projectId: strip[0].projectId, tabId: '', tabs: strip.map((e) => ({ ...e })) }
         : { projectId: '', tabId: '' };
-      const chooserProjectId = (shownTabId ? st.activeProjectId : '')
+      const chooserProjectId = shownProjectId
         || strip[0]?.projectId
         || st.activeProjectId
         || '';
       const opened = openChooserSlotInPane([pane], 0, slotId, {
         at: options?.at,
-        // Контекст центра — проект вкладки, которую он показывал.
-        projectId: chooserProjectId,
-        cwd: projectRoot(chooserProjectId),
+        ...initialContext(chooserProjectId,shownTabId),
       });
       if (!opened) return null;
       useUIStore.getState().setActiveArea('workspace');
@@ -3958,11 +4017,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       return slotId;
     }
 
-    // Проект ЗАПИСЫВАЕТСЯ НА МЕСТО в момент открытия — это его собственный
-    // контекст, и он переживает всё, что случится с окном потом: смену
-    // показанной вкладки, перестановку чипов, уход человека в другое окно.
-    // Показанная вкладка задаёт проект; пустое окно использует выбранную
-    // директорию sidebar. Припаркованный чип не подменяет этот явный выбор.
+    // Freeze this place's initial directory, not the legacy namespace's last
+    // project root. A workflow default starts a new chooser; later explicit
+    // directory selection belongs to the slot and survives navigation.
     const anchorPane = st.splitPanes[paneIndex];
     const anchorProjectId = anchorPane?.projectId
       || st.getFocusedProjectId()
@@ -3970,8 +4027,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       || '';
     const opened = openChooserSlotInPane(st.splitPanes, paneIndex, slotId, {
       at: options?.at,
-      projectId: anchorProjectId,
-      cwd: projectRoot(anchorProjectId),
+      ...initialContext(anchorProjectId,anchorPane?.tabId),
     });
     if (!opened) return null;
     useUIStore.getState().setActiveArea('workspace');
@@ -4114,7 +4170,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           : '',
         projectExists: (projectId: string) => before.openProjects.has(projectId),
       });
-      const targetProjectId = context.projectId || '';
+      const targetWorkflowId = located.spaceId || before.activeSpaceId;
+      const targetProjectId = before.organizationReady ? GLOBAL_EXECUTION_NAMESPACE : context.projectId || '';
       const workspace = targetProjectId ? before.openProjects.get(targetProjectId) : null;
       if (!workspace) {
         // Проект этого места закрыт, и подставлять чужой нельзя. Молчать тоже
@@ -4129,10 +4186,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       const projectPath = workspace.projectPath && !workspace.projectPath.startsWith('__unset__')
         ? workspace.projectPath
         : '';
-      // A chooser starts at the project root and may carry one explicit user
-      // override. It never inherits the cwd of the tab that happened to own
-      // Cmd+T: that directory belongs to the old tab, not this new place.
-      const requestedCwd = context.cwd || projectPath || '';
+      // The frozen slot directory wins over a later default change. Only old
+      // legacy Project mode falls back to that Project's root.
+      const workflowCwd = before.organizationReady
+        ? before.spaces.find(space=>space.id===targetWorkflowId)?.defaultCwd : '';
+      const requestedCwd = context.cwd || workflowCwd || projectPath || '';
       if (!requestedCwd) {
         useUIStore.getState().showToast(
           'У проекта не задана директория — выберите её в строке пути',
@@ -4222,6 +4280,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       const commonOptions = {
         skipInitialRename: true,
         background: true,
+        ...(before.organizationReady ? {workflowId:targetWorkflowId} : {}),
         afterTabId: context.cwdTabId || undefined,
         visualParentTabId: '',
         canPublish,
@@ -4246,6 +4305,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           // `createTabAfterCurrent`, поэтому лишнего PTY и второго лаунчера
           // здесь не появляется.
           createdTabId = await get().createSDKTab(targetProjectId, undefined, {
+            ...commonOptions,
             cwd,
             background: true,
             canPublish,
@@ -4273,7 +4333,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           createdTabId = await get().createSDKTab(
             targetProjectId,
             `${clipSid!.slice(0, 8)}_fork`,
-            { cwd, background: true, canPublish, onPublish },
+            { ...commonOptions, cwd },
           );
           // Привязка источника — только у опубликованного результата.
           if (createdTabId) {
@@ -4611,7 +4671,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
   },
 
   focusSplitPane: (paneIndex, options) => {
-    const { splitPanes, splitFocusedIndex } = get();
+    const state = get();
+    const { splitPanes, splitFocusedIndex } = state;
     const pane = splitPanes[paneIndex];
     if (!pane || pane.displayHidden) return;
     // «Прицелиться в окно, оставшись в чужом проекте».
@@ -4646,6 +4707,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       }
       return;
     }
+    const activationReason = useUIStore.getState().activeArea !== 'workspace'
+      ? 'active-area' : focusedPaneActivationBlockReason(state, paneIndex);
+    if (!activationReason) {
+      // Keep the existing "show this row" signal, including a sidebar which
+      // was manually scrolled away. One publication replaces the redundant
+      // navigation/placement/Map writes, not the user's visible reveal.
+      // A new pointer intention still cancels a former async navigation; its
+      // later runtime ACK must not reclaim focus or complete under this click.
+      set({ activeTabNavigationIntent: null, tabListRevealRequest: {
+        projectId: pane.projectId, tabId: pane.tabId,
+        seq: (state.tabListRevealRequest?.seq || 0) + 1,
+      } });
+      console.warn('[Perf:PaneFocusActivation] outcome=reused pane=' + paneIndex
+        + ' tab=' + pane.tabId.slice(-12) + ' reveal=1 cancelledIntent=' + Number(!!state.activeTabNavigationIntent));
+      return;
+    }
+    console.warn('[Perf:PaneFocusActivation] outcome=activate pane=' + paneIndex
+      + ' tab=' + pane.tabId.slice(-12) + ' reason=' + activationReason);
     get().activateCenterTab(pane.projectId, pane.tabId);
   },
 
@@ -4681,6 +4760,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
 
   openTabById: async (tabId, options = {}) => {
     const origin = get();
+    const originLocation = tabNavigationLocation(origin);
     const source = options.sourceTabId ? resolveTabLinkNavigation(origin,options.sourceTabId) : null;
     const sourcePane = source?.kind === 'reveal' && source.spaceId === origin.activeSpaceId
       && source.paneIndex !== null ? origin.splitPanes[source.paneIndex] : null;
@@ -4713,6 +4793,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     // parent's presentation; opening a file never activates that subagent path.
     const presentationParentId = owner.tab.tabType === 'file' ? null : owner.tab.parentTabId;
     const presentationTabId = presentationParentId || tabId;
+    if (options.windowAction) {
+      const current = get();
+      if (tabNavigationLocation(current) !== originLocation || current.windowDisplayKey !== origin.windowDisplayKey) return false;
+      const anchor = originWindowId ? current.splitPanes.findIndex(pane => pane.windowId === originWindowId)
+        : current.splitPanes.length ? current.splitFocusedIndex : null;
+      if (anchor !== null && (anchor < 0 || current.splitPanes[anchor]?.displayHidden)) return false;
+      const presentationOwner = findOpenTabOwner(current,presentationTabId);
+      if (!presentationOwner) return false;
+      let placed:any;
+      withOwnedTabNavigation(intent.id,() => {
+        const vacant=options.windowAction==='beside'
+          ? get().splitPanes.findIndex((pane,index)=>index!==anchor && !pane.displayHidden && isBareEmptyPane(pane)) : -1;
+        placed=get().commitWorkspaceWindowAction({target:{spaceId:origin.activeSpaceId,
+          anchor:'focused',...(vacant>=0?{windowIndex:vacant}:anchor!==null?{windowIndex:anchor}:{}),
+          mode:options.windowAction==='beside' && vacant<0?'new-window':'same-window',side:'right'},
+          entries:[{projectId:presentationOwner.projectId,tabId:presentationTabId}],
+          replaceShown:options.windowAction==='replace-shown',show:true,focus:true,reveal:true});
+      });
+      if (!placed?.ok) {console.warn('[TabNavigation] placement-rejected tab='+tabId+' reason='+placed?.reason);return false;}
+    }
     let plan = resolveTabLinkNavigation(get(), presentationTabId);
     if (!plan) return false;
     if (plan.spaceId && plan.spaceId !== get().activeSpaceId) withOwnedTabNavigation(intent.id,() => get().switchWorkspaceSpace(plan.spaceId));
@@ -4761,8 +4861,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       }
       if (plan!.kind === 'append') {
         if (plan!.paneIndex !== null) set({splitFocusedIndex:plan!.paneIndex});
-        // A reserve-row click replaces the shown chip; secondary links append.
-        // Existing placements above still reveal their exact window.
+        // Ordinary navigation appends; explicit unplaced replacement is retained
+        // for callers which already chose that placement action.
         get().placeTab(presentationOwner.projectId,presentationTabId,
           options.unplacedMode === 'replace-shown' ? undefined : {mode:PLACEMENT_ADD_HERE});
       } else get().placeTab(presentationOwner.projectId,presentationTabId);
@@ -4781,6 +4881,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       ? !shown || shown.displayHidden || shown.tabId !== presentationTabId || shown.projectId !== currentPresentation.projectId
       : state.activeSpaceTab?.tabId !== presentationTabId)) return false;
     if (presentationParentId && state.openProjects.get(state.activeProjectId || '')?.viewingSubAgentTabId !== tabId) return false;
+    if (options.windowAction && state.organizationReady) await get().commitOrganization();
+    if (get().activeTabNavigationIntent?.id !== intent.id) return false;
+    if (owner.tab.tabType==='file') {
+      const linked=linkedFileOwner(get().openProjects,tabId);
+      if(linked)useUIStore.getState().rememberLinkedFile(linked.tabId,tabId);
+    }
     console.log('[TabNavigation] source=' + (options.reason || 'link')
       + ' tab=' + tabId.slice(-12) + ' kind=' + (plan.kind === 'append' && options.unplacedMode === 'replace-shown' ? 'replace-shown' : plan.kind)
       + ' workflow=' + String(plan.spaceId).slice(-12));
@@ -5169,7 +5275,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
               ` stateWorkspaceTabs=${stateWorkspace?.tabs.size ?? -1}`
             );
           }
-        } else if (!isInbox) {
+        } else if (!isInbox && projectData?.executionScopeVersion !== 2) {
           console.warn(`[RestoreSession] noSavedTabs project=${restoreShortId(proj.projectId)} creatingDefault=true`);
           let createdTabId = '';
           try {
@@ -5197,7 +5303,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
             ` workspaceTabs=${newWorkspace.tabs.size}`
           );
         } else {
-          console.warn(`[RestoreSession] noSavedTabs project=${restoreShortId(proj.projectId)} inboxEmpty=true`);
+          // An execution namespace is an address bucket, not a legacy Project.
+          // Its empty state must survive restore until explicit v2 allocation.
+          console.warn(`[RestoreSession] noSavedTabs project=${restoreShortId(proj.projectId)} preservingEmpty=true scopeVersion=${projectData?.executionScopeVersion || 1}`);
         }
 
         // Set active tab by saved index
@@ -5596,7 +5704,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
               );
             }
           }
-        } else if (!isInbox) {
+        } else if (!isInbox && projectData?.executionScopeVersion !== 2) {
           // Create default tab
           try {
             await createTab(projectId, 'Terminal 1', workspaceProjectPath);
@@ -5830,6 +5938,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       isUtility: false,
       commandType: options?.commandType,
       pendingAction: options?.pendingAction,
+      pendingOperation: options?.pendingAction?.contextFork ? 'Создание форка…' : undefined,
       claudeSessionId: options?.claudeSessionId,
       geminiSessionId: options?.geminiSessionId,
       codexSessionId: options?.codexSessionId,
@@ -5906,6 +6015,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           initialCommand
         });
         pid = result.pid;
+        rememberAgentLaunchFence(tabId, result.launchFence);
+        if (newTab.pendingAction?.contextFork) newTab.pendingAction.launchFence = result.launchFence || null;
         if (typeof result.cwd === 'string' && result.cwd) newTab.cwd = result.cwd;
         console.warn(
           `[Store:createTabTerminalEnd] project=${restoreShortId(projectId)}` +
@@ -5942,10 +6053,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         getPersistenceRevision: () => projectTabSaveRevisions.get(projectId) || 0,
         buildCandidateTabs: (currentTabs) => new Map([...currentTabs, [tabId, newTab]]),
         persist: (candidateTabs) => {
-          console.log('[Store] createTab: Persisting tab, tabs count:', candidateTabs.size);
+          // A new v2 subject was already allocated by the canonical factory.
+          // Commit only that exact row, through the existing save lane/ACK/CAS.
+          // The candidate Map is placement, not authority to save its neighbors.
+          // Legacy/cold restore retains its full-snapshot persistence contract.
+          const persistenceTabs = (newTab as any).executionSubject?.version === 2 && !options?.restoreId
+            ? new Map([[tabId, newTab]]) : candidateTabs;
+          console.log('[Store] createTab: Persisting tab, tabs count:', persistenceTabs.size);
           return saveTabsThenNotifyProjectLayoutChanged(
             workspace.projectId,
-            candidateTabs,
+            persistenceTabs,
             'tab-created',
           );
         },
@@ -6060,6 +6177,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       isUtility: false,
       commandType: options?.commandType,
       pendingAction: options?.pendingAction,
+      pendingOperation: options?.pendingAction?.contextFork ? 'Создание форка…' : undefined,
       claudeSessionId: options?.claudeSessionId,
       geminiSessionId: options?.geminiSessionId,
       codexSessionId: options?.codexSessionId,
@@ -6115,7 +6233,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         initialCommand
       });
 
-      const { pid, cwd: runtimeCwd } = await ipcRenderer.invoke('terminal:create', {
+      const { pid, cwd: runtimeCwd, launchFence } = await ipcRenderer.invoke('terminal:create', {
         tabId,
         projectId,
         cwd: newTab.cwd,
@@ -6126,6 +6244,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
 
       console.log('[Store:createTabAfterCurrent] Terminal created with pid:', pid);
       newTab.pid = pid;
+      rememberAgentLaunchFence(tabId, launchFence);
+      if (newTab.pendingAction?.contextFork) newTab.pendingAction.launchFence = launchFence || null;
       if (typeof runtimeCwd === 'string' && runtimeCwd) newTab.cwd = runtimeCwd;
     }
 
@@ -6174,7 +6294,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       },
       persist: (candidateTabs) => saveTabsThenNotifyProjectLayoutChanged(
         workspace.projectId,
-        candidateTabs,
+        // Native New/Fork commits its own allocated subject, not unrelated metadata.
+        (newTab as any).executionSubject?.version === 2 && !options?.restoreId
+          ? new Map([[tabId, newTab]]) : candidateTabs,
         'tab-created',
       ),
       publish: (candidateTabs) => {
@@ -8091,10 +8213,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       // provider label that no running process ever accepted.
       if (snap.commandType) tab.commandType = snap.commandType;
       else delete tab.commandType;
-      tab.name = snap.name;
+      // Launch rollback does not own a later manual rename.
+      if (!tab.nameSetManually) {
+        tab.name = snap.name;
+        tab.nameSetManually = snap.nameSetManually;
+      }
       tab.color = snap.color;
       tab.colorSetManually = snap.colorSetManually;
-      tab.nameSetManually = snap.nameSetManually;
       tab.claudeSessionId = snap.claudeSessionId;
       tab.geminiSessionId = snap.geminiSessionId;
       tab.codexSessionId = snap.codexSessionId;
@@ -9411,14 +9536,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     }
   },
 
-  setAiBusy: (tabId, busy, reason) => {
+  retryTabCompletionNotification: (tabId) => {
+    const tab = [...get().openProjects.values()].find(workspace => workspace.tabs.has(tabId))?.tabs.get(tabId);
+    if (!tab || tab.aiBusy || !deferredTabCompletionReasons.has(tab)) return;
+    get().setAiBusy(tabId, false, deferredTabCompletionReasons.get(tab), tab.codexGoalWork);
+  },
+
+  setAiBusy: (tabId, busy, reason, goalWork) => {
     const { openProjects, activeProjectId } = get();
     let notificationDetail: { projectId: string; tabId: string; tabName: string } | null = null;
     for (const [, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         const wasBusy = !!tab.aiBusy;
-        if (wasBusy === busy) return;
+        if (goalWork !== undefined) tab.codexGoalWork = goalWork;
+        else if (busy) tab.codexGoalWork = null;
+        if (busy) deferredTabCompletionReasons.delete(tab);
+        if (wasBusy === busy && !(busy === false && deferredTabCompletionReasons.has(tab))) return;
         tab.aiBusy = busy;
         if (busy) {
           if (tab.completionNotificationPersistent) {
@@ -9429,13 +9563,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
             delete tab.completionNotificationFiredAt;
             emitTabCompletionNotificationCleared({ projectId: workspace.projectId, tabId });
           }
-        } else if (wasBusy && (tab.completionNotificationArmed || tab.completionNotificationPersistent)) {
+        } else if ((wasBusy || deferredTabCompletionReasons.has(tab))
+          && (tab.completionNotificationArmed || tab.completionNotificationPersistent)) {
           const successful = isNaturalAgentTurnEndReason(reason);
           // Deferring leaves the bell ARMED: the queue's own last item ends a
           // turn with nothing pending, and that turn rings once for the whole
           // Run after run instead of once per item.
           const deferReason = tabCompletionDeferralReason(tabId, successful);
           if (deferReason) {
+            if (successful) deferredTabCompletionReasons.set(tab, reason);
             console.warn('[TabNotification] completion deferred tab=' + tabId.slice(-12)
               + ' reason=' + deferReason);
           } else {
@@ -9622,6 +9758,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       // одной записью работают здесь без второго лаунчера и без лишнего PTY.
       canPublish: options?.canPublish,
       onPublish: options?.onPublish,
+      workflowId: options?.workflowId,
     });
   },
 
@@ -9984,6 +10121,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
 });
 });
 
+const workflowGroupClient = createWorkflowGroupClient({
+  invoke:(channel:string,payload:any)=>ipcRenderer.invoke(channel,payload),
+  publish:(publication:any)=>{
+    const current=useWorkspaceStore.getState().globalGroups;
+    const globalGroups=newerWorkflowGroups(current,publication);
+    if(globalGroups!==current)useWorkspaceStore.setState({globalGroups});
+  },
+});
+
 const organizationCommitter = createOrganizationCommitter({
   invoke:(channel:string,payload:any) => ipcRenderer.invoke(channel,payload),
   getPublication:() => ({revision:useWorkspaceStore.getState().organizationRevision}),
@@ -10000,6 +10146,7 @@ const organizationCommitter = createOrganizationCommitter({
       spaces:reconcileWorkflowOrder(projection.spaces,state.spaces,state.organizationWorkflowOrder,state.activeSpaceId),
       organizationWorkflowOrder:projection.organizationWorkflowOrder,
       organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation,
+      globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),
       pendingTabWorkflowMembership:pending,organizationError:null});
     return snapshot;
   },
@@ -10015,8 +10162,12 @@ async function allocateOrganizationTab(projectId:string, tab:Tab, options:any): 
   const ownerId = options?.sourceTabId || options?.visualParentTabId || options?.parentTabId;
   const workflowId = options?.workflowId || (ownerId && initial.tabWorkflowMembership[ownerId]?.workflowId) || initial.activeSpaceId || INBOX_WORKFLOW_ID;
   await organizationCommitter.runTask(async () => {
+    // The early fork container is durable; its in-memory launch/Stop fence
+    // is not. A restart must not replay a copy with an unknown prior outcome.
+    const record = tab.pendingAction?.contextFork
+      ? { ...tab, pendingAction: undefined, pendingOperation: undefined } : tab;
     const request = {mutationId:crypto.randomUUID(),tabId:tab.id,
-      cwd:tab.cwd,workflowId,sourceTabId:ownerId,executionNamespace:projectId,record:tab,
+      cwd:tab.cwd,workflowId,sourceTabId:ownerId,executionNamespace:projectId,record,
       expectedRevision:useWorkspaceStore.getState().organizationRevision};
     let result;
     try {result = await ipcRenderer.invoke('workflow:create-tab',request);}
@@ -10028,9 +10179,11 @@ async function allocateOrganizationTab(projectId:string, tab:Tab, options:any): 
       throw new Error('workflow_creation_unconfirmed');
     (tab as any).executionSubject = result.executionSubject;
     (tab as any).executionStorageRevision = 1;
-    console.info('[WorkflowCreation] allocated tab=' + tab.id + ' workflow=' + result.workflowId
+    console.log('[WorkflowCreation] allocated tab=' + tab.id + ' workflow=' + result.workflowId
       + ' namespace=' + projectId + ' source=' + (ownerId || '-')
       + ' identity=' + (options?.reservedTabId ? 'reserved-new' : 'new'));
+    workflowCreationVisibility.allocated({tabId:tab.id,workflowId:result.workflowId,namespace:projectId,
+      sourceTabId:ownerId,background:options?.background,revision:result.revision});
     const state = useWorkspaceStore.getState();
     useWorkspaceStore.setState({organizationRevision:result.revision,organizationGeneration:result.generation,
       tabWorkflowMembership:{...state.tabWorkflowMembership,[tab.id]:{tabId:tab.id,workflowId:result.workflowId,revision:result.membershipRevision}},

@@ -145,6 +145,37 @@ function normalizeAudit(audit) {
   };
 }
 
+function canonicalAuditFollowupMetadata(record, audit) {
+  const candidate = audit.raw?.executionContext;
+  const context = candidate && candidate.provider === audit.provider
+    && candidate.sessionId === audit.sessionId
+    && typeof candidate.turnId === 'string' && candidate.turnId.trim()
+    ? {
+        provider: audit.provider, sessionId: audit.sessionId, turnId: candidate.turnId.trim(),
+        processId: candidate.processId == null ? null : String(candidate.processId),
+        generation: candidate.generation != null && Number.isFinite(Number(candidate.generation))
+          ? Number(candidate.generation) : null,
+        startedAt: candidate.startedAt != null && Number.isFinite(Number(candidate.startedAt))
+          ? Number(candidate.startedAt) : null,
+      }
+    : null;
+  const previous = record.receipt || {};
+  // A duplicate canonical audit may fill missing proof, never retarget a proof
+  // already accepted for this exact user row to the tab's later provider turn.
+  let enrichedContext = context;
+  if (context && previous.auditExecutionContext) {
+    const known = previous.auditExecutionContext;
+    if (Object.keys(context).some(key => known[key] != null && context[key] != null && known[key] !== context[key])) return {};
+    enrichedContext = Object.fromEntries(Object.keys(context).map(key => [key, known[key] ?? context[key]]));
+  }
+  return {
+    ...(enrichedContext && JSON.stringify(enrichedContext) !== JSON.stringify(previous.auditExecutionContext)
+      ? { auditExecutionContext: enrichedContext } : {}),
+    ...(typeof previous.auditQueuedAtSubmit !== 'boolean' && typeof audit.raw?.queuedAtSubmit === 'boolean'
+      ? { auditQueuedAtSubmit: audit.raw.queuedAtSubmit } : {}),
+  };
+}
+
 function encodeJson(value) {
   if (value === undefined || value === null) return null;
   return JSON.stringify(value);
@@ -649,6 +680,11 @@ class AgentSendReceiptStore {
     if (cancelled?.request_fingerprint && cancelled.request_fingerprint !== identity.requestFingerprint) {
       return { ok: false, action: 'conflict', code: 'agent_send_handoff_conflict', record: this._record(identity.operationKey) };
     }
+    const cancelledControl = decodeJson(cancelled?.control_json);
+    if (cancelled && (cancelled.tab_id !== identity.tabId || cancelled.handoff_id !== identity.handoffId
+      || cancelledControl?.provider && cancelledControl.provider !== identity.provider)) {
+      return { ok: false, action: 'conflict', code: 'agent_send_handoff_conflict', record: this._record(identity.operationKey) };
+    }
     const existing = this._record(identity.operationKey);
     if (existing) {
       const mismatchedFields = identityMismatches(existing, identity, {
@@ -758,13 +794,46 @@ class AgentSendReceiptStore {
     return () => this.listeners.delete(listener);
   }
 
+  // Read-only preflight lets a composite Stop validate every exact intent
+  // before cancelling any other FIFO item. The caller resolves a missing ACK's
+  // attempt from the existing immutable handoff, never from the current tab.
+  validateDeliveryCancellation(input = {}) {
+    const operationKey = requiredString(input.operationKey, 'operationKey');
+    const record = this._record(operationKey);
+    if (record) {
+      if (record.tabId !== input.tabId || record.handoffId !== input.handoffId
+        || input.provider != null && record.provider !== input.provider) {
+        return { ok: false, reason: 'cancel-identity-mismatch', record };
+      }
+      if (input.attemptId !== record.attemptId) return { ok: false, reason: 'stale-attempt', record };
+      return { ok: true, record, control: record.deliveryControl || null };
+    }
+    if (input.allowUnreserved !== true) return { ok: false, reason: 'cancel-identity-mismatch', record: null };
+    requiredString(input.tabId, 'tabId'); requiredString(input.handoffId, 'handoffId');
+    const marker = this.db.prepare('SELECT * FROM agent_send_cancelled_intents WHERE operation_key = ?').get(operationKey);
+    const control = decodeJson(marker?.control_json);
+    if (marker && (control?.version !== 1 || !Number.isFinite(control.cancelledAt) || control.cancelledAt <= 0)) {
+      return { ok: false, reason: 'cancel-control-unavailable', record: null };
+    }
+    if (marker && (marker.tab_id !== input.tabId || marker.handoff_id !== input.handoffId
+      || control?.provider && input.provider != null && control.provider !== input.provider)) {
+      return { ok: false, reason: 'cancel-identity-mismatch', record: null };
+    }
+    if (input.attemptId != null && input.attemptId !== control?.attemptId) {
+      return { ok: false, reason: 'receipt-or-attempt-unavailable', record: null };
+    }
+    return { ok: true, record: null, control, requestFingerprint: marker?.request_fingerprint || '' };
+  }
+
   // Cancelling future input is not a statement about an earlier Enter. Keep
   // this tombstone outside receipt_json so late transport/audit callbacks can
   // enrich delivery evidence without resurrecting the user's intent.
   cancelDelivery(input = {}) {
     const operationKey = requiredString(input.operationKey, 'operationKey');
     const result = this.db.transaction(() => {
-      const record = this._record(operationKey);
+      const validation = this.validateDeliveryCancellation(input);
+      if (!validation.ok) return validation;
+      const record = validation.record;
       if (!record && input.allowUnreserved === true) {
         const tabId = requiredString(input.tabId, 'tabId'), handoffId = requiredString(input.handoffId, 'handoffId');
         const previous = this.db.prepare('SELECT * FROM agent_send_cancelled_intents WHERE operation_key = ?').get(operationKey);
@@ -773,7 +842,11 @@ class AgentSendReceiptStore {
         }
         const control = previous ? decodeJson(previous.control_json) : { version: 1,
           cancelledAt: this.now(), attemptId: null, reason: optionalString(input.reason) || 'user-cancel',
-          presentationDismissed: input.presentationDismissed === true };
+          presentationDismissed: input.presentationDismissed === true,
+          ...(input.provider != null ? { provider: input.provider } : {}),
+          // A missing receipt may have been pruned/reset. This marker forbids
+          // future admission; it does not prove what an earlier request wrote.
+          deliveryOutcomeUnknown: true };
         this.db.prepare(`INSERT OR IGNORE INTO agent_send_cancelled_intents
           (operation_key,request_fingerprint,tab_id,handoff_id,control_json) VALUES(?,'',?,?,?)`)
           .run(operationKey, tabId, handoffId, encodeJson(control));
@@ -797,6 +870,7 @@ class AgentSendReceiptStore {
         return { ok: true, applied: false, idempotent: true, record };
       }
       const control = { version: 1, cancelledAt: this.now(), attemptId: record.attemptId,
+        provider: record.provider,
         reason: optionalString(input.reason) || 'user-cancel',
         presentationDismissed: input.presentationDismissed === true };
       // Like audit claims, this small immutable marker outlives payload pruning.
@@ -820,7 +894,9 @@ class AgentSendReceiptStore {
       && (attemptId === null || row.attempt_id === attemptId);
     const marker = this.db.prepare('SELECT control_json FROM agent_send_cancelled_intents WHERE operation_key = ?').get(operationKey);
     const control = decodeJson(marker?.control_json);
-    return !!control?.cancelledAt && (attemptId === null || control.attemptId === attemptId);
+    // An unreserved tombstone revokes the immutable operation, including an
+    // old dispatched attempt whose receipt is no longer retained.
+    return !!control?.cancelledAt && (attemptId === null || control.attemptId === null || control.attemptId === attemptId);
   }
 
   beginAttempt(identityInput) {
@@ -1646,6 +1722,7 @@ class AgentSendReceiptStore {
       if (this.findConflictingAuditClaim(audit)) {
         return { ok: false, matched: true, promoted: false, reason: 'canonical-user-already-owned', record };
       }
+      const followupMetadata = canonicalAuditFollowupMetadata(record, audit);
       if (record.state === STORE_STATES.CONFIRMED && record.auditIdentity) {
         const sameExactRow = record.auditIdentity.entryUuid
           ? (record.auditIdentity.entryUuid === audit.entryUuid
@@ -1684,7 +1761,7 @@ class AgentSendReceiptStore {
             || audit.entryUuidAliases.includes(record.auditIdentity.entryUuid);
           const entryUuid = upgrades ? audit.entryUuid : record.auditIdentity.entryUuid;
           const sourceIdentity = upgrades ? audit.sourceIdentity : record.auditIdentity.sourceIdentity;
-          const receipt = { ...record.receipt, entryUuid, sourceIdentity,
+          const receipt = { ...record.receipt, ...followupMetadata, entryUuid, sourceIdentity,
             recordByteOffset: upgrades ? audit.recordByteOffset : record.receipt?.recordByteOffset ?? null,
             entryUuidAliases: [...new Set([...previous.entryUuids, ...incoming.entryUuids])].filter(value => value !== entryUuid),
             sourceIdentityAliases: [...new Set([...previous.sourceIdentities, ...incoming.sourceIdentities])].filter(value => value !== sourceIdentity),
@@ -1703,7 +1780,7 @@ class AgentSendReceiptStore {
         // later, independently of History presentation. This is metadata
         // enrichment of the SAME audited row, not a second delivery/settlement.
         if (sameAuditIdentity && !record.auditIdentity.entryUuid && audit.entryUuid) {
-          const receipt = { ...record.receipt, entryUuid: audit.entryUuid,
+          const receipt = { ...record.receipt, ...followupMetadata, entryUuid: audit.entryUuid,
             recordByteOffset: audit.recordByteOffset ?? record.receipt?.recordByteOffset ?? null };
           const info = this.statements.enrichAuditAddress.run({
             operationKey: record.operationKey, attemptId: record.attemptId,
@@ -1714,6 +1791,18 @@ class AgentSendReceiptStore {
           return { ok: info.changes === 1, matched: true, promoted: false,
             enriched: info.changes === 1, idempotent: info.changes === 1,
             reason: info.changes === 1 ? 'canonical-address-enriched' : 'state-changed',
+            record: this._record(record.operationKey) };
+        }
+        if (sameAuditIdentity && Object.keys(followupMetadata).length) {
+          const info = this.statements.enrichAuditAliases.run({
+            operationKey: record.operationKey, attemptId: record.attemptId,
+            entryUuid: record.auditIdentity.entryUuid, sourceIdentity: record.auditIdentity.sourceIdentity,
+            previousEntryUuid: record.auditIdentity.entryUuid, previousSourceIdentity: record.auditIdentity.sourceIdentity,
+            receiptJson: encodeJson({ ...record.receipt, ...followupMetadata }), updatedAt: this.now(),
+          });
+          return { ok: info.changes === 1, matched: true, promoted: false,
+            enriched: info.changes === 1, idempotent: info.changes === 1,
+            reason: info.changes === 1 ? 'canonical-context-enriched' : 'state-changed',
             record: this._record(record.operationKey) };
         }
         return {
@@ -1739,6 +1828,7 @@ class AgentSendReceiptStore {
       const historyOnly = audit.raw?.historyOnly === true;
       const receipt = {
         ...(record.receipt || {}),
+        ...followupMetadata,
         ok: true,
         success: true,
         accepted: true,
@@ -2051,6 +2141,11 @@ class AgentSendReceiptStore {
   unpinForOwner(operationKey, owner) {
     this.db.prepare('DELETE FROM agent_send_receipt_pins WHERE operation_key = ? AND owner = ?')
       .run(requiredString(operationKey, 'operationKey'), requiredString(owner, 'owner'));
+  }
+
+  listOwnerPins(owner) {
+    return this.db.prepare('SELECT operation_key FROM agent_send_receipt_pins WHERE owner = ? ORDER BY operation_key')
+      .all(requiredString(owner, 'owner')).map(row => row.operation_key);
   }
 
   prune(timestamp = this.now()) {

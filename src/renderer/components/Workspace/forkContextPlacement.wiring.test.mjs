@@ -23,7 +23,7 @@ test('pane context fork stays beside its source; sidebar context stays sidebar-o
   );
   assert.match(block, /tabContextSurface\(renameHostRef\.current, tab\.id\)/);
   assert.match(block, /afterVisualSubtree: true/);
-  assert.match(block, /placeContextCreatedTab\(contextSurface, tab\.id, newTabId\)/);
+  assert.match(block, /placeContextCreatedTab\(contextSurface, tab\.id, newTabId, placementOrigin\)/);
   assert.match(placement, /paneHoldsTab\(pane, sourceTabId\)/);
   assert.match(placement, /addTabToSplitPaneStrip\(paneIndex, projectId, newTabId\)/);
   assert.match(placement, /reorderSplitPaneTab\(paneIndex, newTabId, sourceIndex \+ 1\)/);

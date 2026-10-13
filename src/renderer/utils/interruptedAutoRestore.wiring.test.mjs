@@ -2,16 +2,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const renderer = path.join(here, '..');
 const src = path.join(renderer, '..');
 const app = fs.readFileSync(path.join(renderer, 'App.tsx'), 'utf8');
-const dashboard = fs.readFileSync(path.join(renderer, 'components', 'Dashboard', 'Dashboard.tsx'), 'utf8');
 const continueFlow = fs.readFileSync(path.join(here, 'continueInterruptedSession.ts'), 'utf8');
-const lifecycle = fs.readFileSync(path.join(renderer, 'components', 'Workspace', 'useAgentLifecycle.ts'), 'utf8');
-const settings = fs.readFileSync(path.join(renderer, 'components', 'UI', 'SettingsModal.tsx'), 'utf8');
 const main = fs.readFileSync(path.join(src, 'main', 'main.js'), 'utf8');
 
 test('boot restore is unconditional, workflow-prioritized and bounded while each tab waits for ready', () => {
@@ -35,6 +33,7 @@ test('boot restore is unconditional, workflow-prioritized and bounded while each
   assert.match(restoreBlock, /app:getState', 'interruptedAutoRestoreParallelism'/);
   assert.match(restoreBlock, /onLaunchSettled: releaseAdmission/);
   assert.doesNotMatch(app, /Promise\.all\(tabs\.map\(startOne\)/);
+  const dashboard = fs.readFileSync(path.join(renderer, 'components', 'Dashboard', 'Dashboard.tsx'), 'utf8');
   assert.doesNotMatch(dashboard, /Auto-resume AI sessions|auto_resume_sessions/);
 
   const waitAt = continueFlow.indexOf("ipcRenderer.invoke('agent:wait-start-ready'");
@@ -43,7 +42,9 @@ test('boot restore is unconditional, workflow-prioritized and bounded while each
   assert.ok(clearAt > waitAt, 'wasInterrupted may clear only after ready proof');
   assert.match(app, /phase=' \+ phase/);
   assert.match(continueFlow, /settled: terminalFailure/);
-  assert.match(continueFlow, /run-command` returning is the main-owned admission boundary/);
+  assert.match(continueFlow, /const knownPendingLaunch = runResult\?\.accepted === true[\s\S]*?acceptancePending[\s\S]*?joined/);
+  assert.match(continueFlow, /deferAdmissionRelease = true;[\s\S]*?releaseAdmission\(\);[\s\S]*?await assertSourceCurrent\(\)/);
+  const settings = fs.readFileSync(path.join(renderer, 'components', 'UI', 'SettingsModal.tsx'), 'utf8');
   assert.match(settings, /data-settings-section="history-memory"/);
   assert.match(settings, /interruptedAutoRestoreParallelism/);
   assert.match(settings, /min=\{1\}[\s\S]{0,80}max=\{3\}/);
@@ -70,7 +71,17 @@ test('automatic restore errors use the shared persistent toast with a copy repor
     app.indexOf('// Semantic index watchers'),
   );
   assert.match(restoreBlock, /buildInterruptedRestoreIncidentReport\(\{/);
-  assert.match(restoreBlock, /'error',[\s\S]{0,120}true,[\s\S]{0,120}incidentReport/);
+  const call = restoreBlock.match(/showToast\(\s*message,[\s\S]*?\n\s*\);/)?.[0];
+  assert.ok(call, 'shared toast call retains the actual failure report');
+  let args;
+  const report = Object.freeze({ incident: 'original' });
+  vm.runInNewContext(call, { message: 'failure', incidentReport: report, item: { tabId: 'T' },
+    showToast: (...values) => { args = values; } });
+  assert.equal(args[1], 'warning', 'retained paused session uses the established warning severity');
+  assert.equal(args[3], true, 'persistent toast');
+  assert.strictEqual(args[4], report);
+  assert.equal(args[7], 'T');
+  assert.strictEqual(args[9], report, 'copy report carries the same incident');
   assert.doesNotMatch(restoreBlock, /true,\s*undefined,[\s\S]{0,160}`Session /);
 });
 
@@ -83,11 +94,15 @@ test('an admitted empty Claude restart releases the old UUID guard without prema
   assert.doesNotMatch(body, /clearInterruptedState/);
 });
 
-test('launch failure is visible before the retained interrupted fallback', () => {
-  const startingAt = lifecycle.indexOf('if (sessionStarting && sessionStarting.tabId === tabId)');
-  const interruptedAt = lifecycle.indexOf('if (interrupted)', startingAt);
-  assert.ok(startingAt >= 0 && interruptedAt > startingAt);
-  assert.match(lifecycle, /Waiting for automatic restore/);
+test('current launch failure stays visible without resurrecting the removed interrupted overlay', () => {
+  const lifecycle = fs.readFileSync(path.join(renderer, 'components', 'Workspace', 'useAgentLifecycle.ts'), 'utf8');
+  const summary = lifecycle.slice(lifecycle.lastIndexOf('return useMemo<AgentLifecycleSummary | null>'));
+  assert.match(summary, /if \(sessionStarting && sessionStarting\.tabId === tabId\)/);
+  assert.match(summary, /getSessionStartingPresentation\(sessionStarting\)/);
+  assert.match(summary, /presentation\.isError \? 'error'/);
+  assert.match(summary, /onDismiss: presentation\.isError/);
+  assert.doesNotMatch(summary, /if \(interrupted\)|Waiting for automatic restore/);
+  assert.match(summary, /return null;/);
 });
 
 test('stale commandRunning can self-repair only with prompt, foreground and process proof', () => {

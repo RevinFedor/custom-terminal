@@ -140,6 +140,8 @@ export type OrchestrationRun = {
   resultPromptCarrierKind?: 'event' | 'response' | 'user' | null;
   resultProofStatus?: OrchestrationResultProofStatus | null;
   recoveryReason?: string | null;
+  continuation?: { operationId: string; handoffId: string; state: 'prepared' | 'sending' | 'unconfirmed' | 'blocked' | 'bound' | 'delivered-paused'; error?: string | null; createdAt: number; confirmedAt?: number | null };
+  replacementRunId?: string | null;
   error?: string | null;
 };
 

@@ -29,6 +29,20 @@ test('membership-only move updates scope and selected target without changing so
   assert.deepEqual(inventory.groups[0].tabs.map(t=>t.id),['second','owner','other']);assert.deepEqual(state,before);
 });
 
+test('icon scope explicitly includes empty workflows and Inbox without inventing target tabs',()=>{
+  const state=fixture();
+  state.tabWorkflowMembership.inbox={workflowId:'a',revision:2};
+  state.spaces.splice(1,0,{id:'empty',name:'Empty',projectIds:[]});
+  const before=structuredClone(state);
+  const compact=canonicalRunAfterPickerInventory(state,{ownerTabId:'owner',includeEmptyWorkflows:true});
+  assert.deepEqual(compact.groups.map(group=>group.workflowId),['a','empty','b',inbox]);
+  assert.deepEqual(compact.groups.find(group=>group.workflowId===inbox).tabs,[]);
+  assert.deepEqual(compact.groups.find(group=>group.workflowId==='empty').rows,[]);
+  const legacy=canonicalRunAfterPickerInventory(state,{ownerTabId:'owner'});
+  assert.deepEqual(legacy.groups.map(group=>group.workflowId),['a','b']);
+  assert.deepEqual(state,before);
+});
+
 test('global group spans namespaces in one workflow and uses mixed root order',()=>{
   const state=fixture();state.openProjects.set('second-namespace',{tabs:new Map([['extra',{id:'extra',commandType:'codex'}]])});
   state.tabWorkflowMembership.extra={workflowId:'a',revision:1};

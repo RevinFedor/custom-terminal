@@ -181,6 +181,21 @@ test('renderer-only positive still blocks safely when headless state is unavaila
   assert.match(result.source, /^renderer-positive:/);
 });
 
+test('4196: older renderer positive cannot settle an unknown newer Main input', () => {
+  const main = { success: true, hasDraft: null, source: 'headless-main',
+    frameBlocker: 'synchronized-output-open', frameIdentity: frame(5132, 'same') };
+  const old = { success: true, hasDraft: true, source: 'cursor:5051:multiline-draft-row-5054',
+    preview: 'Working context changed', frameIdentity: frame(5031, 'same') };
+  const result = mergeCodexDraftAuthority(main, old);
+  assert.equal(result.hasDraft, null, 'unknown is not permission to paste');
+  assert.equal(result.success, false);
+  assert.equal(result.rendererPositiveIgnored, 'renderer-frame-behind');
+  assert.equal(result.frameBlocker, main.frameBlocker, 'existing frame event can wake the observation');
+  for (const seq of [5132, 5133]) {
+    assert.equal(mergeCodexDraftAuthority(main, { ...old, frameIdentity: frame(seq, 'same') }).hasDraft, true);
+  }
+});
+
 test('renderer positive cannot revive a superseded or cancelled observation', () => {
   const renderer = {
     success: true,

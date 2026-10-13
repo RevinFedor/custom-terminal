@@ -3,9 +3,16 @@ import { attributeFreeze, recentRendererActivities } from './rendererActivityTra
 import { reportPerfIncident, setPerfIncidentWriter, sendPerfHeartbeat, createPerfSocketWriter } from './perfIncidentChannel';
 import { getInteractionCursor } from './interactionCursor';
 import { installUIActionDiagnostics, captureUIAction, recordUIFrame, recordUIEventTiming,
-  summarizeUIAction, formatDiagnosticKey } from './uiPerformanceDiagnostics.mjs';
+  summarizeUIAction, formatDiagnosticKey, createUIClipboardOutcomeQueue, createUIFrameScheduler } from './uiPerformanceDiagnostics.mjs';
 
 let installed = false;
+
+function onFinalPageHide(dispose: () => void): void {
+  // beforeunload can be cancelled; a persisted pagehide can resume from bfcache.
+  window.addEventListener('pagehide', (event: PageTransitionEvent) => {
+    if (!event.persisted) dispose();
+  });
+}
 
 function shortId(value: string | null | undefined): string {
   return value ? value.slice(-12) : 'none';
@@ -116,29 +123,35 @@ export function installWatchdogHeartbeat() {
     const { ipcRenderer } = electronRequire('electron');
     const net = electronRequire('net');
     const proc = electronRequire('process');
+    let sock: any = null;
+    let timer: number | null = null;
+    let reconnectTimer: number | null = null;
+    let stopped = false;
+    const teardownSock = () => {
+      setPerfIncidentWriter(null);
+      if (timer !== null) { window.clearInterval(timer); timer = null; }
+      if (sock) {
+        // Listeners off before destroy so close cannot schedule a reconnect.
+        try { sock.removeAllListeners(); sock.destroy(); } catch {}
+        sock = null;
+      }
+    };
+    // Own the lifetime before requesting transport metadata: a late ACK must
+    // not create a connection for a document that has already departed.
+    onFinalPageHide(() => {
+      stopped = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      teardownSock();
+    });
     ipcRenderer.invoke('perf:watchdog-info').then((info: { socketPath?: string | null }) => {
+      if (stopped) return;
       const socketPath = info?.socketPath;
       if (!socketPath) {
         log('[Perf:Probe] watchdog-heartbeat disabled (no socket)');
         return;
       }
-      let sock: any = null;
-      let timer: number | null = null;
       let retryDelayMs = 1000;
       let reconnectPending = false;
-      let reconnectTimer: number | null = null;
-      let stopped = false;
-      const teardownSock = () => {
-        setPerfIncidentWriter(null);
-        if (timer !== null) { window.clearInterval(timer); timer = null; }
-        if (sock) {
-          // Listeners off BEFORE destroy — destroy() re-fires 'close', which
-          // would otherwise schedule a second reconnect per cycle and multiply
-          // connection attempts.
-          try { sock.removeAllListeners(); sock.destroy(); } catch {}
-          sock = null;
-        }
-      };
       const scheduleReconnect = () => {
         if (stopped || reconnectPending) return;
         reconnectPending = true;
@@ -173,11 +186,6 @@ export function installWatchdogHeartbeat() {
         sock.on('close', scheduleReconnect);
       };
       connect();
-      window.addEventListener('beforeunload', () => {
-        stopped = true;
-        if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-        teardownSock();
-      });
       log('[Perf:Probe] watchdog-heartbeat armed sock=' + socketPath);
     }).catch((e: any) => {
       log('[Perf:Probe] watchdog-info-failed error=' + (e?.message || String(e)));
@@ -203,7 +211,8 @@ export function installPerfFreezeProbe() {
   installWatchdogHeartbeat();
   let diagnosticIpc: any = null;
   try { diagnosticIpc = (window as any).require?.('electron')?.ipcRenderer; } catch {}
-  installUIActionDiagnostics({ emit: log, notify: (action: any) => {
+  let frameScheduler: ReturnType<typeof createUIFrameScheduler> | null = null;
+  const uiActions = installUIActionDiagnostics({ emit: log, onPendingFrame: () => frameScheduler?.wake(), notify: (action: any) => {
     try { diagnosticIpc?.send('perf:ui-summary', action); } catch {}
   } });
   log('[Perf:Probe] actionSchema=2 targetSnapshot=1 safeKeyClass=1 stylesheetIdentity=1 nativeCounters=' + Number(!!diagnosticIpc));
@@ -211,12 +220,12 @@ export function installPerfFreezeProbe() {
   const rafSamples: LoopSample[] = [];
   const timerSamples: LoopSample[] = [];
 
-  let lastRaf = performance.now();
+  let lastRaf: number | null = null;
   let lastRafLogAt = 0;
   const rafProbe = (now: number) => {
-    const gapMs = now - lastRaf;
-    const frameAbs = performance.timeOrigin + now;
-    recordUIFrame(frameAbs);
+    const frameAbs = absNow();
+    const gapMs = lastRaf === null ? 0 : frameAbs - lastRaf;
+    recordUIFrame(performance.timeOrigin + now);
     pushLoopSample(rafSamples, { abs: frameAbs, gapMs });
     if (
       document.visibilityState === 'visible' &&
@@ -226,7 +235,7 @@ export function installPerfFreezeProbe() {
       lastRafLogAt = now;
       log(
         '[Perf:EventLoopLag] source=raf' +
-        ' prevFrameAbs=' + (performance.timeOrigin + lastRaf).toFixed(1) +
+        ' prevFrameAbs=' + lastRaf!.toFixed(1) +
         ' frameAbs=' + frameAbs.toFixed(1) +
         ' gapMs=' + gapMs.toFixed(1)
       );
@@ -235,16 +244,22 @@ export function installPerfFreezeProbe() {
           '[Perf:FreezeSummary] layer=renderer' +
           ' kind=rafGap' +
           ' severity=' + freezeSeverity(gapMs) +
-          ' prevFrameAbs=' + (performance.timeOrigin + lastRaf).toFixed(1) +
+          ' prevFrameAbs=' + lastRaf!.toFixed(1) +
           ' frameAbs=' + frameAbs.toFixed(1) +
           ' gapMs=' + gapMs.toFixed(1)
         );
       }
     }
-    lastRaf = now;
-    window.requestAnimationFrame(rafProbe);
+    lastRaf = frameAbs;
   };
-  window.requestAnimationFrame(rafProbe);
+  frameScheduler = createUIFrameScheduler({
+    request: (callback: FrameRequestCallback) => window.requestAnimationFrame(callback),
+    cancel: (id: number) => window.cancelAnimationFrame(id),
+    hasPending: () => uiActions.pending(), onFrame: rafProbe,
+    // There is no pre-event continuous frame evidence across intentional idle.
+    onIdle: () => { lastRaf = null; rafSamples.length = 0; },
+  });
+  onFinalPageHide(() => frameScheduler?.dispose());
 
   const timerIntervalMs = 250;
   let lastTimer = performance.now();
@@ -468,9 +483,12 @@ export function installPerfFreezeProbe() {
     );
   };
 
+  const clipboardOutcomes = createUIClipboardOutcomeQueue({emit:log});
+  onFinalPageHide(() => clipboardOutcomes.dispose());
   const captureInput = (event: Event) => {
-    const capturedAction = ['click', 'pointerdown', 'mousedown', 'keydown', 'keyup', 'wheel'].includes(event.type)
+    const capturedAction = ['click', 'pointerdown', 'mousedown', 'keydown', 'keyup', 'wheel', 'copy', 'cut', 'paste'].includes(event.type)
       ? captureUIAction(event) : null;
+    if (capturedAction?.clipboardState) clipboardOutcomes.enqueue(capturedAction, event);
     const pointer = event as PointerEvent | MouseEvent;
     const now = performance.now();
     if ('clientX' in pointer) {
@@ -526,7 +544,9 @@ export function installPerfFreezeProbe() {
         ' inputDelayMs=' + inputDelayMs.toFixed(1) +
         ' eventTimeAbs=' + eventTimeAbs.toFixed(1) +
         ' receivedAbs=' + receivedAbs.toFixed(1) +
-        ' lastRafAbs=' + (lastRaf ? lastRaf.abs.toFixed(1) : 'none') +
+        ' rafSampling=ui-action-frames' +
+        ' rafBaseline=' + (lastRaf ? 'sampled-current-burst' : 'unknown-idle-or-before-first-frame') +
+        ' lastRafAbs=' + (lastRaf ? lastRaf.abs.toFixed(1) : 'unknown') +
         ' lastTimerAbs=' + (lastTimer ? lastTimer.abs.toFixed(1) : 'none') +
         ' rafAgeAtReceiveMs=' + (lastRaf ? (receivedAbs - lastRaf.abs).toFixed(1) : 'na') +
         ' timerAgeAtReceiveMs=' + (lastTimer ? (receivedAbs - lastTimer.abs).toFixed(1) : 'na') +
@@ -546,6 +566,9 @@ export function installPerfFreezeProbe() {
   window.addEventListener('keydown', captureInput, { capture: true, passive: true });
   window.addEventListener('keyup', captureInput, { capture: true, passive: true });
   window.addEventListener('wheel', captureInput, { capture: true, passive: true });
+  window.addEventListener('copy', captureInput, { capture: true, passive: true });
+  window.addEventListener('cut', captureInput, { capture: true, passive: true });
+  window.addEventListener('paste', captureInput, { capture: true, passive: true });
   window.addEventListener('mouseover', captureInput, { capture: true, passive: true });
   window.addEventListener('pointermove', (event) => {
     lastPointerX = event.clientX;

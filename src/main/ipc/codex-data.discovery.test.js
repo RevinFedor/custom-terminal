@@ -15,6 +15,31 @@ function sessionMeta(payload) {
   });
 }
 
+test('linked-live boundary skips UTF8 decoding of irrelevant bodies while keeping physical coordinates and partial tail', async (t) => {
+  const sessionsDir = await makeSessionsDir(t);
+  const filePath = path.join(sessionsDir, 'rollout-boundary-decode.jsonl');
+  const metadata = sessionMeta({id:'decode-fixture',cwd:'/tmp/project',timestamp:'2026-10-12T00:00:00Z'});
+  const ignored = JSON.stringify({type:'response_item',payload:{type:'message',content:'irrelevant-body-'+'я'.repeat(1024*1024)}});
+  const oldTurn = JSON.stringify({type:'event_msg',timestamp:'2026-10-12T00:00:01Z',payload:{type:'task_started',turn_id:'old',started_at:1791763201}});
+  const liveTurn = JSON.stringify({type:'event_msg',timestamp:'2026-10-12T00:02:00Z',payload:{type:'task_started',turn_id:'live',started_at:1791763320}});
+  const prefix = [metadata,ignored,oldTurn,'{bad json "event_msg" "task_started"}'].join('\r\n')+'\r\n';
+  await fs.promises.writeFile(filePath,prefix+liveTurn+'\n');
+  const original = Buffer.prototype.toString;let largeDecodeBytes=0;
+  Buffer.prototype.toString=function(...args){if(this.length>1024*1024&&this.includes(Buffer.from('irrelevant-body-')))largeDecodeBytes+=this.length;return original.apply(this,args);};
+  let boundary;
+  try { boundary=await _api.findCodexLinkedLiveBoundary(filePath,{startedAtMs:Date.parse('2026-10-12T00:01:00Z')}); }
+  finally { Buffer.prototype.toString=original; }
+  assert.equal(boundary.found,true);assert.equal(boundary.turnId,'live');assert.equal(boundary.offset,Buffer.byteLength(prefix));
+  assert.equal(boundary.scannedLines,5);assert.equal(largeDecodeBytes,0,'a task-boundary search must not decode the unrelated multi-MiB text');
+  const tail='{"type":"event_msg","payload":{"type":"task_started"';
+  await fs.promises.writeFile(filePath,metadata+'\n'+ignored+'\n'+tail);
+  const incomplete=await _api.findCodexLinkedLiveBoundary(filePath,{startedAtMs:Date.parse('2026-10-12T00:01:00Z')});
+  assert.equal(incomplete.found,false);assert.equal(incomplete.offset,Buffer.byteLength(metadata+'\n'+ignored+'\n'));
+  await fs.promises.writeFile(filePath,metadata+'\n'+liveTurn);
+  const completeTail=await _api.findCodexLinkedLiveBoundary(filePath,{startedAtMs:Date.parse('2026-10-12T00:01:00Z')});
+  assert.equal(completeTail.found,true);assert.equal(completeTail.offset,Buffer.byteLength(metadata+'\n'));
+});
+
 async function makeSessionsDir(t) {
   const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-discovery-'));
   const sessionsDir = path.join(root, 'sessions');

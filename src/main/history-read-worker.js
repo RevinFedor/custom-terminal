@@ -21,6 +21,7 @@ const { historyPreparationActivity } = require('./history-preparation-activity')
 const { observeHistoryResponseTimingBindings } = require('./history-response-timings');
 const { PromptQueueAssetStore } = require('./prompt-queue-assets');
 const { recordCodexProcessActionOwnership } = require('./codex-process-action-ownership');
+const { beginHistoryReadDiagnostic } = require('./history-read-memory-diagnostics');
 
 // This connection uses the existing application's schema and exact methods.
 // It does not run startup migrations, create tabs, or own runtime delivery.
@@ -441,6 +442,20 @@ historyPayloadStash.get = (tool, sessionId, id) => {
 const service = createSessionTranscriptService({ codexData, promptPresentationStore: db, sessionHistoryStore: db,
   preparedHistoryStore: cache,
   codexVirtualMaxBytes: virtualGraphBudget,
+  catalogSearchHooks: {
+    onRead(event) {
+      const bytes = Number(event?.bytes) || 0;
+      sourceBytes += bytes;
+      const context = requestContext.getStore();
+      if (context) { context.sourceBytes += bytes; context.exceptional = true; }
+      phaseDiagnostic({ phase: 'catalog-source', outcome: 'success', reason: event?.phase || 'scan', bytes });
+    },
+    onDiagnostic(event) {
+      phaseDiagnostic({ phase: 'catalog-projection', outcome: 'success', reason: 'query-only',
+        rows: event?.rows, records: event?.records, bytes: event?.resultBytes,
+        durationMs: event?.durationMs });
+    },
+  },
   getMainWindow: () => ({ isDestroyed: () => false, webContents: { send: (channel, payload) => send({ event: 'window', channel, payload }) } }),
   recoverManagedHistoryImageRef: ref => {
     const result = assets?.existingManagedRefSync(ref) || null;
@@ -452,6 +467,24 @@ const service = createSessionTranscriptService({ codexData, promptPresentationSt
     return result;
   },
 });
+let lastCacheMemory = '';
+function publishCacheMemory() {
+  try {
+  const snapshot = { graphBytes: api.getCodexHistoryProjectorStats().approxBytes,
+    virtualBytes: service.codexVirtualTranscriptStore?.stats().approxBytes ?? 0,
+    indexBytes: cache.stats().indexMemoryBytes };
+  const identity = `${snapshot.graphBytes}:${snapshot.virtualBytes}:${snapshot.indexBytes}`;
+  if (identity === lastCacheMemory) return;
+  send({ event: 'cache-memory', snapshot });
+  lastCacheMemory = identity;
+  } catch {
+    lastCacheMemory = '';
+    try { send({ event: 'cache-memory', snapshot: null }); } catch {}
+    // Telemetry failure is unknown, and cannot alter the read/source proof.
+  }
+}
+const cacheDiagnostic = cache.onDiagnostic;
+cache.onDiagnostic = event => { cacheDiagnostic(event); if (!requestContext.getStore()) publishCacheMemory(); };
 historyPreparationActivity.subscribe(snapshot => send({ event: 'preparation', snapshot }));
 observeHistoryResponseTimingBindings(payload => send({ event: 'timing-bound', payload }));
 const chains = new Map();
@@ -471,12 +504,14 @@ parentPort.on('message', message => {
   }
   if (message.event === 'invalidate') {
     api.invalidateJsonlCache(message.filePath, message);
+    publishCacheMemory();
     return;
   }
   if (message.event === 'ownership') { recordCodexProcessActionOwnership(message.payload); return; }
   if (message.event === 'lineage') {
     service.codexProviderForkMetadata.delete(message.sessionId);
     db?.invalidateForkMarkerCache(message.sessionId);
+    publishCacheMemory();
     return;
   }
   if (!message.id) return;
@@ -508,12 +543,16 @@ parentPort.on('message', message => {
       memory: { heapUsed: process.memoryUsage().heapUsed, rss: process.memoryUsage().rss } }, readProof: [] };
     if (method === 'releaseMemory') { api.invalidateCodexHistoryProjectors(); cache.clearMemory();
       service.codexVirtualTranscriptStore?.clear(); return { value: true, readProof: [] }; }
-    if (!['getHistory', 'getTimeline', 'getToolPayload', 'getTabMessageSourceLocation', 'getMessages', 'searchHistory',
+    if (!['getHistory', 'getTimeline', 'getToolPayload', 'getTabMessageSourceLocation', 'getMessages', 'searchHistory', 'searchCatalogCandidate',
       'resolveCodexPhysicalRow', 'copyCodexVirtualRange', 'exportCodexSession'].includes(method)) throw new Error('history_read_method');
     if (message.rewriteReceipt) receipts.set(payload.sessionId, message.rewriteReceipt);
     Object.assign(context, { payloads: new Map(), sources: new Set(), sourceEpochs: sourceEpochs.slice(), preparations: [], assets: new Map() });
     return requestContext.run(context, async () => {
+      const memoryRead = method === 'searchCatalogCandidate' ? beginHistoryReadDiagnostic('catalog-projection', {
+        sessionId: payload.sessionId, provider: 'codex', readId: correlation.diagnosticReadId,
+      }) : null;
       try {
+        if (method === 'searchCatalogCandidate') { context.catalogScan = true; await enterCold(); }
         const result = await service[method](payload);
         const readProof = [...context.sources].map(filePath => ({ filePath,
           epoch: context.sourceEpochs[epochSlot(filePath)], slot: epochSlot(filePath) }));
@@ -522,7 +561,11 @@ parentPort.on('message', message => {
           throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
         }
         if (context.payloads.size) cache.savePayloads(payload, context.payloads);
+        memoryRead?.end('success', { totalIterations: result?.totalIterations, matches: result?.bestMatches?.length });
         return { value: result, readProof };
+      } catch (error) {
+        memoryRead?.end('error', { errorCode: error.code });
+        throw error;
       } finally {
         if (context.assets.size) send({ event: 'assets', refs: [...context.assets.values()] });
         for (const finish of context.preparations) finish();
@@ -554,12 +597,13 @@ parentPort.on('message', message => {
       serializationEndAbs: serializationEnd?.abs, serializationEndPerf: serializationEnd?.perf,
       serializationMs: serializationEnd ? serializationEnd.perf - serializationStart.perf : null,
       replyReadyAbs: ready.abs, replyReadyPerf: ready.perf, resultBytes, transport: message.binary ? 'v8-transfer' : 'structured-clone',
-      source: context.rebuilds ? 'raw-rebuild' : context.sourceBytes ? 'raw-append' : context.ssdHits ? 'ssd' : context.ramHits ? 'ram'
+      source: context.catalogScan ? 'catalog-scan' : context.rebuilds ? 'raw-rebuild' : context.sourceBytes ? 'raw-append' : context.ssdHits ? 'ssd' : context.ramHits ? 'ram'
         : context.unmeasuredRecordRead ? 'records-cache-or-raw' : 'unobserved',
       sourceBytes: context.unmeasuredRecordRead ? null : context.sourceBytes, projectionSourceBytes: context.sourceBytes,
       sourceSize: context.sourceSize, loadedRecords: context.loadedRecords, verificationBytes: context.verificationBytes,
       fedRecords: context.fedRecords, consumedRecords: context.consumedRecords, lineCount: context.lineCount,
       ramHits: context.ramHits, ssdHits: context.ssdHits, rebuilds: context.rebuilds, outcome, reason, exceptional };
+    publishCacheMemory();
     send({ ...body, diagnostic }, transfer);
     const posted = stamp();
     if (exceptional || posted.perf - received.perf >= slowMs) {
@@ -584,7 +628,8 @@ parentPort.on('message', message => {
         proof: { filePath: result.filePath, error: result.error,
           sourcePaths: (result.revision?.sources || []).map(source => source.filePath) } } }, data.byteLength, [data.buffer]);
     } else reply({ id, readProof, result });
-  }, error => { executionEnd = stamp(); reply({ id, error: { message: error.message, code: error.code } }); })
+  }, error => { executionEnd = stamp(); reply({ id, error: { message: error.message, code: error.code,
+    ...(typeof error.lineageReason === 'string' ? { lineageReason: error.lineageReason } : {}) } }); })
     .catch(error => { try {
       if (serializationStart && !serializationEnd) serializationEnd = stamp();
       reply({ id, error: { message: error.message, code: error.code } });
@@ -602,4 +647,5 @@ emitDiagnostic('worker-ready', { cacheEnabled: cache.enabled, cacheSchema: requi
   capabilities: { cacheOnDiagnostic: typeof cache.diagnose === 'function', sourceOnRead: 'projection-storage-only',
     recordReadBytes: false, binaryBytes: true, structuredCloneBytes: false },
   startupCacheErrors: cache.stats().errors, counters: { ...counters } });
+publishCacheMemory();
 send({ event: 'ready' });

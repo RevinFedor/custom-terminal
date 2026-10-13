@@ -104,6 +104,60 @@ test('observed Codex 0.156.1 Luna Reserve footer maps its display name to the ex
   }).ready, true);
 });
 
+test('incident d10d3862: right-aligned warning does not hide the initialized Resume footer', () => {
+  // Exact current-frame text, not a historical transcript footer. The warning
+  // occupies the right column without a separator after model/effort.
+  const frame = selectCodexCurrentInteractiveFrameText([
+    '  Worked for 4m 16s • Oct 11 at 18:50', '',
+    '» Ask Codex to do anything', ' ',
+    '  GPT-6-Astra ultra                                ⚠ 1 warning · f2 to view',
+  ].join('\n'));
+  assert.deepEqual(parseCodexVerifiedComposerFooter(frame), {
+    model: 'gpt-6-astra', effort: 'ultra', fast: false,
+    proof: 'verified-composer-footer',
+  });
+  assert.equal(inspectCodexInputReadyTextCore(frame, '', {
+    requireSyncMarker: false, requireInitializedComposer: true,
+  }).ready, true);
+  for (const blocker of ['auth-required', 'trust-directory', 'resume-goal']) {
+    const blocked = inspectCodexInputReadyTextCore(frame, '', {
+      requireSyncMarker: false, requireInitializedComposer: true, blockers: [blocker],
+    });
+    assert.equal(blocked.ready, false, blocker);
+    assert.deepEqual(blocked.blockers, [blocker]);
+  }
+});
+
+test('warning footer keeps exact model/effort/fast and never initializes a bare StartupDraft', () => {
+  for (const warning of ['⚠ 2 warnings · f2 to view', '⚠️ 12 warnings · f2 to view']) {
+    const footer = 'GPT-6.1-Sol max fast   ' + warning;
+    assert.deepEqual(parseCodexVerifiedComposerFooter(footer), {
+      model: 'gpt-6.1-sol', effort: 'max', fast: true,
+      proof: 'verified-composer-footer',
+    });
+    assert.equal(inspectCodexInputReadyTextCore(footer, '', {
+      requireSyncMarker: false, requireInitializedComposer: true,
+    }).ready, false, 'a footer without its composer is not ready');
+    const bare = '» Ask Codex to do anything\n' + warning;
+    assert.equal(parseCodexVerifiedComposerFooter(bare), null);
+    assert.equal(inspectCodexInputReadyTextCore(bare, '', {
+      requireSyncMarker: false, requireInitializedComposer: true,
+    }).ready, false, 'warning chrome alone cannot initialize StartupDraft');
+  }
+  const oldFooter = 'GPT-6-Astra ultra   ⚠ 1 warning · f2 to view';
+  const frame = selectCodexCurrentInteractiveFrameText([
+    oldFooter, 'unrelated historical output', '» Ask Codex to do anything', '? for shortcuts',
+  ].join('\n'));
+  assert.equal(parseCodexVerifiedComposerFooter(frame), null, 'do not reuse an old warning footer');
+  assert.equal(inspectCodexInputReadyTextCore(frame, '', {
+    requireSyncMarker: false, requireInitializedComposer: true,
+  }).ready, false);
+  for (const tail of ['⚠ warning text', '⚠ 1 warning · run this command',
+    '⚠ 0 warnings · f2 to view', '⚠ 1 warning · f2 to view additional prose']) {
+    assert.equal(parseCodexVerifiedComposerFooter('GPT-6-Astra ultra   ' + tail), null, tail);
+  }
+});
+
 for (const glyph of ['›', '❯', '»']) {
   test(`recognizes Codex composer marker ${glyph}`, () => {
     const inspected = inspectCodexInputReadyTextCore(readyFrame(glyph), '', {

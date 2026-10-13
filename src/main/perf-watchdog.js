@@ -47,7 +47,6 @@ const THRESHOLDS = {
 };
 
 const bootAt = Date.now();
-let lastMainHeartbeatAt = performance.now();
 const bootId = 'wd-' + bootAt.toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 let logSeq = 0;
 
@@ -270,7 +269,6 @@ process.on('message', (m) => {
     return;
   }
   if (m.t === 'hb' && m.proc === 'main') {
-    lastMainHeartbeatAt = performance.now();
     if (m.context && Array.isArray(m.context.appPids) && Array.isArray(m.context.tabs)) {
       mainContext = { appPids: m.context.appPids.slice(0, 64), tabs: m.context.tabs.slice(0, 1024) };
       mainContextAt = performance.now();
@@ -282,6 +280,10 @@ process.on('message', (m) => {
     }
   }
 });
+// Main and the standalone diagnostic fixture both fork us with IPC ownership.
+// Heartbeat silence is the stall being observed, however long it lasts; only
+// channel closure proves that this owner is gone. Shutdown signals also retain
+// their explicit cleanup path below.
 process.on('disconnect', () => {
   wdLog('[Watchdog] main channel closed — exit');
   cleanupAndExit(0);
@@ -350,16 +352,6 @@ if (SOCKET_PATH) {
     wdLog('[Watchdog] listening sock=' + SOCKET_PATH);
   });
 }
-
-// Orphan belt: fork channel close already exits us; this covers exotic cases
-// where the channel object leaks but main is long gone.
-setInterval(() => {
-  if (lameDuck) return;
-  if (performance.now() - lastMainHeartbeatAt > 180000) {
-    wdLog('[Watchdog] no main heartbeat for 180s — assuming orphan, exit');
-    cleanupAndExit(0);
-  }
-}, 30000);
 
 wdLog(
   '[Watchdog] started mainPid=' + MAIN_PID +

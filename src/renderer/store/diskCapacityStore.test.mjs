@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDiskCapacityStore } from './diskCapacityStore.mjs';
-import { diskCapacityPresentation, diskCapacityBytes } from '../utils/diskCapacityPresentation.mjs';
+import { diskCapacityPresentation, diskCapacityBytes, cacheCapacityGiBNumber } from '../utils/diskCapacityPresentation.mjs';
 const ready = (overrides = {}) => ({ status: 'ready', epoch: 'e', revision: 1, measuredAt: 100, expiresAt: 60100,
   freeBytes: 12, cacheBytes: 14, budgetBytes: 20, reserveBytes: 6, remainingGrowthBytes: 6, projectedFreeBytes: 6, warning: false, ...overrides });
 function fixture() {
@@ -50,4 +50,13 @@ test('a failed old subscribe ACK cannot replace a newer push measurement', async
     invoke(name) { return name.endsWith('unsubscribe') ? Promise.resolve() : pending; } } });
   const stop = store.subscribe(() => {}); receive({}, ready({ revision: 4 })); reject(Error('late failure'));
   await Promise.resolve(); assert.equal(store.getSnapshot().status, 'ready'); assert.equal(store.getSnapshot().revision, 4); stop();
+});
+test('RAM freshness can expire independently after a disk error; unknown is not zero', () => {
+  const f = fixture(); const stop = f.store.subscribe(() => {});
+  f.emit({ status: 'error', ram: { status: 'ready', approxBytes: 1, budgetBytes: 2, expiresAt: 60100 } });
+  assert.equal(f.store.getSnapshot().ram.status, 'ready');
+  f.advance(60000); [...f.timers.values()][0].fn();
+  assert.equal(f.store.getSnapshot().status, 'error'); assert.equal(f.store.getSnapshot().ram.status, 'stale');
+  assert.equal(cacheCapacityGiBNumber(null), '—'); assert.equal(cacheCapacityGiBNumber(0), '0');
+  assert.equal(cacheCapacityGiBNumber(1), '<0,01'); stop();
 });

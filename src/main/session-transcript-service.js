@@ -107,6 +107,11 @@ const IDLE_STATE_GRACE_MS = 90_000;
 // accumulate watchers indefinitely — oldest idle state is evicted first.
 const IDLE_STATE_MAX = 8;
 
+// Only SHA-256 scope/version pairs, never records, UUID arrays or metadata
+// bodies. At most 16 KiB of string data (plus bounded Map overhead), owned by
+// this service/worker lifetime and independent of the heavyweight raw LRU.
+const CODEX_MATERIALIZED_COMPACT_PROOF_LIMIT = 64;
+
 function normalizeToolType(toolType) {
   return toolType === 'codex' ? 'codex' : toolType === 'gemini' ? 'gemini' : 'claude';
 }
@@ -236,6 +241,7 @@ class SessionTranscriptService {
     historyReader = null,
     preparedHistoryStore = null,
     codexVirtualMaxBytes = undefined,
+    catalogSearchHooks = null,
     idleGraceMs = IDLE_STATE_GRACE_MS,
     idleStateMax = IDLE_STATE_MAX,
   }) {
@@ -255,6 +261,7 @@ class SessionTranscriptService {
     this.historyReader = historyReader;
     this.preparedHistoryStore = preparedHistoryStore;
     this.codexVirtualMaxBytes = codexVirtualMaxBytes;
+    this.catalogSearchHooks = catalogSearchHooks;
     this.sessionHistoryStore = sessionHistoryStore;
     this.promptPresentationStore = promptPresentationStore;
     this.recoverManagedHistoryImageRef = typeof recoverManagedHistoryImageRef === 'function'
@@ -280,6 +287,7 @@ class SessionTranscriptService {
     this.codexVirtualTranscriptStore = null;
     this.codexResultSourceResolver = null;
     this.codexProviderForkMetadata = new Map();
+    this.codexMaterializedCompactProofs = new Map();
     this.codexLineageRecoveryInflight = new Map();
     this.codexForkPrefixDiagnosticSignatures = new Map();
     this.codexForkValidationFailures = new Map();
@@ -662,8 +670,39 @@ class SessionTranscriptService {
       return result;
     } catch (error) {
       sourceVerificationBytes = error?.sourceVerificationBytes ?? sourceVerificationBytes;
-      return unresolved(error?.reason || error?.message || 'result-source-resolution-failed', error?.retryable === true);
+      return unresolved(error?.reason || error?.message || 'result-source-resolution-failed',
+        error?.retryable === true || error?.code === 'CODEX_SOURCE_READ_INVALIDATED');
     }
+  }
+
+  // Physical Main graphs reuse the existing logical lineage and reader journal.
+  // Virtual graphs need full ancestry proof and keep the canonical read path.
+  captureCodexTurnsLineageProof(sessionId, cwd) {
+    const reader = this.historyReader;
+    if (!reader?.captureCodexLineageReadProof || !reader?.isCodexLineageReadProofCurrent) return null;
+    const readerProof = reader.captureCodexLineageReadProof(sessionId);
+    const lineage = this._resolveCodexLineage(sessionId, 'full');
+    if (lineage.kind !== 'physical') return null;
+    const proof = Object.freeze({ sessionId, cwd,
+      revisionKey: codexResultSourceRevisionKey(sessionId, lineage),
+      legacyEventDigest: createHash('sha256').update(JSON.stringify(lineage.legacyForkEvent || null)).digest('hex'),
+      readerProof });
+    return this.isCodexTurnsLineageProofCurrent(proof, sessionId, cwd) ? proof : null;
+  }
+
+  // Cheap interim guard only: exact owner/reader and the existing bounded
+  // commit journal. Final admission still compares the actual logical view.
+  isCodexTurnsLineageProofAdmitted(proof, sessionId, cwd) {
+    return !!proof && proof.sessionId === sessionId && proof.cwd === cwd
+      && this.historyReader?.isCodexLineageReadProofCurrent?.(proof.readerProof, sessionId) === true;
+  }
+
+  isCodexTurnsLineageProofCurrent(proof, sessionId, cwd) {
+    if (!this.isCodexTurnsLineageProofAdmitted(proof, sessionId, cwd)) return false;
+    const lineage = this._resolveCodexLineage(sessionId, 'full');
+    return lineage.kind === 'physical' && proof.revisionKey === codexResultSourceRevisionKey(sessionId, lineage)
+      && proof.legacyEventDigest === createHash('sha256').update(JSON.stringify(lineage.legacyForkEvent || null)).digest('hex')
+      && this.isCodexTurnsLineageProofAdmitted(proof, sessionId, cwd);
   }
 
   // Shared raw input for history operations and MCP. A view may span frozen
@@ -1042,6 +1081,107 @@ class SessionTranscriptService {
     };
   }
 
+  async _checkCodexMaterializedCompactProof({ childSessionId, cwd, legacyFork, meta }) {
+    const api = this.codexData._api;
+    const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+    const scope = digest([childSessionId, cwd || '']);
+    const certificates = this.codexMaterializedCompactProofs;
+    const previous = certificates.get(scope);
+    // Unknown, failed, or changed inputs must also revoke an older success.
+    certificates.delete(scope);
+    let read = null, signature = null, guardedRead = false;
+    // Freeze values, not the mutable event object: both replacement and
+    // in-place edits must invalidate the result as well as its certificate.
+    const forkSignature = digest(legacyFork);
+    const invalidated = () => Object.assign(new Error('Codex compact proof inputs changed during read'),
+      { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+    let reason = previous ? 'source-or-proof-changed' : 'not-retained';
+    const remember = () => {
+      certificates.delete(scope);
+      certificates.set(scope, signature);
+      while (certificates.size > CODEX_MATERIALIZED_COMPACT_PROOF_LIMIT) {
+        certificates.delete(certificates.keys().next().value);
+      }
+    };
+    const sameLineage = () => {
+      const current = this._resolveCodexLineage(childSessionId, 'dehydrated');
+      return current.kind !== 'virtual' && !!current.legacyForkEvent
+        && digest(current.legacyForkEvent) === forkSignature;
+    };
+    const assertPublicationCurrent = () => {
+      if (guardedRead && !api.isCodexSourceSnapshotCurrent(read.snapshot)) throw invalidated();
+      if (!sameLineage()) throw invalidated();
+    };
+    try {
+      try {
+        if (!['beginCodexSourceRead', 'assertCodexSourceRead', 'finishCodexSourceRead',
+          'isCodexSourceSnapshotCurrent'].every(name => typeof api[name] === 'function')) {
+          throw new Error('compact-proof-source-guard-unavailable');
+        }
+        const found = await api.findCodexSessionFile(childSessionId, cwd);
+        if (!found?.filePath) throw new Error('compact-proof-source-unavailable');
+        // Reuse the existing physical read fence, including the worker's shared
+        // external epoch. Stat-only/mtime-only witnesses are insufficient.
+        read = await api.beginCodexSourceRead(found.filePath, childSessionId);
+        const snapshot = read?.snapshot;
+        if (!read?.ticket || snapshot?.filePath !== found.filePath || snapshot.sessionId !== childSessionId
+          || !snapshot.fileIdentity || !snapshot.sourceGeneration
+          || !['size', 'mtimeMs', 'ctimeMs'].every(key => Number.isFinite(snapshot[key]))) {
+          throw new Error('compact-proof-source-unknown');
+        }
+        guardedRead = true;
+        // The old SID-only header memo is not authority for a new certificate.
+        // This bounded metadata reader runs under the same physical fence.
+        const metadata = await api.readCodexSessionMetadata(found.filePath);
+        if (metadata?.meta?.id !== childSessionId) throw new Error('compact-proof-metadata-unknown');
+        meta = metadata.meta;
+        this.codexProviderForkMetadata.set(childSessionId, meta);
+        signature = digest([snapshot, { externalVersion: read.ticket.externalVersion }, legacyFork, meta]);
+        if (previous === signature) {
+          await api.assertCodexSourceRead(read);
+          assertPublicationCurrent();
+          remember();
+          console.log('[CodexForkLineage] materialized-proof session=' + shortId(childSessionId) + ' cache=hit');
+          return { proven: true, meta };
+        }
+      } catch (error) {
+        if (error?.code === 'CODEX_SOURCE_READ_INVALIDATED') throw error;
+        signature = null;
+        reason = 'source-guard-unknown';
+      }
+      if (meta?.history_mode !== 'paginated') {
+        if (guardedRead) await api.assertCodexSourceRead(read);
+        assertPublicationCurrent();
+        return { proven: false, meta };
+      }
+      const physical = await api.loadSessionRecords?.(childSessionId, cwd);
+      // The full canonical read remains the authority on a miss, including a
+      // changed header or an unavailable fast-path guard. Do not prove a new
+      // file using a stale SID-only metadata memo.
+      const physicalMeta = physical?.success && typeof api.getTimelineSessionMeta === 'function'
+        ? api.getTimelineSessionMeta(physical.records) : meta;
+      const proven = !!physical?.success && isProvenMaterializedCompactFork(
+        legacyFork, physicalMeta, physical.records,
+        api.buildCodexTimeline(physical.records, childSessionId),
+      );
+      // Publication is fenced even on a miss or negative predicate. A stale
+      // attempt must reach HistoryReadClient's existing retry/failure path;
+      // it cannot return success or recover virtual lineage from old inputs.
+      if (guardedRead) await api.assertCodexSourceRead(read);
+      assertPublicationCurrent();
+      if (proven && signature && ['filePath', 'sessionId', 'fileIdentity', 'size', 'mtimeMs', 'ctimeMs', 'sourceGeneration']
+        .every(key => physical.sourceSnapshot?.[key] === read.snapshot[key])) {
+        remember();
+      }
+      console.log('[CodexForkLineage] materialized-proof session=' + shortId(childSessionId)
+        + ' cache=miss reason=' + reason + ' proven=' + Number(proven)
+        + ' retained=' + Number(certificates.has(scope)));
+      return { proven, meta: physicalMeta || meta };
+    } finally {
+      if (read?.ticket) api.finishCodexSourceRead(read);
+    }
+  }
+
   async prepareCodexProviderForkLineage({
     childSessionId,
     cwd,
@@ -1077,6 +1217,16 @@ class SessionTranscriptService {
         : null;
       if (meta) this.codexProviderForkMetadata.set(childSessionId, meta);
     }
+    // Old app compact copies retained the parent's paging header. Only the
+    // original canonical compact/prefix proof can seed this bounded memo.
+    if (legacyFork?.forkMode === 'latest_compact'
+      && ['app', 'terminal-mcp', 'orchestration'].includes(legacyFork.origin)) {
+      const checked = await this._checkCodexMaterializedCompactProof({ childSessionId, cwd, legacyFork, meta });
+      meta = checked.meta;
+      if (checked.proven) {
+        return { required: false, success: true, reason: 'proven-app-materialized-compact-fork' };
+      }
+    }
     const sourceSessionId = String(meta?.forked_from_id || '').trim();
     const historyBase = meta?.history_base && typeof meta.history_base === 'object'
       ? meta.history_base
@@ -1086,20 +1236,6 @@ class SessionTranscriptService {
     const baseOrdinal = Number(historyBase?.end_ordinal_exclusive);
     const forkOrdinal = Number(meta?.forked_from_ordinal_exclusive);
     const providerPaginated = meta?.history_mode === 'paginated';
-    // Old app compact copies retained the parent's paging header (tab-29).
-    // Accept the self-contained representation only with the exact persisted
-    // app snapshot AND an actual leading compact. Nonempty/native children do
-    // not get this exception; no transcript file is rewritten by a read.
-    if (providerPaginated && legacyFork?.forkMode === 'latest_compact'
-      && ['app', 'terminal-mcp', 'orchestration'].includes(legacyFork.origin)) {
-      const physical = await api.loadSessionRecords?.(childSessionId, cwd);
-      if (physical?.success && isProvenMaterializedCompactFork(
-        legacyFork, meta, physical.records,
-        api.buildCodexTimeline(physical.records, childSessionId),
-      )) {
-        return { required: false, success: true, reason: 'proven-app-materialized-compact-fork' };
-      }
-    }
     if (!providerPaginated || !historyBase) {
       const legacyUnknownLineage = !!legacyFork
         && (!legacyFork.forkMode || legacyFork.forkMode === 'unknown')
@@ -1742,18 +1878,37 @@ class SessionTranscriptService {
     };
   }
 
+  // A catalog candidate returns query facts, not a full History/turn graph.
+  // The resolver still owns canonical lineage recovery and physical ranges.
+  async searchCatalogCandidate(payload = {}) {
+    if (normalizeToolType(payload.toolType) !== 'codex' || !payload.sessionId) {
+      throw Object.assign(new Error('Codex catalog identity required'), { code: 'HISTORY_CATALOG_IDENTITY_REQUIRED' });
+    }
+    if (this.historyReader) return this.historyReader.call('searchCatalogCandidate', payload);
+    const { createCodexCatalogSearchReader } = require('./codex-catalog-search');
+    this.codexCatalogSearchReader ||= createCodexCatalogSearchReader({
+      codexApi: this.codexData?._api,
+      onRead: this.catalogSearchHooks?.onRead,
+      onDiagnostic: this.catalogSearchHooks?.onDiagnostic,
+    });
+    return this.codexCatalogSearchReader.search({
+      sessionId: payload.sessionId, query: payload.query,
+      matchesPerSession: payload.matchesPerSession,
+      resolveSource: () => this.resolveCodexResultSource({ sessionId: payload.sessionId, cwd: payload.cwd }),
+      assertLogicalCurrent: source => {
+        try {
+          const key = codexResultSourceRevisionKey(payload.sessionId, this._resolveCodexLineage(payload.sessionId, 'dehydrated'));
+          if (key === source.revisionKey) return;
+        } catch { /* An unresolved current lineage cannot admit the old result. */ }
+        throw Object.assign(new Error('Codex catalog lineage changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+      },
+    });
+  }
+
   /**
    * Cmd+F over the FULL projection, in the read service (worker in desktop).
-   *
-   * The panel used to scan `entry.content` of every row it held. With
-   * row-level hydration a far-away row travels as an identity stub, so a
-   * renderer-side scan would silently miss matches — worse than slow: the
-   * user would conclude the text is not there. This service can obtain the
-   * whole projection independently of the renderer's current window.
-   *
-   * Returns row identities + offsets only, never row content: the caller
-   * scrolls to the row, and hydration delivers the text through the normal
-   * window path.
+   * A row omitted from the renderer's hydrated window must still be searchable.
+   * Returns row identities/offsets; the normal window path hydrates the result.
    */
   async searchHistory(payload = {}) {
     const toolType = normalizeToolType(payload.toolType);

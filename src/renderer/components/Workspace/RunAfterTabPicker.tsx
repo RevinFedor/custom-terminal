@@ -19,7 +19,7 @@ import {
 } from '../../utils/workflowVisuals.mjs';
 import ControlHint from '../UI/ControlHint';
 import TabCard from './TabCard';
-import WorkflowChipPresentation from './WorkflowChip';
+import WorkflowChipPresentation, { WORKFLOW_ICON_CHIP_WIDTH } from './WorkflowChip';
 import { CONTEXT_MENU_ICON_SLOT_STYLE, CONTEXT_MENU_ROW_STYLE } from '../UI/contextMenuMetrics.mjs';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
 import { markQueueChildDismiss, notifyQueueClickChildClosed } from '../../utils/hoverReturnGate.mjs';
@@ -101,6 +101,7 @@ type PickerRow =
 
 type PickerAnchor = {
   top: number;
+  width: number;
   left?: number;
   right?: number;
   maxHeight: number;
@@ -140,6 +141,8 @@ export type RunAfterTabPickerProps = {
   triggerLabel?: string;
   triggerIcon?: ReactNode;
   menuWidth?: number;
+  /** Compact Run After scope: complete workflow inventory, including Inbox. */
+  workflowIconsOnly?: boolean;
   zIndex?: number;
   side?: 'left' | 'right';
   accentColor?: string;
@@ -295,6 +298,7 @@ export function RunAfterTabPicker({
   triggerLabel = 'Run after',
   triggerIcon = null,
   menuWidth = 252,
+  workflowIconsOnly = false,
   zIndex = FLOATING_OVERLAY_Z_INDEX,
   side = 'left',
   accentColor = '#10A37F',
@@ -406,7 +410,8 @@ export function RunAfterTabPicker({
     const state = useWorkspaceStore.getState();
     const projects = useProjectsStore.getState().projects;
     if(state.organizationReady)return canonicalRunAfterPickerInventory(state,{
-      ownerTabId:tabId,selectedTabIds:selectedInputIds,selectedWorkflowIds:runAfterWorkflowIds,projects});
+      ownerTabId:tabId,selectedTabIds:selectedInputIds,selectedWorkflowIds:runAfterWorkflowIds,projects,
+      includeEmptyWorkflows:workflowIconsOnly});
     const allTabsById = new Map<string, AiTab>();
     const allTabsByProject = new Map<string, AiTab[]>();
     const tabGroupsByProject = new Map<string, TabGroup[]>();
@@ -470,7 +475,7 @@ export function RunAfterTabPicker({
       const orderedTabs = workflowProjectIds.flatMap(
         (projectId) => allTabsByProject.get(projectId) || [],
       );
-      if (orderedTabs.length === 0 && space.id !== ownerWorkflowId && !runAfterWorkflowIds.includes(space.id)) continue;
+      if (!workflowIconsOnly && orderedTabs.length === 0 && space.id !== ownerWorkflowId && !runAfterWorkflowIds.includes(space.id)) continue;
       groups.push({
         workflowId: space.id,
         name: space.name || 'Workflow',
@@ -500,7 +505,7 @@ export function RunAfterTabPicker({
     }
 
     return { groups, ownerWorkflowId, selectedTargetWorkflowId };
-  }, [fingerprint, projectIconFingerprint, tabId, selectedInputKey, selectedWorkflowKey]);
+  }, [fingerprint, projectIconFingerprint, tabId, selectedInputKey, selectedWorkflowKey, workflowIconsOnly]);
 
   const [busyMap, setBusyMap] = useState<Map<string, boolean>>(() => getBusyTabsSnapshot());
   // Which tabs are working right now, app-wide. A STRING, not a Set: a selector
@@ -657,7 +662,10 @@ export function RunAfterTabPicker({
     };
   }, [open, openOnHover]);
 
-  const handleOpen = useCallback((): boolean => {
+  const naturalMenuWidth = workflowIconsOnly
+    ? Math.max(menuWidth, 18 + inventory.groups.length * WORKFLOW_ICON_CHIP_WIDTH + Math.max(0, inventory.groups.length - 1) * 4)
+    : menuWidth;
+  const positionMenu = useCallback((): boolean => {
     const panelRect = panelRef.current?.getBoundingClientRect() ?? null;
     const triggerRect = triggerRef.current?.getBoundingClientRect() ?? null;
     const useTriggerRect = !!externalTriggerRef || triggerVariant === 'context-row';
@@ -665,20 +673,33 @@ export function RunAfterTabPicker({
     const horizontalRect = externalTriggerRef && triggerRect ? triggerRect : (panelRect ?? triggerRect);
     if (!verticalRect || !horizontalRect) return false;
     const top = Math.max(8, verticalRect.top);
+    const width = Math.min(naturalMenuWidth, Math.max(1, window.innerWidth - 16));
     const nextAnchor: PickerAnchor = {
       top,
+      width,
       maxHeight: Math.max(180, window.innerHeight - top - 8),
     };
-    const leftSide = horizontalRect.left - menuWidth - 6;
+    const leftSide = horizontalRect.left - width - 6;
     const rightSide = horizontalRect.right + 6;
-    const maxLeft = Math.max(8, window.innerWidth - menuWidth - 8);
+    const maxLeft = Math.max(8, window.innerWidth - width - 8);
     let left = side === 'right' ? rightSide : leftSide;
     if (side === 'left' && leftSide < 8) left = rightSide;
     if (side === 'right' && rightSide > maxLeft && leftSide >= 8) left = leftSide;
     nextAnchor.left = Math.max(8, Math.min(maxLeft, left));
-    setAnchor({
-      ...nextAnchor,
-    });
+    setAnchor(previous => previous && previous.left === nextAnchor.left && previous.top === nextAnchor.top
+      && previous.width === nextAnchor.width && previous.maxHeight === nextAnchor.maxHeight ? previous : nextAnchor);
+    return true;
+  }, [externalTriggerRef, naturalMenuWidth, panelRef, side, triggerRef, triggerVariant]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    positionMenu();
+    window.addEventListener('resize', positionMenu);
+    return () => window.removeEventListener('resize', positionMenu);
+  }, [open, positionMenu]);
+
+  const handleOpen = useCallback((): boolean => {
+    if (!positionMenu()) return false;
     // The counter always reopens off; the workflow keeps whatever the user
     // last picked (the effect above still rescues a workflow that closed).
     if (!persistProjectSelection) {
@@ -692,7 +713,7 @@ export function RunAfterTabPicker({
     setShowAllTabs(showAllTabsOnOpen);
     setOpen(true);
     return true;
-  }, [externalTriggerRef, inventory.groups, inventory.ownerWorkflowId, inventory.selectedTargetWorkflowId, menuWidth, panelRef, persistProjectSelection, setSelectedWorkflowId, showAllTabsOnOpen, side, triggerRef, triggerVariant]);
+  }, [inventory.groups, inventory.ownerWorkflowId, inventory.selectedTargetWorkflowId, persistProjectSelection, positionMenu, setSelectedWorkflowId, showAllTabsOnOpen]);
 
   useEffect(() => {
     if (!openRequestKey) return;
@@ -710,7 +731,7 @@ export function RunAfterTabPicker({
   }, [closeRequestKey]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || workflowIconsOnly) return;
     const strip = workflowStripRef.current;
     if (!strip) return;
     // React/Chromium may register delegated wheel handlers as passive. Then a
@@ -730,7 +751,7 @@ export function RunAfterTabPicker({
     };
     strip.addEventListener('wheel', onWheel, { passive: false });
     return () => strip.removeEventListener('wheel', onWheel);
-  }, [open, inventory.groups.length]);
+  }, [open, inventory.groups.length, workflowIconsOnly]);
 
   const selectedIdSet = useMemo(() => new Set(selectedInputIds), [selectedInputKey]);
   // The rule itself lives in utils/runAfterTabStatus.mjs — this menu is a
@@ -766,7 +787,7 @@ export function RunAfterTabPicker({
   const [allHover, setAllHover] = useState(false);
 
   useEffect(() => {
-    if (!open || !selectedWorkflow?.workflowId) return;
+    if (!open || workflowIconsOnly || !selectedWorkflow?.workflowId) return;
     const frame = requestAnimationFrame(() => {
       const strip = workflowStripRef.current;
       if (!strip || strip.scrollWidth <= strip.clientWidth) return;
@@ -778,7 +799,7 @@ export function RunAfterTabPicker({
       strip.scrollLeft = Math.max(0, Math.min(maxLeft, centeredLeft));
     });
     return () => cancelAnimationFrame(frame);
-  }, [open, selectedWorkflow?.workflowId, inventory.groups.length]);
+  }, [open, selectedWorkflow?.workflowId, inventory.groups.length, workflowIconsOnly]);
 
   const isVisibleTab = useCallback((t: AiTab) => {
     if (t.id === tabId) return false;
@@ -1151,7 +1172,7 @@ export function RunAfterTabPicker({
                 position: 'fixed',
                 top: anchor.top,
                 ...(anchor.left !== undefined ? { left: anchor.left } : { right: anchor.right }),
-                width: menuWidth,
+                width: anchor.width,
                 maxWidth: 'calc(100vw - 16px)',
                 maxHeight: anchor.maxHeight,
                 background: TABBAR_PANEL_BG,
@@ -1223,11 +1244,13 @@ export function RunAfterTabPicker({
 
               <div
                 ref={workflowStripRef}
+                data-run-after-workflow-strip={workflowIconsOnly ? 'icons' : 'labels'}
                 className="scrollbar-hide"
                 style={{
                   display: 'flex',
                   gap: 4,
-                  overflowX: 'auto',
+                  flexWrap: workflowIconsOnly ? 'wrap' : 'nowrap',
+                  overflowX: workflowIconsOnly ? 'hidden' : 'auto',
                   overflowY: 'hidden',
                   paddingBottom: 1,
                 }}
@@ -1236,6 +1259,7 @@ export function RunAfterTabPicker({
                   <WorkflowChip
                     key={g.workflowId}
                     workflowId={g.workflowId}
+                    iconOnly={workflowIconsOnly}
                     label={g.name}
                     icon={g.icon}
                     unplaced={g.unplaced}
@@ -1330,6 +1354,7 @@ export function RunAfterTabPicker({
 
 function WorkflowChip({
   workflowId,
+  iconOnly,
   label,
   icon,
   unplaced,
@@ -1340,6 +1365,7 @@ function WorkflowChip({
   onClick,
 }: {
   workflowId: string;
+  iconOnly?: boolean;
   label: string;
   icon: string | null;
   unplaced: boolean;
@@ -1351,13 +1377,14 @@ function WorkflowChip({
 }) {
   return (
     <WorkflowChipPresentation workflowId={workflowId} label={label} icon={icon} unplaced={unplaced}
+      iconOnly={iconOnly}
       selected={selected}
       data-run-after-workflow-chip={workflowId}
       onClick={onClick}
       title={`${label}: ${count} loader / ${total} AI tabs`}
     >
-      {isOwner && <span style={{ width: 4, height: 4, borderRadius: '50%', background: '#fff', opacity: 0.7, flexShrink: 0 }} />}
-      {count > 0 && <span style={{ color: selected ? '#fff' : PULSE, fontSize: 8, flexShrink: 0 }}>{count}</span>}
+      {!iconOnly && isOwner && <span style={{ width: 4, height: 4, borderRadius: '50%', background: '#fff', opacity: 0.7, flexShrink: 0 }} />}
+      {!iconOnly && count > 0 && <span style={{ color: selected ? '#fff' : PULSE, fontSize: 8, flexShrink: 0 }}>{count}</span>}
     </WorkflowChipPresentation>
   );
 }

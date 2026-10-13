@@ -45,6 +45,41 @@ export function workflowTabCatalog(state) {
   return catalog;
 }
 
+/** Presentation only. Scroll/selection/focus notifications do not change the
+ * represented forest. Live tab/catalog and organization changes still rebuild
+ * it; drag admission always reads the actual store independently. */
+export function createWorkflowSidebarProjection() {
+  let catalogInputs, catalog, presentationInputs, presentation;
+  const equal=(a,b)=>a?.length===b.length && a.every((value,index)=>Object.is(value,b[index]));
+  const keys=['openProjects','tabCatalog','spaces','activeSpaceId','splitPanes','centerStrips',
+    'activeSpaceTab','windowDisplayLayouts','tabWorkflowMembership','pendingTabWorkflowMembership','globalGroups'];
+  return state=>{
+    const nextCatalog=[state.openProjects,state.tabCatalog];
+    if(!equal(catalogInputs,nextCatalog)) {
+      catalog=workflowTabCatalog(state);catalogInputs=nextCatalog;
+    }
+    const nextPresentation=keys.map(key=>state[key]);
+    if(!equal(presentationInputs,nextPresentation)) {
+      const placed=workflowPlacedTabIds(state),represented=new Set(placed),children=new Map();
+      const presentedCatalog={...state.tabCatalog};
+      for(const owner of catalog.values()) {
+        const parent=owner.tab.parentTabId || (owner.tab.tabType==='file' && owner.tab.visualParentTabId);
+        if(parent){const ids=children.get(parent) || [];ids.push(owner.tabId);children.set(parent,ids);}
+      }
+      // One catalog pass and a visited queue, including reversed/deep families.
+      const queue=[...represented];
+      for(let at=0;at<queue.length;at++)for(const id of children.get(queue[at]) || []) {
+        if(represented.has(id))continue;
+        represented.add(id);queue.push(id);presentedCatalog[id]={...presentedCatalog[id],active:false};
+      }
+      presentation={...Object.fromEntries(keys.map(key=>[key,state[key]])),tabCatalog:presentedCatalog,
+        tabWorkflowMembership:{...state.tabWorkflowMembership,...state.pendingTabWorkflowMembership}};
+      presentationInputs=nextPresentation;
+    }
+    return {catalog,presentation};
+  };
+}
+
 export function selectWorkflowReserve(state, workflowId = state.activeSpaceId, orderedTabIds = []) {
   const catalog = workflowTabCatalog(state), placed = workflowPlacedTabIds(state);
   const groups = new Map();

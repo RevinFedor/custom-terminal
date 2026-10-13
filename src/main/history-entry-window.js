@@ -169,6 +169,11 @@ const HISTORY_ROW_STUB_FIELDS = [
   'rawUuid', 'contentRevision', 'entryRef', 'recordByteOffset',
   'sourceIdentity', 'sourceIdentityAliases', 'sourceUuidAliases',
 ];
+// Structural provenance keeps user-side Research grouping identical outside
+// the hydration span. No generated envelope, body offsets, chips or payload.
+// Tab-message/origin fields preserve the existing classifier's priority.
+const HISTORY_STUB_TAG_FIELDS = ['kind', 'runId', 'runKind', 'phase', 'messageId',
+  'source', 'sourceTabId', 'targetTabId', 'systemSource'];
 
 /**
  * Grouping metadata a stub must keep. The display-side series collapsing
@@ -309,6 +314,11 @@ function makeHistoryRowStub(entry) {
     stub.sourceIdentityAliases = entry.sourceIdentityAliases;
   }
   if (entry.serviceCarrier !== undefined) stub.serviceCarrier = entry.serviceCarrier;
+  if (Array.isArray(entry.semanticTags)) {
+    stub.semanticTags = entry.semanticTags.filter(tag => tag && typeof tag === 'object')
+      .map(tag => Object.fromEntries(HISTORY_STUB_TAG_FIELDS
+        .filter(field => typeof tag[field] === 'string').map(field => [field, tag[field]])));
+  }
   // A short caption belongs to its action group, while a long reply is a
   // boundary. Keep its exact trimmed length: hasContent alone changes that
   // decision when an old row leaves the hydration span, reindexing everything

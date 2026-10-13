@@ -4,7 +4,7 @@ import {resolveWorkflowIcon} from './workflowVisuals.mjs';
 
 // Canonical picker inventory is a complete AI membership view, independent of
 // Mac window placement and execution namespace. Callers still own all actions.
-export function canonicalRunAfterPickerInventory(state,{ownerTabId,selectedTabIds=[],selectedWorkflowIds=[],projects={}}) {
+export function canonicalRunAfterPickerInventory(state,{ownerTabId,selectedTabIds=[],selectedWorkflowIds=[],projects={},includeEmptyWorkflows=false}) {
   const catalog=new Map();
   for(const [projectId,workspace] of state.openProjects)for(const tab of workspace.tabs.values()) {
     const kind=aiKindForTab(tab);
@@ -22,7 +22,7 @@ export function canonicalRunAfterPickerInventory(state,{ownerTabId,selectedTabId
     const selection=selectWorkflowMembers({catalog,membership:state.tabWorkflowMembership,workflowId:space.id,
       orderedTabIds:space.reserveOrder || [],rootOrder:space.reserveRootOrder || [],globalGroups:state.globalGroups});
     const tabs=selection.items.map(owner=>owner.tab),rows=[];
-    if(!tabs.length && space.id!==ownerWorkflowId && !selectedWorkflowIds.includes(space.id))continue;
+    if(!includeEmptyWorkflows && !tabs.length && space.id!==ownerWorkflowId && !selectedWorkflowIds.includes(space.id))continue;
     const flatten=nodes=>nodes.flatMap(node=>[...(node.tabId?[catalog.get(node.tabId).tab]:[]),...flatten(node.children || [])]);
     for(const root of workflowMemberOutline(selection)) {
       const members=flatten([root]);

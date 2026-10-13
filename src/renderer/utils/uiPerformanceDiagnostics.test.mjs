@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createUIActionDiagnostics, createStylesheetDiagnostics, describeDiagnosticKey,
-  describeDiagnosticTarget, summarizeUIAction, formatDiagnosticKey, UI_ACTION_COVERAGE } from './uiPerformanceDiagnostics.mjs';
+  describeDiagnosticTarget, describeDiagnosticClipboard, recordUIClipboardOutcome, createUIClipboardOutcomeQueue,
+  summarizeUIAction, formatDiagnosticKey, UI_ACTION_COVERAGE } from './uiPerformanceDiagnostics.mjs';
 
 test('a removed click target keeps captured source and correlated frame/native outcome', () => {
   let time = 100; const logs = [], native = [];
@@ -98,6 +99,73 @@ test('removed keyboard target and slow EventTiming retain the exact action, safe
   assert.equal(summary.target.source, 'Control.tsx:25'); assert.equal(summary.keyClass, 'Meta');
   assert.equal(summary.coverage, UI_ACTION_COVERAGE);
   assert.equal(summarizeUIAction(first, { inputDelayMs: 25 }).handlerMs, null, 'unmeasured is not zero');
+});
+
+test('clipboard shortcut identities survive capture and summaries without recording typed keys or code', () => {
+  for(const [code,shortcutClass] of [['KeyA','SelectAll'],['KeyC','Copy'],['KeyX','Cut'],['KeyV','Paste'],['Backspace','DeleteToStart']]) {
+    const fields=describeDiagnosticKey({type:'keydown',key:'с',code,metaKey:true});
+    assert.equal(fields.keyClass,'Other');assert.equal(fields.shortcutClass,shortcutClass);
+    const d=createUIActionDiagnostics({now:()=>100,emit() {}});
+    const action=d.capture('keydown',90,{},true,fields);
+    assert.equal(summarizeUIAction(action).shortcutClass,shortcutClass);
+    assert.doesNotMatch(JSON.stringify(action),/Key[A-Z]|с/);
+  }
+  assert.equal(describeDiagnosticKey({type:'keydown',key:'c',code:'KeyC'}).shortcutClass,undefined);
+  assert.equal(describeDiagnosticKey({type:'keydown',key:'c',code:'KeyC',ctrlKey:true,altKey:true}).shortcutClass,undefined);
+  assert.equal(describeDiagnosticKey({type:'keydown',key:'c',code:'__proto__',metaKey:true}).shortcutClass,undefined);
+  const malicious={keyClass:'Other',shortcutClass:'SECRET',meta:true};
+  assert.equal(summarizeUIAction(malicious).shortcutClass,undefined);
+});
+
+test('native selected-copy evidence survives removal without reading text, clipboard data or layout', () => {
+  const node={nodeType:3,parentElement:{closest(selector) {return {getAttribute:()=>selector==='[data-tab-id]'?'tab-owned':'entry-owned'};}}};
+  const event={type:'copy',isTrusted:true,defaultPrevented:false,
+    target:{ownerDocument:{getSelection:()=>({anchorNode:node,focusNode:node,anchorOffset:1,focusOffset:4,
+      rangeCount:1,isCollapsed:false,toString(){throw Error('must not read text');}})}},
+    get clipboardData(){throw Error('must not read clipboard');}};
+  const state=describeDiagnosticClipboard(event);
+  assert.equal(state.selectedChars,3);assert.equal(state.anchorEntry,'entry-owned');
+  const action={event:'copy',clipboardState:state};
+  event.target=null;event.defaultPrevented=true;recordUIClipboardOutcome(action,event);
+  const summary=summarizeUIAction(action);
+  assert.equal(summary.clipboardState.selectedChars,3);assert.equal(summary.clipboardState.finalDefaultPrevented,true);
+  assert.equal(summary.clipboardState.trusted,true);
+  const hidden=Object.create({selectedChars:999});hidden.text='SECRET';
+  assert.equal(summarizeUIAction({event:'copy',clipboardState:hidden}).clipboardState.selectedChars,null);
+  assert.doesNotMatch(JSON.stringify(summary),/SECRET|clipboardData/);
+  assert.equal(describeDiagnosticClipboard({type:'keydown',get target(){throw Error('not a clipboard gesture');}}),null);
+});
+
+test('clipboard outcome is unknown until a bounded post-dispatch task and keeps the original action after target removal',()=>{
+  const tasks=[],logs=[];
+  const q=createUIClipboardOutcomeQueue({postTask:fn=>tasks.push(fn),emit:s=>logs.push(JSON.parse(s.slice(s.indexOf('{')))),now:()=>100,max:1});
+  const event={type:'copy',defaultPrevented:false,isTrusted:true,target:null};
+  const action={id:'ui-native-1',clipboardState:describeDiagnosticClipboard(event)};
+  q.enqueue(action,event);
+  assert.equal(action.clipboardState.finalDefaultPrevented,null);
+  event.defaultPrevented=true;
+  const rejected={id:'ui-native-2',clipboardState:describeDiagnosticClipboard(event)};
+  q.enqueue(rejected,event);
+  assert.equal(rejected.clipboardState.finalDefaultPrevented,null);
+  assert.equal(logs[0].reason,'queue-overflow');
+  assert.equal(q.health().clipboardOutcomeDropped,1);
+  tasks.shift()();
+  assert.equal(action.clipboardState.finalDefaultPrevented,true);
+  assert.equal(action.clipboardState.defaultPreventedAtCapture,false);
+  assert.equal(logs[1].actionId,'ui-native-1');
+  q.dispose();
+});
+
+test('a late unavailable native outcome remains unknown and reports lost evidence',()=>{
+  const tasks=[],logs=[];
+  const q=createUIClipboardOutcomeQueue({postTask:fn=>tasks.push(fn),emit:s=>logs.push(JSON.parse(s.slice(s.indexOf('{'))))});
+  let unavailable=false;
+  const event={type:'copy',isTrusted:true,get defaultPrevented(){if(unavailable)throw Error('SECRET');return false;}};
+  const action={id:'ui-copy-late',clipboardState:describeDiagnosticClipboard(event)};
+  q.enqueue(action,event);unavailable=true;tasks.shift()();
+  assert.equal(action.clipboardState.finalDefaultPrevented,null);
+  assert.equal(logs[0].reason,'event-unavailable');assert.equal(q.health().clipboardOutcomeDropped,1);
+  assert.doesNotMatch(JSON.stringify(logs),/SECRET/);q.dispose();
 });
 
 test('summaries and EventTiming reject payloads, object coercion and prototype fields', () => {

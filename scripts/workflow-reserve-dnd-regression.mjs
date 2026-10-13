@@ -18,7 +18,7 @@ try {
       b.onLoad({filter:/.*/,namespace:'fixture'},args=>({loader:'tsx',resolveDir:repo,contents:args.path==='TabCard'
         ? `import React from 'react';export default React.forwardRef(({children,projectId,tabId,fullWidth,sharedActivity,selected,interactiveStatus,onLinkedFileOpen,as,...props},ref)=><span {...props} ref={ref} data-tab-card style={{display:'flex',alignItems:'center',boxSizing:'border-box',height:tabId==='Q'?52:32,padding:'4px 8px',background:selected?'#36574c':'#292e30',border:'1px solid #788',borderRadius:5,color:'#ddd'}}>{children}</span>);`
         : args.path==='TabBar' ? `export const TAB_RENAME_REQUEST_EVENT='fixture-rename';export const openTabContextMenuAt=()=>{};`
-          : args.path==='tabLinkedFilePreview' ? `export const openTabLinkedFile=()=>{};export const dismissTabLinkedFile=()=>{};` : `export default function(){return null;}`}));
+          : args.path==='tabLinkedFilePreview' ? `export const openTabLinkedFile=()=>{};export const openSidebarLinkedFile=()=>{};export const dismissTabLinkedFile=()=>{};` : `export default function(){return null;}`}));
     }}]});
   await fs.writeFile(path.join(artifact,'index.html'),`<html><head><link rel="stylesheet" href="bundle.css"></head><body style="margin:0;background:#171717;color:#ccc;font-family:Arial"><div id="root"></div><script>${shim}</script><script src="bundle.js"></script></body></html>`);
   await fs.writeFile(path.join(artifact,'main.cjs'),`const {app,BrowserWindow}=require('electron');app.setPath('userData',${JSON.stringify(path.join(artifact,'profile'))});app.whenReady().then(()=>{const win=new BrowserWindow({show:false,focusable:false,width:900,height:650,webPreferences:{nodeIntegration:true,contextIsolation:false,backgroundThrottling:false,offscreen:true}});win.loadFile(${JSON.stringify(path.join(artifact,'index.html'))});});`);
@@ -51,6 +51,8 @@ try {
   assert.equal((await committed()).length,0);result.checks.push('multi-X blocked; Escape cancels transport and projection');
 
   await reset({selected:['B']});const single=await pickup('B');await page.keyboard.down('Meta');await page.mouse.move(single.x+55,single.y);await frames();
+  assert.equal(await page.locator('[data-sidebar-tab-drag-cursor-chip]').isVisible(),false);
+  await page.screenshot({path:path.join(artifact,'local-cmd-no-clone.png')});
   s=await snapshot();assert.equal(s.rows.find(row=>row.id==='reserve-tab:B').parent,'reserve-tab:Q');await end();
   assert.equal((await committed()).length,1);result.checks.push('single-X still reparents in painted preview');
 
@@ -66,12 +68,15 @@ try {
   result.checks.push('physical AI child keeps execution parent and blocked feedback');
 
   await reset({selected:['B']});await pickup('B');await page.mouse.move(480,210,{steps:12});await frames();
+  assert.equal(await page.locator('[data-sidebar-tab-drag-cursor-chip]').isVisible(),true);
+  await page.screenshot({path:path.join(artifact,'plain-external-payload.png')});
   s=await snapshot();assert.equal(s.pane.target?.zone,'body');await end();commits=await committed();
   assert.equal(commits.length,1);assert.equal(commits[0].request.destinationKind,'window');
   assert.deepEqual(commits[0].request.paneRootTabIds,['B']);
   result.checks.push('reserve to window body needs no Cmd; one painted canonical placement command');
 
   await reset();await pickup('B');await page.locator('[data-space-chip="w2"]').hover();
+  await page.locator('[data-sidebar-tab-drag-cursor-chip]').waitFor({state:'visible'});
   await page.waitForFunction(()=>window.fixture.store.getState().activeSpaceId==='w2');
   await page.mouse.move(120,250,{steps:6});await frames();await end();commits=await committed();
   assert.equal(commits.length,1);assert.equal(commits[0].request.targetWorkflowId,'w2');

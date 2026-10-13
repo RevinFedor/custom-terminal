@@ -55,6 +55,45 @@ test('29Sep compact footer recognizes the same complete picker, not its scrollba
   assert.equal(inspectCodexResumeGoalPrompt(frame.replace('  2. Leave paused', '  2. Something else')).interactiveVisible, false);
 });
 
+test('0.162 Goal description prefix is not the selected-option marker', () => {
+  for (const footer of ['Press enter to confirm or esc to go back', 'enter select · esc back']) {
+    const frame = narrowProductionFrame
+      .replace('Goal: Исправить', '› Goal: Исправить')
+      .replace('Press enter to confirm or esc to go back', footer);
+    const prompt = inspectCodexResumeGoalPrompt(frame);
+    assert.equal(prompt.interactiveVisible, true);
+    assert.equal(prompt.canAutoEnter, true);
+    assert.deepEqual(prompt.missing, []);
+
+    const leave = frame.replace('› 1.', '  1.').replace('  2.', '› 2.');
+    const leavePrompt = inspectCodexResumeGoalPrompt(leave);
+    assert.equal(leavePrompt.interactiveVisible, true);
+    assert.equal(leavePrompt.canAutoEnter, false);
+    assert.equal(leavePrompt.secondOptionSelected, true);
+    assert.equal(inspectCodexResumeGoalPrompt(frame.replace('› 1.', '  1.')).canAutoEnter, false,
+      'the description marker must not invent a selected option');
+  }
+});
+
+test('prefixed Goal still requires a body, both options and the current complete footer', () => {
+  const frame = narrowProductionFrame.replace('Goal: Исправить', '› Goal: Исправить');
+  for (const invalid of [
+    frame.replace(/› Goal:[^\n]*/, '› Goal:'),
+    frame.replace('› Goal:', '> Goal:'),
+    frame.replace('› Goal:', 'Example › Goal:'),
+    frame.replace('  2. Leave paused', '  2. Another action'),
+    frame.replace('Press enter to confirm or esc to go back', ''),
+    frame + '\n› Ask Codex to do anything\ngpt-6-astra max · Context 42% used',
+  ]) assert.equal(inspectCodexResumeGoalPrompt(invalid).interactiveVisible, false);
+
+  const base = { sameTerminal: true, sameRunSeq: true, sameInputRevision: true,
+    screenAvailable: true, cleanText: frame };
+  assert.equal(decideCodexResumeGoalAutoEnter(base).allowed, true);
+  for (const key of ['sameTerminal', 'sameRunSeq', 'sameInputRevision', 'screenAvailable']) {
+    assert.equal(decideCodexResumeGoalAutoEnter({ ...base, [key]: false }).allowed, false);
+  }
+});
+
 test('does not override a user-selected Leave paused choice', () => {
   const frame = narrowProductionFrame
     .replace('› 1. Resume goal', '  1. Resume goal')

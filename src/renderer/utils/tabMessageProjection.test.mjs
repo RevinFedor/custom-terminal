@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildSync } from 'esbuild';
-import { nextRequestSuccessExpiry, REQUEST_SUCCESS_VISIBLE_MS } from './requestTrackerVisibility.mjs';
+import { isRequestSuccessPresentation } from './requestTrackerVisibility.mjs';
 
 const compiled = { exports: {} };
 const output = buildSync({ entryPoints: [new URL('./tabMessageProjection.ts', import.meta.url).pathname], bundle: true, write: false, platform: 'node', format: 'cjs' }).outputFiles[0].text;
@@ -16,18 +16,16 @@ test('normal waiting is gray, transport blue, confirmed green, attention yellow 
   for (const [deliveryState,color] of Object.entries(expected)) assert.equal(delivery(question({deliveryState})).color,color);
 });
 
-test('confirmed question and reply leave the live tracker after four seconds, not History', () => {
+test('confirmed question and reply leave the live tracker immediately, not History', () => {
   const { tabMessageSuccessAt, tabMessageVisibleInTracker } = compiled.exports;
   const index = merge({}, [question(), reply({ updatedAt: 1000 })]);
   for (const tabId of ['a', 'b']) {
     const [thread] = threads(index, tabId);
     assert.equal(tabMessageSuccessAt(thread), 1000);
-    assert.equal(tabMessageVisibleInTracker(thread, tabId, 4999), true);
-    assert.equal(tabMessageVisibleInTracker(thread, tabId, 5000), false);
+    assert.equal(tabMessageVisibleInTracker(thread, tabId), false);
     assert.equal(threads(index, tabId).length, 1);
     assert.equal(thread.question.sourceDismissedAt, undefined);
   }
-  assert.equal(REQUEST_SUCCESS_VISIBLE_MS, 4000);
 });
 
 test('pending, missing and failed reply never disappear as a success', () => {
@@ -35,14 +33,14 @@ test('pending, missing and failed reply never disappear as a success', () => {
   for (const deliveryState of ['pending', 'sending', 'queued', 'waiting-for-input', 'unconfirmed', 'failed']) {
     const [thread] = threads(merge({}, [question(), reply({ deliveryState })]), 'a');
     assert.equal(tabMessageSuccessAt(thread), null);
-    assert.equal(tabMessageVisibleInTracker(thread, 'a', 100000), true);
+    assert.equal(tabMessageVisibleInTracker(thread, 'a'), true);
     assert.equal(tabMessagePresentation(thread).icon, delivery(thread.reply).icon);
   }
   for (const input of [[question()], [question({ replyMessageId: 'r1', answeredAt: 30 })],
     [question({ deliveryState: 'unconfirmed' }), reply()]]) {
     const [thread] = threads(merge({}, input), 'a');
     assert.equal(tabMessageSuccessAt(thread), null);
-    assert.equal(tabMessageVisibleInTracker(thread, 'a', 100000), true);
+    assert.equal(tabMessageVisibleInTracker(thread, 'a'), true);
   }
 });
 
@@ -54,15 +52,20 @@ test('other participant dismissal and late body hydration do not revive complete
     reply({ updatedAt: 200, text: 'late full body' })]);
   const [thread] = threads(index, 'a');
   assert.equal(tabMessageSuccessAt(thread), completedAt);
-  assert.equal(tabMessageVisibleInTracker(thread, 'a', completedAt + 10001), false);
+  assert.equal(tabMessageVisibleInTracker(thread, 'a'), false);
   assert.equal(thread.reply.text, 'late full body');
 });
 
-test('success timer advances to every next expiry, including message-only updates', () => {
-  assert.equal(nextRequestSuccessExpiry([1000, 2000, null, undefined, NaN], 3000), 5000);
-  assert.equal(nextRequestSuccessExpiry([1000, 2000], 5020), 6000);
-  assert.equal(nextRequestSuccessExpiry([1000, 2000], 6020), null);
-  assert.equal(nextRequestSuccessExpiry([0, null, -10], 0), null);
+test('compact visibility uses the current presentation, not a completion timestamp', () => {
+  assert.equal(isRequestSuccessPresentation({ icon: 'success', color: '#4ade80' }), true);
+  assert.equal(isRequestSuccessPresentation({ icon: 'delivered', color: '#4ade80' }), true);
+  assert.equal(isRequestSuccessPresentation({ icon: 'loading', color: '#4ade80' }), true);
+  for (const color of ['#a78bfa', '#a1a1aa', '#60a5fa', '#fbbf24', '#f87171']) {
+    assert.equal(isRequestSuccessPresentation({ icon: 'waiting', color }), false);
+  }
+  const { tabMessageVisibleInTracker } = compiled.exports;
+  const [thread] = threads(merge({}, [question(), reply({ updatedAt: 0, createdAt: 0 })]), 'a');
+  assert.equal(tabMessageVisibleInTracker(thread, 'a'), false);
 });
 
 test('dismissal stays per participant and does not erase history or a failed reply', () => {

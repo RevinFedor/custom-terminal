@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
+const { EventEmitter } = require('node:events');
 const ts = require('typescript');
 const { createCodexSettingsMutationQueue } = require('./codex-settings-mutation-queue');
 const runtimeContract = require('./codex-runtime-contract');
@@ -46,6 +47,10 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   const logs = [];
   const bridge = [];
   const handlers = new Map();
+  const ipcMain = new EventEmitter();
+  ipcMain.handle = (channel, handler) => handlers.set(channel, handler);
+  const mirror = { complete: true, failed: false, generation: 'fixture-mirror',
+    writeSeq: 10, flushedSeq: 10, redrawTrace: {}, synchronizedFrameWaiters: new Set() };
   const commands = new Map([['tab', { runSeq: 2, isRunning: true }]]);
   const terminals = new Map([['tab', term]]);
   let competing;
@@ -64,6 +69,14 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     isPromptQueueAutomationSource: () => false,
     isCodexTuiEffectivelyReady: () => true,
     isCodexOperationalInputReady: () => true,
+    prepareCodexMainComposerForSend: async () => ({ success: true }),
+    getHeadlessTerminalMirror: () => mirror,
+    readCodexAuthoritativeScreen: async () => {
+      mirror.writeSeq++; mirror.flushedSeq = mirror.writeSeq;
+      return { success: frameAvailable, snapshot: { authoritativeFrameCommitted: frameAvailable,
+        writeSeq: mirror.writeSeq, lines: [{ text: '› Ask Codex to do anything' },
+          { text: model + ' ' + effort + ' · Context 42% used' }] } };
+    },
     codexLiveSettingsObserver: null,
     hasCodexEstablishedComposerLifecycle: () => true,
     codexHasLivePtySubmitEvidence: () => true,
@@ -119,7 +132,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     mainWindow: { isDestroyed: () => false, webContents: { send: (channel, data) => {
       events.push({ kind: 'publication', channel, model: data?.model, effort: data?.effort });
     } } },
-    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    ipcMain,
   });
   const lockStart = mainSource.indexOf('const pasteInflight = new WeakMap();');
   const lockEnd = mainSource.indexOf('\nfunction markActivePtySubmit(', lockStart);
@@ -176,6 +189,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   const helperPath = path.join(__dirname, 'codex-settings-send.js');
   if (fs.existsSync(helperPath)) Object.assign(context, require(helperPath));
   for (const name of ['readCodexSettingsSendScope', 'readCodexSettingsForSend',
+    'codexPolicyFrame',
     'resolveConfiguredCodexSettingsModelIdentity',
     'agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure',
     'currentCodexAcceptedResumeSourceProof', 'readAgentSendDestinationAtWriteBoundary',
@@ -416,6 +430,9 @@ test('generation change while waiting in the existing global queue cancels befor
   const blocker = h.context.codexSettingsMutationQueue.run(() => new Promise(resolve => { release = resolve; }));
   await nextTurn();
   const sending = h.direct({ model: 'requested-model', effort: 'high' });
+  // The existing native-question preparation is async before the settings
+  // transaction captures its owner. Reach that queue before replacing it.
+  await nextTurn();
   h.set({ lifecycle: 'replacement' });
   release();
   await blocker;

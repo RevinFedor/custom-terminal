@@ -13,6 +13,14 @@ export function diskCapacityPresentation(snapshot, now = Date.now()) {
 
 export function diskCapacityBytes(bytes) {
   if (!Number.isFinite(bytes)) return '—';
-  // This explicitly labels binary GiB; the cache's byte limit uses these units.
-  return `${(bytes / 1024 ** 3).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ГиБ`;
+  // Keep the same two-letter UI convention as the resource chip. The byte
+  // budgets and binary divisor are unchanged; this is a display label only.
+  return `${(bytes / 1024 ** 3).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ГБ`;
+}
+
+export function cacheCapacityGiBNumber(bytes) {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) return '—';
+  const gib = bytes / 1024 ** 3;
+  if (gib > 0 && gib < 0.01) return '<0,01';
+  return gib.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
 }

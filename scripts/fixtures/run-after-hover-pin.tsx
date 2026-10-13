@@ -45,6 +45,20 @@ usePromptQueueStore.setState({ queues: new Map([['owner', { ...queue, panelColla
 
 const f = (window as any).hoverFixture;
 f.state = () => usePromptQueueStore.getState().getQueue('owner');
+f.emptyQueue = () => {
+  const state = usePromptQueueStore.getState(), queue = state.getQueue('owner');
+  usePromptQueueStore.setState({ queues: new Map([['owner', { ...queue, items: [], autoRun: false, panelCollapsed: true }]]) } as any);
+};
+f.pickerWorkflows = (count: number) => {
+  const groups = Array.from({ length: count - 1 }, (_, i) => ({ id: i === 0 ? 'hover-workflow' : 'icon-' + i,
+    name: 'Workflow ' + i, icon: i % 2 ? null : workflowIcon, projectIds: [], layout: emptySpaceLayout() }));
+  groups.push({ id: '__noted_workflow_inbox__', name: 'Inbox', icon: null, projectIds: [], layout: emptySpaceLayout() });
+  useWorkspaceStore.setState({ organizationReady: true, spaces: groups,
+    tabWorkflowMembership: { owner: { workflowId: 'hover-workflow', revision: 1 },
+      source: { workflowId: '__noted_workflow_inbox__', revision: 1 }, alternative: { workflowId: 'hover-workflow', revision: 1 } },
+    tabCatalog: {}, globalGroups: { version: 1, revision: 1, groups: [], tabGroups: {} } } as any);
+};
+f.armQueue = () => usePromptQueueStore.getState().setAutoRun('owner', true);
 f.completeDependency = (target: string) => usePromptQueueStore.getState().completePromptTabDependency(
   'owner', 'synthetic-card', target, Date.now() + 100);
 f.restoreDependencies = () => {

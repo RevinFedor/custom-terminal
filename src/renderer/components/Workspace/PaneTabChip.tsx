@@ -72,6 +72,7 @@ export default function PaneTabChip({
   // can be renamed from whichever surface the user is already looking at.
   const [renaming, setRenaming] = useState(false);
   const [renameDraft, setRenameDraft] = useState('');
+  const renameOriginal = useRef('');
   const renameInput = useInlineRenameInputRef(renaming);
 
   useEffect(() => {
@@ -91,7 +92,9 @@ export default function PaneTabChip({
   const commitRename = () => {
     const next = renameDraft.trim();
     setRenaming(false);
-    if (!next || next === tabName) return;
+    // An async title can arrive while this editor is open. Unchanged blur
+    // must not restore the old draft and accidentally mark it as manual.
+    if (!next || next === renameOriginal.current) return;
     useWorkspaceStore.getState().renameTab(projectId, tabId, next);
   };
 
@@ -110,6 +113,7 @@ export default function PaneTabChip({
       // for the tab to be renamed from somewhere else.
       const current = useWorkspaceStore.getState()
         .openProjects.get(projectId)?.tabs.get(tabId)?.name || '';
+      renameOriginal.current = current;
       setRenameDraft(current);
       setRenaming(true);
     };
@@ -255,6 +259,7 @@ export default function PaneTabChip({
         e.preventDefault();
         e.stopPropagation();
         if (tabType === 'file') return;
+        renameOriginal.current = tabName;
         setRenameDraft(tabName);
         setRenaming(true);
       }}

@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { isDeepStrictEqual } = require('node:util');
+const { continuationOwnerKey } = require('./orchestration-continuation');
+const { bindTargetInputOwner } = require('./orchestration-target-input-owner');
 const {
   decideAutomaticRestoreAdmission,
   normalizeAgentLaunchSource,
@@ -345,6 +347,7 @@ function captureOrchestrationResultAttempt(run) {
     targetCwd: run.targetCwd || null,
     targetProjectPath: run.targetProjectPath || null,
     targetLifecycleGeneration: run.targetLifecycleGeneration || null,
+    targetLifecycleProof: run.targetLifecycleProof ? { ...run.targetLifecycleProof } : null,
     targetContinuationExecutionContext: continuation ? Object.freeze(continuation) : null,
     recoveryAttempt: Number(run.recoveryAttempt || 0),
     resumeAfterAt: run.resumeAfterAt || null,
@@ -805,9 +808,14 @@ function publicRun(run) {
     waitingForPriorTurn: _waitingForPriorTurn,
     targetRestoration: _targetRestoration,
     targetRestoreAddress: _targetRestoreAddress,
+    continuationIntent: _continuationIntent,
     ...safe
   } = run;
-  return { ...safe };
+  return { ...safe, ...(run.continuationIntent ? { continuation: {
+    operationId: run.continuationIntent.operationId, handoffId: run.continuationIntent.handoffId,
+    state: run.continuationIntent.state, error: run.continuationIntent.error || null,
+    createdAt: run.continuationIntent.createdAt, confirmedAt: run.continuationIntent.confirmedAt || null,
+  } } : {}) };
 }
 
 class OrchestrationRunStore {
@@ -1731,7 +1739,8 @@ class OrchestrationRunStore {
             contextReason: 'resumed-turn-not-started',
           }
         : bindPromptProofExecutionContext(run, proof);
-      if (contextBinding.changed) {
+      const inputOwnerBinding = bindTargetInputOwner(run, proof, contextBinding);
+      if (contextBinding.changed || inputOwnerBinding.changed) {
         run.updatedAt = Date.now();
         this._pushChanged(changed, run);
         this._schedulePersist();
@@ -1742,6 +1751,7 @@ class OrchestrationRunStore {
         reason: null,
         contextBound: contextBinding.contextBound,
         contextReason: contextBinding.contextReason,
+        inputOwnerReason: inputOwnerBinding.reason,
         run: publicRun(run),
         changed,
       };
@@ -1781,6 +1791,8 @@ class OrchestrationRunStore {
         }
       : bindPromptProofExecutionContext(run, proof);
 
+    const inputOwnerBinding = bindTargetInputOwner(run, proof, contextBinding);
+
     const repairableUnknownDelivery = run.status === 'waiting_recovery'
       && canExactResultResolveRecovery(run);
     if (repairableUnknownDelivery) {
@@ -1813,6 +1825,7 @@ class OrchestrationRunStore {
       contextBound: contextBinding.contextBound,
       contextReason: contextBinding.contextReason,
       adoptedChildRunIds,
+      inputOwnerReason: inputOwnerBinding.reason,
       run: publicRun(run),
       changed,
     };
@@ -2202,6 +2215,7 @@ class OrchestrationRunStore {
       return { confirmed: false, reason: 'result-source-unverified', run: publicRun(run), changed, settled };
     }
     if (run.sourceFollowupStartedAt) {
+      await this.persistStrict();
       return { confirmed: true, idempotent: true, run: publicRun(run), changed, settled };
     }
     if (!isTerminalStatus(run.status) || !canNotifySource(run)) {
@@ -2268,6 +2282,11 @@ class OrchestrationRunStore {
     const now = Number.isFinite(requestedNow)
       ? requestedNow
       : (Number.isFinite(parsedAuditAt) ? parsedAuditAt : Date.now());
+    const previousPublications = new Map();
+    for (let current = run; current && !previousPublications.has(current.runId);
+      current = this.runs.get(current.parentRunId)) {
+      previousPublications.set(current.runId, Number(current.updatedAt) || 0);
+    }
     run.sourceFollowupPending = false;
     run.sourceFollowupStartedAt = now;
     run.sourceFollowupProofKind = proofKind;
@@ -2328,7 +2347,19 @@ class OrchestrationRunStore {
       }
     }
     this._pushChanged(changed, run);
-    this._schedulePersist();
+    // Provider record time remains the causal proof; UI freshness is the time
+    // this newer state is committed, not an earlier queued prompt timestamp.
+    const publishedAt = Date.now();
+    for (const snapshot of changed) {
+      const current = this.runs.get(snapshot.runId);
+      current.updatedAt = Math.max(publishedAt, (previousPublications.get(snapshot.runId) || 0) + 1);
+      snapshot.updatedAt = current.updatedAt;
+    }
+    for (const snapshot of settled) snapshot.updatedAt = this.runs.get(snapshot.runId).updatedAt;
+    await this.persistStrict();
+    console.log('[OrchestrationPublication] source-confirm run=' + run.runId
+      + ' proofAt=' + now + ' previous=' + previousPublications.get(run.runId)
+      + ' published=' + run.updatedAt);
     return {
       confirmed: true,
       contextBound: Boolean(followupContext.context),
@@ -2760,7 +2791,11 @@ class OrchestrationRunStore {
       if (!exactOwner || !eligible || !proof.handoffId
         || run.sourceFollowupStartedAt
         || ['sending', 'sent', 'queued', 'confirmed'].includes(run.notificationStatus)) {
-        return { run: publicRun(run), changed: [], settled: [], error: 'capacity-recovery-owner-changed' };
+        return { run: publicRun(run), changed: [], settled: [], error: 'capacity-recovery-owner-changed',
+          reason: !run?.targetLifecycleGeneration ? 'target-generation-unproven'
+            : run.targetLifecycleGeneration !== proof.lifecycleGeneration ? 'target-generation-changed'
+            : !exactOwner ? 'target-identity-changed' : !eligible ? 'run-not-eligible'
+            : !proof.handoffId ? 'handoff-required' : 'source-notification-started' };
       }
     } else if (!run || run.status !== 'waiting_recovery') {
       return { run: publicRun(run), changed: [], settled: [] };
@@ -2845,6 +2880,153 @@ class OrchestrationRunStore {
     this._refreshAncestors(run.parentRunId, changed, settled, now);
     this._schedulePersist();
     return { run: publicRun(run), changed, settled };
+  }
+
+  async beginRequestContinuation(runId, input) {
+    const work = this.reservationChain.catch(() => {}).then(async () => {
+      await this.initialize();
+      const run = this.runs.get(runId);
+      if (!run || run.status !== 'waiting_recovery' || isPausedRun(run)
+        || run.notificationSuppressed || continuationOwnerKey(run) !== input.ownerKey) {
+        return { accepted: false, reason: 'continuation-state-changed', run: publicRun(run) };
+      }
+      if (run.continuationIntent && !['bound', 'delivered-paused'].includes(run.continuationIntent.state) && !input.replaceProvenNoSubmit) {
+        await this.persistStrict();
+        return { accepted: true, idempotent: true, intent: { ...run.continuationIntent }, run: publicRun(run) };
+      }
+      const competing = [...this.runs.values()].find(other => other.runId !== runId && other.targetTabId === run.targetTabId
+        && !isTerminalStatus(other.status) && (ownsTargetExecution(other)
+          || other.continuationIntent && other.continuationIntent.state !== 'bound'));
+      if (competing) return { accepted: false, reason: 'continuation-target-claimed', run: publicRun(run) };
+      const ordinal = Number(run.continuationOrdinal || 0) + 1;
+      const operationId = runId + ':' + ordinal;
+      const handoffId = 'orchestration-continue:' + operationId;
+      run.continuationOrdinal = ordinal;
+      run.continuationIntent = { version: 1, operationId, handoffId,
+        operationKey: `history:${run.targetTabId}:${handoffId}`, state: 'prepared', createdAt: input.now,
+        sourceExpected: input.sourceExpected, targetExpected: input.targetExpected,
+        baseExecutionContext: normalizeExecutionContext(run.targetExecutionContext),
+        baseLookup: buildOrchestrationResultLookup(run),
+        promptHash: input.promptHash, auditHash: input.auditHash,
+        previousError: run.error || null, previousDeadlineAt: run.recoveryDeadlineAt || null,
+      };
+      run.resumeAwaitingNewTurn = true;
+      run.recoveryDeadlineAt = null;
+      run.error = null;
+      run.updatedAt = input.now;
+      await this.persistStrict();
+      return { accepted: true, intent: { ...run.continuationIntent }, run: publicRun(run), changed: [publicRun(run)] };
+    });
+    this.reservationChain = work.catch(() => {});
+    return work;
+  }
+
+  async markRequestContinuationSending(runId, operationId) {
+    await this.initialize();
+    const run = this.runs.get(runId), intent = run?.continuationIntent;
+    if (!intent || intent.operationId !== operationId || isTerminalStatus(run.status) || intent.cancelledAt) {
+      throw new Error('continuation_cancelled');
+    }
+    intent.state = 'sending'; intent.sendStartedAt ||= Date.now(); run.updatedAt = Date.now();
+    await this.persistStrict();
+    return publicRun(run);
+  }
+
+  async setRequestContinuationOutcome(runId, operationId, state, error) {
+    await this.initialize();
+    const run = this.runs.get(runId), intent = run?.continuationIntent;
+    if (!intent || intent.operationId !== operationId || ['bound', 'delivered-paused'].includes(intent.state) || isTerminalStatus(run.status)) return { run: publicRun(run) };
+    intent.state = state; intent.error = error || null; run.updatedAt = Date.now();
+    await this.persistStrict();
+    return { run: publicRun(run), changed: [publicRun(run)] };
+  }
+
+  async resetRequestContinuationBeforeAdmission(runId, operationId, error) {
+    await this.initialize();
+    const run = this.runs.get(runId), intent = run?.continuationIntent;
+    if (!intent || intent.operationId !== operationId || isTerminalStatus(run.status)) return;
+    intent.state = 'prepared'; intent.sendStartedAt = null; intent.error = error || null;
+    await this.persistStrict();
+  }
+
+  async confirmRequestContinuation(runId, proof) {
+    await this.initialize();
+    const run = this.runs.get(runId), intent = run?.continuationIntent;
+    if (!run || !intent || isTerminalStatus(run.status) || intent.cancelledAt
+      || proof.handoffId !== intent.handoffId || proof.operationKey !== intent.operationKey) return { confirmed: false, reason: 'continuation-identity-mismatch' };
+    const context = normalizeExecutionContext(proof.executionContext);
+    if (!context || context.provider !== run.targetToolType || context.sessionId !== proof.sessionId
+      || !context.turnId || !context.startedAt || context.startedAt < intent.createdAt
+      || context.turnId === intent.baseExecutionContext?.turnId) return { confirmed: false, reason: 'continuation-execution-unproven' };
+    if (isPausedRun(run) || run.resumeAfterAt && context.startedAt < run.resumeAfterAt) {
+      intent.state = 'delivered-paused'; intent.confirmedAt = Date.now();
+      intent.pausedExecutionProof = { ...proof, executionContext: context };
+      await this.persistStrict();
+      return { confirmed: false, deliveryConfirmed: true, paused: true, run: publicRun(run), changed: [publicRun(run)] };
+    }
+    if (intent.state === 'bound') {
+      const known = normalizeExecutionContext(run.targetExecutionContext);
+      if (!known || known.provider !== context.provider || known.sessionId !== context.sessionId || known.turnId !== context.turnId
+        || known.processId != null && context.processId != null && known.processId !== context.processId
+        || known.generation != null && context.generation != null && known.generation !== context.generation) {
+        return { confirmed: false, reason: 'continuation-context-conflict' };
+      }
+      run.targetExecutionContext = { ...known, processId: known.processId ?? context.processId,
+        generation: known.generation ?? context.generation, startedAt: known.startedAt ?? context.startedAt };
+      if (!run.targetLifecycleGeneration && proof.lifecycleGeneration) run.targetLifecycleGeneration = proof.lifecycleGeneration;
+      await this.persistStrict();
+      return { confirmed: true, idempotent: true, run: publicRun(run) };
+    }
+    if (run.status !== 'waiting_recovery' && !(run.status === 'queued' && run.resumeAwaitingNewTurn)) return { confirmed: false, reason: 'continuation-state-changed' };
+    intent.state = 'bound'; intent.confirmedAt = Date.now(); intent.attemptId = proof.attemptId;
+    run.resultPromptHash = intent.promptHash;
+    run.resultPromptProofUserUuid = proof.userUuid || null;
+    run.resultPromptProofSourceIdentity = proof.sourceIdentity || null;
+    run.resultPromptRequestedAt = intent.createdAt;
+    run.resultAfterAt = null;
+    run.resultComplete = false; run.resultAvailable = false; run.resultProofStatus = 'awaiting-transcript';
+    run.outcome = null; run.ownCompletedAt = null; run.completedAt = null; run.completionReason = null;
+    run.recoveryDeadlineAt = null; run.error = null;
+    run.resumeAwaitingNewTurn = false; run.waitingForPriorTurn = false;
+    run.targetExecutionContext = context; run.targetContinuationExecutionContext = null;
+    run.targetLifecycleGeneration = proof.lifecycleGeneration || null;
+    run.sessionId = proof.sessionId;
+    run.targetBusySeen = true; run.status = 'running'; run.recoveryAttempt = Number(run.recoveryAttempt || 0) + 1;
+    run.updatedAt = Date.now();
+    const changed = []; this._pushChanged(changed, run);
+    this._adoptExactOrphanChildren(run, changed, run.updatedAt);
+    await this.persistStrict();
+    return { confirmed: true, run: publicRun(run), changed };
+  }
+
+  async acceptContinuationReadyResult(runId, ownerKey, proof) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run || run.status !== 'waiting_recovery' || continuationOwnerKey(run) !== ownerKey
+      || proof?.complete !== true || proof.sourceVerified !== true
+      || !['task_complete', 'Stop'].includes(proof.terminalEvent)) return { accepted: false };
+    const expected = normalizeExecutionContext(run.targetExecutionContext), actual = normalizeExecutionContext(proof.executionContext);
+    if (expected && (!actual || expected.provider !== actual.provider || expected.sessionId !== actual.sessionId
+      || expected.turnId !== actual.turnId)) return { accepted: false, reason: 'continuation-result-owner-mismatch' };
+    run.outcome = 'success'; run.error = null; run.recoveryDeadlineAt = null;
+    run.ownCompletedAt ||= Date.now(); run.targetBusySeen = false;
+    run.resultComplete = true; run.resultAvailable = true; run.resultProofStatus = 'complete';
+    const changed = [], settled = [];
+    this._settleSuccessfulRun(run, changed, settled, Date.now());
+    this._refreshAncestors(run.parentRunId, changed, settled, Date.now());
+    await this.persistStrict();
+    return { accepted: true, run: publicRun(run), changed, settled };
+  }
+
+  async adoptWorkingContinuation(runId, ownerKey, context) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run || run.status !== 'waiting_recovery' || continuationOwnerKey(run) !== ownerKey
+      || !executionContextsMatch(run.targetExecutionContext, context)) return { accepted: false };
+    run.status = 'running'; run.outcome = null; run.error = null; run.recoveryDeadlineAt = null;
+    run.ownCompletedAt = null; run.targetBusySeen = true;
+    await this.persistStrict();
+    return { accepted: true, run: publicRun(run), changed: [publicRun(run)] };
   }
 
   async pause(runId) {
@@ -3112,6 +3294,7 @@ class OrchestrationRunStore {
       const predecessor = this.runs.get(run.predecessorRunId);
       return !predecessor || !ownsTargetExecution(predecessor);
     }).filter((run) => {
+      if (run.continuationIntent && ['prepared', 'sending', 'unconfirmed', 'blocked'].includes(run.continuationIntent.state)) return false;
       if (run.resumeAwaitingNewTurn !== true) return true;
       if (lifecycleType !== 'busy') return false;
       const exactContext = normalizeExecutionContext(executionContext);
@@ -3173,7 +3356,7 @@ class OrchestrationRunStore {
       if (run.status !== 'waiting_recovery'
         || run.outcome !== 'interrupted'
         || !run.deliveryAcceptedAt
-        || run.deliveryIntent) return false;
+        || run.deliveryIntent || run.continuationIntent && ['prepared', 'sending', 'unconfirmed', 'blocked'].includes(run.continuationIntent.state)) return false;
       if (run.targetToolType && run.targetToolType !== exactContext.provider) return false;
       const previousContext = normalizeExecutionContext(run.targetExecutionContext);
       if (previousContext && executionContextsMatch(previousContext, exactContext)) return false;

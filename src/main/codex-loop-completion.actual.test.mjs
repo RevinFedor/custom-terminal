@@ -6,6 +6,7 @@ import ts from 'typescript';
 import { createRequire } from 'node:module';
 import { isNaturalAgentTurnEndReason, normalizeAgentTurnEndReason } from '../renderer/utils/agentCompletionOutcome.mjs';
 import { choosePromptQueueContinuationForOutcome } from '../renderer/utils/promptQueueReconciliation.mjs';
+import { hasPendingAgentGoalWork } from '../shared/agent-work-completion.mjs';
 
 const require = createRequire(import.meta.url);
 const { TaskCompletionIntentRegistry, taskCompletionOutcomeMeta } = require('./task-completion-intent');
@@ -57,7 +58,7 @@ function harness({ eligible = true, ordinaryQueue = false, providerActive = true
       compactContinuation = continuation; return true;
     }, wake() {}, cancel() {} }, canProcessWorkflowOutcomes: () => true,
     isOrchestrationCompletionBlocked: () => false, isSuccessfulCompactLocalCommandEnd: () => false,
-    isNaturalAgentTurnEndReason, normalizeAgentTurnEndReason, signalQueueOwnerReadiness() {},
+    isNaturalAgentTurnEndReason, normalizeAgentTurnEndReason, hasPendingAgentGoalWork, signalQueueOwnerReadiness() {},
     interruptionContinuesWithQueuedTurn: () => false, applyAbnormalQueueOutcome() {},
     queueManualStopping: new Set(),
     findOwnersWaitingOn: () => [], describeQueuesForTriggerLog: () => '', shortQueueTabId: id => id,
@@ -92,9 +93,9 @@ function harness({ eligible = true, ordinaryQueue = false, providerActive = true
   return { registry, queue, owner, watcher, events, activity, projected, fired, logs, toasts, context,
     rearm: value => { queueArmedAt = value; }, releaseCompact: () => compactContinuation(),
     request: status => context.registerTaskCompletionIntent({ tabId, status, reason: status === 'blocked' ? 'Unlock Mac' : null }),
-    finish: (reason = 'task_complete', eventTurnId = turnId) => {
+    finish: (reason = 'task_complete', eventTurnId = turnId, goalWork = null) => {
       const outcome = { event: reason === 'turn_aborted' ? reason : 'task_complete', busy: false, reason,
-        hasFinalResult: reason === 'task_complete' };
+        hasFinalResult: reason === 'task_complete', goalWork };
       watcher.busy = false;
       // Actual record handler settles provider activity BEFORE emitCodexBusy.
       context.applyCodexWatcherOutcome(watcher, outcome, 100, eventTurnId, null);
@@ -110,6 +111,25 @@ test('accepted completed survives provider activity settlement and the real rend
   assert.equal(h.events[0].explicitTaskComplete, true);
   assert.equal(h.owner.turnActive, false); assert.equal(h.watcher.providerTurnActive, false);
   assert.ok(h.activity.some(([, busy]) => busy === false)); assert.ok(h.projected.length > 0);
+});
+
+test('native active Goal preserves turn idle but does not launch Loop/queued work', () => {
+  const h = harness({ ordinaryQueue: true });
+  h.finish('task_complete', 'turn-1', { version: 1, pending: true, phase: 'continuing', status: 'active', turnId: 'turn-1', sessionId: 'S' });
+  assert.equal(h.events[0].busy, false);
+  assert.equal(h.events[0].goalWork.pending, true);
+  assert.deepEqual(h.fired, []);
+  assert.equal(h.queue.autoRun, true);
+  assert.equal(h.queue.loopPromptEnabled, true);
+});
+
+test('native Goal deferral still consumes the separate exact Loop completion intent', () => {
+  const h = harness({ ordinaryQueue: true });
+  assert.equal(h.request('completed').ok, true);
+  h.finish('task_complete', 'turn-1', { version: 1, pending: true, phase: 'continuing', status: 'active', turnId: 'turn-1', sessionId: 'S' });
+  assert.equal(h.queue.loopPromptEnabled, false);
+  assert.equal(h.queue.autoRun, true);
+  assert.deepEqual(h.fired, []);
 });
 
 test('blocked stops Loop with its reason but preserves ordinary queued work', () => {

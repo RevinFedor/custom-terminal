@@ -5,6 +5,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import asar from '@electron/asar';
+import { writePackagedNodePtyFixture } from './node-pty-test-fixture.mjs';
 import {
   acquireInstallLock, buildInstallNotedTerminal, INSTALL_READY_PREFIX,
   isProcessAlive, PREPARE_SCRIPTS, pruneInstallStaging, releaseInstallLock,
@@ -209,7 +210,8 @@ test('bundle validation requires exact identifier, real artifacts and stable sig
   const archiveSource = await fs.mkdtemp(path.join(tmpdir(), 'noted-install-valid-archive-'));
   t.after(() => fs.rm(archiveSource, { recursive: true, force: true }));
   await fs.writeFile(path.join(archiveSource, 'main.js'), 'module.exports = 1;');
-  await asar.createPackage(archiveSource, path.join(f.releaseApp, 'Contents', 'Resources', 'app.asar'));
+  await writePackagedNodePtyFixture(archiveSource);
+  await asar.createPackageWithOptions(archiveSource, path.join(f.releaseApp, 'Contents', 'Resources', 'app.asar'), { unpack: '**/build/Release/*' });
   const commandLog = [];
   const run = async (command, args) => {
     commandLog.push({ command, args });
@@ -227,6 +229,26 @@ test('bundle validation requires exact identifier, real artifacts and stable sig
   }), /unexpected signing authority/);
   await fs.writeFile(path.join(f.releaseApp, 'Contents', 'Resources', 'app.asar'), '');
   await assert.rejects(validateAppBundle(f.releaseApp, { run }), /missing\/empty app artifact/);
+});
+
+test('packaged node-pty guard rejects ordinary binary before idle ACK, host quit or install', async t => {
+  const f = await fixture(t);
+  const source = path.join(f.root, 'native-archive');
+  await fs.mkdir(source);
+  await writePackagedNodePtyFixture(source);
+  await fs.writeFile(path.join(source, 'node_modules/node-pty/build/Release/pty.node'), 'ordinary unpatched binary');
+  await asar.createPackageWithOptions(source, path.join(f.releaseApp, 'Contents/Resources/app.asar'), { unpack: '**/build/Release/*' });
+  const run = async (command, args) => {
+    if (args.includes('Print :CFBundleIdentifier')) return 'com.noted.terminal\n';
+    if (args.includes('Print :CFBundleExecutable')) return 'Noted Terminal\n';
+    return 'Authority=' + (process.env.LOCAL_CODESIGN_IDENTITY || 'Noted Terminal Dev') + '\n';
+  };
+  const result = await f.execute({ validate: app => validateAppBundle(app, { run }) });
+  assert.equal(result.ok, false);
+  assert.equal(result.failedStep, 'validate-release');
+  assert.match(result.error, /invalid Mach-O/);
+  assert.ok(f.events.every(event => !['idle-ack', 'quit', 'replace', 'open'].includes(event.label)));
+  assert.equal(await f.readVersion(f.installedApp), 'old installed bytes');
 });
 
 const nonce = 'test-job-123';

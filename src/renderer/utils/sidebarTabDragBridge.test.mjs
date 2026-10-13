@@ -10,12 +10,26 @@ import {
   subscribeSidebarTabDragSession,
   resetSidebarTabDragForTests,
   updateSidebarTabDragPointer,
+  sidebarTabDragUsesCursorChip,
 } from './sidebarTabDragBridge.mjs';
 import { historyForegroundPriority } from './historyForegroundPriority.mjs';
 
 test.afterEach(() => {
   resetSidebarTabDragForTests();
   historyForegroundPriority.resetForTests();
+});
+
+test('cursor payload belongs to the external receiver, never to Cmd-X inside an outline', () => {
+  const drag={active:true,sessionId:'gesture',rootTabId:'a',metaKey:true};
+  const pane={active:true,source:{owner:'sidebar',rootTabId:'a',gestureId:'gesture'},target:null};
+  assert.equal(sidebarTabDragUsesCursorChip(drag,pane,null),false);
+  assert.equal(sidebarTabDragUsesCursorChip({...drag,metaKey:false},{...pane,target:{zone:'body'}},null),true);
+  assert.equal(sidebarTabDragUsesCursorChip(drag,pane,{source:'sidebar',target:{kind:'workflow'}}),true);
+  assert.equal(sidebarTabDragUsesCursorChip(drag,pane,{source:'pane',target:{kind:'workflow'}}),false);
+  assert.equal(sidebarTabDragUsesCursorChip(drag,{...pane,source:{...pane.source,gestureId:'old'},target:{}},null),false);
+  assert.equal(sidebarTabDragUsesCursorChip({...drag,active:false},pane,null,true),false);
+  assert.equal(sidebarTabDragUsesCursorChip(drag,null,null,false),false);
+  assert.equal(sidebarTabDragUsesCursorChip({...drag,metaKey:false},null,null,true),true);
 });
 
 test('cross-project bridge retains the exact source subtree and latest pointer', () => {
@@ -49,7 +63,7 @@ test('cross-project bridge retains the exact source subtree and latest pointer',
     metaKey: false,
   });
   assert.equal(getSidebarTabDragProjectionKey(), projectionKey);
-  assert.equal(getSidebarTabDragCursorChip(), null);
+  assert.equal(getSidebarTabDragCursorChip().label, 'Root tab');
   assert.deepEqual(getSidebarTabDragSnapshot(), {
     active: true,
     revision: 2,

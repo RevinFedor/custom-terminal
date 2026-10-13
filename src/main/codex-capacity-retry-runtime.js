@@ -94,7 +94,9 @@ function createCodexCapacityRetryRuntime({ getSettings, loadState, saveState, is
       && entries.get(owner.tabId) === entry
       && isCodexCapacityRetryEffectCurrent(entry.state, effect, await getSettings());
     if (!await stillCurrent()) return { ignored: true };
-    log('capacity ' + effect.type + ' tab=' + owner.tabId.slice(-12) + ' attempt=' + effect.attempt);
+    log('capacity ' + effect.type + ' tab=' + owner.tabId + ' session=' + owner.sessionId
+      + ' turn=' + effect.errorId + ' generation=' + owner.generation
+      + ' handoff=' + effect.handoffId + ' attempt=' + effect.attempt);
     if (effect.type === 'exhausted') {
       await notify(owner, effect);
       return { exhausted: true };
@@ -134,7 +136,10 @@ function createCodexCapacityRetryRuntime({ getSettings, loadState, saveState, is
       // receipt and the next typed provider event own further reconciliation.
       return result;
     } catch (error) {
-      log('capacity delivery observation failed: ' + String(error?.message || error));
+      log('capacity delivery observation failed tab=' + owner.tabId + ' session=' + owner.sessionId
+        + ' turn=' + effect.errorId + ' generation=' + owner.generation + ' handoff=' + effect.handoffId
+        + ' code=' + JSON.stringify(error?.code || null)
+        + ' error=' + JSON.stringify(String(error?.message || error)));
       return { submitted: null, deliveryUnknown: true };
     }
   }

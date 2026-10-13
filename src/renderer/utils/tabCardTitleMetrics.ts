@@ -4,7 +4,8 @@ import {useLayoutEffect,useState,type RefObject} from 'react';
 // create different card heights within the same strip/sidebar.
 export const TAB_TITLE_GLYPHS='HРрgjpqy';
 type FontProfile={ascent:number;descent:number;baseline:number;lineHeight:number};
-const caches=new WeakMap<Document,Map<string,FontProfile>>();
+type FontCache={profiles:Map<string,FontProfile>;context?:CanvasRenderingContext2D;defaultFont?:string};
+const caches=new WeakMap<Document,FontCache>();
 
 function fontProfile(element:HTMLElement):FontProfile|null {
   if(!element.isConnected)return null;
@@ -13,11 +14,24 @@ function fontProfile(element:HTMLElement):FontProfile|null {
   const font=style.font||[style.fontStyle,style.fontWeight,style.fontSize,style.fontFamily].join(' ');
   const key=font+'|'+style.lineHeight;
   let cache=caches.get(doc);
-  if(!cache){cache=new Map();caches.set(doc,cache);doc.fonts?.addEventListener('loadingdone',()=>cache!.clear());}
-  const canvas=doc.createElement('canvas'),context=canvas.getContext('2d');if(!context)return null;
+  if(!cache){cache={profiles:new Map()};caches.set(doc,cache);doc.fonts?.addEventListener('loadingdone',()=>cache!.profiles.clear());}
+  // The glyphs still get fresh metrics on every measurement. Only the private
+  // canvas/context is reused, avoiding one new canvas per retained title/RO.
+  // Explicitly set font again so font loading and inherited font changes keep
+  // the same refresh path. A lost/unavailable context can recover next time.
+  let context=cache.context;
+  if(!context||context.isContextLost?.()){
+    context=doc.createElement('canvas').getContext('2d')||undefined;
+    if(!context)return null;
+    cache.context=context;
+    cache.defaultFont=context.font;
+  }
+  // Canvas ignores an unsupported font assignment. Reset its original default
+  // first, so a rejected value cannot inherit the preceding title's font.
+  context.font=cache.defaultFont!;
   context.font=font;
   const ink=context.measureText(TAB_TITLE_GLYPHS);
-  const saved=cache.get(key);if(saved)return {...saved,ascent:ink.actualBoundingBoxAscent,descent:ink.actualBoundingBoxDescent};
+  const saved=cache.profiles.get(key);if(saved)return {...saved,ascent:ink.actualBoundingBoxAscent,descent:ink.actualBoundingBoxDescent};
   // One tiny baseline probe per font profile, outside application layout.
   // No measurement is scheduled by hover, pointer movement or unrelated saves.
   const probe=doc.createElement('span'),baseline=doc.createElement('span');
@@ -32,7 +46,7 @@ function fontProfile(element:HTMLElement):FontProfile|null {
     lineHeight:Number.parseFloat(style.lineHeight)||rect.height};}
   finally{probe.remove();}
   if(!Number.isFinite(result.ascent+result.descent+result.baseline)||result.ascent<=0)return null;
-  cache.set(key,result);return result;
+  cache.profiles.set(key,result);return result;
 }
 
 export function linkedTitleLayout(profile:FontProfile,{paddingY,gap,chipHeight}:{paddingY:number;gap:number;chipHeight:number}) {

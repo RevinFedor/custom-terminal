@@ -25,10 +25,15 @@ subagents, `tool-results` и многочисленные `.bak`/`autorepair`/ma
 - Физические source-файлы, необходимые открытой thin-fork сессии, считаются
   частью открытой сессии и тоже защищены.
 - Claude subagent открытой родительской сессии защищён для инспекции.
-- Все остальные session-файлы по умолчанию удаляются через один день после
-  закрытия/последнего изменения. Home History row может остаться metadata-only:
+- Все остальные session-файлы получают полный срок после доказанной потери
+  защиты: по умолчанию не раньше 24 часов, не по старому возрасту JSONL.
+  Home History row может остаться metadata-only:
   название, проект и дата видны, но Preview/Resume после удаления невозможны.
 - Таймер можно переопределить по группе: 1/3/7/30 дней либо Never.
+  Общий `Auto-delete delay` в часах задаёт минимальную отсрочку после потери
+  защиты; более длинный срок группы сохраняется, Never отключает автоматическое
+  удаление этой группы. Снятие chip с окна при сохранении вкладки в workflow/
+  reserve вообще не снимает защиту.
 - Renderer не решает, что безопасно удалить. Main отдаёт `deletable`,
   `protectedReason`, closure и opaque item ID, затем повторно проверяет версии
   выбранных физических файлов и полный подтверждённый состав удаления.
@@ -279,6 +284,36 @@ delete не начинается. Затем туда append-only пишутся
 provider session ID, group/path/bytes, provider closure и фактические deleted
 IDs. Те же ID попадают в `[StorageCleanup:Item]` production log; агрегат
 `requested/removed/bytes` остаётся только summary, не forensic evidence.
+
+### Отсрочка после потери защиты
+
+Пользователь уточнил: закрытая старая вкладка не должна исчезать при ближайшей
+очистке только потому, что её JSONL давно не изменялся. Прежний fallback
+`closedAt || modifiedAt` смешивал возраст данных и время возникновения права
+на автоматическое удаление. Main теперь хранит отдельный `unprotectedSince`:
+первый успешный inventory без защиты даёт полный новый срок. Это консервативное
+наблюдение, не обещание удаления ровно через N часов после клика; sweep может
+обнаружить закрытие позже. При первом запуске новой версии и при потере clock
+старые внешние сессии тоже получают новый срок, не считаются уже просроченными.
+
+Clock переживает restart в отдельной SQLite-таблице storage owner. Возврат
+saved binding, физическая замена/изменение файла либо новое закрытие отменяют
+старый отсчёт. SQL-trigger привязки и exact lineage sources нужен потому, что
+Restore → Full Close может целиком пройти между двумя inventory: один только
+UI close callback или следующий scan не доказывает непрерывную потерю защиты.
+Recovery copy с тем же SID остаётся отдельным физическим объектом. Reconcile
+читает clock после async scan в одной транзакции; перед mutation после await
+audit/provider снова проверяются текущий clock, settings и stat. Истёкший срок
+не отменяет прежние runtime/production/closure guards и provider leaf proof.
+
+Рядом с `Auto-delete on/off` — `Auto-delete delay [24] hours`, минимум один час;
+изменение сохраняется по Enter/blur. Старые group preferences сохраняются:
+deadline — более поздний из group-age threshold и `unprotectedSince + delay`.
+Явный `Delete now` остаётся ручным подтверждённым действием, не ждёт отсрочку.
+`Never=null` нельзя заменять fallback regular: иначе UI обещает сохранение,
+а main снова использует один день. Базовый filesystem inventory сам по себе
+не является готовым retention decision: действующий DTO проходит service clock.
+Новых polling/reader/History loops нет — reconcile только на прежнем scan.
 
 ## Инцидент 25.08: изолированный dev удалял production history
 

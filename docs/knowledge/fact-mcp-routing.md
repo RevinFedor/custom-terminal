@@ -77,7 +77,7 @@ Hint для разных tool'ов:
 
 ### HTTP-уровень — projectId-pinned endpoints
 Каждый `/terminal/*` endpoint принимает `parentProjectId` в body (POST) или query (GET):
-- `/terminal/tabs?parentProjectId=…&color=…` — `SELECT * FROM projects WHERE id = ?` напрямую, без `WHERE path = ?` лотереи (одинаковые path для двух разных project rows — реальная ситуация после rename'ов).
+- `/terminal/tabs?parentProjectId=…&color=…` — exact legacy Project либо v2 execution namespace. С11.10 namespace проверяется по существующему `workflow_execution_scopes` без чтения всех его records; отсутствие Project row не скрывает standalone tabs. Known empty namespace остаётся пустым даже при совпавшем legacy cwd. Fallback по legacy path сохраняется только для отсутствующего/неизвестного адреса; namespace не является workflowId.
 - `/terminal/create` — body `{ cwd?, parentProjectId? }`. Когда есть `parentProjectId` без `cwd`, main подтягивает `projects.path` из БД.
 - `/terminal/run`, `/terminal/restart`, `/terminal/kill`, `/terminal/output`, `/terminal/chain` — все валидируют, что `tabId` принадлежит `parentProjectId` через `resolveProjectForTab(tabId)` (priority: live `terminalProjectIds` Map → SQLite `tabs.project_id`). Mismatch → HTTP 403 с body `{ owner, requested }`.
 

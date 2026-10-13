@@ -5,6 +5,7 @@ import {
   historyRecordTimeLabel, intersectRect, placeHistoryRecordTime, rectsIntersect,
 } from '../../utils/historyRecordTimePresentation.mjs';
 import recordTimes from '../../../shared/history-record-time.cjs';
+import { uiPerformancePhase } from '../../utils/uiPerformanceDiagnostics.mjs';
 
 type Rect = { left: number; top: number; right: number; bottom: number };
 type View = {
@@ -96,24 +97,31 @@ export function HistoryRecordTimeOverlay({ panelRef, scrollerRef, ownerKey, tabI
     if (!enabled || !panel) return;
     let meta = false, point: { x: number; y: number } | null = null, target: HTMLElement | null = null;
     let frame = 0, disposed = false;
-    let chromeRects: Rect[] = [], safeTop = Infinity;
+    let chromeRects: Rect[] = [], safeTop = Infinity, chromeDirty = true;
     const observedChrome = new Set<HTMLElement>();
     let observedMutationRoots: HTMLElement[] = [];
     const clear = () => { setView(null); };
-    const validPanel = () => shown(panel) && panel.dataset.historyPresented !== '0'
-      && panel.dataset.historyViewportReady !== '0';
-    const chromeObserver = new ResizeObserver(() => { refreshChrome(); schedule(); });
-    const chromeMutation = new MutationObserver(() => { refreshChrome(); schedule(); });
+    const validPanel = () => panel.dataset.historyPresented !== '0'
+      && panel.dataset.historyViewportReady !== '0' && shown(panel);
+    const invalidateChrome = () => { chromeDirty = true; schedule(); };
+    const chromeObserver = new ResizeObserver(invalidateChrome);
+    const chromeMutation = new MutationObserver(invalidateChrome);
     const targetObserver = new ResizeObserver(() => schedule());
     const targetMutation = new MutationObserver(() => schedule());
-    const panelObserver = new ResizeObserver(() => { refreshChrome(); schedule(); });
+    const panelObserver = new ResizeObserver(invalidateChrome);
     const visibilityObserver = new MutationObserver(() => {
-      if (!validPanel()) { meta = false; target = null; clear(); }
-      else { refreshChrome(); schedule(); }
+      chromeDirty = true;
+      if (panel.dataset.historyPresented === '0' || panel.dataset.historyViewportReady === '0'
+        || (meta && !validPanel())) { target = null; clear(); }
+      else schedule();
     });
 
     function refreshChrome() {
-      // A cached envelope of this owner's bounded chrome. Never called by mousemove.
+      // Only an admitted Cmd-hover target needs collision geometry. Retained
+      // owner resize/control changes invalidate the cache without walking DOM.
+      if (!chromeDirty) return;
+      const started = performance.now();
+      chromeDirty = false;
       const controls = panel.querySelector<HTMLElement>('[data-history-controls]')
         || (tabId ? getComposerControlsHost(tabId)?.closest('[data-history-controls]') : null);
       const nodes = new Set<HTMLElement>();
@@ -152,6 +160,7 @@ export function HistoryRecordTimeOverlay({ panelRef, scrollerRef, ownerKey, tabI
         // ceiling hundreds of pixels above the input.
         if (node === controls || rect.width >= pane.width * 0.45) safeTop = Math.min(safeTop, rect.top);
       }
+      uiPerformancePhase('history-record-time-chrome', { tab: tabId, nodes: nodes.size, ms: performance.now() - started });
     }
     function resolveTarget() {
       if (!meta || !point || !validPanel()) return null;
@@ -168,6 +177,7 @@ export function HistoryRecordTimeOverlay({ panelRef, scrollerRef, ownerKey, tabI
     function activate() {
       const resolved = resolveTarget();
       if (!resolved) { target = null; targetObserver.disconnect(); targetMutation.disconnect(); clear(); return; }
+      refreshChrome();
       const { found, time } = resolved;
       if (target !== found) {
         target = found; targetObserver.disconnect(); targetMutation.disconnect();
@@ -187,6 +197,7 @@ export function HistoryRecordTimeOverlay({ panelRef, scrollerRef, ownerKey, tabI
     function measure() {
       const current = viewRef.current, scroller = scrollerRef.current, label = labelRef.current;
       if (!current || !label || !scroller || !meta || resolveTarget()?.found !== current.element) { clear(); return; }
+      refreshChrome();
       const pane = intersectRect(panel.getBoundingClientRect(), { left: 0, top: 0, right: innerWidth, bottom: innerHeight });
       const element = current.element;
       const kind = element.dataset.historyTimeKind;
@@ -213,29 +224,30 @@ export function HistoryRecordTimeOverlay({ panelRef, scrollerRef, ownerKey, tabI
           ? previous : { ...previous, position } : previous);
     }
     function schedule() {
-      if (!meta || disposed || frame) return;
+      if (!meta || disposed || frame || panel.dataset.historyPresented === '0'
+        || panel.dataset.historyViewportReady === '0') return;
       frame = requestAnimationFrame(() => { frame = 0; activate(); });
     }
     const move = (event: MouseEvent) => {
       point = { x: event.clientX, y: event.clientY };
       const changed = meta !== event.metaKey; meta = event.metaKey;
+      if (changed && meta) chromeDirty = true;
       if (!meta) { if (changed) clear(); return; }
       if (!(event.target instanceof Element) || !panel.contains(event.target) || event.target.closest(EXCLUDED)) {
         target = null; clear(); return;
       }
       const hit = event.target instanceof Element ? event.target.closest(TARGET) : null;
-      if (hit !== target || changed) activate();
+      if (hit !== target || changed) { if (hit !== target) chromeDirty = true; activate(); }
     };
-    const down = (event: KeyboardEvent) => { if (event.key === 'Meta') { meta = true; refreshChrome(); activate(); } };
+    const down = (event: KeyboardEvent) => { if (event.key === 'Meta') { chromeDirty = true; meta = true; activate(); } };
     const up = (event: KeyboardEvent) => { if (event.key === 'Meta') { meta = false; clear(); } };
     const blur = () => { meta = false; target = null; point = null; clear(); };
-    const leave = () => { target = null; point = null; clear(); };
+    const leave = () => { chromeDirty = true; target = null; point = null; clear(); };
     const scroll = () => { clear(); schedule(); };
-    const resize = () => { refreshChrome(); clear(); schedule(); };
+    const resize = () => { chromeDirty = true; clear(); schedule(); };
     panelObserver.observe(panel); panelObserver.observe(scrollerRef.current || panel);
     visibilityObserver.observe(panel, { attributes: true, attributeFilter: ['inert', 'aria-hidden', 'style', 'data-history-presented', 'data-history-viewport-ready'] });
-    refreshChrome();
-    const unsubscribe = tabId ? subscribeComposerControlsHost(tabId, () => { refreshChrome(); schedule(); }) : () => {};
+    const unsubscribe = tabId ? subscribeComposerControlsHost(tabId, invalidateChrome) : () => {};
     window.addEventListener('mousemove', move, true);
     window.addEventListener('keydown', down); window.addEventListener('keyup', up);
     window.addEventListener('blur', blur); window.addEventListener('resize', resize);

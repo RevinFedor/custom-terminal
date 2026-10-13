@@ -1,6 +1,7 @@
 import type { ClipboardAdapter } from '@gt-editor/markdown-editor';
 import { NOTED_COMPOSER_SNAPSHOT_FLAVOR } from './composerClipboard.mjs';
 import { isDictationClipboardPayload } from './composerChips.mjs';
+import { measureComposerClipboardCall } from './composerClipboardDiagnostics.mjs';
 
 const NOTED_COMPOSER_SNAPSHOT_HTML_ATTR = 'data-noted-terminal-composer-snapshot';
 
@@ -27,9 +28,20 @@ const resolveElectronClipboard = (): ElectronClipboard | null => {
  * event, while Electron supplies deterministic text and custom-format reads.
  */
 export const electronComposerClipboardAdapter: ClipboardAdapter = {
-  readText: () => resolveElectronClipboard()?.readText() || '',
-  writeText: (text: string) => resolveElectronClipboard()?.writeText(text),
-  readFormats: () => resolveElectronClipboard()?.availableFormats() || [],
+  readText: () => {
+    const target = resolveElectronClipboard();
+    return measureComposerClipboardCall('read-text', () => target?.readText() || '', { missing: !target?.readText });
+  },
+  writeText: (text: string) => {
+    const target = resolveElectronClipboard();
+    return measureComposerClipboardCall('write-text', () => target?.writeText(text),
+      { chars: typeof text === 'string' ? text.length : null, missing: !target?.writeText });
+  },
+  readFormats: () => {
+    const target = resolveElectronClipboard();
+    return measureComposerClipboardCall('read-formats', () => target?.availableFormats() || [],
+      { missing: !target?.availableFormats });
+  },
 };
 
 export const isElectronDictationClipboardPayload = (clipboardData: unknown): boolean =>
@@ -151,6 +163,7 @@ export const writeElectronComposerSnapshotClipboard = ({
 
 export const readElectronComposerSnapshotClipboard = (): unknown | null => {
   try {
+    return measureComposerClipboardCall('read-snapshot', () => {
     const electron = (window as any).require?.('electron');
     const target = electron?.clipboard;
     const htmlSnapshot = snapshotFromClipboardHtml(target?.readHTML?.() || '');
@@ -164,8 +177,9 @@ export const readElectronComposerSnapshotClipboard = (): unknown | null => {
     const buffer = target.readBuffer?.(NOTED_COMPOSER_SNAPSHOT_FLAVOR);
     if (!buffer || buffer.length === 0) return null;
     return JSON.parse(buffer.toString('utf8'));
-  } catch (cause: any) {
-    console.warn('[ComposerClipboard] snapshot read failed error=' + String(cause?.message || cause));
+    });
+  } catch {
+    console.warn('[ComposerClipboard] snapshot read failed code=clipboard_snapshot_read_failed');
     return null;
   }
 };

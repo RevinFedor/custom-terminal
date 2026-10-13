@@ -37,6 +37,7 @@ export function collectAgentBusyHydration({ tabs = [], states = {}, eventObserve
         tabId,
         engine: 'codex',
         busy: codexTurn.busy === true,
+        ...(codexTurn.goalWork ? { goalWork: codexTurn.goalWork } : {}),
         reason: codexTurn.busy === true
           ? 'task_started'
           : (codexTurn.outcomeKnown && codexTurn.lastOutcomeReason

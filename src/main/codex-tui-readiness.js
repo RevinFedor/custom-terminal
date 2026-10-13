@@ -29,8 +29,10 @@ const CODEX_LEADING_COMPOSER_PROMPT_RE = new RegExp(
 const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Find and fix a bug|Explain this codebase|Ask Codex|directory:\s*|permissions:\s*|Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed|Try\s+new\s+model|Use\s+existing\s+model|Resume paused goal\?/i;
 // Only the stable prefix belongs to the settings contract. Everything after
 // the separator is presentation owned by Codex (`Full Access`, Context, cwd,
-// Goal achieved, or a future replacement) and must not gate readiness.
-const CODEX_COMPOSER_STATUS_PREFIX_RE = /^(Luna Reserve|[a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?:\s*·(?:\s+.*)?|\s+Goal\s+achieved(?:\s+\([^\r\n)]*\))?|)$/i;
+// Goal achieved, or a future replacement) and must not gate readiness. Codex
+// also right-aligns its warning counter without a dot after model/effort.
+// Accept that complete native suffix, not arbitrary prose after an effort.
+const CODEX_COMPOSER_STATUS_PREFIX_RE = /^(Luna Reserve|[a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?:\s*·(?:\s+.*)?|\s+Goal\s+achieved(?:\s+\([^\r\n)]*\))?|\s+⚠\uFE0F?\s+[1-9]\d*\s+warnings?\s*·\s*f2\s+to\s+view|)$/i;
 const CODEX_MCP_STARTUP_STATUS_ANCHOR_RE = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|MCP\s+servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)|servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)/i;
 const CODEX_LIVE_INTERRUPT_FOOTER_RE = /esc\s+to\s+interrupt/i;
 const CODEX_BOOTSTRAP_STATUS_RE = /^\s*(?:Resuming|Forking)\s+session(?:…|\.{3})\s*$/i;

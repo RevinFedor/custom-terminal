@@ -46,6 +46,8 @@ interface StorageItem {
   closedAt?: number | null;
   deleteAfter?: number | null;
   retentionDays?: number | null;
+  unprotectedSince?: number | null;
+  graceDeleteAfter?: number | null;
   iterations?: number | null;
   notedTerminal: boolean;
   forkMode?: string | null;
@@ -66,6 +68,7 @@ interface StorageInventory {
   settings: {
     enabled: boolean;
     provider: ProviderFilter;
+    gracePeriodHours?: number;
     retentionDays: Record<string, number | null>;
   };
   summary: {
@@ -127,8 +130,15 @@ export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElem
   const [confirmationPreparing, setConfirmationPreparing] = useState(false);
   const confirmationPreparationSeqRef = useRef(0);
   const [deleting, setDeleting] = useState(false);
+  const [retentionSaving, setRetentionSaving] = useState(false);
+  const retentionSettingsBusyRef = useRef(false);
+  const [graceHoursDraft, setGraceHoursDraft] = useState('24');
   const [deleteProgress, setDeleteProgress] = useState<{ completed: number; total: number; removed: number; failed: number } | null>(null);
   const activeDeleteOperationRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    setGraceHoursDraft(String(inventory?.settings.gracePeriodHours ?? 24));
+  }, [inventory?.settings.gracePeriodHours]);
 
   useEffect(() => {
     const onProgress = (_event: unknown, payload: any) => {
@@ -248,28 +258,51 @@ export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElem
   }, [detailsById, selected]);
 
   const updateRetention = async (storageGroup: string, value: number | null) => {
-    if (!inventory) return;
+    if (!inventory || retentionSettingsBusyRef.current) return;
     const key = storageRetentionKey({ section, group: storageGroup });
     const settings = {
       ...inventory.settings,
       retentionDays: { ...inventory.settings.retentionDays, [key]: value },
     };
-    const result = await ipcRenderer.invoke('storage:set-settings', settings);
-    if (result?.success !== true) {
-      showToast(result?.error || 'Could not save storage retention', 'error', 5000);
+    await saveRetentionSettings(settings);
+  };
+
+  const saveRetentionSettings = async (settings: StorageInventory['settings']) => {
+    if (retentionSettingsBusyRef.current) return;
+    retentionSettingsBusyRef.current = true;
+    setRetentionSaving(true);
+    try {
+      const result = await ipcRenderer.invoke('storage:set-settings', settings);
+      if (result?.success !== true) throw new Error(result?.error || 'Could not save storage retention');
+      setInventory((current) => current ? { ...current, settings: result.settings } : current);
+      await loadInventory(true);
+    } catch (cause: any) {
+      showToast(cause?.message || 'Could not save storage retention', 'error', 5000);
+      setGraceHoursDraft(String(inventory?.settings.gracePeriodHours ?? 24));
+    } finally {
+      retentionSettingsBusyRef.current = false;
+      setRetentionSaving(false);
+    }
+  };
+
+  const updateGraceHours = async () => {
+    if (!inventory || retentionSettingsBusyRef.current) return;
+    const hours = Number(graceHoursDraft);
+    if (!Number.isInteger(hours) || hours < 1 || hours > 87600) {
+      setGraceHoursDraft(String(inventory.settings.gracePeriodHours ?? 24));
+      showToast('Enter a whole number of hours between 1 and 87600', 'warning', 4000);
       return;
     }
-    setInventory((current) => current ? { ...current, settings: result.settings } : current);
-    await loadInventory(true);
+    if (hours === (inventory.settings.gracePeriodHours ?? 24)) return;
+    await saveRetentionSettings({ ...inventory.settings, gracePeriodHours: hours });
   };
 
   const toggleRetention = async () => {
-    if (!inventory) return;
-    const result = await ipcRenderer.invoke('storage:set-settings', {
+    if (!inventory || retentionSettingsBusyRef.current) return;
+    await saveRetentionSettings({
       ...inventory.settings,
       enabled: !inventory.settings.enabled,
     });
-    if (result?.success === true) await loadInventory(true);
   };
 
   const eligibleItems = useMemo(() => (inventory?.items || []).filter((item) => item.eligible), [inventory?.items]);
@@ -469,6 +502,7 @@ export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElem
                         <dt className="text-[#666]">Created by</dt><dd className="text-[#ccc]">{STORAGE_GROUPS[selected.group]?.label || selected.group}</dd>
                         <dt className="text-[#666]">Parent</dt><dd className="break-all font-mono text-[9px] text-[#888]">{selected.parentSessionId || '—'}</dd>
                         <dt className="text-[#666]">Modified</dt><dd className="text-[#ccc]">{formatStorageDate(selected.modifiedAt)}</dd>
+                        {selected.unprotectedSince && <><dt className="text-[#666]">Unprotected</dt><dd className="text-[#ccc]">{new Date(selected.unprotectedSince).toLocaleString('en')}</dd></>}
                         <dt className="text-[#666]">Retention</dt><dd className="text-[#ccc]">{selected.protected ? 'Never' : selected.section === 'builds' ? 'Manual cleanup' : formatDeleteCountdown(selected.deleteAfter)}</dd>
                       </dl>
                       <Tooltip content={selected.path} side="left">
@@ -529,13 +563,41 @@ export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElem
               </button>
             </ControlHint>
             {inventory && (
-              <button
-                type="button"
-                className={`ml-auto rounded-md border px-2.5 py-1 text-[11px] ${inventory.settings.enabled ? 'border-[#5d472d] bg-[#241b10] text-[#e6a45a]' : 'border-[#333] text-[#777]'}`}
-                onClick={() => void toggleRetention()}
-              >
-                Auto-delete {inventory.settings.enabled ? 'on' : 'off'}
-              </button>
+              <div className="ml-auto flex flex-wrap items-center gap-2 text-[11px]">
+                <ControlHint label="Minimum wait after a session loses protection. Reopening resets the wait; group retention can keep it longer, and Never stays Never. Removing a window chip does not unprotect a saved tab." side="top">
+                  <label className="flex items-center gap-1.5 text-[#888]">
+                    <span>Auto-delete delay</span>
+                    <input
+                      data-storage-grace-hours
+                      aria-label="Minimum hours after losing protection before auto-delete"
+                      type="number" min={1} max={87600} step={1}
+                      value={graceHoursDraft}
+                      disabled={retentionSaving}
+                      onChange={(event) => setGraceHoursDraft(event.target.value)}
+                      onBlur={() => void updateGraceHours()}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); }
+                        if (event.key === 'Escape') {
+                          setGraceHoursDraft(String(inventory.settings.gracePeriodHours ?? 24));
+                          event.stopPropagation();
+                        }
+                      }}
+                      className="h-6 w-16 rounded border border-[#3a3024] bg-[#171717] px-1.5 text-right tabular-nums text-[#d7aa75] outline-none focus:border-[#815a31] disabled:opacity-50"
+                    />
+                    <span>hours</span>
+                  </label>
+                </ControlHint>
+                <button
+                  type="button"
+                  data-storage-auto-delete
+                  disabled={retentionSaving}
+                  className={`rounded-md border px-2.5 py-1 text-[11px] ${inventory.settings.enabled ? 'border-[#5d472d] bg-[#241b10] text-[#e6a45a]' : 'border-[#333] text-[#777]'}`}
+                  onClick={() => void toggleRetention()}
+                >
+                  {retentionSaving && <RefreshCw size={10} className="mr-1 inline animate-spin" />}
+                  Auto-delete {inventory.settings.enabled ? 'on' : 'off'}
+                </button>
+              </div>
             )}
           </>
         )}
@@ -716,6 +778,7 @@ export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElem
                               value={retentionValue == null ? 'never' : String(retentionValue)}
                               onChange={(event) => void updateRetention(summary.group, event.target.value === 'never' ? null : Number(event.target.value))}
                               onClick={(event) => event.stopPropagation()}
+                              disabled={retentionSaving}
                               className="ml-auto h-5 rounded border border-[#2e2e2e] bg-[#171717] px-1 text-[10px] text-[#888]"
                             >
                               {RETENTION_DAY_OPTIONS.map((option: any) => (

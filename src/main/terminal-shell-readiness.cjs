@@ -2,6 +2,7 @@
 
 function createTerminalShellReadinessTracker() {
   const states = new Map();
+  let launchWriteSequence = 0;
   const normalizePid = (pid) => (
     pid !== null && pid !== undefined && Number.isFinite(Number(pid))
       ? Number(pid)
@@ -16,6 +17,7 @@ function createTerminalShellReadinessTracker() {
       ready: false,
       readyAt: null,
       promptFrame: null,
+      pendingAgentLaunch: null,
     };
     states.set(tabId, state);
     return state;
@@ -59,6 +61,31 @@ function createTerminalShellReadinessTracker() {
     return true;
   };
 
+  // Shell input may have been written while the AI child is not visible yet.
+  // Neither a process lookup miss nor the Ctrl+C prelude's prompt proves that
+  // these bytes were consumed. Retain this small witness in the shell owner.
+  const markAgentLaunchWrite = (tabId, terminalToken, toolType, launchId) => {
+    const state = states.get(tabId);
+    if (!state || state.terminalToken !== terminalToken) return false;
+    state.pendingAgentLaunch = { writeId: ++launchWriteSequence,
+      toolType, launchId: launchId || null, commandStarted: false };
+    markCommandBoundary(tabId, terminalToken);
+    return true;
+  };
+  const markAgentLaunchStarted = (tabId, terminalToken) => {
+    const state = states.get(tabId);
+    if (state?.terminalToken === terminalToken && state.pendingAgentLaunch) {
+      state.pendingAgentLaunch.commandStarted = true;
+    }
+  };
+  const finishAgentLaunch = (tabId, terminalToken, processStopped = false) => {
+    const state = states.get(tabId);
+    if (!state || state.terminalToken !== terminalToken || !state.pendingAgentLaunch) return false;
+    if (!processStopped && !state.pendingAgentLaunch.commandStarted) return false;
+    state.pendingAgentLaunch = null;
+    return true;
+  };
+
   const remove = (tabId, terminalToken = null) => {
     const state = states.get(tabId);
     if (!state || (terminalToken && state.terminalToken !== terminalToken)) return false;
@@ -75,10 +102,14 @@ function createTerminalShellReadinessTracker() {
       ready: state.ready === true,
       pid: state.pid,
       readyAt: state.readyAt,
+      pendingAgentLaunch: state.pendingAgentLaunch ? { ...state.pendingAgentLaunch } : null,
     };
   };
 
   return {
+    markAgentLaunchWrite,
+    markAgentLaunchStarted,
+    finishAgentLaunch,
     markCommandBoundary,
     markPromptFrame,
     markPromptReady,

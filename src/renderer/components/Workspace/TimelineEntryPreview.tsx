@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Bot, Check, ChevronDown, ChevronRight, Copy, FileText, Image as ImageIcon, Layers,
-  Maximize2, MessageSquareText, Minimize2, Pencil, RefreshCw, Repeat2, Sparkles, TriangleAlert } from 'lucide-react';
+  Maximize2, MessageSquareText, Minimize2, Pencil, RefreshCw, Repeat2, Sparkles, Target, TriangleAlert } from 'lucide-react';
 import { Markdown } from '@noted/claude-blocks';
 import { CUSTOM_ICONS } from '../../assets/icons/registry';
 import scDesktopIcon from '../../assets/sc-desktop.png';
@@ -119,7 +119,7 @@ export function TimelineEntryPreview(props: Props) {
     if (copyTimer.current) clearTimeout(copyTimer.current);
     copyTimer.current = setTimeout(() => setCopied(false), 1200);
   };
-  const normal = entry.type === 'user' && !entry.isCompactSummary && !entry.isSubAgent && !entry.isSubAgentTimeout;
+  const normal = entry.type === 'user' && !entry.isCompactSummary && !entry.isSubAgent && !entry.isSubAgentTimeout && !prompt.goal;
   const service = prompt.service;
   const sc = service?.runKind === 'external-research';
   const scModel = timelineResearchModelLabel(props.researchModel);
@@ -130,14 +130,15 @@ export function TimelineEntryPreview(props: Props) {
   const kind = compact ? 'compact' : entry.type === 'continued' ? 'continued'
     : entry.isSubAgentTimeout ? 'timeout' : entry.isSubAgent ? 'agent'
     : prompt.questionReply ? 'question-reply'
-    : service ? sc ? 'research' : 'mcp' : automatic ? automatic.kind : entry.isGoalContinuation ? 'goal'
+    : service ? sc ? 'research' : 'mcp' : prompt.goal ? prompt.goal.kind === 'status' ? 'goal-status' : 'goal'
+    : automatic ? automatic.kind : entry.isGoalContinuation ? 'goal'
     : entry.isPlan ? 'plan' : 'iteration';
   const Icon = kind === 'compact' || kind === 'continued' || kind === 'loop' ? Repeat2 : kind === 'system' || kind === 'continue' ? RefreshCw : kind === 'agent' ? Bot
-    : kind === 'timeout' ? TriangleAlert : kind === 'mcp' ? Layers : MessageSquareText;
+    : kind === 'timeout' ? TriangleAlert : kind === 'mcp' ? Layers : kind === 'goal' || kind === 'goal-status' ? Target : MessageSquareText;
   const title = compact ? compact.encrypted ? 'context compacted (encrypted)' : 'context compacted'
     : prompt.questionReply ? prompt.questionReply.title
     : kind === 'continued' ? 'Context Overflow Recovery' : kind === 'timeout' ? 'Timeout'
-    : kind === 'agent' ? entry.subAgentName || 'Agent' : automatic ? automatic.title : kind === 'goal' ? 'Goal continuation'
+    : kind === 'agent' ? entry.subAgentName || 'Agent' : prompt.goal ? prompt.goal.title : automatic ? automatic.title : kind === 'goal' ? 'Goal continuation'
     : kind === 'plan' ? 'Plan Mode' : kind === 'mcp' ? service?.kind === 'tab-message'
       ? service.phase === 'reply' ? 'Terminal MCP reply' : 'Terminal MCP question'
       : `Terminal MCP ${service?.phase || 'prompt'}` : kind === 'research' ? 'SC Desktop' : 'User mess.';
@@ -145,7 +146,7 @@ export function TimelineEntryPreview(props: Props) {
   const attachmentParts = prompt.parts.filter((part: any) => part.kind !== 'text');
   const showBody = !compact?.encrypted;
   const docsOnly = entry.type === 'docs_edit' || entry.type === 'docs_search';
-  const canExpand = showBody && (!!preview || prompt.text.length > 80 || attachmentParts.length > 0 || !!compact?.text);
+  const canExpand = showBody && (!!prompt.research?.needsDisclosure || !!preview || prompt.text.length > 80 || attachmentParts.length > 0 || !!compact?.text);
 
   if (group) {
     const aggregate = timelineGroupPreview(group.entries, group.kind);
@@ -193,7 +194,12 @@ export function TimelineEntryPreview(props: Props) {
           {!docsOnly && (expanded ? <div className="timeline-preview-prompt-expanded" data-timeline-preview-prompt>
             {compact ? compact.loading ? <span role="status">Загружаю compact summary…</span>
               : <Markdown text={compact.text || 'Compact summary не найден'} />
-              : prompt.parts.map((part: any, index: number) => part.kind === 'text'
+              : prompt.research ? <>
+                {prompt.parts.slice(0, -1).map((part: any, index: number) => part.kind === 'text'
+                  ? <span key={index} className="timeline-preview-prompt-text">{part.text}</span>
+                  : <Attachment key={index} part={part} />)}
+                <Markdown text={prompt.research.displayText} />
+              </> : prompt.parts.map((part: any, index: number) => part.kind === 'text'
                 ? <span key={index} className="timeline-preview-prompt-text">{part.text}</span>
                 : <Attachment key={index} part={part} />)}
           </div> : <>
@@ -204,7 +210,7 @@ export function TimelineEntryPreview(props: Props) {
                 <span>{part.kind === 'paste' ? 'Pasted Content' : part.kind === 'image' ? `Image #${part.id || 1}` : part.chip?.label || 'PROMPT'}</span>
               </span>)}
             </div>}
-            {(compact || prompt.text) && <div className="timeline-preview-prompt-collapsed" data-timeline-preview-prompt
+            {(compact || prompt.text) && <div className={`timeline-preview-prompt-collapsed${prompt.research ? ' timeline-preview-research-collapsed' : ''}`} data-timeline-preview-prompt
               role={normal && !compact ? 'button' : undefined} tabIndex={normal && !compact ? 0 : undefined}
               onClick={normal && !compact ? props.onNavigatePrompt : undefined}
               onKeyDown={event => { if (normal && !compact && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); props.onNavigatePrompt(); } }}

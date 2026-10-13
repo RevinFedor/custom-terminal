@@ -13,7 +13,11 @@ import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { organizationPlacementIntent } from '../utils/workflowPlacementMembership.mjs';
 import { tabNavigationLocation } from '../utils/tabNavigationLocation.mjs';
 import * as links from '../utils/tabLinkNavigation.mjs';
+import {linkedFileOwner} from '../utils/tabLinkedFiles.mjs';
 import * as placement from '../utils/tabPlacementResolver.mjs';
+import * as windowTargets from '../utils/workspaceWindowTarget.mjs';
+import {applyWorkspaceWindowMutation as applyWorkspaceWindowMutationModel,dropTabsFromWorkspaceLayout} from '../utils/workspaceWindowMutation.mjs';
+import {workspaceSpacesFingerprint,spacesWithLiveLayout} from '../utils/workspaceSpaceRecovery.mjs';
 import { webcrypto } from 'node:crypto';
 
 // Run the actual store methods and its display-reconciliation boundary in
@@ -29,12 +33,13 @@ const setStatement = factory.body.statements.find(statement => ts.isVariableStat
 let object = factory.body.statements.find(ts.isReturnStatement).expression;
 while (ts.isParenthesizedExpression(object)) object = object.expression;
 const names = [
-  'showHiddenWindow', 'activateCenterTab', 'switchTab', 'touchGlobalTabMru',
+  'showHiddenWindow', 'focusSplitPane', 'activateCenterTab', 'switchTab', 'touchGlobalTabMru',
   'getFocusedProjectId', 'requestTabListReveal', 'setProjectView', 'workspaceSpaceIndexOfTab',
   'addEmptySplitPane', 'addVerticalSplitPane',
   'minimizeWorkspaceWindow',
   'openTabById', 'placeTab', 'setViewingSubAgent', 'addTabToSplitPaneStrip',
   'centerStripKey', 'addTabToCenterStrip',
+  'commitWorkspaceWindowAction',
 ];
 const methods = names.map(name => {
   const property = object.properties.find(candidate => candidate.name?.getText(ast) === name);
@@ -46,6 +51,7 @@ const navigationOwner = ast.statements.find(statement => ts.isFunctionDeclaratio
   && statement.name?.text === 'withOwnedTabNavigation');
 const code = transformSync('let ownedTabNavigation = null;\n' + navigationOwner.getText(ast) + '\n' + setStatement.getText(ast)
   + '\nconst activationFollowPatch = ' + variable('activationFollowPatch').initializer.getText(ast)
+  + (variable('focusedPaneActivationBlockReason') ? ';\nconst focusedPaneActivationBlockReason = ' + variable('focusedPaneActivationBlockReason').initializer.getText(ast) : '')
   + ';\nmodule.exports = {' + methods.join(',\n') + '};', { loader: 'ts', format: 'cjs' }).code;
 const clone = value => JSON.parse(JSON.stringify(value));
 const chip = (tabId, projectId = 'p') => ({ projectId, tabId });
@@ -102,16 +108,19 @@ function fixture({ chooser = false, vacant = false, customLayout = null } = {}) 
     const module = { exports: {} };
     vm.runInNewContext(code, {
       module, baseSet, get, ...panes, ...displays, ...spaces, ...links, ...placement, touchMru, isVisitWorthRecording,
-      organizationPlacementIntent,tabNavigationLocation,crypto:webcrypto,
+      organizationPlacementIntent,tabNavigationLocation,linkedFileOwner,crypto:webcrypto,
+      ...windowTargets,applyWorkspaceWindowMutationModel,dropTabsFromWorkspaceLayout,workspaceSpacesFingerprint,spacesWithLiveLayout,
       performance, console: { log() {}, warn() {}, info() {} },
       startTransition: fn => fn(), requestAnimationFrame: fn => fn(), markRendererActivity: () => () => {},
       emitTabCompletionNotificationCleared: event => effects.push({ kind: 'notification', ...event }),
       saveTabs: projectId => effects.push({ kind: 'save-tabs', projectId }),
-      useUIStore: { getState: () => ({ setActiveArea: area => effects.push({ kind: 'area', area }) }) },
+      useUIStore: { getState: () => ({ activeArea: 'workspace', setActiveArea: area => effects.push({ kind: 'area', area }),
+        rememberLinkedFile:(ownerTabId,fileTabId)=>effects.push({kind:'remember-file',ownerTabId,fileTabId}) }) },
     });
     return { ...initial, ...module.exports,
       saveSession: () => effects.push({ kind: 'save-session' }),
       ensureTabRuntime: async () => true,
+      commitOrganization:async()=>effects.push({kind:'organization-save'}),
       switchWorkspaceSpace: () => assert.fail('reveal must stay in the current workflow'),
     };
   });
@@ -129,6 +138,92 @@ function snapshot(state) {
     projects: [...state.openProjects].map(([id, workspace]) => [id, { ...workspace, tabs: [...workspace.tabs] }]),
   });
 }
+
+function primeFocusedPane(f) {
+  f.store.setState({ tabCatalog: { a: { namespace: 'p', active: true } } });
+  f.store.getState().activateCenterTab('p', 'a');
+}
+
+test('repeated focus on the already activated pane keeps only the sidebar reveal publication', () => {
+  const f = fixture();
+  primeFocusedPane(f);
+  const before = f.store.getState();
+  f.writes.length = 0; f.effects.length = 0;
+  before.focusSplitPane(0);
+  const after = f.store.getState();
+  assert.equal(f.writes.length, 1, 'no repeated switch/placement/MRU publication');
+  assert.equal(after.openProjects, before.openProjects);
+  assert.equal(after.activeSpaceTab, before.activeSpaceTab);
+  assert.equal(after.splitPanes, before.splitPanes);
+  assert.equal(after.globalTabMru, before.globalTabMru);
+  assert.equal(after.tabListRevealRequest.seq, before.tabListRevealRequest.seq + 1, 'explicit sidebar reveal still works');
+  assert.deepEqual(f.effects, [], 'no redundant persistence or notification acknowledgement');
+});
+
+for (const change of ['parked-sidebar', 'selected-set', 'notification', 'mru', 'missing-visit', 'project-home']) {
+  test('focused-pane reuse preserves meaningful activation: ' + change, () => {
+    const f = fixture(); primeFocusedPane(f);
+    const state = f.store.getState(), workspace = state.openProjects.get('p'), tab = workspace.tabs.get('a');
+    if (change === 'parked-sidebar') f.store.setState({ focusedProjectId: 'q' });
+    if (change === 'selected-set') workspace.selectedTabIds = ['a', 'b'];
+    if (change === 'notification') { tab.completionNotificationFired = true; tab.completionNotificationArmed = true; }
+    if (change === 'mru') f.store.setState({ globalTabMru: [chip('b'), chip('a')] });
+    if (change === 'missing-visit') tab.lastActivatedAt = 0;
+    if (change === 'project-home') workspace.currentView = 'home';
+    f.writes.length = 0; f.effects.length = 0;
+    f.store.getState().focusSplitPane(0);
+    const after = f.store.getState();
+    assert.equal(after.focusedProjectId, 'p'); assert.equal(after.activeProjectId, 'p');
+    assert.deepEqual([...workspace.selectedTabIds], ['a']);
+    assert.equal(workspace.currentView, 'terminal');
+    assert.equal(after.globalTabMru[0].tabId, 'a'); assert.ok(tab.lastActivatedAt > 0);
+    assert.ok(f.writes.length > 1, 'the meaningful original activation path must run');
+    if (change === 'notification') {
+      assert.equal(tab.completionNotificationFired, undefined);
+      assert.equal(tab.completionNotificationArmed, true, 'only the fired notification is acknowledged');
+      assert.equal(f.effects.filter(e => e.kind === 'notification').length, 1);
+    }
+  });
+}
+
+test('an already-presented pane click cancels an older navigation awaiting runtime without replaying activation', async () => {
+  const f = fixture(); primeFocusedPane(f); f.store.setState({ organizationReady: true });
+  await f.store.getState().openTabById('a');
+  let release;
+  f.store.setState({ ensureTabRuntime: () => new Promise(resolve => { release = resolve; }) });
+  const old = f.store.getState().openTabById('a');
+  assert.equal(typeof release, 'function');
+  f.writes.length = 0; f.effects.length = 0;
+  f.store.getState().focusSplitPane(0);
+  assert.equal(f.store.getState().activeTabNavigationIntent, null);
+  assert.equal(f.writes.length, 1);
+  release(true);
+  assert.equal(await old, false, 'old async navigation cannot claim the later pointer intent');
+});
+
+test('focused pane without canonical namespace proof takes the existing activation route', () => {
+  const f = fixture(); primeFocusedPane(f);
+  f.store.setState({ tabCatalog: {} });
+  f.writes.length = 0;
+  f.store.getState().focusSplitPane(0);
+  assert.ok(f.writes.length > 1, 'unknown owner is not a reuse certificate');
+});
+
+test('a namespace handoff cannot reuse the old pane owner merely because its local pointers still agree', async () => {
+  const f = fixture(); primeFocusedPane(f);
+  const previousReveal = f.store.getState().tabListRevealRequest;
+  const open = f.store.getState().openTabById;
+  let flight, refreshes = 0;
+  f.store.setState({ organizationReady: true, tabCatalog: { a: { namespace: 'q', active: true } },
+    refreshOrganizationCatalog: async () => { refreshes++; },
+    openTabById: (...args) => (flight = open(...args)),
+  });
+  f.store.getState().focusSplitPane(0);
+  assert.ok(flight, 'must resolve current namespace through the existing navigator');
+  assert.equal(await flight, false, 'new namespace has no materialized owner in this fixture');
+  assert.equal(refreshes, 1);
+  assert.equal(f.store.getState().tabListRevealRequest, previousReveal, 'no old-owner reveal from the fast path');
+});
 
 function oneVisibleWithHidden({ placeholder = false } = {}) {
   return displays.reconcileWindowDisplay({
@@ -181,7 +276,7 @@ test('secondary link without a position on this display uses the current visible
 });
 
 for (const replace of [false, true]) {
-  test(`unplaced tab ${replace ? 'sidebar click replaces the shown chip' : 'secondary link appends without replacing'}`, async () => {
+  test(`unplaced tab ${replace ? 'explicit legacy replacement replaces the shown chip' : 'ordinary navigation appends without replacing'}`, async () => {
     const f = fixture();
     f.store.setState({organizationReady:true,tabWorkflowMembership:{unplaced:{workflowId:'main',revision:1}}});
     const before = f.store.getState();
@@ -190,7 +285,7 @@ for (const replace of [false, true]) {
     const oldTab = before.openProjects.get('p').tabs.get('b');
     oldTab.cwd = '/kept'; oldTab.codexSessionId = 'saved-writer';
     const oldData = clone(oldTab);
-    const options = replace ? {reason:'workflow-reserve',unplacedMode:'replace-shown'} : {reason:'orchestration-linked-tab'};
+    const options = replace ? {reason:'explicit-unplaced-replacement',unplacedMode:'replace-shown'} : {reason:'workflow-reserve'};
     assert.equal(await f.store.getState().openTabById('unplaced', options), true);
     const next = f.store.getState(), shown = next.splitPanes[1];
     assert.equal(next.splitFocusedIndex,1);
@@ -215,6 +310,47 @@ test('replace-unplaced option still reveals an existing hidden placement in its 
   assert.equal(f.store.getState().splitPanes[0],left);
   assert.equal(f.store.getState().splitFocusedIndex,1);
   assert.equal(f.store.getState().splitPanes[1].windowId,'incoming');
+});
+
+for (const action of ['beside','replace-shown']) {
+  test(`explicit ${action} uses actual window writer, preserving tabs, execution and other windows`,async()=>{
+    const f=fixture();
+    f.store.setState({organizationReady:true,tabWorkflowMembership:{unplaced:{workflowId:'main',revision:1}}});
+    const initial=f.store.getState(),right=initial.splitPanes[1];
+    const before=initial.openProjects.get('p').tabs.get('a');
+    before.cwd='/original';before.codexSessionId='writer';
+    assert.equal(await initial.openTabById('unplaced',{windowAction:action}),true);
+    const state=f.store.getState();
+    assert.equal(state.splitPanes[state.splitFocusedIndex].tabId,'unplaced');
+    assert.equal(state.openProjects.get('p').tabs.get('a'),before);
+    assert.equal(before.cwd,'/original');assert.equal(before.codexSessionId,'writer');
+    assert.deepEqual(panes.paneSlots(state.splitPanes.find(p=>p.windowId===right.windowId)),panes.paneSlots(right));
+    assert.equal(state.splitPanes.filter(p=>!p.displayHidden).length,action==='beside'?3:2);
+    assert.equal(state.splitPanes.some(p=>panes.paneTabs(p).some(t=>t.tabId==='a')),action==='beside');
+    assert.ok(f.effects.some(e=>e.kind==='organization-save'));
+  });
+}
+
+test('ordinary repeated file navigation appends once and never turns into parent preview',async()=>{
+  const f=fixture(),before=f.store.getState().splitPanes[0];
+  const file=f.store.getState().openProjects.get('p').tabs.get('unplaced');
+  file.tabType='file';file.filePath='/synthetic/doc.md';file.visualParentTabId='a';
+  assert.equal(await f.store.getState().openTabById('unplaced'),true);
+  assert.equal(await f.store.getState().openTabById('unplaced'),true);
+  const state=f.store.getState(),shown=state.splitPanes[state.splitFocusedIndex];
+  assert.deepEqual(panes.paneTabs(shown),[chip('a'),chip('unplaced')]);
+  assert.equal(shown.windowId,before.windowId);assert.equal(file.visualParentTabId,'a');
+  assert.ok(f.effects.some(e=>e.kind==='remember-file' && e.ownerTabId==='a' && e.fileTabId==='unplaced'));
+});
+
+test('explicit placement refuses an origin changed during lazy catalog read',async()=>{
+  const f=fixture(),tab=f.store.getState().openProjects.get('p').tabs.get('unplaced');
+  tab.lazyRuntime=true;let finish;
+  f.store.setState({organizationReady:true,refreshOrganizationCatalog:()=>new Promise(r=>{finish=r;})});
+  const opening=f.store.getState().openTabById('unplaced',{windowAction:'replace-shown'});
+  f.store.setState({splitFocusedIndex:1});finish();
+  assert.equal(await opening,false);assert.equal(f.store.getState().splitPanes[0].tabId,'a');
+  assert.equal(f.store.getState().splitPanes[1].tabId,'b');
 });
 
 for (const replace of [false,true]) {

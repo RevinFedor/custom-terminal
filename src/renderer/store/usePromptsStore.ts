@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { GeminiModelId } from '../constants/geminiModels';
 import { RUN_AFTER_LOOP_PROMPT_ID, DEFAULT_LOOP_PROMPT } from '../../shared/prompt-loop.mjs';
 import { DEFAULT_TAB_TITLE_PROMPT } from '../../shared/tab-title-prompt.mjs';
+import { TASK_THEME_PROMPT_ID, DEFAULT_TASK_THEME_PROMPT } from '../../shared/task-theme-prompt.mjs';
 export { DEFAULT_TAB_TITLE_PROMPT };
 export { RUN_AFTER_LOOP_PROMPT_ID };
 
@@ -51,6 +52,9 @@ interface PromptsStore {
 
 // Fallback defaults (used before DB loads)
 const FALLBACK_PROMPTS: AIPrompt[] = [
+  { id: TASK_THEME_PROMPT_ID, name: 'Тема задачи', content: DEFAULT_TASK_THEME_PROMPT,
+    model: 'gemini-3.5-flash-lite', thinkingLevel: 'NONE', color: '#a78bfa',
+    isBuiltIn: true, showInContextMenu: false, position: 11, filePaths: [] },
   { id: RUN_AFTER_LOOP_PROMPT_ID, name: 'Run After Loop', content: DEFAULT_LOOP_PROMPT,
     model: 'gemini-3.8-flash', thinkingLevel: 'NONE', color: '#a78bfa',
     isBuiltIn: true, showInContextMenu: false, position: 10, filePaths: [] },

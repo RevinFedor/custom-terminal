@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
 import { createRequire } from 'node:module';
+import { isRequestSuccessPresentation } from '../utils/requestTrackerVisibility.mjs';
 const require = createRequire(import.meta.url);
 const hook = fs.readFileSync(new URL('./useTabMessages.ts', import.meta.url), 'utf8');
 const source = ts.createSourceFile('hook.ts', hook, ts.ScriptTarget.Latest, true);
@@ -19,7 +20,7 @@ const compiled = ts.transpileModule('const ' + cancel + ';globalThis.runCancel=c
 const projection = {};
 vm.runInNewContext(ts.transpileModule(fs.readFileSync(new URL('../utils/tabMessageProjection.ts', import.meta.url), 'utf8'), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
-}).outputText, { exports: projection, require: () => ({ REQUEST_SUCCESS_VISIBLE_MS: 4000 }) });
+}).outputText, { exports: projection, require: () => ({ isRequestSuccessPresentation }) });
 
 test('actual controller X requests cancellation and hides only after an exact durable ACK', async () => {
   let response, errors = {}, merged = [];
@@ -45,8 +46,8 @@ test('cancel event behind a newer delivery event stays monotonic; saved History 
   assert.equal(state.q.cancelledAt, 35);
   const [thread] = projection.tabMessageThreads(state, 'B');
   assert.equal(thread.question.text, q.text);
-  assert.equal(projection.tabMessageVisibleInTracker(thread, 'A', 80), false);
-  assert.equal(projection.tabMessageVisibleInTracker(thread, 'B', 80), false);
+  assert.equal(projection.tabMessageVisibleInTracker(thread, 'A'), false);
+  assert.equal(projection.tabMessageVisibleInTracker(thread, 'B'), false);
   assert.match(projection.tabMessageDelivery(thread.question).label, /не подтверждена/);
   assert.equal(projection.tabMessageQuestionLabel({ ...thread.question, deliveryState: 'sent' }, false), 'Доставлено');
 });

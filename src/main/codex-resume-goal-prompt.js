@@ -42,7 +42,9 @@ function inspectCodexResumeGoalPrompt(cleanText) {
   const secondOptionSelected = RESUME_GOAL_SECOND_SELECTED_RE.test(section);
   const checks = {
     title: true,
-    goal: /(?:^|\n)[\t ]*Goal:[\t ]*\S/im.test(section),
+    // Codex 0.162 may prefix the description with › as well as the option.
+    // Keep that decoration local: it must not count as a selected menu item.
+    goal: /(?:^|\n)[\t ]*(?:›[\t ]+)?Goal:[\t ]*\S/im.test(section),
     resumeOption: /(?:^|\n)[\t ]*(?:[›❯»>][\t ]*)?1\.[\t ]*Resume\s+goal\b/im.test(section),
     resumeDescription: /Mark it active and continue when idle/i.test(compact),
     leaveOption: /(?:^|\n)[\t ]*(?:[›❯»>][\t ]*)?2\.[\t ]*Leave\s+paused\b/im.test(section),

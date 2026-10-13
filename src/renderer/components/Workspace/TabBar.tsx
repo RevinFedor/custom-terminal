@@ -10,6 +10,7 @@ import { CompositedTextShimmer } from '../UI/CompositedTextShimmer';
 import TabNotificationControls from './TabNotificationControls';
 import { IdleSessionStopCountdown } from './IdleSessionStopCountdown';
 import TabFileDeleteAction from './TabFileDeleteAction';
+import { openSidebarLinkedFile } from '../../utils/tabLinkedFilePreview';
 import {
   CONTEXT_MENU_BLOCK_DIVIDER_STYLE,
   CONTEXT_MENU_BOTTOM_DIVIDER_STYLE,
@@ -36,6 +37,7 @@ import { TabPaneMap } from './PaneMap';
 import { TabIdActions } from './TabIdActions';
 import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
 import { tabContextSurface, tabContextPaneIndex } from '../../utils/tabContextSurface.mjs';
+import TabWindowActionButton from './TabWindowActionButton';
 import type { WindowCell } from './MoveToWindowMenu';
 import NewTabMenuRows from './NewTabMenuRows';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
@@ -166,7 +168,7 @@ import { resolveSubmenuSide, submenuArrow, WIDEST_SUBMENU_WIDTH } from '../../ut
 import { acceptTabBackgroundWorkRecord } from '../../utils/tabBackgroundWorkState.mjs';
 import {
   openProjectIdsFingerprint,
-  tabSidebarProjectFingerprint,
+  publishedTabSidebarProjectFingerprint,
 } from '../../utils/tabSidebarProjectFingerprint.mjs';
 import TabPendingOperation, { resolveTabPendingOperationLabel } from './TabPendingOperation';
 import { resolveTabRangeSelection } from '../../utils/tabRangeSelection.mjs';
@@ -1985,6 +1987,8 @@ const TabItem = memo(({
   const pendingOperationLabel = resolveTabPendingOperationLabel({
     aiClosing: tab.aiClosing,
     pendingOperation: tab.pendingOperation,
+    nameSetManually: tab.nameSetManually,
+    name: tab.name,
   });
   const isInboxApiOrigin = isInboxApiCreatedTab(tab);
 
@@ -2281,7 +2285,7 @@ const TabItem = memo(({
                   секундами не происходило ничего видимого. */}
               {pendingOperationLabel ? (
                 <TabPendingOperation label={pendingOperationLabel} tabName={tab.name} />
-              ) : isTitleNaming ? (
+              ) : isTitleNaming && !tab.nameSetManually ? (
                 <span className="tab-title-naming-frame" title={tab.name}>
                   <span className="tab-title-naming-ghost">{tab.name}</span>
                   <CompositedTextShimmer className="tab-title-naming-text" variant="naming">naming...</CompositedTextShimmer>
@@ -3482,12 +3486,13 @@ function TabBar({
   sharedPasteBusyTabs,
 }: TabBarProps) {
   const isVerticalLayout = layout === 'vertical';
+  const visualTreeMemo = useRef<{key: unknown; value: Map<string, {hasLaterSibling:boolean;continuationDepths:number[]}>} | null>(null);
   // ProjectWorkspace/Tab objects mutate in place, while openProjects is cloned
   // as a broad notification envelope. The exact primitive projection wakes
   // this TabBar only when THIS project's visible rows can differ; a workflow
   // switch or a status write in another project leaves the retained DOM alone.
   const workspaceProjectionKey = useWorkspaceStore((state) => (
-    tabSidebarProjectFingerprint(state.openProjects.get(projectId))
+    publishedTabSidebarProjectFingerprint(state, projectId)
   ));
   const openProjectIdsKey = useWorkspaceStore((state) => (
     openProjectIdsFingerprint(state.openProjects)
@@ -3745,9 +3750,9 @@ function TabBar({
   // Сторона вложенных списков — одна на всё меню, см. utils/submenuSide.mjs.
   const [submenuSide, setSubmenuSide] = useState<'left' | 'right'>('right');
 
-  const isCmdPressed = useCmdKey();
   const isShiftPressed = useShiftKey();
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
+  const isCmdPressed = useCmdKey(!menuOnlyForProject && isMouseInTabBar);
   const [shiftRangeTargetId, setShiftRangeTargetId] = useState<string | null>(null);
   const trackShiftRangeTarget = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement | null;
@@ -3980,23 +3985,8 @@ function TabBar({
   };
 
   const activateTabFromSidebar = (tabId: string) => {
-    const clickedTab = workspace?.tabs.get(tabId);
-    if (clickedTab?.tabType === 'file' && tabId === workspace?.activeTabId) {
-      const historyTargetId = [...(workspace.tabHistory || [])]
-        .reverse()
-        .find((id) => id !== tabId && workspace.tabs.get(id)?.tabType !== 'file');
-      const fallbackParentId = clickedTab.visualParentTabId && workspace.tabs.has(clickedTab.visualParentTabId)
-        ? clickedTab.visualParentTabId
-        : null;
-      const returnTargetId = historyTargetId || fallbackParentId;
-      if (returnTargetId) {
-        console.warn('[TabBar:click] file-tab-toggle-back tabId=' + tabId + ' target=' + returnTargetId + ' ts=' + Date.now());
-        useWorkspaceStore.getState().activateCenterTab(projectId, returnTargetId);
-        useUIStore.getState().setActiveArea('workspace');
-        requestTabPrimaryInputFocus(returnTargetId, 'sidebar-file-toggle-back');
-        return;
-      }
-    }
+    const linkedPreview = openSidebarLinkedFile(projectId,tabId);
+    if (linkedPreview !== null) { void linkedPreview; return; }
     if (currentView === 'home' && tabId === workspace?.activeTabId) {
       console.warn('[TabBar:click] return-from-home active-tab project=' + projectId + ' tabId=' + tabId + ' ts=' + Date.now());
     }
@@ -4016,13 +4006,13 @@ function TabBar({
       // Общее размещение, а не голая активация: у вкладки может быть окно в
       // другом пространстве, и туда нужно перейти ПЕРЕД показом. Правило одно
       // на список, переключатель и меню оркестрации.
-      useWorkspaceStore.getState().placeTab(projectId, tabId);
+      void useWorkspaceStore.getState().openTabById(tabId,{projectId,reason:'sidebar-tab-click'}).then(opened=>{
+        if(opened)requestTabPrimaryInputFocus(tabId,'sidebar-tab-click');
+      });
       // Pointerdown belongs to the sidebar so clicking its empty/background
       // area still scopes Cmd+T there. A TAB row is different: it is explicit
       // navigation into the window that now displays the tab, so white-frame
       // ownership and real DOM input focus move together after placement.
-      useUIStore.getState().setActiveArea('workspace');
-      requestTabPrimaryInputFocus(tabId, 'sidebar-tab-click');
     } finally {
       endClickMark();
       const activateMs = performance.now() - activateStartedAt;
@@ -6643,9 +6633,20 @@ function TabBar({
   const projectedTabById = new Map(projectedTabsForDisplay.map(tab => [tab.id, tab]));
   const visualDepthById = isVerticalLayout ? buildVisualDepthMap(mainTabsForDisplay) : new Map<string, number>();
   const projectedDepthById = isVerticalLayout ? buildVisualDepthMap(projectedTabsForDisplay) : visualDepthById;
+  // Connector ancestry depends on this ordered ID/parent projection, not on
+  // titles, focus or activity. Reuse the existing hierarchy calculation while
+  // those primitive inputs match, including after in-place metadata edits.
+  // Context-menu-only hosts never render these connector rows. Their menu
+  // data/actions stay live, but need no connector geometry at all.
+  // Unknown ID/parent shapes keep the original fresh calculation.
+  const visualTreeStructureKey = (!isVerticalLayout || menuOnlyForProject) ? '' : mainTabsForDisplay.every(tab => (
+    typeof tab.id === 'string' && (tab.visualParentTabId == null || typeof tab.visualParentTabId === 'string')
+  )) ? JSON.stringify(mainTabsForDisplay.map(tab => [tab.id, tab.visualParentTabId ?? null])) : {};
   const visualTreeMetaById = (() => {
+    const previous = visualTreeMemo.current;
+    if (previous && Object.is(previous.key, visualTreeStructureKey)) return previous.value;
     const meta = new Map<string, { hasLaterSibling: boolean; continuationDepths: number[] }>();
-    if (!isVerticalLayout) return meta;
+    if (!isVerticalLayout || menuOnlyForProject) return meta;
     const rootFirstAncestors = new Map(mainTabsForDisplay.map(tab => [
       tab.id,
       visualHierarchyAncestorIds(mainTabsForDisplay, tab.id, { parentKey: 'visualParentTabId' }).reverse(),
@@ -6682,6 +6683,7 @@ function TabBar({
       }
       meta.set(tab.id, { hasLaterSibling: hasLaterSibling(tab, index), continuationDepths });
     });
+    visualTreeMemo.current = {key: visualTreeStructureKey, value: meta};
     return meta;
   })();
   const verticalRows = isVerticalLayout ? buildVerticalRows(mainTabsForDisplay, tabGroupsForDisplay) : [];
@@ -6969,8 +6971,13 @@ function TabBar({
     surface: ReturnType<typeof tabContextSurface>,
     sourceTabId: string,
     newTabId: string,
+    origin?: { spaceId: string | null; navigationRevision: number },
   ) => {
     const state = useWorkspaceStore.getState();
+    // Allocation is async. A late result stays in its source workflow's
+    // reserve; it cannot put a chip into a different workflow or steal focus.
+    if (origin && (state.activeSpaceId !== origin.spaceId
+      || (state.navigationRevision || 0) !== origin.navigationRevision)) return;
     if (surface?.kind === 'pane' || surface?.kind === 'window') {
       const paneIndex = tabContextPaneIndex(surface, state, sourceTabId);
       const pane = state.splitPanes[paneIndex];
@@ -7025,72 +7032,29 @@ function TabBar({
     // a pane/center right-click must add the fork immediately to the right of
     // the source chip on that same surface.
     const contextSurface = tabContextSurface(renameHostRef.current, tab.id);
+    const placementOrigin = { spaceId: store.activeSpaceId, navigationRevision: store.navigationRevision || 0 };
     renameHostRef.current = null;
     setContextMenu(null);
 
     try {
-      const sourceSessionId = await resolveContextForkSessionId(
-        tab,
-        provider,
-        fromLatestCompact ? 'создать fork от последнего compact' : 'создать fork сессии',
-      );
+      // Publish the exact target before slow history proof/copy. Main performs
+      // those steps inside the existing guarded launch, not in this menu.
+      const sourceSessionId = provider === 'codex' ? tab.codexSessionId : tab.claudeSessionId;
       if (!sourceSessionId) return;
-
       const cwd = tab.cwd || workspace.projectPath || '';
-      let launchSessionId = sourceSessionId;
-      if (fromLatestCompact) {
-        const result = provider === 'claude'
-          ? await ipcRenderer.invoke('claude:fork-session-file', {
-            sourceSessionId,
-            cwd,
-            skipChainResolve: true,
-            fromLatestCompact: true,
-          })
-          : await ipcRenderer.invoke('codex:fork-from-latest-compact', {
-            sessionId: sourceSessionId,
-            cwd,
-          });
-        if (!result?.success || !result?.newSessionId) {
-          const noCompact = result?.reason === 'no-compact';
-          const message = noCompact
-            ? (result?.error || `В этой ${provider === 'claude' ? 'Claude' : 'Codex'}-сессии ещё нет сжатия контекста`)
-            : 'Compact fork не создан: ' + (result?.error || 'неизвестная ошибка');
-          console.warn(
-            '[CompactFork] rejected' +
-            ' tab=' + String(tab.id).slice(-12) +
-            ' provider=' + provider +
-            ' reason=' + String(result?.reason || 'error')
-          );
-          showToast(
-            message,
-            noCompact ? 'info' : 'error',
-            noCompact ? 6000 : 4500,
-          );
-          return;
-        }
-        launchSessionId = result.newSessionId;
-      }
-
       const suffix = fromLatestCompact ? '_compact' : '_fork';
       const forkName = tab.name ? `${tab.name}${suffix}` : undefined;
       const newTabId = await useWorkspaceStore.getState().createTabAfterCurrent(projectId, forkName, cwd, {
-        pendingAction: fromLatestCompact
-          ? {
-            type: provider === 'claude' ? 'claude-compact-fork' : 'codex-compact-fork',
-            sessionId: launchSessionId,
-            sourceSessionId,
-          }
-          : {
-            type: provider === 'claude' ? 'claude-fork' : 'codex-fork',
-            sessionId: launchSessionId,
-          },
-        // Compact fork is materialized by the app before this tab exists, so
-        // its exact history identity is already proven for reads. Keep the
-        // runtime writer proof separate: the pending resume still has to earn
-        // live ownership before new output is attributed to this tab.
-        claudeSessionId: fromLatestCompact && provider === 'claude' ? launchSessionId : undefined,
-        codexSessionId: fromLatestCompact && provider === 'codex' ? launchSessionId : undefined,
+        pendingAction: {
+          type: provider === 'claude' ? 'claude-fork' : 'codex-fork',
+          sessionId: sourceSessionId,
+          contextFork: { sourceTabId: tab.id, sourceSessionId, fromLatestCompact },
+        },
+        // Intent only; do not lend the child its parent's History/writer SID.
+        commandType: provider,
+        color: provider,
         nameSetManually: false,
+        skipInitialRename: true,
         afterTabId: tab.id,
         afterVisualSubtree: true,
         visualParentTabId: tab.id,
@@ -7101,13 +7065,8 @@ function TabBar({
         background: true,
       });
       if (!newTabId) throw new Error('fork tab was not created');
-      placeContextCreatedTab(contextSurface, tab.id, newTabId);
-      showToast(
-        fromLatestCompact
-          ? `Fork ${provider === 'claude' ? 'Claude' : 'Codex'} от последнего compact создан`
-          : `Fork ${provider === 'claude' ? 'Claude' : 'Codex'} создан`,
-        'success',
-      );
+      placeContextCreatedTab(contextSurface, tab.id, newTabId, placementOrigin);
+      // Creating a container is not confirmation that its history is ready.
     } catch (error: any) {
       showToast('Не удалось открыть вкладку fork: ' + (error?.message || String(error)), 'error');
     } finally {
@@ -9582,7 +9541,7 @@ function TabBar({
       {/* Ordinary outline reorder already shows its result in-tree and must not
           grow a second ghost. Cmd freezes that tree for cross-context
           navigation, so only that mode gets a small pointer payload chip. */}
-      <SidebarTabDragCursorChip enabled={!menuOnlyForProject && focusedSidebarProjectId === projectId} />
+      <SidebarTabDragCursorChip enabled={!menuOnlyForProject && focusedSidebarProjectId === projectId} externalTarget={!!structuredExternalTarget} />
       {/* menuOnlyForProject: the LIST is not rendered, the menu below still is.
           This instance exists only so a right click on a pane header chip whose
           project the sidebar is not showing has an owner to open — see
@@ -9742,6 +9701,7 @@ function TabBar({
           className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl"
           style={{
             ...CONTEXT_MENU_PANEL_STYLE,
+            minWidth: 252,
             left: contextMenuPos.x,
             top: contextMenuPos.y,
             zIndex: 100030,
@@ -9921,6 +9881,7 @@ function TabBar({
 
             if (isFileTab) {
               return (
+                <>
                 <div
                   data-context-menu-row="ordinary"
                   className="text-[13px] text-[#d8b4fe] flex items-center min-w-0"
@@ -9932,6 +9893,9 @@ function TabBar({
                   </span>
                   <span className="min-w-0 flex-1 truncate">{targetFileTab?.name || 'Linked File'}</span>
                 </div>
+                <div className="flex"><TabWindowActionButton projectId={projectId} tabId={contextMenu!.tabId} action="beside"
+                  onClose={()=>setContextMenu(null)} isCurrent={()=>externalContextMenuRef.current?.isCurrent?.()!==false}/></div>
+                </>
               );
             }
 
@@ -10126,10 +10090,10 @@ function TabBar({
             }
 
             // Single-tab mode: 2×2 grid.
-            //   Sidebar row 1: [+ add new] [Close Tab]
-            //   Window row 1:  [+ add new] [Убрать | Full]
+            //   Sidebar row 1: [Open beside] [Close Tab]
+            //   Window row 1:  [Open beside] [Убрать | Full]
             //   Row 2: [Rename]    [Stop ...]
-            // + add new mirrors Cmd+T (handleNewTab → createTabAfterCurrent).
+            // Creation remains at + / empty space; this menu addresses its tab.
             // A pane gets one visual split control, not three menu rows: Убрать
             // only drops this chip; Full is the same durable Close Tab used by
             // the sidebar. They are sibling buttons (never nested buttons), so
@@ -10137,18 +10101,8 @@ function TabBar({
             return (
               <>
                 <div className="flex items-stretch w-full">
-                  <button
-                    data-context-menu-row="compact"
-                    data-tab-context-action="add"
-                    className="flex-1 basis-0 text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
-                    style={CONTEXT_MENU_COMPACT_ROW_STYLE}
-                    onClick={(e) => { e.stopPropagation(); handleNewTab(); setContextMenu(null); }}
-                  >
-                    <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
-                      <Plus size={12} className="text-[#888]" />
-                    </span>
-                    add new
-                  </button>
+                  <TabWindowActionButton projectId={projectId} tabId={contextMenu!.tabId} action="beside"
+                    onClose={()=>setContextMenu(null)} isCurrent={()=>externalContextMenuRef.current?.isCurrent?.()!==false}/>
                   {contextOpenedFromWindow ? (
                     <div
                       data-tab-window-close-split

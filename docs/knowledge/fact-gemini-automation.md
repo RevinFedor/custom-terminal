@@ -53,9 +53,14 @@ stream они недоступны. Старое копирование/обре
 5 минут отменён начиная с 1.2.6. Клиентский таймер не является turn completion.
 
 Не перехватывать и не воспроизводить внутренние OAuth-запросы. Документированный
-subprocess/headless остаётся внутри официального клиента; Antigravity Terms
-отдельно запрещают доступ к сервису сторонним ПО через OAuth и допускают
-блокировку аккаунта. Сетевой reverse engineering вдобавок не даёт владельца
+subprocess/headless остаётся внутри официального клиента, но это само по себе
+не разрешает его встраивание в любое стороннее приложение. На12.10.2026
+[FAQ Google](https://www.antigravity.google/docs/faq/#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching)
+отдельно различает прямые scripts/CI и wrapping agy в third-party coding agents
+или applications: последнее не поддерживается на consumer-планах. Повышение
+Pro до Ultra не является исключением. Технический probe и отсутствие token
+replay не доказывают поддерживаемость consumer embedding. Для сторонних
+coding agents FAQ указывает API key/Enterprise. Сетевой reverse engineering вдобавок не даёт владельца
 tool state, permission и conversation mutation. Проверенный ниже локальный
 control API не извлекает Google OAuth credential: запрос к модели выполняет
 сам AGY с текущим входом. Техническая работоспособность приватного API не делает
@@ -65,6 +70,80 @@ control API не извлекает Google OAuth credential: запрос к м�
 самому факту появления `user` event.
 
 ---
+
+## Отдельный официальный ACP server — не stdio-режим agy
+
+На12.10.2026 подтверждена отдельная поставка Google Antigravity ACP1.3.0
+в ACP Registry: author Google LLC, macOS executable `agy_acp_server.par`.
+[Запись поставки](https://raw.githubusercontent.com/agentclientprotocol/registry/f6c0f4e8357c7f28e84e3b883695c387b04ed2b9/antigravity-acp/agent.json).
+Google [документирует подключение через Zed](https://antigravity.google/docs/ide/extensions/zed/)
+с `oauth-personal` для Free/Pro/Ultra. Поэтому общее утверждение «у Antigravity
+нет публичного ACP» устарело; отсутствие ACP-команд именно в stream-json agy
+остаётся отдельным верным ограничением.
+
+Это путь для собственного chat-host без xterm, но не доказательство полного
+App Server parity или разрешения автоматического observer-оркестратора.
+Сначала прочитать объявленные capabilities: resume/load, cancel и permissions
+конкретной Google-поставки не выводятся только из общего стандарта ACP.
+Первый sources-only разбор не запускал runtime; последующий live proof ниже
+закрыл handshake, authenticated inference, cancel и exact-ID load1.3.0.
+Публичный редакторский Google-login не переносится автоматически в GenAI SDK
+или сторонний фоновый workflow. Исследование и границы —
+[программный доступ12.10](../tmp/gemini-программный-доступ-2026-10-12.md).
+
+Уточнение для личного наблюдателя12.10: ACP убирает необходимость PTY/private
+control RPC, но не делает engine plain model API. В [форумном ответе05.10 о
+consultation-only1.3.0](https://discuss.ai.google.dev/t/official-acp-1-3-0-supported-consultation-only-controls-on-an-individual-google-ai-pro-account/186726)
+указано отсутствие supported zero-tool configuration; internal enabledTools[]
+не выключает core components, empty cwd/GEMINI_HOME не гарантируют отсутствие
+всего implicit context. Это внешний ответ, не live proof локального бинарника.
+ACP clientCapabilities fs/terminal объявляют услуги клиента, а не sandbox
+самого агента; permission request по стандарту необязателен для каждогоtool.
+Read-only observer требует отдельной policy/effect проверки. Для собственного
+single-user ACP host нет однозначного текущего vendor-разъяснения: опубликованный
+Zed workflow поддержан, а FAQ оwrapping agy нельзя автоматически переносить
+на все ACP-клиенты. Старые форумные ответы оlocal orchestrator противоречат
+друг другу; успешный Google turn не является Terms approval. Полный PTY-план
+и новый узкий observer не смешиваются; карта опыта/условий в рабочем файле.
+
+### Живой официальный ACP 1.3.0: Free, отмена, load и deny — 12.10
+
+Оригинальная macOS arm64 поставка Google и bundled localharness запущены через
+Node pipes, без Noted DEV/xterm/PTY/private RPC/patch. Google Developer ID и
+строгая подпись valid, SHA до/после одинаковы. Настоящий initialize объявил
+oauth-personal, loadSession=true, sessionCapabilities.list/resume, auth.logout.
+Штатный browser OAuth текущего аккаунта завершён; сервер сообщил free-tier /
+Antigravity Starter Quota. API key/ADC, billing и покупка не использованы.
+Все наблюдённые model requests — выбранная из каталога Gemini 3.8 Flash Low.
+
+8 реальных prompt: 7 end_turn / 1 cancelled. Два ID держат разные nonce; первый
+B не получил ранний A. Cancel отправлен после первого agent text chunk,
+исходный prompt ответил cancelled; PID сохранён, следующий turn помнит nonce.
+Новый процесс + exact session/load восстановил контекст и следующий Google
+ответ. Load при этом вернул Flash High вместо Low: host должен повторно
+применить свой выбор через session/set_config_option до нового промпта.
+
+В default mode реальный create_file overwrite disposable fixture поднял
+permission request; reject_once/deny дал tool failed `Rejected by user`,
+неизменный file SHA и final DENIED. Это контроль одной file-операции, не полная
+OS read-only изоляция. end_turn подтверждает конец хода, но не успех tool.
+Заведомо неверный model ID дал -32602 с availableModels без inference/fallback.
+Исчерпание квоты и crash recovery не проверялись.
+
+GEMINI_HOME изолирует wrapper config/session data, но не весь процесс:
+companion логировал installation/update общего `~/.gemini/antigravity/bin/webm_encoder`.
+Shipped credential_store выбирает общий ACP-specific Keychain account независимо
+от этой директории. Не извлекать/копировать secret и не объявлять такую настройку
+OS sandbox. Own plaintext token file отсутствовал; Keychain не читали/не удаляли.
+Старый CLI account отличается в исходниках; logout не делали. Оба собственных
+ACP завершились exit0, дочерние процессы отсутствуют.
+
+Устойчивый источник: `docs/tmp/agy-acp-proof-20261012.DXG2va/summary.json`,
+`wire-redacted.jsonl`, scripts/per-step JSON; 14 offline assertions PASS.
+Запросы, метод и ограничения — `docs/tmp/исследование-терминалов-и-агентов.md`.
+Запуск наблюдателя на имеющейся квоте технически возможен; production adapter
+не разработан. Consumer Terms допуск своего автоматического host остаётся
+отдельным вопросом.
 
 ## Внутренний API AGY 1.2.14 без терминального экрана
 
@@ -88,17 +167,20 @@ loopback HTTP/HTTPS listeners. В исследовании порты получ
   иначе сервер отвечает `plan model not specified`.
 - После fork/rewind hash исходных steps не изменился; новый процесс на ветке
   помнит ранний canary и не знает удалённый поздний, исходник помнит поздний.
-- Native `CancelCascadeInvocation` прекращает генерацию, сохраняя процесс;
-  следующий запрос работает. Также проверены обычный stream-json, реальный
-  file-read tool, resume и переключение low → medium через новый процесс.
+- Проверены обычный stream-json, реальный file-read tool, resume и переключение
+  low → medium через новый процесс. Прежняя запись здесь также относила cancel
+  кstock, но подробный журнал подтверждает active cancel→следующий turn на
+  host-copy ниже. На12.10 исходные `/tmp/noted-agy-proof.R14Ohk/*result.json`
+  недоступны: отдельный stock cancel не считать повторно подтверждённым.
 
 Отдельное ограничение print-обвязки: она автоматически пропускает `ask_question`
 и отклоняет permission requests. Успеть ответить HTTP-вызовом нельзя считать
 решением: в наблюдении `WAITING → skipped` заняло 2 мс. В **изолированной копии**
 1.2.14 исследовательский патч getter `Manager.IsPrintMode` (4 байта, exact
 SHA/version guard) оставил запросы ожидающими собственного host UI. На этой
-копии подтверждены `HandleCascadeUserInteraction`, ответ RED, очередь
-`WHEN_IDLE` и `NEXT_INVOCATION` (ввод потреблён до idle текущего turn),
+копии подтверждены `HandleCascadeUserInteraction`, ответ RED,
+`CancelCascadeInvocation` без смерти процесса и успешный следующий turn;
+также проверены очереди `WHEN_IDLE` и `NEXT_INVOCATION` (ввод потреблён до idle текущего turn),
 отказ записи без изменения файла и разовый allow с реальной
 записью; fixture восстановлена. Это не auto-approve и не установленный патч.
 Полное устранение TUI поэтому требует учёта host-owned interactions, а не

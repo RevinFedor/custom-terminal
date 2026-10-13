@@ -17,6 +17,31 @@ const target = (overrides = {}) => ({
   ...overrides,
 });
 
+test('explicit replacement moves an existing tab, keeps outgoing alive and preserves chooser order',()=>{
+  const layout={splitPanes:[
+    {windowId:'left',...entry('a'),tabs:[entry('a'),{slotId:'choose'},entry('parked')]},
+    {windowId:'right',...entry('incoming','q'),tabs:[entry('incoming','q'),entry('tail')]}],splitFocusedIndex:0};
+  const result=applyWorkspaceWindowMutation({layout,target:target(),entries:[entry('incoming','q')],show:true,focus:true,replaceShown:true});
+  assert.equal(result.ok,true);
+  assert.deepEqual(result.layout.splitPanes[0].tabs,[entry('incoming','q'),{slotId:'choose'},entry('parked')]);
+  assert.equal(result.layout.splitPanes[1].tabId,'');
+  assert.deepEqual(paneTabs(result.layout.splitPanes[1]),[entry('tail')]);
+  assert.equal(layout.splitPanes[0].tabId,'a','input and durable tab inventory are not deleted');
+});
+
+test('explicit replacement of a parked chip uses the outgoing position without duplication',()=>{
+  const layout={splitPanes:[{...entry('a'),tabs:[entry('target'),{slotId:'choose',projectId:''},entry('a'),entry('tail')]}]};
+  const result=applyWorkspaceWindowMutation({layout,target:target(),entries:[entry('target')],show:true,replaceShown:true});
+  assert.deepEqual(result.layout.splitPanes[0].tabs,[{slotId:'choose',projectId:''},entry('target'),entry('tail')]);
+});
+
+test('single center replacement retains other chips across execution namespaces',()=>{
+  const layout={splitPanes:[],activeSpaceTab:entry('a'),centerStrips:{p:[entry('a'),entry('parked')]}};
+  const result=applyWorkspaceWindowMutation({layout,target:target({paneIndex:null}),entries:[entry('incoming','q')],show:true,replaceShown:true});
+  assert.deepEqual(result.layout.centerStrips,{q:[entry('incoming','q'),entry('parked')]});
+  assert.equal(result.layout.activeSpaceTab.tabId,'incoming');
+});
+
 test('same-window creation inserts directly after the source without stealing shown focus', () => {
   const result = applyWorkspaceWindowMutation({
     layout: {

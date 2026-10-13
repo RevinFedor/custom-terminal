@@ -15,6 +15,13 @@ test('a clicked disappearing child grants one return trip, never a pin', () => {
   assert.equal(gate.holds(point, false), false);
 });
 
+test('explicit keyboard save grants a return trip that clears on reentry or window blur', () => {
+  const gate = createHoverReturnGate();
+  gate.retain(); assert.equal(gate.holds({}, false), true);
+  assert.equal(gate.holds({}, true), false); assert.equal(gate.holds({}, false), false);
+  gate.retain(); gate.holds(null, false); assert.equal(gate.holds({}, false), false);
+});
+
 test('a click which kept its popup open cannot arm a later Escape', () => {
   const gate = createHoverReturnGate(), child = { isConnected: true };
   gate.capture(child); gate.settle(child); child.isConnected = false;

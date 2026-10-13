@@ -119,9 +119,10 @@ test('automatic retention skips a Codex parent whose delete closure has descenda
   fs.mkdirSync(path.dirname(parentPath), { recursive: true });
   fs.writeFileSync(parentPath, 'p');
   fs.writeFileSync(leafPath, 'l');
+  let nowMs = Date.now();
   const items = [
-    { id: 'parent', section: 'sessions', group: 'fork', provider: 'codex', sessionId: 'parent', path: parentPath, sizeBytes: 1, protected: false, deletable: true, eligible: true, deleteAfter: 1, affectedItems: 2 },
-    { id: 'leaf', section: 'sessions', group: 'fork', provider: 'codex', sessionId: 'leaf', path: leafPath, sizeBytes: 1, protected: false, deletable: true, eligible: true, deleteAfter: 1, affectedItems: 1 },
+    { id: 'parent', section: 'sessions', group: 'fork', provider: 'codex', sessionId: 'parent', path: parentPath, modifiedAt: fs.statSync(parentPath).mtimeMs, sizeBytes: 1, protected: false, deletable: true, eligible: true, deleteAfter: 1, affectedItems: 2 },
+    { id: 'leaf', section: 'sessions', group: 'fork', provider: 'codex', sessionId: 'leaf', path: leafPath, modifiedAt: fs.statSync(leafPath).mtimeMs, sizeBytes: 1, protected: false, deletable: true, eligible: true, deleteAfter: 1, affectedItems: 1 },
   ];
   const service = new StorageCleanupService({
     claudeHome: root,
@@ -130,7 +131,10 @@ test('automatic retention skips a Codex parent whose delete closure has descenda
     dbManager: { getAppState: () => ({ enabled: true }), setAppState() {} },
     scanInventory: async () => inventory(items),
     deleteCodexSession: async (_sessionId, item) => fs.unlinkSync(item.path),
+    now: () => nowMs,
   });
+  await service.scan();
+  nowMs += 24 * 60 * 60 * 1000 + 1000;
   const result = await service.runRetentionSweep({ maxItems: 10, maxBytes: 100 });
   assert.equal(result.success, true);
   assert.deepEqual(result.removed, ['leaf']);
@@ -208,7 +212,8 @@ test('automatic retention only deletes a provider-proven Codex leaf', async (t) 
   const parentPath = path.join(root, 'sessions', 'parent.jsonl');
   fs.mkdirSync(path.dirname(parentPath), { recursive: true });
   fs.writeFileSync(parentPath, 'p');
-  const item = { id: 'parent', section: 'sessions', group: 'outside', provider: 'codex', sessionId: 'parent', path: parentPath, sizeBytes: 1, protected: false, deletable: true, eligible: true, deleteAfter: 1, affectedItems: 1, affectedSessionIds: ['parent'] };
+  let nowMs = Date.now();
+  const item = { id: 'parent', section: 'sessions', group: 'outside', provider: 'codex', sessionId: 'parent', path: parentPath, modifiedAt: fs.statSync(parentPath).mtimeMs, sizeBytes: 1, protected: false, deletable: true, eligible: true, deleteAfter: 1, affectedItems: 1, affectedSessionIds: ['parent'] };
   const service = new StorageCleanupService({
     claudeHome: root,
     codexHome: root,
@@ -221,7 +226,10 @@ test('automatic retention only deletes a provider-proven Codex leaf', async (t) 
       deleteSession: async () => { throw new Error('must not delete'); },
       close() {},
     }),
+    now: () => nowMs,
   });
+  await service.scan();
+  nowMs += 24 * 60 * 60 * 1000 + 1000;
   const result = await service.runRetentionSweep({ maxItems: 10, maxBytes: 100 });
   assert.equal(result.success, false);
   assert.equal(result.failures[0].error, 'storage_codex_retention_requires_provider_leaf');

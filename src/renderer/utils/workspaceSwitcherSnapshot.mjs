@@ -4,35 +4,24 @@ import { workflowFallbackColor, workflowInitial } from './workflowVisuals.mjs';
 const { normalizeSwitcherRequest, switcherRequestKey } = contract;
 const fail = (code, statusCode = 503) => { throw Object.assign(new Error(code), { code, statusCode }); };
 
-function tabDto(row, fileVerdict) {
+function tabDto(row, fileVerdict, iconRef) {
   const tab = row.tab;
   const fileRef = tab.tabType === 'file' && typeof tab.filePath === 'string' && tab.filePath
     ? { path: tab.filePath } : null;
   const exists = fileRef ? fileVerdict(fileRef.path) : undefined;
   const commandType = typeof tab.commandType === 'string' ? tab.commandType : null;
   return { kind: 'tab', rowId: 'tab:' + tab.id, tabId: tab.id, projectId: row.projectId,
-    projectName: row.projectName, projectIcon: row.projectIcon, workflowId: row.workflowId,
+    projectName: row.projectName, workflowId: row.workflowId,
     title: typeof tab.name === 'string' ? tab.name : '', tabType: tab.tabType || 'terminal', commandType,
     provider: ['claude', 'codex', 'gemini'].includes(commandType) ? commandType
       : tab.tabType === 'claude-sdk' || commandType === 'claude-sdk' ? 'claude' : null,
     fileRef, availability: fileRef ? exists === true ? 'available' : exists === false ? 'missing' : 'unknown' : null,
-    missing: row.missing === true, selectable: row.missing !== true };
+    missing: row.missing === true, selectable: row.missing !== true, projectIconId: iconRef(row.projectIcon) };
 }
 function rowsDto(rows, fileVerdict) {
-  const occurrences = new Map();
-  return rows.map(row => {
-    if (row.kind === 'tab') return tabDto(row, fileVerdict);
-    const index = occurrences.get(row.workflowId) || 0; occurrences.set(row.workflowId, index + 1);
-    return { kind: 'workflow', rowId: 'workflow:' + row.workflowId + ':' + index,
-      workflowId: row.workflowId, title: row.workflowName, icon: row.workflowIcon,
-      iconFallback: row.unplaced === true ? null
-        : { text: workflowInitial(row.workflowName), color: workflowFallbackColor(row.workflowId) },
-      unplaced: row.unplaced === true, selectable: false };
-  });
-}
-
-function compactIcons(rows) {
-  const ids = new Map(), icons = {};
+  // Build the final DTO directly: no intermediate raw-icon rows followed by
+  // a second map/rest-spread of every field. All state remains capture-local.
+  const occurrences = new Map(), ids = new Map(), icons = {};
   const ref = value => {
     if (typeof value !== 'string' || !value) return null;
     if (!ids.has(value)) {
@@ -41,10 +30,13 @@ function compactIcons(rows) {
     return ids.get(value);
   };
   return { icons, rows: rows.map(row => {
-    if (row.kind === 'workflow') {
-      const { icon, ...rest } = row; return { ...rest, iconId: ref(icon) };
-    }
-    const { projectIcon, ...rest } = row; return { ...rest, projectIconId: ref(projectIcon) };
+    if (row.kind === 'tab') return tabDto(row, fileVerdict, ref);
+    const index = occurrences.get(row.workflowId) || 0; occurrences.set(row.workflowId, index + 1);
+    return { kind: 'workflow', rowId: 'workflow:' + row.workflowId + ':' + index,
+      workflowId: row.workflowId, title: row.workflowName,
+      iconFallback: row.unplaced === true ? null
+        : { text: workflowInitial(row.workflowName), color: workflowFallbackColor(row.workflowId) },
+      unplaced: row.unplaced === true, selectable: false, iconId: ref(row.workflowIcon) };
   }) };
 }
 
@@ -61,12 +53,12 @@ export function createWorkspaceSwitcherSnapshot({ epoch, readWorkspace, readProj
     const input = captureSwitcherInputs(ws, readProjects(), { isFileMissing: path => fileVerdict(path) === false, inboxName });
     const catalog = rowsDto(selectSwitcherRows(input).rows, fileVerdict);
     // Explicit metadata only. Never serialize the full Tab (draft/chips/body).
-    const next = JSON.stringify([input.desktop, input.globalMru.map(x => [x.projectId, x.tabId]), compactIcons(catalog)]);
+    const next = JSON.stringify([input.desktop, input.globalMru.map(x => [x.projectId, x.tabId]), catalog]);
     if (next !== fingerprint) {
       fingerprint = next; revision++;
       onChanged({ version: 1, epoch, revision, available: true });
     }
-    return { input, catalog };
+    return { input, catalog: catalog.rows };
   };
   const refresh = () => {
     try { capture(); } catch (error) {
@@ -97,7 +89,7 @@ export function createWorkspaceSwitcherSnapshot({ epoch, readWorkspace, readProj
       const { input, catalog } = capture(); validateContext(request, catalog);
       const context = request.scope === 'desktop' ? input.desktop : request;
       const selected = selectSwitcherRows(input, { hideOnScreen: true, context });
-      const { rows, icons } = compactIcons(rowsDto(selected.rows, fileVerdict));
+      const { rows, icons } = rowsDto(selected.rows, fileVerdict);
       return { version: 1, iconCatalogVersion: 1, icons, epoch, revision, known: true, requestKey: switcherRequestKey(request), scope: request,
         view: { anchorTabId: selected.anchorTabId, visibleTabIds: selected.visibleTabIds,
           activeSpaceId: input.desktop.activeSpaceId },

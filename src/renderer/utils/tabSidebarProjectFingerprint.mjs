@@ -116,6 +116,23 @@ export function tabSidebarProjectFingerprint(workspace) {
   return parts.join('');
 }
 
+const publicationFingerprints = new WeakMap();
+// React can read the same selector repeatedly, and multiple retained surfaces
+// can subscribe to one project. Share only within this published STATE object;
+// a new publication must observe in-place edits to workspace/tab metadata.
+// The direct function above remains a fresh reader for callers without STATE.
+export function publishedTabSidebarProjectFingerprint(state, projectId) {
+  let fingerprints = publicationFingerprints.get(state);
+  if (!fingerprints) {
+    fingerprints = new Map();
+    publicationFingerprints.set(state, fingerprints);
+  }
+  if (!fingerprints.has(projectId)) {
+    fingerprints.set(projectId, tabSidebarProjectFingerprint(state.openProjects.get(projectId)));
+  }
+  return fingerprints.get(projectId);
+}
+
 export function openProjectIdsFingerprint(openProjects) {
   if (!(openProjects instanceof Map)) return '';
   const parts = [];

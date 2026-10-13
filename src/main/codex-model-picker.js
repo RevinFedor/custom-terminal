@@ -73,11 +73,26 @@ function parseCodexVerifiedLaunchCardSettings(frameText) {
   return latest;
 }
 
+// Optional "Meet ..." promotion in newer Codex is not the legacy mandatory
+// migration. Its current two selected-action rows + exact footer prove a manual
+// control even when the heading is clipped. No model/default metadata or
+// automatic Enter permission is inferred from the promotional copy.
+function isCodexModelPromotionFrame(cleanText) {
+  const text = String(cleanText || '').replace(/\u00a0/g, ' ');
+  if (!/enter\/esc\s+confirm/i.test(text)) return false;
+  const pattern = /(?:^|\n)[\t ]*([›❯»>]?)\s*1\.\s+Try\s+new\s+model\s*\n[\t ]*([›❯»>]?)\s*2\.\s+Use\s+existing\s+model\s*\n[\t ]*enter\/esc\s+confirm\s*[·•]\s*(?:⌃|\^|ctrl\+?)c\s+quit[\t ]*(?=\n|$)/gi;
+  let latest = null;
+  for (const match of text.matchAll(pattern)) latest = match;
+  if (!latest || !!latest[1] === !!latest[2]) return false;
+  // An old menu followed by output/a composer must never classify its Enter.
+  return text.slice(latest.index + latest[0].length).trim() === '';
+}
+
 function inspectCodexModelMigrationPrompt(cleanText) {
   const text = String(cleanText || '').replace(/\u00a0/g, ' ');
   const chooserPattern = /Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed/gi;
   const chooserMatches = Array.from(text.matchAll(chooserPattern));
-  const chooserStart = chooserMatches.length > 0
+  const chooserStart = chooserMatches.length > 0 && !isCodexModelPromotionFrame(text)
     ? (chooserMatches[chooserMatches.length - 1].index || 0)
     : -1;
   const beforeChooser = chooserStart >= 0 ? text.slice(0, chooserStart) : text;
@@ -533,6 +548,7 @@ function parseCodexPlanReasoningScopePicker(cleanText) {
 }
 
 function isCodexActivePickerFrame(cleanText) {
+  if (isCodexModelPromotionFrame(cleanText)) return true;
   if (inspectCodexModelMigrationPrompt(cleanText).visible) return true;
   const active = latestCodexPickerSection(cleanText);
   if (!active) return false;
@@ -548,6 +564,9 @@ function isCodexActivePickerFrame(cleanText) {
 
 function classifyCodexManualEnterFrame(cleanText) {
   const text = String(cleanText || '');
+  if (isCodexModelPromotionFrame(text)) {
+    return { action: 'picker-control', kind: 'model-promotion', reason: 'model-promotion-picker' };
+  }
   if (inspectCodexResumeGoalPrompt(text).interactiveVisible) {
     return {
       action: 'picker-control',

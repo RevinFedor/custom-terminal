@@ -277,7 +277,9 @@ class ProjectPromptCatalogService {
     if (typeof tabId !== 'string' || !tabId) {
       throw Object.assign(new Error('tab_id_required'), { code: 'tab_id_required' });
     }
-    return this.describeSources(this.rootRegistry.sourcesForTab(tabId), readContext);
+    const sources = readContext?.sourcesForTab
+      ? readContext.sourcesForTab(tabId) : this.rootRegistry.sourcesForTab(tabId);
+    return this.describeSources(sources, readContext);
   }
 
   setTabSources(request) {
@@ -328,7 +330,7 @@ class ProjectPromptCatalogService {
     };
     this.tabCache.set(tabId, { signature, cachedAt: Date.now(), value });
     // Missing roots can reappear while the picker was closed.
-    if (refreshWatchers) this.refreshWatchers();
+    if (refreshWatchers) this.refreshWatchers(readContext);
     return value;
   }
 
@@ -385,7 +387,8 @@ class ProjectPromptCatalogService {
     // A usage request can include hundreds of open and archived tab bindings.
     // Keep the exact per-tab checks/cache, but reuse identical synchronous reads
     // inside this request. Nothing here survives into the next usage request.
-    const readContext = { directories: new Map(), scans: new Map(), canonicalPaths: new Map(), projects: new Map() };
+    const readContext = { directories: new Map(), scans: new Map(), canonicalPaths: new Map(), projects: new Map(),
+      sourcesForTab: this.rootRegistry?.createSourcesReader?.() };
     const canonical = value => canonicalPath(value, this.fs, readContext.canonicalPaths);
     const canonicalRoot = canonical(rootPath);
     const byPath = new Map();
@@ -404,7 +407,7 @@ class ProjectPromptCatalogService {
           byPath.set(prompt.path, usage);
         }
       }
-      this.refreshWatchers();
+      this.refreshWatchers(readContext);
       return [...byPath.entries()].sort(([a], [b]) => naturalCompare(a, b))
         .map(([filePath, usage]) => ({
           path: filePath,
@@ -455,8 +458,12 @@ class ProjectPromptCatalogService {
     }
   }
 
-  refreshWatchers() {
+  refreshWatchers(readContext) {
     if (!this.watchEnabled) return;
+    // Recheck filesystem state for this reconciliation, even after a catalog
+    // read. Share only compiled SQL with that read; roots/rows are never retained.
+    const watchContext = { directories: new Map(),
+      sourcesForTab: readContext?.sourcesForTab || this.rootRegistry?.createSourcesReader?.() };
     const wanted = new Map();
     const scopes = this.rootRegistry ? this.rootRegistry.listSourceScopes() : this.db.getProjectsWithPromptSources();
     const add = (source, projectId = null, tabId = null) => {
@@ -468,12 +475,12 @@ class ProjectPromptCatalogService {
       wanted.set(target, ids);
     };
     for (const scope of scopes) {
-      for (const source of this.rootRegistry ? this.getTabSources(scope.tabId) : this.getSources(scope.id)) {
+      for (const source of this.rootRegistry ? this.getTabSources(scope.tabId, watchContext) : this.getSources(scope.id, watchContext)) {
         add(source, this.rootRegistry ? source.projectId : scope.id, scope.tabId);
       }
     }
     if (this.rootRegistry) {
-      for (const source of this.describeSources(this.rootRegistry.read().roots.map(root => ({ ...root, rootPath: root.path })))) {
+      for (const source of this.describeSources(this.rootRegistry.read().roots.map(root => ({ ...root, rootPath: root.path })), watchContext)) {
         add(source);
       }
     }
@@ -484,6 +491,10 @@ class ProjectPromptCatalogService {
         wanted.delete(target);
         continue;
       }
+      if (this.watchDebounce.has(target)) {
+        clearTimeout(this.watchDebounce.get(target));
+        this.watchDebounce.delete(target);
+      }
       try { entry.watcher.close(); } catch {}
       this.watchers.delete(target);
     }
@@ -492,8 +503,10 @@ class ProjectPromptCatalogService {
       try {
         const entry = { watcher: null, ...scopeIds };
         entry.watcher = this.fs.watch(target, { recursive: true }, () => {
+          if (this.watchers.get(target) !== entry) return;
           if (this.watchDebounce.has(target)) clearTimeout(this.watchDebounce.get(target));
           const timer = setTimeout(() => {
+            if (this.watchers.get(target) !== entry) return;
             this.watchDebounce.delete(target);
             for (const projectId of entry.projectIds) this.cache.delete(projectId);
             this.invalidateTabs([...entry.tabIds], 'filesystem', [...entry.projectIds]);

@@ -1,6 +1,7 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { clearPendingResume, markPendingResume } from './pendingResume';
-import type { AgentSendTarget } from './historyAgentRuntimes';
+import type { AgentSendLaunchContext, AgentSendTarget } from './historyAgentRuntimes';
+import { withAgentLaunchAdmission } from './agentLaunchAdmission.mjs';
 import {
   isStandaloneAgentLocalCommand,
   normalizeAgentLocalCommand,
@@ -300,44 +301,24 @@ export async function resumeClaudePtySession({
   sessionId,
   cwd,
   repair = true,
+  ...launchContext
 }: {
   tabId: string;
   sessionId: string;
   cwd?: string;
   repair?: boolean;
-}): Promise<ClaudePtyResumeResult> {
+} & AgentSendLaunchContext): Promise<ClaudePtyResumeResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
   if (!sessionId) return { success: false, error: 'sessionId required' };
 
-  const existing = resumeInflight.get(tabId);
-  if (existing) {
-    console.log('[ClaudePtyActions:resume] join-inflight tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId));
-    return existing;
-  }
-
-  const work = resumeClaudePtySessionInner({ tabId, sessionId, cwd, repair })
-    .finally(() => {
-      if (resumeInflight.get(tabId) === work) resumeInflight.delete(tabId);
-    });
-  resumeInflight.set(tabId, work);
-  return work;
-}
-
-async function resumeClaudePtySessionInner({
-  tabId,
-  sessionId,
-  cwd,
-  repair = true,
-}: {
-  tabId: string;
-  sessionId: string;
-  cwd?: string;
-  repair?: boolean;
-}): Promise<ClaudePtyResumeResult> {
+  return withAgentLaunchAdmission({ ...launchContext,
+    invoke: ipcRenderer.invoke.bind(ipcRenderer), events: ipcRenderer, tabId, toolType: 'claude', sessionId, cwd,
+    assertCurrent: launchContext.assertNotCancelled,
+  }, async admission => {
+  launchContext.assertNotCancelled?.();
   const store = useWorkspaceStore.getState();
   store.setTabCommandType(tabId, 'claude');
   console.log('[ClaudePtyActions:resume] start tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId) + ' repair=' + repair);
-
   let presence: ClaudePtyPresence | null = null;
   try {
     presence = await getClaudePtyPresence(tabId);
@@ -345,23 +326,76 @@ async function resumeClaudePtySessionInner({
   } catch (e: any) {
     console.warn('[ClaudePtyActions:resume] presence failed tab=' + shortTab(tabId) + ': ' + errorText(e));
   }
-
+  launchContext.assertNotCancelled?.();
   if (presence?.status === 'stopping') {
     console.log('[ClaudePtyActions:resume] blocked tab=' + shortTab(tabId) + ' status=stopping');
     return { success: false, sessionId, status: 'stopping', error: 'Claude is stopping' };
   }
   if (presence?.status === 'active' || presence?.status === 'busy' || presence?.status === 'starting') {
+    // An ordinary Resume can observe an already-running process without a
+    // launch. Stronger caller pins and real Send ownership still have to join
+    // their exact original authority, including its Stop fence.
+    if (launchContext.launchAdmission || launchContext.launchFence !== undefined
+      || launchContext.expectedTarget || launchContext.sendOperationKey || launchContext.sendAttemptId) {
+      await admission.ready();
+      launchContext.assertNotCancelled?.();
+    }
     store.clearInterruptedState(tabId);
     console.log('[ClaudePtyActions:resume] already-running tab=' + shortTab(tabId) + ' status=' + presence.status);
     return { ...presence, success: true, alreadyRunning: true, status: presence.status };
   }
-
   if (presence && presence.hasTerm === false) {
     console.warn('[ClaudePtyActions:resume] no-terminal tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId));
     return { success: false, sessionId, status: presence.status, error: 'terminal not ready' };
   }
+  const launchIntent = await admission.ready();
+  const { launchFence } = launchIntent;
+  launchContext.assertNotCancelled?.();
+  // Keep manual tab-level joins. A Send may only join its own launch promise;
+  // joining another intent or a pre-Stop preparation would lose its owner.
+  const key = JSON.stringify([tabId, launchContext.sendOperationKey ?? null,
+    launchContext.sendAttemptId ?? null, launchFence, sessionId, cwd || null,
+    launchContext.launchAdmission ? launchIntent.token : null]);
+  const existing = resumeInflight.get(key);
+  if (existing) {
+    console.log('[ClaudePtyActions:resume] join-inflight tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId));
+    const result = await existing;
+    if (result.success !== false) launchContext.assertNotCancelled?.();
+    return result;
+  }
 
+  const work = resumeClaudePtySessionInner({ tabId, sessionId, cwd, repair, ...launchContext,
+    launchFence, launchAdmission: admission })
+    .finally(() => {
+      if (resumeInflight.get(key) === work) resumeInflight.delete(key);
+    });
+  resumeInflight.set(key, work);
+  return work;
+  });
+}
+
+async function resumeClaudePtySessionInner({
+  tabId,
+  sessionId,
+  cwd,
+  repair = true,
+  sendOperationKey,
+  sendAttemptId,
+  expectedTarget,
+  assertNotCancelled,
+  launchFence: requestedLaunchFence,
+  launchAdmission,
+}: {
+  tabId: string;
+  sessionId: string;
+  cwd?: string;
+  repair?: boolean;
+} & AgentSendLaunchContext): Promise<ClaudePtyResumeResult> {
+  assertNotCancelled?.();
+  const store = useWorkspaceStore.getState();
+  const launchFence = requestedLaunchFence;
   const materialization = await readClaudeSessionMaterialization(sessionId, cwd);
+  assertNotCancelled?.();
   if (materialization.conversationMaterialized !== true) {
     console.warn('[ClaudePtyActions:resume] blocked-empty-session tab=' + shortTab(tabId)
       + ' sid=' + shortSid(sessionId)
@@ -384,17 +418,19 @@ async function resumeClaudePtySessionInner({
   // bridge record.
   markPendingResume(tabId, sessionId);
   console.log('[ClaudePtyActions:resume] pending-marked-and-write tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId));
-  const runResult = await ipcRenderer.invoke('claude:run-command', {
+  const runResult = await launchAdmission!.run('claude:run-command', {
     tabId,
     command: 'claude-c',
     sessionId,
+    sendOperationKey, sendAttemptId, expectedTarget, launchFence,
     ...(cwd ? { cdTo: cwd } : {}),
     ...(repair ? {} : { skipResumeRepair: true }),
-  }).catch((e: any) => ({ success: false, error: errorText(e) }));
+  });
   if (runResult?.success === false) {
     clearPendingResume(tabId);
-    return { success: false, sessionId, repaired: Number(runResult?.repaired || 0), error: runResult.error || runResult.reason || 'Claude resume failed' };
+    return { ...runResult, success: false, sessionId, repaired: Number(runResult?.repaired || 0), error: runResult.error || runResult.reason || 'Claude resume failed' };
   }
+  assertNotCancelled?.();
   store.clearInterruptedState(tabId);
   return { ...runResult, success: true, sessionId, repaired: Number(runResult?.repaired || 0) };
 }

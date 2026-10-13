@@ -1,0 +1,9 @@
+.hp-background-scroll-strip { position: relative; box-sizing: border-box; width: max-content; max-width: 100%; min-width: 0; flex-shrink: 0; border-top: 1px solid #2a2a2a; border-right: 1px solid #2a2a2a; background: #141414; }
+.hp-background-scroll-viewport { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; overscroll-behavior-x: contain; }
+.hp-background-scroll-viewport::-webkit-scrollbar { display: none; width: 0; height: 0; }
+.hp-background-scroll-content { display: flex; align-items: stretch; width: max-content; }
+.hp-background-scroll-arrow { position: absolute; top: 50%; translate: 0 -50%; width: 18px; height: 22px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 3px; color: #999; background: #141414; cursor: pointer; z-index: 1; }
+.hp-background-scroll-arrow--left { left: 0; }
+.hp-background-scroll-arrow--right { right: 0; }
+.hp-background-scroll-arrow:hover, .hp-background-scroll-arrow:focus-visible { color: #ddd; background: #252525; }
+.hp-background-scroll-arrow:focus-visible { outline: 1px solid #777; outline-offset: -1px; }

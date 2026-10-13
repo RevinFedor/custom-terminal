@@ -1,5 +1,7 @@
 'use strict';
 
+const { observeCodexGoalWork, codexGoalWorkForOutcome } = require('./codex-goal-work');
+
 const CODEX_NO_FINAL_RESULT_REASON = 'codex-no-final-result';
 const CODEX_INPUT_READY_TURN_END_EVENTS = new Set([
   'task_complete',
@@ -141,6 +143,7 @@ function describeCodexTurnEndContradiction(tracker, record) {
 }
 
 function classifyCodexTurnRecord(tracker, record, options = null) {
+  observeCodexGoalWork(tracker, record);
   if (typeof options?.onTurnEndContradiction === 'function') {
     try {
       const contradiction = describeCodexTurnEndContradiction(tracker, record);
@@ -162,11 +165,13 @@ function classifyCodexTurnRecord(tracker, record, options = null) {
     hasTrackedFinalResult: trackerHasFinalResultForEvent(tracker, record?.payload),
   });
   if (!outcome) return null;
-  return {
+  const result = {
     ...outcome,
     timestamp: record?.timestamp || null,
     turnId: typeof record?.payload?.turn_id === 'string' ? record.payload.turn_id : null,
   };
+  const goalWork = codexGoalWorkForOutcome(tracker, result);
+  return goalWork ? { ...result, goalWork } : result;
 }
 
 function reduceCodexTurnOutcomeSummary(summary, outcome) {
@@ -196,6 +201,7 @@ function projectCodexSuppressedCatchUpPublication(state) {
       hasFinalResult: typeof state.lastOutcomeHasFinalResult === 'boolean'
         ? state.lastOutcomeHasFinalResult
         : null,
+      ...(state.lastOutcomeGoalWork ? { goalWork: state.lastOutcomeGoalWork } : {}),
     },
     timestamp: state.lastEventTs || null,
     turnId: state.lastOutcomeTurnId || state.currentTurnId || null,

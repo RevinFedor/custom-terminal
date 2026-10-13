@@ -265,6 +265,7 @@ const {
   resolveClaudeHookTab,
 } = require(path.join(srcMainDir, 'claude-hook-routing'));
 const { buildSessionProgress } = require(path.join(srcMainDir, 'session-progress'));
+const { beginHistoryReadDiagnostic } = require(path.join(srcMainDir, 'history-read-memory-diagnostics'));
 const {
   resolveSearchDateWindow,
   scoreSessionTurnMatch,
@@ -867,6 +868,7 @@ const {
 const {
   createCodexSettingsSendRuntime,
   codexSettingsObservationCurrent,
+  observeCodexSettingsApplication,
 } = require(path.join(srcMainDir, 'codex-settings-send'));
 const CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:';
 const CODEX_NATIVE_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-receipt.v1:';
@@ -1032,6 +1034,7 @@ const {
   validateCodexActionAuthority,
 } = require(path.join(srcMainDir, 'codex-action-authority'));
 const {
+  canonicalizeExistingPath,
   classifyManualCodexSubmitAfterWriteQueue,
   classifyCodexBranchWriterHandoffSettlement,
   classifyCodexNativeRewindReplacementProjection,
@@ -1256,6 +1259,10 @@ function recoverManagedHistoryImageRefsForLiveText(text) {
 }
 const scDesktopNotificationOutbox = createScDesktopNotificationOutbox({
   storagePath: path.join(app.getPath('userData'), 'sc-desktop-terminal-completion-outbox.json'),
+});
+const userNotificationOutbox = createScDesktopNotificationOutbox({
+  storagePath: path.join(app.getPath('userData'), 'sc-desktop-terminal-user-outbox.json'),
+  strictLoad: true,
 });
 const codexImageBindings = new CodexImageBindingRegistry();
 const tabHistoryRestoreLeases = new TabHistoryRestoreLeases({
@@ -2017,7 +2024,8 @@ if (process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
           ' cpuUserMs=' + (cpuDelta.user / 1000).toFixed(1) +
           ' cpuSystemMs=' + (cpuDelta.system / 1000).toFixed(1) +
           ' rssMb=' + Math.round(mem.rss / 1024 / 1024) +
-          ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024)
+          ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024) +
+          ' heapLimitMb=' + Math.round(require('node:v8').getHeapStatistics().heap_size_limit / 1024 / 1024)
         );
       }
       mainLoopDelay.reset();
@@ -2053,7 +2061,8 @@ if (process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
           ' cpuSystemMs=' + (cpuDelta.system / 1000).toFixed(1) +
           ' threadMetrics=' + JSON.stringify(thread) +
           ' rssMb=' + Math.round(mem.rss / 1024 / 1024) +
-          ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024)
+          ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024) +
+          ' heapLimitMb=' + Math.round(require('node:v8').getHeapStatistics().heap_size_limit / 1024 / 1024)
         );
         if (gapMs >= 500) {
           console.warn(
@@ -2071,7 +2080,8 @@ if (process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
             ' cpuUserMs=' + (cpuDelta.user / 1000).toFixed(1) +
             ' cpuSystemMs=' + (cpuDelta.system / 1000).toFixed(1) +
             ' rssMb=' + Math.round(mem.rss / 1024 / 1024) +
-            ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024)
+            ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024) +
+            ' heapLimitMb=' + Math.round(require('node:v8').getHeapStatistics().heap_size_limit / 1024 / 1024)
           );
         }
       }
@@ -2966,6 +2976,11 @@ try {
 // Electron's main loop. Runtime/writer/receipt ownership stays in this process.
 const { HistoryReadClient, splitHistoryReadBudget } = require(path.join(srcMainDir, 'history-read-client'));
 const historyReadBudget = splitHistoryReadBudget(codexDataModule._api.getCodexHistoryProjectorStats().budgetBytes);
+const { historyDiskBudgetBytes } = require(path.join(srcMainDir, 'history-cache-policy'));
+const { HISTORY_DISK_BUDGET_KEY } = require(path.join(srcSharedDir, 'history-cache-settings.cjs'));
+let historyDiskBudgetForBoot = historyDiskBudgetBytes();
+try { historyDiskBudgetForBoot = historyDiskBudgetBytes(projectManager.db.getAppState(HISTORY_DISK_BUDGET_KEY)); }
+catch { console.warn('[HistoryCache] disk budget unavailable; using default'); }
 codexDataModule._api.setCodexProjectionRuntimeBudgetBytes(historyReadBudget.mainGraphBytes);
 const historyReadClient = new HistoryReadClient({
   codexData: codexDataModule,
@@ -2973,6 +2988,7 @@ const historyReadClient = new HistoryReadClient({
   cacheDirectory: path.join(app.getPath('userData'), 'history-prepared-cache'),
   assetDirectory: promptQueueAssetStore.rootDir,
   memoryBudgetMb: historyReadBudget.workerGraphBytes / (1024 * 1024),
+  diskBudgetBytes: historyDiskBudgetForBoot,
   indexBudgetBytes: historyReadBudget.indexBytes,
   onWindowEvent: (channel, payload) => {
     if (channel === 'agent-transcript:changed' && payload?.reason === 'lineage-committed') {
@@ -3197,6 +3213,8 @@ const terminalLifecycleEpochs = new WeakMap(); // ptyProcess -> random epoch, pa
 // Stop intent invalidates reads even when Stop→clear leaves the same PTY/run
 // alive. It is not user input and must not supersede logical History ownership.
 const terminalStopRevisions = new WeakMap();
+const terminalLaunchFenceOrders = new WeakMap();
+let nextTerminalLaunchFenceOrder = 0;
 const { createAgentInputObservation, observeAgentInput } = require(path.join(srcMainDir, 'agent-input-observation'));
 const { agentInputObservationInvalidated } = require(path.join(srcMainDir, '../shared/agent-input-observation.cjs'));
 // Keep the main/headless mirror on the same bounded raw-tail budget as the
@@ -4885,7 +4903,359 @@ function agentShellLaunchError(admission, alreadyRunningError) {
   return 'shell_not_idle';
 }
 
-function writeAgentLaunchCommandToIdleShell(term, { tabId, toolType, command, launchId = null, admission }) {
+// A launch refusal is not a Send receipt. In particular, an old duplicate
+// launch may arrive after Enter: never manufacture submitted/paste/enter=false.
+function captureAgentLaunchFence(tabId) {
+  const term = terminals.get(tabId);
+  if (!term) return null;
+  let terminalInstanceId = terminalLifecycleEpochs.get(term);
+  if (!terminalInstanceId) {
+    terminalInstanceId = crypto.randomUUID();
+    terminalLifecycleEpochs.set(term, terminalInstanceId);
+  }
+  const stopRevision = getTerminalStopRevision(tabId);
+  let publication = terminalLaunchFenceOrders.get(term);
+  if (!publication || publication.stopRevision !== stopRevision) {
+    publication = { stopRevision, order: ++nextTerminalLaunchFenceOrder };
+    terminalLaunchFenceOrders.set(term, publication);
+  }
+  return { terminalInstanceId, stopRevision, order: publication.order };
+}
+
+function broadcastAgentLaunchFenceRevoked(tabId, reason) {
+  const publication = { tabId, reason, launchFence: captureAgentLaunchFence(tabId) };
+  for (const window of BrowserWindow.getAllWindows()) {
+    try {
+      if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+        window.webContents.send('agent:launch-fence-revoked', publication);
+      }
+    } catch (error) {
+      console.warn('[AgentLaunchIntent] fence publication failed tab=' + String(tabId).slice(-12)
+        + ' reason=' + reason + ' error=' + (error?.message || String(error)));
+    }
+  }
+}
+
+function readAgentLaunchIntentSource(tabId, toolType) {
+  const projectId = resolveAuthoritativeTabProjectId(tabId);
+  const terminalCwd = terminalProjects.get(tabId) || null;
+  if (!terminals.has(tabId) || !projectId || !terminalCwd) {
+    throw new Error('agent_launch_source_unavailable');
+  }
+  const rows = projectManager.db.db.prepare(
+    'SELECT id, COALESCE(project_id,execution_namespace) AS project_id, cwd, claude_session_id, codex_session_id FROM tabs WHERE tab_id = ?'
+  ).all(tabId);
+  const matches = rows.filter(row => row.project_id === projectId);
+  if (matches.length > 1 || rows.length && matches.length !== 1) {
+    throw new Error('agent_launch_source_ambiguous');
+  }
+  const row = matches[0] || null;
+  // terminal:create is the existing authority before the first workspace save.
+  // A later first row is adopted only if it describes this same empty owner.
+  if (!row && terminalProjectIds.get(tabId) !== projectId) throw new Error('agent_launch_source_unavailable');
+  return { projectId, terminalCwd, rowId: row?.id ?? null,
+    storedCwd: row?.cwd || null,
+    sessionId: (toolType === 'codex' ? row?.codex_session_id : row?.claude_session_id) || null };
+}
+
+function agentLaunchIntentSourceCurrent(state, {
+  current = readAgentLaunchIntentSource(state.tabId, state.toolType), adoptFirstRow = true,
+} = {}) {
+  const expected = state.source;
+  if (!expected || current.projectId !== expected.projectId || current.terminalCwd !== expected.terminalCwd) return false;
+  if (current.sessionId !== expected.sessionId) {
+    const writer = readAgentSendDestinationAtWriteBoundary(state.tabId, state.toolType);
+    if (!expected.sessionId || writer?.sessionId !== current.sessionId
+      || writer?.acceptedResumeSourceSessionId !== expected.sessionId
+      || writer?.terminalInstanceId !== state.launchFence?.terminalInstanceId) return false;
+  }
+  if (current.rowId === expected.rowId && current.storedCwd === expected.storedCwd) return true;
+  if (expected.rowId === null && current.rowId !== null && !expected.sessionId
+    && current.storedCwd === expected.terminalCwd) {
+    return !adoptFirstRow || agentLaunchPreparations.adoptIntentSource(state.token, current);
+  }
+  return false;
+}
+
+function agentLaunchIntentTrace(payload = {}, state = null, stage = 'launch-admission') {
+  return { protocolVersion: 1,
+    launchIntent: state ? agentLaunchPreparations.intentIdentity(state) : payload.launchIntent || null,
+    launchAttempt: Number(payload.launchAttempt || 0), launchStage: stage,
+    launchFence: state?.launchFence || payload.launchFence || payload.launchIntent?.launchFence || null,
+    // Cache observation for a later explicit intent; never renew this one's fence.
+    observedLaunchFence: captureAgentLaunchFence(state?.tabId || payload.tabId) };
+}
+
+function agentLaunchIntentRefusal(payload, state, code, stage = 'launch-admission') {
+  const mayHaveWritten = !state || state.writeState !== 'none';
+  const result = { success: false, accepted: mayHaveWritten ? null : false,
+    launchWritten: state?.writeState === 'written' ? true : mayHaveWritten ? null : false,
+    error: code, code, reason: code, tabId: payload.tabId,
+    ...agentLaunchIntentTrace(payload, state, stage),
+    ...(payload.sendOperationKey || payload.sendAttemptId ? {
+      sendReceipt: { success: null, accepted: null, submitted: null,
+        status: 'delivery-unknown', deliveryUnknown: true, code, error: code,
+        operationKey: payload.sendOperationKey || null, attemptId: payload.sendAttemptId || null },
+    } : {}) };
+  console.warn('[AgentLaunchIntent] refusal ' + JSON.stringify({
+    tabId: payload.tabId, intentId: state?.intentId || payload.intentId || payload.launchIntent?.intentId || null,
+    token: state?.token || null, stage, code, launchAttempt: result.launchAttempt,
+    accepted: result.accepted, launchWritten: result.launchWritten,
+    originalFence: result.launchFence, observedFence: result.observedLaunchFence,
+    operationKey: payload.sendOperationKey || null, sendAttemptId: payload.sendAttemptId || null,
+  }));
+  return result;
+}
+
+function agentLaunchIntentPayloadKey(payload) {
+  const stable = value => {
+    if (Array.isArray(value)) return value.map(stable);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.keys(value).sort().filter(key => value[key] !== undefined)
+      .map(key => [key, stable(value[key])]));
+  };
+  const { launchIntent, launchAttempt, launchFence, ...immutable } = payload;
+  return crypto.createHash('sha256').update(JSON.stringify(stable(immutable))).digest('hex');
+}
+
+async function runAgentLaunchIntentAttempt(sender, payload, run) {
+  if (payload.launchIntent === undefined) return run();
+  let state = agentLaunchPreparations.getIntent(payload.launchIntent?.token);
+  if (!state || state.senderId !== sender?.id || state.intentId !== payload.launchIntent?.intentId
+    || state.tabId !== payload.tabId || state.tabId !== payload.launchIntent?.tabId
+    || state.toolType !== payload.launchIntent?.toolType) {
+    return agentLaunchIntentRefusal(payload, null, 'agent_launch_intent_missing');
+  }
+  if (payload.launchFence?.terminalInstanceId !== state.launchFence?.terminalInstanceId
+    || payload.launchFence?.stopRevision !== state.launchFence?.stopRevision
+    || payload.launchIntent.launchFence?.terminalInstanceId !== state.launchFence?.terminalInstanceId
+    || payload.launchIntent.launchFence?.stopRevision !== state.launchFence?.stopRevision) {
+    return agentLaunchIntentRefusal(payload, state, 'agent_launch_intent_fence_changed');
+  }
+  const expectedSessionId = state.materializedSessionId || state.requestedSessionId || null;
+  if ((payload.sessionId || null) !== expectedSessionId) {
+    return agentLaunchIntentRefusal(payload, state, 'agent_launch_intent_session_changed');
+  }
+  if ((payload.cwd || payload.cdTo) && (payload.cwd || payload.cdTo) !== state.source?.terminalCwd) {
+    return agentLaunchIntentRefusal(payload, state, 'agent_launch_intent_cwd_changed');
+  }
+  const admission = agentLaunchPreparations.beginIntentAttempt(state.token, payload.launchAttempt,
+    agentLaunchIntentPayloadKey(payload), sender?.id);
+  if (admission.replay) return { ...admission.result, launchReplay: true };
+  if (!admission.allowed) return agentLaunchIntentRefusal(payload, admission.state || state, admission.reason);
+  let result;
+  try { result = await run(); }
+  catch (error) {
+    result = error?.sendLaunchRefusal || { success: false, error: error?.message || String(error),
+      code: error?.code || 'agent_launch_failed', reason: error?.reason || error?.code || 'agent_launch_failed',
+      ...(typeof error?.lookupUnknown === 'boolean' ? { lookupUnknown: error.lookupUnknown } : {}) };
+  }
+  state = agentLaunchPreparations.getIntent(state.token);
+  const written = state?.writeState === 'written' || result?.launchWritten === true;
+  const unknown = !state || state.writeState === 'started';
+  if (state && !written && !unknown && result?.accepted !== true && result?.acceptancePending !== true
+    && result?.joined !== true) {
+    // A slow refused probe can finish after cancellation or replacement. Its
+    // old lookup result must not authorize another attempt against new state.
+    try { assertAgentSendLaunchCurrent(payload.tabId, state.toolType, payload, { validateTarget: true }); }
+    catch (error) { result = error?.sendLaunchRefusal || agentLaunchIntentRefusal(payload, state,
+      error?.code || 'agent_launch_source_unavailable'); }
+  }
+  result = { ...result,
+    accepted: unknown || written && result?.success === false ? null : result?.accepted ?? (written ? null : false),
+    launchWritten: written ? true : unknown ? null : false,
+    reason: result?.reason || result?.error || (written ? 'launch-written' : result?.joined ? 'launch-joined' : 'launch-not-written'),
+    ...agentLaunchIntentTrace(payload, state, unknown ? 'write-unknown' : written ? 'written'
+      : result?.joined ? 'joined' : 'no-launch') };
+  agentLaunchPreparations.settleIntentAttempt(payload.launchIntent.token, payload.launchAttempt, result);
+  console.log('[AgentLaunchIntent] settle tab=' + String(payload.tabId).slice(-12)
+    + ' intent=' + payload.launchIntent.intentId + ' token=' + payload.launchIntent.token
+    + ' attempt=' + payload.launchAttempt + ' stage=' + result.launchStage
+    + ' accepted=' + result.accepted + ' written=' + result.launchWritten + ' reason=' + result.reason);
+  return result;
+}
+
+function adoptAgentLaunchMaterializedSource(request, sessionId) {
+  if (request.launchIntent === undefined) return true;
+  const state = agentLaunchPreparations.getIntent(request.launchIntent?.token);
+  return !!state && agentLaunchPreparations.adoptIntentSource(state.token,
+    { ...state.source, sessionId }, sessionId);
+}
+
+function agentLaunchMaterializationResult(request, result) {
+  if (request.launchIntent === undefined) return result;
+  const state = agentLaunchPreparations.getIntent(request.launchIntent?.token);
+  return { ...result, accepted: false, launchWritten: false,
+    reason: result?.reason || result?.error || 'session-materialized',
+    ...agentLaunchIntentTrace(request, state, 'materialization'),
+    ...(result?.success === true && state?.materializedSessionId === result.sessionId
+      ? { materializedSessionId: state.materializedSessionId } : {}) };
+}
+
+function withAgentLaunchFence(tabId, request = {}) {
+  // Capture before joining the lifecycle queue. A Stop received while that
+  // queue/preparation is awaiting must invalidate this invocation too.
+  if (request.launchIntent !== undefined) return request.launchFence !== undefined ? request
+    : { ...request, launchFence: request.launchIntent?.launchFence || null };
+  return request.launchFence !== undefined ? request
+    : { ...request, launchFence: captureAgentLaunchFence(tabId) };
+}
+
+function assertAgentSendLaunchCurrent(tabId, toolType, request = {}, {
+  validateTarget = false, expectedTerminal, preparationToken = null,
+} = {}) {
+  const operationKey = request?.sendOperationKey;
+  const attemptId = request?.sendAttemptId;
+  const isSend = operationKey != null || attemptId != null;
+  const refuse = (code) => {
+    const result = { success: false, accepted: false, launchWritten: false,
+      tabId, code, error: code, sendOperationKey: operationKey, sendAttemptId: attemptId,
+      ...(code === 'agent_send_cancelled' || code === 'agent_launch_intent_cancelled' ? { cancelled: true } : {}),
+      ...(request?.launchIntent !== undefined ? agentLaunchIntentTrace(request,
+        agentLaunchPreparations.getIntent(request.launchIntent?.token), 'launch-authority') : {}),
+      // IN_FLIGHT/cancellation proves a future write fence, not no prior
+      // paste. Reconcile through the existing durable owner; never invent
+      // a negative Send receipt from this launch invocation's phase.
+      ...(isSend ? { sendReceipt: { success: null, accepted: null, submitted: null,
+        deliveryUnknown: true, status: 'delivery-unknown', code, error: code,
+        operationKey, attemptId } } : {}) };
+    throw Object.assign(new Error(code), { code, sendLaunchRefusal: result });
+  };
+  const intent = request?.launchIntent;
+  if (intent !== undefined) {
+    const state = agentLaunchPreparations.getIntent(intent?.token);
+    if (!state || state.tabId !== tabId || state.toolType !== toolType || state.intentId !== intent?.intentId
+      || intent.tabId !== tabId || intent.toolType !== toolType) refuse('agent_launch_intent_missing');
+    if (state.revoked) refuse('agent_launch_intent_cancelled');
+    if (state.writeState !== 'none') refuse('agent_launch_attempt_unresolved');
+    if (Number(request.launchAttempt || 0) !== state.attempt) refuse('agent_launch_attempt_changed');
+    if (state.sendOperationKey !== (operationKey || null) || state.sendAttemptId !== (attemptId || null)) {
+      refuse('agent_launch_intent_send_changed');
+    }
+    if (request.launchFence?.terminalInstanceId !== state.launchFence?.terminalInstanceId
+      || request.launchFence?.stopRevision !== state.launchFence?.stopRevision) refuse('agent_launch_intent_fence_changed');
+    if ((request.cwd || request.cdTo) && (request.cwd || request.cdTo) !== state.source?.terminalCwd) {
+      refuse('agent_launch_intent_cwd_changed');
+    }
+    try { if (!agentLaunchIntentSourceCurrent(state)) refuse('agent_launch_intent_source_changed'); }
+    catch (error) { if (error?.sendLaunchRefusal) throw error; refuse('agent_launch_source_unavailable'); }
+    if (validateTarget && state.expectedTarget) {
+      try {
+        const failure = agentSendRequestTargetFailure(tabId, toolType,
+          { ...request, expectedTarget: state.expectedTarget }, null, { allowUnresolved: true });
+        if (failure) refuse(failure.code);
+      } catch (error) {
+        if (error?.sendLaunchRefusal) throw error;
+        refuse('agent_launch_target_control_unavailable');
+      }
+    }
+  }
+  const fence = request?.launchFence;
+  if (fence !== undefined) {
+    const current = captureAgentLaunchFence(tabId);
+    if (!fence || !current || fence.terminalInstanceId !== current.terminalInstanceId
+      || fence.stopRevision !== current.stopRevision) refuse('agent_launch_cancelled');
+  }
+  if (expectedTerminal !== undefined && terminals.get(tabId) !== expectedTerminal) {
+    refuse('agent_send_launch_owner_changed');
+  }
+  if (preparationToken !== null) {
+    const preparation = agentLaunchPreparations.get(tabId);
+    if (preparation?.token !== preparationToken || preparation?.toolType !== toolType
+      || preparation?.preparing !== true) refuse('agent_send_launch_owner_changed');
+  }
+  if (!isSend) {
+    if (intent !== undefined && validateTarget) {
+      try {
+        const failure = agentSendRequestTargetFailure(tabId, toolType, request, null, { allowUnresolved: true });
+        if (failure) refuse(failure.code);
+      } catch (error) {
+        if (error?.sendLaunchRefusal) throw error;
+        refuse('agent_launch_target_control_unavailable');
+      }
+    }
+    return;
+  }
+  if (typeof operationKey !== 'string' || !operationKey.trim()
+    || typeof attemptId !== 'string' || !attemptId.trim()) {
+    refuse('agent_send_launch_identity_required');
+  }
+  try {
+    const record = agentSendReceiptStore.get(operationKey);
+    if (!record || record.tabId !== tabId || record.provider !== toolType
+      || record.attemptId !== attemptId) refuse('agent_send_launch_identity_changed');
+    if (agentSendReceiptStore.isDeliveryCancelled(operationKey, attemptId)) {
+      refuse('agent_send_cancelled');
+    }
+    if (record.state !== AGENT_SEND_DURABLE_STATES.IN_FLIGHT) {
+      refuse('agent_send_launch_attempt_not_active');
+    }
+    if (validateTarget) {
+      const failure = agentSendRequestTargetFailure(tabId, toolType, request, null, { allowUnresolved: true });
+      if (failure) refuse(failure.code);
+    }
+  } catch (error) {
+    if (error?.sendLaunchRefusal) throw error;
+    refuse('agent_send_launch_control_unavailable');
+  }
+}
+
+function returnAgentSendLaunchRefusal(error) {
+  if (error?.sendLaunchRefusal) return error.sendLaunchRefusal;
+  throw error;
+}
+
+async function prepareTabContextForkLaunch(payload, toolType, assertCurrent, preparation) {
+  if (!payload.contextFork) return payload;
+  const readRow = (id) => projectManager.db.db.prepare(
+    'SELECT id, COALESCE(project_id,execution_namespace) AS project_id, cwd, claude_session_id, codex_session_id FROM tabs WHERE tab_id = ?'
+  ).get(id);
+  const target = readRow(payload.tabId);
+  if (!target || target.claude_session_id || target.codex_session_id) {
+    throw new Error('context_fork_target_not_empty');
+  }
+  return require(path.join(srcMainDir, 'context-fork-launch')).prepareContextForkLaunch({
+    payload, toolType, assertCurrent,
+    captureSource: (id, provider) => {
+      const row = readRow(id);
+      return row ? { rowId: row.id, projectId: row.project_id, cwd: row.cwd,
+        sessionId: provider === 'codex' ? row.codex_session_id : row.claude_session_id,
+        terminal: terminals.get(id) || null, lifecycle: getTerminalLifecycleGeneration(id) } : null;
+    },
+    readSource: async (id, sessionId, cwd, provider) => {
+      if (provider === 'codex') {
+        const snapshot = await getCodexForkSourceRuntimeSnapshot(id);
+        return { allowed: snapshot.canForkSnapshot === true && snapshot.readSessionId === sessionId,
+          reason: snapshot.forkSnapshotReason || 'codex_fork_source_unresolved' };
+      }
+      const materialization = getSessionMaterialization(sessionId, cwd);
+      return { allowed: materialization?.materialized === true || materialization?.conversationMaterialized === true,
+        reason: 'claude_fork_source_not_materialized' };
+    },
+    materializeCompact: (sessionId, cwd, provider) => provider === 'codex'
+      ? codexDataModule._api.forkCodexFromLatestCompact({ sessionId, cwd })
+      : claudeDataApi.forkSessionFile({ sourceSessionId: sessionId, cwd, skipChainResolve: true, fromLatestCompact: true }),
+    commitReadBinding: (sessionId) => {
+      assertCurrent(true);
+      const current = readRow(payload.tabId);
+      if (!current || current.id !== target.id || current.project_id !== target.project_id
+        || current.cwd !== target.cwd || current.claude_session_id || current.codex_session_id) {
+        throw new Error('context_fork_target_changed');
+      }
+      const committed = toolType === 'codex'
+        ? projectManager.db.compareAndSetTabCodexSessionId(target.project_id, payload.tabId, null, sessionId)
+        : projectManager.db.compareAndSetTabClaudeSessionId(target.project_id, payload.tabId, null, sessionId);
+      if (!committed) throw new Error('context_fork_binding_changed');
+      console.log('[ContextFork] read-binding committed tab=' + payload.tabId + ' tool=' + toolType + ' child=' + sessionId);
+    },
+    onPhase: (phase, sessionId) => agentLaunchPreparations.update(payload.tabId, preparation.token,
+      { phase, reason: 'context-fork', ...(sessionId ? { sessionId } : {}) }),
+  });
+}
+
+function writeAgentLaunchCommandToIdleShell(term, {
+  tabId, toolType, command, launchId = null, admission, sendLaunchRequest = null,
+}) {
   if (!term || terminals.get(tabId) !== term) {
     throw new Error('terminal_generation_changed');
   }
@@ -4898,6 +5268,7 @@ function writeAgentLaunchCommandToIdleShell(term, { tabId, toolType, command, la
   if (proof.inputRevision !== getTerminalInputRevision(tabId)) {
     throw new Error('terminal_input_changed_before_launch');
   }
+  assertAgentSendLaunchCurrent(tabId, toolType, sendLaunchRequest);
   const trackedDraftChars = String(terminalInputLineBuffers.get(tabId) || '').length;
   terminalInputLineBuffers.delete(tabId);
   terminalInputEscapeStates.delete(tabId);
@@ -4908,7 +5279,18 @@ function writeAgentLaunchCommandToIdleShell(term, { tabId, toolType, command, la
     + ' lookup=absent'
     + ' trackedDraftChars=' + trackedDraftChars
     + ' bytes=' + input.length);
+  if (toolType === 'claude' || toolType === 'codex') {
+    if (!terminalShellReadiness.markAgentLaunchWrite(tabId, term, toolType, launchId)) {
+      throw new Error('agent_launch_shell_owner_unavailable');
+    }
+  }
+  if (sendLaunchRequest?.launchIntent !== undefined && !agentLaunchPreparations.markIntentWrite(
+    sendLaunchRequest.launchIntent.token, sendLaunchRequest.launchAttempt, false, launchId)) {
+    throw Object.assign(new Error('agent_launch_attempt_unresolved'), { code: 'agent_launch_attempt_unresolved' });
+  }
   term.write(input);
+  if (sendLaunchRequest?.launchIntent !== undefined) agentLaunchPreparations.markIntentWrite(
+    sendLaunchRequest.launchIntent.token, sendLaunchRequest.launchAttempt, true);
 }
 
 function markClaudeShellLaunchStarted(
@@ -5238,6 +5620,9 @@ function getTerminalStopRevision(tabId) {
   const term = terminals.get(tabId);
   return term ? Number(terminalStopRevisions.get(term) || 0) : 0;
 }
+
+const automaticSendFrameGate = require(path.join(srcMainDir, 'automatic-send-frame-gate'))
+  .createAutomaticSendFrameGate({ getMirror: tabId => getHeadlessTerminalMirror(tabId) });
 
 function agentInputObservationOwner(tabId, identity) {
   return {
@@ -6786,6 +7171,9 @@ function getHeadlessCodexDraftState(tabId, reason = 'headless-draft') {
       preview: '',
       source: 'headless-main:frame-not-authoritative',
       frameBlocker,
+      // Ordering evidence only: the frame remains UNKNOWN until committed.
+      // It may reject an older renderer hint, never authorize an empty input.
+      frameIdentity: { generation: state.generation, writeSeq: state.flushedSeq },
       frameState: {
         generation: state.generation || null,
         writeSeq: state.writeSeq,
@@ -8663,15 +9051,17 @@ function computeActiveLoaders() {
   }
 
   // 4) Codex turn watcher. Codex CLI stays alive while idle, so process liveness
-  //    is not enough; only rollout task_started→task_complete busy blocks.
+  //    is not enough. Active Goal continuation also spans the inter-turn gap.
   for (const [tabId, state] of codexTurnWatchers) {
     const compactOperation = compactOperations.getActive(tabId, 'codex');
-    if (seen.has(tabId) || (state?.busy !== true && !compactOperation)) continue;
+    const goalContinuing = state?.lastOutcomeGoalWork?.pending === true
+      && state.lastOutcomeGoalWork.phase === 'continuing';
+    if (seen.has(tabId) || (state?.busy !== true && !compactOperation && !goalContinuing)) continue;
     loaders.push({
       tabId,
       kind: 'codex',
       status: 'busy',
-      phase: compactOperation?.phase || null,
+      phase: compactOperation?.phase || (goalContinuing ? 'goal-continuation' : null),
       operation: compactOperation?.kind || null,
       ...labelFor(tabId),
     });
@@ -10105,8 +10495,16 @@ function createConfiguredCodexAuthProfileRoute() {
   return require(path.join(srcMainDir, 'codex-auth-profile-route')).createCodexAuthProfileRoute({
     configuration: { ...configuration, fixtureCwd: fixture },
     readAuth: home => codexDataModule._api.readCodexAuthSession(home),
-    captureTab: tabId => ({ terminal: terminals.get(tabId), cwd: terminalProjects.get(tabId),
-      launchId: codexLastRunCommandPayload.get(tabId)?.launchId }),
+    captureTab: tabId => {
+      const command = terminalCommandState.get(tabId);
+      const pendingLaunch = codexLastRunCommandPayload.get(tabId);
+      return { terminal: terminals.get(tabId), cwd: terminalProjects.get(tabId),
+        // The startup payload is consumed when the writer is adopted. Its
+        // absence is explicit; actual physical ownership lives for the command.
+        launchId: pendingLaunch ? pendingLaunch.launchId : null,
+        lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+        runSeq: Number(command?.runSeq || 0), commandRunning: command?.isRunning === true };
+    },
   });
 }
 const codexAuthProfileRoute = createConfiguredCodexAuthProfileRoute();
@@ -10151,7 +10549,7 @@ const providerProxy = http.createServer((req, res) => {
       proxyRoute = { ...proxyRoute, forwardUrl: authorized.forwardUrl, authLaunchId: authorized.launchId };
       req.headers = authorized.headers;
     } catch (error) {
-      console.warn('[CodexAuthProfile] HTTP refused tab=' + String(proxyRoute.tabId).slice(-12) + ' code=' + error.code);
+      console.warn('[CodexAuthProfile] HTTP refused tab=' + String(proxyRoute.tabId).slice(-12) + ' code=' + error.code + ' reason=' + (error.reason || '-'));
       res.writeHead(error.statusCode || 409, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { code: error.code || 'codex_auth_route_failed', message: 'The configured Codex authentication profile is unavailable.' } }));
       return;
@@ -10167,7 +10565,10 @@ const providerProxy = http.createServer((req, res) => {
   req.on('end', () => {
     if (codexAuthProfileRoute && proxyProvider === 'codex') {
       try { codexAuthProfileRoute.assertCurrent(tabId, proxyRoute.authLaunchId); }
-      catch (error) { res.writeHead(error.statusCode || 409); res.end(JSON.stringify({ error: error.code })); return; }
+      catch (error) {
+        console.warn('[CodexAuthProfile] HTTP body refused tab=' + String(tabId).slice(-12) + ' code=' + error.code + ' reason=' + (error.reason || '-'));
+        res.writeHead(error.statusCode || 409); res.end(JSON.stringify({ error: error.code })); return;
+      }
     }
     let body = Buffer.concat(chunks);
     const mode = proxyProvider === 'codex' ? 'codex' : reqState.type;
@@ -10560,6 +10961,24 @@ function providerProxyCloseReason(reason) {
 // the local client so a failed relay cannot masquerade as a connected stream.
 providerProxy.on('upgrade', (req, socket, head) => {
   let route = parseProviderProxyRoute(req.url);
+  let webSocketRequestId = null;
+  // Node releases its HTTP socket error handler when it emits 'upgrade'. Our
+  // upstream handshake is asynchronous; ws does not own this socket yet. A
+  // local reset in that interval must close this connection, not escape as an
+  // uncaught Main exception. Keep coverage through rejection and transfer it
+  // only after handleUpgrade has installed the WebSocket socket listeners.
+  const onPendingSocketError = (error) => {
+    console.warn('[ProviderProxy:WS] event=downstream-error-before-upgrade request='
+      + (webSocketRequestId || '-') + ' tab=' + String(route.tabId || '').slice(-12)
+      + ' code=' + String(error?.code || 'UNKNOWN'));
+    socket.destroy();
+  };
+  const releasePendingSocketError = () => {
+    socket.removeListener('error', onPendingSocketError);
+    socket.removeListener('close', releasePendingSocketError);
+  };
+  socket.on('error', onPendingSocketError);
+  socket.once('close', releasePendingSocketError);
   if (route.provider !== 'codex' || !route.tabId) {
     rejectProviderProxyUpgrade(socket, 404, 'Unsupported WebSocket route');
     return;
@@ -10570,12 +10989,12 @@ providerProxy.on('upgrade', (req, socket, head) => {
       route = { ...route, forwardUrl: authorized.forwardUrl, authLaunchId: authorized.launchId };
       req.headers = authorized.headers;
     } catch (error) {
-      console.warn('[CodexAuthProfile] WS refused tab=' + String(route.tabId).slice(-12) + ' code=' + error.code);
+      console.warn('[CodexAuthProfile] WS refused tab=' + String(route.tabId).slice(-12) + ' code=' + error.code + ' reason=' + (error.reason || '-'));
       rejectProviderProxyUpgrade(socket, error.statusCode || 409, 'Codex authentication profile unavailable');
       return;
     }
   }
-  const webSocketRequestId = 'w' + (++providerProxyWebSocketSeq).toString(36);
+  webSocketRequestId = 'w' + (++providerProxyWebSocketSeq).toString(36);
   proxyActiveConnections.add(socket);
   socket.once('close', () => proxyActiveConnections.delete(socket));
 
@@ -10630,6 +11049,7 @@ providerProxy.on('upgrade', (req, socket, head) => {
     req.__providerProxyUpstreamHeaders = upstreamHeaders;
     req.__providerProxyUpstreamProtocol = upstream.protocol || '';
     providerProxyWebSocketServer.handleUpgrade(req, socket, head, (accepted) => {
+      releasePendingSocketError();
       client = accepted;
       proxyActiveWebSockets.add(client);
       console.log('[ProviderProxy] Codex[' + route.tabId.slice(-12)
@@ -10656,7 +11076,10 @@ providerProxy.on('upgrade', (req, socket, head) => {
       client.on('message', (data, isBinary) => {
         if (codexAuthProfileRoute) {
           try { codexAuthProfileRoute.assertCurrent(route.tabId, route.authLaunchId); }
-          catch (error) { client.close(1008, error.code || 'auth-profile-changed'); upstream.terminate(); return; }
+          catch (error) {
+            console.warn('[CodexAuthProfile] WS frame refused tab=' + String(route.tabId).slice(-12) + ' code=' + error.code + ' reason=' + (error.reason || '-'));
+            client.close(1008, error.code || 'auth-profile-changed'); upstream.terminate(); return;
+          }
         }
         if (semanticConnection) {
           safelyObserveProviderSemantic(
@@ -12256,8 +12679,8 @@ function captureClaudeFirstAcceptedBridge(tabId, pid, isFreshProcess) {
   const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
   const numericPid = Number(pid);
-  if (isFreshProcess !== true || launch?.launchMode !== 'resume'
-    || !launch.sessionIdHint || !launch.generation || launch.firstAcceptedBridge
+  if (isFreshProcess !== true || !['resume', 'fresh'].includes(launch?.launchMode)
+    || (launch.launchMode === 'resume' && !launch.sessionIdHint) || !launch.generation || launch.firstAcceptedBridge
     || !terminalToken || !Number.isInteger(runSeq) || runSeq <= 0 || !lifecycleGeneration
     || !Number.isInteger(numericPid) || numericPid <= 0 || Number(launch.pid) !== numericPid
     || bridgePidCache.get(numericPid) !== tabId) return null;
@@ -12284,7 +12707,7 @@ function pinClaudeFirstAcceptedBridge(tabId, sessionId, captured) {
     runSeq: captured.runSeq, lifecycleGeneration: captured.lifecycleGeneration,
     generation: captured.generation,
   });
-  console.log('[Bridge:ResumeInitialWriter] tab=' + String(tabId).slice(-12)
+  console.log('[Bridge:LaunchInitialWriter] tab=' + String(tabId).slice(-12)
     + ' generation=' + captured.generation + ' pid=' + captured.pid
     + ' source=' + String(launch.sessionIdHint).slice(0, 8)
     + ' writer=' + String(sessionId).slice(0, 8));
@@ -12437,7 +12860,7 @@ function startSessionBridge() {
           data.session_id,
         );
       }
-      // Only this first process observation can prove the accepted Resume's
+      // Only this first process observation can prove the accepted launch's
       // initial writer. Later same-PID /resume updates must never replace it,
       // even if they overtake this callback while quota persistence awaits.
       const firstAcceptedBridgeScope = captureClaudeFirstAcceptedBridge(tabId, data.ppid, isFreshProcess);
@@ -14098,6 +14521,18 @@ function getCodexCapacityRetryRuntime() {
       }
     },
     notify: async (owner, effect, failure = null, delivery = null) => {
+      // Error-only pre-admission refusals used to collapse into a generic code.
+      // Log before notification/project lookup: delivery to the human is not
+      // the persistence boundary for the decision which withheld provider input.
+      console.warn('[CodexCapacityRetry] ' + (failure ? 'not-submitted' : 'exhausted')
+        + ' tab=' + owner.tabId + ' session=' + owner.sessionId + ' turn=' + effect.errorId
+        + ' generation=' + owner.generation + ' handoff=' + effect.handoffId
+        + ' attempts=' + effect.attempt
+        + ' code=' + JSON.stringify(delivery?.code || delivery?.error || failure || 'capacity_retry_exhausted')
+        + ' reason=' + JSON.stringify(delivery?.reason || null)
+        + ' run=' + (delivery?.runId || '-')
+        + ' expectedGeneration=' + (delivery?.expectedLifecycleGeneration || '-')
+        + ' observedGeneration=' + (delivery?.observedLifecycleGeneration || owner.generation));
       const projectId = resolveAuthoritativeTabProjectId(owner.tabId);
       if (!projectId) return;
       const row = projectManager.db.getAllProjects().find(p => p.id === projectId)?.tabs?.find(t => t.tabId === owner.tabId);
@@ -14120,9 +14555,6 @@ function getCodexCapacityRetryRuntime() {
         ipcMain.emit('tab-notification:fired', null, detail);
       }
       mainWindow?.webContents?.send('tab-notification:force-fired', detail);
-      console.warn('[CodexCapacityRetry] ' + (failure ? 'not-submitted' : 'exhausted')
-        + ' tab=' + owner.tabId.slice(-12) + ' attempts=' + effect.attempt
-        + (failure ? ' code=' + (delivery?.code || 'capacity_retry_not_submitted') : ''));
     },
     log: message => console.log('[CodexCapacityRetry] ' + message),
   });
@@ -14484,7 +14916,7 @@ function getCodexPublicRuntimeProjection(tabId) {
   const turnBusy = turnState.busy === true || providerTurnBusy;
   const stopping = aiStoppingTabs.get(tabId)?.toolType === 'codex';
   const proofPending = codexLateMcpProofPending.has(tabId);
-  return projectCodexPolicyRuntime(projectCodexPublicRuntimeProjection({
+  const runtime = projectCodexPolicyRuntime(projectCodexPublicRuntimeProjection({
     liveLifecycle: null,
     stopping,
     turnBusy,
@@ -14496,6 +14928,7 @@ function getCodexPublicRuntimeProjection(tabId) {
     writerUiLifecycleEstablished: hasCodexEstablishedWriterUiLifecycle(tabId),
     hasEstablishedLifecycle: true,
   }), codexRuntimePolicies?.read(tabId));
+  return { ...runtime, goalWork: turnState.goalWork || null };
 }
 
 function projectCodexRuntimeSnapshotFromEvents(
@@ -14766,6 +15199,7 @@ function projectCodexRuntimeSnapshotFromEvents(
     outcomeKnown: turnState.outcomeKnown === true,
     lastOutcomeReason: turnState.lastOutcomeReason || null,
     hasLaunchPayload: !!currentPayload,
+    goalWork: turnState.goalWork || null,
     startupWait: projectCodexSendStartupWait({ payload: currentPayload, terminal: currentTerminal,
       lifecycleGeneration: currentLifecycleGeneration, runSeq: currentRunSeq,
       commandRunning: commandState?.isRunning === true, stopping, inputReady,
@@ -14832,6 +15266,7 @@ function broadcastCodexPublicRuntimeSnapshot(tabId, reason = 'runtime-snapshot')
     toolType: 'codex',
     commandType: 'codex',
     inputReady: runtimeProjection.inputReady,
+    goalWork: runtimeProjection.goalWork || null,
     reason,
     ...getCodexPublicWriterFields(tabId),
   });
@@ -15023,7 +15458,11 @@ function markAiStopping(tabId, toolType, reason = 'manual-stop', options = {}) {
   };
   aiStoppingTabs.set(tabId, state);
   const stoppingTerm = terminals.get(tabId);
-  if (stoppingTerm) terminalStopRevisions.set(stoppingTerm, getTerminalStopRevision(tabId) + 1);
+  if (stoppingTerm) {
+    terminalStopRevisions.set(stoppingTerm, getTerminalStopRevision(tabId) + 1);
+    broadcastAgentLaunchFenceRevoked(tabId, 'stop-start:' + reason);
+  }
+  state.launchFence = captureAgentLaunchFence(tabId);
   try { ipcMain.emit('agent:input-owner-changed-internal', null, { tabId, reason: 'process-stopping' }); }
   catch (error) { console.warn('[AgentInputObservation] stop observer failed:', error?.message || error); }
   if (resolvedTool === 'codex') {
@@ -15541,6 +15980,7 @@ function captureAgentResponseReadState(tabId) {
   const backgroundWorkCount = getCombinedTabBackgroundWorkCount(tabId);
   return {
     known, exists: true, tabId, toolType, sessionId, cwd: owner?.cwd || null, busy, transitioning, turn, backgroundWorkCount,
+    goalWork: codexRuntime?.goalWork || null,
     executionContext: executionContext?.sessionId === liveSessionId ? executionContext : null,
     // Counters survive busy -> idle within one async read. Input and launch
     // generations also fence off restart/owner ABA; spinner state is absent.
@@ -15549,6 +15989,7 @@ function captureAgentResponseReadState(tabId) {
       turn?.generation, turn?.turnId, turn?.processId, busy, transitioning, liveSessionId,
       codex?.liveTurnEvents, codex?.currentTurnId, codex?.lastOutcomeTurnId,
       codex?.lastEventType, codex?.catchUpPending, codex?.outcomeKnown, codex?.processGeneration,
+      codexRuntime?.goalWork || null,
       authoritativeIdle, claudeHookLastEvent.get(tabId),
       backgroundWorkCount, tabBackgroundWorkRevisionByTab.get(tabId)]),
     ...(!known ? { error: 'response_owner_unknown' } : {}),
@@ -15586,6 +16027,18 @@ async function readObservedTranscriptResponse(request) {
     && source.size === stat.size && source.mtimeMs === stat.mtimeMs && source.ctimeMs === stat.ctimeMs;
   return { ...result, ...(sourceVerified ? terminalOutcome : null), sourceVerified,
     ...(!sourceVerified ? { errorCode: 'response_source_unverified', error: 'Claude source changed or lacks a verified snapshot' } : {}) };
+}
+
+async function readAgentContinuationOriginalProof(request) {
+  const result = await readObservedTranscriptResponse(request);
+  if (request.toolType !== 'claude' || result.sourceVerified !== true || result.found !== true) return result;
+  const original = request.targetExecutionContext;
+  const sameOriginal = original?.provider === 'claude' && original.sessionId === request.sessionId
+    && !!request.promptUserUuid && request.promptUserUuid === result.userUuid;
+  return { ...result,
+    ...(sameOriginal ? { executionContext: original, executionContextSource: 'persisted-original-prompt' } : {}),
+    ...(result.complete === true ? { terminalEvent: 'Stop', hasFinalResult: true, proofDefinitive: true } : {}),
+  };
 }
 
 function getAgentResponseObservationReader() {
@@ -19156,6 +19609,11 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
     const type = match[1];
     const param = match[2] ? match[2].slice(1) : null; // Remove leading ';'
 
+    // Wake the existing bounded Stop observation; it rereads after this
+    // synchronous OSC reducer, never infers process absence from the event.
+    try { ipcMain.emit('terminal:command-boundary-internal', null, { tabId }); }
+    catch (error) { console.warn('[AgentLaunchPreparation] OSC observer failed:', error?.message || error); }
+
     const state = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
 
     switch (type) {
@@ -19177,6 +19635,7 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
 
       case 'B': { // Command start - user pressed Enter
         terminalShellReadiness.markCommandBoundary(tabId, terminalToken);
+        terminalShellReadiness.markAgentLaunchStarted(tabId, terminalToken);
         const oscAgentTool = parseOsc133AgentTool(param);
         console.log(`[OSC 133] Tab ${tabId}: Command STARTED (B)`
           + (oscAgentTool ? ` tool=${oscAgentTool}` : ''));
@@ -19328,6 +19787,7 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
             break;
           }
         }
+        terminalShellReadiness.finishAgentLaunch(tabId, terminalToken);
         state.lastExitCode = exitCodeAtD;
         clearClaudeEditableLastPrompt(tabId, 'osc-command-finished');
         // [RunAfterDiag] Correlate D markers with Claude liveness. If a D fires
@@ -20492,15 +20952,31 @@ function _setOverseerTurnsCache(cacheKey, result) {
 }
 
 async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
-  return perfCausal.run('history.codex-session-turns', { sessionId,
+  const { CodexTurnsCacheAdmission } = require(path.join(srcMainDir, 'codex-turns-cache-admission'));
+  const admission = new CodexTurnsCacheAdmission(codexDataModule?._api, transcriptService);
+  let read = null, proof = null, cacheResult = false;
+  const cacheKey = 'codex:' + sessionId;
+  try {
+  const value = await perfCausal.run('history.codex-session-turns', { sessionId,
     caller: perfCausal.current()?.name || perfCallerToken() }, async () => {
   if (!codexDataModule?._api?.loadSessionRecords || !codexDataModule?._api?.buildCodexFullHistory) {
     const err = new Error('Codex overseer loader is unavailable');
     err.status = 500;
     throw err;
   }
-  const cacheKey = 'codex:' + sessionId;
   if (options.forceFresh === true) _deleteOverseerTurnsCache(cacheKey);
+  const cached = _getOverseerTurnsCache(cacheKey);
+  proof = cached ? admission.get(cached, sessionId, cwd) : null;
+  try { read = await admission.open(proof); }
+  catch (error) {
+    if (error?.code !== 'CODEX_SOURCE_READ_INVALIDATED') throw error;
+    _deleteOverseerTurnsCache(cacheKey);
+  }
+  if (read) return perfCausal.run('history.codex-turn-projection', { sessionId, mode: 'memory-hit' }, () => {
+    const annotations = _loadSessionAnnotations(sessionId, cached.turns);
+    return { ...cached, ...annotations };
+  });
+  const lineage = admission.captureLineage(sessionId, cwd);
   const loaded = await transcriptService.loadCodexOperationSource({
     sessionId, cwd, forceFresh: options.forceFresh === true, includeRecords: false,
   });
@@ -20510,11 +20986,16 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
     err.lineageReason = loaded?.lineageReason;
     throw err;
   }
+  proof = admission.captureSource(loaded, sessionId, cwd, lineage);
+  read = await admission.open(proof);
+  if (!read) proof = null;
   return perfCausal.run('history.codex-turn-projection', { sessionId,
     snapshotRecords: loaded.records?.length ?? null, rows: loaded.historyEntries?.length ?? null }, () => {
   const stat = fs.statSync(loaded.filePath);
-  const cached = _getOverseerTurnsCache(cacheKey);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size
+  // Virtual views keep the full canonical ancestry read above. A physical
+  // miss must build from that read, never revive a rejected outer graph.
+  if (loaded.composite === true && cached?.composite === true && cached.filePath === loaded.filePath
+    && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size
     && cached.contentRevision === loaded.contentRevision) {
     const annotations = _loadSessionAnnotations(sessionId, cached.turns);
     return { ...cached, ...annotations, filePath: loaded.filePath };
@@ -20694,14 +21175,30 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
     sessionMeta,
     ...annotations,
   };
-  _setOverseerTurnsCache(cacheKey, result);
+  cacheResult = true;
   return result;
   });
   });
+  // perfCausal settle observers may reenter application code. Admission belongs
+  // after those callbacks, annotations, and every awaited physical validation.
+  if (read) {
+    await admission.validate(proof, read);
+    const completedRead = read;
+    read = null;
+    admission.finish(completedRead);
+    admission.assertCurrent(proof, completedRead);
+    admission.remember(value, proof);
+  }
+  if (cacheResult) _setOverseerTurnsCache(cacheKey, value);
+  return value;
+  } finally { if (read) admission.finish(read); }
 }
 
 async function _loadSessionTurns(sessionId, cwd, options = {}) {
-  return perfCausal.run('history.session-turns', { sessionId,
+  const diagnostic = beginHistoryReadDiagnostic('session-turns', { sessionId, provider: options.provider,
+    caller: perfCausal.current()?.name || perfCallerToken() });
+  try {
+  const value = await perfCausal.run('history.session-turns', { sessionId,
     caller: perfCausal.current()?.name || perfCallerToken() }, async () => {
   const located = await _resolveHistoryReadSession(sessionId, cwd, options.provider);
   if (located.provider === 'codex') {
@@ -20750,6 +21247,23 @@ async function _loadSessionTurns(sessionId, cwd, options = {}) {
   _setOverseerTurnsCache(cacheKey, result);
   return result;
   });
+  const diagnosticFields = { sourceBytes: value.retainedSourceBytes ?? value.size,
+    records: value.recordMap?.size, preparedRows: value.turns?.length };
+  if (value.engine === 'codex') {
+    diagnostic.prepared(diagnosticFields);
+    const { CodexTurnsCacheAdmission } = require(path.join(srcMainDir, 'codex-turns-cache-admission'));
+    const admission = new CodexTurnsCacheAdmission(codexDataModule?._api, transcriptService);
+    const verified = await admission.revalidate(value, sessionId, cwd);
+    const commitDiagnostic = diagnostic.deferSuccess();
+    if (verified) admission.assertCurrent(verified.proof, verified.read);
+    // Decide without a synchronous observer between final admission and return.
+    commitDiagnostic();
+  } else diagnostic.end('success', diagnosticFields);
+  return value;
+  } catch (error) {
+    diagnostic.end('error', { errorCode: error.code });
+    throw error;
+  }
 }
 
 function _historyReadBindings(sessionId) {
@@ -21716,10 +22230,52 @@ async function searchSessionCatalog(options = {}) {
   const errors = [];
 
   for (const candidate of candidates) {
+    const diagnostic = beginHistoryReadDiagnostic('catalog-candidate', {
+      sessionId: candidate.sessionId, provider: candidate.provider,
+    });
+    if (candidate.provider === 'codex') {
+      let located;
+      try {
+        // Resolve the same provider/binding authority as the full turn reader,
+        // then keep raw decoding and canonical query projection in its worker.
+        located = await _resolveHistoryReadSession(candidate.sessionId, candidate.cwd, 'codex');
+        const result = await transcriptService.searchCatalogCandidate({
+          toolType: 'codex', sessionId: candidate.sessionId, cwd: candidate.cwd,
+          query, matchesPerSession, diagnosticReadId: diagnostic.readId,
+        });
+        if (!result?.success) {
+          throw Object.assign(new Error(result?.error || 'Catalog projection failed'), {
+            code: result?.error || 'HISTORY_CATALOG_READ_FAILED', lineageReason: result?.lineageReason,
+          });
+        }
+        if (!Number.isSafeInteger(result.totalIterations) || result.totalIterations < 0
+          || !Array.isArray(result.bestMatches) || result.bestMatches.length > matchesPerSession) {
+          throw Object.assign(new Error('Invalid catalog projection result'), { code: 'HISTORY_CATALOG_RESULT_INVALID' });
+        }
+        const totalIterations = result.totalIterations;
+        sessions.push({ ...candidate, totalIterations });
+        const sessionMatches = query ? result.bestMatches.map(match => ({ ...candidate, ...match, totalIterations })) : [];
+        if (query && sessionMatches.length === 0) {
+          const titleMatch = scoreSessionTurnMatch({ query, title: candidate.title });
+          if (titleMatch.matched) sessionMatches.push({ ...candidate, totalIterations,
+            iterationIndex: null, turnIndex: null, entryUuid: null, timestamp: null,
+            matchedIn: ['title'], score: titleMatch.score, userPreview: '', assistantPreview: '' });
+        }
+        matches.push(...sessionMatches);
+        diagnostic.end('success', { totalIterations, matches: sessionMatches.length });
+      } catch (error) {
+        error.diagnostics ||= located?.diagnostics;
+        diagnostic.end('error', { errorCode: error.code });
+        errors.push({ sessionId: candidate.sessionId, title: candidate.title, provider: candidate.provider,
+          ...require(path.join(srcMainDir, 'history-session-resolution')).historyReadError(error) });
+      }
+      continue;
+    }
     let data;
     try {
       data = await _loadSessionTurns(candidate.sessionId, candidate.cwd, { provider: candidate.provider });
     } catch (error) {
+      diagnostic.end('error', { errorCode: error.code });
       errors.push({
         sessionId: candidate.sessionId,
         title: candidate.title,
@@ -21743,6 +22299,7 @@ async function searchSessionCatalog(options = {}) {
     }
     const totalIterations = iterations.length;
     sessions.push({ ...candidate, totalIterations });
+    diagnostic.end('success', { preparedRows: data.turns?.length || 0, totalIterations });
     if (!query) continue;
 
     const sessionMatches = [];
@@ -23117,21 +23674,26 @@ function startMcpHttpServer() {
             return;
           }
 
-          // parentProjectId wins. Resolves project by id (authoritative). Falls
-          // back to cwd-path match only when id missing or unknown.
+          // parentProjectId is an execution address: legacy Project or v2
+          // namespace. Resolve either exact address before legacy cwd fallback.
           let project = null;
+          let scopeId = null;
           if (parentProjectId) {
             project = projectManager.db.db.prepare(
               'SELECT * FROM projects WHERE id = ? LIMIT 1'
             ).get(parentProjectId);
+            scopeId = project?.id || projectManager.db.db.prepare(
+              'SELECT namespace FROM workflow_execution_scopes WHERE namespace = ? LIMIT 1'
+            ).get(parentProjectId)?.namespace || null;
           }
-          if (!project && projectPath) {
+          if (!scopeId && projectPath) {
             project = projectManager.db.db.prepare(
               'SELECT * FROM projects WHERE path = ? ORDER BY updated_at DESC LIMIT 1'
             ).get(projectPath);
+            scopeId = project?.id || null;
           }
 
-          if (!project) {
+          if (!scopeId) {
             res.writeHead(200);
             res.end(JSON.stringify({ tabs: [] }));
             return;
@@ -23140,7 +23702,7 @@ function startMcpHttpServer() {
           // Get tabs from DB
           const dbTabs = projectManager.db.db.prepare(
             'SELECT *,COALESCE(project_id,execution_namespace) AS project_id FROM tabs WHERE COALESCE(project_id,execution_namespace) = ? AND execution_archived=0 ORDER BY position'
-          ).all(project.id);
+          ).all(scopeId);
           // A tab list is a passive projection, not a writer reconciliation.
           // Use the same event-owned batch as Project API: per-tab snapshots
           // perform process/rollout I/O and make large projects time out.
@@ -23148,7 +23710,7 @@ function startMcpHttpServer() {
             dbTabs
               .filter(t => t.tab_id && t.command_type === 'codex' && (!colorFilter || t.color === colorFilter))
               .map(t => ({ tabId: t.tab_id, savedSessionId: t.codex_session_id || null })),
-            project.id,
+            scopeId,
           );
 
           const tabs = [];
@@ -23205,7 +23767,7 @@ function startMcpHttpServer() {
             });
           }
 
-          console.log('[MCP:HTTP] GET /terminal/tabs projectId=' + (parentProjectId || project.id) + ' project=' + (project.path || '') + ' color=' + colorFilter + ' found=' + tabs.length);
+          console.log('[MCP:HTTP] GET /terminal/tabs projectId=' + scopeId + ' project=' + (project?.path || '') + ' color=' + colorFilter + ' found=' + tabs.length);
           res.writeHead(200);
           res.end(JSON.stringify({ tabs }));
         } catch (e) {
@@ -23861,6 +24423,7 @@ function startMcpHttpServer() {
                   tabId,
                   engine,
                   startReadyTimeoutMs,
+                  agentAdmittedReadyOwner({ ...runResult, toolType: engine }) || {},
                 );
               } catch (readyError) {
                 const statusCode = readyError?.code === 'codex_auth_required'
@@ -23973,6 +24536,7 @@ function startMcpHttpServer() {
                   tabId,
                   engine,
                   startReadyTimeoutMs,
+                  agentAdmittedReadyOwner({ ...runResult, toolType: engine }) || {},
                 );
               } catch (readyError) {
                 const statusCode = readyError?.code === 'agent_startup_defaults_failed' ? 409 : 504;
@@ -24742,6 +25306,7 @@ app.whenReady().then(async () => {
     webServer.start({
       sdkSessions,
       tabWorkContext,
+      userNotificationOutbox,
       computeActiveLoaders,
       computeProjectActivity,
       readTabActivityState: readPublicTabActivityState,
@@ -24795,6 +25360,7 @@ app.whenReady().then(async () => {
         };
       },
       getAgentTurnResult: _getAgentTurnResultForOrchestration,
+      readAgentContinuationOriginalProof,
       getAgentResponseState: tabId => getAgentResponseObservationReader().getAgentResponseState(tabId),
       readAgentObservedResponse: request => getAgentResponseObservationReader().readAgentObservedResponse(request),
       onAgentResponseCompletion: listener => getAgentResponseObservationReader().onAgentResponseCompletion(listener),
@@ -24802,12 +25368,15 @@ app.whenReady().then(async () => {
       readAgentLifecycleIdentity: readAiLifecycleIdentityForTab,
       readAgentStartReadiness: readMainAgentStartReadinessForTab,
       readAgentRuntimeSnapshot: readMainPublicRuntimeSnapshot,
+      readAutomaticSendFrame: (tabId, wake) => automaticSendFrameGate.read(tabId, wake),
+      readAgentSendDestination: readAgentSendDestinationAtWriteBoundary,
       readAgentSendInputSlot: readMainSendInputSlot,
       codexGoalActions: {
         read: (tabId, request) => getCodexRuntimePolicies().readGoalAction(tabId, request),
         apply: (tabId, request) => getCodexRuntimePolicies().applyGoalAction(tabId, request),
       },
       stopAgentProcess: stopAgentProcessScenarioInMain,
+      readAgentLaunchFence: captureAgentLaunchFence,
       readAgentParams: tabId => mainAgentParamsReader.read(tabId),
       agentParamsService: mainAgentParamsService,
       readCodexAuthProfile: codexAuthProfileRoute ? readCodexAuthProfileProof : null,
@@ -24895,6 +25464,10 @@ app.whenReady().then(async () => {
     });
     ipcMain.handle('orchestration:open-research-job', async (_event, payload = {}) => {
       return payload.runId ? webServer.openExternalResearchJob(payload.runId)
+        : { success: false, error: 'runId required' };
+    });
+    ipcMain.handle('orchestration:open-research-browser', async (_event, payload = {}) => {
+      return payload.runId ? webServer.openExternalResearchBrowser(payload.runId, { actionId: payload.actionId })
         : { success: false, error: 'runId required' };
     });
     ipcMain.handle('tab-messages:dismiss', async (_event, payload = {}) => {
@@ -25321,9 +25894,10 @@ app.on('will-quit', () => {
   // и 04:53 местного времени), стек обоих отчётов обрывался в разборе
   // окружения, а не в нашем коде.
   //
-  // Единственный настоящий ремонт — чтобы к этому моменту звать было НЕКОГО.
-  // Снимаем свои обработчики: терминалы всё равно уже помечены, состояние
-  // сохранено выше, и никакая уборка на этой стадии больше не нужна.
+  // Снимаем обработчики приложения после сохранения состояния. Это не отменяет
+  // native exit callback node-pty: removeAllListeners работает с JS socket,
+  // а TSFN вызывает внутренний onexit ещё до наших подписчиков. Отказ N-API
+  // при FreeEnvironment требует отдельной защиты в native-модуле (live16/17).
   try {
     let detached = 0;
     for (const [, term] of terminals) {
@@ -25335,8 +25909,8 @@ app.on('will-quit', () => {
       } catch {}
     }
     // Карту НЕ очищаем: если выход по какой-то причине будет отменён, пустая
-    // карта при живых терминалах — это потерянные вкладки. Снятых обработчиков
-    // достаточно: звать через мост уже некого.
+    // карта при живых терминалах — это потерянные вкладки. Detach прекращает
+    // доставку нашим слушателям, но не является proof отмены native callback.
     console.log('[Shutdown:will-quit] detached terminal listeners count=' + detached);
   } catch (e) {
     console.error('[Shutdown] detach terminal listeners failed:', e.message);
@@ -25433,7 +26007,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           incompleteReason: 'existing-pty-mirror-missing',
         });
       }
-      return { pid: existingPty.pid, cwd: terminalProjects.get(tabId) };
+      return { pid: existingPty.pid, cwd: terminalProjects.get(tabId), launchFence: captureAgentLaunchFence(tabId) };
     }
 
     console.time(`[PERF:main] terminal:create ${tabId}`);
@@ -25600,6 +26174,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     revokeCodexActionAuthoritiesForTab(tabId, 'terminal-replaced');
     aiBoundaryTestGate.cancelMatching({ tabId }, 'terminal-replaced');
     terminals.set(tabId, ptyProcess);
+    broadcastAgentLaunchFenceRevoked(tabId, 'terminal-created-or-replaced');
     terminalShellReadiness.reset(tabId, ptyProcess, ptyProcess.pid);
     terminalProjects.set(tabId, workingDir);
     if (typeof projectId === 'string' && projectId) {
@@ -26375,7 +26950,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         console.error(`[PTY:EXIT] tabId=${tabId} pid=${ptyProcess.pid} exitCode=${JSON.stringify(exitCode)} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)}`);
         console.error(`[JsonlChainDiag:PtyExit] tabId=${tabId} shellPid=${ptyProcess.pid} sessionId=${_diagSid ? _diagSid.substring(0, 8) : 'none'} spinnerBusy=${_diagSpinBusy} turnBusy=${_diagTurnBusy} localBusy=${_diagLocalBusy} ${_diagBusy ? '*** EXITED MID-TURN — likely JSONL chain break next user prompt ***' : '(idle, safe)'}`);
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('terminal:exit', tabId, exitCode);
+          mainWindow.webContents.send('terminal:exit', tabId, exitCode, captureAgentLaunchFence(tabId));
         }
         deleteTerminalRuntimeIfOwned(terminals, tabId, ptyProcess);
         terminalCwdChangeProofs.cancel(tabId, null, 'terminal_generation_changed');
@@ -26448,7 +27023,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     });
 
     console.timeEnd(`[PERF:main] terminal:create ${tabId}`);
-    return { pid: ptyProcess.pid, cwd: workingDir };
+    return { pid: ptyProcess.pid, cwd: workingDir, launchFence: captureAgentLaunchFence(tabId) };
   });
 
 // Bracketed Paste Mode escape sequences
@@ -26909,6 +27484,7 @@ function isOrchestrationPromptAudit(detail) {
   const handoffId = typeof detail?.handoffId === 'string' ? detail.handoffId : '';
   return detail?.success === true
     && (handoffId.startsWith('orchestration:')
+      || handoffId.startsWith('orchestration-continue:')
       || handoffId.startsWith('orchestration-complete:'));
 }
 
@@ -27124,6 +27700,9 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
         recordByteOffset: result.recordByteOffset ?? null,
         transcriptBoundary: result.transcriptBoundary || null,
         auditTimestamp: result.auditTimestamp || null,
+        executionContext: compatiblePromptAuditExecutionContext({ toolType, sessionId: result.sessionId },
+          result.executionContext || audit.executionContext || null).context,
+        ...(typeof audit.queuedAtSubmit === 'boolean' ? { queuedAtSubmit: audit.queuedAtSubmit } : {}),
       });
       const durableAccepted = durablePromotion?.promoted === true
         || (durablePromotion?.idempotent === true
@@ -27206,7 +27785,7 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
     expectedLen: Number.isFinite(result?.expectedLen)
       ? Number(result.expectedLen)
       : (Number.isFinite(audit.expectedLen) ? Number(audit.expectedLen) : null),
-    queuedAtSubmit: audit.queuedAtSubmit === true,
+    ...(typeof audit.queuedAtSubmit === 'boolean' ? { queuedAtSubmit: audit.queuedAtSubmit } : {}),
   };
   const candidateContext = result?.executionContext
     || audit.executionContext
@@ -29248,7 +29827,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           return { success: false, accepted: false, submitted: false, pasteWritten: false,
             enterWritten: false, status: 'not-submitted', code: 'agent_send_target_unresolved',
             error: 'The current target conversation could not be confirmed; input was not touched.',
-            writerStatus: codexSubmissionWatcher?.writerStatus || 'unknown' };
+            writerStatus: codexSubmissionWatcher?.writerStatus || 'unknown',
+            reason: codexSubmissionWatcher?.provisionalReason || 'writer-not-proven' };
         }
       }
       if (!codexSubmissionWatcher?.available) {
@@ -33465,9 +34045,201 @@ ipcMain.handle('agent:get-stopping-state', async (_event, tabId) => {
   };
 });
 
+const agentLaunchIntentSenders = new Set();
+function watchAgentLaunchIntentSender(sender) {
+  if (agentLaunchIntentSenders.has(sender.id)) return;
+  agentLaunchIntentSenders.add(sender.id);
+  sender.once('destroyed', () => {
+    agentLaunchPreparations.clearIntentSender(sender.id);
+    agentLaunchIntentSenders.delete(sender.id);
+  });
+}
+
+function beginAgentLaunchIntent(event, request = {}) {
+  const identity = { senderId: event.sender.id, tabId: String(request.tabId || ''),
+    toolType: request.toolType, intentId: request.intentId };
+  let state = null;
+  try {
+    if (!identity.tabId || !['claude', 'codex'].includes(identity.toolType)) throw new Error('agent_launch_intent_identity_required');
+    watchAgentLaunchIntentSender(event.sender);
+    const requestKey = agentLaunchIntentPayloadKey(request);
+    state = agentLaunchPreparations.getIntentByIdentity(identity);
+    if (state && state.requestKey && state.requestKey !== requestKey) throw new Error('agent_launch_intent_payload_changed');
+    if (state?.launchFence) {
+      const currentFence = captureAgentLaunchFence(identity.tabId);
+      if (!request.launchFence || !currentFence
+        || request.launchFence.terminalInstanceId !== state.launchFence.terminalInstanceId
+        || request.launchFence.stopRevision !== state.launchFence.stopRevision
+        || currentFence.terminalInstanceId !== state.launchFence.terminalInstanceId
+        || currentFence.stopRevision !== state.launchFence.stopRevision) {
+        throw new Error('agent_launch_intent_fence_changed');
+      }
+    }
+    if (!state) {
+      if (aiStoppingTabs.has(identity.tabId)) throw new Error('agent_launch_cancelled');
+      const launchFence = captureAgentLaunchFence(identity.tabId);
+      if (!launchFence) throw new Error('agent_launch_terminal_unavailable');
+      // First begin also requires the caller's already-observed authority.
+      // A delayed old begin cannot obtain a fresh fence after Stop merely
+      // because the renderer missed the revocation publication.
+      if (!request.launchFence) throw new Error('agent_launch_original_fence_required');
+      if (request.launchFence && (!request.launchFence
+        || request.launchFence.terminalInstanceId !== launchFence.terminalInstanceId
+        || request.launchFence.stopRevision !== launchFence.stopRevision)) throw new Error('agent_launch_cancelled');
+      state = agentLaunchPreparations.beginIntent({ ...identity, launchFence,
+        source: readAgentLaunchIntentSource(identity.tabId, identity.toolType), requestKey,
+        requestedSessionId: request.sessionId || null, requestedCwd: request.cwd || null,
+        expectedTarget: request.expectedTarget ? Object.freeze({ ...request.expectedTarget }) : null,
+        sendOperationKey: request.sendOperationKey || null, sendAttemptId: request.sendAttemptId || null }).state;
+      // The renderer's original source is a precondition, including before
+      // ordinary Send admission. Capturing a changed row is not permission to
+      // launch an older saved request in it.
+      if (request.cwd && (request.cwd !== state.source.terminalCwd
+        || state.source.storedCwd && request.cwd !== state.source.storedCwd)) {
+        throw new Error('agent_launch_intent_cwd_changed');
+      }
+      if (state.requestedSessionId !== state.source.sessionId) {
+        const writer = readAgentSendDestinationAtWriteBoundary(identity.tabId, identity.toolType);
+        if (!state.requestedSessionId || writer?.sessionId !== state.source.sessionId
+          || writer?.acceptedResumeSourceSessionId !== state.requestedSessionId
+          || writer?.terminalInstanceId !== launchFence.terminalInstanceId) {
+          throw new Error('agent_launch_intent_session_changed');
+        }
+      }
+      assertAgentSendLaunchCurrent(identity.tabId, identity.toolType,
+        { ...request, launchFence, launchIntent: agentLaunchPreparations.intentIdentity(state) }, { validateTarget: true });
+    }
+    if (state.revoked || state.finished) return agentLaunchIntentRefusal(request, state,
+      state.reason || 'agent_launch_intent_cancelled', 'intent-begin');
+    const result = { success: true, ...agentLaunchIntentTrace(request, state, 'intent-begin') };
+    console.log('[AgentLaunchIntent] acquired ' + JSON.stringify({
+      tabId: state.tabId, intentId: state.intentId, token: state.token,
+      originalFence: state.launchFence, observedFence: result.observedLaunchFence,
+      sourceSessionId: state.requestedSessionId, operationKey: state.sendOperationKey, sendAttemptId: state.sendAttemptId,
+    }));
+    return result;
+  } catch (error) {
+    try { agentLaunchPreparations.cancelIntent(identity, error?.code || error?.message || 'agent_launch_intent_failed'); }
+    catch {}
+    return agentLaunchIntentRefusal(request, state, error?.code || error?.message || 'agent_launch_intent_failed', 'intent-begin');
+  }
+}
+
+function cancelAgentLaunchIntent(event, request = {}, finish = false) {
+  const identity = { senderId: event.sender.id, tabId: String(request.tabId || ''),
+    toolType: request.toolType, intentId: request.intentId, token: request.token };
+  try {
+    if (!identity.tabId || !['claude', 'codex'].includes(identity.toolType)) throw new Error('agent_launch_intent_identity_required');
+    watchAgentLaunchIntentSender(event.sender);
+    const state = agentLaunchPreparations.cancelIntent(identity, finish ? 'agent_launch_intent_finished'
+      : String(request.reason || 'agent_launch_intent_cancelled'));
+    if (!state) return agentLaunchIntentRefusal(request, null, 'agent_launch_intent_identity_changed', 'intent-cancel');
+    return { success: true, cancelled: true, ...agentLaunchIntentTrace(request, state,
+      finish ? 'intent-finish' : 'intent-cancel'),
+      launchWritten: state.writeState === 'written' ? true : state.writeState === 'none' ? false : null };
+  } catch (error) {
+    return agentLaunchIntentRefusal(request, null, error?.message || 'agent_launch_intent_cancel_failed', 'intent-cancel');
+  }
+}
+
+function inspectAgentLaunchIntent(event, request = {}) {
+  const intent = request.launchIntent;
+  const state = agentLaunchPreparations.getIntent(intent?.token);
+  const payload = { ...request, tabId: intent?.tabId, launchAttempt: state?.attempt || 0 };
+  const refuse = code => agentLaunchIntentRefusal(payload, state, code, 'intent-source');
+  if (!state || state.senderId !== event.sender.id || state.intentId !== intent?.intentId
+    || state.tabId !== intent?.tabId || state.toolType !== intent?.toolType) return refuse('agent_launch_intent_missing');
+  if (state.revoked || state.finished) return refuse('agent_launch_intent_cancelled');
+  if (request.revoke === true) {
+    // A renderer observed a new source. Retire its old launch authority now,
+    // before proving whether it can merely wait for this already-written one.
+    agentLaunchPreparations.cancelIntent({ senderId: state.senderId, intentId: state.intentId,
+      tabId: state.tabId, toolType: state.toolType, token: state.token }, 'agent_launch_source_transition');
+  }
+  const term = terminals.get(state.tabId);
+  if (!term || terminalLifecycleEpochs.get(term) !== state.launchFence?.terminalInstanceId
+    || getTerminalStopRevision(state.tabId) !== state.launchFence.stopRevision
+    || request.launchFence?.terminalInstanceId !== state.launchFence.terminalInstanceId
+    || request.launchFence?.stopRevision !== state.launchFence.stopRevision
+    || intent.launchFence?.terminalInstanceId !== state.launchFence.terminalInstanceId
+    || intent.launchFence?.stopRevision !== state.launchFence.stopRevision) return refuse('agent_launch_cancelled');
+  try {
+    const current = readAgentLaunchIntentSource(state.tabId, state.toolType);
+    const originalSessionId = state.materializedSessionId || state.requestedSessionId || null;
+    if (request.revoke === true) {
+      const sessionId = request.sessionId;
+      const source = state.source;
+      const admittedLaunchId = state.writeLaunchId || state.result?.launchId || state.result?.launchGeneration;
+      const sameRow = current.rowId === source?.rowId && current.storedCwd === source?.storedCwd;
+      const firstOwnedRow = source?.rowId === null && current.rowId !== null && !source.sessionId
+        && current.storedCwd === source.terminalCwd;
+      if (!source || !sessionId || current.projectId !== source.projectId
+        || current.terminalCwd !== source.terminalCwd || (!sameRow && !firstOwnedRow)
+        || (current.sessionId !== source.sessionId && current.sessionId !== sessionId)) return refuse('agent_launch_intent_source_changed');
+      const actual = readAgentSendDestinationAtWriteBoundary(state.tabId, state.toolType);
+      // Another exact Resume can have won before this intent's first attempt.
+      // Its current accepted source proof allows a read-only join after revoke;
+      // a fresh/null source or a stronger prior launch pin cannot use it.
+      const launchId = admittedLaunchId || (originalSessionId
+        && actual.acceptedResumeSourceSessionId === originalSessionId ? actual.launchId : null);
+      if (!launchId || !admittedLaunchId && state.expectedTarget
+        && agentSendRequestTargetFailure(state.tabId, state.toolType,
+          { expectedTarget: state.expectedTarget }, null, { allowUnresolved: true })) return refuse('agent_launch_intent_join_unproven');
+      let exactWriter = false;
+      if (state.toolType === 'codex') {
+        const writer = getCodexWriterProofSnapshot(state.tabId);
+        exactWriter = writer?.valid === true && writer.sessionId === sessionId
+          && writer.terminalToken === term && writer.launchId === launchId
+          && writer.runSeq === Number(terminalCommandState.get(state.tabId)?.runSeq || 0)
+          && writer.lifecycleGeneration === getTerminalLifecycleGeneration(state.tabId)
+          && (actual.acceptedResumeSourceSessionId === originalSessionId
+            || !!state.materializedSessionId && writer.sourceSessionId === state.materializedSessionId);
+      } else {
+        const launch = claudeLaunchGenerationByTab.get(state.tabId), first = launch?.firstAcceptedBridge;
+        exactWriter = launch?.generation === launchId && first?.sessionId === sessionId
+          && first.generation === launchId && first.terminalToken === term
+          && first.runSeq === Number(terminalCommandState.get(state.tabId)?.runSeq || 0)
+          && first.lifecycleGeneration === getTerminalLifecycleGeneration(state.tabId)
+          && first.pid === launch.pid && first.pid === findClaudePidByTab(state.tabId)
+          && actual.sessionId === sessionId
+          && (launch.launchMode === 'fresh' || launch.launchMode === 'resume' && launch.sessionIdHint === originalSessionId);
+      }
+      if (!exactWriter || actual.terminalInstanceId !== state.launchFence.terminalInstanceId
+        || actual.launchId !== launchId) return refuse('agent_launch_intent_join_unproven');
+      const trace = agentLaunchIntentTrace(payload, state, 'intent-revoked-join');
+      return { success: true, ...trace, originalSessionId, currentSessionId: sessionId,
+        acceptedResumeSourceSessionId: actual.acceptedResumeSourceSessionId || null,
+        joined: true, joinResult: { ...state.result, ...trace, success: true, accepted: true,
+          joined: true, acceptancePending: true,
+          launchWritten: state.writeState === 'written' ? true : state.writeState === 'none' ? false : null,
+          error: null, code: null, reason: 'launch-intent-revoked-and-joined', launchId,
+          lifecycleGeneration: actual.lifecycleGeneration, sessionId } };
+    }
+    if (!agentLaunchIntentSourceCurrent(state, { current, adoptFirstRow: false })) return refuse('agent_launch_intent_source_changed');
+    const writer = readAgentSendDestinationAtWriteBoundary(state.tabId, state.toolType);
+    const launchId = state.writeLaunchId || state.result?.launchId || state.result?.launchGeneration || state.expectedTarget?.launchId;
+    const acceptedSource = originalSessionId && writer?.sessionId === current.sessionId
+      && writer?.acceptedResumeSourceSessionId === originalSessionId
+      && writer?.terminalInstanceId === state.launchFence.terminalInstanceId
+      && (!launchId || writer.launchId === launchId) ? originalSessionId : null;
+    if (current.sessionId !== originalSessionId && !acceptedSource) return refuse('agent_launch_intent_source_changed');
+    // This permits the existing Resume source -> accepted writer relationship
+    // only. It does not update the source, recapture a fence, or admit input.
+    return { success: true, ...agentLaunchIntentTrace(payload, state, 'intent-source'),
+      originalSessionId, currentSessionId: current.sessionId,
+      acceptedResumeSourceSessionId: acceptedSource };
+  } catch (error) { return refuse(error?.code || error?.message || 'agent_launch_source_unavailable'); }
+}
+
+ipcMain.handle('agent:begin-launch-intent', beginAgentLaunchIntent);
+ipcMain.handle('agent:cancel-launch-intent', (event, request) => cancelAgentLaunchIntent(event, request));
+ipcMain.handle('agent:finish-launch-intent', (event, request) => cancelAgentLaunchIntent(event, request, true));
+ipcMain.handle('agent:inspect-launch-intent', inspectAgentLaunchIntent);
+
 ipcMain.handle('agent:get-launch-preparation-state', (_event, tabId) => ({
   success: true,
   state: agentLaunchPreparations.get(String(tabId || '')),
+  launchFence: captureAgentLaunchFence(String(tabId || '')),
 }));
 
 ipcMain.handle('agent:clear-launch-preparation-state', (_event, payload = {}) => {
@@ -41785,16 +42557,22 @@ ipcMain.handle('project:save-actions', (event, { projectId, actions }) => {
 // Codex session identity has a point-write ownership path. Renderer calls this
 // before its generic workspace save so the latter can safely preserve the
 // already-committed DB value instead of treating a cached snapshot as truth.
-ipcMain.handle('codex:materialize-empty-session', async (_event, {
-  projectId,
-  tabId,
-  cwd,
-} = {}) => {
+ipcMain.handle('codex:materialize-empty-session', async (_event, request = {}) => {
+  request = withAgentLaunchFence(request.tabId, request);
+  const { projectId, tabId, cwd } = request;
+  if (request.launchIntent !== undefined
+    && agentLaunchPreparations.getIntent(request.launchIntent?.token)?.senderId !== _event.sender.id) {
+    return agentLaunchIntentRefusal(request, null, 'agent_launch_intent_missing', 'materialization');
+  }
   if (!projectId || !tabId) {
-    return { success: false, error: 'codex_empty_session_identity_required' };
+    return agentLaunchMaterializationResult(request, { success: false, error: 'codex_empty_session_identity_required' });
   }
   return runKeyedExclusive(codexLaunchInflight, tabId, async () => (
     runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+      const expectedTerminal = terminals.get(tabId);
+      const assertCurrent = () => assertAgentSendLaunchCurrent(tabId, 'codex', request,
+        { validateTarget: true, expectedTerminal });
+      assertCurrent();
       const resolvedProjectId = resolveAuthoritativeTabProjectId(tabId, projectId);
       if (resolvedProjectId !== projectId) {
         return { success: false, error: 'codex_tab_project_mismatch' };
@@ -41805,6 +42583,7 @@ ipcMain.handle('codex:materialize-empty-session', async (_event, {
         expectedProcess: 'codex',
         allowProcessTreeLookup: true,
       });
+      assertCurrent();
       if (commandState?.processLookupUnknown) {
         return { success: false, error: 'codex_process_state_unknown' };
       }
@@ -41836,12 +42615,16 @@ ipcMain.handle('codex:materialize-empty-session', async (_event, {
           currentSessionId,
           exactCwd,
         );
+        assertCurrent();
         const materialization = loaded?.success
           ? codexDataModule._api.inspectConversationMaterialization(
             loaded.records,
             currentSessionId,
           )
           : null;
+        if (!adoptAgentLaunchMaterializedSource(request, currentSessionId)) {
+          return { success: false, error: 'agent_launch_materialization_adoption_lost', sessionId: currentSessionId };
+        }
         return {
           success: true,
           created: false,
@@ -41856,8 +42639,13 @@ ipcMain.handle('codex:materialize-empty-session', async (_event, {
         return { success: false, error: 'codex_empty_session_api_unavailable' };
       }
       let created = null;
+      let materializationCommitted = false;
       try {
         created = await materialize({ cwd: exactCwd });
+        // No await between this cancellation check and the existing owner CAS.
+        // Do not throw a cancellation after a successful CAS: catch unlinks
+        // created.filePath and must never delete an already-bound session.
+        assertCurrent();
         const committed = projectManager.db.compareAndSetTabCodexSessionId(
           projectId,
           tabId,
@@ -41872,6 +42660,12 @@ ipcMain.handle('codex:materialize-empty-session', async (_event, {
             error: 'codex_session_compare_and_set_conflict',
             currentSessionId: projectManager.db.getTabCodexSessionId(projectId, tabId),
           };
+        }
+        materializationCommitted = true;
+        // The CAS is now the owner. No later bookkeeping failure may unlink
+        // this bound file; adoption never changes the original launch fence.
+        if (!adoptAgentLaunchMaterializedSource(request, created.sessionId)) {
+          return { success: false, error: 'agent_launch_materialization_adoption_lost', sessionId: created.sessionId };
         }
         console.log('[CodexMaterialize] empty session created tab=' + String(tabId).slice(-12)
           + ' session=' + String(created.sessionId).slice(0, 8)
@@ -41891,14 +42685,19 @@ ipcMain.handle('codex:materialize-empty-session', async (_event, {
           metadataOnly: true,
         };
       } catch (error) {
-        if (created?.filePath) {
+        if (created?.filePath && !materializationCommitted) {
           await fs.promises.unlink(created.filePath).catch(() => null);
           codexDataModule._api.invalidateJsonlCache?.(created.filePath);
         }
+        if (error?.sendLaunchRefusal) return error.sendLaunchRefusal;
         return { success: false, error: error?.message || String(error) };
       }
     })
-  ));
+  )).catch(error => {
+    if (request.launchIntent === undefined) return returnAgentSendLaunchRefusal(error);
+    return error?.sendLaunchRefusal || { success: false,
+      error: error?.message || String(error), code: error?.code || 'agent_launch_materialization_failed' };
+  }).then(result => agentLaunchMaterializationResult(request, result));
 });
 
 ipcMain.handle('tab:set-codex-session-id', async (_event, {
@@ -44691,8 +45490,16 @@ ipcMain.handle('system:detect-project-ports', async (event, cwd) => {
 
 require(path.join(srcMainDir, 'history-preparation-activity')).installHistoryPreparationIpc({ ipcMain });
 
-const disposeDiskCapacityIpc = require(path.join(srcMainDir, 'disk-capacity-service')).installDiskCapacityIpc({
-  ipcMain, cacheDirectory: path.join(app.getPath('userData'), 'history-prepared-cache'),
+const { createDiskCapacityService, installDiskCapacityIpc } = require(path.join(srcMainDir, 'disk-capacity-service'));
+const { historyCacheRamSnapshot } = require(path.join(srcMainDir, 'history-cache-memory'));
+const disposeDiskCapacityIpc = installDiskCapacityIpc({
+  ipcMain, service: createDiskCapacityService({
+    cacheDirectory: path.join(app.getPath('userData'), 'history-prepared-cache'),
+    budgetBytes: historyDiskBudgetForBoot,
+    getRamUsage: () => historyCacheRamSnapshot(
+      codexDataModule._api.getCodexHistoryProjectorStats(), historyReadClient.getCacheMemorySnapshot(),
+      historyReadBudget.mainGraphBytes + historyReadBudget.workerGraphBytes + historyReadBudget.indexBytes),
+  }),
 });
 app.once('will-quit', disposeDiskCapacityIpc);
 
@@ -45247,6 +46054,10 @@ function validateOrchestrationAutoStopGuard(authority, observedIdentity) {
     if (!validation?.valid) {
       return { allowed: false, reason: validation?.reason || 'auto-stop-claim-invalid' };
     }
+    const target = validation.run?.targetTabId;
+    if (target && getCodexPublicRuntimeProjection(target)?.goalWork?.pending === true) {
+      return { allowed: false, reason: 'target-goal-activity-pending' };
+    }
     const comparison = compareAiLifecycleIdentity(
       validation.expectedTargetIdentity,
       observedIdentity,
@@ -45261,6 +46072,52 @@ function validateOrchestrationAutoStopGuard(authority, observedIdentity) {
       reason: 'auto-stop-authority-check-failed:' + (error?.message || String(error)),
     };
   }
+}
+
+async function observePendingAgentLaunchForStop(tabId, term, pending) {
+  const stopRevision = getTerminalStopRevision(tabId);
+  const mirror = captureAgentInputIdentity(tabId, term).mirrorToken;
+  const observation = createAgentInputObservation({
+    timeoutMs: 5000, // failure deadline only; never a stopped/empty proof
+    isCurrent: () => terminals.get(tabId) === term && getTerminalStopRevision(tabId) === stopRevision
+      && (!terminalShellReadiness.snapshot(tabId, term).pendingAgentLaunch
+        || terminalShellReadiness.snapshot(tabId, term).pendingAgentLaunch.writeId === pending.writeId),
+    subscribe(wake) {
+      const onChange = (_event, change) => { if (change?.tabId === tabId) wake(); };
+      const onPrompt = (_event, id) => { if (id === tabId) wake(); };
+      const onFrame = () => wake();
+      mirror?.synchronizedFrameWaiters?.add(onFrame);
+      ipcMain.on('terminal:command-boundary-internal', onChange);
+      ipcMain.on('terminal:prompt-ready-internal', onPrompt);
+      ipcMain.on('agent:readiness-changed-internal', onChange);
+      ipcMain.on('agent:tui-ready-internal', onChange);
+      ipcMain.on('agent:input-owner-changed-internal', onChange);
+      return () => {
+        mirror?.synchronizedFrameWaiters?.delete(onFrame);
+        ipcMain.removeListener('terminal:command-boundary-internal', onChange);
+        ipcMain.removeListener('terminal:prompt-ready-internal', onPrompt);
+        ipcMain.removeListener('agent:readiness-changed-internal', onChange);
+        ipcMain.removeListener('agent:tui-ready-internal', onChange);
+        ipcMain.removeListener('agent:input-owner-changed-internal', onChange);
+      };
+    },
+  });
+  return observeAgentInput({ observation,
+    probe: async () => {
+      const before = terminalShellReadiness.snapshot(tabId, term).pendingAgentLaunch;
+      let snapshot = null;
+      const lookup = await inspectAiDescendantProcessesByTab(tabId, null, {
+        forceFresh: true, onSnapshot: value => { snapshot = value; },
+      });
+      const after = terminalShellReadiness.snapshot(tabId, term).pendingAgentLaunch;
+      // A D that arrived during ps cannot make its earlier ABSENT snapshot a
+      // post-command proof. The already-recorded wake causes one fresh read.
+      return { lookup, snapshot, pending: !!after || before?.writeId !== after?.writeId };
+    },
+    isSettled: value => value.lookup.status !== AI_PROCESS_LOOKUP_STATUS.UNKNOWN
+      && (value.lookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND || !value.pending),
+    shouldWait: value => value.lookup.status === AI_PROCESS_LOOKUP_STATUS.ABSENT && value.pending,
+  });
 }
 
 async function stopAiProcessInTab(tabId, options = {}) {
@@ -45292,6 +46149,9 @@ async function stopAiProcessInTab(tabId, options = {}) {
     // A rejected workflow observation has not acquired this live owner. Do not
     // cancel its Send/compact or restore/clear a replacement's runtime state.
     if (!stopAdmitted) return result;
+    if (result?.success === true && result?.noProcess !== true) {
+      terminalShellReadiness.finishAgentLaunch(tabId, term, true);
+    }
     const resolvedToolType = resolveAiToolTypeForTab(
       tabId,
       result?.processName || requestedToolType,
@@ -45336,12 +46196,27 @@ async function stopAiProcessInTab(tabId, options = {}) {
   let processName = requestedToolType || null;
   let stopProcessTreeSnapshot = null;
   let stopScope = null;
-  const aiProcessLookup = await inspectAiDescendantProcessesByTab(tabId, null, {
+  let aiProcessLookup = await inspectAiDescendantProcessesByTab(tabId, null, {
     forceFresh: true,
     onSnapshot: (snapshot) => {
       stopProcessTreeSnapshot = snapshot;
     },
   });
+  const writtenLaunch = terminalShellReadiness.snapshot(tabId, term).pendingAgentLaunch;
+  if (aiProcessLookup.status === AI_PROCESS_LOOKUP_STATUS.ABSENT && writtenLaunch) {
+    const observed = await observePendingAgentLaunchForStop(tabId, term, writtenLaunch);
+    if (!observed.value) {
+      const failure = { success: false, stopped: false,
+        code: 'agent_launch_stop_unconfirmed', error: 'agent_launch_stop_unconfirmed',
+        processName: writtenLaunch.toolType, launchWritten: true, processOutcomeUnknown: true,
+        observation: observed.observation, reason: observed.reason };
+      // This extra await must not clean up a newer terminal/Stop owner.
+      if (observed.reason === 'owner-changed') return failure;
+      return finishStop(failure, false);
+    }
+    aiProcessLookup = observed.value.lookup;
+    stopProcessTreeSnapshot = observed.value.snapshot;
+  }
   const stopCandidate = aiProcessLookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND
     ? selectAiProcessForStop(aiProcessLookup.matches)
     : null;
@@ -45506,6 +46381,18 @@ async function stopAiProcessInTab(tabId, options = {}) {
           guardReason: guardDecision.reason || null,
         }, false);
       }
+    }
+    const pendingLaunch = terminalShellReadiness.snapshot(tabId, term).pendingAgentLaunch;
+    if (pendingLaunch) {
+      // Already-written shell input is not a cancellable preparation. Do not
+      // invent a stopped process or send Ctrl+C into an unproven current TUI.
+      // Existing OSC/process events retain runtime ownership; future Send
+      // writes were revoked independently by the durable Stop cancellation.
+      console.warn('[StopAI] written launch remains unconfirmed tab=' + String(tabId).slice(-12)
+        + ' launch=' + (pendingLaunch.launchId || '-') + ' childLookup=absent');
+      return finishStop({ success: false, stopped: false, processName: pendingLaunch.toolType,
+        code: 'agent_launch_stop_unconfirmed', error: 'agent_launch_stop_unconfirmed',
+        launchWritten: true, processOutcomeUnknown: true }, false);
     }
     admitStop();
     if (isCodexRuntime) retireAgentInputCaptureForProcess(tabId, 'codex', 'stop-no-process:' + stopReason);
@@ -45929,6 +46816,21 @@ async function stopAiProcessInTab(tabId, options = {}) {
 
 async function stopAiProcessInTabSerialized(tabId, options = {}) {
   if (!tabId) return { success: false, error: 'tabId required' };
+  // Manual Stop revokes preparations synchronously, before waiting behind a
+  // launch in this SAME lifecycle owner. Guarded workflow/auto-stop callers
+  // still admit inside their existing pre-signal guard; they cannot revoke a
+  // replacement merely by entering this queue.
+  if (!options.preSignalGuard && /^(manual|history-stop|queued-stop)/.test(options.reason || 'manual-stop')) {
+    const term = terminals.get(tabId);
+    if (term) {
+      terminalStopRevisions.set(term, getTerminalStopRevision(tabId) + 1);
+      broadcastAgentLaunchFenceRevoked(tabId, 'stop-requested:' + (options.reason || 'manual-stop'));
+    }
+    try { ipcMain.emit('agent:input-owner-changed-internal', null, { tabId, reason: 'process-stopping' }); }
+    catch (error) { console.warn('[AgentLaunchPreparation] Stop observer failed:', error?.message || error); }
+    console.log('[AgentLaunchPreparation] stop-fence tab=' + String(tabId).slice(-12)
+      + ' revision=' + getTerminalStopRevision(tabId));
+  }
   return runKeyedExclusive(aiLifecycleActionInflight, tabId, () => (
     stopAiProcessInTab(tabId, options)
   ));
@@ -46038,9 +46940,12 @@ function validateClaudeSavedHistoryLaunch(payload, phase, detail = {}) {
 async function writeClaudeSavedHistoryResume(term, payload, command, expectedRunSeq, sendExpected = null) {
   const tabId = payload.tabId;
   return withPtyWriteLock(term, async () => {
+    assertAgentSendLaunchCurrent(tabId, 'claude', payload, { validateTarget: true, expectedTerminal: term });
     const boundary = await proveIdleShellForAgentLaunch(tabId, 'claude', { expectedTerm: term, expectedRunSeq });
+    assertAgentSendLaunchCurrent(tabId, 'claude', payload, { validateTarget: true, expectedTerminal: term });
     if (!boundary.allowed) return { success: false, accepted: false, launchWritten: false,
-      error: agentShellLaunchError(boundary, 'claude_already_running') };
+      error: agentShellLaunchError(boundary, 'claude_already_running'), reason: boundary.reason,
+      lookupUnknown: boundary.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN };
     if (sendExpected) conversationOwners.beforeLaunch(tabId, sendExpected, payload);
     else validateClaudeSavedHistoryLaunch(payload, 'claim');
     if (!sendExpected && !markClaudePendingJsonlOwner(payload.sessionId, tabId, 'saved-history-resume')) {
@@ -46066,7 +46971,9 @@ async function writeClaudeSavedHistoryResume(term, payload, command, expectedRun
       // its newly reserved command generation. There is no asynchronous gap.
       const admission = { ...boundary, shellWriteProof: { ...boundary.shellWriteProof,
         runSeq: launchRunSeq, lifecycleGeneration: getTerminalLifecycleGeneration(tabId) } };
-      writeAgentLaunchCommandToIdleShell(term, { tabId, toolType: 'claude', command, launchId, admission });
+      writeAgentLaunchCommandToIdleShell(term, {
+        tabId, toolType: 'claude', command, launchId, admission, sendLaunchRequest: payload,
+      });
       written = true;
       if (sendExpected) conversationOwners.launchWritten(tabId, sendExpected, payload, captureConversationOwner(tabId));
       markClaudeShellLaunchStarted(tabId, payload.sessionId, 'claude-run-command-resume', { preclaimedLaunchId: launchId });
@@ -46087,24 +46994,137 @@ async function writeClaudeSavedHistoryResume(term, payload, command, expectedRun
   }, { kind: 'claude-saved-history-resume', tabId, submitted: false, manualInputYields: false });
 }
 
+// Optional request extension for exact pre-ACK project Sends. This is NOT an
+// owner CAS for process Stop: the legacy empty request still stops the tab.
+function prepareStopPendingSends(payload) {
+  const intents = payload.pendingSends === undefined ? [] : payload.pendingSends;
+  const fail = (code, httpStatus = 409) => ({ ok: false, code, httpStatus });
+  if (!Array.isArray(intents)) return fail('invalid-stop-pending-sends', 400);
+  const seen = new Set(), inputs = [];
+  for (const intent of intents) {
+    if (!intent || Array.isArray(intent) || typeof intent !== 'object'
+      || Object.keys(intent).some(key => !['operationKey', 'handoffId', 'provider', 'attemptId'].includes(key))
+      || typeof intent.handoffId !== 'string' || !intent.handoffId || intent.handoffId.trim() !== intent.handoffId
+      || intent.handoffId.length > 2048 || typeof intent.operationKey !== 'string'
+      || intent.operationKey !== `project:${payload.tabId}:${intent.handoffId}`
+      || !['claude', 'codex'].includes(intent.provider)
+      || intent.attemptId != null && (typeof intent.attemptId !== 'string' || !intent.attemptId
+        || intent.attemptId.trim() !== intent.attemptId || intent.attemptId.length > 2048)
+      || seen.has(intent.operationKey)) return fail('invalid-stop-pending-send-identity', 400);
+    seen.add(intent.operationKey);
+    if (!agentSendReceiptStore) return fail('agent_send_receipt_store_unavailable', 503);
+    const record = agentSendReceiptStore.get(intent.operationKey);
+    if (record && (record.surface !== 'project-api' || record.tabId !== payload.tabId
+      || record.handoffId !== intent.handoffId || record.provider !== intent.provider
+      || intent.attemptId != null && intent.attemptId !== record.attemptId)) {
+      return fail('agent_stop_pending_send_changed');
+    }
+    // No ACK means the caller knows the immutable operation, not Main's UUID.
+    // Explicit attempts are exact. New explicit Sends must use a new handoff.
+    const input = { operationKey: intent.operationKey, tabId: payload.tabId,
+      handoffId: intent.handoffId, provider: intent.provider,
+      attemptId: record ? record.attemptId : intent.attemptId || null,
+      allowUnreserved: true, reason: 'manual-stop', presentationDismissed: false };
+    const validation = agentSendReceiptStore.validateDeliveryCancellation(input);
+    if (!validation.ok) return fail(validation.reason || 'agent_stop_pending_send_changed');
+    inputs.push(input);
+  }
+  return { ok: true, inputs };
+}
+
 async function stopAgentProcessScenarioInMain(request) {
   const payload = request && typeof request === 'object' ? request : { tabId: request };
   const authority = payload.authority && typeof payload.authority === 'object'
     ? payload.authority
     : null;
-  if (!authority && (!payload.reason || /^(manual|history-stop|queued-stop)/.test(payload.reason))) {
-    require(path.join(srcMainDir, 'web-server')).cancelQueuedAgentSends(payload.tabId, null, { stop: true });
+  const manualStop = !authority && (!payload.reason || /^(manual|history-stop|queued-stop)/.test(payload.reason));
+  const web = require(path.join(srcMainDir, 'web-server'));
+  let prepared;
+  try {
+    // Empty/absent lists preserve legacy process Stop in isolated hosts. A
+    // nonempty extension requires the exact admission capability end-to-end.
+    prepared = Array.isArray(payload.pendingSends) && payload.pendingSends.length > 0
+      && !web.sendIntentCancellationAvailable()
+      ? { ok: false, code: 'agent_stop_cancellation_unavailable', httpStatus: 503 }
+      : prepareStopPendingSends(payload);
+    if (!manualStop && prepared.inputs?.length) prepared = { ok: false,
+      code: 'pending-send-cancellation-requires-manual-stop', httpStatus: 409 };
+  } catch (error) {
+    prepared = { ok: false, code: error.code || 'agent_stop_cancellation_read_failed', httpStatus: 503 };
   }
-  return stopAiProcessInTabSerialized(payload.tabId, {
-    toolType: payload.toolType || null,
-    reason: payload.reason || 'manual-stop',
-    captureCodexRestartSettings: payload.captureCodexRestartSettings === true,
-    preSignalGuard: authority?.kind === 'orchestration-auto-stop'
-      ? (observedIdentity) => validateOrchestrationAutoStopGuard(authority, observedIdentity)
-      : authority?.kind === 'saved-history'
-        ? () => require(path.join(srcMainDir, 'web-server')).validateSavedHistoryStop({ ...authority, tabId: payload.tabId })
-      : undefined,
-  });
+  // Reject the whole supplied capability set BEFORE any tab-wide FIFO cancel
+  // or physical process action. A malformed/stale tuple cannot cancel peers.
+  if (!prepared.ok) return { success: false, stopped: false, code: prepared.code,
+    httpStatus: prepared.httpStatus, processStop: { attempted: false, stopped: false },
+    sendCancellation: { version: 1, complete: false, requested: payload.pendingSends?.length || 0, results: [] } };
+
+  const results = [];
+  // No await between preflight and these existing durable owner writes. A
+  // queued/later HTTP admission consults these same immutable cancellation keys.
+  for (const input of prepared.inputs) {
+    let durable;
+    try { durable = agentSendReceiptStore.cancelDelivery(input); }
+    catch (error) {
+      results.push({ operationKey: input.operationKey, tabId: input.tabId, handoffId: input.handoffId,
+        provider: input.provider, durable: false, complete: false,
+        code: error.code || 'agent_stop_cancellation_write_failed' });
+      continue;
+    }
+    if (!durable.ok) {
+      results.push({ operationKey: input.operationKey, tabId: input.tabId, handoffId: input.handoffId,
+        provider: input.provider, durable: false, complete: false, code: durable.reason });
+      continue;
+    }
+    const control = durable.record?.deliveryControl || durable.control;
+    const result = { operationKey: input.operationKey, tabId: input.tabId, handoffId: input.handoffId,
+      provider: input.provider, attemptId: durable.record?.attemptId || control?.attemptId || null,
+      durable: true, complete: true, deliveryIntentCancelled: true, deliveryControl: control,
+      deliveryOutcome: durable.record?.state || 'delivery-unknown',
+      receiptAvailable: !!durable.record, idempotent: durable.idempotent === true };
+    try {
+      if (durable.record) {
+        agentSendCancellations.cancel(input.tabId, input.handoffId, { attemptId: durable.record.attemptId || null });
+        result.receipt = web.publicAgentSendReceipt(durable.record);
+      }
+    } catch (error) {
+      result.complete = false;
+      result.code = error.code || 'agent_stop_cancellation_projection_failed';
+    }
+    results.push(result);
+  }
+  let applicationQueue = { cancelled: false, count: 0, complete: true, results: [] };
+  if (manualStop) {
+    try { applicationQueue = web.cancelQueuedAgentSends(payload.tabId, null, { stop: true }); }
+    catch (error) { applicationQueue = { cancelled: false, count: 0, complete: false, results: [],
+      code: error.code || 'agent_stop_queue_cancellation_failed' }; }
+  }
+  const sendCancellation = { version: 1, available: web.sendIntentCancellationAvailable(),
+    requested: prepared.inputs.length, results, applicationQueue,
+    complete: results.every(result => result.complete === true) && applicationQueue.complete === true };
+  let processResult;
+  try {
+    processResult = await stopAiProcessInTabSerialized(payload.tabId, {
+      toolType: payload.toolType || null,
+      reason: payload.reason || 'manual-stop',
+      captureCodexRestartSettings: payload.captureCodexRestartSettings === true,
+      preSignalGuard: authority?.kind === 'orchestration-auto-stop'
+        ? (observedIdentity) => validateOrchestrationAutoStopGuard(authority, observedIdentity)
+        : authority?.kind === 'saved-history'
+          ? () => web.validateSavedHistoryStop({ ...authority, tabId: payload.tabId })
+        : undefined,
+    });
+  } catch (error) { processResult = { success: false, error: error.message,
+    code: error.code || 'agent_process_stop_failed' }; }
+  const processStop = { ...processResult, attempted: true, stopped: processResult?.success === true };
+  console.log('[AgentStopCancellation] tab=' + String(payload.tabId).slice(-12)
+    + ' requested=' + sendCancellation.requested + ' complete=' + sendCancellation.complete
+    + ' processStopped=' + processStop.stopped + ' processCode=' + (processResult.code || processResult.error || '-')
+    + ' results=' + JSON.stringify(results.map(result => ({ operationKey: result.operationKey,
+      attemptId: result.attemptId || null, durable: result.durable, complete: result.complete,
+      code: result.code || null }))));
+  return { ...processResult, stopped: processStop.stopped, processStop, sendCancellation,
+    success: processStop.stopped && sendCancellation.complete,
+    ...(!sendCancellation.complete ? { code: 'agent_stop_cancellation_incomplete', httpStatus: 503 } : {}) };
 }
 
 ipcMain.handle('terminal:stop-ai-process', (_event, request) => stopAgentProcessScenarioInMain(request));
@@ -46139,6 +47159,11 @@ function readWorkflowSessionBusy(tabId, owner, captured = null) {
       || owner.token.channel.pendingCount() > 0 };
   }
   if (owner.kind === 'terminal') return { known: true, busy: aiStoppingTabs.has(tabId) };
+  // A native Goal continuation is pending work, not an idle Stop window.
+  // Explicit all/live Stop remains independent of this idle-only predicate.
+  if (owner.toolType === 'codex' && getCodexPublicRuntimeProjection(tabId)?.goalWork?.pending === true) {
+    return { known: true, busy: true };
+  }
   const activity = captured ? captured.activities.get(tabId)
     : computeProjectActivity().projects.flatMap(project => project.tabs).find(tab => tab.tabId === tabId);
   if (!activity) return { known: false };
@@ -48557,6 +49582,7 @@ function settleStoppedCodexMcpStartupReplacement(
 }
 
 async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
+  const restartFence = captureAgentLaunchFence(tabId);
   const current = codexMcpStartupWatchdogs.get(tabId);
   if (!current || current !== state || current.mcpStartupRestarting) return;
   if (codexTuiReadyTabs.has(tabId)) {
@@ -48672,6 +49698,7 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
   try {
     transaction = await runKeyedExclusive(codexLaunchInflight, tabId, async () => (
       runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+        assertAgentSendLaunchCurrent(tabId, 'codex', { launchFence: restartFence });
         if (codexMcpStartupWatchdogs.get(tabId) !== state) {
           return { stage: 'stale-before-stop', reason: 'watchdog-generation-changed' };
         }
@@ -48691,6 +49718,7 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
           preservePublicLifecycle: true,
           retainStoppingState: true,
           preSignalGuard: () => {
+            assertAgentSendLaunchCurrent(tabId, 'codex', { launchFence: restartFence });
             const latestState = codexMcpStartupWatchdogs.get(tabId);
             const latestPayload = codexLastRunCommandPayload.get(tabId);
             const mirror = getHeadlessTerminalMirror(tabId);
@@ -48773,6 +49801,9 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
         }
 
         handoff.stoppingState = aiStoppingTabs.get(tabId) || null;
+        // Adopt only this accepted internal Stop's fence, not a fresh one
+        // after an intervening manual Stop during process-exit observation.
+        const replacementFence = handoff.stoppingState?.launchFence || null;
         handoff.stopAbsenceProven = true;
         handoff.phase = 'stopped';
         const stoppedIdentity = await readAiLifecycleIdentityForTab(tabId, 'codex');
@@ -48811,6 +49842,7 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
           : payload.sender;
         const restartResult = await runCodexCommandWithinLifecycle(sender, {
           ...payload,
+          launchFence: replacementFence,
           launchId: undefined,
           mcpStartupRestartAttempts: attempt,
           restartReason: 'mcp-startup-watchdog',
@@ -49667,6 +50699,7 @@ function applyCodexWatcherOutcome(state, outcome, timestamp, turnId = null, fall
     state.lastOutcomeTs = null;
     state.lastOutcomeHasFinalResult = null;
     state.lastOutcomeTurnId = null;
+    state.lastOutcomeGoalWork = null;
     return;
   }
   state.outcomeKnown = true;
@@ -49674,6 +50707,7 @@ function applyCodexWatcherOutcome(state, outcome, timestamp, turnId = null, fall
   state.lastOutcomeTs = codexOutcomeTimestampMs(timestamp, fallbackTimestamp);
   state.lastOutcomeHasFinalResult = outcome.hasFinalResult === true;
   state.lastOutcomeTurnId = turnId || outcome.turnId || null;
+  state.lastOutcomeGoalWork = outcome.goalWork || null;
   if (outcome.completionKind === 'compact' && outcome.reason === 'task_complete') {
     state.lastSuccessfulCompactOutcome = {
       generation: state.processGeneration,
@@ -49816,6 +50850,7 @@ function codexTurnStateSnapshot(state) {
     success: true,
     hasWatcher: true,
     busy: state.busy === true,
+    goalWork: state.lastOutcomeGoalWork || null,
     sessionId: state.sessionId || null,
     lastEventType: state.lastEventType || null,
     lastEventTs: state.lastEventTs || null,
@@ -49985,6 +51020,7 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
     turnStartedAt: taskTurnSnapshot?.startedAt || null,
     backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId),
     ...getCodexPublicWriterFields(tabId),
+    goalWork: state?.lastOutcomeGoalWork || null,
   });
   if (!busy) {
     _webBroadcast(tabId, {
@@ -50000,6 +51036,7 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
       turnGeneration: taskTurnSnapshot?.generation || null,
       turnStartedAt: taskTurnSnapshot?.startedAt || null,
       backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId),
+      goalWork: state?.lastOutcomeGoalWork || null,
     });
   }
 }
@@ -52043,7 +53080,7 @@ function processCodexUserMessagePasteAudit(state, record) {
       presentation: { text: presentationText, hash: presentationHash, snapshot: matchedAudit.presentationSnapshot },
       expectedLen: matchedAudit.expectedLen,
       expectedHash: matchedAudit.expectedHash,
-      queuedAtSubmit: matchedAudit.queuedAtSubmit === true,
+      ...(typeof matchedAudit.queuedAtSubmit === 'boolean' ? { queuedAtSubmit: matchedAudit.queuedAtSubmit } : {}),
     });
     if (finished === false) return false;
     const result = {
@@ -53477,10 +54514,10 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
   }
 }
 
-function inferCodexBusyFromText(text) {
+function inferCodexBusyFromText(text, sessionId = null) {
   const outcomes = { latest: null, lastAbnormal: null };
   let lastTokenInfo = null;
-  const tracker = {};
+  const tracker = { sessionId };
   const lines = String(text || '').split('\n');
   for (const line of lines) {
     const trimmed = String(line || '').trim();
@@ -53540,7 +54577,7 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, {
       text = firstNewline >= 0 ? text.slice(firstNewline + 1) : '';
     }
 
-    const { inferred, lastAbnormal, lastTokenInfo } = inferCodexBusyFromText(text);
+    const { inferred, lastAbnormal, lastTokenInfo } = inferCodexBusyFromText(text, codexTurnWatchers.get(tabId)?.sessionId);
     const state = codexTurnWatchers.get(tabId);
     if (
       !state
@@ -53629,6 +54666,7 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, {
         type: 'done',
         sessionId: state.sessionId || getCodexRuntimeSessionId(tabId),
         reason: inferred.reason,
+        goalWork: inferred.goalWork || null,
       });
     }
   } catch (e) {
@@ -53867,6 +54905,11 @@ function startCodexTurnWatcher({
   manualBindingConflict = null,
 }) {
   if (!tabId || !sessionId || !filePath) return false;
+  // The process/lsof proof already canonicalizes this path. Use that same
+  // physical identity when the source watcher is first attached: /var and
+  // /private/var (or another symlink) must not replace it and lose its launch,
+  // held byte range or deferred proof release during source adoption.
+  filePath = canonicalizeExistingPath(filePath);
   const existing = codexTurnWatchers.get(tabId);
   if (existing?.sessionId === sessionId && existing?.filePath === filePath) return true;
   const inheritedBusy = linkedHandoff && existing?.busy === true;
@@ -57890,6 +58933,7 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     hasWatcher: turnState.hasWatcher === true,
     catchUpPending: turnState.catchUpPending === true,
     outcomeKnown: turnState.outcomeKnown === true,
+    goalWork: turnState.goalWork || null,
     lastOutcomeReason: turnState.lastOutcomeReason || null,
     turnSessionId: turn?.sessionId || null,
     knownSessionId,
@@ -64952,26 +65996,35 @@ ipcMain.on('gemini:send-command', (event, tabId, command) => {
 // ========== CODEX INPUT INTERCEPTION ==========
 
 async function runCodexCommandAfterLifecycleAdmission(sender, payload = {}) {
+  // This proof is produced below, never accepted from an IPC caller.
+  if (payload.contextForkBinding) payload = { ...payload, contextForkBinding: undefined };
   const tabId = payload?.tabId;
   if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
   const preparation = agentLaunchPreparations.begin({
     tabId,
     toolType: 'codex',
-    sessionId: payload?.sessionId || null,
+    sessionId: payload.contextFork ? null : payload?.sessionId || null,
     command: payload?.command || null,
     phase: 'proving-shell',
     reason: payload?.sessionId ? 'resume-requested' : 'launch-requested',
   });
+  const expectedTerminal = terminals.get(tabId);
+  const assertCurrent = (validateTarget = false) => assertAgentSendLaunchCurrent(
+    tabId, 'codex', payload, { validateTarget, expectedTerminal, preparationToken: preparation.token });
   let result = null;
   try {
-    result = await runCodexCommandFromPayloadInner(sender, payload);
-    return result;
+    assertCurrent(true);
+    if (payload.contextFork) payload = await prepareTabContextForkLaunch(payload, 'codex', assertCurrent, preparation);
+    result = await runCodexCommandFromPayloadInner(sender, payload, assertCurrent);
+    return payload.contextForkBinding ? { ...result, contextForkBinding: payload.contextForkBinding } : result;
   } catch (error) {
     result = {
       success: false,
       accepted: false,
       error: error?.message || String(error),
     };
+    if (payload.contextForkBinding) return { ...(error?.sendLaunchRefusal || result),
+      contextForkBinding: payload.contextForkBinding };
     throw error;
   } finally {
     agentLaunchPreparations.finish(
@@ -65012,7 +66065,11 @@ function reuseCurrentCodexResumeLaunch(payload) {
 async function runCodexCommandWithinLifecycle(sender, payload = {}) {
   const tabId = payload?.tabId;
   if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
+  payload = withAgentLaunchFence(tabId, payload);
+  const expectedTerminal = terminals.get(tabId);
+  assertAgentSendLaunchCurrent(tabId, 'codex', payload, { validateTarget: true, expectedTerminal });
   const lifecycleAdmission = await admitAiLifecycleLaunch(tabId, payload);
+  assertAgentSendLaunchCurrent(tabId, 'codex', payload, { validateTarget: true, expectedTerminal });
   if (lifecycleAdmission?.allowed !== true) {
     console.warn('[AILifecycle] Codex launch suppressed tab=' + String(tabId).slice(-12)
       + ' source=' + (lifecycleAdmission?.source || '-')
@@ -65043,15 +66100,17 @@ async function runCodexCommandWithinLifecycle(sender, payload = {}) {
 
 async function runCodexCommandFromPayload(sender, payload = {}) {
   const tabId = payload?.tabId;
-  if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
-  return await runKeyedExclusive(codexLaunchInflight, tabId, async () => {
+  if (!tabId) return payload?.launchIntent === undefined ? { success: false, accepted: false, error: 'tabId required' }
+    : agentLaunchIntentRefusal(payload, null, 'agent_launch_intent_identity_required');
+  payload = withAgentLaunchFence(tabId, payload);
+  return runAgentLaunchIntentAttempt(sender, payload, () => runKeyedExclusive(codexLaunchInflight, tabId, async () => {
     return await runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
       return await runCodexCommandWithinLifecycle(sender, payload);
     });
-  });
+  }).catch(returnAgentSendLaunchRefusal));
 }
 
-async function runCodexCommandFromPayloadInner(sender, payload = {}) {
+async function runCodexCommandFromPayloadInner(sender, payload = {}, assertCurrent = () => {}) {
   const {
     tabId,
     command,
@@ -65158,6 +66217,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       success: false,
       accepted: false,
       error: agentShellLaunchError(preLaunchAdmission, 'codex_already_running'),
+      launchWritten: false,
       lookupUnknown,
       reason: preLaunchAdmission.reason,
       tabId,
@@ -65425,6 +66485,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   const mcpStartupRestartAttempts = Number(payload.mcpStartupRestartAttempts) || 0;
   // Source settings/materialization reads are preparation, not launch time.
   // The timestamp is rebased once more at the exact PTY write boundary below.
+  assertCurrent(true);
   let startedAt = Date.now();
   const launchId = payload.launchId || ('codex-' + Date.now() + '-' + (++codexLaunchSeq));
   if (payload.historyOperation) {
@@ -65709,6 +66770,9 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       startedAt,
       launchId,
     });
+    // The launch now owns a new runSeq; retain exact terminal/preparation and
+    // Send identity without comparing it against its own pre-claim alias.
+    assertCurrent();
   } catch (error) {
     rollbackLaunchSetup('launch-observation-error', error);
     if (ownsMcpStartupRecoveryHandoff) {
@@ -65751,12 +66815,14 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       + ' enabled=' + !!providerProxyBaseUrl
       + ' base=' + JSON.stringify(providerProxyBaseUrl));
     const boundary = await withPtyWriteLock(term, async () => {
+      assertCurrent();
       const admission = await proveIdleShellForAgentLaunch(tabId, 'codex', {
         expectedTerm: term,
         expectedRunSeq: launchRunSeq,
         allowCurrentLaunchClaim: true,
         allowCurrentStoppingClaim: ownsMcpStartupRecoveryHandoff,
       });
+      assertCurrent();
       if (!admission.allowed) return { written: false, admission };
       if (payload.historyOperation) {
         require(path.join(srcMainDir, 'web-server')).validateSavedHistoryResume(
@@ -65831,6 +66897,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
         command: cmdLine,
         launchId,
         admission,
+        sendLaunchRequest: payload,
       });
       return { written: true, admission };
     });
@@ -65848,6 +66915,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
         success: false,
         accepted: false,
         error: agentShellLaunchError(boundary.admission, 'codex_already_running'),
+        launchWritten: false,
         lookupUnknown: boundary.admission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
         reason: boundary.admission.reason,
         tabId,
@@ -66530,6 +67598,57 @@ async function executeCodexSelectModelEffortRequest(sender, {
             },
           ),
         });
+        if ((result?.success === true || result?.applied === true)
+          && !codexSettingsObservationCurrent(
+            { settingsObservationKey: settingsObservationBeforePicker },
+            readCodexSettingsSendScope(tabId), result.model, result.effort,
+            resolveConfiguredCodexSettingsModelIdentity,
+          )) {
+          // Preserve unchanged causal picker ACKs (including draft-preserving
+          // and conversation-only flows). Only a conflicting newer observation
+          // needs this current-frame reconciliation before declaring failure.
+          measurePhase('current-pair');
+          const mirror = getHeadlessTerminalMirror(tabId);
+          const confirmation = await observeCodexSettingsApplication({
+            model: result.model, effort: result.effort,
+            resolveModelIdentity: resolveConfiguredCodexSettingsModelIdentity,
+            isCurrent: () => !!mirror && getHeadlessTerminalMirror(tabId) === mirror
+              && readAdmission(freshHasDraft, expectedInputRevision).allowed === true,
+            subscribe(wake) {
+              const onFrame = () => wake();
+              const onOwner = (_event, change) => { if (change?.tabId === tabId) wake(); };
+              mirror?.synchronizedFrameWaiters?.add(onFrame);
+              ipcMain.on('agent:input-owner-changed-internal', onOwner);
+              ipcMain.on('agent:readiness-changed-internal', onOwner);
+              return () => {
+                mirror?.synchronizedFrameWaiters?.delete(onFrame);
+                ipcMain.removeListener('agent:input-owner-changed-internal', onOwner);
+                ipcMain.removeListener('agent:readiness-changed-internal', onOwner);
+              };
+            },
+            readFrame: async () => {
+              const projected = await readCodexAuthoritativeScreen(tabId, 'settings-application-confirmation');
+              const frame = codexPolicyFrame(tabId, mirror, projected?.snapshot);
+              const pair = projected?.success && frame.valid
+                ? parseCodexVerifiedComposerFooter(frame.text) : null;
+              if (!pair) return { valid: false };
+              // Feed the SAME current-frame observer, not requested settings
+              // masquerading as runtime state. No await between proof and feed.
+              codexLiveSettingsObserver?.observe(tabId, frame);
+              return { valid: true, model: pair.model, effort: pair.effort,
+                frameSeq: frame.seq, mirrorGeneration: mirror.generation };
+            },
+          });
+          console.log('[CodexSettingsProof] current-pair tab=' + String(tabId).slice(-12)
+            + ' requested=' + result.model + '/' + result.effort
+            + ' status=' + confirmation.observation.status + ' checks=' + confirmation.checks
+            + ' frame=' + (confirmation.frame?.frameSeq ?? '-')
+            + ' reason=' + (confirmation.reason || 'current-pair-confirmed'));
+          if (!confirmation.success) return { ...result, success: false, applied: false,
+            settingsApplicationUnconfirmed: true,
+            settingsObservationSuperseded: confirmation.code === 'codex_settings_observation_changed',
+            code: confirmation.code, error: confirmation.code };
+        }
         measurePhase('publication');
         const finalOwnership = readAdmission(freshHasDraft, expectedInputRevision);
         // Persistent config acknowledgement may arrive after a newer native
@@ -67504,6 +68623,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
     console.error('[Claude Runner] Terminal not found for tab:', tabId);
     return { success: false, accepted: false, error: 'terminal_not_found', tabId };
   }
+  options.assertSendLaunchCurrent?.(true);
   let knownEmptySend;
   try { knownEmptySend = assertKnownEmptySend(tabId, payload); }
   catch (error) { return { ...error, error: error.message, launchWritten: false, tabId }; }
@@ -67584,6 +68704,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
     return {
       success: false,
       accepted: false,
+      launchWritten: false,
       error: agentShellLaunchError(preLaunchAdmission, 'claude_already_running'),
       lookupUnknown: preLaunchAdmission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
       reason: preLaunchAdmission.reason,
@@ -67592,10 +68713,16 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
     };
   }
 
-  const proveWriteBoundary = () => proveIdleShellForAgentLaunch(tabId, 'claude', {
-    expectedTerm: term,
-    expectedRunSeq: shellRunSeqBeforeLaunch,
-  });
+  const proveWriteBoundary = async () => {
+    const admission = await proveIdleShellForAgentLaunch(tabId, 'claude', {
+      expectedTerm: term,
+      expectedRunSeq: shellRunSeqBeforeLaunch,
+    });
+    if (!admission.allowed) launchResult = { success: false, accepted: false, launchWritten: false,
+      error: agentShellLaunchError(admission, 'claude_already_running'), reason: admission.reason,
+      lookupUnknown: admission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN, tabId, command };
+    return admission;
+  };
   let launchResult = {
     success: false,
     accepted: false,
@@ -67622,6 +68749,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
       }
 
       const boundary = await proveWriteBoundary();
+      options.assertSendLaunchCurrent?.(true);
       if (!boundary.allowed) {
         console.warn('[Claude Runner] fresh launch boundary rejected tab=' + String(tabId).slice(-12)
           + ' reason=' + boundary.reason);
@@ -67653,6 +68781,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           toolType: 'claude',
           command: 'claude --dangerously-skip-permissions',
           admission: boundary,
+          sendLaunchRequest: payload,
         });
       } catch (error) {
         rollbackClaudeShellLaunchClaims(tabId, { reason: 'fresh-shell-write-failed' });
@@ -67671,6 +68800,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
         const tabCwd = terminalProjects.get(tabId);
         const liveOwner = getClaudeJsonlLiveOwner(sessionId, tabId)
           || await getClaudeJsonlExternalOwner(sessionId, tabCwd);
+        options.assertSendLaunchCurrent?.(true);
         if (liveOwner) {
           console.warn('[Claude Runner] BLOCKED duplicate claude-c resume of ' + sessionId.slice(0, 8) +
             ': owner tab=' + String(liveOwner.tabId || '').slice(-12) +
@@ -67706,6 +68836,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           cmdLine = `cd '${safe}' && ${cmdLine}`;
         }
         const boundary = await proveWriteBoundary();
+        options.assertSendLaunchCurrent?.(true);
         if (!boundary.allowed) {
           console.warn('[Claude Runner] resume launch boundary rejected tab=' + String(tabId).slice(-12)
             + ' reason=' + boundary.reason);
@@ -67733,6 +68864,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
             toolType: 'claude',
             command: cmdLine,
             admission: boundary,
+            sendLaunchRequest: payload,
           });
         } catch (error) {
           rollbackClaudeShellLaunchClaims(tabId, {
@@ -67890,6 +69022,8 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
             cmdLine = `cd '${safe}' && ${cmdLine}`;
           }
           const boundary = await proveWriteBoundary();
+          try { options.assertSendLaunchCurrent?.(true); }
+          catch (error) { rollbackForkPreparation('fork-launch-cancelled'); throw error; }
           if (!boundary.allowed) {
             console.warn('[Claude Runner] fork launch boundary rejected tab=' + String(tabId).slice(-12)
               + ' reason=' + boundary.reason);
@@ -67928,6 +69062,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
               toolType: 'claude',
               command: cmdLine,
               admission: boundary,
+              sendLaunchRequest: payload,
             });
           } catch (error) {
             rollbackForkPreparation('fork-shell-write-failed');
@@ -68004,11 +69139,17 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
 }
 
 async function runClaudeCommandSerialized(event, payload = {}) {
+  if (payload.contextForkBinding) payload = { ...payload, contextForkBinding: undefined };
   const tabId = payload?.tabId;
-  if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
-  return await runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+  if (!tabId) return payload?.launchIntent === undefined ? { success: false, accepted: false, error: 'tabId required' }
+    : agentLaunchIntentRefusal(payload, null, 'agent_launch_intent_identity_required');
+  payload = withAgentLaunchFence(tabId, payload);
+  return runAgentLaunchIntentAttempt(event.sender, payload, () => runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+    const expectedTerminal = terminals.get(tabId);
+    assertAgentSendLaunchCurrent(tabId, 'claude', payload, { validateTarget: true, expectedTerminal });
     validateClaudeSavedHistoryLaunch(payload, 'claim');
     const lifecycleAdmission = await admitAiLifecycleLaunch(tabId, payload);
+    assertAgentSendLaunchCurrent(tabId, 'claude', payload, { validateTarget: true, expectedTerminal });
     if (lifecycleAdmission?.allowed !== true) {
       console.warn('[AILifecycle] Claude launch suppressed tab=' + String(tabId).slice(-12)
         + ' source=' + (lifecycleAdmission?.source || '-')
@@ -68025,8 +69166,8 @@ async function runClaudeCommandSerialized(event, payload = {}) {
         tabId,
       };
     }
-    const command = String(payload?.command || '');
-    const sessionId = command === 'claude-c' ? String(payload?.sessionId || '') : '';
+    let command = String(payload?.command || '');
+    let sessionId = command === 'claude-c' ? String(payload?.sessionId || '') : '';
     const preparation = agentLaunchPreparations.begin({
       tabId,
       toolType: 'claude',
@@ -68037,8 +69178,11 @@ async function runClaudeCommandSerialized(event, payload = {}) {
         : 'proving-shell',
       reason: command === 'claude-c' ? 'resume-requested' : 'launch-requested',
     });
+    const assertCurrent = (validateTarget = false) => assertAgentSendLaunchCurrent(
+      tabId, 'claude', payload, { validateTarget, expectedTerminal, preparationToken: preparation.token });
     let result = null;
     const execute = async () => {
+      assertCurrent(true);
       let resumeJsonlPrepared = false;
       let repairResult = null;
       if (sessionId && payload?.skipResumeRepair !== true) {
@@ -68061,6 +69205,7 @@ async function runClaudeCommandSerialized(event, payload = {}) {
         }
         resumeJsonlPrepared = true;
       }
+      assertCurrent(true);
       agentLaunchPreparations.update(tabId, preparation.token, {
         phase: 'proving-shell',
         reason: 'history-ready',
@@ -68079,12 +69224,14 @@ async function runClaudeCommandSerialized(event, payload = {}) {
           + ' session=' + sessionId.slice(0, 8) + ' mode=fresh'
           + ' reason=complete-metadata-only bytes=' + emptyRestoreProof.size);
       }
+      assertCurrent(true);
       const launch = await runClaudeCommandFromPayload(event, emptyRestoreProof
         ? { ...payload, command: 'claude', sessionId: null }
         : payload, {
         resumeJsonlPrepared,
         emptyRestoreProof,
         emptyRestoreSessionId: emptyRestoreProof ? sessionId : null,
+        assertSendLaunchCurrent: assertCurrent,
       });
       if (emptyRestoreProof && launch.accepted === true) {
         launch.restoredEmptySessionId = sessionId;
@@ -68098,10 +69245,15 @@ async function runClaudeCommandSerialized(event, payload = {}) {
         : launch;
     };
     try {
+      if (payload.contextFork) {
+        payload = await prepareTabContextForkLaunch(payload, 'claude', assertCurrent, preparation);
+        command = String(payload.command);
+        sessionId = command === 'claude-c' ? String(payload.sessionId || '') : '';
+      }
       result = sessionId
         ? await runKeyedExclusive(claudeResumePreparationInflight, sessionId.toLowerCase(), execute)
         : await execute();
-      return result;
+      return payload.contextForkBinding ? { ...result, contextForkBinding: payload.contextForkBinding } : result;
     } catch (error) {
       result = {
         success: false,
@@ -68110,6 +69262,8 @@ async function runClaudeCommandSerialized(event, payload = {}) {
         tabId,
         command,
       };
+      if (payload.contextForkBinding) return { ...(error?.sendLaunchRefusal || result),
+        contextForkBinding: payload.contextForkBinding };
       throw error;
     } finally {
       agentLaunchPreparations.finish(tabId, preparation.token, {
@@ -68118,7 +69272,7 @@ async function runClaudeCommandSerialized(event, payload = {}) {
         error: result?.accepted === true ? null : (result?.error || result?.reason || null),
       });
     }
-  });
+  }).catch(returnAgentSendLaunchRefusal));
 }
 
 ipcMain.on('claude:run-command', async (event, payload = {}) => {

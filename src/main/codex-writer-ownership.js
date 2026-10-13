@@ -2033,6 +2033,7 @@ function releaseExclusiveActionReservation(registry, reservation) {
 }
 
 module.exports = {
+  canonicalizeExistingPath,
   isSameCodexUnwrittenOperationScope,
   canUseCodexProofAfterDiscoveryCompletion,
   classifyManualCodexSubmitAfterWriteQueue,

@@ -177,8 +177,26 @@ Pre-dispatch Cancel снимает listener lease; намеренный ручн
 Причинаv2 — incident09.10 наtab367: live user04:52:47 содержал952chars прежнего
 clipboard вместо208chars речи, исправление user04:55:02 восстановило речь. Вv1
 `other-input-focused TEXTAREA xterm=false` обходил receipt. Сам installed909/f52
-был актуален: это не задача повторно установить прежний пакет. Rich contenteditable
-вне History сохраняет прежний путь; v2 не должен объявляться proof всех редакторов.
+был актуален: это не задача повторно установить прежний пакет.
+
+Зарегистрированные NT `ComposerEditor` также используют receiptv2: общий host-wrapper
+передаёт реальный документ, selection и семантического владельца. Наблюдаются оба
+пути — DOM Paste и синхронная Mod-v facade общего редактора; вставка, Undo и
+sidecar остаются у CodeMirror/host. Подтверждается полный документ после применения,
+а не `textContent` виджета. Title и body Run after делят editor-session owner;
+смена задачи отзывает прежнюю принадлежность. Незарегистрированный rich
+contenteditable сохраняет прежний путь: это не proof всех произвольных редакторов.
+Новый NT ComposerEditor подключать через host-wrapper, а не прямым импортом
+компонента из пакета.
+
+Шрам12.10 12:26UTC: take1791807919482 полностью распознал688символов, но Run after
+body уже был CodeMirror DIV. Гейт `other-input-focused` не выдал receipt; Voice
+вернул прежний131char clipboard в12:26:10.218, а CM Paste обработался позже.
+Настоящий Run after воспроизвёл замену старым буфером на прежнем native-only adapter.
+Расширение Source подтвердило DOM/Mod-v, новую/существующую карточку, Post/Loop,
+selection/Undo, смену queue owner и scoped Return с установленным Voice client/
+state machine. Clipboard/native menu dispatch/provider в fixture изолированы;
+NT production не установлен. Статус и evidence — Voice `docs/tmp/диктовка-run-after-2026-10-12.md`.
 
 Причина — инцидент08.10: буфер вернулся к изображению с пустым text за75мс до
 `terminal:input` с одними brackets. Native menu success был принят за доставку.

@@ -30,7 +30,7 @@ try {
     alias: { '@noted/claude-blocks': path.join(snapshot, 'packages/claude-blocks/src'),
       '@noted/structured-dnd': path.join(shared, 'structured-dnd/src'), '@noted/file-explorer': path.join(shared, 'file-explorer/src'),
       react: path.join(repo, 'node_modules/react'), 'react-dom': path.join(repo, 'node_modules/react-dom') },
-    loader: { '.ttf': 'file', '.woff2': 'file', '.svg': 'dataurl' } });
+    loader: { '.ttf': 'file', '.woff2': 'file', '.svg': 'dataurl', '.png': 'dataurl' } });
   execFileSync(path.join(repo, 'node_modules/.bin/tailwindcss'), ['-i', path.join(snapshot, 'src/renderer/styles/globals.css'),
     '-o', path.join(artifact, 'globals.css'), '--minify'], { cwd: snapshot, stdio: 'pipe' });
   function installShim() {
@@ -128,7 +128,189 @@ try {
   const state = () => page.evaluate(() => window.hoverFixture.state());
   const assertPreview = async () => { assert.equal(await local.getAttribute('data-prompt-queue-panel-mode'), 'preview'); assert.equal((await state()).panelCollapsed, true); };
   const openLocal = async () => { await far(); await count.hover(); await local.waitFor(); await frames(); await assertPreview(); };
-  if (process.env.NOTED_AUTOMATION_SETTINGS_ONLY === '1') {
+  if (process.env.NOTED_HOVER_DISMISS_ONLY === '1') {
+    // Observe the first pre-paint callback after real pointer departure, not only the final
+    // state after a comfortable wait. No provider or application timers supply
+    // readiness: a MutationObserver records the actual portal removal.
+    const cdp = await page.context().newCDPSession(page);
+    result.dismissals = [];
+    const probeDeparture = async (label, point) => {
+      await page.evaluate(() => {
+        const f = window.hoverFixture;
+        const originalTimeout = window.setTimeout;
+        const probe = f.dismissProbe = { trusted: false, removedMs: null, afterEvent: null, beforeNextPaint: null, timers: [] };
+        let started = null;
+        window.setTimeout = function(callback, delay, ...args) {
+          if (started !== null) probe.timers.push({ delay, stack: new Error().stack });
+          return originalTimeout.call(this, callback, delay, ...args);
+        };
+        const observer = new MutationObserver(() => {
+          if (started === null || document.querySelector('[data-global-run-after-panel]')) return;
+          probe.removedMs = performance.now() - started;
+          observer.disconnect(); window.setTimeout = originalTimeout;
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+        window.addEventListener('mousemove', event => {
+          started = performance.now(); probe.trusted = event.isTrusted;
+          requestAnimationFrame(() => { probe.beforeNextPaint = {
+            visible: !!document.querySelector('[data-global-run-after-panel]'), elapsedMs: performance.now() - started,
+          }; });
+        }, { once: true, capture: true });
+        // Registered after the product's window listener: no extra frame or
+        // await can conceal a deferred setState in this assertion.
+        window.addEventListener('mousemove', () => { probe.afterEvent = {
+          visible: !!document.querySelector('[data-global-run-after-panel]'), elapsedMs: performance.now() - started,
+        }; }, { once: true });
+      });
+      await page.mouse.move(point.x, point.y);
+      await frames();
+      const probe = await page.evaluate(() => window.hoverFixture.dismissProbe);
+      result.dismissals.push({ label, point, ...probe });
+      assert.equal(probe.trusted, true);
+      assert.equal(probe.afterEvent?.visible, false, label + ': popup survived its departure handler');
+      assert.equal(probe.beforeNextPaint?.visible, false, label + ': popup survived the first pre-paint callback after departure');
+      assert.notEqual(probe.removedMs, null, label + ': no portal removal observed');
+      assert.deepEqual(probe.timers, [], label + ': departure scheduled a timeout');
+      assert.equal(await global.count(), 0);
+    };
+    for (const rate of [1, 4]) {
+      await cdp.send('Emulation.setCPUThrottlingRate', { rate });
+      for (const surface of ['Queues', 'Settings']) for (const direction of ['left', 'right', 'bottom', 'diagonal']) {
+        await far(); await globalTrigger.hover(); await global.waitFor();
+        await global.getByRole('button', { name: new RegExp('^' + surface) }).click(); await frames();
+        const box = await global.boundingBox();
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2); await frames();
+        const point = direction === 'left' ? { x: box.x - 8, y: box.y + box.height / 2 }
+          : direction === 'right' ? { x: box.x + box.width + 8, y: box.y + box.height / 2 }
+          : direction === 'bottom' ? { x: box.x + box.width / 2, y: box.y + box.height + 8 }
+          : { x: box.x + box.width + 8, y: box.y + box.height + 8 };
+        await probeDeparture(surface + '/' + direction + '/CPU' + rate, point);
+      }
+    }
+    await page.evaluate(() => window.hoverFixture.graph());
+    await far(); await globalTrigger.hover(); await global.waitFor();
+    await global.getByRole('button', { name: /^Queues/ }).click(); await frames();
+    assert.ok(await global.locator('[data-global-run-after-inline-editor]').count() >= 7);
+    const graphBox = await global.boundingBox();
+    await page.mouse.move(graphBox.x + graphBox.width / 2, graphBox.y + graphBox.height / 2); await frames();
+    await probeDeparture('multiple inline queues/CPU4', { x: graphBox.x - 8, y: graphBox.y + graphBox.height / 2 });
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 });
+    result.checks.push('Queues/Settings and a multi-queue graph: trusted departure removes the portal in its native event and before the next pre-paint callback, with no timeout, including CPU4x');
+  } else if (process.env.NOTED_NEW_PROMPT_ONLY === '1') {
+    await page.evaluate(() => window.hoverFixture.emptyQueue());
+    await openLocal();
+    const add = local.locator('[data-editor-trigger="add"]');
+    const editor = page.locator('[data-run-after-satellite]').filter({ has: page.locator('.pq-image-marker-textarea') });
+    await add.click(); await editor.waitFor();
+    await frames();
+    const body = editor.locator('.cm-content'), title = editor.locator('input').first();
+    assert.equal(await body.evaluate(el => el.contains(document.activeElement)), true, 'new prompt focuses its body');
+    assert.match(await title.getAttribute('placeholder'), /Title.*generated/);
+    assert.equal(await add.getAttribute('aria-pressed'), 'true');
+    const activeAdd = await add.evaluate(el => ({ color: getComputedStyle(el).color, background: getComputedStyle(el).backgroundColor }));
+    assert.equal(activeAdd.color, 'rgb(241, 237, 248)');
+    await page.screenshot({ path: path.join(artifact, 'new-prompt-focus-active-plus.png') });
+    await editor.locator('.cm-content').fill('One new prompt body');
+    await editor.locator('input').first().fill('One card');
+    // Pointer leaves the editor for the empty queue. The pinned editor blur
+    // auto-saves but stays visible; its next outside close must update that ID.
+    await local.getByText('empty', { exact: true }).click(); await frames();
+    assert.equal((await state()).items.length, 1);
+    const id = (await state()).items[0].id;
+    await page.mouse.click(15, 825); await frames();
+    assert.equal((await state()).items.length, 1, 'empty-panel blur followed by overlay close creates exactly one card');
+    assert.equal((await state()).items[0].id, id);
+    result.checks.push('new draft → empty list blur → outside close keeps one durable item');
+
+    await openLocal(); await add.click(); await editor.waitFor();
+    await body.fill('Second independent prompt');
+    await add.click(); await frames();
+    assert.equal(await editor.count(), 0); await assertPreview();
+    assert.equal((await state()).items.length, 2);
+    assert.equal(await add.getAttribute('aria-pressed'), 'false');
+    const secondId = (await state()).items[1].id;
+    await page.mouse.click(15, 825); await frames(); assert.equal((await state()).items.length, 2);
+    await openLocal(); await add.click(); await editor.waitFor();
+    await body.fill('Third prompt saved by keyboard'); await body.hover();
+    await page.keyboard.press('Meta+Enter'); await frames();
+    assert.equal(await editor.count(), 0); await assertPreview();
+    assert.equal((await state()).items.length, 3);
+    assert.equal((await state()).items[2].text, 'Third prompt saved by keyboard');
+    await far(); await assertPreview(); // one return trip after keyboard save outside parent
+    await local.getByRole('button', { name: 'Post', exact: true }).hover(); await far();
+    assert.equal(await local.count(), 0);
+    await openLocal(); await add.click(); await editor.waitFor();
+    await add.click(); await frames(); assert.equal(await editor.count(), 0); await assertPreview();
+    assert.equal((await state()).items.length, 3, 'empty explicit save does not add a card');
+    result.checks.push('new body autofocus/English title placeholder, violet active +, repeat +/Cmd+Enter save without closing parent, empty draft has no row');
+
+    await local.locator('[data-prompt-queue-item="' + secondId + '"]').click(); await editor.waitFor();
+    assert.equal(await add.getAttribute('aria-pressed'), 'false', 'editing an existing item does not activate Add');
+    await title.fill('Edited existing title'); await page.keyboard.press('Meta+Enter'); await frames();
+    assert.equal((await state()).items.length, 3);
+    assert.equal((await state()).items[1].title, 'Edited existing title');
+    await add.click(); await editor.waitFor(); await body.fill('Fourth retained draft');
+    await local.getByRole('button', { name: 'Post', exact: true }).click(); await frames();
+    const fourthId = (await state()).items[3].id;
+    assert.equal(await add.getAttribute('aria-pressed'), 'true', 'auto-saved draft retains its Add entry point');
+    await body.click(); await page.keyboard.press('Meta+z');
+    assert.equal((await body.innerText()).trim(), '', 'first blur-save does not discard this draft undo history');
+    await page.keyboard.press('Meta+Shift+z'); assert.equal(await body.innerText(), 'Fourth retained draft');
+    await body.fill('Fourth retained draft edited');
+    await add.click(); await frames(); assert.equal(await editor.count(), 0); assert.equal((await state()).items.length, 4);
+    assert.equal((await state()).items[3].id, fourthId); assert.equal((await state()).items[3].text, 'Fourth retained draft edited');
+    result.checks.push('existing edit uses the same ID; repeated blur-save/body edits/active Add update the materialized draft');
+
+    // The saved card is immediately available for the next requested action.
+    await local.locator('[data-prompt-queue-item="' + fourthId + '"]').click({ button: 'right' });
+    await page.locator('[data-prompt-queue-chip-menu]').getByText('on tab', { exact: true }).click();
+    const picker = page.locator('[data-run-after-picker-menu]'); await picker.waitFor();
+    await page.evaluate(() => window.hoverFixture.pickerWorkflows(14)); await frames();
+    const icons = picker.locator('[data-run-after-workflow-chip]');
+    assert.equal(await icons.count(), 14); assert.equal(await icons.locator('[data-workflow-chip-label]').count(), 0);
+    const strip = picker.locator('[data-run-after-workflow-strip="icons"]');
+    const bounds = await picker.boundingBox(); assert.ok(bounds.width > 252);
+    assert.ok(await strip.evaluate(el => el.scrollWidth <= el.clientWidth + 1));
+    const boxes = await icons.evaluateAll(nodes => nodes.map(n => n.getBoundingClientRect().toJSON()));
+    assert.ok(boxes.every(box => Math.abs(box.top - boxes[0].top) < 1));
+    assert.ok(boxes.every(box => box.left >= bounds.x && box.right <= bounds.x + bounds.width));
+    const inbox = icons.filter({ has: page.locator('[data-workflow-inbox-icon]') });
+    assert.equal(await inbox.count(), 1); await inbox.click();
+    await picker.locator('[data-run-after-tab-row="source"]').click(); await frames();
+    assert.equal((await state()).items[3].trigger.tabId, 'source');
+    await local.locator('[data-prompt-trigger-row="' + fourthId + '"] [data-tab-card]').click({ button: 'right' });
+    await picker.waitFor(); await page.screenshot({ path: path.join(artifact, 'picker-workflow-icons-inbox.png') });
+    await page.evaluate(() => window.hoverFixture.pickerWorkflows(50)); await frames();
+    assert.equal(await icons.count(), 50);
+    assert.ok(await strip.evaluate(el => el.scrollWidth <= el.clientWidth + 1));
+    const wide = await picker.boundingBox(); assert.ok(wide.x >= 7 && wide.x + wide.width <= 1193);
+    const wrapped = await icons.evaluateAll(nodes => nodes.map(n => n.getBoundingClientRect().top));
+    assert.ok(Math.max(...wrapped) > Math.min(...wrapped), 'viewport overflow wraps icons instead of horizontal scrolling');
+    await page.evaluate(() => window.hoverFixture.pickerWorkflows(3)); await frames();
+    assert.equal(Math.round((await picker.boundingBox()).width), 252, 'original minimum width is preserved');
+    await page.keyboard.press('Escape'); await page.mouse.click(15, 825);
+    result.checks.push('on-tab picker shows complete icon-only workflows plus Inbox, grows above original minimum, wraps only at viewport, selects the actual Inbox target');
+
+    await page.evaluate(() => window.hoverFixture.armQueue()); await globalTrigger.hover(); await global.waitFor();
+    const embedded = global.locator('[data-global-run-after-inline-editor="owner"]'); await embedded.waitFor();
+    const globalAdd = embedded.locator('[data-editor-trigger="add"]'); await globalAdd.click(); await editor.waitFor();
+    await body.fill('Global draft saved by keyboard'); await body.hover(); await page.keyboard.press('Meta+Enter'); await frames();
+    assert.equal(await editor.count(), 0); assert.equal(await global.count(), 1);
+    assert.equal(await global.getAttribute('data-global-run-after-mode'), 'preview');
+    assert.equal((await state()).items.length, 5);
+    await far(); assert.equal(await global.count(), 1); await global.hover(); await far(); assert.equal(await global.count(), 0);
+    result.checks.push('global inline creation uses the same one-card save and keyboard return trip without pin');
+
+    await openLocal(); await add.click(); await editor.waitFor(); await body.fill('Sixth draft before switching');
+    const originalFirst = (await state()).items[0];
+    await local.locator('[data-prompt-queue-item="' + originalFirst.id + '"]').click(); await frames();
+    assert.equal((await state()).items.length, 6);
+    assert.equal((await state()).items[0].text, originalFirst.text, 'old blur cannot apply the new-draft body to the next editor');
+    assert.equal((await state()).items[5].text, 'Sixth draft before switching');
+    await title.fill('First title after switch'); await page.keyboard.press('Meta+Enter'); await frames();
+    assert.equal((await state()).items.length, 6); assert.equal((await state()).items[0].title, 'First title after switch');
+    result.checks.push('deferred blur cannot overwrite the next item after switching editors; adopted draft keeps Undo/Redo');
+  } else if (process.env.NOTED_AUTOMATION_SETTINGS_ONLY === '1') {
     await globalTrigger.hover(); await global.waitFor();
     await global.getByRole('button', { name: 'Settings', exact: true }).click(); await frames();
     assert.equal(await global.getByRole('button', { name: /^Queues/ }).count(), 1);
@@ -138,6 +320,9 @@ try {
     await compactSelect.hover(); await frames(); assert.equal(await page.locator('[data-automation-workflow-menu]').count(), 0);
     await compactSelect.click();
     const picker = page.locator('[data-automation-workflow-menu="Auto-compact"]'); await picker.waitFor();
+    const bulkAction = menu => menu.getByRole('button', { name: /^(Select all|Clear all)$/ });
+    assert.equal(await bulkAction(picker).count(), 1, 'one bulk toggle, not two adjacent opposite actions');
+    assert.equal(await bulkAction(picker).innerText(), 'Select all');
     await far(); assert.equal(await picker.count(), 1); assert.equal(await global.count(), 1);
     const option = picker.locator('[data-automation-workflow-option="legacy-workflow"]');
     await option.click(); await frames(); assert.equal(await option.getAttribute('aria-checked'), 'true');
@@ -146,7 +331,10 @@ try {
     assert.equal((await page.evaluate(() => window.hoverFixture.scope())).activeSpaceId, 'hover-workflow');
     await picker.getByRole('button', { name: 'Select all', exact: true }).click(); await frames();
     assert.equal(await picker.locator('[role="menuitemcheckbox"][aria-checked="false"]').count(), 0);
+    assert.equal(await bulkAction(picker).count(), 1); assert.equal(await bulkAction(picker).innerText(), 'Clear all');
     await option.click(); await frames(); assert.equal(await option.getAttribute('aria-checked'), 'false');
+    assert.equal(await bulkAction(picker).innerText(), 'Select all');
+    await bulkAction(picker).click(); await frames();
     await picker.getByRole('button', { name: 'Clear all', exact: true }).click(); await frames();
     assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, false);
     await option.click(); await frames(); assert.equal((await page.evaluate(() => window.hoverFixture.scope())).policy.enabled, true);
@@ -156,10 +344,27 @@ try {
 
     await stopSelect.click();
     const stopPicker = page.locator('[data-automation-workflow-menu="Auto-stop"]'); await stopPicker.waitFor();
+    assert.equal(await bulkAction(stopPicker).count(), 1); assert.equal(await bulkAction(stopPicker).innerText(), 'Select all');
+    await bulkAction(stopPicker).click(); await frames();
+    assert.equal((await page.evaluate(() => window.hoverFixture.idleProjection)).policy.allWorkflows, true);
+    assert.equal(await stopPicker.locator('[role="menuitemcheckbox"][aria-checked="false"]').count(), 0);
+    assert.equal(await bulkAction(stopPicker).count(), 1); assert.equal(await bulkAction(stopPicker).innerText(), 'Clear all');
+    await bulkAction(stopPicker).click(); await frames();
+    assert.equal((await page.evaluate(() => window.hoverFixture.idleProjection)).policy.allWorkflows, false);
+    assert.deepEqual((await page.evaluate(() => window.hoverFixture.idleProjection)).policy.workflowIds, []);
+    assert.equal(await bulkAction(stopPicker).innerText(), 'Select all');
+    // Selecting every row manually must offer Clear too, without silently
+    // enabling dynamic allWorkflows for future groups.
+    for (const row of await stopPicker.locator('[role="menuitemcheckbox"]').all()) await row.click();
+    await frames();
+    assert.equal((await page.evaluate(() => window.hoverFixture.idleProjection)).policy.allWorkflows, false);
+    assert.equal(await bulkAction(stopPicker).innerText(), 'Clear all');
+    await bulkAction(stopPicker).click(); await frames();
     await stopPicker.locator('[data-automation-workflow-option="hover-workflow"]').click(); await frames();
     assert.deepEqual((await page.evaluate(() => window.hoverFixture.idleProjection)).policy.workflowIds, ['hover-workflow']);
     assert.deepEqual((await page.evaluate(() => window.hoverFixture.scope())).policy.workflowIds, ['legacy-workflow']);
     await stopPicker.screenshot({ path: path.join(artifact, 'workflow-checkbox-picker.png') });
+    result.checks.push('both policy pickers expose one bulk toggle: none/partial→Select all, all/manual-all→Clear all; explicit rows and dynamic all remain distinct');
     await page.keyboard.press('Escape');
     await global.getByLabel('Время до автоостановки, минут').fill('3');
     assert.equal((await page.evaluate(() => window.hoverFixture.idleProjection)).policy.minutes, 10, 'partial timer edits do not stop idle processes before commit');
@@ -480,6 +685,7 @@ try {
   assert.equal(await scopeOption('legacy-workflow').isDisabled(), false);
   await scopeOption('legacy-workflow').click(); await frames();
   assert.equal(await scopeOption('legacy-workflow').getAttribute('aria-checked'), 'false');
+  await workflowMenu.getByRole('button', { name: 'Select all', exact: true }).click(); await frames();
   await workflowMenu.getByRole('button', { name: 'Clear all', exact: true }).click();
   await scopeOption('hover-workflow').click(); await frames();
   const compactThreshold = global.getByLabel('Порог автокомпакта');

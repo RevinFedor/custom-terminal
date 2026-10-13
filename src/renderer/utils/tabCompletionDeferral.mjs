@@ -20,7 +20,9 @@ export function shouldDeferTabCompletionNotification({
   successful,
   orchestrationBlocked = false,
   queueContinuationPending = false,
+  goalWork = null,
 }) {
+  if (successful && goalWork?.version === 1 && goalWork.pending === true) return 'native-goal-' + goalWork.phase;
   if (orchestrationBlocked) return 'orchestration-blocked';
   if (!successful) return null;
   if (queueContinuationPending) return 'queue-continuation-pending';

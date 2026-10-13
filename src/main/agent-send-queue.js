@@ -28,7 +28,7 @@ function applicationQueueReceipt(record, item) {
     success: true, accepted: true, submitted: false, pasteWritten: false, enterWritten: false,
     status: 'application-queued', queued: true, applicationQueued: true,
     providerQueueAccepted: false, exactAuditConfirmed: false, auditPending: false,
-    handoffId: record.handoffId, tabId: record.tabId, operationKey: record.operationKey,
+    handoffId: record.handoffId, tabId: record.tabId, operationKey: record.operationKey, provider: record.provider,
     sendOperationKey: record.operationKey, attemptId: null, sendAttemptId: null,
     receiptState: record.state,
     applicationQueue: { version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
@@ -602,7 +602,13 @@ class AgentSendQueue {
       if (this.admit) {
         this.parked.add(tabId);
         const admission = await this.admit(request);
-        if (admission?.cancel === true) { this.cancelWaiting(tabId, record.handoffId); return; }
+        if (admission?.cancel === true) {
+          this.cancelWaiting(tabId, record.handoffId, {
+            reason: typeof admission.reason === 'string' && admission.reason
+              ? admission.reason : 'automatic-admission-cancelled',
+          });
+          return;
+        }
         if (!admission) { parked = true; return; }
         this.parked.delete(tabId);
       }
@@ -650,29 +656,21 @@ class AgentSendQueue {
     }
   }
 
-  cancelWaiting(tabId, handoffId = null, { dismiss = false } = {}) {
+  cancelWaiting(tabId, handoffId = null, { dismiss = false, reason = 'user-cancel' } = {}) {
     const items = this.db.prepare(`SELECT q.* FROM agent_send_queue q
       JOIN agent_send_receipts r ON r.operation_key = q.operation_key
       WHERE q.tab_id = ? AND q.state = 'waiting'`
       + (handoffId ? ' AND r.handoff_id = ?' : '')).all(...(handoffId ? [tabId, handoffId] : [tabId]))
-      .filter(item => {
-        const record = this.store.get(item.operation_key);
-        return !record?.attemptId || isAutomaticNoWriteWait(record, JSON.parse(item.request_json));
-      });
-    for (const item of items) {
-      const original = this.store.get(item.operation_key);
-      this.store.cancelDelivery({ operationKey: item.operation_key, tabId, handoffId: original.handoffId,
-        attemptId: original.attemptId, presentationDismissed: dismiss, reason: 'user-cancel' });
-      this.finish(item, 'cancelled');
-      const record = this.store.get(item.operation_key);
-      if (!record.attemptId) this.store.settleQueuedNoWrite(item.operation_key, {
-        code: 'agent_send_queue_cancelled', error: 'Queued send cancelled before terminal input', cancelled: true,
-        ...(dismiss ? { presentationDismissedAt: Date.now(), presentationDismissedSurface: 'desktop-history' } : {}),
-      });
-      else this.publishRecord(record); // retain the last physical no-write fact
-      if (dismiss) this.releasePresentation(item.operation_key);
-    }
-    return { cancelled: items.length > 0, count: items.length };
+      .map(item => ({ item, record: this.store.get(item.operation_key) }))
+      .filter(({ item, record }) => record && (!record.attemptId
+        || isAutomaticNoWriteWait(record, JSON.parse(item.request_json))));
+    const results = items.map(({ item, record }) => {
+      try { return this.cancelDelivery(tabId, record.handoffId, { dismiss, reason }); }
+      catch (error) { return { cancelled: false, durable: false, complete: false,
+        operationKey: item.operation_key, reason: error.code || 'agent_send_cancel_storage_failed' }; }
+    });
+    const count = results.filter(result => result.cancelled === true).length;
+    return { cancelled: count > 0, count, complete: results.every(result => result.complete === true), results };
   }
 
   // One user cancellation boundary for queued and already-started sends. It
@@ -681,34 +679,51 @@ class AgentSendQueue {
     const item = this.db.prepare(`SELECT q.* FROM agent_send_queue q
       JOIN agent_send_receipts r ON r.operation_key=q.operation_key
       WHERE q.tab_id=? AND r.handoff_id=?`).get(tabId, handoffId);
-    if (!item) return { cancelled: false, reason: 'queue-item-not-found' };
+    if (!item) return { cancelled: false, durable: false, complete: false, reason: 'queue-item-not-found' };
     const before = this.store.get(item.operation_key);
-    let result;
+    if (!before) return { cancelled: false, durable: false, complete: false, reason: 'receipt-unavailable' };
+    let cancellation;
+    try {
+      // Commit the cancellation before retiring presentation/queue state. A
+      // later projection failure must not roll back this future-write fence.
+      cancellation = this.store.cancelDelivery({ operationKey: item.operation_key,
+        tabId, handoffId, attemptId: before.attemptId, reason, presentationDismissed: dismiss });
+    } catch (error) {
+      return { cancelled: false, durable: false, complete: false, operationKey: item.operation_key,
+        reason: error.code || 'agent_send_cancel_storage_failed' };
+    }
+    if (!cancellation.ok) return { cancelled: false, durable: false, complete: false,
+      operationKey: item.operation_key, reason: cancellation.reason };
+    const result = { cancelled: true, durable: true, complete: true, deliveryIntentCancelled: true,
+      deliveryCancelled: !before.attemptId || before.state === 'not-submitted'
+        && before.receipt?.submitted === false && before.receipt?.enterWritten === false,
+      deliveryOutcome: before.attemptId ? before.state : 'not-submitted',
+      operationKey: item.operation_key, tabId, handoffId, provider: before.provider,
+      attemptId: before.attemptId, deliveryControl: cancellation.record?.deliveryControl || null,
+      idempotent: cancellation.idempotent === true };
     this.admitting += 1;
     try {
-      result = this.db.transaction(() => {
-        const cancelled = this.store.cancelDelivery({ operationKey: item.operation_key,
-          tabId, handoffId, attemptId: before.attemptId, reason, presentationDismissed: dismiss });
-        if (!cancelled.ok) return { cancelled: false, reason: cancelled.reason };
-        if (!before.attemptId) {
-          this.finish(item, 'cancelled');
-          this.store.settleQueuedNoWrite(item.operation_key, { cancelled: true,
-            code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
-        } else if (FAILED.has(before.state)) this.finish(item, 'cancelled');
-        return { cancelled: true, deliveryCancelled: !before.attemptId || FAILED.has(before.state),
-          deliveryOutcome: before.attemptId ? before.state : 'not-submitted',
-          operationKey: item.operation_key, attemptId: before.attemptId,
-          idempotent: cancelled.idempotent === true };
-      })();
-    } finally { this.admitting -= 1; }
-    if (result.cancelled) {
-      // Memory revocation runs in the same JS turn as the durable tombstone.
-      // A concurrent pre-write arm independently checks the durable marker.
-      this.cancelAttempt(this.store.get(item.operation_key));
+      // The final PTY guard also reads the durable marker if no memory waiter
+      // is present. No late Enter/audit receipt is replaced by cancellation.
+      this.cancelAttempt(cancellation.record);
+      if (!before.attemptId) {
+        const settled = this.store.settleQueuedNoWrite(item.operation_key, { cancelled: true,
+          code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
+        if (!settled.ok) throw Object.assign(new Error(settled.reason), { code: settled.reason });
+        this.finish(item, 'cancelled');
+      } else if (FAILED.has(before.state)) this.finish(item, 'cancelled');
       if (dismiss) this.releasePresentation(item.operation_key);
+    } catch (error) {
+      result.complete = false;
+      result.reason = error.code || 'agent_send_cancel_projection_failed';
+    } finally { this.admitting -= 1; }
+    try {
       this.publishRecord(this.store.get(item.operation_key));
       this.resolveWaiters(item.operation_key);
       this.wake(tabId);
+    } catch (error) {
+      result.complete = false;
+      result.reason = error.code || 'agent_send_cancel_projection_failed';
     }
     return result;
   }
@@ -749,21 +764,26 @@ class AgentSendQueue {
   }
 
   stop(tabId) {
-    const result = this.cancelWaiting(tabId);
+    const waiting = this.cancelWaiting(tabId, null, { reason: 'manual-stop' });
+    const results = [...waiting.results];
     const head = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
       AND state IN ('dispatching','awaiting-receipt') ORDER BY ${ORDER} LIMIT 1`).get(tabId);
-    if (head) {
-      const record = this.store.get(head.operation_key);
-      // Cancels future work in the existing executor; never reverses an Enter
-      // or reports the provider-owned item as an untouched application item.
-      if (record) this.cancelDelivery(tabId, record.handoffId, { dismiss: false, reason: 'manual-stop' });
-      if (!record?.attemptId) {
-        this.finish(head, 'cancelled');
-        this.store.settleQueuedNoWrite(head.operation_key,
-          { cancelled: true, code: 'agent_send_queue_cancelled', error: 'Send cancelled before terminal input' });
+    if (head && !results.some(result => result.operationKey === head.operation_key)) {
+      try {
+        const record = this.store.get(head.operation_key);
+        results.push(record
+          ? this.cancelDelivery(tabId, record.handoffId, { dismiss: false, reason: 'manual-stop' })
+          : { cancelled: false, durable: false, complete: false,
+            operationKey: head.operation_key, reason: 'receipt-unavailable' });
+      } catch (error) {
+        results.push({ cancelled: false, durable: false, complete: false,
+          operationKey: head.operation_key, reason: error.code || 'agent_send_cancel_storage_failed' });
       }
     }
-    return result;
+    // Include an active-head-only cancellation and expose per-item partial
+    // persistence/projection failure separately from the physical Stop result.
+    const count = results.filter(result => result.cancelled === true).length;
+    return { cancelled: count > 0, count, complete: results.every(result => result.complete === true), results };
   }
 
   dispose() {

@@ -7,12 +7,12 @@
  *
  *  - Pure and memoizable; groups are презентация — never written to any
  *    durable cache or snapshot.
- *  - Group key (first member's tool_use id) is INTERNAL. Everything that
+ *  - Group key (first tool_use id or exact first Research row UUID) is INTERNAL. Everything that
  *    crosses the projection boundary — hydration center, reading anchor,
  *    Timeline jump, search — speaks server-row uuids only.
  *  - Grouping reads ONLY fields that exist on both full rows and row-window
  *    stubs (family/bashWord/mcpServer/mcpMethod/messageId/hasContent/
- *    actionSummary) so grouping(any hydration window) === grouping(full).
+ *    actionSummary / structural semanticTags) so grouping(any hydration window) === grouping(full).
  *  - Kill switch: `enabled: false` → identity projection.
  *
  * What groups: consecutive assistant work actions form a broad noise/edit
@@ -33,6 +33,25 @@ import {
   historyDisplayPath,
 } from '../../shared/history-action-grammar.mjs';
 import textPhases from '../../shared/history-text-phase.cjs';
+import { resolveHistoryOrchestrationPromptPresentation } from './historyOrchestrationPromptPresentation.mjs';
+import { resolveHistoryGroupCaption } from './historyGroupCaption.mjs';
+
+/** Stub-safe provenance only: never read/parse a response body just to group
+ * it. Pending application input and native question replies stay reachable. */
+export function isHistoryResearchReplyEntry(entry) {
+  if (!isObject(entry) || !['user', 'queued'].includes(entry.role) || entry.questionReplyProof) return false;
+  if (entry.queueStatus !== undefined && entry.queueStatus !== 'sent') return false;
+  if ((entry.isLocal === true || entry.handoffId) && entry.queueStatus !== 'sent') return false;
+  const service = resolveHistoryOrchestrationPromptPresentation(entry);
+  return service?.runKind === 'external-research' && ['completion', 'failure'].includes(service.phase);
+}
+
+export function historyResearchGroupKey(entry) {
+  // Exact SENT audit UUID is already the eventual canonical row's address.
+  // Run ID alone is not a row identity: repeated runs must not share toggles.
+  const identity = entry?.auditEntryUuid || entry?.auditProof?.entryUuid || entry?.uuid;
+  return typeof identity === 'string' && identity ? 'research-grp:' + identity : null;
+}
 
 /** Short digest subject for a hydrated action — mirrors main's stubActionSubject. */
 function hydratedSubject(raw, presentation = null) {
@@ -295,15 +314,21 @@ export function isCaptionForNext(entry, nextEntry) {
  * unit. The append projector rebuilds only the open tail and reuses closed
  * prefix units, so no separate mutable "live caption" state is needed.
  */
-function latestHistoryGroupCaptionEntry(entries, fallback = null) {
-  let latest = fallback;
+export function historyGroupCaptionEntries(entries, fallback = null) {
+  const captions = [], seen = new Set();
+  const add = entry => {
+    const identity = entry?.uuid || entry;
+    if (seen.has(identity)) return;
+    seen.add(identity); captions.push(entry);
+  };
+  if (fallback) add(fallback);
   for (const entry of (Array.isArray(entries) ? entries : [])) {
     if (!isObject(entry) || entry.role !== 'assistant') continue;
     if (!entryHasText(entry) || isStandaloneAnswer(entry)) continue;
     if (contentLength(entry) > HISTORY_CAPTION_MAX_CHARS) continue;
-    latest = entry;
+    add(entry);
   }
-  return latest;
+  return captions;
 }
 
 /**
@@ -502,12 +527,11 @@ export function buildHistoryInnerUnits(entries, options = {}) {
  *   { kind: 'group', key, familyKey, entries,
  *     facts, errorCount, captionEntry }            — collapsed series
  *
- * `key` = 'grp:' + first member's first tool_use id (stable across appends:
- * a growing live series keeps its first member). Expanded groups are NOT
- * returned as groups — the caller passes `expandedKeys`, and expanded
- * members come back as plain entry units (so their light card headers mount
- * only then). Heavy bodies still wait for the CHILD card's own click, with
- * `expandedGroup` metadata used only for rail rendering.
+ * `key` = 'grp:' + first tool_use id, or 'research-grp:' + first exact
+ * Research row UUID. A growing series keeps its first member. An expanded
+ * group retains its counter header followed by flat entry units; heavy bodies
+ * still wait for the CHILD card's own click. `expandedGroup` is rail metadata,
+ * not another History or a persisted provider message.
  */
 export function buildHistoryDisplayUnits(entries, options = {}) {
   const list = Array.isArray(entries) ? entries : [];
@@ -528,6 +552,23 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
   const messageFamilies = messageMembershipMap(list, entrySeriesFamily);
   while (index < list.length) {
     const entry = list[index];
+    if (isHistoryResearchReplyEntry(entry)) {
+      let cursor = index + 1;
+      while (cursor < list.length && isHistoryResearchReplyEntry(list[cursor])) cursor++;
+      const members = list.slice(index, cursor), key = historyResearchGroupKey(entry);
+      if (members.length >= 2 && key) {
+        const expanded = expandedKeys.has(key);
+        units.push({ kind: 'group', key, level: 1, familyKey: 'research', entries: members,
+          facts: [], errorCount: members.filter(member => resolveHistoryOrchestrationPromptPresentation(member)?.phase === 'failure').length,
+          captionEntry: null, expanded });
+        if (expanded) for (let child = 0; child < members.length; child++) units.push({
+          kind: 'entry', entry: members[child], expandedGroup: { key, familyKey: 'research',
+            first: child === 0, last: child === members.length - 1 },
+        });
+      } else for (const member of members) units.push({ kind: 'entry', entry: member });
+      index = cursor;
+      continue;
+    }
     // A slash command stays its own quiet service line, never a group. The
     // collapsed «Изменены настройки ×2» was tried and rejected live: two
     // one-word rows cost nothing, while the wrapper hid WHICH settings
@@ -665,7 +706,8 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
     }
     const allMembers = members;
     const facts = allMembers.flatMap((member) => entryActionFacts(member));
-    const detailEntry = latestHistoryGroupCaptionEntry(allMembers, captionEntry);
+    const captions = historyGroupCaptionEntries(allMembers, captionEntry);
+    const detailEntry = captions.at(-1) || null;
     const firstCallId = facts.find((fact) => fact.toolUseId)?.toolUseId
       || allMembers[0]?.rewriteLayoutUuid || allMembers[0]?.uuid || String(index);
     const aggregateKeys = new Set(facts.map((fact) => fact.aggregateKey).filter(Boolean));
@@ -678,6 +720,7 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
     if (pureHomogeneousRun) {
       const direct = makeInnerGroup(allMembers, facts, expandedKeys);
       direct.captionEntry = detailEntry;
+      direct.captionEntries = captions;
       units.push(direct);
       if (direct.expanded) {
         for (let memberIndex = 0; memberIndex < allMembers.length; memberIndex += 1) {
@@ -715,6 +758,7 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
       docsKind: outerDocsKind,
       entries: allMembers,
       captionEntry: detailEntry,
+      captionEntries: captions,
       facts,
       errorCount: facts.reduce((sum, fact) => sum + (fact.isError ? 1 : 0), 0),
       // ONE reasoning figure for the whole block, not one per row. «думал 7s,
@@ -842,6 +886,7 @@ export function rememberHistoryDisplayUnitsCached(entries, options, units) {
  * no chain the builder recognizes crosses it, in either direction.
  */
 function isGroupingConnectorRow(entry) {
+  if (isHistoryResearchReplyEntry(entry)) return true;
   if (entrySeriesFamily(entry) !== null) return true;
   if (isThinkingOnlyRow(entry)) return true;
   return isObject(entry)
@@ -982,7 +1027,7 @@ export function resolveHistoryDisplayTarget(units, uuid) {
  * («└ …») needs member content, and skipping it would make the header's
  * height differ between stubbed and hydrated states.
  */
-export function findHistoryHydrationStub(units, range, entryMargin) {
+export function findHistoryHydrationStub(units, range, entryMargin, captionSelections = null) {
   if (!Array.isArray(units) || units.length === 0) return null;
   const total = units.length;
   const margin = Math.max(0, Number(entryMargin) || 0);
@@ -993,6 +1038,16 @@ export function findHistoryHydrationStub(units, range, entryMargin) {
   const anyStubOf = (unit) => {
     if (!unit) return null;
     if (isGroupUnit(unit)) {
+      // Research headers are counters only. Unlike tool-group captions, they
+      // need no hidden body; expanded children hydrate as their own entry units.
+      if (unit.familyKey === 'research') return null;
+      // An explicit caption choice takes priority within the same visible
+      // group; the ordinary member/body hydration policy stays unchanged.
+      const choice = captionSelections?.get(unit.key);
+      if (choice) {
+        const caption = resolveHistoryGroupCaption(unit.captionEntries, choice).entry;
+        if (caption?.rowStub) return caption;
+      }
       for (const member of unit.entries) {
         if (member?.rowStub) return member;
       }
@@ -1012,7 +1067,21 @@ export function findHistoryHydrationStub(units, range, entryMargin) {
   };
   const start = Math.max(0, Math.min(total - 1, Number(range?.start) || 0));
   const end = Math.max(start, Math.min(total - 1, Number(range?.end) || 0));
-  // Everything on screen hydrates unconditionally, group members included.
+  // The most recent explicit visible caption choice beats unrelated automatic
+  // stub warming. It still uses the same request/queue and raw UUID address.
+  if (captionSelections?.size) {
+    const visibleGroups = new Map();
+    for (let index = start; index <= end; index++) {
+      if (isGroupUnit(units[index]) && units[index].expanded !== true) visibleGroups.set(units[index].key, index);
+    }
+    for (const [key, identity] of Array.from(captionSelections).reverse()) {
+      const index = visibleGroups.get(key);
+      if (index === undefined) continue;
+      const caption = resolveHistoryGroupCaption(units[index].captionEntries, identity).entry;
+      if (caption?.rowStub) return { entry: caption, index, caption: true };
+    }
+  }
+  // Visible entry bodies and tool captions hydrate; counters-only SC headers do not.
   for (let index = start; index <= end; index += 1) {
     const found = anyStubOf(units[index]);
     if (found) return { entry: found, index };

@@ -158,6 +158,27 @@ class ScExternalResearchClient {
     return responseJson(response);
   }
 
+  async openBrowser(jobId, { requestId, signal } = {}) {
+    const capabilities = await this.capabilities({ signal });
+    if (capabilities?.browserNavigation?.version !== 1
+      || capabilities.browserNavigation.exactJob !== true || capabilities.browserNavigation.confirmedTab !== true) {
+      throw new ScExternalResearchHttpError('Обновите SC Desktop: переход к вкладке research в браузере недоступен', {
+        code: 'sc_research_browser_navigation_unavailable',
+      });
+    }
+    const result = await responseJson(await this._request(`${this.baseUrl}/research-open-browser`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
+      body: JSON.stringify({ jobId, requestId }),
+    }, 15_000));
+    if (result?.ok !== true || result.opened !== true || result.jobId !== jobId
+      || result.requestId !== requestId || !Number.isInteger(result.tabId) || result.tabId < 0) {
+      throw new ScExternalResearchHttpError('SC Desktop не подтвердил переход к вкладке research в браузере', {
+        code: 'sc_research_browser_navigation_not_confirmed',
+      });
+    }
+    return result;
+  }
+
   async openJob(jobId, { requestId, signal } = {}) {
     const capabilities = await this.capabilities({ signal });
     if (capabilities?.navigation?.version !== 1 || capabilities.navigation.renderedAck !== true) {

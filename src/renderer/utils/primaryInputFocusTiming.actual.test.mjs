@@ -28,7 +28,9 @@ function harness(){
    tabId:'tab-a',promptTextareaRef:{current:editor},promptCaretRef:caret,
    uiPerformancePhase,
    requestAnimationFrame:callback=>raf.push(callback),useEffect:callback=>callback(),
-   document:{body,activeElement:body,querySelectorAll:()=>[{dataset:{terminalPaneWrapper:'tab-a',terminalSurfacePresented:'1',paneFocusIsolated:'0'},getAttribute:()=>null}]},
+   document:{body,activeElement:body,getElementById:id=>id==='terminal-pane-wrapper:tab-a'
+     ?{isConnected:true,dataset:{terminalPaneWrapper:'tab-a',terminalSurfacePresented:'1',paneFocusIsolated:'0'},getAttribute:()=>null}:null,
+     querySelectorAll:()=>assert.fail('primary focus must not enumerate retained wrappers')},
    window:{addEventListener:(name,fn)=>listeners.set(name,fn),removeEventListener(){},dispatchEvent:event=>listeners.get(event.type)?.(event)},
    CustomEvent:class{constructor(type,{detail}){this.type=type;this.detail=detail;}},exports:{},
    require:name=>name.includes('useUIStore')?{useUIStore:{getState:()=>({activeArea:'workspace',historyPanelOpenTabs:{}})},resolveTabTerminalPrimary:()=>false}

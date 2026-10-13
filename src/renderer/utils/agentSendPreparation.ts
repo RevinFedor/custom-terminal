@@ -22,6 +22,7 @@ import { showAgentDraftScreenContradictionToast } from './agentDraftContradictio
 import { draftTransferResultFields, readAgentDraftTransfer } from './agentDraftTransfer.mjs';
 import sendTargetContract from '../../shared/agent-send-target-precondition.cjs';
 import manualActionContract from '../../shared/agent-manual-action.cjs';
+import { createAgentLaunchAdmission } from './agentLaunchAdmission.mjs';
 
 const { createAgentSendTargetExpectation, resolveReadyAgentSendTarget } = sendTargetContract;
 
@@ -160,6 +161,9 @@ export async function prepareAgentRuntimeForSend({
   sendAttemptId,
   expectedTarget: pinnedTarget,
   admissionSignal,
+  launchAdmission: suppliedLaunchAdmission,
+  assertAdmissionCurrent,
+  acceptPreparedSession,
 }: {
   tabId: string;
   runtime: HistoryAgentRuntime;
@@ -174,7 +178,27 @@ export async function prepareAgentRuntimeForSend({
   sendAttemptId?: string | null;
   expectedTarget?: AgentSendTarget;
   admissionSignal?: AbortSignal;
+  launchAdmission?: ReturnType<typeof createAgentLaunchAdmission>;
+  assertAdmissionCurrent?: () => void;
+  acceptPreparedSession?: (sessionId: string) => void;
 }) {
+  const launchController = new AbortController();
+  const abortLaunch = () => {
+    launchController.abort();
+    suppliedLaunchAdmission?.cancel('preparation-aborted');
+  };
+  admissionSignal?.addEventListener('abort', abortLaunch, { once: true });
+  const launchCancellation = coordinatedSendToken
+    ? createCoordinatedAgentSendCancellationWait(tabId, coordinatedSendToken) : null;
+  void launchCancellation?.promise.then(abortLaunch);
+  if (admissionSignal?.aborted || (coordinatedSendToken
+    && isCoordinatedAgentSendCancellationRequested(tabId, coordinatedSendToken))) abortLaunch();
+  const launchAdmission = suppliedLaunchAdmission || createAgentLaunchAdmission({
+    invoke: ipcRenderer.invoke.bind(ipcRenderer), events: ipcRenderer, tabId, toolType: runtime.toolType,
+    sessionId, cwd, sendOperationKey, sendAttemptId, expectedTarget: pinnedTarget,
+    signal: launchController.signal, assertCurrent: () => assertAdmissionCurrent?.(),
+  });
+  try {
   let expectedTarget = pinnedTarget
     ? Object.freeze({ ...pinnedTarget })
     : createAgentSendTargetExpectation(runtime.toolType, sessionId);
@@ -195,6 +219,7 @@ export async function prepareAgentRuntimeForSend({
     { code: 'agent_send_cancelled', cancelled: true, submitted: false, pasteWritten: false, enterWritten: false },
   );
   const assertSendNotCancelled = () => {
+    assertAdmissionCurrent?.();
     if (admissionSignal?.aborted) throw cancelledBeforeSubmit();
     if (
       coordinatedSendToken
@@ -285,7 +310,8 @@ export async function prepareAgentRuntimeForSend({
     }
   }
 
-  const launchAlreadyInProgress = requestedStatusAtSend === 'starting';
+  const launchAlreadyInProgress = requestedStatusAtSend === 'starting'
+    || runtime.hasPendingForkLaunch?.(tabId) === true;
   if (presence?.status === 'inactive' && !launchAlreadyInProgress) {
     if (requireLive) throw Object.assign(new Error('Automatic continuation cannot restart a stopped session'), {
       code: 'agent_auto_continue_not_live',
@@ -297,11 +323,23 @@ export async function prepareAgentRuntimeForSend({
     }
     console.log('[AgentScenario:send] ' + actionLabel + ' before send tool=' + runtime.toolType
       + ' tab=' + String(tabId).slice(-12));
+    const launchContext = {
+      sendOperationKey, sendAttemptId,
+      launchAdmission, acceptPreparedSession,
+      // Keep the observed old physical owner for launch admission only. Ready
+      // adoption below may legitimately observe this operation's new launch.
+      expectedTarget: resolveReadyAgentSendTarget(expectedTarget, presence, runtime.toolType),
+      assertNotCancelled: assertSendNotCancelled,
+    };
     const resumeResult = hasSession
-      ? await runtime.resume({ tabId, sessionId, cwd, resumePausedGoal })
-      : await runtime.startFresh!({ tabId, cwd, sendOperationKey, sendAttemptId });
+      ? await runtime.resume({ tabId, sessionId, cwd, resumePausedGoal, ...launchContext })
+      : await runtime.startFresh!({ tabId, cwd, ...launchContext });
     if (resumeResult?.success === false) {
-      if ((resumeResult as any).code === 'agent_send_binding_changed' || (resumeResult as any).code === 'agent_send_owner_launch_changed') {
+      const launchCode = (resumeResult as any).code;
+      if (launchCode === 'agent_send_binding_changed' || launchCode === 'agent_send_owner_launch_changed'
+        || launchCode === 'agent_send_cancelled' || launchCode === 'agent_send_target_changed'
+        || String(launchCode || '').startsWith('agent_launch_')
+        || String(launchCode || '').startsWith('agent_send_launch_')) {
         throw Object.assign(new Error(resumeResult.error || 'Conversation owner changed'), resumeResult);
       }
       // Another History/API/Queue intent may have won launch admission between
@@ -312,7 +350,10 @@ export async function prepareAgentRuntimeForSend({
       const afterRejectedLaunch = await runtime.getPresence(tabId).catch(() => null);
       assertSendNotCancelled();
       if (afterRejectedLaunch?.status === 'inactive') {
-        throw new Error(resumeResult.error || runtime.label + ' ' + actionLabel + ' failed before send');
+        // Preserve Main's exact no-launch/lookup/owner refusal across the
+        // common preparation boundary. A bare Error loses retry eligibility
+        // and the diagnostic reason; it must not become a Send receipt.
+        throw Object.assign(new Error(resumeResult.error || runtime.label + ' ' + actionLabel + ' failed before send'), resumeResult);
       }
       presence = afterRejectedLaunch;
       console.warn('[AgentScenario:send] ' + actionLabel + ' refused but owner is no longer proven inactive tool='
@@ -360,7 +401,7 @@ export async function prepareAgentRuntimeForSend({
       { code: 'agent_send_readiness_timeout', submitted: false, pasteWritten: false, enterWritten: false,
         readinessStatus: presence?.status || 'unknown',
         readinessReason: presence?.lastNotReady?.reason || 'no-ready-proof',
-        sendReceipt: { success: false, accepted: false, submitted: false,
+        sendReceipt: { success: false, accepted: false, submitted: false, status: 'not-submitted',
           pasteWritten: false, enterWritten: false, code: 'agent_send_readiness_timeout' } });
   };
   for (let pass = 0; ; pass += 1) {
@@ -463,6 +504,11 @@ export async function prepareAgentRuntimeForSend({
       removeAdmissionAbort();
       cancellationWait?.cancel();
     }
+  }
+  } finally {
+    admissionSignal?.removeEventListener('abort', abortLaunch);
+    launchCancellation?.cancel();
+    if (!suppliedLaunchAdmission) void launchAdmission.finish();
   }
 }
 
