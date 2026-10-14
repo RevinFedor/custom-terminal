@@ -72,6 +72,18 @@ function createResponseObservationService({ store, readState, readResponse, evid
     return work;
   }
 
+  async function readRuntime(run, phase) {
+    const state = await readState(run.targetTabId);
+    if (stopped || state?.known === true
+      || (state?.code || state?.error) !== 'response_state_changed') return state;
+    // A failed compare-and-set is not an unavailable process. Acquire one
+    // fresh transaction on that observed change, without a timer or a loop.
+    // The fresh result still passes every owner/work/result guard below.
+    log.log('[ResponseObservation] runtime read invalidated run=' + run.runId
+      + ' phase=' + phase + ' recheck=1');
+    return readState(run.targetTabId);
+  }
+
   async function pass(runId, reason) {
     let run = await store.getInternal(runId);
     if (stopped || !isResponseObservation(run)) return;
@@ -88,7 +100,7 @@ function createResponseObservationService({ store, readState, readResponse, evid
     let result = selected?.result;
     if (subject || currentTurnOnly) result = evidence.read(runId, subject || run.observationCurrentTurnSubject)?.result;
     if (!result) {
-      const state = await readState(run.targetTabId);
+      const state = await readRuntime(run, 'admission');
       if (stopped) return;
       if (state?.exists === false || state?.code === 'tab_not_found') {
         return settle(run, null, { code: 'response_target_closed', error: 'Наблюдаемая вкладка закрыта' });
@@ -127,7 +139,7 @@ function createResponseObservationService({ store, readState, readResponse, evid
         return wait(run, children, 'response-subject-unavailable');
       }
       if (!subject && !currentTurnOnly) {
-        const current = await readState(run.targetTabId);
+        const current = await readRuntime(run, 'after-response');
         const currentChildren = run.waitForDescendants === false ? [] : childRuns(await store.listAll(), run.targetTabId);
         if (current?.known !== true) return wait(run, currentChildren, 'runtime-unknown:changed-during-read');
         if (current.sessionId !== target.sessionId || current.toolType !== target.toolType) {

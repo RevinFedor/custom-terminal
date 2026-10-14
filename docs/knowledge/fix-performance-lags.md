@@ -588,6 +588,19 @@ background output и отказ скрытого Home принимать surface
 
 ---
 
+### Повторный status из-за собственного index.lock
+
+13.10 отдельно подтверждён цикл даже у одного foreground chip: `git status`
+обновляет индекс, recursive watcher видит index/index.lock, renderer снова запрашивает
+status. В private repo три чтения дали файловые события при неизменном porcelain;
+без optional locks — тот же ответ без этих событий. Новый actual контроль подменяет
+inode рабочего файла при сохранённых bytes: обычный status переписывает index,
+исправленный summary/full сохраняет его bytes и всё равно видит следующие изменения
+и untracked-файлы. Явный staging и merge не затронуты. RED2FAIL/1PASS, GREEN19PASS
+вместе с coordinator и actual Git merge controls; Electron/UI в этом контроле нет.
+Это source-ремонт лишнего фонового цикла, не доказанное устранение production Main
+SQL-пауз28–32s. Installed-приёмка отдельно; пользователь пока запретил Build Install.
+
 ## 8. Observability Toolkit (для будущих регрессий)
 
 12.10 installed-репорт после restore показал одновременно renderer input waits
@@ -616,6 +629,18 @@ hashing и SQL PREPARE в Main. Source-ремонт переиспользует
 192 executions, stat54→6. Этот профиль снят после trigger, а не на wheel17:18:
 счётчики доказывают устранение лишних операций, не ускорение того жеста.
 Границы свежести и retirement debounce — [каталог промптов](fact-project-prompts.md).
+
+После пользовательской установки Diagnostic25 в13Oct18:24UTC именованные production
+summaries показали оставшуюся работу этого caller: один `catalog.usageForRoot` занял
+1378ms/1077ms Main-threadCPU, прошёл1754bindings и11857каталогов; собственные SQL
+counts/times участка составили около23ms. Это наблюдение после установки prepare reuse,
+не ретроспективный JS-стек прежних30s пауз. Даже пустой результат usage был дорогим:
+фильтрация requested root происходила после полного scan чужих `docs`. Адресная
+дельта пропускает только proven-disjoint каталоги и не прогревает полный cache
+частичным ответом. Сравнение before/after на настоящем tempFS/symlinks проверяет
+равенство всего usage и следующего полного picker, fresh SQL/CAS/watchers отдельно.
+Installed ускорение этой дельты должно подтверждаться на новом artifact; меньшее
+число directory reads в контроле не является замером прежнего клика.
 
 Название кнопки не локализует зависание. В сохранённом installed Copy сначала
 pointerdown занял236.3ms и содержал работу переключения панели; поздний click

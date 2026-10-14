@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const { promptFingerprint } = require('./claude-prompt-carriers');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { agentPromptAuditMatchesHash } = require('./agent-prompt-audit-identity');
+const { canSubmitContinuationInput, continuationTargetExpectation, continuationTargetScopeMatches } = require('./orchestration-continuation-input');
 
 const CONTINUATION_SOURCE = 'orchestration-continue:';
 const OWNER = 'orchestration-continuation';
@@ -48,20 +49,23 @@ function latestMatchesOriginal(latest, original, run) {
     return context.provider === expected.provider && context.sessionId === expected.sessionId
       && context.turnId === expected.turnId;
   }
-  if (latest.subject.promptUserUuid === original.userUuid
-    || latest.subject.promptUserUuid === run.resultPromptProofUserUuid
-    || latest.subject.promptUserUuid === run.targetPromptProofUserUuid) return true;
+  if (latest.subject.promptUserUuid && [original.userUuid, run.resultPromptProofUserUuid,
+    run.targetPromptProofUserUuid].some(uuid => uuid && uuid === latest.subject.promptUserUuid)) return true;
   return Number.isSafeInteger(latest.result.turnIndex) && Number.isSafeInteger(original.startTurnIndex)
     && Number.isSafeInteger(original.endTurnIndex) && latest.result.turnIndex >= original.startTurnIndex
     && latest.result.turnIndex <= original.endTurnIndex;
 }
 
 function createOrchestrationContinuationService({ store, receipts, readState, readOriginal, readLatest,
-  send, reconcile, deliver, emit = () => {}, now = Date.now, createReplacement, readInfo, reaudit, resumeReplacement } = {}) {
+  send, reconcile, deliver, emit = () => {}, now = Date.now, createReplacement, readInfo, reaudit, resumeReplacement, log = console } = {}) {
   const inflight = new Map();
-  const reject = async (runId, code, error) => ({ ok: false, code, error,
-    canCreateNewRequest: ['continuation_history_changed', 'continuation_request_closed'].includes(code),
-    run: await store.get(runId) });
+  const reject = async (runId, code, error, reason = code) => {
+    const run = await store.get(runId);
+    log.warn('[OrchestrationContinuation] refused ' + JSON.stringify({ run: runId,
+      operation: run?.continuation?.operationId || null, reason }));
+    return { ok: false, code, error,
+      canCreateNewRequest: ['continuation_history_changed', 'continuation_request_closed'].includes(code), run };
+  };
   const emitResult = result => { emit(result?.changed || (result?.run ? [result.run] : [])); return result; };
 
   async function prepareRequest(runId, operationId) {
@@ -70,7 +74,8 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
       || receipts.isDeliveryCancelled(intent.operationKey)) throw new Error('continuation_cancelled');
     const source = await readState(run.sourceTabId), target = await readState(run.targetTabId);
     if (!partyMatches(source, intent.sourceExpected) || !partyMatches(target, intent.targetExpected)) throw new Error('continuation_history_changed');
-    if (target.busy !== false || !['found', 'absent'].includes(target.processStatus)
+    if (run.targetCwd && target.cwd && require('node:path').resolve(run.targetCwd) !== require('node:path').resolve(target.cwd)) throw new Error('continuation_history_changed');
+    if (!canSubmitContinuationInput(target) || !continuationTargetScopeMatches(intent.targetExpected, target)
       || target.backgroundWorkCount > 0 || ['active', 'attention', 'attention_required'].includes(target.goalWork?.status)) throw new Error('continuation_target_not_idle');
     const baseRun = { ...run, targetExecutionContext: intent.baseExecutionContext };
     const original = await readOriginal(baseRun, { target, baseLookup: intent.baseLookup });
@@ -79,8 +84,10 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
     const sourceAfter = await readState(run.sourceTabId), targetAfter = await readState(run.targetTabId);
     const current = await store.getInternal(runId);
     if (terminal(current) || current?.continuationIntent?.operationId !== operationId
+      || current.continuationIntent.cancelledAt || receipts.isDeliveryCancelled(intent.operationKey)
       || !partyMatches(sourceAfter, intent.sourceExpected) || !partyMatches(targetAfter, intent.targetExpected)
-      || sourceAfter.revision !== source.revision || targetAfter.revision !== target.revision || targetAfter.busy !== false) throw new Error('continuation_state_changed');
+      || sourceAfter.revision !== source.revision || targetAfter.revision !== target.revision
+      || !canSubmitContinuationInput(targetAfter) || !continuationTargetScopeMatches(intent.targetExpected, targetAfter)) throw new Error('continuation_state_changed');
   }
 
   async function confirm(runId) {
@@ -146,16 +153,19 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
     }
     const sourceExpected = run.sourceSendTarget || { toolType: run.sourceToolType || run.sourceExecutionContext?.provider,
       sessionId: run.sourceExecutionContext?.sessionId || run.sourceSessionId };
-    const targetExpected = { toolType: run.targetToolType, sessionId: run.sessionId || run.targetPromptProofSessionId };
+    let targetExpected = { toolType: run.targetToolType, sessionId: run.sessionId || run.targetPromptProofSessionId };
     const source = await readState(run.sourceTabId);
     const target = await readState(run.targetTabId);
+    if ([source, target].some(state => state?.continuationInput?.reason === 'continuation_runtime_changed')) {
+      return reject(runId, 'continuation_runtime_unknown', 'Состояние изменилось во время проверки; повторите действие.',
+        'continuation_runtime_changed');
+    }
     if (!partyMatches(source, sourceExpected) || !partyMatches(target, targetExpected)) {
       return reject(runId, 'continuation_history_changed', 'Источник или исполнитель теперь относятся к другой либо недоступной истории. Создайте новый запрос явно.');
     }
     if (run.targetCwd && target.cwd && require('node:path').resolve(run.targetCwd) !== require('node:path').resolve(target.cwd)) {
       return reject(runId, 'continuation_history_changed', 'Рабочая директория исполнителя изменилась. Создайте новый запрос явно.');
     }
-    if (target.busy === null || target.processStatus === 'unknown') return reject(runId, 'continuation_runtime_unknown', 'Состояние исполнителя пока не подтверждено. Повторите проверку, не отправляя continue вручную.');
     const original = await readOriginal(run, { target });
     if (original?.found !== true || original.sourceVerified !== true) return reject(runId, 'continuation_history_changed', 'Исходное поручение не подтверждено в текущей истории. Создайте новый запрос.');
     if (target.backgroundWorkCount > 0 || ['active', 'attention', 'attention_required'].includes(target.goalWork?.status)) {
@@ -174,6 +184,8 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
       await deliver(runId);
       return { ok: true, resultReady: true, run: await store.get(runId) };
     }
+    if (!['found', 'absent'].includes(target.processStatus)) return reject(runId, 'continuation_runtime_unknown',
+      'Состояние процесса исполнителя пока не подтверждено; повторите проверку.', 'continuation_process_unknown');
     if (target.busy === true) {
       const context = target.executionContext, expected = run.targetExecutionContext;
       if (!context || context.provider !== expected?.provider || context.sessionId !== expected?.sessionId || context.turnId !== expected?.turnId) {
@@ -184,11 +196,16 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
       await reconcile(runId, 'continuation-already-working');
       return { ok: true, alreadyActive: true, run: await store.get(runId) };
     }
+    if (!canSubmitContinuationInput(target)) return reject(runId, 'continuation_runtime_unknown',
+      'Состояние исполнителя пока не подтверждено. Повторите проверку, не отправляя continue вручную.',
+      target.continuationInput?.reason || 'continuation_input_unproven');
+    targetExpected = continuationTargetExpectation(targetExpected, target);
     const latest = await readLatest(run, target);
-    if (!latestMatchesOriginal(latest, original, run)) return reject(runId, 'continuation_history_changed', 'Последний ход не относится к выбранному поручению. Создайте новый запрос, не продолжая чужую задачу.');
+    if (!latestMatchesOriginal(latest, original, run)) return reject(runId, 'continuation_history_changed', 'Последний ход не относится к выбранному поручению. Создайте новый запрос, не продолжая чужую задачу.', latest?.code || 'continuation_history_changed');
     const afterSource = await readState(run.sourceTabId), afterTarget = await readState(run.targetTabId);
     if (!partyMatches(afterSource, sourceExpected) || !partyMatches(afterTarget, targetExpected)
-      || afterSource.revision !== source.revision || afterTarget.revision !== target.revision || afterTarget.busy !== false) {
+      || afterSource.revision !== source.revision || afterTarget.revision !== target.revision
+      || !canSubmitContinuationInput(afterTarget) || !continuationTargetScopeMatches(targetExpected, afterTarget)) {
       return reject(runId, 'continuation_state_changed', 'Вкладки изменились во время проверки. Continue не отправлен; повторите действие.');
     }
     const claimed = emitResult(await store.beginRequestContinuation(runId, {
@@ -200,6 +217,9 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
     if (!claimed.accepted) return reject(runId, claimed.reason || 'continuation_state_changed',
       claimed.reason === 'continuation-target-claimed' ? 'Для исполнителя уже принято другое поручение. Порядок очереди не изменён.' : 'Состояние запроса изменилось; ввод не выполнен.');
     const intent = claimed.intent;
+    // Reuse the persisted target on an idempotent claim. A stopped -> ready
+    // transition must not change the fingerprint of an already-reserved send.
+    const sendExpectedTarget = intent.targetExpected;
     if (run.continuationIntent && run.continuationIntent.operationKey !== intent.operationKey) {
       receipts.unpinForOwner(run.continuationIntent.operationKey, OWNER);
     }
@@ -211,7 +231,7 @@ function createOrchestrationContinuationService({ store, receipts, readState, re
       const result = await send({ tabId: run.targetTabId, prompt: 'continue', workContextPrepared: true,
         handoffId: intent.handoffId, sendOperationKey: intent.operationKey, sendSurface: 'desktop-history',
         source: CONTINUATION_SOURCE + runId, ownership: 'project', queue: false,
-        provider: targetExpected.toolType, sessionId: targetExpected.sessionId, expectedTarget: targetExpected,
+        provider: sendExpectedTarget.toolType, sessionId: sendExpectedTarget.sessionId, expectedTarget: sendExpectedTarget,
         statusAtSend: afterTarget.processStatus === 'absent' ? 'inactive' : 'active',
         prepareSend: () => prepareRequest(runId, intent.operationId),
       }, run);

@@ -134,6 +134,7 @@ function createAgentResponseObservationReader({
       before = capture(tabId);
       const base = { known: before.known === true, tabId, toolType: before.toolType || null,
         sessionId: before.sessionId || null, cwd: before.cwd || null, busy: null, revision: before.revision,
+        transitioning: before.transitioning,
         backgroundWorkCount: before.backgroundWorkCount ?? 0, executionContext: null, processStatus: 'unknown' };
       if (before.goalWork) base.goalWork = before.goalWork;
       if (before.exists === false && base.known) return { ...base, exists: false,
@@ -228,7 +229,51 @@ function createAgentResponseObservationReader({
     return null;
   }
 
-  async function readAgentObservedResponse({ tabId, expectedSessionId, subject: inputSubject, maxChars } = {}) {
+  // Private continuation history check. It selects the latest EXECUTION, not
+  // the latest successful answer, and publishes identity only. An interrupted
+  // or abruptly-ended saved request need not have a completed response. Input
+  // authority belongs to the continuation adapter and canonical sender.
+  async function readContinuationLatestIdentity({ tabId, expectedSessionId, maxChars } = {}) {
+    if (!tabId || !expectedSessionId) return failure('response_identity_required');
+    const before = await getAgentResponseState(tabId);
+    const invalid = ownerError(before, expectedSessionId, null);
+    if (invalid) return invalid;
+    if (before.toolType !== 'codex') return failure('continuation_history_provider_unsupported');
+    if (before.busy === true || before.transitioning !== false
+      || !['found', 'absent'].includes(before.processStatus)) return pending('continuation_history_runtime_unstable');
+    if (typeof readLatestCodexExecution !== 'function') return failure('codex_latest_observed_execution_reader_unavailable');
+    let loaded;
+    try {
+      loaded = await readLatestCodexExecution({ sessionId: expectedSessionId, cwd: before.cwd,
+        resultReadMode: 'authoritative', maxChars: limitChars(maxChars) });
+    } catch (error) {
+      return failure(error?.code || 'continuation_history_read_failed');
+    }
+    const after = await getAgentResponseState(tabId);
+    const changedOwner = ownerError(after, expectedSessionId, null);
+    if (changedOwner) return changedOwner;
+    if (before.revision !== after.revision || before.toolType !== after.toolType || before.cwd !== after.cwd
+      || before.processStatus !== after.processStatus || after.busy === true || after.transitioning !== false) {
+      return pending('response_state_changed');
+    }
+    if (loaded?.success !== true || loaded.sourceVerified !== true) {
+      return pending(loaded?.errorCode || 'response_source_unverified');
+    }
+    const subject = normalizeSubject({ kind: 'codex-historical-execution', toolType: 'codex',
+      sessionId: expectedSessionId, targetExecutionContext: loaded.executionContext });
+    if (!subject) return failure('response_subject_unresolved');
+    return { subject, result: { found: true, sourceVerified: true,
+      executionContext: subject.targetExecutionContext,
+      ...(Number.isSafeInteger(loaded.turnIndex) ? { turnIndex: loaded.turnIndex } : {}) } };
+  }
+
+  async function readAgentObservedResponse({ tabId, expectedSessionId, subject: inputSubject, maxChars, purpose } = {}) {
+    // Reuse the existing private Main callback, without adding an unprovided
+    // web option or an idle override to the ordinary completion reader.
+    if (purpose === 'continuation-history') {
+      if (inputSubject != null) return failure('continuation_history_requires_latest');
+      return readContinuationLatestIdentity({ tabId, expectedSessionId, maxChars });
+    }
     if (!tabId || !expectedSessionId) return failure('response_identity_required');
     const explicit = inputSubject != null;
     let subject = explicit ? normalizeSubject(inputSubject) : null;

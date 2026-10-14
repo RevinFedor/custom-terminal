@@ -5,6 +5,8 @@ const path = require('path');
 const { callGeminiApi } = require('./gemini-api');
 const { buildChildProcessEnv } = require('../child-process-env');
 const { createGitStatusCoordinator } = require('./git-status-coordinator');
+const { causal } = require('../perf-causal-context');
+let diagnosticGitSequence = 0;
 
 const GIT_TIMEOUT_MS = 90 * 1000;
 const GIT_MAX_BUFFER = 32 * 1024 * 1024;
@@ -48,13 +50,15 @@ function safeProjectPath(projectPath) {
 }
 
 function runGit(cwd, args, options = {}) {
+  const fields = { readId: 'git-command:' + process.pid + ':' + (++diagnosticGitSequence) };
   return new Promise((resolve) => {
-    execFile('git', args, {
+    causal.syncWork('git.launch', fields, () => {
+    const child = execFile('git', args, {
       cwd,
       timeout: options.timeout || GIT_TIMEOUT_MS,
       maxBuffer: options.maxBuffer || GIT_MAX_BUFFER,
       env: buildChildProcessEnv({ GIT_TERMINAL_PROMPT: '0' }),
-    }, (error, stdout = '', stderr = '') => {
+    }, (error, stdout = '', stderr = '') => causal.syncWork('git.callback', fields, () => {
       if (error) {
         return resolve({
           success: false,
@@ -65,6 +69,14 @@ function runGit(cwd, args, options = {}) {
         });
       }
       resolve({ success: true, code: 0, stdout, stderr });
+    }));
+    // These timestamps describe observed callbacks, not kernel exit time or
+    // child CPU. Never record argv, stdout, stderr or error bodies here.
+    child.once('spawn', () => causal.event('git-child', { ...fields, phase: 'spawn-observed', childPid: child.pid }));
+    child.once('exit', code => causal.event('git-child', { ...fields, phase: 'exit-observed', childPid: child.pid,
+      exitCode: Number.isFinite(code) ? code : null }));
+    child.once('close', code => causal.event('git-child', { ...fields, phase: 'close-observed', childPid: child.pid,
+      exitCode: Number.isFinite(code) ? code : null }));
     });
   });
 }
@@ -117,6 +129,7 @@ function fileStatusFromNameStatus(code) {
 }
 
 function parseStatus(stdout) {
+  return causal.syncWork('git.parse-full', {}, () => {
   const lines = stdout.split(/\r?\n/).filter(Boolean);
   const branchInfo = parseBranchLine(lines[0] || '');
   const files = [];
@@ -138,9 +151,11 @@ function parseStatus(stdout) {
     });
   }
   return { ...branchInfo, files };
+  });
 }
 
 function parseStatusSummary(stdout) {
+  return causal.syncWork('git.parse-summary', {}, () => {
   const lines = String(stdout || '').split(/\r?\n/).filter(Boolean);
   const branchInfo = parseBranchLine(lines[0] || '');
   let changedCount = 0;
@@ -153,6 +168,7 @@ function parseStatusSummary(stdout) {
     if (isDocsPath(displayPath || '')) hasDocsChanges = true;
   }
   return { ...branchInfo, changedCount, hasDocsChanges };
+  });
 }
 
 function isDocsPath(filePath) {
@@ -203,7 +219,9 @@ function trimText(text, maxChars) {
 
 async function getStatusForRoot(root, detail = 'full') {
   if (detail === 'summary') {
-    const statusResult = await runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']);
+    // A status read must not refresh .git/index: our repository watcher would
+    // observe that optional write and request the same status again.
+    const statusResult = await runGit(root, ['--no-optional-locks', '-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']);
     if (!statusResult.success) throw new Error(statusResult.stderr || statusResult.error || 'git status failed');
     const parsed = parseStatusSummary(statusResult.stdout);
     return {
@@ -222,7 +240,7 @@ async function getStatusForRoot(root, detail = 'full') {
     };
   }
   const [statusResult, remoteResult, userNameResult, userEmailResult, credentialHelperResult, merge] = await Promise.all([
-    runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']),
+    runGit(root, ['--no-optional-locks', '-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']),
     runGit(root, ['config', '--get', 'remote.origin.url']),
     runGit(root, ['config', '--get', 'user.name']),
     runGit(root, ['config', '--get', 'user.email']),
@@ -827,7 +845,7 @@ async function previewMergeForRoot(root, sourceBranch) {
     };
   }
 
-  const statusResult = await runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']);
+  const statusResult = await runGit(root, ['--no-optional-locks', '-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']);
   if (!statusResult.success) throw new Error(statusResult.stderr || statusResult.error || 'git status failed');
   const dirtyFiles = parseStatus(statusResult.stdout).files;
   if (dirtyFiles.length) {

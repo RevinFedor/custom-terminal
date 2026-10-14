@@ -33,6 +33,34 @@ test('continue_delegation rejects an old Main before any mutation', async t => {
   assert.equal(response.result.isError, true); assert.equal(h.requests.length, 1);
 });
 
+test('recheck_tab_response uses a dedicated read-only same-ID action, not generic retry or new wait', async t => {
+  const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { responseObservations: { version: 1, recheck: { version: 1 } } } } }
+    : { status: 200, body: { ok: true, run: { runId: 'old-observation', status: 'running' } } });
+  const result = await h.invoke({ runId: 'old-observation' }, 'recheck_tab_response');
+  assert.equal(result.result.isError, undefined);
+  assert.deepEqual(h.requests.map(r => [r.method, r.url]), [['GET', '/api/me'], ['POST', '/api/orchestrations/old-observation/action']]);
+  assert.deepEqual(h.requests[1].body, { action: 'recheck' });
+  const tool = (await h.rpc('tools/list')).result.tools.find(item => item.name === 'recheck_tab_response');
+  assert.deepEqual(tool.inputSchema.required, ['runId']);
+});
+
+test('read-only recheck requires its own capability and forbids target/input overrides', async t => {
+  const h = await createHarness(t, () => ({ status: 200, body: { capabilities: { responseObservations: { version: 1 } } } }));
+  assert.equal((await h.invoke({ runId: 'old' }, 'recheck_tab_response')).result.isError, true);
+  assert.equal(h.requests.length, 1);
+  assert.equal((await h.invoke({ runId: 'old', tabId: 'new-target' }, 'recheck_tab_response')).result.isError, true);
+  assert.equal(h.requests.length, 1);
+});
+
+test('lost read-only recheck ACK never triggers a fallback or an automatic second request', async t => {
+  const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
+    ? { status: 200, body: { capabilities: { responseObservations: { recheck: { version: 1 } } } } }
+    : { disconnect: true });
+  assert.equal((await h.invoke({ runId: 'old' }, 'recheck_tab_response')).result.isError, true);
+  assert.equal(h.requests.length, 2);
+});
+
 const userNotifyCapability = { userNotifications: { version: 1, telegramOnly: true } };
 function userNotifyReceipt(body, extra = {}) {
   const sentAt = Date.now() - 2000;

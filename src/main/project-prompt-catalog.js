@@ -2,6 +2,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { causal } = require('./perf-causal-context');
 
 const PROMPT_SUFFIX = '.prompt.md';
 const ROOT_PARENT = '__root__';
@@ -21,15 +22,20 @@ function expandHome(input) {
   return value;
 }
 
-function canonicalPath(input, fsImpl = fs, cache) {
+function canonicalPath(input, fsImpl = fs, cache, knownPaths) {
   const resolved = path.resolve(expandHome(input));
-  if (cache?.has(resolved)) return cache.get(resolved);
+  if (cache?.has(resolved)) {
+    causal.count('canonicalHits');
+    return cache.get(resolved);
+  }
+  causal.count('canonicalReads');
   let canonical = resolved;
   try {
     canonical = fsImpl.realpathSync.native
       ? fsImpl.realpathSync.native(resolved)
       : fsImpl.realpathSync(resolved);
-  } catch {}
+    knownPaths?.set(resolved, true);
+  } catch { knownPaths?.set(resolved, false); }
   cache?.set(resolved, canonical);
   return canonical;
 }
@@ -87,6 +93,7 @@ function sourceDisplayLabels(sourcePaths) {
 
 function safeDirectoryEntries(dirPath, fsImpl = fs) {
   try {
+    causal.count('directoryReads');
     return fsImpl.readdirSync(dirPath, { withFileTypes: true })
       .filter((entry) => !entry.name.startsWith('.') && !entry.isSymbolicLink())
       .map((entry) => ({
@@ -155,10 +162,14 @@ function orderDirectoryEntries(entries, dirPath, rootPath, rawLayout) {
 }
 
 function sourceDirectoryState(rootPath, fsImpl, readContext) {
-  if (readContext?.directories.has(rootPath)) return readContext.directories.get(rootPath);
+  if (readContext?.directories.has(rootPath)) {
+    causal.count('directoryHits');
+    return readContext.directories.get(rootPath);
+  }
   const docsPath = path.join(rootPath, 'docs');
   let rootExists = false;
   let docsExists = false;
+  causal.count('statReads', 2);
   try { rootExists = fsImpl.statSync(rootPath).isDirectory(); } catch {}
   try { docsExists = fsImpl.statSync(docsPath).isDirectory(); } catch {}
   const value = { docsPath, exists: rootExists, docsExists };
@@ -166,12 +177,31 @@ function sourceDirectoryState(rootPath, fsImpl, readContext) {
   return value;
 }
 
+// A usage-only scan may omit unrelated subtrees. Such records must never warm
+// the complete picker catalog. Weak metadata leaves every public DTO unchanged.
+const partialUsageScans = new WeakSet();
 function scanSource({ projectId, rootPath, sourceName, layout, fsImpl = fs, readContext }) {
+  causal.count('sourceScans');
   const { docsPath, exists: rootExists, docsExists } = sourceDirectoryState(rootPath, fsImpl, readContext);
 
   const prompts = [];
+  let partial = false;
   if (docsExists) {
-    const walk = (dirPath) => {
+    const walk = (dirPath, scanWholeSubtree = false) => {
+      const usageRoot = readContext?.usageRoot;
+      if (usageRoot && !scanWholeSubtree) {
+        const real = canonicalPath(dirPath, fsImpl, readContext.canonicalPaths, readContext.canonicalKnown);
+        // Failed realpath is UNKNOWN, not proof of disjointness. Preserve the
+        // original full walk in that case, including its read/error behavior.
+        if (readContext.canonicalKnown.get(path.resolve(dirPath)) === true) {
+          // A known directory realpath does not prove that every leaf realpath
+          // will succeed. Preserve the final filter's configured-path fallback.
+          if (!sourceOverlap(usageRoot, real) && !sourceOverlap(usageRoot, path.resolve(dirPath))) {
+            partial = true; causal.count('usageSubtreesSkipped'); return;
+          }
+          scanWholeSubtree = isInside(usageRoot, real);
+        } else { scanWholeSubtree = true; causal.count('usageCanonicalUnknown'); }
+      }
       const entries = orderDirectoryEntries(
         safeDirectoryEntries(dirPath, fsImpl),
         dirPath,
@@ -180,7 +210,7 @@ function scanSource({ projectId, rootPath, sourceName, layout, fsImpl = fs, read
       );
       for (const entry of entries) {
         if (entry.isDirectory) {
-          walk(entry.path);
+          walk(entry.path, scanWholeSubtree);
           continue;
         }
         if (!entry.name.toLocaleLowerCase().endsWith(PROMPT_SUFFIX)) continue;
@@ -204,7 +234,7 @@ function scanSource({ projectId, rootPath, sourceName, layout, fsImpl = fs, read
     walk(docsPath);
   }
 
-  return {
+  const result = {
     rootPath,
     sourceName,
     docsPath,
@@ -213,6 +243,8 @@ function scanSource({ projectId, rootPath, sourceName, layout, fsImpl = fs, read
     promptCount: prompts.length,
     prompts,
   };
+  if (partial) partialUsageScans.add(result);
+  return result;
 }
 
 function catalogSource(input, readContext) {
@@ -224,9 +256,11 @@ function catalogSource(input, readContext) {
   if (!value) {
     value = scanSource({ ...input, readContext });
     readContext.scans.set(key, value);
-  }
+  } else causal.count('scanHits');
   // Each retained tab catalog still owns its records and attachment arrays.
-  return { ...value, prompts: value.prompts.map(prompt => ({ ...prompt, file_paths: [...prompt.file_paths] })) };
+  const result = { ...value, prompts: value.prompts.map(prompt => ({ ...prompt, file_paths: [...prompt.file_paths] })) };
+  if (partialUsageScans.has(value)) partialUsageScans.add(result);
+  return result;
 }
 
 class ProjectPromptCatalogService {
@@ -246,8 +280,11 @@ class ProjectPromptCatalogService {
   }
 
   getSources(projectId, readContext) {
-    const rows = this.db.getProjectPromptSources(projectId);
-    return this.describeSources(rows, readContext);
+    const work = () => {
+      const rows = this.db.getProjectPromptSources(projectId);
+      return this.describeSources(rows, readContext);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('catalog.getSources', {}, work);
   }
 
   describeSources(rows, readContext) {
@@ -271,255 +308,304 @@ class ProjectPromptCatalogService {
   }
 
   getTabSources(tabId, readContext) {
-    if (!this.rootRegistry) {
-      throw Object.assign(new Error('root_registry_unavailable'), { code: 'root_registry_unavailable' });
-    }
-    if (typeof tabId !== 'string' || !tabId) {
-      throw Object.assign(new Error('tab_id_required'), { code: 'tab_id_required' });
-    }
-    const sources = readContext?.sourcesForTab
-      ? readContext.sourcesForTab(tabId) : this.rootRegistry.sourcesForTab(tabId);
-    return this.describeSources(sources, readContext);
+    const work = () => {
+      if (!this.rootRegistry) {
+        throw Object.assign(new Error('root_registry_unavailable'), { code: 'root_registry_unavailable' });
+      }
+      if (typeof tabId !== 'string' || !tabId) {
+        throw Object.assign(new Error('tab_id_required'), { code: 'tab_id_required' });
+      }
+      const sources = readContext?.sourcesForTab
+        ? readContext.sourcesForTab(tabId) : this.rootRegistry.sourcesForTab(tabId);
+      return this.describeSources(sources, readContext);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('catalog.getTabSources', { tabId }, work);
   }
 
   setTabSources(request) {
-    const current = this.getTabSources(request?.tabId);
-    const snapshot = this.rootRegistry.read();
-    const roots = snapshot.roots;
-    const byId = new Map([...current, ...roots.map(root => ({ ...root, rootPath: root.path }))]
-      .map(root => [root.rootId || root.id, root]));
-    const selected = (Array.isArray(request.rootIds) ? request.rootIds : []).map(id => byId.get(id));
-    // Preserve unavailable registrations; path existence is not binding validity.
-    const known = selected.filter(Boolean);
-    // A committed retry has an older revision. Let the registry return its
-    // durable receipt before validating paths that may since have changed.
-    if (request.expectedRevision === snapshot.revision && normalizeSourceRoots(known, this.fs).length !== known.length) {
-      throw Object.assign(new Error('overlapping_prompt_sources'), {
-        code: 'overlapping_prompt_sources', paths: known.map(source => source.rootPath),
-      });
-    }
-    const result = this.rootRegistry.setTabSources(request);
-    this.invalidateTabs([request.tabId], 'sources-changed');
-    this.refreshWatchers();
-    return result;
+    const work = () => {
+      const current = this.getTabSources(request?.tabId);
+      const snapshot = this.rootRegistry.read();
+      const roots = snapshot.roots;
+      const byId = new Map([...current, ...roots.map(root => ({ ...root, rootPath: root.path }))]
+        .map(root => [root.rootId || root.id, root]));
+      const selected = (Array.isArray(request.rootIds) ? request.rootIds : []).map(id => byId.get(id));
+      // Preserve unavailable registrations; path existence is not binding validity.
+      const known = selected.filter(Boolean);
+      // A committed retry has an older revision. Let the registry return its
+      // durable receipt before validating paths that may since have changed.
+      if (request.expectedRevision === snapshot.revision && normalizeSourceRoots(known, this.fs).length !== known.length) {
+        throw Object.assign(new Error('overlapping_prompt_sources'), {
+          code: 'overlapping_prompt_sources', paths: known.map(source => source.rootPath),
+        });
+      }
+      const result = this.rootRegistry.setTabSources(request);
+      this.invalidateTabs([request.tabId], 'sources-changed');
+      this.refreshWatchers();
+      return result;
+    };
+    return causal.hasWork() ? work() : causal.syncWork('catalog.setTabSources', {}, work);
   }
 
   listTab(tabId, { force = false, refreshWatchers = true, readContext } = {}) {
-    const allSources = this.getTabSources(tabId, readContext);
-    const signature = JSON.stringify(allSources);
-    const cached = this.tabCache.get(tabId);
-    if (!force && cached?.signature === signature && Date.now() - cached.cachedAt < CACHE_TTL_MS) return cached.value;
-    const sources = allSources.filter(source => source.enabled === true)
-      .sort((a, b) => naturalCompare(a.sourceName, b.sourceName));
-    const scannedSources = sources.map(source => ({
-      ...source,
-      ...catalogSource({
-        // The namespace of the ORIGINAL binding is part of the prompt id.
-        projectId: source.projectId,
-        rootPath: source.rootPath,
-        sourceName: source.sourceName,
-        layout: this.layoutStore?.get(source.rootPath)?.layout || null,
-        fsImpl: this.fs,
-      }, readContext),
-    }));
-    const value = {
-      tabId,
-      sources: scannedSources.map(({ prompts, ...source }) => ({ ...source, promptCount: prompts.length })),
-      prompts: scannedSources.flatMap(source => source.prompts),
-      updatedAt: Date.now(),
+    const work = () => {
+      const allSources = this.getTabSources(tabId, readContext);
+      const signature = JSON.stringify(allSources);
+      const cached = this.tabCache.get(tabId);
+      if (!force && cached?.signature === signature && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
+        causal.count('cacheHits');
+        return cached.value;
+      }
+      causal.count('cacheMisses');
+      const sources = allSources.filter(source => source.enabled === true)
+        .sort((a, b) => naturalCompare(a.sourceName, b.sourceName));
+      let complete = true;
+      const scannedSources = sources.map(source => {
+        const scanned = catalogSource({
+          // The namespace of the ORIGINAL binding is part of the prompt id.
+          projectId: source.projectId,
+          rootPath: source.rootPath,
+          sourceName: source.sourceName,
+          layout: this.readLayout(source.rootPath),
+          fsImpl: this.fs,
+        }, readContext);
+        if (partialUsageScans.has(scanned)) complete = false;
+        return { ...source, ...scanned };
+      });
+      const value = {
+        tabId,
+        sources: scannedSources.map(({ prompts, ...source }) => ({ ...source, promptCount: prompts.length })),
+        prompts: scannedSources.flatMap(source => source.prompts),
+        updatedAt: Date.now(),
+      };
+      if (complete) this.tabCache.set(tabId, { signature, cachedAt: Date.now(), value });
+      // Missing roots can reappear while the picker was closed.
+      if (refreshWatchers) this.refreshWatchers(readContext);
+      return value;
     };
-    this.tabCache.set(tabId, { signature, cachedAt: Date.now(), value });
-    // Missing roots can reappear while the picker was closed.
-    if (refreshWatchers) this.refreshWatchers(readContext);
-    return value;
+    return causal.hasWork() ? work() : causal.syncWork('catalog.listTab', { tabId }, work);
   }
 
   setSources(projectId, roots) {
-    const normalized = normalizeSourceRoots(roots, this.fs);
-    const saved = this.db.saveProjectPromptSources(projectId, normalized);
-    this.invalidate([projectId], 'sources-changed');
-    this.refreshWatchers();
-    return saved;
+    const work = () => {
+      const normalized = normalizeSourceRoots(roots, this.fs);
+      const saved = this.db.saveProjectPromptSources(projectId, normalized);
+      this.invalidate([projectId], 'sources-changed');
+      this.refreshWatchers();
+      return saved;
+    };
+    return causal.hasWork() ? work() : causal.syncWork('catalog.setSources', {}, work);
   }
 
   listProject(projectId, { force = false, readContext } = {}) {
-    const cached = this.cache.get(projectId);
-    if (!force && cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) return cached.value;
-
-    const project = this.db.getProjectById(projectId);
-    if (!project) {
-      const error = new Error('project_not_found');
-      error.code = 'project_not_found';
-      throw error;
-    }
-    const sources = this.getSources(projectId, readContext)
-      .sort((a, b) => naturalCompare(a.sourceName, b.sourceName));
-    const scannedSources = sources.map((source) => {
-      const layout = this.layoutStore?.get(source.rootPath)?.layout || null;
-      return catalogSource({
-        projectId,
-        rootPath: source.rootPath,
-        sourceName: source.sourceName,
-        layout,
-        fsImpl: this.fs,
-      }, readContext);
-    });
-    const prompts = scannedSources.flatMap((source) => source.prompts);
-    const value = {
-      project: {
-        id: project.id,
-        name: project.name,
-        path: project.path,
-        icon: project.icon || null,
-      },
-      sources: scannedSources.map(({ prompts: sourcePrompts, ...source }) => ({
-        ...source,
-        promptCount: sourcePrompts.length,
-      })),
-      prompts,
-      updatedAt: Date.now(),
+    const work = () => {
+      const cached = this.cache.get(projectId);
+      if (!force && cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
+        causal.count('cacheHits');
+        return cached.value;
+      }
+      causal.count('cacheMisses');
+  
+      const project = this.db.getProjectById(projectId);
+      if (!project) {
+        const error = new Error('project_not_found');
+        error.code = 'project_not_found';
+        throw error;
+      }
+      const sources = this.getSources(projectId, readContext)
+        .sort((a, b) => naturalCompare(a.sourceName, b.sourceName));
+      const scannedSources = sources.map((source) => {
+        const layout = this.readLayout(source.rootPath);
+        return catalogSource({
+          projectId,
+          rootPath: source.rootPath,
+          sourceName: source.sourceName,
+          layout,
+          fsImpl: this.fs,
+        }, readContext);
+      });
+      const prompts = scannedSources.flatMap((source) => source.prompts);
+      const value = {
+        project: {
+          id: project.id,
+          name: project.name,
+          path: project.path,
+          icon: project.icon || null,
+        },
+        sources: scannedSources.map(({ prompts: sourcePrompts, ...source }) => ({
+          ...source,
+          promptCount: sourcePrompts.length,
+        })),
+        prompts,
+        updatedAt: Date.now(),
+      };
+      if (scannedSources.every(source => !partialUsageScans.has(source))) {
+        this.cache.set(projectId, { cachedAt: Date.now(), value });
+      }
+      return value;
     };
-    this.cache.set(projectId, { cachedAt: Date.now(), value });
-    return value;
+    return causal.hasWork() ? work() : causal.syncWork('catalog.listProject', {}, work);
   }
 
   usageForRoot(rootPath) {
-    // A usage request can include hundreds of open and archived tab bindings.
-    // Keep the exact per-tab checks/cache, but reuse identical synchronous reads
-    // inside this request. Nothing here survives into the next usage request.
-    const readContext = { directories: new Map(), scans: new Map(), canonicalPaths: new Map(), projects: new Map(),
-      sourcesForTab: this.rootRegistry?.createSourcesReader?.() };
-    const canonical = value => canonicalPath(value, this.fs, readContext.canonicalPaths);
-    const canonicalRoot = canonical(rootPath);
-    const byPath = new Map();
-    if (this.rootRegistry) {
-      for (const scope of this.rootRegistry.listSourceScopes()) {
-        const catalog = this.listTab(scope.tabId, { refreshWatchers: false, readContext });
+    const work = () => {
+      // A usage request can include hundreds of open and archived tab bindings.
+      // Keep the exact per-tab checks/cache, but reuse identical synchronous reads
+      // inside this request. Nothing here survives into the next usage request.
+      const readContext = { directories: new Map(), scans: new Map(), canonicalPaths: new Map(), canonicalKnown: new Map(), projects: new Map(),
+        sourcesForTab: this.rootRegistry?.createSourcesReader?.() };
+      const canonical = value => canonicalPath(value, this.fs, readContext.canonicalPaths, readContext.canonicalKnown);
+      const canonicalRoot = canonical(rootPath);
+      // Root '/' needs the complete tree. For narrower existing roots, prune
+      // only proven-disjoint directories; every binding and watcher pass stays.
+      if (canonicalRoot !== path.parse(canonicalRoot).root
+        && readContext.canonicalKnown.get(resolvedSourcePath(rootPath)) === true) readContext.usageRoot = canonicalRoot;
+      const byPath = new Map();
+      if (this.rootRegistry) {
+        for (const scope of this.rootRegistry.listSourceScopes()) {
+          causal.count('scopes');
+          const catalog = this.listTab(scope.tabId, { refreshWatchers: false, readContext });
+          for (const prompt of catalog.prompts) {
+            if (!isInside(canonicalRoot, canonical(prompt.path))) continue;
+            const usage = byPath.get(prompt.path) || { projects: new Map(), tabs: new Map() };
+            usage.tabs.set(scope.tabId, { id: scope.tabId, name: scope.name || scope.tabId });
+            if (prompt.projectId && !readContext.projects.has(prompt.projectId)) {
+              readContext.projects.set(prompt.projectId, this.db.getProjectById(prompt.projectId));
+            }
+            const project = readContext.projects.get(prompt.projectId);
+            if (project) usage.projects.set(project.id, { id: project.id, name: project.name, icon: project.icon || null });
+            byPath.set(prompt.path, usage);
+          }
+        }
+        this.refreshWatchers(readContext);
+        return [...byPath.entries()].sort(([a], [b]) => naturalCompare(a, b))
+          .map(([filePath, usage]) => ({
+            path: filePath,
+            projects: [...usage.projects.values()].sort((a, b) => naturalCompare(a.name, b.name)),
+            tabs: [...usage.tabs.values()],
+          }));
+      }
+      for (const project of this.db.getProjectsWithPromptSources()) {
+        causal.count('scopes');
+        let catalog;
+        try { catalog = this.listProject(project.id, { readContext }); } catch { continue; }
         for (const prompt of catalog.prompts) {
           if (!isInside(canonicalRoot, canonical(prompt.path))) continue;
-          const usage = byPath.get(prompt.path) || { projects: new Map(), tabs: new Map() };
-          usage.tabs.set(scope.tabId, { id: scope.tabId, name: scope.name || scope.tabId });
-          if (prompt.projectId && !readContext.projects.has(prompt.projectId)) {
-            readContext.projects.set(prompt.projectId, this.db.getProjectById(prompt.projectId));
-          }
-          const project = readContext.projects.get(prompt.projectId);
-          if (project) usage.projects.set(project.id, { id: project.id, name: project.name, icon: project.icon || null });
-          byPath.set(prompt.path, usage);
+          const existing = byPath.get(prompt.path) || [];
+          existing.push({
+            id: catalog.project.id,
+            name: catalog.project.name,
+            icon: catalog.project.icon || null,
+          });
+          byPath.set(prompt.path, existing);
         }
       }
-      this.refreshWatchers(readContext);
-      return [...byPath.entries()].sort(([a], [b]) => naturalCompare(a, b))
-        .map(([filePath, usage]) => ({
+      return [...byPath.entries()]
+        .sort(([a], [b]) => naturalCompare(a, b))
+        .map(([filePath, projects]) => ({
           path: filePath,
-          projects: [...usage.projects.values()].sort((a, b) => naturalCompare(a.name, b.name)),
-          tabs: [...usage.tabs.values()],
+          projects: projects.sort((a, b) => naturalCompare(a.name, b.name)),
         }));
-    }
-    for (const project of this.db.getProjectsWithPromptSources()) {
-      let catalog;
-      try { catalog = this.listProject(project.id, { readContext }); } catch { continue; }
-      for (const prompt of catalog.prompts) {
-        if (!isInside(canonicalRoot, canonical(prompt.path))) continue;
-        const existing = byPath.get(prompt.path) || [];
-        existing.push({
-          id: catalog.project.id,
-          name: catalog.project.name,
-          icon: catalog.project.icon || null,
-        });
-        byPath.set(prompt.path, existing);
-      }
-    }
-    return [...byPath.entries()]
-      .sort(([a], [b]) => naturalCompare(a, b))
-      .map(([filePath, projects]) => ({
-        path: filePath,
-        projects: projects.sort((a, b) => naturalCompare(a.name, b.name)),
-      }));
+    };
+    return causal.syncWork('catalog.usageForRoot', { fileIdentity: rootPath }, work);
   }
 
   invalidate(projectIds = null, reason = 'filesystem') {
-    const ids = projectIds ? [...new Set(projectIds.filter(Boolean))] : [...this.cache.keys()];
-    if (projectIds) ids.forEach((projectId) => this.cache.delete(projectId));
-    else this.cache.clear();
-    // Old callers invalidate after shared-layout/root edits. In registry mode
-    // resolve exact tab consumers instead of treating a namespace as a union.
-    const tabIds = this.rootRegistry ? this.rootRegistry.listSourceScopes()
-      .filter(scope => !projectIds || this.getTabSources(scope.tabId).some(source => ids.includes(source.projectId)))
-      .map(scope => scope.tabId) : [];
-    this.invalidateTabs(tabIds, reason, ids);
+    const work = () => {
+      const ids = projectIds ? [...new Set(projectIds.filter(Boolean))] : [...this.cache.keys()];
+      if (projectIds) ids.forEach((projectId) => this.cache.delete(projectId));
+      else this.cache.clear();
+      // Old callers invalidate after shared-layout/root edits. In registry mode
+      // resolve exact tab consumers instead of treating a namespace as a union.
+      const tabIds = this.rootRegistry ? this.rootRegistry.listSourceScopes()
+        .filter(scope => !projectIds || this.getTabSources(scope.tabId).some(source => ids.includes(source.projectId)))
+        .map(scope => scope.tabId) : [];
+      this.invalidateTabs(tabIds, reason, ids);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('catalog.invalidate', {}, work);
   }
 
   invalidateTabs(tabIds = null, reason = 'filesystem', projectIds = []) {
-    const ids = tabIds ? [...new Set(tabIds.filter(Boolean))] : [...this.tabCache.keys()];
-    if (tabIds) ids.forEach(tabId => this.tabCache.delete(tabId));
-    else this.tabCache.clear();
-    if (this.onChanged) {
-      try { this.onChanged({ projectIds, ...(this.rootRegistry ? { tabIds: ids } : {}), reason, at: Date.now() }); } catch {}
-    }
+    const work = () => {
+      const ids = tabIds ? [...new Set(tabIds.filter(Boolean))] : [...this.tabCache.keys()];
+      if (tabIds) ids.forEach(tabId => this.tabCache.delete(tabId));
+      else this.tabCache.clear();
+      if (this.onChanged) {
+        causal.count('notifications');
+        try { this.onChanged({ projectIds, ...(this.rootRegistry ? { tabIds: ids } : {}), reason, at: Date.now() }); } catch {}
+      }
+    };
+    return causal.hasWork() ? work() : causal.syncWork('catalog.invalidateTabs', {}, work);
   }
 
   refreshWatchers(readContext) {
-    if (!this.watchEnabled) return;
-    // Recheck filesystem state for this reconciliation, even after a catalog
-    // read. Share only compiled SQL with that read; roots/rows are never retained.
-    const watchContext = { directories: new Map(),
-      sourcesForTab: readContext?.sourcesForTab || this.rootRegistry?.createSourcesReader?.() };
-    const wanted = new Map();
-    const scopes = this.rootRegistry ? this.rootRegistry.listSourceScopes() : this.db.getProjectsWithPromptSources();
-    const add = (source, projectId = null, tabId = null) => {
-      const target = source.docsExists ? source.docsPath : (source.exists ? source.rootPath : null);
-      if (!target) return;
-      const ids = wanted.get(target) || { projectIds: new Set(), tabIds: new Set() };
-      if (projectId) ids.projectIds.add(projectId);
-      if (tabId) ids.tabIds.add(tabId);
-      wanted.set(target, ids);
-    };
-    for (const scope of scopes) {
-      for (const source of this.rootRegistry ? this.getTabSources(scope.tabId, watchContext) : this.getSources(scope.id, watchContext)) {
-        add(source, this.rootRegistry ? source.projectId : scope.id, scope.tabId);
+    const work = () => {
+      if (!this.watchEnabled) return;
+      // Recheck filesystem state for this reconciliation, even after a catalog
+      // read. Share only compiled SQL with that read; roots/rows are never retained.
+      const watchContext = { directories: new Map(),
+        sourcesForTab: readContext?.sourcesForTab || this.rootRegistry?.createSourcesReader?.() };
+      const wanted = new Map();
+      const scopes = this.rootRegistry ? this.rootRegistry.listSourceScopes() : this.db.getProjectsWithPromptSources();
+      const add = (source, projectId = null, tabId = null) => {
+        const target = source.docsExists ? source.docsPath : (source.exists ? source.rootPath : null);
+        if (!target) return;
+        const ids = wanted.get(target) || { projectIds: new Set(), tabIds: new Set() };
+        if (projectId) ids.projectIds.add(projectId);
+        if (tabId) ids.tabIds.add(tabId);
+        wanted.set(target, ids);
+      };
+      for (const scope of scopes) {
+        causal.count('scopes');
+        for (const source of this.rootRegistry ? this.getTabSources(scope.tabId, watchContext) : this.getSources(scope.id, watchContext)) {
+          add(source, this.rootRegistry ? source.projectId : scope.id, scope.tabId);
+        }
       }
-    }
-    if (this.rootRegistry) {
-      for (const source of this.describeSources(this.rootRegistry.read().roots.map(root => ({ ...root, rootPath: root.path })), watchContext)) {
-        add(source);
+      if (this.rootRegistry) {
+        for (const source of this.describeSources(this.rootRegistry.read().roots.map(root => ({ ...root, rootPath: root.path })), watchContext)) {
+          add(source);
+        }
       }
-    }
-
-    for (const [target, entry] of this.watchers) {
-      if (wanted.has(target)) {
-        Object.assign(entry, wanted.get(target));
-        wanted.delete(target);
-        continue;
+  
+      for (const [target, entry] of this.watchers) {
+        if (wanted.has(target)) {
+          Object.assign(entry, wanted.get(target));
+          wanted.delete(target);
+          continue;
+        }
+        if (this.watchDebounce.has(target)) {
+          clearTimeout(this.watchDebounce.get(target));
+          this.watchDebounce.delete(target);
+        }
+        try { causal.count('watchersClosed'); entry.watcher.close(); } catch {}
+        this.watchers.delete(target);
       }
-      if (this.watchDebounce.has(target)) {
-        clearTimeout(this.watchDebounce.get(target));
-        this.watchDebounce.delete(target);
-      }
-      try { entry.watcher.close(); } catch {}
-      this.watchers.delete(target);
-    }
-
-    for (const [target, scopeIds] of wanted) {
-      try {
-        const entry = { watcher: null, ...scopeIds };
-        entry.watcher = this.fs.watch(target, { recursive: true }, () => {
-          if (this.watchers.get(target) !== entry) return;
-          if (this.watchDebounce.has(target)) clearTimeout(this.watchDebounce.get(target));
-          const timer = setTimeout(() => {
+  
+      for (const [target, scopeIds] of wanted) {
+        try {
+          const entry = { watcher: null, ...scopeIds };
+          causal.count('watchersCreated');
+          entry.watcher = this.fs.watch(target, { recursive: true }, () => causal.syncWork('catalog.watchEvent', { fileIdentity: target }, () => {
+            causal.count('watchEvents');
             if (this.watchers.get(target) !== entry) return;
-            this.watchDebounce.delete(target);
-            for (const projectId of entry.projectIds) this.cache.delete(projectId);
-            this.invalidateTabs([...entry.tabIds], 'filesystem', [...entry.projectIds]);
-            this.refreshWatchers();
-          }, 180);
-          timer.unref?.();
-          this.watchDebounce.set(target, timer);
-        });
-        this.watchers.set(target, entry);
-      } catch (error) {
-        console.warn('[ProjectPrompts] watcher failed path=' + target + ': ' + error.message);
+            if (this.watchDebounce.has(target)) clearTimeout(this.watchDebounce.get(target));
+            const timer = setTimeout(() => causal.syncWork('catalog.watchDebounce', { fileIdentity: target }, () => {
+              if (this.watchers.get(target) !== entry) return;
+              this.watchDebounce.delete(target);
+              for (const projectId of entry.projectIds) this.cache.delete(projectId);
+              this.invalidateTabs([...entry.tabIds], 'filesystem', [...entry.projectIds]);
+              this.refreshWatchers();
+            }, { root: true }), 180);
+            timer.unref?.();
+            this.watchDebounce.set(target, timer);
+          }, { root: true }));
+          this.watchers.set(target, entry);
+        } catch (error) {
+          console.warn('[ProjectPrompts] watcher failed path=' + target + ': ' + error.message);
+        }
       }
-    }
+    };
+    return causal.syncWork('catalog.refreshWatchers', {}, work);
   }
 
   close() {
@@ -531,6 +617,11 @@ class ProjectPromptCatalogService {
     this.watchers.clear();
     this.cache.clear();
     this.tabCache.clear();
+  }
+
+  readLayout(rootPath) {
+    if (this.layoutStore) causal.count('layoutReads');
+    return this.layoutStore?.get(rootPath)?.layout || null;
   }
 }
 

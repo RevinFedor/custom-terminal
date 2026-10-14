@@ -291,6 +291,16 @@ update-required без Send/polling fallback. После потери ACK сох
 runId и неизменные аргументы. Точное чтение, ошибки и persistence описаны в
 fact-оркестрация-вкладок::Наблюдение уже выполняющейся работы.
 
+Для адресного восстановления такого ожидания есть `recheck_tab_response({runId})`:
+требует `responseObservations.recheck.version=1` и вызывает прежний `/action`
+с отдельным `action:"recheck"`. Сохраняет target, wait policy и получателя; нового
+run/input/Resume не создаёт. Ранее сохранённый terminal outcome возвращается без
+повторной source notification, новый проверенный результат доставляется обычным
+путём. `get_delegation` и replay `wait_for_tab_response` остаются пассивными;
+generic Retry/agent-only Continue не являются безопасной заменой recheck.
+Обновления одного MCP недостаточно без соответствующего Main; старый capability
+отклоняется до POST. Это единичное recovery-действие, не разрешение polling.
+
 При явном восстановлении после Build Install проверяется весь обмен, а не только
 запуск CLI или доставка нового «продолжай» родителю. Shutdown snapshot перечисляет
 живые процессы, не все незавершённые поручения. `GET /api/orchestrations` даёт только
@@ -377,6 +387,22 @@ Ready/already-active work не получает новый input; cancelled/term
 snapshot — отдельное user action `new-request`, с новым run и обычной очередью.
 Старый Main отвергается до POST; вручную имитировать этот flow несколькими tool
 Send/Resume/read-latest нельзя. Browser jobs и read-only observations не перезапускаются.
+
+Диагностический шрам14.10: после Codex Resume процесс и writer могут быть
+подтверждены, input-ready уже true, но response reader сохраняет busy=null до
+current-generation outcome. Это корректная неопределённость завершения ответа;
+использование её как обязательного условия первого Continue создаёт блокировку
+`continuation_runtime_unknown`. Проверять также preparation и latest-request read:
+снятие одного раннего guard не исправляет всю цепочку. Готовность ввода нельзя
+объявлять доказательством результата. Continue отдельно соединяет coherent Main
+input-ready с exact writer/launch и стабильной response revision; generic busy=null
+сохраняется. Проверка последнего задания читает только verified execution identity,
+включая interrupted/no-final, без выдачи этого чтения за готовый ответ. Обе границы
+повторяются в FIFO preparation. Уже готовый exact исходный результат не требует
+input-ready; его доставка сохраняет прежние ownership/Goal/background guards.
+Повтор durable intent использует сохранённый target, иначе stopped→ready незаметно
+меняет fingerprint уже принятого Send. Исторический run не принимается по двум
+пустым UUID. Проверка SOURCE и граница установленной версии — в рабочем tmp темы.
 
 Request и PTY transport могут иметь разные hashes после доказанного codec.
 Target и source-followup conduits сохраняют основание преобразования

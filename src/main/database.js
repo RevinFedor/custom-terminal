@@ -1,3 +1,11 @@
+
+const { causal } = require('./perf-causal-context');
+
+// Named call sites only: retain the original statement and separate compile/execute timing.
+function sqlStatement(siteId, operation, prepare, execute) {
+  const statement = causal.sql(siteId, 'prepare', prepare);
+  return causal.sql(siteId, operation, () => execute(statement));
+}
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
@@ -2287,15 +2295,17 @@ class DatabaseManager {
     });
   }
   getExecutionNamespace(executionNamespace, { includeArchived = false } = {}) {
-    const read = () => {
-      const scope = this.db.prepare('SELECT * FROM workflow_execution_scopes WHERE namespace=?').get(executionNamespace);
-      if (!scope) return null;
-      return { namespace: executionNamespace, revision: scope.revision, metadata: JSON.parse(scope.metadata_json),
-      groups: JSON.parse(scope.groups_json), roots: JSON.parse(scope.roots_json), notes: scope.notes,
-      tabs: this.db.prepare('SELECT tab_id FROM tabs WHERE execution_subject_version=2 AND execution_namespace=? AND (? OR execution_archived=0) ORDER BY position,id')
-        .all(executionNamespace, Number(includeArchived)).map(row => this.getExecutionTabV2({ executionNamespace, tabId: row.tab_id }).tab) };
+    const work = () => {
+      const read = () => {
+        const scope = sqlStatement('db.getExecutionNamespace.workflow_execution_scopes', 'get', () => this.db.prepare('SELECT * FROM workflow_execution_scopes WHERE namespace=?'), statement => statement.get(executionNamespace));
+        if (!scope) return null;
+        return { namespace: executionNamespace, revision: scope.revision, metadata: JSON.parse(scope.metadata_json),
+        groups: JSON.parse(scope.groups_json), roots: JSON.parse(scope.roots_json), notes: scope.notes,
+        tabs: sqlStatement('db.getExecutionNamespace.tabs', 'all', () => this.db.prepare('SELECT tab_id FROM tabs WHERE execution_subject_version=2 AND execution_namespace=? AND (? OR execution_archived=0) ORDER BY position,id'), statement => statement.all(executionNamespace, Number(includeArchived))).map(row => this.getExecutionTabV2({ executionNamespace, tabId: row.tab_id }).tab) };
+      };
+      return this.db.inTransaction ? read() : this.db.transaction(read)();
     };
-    return this.db.inTransaction ? read() : this.db.transaction(read)();
+    return causal.hasWork() ? work() : causal.syncWork('db.getExecutionNamespace', {}, work);
   }
   saveExecutionNamespace({ executionNamespace, expectedRevision, metadata, groups, roots, notes }) {
     return this._executionTransaction(() => {
@@ -2448,161 +2458,164 @@ class DatabaseManager {
   }
 
   getProjectById(projectId) {
-    const project = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-    const v2 = !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'").get();
-    if (!project) {
-      if (!v2) return null;
-      const scope = this.getExecutionNamespace(projectId);
-      if (!scope) return null;
-      // Legacy wire shape for an exact execution bucket. This is not a Project
-      // row, cwd/default directory or workflow organization authority.
-      return { id: scope.namespace, executionNamespace: scope.namespace, executionScopeVersion: 2,
-        recommendedCwd:scope.metadata.recommendedCwd || null,
-        path: null, name: scope.metadata.name || scope.namespace, description: '', icon: scope.metadata.icon || null,
-        notesGlobal: scope.notes, tabGroups: scope.groups, quickActions:this.getGlobalCommands().map(command=>({name:command.name,command:command.command})),
-        sidebarOpen:scope.metadata.sidebarOpen || false,openFilePath:scope.metadata.openFilePath || null,
-        sidebarExpandedDirs:scope.metadata.sidebarExpandedDirs || null,sidebarScrollTop:scope.metadata.sidebarScrollTop || 0,
-        tabListScrollTop:scope.metadata.tabListScrollTop || 0,tabs: scope.tabs };
-    }
-
-    // The removed Utils surface had its own position namespace. During the
-    // one-way migration, preserve the old visible order: main tabs first,
-    // then utility tabs, with a deterministic row-id tie-break.
-    const tabs = this.db.prepare(`
-      SELECT * FROM tabs
-      WHERE ${v2 ? '(project_id = ? OR (execution_subject_version=2 AND execution_namespace=? AND execution_archived=0))' : 'project_id = ?'}
-      ORDER BY is_utility ASC, position ASC, id ASC
-    `).all(...(v2 ? [project.id, project.id] : [project.id]));
-    const globalCommands = this.getGlobalCommands();
-
-    return {
-      id: project.id,
-      path: project.path,
-      name: project.name,
-      description: project.description || '',
-      icon: project.icon || null,
-      // The titlebar owns a coloured folder fallback, so icon-only remains a
-      // valid persisted preference even when a custom raster is later removed.
-      hideName: project.hide_name === 1,
-      geminiPrompt: project.gemini_prompt,
-      notesGlobal: project.notes_global || '',
-      tabGroups: (() => {
-        if (!project.tab_groups) return [];
-        try {
-          const parsed = JSON.parse(project.tab_groups);
-          return Array.isArray(parsed) ? parsed : [];
-        } catch {
-          return [];
-        }
-      })(),
-      sidebarOpen: project.sidebar_open === 1,
-      openFilePath: project.open_file_path || null,
-      sidebarExpandedDirs: project.sidebar_expanded_dirs ? JSON.parse(project.sidebar_expanded_dirs) : null,
-      sidebarScrollTop: Number.isFinite(Number(project.sidebar_scroll_top))
-        ? Math.max(0, Number(project.sidebar_scroll_top))
-        : 0,
-      tabListScrollTop: Number.isFinite(Number(project.tab_list_scroll_top))
-        ? Math.max(0, Number(project.tab_list_scroll_top))
-        : 0,
-      createdAt: project.created_at,
-      updatedAt: project.updated_at,
-      quickActions: globalCommands.map(gc => ({ name: gc.name, command: gc.command })),
-      tabs: tabs.map(t => ({
-        ...(t.execution_subject_version === 2 ? {executionSubject:workflowStorage.executionScopeForRow(t),
-          executionStorageRevision:t.execution_storage_revision} : {}),
-        ...(t.execution_subject_version === 2 ? { ...JSON.parse(t.execution_record_json),
-          executionSubject: workflowStorage.executionScopeForRow(t), executionStorageRevision: t.execution_storage_revision } : {}),
-        name: t.name,
-        nameSetManually: t.name_set_manually === 1 || undefined,
-        cwd: t.cwd,
-        color: t.color || undefined,
-        isUtility: t.is_utility === 1,
-        commandType: t.command_type || undefined,
-        claudeSessionId: t.claude_session_id || undefined,
-        claudeSessionHistory: (() => {
-          if (!t.claude_session_history) return undefined;
-          try { return JSON.parse(t.claude_session_history); }
-          catch { return undefined; }
-        })(),
-        geminiSessionId: t.gemini_session_id || undefined,
-        codexSessionId: t.codex_session_id || undefined,
-        codexModel: t.codex_model || undefined,
-        codexEffort: t.codex_effort || undefined,
-        codexSettingsProofAt: Number(t.codex_settings_proof_at) || undefined,
-        codexSettingsProofSessionId: t.codex_settings_proof_session_id || undefined,
-        codexModelMigrationPending: t.codex_model_migration_pending === 1 || undefined,
-        codexModelMigrationRestoreDefaultModel: t.codex_model_migration_restore_default_model === 1 || undefined,
-        codexModelMigrationRestoreDefaultEffort: t.codex_model_migration_restore_default_effort === 1 || undefined,
-        codexModelMigrationSourceModel: t.codex_model_migration_source_model || undefined,
-        codexModelMigrationSourceEffort: t.codex_model_migration_source_effort || undefined,
-        codexModelMigrationTargetModel: t.codex_model_migration_target_model || undefined,
-        codexModelMigrationConfigPath: t.codex_model_migration_config_path || undefined,
-        codexModelMigrationConfigFingerprint: t.codex_model_migration_config_fingerprint || undefined,
-        codexModelMigrationConfigAlreadyTarget: t.codex_model_migration_config_already_target === 1 || undefined,
-        externalRun: (() => {
-          if (!t.external_run) return undefined;
-          try { return JSON.parse(t.external_run); }
-          catch { return undefined; }
-        })(),
-        wasInterrupted: t.was_interrupted === 1,
-        overlayDismissed: t.overlay_dismissed === 1,
-        notes: t.notes || '',
-        taskPlan: normalizeTaskPlan(t.task_plan),
-        // Встроенная browser-вкладка удалена 2026-08-17. У кого-то в базе такие
-        // строки ещё лежат, и рендерер про этот тип уже не знает — поэтому здесь
-        // они становятся обычным терминалом, а не «вкладкой, которую никто не
-        // умеет показать». Колонки url/terminal_id/terminal_name/active_view
-        // остаются в схеме пустыми: удалять колонку в SQLite дороже, чем
-        // перестать её читать.
-        tabType: (!t.tab_type || t.tab_type === 'browser') ? 'terminal' : t.tab_type,
-        filePath: t.file_path || undefined,
-        createdAt: t.created_at || undefined,
-        isCollapsed: t.is_collapsed === 1,
-        groupId: t.tab_group_id || undefined,
-        visualParentTabId: t.visual_parent_tab_id || undefined,
-        closedVisualParentTabId: t.closed_visual_parent_tab_id || undefined,
-        restorePlacementId: t.restore_placement_id || undefined,
-        windowScoped: t.window_scoped === 1 || undefined,
-        tabId: t.tab_id || undefined,
-        sessionStatus: t.session_status || undefined,
-        completionNotificationPersistent: t.completion_notification_persistent === 1 || undefined,
-        restartAfterTabId: t.restart_after_tab_id || undefined,
-        restartAfterTabIds: (() => {
-          if (!t.restart_after_tab_ids) return undefined;
+    const work = () => {
+      const project = sqlStatement('db.getProjectById.projects', 'get', () => this.db.prepare('SELECT * FROM projects WHERE id = ?'), statement => statement.get(projectId));
+      const v2 = !!sqlStatement('db.getProjectById.sqlite_master', 'get', () => this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'"), statement => statement.get());
+      if (!project) {
+        if (!v2) return null;
+        const scope = this.getExecutionNamespace(projectId);
+        if (!scope) return null;
+        // Legacy wire shape for an exact execution bucket. This is not a Project
+        // row, cwd/default directory or workflow organization authority.
+        return { id: scope.namespace, executionNamespace: scope.namespace, executionScopeVersion: 2,
+          recommendedCwd:scope.metadata.recommendedCwd || null,
+          path: null, name: scope.metadata.name || scope.namespace, description: '', icon: scope.metadata.icon || null,
+          notesGlobal: scope.notes, tabGroups: scope.groups, quickActions:this.getGlobalCommands().map(command=>({name:command.name,command:command.command})),
+          sidebarOpen:scope.metadata.sidebarOpen || false,openFilePath:scope.metadata.openFilePath || null,
+          sidebarExpandedDirs:scope.metadata.sidebarExpandedDirs || null,sidebarScrollTop:scope.metadata.sidebarScrollTop || 0,
+          tabListScrollTop:scope.metadata.tabListScrollTop || 0,tabs: scope.tabs };
+      }
+  
+      // The removed Utils surface had its own position namespace. During the
+      // one-way migration, preserve the old visible order: main tabs first,
+      // then utility tabs, with a deterministic row-id tie-break.
+      const tabs = sqlStatement('db.getProjectById.tabs', 'all', () => this.db.prepare(`
+        SELECT * FROM tabs
+        WHERE ${v2 ? '(project_id = ? OR (execution_subject_version=2 AND execution_namespace=? AND execution_archived=0))' : 'project_id = ?'}
+        ORDER BY is_utility ASC, position ASC, id ASC
+      `), statement => statement.all(...(v2 ? [project.id, project.id] : [project.id])));
+      const globalCommands = this.getGlobalCommands();
+  
+      return {
+        id: project.id,
+        path: project.path,
+        name: project.name,
+        description: project.description || '',
+        icon: project.icon || null,
+        // The titlebar owns a coloured folder fallback, so icon-only remains a
+        // valid persisted preference even when a custom raster is later removed.
+        hideName: project.hide_name === 1,
+        geminiPrompt: project.gemini_prompt,
+        notesGlobal: project.notes_global || '',
+        tabGroups: (() => {
+          if (!project.tab_groups) return [];
           try {
-            const parsed = JSON.parse(t.restart_after_tab_ids);
-            return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string' && id.trim()) : undefined;
+            const parsed = JSON.parse(project.tab_groups);
+            return Array.isArray(parsed) ? parsed : [];
           } catch {
-            return undefined;
+            return [];
           }
         })(),
-        restartAfterWorkflowIds: (() => {
-          try {
-            const ids = JSON.parse(t.restart_after_workflow_ids || 'null');
-            return Array.isArray(ids) ? [...new Set(ids.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()))] : undefined;
-          } catch { return undefined; }
-        })(),
-        restartAfterCommand: t.restart_after_command || undefined,
-        restartAfterPaused: t.restart_after_paused === 1 || undefined,
-        restartAfterArmed: t.restart_after_armed === 1 || undefined,
-        restartAfterPersistent: t.restart_after_persistent === 1 || undefined,
-        contextPct: (t.context_pct ?? undefined),
-        // Durable tab-visit time — the switcher orders ALL tabs of ALL projects
-        // by this, so the order survives a restart even for projects whose
-        // per-session visit list is gone.
-        lastActivatedAt: Number(t.last_activated_at) || undefined,
-        cacheStats: (() => {
-          if (!t.cache_stats) return undefined;
-          try { return JSON.parse(t.cache_stats); }
-          catch { return undefined; }
-        })(),
-        providerState: (() => {
-          if (!t.provider_state) return undefined;
-          try { return JSON.parse(t.provider_state); }
-          catch { return undefined; }
-        })()
-      }))
+        sidebarOpen: project.sidebar_open === 1,
+        openFilePath: project.open_file_path || null,
+        sidebarExpandedDirs: project.sidebar_expanded_dirs ? JSON.parse(project.sidebar_expanded_dirs) : null,
+        sidebarScrollTop: Number.isFinite(Number(project.sidebar_scroll_top))
+          ? Math.max(0, Number(project.sidebar_scroll_top))
+          : 0,
+        tabListScrollTop: Number.isFinite(Number(project.tab_list_scroll_top))
+          ? Math.max(0, Number(project.tab_list_scroll_top))
+          : 0,
+        createdAt: project.created_at,
+        updatedAt: project.updated_at,
+        quickActions: globalCommands.map(gc => ({ name: gc.name, command: gc.command })),
+        tabs: tabs.map(t => ({
+          ...(t.execution_subject_version === 2 ? {executionSubject:workflowStorage.executionScopeForRow(t),
+            executionStorageRevision:t.execution_storage_revision} : {}),
+          ...(t.execution_subject_version === 2 ? { ...JSON.parse(t.execution_record_json),
+            executionSubject: workflowStorage.executionScopeForRow(t), executionStorageRevision: t.execution_storage_revision } : {}),
+          name: t.name,
+          nameSetManually: t.name_set_manually === 1 || undefined,
+          cwd: t.cwd,
+          color: t.color || undefined,
+          isUtility: t.is_utility === 1,
+          commandType: t.command_type || undefined,
+          claudeSessionId: t.claude_session_id || undefined,
+          claudeSessionHistory: (() => {
+            if (!t.claude_session_history) return undefined;
+            try { return JSON.parse(t.claude_session_history); }
+            catch { return undefined; }
+          })(),
+          geminiSessionId: t.gemini_session_id || undefined,
+          codexSessionId: t.codex_session_id || undefined,
+          codexModel: t.codex_model || undefined,
+          codexEffort: t.codex_effort || undefined,
+          codexSettingsProofAt: Number(t.codex_settings_proof_at) || undefined,
+          codexSettingsProofSessionId: t.codex_settings_proof_session_id || undefined,
+          codexModelMigrationPending: t.codex_model_migration_pending === 1 || undefined,
+          codexModelMigrationRestoreDefaultModel: t.codex_model_migration_restore_default_model === 1 || undefined,
+          codexModelMigrationRestoreDefaultEffort: t.codex_model_migration_restore_default_effort === 1 || undefined,
+          codexModelMigrationSourceModel: t.codex_model_migration_source_model || undefined,
+          codexModelMigrationSourceEffort: t.codex_model_migration_source_effort || undefined,
+          codexModelMigrationTargetModel: t.codex_model_migration_target_model || undefined,
+          codexModelMigrationConfigPath: t.codex_model_migration_config_path || undefined,
+          codexModelMigrationConfigFingerprint: t.codex_model_migration_config_fingerprint || undefined,
+          codexModelMigrationConfigAlreadyTarget: t.codex_model_migration_config_already_target === 1 || undefined,
+          externalRun: (() => {
+            if (!t.external_run) return undefined;
+            try { return JSON.parse(t.external_run); }
+            catch { return undefined; }
+          })(),
+          wasInterrupted: t.was_interrupted === 1,
+          overlayDismissed: t.overlay_dismissed === 1,
+          notes: t.notes || '',
+          taskPlan: normalizeTaskPlan(t.task_plan),
+          // Встроенная browser-вкладка удалена 2026-08-17. У кого-то в базе такие
+          // строки ещё лежат, и рендерер про этот тип уже не знает — поэтому здесь
+          // они становятся обычным терминалом, а не «вкладкой, которую никто не
+          // умеет показать». Колонки url/terminal_id/terminal_name/active_view
+          // остаются в схеме пустыми: удалять колонку в SQLite дороже, чем
+          // перестать её читать.
+          tabType: (!t.tab_type || t.tab_type === 'browser') ? 'terminal' : t.tab_type,
+          filePath: t.file_path || undefined,
+          createdAt: t.created_at || undefined,
+          isCollapsed: t.is_collapsed === 1,
+          groupId: t.tab_group_id || undefined,
+          visualParentTabId: t.visual_parent_tab_id || undefined,
+          closedVisualParentTabId: t.closed_visual_parent_tab_id || undefined,
+          restorePlacementId: t.restore_placement_id || undefined,
+          windowScoped: t.window_scoped === 1 || undefined,
+          tabId: t.tab_id || undefined,
+          sessionStatus: t.session_status || undefined,
+          completionNotificationPersistent: t.completion_notification_persistent === 1 || undefined,
+          restartAfterTabId: t.restart_after_tab_id || undefined,
+          restartAfterTabIds: (() => {
+            if (!t.restart_after_tab_ids) return undefined;
+            try {
+              const parsed = JSON.parse(t.restart_after_tab_ids);
+              return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string' && id.trim()) : undefined;
+            } catch {
+              return undefined;
+            }
+          })(),
+          restartAfterWorkflowIds: (() => {
+            try {
+              const ids = JSON.parse(t.restart_after_workflow_ids || 'null');
+              return Array.isArray(ids) ? [...new Set(ids.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()))] : undefined;
+            } catch { return undefined; }
+          })(),
+          restartAfterCommand: t.restart_after_command || undefined,
+          restartAfterPaused: t.restart_after_paused === 1 || undefined,
+          restartAfterArmed: t.restart_after_armed === 1 || undefined,
+          restartAfterPersistent: t.restart_after_persistent === 1 || undefined,
+          contextPct: (t.context_pct ?? undefined),
+          // Durable tab-visit time — the switcher orders ALL tabs of ALL projects
+          // by this, so the order survives a restart even for projects whose
+          // per-session visit list is gone.
+          lastActivatedAt: Number(t.last_activated_at) || undefined,
+          cacheStats: (() => {
+            if (!t.cache_stats) return undefined;
+            try { return JSON.parse(t.cache_stats); }
+            catch { return undefined; }
+          })(),
+          providerState: (() => {
+            if (!t.provider_state) return undefined;
+            try { return JSON.parse(t.provider_state); }
+            catch { return undefined; }
+          })()
+        }))
+      };
     };
+    return causal.hasWork() ? work() : causal.syncWork('db.getProjectById', {}, work);
   }
 
   // OSC 7 proof is resolved in main, so persist the accepted value point-wise
@@ -4641,63 +4654,72 @@ class DatabaseManager {
   }
 
   getProjectPromptSources(projectId) {
-    if (!projectId) return [];
-    return this.db.prepare(`
-      SELECT id, project_id, root_path, position, created_at, updated_at
-      FROM project_prompt_sources
-      WHERE project_id = ?
-      ORDER BY position ASC, id ASC
-    `).all(projectId).map((row) => ({
-      id: row.id,
-      projectId: row.project_id,
-      rootPath: row.root_path,
-      position: row.position,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    }));
+    const work = () => {
+      if (!projectId) return [];
+      return sqlStatement('db.getProjectPromptSources.project_prompt_sources', 'all', () => this.db.prepare(`
+        SELECT id, project_id, root_path, position, created_at, updated_at
+        FROM project_prompt_sources
+        WHERE project_id = ?
+        ORDER BY position ASC, id ASC
+      `), statement => statement.all(projectId)).map((row) => ({
+        id: row.id,
+        projectId: row.project_id,
+        rootPath: row.root_path,
+        position: row.position,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      }));
+    };
+    return causal.hasWork() ? work() : causal.syncWork('db.getProjectPromptSources', {}, work);
   }
 
   getProjectsWithPromptSources() {
-    return this.db.prepare(`
-      SELECT DISTINCT p.id, p.name, p.path, p.icon, p.updated_at
-      FROM projects p
-      INNER JOIN project_prompt_sources s ON s.project_id = p.id
-      ORDER BY p.updated_at DESC, p.id ASC
-    `).all().map((row) => ({
-      id: row.id,
-      name: row.name,
-      path: row.path,
-      icon: row.icon || null,
-      updatedAt: row.updated_at,
-    }));
+    const work = () => {
+      return sqlStatement('db.getProjectsWithPromptSources.projects', 'all', () => this.db.prepare(`
+        SELECT DISTINCT p.id, p.name, p.path, p.icon, p.updated_at
+        FROM projects p
+        INNER JOIN project_prompt_sources s ON s.project_id = p.id
+        ORDER BY p.updated_at DESC, p.id ASC
+      `), statement => statement.all()).map((row) => ({
+        id: row.id,
+        name: row.name,
+        path: row.path,
+        icon: row.icon || null,
+        updatedAt: row.updated_at,
+      }));
+    };
+    return causal.hasWork() ? work() : causal.syncWork('db.getProjectsWithPromptSources', {}, work);
   }
 
   saveProjectPromptSources(projectId, roots) {
-    if (!projectId || !Array.isArray(roots)) return [];
-    const projectExists = this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId);
-    if (!projectExists) throw new Error('project_not_found');
-
-    const normalized = [];
-    const seen = new Set();
-    for (const value of roots) {
-      const raw = typeof value === 'string' ? value : value?.rootPath;
-      if (typeof raw !== 'string' || !raw.trim()) continue;
-      const rootPath = path.resolve(raw.trim());
-      if (seen.has(rootPath)) continue;
-      seen.add(rootPath);
-      normalized.push(rootPath);
-    }
-
-    const save = this.db.transaction(() => {
-      this.db.prepare('DELETE FROM project_prompt_sources WHERE project_id = ?').run(projectId);
-      const insert = this.db.prepare(`
-        INSERT INTO project_prompt_sources (project_id, root_path, position)
-        VALUES (?, ?, ?)
-      `);
-      normalized.forEach((rootPath, position) => insert.run(projectId, rootPath, position));
-    });
-    save();
-    return this.getProjectPromptSources(projectId);
+    const work = () => {
+      if (!projectId || !Array.isArray(roots)) return [];
+      const projectExists = sqlStatement('db.saveProjectPromptSources.projects', 'get', () => this.db.prepare('SELECT 1 FROM projects WHERE id = ?'), statement => statement.get(projectId));
+      if (!projectExists) throw new Error('project_not_found');
+  
+      const normalized = [];
+      const seen = new Set();
+      for (const value of roots) {
+        const raw = typeof value === 'string' ? value : value?.rootPath;
+        if (typeof raw !== 'string' || !raw.trim()) continue;
+        const rootPath = path.resolve(raw.trim());
+        if (seen.has(rootPath)) continue;
+        seen.add(rootPath);
+        normalized.push(rootPath);
+      }
+  
+      const save = this.db.transaction(() => {
+        sqlStatement('db.saveProjectPromptSources.project_prompt_sources', 'run', () => this.db.prepare('DELETE FROM project_prompt_sources WHERE project_id = ?'), statement => statement.run(projectId));
+        const insert = causal.sql('db.promptSources.insert', 'prepare', () => this.db.prepare(`
+          INSERT INTO project_prompt_sources (project_id, root_path, position)
+          VALUES (?, ?, ?)
+        `));
+        normalized.forEach((rootPath, position) => causal.sql('db.promptSources.insert', 'run', () => insert.run(projectId, rootPath, position)));
+      });
+      save();
+      return this.getProjectPromptSources(projectId);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('db.saveProjectPromptSources', {}, work);
   }
 
   rewriteFilePathReferences(oldPath, newPath) {
@@ -5753,7 +5775,12 @@ class DatabaseManager {
 
   // ========== GLOBAL COMMANDS & PROMPTS ========== 
 
-  getGlobalCommands() { return this.db.prepare('SELECT * FROM global_commands ORDER BY position').all(); }
+  getGlobalCommands() {
+    const work = () => {
+      return sqlStatement('db.getGlobalCommands.global_commands', 'all', () => this.db.prepare('SELECT * FROM global_commands ORDER BY position'), statement => statement.all());
+    };
+    return causal.hasWork() ? work() : causal.syncWork('db.getGlobalCommands', {}, work);
+  }
   saveGlobalCommands(commands) {
     if (!Array.isArray(commands)) return;
     const existingCount = this.db.prepare('SELECT COUNT(*) as cnt FROM global_commands').get()?.cnt || 0;
@@ -7449,32 +7476,38 @@ class DatabaseManager {
   }
 
   getSessionHistoryEvents(sessionId) {
-    if (!sessionId) return [];
-    return this.db.prepare(`
-      SELECT *
-      FROM session_history_events
-      WHERE session_id = ? OR source_session_id = ?
-      ORDER BY COALESCE(occurred_at, created_at), id
-    `).all(sessionId, sessionId).map((row) => this._mapSessionHistoryEvent(row));
+    const work = () => {
+      if (!sessionId) return [];
+      return sqlStatement('db.getSessionHistoryEvents.session_history_events', 'all', () => this.db.prepare(`
+        SELECT *
+        FROM session_history_events
+        WHERE session_id = ? OR source_session_id = ?
+        ORDER BY COALESCE(occurred_at, created_at), id
+      `), statement => statement.all(sessionId, sessionId)).map((row) => this._mapSessionHistoryEvent(row));
+    };
+    return causal.hasWork() ? work() : causal.syncWork('db.getSessionHistoryEvents', { sessionId }, work);
   }
 
   getSessionHistoryContext(sessionId) {
-    const events = this.getSessionHistoryEvents(sessionId);
-    const directFork = events
-      .filter((event) => event.eventType === 'fork' && event.sessionId === sessionId)
-      .sort((left, right) => (
-        Number(right.isDirect) - Number(left.isDirect)
-        || Number(right.occurredAt || right.createdAt || 0) - Number(left.occurredAt || left.createdAt || 0)
-      ))[0] || null;
-    return {
-      fork: directFork,
-      children: events.filter((event) => (
-        event.eventType === 'fork' && event.sourceSessionId === sessionId
-      )),
-      compacts: events.filter((event) => (
-        event.eventType === 'compact' && event.sessionId === sessionId
-      )),
+    const work = () => {
+      const events = this.getSessionHistoryEvents(sessionId);
+      const directFork = events
+        .filter((event) => event.eventType === 'fork' && event.sessionId === sessionId)
+        .sort((left, right) => (
+          Number(right.isDirect) - Number(left.isDirect)
+          || Number(right.occurredAt || right.createdAt || 0) - Number(left.occurredAt || left.createdAt || 0)
+        ))[0] || null;
+      return {
+        fork: directFork,
+        children: events.filter((event) => (
+          event.eventType === 'fork' && event.sourceSessionId === sessionId
+        )),
+        compacts: events.filter((event) => (
+          event.eventType === 'compact' && event.sessionId === sessionId
+        )),
+      };
     };
+    return causal.hasWork() ? work() : causal.syncWork('db.getSessionHistoryContext', { sessionId }, work);
   }
 
   markSessionForkMetadataCopied(eventKey) {

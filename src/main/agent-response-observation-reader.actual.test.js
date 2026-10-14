@@ -138,6 +138,44 @@ test('web options expose all three additive callbacks beside the existing result
   assert.match(source, /getAgentTurnResult: _getAgentTurnResultForOrchestration,/);
 });
 
+test('actual Main revision conflict recovers the SAME durable observation and then its exact final', async t => {
+  const h = fixture(t, { provider: 'codex', rows: codexTurn('live-turn', 'PARTIAL', null) });
+  const turn = h.begin('live-turn');
+  const Database = require('better-sqlite3');
+  const { OrchestrationRunStore } = require('./orchestration-runs');
+  const { ResponseObservationEvidenceStore } = require('./response-observation-evidence');
+  const { createResponseObservationApi } = require('./response-observation-api');
+  const { createResponseObservationService } = require('./response-observation-service');
+  const store = new OrchestrationRunStore(path.join(h.dir, 'observations.json'));
+  const db = new Database(':memory:');
+  const evidence = new ResponseObservationEvidenceStore(db), results = [];
+  let responseReads = 0;
+  const service = createResponseObservationService({ store, evidence, readState: () => h.state(),
+    readResponse: request => { responseReads++; return h.reader.readAgentObservedResponse(request); },
+    subscribe: async () => ({ success: true }), unsubscribe: async () => {}, onChanged() {},
+    onSettled: async run => results.push(evidence.readSelected(run.runId)), log: { log() {}, warn() {} } });
+  t.after(async () => { await service.dispose(); await store.flush(); db.close(); });
+  const api = createResponseObservationApi({ store, readState: () => h.state(),
+    descriptor: id => ({ tabId: id, toolType: 'codex', cwd: h.dir }),
+    sourceExecutionContext: () => null, captureSourceTarget: async () => ({ toolType: 'codex', sessionId: 'parent' }),
+    onAccepted() {} });
+  const accepted = await api.start('T', { runId: 'same-observation', sourceTabId: 'parent' });
+  let lifecycleReads = 0;
+  h.controls.beforeLifecycle = () => { if (++lifecycleReads === 1) h.controls.input++; };
+  await service.arm(accepted.run);
+  assert.equal(lifecycleReads, 2);
+  assert.equal((await store.get('same-observation')).status, 'running');
+  assert.equal(responseReads, 0);
+  h.write(codexTurn('live-turn', 'EXACT FINAL'));
+  h.finish(turn);
+  lifecycleReads = 0;
+  await service.reconcile('same-observation', 'only-done-edge');
+  assert.equal(results.length, 1);
+  assert.equal(results[0].result.assistantText, 'EXACT FINAL');
+  assert.equal(results[0].subject.targetExecutionContext.turnId, 'live-turn');
+  assert.equal((await store.get('same-observation')).status, 'completed');
+});
+
 for (const provider of ['claude', 'codex']) {
   test('actual ' + provider + ' Main latest pins exact saved identity and returns the latest completed text', async t => {
     const rows = provider === 'claude' ? [cUser('U1'), cAnswer('A1', 'old'), cUser('U2'), cAnswer('A2', 'latest')]
@@ -979,4 +1017,71 @@ for (const subject of [
   const result = await f.read({ subject });
   assert.equal(result.code, 'response_subject_unresolved');
   assert.equal(result.result, undefined);
+});
+
+
+// New continuation identity-only path. Keep all preceding completion controls
+// unchanged: input-ready is NOT an authoritative idle outcome.
+for (const terminal of ['turn_aborted', null, 'task_complete']) {
+  test('actual Codex continuation history selects incomplete/aborted/final identity without response authority: ' + terminal, async t => {
+    const f = fixture(t, { provider: 'codex', rows: [...codexTurn('OLD', 'old final'), ...codexTurn('CURRENT', 'partial', terminal)] });
+    f.context.codexTurnWatchers.get('T').outcomeKnown = false;
+    assert.equal((await f.state()).busy, null);
+    assert.equal((await f.read()).code, 'response_busy_unknown');
+    const identity = await f.read({ purpose: 'continuation-history', maxChars: 500 });
+    assert.equal(identity.subject?.targetExecutionContext.turnId, 'CURRENT', JSON.stringify(identity));
+    assert.equal(identity.subject.targetExecutionContext.generation, null);
+    assert.equal(identity.result.sourceVerified, true);
+    assert.equal(identity.result.complete, undefined);
+    assert.equal(identity.result.assistantText, undefined);
+    assert.equal((await f.read()).code, 'response_busy_unknown');
+  });
+}
+
+for (const noUser of [false, true]) test('continuation compact identity never skips latest Goal/no-user execution: ' + noUser, async t => {
+  const f = fixture(t, { provider: 'codex', rows: latestGoalRows({ noUser, terminal: null }) });
+  f.context.codexTurnWatchers.get('T').outcomeKnown = false;
+  const identity = await f.read({ purpose: 'continuation-history' });
+  assert.equal(identity.subject?.targetExecutionContext.turnId, 'B', JSON.stringify(identity));
+  assert.equal(identity.result.sourceVerified, true);
+  assert.equal(identity.result.complete, undefined);
+});
+
+test('stopped abruptly-ended Codex retains historical identity but never returns partial text as completion', async t => {
+  const f = fixture(t, { provider: 'codex', rows: codexTurn('A', 'partial', null) });
+  f.controls.lifecycle.processStatus = 'absent';
+  const identity = await f.read({ purpose: 'continuation-history' });
+  assert.equal(identity.subject?.targetExecutionContext.turnId, 'A', JSON.stringify(identity));
+  assert.equal(identity.result.sourceVerified, true); assert.equal(identity.result.assistantText, undefined);
+  assert.equal((await f.read()).code, 'result_unavailable');
+});
+
+for (const mutation of ['input', 'launch', 'background-ABA', 'process-unknown', 'close']) {
+  test('actual continuation history discards identity across ' + mutation + ' during source I/O', async t => {
+    const f = fixture(t, { provider: 'codex', rows: codexTurn('A', 'partial', 'turn_aborted') });
+    f.context.codexTurnWatchers.get('T').outcomeKnown = false;
+    const original = f.context.codexDataModule._api.loadLatestCodexObservedExecution;
+    f.context.codexDataModule._api.loadLatestCodexObservedExecution = async request => {
+      const loaded = await original(request);
+      if (mutation === 'input') f.controls.input += 2;
+      if (mutation === 'launch') f.controls.generation = 'replacement';
+      if (mutation === 'background-ABA') f.context.tabBackgroundWorkRevisionByTab.set('T', 2);
+      if (mutation === 'process-unknown') f.controls.lifecycle.processStatus = 'unknown';
+      if (mutation === 'close') f.owner.exists = false;
+      return loaded;
+    };
+    const identity = await f.read({ purpose: 'continuation-history' });
+    assert.equal(identity.result, undefined); assert.equal(identity.subject, null);
+    assert.ok(identity.pending || identity.error);
+  });
+}
+
+for (const pending of ['prompt', 'catch-up', 'binding-conflict']) test('identity selection cannot bypass Main transition: ' + pending, async t => {
+  const f = fixture(t, { provider: 'codex', rows: codexTurn('A', 'partial', 'turn_aborted') });
+  f.context.codexTurnWatchers.get('T').outcomeKnown = false;
+  if (pending === 'prompt') f.context.codexPromptInFlight.set('T', true);
+  if (pending === 'catch-up') f.context.codexTurnWatchers.get('T').catchUpPending = true;
+  if (pending === 'binding-conflict') f.context.codexTurnWatchers.get('T').manualBindingConflict = { source: 'test' };
+  f.context.codexDataModule._api.loadLatestCodexObservedExecution = () => { throw new Error('must not read through a transition'); };
+  assert.equal((await f.read({ purpose: 'continuation-history' })).code, 'continuation_history_runtime_unstable');
 });

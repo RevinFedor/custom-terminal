@@ -177,6 +177,88 @@ test('unknown state after the read keeps the wait recoverable instead of claimin
   assert.equal(h.notifications.length, 1);
 });
 
+test('one invalidated runtime read is reacquired before parking a live busy observation', async t => {
+  const h = await fixture(t); let reads = 0;
+  h.setStateRead(async () => ++reads === 1
+    ? { known: false, error: 'response_state_changed' }
+    : { known: true, exists: true, toolType: 'codex', sessionId: 'session', busy: true,
+      revision: 'fresh-turn', backgroundWorkCount: 0 });
+  await h.start();
+  assert.equal(reads, 2);
+  assert.equal((await h.store.get('observe')).status, 'running');
+  assert.equal((await h.store.getInternal('observe')).observationWaitReason, 'target-busy');
+  assert.equal(h.calls.length, 0); assert.equal(h.notifications.length, 0);
+  assert.equal(h.watched.size, 0, 'busy recovery must not subscribe to full transcript updates');
+});
+
+test('invalidated read on the last completion edge can recover without another lifecycle event', async t => {
+  const h = await fixture(t); await h.start(); let reads = 0;
+  h.setStateRead(async () => ++reads === 1
+    ? { known: false, error: 'response_state_changed' }
+    : { known: true, exists: true, toolType: 'codex', sessionId: 'session', busy: false,
+      revision: 'final', backgroundWorkCount: 0 });
+  await h.service.reconcile('observe', 'last-done-edge');
+  assert.equal(h.notifications.length, 1);
+  assert.equal(h.notifications[0].body, 'TARGET FINAL');
+  assert.equal((await h.store.get('observe')).status, 'completed');
+});
+
+test('continuous invalidation stays unknown after a bounded second read, never polls or fabricates idle', async t => {
+  const h = await fixture(t); let reads = 0;
+  h.setStateRead(async () => { reads++; return { known: false, error: 'response_state_changed' }; });
+  await h.start(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads, 2);
+  assert.equal((await h.store.get('observe')).status, 'waiting_recovery');
+  assert.equal(h.calls.length, 0); assert.equal(h.notifications.length, 0);
+});
+
+test('unknown process and owner failure are not treated as a transient revision conflict', async t => {
+  const h = await fixture(t); let reads = 0;
+  h.setStateRead(async () => { reads++; return { known: false, code: 'response_process_lookup_failed' }; });
+  await h.start();
+  assert.equal(reads, 1); assert.equal((await h.store.get('observe')).status, 'waiting_recovery');
+  assert.equal(h.calls.length, 0);
+});
+
+test('fresh snapshot after invalidation still rejects a different source owner', async t => {
+  const h = await fixture(t); let reads = 0;
+  h.setStateRead(async () => ++reads === 1 ? { known: false, error: 'response_state_changed' }
+    : { known: true, exists: true, toolType: 'codex', sessionId: 'other-session', busy: false, revision: 'other' });
+  await h.start();
+  const run = await h.store.get('observe');
+  assert.equal(run.status, 'failed'); assert.equal(run.resultErrorCode, 'response_target_changed');
+  assert.equal(h.calls.length, 0);
+});
+
+test('same-ID explicit recheck is observation-only even when a settled source notification could retry', async t => {
+  const h = await fixture(t); await h.start();
+  const action = await webBoundary('performOrchestrationAction', {
+    getOrchestrationRunStore: () => h.store, getResponseObservationService: () => h.service,
+    withOrchestrationUrls: value => value,
+    sendOrchestrationCompletionNotification: () => assert.fail('no retry of source notification'),
+  });
+  h.setState({ busy: false, revision: 'final' });
+  const result = await action('observe', 'recheck', { tabId: 'source' });
+  assert.equal(result.ok, true); assert.equal(result.run.runId, 'observe');
+  assert.equal(h.notifications.length, 1);
+  await h.store.patch('observe', { notificationStatus: 'failed' });
+  const again = await action('observe', 'recheck', { tabId: 'source' });
+  assert.equal(again.ok, true); assert.equal(again.alreadySettled, true);
+  assert.equal(h.notifications.length, 1);
+});
+
+test('read-only recheck rejects an agent assignment without entering its Send/Resume recovery', async t => {
+  const h = await fixture(t);
+  await h.store.create({ runId: 'agent-run', sourceTabId: 'source', targetTabId: 'worker' });
+  const action = await webBoundary('performOrchestrationAction', {
+    getOrchestrationRunStore: () => h.store,
+    getOrchestrationContinuationService: () => assert.fail('must not access continuation'),
+    withOrchestrationUrls: value => value,
+  });
+  const result = await action('agent-run', 'recheck');
+  assert.equal(result.ok, false); assert.equal(result.code, 'response_observation_required');
+});
+
 test('a child notification problem is attention, not successful completion or a spin loop', async t => {
   const h = await fixture(t);
   await h.start();

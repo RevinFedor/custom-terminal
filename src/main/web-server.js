@@ -47,6 +47,7 @@ const http2 = require('http2');
 const url = require('url');
 const path = require('path');
 const srcMainDir = __dirname;
+const { causal: perfCausal } = require(path.join(srcMainDir, 'perf-causal-context'));
 const { AgentSendQueue, hasCanonicalSendConsumption } = require(path.join(srcMainDir, 'agent-send-queue'));
 const { isAutomaticPromptQueueRequest, hasPromptQueueContextConditionKey } = require(path.join(srcMainDir, '../shared/prompt-queue-send-intent.cjs'));
 const { importMobileUploads, uploadPathKey, createOwnedAttachmentSnapshot,
@@ -6548,15 +6549,12 @@ function getOrchestrationContinuationService() {
     throw Object.assign(new Error('Продолжение запросов недоступно в этой версии приложения.'), { code: 'orchestration_continuation_unavailable' });
   }
   const { createOrchestrationContinuationService } = require('./orchestration-continuation');
+  const { createContinuationInputReader } = require('./orchestration-continuation-input');
   orchestrationContinuationService = createOrchestrationContinuationService({
     store: getOrchestrationRunStore(), receipts: agentSendReceiptStore,
-    readState: async tabId => {
-      const state = await getAgentResponseState(tabId);
-      const destination = state.known && state.processStatus === 'found'
-        ? readAgentSendDestination?.(tabId, state.toolType, state.sessionId) : null;
-      return destination?.sessionId === state.sessionId && destination?.toolType === state.toolType
-        ? { ...state, acceptedResumeSourceSessionId: destination.acceptedResumeSourceSessionId || null } : state;
-    },
+    readState: createContinuationInputReader({ readResponseState: getAgentResponseState,
+      readRuntimeSnapshot: typeof readAgentRuntimeSnapshot === 'function' ? readAgentRuntimeSnapshot : null,
+      readSendDestination: readAgentSendDestination }),
     readInfo: tabId => resolveAgentSessionInfo(tabId, 2000),
     reaudit: record => reconcileAgentSendReceiptForApi(record.tabId, { operationKey: record.operationKey, attemptId: record.attemptId }),
     readOriginal: (run, options = {}) => {
@@ -6572,7 +6570,8 @@ function getOrchestrationContinuationService() {
         forceFresh: true, resultReadMode: 'prompt-proof', maxChars: 500 });
     },
     readLatest: (run, state) => readAgentObservedResponse({ tabId: run.targetTabId,
-      expectedSessionId: state.sessionId, maxChars: 500 }),
+      expectedSessionId: state.sessionId, maxChars: 500,
+      ...(run.targetToolType === 'codex' ? { purpose: 'continuation-history' } : {}) }),
     send: (request, run) => runAgentSendScenario({ ...request,
       presentationSnapshot: orchestrationPresentationSnapshot(run, 'request', null, request.prompt),
       timeoutMs: agentSendBridgeTimeoutMs }),
@@ -6637,6 +6636,16 @@ async function performOrchestrationAction(runId, action, options = {}) {
   const store = getOrchestrationRunStore();
   const current = await store.get(runId);
   if (!current) return { ok: false, statusCode: 404, error: 'run not found' };
+  if (action === 'recheck') {
+    if (!isResponseObservation(current)) return { ok: false, statusCode: 409,
+      code: 'response_observation_required', error: 'Recheck requires a read-only response observation' };
+    // Keep this separate from retry: a run can settle between the caller GET
+    // and POST, and retry may then resend its source notification.
+    if (isTerminalStatus(current.status)) return { ok: true, alreadySettled: true,
+      run: withOrchestrationUrls(current) };
+    await getResponseObservationService().reconcile(runId, 'explicit-readonly-recheck');
+    return { ok: true, run: withOrchestrationUrls(await store.get(runId)) };
+  }
   if (action === 'continue' || action === 'new-request') {
     try {
       await agentSendReceiptStartupReady;
@@ -7835,6 +7844,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           version: 1, providers: ['claude', 'codex'], durable: true, targetInput: false,
           endpoint: '/api/terminal-tabs/:tabId/response-observations',
           resultEndpoint: '/api/orchestrations/:runId/result',
+          recheck: { version: 1, action: 'recheck', targetInput: false },
         } } : {}),
         externalResearchOrchestration: {
           version: 1,
@@ -9365,7 +9375,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 400, { ok: false, error: 'absolute root required' });
     }
     try {
-      const usages = projectPromptCatalog.usageForRoot(rootPath);
+      const usages = perfCausal.syncWork('http.prompt-usage', {
+        caller: 'http.project-prompt-usage', fileIdentity: rootPath,
+      }, () => projectPromptCatalog.usageForRoot(rootPath), { root: true });
       return sendJson(res, 200, { ok: true, root: rootPath, usages, updatedAt: Date.now() });
     } catch (error) {
       return sendJson(res, 500, { ok: false, error: String(error?.message || error) });

@@ -1116,7 +1116,7 @@ Stale-closure gotcha: blur-save и следующий click могут прои�
 | `src/renderer/store/usePromptQueueStore.ts` | Per-tab queue + autoRun + stopAfter state |
 | `src/renderer/utils/composerClipboard.mjs` | Единый positional copy/cut export и `[imagePath]` import для History/Run after; разворачивает paste sidecars |
 | `src/renderer/utils/composerDraftPersistence.mjs` | Ограниченный durable snapshot History по `tabId`: text + image refs + полные тела prompt/paste chips |
-| `src/renderer/utils/composerViewState.mjs` | Нормализация и per-tab память selection/internal `scrollTop`; отсекает технические события во время owner restore |
+| `src/renderer/utils/composerViewState.mjs` | Нормализация и per-tab память диапазона, optional anchor/head и internal `scrollTop`; отсекает технические события во время owner restore. Контракт History возврата — `fact-история-как-основная-поверхность.md::Каретка и направление выделения после возврата` |
 | `src/renderer/utils/composerShortcutRouting.mjs` | Физическое владение `Cmd/Ctrl+F`: портальный Run after остаётся локальным composer, History не перехватывает его capture-событие |
 | `src/renderer/utils/projectArrowNavigation.mjs` | Guard Left/Right по реальному DOM-target; stale `activeArea=projects` не отнимает клавиши у xterm/composer/form controls |
 | `src/renderer/utils/composerWordMotion.ts` | Один Opt+Arrow через целый image/paste marker, с теми же диапазонами, что presentation layer |

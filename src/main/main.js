@@ -1735,25 +1735,15 @@ const { causal: perfCausal, boundedCallerToken: perfCallerToken } = require(path
 const { createThreadMetrics } = require(path.join(srcMainDir, 'perf-thread-metrics'));
 let perfWatchdog = null;
 let perfWatchdogSocketPath = null;
-let perfCausalPendingPackets = 0;
+const perfCausalTransport = require(path.join(srcMainDir, 'perf-causal-transport')).createCausalTransport({
+  target: () => perfWatchdog, onFailure: () => perfCausal.transportFailed(),
+});
 const perfDiagnosticsEnabled = process.env.NOTED_PERF_LOOP_MONITOR !== '0' && process.env.NOTED_E2E_TEST !== 'true';
 const perfThreadMetrics = perfDiagnosticsEnabled ? createThreadMetrics({
   onGC: entry => perfCausal.event('gc', entry),
 }) : null;
 perfCausal.configure({ enabled: perfDiagnosticsEnabled, metrics: perfThreadMetrics,
-  sink: record => {
-    if (!perfWatchdog?.connected || perfCausalPendingPackets >= 32) return false;
-    perfCausalPendingPackets++;
-    try {
-      // One bounded metadata packet before an explicit raw/projection span can
-      // block. The external observer persists it even if Main never settles it.
-      perfWatchdog.send({ t: 'causal', record }, error => {
-        perfCausalPendingPackets--;
-        if (error) perfCausal.transportFailed();
-      });
-      return true;
-    } catch { perfCausalPendingPackets--; return false; }
-  },
+  sink: record => perfCausalTransport.sendRecord(record),
 });
 app.once('before-quit', () => perfThreadMetrics?.close());
 
@@ -2046,8 +2036,9 @@ if (process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
         const mem = process.memoryUsage();
         const ipcAgg = summarizeIpcAgg(5000);
         const thread = lastGapThread && threadNow ? perfThreadMetrics.between(lastGapThread, threadNow) : null;
+        const workCapsule = perfCausal.gapCapsule(lastGapTickAbs, firedAbs);
         perfCausal.event('main-gap', { startAbs: lastGapTickAbs, durationMs: gapMs,
-          ...thread, expectedAbs: lastGapTickAbs + gapIntervalMs });
+          ...thread, expectedAbs: lastGapTickAbs + gapIntervalMs, workCapsule });
         console.warn(
           '[Perf:MainLoopGap]' +
           ' expectedAbs=' + (lastGapTickAbs + gapIntervalMs).toFixed(1) +
@@ -2060,6 +2051,7 @@ if (process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
           ' cpuUserMs=' + (cpuDelta.user / 1000).toFixed(1) +
           ' cpuSystemMs=' + (cpuDelta.system / 1000).toFixed(1) +
           ' threadMetrics=' + JSON.stringify(thread) +
+          ' workCapsule=' + JSON.stringify(workCapsule) +
           ' rssMb=' + Math.round(mem.rss / 1024 / 1024) +
           ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024) +
           ' heapLimitMb=' + Math.round(require('node:v8').getHeapStatistics().heap_size_limit / 1024 / 1024)
@@ -2146,6 +2138,10 @@ if (process.env.NOTED_PERF_WATCHDOG !== '0' && process.env.NOTED_E2E_TEST !== 't
     });
     const { captureIncidentProfile } = require(path.join(srcMainDir, 'perf-incident-profile.js'));
     perfWatchdog.on('message', (request) => {
+      if (request?.t === 'causal-ack') {
+        if (request.sourcePid === process.pid) perfCausal.acknowledge(request);
+        return;
+      }
       if (request?.t !== 'capture' || !/^incident-\d+-\d+$/.test(request.id || '')) return;
       const all = BrowserWindow.getAllWindows().filter(win => !win.isDestroyed());
       const target = all.find(win => win.webContents.getOSProcessId() === request.pid) ||
@@ -2171,7 +2167,7 @@ if (process.env.NOTED_PERF_WATCHDOG !== '0' && process.env.NOTED_E2E_TEST !== 't
           };
         }
         heartbeatPending = true;
-        perfWatchdog.send({
+        const accepted = perfCausalTransport.sendHeartbeat(() => ({
           t: 'hb',
           proc: 'main',
           sentAbs: nodePerformance.timeOrigin + nodePerformance.now(),
@@ -2179,9 +2175,11 @@ if (process.env.NOTED_PERF_WATCHDOG !== '0' && process.env.NOTED_E2E_TEST !== 't
           // arrives, the watchdog logs THIS list as lastActiveOps — the op that
           // was running when the loop froze, captured before the freeze.
           ops: perfActiveOps.size ? summarizePerfOps() : '',
-          causal: perfCausal.snapshot(),
+          causal: perfCausal.snapshot({ delivery: true }),
+          diagnosticHealth: { causalTransport: perfCausalTransport.snapshot() },
           context,
-        }, () => { heartbeatPending = false; });
+        }), () => { heartbeatPending = false; });
+        if (!accepted) heartbeatPending = false;
       } catch { heartbeatPending = false; /* channel raced shutdown/startup */ }
     }, 250);
     if (typeof hbTimer.unref === 'function') hbTimer.unref();
@@ -62985,7 +62983,8 @@ function captureCodexFrame(term, {
   tabId = null,
   authoritativeScreen = false,
 } = {}) {
-  return new Promise((resolve) => {
+  let cancelCapture;
+  const capture = new Promise((resolve) => {
     let raw = '';
     let resolved = false;
     let settling = false;
@@ -63001,6 +63000,13 @@ function captureCodexFrame(term, {
       if (timer) clearTimeout(timer);
       if (quietTimer) clearTimeout(quietTimer);
       try { sub?.dispose?.(); } catch {}
+    };
+    cancelCapture = () => {
+      if (resolved) return;
+      resolved = true;
+      cleanup();
+      raw = '';
+      resolve({ raw: '', clean: '', timedOut: false, cancelled: true, screenSource: 'cancelled' });
     };
     const finish = (timedOut, projectedClean = null, screenSource = null) => {
       if (resolved || settling) return;
@@ -63019,6 +63025,7 @@ function captureCodexFrame(term, {
             source = 'headless-current-screen';
           }
         }
+        if (resolved) return;
         if (clean == null) clean = cleanCodexTuiFrame(raw);
         resolved = true;
         settling = false;
@@ -63106,6 +63113,8 @@ function captureCodexFrame(term, {
       }
     });
   });
+  capture.cancel = () => cancelCapture();
+  return capture;
 }
 
 async function sendCodexKeyAndCapture(
@@ -63279,31 +63288,41 @@ function readCodexOwnedModelInputDecision(term, receipt, { observePaste = false 
   if (owner.pending) return { action: 'wait', reason: owner.reason };
   if (!owner.valid) return { action: 'retire', reason: owner.reason };
   if (!receipt.recoveryPending && !observePaste) return { action: 'wait', reason: 'original-write-active' };
-  if (!codexTuiReadyTabs.has(receipt.identity.tabId)
-    || codexLateMcpProofPending.has(receipt.identity.tabId)
-    || codexRuntimePolicies?.read(receipt.identity.tabId)) {
-    return { action: 'wait', reason: 'composer-control-unavailable' };
+  const controlEvidence = { ready: codexTuiReadyTabs.has(receipt.identity.tabId),
+    lateMcpProofPending: codexLateMcpProofPending.has(receipt.identity.tabId),
+    runtimePolicy: !!codexRuntimePolicies?.read(receipt.identity.tabId) };
+  if (!controlEvidence.ready || controlEvidence.lateMcpProofPending || controlEvidence.runtimePolicy) {
+    return { action: 'wait', reason: 'composer-control-unavailable', controlEvidence };
   }
   const proof = getHeadlessCodexDraftState(receipt.identity.tabId, 'owned-model-input');
   const buffer = getHeadlessTerminalMirror(receipt.identity.tabId)?.terminal?.buffer?.active;
   const cursorRow = buffer ? Number(buffer.baseY) + Number(buffer.cursorY) : null;
   const cursorSource = 'headless-main:cursor:' + cursorRow;
   const afterSeq = receipt.clearWriteSeq ?? receipt.identity.mirrorWriteSeq;
+  const frameEvidence = {
+    available: proof?.success === true,
+    generationMatches: proof?.frameIdentity?.generation === receipt.identity.mirrorGeneration,
+    writeSeq: Number.isFinite(proof?.frameIdentity?.writeSeq) ? proof.frameIdentity.writeSeq : null,
+    afterWriteSeq: afterSeq,
+    cursorRow,
+    cursorSourceMatches: proof?.source === cursorSource || String(proof?.source || '').startsWith(cursorSource + ':'),
+    hasDraft: typeof proof?.hasDraft === 'boolean' ? proof.hasDraft : null,
+  };
   if (proof?.success !== true || proof.frameIdentity?.generation !== receipt.identity.mirrorGeneration
     || !Number.isInteger(cursorRow)
     || !(proof.source === cursorSource || String(proof.source || '').startsWith(cursorSource + ':'))
     || !Number.isFinite(proof.frameIdentity?.writeSeq) || proof.frameIdentity.writeSeq <= afterSeq) {
-    return { action: 'wait', reason: 'post-write-composer-unproven' };
+    return { action: 'wait', reason: 'post-write-composer-unproven', frameEvidence };
   }
   if (receipt.clearWriteSeq != null) {
-    return proof.hasDraft === false ? { action: 'clear-confirmed' }
-      : { action: 'wait', reason: 'clear-not-confirmed' };
+    return proof.hasDraft === false ? { action: 'clear-confirmed', frameEvidence }
+      : { action: 'wait', reason: 'clear-not-confirmed', frameEvidence };
   }
   const owned = decideCodexOwnedSlashDraft({ slashInserted: true, enterSubmitted: false,
     identityCurrent: true, draftProofAvailable: true, hasDraft: proof.hasDraft,
     expectedCommand: receipt.command, currentDraft: proof.preview });
-  return owned.owned ? { action: 'clear', proof }
-    : { action: 'wait', reason: owned.reason };
+  return owned.owned ? { action: 'clear', proof, frameEvidence }
+    : { action: 'wait', reason: owned.reason, frameEvidence };
 }
 
 async function waitForCodexOwnedModelPaste(tabId, term, receipt) {
@@ -63317,8 +63336,12 @@ async function waitForCodexOwnedModelPaste(tabId, term, receipt) {
     isSettled: result => result?.accepted === true,
     shouldWait: result => result?.action === 'wait',
   });
+  const decision = report.value || report.lastObservation;
   return { timedOut: report.value?.accepted !== true, raw: '',
     clean: report.value?.proof?.preview || '',
+    inputObservation: { ...report.observation, checks: report.checks, reason: report.reason || null,
+      decision: decision?.action || null, decisionReason: decision?.reason || null,
+      frame: decision?.frameEvidence || null, control: decision?.controlEvidence || null },
     ownerChanged: report.observation?.status === 'superseded'
       || ['retire', 'retired'].includes(report.value?.action),
   };
@@ -63938,7 +63961,8 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
       error: 'codex_input_ownership_changed', manualTakeover: true };
   }
   if (frame.timedOut) {
-    console.warn(logPrefix + ' slash input frame timed out for ' + JSON.stringify(text) + ' clean=' + JSON.stringify(frame.clean.slice(0, 500)));
+    console.warn(logPrefix + ' slash input frame timed out for ' + JSON.stringify(text)
+      + ' observation=' + JSON.stringify(frame.inputObservation || null));
     const rollback = slashDraftIdentity
       ? await rollbackCodexOwnedSlashDraft({
         term,
@@ -63956,6 +63980,7 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
       pasteWritten: true,
       enterWritten: false,
       slashRollback: rollback,
+      slashInputObservation: frame.inputObservation || null,
     };
   }
   let enterRefusal = readCodexPickerWriteRefusal(
@@ -64703,6 +64728,7 @@ async function selectCodexModelEffort(term, {
   let slashSubmitted = false;
   let outcome = null;
   let pickerMayBeOpen = false;
+  let modelOpenCapture = null;
   const confirmPersistentSelection = async (planScopeApplied = false) => {
     const expected = {
       model,
@@ -64788,7 +64814,7 @@ async function selectCodexModelEffort(term, {
   }
 
   try {
-    const openCapture = captureCodexFrame(term, {
+    const openCapture = modelOpenCapture = captureCodexFrame(term, {
       timeoutMs: 6000,
       logPrefix: logPrefix + ':open',
       tabId,
@@ -65421,6 +65447,7 @@ async function selectCodexModelEffort(term, {
     outcome = { success: false, error: error?.message || String(error) };
     return outcome;
   } finally {
+    modelOpenCapture?.cancel?.();
     let inputOwnershipLost = outcome?.manualTakeover === true
       || outcome?.error === 'codex_input_ownership_changed';
     const unsubmittedModelInput = codexSettingsMutationQueue.getUnsubmittedInput(term);

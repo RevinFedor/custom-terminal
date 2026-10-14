@@ -170,6 +170,8 @@ export interface HistoryPromptDraftWriteOptions {
 export interface HistoryComposerViewState {
   selectionStart: number;
   selectionEnd: number;
+  selectionAnchor?: number;
+  selectionHead?: number;
   scrollTop: number;
   updatedAt: number;
 }
@@ -671,7 +673,7 @@ interface UIStore {
   scheduleHistoryComposerDraftSave: () => void;
   setHistoryComposerView: (
     tabId: string,
-    patch: Partial<Pick<HistoryComposerViewState, 'selectionStart' | 'selectionEnd' | 'scrollTop'>>,
+    patch: Partial<Pick<HistoryComposerViewState, 'selectionStart' | 'selectionEnd' | 'selectionAnchor' | 'selectionHead' | 'scrollTop'>>,
   ) => void;
   flushHistoryComposerView: () => void;
   setHistoryComposerAvailability: (

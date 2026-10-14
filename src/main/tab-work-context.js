@@ -1,5 +1,13 @@
 'use strict';
 
+const { causal } = require('./perf-causal-context');
+
+// Named call sites only: retain the original statement and separate compile/execute timing.
+function sqlStatement(siteId, operation, prepare, execute) {
+  const statement = causal.sql(siteId, 'prepare', prepare);
+  return causal.sql(siteId, operation, () => execute(statement));
+}
+
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -261,6 +269,7 @@ function changedHunks(before, after, contextLines = FILE_DIFF_CONTEXT_LINES) {
 }
 
 function changedFilePresentation(before, after) {
+  causal.count('diffs');
   const diff = changedHunks(before, after);
   const hunks = diff.hunks;
   const first = hunks[0] || { newStart: 1 };
@@ -999,13 +1008,13 @@ class TabWorkContext {
         ON tab_context_handoffs(tab_id, payload_hash, status);
     `);
     const updateColumns = new Set(
-      this.db.prepare('PRAGMA table_info(tab_context_updates)').all().map((column) => column.name),
+      sqlStatement('tabContext.init.tab_context_updates', 'all', () => this.db.prepare('PRAGMA table_info(tab_context_updates)'), statement => statement.all()).map((column) => column.name),
     );
     if (!updateColumns.has('file_changes_json')) {
       this.db.exec('ALTER TABLE tab_context_updates ADD COLUMN file_changes_json TEXT');
     }
     const handoffColumns = new Set(
-      this.db.prepare('PRAGMA table_info(tab_context_handoffs)').all().map((column) => column.name),
+      sqlStatement('tabContext.init.tab_context_handoffs', 'all', () => this.db.prepare('PRAGMA table_info(tab_context_handoffs)'), statement => statement.all()).map((column) => column.name),
     );
     if (!handoffColumns.has('prepared_prompt')) {
       this.db.exec('ALTER TABLE tab_context_handoffs ADD COLUMN prepared_prompt TEXT');
@@ -1034,7 +1043,7 @@ class TabWorkContext {
     this.resolveContinuationWriteTarget = resolveContinuationWriteTarget;
     // A staged UI send that never crossed the durable send boundary can be
     // restored. Unknown physical attempts keep their immutable attachment set.
-    for (const row of this.db.prepare("SELECT * FROM tab_context_handoffs WHERE status='preparing'").all()) {
+    for (const row of sqlStatement('tabContext.configure.tab_context_handoffs', 'all', () => this.db.prepare("SELECT * FROM tab_context_handoffs WHERE status='preparing'"), statement => statement.all())) {
       const receipt = (readReceipts?.(row.tab_id) || []).find((r) => r.handoffId === row.handoff_id);
       if (receipt?.state === 'confirmed') this.confirm(row.tab_id, row.handoff_id, row.payload_hash);
       else if (!receipt || ['not-submitted', 'reserved', 'preparing'].includes(receipt.state)) {
@@ -1053,9 +1062,13 @@ class TabWorkContext {
   }
 
   touch(tabId) {
-    this.db.prepare(`INSERT INTO tab_work_context(tab_id, revision) VALUES (?, 1)
-      ON CONFLICT(tab_id) DO UPDATE SET revision=revision+1`).run(tabId);
-    this.onChanged?.(this.get(tabId));
+    const work = () => {
+      sqlStatement('tabContext.touch.tab_work_context', 'run', () => this.db.prepare(`INSERT INTO tab_work_context(tab_id, revision) VALUES (?, 1)
+        ON CONFLICT(tab_id) DO UPDATE SET revision=revision+1`), statement => statement.run(tabId));
+      if (this.onChanged) causal.count('notifications');
+      this.onChanged?.(this.get(tabId));
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.touch', { tabId }, work);
   }
 
   sourceDescriptor(tabId, sessionId = null, operationId = null) {
@@ -1152,67 +1165,71 @@ class TabWorkContext {
   }
 
   get(tabId, tab = this.tab(tabId)) {
-    const row = this.db.prepare('SELECT * FROM tab_work_context WHERE tab_id=?').get(tabId);
-    const updateRows = this.db.prepare(`SELECT * FROM tab_context_updates
-      WHERE tab_id=? AND status IN ('pending','sending') ORDER BY created_at, rowid`)
-      .all(tabId);
-    const updates = this.presentUpdates(updateRows);
-    const files = this.db.prepare('SELECT path, hash, error FROM tab_context_files WHERE tab_id=? ORDER BY path').all(tabId);
-    return {
-      tabId, name: tab?.name || null, projectId: tab?.projectId || null,
-      responsibility: row?.responsibility || '', revision: row?.revision || 0,
-      files, updates, pendingCount: updates.filter((item) => item.status === 'pending').length,
-      sessionId: tab?.codexSessionId || tab?.claudeSessionId || null,
-      cwd: tab?.cwd || null,
+    const work = () => {
+      const row = sqlStatement('tabContext.get.tab_work_context', 'get', () => this.db.prepare('SELECT * FROM tab_work_context WHERE tab_id=?'), statement => statement.get(tabId));
+      const updateRows = sqlStatement('tabContext.get.tab_context_updates', 'all', () => this.db.prepare(`SELECT * FROM tab_context_updates
+        WHERE tab_id=? AND status IN ('pending','sending') ORDER BY created_at, rowid`), statement => statement.all(tabId));
+      const updates = this.presentUpdates(updateRows);
+      const files = sqlStatement('tabContext.get.tab_context_files', 'all', () => this.db.prepare('SELECT path, hash, error FROM tab_context_files WHERE tab_id=? ORDER BY path'), statement => statement.all(tabId));
+      return {
+        tabId, name: tab?.name || null, projectId: tab?.projectId || null,
+        responsibility: row?.responsibility || '', revision: row?.revision || 0,
+        files, updates, pendingCount: updates.filter((item) => item.status === 'pending').length,
+        sessionId: tab?.codexSessionId || tab?.claudeSessionId || null,
+        cwd: tab?.cwd || null,
+      };
     };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.get', { tabId }, work);
   }
 
   summaries(tabIds) {
-    // Same logical grouping as presentUpdates: all valid pending file members
-    // make ONE chip; manual/file-error/invalid file members each make one.
-    // Inspect only shape metadata in SQLite, never materialize prompt/diff
-    // bodies, sync linked files, or subscribe to a transcript for a card read.
-    const rows = this.db.prepare(`
-      WITH requested AS (SELECT value AS tab_id FROM json_each(?)),
-      members AS (
-        SELECT u.tab_id, CASE WHEN u.kind IN ('file','file-batch') THEN
-          CASE WHEN json_valid(u.file_changes_json)
-            AND json_type(u.file_changes_json) = 'array' THEN EXISTS (
-              SELECT 1 FROM json_each(u.file_changes_json) c WHERE c.type = 'object'
-                AND json_type(c.value, '$.path') = 'text'
-                AND noted_context_has_file_path(json_extract(c.value, '$.path')) = 1
-                AND json_type(c.value, '$.beforeText') = 'text'
-                AND json_type(c.value, '$.afterText') = 'text'
-            ) ELSE (typeof(u.path) = 'text' AND noted_context_has_file_path(u.path) = 1
-              AND typeof(u.before_text) = 'text' AND typeof(u.after_text) = 'text') END
-          ELSE 0 END AS grouped_file
-        FROM tab_context_updates u JOIN requested r ON r.tab_id = u.tab_id WHERE u.status = 'pending'
-      ), counts AS (
-        SELECT tab_id, sum(CASE WHEN grouped_file THEN 0 ELSE 1 END) + max(grouped_file) AS count
-        FROM members GROUP BY tab_id
-      )
-      SELECT r.tab_id, coalesce(w.revision,0) AS revision, coalesce(c.count,0) AS count
-      FROM requested r LEFT JOIN tab_work_context w ON w.tab_id = r.tab_id
-        LEFT JOIN counts c ON c.tab_id = r.tab_id
-    `).all(JSON.stringify(tabIds));
-    return Object.fromEntries(rows.map(row => [row.tab_id, { known: true, revision: row.revision, count: row.count }]));
+    const work = () => {
+      // Same logical grouping as presentUpdates: all valid pending file members
+      // make ONE chip; manual/file-error/invalid file members each make one.
+      // Inspect only shape metadata in SQLite, never materialize prompt/diff
+      // bodies, sync linked files, or subscribe to a transcript for a card read.
+      const rows = sqlStatement('tabContext.summaries.json_each', 'all', () => this.db.prepare(`
+        WITH requested AS (SELECT value AS tab_id FROM json_each(?)),
+        members AS (
+          SELECT u.tab_id, CASE WHEN u.kind IN ('file','file-batch') THEN
+            CASE WHEN json_valid(u.file_changes_json)
+              AND json_type(u.file_changes_json) = 'array' THEN EXISTS (
+                SELECT 1 FROM json_each(u.file_changes_json) c WHERE c.type = 'object'
+                  AND json_type(c.value, '$.path') = 'text'
+                  AND noted_context_has_file_path(json_extract(c.value, '$.path')) = 1
+                  AND json_type(c.value, '$.beforeText') = 'text'
+                  AND json_type(c.value, '$.afterText') = 'text'
+              ) ELSE (typeof(u.path) = 'text' AND noted_context_has_file_path(u.path) = 1
+                AND typeof(u.before_text) = 'text' AND typeof(u.after_text) = 'text') END
+            ELSE 0 END AS grouped_file
+          FROM tab_context_updates u JOIN requested r ON r.tab_id = u.tab_id WHERE u.status = 'pending'
+        ), counts AS (
+          SELECT tab_id, sum(CASE WHEN grouped_file THEN 0 ELSE 1 END) + max(grouped_file) AS count
+          FROM members GROUP BY tab_id
+        )
+        SELECT r.tab_id, coalesce(w.revision,0) AS revision, coalesce(c.count,0) AS count
+        FROM requested r LEFT JOIN tab_work_context w ON w.tab_id = r.tab_id
+          LEFT JOIN counts c ON c.tab_id = r.tab_id
+      `), statement => statement.all(JSON.stringify(tabIds)));
+      return Object.fromEntries(rows.map(row => [row.tab_id, { known: true, revision: row.revision, count: row.count }]));
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.summaries', {}, work);
   }
 
   deliveredUpdatePresentation(tabId, prompt, updateId) {
     this.requireTab(tabId);
     if (typeof prompt !== 'string' || prompt.length > 2 * MAX_FILE_BYTES || !clean(updateId)) return null;
-    const handoffs = this.db.prepare(`SELECT prepared_prompt, update_ids FROM tab_context_handoffs
-      WHERE tab_id=? AND payload_hash=? AND status='delivered'`)
-      .all(tabId, promptAuditFingerprint(prompt));
+    const handoffs = sqlStatement('tabContext.deliveredUpdatePresentation.tab_context_handoffs', 'all', () => this.db.prepare(`SELECT prepared_prompt, update_ids FROM tab_context_handoffs
+      WHERE tab_id=? AND payload_hash=? AND status='delivered'`), statement => statement.all(tabId, promptAuditFingerprint(prompt)));
     let matching = null;
     for (const handoff of handoffs) {
       if (handoff.prepared_prompt !== prompt) continue;
       let memberIds;
       try { memberIds = JSON.parse(handoff.update_ids); } catch { continue; }
       if (!Array.isArray(memberIds) || memberIds.length === 0 || memberIds.length > 256) continue;
-      const rows = memberIds.map((id) => this.db.prepare(
+      const rows = memberIds.map((id) => sqlStatement('tabContext.deliveredUpdatePresentation.tab_context_updates', 'get', () => this.db.prepare(
         'SELECT * FROM tab_context_updates WHERE tab_id=? AND id=?',
-      ).get(tabId, id));
+      ), statement => statement.get(tabId, id)));
       if (rows.some((row) => !row)) continue;
       const updates = this.presentUpdates(rows.map((row) => ({ ...row, status: 'pending' })));
       const update = updates.find((item) => item.id === updateId);
@@ -1233,44 +1250,53 @@ class TabWorkContext {
   }
 
   list() {
-    return this.listTabs().filter((tab) => tab.tabType !== 'file').map((tab) => {
-      const state = this.get(tab.tabId, tab);
-      return { ...state, updates: state.updates.map(({ text, sections, ...item }) => ({
-        ...item,
-        ...(sections ? { sections: sections.map(({ textStart: _start, textEnd: _end, ...section }) => section) } : {}),
-      })) };
-    });
+    const work = () => {
+      return this.listTabs().filter((tab) => tab.tabType !== 'file').map((tab) => {
+        const state = this.get(tab.tabId, tab);
+        return { ...state, updates: state.updates.map(({ text, sections, ...item }) => ({
+          ...item,
+          ...(sections ? { sections: sections.map(({ textStart: _start, textEnd: _end, ...section }) => section) } : {}),
+        })) };
+      });
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.list', {}, work);
   }
 
   setResponsibility(tabId, description) {
-    this.requireTab(tabId);
-    if (typeof description !== 'string' || description.length > 12000) throw fail('description must be text up to 12000 characters');
-    this.db.prepare(`INSERT INTO tab_work_context(tab_id, responsibility) VALUES (?, ?)
-      ON CONFLICT(tab_id) DO UPDATE SET responsibility=excluded.responsibility`).run(tabId, description.trim());
-    this.touch(tabId);
-    return this.get(tabId);
+    const work = () => {
+      this.requireTab(tabId);
+      if (typeof description !== 'string' || description.length > 12000) throw fail('description must be text up to 12000 characters');
+      sqlStatement('tabContext.setResponsibility.tab_work_context', 'run', () => this.db.prepare(`INSERT INTO tab_work_context(tab_id, responsibility) VALUES (?, ?)
+        ON CONFLICT(tab_id) DO UPDATE SET responsibility=excluded.responsibility`), statement => statement.run(tabId, description.trim()));
+      this.touch(tabId);
+      return this.get(tabId);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.setResponsibility', {}, work);
   }
 
   publish(tabId, { title, text, sourceTabId = null, requestId = null }) {
-    this.requireTab(tabId);
-    sourceTabId = clean(sourceTabId) || null;
-    if (sourceTabId === tabId) throw Object.assign(fail(
-      'publish_context_update is for another tab; do not queue your own work as a self-addressed context update',
-    ), { code: 'context_update_self_target' });
-    if (!clean(text) || text.length > 100000) throw fail('update text must contain 1-100000 characters');
-    const key = clean(requestId) || null;
-    const storedTitle = clean(title) || 'Обновление состояния';
-    const existing = key && this.db.prepare('SELECT * FROM tab_context_updates WHERE tab_id=? AND request_key=?').get(tabId, key);
-    if (existing) {
-      if (existing.text !== text.trim() || existing.title !== storedTitle) throw fail('update requestId was reused with different content', 409);
-      return { updateId: existing.id, deduplicated: true };
-    }
-    const id = crypto.randomUUID();
-    this.db.prepare(`INSERT INTO tab_context_updates(id, tab_id, source_tab_id, request_key, title, text, kind, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'message', ?)`).run(id, tabId, sourceTabId, key, storedTitle, text.trim(), Date.now());
-    this.touch(tabId);
-    void this.syncLinks().catch((e) => console.warn('[TabContext] update subscription:', e.message));
-    return { updateId: id, deduplicated: false };
+    const work = () => {
+      this.requireTab(tabId);
+      sourceTabId = clean(sourceTabId) || null;
+      if (sourceTabId === tabId) throw Object.assign(fail(
+        'publish_context_update is for another tab; do not queue your own work as a self-addressed context update',
+      ), { code: 'context_update_self_target' });
+      if (!clean(text) || text.length > 100000) throw fail('update text must contain 1-100000 characters');
+      const key = clean(requestId) || null;
+      const storedTitle = clean(title) || 'Обновление состояния';
+      const existing = key && sqlStatement('tabContext.publish.tab_context_updates', 'get', () => this.db.prepare('SELECT * FROM tab_context_updates WHERE tab_id=? AND request_key=?'), statement => statement.get(tabId, key));
+      if (existing) {
+        if (existing.text !== text.trim() || existing.title !== storedTitle) throw fail('update requestId was reused with different content', 409);
+        return { updateId: existing.id, deduplicated: true };
+      }
+      const id = crypto.randomUUID();
+      sqlStatement('tabContext.publish.tab_context_updates.2', 'run', () => this.db.prepare(`INSERT INTO tab_context_updates(id, tab_id, source_tab_id, request_key, title, text, kind, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'message', ?)`), statement => statement.run(id, tabId, sourceTabId, key, storedTitle, text.trim(), Date.now()));
+      this.touch(tabId);
+      void this.syncLinks().catch((e) => console.warn('[TabContext] update subscription:', e.message));
+      return { updateId: id, deduplicated: false };
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.publish', {}, work);
   }
 
   attributionBinding(tab, forceOwner = false) {
@@ -1292,8 +1318,7 @@ class TabWorkContext {
 
   pendingUpdateMemberIds(tabId, id, requestedIds = null) {
     this.requireTab(tabId);
-    const pendingRows = this.db.prepare("SELECT * FROM tab_context_updates WHERE tab_id=? AND status='pending' ORDER BY created_at,rowid")
-      .all(tabId);
+    const pendingRows = sqlStatement('tabContext.pendingUpdateMemberIds.tab_context_updates', 'all', () => this.db.prepare("SELECT * FROM tab_context_updates WHERE tab_id=? AND status='pending' ORDER BY created_at,rowid"), statement => statement.all(tabId));
     const logical = this.presentUpdates(pendingRows).find((update) => update.id === id);
     if (!logical) throw fail('update changed or is already being sent', 409);
     const available = new Set(logical.memberIds || [id]);
@@ -1307,51 +1332,57 @@ class TabWorkContext {
   }
 
   dismiss(tabId, id, requestedIds = null) {
-    const memberIds = this.pendingUpdateMemberIds(tabId, id, requestedIds);
-    this.db.transaction(() => {
-      for (const memberId of memberIds) {
-        const result = this.db.prepare("UPDATE tab_context_updates SET status='dismissed' WHERE id=? AND tab_id=? AND status='pending'")
-          .run(memberId, tabId);
-        if (!result.changes) throw fail('context update group changed', 409);
-      }
-    })();
-    this.touch(tabId);
-    return this.get(tabId);
+    const work = () => {
+      const memberIds = this.pendingUpdateMemberIds(tabId, id, requestedIds);
+      this.db.transaction(() => {
+        for (const memberId of memberIds) {
+          const result = sqlStatement('tabContext.dismiss.tab_context_updates', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='dismissed' WHERE id=? AND tab_id=? AND status='pending'"), statement => statement.run(memberId, tabId));
+          if (!result.changes) throw fail('context update group changed', 409);
+        }
+      })();
+      this.touch(tabId);
+      return this.get(tabId);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.dismiss', {}, work);
   }
 
   deleteUpdate(tabId, id, requestedIds = null) {
-    const memberIds = this.pendingUpdateMemberIds(tabId, id, requestedIds);
-    this.db.transaction(() => {
-      for (const memberId of memberIds) {
-        // Keep a terminal tombstone: a publish_context_update retry with the
-        // same requestId must not resurrect something the user deleted.
-        const result = this.db.prepare("UPDATE tab_context_updates SET status='deleted' WHERE id=? AND tab_id=? AND status='pending'")
-          .run(memberId, tabId);
-        if (!result.changes) throw fail('context update group changed', 409);
-      }
-    })();
-    this.touch(tabId);
-    return this.get(tabId);
+    const work = () => {
+      const memberIds = this.pendingUpdateMemberIds(tabId, id, requestedIds);
+      this.db.transaction(() => {
+        for (const memberId of memberIds) {
+          // Keep a terminal tombstone: a publish_context_update retry with the
+          // same requestId must not resurrect something the user deleted.
+          const result = sqlStatement('tabContext.deleteUpdate.tab_context_updates', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='deleted' WHERE id=? AND tab_id=? AND status='pending'"), statement => statement.run(memberId, tabId));
+          if (!result.changes) throw fail('context update group changed', 409);
+        }
+      })();
+      this.touch(tabId);
+      return this.get(tabId);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.deleteUpdate', {}, work);
   }
 
   restoreDismissed(tabId, id, requestedIds = null) {
-    this.requireTab(tabId);
-    const memberIds = Array.from(new Set((Array.isArray(requestedIds) && requestedIds.length > 0
-      ? requestedIds
-      : [id]).map(String).filter(Boolean)));
-    const rows = memberIds.map((memberId) => this.db.prepare(
-      "SELECT * FROM tab_context_updates WHERE id=? AND tab_id=? AND status='dismissed'",
-    ).get(memberId, tabId));
-    if (rows.some((row) => !row)) throw fail('dismissed update group changed', 409);
-    this.db.transaction(() => {
-      for (const memberId of memberIds) {
-        const result = this.db.prepare("UPDATE tab_context_updates SET status='pending' WHERE id=? AND tab_id=? AND status='dismissed'")
-          .run(memberId, tabId);
-        if (!result.changes) throw fail('dismissed update group changed', 409);
-      }
-    })();
-    this.touch(tabId);
-    return this.get(tabId);
+    const work = () => {
+      this.requireTab(tabId);
+      const memberIds = Array.from(new Set((Array.isArray(requestedIds) && requestedIds.length > 0
+        ? requestedIds
+        : [id]).map(String).filter(Boolean)));
+      const rows = memberIds.map((memberId) => sqlStatement('tabContext.restoreDismissed.tab_context_updates', 'get', () => this.db.prepare(
+        "SELECT * FROM tab_context_updates WHERE id=? AND tab_id=? AND status='dismissed'",
+      ), statement => statement.get(memberId, tabId)));
+      if (rows.some((row) => !row)) throw fail('dismissed update group changed', 409);
+      this.db.transaction(() => {
+        for (const memberId of memberIds) {
+          const result = sqlStatement('tabContext.restoreDismissed.tab_context_updates.2', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='pending' WHERE id=? AND tab_id=? AND status='dismissed'"), statement => statement.run(memberId, tabId));
+          if (!result.changes) throw fail('dismissed update group changed', 409);
+        }
+      })();
+      this.touch(tabId);
+      return this.get(tabId);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.restoreDismissed', {}, work);
   }
 
   async syncLinks() {
@@ -1363,73 +1394,104 @@ class TabWorkContext {
     }
   }
 
-  async _syncLinks() {
-    const tabs = this.listTabs();
-    const owners = new Map(tabs.map((tab) => [tab.tabId, tab]));
-    const links = new Set();
-    const dirs = new Set();
-    const subscriptionIds = new Set();
-    const linkedOwnerIds = new Set();
+  // The generator stops at exactly the existing file-read awaits. Each next()
+  // measures the synchronous traversal between those yields, not the IO lifetime.
+  *_syncLinkedFiles(tabs, owners, links, dirs, linkedOwnerIds) {
     for (const child of tabs) {
+      causal.count('tabsVisited');
       if (child.tabType !== 'file' || !/\.(md|markdown)$/i.test(child.filePath || '')) continue;
       const owner = owners.get(child.visualParentTabId);
       if (!owner) continue;
+      causal.count('linksVisited');
       const filePath = path.resolve(child.filePath);
       linkedOwnerIds.add(owner.tabId);
       links.add(owner.tabId + '\0' + filePath);
       dirs.add(path.dirname(filePath));
-      const inserted = this.db.prepare('INSERT OR IGNORE INTO tab_context_files(tab_id,path) VALUES (?,?)').run(owner.tabId, filePath);
-      if (inserted.changes || !this.watchers.has(path.dirname(filePath))) await this.readFile(filePath);
+      const inserted = sqlStatement('tabContext._syncLinks.tab_context_files', 'run', () => this.db.prepare('INSERT OR IGNORE INTO tab_context_files(tab_id,path) VALUES (?,?)'), statement => statement.run(owner.tabId, filePath));
+      if (inserted.changes || !this.watchers.has(path.dirname(filePath))) yield filePath;
     }
-    const sourceBindings = new Map();
-    for (const tab of tabs) {
-      if (tab.tabType === 'file') continue;
-      const isOwner = linkedOwnerIds.has(tab.tabId);
-      if (!isOwner && linkedOwnerIds.size === 0) continue;
-      const binding = this.attributionBinding(tab, isOwner);
-      if (binding) sourceBindings.set(tab.tabId, { tab, ...binding });
-    }
-    for (const source of sourceBindings.values()) {
-      const { tab, sessionId, toolType } = source;
-      if (this.transcriptService) {
-        const consumerId = 'tab-work-context:' + tab.tabId;
-        subscriptionIds.add(consumerId);
-        if (this.subscriptions.get(consumerId) !== sessionId && !this.subscriptionInflight.has(consumerId)) {
-          const request = this.transcriptService.subscribe({ consumerId, tabId: tab.tabId, sessionId, toolType, cwd: tab.cwd })
-            .then((subscribed) => { if (subscribed.success) this.subscriptions.set(consumerId, sessionId); })
-            .catch((error) => console.warn('[TabContext] transcript unavailable:', tab.tabId, error.message))
-            .finally(() => {
-              this.subscriptionInflight.delete(consumerId);
-              const current = this.listTabs().find((candidate) => candidate.tabId === tab.tabId);
-              const desired = current ? this.attributionBinding(current, linkedOwnerIds.has(current.tabId))?.sessionId : null;
-              if (desired !== sessionId) {
-                void this.syncLinks().catch((error) => console.warn('[TabContext] rebind:', error.message));
-              }
-            });
-          this.subscriptionInflight.set(consumerId, request);
+  }
+
+  async _syncLinks() {
+    const { tabs, owners } = causal.syncWork('tabContext.syncLinks.snapshot', {}, () => {
+      const tabs = this.listTabs();
+      const owners = new Map(tabs.map((tab) => {
+        causal.count('tabsIndexed');
+        return [tab.tabId, tab];
+      }));
+      return { tabs, owners };
+    });
+    const links = new Set();
+    const dirs = new Set();
+    const subscriptionIds = new Set();
+    const linkedOwnerIds = new Set();
+    const linkedFiles = this._syncLinkedFiles(tabs, owners, links, dirs, linkedOwnerIds);
+    const nextLink = () => causal.syncWork('tabContext.syncLinks.links', {}, () => linkedFiles.next());
+    for (let next = nextLink(); !next.done; next = nextLink()) await this.readFile(next.value);
+    causal.syncWork('tabContext.syncLinks.reconcile', {}, () => {
+      const sourceBindings = new Map();
+      for (const tab of tabs) {
+        causal.count('tabsVisited');
+        if (tab.tabType === 'file') continue;
+        const isOwner = linkedOwnerIds.has(tab.tabId);
+        if (!isOwner && linkedOwnerIds.size === 0) continue;
+        const binding = this.attributionBinding(tab, isOwner);
+        if (binding) sourceBindings.set(tab.tabId, { tab, ...binding });
+      }
+      for (const source of sourceBindings.values()) {
+        const { tab, sessionId, toolType } = source;
+        if (this.transcriptService) {
+          const consumerId = 'tab-work-context:' + tab.tabId;
+          subscriptionIds.add(consumerId);
+          if (this.subscriptions.get(consumerId) !== sessionId && !this.subscriptionInflight.has(consumerId)) {
+            const request = this.transcriptService.subscribe({ consumerId, tabId: tab.tabId, sessionId, toolType, cwd: tab.cwd })
+              .then((subscribed) => { if (subscribed.success) this.subscriptions.set(consumerId, sessionId); })
+              .catch((error) => console.warn('[TabContext] transcript unavailable:', tab.tabId, error.message))
+              .finally(() => causal.syncWork('tabContext.subscriptionSettled', { tabId: tab.tabId }, () => {
+                this.subscriptionInflight.delete(consumerId);
+                const current = this.listTabs().find((candidate) => candidate.tabId === tab.tabId);
+                const desired = current ? this.attributionBinding(current, linkedOwnerIds.has(current.tabId))?.sessionId : null;
+                if (desired !== sessionId) {
+                  void this.syncLinks().catch((error) => console.warn('[TabContext] rebind:', error.message));
+                }
+              }));
+            this.subscriptionInflight.set(consumerId, request);
+          }
         }
       }
-    }
-    for (const row of this.db.prepare('SELECT tab_id,path FROM tab_context_files').all()) {
-      // Closed owners retain their baseline; reopening can catch offline edits.
-      if (owners.has(row.tab_id) && !links.has(row.tab_id + '\0' + row.path)) {
-        this.db.prepare('DELETE FROM tab_context_files WHERE tab_id=? AND path=?').run(row.tab_id, row.path);
-        this.touch(row.tab_id);
-      } else if (!owners.has(row.tab_id)) dirs.add(path.dirname(row.path));
-    }
-    for (const [dir, watcher] of this.watchers) if (!dirs.has(dir)) { watcher.close(); this.watchers.delete(dir); }
+      for (const row of sqlStatement('tabContext._syncLinks.tab_context_files.2', 'all', () => this.db.prepare('SELECT tab_id,path FROM tab_context_files'), statement => statement.all())) {
+        causal.count('linksVisited');
+        // Closed owners retain their baseline; reopening can catch offline edits.
+        if (owners.has(row.tab_id) && !links.has(row.tab_id + '\0' + row.path)) {
+          sqlStatement('tabContext._syncLinks.tab_context_files.3', 'run', () => this.db.prepare('DELETE FROM tab_context_files WHERE tab_id=? AND path=?'), statement => statement.run(row.tab_id, row.path));
+          this.touch(row.tab_id);
+        } else if (!owners.has(row.tab_id)) dirs.add(path.dirname(row.path));
+      }
+      for (const [dir, watcher] of this.watchers) if (!dirs.has(dir)) { causal.count('watchersClosed'); watcher.close(); this.watchers.delete(dir); }
+    });
     for (const dir of dirs) {
       if (this.watchers.has(dir)) continue;
       try {
-        const watcher = fs.watch(dir, (_event, name) => {
-          const paths = this.db.prepare('SELECT DISTINCT path FROM tab_context_files').all()
-            .filter((row) => path.dirname(row.path) === dir && (!name || path.basename(row.path) === String(name)));
-          for (const row of paths) void this.readFile(row.path).catch((e) => console.warn('[TabContext] watch:', e.message));
+        const files = causal.syncWork('tabContext.syncLinks.watchDirectory', { fileIdentity: dir }, () => {
+          causal.count('watchersCreated');
+          const watcher = fs.watch(dir, (_event, name) => causal.syncWork('tabContext.watchEvent', { fileIdentity: dir }, () => {
+            causal.count('watchEvents');
+            const paths = sqlStatement('tabContext.watchEvent.paths', 'all', () => this.db.prepare('SELECT DISTINCT path FROM tab_context_files'), statement => statement.all())
+              .filter((row) => {
+                causal.count('pathsVisited');
+                return path.dirname(row.path) === dir && (!name || path.basename(row.path) === String(name));
+              });
+            for (const row of paths) {
+              causal.count('matchedPaths');
+              void this.readFile(row.path).catch((e) => console.warn('[TabContext] watch:', e.message));
+            }
+          }, { root: true }));
+          watcher.on('error', (e) => console.warn('[TabContext] watcher:', dir, e.message));
+          watcher.unref();
+          this.watchers.set(dir, watcher);
+          return sqlStatement('tabContext.syncLinks.watchPaths', 'all', () => this.db.prepare('SELECT DISTINCT path FROM tab_context_files'), statement => statement.all());
         });
-        watcher.on('error', (e) => console.warn('[TabContext] watcher:', dir, e.message));
-        watcher.unref();
-        this.watchers.set(dir, watcher);
-        for (const file of this.db.prepare('SELECT DISTINCT path FROM tab_context_files').all()) {
+        for (const file of files) {
           if (path.dirname(file.path) === dir) await this.readFile(file.path);
         }
       } catch (e) { console.warn('[TabContext] watcher unavailable:', dir, e.message); }
@@ -1450,9 +1512,12 @@ class TabWorkContext {
         const handle = await fs.promises.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
         try {
           const stat = await handle.stat();
-          modifiedAt = Number(stat.mtimeMs) || null;
-          if (!stat.isFile() || stat.size > MAX_FILE_BYTES) throw fail('Markdown file is unavailable or exceeds 2 MB');
-          const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
+          const buffer = causal.syncWork('tabContext.readFile.allocate', { fileIdentity: filePath }, () => {
+            modifiedAt = Number(stat.mtimeMs) || null;
+            if (!stat.isFile() || stat.size > MAX_FILE_BYTES) throw fail('Markdown file is unavailable or exceeds 2 MB');
+            causal.count('fileBuffers');
+            return Buffer.alloc(MAX_FILE_BYTES + 1);
+          });
           let bytesRead = 0;
           while (bytesRead < buffer.length) {
             const chunk = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
@@ -1460,39 +1525,43 @@ class TabWorkContext {
             bytesRead += chunk.bytesRead;
           }
           if (bytesRead > MAX_FILE_BYTES) throw fail('Markdown file exceeds 2 MB');
-          content = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead));
+          content = causal.syncWork('tabContext.readFile.decode', { fileIdentity: filePath, bytes: bytesRead }, () =>
+            new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead)));
         } finally { await handle.close(); }
       } catch (e) { error = String(e.message || e); }
-      for (const row of this.db.prepare('SELECT * FROM tab_context_files WHERE path=?').all(filePath)) {
-        if (error) {
-          if (row.error === error) continue;
-          this.db.prepare('UPDATE tab_context_files SET error=? WHERE tab_id=? AND path=?').run(error, row.tab_id, filePath);
-          this.publishFileUpdate(row, { error });
+      causal.syncWork('tabContext.readFile.consume', { fileIdentity: filePath }, () => {
+        for (const row of sqlStatement('tabContext.readFile.tab_context_files', 'all', () => this.db.prepare('SELECT * FROM tab_context_files WHERE path=?'), statement => statement.all(filePath))) {
+          causal.count('linkedOwners');
+          if (error) {
+            if (row.error === error) continue;
+            sqlStatement('tabContext.readFile.tab_context_files.2', 'run', () => this.db.prepare('UPDATE tab_context_files SET error=? WHERE tab_id=? AND path=?'), statement => statement.run(error, row.tab_id, filePath));
+            this.publishFileUpdate(row, { error });
+            this.touch(row.tab_id);
+            continue;
+          }
+          causal.count('fileHashes');
+          const digest = hash(content);
+          if (digest === row.hash && !row.error) continue;
+          const transition = row.hash && row.hash !== digest ? {
+            id: ++this.fileTransitionSequence,
+            targetTabId: row.tab_id,
+            filePath,
+            before: row.content,
+            after: content,
+            beforeHash: row.hash,
+            afterHash: digest,
+            afterMtimeMs: modifiedAt,
+          } : null;
+          this.db.transaction(() => {
+            if (row.error) sqlStatement('tabContext.readFile.tab_context_updates', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='superseded' WHERE tab_id=? AND path=? AND kind='file-error' AND status='pending'"), statement => statement.run(row.tab_id, filePath));
+            if (row.hash && row.hash !== digest) this.publishFileUpdate(row, { content, digest, modifiedAt });
+            sqlStatement('tabContext.readFile.tab_context_files.3', 'run', () => this.db.prepare('UPDATE tab_context_files SET content=?, hash=?, error=NULL WHERE tab_id=? AND path=?'), statement => statement.run(content, digest, row.tab_id, filePath));
+          })();
+          if (transition) this.rememberFileTransition(transition);
           this.touch(row.tab_id);
-          continue;
         }
-        const digest = hash(content);
-        if (digest === row.hash && !row.error) continue;
-        const transition = row.hash && row.hash !== digest ? {
-          id: ++this.fileTransitionSequence,
-          targetTabId: row.tab_id,
-          filePath,
-          before: row.content,
-          after: content,
-          beforeHash: row.hash,
-          afterHash: digest,
-          afterMtimeMs: modifiedAt,
-        } : null;
-        this.db.transaction(() => {
-          if (row.error) this.db.prepare("UPDATE tab_context_updates SET status='superseded' WHERE tab_id=? AND path=? AND kind='file-error' AND status='pending'").run(row.tab_id, filePath);
-          if (row.hash && row.hash !== digest) this.publishFileUpdate(row, { content, digest, modifiedAt });
-          this.db.prepare('UPDATE tab_context_files SET content=?, hash=?, error=NULL WHERE tab_id=? AND path=?')
-            .run(content, digest, row.tab_id, filePath);
-        })();
-        if (transition) this.rememberFileTransition(transition);
-        this.touch(row.tab_id);
-      }
-      this.reconcileShellEditProofs(filePath);
+        this.reconcileShellEditProofs(filePath);
+      });
     });
     this.reads.set(filePath, work);
     try { await work; } finally { if (this.reads.get(filePath) === work) this.reads.delete(filePath); }
@@ -1500,7 +1569,7 @@ class TabWorkContext {
 
   reservedUpdateIds(tabId) {
     const ids = new Set();
-    for (const row of this.db.prepare('SELECT update_ids FROM tab_context_handoffs WHERE tab_id=?').all(tabId)) {
+    for (const row of sqlStatement('tabContext.reservedUpdateIds.tab_context_handoffs', 'all', () => this.db.prepare('SELECT update_ids FROM tab_context_handoffs WHERE tab_id=?'), statement => statement.all(tabId))) {
       try {
         for (const id of JSON.parse(row.update_ids || '[]')) ids.add(String(id));
       } catch {}
@@ -1509,12 +1578,15 @@ class TabWorkContext {
   }
 
   pendingFileRows(tabId, { mutableOnly = false } = {}) {
-    const rows = this.db.prepare(`SELECT * FROM tab_context_updates
-      WHERE tab_id=? AND status='pending' AND kind IN ('file','file-batch')
-      ORDER BY created_at,rowid`).all(tabId);
-    if (!mutableOnly) return rows;
-    const reserved = this.reservedUpdateIds(tabId);
-    return rows.filter((row) => !reserved.has(row.id));
+    const work = () => {
+      const rows = sqlStatement('tabContext.pendingFileRows.tab_context_updates', 'all', () => this.db.prepare(`SELECT * FROM tab_context_updates
+        WHERE tab_id=? AND status='pending' AND kind IN ('file','file-batch')
+        ORDER BY created_at,rowid`), statement => statement.all(tabId));
+      if (!mutableOnly) return rows;
+      const reserved = this.reservedUpdateIds(tabId);
+      return rows.filter((row) => !reserved.has(row.id));
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.pendingFileRows', {}, work);
   }
 
   saveFileBatch(rowId, tabId, changes, emptyStatus = 'superseded') {
@@ -1522,51 +1594,40 @@ class TabWorkContext {
       .filter(fileChangeIsPending)
       .map((item) => ({ ...item, presentationVersion: FILE_CHANGE_PRESENTATION_VERSION }));
     if (normalized.length === 0) {
-      return this.db.prepare(`UPDATE tab_context_updates
+      return sqlStatement('tabContext.saveFileBatch.tab_context_updates', 'run', () => this.db.prepare(`UPDATE tab_context_updates
         SET status=?,before_text=NULL,after_text=NULL,file_changes_json='[]'
-        WHERE id=? AND tab_id=? AND status='pending'`).run(emptyStatus, rowId, tabId).changes > 0;
+        WHERE id=? AND tab_id=? AND status='pending'`), statement => statement.run(emptyStatus, rowId, tabId)).changes > 0;
     }
     const presentation = fileBatchPresentation(normalized);
     const single = normalized.length === 1 ? normalized[0] : null;
-    return this.db.prepare(`UPDATE tab_context_updates SET
+    return sqlStatement('tabContext.saveFileBatch.tab_context_updates.2', 'run', () => this.db.prepare(`UPDATE tab_context_updates SET
       title=?,text=?,kind='file-batch',path=?,source_tab_id=?,before_hash=?,after_hash=?,
       before_text=?,after_text=?,start_line=?,end_line=?,file_changes_json=?
-      WHERE id=? AND tab_id=? AND status='pending'`).run(
-      presentation.title,
-      presentation.text,
-      single?.path || null,
-      presentation.sourceTabId,
-      single?.beforeHash || null,
-      single?.afterHash || null,
-      single?.beforeText || null,
-      single?.afterText || null,
-      presentation.startLine,
-      presentation.endLine,
-      JSON.stringify(normalized),
-      rowId,
-      tabId,
-    ).changes > 0;
+      WHERE id=? AND tab_id=? AND status='pending'`), statement => statement.run(presentation.title, presentation.text, single?.path || null, presentation.sourceTabId, single?.beforeHash || null, single?.afterHash || null, single?.beforeText || null, single?.afterText || null, presentation.startLine, presentation.endLine, JSON.stringify(normalized), rowId, tabId)).changes > 0;
   }
 
   consolidatePendingFileBatches(tabId = null) {
-    const ownerIds = tabId
-      ? [tabId]
-      : this.db.prepare(`SELECT DISTINCT tab_id FROM tab_context_updates
-          WHERE status='pending' AND kind IN ('file','file-batch')`).all().map((row) => row.tab_id);
-    for (const ownerId of ownerIds) {
-      const rows = this.pendingFileRows(ownerId, { mutableOnly: true });
-      if (rows.length === 0) continue;
-      let changes = [];
-      for (const row of rows) {
-        for (const item of fileChangesFromRow(row)) changes = mergeFileChanges(changes, item);
+    const work = () => {
+      const ownerIds = tabId
+        ? [tabId]
+        : sqlStatement('tabContext.consolidatePendingFileBatches.tab_context_updates', 'all', () => this.db.prepare(`SELECT DISTINCT tab_id FROM tab_context_updates
+            WHERE status='pending' AND kind IN ('file','file-batch')`), statement => statement.all()).map((row) => row.tab_id);
+      for (const ownerId of ownerIds) {
+        const rows = this.pendingFileRows(ownerId, { mutableOnly: true });
+        if (rows.length === 0) continue;
+        let changes = [];
+        for (const row of rows) {
+          for (const item of fileChangesFromRow(row)) changes = mergeFileChanges(changes, item);
+        }
+        this.saveFileBatch(rows[0].id, ownerId, changes);
+        for (const row of rows.slice(1)) {
+          sqlStatement('tabContext.consolidatePendingFileBatches.tab_context_updates.2', 'run', () => this.db.prepare(`UPDATE tab_context_updates
+            SET status='superseded',before_text=NULL,after_text=NULL,file_changes_json=NULL
+            WHERE id=? AND tab_id=? AND status='pending'`), statement => statement.run(row.id, ownerId));
+        }
       }
-      this.saveFileBatch(rows[0].id, ownerId, changes);
-      for (const row of rows.slice(1)) {
-        this.db.prepare(`UPDATE tab_context_updates
-          SET status='superseded',before_text=NULL,after_text=NULL,file_changes_json=NULL
-          WHERE id=? AND tab_id=? AND status='pending'`).run(row.id, ownerId);
-      }
-    }
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.consolidatePendingFileBatches', {}, work);
   }
 
   upsertPendingFileChange(tabId, incoming) {
@@ -1580,21 +1641,18 @@ class TabWorkContext {
       if (changes.length === 0) return;
       const id = crypto.randomUUID();
       const first = changes[0];
-      this.db.prepare(`INSERT INTO tab_context_updates(
+      sqlStatement('tabContext.upsertPendingFileChange.tab_context_updates', 'run', () => this.db.prepare(`INSERT INTO tab_context_updates(
         id,tab_id,title,text,kind,path,before_hash,after_hash,before_text,after_text,
         start_line,end_line,file_changes_json,created_at
-      ) VALUES (?,?,'','', 'file-batch',?,?,?,?,?,NULL,NULL,?,?)`).run(
-        id, tabId, first.path, first.beforeHash, first.afterHash,
-        first.beforeText, first.afterText, JSON.stringify(changes), Date.now(),
-      );
+      ) VALUES (?,?,'','', 'file-batch',?,?,?,?,?,NULL,NULL,?,?)`), statement => statement.run(id, tabId, first.path, first.beforeHash, first.afterHash, first.beforeText, first.afterText, JSON.stringify(changes), Date.now()));
       this.saveFileBatch(id, tabId, changes);
       return;
     }
     this.saveFileBatch(rows[0].id, tabId, changes);
     for (const row of rows.slice(1)) {
-      this.db.prepare(`UPDATE tab_context_updates
+      sqlStatement('tabContext.upsertPendingFileChange.tab_context_updates.2', 'run', () => this.db.prepare(`UPDATE tab_context_updates
         SET status='superseded',before_text=NULL,after_text=NULL,file_changes_json=NULL
-        WHERE id=? AND tab_id=? AND status='pending'`).run(row.id, tabId);
+        WHERE id=? AND tab_id=? AND status='pending'`), statement => statement.run(row.id, tabId));
     }
   }
 
@@ -1630,16 +1688,13 @@ class TabWorkContext {
     const text = error
       ? 'Linked working file is unavailable: ' + row.path + '\n' + error
       : presentation.text;
-    this.db.prepare(`INSERT INTO tab_context_updates(id,tab_id,title,text,kind,path,before_hash,after_hash,
-      before_text,after_text,start_line,end_line,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(crypto.randomUUID(), row.tab_id, title, text, error ? 'file-error' : 'file', row.path,
-        row.hash, digest || null, error ? null : row.content, content ?? null,
-        presentation?.span.startLine || null, presentation?.span.endLine || null, Date.now());
+    sqlStatement('tabContext.publishFileUpdate.tab_context_updates', 'run', () => this.db.prepare(`INSERT INTO tab_context_updates(id,tab_id,title,text,kind,path,before_hash,after_hash,
+      before_text,after_text,start_line,end_line,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`), statement => statement.run(crypto.randomUUID(), row.tab_id, title, text, error ? 'file-error' : 'file', row.path, row.hash, digest || null, error ? null : row.content, content ?? null, presentation?.span.startLine || null, presentation?.span.endLine || null, Date.now()));
   }
 
   async prepare(tabId, handoffId, prompt) {
     if (!tabId || !handoffId || !String(prompt).trim() || isLocalSlashCommandPrompt(prompt)) return { prompt, prefix: '' };
-    const saved = this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
+    const saved = sqlStatement('tabContext.prepare.tab_context_handoffs', 'get', () => this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
     if (saved) {
       if (promptAuditFingerprint(prompt) === saved.payload_hash) return { prompt, prefix: saved.prefix };
       if (hash(prompt) !== saved.base_hash) throw fail('context handoff reused for another prompt', 409);
@@ -1649,7 +1704,7 @@ class TabWorkContext {
       return { prompt, prefix: '' };
     }
     await this.syncLinks();
-    for (const file of this.db.prepare('SELECT path FROM tab_context_files WHERE tab_id=?').all(tabId)) await this.readFile(file.path);
+    for (const file of sqlStatement('tabContext.prepare.tab_context_files', 'all', () => this.db.prepare('SELECT path FROM tab_context_files WHERE tab_id=?'), statement => statement.all(tabId))) await this.readFile(file.path);
     // Quiet completion context is attached only to a new ordinary send. Do not
     // revive an old notification, touch the UI's dismissed chips, or read an
     // answer on the user's behalf. Unknown input delivery keeps the SAME frozen
@@ -1669,120 +1724,131 @@ class TabWorkContext {
         if (source.sessionId !== currentSource?.sessionId || source.toolType !== currentSource?.toolType) continuationFacts = [];
       }
     }
-    // Another caller may have reserved this same handoff while file IO yielded.
-    if (this.db.prepare('SELECT 1 FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId)) {
-      return this.prepare(tabId, handoffId, prompt);
-    }
-    if (continuationFacts.length) {
-      const claimedFacts = new Set(this.db.prepare(`SELECT continuation_facts FROM tab_context_handoffs
-        WHERE tab_id=? AND status IN ('preparing','delivered') AND continuation_facts!='[]'`).all(tabId)
-        .flatMap(row => JSON.parse(row.continuation_facts)));
-      continuationFacts = continuationFacts.filter(fact => !claimedFacts.has(fact.id)).slice(0, 8);
-    }
-    const updateRows = this.db.prepare("SELECT * FROM tab_context_updates WHERE tab_id=? AND status='pending' ORDER BY created_at,rowid")
-      .all(tabId);
-    const updates = this.presentUpdates(updateRows);
-    const memberIds = updateRows.map((row) => row.id);
-    let preparedBase = prompt;
-    const missing = [];
-    for (const update of updates) {
-      const refreshed = refreshUpdateWrapper(preparedBase, update);
-      preparedBase = refreshed.prompt;
-      if (!refreshed.found) missing.push(update);
-    }
-    const prefix = [completionContextText(continuationFacts), ...missing.map(updateWrapper)].filter(Boolean).join('\n\n');
-    const separatorPrefix = prefix ? prefix + '\n\n' : '';
-    const full = separatorPrefix + preparedBase;
-    this.db.transaction(() => {
-      this.db.prepare(`INSERT OR IGNORE INTO tab_context_handoffs(
-        tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,created_at,continuation_facts
-      ) VALUES (?,?,?,?,?,?,?,?,?)`).run(
-        tabId, handoffId, hash(prompt), separatorPrefix, full,
-        promptAuditFingerprint(full), JSON.stringify(memberIds), Date.now(), JSON.stringify(continuationFacts.map(fact => fact.id)),
-      );
-      for (const id of memberIds) {
-        this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND status='pending'").run(id);
+    return causal.syncWork('tabContext.prepare.commit', { tabId }, () => {
+      // Another caller may have reserved this same handoff while file IO yielded.
+      if (sqlStatement('tabContext.prepare.tab_context_handoffs.2', 'get', () => this.db.prepare('SELECT 1 FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId))) {
+        return this.prepare(tabId, handoffId, prompt);
       }
-    })();
-    if (updates.length) this.touch(tabId);
-    if (continuationFacts.length) console.log('[OrchestrationContext] prepared tab=' + tabId.slice(-12)
-      + ' handoff=' + handoffId + ' facts=' + continuationFacts.length + ' (not result/delivery proof)');
-    return { prompt: full, prefix: separatorPrefix };
+      if (continuationFacts.length) {
+        const claimedFacts = new Set(sqlStatement('tabContext.prepare.tab_context_handoffs.3', 'all', () => this.db.prepare(`SELECT continuation_facts FROM tab_context_handoffs
+          WHERE tab_id=? AND status IN ('preparing','delivered') AND continuation_facts!='[]'`), statement => statement.all(tabId))
+          .flatMap(row => JSON.parse(row.continuation_facts)));
+        continuationFacts = continuationFacts.filter(fact => !claimedFacts.has(fact.id)).slice(0, 8);
+      }
+      const updateRows = sqlStatement('tabContext.prepare.tab_context_updates', 'all', () => this.db.prepare("SELECT * FROM tab_context_updates WHERE tab_id=? AND status='pending' ORDER BY created_at,rowid"), statement => statement.all(tabId));
+      const updates = this.presentUpdates(updateRows);
+      const memberIds = updateRows.map((row) => row.id);
+      let preparedBase = prompt;
+      const missing = [];
+      for (const update of updates) {
+        const refreshed = refreshUpdateWrapper(preparedBase, update);
+        preparedBase = refreshed.prompt;
+        if (!refreshed.found) missing.push(update);
+      }
+      const prefix = [completionContextText(continuationFacts), ...missing.map(updateWrapper)].filter(Boolean).join('\n\n');
+      const separatorPrefix = prefix ? prefix + '\n\n' : '';
+      const full = separatorPrefix + preparedBase;
+      this.db.transaction(() => {
+        sqlStatement('tabContext.prepare.tab_context_handoffs.4', 'run', () => this.db.prepare(`INSERT OR IGNORE INTO tab_context_handoffs(
+          tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,created_at,continuation_facts
+        ) VALUES (?,?,?,?,?,?,?,?,?)`), statement => statement.run(tabId, handoffId, hash(prompt), separatorPrefix, full, promptAuditFingerprint(full), JSON.stringify(memberIds), Date.now(), JSON.stringify(continuationFacts.map(fact => fact.id))));
+        for (const id of memberIds) {
+          sqlStatement('tabContext.prepare.tab_context_updates.2', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND status='pending'"), statement => statement.run(id));
+        }
+      })();
+      if (updates.length) this.touch(tabId);
+      if (continuationFacts.length) console.log('[OrchestrationContext] prepared tab=' + tabId.slice(-12)
+        + ' handoff=' + handoffId + ' facts=' + continuationFacts.length + ' (not result/delivery proof)');
+      return { prompt: full, prefix: separatorPrefix };
+    });
   }
 
   confirm(tabId, handoffId, expectedHash) {
-    const sent = this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
-    if (!sent || sent.payload_hash !== expectedHash || sent.status === 'delivered' || sent.status === 'merged') return;
-    this.db.transaction(() => {
-      for (const id of JSON.parse(sent.update_ids)) {
-        this.db.prepare("UPDATE tab_context_updates SET status='delivered',before_text=NULL,after_text=NULL WHERE id=? AND tab_id=? AND status='sending'").run(id, tabId);
-      }
-      this.db.prepare("UPDATE tab_context_handoffs SET status='delivered' WHERE tab_id=? AND handoff_id=?").run(tabId, handoffId);
-    })();
-    this.touch(tabId);
+    const work = () => {
+      const sent = sqlStatement('tabContext.confirm.tab_context_handoffs', 'get', () => this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
+      if (!sent || sent.payload_hash !== expectedHash || sent.status === 'delivered' || sent.status === 'merged') return;
+      this.db.transaction(() => {
+        for (const id of JSON.parse(sent.update_ids)) {
+          sqlStatement('tabContext.confirm.tab_context_updates', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='delivered',before_text=NULL,after_text=NULL WHERE id=? AND tab_id=? AND status='sending'"), statement => statement.run(id, tabId));
+        }
+        sqlStatement('tabContext.confirm.tab_context_handoffs.2', 'run', () => this.db.prepare("UPDATE tab_context_handoffs SET status='delivered' WHERE tab_id=? AND handoff_id=?"), statement => statement.run(tabId, handoffId));
+      })();
+      this.touch(tabId);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.confirm', {}, work);
   }
 
   activate(tabId, handoffId) {
-    const sent = this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
-    if (!sent || sent.status === 'delivered' || sent.status === 'merged') return;
-    let changed = 0;
-    this.db.transaction(() => {
-      for (const id of JSON.parse(sent.update_ids)) changed += this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND tab_id=? AND status='pending'").run(id, tabId).changes;
-      this.db.prepare("UPDATE tab_context_handoffs SET status='preparing' WHERE tab_id=? AND handoff_id=?").run(tabId, handoffId);
-    })();
-    if (changed) this.touch(tabId);
+    const work = () => {
+      const sent = sqlStatement('tabContext.activate.tab_context_handoffs', 'get', () => this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
+      if (!sent || sent.status === 'delivered' || sent.status === 'merged') return;
+      let changed = 0;
+      this.db.transaction(() => {
+        for (const id of JSON.parse(sent.update_ids)) changed += sqlStatement('tabContext.activate.tab_context_updates', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND tab_id=? AND status='pending'"), statement => statement.run(id, tabId)).changes;
+        sqlStatement('tabContext.activate.tab_context_handoffs.2', 'run', () => this.db.prepare("UPDATE tab_context_handoffs SET status='preparing' WHERE tab_id=? AND handoff_id=?"), statement => statement.run(tabId, handoffId));
+      })();
+      if (changed) this.touch(tabId);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.activate', {}, work);
   }
 
   hasHandoff(tabId, handoffId) {
-    return !!this.db.prepare('SELECT 1 FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
+    const work = () => {
+      return !!sqlStatement('tabContext.hasHandoff.tab_context_handoffs', 'get', () => this.db.prepare('SELECT 1 FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.hasHandoff', {}, work);
   }
 
   rebindPreparedHandoff(sourceTabId, targetTabId, handoffId, prompt) {
-    if(sourceTabId===targetTabId)return;
-    this.db.transaction(()=>{
-      const source=this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(sourceTabId,handoffId);
-      const target=this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(targetTabId,handoffId);
-      const current=source || target;
-      if(!current)return;
-      if(current.prepared_prompt!==prompt || current.payload_hash!==promptAuditFingerprint(prompt)
-        || ['delivered','merged'].includes(current.status) || source && target
-        || (this.readReceipts?.(sourceTabId) || []).some(receipt=>receipt.handoffId===handoffId && receipt.attemptId))
-        throw Object.assign(fail('Prepared context restore changed',409),{code:'context_restore_handoff_changed'});
-      if(!source)return;
-      for(const id of JSON.parse(source.update_ids)) {
-        const update=this.db.prepare('SELECT tab_id,status FROM tab_context_updates WHERE id=?').get(id);
-        if(!update || update.tab_id!==sourceTabId || update.status!=='sending')
-          throw Object.assign(fail('Prepared context restore changed',409),{code:'context_restore_update_changed'});
-        this.db.prepare('UPDATE tab_context_updates SET tab_id=? WHERE id=?').run(targetTabId,id);
-      }
-      this.db.prepare('UPDATE tab_context_handoffs SET tab_id=? WHERE tab_id=? AND handoff_id=?').run(targetTabId,sourceTabId,handoffId);
-    })();
+    const work = () => {
+      if(sourceTabId===targetTabId)return;
+      this.db.transaction(()=>{
+        const source=sqlStatement('tabContext.rebindPreparedHandoff.tab_context_handoffs', 'get', () => this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(sourceTabId, handoffId));
+        const target=sqlStatement('tabContext.rebindPreparedHandoff.tab_context_handoffs.2', 'get', () => this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(targetTabId, handoffId));
+        const current=source || target;
+        if(!current)return;
+        if(current.prepared_prompt!==prompt || current.payload_hash!==promptAuditFingerprint(prompt)
+          || ['delivered','merged'].includes(current.status) || source && target
+          || (this.readReceipts?.(sourceTabId) || []).some(receipt=>receipt.handoffId===handoffId && receipt.attemptId))
+          throw Object.assign(fail('Prepared context restore changed',409),{code:'context_restore_handoff_changed'});
+        if(!source)return;
+        for(const id of JSON.parse(source.update_ids)) {
+          const update=sqlStatement('tabContext.rebindPreparedHandoff.tab_context_updates', 'get', () => this.db.prepare('SELECT tab_id,status FROM tab_context_updates WHERE id=?'), statement => statement.get(id));
+          if(!update || update.tab_id!==sourceTabId || update.status!=='sending')
+            throw Object.assign(fail('Prepared context restore changed',409),{code:'context_restore_update_changed'});
+          sqlStatement('tabContext.rebindPreparedHandoff.tab_context_updates.2', 'run', () => this.db.prepare('UPDATE tab_context_updates SET tab_id=? WHERE id=?'), statement => statement.run(targetTabId, id));
+        }
+        sqlStatement('tabContext.rebindPreparedHandoff.tab_context_handoffs.3', 'run', () => this.db.prepare('UPDATE tab_context_handoffs SET tab_id=? WHERE tab_id=? AND handoff_id=?'), statement => statement.run(targetTabId, sourceTabId, handoffId));
+      })();
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.rebindPreparedHandoff', {}, work);
   }
 
   mergeHandoffs(tabId, originals, replacement) {
-    const sources = originals.map(request => ({ request, row: this.db.prepare(
-      'SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, request.handoffId) }));
-    if (!sources.some(source => source.row)) return;
-    for (const { row, request } of sources) if (row && (row.status === 'delivered' || row.status === 'merged'
-      || row.prepared_prompt !== request.prompt)) throw Object.assign(fail('Контекст ожидающего сообщения изменился.', 409), {
-      code: 'send_queue_merge_context_changed' });
-    const updateIds = [...new Set(sources.flatMap(source => source.row ? JSON.parse(source.row.update_ids) : []))];
-    const facts = [...new Set(sources.flatMap(source => source.row ? JSON.parse(source.row.continuation_facts || '[]') : []))];
-    this.db.transaction(() => {
-      this.db.prepare(`INSERT INTO tab_context_handoffs(tab_id,handoff_id,base_hash,prefix,prepared_prompt,
-        payload_hash,update_ids,created_at,continuation_facts) VALUES (?,?,?,'',?,?,?,?,?)`).run(tabId,
-        replacement.handoffId, hash(replacement.prompt), replacement.prompt, promptAuditFingerprint(replacement.prompt),
-        JSON.stringify(updateIds), Date.now(), JSON.stringify(facts));
-      for (const { row } of sources) if (row) this.db.prepare(
-        "UPDATE tab_context_handoffs SET status='merged' WHERE tab_id=? AND handoff_id=?").run(tabId, row.handoff_id);
-    })();
-    // Queue and context share the same SQLite commit. Cancellation of an old
-    // superseded handoff can no longer put the replacement's updates back.
+    const work = () => {
+      const sources = originals.map(request => ({ request, row: sqlStatement('tabContext.mergeHandoffs.tab_context_handoffs', 'get', () => this.db.prepare(
+        'SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, request.handoffId)) }));
+      if (!sources.some(source => source.row)) return;
+      for (const { row, request } of sources) if (row && (row.status === 'delivered' || row.status === 'merged'
+        || row.prepared_prompt !== request.prompt)) throw Object.assign(fail('Контекст ожидающего сообщения изменился.', 409), {
+        code: 'send_queue_merge_context_changed' });
+      const updateIds = [...new Set(sources.flatMap(source => source.row ? JSON.parse(source.row.update_ids) : []))];
+      const facts = [...new Set(sources.flatMap(source => source.row ? JSON.parse(source.row.continuation_facts || '[]') : []))];
+      this.db.transaction(() => {
+        sqlStatement('tabContext.mergeHandoffs.tab_context_handoffs.2', 'run', () => this.db.prepare(`INSERT INTO tab_context_handoffs(tab_id,handoff_id,base_hash,prefix,prepared_prompt,
+          payload_hash,update_ids,created_at,continuation_facts) VALUES (?,?,?,'',?,?,?,?,?)`), statement => statement.run(tabId, replacement.handoffId, hash(replacement.prompt), replacement.prompt, promptAuditFingerprint(replacement.prompt), JSON.stringify(updateIds), Date.now(), JSON.stringify(facts)));
+        for (const { row } of sources) if (row) sqlStatement('tabContext.mergeHandoffs.tab_context_handoffs.3', 'run', () => this.db.prepare(
+          "UPDATE tab_context_handoffs SET status='merged' WHERE tab_id=? AND handoff_id=?"), statement => statement.run(tabId, row.handoff_id));
+      })();
+      // Queue and context share the same SQLite commit. Cancellation of an old
+      // superseded handoff can no longer put the replacement's updates back.
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.mergeHandoffs', {}, work);
   }
 
   assertContinuationScope(tabId, handoffId, { atWrite = false } = {}) {
     if (!tabId || !handoffId) return;
-    const saved = this.db.prepare('SELECT continuation_facts FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
+    const saved = sqlStatement('tabContext.assertContinuationScope.tab_context_handoffs', 'get', () => this.db.prepare('SELECT continuation_facts FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
     if (!saved || saved.continuation_facts === '[]') return;
     const tab = this.tab(tabId);
     let matches = false;
@@ -1811,23 +1877,29 @@ class TabWorkContext {
   }
 
   release(tabId, handoffId) {
-    const sent = this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
-    if (!sent || sent.status === 'delivered' || sent.status === 'merged') return;
-    this.db.transaction(() => {
-      for (const id of JSON.parse(sent.update_ids)) this.db.prepare("UPDATE tab_context_updates SET status='pending' WHERE id=? AND tab_id=? AND status='sending'").run(id, tabId);
-      this.db.prepare("UPDATE tab_context_handoffs SET status='failed' WHERE tab_id=? AND handoff_id=?").run(tabId, handoffId);
-    })();
-    this.touch(tabId);
+    const work = () => {
+      const sent = sqlStatement('tabContext.release.tab_context_handoffs', 'get', () => this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
+      if (!sent || sent.status === 'delivered' || sent.status === 'merged') return;
+      this.db.transaction(() => {
+        for (const id of JSON.parse(sent.update_ids)) sqlStatement('tabContext.release.tab_context_updates', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='pending' WHERE id=? AND tab_id=? AND status='sending'"), statement => statement.run(id, tabId));
+        sqlStatement('tabContext.release.tab_context_handoffs.2', 'run', () => this.db.prepare("UPDATE tab_context_handoffs SET status='failed' WHERE tab_id=? AND handoff_id=?"), statement => statement.run(tabId, handoffId));
+      })();
+      this.touch(tabId);
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.release', {}, work);
   }
 
   settle(tabId, handoffId, result) {
-    const receipt = classifyAgentSendReceipt(result);
-    if (receipt.state === 'not-submitted' || receipt.state === 'provider-not-accepted' || result?.historyRecorded === true) {
-      if (result?.historyRecorded === true) {
-        const record = this.db.prepare('SELECT payload_hash FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
-        if (record) this.confirm(tabId, handoffId, record.payload_hash);
-      } else this.release(tabId, handoffId);
-    }
+    const work = () => {
+      const receipt = classifyAgentSendReceipt(result);
+      if (receipt.state === 'not-submitted' || receipt.state === 'provider-not-accepted' || result?.historyRecorded === true) {
+        if (result?.historyRecorded === true) {
+          const record = sqlStatement('tabContext.settle.tab_context_handoffs', 'get', () => this.db.prepare('SELECT payload_hash FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
+          if (record) this.confirm(tabId, handoffId, record.payload_hash);
+        } else this.release(tabId, handoffId);
+      }
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.settle', {}, work);
   }
 
   ownedHeadKey(tabId, sessionId, filePath) {
@@ -2049,75 +2121,80 @@ class TabWorkContext {
   }
 
   acceptShellEditProof(operation, transition) {
-    const conflictingSource = this.pendingTransitionHasConflictingSource(operation, transition);
-    if (conflictingSource) return { consumed: true, changed: false, outcome: 'conflicting-source' };
-    const current = this.db.prepare('SELECT * FROM tab_context_files WHERE tab_id=? AND path=?')
-      .get(operation.targetTabId, operation.filePath);
-    const ownEdit = operation.sourceTabId === operation.targetTabId;
-    const reconciled = ownEdit
-      ? this.reconcileObservedOwnedTransition(
-          operation.targetTabId,
-          operation.filePath,
-          transition.before,
-          transition.after,
-          current,
-        )
-      : this.attributeAgentTransition(
-          operation.targetTabId,
-          operation.filePath,
-          transition.before,
-          transition.after,
-          this.sourceDescriptor(
-            operation.sourceTabId,
-            operation.sessionId,
-            operation.operationId,
-          ),
-        );
-    if (reconciled) {
-      if (reconciled.changed) this.touch(operation.targetTabId);
-      return { consumed: true, changed: !!reconciled.changed, outcome: reconciled.outcome };
-    }
-    const stillPending = this.pendingFileRows(operation.targetTabId)
-      .some((row) => fileChangesFromRow(row).some((item) => item.path === operation.filePath));
-    return { consumed: !stillPending, changed: false, outcome: 'not-pending' };
+    const work = () => {
+      const conflictingSource = this.pendingTransitionHasConflictingSource(operation, transition);
+      if (conflictingSource) return { consumed: true, changed: false, outcome: 'conflicting-source' };
+      const current = sqlStatement('tabContext.acceptShellEditProof.tab_context_files', 'get', () => this.db.prepare('SELECT * FROM tab_context_files WHERE tab_id=? AND path=?'), statement => statement.get(operation.targetTabId, operation.filePath));
+      const ownEdit = operation.sourceTabId === operation.targetTabId;
+      const reconciled = ownEdit
+        ? this.reconcileObservedOwnedTransition(
+            operation.targetTabId,
+            operation.filePath,
+            transition.before,
+            transition.after,
+            current,
+          )
+        : this.attributeAgentTransition(
+            operation.targetTabId,
+            operation.filePath,
+            transition.before,
+            transition.after,
+            this.sourceDescriptor(
+              operation.sourceTabId,
+              operation.sessionId,
+              operation.operationId,
+            ),
+          );
+      if (reconciled) {
+        if (reconciled.changed) this.touch(operation.targetTabId);
+        return { consumed: true, changed: !!reconciled.changed, outcome: reconciled.outcome };
+      }
+      const stillPending = this.pendingFileRows(operation.targetTabId)
+        .some((row) => fileChangesFromRow(row).some((item) => item.path === operation.filePath));
+      return { consumed: !stillPending, changed: false, outcome: 'not-pending' };
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.acceptShellEditProof', {}, work);
   }
 
   reconcileShellEditProofs(filePath) {
-    let progressed = true;
-    while (progressed) {
-      progressed = false;
-      const transitions = [...this.fileTransitions.entries()]
-        .filter(([, transition]) => transition.filePath === filePath);
-      const operations = [...this.shellEdits.entries()]
-        .filter(([, operation]) => operation.filePath === filePath);
-      for (const [operationKey, operation] of operations) {
-        if (!Number.isFinite(operation.completedAt) || operation.claimable !== true) continue;
-        const candidates = transitions.filter(([, transition]) => (
-          shellOperationCouldProduceTransition(operation, transition)
-        ));
-        if (candidates.length !== 1) continue;
-        const [transitionKey, transition] = candidates[0];
-        // Require degree one on both sides. A timestamp window narrows causal
-        // evidence; it does not choose between two commands that could both
-        // have written the same version.
-        const possibleOwners = operations.filter(([, candidate]) => (
-          shellOperationCouldProduceTransition(candidate, transition)
-        ));
-        if (possibleOwners.length !== 1) continue;
-        const accepted = this.acceptShellEditProof(operation, transition);
-        if (!accepted.consumed) continue;
-        this.shellEdits.delete(operationKey);
-        this.deleteFileTransition(transitionKey);
-        console.log('[TabContext] shell file change ' + (accepted.changed ? 'reconciled' : 'retained')
-          + ' tab=' + String(operation.targetTabId).slice(-12)
-          + ' source=' + String(operation.sourceTabId || '-').slice(-12)
-          + ' session=' + String(operation.sessionId || '-').slice(0, 8)
-          + ' operation=' + String(operation.operationId || '-').slice(0, 24)
-          + ' outcome=' + accepted.outcome + ' file=' + path.basename(filePath));
-        progressed = true;
-        break;
+    const work = () => {
+      let progressed = true;
+      while (progressed) {
+        progressed = false;
+        const transitions = [...this.fileTransitions.entries()]
+          .filter(([, transition]) => transition.filePath === filePath);
+        const operations = [...this.shellEdits.entries()]
+          .filter(([, operation]) => operation.filePath === filePath);
+        for (const [operationKey, operation] of operations) {
+          if (!Number.isFinite(operation.completedAt) || operation.claimable !== true) continue;
+          const candidates = transitions.filter(([, transition]) => (
+            shellOperationCouldProduceTransition(operation, transition)
+          ));
+          if (candidates.length !== 1) continue;
+          const [transitionKey, transition] = candidates[0];
+          // Require degree one on both sides. A timestamp window narrows causal
+          // evidence; it does not choose between two commands that could both
+          // have written the same version.
+          const possibleOwners = operations.filter(([, candidate]) => (
+            shellOperationCouldProduceTransition(candidate, transition)
+          ));
+          if (possibleOwners.length !== 1) continue;
+          const accepted = this.acceptShellEditProof(operation, transition);
+          if (!accepted.consumed) continue;
+          this.shellEdits.delete(operationKey);
+          this.deleteFileTransition(transitionKey);
+          console.log('[TabContext] shell file change ' + (accepted.changed ? 'reconciled' : 'retained')
+            + ' tab=' + String(operation.targetTabId).slice(-12)
+            + ' source=' + String(operation.sourceTabId || '-').slice(-12)
+            + ' session=' + String(operation.sessionId || '-').slice(0, 8)
+            + ' operation=' + String(operation.operationId || '-').slice(0, 24)
+            + ' outcome=' + accepted.outcome + ' file=' + path.basename(filePath));
+          progressed = true;
+          break;
+        }
       }
-    }
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.reconcileShellEditProofs', {}, work);
   }
 
   observeShellEditStep({ sourceTabId, sessionId, step, recordedAt, cwd }) {
@@ -2126,7 +2203,7 @@ class TabWorkContext {
     if (!action) return;
     const operationPrefix = sourceTabId + ':' + sessionId + ':' + step.id + '\0';
     if (step.result === undefined) {
-      const rows = this.db.prepare('SELECT tab_id,hash FROM tab_context_files WHERE path=?').all(action.filePath);
+      const rows = sqlStatement('tabContext.observeShellEditStep.tab_context_files', 'all', () => this.db.prepare('SELECT tab_id,hash FROM tab_context_files WHERE path=?'), statement => statement.all(action.filePath));
       for (const row of rows) {
         const operationKey = operationPrefix + row.tab_id;
         const lateTransitionIds = [...this.fileTransitions.values()]
@@ -2180,186 +2257,189 @@ class TabWorkContext {
     const tab = this.tab(tabId);
     const action = resolveReadAction(step, tab?.cwd || '/');
     if (!action) return;
-    const linked = this.db.prepare('SELECT * FROM tab_context_files WHERE tab_id=? AND path=?')
-      .get(tabId, action.filePath);
+    const linked = sqlStatement('tabContext.acceptAgentRead.tab_context_files', 'get', () => this.db.prepare('SELECT * FROM tab_context_files WHERE tab_id=? AND path=?'), statement => statement.get(tabId, action.filePath));
     if (!linked) return;
     await this.readFile(action.filePath);
-    const current = this.db.prepare('SELECT * FROM tab_context_files WHERE tab_id=? AND path=?')
-      .get(tabId, action.filePath);
-    if (!current?.hash || current.error) return;
-    const coverage = verifiedReadCoverage(step, current.content, tab?.cwd || '/');
-    if (!coverage || coverage.filePath !== action.filePath) return;
-
-    let changed = false;
-    let acknowledgedLines = 0;
-    for (const row of this.pendingFileRows(tabId)) {
-      // Transcript subscriptions can replay old calls after restart. Matching
-      // bytes prove what was read, while these version times prove it was read
-      // after this file version existed rather than in an older equal state.
-      if (recordedAt + READ_ACK_CLOCK_SKEW_MS < Number(row.created_at || 0)) continue;
-      const changes = fileChangesFromRow(row);
-      const index = changes.findIndex((item) => (
-        item.path === action.filePath && item.afterHash === current.hash
-      ));
-      if (index < 0) continue;
-      const observed = changes[index];
-      if (observed.afterMtimeMs !== null
-        && recordedAt + READ_ACK_MTIME_ROUNDING_MS < observed.afterMtimeMs) continue;
-      const before = effectiveFileChangeBeforeText(observed);
-      const next = acknowledgeReadCoverage(before, observed.afterText, coverage);
-      if (next === before) continue;
-      const beforeCount = changedFilePresentation(before, observed.afterText).changedLineCount;
-      const afterCount = changedFilePresentation(next, observed.afterText).changedLineCount;
-      acknowledgedLines += Math.max(0, beforeCount - afterCount);
-      if (next === observed.afterText) changes.splice(index, 1);
-      else changes[index] = { ...observed, acknowledgedText: next };
-      this.saveFileBatch(row.id, tabId, changes, 'read-acknowledged');
-      changed = true;
-    }
-    if (!changed) return;
-    console.log('[TabContext] linked file read acknowledged tab=' + String(tabId).slice(-12)
-      + ' operation=' + String(step.id || '-').slice(0, 24)
-      + ' lines=' + acknowledgedLines
-      + ' full=' + (coverage.full ? '1' : '0')
-      + ' file=' + path.basename(action.filePath));
-    this.touch(tabId);
+    return causal.syncWork('tabContext.acceptAgentRead.consume', { tabId, fileIdentity: action.filePath }, () => {
+      const current = sqlStatement('tabContext.acceptAgentRead.tab_context_files.2', 'get', () => this.db.prepare('SELECT * FROM tab_context_files WHERE tab_id=? AND path=?'), statement => statement.get(tabId, action.filePath));
+      if (!current?.hash || current.error) return;
+      const coverage = verifiedReadCoverage(step, current.content, tab?.cwd || '/');
+      if (!coverage || coverage.filePath !== action.filePath) return;
+  
+      let changed = false;
+      let acknowledgedLines = 0;
+      for (const row of this.pendingFileRows(tabId)) {
+        // Transcript subscriptions can replay old calls after restart. Matching
+        // bytes prove what was read, while these version times prove it was read
+        // after this file version existed rather than in an older equal state.
+        if (recordedAt + READ_ACK_CLOCK_SKEW_MS < Number(row.created_at || 0)) continue;
+        const changes = fileChangesFromRow(row);
+        const index = changes.findIndex((item) => (
+          item.path === action.filePath && item.afterHash === current.hash
+        ));
+        if (index < 0) continue;
+        const observed = changes[index];
+        if (observed.afterMtimeMs !== null
+          && recordedAt + READ_ACK_MTIME_ROUNDING_MS < observed.afterMtimeMs) continue;
+        const before = effectiveFileChangeBeforeText(observed);
+        const next = acknowledgeReadCoverage(before, observed.afterText, coverage);
+        if (next === before) continue;
+        const beforeCount = changedFilePresentation(before, observed.afterText).changedLineCount;
+        const afterCount = changedFilePresentation(next, observed.afterText).changedLineCount;
+        acknowledgedLines += Math.max(0, beforeCount - afterCount);
+        if (next === observed.afterText) changes.splice(index, 1);
+        else changes[index] = { ...observed, acknowledgedText: next };
+        this.saveFileBatch(row.id, tabId, changes, 'read-acknowledged');
+        changed = true;
+      }
+      if (!changed) return;
+      console.log('[TabContext] linked file read acknowledged tab=' + String(tabId).slice(-12)
+        + ' operation=' + String(step.id || '-').slice(0, 24)
+        + ' lines=' + acknowledgedLines
+        + ' full=' + (coverage.full ? '1' : '0')
+        + ' file=' + path.basename(action.filePath));
+      this.touch(tabId);
+    });
   }
 
   observeRecord(detail) {
-    const { tabId: sourceTabId, sessionId, toolType, message } = detail;
-    let userText = null;
-    if (toolType === 'codex' && message?.type === 'event_msg' && message.payload?.type === 'user_message') {
-      userText = message.payload.message;
-    } else if (toolType === 'claude' && message?.type === 'user' && message.uuid && message.isMeta !== true) {
-      const blocks = message.message?.content;
-      if (typeof blocks === 'string') userText = blocks;
-      else if (Array.isArray(blocks) && !blocks.some((block) => block.type === 'tool_result')) {
-        userText = blocks.filter((block) => block.type === 'text').map((block) => block.text || '').join('\n');
-      }
-    }
-    if (typeof userText === 'string') {
-      const digest = promptAuditFingerprint(userText);
-      for (const sent of this.db.prepare("SELECT handoff_id FROM tab_context_handoffs WHERE tab_id=? AND payload_hash=? AND status='preparing'").all(sourceTabId, digest)) {
-        this.confirm(sourceTabId, sent.handoff_id, digest);
-      }
-    }
-    if (!this.db.prepare('SELECT 1 FROM tab_context_files LIMIT 1').get()) return;
-    const sourceTab = this.tab(sourceTabId);
-    const recordedAt = Date.parse(message?.timestamp || message?.payload?.timestamp || '');
-    if (toolType === 'codex' && message?.type === 'response_item') {
-      const payload = message.payload || {}, callId = payload.call_id || payload.id;
-      const callKey = sourceTabId + ':' + sessionId + ':' + callId;
-      if (callId && ['function_call', 'custom_tool_call'].includes(payload.type)) {
-        const intents = computedPatchWriteIntents(payload);
-        if (intents.length) {
-          const steps = intents.map(intent => ({ kind: 'tool', tool: 'Patch',
-            id: callId + ':computed-patch:' + intent.index,
-            args: { file_path: intent.filePath, computedPatchIntent: true } }));
-          this.computedPatchCalls.set(callKey, steps);
-          while (this.computedPatchCalls.size > MAX_SHELL_EDIT_PROOFS) this.computedPatchCalls.delete(this.computedPatchCalls.keys().next().value);
-          for (const step of steps) this.observeShellEditStep({ sourceTabId, sessionId, step, recordedAt, cwd: sourceTab?.cwd });
-        }
-      } else if (callId && ['function_call_output', 'custom_tool_call_output'].includes(payload.type)) {
-        const steps = this.computedPatchCalls.get(callKey);
-        if (steps) {
-          this.computedPatchCalls.delete(callKey);
-          const yielded = computedPatchResultYielded(payload);
-          const failed = computedPatchResultFailed(payload);
-          if (yielded || failed) console.log('[TabContext] computed patch retained tab=' + String(sourceTabId).slice(-12)
-            + ' operation=' + String(callId).slice(0, 24) + ' reason=' + (yielded ? 'yielded-exec' : 'failed-exec'));
-          for (const step of steps) this.observeShellEditStep({ sourceTabId, sessionId,
-            step: { ...step, result: payload.output, isError: yielded || failed },
-            recordedAt, cwd: sourceTab?.cwd });
+    const work = () => {
+      const { tabId: sourceTabId, sessionId, toolType, message } = detail;
+      let userText = null;
+      if (toolType === 'codex' && message?.type === 'event_msg' && message.payload?.type === 'user_message') {
+        userText = message.payload.message;
+      } else if (toolType === 'claude' && message?.type === 'user' && message.uuid && message.isMeta !== true) {
+        const blocks = message.message?.content;
+        if (typeof blocks === 'string') userText = blocks;
+        else if (Array.isArray(blocks) && !blocks.some((block) => block.type === 'tool_result')) {
+          userText = blocks.filter((block) => block.type === 'text').map((block) => block.text || '').join('\n');
         }
       }
-    }
-    if (toolType === 'codex' && message?.type === 'event_msg') {
-      for (const action of this.decodeCodexPatch?.(message.payload) || []) {
-        const filePath = path.resolve(sourceTab?.cwd || '/', action.args?.file_path || '');
-        const rows = this.db.prepare('SELECT * FROM tab_context_files WHERE path=?').all(filePath);
-        for (const row of rows) {
-          void this.acceptAgentEdit(row.tab_id, sourceTabId, filePath, {
-            before: sourceTabId === row.tab_id
-              ? this.ownedEditBefore(row.tab_id, sessionId, filePath, row)
-              : row.content,
-            args: action.args,
-            tool: action.toolName,
-            diffHunks: action.diffHunks,
-            sessionId,
-            operationId: String(message.payload?.call_id || message.payload?.id || 'patch'),
-            beforeTrusted: false,
-          }).catch((e) => console.warn('[TabContext] agent patch:', e.message));
+      if (typeof userText === 'string') {
+        const digest = promptAuditFingerprint(userText);
+        for (const sent of sqlStatement('tabContext.observeRecord.tab_context_handoffs', 'all', () => this.db.prepare("SELECT handoff_id FROM tab_context_handoffs WHERE tab_id=? AND payload_hash=? AND status='preparing'"), statement => statement.all(sourceTabId, digest))) {
+          this.confirm(sourceTabId, sent.handoff_id, digest);
         }
       }
-    }
-    const key = sourceTabId + ':' + sessionId;
-    let state = this.projectors.get(key);
-    if (!state) {
-      for (const candidate of this.projectors.keys()) {
-        if (candidate.startsWith(sourceTabId + ':')) this.projectors.delete(candidate);
+      if (!sqlStatement('tabContext.observeRecord.tab_context_files', 'get', () => this.db.prepare('SELECT 1 FROM tab_context_files LIMIT 1'), statement => statement.get())) return;
+      const sourceTab = this.tab(sourceTabId);
+      const recordedAt = Date.parse(message?.timestamp || message?.payload?.timestamp || '');
+      if (toolType === 'codex' && message?.type === 'response_item') {
+        const payload = message.payload || {}, callId = payload.call_id || payload.id;
+        const callKey = sourceTabId + ':' + sessionId + ':' + callId;
+        if (callId && ['function_call', 'custom_tool_call'].includes(payload.type)) {
+          const intents = computedPatchWriteIntents(payload);
+          if (intents.length) {
+            const steps = intents.map(intent => ({ kind: 'tool', tool: 'Patch',
+              id: callId + ':computed-patch:' + intent.index,
+              args: { file_path: intent.filePath, computedPatchIntent: true } }));
+            this.computedPatchCalls.set(callKey, steps);
+            while (this.computedPatchCalls.size > MAX_SHELL_EDIT_PROOFS) this.computedPatchCalls.delete(this.computedPatchCalls.keys().next().value);
+            for (const step of steps) this.observeShellEditStep({ sourceTabId, sessionId, step, recordedAt, cwd: sourceTab?.cwd });
+          }
+        } else if (callId && ['function_call_output', 'custom_tool_call_output'].includes(payload.type)) {
+          const steps = this.computedPatchCalls.get(callKey);
+          if (steps) {
+            this.computedPatchCalls.delete(callKey);
+            const yielded = computedPatchResultYielded(payload);
+            const failed = computedPatchResultFailed(payload);
+            if (yielded || failed) console.log('[TabContext] computed patch retained tab=' + String(sourceTabId).slice(-12)
+              + ' operation=' + String(callId).slice(0, 24) + ' reason=' + (yielded ? 'yielded-exec' : 'failed-exec'));
+            for (const step of steps) this.observeShellEditStep({ sourceTabId, sessionId,
+              step: { ...step, result: payload.output, isError: yielded || failed },
+              recordedAt, cwd: sourceTab?.cwd });
+          }
+        }
       }
-      state = createSubagentStepProjectionState({ codexSessionId: sessionId });
-      this.projectors.set(key, state);
-    }
-    const steps = toolType === 'codex'
-      ? codexRecordToSteps(message, state, this.decodeCodexCall)
-      : claudeRecordToSteps(message, state);
-    for (const step of steps) {
-      const readAction = resolveReadAction(step, sourceTab?.cwd || '/');
-      if (readAction && step.result !== undefined && !step.isError) {
-        void this.acceptAgentRead(sourceTabId, step, recordedAt)
-          .catch((e) => console.warn('[TabContext] agent read:', e.message));
-        continue;
+      if (toolType === 'codex' && message?.type === 'event_msg') {
+        for (const action of this.decodeCodexPatch?.(message.payload) || []) {
+          const filePath = path.resolve(sourceTab?.cwd || '/', action.args?.file_path || '');
+          const rows = sqlStatement('tabContext.observeRecord.tab_context_files.2', 'all', () => this.db.prepare('SELECT * FROM tab_context_files WHERE path=?'), statement => statement.all(filePath));
+          for (const row of rows) {
+            void this.acceptAgentEdit(row.tab_id, sourceTabId, filePath, {
+              before: sourceTabId === row.tab_id
+                ? this.ownedEditBefore(row.tab_id, sessionId, filePath, row)
+                : row.content,
+              args: action.args,
+              tool: action.toolName,
+              diffHunks: action.diffHunks,
+              sessionId,
+              operationId: String(message.payload?.call_id || message.payload?.id || 'patch'),
+              beforeTrusted: false,
+            }).catch((e) => console.warn('[TabContext] agent patch:', e.message));
+          }
+        }
       }
-      if (step.kind === 'tool' && step.tool === 'Bash') {
-        this.observeShellEditStep({
-          sourceTabId,
-          sessionId,
-          step,
-          recordedAt,
-          cwd: sourceTab?.cwd || '/',
-        });
-        continue;
+      const key = sourceTabId + ':' + sessionId;
+      let state = this.projectors.get(key);
+      if (!state) {
+        for (const candidate of this.projectors.keys()) {
+          if (candidate.startsWith(sourceTabId + ':')) this.projectors.delete(candidate);
+        }
+        state = createSubagentStepProjectionState({ codexSessionId: sessionId });
+        this.projectors.set(key, state);
       }
-      if (step.kind !== 'tool' || !['Edit','MultiEdit','Write','edit_file','write_file'].includes(step.tool)) continue;
-      const args = step.args || {};
-      const filePath = path.resolve(sourceTab?.cwd || '/', args.file_path || args.path || '');
-      const operationKey = key + ':' + step.id;
-      if (step.result === undefined) {
-        const rows = this.db.prepare('SELECT * FROM tab_context_files WHERE path=?').all(filePath);
-        for (const row of rows) {
-          const targetKey = operationKey + '\0' + row.tab_id;
-          if (!this.pendingEdits.has(targetKey)) this.pendingEdits.set(targetKey, {
-            targetTabId: row.tab_id,
+      const steps = toolType === 'codex'
+        ? codexRecordToSteps(message, state, this.decodeCodexCall)
+        : claudeRecordToSteps(message, state);
+      for (const step of steps) {
+        const readAction = resolveReadAction(step, sourceTab?.cwd || '/');
+        if (readAction && step.result !== undefined && !step.isError) {
+          void this.acceptAgentRead(sourceTabId, step, recordedAt)
+            .catch((e) => console.warn('[TabContext] agent read:', e.message));
+          continue;
+        }
+        if (step.kind === 'tool' && step.tool === 'Bash') {
+          this.observeShellEditStep({
             sourceTabId,
-            filePath,
-            before: sourceTabId === row.tab_id
-              ? this.ownedEditBefore(row.tab_id, sessionId, filePath, row)
-              : row.content,
-            args,
-            tool: step.tool,
-            diffHunks: step.diffHunks,
             sessionId,
-            operationId: step.id,
-            beforeTrusted: true,
+            step,
+            recordedAt,
+            cwd: sourceTab?.cwd || '/',
           });
+          continue;
         }
-        while (this.pendingEdits.size > 2048) {
-          this.pendingEdits.delete(this.pendingEdits.keys().next().value);
+        if (step.kind !== 'tool' || !['Edit','MultiEdit','Write','edit_file','write_file'].includes(step.tool)) continue;
+        const args = step.args || {};
+        const filePath = path.resolve(sourceTab?.cwd || '/', args.file_path || args.path || '');
+        const operationKey = key + ':' + step.id;
+        if (step.result === undefined) {
+          const rows = sqlStatement('tabContext.observeRecord.tab_context_files.3', 'all', () => this.db.prepare('SELECT * FROM tab_context_files WHERE path=?'), statement => statement.all(filePath));
+          for (const row of rows) {
+            const targetKey = operationKey + '\0' + row.tab_id;
+            if (!this.pendingEdits.has(targetKey)) this.pendingEdits.set(targetKey, {
+              targetTabId: row.tab_id,
+              sourceTabId,
+              filePath,
+              before: sourceTabId === row.tab_id
+                ? this.ownedEditBefore(row.tab_id, sessionId, filePath, row)
+                : row.content,
+              args,
+              tool: step.tool,
+              diffHunks: step.diffHunks,
+              sessionId,
+              operationId: step.id,
+              beforeTrusted: true,
+            });
+          }
+          while (this.pendingEdits.size > 2048) {
+            this.pendingEdits.delete(this.pendingEdits.keys().next().value);
+          }
+          continue;
         }
-        continue;
+        const prefix = operationKey + '\0';
+        for (const [pendingKey, pending] of [...this.pendingEdits]) {
+          if (!pendingKey.startsWith(prefix)) continue;
+          this.pendingEdits.delete(pendingKey);
+          if (step.isError) continue;
+          void this.acceptAgentEdit(pending.targetTabId, pending.sourceTabId, pending.filePath, {
+            ...pending,
+            diffHunks: step.diffHunks || pending.diffHunks,
+          }).catch((e) => console.warn('[TabContext] agent edit:', e.message));
+        }
       }
-      const prefix = operationKey + '\0';
-      for (const [pendingKey, pending] of [...this.pendingEdits]) {
-        if (!pendingKey.startsWith(prefix)) continue;
-        this.pendingEdits.delete(pendingKey);
-        if (step.isError) continue;
-        void this.acceptAgentEdit(pending.targetTabId, pending.sourceTabId, pending.filePath, {
-          ...pending,
-          diffHunks: step.diffHunks || pending.diffHunks,
-        }).catch((e) => console.warn('[TabContext] agent edit:', e.message));
-      }
-    }
+    };
+    return causal.hasWork() ? work() : causal.syncWork('tabContext.observeRecord', {}, work);
   }
 
   async acceptAgentEdit(tabId, sourceTabId, filePath, {
@@ -2372,56 +2452,58 @@ class TabWorkContext {
       this.rememberOwnedHead(tabId, sessionId, filePath, before, initialExpected);
     }
     await this.readFile(filePath);
-    const current = this.db.prepare('SELECT * FROM tab_context_files WHERE tab_id=? AND path=?').get(tabId, filePath);
-    const latestTransition = current?.hash
-      ? this.latestPendingFileChange(tabId, filePath, current.hash)
-      : null;
-    const candidates = new Set([before, latestTransition?.beforeText].filter((item) => typeof item === 'string'));
-    let changed = false;
-    let outcome = null;
-    for (const candidate of candidates) {
-      const expected = applyOwnedEdit(candidate, { args, tool, diffHunks });
-      if (expected === null) continue;
-      const reconciled = ownEdit
-        ? this.reconcileOwnedTransition(tabId, filePath, candidate, expected, current, {
-            args,
-            tool,
-            diffHunks,
-          }) || (beforeTrusted && candidate === before
-            ? this.rebaseOwnedEditAcrossPending(tabId, filePath, candidate, expected, current, {
-                args,
-                tool,
-                diffHunks,
-              })
-            : null)
-        : this.attributeAgentTransition(
-            tabId,
-            filePath,
-            candidate,
-            expected,
-            this.sourceDescriptor(sourceTabId, sessionId, operationId),
-          );
-      if (reconciled?.changed) {
-        if (ownEdit) this.rememberOwnedHead(tabId, sessionId, filePath, candidate, expected);
-        changed = true;
-        outcome = reconciled.outcome;
+    return causal.syncWork('tabContext.acceptAgentEdit.consume', { tabId, fileIdentity: filePath }, () => {
+      const current = sqlStatement('tabContext.acceptAgentEdit.tab_context_files', 'get', () => this.db.prepare('SELECT * FROM tab_context_files WHERE tab_id=? AND path=?'), statement => statement.get(tabId, filePath));
+      const latestTransition = current?.hash
+        ? this.latestPendingFileChange(tabId, filePath, current.hash)
+        : null;
+      const candidates = new Set([before, latestTransition?.beforeText].filter((item) => typeof item === 'string'));
+      let changed = false;
+      let outcome = null;
+      for (const candidate of candidates) {
+        const expected = applyOwnedEdit(candidate, { args, tool, diffHunks });
+        if (expected === null) continue;
+        const reconciled = ownEdit
+          ? this.reconcileOwnedTransition(tabId, filePath, candidate, expected, current, {
+              args,
+              tool,
+              diffHunks,
+            }) || (beforeTrusted && candidate === before
+              ? this.rebaseOwnedEditAcrossPending(tabId, filePath, candidate, expected, current, {
+                  args,
+                  tool,
+                  diffHunks,
+                })
+              : null)
+          : this.attributeAgentTransition(
+              tabId,
+              filePath,
+              candidate,
+              expected,
+              this.sourceDescriptor(sourceTabId, sessionId, operationId),
+            );
+        if (reconciled?.changed) {
+          if (ownEdit) this.rememberOwnedHead(tabId, sessionId, filePath, candidate, expected);
+          changed = true;
+          outcome = reconciled.outcome;
+        }
+        if (!ownEdit && reconciled) break;
       }
-      if (!ownEdit && reconciled) break;
-    }
-    if (ownEdit) {
-      const headKey = this.ownedHeadKey(tabId, sessionId, filePath);
-      const head = this.ownedHeads.get(headKey);
-      if (head && current?.hash === head.afterHash) this.ownedHeads.delete(headKey);
-    }
-    if (changed) {
-      console.log('[TabContext] ' + (ownEdit ? 'own' : 'attributed')
-        + ' file change reconciled tab=' + String(tabId).slice(-12)
-        + ' source=' + String(sourceTabId || '-').slice(-12)
-        + ' session=' + String(sessionId || '-').slice(0, 8)
-        + ' operation=' + String(operationId || '-').slice(0, 24)
-        + ' outcome=' + outcome + ' file=' + path.basename(filePath));
-      this.touch(tabId);
-    }
+      if (ownEdit) {
+        const headKey = this.ownedHeadKey(tabId, sessionId, filePath);
+        const head = this.ownedHeads.get(headKey);
+        if (head && current?.hash === head.afterHash) this.ownedHeads.delete(headKey);
+      }
+      if (changed) {
+        console.log('[TabContext] ' + (ownEdit ? 'own' : 'attributed')
+          + ' file change reconciled tab=' + String(tabId).slice(-12)
+          + ' source=' + String(sourceTabId || '-').slice(-12)
+          + ' session=' + String(sessionId || '-').slice(0, 8)
+          + ' operation=' + String(operationId || '-').slice(0, 24)
+          + ' outcome=' + outcome + ' file=' + path.basename(filePath));
+        this.touch(tabId);
+      }
+    });
   }
 }
 

@@ -165,7 +165,17 @@ try {
       // Heavy quota affects only the CPU/trace request sent to Main above.
     },
   });
-  if (flight) causalJournal = createCausalJournal({ artifacts: flight.artifacts, now: watchdogAbs, log: wdLog });
+  let causalAckPending = 0;
+  if (flight) causalJournal = createCausalJournal({ artifacts: flight.artifacts, now: watchdogAbs, log: wdLog,
+    onPersisted: ack => {
+      if (!process.connected || causalAckPending >= 8) return false;
+      causalAckPending++;
+      let settled = false;
+      const finish = () => { if (!settled) { settled = true; causalAckPending--; } };
+      try { process.send({ t: 'causal-ack', ...ack }, finish); return true; }
+      catch { finish(); return false; }
+    },
+  });
   if (flight) stallSampler = createNativeStallSampler({ artifacts: flight.artifacts, log: wdLog,
     env: buildChildProcessEnv(), verifyTarget: metadata => {
       const current = [...procs.values()].find(p => p.pid === metadata.pid && p.label === metadata.kind);

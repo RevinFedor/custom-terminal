@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { causal } = require('./perf-causal-context');
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig;
 const DEFAULT_CACHE_MS = 15_000;
@@ -240,26 +241,34 @@ class AgentSessionAvailabilityService {
   }
 
   async _probeDescriptors(descriptors, force) {
-    const checkedAt = this.now();
-    const wantedByProvider = new Map([
-      ['claude', new Set()],
-      ['codex', new Set()],
-      ['gemini', new Set()],
-    ]);
-    const manifests = new Map();
-    for (const descriptor of descriptors) {
-      wantedByProvider.get(descriptor.provider).add(descriptor.sessionId);
-      if (descriptor.provider !== 'codex' || !this.getCodexLineageManifest) continue;
-      try {
-        const manifest = this.getCodexLineageManifest(descriptor.sessionId);
-        if (!manifest || !Array.isArray(manifest.sourceSegments)) continue;
-        manifests.set(sessionKey('codex', descriptor.sessionId), manifest);
-        for (const segment of manifest.sourceSegments) {
-          const physicalSessionId = clean(segment?.physicalSessionId).toLowerCase();
-          if (physicalSessionId) wantedByProvider.get('codex').add(physicalSessionId);
-        }
-      } catch {}
-    }
+    // Starts after probeBatch's inflight await; discovery IO is outside this work.
+    const { checkedAt, wantedByProvider, manifests } = causal.syncWork('availability.manifests', {}, () => {
+      const checkedAt = this.now();
+      const wantedByProvider = new Map([
+        ['claude', new Set()],
+        ['codex', new Set()],
+        ['gemini', new Set()],
+      ]);
+      const manifests = new Map();
+      for (const descriptor of descriptors) {
+        causal.count('descriptors');
+        wantedByProvider.get(descriptor.provider).add(descriptor.sessionId);
+        if (descriptor.provider !== 'codex' || !this.getCodexLineageManifest) continue;
+        try {
+          causal.count('manifestReads');
+          const manifest = this.getCodexLineageManifest(descriptor.sessionId);
+          if (!manifest || !Array.isArray(manifest.sourceSegments)) continue;
+          manifests.set(sessionKey('codex', descriptor.sessionId), manifest);
+          for (const segment of manifest.sourceSegments) {
+            causal.count('manifestSegments');
+            const physicalSessionId = clean(segment?.physicalSessionId).toLowerCase();
+            if (physicalSessionId) wantedByProvider.get('codex').add(physicalSessionId);
+          }
+        } catch {}
+      }
+  
+      return { checkedAt, wantedByProvider, manifests };
+    });
 
     const rawByKey = new Map();
     const unresolved = new Map();

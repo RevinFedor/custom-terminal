@@ -19,6 +19,10 @@ const HEAVY_BYTES = 8 * 1024 * 1024;
 const CAUSAL_PROTECTED_BYTES = 64 * 1024 * 1024;
 const NATIVE_SAMPLE_PROTECTED_BYTES = 64 * 1024 * 1024;
 const PAYLOAD_CAP = 4 * 1024 * 1024;
+const CAUSAL_NORMAL_BYTES = 2 * 1024 * 1024;
+const RETENTION_LEDGER = 'retention-ledger.json';
+const LEDGER_BYTES = 16384;
+const LEDGER_ENTRIES = 32;
 const OWN_FILE = /^(?:(?:cpu|causal)-\d{10}\.ndjson|stall-\d+-\d+-\d+\.(?:sample\.txt|sample\.json|sample-capture\.json)|incident-\d+-\d+(?:\.json|\.sample\.txt|\.main\.cpuprofile|\.cpuprofile|\.trace\.json|\.profile\.json|\.capture\.json|\.ui\.json))$/;
 const NATIVE_RECEIPT = /^stall-(\d+)-\d+-\d+\.sample-capture\.json$/;
 const NATIVE_SAMPLE = /^stall-\d+-\d+-\d+\.sample\.txt$/;
@@ -129,7 +133,7 @@ function summarizeFrames(frames) {
 function createArtifactStore(directory, { log = () => {} } = {}) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const file = name => {
-    if (!OWN_FILE.test(name)) throw new Error('invalid perf artifact name');
+    if (name !== RETENTION_LEDGER && !OWN_FILE.test(name)) throw new Error('invalid perf artifact name');
     return path.join(directory, name);
   };
   const entries = () => fs.readdirSync(directory).filter(n => OWN_FILE.test(n)).flatMap(name => {
@@ -144,7 +148,7 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
     const fd = fs.openSync(file(name), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     try {
       const stat = fs.fstatSync(fd);
-      if (!stat.isFile() || stat.size > maxBytes) throw new Error('invalid perf artifact read');
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > maxBytes) throw new Error('invalid perf artifact read');
       const buffer = Buffer.alloc(maxBytes + 1);
       const size = fs.readSync(fd, buffer, 0, buffer.length, 0);
       if (size > maxBytes) throw new Error('perf artifact grew beyond read bound');
@@ -167,24 +171,92 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
   const write = (name, data, append = false) => {
     const bytes = typeof data === 'string' ? data : JSON.stringify(data);
     const size = Buffer.byteLength(bytes);
-    if (size > PAYLOAD_CAP) throw new Error('perf artifact payload too large');
+    if (size > (name === RETENTION_LEDGER ? LEDGER_BYTES : PAYLOAD_CAP)) throw new Error('perf artifact payload too large');
     const causal = name.startsWith('causal-');
     const fd = fs.openSync(file(name), (append ? fs.constants.O_APPEND : 0) |
       fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
     try {
-      const stat = fs.fstatSync(fd);
-      if (!stat.isFile() || stat.nlink !== 1) throw new Error('invalid perf artifact write');
+      const stat = fs.fstatSync(fd), current = fs.lstatSync(file(name));
+      if (!stat.isFile() || stat.nlink !== 1 || !current.isFile() || current.isSymbolicLink()
+        || current.dev !== stat.dev || current.ino !== stat.ino) throw new Error('invalid perf artifact write');
       // An active hour must not grow forever while exempt from age-based
       // pruning. Parent records this explicit loss; never silently trim NDJSON.
       if (causal && (append ? stat.size : 0) + size > PAYLOAD_CAP) throw new Error('causal artifact bucket full');
       if (!append) fs.ftruncateSync(fd, 0);
       fs.writeFileSync(fd, bytes);
+      if (name === RETENTION_LEDGER) fs.fsyncSync(fd);
     } finally { fs.closeSync(fd); }
-    if (causal) prune();
   };
+  // One global file per hour, across all source PIDs/boots. Ordinary writes
+  // stop at the lower watermark; essential evidence can consume the reserved
+  // remainder. Check the actual inode size, so a new store has the same quota.
+  // Maintenance is deliberately NOT part of an append's persistence result.
+  const writeCausal = (name, text, { essential = false } = {}) => {
+    if (!/^causal-\d{10}\.ndjson$/.test(name) || typeof text !== 'string' || !text.endsWith('\n')) {
+      throw new Error('invalid causal append');
+    }
+    const size = Buffer.byteLength(text);
+    const ceiling = essential ? PAYLOAD_CAP : CAUSAL_NORMAL_BYTES;
+    const bucketFull = () => Object.assign(new Error('causal artifact bucket full'),
+      { code: essential ? 'CAUSAL_TOTAL_BUCKET_FULL' : 'CAUSAL_NORMAL_BUCKET_FULL' });
+    if (size > ceiling) throw bucketFull();
+    const fd = fs.openSync(file(name), fs.constants.O_APPEND | fs.constants.O_CREAT |
+      fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+    let receipt;
+    try {
+      const stat = fs.fstatSync(fd), current = fs.lstatSync(file(name));
+      if (!stat.isFile() || stat.nlink !== 1 || !current.isFile() || current.isSymbolicLink()
+        || current.dev !== stat.dev || current.ino !== stat.ino) throw new Error('invalid causal artifact inode');
+      if (stat.size + size > ceiling) throw bucketFull();
+      // A failed append AND failed rollback may have left an undecodable tail.
+      // Check this same guarded inode on every append, including after restart;
+      // never ACK a new record concatenated onto ambiguous previous bytes.
+      if (stat.size > 0) {
+        const tail = Buffer.alloc(1);
+        if (fs.readSync(fd, tail, 0, 1, stat.size - 1) !== 1 || tail[0] !== 10) {
+          throw Object.assign(new Error('causal artifact has incomplete tail'), { code: 'CAUSAL_TORN_BUCKET' });
+        }
+      }
+      try {
+        fs.writeFileSync(fd, text);
+        fs.fsyncSync(fd);
+        if (stat.size === 0) {
+          const directoryFd = fs.openSync(directory, fs.constants.O_RDONLY);
+          try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
+        }
+        const after = fs.lstatSync(file(name));
+        if (!after.isFile() || after.nlink !== 1 || after.dev !== stat.dev || after.ino !== stat.ino
+          || after.size !== stat.size + size) throw new Error('causal artifact changed during append');
+      } catch (error) {
+        // A failed partial append must not leave a torn NDJSON line in front
+        // of the next retry. This fd is our checked, single-link inode.
+        try { fs.ftruncateSync(fd, stat.size); fs.fsyncSync(fd); } catch {}
+        throw error;
+      }
+      receipt = { name, appended: true, bytes: size, fromBytes: stat.size,
+        toBytes: stat.size + size, essential: !!essential };
+    } finally { fs.closeSync(fd); }
+    return receipt;
+  };
+  function retentionLedger() {
+    try {
+      const value = JSON.parse(read(RETENTION_LEDGER, LEDGER_BYTES));
+      if (value?.version !== 1 || !Array.isArray(value.entries) || value.entries.length > LEDGER_ENTRIES
+        || !Number.isSafeInteger(value.omitted) || value.omitted < 0) throw new Error('invalid retention ledger');
+      return value;
+    } catch (error) {
+      if (error.code === 'ENOENT') return { version: 1, entries: [], omitted: 0 };
+      throw error;
+    }
+  }
   function prune(now = Date.now()) {
       const all = entries().sort((a, b) => a.at - b.at);
-      let bytes = all.reduce((sum, e) => sum + e.size, 0);
+      const ledger = retentionLedger();
+      let ledgerSize = 0;
+      try { ledgerSize = fs.lstatSync(file(RETENTION_LEDGER)).size; } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      let bytes = all.reduce((sum, e) => sum + e.size, 0) + ledgerSize;
+      // Reserve the ledger's maximum growth inside the SAME five GiB cap.
+      const pruneCap = DISK_CAP - (LEDGER_BYTES - ledgerSize);
       let causalBytes = all.filter(e => e.name.startsWith('causal-')).reduce((sum, e) => sum + e.size, 0);
       let nativeSampleBytes = all.filter(e => NATIVE_SAMPLE.test(e.name)).reduce((sum, e) => sum + e.size, 0);
       let removed = 0, removedNative = 0, removedExpired = 0, removedHeavyExpired = 0, removedBudget = 0;
@@ -201,7 +273,7 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
         ...all.filter(e => !expired(e) && heavy(e)),
         ...all.filter(e => !expired(e) && !heavy(e)),
       ];
-      for (const e of ordered) {
+      try { for (const e of ordered) {
         const causal = e.name.startsWith('causal-');
         const nativeSample = NATIVE_SAMPLE.test(e.name);
         // Native and heavy receipts are independent, small, and non-evictable
@@ -209,17 +281,23 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
         if (NATIVE_RECEIPT.test(e.name) && !expired(e)) continue;
         if (HEAVY_RECEIPT.test(e.name) && now - e.at < DAY) continue;
         if (!causal && now - e.at < 120000) continue;
-        if (!expired(e) && bytes <= DISK_CAP) continue;
+        if (!expired(e) && bytes <= pruneCap) continue;
         if (nativeSample && !expired(e) && e.size <= DISK_CAP && nativeSampleBytes - e.size < NATIVE_SAMPLE_PROTECTED_BYTES) continue;
         if (causal && !expired(e) && e.size <= DISK_CAP && causalBytes - e.size < CAUSAL_PROTECTED_BYTES) continue;
         try {
           const current = fs.lstatSync(file(e.name));
-          if (!current.isFile() || current.isSymbolicLink() || current.ino !== e.ino || current.dev !== e.dev ||
+          if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1 || current.ino !== e.ino || current.dev !== e.dev ||
             current.mtimeMs !== e.at || current.size !== e.size) continue;
           fs.unlinkSync(file(e.name)); bytes -= e.size;
           removed++;
           const removalReason = expired(e)
             ? heavy(e) ? 'heavy-retention-expired' : 'retention-expired' : 'artifact-budget';
+          const sourceHour = /^(?:causal|cpu)-(\d{10})\.ndjson$/.exec(e.name)?.[1]
+            || new Date(e.at).toISOString().slice(0, 13).replace(/\D/g, '');
+          ledger.entries.push({ file: e.name, sourceHour, bytes: e.size, reason: removalReason, removedAt: now });
+          while (ledger.entries.length > LEDGER_ENTRIES || Buffer.byteLength(JSON.stringify(ledger)) > LEDGER_BYTES) {
+            ledger.entries.shift(); ledger.omitted = Math.min(Number.MAX_SAFE_INTEGER, ledger.omitted + 1);
+          }
           if (removalReason === 'heavy-retention-expired') removedHeavyExpired++;
           else if (removalReason === 'retention-expired') removedExpired++;
           else removedBudget++;
@@ -255,13 +333,19 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
             } catch { /* Legacy/missing metadata cannot prevent bounded pruning. */ }
           }
         } catch (err) { if (err.code !== 'ENOENT') throw err; }
+      } } finally {
+        // A later unlink failure must not hide earlier successful removals.
+        if (removed) {
+          write(RETENTION_LEDGER, ledger);
+          bytes += Buffer.byteLength(JSON.stringify(ledger)) - ledgerSize;
+        }
       }
       if (removed) try { log('[Perf:ArtifactPrune] removed=' + removed + ' native=' + removedNative
         + ' weekExpired=' + removedExpired + ' heavyExpired=' + removedHeavyExpired + ' budgetEvicted=' + removedBudget
         + ' bytes=' + bytes + ' nativeBytes=' + nativeSampleBytes + ' causalBytes=' + causalBytes); } catch {}
       return { bytes, causalBytes, nativeSampleBytes };
   }
-  return { directory, file, write, entries, read, openExclusive, writeExclusive, prune,
+  return { directory, file, write, writeCausal, entries, read, openExclusive, writeExclusive, prune, retentionLedger,
     reserveCaptureDetails(id, now = Date.now(), kind = 'unknown', detail = {}) {
       const recent = entries().filter(e => HEAVY_RECEIPT.test(e.name) && now - e.at < DAY).map(e => {
         try { return { ...e, group: JSON.parse(read(e.name)).group }; }

@@ -102,6 +102,14 @@ Cancellation/suppression подтверждаются только после д
 Ожидание event-driven: busy/child wait не читает transcript на каждый append;
 после completion подписка на прежний transcript-owner закрывает окно flush.
 Перед выбором latest повторно проверяются owner, runtime revision и child gate.
+`response_state_changed` означает конфликт одного чтения, не остановку target.
+На этом конкретном исходе service заново получает один снимок: иначе последний
+lifecycle-edge мог оставить unknown без следующего сигнала для восстановления.
+Второй конфликт остаётся unknown; таймерного polling и busy/idle подстановки нет.
+Свежий снимок по-прежнему обязан пройти exact owner/Goal/child/current-turn guards.
+Адресный `recheck` повторяет только чтение прежнего observation. Это не generic
+`retry`: run может завершиться между GET/POST, а retry у source уже означает
+повтор доставки. Terminal/cancelled recheck ничего не оживляет и не пересылает.
 UI показывает статичный timer, unknown/child attention отдельно; отмена снимает
 только ожидание. Детали API и версий — fact-terminal-mcp::Статус доставки и
 получение результата. Это новый read-flow, не изменение прав обычной делегации.
@@ -474,6 +482,14 @@ input, только после свежих ownership/work checks. Claude origin
 существующий verified transcript callback, не объявляет legacy stat source proof.
 Пауза остаётся link-only: поздняя Continue-квитанция хранит delivery proof, но не
 снимает Pause; Resume не принимает turn, начавшийся раньше его собственной границы.
+
+После Resume у готового Codex ещё может не быть outcome текущего поколения.
+Не требовать такого outcome для первого продолжения: это замыкает ожидание само
+на себя. Main input readiness вместе с текущим writer/launch разрешает только
+подготовку ввода; private latest-history read подтверждает последнее исполнение,
+но не результат. Generic response reader остаётся строгим. Смена owner/input во
+время проверки отменяет подготовку; saved target не заменяется новым при повторе
+того же intent. Отказ до подтверждённой готовности не создаёт скрытый будущий Send.
 
 `new-request` — явное новое поручение в текущих историях: копируется сохранённый
 original snapshot text, получается новый стабильный runId и обычный queued intent.

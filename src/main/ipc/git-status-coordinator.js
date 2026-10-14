@@ -1,4 +1,5 @@
 'use strict';
+const { causal } = require('../perf-causal-context');
 
 function createConcurrencyLimiter(maxConcurrent = 2) {
   const limit = Math.max(1, Math.floor(Number(maxConcurrent) || 1));
@@ -22,7 +23,9 @@ function createConcurrencyLimiter(maxConcurrent = 2) {
   return {
     run(task) {
       return new Promise((resolve, reject) => {
-        queue.push({ task, resolve, reject });
+      // A queued entry may be drained by another request's finally callback.
+      // Preserve the diagnostic owner captured when THIS entry was enqueued.
+      queue.push({ task: causal.bind(task), resolve, reject });
         drain();
       });
     },

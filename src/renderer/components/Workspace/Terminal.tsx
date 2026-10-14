@@ -1117,6 +1117,21 @@ async function finalizeAiLaunchSnapshot(tabId: string) {
       tabId,
       visible: null,
     });
+    // The read may complete after another launch/session has claimed this
+    // tab. Its empty result only describes the original launch snapshot.
+    const currentStore = useWorkspaceStore.getState();
+    let currentTab;
+    for (const workspace of currentStore.openProjects.values()) {
+      const candidate = workspace.tabs.get(tabId);
+      if (candidate) { currentTab = candidate; break; }
+    }
+    const currentSessionId = snapshot.sessionType === 'claude'
+      ? currentTab?.claudeSessionId : currentTab?.codexSessionId;
+    if (currentStore.getAiLaunchSnapshot(tabId) !== snapshot || !currentTab
+      || currentSessionId !== tabInfo.sessionId || currentTab.cwd !== tabInfo.cwd) {
+      console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' result=source-changed → keep');
+      return;
+    }
     const entries = Array.isArray(result?.entries) ? result.entries.length : -1;
     console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' sid=' + tabInfo.sessionId.slice(0, 8) + ' success=' + !!result?.success + ' entries=' + entries + (result?.error ? ' error=' + result.error : ''));
     if (result?.success && entries === 0) {

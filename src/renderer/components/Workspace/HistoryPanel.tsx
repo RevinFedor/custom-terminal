@@ -7878,12 +7878,15 @@ function AgentHistoryControls({
       const snapshot = {
         selectionStart: editor.selectionStart,
         selectionEnd: editor.selectionEnd,
+        selectionAnchor: editor.selectionAnchor,
+        selectionHead: editor.selectionHead,
         scrollTop: editor.scrollTop,
       };
       setHistoryComposerView(ownerTabId, snapshot);
       console.log('[HistoryComposerView] capture tab=' + ownerTabId.slice(-12)
         + ' reason=' + reason
         + ' selection=' + snapshot.selectionStart + ':' + snapshot.selectionEnd
+        + ' anchor/head=' + snapshot.selectionAnchor + ':' + snapshot.selectionHead
         + ' scrollTop=' + snapshot.scrollTop.toFixed(3));
     }
     if (persist) {
@@ -7924,6 +7927,7 @@ function AgentHistoryControls({
         composerViewRestoringTabRef.current = null;
         console.log('[HistoryComposerView] restore tab=' + ownerTabId.slice(-12)
           + ' selection=' + applied.selectionStart + ':' + applied.selectionEnd
+          + ' anchor/head=' + applied.selectionAnchor + ':' + applied.selectionHead
           + ' scrollTop=' + applied.scrollTop.toFixed(3));
       });
     } else if (tabIdRef.current === ownerTabId) {
@@ -12571,6 +12575,8 @@ function AgentHistoryControls({
                   setHistoryComposerView(tabId, {
                     selectionStart: selection.start,
                     selectionEnd: selection.end,
+                    selectionAnchor: selection.anchor,
+                    selectionHead: selection.head,
                   });
                 }}
                 onScrollChange={(scrollTop) => {

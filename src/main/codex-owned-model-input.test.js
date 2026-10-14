@@ -116,6 +116,59 @@ test('actual timeout retains its insertion; a late exact frame clears only /mode
   assert.equal(h.mirror.synchronizedFrameWaiters.size, 0);
 });
 
+test('slash timeout reports the last rejected frame boundary, not an invented empty composer', async () => {
+  const h = harness();
+  const result = await h.expire();
+  assert.equal(result.slashInputObservation.status, 'expired');
+  assert.equal(result.slashInputObservation.reason, 'deadline');
+  assert.equal(result.slashInputObservation.decisionReason, 'post-write-composer-unproven');
+  assert.equal(result.slashInputObservation.frame.writeSeq, 10);
+  assert.equal(result.slashInputObservation.frame.afterWriteSeq, 10);
+  assert.equal(result.slashInputObservation.frame.cursorSourceMatches, true);
+  assert.equal(result.slashInputObservation.frame.hasDraft, false);
+  assert.equal(h.writes.length, 1);
+  h.change('input');
+});
+
+test('frame diagnostics distinguish a foreign composer value without storing its text', async () => {
+  const h = harness();
+  const receipt = h.ctx.retainCodexOwnedModelInput(h.term,
+    h.ctx.captureCodexOwnedSlashDraftIdentity('T', h.term), '/model');
+  h.frame('PRIVATE USER TEXT', 11);
+  const result = await h.ctx.waitForCodexOwnedModelPaste('T', h.term, receipt);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.inputObservation.frame.hasDraft, true);
+  assert.equal(result.inputObservation.frame.writeSeq, 11);
+  assert.equal(JSON.stringify(result).includes('PRIVATE USER TEXT'), false);
+  assert.equal(h.writes.length, 0);
+  h.change('input');
+});
+
+test('slash diagnostics distinguish a late MCP control from a missing echo frame', async () => {
+  const h = harness();
+  h.ctx.codexLateMcpProofPending.set('T', {});
+  const result = await h.expire();
+  assert.equal(result.slashInputObservation.decisionReason, 'composer-control-unavailable');
+  assert.equal(result.slashInputObservation.control.ready, true);
+  assert.equal(result.slashInputObservation.control.lateMcpProofPending, true);
+  assert.equal(result.slashInputObservation.frame, null);
+  assert.equal(h.writes.length, 1);
+  h.change('input');
+});
+
+test('failed slash preparation cancels only its unused model-menu reader', async () => {
+  const h = harness(); let cancelled = 0;
+  h.ctx.captureCodexFrame = () => Object.assign(new Promise(() => {}), { cancel: () => { cancelled++; } });
+  const result = await h.ctx.withPtyWriteLock(h.term, () => h.ctx.selectCodexModelEffort(h.term, {
+    tabId: 'T', model: 'gpt-6.1-sol', effort: 'high', hasDraft: false,
+    readDraftState: async () => ({ success: true, hasDraft: false }),
+  }));
+  assert.equal(result.success, false); assert.equal(cancelled, 1);
+  assert.equal(h.receipt.command, '/model', 'physical insertion lifetime survives reader cancellation');
+  assert.equal(h.writes.length, 1);
+  h.change('input');
+});
+
 test('/compact uses committed owner frames, not a separate raw-output delta; timeout retains exact bytes and reports paste truth', async () => {
   const h = harness();
   const result = await h.expire('/compact');

@@ -36,7 +36,7 @@ async function fixture(t, extra = {}) {
   const calls = { sends: [], reconciles: [], delivered: [], originals: 0, latest: 0, replacements: [] };
   let resultKind = 'confirmed', original = { found: true, sourceVerified: true, complete: false, userUuid: 'original-user', executionContext: oldContext };
   let latest = { subject: { kind: 'codex-historical-execution', targetExecutionContext: oldContext }, result: { sourceVerified: true } };
-  let beforeSend = null, sendOverride = null, originalOverride = null, replacementOverride = null, resumeOverride = null;
+  let beforeSend = null, sendOverride = null, originalOverride = null, replacementOverride = null, resumeOverride = null, readStateOverride = null;
   function commit(request, context = nextContext, more = {}) {
     const identity = { operationKey: request.sendOperationKey, tabId: 'B', handoffId: request.handoffId,
       surface: 'desktop-history', requestFingerprint: crypto.createHash('sha256').update(JSON.stringify([request.prompt, request.expectedTarget])).digest('hex'),
@@ -52,7 +52,7 @@ async function fixture(t, extra = {}) {
     return { identity, attempt };
   }
   const makeService = () => createOrchestrationContinuationService({ store, receipts, now: () => 1000,
-    readState: async id => ({ ...states.get(id) }), readInfo: async () => ({ sessionId: 'B', lifecycleGeneration: 'L-new' }),
+    readState: async id => readStateOverride ? readStateOverride(id) : ({ ...states.get(id) }), readInfo: async () => ({ sessionId: 'B', lifecycleGeneration: 'L-new' }),
     readOriginal: async (...args) => { calls.originals++; return originalOverride ? originalOverride(...args) : original; }, readLatest: async () => { calls.latest++; return latest; },
     reconcile: async id => { calls.reconciles.push(id); }, deliver: async id => { calls.delivered.push(id); },
     createReplacement: async plan => { calls.replacements.push(plan); return replacementOverride ? replacementOverride(plan) : { ok: true, replacementRunId: plan.runId }; },
@@ -80,6 +80,7 @@ async function fixture(t, extra = {}) {
     setResult: value => { resultKind = value; }, setBeforeSend: value => { beforeSend = value; },
     setSendOverride: value => { sendOverride = value; },
     setOriginalOverride: value => { originalOverride = value; },
+    setReadStateOverride: value => { readStateOverride = value; },
     setReplacementOverrides: (create, resume) => { replacementOverride = create; resumeOverride = resume; },
     reopen: async () => { await store.flush(); db.close(); db = new Database(database); receipts = createAgentSendReceiptStore(db, { now: () => 2000, settledRetentionMs: 10 });
       store = new OrchestrationRunStore(file); await store.initialize(); service = makeService(); }, file };
@@ -126,6 +127,25 @@ test('unknown runtime never means stopped', async t => {
   const h = await fixture(t); Object.assign(h.states.get('B'), { busy: null, processStatus: 'unknown' });
   assert.equal((await h.service.continueRequest('R')).code, 'continuation_runtime_unknown');
   assert.equal(h.calls.sends.length, 0);
+});
+
+test('restored ready Codex without a new completed turn can accept the authorized continuation', async t => {
+  const h = await fixture(t);
+  Object.assign(h.states.get('B'), {
+    busy: null, transitioning: false, processStatus: 'found', inputReady: true, status: 'active',
+    writerUsableForMutation: true, error: 'response_busy_unknown',
+  });
+  const { createContinuationInputReader } = require('./orchestration-continuation-input');
+  h.setReadStateOverride(createContinuationInputReader({
+    readResponseState: async id => ({ ...h.states.get(id) }),
+    readRuntimeSnapshot: async id => ({ coherent: true, toolType: 'codex', processStatus: 'found',
+      status: 'active', inputReady: true, busy: false, lifecycleGeneration: 'L-' + id,
+      sendTarget: { toolType: 'codex', sessionId: id, terminalInstanceId: 'instance-' + id, launchId: 'launch-' + id } }),
+  }));
+  const result = await h.service.continueRequest('R');
+  assert.equal(result.resumed, true, JSON.stringify(result));
+  assert.equal(h.calls.sends.length, 1);
+  assert.equal(h.calls.sends[0].expectedTarget.launchId, 'launch-B');
 });
 
 test('ready original result is delivered, not executed again', async t => {
@@ -441,4 +461,13 @@ test('actual action -> common FIFO -> actual Main canonical publisher -> exact c
     lifecycleGeneration: 'L-new', executionContext: nextContext, backgroundWorkCount: 0 });
   assert.equal(done.settled[0]?.runId, 'R');
   assert.equal((await h.store.get('R')).resultComplete, false, 'existing exact final reader still owns completion proof');
+});
+
+
+test('the illustrative public ready/writer flags alone never supply continuation input authority', async t => {
+  const h = await fixture(t);
+  Object.assign(h.states.get('B'), { busy: null, transitioning: false, processStatus: 'found',
+    inputReady: true, status: 'active', writerUsableForMutation: true, error: 'response_busy_unknown' });
+  assert.equal((await h.service.continueRequest('R')).code, 'continuation_runtime_unknown');
+  assert.equal(h.calls.sends.length, 0);
 });

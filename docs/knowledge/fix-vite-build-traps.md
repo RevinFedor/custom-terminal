@@ -1,7 +1,7 @@
 # Fix: Vite-специфичные ловушки сборки (main + renderer)
 
-Пять независимых ловушек Vite, все про **build-time трансформацию**, runtime
-адреса внутри ASAR или source input сборки.
+Ловушки Vite, связанные с **build-time трансформацией**, runtime-адресами
+внутри ASAR и входными файлами сборки.
 
 ## Часть 1: `$` в template literals = «Unexpected character $»
 
@@ -150,3 +150,21 @@ requires проверяются отдельным source↔package wiring-те�
 `require(path.join(srcSharedDir, "working-directory.cjs"))`, не содержит старого
 относительного require; synthetic ASAR подтвердил42 файла и2786043 байта.
 Это source/isolated package proof, не установленная приёмка.
+
+## Часть 6: `--configLoader runner` не заменяет обычную загрузку конфига
+
+В приватной сборке shared markdown-editor14.10 Vite6.4.1 с добавленным
+`--configLoader runner` остановился ещё при загрузке неизменённого
+`vite.config.ts`: `ReferenceError: __dirname is not defined`. Наличие самого
+флага в CLI не доказывает совместимость с существующим конфигом, который
+использует `resolve(__dirname, ...)`.
+
+На новой физической копии тех же исходников обычный `vite build`, как в
+package script, завершил library output и declarations; последующий
+electron-vite build дал Main/renderer/assets. Product config не переписывался.
+Изоляцию обеспечивают приватные dependency/output/cache paths, а не смена
+семантики config loader. Временные config bundles должны оставаться внутри
+этой копии. Сохранять отдельно исходный exit1 и успешный новый результат;
+build PASS ещё не означает Electron/runtime/installed PASS.
+Evidence: `/private/tmp/noted-ui-lag-0715-jc9pi7rs/startup27/build37/evidence/shared-build-result.json`
+и `build38/evidence/shared-build-result.json` в том же startup27.

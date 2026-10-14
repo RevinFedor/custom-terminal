@@ -23,6 +23,7 @@ const { captureNativeSnapshot, computeCpuPercent, loadNative } = require('./proc
 const { groupProcessMetrics } = require('./process-metrics-grouping');
 const { groupApplications } = require('./process-metrics-applications');
 const { captureSystemMemory } = require('./system-memory-source');
+const { causal } = require('./perf-causal-context');
 
 const DEFAULT_INTERVAL_MS = 2000;
 const DEFAULT_AMBIENT_INTERVAL_MS = 5000;
@@ -94,7 +95,12 @@ function createProcessMetricsService({
   }
 
   function measure() {
-    const snapshot = capture();
+    const snapshot = causal.syncWork('resource.capture', {}, () => {
+      const value = capture();
+      if (Number.isFinite(value?.scannedAt)) causal.update({ readId: 'metrics:' + value.scannedAt });
+      if (Array.isArray(value?.processes)) causal.count('processes', value.processes.length);
+      return value;
+    });
     if (!snapshot || !snapshot.ok) {
       panelSnapshot = panelCpu = panelPayload = applications = null;
       return {
@@ -110,13 +116,15 @@ function createProcessMetricsService({
     previousSnapshot = snapshot;
 
     const context = collectContext() || {};
-    const grouped = group({
+    const readId = Number.isFinite(snapshot.scannedAt) ? 'metrics:' + snapshot.scannedAt : undefined;
+    causal.update({ readId });
+    const grouped = causal.syncWork('resource.group', { readId }, () => group({
       snapshot,
       cpuByPid,
       tabs: context.tabs || [],
       appPids: context.appPids || [],
       projectId: context.projectId || null,
-    });
+    }));
 
     const payload = { ok: true, ...grouped };
     if (subscribers.size > 0) {
@@ -136,7 +144,7 @@ function createProcessMetricsService({
    */
   function measureSafely() {
     try {
-      return measure();
+      return causal.syncWork('resource.measure', { caller: 'process-metrics' }, measure);
     } catch (error) {
       panelSnapshot = panelCpu = panelPayload = applications = null;
       log.warn('[ProcessMetrics] measure failed: ' + (error && error.message));
@@ -151,12 +159,16 @@ function createProcessMetricsService({
    * показывал бы не то, что подпись под открытой панелью.
    */
   function publish(payload) {
-    if (subscribers.size > 0 && typeof onUpdate === 'function') onUpdate(payload);
-    if (ambientEnabled && typeof onAmbientUpdate === 'function') onAmbientUpdate(toAmbient(payload));
+    const readId = Number.isFinite(payload?.scannedAt) ? 'metrics:' + payload.scannedAt : undefined;
+    return causal.syncWork('resource.publish', { readId }, () => {
+      if (subscribers.size > 0 && typeof onUpdate === 'function') { causal.count('panelPublishes'); onUpdate(payload); }
+      if (ambientEnabled && typeof onAmbientUpdate === 'function') { causal.count('ambientPublishes'); onAmbientUpdate(toAmbient(payload)); }
+    });
   }
 
   function tick() {
-    publish(measureSafely());
+    return causal.syncWork('resource.timer', { caller: 'process-metrics-timer' },
+      () => publish(measureSafely()), { root: true });
   }
 
   function start() {

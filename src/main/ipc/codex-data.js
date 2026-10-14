@@ -6782,12 +6782,20 @@ function inspectCodexConversationMaterialization(records, sessionId = null) {
   const userRecords = list.filter(isCodexRealUserRecord).length;
   const userTurns = buildCodexTimeline(list, meta.id)
     .filter((entry) => entry?.type === 'user').length;
+  // A native fork can own only a header/settings tail while its conversation
+  // lives in a proven source prefix. Zero local users is not permission to
+  // clear its binding or unlink that tail. Readability belongs to the shared
+  // composite reader; malformed/unresolved lineage must also be preserved.
+  const linkedHistory = meta.forked_from_id != null || meta.history_base != null
+    || meta.forked_from_ordinal_exclusive != null
+    || (meta.history_mode != null && meta.history_mode !== 'legacy');
   return {
     materialized: userTurns > 0,
-    metadataOnly: userTurns === 0,
+    metadataOnly: userTurns === 0 && !linkedHistory,
     userRecords,
     userTurns,
-    reason: userTurns > 0 ? 'user-history-present' : 'session-meta-only',
+    reason: userTurns > 0 ? 'user-history-present'
+      : linkedHistory ? 'fork-history-requires-composite-read' : 'session-meta-only',
   };
 }
 
@@ -11657,7 +11665,14 @@ function register({ projectManager, transcriptService } = {}) {
     }
   });
 
-  ipcMain.handle('codex:get-timeline', async (_event, { sessionId, cwd }) => {
+  ipcMain.handle('codex:get-timeline', async (_event, payload = {}) => {
+    // Legacy callers (including launch finalization) must see the same frozen
+    // prefix + child tail as History. A physical-only empty answer can cause
+    // the caller to discard a perfectly valid thin native fork after Stop.
+    if (transcriptService?.getTimeline) {
+      return transcriptService.getTimeline({ ...payload, toolType: 'codex' });
+    }
+    const { sessionId, cwd } = payload;
     try {
       // Same file-cursor projector as the panel's Timeline: this channel is
       // also called on ordinary flows (tab-title generation, AI-launch

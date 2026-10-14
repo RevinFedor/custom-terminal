@@ -933,6 +933,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'fork_tab',
   'delegate_to_session',
   'wait_for_tab_response',
+  'recheck_tab_response',
   'start_external_research',
   'import_external_conversation',
   'continue_external_research',
@@ -1353,6 +1354,13 @@ const TOOLS = [
       },
       required: ['runId'],
     },
+  },
+  {
+    name: 'recheck_tab_response',
+    description: 'Explicitly recheck ONE existing read-only response observation after a transient runtime/read failure. Keeps its runId, target, current-turn/child policy and original recipient. Does not send a target prompt, Resume, Stop, restart browser research, or retry an old source notification. A newly proven result follows the original normal completion delivery. Completed/cancelled observations are returned unchanged. Requires the app responseObservations.recheck capability. After one recheck wait for the normal completion notification; do not poll or create a replacement wait.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {
+      runId: { type: 'string', minLength: 1 }, cwd: { type: 'string' },
+    }, required: ['runId'] },
   },
   {
     name: 'continue_delegation',
@@ -2716,6 +2724,18 @@ async function callTool(name, args) {
         throw new Error('Project API accepted external research without durable runId/jobId identity');
       }
       return JSON.stringify({ ...result, runId, jobId }, null, 2);
+    }
+
+    case 'recheck_tab_response': {
+      if (typeof args.runId !== 'string' || !args.runId.trim()
+        || Object.keys(args).some(key => !['runId', 'cwd'].includes(key))) throw new Error('runId required; only runId/cwd are accepted');
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD_() });
+      const me = await httpApiGet(target, '/api/me');
+      if (me?.capabilities?.responseObservations?.recheck?.version !== 1) {
+        throw Object.assign(new Error('Update Noted Terminal for read-only observation recheck. No retry/Continue/new wait fallback was attempted.'), { code: 'app_update_required' });
+      }
+      const result = await httpApiPost(target, '/api/orchestrations/' + encodeURIComponent(args.runId) + '/action', { action: 'recheck' });
+      return JSON.stringify({ ...result, guidance: 'This rechecks the SAME observation without target input or a replacement run. Unknown remains unknown. Use the original completion notification; do not poll.' }, null, 2);
     }
 
     case 'continue_delegation': {
