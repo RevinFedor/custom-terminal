@@ -58,7 +58,7 @@ const handleLinkActivation = (
   }
 
   // If it looks like a file path, try to open in preview
-  // This handles paths like /Users/fedor/file.ts or ./src/file.ts
+  // This handles paths like /Users/example/file.ts or ./src/file.ts
   if (uri.startsWith('/') || uri.startsWith('./') || uri.startsWith('../')) {
     console.log('[Link] Opening file in preview:', uri);
     // Use ipcRenderer to open file preview

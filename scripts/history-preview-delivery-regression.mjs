@@ -40,7 +40,7 @@ try {
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
   const shared = path.join(artifact, 'noted-shared/packages');
   for (const name of ['structured-dnd', 'file-explorer']) {
-    await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name), {
+    await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, name), {
       recursive: true, filter: p => !p.includes('/node_modules') });
   }
   result.sourceHash = createHash('sha256').update(await fs.readFile(path.join(snapshot,
@@ -66,7 +66,7 @@ try {
     if (!file.startsWith(snapshotRoot + path.sep) && !file.startsWith(sharedRoot + path.sep)) continue;
     const content = await fs.readFile(file);
     inputs.push({ path: file.startsWith(snapshotRoot + path.sep) ? path.relative(snapshotRoot, file)
-      : '../noted-shared/packages/' + path.relative(sharedRoot, file),
+      : 'vendor/noted-shared/packages/' + path.relative(sharedRoot, file),
       sha256: createHash('sha256').update(content).digest('hex'), bytes: content.length });
   }
   assert(inputs.some(input => input.path === 'src/renderer/components/Workspace/HistoryPanel.tsx'),

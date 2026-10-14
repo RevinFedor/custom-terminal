@@ -749,7 +749,7 @@ test('tool result enriches its existing action and never creates a user row', ()
     [{
       type: 'tool_result',
       tool_use_id: 'tool-1',
-      content: [{ type: 'text', text: '/Users/fedor' }],
+      content: [{ type: 'text', text: '/Users/example' }],
       is_error: false,
     }],
   ));
@@ -764,7 +764,7 @@ test('tool result enriches its existing action and never creates a user row', ()
     bashWord: 'pwd',
     mcpServer: undefined,
     mcpMethod: undefined,
-    result: '/Users/fedor',
+    result: '/Users/example',
     isError: false,
   });
 
@@ -804,7 +804,7 @@ test('tool result can overlay an already durable action without cloning full his
     [{
       type: 'tool_result',
       tool_use_id: 'tool-1',
-      content: '/Users/fedor',
+      content: '/Users/example',
       is_error: false,
     }],
   ));
@@ -813,11 +813,11 @@ test('tool result can overlay an already durable action without cloning full his
 
   assert.deepEqual(results, [{
     toolUseId: 'tool-1',
-    result: '/Users/fedor',
+    result: '/Users/example',
     isError: false,
   }]);
   assert.notStrictEqual(patched, durableEntry);
-  assert.equal(patched.actions[0].rawTool.result, '/Users/fedor');
+  assert.equal(patched.actions[0].rawTool.result, '/Users/example');
   assert.equal(patched.actions[0].rawTool.isError, false);
   assert.equal(
     applyHistoryLiveToolResultsToEntry(patched, results),

@@ -1,3 +1,4 @@
+import { getGeminiApiKey } from './geminiApiKey.mjs';
 import { readHistoryThroughIpc } from './historyReadTransport.mjs';
 import {
   DEFAULT_PROMPT_SUMMARY_PROMPT,
@@ -362,7 +363,7 @@ export async function generateTitleFromPromptWithConfig(
     usageMetadata?: PromptUsageMetadata;
   }
 ): Promise<string | null> {
-  const apiKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) || '';
+  const apiKey = await getGeminiApiKey();
   if (!apiKey) {
     console.warn('[' + options.logPrefix + '] GEMINI_API_KEY missing');
     return null;

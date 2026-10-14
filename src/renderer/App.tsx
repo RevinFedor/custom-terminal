@@ -1,3 +1,4 @@
+import { getGeminiApiKey } from './utils/geminiApiKey.mjs';
 import { usePointerGesture } from './hooks/usePointerGesture';
 import { rememberAgentLaunchFence } from './utils/agentLaunchFence.mjs';
 import { createEditableDictationClipboard } from './utils/dictationEditableClipboard.mjs';
@@ -589,7 +590,7 @@ async function buildMobileAiRewindText(args: {
     }
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = await getGeminiApiKey();
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
 
   const model = promptConfig.model;

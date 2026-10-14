@@ -243,7 +243,7 @@ try {
   await fs.copyFile(path.join(repo, 'scripts/fixtures/application-send-queue.tsx'), path.join(snapshot, 'scripts/fixtures/application-send-queue.tsx'));
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
   const shared = path.join(artifact, 'shared');
-  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name),
+  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, name),
     { recursive: true, filter: value => !value.includes('/node_modules') });
   const bundled = await build({ entryPoints: [path.join(snapshot, 'scripts/fixtures/application-send-queue.tsx')],
     bundle: true, outfile: path.join(artifact, 'bundle.js'), platform: 'browser', format: 'esm', target: 'chrome120',

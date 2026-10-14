@@ -165,7 +165,7 @@ async function makePrivateApp(artifact, width) {
   const sharedRoot = path.join(artifact, 'noted-shared/packages');
   await fs.mkdir(sharedRoot, { recursive: true });
   for (const name of ['structured-dnd', 'file-explorer']) {
-    await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(sharedRoot, name), {
+    await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(sharedRoot, name), {
       recursive: true,
       filter: (p) => !p.includes('/node_modules'),
     });

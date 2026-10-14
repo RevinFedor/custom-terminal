@@ -1499,7 +1499,7 @@ test('Codex JSON-string arguments derive the same exact semantic tool projection
     + 'provisional-text-not-yet-materialized|BOUNDARY_HELD|tool-use" '
     + 'src/main/terminal-history-preview.js';
   const proof = createTerminalHistoryStructuredProof([
-    JSON.stringify({ cmd: command, workdir: '/Users/fedor/Desktop/custom-terminal' }),
+    JSON.stringify({ cmd: command, workdir: '/Users/example/Desktop/custom-terminal' }),
   ]);
   const projected = [
     'classify|branch-status|scrol',

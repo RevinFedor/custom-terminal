@@ -32,7 +32,7 @@ try {
   await fs.writeFile(timelinePath,source.slice(0,insertion)+'\n(window as any).modifierFixture.renders[tabId] = ((window as any).modifierFixture.renders[tabId] || 0) + 1;\n'+source.slice(insertion));
   result.instrumentation='one render counter at the start of the actual Timeline function, same in both arms';
   const shared=path.join(artifact,'noted-shared/packages');
-  for(const name of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'../noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')&&!p.includes('/.git')});
+  for(const name of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'vendor/noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')&&!p.includes('/.git')});
   await build({entryPoints:[path.join(snapshot,'scripts/fixtures/timeline-modifier-native.tsx')],bundle:true,
     outfile:path.join(artifact,'bundle.js'),sourcemap:true,platform:'browser',format:'iife',target:'chrome120',logLevel:'silent',
     define:{'process.env.NODE_ENV':'"production"','import.meta.env':'{"DEV":false,"MODE":"test"}'},

@@ -14,7 +14,7 @@ test('rejects a non-absolute OSC cwd candidate before reading live process state
     candidate: 'Users/fedor/Desktop/custom-terminal',
     readLiveCwd: async () => {
       liveReads += 1;
-      return '/Users/fedor/Desktop/custom-terminal';
+      return '/Users/example/Desktop/custom-terminal';
     },
   });
 

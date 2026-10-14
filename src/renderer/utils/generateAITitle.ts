@@ -1,3 +1,4 @@
+import { getGeminiApiKey } from './geminiApiKey.mjs';
 /**
  * Generates a short title for an AI Paste collapsed block via Gemini Flash.
  *
@@ -6,7 +7,7 @@
  * replaces `⏳` with the returned title (or 'paste text' fallback on failure).
  *
  * Mirrors the same API pattern already used by InfoPanel.handleGenerateDescription —
- * GEMINI_API_KEY from the renderer's process.env (set during electron-vite bootstrap),
+ * GEMINI_API_KEY from Electron main's runtime ENV via local IPC,
  * gemini-2.0-flash model with a system prompt asking for a 2-5 word title.
  */
 // Tried models in order — fall back to next when previous returns 429.
@@ -45,7 +46,7 @@ async function callGemini(apiKey: string, model: string, text: string): Promise<
 }
 
 export async function generateAITitle(text: string): Promise<string> {
-  const apiKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) || '';
+  const apiKey = await getGeminiApiKey();
   if (!apiKey) {
     console.warn('[AITitle] GEMINI_API_KEY missing, returning fallback');
     return `paste text [${text.length}]`;

@@ -1,0 +1,17 @@
+{
+  "name": "noted-shared",
+  "version": "0.2.0",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "node --test build/*.test.mjs && npm test --workspace @noted/structured-dnd && npm test --workspace @noted/file-explorer"
+  },
+  "devDependencies": {
+    "lucide-react": "^0.562.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "react-icons": "^5.5.0"
+  }
+}

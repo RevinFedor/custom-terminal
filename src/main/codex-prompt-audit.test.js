@@ -234,7 +234,7 @@ test('17 Aug provider envelope and its in-place placeholder stay one slot across
 });
 
 test('19:40 tab-3607 production carrier matches the exact 877-char send', () => {
-  const assetPath = '/Users/fedor/Library/Application Support/noted-terminal/prompt-queue-assets/f2daf846013d0ea3bb2f6ec9ec4f5e6afc624f76403a62c8aeb0f2d82e30ac35.png';
+  const assetPath = '/Users/example/Library/Application Support/noted-terminal/prompt-queue-assets/f2daf846013d0ea3bb2f6ec9ec4f5e6afc624f76403a62c8aeb0f2d82e30ac35.png';
   const providerPath = '/tmp/noted-terminal-codex-image-input/f2daf846013d0ea3bb2f6ec9ec4f5e6afc624f76403a62c8aeb0f2d82e30ac35.png';
   const submitted = `Что за хуйня, почему тут, блядь, все два идёт дублируется? Это вот эти вот два сообщения, что это какая-то хуета: «проверь, посмотри, что там за дела». Куда это взялось?[imagePath: ${assetPath}] Agent: Codex
 Role: assistant

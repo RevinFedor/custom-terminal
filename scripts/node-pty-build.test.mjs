@@ -1,3 +1,4 @@
+import { finished } from 'node:stream/promises';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
@@ -176,7 +177,9 @@ test('actual local builder skip reader accepts published metadata, before any pr
   assert.equal(pkg.build.afterExtract, pkg.build.beforePack);
   assert.notEqual(pkg.build.npmRebuild, false);
   assert.match(pkg.scripts._rebuild, /node scripts\/node-pty-build.mjs/);
-  assert.ok(pkg.scripts.build.indexOf('validate-app-asar.mjs') < pkg.scripts.build.indexOf('npm run sign:local-fast'));
+  assert.equal(pkg.scripts.build, 'npm run build:app');
+  const publicBuild = await fs.readFile(new URL('./build-public-app.mjs', import.meta.url), 'utf8');
+  assert.ok(publicBuild.indexOf('validate-app-asar.mjs') < publicBuild.indexOf('/usr/bin/codesign'));
 });
 
 test('unsupported target and missing hook proof refuse without compiler calls', async t => {
@@ -209,7 +212,9 @@ test('ASAR validation checks actual packaged native bytes, not source hashes or 
       await fs.writeFile(path.join(release, 'source-proof.json'), JSON.stringify({ marker: PTY_MARKER, sourceSHA: '8e1a7918403a6995655affc6b374e4e7604e60b1c52e3eacfa1876f41200323b' }));
       if (scenario === 'loader drift') await fs.appendFile(path.join(f.pty, 'lib/utils.js'), '\n');
       const archive = path.join(f.root, 'app.asar');
-      await asar.createPackageWithOptions(f.project, archive, scenario === 'packed native' ? {} : { unpack: '**/build/Release/*' });
+      const archiveStream = await asar.createPackageWithOptions(f.project, archive, scenario === 'packed native' ? {} : { unpack: '**/build/Release/*' });
+      // asar returns its ending WriteStream before the final writes finish.
+      await finished(archiveStream);
       if (scenario === 'fixed') assert.equal((await validateAsarArchive(archive)).nodePty.arch, 'arm64');
       else await assert.rejects(validateAsarArchive(archive), /marker|missing|loader drift|must be unpacked|architecture/);
     });

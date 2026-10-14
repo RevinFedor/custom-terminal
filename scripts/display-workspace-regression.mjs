@@ -325,7 +325,7 @@ try {
     // Same real source aliases/deduplication as electron.vite.config.js.
     alias: {
       '@noted/claude-blocks': path.join(root, 'packages/claude-blocks/src'),
-      '@noted/structured-dnd': path.resolve(root, '../noted-shared/packages/structured-dnd/src'),
+      '@noted/structured-dnd': path.resolve(root, 'vendor/noted-shared/packages/structured-dnd/src'),
       react: path.join(root, 'node_modules/react'), 'react-dom': path.join(root, 'node_modules/react-dom'),
     },
     // This authored font URL is absent in the repo; Vite also leaves it for

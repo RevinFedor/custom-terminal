@@ -31,7 +31,7 @@ const append = find(node => ts.isExpressionStatement(node) && ts.isCallExpressio
   && node.expression.arguments[0]?.text === 'claude:append-input').getText(ast);
 const log = { log() {}, warn() {}, error() {} };
 
-for (const prompt of ['/Users/fedor/Desktop/voice-record Так, хочу описать задачу',
+for (const prompt of ['/Users/example/Desktop/voice-record Так, хочу описать задачу',
   '/tmp/input.txt', '/status\nexplain this example', 'ordinary prompt', '/compact', '/model haiku']) {
   test('actual command and append callers agree with receipt/audit for ' + JSON.stringify(prompt), async () => {
     const calls = [], handlers = new Map();
@@ -71,7 +71,7 @@ function receiptHarness(t) {
   const store = createAgentSendReceiptStore(db, { onChanged: activity.update });
   const identity = history.buildDesktopHistorySendIdentity({
     tabId: 'T', handoffId: 'H', provider: 'claude', source: 'history-panel',
-    rawPrompt: '/Users/fedor/project request', promptHash: 'hash', promptLength: 28,
+    rawPrompt: '/Users/example/project request', promptHash: 'hash', promptLength: 28,
   });
   const begun = store.beginAttempt(identity);
   store.markAttemptState(identity.operationKey, begun.attemptId, 'enter-armed');

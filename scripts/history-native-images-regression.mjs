@@ -194,7 +194,7 @@ try {
   const shared = path.join(artifact, 'noted-shared/packages');
   for (const name of ['structured-dnd', 'file-explorer']) {
     await fs.mkdir(shared, { recursive: true });
-    await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name), {
+    await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, name), {
       recursive: true, force: true, filter: (entry) => !entry.includes('/node_modules'),
     });
   }

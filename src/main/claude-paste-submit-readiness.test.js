@@ -120,7 +120,7 @@ test('expected shape preserves text whitespace and treats images separately', ()
 });
 
 test('image references may stay text or collapse with the entire prompt, without native image chips', () => {
-  const imagePath = '/Users/fedor/Library/Application Support/noted-terminal/prompt-queue-assets/8a68.png';
+  const imagePath = '/Users/example/Library/Application Support/noted-terminal/prompt-queue-assets/8a68.png';
   const payload = '[imagePath: ' + imagePath + ']\n  explain this camera setting';
   const shape = expectedClaudePasteShape(payload, { imagePaths: [{ id: 1, path: imagePath }] });
   for (const text of [

@@ -38,7 +38,7 @@ test('joinPromptInsertionText keeps prompt and file order with readable gaps', (
 });
 
 test('Cmd insertion keeps a path with spaces as plain editable text', () => {
-  const spaced = '/Users/fedor/Global-Templates/🧩 Code-Patterns/docs-rules.prompt.md';
+  const spaced = '/Users/example/Global-Templates/🧩 Code-Patterns/docs-rules.prompt.md';
   assert.equal(buildPromptFilePathText([spaced]), spaced);
 });
 
@@ -63,7 +63,7 @@ test('a prompt without files has nothing to reference', () => {
 });
 
 test('a leading macOS Users path gets a tilde only at the first visible position', () => {
-  const path = '/Users/fedor/Desktop/example.md';
+  const path = '/Users/example/Desktop/example.md';
   assert.equal(protectLeadingMacUsersPath(path), `~${path}`);
   assert.equal(protectLeadingMacUsersPath(path, '  \n'), `~${path}`);
   assert.equal(protectLeadingMacUsersPath(path, 'before '), path);

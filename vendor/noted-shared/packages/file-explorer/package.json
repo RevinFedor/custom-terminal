@@ -1,0 +1,26 @@
+{
+  "name": "@noted/file-explorer",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./styles.css": "./src/styles.css",
+    "./context-menu.css": "./src/context-menu.css",
+    "./outline": "./src/outline/index.js",
+    "./context-menu": "./src/context-menu/index.js",
+    "./sidebar-layout": "./src/sidebarLayout.js",
+    "./icon-profile": "./src/iconProfile.js",
+    "./main/shared-layout-store": "./main/shared-layout-store.cjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.*"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18",
+    "@noted/structured-dnd": "0.2.0",
+    "lucide-react": ">=0.469.0",
+    "react-icons": ">=5.5.0"
+  }
+}

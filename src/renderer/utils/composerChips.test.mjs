@@ -97,7 +97,7 @@ test('terminal-only slash detection ignores leading whitespace but not ordinary 
   assert.equal(isTerminalOnlyComposerDraft(' \n\t /effort high'), true);
   assert.equal(isTerminalOnlyComposerDraft('explain /model'), false);
   assert.equal(isTerminalOnlyComposerDraft('   '), false);
-  assert.equal(isTerminalOnlyComposerDraft('/Users/fedor/Desktop/voice-record Описание задачи'), false);
+  assert.equal(isTerminalOnlyComposerDraft('/Users/example/Desktop/voice-record Описание задачи'), false);
   assert.equal(isTerminalOnlyComposerDraft('/status\nобъясни этот пример'), false);
 });
 
@@ -704,7 +704,7 @@ test('чип промпта восстанавливается из ТЕКСТА
 test('контекстный файл восстанавливается как file-chip без отдельной записи', () => {
   const file = {
     label: 'правила.md',
-    filePath: '/Users/fedor/docs/правила.md',
+    filePath: '/Users/example/docs/правила.md',
     role: 'instructions',
     sha256: 'a'.repeat(64),
     bytes: 42,
@@ -728,7 +728,7 @@ test('контекстный файл восстанавливается как 
   }, {
     attachmentKind: 'file',
     label: 'правила.md',
-    filePath: '/Users/fedor/docs/правила.md',
+    filePath: '/Users/example/docs/правила.md',
     role: 'instructions',
     sha256: 'a'.repeat(64),
     bytes: 42,

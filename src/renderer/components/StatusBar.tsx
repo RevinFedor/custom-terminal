@@ -937,12 +937,8 @@ function WebServerChip({ hidden = false }: { hidden?: boolean }) {
   }
 
   // Prod (7878) → публичный домен через VPS-туннель; dev (7979 и любой другой) → локальный IP:port
-  const isProd = info.port === 7878;
-  const PUBLIC_HOST = 'remote-control.f9922.tech';
-  const fullUrl = isProd
-    ? `https://${PUBLIC_HOST}/?token=${info.token}`
-    : `http://${info.lanIp}:${info.port}/?token=${info.token}`;
-  const shortUrl = isProd ? PUBLIC_HOST : `local:${info.port}`;
+  const fullUrl = `http://${info.lanIp}:${info.port}/?token=${info.token}`;
+  const shortUrl = `local:${info.port}`;
 
   const handleClick = () => {
     try {

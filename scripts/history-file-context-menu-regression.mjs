@@ -71,7 +71,7 @@ const ipcRenderer={send:(channel,payload)=>state.requests.push({channel,payload}
 window.require=name=>{
  if(name==='node:path')return{isAbsolute:p=>p.startsWith('/'),resolve:(base,p)=>p.startsWith('/')?p:(base.endsWith('/')?base.slice(0,-1):base)+'/'+p};
  if(name==='node:url')return{pathToFileURL:p=>new URL(p.split('/').map(encodeURIComponent).join('/'),'file://')};
- if(name==='node:os')return{homedir:()=>'/Users/fedor'};
+ if(name==='node:os')return{homedir:()=>'/Users/example'};
  throw Error('Unexpected host access '+name);
 };
 const shortPath=p=>p.split('/').pop();

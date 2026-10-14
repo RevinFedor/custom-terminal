@@ -29,7 +29,7 @@ let gitIpcModule = null;
 
 const sharedFileExplorerMainPath = app.isPackaged
   ? path.join(process.resourcesPath, 'shared-packages', 'file-explorer')
-  : path.join(process.cwd(), '..', 'noted-shared', 'packages', 'file-explorer', 'main');
+  : path.join(process.cwd(), 'vendor', 'noted-shared', 'packages', 'file-explorer', 'main');
 const { registerSharedFileIconIpc, registerSharedFileLayoutIpc } = require(
   path.join(sharedFileExplorerMainPath, 'shared-layout-store.cjs')
 );
@@ -25515,12 +25515,8 @@ app.whenReady().then(async () => {
       try {
         const info = webServer.getInfo();
         if (!info.running) return { ok: false, error: 'web-server not running' };
-        // Prod (port 7878) → публичный URL через VPS-туннель.
-        // Dev и любой другой порт → локальный LAN-IP.
-        const isProd = info.port === 7878;
-        const url = isProd
-          ? `https://remote-control.f9922.tech/?token=${encodeURIComponent(info.token)}`
-          : `http://${info.lanIp}:${info.port}/?token=${encodeURIComponent(info.token)}`;
+        // Open this Mac’s actual LAN listener; remote access is configured by its owner.
+        const url = `http://${info.lanIp}:${info.port}/?token=${encodeURIComponent(info.token)}`;
         require('electron').shell.openExternal(url);
         return { ok: true };
       } catch (e) {

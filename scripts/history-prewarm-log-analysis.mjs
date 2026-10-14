@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import os from 'node:os'
 
 import fs from 'node:fs';
 
@@ -249,7 +250,7 @@ const parseArgs = (argv) => {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const args = parseArgs(process.argv.slice(2));
-  const logPath = args.log || '/Users/fedor/Library/Logs/noted-terminal/production.log';
+  const logPath = args.log || path.join(os.homedir(), 'Library/Logs/noted-terminal/production.log');
   const analysis = analyzeHistoryPrewarmLog(fs.readFileSync(logPath, 'utf8'), {
     bootId: args.boot || null,
     tabSuffix: args.tab || 'tab-3951',

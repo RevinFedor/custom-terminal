@@ -36,7 +36,7 @@ await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modu
 
 const shared = path.join(artifact, 'noted-shared/packages');
 for (const name of ['structured-dnd', 'file-explorer']) {
-  await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name), {
+  await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, name), {
     recursive: true,
     filter: p => !p.includes('/node_modules'),
   });

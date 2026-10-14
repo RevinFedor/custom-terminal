@@ -14,8 +14,8 @@ const path = require('path');
 //     pre-expanded include blocks on disk.
 //
 // References:
-//   - /Users/fedor/Desktop/gt-editor/src/components/Sidebar.jsx::onCopyContent
-//   - /Users/fedor/Desktop/gt-editor/src/utils/includeTransform.js
+//   - /Users/example/Desktop/gt-editor/src/components/Sidebar.jsx::onCopyContent
+//   - /Users/example/Desktop/gt-editor/src/utils/includeTransform.js
 const INCLUDE_LINE_RE = /^<!-- @include: (.+?) -->$/;
 const MAX_INCLUDE_DEPTH = 8;
 
@@ -81,6 +81,9 @@ function sanitizeFileForPrompt(raw, filePath) {
 }
 
 function register({ projectManager, savedPromptService, systemPromptService }) {
+  // Local renderer reads the configured runtime key; never bake it into build output.
+  ipcMain.handle('settings:get-gemini-api-key', () => String(process.env.GEMINI_API_KEY || ''));
+
   // ── Prompts ──
 
   ipcMain.handle('prompts:get', async () => {

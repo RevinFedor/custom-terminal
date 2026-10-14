@@ -22,7 +22,7 @@ try {
   await fs.copyFile(path.join(repo, 'scripts/fixtures/workflow-switch-cost.tsx'), path.join(snapshot, 'scripts/fixtures/workflow-switch-cost.tsx'));
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
   const shared = path.join(artifact, 'noted-shared/packages');
-  for (const n of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', n), path.join(shared, n),
+  for (const n of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', n), path.join(shared, n),
     { recursive: true, filter: p => !p.includes('/node_modules') });
   if (process.env.NOTED_WORKFLOW_BASELINE_GATE) await fs.copyFile(process.env.NOTED_WORKFLOW_BASELINE_GATE,
     path.join(snapshot, 'src/renderer/styles/presentationAnimations.css'));

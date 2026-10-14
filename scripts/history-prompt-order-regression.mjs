@@ -107,7 +107,7 @@ try {
   await fs.mkdir(path.join(snapshot, 'scripts/fixtures'), { recursive: true });
   await fs.copyFile(path.join(repo, 'scripts/fixtures/history-prompt-order.tsx'), path.join(snapshot, 'scripts/fixtures/history-prompt-order.tsx'));
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
-  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name), {
+  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, name), {
     recursive: true, filter: value => !value.includes('/node_modules') && !value.includes('/.git'),
   });
   const bundled = await build({ entryPoints: [path.join(snapshot, 'scripts/fixtures/history-prompt-order.tsx')],

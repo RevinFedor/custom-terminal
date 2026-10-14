@@ -1,0 +1,30 @@
+{
+  "name": "@noted/structured-dnd",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "default": "./src/index.js"
+    },
+    "./core": {
+      "types": "./src/core/index.d.ts",
+      "import": "./src/core/index.js",
+      "default": "./src/core/index.js"
+    },
+    "./react": {
+      "types": "./src/react/index.d.ts",
+      "import": "./src/react/index.js",
+      "default": "./src/react/index.js"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js src/react/*.test.js"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18"
+  }
+}

@@ -822,11 +822,11 @@ test('provider history_base flattens an already-virtual source at the exact pare
 test('real tab-678 637-record source and two-record child become non-empty at writer-ready', async (t) => {
   const sourceLoaded = await codexData._api.loadSessionRecords(
     SOURCE,
-    '/Users/fedor/Desktop/sc-desktop',
+    '/Users/example/Desktop/sc-desktop',
   );
   const childLoaded = await codexData._api.loadSessionRecords(
     CHILD,
-    '/Users/fedor/Desktop/sc-desktop',
+    '/Users/example/Desktop/sc-desktop',
   );
   if (!sourceLoaded?.success || !childLoaded?.success) {
     t.skip('production tab-678 fixture is not present on this machine');
@@ -844,13 +844,13 @@ test('real tab-678 637-record source and two-record child become non-empty at wr
   });
   const sourceSnapshot = await captureService.captureCodexForkSourceSnapshot({
     sessionId: SOURCE,
-    cwd: '/Users/fedor/Desktop/sc-desktop',
+    cwd: '/Users/example/Desktop/sc-desktop',
     loaded: sourceLoaded,
   });
   const childTailStart = await captureService.captureCodexForkChildTailStart({
     sourceSessionId: SOURCE,
     childSessionId: CHILD,
-    cwd: '/Users/fedor/Desktop/sc-desktop',
+    cwd: '/Users/example/Desktop/sc-desktop',
   });
   assert.equal(sourceSnapshot.sourceSegments[0].toByte, 7067455);
   assert.deepEqual(
@@ -883,10 +883,10 @@ test('real tab-678 637-record source and two-record child become non-empty at wr
     sessionHistoryStore: { getSessionHistoryEvents: () => [event] },
   });
   const timeline = await service.getTimeline({
-    toolType: 'codex', sessionId: CHILD, cwd: '/Users/fedor/Desktop/sc-desktop', tabId: 'tab-678',
+    toolType: 'codex', sessionId: CHILD, cwd: '/Users/example/Desktop/sc-desktop', tabId: 'tab-678',
   });
   const history = await service.getHistory({
-    toolType: 'codex', sessionId: CHILD, cwd: '/Users/fedor/Desktop/sc-desktop', tabId: 'tab-678',
+    toolType: 'codex', sessionId: CHILD, cwd: '/Users/example/Desktop/sc-desktop', tabId: 'tab-678',
     dehydrate: true,
   });
   assert.equal(timeline.success, true);
@@ -901,8 +901,8 @@ test('real tab-34 native Rewind history_base reconstructs its virtual parent pre
   const sourceSessionId = '01a04c0a-d097-7da3-83de-62cf94758707';
   const childSessionId = '01a05364-5bb1-7c11-9252-2622e6882c67';
   const grandSessionId = '01a045f3-e1e4-7e81-b0e4-07e2e891ef3c';
-  const sourceLoaded = await codexData._api.loadSessionRecords(sourceSessionId, '/Users/fedor');
-  const childLoaded = await codexData._api.loadSessionRecords(childSessionId, '/Users/fedor');
+  const sourceLoaded = await codexData._api.loadSessionRecords(sourceSessionId, '/Users/example');
+  const childLoaded = await codexData._api.loadSessionRecords(childSessionId, '/Users/example');
   if (!sourceLoaded?.success || !childLoaded?.success) {
     t.skip('production tab-34 fixture is not present on this machine');
     return;
@@ -972,7 +972,7 @@ test('real tab-34 native Rewind history_base reconstructs its virtual parent pre
     viewSessionId: sourceSessionId,
     physicalSessionId: sourceSessionId,
     targetSourceLine: 1_878,
-    cwd: '/Users/fedor',
+    cwd: '/Users/example',
   });
   assert.equal(preEnterSnapshot.snapshotComplete, true);
   assert.equal(preEnterSnapshot.targetTurnStartByteOffset, 15_911_314);
@@ -980,7 +980,7 @@ test('real tab-34 native Rewind history_base reconstructs its virtual parent pre
   assert.equal(preEnterSnapshot.sourceSegments.at(-1).toByte, 15_911_314);
   const prepared = await service.prepareCodexProviderForkLineage({
     childSessionId,
-    cwd: '/Users/fedor',
+    cwd: '/Users/example',
     childTabId: '__noted_inbox__-tab-34',
   });
   assert.equal(prepared.success, true);
@@ -998,7 +998,7 @@ test('real tab-34 native Rewind history_base reconstructs its virtual parent pre
   const timeline = await service.getTimeline({
     toolType: 'codex',
     sessionId: childSessionId,
-    cwd: '/Users/fedor',
+    cwd: '/Users/example',
     tabId: '__noted_inbox__-tab-34',
   });
   assert.equal(timeline.success, true);
@@ -1010,7 +1010,7 @@ test('real tab-34 native Rewind history_base reconstructs its virtual parent pre
   assert.deepEqual(inheritedEntries.map((entry) => entry.uuid), preEnterSnapshot.entryUuids);
   assert.equal(inheritedEntries.filter((entry) => entry.type === 'user').length, 47);
   assert.ok(timeline.entries.some((entry) => entry.physicalSessionId === childSessionId && entry.type === 'user'));
-  const operationSource = await service.loadCodexOperationSource({ sessionId: childSessionId, cwd: '/Users/fedor' });
+  const operationSource = await service.loadCodexOperationSource({ sessionId: childSessionId, cwd: '/Users/example' });
   assert.equal(operationSource.success, true);
   assert.equal(operationSource.composite, true);
   const compacts = operationSource.records.filter((record) => record.type === 'compacted');

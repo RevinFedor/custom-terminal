@@ -27,7 +27,7 @@ test('codex vendor binary and package path are recognised', () => {
 
 test('claude and gemini are recognised in bare and path form', () => {
   assert.equal(isAiForegroundProcess(child('claude', 'claude')), true);
-  assert.equal(isAiForegroundProcess(child('node', 'node /Users/fedor/.claude/local/bin/claude --resume abc')), true);
+  assert.equal(isAiForegroundProcess(child('node', 'node /Users/example/.claude/local/bin/claude --resume abc')), true);
   assert.equal(isAiForegroundProcess(child('gemini', '/opt/homebrew/bin/gemini')), true);
 });
 

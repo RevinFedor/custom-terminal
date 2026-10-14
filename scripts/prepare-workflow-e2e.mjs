@@ -33,8 +33,8 @@ await snapshot(project,source);
 await fs.symlink(path.join(project,'node_modules'),path.join(source,'node_modules'));
 // Shared source packages must be frozen, even with read-only dependencies.
 const shared=path.join(lease,'noted-shared');
-await snapshot(path.resolve(project,'../noted-shared'),shared,'../noted-shared/');
-await fs.symlink(path.resolve(project,'../noted-shared/node_modules'),path.join(shared,'node_modules'));
+await snapshot(path.resolve(project,'vendor/noted-shared'),shared,'vendor/noted-shared/');
+await fs.symlink(path.resolve(project,'vendor/noted-shared/node_modules'),path.join(shared,'node_modules'));
 const env={NODE_ENV:'development',NOTED_E2E_TEST:'true',NOTED_E2E_WINDOWED:'1',NOTED_E2E_VISIBLE:'1',NOTED_E2E_USE_BUILT_RENDERER:'true',
   NOTED_E2E_FILE_LOG:'1',NOTED_E2E_CLI_ISOLATION_ROOT:lease,NOTED_USER_DATA_DIR:path.join(lease,'user-data'),
   NOTED_DISCOVERY_DIR:path.join(lease,'discovery'),CODEX_HOME:path.join(lease,'codex-profile'),CLAUDE_CONFIG_DIR:path.join(lease,'claude-profile'),

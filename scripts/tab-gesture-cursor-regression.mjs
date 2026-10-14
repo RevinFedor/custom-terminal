@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-tab-cursor-'));
-const outlineSource = path.resolve(root, '../noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js');
+const outlineSource = path.resolve(root, 'vendor/noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js');
 const bundle = await build({
   stdin: { resolveDir: root, loader: 'tsx', contents: `
 import React,{useRef,useState,useLayoutEffect} from 'react';

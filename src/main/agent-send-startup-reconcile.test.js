@@ -405,7 +405,7 @@ test('physical Inbox path receipt recovers the same attempt from its exact post-
   for (const paths of [[], run.expectedImagePaths, entry.imagePaths.map(ref => ref.path)]) {
     const service = { type: 'response_item', timestamp: entry.timestamp,
       payload: { type: 'message', role: 'user', content: [{ type: 'input_text',
-        text: '# AGENTS.md instructions for /Users/fedor\n\n<INSTRUCTIONS>project rules</INSTRUCTIONS>' }] } };
+        text: '# AGENTS.md instructions for /Users/example\n\n<INSTRUCTIONS>project rules</INSTRUCTIONS>' }] } };
     const user = { type: 'event_msg', timestamp: entry.timestamp,
       payload: { type: 'user_message', message: entry.content, local_images: paths } };
     await fs.promises.writeFile(filePath, [service, user].map(x => JSON.stringify(x)).join('\n') + '\n');

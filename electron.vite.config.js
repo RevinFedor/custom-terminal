@@ -5,13 +5,13 @@ import tailwindcss from '@tailwindcss/vite';
 import { codeInspectorPlugin } from 'code-inspector-plugin';
 import { resolve } from 'path';
 import { config } from 'dotenv';
-import { assertNotedShared } from '../noted-shared/build/assert-packages.mjs';
-import { buildWorkflowNativeDrag } from './build/workflow-native-drag.mjs';
+import { assertNotedShared } from './vendor/noted-shared/build/assert-packages.mjs';
+import { buildWorkflowNativeDrag } from './scripts/build-workflow-native-drag.mjs';
 import { historyVirtuosoMeasurementVitePlugin } from './scripts/lib/history-virtuoso-measurement.mjs';
 
 // Load .env so renderer can access env vars at build time
 const env = config({ path: resolve(__dirname, '.env') }).parsed || {};
-const SHARED_ROOT = resolve(__dirname, '../noted-shared');
+const SHARED_ROOT = resolve(__dirname, 'vendor/noted-shared');
 // Browser-reachable shared contracts may use CJS for the main process too.
 // Renderer bundles these files; packaged main loads them through its existing
 // `srcSharedDir` runtime path because static local require paths are preserved
@@ -115,7 +115,7 @@ renderer: {
       tailwindcss(),
     ],
     define: {
-      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY || ''),
+      'process.env.GEMINI_API_KEY': JSON.stringify(''),
     },
     resolve: {
       alias: [

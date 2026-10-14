@@ -1,12 +1,12 @@
 {
   "name": "noted-terminal",
   "version": "1.0.0",
-  "description": "Terminal with tabs and notes",
+  "description": "macOS workspace for persistent Claude Code and Codex sessions, history and agent collaboration",
   "main": "dist/main/main.js",
   "scripts": {
     "dev": "NOTED_WEB_PORT=7979 electron-vite dev",
     "dev:d": "cd design-lab && npm run dev",
-    "build": "NODE_GYP_FORCE_PYTHON=/Users/fedor/.node-gyp-py/bin/python CSC_IDENTITY_AUTO_DISCOVERY=false electron-vite build && NODE_GYP_FORCE_PYTHON=/Users/fedor/.node-gyp-py/bin/python CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder && node scripts/validate-app-asar.mjs \"release/mac-arm64/Noted Terminal.app/Contents/Resources/app.asar\" && npm run sign:local-fast",
+    "build": "npm run build:app",
     "build:install": "node scripts/build-install-noted-terminal.mjs",
     "sign:local-fast": "bash scripts/codesign/sign-local-fast.sh \"release/mac-arm64/Noted Terminal.app\" com.noted.terminal",
     "build:mobile": "cd mobile-web && npm run build && echo '[build:mobile] mobile-web/dist rebuilt'",
@@ -17,10 +17,14 @@
     "build:i": "npm run build:install",
     "build:i-obs": "node scripts/build-when-idle.js",
     "build:i-cont": "node scripts/build-and-continue.js",
-    "build:markdown": "cd ../gt-editor/packages/markdown-editor && npm run build && rsync -a --delete dist/ ../../../custom-terminal/node_modules/@gt-editor/markdown-editor/dist/ && rm -rf ../../../custom-terminal/node_modules/.vite && echo '[build:markdown] gt-editor → custom-terminal node_modules synced, vite cache cleared'",
-    "_rebuild": "NODE_GYP_FORCE_PYTHON=/Users/fedor/.node-gyp-py/bin/python node scripts/node-pty-build.mjs",
+    "_rebuild": "node scripts/node-pty-build.mjs",
     "_test:e2e": "cd runtime-tests && npx playwright test",
-    "_test:e2e:headed": "cd runtime-tests && npx playwright test --headed"
+    "_test:e2e:headed": "cd runtime-tests && npx playwright test --headed",
+    "build:renderer": "npm run build:markdown && electron-vite build",
+    "build:app": "node scripts/build-public-app.mjs",
+    "rebuild:native": "node scripts/setup-native.mjs",
+    "build:markdown": "npm run build --workspace @gt-editor/markdown-editor",
+    "test:setup": "node --test scripts/public-setup.test.mjs scripts/node-pty-build.test.mjs scripts/install-terminal-mcp.test.mjs scripts/install-claude-turn-hook.test.mjs scripts/runtime-api-key.test.mjs"
   },
   "build": {
     "appId": "com.noted.terminal",
@@ -51,7 +55,7 @@
     ],
     "extraResources": [
       {
-        "from": "../noted-shared/packages/file-explorer/main",
+        "from": "vendor/noted-shared/packages/file-explorer/main",
         "to": "shared-packages/file-explorer"
       }
     ],
@@ -70,7 +74,7 @@
     "@atlaskit/pragmatic-drag-and-drop-hitbox": "^1.1.0",
     "@babel/parser": "7.29.3",
     "@google/genai": "^1.38.0",
-    "@gt-editor/markdown-editor": "^0.1.1",
+    "@gt-editor/markdown-editor": "file:vendor/markdown-editor",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@radix-ui/react-dialog": "^1.1.15",
     "@tailwindcss/typography": "^0.5.19",
@@ -118,5 +122,16 @@
     "playwright": "^1.57.0",
     "tailwindcss": "^4.1.18",
     "vite": "^7.3.1"
-  }
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0 <23"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RevinFedor/custom-terminal.git"
+  },
+  "workspaces": [
+    "vendor/markdown-editor"
+  ]
 }

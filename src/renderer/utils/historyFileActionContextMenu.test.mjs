@@ -4,8 +4,8 @@ import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { historyFileActionMenuPayload, dispatchHistoryFileActionContextMenu } from './historyFileActionContextMenu.mjs';
 
-const cwd = '/Users/fedor/Desktop/custom-terminal';
-const environment = { path, pathToFileURL, homeDir: '/Users/fedor' };
+const cwd = '/Users/example/Desktop/custom-terminal';
+const environment = { path, pathToFileURL, homeDir: '/Users/example' };
 const target = action => {
   const payload = historyFileActionMenuPayload(action, cwd, environment);
   return payload ? fileURLToPath(payload.href) : null;
@@ -43,7 +43,7 @@ test('shell Read and Git reuse the existing grammar and their explicit workdir',
   } }), cwd + '/docs/tmp/хранилище-и-очистка-диска.md');
   assert.equal(target({ toolName: 'Bash', family: 'read', args: {
     command: 'cat docs/a.md', workdir: '~/other-owner',
-  } }), '/Users/fedor/other-owner/docs/a.md');
+  } }), '/Users/example/other-owner/docs/a.md');
 });
 
 test('literal shell mutation keeps its existing Edit target', () => {

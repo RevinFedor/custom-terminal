@@ -11,7 +11,7 @@ const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const ownerSource = main.slice(main.indexOf('async function handleClaudeTrustFolderPrompt('),
   main.indexOf('function clearClaudeConfirmDialogCooldown('));
 const header = [
-  'Accessing workspace:', '/Users/fedor/Desktop/voice-record', '',
+  'Accessing workspace:', '/Users/example/Desktop/voice-record', '',
   'Quick safety check: Is this a project you created or one',
   'you trust? (Like your own code, a well-known open source',
   "Claude Code'll be able to read, edit, and execute files", 'here.',

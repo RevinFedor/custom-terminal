@@ -10,7 +10,7 @@ const shim=`window.require=()=>({ipcRenderer:{invoke:async(...args)=>{throw Erro
 try {
   await build({entryPoints:[path.join(repo,'scripts/fixtures/workflow-reserve-dnd.tsx')],outfile:path.join(artifact,'bundle.js'),bundle:true,
     platform:'browser',format:'iife',target:'chrome120',jsx:'automatic',logLevel:'silent',define:{'process.env.NODE_ENV':'"production"'},
-    alias:{'@noted/structured-dnd':path.resolve(repo,'../noted-shared/packages/structured-dnd/src'),react:path.join(repo,'node_modules/react'),
+    alias:{'@noted/structured-dnd':path.resolve(repo,'vendor/noted-shared/packages/structured-dnd/src'),react:path.join(repo,'node_modules/react'),
       'react-dom':path.join(repo,'node_modules/react-dom')},
     plugins:[{name:'explicit-component-boundaries',setup(b){
       b.onResolve({filter:/\/(useWorkspaceStore|useUIStore)$/},()=>({path:path.join(repo,'scripts/fixtures/workflow-reserve-dnd-store.ts')}));

@@ -131,7 +131,7 @@ test('warm workflow switch performs no synchronous sidebar geometry read', () =>
 
   const sharedDndPath = path.resolve(
     here,
-    '../../../../noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js',
+    '../../../vendor/noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js',
   );
   const sharedDnd = fs.readFileSync(sharedDndPath, 'utf8');
   const effectStart = sharedDnd.indexOf('const renderedRows = rows.map');

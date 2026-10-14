@@ -59,55 +59,27 @@ function resolveNodeExecutable(env = process.env) {
 
 // Same six servers as ~/.claude.json / ~/.codex/config.toml. `stateful` marks
 // servers that receive client-closed notifications for per-tab cleanup.
-function defaultServerDefs() {
-  return {
-    knowledge: {
-      command: 'node',
-      args: [path.join(HOME, '.claude/mcp/knowledge-server.mjs')],
-      env: {
-        KNOWLEDGE_DISABLE_GEMINI: 'true',
-        KNOWLEDGE_DISABLE_CLAUDE_P: 'true',
-        KNOWLEDGE_ROUTER_PROVIDER: 'codex',
-        KNOWLEDGE_CODEX_MODEL: 'gpt-5.6-luna',
-        KNOWLEDGE_CODEX_EFFORT: 'low',
-        KNOWLEDGE_INDEX_PROVIDER: 'codex',
-      },
-      stateful: false,
-    },
-    terminal: {
-      command: 'node',
-      args: [path.join(HOME, '.claude/mcp/terminal-server.mjs')],
-      env: {},
-      stateful: false, // identity is per-call via _meta, no per-tab resources held
-    },
-    browser: {
-      command: 'node',
-      args: ['/Users/fedor/Desktop/sc-desktop/mcp/browser/index.js'],
-      env: {},
-      stateful: false, // multi-client safe by design (shared bridge.js)
-    },
-    electron: {
-      command: 'node',
-      args: ['/Users/fedor/Desktop/electron-mcp/src/index.mjs'],
-      env: {},
-      stateful: true, // per-tab CDP connections
-    },
-    ios: {
-      command: 'node',
-      args: ['/Users/fedor/Desktop/ios-mcp/src/index.mjs'],
-      env: {},
-      stateful: true, // per-tab simulator/appium sessions
-    },
-    'sc-desktop': {
-      command: '/Users/fedor/Desktop/sc-desktop/mcp/run.sh',
-      args: [],
-      env: {},
-      stateful: false,
-      // run.sh execs Electron with server.js — the orphan on ps shows server.js,
-      // not run.sh, so the reaper needs the real marker.
-      reapMarker: '/Users/fedor/Desktop/sc-desktop/mcp/server.js',
-    },
+function defaultServerDefs(source = process.env) {
+  const definitions = {};
+  const nodeServer = (name, file, stateful = false, env = {}) => {
+    if (file && fs.existsSync(file)) definitions[name] = { command: 'node', args: [file], env, stateful };
   };
+  // Terminal's installer lives in this repository. Other adapters are optional
+  // independent packages; never assume the maintainer's filesystem on a new Mac.
+  nodeServer('terminal', source.NOTED_TERMINAL_MCP_PATH || path.join(HOME, '.claude/mcp/terminal-server.mjs'));
+  nodeServer('knowledge', source.NOTED_KNOWLEDGE_MCP_PATH || path.join(HOME, '.claude/mcp/knowledge-server.mjs'), false, {
+    KNOWLEDGE_DISABLE_GEMINI: 'true', KNOWLEDGE_DISABLE_CLAUDE_P: 'true',
+    KNOWLEDGE_ROUTER_PROVIDER: 'codex', KNOWLEDGE_CODEX_MODEL: source.KNOWLEDGE_CODEX_MODEL || 'gpt-5.6-luna',
+    KNOWLEDGE_CODEX_EFFORT: 'low', KNOWLEDGE_INDEX_PROVIDER: 'codex',
+  });
+  nodeServer('browser', source.NOTED_BROWSER_MCP_PATH);
+  nodeServer('electron', source.NOTED_ELECTRON_MCP_PATH, true);
+  nodeServer('ios', source.NOTED_IOS_MCP_PATH, true);
+  if (source.NOTED_SC_DESKTOP_MCP_COMMAND && fs.existsSync(source.NOTED_SC_DESKTOP_MCP_COMMAND)) {
+    definitions['sc-desktop'] = { command: source.NOTED_SC_DESKTOP_MCP_COMMAND, args: [], env: {}, stateful: false,
+      ...(source.NOTED_SC_DESKTOP_MCP_REAP_MARKER ? { reapMarker: source.NOTED_SC_DESKTOP_MCP_REAP_MARKER } : {}) };
+  }
+  return definitions;
 }
 
 const HANDSHAKE = {

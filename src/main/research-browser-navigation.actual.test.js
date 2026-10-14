@@ -33,7 +33,7 @@ test('actual SC metadata SQL reads URL without materializing result, prompt or a
   db.exec('CREATE TABLE research_jobs(job_id TEXT,provider TEXT,url TEXT,result_json TEXT,prompt TEXT)');
   db.prepare('INSERT INTO research_jobs VALUES(?,?,?,?,?)').run('job', 'chatgpt', 'https://chatgpt.com/c/one', 'invalid '.repeat(262144), 'secret prompt');
   const ctx = vm.createContext({ getDb: () => db });
-  vm.runInContext(declaration('/Users/fedor/Desktop/sc-desktop/electron/database.js', 'getResearchBrowserLink'), ctx);
+  vm.runInContext(declaration('/Users/example/Desktop/sc-desktop/electron/database.js', 'getResearchBrowserLink'), ctx);
   const row = ctx.getResearchBrowserLink('job');
   assert.deepEqual(Object.keys(row).sort(), ['jobId', 'provider', 'url']);
   assert.equal(row.jobId, 'job'); assert.equal(ctx.getResearchBrowserLink('missing'), null);

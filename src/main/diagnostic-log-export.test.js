@@ -20,12 +20,12 @@ test('parseLogTimestamp reads the logger UTC format', () => {
 test('sanitizer keeps diagnostic identity while removing secrets and message fields', () => {
   const sanitizer = createDiagnosticSanitizer({ includeMessageText: false });
   const line = sanitizer.sanitizeLine(
-    'tabId=tab-42 sessionId=019f-test cwd=/Users/fedor/project preview=user@t1:"hello world" | user@t2:"second private message"',
+    'tabId=tab-42 sessionId=019f-test cwd=/Users/example/project preview=user@t1:"hello world" | user@t2:"second private message"',
   );
 
   assert.match(line, /tabId=tab-42/);
   assert.match(line, /sessionId=019f-test/);
-  assert.match(line, /cwd=\/Users\/fedor\/project/);
+  assert.match(line, /cwd=\/Users\/example\/project/);
   assert.doesNotMatch(line, /hello world|second private message/);
   assert.match(line, /preview=<redacted-message-text>/);
 });

@@ -1,64 +1,45 @@
-# Dependencies
 node_modules/
-
-# Build output
 dist/
 release/
 *.app
 *.dmg
 *.pkg
-/main-*.js
-
-# Logs
-logs/
+*.db
+*.db-*
+*.sqlite*
 *.log
-npm-debug.log*
-app.log
-
-# OS
+.env
+.env.*
+!.env.example
 .DS_Store
-Thumbs.db
-
-# IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
+logs/
+coverage/
+test-results/
+evidence/
+docs/tmp/
+tmp/
+.claude/
+.codex/
+.mcp.json
+.gemini/
+.gemini-clipboard/
+.gt-assets/
+/private/
+/main-*.js
+/App-*.js
 
-# Environment
-.env
-.env.local
-
-# Electron
-out/
-build/
-
-# Icon generation
-build-resources/icon.iconset/
-build-resources/.DS_Store
-
-# Native modules
-prebuilds/
-/src/pty-proxy
-
-# Packages (leaked source code, forks)
-/packages/*
-!/packages/structured-dnd/
-!/packages/structured-dnd/**
-!/packages/file-explorer/
-!/packages/file-explorer/**
-!/packages/claude-blocks/
-!/packages/claude-blocks/**
-
-# Private infra (VPS IP, root SSH, tunnel topology)
-docs/knowledge/fact-remote-access.md
-
-# Database
-*.db
-
-# Test sandbox
-auto/sandbox/
-
-# Video analysis scripts (contain API keys)
-scripts/video/
+# Local research and captured artifacts remain on disk, outside source history.
+/docs/meta/
+/undefined/
+/assets/hero.png
+/assets/mobile-main-ios-app-terminal.png
+/build-resources/assets/hero.png
+/src/main/fixtures/codex-ios-native-image-20260916.json
+/src/main/fixtures/inbox-png-path-audit-20260909.json
+/src/main/fixtures/structured-authoring-37de-confirmed.json
+/packages/claude-code-src/
+/packages/claw-code/
+/packages/openclaw/
+/packages/codex/

@@ -22,7 +22,7 @@ try {
   await fs.copyFile(path.join(repo, 'scripts/fixtures/run-after-hover-pin.tsx'), path.join(snapshot, 'scripts/fixtures/run-after-hover-pin.tsx'));
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
   const shared = path.join(artifact, 'noted-shared/packages');
-  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name),
+  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, name),
     { recursive: true, filter: p => !p.includes('/node_modules') });
   await build({ sourcemap: true, entryPoints: [path.join(snapshot, 'scripts/fixtures/run-after-hover-pin.tsx')], bundle: true,
     outfile: path.join(artifact, 'bundle.js'), platform: 'browser', format: 'iife', target: 'chrome120', jsx: 'automatic', logLevel: 'silent',

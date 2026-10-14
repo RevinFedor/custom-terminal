@@ -1,3 +1,4 @@
+import { getGeminiApiKey } from '../../utils/geminiApiKey.mjs';
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Sparkles, ChevronRight, X, Check, Pencil, Copy } from 'lucide-react';
@@ -197,7 +198,8 @@ export default function EditRangePanel({
     setAbortController(controller);
 
     try {
-      const apiKey = process.env.GEMINI_API_KEY;
+      const apiKey = await getGeminiApiKey();
+      if (controller.signal.aborted) return;
 
       // Build conversation history for API
       const contents = submission.contents;

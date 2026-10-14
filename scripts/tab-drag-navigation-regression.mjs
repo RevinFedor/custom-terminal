@@ -9,7 +9,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('..', import.meta.url));
-const shared = path.resolve(root, '../noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js');
+const shared = path.resolve(root, 'vendor/noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js');
 const arg = process.argv.indexOf('--baseline-dir');
 const baseline = arg >= 0 ? process.argv[arg + 1] : null;
 const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-dnd-navigation-'));

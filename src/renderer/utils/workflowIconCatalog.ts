@@ -25,7 +25,7 @@ const pngDataUrl = (base64: string) => `data:image/png;base64,${base64.trim()}`;
 export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [
   {
     key: 'noted-terminal',
-    projectPaths: ['/Users/fedor/Desktop/custom-terminal'],
+    projectPaths: [],
     projectNames: ['custom-terminal'],
     workflowNames: ['main'],
     canonicalWorkflowName: 'main',
@@ -34,7 +34,7 @@ export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [
   },
   {
     key: 'gt-editor',
-    projectPaths: ['/Users/fedor/Desktop/gt-editor'],
+    projectPaths: [],
     projectNames: ['gt-editor'],
     workflowNames: ['gt-editor'],
     canonicalWorkflowName: 'gt-editor',
@@ -44,7 +44,7 @@ export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [
   },
   {
     key: 'agrofield',
-    projectPaths: ['/Users/fedor/Desktop/vs-code/agrotech/uav'],
+    projectPaths: [],
     projectNames: ['agrotech', 'uav'],
     workflowNames: ['uav repo', 'uav-repo', 'uav репо'],
     canonicalWorkflowName: 'uav repo',
@@ -53,7 +53,7 @@ export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [
   },
   {
     key: 'sc-desktop',
-    projectPaths: ['/Users/fedor/Desktop/sc-desktop'],
+    projectPaths: [],
     projectNames: ['sc-desktop'],
     workflowNames: ['sc-desk', 'sc desk', 'sc-test', 'sc test'],
     canonicalWorkflowName: 'sc-desk',
@@ -62,7 +62,7 @@ export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [
   },
   {
     key: 'flow-tab',
-    projectPaths: ['/Users/fedor/Desktop/hh-tool'],
+    projectPaths: [],
     projectNames: ['hh-tool', 'flow-tab'],
     workflowNames: ['flow-tab', 'flow tab'],
     canonicalWorkflowName: 'flow-tab',
@@ -71,7 +71,7 @@ export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [
   },
   {
     key: 'voice-record',
-    projectPaths: ['/Users/fedor/Desktop/voice-record'],
+    projectPaths: [],
     projectNames: ['mac-electron', 'voice-record'],
     workflowNames: ['voice', 'voice-record', 'mac-electron'],
     canonicalWorkflowName: 'mac-electron',
@@ -81,7 +81,7 @@ export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [
   },
   {
     key: 'ios-dev',
-    projectPaths: ['/Users/fedor/Desktop/vs-code/habit-tracker'],
+    projectPaths: [],
     projectNames: ['main-ios-app', 'habit-tracker'],
     workflowNames: ['ios-dev', 'ios dev'],
     canonicalWorkflowName: 'ios-dev',

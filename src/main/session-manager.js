@@ -274,7 +274,7 @@ class SessionManager {
 
   /**
    * Calculate Claude project slug from path
-   * Example: /Users/fedor/Desktop/custom-terminal -> -Users-fedor-Desktop-custom-terminal
+   * Example: /Users/example/Desktop/custom-terminal -> -Users-example-Desktop-custom-terminal
    */
   calculateClaudeSlug(dirPath) {
     const normalizedPath = path.resolve(dirPath);

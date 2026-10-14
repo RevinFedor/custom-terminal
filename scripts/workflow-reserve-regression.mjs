@@ -21,7 +21,7 @@ try {
   await fs.copyFile(path.join(repo,'scripts/workflow-reserve-regression.mjs'),path.join(snapshot,'scripts/workflow-reserve-regression.mjs'));
   await fs.symlink(path.join(repo,'node_modules'),path.join(snapshot,'node_modules'));
   const shared=path.join(artifact,'noted-shared/packages');
-  for(const name of ['structured-dnd','file-explorer']) await fs.cp(path.join(repo,'../noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')});
+  for(const name of ['structured-dnd','file-explorer']) await fs.cp(path.join(repo,'vendor/noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')});
   const compiled=await build({entryPoints:[path.join(snapshot,'scripts/fixtures/workflow-reserve.tsx')],bundle:true,sourcemap:true,metafile:true,
     outfile:path.join(artifact,'bundle.js'),platform:'browser',format:'iife',target:'chrome120',jsx:'automatic',logLevel:'silent',
     define:{'process.env.NODE_ENV':'"production"','import.meta.env':'{"DEV":false,"MODE":"test"}'},

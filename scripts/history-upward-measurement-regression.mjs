@@ -112,7 +112,7 @@ try {
   for (const name of ['scripts/fixtures/history-upward-measurement.tsx', 'scripts/lib/history-virtuoso-measurement.mjs'])
     await fs.copyFile(path.join(source, name), path.join(snapshot, name));
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
-  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name), {
+  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, name), {
     recursive: true, filter: p => !p.includes('/node_modules') && !p.includes('/.git'),
   });
   const adapter = await import(pathToFileURL(path.join(snapshot, 'scripts/lib/history-virtuoso-measurement.mjs')).href);

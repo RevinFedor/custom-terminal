@@ -58,7 +58,7 @@ function shim() {
 const bundle = await build({ entryPoints: [path.join(root, 'scripts/fixtures/history-busy-ordering.tsx')],
   bundle: true, write: false, format: 'iife', platform: 'browser', outfile: path.join(dir, 'renderer.js'),
   alias: { '@noted/claude-blocks': path.join(root, 'packages/claude-blocks/src'),
-    '@noted/structured-dnd': path.resolve(root, '../noted-shared/packages/structured-dnd/src'),
+    '@noted/structured-dnd': path.resolve(root, 'vendor/noted-shared/packages/structured-dnd/src'),
     react: path.join(root, 'node_modules/react'), 'react-dom': path.join(root, 'node_modules/react-dom') },
   loader: { '.png': 'dataurl', '.svg': 'dataurl', '.ttf': 'dataurl', '.woff': 'dataurl', '.woff2': 'dataurl' },
   external: ['../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf'],

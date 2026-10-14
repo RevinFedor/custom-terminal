@@ -483,7 +483,7 @@ test('manual native Rewind identity is invariant to quotes, markup, images and t
     '“the exact latest persisted user prompt”',
     '<pasted_content>the exact latest persisted user prompt</pasted_content>',
     '<image name=[Image #1] path="/tmp/image.png">[Image #1]</image>',
-    '$ sed -n \'1,260p\' /Users/fedor/.codex/skills/electron-e2e-testing/SKILL.md',
+    '$ sed -n \'1,260p\' /Users/example/.codex/skills/electron-e2e-testing/SKILL.md',
     '…the exact latest persisted user…',
   ];
 
@@ -514,7 +514,7 @@ test('production long-cell frame keeps Enter actionable while only tool output i
       { row: 3435, text: '/ T R A N S C R I P T / / / / / /' },
     ],
     lines: [
-      { row: 3457, text: "$ sed -n '1,260p' /Users/fedor/.codex/skills/electron-e2e-" },
+      { row: 3457, text: "$ sed -n '1,260p' /Users/example/.codex/skills/electron-e2e-" },
       { row: 3458, text: 'testing/SKILL.md' },
       { row: 3490, text: '────────────────────────────────────────────── 74% ─' },
       { row: 3491, text: '↑/↓ to scroll pgup/pgdn to page home/end to jump' },

@@ -1,3 +1,4 @@
+import { getGeminiApiKey } from '../../../utils/geminiApiKey.mjs';
 import React, { useState, useEffect, useRef } from 'react';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
@@ -353,7 +354,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       const descModel = descPrompt?.model || 'gemini-3.8-flash';
       const descThinking = descPrompt?.thinkingLevel || 'NONE';
       const fullPrompt = descContent + exportResult.content;
-      const apiKey = process.env.GEMINI_API_KEY;
+      const apiKey = await getGeminiApiKey();
       const requestBody: any = {
         contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
         systemInstruction: { parts: [{ text: '1-2 предложения. Без маркдауна.' }] }

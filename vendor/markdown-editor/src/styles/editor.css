@@ -1,0 +1,1065 @@
+/* ============================================================================
+   MARKDOWN EDITOR — Container Styles
+   ============================================================================ */
+
+.markdown-editor {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.markdown-editor .cm-editor {
+    flex: 1;
+    min-height: 0;
+}
+
+/* Lightweight AI-composer surface. Unlike the old painted textarea overlay,
+   these are real CM replacement widgets: token width and caret geometry are
+   calculated by one editor, so an interactive chip cannot drift from text. */
+.gt-composer-editor {
+  position: relative;
+  width: 100%;
+  box-sizing: border-box;
+  color: inherit;
+  font-family: inherit;
+}
+
+.cm-composer-token {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  min-height: 22px;
+  padding: 0 7px;
+  border-radius: 5px;
+  /* Inline-flex otherwise derives its baseline from the first child.  An
+     image token starts with a baseline-less thumbnail while paste/error
+     tokens start with text, so equal-sized chips land on different rows.
+     Align the shared box by its own midpoint instead of its contents.
+
+     CSS `middle` targets baseline + half x-height, while CodeMirror paints
+     its caret around the authored text box.  In the composer font metrics
+     those centers differ by 0.11em: the chip sits visibly lower as soon as
+     whitespace separates its border from the caret.  Raise the whole shared
+     box after midpoint alignment so image/paste/error stay identical while
+     their center matches ordinary text and the caret. */
+  vertical-align: middle;
+  transform: translateY(-0.11em);
+  box-sizing: border-box;
+  font-size: 0.9em;
+  line-height: 1;
+  user-select: none;
+  cursor: pointer;
+}
+
+.cm-composer-token--image {
+  color: #b4a0fa;
+  border: 1px solid rgba(180, 160, 250, 0.40);
+  background: rgba(180, 160, 250, 0.15);
+}
+
+.cm-composer-token--paste {
+  color: #c7d2fe;
+  border: 1px solid rgba(129, 140, 248, 0.38);
+  background: rgba(129, 140, 248, 0.16);
+}
+
+.cm-composer-token.cm-composer-token--selected {
+  color: #f4f7ff;
+  border-color: rgba(147, 197, 253, 0.82);
+  background: rgba(96, 165, 250, 0.36);
+  box-shadow: inset 0 0 0 1px rgba(219, 234, 254, 0.12);
+}
+
+.cm-composer-token-arrow {
+  opacity: 0.82;
+  line-height: 1;
+}
+
+.cm-composer-token-thumbnail {
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 20px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: rgba(180, 160, 250, 0.12);
+}
+
+.cm-composer-token-thumbnail img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  pointer-events: none;
+  user-select: none;
+}
+
+.cm-composer-token-thumbnail-fallback {
+  width: 16px;
+  height: 16px;
+  color: currentColor;
+}
+
+.cm-composer-token-thumbnail-fallback svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.cm-composer-token-label {
+  white-space: nowrap;
+}
+
+.cm-composer-token-source {
+  opacity: 0.62;
+}
+
+.cm-composer-token-source--error {
+  color: #f59e0b;
+  opacity: 1;
+}
+
+.cm-composer-token-source--pending {
+  color: #a3a3a3;
+  opacity: 1;
+}
+
+/* Hide horizontal scroll - word wrap handles long lines */
+.markdown-editor .cm-scroller {
+    overflow-x: hidden !important;
+}
+
+/* ============================================================================
+   MANUAL LAYER SELECTION — Custom Implementation
+   ============================================================================ */
+
+/* 1. Hide Native Selection Globally */
+.cm-selectionBackground {
+    display: none !important;
+}
+
+/* ComposerEditor uses CM's native geometry and does not install the full
+   MarkdownEditor's custom-selection plugin.  Keeping the global hide here
+   made selection real (copy worked) but completely invisible in History and
+   Run after.  The scoped, more-specific override restores paint only; it does
+   not add padding/borders or intercept pointer events. */
+.gt-composer-editor .cm-selectionBackground {
+    display: block !important;
+}
+
+/* 2. Custom Layer Container */
+.cm-scroller {
+    position: relative !important;
+}
+
+.cm-custom-selection-layer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    min-width: 100vw; 
+    pointer-events: none;
+    z-index: -2;
+    contain: size layout style;
+}
+
+/* 3. Selection Rectangles */
+.cm-custom-selection-rect {
+    position: absolute;
+    background-color: rgba(137, 180, 250, 0.25);
+    /* No border-radius for full-width lines to look sharp */
+}
+
+/* Optional: Add border-radius only for partial selections if desired
+   But usually, standard selection is sharp rectangles. 
+*/
+
+/* Indent Guides (Unchanged) */
+[class*="cm-indent-L"] {
+    background-repeat: repeat-y !important;
+    background-color: transparent !important;
+}
+
+/* ============================================================================
+   GT MARKDOWN COLOR TOKENS — единый источник истины
+   ----------------------------------------------------------------------------
+   Все цвета подсветки markdown определены здесь как CSS-переменные с
+   дефолтами. theme.ts, CollapsibleArrowWidget.ts и палитра команд
+   (contextMenu.ts) читают именно эти переменные — больше нигде цвет не
+   хардкодится. Приложение-хост (GT Editor) переопределяет их на :root через
+   element.style.setProperty(...) из настроек — браузер перекрашивает на месте,
+   без пересоздания EditorView. Хост, который их не выставляет, получает эти
+   дефолты (полная обратная совместимость для других приложений на пакете).
+   ============================================================================ */
+:root {
+    --gt-md-bg: #1e1e2e;            /* фон редактора */
+    --gt-md-fg: #f0efed;            /* основной текст (Notion-white, лучше читается на цветных фонах строк) */
+    --gt-md-bold: #ffa348;         /* **жирный** */
+    --gt-md-italic: #69dbdb;       /* *курсив* */
+    --gt-md-code: #50fa7b;         /* `код` (текст) */
+    --gt-md-strike: #868e96;       /* ~~зачёркнутый~~ */
+    --gt-md-link: #89b4fa;         /* [ссылки](...) */
+    --gt-md-markup: #6c7086;       /* символы разметки (**, ##, --) */
+    --gt-md-hr: #6c6f85;           /* горизонтальная линия (---, ///, \\\) */
+    --gt-md-list: #f9e2af;         /* маркеры списков */
+    --gt-md-collapsible: #f0efed;  /* заголовок сворачиваемого блока (>>) — белый как обычный текст/список; формат-токены перебивают по specificity */
+    --gt-md-h1: #c678dd;
+    --gt-md-h2: #b197fc;
+    --gt-md-h3: #a78bfa;
+    --gt-md-h4: #9775fa;
+    --gt-md-h5: #8b5cf6;
+    --gt-md-h6: #7c3aed;
+    --gt-md-tag-logs: #f5a3bb;        /* заголовок [logs] */
+    --gt-md-tag-links: #74c7ec;       /* заголовок [links] */
+    --gt-md-tag-deprecated: #fab387;  /* заголовок [deprecated] */
+    --gt-md-tag-status: #e06070;      /* заголовок [status] */
+    --gt-md-selection: #89b4fa;       /* фон выделения (база, alpha добавляется в theme) */
+
+    /* Индент-линии наследуют цвета формата (50% alpha через color-mix) —
+       один источник: меняешь --gt-md-bold → линия collapsible-блока тоже меняется. */
+    --indent-line-color: rgba(255, 255, 255, 0.15);
+    --indent-line-active-color: rgba(66, 135, 245, 0.4);
+    --color-format-bold: color-mix(in srgb, var(--gt-md-bold) 50%, transparent);
+    --color-format-italic: color-mix(in srgb, var(--gt-md-italic) 50%, transparent);
+    --color-format-code: color-mix(in srgb, var(--gt-md-code) 50%, transparent);
+    --color-format-strike: color-mix(in srgb, var(--gt-md-strike) 50%, transparent);
+    --color-format-h1: color-mix(in srgb, var(--gt-md-h1) 50%, transparent);
+    --color-format-h2: color-mix(in srgb, var(--gt-md-h2) 50%, transparent);
+    --color-format-h3: color-mix(in srgb, var(--gt-md-h3) 50%, transparent);
+    --color-format-h4: color-mix(in srgb, var(--gt-md-h4) 50%, transparent);
+    --color-format-h5: color-mix(in srgb, var(--gt-md-h5) 50%, transparent);
+    --color-format-h6: color-mix(in srgb, var(--gt-md-h6) 50%, transparent);
+}
+
+.cm-indent-L1 { background-image: linear-gradient(to right, var(--indent-line-color-L1, var(--indent-line-color)) 1px, transparent 1px); background-position: 0.8ch 0; }
+.cm-indent-L2 { background-image: linear-gradient(to right, var(--indent-line-color-L1, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L2, var(--indent-line-color)) 1px, transparent 1px); background-position: 0.8ch 0, 4.8ch 0; }
+.cm-indent-L3 { background-image: linear-gradient(to right, var(--indent-line-color-L1, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L2, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L3, var(--indent-line-color)) 1px, transparent 1px); background-position: 0.8ch 0, 4.8ch 0, 8.8ch 0; }
+.cm-indent-L4 { background-image: linear-gradient(to right, var(--indent-line-color-L1, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L2, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L3, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L4, var(--indent-line-color)) 1px, transparent 1px); background-position: 0.8ch 0, 4.8ch 0, 8.8ch 0, 12.8ch 0; }
+.cm-indent-L5 { background-image: linear-gradient(to right, var(--indent-line-color-L1, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L2, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L3, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L4, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L5, var(--indent-line-color)) 1px, transparent 1px); background-position: 0.8ch 0, 4.8ch 0, 8.8ch 0, 12.8ch 0, 16.8ch 0; }
+.cm-indent-L6 { background-image: linear-gradient(to right, var(--indent-line-color-L1, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L2, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L3, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L4, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L5, var(--indent-line-color)) 1px, transparent 1px), linear-gradient(to right, var(--indent-line-color-L6, var(--indent-line-color)) 1px, transparent 1px); background-position: 0.8ch 0, 4.8ch 0, 8.8ch 0, 12.8ch 0, 16.8ch 0, 20.8ch 0; }
+
+.cm-line.cm-collapsible-header, .cm-line.cm-folded-scope { background-color: transparent !important; }
+
+/* ============================================================================
+   Fenced code block (```) — серый слой
+   Серый рисуется как ::before, НЕ как background строки: background-shorthand
+   с !important сбрасывал background-image и этим убивал indent-гайды на всех
+   строках блока (баг «вертикальную черту не видно»), а отдельное правило с
+   background-image дралось бы с .cm-indent-LN за тот же слот. ::before в своём
+   слое: гайды (фон строки) видны слева от --cb-start, серый — правее.
+   z-index:0 на строке создаёт stacking context, чтобы ::before(z:-1) остался
+   под текстом ЭТОЙ строки, а не провалился под фон всего cm-content.
+   ============================================================================ */
+.cm-line.cm-code-block-line { position: relative; z-index: 0; }
+.cm-line.cm-code-block-line::before {
+  content: '';
+  position: absolute;
+  left: var(--cb-start, 0);
+  right: 0;
+  top: 0;
+  bottom: 0;
+  background: rgba(80, 80, 80, 0.25);
+  pointer-events: none;
+  z-index: -1;
+}
+.cm-code-block-start::before { border-top-left-radius: 6px; border-top-right-radius: 6px; }
+.cm-code-block-end::before { border-bottom-left-radius: 6px; border-bottom-right-radius: 6px; }
+/* Старт серого = визуальная колонка fence (cm-cb-sN из markdownSyntax; N в
+   колонках, таб = 4). 6px — padding-left строки (визуальный ноль колонок),
+   −0.5ch — вдох, чтобы ``` не упирались в скруглённый край. s0 — во всю
+   ширину, как было до column-aware рендера. */
+.cm-cb-s0  { --cb-start: 0; }
+.cm-cb-s1  { --cb-start: calc(0.5ch + 6px); }
+.cm-cb-s2  { --cb-start: calc(1.5ch + 6px); }
+.cm-cb-s3  { --cb-start: calc(2.5ch + 6px); }
+.cm-cb-s4  { --cb-start: calc(3.5ch + 6px); }
+.cm-cb-s5  { --cb-start: calc(4.5ch + 6px); }
+.cm-cb-s6  { --cb-start: calc(5.5ch + 6px); }
+.cm-cb-s7  { --cb-start: calc(6.5ch + 6px); }
+.cm-cb-s8  { --cb-start: calc(7.5ch + 6px); }
+.cm-cb-s9  { --cb-start: calc(8.5ch + 6px); }
+.cm-cb-s10 { --cb-start: calc(9.5ch + 6px); }
+.cm-cb-s11 { --cb-start: calc(10.5ch + 6px); }
+.cm-cb-s12 { --cb-start: calc(11.5ch + 6px); }
+.cm-cb-s13 { --cb-start: calc(12.5ch + 6px); }
+.cm-cb-s14 { --cb-start: calc(13.5ch + 6px); }
+.cm-cb-s15 { --cb-start: calc(14.5ch + 6px); }
+.cm-cb-s16 { --cb-start: calc(15.5ch + 6px); }
+.cm-cb-s17 { --cb-start: calc(16.5ch + 6px); }
+.cm-cb-s18 { --cb-start: calc(17.5ch + 6px); }
+.cm-cb-s19 { --cb-start: calc(18.5ch + 6px); }
+.cm-cb-s20 { --cb-start: calc(19.5ch + 6px); }
+.cm-cb-s21 { --cb-start: calc(20.5ch + 6px); }
+.cm-cb-s22 { --cb-start: calc(21.5ch + 6px); }
+.cm-cb-s23 { --cb-start: calc(22.5ch + 6px); }
+.cm-cb-s24 { --cb-start: calc(23.5ch + 6px); }
+
+/* Делаем так, чтобы линии в пустых строках не прерывались */
+.cm-line {
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    padding-left: 6px; /* BASE LINE: This is our visual zero */
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    line-height: 1.5; /* Фиксируем высоту для стыковки */
+}
+
+.cm-content, .cm-scroller { cursor: text !important; }
+.cm-editor.cm-emoji-hover .cm-content { cursor: default !important; }
+/* Cmd/Ctrl is only an affordance modifier for specific interactive ranges.
+   Keep .cm-content text-cursor so Cmd+click multi-cursor/selection stays visually
+   honest over ordinary text. Scoped link/widget rules below opt into pointer. */
+.cmd-held .cm-md-link { cursor: pointer !important; }
+
+/* Tables are a view of unchanged Markdown. Entering a cell reveals its source. */
+.cm-markdown-table-widget {
+    --cm-table-control-half: max(11px, calc(0.8em + 0.4px));
+    box-sizing: border-box;
+    padding: calc(var(--cm-table-control-half) + 5px) 0 6px calc(var(--cm-table-indent, 0) * 1ch + 6px);
+    max-width: 100%;
+    text-indent: 0;
+    white-space: normal;
+    user-select: text;
+    -webkit-user-select: text;
+    outline: none;
+}
+.cm-markdown-table-frame {
+    position: relative;
+    overflow: visible;
+    background: var(--gt-md-bg);
+    border: 1px solid color-mix(in srgb, var(--gt-md-fg) 20%, transparent);
+    border-radius: 5px;
+}
+.cm-markdown-table-edge-controls {
+    position: absolute;
+    left: 8px;
+    top: 0;
+    transform: translateY(-50%);
+    background: var(--gt-md-bg);
+    z-index: 2;
+    padding-inline: 3px;
+    visibility: hidden;
+}
+.cm-markdown-table-widget:focus-within .cm-markdown-table-edge-controls { visibility: visible; }
+.cm-markdown-table-edge-controls .cm-markdown-table-edge-action {
+    min-height: 22px;
+    padding-block: 1px;
+    font-size: calc(1em - 2px);
+}
+.cm-markdown-table-edge-action {
+    min-height: 30px;
+    padding: 2px 7px;
+    background: var(--gt-md-bg);
+    border: 1px solid color-mix(in srgb, var(--gt-md-fg) 20%, transparent);
+    border-radius: 4px;
+    font: inherit;
+    line-height: 1.6;
+    color: inherit;
+    cursor: pointer;
+    user-select: none;
+}
+.cm-markdown-table-edge-action:hover { box-shadow: inset 0 0 0 999px color-mix(in srgb, var(--gt-md-fg) 9%, transparent); }
+.cm-markdown-table-edge-action:focus-visible { outline: 2px solid var(--gt-md-link); outline-offset: 1px; }
+.cm-markdown-table-source-controls {
+    --cm-table-control-half: max(15px, calc(0.8em + 3px));
+    position: relative;
+    height: var(--cm-table-control-half);
+    border-bottom: 1px solid color-mix(in srgb, var(--gt-md-fg) 20%, transparent);
+    background: var(--gt-md-bg);
+    box-sizing: border-box;
+}
+.cm-markdown-table-source-controls .cm-markdown-table-edge-action {
+    position: absolute;
+    top: var(--cm-table-control-half);
+    left: 8px;
+    transform: translateY(-50%);
+    z-index: 2;
+}
+.cm-line.cm-markdown-table-source-line { border-inline: 1px solid color-mix(in srgb, var(--gt-md-fg) 20%, transparent); }
+.cm-line.cm-markdown-table-source-first { padding-top: max(16px, calc(0.8em + 4px)) !important; }
+.cm-line.cm-markdown-table-source-last { padding-bottom: 7px !important; border-bottom: 1px solid color-mix(in srgb, var(--gt-md-fg) 20%, transparent); }
+.cm-markdown-table ::selection {
+    background: color-mix(in srgb, var(--gt-md-selection) 35%, transparent) !important;
+}
+.cm-markdown-table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+    padding-top: var(--cm-table-control-half);
+    border-radius: 5px;
+}
+.cm-markdown-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: auto;
+    color: inherit;
+    font: inherit;
+    line-height: 1.5;
+}
+.cm-markdown-table th,
+.cm-markdown-table td {
+    min-width: 10ch;
+    padding: 8px 10px;
+    border-right: 1px solid color-mix(in srgb, var(--gt-md-fg) 15%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--gt-md-fg) 15%, transparent);
+    vertical-align: top;
+    overflow-wrap: anywhere;
+    cursor: text;
+}
+.cm-markdown-table th {
+    font-weight: 600;
+    background: color-mix(in srgb, var(--gt-md-fg) 7%, transparent);
+}
+.cm-markdown-table tr > :last-child { border-right: 0; }
+.cm-markdown-table tbody tr:last-child > td { border-bottom: 0; }
+.cm-markdown-table:not(:has(tbody)) th { border-bottom: 0; }
+.cm-markdown-table tbody tr:nth-child(even) { background: color-mix(in srgb, var(--gt-md-fg) 2%, transparent); }
+.cm-markdown-table .cm-md-link { cursor: text; }
+.cm-markdown-table-image { max-width: 100%; max-height: 180px; object-fit: contain; }
+/* Collapsible cursor affordance:
+   - .cm-collapsible-header is a structural line-class and spans the whole row.
+     Do NOT put pointer on it: the empty edit zone to the right must stay text.
+   - .cm-collapsible-title-text is a range-decoration over the actual title text
+     from collapsibleArrow.ts, so it survives DOM rebuilds without mousemove JS.
+     Its transparent ::before extends only vertically: the x-range stays title-
+     only, but the line-height gap between two collapsible headers also shows
+     pointer instead of falling back to .cm-content text cursor.
+   - active line (caret on this collapsible header) turns the title back into
+     text cursor; the arrow remains a pointer control. */
+.cm-collapsible-title-text { position: relative; }
+.cm-collapsible-title-text::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -0.45em;
+    bottom: -0.45em;
+    pointer-events: auto;
+    cursor: inherit;
+}
+.cm-collapsible-title-text,
+.cm-collapsible-title-text * { cursor: pointer !important; }
+.cm-collapsible-header:not(.cm-activeLine) .cm-custom-emoji { cursor: pointer !important; }
+.cm-collapsible-header.cm-activeLine .cm-collapsible-title-text,
+.cm-collapsible-header.cm-activeLine .cm-collapsible-title-text * { cursor: text !important; }
+.cm-collapsible-header.cm-activeLine .cm-custom-emoji { cursor: text !important; }
+.cm-collapsible-header.cm-activeLine .cm-collapsible-line-count { cursor: text !important; }
+/* Cmd/Ctrl over a collapsible title is still text/edit selection mode: the
+   title-click handler deliberately yields to CM6 so Cmd+click can place/add
+   cursors while Cmd+hover preview stays available. */
+.cmd-held .cm-collapsible-title-text,
+.cmd-held .cm-collapsible-title-text *,
+.cmd-held .cm-collapsible-header .cm-custom-emoji,
+.cmd-held .cm-collapsible-header .cm-collapsible-line-count { cursor: text !important; }
+/* Стрелка тогглит всегда, даже в режиме редактирования строки → pointer
+   (кроме .empty — у пустой секции нечего тогглить, default). */
+.cm-collapsible-header.cm-activeLine .cm-collapsible-arrow:not(.empty) { cursor: pointer !important; }
+/* Option/Alt inverts the current title mode:
+   - inactive rows: force text-edit mode, no pointer affordance
+   - active row: force title pointer/toggle back on. */
+.option-held .cm-collapsible-title-text,
+.option-held .cm-collapsible-title-text *,
+.option-held .cm-collapsible-header:not(.cm-activeLine) .cm-custom-emoji,
+.option-held .cm-collapsible-header:not(.cm-activeLine) .cm-collapsible-line-count,
+.option-held .cm-collapsible-arrow,
+.option-held .cm-collapsible-header.cm-activeLine .cm-collapsible-arrow:not(.empty) { cursor: text !important; }
+.option-held .cm-collapsible-header.cm-activeLine .cm-collapsible-title-text,
+.option-held .cm-collapsible-header.cm-activeLine .cm-collapsible-title-text *,
+.option-held .cm-collapsible-header.cm-activeLine .cm-custom-emoji,
+.option-held .cm-collapsible-header.cm-activeLine .cm-collapsible-line-count,
+.option-held .cm-collapsible-header.cm-activeLine .cm-collapsible-arrow:not(.empty) { cursor: pointer !important; }
+
+.cm-hr-text-hidden { color: transparent; font-size: 0; }
+.cm-hr-line { position: relative; }
+.cm-hr-line:not(.cm-activeLine)::after { content: ''; display: block; position: absolute; left: 0; right: 0; top: 50%; height: 1px; background-color: var(--gt-md-hr); }
+/* HR с отступом: линия начинается с позиции отступа (4ch = 1 tab) */
+.cm-hr-line.cm-indent-L1:not(.cm-activeLine)::after { left: 4ch; }
+.cm-hr-line.cm-indent-L2:not(.cm-activeLine)::after { left: 8ch; }
+.cm-hr-line.cm-indent-L3:not(.cm-activeLine)::after { left: 12ch; }
+.cm-hr-line.cm-indent-L4:not(.cm-activeLine)::after { left: 16ch; }
+.cm-hr-line.cm-indent-L5:not(.cm-activeLine)::after { left: 20ch; }
+.cm-hr-line.cm-indent-L6:not(.cm-activeLine)::after { left: 24ch; }
+
+/* Context menu — compact, matches the Cmd+/ command palette aesthetic.
+   No justify-content:space-between bloat; tight paddings; left color bar /
+   swatch like the palette. */
+.cm-context-menu { position: fixed; z-index: 99999; min-width: 150px; background: #1e1e1e; border: 1px solid #3c3c3c; border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 13px; color: #cccccc; }
+.cm-context-menu-item { padding: 5px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; position: relative; user-select: none; white-space: nowrap; }
+.cm-context-menu-item:hover { background: #094771; color: #ffffff; }
+.cm-context-menu-item.has-submenu { padding-right: 24px; }
+.cm-context-menu-item .submenu-arrow { position: absolute; right: 7px; top: 50%; transform: translateY(-50%); opacity: 0.55; display: inline-flex; align-items: center; }
+.cm-context-menu-item .submenu-arrow svg { display: block; }
+.cm-context-menu-item:hover .submenu-arrow { opacity: 1; }
+.cm-context-menu-divider { height: 1px; background: #3c3c3c; margin: 4px 0; }
+
+/* Leading indicators inside an item */
+.cm-context-menu-item .cm-menu-color { width: 4px; height: 16px; border-radius: 2px; flex-shrink: 0; }
+.cm-context-menu-item .cm-menu-swatch { width: 15px; height: 15px; border-radius: 4px; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.35); box-shadow: 0 0 0 1px rgba(0,0,0,0.3) inset; }
+.cm-context-menu-item .cm-menu-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.cm-context-menu-item .cm-menu-check { margin-left: auto; font-size: 11px; opacity: 0.9; flex-shrink: 0; }
+
+.cm-context-submenu { position: absolute; left: 100%; top: -5px; min-width: 150px; background: #1e1e1e; border: 1px solid #3c3c3c; border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); padding: 4px 0; display: none; }
+.cm-context-menu-item.has-submenu:hover > .cm-context-submenu { display: block; }
+.cm-context-submenu .cm-context-menu-item { padding: 5px 12px; }
+
+/* Per-line custom background (Background menu). The color comes from an
+   injected <style id="cm-line-bg-styles"> rule (.cm-line-bg-<id>) — NOT an
+   inline style — so it survives CM6 line-decoration merging with cm-indent-L*.
+   This base rule only adds the corner rounding. */
+.cm-line.cm-line-bg { border-radius: 2px; }
+
+/* ============================================================================
+   COMMAND PALETTE — Cmd+/
+   ============================================================================ */
+
+.cm-command-palette { position: fixed; z-index: 99999; min-width: 180px; background: #1e1e1e; border: 1px solid #3c3c3c; border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 13px; color: #cccccc; }
+.cm-command-palette-item { padding: 6px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; user-select: none; white-space: nowrap; }
+.cm-command-palette-item.active { background: #094771; color: #ffffff; }
+/* Hover only "arms" after the mouse moves inside the palette — prevents the
+   item under a stationary cursor from hijacking the active highlight when the
+   palette opens via Cmd+/. Class set by JS on first mousemove. */
+.cm-command-palette.mouse-armed .cm-command-palette-item:not(.split):hover { background: #094771; color: #ffffff; }
+.cm-command-palette-item .palette-color { width: 4px; height: 16px; border-radius: 2px; flex-shrink: 0; }
+
+/* Split palette row: two independently highlightable halves */
+.cm-command-palette-item.split { padding: 0; gap: 0; }
+.cm-command-palette-item.split .palette-color { margin: 6px 8px 6px 12px; }
+.cm-command-palette-item.split .palette-half {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 6px 1px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cm-command-palette-item.split .palette-half-left { padding-left: 0; padding-right: 1px; }
+.cm-command-palette-item.split .palette-half-right {
+  padding-left: 5px;
+  padding-right: 12px;
+  border-left: 1px solid #3c3c3c;
+  margin-left: 1px;
+  color: #aaa;
+}
+.cm-command-palette-item.split .palette-half.active { background: #094771; color: #ffffff; }
+.cm-command-palette.mouse-armed .cm-command-palette-item.split .palette-half:hover { background: #094771; color: #ffffff; }
+.cm-command-palette-preview { padding: 4px 12px 4px; font-size: 11px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid #3c3c3c; margin-bottom: 2px; }
+/* Header при мульти-курсоре — «Выделено: N строк». Чуть ярче превью, тот же бордюр. */
+.cm-command-palette-header { padding: 5px 12px; font-size: 11px; font-weight: 600; color: #bbb; white-space: nowrap; border-bottom: 1px solid #3c3c3c; margin-bottom: 2px; }
+
+/* @-trigger palette — opens when user types `@` in plain text */
+.cm-at-palette {
+  position: fixed;
+  z-index: 99999;
+  min-width: 240px;
+  background: #1e1e1e;
+  border: 1px solid #3c3c3c;
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  padding: 4px 0;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 13px;
+  color: #cccccc;
+}
+.cm-at-palette-items { display: flex; flex-direction: column; }
+.cm-at-palette-item {
+  padding: 6px 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+  white-space: nowrap;
+}
+.cm-at-palette-item.active { background: #094771; color: #ffffff; }
+.cm-at-palette-item:hover { background: #2a2a2a; }
+.cm-at-palette-item.active:hover { background: #094771; }
+.cm-at-palette-color {
+  width: 4px;
+  height: 16px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+.cm-at-palette-label { flex-shrink: 0; }
+.cm-at-palette-hint {
+  margin-left: auto;
+  font-size: 11px;
+  color: #888;
+  font-style: italic;
+}
+.cm-at-palette-item.active .cm-at-palette-hint { color: #c5d6e0; }
+
+/* Emoji tooltip (Cmd+hover in context menu & in-editor) */
+.cm-emoji-tooltip { position: fixed; z-index: 100000; max-width: 220px; padding: 6px 10px; background: #2d2d2d; border: 1px solid #555; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 12px; color: #bbb; pointer-events: none; white-space: pre-wrap; line-height: 1.4; }
+
+/* Collapsible Cmd+hover preview — body of a folded ^^ section.
+   Background matches editor (#1e1e2e). Distinct border to separate from
+   the surrounding text. No scroll: max-width keeps long lines wrapped,
+   max-height in vh prevents super-long bodies from covering the whole
+   screen but still avoids inner scrollbars for the common case. */
+/* scrollbar-gutter: stable reserves the scrollbar track width upfront, so
+   toggling overflow from hidden (unpinned) to auto (pinned) does NOT change
+   the popover's inner width — no text-reflow jitter on Cmd+Shift pin. */
+.cm-collapsible-preview { position: fixed; z-index: 100000; max-width: min(720px, 80vw); max-height: 70vh; padding: 8px 12px; background: #1e1e2e; border: 1px solid #585b70; border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); font-family: Menlo, Monaco, 'Courier New', monospace; font-size: 13px; color: #cdd6f4; pointer-events: none; line-height: 1.5; overflow: hidden; scrollbar-gutter: stable; }
+/* Each logical line is its own <div>. Wrapped visual rows inherit padding-left,
+   producing the hanging-indent effect that single pre-wrap textContent lacks. */
+.cm-collapsible-preview-line { white-space: pre-wrap; min-height: 1em; }
+.cm-collapsible-preview.pinned { border: 1px solid #ffffff; pointer-events: auto; user-select: text; overflow-y: auto; }
+/* Custom scrollbar styling — match editor's dark theme so it doesn't clash. */
+.cm-collapsible-preview.pinned::-webkit-scrollbar { width: 10px; }
+.cm-collapsible-preview.pinned::-webkit-scrollbar-track { background: transparent; }
+.cm-collapsible-preview.pinned::-webkit-scrollbar-thumb { background: #45475a; border-radius: 5px; border: 2px solid #1e1e2e; }
+.cm-collapsible-preview.pinned::-webkit-scrollbar-thumb:hover { background: #585b70; }
+
+/* AI Paste waiting indicator */
+.cm-ai-paste-indicator { position: fixed; z-index: 99999; display: flex; align-items: center; gap: 6px; padding: 4px 10px; background: #1e1e1e; border: 1px solid #4ecdc4; border-radius: 12px; box-shadow: 0 2px 12px rgba(78, 205, 196, 0.25); font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 12px; color: #cccccc; user-select: none; animation: cm-ai-paste-pulse 2s ease-in-out infinite; }
+.cm-ai-paste-badge { pointer-events: none; }
+.cm-ai-paste-cancel { cursor: pointer; color: #888; font-size: 14px; line-height: 1; padding: 0 2px; border-radius: 3px; transition: color 0.15s, background 0.15s; }
+.cm-ai-paste-cancel:hover { color: #ff6b6b; background: rgba(255, 107, 107, 0.15); }
+@keyframes cm-ai-paste-pulse { 0%, 100% { border-color: #4ecdc4; box-shadow: 0 2px 12px rgba(78, 205, 196, 0.25); } 50% { border-color: #45b7aa; box-shadow: 0 2px 16px rgba(78, 205, 196, 0.4); } }
+
+.cm-collapsible-arrow-container { display: inline; }
+.cm-collapsible-indent { white-space: pre; }
+.cm-collapsible-arrow {
+    cursor: pointer !important;
+    user-select: none; /* FIX: Prevent selection on click */
+    -webkit-user-select: none;
+    color: inherit; /* Наследует цвет от текста строки */
+    font-size: 1.2em; /* Увеличенный размер */
+    line-height: 1;
+    transition: opacity 0.15s ease;
+    padding: 0;
+    /* opacity:1 — стрелка тем же белым, что и текст. Раньше 0.7/0.8 делали белый
+       полупрозрачным → визуально серый, отличался от заголовка. open/closed
+       различаются глифом ▾/▸, не прозрачностью, поэтому оба на 1. */
+    opacity: 1;
+}
+.cm-collapsible-arrow:hover { opacity: 1; }
+.cm-collapsible-arrow.open { opacity: 1; }
+.cm-collapsible-arrow.closed { opacity: 1; }
+.cm-collapsible-line-count {
+    margin-left: 5px;
+    font-size: var(--gt-collapsible-line-count-number-size, 0.72em);
+    line-height: 1;
+    letter-spacing: 0;
+    color: inherit;
+    vertical-align: baseline;
+    cursor: pointer !important;
+    user-select: none;
+    -webkit-user-select: none;
+}
+.cm-collapsible-line-count-unit {
+    font-size: var(--gt-collapsible-line-count-unit-size, 0.8em);
+    vertical-align: -0.12em;
+    text-transform: uppercase;
+}
+/* .empty остаётся тусклой намеренно — секция без контента, не кликается.
+   cursor:default — !important, чтобы перебить pointer-аффорданс стрелки/title
+   (иначе тусклая «непустая» стрелка получила бы pointer-аффорданс зря). */
+.cm-collapsible-arrow.empty { opacity: 0.3; cursor: default !important; }
+.cm-collapsible-arrow.empty:hover { opacity: 0.3; }
+.cm-foldGutter { display: none !important; }
+
+/* Scope color overrides: L1 */
+.cm-line.cm-scope-L1-bold { --indent-line-color-L1: var(--color-format-bold); }
+.cm-line.cm-scope-L1-italic { --indent-line-color-L1: var(--color-format-italic); }
+.cm-line.cm-scope-L1-code { --indent-line-color-L1: var(--color-format-code); }
+.cm-line.cm-scope-L1-strike { --indent-line-color-L1: var(--color-format-strike); }
+.cm-line.cm-scope-L1-h1 { --indent-line-color-L1: var(--color-format-h1); }
+.cm-line.cm-scope-L1-h2 { --indent-line-color-L1: var(--color-format-h2); }
+.cm-line.cm-scope-L1-h3 { --indent-line-color-L1: var(--color-format-h3); }
+.cm-line.cm-scope-L1-h4 { --indent-line-color-L1: var(--color-format-h4); }
+.cm-line.cm-scope-L1-h5 { --indent-line-color-L1: var(--color-format-h5); }
+.cm-line.cm-scope-L1-h6 { --indent-line-color-L1: var(--color-format-h6); }
+
+/* Scope color overrides: L2 */
+.cm-line.cm-scope-L2-bold { --indent-line-color-L2: var(--color-format-bold); }
+.cm-line.cm-scope-L2-italic { --indent-line-color-L2: var(--color-format-italic); }
+.cm-line.cm-scope-L2-code { --indent-line-color-L2: var(--color-format-code); }
+.cm-line.cm-scope-L2-strike { --indent-line-color-L2: var(--color-format-strike); }
+.cm-line.cm-scope-L2-h1 { --indent-line-color-L2: var(--color-format-h1); }
+.cm-line.cm-scope-L2-h2 { --indent-line-color-L2: var(--color-format-h2); }
+.cm-line.cm-scope-L2-h3 { --indent-line-color-L2: var(--color-format-h3); }
+.cm-line.cm-scope-L2-h4 { --indent-line-color-L2: var(--color-format-h4); }
+.cm-line.cm-scope-L2-h5 { --indent-line-color-L2: var(--color-format-h5); }
+.cm-line.cm-scope-L2-h6 { --indent-line-color-L2: var(--color-format-h6); }
+
+/* Scope color overrides: L3 */
+.cm-line.cm-scope-L3-bold { --indent-line-color-L3: var(--color-format-bold); }
+.cm-line.cm-scope-L3-italic { --indent-line-color-L3: var(--color-format-italic); }
+.cm-line.cm-scope-L3-code { --indent-line-color-L3: var(--color-format-code); }
+.cm-line.cm-scope-L3-strike { --indent-line-color-L3: var(--color-format-strike); }
+.cm-line.cm-scope-L3-h1 { --indent-line-color-L3: var(--color-format-h1); }
+.cm-line.cm-scope-L3-h2 { --indent-line-color-L3: var(--color-format-h2); }
+.cm-line.cm-scope-L3-h3 { --indent-line-color-L3: var(--color-format-h3); }
+.cm-line.cm-scope-L3-h4 { --indent-line-color-L3: var(--color-format-h4); }
+.cm-line.cm-scope-L3-h5 { --indent-line-color-L3: var(--color-format-h5); }
+.cm-line.cm-scope-L3-h6 { --indent-line-color-L3: var(--color-format-h6); }
+
+/* Scope color overrides: L4 */
+.cm-line.cm-scope-L4-bold { --indent-line-color-L4: var(--color-format-bold); }
+.cm-line.cm-scope-L4-italic { --indent-line-color-L4: var(--color-format-italic); }
+.cm-line.cm-scope-L4-code { --indent-line-color-L4: var(--color-format-code); }
+.cm-line.cm-scope-L4-strike { --indent-line-color-L4: var(--color-format-strike); }
+.cm-line.cm-scope-L4-h1 { --indent-line-color-L4: var(--color-format-h1); }
+.cm-line.cm-scope-L4-h2 { --indent-line-color-L4: var(--color-format-h2); }
+.cm-line.cm-scope-L4-h3 { --indent-line-color-L4: var(--color-format-h3); }
+.cm-line.cm-scope-L4-h4 { --indent-line-color-L4: var(--color-format-h4); }
+.cm-line.cm-scope-L4-h5 { --indent-line-color-L4: var(--color-format-h5); }
+.cm-line.cm-scope-L4-h6 { --indent-line-color-L4: var(--color-format-h6); }
+
+/* Scope color overrides: L5 */
+.cm-line.cm-scope-L5-bold { --indent-line-color-L5: var(--color-format-bold); }
+.cm-line.cm-scope-L5-italic { --indent-line-color-L5: var(--color-format-italic); }
+.cm-line.cm-scope-L5-code { --indent-line-color-L5: var(--color-format-code); }
+.cm-line.cm-scope-L5-strike { --indent-line-color-L5: var(--color-format-strike); }
+.cm-line.cm-scope-L5-h1 { --indent-line-color-L5: var(--color-format-h1); }
+.cm-line.cm-scope-L5-h2 { --indent-line-color-L5: var(--color-format-h2); }
+.cm-line.cm-scope-L5-h3 { --indent-line-color-L5: var(--color-format-h3); }
+.cm-line.cm-scope-L5-h4 { --indent-line-color-L5: var(--color-format-h4); }
+.cm-line.cm-scope-L5-h5 { --indent-line-color-L5: var(--color-format-h5); }
+.cm-line.cm-scope-L5-h6 { --indent-line-color-L5: var(--color-format-h6); }
+
+/* ============================================================================
+   INCLUDE LINK WIDGET — File Transclusion
+   ============================================================================ */
+
+.cm-include-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    background: rgba(100, 149, 237, 0.15);
+    border: 1px solid rgba(100, 149, 237, 0.3);
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+    color: #6cb6ff;
+    cursor: default;
+}
+
+.cm-include-link-icon {
+    font-size: 1em;
+}
+
+.cm-include-link-path {
+    color: #6cb6ff;
+}
+
+.cm-include-link-open {
+    background: none;
+    border: none;
+    color: #6cb6ff;
+    cursor: pointer;
+    padding: 0 2px;
+    margin-left: 4px;
+    opacity: 0.6;
+    font-size: 1em;
+    line-height: 1;
+}
+
+.cm-include-link-open:hover {
+    opacity: 1;
+}
+
+/* Cmd+Click mode: show pointer cursor on include links */
+.cm-include-cmd-mode .cm-include-link {
+    cursor: pointer;
+}
+
+.cm-include-cmd-mode .cm-include-link:hover {
+    background: rgba(100, 149, 237, 0.25);
+    border-color: rgba(100, 149, 237, 0.5);
+}
+
+/* Embedding link (pink) — GraphRAG indexing sources */
+.cm-embedding-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    background: rgba(236, 72, 153, 0.15);
+    border: 1px solid rgba(236, 72, 153, 0.3);
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+    color: #f472b6;
+    cursor: default;
+    position: relative;
+}
+
+.cm-embedding-link-icon {
+    font-size: 1em;
+}
+
+.cm-embedding-link-path {
+    color: #f472b6;
+}
+
+.cm-embedding-link-tooltip {
+    display: none;
+    position: absolute;
+    top: -28px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1e1e2e;
+    border: 1px solid rgba(236, 72, 153, 0.4);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 0.85em;
+    color: #f472b6;
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+.cm-embedding-link-tooltip.visible {
+    display: block;
+}
+
+/* Yellow "file not found" state — applied to @link / @include / @embedding
+   when the file referenced no longer exists on disk. Identical look for all
+   three so the absent-file signal reads the same regardless of directive. */
+.cm-link-widget.not-found,
+.cm-include-link.not-found,
+.cm-embedding-link.not-found {
+    background: rgba(250, 204, 21, 0.13) !important;
+    border-color: rgba(250, 204, 21, 0.45) !important;
+    color: #fde047 !important;
+}
+.cm-link-widget.not-found .cm-link-widget-path,
+.cm-include-link.not-found .cm-include-link-path,
+.cm-embedding-link.not-found .cm-embedding-link-path {
+    color: #fde047 !important;
+    text-decoration: line-through;
+    text-decoration-color: rgba(250, 204, 21, 0.6);
+}
+.cm-link-widget.not-found .cm-link-widget-icon,
+.cm-include-link.not-found .cm-include-link-icon,
+.cm-embedding-link.not-found .cm-embedding-link-icon {
+    /* Replace original emoji with a warning sign via ::before overlay */
+    visibility: hidden;
+    position: relative;
+}
+.cm-link-widget.not-found .cm-link-widget-icon::after,
+.cm-include-link.not-found .cm-include-link-icon::after,
+.cm-embedding-link.not-found .cm-embedding-link-icon::after {
+    content: "\26A0\FE0F"; /* ⚠️ */
+    visibility: visible;
+    position: absolute;
+    left: 0; top: 0;
+}
+
+/* Link widget (green) — simple file pointer, no inlining, no GraphRAG */
+.cm-link-widget {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    background: rgba(110, 231, 183, 0.13);
+    border: 1px solid rgba(110, 231, 183, 0.32);
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+    color: #6ee7b7;
+    cursor: pointer;
+}
+
+.cm-link-widget:hover {
+    background: rgba(110, 231, 183, 0.22);
+    border-color: rgba(110, 231, 183, 0.55);
+}
+
+.cm-link-widget-icon {
+    font-size: 1em;
+}
+
+.cm-link-widget-path {
+    color: #6ee7b7;
+}
+
+/* AI Protocol frontmatter widget (Peach) */
+.cm-ai-protocol {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    background: rgba(250, 179, 135, 0.12);
+    border: 1px solid rgba(250, 179, 135, 0.25);
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+    color: #fab387;
+    cursor: default;
+}
+
+.cm-ai-protocol-icon {
+    font-weight: 700;
+    font-size: 0.85em;
+    background: rgba(250, 179, 135, 0.2);
+    padding: 0 5px;
+    border-radius: 3px;
+}
+
+.cm-ai-protocol-label {
+    color: rgba(250, 179, 135, 0.7);
+}
+
+.cm-frontmatter-hidden {
+    display: none !important;
+}
+
+.cm-frontmatter-active {
+    background: rgba(250, 179, 135, 0.06) !important;
+}
+
+/* Domain favicon before link text */
+.cm-link-favicon {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    vertical-align: -2px;
+    margin-right: 4px;
+    border-radius: 2px;
+    object-fit: contain;
+}
+
+/* Кастомный image-эмодзи (`:имя:` → картинка, customEmoji.ts). Размер ~ глифа
+   эмодзи: 1.15em масштабируется со шрифтом редактора. */
+.cm-custom-emoji {
+    display: inline-flex;
+    position: relative;
+    align-items: center;
+    justify-content: center;
+    width: 1.15em;
+    height: 1.15em;
+    vertical-align: -0.2em;
+    border-radius: 2px;
+    cursor: text;
+    user-select: text;
+    -webkit-user-select: text;
+}
+
+.cm-custom-emoji-img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    object-fit: contain;
+    pointer-events: none;
+}
+
+.cm-custom-emoji.selected::after {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: 3px;
+    background-color: rgba(137, 180, 250, 0.25);
+    pointer-events: none;
+}
+
+/* Мини-превью image-эмодзи в RMB-меню (перед label). */
+.cm-menu-emoji-img {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    margin-right: 8px;
+    border-radius: 2px;
+    object-fit: contain;
+    flex-shrink: 0;
+}
+
+/* Anchor links: [text](#frag) and [text](./file.md#frag).
+   Text cursor normally, pointer only in Cmd/Ctrl navigation mode. */
+.cm-anchor-link {
+    text-decoration: underline;
+    text-decoration-color: rgba(137, 180, 250, 0.45);
+    text-underline-offset: 2px;
+    cursor: text !important;
+}
+.cmd-held .cm-anchor-link {
+    cursor: pointer !important;
+    text-decoration-color: rgba(137, 180, 250, 0.95);
+}
+.cm-anchor-link.cm-anchor-broken {
+    text-decoration-color: rgba(243, 139, 168, 0.85);
+    text-decoration-style: wavy;
+}
+.cm-anchor-link.cm-anchor-duplicate {
+    text-decoration-color: rgba(250, 179, 135, 0.85);
+    text-decoration-style: wavy;
+}
+.cm-anchor-link.cm-anchor-pending {
+    text-decoration-color: rgba(166, 173, 200, 0.45);
+    text-decoration-style: dotted;
+}
+.cm-composer-search-panel {
+  position: absolute;
+  z-index: 20;
+  top: 5px;
+  right: 7px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 4px 3px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  background: rgba(20, 20, 22, 0.96);
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.34);
+  color: #cfcfd4;
+}
+
+.cm-composer-search-input {
+  width: min(150px, 30vw);
+  min-width: 72px;
+  height: 22px;
+  padding: 0 4px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.cm-composer-search-count {
+  min-width: 34px;
+  color: #8f8f98;
+  font-size: 10px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.cm-composer-search-action {
+  width: 22px;
+  height: 22px;
+  padding: 3px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #a7a7b0;
+  cursor: pointer;
+}
+
+.cm-composer-search-action:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.cm-composer-search-action svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}

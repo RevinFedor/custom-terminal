@@ -1,514 +1,95 @@
-<p align="center">
-  <h1 align="center">Noted Terminal</h1>
-  <p align="center">
-    Terminal-native API/workbench для Claude Code и Codex CLI.<br/>
-    Не обёртка над SDK — живой терминал + детерминированный PTY/JSONL control layer.
-  </p>
-</p>
+# Noted Terminal
 
-<p align="center">
-  <img src="assets/hero.png" alt="Noted Terminal" width="800"/>
-</p>
+**Рабочая среда для долгих задач с Claude Code и Codex на Mac.** Организуйте AI-сессии в окна и workflow, читайте историю, возвращайтесь к прошлым запросам и передавайте задачи между агентами, сохраняя доступ к настоящему терминалу.
+
+Noted Terminal подходит разработчику, который параллельно ведёт реализацию, проверку и исследование и хочет видеть, какой сессии принадлежит задача, что она уже сделала и какой результат получен. CLI работают локально с вашими файлами и вашим аккаунтом.
+
+![Рабочее пространство Noted Terminal с несколькими AI-сессиями](assets/workspace.png)
+
+*Реальный скриншот рабочего пространства. Текст внутренних обсуждений и личный путь скрыты.*
+
+**macOS · исходники · локальные Claude/Codex CLI.** Начните с [установки для человека](docs/setup/macos.md) или передайте своему локальному AI [самодостаточную инструкцию установки](docs/setup/noted-terminal.prompt.md). Подписанного бинарного установщика в этом репозитории пока нет.
+
+## От задачи до проверенного результата
+
+Пример из личной разработки: при раскрытии видеоплеер повторно перематывал видео и начинал воспроизведение. Пользователь описал скачок и ожидаемое поведение; задача была передана отдельной рабочей сессии с Markdown-контекстом. После изменения обработчиков прошла отдельная проверка в настоящем браузере: на паузе и при проигрывании, в двух языках, с сохранением того же video element, позиции и звука. Результат вернулся владельцу задачи вместе с пределом проверки: слабая сеть и поведение декодера этим прогоном не подтверждались.
+
+```text
+Человек: описывает проблему и ожидаемый результат
+  → рабочая вкладка: ответственность + контекст + поручение
+    → агент: исследует причину и меняет код
+      → проверка: воспроизводит исходный сценарий
+        → результат: что исправлено, чем проверено, что осталось
+```
+
+Это пример индивидуальной работы автора, а не заявление о внедрении в команде. Человек выбирает цель, права и критерий готовности; количество запущенных моделей само по себе не подтверждает качество результата.
+
+## Что можно делать
+
+| Действие пользователя | Возможности |
+|---|---|
+| Организовать работу | Workflow, несколько окон/колонок, многострочные полосы вкладок, резерв и скрытые окна, поиск/переключение, пользовательские категории и избранное. Перенос вкладки не меняет её рабочую папку или разговор. |
+| Читать и находить прошлое | History с Markdown, действиями инструментов и diff, поиск по истории, Timeline сообщений/compact, выбранные блоки и диапазоны, заметки и файловые связи. |
+| Попробовать другой путь | Fork/Continue/Rewind и операции над диапазоном истории. Claude и Codex используют разные механизмы; [таблица ограничений](docs/features.md#история-и-провайдеры) описывает их отдельно. |
+| Подготовить запрос | Общий composer, сохранённый draft, изображения/файлы/контекстные чипы, библиотека промптов, ручной ввод в живом CLI. Отправка и готовый ответ имеют отдельные состояния. |
+| Запланировать продолжение | Очереди и Run After, ожидание выбранных вкладок, таймеры и Loop; Restart after для команд/dev-server. Ручной Stop, Pause очереди и завершение работы — разные действия. |
+| Передать задачу агенту | Область ответственности и план вкладки, адресные вопросы/ответы, долговечная делегация, возврат результата, отложенные изменения контекста, точечное чтение чужой истории через Terminal MCP. |
+| Подключить другой клиент | REST/SSE для project/tab управления; Codex-only Inbox API для внешнего чата. Нативный iPhone-клиент и companion-приложения устанавливаются отдельно. |
+| Разобраться в состоянии | Context и provider usage, активность/процессы, ресурсы и кэши, экспорт диагностических логов. Usage провайдера, размер контекста и память компьютера не взаимозаменяемы. |
+
+Подробнее: [возможности и границы](docs/features.md), [API/MCP и подключения](docs/api.md).
+
+## Работа с iPhone
 
 <table>
   <tr>
-    <td width="34%">
-      <img src="assets/mobile-main-ios-app-terminal.png" alt="Main iOS App terminal project list" width="260"/>
-    </td>
-    <td>
-      <h3>Mobile terminal control</h3>
-      <p>
-        Для управления терминалами с телефона используется отдельное нативное приложение
-        <a href="https://github.com/RevinFedor/main-ios-app">Main iOS App</a>.
-        Оно подключается к REST/SSE API Noted Terminal, показывает проекты и вкладки,
-        управляет Claude/Codex/SDK-сессиями, отправляет prompt'ы, делает interrupt/resume,
-        читает history/timeline/queue и запускает build-install без web-зеркала терминала.
-      </p>
-    </td>
+    <td width="33%"><img src="assets/mobile-prompts.png" alt="Библиотека Terminal prompts на iPhone" width="280" /></td>
+    <td width="33%"><img src="assets/mobile-chat.png" alt="Чат и история инструментов Noted Terminal на iPhone" width="280" /></td>
+    <td width="33%"><img src="assets/mobile-tabs.png" alt="Дерево вкладок и прикреплённые рабочие документы на iPhone" width="280" /></td>
   </tr>
 </table>
 
-## Related Repositories
+**Промпты, чат и вкладки — тот же рабочий контекст с телефона.** Можно выбрать сохранённый промпт, читать ответ и действия агента, переключаться между workflow, вкладками и связанными документами. Это отдельный нативный [Main iOS App](https://github.com/RevinFedor/main-ios-app), подключённый к API работающего Noted Terminal на Mac. Телефон получает данные сессии; приложение на Mac исполняет запросы. Подключение описано в [API/MCP](docs/api.md).
 
-- [AI Mac Electron](https://github.com/RevinFedor/ai-mac-electron) — macOS companion app for system dictation, desktop Gemini chat, prompt library, and a Codex provider that delegates terminal execution to Noted Terminal Inbox.
-- [Main iOS App](https://github.com/RevinFedor/main-ios-app) — native iPhone control surface for Noted Terminal projects/tabs and AI Mac Electron chat/voice workflows.
+## Быстрый запуск из исходников
 
----
-
-## Что это
-
-Noted Terminal запускает настоящие локальные AI CLI в терминале и превращает их в управляемые сессии: внешний агент, мобильный клиент или другое desktop-приложение может создать вкладку, запустить Claude/Codex, отправить prompt, остановить turn/process, прочитать историю и сделать fork/edit без переписывания собственного terminal parser.
-
-Главная ценность не в UI-оболочке, а в готовом слое управления:
-
-- **PTY/TUI control:** безопасная доставка prompt/slash-команд в живой `claude`/`codex`, без `claude -p` как основного пути.
-- **Structured history:** Claude JSONL и Codex rollout парсятся в Timeline/History, а не в сырой terminal scrollback.
-- **MCP API:** внешние AI-клиенты управляют вкладками и читают/редактируют историю через MCP.
-- **Mobile / external REST/SSE API:** телефон, Voice Record и нативные клиенты используют тот же backend, что desktop UI.
-- **Event-driven status:** завершение turn'а, prompt-ready, CWD, session id и context% берутся из событий/транскриптов; таймеры только fallback.
-
-Ключевая архитектурная философия: внешний клиент владеет своим UI и пользовательским transcript, а Noted Terminal владеет живым terminal runtime. Например, Voice Record может показать Codex как provider в обычном чате, но Codex-процесс, session id, rollout, Timeline/History, readiness и Stop/Continue живут в Noted Terminal Inbox. HTTP/SSE слой здесь не заменяет терминал SDK-обёрткой, а даёт control-plane над настоящей PTY-сессией. Поэтому completion для внешних клиентов — это событие `done` от Noted Terminal, а не локальная догадка по `busy:false` или таймеру.
-
-Из этого следует граница для будущих Rewind/streaming-доработок: terminal core меняется один раз, а поверхности только вызывают его. History и iOS остаются клиентами real project/tab API (`/api/terminal-tabs/:tabId/...`), потому что управляют конкретной вкладкой проекта. Inbox (`/api/inbox/runs`) нужен внешнему продукту, который владеет своим чатом и использует Noted Terminal как runtime-provider; он не заменяет mobile/project API. Если Inbox когда-нибудь получит Rewind, он должен вызвать тот же core-механизм и перевести результат в семантику внешнего чата, а не заводить второй Rewind.
-
-`/api/terminal-tabs/*` — canonical имя Project Terminal API для Claude/Codex PTY-вкладок. Старое `sdk-tabs` больше не используется для terminal-control; оставшиеся `/api/projects/:id/sdk-tabs` и `/api/inbox/sdk-tabs` относятся только к legacy Claude SDK tab creation.
-
-Подробнее по продуктовой рамке:
-
-- [docs/product/наш-терминал.md](docs/product/наш-терминал.md)
-- [docs/product/анализ-конкурентов.md](docs/product/анализ-конкурентов.md)
-
----
-
-## API surfaces
-
-### 1. Terminal MCP — единая AI-поверхность
-
-Для внешнего AI это основной путь: один MCP управляет живыми вкладками, долговечной делегацией, метаданными вкладки и структурной историей. Внутри приложения live/history/edit остаются разными границами безопасности, но агенту не нужно выбирать между двумя MCP.
-
-| Tool | Что делает |
-|---|---|
-| `current_context` | возвращает собственные project/tab/session id без догадок по активной вкладке |
-| `list_projects` | показывает открытые проекты Noted Terminal |
-| `list_tabs` | показывает вкладки, live PID, commandType, sessionId |
-| `create_tab` | создаёт terminal/AI вкладку |
-| `start_ai` | запускает или resume'ит Claude/Codex через native launch hooks |
-| `send_prompt` | доставляет prompt в live AI TUI через TUI-safe paste |
-| `stop_ai` | останавливает AI process, не уничтожая shell tab |
-| `delegate_to_session` | создаёт долговечный orchestration run: доставка, отслеживание и уведомление о завершении |
-| `get_delegation_result` | один раз читает готовый структурный ответ после уведомления |
-| `rename_tab` / `get_tab_plan` / `apply_tab_plan_changes` | управляет именем и структурированным планом в левом верхнем углу вкладки |
-| `link_file` | прикрепляет существующий файл к своей или указанной AI-вкладке как visual-child |
-| `list_open_sessions` / `session_stats` / `list_turns` | даёт карту сохранённой Claude/Codex-истории без terminal scrollback |
-| `get_user_prompt` / `get_thinking` / `get_assistant_text` | точечно читает выбранный блок истории |
-| `fork_session` / `propose_edit` / `apply_edit` | безопасно форкает и редактирует Claude history; Codex остаётся read-only |
-| `run_command` / `restart_process` / `kill_process` | управляет обычными shell/dev-server вкладками |
-| `read_output` | читает хвост terminal output как fallback |
-
-Где смотреть:
-
-- MCP wrapper: [mcp/terminal-server.mjs](mcp/terminal-server.mjs)
-- HTTP backend: [src/main/main.js](src/main/main.js) и [src/main/web-server.js](src/main/web-server.js)
-- docs: [docs/knowledge/fact-terminal-mcp.md](docs/knowledge/fact-terminal-mcp.md), [docs/knowledge/fact-session-history.md](docs/knowledge/fact-session-history.md)
-
-Минимальный сценарий для внешнего агента:
-
-```text
-delegate_to_session { projectId, toolType, prompt }
-→ дождаться одного уведомления в исходной вкладке
-→ get_delegation_result { runId }
-```
-
-`send_prompt` остаётся низкоуровневым live-действием и подтверждает только доставку. Для работы на 30 минут и переживания restart нужен `delegate_to_session`: run хранится в приложении и завершается по lifecycle/SSE без polling истории.
-
-### 2. Mobile / external REST + SSE API
-
-Mobile API уже используется web/mobile клиентами и нативным iOS-клиентом. Это не web-зеркало терминала: клиент получает структурные snapshots/history/timeline/events и отправляет команды в тот же backend.
-
-Ключевые endpoints:
-
-```text
-GET  /api/projects
-GET  /api/inbox
-POST /api/inbox/runs                   # external Codex run in system Inbox
-POST /api/inbox/runs/:runId/stop
-GET  /api/projects/:id/tabs
-POST /api/projects/:id/agent-tabs        { toolType: "claude" | "codex" }
-POST /api/terminal-tabs/:tabId/send
-POST /api/terminal-tabs/:tabId/interrupt
-POST /api/terminal-tabs/:tabId/stop
-POST /api/terminal-tabs/:tabId/resume
-GET  /api/terminal-tabs/:tabId/status
-GET  /api/terminal-tabs/:tabId/history
-GET  /api/terminal-tabs/:tabId/timeline
-POST /api/terminal-tabs/:tabId/edit-range    { startUuid, endUuid, compactText }
-POST /api/terminal-tabs/:tabId/delete-range  { startUuid, endUuid }
-GET  /api/terminal-tabs/:tabId/params
-POST /api/terminal-tabs/:tabId/params
-GET  /api/events?token=&tabId=           # SSE live channel
-```
-
-**Local LAN test, no hosting required:**
-
-```bash
-npm run dev                              # starts Noted Terminal with NOTED_WEB_PORT=7979
-ipconfig getifaddr en0                   # Mac Wi-Fi/LAN IP
-cat ~/.noted-terminal/web-token.txt      # bearer token
-```
-
-Open from an iPhone on the same network:
-
-```text
-http://<MAC_LAN_IP>:7979/?token=<TOKEN>
-```
-
-The installed app uses port `7878`; dev uses `7979`. The public
-`https://remote-control.f9922.tech` URL is only a VPS/reverse-SSH tunnel to
-the same Mac server and is not required for local testing.
-
-Где смотреть:
-
-- REST/SSE backend: [src/main/web-server.js](src/main/web-server.js)
-- renderer bridge actions: [src/renderer/App.tsx](src/renderer/App.tsx)
-- mobile frontend: [mobile-web/](mobile-web/)
-- docs: [docs/knowledge/fact-mobile-web.md](docs/knowledge/fact-mobile-web.md), [docs/knowledge/fact-mobile-claude-pty.md](docs/knowledge/fact-mobile-claude-pty.md), [docs/knowledge/fact-codex.md](docs/knowledge/fact-codex.md)
-
-### 4. Core source map
-
-Если нужно встроить или переиспользовать только terminal/API слой, начинать отсюда:
-
-| Файл | Зачем читать |
-|---|---|
-| [src/main/main.js](src/main/main.js) | PTY lifecycle, `safePasteAndSubmit`, Claude/Codex launch, Stop/interrupt, MCP HTTP |
-| [src/main/ipc/claude-data.js](src/main/ipc/claude-data.js) | Claude JSONL: session file lookup, active-branch backtrace, fork/edit/delete range |
-| [src/main/ipc/codex-data.js](src/main/ipc/codex-data.js) | Codex rollout: timeline/history/context/compact parsing |
-| [src/main/web-server.js](src/main/web-server.js) | mobile/native REST API, SSE, live JSONL tail |
-| [src/renderer/components/Workspace/Terminal.tsx](src/renderer/components/Workspace/Terminal.tsx) | xterm lifecycle, pendingAction launch, prompt readiness |
-| [src/renderer/components/Workspace/ClaudeControlBar.tsx](src/renderer/components/Workspace/ClaudeControlBar.tsx) | user-facing controls for model/effort/stop/fork/copy prompt |
-| [src/renderer/components/Workspace/Timeline.tsx](src/renderer/components/Workspace/Timeline.tsx) | Timeline, range selection, edit-range UI |
-
----
-
-## Demo flow
-
-Самая короткая демонстрация продукта:
-
-1. Открыть Noted Terminal с живой Claude/Codex вкладкой.
-2. Рядом открыть mobile client или `mobile-web`.
-3. Написать prompt в desktop History/agent input.
-4. Показать, что mobile side получает тот же turn через REST/SSE: user message, busy, assistant output, status/context.
-5. Нажать mobile interrupt/stop/resume или поменять params — desktop остаётся источником живого процесса, mobile только внешний клиент.
-
-Внешний desktop-клиент показывает тот же принцип без телефона: Voice Record отправляет Codex prompt в `/api/inbox/runs`, получает SSE и сохраняет ответ в своей истории, а Noted Terminal держит Inbox-вкладку, PTY, rollout и auto-stop. Это и есть intended split: внешний продукт может быть отдельным UX, но не должен становиться владельцем Codex internals.
-
-Если во время такого external send в живом Codex composer уже есть ручной draft, Noted Terminal останавливает отправку и возвращает конфликт. Для Inbox-клиента draft передаётся наружу вместе с новым prompt'ом, чтобы внешний продукт восстановил input и не создал ghost-turn; для project/tab API draft остаётся в терминале и клиент получает `409`.
-
-Это демонстрирует главное: API уже существует и используется реальным вторым клиентом. Мобилка не парсит терминальный экран и не запускает свой Claude; она ходит в backend Noted Terminal, который сам владеет PTY, JSONL/rollout parsing, session status и history.
-
----
-
-## Проблема
-
-Все AI-инструменты теряют контекст: сессия закончилась → агент забыл всё. С 1M контекстом один агент умеет почти всё, но через 2 часа окно забито мусором — начинаешь заново или чистишь вручную. А когда параллельно открыто 5 сессий — ни одна не знает что делают остальные.
-
-**Noted Terminal даёт пять вещей, которых не даёт обычный терминал или SDK-wrapper:**
-
-| | Возможность | Суть |
-|---|---|---|
-| 🔌 | **Terminal/API layer** | Готовый MCP/REST/SSE доступ к живым Claude/Codex сессиям |
-| 🔀 | **Fork / Rewind / Edit Range** | Git для диалогов с AI |
-| 🧠 | **Knowledge Base + Semantic Router** | Персистентная память проекта между сессиями |
-| 📊 | **Visual Timeline** | История как дерево, а не лог |
-| 🎛️ | **Cross-Session Access** | Любая вкладка читает и редактирует историю любой другой |
-
-> Под капотом — не spawn-subprocess-и-собери-stdout. Приложение **полностью парсит** PTY-поток и JSONL-транскрипты активных CLI (Claude и Codex), превращая живую сессию в структурированное, адресуемое состояние. На этом стоит всё остальное.
-
----
-
-## Features
-
-### 🔀 Context Management
-
-<details>
-<summary><b>Fork</b> — клонирование сессии в один клик</summary>
-
-Нажал кнопку → получил полную копию истории в новом табе, оригинал не тронут. `fs.copyFile` JSONL + перезапись всех `sessionId` на новый UUID (чтобы Timeline не показал ложную Clear-Context границу).
-
-Основной паттерн: **Fork → вырезать ненужное → продолжить с чистой историей.**
-
-</details>
-
-<details>
-<summary><b>Edit Range</b> — компактирование мусора в резюме</summary>
-
-Выделяешь диапазон на Timeline (например 30 шагов где агент не мог пройти тесты) → диапазон сжимается в одно резюме: *"пробовали X, Y, Z — не вышло, ошибка была в W"* → JSONL атомарно редактируется (backtrace + forward-expand + relink `parentUuid` + orphan cleanup), агент рестартует с чистым контекстом.
-
-Контекстное окно освободилось, суть сохранилась. Тот же движок доступен другим агентам через MCP (см. Cross-Session Access).
-
-</details>
-
-<details>
-<summary><b>Rewind</b> — откат к любому сообщению</summary>
-
-ПКМ по точке на Timeline → терминал автоматически навигирует по TUI-меню Claude (Escape → стрелки → выбор → Enter) → агент откатывается + получает резюме удалённого контекста.
-
-По сути **Ctrl+Z для разговора с AI** — вернуться в точку где всё было хорошо и пойти другим путём.
-
-</details>
-
----
-
-### 🧠 Knowledge Base + Semantic Router
-
-70+ файлов `docs/knowledge/` — **персистентная память проекта**, которая переживает любую сессию:
-
-| Тип | Содержимое |
-|-----|-----------|
-| `fact-*` | Как работают подсистемы, API-лимиты, ограничения платформ |
-| `fix-*` | Баги которые стоили часов: что пробовали, почему не сработало, как починили |
-
-> Записывается только то, что AI **не может вывести из кода**: мотивация, отброшенные подходы, неочевидные связи.
-
-**Как работает поиск:**
-
-```
-Пользователь: "почему sync возвращает 0 полей"
-                                                  ↓
-              Агент вызывает MCP docs_search с симптомом
-                                                  ↓
-              Промпт + .semantic-index.json → Claude Haiku
-                                                  ↓
-              Haiku выбирает 2-4 релевантных файла по тегам и симптомам
-                                                  ↓
-              Содержимое файлов инжектится в контекст агента
-                                                  ↓
-              Агент сразу знает: "Axenta имеет telemetryAccountId: null,
-              искать нужно через userId"
-```
-
-- **`docs_search` MCP** — агент сам вызывает когда работает с незнакомой подсистемой
-- **`docs_reindex` MCP** — пересборка `.semantic-index.json`; индексатор живёт в knowledge MCP, не в repo-local shell script
-
-> Новый агент (хоть другая модель через полгода) за 5 минут входит в проект на уровне, недостижимом для человека за неделю.
-
----
-
-### 📊 Timeline
-
-Вертикальная полоса справа — **каждая точка = сообщение**.
-
-- Клик → скролл терминала к сообщению
-- Наведение → превью текста промпта
-- Session chain: `(root)` → `(plan mode)` → `(fork)` с маркером активной ветки
-- **History Panel:** полная markdown-рендеренная история с syntax highlighting и diff-view
-- Compact counter `♻️ ×N`, token usage, длительность каждого хода
-- Якоря: пользовательские заметки (фиолетовые), rewind-маркеры (розовые), docs-update индикаторы (зелёные)
-- Range copy: выбор диапазона сообщений для экспорта
-
----
-
-### 🎛️ Cross-Session Access
-
-**Не оркестратор, раздающий задачи. Peer-модель: любая вкладка имеет доступ к любой другой.**
-
-Claude Code в PTY-табе, Claude SDK-таб, Codex — любой локальный чат, подключённый к MCP, может **прочитать историю** и **отредактировать** любую другую сессию в приложении. Открыл 5 сессий (фича, багфикс, рефакторинг, форк) — спрашиваешь одну из них *«что сейчас делается в остальных и на чём они остановились»*, и получаешь ответ из распарсенных транскриптов, а не из догадок по имени вкладки.
-
-Работает это потому что парсинг JSONL обоих агентов и управление PTY экспонированы через внутренние HTTP boundaries main process. Один глобальный stdio-MCP даёт агенту общую точку входа, а права и проверки остаются у соответствующего backend-сценария:
-
-<details open>
-<summary><b>Terminal MCP: история и редактирование</b></summary>
-
-Гранулярный доступ: агент **сам решает сколько контекста забрать**. Сначала карта сессии (только размеры), потом точечный pull нужных блоков. Сессия 19MB / 262 turn'а → читаемый overview за **~6K токенов** — без затягивания дампа в контекст.
-
-| Tool | |
-|------|--|
-| `list_open_sessions` | все Claude/Codex табы во всех проектах: sessionId, isLive, cwd, когда создан |
-| `session_stats` | масштаб без контента: turn count, char-counts по ролям, largest turns, compact'ы |
-| `list_turns` | карта ходов: preview + размеры thinking/text-блоков + имена tool_uses (контент НЕ грузится) |
-| `get_user_prompt` · `get_thinking` · `get_assistant_text` | точечный pull одного блока, byte-range для больших |
-| `list_notes` | пользовательские якоря на Timeline (заметки, rewind-маркеры, docs-edits) |
-| `fork_session` | клон сессии под новым UUID |
-| `propose_edit` | dry-run: что именно будет удалено, без записи на диск |
-| `apply_edit` | реальная правка JSONL через **те же IPC что Timeline-кнопка** (backtrace, relink, orphan cleanup, atomic write); auto-fork по умолчанию |
-
-**Safety:** первая правка сессии автоматически делает fork и оперирует на копии — оригинал нетронут, откат = закрыть таб форка. Редактирование никогда не пишет JSONL напрямую: только через обкатанные edit-range / delete-range пути, которые знают про compact-границы и parentUuid-цепочку.
-
-</details>
-
-<details>
-<summary><b>Terminal MCP: live-сессии и делегирование</b></summary>
-
-| Tool | |
-|------|--|
-| `current_context` | собственные project/tab/session id текущей вкладки |
-| `list_tabs` | вкладки проекта: PID, цвет, тип и session id |
-| `create_tab` · `start_ai` · `send_prompt` · `stop_ai` | низкоуровневое управление живой PTY-сессией |
-| `delegate_to_session` · `get_delegation_result` | долговечная работа с уведомлением вместо polling |
-| `rename_tab` · `get_tab_plan` · `apply_tab_plan_changes` | имя и структурированный план задач вкладки |
-| `link_file` | visual-child файл у AI-вкладки |
-| `run_command` · `restart_process` · `kill_process` | управление shell/dev-server процессом |
-
-</details>
-
-> **Граница остаётся строгой внутри приложения:** live-команды не переписывают JSONL, а history edit не управляет процессом. Объединена только обнаруживаемая MCP-поверхность, чтобы агент не выбирал канал по длинной внешней инструкции.
-
-**Типичный flow:** для долгой работы `delegate_to_session` создаёт вкладку/run и сразу возвращает `runId` → приложение само следит за lifecycle и показывает состояние рядом с Run After → после завершения вставляет короткое уведомление в исходный input → агент один раз вызывает `get_delegation_result`. Для исследования существующей истории: `list_open_sessions` → `session_stats` / `list_turns` → точечный `get_thinking` или `get_assistant_text`.
-
----
-
-### ⌨️ TUI Control (Claude & Codex)
-
-Управление обоими CLI напрямую из UI — детерминированно, через парсинг PTY-потока, без `setTimeout`.
-
-**Claude**
-
-| Команда | Что делает |
-|---------|-----------|
-| `/model` | `default \| sonnet \| opus \| haiku` из UI-кнопки. Command Guard блокирует double operations |
-| `/effort` | `low \| medium \| high \| xhigh \| max` — уровень reasoning (single source в `claudeLevels.ts`) |
-| `meta+t` | Think mode — парсинг picker menu, навигация стрелками |
-| Stop hook | Детерминированный конец turn'а: `UserPromptSubmit`/`Stop` хуки → Unix socket → authoritative loader |
-
-**Codex**
-
-| Команда | Что делает |
-|---------|-----------|
-| `/model` | Два последовательных picker'а (модель → effort), парсинг через PTY-кадры, не таймауты |
-| `--model` / effort | Передаются прямо в process-start args (`-c 'model_reasoning_effort=...'`), не через TUI |
-| Draft stash | Native `Ctrl+C` сохраняет недописанный composer в history перед сменой модели |
-| Stop | `terminal:stop-ai-process` — controlled kill-ladder (`\x03` → SIGTERM → SIGKILL) по PID агента |
-
-> У Codex нет отдельного Think-toggle — reasoning effort идёт через тот же `/model` flow, что и модель. Loader держится на rollout-событиях `task_started` / `task_complete` / `turn_aborted`, а не на эвристиках спиннера.
-
----
-
-### 📝 Docs Pipeline
-
-В конце сессии вставляешь промпт `docs-rules.prompt.md` → агент анализирует изменения → обновляет `docs/knowledge/`. Фильтрация: только невидимый контекст (мотивация, шрамы, неочевидные связи — не пересказ кода). Индекс пересобирается через MCP `docs_reindex` с `projectPath` текущего проекта.
-
-### 🔎 Documentation Search MCP
-
-Для поиска по проектной документации используется отдельный публичный пакет
-[docs_search MCP](https://github.com/RevinFedor/docs_search_mcp). Проект хранит факты, шрамы и методологию в `docs/`, а `.semantic-index.json` выступает компактной картой: агент отправляет в `docs_search` симптом или задачу, MCP выбирает нужные markdown-файлы, и агент читает их в контекст перед изменением кода.
-
-После существенных изменений в документации индекс пересобирается через MCP `docs_reindex` с `projectPath` текущего проекта. Repo-local shell-индексатор больше не используется.
-
----
-
-## Getting Started
-
-> **macOS only.** Приложение использует `node-pty` и shell integration, заточенные под macOS. Windows/Linux не тестировались.
+Проверяемый путь этой публикации — macOS arm64, Node.js **22.12+ из ветки 22**, Git, Python 3 и Xcode Command Line Tools. Claude Code или Codex устанавливается отдельно и требует вашего входа/доступа к провайдеру. Нужные интерфейсные библиотеки включены в checkout; соседние репозитории автора не требуются.
 
 ```bash
 git clone https://github.com/RevinFedor/custom-terminal.git
 cd custom-terminal
-cp .env.example .env        # вписать API-ключи (см. комментарии внутри)
-npm install
-npm run dev                  # dev mode с hot-reload
+npm ci
+npm run rebuild:native
+npm run build:renderer
+npm run test:setup
 ```
 
-**Production build:**
+Сборка выше ограничена checkout. Для полноценного запуска подготовьте helpers по [инструкции](docs/setup/macos.md): сначала dry-run, затем `install:terminal-mcp`/`install:claude-hook` и `npm run dev`. Установщики обновляют managed записи глобальных CLI-конфигов с backup, а не только этот checkout.
 
-```bash
-npm run build:i              # собирает, копирует в /Applications, запускает
-```
+Откройте workflow/вкладку, выберите рабочую папку и запустите установленный CLI. Выполните native login. Только после готовности ввода отправьте короткий согласованный запрос; успех — ответ в History, а не просто появившийся процесс.
 
-**Terminal MCP** регистрируется глобально один раз для Claude и Codex:
+**Режим доступа:** управляемые запуски в этой версии используют Claude `--dangerously-skip-permissions` и Codex `--dangerously-bypass-approvals-and-sandbox`. Они рассчитаны на доверенный локальный проект; ознакомьтесь с этим режимом до первого запуска агента. Настройка и сборка сами не запускают inference.
 
-```bash
-npm run install:terminal-mcp
-```
+Логин с подпиской CLI и API-ключ — разные способы доступа. Не требуется покупать отдельный ключ для установки Noted; запросы расходуют квоту выбранного аккаунта или деньги выбранного API. Не вводите credentials в AI-чат.
 
-Установщик копирует standalone-сервер в `~/.claude/mcp/`, сохраняет остальные MCP-настройки и добавляет Codex-наследование `NOTED_PARENT_*`. После этого любая полная сессия в Noted Terminal получает свой project/tab context; перезапусти уже открытые Claude/Codex процессы после обновления.
+Дополнительные сервисы настраиваются через локальный ENV: [ключи и `.env.example`](docs/setup/keys.md).
 
-## Tech Stack
+## Что опубликовано и проверено
 
-| | Технология |
-|---|---|
-| Runtime | Electron 28 |
-| Frontend | React 19 + Vite + TypeScript |
-| State | Zustand |
-| Terminal | xterm.js (Canvas renderer) |
-| Styling | Tailwind CSS v4 |
-| DB | SQLite (sessions, projects, tabs) |
-| AI Rendering | react-markdown + remark-gfm + syntax-highlighter |
-| Agents | Claude Code (PTY + Agent SDK), Codex CLI (PTY). Gemini integration is legacy/partial and not part of the current public positioning. |
+Репозиторий сохраняет историю разработки и поставляет исходники с переносимыми зависимостями. Из исторических версий удалены ключи, личные экспорты, базы и runtime-конфиги. Незакоммиченные изменения текущих рабочих сессий не являются частью этой публикации.
 
----
+Проверки опубликованного исходника и их ограничения приведены в [verification](docs/verification.md). Сборка на машине автора и clone без credentials не являются установкой на другом Mac. Windows/Linux и Intel Mac не прошли такую же приёмку.
 
-## Architecture
+- Отдельный no-GUI daemon не поставляется: для API нужен работающий desktop runtime.
+- Native iPhone, SC Desktop/Voice Record, GT Editor, browser/Electron/iOS MCP — отдельные optional интеграции. Их установка не происходит автоматически.
+- Knowledge MCP не нужен для обычной AI-сессии и не включён как обязательный внешний сервис. Подключайте версию, соответствующую своему проекту.
+- `mobile-web/` — legacy браузерная поверхность.
+- Постоянный Gemini-наблюдатель, новый quick-chat и автоматические вопросы в Telegram не объявлены выпущенными этим снимком.
 
-<details>
-<summary><b>Event-Driven — таймеры только fallback</b></summary>
+## Дальше
 
-Всё критичное управление через события, не через "подождать N секунд":
-- `safePasteAndSubmit` с sync marker verification (`\x1b[?2026l`)
-- OSC 7777 маркеры → xterm.js IMarker на точную строку
-- OSC 133 детектит начало/конец команды, OSC 7 трекает CWD
-- Claude busy state: Stop hook (`UserPromptSubmit`/`Stop`) → Unix socket → UI/Mobile/MCP status
-- Codex busy state: rollout events `task_started` / `task_complete` / `turn_aborted`
-- Safety timers есть только как аварийный выход, не как источник truth
-- Результат: меньше потерянных команд, race conditions и ложных "агент закончил"
-
-</details>
-
-<details>
-<summary><b>PTY & JSONL Parsing — две модели транскрипта</b></summary>
-
-Приложение читает не скриншот терминала, а структурированный транскрипт. У двух агентов он устроен по-разному, и парсер это учитывает:
-
-**Claude — parentUuid DAG**
-- **Backtrace** — обратный обход `parentUuid` цепочки с пропуском Escape-отменённых веток
-- **Bridge following** — автоматический переход между файлами при Clear Context / Plan Mode
-- **Incremental reader** — async чтение только новых байт, race-safe снапшот перед `await`
-- **Compact boundary recovery** — `compact_boundary` + `isCompactSummary` пишутся парой записей; двухуровневый fallback восстанавливает историю после `/compact`
-- **Sub-agent progress** — группировка по `parentToolUseID`, inline в timeline
-
-**Codex — линейный rollout**
-- Session id из `session_meta.payload.id` в `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (append-only, парсер игнорирует битый хвост)
-- Timeline из `event_msg.user_message` + `turn_context` (model/effort) + `token_count` (context% / rate-limits)
-- History из `response_item`: reasoning summary → thinking, message → ответ, `function_call` + output → tool card
-- Compact из top-level `type:"compacted"` с `payload.replacement_history`; `thread_rolled_back` откатывает turn'ы
-- Нет parentUuid-DAG: history-методы Terminal MCP читают Codex, но fork/edit намеренно не поддерживаются
-
-Обе модели отдаются через единый HTTP-слой в main, поверх которого работают Timeline UI, History Panel и history-методы Terminal MCP.
-
-</details>
-
-<details>
-<summary><b>Session Management</b></summary>
-
-**Claude** — три метода детекции sessionId:
-- **StatusLine Bridge:** shell script после каждого ответа Claude → `~/.claude/bridge/` (с защитой от stale-takeover: проверка `updated_at` + `transcript_path` + ppid)
-- **Sniper Watcher:** `fs.watch` + 1s polling fallback, snapshot filtering
-- **Manual entry:** real-time validation на диске
-
-Session chain resolution: обход Plan Mode / Clear Context / Fork через `resolveSessionChain()` (backward) и `resolveLatestSessionInChain()` (forward).
-
-**Codex** — `codexKnownSessions` Map из rollout-watcher'а: нет statusline-bridge, durable state — сам rollout JSONL. Resume/fork восстанавливаются из транскрипта, не из RAM. Для `codex-f` (fork) watcher принимает файл по cwd-match или по `sourceSessionId` внутри JSONL.
-
-</details>
-
-<details>
-<summary><b>Rendering & Performance</b></summary>
-
-- `TERM_PROGRAM=vscode` — Ink переключается на xterm.js-оптимизированный path (убрало 90% scroll jitter)
-- Sync frame protection: BSU/ESU buffering → atomic write
-- Canvas renderer (не WebGL) — instant tab switching, stale recovery
-- GPU compositor: `will-change: transform`, React 19 `startTransition` для 200+ entries
-
-</details>
-
-<details>
-<summary><b>Workspace & Projects</b></summary>
-
-Multi-project: каждый проект = набор табов + sessions + notes.
-- Левый `TabSidebar` (drag-resize), tab-группы, visual-child вкладки (fork → visual child источника)
-- Auto-naming (`claude-N`, `codex-N`, `docs-XX`), AI auto-title по первому prompt, цвета, drag-and-drop
-- Multi-select: Shift+Click range, Cmd+Click toggle, batch operations
-- SQLite persistence с safety guard (no silent data loss)
-- Terminal buffer serialization: save/restore при switch между табами
-- Dashboard: процесс-мониторинг (In-App vs External), stop button, Tab History (reopen закрытых)
-
-</details>
-
----
-
-## Testing
-
-Two-tier + live MCP:
-
-| Уровень | Runtime | Скорость | Что тестирует |
-|---------|---------|----------|--------------|
-| Headless | Node.js | <1s | JSONL parsing, backtrace, TUI markers |
-| E2E | Electron + `mcp__electron__*` | 15-60s | Store polling, OSC signals, real PTY, drag/IPC/dialog |
-
-Event-driven: `waitForClaudeSessionId`, `findInLogs('BoundaryMarker')`, no `waitForTimeout`. Методология — глобальный skill `electron-e2e-testing`.
-
----
-
-## License
-
-MIT
-
-> ! Documentation is routed through `docs_search MCP`: agents call `docs_search`, receive relevant files from `.semantic-index.json`, and read those files into context before non-trivial code changes.
+- [Установка на macOS](docs/setup/macos.md) · [Markdown для вашего AI](docs/setup/noted-terminal.prompt.md)
+- [Возможности](docs/features.md) · [Архитектура и API](docs/api.md)
+- [Ошибки и диагностика](docs/troubleshooting.md)
+- [Разработка и вклад](docs/development.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
+- [MIT License](LICENSE)

@@ -1,3 +1,4 @@
+import { getGeminiApiKey } from '../../utils/geminiApiKey.mjs';
 import {useHistorySearchMarkers} from '../../utils/historySearchMarkers';
 import {historySearchEntryKeys} from '../../../shared/history-search.mjs';
 import { usePointerGesture } from '../../hooks/usePointerGesture';
@@ -5558,7 +5559,7 @@ function Timeline({
         ).join('\n\n');
       }
     }
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = await getGeminiApiKey();
     const model = promptConfig.model;
     // If additionalPrompt provided, prepend it as higher-priority instruction
     const promptPrefix = additionalPrompt
@@ -6532,7 +6533,8 @@ function Timeline({
                 ).join('\n\n');
               }
             }
-            const apiKey = process.env.GEMINI_API_KEY;
+            const apiKey = await getGeminiApiKey();
+            if (!isThisRewindActive()) return;
             const model = promptConfig.model;
             const promptPrefix = additionalPrompt
               ? `ПРИОРИТЕТНАЯ ИНСТРУКЦИЯ (выполнить в первую очередь):\n${additionalPrompt}\n\n---\nОСНОВНОЙ ПРОМПТ:\n`

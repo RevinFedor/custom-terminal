@@ -88,11 +88,11 @@ try {
   for (const entry of ['src', 'packages/claude-blocks']) await fs.cp(path.join(source, entry), path.join(snapshot, entry),
     { recursive: true, filter: file => !file.includes('/node_modules') && !file.includes('/.git') });
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
-  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, 'packages', name),
+  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, 'packages', name),
     { recursive: true, filter: file => !file.includes('/node_modules') });
   const rootFiles = ['package.json', 'package-lock.json', 'electron.vite.config.js', 'index.html'];
   for (const file of rootFiles) await fs.copyFile(path.join(source,file),path.join(snapshot,file));
-  for (const entry of ['package.json','build']) await fs.cp(path.join(repo,'../noted-shared',entry),path.join(shared,entry),{recursive:true});
+  for (const entry of ['package.json','build']) await fs.cp(path.join(repo,'vendor/noted-shared',entry),path.join(shared,entry),{recursive:true});
   if (await fs.stat(path.join(source,'public')).catch(()=>null)) await fs.cp(path.join(source,'public'),path.join(snapshot,'public'),{recursive:true});
   const filesUnder = async directory => {
     const found=[];

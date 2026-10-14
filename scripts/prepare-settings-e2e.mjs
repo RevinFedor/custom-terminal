@@ -48,11 +48,11 @@ for (const name of new Set(stdout.split('\0').filter(Boolean))) {
 }
 await fs.symlink(path.join(project, 'node_modules'), path.join(source, 'node_modules'));
 // Vite's two repo-local source packages must be frozen too, not HMR symlinks.
-await fs.cp(path.resolve(project, '../noted-shared'), path.join(lease, 'noted-shared'), {
+await fs.cp(path.resolve(project, 'vendor/noted-shared'), path.join(lease, 'noted-shared'), {
   recursive: true,
   filter: p => !/(^|\/)(node_modules|\.git|target|logs)(\/|$)/.test(p),
 });
-await fs.symlink(path.resolve(project, '../noted-shared/node_modules'), path.join(lease, 'noted-shared/node_modules'));
+await fs.symlink(path.resolve(project, 'vendor/noted-shared/node_modules'), path.join(lease, 'noted-shared/node_modules'));
 await fs.writeFile(path.join(env.CODEX_HOME, 'config.toml'), 'model = "gpt-5.6-luna"\nmodel_reasoning_effort = "low"\n', { mode: 0o600, flag: 'wx' });
 // Auth is reused locally for the same provider/account, never logged. Do not
 // copy sessions, config, account profile directories or MCP server settings.

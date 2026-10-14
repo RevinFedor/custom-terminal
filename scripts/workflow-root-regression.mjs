@@ -28,7 +28,7 @@ try{
  await fs.copyFile(path.join(repo,'package.json'),path.join(source,'package.json'));
  await fs.symlink(path.join(repo,'node_modules'),path.join(source,'node_modules'));
  const shared=path.join(artifact,'shared');
- for(const name of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'../noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')});
+ for(const name of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'vendor/noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')});
  const base=await fs.readFile(path.join(repo,'scripts/terminal-full-view-regression.mjs'),'utf8');
  const shim=base.slice(base.indexOf('function installShim('),base.indexOf('\ntry {\n  execFileSync'));
  assert.ok(shim.endsWith('}\n'),'exact isolated existing IPC adapter');

@@ -134,7 +134,7 @@ test('a path-first prompt includes pending context; only a standalone command le
   const command = await h.context.prepare(h.owner.tabId, 'local-command', '/compact');
   assert.equal(command.prefix, '');
   assert.equal(h.context.get(h.owner.tabId).pendingCount, 1);
-  const prompt = '/Users/fedor/Desktop/voice-record Описание задачи';
+  const prompt = '/Users/example/Desktop/voice-record Описание задачи';
   const prepared = await h.context.prepare(h.owner.tabId, 'ordinary-path', prompt);
   assert.ok(prepared.prefix.includes('context-update-id='));
   assert.ok(prepared.prompt.includes('updated body'));

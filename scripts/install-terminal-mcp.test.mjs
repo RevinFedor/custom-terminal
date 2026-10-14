@@ -48,7 +48,10 @@ test('canonical build install syncs Terminal MCP after packaging and before repl
   const { PREPARE_SCRIPTS } = await import('./build-install-noted-terminal.mjs');
   assert.equal(PREPARE_SCRIPTS.filter(step => step === 'install:terminal-mcp').length, 1);
   assert.ok(PREPARE_SCRIPTS.indexOf('build') < PREPARE_SCRIPTS.indexOf('install:terminal-mcp'));
-  assert.match(packageJson.scripts.build, /electron-builder.*sign:local-fast/);
+  assert.equal(packageJson.scripts.build, 'npm run build:app');
+  const publicBuild = await readFile(new URL('./build-public-app.mjs', import.meta.url), 'utf8');
+  assert.ok(publicBuild.indexOf('validate-app-asar.mjs') < publicBuild.indexOf('/usr/bin/codesign'));
+  assert.ok(!publicBuild.includes('sign:local-fast'));
   const driver = await readFile(join(projectDir, 'scripts', 'build-install-noted-terminal.mjs'), 'utf8');
   assert.ok(driver.indexOf('for (const script of PREPARE_SCRIPTS)') < driver.indexOf("step = 'quit'"));
   assert.ok(driver.indexOf("step = 'quit'") < driver.indexOf('await fileSystem.rename(stagedApp, installedApp)'));
@@ -56,7 +59,7 @@ test('canonical build install syncs Terminal MCP after packaging and before repl
   assert.equal(packageJson.scripts?.['build:i'], 'npm run build:install');
 
   const observer = await readFile(join(projectDir, 'scripts', 'build-when-idle.js'), 'utf8');
-  assert.match(observer, /spawn\('npm', \['run', 'build:install'\]/);
+  assert.match(observer, /spawnBuild\('npm', \['run', 'build:install'\]/);
 });
 
 test('installer atomically mirrors repo bytes, preserves config, and is idempotent in a temp HOME', async () => {

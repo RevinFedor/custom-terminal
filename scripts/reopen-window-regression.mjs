@@ -17,7 +17,7 @@ await fs.mkdir(path.join(snapshot,'scripts/fixtures'),{recursive:true});
 await fs.copyFile(path.join(repo,'scripts/fixtures/reopen-window.tsx'),path.join(snapshot,'scripts/fixtures/reopen-window.tsx'));
 await fs.symlink(path.join(repo,'node_modules'),path.join(snapshot,'node_modules'));
 const shared=path.join(artifact,'noted-shared/packages');
-for(const n of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'../noted-shared/packages',n),path.join(shared,n),{recursive:true,filter:p=>!p.includes('/node_modules')});
+for(const n of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'vendor/noted-shared/packages',n),path.join(shared,n),{recursive:true,filter:p=>!p.includes('/node_modules')});
 const appSource=await fs.readFile(process.env.NOTED_REOPEN_BASELINE_APP||path.join(snapshot,'src/renderer/App.tsx'),'utf8');
 const ast=ts.createSourceFile('App.tsx',appSource,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
 let handler;function visit(node){if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='handleReopenLastClosedCapture')handler=node.initializer.getText(ast);ts.forEachChild(node,visit);}visit(ast);assert.ok(handler);

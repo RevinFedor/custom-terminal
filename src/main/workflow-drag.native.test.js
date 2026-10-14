@@ -9,13 +9,13 @@ const {dragRelation}=require('../shared/workflow-drag.cjs');
 function bundled(file) {
   const filename=path.resolve(__dirname,file),mod=new Module(filename,module);mod.filename=filename;mod.paths=module.paths;
   const {outputFiles}=buildSync({entryPoints:[filename],bundle:true,platform:'node',format:'cjs',write:false,logLevel:'silent',
-    alias:{'@noted/structured-dnd':path.resolve(__dirname,'../../../noted-shared/packages/structured-dnd/src')}});
+    alias:{'@noted/structured-dnd':path.resolve(__dirname,'../../vendor/noted-shared/packages/structured-dnd/src')}});
   mod._compile(outputFiles[0].text,filename);return mod.exports;
 }
 const {captureWorkflowDrag,workflowDragRequest,workflowDragSourceValid}=bundled('../renderer/utils/workflowDragModel.mjs');
 const {organizationProjection,createOrganizationCommitter}=bundled('../renderer/utils/workflowOrganizationClient.mjs');
 const {selectWorkflowReserve,workflowReserveOutline,projectReservePaneSource}=bundled('../renderer/utils/workflowReserve.mjs');
-const {prepareDrag,projectVerticalMove,projectForestToRootEnd}=bundled('../../../noted-shared/packages/structured-dnd/src/core/index.js');
+const {prepareDrag,projectVerticalMove,projectForestToRootEnd}=bundled('../../vendor/noted-shared/packages/structured-dnd/src/core/index.js');
 const {createWorkflowRelationReceipts}=bundled('../renderer/utils/workflowRelationReceipts.mjs');
 const {createProjectTabSaveQueue}=bundled('../renderer/utils/projectTabSaveQueue.mjs');
 const {createExecutionRevisionAcks}=bundled('../renderer/utils/executionRevisionAcks.mjs');

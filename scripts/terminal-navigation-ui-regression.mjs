@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';import path from 'node:path';import os from 'n
 import {fileURLToPath} from 'node:url';import {execFileSync} from 'node:child_process';
 import {once} from 'node:events';import assert from 'node:assert/strict';import {createHash} from 'node:crypto';
 import {build as bundle} from 'esbuild';import {_electron as electron} from 'playwright';import ts from 'typescript';
-const noted=fileURLToPath(new URL('..',import.meta.url)),sc='/Users/fedor/Desktop/sc-desktop';
+const noted=fileURLToPath(new URL('..',import.meta.url)),sc='/Users/example/Desktop/sc-desktop';
 const trackerOnly=process.argv.includes('--tracker-only');
 const artifact=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'noted-terminal-navigation-ui-')));
 const report={artifact,checks:[],errors:[],console:[],source:{},pass:false,boundary:'Actual Noted Timeline/header/message rows, SC navigation binding/store/detail; private synthetic IO, actual HTTP/controller. No provider/production/OS input. Not whole app initialization.'};
@@ -110,7 +110,7 @@ try{
     report.source[file]=createHash('sha256').update(await fs.readFile(path.join(notedSnap,file))).digest('hex');
   }
   const shared=path.join(artifact,'noted-shared/packages');
-  for(const name of ['structured-dnd','file-explorer'])await fs.cp(path.join(noted,'../noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')});
+  for(const name of ['structured-dnd','file-explorer'])await fs.cp(path.join(noted,'vendor/noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')});
   const output=path.join(artifact,'noted-ui');await fs.mkdir(output);
   await bundle({entryPoints:[path.join(notedSnap,'scripts/fixtures/terminal-navigation-ui.tsx')],bundle:true,outfile:path.join(output,'bundle.js'),platform:'browser',format:'esm',jsx:'automatic',target:'chrome120',logLevel:'silent',
     define:{'process.env.NODE_ENV':'"production"','import.meta.env':'{"DEV":false,"MODE":"test"}'},

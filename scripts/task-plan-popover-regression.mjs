@@ -19,7 +19,7 @@ try {
   await fs.copyFile(path.join(repo, 'scripts/fixtures/task-plan-popover.tsx'), path.join(snapshot, 'scripts/fixtures/task-plan-popover.tsx'));
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
   const shared = path.join(artifact, 'noted-shared/packages');
-  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name), { recursive: true, filter: p => !p.includes('/node_modules') });
+  for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, name), { recursive: true, filter: p => !p.includes('/node_modules') });
   for (const name of ['src/renderer/components/Workspace/TabTaskPlanPanel.tsx', 'src/renderer/components/Workspace/TaskPlanPopover.tsx', 'src/renderer/components/Workspace/TaskThemeEditor.tsx', 'src/renderer/hooks/useTaskEditorFloatingSurfaces.ts', 'src/renderer/utils/taskPlanPopupDismissal.mjs', 'src/renderer/utils/generateTaskTheme.ts', 'src/shared/task-theme-prompt.cjs', 'src/renderer/store/usePromptsStore.ts', 'src/renderer/store/useUIStore.ts', 'src/renderer/store/useWorkspaceStore.ts', 'src/main/tab-task-plan.js'])
     result.sources[name] = createHash('sha256').update(await fs.readFile(path.join(snapshot, name))).digest('hex');
   await build({ entryPoints: [path.join(snapshot, 'scripts/fixtures/task-plan-popover.tsx')], bundle: true, sourcemap: true,

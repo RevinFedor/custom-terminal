@@ -61,7 +61,7 @@ if (process.env.NOTED_AUDIT_CONTROL_STALE_RUNS === '1') {
 }
 await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
 for (const name of ['structured-dnd', 'file-explorer']) {
-  await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(artifact, 'noted-shared/packages', name),
+  await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(artifact, 'noted-shared/packages', name),
     { recursive: true, filter: file => !file.includes('/node_modules') });
 }
 for (const name of ['PromptQueueOverlay', 'OrchestrationStatusChip', 'TabMessageTracker', 'TabMessageSourceChip', 'RequestTrackerRow']) {

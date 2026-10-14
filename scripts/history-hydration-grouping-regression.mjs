@@ -20,7 +20,7 @@ await fs.copyFile(path.join(repo,'scripts/fixtures/history-hydration-grouping.ts
 await fs.symlink(path.join(repo,'node_modules'),path.join(snapshot,'node_modules'));
 const {applyHistoryRowWindow}=require(path.join(snapshot,'src/main/history-entry-window.js'));
 const shared=path.join(artifact,'noted-shared/packages');
-for(const n of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'../noted-shared/packages',n),path.join(shared,n),{recursive:true,filter:p=>!p.includes('/node_modules')});
+for(const n of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'vendor/noted-shared/packages',n),path.join(shared,n),{recursive:true,filter:p=>!p.includes('/node_modules')});
 const stamp=(i)=>new Date(Date.UTC(2026,8,1,0,0,i)).toISOString();
 const rows=Array.from({length:200},(_,i)=>({uuid:'row-'+i,role:i%2?'assistant':'user',sessionId:'hydration-grouping-session',
  sourceIdentity:'source-'+i,timestamp:stamp(i),content:i%2?'Earlier answer. '.repeat(16):'Earlier question '+i}));

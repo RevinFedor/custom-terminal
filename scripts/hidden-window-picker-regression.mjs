@@ -30,7 +30,7 @@ try {
   }
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
   const shared = path.join(artifact, 'noted-shared/packages');
-  for (const n of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', n), path.join(shared, n),
+  for (const n of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', n), path.join(shared, n),
     { recursive: true, filter: p => !p.includes('/node_modules') });
   await build({ sourcemap: true, entryPoints: [path.join(snapshot, 'scripts/fixtures/hidden-window-picker.tsx')], bundle: true,
     outfile: path.join(artifact, 'bundle.js'), platform: 'browser', format: 'iife', target: 'chrome120', jsx: 'automatic', logLevel: 'silent',

@@ -39,7 +39,7 @@ const longText = [
   'A long assistant block keeps its last visible line available for the timestamp.',
   '',
   '- Markdown list item with enough text to wrap in a narrow pane.',
-  '- Another list item with a long path: /Users/fedor/Desktop/custom-terminal/docs/knowledge/fact-history.md',
+  '- Another list item with a long path: /Users/example/Desktop/custom-terminal/docs/knowledge/fact-history.md',
   '',
   '| column | value |',
   '| --- | --- |',
@@ -152,7 +152,7 @@ function FixtureApp() {
     content: config.variant === 'streamed' ? longText + '\nStream update.' : longText,
     sessionId: 'history-record-time',
   };
-  const toolArgs = { command: 'rg --hidden --glob **/*.md history-record-time /Users/fedor/Desktop/custom-terminal' };
+  const toolArgs = { command: 'rg --hidden --glob **/*.md history-record-time /Users/example/Desktop/custom-terminal' };
   const toolAction: any = {
     toolUseId: 'exact-call',
     toolName: 'exec_command',

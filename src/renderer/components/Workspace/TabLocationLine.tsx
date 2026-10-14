@@ -28,7 +28,7 @@ const { shell } = window.require('electron');
 
 const HOME = (typeof process !== 'undefined' && process.env.HOME) || '';
 
-/** `/Users/fedor/x` → `~/x`. The home prefix is noise on every single path. */
+/** `/Users/example/x` → `~/x`. The home prefix is noise on every single path. */
 export function shortenHome(fullPath: string, home = HOME): string {
   const value = String(fullPath || '');
   if (!home || !value.startsWith(home)) return value;

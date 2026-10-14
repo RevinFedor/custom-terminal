@@ -40,7 +40,7 @@ test('bash family split: read / search / git / run', () => {
 });
 
 test('a pathlib write is an edit with its explicit target; a Python read is not', () => {
-  const filePath = '/Users/fedor/Desktop/project/docs/tmp/state.md';
+  const filePath = '/Users/example/Desktop/project/docs/tmp/state.md';
   const command = `python3 - <<'PY'\nfrom pathlib import Path\np=Path('${filePath}')\ns=p.read_text()\np.write_text(s + 'updated\\n')\nPY`;
   const call = { toolName: 'Bash', args: { command } };
   const classified = classifyHistoryAction(call);
@@ -53,7 +53,7 @@ test('a pathlib write is an edit with its explicit target; a Python read is not'
 });
 
 test('real Claude assignment-prefixed writes keep their exact linked-file target', () => {
-  const filePath = '/Users/fedor/Global-Templates/🔧 Template-Prompts/artistic-mastery/state.md';
+  const filePath = '/Users/example/Global-Templates/🔧 Template-Prompts/artistic-mastery/state.md';
   const commands = [
     `F="${filePath}"\ncat >> "$F" <<'EOF'\nnew notes\nEOF`,
     `F="${filePath}"\npython3 - <<'PY'\nimport io\nF="${filePath}"\ns=io.open(F,encoding="utf-8").read()\nio.open(F,"w",encoding="utf-8").write(s)\nPY`,
@@ -72,7 +72,7 @@ test('dynamic shell variables do not become file ownership evidence', () => {
     'F="$HOME/state.md"\ncat >> "$F" <<EOF\nbody\nEOF',
     'F="$(pwd)/state.md"\ncat >> "$F" <<EOF\nbody\nEOF',
     'cat >> "$UNDECLARED" <<EOF\nbody\nEOF',
-    'cat >> "$F" <<EOF\nF="/Users/fedor/state.md"\nEOF',
+    'cat >> "$F" <<EOF\nF="/Users/example/state.md"\nEOF',
   ]) {
     assert.notEqual(classifyHistoryAction({ toolName: 'Bash', args: { command } }).family, 'edit');
   }
@@ -293,7 +293,7 @@ test('a run headline is program + subcommand words ONLY — no flags, paths or e
     historyActionHeadline({ toolName: 'Bash', args: { command }, family: 'run' }).subject;
   assert.equal(subject('npm run build'), 'npm run build');
   assert.equal(subject('docker compose up -d'), 'docker compose up');
-  assert.equal(subject('mkdir -p /Users/fedor/Desktop/vs-code/agrotech/webodm/docs/tmp'), 'mkdir');
+  assert.equal(subject('mkdir -p /Users/example/Desktop/vs-code/agrotech/webodm/docs/tmp'), 'mkdir');
   assert.equal(subject('sips --cropToHeightWidth 340 680 shot.png'), 'sips');
   assert.equal(subject('python3 -c "import x"'), 'python3');
   assert.equal(subject("printf '%s\\n' a; rg --files docs | sort"), 'printf');

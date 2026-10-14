@@ -67,7 +67,7 @@ try {
   await fs.mkdir(path.join(snapshot, 'scripts/fixtures'), { recursive: true });
   await fs.copyFile(path.join(repo, 'scripts/fixtures/history-renderer-input-paint.tsx'), path.join(snapshot, 'scripts/fixtures/history-renderer-input-paint.tsx'));
   await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
-  for (const file of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', file), path.join(shared, file), {
+  for (const file of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', file), path.join(shared, file), {
     recursive: true, filter: item => !item.includes('/node_modules') && !item.includes('/.git') });
   const switched = ['src/renderer/components/Workspace/HistoryPanel.tsx', 'src/renderer/styles/globals.css'];
   const current = new Map(await Promise.all(switched.map(async file => [file, await fs.readFile(path.join(snapshot, file))])));

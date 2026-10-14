@@ -104,7 +104,7 @@ try {
   await fs.copyFile(fileURLToPath(import.meta.url),path.join(snapshot,'scripts/window-split-reveal-regression.mjs'));
   await fs.symlink(path.join(repo,'node_modules'),path.join(snapshot,'node_modules'));
   const shared = path.join(artifact,'noted-shared/packages');
-  for (const name of ['structured-dnd','file-explorer']) await fs.cp(path.join(repo,'../noted-shared/packages',name),path.join(shared,name),
+  for (const name of ['structured-dnd','file-explorer']) await fs.cp(path.join(repo,'vendor/noted-shared/packages',name),path.join(shared,name),
     { recursive: true, filter: p => !p.includes('/node_modules') });
   const bundled = await build({ nodePaths: [path.join(repo,'node_modules')], sourcemap: true, metafile: true,
     entryPoints: [path.join(snapshot,'scripts/fixtures/window-split-reveal.tsx')], bundle: true,

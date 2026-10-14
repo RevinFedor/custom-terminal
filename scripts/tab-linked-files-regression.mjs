@@ -42,7 +42,7 @@ try {
   }
   const baselinePath=path.join(snapshot,baselineModules[0][1]);
   const shared=path.join(artifact,'noted-shared/packages');
-  for(const name of ['structured-dnd','file-explorer']) await fs.cp(path.join(repo,'../noted-shared/packages',name),path.join(shared,name),
+  for(const name of ['structured-dnd','file-explorer']) await fs.cp(path.join(repo,'vendor/noted-shared/packages',name),path.join(shared,name),
     {recursive:true,filter:p=>!p.includes('/node_modules')});
   for(const file of ['src/renderer/components/Workspace/TabCard.tsx','src/renderer/components/Workspace/PaneTabChip.tsx',
     'src/renderer/components/Workspace/TabSignals.tsx','src/renderer/components/Workspace/tabChrome.ts',

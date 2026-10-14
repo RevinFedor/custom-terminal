@@ -17,7 +17,7 @@ const compiled = ts.transpileModule(source.slice(start, end), { compilerOptions:
   target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
 } }).outputText;
 
-for (const text of ['/Users/fedor/Desktop/voice-record Описание задачи',
+for (const text of ['/Users/example/Desktop/voice-record Описание задачи',
   '/tmp/readme.md', '/status\nexplain this example', 'ordinary text']) {
   test('actual History send retains every attached prompt for ' + JSON.stringify(text), () => {
     const sourceChips = [
@@ -57,7 +57,7 @@ for (const text of ['/compact', ' \n\t /model haiku', '/effort max']) {
 }
 
 test('renderer, main receipt and composer use one local-command grammar', () => {
-  for (const text of [null, '', '/compact', '/Users/fedor/file', '/status\nexplain',
+  for (const text of [null, '', '/compact', '/Users/example/file', '/status\nexplain',
     '//text', 'text /model', '/custom-command arguments', ' \n /effort max']) {
     const expected = normalizeAgentLocalCommand(text) !== null;
     assert.equal(chips.isTerminalOnlyComposerDraft(text), expected);

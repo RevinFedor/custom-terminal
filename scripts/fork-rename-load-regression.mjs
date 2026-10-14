@@ -20,7 +20,7 @@ await fs.mkdir(path.join(snapshot,'scripts/lib'),{recursive:true});
 for(const name of ['fixtures/fork-rename-load.tsx','lib/codex-turn-append-harness.cjs'])await fs.copyFile(path.join(repo,'scripts',name),path.join(snapshot,'scripts',name));
 await fs.symlink(path.join(repo,'node_modules'),path.join(snapshot,'node_modules'));
 const shared=path.join(artifact,'noted-shared/packages');
-for(const name of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'../noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')});
+for(const name of ['structured-dnd','file-explorer'])await fs.cp(path.join(repo,'vendor/noted-shared/packages',name),path.join(shared,name),{recursive:true,filter:p=>!p.includes('/node_modules')});
 await build({entryPoints:[path.join(snapshot,'scripts/fixtures/fork-rename-load.tsx')],bundle:true,outfile:path.join(artifact,'bundle.js'),platform:'browser',format:'esm',target:'chrome120',logLevel:'silent',
  define:{'process.env.NODE_ENV':'"production"','import.meta.env':'{"DEV":false,"MODE":"test"}'},
  alias:{'@noted/claude-blocks':path.join(snapshot,'packages/claude-blocks/src'),'@noted/structured-dnd':path.join(shared,'structured-dnd/src'),'@noted/file-explorer':path.join(shared,'file-explorer/src'),react:path.join(repo,'node_modules/react'),'react-dom':path.join(repo,'node_modules/react-dom')},

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import {transformSync} from 'esbuild';
-import {visualHierarchyAncestorIds} from '../../../../../noted-shared/packages/structured-dnd/src/index.js';
+import {visualHierarchyAncestorIds} from '../../../../vendor/noted-shared/packages/structured-dnd/src/index.js';
 
 function sourceHarness(){
  const source=fs.readFileSync(process.env.NOTED_TABBAR_TREE_SOURCE||new URL('./TabBar.tsx',import.meta.url),'utf8');

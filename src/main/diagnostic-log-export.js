@@ -67,6 +67,15 @@ function createDiagnosticSanitizer({ includeMessageText = false } = {}) {
     }
 
     const beforeSecrets = stats.redactions;
+    // JSON logs quote field names; the plain key=value patterns below do not
+    // cover the quote between a name and its colon. Redact known scalar secrets
+    // independently of the include-message-text option.
+    line = replaceAndCount(
+      line,
+      /"(authorization|proxy[-_]authorization|cookie|set[-_]cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|client[_-]?secret|secret|password|passwd|(?:ANTHROPIC|OPENAI|GEMINI|GOOGLE|GITHUB|GH|AWS|SONIOX|ASSEMBLYAI|PERPLEXITY)[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))"\s*:\s*(?:"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/gi,
+      (_match, key) => `"${key}":"<redacted>"`,
+      stats,
+    );
     line = replaceAndCount(
       line,
       /\b(authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*[^\r\n]*/gi,

@@ -1,3 +1,9 @@
+## Самостоятельная установка на macOS
+
+Для установки на другом Mac сначала читать [README](README.md), [macOS setup](docs/setup/macos.md) и [самодостаточную инструкцию для AI](docs/setup/noted-terminal.prompt.md). Они описывают переносимый source build этого репозитория. Внешние пути и инструменты машины автора в последующих developer-инструкциях не являются обязательными зависимостями установки; при их отсутствии использовать документацию самого checkout. `npm run build:app` собирает локальный bundle без установки/перезапуска, а legacy `build:install`/`build:i` заменяют приложение и требуют отдельного поручения.
+
+Ключи задаются только локально: [`.env.example`](.env.example) → `.env` для dev; `~/.noted-terminal/.env` для packaged приложения. Сам `.env` в Git не входит. Обычный Claude/Codex CLI login не требует API-ключей Noted. Ни сборка, ни проверка инструкции не должны запускать model prompt автоматически.
+
 <!-- @deploy-start -->
 <instructions>
   <step index="1">

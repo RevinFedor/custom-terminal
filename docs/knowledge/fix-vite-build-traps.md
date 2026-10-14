@@ -42,28 +42,20 @@ const cmd = 'lsof -p ' + pid + ' | grep cwd | awk \'{print ' + '\$' + '9}\'';
 ### Причина
 Vite заменяет `process.env.X` в renderer-коде на **литерал при сборке**. Если env var не определён в build-time контексте — подставится `undefined`. Main process работает с настоящим Node.js `process.env` (runtime), renderer — с замороженным снапшотом времени сборки.
 
-### Решение — `define` в `electron.vite.config.js` с предварительной загрузкой `.env`:
+### Решение для ключей — runtime ENV и локальный IPC
 
-```js
-import { config } from 'dotenv';
-const env = config({ path: resolve(__dirname, '.env') }).parsed || {};
+Ключи нельзя подставлять через Vite `define`: значение окажется в renderer JS,
+артефакте сборки и при ошибочном коммите — в истории. Main читает локальный `.env`
+на старте приложения; `settings:get-gemini-api-key` возвращает только configured
+Gemini key существующим renderer-действиям. Общий `getGeminiApiKey` используется
+названиями, описаниями, EditRange и AI-Rewind. Rewind/cancel сохраняют свои guards
+после await. HTTP/model runner не дублируется, синхронный IPC не добавляется.
 
-export default defineConfig({
-  renderer: {
-    define: {
-      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY || ''),
-      'process.env.ANTHROPIC_API_KEY': JSON.stringify(env.ANTHROPIC_API_KEY || ''),
-    },
-  },
-});
-```
-
-Каждый env var, который renderer должен видеть, **явно** перечисляется в `define`. Не перечислил — будет `undefined` в production.
-
-### Почему не другие подходы
-- **`VITE_` префикс** (`import.meta.env.VITE_X`) — требует переписать **все** места использования в renderer, ломает единообразие с main (где `process.env.X` работает нативно).
-- **IPC handler `app:getEnv`** — оверинжиниринг для статических значений (ключи API не меняются в runtime), плюс async везде где должно быть sync.
-- **`.env` loader в main.js** — работает только для main process, renderer бандлится отдельно и не видит этот код.
+`define` допустим для несекретных build constants. Прежнее решение inline ENV
+исправляло undefined в production, но не подходило для распространяемого приложения:
+renderer должен получать credential runtime, сохраняя существующие API-действия.
+Runtime-key tests проверяют actual IPC registration на синтетическом ENV; сборка
+с key-canary дополнительно проверяет, что значение не попало в renderer output.
 
 ---
 

@@ -144,25 +144,25 @@ test('parses lsof field records and keeps only writable rollout files', () => {
     'p71060',
     'f30',
     'ar',
-    'n/Users/fedor/.codex/sessions/2026/07/22/read-only.jsonl',
+    'n/Users/example/.codex/sessions/2026/07/22/read-only.jsonl',
     'f31',
     'au',
-    'n/Users/fedor/.codex/sessions/2026/07/22/current.jsonl',
+    'n/Users/example/.codex/sessions/2026/07/22/current.jsonl',
     'f32',
     'au',
-    'n/Users/fedor/Desktop/unrelated.jsonl',
+    'n/Users/example/Desktop/unrelated.jsonl',
   ].join('\n');
 
   assert.equal(parseLsofFieldRecords(output).length, 3);
   assert.deepEqual(
-    writableCodexRolloutsFromLsof(output, '/Users/fedor/.codex/sessions')
+    writableCodexRolloutsFromLsof(output, '/Users/example/.codex/sessions')
       .map((record) => record.name),
-    ['/Users/fedor/.codex/sessions/2026/07/22/current.jsonl'],
+    ['/Users/example/.codex/sessions/2026/07/22/current.jsonl'],
   );
 });
 
 test('one writable rollout is authoritative even when wrapper and child share it', () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const filePath = sessionsDir + '/2026/07/22/current.jsonl';
   const proof = resolveCodexWriterProof([
     { pid: 100, output: `p100\nf20\nau\nn${filePath}\n` },
@@ -198,7 +198,7 @@ test('writer ownership treats symlink aliases as the same sessions directory', (
 });
 
 test('multiple writable rollouts are ambiguous and cannot become a binding', () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const proof = resolveCodexWriterProof([
     { pid: 100, output: `p100\nf20\nau\nn${sessionsDir}/a.jsonl\n` },
     { pid: 101, output: `p101\nf21\naw\nn${sessionsDir}/b.jsonl\n` },
@@ -212,7 +212,7 @@ test('multiple writable rollouts are ambiguous and cannot become a binding', () 
 });
 
 test('one candidate plus one failed process inspection is unknown, not owned', () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const filePath = sessionsDir + '/2026/07/22/current.jsonl';
   const proof = resolveCompleteCodexWriterProof([
     { pid: 100, output: `p100\nf20\nau\nn${filePath}\n` },
@@ -346,7 +346,7 @@ test('descriptor proof retry fails closed when launch generation changes', async
 });
 
 test('user TUI writer stays authoritative while collaboration subagents are writable', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const paths = {
     parent: sessionsDir + '/rollout-parent.jsonl',
     childA: sessionsDir + '/rollout-child-a.jsonl',
@@ -371,7 +371,7 @@ test('user TUI writer stays authoritative while collaboration subagents are writ
 });
 
 test('two user TUI writable rollouts remain ambiguous after subagent filtering', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const first = sessionsDir + '/rollout-user-a.jsonl';
   const second = sessionsDir + '/rollout-user-b.jsonl';
   const descriptorProof = resolveCodexWriterProof([{
@@ -387,7 +387,7 @@ test('two user TUI writable rollouts remain ambiguous after subagent filtering',
 });
 
 test('explicit native Rewind selects the one direct child with exact-generation live proof', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const source = sessionsDir + '/rollout-source.jsonl';
   const child = sessionsDir + '/rollout-child.jsonl';
   const descriptorProof = resolveCodexWriterProof([{
@@ -425,7 +425,7 @@ test('explicit native Rewind selects the one direct child with exact-generation 
 });
 
 test('explicit native Rewind does not accept a sole still-open source rollout', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const source = sessionsDir + '/rollout-source.jsonl';
   const descriptorProof = resolveCodexWriterProof([{
     pid: 100,
@@ -450,7 +450,7 @@ test('explicit native Rewind does not accept a sole still-open source rollout', 
 });
 
 test('log fixture: exact durable Rewind may keep the sole source rollout on the same PTY generation', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const sourceSessionId = '019f8f94-993d-7011-ad76-a29419fcd523';
   const source = sessionsDir + '/2026/07/23/rollout-2026-07-23T18-25-08-'
     + sourceSessionId + '.jsonl';
@@ -510,7 +510,7 @@ test('log fixture: exact durable Rewind may keep the sole source rollout on the 
 });
 
 test('explicit native Rewind accepts a sole child only with exact live proof', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const child = sessionsDir + '/rollout-child.jsonl';
   const descriptorProof = resolveCodexWriterProof([{
     pid: 100,
@@ -727,7 +727,7 @@ test('native Rewind accepts a root replacement only with exact target-prefix and
 });
 
 test('Codex 0.145 root replacement with an empty retained prefix resolves through the full writer filter', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const sourcePath = sessionsDir + '/rollout-source-c1.jsonl';
   const replacementPath = sessionsDir + '/rollout-replacement-c2.jsonl';
   const descriptorProof = resolveCodexWriterProof([{
@@ -921,7 +921,7 @@ test('restart reconcile accepts only the recorded root replacement and tolerates
 });
 
 test('settled native Rewind proof resolves source plus exact child only while every scope still matches', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const source = sessionsDir + '/rollout-source.jsonl';
   const child = sessionsDir + '/rollout-child.jsonl';
   const terminalToken = {};
@@ -1070,7 +1070,7 @@ test('settled Rewind proof fails closed for stale scope, wrong identity, or non-
 });
 
 test('settled stable-source proof survives an ordinary sole-source revalidation', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const source = sessionsDir + '/rollout-source-stable.jsonl';
   const terminalToken = {};
   const descriptorProof = resolveCodexWriterProof([{
@@ -1410,7 +1410,7 @@ test('a committed root replacement stays authoritative while its exact runtime s
 });
 
 test('the full public writer filter revalidates a committed root replacement after its handoff closes', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const source = sessionsDir + '/rollout-manual-c1.jsonl';
   const replacement = sessionsDir + '/rollout-replacement-c2.jsonl';
   const terminalToken = {};
@@ -1667,7 +1667,7 @@ test('writer proof run sequence keeps only explicit positive generations', () =>
 });
 
 test('first native Rewind preserves only the exact source as a read-only incumbent', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const sourceA = sessionsDir + '/rollout-a.jsonl';
   const siblingD = sessionsDir + '/rollout-d.jsonl';
   const terminalToken = {};
@@ -1748,7 +1748,7 @@ test('first native Rewind preserves only the exact source as a read-only incumbe
 });
 
 test('active native Rewind B to C ignores settled B and selects exact live child C', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const sourceA = sessionsDir + '/rollout-a.jsonl';
   const settledB = sessionsDir + '/rollout-b.jsonl';
   const childC = sessionsDir + '/rollout-c.jsonl';
@@ -1802,7 +1802,7 @@ test('active native Rewind B to C ignores settled B and selects exact live child
 });
 
 test('active native Rewind preserves the exact incumbent read-only while its successor is pending', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const sourceA = sessionsDir + '/rollout-a.jsonl';
   const settledB = sessionsDir + '/rollout-b.jsonl';
   const terminalToken = {};
@@ -1857,7 +1857,7 @@ test('active native Rewind preserves the exact incumbent read-only while its suc
 });
 
 test('active native Rewind does not preserve an incumbent across a sibling writer', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const sourceA = sessionsDir + '/rollout-a.jsonl';
   const settledB = sessionsDir + '/rollout-b.jsonl';
   const siblingD = sessionsDir + '/rollout-d.jsonl';
@@ -1989,7 +1989,7 @@ test('stable source settlement requires the exact durable same-generation Rewind
 });
 
 test('unreadable writable candidate makes the complete writer proof unknown', async () => {
-  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sessionsDir = '/Users/example/.codex/sessions';
   const parent = sessionsDir + '/rollout-parent.jsonl';
   const unreadable = sessionsDir + '/rollout-unreadable.jsonl';
   const descriptorProof = resolveCodexWriterProof([{

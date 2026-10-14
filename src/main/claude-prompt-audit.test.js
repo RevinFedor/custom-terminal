@@ -275,8 +275,8 @@ test('an identical pre-submit Claude record cannot satisfy the next audit', asyn
 
 test('209: a path-first prompt gets the same receipt and Claude audit classification', () => {
   const { isDesktopHistorySendReceiptEligible } = require('./agent-history-send-receipt');
-  for (const content of ['/Users/fedor/Desktop/voice-record Так, хочу описать задачу',
-    '/tmp/input.txt', '/status\nexplain this example', '  /Users/fedor/Desktop/My Project/file.md']) {
+  for (const content of ['/Users/example/Desktop/voice-record Так, хочу описать задачу',
+    '/tmp/input.txt', '/status\nexplain this example', '  /Users/example/Desktop/My Project/file.md']) {
     assert.equal(isDesktopHistorySendReceiptEligible({
       submit: true, tabId: 'tab-209', handoffId: 'attempt-209', source: 'history-panel', rawPrompt: content,
     }), true);

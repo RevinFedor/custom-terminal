@@ -11,7 +11,7 @@ const {
 
 const prompt = [
   'Accessing workspace:',
-  '/Users/fedor/Desktop/sc-desktop',
+  '/Users/example/Desktop/sc-desktop',
   'Quick safety check: Is this a project you created or one you trust?',
   "Claude Code'll be able to read, edit, and execute files here.",
   'Security guide',

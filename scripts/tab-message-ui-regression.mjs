@@ -33,7 +33,7 @@ for (const width of [900, 350]) test(`isolated tracker, History hash/envelope gu
     for (const name of ['src', 'packages/claude-blocks']) await fs.cp(path.join(repo, name), path.join(snapshot, name), { recursive: true, filter: p => !p.includes('/node_modules') && !p.includes('/.git') });
     await fs.symlink(path.join(repo, 'node_modules'), path.join(snapshot, 'node_modules'));
     const shared = path.join(artifact, 'noted-shared/packages');
-    for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, '../noted-shared/packages', name), path.join(shared, name), { recursive: true, filter: p => !p.includes('/node_modules') });
+    for (const name of ['structured-dnd', 'file-explorer']) await fs.cp(path.join(repo, 'vendor/noted-shared/packages', name), path.join(shared, name), { recursive: true, filter: p => !p.includes('/node_modules') });
     await fs.mkdir(path.join(snapshot, 'scripts/fixtures'), { recursive: true });
     await fs.copyFile(path.join(repo, 'scripts/fixtures/tab-message-ui.tsx'), path.join(snapshot, 'scripts/fixtures/tab-message-ui.tsx'));
     await fs.copyFile(path.join(repo, 'scripts/fixtures/codex-service-presentation.cjs'), path.join(snapshot, 'scripts/fixtures/codex-service-presentation.cjs'));

@@ -540,7 +540,7 @@ async function run() {
     );
     for (const name of ["structured-dnd", "file-explorer"]) {
       await fs.cp(
-        path.join(repo, "../noted-shared/packages", name),
+        path.join(repo, "vendor/noted-shared/packages", name),
         path.join(shared, name),
         {
           recursive: true,

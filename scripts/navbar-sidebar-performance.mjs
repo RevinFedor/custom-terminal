@@ -10,7 +10,7 @@ const shim=`window.require=(id)=>id==='electron'?{ipcRenderer:{on(){},removeList
 try {
  await build({entryPoints:[path.join(repo,'scripts/fixtures/navbar-sidebar-performance.tsx')],outfile:path.join(artifact,'bundle.js'),bundle:true,
   platform:'browser',format:'iife',jsx:'automatic',target:'chrome120',logLevel:'silent',define:{'process.env.NODE_ENV':'"production"'},
-  alias:{'@noted/structured-dnd':path.resolve(repo,'../noted-shared/packages/structured-dnd/src'),react:path.join(repo,'node_modules/react'),'react-dom':path.join(repo,'node_modules/react-dom')},
+  alias:{'@noted/structured-dnd':path.resolve(repo,'vendor/noted-shared/packages/structured-dnd/src'),react:path.join(repo,'node_modules/react'),'react-dom':path.join(repo,'node_modules/react-dom')},
   plugins:[{name:'explicit-controls-and-counters',setup(b){
    b.onResolve({filter:/\/useWorkspaceStore$/},()=>({path:path.join(repo,'scripts/fixtures/workflow-reserve-dnd-store.ts')}));
    b.onResolve({filter:/\/(TabBar|WorkflowGroupMenu|tabLinkedFilePreview)$/},args=>({path:args.path.split('/').at(-1),namespace:'controlled'}));

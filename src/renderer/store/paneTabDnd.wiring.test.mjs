@@ -17,7 +17,7 @@ const tabBar = read(path.join(workspace, 'TabBar.tsx'));
 const sidebarCursorChip = read(path.join(workspace, 'SidebarTabDragCursorChip.tsx'));
 const app = read(path.join(renderer, 'App.tsx'));
 const store = read(path.join(here, 'useWorkspaceStore.ts'));
-const shared = read(path.resolve(here, '../../../../noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js'));
+const shared = read(path.resolve(here, '../../../vendor/noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js'));
 const sidebarBridge = read(path.join(renderer, 'utils/sidebarTabDragBridge.mjs'));
 const pointerGesture = read(path.join(renderer, 'utils/paneTabPointerGesture.ts'));
 
