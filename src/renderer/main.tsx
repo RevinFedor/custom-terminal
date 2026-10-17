@@ -292,6 +292,12 @@ if (!rendererBootstrapWindow.__notedTerminalRendererBootstrapStarted) {
     }
   }).catch((error) => {
     rendererBootstrapWindow.__notedTerminalRendererBootstrapStarted = false;
-    console.error('[RendererBootstrap] failed to load application modules', error);
+    // Error fields are non-enumerable: forwarding the Error itself via
+    // JSON.stringify loses the import cause as "{}" in the Main log.
+    console.error('[RendererBootstrap] failed to load application modules', {
+      name: String(error?.name || typeof error).slice(0, 100),
+      message: String(error?.message || error).slice(0, 1000),
+      stack: String(error?.stack || '').slice(0, 4000),
+    });
   });
 }

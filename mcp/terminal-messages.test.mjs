@@ -21,7 +21,7 @@ function harness({ respond, env = {} } = {}) {
   const targets = [];
   const events = [];
   const context = vm.createContext({
-    AsyncLocalStorage, Buffer, URL, basename, join, resolve, promisify, execFile,
+    AsyncLocalStorage, Buffer, URL, URLSearchParams, basename, join, resolve, promisify, execFile,
     homedir: () => '/isolated-home',
     readdirSync: () => [],
     process: { env, argv: ['node', 'terminal-server.mjs'], cwd: () => '/fallback', stderr: { write() {} } },
@@ -73,6 +73,25 @@ function assertStructured(result) {
   if (!result.isError) assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
   return result.structuredContent;
 }
+
+test('inspect_tabs actual dispatcher is two GETs, strict bounds and update-required without fallback', async () => {
+  const h = harness({ respond: call => ({ status: 200, body: call.endpoint === '/api/me'
+    ? { capabilities: { tabInspection: { version: 1 } } }
+    : { version: 1, passive: true, tabs: [{ tabId: 'T', known: false, revision: 'r' }] } }) });
+  const schema = (await h.list()).find(tool => tool.name === 'inspect_tabs').inputSchema;
+  assert.equal(schema.properties.tabIds.maxItems, 8); assert.equal(schema.properties.maxPreviewChars.maximum, 2000);
+  const result = assertStructured(await h.call('inspect_tabs', { tabIds: ['T'], includeLastResponse: true, maxPreviewChars: 0 }));
+  assert.equal(result.tabs[0].known, false);
+  assert.deepEqual(h.calls.map(call => call.method), ['GET', 'GET']);
+  const params = new URL('http://local' + h.calls[1].endpoint).searchParams;
+  assert.equal(params.get('tabIds'), '["T"]'); assert.equal(params.get('maxPreviewChars'), '0');
+  const count = h.calls.length;
+  assert.equal((await h.call('inspect_tabs', { tabIds: Array.from({ length: 9 }, (_, i) => String(i)) })).isError, true);
+  assert.equal(h.calls.length, count);
+  const old = harness();
+  assert.equal((await old.call('inspect_tabs', { tabIds: ['T'] })).isError, true);
+  assert.equal(old.calls.length, 1);
+});
 
 test('tool schemas expose only the agreed arguments and describe message/receipt/completion workflows', async () => {
   const tools = await harness().list();

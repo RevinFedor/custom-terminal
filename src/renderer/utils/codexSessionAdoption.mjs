@@ -35,6 +35,11 @@ export function planCarriedCodexSettingsProofApplication({
   proof,
   nextSessionId,
   currentPersistentEffort,
+  currentProofAt,
+  currentProofSessionId,
+  currentLiveProofAt,
+  currentLiveSettingsSessionId,
+  currentProviderState,
 } = {}) {
   const model = typeof proof?.model === 'string' ? proof.model.trim() : '';
   const effort = typeof proof?.effort === 'string' ? proof.effort.trim().toLowerCase() : '';
@@ -42,6 +47,20 @@ export function planCarriedCodexSettingsProofApplication({
   const owner = typeof nextSessionId === 'string' ? nextSessionId.trim() : '';
   if (!model || !effort || !owner || !Number.isFinite(proofAt) || proofAt <= 0) {
     return { allowed: false, reason: 'carried-codex-settings-proof-invalid' };
+  }
+  // Binding is still adopted by its caller. Only an older settings projection
+  // loses to the child's newer explicit/applied choice; a foreign source proof
+  // never gains this priority merely because its timestamp happens to be high.
+  const newerPersistent = (!currentProofSessionId || currentProofSessionId === owner)
+    && Number(currentProofAt || 0) > proofAt;
+  const newerLive = (currentLiveSettingsSessionId === owner
+    || String(currentLiveSettingsSessionId || '').startsWith('launch:'))
+    && Number(currentLiveProofAt || 0) > proofAt;
+  if (newerPersistent || newerLive) return { allowed: false, reason: 'newer-child-settings-present' };
+  if (Number(currentProviderState?.codexSettingsIntentRevision || 0) > 0
+    && currentProviderState.codexSettingsIntentModel && currentProviderState.codexSettingsIntentEffort
+    && (currentProviderState.codexSettingsIntentModel !== model || currentProviderState.codexSettingsIntentEffort !== effort)) {
+    return { allowed: false, reason: 'child-settings-choice-present' };
   }
   const serviceTierPatch = typeof proof?.fast === 'boolean'
     ? {

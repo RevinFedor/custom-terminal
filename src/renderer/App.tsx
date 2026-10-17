@@ -1,5 +1,7 @@
 import { getGeminiApiKey } from './utils/geminiApiKey.mjs';
 import { usePointerGesture } from './hooks/usePointerGesture';
+import {validatePromptNativeMenuIntent,capturedPromptCommandTarget} from './utils/promptNativeMenuIntent.mjs';
+import { jumpToTerminalMessageTarget } from './utils/tabMessageSourceJump';
 import { rememberAgentLaunchFence } from './utils/agentLaunchFence.mjs';
 import { createEditableDictationClipboard } from './utils/dictationEditableClipboard.mjs';
 const editableDictation = createEditableDictationClipboard({ document, ipc: window.require('electron').ipcRenderer,
@@ -2320,6 +2322,7 @@ function App() {
       };
       try {
         const state = useWorkspaceStore.getState();
+        if (action === 'validatePromptNativeMenuIntent') return reply(true,validatePromptNativeMenuIntent(payload?.intent));
         if (action === 'readWorkspaceSwitcher') {
           try {
             if (!workspaceSwitcherRef.current) return reply(true, { error: 'switcher_renderer_unavailable', statusCode: 503 });
@@ -3024,6 +3027,14 @@ function App() {
             },
             reason: null,
           });
+        }
+        if (action === 'terminalMessageReferenceOpen') {
+          try {
+            const found = await jumpToTerminalMessageTarget(payload?.source, payload?.referenceId);
+            return reply(true, { found: found === true });
+          } catch (error) {
+            return reply(true, { found: false, reason: String(error?.message || 'exact-message-unavailable').slice(0, 200) });
+          }
         }
         if (action === 'dictationChipOpenOwner') {
           const tabId = String(payload?.tabId || '').trim();
@@ -5329,6 +5340,7 @@ function App() {
                 workContextPrepared: payload?.workContextPrepared === true,
                 sendAttemptId,
                 sendOperationKey,
+                preflightScope: payload?.preflightScope,
                 source: promptSource,
                 ...(payload?.promptQueueAction === 'send-now' ? { promptQueueAction: 'send-now' as const } : {}),
                 statusAtSend,
@@ -6907,11 +6919,16 @@ function App() {
     const handleContextMenuCommand = (_: any, cmd: string, data?: any) => {
       console.log('[ContextMenu] Command received:', cmd);
       if (cmd === 'insert-prompt') {
-        // Insert prompt text + file attachments into effective terminal (sub-agent aware)
-        const effectiveId = getEffectiveTabId();
+        // A validated native choice owns its captured tab through file awaits.
+        // Old callers without a target retain their previous compatibility path.
+        const effectiveId = capturedPromptCommandTarget(data,getEffectiveTabId);
         const { content, filePaths } = data as { content: string; filePaths: string[] };
         console.warn('[ContextMenu] insert-prompt: tabId=' + effectiveId + ' contentLen=' + (content?.length || 0) + ' files=' + (filePaths?.length || 0));
         if (effectiveId) {
+          const state=useWorkspaceStore.getState();
+          const owner=data?.projectId ? state.openProjects.get(data.projectId)?.tabs.has(effectiveId)
+            : [...state.openProjects.values()].some(workspace=>workspace.tabs.has(effectiveId));
+          if(data?.tabId && !owner)return;
           // 1. Prompt text — typed as keyboard input
           ipcRenderer.send('terminal:input', effectiveId, content);
           // 2. File contents — pasted via bracketed paste (shows as [Pasted text #N] in Claude TUI)
@@ -6920,6 +6937,12 @@ function App() {
               const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', filePaths);
               if (filesResult.success) {
                 for (const f of filesResult.data) {
+                  if(data?.tabId){
+                    const current=useWorkspaceStore.getState();
+                    const present=data?.projectId?current.openProjects.get(data.projectId)?.tabs.has(effectiveId)
+                      : [...current.openProjects.values()].some(workspace=>workspace.tabs.has(effectiveId));
+                    if(!present)return;
+                  }
                   await ipcRenderer.invoke('terminal:paste', { tabId: effectiveId, content: f.content, submit: false });
                 }
               }

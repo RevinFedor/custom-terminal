@@ -115,6 +115,8 @@ function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}
     terminalCommandState: new Map([['T', { isRunning: status !== 'inactive' }]]),
     terminalLifecycleEpochs: new WeakMap([[terminal, 'instance-T']]),
     getTerminalLifecycleGeneration: () => 'lifecycle-T',
+    agentSendCancellations: require('../../main/agent-send-cancellation').createAgentSendCancellationRegistry(),
+    codexNativeQuestionMirror: { get: () => null },
     getCodexWriterProofSnapshot: () => ({ sessionId: 'writer', terminalToken: terminal,
       runSeq: 0, lifecycleGeneration: 'lifecycle-T' }),
     currentCodexAcceptedResumeSourceProof: () => null,
@@ -139,6 +141,7 @@ function harness({ status = 'busy', inputReady = true, pasteResult = null } = {}
     } },
   };
   vm.createContext(context);
+  vm.runInContext(declaration(main, 'prepareCodexMainComposerForSend'), context);
   vm.runInContext(part(main, 'function readAgentSendDestinationAtWriteBoundary(',
     'function captureClaudeDraftPasteTarget('), context);
   vm.runInContext(part(main, 'function isCodexOperationalInputReady(', 'function observeCodexInputControlReadinessFrame('), context);

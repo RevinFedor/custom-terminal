@@ -7,7 +7,7 @@ import {
   projectAgentLocalCommandSendResult,
 } from './agentLocalCommand.mjs';
 import { isAutomaticReadinessWaitReceipt } from '../../shared/prompt-queue-send-intent.cjs';
-import { hiddenSendPresentation, canProjectCurrentProviderQueue, retiredSendInputSlot, cancelledSendIntent } from '../../shared/agent-send-receipt-control.cjs';
+import { hiddenSendPresentation, canProjectCurrentProviderQueue, retiredSendInputSlot, cancelledSendIntent, isTabMessageNoInputReceipt } from '../../shared/agent-send-receipt-control.cjs';
 
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
 
@@ -1428,7 +1428,15 @@ export class HistoryPromptHandoffStore {
         && !!proof?.auditTimestamp && !!proof?.actualHash
         && !!(proof?.entryUuid || proof?.sourceIdentity)
         && !/^(?:claude-queue:|codex-tui-queue:)/.test(proof?.sourceIdentity || '');
-      if (!exactConfirmation) return current.value;
+      const certifiedApplicationWait = current.value.queueStatus === 'failed'
+        && input.queueStatus === 'application-queued' && !control?.cancelled && !control?.retired
+        && !current.value.auditProof && !current.value.providerQueueProof
+        && !!current.value.sendAttemptId && !!current.value.sendOperationKey
+        && input.noWriteAttemptId === current.value.sendAttemptId
+        && input.sendAttemptId === current.value.sendAttemptId
+        && input.sendOperationKey === current.value.sendOperationKey
+        && input.toolType === current.value.toolType;
+      if (!exactConfirmation && !certifiedApplicationWait) return current.value;
     }
 
     const nextProof = mergeCompatibleAuditProof(current.value.auditProof, input.proof);
@@ -1918,6 +1926,8 @@ export async function runHistoryPromptHandoff(
       ));
     const failedWithoutSubmitProof = result?.success === false
       && result?.submitted !== true && !provenNotSubmitted;
+    const cancelledBeforeSubmit = provenNotSubmitted && result?.deliveryUnknown !== true
+      && (result?.cancelled === true || cancelledSendIntent(result));
     const transferred = !provenNotSubmitted && (localCommandReceipt.handled
       ? localCommandReceipt.transferred === true
       : !result
@@ -1935,7 +1945,7 @@ export async function runHistoryPromptHandoff(
       : failedWithoutSubmitProof
       ? 'delivery-unknown'
       : !transferred
-      ? 'failed'
+      ? (cancelledBeforeSubmit ? 'cancelled' : 'failed')
       : providerQueueReturned
       ? 'cancelled'
       : (result?.success === false && result?.submitted === true && !unconfirmedStatus)
@@ -1947,7 +1957,9 @@ export async function runHistoryPromptHandoff(
       // Keep the new exact negative receipt distinguishable from legacy
       // generic failures that were also labelled "before submit". Missing
       // fields alone must not turn an uncertain send into a safe retry/hide.
-      reason: provenNotSubmitted
+      reason: cancelledBeforeSubmit
+        ? 'send-cancelled-before-submit'
+        : provenNotSubmitted
         ? 'send-proven-not-submitted'
         : failedWithoutSubmitProof
           ? 'send-delivery-unknown'
@@ -1971,10 +1983,14 @@ export async function runHistoryPromptHandoff(
       ? { ...result, handoffId: result.handoffId || handoffId }
       : result;
   } catch (error) {
-    const beforeSubmit = (error as any)?.sendReceipt?.submitted === false;
+    const receipt = (error as any)?.sendReceipt;
+    const beforeSubmit = receipt?.submitted === false;
+    const cancelledBeforeSubmit = beforeSubmit && receipt?.deliveryUnknown !== true
+      && (receipt?.cancelled === true || cancelledSendIntent(receipt));
     store.settle(input.tabId, handoffId, {
-      queueStatus: beforeSubmit ? 'failed' : 'delivery-unknown',
-      reason: beforeSubmit ? 'send-error-before-submit' : 'send-error-without-delivery-proof',
+      queueStatus: cancelledBeforeSubmit ? 'cancelled' : beforeSubmit ? 'failed' : 'delivery-unknown',
+      reason: cancelledBeforeSubmit ? 'send-cancelled-before-submit'
+        : beforeSubmit ? 'send-error-before-submit' : 'send-error-without-delivery-proof',
       requiresAuditIdentity: !beforeSubmit,
     });
     throw error;
@@ -2202,7 +2218,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     && ((!attemptId && (record.state === 'reserved' || record.state === 'preparing'))
       || (record.applicationQueue.waitingBeforeInput === true && !!attemptId
         && record.applicationQueue.lastNoWriteAttemptId === attemptId && record.state === 'not-submitted'
-        && isAutomaticReadinessWaitReceipt(receipt)));
+        && (isAutomaticReadinessWaitReceipt(receipt) || isTabMessageNoInputReceipt(record))));
   const applicationNoWrite = record.applicationQueue?.version === 1
     && record.state === 'not-submitted';
   if ((record?.surface !== 'desktop-history' && record.applicationQueue?.version !== 1)
@@ -2388,7 +2404,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
         reason: queueStatus === 'sent'
           ? 'durable-audit-confirmed'
           : deliveryControl?.retired ? 'durable-input-slot-retired'
-          : applicationWaiting ? 'automatic-readiness-wait'
+          : applicationWaiting ? record.surface === 'tab-message' ? 'message-application-wait' : 'automatic-readiness-wait'
           : queueStatus === 'queued'
             ? 'durable-provider-queue-accepted'
           : queueStatus === 'audit-pending'

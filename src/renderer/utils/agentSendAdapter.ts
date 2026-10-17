@@ -40,6 +40,7 @@ export interface AgentProviderOperationInput {
   runtimeSnapshot?: unknown;
   expectedTarget?: AgentSendTarget;
   composer?: {
+    codexStartupFrameWaitId?: string | null;
     exactEmptyEvidence?: Record<string, unknown> | null;
     refreshExactEmptyEvidence?: AgentSendPromptOptions['refreshClaudeExactEmptyEvidence'];
   };
@@ -121,6 +122,7 @@ export function createAgentSendAdapter({
         thinking: explicitSettings?.thinking,
         runtimeSnapshot: input.runtimeSnapshot,
         expectedTarget: input.expectedTarget,
+        codexStartupFrameWaitId: input.composer?.codexStartupFrameWaitId,
         claudeExactEmptyEvidence: input.composer?.exactEmptyEvidence,
         refreshClaudeExactEmptyEvidence: input.composer?.refreshExactEmptyEvidence,
         presentationSnapshot: input.presentationSnapshot,

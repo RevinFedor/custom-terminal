@@ -12,24 +12,30 @@ export type AutomationTab = {
   sessionId: string | null; color?: string; tabType?: string;
   membershipRevision?: number;
 };
-export function useAutomationInventory() {
-  const fingerprint = useWorkspaceStore((state) => JSON.stringify({
-    membership:state.tabWorkflowMembership,organizationReady:state.organizationReady,
+const EMPTY_INVENTORY = {tabs: [] as AutomationTab[], groups: [] as any[]};
+// null = the complete opened editor. A closed trigger needs only the exact IDs
+// that contribute to its queue/compaction counters; no executor uses this hook.
+export function useAutomationInventory(tabIds: ReadonlySet<string> | null = null) {
+  const fingerprint = useWorkspaceStore((state) => tabIds?.size === 0 ? '' : JSON.stringify({
+    membership:tabIds ? Object.fromEntries([...tabIds].map(id=>[id,state.tabWorkflowMembership[id]]))
+      : state.tabWorkflowMembership,organizationReady:state.organizationReady,
     spaces: state.spaces.map((s) => ({ id: s.id, name: s.name, projectIds: s.projectIds || [], icon: s.icon })),
     projects: [...state.openProjects].map(([id, ws]) => ({ id, path: ws.projectPath,
-      tabs: [...ws.tabs.values()].filter((t) => t.tabType !== 'claude-sdk' && resolvePtyAgentOwner(t))
+      tabs: [...ws.tabs.values()].filter((t) => (!tabIds || tabIds.has(t.id))
+        && t.tabType !== 'claude-sdk' && resolvePtyAgentOwner(t))
         .map((t) => ({ id: t.id, name: t.name, provider: resolvePtyAgentOwner(t),
           sessionId: resolvePtyAgentOwner(t) === 'codex' ? t.codexSessionId : t.claudeSessionId,
           color: t.color, tabType: t.tabType })),
     })),
   }));
-  const projectMetadata = useProjectsStore((state) => JSON.stringify(Object.entries(state.projects)
+  const projectMetadata = useProjectsStore((state) => tabIds?.size === 0 ? '' : JSON.stringify(Object.entries(state.projects)
     .map(([id, p]) => [id, p.name, p.icon, p.path])));
   return useMemo(() => {
-    return automationInventory(useWorkspaceStore.getState(), useProjectsStore.getState().projects) as {
+    if (tabIds?.size === 0) return EMPTY_INVENTORY;
+    return automationInventory(useWorkspaceStore.getState(), useProjectsStore.getState().projects, tabIds) as {
       tabs: AutomationTab[]; groups: any[];
     };
-  }, [fingerprint, projectMetadata]);
+  }, [fingerprint, projectMetadata, tabIds]);
 }
 
 export function useAutomationBusyTabs() {

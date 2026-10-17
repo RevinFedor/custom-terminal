@@ -18,9 +18,8 @@ const quiet = { log() {}, warn() {}, error() {} };
 // external I/O (process inspection, SQLite, watchers and PTY) is replaced.
 // In particular, do not stub ensureCodexSubmissionWatcher as always available:
 // that hid the settings -> old Resume rearm -> /compact production failure.
-function harness({ hasTurn = true, provisional = false, failFirstAttach = false } = {}) {
-  const tabId = 'fixture-tab';
-  const sessionId = 'fixture-session';
+function harness({ hasTurn = true, provisional = false, failFirstAttach = false,
+  tabId = 'fixture-tab', sessionId = 'fixture-session' } = {}) {
   const term = { write() { assert.fail('no real PTY writes in this fixture'); } };
   const runtime = { lifecycle: 'fixture-terminal:1', input: 3, observation: 0 };
   const commandState = { runSeq: 1, isRunning: true };
@@ -472,6 +471,140 @@ test('unsettled Resume still rearms both source/child observation and reserves o
   assert.equal(repeated.available, false);
   assert.equal(h.events.some(event => event.startsWith('write:')), false);
 });
+
+function completedDiscoveryDuringSubmit(change = () => {}, lookupChange = () => {}, options = {}) {
+  const h = harness({ ...options, provisional: true });
+  const { context: c, tabId, candidate, term, runtime, launch } = h;
+  c.codexSessionDiscoveryIntents.set(tabId, { ...launch, sourceSessionId: h.sessionId, sourceMode: 'resume' });
+  c.codexWatchers.set(tabId, { ...launch, sourceSessionId: h.sessionId, sourceMode: 'resume' });
+  // The competing observation commits while this actual reconciliation is
+  // awaiting metadata. Its stale-generation response must remain stale, but
+  // the current proof can authorize this SAME still-unwritten operation.
+  c.codexDataModule._api.findCodexLinkedLiveBoundary = async () => {
+    c.codexWriterProofs.set(tabId, { ...candidate, valid: true, kind: 'process-open-rollout',
+      terminalToken: term, runSeq: 1, lifecycleGeneration: runtime.lifecycle, launchId: launch.launchId });
+    c.codexKnownSessions.set(tabId, h.sessionId);
+    c.codexSessionDiscoveryIntents.delete(tabId); c.codexWatchers.delete(tabId);
+    h.state.sourceObservationLaunchId = null; change(h);
+    return { found: false };
+  };
+  c.isCodexWriterUsableForMutation = () => c.getCodexWriterProofSnapshot(tabId)?.valid === true;
+  c.inspectAiDescendantProcessesByTab = async () => {
+    lookupChange(h); return { status: 'found', matches: [{ pid: 42 }] };
+  };
+  return h;
+}
+
+test('Send joins exact current writer after concurrent Resume discovery completion, without rearming or writing', async () => {
+  const h = completedDiscoveryDuringSubmit();
+  const result = await h.observe('send-target-revalidation');
+  assert.equal(result.available, true, JSON.stringify(result));
+  assert.equal(result.sessionId, h.sessionId); assert.equal(result.kind, 'turn');
+  assert.equal(h.events.includes('start-discovery'), false);
+  assert.equal(h.events.some(event => event.startsWith('write:')), false);
+});
+
+test('same exact writer survives normal launch-payload cleanup while the fresh PID check awaits', async () => {
+  const h = completedDiscoveryDuringSubmit(() => {}, h => h.context.codexLastRunCommandPayload.delete(h.tabId));
+  const result = await h.observe('send-target-revalidation');
+  assert.equal(result.available, true, JSON.stringify(result)); assert.equal(result.sessionId, h.sessionId);
+});
+
+function completedDiscoveryWithActualProcessRead(change = () => {}, secondChange = () => {}, options = {}) {
+  const h = completedDiscoveryDuringSubmit(undefined, undefined, options);
+  const c = h.context;
+  h.term.pid = 7;
+  let reads = 0;
+  c.commandLooksLikeAiProcess = (command, expected) => command === 'codex' && expected === 'codex';
+  c.getProcessTreeSnapshot = async () => {
+    reads++;
+    if (reads === 1) {
+      c.codexLastRunCommandPayload.delete(h.tabId);
+      change(h);
+    } else secondChange(h);
+    return { children: new Map([[7, [{ pid: 42, ppid: 7, cmd: 'codex' }]]]),
+      createdAt: Date.now(), psMs: 0, parseMs: 0, linesCount: 2, source: 'fixture' };
+  };
+  const node = ast.statements.find(item => ts.isFunctionDeclaration(item)
+    && item.name?.text === 'inspectAiDescendantProcessesByTab');
+  vm.runInContext(node.getText(ast), c);
+  return { ...h, reads: () => reads };
+}
+
+test('HH367: actual process reader losing disposable launch payload rejoins the SAME unwritten Send once', async () => {
+  const h = completedDiscoveryWithActualProcessRead();
+  const result = await h.observe('send-target-revalidation');
+  assert.equal(result.available, true, JSON.stringify(result));
+  assert.equal(result.sessionId, h.sessionId);
+  assert.equal(h.reads(), 2, 'one replacement READ, never another Send or launch');
+  assert.equal(h.events.includes('start-discovery'), false);
+  assert.equal(h.events.some(event => event.startsWith('write:')), false);
+});
+
+for (const change of ['terminal', 'lifecycle', 'run', 'input', 'observation', 'launch', 'session', 'stop', 'cwd', 'project']) {
+  test('launch cleanup cannot authorize a new process read across ' + change, async () => {
+    const h = completedDiscoveryWithActualProcessRead(h => {
+      const c = h.context;
+      if (change === 'terminal') c.terminals.set(h.tabId, { pid: 7 });
+      if (change === 'lifecycle') h.runtime.lifecycle = 'new-lifecycle';
+      if (change === 'run') h.commandState.runSeq++;
+      if (change === 'input') h.runtime.input++;
+      if (change === 'observation') h.runtime.observation++;
+      if (change === 'launch') c.codexLastRunCommandPayload.set(h.tabId, { ...h.launch, launchId: 'replacement' });
+      if (change === 'session') c.codexKnownSessions.set(h.tabId, 'other');
+      if (change === 'stop') c.getTerminalStopRevision = () => 1;
+      if (change === 'cwd') c.terminalProjects.set(h.tabId, '/other');
+      if (change === 'project') c.terminalProjectIds.set(h.tabId, 'other');
+    });
+    assert.equal((await h.observe('send-target-revalidation')).available, false);
+    assert.equal(h.reads(), 1);
+  });
+}
+
+test('a second process-read failure remains unknown without further reads or input', async () => {
+  const h = completedDiscoveryWithActualProcessRead(() => {}, () => { throw new Error('controlled ps failure'); });
+  assert.equal((await h.observe('send-target-revalidation')).available, false);
+  assert.equal(h.reads(), 2);
+  assert.equal(h.events.some(event => event.startsWith('write:')), false);
+});
+
+for (const change of ['input', 'stop']) test('the replacement process read still checks original ' + change + ' before accepting', async () => {
+  const h = completedDiscoveryWithActualProcessRead(() => {}, h => {
+    if (change === 'input') h.runtime.input++;
+    else h.context.getTerminalStopRevision = () => 1;
+  });
+  assert.equal((await h.observe('send-target-revalidation')).available, false);
+  assert.equal(h.reads(), 2);
+  assert.equal(h.events.some(event => event.startsWith('write:')), false);
+});
+
+test('original process failure is not retried merely because discovery has completed', async () => {
+  const h = completedDiscoveryWithActualProcessRead();
+  let reads = 0;
+  h.context.getProcessTreeSnapshot = async () => { reads++; throw new Error('controlled ps failure'); };
+  assert.equal((await h.observe('send-target-revalidation')).available, false);
+  assert.equal(reads, 1);
+});
+
+for (const change of ['terminal', 'lifecycle', 'run', 'input', 'observation', 'launch', 'session', 'pid', 'stop']) {
+  test('Send cannot inherit a completed discovery proof across ' + change, async () => {
+    const mutate = h => {
+      const c = h.context, proof = c.codexWriterProofs.get(h.tabId);
+      if (change === 'terminal') c.terminals.set(h.tabId, {});
+      if (change === 'lifecycle') h.runtime.lifecycle = 'new-lifecycle';
+      if (change === 'run') h.commandState.runSeq++;
+      if (change === 'input') h.runtime.input++;
+      if (change === 'observation') h.runtime.observation++;
+      if (change === 'launch') c.codexLastRunCommandPayload.set(h.tabId, { ...h.launch, launchId: 'new-launch' });
+      if (change === 'session') { proof.sessionId = 'foreign'; c.codexKnownSessions.set(h.tabId, 'foreign'); }
+      if (change === 'pid') proof.pids = [999];
+      if (change === 'stop') c.aiStoppingTabs.set(h.tabId, { toolType: 'codex' });
+    };
+    const h = completedDiscoveryDuringSubmit(() => {}, mutate);
+    assert.equal((await h.observe('send-target-revalidation')).available, false);
+    assert.equal(h.events.some(event => event.startsWith('write:')), false);
+  });
+}
 
 test('unknown process ownership still refuses before slash write', async () => {
   const h = harness();

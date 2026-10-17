@@ -10,6 +10,7 @@ import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
 import { rememberAgentLaunchFence } from '../utils/agentLaunchFence.mjs';
 import { resolveSiblingInsertionIndex, resolveTabInsertionIndex } from '../utils/tabInsertionModel.mjs';
+import { planCodexContextForkSettings, resolveCodexEffectiveSettings } from '../utils/codexEffectiveSettings.mjs';
 const require = createRequire(import.meta.url);
 const { resolveWorkingDirectory } = require('../../shared/working-directory.cjs');
 const root = path.resolve(import.meta.dirname, '../../..');
@@ -78,6 +79,7 @@ async function fixture(t, projectPath = '~') {
       assert.equal(channel, 'terminal:create'); return createPty({}, request);
     }, send() { throw new Error('unexpected kill'); } },
     commitCreatedTabSnapshot, rememberAgentLaunchFence, projectTabCreationQueue: createProjectTabSaveQueue(), projectTabSaveRevisions: new Map(),
+    planCodexContextForkSettings,
     saveTabsThenNotifyProjectLayoutChanged: async (project, tabs) => {
       persisted.push([...tabs.values()].map(tab => ({ ...tab }))); return { success: true };
     }, resolveSiblingInsertionIndex, resolveTabInsertionIndex,
@@ -85,6 +87,23 @@ async function fixture(t, projectPath = '~') {
   Object.assign(state, module.exports);
   return { home, systems, methods: module.exports, workspace, validated, persisted, createPty };
 }
+
+for (const method of ['createTab', 'createTabAfterCurrent']) test(method + ': Fork publishes source model before SID/proof, not global defaults', async t => {
+  const f = await fixture(t);
+  const source = { id: 'source', codexSessionId: 'source-SID', codexModel: 'gpt-6-astra', codexEffort: 'max',
+    codexSettingsProofAt: 123, codexSettingsProofSessionId: 'source-SID' };
+  f.workspace.tabs.set(source.id, source);
+  const pendingAction = { type: 'codex-fork', sessionId: source.codexSessionId,
+    contextFork: { sourceTabId: source.id, sourceSessionId: source.codexSessionId, fromLatestCompact: true } };
+  const id = await f.methods[method]('project', 'fork', undefined, { background: true, pendingAction });
+  const child = f.workspace.tabs.get(id), first = f.persisted.at(-1).find(tab => tab.id === id);
+  assert.equal(first.codexModel, 'gpt-6-astra'); assert.equal(child.codexEffort, 'max');
+  assert.equal(child.codexSessionId, undefined); assert.equal(child.codexSettingsProofAt, undefined);
+  assert.equal(child.codexSettingsProofSessionId, undefined); assert.equal(child.codexLiveSettingsSessionId, undefined);
+  assert.equal(resolveCodexEffectiveSettings(child).model, 'gpt-6-astra');
+  child.codexModel = 'my-new-choice';
+  assert.equal(source.codexModel, 'gpt-6-astra', 'the child owns an independent selection');
+});
 
 test('Inbox uses native home/config even when browser process.env is compiled to an empty object', () => {
   assert.equal(runtime('/native/home').getInboxProjectPath(), '/native/home');

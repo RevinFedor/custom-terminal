@@ -21,4 +21,17 @@ function hiddenSendPresentation(record) {
       && Number(record.receipt.presentationDismissedAt) > 0;
 }
 
-module.exports = { cancelledSendIntent, retiredSendInputSlot, canProjectCurrentProviderQueue, hiddenSendPresentation };
+function isTabMessageNoInputReceipt(record) {
+  const receipt = record?.receipt;
+  return record?.surface === 'tab-message' && !!record.attemptId
+    && ['claude', 'codex'].includes(record.provider)
+    && record.state === 'not-submitted' && !record.deliveryControl?.cancelledAt
+    && !retiredSendInputSlot(record)
+    && receipt?.submitted === false && receipt.pasteWritten === false && receipt.enterWritten === false
+    && receipt.deliveryUnknown !== true && receipt.auditPending !== true
+    && receipt.providerQueueAccepted !== true && receipt.cancelled !== true
+    && receipt.code !== 'agent_send_queue_cancelled';
+}
+
+module.exports = { cancelledSendIntent, retiredSendInputSlot, canProjectCurrentProviderQueue, hiddenSendPresentation,
+  isTabMessageNoInputReceipt };

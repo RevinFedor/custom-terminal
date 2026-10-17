@@ -24,13 +24,16 @@ function harness() {
   const writes = [];
   const term = { pid: 123, write: data => writes.push(data) };
   const context = {
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
     ...shell,
     console: { log() {}, warn() {} },
     terminals: new Map([['tab', term]]),
     terminalCommandState: new Map([['tab', { runSeq: 1, isRunning: false }]]),
     terminalInputLineBuffers: new Map(), terminalInputEscapeStates: new Map(),
     aiStoppingTabs: new Map(), hasClaimedAiLifecycle: () => false,
-    terminalShellReadiness: { snapshot: () => ({ ready: true }) },
+    // This fixture supplies an admitted shell; registry publication is a port,
+    // while the real generation/input checks and final writer execute below.
+    terminalShellReadiness: { snapshot: () => ({ ready: true }), markAgentLaunchWrite: () => true },
     reconcileShellDraftProofForLaunch: async () => ({ status: 'empty', reason: 'same-empty-prompt-frame' }),
     AI_PROCESS_LOOKUP_STATUS: { FOUND: 'found', ABSENT: 'absent', UNKNOWN: 'unknown' },
     invalidateAiProcessLookupCache() {},

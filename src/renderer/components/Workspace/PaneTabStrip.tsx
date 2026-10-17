@@ -1,6 +1,7 @@
 // Wrapped tab chips in a workflow window. Execution namespaces remain routing
 // metadata; they do not add directory badges or extra spacing to the strip.
 
+import {uiDragDiagnostic} from '../../utils/uiPerformanceDiagnostics.mjs';
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
@@ -95,6 +96,14 @@ export default function PaneTabStrip({
   const baseEntryIds = React.useMemo(() => new Set(entries.map((entry) => entry.tabId)), [entries]);
   const entriesKey = previewEntries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('|');
   const inStrip = previewEntries.length > 1;
+  useLayoutEffect(()=>{
+    if(!desiredPreviewEntries || !paneDrag.source)return;
+    const matches=desiredPreviewEntries.length===previewEntries.length
+      && desiredPreviewEntries.every((entry,i)=>entry.tabId===previewEntries[i].tabId && entry.projectId===previewEntries[i].projectId);
+    uiDragDiagnostic('layout-receipt',{gestureId:paneDrag.source.gestureId,revision:paneDrag.revision,
+      workflowId:activeSpaceId,paneKey,zone:paneDrag.target?.zone,at:paneDrag.target?.at,matches,
+      presentation:'react-strip-layout-not-compositor'});
+  },[desiredPreviewEntries,entriesKey,paneDrag.revision,paneDrag.source,paneKey,activeSpaceId]);
 
   // Что рисуется в строке: группы вкладок и страницы выбора между ними.
   // Порядок вкладок — из предпросмотра перетаскивания, позиции заготовок — из

@@ -24,7 +24,7 @@ test('programmatic compact passes its exact pending operation into the PTY submi
   assert.match(request, /result\.compactStartConfirmed === true[\s\S]{0,120}codex-compact-causal-task-started/);
   assert.match(
     request,
-    /result\?\.success !== true[\s\S]{0,100}result\?\.compactStartConfirmed !== true[\s\S]{0,180}cancelCodexManualCompactPending/,
+    /result\?\.success !== true[\s\S]{0,100}result\?\.compactStartConfirmed !== true[\s\S]{0,150}result\?\.submitted !== true[\s\S]{0,180}cancelCodexManualCompactPending/,
   );
 });
 

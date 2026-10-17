@@ -49,6 +49,7 @@ import {
   shouldDeferComposerPasteToNative,
 } from './composerClipboard'
 import { readComposerNaturalHeight } from './composerGeometry'
+import { attachTerminalMessageChip } from './terminalMessageReferenceChip'
 import type { ClipboardAdapter } from './plugins/clipboardAdapter'
 import { composerSearchExtensions } from './composerSearch'
 
@@ -63,6 +64,7 @@ export interface ComposerInlineToken {
   kind: ComposerInlineTokenKind
   label: string
   thumbnailUrl?: string
+  messageReference?: { referenceId: string; source: any; detailsText: string }
   /** Error/pending ranges stay text; image/paste ranges become atomic chips. */
   replace?: boolean
 }
@@ -170,6 +172,7 @@ export interface ComposerEditorProps
   onContextMenu?: (event: any) => void
   /** Return true to keep the token rendered; false reveals its raw source. */
   onTokenClick?: (token: ComposerInlineToken, event: MouseEvent) => boolean | void
+  onMessageReferenceNavigate?: (snapshot: any) => void | Promise<unknown>
   /** Return true when the host displayed its own menu. */
   onTokenContextMenu?: (token: ComposerInlineToken, event: MouseEvent) => boolean | void
 }
@@ -258,12 +261,14 @@ class ComposerInlineTokenWidget extends WidgetType {
   // host handler; the trailing native click on the same DOM node is a
   // duplicate of that same physical gesture.
   private suppressNextClick = false
+  private disposeMessageReference: (() => void) | null = null
 
   constructor(
     readonly token: ComposerInlineToken,
     readonly selected: boolean,
     readonly clickHandler: TokenHandlerRef,
     readonly contextMenuHandler: TokenHandlerRef,
+    readonly messageNavigate: { current?: ((snapshot: any) => void | Promise<unknown>) | null },
   ) {
     super()
   }
@@ -276,6 +281,9 @@ class ComposerInlineTokenWidget extends WidgetType {
       && other.token.label === this.token.label
       && other.token.thumbnailUrl === this.token.thumbnailUrl
       && other.selected === this.selected
+      && other.token.messageReference?.referenceId === this.token.messageReference?.referenceId
+      && other.token.messageReference?.detailsText === this.token.messageReference?.detailsText
+      && JSON.stringify(other.token.messageReference?.source || null) === JSON.stringify(this.token.messageReference?.source || null)
   }
 
   toDOM(view: EditorView) {
@@ -324,6 +332,24 @@ class ComposerInlineTokenWidget extends WidgetType {
     label.className = 'cm-composer-token-label'
     label.textContent = this.token.label
     chip.appendChild(label)
+
+    if (this.token.messageReference) {
+      this.disposeMessageReference = attachTerminalMessageChip(chip, this.token.messageReference, {
+        allowDetails: () => view.state.selection.main.empty,
+        openDetails: () => this.clickHandler.current?.(this.token, new MouseEvent('click')),
+        navigate: snapshot => {
+          if (!this.messageNavigate.current) throw Error('Переход к сообщению недоступен в этом приложении')
+          return this.messageNavigate.current(snapshot)
+        },
+        error: reason => { chip.title = reason; chip.dataset.messageReferenceError = 'true' },
+      })
+      chip.addEventListener('contextmenu', event => {
+        if (this.contextMenuHandler.current?.(this.token, event) === true) {
+          event.preventDefault(); event.stopPropagation()
+        }
+      })
+      return chip
+    }
 
     const revealSource = (
       clientX: number,
@@ -450,6 +476,7 @@ class ComposerInlineTokenWidget extends WidgetType {
     // Click/context-menu remain semantic host actions handled above.
     return event.type !== 'mousedown'
   }
+  destroy() { this.disposeMessageReference?.(); this.disposeMessageReference = null }
 }
 
 interface ComposerTokenFieldValue {
@@ -474,6 +501,7 @@ const buildTokenFieldValue = (
   tokens: ComposerInlineToken[],
   clickHandler: TokenHandlerRef,
   contextMenuHandler: TokenHandlerRef,
+  messageNavigate: { current?: ((snapshot: any) => void | Promise<unknown>) | null },
 ): ComposerTokenFieldValue => {
   const normalized = normalizeTokens(tokens, state.doc.length)
   const decorations: Array<{ from: number; to: number; value: Decoration }> = []
@@ -493,7 +521,7 @@ const buildTokenFieldValue = (
         from: token.from,
         to: token.to,
         value: Decoration.replace({
-          widget: new ComposerInlineTokenWidget(token, selected, clickHandler, contextMenuHandler),
+          widget: new ComposerInlineTokenWidget(token, selected, clickHandler, contextMenuHandler, messageNavigate),
         }),
       })
       atoms.push({ from: token.from, to: token.to, value: COMPOSER_TOKEN_ATOM })
@@ -519,9 +547,10 @@ const buildTokenFieldValue = (
 const createComposerTokenField = (
   clickHandler: TokenHandlerRef,
   contextMenuHandler: TokenHandlerRef,
+  messageNavigate: { current?: ((snapshot: any) => void | Promise<unknown>) | null },
 ) => StateField.define<ComposerTokenFieldValue>({
   create(state) {
-    return buildTokenFieldValue(state, [], clickHandler, contextMenuHandler)
+    return buildTokenFieldValue(state, [], clickHandler, contextMenuHandler, messageNavigate)
   },
   update(previous, transaction) {
     let tokens = previous.tokens
@@ -529,7 +558,7 @@ const createComposerTokenField = (
       if (effect.is(setTokensEffect)) tokens = effect.value
     }
     if (!transaction.docChanged && !transaction.selection && tokens === previous.tokens) return previous
-    return buildTokenFieldValue(transaction.state, tokens, clickHandler, contextMenuHandler)
+    return buildTokenFieldValue(transaction.state, tokens, clickHandler, contextMenuHandler, messageNavigate)
   },
   provide: (field) => [
     EditorView.decorations.from(field, (value) => value.decorations),
@@ -575,6 +604,7 @@ const makeTextPasteFacade = (
   view: EditorView,
   text: string,
   formats: string[],
+  html = '',
 ) => {
   let defaultPrevented = false
   const target = makeEventTarget(view)
@@ -600,7 +630,7 @@ const makeTextPasteFacade = (
       getData: (type: string) => (
         type.toLowerCase() === 'text/plain' || type.toLowerCase() === 'text'
           ? text
-          : ''
+          : type.toLowerCase() === 'text/html' ? html : ''
       ),
     },
     nativeEvent,
@@ -649,6 +679,7 @@ export const ComposerEditor = forwardRef<ComposerEditorHandle, ComposerEditorPro
   onKeyDown,
   onContextMenu,
   onTokenClick,
+  onMessageReferenceNavigate,
   onTokenContextMenu,
   className,
   style,
@@ -676,6 +707,7 @@ export const ComposerEditor = forwardRef<ComposerEditorHandle, ComposerEditorPro
   const onKeyDownRef = useRef(onKeyDown)
   const onContextMenuRef = useRef(onContextMenu)
   const tokenClickRef = useRef(onTokenClick)
+  const messageNavigateRef = useRef(onMessageReferenceNavigate)
   const tokenContextMenuRef = useRef(onTokenContextMenu)
   const readOnlyCompartmentRef = useRef(new Compartment())
   const appliedReadOnlyRef = useRef<{ view: EditorView; value: boolean } | null>(null)
@@ -695,6 +727,7 @@ export const ComposerEditor = forwardRef<ComposerEditorHandle, ComposerEditorPro
   onKeyDownRef.current = onKeyDown
   onContextMenuRef.current = onContextMenu
   tokenClickRef.current = onTokenClick
+  messageNavigateRef.current = onMessageReferenceNavigate
   tokenContextMenuRef.current = onTokenContextMenu
   if (historyOwnerKeyRef.current !== historyOwnerKey) {
     historyOwnerTransitionRef.current = true
@@ -846,7 +879,7 @@ export const ComposerEditor = forwardRef<ComposerEditorHandle, ComposerEditorPro
   useLayoutEffect(() => {
     const root = rootRef.current
     if (!root) return
-    const tokenField = createComposerTokenField(tokenClickRef, tokenContextMenuRef)
+    const tokenField = createComposerTokenField(tokenClickRef, tokenContextMenuRef, messageNavigateRef)
     const aggregateHistory = createComposerHistoryPayloadExtension<unknown>({
       initial: historyPayloadRef.current,
       textMode: historyTextMode,
@@ -955,7 +988,7 @@ export const ComposerEditor = forwardRef<ComposerEditorHandle, ComposerEditorPro
         const payload = readSynchronousComposerClipboardPayload(clipboardRef.current)
         if (shouldDeferComposerPasteToNative(payload)) return false
 
-        const pasteEvent = makeTextPasteFacade(view, payload!.text, payload!.formats)
+        const pasteEvent = makeTextPasteFacade(view, payload!.text, payload!.formats, payload!.html)
         onPasteRef.current?.(pasteEvent)
         if (!pasteEvent.defaultPrevented) {
           insertComposerClipboardText(view, payload!.text)

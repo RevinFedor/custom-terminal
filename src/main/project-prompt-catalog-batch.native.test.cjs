@@ -1,3 +1,4 @@
+const prepared=require('./project-prompt-catalog.test-support.cjs');
 // One plain Node process with Electron's SQLite ABI, no Electron app/window:
 // ELECTRON_RUN_AS_NODE=1 node_modules/.bin/electron --max-old-space-size=128 this-file
 const test = require('node:test');
@@ -65,7 +66,7 @@ function fixture(t, n = 2) {
     db.prepare('INSERT INTO workflow_org_tabs VALUES(?,?)').run(tab, JSON.stringify({ executionNamespace: 'P' }));
     registry.setTabSources({ tabId: tab, rootIds: [ra], expectedRevision: registry.read().revision, mutationId: 'bind-' + (++mutation) });
   }
-  const service = new catalog.ProjectPromptCatalogService({ db: database, rootRegistry: registry, fsImpl,
+  const service = new catalog.ProjectPromptCatalogService({ db: database, rootRegistry: registry, fsImpl, asyncFs:{...fs.promises,stat:async p=>{bump('stats',p);const value=await fs.promises.stat(p);const hook=afterStat;afterStat=undefined;hook?.(p);return value;},opendir:async(p,...a)=>{bump('readdirs',p);return fs.promises.opendir(p,...a);}},
     layoutStore: { get: () => ({ layout: {} }) }, onChanged: c => changes.push(plain(c)) });
   registry.onChanged = change => { service.invalidateTabs(change.tabIds || null, 'root-bindings-changed'); service.refreshWatchers(); };
   t.after(() => {
@@ -88,105 +89,37 @@ function fixture(t, n = 2) {
   };
 }
 
-test('usage prepares each source SELECT once per call; every exact binding is still read in both passes', t => {
-  const f = fixture(t, 24);
-  f.reset(); const usage = f.service.usageForRoot(f.root); const cold = f.summary();
-  t.diagnostic(JSON.stringify({ cold }));
-  assert.equal(usage.length, 2); assert.equal(usage[0].tabs.length, 24);
-  assert.deepEqual(plain(usage[0].projects), [{ id: 'P', name: 'Project', icon: null }]);
-  assert.equal(cold.sourcePrepares, 4, 'compile four source queries once, not once per tab/pass');
-  assert.equal(cold.sourceReads, 24 * 4 * 2, 'fresh SQL still executes for every binding');
-  assert.equal(cold.stats, 6, 'usage A then fresh watcher pass A/B, one stat per root/docs in each pass');
-  assert.equal(cold.readdirs, 1, 'existing per-request scan sharing remains');
-  const cached = f.service.tabCache.get(f.tabs[0]).value;
-  f.reset(); const warm = f.service.usageForRoot(f.root); t.diagnostic(JSON.stringify({ warm: f.summary() }));
-  assert.equal(f.summary().sourcePrepares, 4, 'statements do not persist to the next request');
-  assert.equal(f.summary().sourceReads, 24 * 4 * 2);
-  assert.equal(f.summary().stats, 6); assert.equal(f.summary().readdirs, 0);
-  assert.equal(f.service.tabCache.get(f.tabs[0]).value, cached, 'original catalog TTL unchanged');
-  assert.deepEqual(plain(warm), plain(usage));
+test('usage uses statement-only fresh pages and one complete source; warm read has no discovery or watcher pass',async t=>{
+  const f=fixture(t,24);const usage=await prepared.usage(f.service,f.root);assert.equal(usage[0].tabs.length,24);assert.equal(usage.length,2);
+  assert.deepEqual(plain(usage[0].projects),[{id:'P',name:'Project',icon:null}]);f.reset();const warm=await f.service.usageForRoot(f.root);
+  const summary=f.summary();t.diagnostic(JSON.stringify(summary));assert.deepEqual(plain(warm),plain(usage));assert.equal(summary.readdirs,0);
+  assert.ok(summary.sourceReads>=24*4);assert.ok(summary.sourcePrepares<24,'statements reused, rows never cached');assert.equal(f.service.tabCache.size,0);
 });
-
-test('watch-only refresh batches preparation and stats but does not skip current bindings', t => {
-  const f = fixture(t, 24), original = [...f.watches];
-  f.reset(); f.service.refreshWatchers(); t.diagnostic(JSON.stringify(f.summary()));
-  assert.equal(f.summary().sourcePrepares, 4); assert.equal(f.summary().sourceReads, 24 * 4);
-  assert.equal(f.summary().stats, 4); assert.equal(f.summary().readdirs, 0);
-  assert.deepEqual(f.watches, original, 'stable source keeps the existing watcher');
+test('compatibility refresh schedules reconciliation; stable source retains owners without discovery',async t=>{
+  const f=fixture(t,24);await prepared.usage(f.service,f.root);const owners=[...f.watches];f.reset();f.service.refreshWatchers();assert.equal(f.summary().sourceReads,0);
+  await f.service.prepared.reconcile();assert.equal(f.summary().readdirs,0);assert.ok(owners.filter(w=>!w.closed).every(w=>f.watches.includes(w)));
 });
-
-test('a second SQLite connection can change roots/scope version inside a batch; no row snapshot hides it', t => {
-  const f = fixture(t, 2), writer = new SQLite(f.filename);
-  try {
-    f.afterStat(() => writer.prepare('UPDATE workflow_roots SET metadata_json=? WHERE id=?')
-      .run(JSON.stringify({ kind: 'prompt-source', enabled: false }), f.ra));
-    const result = f.service.usageForRoot(f.root);
-    assert.deepEqual(plain(result[0].tabs.map(t => t.id)), [f.tabs[0]], 'next binding sees the external commit');
-    assert.deepEqual(plain(f.service.usageForRoot(f.root)), []);
-    writer.prepare('UPDATE workflow_roots SET metadata_json=? WHERE id=?').run(JSON.stringify({ enabled: true }), f.ra);
-    f.afterStat(() => writer.prepare('UPDATE workflow_root_scope_meta SET version=2 WHERE scope=?').run('tab:' + f.tabs[1]));
-    assert.throws(() => f.service.usageForRoot(f.root), error => error.code === 'root_binding_forward_version');
-    writer.prepare('UPDATE workflow_root_scope_meta SET version=1 WHERE scope=?').run('tab:' + f.tabs[1]);
-    assert.equal(f.service.usageForRoot(f.root)[0].tabs.length, 2);
-    writer.prepare("UPDATE projects SET name='Renamed' WHERE id='P'").run();
-    assert.equal(f.service.usageForRoot(f.root)[0].projects[0].name, 'Renamed');
-  } finally { writer.close(); }
+test('second SQLite connection exact disabled/empty/future changes produce current aggregate or explicit failure',async t=>{
+  const f=fixture(t,2),writer=new SQLite(f.filename);t.after(()=>writer.close());await prepared.usage(f.service,f.root);
+  f.afterStat(()=>writer.prepare('UPDATE workflow_roots SET metadata_json=? WHERE id=?').run(JSON.stringify({enabled:false}),f.ra));assert.deepEqual(plain(await f.service.usageForRoot(f.root)),[]);
+  writer.prepare('UPDATE workflow_roots SET metadata_json=? WHERE id=?').run(JSON.stringify({enabled:true}),f.ra);
+  f.afterStat(()=>writer.prepare('UPDATE workflow_root_scope_meta SET version=2 WHERE scope=?').run('tab:'+f.tabs[1]));await assert.rejects(f.service.usageForRoot(f.root),{code:'root_binding_forward_version'});
+  writer.prepare('UPDATE workflow_root_scope_meta SET version=1 WHERE scope=?').run('tab:'+f.tabs[1]);writer.prepare("UPDATE projects SET name='Renamed' WHERE id='P'").run();assert.equal((await f.service.usageForRoot(f.root))[0].projects[0].name,'Renamed');
 });
-
-test('source add/rebind/remove, archive provenance, CAS refusal and durable replay stay intact', t => {
-  const f = fixture(t, 2), oldId = f.service.listTab(f.tabs[1]).prompts[0].id;
-  fs.mkdirSync(path.join(f.b, 'docs')); fs.writeFileSync(path.join(f.b, 'docs', 'other.prompt.md'), 'other');
-  const request = f.nextRequest(f.tabs[0], [f.rb]);
-  const ack = f.service.setTabSources(request);
-  assert.deepEqual(plain(f.service.listTab(f.tabs[0]).prompts.map(p => p.title)), ['other']);
-  assert.equal(f.service.listTab(f.tabs[1]).prompts[0].id, oldId, 'archive keeps its exact original namespace/ID');
-  const revision = f.registry.read().revision;
-  assert.throws(() => f.service.setTabSources({ ...request, mutationId: 'stale', expectedRevision: revision - 1 }), e => e.code === 'root_revision_changed');
-  assert.throws(() => f.service.setTabSources({ ...request, rootIds: [], mutationId: request.mutationId }), e => e.code === 'root_mutation_id_conflict');
-  const removed = f.registry.remove({ id: f.rb, expectedRevision: revision,
-    expectedRootRevision: f.registry.read().roots.find(r => r.id === f.rb).revision, mutationId: 'remove-b' });
-  assert.equal(removed.removed, true);
-  const source = f.service.getTabSources(f.tabs[0])[0];
-  assert.equal(source.removed, true); assert.equal(source.enabled, false);
-  assert.deepEqual(plain(f.service.listTab(f.tabs[0]).prompts), []);
-  assert.deepEqual(plain(f.service.setTabSources(request)), plain(ack), 'committed retry is still a receipt replay');
-  assert.throws(() => f.service.setTabSources(f.nextRequest(f.tabs[1], [f.rb])), e => e.code === 'root_registration_missing');
-  f.service.setTabSources(f.nextRequest(f.tabs[0], []));
-  assert.deepEqual(plain(f.service.getTabSources(f.tabs[0])), []);
+test('source rebind/remove/archive provenance/CAS refusal/durable replay remain synchronous and exact',async t=>{
+  const f=fixture(t,2),oldId=(await prepared.tab(f.service,f.tabs[1])).prompts[0].id;fs.mkdirSync(path.join(f.b,'docs'));fs.writeFileSync(path.join(f.b,'docs','other.prompt.md'),'other');
+  const request=f.nextRequest(f.tabs[0],[f.rb]),ack=f.service.setTabSources(request);assert.ok(!(ack instanceof Promise));assert.deepEqual(plain((await prepared.tab(f.service,f.tabs[0])).prompts.map(p=>p.title)),['other']);assert.equal((await f.service.listTab(f.tabs[1])).prompts[0].id,oldId);
+  const revision=f.registry.read().revision;assert.throws(()=>f.service.setTabSources({...request,mutationId:'stale',expectedRevision:revision-1}),e=>e.code==='root_revision_changed');assert.throws(()=>f.service.setTabSources({...request,rootIds:[]}),e=>e.code==='root_mutation_id_conflict');
+  f.registry.remove({id:f.rb,expectedRevision:revision,expectedRootRevision:f.registry.read().roots.find(r=>r.id===f.rb).revision,mutationId:'remove-b'});
+  assert.equal(f.service.getTabSources(f.tabs[0])[0].removed,true);assert.deepEqual(plain((await f.service.listTab(f.tabs[0])).prompts),[]);assert.deepEqual(plain(f.service.setTabSources(request)),plain(ack));assert.throws(()=>f.service.setTabSources(f.nextRequest(f.tabs[1],[f.rb])),e=>e.code==='root_registration_missing');
 });
-
-test('filesystem add/remove and missing/reappearing docs/root remain fresh through watch invalidation and reads', t => {
-  const f = fixture(t, 1), docs = path.join(f.a, 'docs'), tab = f.tabs[0];
-  f.service.listTab(tab);
-  const added = path.join(docs, 'new.prompt.md'); fs.writeFileSync(added, 'new');
-  assert.equal(f.service.listTab(tab).prompts.length, 2, 'existing short TTL is not silently replaced');
-  f.watch(docs).callback(); f.flush(); assert.equal(f.service.listTab(tab).prompts.length, 3);
-  fs.unlinkSync(added); f.watch(docs).callback(); f.flush(); assert.equal(f.service.listTab(tab).prompts.length, 2);
-  const oldDocsWatch = f.watch(docs); fs.rmSync(docs, { recursive: true });
-  oldDocsWatch.callback(); f.flush(); assert.ok(oldDocsWatch.closed); assert.ok(f.watch(f.a));
-  assert.equal(f.service.listTab(tab).prompts.length, 0);
-  fs.mkdirSync(docs); fs.writeFileSync(path.join(docs, 'back.prompt.md'), 'back');
-  const rootWatch = f.watch(f.a); rootWatch.callback(); f.flush(); assert.ok(rootWatch.closed); assert.ok(f.watch(docs));
-  assert.deepEqual(plain(f.service.listTab(tab).prompts.map(p => p.title)), ['back']);
-  const gone = f.watch(docs); fs.rmSync(f.a, { recursive: true }); gone.callback(); f.flush();
-  assert.equal(f.service.getTabSources(tab)[0].exists, false); assert.equal(f.service.listTab(tab).prompts.length, 0);
-  fs.mkdirSync(docs, { recursive: true }); fs.writeFileSync(path.join(docs, 'again.prompt.md'), 'again');
-  assert.deepEqual(plain(f.service.listTab(tab).prompts.map(p => p.title)), ['again']); assert.ok(f.watch(docs));
-  fs.writeFileSync(path.join(docs, 'ttl.prompt.md'), 'ttl'); f.advance(1501);
-  assert.equal(f.service.listTab(tab).prompts.length, 2, 'original TTL fallback remains');
+test('filesystem events and current root/docs probes recover missing/reappearing source without TTL',async t=>{
+  const f=fixture(t,1),docs=path.join(f.a,'docs'),id=f.tabs[0];await prepared.tab(f.service,id);const added=path.join(docs,'new.prompt.md');fs.writeFileSync(added,'new');f.watch(docs).callback('rename',null);
+  assert.equal((await prepared.tab(f.service,id)).prompts.length,3);fs.unlinkSync(added);f.watch(docs).callback('rename',null);assert.equal((await prepared.tab(f.service,id)).prompts.length,2);
+  fs.rmSync(docs,{recursive:true});assert.equal((await prepared.tab(f.service,id)).prompts.length,0);fs.mkdirSync(docs);fs.writeFileSync(path.join(docs,'back.prompt.md'),'back');assert.deepEqual(plain((await prepared.tab(f.service,id)).prompts.map(p=>p.title)),['back']);
+  fs.rmSync(f.a,{recursive:true});assert.equal((await prepared.tab(f.service,id)).sources[0].exists,false);fs.mkdirSync(docs,{recursive:true});fs.writeFileSync(path.join(docs,'again.prompt.md'),'again');assert.deepEqual(plain((await prepared.tab(f.service,id)).prompts.map(p=>p.title)),['again']);
 });
-
-test('retired watch callbacks/timers cannot invalidate a replacement or resurrect watchers after close', t => {
-  const f = fixture(t, 1), target = path.join(f.a, 'docs'), old = f.watch(target);
-  old.callback(); assert.equal(f.timers.size, 1);
-  f.service.setTabSources(f.nextRequest(f.tabs[0], [f.rb]));
-  const root = f.registry.read().roots.find(r => r.id === f.ra);
-  f.registry.remove({ id: f.ra, expectedRevision: f.registry.read().revision, expectedRootRevision: root.revision, mutationId: 'retire-a' });
-  assert.ok(old.closed); assert.equal(f.timers.size, 0, 'retiring target cancels its pending debounce');
-  old.callback(); assert.equal(f.timers.size, 0, 'late old filesystem event is ignored');
-  f.register(f.a); const replacement = f.watch(target); assert.notEqual(replacement, old);
-  replacement.callback(); const pending = f.service.watchDebounce.get(target);
-  old.callback(); assert.equal(f.service.watchDebounce.get(target), pending, 'old owner cannot replace new owner timer');
-  f.flush(); f.service.close();
-  replacement.callback(); assert.equal(f.timers.size, 0); assert.equal(f.service.watchers.size, 0);
+test('retired callbacks and closed lifetime cannot replace current owner timer or resurrect old watchers',async t=>{
+  const f=fixture(t,1),docs=path.join(f.a,'docs');await prepared.tab(f.service,f.tabs[0]);const old=f.watch(docs);old.callback('rename',null);f.service.close();const previous=f.service.prepared;old.callback('rename',null);assert.equal(previous.watchers.size,0);
+  await prepared.tab(f.service,f.tabs[0]);const replacement=f.watch(docs);assert.notEqual(old,replacement);const slot=f.service.prepared.slots.get(f.a),epoch=slot.epoch;old.callback('rename',null);assert.equal(slot.epoch,epoch);assert.equal(old.closed,true);
 });

@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const { createTerminalIncidentReporter, terminalSendIncidentNotification } = require('./terminal-incident-reporting');
+const { createTerminalIncidentReporter, terminalSendIncidentNotification,
+  resolveTerminalIncidentSendIdentity, terminalSendFailureDiagnosticPayload } = require('./terminal-incident-reporting');
 
 test('freeze starts at detection, exact repeats share one artifact and notification', async () => {
   const notifications = [];
@@ -27,6 +28,55 @@ test('disk failure is reported and never throws into the input operation', async
   assert.equal(result.success, false);
   assert.equal(result.error, 'disk full');
   assert.equal(notifications.length, 1);
+});
+
+test('failure channel keeps only exact durable identity and bounded metadata, never prompt content', () => {
+  const record = receipt(), store = { list: () => [record] };
+  const input = { tabId: 'tab-A', toolType: 'codex', handoffId: 'handoff-A',
+    sendAttemptId: 'attempt-A', sendOperationKey: 'spoofed-operation', promptText: 'SECRET',
+    error: 'SECRET EXCEPTION', code: 'terminal_draft_state_unknown', submitted: false, pasteWritten: false };
+  const value = terminalSendFailureDiagnosticPayload(input, store);
+  assert.deepEqual(value.sendIdentity, { operationKey: 'operation-A', attemptId: 'attempt-A', handoffId: 'handoff-A' });
+  assert.equal(value.context.durableIdentity, 'exact-tab-handoff-attempt');
+  assert.equal(value.silent, true); assert.doesNotMatch(JSON.stringify(value), /SECRET/);
+  for (const patch of [{ sendAttemptId: 'other' }, { toolType: 'claude' }, { tabId: 'foreign' }]) {
+    const next = terminalSendFailureDiagnosticPayload({ ...input, ...patch }, store);
+    assert.deepEqual(next.sendIdentity, { handoffId: 'handoff-A' });
+    assert.equal(next.context.durableIdentity, 'unavailable');
+  }
+  assert.equal(terminalSendFailureDiagnosticPayload({ ...input, tabId: 'bad\nID' }, store), null);
+  const standalone = terminalSendFailureDiagnosticPayload({ ...input, sendAttemptId: null }, store);
+  assert.deepEqual(standalone.sendIdentity, { handoffId: 'handoff-A' });
+  assert.equal(resolveTerminalIncidentSendIdentity(store, { tabId: 'tab-A', provider: 'codex',
+    handoffId: 'handoff-A', attemptId: 'other' }), null);
+});
+
+test('actual Main failure channel freezes immediately, deduplicates same report, rejects foreign sender and stays silent', async () => {
+  const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+  const start = main.indexOf('const reportTerminalIncident = createTerminalIncidentReporter({');
+  const end = main.indexOf('\nfunction requestTerminalIncidentRendererSnapshot(', start);
+  const sender = { isDestroyed: () => false }, captures = [], notifications = [];
+  const runtime = vm.runInNewContext(main.slice(start, end)
+    + '\n({ handleTerminalSendFailureDiagnostic, reportTerminalRejectedSendDiagnostic })', {
+    createTerminalIncidentReporter, terminalSendIncidentNotification, terminalSendFailureDiagnosticPayload,
+    captureTerminalHistoryPreviewDiagnostic: payload => { captures.push(payload); return Promise.resolve({ reference: 'saved', artifactPath: '/fixture' }); },
+    BrowserWindow: { fromWebContents: wc => wc === sender ? {} : null },
+    agentSendReceiptStore: { list: () => [receipt()], get: () => receipt() }, console: { warn() {} },
+    mainWindow: { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: (...args) => notifications.push(args) } },
+  });
+  const input = { tabId: 'tab-A', toolType: 'codex', handoffId: 'handoff-A', sendAttemptId: 'attempt-A' };
+  const first = runtime.handleTerminalSendFailureDiagnostic({ sender }, input);
+  assert.equal(captures.length, 1, 'pin starts before any renderer/disk await');
+  assert.equal(runtime.handleTerminalSendFailureDiagnostic({ sender }, input), first);
+  await first;
+  runtime.handleTerminalSendFailureDiagnostic({ sender: { isDestroyed: () => false } }, input);
+  runtime.handleTerminalSendFailureDiagnostic({ sender }, { ...input, toolType: 'foreign' });
+  assert.equal(captures.length, 1); assert.equal(notifications.length, 0);
+  await runtime.handleTerminalSendFailureDiagnostic({ sender }, { ...input, handoffId: 'standalone-H', sendAttemptId: null });
+  assert.equal(captures.length, 2, 'no-attempt local slash refusal is captured too');
+  await runtime.reportTerminalRejectedSendDiagnostic(receipt({ state: 'not-submitted' }));
+  assert.equal(captures.length, 3); assert.equal(captures[2].context.state, 'not-submitted');
+  assert.equal(notifications.length, 0, 'does not add a second error toast');
 });
 
 const receipt = (overrides = {}) => ({

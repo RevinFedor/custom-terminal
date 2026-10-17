@@ -540,6 +540,16 @@ headless TUI draft. Подготовка/unknown Send/редактор/compact �
 SDK result/compact/task события будят тот же Main; собственный interrupt Stop
 не считается новым завершением для отсчёта.
 
+Native Claude/Codex background work проверяется прямо по существующему Main
+`getCombinedTabBackgroundWorkCount`, отдельно от `turnBusy` и MCP inherited work.
+Положительный count запрещает Auto-stop и `Stop idle`, в том числе перед сигналом.
+Публикация начала/окончания этой работы будит тот же idle-owner; после последнего
+child начинается полный срок, а не остаток от более раннего parent final.
+Шрам15.10: fb4f61a5, parent final15:23:16.910UTC, живой Galileo/count1 и его
+команды до15:33:10.665; Auto-stop15:33:19 ошибочно убил host. Count стал0 только
+при process cleanup, не по child completion. В SOURCE добавлены эти consumer
+guards и event wake; это не доказательство обновления установленного приложения.
+
 Останавливается прежний процесс, вкладка/History/shell сохраняются. `manual-stop`
 cleanup остаётся прежним и не превращается в Pause Run After: будущий trigger
 может выполнить обычный Resume. Это не удаление вкладки и не orchestration
@@ -551,6 +561,13 @@ autoStopCreatedTargets. Настройка относится к desktop IPC; na
 ## Auto-runner — singleton hook, не в overlay
 
 Auto-runner живёт в `src/renderer/hooks/usePromptQueueRunner.ts` и **монтируется один раз в App root** (`App.tsx`), не внутри `PromptQueueOverlay`.
+
+Закрытый `GlobalRunAfterControl` — только presentation: его inventory ограничен
+IDs, нужными текущим queue/compaction counters. При пустом наборе нет обхода всех
+вкладок; открытие preview/pinned editor сразу получает полный свежий inventory.
+Счётчики остаются эквивалентны полному списку с прежним eligibility predicate;
+workflow/SID/rename обновляются для нужных IDs. Full picker/graph, память layout,
+Main executor, arm/completion/readiness и очереди этим не сужаются.
 
 ```ts
 // App.tsx (mount once)
@@ -773,6 +790,14 @@ receipt-only publication не будит саму себя. Unknown/Enter/provid
 предшественника: старый unknown нельзя обойти сменой key, exact consumed item
 не отправляется повторно. После renderer restore join читает исходный frozen
 intent, не переписывает его новыми подсказками/context. Legacy key не изменён.
+
+`app-restart` доказывает только новый Main lifetime, не снимает ожидание
+дочерних задач. Шрам14.10:367 увидела новый runtime/ready, сохранила autoRun/head,
+но её прежний Astra research был running и общий completion predicate удерживал
+отправку. Восстановленная подписка SC и запуск queued `продолжай` — разные действия.
+После causal child return/release runner оценивает ту же голову, не новую arm.
+Сверять нужно completionBlocked predicate, не только purple inheritedBusy UI.
+Не отменять research и не подменять его итог старым idle ради продолжения очереди.
 
 ### Auto-disarm
 

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { ELECTRON_ABI, ELECTRON_VERSION, LOADER_SHA, PTY_MARKER, PTY_VERSION, inspectMachO, sha256 } from './node-pty-binary.mjs';
+import { patchNodePtyWriteTrace, PTY_WRITE_TRACE_SHA } from './node-pty-write-trace.mjs';
 
 // ordinary-runtime/candidate, 2026-10-13: the exact two-file repair, plus a
 // compile-time private marker. No runtime probes, TSFN rewrite or new JS API.
@@ -78,6 +79,8 @@ export async function readInputs(ptyDir) {
   // Installed sources must stay pristine. Patching is exclusively in scratch.
   if (sha256(gyp) !== originalGyp || sha256(pty) !== originalPty) drift('installed node-pty sources are not the pinned originals');
   const patched = patchSources(gyp, pty);
+  files['lib/unixTerminal.js'] = Buffer.from(patchNodePtyWriteTrace(
+    (await readRegular(path.join(ptyDir, 'lib/unixTerminal.js'))).toString()));
   files['binding.gyp'] = Buffer.from(patched.gyp);
   files['src/unix/pty.cc'] = Buffer.from(patched.pty);
   const addon = await readTree(path.join(ptyDir, 'node_modules/node-addon-api'));
@@ -156,9 +159,11 @@ export async function rebuildNodePty({ projectDir, electronVersion, arch, platfo
     await ensureRealDirectory(destination);
     await atomicPublish(path.join(destination, 'spawn-helper'), helper, 0o755);
     await atomicPublish(path.join(destination, 'pty.node'), binary, 0o755);
+    await atomicPublish(path.join(ptyDir, 'lib/unixTerminal.js'), files['lib/unixTerminal.js']);
     // Publish the real rebuilder's skip token last, after validated outputs.
     await atomicPublish(path.join(destination, '.forge-meta'), meta);
-    return { arch, electronVersion, binarySHA: sha256(binary), helperSHA: sha256(helper), meta: meta.toString() };
+    return { arch, electronVersion, binarySHA: sha256(binary), helperSHA: sha256(helper),
+      writeTraceSHA: PTY_WRITE_TRACE_SHA, meta: meta.toString() };
   } finally { await fs.rm(scratch, { recursive: true, force: true }); }
 }
 
@@ -206,6 +211,8 @@ export async function verifyPublished(projectDir, proof) {
   inspectMachO(binary, { arch: proof.arch, marker: true });
   inspectMachO(helper, { arch: proof.arch, type: 2 });
   if (sha256(binary) !== proof.binarySHA || sha256(helper) !== proof.helperSHA
+    || proof.writeTraceSHA !== PTY_WRITE_TRACE_SHA
+    || sha256(await readRegular(path.join(projectDir, 'node_modules/node-pty/lib/unixTerminal.js'))) !== PTY_WRITE_TRACE_SHA
     || (await readRegular(path.join(release, '.forge-meta'))).toString() !== proof.meta) {
     drift('native rebuild replaced the prepared node-pty outputs');
   }

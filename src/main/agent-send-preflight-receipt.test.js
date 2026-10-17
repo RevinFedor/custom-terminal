@@ -48,6 +48,44 @@ test('real readiness failure crosses the App bridge with its negative receipt in
   }
 });
 
+test('Main-issued preflight scope survives actual scenario, flow, and App error bridge', async () => {
+  const { runAgentSendFlow } = await import(pathToFileURL(path.join(__dirname,
+    '../renderer/utils/agentSendFlow.mjs')).href);
+  const source = read('../renderer/utils/agentScenarios.ts');
+  const ast = ts.createSourceFile('scenario.ts', source, ts.ScriptTarget.Latest, true);
+  const fn = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'runAgentPromptScenario');
+  const scope = { version: 1, id: 'main-scope', operationKey: 'O', attemptId: 'A',
+    tabId: 'T', handoffId: 'H', provider: 'codex' };
+  const launch = { success: false, accepted: false, launchWritten: false, protocolVersion: 1,
+    launchStage: 'no-launch', launchAttempt: 1,
+    launchIntent: { intentId: 'launch:fixture:1', token: 1, tabId: 'T', toolType: 'codex' },
+    sendReceipt: { submitted: null, deliveryUnknown: true, status: 'delivery-unknown', operationKey: 'O', attemptId: 'A' } };
+  const context = vm.createContext({ runAgentSendFlow, normalizeStatus: x => x,
+    agentSendSettingsContractError: () => null,
+    createAgentSendAdapter: () => ({
+      prepareRecordContext: async () => ({ complete: false }),
+      ensureReady: async () => { throw Object.assign(new Error('known no-launch'), launch); },
+      proveComposer: () => assert.fail('must not read composer'),
+      runProviderOperation: () => assert.fail('must not submit'),
+    }), console: { log() {} } });
+  vm.runInContext(compile(fn.getText(ast)), context);
+  let error;
+  await assert.rejects(context.runAgentPromptScenario({ tabId: 'T', toolType: 'codex', runtime: {},
+    prompt: 'immutable', handoffId: 'H', sendOperationKey: 'O', sendAttemptId: 'A', preflightScope: scope,
+    settingsIntent: { kind: 'none' } }), caught => { error = caught; return true; });
+  const app = read('../renderer/App.tsx');
+  const start = app.indexOf('} catch (err: any) {', app.indexOf("return reply(false, null, 'unknown action: ' + action)"));
+  const end = app.indexOf('\n      }', start);
+  const bridge = vm.createContext({ err: error, action: 'sendAgentPromptScenario',
+    payload: { tabId: 'T', handoffId: 'H' }, reply: (ok, data) => ({ ok, data }) });
+  vm.runInContext(compile('function forward(){' + app.slice(start + '} catch (err: any) {'.length, end) + '}'), bridge);
+  const response = bridge.forward();
+  assert.equal(response.ok, true);
+  assert.equal(response.data.deliveryUnknown, true, 'renderer alone does not reclassify a durable receipt');
+  assert.deepEqual(response.data.preflightRefusal.scope, scope);
+  assert.equal(response.data.preflightRefusal.providerOperationStarted, false);
+});
+
 async function runCodexRefusal({ blocked = false, hasDraft = false, mainReceipt = null } = {}) {
   const source = read('../renderer/utils/historyAgentRuntimes.ts');
   const file = ts.createSourceFile('runtime.ts', source, ts.ScriptTarget.Latest, true);
@@ -94,6 +132,10 @@ async function runCodexRefusal({ blocked = false, hasDraft = false, mainReceipt 
   });
   vm.runInContext(compile(errorTextHelper.getText(file)), context);
   vm.runInContext(compile(auditTimeoutHelper.getText(file)), context);
+  const draftProbe = file.statements.find(node => ts.isFunctionDeclaration(node)
+    && node.name?.text === 'probeCodexDraft');
+  assert.ok(draftProbe, 'actual shared Codex draft probe');
+  vm.runInContext(compile(draftProbe.getText(file)), context);
   vm.runInContext(compile(declaration.getText(file)), context);
   const result = await context.sendCodexPrompt('tab', 'user prompt', {
     model: 'new', effort: 'medium', runtimeSnapshot: {},

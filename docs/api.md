@@ -68,6 +68,7 @@ curl --fail --silent --show-error \
 |---|---|
 | `GET /api/projects` | Legacy execution namespaces; не workflow identities |
 | `GET /api/projects/:id/tabs` | Вкладки и их runtime metadata |
+| `GET /api/terminal-tabs/inspect?tabIds=[...]` | До8 точных вкладок: passive runtime/turn, own background, jobs/delivery; optional cached final |
 | `POST /api/terminal-tabs/:tabId/send` | Send в выбранную сессию |
 | `GET /api/terminal-tabs/:tabId/send-receipts` | Прежняя доставка без повторного Enter |
 | `GET /api/terminal-tabs/:tabId/history` | Structured history snapshot/delta |
@@ -104,3 +105,22 @@ API не очищает чужой TUI draft. Cancel observation, interrupt turn
 Native iPhone и companion-chat используют этот Mac backend, но являются отдельными
 продуктами/сборками. `mobile-web` оставлен как legacy и не является primary iPhone
 клиентом. No-GUI daemon из одного web-server.js не поставляется.
+
+## Storage maintenance
+
+Проверять `GET /api/me → capabilities.storageMaintenance.version=1`; source/MCP
+update не означает, что метод доступен у работающего app. Auth тот же Bearer.
+
+- `GET /api/storage/inventory` — metadata inventory, в том числе `Test runs`.
+- `GET /api/storage/plan` — dry-run готовых session deletions и closed History.
+- `GET /api/storage/database-space` — page/free-page counters и число служебных
+  workflow snapshots; не тяжёлый scan RAG и не обещание размера reclaimed.
+- `POST /api/storage/cleanup {operationId,maxItems?}` — прежний bounded retention
+  executor. Только созревшие/не защищённые данные; текущие workflow/процессы не
+  закрывает. Archive expiration сохраняет RAG, files проходят provider guards.
+- `GET /api/storage/cleanup/:operationId` — durable receipt. `started/unknown`
+  не повторяются и не разрешают новую отправку с другим ID для «проверки».
+
+`node scripts/storage-cleanup.mjs` по умолчанию dry-run. `--apply` требует
+заранее выбранный `--operation-id`; потерянный ответ читается с `--receipt`.
+На старой версии — update-required без прямого открытия/правки SQLite.

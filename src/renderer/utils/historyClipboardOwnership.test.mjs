@@ -14,7 +14,8 @@ import * as cmCommands from '@codemirror/commands';
 import * as persistence from './composerDraftPersistence.mjs';
 import { mergeFailedHistoryAuthoringSnapshots } from './historyDraftOwnership.mjs';
 import { recoverAgentDraftTransferToHistory } from './agentDraftTransfer.mjs';
-import { measureComposerClipboardCall } from './composerClipboardDiagnostics.mjs';
+import { measureComposerClipboardCall, writeMeasuredClipboardText } from './composerClipboardDiagnostics.mjs';
+import { readTerminalMessageClipboard } from './terminalMessageChips.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(directory, '../components/Workspace/HistoryPanel.tsx'), 'utf8');
@@ -160,6 +161,10 @@ function harness() {
     };
     const context = vm.createContext({
       ...chips, ...images, ...clipboard, ...ownership, useUIStore: api,
+      // This suite's ordinary user-message fixtures have no Research projection.
+      researchReply: null,
+      readTerminalMessageClipboard,
+      writeHistoryClipboardText: text => writeMeasuredClipboardText({ writeText() {} }, text, 'history'),
       performance, currentUIActionId: () => 'ui-copy-test', uiPerformancePhase() {},
       tabId, tabIdRef: { current: tabId }, promptTextareaRef: { current: element }, promptCaretRef: { current: { start: 0, end: 0 } },
       dismissedContextUpdatesRef: { current: [] },

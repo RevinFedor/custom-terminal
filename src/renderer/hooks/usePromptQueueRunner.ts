@@ -34,6 +34,8 @@ import {
   acceptHistoryPromptHandoffProviderQueue,
   beginHistoryPromptHandoff,
   getHistoryPromptHandoffsSnapshot,
+  historyPromptHandoffBlocksNewSubmit,
+  subscribeHistoryPromptHandoffs,
   historyPromptAuditIsProviderQueueReturn,
   historyPromptHandoffAcceptsAuditIdentity,
   historyPromptHandoffAuditProofFromSendResult,
@@ -583,9 +585,68 @@ function withPostPrompt(tabId: string, body: string): string {
 const prevBusyRef = new Map<string, boolean>();
 const queueManualStopping = new Set<string>();
 
+function hasPriorWorkflowInput(tabId: string): boolean {
+  const handoffs = getHistoryPromptHandoffsSnapshot(tabId);
+  const ownId = deferredOwnerSends.get(tabId)?.handoffId;
+  const own = ownId ? handoffs.find(handoff => handoff.handoffId === ownId) : null;
+  // Readiness/Resume and a caller returning audit-pending are still input work.
+  // A later manual FIFO follower must not block its already admitted head,
+  // and this queue's own scenario must not wait for itself.
+  if (!own && pendingAgentSendScenarioCount(tabId) > 0) return true;
+  return historyPromptHandoffBlocksNewSubmit(handoffs.filter(handoff => {
+    if (handoff.handoffId === ownId) return false;
+    if (!own) return true;
+    if (Number.isFinite(own.applicationQueuePosition) && Number.isFinite(handoff.applicationQueuePosition)) {
+      return handoff.applicationQueuePosition! < own.applicationQueuePosition!;
+    }
+    return handoff.submittedAt <= own.submittedAt;
+  }));
+}
+
+function subscribeWorkflowInputRelease(wake: (tabId: string) => void): () => void {
+  let disposed = false;
+  const subscriptions = new Map<string, () => void>();
+  const release = (tabId: string) => queueMicrotask(() => { if (!disposed) wake(tabId); });
+  const refresh = () => {
+    const targets = new Set<string>();
+    for (const [tabId, queue] of usePromptQueueStore.getState().queues) {
+      if (!queue.autoRun && !isLoopPromptActive(queue)) continue;
+      targets.add(tabId);
+      targets.add(getEffectiveQueueTrigger(tabId, queue));
+    }
+    for (const [tabId, unsubscribe] of subscriptions) if (!targets.has(tabId)) {
+      unsubscribe(); subscriptions.delete(tabId);
+    }
+    for (const tabId of targets) if (!subscriptions.has(tabId)) {
+      let previous = getHistoryPromptHandoffsSnapshot(tabId);
+      subscriptions.set(tabId, subscribeHistoryPromptHandoffs(tabId, snapshot => {
+        const failedInputReleased = snapshot.some(handoff =>
+          (handoff.queueStatus === 'failed' || handoff.queueStatus === 'cancelled')
+          && previous.some(old => old.handoffId === handoff.handoffId
+            && old.queueStatus !== handoff.queueStatus));
+        previous = snapshot;
+        // A sent receipt is not whole-turn completion. That wake remains with
+        // the existing natural outcome/readiness owner, not this input journal.
+        if (failedInputReleased) release(tabId);
+      }));
+    }
+  };
+  refresh();
+  const unsubscribeQueue = usePromptQueueStore.subscribe(refresh);
+  const unsubscribeScenarios = subscribeAgentSendScenarios(({ tabId, pending }: { tabId: string; pending: number }) => {
+    if (pending === 0 && subscriptions.has(tabId)) release(tabId);
+  });
+  return () => {
+    disposed = true; unsubscribeQueue(); unsubscribeScenarios();
+    for (const unsubscribe of subscriptions.values()) unsubscribe();
+    subscriptions.clear();
+  };
+}
+
 function isTabWorkflowBlocked(tabId: string, waitingItem?: QueuedPrompt | null): boolean {
   if (waitingItem?.trigger?.kind === 'onTab' && waitingItem.trigger.dependencies
     && promptTabTriggerReady(waitingItem.trigger)) return false;
+  if (hasPriorWorkflowInput(tabId)) return true;
   return queueShutdownPending || queueManualStopping.has(tabId) || autoCompactCoordinator?.has(tabId) === true
     || prevBusyRef.get(tabId) === true || isOrchestrationCompletionBlocked(tabId)
     || Array.from(useWorkspaceStore.getState().openProjects.values()).some(workspace =>
@@ -3756,6 +3817,12 @@ export function usePromptQueueRunner() {
       const current = usePromptQueueStore.getState();
       evaluateQueues(current, current, { forceRuntimeArms: true, forceAppRestartTriggers: true });
     });
+    const unsubscribeInput = subscribeWorkflowInputRelease(tabId => {
+      resumePersistedTimers(tabId);
+      signalQueueOwnerReadiness(tabId, 'input-owner-released');
+      const current = usePromptQueueStore.getState();
+      evaluateQueues(current, current, { forceRuntimeArms: true, forceAppRestartTriggers: true });
+    });
     if (workflowRestoreReconciled) {
       const current = usePromptQueueStore.getState();
       resumePersistedTimers();
@@ -3766,6 +3833,7 @@ export function usePromptQueueRunner() {
       unsubscribeReconciliation();
       unsubscribeOrchestration();
       unsubscribeDeadlineEditor();
+      unsubscribeInput();
       queueDeadlineWakeListeners.delete(resumePersistedTimers);
       queueDelayStartListeners.delete(delayStartListener);
       for (const t of pendingTimers.values()) clearTimeout(t);

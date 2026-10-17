@@ -31,6 +31,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { buildChildProcessEnv } = require('./child-process-env');
+const { resolveHubConfiguration, CONFIG_HEADER, EXPECTED_CONFIG_ENV } = require('./mcp-hub-config');
 
 const DEFAULT_PORT = 53133;
 const HUB_VERSION = '1.1.0';
@@ -57,29 +58,9 @@ function resolveNodeExecutable(env = process.env) {
   throw new Error('Node.js не найден: установите Node.js и повторите запуск MCP');
 }
 
-// Same six servers as ~/.claude.json / ~/.codex/config.toml. `stateful` marks
-// servers that receive client-closed notifications for per-tab cleanup.
+// Compatibility export: membership only, never a native-client config importer.
 function defaultServerDefs(source = process.env) {
-  const definitions = {};
-  const nodeServer = (name, file, stateful = false, env = {}) => {
-    if (file && fs.existsSync(file)) definitions[name] = { command: 'node', args: [file], env, stateful };
-  };
-  // Terminal's installer lives in this repository. Other adapters are optional
-  // independent packages; never assume the maintainer's filesystem on a new Mac.
-  nodeServer('terminal', source.NOTED_TERMINAL_MCP_PATH || path.join(HOME, '.claude/mcp/terminal-server.mjs'));
-  nodeServer('knowledge', source.NOTED_KNOWLEDGE_MCP_PATH || path.join(HOME, '.claude/mcp/knowledge-server.mjs'), false, {
-    KNOWLEDGE_DISABLE_GEMINI: 'true', KNOWLEDGE_DISABLE_CLAUDE_P: 'true',
-    KNOWLEDGE_ROUTER_PROVIDER: 'codex', KNOWLEDGE_CODEX_MODEL: source.KNOWLEDGE_CODEX_MODEL || 'gpt-5.6-luna',
-    KNOWLEDGE_CODEX_EFFORT: 'low', KNOWLEDGE_INDEX_PROVIDER: 'codex',
-  });
-  nodeServer('browser', source.NOTED_BROWSER_MCP_PATH);
-  nodeServer('electron', source.NOTED_ELECTRON_MCP_PATH, true);
-  nodeServer('ios', source.NOTED_IOS_MCP_PATH, true);
-  if (source.NOTED_SC_DESKTOP_MCP_COMMAND && fs.existsSync(source.NOTED_SC_DESKTOP_MCP_COMMAND)) {
-    definitions['sc-desktop'] = { command: source.NOTED_SC_DESKTOP_MCP_COMMAND, args: [], env: {}, stateful: false,
-      ...(source.NOTED_SC_DESKTOP_MCP_REAP_MARKER ? { reapMarker: source.NOTED_SC_DESKTOP_MCP_REAP_MARKER } : {}) };
-  }
-  return definitions;
+  return resolveHubConfiguration(source).serverDefs;
 }
 
 const HANDSHAKE = {
@@ -176,14 +157,17 @@ class ChildServer {
         }
         const childEnv = buildMcpEnvironment({ ...baseEnv, ...env });
         const executable = command === 'node' ? resolveNodeExecutable(childEnv) : command;
-        this.log(`[MCPHub] spawn ${this.name}: ${executable} ${args.join(' ')}`);
+        // Explicit per-server env must not reintroduce another tab's identity.
+        for (const key of ['NOTED_PARENT_TAB_ID', 'NOTED_PARENT_PROJECT_ID', 'NOTED_MAIN_PID',
+          'NOTED_MCP_IDENTITY', 'NOTED_MCP_INSTANCE_ROUTE', 'NOTED_DISCOVERY_DIR', 'CLAUDE_PROJECT_DIR', EXPECTED_CONFIG_ENV]) delete childEnv[key];
+        this.log(`[MCPHub] spawn ${this.name}`);
         proc = spawn(executable, args, {
           env: childEnv,
           stdio: ['pipe', 'pipe', 'pipe'],
           cwd: HOME,
         });
       } catch (err) {
-        this.lastError = String(err.message || err);
+        this.lastError = err.code || 'spawn failed';
         reject(err);
         return;
       }
@@ -200,18 +184,18 @@ class ChildServer {
       };
 
       proc.on('error', (err) => {
-        this.log(`[MCPHub] ${this.name} spawn error: ${err.message}`);
-        failStartup(`spawn error: ${err.message}`);
+        this.log(`[MCPHub] ${this.name} spawn error: ${err.code || 'unknown'}`);
+        failStartup(`spawn error: ${err.code || 'unknown'}`);
         this._onExit(proc, null, null);
       });
       proc.stdin.on('error', (err) => {
         // EPIPE after a failed spawn must not terminate the whole shared hub.
-        failStartup(`stdin error: ${err.message}`);
+        failStartup(`stdin error: ${err.code || 'unknown'}`);
       });
 
       proc.stderr.on('data', (chunk) => {
         const text = String(chunk).trim();
-        if (text) this.log(`[MCPHub:${this.name}:err] ${text.slice(0, 500)}`);
+        if (text) this.log(`[MCPHub:${this.name}:err] stderr received (content withheld)`);
       });
 
       this.rl = readline.createInterface({ input: proc.stdout, terminal: false });
@@ -223,8 +207,8 @@ class ChildServer {
           // one accidental stdout diagnostic must not poison every later reply.
           msg = JSON.parse(line);
         } catch (error) {
-          this.lastError = `invalid stdout line: ${String(error.message || error)}`;
-          this.log(`[MCPHub] ${this.name} ignored non-JSON stdout: ${line.slice(0, 240)}`);
+          this.lastError = 'invalid stdout line';
+          this.log(`[MCPHub] ${this.name} ignored non-JSON stdout`);
           return;
         }
         if (this.proc === proc) this._onMessage(msg);
@@ -250,10 +234,10 @@ class ChildServer {
           this.initResult = result;
           this._writeRaw({ jsonrpc: '2.0', method: 'notifications/initialized' });
           settled = true;
-          this.log(`[MCPHub] ${this.name} ready (pid ${proc.pid}, server ${result?.serverInfo?.name || '?'} ${result?.serverInfo?.version || ''})`);
+          this.log(`[MCPHub] ${this.name} ready (pid ${proc.pid})`);
           resolve(result);
         },
-        reject: (err) => { clearTimeout(timer); failStartup(String(err?.message || err)); },
+        reject: () => { clearTimeout(timer); failStartup('initialize rejected'); },
       });
       this._writeRaw({ ...HANDSHAKE, id });
     });
@@ -352,6 +336,8 @@ class ChildServer {
       // Concurrent catalog callers are rejected when the first timeout kills
       // the child. They join the same recovery and retry instead of failing.
       if (!timedOut && !this.recoveryPromise) throw error;
+      // Catalog recovery cannot cancel an in-flight tool operation.
+      if (!this.recoveryPromise && [...this.pending.values()].some(entry => !CATALOG_METHODS.has(entry.method))) throw error;
       if (!this.recoveryPromise) {
         this.lastRecovery = {
           at: Date.now(),
@@ -417,12 +403,14 @@ function parseIdentity(req, urlObj) {
   let project = q.get('project') || '';
   let cwd = q.get('cwd') || '';
   let mainPid = q.get('mainPid') || '';
+  let instanceRoute = q.get('instanceRoute') || '';
   // Claude leaves `${VAR}` literally when the variable is missing (external
   // sessions without NOTED_* env). Treat unexpanded placeholders as empty.
   if (tab.startsWith('${')) tab = '';
   if (project.startsWith('${')) project = '';
   if (cwd.startsWith('${')) cwd = '';
   if (mainPid.startsWith('${')) mainPid = '';
+  if (instanceRoute.startsWith('${')) instanceRoute = '';
   if (!tab) {
     const auth = String(req.headers['authorization'] || '');
     const m = auth.match(/^Bearer\s+(.+)$/i);
@@ -430,14 +418,15 @@ function parseIdentity(req, urlObj) {
     // any '|' is not our format (some client sending a real auth token) —
     // treat as anonymous rather than mistaking it for a tab id.
     if (m && m[1].includes('|')) {
-      const [t, p, c, mp] = m[1].split('|');
+      const [t, p, c, mp, route] = m[1].split('|');
       tab = t || '';
       project = project || p || '';
       cwd = cwd || c || '';
       mainPid = mainPid || mp || '';
+      instanceRoute = instanceRoute || route || '';
     }
   }
-  return { tabId: tab, projectId: project, cwd, mainPid };
+  return { tabId: tab, projectId: project, cwd, mainPid, ...(instanceRoute ? { instanceRoute } : {}) };
 }
 
 function sendJson(res, status, obj) {
@@ -460,7 +449,9 @@ class McpHub {
     this.port = port;
     this.log = log;
     this.children = new Map();
-    for (const [name, def] of Object.entries(serverDefs || defaultServerDefs())) {
+    this.configuration = serverDefs === null ? resolveHubConfiguration(env) : null;
+    this.expectedConfiguration = env[EXPECTED_CONFIG_ENV];
+    for (const [name, def] of Object.entries(serverDefs || this.configuration.serverDefs)) {
       this.children.set(name, new ChildServer(name, def, log, { catalogTimeoutMs, env }));
     }
     this.httpServer = null;
@@ -473,6 +464,7 @@ class McpHub {
   status() {
     return {
       port: this.actualPort,
+      configuration: this.configuration?.status || null,
       servers: Array.from(this.children.values()).map((c) => c.status()),
       clients: Array.from(this.knownClients.entries()).map(([tabId, lastSeen]) => ({ tabId, lastSeen })),
     };
@@ -490,9 +482,11 @@ class McpHub {
     } catch { return; }
     const needles = [];
     for (const child of this.children.values()) {
-      const marker = child.def.reapMarker
-        || (child.def.args && child.def.args.length ? child.def.args[child.def.args.length - 1] : child.def.command);
-      if (marker) needles.push(marker);
+      // Generic commands/last arbitrary argv are not ownership evidence.
+      const script = child.def.args?.[0];
+      const marker = child.def.reapMarker ||
+        (/^node(?:js)?(?:\.exe)?$/i.test(path.basename(child.def.command)) && script && path.isAbsolute(script) ? script : null);
+      if (marker && path.isAbsolute(marker)) needles.push(marker);
     }
     for (const line of rows) {
       const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
@@ -501,16 +495,31 @@ class McpHub {
       const ppid = parseInt(m[2], 10);
       const args = m[3];
       if (ppid !== 1 || pid === process.pid) continue;
-      if (needles.some((n) => args.includes(n))) {
+      const ownsMarker = marker => {
+        let at = args.indexOf(marker);
+        while (at !== -1) {
+          const end = at + marker.length;
+          if ((at === 0 || /[\s"']/.test(args[at - 1]))
+            && (end === args.length || /[\s"']/.test(args[end]))) return true;
+          at = args.indexOf(marker, at + marker.length);
+        }
+        return false;
+      };
+      if (needles.some(ownsMarker)) {
         try {
           process.kill(pid, 'SIGTERM');
-          this.log('[MCPHub] reaped orphaned server pid ' + pid + ' (' + args.slice(0, 80) + ')');
+          this.log('[MCPHub] reaped orphaned server pid ' + pid);
         } catch {}
       }
     }
   }
 
   async start({ eager = true } = {}) {
+    if (this.configuration && !this.configuration.canLaunch) throw new Error(this.configuration.status.error);
+    // Controller pinned the reviewed read before spawn. A newer file cannot
+    // execute first and merely report configurationApplied:false afterwards.
+    if (this.configuration && this.expectedConfiguration !== undefined
+      && this.expectedConfiguration !== this.configuration.fingerprint) throw new Error('profile_changed_before_launch');
     await new Promise((resolve, reject) => {
       const srv = http.createServer((req, res) => this._handleHttp(req, res));
       srv.on('error', (err) => reject(err));
@@ -527,7 +536,7 @@ class McpHub {
     if (eager) {
       // Warm all servers so first tool call in a fresh session is instant.
       for (const child of this.children.values()) {
-        child.ensureStarted().catch((err) => this.log(`[MCPHub] eager start ${child.name} failed: ${err.message}`));
+        child.ensureStarted().catch(() => this.log(`[MCPHub] eager start ${child.name} failed`));
       }
     }
     // TTL sweep: forget clients silent for 6h, notify stateful servers.
@@ -598,7 +607,9 @@ class McpHub {
     if (parts[0] !== 'mcp') return sendJson(res, 404, { error: 'not found' });
 
     if (parts[1] === '_status') {
-      return sendJson(res, 200, { version: HUB_VERSION, pid: process.pid, capabilities: { restartAll: true, launchEnvironment: 1 }, ...this.status() });
+      return sendJson(res, 200, { version: HUB_VERSION, pid: process.pid,
+        capabilities: { restartAll: true, launchEnvironment: 1, configuration: 1, instanceRouting: 1 }, ...this.status(),
+        configurationMatches: this.configuration ? req.headers[CONFIG_HEADER] === this.configuration.fingerprint : null });
     }
     // Control endpoints (used by Noted Terminal main over HTTP — the hub is a
     // detached process, so in-proc calls are not available to the app).
@@ -652,7 +663,7 @@ class McpHub {
       try {
         await this._handleRpc(child, msg, identity, res);
       } catch (err) {
-        this.log(`[MCPHub] ${child.name} rpc failure: ${err.message}`);
+        this.log(`[MCPHub] ${child.name} rpc failure`);
         if (!res.headersSent) {
           const rpcError = err.rpcError || { code: -32000, message: String(err.message || err) };
           sendJson(res, 200, { jsonrpc: '2.0', id: msg.id ?? null, error: rpcError });
@@ -713,7 +724,7 @@ if (require.main === module) {
     hub.start().then(() => {
       console.log(`[MCPHub] standalone ready on ${hub.actualPort}`);
       process.send?.({ type: 'mcp-hub:ready', status: { version: HUB_VERSION, pid: process.pid,
-        capabilities: { restartAll: true, launchEnvironment: 1 }, ...hub.status() } });
+        capabilities: { restartAll: true, launchEnvironment: 1, configuration: 1 }, ...hub.status() } });
     }).catch((err) => {
       console.error(`[MCPHub] failed to start: ${err.message}`);
       if (process.send) process.send({ type: 'mcp-hub:error', error: err.message }, () => process.exit(1));

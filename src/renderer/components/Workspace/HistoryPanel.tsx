@@ -20,22 +20,22 @@ import {
   bindHistoryImagePreviewKeys,
 } from '../../utils/historyImageRuns.mjs';
 import HistorySearchBar from './HistorySearchBar';
-import HistoryAgentLaunchParameters, { type SubagentLaunchSettings } from './HistoryAgentLaunchParameters';
+import HistoryAgentLaunchParameters, { type SubagentLaunchSettings, type SubagentLaunchServiceTier } from './HistoryAgentLaunchParameters';
 import CodexNativeQuestionMirror from './CodexNativeQuestionMirror';
 import { projectNativeQuestionReply } from '../../../shared/native-question-reply.mjs';
 import { getAutomaticContinuationKind } from '../../../shared/prompt-origin.mjs';
 import { CompositedTextShimmer } from '../UI/CompositedTextShimmer';
 import {HISTORY_SEARCH_PAGE_SIZE, searchHistoryEntries, historySearchEntryKeys} from '../../../shared/history-search.mjs';
-import {publishHistorySearchMarkers, clearHistorySearchMarkers, useHistorySearchMarkers, consumeHistorySearchRequest} from '../../utils/historySearchMarkers';
+import {publishHistorySearchMarkers, clearHistorySearchMarkers, useHistorySearchMarkers, consumeHistorySearchRequest, consumeInputSearchRequest} from '../../utils/historySearchMarkers';
 import {setHistorySearchHighlights, clearHistorySearchHighlights} from '../../utils/historySearchHighlights.mjs';
-import {currentUIActionId, uiPerformancePhase} from '../../utils/uiPerformanceDiagnostics.mjs';
+import {currentUIActionId, uiPerformancePhase, uiPerformancePhaseForAction} from '../../utils/uiPerformanceDiagnostics.mjs';
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Repeat2, RefreshCw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { canInterruptHistoryTurn, requestHistoryTurnInterrupt } from '../../utils/historyTurnInterrupt.mjs';
-import { ComposerEditor } from '../ComposerEditor';
+import { ComposerEditor, openComposerInputSearch } from '../ComposerEditor';
 import {
   type ComposerEditorHandle,
   type ComposerInlineToken,
@@ -381,6 +381,11 @@ import {
 import { stabilizeHistoryRevealAnchor } from '../../utils/historyRevealAnchor.mjs';
 import { holdHistoryRevealExtent } from '../../utils/historyRevealExtent.mjs';
 import { historyEntryCopyDiagnostic } from '../../utils/historyEntryCopyDiagnostic.mjs';
+import { historyEntryMessageReference, copiedHistoryMessageIteration } from '../../utils/historyEntryMessageReference.mjs';
+import { isEligibleTabTitleEntry } from '../../utils/generateTabTitle';
+import { readTerminalMessageClipboard, terminalMessageTokenPresentation, terminalMessageLabel } from '../../utils/terminalMessageChips.mjs';
+import { attachTerminalMessageChip } from '@gt-editor/markdown-editor';
+import { jumpToTerminalMessageReference } from '../../utils/tabMessageSourceJump';
 import {
   acceptHistoryPromptHandoffProviderQueue,
   adoptHistoryPromptHandoffCanonicalEntry,
@@ -494,7 +499,11 @@ import {
   type HistoryTranscriptStep,
 } from './HistoryTranscriptPresentation';
 
+import { captureClipboardWriteContext, writeMeasuredClipboardText } from '../../utils/composerClipboardDiagnostics.mjs';
+
 const { ipcRenderer, clipboard } = window.require('electron');
+const writeHistoryClipboardText = (text: string, context?: ReturnType<typeof captureClipboardWriteContext>) =>
+  writeMeasuredClipboardText(clipboard, text, 'history', context);
 const historyServicePromptFingerprint = (text: string): string => (
   window.require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex')
 );
@@ -584,7 +593,8 @@ const historyMeasuredUnitKey = (unit: any): string => {
     return [
       'group',
       historyVirtuosoUnitKey(unit),
-      unit?.expanded === true ? 'open' : 'closed',
+      // Markdown changes the caption's physical height, not its group UUID.
+      unit?.expanded === true ? 'open' : unit?.familyKey === 'research' ? 'closed' : 'closed:caption-markdown:v2',
       members.length,
       members.at(-1)?.rewriteLayoutUuid || members.at(-1)?.uuid || '',
       unit?.parentGroup?.key || '',
@@ -592,7 +602,9 @@ const historyMeasuredUnitKey = (unit: any): string => {
   }
   const entry = unit?.entry || {};
   return [
-    'entry',
+    // Bounded inline chips and formatted service previews change wrapping.
+    // Older measurements are not exact geometry; physical row IDs stay put.
+    entry.role === 'user' || entry.role === 'queued' ? 'entry:inline-chips:v3' : 'entry',
     historyVirtuosoUnitKey(unit),
     typeof entry.content === 'string' ? entry.content.length : 0,
     entry.settingsProjectionError || '',
@@ -848,7 +860,7 @@ interface TerminalHistoryPreview {
     requestId: string | null;
     text: string;
     phase: 'streaming' | 'settled';
-    deliveryState: 'pending' | 'unknown';
+    deliveryState: 'pending' | 'unknown' | 'saved';
   }>;
   text: string;
   textHash: string | null;
@@ -2476,24 +2488,26 @@ const useRehydratedCopy = (
   presented: string | undefined,
   requestPayload: (wanted: boolean) => void,
 ) => {
-  const pendingRef = useRef(false);
+  const pendingRef = useRef<ReturnType<typeof captureClipboardWriteContext> | null>(null);
   const isWhole = !ref || (presented != null && presented !== preview);
   // The deferred press completes in an EFFECT, never during render: writing
   // to the clipboard is a side effect, and React may render a component more
   // than once per commit.
   useEffect(() => {
     if (!pendingRef.current || !isWhole) return;
-    pendingRef.current = false;
+    const copyContext = pendingRef.current;
+    pendingRef.current = null;
     const text = presented || preview || '';
-    if (text) clipboard.writeText(text);
+    if (text) writeHistoryClipboardText(text, copyContext);
   }, [isWhole, presented, preview]);
   return (value: string) => {
+    const copyContext = captureClipboardWriteContext();
     if (isWhole) {
       const text = value || presented || preview || '';
-      if (text) clipboard.writeText(text);
+      if (text) writeHistoryClipboardText(text, copyContext);
       return;
     }
-    pendingRef.current = true;
+    pendingRef.current = copyContext;
     requestPayload(true);
   };
 };
@@ -3134,12 +3148,13 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
   const launchOwnerKey = [tabId, toolType, sessionId, chipKey,
     chip?.agentSessionId || chip?.agentId || '', String(chip?.startedAt || '')].join('|');
   const [launchSnapshot, setLaunchSnapshot] = useState<{
-    ownerKey: string; settings: SubagentLaunchSettings | null;
-  }>({ ownerKey: '', settings: null });
+    ownerKey: string; settings: SubagentLaunchSettings | null; serviceTier: SubagentLaunchServiceTier | null;
+    loading: boolean;
+  }>({ ownerKey: '', settings: null, serviceTier: null, loading: false });
 
   useEffect(() => {
     if (!chipKey) { setSteps([]); setPending(false); offsetRef.current = 0;
-      setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null }); return; }
+      setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null, serviceTier: null, loading: false }); return; }
     let cancelled = false;
     let tickInFlight = false;
     let drainTimer: number | null = null;
@@ -3154,7 +3169,9 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     offsetRef.current = 0;
     setSteps([]);
     setPending(true);
-    setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null });
+    setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null, serviceTier: null, loading: true });
+    const finishMetadataLoading = () => setLaunchSnapshot(previous =>
+      previous.ownerKey !== launchOwnerKey || !previous.loading ? previous : { ...previous, loading: false });
     // A LIVE Codex card has no thread id yet: the spawn is rendered when the
     // call appears, while the id arrives later (spawn output in v1, an activity
     // event in v2). The main-side watcher already knows it, so ask before the
@@ -3193,13 +3210,29 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
             && res.launchSettings.provider === toolType
             && (toolType !== 'codex' || res.launchSettings.sessionId === resolvedThreadId)
               ? res.launchSettings : null;
-          setLaunchSnapshot(previous => previous.ownerKey === launchOwnerKey
+          const serviceTier: SubagentLaunchServiceTier | null = toolType === 'codex'
+            && res.launchServiceTier?.version === 1 && res.launchServiceTier.provider === 'codex'
+            && res.launchServiceTier.source === 'own-thread-settings'
+            && !!resolvedThreadId && res.launchServiceTier.sessionId === resolvedThreadId
+            && [null, 'priority', 'default'].includes(res.launchServiceTier.serviceTier)
+              ? res.launchServiceTier : null;
+          const nextOffset = Number(res.offset) || offsetRef.current;
+          setLaunchSnapshot(previous => {
+            // Transcript rows can arrive before launch metadata. Keep its
+            // initial loading phase until catch-up, not until the first row;
+            // ordinary tail reads never restart a completed metadata phase.
+            const loading = (previous.ownerKey !== launchOwnerKey || previous.loading || res.reset === true)
+              && res.pending === true && (chip?.status === 'running' || nextOffset > previousOffset);
+            return previous.ownerKey === launchOwnerKey && previous.loading === loading
             && previous.settings?.model === settings?.model
             && previous.settings?.effort === settings?.effort
             && previous.settings?.source === settings?.source
             && previous.settings?.sessionId === settings?.sessionId
-            ? previous : { ownerKey: launchOwnerKey, settings });
-          const nextOffset = Number(res.offset) || offsetRef.current;
+            && previous.serviceTier?.serviceTier === serviceTier?.serviceTier
+            && previous.serviceTier?.source === serviceTier?.source
+            && previous.serviceTier?.sessionId === serviceTier?.sessionId
+            ? previous : { ownerKey: launchOwnerKey, settings, serviceTier, loading };
+          });
           offsetRef.current = nextOffset;
           if (res.steps.length > 0) {
             // Calls and results may cross byte-read boundaries. The reader
@@ -3220,14 +3253,18 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
             setPending(false);
           }
           shouldDrain = res.pending === true && nextOffset > previousOffset;
-        } else if (chip?.status !== 'running') {
-          setPending(false);
+        } else {
+          finishMetadataLoading();
+          if (chip?.status !== 'running') setPending(false);
         }
       } catch {
         // A live file may appear on the next incremental read. A completed
         // agent gets one bounded attempt and then shows the durable result or
         // the explicit unavailable state instead of an eternal loader.
-        if (chip?.status !== 'running' && !cancelled) setPending(false);
+        if (!cancelled) {
+          finishMetadataLoading();
+          if (chip?.status !== 'running') setPending(false);
+        }
       } finally {
         tickInFlight = false;
         if (shouldDrain && !cancelled) {
@@ -3250,7 +3287,10 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     };
   }, [chipKey, tabId, toolType, cwd, sessionId, chip?.agentId, chip?.agentSessionId, chip?.taskPrompt, chip?.label, chip?.startedAt, chip?.status]);
 
-  return { steps, pending, launchSettings: launchSnapshot.ownerKey === launchOwnerKey ? launchSnapshot.settings : null };
+  return { steps, pending,
+    launchMetadataPending: !!chipKey && (launchSnapshot.ownerKey !== launchOwnerKey || launchSnapshot.loading),
+    launchSettings: launchSnapshot.ownerKey === launchOwnerKey ? launchSnapshot.settings : null,
+    launchServiceTier: launchSnapshot.ownerKey === launchOwnerKey ? launchSnapshot.serviceTier : null };
 }
 
 // One docked inspector serves both live and completed agents. It is a sibling
@@ -3297,7 +3337,7 @@ const HistoryBackgroundDetailPane = memo(({
   const followBottomRef = useRef(true);
   const restoredScrollRef = useRef(false);
   const programmaticScrollRef = useRef(false);
-  const { steps: liveSteps, pending: stepsPending, launchSettings: ownLaunchSettings } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
+  const { steps: liveSteps, pending: stepsPending, launchSettings: ownLaunchSettings, launchServiceTier, launchMetadataPending } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
   const creationLaunchSettings = chip.launchSettings?.version === 1
     && chip.launchSettings.provider === toolType
     && (toolType !== 'codex' || chip.launchSettings.sessionId === chip.agentSessionId)
@@ -3355,7 +3395,7 @@ const HistoryBackgroundDetailPane = memo(({
   }, [chip.taskResult, liveSteps]);
   const copyAgentAnswer = useCallback(() => {
     if (!fullAgentAnswer) return;
-    clipboard.writeText(fullAgentAnswer);
+    writeHistoryClipboardText(fullAgentAnswer);
     setAnswerCopied(true);
     if (answerCopiedTimerRef.current) window.clearTimeout(answerCopiedTimerRef.current);
     answerCopiedTimerRef.current = window.setTimeout(() => {
@@ -3460,8 +3500,10 @@ const HistoryBackgroundDetailPane = memo(({
         background: '#111111',
       }}
     >
-      <div style={{
+      <div data-history-agent-detail-header style={{
         display: 'flex', alignItems: 'center', gap: 8,
+        flexWrap: chip.kind === 'subagent' ? 'wrap' : undefined,
+        rowGap: 3,
         padding: '5px 10px', borderBottom: '1px solid #222',
         color: '#bdbdbd', fontSize: '0.85em',
       }}>
@@ -3476,8 +3518,10 @@ const HistoryBackgroundDetailPane = memo(({
             ? <TerminalSquare size={12} style={{ color: statusColor, flexShrink: 0 }} />
             : <Bot size={12} style={{ color: statusColor, flexShrink: 0 }} />}
         {chip.kind === 'subagent'
-          ? <HistoryAgentLaunchParameters settings={creationLaunchSettings || ownLaunchSettings} taskLabel={chip.label} />
+          ? <HistoryAgentLaunchParameters settings={creationLaunchSettings || ownLaunchSettings}
+              provider={toolType} serviceTier={launchServiceTier} loading={launchMetadataPending} taskLabel={chip.label} />
           : <span className="truncate" style={{ flex: 1, fontFamily: 'monospace' }}>{chip.label}</span>}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, marginLeft: 'auto' }}>
         <span style={{ color: statusColor, fontSize: '0.9em' }}>{statusLabel}</span>
         <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums', minWidth: 0 }}>
           {running
@@ -3524,6 +3568,7 @@ const HistoryBackgroundDetailPane = memo(({
         >
           <X size={13} />
         </button>
+        </div>
       </div>
       <div
         ref={scrollRef}
@@ -3550,7 +3595,7 @@ const HistoryBackgroundDetailPane = memo(({
             <HistoryTranscriptPresentation
               steps={presentedSteps}
               isTurnBusy={running}
-              onCopy={(text) => clipboard.writeText(text)}
+              onCopy={(text) => writeHistoryClipboardText(text)}
               loadPayload={loadSubagentPayload}
               onMessageContextMenu={openSubagentMessageContextMenu}
             />
@@ -3958,6 +4003,8 @@ const openHistoryEntryContextMenu = (
   entry: FullHistoryEntry,
   toolType?: 'claude' | 'gemini' | 'codex',
   tabId?: string,
+  iteration: number | null = null,
+  readSessionId?: string,
 ) => {
   const selection = window.getSelection();
   if (
@@ -3982,6 +4029,17 @@ const openHistoryEntryContextMenu = (
   ipcRenderer.send('show-history-entry-context-menu', {
     copyText: historyEntryDetailsText(entry, toolType),
     diagnostic: historyEntryCopyDiagnostic(entry, tabId, toolType),
+    messageReference: historyEntryMessageReference(entry, {
+      tabId, provider: toolType,
+      // This is an action-time metadata lookup, not a whole-workspace selector.
+      tabName: tabId ? [...useWorkspaceStore.getState().openProjects.values()]
+        .find(workspace => workspace.tabs.has(tabId))?.tabs.get(tabId)?.name : undefined,
+      iteration,
+      readSessionId: readSessionId || entry.entryRef?.viewOwnerSessionId || entry.viewOwnerSessionId,
+      timeLabel: entry.timestamp && Number.isFinite(Date.parse(entry.timestamp))
+        ? new Date(entry.timestamp).toLocaleString() : undefined,
+      referenceId: crypto.randomUUID(),
+    }),
   });
 };
 
@@ -4001,8 +4059,8 @@ const HistoryCollapsiblePrompt = ({
   const toggleExpanded = useHistoryRevealToggle(anchorRef, expanded, setExpanded);
   const preview = text.slice(0, HISTORY_USER_TEXT_COLLAPSED_CHARS).trimEnd();
   const visibleText = needsCollapse && !open ? preview + '…' : text;
-  const body = markdown && (!needsCollapse || open)
-    ? <CBMarkdown text={visibleText} />
+  const body = markdown
+    ? <CBMarkdown text={visibleText} preview={needsCollapse && !open} />
     : <p className="cb-msg-text">{renderSentHistoryPromptHighlight(visibleText)}</p>;
   if (!needsCollapse) return body;
   const toggle = (
@@ -4200,6 +4258,7 @@ const HistoryComposerToken = ({
   onClick,
   buttonRef,
   error,
+  messageReference,
 }: {
   kind: 'image' | 'paste';
   label: string;
@@ -4207,9 +4266,22 @@ const HistoryComposerToken = ({
   onClick: (trigger: HTMLElement) => void;
   buttonRef: (node: HTMLElement | null) => void;
   error?: boolean;
-}) => (
+  messageReference?: any;
+}) => {
+  const nodeRef = useRef<HTMLElement | null>(null);
+  const clickRef = useRef(onClick); clickRef.current = onClick;
+  useEffect(() => {
+    if (!nodeRef.current || !messageReference) return;
+    return attachTerminalMessageChip(nodeRef.current, messageReference, {
+      openDetails: () => { if (nodeRef.current) clickRef.current(nodeRef.current); },
+      navigate: jumpToTerminalMessageReference,
+      error: reason => { if (nodeRef.current) nodeRef.current.title = reason; },
+    });
+  }, [messageReference?.referenceId]);
+  return (
   <span
-    ref={buttonRef}
+    ref={node => { nodeRef.current = node; buttonRef(node); }}
+    className="hp-history-user-prompt-chip-slot"
     data-history-composer-token={kind}
     style={{ display: 'inline-flex', verticalAlign: 'middle' }}
   >
@@ -4225,7 +4297,8 @@ const HistoryComposerToken = ({
       }}
     />
   </span>
-);
+  );
+};
 
 type HistoryInstructionAttachment = {
   fileName: 'AGENTS.md' | 'CLAUDE.md';
@@ -4241,8 +4314,12 @@ type HistoryInstructionAttachment = {
 const historyInstructionAttachment = (
   text: string,
   toolType?: 'claude' | 'gemini' | 'codex',
+  serviceCarrier?: string,
 ): HistoryInstructionAttachment | null => {
   if (toolType !== 'codex' && toolType !== 'claude') return null;
+  // A file name or pasted wrapper is not proof of provider bootstrap. Codex
+  // already marks its separate instructions carrier in canonical History.
+  if (toolType === 'codex' && serviceCarrier !== 'project-instructions') return null;
   const value = String(text || '').trim();
   if (!value) return null;
 
@@ -4284,13 +4361,15 @@ const historyUserPromptIsChipOnly = ({
   promptChips = [],
   imagePaths = [],
   toolType,
+  serviceCarrier,
 }: {
   text: string;
   promptChips?: HistoryPromptDraftChip[];
   imagePaths?: HistoryPromptDraftImageRef[];
   toolType?: 'claude' | 'gemini' | 'codex';
+  serviceCarrier?: string;
 }) => {
-  if (historyInstructionAttachment(text, toolType)) return true;
+  if (historyInstructionAttachment(text, toolType, serviceCarrier)) return true;
   const presentation = buildHistoryComposerPresentationParts({
     text,
     chips: promptChips,
@@ -4341,13 +4420,13 @@ const HistoryInstructionChip = ({
   const anchorRef = useRef<HTMLSpanElement>(null);
   const closePopover = useCallback(() => setOpen(false), []);
   return (
-    <div className="cb-msg-text hp-history-instruction-attachment">
+    <div className="cb-msg-text hp-history-instruction-attachment" data-history-service-carrier="project-instructions">
       <span ref={anchorRef} style={{ display: 'inline-flex', verticalAlign: 'middle' }}>
         <ComposerChip
           kind="prompt"
           className="hp-history-instruction-chip"
           leading={<HistoryInstructionProviderIcon provider={attachment.provider} />}
-          label={attachment.fileName}
+          label={'Project instructions · ' + attachment.fileName}
           preview={attachment.scopeLabel || undefined}
           onClick={forceExpanded ? undefined : (event) => {
             event.preventDefault();
@@ -4529,6 +4608,7 @@ const HistoryUserPromptContent = ({
   toolType,
   forceExpanded = false,
   presentationParts,
+  serviceCarrier,
 }: {
   text: string;
   messageText?: string;
@@ -4539,10 +4619,11 @@ const HistoryUserPromptContent = ({
   toolType?: 'claude' | 'gemini' | 'codex';
   forceExpanded?: boolean;
   presentationParts?: Array<any>;
+  serviceCarrier?: string;
 }) => {
   const instructionAttachment = useMemo(
-    () => markdown ? null : historyInstructionAttachment(text, toolType),
-    [text, toolType, markdown],
+    () => markdown ? null : historyInstructionAttachment(text, toolType, serviceCarrier),
+    [text, toolType, markdown, serviceCarrier],
   );
   const [expandedPart, setExpandedPart] = useState<string | null>(null);
   // Раскрытие всего сообщения — отдельное состояние от раскрытия одной части
@@ -4624,7 +4705,7 @@ const HistoryUserPromptContent = ({
   const visible = needsCollapse && !open
     ? truncateMixedMessageParts(parts, HISTORY_USER_TEXT_COLLAPSED_CHARS)
     : { parts, truncated: false };
-  const renderMarkdown = markdown && (!needsCollapse || open);
+  const markdownPreview = needsCollapse && !open;
   const collapseToggle = needsCollapse && !forceExpanded ? (
     <button
       type="button"
@@ -4642,7 +4723,7 @@ const HistoryUserPromptContent = ({
 
   const renderVisiblePart = (part: any, index: number) => {
         if (part.kind === 'text') {
-          if (renderMarkdown) return <CBMarkdown key={`text:${index}`} text={part.text} />;
+          if (markdown) return <CBMarkdown key={`text:${index}`} text={part.text} preview={markdownPreview} />;
           return (
             <HistoryInlineTextPart
               key={`text:${index}`}
@@ -4658,6 +4739,7 @@ const HistoryUserPromptContent = ({
             <React.Fragment key={partKey}>
               <span
                 ref={(node) => setRevealAnchor(partKey, node)}
+                className="hp-history-user-prompt-chip-slot"
                 style={{ display: 'inline-flex', verticalAlign: 'middle' }}
               >
                 <ComposerChip
@@ -4694,7 +4776,8 @@ const HistoryUserPromptContent = ({
             <React.Fragment key={partKey}>
               <HistoryComposerToken
                 kind="paste"
-                label={`Pasted Content ${part.text.length.toLocaleString('ru-RU')} chars`}
+                label={part.messageReference ? terminalMessageLabel(part.messageReference) : `Pasted Content ${part.text.length.toLocaleString('ru-RU')} chars`}
+                messageReference={part.messageReference}
                 buttonRef={(node) => setRevealAnchor(partKey, node)}
                 onClick={(trigger) => togglePopoverPart(partKey, trigger)}
               />
@@ -4879,8 +4962,8 @@ const HistoryUserEntry = memo(({
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editableLastPrompt = entry.deliveryStatus === 'editable-last-prompt';
   const instructionAttachment = useMemo(
-    () => historyInstructionAttachment(entry.content, toolType),
-    [entry.content, toolType],
+    () => historyInstructionAttachment(entry.content, toolType, entry.serviceCarrier),
+    [entry.content, toolType, entry.serviceCarrier],
   );
   const canRewind = allowRewind && !rewindLocked && !instructionAttachment;
   const canHistoryRewriteRewind = allowHistoryRewriteRewind
@@ -4939,19 +5022,26 @@ const HistoryUserEntry = memo(({
       promptChips: entry.promptChips,
       imagePaths: entry.imagePaths,
       toolType,
+      serviceCarrier: entry.serviceCarrier,
     })
-  ), [serviceBody.text, entry.imagePaths, entry.promptChips, forceExpanded, toolType]);
+  ), [serviceBody.text, entry.imagePaths, entry.promptChips, entry.serviceCarrier, forceExpanded, toolType]);
   const orchestrationPrompt = useMemo(
     () => resolveHistoryOrchestrationPromptPresentation(entry),
     [entry],
   );
+  const mcpAsUser = useUIStore(state => !!orchestrationPrompt
+    && orchestrationPrompt.runKind !== 'external-research'
+    && !researchReply
+    && !serviceBody.questionReply
+    && state.historyMcpAsUserTabs[tabId] === true);
+  const orchestrationStyle = !!orchestrationPrompt && !mcpAsUser;
   const promptSender = resolveHistoryPromptSender(orchestrationPrompt);
   const automaticContinuation = !orchestrationPrompt && !serviceBody.questionReply ? getAutomaticContinuationKind(entry) : null;
   const loopPrompt = automaticContinuation === 'loop';
   const continuePrompt = automaticContinuation === 'continue';
   const userBubbleClassName = [
     chipOnly ? 'hp-history-user-bubble--single-chip' : '',
-    orchestrationPrompt ? 'hp-history-user-bubble--orchestration' : '',
+    orchestrationStyle ? 'hp-history-user-bubble--orchestration' : '',
     researchReply ? 'hp-history-user-bubble--research' : '',
     loopPrompt ? 'hp-history-user-bubble--loop' : '',
     continuePrompt ? 'hp-history-user-bubble--continue' : '',
@@ -5106,7 +5196,8 @@ const HistoryUserEntry = memo(({
       data-history-question-reply={serviceBody.questionReply?.provider}
       entryUuid={entry.uuid}
       {...historyRecordTimeAttributes(entry.recordTime, entry.uuid + ':user', 'user')}
-      className={researchReply ? 'hp-history-user--orchestration hp-history-research-entry' : orchestrationPrompt ? 'hp-history-user--orchestration' : loopPrompt ? 'hp-history-user--loop' : continuePrompt ? 'hp-history-user--continue' : undefined}
+      className={researchReply ? 'hp-history-user--orchestration hp-history-research-entry' : orchestrationStyle ? 'hp-history-user--orchestration' : loopPrompt ? 'hp-history-user--loop' : continuePrompt ? 'hp-history-user--continue' : undefined}
+      data-history-mcp-as-user={mcpAsUser || undefined}
       data-history-prompt-origin={loopPrompt ? 'loop' : continuePrompt ? 'codex-capacity-retry' : undefined}
       data-history-orchestration-phase={orchestrationPrompt?.phase}
       data-history-tab-message-id={orchestrationPrompt?.messageId}
@@ -5304,7 +5395,7 @@ const HistoryUserEntry = memo(({
         </>
       )}
     >
-      {promptSender && !researchReply && (
+      {promptSender && !researchReply && !mcpAsUser && (
         <HistoryPromptSource source={promptSender} phase={orchestrationPrompt.phase} />
       )}
       {(loopPrompt || continuePrompt) && <div className="hp-history-loop-label" data-history-loop-label={loopPrompt || undefined}
@@ -5327,6 +5418,7 @@ const HistoryUserEntry = memo(({
         promptChips={entry.promptChips}
         imagePaths={entry.imagePaths}
         toolType={toolType}
+        serviceCarrier={entry.serviceCarrier}
         forceExpanded={forceExpanded}
         presentationParts={serviceBody.questionReply ? promptPresentation.parts : hasDetachedPromptBand ? detachedPrompts.bodyParts : undefined}
       />}
@@ -5362,7 +5454,7 @@ const HistoryAssistantEntry = memo(({
       || (!hasAssistantActions && !!entry.thinking));
   const copyAnswer = () => {
     if (!entry.content) return;
-    clipboard.writeText(entry.content);
+    writeHistoryClipboardText(entry.content);
     setCopied(true);
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
     copiedTimerRef.current = setTimeout(() => {
@@ -5938,11 +6030,14 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
 .hp-history-user-prompt-chip-slot .cb-composer-chip {
   min-width: 0;
   max-width: min(240px, 100%);
+  box-sizing: border-box;
 }
 .hp-history-user-prompt-chip-slot .cb-composer-chip-hit,
 .hp-history-user-prompt-chip-slot .cb-composer-chip-content {
+  flex: 1 1 auto;
   min-width: 0;
   max-width: 100%;
+  overflow: hidden;
 }
 .hp-history-user-prompt-chip-slot .cb-composer-chip-label {
   flex: 1 1 auto;
@@ -5991,9 +6086,9 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   padding-left: var(--hp-horizontal-padding, 4px);
   padding-right: var(--hp-horizontal-padding, 4px);
 }
-/* Terminal MCP/orchestration prompts are app-owned service input, not words
-   typed by the user. Proven semantic metadata selects a quiet violet surface;
-   quoted orchestration text without that metadata keeps the ordinary orange. */
+/* Audited MCP/orchestration prompts default to violet. The per-tab user-view
+   preference omits this class without changing provenance; quoted service
+   text without metadata keeps the ordinary orange in either mode. */
 .hp-history-transcript .cb-user-bubble.hp-history-user-bubble--orchestration {
   --cb-user-bubble-bg: rgba(124, 58, 237, 0.08);
   --cb-user-bubble-border: rgba(167, 139, 250, 0.20);
@@ -6551,6 +6646,28 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
 }
 .hp-history-composer-frame:focus-within {
   border-color: #FFB382;
+}
+/* Preparation is feedback, not an input lock. Composite only this painted
+   outline; the editable draft, caption and controls never blink or reflow. */
+@keyframes hp-history-composer-preparing {
+  0%, 100% { opacity: 0.2; }
+  50% { opacity: 1; }
+}
+.hp-history-composer-preparing::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border: 1px solid #60a5fa;
+  border-radius: inherit;
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.2), 0 0 8px rgba(96, 165, 250, 0.3);
+  pointer-events: none;
+  animation: hp-history-composer-preparing 1.2s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hp-history-composer-preparing::after {
+    animation: none;
+    opacity: 1;
+  }
 }
 .hp-history-composer-frame .cb-composer-main {
   padding-top: 0;
@@ -7700,6 +7817,19 @@ function AgentHistoryControls({
   }, []);
   const statusCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const promptTextareaRef = useRef<ComposerEditorHandle | null>(null);
+  const requestedInputSearch = useHistorySearchMarkers(state=>state.inputRequests[tabId] || 0);
+  // The actual composer owns this request, including its portalled placement.
+  // Keep it until its live owner is mounted; no timer, draft edit or global scan.
+  useLayoutEffect(() => {
+    if (!requestedInputSearch || !agentInputSurface || interactionDisabled
+      || effectiveSuppressWindowEscapeRef.current) return;
+    const editor = promptTextareaRef.current;
+    if (editor?.getAttribute('data-history-composer-tab-id') !== tabId) return;
+    if (openComposerInputSearch(editor)) {
+      uiPerformancePhase('input-search-open', {tab:tabId});
+      consumeInputSearchRequest(tabId,requestedInputSearch);
+    }
+  });
   useLayoutEffect(() => {
     if (!interactionDisabled) return;
     promptTextareaRef.current?.dom?.blur();
@@ -9127,7 +9257,7 @@ function AgentHistoryControls({
 
   const runAction = useCallback(async (
     kind: 'resume' | 'send' | 'interrupt' | 'stop',
-    options: { recordWithoutReply?: boolean } = {},
+    options: { recordWithoutReply?: boolean; uiActionId?: string | null } = {},
   ) => {
     if (kind === 'interrupt') {
       return requestHistoryTurnInterrupt({
@@ -9241,6 +9371,10 @@ function AgentHistoryControls({
     }
     const actionTabId = tabId;
     let coordinatedSendToken: number | null = null;
+    const preparationStartedAt = Date.now();
+    // Programmatic submit/late dictation has no current native gesture. Only
+    // an explicit caller may bind this work to its captured UI action.
+    const preparationUIActionId = kind === 'send' ? options.uiActionId || null : null;
     if (kind === 'send') {
       const started = beginCoordinatedAgentSend(actionTabId, Date.now(), {
         recordWithoutReply,
@@ -9289,6 +9423,16 @@ function AgentHistoryControls({
     let sendCoordinatedSettlement: any = null;
     let historyRecordSettledEarly = false;
     let cascadeBatchRestored = false;
+    const markSendPreparation = (phase: string) => {
+      if (kind !== 'send' || !coordinatedSendToken) return;
+      const elapsedMs = Date.now() - preparationStartedAt;
+      historyDiag('SEND_PREPARATION tab=' + actionTabId.slice(-12)
+        + ' token=' + coordinatedSendToken + ' phase=' + phase
+        + ' handoff=' + (sendHandoffId || '-') + ' elapsedMs=' + elapsedMs
+        + ' uiAction=' + (preparationUIActionId || '-'));
+      if (preparationUIActionId) uiPerformancePhaseForAction(preparationUIActionId,
+        'history-send-preparation-' + phase, { tab: actionTabId, token: coordinatedSendToken, elapsedMs });
+    };
     const restoreClearedSendSnapshot = (reason: string) => {
       const restorePrompt = clearedPromptText;
       if (
@@ -9378,6 +9522,7 @@ function AgentHistoryControls({
     actionInFlightRef.current = true;
     activeActionKindRef.current = kind;
     setBusyAction(kind);
+    markSendPreparation('begin');
     try {
       if (kind === 'resume') {
         processStopInFlightRef.current = false;
@@ -9491,6 +9636,7 @@ function AgentHistoryControls({
           useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
         );
         const preparedPrompt = await prepareHistoryPromptForSend(rawDraftSnapshot, sourceDraftImages);
+        markSendPreparation('images-ready');
         if (!isCurrentAction()) return;
         if (!preparedPrompt.success) {
           const latestText = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
@@ -9536,6 +9682,7 @@ function AgentHistoryControls({
         const handoffId = createPromptHandoffId();
         sendHandoffId = handoffId;
         const contextPrepared = await prepareTabWorkContext(actionTabId, handoffId, sendPayload);
+        markSendPreparation('context-ready');
         sendPayload = contextPrepared.prompt;
         presentationText = contextPrepared.prefix + presentationText;
         sendIncidentPromptText = sendPayload;
@@ -9575,8 +9722,8 @@ function AgentHistoryControls({
           ' pasteBusy=' + pasteBusyRef.current +
           ' preview="' + promptPreview(presentationText) + '"');
         const promptChipsForHistory = sendDraftChips
-          .filter((chip) => chip.kind === 'prompt')
-          .map((chip) => ({ ...chip, kind: 'prompt' as const }));
+          .filter((chip) => chip.kind === 'prompt' || chip.kind === 'paste' && chip.messageReference)
+          .map((chip) => ({ ...chip }));
         const localCommandCandidate = !recordWithoutReply
           && isStandaloneAgentLocalCommand({
             prompt: sendPayload,
@@ -9668,6 +9815,7 @@ function AgentHistoryControls({
         }
         delayedDeliveryWarningHandoffRef.current = null;
         setDraftWarning(null);
+        markSendPreparation('handoff-published');
         // A normal prompt does not request model/effort at all. The live
         // ControlBar picker has already applied them, while cold Start/Resume
         // gets them from buildCodexRunPayload. Only record-without-reply stops
@@ -10019,6 +10167,20 @@ function AgentHistoryControls({
     } catch (e: any) {
       if (kind === 'send') {
         sendCoordinatedSettlement = e?.coordinatedSettlement || sendCoordinatedSettlement;
+        // Freeze at the failure boundary, before draft recovery/renderer awaits.
+        // This is only a diagnostic request: it must not retry or settle Send.
+        if (sendHandoffId) {
+          try {
+            ipcRenderer.send('terminal:send-failure-diagnostic', {
+              tabId: actionTabId, toolType: runtime.toolType, handoffId: sendHandoffId,
+              sendAttemptId: sendFailureResult?.sendAttemptId || sendFailureResult?.attemptId,
+              sendOperationKey: sendFailureResult?.sendOperationKey || sendFailureResult?.operationKey,
+              reportedAt: Date.now(), code: sendFailureResult?.code || e?.code,
+              submitted: sendFailureResult?.submitted,
+              pasteWritten: sendFailureResult?.pasteWritten ?? sendRefusalPasteWritten,
+            });
+          } catch { /* Observability cannot replace the original recovery. */ }
+        }
       }
       const currentAction = isCurrentAction();
       if (kind === 'send' && e?.cascadeRestoreByToken && e?.cascadeRestoreBatched === true) {
@@ -10175,6 +10337,7 @@ function AgentHistoryControls({
           token: coordinatedSendToken,
           runQueuedStop: () => runtime.stopProcess(actionTabId, { reason: 'history-send-preparation-settled' }),
         });
+        markSendPreparation('settled');
         if (fallbackSettlement.settled) sendCoordinatedSettlement = fallbackSettlement;
         if (deferredSendRollback) {
           if (sendCoordinatedSettlement?.stopped) {
@@ -10507,6 +10670,14 @@ function AgentHistoryControls({
   const meta = AGENT_STATUS_META[status];
   const rawActiveLifecycle = lifecycleStatus?.tabId === tabId ? lifecycleStatus : null;
   const coordinatedComposerAction = getCoordinatedAgentAction(tabId);
+  // Before the exact handoff exists the text is still an editable draft, not
+  // a Main FIFO receipt. Show the existing coordinator's preparation lease
+  // immediately, including while image/context IPC awaits. Never borrow a
+  // completed message's delivery phase or let late cleanup revive this label.
+  const sendPreparationPending = coordinatedComposerAction?.phase === 'sending'
+    && !coordinatedComposerAction.handoffId
+    && coordinatedComposerAction.stopRequestedAt === null
+    && coordinatedComposerAction.cancelledAt === null;
   const recordContextAcceptsFollowup = busyAction === 'send'
     && coordinatedComposerAction?.recordWithoutReply === true
     && coordinatedComposerAction.stopRequestedAt === null;
@@ -10690,6 +10861,7 @@ function AgentHistoryControls({
   const draftImagePreviewUrls = useComposerImagePreviews(draftImages);
   const promptComposerTokens = useMemo<ComposerInlineToken[]>(() => {
     const refsById = new Map(draftImages.map((ref) => [Number(ref.id), ref]));
+    const chipsById = new Map(draftChips.map(chip => [chip.id, chip]));
     const result: ComposerInlineToken[] = [
       ...promptImageMarkerRanges.map((range) => ({
         id: `image:${range.id}:${range.start}`,
@@ -10704,7 +10876,8 @@ function AgentHistoryControls({
         from: range.start,
         to: range.end,
         kind: 'paste' as const,
-        label: prompt.slice(range.start + 1, Math.max(range.start + 1, range.end - 1)),
+        ...terminalMessageTokenPresentation(chipsById.get(range.id),
+          prompt.slice(range.start + 1, Math.max(range.start + 1, range.end - 1))),
       })),
       // Dictation chips: atomic pending token while Voice Record commits the
       // speech tail; amber `error` token (retry on click) when it failed or
@@ -10739,7 +10912,7 @@ function AgentHistoryControls({
       replace: range.replace,
     })));
     return result;
-  }, [dictationEntriesByChipId, dictationMarkerRanges, draftImagePreviewUrls, draftImages, prompt, promptImageMarkerRanges, promptPasteMarkerRanges]);
+  }, [dictationEntriesByChipId, dictationMarkerRanges, draftImagePreviewUrls, draftImages, draftChips, prompt, promptImageMarkerRanges, promptPasteMarkerRanges]);
   const previewedDraftImageRange = useMemo(() => (
     previewChipId
       ? promptImageMarkerRanges.find((range) => (
@@ -11088,7 +11261,7 @@ function AgentHistoryControls({
         userEvent: 'delete.cut',
       });
     }
-    clipboard.writeText(result.text);
+    writeHistoryClipboardText(result.text);
     if (result.imagePartial > 0 || result.imageMissing > 0) {
       setDraftWarning('Image marker is damaged or has no matching attachment. An imageError marker was copied instead.');
     } else if (result.pasteMissing > 0) {
@@ -11115,6 +11288,7 @@ function AgentHistoryControls({
     const hasImageItem = Array.from(event.clipboardData?.items || [])
       .some((item) => item.kind === 'file' && item.type.toLowerCase().startsWith('image/'));
     const pastedText = event.clipboardData?.getData('text/plain') || '';
+    const messageReference = readTerminalMessageClipboard(event.clipboardData, pastedText);
     const portableMarkers = !structuredSnapshot && !hasImageItem
       ? collectPortableImagePathMarkers(pastedText) : [];
     uiPerformancePhase('history-composer-paste-classified', { ms: performance.now() - pasteStartedAt,
@@ -11125,7 +11299,7 @@ function AgentHistoryControls({
     if (!hasImageItem && portableMarkers.length === 0
       && isElectronDictationClipboardPayload(event.clipboardData)) return;
     if (!structuredSnapshot && !hasImageItem && portableMarkers.length === 0
-      && !shouldCreatePasteChip(pastedText, aiComposerChipThreshold)) return;
+      && !messageReference && !shouldCreatePasteChip(pastedText, aiComposerChipThreshold)) return;
     event.preventDefault();
     event.stopPropagation();
     if (isCancellingTurn || rewindLocked || effectiveStopping) {
@@ -11176,6 +11350,7 @@ function AgentHistoryControls({
       const chip: HistoryPromptDraftChip = {
         id: createComposerChipId('paste'), kind: 'paste', text: pastedText,
         label: 'Вставка', createdAt: Date.now(),
+        ...(messageReference ? { messageReference } : {}),
       };
       insertSnapshot({ text: buildPasteChipMarker(chip), chips: [chip] });
       return;
@@ -11721,7 +11896,7 @@ function AgentHistoryControls({
       statusSessionId ? 'Session ' + statusSessionId : null,
       'Tab ' + tabId,
     ].filter(Boolean).join('\n');
-    clipboard.writeText(text);
+    writeHistoryClipboardText(text);
     setStatusCopied(true);
     if (statusCopiedTimerRef.current) clearTimeout(statusCopiedTimerRef.current);
     statusCopiedTimerRef.current = setTimeout(() => {
@@ -11793,6 +11968,7 @@ function AgentHistoryControls({
   // with them. Suppressing them was only ever about not stacking two red things
   // in the same place.
   const hasFloatingStatus = showStatusText
+    || sendPreparationPending
     || !!activeLifecycle
     || (!!visibleDraftWarning && !!inlineDraftNoticeMeta)
     || rewindPreviewActive;
@@ -11850,6 +12026,18 @@ function AgentHistoryControls({
       }}
     >
       <span style={{ display: 'contents', pointerEvents: 'auto' }}>
+        {sendPreparationPending && (
+          <span
+            role="status"
+            aria-live="polite"
+            data-history-send-preparation
+            data-preparation-token={coordinatedComposerAction.token}
+            title="Нажатие принято. Проверяем вложения и обновления контекста; сообщение ещё не принято в очередь приложения. Повторять Enter не нужно."
+            style={{ color: '#60a5fa', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }}
+          >
+            {presentStatusTitle('PREPARING SEND...')}
+          </span>
+        )}
         {showStatusText && (
           <span
             data-agent-status-title
@@ -12326,7 +12514,7 @@ function AgentHistoryControls({
       ) : (
         <AIComposerSurface
           density="comfortable"
-          className="hp-history-composer-frame"
+          className={'hp-history-composer-frame' + (sendPreparationPending ? ' hp-history-composer-preparing' : '')}
           topBar={historyComposerTopBar}
           topBarTrailing={historyComposerTopBarTrailing}
           // Никаких чипов ВНУТРИ поверхности: и промпты, и вставки, и картинки
@@ -12560,7 +12748,7 @@ function AgentHistoryControls({
                     }
                     return;
                   }
-                  if (canSend) runAction('send');
+                  if (canSend) runAction('send', { uiActionId: currentUIActionId() });
                 }}
                 onSelectionChange={(selection) => {
                   if (!shouldRecordComposerViewEvent(
@@ -12986,6 +13174,7 @@ function HistoryPanel({
   const flushHistoryComposerDrafts = useUIStore((s) => s.flushHistoryComposerDrafts);
   const setHistoryRewindPreview = useUIStore((s) => s.setHistoryRewindPreview);
   const historyFontSize = useUIStore((s) => s.historyFontSize);
+  const historyMcpAsUser = useUIStore((s) => s.historyMcpAsUserTabs[tabId] === true);
   const historyHorizontalPadding = useUIStore((s) => s.historyHorizontalPadding);
   const historyLetterSpacing = useUIStore((s) => s.historyLetterSpacing);
   const historyMarkdownCodeMaxLines = useUIStore((s) => s.historyMarkdownCodeMaxLines);
@@ -14232,11 +14421,12 @@ function HistoryPanel({
   );
   const topChromeInset = mainSurface && enableClaudePtyControls && !previewMode ? HISTORY_TOP_CHROME_INSET : 0;
   const displayUnitLayoutKeys = useMemo(
-    // The added Header changes physical offsets, but never display-unit IDs.
-    // Reject an old zero-header snapshot through the existing shape guard;
-    // semantic reading anchors still restore through their normal owner.
-    () => displayUnits.map((unit) => (topChromeInset ? `chrome:${topChromeInset}|` : '') + historyMeasuredUnitKey(unit)),
-    [displayUnits, topChromeInset],
+    // Chrome and optional MCP source headers change heights, not unit IDs.
+    // Keep cached geometry specific to the presentation; reading anchors
+    // still restore through their normal semantic owner.
+    () => displayUnits.map((unit) => (topChromeInset ? `chrome:${topChromeInset}|` : '')
+      + (historyMcpAsUser ? 'mcp-as-user|' : '') + historyMeasuredUnitKey(unit)),
+    [displayUnits, topChromeInset, historyMcpAsUser],
   );
   const displayUnitLayoutKeysRef = useRef(displayUnitLayoutKeys);
   displayUnitLayoutKeysRef.current = displayUnitLayoutKeys;
@@ -15843,16 +16033,16 @@ function HistoryPanel({
         terminalOpen,
         terminalIsPrimary,
       })) {
-        // Cmd+F follows the CENTER surface: whichever one the user is looking
-        // at owns find. In terminal-primary that is the terminal, so this
-        // panel keeps its own search behind the header button instead of
-        // stealing the shortcut from the surface filling the window.
+        // History owns find from its feed and composer. Raw-terminal
+        // presentation retains its existing surface-specific route.
         if (terminalIsPrimary) return;
         if (mainSurface && terminalOpen) return;
         e.preventDefault();
         e.stopPropagation();
+        e.stopImmediatePropagation();
+        uiPerformancePhase('search-open', {tab:tabId});
         setSearchOpen(true);
-        setTimeout(() => searchInputRef.current?.focus(), 50);
+        searchInputRef.current?.focus();
       }
       if (e.key === 'Escape' && searchOpen) {
         // The resource popup is above History and owns this Escape. Window
@@ -15872,12 +16062,12 @@ function HistoryPanel({
     };
     window.addEventListener('keydown', handleKeyDown, true); // capture phase
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [isOpen, mainSurface, searchOpen, terminalOpen, terminalIsPrimary]);
+  }, [isOpen, mainSurface, searchOpen, terminalOpen, terminalIsPrimary, tabId]);
 
   const openSearch = useCallback(() => {
     uiPerformancePhase('search-open', {tab:tabId});
     setSearchOpen(true);
-    setTimeout(() => searchInputRef.current?.focus(), 50);
+    searchInputRef.current?.focus();
   }, [tabId]);
 
   const closeSearch = useCallback(() => {
@@ -21995,7 +22185,9 @@ function HistoryPanel({
     const requestedTargetIdentity = historyScrollToUuid;
     const toolTarget = historyScrollToolTarget;
     const requestGeneration = useUIStore.getState().historyScrollRequestGeneration;
-    if (toolTarget && toolTarget.readSessionId !== sessionId) {
+    if (toolTarget && (toolTarget.messageReference
+      ? toolTarget.messageReference.provider !== toolType
+      : toolTarget.readSessionId !== sessionId)) {
       setHistoryScrollToUuid(null);
       window.dispatchEvent(new CustomEvent('history-panel:scrolled-to', { detail: {
         tabId, uuid: requestedTargetIdentity, requestId: toolTarget.requestId, found: false, reason: 'source-session-changed',
@@ -22099,7 +22291,7 @@ function HistoryPanel({
           userIntentLogged: false,
           scrollEventLogged: false,
         };
-        if (toolTarget) {
+        if (toolTarget?.toolUseId) {
           const row = scroller?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`);
           sourceCallFlashRef.current = flashHistoryNavigationNode(
             historyToolNavigationNode(row, toolTarget.toolUseId), toolTarget.requestId,
@@ -22199,7 +22391,7 @@ function HistoryPanel({
       }
       lastTargetWasStub = targetIsStub;
       const mountedRow = virtuosoScrollerRef.current?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`);
-      const mountedTool = toolTarget && historyToolNavigationNode(mountedRow, toolTarget.toolUseId);
+      const mountedTool = toolTarget?.toolUseId && historyToolNavigationNode(mountedRow, toolTarget.toolUseId);
       let sourceToolMoved = false;
       // Keep the existing jump's sole writer, but center the inner call rather
       // than the whole (possibly very tall) assistant row once it materializes.
@@ -22246,10 +22438,10 @@ function HistoryPanel({
         // Offset of the row relative to the scroller's own viewport — immune to
         // the panel's slide-in transform (both translate together), so this only
         // moves when the INTERNAL scroll position is still settling.
-        const targetNode = toolTarget ? historyToolNavigationNode(node, toolTarget.toolUseId) : node;
+        const targetNode = toolTarget?.toolUseId ? historyToolNavigationNode(node, toolTarget.toolUseId) : node;
         const rect = targetNode?.getBoundingClientRect();
         const top = rect ? rect.top - scroller.getBoundingClientRect().top : null;
-        const visible = !toolTarget || (!!rect && rect.height > 0 && top !== null
+        const visible = !toolTarget?.toolUseId || (!!rect && rect.height > 0 && top !== null
           && top >= -1 && top + rect.height <= scroller.clientHeight + 1);
         if (!sourceToolMoved && !isShell && visible && top !== null && lastTop !== null && Math.abs(top - lastTop) < 1) stable++; else stable = 0;
         // A correcting write is not a stable presentation frame. Begin the
@@ -23590,7 +23782,8 @@ function HistoryPanel({
                     data-history-mount-shell="1"
                     data-history-row-stub="1"
                     data-history-unit-key={displayUnitItemKeys[_idx]}
-                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId)}
+                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId,
+                      copiedHistoryMessageIteration(entries, presentedEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
                     style={{
                       paddingTop: 4,
                       paddingBottom: 4,
@@ -23617,7 +23810,8 @@ function HistoryPanel({
                     data-history-row-owner={historyOwnerDomId}
                     data-history-mount-shell="1"
                     data-history-unit-key={displayUnitItemKeys[_idx]}
-                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId)}
+                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId,
+                      copiedHistoryMessageIteration(entries, presentedEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
                     style={{
                       paddingTop: 4,
                       paddingBottom: 4,
@@ -23682,7 +23876,8 @@ function HistoryPanel({
                       ? presentedEntry.sourceIdentity || undefined
                       : undefined
                   }
-                  onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId)}
+                  onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId,
+                      copiedHistoryMessageIteration(entries, presentedEntry, { tabId, toolType, sessionId, cwd }, isEligibleTabTitleEntry), sessionId)}
                   style={{
                     // Member rows tile FLUSH: any wrapper padding would cut
                     // the group rail into segments (the member's border-left

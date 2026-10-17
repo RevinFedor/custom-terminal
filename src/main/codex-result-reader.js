@@ -55,10 +55,11 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
     // Body samples must never survive a same-offset rewrite.
     texts.clear(); textBytes = 0;
   }
-  async function readBody(row) {
+  async function readBody(row, cacheOnly = false) {
     const key = locatorKey(row.locator) + ':' + row.kind;
     const hit = texts.get(key);
     if (hit) { stats.textHits++; texts.delete(key); texts.set(key, hit); return hit.value; }
+    if (cacheOnly) throw new Error('response_text_not_cached');
     stats.textMisses++;
     const loc = row.locator;
     const result = await readJsonlRange(loc.filePath, loc.fromByte, loc.toByte - 1,
@@ -226,7 +227,7 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
     if (epoch !== beginEpoch) throw new Error('result-source-invalidated');
   }
 
-  async function projectRows(blocks, maxChars) {
+  async function projectRows(blocks, maxChars, cacheOnly = false) {
     const limit = Math.max(500, Math.min(MAX_RESULT_CHARS, Number(maxChars) || 8000));
     const total = blocks.reduce((sum, row) => sum + row.length, 0) + Math.max(0, blocks.length - 1) * 2;
     const samples = [];
@@ -234,7 +235,7 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
       if (total > limit && i !== 0 && i !== blocks.length - 1) {
         samples.push({ length: blocks[i].length }); continue;
       }
-      const sample = await readBody(blocks[i]);
+      const sample = await readBody(blocks[i], cacheOnly);
       if (!sample || sample.length !== blocks[i].length) throw new Error('result-text-source-changed');
       samples.push(sample);
     }
@@ -253,7 +254,7 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
   }
 
   async function materialize(entry, sessionId, proof, maxChars, { historical = false, executionOnly = false,
-    historicalExecution = false, latestExecution = false } = {}) {
+    historicalExecution = false, latestExecution = false, cacheOnly = false } = {}) {
     if (historicalExecution) {
       let context = proof.targetExecutionContext;
       if (latestExecution) {
@@ -312,7 +313,7 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
     for (const row of selected) {
       const record = { ...row.record, payload: { ...row.record.payload } };
       if (row.kind === 'user') {
-        const text = await readBody(row);
+        const text = await readBody(row, cacheOnly);
         if (record.type === 'event_msg') record.payload.message = text;
         else record.payload.content = [{ type: 'input_text', text }];
       }
@@ -338,7 +339,7 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
     const { promptIndex, boundaryIndex, terminalIndex } = selectedTextRange;
     let blocks = selected.slice(promptIndex + 1, boundaryIndex).filter(row => row.kind === 'assistant' && row.length > 0);
     if (!blocks.length && terminalIndex >= 0 && selected[terminalIndex]?.length > 0) blocks = [selected[terminalIndex]];
-    const projection = await projectRows(blocks, maxChars);
+    const projection = await projectRows(blocks, maxChars, cacheOnly);
     // Reuse the SAME outcome/matcher after body availability is known. In
     // particular an empty open prompt-proof turn remains ASSISTANT_NOT_MATERIALIZED.
     return buildResult(rows, sessionId, proof, maxChars, { ...options, projectAssistant: () => projection });
@@ -525,8 +526,50 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
     return enqueue({ sessionId, cwd, resolveSource, resultReadMode, maxChars,
       proof: { targetExecutionContext: targetExecutionContext ? { ...targetExecutionContext } : null } }, 'historical-execution');
   }
+  async function readCachedCompleted({ sessionId, cwd, readSourceRevision } = {}) {
+    const unavailable = reason => ({ known: false, reason });
+    const key = sessionId + ':' + (cwd || ''), entry = views.get(key), beginEpoch = epoch;
+    if (!entry || flights.has(key)) return unavailable(entry ? 'result_read_in_progress' : 'result_cache_cold');
+    if (typeof readSourceRevision !== 'function' || entry.sourceKey !== readSourceRevision()) {
+      return unavailable('result_lineage_unverified');
+    }
+    if (!entry.parts.length || entry.parts.length > 32 || entry.parts.some(part => !part.verified || part.leftoverBuffer.length)) {
+      return unavailable('result_cache_unverified');
+    }
+    const current = async () => {
+      for (const part of entry.parts) {
+        if (statKey(await fs.promises.stat(part.segment.filePath)) !== statKey(part.stat)) return false;
+      }
+      return epoch === beginEpoch && views.get(key) === entry && !flights.has(key)
+        && entry.sourceKey === readSourceRevision();
+    };
+    try {
+      if (!await current()) return unavailable('result_cache_stale');
+      // Traverse the bounded structural index, not the transcript or tool bodies.
+      const candidates = entry.boundaries.filter(index => entry.rows[index].record.payload.type === 'task_complete');
+      for (const index of candidates.slice(-32).reverse()) {
+        if (entry.rows.slice(index + 1).some(row => row.control === 'rollback')) {
+          return unavailable('result_history_rewritten');
+        }
+        const record = entry.rows[index].record;
+        const starts = entry.starts.get(turnId(record));
+        if (starts?.length !== 1) continue;
+        const context = historicalContext(entry.rows[starts[0]].record, sessionId);
+        const result = await materialize(entry, context.sessionId, { targetExecutionContext: context }, 2000,
+          { executionOnly: true, historicalExecution: true, cacheOnly: true });
+        if (result.complete !== true || result.success !== true) continue;
+        if (!await current()) return unavailable('result_cache_stale');
+        return { known: true, complete: true, assistantText: result.assistantText,
+          assistantChars: result.assistantChars, truncated: result.truncated === true,
+          ref: { kind: 'codex-historical-execution', toolType: 'codex', sessionId,
+            targetExecutionContext: context, userUuid: result.userUuid || null,
+            sourceIdentity: result.sourceIdentity || null, turnIndex: result.turnIndex ?? null } };
+      }
+      return unavailable(candidates.length > 32 ? 'completed_response_scan_limit' : 'completed_response_not_cached');
+    } catch (error) { return unavailable(error.message === 'response_text_not_cached' ? error.message : 'result_cache_unavailable'); }
+  }
   return { load: request => enqueue(request, 'prompt'), loadObservedExecution,
-    loadLatestObservedExecution, loadHistoricalObservedExecution, invalidate, stats: () => ({ ...stats, views: views.size, textBytes,
+    loadLatestObservedExecution, loadHistoricalObservedExecution, readCachedCompleted, invalidate, stats: () => ({ ...stats, views: views.size, textBytes,
     indexBytes: [...views.values()].reduce((sum, value) => sum + value.indexBytes, 0) }) };
 }
 

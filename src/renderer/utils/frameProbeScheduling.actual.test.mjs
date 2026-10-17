@@ -195,3 +195,30 @@ for(const lifecycle of ['final','cancelled','persisted']) {
   }
  });
 }
+
+test('active drag shares one existing RAF and does not resample stylesheets after discrete frames',()=>{
+ const h=harness();h.probe.installPerfFreezeProbe();input(h);
+ h.time(1016);h.fire();h.time(1032);h.fire();assert.equal(h.rafs.size,0);
+ const d=h.ui.installUIActionDiagnostics();d.drag.configure({mode:'frames',hz:120});
+ h.ui.uiDragDiagnostic('pending',{pointerId:1,eventAbs:101000,gestureId:'one-physical-gesture'});
+ Object.defineProperty(h.document,'styleSheets',{get(){throw Error('continuous drag must not enumerate stylesheets');}});
+ h.ui.uiDragDiagnostic('threshold',{pointerId:1,gestureId:'one-physical-gesture'});assert.equal(h.rafs.size,1);
+ for(let i=0;i<5;i++){
+   h.time(1040+i*8);h.ui.uiDragInput({type:'pointermove',pointerId:1,timeStamp:1040+i*8,clientX:i,clientY:10,buttons:1});
+   h.fire();assert.equal(h.rafs.size,1);
+ }
+ h.ui.uiDragDiagnostic('physical-end',{gestureId:'one-physical-gesture',reason:'release'});
+ assert.equal(d.drag.pending(),false);h.time(1080);h.fire();assert.equal(h.rafs.size,0);
+ assert.equal(h.logs.filter(s=>s.startsWith('[Perf:DragSummary]')).length,1);h.unload();
+});
+
+test('drag OFF preserves the old idle scheduler and a cancelled pre-threshold pickup stays an ordinary click',()=>{
+ const h=harness();h.probe.installPerfFreezeProbe();
+ const d=h.ui.installUIActionDiagnostics();d.drag.configure({mode:'off'});
+ h.ui.uiDragDiagnostic('pending',{pointerId:1,eventAbs:101000,gestureId:'off-gesture'});
+ h.ui.uiDragDiagnostic('threshold',{gestureId:'off-gesture'});assert.equal(h.rafs.size,0);
+ d.drag.configure({mode:'summary'});input(h);h.time(1016);h.fire();h.time(1032);h.fire();
+ h.ui.uiDragDiagnostic('pending',{pointerId:1,eventAbs:101000,gestureId:'click-gesture'});
+ h.ui.uiDragDiagnostic('click-release',{gestureId:'click-gesture'});assert.equal(h.rafs.size,0);
+ assert.equal(d.drag.pending(),false);h.unload();
+});

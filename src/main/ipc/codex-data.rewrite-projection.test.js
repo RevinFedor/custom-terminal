@@ -67,6 +67,11 @@ for (const kind of ['delete-tail', 'edit-middle', 'delete-compact']) {
     assert.equal(warm.mode, 'unchanged');
     assert.equal(warm.fedRecords, 0, 'no post-commit re-read or replay');
     assert.equal(timeline.mode, 'unchanged');
+    const resume = await api.loadResumeSource(result.newSessionId, '/fixture');
+    assert.equal(resume.success, true, resume.error);
+    assert.equal(resume.mode, 'unchanged', 'actual COW -> Resume uses its exact prepared compact proof, not a second file scan');
+    assert.equal(resume.sourceSettingsProof.status, 'found');
+    assert.equal(resume.sourceMaterialization.userTurns, timeline.entries.filter(entry => entry.type === 'user').length);
     const loaded = await api.loadSessionRecords(result.newSessionId, '/fixture');
     assert.deepEqual(warm.entries, api.buildCodexFullHistory(loaded.records, result.newSessionId));
     assert.deepEqual(timeline.entries, api.buildCodexTimeline(loaded.records, result.newSessionId));

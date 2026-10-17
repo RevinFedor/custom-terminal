@@ -48,6 +48,32 @@ const STARTUP_UNCONFIRMED_STATES = new Set([
   STORE_STATES.AUDIT_PENDING,
 ]);
 
+function exactSendPreflightScope(scope, record) {
+  return scope?.version === 1 && typeof scope.id === 'string' && !!scope.id
+    && scope.operationKey === record.operationKey && scope.attemptId === record.attemptId
+    && scope.tabId === record.tabId && scope.handoffId === record.handoffId
+    && scope.provider === record.provider && ['codex', 'claude'].includes(scope.provider);
+}
+
+function exactSendPreflightRefusal(record, receipt) {
+  const scope = record.receipt?.preflightScope, proof = receipt.preflightRefusal;
+  // IN_FLIGHT alone is not negative proof: paste may already have occurred.
+  // Only the single driver issued for this attempt can attest no provider call.
+  return record.state === STORE_STATES.IN_FLIGHT && !record.inputLease && !record.transcriptBoundary
+    && !record.receipt?.transportText && record.receipt?.submitted !== true
+    && record.receipt?.pasteWritten !== true && record.receipt?.enterWritten !== true
+    && exactSendPreflightScope(scope, record) && exactSendPreflightScope(proof?.scope, record)
+    && scope.id === proof.scope.id && proof.version === 1 && proof.phase === 'ensuring-ready'
+    && proof.providerOperationStarted === false && proof.launchStage === 'no-launch'
+    && proof.launchWritten === false && proof.launchAccepted === false
+    && typeof proof.launchIntentId === 'string' && !!proof.launchIntentId
+    && Number.isSafeInteger(proof.launchToken) && proof.launchToken > 0
+    && Number.isSafeInteger(proof.launchAttempt) && proof.launchAttempt > 0 && proof.launchAttempt <= 4
+    && receipt.operationKey === record.operationKey && receipt.attemptId === record.attemptId
+    && receipt.deliveryUnknown === true && receipt.submitted !== true
+    && receipt.pasteWritten !== true && receipt.enterWritten !== true;
+}
+
 // Dismissal changes only the desktop History presentation. It never changes
 // delivery truth, retryability or the active PTY operation, so every durable
 // receipt state is safe to hide. A canonical provider row may still appear at
@@ -1154,6 +1180,11 @@ class AgentSendReceiptStore {
           record,
         };
       }
+      if (context.preflightScope !== undefined
+        && (!exactSendPreflightScope(context.preflightScope, record)
+          || record.receipt?.preflightScope && encodeJson(record.receipt.preflightScope) !== encodeJson(context.preflightScope))) {
+        return { ok: false, applied: false, reason: 'preflight-scope-changed', record };
+      }
       const contextSessionId = optionalString(context.sessionId);
       const boundarySessionId = optionalString(context.transcriptBoundary?.sessionId);
       if (contextSessionId && boundarySessionId && contextSessionId !== boundarySessionId) {
@@ -1439,7 +1470,20 @@ class AgentSendReceiptStore {
         ...(record.receipt || {}),
         ...nextReceipt,
       };
+      if (exactSendPreflightRefusal(record, nextReceipt)) {
+        Object.assign(mergedReceipt, { success: false, accepted: false, submitted: false,
+          pasteWritten: false, enterWritten: false, status: STORE_STATES.NOT_SUBMITTED,
+          deliveryUnknown: false, auditPending: false, preflightScope: record.receipt.preflightScope,
+          preflightRefusal: { ...nextReceipt.preflightRefusal, verified: true } });
+      }
       const nextState = classifyAgentSendRegistryReceipt(mergedReceipt);
+      if (record.state === STORE_STATES.ENTER_ARMED && nextState === STORE_STATES.NOT_SUBMITTED) {
+        // Durable arm precedes the physical write. A late readiness/cancellation
+        // callback cannot prove that the write never happened (or release FIFO).
+        // Keep the same auditable attempt; exact provider rejection still has
+        // its separate PROVIDER_NOT_ACCEPTED proof, not submitted:false.
+        return { ok: false, applied: false, reason: 'non-monotonic-attempt-state', record };
+      }
       if (
         (record.state === STORE_STATES.AUDIT_PENDING
           || record.state === STORE_STATES.DELIVERY_UNKNOWN)

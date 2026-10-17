@@ -46,8 +46,12 @@ async function copyHistoryEntryDetails(payload, { captureDiagnostic, writeText }
   if (typeof copyText !== 'string' || !copyText.trim()) return { success: false, copied: false };
   const context = normalizeHistoryEntryCopyDiagnostic(payload.diagnostic);
   if (!context) {
-    writeText(copyText);
-    return { success: true, copied: true, diagnosticRequested: false };
+    try {
+      await writeText(copyText);
+      return { success: true, copied: true, diagnosticRequested: false };
+    } catch (error) {
+      return { success: false, copied: false, diagnosticRequested: false, error: String(error?.message || error) };
+    }
   }
   let saved;
   try {
@@ -60,7 +64,7 @@ async function copyHistoryEntryDetails(payload, { captureDiagnostic, writeText }
   } catch (error) {
     const reason = String(error?.message || error).slice(0, 4096);
     try {
-      writeText(copyText + '\n\nTerminal diagnostic could not be saved: ' + reason);
+      await writeText(copyText + '\n\nTerminal diagnostic could not be saved: ' + reason);
     } catch (copyError) {
       return { success: false, copied: false, diagnosticRequested: true,
         error: reason + '; clipboard: ' + String(copyError?.message || copyError) };
@@ -71,7 +75,7 @@ async function copyHistoryEntryDetails(payload, { captureDiagnostic, writeText }
   // A reference is published only after the shared collector has atomically
   // saved its artifact. Failure still leaves the original ID copy useful.
   try {
-    writeText(copyText + '\n\n' + saved.reference
+    await writeText(copyText + '\n\n' + saved.reference
       + (partial ? '\nTerminal snapshot: unavailable; see artifact for the recorded reason.' : ''));
   } catch (error) {
     return { ...saved, success: false, copied: false, diagnosticRequested: true,

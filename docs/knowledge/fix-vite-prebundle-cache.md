@@ -21,7 +21,12 @@ Custom-terminal зависит от `@gt-editor/markdown-editor` через npm 
 Эффект: 4-5 итераций «пересобрал → не работает → пересобрал ещё раз» — потому что фикс физически не загружался.
 
 ## Решение
-Pipeline-команда `npm run build:markdown` в `package.json` custom-terminal:
+Текущий переносимый checkout собирает `vendor/markdown-editor` как npm workspace;
+соседний GT source автоматически в него не переносится. Актуальный flow и npm-link
+описаны в `fact-file-preview-markdown.md::Build Process`. Для dev при сохранённом
+старом prebundle отдельно очищается `node_modules/.vite` и перезапускается dev.
+
+Историческая pipeline-команда до перехода на vendored workspace:
 
 ```json
 "build:markdown": "cd ../gt-editor/packages/markdown-editor && npm run build && rsync -a --delete dist/ ../../../custom-terminal/node_modules/@gt-editor/markdown-editor/dist/ && rm -rf ../../../custom-terminal/node_modules/.vite && echo '[build:markdown] gt-editor → custom-terminal node_modules synced, vite cache cleared'"

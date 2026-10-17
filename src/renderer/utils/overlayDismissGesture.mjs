@@ -37,10 +37,14 @@ export const DISMISSIBLE_OVERLAY_SELECTORS = Object.freeze([
   '[data-hidden-window-picker]',
 ]);
 
+const DISMISSIBLE_OVERLAY_SELECTOR = DISMISSIBLE_OVERLAY_SELECTORS.join(',');
+
 /** Is any click-to-dismiss overlay on screen right now? */
 export function isDismissibleOverlayOpen(doc) {
   if (!doc || typeof doc.querySelector !== 'function') return false;
-  return DISMISSIBLE_OVERLAY_SELECTORS.some((selector) => !!doc.querySelector(selector));
+  // One DOM traversal for the same fixed menu set, rather than six full
+  // retained-workspace searches on every pointer press and Escape.
+  return !!doc.querySelector(DISMISSIBLE_OVERLAY_SELECTOR);
 }
 
 /**

@@ -314,7 +314,6 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const messages = useTabMessages(tabId);
   const [selectedMessage, setSelectedMessage] = useState<MessageSelection | null>(null);
   const selectedThread = messages.threads.find(thread => thread.question.messageId === selectedMessage?.messageId);
-  const dock = useRequestDockLayout(rootRef, queueVisible, effectiveWidth);
   const closeMessage = useCallback(() => setSelectedMessage(null), []);
   const openMessage = useCallback((selection: MessageSelection) => {
     setSettingsOpen(false);
@@ -404,6 +403,8 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
   const statusRuns = useMemo(() => orderedRuns.filter(run => runVisibleInTracker(run, tabId)), [orderedRuns, tabId]);
   const hasVisibleMessages = messages.threads.some(thread => tabMessageVisibleInTracker(thread, tabId));
   const hasDockEntries = statusRuns.length > 0 || hasVisibleMessages || Boolean(messages.listError);
+  const dock = useRequestDockLayout(rootRef, queueVisible, effectiveWidth,
+    hasDockEntries || historyOpen || settingsOpen || selectedMessage !== null);
 
   const openLinkedTab = useCallback(async (run: OrchestrationRun) => {
     if (openingLinkedRuns.current.has(run.runId)) return;

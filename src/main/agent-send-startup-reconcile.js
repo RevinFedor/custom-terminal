@@ -141,16 +141,18 @@ function claudeSessionIdFromTranscriptPath(value) {
   return CLAUDE_SESSION_FILE_RE.test(basename) ? basename : '';
 }
 
-function normalizeUnresolvedRecord(record) {
+function normalizeUnresolvedRecord(record, options = {}) {
   if (!record || typeof record !== 'object') {
     return { ok: false, reason: 'receipt-record-missing' };
   }
-  if (!UNRESOLVED_STATES.has(record.state)) {
+  const provider = cleanString(record.provider).toLowerCase();
+  const liveCodexAttempt = options.liveCodexAttempt === true && provider === 'codex'
+    && record.state === 'enter-armed';
+  if (!UNRESOLVED_STATES.has(record.state) && !liveCodexAttempt) {
     return { ok: false, reason: 'receipt-state-not-unresolved' };
   }
   const operationKey = cleanString(record.operationKey);
   const attemptId = cleanString(record.attemptId);
-  const provider = cleanString(record.provider).toLowerCase();
   const promptHash = cleanString(record.promptHash);
   const promptLength = nonNegativeSafeInteger(record.promptLength);
   if (provider !== 'claude' && provider !== 'codex') {
@@ -1092,7 +1094,7 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
 }
 
 async function reconcileAgentSendStartupRecord(record, options = {}) {
-  const normalized = normalizeUnresolvedRecord(record);
+  const normalized = normalizeUnresolvedRecord(record, options);
   if (!normalized.ok) return unknown(record, normalized.reason);
   const maxReadBytes = normalizeReadLimit(options.maxReadBytes);
   return normalized.value.provider === 'claude'

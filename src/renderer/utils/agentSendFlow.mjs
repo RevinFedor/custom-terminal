@@ -53,6 +53,7 @@ const finishResult = (flow, result, reason) => {
  * order; provider mechanics live behind the callbacks.
  */
 export async function runAgentSendFlow({
+  preflightScope,
   prepareContext,
   ensureReady,
   finishAfterReady,
@@ -61,6 +62,7 @@ export async function runAgentSendFlow({
   recoverReadyFailure,
   onPhase,
 }) {
+  preflightScope = preflightScope ? Object.freeze({ ...preflightScope }) : null;
   const flow = createFlowTrace(onPhase);
   try {
     flow.advance('preparing-context', 'prepare-context');
@@ -104,6 +106,26 @@ export async function runAgentSendFlow({
     if (error && typeof error === 'object') {
       error.sendFlowPhase = snapshot.phase;
       error.sendFlowTrace = snapshot.trace;
+      const receipt = error.sendReceipt;
+      if (snapshot.phase === 'ensuring-ready' && preflightScope?.version === 1
+        && typeof preflightScope.id === 'string' && preflightScope.id
+        && receipt?.deliveryUnknown === true && receipt.submitted !== true
+        && receipt.operationKey === preflightScope.operationKey && receipt.attemptId === preflightScope.attemptId
+        && error.protocolVersion === 1 && error.launchStage === 'no-launch'
+        && error.accepted === false && error.launchWritten === false
+        && error.launchOutcomeUnknown !== true && error.joined !== true && error.acceptancePending !== true
+        && error.launchIntent?.tabId === preflightScope.tabId
+        && error.launchIntent?.toolType === preflightScope.provider) {
+        // Attest only this completed driver's preflight. Main joins its issued
+        // scope to the durable attempt before refining historical delivery.
+        error.sendReceipt = { ...receipt, preflightRefusal: {
+          version: 1, scope: { ...preflightScope }, phase: snapshot.phase,
+          providerOperationStarted: false,
+          launchIntentId: error.launchIntent.intentId, launchToken: error.launchIntent.token,
+          launchAttempt: error.launchAttempt, launchStage: error.launchStage,
+          launchWritten: false, launchAccepted: false, reason: error.reason || error.code || null,
+        } };
+      }
       // An initialized session and permission to paste are separate facts.
       // A readiness/composer failure happens before this invocation can call
       // the provider adapter. Keep that negative receipt across the bridge;

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, memo, useMemo } from 'react';
+import {beginPromptNativeMenuIntent,invalidatePromptNativeMenuSource} from '../../../utils/promptNativeMenuIntent.mjs';
 import { flushSync } from 'react-dom';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useUIStore, type HistoryPromptDraftChip } from '../../../store/useUIStore';
@@ -2937,6 +2938,10 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
   }), [actionBusy, isRunning, bgAgentRunning, truncateAndResend]);
 
   const isVisible = active && isActiveProject;
+  const nativeMenuSourceRef = useRef(Symbol('sdk-native-menu'));
+  const nativeMenuPresentedRef = useRef(false);
+  nativeMenuPresentedRef.current = isVisible;
+  useLayoutEffect(() => () => invalidatePromptNativeMenuSource(nativeMenuSourceRef.current),[isVisible,tabId,ownerProjectId]);
 
   // Gate Virtuoso mount until the tab has been visible at least once.
   // Virtuoso uses a ResizeObserver on its own viewport to compute item ranges.
@@ -3298,7 +3303,12 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
     e.preventDefault();
     const sel = window.getSelection();
     const hasSelection = !!(sel && sel.toString().length > 0);
-    ipcRenderer.send('show-sdk-context-menu', { tabId, projectId: ownerProjectId || null, hasSelection });
+    const projectId=ownerProjectId || [...useWorkspaceStore.getState().openProjects].find(([,workspace])=>workspace.tabs.has(tabId))?.[0] || null;
+    const owner=beginPromptNativeMenuIntent({tabId,projectId,kind:'sdk',source:nativeMenuSourceRef.current,
+      isPresented:()=>nativeMenuPresentedRef.current,
+      isAlive:()=>!!projectId && !!useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.has(tabId)});
+    if(!owner.isCurrent()){owner.close();return;}
+    ipcRenderer.send('show-sdk-context-menu', { tabId, projectId, hasSelection,intent:owner.intent });
   }, [ownerProjectId, tabId]);
 
   // Global keydown → composer. Detached from focus state.

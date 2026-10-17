@@ -74,3 +74,5 @@ export {
   BulletWidget,
   CollapsibleHeaderWidget
 } from './widgets'
+export { attachTerminalMessageChip, openTerminalMessageDetails } from './terminalMessageReferenceChip'
+export { readTerminalMessageClipboard, normalizeTerminalMessageSnapshot, terminalMessageLabel } from './terminalMessageReference.mjs'

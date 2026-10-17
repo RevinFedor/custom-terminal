@@ -7,6 +7,23 @@ const CLAUDE_CLOSE = ". You can now continue with the user's answers in mind.";
 const HASH = /^[a-f0-9]{64}$/;
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 
+// Codex0.162 c1382380, context-fragments/src/answered_question.rs:
+// AnsweredQuestion::new takes <=512 UTF-8 bytes at a character boundary,
+// then replaces CR and LF individually. Keep this exact wire variant beside
+// the original-title hash; arbitrary prefixes/whitespace are NOT equivalent.
+// Iterate only the bounded prefix, without Buffer/Node APIs in shared code.
+function codexReplyQuestionText(title) {
+  let bytes = 0, prefix = '';
+  for (const character of title) {
+    const code = character.codePointAt(0);
+    const width = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+    if (bytes + width > 512) break;
+    bytes += width;
+    prefix += character;
+  }
+  return prefix.replace(/[\r\n]/g, ' ');
+}
+
 function readCodexQuestionReply(content) {
   if (typeof content !== 'string') return null;
   const text = content.trim();
@@ -37,7 +54,8 @@ function codexNativeQuestionDefinition(call, fingerprint) {
     || !Array.isArray(call.args?.questions) || !call.args.questions.length
     || call.args.questions.some(question => typeof question?.title !== 'string')) return null;
   return { callId: call.callId, sourceIdentity: call.sourceIdentity, physicalSessionId: call.physicalSessionId,
-    turnIndex: call.turnIndex, questionHashes: call.args.questions.map(question => fingerprint(question.title)) };
+    turnIndex: call.turnIndex, questionHashes: call.args.questions.map(question => fingerprint(question.title)),
+    replyQuestionHashes: call.args.questions.map(question => fingerprint(codexReplyQuestionText(question.title))) };
 }
 
 function registerNativeQuestionDefinition(definitions, definition) {
@@ -58,7 +76,8 @@ function proveCodexNativeQuestionReply(content, definitions, physicalSessionId, 
     const definition = definitions.get(row.callId);
     const questionHash = fingerprint(row.question);
     if (!definition || definition.ambiguous || definition.physicalSessionId !== physicalSessionId
-      || definition.questionHashes[row.questionIndex] !== questionHash) return null;
+      || (definition.questionHashes[row.questionIndex] !== questionHash
+        && definition.replyQuestionHashes?.[row.questionIndex] !== questionHash)) return null;
     links.push({ callId: row.callId, questionIndex: row.questionIndex, questionHash,
       callSourceIdentity: definition.sourceIdentity });
   }

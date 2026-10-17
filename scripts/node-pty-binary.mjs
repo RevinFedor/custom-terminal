@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { statSync } from 'node:fs';
+import { PTY_WRITE_TRACE_SHA } from './node-pty-write-trace.mjs';
 
 export const PTY_VERSION = '1.2.0-beta.13';
 export const ELECTRON_VERSION = '28.3.3';
@@ -56,6 +57,7 @@ export function validatePackagedNodePty(asar, archivePath, packedFiles) {
   const pkg = JSON.parse(read('package.json'));
   if (pkg.version !== PTY_VERSION) throw new Error('[node-pty] packaged version drift: ' + pkg.version);
   if (sha256(read('lib/utils.js')) !== LOADER_SHA) throw new Error('[node-pty] packaged native loader drift');
+  if (sha256(read('lib/unixTerminal.js')) !== PTY_WRITE_TRACE_SHA) throw new Error('[node-pty] packaged outbound observer drift');
   const binary = 'build/Release/pty.node';
   const bytes = read(binary);
   if (!asar.statFile(archivePath, root + binary).unpacked) throw new Error('[node-pty] packaged pty.node must be unpacked');

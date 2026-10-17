@@ -2,6 +2,7 @@ const { ipcMain } = require('node:worker_threads').isMainThread ? require('elect
 const path = require('path');
 const fs = require('fs');
 const { causal: perfCausal } = require('../perf-causal-context');
+const { drainProjectionSteps } = require('../codex-turns-projection');
 const { timelineResponsePreview } = require('../../shared/timeline-response-preview.cjs');
 const { historyImageCountFromProviderRecord } = require('../../shared/history-search.cjs');
 const { historyRecordTimeFromRecord } = require('../../shared/history-record-time.cjs');
@@ -18,6 +19,7 @@ const {
 const questionReplyFingerprint = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 const { historyRewriteOperation } = require('../../shared/fork-operation.cjs');
 const { commitPreparedFork } = require('../fork-commit');
+const { cloneCodexPromptPresentationsForProvenChild } = require('../history-prompt-presentations');
 const { cloneProjectionGraphAsync, measureProjectionGraphBytes, createProjectionIdentityMap, retainCheckpoint } = require('../codex-projection-checkpoint');
 const { dehydrateHistoryEntries, historyPayloadStash } = require('../history-payload-dehydrate');
 const {
@@ -2886,6 +2888,11 @@ async function loadCodexHistoricalObservedExecution(request) {
   return codexResultReader().loadHistoricalObservedExecution(request);
 }
 
+function readCachedCodexCompletedResponse(request) {
+  return _codexResultReader?.readCachedCompleted(request)
+    || { known: false, reason: 'result_cache_cold' };
+}
+
 function getSessionMeta(records) {
   for (const record of records) {
     if (record?.type === 'session_meta') return record.payload || {};
@@ -3833,7 +3840,7 @@ function attachCodexQuestionReplyProof(entry, definitions, physicalSessionId) {
   else delete entry.questionReplyProof;
 }
 
-function createCodexTimelineProjector(sessionId, seed = {}) {
+function createCodexTimelineProjector(sessionId, seed = {}, { mutationOnly = false } = {}) {
   const entries = seed.entries ?? [];
   const questionDefinitions = seed.questionDefinitions ?? new Map();
   const pendingResponseUsers = seed.pendingResponseUsers ?? [];
@@ -3883,7 +3890,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
   const feed = (record) => {
     const payload = record.payload || {};
     const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
-    rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
+    if (!mutationOnly) rememberCodexNativeQuestion(questionDefinitions, record, sessionId, currentTurnIndex);
 
     if (record.type === 'session_meta') {
       if (payload.cwd) sessionCwd = payload.cwd;
@@ -3947,7 +3954,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
     }
 
     if (record.type === 'event_msg') {
-      if (payload.type === 'patch_apply_end' && parseCodexPatchApplyChanges(payload)
+      if (!mutationOnly && payload.type === 'patch_apply_end' && parseCodexPatchApplyChanges(payload)
         && attachCodexPatchApplyEvent(pendingFileEditCalls, payload, sessionCwd)) {
         for (const call of pendingFileEditCalls.values()) {
           if (!call.patchApplyEvents.includes(payload) || !call.userOwner) continue;
@@ -4021,7 +4028,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
         }
         currentTurnCanonicalUserText = text;
         currentTurnCanonicalUserEntry = currentUser;
-        attachCodexQuestionReplyProof(currentUser, questionDefinitions, physicalSessionId);
+        if (!mutationOnly) attachCodexQuestionReplyProof(currentUser, questionDefinitions, physicalSessionId);
       } else if (payload.type === 'thread_rolled_back') {
         const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
         for (const [id, definition] of questionDefinitions) {
@@ -4158,7 +4165,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
           responseEffort: latestEffort || undefined,
           ...(codexUserMessageImageRefs(record).length > 0 ? { imagePaths: codexUserMessageImageRefs(record) } : {}),
         };
-        attachCodexQuestionReplyProof(entry, questionDefinitions, physicalSessionId);
+        if (!mutationOnly) attachCodexQuestionReplyProof(entry, questionDefinitions, physicalSessionId);
         entries.push(entry);
         currentUser = entry;
         pendingResponsePreview = null;
@@ -4166,6 +4173,10 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
         pendingResponseUsers.push({ entry, text });
         return;
       }
+      // Mutation proof needs the same canonical carrier/compact/rollback
+      // reducer, not another scan of retained tool code or answer enrichment.
+      // This private mode is never published as the rich UI projection.
+      if (mutationOnly) return;
       if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
         // An untyped interim note before work is not a completed answer.
         pendingResponsePreview = null;
@@ -4227,16 +4238,26 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
     }
   };
 
-  const finalize = () => entries.map((entry) => ({
-    ...entry,
-    ...(entry.questionReplyProof ? { questionReplyProof: { ...entry.questionReplyProof,
-      links: entry.questionReplyProof.links.map(link => ({ ...link })) } } : {}),
-    ...(entry.imagePaths ? { imagePaths: entry.imagePaths.map(ref => ({ ...ref })) } : {}),
-    ...(entry.responsePreview ? { responsePreview: { ...entry.responsePreview } } : {}),
-    ...(Array.isArray(entry.subAgents)
-      ? { subAgents: entry.subAgents.map((agent) => ({ ...agent })) }
-      : {}),
-  }));
+  function* finalizeSteps() {
+    const length = entries.length, result = new Array(length);
+    for (let index = 0; index < length; index++) {
+      yield;
+      if (!(index in entries)) continue;
+      const entry = entries[index];
+      result[index] = {
+        ...entry,
+        ...(entry.questionReplyProof ? { questionReplyProof: { ...entry.questionReplyProof,
+          links: entry.questionReplyProof.links.map(link => ({ ...link })) } } : {}),
+        ...(entry.imagePaths ? { imagePaths: entry.imagePaths.map(ref => ({ ...ref })) } : {}),
+        ...(entry.responsePreview ? { responsePreview: { ...entry.responsePreview } } : {}),
+        ...(Array.isArray(entry.subAgents)
+          ? { subAgents: entry.subAgents.map((agent) => ({ ...agent })) }
+          : {}),
+      };
+    }
+    return result;
+  }
+  const finalize = () => drainProjectionSteps(finalizeSteps());
 
   const getSessionMeta = () => {
     const meta = metaRecord?.payload || {};
@@ -4257,6 +4278,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
   return {
     feed,
     finalize,
+    finalizeSteps,
     getSessionMeta,
     exportState: () => ({
       entries, questionDefinitions, pendingResponseUsers, pendingFileEditCalls, pendingSubagentCalls, currentUser, currentTurnIndex, latestModel,
@@ -4277,6 +4299,24 @@ function buildCodexTimeline(records, sessionId) {
     projector.feed(record);
   }
   return projector.finalize();
+}
+
+function buildCodexMutationTimeline(records, sessionId) {
+  const projector = createCodexTimelineProjector(sessionId, {}, { mutationOnly: true });
+  for (const record of Array.isArray(records) ? records : []) projector.feed(record);
+  return projector.finalize();
+}
+
+async function buildCodexTimelineCooperatively(records, sessionId, control) {
+  const projector = createCodexTimelineProjector(sessionId);
+  await control.drain('timelineFeed', (function* () {
+    for (const record of Array.isArray(records) ? records : []) {
+      projector.feed(record);
+      control.stats.timelineFedRecords++;
+      yield;
+    }
+  })());
+  return control.drain('timelineFinalize', projector.finalizeSteps());
 }
 
 /**
@@ -4309,16 +4349,26 @@ function buildCodexTimeline(records, sessionId) {
  * by an explicit resume record, which arrives through `feed`).
  */
 function refreshCodexSubagentCards(cards, sessionId) {
+  return drainProjectionSteps(refreshCodexSubagentCardSteps(cards, sessionId));
+}
+
+function* refreshCodexSubagentCardSteps(cards, sessionId) {
   for (const card of cards) {
+    yield;
     const generation = card.processOwnerSource && getCodexProcessActionGeneration(card.processOwnerSource);
     if (generation) card.processGeneration = generation;
     else delete card.processGeneration;
   }
-  const tracked = cards.filter(card => card.subagentStatus === 'running'
-    || (card.subagentStatus === 'completed' && (!Number(card.completedAt)
-      || card.completionTimingSource === 'parent')));
+  const tracked = [];
+  for (const card of cards) {
+    yield;
+    if (card.subagentStatus === 'running'
+      || (card.subagentStatus === 'completed' && (!Number(card.completedAt)
+        || card.completionTimingSource === 'parent'))) tracked.push(card);
+  }
   let resolved = 0;
   for (const card of tracked) {
+    yield;
     if (!card.agentSessionId) continue;
     const timingKey = String(card.startedAt || 0) + ':' + String(card.completedAt || 0);
     if (card.subagentStatus === 'completed' && card.completionTimingAttemptKey === timingKey) continue;
@@ -5043,7 +5093,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     }
   }
 
-  const finalize = (options = {}) => {
+  function* finalizeSteps(options = {}) {
     // A transcript-changed notification is emitted as soon as Codex appends
     // the call, before its output exists. Keep that in-flight call in the
     // canonical history snapshot so a live semantic tool card is not briefly
@@ -5067,6 +5117,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     };
     let tailThinking = pendingThinking;
     for (const { call, kind } of catalogPendingPlan || pendingCallFinalizations()) {
+      yield;
       const callTurnIndex = call.userOwner?.turnIndex ?? call.turnIndexAtCall;
       const callOwnsThinking = pendingThinkingOwner === call.userOwner;
       const callThinking = callOwnsThinking ? tailThinking : '';
@@ -5114,7 +5165,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     // agent is checked against its OWN transcript, which is authoritative
     // about itself. Card mutation here is monotone — an explicit resume
     // record arriving later through `feed` reopens it, same as a fresh pass.
-    if (!catalogSink) refreshCodexSubagentCards(subagents.allCards(), sessionId);
+    if (!catalogSink) yield* refreshCodexSubagentCardSteps(subagents.allCards(), sessionId);
 
     // Pending calls are presentation rows, but not necessarily TAIL rows. A
     // current in-flight call naturally anchors at entries.length; an old call
@@ -5123,6 +5174,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
     // several concurrent calls share one slot.
     const pendingByAnchor = new Map();
     for (const placement of tailPlacements) {
+      yield;
       const bucket = pendingByAnchor.get(placement.anchor) || [];
       bucket.push(placement.entry);
       pendingByAnchor.set(placement.anchor, bucket);
@@ -5136,14 +5188,20 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
         ? { ...entry, turnIndex, ...(sourceUuidAliases.length ? { sourceUuidAliases } : {}) } : entry);
     };
     for (let index = 0; index <= entries.length; index += 1) {
+      yield;
       const pending = pendingByAnchor.get(index);
-      if (pending) pending.forEach(appendPresented);
+      if (pending) for (const entry of pending) { yield; appendPresented(entry); }
       if (index < entries.length) appendPresented(entries[index]);
     }
     if (options?.includeTurnCoordinates === true) {
-      const projectedThinking = new Map([...unrenderedThinkingByUser].map(([owner, thinking]) => [owner, { thinking, pending: false }]));
+      const projectedThinking = new Map();
+      for (const [owner, thinking] of unrenderedThinkingByUser) {
+        yield;
+        projectedThinking.set(owner, { thinking, pending: false });
+      }
       if (tailThinking && pendingThinkingOwner) projectedThinking.set(pendingThinkingOwner, { thinking: tailThinking, pending: true });
       for (const [owner, projected] of projectedThinking) {
+        yield;
         if (discardedUserOwners.has(owner)) continue;
         presented.push({
           uuid: `codex-thinking-projection:${owner.uuid}`,
@@ -5154,7 +5212,8 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       }
     }
     return presented;
-  };
+  }
+  const finalize = (options = {}) => drainProjectionSteps(finalizeSteps(options));
 
   return {
     feed: catalogSink ? record => {
@@ -5178,6 +5237,7 @@ function createCodexHistoryProjector(sessionId, seed = {}, { catalogSink } = {})
       },
     } : {}),
     finalize,
+    finalizeSteps,
     getConsumedRecords: () => consumedRecords,
     exportState: () => ({
       entries, questionDefinitions, pendingResponseUsers, pendingProjectInstructions, pendingCalls,
@@ -5210,6 +5270,18 @@ function buildCodexFullHistory(records, sessionId) {
     projector.feed(record);
   }
   return projector.finalize();
+}
+
+async function buildCodexFullHistoryCooperatively(records, sessionId, control) {
+  const projector = createCodexHistoryProjector(sessionId);
+  await control.drain('historyFeed', (function* () {
+    for (const record of Array.isArray(records) ? records : []) {
+      projector.feed(record);
+      control.stats.historyFedRecords++;
+      yield;
+    }
+  })());
+  return control.drain('historyFinalize', projector.finalizeSteps());
 }
 
 // Addressable history evidence deliberately stays separate from the ordinary
@@ -5460,14 +5532,33 @@ const CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES = 1024 * 1024;
 let _codexHistoryProjectorBudgetBytes = CODEX_HISTORY_PROJECTOR_BUDGET_DEFAULT_MB * 1024 * 1024;
 let _codexHistoryProjectorBytes = 0;
 const _codexHistoryProjectors = new Map(); // sessionId → cache record
+const _codexRewriteReceipts = new Map(); // Coordinates only; shares the existing graph budget.
+let _codexRewriteReceiptBytes = 0;
 const _codexProjectorChains = new Map(); // sessionId → serialization tail
 let _codexProjectionStorage = null;
+let _codexRewriteProjectionPublisher = null;
 const _codexReadInvalidationListeners = new Set();
 function observeCodexReadInvalidation(listener) {
   _codexReadInvalidationListeners.add(listener);
   return () => _codexReadInvalidationListeners.delete(listener);
 }
 function setCodexProjectionStorage(storage) { _codexProjectionStorage = storage; }
+function setCodexRewriteProjectionPublisher(publish) { _codexRewriteProjectionPublisher = typeof publish === 'function' ? publish : null; }
+async function rememberCodexRewriteReceipt(receipt) {
+  const bytes = 1024 + receipt.records.length * 192 + (receipt.sourceProof?.length || 0) * 160
+    + await measureProjectionGraphBytes(receipt.headerRecord);
+  const previous = _codexRewriteReceipts.get(receipt.sessionId);
+  if (previous) _codexRewriteReceiptBytes -= previous.bytes;
+  _codexRewriteReceipts.delete(receipt.sessionId);
+  _codexRewriteReceipts.set(receipt.sessionId, { receipt, bytes });
+  _codexRewriteReceiptBytes += bytes;
+  // Optional coordinate reuse must not create an independent unbounded cache.
+  for (const [id, item] of _codexRewriteReceipts) {
+    if (_codexRewriteReceiptBytes <= _codexHistoryProjectorBudgetBytes / 4
+      && _codexRewriteReceiptBytes + _codexHistoryProjectorBytes + _codexSourceGenerations.bytes <= _codexHistoryProjectorBudgetBytes) break;
+    _codexRewriteReceipts.delete(id); _codexRewriteReceiptBytes -= item.bytes;
+  }
+}
 function restoreCodexSourceSnapshot(snapshot) {
   return !!snapshot && _codexSourceGenerations.restore(snapshot.filePath, snapshot, snapshot.sessionId);
 }
@@ -5561,6 +5652,9 @@ function _dropProjectorEntry(sessionId) {
 
 function invalidateCodexHistoryProjectors(filePath = null) {
   _codexReadFence.invalidate(filePath, 'projection');
+  for (const [id, item] of _codexRewriteReceipts) if (!filePath || item.receipt.targetSnapshot.filePath === filePath) {
+    _codexRewriteReceipts.delete(id); _codexRewriteReceiptBytes -= item.bytes;
+  }
   if (!filePath) {
     _codexHistoryProjectors.clear();
     _codexHistoryProjectorBytes = 0;
@@ -5574,7 +5668,7 @@ function invalidateCodexHistoryProjectors(filePath = null) {
 function getCodexHistoryProjectorStats() {
   return {
     sessions: _codexHistoryProjectors.size,
-    approxBytes: _codexHistoryProjectorBytes,
+    approxBytes: _codexHistoryProjectorBytes + _codexRewriteReceiptBytes,
     budgetBytes: _codexHistoryProjectorBudgetBytes,
     sourceMetadataBytes: _codexSourceGenerations.bytes,
     minimumSessionBytes: CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES,
@@ -5682,6 +5776,10 @@ function rememberCodexProjection(sessionId, cached) {
   _codexHistoryProjectorBytes = Math.max(0, _codexHistoryProjectorBytes - previousCost)
     + cached.approxBytes;
   _codexHistoryProjectors.set(sessionId, cached);
+  for (const [id, item] of _codexRewriteReceipts) {
+    if (_codexRewriteReceiptBytes + _codexHistoryProjectorBytes + _codexSourceGenerations.bytes <= _codexHistoryProjectorBudgetBytes) break;
+    _codexRewriteReceipts.delete(id); _codexRewriteReceiptBytes -= item.bytes;
+  }
   const usedBeforeEvictionBytes = _codexHistoryProjectorBytes + _codexSourceGenerations.bytes;
   const evicted = [];
   while (
@@ -5742,6 +5840,10 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
     releaseCold = await _codexProjectionStorage.enterCold();
     _codexReadFence.assertCurrent(ticket);
     stat = await fs.promises.stat(filePath);
+  }
+  if (!cached && _codexProjectionStorage && !options.cacheOnly) {
+    cached = await restoreCodexRewriteCheckpoint(options.rewriteReceipt, { sessionId, cwd, filePath, stat, ticket });
+    _codexReadFence.assertCurrent(ticket);
   }
   if (!cached && _codexProjectionStorage && !options.cacheOnly) {
     const restored = await _codexProjectionStorage.read({ sessionId, cwd, filePath, stat });
@@ -5852,7 +5954,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
         records: [],
         lineCount: cached.lineCount,
         leftoverBuffer: cached.leftoverBuffer,
-        onChunk: _codexProjectionStorage ? (chunk, offset) => (cached.sourceProof ||= []).push({
+        onChunk: _codexProjectionStorage && !cached.preparedSourceProof ? (chunk, offset) => (cached.sourceProof ||= []).push({
           offset, bytes: chunk.length, hash: crypto.createHash('sha256').update(chunk).digest('hex'),
         }) : null,
       });
@@ -5864,6 +5966,10 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       cached.fileCtimeMs = stat.ctimeMs;
       cached.lineCount = result.lineCount;
       cached.leftoverBuffer = result.leftoverBuffer;
+      if (cached.preparedSourceProof) {
+        cached.sourceProof = cached.preparedSourceProof;
+        delete cached.preparedSourceProof;
+      }
     }
 
     _codexReadFence.assertCurrent(ticket);
@@ -5900,6 +6006,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
         filePath,
         mode,
         fedRecords,
+        reusedRecords: cached.preparedReusedRecords || 0,
         // Built from the CURSOR, not a fresh stat: the file may have grown
         // again while we were reading, and a revision newer than the entries
         // it labels would make the next ifRevision check falsely answer
@@ -6418,8 +6525,8 @@ function planCodexTrailingServiceCarrierRemoval(records, sessionId, startUuid, e
   const removedCount = records.length - outputRecords.length;
   if (removedCount < 1) return null;
 
-  const sourceTimeline = buildCodexTimeline(records, sessionId);
-  const outputTimeline = buildCodexTimeline(
+  const sourceTimeline = buildCodexMutationTimeline(records, sessionId);
+  const outputTimeline = buildCodexMutationTimeline(
     outputRecords.map((record, index) => ({ ...record, __line: index })),
     sessionId,
   );
@@ -6539,10 +6646,17 @@ async function writeCodexJsonlExclusive(filePath, records) {
     let chunkBytes = 0;
     let byteOffset = 0;
     const writtenRecords = [];
+    const sourceHash = crypto.createHash('sha256');
+    let proofBytes = 0;
+    const writer = { appendFile: async (data, encoding) => {
+      const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data, encoding);
+      await handle.appendFile(bytes);
+      sourceHash.update(bytes); proofBytes += bytes.length;
+    } };
 
     const flush = async () => {
       if (!chunk || !handle) return;
-      await handle.appendFile(chunk, 'utf8');
+      await writer.appendFile(chunk, 'utf8');
       chunk = '';
       chunkBytes = 0;
     };
@@ -6572,7 +6686,7 @@ async function writeCodexJsonlExclusive(filePath, records) {
       };
       if (rawImages) {
         await flush();
-        remember(await appendCodexRecordWithRawImages(handle, serialized, rawImages));
+        remember(await appendCodexRecordWithRawImages(writer, serialized, rawImages));
         continue;
       }
       if (writableRecord?.type === 'compacted'
@@ -6589,7 +6703,7 @@ async function writeCodexJsonlExclusive(filePath, records) {
         await flush();
       }
       if (lineBytes >= CODEX_JSONL_WRITE_CHUNK_BYTES) {
-        await handle.appendFile(line, 'utf8');
+        await writer.appendFile(line, 'utf8');
       } else {
         chunk += line;
         chunkBytes += lineBytes;
@@ -6597,9 +6711,11 @@ async function writeCodexJsonlExclusive(filePath, records) {
     }
     await flush();
     const writtenStat = await handle.stat();
+    if (proofBytes !== writtenStat.size || byteOffset !== writtenStat.size) throw Error('codex_prepared_write_size_changed');
     await handle.close();
     handle = null;
     return { records: writtenRecords, lineCount: writtenRecords.length, size: byteOffset,
+      sourceProof: [{ offset: 0, bytes: proofBytes, hash: sourceHash.digest('hex') }],
       mtimeMs: writtenStat.mtimeMs, ctimeMs: writtenStat.ctimeMs,
       dev: writtenStat.dev, ino: writtenStat.ino };
   } catch (error) {
@@ -7062,8 +7178,11 @@ function persistCodexForkHistoryEvent({
   if (!codexUsageStateStore?.saveSessionForkEvent) return false;
   const childRecords = (Array.isArray(outputRecords) ? outputRecords : [])
     .map((record, index) => ({ ...record, __line: index }));
-  const childTimeline = buildCodexTimeline(childRecords, childSessionId);
-  const sourceTimeline = buildCodexTimeline(
+  // Annotation identities depend on the SAME reducer's user/compact text and
+  // coordinates, not tool/docs enrichment. Sidecar copying below still uses
+  // the exact RAW physical records and its independent provenance checks.
+  const childTimeline = buildCodexMutationTimeline(childRecords, childSessionId);
+  const sourceTimeline = buildCodexMutationTimeline(
     Array.isArray(sourceRecords) ? sourceRecords : [],
     sourceSessionId,
   );
@@ -7086,6 +7205,16 @@ function persistCodexForkHistoryEvent({
     nextIterationIndex: sourceTotalIterations,
   });
   if (!event?.eventKey) throw new Error('fork_history_event_not_committed');
+  const presentations = cloneCodexPromptPresentationsForProvenChild(codexUsageStateStore, {
+    sourceSessionId,
+    childSessionId,
+    sourceRecords,
+    childRecords,
+  });
+  console.log('[HistoryPromptPresentation:CodexChild] source=' + sourceSessionId.slice(0, 8)
+    + ' child=' + childSessionId.slice(0, 8) + ' reason=' + forkMode
+    + ' matched=' + presentations.matchedRecordCount + ' cloned=' + presentations.cloned
+    + ' skipped=' + presentations.skipped + ' projection=' + presentations.stoppedReason);
   if (codexUsageStateStore.copyTimelineMetadataForMappedFork) {
     codexUsageStateStore.copyTimelineMetadataForMappedFork(
       childSessionId,
@@ -7175,6 +7304,96 @@ function sameCodexSourceSnapshot(cached, snapshot) {
     && cached.fileIdentity === snapshot.fileIdentity && cached.fileCtimeMs === snapshot.ctimeMs;
 }
 
+// Private Main-issued COW witness, not a public History hint or write authority.
+// The worker reuses ITS own immutable checkpoint; no large graph/raw array is
+// cloned across threads. A miss retains the ordinary canonical file reader.
+async function restoreCodexRewriteCheckpoint(receipt, { sessionId, cwd, filePath, stat, ticket }) {
+  const miss = reason => {
+    if (receipt) console.log('[CodexRewriteProjection] owner=reader child=' + String(sessionId).slice(0, 8) + ' reused=0 reason=' + reason);
+    return null;
+  };
+  if (receipt?.schema !== 'codex-rewrite-prefix-v1' || receipt.sessionId !== sessionId
+    || receipt.targetSnapshot?.filePath !== filePath || !codexSourceSnapshotMatchesStat(receipt.targetSnapshot, stat)
+    || receipt.headerRecord?.payload?.id !== sessionId || receipt.headerRecord.payload.cwd !== cwd
+    || !Array.isArray(receipt.records) || !receipt.records.length || !Array.isArray(receipt.sourceProof)) return miss('prefix-witness-unavailable');
+  const source = _codexHistoryProjectors.get(receipt.sourceSessionId);
+  if (!source) return miss('worker-source-not-resident');
+  if (!sameCodexSourceSnapshot(source, receipt.sourceSnapshot)
+    || source.sourceGeneration !== _codexSourceGenerations.get(source.filePath)?.generation
+    || _codexSourceGenerations.get(source.filePath)?.rewritePending) return miss('source-snapshot-changed');
+  const checkpoint = [...(source.checkpoints || [])].reverse().find(item => item.count <= receipt.sourcePrefixCount);
+  if (!checkpoint) return miss('no-checkpoint-before-cut');
+  await _codexExternalReadPrepare?.(source.filePath);
+  const sourceTicket = _codexReadFence.begin(source.filePath, 'projection');
+  try {
+    if (!codexSourceSnapshotMatchesStat(receipt.sourceSnapshot, await fs.promises.stat(source.filePath))) return miss('source-stat-changed');
+    let proofBytes = 0;
+    for (const proof of receipt.sourceProof) {
+      if (proof.offset !== proofBytes || !Number.isSafeInteger(proof.bytes) || proof.bytes <= 0
+        || !/^[a-f0-9]{64}$/.test(proof.hash)) return null;
+      proofBytes += proof.bytes;
+    }
+    if (proofBytes !== stat.size) return null;
+    let previousSource = -1, previousOffset = -1;
+    for (let i = 0; i < receipt.records.length; i++) {
+      const pair = receipt.records[i];
+      if (!Number.isSafeInteger(pair.sourceIndex) || pair.sourceIndex <= previousSource
+        || !Number.isSafeInteger(pair.source?.__line) || pair.source.__line < 0
+        || !Number.isSafeInteger(pair.source.__byteOffset) || pair.source.__byteOffset < 0
+        || pair.target?.__line !== i || !Number.isSafeInteger(pair.target.__byteOffset)
+        || pair.target.__byteOffset <= previousOffset || pair.target.__byteOffset >= stat.size) return null;
+      previousSource = pair.sourceIndex; previousOffset = pair.target.__byteOffset;
+    }
+    const pairs = receipt.records.filter(pair => pair.sourceIndex < checkpoint.count);
+    if (!pairs.length) return null;
+    const boundary = receipt.records[pairs.length]?.target || receipt.prefixEnd;
+    if (boundary?.__line !== pairs.length || !Number.isSafeInteger(boundary.__byteOffset)
+      || boundary.__byteOffset <= pairs.at(-1).target.__byteOffset || boundary.__byteOffset > stat.size) return null;
+    const mapping = createProjectionIdentityMap(receipt.sourceSessionId, sessionId, pairs);
+    const state = (await cloneProjectionGraphAsync(checkpoint.state, mapping.transform)).value;
+    state.timeline.metaRecord = { payload: receipt.headerRecord.payload, __line: 0 };
+    state.timeline.metaRecordPhysicalSessionId = sessionId;
+    state.timeline.forkStartedAtMs = parseTimestampMs(receipt.headerRecord.payload.timestamp);
+    state.timeline.forkLiveStartLine = Number.isSafeInteger(receipt.forkLiveStartLine)
+      && receipt.forkLiveStartLine < pairs.length ? receipt.forkLiveStartLine : undefined;
+    state.history.sessionCwd = cwd;
+    state.history.consumedRecords = pairs.length;
+    const backup = await cloneProjectionGraphAsync(state);
+    _codexReadFence.assertCurrent(sourceTicket); _codexReadFence.assertCurrent(ticket);
+    if (!codexSourceSnapshotMatchesStat(receipt.sourceSnapshot, await fs.promises.stat(source.filePath))
+      || !codexSourceSnapshotMatchesStat(receipt.targetSnapshot, await fs.promises.stat(filePath))) return null;
+    _codexReadFence.assertCurrent(sourceTicket); _codexReadFence.assertCurrent(ticket);
+    if (!restoreCodexSourceSnapshot(receipt.targetSnapshot)) return null;
+    console.log('[CodexRewriteProjection] owner=reader child=' + sessionId.slice(0, 8)
+      + ' reused=' + pairs.length + ' reason=exact-worker-checkpoint');
+    return { sessionId, filePath, fileSize: boundary.__byteOffset, fileIdentity: stat.dev + ':' + stat.ino,
+      fileMtimeMs: stat.mtimeMs, fileCtimeMs: stat.ctimeMs, sourceGeneration: receipt.targetSnapshot.sourceGeneration,
+      historyProjector: createCodexHistoryProjector(sessionId, state.history),
+      timelineProjector: createCodexTimelineProjector(sessionId, state.timeline),
+      lineCount: pairs.length, leftoverBuffer: Buffer.alloc(0), sourceProof: [],
+      preparedSourceProof: receipt.sourceProof, preparedReusedRecords: pairs.length,
+      checkpoints: backup.approxBytes <= _codexHistoryProjectorBudgetBytes / 4
+        ? [{ count: pairs.length, state: backup.value, approxBytes: backup.approxBytes }] : [] };
+  } catch (error) {
+    if (error.code === 'CODEX_SOURCE_READ_INVALIDATED') throw error;
+    console.warn('[CodexRewriteProjection] worker checkpoint miss reason=' + (error.code || error.message));
+    return null;
+  } finally { _codexReadFence.finish(sourceTicket); }
+}
+
+function codexPreparedRewriteReceipt({ sourceSessionId, sessionId, loaded, records, pairs, sourcePrefixCount, stat, filePath, sourceGeneration, sourceProof, reusedRecords = 0 }) {
+  return { schema: 'codex-rewrite-prefix-v1', sourceSessionId, sessionId, sourceSnapshot: loaded.sourceSnapshot,
+    targetSnapshot: { filePath, size: stat.size, mtimeMs: stat.mtimeMs, fileIdentity: stat.dev + ':' + stat.ino,
+      ctimeMs: stat.ctimeMs, sourceGeneration, sessionId, linkKind: 'end' },
+    records: pairs.map(({ source, target, sourceIndex }) => ({ sourceIndex,
+      source: { __line: source.__line, __byteOffset: source.__byteOffset },
+      target: { __line: target.__line, __byteOffset: target.__byteOffset } })),
+    sourcePrefixCount, prefixEnd: { __line: pairs.length, __byteOffset: records[pairs.length]?.__byteOffset ?? stat.size },
+    headerRecord: { type: 'session_meta', payload: records[0]?.payload },
+    forkLiveStartLine: getCodexForkLiveStartLine(records.slice(0, pairs.length), records[0]?.payload),
+    sourceProof, reusedRecords };
+}
+
 // The write planner retains object provenance, not a text match. Only a
 // contiguous unchanged prefix (apart from the deliberately replaced header)
 // may reuse a parser checkpoint. Tombstone normalization/virtual ancestors
@@ -7218,9 +7437,34 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
       // coincidentally cached projection of just that child's physical file.
       const { pairs, sourcePrefixCount } = loaded.composite ? { pairs: [], sourcePrefixCount: 0 }
         : codexRewritePrefix(loaded.records, outputRecords, records);
+      if (_codexRewriteProjectionPublisher) {
+        const stat = await fs.promises.stat(result.filePath);
+        if (!codexSourceSnapshotMatchesStat({ size: result.written.size, mtimeMs: result.written.mtimeMs,
+          ctimeMs: result.written.ctimeMs, fileIdentity: result.written.dev + ':' + result.written.ino }, stat)) throw Error('prepared_child_changed');
+        const sourceGeneration = rememberCodexSourceGeneration(result.filePath, stat, ticket, sessionId);
+        const receipt = codexPreparedRewriteReceipt({ sourceSessionId, sessionId, loaded, records, pairs,
+          sourcePrefixCount, stat, filePath: result.filePath, sourceGeneration, sourceProof: result.written.sourceProof });
+        await rememberCodexRewriteReceipt(receipt);
+        setCodexJsonlCacheEntry(result.filePath, { size: stat.size, mtimeMs: stat.mtimeMs, lineCount: records.length,
+          fileIdentity: stat.dev + ':' + stat.ino, ctimeMs: stat.ctimeMs, sourceGeneration,
+          leftover: '', leftoverBuffer: Buffer.alloc(0), records });
+        await codexResumeSourceReader().seedPrepared(sessionId, records[0]?.payload?.cwd || '', { filePath: result.filePath, stat, records });
+        const prepared = await _codexRewriteProjectionPublisher({ receipt, cwd: records[0]?.payload?.cwd || '' });
+        _codexReadFence.assertCurrent(ticket);
+        if (!codexSourceSnapshotMatchesStat(receipt.targetSnapshot, await fs.promises.stat(result.filePath))) throw Error('prepared_child_changed');
+        _codexReadFence.assertCurrent(ticket);
+        if (!prepared?.success) throw Error(prepared?.error || 'worker_preparation_unavailable');
+        console.log('[CodexRewriteProjection] owner=history-worker child=' + sessionId.slice(0, 8)
+          + ' reused=' + (prepared.reusedRecords || 0) + ' fed=' + prepared.fedRecords + ' mode=' + prepared.mode);
+        return;
+      }
       const checkpoint = sameCodexSourceSnapshot(source, loaded.sourceSnapshot)
         ? [...(source.checkpoints || [])].reverse().find((item) => item.count <= sourcePrefixCount)
         : null;
+      let reuseReason = loaded.composite ? 'composite-source'
+        : !source ? 'source-projection-missing'
+          : !sameCodexSourceSnapshot(source, loaded.sourceSnapshot) ? 'source-snapshot-changed'
+            : checkpoint ? 'exact-checkpoint' : 'no-checkpoint-before-cut';
       let state = null;
       let reusedRecords = 0;
       if (checkpoint) {
@@ -7243,6 +7487,7 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
         } catch (error) {
           console.warn('[CodexRewriteProjection] checkpoint rejected: ' + error.message);
           state = null;
+          reuseReason = 'checkpoint-transform-rejected';
         }
       }
       const cached = {
@@ -7251,6 +7496,7 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
         timelineProjector: createCodexTimelineProjector(sessionId, state?.timeline),
         filePath: result.filePath, lineCount: records.length, leftoverBuffer: Buffer.alloc(0),
         fileSize: result.written.size,
+        readMetrics: { feedMs: 0, checkpoints: 0, checkpointMs: 0, yieldMs: 0 },
       };
       if (state) {
         const checkpointCopy = await cloneProjectionGraphAsync(state);
@@ -7272,19 +7518,9 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
       cached.fileIdentity = stat.dev + ':' + stat.ino;
       cached.fileCtimeMs = stat.ctimeMs;
       cached.sourceGeneration = rememberCodexSourceGeneration(result.filePath, stat, ticket, sessionId);
-      cached.rewriteReceipt = {
-        schema: 'codex-rewrite-prefix-v1', sourceSessionId, sessionId,
-        sourceSnapshot: loaded.sourceSnapshot,
-        targetSnapshot: { filePath: result.filePath, size: stat.size, mtimeMs: stat.mtimeMs,
-          fileIdentity: cached.fileIdentity, ctimeMs: stat.ctimeMs,
-          sourceGeneration: cached.sourceGeneration, sessionId, linkKind: 'end' },
-        // Only coordinates; never another copy of the 400MB record array.
-        records: pairs.map(({ source, target }) => ({
-          source: { __line: source.__line, __byteOffset: source.__byteOffset },
-          target: { __line: target.__line, __byteOffset: target.__byteOffset },
-        })),
-        reusedRecords,
-      };
+      cached.rewriteReceipt = codexPreparedRewriteReceipt({ sourceSessionId, sessionId, loaded, records, pairs,
+        sourcePrefixCount, stat, filePath: result.filePath, sourceGeneration: cached.sourceGeneration,
+        sourceProof: result.written.sourceProof, reusedRecords });
       rememberCodexProjection(sessionId, cached);
       // Continue/settings/export use the independent raw-record reader. Its
       // prepared cursor is exact too; otherwise Continue immediately re-reads
@@ -7296,9 +7532,17 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
         sourceGeneration: cached.sourceGeneration,
         leftover: '', leftoverBuffer: Buffer.alloc(0), records,
       });
+      await codexResumeSourceReader().seedPrepared(sessionId, records[0]?.payload?.cwd || '', {
+        filePath: result.filePath, stat, records,
+      }).catch(error => console.warn('[CodexResumeSource] prepared cache skipped: ' + error.message));
       console.log('[CodexRewriteProjection] source=' + sourceSessionId.slice(0, 8)
         + ' child=' + sessionId.slice(0, 8) + ' prefix=' + pairs.length
-        + ' reused=' + reusedRecords + ' fed=' + (records.length - reusedRecords) + ' readKB=0');
+        + ' reused=' + reusedRecords + ' reuseReason=' + reuseReason
+        + ' fed=' + (records.length - reusedRecords) + ' readKB=0'
+        + ' feedMs=' + cached.readMetrics.feedMs.toFixed(1)
+        + ' checkpointMs=' + cached.readMetrics.checkpointMs.toFixed(1)
+        + ' checkpoints=' + cached.readMetrics.checkpoints
+        + ' yieldMs=' + cached.readMetrics.yieldMs.toFixed(1));
     } catch (error) {
       invalidateCodexHistoryProjectors(result.filePath);
       console.warn('[CodexRewriteProjection] cold fallback child=' + sessionId.slice(0, 8) + ': ' + error.message);
@@ -7307,6 +7551,13 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
 }
 
 function getCodexRewriteReceipt(sessionId, sourceSessionId) {
+  const prepared = _codexRewriteReceipts.get(sessionId)?.receipt;
+  if (prepared && prepared.sourceSessionId === sourceSessionId) {
+    const known = _codexSourceGenerations.get(prepared.targetSnapshot.filePath);
+    if (known && !known.rewritePending && known.generation === prepared.targetSnapshot.sourceGeneration
+      && codexSourceSnapshotMatchesStat(prepared.targetSnapshot, { ...known.stat,
+        dev: known.stat.fileIdentity.split(':')[0], ino: known.stat.fileIdentity.split(':')[1] })) return prepared;
+  }
   const cached = _codexHistoryProjectors.get(sessionId);
   const receipt = cached?.rewriteReceipt;
   return receipt && typeof sourceSessionId === 'string' && receipt.sourceSessionId === sourceSessionId
@@ -7370,7 +7621,7 @@ function validateCodexRangeRewriteProjection({
     ...record,
     __line: index,
   }));
-  const actual = buildCodexTimeline(projectedRecords, 'codex-range-validation')
+  const actual = buildCodexMutationTimeline(projectedRecords, 'codex-range-validation')
     .map(codexTimelineSemanticEntry);
   if (actual.length !== expected.length) {
     return {
@@ -7397,7 +7648,7 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
   if (typeof toPhysicalEnd !== 'boolean' || toPhysicalEnd && replacementText != null) {
     return { success: false, error: 'Physical suffix mode is only valid for Rewind deletion' };
   }
-  const timeline = buildCodexTimeline(records, sessionId);
+  const timeline = buildCodexMutationTimeline(records, sessionId);
   const startIndex = timeline.findIndex((entry) => entry.uuid === startUuid);
   const endIndex = timeline.findIndex((entry) => entry.uuid === endUuid);
   if (startIndex < 0 || endIndex < 0) {
@@ -7771,7 +8022,7 @@ async function editCodexRange({
   }
   const outputRecords = plan.outputRecords;
   const rewrittenRecords = outputRecords.map((record, index) => ({ ...record, __line: index }));
-  const remainingTimeline = buildCodexTimeline(rewrittenRecords, result.newSessionId);
+  const remainingTimeline = buildCodexMutationTimeline(rewrittenRecords, result.newSessionId);
   if (remainingTimeline.length !== plan.expectedRemainingCount) {
     await fs.promises.unlink(result.filePath).catch(() => {});
     invalidateCodexJsonlCache(result.filePath);
@@ -7962,11 +8213,23 @@ async function deleteCodexRange({
   validateSource = null,
   beforeWrite = null,
   toPhysicalEnd = false,
+  diagnosticOperationId = null,
 }) {
   if (!sessionId) return { success: false, error: 'sessionId required' };
   if (!startUuid || !endUuid) return { success: false, error: 'startUuid/endUuid required' };
+  const stageStarted = performance.now();
+  let stageAt = stageStarted;
+  const stage = phase => {
+    const now = performance.now();
+    console.log('[CodexRangeRewrite:Stage] operation=' + String(diagnosticOperationId || '-').slice(0, 160)
+      + ' source=' + sessionId.slice(0, 8) + ' validateOnly=' + (validateOnly === true)
+      + ' phase=' + phase + ' elapsedMs=' + (now - stageAt).toFixed(1)
+      + ' totalMs=' + (now - stageStarted).toFixed(1));
+    stageAt = now;
+  };
 
   const loaded = await loadCodexOperationSource(sessionId, cwd);
+  stage('load');
   if (!loaded.success) return loaded;
   if (typeof validateSource === 'function') validateSource(loaded);
 
@@ -7978,6 +8241,7 @@ async function deleteCodexRange({
     null,
     { toPhysicalEnd },
   );
+  stage('plan');
   if (!plan.success) return plan;
   const effectiveSettingsProof = resolveCodexHistoryMutationSettingsProof(
     loaded.records,
@@ -8025,6 +8289,7 @@ async function deleteCodexRange({
       beforeWrite,
       operationSource: loaded,
     });
+    stage('write');
   } catch (error) {
     return {
       success: false,
@@ -8034,7 +8299,8 @@ async function deleteCodexRange({
     };
   }
   const rewrittenRecords = plan.outputRecords.map((record, index) => ({ ...record, __line: index }));
-  const remainingTimeline = buildCodexTimeline(rewrittenRecords, result.newSessionId);
+  const remainingTimeline = buildCodexMutationTimeline(rewrittenRecords, result.newSessionId);
+  stage('postwrite-proof');
   if (remainingTimeline.length !== plan.expectedRemainingCount) {
     await fs.promises.unlink(result.filePath).catch(() => {});
     invalidateCodexJsonlCache(result.filePath);
@@ -8060,8 +8326,10 @@ async function deleteCodexRange({
     console.warn('[CodexData] deleted fork history event persist failed child=' + result.newSessionId.slice(0, 8) + ': ' + historyEventError.message);
     return { success: false, error: historyEventError.message, code: historyEventError.code, recoveryPath: historyEventError.recoveryPath };
   }
+  stage('lineage-commit');
 
   await publishCodexRewriteProjection({ sourceSessionId: sessionId, loaded, result, outputRecords: plan.outputRecords });
+  stage('projection');
 
   return {
     success: true,
@@ -11379,17 +11647,20 @@ async function loadSessionRecords(sessionId, cwd, options = {}) {
 }
 
 let _codexResumeSourceReader = null;
-function loadResumeSource(sessionId, cwd, options = {}) {
+function codexResumeSourceReader() {
   _codexResumeSourceReader ||= createCodexResumeSourceReader({
     findSessionFile: findCodexSessionFile,
     readJsonlRange,
     createTimelineProjector: createCodexTimelineProjector,
     activity: historyPreparationActivity,
   });
-  return _codexResumeSourceReader.load(sessionId, cwd, options);
+  return _codexResumeSourceReader;
+}
+function loadResumeSource(sessionId, cwd, options = {}) {
+  return codexResumeSourceReader().load(sessionId, cwd, options);
 }
 
-function register({ projectManager, transcriptService } = {}) {
+function register({ projectManager, transcriptService, historyMutationInput } = {}) {
   codexUsageStateStore = projectManager?.db || null;
   codexUsageStateHydrated = false;
   hydrateCodexUsageState();
@@ -11818,7 +12089,14 @@ function register({ projectManager, transcriptService } = {}) {
 
   ipcMain.handle('codex:delete-range', async (_event, params = {}) => {
     try {
-      return await deleteCodexRange(params);
+      const perform = () => {
+        if (params.tabId) historyMutationInput?.assert(params.tabId, params.historyInput, { action: 'mutation' });
+        return deleteCodexRange({ ...params, diagnosticOperationId: params.historyInput?.operationId || null, beforeWrite: () => {
+          if (params.tabId) historyMutationInput?.assert(params.tabId, params.historyInput, { action: 'mutation' });
+          params.beforeWrite?.();
+        } });
+      };
+      return historyMutationInput ? await historyMutationInput.run(params.historyInput, perform) : await perform();
     } catch (error) {
       console.error('[CodexData] delete-range error:', error);
       return {
@@ -12114,6 +12392,8 @@ module.exports = {
   findCodexLinkedLiveBoundary,
   buildCodexTimeline,
   buildCodexFullHistory,
+  buildCodexTimelineCooperatively,
+  buildCodexFullHistoryCooperatively,
   buildCodexTurnEvidence,
   buildCodexCleanExport,
   buildCodexRangeExport,
@@ -12140,6 +12420,7 @@ module.exports = {
     buildCodexInterruptedHistoryEntry,
     observeCodexReadInvalidation,
     setCodexProjectionStorage,
+    setCodexRewriteProjectionPublisher,
     restoreCodexSourceSnapshot,
     isCodexSourceSnapshotCurrent,
     beginCodexSourceRead,
@@ -12180,6 +12461,7 @@ module.exports = {
     loadCodexObservedExecution,
     loadLatestCodexObservedExecution,
     loadCodexHistoricalObservedExecution,
+    readCachedCodexCompletedResponse,
     getCodexResultReaderStats: () => codexResultReader().stats(),
     getCodexUserRecordIdentity,
     isCompactPayload,
@@ -12208,6 +12490,7 @@ module.exports = {
     loadResumeSource,
     injectHistoryContext: null,
     buildCodexFullHistory,
+    buildCodexFullHistoryCooperatively,
     buildCodexTurnEvidence,
     createCodexHistoryProjector,
     projectCodexFullHistoryFromFile,
@@ -12221,6 +12504,7 @@ module.exports = {
     estimateProjectorBytes,
     estimateCodexProjectorCacheEntryBytes,
     buildCodexTimeline,
+    buildCodexTimelineCooperatively,
     findCodexExecNestedCalls,
     codexHistoryLogicalCalls,
     resolveSimpleJsCallValue,

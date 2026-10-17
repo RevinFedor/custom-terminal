@@ -18,6 +18,7 @@ import {
   BrainIcon,
   ChatMessage,
   ConversationMessage,
+  Markdown,
   ColoredToolIcon,
   ComposerChip,
   defaultOpenForTool,
@@ -314,8 +315,8 @@ export const HistoryCollapsedGroupRow = memo(({
   const headerText = historyGroupHeaderText(segments);
   const captionEntry = selected.entry;
   const captionPending = captionEntry?.rowStub === true;
-  const caption = captionEntry && typeof captionEntry.content === 'string'
-    ? captionEntry.content.trim()
+  const caption = captionEntry && typeof captionEntry.content === 'string' && captionEntry.content.trim()
+    ? captionEntry.content
     : '';
   return (
     <div
@@ -386,8 +387,9 @@ export const HistoryCollapsedGroupRow = memo(({
               {selected.index + 1}
             </button>}
           </span>
-          <span className="hp-history-caption-text" {...(caption ? historyRecordTimeAttributes(captionEntry?.recordTime,
-            captionEntry?.uuid + ':caption', 'text') : {})}>{captionPending ? 'Loading text…' : caption || digest}</span>
+          <div className="hp-history-caption-text" {...(caption ? historyRecordTimeAttributes(captionEntry?.recordTime,
+            captionEntry?.uuid + ':caption', 'text') : {})}>{captionPending ? 'Loading text…'
+              : caption ? <Markdown text={caption} preview /> : digest}</div>
         </div>
       )}
     </div>

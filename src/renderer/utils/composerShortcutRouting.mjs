@@ -7,13 +7,11 @@ export function isComposerKeyboardTarget(target) {
 
 export function shouldOpenHistorySearchFromKeydown(event, surface) {
   if (!surface?.isOpen || event?.defaultPrevented || event?.isComposing) return false;
-  if (event?.key?.toLowerCase() !== 'f') return false;
+  if (event?.code ? event.code !== 'KeyF' : event?.key?.toLowerCase() !== 'f') return false;
   if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return false;
 
-  // Run after is portalled out of History's React subtree but still bubbles
-  // through this window capture listener. Physical DOM ownership is the only
-  // reliable boundary: every shared composer must receive Mod-F itself.
-  if (isComposerKeyboardTarget(event.target)) return false;
+  // Find follows the presented History even while its composer owns focus.
+  // The input-only find panel is an explicit window-menu action.
   if (surface.terminalIsPrimary) return false;
   if (surface.mainSurface && surface.terminalOpen) return false;
   return true;

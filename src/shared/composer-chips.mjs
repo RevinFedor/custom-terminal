@@ -1,5 +1,6 @@
 import localCommand from './agent-local-command.cjs';
 import pastedContent from './pasted-content.cjs';
+import { normalizeTerminalMessageSnapshot } from './terminal-message-reference.mjs';
 const { normalizeAgentLocalCommand } = localCommand;
 const { findPastedContentEnvelope } = pastedContent;
 
@@ -9,6 +10,12 @@ export const MAX_AI_COMPOSER_CHIP_THRESHOLD = 100_000;
 
 const PASTED_CONTENT_OPEN = '<pasted_content>';
 const PASTED_CONTENT_CLOSE = '</pasted_content>';
+
+export function buildPasteChipWrapper(chip) {
+  const reference = normalizeTerminalMessageSnapshot(chip?.messageReference, chip?.text);
+  const suffix = reference ? ` id="${reference.referenceId}"` : '';
+  return `<pasted_content${suffix}>\n${chip.text}\n</pasted_content${suffix}>`;
+}
 
 // Метка сохранённого промпта — ровно та же роль, что у `<pasted_content>` для
 // вставки: она едет В САМОМ ТЕКСТЕ, поэтому чип в истории восстанавливается из
@@ -264,11 +271,14 @@ function normalizeChip(raw) {
   const id = String(raw.id || '').trim();
   const text = String(raw.text || '');
   if (!id || (!text && !(raw.kind === 'prompt' && raw.attachmentKind === 'file'))) return null;
+  const { messageReference: rawReference, ...base } = raw;
+  const reference = raw.kind === 'paste' ? normalizeTerminalMessageSnapshot(rawReference, text) : null;
   return {
-    ...raw,
+    ...base,
     id,
     kind: raw.kind,
     text,
+    ...(reference ? { messageReference: reference } : {}),
     ...(typeof raw.label === 'string' && raw.label.trim()
       ? { label: raw.label.trim() }
       : {}),
@@ -371,7 +381,9 @@ export function haveSameComposerChips(left, right) {
       && chip.role === other.role
       && chip.sha256 === other.sha256
       && chip.bytes === other.bytes
-      && chip.contextUpdateId === other.contextUpdateId;
+      && chip.contextUpdateId === other.contextUpdateId
+      && chip.messageReference?.referenceId === other.messageReference?.referenceId
+      && JSON.stringify(chip.messageReference?.source || null) === JSON.stringify(other.messageReference?.source || null);
   });
 }
 
@@ -496,7 +508,7 @@ export function serializeComposerDraft({ text = '', chips = [], parts = null, re
         value = part.text;
         onTextRange?.({ partIndex, start: position, end: position + value.length });
       }
-      else if (part.kind === 'paste') value = `${PASTED_CONTENT_OPEN}\n${byId.get(part.chipId).text}\n${PASTED_CONTENT_CLOSE}`;
+      else if (part.kind === 'paste') value = buildPasteChipWrapper(byId.get(part.chipId));
       else if (part.kind === 'image') {
         value = renderImage ? renderImage(part.imageId) : `[Image #${part.imageId}]`;
         onImageRange?.({ id: part.imageId, start: position, end: position + value.length });
@@ -521,7 +533,7 @@ export function serializeComposerDraft({ text = '', chips = [], parts = null, re
     const chip = chipById.get(range.id);
     if (!chip) continue;
     inlinedText = inlinedText.slice(0, range.start)
-      + `${PASTED_CONTENT_OPEN}\n${chip.text}\n${PASTED_CONTENT_CLOSE}`
+      + buildPasteChipWrapper(chip)
       + inlinedText.slice(range.end);
   }
 
@@ -530,7 +542,7 @@ export function serializeComposerDraft({ text = '', chips = [], parts = null, re
   // touching the text, must still send their content.
   const pasteParts = normalized
     .filter((chip) => chip.kind === 'paste' && !anchoredIds.has(chip.id))
-    .map((chip) => `${PASTED_CONTENT_OPEN}\n${chip.text}\n${PASTED_CONTENT_CLOSE}`);
+    .map(buildPasteChipWrapper);
 
   return [
     ...promptParts,
@@ -571,7 +583,7 @@ export function splitPromptChipPresentation({ text = '', chips = [] } = {}) {
  * Prompt-chip presentation is attached by durable entry UUID outside the
  * transport text.
  */
-export function parsePastedContentParts(value) {
+export function parsePastedContentParts(value, { includePasteIdentity = false } = {}) {
   const text = String(value || '');
   const parts = [];
   let cursor = 0;
@@ -615,7 +627,8 @@ export function parsePastedContentParts(value) {
       }
       const before = text.slice(cursor, next.at);
       if (before) parts.push({ kind: 'text', text: before });
-      parts.push({ kind: 'paste', text: pasteEnvelope.body });
+      parts.push({ kind: 'paste', text: pasteEnvelope.body,
+        ...(includePasteIdentity && pasteEnvelope.id ? { pasteIdentity: pasteEnvelope.id } : {}) });
       cursor = pasteEnvelope.end;
       continue;
     }
@@ -868,7 +881,14 @@ export function buildHistoryComposerPresentationParts({
   // разойтись с ним не может. Запись-спутник рядом с историей остаётся для
   // сообщений, отправленных ДО появления метки, и для тех, что пришли путём, где
   // текст собирали не мы.
-  const wrapperParts = parsePastedContentParts(String(text || ''));
+  const wrapperParts = parsePastedContentParts(String(text || ''), { includePasteIdentity: true });
+  const references = normalizeComposerChips(chips).filter(chip => chip.kind === 'paste' && chip.messageReference);
+  const bindReference = part => {
+    if (!part.pasteIdentity) return part;
+    const candidates = references.filter(chip => chip.messageReference.referenceId === part.pasteIdentity && chip.text === part.text);
+    const sameSource = candidates.length && candidates.every(chip => JSON.stringify(chip.messageReference.source) === JSON.stringify(candidates[0].messageReference.source));
+    return sameSource ? { ...part, messageReference: candidates[0].messageReference } : part;
+  };
   const hasWrappedPromptChip = wrapperParts.some((part) => (
     part.kind === 'prompt-wrapper' || part.kind === 'context-file-wrapper'
   ));
@@ -876,7 +896,7 @@ export function buildHistoryComposerPresentationParts({
     const parts = [];
     for (const part of wrapperParts) {
       if (part.kind === 'paste') {
-        parts.push(part);
+        parts.push(bindReference(part));
         continue;
       }
       if (part.kind === 'prompt-wrapper') {
@@ -932,9 +952,9 @@ export function buildHistoryComposerPresentationParts({
   if (promptPresentation.chips.length > 0 && promptPresentation.text) {
     parts.push({ kind: 'text', text: '\n\n' });
   }
-  for (const part of parsePastedContentParts(promptPresentation.text)) {
+  for (const part of parsePastedContentParts(promptPresentation.text, { includePasteIdentity: true })) {
     if (part.kind === 'paste') {
-      parts.push(part);
+      parts.push(bindReference(part));
       continue;
     }
     // Wrapper parts are impossible here: this branch runs only without wrappers.
@@ -1041,6 +1061,7 @@ export function restoreComposerDraftFromHistoryPresentation({
         id: `history-rewrite-paste-${pasteIndex}`,
         kind: 'paste',
         text: String(part.text || ''),
+        ...(part.messageReference ? { messageReference: part.messageReference } : {}),
       };
       restoredChips.push(chip);
       editableText += buildPasteChipMarker(chip);

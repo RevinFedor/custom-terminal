@@ -139,6 +139,7 @@ export function buildHistoryMessageComposerSnapshot({
         kind: 'paste',
         label: 'Вставка',
         text: pasteText,
+        ...(part.messageReference ? { messageReference: part.messageReference } : {}),
       };
       pasteChips.push(paste);
       editableText += buildPasteChipMarker(paste);

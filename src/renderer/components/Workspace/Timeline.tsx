@@ -24,6 +24,7 @@ import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { shouldBypassTimelineApplyPriority } from '../../utils/timelineApplyPriority.mjs';
 import {
   createTimelineSnapshotCache,
+  timelineMessageSnapshotCache,
   createTimelineSnapshotOwner,
   makeTimelineSnapshotKey,
 } from '../../utils/timelineSnapshotCache.mjs';
@@ -863,7 +864,7 @@ interface TimelineSnapshotCacheRecord {
   revision: HistoryDurableRevision | null;
 }
 
-const _timelineSnapshotCache = createTimelineSnapshotCache();
+const _timelineSnapshotCache = timelineMessageSnapshotCache;
 
 function perfAbsNow(): number {
   return performance.timeOrigin + performance.now();
@@ -5645,7 +5646,7 @@ function Timeline({
     }
   };
 
-  const stopCodexForHistoryMutation = async (operation: 'Edit Range' | 'Delete Range' | 'History Rewind'): Promise<string> => {
+  const stopCodexForHistoryMutation = async (operation: 'Edit Range' | 'Delete Range' | 'History Rewind', historyInput?: any): Promise<string> => {
     // The selected source belongs to this action's render, not to a ref which
     // may already describe another tab after an asynchronous preflight.
     const historicalSessionId = sessionId;
@@ -5661,7 +5662,7 @@ function Timeline({
       allowProcessTreeLookup: true,
     });
     console.warn(`[Codex${operation.replace(/\s/g, '')}] commandState:`, JSON.stringify(cmdState));
-    if (cmdState?.processLookupUnknown && !cmdState?.isRunning) {
+    if (typeof cmdState?.isRunning !== 'boolean' || cmdState?.processLookupUnknown && !cmdState?.isRunning) {
       throw new Error(`Не удалось проверить процесс Codex перед ${operation}; история не изменена`);
     }
 
@@ -5681,6 +5682,7 @@ function Timeline({
         tabId,
         toolType: 'codex',
         reason: 'timeline-history-mutation',
+        ...(historyInput ? { historyInput } : {}),
       });
       if (!stopResult?.success) {
         throw new Error(stopResult?.error || 'Failed to stop Codex');
@@ -5693,24 +5695,25 @@ function Timeline({
     newSessionId: string,
     reason: 'editRange' | 'deleteRange',
     codexSettingsProof?: { model: string; effort: string; proofAt: number; fast?: boolean } | null,
+    historyInput?: any,
   ) => {
     const committed = await useWorkspaceStore.getState().setCodexSessionId(
       tabId,
       newSessionId,
       reason,
-      codexSettingsProof ? { codexSettingsProof } : {},
+      { ...(codexSettingsProof ? { codexSettingsProof } : {}), ...(historyInput ? { historyInput } : {}) },
     );
     if (!committed) {
       const error: any = new Error('Codex session binding could not be committed');
       error.codexHistoryChildAdopted = false;
       throw error;
     }
-    const launchResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+    const launchResult = await ipcRenderer.invoke('codex:run-command', { ...buildCodexRunPayload({
       tabId,
       command: 'codex-c',
       sessionId: newSessionId,
       cwd,
-    }));
+    }), ...(historyInput ? { historyInput } : {}) });
     if (launchResult?.success === false) {
       const error: any = new Error(launchResult.error || launchResult.reason || 'Codex restart failed');
       error.codexHistoryChildAdopted = true;
@@ -5918,7 +5921,12 @@ function Timeline({
     let stoppedTool: 'claude' | 'codex' | null = null;
     let stoppedSessionId = sessionId;
     let codexSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
+    let historyInput: any = null;
+    let committedChildSessionId: string | null = null;
     try {
+      historyInput = await ipcRenderer.invoke('history-mutation:begin', {
+        tabId, sessionId, toolType: isCodex ? 'codex' : 'claude', operationId: activity.id,
+      });
       codexSettingsProof = isCodex ? getCodexHistoryMutationSettingsProof(tabId, sessionId) : null;
       let mutationSessionId = sessionId;
       if (isCodex) {
@@ -5928,6 +5936,7 @@ function Timeline({
           startUuid,
           endUuid,
           validateOnly: true,
+          tabId, historyInput,
           ...(codexSettingsProof ? { codexSettingsProof } : {}),
         });
         if (!preflight?.success) {
@@ -5935,13 +5944,14 @@ function Timeline({
         }
         codexSettingsProof = preflight.codexSettingsProof || codexSettingsProof;
         activity.setPhase('stopping');
-        mutationSessionId = await stopCodexForHistoryMutation('Delete Range');
+        mutationSessionId = await stopCodexForHistoryMutation('Delete Range', historyInput);
         stoppedTool = 'codex';
         stoppedSessionId = mutationSessionId;
       } else {
         activity.setPhase('stopping');
         const stopped = await stopClaudePtyProcess(tabId, {
           reason: 'timeline-delete-range',
+          historyInput,
         });
         if (stopped?.success === false) {
           throw new Error(stopped.error || 'Claude did not stop before Delete Range');
@@ -5956,9 +5966,12 @@ function Timeline({
         cwd,
         startUuid,
         endUuid,
+        tabId, historyInput,
         ...(codexSettingsProof ? { codexSettingsProof } : {}),
       });
 
+      if (result?.committed === true) historyMutated = true;
+      if (result?.newSessionId && (result?.success === true || result?.committed === true)) committedChildSessionId = result.newSessionId;
       if (!result.success) {
         throw new Error(result.error || 'unknown');
       }
@@ -5976,6 +5989,7 @@ function Timeline({
           result.newSessionId,
           'deleteRange',
           result.codexSettingsProof || codexSettingsProof,
+          historyInput,
         );
         historyChildAdopted = true;
         stoppedTool = null;
@@ -5991,6 +6005,7 @@ function Timeline({
           tabId,
           command: 'claude-c',
           sessionId: mutationSessionId,
+          historyInput,
         });
         if (launchResult?.success === false || launchResult?.accepted === false) {
           throw new Error(launchResult?.error || launchResult?.reason || 'Claude restart rejected after Delete Range');
@@ -6011,14 +6026,15 @@ function Timeline({
       historyChildAdopted = historyChildAdopted || err?.codexHistoryChildAdopted === true;
       console.error('[Timeline] Delete range failed: ' + deleteErrorMessage
         + ' historyMutated=' + (historyMutated ? '1' : '0')
+        + ' child=' + (committedChildSessionId || '-')
         + ' childAdopted=' + (historyChildAdopted ? '1' : '0')
         + ' tool=' + toolType
         + ' session=' + String(stoppedSessionId || sessionId).slice(0, 8)
         + ' tab=' + tabId + ' op=' + activity.id + ' start=' + startUuid + ' end=' + endUuid);
-      if (!historyChildAdopted && stoppedTool) {
+      if (!historyMutated && stoppedTool) {
         try {
           if (stoppedTool === 'codex') {
-            const restored = await ipcRenderer.invoke('codex:run-command', buildCodexHistoryMutationResumePayload(
+            const restored = await ipcRenderer.invoke('codex:run-command', { ...buildCodexHistoryMutationResumePayload(
               {
                 tabId,
                 command: 'codex-c',
@@ -6026,7 +6042,7 @@ function Timeline({
                 cwd,
               },
               codexSettingsProof,
-            ));
+            ), historyInput });
             if (restored?.success === false || restored?.accepted === false) {
               throw new Error(restored?.error || restored?.reason || 'Codex source restart failed');
             }
@@ -6036,6 +6052,7 @@ function Timeline({
               tabId,
               command: 'claude-c',
               sessionId: stoppedSessionId,
+              historyInput,
             });
             if (restored?.success === false || restored?.accepted === false) {
               throw new Error(restored?.error || restored?.reason || 'Claude source restart failed');
@@ -6052,13 +6069,18 @@ function Timeline({
           : historyMutated
             ? (sourceSessionRestored
               ? 'Удаление не принято вкладкой; исходная сессия восстановлена: ' + deleteErrorMessage
-              : 'Создана отдельная изменённая копия, но вкладка осталась на остановленной исходной сессии: ' + deleteErrorMessage)
+              : 'Изменённая копия сохранена (' + (committedChildSessionId || 'ID неизвестен')
+                + '), но её привязка к вкладке не подтверждена: ' + deleteErrorMessage)
             : (stoppedTool && !sourceSessionRestored
               ? 'Удаление не выполнено, исходную сессию не удалось перезапустить: ' + deleteErrorMessage
               : 'Удаление не удалось: ' + deleteErrorMessage),
         'error', 0, true, undefined, undefined, undefined, tabId
       );
       activity.finish(deleteErrorMessage);
+    } finally {
+      if (historyInput) await ipcRenderer.invoke('history-mutation:finish', historyInput).catch(error => {
+        console.warn('[HistoryDelete] input settlement failed:', error);
+      });
     }
   };
 

@@ -1,9 +1,25 @@
 import { resolveHistoryNavigationTarget } from './historyPromptPresentation.mjs';
+import { historyEntryHasExactIdentity } from '../../shared/history-entry-identity.mjs';
 
 export const HISTORY_NAVIGATION_FLASH_MS = 500;
 export const HISTORY_NAVIGATION_FLASH_CSS = '@keyframes hp-flash {0% { background-color: transparent; } 20% { background-color: rgba(91,156,245,0.2); } 100% { background-color: transparent; }}';
 
 export function resolveHistoryToolNavigationTarget(entries, identity, tool) {
+  if (tool?.messageReference) {
+    const target = tool.messageReference;
+    const matches = entries.filter(entry => {
+      const ref = entry.entryRef || {};
+      const physical = ref.physicalSessionId || entry.physicalSessionId || entry.sessionId;
+      const raw = ref.rawUuid || entry.rawUuid || entry.uuid;
+      if (target.physicalSessionId && physical !== target.physicalSessionId) return false;
+      if (!target.physicalSessionId && physical !== target.sessionId) return false;
+      if (target.transcriptSegmentId && (ref.segmentId || entry.transcriptSegmentId) !== target.transcriptSegmentId) return false;
+      if (target.rawUuid && raw !== target.rawUuid) return false;
+      return historyEntryHasExactIdentity(entry, identity)
+        || !!target.rawUuid && raw === target.rawUuid && physical === target.physicalSessionId;
+    });
+    return matches.length === 1 ? matches[0] : null;
+  }
   const exact = resolveHistoryNavigationTarget(entries, identity);
   if (!tool) return exact;
   // A header stub has no actions yet. Hydrate its exact row before checking the

@@ -1,6 +1,16 @@
 import { forwardRef, useCallback, useLayoutEffect, useRef } from 'react';
 import { ComposerEditor as SharedComposerEditor, type ComposerEditorHandle, type ComposerEditorProps } from '@gt-editor/markdown-editor';
 import { observeDictationComposerPaste, registerDictationComposer } from '../utils/dictationEditableClipboard.mjs';
+import { jumpToTerminalMessageReference } from '../utils/tabMessageSourceJump';
+import { EditorView } from '@codemirror/view';
+import { openSearchPanel } from '@codemirror/search';
+
+export function openComposerInputSearch(handle: ComposerEditorHandle | null): boolean {
+  const root = handle?.dom;
+  if (!root?.isConnected) return false;
+  const view = EditorView.findFromDOM(root);
+  return view ? openSearchPanel(view) : false;
+}
 
 // Host adapter for every Noted ComposerEditor. The shared editor keeps ownership
 // of paste, history and token sidecars; this only proves its exact document edit
@@ -28,7 +38,7 @@ export const ComposerEditor = forwardRef<ComposerEditorHandle, ComposerEditorPro
     });
   }, [props.historyOwnerKey, props.readOnly]);
 
-  return <SharedComposerEditor {...props} ref={setHandle} onPaste={(event) => {
+  return <SharedComposerEditor {...props} onMessageReferenceNavigate={props.onMessageReferenceNavigate || jumpToTerminalMessageReference} ref={setHandle} onPaste={(event) => {
     const content = handleRef.current?.dom?.querySelector<HTMLElement>('.cm-content');
     if (content) observeDictationComposerPaste(content, event);
     if (!(event.nativeEvent || event).defaultPrevented) propsRef.current.onPaste?.(event);

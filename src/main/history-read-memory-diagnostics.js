@@ -5,7 +5,11 @@ const { getHeapStatistics } = require('node:v8');
 const { isMainThread, threadId } = require('node:worker_threads');
 const enqueueMicrotask = queueMicrotask;
 let sequence = 0;
-const numberFields = ['sourceBytes', 'records', 'preparedRows', 'returnedRows', 'totalIterations', 'matches'];
+const numberFields = ['sourceBytes', 'records', 'preparedRows', 'returnedRows', 'totalIterations', 'matches',
+  'projectionQueueUs', 'projectionRawReadUs', 'projectionHistoryFeedUs', 'projectionHistoryFinalizeUs',
+  'projectionTimelineFeedUs', 'projectionTimelineFinalizeUs', 'projectionMetadataUs', 'projectionDtoUs',
+  'projectionSlices', 'projectionYields', 'projectionMaxSliceUs', 'projectionMaxUnitUs',
+  'projectionHistoryFedRecords', 'projectionTimelineFedRecords'];
 const token = value => typeof value === 'string' && /^[\w.:-]{1,100}$/.test(value) ? value : undefined;
 const snapshotFields = (fields = {}) => {
   const counts = {};
@@ -13,7 +17,7 @@ const snapshotFields = (fields = {}) => {
     const value = fields[key];
     if (Number.isSafeInteger(value) && value >= 0) counts[key] = value;
   }
-  return { ...counts, errorCode: token(fields.errorCode) };
+  return { ...counts, errorCode: token(fields.errorCode), projectionMode: token(fields.projectionMode) };
 };
 
 // Admission and terminal snapshots, never a heap walk, body serialization, timer

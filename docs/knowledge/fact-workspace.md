@@ -15,6 +15,21 @@ Workflow организует окна и вкладки независимо о
 Удаление workflow переводит оставшихся участников в системный Inbox; архив,
 groups, roots, favorites и exports имеют собственный срок жизни.
 
+Full Close сохраняет `workflow_org_memberships` как происхождение для Restore.
+Поэтому membership row не равна текущей вкладке: active catalog требует
+resolved execution row, `execution_archived!=1` и существующий workflow.
+Storage17.10 использует ту же границу; окна/sidebar/reserve/stopped внутри
+active membership сохраняются, закрытые native rows не попадают в Open now.
+Истёкший архив не восстанавливается через latest/by-id/window undo; его
+минимальная search source identity сохраняется отдельно от restore payload.
+
+Полные `workflow_org_generations.snapshot_json` — служебные диагностические
+копии, не authority новых операций. После накопления восьми отдельный worker
+оставляет первый migration snapshot и два последних. Current organization,
+prepared migration source и immutable mutation request/response receipts не
+подчищаются. Maintenance error не отзывает committed publication. Подробности
+сроков, private-test границ и SQLite free pages — `fact-хранилище-сессий.md`.
+
 Старые `projectId`/namespace — адреса legacy исполнения, а не новые workflow IDs.
 Один namespace может адресовать вкладки разных workflow/cwd. Существующие v1
 guards project/cwd сохраняются; новый v2 subject не требует Project row/FK.
@@ -262,7 +277,10 @@ Canvas/context для этих замеров переиспользуется �
 Каждое чтение по-прежнему берёт текущий computed font и измеряет ink: кэш baseline
 не заменяет свежий размер текста. Перед назначением font восстанавливается исходный
 canvas font, чтобы непринятое значение не наследовало шрифт предыдущей карточки.
-Потерянный/недоступный context создаётся заново; loadingdone очищает профили.
+При том же последнем назначенном font приватный context не сбрасывается повторно;
+свежий measureText всё равно выполняется, включая изменение ink до loadingdone.
+Потерянный/недоступный context создаётся заново; loadingdone очищает профили и
+последнее назначение, поэтому следующий замер снова применяет font.
 Private Electron сравнение проверяет геометрию, но само не доказывает latency
 полного workspace. Формула layout и существующие font/resize observers сохранены.
 

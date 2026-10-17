@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Server, RotateCw, Cloud, Terminal, Puzzle, Loader2 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
-import { externalMcpServers, mcpCatalogErrorMessage } from '../../utils/mcpCatalogPresentation.mjs';
+import { externalMcpServers, mcpCatalogErrorMessage, hubConfigurationNotice } from '../../utils/mcpCatalogPresentation.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -28,6 +28,9 @@ type HubStatus = {
   servers?: HubServer[];
   clients?: { tabId: string; lastSeen: number }[];
   down?: boolean;
+  configurationApplied?: boolean;
+  desiredConfiguration?: { error: string | null; needsReview: boolean;
+    entries: { name: string; state: string; error?: string }[] };
 };
 
 type CodexMcpServer = {
@@ -57,8 +60,8 @@ function formatUptime(startedAt: number | null): string {
   return Math.floor(sec / 86400) + 'д';
 }
 
-// Чип статуса общего MCP-бэкенда (хаба): зелёная точка — все шесть серверов
-// живы, янтарная — часть упала, красная — хаб недоступен. Панель показывает
+// Зелёная точка: настроенные children готовы и профиль подтверждён.
+// Янтарная: требуется проверка конфигурации или готовности. Панель показывает
 // каждый сервер с аптаймом и кнопкой рестарта. Опрос идёт только пока панель
 // открыта (или раз в 30с для цвета точки — дешёвый fetch статуса).
 const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
@@ -134,10 +137,11 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
 
   const servers = status?.servers || [];
   const visibleCatalog = catalogScopeRef.current === cwd ? catalog : null;
-  const externalServers: CodexMcpServer[] = externalMcpServers(visibleCatalog);
+  const externalServers: CodexMcpServer[] = externalMcpServers(visibleCatalog, servers);
+  const configurationNotice = hubConfigurationNotice(status, visibleCatalog);
   const isReady = (server: HubServer) => server.up && server.initialized && !server.recovering;
   const readyCount = servers.filter(isReady).length;
-  const allUp = !status?.down && servers.length > 0 && readyCount === servers.length;
+  const allUp = !configurationNotice && !status?.down && servers.length > 0 && readyCount === servers.length;
   const dotColor = status?.down || readyCount === 0
     ? '#f87171'
     : allUp ? '#4ade80' : '#fbbf24';
@@ -224,7 +228,7 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
                 MCP-хаб {status?.down ? '· недоступен' : '· порт ' + (status?.port ?? '?')}
               </div>
               <div className="text-[11px]" style={{ color: '#71717a' }}>
-                {status?.down ? '' : readyCount + '/' + servers.length}
+                {status?.down ? '' : readyCount + '/' + servers.length + ' активных'}
               </div>
             </div>
 
@@ -232,6 +236,12 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
               <div className="mb-2 rounded-md border p-2 text-[11px]"
                 style={{ borderColor: 'rgba(248,113,113,0.35)', background: 'rgba(248,113,113,0.08)', color: '#fca5a5' }}>
                 Хаб не отвечает. MCP-инструменты недоступны до восстановления.
+              </div>
+            )}
+
+            {configurationNotice && (
+              <div role="status" className="mb-2 rounded border p-2 text-[11px]" style={{ color: '#fbbf24' }}>
+                {configurationNotice}
               </div>
             )}
 
@@ -308,7 +318,7 @@ const McpHubButton: React.FC<{ cwd?: string | null }> = ({ cwd = null }) => {
                     <Icon size={12} className="flex-none" style={{ color: '#71717a' }} />
                     <span className="min-w-0 flex-1 truncate font-mono text-[11px]" style={{ color: '#e4e4e7' }}>{server.name}</span>
                     <span className="flex-none text-[11px]" style={{ color: '#71717a' }}>
-                      {server.enabled ? 'настроен' : 'отключён'}
+                      {!server.enabled ? 'отключён' : server.hubServer ? 'нет в хабе' : 'настроен'}
                     </span>
                   </div>
                 );

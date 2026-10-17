@@ -180,6 +180,39 @@ test('complete large catalog still serializes each shared icon once and no large
   assert.ok(wire.length < 150000); assert.equal(wire.includes('SECRET_BODY'), false);
 });
 
+test('metadata bridge never even reads private Tab body/process fields, while rename stays fresh', async t => {
+  const f = fixture(); t.after(() => f.close());
+  for (const tab of f.tabs.values()) {
+    for (const key of ['notes', 'historyPrompt', 'draft', 'bgTasks', 'taskPlan']) {
+      Object.defineProperty(tab, key, { configurable: true, get() { throw Error('private field read: ' + key); } });
+    }
+  }
+  f.snapshot.refresh();
+  f.tabs.get('b').name = 'current title';
+  f.publish();
+  const result = await f.snapshot.read(native);
+  assert.equal(result.rows.find(row => row.tabId === 'b').title, 'current title');
+  assert.equal(result.totalTabs, 8);
+});
+
+test('one capture looks up a repeated large project icon once, without a cross-publication cache', async t => {
+  const f = fixture(undefined, 240); t.after(() => f.close());
+  const has = Map.prototype.has;
+  let lookups = 0;
+  Map.prototype.has = function(key) {
+    if (typeof key === 'string' && key.length > 30000) lookups++;
+    return has.call(this, key);
+  };
+  try { f.snapshot.refresh(); } finally { Map.prototype.has = has; }
+  assert.equal(lookups, 2, 'one workflow-header lookup and one lookup for the repeated project icon');
+  const next = 'data:image/png;base64,' + 'B'.repeat(32000);
+  f.projects.P.icon = next;
+  f.publish();
+  const result = await f.snapshot.read(native);
+  assert.deepEqual(Object.values(result.icons), [next]);
+  assert.equal(result.rows.filter(row => row.kind === 'tab').length, 240);
+});
+
 async function transcript(factory) {
   const f = fixture(factory), values = [];
   const take = async label => values.push([label, JSON.stringify(await f.snapshot.read(native))]);

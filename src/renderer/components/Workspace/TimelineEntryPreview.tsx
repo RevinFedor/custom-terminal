@@ -210,12 +210,14 @@ export function TimelineEntryPreview(props: Props) {
                 <span>{part.kind === 'paste' ? 'Pasted Content' : part.kind === 'image' ? `Image #${part.id || 1}` : part.chip?.label || 'PROMPT'}</span>
               </span>)}
             </div>}
-            {(compact || prompt.text) && <div className={`timeline-preview-prompt-collapsed${prompt.research ? ' timeline-preview-research-collapsed' : ''}`} data-timeline-preview-prompt
+            {(compact || prompt.text) && <div className={`timeline-preview-prompt-collapsed${prompt.research ? ' timeline-preview-research-collapsed' : ''}${compact ? ' timeline-preview-markdown-line' : ''}`} data-timeline-preview-prompt
               role={normal && !compact ? 'button' : undefined} tabIndex={normal && !compact ? 0 : undefined}
               onClick={normal && !compact ? props.onNavigatePrompt : undefined}
               onKeyDown={event => { if (normal && !compact && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); props.onNavigatePrompt(); } }}
               style={normal && !compact ? { cursor: 'pointer' } : undefined}>
-              {compact ? compact.loading ? 'Загружаю compact summary…' : compact.text || 'Compact summary не найден' : prompt.text}
+              {compact ? compact.loading ? 'Загружаю compact summary…'
+                : <Markdown text={compact.text || 'Compact summary не найден'} preview />
+                : prompt.research?.code === null ? <Markdown text={prompt.text} preview /> : prompt.text}
             </div>}
           </>)}
           {preview && <>
@@ -225,7 +227,7 @@ export function TimelineEntryPreview(props: Props) {
               onClick={expanded ? undefined : props.onNavigateAnswer}
               onKeyDown={event => { if (!expanded && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); props.onNavigateAnswer(); } }}
               style={expanded ? undefined : { WebkitLineClamp: responseLines, cursor: 'pointer' }}>
-              {expanded ? <Markdown text={answer} /> : answer}
+              <Markdown text={answer} preview={!expanded} />
             </div>
             {responseLoading && <span className="timeline-preview-load" role="status">Загружаю полный ответ…</span>}
             {responseError && <span className="timeline-preview-load" role="alert">{responseError}</span>}

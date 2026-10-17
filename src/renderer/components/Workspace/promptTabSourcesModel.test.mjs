@@ -3,7 +3,24 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { transformSync } from 'esbuild';
-import { loadPickerPromptCatalog, promptCatalogChangeAffectsTarget, promptRootChoices, togglePromptRoot, tabPromptBindingRequest, validatePromptRootSnapshot } from './promptTabSourcesModel.mjs';
+import { loadPickerPromptCatalog, promptCatalogChangeAffectsTarget, promptRootChoices, promptSourceSearchPath, promptRootForSelectedFolder, togglePromptRoot, tabPromptBindingRequest, validatePromptRootSnapshot } from './promptTabSourcesModel.mjs';
+
+test('source settings show the configured root and fixed docs search folder without rewriting a root named docs',()=>{
+  assert.equal(promptSourceSearchPath('/source/'),'/source/docs');
+  assert.equal(promptSourceSearchPath('/'),'/docs');
+  assert.equal(promptSourceSearchPath({rootPath:'/alias/source'}),'/alias/source/docs');
+  assert.equal(promptSourceSearchPath({rootPath:'/old',path:'/new'}),'/new/docs');
+  assert.equal(promptSourceSearchPath('/source/docs'),'/source/docs/docs');
+  assert.equal(promptSourceSearchPath(''),'');
+});
+
+test('choosing the known docs search folder reuses its registration; an exact registered docs root has priority',()=>{
+  const parent={id:'parent',path:'/source'},docs={id:'docs-root',path:'/source/docs'};
+  assert.equal(promptRootForSelectedFolder({roots:[parent]},'/source/docs/'),parent);
+  assert.equal(promptRootForSelectedFolder({roots:[parent,docs]},'/source/docs'),docs);
+  assert.equal(promptRootForSelectedFolder({roots:[parent]},'/unknown/docs'),undefined);
+  assert.equal(promptRootForSelectedFolder({roots:[{id:'slash',path:'/'}]},'/').id,'slash');
+});
 
 test('migrated picker reads the captured opaque target, never its common execution namespace', async () => {
   const requests = [];
@@ -61,7 +78,8 @@ test('editor retains disabled/missing/removed bindings and sends ordered explici
 test('picker keeps captured insertion targets while source controls live in workflow settings', () => {
   const picker = fs.readFileSync(new URL('./PromptPickerOverlay.tsx', import.meta.url), 'utf8');
   assert.match(picker, /const pickerTabId = contextRequest\?\.tabId \|\| shortcutTarget\?\.tabId/);
-  assert.match(picker, /loadPickerPromptCatalog\(ipcRenderer, \{ tabId: pickerTabId/);
+  assert.match(picker, /const target = \{tabId:pickerTabId,projectId:pickerProjectId,organizationReady\}/);
+  assert.match(picker, /read:\(\) => loadPickerPromptCatalog\(ipcRenderer,target\)/);
   const settings = fs.readFileSync(new URL('../UI/WorkflowSourcesSettings.tsx', import.meta.url), 'utf8');
   assert.doesNotMatch(picker, /data-prompt-tab-sources-action/);
   assert.match(settings, /workflow:tab-roots/);
@@ -84,7 +102,7 @@ function actualSourceActions(invoke, extra = {}) {
   const context={useCallback:callback=>callback,useEffect:()=>{},tabId:'captured-target',workflowId:'W',snapshot,ids:['old'],pending:null,
     generation,lock:operation,alive,ipc:()=>({invoke}),crypto:{randomUUID:()=> 'generated-uuid'},
     useWorkspaceStore:{getState:()=>({tabWorkflowMembership:{'captured-target':{workflowId:'W'}}})},
-    tabPromptBindingRequest,togglePromptRoot,validatePromptRootSnapshot};
+    tabPromptBindingRequest,togglePromptRoot,validatePromptRootSnapshot,promptRootForSelectedFolder};
   const set=(key,variable=key)=>value=>{state[key]=typeof value==='function'?value(state[key]):value;context[variable]=state[key];};
   Object.assign(context,{setBusy:set('busy'),setError:set('error'),setSnapshot:set('snapshot'),setIds:set('rootIds','ids'),setPending:set('pending')});
   const script=transformSync(source.slice(start,end)+'\nglobalThis.actions={openSourceEditor:load,saveTabSources:save,addPromptFolder:add};',{loader:'ts'}).code;
@@ -146,6 +164,40 @@ test('actual Add reuses an existing registration and never changes cwd or create
     sourceSnapshot: { version: 1, revision: 8, roots: [{ id: 'existing', path: '/registered' }] },
   });
   await f.actions.addPromptFolder();
-  assert.deepEqual(requests, [['app:select-directory']]);
+  assert.deepEqual(JSON.parse(JSON.stringify(requests)), [['app:select-directory', {buttonLabel:'Выбрать корень'}]]);
   assert.deepEqual(Array.from(f.state.rootIds), ['old', 'existing']);
+});
+
+test('actual Add of a known docs folder keeps its parent root ID and does not create docs/docs registration',async()=>{
+  const requests=[];
+  const f=actualSourceActions(async(...args)=>{requests.push(args);return '/registered/docs';},{
+    sourceSnapshot:{version:1,revision:8,roots:[{id:'existing',path:'/registered'}]},
+  });
+  await f.actions.addPromptFolder();
+  assert.equal(requests.length,1);
+  assert.equal(requests[0][0],'app:select-directory');
+  assert.deepEqual(Array.from(f.state.rootIds),['old','existing']);
+});
+
+test('actual Save retains an unknown envelope and retries the same exact mutation without selecting another tab',async()=>{
+  const requests=[];
+  const f=actualSourceActions(async(...args)=>{requests.push(args);throw Error('transport outcome unknown');});
+  await f.actions.saveTabSources();
+  const pending=f.state.pending;
+  assert.equal(pending.tabId,'captured-target');
+  assert.equal(pending.expectedRevision,8);
+  await f.actions.saveTabSources();
+  assert.equal(requests.length,2);
+  assert.equal(requests[0][1],requests[1][1]);
+  assert.equal(f.state.pending,pending);
+});
+
+test('actual Add ignores a late native directory choice after its captured target was closed',async()=>{
+  const requests=[];let resolve;
+  const f=actualSourceActions((...args)=>{requests.push(args);return new Promise(done=>{resolve=done;});});
+  const pending=f.actions.addPromptFolder();
+  f.alive.current=false;resolve('/registered/docs');await pending;
+  assert.equal(requests.length,1);
+  assert.equal(requests[0][0],'app:select-directory');
+  assert.deepEqual(f.state.rootIds,['old']);
 });

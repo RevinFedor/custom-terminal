@@ -191,12 +191,14 @@ export type UseOutlineDndOptions<TNode extends OutlineDndNode = OutlineDndNode> 
   outline: TNode[];
   scopeKey?: string;
   getDragSource?: (input: {outline:TNode[];sourceId:OutlineDndId;sessionId:string;
-    pointerId:number;clientX:number;clientY:number;metaKey:boolean}) => false | {
+    pointerId:number;clientX:number;clientY:number;metaKey:boolean;grabOffsetY:number}) => false | {
       rootIds:OutlineDndId[];context?:any;releaseOwnerKey?:string};
   validateDragSource?: (drag:OutlineDndDragState) => boolean;
   externalDrag?: {active?:boolean;ownerKey:string;sourceId:OutlineDndId;pointerId:number;pointerType?:string;
     clientX:number;clientY:number;metaKey?:boolean;sourceRootIds?:OutlineDndId[];sourceContext?:any;rollbackOutline?:TNode[];
     gestureId?:string;
+    /** Optional original sidebar grab, in viewport CSS pixels. Omitted keeps pane centre grab. */
+    grabOffsetY?:number;
     /** Inside adoption RAF, reread physical identity/coordinates without recapturing the frozen source. */
     readCurrentInput?:()=>Readonly<{active:boolean;ownerKey:string;gestureId:string;pointerId:number;clientX:number;clientY:number;metaKey?:boolean}> | null;
     releaseOwner?:'bridge' | 'hook'} | null;
@@ -206,6 +208,7 @@ export type UseOutlineDndOptions<TNode extends OutlineDndNode = OutlineDndNode> 
   onExpansionRequest?: (payload: OutlineDndExpansionPayload) => OutlineDndMaybeAsyncResult;
   onToggle?: (payload: OutlineDndExpansionPayload) => OutlineDndMaybeAsyncResult;
   onLog?: (event: OutlineDndLogEvent) => void;
+  onDiagnostic?: (phase: string, fields: Record<string, unknown>) => void;
   canHorizontalMove?: (
     payload: OutlineDndHorizontalMovePayload<TNode>,
   ) => OutlineDndHorizontalMoveDecision;
@@ -223,6 +226,8 @@ export type UseOutlineDndOptions<TNode extends OutlineDndNode = OutlineDndNode> 
   hierarchyModifier?: 'meta' | null;
   /** Explicit immutable-outline host with its own imperative floating preview. Default publishes every processed frame. */
   pointerPublication?: 'frame' | 'semantic';
+  /** Continuous real-row Y; merge getRowProps().style. X stays semantic. Default off for hosts with their own feedback. */
+  sourceFollow?: 'y' | null;
   verticalRebaseDistance?: number;
   edgeZoneSize?: number;
   edgeScrollStep?: number;

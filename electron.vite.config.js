@@ -1,5 +1,4 @@
 import { defineConfig } from 'electron-vite';
-import { transformWithEsbuild } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { codeInspectorPlugin } from 'code-inspector-plugin';
@@ -8,6 +7,8 @@ import { config } from 'dotenv';
 import { assertNotedShared } from './vendor/noted-shared/build/assert-packages.mjs';
 import { buildWorkflowNativeDrag } from './scripts/build-workflow-native-drag.mjs';
 import { historyVirtuosoMeasurementVitePlugin } from './scripts/lib/history-virtuoso-measurement.mjs';
+import { styleModSameRulesVitePlugin } from './scripts/lib/style-mod-same-rules.mjs';
+import { rendererSharedCjsDevPlugin, rendererSharedCjsIds } from './scripts/lib/renderer-shared-cjs.mjs';
 
 // Load .env so renderer can access env vars at build time
 const env = config({ path: resolve(__dirname, '.env') }).parsed || {};
@@ -60,6 +61,9 @@ renderer: {
       // :5182 instance without attaching to or restarting the wrong renderer.
       host: process.env.NOTED_RENDERER_HOST || 'localhost',
       port: Number(process.env.NOTED_RENDERER_PORT || 5182),
+      // Generated test workspaces can contain intentional symlink loops.
+      // They are not renderer inputs and must not enter Vite's watcher.
+      watch: { ignored: ['**/docs/tmp/**'] },
       fs: { allow: ['.', SHARED_ROOT] }
     },
     build: {
@@ -77,17 +81,9 @@ renderer: {
       }
     },
     plugins: [
+      rendererSharedCjsDevPlugin(__dirname),
       historyVirtuosoMeasurementVitePlugin(),
-      {
-        name: 'terminal-shared-contracts-dev',
-        apply: 'serve',
-        enforce: 'pre',
-        transform(code, id) {
-          if (SHARED_CJS_RE.test(id)) {
-            return transformWithEsbuild(code, id, { loader: 'js', format: 'esm' });
-          }
-        },
-      },
+      styleModSameRulesVitePlugin(),
       // code-inspector-plugin MUST come BEFORE react() — it stamps
       // data-insp-path="src/Foo.tsx:42:6" attributes on every JSX element
       // at compile time. Works in prod via dev:()=>true override. Pure
@@ -137,7 +133,9 @@ renderer: {
       dedupe: ['react', 'react-dom', 'lucide-react', 'react-icons']
     },
     optimizeDeps: {
-      include: ['react', 'react-dom']
+      // A source-only CJS transform exports only default and leaves relative
+      // require calls unresolved. Use Vite's normal CJS interop for DEV too.
+      include: ['react', 'react-dom', ...rendererSharedCjsIds(__dirname)]
     }
   }
 });

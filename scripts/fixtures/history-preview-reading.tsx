@@ -45,14 +45,15 @@ function installTransport() {
   };
 }
 
-export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, composer = false, readerText, payloadGeneration }: { provider?: 'claude' | 'codex'; left?: number; composer?: boolean; readerText?: string; payloadGeneration?: string } = {}) {
+export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, composer = false, readerText, payloadGeneration,
+  tabId: fixedTabId, sessionId: fixedSessionId }: { provider?: 'claude' | 'codex'; left?: number; composer?: boolean; readerText?: string; payloadGeneration?: string; tabId?: string; sessionId?: string } = {}) {
   installTransport();
   // Saved reading anchors survive a DEV restart. Each case needs a new owner,
   // otherwise an earlier test's mid-list position becomes its initial state.
   const id = `preview-e2e-${Date.now().toString(36)}-${++serial}`;
-  const tabId = `${id}-tab`;
+  const tabId = fixedTabId || `${id}-tab`;
   const projectId = `${id}-project`;
-  const sessionId = `${id}-session`;
+  const sessionId = fixedSessionId || `${id}-session`;
   const previewId = `${id}-preview`;
   const canonicalIdentity = `${id}-source`;
   const canonicalUuid = `${id}-canonical`;

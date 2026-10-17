@@ -11,7 +11,7 @@ import {
 
 /** Minimal document stand-in: answers querySelector for a set of markers. */
 const docWith = (...openMarkers) => ({
-  querySelector: (selector) => (openMarkers.includes(selector) ? {} : null),
+  querySelector: (selector) => (selector.split(',').some(part => openMarkers.includes(part.trim())) ? {} : null),
 });
 
 test('a press while a menu is open is a dismissal', () => {
@@ -24,6 +24,13 @@ test('a press with nothing open is a normal click', () => {
   resetDismissalGesture();
   assert.equal(notePointerDownForDismissal(docWith()), false);
   assert.equal(isDismissalGesture(), false);
+});
+
+test('a normal pointer press scans the retained workspace only once', () => {
+  const queries = [];
+  assert.equal(notePointerDownForDismissal({ querySelector(selector) { queries.push(selector); return null; } }), false);
+  assert.equal(queries.length, 1);
+  assert.deepEqual(queries[0].split(','), [...DISMISSIBLE_OVERLAY_SELECTORS]);
 });
 
 test('the guard lasts ONE gesture, not until the next overlay', () => {

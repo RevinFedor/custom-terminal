@@ -158,6 +158,17 @@ PTY, writer/operation proof, подписки, live delivery и мутации �
 SQLite sidecars читаются прежними методами через отдельное соединение без
 startup migrations; точные binding/asset/lineage уведомления возвращаются main.
 
+После saved COW Rewind подготовка должна попасть именно в этот configured worker,
+а не только в Main cache: иначе тот же большой retained prefix строился дважды.
+Main передаёт private committed coordinate/byte witness, не raw JSONL/полный graph;
+worker переиспользует свой exact pre-cut checkpoint и дочитывает остаток теми же
+двумя reducers. Physical source+child/epoch guards остаются, miss/eviction дают
+один обычный canonical rebuild с причиной. Record count не равен physical line
+при пустых строках. Полный потоковый hash записанного ребёнка сохраняет проверку
+append после restart, включая streamed image bytes; hash только дочитанного
+tail её не заменяет. Header/proof hints не выходят в public History receipt и не
+дают writer/inputReady authority. Non-worker reader остаётся поддержан.
+
 На SSD раздельны готовые тела строк с лёгким позиционным индексом, Timeline,
 canonical base rows до sidecars, полные раскрываемые payload и continuation
 обоих парсеров. Это относится и к physical, и к direct-virtual Fork/Rewind.
@@ -472,6 +483,23 @@ event-loop max62.4→19.1мс, cold678→892мс; unchanged0байт. Это о�
   со свежими annotations и последней проверкой текущего resolver/source/lineage.
   Virtual ancestry и cold miss сохраняют полную canonical подготовку; текущий
   stat старого файла не заменяет provenance graph и binding запроса;
+- SOURCE14.10 direct physical Codex turns miss с действующими graph proof/read
+  готовится порциями через `setImmediate`: прежние History feed/finalize, затем
+  Timeline feed/finalize, metadata и полный Main turns/recordMap. Это private
+  one-shot graph запроса, не reuse persistent projector и не новый worker RPC.
+  Цель порции128units/~8ms; неделимый decoder/helper может быть дольше, его время
+  видно отдельно. Полный prefix по-прежнему обрабатывается, общая CPU/RAM работа
+  и снижение production latency этим SOURCE-контролем не подтверждены.
+  Локальный FIFO допускает miss до raw load, после ожидания повторяет cache
+  eligibility; valid warm hit обходит его, ошибка освобождает следующего.
+  Проверки после yield не заменяют финальные fd/stat/resolver/lineage guards.
+  Release очереди выполняется до последнего assert, включая reentrant
+  async_hooks; partial graph не публикуется. Notes/rewind читаются по прежней
+  свежей Main-границе. Virtual/composite/UNKNOWN proof сохраняют canonical
+  fallback. Outer cache192MiB/64 неизменен: один oversized334MB result также
+  вытесняется, поэтому малый unchanged-hit не доказывает такой hit для него.
+  Проверки — immutable original reducers/Main mapper, реальные Node macrotasks,
+  queue/source races и маленькие tempFS; runtime/installed — отдельная приёмка;
 - Timeline, History и Codex presence держат один request в полёте и максимум одну trailing reconciliation. Invalidation, пришедшая во время активного чтения, не считается уже покрытой первым snapshot: watcher запоминает её и запускает ровно одно дополнительное чтение после завершения первого. То же правило действует при смене presence-generation во время IPC: текущий flight сам взводит повторное чтение, иначе спокойная остановленная вкладка навсегда остаётся в `Checking` до remount. Read-only presence берётся из main-owned event projection; тяжёлое process/materialization observation не является UI-refresh endpoint. Удалить trailing или молча отбросить такое событие значит оставить последний append или lifecycle edge невидимым до следующего внешнего изменения;
 - History не держит вторую полную server-entry copy только ради Rewind convergence; для membership достаточен UUID set;
 - повторное открытие History сначала показывает renderer snapshot, а read-сервис проверяет durable revision до parse/projection; unchanged-ответ не переносит полный массив через IPC. Для Codex read-сервис и SSD pages принадлежат worker, для Claude сохраняется прежний main-путь;

@@ -31,6 +31,7 @@ async function fixture(t, options = {}) {
   const events = [];
   let failedOnce = false;
   let validation = 0;
+  let signature = 'ad-hoc';
   const fail = label => {
     if (options.fail === label && !failedOnce) { failedOnce = true; throw new Error('injected ' + label); }
   };
@@ -39,6 +40,8 @@ async function fixture(t, options = {}) {
     const label = command === 'npm' ? args[1] : command === 'bash' ? 'quit' : command === '/usr/bin/open' ? 'open' : command === '/usr/bin/ditto' ? 'copy' : command;
     events.push({ label, args, commandOptions });
     fail(label);
+    if (label === 'build') signature = 'ad-hoc';
+    if (label === 'sign:local-fast') signature = 'Noted Terminal Dev';
     if (label === 'copy') await fs.cp(args[0], args[1], { recursive: true });
     if (label === 'open') events.push({ label: 'opened-version', version: await readVersion(args[0]) });
     if (label === 'quit') options.onQuit?.();
@@ -57,6 +60,7 @@ async function fixture(t, options = {}) {
     const label = ['validate-release', 'validate-stage', 'validate-installed'][validation++];
     events.push({ label, target });
     fail(label);
+    if (options.requireDevSignature) assert.equal(signature, 'Noted Terminal Dev');
     assert.equal(await readVersion(target), 'new prepared bytes');
   };
   const beforeQuit = async data => {
@@ -83,6 +87,13 @@ test('prepare/sign/integrations and staged validation precede quit; old app is r
   assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
   assert.equal(await f.readVersion(result.previousApp), 'old installed bytes');
   await assert.rejects(fs.stat(path.join(f.applicationsDir, '.noted-terminal-install-lock')), { code: 'ENOENT' });
+});
+
+test('portable ad-hoc output is signed for the existing install identity before validation', async t => {
+  const f = await fixture(t, { requireDevSignature: true });
+  const result = await f.execute();
+  assert.equal(result.ok, true);
+  assert.equal(f.events.filter(event => event.label === 'sign:local-fast').length, 1);
 });
 
 for (const failure of [...PREPARE_SCRIPTS, 'validate-release', 'copy', 'validate-stage', 'idle-ack']) {

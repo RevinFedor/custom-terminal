@@ -92,10 +92,14 @@ async function harness({ toolType = 'codex', status = 'active', sessionId = 'A',
       if (afterStartupGate) current = { ...current, ...afterStartupGate };
     },
   };
+  const { ipcRenderer, fence } = (await import('./agentLaunchFixture.mjs')).createLaunchFixture();
+  const { rememberAgentLaunchFence } = await import('./agentLaunchFence.mjs');
+  rememberAgentLaunchFence('tab', fence);
   const context = vm.createContext({
     manualActionContract: require('../../shared/agent-manual-action.cjs'),
     console: { log() {}, warn() {} }, setTimeout, clearTimeout,
-    ipcRenderer: { on() {}, removeListener() {} },
+    ipcRenderer, AbortController,
+    ...(await import('./agentLaunchAdmission.mjs')),
     terminalRegistry: { get: () => hidden ? null : ({}), getDraftDiagnosticSnapshot: () => ({}) },
     isCoordinatedAgentSendCancellationRequested: () => false,
     getCoordinatedAgentSendCancellation: () => null,

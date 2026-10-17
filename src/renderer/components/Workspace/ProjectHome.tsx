@@ -494,6 +494,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     favorites: number;
   } | null>(null);
   const loadSeqRef = useRef(0);
+  const expiredHistoryIdsRef = useRef(new Set<number>());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set(['This Month', 'Older']));
   // OSC 133 event-driven process status — mirror of TabBar's subscription. Used
   // to render the same green/red status dot on Active cards that the real
@@ -681,8 +682,19 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       )));
     };
     ipcRenderer.on('tab-history:message-count-updated', handleMessageCountUpdated);
+    const handleExpired = (_event:unknown, payload:{historyIds?:number[]}) => {
+      const ids = new Set(payload?.historyIds || []);
+      if (ids.size) {
+        for (const id of ids) expiredHistoryIdsRef.current.add(id);
+        setHistory(previous => previous.filter(entry => !ids.has(entry.id)));
+        setIterationResults(previous => previous.filter(entry => !ids.has(entry.id)));
+        setSelectedPreview(previous => previous && ids.has(previous.entry.id) ? null : previous);
+      }
+    };
+    ipcRenderer.on('tab-history:expired', handleExpired);
     return () => {
       ipcRenderer.removeListener('tab-history:message-count-updated', handleMessageCountUpdated);
+      ipcRenderer.removeListener('tab-history:expired', handleExpired);
     };
   }, []);
 
@@ -886,7 +898,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     }
     (ipcRenderer.invoke('project:get-tab-history', { projectId }) as Promise<TabHistoryEntry[]>).then((h) => {
       if (cancelled) return;
-      const historyRows = h || [];
+      const historyRows = (h || []).filter(row => !expiredHistoryIdsRef.current.has(row.id));
       const ipcMs = performance.now() - startedAt;
       console.warn(
         `[Perf:Home] ready project=${projectId.slice(-12)} loadId=${loadId} firstLoad=${firstLoadForProject}` +
@@ -1419,7 +1431,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       });
       if (res?.success) {
         setIterationQuery(query);
-        setIterationResults(res.data || []);
+        setIterationResults((res.data || []).filter((row:IterationSearchResult) => !expiredHistoryIdsRef.current.has(row.id)));
         setVisibleRange({ startIndex: 0, endIndex: 0 });
       } else {
         setIterationSearchError(res?.error || 'Iteration search failed');

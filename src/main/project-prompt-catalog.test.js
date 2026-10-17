@@ -1,3 +1,4 @@
+const prepared = require('./project-prompt-catalog.test-support.cjs');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -20,7 +21,7 @@ function createDb(project, sourceRoots) {
   };
 }
 
-test('catalog groups sources alphabetically and follows the shared sidebar order', t => {
+test('catalog groups sources alphabetically and follows the shared sidebar order', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'project-prompts-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const agar = path.join(root, 'Agaratech');
@@ -40,16 +41,16 @@ test('catalog groups sources alphabetically and follows the shared sidebar order
     visualParentByPath: {},
   }]]);
   const service = new ProjectPromptCatalogService({
-    db: createDb(project, [uauth, agar]),
+    db: createDb(project, [uauth, agar]), authorityFence: prepared.controlledFence(project),
     layoutStore: { get: sourceRoot => ({ layout: layouts.get(sourceRoot) || {} }) },
     watch: false,
   });
 
-  const catalog = service.listProject(project.id, { force: true });
+  const catalog = await prepared.project(service, project.id);
   assert.deepEqual(catalog.sources.map(source => source.sourceName), ['Agaratech', 'UAuth']);
   assert.deepEqual(catalog.prompts.map(prompt => prompt.title), ['second', 'first', 'auth']);
   assert.deepEqual(catalog.prompts.map(prompt => prompt.sourceName), ['Agaratech', 'Agaratech', 'UAuth']);
-  assert.deepEqual(service.usageForRoot(agar), [{
+  assert.deepEqual((await prepared.usage(service, agar)), [{
     path: first,
     projects: [{ id: 'p1', name: 'Demo', icon: null }],
   }, {
@@ -89,26 +90,26 @@ function tabFixture(t, { watch = false } = {}) {
     getProjectById: () => null,
     getProjectsWithPromptSources: () => { throw new Error('must not consult active Projects'); },
   };
-  const service = new ProjectPromptCatalogService({ db, rootRegistry: registry, fsImpl, watch, onChanged: value => changes.push(value) });
+  const service = new ProjectPromptCatalogService({ db, rootRegistry: registry, fsImpl, asyncFs: fs.promises, authorityFence: prepared.controlledFence(registry), watch, onChanged: value => changes.push(value) });
   t.after(() => service.close());
   return { base, a, b, source, bindings, calls, registry, changes, watches, service };
 }
 
-test('tab catalogs remain exact even for tabs sharing a legacy namespace and preserve stable prompt ids', t => {
+test('tab catalogs remain exact even for tabs sharing a legacy namespace and preserve stable prompt ids', async t => {
   const { a, bindings, service } = tabFixture(t);
-  const first = service.listTab('opaque:a');
+  const first = (await prepared.tab(service, 'opaque:a'));
   assert.deepEqual(first.prompts.map(p => p.title), ['first']);
-  assert.deepEqual(service.listTab('opaque:b').prompts.map(p => p.title), ['second']);
-  assert.deepEqual(service.listTab('empty').prompts, []);
-  assert.equal(service.listTab('opaque:a'), first, 'same exact-tab cache entry');
-  assert.notEqual(service.listTab('archive-only'), first, 'no namespace cache union');
+  assert.deepEqual((await prepared.tab(service, 'opaque:b')).prompts.map(p => p.title), ['second']);
+  assert.deepEqual((await prepared.tab(service, 'empty')).prompts, []);
+  assert.deepEqual((await prepared.tab(service, 'opaque:a')).prompts, first.prompts, 'same prepared source, detached exact-tab projection');
+  assert.notEqual((await prepared.tab(service, 'archive-only')), first, 'no namespace cache union');
   assert.equal(first.prompts[0].id, scanSource({ projectId: 'original-ns', rootPath: a }).prompts[0].id);
   bindings.set('opaque:a', []);
-  assert.deepEqual(service.listTab('opaque:a').prompts, [], 'explicit empty is observed without waiting for TTL');
-  assert.deepEqual(service.usageForRoot(a)[0].tabs.map(tab => tab.id), ['archive-only']);
+  assert.deepEqual((await prepared.tab(service, 'opaque:a')).prompts, [], 'explicit empty is observed without waiting for TTL');
+  assert.deepEqual((await prepared.usage(service, a))[0].tabs.map(tab => tab.id), ['archive-only']);
 });
 
-test('disabled, removed, missing sources remain readable and bound but only enabled sources scan', t => {
+test('disabled, removed, missing sources remain readable and bound but only enabled sources scan', async t => {
   const { a, b, base, source, bindings, service } = tabFixture(t);
   bindings.set('opaque:a', [
     source(a, 'ra'), source(b, 'rb', false),
@@ -117,14 +118,14 @@ test('disabled, removed, missing sources remain readable and bound but only enab
   ]);
   assert.equal(service.getTabSources('opaque:a').length, 4);
   assert.equal(service.getTabSources('opaque:a')[3].exists, false);
-  const catalog = service.listTab('opaque:a');
+  const catalog = (await prepared.tab(service, 'opaque:a'));
   assert.deepEqual(catalog.prompts.map(p => p.title), ['first']);
   assert.equal(catalog.sources.length, 2);
   assert.equal(catalog.sources.find(s => s.rootId === 'missing').exists, false);
   assert.equal(catalog.sources[0].rootId, 'missing');
 });
 
-test('tab scans retain configured spelling, explorer order, labels and skip hidden/symlink branches', t => {
+test('tab scans retain configured spelling, explorer order, labels and skip hidden/symlink branches', async t => {
   const { a, b, base, source, bindings, service } = tabFixture(t);
   const alias = path.join(base, 'alias');
   fs.symlinkSync(a, alias);
@@ -137,16 +138,16 @@ test('tab scans retain configured spelling, explorer order, labels and skip hidd
     orderByParent: { [path.join(alias, 'docs')]: [zed, first] }, visualParentByPath: {},
   } : {} }) };
   bindings.set('opaque:a', [source(alias, 'alias'), source(b, 'rb')]);
-  const catalog = service.listTab('opaque:a');
+  const catalog = (await prepared.tab(service, 'opaque:a'));
   assert.deepEqual(catalog.prompts.map(p => p.title), ['zed', 'first', 'second']);
   assert.equal(catalog.prompts[1].sourceRoot, alias);
   bindings.set('opaque:a', [source(a, 'ra'), source(b, 'rb')]);
-  const labels = service.listTab('opaque:a').sources.map(s => s.sourceName);
+  const labels = (await prepared.tab(service, 'opaque:a')).sources.map(s => s.sourceName);
   assert.ok(labels.every(label => label.startsWith('Prompts · ')));
   assert.notEqual(labels[0], labels[1]);
 });
 
-test('source mutation validates overlap and delegates exact CAS request without altering provenance', t => {
+test('source mutation validates overlap and delegates exact CAS request without altering provenance', async t => {
   const { a, service, registry, calls, changes } = tabFixture(t);
   const request = { mutationId: 'm1', expectedRevision: 7, tabId: 'opaque:a', rootIds: ['rb'] };
   assert.equal(service.setTabSources(request).revision, 8);
@@ -161,7 +162,7 @@ test('source mutation validates overlap and delegates exact CAS request without 
   assert.equal(changes.length, 1, 'failed CAS must not publish a success');
 });
 
-test('an old committed CAS replay reaches the registry receipt despite later overlapping paths', t => {
+test('an old committed CAS replay reaches the registry receipt despite later overlapping paths', async t => {
   const { a, service, registry, calls } = tabFixture(t);
   registry.read = () => ({ version: 1, revision: 8, roots: [{ id: 'ra', path: a }, { id: 'rb', path: path.join(a, 'docs') }] });
   const request = { mutationId: 'already-committed', expectedRevision: 7, tabId: 'opaque:a', rootIds: ['ra', 'rb'] };
@@ -169,43 +170,32 @@ test('an old committed CAS replay reaches the registry receipt despite later ove
   assert.equal(calls[0], request);
 });
 
-test('watchers include archived-only bindings and unbound registrations and invalidate exact consumers', t => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { a, b, base, source, bindings, registry, watches, changes, service } = tabFixture(t, { watch: true });
-  const unbound = path.join(base, 'unbound');
-  fs.mkdirSync(unbound);
+test('watchers include archived-only bindings and unbound registrations and invalidate exact consumers', async t => {
+  const { a, base, source, bindings, registry, watches, changes, service } = tabFixture(t, { watch: true });
+  const unbound = path.join(base, 'unbound'); fs.mkdirSync(unbound);
   registry.read = () => ({ roots: [{ id: 'unbound', path: unbound }] });
-  bindings.delete('opaque:a');
-  bindings.delete('opaque:b');
-  service.refreshWatchers();
+  bindings.delete('opaque:a'); bindings.delete('opaque:b');
+  await service.prepared.reconcile();
+  const before = await prepared.tab(service, 'archive-only');
   assert.ok(watches.has(unbound));
-  assert.equal(watches.get(path.join(b, 'docs')).closed, true);
-  const before = service.listTab('archive-only');
   fs.writeFileSync(path.join(a, 'docs', 'new.prompt.md'), 'new');
-  watches.get(path.join(a, 'docs')).callback();
-  t.mock.timers.tick(180);
-  assert.deepEqual(changes.at(-1).tabIds, ['archive-only']);
-  assert.notEqual(service.listTab('archive-only'), before);
-  assert.deepEqual(service.listTab('archive-only').prompts.map(p => p.title), ['first', 'new']);
+  watches.get(path.join(a, 'docs')).callback('rename', null);
+  const after = await prepared.tab(service, 'archive-only');
+  assert.deepEqual(after.prompts.map(p => p.title), ['first', 'new']);
+  assert.notEqual(after.prompts, before.prompts);
+  assert.ok(changes.some(p => p.reason === 'catalog-preparing' && (!p.tabIds || p.tabIds.includes('archive-only'))));
   bindings.set('empty', [source(unbound, 'unbound')]);
-  service.refreshWatchers();
-  fs.mkdirSync(path.join(unbound, 'docs'));
-  watches.get(unbound).callback();
-  t.mock.timers.tick(180);
-  assert.ok(watches.has(path.join(unbound, 'docs')), 'root watch follows docs creation');
-  assert.equal(watches.get(unbound).closed, true);
-  const missing = path.join(base, 'missing');
-  bindings.set('missing-tab', [source(missing, 'missing')]);
-  assert.deepEqual(service.listTab('missing-tab').prompts, []);
-  fs.mkdirSync(path.join(missing, 'docs'), { recursive: true });
-  fs.writeFileSync(path.join(missing, 'docs', 'back.prompt.md'), 'back');
-  assert.deepEqual(service.listTab('missing-tab').prompts.map(p => p.title), ['back']);
-  assert.ok(watches.has(path.join(missing, 'docs')), 'reappearing root attaches when read without an active Project');
-  service.close();
-  assert.equal(watches.get(path.join(a, 'docs')).closed, true);
+  await prepared.tab(service, 'empty');
+  fs.mkdirSync(path.join(unbound, 'docs')); watches.get(unbound).callback('rename', 'docs');
+  await prepared.tab(service, 'empty'); assert.ok(watches.has(path.join(unbound, 'docs')));
+  const missing = path.join(base, 'missing'); bindings.set('missing-tab', [source(missing, 'missing')]);
+  assert.deepEqual((await prepared.tab(service, 'missing-tab')).prompts, []);
+  fs.mkdirSync(path.join(missing, 'docs'), { recursive: true }); fs.writeFileSync(path.join(missing, 'docs', 'back.prompt.md'), 'back');
+  assert.deepEqual((await prepared.tab(service, 'missing-tab')).prompts.map(p => p.title), ['back']);
+  service.close(); assert.equal(watches.get(path.join(a, 'docs')).closed, true);
 });
 
-test('rejects overlapping source roots for one project', t => {
+test('rejects overlapping source roots for one project', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'project-prompts-overlap-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const child = path.join(root, 'child');

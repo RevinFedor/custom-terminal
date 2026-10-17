@@ -9,7 +9,9 @@ import { validateAsarArchive } from './validate-app-asar.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const APP_NAME = 'Noted Terminal.app';
-export const PREPARE_SCRIPTS = ['build:markdown', 'build:mobile', 'build', 'install:terminal-mcp', 'install:claude-hook'];
+// The portable build produces an ad-hoc bundle. The installed maintainer build
+// needs the stable local certificate before release/staging validation and quit.
+export const PREPARE_SCRIPTS = ['build:markdown', 'build:mobile', 'build', 'sign:local-fast', 'install:terminal-mcp', 'install:claude-hook'];
 export const INSTALL_READY_PREFIX = '[NotedInstall:ready-to-quit] ';
 export const INSTALL_RESULT_PREFIX = '[NotedInstall:result] ';
 

@@ -4,7 +4,7 @@
   "description": "macOS workspace for persistent Claude Code and Codex sessions, history and agent collaboration",
   "main": "dist/main/main.js",
   "scripts": {
-    "dev": "NOTED_WEB_PORT=7979 electron-vite dev",
+    "dev": "node scripts/prepare-node-pty-write-trace.mjs && NOTED_WEB_PORT=7979 electron-vite dev",
     "dev:d": "cd design-lab && npm run dev",
     "build": "npm run build:app",
     "build:install": "node scripts/build-install-noted-terminal.mjs",

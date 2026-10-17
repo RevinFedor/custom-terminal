@@ -32,6 +32,8 @@ export interface ClipboardItemLike {
 export interface ClipboardAdapter {
   /** Read plain text from the clipboard. May be sync (Electron) or async (web). */
   readText: () => Promise<string> | string
+  /** Optional HTML from the same host clipboard transport. */
+  readHTML?: () => Promise<string> | string
   /** Write plain text to the clipboard. May be sync (Electron) or async (web). */
   writeText: (text: string) => Promise<void> | void
   /**

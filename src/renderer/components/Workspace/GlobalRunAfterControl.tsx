@@ -653,9 +653,14 @@ export function GlobalRunAfterControl() {
   const sidebarWidth = useUIStore((state) => state.tabSidebarWidth);
   const policy = useAutoCompactStore((state) => state.policy);
   const activities = useAutoCompactStore((state) => state.activities);
-  const inventory = useAutomationInventory();
-  const busy = useAutomationBusyTabs();
   const queues = usePromptQueueStore((state) => state.queues);
+  const visible = mode !== 'hidden';
+  const summaryTabIds = useMemo(() => visible ? null : new Set([
+    ...[...queues].filter(([,queue])=>!!queue && hasPendingPromptQueueContinuation(queue)).map(([id])=>id),
+    ...Object.entries(activities).filter(([,activity])=>activity?.phase==='compacting').map(([id])=>id),
+  ]),[visible,queues,activities]);
+  const inventory = useAutomationInventory(summaryTabIds);
+  const busy = useAutomationBusyTabs();
   const activeCount = inventory.tabs.filter((tab) => {
     const queue = queues.get(tab.id);
     return !!queue && hasPendingPromptQueueContinuation(queue);
@@ -664,7 +669,6 @@ export function GlobalRunAfterControl() {
     () => summarizeRunningAutoCompacts(activities, inventory.tabs),
     [activities, inventory.tabs],
   );
-  const visible = mode !== 'hidden';
   const fittedWidth = Math.min(position.width, Math.max(minimumWidth, contentWidth ?? position.width));
   const closePanel = useCallback((reason?: 'outside', immediate = false) => {
     // Hover dismissal is an editor exit too. Blur fields before unmount so

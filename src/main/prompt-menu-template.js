@@ -42,9 +42,12 @@ function buildGlobalPromptRows(prompts, groups, onPick) {
   return rows;
 }
 
-function buildPromptMenuTemplate({ prompts = [], groups = [], projectCatalog = null, onPick }) {
+function buildPromptMenuTemplate({ prompts = [], groups = [], projectCatalog = null, projectCatalogState = null, onPick }) {
   const rows = [];
-  if ((projectCatalog?.project || projectCatalog?.tabId) && projectCatalog.prompts?.length > 0) {
+  if (projectCatalogState && projectCatalogState.status !== 'ready') {
+    const label = projectCatalogState.label || projectCatalog?.project?.name || 'Документы вкладки';
+    rows.push({label:label + (projectCatalogState.status === 'failed' ? ' · Недоступны' : ' · Подготавливаются…'),enabled:false});
+  } else if ((projectCatalog?.project || projectCatalog?.tabId) && projectCatalog.prompts?.length > 0) {
     rows.push({
       label: projectCatalog.project?.name || 'Документы вкладки',
       submenu: buildProjectPromptRows(projectCatalog, onPick),

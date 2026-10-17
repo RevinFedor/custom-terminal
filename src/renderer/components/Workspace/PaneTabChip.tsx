@@ -216,6 +216,15 @@ export default function PaneTabChip({
         // special project-following path anymore.
         e.stopPropagation();
         if (renaming) return;
+        // The first click already navigated. A plain second click belongs to
+        // rename; repeating activation delays its input and requests composer
+        // focus just before the name editor mounts.
+        if (e.detail > 1 && tabType !== 'file'
+          && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+          setPressed(false);
+          setPointerHeld(false);
+          return;
+        }
         // Bare Cmd+click removes exactly this chip, like middle-click. Keep
         // combined shortcuts available to the pane-focus gesture below.
         if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {

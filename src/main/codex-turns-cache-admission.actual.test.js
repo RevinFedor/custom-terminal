@@ -11,6 +11,7 @@ const { SessionTranscriptService } = require('./session-transcript-service');
 const { HistoryReadClient } = require('./history-read-client');
 const { _api: actual } = require('./ipc/codex-data');
 const { createCausalContext } = require('./perf-causal-context');
+const projection = require('./codex-turns-projection');
 const { beginHistoryReadDiagnostic } = require('./history-read-memory-diagnostics');
 function preparedDiagnostic(callback = () => {}) {
   const diagnostic = beginHistoryReadDiagnostic('session-turns');
@@ -63,7 +64,7 @@ async function fixture(t) {
   assert.equal(fs.statSync(fileA).mtimeMs, fs.statSync(fileB).mtimeMs);
   assert.ok(fs.statSync(fileA).size < 16 * 1024, 'fixture stays small');
   const f = { root, sid, fileA, fileB, file: fileA, hooks: {}, notes: [], rewinds: [],
-    counts: { loads: 0, full: 0, timeline: 0, operation: 0 }, files: [fileA, fileB] };
+    counts: { loads: 0, full: 0, timeline: 0, operation: 0 }, controls: [], files: [fileA, fileB] };
   const api = f.api = { ...actual,
     findCodexSessionFile: async (id, cwd) => {
       const value = id === sid ? { filePath: f.file } : null;
@@ -79,6 +80,12 @@ async function fixture(t) {
     },
     buildCodexFullHistory: (...args) => { f.counts.full++; const value = actual.buildCodexFullHistory(...args); f.hooks.full?.(); return value; },
     buildCodexTimeline: (...args) => { f.counts.timeline++; return actual.buildCodexTimeline(...args); },
+    buildCodexFullHistoryCooperatively: async (...args) => {
+      f.counts.full++; const value = await actual.buildCodexFullHistoryCooperatively(...args); f.hooks.full?.(); return value;
+    },
+    buildCodexTimelineCooperatively: (...args) => {
+      f.counts.timeline++; return actual.buildCodexTimelineCooperatively(...args);
+    },
     beginCodexSourceRead: async (...args) => {
       const value = await actual.beginCodexSourceRead(...args); await f.hooks.begin?.(value); return value;
     },
@@ -101,7 +108,13 @@ async function fixture(t) {
   const load = service.loadCodexOperationSource.bind(service);
   service.loadCodexOperationSource = args => { f.counts.operation++; return load(args); };
   const perf = f.perf = createCausalContext();
-  const context = f.context = vm.createContext({ require: id => (
+  const context = f.context = vm.createContext({ require: id => id === path.join(__dirname, 'codex-turns-projection')
+    ? { ...projection, createProjectionControl(options) {
+      const control = projection.createProjectionControl({ ...options, ...f.hooks.control,
+        schedule: async () => { await f.hooks.yield?.(control); await new Promise(resolve => setImmediate(resolve)); } });
+      f.controls.push(control);
+      return control;
+    } } : (
     process.env.NOTED_CODEX_TURNS_ADMISSION_SOURCE && id === path.join(__dirname, 'codex-turns-cache-admission')
       ? require(process.env.NOTED_CODEX_TURNS_ADMISSION_SOURCE) : require(id)
   ), path, fs, srcMainDir: __dirname,

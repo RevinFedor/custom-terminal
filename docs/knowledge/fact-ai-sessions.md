@@ -61,6 +61,11 @@ file/browser без процесса и archived provenance не получаю�
 subject, token/generation/run/input и process identity. Unknown lookup и поздний
 replacement сохраняют процесс; частичный отказ возвращается отдельно по цели.
 
+Для native Claude/Codex дочерняя работа включает собственный Main background
+registry, не только MCP inherited projection: `turnBusy=false` родителя при
+положительном `getCombinedTabBackgroundWorkCount` не разрешает `idle` Stop.
+Явный `all`/ручной Stop сохраняет прежнее право завершить работающий процесс.
+
 PTY Claude/Codex/Gemini использует прежний сериализованный Stop/graceful/escalation
 и сохраняет shell/историю; script — прежний deterministic Stop без Restart.
 SDK — прежний hard Stop query, включая background tasks, а не soft interrupt

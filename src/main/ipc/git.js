@@ -2,10 +2,12 @@ const { ipcMain, shell } = require('electron');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { performance } = require('node:perf_hooks');
 const { callGeminiApi } = require('./gemini-api');
 const { buildChildProcessEnv } = require('../child-process-env');
 const { createGitStatusCoordinator } = require('./git-status-coordinator');
 const { causal } = require('../perf-causal-context');
+const { validGitDiffRequestId, stableGitPathIdentity, measureGitDiffText } = require('./git-diff-diagnostics.cjs');
 let diagnosticGitSequence = 0;
 
 const GIT_TIMEOUT_MS = 90 * 1000;
@@ -1077,13 +1079,20 @@ function register({ projectManager }) {
     }
   });
 
-  ipcMain.handle('git:commit-details', async (event, { projectPath, hash, filePath }) => {
+  ipcMain.handle('git:commit-details', async (event, request) => {
+    const { projectPath, hash, filePath } = request || {};
+    const requestId = validGitDiffRequestId(request?.__perfRid);
+    const startedAt = performance.now();
+    let metaMs = 0, bodyMs = 0, diffMs = 0, numstatMs = 0;
     try {
+      const rootStarted = performance.now();
       const root = await getRepoRoot(projectPath);
+      const rootMs = performance.now() - rootStarted;
       if (!root) throw new Error('Not a Git repository');
       const commitHash = String(hash || '').trim();
       if (!commitHash) throw new Error('Commit hash is required');
 
+      let stageStarted = performance.now();
       const meta = await runGit(root, [
         '-c', 'core.quotepath=false',
         'show',
@@ -1094,9 +1103,12 @@ function register({ projectManager }) {
         '--no-ext-diff',
         commitHash,
       ], { maxBuffer: GIT_MAX_BUFFER });
+      metaMs = performance.now() - stageStarted;
       if (!meta.success) throw new Error(meta.stderr || meta.error || 'git show failed');
       const details = parseCommitNameStatus(meta.stdout);
+      stageStarted = performance.now();
       const body = await runGit(root, ['show', '-s', '--format=%B', commitHash], { maxBuffer: GIT_MAX_BUFFER });
+      bodyMs = performance.now() - stageStarted;
       const commitDescription = body.success ? commitDescriptionFromBody(body.stdout, details.subject) : '';
       const requestedPath = String(filePath || '').trim();
       const activeFile = details.files.find((file) => file.path === requestedPath)
@@ -1112,16 +1124,30 @@ function register({ projectManager }) {
         commitHash,
       ];
       if (activeFile?.path) diffArgs.push('--', activeFile.path);
+      stageStarted = performance.now();
       const diffResult = await runGit(root, diffArgs, { maxBuffer: GIT_MAX_BUFFER });
+      diffMs = performance.now() - stageStarted;
       const diffText = diffResult.success ? diffResult.stdout : '';
       const limited = trimText(diffText, MAX_PREVIEW_DIFF_CHARS);
 
+      stageStarted = performance.now();
       const numstat = await runGit(root, ['show', '--format=', '--numstat', commitHash], { maxBuffer: GIT_MAX_BUFFER });
+      numstatMs = performance.now() - stageStarted;
       const stats = numstat.success ? parseNumstat(numstat.stdout) : diffStats(limited.text);
       const fileStats = diffStats(limited.text);
 
+      const diffMetrics = measureGitDiffText(limited.text);
+      diffMetrics.pathHash = stableGitPathIdentity(activeFile?.path || requestedPath);
+      if (requestId) console.warn('[GitDiffTrace] ' + JSON.stringify({ requestId, channel: 'git:commit-details',
+        phase: 'main-return', pathHash: diffMetrics.pathHash,
+        rootLifetimeMs: +rootMs.toFixed(1), metaLifetimeMs: +metaMs.toFixed(1), bodyLifetimeMs: +bodyMs.toFixed(1),
+        diffLifetimeMs: +diffMs.toFixed(1), numstatLifetimeMs: +numstatMs.toFixed(1),
+        handlerLifetimeMs: +(performance.now() - startedAt).toFixed(1), ...diffMetrics, truncated: limited.truncated }));
+
       return {
         success: true,
+        diagnosticRequestId: requestId,
+        diagnosticMetrics: diffMetrics,
         hash: details.hash,
         shortHash: details.shortHash,
         author: details.author,
@@ -1138,7 +1164,10 @@ function register({ projectManager }) {
         totalDeletions: stats.deletions,
       };
     } catch (error) {
-      return { success: false, error: error.message };
+      if (requestId) console.warn('[GitDiffTrace] ' + JSON.stringify({ requestId, channel: 'git:commit-details',
+        phase: 'main-error', elapsedLifetimeMs: +(performance.now() - startedAt).toFixed(1),
+        errorKind: error?.name || 'Error' }));
+      return { success: false, diagnosticRequestId: requestId, error: error.message };
     }
   });
 
@@ -1229,21 +1258,34 @@ function register({ projectManager }) {
     }
   });
 
-  ipcMain.handle('git:file-diff', async (event, { projectPath, filePath }) => {
+  ipcMain.handle('git:file-diff', async (event, request) => {
+    const { projectPath, filePath } = request || {};
+    const requestId = validGitDiffRequestId(request?.__perfRid);
+    const startedAt = performance.now();
+    let rootMs = 0, statusMs = 0, stagedMs = 0, unstagedMs = 0, untrackedMs = 0;
     try {
+      let stageStarted = performance.now();
       const root = await getRepoRoot(projectPath);
+      rootMs = performance.now() - stageStarted;
       if (!root) throw new Error('Not a Git repository');
       const relPath = String(filePath || '').trim();
       if (!relPath) throw new Error('File path is required');
+      stageStarted = performance.now();
       const status = await getStatusForRoot(root);
+      statusMs = performance.now() - stageStarted;
       const file = status.files.find((item) => item.path === relPath) || null;
       const argsSuffix = ['--', relPath];
+      stageStarted = performance.now();
       const staged = await runGit(root, ['diff', '--cached', '--color=never', '--find-renames', ...argsSuffix], { maxBuffer: GIT_MAX_BUFFER });
+      stagedMs = performance.now() - stageStarted;
+      stageStarted = performance.now();
       const unstaged = await runGit(root, ['diff', '--color=never', '--find-renames', ...argsSuffix], { maxBuffer: GIT_MAX_BUFFER });
+      unstagedMs = performance.now() - stageStarted;
       const sections = [];
       if (staged.success && staged.stdout.trim()) sections.push(staged.stdout.trim());
       if (unstaged.success && unstaged.stdout.trim()) sections.push(unstaged.stdout.trim());
       if (!sections.length && file?.xy === '??') {
+        stageStarted = performance.now();
         const preview = await buildUntrackedPreviewDiff(root, relPath).catch((error) => {
           return [
             'diff --git a/' + relPath + ' b/' + relPath,
@@ -1253,13 +1295,23 @@ function register({ projectManager }) {
             '[Read failed: ' + error.message + ']',
           ].join('\n') + '\n';
         });
+        untrackedMs = performance.now() - stageStarted;
         if (preview.trim()) sections.push(preview.trim());
       }
       const joined = sections.join('\n\n');
       const limited = trimText(joined, MAX_PREVIEW_DIFF_CHARS);
       const stats = diffStats(limited.text);
+      const diffMetrics = measureGitDiffText(limited.text);
+      diffMetrics.pathHash = stableGitPathIdentity(relPath);
+      if (requestId) console.warn('[GitDiffTrace] ' + JSON.stringify({ requestId, channel: 'git:file-diff',
+        phase: 'main-return', pathHash: diffMetrics.pathHash, rootLifetimeMs: +rootMs.toFixed(1),
+        statusLifetimeMs: +statusMs.toFixed(1), stagedLifetimeMs: +stagedMs.toFixed(1),
+        unstagedLifetimeMs: +unstagedMs.toFixed(1), untrackedLifetimeMs: +untrackedMs.toFixed(1),
+        handlerLifetimeMs: +(performance.now() - startedAt).toFixed(1), ...diffMetrics, truncated: limited.truncated }));
       return {
         success: true,
+        diagnosticRequestId: requestId,
+        diagnosticMetrics: diffMetrics,
         file,
         diff: limited.text,
         truncated: limited.truncated,
@@ -1267,7 +1319,10 @@ function register({ projectManager }) {
         deletions: stats.deletions,
       };
     } catch (error) {
-      return { success: false, error: error.message };
+      if (requestId) console.warn('[GitDiffTrace] ' + JSON.stringify({ requestId, channel: 'git:file-diff',
+        phase: 'main-error', elapsedLifetimeMs: +(performance.now() - startedAt).toFixed(1),
+        errorKind: error?.name || 'Error' }));
+      return { success: false, diagnosticRequestId: requestId, error: error.message };
     }
   });
 

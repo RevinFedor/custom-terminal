@@ -1,0 +1,13 @@
+/* Message reference feedback belongs to the hovered/focused chip. */
+.cm-terminal-message--navigate {
+  color: #c4b5fd !important;
+  border-color: #8b5cf6;
+  background: rgba(139, 92, 246, .16);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.cm-terminal-message--navigate .cm-composer-token-label { text-decoration: underline; }
+.cm-terminal-message-details button {
+  color: #c4b5fd !important; background: #24212b; border: 1px solid #655380;
+  border-radius: 6px; padding: 5px 9px; cursor: pointer; margin-right: 8px;
+}

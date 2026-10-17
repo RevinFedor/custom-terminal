@@ -1,5 +1,5 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { Profiler, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import {
@@ -37,6 +37,9 @@ import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
 import ControlHint from '../UI/ControlHint';
+import { currentUIActionId } from '../../utils/uiPerformanceDiagnostics.mjs';
+import { acceptsGitDiffResultGeneration, bindGitDiffDiagnosticResponse,
+  nextGitDiffDiagnosticId } from '../../utils/gitDiffRequestDiagnostics.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -179,8 +182,13 @@ type GitCommitDetails = {
   totalAdditions: number;
   totalDeletions: number;
   truncated?: boolean;
+  diagnosticRequestId?: string | null;
+  diagnosticActionId?: string | null;
+  diagnosticMetrics?: GitDiffDiagnosticMetrics;
   error?: string;
 };
+
+type GitDiffDiagnosticMetrics = { chars: number; utf8Bytes: number; lines: number; pathHash: string | null };
 
 type GitBranchInfo = {
   name: string;
@@ -220,6 +228,9 @@ type GitFileDiff = {
   additions: number;
   deletions: number;
   truncated?: boolean;
+  diagnosticRequestId?: string | null;
+  diagnosticActionId?: string | null;
+  diagnosticMetrics?: GitDiffDiagnosticMetrics;
   error?: string;
 };
 
@@ -744,6 +755,7 @@ export default function GitStatusButton({
   const historyRequestRef = useRef(0);
   const historyListRef = useRef<HTMLDivElement>(null);
   const commitDetailsRequestRef = useRef(0);
+  const fileDiffGenerationRef = useRef(0);
   const branchesRequestRef = useRef(0);
   const mergePreviewRequestRef = useRef(0);
   const statusRef = useRef<GitStatus | null>(status);
@@ -1061,6 +1073,9 @@ export default function GitStatusButton({
 
   const loadCommitDetails = useCallback(async (commitHash: string, filePath?: string) => {
     const requestId = ++commitDetailsRequestRef.current;
+    const diagnosticRequestId = nextGitDiffDiagnosticId();
+    const diagnosticActionId = currentUIActionId();
+    const requestStartedAt = performance.now();
     const requestPath = effectiveRepoPath;
     const requestKey = commitDetailsRequestKey(requestPath, commitHash, filePath);
     if (!requestPath || !commitHash) {
@@ -1077,11 +1092,22 @@ export default function GitStatusButton({
         projectPath: requestPath,
         hash: commitHash,
         filePath: filePath || undefined,
+        __perfRid: diagnosticRequestId,
+        diagnosticActionId,
       });
       if (commitDetailsRequestRef.current !== requestId) return;
+      if (!acceptsGitDiffResultGeneration({ cancelled: false, capturedGeneration: requestId,
+        currentGeneration: commitDetailsRequestRef.current, requestId: diagnosticRequestId,
+        responseRequestId: result?.diagnosticRequestId })) return;
       if (!result?.success) throw new Error(result?.error || 'git commit details failed');
+      const acceptedResult = bindGitDiffDiagnosticResponse(result, diagnosticRequestId);
+      if (acceptedResult.diagnosticRequestId) console.warn('[GitDiffTrace] ' + JSON.stringify({ requestId: diagnosticRequestId,
+        actionId: diagnosticActionId, channel: 'git:commit-details', phase: 'renderer-received',
+        ipcLifetimeMs: +(performance.now() - requestStartedAt).toFixed(1),
+        pathHash: result.diagnosticMetrics?.pathHash || null, ...result.diagnosticMetrics }));
       setCommitDetailsRepoPath(requestPath);
-      setCommitDetails(result as GitCommitDetails);
+      setCommitDetails({ ...(acceptedResult as GitCommitDetails),
+        diagnosticActionId: acceptedResult.diagnosticRequestId ? diagnosticActionId : null });
       setActiveCommitFilePath((prev) => {
         const files = Array.isArray(result.files) ? result.files : [];
         if (prev && files.some((file: GitFile) => file.path === prev)) return prev;
@@ -1511,18 +1537,31 @@ export default function GitStatusButton({
     const hasVisibleDiffForSelection = Boolean(fileDiff && fileDiffKey.startsWith(selectionKey));
     let cancelled = false;
     let started = false;
+    const requestGeneration = ++fileDiffGenerationRef.current;
+    const diagnosticActionId = currentUIActionId();
     setFileDiffLoading(!hasVisibleDiffForSelection);
     const timer = window.setTimeout(() => {
       started = true;
-      ipcRenderer.invoke('git:file-diff', { projectPath: effectiveRepoPath, filePath: activeFilePath })
+      const diagnosticRequestId = nextGitDiffDiagnosticId();
+      const requestStartedAt = performance.now();
+      ipcRenderer.invoke('git:file-diff', { projectPath: effectiveRepoPath, filePath: activeFilePath,
+        __perfRid: diagnosticRequestId, diagnosticActionId })
         .then((result: GitFileDiff) => {
-          if (cancelled) return;
+          if (!acceptsGitDiffResultGeneration({ cancelled, capturedGeneration: requestGeneration,
+            currentGeneration: fileDiffGenerationRef.current, requestId: diagnosticRequestId,
+            responseRequestId: result?.diagnosticRequestId })) return;
           if (!result?.success) throw new Error(result?.error || 'git diff failed');
-          setFileDiff(result);
+          const acceptedResult = bindGitDiffDiagnosticResponse(result, diagnosticRequestId);
+          if (acceptedResult.diagnosticRequestId) console.warn('[GitDiffTrace] ' + JSON.stringify({ requestId: diagnosticRequestId,
+            actionId: diagnosticActionId, channel: 'git:file-diff', phase: 'renderer-received',
+            ipcLifetimeMs: +(performance.now() - requestStartedAt).toFixed(1),
+            pathHash: result.diagnosticMetrics?.pathHash || null, ...result.diagnosticMetrics,
+            truncated: result.truncated === true }));
+          setFileDiff({ ...acceptedResult, diagnosticActionId: acceptedResult.diagnosticRequestId ? diagnosticActionId : null });
           setFileDiffKey(requestKey);
         })
         .catch((error: any) => {
-          if (!cancelled) {
+          if (!cancelled && fileDiffGenerationRef.current === requestGeneration) {
             if (!hasVisibleDiffForSelection) {
               setFileDiff({ success: false, diff: '', additions: 0, deletions: 0, error: trimError(error?.message || error) });
               setFileDiffKey(requestKey);
@@ -1530,7 +1569,7 @@ export default function GitStatusButton({
           }
         })
         .finally(() => {
-          if (!cancelled) setFileDiffLoading(false);
+          if (!cancelled && fileDiffGenerationRef.current === requestGeneration) setFileDiffLoading(false);
         });
     }, 120);
     return () => {
@@ -3816,8 +3855,50 @@ function DiffPreview({
   diff: GitFileDiff | null;
   loading: boolean;
 }) {
-  const lines = useMemo(() => renderDiffLines(diff?.diff || ''), [diff?.diff]);
+  const parsed = useMemo(() => {
+    const startedAt = performance.now();
+    const lines = renderDiffLines(diff?.diff || '');
+    const completedAt = performance.now();
+    return { lines, syncElapsedMs: completedAt - startedAt, completedAt };
+  }, [diff?.diff, diff?.diagnosticRequestId]);
+  const lines = parsed.lines;
+  const loggedParseRequestRef = useRef<string | null>(null);
+  const observedCommitRequestRef = useRef<string | null>(null);
+  const loggedCommitRef = useRef<{ requestId: string | null; count: number }>({ requestId: null, count: 0 });
+  useEffect(() => {
+    const requestId = diff?.diagnosticRequestId;
+    if (!requestId || loggedParseRequestRef.current === requestId) return;
+    loggedParseRequestRef.current = requestId;
+    console.warn('[GitDiffTrace] ' + JSON.stringify({ requestId, actionId: diff?.diagnosticActionId || null,
+      channel: 'git:diff-preview', phase: 'parsed', parseSyncElapsedMs: +parsed.syncElapsedMs.toFixed(1),
+      parsedRows: lines.length, chars: diff?.diagnosticMetrics?.chars ?? null,
+      utf8Bytes: diff?.diagnosticMetrics?.utf8Bytes ?? null, sourceLines: diff?.diagnosticMetrics?.lines ?? null,
+      pathHash: diff?.diagnosticMetrics?.pathHash || null }));
+  }, [diff?.diagnosticActionId, diff?.diagnosticMetrics, diff?.diagnosticRequestId, lines.length, parsed.syncElapsedMs]);
+  useLayoutEffect(() => {
+    const requestId = diff?.diagnosticRequestId;
+    if (!requestId || observedCommitRequestRef.current === requestId) return;
+    observedCommitRequestRef.current = requestId;
+    const committedAt = performance.now();
+    console.warn('[GitDiffTrace] ' + JSON.stringify({ requestId, actionId: diff?.diagnosticActionId || null,
+      channel: 'git:diff-preview', phase: 'react-commit-observed',
+      commitObservedAbs: +(performance.timeOrigin + committedAt).toFixed(1),
+      parseToCommitObservedMs: +(committedAt - parsed.completedAt).toFixed(1), parsedRows: lines.length }));
+  }, [diff?.diagnosticActionId, diff?.diagnosticRequestId, lines.length, parsed.completedAt]);
+  const onDiffRender = useCallback((_id: string, phase: string, actualDuration: number,
+    _baseDuration: number, commitTime: number) => {
+    const requestId = diff?.diagnosticRequestId;
+    if (!requestId) return;
+    if (loggedCommitRef.current.requestId !== requestId) loggedCommitRef.current = { requestId, count: 0 };
+    if (loggedCommitRef.current.count >= 2) return;
+    loggedCommitRef.current.count += 1;
+    console.warn('[GitDiffTrace] ' + JSON.stringify({ requestId, actionId: diff?.diagnosticActionId || null,
+      channel: 'git:diff-preview', phase: 'react-commit', commitPhase: phase,
+      commitAbs: +(performance.timeOrigin + commitTime).toFixed(1), reactActualDurationMs: +actualDuration.toFixed(1),
+      parsedRows: lines.length }));
+  }, [diff?.diagnosticActionId, diff?.diagnosticRequestId, lines.length]);
   return (
+    <Profiler id="git-diff-preview" onRender={onDiffRender}>
     <div style={diffPaneStyle}>
       <div style={diffHeaderStyle}>
         <div style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -3867,6 +3948,7 @@ function DiffPreview({
         )}
       </div>
     </div>
+    </Profiler>
   );
 }
 
@@ -3891,6 +3973,9 @@ function HistoryCommitPreview({
     deletions: details.deletions,
     truncated: details.truncated,
     error: details.error,
+    diagnosticRequestId: details.diagnosticRequestId,
+    diagnosticActionId: details.diagnosticActionId,
+    diagnosticMetrics: details.diagnosticMetrics,
   } : null;
 
   if (loading && !details) {

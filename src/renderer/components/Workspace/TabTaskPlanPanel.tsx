@@ -1,3 +1,4 @@
+import './workspaceControlStyles.css';
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import { taskPlanHeightLayout, taskPlanHostHeightLayout } from '../../utils/historyComposerHeightBudget.mjs';
 import React, { useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
@@ -2215,33 +2216,7 @@ function TabTaskPlanPanel({
             : 'border-color 110ms ease',
         }}
       >
-        <style>{`
-          [data-task-plan-topic-strip]::-webkit-scrollbar { display: none; }
-          [data-task-plan-topic]:is(:hover,[data-task-plan-preview="true"]) {
-            box-shadow: inset 0 0 0 99px rgba(255,255,255,0.06);
-            transform: scale(1.04);
-            z-index: 1;
-          }
-          [data-task-plan-topic][data-task-plan-markers-only="true"]:is(:hover,[data-task-plan-preview="true"]) {
-            transform: scale(1.16);
-          }
-          [data-tab-task-plan] > [data-tab-responsibility]:hover,
-          [data-tab-task-plan] > [data-task-plan-header]:hover {
-            box-shadow: inset 0 0 0 999px rgba(255,255,255,0.045);
-          }
-          @keyframes noted-task-plan-flash {
-            0% { background-color: rgba(167, 139, 250, 0.34); box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0.62); }
-            100% { background-color: transparent; box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0); }
-          }
-          @keyframes noted-task-plan-selection-reveal {
-            from { opacity: 0.999; }
-            to { opacity: 1; }
-          }
-          @keyframes noted-task-plan-checkbox-reveal {
-            from { opacity: 0; }
-            to { opacity: 1; }
-          }
-        `}</style>
+
 
         {animateWidth && (
           <span

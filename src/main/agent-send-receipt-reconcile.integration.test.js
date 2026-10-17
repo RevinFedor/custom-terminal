@@ -60,12 +60,17 @@ async function fixture(t, options = {}) {
     sent.push(req.handoffId);
     const begun = store.beginAttempt(identity(req));
     const boundary = { sessionId, filePath: file, fileSize: fs.statSync(file).size, capturedAt: Date.now() };
-    store.stageAttemptContext(req.sendOperationKey, begun.attemptId, { sessionId, transcriptBoundary: boundary,
-      transportText: req.prompt, source: 'codex-tab-message:' + req.handoffId });
-    store.markAttemptState(req.sendOperationKey, begun.attemptId, 'enter-armed');
-    store.settleAttempt(req.sendOperationKey, begun.attemptId, { submitted: true, auditPending: true });
-    store.markProviderQueueAccepted(req.sendOperationKey, begun.attemptId, { provider: 'codex', sessionId,
-      sourceIdentity: 'codex-tui-queue:fixture:' + req.handoffId });
+    const activeState = req.handoffId === 'head-429' ? options.activeState : null;
+    if (!options.omitContext || req.handoffId !== 'head-429') {
+      store.stageAttemptContext(req.sendOperationKey, begun.attemptId, { sessionId, transcriptBoundary: boundary,
+        transportText: req.prompt, source: 'codex-tab-message:' + req.handoffId });
+    }
+    if (activeState !== 'in-flight') store.markAttemptState(req.sendOperationKey, begun.attemptId, 'enter-armed');
+    if (!activeState) {
+      store.settleAttempt(req.sendOperationKey, begun.attemptId, { submitted: true, auditPending: true });
+      store.markProviderQueueAccepted(req.sendOperationKey, begun.attemptId, { provider: 'codex', sessionId,
+        sourceIdentity: 'codex-tui-queue:fixture:' + req.handoffId });
+    }
     return store.get(req.sendOperationKey).receipt;
   } });
   queue = makeQueue();
@@ -74,10 +79,12 @@ async function fixture(t, options = {}) {
   await tick();
   queue.enqueue({ identity: identity(follower), request: follower });
   await tick();
-  const startup = store.reconcileStartup();
-  const decisions = await reconcileAgentSendStartupRecords(startup.records.filter(record =>
-    ['audit-pending', 'delivery-unknown'].includes(record.state)), { allRecords: startup.records });
-  for (const decision of decisions) store.markStartupUnconfirmed(decision.operationKey, decision.attemptId, decision);
+  if (!options.activeState) {
+    const startup = store.reconcileStartup();
+    const decisions = await reconcileAgentSendStartupRecords(startup.records.filter(record =>
+      ['audit-pending', 'delivery-unknown'].includes(record.state)), { allRecords: startup.records });
+    for (const decision of decisions) store.markStartupUnconfirmed(decision.operationKey, decision.attemptId, decision);
+  }
   const attemptId = store.get(head.sendOperationKey).attemptId;
   const exact = { operationKey: head.sendOperationKey, attemptId };
   let scans = 0;
@@ -157,6 +164,89 @@ test('actual HTTP -> Main publisher -> existing scanner -> SQLite frees ONLY the
   const repeat = await h.post(); await tick();
   assert.equal(repeat.body.reconciliation.reason, 'already-exact-confirmed');
   assert.equal(h.scans, 1); assert.deepEqual(h.sent, ['head-429', 'task-440']);
+});
+
+for (const activeState of ['enter-armed']) {
+  test(`active ${activeState}: absent proof preserves attempt/slot; late exact proof confirms without a second head Send`, async t => {
+    const h = await fixture(t, { activeState });
+    const before = h.store.get(h.head.sendOperationKey);
+    const absent = await h.post(); await tick();
+    assert.equal(absent.status, 200);
+    assert.equal(absent.body.reconciliation.confirmed, false);
+    assert.equal(absent.body.reconciliation.decision, 'absent');
+    assert.deepEqual(h.store.get(h.head.sendOperationKey), before);
+    assert.equal(h.queue.item(h.follower.sendOperationKey).state, 'waiting');
+    assert.deepEqual(h.sent, ['head-429']);
+    h.append();
+    const found = await h.post(); await tick();
+    assert.equal(found.status, 200);
+    assert.equal(found.body.reconciliation.confirmed, true);
+    assert.equal(found.body.receipt.attemptId, before.attemptId);
+    assert.equal(found.body.receipt.sessionId, before.sessionId);
+    assert.equal(h.publications.length, 1);
+    assert.deepEqual(h.sent, ['head-429', 'task-440']);
+    await h.post(); await tick();
+    assert.deepEqual(h.sent, ['head-429', 'task-440']);
+  });
+}
+
+test('3359-shaped in-flight without a staged boundary is a truthful unknown proof read, not no-submit or queue release', async t => {
+  const h = await fixture(t, { activeState: 'in-flight', omitContext: true });
+  const before = h.store.get(h.head.sendOperationKey);
+  const result = await h.post(); await tick();
+  assert.equal(result.status, 200);
+  assert.equal(result.body.reconciliation.decision, 'unknown');
+  assert.equal(result.body.reconciliation.reason, 'enter-not-recorded');
+  assert.equal(result.body.receipt.deliveryUnknown, true);
+  assert.equal(result.body.receipt.submitted, null);
+  assert.equal(result.body.receipt.inputSlot.state, 'held');
+  assert.deepEqual(h.store.get(h.head.sendOperationKey), before);
+  assert.deepEqual(h.sent, ['head-429']);
+  assert.equal(h.publications.length, 0);
+  assert.equal(h.queue.item(h.follower.sendOperationKey).state, 'waiting');
+});
+
+test('a matching manual row after a pre-Enter boundary cannot claim an in-flight attempt', async t => {
+  const h = await fixture(t, { activeState: 'in-flight' });
+  const before = h.store.get(h.head.sendOperationKey);
+  h.append();
+  const result = await h.post(); await tick();
+  assert.equal(result.status, 200);
+  assert.equal(result.body.reconciliation.decision, 'unknown');
+  assert.equal(result.body.reconciliation.reason, 'enter-not-recorded');
+  assert.equal(h.scans, 0);
+  assert.equal(h.publications.length, 0);
+  assert.deepEqual(h.store.get(h.head.sendOperationKey), before);
+  assert.deepEqual(h.sent, ['head-429']);
+});
+
+test('active read pins staged transport as well as source boundary before publication', async t => {
+  let release;
+  const h = await fixture(t, { activeState: 'enter-armed', scan: (...args) => new Promise(resolve => {
+    release = async () => resolve(await reconcileAgentSendStartupRecords(...args));
+  }) });
+  h.append();
+  const pending = h.post(); await Promise.race([h.scanStarted, pending]);
+  assert.equal(typeof release, 'function', 'active proof read must reach the scanner');
+  h.store.settleAttempt(h.head.sendOperationKey, h.exact.attemptId, {
+    submitted: true, auditPending: true, transportText: prompt + ' changed',
+  });
+  await release();
+  const result = await pending;
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error, 'send_receipt_source_changed');
+  assert.equal(h.publications.length, 0);
+  assert.deepEqual(h.sent, ['head-429']);
+});
+
+test('ordinary startup scanning does not gain live-attempt eligibility', async t => {
+  const h = await fixture(t, { activeState: 'in-flight' });
+  h.append();
+  const [decision] = await reconcileAgentSendStartupRecords([h.store.get(h.head.sendOperationKey)]);
+  assert.equal(decision.decision, 'unknown');
+  assert.equal(decision.reason, 'receipt-state-not-unresolved');
+  assert.equal(h.publications.length, 0);
+  assert.deepEqual(h.sent, ['head-429']);
 });
 
 test('a real startup-shaped absent/queue-accepted head stays UNKNOWN; old FIFO and original waiting440 survive reopen', async t => {

@@ -3,10 +3,10 @@
 ## Зачем
 Два независимых уровня routing'а:
 
-1. **Между параллельными Electron-инстансами** (dev vs prod) — какому процессу отдать запрос. Решается через `NOTED_MAIN_PID` env priority-1 → cwd longest-prefix → mtime. См. секцию `Discovery в terminal-server.mjs`.
+1. **Между параллельными Electron-инстансами** (dev vs prod) — какому процессу отдать запрос. Явный Main PID/instance route закрепляет экземпляр; missing binding даёт отказ, не переход к host. Только caller без PID использует cwd longest-prefix → mtime. См. секцию `Discovery в terminal-server.mjs`.
 2. **Между проектами внутри одного инстанса** — в какой проект класть таб / по какому проекту фильтровать `list_tabs`. Решается через `NOTED_PARENT_PROJECT_ID` env priority-1 → cwd longest-prefix match → `activeProjectId` fallback.
 
-> **Обновление (MCP-хаб, 2026-09):** terminal-server теперь обычно ОДИН общий процесс за HTTP-хабом (см. [`fact-mcp-hub.md`](fact-mcp-hub.md)), поэтому env-переменные не могут нести per-session identity. Identity приезжает per-request: хаб кладёт `{tabId, projectId, cwd, mainPid}` в `params._meta.noted`, terminal-server читает их через AsyncLocalStorage-геттеры `PARENT_TAB_ID()`/`PARENT_PROJECT_ID()`/`PROJECT_CWD_()`/`MAIN_PID_HINT()`. Приоритеты роутинга ниже не изменились — сменился только транспорт identity (env → meta, env остаётся fallback'ом для прямого stdio-запуска).
+> Shared terminal-server получает `{tabId, projectId, cwd, mainPid, instanceRoute?}` через `params._meta.noted` и AsyncLocalStorage. С17.10 Main добавляет opaque base64url route `{version:1,discoveryDir,instanceId}`: это служебная identity, не аргумент инструмента и не credentials. Прямой stdio сохраняет env-вариант, старый host — четырёхпольную identity.
 
 После workflow-aware Terminal MCP есть третий, независимый уровень:
 
@@ -64,6 +64,20 @@ tab. Bare create без `windowTarget` сохраняет legacy project-pinned 
 1. **`NOTED_MAIN_PID` env** — каждый Claude процесс наследует env от того main'а который его spawn'ил. Эту переменную main инжектит при `pty.spawn` рядом с `EDITOR=noted-code-grab.js`. Если хоть один live-инстанс имеет совпадающий `pid` — return immediately. Это убирает ambiguity когда дев и прод одновременно open'или один cwd (longest-prefix даёт tie длины 38, sort-order arbitrary — без env запрос уходил в случайный из двух). См. `methodology/дизайн-принципы.md::ID-pinned routing > cwd-routing`.
 2. **cwd longest-prefix** — entry в `openProjectPaths` префикс `cwd` (включая subdirectories — `/uav/agrofield_back` матчится с `/uav`). Wins на случай вложенных открытых проектов. Fallback когда NOTED_MAIN_PID не выставлен (helper-script запущен из `/tmp`, сторонний tool).
 3. **mtime** — самый свежий port-файл. Последний рубеж для свободных cwd.
+
+Для явного PID пункты2/3 не являются fallback при missing/dead binding. Новый
+instanceRoute задаёт root и app-generation: точечно читаются оба mcp-port-PID и
+web-server-PID.json, с bounded FD/stat проверками. PID/port/generation должны
+совпасть; пара закреплена на вызов, изменение между capability GET и mutation
+отказывает. Token читается из того же root, port не берётся из tool args.
+Обновлённые Main/API ingress проверяют PID/instance headers до dispatch.
+Это routing proof, не writer/Send readiness; прежние app guards сохраняются.
+
+Шрам17.10: process-global root общего child не видел private PID и fallback
+читал host: правильный caller ID, но tab=null/exists=false. После ремонта один
+реальный shared-hub roundtrip двух private Luna подтвердил context/inspect,
+вопрос/адресный reply и canonical get_message; host lookup остался правильным.
+Отдельный stdio-стек для обхода discovery не требуется.
 
 Hint для разных tool'ов:
 - `create_tab` — берёт hint напрямую из `args.cwd`.

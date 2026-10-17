@@ -1034,10 +1034,12 @@ class OrchestrationRunStore {
     return work;
   }
 
-  async patch(runId, patch) {
+  async patch(runId, patch, { unlessTerminal = false } = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
     if (!run) return null;
+    // Admission may have been cancelled while initialization was awaiting I/O.
+    if (unlessTerminal && isTerminalStatus(run.status)) return null;
     Object.assign(run, patch, { updatedAt: Date.now() });
     if (patch?.autoStopStatus === 'scheduled' && patch?.autoStopAt) {
       const activity = this._activityForTarget(run.targetTabId);
@@ -3235,6 +3237,31 @@ class OrchestrationRunStore {
     const { isOrchestrationInheritedActivity } = require('../shared/orchestration-activity.cjs');
     return { known: true, sourceTabIds: [...new Set([...this.runs.values()]
       .filter(isOrchestrationInheritedActivity).map(run => run.sourceTabId))] };
+  }
+
+  readTabInspection(tabId) {
+    if (!this.initialized || this.activityReadError) return { known: false,
+      reason: this.activityReadError || 'orchestration-not-ready', revision: null };
+    const { isOrchestrationInheritedActivity } = require('../shared/orchestration-activity.cjs');
+    const jobs = [...this.runs.values()]
+      .filter(run => (run.sourceTabId === tabId || run.targetTabId === tabId) && isTrackedOrchestrationRun(run))
+      .map(run => ({ runId: run.runId, kind: run.runKind || 'agent', status: run.status,
+        direction: run.sourceTabId === tabId ? 'outgoing' : 'incoming',
+        targetTabId: run.targetTabId || null, sourceTabId: run.sourceTabId,
+        inherited: run.sourceTabId === tabId && isOrchestrationInheritedActivity(run),
+        pendingDelivery: run.sourceTabId === tabId && (isSourceFollowupPending(run) || isSourceNotificationBlocked(run)),
+        targetDeliveryPending: ['creating', 'starting', 'sending', 'queued'].includes(run.status)
+          && !run.targetPromptProofAt,
+        notifySource: canNotifySource(run), notificationStatus: run.notificationStatus || null,
+        executionContext: run.targetExecutionContext || null, updatedAt: run.updatedAt || null }));
+    jobs.sort((a, b) => a.runId.localeCompare(b.runId));
+    return { known: true, revision: crypto.createHash('sha256').update(JSON.stringify(jobs)).digest('hex'),
+      inheritedCount: jobs.filter(job => job.inherited).length,
+      pendingDeliveryCount: jobs.filter(job => job.pendingDelivery || job.targetDeliveryPending).length,
+      pendingResultDeliveryCount: jobs.filter(job => job.pendingDelivery).length,
+      pendingTargetDeliveryCount: jobs.filter(job => job.targetDeliveryPending).length,
+      incomingCount: jobs.filter(job => job.direction === 'incoming').length,
+      count: jobs.length, jobs: jobs.slice(0, 24), truncated: jobs.length > 24 };
   }
 
   async listAll() {

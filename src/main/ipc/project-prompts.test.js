@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
 
-test('IPC routes exact-tab reads/CAS writes, exposes errors, and removes every owned handler', () => {
+test('IPC routes exact-tab reads/CAS writes, exposes errors, and removes every owned handler', async () => {
   const handlers = new Map();
   const sends = [];
   const oldLoad = Module._load;
@@ -36,7 +36,7 @@ test('IPC routes exact-tab reads/CAS writes, exposes errors, and removes every o
     ['project-prompts:get-sources', 'legacy', 'getSources'],
     ['project-prompts:usage-for-root', '/root', 'usageForRoot'],
   ]) {
-    const result = handlers.get(channel)({}, argument);
+    const result = await handlers.get(channel)({}, argument);
     assert.equal(result.success, true);
     assert.equal(calls.at(-1).method, method);
     assert.equal(calls.at(-1).args[0], argument);

@@ -114,3 +114,21 @@ test('a provider error is not proof that Enter was never written', async () => {
     return true;
   });
 });
+
+test('preflight attestation pins the original issued scope before the first await', async () => {
+  const scope = { version: 1, id: 'original', operationKey: 'O', attemptId: 'A', tabId: 'T', provider: 'codex' };
+  await assert.rejects(runAgentSendFlow({ preflightScope: scope,
+    prepareContext: async () => ({}),
+    ensureReady: async () => {
+      scope.id = 'changed-after-admission';
+      throw Object.assign(new Error('no launch'), { protocolVersion: 1, accepted: false,
+        launchWritten: false, launchStage: 'no-launch', launchAttempt: 1,
+        launchIntent: { tabId: 'T', toolType: 'codex', intentId: 'launch:test:1', token: 1 },
+        sendReceipt: { operationKey: 'O', attemptId: 'A', submitted: null, deliveryUnknown: true } });
+    },
+    proveComposer: () => assert.fail('no composer'), runProviderOperation: () => assert.fail('no provider'),
+  }), error => {
+    assert.equal(error.sendReceipt.preflightRefusal.scope.id, 'original');
+    return true;
+  });
+});

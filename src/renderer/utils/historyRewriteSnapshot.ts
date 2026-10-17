@@ -123,6 +123,7 @@ export async function prepareHistoryRewriteSnapshot({ tabId, sessionId, sourceSe
   const to = { ...from, sessionId };
   const fromKey = makeHistorySnapshotKey(from);
   const before = historySnapshotCache.peek<Row>(from);
+  const beforeTarget = historySnapshotCache.peek<Row>(to);
   const revision = before?.revision as Row | null;
   if (!before || !revision?.token) return null;
   let hydrate = null;
@@ -135,6 +136,8 @@ export async function prepareHistoryRewriteSnapshot({ tabId, sessionId, sourceSe
   });
   if (!result?.success || (!result.rewriteDelta && !Array.isArray(result.entries)) || !result.revision
     || result.revision.sessionId !== sessionId || result.revision.cwd !== cwd) return null;
+  // Do not spend a full remap on a read already superseded on either owner.
+  if (historySnapshotCache.peek(from) !== before || historySnapshotCache.peek(to) !== beforeTarget) return null;
   const receipt = result.rewriteReceipt;
   if (receipt?.schema !== 'codex-rewrite-prefix-v1' || receipt.sourceSessionId !== sourceSessionId
     || receipt.sessionId !== sessionId || !receipt.records?.length) return null;
@@ -144,7 +147,8 @@ export async function prepareHistoryRewriteSnapshot({ tabId, sessionId, sourceSe
   return () => {
     // A late response cannot adopt an obsolete hydration window or reading
     // position. Source cache and physical owner must still be the captured ones.
-    if (historySnapshotCache.peek(from) !== before) return false;
+    if (historySnapshotCache.peek(from) !== before
+      || historySnapshotCache.peek(to) !== beforeTarget) return false;
     const current = captures.get(fromKey)?.();
     const oldAnchor = current?.anchor || getHistoryReadingAnchor(tabId + ':' + sourceSessionId);
     let anchor = null;
@@ -154,6 +158,11 @@ export async function prepareHistoryRewriteSnapshot({ tabId, sessionId, sourceSe
         if (reused.entries.some((row) => row.uuid === uuid)) anchor = { ...oldAnchor, uuid, savedAt: Date.now() };
       }
     } catch { /* The reading row was deleted; normal tail restore owns it. */ }
+    // The capture/anchor adapter is application code, not a cache authority.
+    // It may synchronously publish another window; claim both owners again
+    // directly before our write, with no callback or await in between.
+    if (historySnapshotCache.peek(from) !== before
+      || historySnapshotCache.peek(to) !== beforeTarget) return false;
     const stored = historySnapshotCache.set(to, {
       entries: reused.entries, revision: result.revision,
       payloadGeneration: result.payloadGeneration || '',

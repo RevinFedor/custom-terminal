@@ -1,3 +1,4 @@
+import {uiDragDiagnostic} from './uiPerformanceDiagnostics.mjs';
 import {beginPaneTabDrag,endPaneTabDrag,type PaneTabDragSource} from './paneTabDragBridge';
 import {updatePaneTabPointer,finishPaneTabPointer,cancelPaneTabPointer,getPaneTabPointerSnapshot} from './paneTabPointerBridge';
 import {beginSidebarTabDrag,endSidebarTabDrag} from './sidebarTabDragBridge.mjs';
@@ -5,7 +6,7 @@ import {setTabDragNavigationTarget,clearTabDragNavigationTarget} from './tabDrag
 import {useWorkspaceStore} from '../store/useWorkspaceStore';
 import {workflowDragSourceValid} from './workflowDragModel.mjs';
 
-type Point={clientX:number;clientY:number;pointerId:number;metaKey:boolean};
+type Point={clientX:number;clientY:number;pointerId:number;metaKey:boolean;grabOffsetY?:number};
 let active:{source:PaneTabDragSource;point:Point;cleanup:()=>void;frame:number}|null=null;
 export const reserveReleaseOwner=(workflowId:string,source:PaneTabDragSource)=>`reserve:${workflowId}:${source.gestureId}`;
 
@@ -19,6 +20,7 @@ function finish(cancelled:boolean,reason='release') {
   endPaneTabDrag(drag.source.rootTabId,drag.source.gestureId);
   endSidebarTabDrag(drag.source.gestureId);
   clearTabDragNavigationTarget('sidebar');
+  uiDragDiagnostic('physical-end',{gestureId:drag.source.gestureId,reason:cancelled?'cancel:'+reason:'release',x:drag.point.clientX,y:drag.point.clientY});
 }
 
 /** Physical ownership outlives a reserve host replaced by workflow hover. */
@@ -26,7 +28,8 @@ export function beginReserveDragTransport(admission:any,point:Point,sourceNode:a
   finish(true,'new-gesture');
   const source:PaneTabDragSource={owner:'sidebar',input:'pointer',gestureId:admission.gestureId,
     entries:admission.paneEntries,rootTabId:admission.paneEntries[0]?.tabId || '',
-    sourceSpaceId:admission.sourceWorkflowId,pointerId:point.pointerId,workflowDrag:admission};
+    sourceSpaceId:admission.sourceWorkflowId,pointerId:point.pointerId,workflowDrag:admission,
+    sourceGrabOffsetY:point.grabOffsetY};
   const drag={source,point,cleanup:()=>{},frame:0};active=drag;
   let receivedMoves=0;
   let metaHeld=point.metaKey;

@@ -86,6 +86,16 @@ class SqliteStorageGraceStore {
       WHEN NEW.codex_session_id IS NOT OLD.codex_session_id
         OR NEW.claude_session_id IS NOT OLD.claude_session_id
       BEGIN ${invalidateBindings} END;`);
+    if (columns.has('execution_archived')) sqlite.exec(`CREATE TRIGGER IF NOT EXISTS storage_grace_tab_restore
+      AFTER UPDATE OF execution_archived ON tabs WHEN OLD.execution_archived=1 AND NEW.execution_archived=0
+      BEGIN ${invalidateBindings} END;`);
+    if (sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_org_memberships'").get()) {
+      sqlite.exec(`CREATE TRIGGER IF NOT EXISTS storage_grace_membership_insert
+        AFTER INSERT ON workflow_org_memberships BEGIN DELETE FROM ${TABLE} WHERE recovery_copy=0 AND (
+          (provider='codex' AND session_id IN (SELECT codex_session_id FROM tabs WHERE tab_id=NEW.tab_id)) OR
+          (provider='claude' AND session_id IN (SELECT claude_session_id FROM tabs WHERE tab_id=NEW.tab_id))
+        ); END;`);
+    }
     const eventColumns = new Set(sqlite.prepare('PRAGMA table_info(session_history_events)').all().map((row) => row.name));
     if (['provider', 'source_session_id', 'lineage_manifest_json'].every((field) => eventColumns.has(field))) {
       const invalidateSources = `DELETE FROM ${TABLE}

@@ -15,14 +15,38 @@ function find(predicate) {
   visit(tree); assert.ok(found); return found;
 }
 
+for (const command of [undefined, {}, { isRunning: undefined }, { isRunning: 'false' },
+  { isRunning: false, processLookupUnknown: true }, { isRunning: true }, { isRunning: false }]) {
+  test('actual Main capture -> actual afterStop guard preserves process tri-state: ' + JSON.stringify(command), () => {
+    const context = { terminalCommandState: new Map(command === undefined ? [] : [['T', command]]),
+      terminals: new Map([['T', {}]]), terminalProjects: new Map([['T', '/f']]),
+      codexLastRunCommandPayload: new Map(), aiStoppingTabs: new Set(),
+      resolveAiToolTypeForTab: () => 'codex', resolveAuthoritativeTabProjectId: () => 'P',
+      getTerminalLifecycleGeneration: () => 'L', getTerminalInputRevision: () => 4,
+      codexSessionIdFromDb: () => 'S' };
+    const capture = vm.runInNewContext('(' + find(n => ts.isFunctionDeclaration(n)
+      && n.name?.text === 'captureSavedHistoryRuntime').getText(tree) + ')', context);
+    const snapshot = capture('T');
+    assert.equal(snapshot.isRunning, typeof command?.isRunning === 'boolean' ? command.isRunning : null);
+    const registry = new SavedHistoryOperations({ runtime: { capture } });
+    const lease = { record: { tabId: 'T', expectedSessionId: 'S' }, scope: snapshot };
+    if (command?.isRunning === false && !command.processLookupUnknown) {
+      assert.doesNotThrow(() => registry.assertScope(lease, { afterStop: true }));
+    } else assert.throws(() => registry.assertScope(lease, { afterStop: true }),
+      command?.isRunning === true ? /process_not_stopped/ : /process_state_unknown/);
+  });
+}
+
 test('actual Stop IPC forwards a receipt authority tied to the real target, not a caller-supplied other tab', async () => {
   const call = find(n => ts.isCallExpression(n) && n.expression.getText(tree) === 'ipcMain.handle'
     && n.arguments[0]?.text === 'terminal:stop-ai-process');
   const context = { options: null, path, srcMainDir: __dirname,
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
+    prepareStopPendingSends: () => ({ ok: true, inputs: [] }),
     stopAiProcessInTabSerialized: async (tabId, options) => {
       context.options = options;
       return options.preSignalGuard();
-    }, require: () => ({ validateSavedHistoryStop: request => {
+    }, require: () => ({ sendIntentCancellationAvailable: () => true, validateSavedHistoryStop: request => {
       assert.equal(request.tabId, 'real-tab');
       assert.equal(request.operationId, 'same-operation');
       return { allowed: false, reason: 'owner-changed' };
@@ -47,6 +71,7 @@ test('actual Codex write callback revalidates the operation after awaited shell 
   for (const stale of [false, true]) {
     const events = [];
     const context = { term: {}, tabId: 'real-tab', payload: { historyOperation: { tabId: 'forged-tab', operationId: 'op' } },
+      assertCurrent() {}, // The outer launch authority has its own actual-function suite.
       sessionId: 'child', launchId: 'launch', launchRunSeq: 4, ownsMcpStartupRecoveryHandoff: false,
       reserveReturn: null, normalizedCommand: 'codex-c', termCwd: '/private/test',
       effectiveModel: 'fixture-model', effectiveEffort: 'high', sourceSettingsProof: {},

@@ -33,6 +33,10 @@ export function makeTimelineSnapshotKey({ tabId, toolType, sessionId = '', cwd =
   });
 }
 
+// The same accepted bounded cache, also read at an explicit Copy action. No
+// second cache, row subscription, reader or retention policy for message chips.
+export const timelineMessageSnapshotCache = createTimelineSnapshotCache();
+
 export function createTimelineSnapshotOwner(cache, ownerKey) {
   // One reference to the accepted snapshot, no duplicate array or second
   // revision clock. The React owner recreates this holder on its exact key.

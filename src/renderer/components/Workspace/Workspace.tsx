@@ -43,7 +43,7 @@ import {
 import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
 import { generateTabTitleFromSession } from '../../utils/generateTabTitle';
 import { createArchiveTitleRefresher } from '../../utils/workflowOrganizationClient.mjs';
-import {archiveReceiptMatches} from '../../utils/globalTabArchive.mjs';
+import {archiveReceiptMatches,omitExpiredArchiveHistory} from '../../utils/globalTabArchive.mjs';
 import {findOpenTabOwner} from '../../utils/tabLinkNavigation.mjs';
 import {GLOBAL_EXECUTION_NAMESPACE} from '../../utils/workflowMembership.mjs';
 import {archiveServiceScopes, archiveScopeLabel, freezeArchiveClearIntent, archiveClearRequest,
@@ -79,6 +79,8 @@ function GlobalArchivePreview({record,entryUuid}:{record:GlobalArchiveRecord;ent
 export function RootGlobalArchive({onClose,presented=true}:{onClose:()=>void;presented?:boolean}) {
   const workflows = useWorkspaceStore(state => state.spaces);
   const [snapshot,setSnapshot] = useState<any>(null),[service,setService] = useState(false);
+  const [expiredArchiveIds,setExpiredArchiveIds] = useState<ReadonlySet<number>>(() => new Set());
+  const expiredArchiveIdsRef = useRef<ReadonlySet<number>>(expiredArchiveIds);
   const [namespace,setNamespace] = useState(GLOBAL_EXECUTION_NAMESPACE),[serviceResult,setServiceResult] = useState<any>(null);
   const [busy,setBusy] = useState(false),[failure,setFailure] = useState('');
   const [confirm,setConfirm] = useState<ReturnType<typeof freezeArchiveClearIntent>|null>(null);
@@ -121,11 +123,26 @@ export function RootGlobalArchive({onClose,presented=true}:{onClose:()=>void;pre
     window.addEventListener('keydown',cancel,true);return () => window.removeEventListener('keydown',cancel,true);
   },[confirm,cancelConfirm,presented]);
   const readArchive = useCallback(async () => {
-    const result = await ipcRenderer.invoke('workflow:archive-read');
+    const result = omitExpiredArchiveHistory(await ipcRenderer.invoke('workflow:archive-read'),expiredArchiveIdsRef.current);
     if (result?.version !== 1 || !Array.isArray(result.history) || !Array.isArray(result.favorites)) throw new Error('Архив недоступен');
     scopesRef.current = archiveServiceScopes(result,scopesRef.current);
     setSnapshot(result);return result;
   },[]);
+  useEffect(() => {
+    const expired = (_event:unknown, payload:{historyIds?:number[]}) => {
+      const ids = new Set(payload?.historyIds || []);
+      if (!ids.size) return;
+      const nextIds = new Set([...expiredArchiveIdsRef.current,...ids]);
+      expiredArchiveIdsRef.current = nextIds;
+      setExpiredArchiveIds(nextIds);
+      cancelConfirm();
+      // Expiration is already committed in Main. Do not reread transcripts or
+      // the whole archive just to remove known rows from a retained surface.
+      setSnapshot((previous:any) => omitExpiredArchiveHistory(previous,ids));
+    };
+    ipcRenderer.on('tab-history:expired',expired);
+    return () => ipcRenderer.removeListener('tab-history:expired',expired);
+  },[cancelConfirm]);
   const scopes = snapshot ? scopesRef.current : [];
   const selectedScope = scopes.find(scope => scope.namespace === namespace);
   const exactRequest = (request:ArchiveRequest):ArchiveRequest => {
@@ -302,7 +319,7 @@ export function RootGlobalArchive({onClose,presented=true}:{onClose:()=>void;pre
       }</div>}
       {failure && <div role="alert">{failure}</div>}
     </div>}
-    <div style={{flex:1,minHeight:0}}><GlobalTabArchive readArchive={readArchive} workflows={workflows} onRestore={restore} onOpenFavorite={openFavorite}
+    <div style={{flex:1,minHeight:0}}><GlobalTabArchive readArchive={readArchive} expiredHistoryIds={expiredArchiveIds} workflows={workflows} onRestore={restore} onOpenFavorite={openFavorite}
       onDeleteHistory={action('delete-history')} onRemoveFavorite={action('remove-favorite')}
       onAddFavorite={action('add-favorite')} onRename={action('rename-history')} onRefreshTitle={refreshTitle}
       onUpdateNotes={action('update-notes')} renderPreview={(record,{entryUuid}) => <GlobalArchivePreview key={JSON.stringify([record.namespace,record.id])}

@@ -50,6 +50,35 @@ async function parity(h, opts) {
   return actual;
 }
 
+test('prepared committed child seeds the SAME Resume reducer without rereading JSONL bytes', async t => {
+  const h = fixture(t);
+  h.write([meta({ cwd: h.root }), settings(), response('same'), user('same'), event('task_complete'),
+    response('next'), user('next'), event('thread_rolled_back', { num_turns: 1 }),
+    event('thread_settings_applied', { thread_settings: { model: 'current', effort: 'max' } })]);
+  const stat = await fs.promises.stat(h.filePath);
+  const raw = await api.readJsonlRange(h.filePath, 0, stat.size - 1);
+  const cold = await h.load(); h.reader.clear();
+  const before = h.reader.stats().bytesRead;
+  assert.equal(await h.reader.seedPrepared(SID, h.root, { filePath: h.filePath, stat, records: raw.records }), true);
+  const seeded = await h.load();
+  assert.equal(seeded.mode, 'unchanged');
+  assert.deepEqual(seeded.sourceSettingsProof, cold.sourceSettingsProof);
+  assert.deepEqual(seeded.sourceMaterialization, cold.sourceMaterialization);
+  assert.deepEqual(seeded.sourceSnapshot, cold.sourceSnapshot);
+  assert.equal(h.reader.stats().bytesRead, before, 'writer array/cache admission never rereads byte bodies');
+  assert.equal(Object.hasOwn(seeded, 'records'), false);
+  // Any append/rewrite/rename or identity mismatch invalidates prepared proof.
+  await fs.promises.appendFile(h.filePath, jsonl([settings('later', 'low')]));
+  assert.equal((await h.load()).sourceSettingsProof.model, 'later');
+  h.reader.clear();
+  assert.equal(await h.reader.seedPrepared(SID, h.root, { filePath: h.filePath, stat, records: raw.records }), false);
+  const current = await fs.promises.stat(h.filePath);
+  assert.equal(await h.reader.seedPrepared('foreign', h.root, { filePath: h.filePath, stat: current, records: raw.records }), false);
+  assert.equal(await h.reader.seedPrepared(SID, '/foreign', { filePath: h.filePath, stat: current, records: raw.records }), false);
+  assert.equal(await h.reader.seedPrepared(SID, h.root, { filePath: h.filePath, stat: current,
+    records: raw.records.map((r, i) => i === 1 ? { ...r, __byteOffset: undefined } : r) }), false);
+});
+
 test('projected and small shared-reader paths retain batch settings/materialization semantics', async t => {
   const cases = [
     [], [meta()], [meta(), settings(), user('ordinary')],

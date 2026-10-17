@@ -126,6 +126,7 @@ export interface HistoryPromptDraftImageRef {
 export type HistoryPromptDraftChipKind = 'prompt' | 'paste';
 
 export interface HistoryPromptDraftChip {
+  messageReference?: unknown;
   contextUpdateId?: string;
   id: string;
   kind: HistoryPromptDraftChipKind;
@@ -636,7 +637,7 @@ interface UIStore {
   sideTerminalOpenTabs: Record<string, boolean>;
   historyScrollToUuid: string | null;
   historyScrollTargetTabId: string | null;
-  historyScrollToolTarget: { toolUseId: string; readSessionId: string; requestId: string } | null;
+  historyScrollToolTarget: { toolUseId?: string; readSessionId: string; requestId: string; messageReference?: any } | null;
   historyScrollRequestGeneration: number;
   historyVisibleUuids: Record<string, string[]>;
   historyScrollPositions: Record<string, number>;
@@ -691,6 +692,9 @@ interface UIStore {
   // Timeline tree mode (per-tab state)
   timelineTreeModeTabs: Record<string, boolean>;
   setTimelineTreeMode: (tabId: string, open: boolean) => void;
+
+  historyMcpAsUserTabs: Record<string, boolean>;
+  setHistoryMcpAsUser: (tabId: string, enabled: boolean) => void;
 
   // Notes Panel Width
 
@@ -1741,6 +1745,7 @@ const LS_SIDE_TERMINAL_WIDTH = 'noted-terminal-side-terminal-width';
 const LS_SIDE_TERMINAL_OPEN_TABS = 'noted-terminal-side-terminal-open-tabs';
 const LS_RUN_AFTER_PICKER_PROJECT = 'noted-terminal-run-after-picker-project';
 const LS_HISTORY_PANEL_OPEN_TABS = 'noted-terminal-history-panel-open-tabs';
+const LS_HISTORY_MCP_AS_USER_TABS = 'noted-terminal-history-mcp-as-user-tabs';
 const SIDE_TERMINAL_MIN_WIDTH = 360;
 const SIDE_TERMINAL_MAX_WIDTH = 1200;
 
@@ -1843,6 +1848,11 @@ const initialTerminalPrimaryTabs = readLocalTerminalPrimaryTabs();
 const initialSideTerminalWidth = readLocalSideTerminalWidth();
 const initialSideTerminalOpenTabs = readLocalSideTerminalOpenTabs();
 const initialHistoryPanelOpenTabs = readLocalHistoryPanelOpenTabs();
+const initialHistoryMcpAsUserTabs = (() => {
+  try {
+    return sanitizeTerminalPrimaryTabs(JSON.parse(localStorage.getItem(LS_HISTORY_MCP_AS_USER_TABS) || '{}'));
+  } catch { return {}; }
+})();
 
 (async () => {
   try {
@@ -3312,6 +3322,13 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setTimelineTreeMode: (tabId, open) => set(state => ({
     timelineTreeModeTabs: { ...state.timelineTreeModeTabs, [tabId]: open }
   })),
+  historyMcpAsUserTabs: initialHistoryMcpAsUserTabs,
+  setHistoryMcpAsUser: (tabId, enabled) => set(state => {
+    if (!tabId || (state.historyMcpAsUserTabs[tabId] ?? false) === enabled) return state;
+    const historyMcpAsUserTabs = { ...state.historyMcpAsUserTabs, [tabId]: enabled };
+    try { localStorage.setItem(LS_HISTORY_MCP_AS_USER_TABS, JSON.stringify(historyMcpAsUserTabs)); } catch {}
+    return { historyMcpAsUserTabs };
+  }),
 	  setHistoryPanelWidth: (width) => {
 	    const clamped = Math.max(HISTORY_PANEL_MIN_WIDTH, width);
 	    set({ historyPanelWidth: clamped });
@@ -3937,7 +3954,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Focus Area
   activeArea: 'workspace',
-  setActiveArea: (area) => set({ activeArea: area })
+  setActiveArea: (area) => {
+    if (get().activeArea !== area) set({ activeArea: area });
+  }
 }));
 
 // Черновик поля ввода сохраняется САМ, пока человек печатает.

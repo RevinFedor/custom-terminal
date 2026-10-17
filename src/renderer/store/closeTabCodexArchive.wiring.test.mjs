@@ -37,11 +37,13 @@ test('the close archive goes through the stop-and-retry wrapper', () => {
 test('the closing loader is up BEFORE the archive, and cleared on refusal', () => {
   // The Codex archive can spend real time (writer proof, stop, retry); a click
   // with no visible reaction for that long was the reported bug.
-  const loaderAt = closeTab.indexOf('showsPreArchiveLoader');
+  const loaderAt = closeTab.indexOf('beginTabCloseFeedback(');
   const archiveAt = closeTab.indexOf('commitArchiveWithStopRetry(');
   const refusalAt = closeTab.indexOf('if (!archiveCommit.ok) {');
   const clearAt = closeTab.indexOf('clearClosingLoader();');
-  assert.ok(loaderAt >= 0 && loaderAt < archiveAt, 'loader must precede the archive');
+  assert.ok(loaderAt >= 0 && loaderAt < closeTab.indexOf('await ipcRenderer.invoke'), 'feedback precedes the first runtime read');
+  assert.ok(loaderAt < archiveAt, 'loader must precede the archive');
+  assert.match(closeTab, /finally\s*\{\s*finishCloseFeedback\(\);/);
   assert.ok(refusalAt > archiveAt && clearAt > refusalAt, 'refusal must clear the loader');
 });
 

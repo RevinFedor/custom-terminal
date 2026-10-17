@@ -49,6 +49,15 @@ runtime ID из Settings.
 возвращённый draft. Полученный отрицательный renderer receipt не является
 bridge timeout. Если ответ потерян после возможного Enter, состояние остаётся
 delivery-unknown; отсутствие полей само по себе не доказывает no-submit.
+
+Для cold Codex delegate с явной model/effort парой ready launch ещё может быть
+provisional. Settings owner `launch:<id>` и conversation SID — разные оси:
+первая удерживает picker CAS, вторая приходит только из exact Resume authorization
+или adopted writer. Их смешение давало ложный target_changed до native picker
+(4196,17Oct). Обычная отправка без override не проходила этот участок; запрещать
+override, ждать первый пользовательский Enter или replay задания не требуется.
+Полные guards — `fact-codex.md::Модели и effort`.
+
 `read_draft` возвращает полный объект с текстом, imagePaths и draftTransfer,
 а не только непустую текстовую строку. Idle `interrupt_ai` читает current main
 turn у write-boundary и не пишет Escape; повтор не превращается в native Rewind.
@@ -93,11 +102,30 @@ process lookups. Установка из собственной сессии —
 Отдельный `overseer-server.mjs`, его MCP-регистрация и skill удалены. Причина объединения — не смешать blast radius, а дать нейронке одну обнаруживаемую поверхность: раньше правила выбора между двумя MCP жили в длинном skill/prompt и регулярно приводили к чтению ответа через terminal output или polling не того канала. Опасные операции по-прежнему разделены отдельными методами и approval-контрактами. Механика истории описана в [`fact-session-history.md`](fact-session-history.md).
 
 ### Определение проекта и своей вкладки
+
+Для небольшого списка известных tabIds есть пассивный `inspect_tabs` (до8,
+capability `tabInspection.version:1`), без запуска/ps/полного чтения истории.
+Ответ разделяет runtime/turn, собственный background, tracked jobs и pending
+доставку; optional verified cached final ограничен2000UTF-16 символами и содержит
+ref/truncated. Cold/unknown остаётся явным. Он не создаёт wait/job и не заменяет
+`wait_for_tab_response`. Полные границы — fact-session-history::Компактный пассивный
+снимок выбранных вкладок. Новый app handler требует обновления bundle, новый MCP
+wrapper — штатного refresh terminal-child после обновления его установленной копии.
 Внутри полноценной Noted Terminal-сессии main передаёт MCP `NOTED_PARENT_PROJECT_ID`, `NOTED_PARENT_TAB_ID` и `NOTED_MAIN_PID`. Они приоритетнее cwd и активной вкладки UI: пользователь может смотреть другой проект, пока агент работает в фоне. `current_context` возвращает доказанную пару project/tab и известный sessionId; self-операции (`rename_tab`, `link_file`, `get_tab_plan`, `apply_tab_plan_changes`) принимают отсутствующий `tabId` как эту родительскую вкладку.
 
 Внешний клиент без parent env использует `list_projects` и передаёт явный `projectId`/`tabId`. `process.cwd()` остаётся fallback для старых callers, но не source of truth для собственной идентичности.
 
-Изолированный dev/E2E задаёт ещё одну часть instance identity — `NOTED_DISCOVERY_DIR`. В этой папке обязаны вместе жить `mcp-port-*`, `web-server-*` и `web-token.txt`: read-команды Terminal MCP и Project API mutations должны выбрать один и тот же Electron main. Шрам 2026-09-03: `current_context` и `list_tabs` находили тестовый dev по `NOTED_MAIN_PID`, а `delegate_to_session` искал web-server только в глобальном `~/.noted-terminal` и уходил в production; результатом был правдивый, но чужой `404 source tab not found`. Terminal MCP теперь читает один discovery root для обоих каналов, Electron публикует туда обе записи, а Codex-регистрация явно наследует `NOTED_DISCOVERY_DIR`. Без override production по-прежнему использует `~/.noted-terminal`.
+Изолированный dev/E2E задаёт ещё одну часть instance identity — `NOTED_DISCOVERY_DIR`. В этой папке обязаны вместе жить `mcp-port-*`, `web-server-*` и `web-token.txt`: read-команды Terminal MCP и Project API mutations должны выбрать один и тот же Electron main. Шрам 2026-09-03: `current_context` и `list_tabs` находили тестовый dev по `NOTED_MAIN_PID`, а `delegate_to_session` искал web-server только в глобальном `~/.noted-terminal` и уходил в production; результатом был правдивый, но чужой `404 source tab not found`. Прямой stdio использует один process-configured discovery root для обоих каналов; без override это `~/.noted-terminal`. Shared hub использует следующий per-request контракт.
+
+Для shared hub это не общий ENV override: Main передаёт opaque instanceRoute
+с root и поколением в служебной identity. Terminal закрепляет одну пару MCP/API
+records и token того же root; missing/dead/replaced pin не становится host
+fallback. Source/recipient/launch/writer guards остаются у приложения. До ремонта
+17.10 именно fallback давал tab=null/exists=false; message POST ещё не вызывался.
+Новый route проверен настоящими current_context/inspect, send_message/reply/
+get_message двух private Luna и параллельным host lookup. Public root/port/
+credential аргументы не добавлены, дополнительных live stdio не требуется.
+Прямой stdio/env и прежний четырёхпольный host сохраняются отдельно.
 
 ### Tab Data: SQLite + Live State
 `/terminal/tabs` объединяет данные из двух источников:
@@ -113,6 +141,18 @@ Known empty namespace возвращает пустой свой список, �
 `current_context` имел правильные work-context/placement, но `tab:null` из-за
 раннего Project-only return. Это дефект списка Main, не подтверждение потери
 MCP transport и не основание убрать проверку actual tab.
+
+`/overseer/sessions` использует тот же один passive Codex runtime batch для
+глобального каталога, с `{tabId,savedSessionId}` и без общего projectId. Он не
+вызывает per-row process reconciliation или materialization истории. Прежний
+последовательный обход всех сохранённых сессий задерживал `list_open_sessions`
+за клиентский срок60с; тот же fan-out скрывался в `historyResultWithLifecycle`
+даже при чтении одной Claude-сессии. Это не отказ уже выполненного Create/Send.
+Проекция не является свежим физическим proof для Send: unknown/null writer
+сохраняются, saved SID не подставляется вместо живого writer, source не становится
+alias resumed child. History wrapper объявляет idle только при явном busy=false,
+liveLifecycle=true и status active/idle; closed/starting/unknown/missing не дают
+ложного completion. Exact сравнение sessionId и сами mutation guards прежние.
 
 ### План задач вкладки
 
@@ -221,6 +261,22 @@ Late join использует тот же абсолютный Main deadline, �
 доказанной готовности: окончательный допуск записи остаётся у physical guards.
 Точный Stop до paste даёт cancelled receipt, не generic preflight failure;
 уже подтверждённая отправка сильнее поздней отмены. Старые failed receipts не replay.
+
+Первое `ready` может предшествовать следующей незавершённой DEC2026-перерисовке.
+Для cold send-preflight Main использует оставшееся время того же
+launch deadline и прежний event-driven draft observer, а не отдельный ранний2.5s
+отказ, в том числе когда кадр открывается в первом flush await. Возле expiry
+остаток срока может быть меньше2500ms; повторные wakes его не продлевают.
+Definitive draft возвращается сразу. Обычный probe без текущего launch сохраняет свой срок;
+истечение не означает empty и не разрешает новый Send. Шрам/границы —
+`fact-codex.md`, cold Resume753/776/73ea14.10.
+
+Не смешивать этот preflight с публичным `draft_state`: установленный14.10
+HTTP inspect вызывает renderer `inspectDraft`, возвращает визуальный hint и
+frameIdentity, но не Main negative authority. Он полезен для read-only диагностики;
+новый разрешённый Send всё равно обязан пройти обычный Main proof. Отдельный
+Start перед hint не является исправлением cold-frame отказа и не разрешает
+replay прежней unknown/cancelled операции.
 
 ### Явный выбор native Goal через MCP
 
@@ -538,6 +594,23 @@ snapshot запроса в SQLite `agent_send_queue`, связывая его с
 refs фиксируются при приёме; дальнейший input их не меняет. Очередь не зависит
 от смонтированной History. Ошибка сохранения не является ACK.
 
+Pre-beginAttempt проверка адресата не должна смешивать раннюю event projection
+с поздним process proof: нормальная adoption первого cold Send иначе превращала
+следующий item в runtime_snapshot_unstable. Public Codex reader обновляет projection
+после process await под прежним owner/input/Stop fence. Сам FIFO и exact target
+не меняются; эта коррекция не разрешает повторить уже failed/unknown сообщение.
+
+Saved JSONL Rewind/Delete временно удерживает новые Send в этом же FIFO, включая
+ordinary/tab-message: процесс останавливается, а затем меняется сохранённая ветка.
+Один renderer activity-флаг или mutex только вокруг binding оставляли окно для
+чужого Resume источника между Stop и принятием копии. Main reservation берётся
+до первого await; тот же waiting item остаётся без attempt до завершения mutation
+и свежего input-ready proof. Launch-written не открывает очередь. Busy-ready
+разрешает steering; proven absent/inactive сохраняет обычный auto-start. После
+освобождения проверяется исходный адрес Send, без переноса в child. После restart
+сохраняется только пассивное удержание, не старый токен/право писать или replay
+unknown Send. Это SOURCE-контракт; физическая установленная приёмка15.10 открыта.
+
 Run After входит в этот же FIFO с отдельным automatic admission: согласие Root
 сверяется с coherent Main runtime и для Codex с текущим завершённым headless
 кадром. Resume может быть input-ready во время перерисовки старой переписки:
@@ -573,6 +646,14 @@ PTY scenario. Native acceptance (`QUEUED`) остаётся промежуточ
 повторного Enter, но не отменяет проверки чужого composer у следующей.
 Повтор handoff читает прежнюю операцию; другой payload с тем же ID — конфликт,
 одинаковый текст с разными ID — разные items.
+
+`ENTER_ARMED` монотонен и внутри `settleAttempt`, не только в `markAttemptState`:
+same-attempt поздний `submitted:false` от readiness/cancellation не переписывает
+durable arm в `NOT_SUBMITTED` и не освобождает FIFO. Остаётся тот же auditable
+attempt; exact canonical audit может завершить его позже. Отдельный доказанный
+`PROVIDER_NOT_ACCEPTED` после физического Enter сохраняет прежний контракт, как и
+реальный pre-arm no-input отказ. Контроли15.10 исполняют actual registry/store/
+SQLite/FIFO; ошибки или отсутствие native-provider проверки не заменяют receipt.
 
 Delivery evidence, отмена намерения и право держать input — разные оси. Main
 сохраняет exact physical lease при durable Enter-arm. После окончания текущего
@@ -641,6 +722,17 @@ audit может уточнить прошлую доставку, но не о�
 launch и непосредственно перед PTY write читает прежний receipt owner; один
 ошибочный launch invocation не может выдумать отрицательную Send-квитанцию.
 
+SOURCE15.10: новая физическая попытка до bridge получает Main-issued
+`preflightScope` в прежнем receipt JSON. Если тот же common Send завершился
+в `ensuring-ready` с exact `no-launch/launchWritten:false`, renderer передаёт
+отдельное свидетельство, не меняя исторический unknown самостоятельно. Store
+сверяет scope/operation/attempt/tab/handoff/provider и отсутствие provider-boundary,
+только затем сохраняет `not-submitted`. Нет scope, потерян launch ACK, другой
+attempt, уже начатый provider input или старый settled unknown сохраняют прежнюю
+неопределённость. Cancel не снимается; canonical audit имеет приоритет. Исключение
+после beginAttempt, но до вызова bridge, также завершается на той же попытке;
+ошибка вычисления payload не является таймаутом уже отправленного IPC.
+
 Standalone Start/Resume использует существующую terminal-instance/Stop revision,
 захваченную до async подготовки/очереди. Native `/start` и `/resume` передают её
 через bridge; это launch fence, не новый Send. Записанная shell-команда — уже
@@ -682,6 +774,13 @@ startup-решение; он не запускает новый scan. Ожида
 `sendQueue.receiptReconciliation.version=1`; первичный endpoint поддерживает Codex.
 MCP `get_send_receipt` остаётся read-only, без нового implicit reconcile/retry.
 Адресный POST доступен также как `reconcile_send_receipt({tabId,operationKey,attemptId})`.
+
+SOURCE15.10: explicit read допускает также active `in-flight`/`enter-armed`.
+Первый немедленно возвращает `unknown/enter-not-recorded` без scanner/claim/release;
+одной pre-Enter boundary недостаточно даже при matching ручной записи. Для
+`enter-armed` прежний bounded Codex scanner может подтвердить уже записанный Enter
+до renderer ACK. Перед публикацией повторно сверяются transport/attachment
+projection и source boundary. Default startup и Claude eligibility не расширены.
 
 API не принимает текст, SID, файл или готовый audit от caller. Main берёт exact
 receipt, участвует в прежнем tab-wide audit single-flight, передаёт scanner все
@@ -799,6 +898,14 @@ Enter. Тот же контракт используют обычные Prompt Q
 пока точная каноническая user-строка ещё не показана History. Hydration не
 создаёт промежуточный `SENDING`, который успел бы попасть в локальный cache и
 пережить уже подтверждённую отправку.
+
+Для addressed message с доказанным отказом до ввода Main может вновь опубликовать
+ту же запись как application waiting по своему message-owner wake. History принимает
+это только при exact lastNoWriteAttemptId и общем isTabMessageNoInputReceipt,
+не по цвету/ошибке/idle. Старый negative attempt остаётся прежним; только executor
+begin вводит следующую физическую попытку. Hydration A не откатывает B, а sent,
+cancelled и provider-queue proof не превращаются в waiting. Подробности recovery —
+`fact-tab-messages.md::Доставка и восстановление`.
 
 Image refs той же local карточки также восстанавливаются после exact attempt
 binding, включая live FIFO receipt, не только mount-list. Read-only proof не
@@ -932,6 +1039,13 @@ Stop, пришедший во время per-send `/model`/`/effort`/Think, пр
 Portable image marker является намерением вложить файл только когда внутри указан абсолютный filesystem path. Относительный путь или prose-пример проходит в prompt дословно, не занимает image-slot и не запускает staging; документация с буквальным `[imagePath: example only]` не должна приводить к `codex_image_path_unavailable`. Доступный абсолютный путь сохраняет обычный attachment-flow. Если абсолютный файл исчез между подготовкой и отправкой, это не отменяет весь prompt: marker становится позиционным `imageError`, а окружающий текст и остальные вложения отправляются. В UI известная недоступность показывается постоянным предупреждением до Send; после явного Send повторный отказ всего сообщения уже не является допустимым способом сообщить о ней. Direct plan и preflight replacement обязаны проверять одну и ту же границу абсолютности.
 
 ### Таймауты и неизвестный исход отправки
+
+Для tracked SC research deadline/abort охватывает также HTTP body: заголовки200
+не завершают запрос. При cancel/detach пока SC status ещё отвечает404 coordinator
+проверяет terminal после store initialize и после persistence до первого start.
+Это отдельный research transport/admission путь, не terminal PTY timeout и не
+объяснение медленного ps. После сетевого start сохраняются same-job reconciliation
+и unknown-правила, не новый runId. Подробности — fact-оркестрация-вкладок::Browser-консультация.
 
 Два fail-closed edge этого маршрута. (1) Bridge-timeout (60с) ≠ ошибка доставки: renderer-сценарий может законно жить дольше (launch-if-needed + readiness + paste) и всё ещё доставить prompt — ответ в этом случае HTTP 202 `delivery-unknown` с предупреждением не повторять тот же prompt вслепую; повтор в живую AI-сессию хуже неизвестного статуса (тот же принцип, что completion prompt после rebuild выше). (2) Если renderer ещё не гидрировал workspace store (запрос сразу после старта приложения), сценарий не сваливается в Claude SDK fallback — для MCP-источников это была бы отправка НЕ тем агентом в Codex-вкладку; возвращается явная ошибка «tab not resolved yet, retry after load».
 
@@ -1267,7 +1381,7 @@ Shell остаётся живым. Output buffer не теряется. PTY pid 
 ## Развёртывание
 Repo source — `mcp/terminal-server.mjs`, установленная копия — `~/.claude/mcp/terminal-server.mjs`. Claude и Codex регистрируют только имя `terminal`; отдельной регистрации `overseer` нет. Skill-source живёт в `~/.claude/skills/terminal/` и автоматически зеркалится в `~/.codex/skills/terminal/`.
 
-Каноническая установка выполняется `npm run install:terminal-mcp`. Установщик сравнивает runtime-файлы побайтно и заменяет только отличающиеся через временный файл + атомарный rename; конфиги также меняются атомарно, с backup, и точечно нормализуют регистрацию Claude/Codex, не перезаписывая другие MCP и не печатая секреты. В `env_vars` регистрации обязательно прокидываются `NOTED_MAIN_PID`, `NOTED_PARENT_PROJECT_ID`, `NOTED_PARENT_TAB_ID` и опциональный `NOTED_DISCOVERY_DIR`: MCP-процесс, запущенный Codex, не получает эти значения автоматически только потому, что их имел родительский CLI. Dry-run и повторный запуск должны быть идемпотентны.
+Каноническая установка выполняется `npm run install:terminal-mcp`. Runtime-файлы сравниваются побайтно и заменяются через temporary+rename; конфиги — с backup и сохранением permissions, без перезаписи других entries или вывода секретов. Прямой stdio наследует NOTED_MAIN_PID, NOTED_PARENT_PROJECT_ID, NOTED_PARENT_TAB_ID, NOTED_DISCOVERY_DIR, NOTED_MCP_INSTANCE_ROUTE. Для узнаваемого Claude terminal hub URL добавляется только route-placeholder; Codex HTTP config остаётся побайтно прежним. Dry-run и повторный запуск идемпотентны.
 
 `npm run build:install` после успешной упаковки, но до замены и запуска `/Applications/Noted Terminal.app`, обязательно вызывает этот же `install:terminal-mcp`, а затем отдельный `install:claude-hook` для turn-event bridge. Ручной build-install, `build:i-obs` и Voice Record сходятся в одном `npm run build:install`, поэтому copy-логика не дублируется в shell/соседнем приложении. Если синхронизация runtime-интеграций падает, цепочка `&&` не устанавливает и не запускает новый backend; безопаснее временно иметь новый клиент со старым backend, чем поднять новый backend со stale-клиентом без обязательной identity metadata.
 

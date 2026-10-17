@@ -298,13 +298,18 @@ api.loadSessionRecords = async (id, cwd, options = {}) => {
   return result;
 };
 const originalHistory = api.projectCodexFullHistoryFromFile;
+function currentRewriteReceipt(id) {
+  const receipt = requestContext.getStore()?.rewriteReceipt;
+  return receipt?.sessionId === id ? receipt : null;
+}
 function observeProjection(result) {
   const context = requestContext.getStore();
   if (context && Number.isFinite(result?.fedRecords)) context.fedRecords += result.fedRecords;
   return result;
 }
 api.projectCodexFullHistoryFromFile = async (id, cwd, options = {}) => observeProjection(await originalHistory(id, cwd, {
-  ...options, ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
+  ...options, rewriteReceipt: currentRewriteReceipt(id),
+  ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
 }));
 const originalTimeline = api.projectCodexTimelineFromFile;
 api.projectCodexTimelineFromFile = async (id, cwd, options = {}) => {
@@ -319,7 +324,8 @@ api.projectCodexTimelineFromFile = async (id, cwd, options = {}) => {
     };
   }
   return observeProjection(await originalTimeline(id, cwd, {
-    ...options, ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
+    ...options, rewriteReceipt: currentRewriteReceipt(id),
+    ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
   }));
 };
 
@@ -489,10 +495,9 @@ historyPreparationActivity.subscribe(snapshot => send({ event: 'preparation', sn
 observeHistoryResponseTimingBindings(payload => send({ event: 'timing-bound', payload }));
 const chains = new Map();
 const queueDepths = new Map(); // Diagnostic-only; entries follow the existing RPC chains.
-const receipts = new Map();
 const originalReceipt = api.getCodexRewriteReceipt;
 api.getCodexRewriteReceipt = (id, source) => {
-  const receipt = receipts.get(id);
+  const receipt = currentRewriteReceipt(id);
   return receipt && (!source || receipt.sourceSessionId === source) ? receipt : originalReceipt(id, source);
 };
 
@@ -544,8 +549,8 @@ parentPort.on('message', message => {
     if (method === 'releaseMemory') { api.invalidateCodexHistoryProjectors(); cache.clearMemory();
       service.codexVirtualTranscriptStore?.clear(); return { value: true, readProof: [] }; }
     if (!['getHistory', 'getTimeline', 'getToolPayload', 'getTabMessageSourceLocation', 'getMessages', 'searchHistory', 'searchCatalogCandidate',
-      'resolveCodexPhysicalRow', 'copyCodexVirtualRange', 'exportCodexSession'].includes(method)) throw new Error('history_read_method');
-    if (message.rewriteReceipt) receipts.set(payload.sessionId, message.rewriteReceipt);
+      'resolveCodexPhysicalRow', 'copyCodexVirtualRange', 'exportCodexSession', 'prepareCodexRewrite'].includes(method)) throw new Error('history_read_method');
+    context.rewriteReceipt = message.rewriteReceipt || null;
     Object.assign(context, { payloads: new Map(), sources: new Set(), sourceEpochs: sourceEpochs.slice(), preparations: [], assets: new Map() });
     return requestContext.run(context, async () => {
       const memoryRead = method === 'searchCatalogCandidate' ? beginHistoryReadDiagnostic('catalog-projection', {
@@ -553,7 +558,11 @@ parentPort.on('message', message => {
       }) : null;
       try {
         if (method === 'searchCatalogCandidate') { context.catalogScan = true; await enterCold(); }
-        const result = await service[method](payload);
+        const prepared = method === 'prepareCodexRewrite'
+          ? await api.projectCodexFullHistoryFromFile(payload.sessionId, payload.cwd) : null;
+        const result = prepared ? { success: prepared.success, error: prepared.error, mode: prepared.mode,
+          fedRecords: prepared.fedRecords, reusedRecords: prepared.reusedRecords || 0, sourceSnapshot: prepared.sourceSnapshot }
+          : await service[method](payload);
         const readProof = [...context.sources].map(filePath => ({ filePath,
           epoch: context.sourceEpochs[epochSlot(filePath)], slot: epochSlot(filePath) }));
         if (readProof.some(source => source.epoch !== Atomics.load(sourceEpochs, source.slot))) {
@@ -638,7 +647,6 @@ parentPort.on('message', message => {
       if (chains.get(key) === run) chains.delete(key);
       const remaining = queueDepths.get(key) - 1;
       if (remaining) queueDepths.set(key, remaining); else queueDepths.delete(key);
-      receipts.delete(payload.sessionId);
     });
 });
 

@@ -21,10 +21,11 @@ const names = ['withPtyWriteLock', 'captureCodexOwnedSlashDraftIdentity', 'valid
   'rollbackCodexOwnedSlashDraft', 'sendCodexSlashCommand', 'captureAgentInputAtWriteBoundary', 'selectCodexModelEffort',
   'safePasteAndSubmit', 'getCodexLiveInputControl', 'waitForCodexInputPreparation',
   'isCodexOwnedSlashSubmitReady', 'sendCodexLiveSlashCommand'];
+names.push('captureCodexSendStartupFrameWait', 'codexSendStartupFrameWaitIsCurrent');
 const tick = () => new Promise(r => setImmediate(r));
 
-function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
-  const writes = [], wakes = [], fastWakes = [];
+function harness({ frameTimedOut = true, synchronousClear = true, diagnosticLogThrows = false } = {}) {
+  const writes = [], wakes = [], fastWakes = [], logs = [];
   let inputRevision = 1, stopRevision = 0, run = 2, lifecycle = 'G:2';
   let proof;
   const mirror = { generation: 'M', writeSeq: 10, synchronizedFrameWaiters: new Set(),
@@ -44,7 +45,13 @@ function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
     if (!frameTimedOut && slash) frame(slash);
   } };
   const ctx = vm.createContext({ ...picker, codexNativeDraftTransfer, observeAgentInput,
-    console: { log() {}, warn() {} }, queueMicrotask, setTimeout, clearTimeout,
+    ...require('./codex-slash-input-diagnostics'),
+    ...require('./codex-runtime-contract'),
+    codexSendStartupFrameWaits: new WeakMap(), CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000,
+    console: { log(...args) {
+      if (diagnosticLogThrows && String(args[0]).startsWith('[CodexSlashInput] ')) throw new Error('fixture-log-sink');
+      logs.push(args.join(' '));
+    }, warn(...args) { logs.push(args.join(' ')); } }, queueMicrotask, setTimeout, clearTimeout,
     terminals: new Map([['T', term]]), terminalCommandState: new Map([['T', { isRunning: true, runSeq: run }]]),
     aiStoppingTabs: new Map(), codexLastRunCommandPayload: new Map([['T', { launchId: 'L' }]]),
     codexSettingsMutationQueue: createCodexSettingsMutationQueue(),
@@ -83,6 +90,8 @@ function harness({ frameTimedOut = true, synchronousClear = true } = {}) {
   });
   vm.runInContext(names.map(declaration).join('\n'), ctx);
   return { ctx, term, writes, wakes, fastWakes, mirror, frame,
+    diagnostics: () => logs.filter(line => line.startsWith('[CodexSlashInput] '))
+      .map(line => JSON.parse(line.slice('[CodexSlashInput] '.length))),
     get receipt() { return ctx.codexSettingsMutationQueue.getUnsubmittedInput(term); },
     async expire(command = '/model') { return ctx.withPtyWriteLock(term, () => ctx.sendCodexSlashCommand(term, command, '[test]', {
       tabId: 'T', readDraftState: async () => proof, writeGuard: () => ({ allowed: true }),
@@ -128,6 +137,60 @@ test('slash timeout reports the last rejected frame boundary, not an invented em
   assert.equal(result.slashInputObservation.frame.hasDraft, false);
   assert.equal(h.writes.length, 1);
   h.change('input');
+});
+
+test('slash diagnostic preserves the stalled post-paste boundary and the same late cleanup ID', async () => {
+  const h = harness();
+  try {
+    await h.expire('/compact');
+    const expired = h.diagnostics().find(row => row.outcome === 'observation-result');
+    assert.ok(expired, 'timeout must carry its bounded input-chain diagnostic');
+    assert.equal(expired.stages['paste-returned'].count, 1);
+    assert.equal(expired.stages['enter-attempt'], undefined);
+    assert.equal(expired.state.writeSeq, 10);
+    assert.equal(expired.lastDecision.reason, 'post-write-composer-unproven');
+    h.frame('/compact'); await tick(); await tick();
+    const released = h.diagnostics().find(row => row.outcome === 'released');
+    assert.equal(released.traceId, expired.traceId);
+    assert.equal(released.lastDecision.reason, 'owned-input-cleared');
+    assert.equal(released.stages['rollback-returned'].count, 1);
+    assert.equal(h.writes.filter(data => data === '\r').length, 0);
+    assert.equal(h.mirror.codexSlashInputDiagnostic, null);
+  } finally { h.change('input'); }
+});
+
+test('successful slash logs paste proof and physical Enter separately without changing writes', async () => {
+  const h = harness({ frameTimedOut: false });
+  try {
+    await h.expire('/fast');
+    const entered = h.diagnostics().find(row => row.outcome === 'enter-result');
+    assert.ok(entered, 'Enter authorization is not the return of term.write');
+    assert.equal(entered.stages['paste-returned'].count, 1);
+    assert.equal(entered.stages['enter-attempt'].count, 1);
+    assert.equal(entered.stages['enter-returned'].count, 1);
+    assert.equal(entered.stages['enter-threw'], undefined);
+    assert.deepEqual(h.writes, ['\x01\x0b\x1b[200~/fast\x1b[201~', '\r']);
+  } finally { h.change('input'); }
+});
+
+test('a failed diagnostic sink does not change the actual slash result, Enter count or cleanup', async () => {
+  const h = harness({ frameTimedOut: false, diagnosticLogThrows: true });
+  const result = await h.expire('/fast');
+  assert.equal(result.success, true);
+  assert.deepEqual(h.writes, ['\x01\x0b\x1b[200~/fast\x1b[201~', '\r']);
+  assert.equal(h.receipt, null); assert.equal(h.mirror.codexSlashInputDiagnostic, null);
+});
+
+test('physical Enter throw is recorded without claiming returned input or leaking the error body', async () => {
+  const h = harness({ frameTimedOut: false }), write = h.term.write;
+  h.term.write = data => { if (data === '\r') throw new Error('PRIVATE WRITE ERROR'); write(data); };
+  await assert.rejects(h.expire('/fast'), /PRIVATE WRITE ERROR/);
+  const entered = h.diagnostics().find(row => row.outcome === 'enter-result');
+  assert.equal(entered.stages['enter-attempt'].count, 1);
+  assert.equal(entered.stages['enter-threw'].count, 1);
+  assert.equal(entered.stages['enter-returned'], undefined);
+  assert.equal(JSON.stringify(h.diagnostics()).includes('PRIVATE WRITE ERROR'), false);
+  assert.equal(h.receipt, null, 'a possible Enter must not retain cleanup authority');
 });
 
 test('frame diagnostics distinguish a foreign composer value without storing its text', async () => {

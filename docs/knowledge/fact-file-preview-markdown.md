@@ -14,12 +14,11 @@
 
 ### 1. Источник пакета `@gt-editor/markdown-editor`
 
-**ВАЖНО:** Это **НЕ** публичный npm-пакет. Это локальный проект на рабочем столе:
-- Путь: `/Users/fedor/Desktop/gt-editor/packages/markdown-editor/`
-- При изменении пакета перед сборкой Noted Terminal нужен `npm run build:markdown`:
-  он собирает GT package и синхронизирует dist в локальную копию consumer.
-- Если удалить папку `gt-editor` с десктопа — приложение сломается
-- При деплое нужно либо копировать gt-editor, либо опубликовать пакет в приватный registry
+В переносимом checkout это bundled npm workspace `vendor/markdown-editor`.
+`npm run build:markdown` собирает его; корректный npm install связывает
+`node_modules/@gt-editor/markdown-editor` с этой папкой. Соседний GT checkout
+для сборки Noted не требуется. Его редактор продолжает жить отдельно:
+правка только GT source не обновляет vendored source автоматически.
 
 ### 2. ReadOnly ≠ Статичный HTML
 
@@ -105,6 +104,18 @@ Installed версия и полный пользовательский workspac
 
 `sidebarPersistFile` описывает цикл «закрыл → открыл сайдбар», а не «ушёл из проекта → вернулся». Раньше sync-эффект не различал эти события: возврат в проект попадал в ту же ветку, что и закрытие сайдбара, и открытый файл терялся (а при закрытом сайдбаре ещё и стирался сохранённый путь покидаемого проекта). Теперь смена проекта отличается явно: уход ничего не очищает, а возврат восстанавливает переживший файл независимо от настройки — очищать было нечего, значит и восстанавливать нечего запрещать. Переносимый принцип — `methodology/дизайн-принципы.md::Уход из контекста — не отмена внутри него`.
 
+### 6c. Чтение файла в отдельном окне workspace
+
+Возврат AI→Markdown→другой Markdown→AI должен сохранять выбранное место чтения.
+17.10 самостоятельный SplitFilePane терял900px→0 на каждом возврате: editor
+пересоздавался, а память global FilePreview к нему не была подключена. Теперь
+тот же absolute-path memory применяется через настоящий onEditorView и initial
+restore редактора. Начальное programmatic scroll-эхо не сохраняется поверх цели;
+wheel/pointer/scroll-key отдаёт позицию читателю, запись coalesced и flushed при
+detach. Новый path не показывает прежний loaded body до ответа чтения. Нет
+второго reader, DOM polling или удержания всех файловых DOM. Реальный private
+built-renderer подтвердил шесть возвратов двух файлов; installed версия отдельно.
+
 ### 7. Open in Sublime Text
 
 FilePreview остаётся read-only поверх `MarkdownEditor`; кнопка `Sublime` в header'е — явный выход из режима чтения в полноценный внешний редактор. Это не должно идти через renderer `exec` или `shell.openPath`: production `.app` на macOS наследует launchd PATH без Homebrew/user-local bin, поэтому main-side handler сам расширяет PATH (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.claude/local/bin`), валидирует что путь абсолютный и указывает на файл, затем пробует `SUBLIME_TEXT_CLI`, app-bundle `subl`, `subl` из PATH и только потом `open -a "Sublime Text"`.
@@ -151,16 +162,26 @@ Fallback на LaunchServices нужен потому что у пользова�
 
 ## Build Process
 
-В package.json consumer указан `@gt-editor/markdown-editor`; рабочий build-flow
-обновляет локальный GT dist явно. При правке исходников пакета нужны три шага:
+Текущий build-flow собирает vendored workspace:
 
 ```json
-"build:markdown": "cd ../gt-editor/packages/markdown-editor && npm run build && rsync -a --delete dist/ ../../../custom-terminal/node_modules/@gt-editor/markdown-editor/dist/ && rm -rf ../../../custom-terminal/node_modules/.vite"
+"build:markdown": "npm run build --workspace @gt-editor/markdown-editor"
 ```
 
-1. **Build** в gt-editor packages → обновляет `dist/index.cjs`.
-2. **Rsync** в `node_modules/@gt-editor/markdown-editor/dist/` — копия consumer не обновляется от редактирования соседнего GT repo; исторический `file:`-install также оставлял независимую копию dist.
-3. **`rm -rf node_modules/.vite`** — Vite prebundle cache не инвалидируется при изменении `dist/` локально-разрабатываемого пакета. Без удаления кеша Vite на следующем `dev` start читает старый prebundle, и правки не подхватываются.
+После перехода с прежней независимой копии consumer нужны зависимости workspace,
+включая `vite-plugin-dts`, и правильная npm-ссылка. Простое добавление плагина без
+обновления ссылки оставляет приложение на старом dist. Новые host imports требуют
+согласованного source API; чипы сообщений используют общий NT codec, а не отдельный
+парсер в vendored редакторе. Ошибки TypeScript при декларациях завершают build отказом.
+
+Исторический flow собирал соседний GT package и rsync-ил dist. Для dev после
+изменения пакета прежний prebundle может требовать очистки `node_modules/.vite`.
+Production build и dev prebundle — разные границы.
+
+Параллельные сборки одного редактора нельзя направлять в общий dist: rollup типов
+удаляет промежуточные `.d.ts`, которые ещё может читать соседняя сборка.
+Проверочный build должен использовать отдельную source/output копию, включая
+package.json с его `types`: одной подмены Vite outDir недостаточно для деклараций.
 
 После — обязателен перезапуск `npm run dev` (HMR **не** перебирает prebundle).
 

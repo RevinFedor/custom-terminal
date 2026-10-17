@@ -44,6 +44,45 @@ function fixture(t, records, { sessionId = 'S', reader = makeReader() } = {}) {
 const pure = result => { const { sourceSnapshot, sourceVerified, ...value } = result; return value; };
 const proofAt = index => ({ targetExecutionContext: context, promptUserUuid: 'codex-user-S-' + index });
 
+test('passive completed reader uses verified structural/text caches only and marks stale/cold evidence', async t => {
+  const rows = [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'go' }),
+    message('assistant', 'answer'.repeat(500)), event('task_complete', { turn_id: 'T', last_agent_message: 'answer'.repeat(500) })];
+  const f = fixture(t, rows);
+  const request = { sessionId: 'S', cwd: path.dirname(f.file), readSourceRevision: () => f.file };
+  assert.equal((await f.reader.readCachedCompleted(request)).reason, 'result_cache_cold');
+  await f.load(proofAt(1));
+  const before = f.reader.stats();
+  let result = await f.reader.readCachedCompleted(request);
+  assert.equal(result.known, true); assert.equal(result.complete, true);
+  assert.equal(result.ref.targetExecutionContext.turnId, 'T'); assert.ok(result.assistantText.length <= 2000);
+  assert.equal(f.reader.stats().bytesRead, before.bytesRead); assert.equal(f.reader.stats().bodyBytesRead, before.bodyBytesRead);
+  assert.equal(f.reader.stats().verificationBytes, before.verificationBytes);
+  f.append([event('task_started', { turn_id: 'B' }), event('user_message', { message: 'next' })]);
+  assert.equal((await f.reader.readCachedCompleted(request)).reason, 'result_cache_stale');
+  await f.reader.loadLatestObservedExecution({ sessionId: 'S', cwd: request.cwd, resolveSource: f.resolveSource });
+  result = await f.reader.readCachedCompleted(request);
+  assert.equal(result.known, true); assert.equal(result.ref.targetExecutionContext.turnId, 'T');
+  assert.equal((await f.reader.readCachedCompleted({ ...request, readSourceRevision: () => 'changed' })).reason, 'result_lineage_unverified');
+  f.reader.invalidate(f.file);
+  assert.equal((await f.reader.readCachedCompleted(request)).reason, 'result_cache_cold');
+});
+
+test('passive final does not cross rollback, same-size rewrite, or missing cached text', async t => {
+  const rows = [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'go' }),
+    message('assistant', 'answer'), event('task_complete', { turn_id: 'T', last_agent_message: 'answer' })];
+  for (const change of ['rollback', 'rewrite', 'evicted']) {
+    const f = fixture(t, rows, { reader: makeReader(change === 'evicted' ? { maxTextBytes: 0 } : {}) });
+    await f.load(proofAt(1));
+    if (change === 'rollback') {
+      f.append([event('thread_rolled_back', { num_turns: 1 })]);
+      await f.reader.loadLatestObservedExecution({ sessionId: 'S', cwd: path.dirname(f.file), resolveSource: f.resolveSource });
+    }
+    if (change === 'rewrite') fs.writeFileSync(f.file, encode(rows).replaceAll('answer', 'change'));
+    const result = await f.reader.readCachedCompleted({ sessionId: 'S', cwd: path.dirname(f.file), readSourceRevision: () => f.file });
+    assert.equal(result.known, false, change); assert.equal(result.assistantText, undefined);
+  }
+});
+
 for (const warm of [false, true]) for (const replacementKind of ['inode', 'same-inode']) {
 test('final source resolution rejects a physical replacement after I/O, warm=' + warm + ', ' + replacementKind, async t => {
   const rows = [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'go' }),

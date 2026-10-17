@@ -25,6 +25,20 @@ function codexOwnTurnLaunchSettings(record, sessionId, physicalSessionId) {
   return codexLaunchSettings(record.payload, sessionId, 'own-turn-context', record.timestamp);
 }
 
+// Independent of model/effort creation proof: started and turn_context do not
+// carry this field. A copied ancestor snapshot keeps its original thread_id.
+function codexOwnLaunchServiceTier(record, sessionId, physicalSessionId) {
+  const payload = record?.payload;
+  if (record?.type !== 'event_msg' || payload?.type !== 'thread_settings_applied'
+    || !clean(sessionId) || sessionId !== physicalSessionId
+    || payload.thread_id !== sessionId) return null;
+  const value = payload.thread_settings?.service_tier;
+  const tier = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return { version: 1, provider: 'codex', sessionId, source: 'own-thread-settings',
+    serviceTier: tier === 'priority' || tier === 'fast' ? 'priority' : tier === 'default' ? 'default' : null,
+    timestamp: clean(record.timestamp) };
+}
+
 function claudeOwnAssistantLaunchSettings(record) {
   const model = clean(record?.message?.model);
   if (record?.type !== 'assistant' || !model || model === '<synthetic>') return null;
@@ -32,4 +46,5 @@ function claudeOwnAssistantLaunchSettings(record) {
     source: 'own-assistant', model, effort: null, timestamp: clean(record.timestamp) };
 }
 
-module.exports = { codexStartedLaunchSettings, codexOwnTurnLaunchSettings, claudeOwnAssistantLaunchSettings };
+module.exports = { codexStartedLaunchSettings, codexOwnTurnLaunchSettings,
+  codexOwnLaunchServiceTier, claudeOwnAssistantLaunchSettings };

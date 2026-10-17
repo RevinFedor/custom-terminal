@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useUIStore } from '../../store/useUIStore';
 import FilePreviewHeader from './FilePreviewHeader';
+import { writeMeasuredClipboardText } from '../../utils/composerClipboardDiagnostics.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
@@ -185,7 +186,7 @@ export default function FilePreview({ topOffset = 0 }: { topOffset?: number }) {
   const handleCopyContent = async () => {
     if (filePreview) {
       const { clipboard } = window.require('electron');
-      clipboard.writeText(filePreview.content);
+      writeMeasuredClipboardText(clipboard, filePreview.content, 'file-preview');
       setCopied(true);
       showToast('Copied to clipboard', 'success');
       setTimeout(() => setCopied(false), 1500);

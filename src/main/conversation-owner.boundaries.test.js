@@ -45,6 +45,7 @@ function mainHarness(db = memoryDb(), receiptStore = null) {
   let request = { sendOperationKey: 'K', sendAttemptId: 'A' };
   const term = { write: bytes => writes.push(bytes) };
   const ctx = vm.createContext({ console: quiet, path, srcMainDir: __dirname, conversationOwners: owner,
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
     tabWorkContext: { assertContinuationScope() {} }, // this fixture has no quiet completion context
     terminals: new Map([['T', term]]), terminalProjects: new Map([['T', '/fixture']]), terminalInputRevisions: new Map(),
     terminalCommandState: new Map([['T', { runSeq: 1, isRunning: false }]]), claudeLaunchGenerationByTab: new Map(),
@@ -252,6 +253,7 @@ test('actual Codex binding IPC + SQLite commit share the exact operation checkpo
   function visit(n) { if (ts.isCallExpression(n) && n.expression.getText(main.ast) === 'ipcMain.handle' && n.arguments[0]?.text === 'tab:set-codex-session-id') call = n.getText(main.ast); ts.forEachChild(n, visit); }
   visit(main.ast); assert.ok(call);
   vm.runInNewContext(call, { ipcMain: { handle: (_name, fn) => { handler = fn; } }, console: quiet, path, srcMainDir: __dirname,
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
     runKeyedExclusive: (_map, _tab, fn) => fn(), codexLaunchInflight: new Map(),
     resolveAuthoritativeTabProjectId: () => 'P', codexLastRunCommandPayload: new Map(),
     getCodexRuntimeSessionSnapshot: async () => ({ liveLifecycle: false }), projectManager: { db },

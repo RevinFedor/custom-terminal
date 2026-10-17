@@ -83,6 +83,36 @@ test('the shared handoff wrapper distinguishes accepted application work from pr
   assert.equal(store.getSnapshot(r.tabId)[0].queueStatus, 'application-queued');
 });
 
+for (const transport of ['return', 'throw']) {
+  for (const signal of ['cancelled', 'durable-control']) {
+    test('actual wrapper presents known pre-input cancellation, not SEND FAILED: ' + transport + '/' + signal, async () => {
+      const store = new HistoryPromptHandoffStore(), r = record('stop-' + transport + '-' + signal);
+      const receipt = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+        code: 'agent_send_cancelled', ...(signal === 'cancelled' ? { cancelled: true }
+          : { deliveryControl: { version: 1, cancelledAt: 100, attemptId: 'A' } }) };
+      const run = runHistoryPromptHandoff({ tabId: r.tabId, handoffId: r.handoffId, toolType: 'codex',
+        text: r.receipt.promptText, sendAttemptId: 'A', sendOperationKey: r.operationKey,
+        send: async () => { if (transport === 'throw') throw Object.assign(new Error('cancelled'), { sendReceipt: receipt }); return receipt; } }, store);
+      if (transport === 'throw') await assert.rejects(run, /cancelled/); else await run;
+      const row = store.getSnapshot(r.tabId)[0];
+      assert.equal(row.queueStatus, 'cancelled');
+      assert.equal(historyPromptHandoffStatusPresentation(row.queueStatus)?.label, 'CANCELLED');
+      assert.equal(row.text, r.receipt.promptText);
+      assert.equal(row.sendAttemptId, 'A');
+    });
+  }
+  test('cancellation without no-submit proof remains unconfirmed: ' + transport, async () => {
+    const store = new HistoryPromptHandoffStore(), r = record('unknown-stop-' + transport);
+    const receipt = { success: false, submitted: null, cancelled: true, deliveryUnknown: true };
+    const run = runHistoryPromptHandoff({ tabId: r.tabId, handoffId: r.handoffId, toolType: 'codex',
+      text: 'not safe to resend', send: async () => {
+        if (transport === 'throw') throw Object.assign(new Error('unknown'), { sendReceipt: receipt }); return receipt;
+      } }, store);
+    if (transport === 'throw') await assert.rejects(run, /unknown/); else await run;
+    assert.equal(store.getSnapshot(r.tabId)[0].queueStatus, 'delivery-unknown');
+  });
+}
+
 const noInput = { success: false, accepted: false, deferred: true, automaticReadinessWait: 1,
   error: 'codex_input_not_ready', submitted: false, pasteWritten: false, enterWritten: false };
 test('Main-certified busy deferral is IN APP QUEUE, not failed, through wrapper and remount', async () => {

@@ -201,7 +201,7 @@ async function prepareStructuredAuthoring(input, { allowUploadFiles = false } = 
     // Authoring IDs stay editable/client-owned. Native image slots on the new
     // send are numbered in transport occurrence order, including repetitions.
     // A declared missing image is an imageError text part, not a native slot.
-    presentationSnapshot: { promptChips: chips.filter(chip => chip.kind === 'prompt'), imagePaths: usedImages
+    presentationSnapshot: { promptChips: chips.filter(chip => chip.kind === 'prompt' || chip.kind === 'paste' && chip.messageReference), imagePaths: usedImages
       .filter(ref => ref.path && ref.availability !== 'missing')
       .map((ref, index) => ({ ...ref, id: index + 1 })),
       authoringTransport: { sourceHash: hash(prompt), bodyLength: prompt.length - normalizedBodyStart,

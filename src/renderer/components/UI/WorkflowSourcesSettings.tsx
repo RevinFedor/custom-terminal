@@ -1,7 +1,7 @@
 import React,{useCallback,useEffect,useRef,useState} from 'react';
 import {FolderPlus,Settings2,RefreshCw} from 'lucide-react';
 import {useWorkspaceStore} from '../../store/useWorkspaceStore';
-import {promptRootChoices,togglePromptRoot,tabPromptBindingRequest,validatePromptRootSnapshot} from '../Workspace/promptTabSourcesModel.mjs';
+import {promptRootChoices,promptSourceSearchPath,promptRootForSelectedFolder,togglePromptRoot,tabPromptBindingRequest,validatePromptRootSnapshot} from '../Workspace/promptTabSourcesModel.mjs';
 import DirectoryRootsSettings from './DirectoryRootsSettings';
 
 const control:React.CSSProperties={border:'1px solid #444',borderRadius:4,background:'#252526',color:'#ccc',padding:'3px 5px',fontSize:12,cursor:'pointer'};
@@ -36,8 +36,8 @@ function TabSources({tabId,workflowId}:{tabId:string;workflowId:string}){
     if(lock.current || !snapshot || pending || !current())return;
     lock.current=true;setBusy(true);setError('');
     try{
-      const folder=await ipc().invoke('app:select-directory');if(!folder || !current())return;
-      const existing=snapshot.roots.find((root:any)=>root.path===folder);
+      const folder=await ipc().invoke('app:select-directory',{buttonLabel:'Выбрать корень'});if(!folder || !current())return;
+      const existing=promptRootForSelectedFolder(snapshot,folder);
       if(existing){setIds(value=>togglePromptRoot(value,existing.id,true));return;}
       const result=await ipc().invoke('workflow:save-root',{path:folder,kind:'prompt-source',enabled:true,expectedRevision:snapshot.revision,mutationId:crypto.randomUUID()});
       if(!current())return;
@@ -49,11 +49,15 @@ function TabSources({tabId,workflowId}:{tabId:string;workflowId:string}){
     finally{lock.current=false;if(current())setBusy(false);}
   };
   return <div data-workflow-tab-sources={tabId} aria-busy={busy}>
-    {snapshot && promptRootChoices(snapshot).map((root:any)=><label key={root.id} title={root.path}
-      style={{display:'flex',alignItems:'center',gap:5,padding:'2px 0',fontSize:12,cursor:'pointer'}}>
+    {snapshot && promptRootChoices(snapshot).map((root:any)=><label key={root.id} title={`Root: ${root.path}\nSearch: ${promptSourceSearchPath(root)}/**/*.prompt.md`}
+      style={{display:'flex',alignItems:'flex-start',gap:5,padding:'2px 0',fontSize:12,cursor:'pointer'}}>
       <input type="checkbox" data-prompt-source-root-id={root.id} checked={ids.includes(root.id)}
         disabled={busy || !!pending || root.removed&&!ids.includes(root.id)} onChange={event=>setIds(value=>togglePromptRoot(value,root.id,event.target.checked))}/>
-      <span style={{minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{root.name || root.sourceName || root.path}</span>
+      <span style={{minWidth:0,flex:1}}>
+        <span style={{display:'block',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{root.name || root.sourceName || root.path}</span>
+        <span data-prompt-source-root-path style={{display:'block',color:'#aaa',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>Root: {root.path}</span>
+        <span data-prompt-source-search-path style={{display:'block',color:'#aaa',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>Search: {promptSourceSearchPath(root)}</span>
+      </span>
       {(root.removed || root.enabled===false || root.exists===false) && <span style={{color:'#888'}}>{root.removed?'удалена':root.enabled===false?'выключена':'недоступна'}</span>}
     </label>)}
     {!snapshot && busy && <span style={{fontSize:12,color:'#888'}}>Loading…</span>}
@@ -77,7 +81,8 @@ export default function WorkflowSourcesSettings({workflowId}:{workflowId:string}
   return <section data-workflow-sources style={{marginTop:8,borderTop:'1px solid #333',paddingTop:6}}>
     <button type="button" style={{...control,border:0,padding:'2px 0',display:'flex',alignItems:'center',gap:5}} aria-expanded={open} onClick={()=>setOpen(!open)}><Settings2 size={13}/> Sources</button>
     {open && <div style={{paddingTop:5}}>
-      {tabs.length>0 ? <><label style={{display:'flex',alignItems:'center',gap:6,fontSize:12,marginBottom:5}}>Tab
+      <div style={{fontSize:12,color:'#aaa',marginBottom:4}}>Промпты выбранной вкладки: docs/**/*.prompt.md; node_modules исключены.</div>
+      {tabs.length>0 ? <><label style={{display:'flex',alignItems:'center',gap:6,fontSize:12,marginBottom:5}}>Вкладка
         <select aria-label="Tab prompt sources" value={tabId} onChange={event=>setSelected(event.target.value)} style={{...control,minWidth:0,flex:1}}>
           {tabs.map(tab=><option key={tab.id} value={tab.id}>{tab.name}</option>)}
         </select></label><TabSources key={tabId} tabId={tabId} workflowId={workflowId}/></>

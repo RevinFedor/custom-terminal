@@ -2221,6 +2221,7 @@ async function _validateClaudeHistoryTopology(sources, cwd) {
 
 function register({
   projectManager,
+  historyMutationInput,
   formatToolAction,
   getClaudeEditableLastPromptState,
   recoverManagedHistoryImageRef,
@@ -3900,7 +3901,17 @@ function register({
         code: error.code, error: error.message };
     }
   };
-  ipcMain.handle('claude:delete-range', (event, payload) => _api.deleteRange(payload));
+  ipcMain.handle('claude:delete-range', (event, payload = {}) => {
+    const perform = () => {
+      if (payload.tabId) historyMutationInput?.assert(payload.tabId, payload.historyInput, { action: 'mutation' });
+      const guard = () => {
+        if (payload.tabId) historyMutationInput?.assert(payload.tabId, payload.historyInput, { action: 'mutation' });
+        (payload.beforeCommit || payload.beforeWrite)?.();
+      };
+      return _api.deleteRange({ ...payload, beforeCommit: guard });
+    };
+    return historyMutationInput ? historyMutationInput.run(payload.historyInput, perform) : perform();
+  });
 
   // Delete a single user-prompt entry from JSONL.
   // Keeps the assistant response, relinks any direct children's parentUuid to the

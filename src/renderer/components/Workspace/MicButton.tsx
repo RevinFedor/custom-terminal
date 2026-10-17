@@ -1,3 +1,4 @@
+import './workspaceControlStyles.css';
 // Voice-dictation toggle for the Claude control bar.
 //
 // UX flow:
@@ -225,19 +226,7 @@ export default function MicButton({ tabId }: Props) {
         onClose={() => setHistoryOpen(false)}
       />
 
-      <style>{`
-        @keyframes mic-pulse {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: 0.55; transform: scale(0.78); }
-        }
-        @keyframes mic-spin {
-          to { transform: rotate(360deg); }
-        }
-        @keyframes mic-fade-in {
-          from { opacity: 0; transform: translateY(4px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-      `}</style>
+
     </>
   );
 }

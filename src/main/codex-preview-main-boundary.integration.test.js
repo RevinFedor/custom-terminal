@@ -38,6 +38,7 @@ function harness() {
   controller.activateSemanticSource({ tabId, instanceId: sourceId });
   // No PTY, send, launch, Stop, or readiness API is available in this VM.
   const context = vm.createContext({
+    codexCanonicalPresentation: null,
     console: log, codexProviderSemanticSources: new Map([[tabId, owner]]),
     codexProviderPreviewOwnerVerdict,
     currentCodexProviderSemanticOwnerContext: () => current,

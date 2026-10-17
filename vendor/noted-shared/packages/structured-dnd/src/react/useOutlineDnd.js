@@ -221,6 +221,7 @@ export function useOutlineDnd({
   onExpansionRequest,
   onToggle,
   onLog,
+  onDiagnostic,
   canHorizontalMove,
   canUseVerticalSlot,
   resolveExternalTarget,
@@ -232,6 +233,7 @@ export function useOutlineDnd({
   horizontalYTolerance = HORIZONTAL_Y_TOLERANCE,
   hierarchyModifier = null,
   pointerPublication = 'frame',
+  sourceFollow = null,
   verticalRebaseDistance = VERTICAL_REBASE_DISTANCE,
   edgeZoneSize = EDGE_ZONE_SIZE,
   edgeScrollStep = MAX_SCROLL_STEP,
@@ -260,6 +262,8 @@ export function useOutlineDnd({
   const suppressClickRef = useRef(null);
   const rowsRef = useRef([]);
   const rowElementsRef = useRef(new Map());
+  // Only the active real rows own this visual offset. No source clone or model mutation.
+  const sourceFollowRef = useRef(null);
   const rowRefCallbacksRef = useRef(new Map());
   const rowLayoutSnapshotRef = useRef({ scrollTop: 0, rows: [], signature: null });
   const pendingLayoutFirstRef = useRef(null);
@@ -282,6 +286,7 @@ export function useOutlineDnd({
     onExpansionRequest,
     onToggle,
     onLog,
+    onDiagnostic,
     canHorizontalMove,
     canUseVerticalSlot,
     resolveExternalTarget,
@@ -294,6 +299,7 @@ export function useOutlineDnd({
     onExpansionRequest,
     onToggle,
     onLog,
+    onDiagnostic,
     canHorizontalMove,
     canUseVerticalSlot,
     resolveExternalTarget,
@@ -304,8 +310,10 @@ export function useOutlineDnd({
   const configRef = useRef({});
   configRef.current = {
     disabled,
+    scopeKey,
     hierarchyModifier,
     pointerPublication: pointerPublication === 'semantic' ? 'semantic' : 'frame',
+    sourceFollow: sourceFollow === 'y' ? 'y' : null,
     createSessionId,
     pointerThreshold: Math.max(0, Number(pointerThreshold) || 0),
     rowHeight: rowHeight == null ? null : Math.max(1, Number(rowHeight) || ROW_HEIGHT),
@@ -329,7 +337,20 @@ export function useOutlineDnd({
     revision: 0,
   }));
 
+  const emitDiagnostic = useCallback((type, detail = {}, drag = dragRef.current) => {
+    const callback=callbacksRef.current.onDiagnostic;
+    if(typeof callback!=='function')return;
+    try { callback(type,{gestureId:drag?.sourceContext?.gestureId ?? drag?.sessionId,
+      sessionId:drag?.sessionId,sourceId:drag?.sourceId,pointerId:drag?.pointerId,
+      ownerKey:drag?.externalOwnerKey,ownerEpoch:drag?.ownerEpoch,workflowId:configRef.current.scopeKey,
+      revision:drag?.renderRevision,eventAbs:drag?.diagnosticEventAbs,
+      x:drag?.pointerX,y:drag?.pointerY,grabY:drag?.grabOffsetY,
+      boundary:drag?.boundary,depth:drag?.resolvedDepth,meta:drag?.hierarchyMode===true,
+      ...detail}); } catch { /* Diagnostics cannot change gesture acceptance. */ }
+  }, []);
+
   const emitLog = useCallback((type, detail = {}, drag = dragRef.current) => {
+    emitDiagnostic(type,{reason:detail.reason},drag);
     const callback = callbacksRef.current.onLog;
     if (typeof callback !== 'function') return;
     try {
@@ -349,7 +370,108 @@ export function useOutlineDnd({
     } catch {
       // Observability must not change pointer semantics.
     }
+  }, [emitDiagnostic]);
+
+  const followsSourceY = useCallback((drag) => configRef.current.sourceFollow === 'y'
+    && drag?.phase === 'dragging' && !drag.externalReleasePending
+    && drag.ownerEpoch === ownerEpochRef.current, []);
+
+  const restoreSourceRow = useCallback((entry) => {
+    const style = entry.element.style;
+    // Do not undo a later binding/host write when a row leaves this owner.
+    if (style.getPropertyValue('--outline-dnd-source-y') !== entry.written) return;
+    if (entry.previous) style.setProperty('--outline-dnd-source-y', entry.previous, entry.priority);
+    else style.removeProperty('--outline-dnd-source-y');
   }, []);
+
+  const clearSourceFollow = useCallback(() => {
+    const state = sourceFollowRef.current;
+    sourceFollowRef.current = null;
+    if (state) for (const entry of state.rows.values()) restoreSourceRow(entry);
+  }, [restoreSourceRow]);
+
+  const layoutRect = useCallback((element) => {
+    const rect = snapRect(element, { compensateTransform: true });
+    const entry = sourceFollowRef.current?.rows.get(element.dataset.outlineDndKey);
+    // snapRect owns WAAPI transform compensation. Individual translate is our
+    // separate Y channel; subtract its known value without another style read.
+    const y = entry?.element === element
+      && element.style.getPropertyValue('--outline-dnd-source-y') === entry.written ? entry.y : 0;
+    return y ? { ...rect, top: rect.top - y, bottom: rect.bottom - y, midY: rect.midY - y } : rect;
+  }, []);
+
+  const writeSourceFollow = useCallback((drag, measuredRows) => {
+    if (!followsSourceY(drag) || !followsSourceY(dragRef.current)
+      || dragRef.current.sessionId !== drag.sessionId) return;
+    let state = sourceFollowRef.current;
+    if (state && (state.sessionId !== drag.sessionId || state.ownerEpoch !== drag.ownerEpoch)) {
+      clearSourceFollow(); state = null;
+    }
+    if (!state) sourceFollowRef.current = state = {
+      sessionId: drag.sessionId, ownerEpoch: drag.ownerEpoch, rows: new Map(), dirty: true,
+    };
+    if (measuredRows) {
+      const sourceIds = new Set(drag.sourceIds), nextRows = new Map();
+      let offset = 0;
+      for (let index = 0; index < measuredRows.length; index += 1) {
+        const row = measuredRows[index];
+        if (!sourceIds.has(row.id)) continue;
+        const key = domNodeKey(row.id), element = rowElementsRef.current.get(key);
+        if (!element || !Number.isFinite(row.top)) continue;
+        let entry = state.rows.get(key);
+        if (entry?.element !== element) {
+          if (entry) restoreSourceRow(entry);
+          entry = { element, y: 0, written: null,
+            previous: element.style.getPropertyValue('--outline-dnd-source-y'),
+            priority: element.style.getPropertyPriority('--outline-dnd-source-y') };
+        }
+        entry.top = row.top; entry.offset = offset;
+        nextRows.set(key, entry);
+        // Same compact-forest footprint as forestAnchorOffset, including the
+        // real row gap, without the gaps occupied by unselected roots.
+        offset += (measuredRows[index + 1]?.top ?? row.bottom) - row.top;
+      }
+      for (const [key, entry] of state.rows) if (!nextRows.has(key)) restoreSourceRow(entry);
+      state.rows = nextRows;
+      state.outline = previewOutlineRef.current;
+      state.dirty = false;
+    }
+    const anchor = state.rows.get(domNodeKey(drag.sourceId));
+    if (!anchor) return;
+    const top = drag.pointerY - drag.grabOffsetY;
+    let writes = 0;
+    for (const [key, entry] of state.rows) {
+      if (rowElementsRef.current.get(key) !== entry.element || !entry.element.isConnected) continue;
+      const y = top - anchor.offset + entry.offset - entry.top;
+      if (!Number.isFinite(y)) continue;
+      const written = `${y}px`;
+      if (entry.written === written) continue;
+      entry.element.style.setProperty('--outline-dnd-source-y', written);
+      entry.y = y; entry.written = written; writes += 1;
+    }
+    if (writes) emitDiagnostic('authored', { axis: 'y', top, intendedTop: top - anchor.offset,
+      forestOffset: anchor.offset, presentation: 'in-tree-source-y-style-not-pixels' }, drag);
+  }, [clearSourceFollow, emitDiagnostic, followsSourceY, restoreSourceRow]);
+
+  const refreshSourceFollow = useCallback((drag, rects) => {
+    if (!followsSourceY(drag)) { clearSourceFollow(); return; }
+    if (!sourceFollowRef.current) return; // First move uses measureBoundary's existing snapshot.
+    const sourceIds = new Set(drag.sourceIds), needed = new Set();
+    const visible = rowsRef.current;
+    for (let index = 0; index < visible.length; index += 1) if (sourceIds.has(visible[index].id)) {
+      needed.add(visible[index].id);
+      if (visible[index + 1]) needed.add(visible[index + 1].id);
+    }
+    // A real layout/scroll/rebind needs only source rows and their gap anchors.
+    // Pointer-only React publications never enter this measurement path.
+    const measured = visible.flatMap(row => {
+      if (!needed.has(row.id)) return [];
+      const key = domNodeKey(row.id), element = rowElementsRef.current.get(key);
+      const rect = rects?.get(key) || (element ? layoutRect(element) : null);
+      return rect ? [{ id: row.id, top: rect.top, bottom: rect.bottom }] : [];
+    });
+    writeSourceFollow(drag, measured);
+  }, [clearSourceFollow, followsSourceY, layoutRect, writeSourceFollow]);
 
   const clearPendingPointerMove = useCallback(() => {
     const pending = pointerMoveFrameRef.current;
@@ -366,6 +488,7 @@ export function useOutlineDnd({
       ? scrollLeaseRef.current
       : nextLease;
     const previousOutline = previewOutlineRef.current;
+    if (!followsSourceY(nextDrag)) clearSourceFollow();
     if (configRef.current.pointerPublication === 'semantic' && pointerReadPhase
       && canRetainPointerPublication({ current: dragRef.current, next: nextDrag,
         painted: paintedPreviewRef.current, outline: resolvedOutline, previousOutline,
@@ -376,6 +499,7 @@ export function useOutlineDnd({
       const stored = { ...nextDrag, renderRevision: dragRef.current.renderRevision };
       dragRef.current = stored;
       // Keep the acknowledged receipt, including its coordinates, unchanged.
+      emitDiagnostic('published',{presentation:'semantic-state-retained'},stored);
       return stored;
     }
     assertValidOutline(resolvedOutline);
@@ -489,8 +613,9 @@ export function useOutlineDnd({
       scrollLease: resolvedLease,
       revision,
     });
+    if(storedDrag?.phase==='dragging')emitDiagnostic('published',{presentation:'semantic-outline-state'},storedDrag);
     return storedDrag;
-  }, []);
+  }, [clearSourceFollow, emitDiagnostic, followsSourceY]);
 
   const measureBoundary = useCallback((drag, clientY) => {
     const scroller = scrollerRef.current;
@@ -502,7 +627,7 @@ export function useOutlineDnd({
       const key = domNodeKey(id), element = rowElementsRef.current.get(key) || null;
       const cached = rectById.get(key);
       if (cached && cached.element === element) return cached.rect;
-      const rowRect = element ? snapRect(element, { compensateTransform: true }) : null;
+      const rowRect = element ? layoutRect(element) : null;
       rectById.set(key, { element, rect: rowRect });
       return rowRect;
     };
@@ -511,8 +636,16 @@ export function useOutlineDnd({
       const rowRect = readRect(row.id);
       return rowRect ? [{ id: row.id, top: rowRect.top, bottom: rowRect.bottom }] : [];
     });
-    const result = (boundary) => ({ boundary, scroller, rect, rectById, readRect, measuredRows,
-      prepared: drag.prepared, diagnostic: lastBoundaryMeasurementRef.current });
+    const result = (boundary) => {
+      const measured=lastBoundaryMeasurementRef.current;
+      emitDiagnostic('geometry',{sourceLayoutTop:rectById.get(domNodeKey(drag.sourceId))?.rect?.top,
+        intendedTop:measured?.sourceTop,forestOffset:measured?.forestOffset,
+        previousBoundaryTop:measured?.previousBoundaryTop,nextBoundaryTop:measured?.nextBoundaryTop,
+        boundary,presentation:'compensated-layout-not-pixels'},drag);
+      writeSourceFollow(drag, measuredRows);
+      return { boundary, scroller, rect, rectById, readRect, measuredRows,
+        prepared: drag.prepared, diagnostic: lastBoundaryMeasurementRef.current };
+    };
     const forestOffset = drag.sourceRootIds
       ? forestAnchorOffset({ rows: measuredRows, sourceIds: drag.sourceIds, anchorId: drag.sourceId }) : 0;
     const sourceTop = clientY - drag.grabOffsetY - forestOffset;
@@ -576,7 +709,7 @@ export function useOutlineDnd({
       baseVisibleCount,
     };
     return result(boundary);
-  }, []);
+  }, [layoutRect, writeSourceFollow]);
 
   const calculateBoundary = useCallback((drag, clientY) => {
     return measureBoundary(drag, clientY).boundary;
@@ -704,7 +837,8 @@ export function useOutlineDnd({
   const rebaseAfterHorizontalMove = useCallback((drag, result, clientX, clientY) => {
     const scroller = scrollerRef.current;
     const beforeElement = sourceElement(scroller, drag.sourceId);
-    const sourceTopBefore = beforeElement?.getBoundingClientRect().top ?? null;
+    const sourceTopBefore = beforeElement
+      ? (followsSourceY(drag) ? layoutRect(beforeElement) : beforeElement.getBoundingClientRect()).top : null;
     const scrollTopBefore = scroller?.scrollTop ?? 0;
 
     let paintedDrag;
@@ -719,7 +853,8 @@ export function useOutlineDnd({
     });
 
     const movedElement = sourceElement(scroller, drag.sourceId);
-    const sourceTopAfterMutation = movedElement?.getBoundingClientRect().top ?? null;
+    const sourceTopAfterMutation = movedElement
+      ? (followsSourceY(drag) ? layoutRect(movedElement) : movedElement.getBoundingClientRect()).top : null;
     if (scroller && sourceTopBefore != null && sourceTopAfterMutation != null) {
       const targetScrollTop = Math.max(
         0,
@@ -772,7 +907,8 @@ export function useOutlineDnd({
     }
 
     const anchoredElement = sourceElement(scroller, drag.sourceId);
-    const anchoredSourceTop = anchoredElement?.getBoundingClientRect().top ?? sourceTopBefore;
+    const anchoredSourceTop = anchoredElement
+      ? (followsSourceY(drag) ? layoutRect(anchoredElement) : anchoredElement.getBoundingClientRect()).top : sourceTopBefore;
     const scrollCompensation = (scroller?.scrollTop ?? 0) - scrollTopBefore;
     const prepared = prepareDrag(result.tree, drag.sourceId, { sourceRootIds: drag.sourceRootIds });
     const rebased = {
@@ -784,7 +920,7 @@ export function useOutlineDnd({
       preferredDepth: prepared.preferredDepth,
       resolvedDepth: prepared.preferredDepth,
       currentParentId: prepared.sourceLocation.parentId,
-      grabOffsetY: sourceTopBefore != null
+      grabOffsetY: followsSourceY(drag) ? drag.grabOffsetY : sourceTopBefore != null
         && anchoredSourceTop != null
         && Math.abs(anchoredSourceTop - sourceTopBefore) < 1
           ? drag.grabOffsetY
@@ -822,7 +958,7 @@ export function useOutlineDnd({
       scrollCompensation,
     }, drag);
     return publish(rebased, result.tree, null);
-  }, [calculateBoundary, emitLog, measureNaturalScrollMax, publish]);
+  }, [calculateBoundary, emitLog, followsSourceY, layoutRect, measureNaturalScrollMax, publish]);
 
   const expansionPromises = useCallback((drag) => (
     drag?.expansionPromises ? [...drag.expansionPromises.values()] : []
@@ -883,6 +1019,7 @@ export function useOutlineDnd({
     const scroller = scrollerRef.current;
     if (scroller) scroller.scrollTop = drag.originalScrollTop;
     emitLog('cancel', { reason }, drag);
+    if(drag.externalReleaseOwner!=='bridge')emitDiagnostic('physical-end',{reason:'cancel:'+reason},drag);
     return true;
   }, [clearPendingPointerMove, emitLog, publish, restoreTemporaryExpansions]);
 
@@ -1051,6 +1188,7 @@ export function useOutlineDnd({
     if (painted?.sessionId === sessionId && painted.ownerEpoch === ownerEpoch) commitWhenPainted();
     else {
       clearPendingPointerMove();
+      clearSourceFollow();
       // Latch the submitted candidate, not another publication with newer
       // coordinates. Released gestures no longer generate movement/dwell slots.
       dragRef.current = { ...current, externalReleasePending: Object.freeze({sessionId,
@@ -1060,7 +1198,7 @@ export function useOutlineDnd({
       requestAnimationFrame(commitWhenPainted);
     }
     return true;
-  }, [beginCommit, cancel, clearPendingPointerMove]);
+  }, [beginCommit, cancel, clearPendingPointerMove, clearSourceFollow]);
 
   const requestExpansion = useCallback((nodeId, expanded, reason = 'pointer-toggle') => {
     const targetId = nodeId;
@@ -1282,8 +1420,13 @@ export function useOutlineDnd({
   }, [emitLog, projectVertical, publish]);
 
   const processActivePointerMove = useCallback((inputDrag, event) => {
-    if (inputDrag.externalReleasePending) return;
+    if (inputDrag.externalReleasePending || inputDrag.ownerEpoch !== ownerEpochRef.current
+      || dragRef.current?.sessionId !== inputDrag.sessionId || dragRef.current?.phase !== 'dragging'
+      || dragRef.current.externalReleasePending) return;
     pointerTraceRef.current.processed += 1;
+    emitDiagnostic('processed',{eventAbs:Number.isFinite(event.timeStamp)?performance.timeOrigin+event.timeStamp:null,
+      x:event.clientX,y:event.clientY,received:pointerTraceRef.current.received,
+      processed:pointerTraceRef.current.processed,queuedOverwrites:pointerTraceRef.current.queuedOverwrites || 0},inputDrag);
     pointerTraceRef.current.lastProcessed = { x: event.clientX, y: event.clientY, metaKey: !!event.metaKey,
       heldMeta: metaKeyHeldRef.current, navigationMode: inputDrag.navigationMode,
       dx: event.clientX - inputDrag.horizontalBaseX, dy: event.clientY - inputDrag.horizontalBaseY };
@@ -1306,6 +1449,8 @@ export function useOutlineDnd({
       ...current,
       pointerX: event.clientX,
       pointerY: event.clientY,
+      diagnosticEventAbs: Number.isFinite(event.timeStamp)
+        ? performance.timeOrigin + event.timeStamp : current.diagnosticEventAbs,
     };
     const treeRect = scrollerRef.current?.getBoundingClientRect();
     if (treeRect) {
@@ -1333,6 +1478,7 @@ export function useOutlineDnd({
       }
     }
     if (externalTarget != null) {
+      writeSourceFollow(next);
       const externalTargetKey = typeof externalTarget === 'object'
         ? String(externalTarget.id ?? externalTarget.zone ?? JSON.stringify(externalTarget))
         : String(externalTarget);
@@ -1366,6 +1512,7 @@ export function useOutlineDnd({
     }
 
     if (current.navigationMode) {
+      writeSourceFollow(next);
       next.feedback = null;
       next.blockedDirection = null;
       next.axisLock = null;
@@ -1521,19 +1668,25 @@ export function useOutlineDnd({
     publish,
     rebaseAfterHorizontalMove,
     resolveNavigationTarget,
+    writeSourceFollow,
   ]);
 
   const scheduleActivePointerMove = useCallback((event) => {
     const pending = pointerMoveFrameRef.current;
+    pointerTraceRef.current.queuedOverwrites=Math.min(0xffffffff,(pointerTraceRef.current.queuedOverwrites || 0)+Number(!!pending.latest));
     pending.latest = {
       pointerId: event.pointerId,
+      timeStamp: event.timeStamp,
       clientX: event.clientX,
       clientY: event.clientY,
       metaKey: !!(event.metaKey || metaKeyHeldRef.current),
     };
     if (pending.frameId) return;
 
-    pending.frameId = requestAnimationFrame(() => {
+    const sessionId = dragRef.current?.sessionId, ownerEpoch = ownerEpochRef.current;
+    const frameId = requestAnimationFrame(() => {
+      if (pending.frameId !== frameId || ownerEpochRef.current !== ownerEpoch
+        || dragRef.current?.sessionId !== sessionId) return;
       pending.frameId = 0;
       const latest = pending.latest;
       pending.latest = null;
@@ -1546,6 +1699,7 @@ export function useOutlineDnd({
       ) return;
       processActivePointerMove(current, latest);
     });
+    pending.frameId = frameId;
   }, [processActivePointerMove]);
 
   const activatePendingDrag = useCallback((pending, event) => {
@@ -1556,9 +1710,11 @@ export function useOutlineDnd({
     }
 
     const pickupOutline = previewOutlineRef.current;
+    const rowRect = pending.captureElement?.getBoundingClientRect();
+    const grabOffsetY = pending.startY - (rowRect?.top ?? pending.rowTop);
     const descriptor = pending.externalSource || callbacksRef.current.getDragSource?.({
       outline: pickupOutline, sourceId: pending.sourceId, sessionId: pending.sessionId,
-      pointerId:pending.pointerId,clientX:event.clientX,clientY:event.clientY,metaKey:!!event.metaKey,
+      pointerId:pending.pointerId,clientX:event.clientX,clientY:event.clientY,metaKey:!!event.metaKey,grabOffsetY,
     });
     if (descriptor === false) { cancel('source-admission-rejected'); return null; }
     const prepared = prepareDrag(pickupOutline, pending.sourceId, { sourceRootIds: descriptor?.rootIds });
@@ -1570,7 +1726,6 @@ export function useOutlineDnd({
       0,
       scroller.scrollHeight - scroller.clientHeight - (originalLease?.height ?? 0),
     );
-    const rowRect = pending.captureElement?.getBoundingClientRect();
     const measuredRowHeight = configRef.current.rowHeight
       ?? rowRect?.height
       ?? pending.rowHeight
@@ -1604,7 +1759,7 @@ export function useOutlineDnd({
       currentParentId: prepared.sourceLocation.parentId,
       pointerX: event.clientX,
       pointerY: event.clientY,
-      grabOffsetY: pending.startY - (rowRect?.top ?? pending.rowTop),
+      grabOffsetY,
       rowHeight: measuredRowHeight,
       horizontalBaseX: pending.startX,
       horizontalBaseY: pending.startY,
@@ -1645,6 +1800,7 @@ export function useOutlineDnd({
 
     event.preventDefault();
     acquirePointerCapture(next);
+    emitDiagnostic('capture-attempt',{},next);
     lastBoundaryMeasurementRef.current = null;
     pointerTraceRef.current = { received: 1, processed: 0,
       lastReceived: { x: event.clientX, y: event.clientY, pointerId: event.pointerId, metaKey: !!event.metaKey }, lastProcessed: null };
@@ -1686,6 +1842,7 @@ export function useOutlineDnd({
       startY: event.clientY,
       pointerX: event.clientX,
       pointerY: event.clientY,
+      diagnosticEventAbs:performance.timeOrigin+event.timeStamp,
       rowTop: rowRect.top,
       captureElement: event.currentTarget,
       metaKey: !!event.metaKey,
@@ -1693,24 +1850,10 @@ export function useOutlineDnd({
 
     publish(pending, undefined, undefined);
     emitLog('pending', {}, pending);
+    emitDiagnostic('pickup-rect',{left:rowRect.left,top:rowRect.top,width:rowRect.width,height:rowRect.height},pending);
   }, [emitLog, publish]);
 
-  useLayoutEffect(() => {
-    const current = dragRef.current;
-    if (
-      current?.phase === 'dragging'
-      && current.renderRevision === view.revision
-      && view.dragState?.sessionId === current.sessionId
-    ) {
-      paintedPreviewRef.current = {
-        sessionId: current.sessionId,
-        revision: view.revision,
-        ownerEpoch: current.ownerEpoch,
-        outline: view.previewOutline,
-        drag: current,
-      };
-    }
-  }, [view]);
+
 
   useEffect(() => {
     assertValidOutline(controlledOutline);
@@ -1803,7 +1946,10 @@ export function useOutlineDnd({
     // activatePendingDrag/cancel use flushSync to preserve the pointer contract.
     // Run them after the current React lifecycle; calling flushSync directly
     // from this effect produces a warning and can leave the adopted drag stuck.
+    let cancelled = false;
+    const ownerEpoch = ownerEpochRef.current;
     const frame = requestAnimationFrame(() => {
+      if (cancelled || ownerEpochRef.current !== ownerEpoch) return;
       const current = dragRef.current;
       if (!requested) {
         if (
@@ -1876,10 +2022,9 @@ export function useOutlineDnd({
         startY: clientY,
         pointerX: clientX,
         pointerY: clientY,
-        // No foreign element may capture this pointer. A synthetic rowTop gives
-        // the projected source a normal centre grab offset at the current cursor
-        // instead of anchoring it to its temporary end-of-list DOM position.
-        rowTop: clientY - rowHeight / 2,
+        // Keep a sidebar-origin grab across hosts. Pane-origin adoption retains
+        // its existing centre-grab feedback; never capture a foreign element.
+        rowTop: clientY - (Number.isFinite(requested.grabOffsetY) ? requested.grabOffsetY : rowHeight / 2),
         rowHeight,
         captureElement: null,
         metaKey: input.metaKey === true,
@@ -1893,7 +2038,7 @@ export function useOutlineDnd({
       processActivePointerMove(active, event);
       emitLog('external-adopt', { ownerKey }, active);
     });
-    return () => cancelAnimationFrame(frame);
+    return () => { cancelled = true; cancelAnimationFrame(frame); };
   }, [
     activatePendingDrag,
     cancel,
@@ -1926,6 +2071,7 @@ export function useOutlineDnd({
           return;
         }
 
+        emitDiagnostic('threshold',{eventAbs:performance.timeOrigin+event.timeStamp,x:event.clientX,y:event.clientY},nextPending);
         const active = activatePendingDrag(nextPending, event);
         if (active) processActivePointerMove(active, event);
         return;
@@ -1964,6 +2110,7 @@ export function useOutlineDnd({
         return;
       }
       beginCommit('pointerup');
+      emitDiagnostic('physical-end',{reason:'release'},current);
     };
 
     const handlePointerCancel = (event) => {
@@ -2066,10 +2213,13 @@ export function useOutlineDnd({
 
   useEffect(() => {
     if (view.dragState?.phase !== 'dragging') return undefined;
-    let frameId = 0;
+    let frameId = 0, cancelled = false;
+    const sessionId = view.dragState.sessionId, ownerEpoch = ownerEpochRef.current;
 
     const tick = (timestamp) => {
       let current = dragRef.current;
+      if (cancelled || current?.sessionId !== sessionId || current?.ownerEpoch !== ownerEpoch
+        || ownerEpochRef.current !== ownerEpoch) return;
       const scroller = scrollerRef.current;
       if (!current || current.phase !== 'dragging' || current.externalReleasePending || !scroller) return;
       // A host target owns dwell/navigation outside this outline. Its pointer
@@ -2141,7 +2291,7 @@ export function useOutlineDnd({
           nextOutline = projection.outline;
           next.horizontalBaseX = next.pointerX;
           next.horizontalBaseY = next.pointerY;
-        }
+        } else if (didScroll) refreshSourceFollow(next);
       }
 
       let toggle = null;
@@ -2180,10 +2330,11 @@ export function useOutlineDnd({
     };
 
     frameId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frameId);
+    return () => { cancelled = true; cancelAnimationFrame(frameId); };
   }, [
     projectVertical,
     publish,
+    refreshSourceFollow,
     requestExpansion,
     resolveNavigationTarget,
     view.dragState?.phase,
@@ -2195,6 +2346,7 @@ export function useOutlineDnd({
     if (!scroller) return undefined;
 
     const handleScroll = () => {
+      if (followsSourceY(dragRef.current)) refreshSourceFollow(dragRef.current);
       const lease = scrollLeaseRef.current;
       if (!lease || dragRef.current) return;
       const nextLease = leaseForScrollPosition({
@@ -2231,7 +2383,7 @@ export function useOutlineDnd({
       scroller.removeEventListener('scroll', handleScroll);
       window.removeEventListener('resize', clearLease);
     };
-  }, [emitLog, publish]);
+  }, [emitLog, followsSourceY, publish, refreshSourceFollow]);
 
   const rows = useMemo(() => {
     assertValidOutline(view.previewOutline);
@@ -2264,16 +2416,26 @@ export function useOutlineDnd({
 
   const rowRefFor = useCallback((rowId) => {
     const key = domNodeKey(rowId);
-    let callback = rowRefCallbacksRef.current.get(key);
-    if (!callback) {
-      callback = (element) => {
+    const epoch = ownerEpochRef.current;
+    let binding = rowRefCallbacksRef.current.get(key);
+    if (!binding || binding.epoch !== epoch) {
+      let bound = null;
+      const callback = (element) => {
+        if (ownerEpochRef.current !== epoch) return;
+        const state = sourceFollowRef.current, entry = state?.rows.get(key);
+        if (entry?.element === bound && bound !== element) {
+          restoreSourceRow(entry); state.rows.delete(key);
+        }
         if (element) rowElementsRef.current.set(key, element);
-        else rowElementsRef.current.delete(key);
+        else if (rowElementsRef.current.get(key) === bound) rowElementsRef.current.delete(key);
+        bound = element;
+        if (state) state.dirty = true;
       };
-      rowRefCallbacksRef.current.set(key, callback);
+      binding = { epoch, callback };
+      rowRefCallbacksRef.current.set(key, binding);
     }
-    return callback;
-  }, []);
+    return binding.callback;
+  }, [restoreSourceRow]);
 
   useLayoutEffect(() => {
     const frameStartedAt = now();
@@ -2293,6 +2455,14 @@ export function useOutlineDnd({
     }
 
     const activeAnimations = rowLayoutAnimationsRef.current;
+    const follow = sourceFollowRef.current;
+    const sourceKeys = followsSourceY(dragRef.current)
+      ? new Set((dragRef.current.sourceIds || []).map(domNodeKey)) : new Set();
+    const finishSourceFollow = (rects) => {
+      if (!followsSourceY(dragRef.current)) clearSourceFollow();
+      else if (follow && (follow.dirty || follow.outline !== view.previewOutline))
+        refreshSourceFollow(dragRef.current, rects);
+    };
     const animationFor = (entry) => entry?.animation || entry;
     const cancelAnimationKeys = (keys) => {
       const currentTimes = [];
@@ -2338,6 +2508,11 @@ export function useOutlineDnd({
       layoutChangeAxis: view.dragState?.layoutChangeAxis ?? null,
     });
 
+    // The real source owns continuous Y. Its existing semantic X animation
+    // remains independent; neighbouring rows keep their ordinary FLIP budget.
+    cancelAnimationKeys([...sourceKeys].filter(key => activeAnimations.has(key)
+      && activeAnimations.get(key).axis !== 'horizontal'));
+
     if (!layoutChanged) {
       if (modeCancelReason) cancelActiveAnimations(modeCancelReason);
       if (view.dragState?.phase !== 'dragging') {
@@ -2354,6 +2529,7 @@ export function useOutlineDnd({
         rows: renderedRows,
         signature: rowLayoutSignature,
       };
+      finishSourceFollow();
       return undefined;
     }
 
@@ -2424,6 +2600,7 @@ export function useOutlineDnd({
       if (view.dragState?.phase !== 'dragging') {
         rowLayoutLastChangeAtRef.current = -Infinity;
       }
+      finishSourceFollow();
       return undefined;
     }
 
@@ -2444,7 +2621,7 @@ export function useOutlineDnd({
     const afterRects = new Map();
     for (const key of changedVisibleKeys) {
       const element = rowElementsRef.current.get(key);
-      if (element) afterRects.set(key, snapRect(element, { compensateTransform: true }));
+      if (element) afterRects.set(key, layoutRect(element));
     }
 
     const layoutChangeAxis = view.dragState?.layoutChangeAxis ?? null;
@@ -2465,7 +2642,7 @@ export function useOutlineDnd({
       });
       const ownedDelta = axisOwnedLayoutDelta(layoutChangeAxis, delta);
       const deltaX = ownedDelta.x;
-      const deltaY = ownedDelta.y;
+      const deltaY = sourceKeys.has(key) ? 0 : ownedDelta.y;
       if (Math.abs(deltaX) < 0.5 && Math.abs(deltaY) < 0.5) continue;
       createdAnimations += 1;
       maxDeltaX = Math.max(maxDeltaX, Math.abs(deltaX));
@@ -2479,7 +2656,7 @@ export function useOutlineDnd({
         easing: animationConfig.easing,
         fill: 'both',
       });
-      activeAnimations.set(key, { animation, revision: view.revision });
+      activeAnimations.set(key, { animation, revision: view.revision, axis: layoutChangeAxis });
       animation.onfinish = () => {
         const entry = activeAnimations.get(key);
         if (animationFor(entry) !== animation) return;
@@ -2558,9 +2735,14 @@ export function useOutlineDnd({
     }
 
     rowLayoutSnapshotRef.current = nextSnapshot;
+    finishSourceFollow(afterRects);
     return undefined;
   }, [
+    clearSourceFollow,
     emitLog,
+    followsSourceY,
+    layoutRect,
+    refreshSourceFollow,
     rowLayoutSignature,
     rows,
     view.dragState?.layoutChangeAxis,
@@ -2569,7 +2751,34 @@ export function useOutlineDnd({
     view.revision,
   ]);
 
+  // Ref replacement can occur in a host commit with identical row IDs/view
+  // revision. Run the cheap binding check on that commit too, before paint.
+  useLayoutEffect(() => {
+    if (!followsSourceY(dragRef.current)) clearSourceFollow();
+    else if (sourceFollowRef.current?.dirty) refreshSourceFollow(dragRef.current);
+  });
+
+  // Acknowledges this React commit after FLIP/source-style writes, not compositor pixels.
+  useLayoutEffect(() => {
+    const current = dragRef.current;
+    if (
+      current?.phase === 'dragging'
+      && current.renderRevision === view.revision
+      && view.dragState?.sessionId === current.sessionId
+    ) {
+      paintedPreviewRef.current = {
+        sessionId: current.sessionId,
+        revision: view.revision,
+        ownerEpoch: current.ownerEpoch,
+        outline: view.previewOutline,
+        drag: current,
+      };
+      emitDiagnostic('layout-receipt',{presentation:'semantic-outline-row'},current);
+    }
+  }, [view]);
+
   useEffect(() => () => {
+    clearSourceFollow();
     if(dragRef.current?.sourceRootIds) {
       commitTokenRef.current+=1;
       releasePointerCapture(dragRef.current);
@@ -2631,6 +2840,9 @@ export function useOutlineDnd({
 
     return {
       ref: rowRefFor(row.id),
+      // Host row style must merge this object (e.g. its semantic marginLeft).
+      style: isSource && followsSourceY(dragRef.current)
+        ? { translate: '0 var(--outline-dnd-source-y, 0px)', pointerEvents: 'none', zIndex: 1 } : undefined,
       draggable: false,
       'data-outline-dnd-row': 'true',
       'data-outline-hierarchy-modifier': usesCommandHierarchy(configRef.current.hierarchyModifier) ? 'meta' : undefined,
@@ -2656,6 +2868,7 @@ export function useOutlineDnd({
       onClickCapture: (event) => suppressOrToggleClick(event, row),
     };
   }, [
+    followsSourceY,
     handlePointerDown,
     navigationProtectedIds,
     rowRefFor,

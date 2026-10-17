@@ -188,14 +188,18 @@ class HistoryReadClient {
   }
   // Does not start a worker, enqueue RPC or read any transcript/cache file.
   getCacheMemorySnapshot() { return { ...this.cacheMemory }; }
-  async call(method, payload = {}, binary = false) {
+  async prepareCodexRewrite({ receipt, cwd }) {
+    return this.call('prepareCodexRewrite', { toolType: 'codex', sessionId: receipt.sessionId, cwd,
+      rewriteFrom: { sessionId: receipt.sourceSessionId } }, false, receipt);
+  }
+  async call(method, payload = {}, binary = false, preparedRewriteReceipt = null) {
     const call = { callId: ++this.callSequence };
     const started = stamp();
     for (let attempt = 0; attempt < 3; attempt++) {
       call.attempt = attempt + 1;
       const before = this.invalidationSequence;
       let envelope;
-      try { envelope = await this.request(method, payload, binary, call); }
+      try { envelope = await this.request(method, payload, binary, call, preparedRewriteReceipt); }
       catch (error) {
         if (attempt < 2 && (error.code === 'CODEX_SOURCE_READ_INVALIDATED'
           || error.code === 'ERR_WORKER_OUT_OF_MEMORY' || error.message.startsWith('history_worker_exit:'))) {
@@ -250,7 +254,7 @@ class HistoryReadClient {
     this.diagnose('call-complete', { ...call, outcome: 'retry-exhausted', reason: 'source-changed-during-preparation', elapsedMs: performance.now() - started.perf });
     return { success: false, error: 'history_source_changed_during_preparation', entries: [] };
   }
-  request(method, payload, binary = false, call = { callId: ++this.callSequence, attempt: 1 }) {
+  request(method, payload, binary = false, call = { callId: ++this.callSequence, attempt: 1 }, preparedRewriteReceipt = null) {
     const worker = this.start(); const id = ++this.sequence;
     Object.assign(call, { requestId: id, workerGeneration: this.workerGeneration, method: diagnosticIdentity(method),
       tool: diagnosticIdentity(payload.toolType), tab: diagnosticIdentity(payload.tabId), session: diagnosticIdentity(payload.sessionId),
@@ -259,8 +263,8 @@ class HistoryReadClient {
       diagnosticReadId: typeof payload.diagnosticReadId === 'string' && /^[a-z0-9-]{1,90}$/.test(payload.diagnosticReadId)
         ? payload.diagnosticReadId : undefined });
     const identity = { ...call };
-    const rewriteReceipt = payload.rewriteFrom?.sessionId
-      ? this.codexData?._api?.getCodexRewriteReceipt?.(payload.sessionId, payload.rewriteFrom.sessionId) : null;
+    const rewriteReceipt = preparedRewriteReceipt || (payload.rewriteFrom?.sessionId
+      ? this.codexData?._api?.getCodexRewriteReceipt?.(payload.sessionId, payload.rewriteFrom.sessionId) : null);
     return new Promise((resolve, reject) => {
       const posted = stamp(); const request = { resolve, reject, identity, posted };
       this.count('requests');

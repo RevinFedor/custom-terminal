@@ -18,7 +18,7 @@ function functions(file, names) {
 test('actual Main capture uses complete selected membership, saved completion and current input readiness', () => {
   const makeRow = (id, workflowId = 'work') => ({ tabId: id, membership: { workflowId, revision: 1 },
     nativeRow: { id, tab_type: 'terminal' }, executionResolved: true, executionSubject: { subjectId: id } });
-  const rows = ['idle', 'hidden', 'reserve', 'busy', 'starting', 'sdk', 'script'].map(id => makeRow(id));
+  const rows = ['idle', 'hidden', 'reserve', 'busy', 'child', 'starting', 'sdk', 'script'].map(id => makeRow(id));
   rows.push(makeRow('foreign', 'other'));
   const context = vm.createContext({ path, srcMainDir: __dirname, activeWorkflowSessionMember, workflowSessionScopeKey,
     idleSessionStopService: { snapshot: () => ({ policy: { allWorkflows: false, workflowIds: ['work'] } }) },
@@ -26,7 +26,8 @@ test('actual Main capture uses complete selected membership, saved completion an
       listWorkflows: () => [{ id: 'work' }, { id: 'other' }], listMembers: id => rows.filter(row => row.membership.workflowId === id) } },
     captureWorkflowSessionOwner: row => ({ live: true, kind: row.tabId === 'sdk' ? 'sdk' : row.tabId === 'script' ? 'terminal' : 'ai',
       toolType: 'codex', token: { stopObservation: { ...createSdkStopObservation(true), completedAt: 321 } } }),
-    readWorkflowSessionBusy: id => ({ known: true, busy: id === 'busy' }),
+    readWorkflowSessionBusy: id => ({ known: true, busy: id === 'busy' || id === 'child' }),
+    getCombinedTabBackgroundWorkCount: id => id === 'child' ? 1 : 0,
     computeProjectActivity: () => ({ projects: [{ tabs: rows.map(row => ({ tabId: row.tabId, inputReady: row.tabId !== 'starting' })) }] }),
     agentSendActivity: { snapshot: () => ({ pendingTabIds: [] }) },
     codexTurnWatchers: new Map(rows.map(row => [row.tabId, { lastOutcomeTs: 123 }])), claudeHookLastEvent: new Map(),
@@ -35,12 +36,32 @@ test('actual Main capture uses complete selected membership, saved completion an
   });
   vm.runInContext(functions('main.js', ['captureIdleSessionStopTargets']), context);
   const captured = JSON.parse(JSON.stringify(context.captureIdleSessionStopTargets()));
-  assert.deepEqual(captured.map(row => row.tabId), ['idle', 'hidden', 'reserve', 'busy', 'starting', 'sdk']);
+  assert.deepEqual(captured.map(row => row.tabId), ['idle', 'hidden', 'reserve', 'busy', 'child', 'starting', 'sdk']);
   assert.equal(captured.find(row => row.tabId === 'idle').completedAt, 123);
   assert.equal(captured.find(row => row.tabId === 'reserve').completedAt, 0, 'a resumed process does not inherit an expired pre-launch clock');
   assert.equal(captured.find(row => row.tabId === 'sdk').completedAt, 321);
   assert.equal(captured.find(row => row.tabId === 'starting').idle, false);
   assert.equal(captured.find(row => row.tabId === 'busy').idle, false);
+  assert.equal(captured.find(row => row.tabId === 'child').idle, false);
+  assert.equal(captured.find(row => row.tabId === 'child').working, true, 'child completion can start a fresh interval with already-idle disabled');
+});
+
+test('actual native background publication wakes idle Stop on child start and finish without a parent turn', () => {
+  let count = 1;
+  const observed = [];
+  const context = vm.createContext({
+    console: { log() {} }, mainWindow: null, tabBackgroundWorkRevision: 0,
+    tabBackgroundWorkRevisionByTab: new Map(),
+    getCombinedTabBackgroundWorkCount: () => count,
+    getTabBackgroundWorkAgents: () => [], getTabTerminalCodexSubagents: () => [],
+    getTabBackgroundWorkTasks: () => [], getTabTerminalBackgroundToolUseIds: () => [],
+    _webBroadcast() {}, idleSessionStopService: { refresh: () => observed.push(count) },
+  });
+  vm.runInContext(functions('main.js', ['publishTabBackgroundWork']), context);
+  context.publishTabBackgroundWork('T', 'codex:rollout');
+  count = 0;
+  context.publishTabBackgroundWork('T', 'codex:rollout');
+  assert.deepEqual(observed, [1, 0]);
 });
 
 test('actual Main observation requires process, Root continuation and empty draft proofs', async () => {

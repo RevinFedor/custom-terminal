@@ -104,6 +104,7 @@ class SavedHistoryOperations {
     if (next.ownerCheckpoint && next.ownerCheckpoint !== previousCheckpoint) this.runtime?.owner?.announce(next.tabId);
     if (terminal(next)) {
       this.runtime?.owner?.finishOperation(next.tabId, next.operationId);
+      if (lease.historyInput) this.runtime.finishInput?.(lease.historyInput);
       this.leases.delete(lease.key);
       // The ingress may release its own cleanup lease. It never executes any
       // provider action here, and a publication error cannot undo the receipt.
@@ -150,15 +151,22 @@ class SavedHistoryOperations {
       this.db.setAppState(this.lockKey(tabId), request.operationId);
       onReserve?.(record);
     };
-    if (onReserve) {
-      if (!this.db.db?.transaction) fail('history_binding_transaction_unavailable');
-      this.db.db.transaction(reserve)();
-    } else reserve();
+    const historyInput = this.runtime?.reserveInput?.({ tabId, operationId: request.operationId,
+      sessionId: request.expectedSessionId, toolType: request.toolType }) || null;
+    try {
+      if (onReserve) {
+        if (!this.db.db?.transaction) fail('history_binding_transaction_unavailable');
+        this.db.db.transaction(reserve)();
+      } else reserve();
+    } catch (error) {
+      if (historyInput) this.runtime.finishInput?.(historyInput);
+      throw error;
+    }
     // A different accepted history intent owns the next transition already;
     // a late result of the preceding operation must not repopulate its draft.
     // Idempotent reads/replays returned above never enter this path.
     this.runtime?.owner?.noteInput(tabId);
-    const lease = { key, record, executing: false, scope: null, mutation: null, validateOwner, onSettled };
+    const lease = { key, record, executing: false, scope: null, mutation: null, validateOwner, onSettled, historyInput };
     this.leases.set(key, lease);
     // Request acceptance never awaits a UI component or a long-lived HTTP POST.
     Promise.resolve().then(() => this.dispatch('savedHistoryOperationScenario', { tabId, operationId: request.operationId }))
@@ -178,6 +186,7 @@ class SavedHistoryOperations {
 
   assertScope(lease, { afterStop = false, sessionId = lease.record.expectedSessionId, launch = false } = {}) {
     lease.validateOwner?.();
+    if (lease.historyInput) this.runtime.assertInput?.(lease.historyInput);
     const now = this.runtime.capture(lease.record.tabId);
     const old = lease.scope;
     if (!old || !now.terminalToken || now.terminalToken !== old.terminalToken
@@ -185,7 +194,10 @@ class SavedHistoryOperations {
       || now.inputRevision !== old.inputRevision || now.sessionId !== sessionId
       || now.runSeq !== old.runSeq || now.lifecycleGeneration !== old.lifecycleGeneration
       || (!afterStop && now.launchId !== old.launchId)) fail('history_operation_owner_changed');
-    if (!launch && afterStop && now.isRunning) fail('history_operation_process_not_stopped');
+    if (!launch && afterStop) {
+      if (now.isRunning === true || now.stopping === true) fail('history_operation_process_not_stopped');
+      if (now.isRunning !== false || now.processLookupUnknown === true) fail('history_operation_process_state_unknown');
+    }
     return now;
   }
 
@@ -248,6 +260,7 @@ class SavedHistoryOperations {
       || lease.mutation?.newSessionId !== request.sessionId) fail('history_operation_binding_unowned');
     this.assertScope(lease, { afterStop: true });
     this.save(lease, { bindingCommitted: true, activeSessionId: request.sessionId }, commitBinding);
+    if (lease.historyInput) this.runtime.bindInput?.(lease.historyInput, request.sessionId);
     lease.scope = this.runtime.capture(request.tabId);
   }
 
@@ -353,6 +366,7 @@ class SavedHistoryOperations {
       this.save(lease, { phase: 'preparing', target: draftTarget, contentRevision: timeline.contentRevision || null });
       return { sessionId: spec.expectedSessionId, mutationSessionId: lease.mutationSessionId || spec.expectedSessionId,
         toolType: spec.toolType, cwd: info.cwd, target: draftTarget,
+        ...(lease.historyInput ? { historyInput: lease.historyInput } : {}),
         ...(lease.repair ? { incumbentCodexSettingsProof: lease.repair.childSettingsProof } : {}) };
     }
     if (phase === 'stopping') {
@@ -407,13 +421,21 @@ class SavedHistoryOperations {
         });
         if (result?.committed === true) {
           lease.mutation = result;
-          this.save(lease, { phase: 'rewritten', historyMutated: true, mutationSessionId: sessionId,
-            fileDeleted: result.fileDeleted === true, removedCount: result.removedCount, removedUsers: result.removedUsers });
+          try {
+            this.save(lease, { phase: 'rewritten', historyMutated: true, mutationSessionId: sessionId,
+              fileDeleted: result.fileDeleted === true, removedCount: result.removedCount, removedUsers: result.removedUsers });
+          } catch (error) {
+            // IPC exceptions lose custom fields. Return the already-committed
+            // mutation as DATA so the executor cannot attempt source recovery.
+            return { ...result, success: false, committed: true, mutationSessionId: sessionId,
+              error: error.message, code: error.code || 'history_operation_receipt_persist_failed' };
+          }
         }
         if (!result?.success || result.committed !== true) fail(result?.code || result?.error || 'history_rewrite_unproven');
         return { ...result, mutationSessionId: sessionId };
       }
-      const result = await this.deleteRange({ sessionId: lease.mutationSessionId || spec.expectedSessionId, cwd: lease.cwd,
+      const performRewrite = () => this.deleteRange({ sessionId: lease.mutationSessionId || spec.expectedSessionId, cwd: lease.cwd,
+        diagnosticOperationId: spec.operationId,
         startUuid: target.uuid, endUuid, toPhysicalEnd: spec.kind === 'rewind', codexSettingsProof: data.codexSettingsProof || null,
         validateSource: loaded => {
           this.assertScope(lease, { afterStop: true });
@@ -424,10 +446,20 @@ class SavedHistoryOperations {
         },
         beforeWrite: () => { this.assertScope(lease, { afterStop: true }); lease.repair?.validateChild(); },
       });
+      const result = lease.historyInput && this.runtime.runInput
+        ? await this.runtime.runInput(lease.historyInput, performRewrite) : await performRewrite();
       if (!result?.success) fail(result?.code || result?.error || 'history_rewrite_failed');
       lease.mutation = result;
-      this.save(lease, { phase: 'rewritten', historyMutated: true, newSessionId: result.newSessionId,
-        removedCount: result.removedCount, removedUsers: result.removedUsers, suffixProof: result.suffixProof || null });
+      try {
+        this.save(lease, { phase: 'rewritten', historyMutated: true, newSessionId: result.newSessionId,
+          removedCount: result.removedCount, removedUsers: result.removedUsers, suffixProof: result.suffixProof || null });
+      } catch (error) {
+        // The rollout and its lineage committed BEFORE this receipt write.
+        // Never turn its failed bookkeeping into permission to Resume/rewrite
+        // the source. Keep lease.mutation for the existing failed/read path.
+        return { ...result, success: false, committed: true,
+          error: error.message, code: error.code || 'history_operation_receipt_persist_failed' };
+      }
       return result;
     }
     if (phase === 'adopting') {
@@ -448,6 +480,7 @@ class SavedHistoryOperations {
         this.save(lease, { phase, bindingCommitted: true, activeSessionId: nextSid, binding }, () => {
           if (!this.db.compareAndSetTabClaudeSessionId(lease.scope.projectId, spec.tabId, spec.expectedSessionId, nextSid)) fail('history_binding_changed');
         });
+        if (lease.historyInput) this.runtime.bindInput?.(lease.historyInput, nextSid);
         lease.scope = this.runtime.capture(spec.tabId);
         return { binding };
       }

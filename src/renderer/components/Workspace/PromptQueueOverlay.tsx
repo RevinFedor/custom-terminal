@@ -1,4 +1,5 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
+import { readTerminalMessageClipboard, terminalMessageTokenPresentation } from '../../utils/terminalMessageChips.mjs';
 import { useQueuedRewindLabels } from '../../hooks/useQueuedRewindLabels';
 import { queuedRewindLabel } from '../../utils/queuedRewindLabel.mjs';
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo, useSyncExternalStore } from 'react';
@@ -907,7 +908,8 @@ export function PromptQueueOverlay({
         from: range.start,
         to: range.end,
         kind: 'paste' as const,
-        label: editorText.slice(range.start + 1, Math.max(range.start + 1, range.end - 1)),
+        ...terminalMessageTokenPresentation(editorChips.find(chip => chip.id === range.id),
+          editorText.slice(range.start + 1, Math.max(range.start + 1, range.end - 1))),
       })),
       ...editorDictationMarkerRanges.map((range) => {
         const entry = editorDictationEntries.get(range.id);
@@ -932,7 +934,7 @@ export function PromptQueueOverlay({
     })));
     return result;
   }, [editorDictationEntries, editorDictationMarkerRanges, editorImageMarkerRanges, editorImagePaths,
-    editorImagePreviewUrls, editorPasteMarkerRanges, editorText, isSpecialPromptMode]);
+    editorImagePreviewUrls, editorPasteMarkerRanges, editorText, editorChips, isSpecialPromptMode]);
   const editorPreviewImageRange = useMemo(() => (
     editorChipPreviewId
       ? editorImageMarkerRanges.find((range) => (
@@ -2528,11 +2530,12 @@ export function PromptQueueOverlay({
     const imageItem = Array.from(event.clipboardData?.items || [])
       .find((item) => item.kind === 'file' && item.type.toLowerCase().startsWith('image/'));
     const pastedText = event.clipboardData?.getData('text/plain') || '';
+    const messageReference = readTerminalMessageClipboard(event.clipboardData, pastedText);
     if (!imageItem && isElectronDictationClipboardPayload(event.clipboardData)) return;
     const portableMarkers = imageItem ? [] : collectPortableImagePathMarkers(pastedText);
 
     if (!imageItem && portableMarkers.length === 0) {
-      if (!shouldCreatePasteChip(pastedText, aiComposerChipThreshold)) return;
+      if (!messageReference && !shouldCreatePasteChip(pastedText, aiComposerChipThreshold)) return;
       event.preventDefault();
       event.stopPropagation();
       if (isSpecialPromptMode) {
@@ -2562,6 +2565,7 @@ export function PromptQueueOverlay({
         id: createQueuedComposerChipId(),
         kind: 'paste',
         text: pastedText,
+        ...(messageReference ? { messageReference } : {}),
         label: 'Вставка',
         createdAt: Date.now(),
       };

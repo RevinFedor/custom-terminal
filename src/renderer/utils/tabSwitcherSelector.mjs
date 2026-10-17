@@ -18,7 +18,9 @@ export function buildSwitcherWorkflowLookup(ws, projects) {
   };
 }
 
-export function captureSwitcherInputs(ws, projectsMeta, { isFileMissing = () => false, inboxName = 'Inbox' } = {}) {
+export function captureSwitcherInputs(ws, projectsMeta, {
+  isFileMissing = () => false, inboxName = 'Inbox', projectTab,
+} = {}) {
   const workflowForTab = buildSwitcherWorkflowLookup(ws, projectsMeta);
   const recentFirst = [...ws.projectHistory].reverse();
   const orderedIds = [...recentFirst.filter(id => ws.openProjects.has(id)),
@@ -32,7 +34,7 @@ export function captureSwitcherInputs(ws, projectsMeta, { isFileMissing = () => 
       : workspace.projectPath?.split('/').filter(Boolean).pop() || 'Project');
     const tabs = Array.from(workspace.tabs.values()).filter(tab => !tab.parentTabId).map(tab => {
       const workflow = workflowForTab(tab.id);
-      return { ...tab, ...(tab.tabType === 'file' && isFileMissing(tab.filePath) ? { missing: true } : {}),
+      return { ...(projectTab ? projectTab(tab) : tab), ...(tab.tabType === 'file' && isFileMissing(tab.filePath) ? { missing: true } : {}),
         workflowId: workflow.id, workflowName: workflow.name, workflowIcon: workflow.icon, workflowUnplaced: workflow.unplaced };
     });
     return { projectId, projectName, projectIcon: projectsMeta[projectId]?.icon || null, tabs };

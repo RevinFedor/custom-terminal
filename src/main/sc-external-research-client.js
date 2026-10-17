@@ -98,7 +98,10 @@ class ScExternalResearchClient {
       controller.abort();
     }, Math.max(1, Number(timeoutMs) || 1));
     try {
-      return await this.fetch(url, { ...(init || {}), signal: controller.signal });
+      const response = await this.fetch(url, { ...(init || {}), signal: controller.signal });
+      // Fetch resolves at headers. Keep the existing deadline and caller abort
+      // attached until the body is consumed as well.
+      return await responseJson(response);
     } catch (cause) {
       if (timedOut) {
         throw new ScExternalResearchHttpError('SC Desktop research request timed out', {
@@ -113,16 +116,15 @@ class ScExternalResearchClient {
   }
 
   async capabilities({ signal } = {}) {
-    const response = await this._request(
+    return this._request(
       `${this.baseUrl}/research-capabilities`,
       { signal },
       this.capabilityTimeoutMs,
     );
-    return responseJson(response);
   }
 
   async start({ jobId, provider, prompt, options, files, conversationUrl }, { signal } = {}) {
-    const response = await this._request(`${this.baseUrl}/research-start`, {
+    return this._request(`${this.baseUrl}/research-start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal,
@@ -135,27 +137,24 @@ class ScExternalResearchClient {
         ...(conversationUrl ? { conversationUrl } : {}),
       }),
     }, this.startTimeoutMs);
-    return responseJson(response);
   }
 
   async status(jobId, { waitMs = 0, signal } = {}) {
     const wait = Math.max(0, Math.min(60_000, Number(waitMs) || 0));
-    const response = await this._request(
+    return this._request(
       `${this.baseUrl}/research-status?id=${encodeURIComponent(jobId)}&wait=${wait}`,
       { signal },
       wait + this.statusOverheadMs,
     );
-    return responseJson(response);
   }
 
   async stop(jobId, { signal } = {}) {
-    const response = await this._request(`${this.baseUrl}/research-stop`, {
+    return this._request(`${this.baseUrl}/research-stop`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal,
       body: JSON.stringify({ id: jobId }),
     }, this.stopTimeoutMs);
-    return responseJson(response);
   }
 
   async openBrowser(jobId, { requestId, signal } = {}) {
@@ -166,10 +165,10 @@ class ScExternalResearchClient {
         code: 'sc_research_browser_navigation_unavailable',
       });
     }
-    const result = await responseJson(await this._request(`${this.baseUrl}/research-open-browser`, {
+    const result = await this._request(`${this.baseUrl}/research-open-browser`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
       body: JSON.stringify({ jobId, requestId }),
-    }, 15_000));
+    }, 15_000);
     if (result?.ok !== true || result.opened !== true || result.jobId !== jobId
       || result.requestId !== requestId || !Number.isInteger(result.tabId) || result.tabId < 0) {
       throw new ScExternalResearchHttpError('SC Desktop не подтвердил переход к вкладке research в браузере', {
@@ -186,11 +185,10 @@ class ScExternalResearchClient {
         code: 'sc_research_navigation_unavailable',
       });
     }
-    const response = await this._request(`${this.baseUrl}/research-open`, {
+    const result = await this._request(`${this.baseUrl}/research-open`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
       body: JSON.stringify({ jobId, requestId }),
     }, 20_000);
-    const result = await responseJson(response);
     if (result?.ok !== true || result.opened !== true || result.jobId !== jobId || result.requestId !== requestId) {
       throw new ScExternalResearchHttpError('SC Desktop не подтвердил открытие этой задачи', { code: 'sc_research_navigation_not_confirmed' });
     }

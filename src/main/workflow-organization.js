@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { startSnapshotPrune } = require('./workflow-snapshot-prune');
 const { orderedWorkflows } = require('../shared/workflow-order.cjs');
 const {
   ORGANIZATION_VERSION, EXECUTION_SUBJECT_VERSION, INBOX_WORKFLOW_ID,
@@ -34,6 +35,23 @@ class WorkflowOrganization {
       const DatabaseManager = require('./database');
       this.executionDatabase = database?.ensureWorkflowExecutionStorage ? database : new DatabaseManager({ existingConnection: this.db });
       this.executionDatabase.ensureWorkflowExecutionStorage();
+    }
+    this.scheduleSnapshotPrune();
+  }
+
+  scheduleSnapshotPrune() {
+    try {
+      if (this.snapshotPrune || this.db.readonly === true || !require('node:path').isAbsolute(this.db.name || '')
+        || this.getPublication().version !== ORGANIZATION_VERSION) return;
+      // Amortize worker startup across several publications. This index-only
+      // probe never reads a snapshot payload or launches a worker per click.
+      if (!this.db.prepare('SELECT generation FROM workflow_org_generations ORDER BY generation LIMIT 1 OFFSET 7').get()) return;
+      this.snapshotPrune = startSnapshotPrune(this.db.name);
+      this.snapshotPrune?.once('exit', () => { this.snapshotPrune = null; });
+    } catch (error) {
+      // Optional maintenance must not turn an already committed mutation into
+      // a failed/unknown ACK or block startup of the current workspace.
+      console.warn('[WorkflowSnapshots:Prune] scheduling unavailable: ' + error.message);
     }
   }
 
@@ -216,6 +234,7 @@ class WorkflowOrganization {
       this.fault('afterCommit', { kind, generation: result.generation });
       // Publication is durable above; a listener failure cannot revoke commit.
       try { this.publish(clone(result)); } catch { /* recover by getPublication/replay */ }
+      this.scheduleSnapshotPrune();
     }
     return result;
   }

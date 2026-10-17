@@ -5,6 +5,8 @@ import ts from 'typescript';
 import {organizationProjection} from '../utils/workflowOrganizationClient.mjs';
 import {captureSpaceLayout} from '../utils/workspaceSpacesModel.mjs';
 import {applyWorkflowDragLayout} from '../utils/workflowDragNavigation.mjs';
+import {uiDragDiagnostic} from '../utils/uiPerformanceDiagnostics.mjs';
+import {newerWorkflowGroups} from '../utils/workflowGroupClient.mjs';
 
 const source=ts.createSourceFile('store.ts',fs.readFileSync(new URL('./useWorkspaceStore.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);
 let expression;
@@ -26,7 +28,7 @@ function fixture() {
   const pending=new Promise(resolve=>{release=resolve;}),arrived=new Promise(resolve=>{arrive=resolve;});
   const bindings={get:()=>state,set:patch=>Object.assign(state,patch),
     organizationCommitter:{command:()=>{arrive();return pending;}},projectTabSaveQueue:{enqueueMany:(_ids,operation)=>operation()},
-    executionRevisionAcks:{},workflowRelationReceipts:{},organizationProjection,captureSpaceLayout,applyWorkflowDragLayout};
+    executionRevisionAcks:{},workflowRelationReceipts:{},organizationProjection,captureSpaceLayout,applyWorkflowDragLayout,uiDragDiagnostic,newerWorkflowGroups};
   const action=Function(...Object.keys(bindings),'const module={exports:null};'+code+';return module.exports;')(...Object.values(bindings));
   const request={tabs:[],destinationKind:'window',targetWorkflowId:'w1',workflows:[{workflowId:'w1',beforeLayout:before,layout:after,reserveOrder:[],reserveRootOrder:[]}]};
   const run=action(request);

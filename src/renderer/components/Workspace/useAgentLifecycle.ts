@@ -279,6 +279,7 @@ export function useAgentLifecycle({
   // warning-тостом из AutoResume (App.tsx), не плашкой на терминале.
   const targetRef = useRef(target);
   const probeSeqRef = useRef(0);
+  const launchPreparationEventSeqRef = useRef(0);
   const dismissedKeysRef = useRef<Set<string>>(new Set());
   const [sessionStarting, setSessionStarting] = useState<SessionStartingState | null>(null);
   const [agentStopping, setAgentStopping] = useState<AgentStoppingState | null>(null);
@@ -292,6 +293,11 @@ export function useAgentLifecycle({
   ), []);
 
   const invalidateProbe = useCallback((eventTabId: string) => {
+    launchPreparationEventSeqRef.current = invalidateSessionStartingProbeSequence(
+      launchPreparationEventSeqRef.current,
+      targetRef.current,
+      eventTabId,
+    );
     probeSeqRef.current = invalidateSessionStartingProbeSequence(
       probeSeqRef.current,
       targetRef.current,
@@ -307,7 +313,7 @@ export function useAgentLifecycle({
       ? 'codex'
       : (state?.toolType === 'claude' ? 'claude' : info.engine);
     if (info.tabId !== stateTabId || info.engine !== engine) return;
-    if (state?.preparing === true || state?.cleared === true) invalidateProbe(stateTabId);
+    invalidateProbe(stateTabId);
     if (state?.preparing === true) dismissedKeysRef.current.delete(dismissKey(info));
     setSessionStarting((prev) => applyAgentLaunchPreparationSnapshot(prev, info, state));
   }, [dismissKey, enabled, invalidateProbe]);
@@ -362,10 +368,12 @@ export function useAgentLifecycle({
   useEffect(() => {
     if (!target || !enabled) return;
     let cancelled = false;
+    const preparationEventSeq = launchPreparationEventSeqRef.current;
     ipcRenderer.invoke('agent:get-launch-preparation-state', target.tabId)
       .then((result: any) => {
         if (cancelled) return;
-        if (targetRef.current?.tabId !== target.tabId) return;
+        if (!isSessionStartingProbeCurrent(preparationEventSeq,
+          launchPreparationEventSeqRef.current, target, targetRef.current)) return;
         applyLaunchPreparationState(result?.state || null);
       })
       .catch(() => {});
@@ -438,6 +446,7 @@ export function useAgentLifecycle({
     const showFromEvent = (eventTabId: string, reason: string) => {
       const info = targetRef.current;
       if (!isMine(eventTabId) || !info) return;
+      invalidateProbe(eventTabId);
       dismissedKeysRef.current.delete(dismissKey(info));
       console.warn('[AgentLifecycle] event-start tab=' + eventTabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
       setSessionStarting((prev) => prev?.tabId === eventTabId ? prev : {

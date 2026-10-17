@@ -30,11 +30,19 @@ export type HistoryRewriteRewindTarget = {
 
 export class HistoryRewriteRewindError extends Error {
   historyMutated: boolean;
+  historyApplied: boolean;
+  newSessionId: string | null;
+  draft: any;
 
-  constructor(message: string, historyMutated: boolean) {
+  constructor(message: string, historyMutated: boolean, {
+    historyApplied = historyMutated, newSessionId = null, draft = null,
+  }: { historyApplied?: boolean; newSessionId?: string | null; draft?: any } = {}) {
     super(message);
     this.name = 'HistoryRewriteRewindError';
     this.historyMutated = historyMutated;
+    this.historyApplied = historyApplied;
+    this.newSessionId = newSessionId;
+    this.draft = draft;
   }
 }
 
@@ -127,14 +135,15 @@ async function resolveCurrentRange({
   };
 }
 
-async function stopCodexForHistoryRewrite(tabId: string, sessionId: string, authority?: any): Promise<void> {
+async function stopCodexForHistoryRewrite(tabId: string, sessionId: string, authority?: any, historyInput?: any): Promise<void> {
   const commandState = await ipcRenderer.invoke('terminal:getCommandState', {
     tabId,
     caller: 'PromptQueue.codexHistoryRewind',
     expectedProcess: 'codex',
     allowProcessTreeLookup: true,
   });
-  if (commandState?.processLookupUnknown && !commandState?.isRunning) {
+  if (typeof commandState?.isRunning !== 'boolean'
+    || (commandState.processLookupUnknown && !commandState.isRunning)) {
     throw new Error('Не удалось проверить процесс Codex; история не изменена');
   }
   if (!sessionId) throw new Error('Нет Codex-сессии для Rewind');
@@ -144,6 +153,7 @@ async function stopCodexForHistoryRewrite(tabId: string, sessionId: string, auth
     toolType: 'codex',
     reason: 'prompt-queue-history-rewind',
     ...(authority ? { authority } : {}),
+    ...(historyInput ? { historyInput } : {}),
   });
   if (!stopped?.success) throw new Error(stopped?.guardReason || stopped?.error || 'Не удалось остановить Codex');
 }
@@ -192,11 +202,15 @@ export async function executeHistoryRewriteRewindScenario({
   let historyMutated = false;
   let stopped = false;
   let codexChildAdopted = false;
+  let committedChildSessionId: string | null = null;
+  let preparedDraft: any = null;
   let mutationSessionId = sessionId;
   let preparedMutationSessionId: string | null = null;
   let preparedIncumbentSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
   let codexSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
   let incumbentSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
+  let historyInput: any = null;
+  let ownsInputReservation = false;
   try {
     if (operation) {
       const prepared = await checkpoint('prepare');
@@ -207,6 +221,13 @@ export async function executeHistoryRewriteRewindScenario({
       cwd = prepared.cwd;
       preparedMutationSessionId = prepared.mutationSessionId || null;
       preparedIncumbentSettingsProof = prepared.incumbentCodexSettingsProof || null;
+      historyInput = prepared.historyInput || null;
+    }
+    if (!historyInput) {
+      historyInput = await ipcRenderer.invoke('history-mutation:begin', {
+        tabId, sessionId, toolType, operationId: activity.id,
+      });
+      ownsInputReservation = true;
     }
     const range = await resolveCurrentRange({
       tabId,
@@ -226,6 +247,7 @@ export async function executeHistoryRewriteRewindScenario({
         })
       : null;
 
+    preparedDraft = restoredDraft;
     if (toolType === 'codex') {
       incumbentSettingsProof = preparedIncumbentSettingsProof || getCodexHistoryMutationSettingsProof(tabId, sessionId);
       codexSettingsProof = getCodexHistoryMutationSettingsProof(tabId, mutationSessionId);
@@ -236,6 +258,7 @@ export async function executeHistoryRewriteRewindScenario({
         endUuid: range.endUuid,
         validateOnly: true,
         toPhysicalEnd: rangeMode === 'tail',
+        tabId, historyInput,
         ...(codexSettingsProof ? { codexSettingsProof } : {}),
       });
       if (!preflight?.success) {
@@ -245,13 +268,14 @@ export async function executeHistoryRewriteRewindScenario({
       if (mutationSessionId === sessionId) incumbentSettingsProof = codexSettingsProof;
       activity.setPhase('stopping');
       const stop = await checkpoint('stopping');
-      await stopCodexForHistoryRewrite(tabId, sessionId, stop.authority);
+      await stopCodexForHistoryRewrite(tabId, sessionId, stop.authority, historyInput);
     } else {
       activity.setPhase('stopping');
       const stop = await checkpoint('stopping');
       const stopResult = await stopClaudePtyProcess(tabId, {
         reason: 'prompt-queue-history-rewrite-rewind',
         ...(stop.authority ? { authority: stop.authority } : {}),
+        historyInput,
       });
       if (stopResult?.success === false) {
         throw new Error(stopResult.error || 'Не удалось остановить Claude перед Rewind');
@@ -288,10 +312,15 @@ export async function executeHistoryRewriteRewindScenario({
           cwd,
           startUuid: target.uuid,
           endUuid: range.endUuid,
+          tabId, historyInput,
           ...(toolType === 'codex' ? { toPhysicalEnd: rangeMode === 'tail' } : {}),
           ...(toolType === 'codex' && codexSettingsProof ? { codexSettingsProof } : {}),
         });
-    if (toolType === 'claude' && result?.committed === true) historyMutated = true;
+    if (result?.committed === true) historyMutated = true;
+    if (toolType === 'codex' && (result?.success === true || result?.committed === true)
+      && typeof result.newSessionId === 'string' && result.newSessionId) {
+      committedChildSessionId = result.newSessionId;
+    }
     if (!result?.success) {
       throw new Error(result?.error || 'Не удалось обрезать историю для Rewind');
     }
@@ -339,7 +368,7 @@ export async function executeHistoryRewriteRewindScenario({
         'deleteRange',
         { ...(result.codexSettingsProof || codexSettingsProof
           ? { codexSettingsProof: result.codexSettingsProof || codexSettingsProof } : {}),
-          ...(operation ? { historyOperation: operation } : {}) },
+          ...(operation ? { historyOperation: operation } : {}), historyInput },
       );
       if (!committed) throw new Error('Не удалось сохранить новую Codex-сессию во вкладке');
       codexChildAdopted = true;
@@ -351,7 +380,7 @@ export async function executeHistoryRewriteRewindScenario({
         command: 'codex-c',
         sessionId: result.newSessionId,
         cwd,
-      }), ...resumeScope });
+      }), ...resumeScope, historyInput });
       if (launched?.success === false || launched?.accepted === false) {
         throw new Error(launched.error || launched.reason || 'Не удалось перезапустить Codex после Rewind');
       }
@@ -381,7 +410,7 @@ export async function executeHistoryRewriteRewindScenario({
       }
       const resumeScope = await checkpoint('resuming');
       const launched = await ipcRenderer.invoke('claude:run-command', {
-        tabId, command: 'claude-c', sessionId: mutationSessionId, ...resumeScope,
+        tabId, command: 'claude-c', sessionId: mutationSessionId, ...resumeScope, historyInput,
       });
       const resume = { launchWritten: launched?.launchWritten === true,
         accepted: launched?.accepted ?? null, acceptancePending: launched?.inputReady !== true,
@@ -406,6 +435,7 @@ export async function executeHistoryRewriteRewindScenario({
       tabId,
       command: 'claude-c',
       sessionId: mutationSessionId,
+      historyInput,
     });
     if (launched?.success === false || launched?.accepted === false) {
       throw new Error(launched?.error || launched?.reason || 'Не удалось перезапустить Claude после Rewind');
@@ -416,7 +446,9 @@ export async function executeHistoryRewriteRewindScenario({
     const message = String(error?.message || error || 'Rewind failed');
     activityError = message;
     const historyApplied = toolType === 'codex' ? codexChildAdopted : historyMutated;
-    if (!historyApplied && stopped) {
+    // Once the COW commit exists, a failed adoption is not a no-write failure.
+    // Do not launch the incumbent and obstruct recovery of this exact child.
+    if (!historyMutated && stopped) {
       try {
         if (toolType === 'codex') {
           const resumeScope = await checkpoint('resuming');
@@ -428,7 +460,7 @@ export async function executeHistoryRewriteRewindScenario({
               cwd,
             },
             incumbentSettingsProof,
-          ), ...resumeScope });
+          ), ...resumeScope, historyInput });
           if (restored?.success === false || restored?.accepted === false) {
             throw new Error(restored?.error || restored?.reason || 'Codex source restart failed');
           }
@@ -439,6 +471,7 @@ export async function executeHistoryRewriteRewindScenario({
             command: 'claude-c',
             sessionId: mutationSessionId,
             ...resumeScope,
+            historyInput,
           });
           if (restored?.success === false || restored?.accepted === false) {
             throw new Error(restored?.error || restored?.reason || 'Claude source restart failed');
@@ -451,8 +484,16 @@ export async function executeHistoryRewriteRewindScenario({
     await checkpoint('failed', { error: message }).catch((receiptError) => {
       console.warn('[HistoryRewriteRewind] failure receipt pending:', receiptError);
     });
-    throw new HistoryRewriteRewindError(message, historyApplied);
+    throw new HistoryRewriteRewindError(message, historyMutated, {
+      historyApplied, newSessionId: committedChildSessionId,
+      draft: historyMutated ? preparedDraft : null,
+    });
   } finally {
+    if (historyInput && ownsInputReservation) {
+      await ipcRenderer.invoke('history-mutation:finish', historyInput).catch(error => {
+        console.warn('[HistoryRewriteRewind] input settlement failed:', error);
+      });
+    }
     historyRewriteRewindInflightTabs.delete(tabId);
     activity.finish(activityError);
   }

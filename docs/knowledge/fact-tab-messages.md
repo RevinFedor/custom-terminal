@@ -54,6 +54,37 @@ linked Markdown/`publish_context_update`. Иначе уточняющий воп
   явный содержательный ответ; уточнение оформляется новым вопросом. Reply
   не требует автоматического ответного acknowledgement агентом.
 
+Шрам14.10 Ai Mindset→4898: usable writer отправителя не подтверждает адресата.
+У остановленного Codex сохранённый SID был виден, но coherent Main snapshot
+не переносил canResume; message resolver поэтому отказал503 до reservation.
+Stopped identity использует прежнюю binding только при свежем process=absent,
+inactive/liveLifecycle=false и совпадении sessionId/savedSessionId того же снимка.
+Это разрешение общего Resume-сценария, не live writer/input proof. Unknown/found
+process и смена owner не получают saved SID как замену. Сам текст ошибки о
+«current conversation» не означает, что потерян именно источник вызова.
+Класс: `local but check similar paths`. Остановка процесса не отменяет сохранённый
+адрес; отказ возникал до общего Resume/Send. Старый consumer-тест вручную задавал
+canResume=true и потому не проверял полноту Main DTO. Регрессия теперь соединяет
+actual Main producer с messageRuntimeIdentity/scenarioDestination и API/SQLite;
+успех этих проверок не заменяет native cold Resume/Enter acceptance после обновления.
+Тот же шрам подтверждён для saved reply344c8c45 из4196 в4929:07:00UTC manual-stop,
+07:09:23 target lookup0, address-guard503/attempt0 при прежнем SIDd04e6435.
+Ответ сохранён, общий текст «address no longer available» не доказывает смену
+истории. Actual reply-after-stop и changed-history controls проверяют тот же Main
+producer; уже failed reply автоматически не переотправляется после source update.
+
+Отдельный SOURCE seam15.10: стабильный owner не согласует retained event lifecycle
+с отдельным свежим process lookup. При event live/unknown и complete absent public
+snapshot обращается к прежнему canonical Codex reader с forceWriterReconcile;
+тот сохраняет exact accepted-launch/handoff hold. Unknown/found процесс или
+pending launch не превращается в stopped, saved SID не повышается до writer.
+Исходный Boosty50309:21 не сохранил точный tuple/stage, поэтому этот regression
+не выдаётся за доказанную historical rootcause. `[AgentRuntimeIdentity]` отличает
+event/physical/canonical verdict, `[AgentMessageIdentity]` — tab/purpose отказа,
+без prompt body. Actual stopped producer уже возвращал saved SID при live=false:
+гипотеза «stopped всегда NULL» неверна. Контроли —
+`stopped-codex-message-identity.actual.test.js`; новые admission/FIFO права не добавлены.
+
 `get_send_receipt({tabId,handoffId})` отдельно читает старый delivery-only
 send_prompt. Шрам02.10: агент получил400/409, пытаясь прочитать уже доставленный
 ответ повторной отправкой пустого/сокращённого текста. Read не должен пересекать
@@ -66,6 +97,24 @@ SQLite `tab_messages` фиксирует вопрос/ответ и неизме
 Стадии `pending/sending/queued/sent/waiting-for-input/unconfirmed/failed`
 описывают доставку; `replyMessageId/answeredAt` отдельно описывают наличие ответа.
 `sent` доказывает запись prompt, а не понимание или использование текста моделью.
+
+Application FIFO reserved/preparing с waiting/dispatching — ещё не отказ доставки.
+Проекция переписки сохраняет pending/sending и retryAllowed=0, пока executor владеет
+этой записью. Шрам15.10 HH367: прежняя классификация делала queued admission failed
+ещё до ввода; затем новый live statusAtSend=busy менял request hash исходного inactive
+сообщения. Поэтому statusAtSend сохраняется как admission hint; актуальная готовность
+по-прежнему доказывается executor, не этим историческим полем.
+
+Прежний message-owner wake после доказанного no-input refusal вправе вновь поставить
+тот же item в Main FIFO: exact current attempt, not-submitted и явные submitted/
+pasteWritten/enterWritten=false обязательны. Payload/ID не меняются, повторная
+постановка идёт после уже принятой работы. Старый bridge finally удерживает physical
+slot; recovery до его возврата сохраняется без нового wake. Обычный same-ID replay
+сам по себе не ставит item повторно. Cancelled, unknown, provider rejection и уже
+вставленный текст этим recovery не разрешаются; API не даёт caller-у отдельного
+retry-grant. После SQLite reopen владельцем ожидания остаётся та же Main очередь.
+Actual regression: `agent-send-application-queue.integration.test.js` соединяет
+сообщения, очередь и настоящую Main revalidation; provider/PTY в нём controlled.
 
 `accepted:true` при `deliveryState:pending` означает сохранение ответа приложением;
 в итоговом отчёте это нельзя называть подтверждённой доставкой. Поздний отказ
@@ -107,6 +156,13 @@ Wake идёт от событий lifecycle/input, модель не полли�
 
 ## UI и инструкции
 
+Пустой status dock не измеряет rail/pane и не держит ResizeObserver, пока нет
+видимых requests/messages/error либо открытого History/settings/message panel.
+При появлении такого содержимого тот же layout-effect измеряет свежую геометрию
+до показа; кнопки остаются доступны. Подписки/доставка/identity/отмена не зависят
+от этой геометрии.17.10 private built UI сохранил открытие настроек внутри своей
+pane; это UI-проверка, не доказательство MCP message roundtrip.
+
 Вопросы используют существующую поверхность tracker без фиктивных runs. Основная
 строка26px общая с поручением: направление, название, статические status SVG и
 зарезервированное место24px для действия. В компактном live tracker вращающийся
@@ -119,10 +175,20 @@ Wake идёт от событий lifecycle/input, модель не полли�
 дополнительных галочек и правой стрелки. Полный message-item48px включает этот
 дочерний ряд; основной header не становится выше native-run.
 Это два индикатора, не две команды с одинаковым действием.
-Внутри сообщения общий source-header вместо слов «Вопрос/Ответ» показывает
+По умолчанию внутри сообщения общий source-header вместо слов «Вопрос/Ответ» показывает
 стрелку и кликабельное имя отправителя. `↙` означает входящий вопрос/request,
 `↗` — ответ на исходящий вопрос/completion; это причинная роль переписки, не
 факт отправки текущей строки наружу. Тот же header используется в body preview.
+В меню окна `⋮` под Timeline есть `MCP как user`: настройка выбранной вкладки
+сразу показывает её входящие MCP/межвкладочные сообщения обычными оранжевыми
+user-bubbles без source-header. Выключение возвращает источник и фиолетовый фон;
+старые и queued карточки используют тот же режим. Это presentation override:
+semanticTags, полный транспортный текст, ID и receipt/Copy/Rewind не меняются.
+Research и native question replies сохраняют свои специальные поверхности.
+Per-tab map хранится в UIStore через SQLite-зеркало `noted-terminal-*`; настройка
+переживает restart и перенос вкладки. Режим входит в shape-key сохранённых высот,
+но не меняет semantic IDs или reading anchors. Tracker и Timeline preview имеют
+прежние независимые представления.
 Временная `role:queued` карточка использует полный immutable `semanticTags`
 из Main presentation snapshot, а не только общий признак Terminal MCP. Эти данные
 сохраняются в handoff, при поздней exact receipt и при восстановлении History;
@@ -132,6 +198,9 @@ session и полного prompt. Оно не меняет доставку, т�
 Шрам07.10: reply был подтверждён, canonical History имела source-tag, но queued
 карточка показывала raw `[Tab message: reply]` без стрелки/имени. Наличие новой
 шапки в установленном renderer само по себе не закрывало этот отдельный путь.
+После saved-history Codex COW тот же симптом требует проверки переноса sidecar,
+а не переключателя цвета. Exact legacy recovery и атомарный transfer описаны в
+`fact-session-history.md::Service Presentation После Codex COW`.
 У адресного question/reply это две независимые кнопки: имя открывает точную
 вкладку, стрелка открывает её и находит исходный `send_message/reply_to_message`
 по сохранённому messageId. У стрелки собственный приглушённый фон и более яркие

@@ -1,3 +1,4 @@
+import {uiDragDiagnostic} from '../../utils/uiPerformanceDiagnostics.mjs';
 import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback, useMemo, useSyncExternalStore } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { useAgentSendPending } from '../../hooks/useAgentSendActivity';
@@ -37,6 +38,7 @@ import { TabPaneMap } from './PaneMap';
 import { TabIdActions } from './TabIdActions';
 import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
 import { tabContextSurface, tabContextPaneIndex } from '../../utils/tabContextSurface.mjs';
+import { contextCreatedTabPlacement } from '../../utils/contextCreatedTabPlacement.mjs';
 import TabWindowActionButton from './TabWindowActionButton';
 import type { WindowCell } from './MoveToWindowMenu';
 import NewTabMenuRows from './NewTabMenuRows';
@@ -45,6 +47,7 @@ import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunA
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import {
   TabCompletionNotificationBadge,
+  TabCompletionNotificationAlert,
   TabProcessBar,
   TabStatusMarkerButton,
   TabSessionAvailabilityMarker,
@@ -175,6 +178,9 @@ import { resolveTabRangeSelection } from '../../utils/tabRangeSelection.mjs';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 
 const { ipcRenderer } = window.require('electron');
+// A duplicate menu claim is not activity of the source conversation. Share it
+// across card surfaces without publishing a false Fork loader on that source.
+const contextForkSourceClaims = new WeakSet<object>();
 
 const TABBAR_DRAG_VISUAL_LOCK_ATTR = 'data-tabbar-drag-visual-lock';
 const GROUP_COLLAPSE_FLIP_SUPPRESS_MS = 320;
@@ -2107,6 +2113,7 @@ const TabItem = memo(({
                 muted={sessionSignalsMuted}
               />
               <TabContextUpdateBadge active={hasContextUpdate} />
+              <TabCompletionNotificationAlert fired={completionNotificationFired} />
               <TabCompletionNotificationBadge armed={completionNotificationArmed}
                 persistent={completionNotificationPersistent} fired={completionNotificationFired} />
               {/* Context + Fast already share one top-left lane above. */}
@@ -3670,6 +3677,8 @@ function TabBar({
   const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
   const [codexBusyMap, setCodexBusyMap] = useState<Map<string, boolean>>(new Map());
   const [pasteBusyMap, setPasteBusyMap] = useState<Map<string, boolean>>(new Map());
+  const activityProjectIdRef = useRef(projectId);
+  useLayoutEffect(() => { activityProjectIdRef.current = projectId; }, [projectId]);
   // Live background work (in-process subagents / background Bash chips)
   // published by the main-process transcript observers. Display-only.
   const [backgroundWorkMap, setBackgroundWorkMap] = useState<Map<string, boolean>>(new Map());
@@ -4049,6 +4058,26 @@ function TabBar({
   // OSC 133 Event-driven process status (replaces polling)
   // Stable listeners — subscribe once, never re-create
   useEffect(() => {
+    // These Maps draw this roster, not every project. Global runtime/busy
+    // ownership remains with App; an unrelated event must not render all
+    // retained TabBars. Read the current committed owner and mutable roster.
+    const ownsActivityTab = (tabId: string) => !!useWorkspaceStore.getState()
+      .openProjects.get(activityProjectIdRef.current)?.tabs.has(tabId);
+    const discardForeignActivity = (
+      tabId: string,
+      update: React.Dispatch<React.SetStateAction<Map<string, boolean>>>,
+    ) => {
+      if (ownsActivityTab(tabId)) return false;
+      // A moved/closed row may have left an old flag here. Clear that one
+      // entry, while unrelated events keep the exact existing Map reference.
+      update(previous => {
+        if (!previous.has(tabId)) return previous;
+        const next = new Map(previous);
+        next.delete(tabId);
+        return next;
+      });
+      return true;
+    };
     const handleCommandStarted = (_: any, { tabId, commandSource, command }: { tabId: string; commandSource?: string; command?: string }) => {
       console.warn('[TabBar:ProcessStatus] tabId=' + tabId.slice(-8) + ' running=true source=command-started');
       if (commandSource === 'restart-after' && command) setRestartAfterFallbackCommands(previous => {
@@ -4091,6 +4120,7 @@ function TabBar({
 
     const handleClaudeBusy = (_: any, data: { tabId: string; busy: boolean; reason?: string; activityBusy?: boolean }) => {
       const { tabId, busy, reason } = data;
+      if (discardForeignActivity(tabId, setClaudeBusyMap)) return;
       console.warn('[TabBar:BusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
       if (reason === 'spinner') return;
 
@@ -4098,6 +4128,7 @@ function TabBar({
     };
 
     const handleGeminiBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+      if (discardForeignActivity(tabId, setGeminiBusyMap)) return;
       console.warn('[TabBar:GeminiBusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
       setGeminiBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
@@ -4108,6 +4139,7 @@ function TabBar({
     };
 
     const handleCodexBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+      if (discardForeignActivity(tabId, setCodexBusyMap)) return;
       console.warn('[TabBar:CodexBusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
       setCodexBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
@@ -4118,6 +4150,7 @@ function TabBar({
     };
 
     const handlePasteBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      if (discardForeignActivity(tabId, setPasteBusyMap)) return;
       console.warn('[TabBar:PasteBusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy);
       setPasteBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
@@ -4128,6 +4161,7 @@ function TabBar({
     };
 
     const handleAwaitingInput = (_: any, { tabId, awaiting }: { tabId: string; awaiting: boolean }) => {
+      if (discardForeignActivity(tabId, setAwaitingMap)) return;
       console.warn('[TabBar:Awaiting] tabId=' + tabId.slice(-8) + ' awaiting=' + awaiting);
       setAwaitingMap(prev => {
         if ((prev.get(tabId) || false) === awaiting) return prev;
@@ -7017,15 +7051,12 @@ function TabBar({
     const store = useWorkspaceStore.getState();
     const currentTab = store.openProjects.get(projectId)?.tabs.get(tab.id);
     // Several menu surfaces can address this source. Claim the operation in
-    // their shared store before any async lookup, so a second click cannot
+    // a shared exact-object claim before any async lookup, so a second click cannot
     // launch a second Fork while the first click is still being prepared.
-    if (!currentTab || currentTab.pendingOperation === operationLabel) return;
-    store.setTabPendingOperation(projectId, tab.id, operationLabel);
-    const clearOperationLabel = () => {
-      const state = useWorkspaceStore.getState();
-      if (state.openProjects.get(projectId)?.tabs.get(tab.id)?.pendingOperation === operationLabel) {
-        state.setTabPendingOperation(projectId, tab.id, null);
-      }
+    if (!currentTab || currentTab.pendingOperation === operationLabel || contextForkSourceClaims.has(currentTab)) return;
+    contextForkSourceClaims.add(currentTab);
+    const releaseSourceClaim = () => {
+      contextForkSourceClaims.delete(currentTab);
     };
     // Capture the physical surface BEFORE closing the shared menu. A sidebar
     // right-click intentionally has no host and creates only a sidebar row;
@@ -7044,6 +7075,7 @@ function TabBar({
       const cwd = tab.cwd || workspace.projectPath || '';
       const suffix = fromLatestCompact ? '_compact' : '_fork';
       const forkName = tab.name ? `${tab.name}${suffix}` : undefined;
+      let publishedPlacement: ReturnType<typeof contextCreatedTabPlacement> = null;
       const newTabId = await useWorkspaceStore.getState().createTabAfterCurrent(projectId, forkName, cwd, {
         pendingAction: {
           type: provider === 'claude' ? 'claude-fork' : 'codex-fork',
@@ -7058,19 +7090,31 @@ function TabBar({
         afterTabId: tab.id,
         afterVisualSubtree: true,
         visualParentTabId: tab.id,
-        // Creation only inserts the tab. Visibility/focus must go through the
-        // same activation choke point as an ordinary click; otherwise a split
-        // keeps showing the old slot even though workspace.activeTabId already
-        // points at the fork.
         background: true,
+        publishOrganizationWithTab: true,
+        onPublish: (createdId) => {
+          publishedPlacement = contextCreatedTabPlacement(useWorkspaceStore.getState(),
+            contextSurface, projectId, tab.id, createdId, placementOrigin);
+          return publishedPlacement?.patch || null;
+        },
       });
       if (!newTabId) throw new Error('fork tab was not created');
-      placeContextCreatedTab(contextSurface, tab.id, newTabId, placementOrigin);
+      // The durable publication already includes its strip. Keep ordinary
+      // activation/intent/readiness, without append-then-reorder publications.
+      if (publishedPlacement) {
+        const state = useWorkspaceStore.getState();
+        const paneIndex = publishedPlacement.paneIndex;
+        if (paneIndex !== null && state.splitPanes.length && state.splitFocusedIndex !== paneIndex) {
+          useWorkspaceStore.setState({ splitFocusedIndex: paneIndex });
+        }
+        useWorkspaceStore.getState().activateCenterTab(projectId, newTabId);
+        useWorkspaceStore.getState().saveSession();
+      }
       // Creating a container is not confirmation that its history is ready.
     } catch (error: any) {
       showToast('Не удалось открыть вкладку fork: ' + (error?.message || String(error)), 'error');
     } finally {
-      clearOperationLabel();
+      releaseSourceClaim();
     }
   };
 
@@ -8278,6 +8322,7 @@ function TabBar({
       animateDuringScroll: false,
     },
     ...({ externalDrag: externalOutlineDragRequest } as any),
+    onDiagnostic: uiDragDiagnostic,
     onLog: (event) => {
       if (event.type === 'pending' || event.type === 'click-release') return;
       let detail = '{}';

@@ -4,12 +4,13 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
-const { actualFunction, createFakeClock, drainMicrotasks } = require('./fixtures/codex-draft-request-observation.cjs');
+const { actualFunction, startupFrameDeclarations, createFakeClock, drainMicrotasks } = require('./fixtures/codex-draft-request-observation.cjs');
 const { createAgentInputObservation, observeAgentInput } = require('./agent-input-observation');
 const { createAgentSendCancellationRegistry } = require('./agent-send-cancellation');
 
 const declarations = [
   'getTerminalStopRevision', 'getTerminalInputRevision', 'bumpTerminalInputRevision',
+  'captureAgentLaunchFence',
   'captureAgentInputIdentity', 'validateAgentInputIdentity', 'agentInputObservationOwner',
   'createMainAgentInputObservation', 'agentDraftObservationResult', 'decorateAgentDraftProofIdentity',
   'agentSendExecutionFailure', 'agentDraftProofMatchesCaptureIdentity',
@@ -43,6 +44,8 @@ function harness() {
     terminals: new Map([[tabId, term]]), terminalHeadlessMirrors: mirrors,
     terminalCommandState: new Map([[tabId, { runSeq: 1 }]]),
     terminalInputRevisions: new Map([[tabId, 5]]), terminalStopRevisions: new WeakMap(),
+    terminalLifecycleEpochs: new WeakMap([[term, 'fixture-terminal']]),
+    terminalLaunchFenceOrders: new WeakMap(), nextTerminalLaunchFenceOrder: 0,
     aiStoppingTabs: new Map(), agentSendCancellations: createAgentSendCancellationRegistry(),
     mainWindow: null, codexCapacityRetryRuntime: null, codexManualQueueInterrupts: new Map(),
     terminalHistoryPreviewController: { clear() {} },
@@ -53,6 +56,7 @@ function harness() {
     resolveAiToolTypeForTab: (_id, type) => type,
     getAiRuntimeSessionId: () => 'session-A',
     revokeCodexActionAuthoritiesForTab() {}, invalidateCodexExitObservers() {}, broadcastAiRuntimeStatus() {},
+    broadcastAgentLaunchFenceRevoked() {},
     emitAgentReadinessChanged: (_id, event) => ipcMain.emit('agent:readiness-changed-internal', null, { tabId, ...event }),
     classifyClaudeMissingPromptCaptureForTab: () => ({ recommended: false, reason: 'fixture-not-needed' }),
     agentSendTestFaultActive: () => false, codexDraftUnknownTestFaultConsumed: false, codexTurnWatchers: new Map(),
@@ -86,7 +90,7 @@ function harness() {
         frameIdentity: { generation: m?.generation, writeSeq: m?.flushedSeq } };
     },
   });
-  vm.runInContext(declarations, c);
+  vm.runInContext(startupFrameDeclarations() + '\n' + declarations, c);
   return { c, tabId, term, mirror, mirrors, clock, ipcMain,
     reads: () => readCount,
     content: value => { content = value; },
@@ -110,6 +114,185 @@ function harness() {
       assert.equal(clock.timers.size, 0);
     },
   };
+}
+
+function startupFrameHarness() {
+  const h = harness();
+  h.clock.advance(10000);
+  Object.assign(h.c, { ...require('./codex-runtime-contract'), CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000,
+    codexLastRunCommandPayload: new Map([[h.tabId, { launchId: 'L', terminalToken: h.term,
+      lifecycleGeneration: 'lifecycle-A', runSeq: 1, startedAt: 1 }]]) });
+  h.c.terminalCommandState.get(h.tabId).isRunning = true;
+  h.mirror.redrawTrace.synchronizedOutputOpen = true;
+  h.readStartup = () => h.c.requestTerminalCodexDraftState(null, h.tabId,
+    'agent-send-preflight:history-panel', 700, { waitFor: false, waitOnUnknownOnly: true, waitTimeoutMs: 2500 });
+  return h;
+}
+
+// Exercise the actual final pre-paste call site, not another copy of the
+// public/preflight reason string (that missed the cold174 production gap).
+function readPhysicalBeforePaste(h) {
+  const source = actualFunction('_safePasteAndSubmitInner');
+  const start = source.indexOf('const beforeDraft = await requestTerminalCodexDraftState(');
+  const end = source.indexOf('const afterDraftProbeInputRevision', start);
+  assert.ok(start > 0 && end > start);
+  Object.assign(h.c, { broadcastTabId: h.tabId, handoffId: 'H', sendAttemptId: 'A',
+    exactSendCancellationRequested: () => false,
+    codexStartupFrameWait: h.c.captureCodexSendStartupFrameWait(h.tabId), options: {} });
+  return vm.runInContext('(async () => { ' + source.slice(start, end) + ' return beforeDraft; })()', h.c);
+}
+
+test('actual final paste guard retains cold launch budget after common preflight already observed empty', async () => {
+  const h = startupFrameHarness(); h.mirror.redrawTrace.synchronizedOutputOpen = false;
+  assert.equal((await h.readStartup()).hasDraft, false);
+  h.clock.advance(100); h.mirror.redrawTrace.synchronizedOutputOpen = true;
+  let settled = false; const pending = readPhysicalBeforePaste(h).then(r => { settled = true; return r; });
+  await drainMicrotasks(); const reads = h.reads();
+  h.clock.advance(5500); await drainMicrotasks();
+  assert.equal(settled, false, 'the last guard must not fall back to 2500ms during the SAME startup');
+  assert.equal(h.reads(), reads, 'elapsed time cannot poll or manufacture an empty frame');
+  h.mirror.redrawTrace.synchronizedOutputOpen = false; h.mirror.writeSeq++; h.mirror.flushedSeq++;
+  h.wake(); assert.equal((await pending).hasDraft, false); h.clean();
+});
+
+test('actual final paste guard near expiry uses the remaining original deadline, not a fresh 2500ms', async () => {
+  const h = startupFrameHarness(); h.clock.advance(48001);
+  const pending = readPhysicalBeforePaste(h); await drainMicrotasks();
+  assert.deepEqual([...h.clock.timers.values()].map(t => t.dueAt), [60001]);
+  h.clock.advance(1000); const result = await pending;
+  assert.equal(result.hasDraft, null); assert.equal(result.observation.status, 'expired'); h.clean();
+});
+
+for (const change of ['stop', 'input', 'mirror', 'cancel', 'user-draft', 'missing-close']) {
+  test('actual final cold paste guard preserves ' + change, async () => {
+    const h = startupFrameHarness(); const pending = readPhysicalBeforePaste(h); await drainMicrotasks();
+    if (change === 'stop') h.stopAndClear('codex');
+    if (change === 'input') h.c.bumpTerminalInputRevision(h.tabId);
+    if (change === 'mirror') h.mirrors.set(h.tabId, { ...h.mirror, generation: 'replacement' });
+    if (change === 'cancel') h.c.agentSendCancellations.cancel(h.tabId, 'H', { attemptId: 'A' });
+    if (change === 'user-draft') { h.content('real user text'); h.mirror.redrawTrace.synchronizedOutputOpen = false; }
+    if (change === 'missing-close') h.clock.advance(50001);
+    h.wake(); const result = await pending;
+    if (change === 'user-draft') assert.equal(result.hasDraft, true);
+    else { assert.equal(result.hasDraft, null); assert.ok(['expired', 'cancelled', 'superseded'].includes(result.observation.status)); }
+    h.clean();
+  });
+}
+
+for (const change of ['expired', 'foreign-terminal', 'foreign-generation', 'foreign-run', 'post-paste']) {
+  test('final guard does not borrow a startup budget for ' + change, async () => {
+    const h = startupFrameHarness(), launch = h.c.codexLastRunCommandPayload.get(h.tabId);
+    if (change === 'expired') h.clock.advance(60001);
+    if (change === 'foreign-terminal') launch.terminalToken = {};
+    if (change === 'foreign-generation') launch.lifecycleGeneration = 'other';
+    if (change === 'foreign-run') launch.runSeq++;
+    const pending = change === 'post-paste'
+      ? h.c.requestTerminalCodexDraftState(null, h.tabId, 'codex-post-submit', 700,
+        { waitFor: false, waitOnUnknownOnly: true, waitTimeoutMs: 2500 })
+      : readPhysicalBeforePaste(h);
+    await drainMicrotasks(); h.clock.advance(2500); const result = await pending;
+    assert.equal(result.observation.budgetMs, 2500); assert.equal(result.hasDraft, null); h.clean();
+  });
+}
+
+test('cold Send waits for committed first frame under the original Main launch deadline, without polling/input', async () => {
+  const h = startupFrameHarness(); let settled = false;
+  const pending = h.readStartup().then(value => { settled = true; return value; });
+  await drainMicrotasks(); const reads = h.reads();
+  h.clock.advance(5500); await drainMicrotasks();
+  assert.equal(settled, false, '2500ms probe expiry must not truncate an active startup owner');
+  assert.equal(h.reads(), reads, 'elapsed time is not a polling wake');
+  h.mirror.redrawTrace.synchronizedOutputOpen = false; h.mirror.writeSeq++; h.mirror.flushedSeq++;
+  h.wake(); const result = await pending; assert.equal(result.hasDraft, false); h.clean();
+});
+
+test('cold frame opening during the first flush still belongs to the original startup deadline', async () => {
+  const h = startupFrameHarness(); let settled = false;
+  h.mirror.redrawTrace.synchronizedOutputOpen = false;
+  h.flush(async () => {
+    h.mirror.redrawTrace.synchronizedOutputOpen = true;
+    return { success: true };
+  });
+  const pending = h.readStartup().then(value => { settled = true; return value; });
+  await drainMicrotasks(); h.clock.advance(5500); await drainMicrotasks();
+  assert.equal(settled, false, 'a pre-await empty frame cannot choose the shorter observation lifetime');
+  h.flush(async () => ({ success: true }));
+  h.mirror.redrawTrace.synchronizedOutputOpen = false;
+  h.mirror.writeSeq++; h.mirror.flushedSeq++;
+  h.wake(); assert.equal((await pending).hasDraft, false); h.clean();
+});
+
+test('a cold observation begun near startup expiry cannot extend that original deadline', async () => {
+  const h = startupFrameHarness(); h.clock.advance(48001); // now 59001, launch deadline 60001
+  const pending = h.readStartup(); await drainMicrotasks();
+  assert.deepEqual([...h.clock.timers.values()].map(timer => timer.dueAt), [60001]);
+  h.clock.advance(1000); const result = await pending;
+  assert.equal(result.observation.status, 'expired');
+  assert.equal(result.observation.budgetMs, 1000); assert.equal(result.hasDraft, null); h.clean();
+});
+
+test('repeated ready/busy/idle wakes do not renew the cold observation or grant empty input', async () => {
+  const h = startupFrameHarness(); const pending = h.readStartup(); await drainMicrotasks();
+  for (const status of ['active', 'busy', 'active']) {
+    h.clock.advance(3000);
+    h.ipcMain.emit('agent:readiness-changed-internal', null, { tabId: h.tabId, status, inputReady: true });
+    await drainMicrotasks();
+    assert.deepEqual([...h.clock.timers.values()].map(timer => timer.dueAt), [60001]);
+  }
+  h.clock.advance(40001); const result = await pending;
+  assert.equal(result.hasDraft, null); assert.equal(result.observation.status, 'expired'); h.clean();
+});
+
+test('a real draft after cold frame commit is returned immediately, never cleared to authorize Send', async () => {
+  const h = startupFrameHarness(); const pending = h.readStartup(); await drainMicrotasks();
+  h.content('user-owned draft'); h.mirror.redrawTrace.synchronizedOutputOpen = false;
+  h.mirror.writeSeq++; h.mirror.flushedSeq++; h.wake();
+  const result = await pending;
+  assert.equal(result.hasDraft, true); assert.equal(result.preview, 'user-owned draft'); h.clean();
+});
+
+test('cancellation of the original cold attempt remains final after a later empty frame', async () => {
+  const h = startupFrameHarness();
+  const pending = h.c.requestTerminalCodexDraftState(null, h.tabId, 'agent-send-preflight:project-api', 700,
+    { waitFor: false, waitOnUnknownOnly: true, waitTimeoutMs: 2500, handoffId: 'H', attemptId: 'A' });
+  await drainMicrotasks();
+  h.c.agentSendCancellations.cancel(h.tabId, 'H', { attemptId: 'A' });
+  await drainMicrotasks();
+  h.mirror.redrawTrace.synchronizedOutputOpen = false; h.wake();
+  const result = await pending;
+  assert.equal(result.hasDraft, null); assert.equal(result.observation.status, 'cancelled'); h.clean();
+});
+
+test('startup frame wait keeps its original deadline and remains unknown if no committed frame arrives', async () => {
+  const h = startupFrameHarness(); const pending = h.readStartup(); await drainMicrotasks();
+  h.clock.advance(50001); const result = await pending;
+  assert.equal(result.hasDraft, null); assert.equal(result.observation.status, 'expired'); h.clean();
+});
+
+for (const replacement of ['stop', 'input', 'mirror']) {
+  test('startup frame wait never adopts a new ' + replacement + ' owner', async () => {
+    const h = startupFrameHarness(); const pending = h.readStartup(); await drainMicrotasks();
+    if (replacement === 'stop') h.stopAndClear('codex');
+    if (replacement === 'input') h.c.bumpTerminalInputRevision(h.tabId);
+    if (replacement === 'mirror') h.mirrors.set(h.tabId, { ...h.mirror, generation: 'OTHER' });
+    h.wake(); const result = await pending;
+    assert.equal(result.hasDraft, null);
+    assert.ok(['cancelled', 'superseded'].includes(result.observation.status)); h.clean();
+  });
+}
+
+for (const changed of ['expired-launch', 'foreign-terminal', 'foreign-generation', 'foreign-run', 'ordinary-probe']) {
+  test('ordinary draft deadline is unchanged for ' + changed, async () => {
+    const h = startupFrameHarness(); const launch = h.c.codexLastRunCommandPayload.get(h.tabId);
+    if (changed === 'expired-launch') h.clock.advance(60001);
+    if (changed === 'foreign-terminal') launch.terminalToken = {};
+    if (changed === 'foreign-generation') launch.lifecycleGeneration = 'OTHER';
+    if (changed === 'foreign-run') launch.runSeq = 2;
+    const pending = changed === 'ordinary-probe' ? h.read('codex', { waitTimeoutMs: 2500 }) : h.readStartup();
+    await drainMicrotasks(); h.clock.advance(2500);
+    const result = await pending; assert.equal(result.observation.status, 'expired');
+    assert.equal(result.observation.budgetMs, 2500); h.clean();
+  });
 }
 
 for (const provider of ['claude', 'codex']) {

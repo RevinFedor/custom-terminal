@@ -2,6 +2,15 @@
 
 ## Текущий порядок UI-проверок
 
+Private Noted E2E с userData/CODEX_HOME/CLAUDE_CONFIG_DIR в своём physical root
+автоматически публикует accounting receipt для `Home → Storage → Test runs`.
+Это не новый ручной grant и не основание удалять весь завершившийся процессом
+стенд: unfinished evidence/fixtures остаются его владельцу. Закрытые вкладки
+внутри такого профиля имеют обычный срок History; текущий active membership
+защищён независимо от running/stopped. Shared/global CLI homes не получают
+test mutation authority. Проверяются также symlink/hardlink DB и provider path
+из state.sqlite, не только переменные окружения. Детали — `fact-хранилище-сессий.md`.
+
 По решению пользователя 10.10.2026 делегировать можно и короткие рутинные
 UI-проверки: **GPT-6-Luna / medium** для заданных кнопок и видимых состояний,
 **GPT-6-Luna / max** для чтения и сверки данных, **GPT-6.1-Sol / xhigh или max**
@@ -12,7 +21,8 @@ UI-проверки: **GPT-6-Luna / medium** для заданных кнопо�
 
 Полный UI E2E проходит реальное приложение до backend/persistence и конечного
 видимого состояния: web через Browser MCP в настоящем браузере, Electron в полном
-видимом DEV-процессе, iPhone в iOS Simulator. Синтетические данные допустимы,
+видимом процессе с renderer, соответствующим обещанию (DEV либо production-built
+file:///отдельный package), iPhone в iOS Simulator. Синтетические данные допустимы,
 подменённый Main/store/IPC/provider доказывает только границу компонента.
 Обычный Browser MCP DOM click не доказывает trusted pointer/hover или физический
 курсор; для таких механизмов нужен соответствующий ввод в том же приложении.
@@ -20,6 +30,44 @@ UI-проверки: **GPT-6-Luna / medium** для заданных кнопо�
 артефактами фаз и launch receipt либо свежей identity разрешённого reuse.
 Reuse не разрешает перезапуск/закрытие родительского runtime или лишние окна.
 Чтение старого отчёта не становится новым прогоном; без исполнения — NOT RUN.
+
+Для performance17.10 выбран один переиспользуемый full Noted/private DB с
+genuine длинными JSONL и built renderer без Vite/HMR. Direct Electron spawn
+важен: Playwright _electron.launch добавляет background-disable flags. CDP
+mouse/key/wheel остаются trusted адресным вводом; DOM focus emulation не равна
+native foreground/pixel proof. Записывать visible/native-focus/throttling,
+display id/scale, логические bounds, font profile и число реально показанных
+окон. Сравнение ноутбука2panes с большим3panes не выделяет причину «4K».
+Проверять input одновременно с click, coalesced points и потери измерителя;
+client command ACK и rAF callback не являются временем первого painted glyph.
+
+Для instant-Fork отдельно считать настоящий выбор пункта меню→durable ACK→Tab
+publication→первый DOM child→hit-test кадр. Быстрый первый символ после уже
+открытого rename не закрывает ожидание самой карточки. В concurrent fixture
+TUI progress принимается только по уникальному префиксу текущего запроса:
+generic regex может принять redraw старого ответа ещё до нового Send за stream.
+Busy, новые assistant streams и старый replay — отдельные наблюдения. Навигация/
+порядок собственных fixture slots настраиваются до измерения и явно отделяются
+от trusted UI trigger; viewport/strip/source geometry сверяются до/после.
+
+Hover-only Copy сначала раскрывается настоящим pointer move по строке. Opacity0
+ещё проходит Playwright visible-check, а попытка click до hover может вызвать
+scrollIntoView скрытого action и сдвинуть вложенный scroller. Force/DOM click
+не доказывает реальный hit; сохранять failed attempt и проверять свежую геометрию.
+
+Production collector обычно выключен в E2E. Явный NOTED_E2E_PERF_DIAGNOSTICS=1
+включает тот же watchdog/causal/native pipeline только при NOTED_E2E_FILE_LOG=1 и exact
+private userData, отличном от canonical. Использовать отдельный app/log namespace;
+обычные defaults, E2E hub ownership и auth guards прежние. Boot auto-repair
+transcripts отключён во всех E2E, включая private package. Это диагностический
+canary, не installed acceptance. Native clipboard leaf можно явно подменить для
+UI→phase→disk proof, не читать/clear/restore настоящий clipboard; OS Copy тогда NOTRUN.
+
+Clipboard — общий ресурс даже у private DEV. `availableFormats()` с непустым
+списком и нулевыми `readBuffer()` не доказывает пустой clipboard или успешный
+backup.16.10 тестовый restore после такого capture очистил исходные форматы:
+при неполном снимке запрещены последующие write/clear/restore. Для retake того
+прогона clipboard полностью исключён; targeted insertText не требует его менять.
 
 ### Изолированный Codex с существующим auth-профилем
 

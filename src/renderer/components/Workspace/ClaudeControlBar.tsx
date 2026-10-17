@@ -4,7 +4,7 @@ import { ArrowRight, Pause, Play, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useAgentSettingsActivity } from '../../hooks/useAgentSettingsActivity';
-import { mergeTabProviderSnapshot, codexSettingsIntentIsWaiting, settingsPresentation } from '../../utils/agentSettingsPresentation.mjs';
+import { mergeTabProviderSnapshot, projectTabProviderSnapshot, codexSettingsIntentIsWaiting, codexSettingsSelection, settingsPresentation } from '../../utils/agentSettingsPresentation.mjs';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { recoverAgentDraftTransferToHistory } from '../../utils/agentDraftTransfer.mjs';
 import {
@@ -504,6 +504,13 @@ function ClaudeControlBar({
     }
     return undefined;
   });
+  const codexForkInitialSettings = useWorkspaceStore((s) => {
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return t.codexForkInitialSettings;
+    }
+    return undefined;
+  });
   const codexLiveModel = useWorkspaceStore((s) => {
     for (const [, ws] of s.openProjects) {
       const t = ws.tabs.get(tabId);
@@ -567,6 +574,7 @@ function ClaudeControlBar({
     codexLiveModel,
     codexLiveEffort,
     codexLiveSettingsSessionId,
+    codexForkInitialSettings,
   });
   const codexEffectiveProofSessionId = effectiveCodexSettings.liveOwned
     ? codexLiveSettingsSessionId
@@ -1268,15 +1276,16 @@ function ClaudeControlBar({
   const providerState = providerSnapshot.tabId === tabId ? providerSnapshot.state : { type: 'anthropic' } as TabProviderState;
   const adoptProviderState = useCallback((next: any) => {
     if (providerBindingRef.current !== tabId || !next || typeof next !== 'object') return;
+    projectTabProviderSnapshot(useWorkspaceStore.getState().openProjects, tabId, next);
     setProviderSnapshot(previous => mergeTabProviderSnapshot(previous, tabId, next));
   }, [tabId]);
   const setProviderState = adoptProviderState;
-  // A stopped tab shows its next-launch choice. A live tab shows only proved
-  // settings; saving a desired pair must not erase a newer application proof.
-  const codexModel = (!isCommandRunning && providerState.codexSettingsIntentModel)
-    || effectiveCodexSettings.model || persistentCodexModel;
-  const codexEffort = (!isCommandRunning && providerState.codexSettingsIntentEffort)
-    || effectiveCodexSettings.effort || persistentCodexEffort;
+  // A pending selection stays visible while the existing intent spinner tells
+  // it apart from application proof. Launch completion must not undo a click.
+  const { model: codexModel, effort: codexEffort } = codexSettingsSelection({
+    isCommandRunning, providerState, effectiveSettings: effectiveCodexSettings,
+    persistentModel: persistentCodexModel, persistentEffort: persistentCodexEffort,
+  });
   const settingsActivity = useAgentSettingsActivity(tabId);
   const codexIntentWaiting = codexSettingsIntentIsWaiting({ isCodex, isCommandRunning, providerState });
   const providerMemoryRef = useRef<Record<string, string | null>>({ anthropic: null, zen: 'minimax-m2.7', deepseek: 'deepseek-v4-flash' });
@@ -1994,9 +2003,24 @@ function ClaudeControlBar({
   }, [tabId]);
 
   useEffect(() => {
+    // Plain typing must not enqueue same-valued updates in every retained bar.
+    // React can have other pending work, so its eager state bailout alone does
+    // not keep these discrete events out of the render lane. These two values
+    // have no other writers; the listener retains the last physical edge.
+    let publishedMeta = false;
+    let publishedControl = false;
+    const publish = (meta: boolean, control: boolean) => {
+      if (publishedMeta !== meta) {
+        publishedMeta = meta;
+        setEnterCmdHeld(meta);
+      }
+      if (publishedControl !== control) {
+        publishedControl = control;
+        setRunAfterControlHeld(control);
+      }
+    };
     const sync = (event: KeyboardEvent) => {
-      setEnterCmdHeld(event.metaKey);
-      setRunAfterControlHeld(
+      publish(event.metaKey,
         event.ctrlKey
         && !event.metaKey
         && !event.altKey
@@ -2005,8 +2029,7 @@ function ClaudeControlBar({
       );
     };
     const clear = () => {
-      setEnterCmdHeld(false);
-      setRunAfterControlHeld(false);
+      publish(false, false);
     };
     window.addEventListener('keydown', sync, true);
     window.addEventListener('keyup', sync, true);

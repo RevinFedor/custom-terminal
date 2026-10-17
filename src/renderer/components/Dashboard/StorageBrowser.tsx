@@ -25,7 +25,7 @@ import {
 const { ipcRenderer } = window.require('electron');
 
 type ProviderFilter = 'all' | 'codex' | 'claude';
-type StorageSection = 'sessions' | 'builds' | 'app';
+type StorageSection = 'sessions' | 'builds' | 'app' | 'test-runs';
 type StorageSort = 'size' | 'date' | 'iterations';
 type StorageSortDirection = 'asc' | 'desc';
 
@@ -82,6 +82,8 @@ interface StorageInventory {
     claudeItems: number;
   };
   items: StorageItem[];
+  closedTabs?: { ready: number };
+  testRuns?: { complete: boolean; warnings: {root: string; reason: string}[] };
   error?: string;
 }
 
@@ -495,7 +497,7 @@ export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElem
                       <dl className="mt-4 grid grid-cols-[86px_minmax(0,1fr)] gap-x-2 gap-y-2 text-[11px]">
                         <dt className="text-[#666]">Size</dt><dd className="text-[#ccc]">{formatStorageBytes(selected.sizeBytes)}</dd>
                         <dt className="text-[#666]">Provider</dt><dd className="capitalize text-[#ccc]">{selected.provider || '—'}</dd>
-                        <dt className="text-[#666]">Source</dt><dd className="text-[#ccc]">{selected.group === 'development' ? 'Development Noted Terminal' : selected.notedTerminal ? 'Noted Terminal' : 'Outside Noted Terminal'}</dd>
+                        <dt className="text-[#666]">Source</dt><dd className="text-[#ccc]">{selected.section === 'test-runs' ? 'Private test run' : selected.group === 'development' ? 'Development Noted Terminal' : selected.notedTerminal ? 'Noted Terminal' : 'Outside Noted Terminal'}</dd>
                         <dt className="text-[#666]">Directory</dt><dd className="break-words text-[#ccc]">{selected.cwd || selected.project || '—'}</dd>
                         <dt className="text-[#666]">Iterations</dt>
                         <dd className="text-[#ccc]">{selected.iterations ?? selectedDetails?.totalIterations ?? (detailLoadingId === selected.id ? 'Loading…' : '—')}</dd>
@@ -503,7 +505,7 @@ export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElem
                         <dt className="text-[#666]">Parent</dt><dd className="break-all font-mono text-[9px] text-[#888]">{selected.parentSessionId || '—'}</dd>
                         <dt className="text-[#666]">Modified</dt><dd className="text-[#ccc]">{formatStorageDate(selected.modifiedAt)}</dd>
                         {selected.unprotectedSince && <><dt className="text-[#666]">Unprotected</dt><dd className="text-[#ccc]">{new Date(selected.unprotectedSince).toLocaleString('en')}</dd></>}
-                        <dt className="text-[#666]">Retention</dt><dd className="text-[#ccc]">{selected.protected ? 'Never' : selected.section === 'builds' ? 'Manual cleanup' : formatDeleteCountdown(selected.deleteAfter)}</dd>
+                        <dt className="text-[#666]">Retention</dt><dd className="text-[#ccc]">{selected.section === 'test-runs' ? 'Closed tabs: normal delay · whole profile kept' : selected.protected ? 'Never' : selected.section === 'builds' ? 'Manual cleanup' : formatDeleteCountdown(selected.deleteAfter)}</dd>
                       </dl>
                       <Tooltip content={selected.path} side="left">
                         <div className="mt-3 max-h-16 overflow-hidden break-all rounded border border-[#292929] bg-[#101010] p-2 font-mono text-[9px] text-[#777]">{selected.path}</div>
@@ -622,7 +624,9 @@ export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElem
                     key={entry.id}
                     type="button"
                     data-storage-section={entry.id}
-                    className={`flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs ${section === entry.id ? 'bg-[#2b2115] text-[#f0ae63]' : 'text-[#777] hover:bg-white/[0.04] hover:text-[#bbb]'}`}
+                    disabled={entry.id === 'test-runs' && !inventory.testRuns}
+                    title={entry.id === 'test-runs' && !inventory.testRuns ? 'Requires an updated main process. The running application has not scanned test profiles.' : undefined}
+                    className={`flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs disabled:opacity-40 ${section === entry.id ? 'bg-[#2b2115] text-[#f0ae63]' : 'text-[#777] hover:bg-white/[0.04] hover:text-[#bbb]'}`}
                     onClick={() => { setSection(entry.id); setGroup(null); setSelectedId(null); }}
                   >
                     {sectionIcon(entry.id)} {entry.label}
@@ -673,6 +677,9 @@ export default function StorageBrowser({detailsHost=null}:{detailsHost?:HTMLElem
                 {section === 'sessions' && <span>Open tabs keep their history protected, even when the agent is stopped.</span>}
                 {section === 'builds' && <span>Generated build output. Cleanup is manual; the installed runtime is protected.</span>}
                 {section === 'app' && <span>Application databases, backups and caches. Active data is protected.</span>}
+                {section === 'test-runs' && <span>Private test instances, not your installed app. Closed tabs use the same delay inside their owning profile; the entire stand is not deleted automatically.</span>}
+                {section === 'test-runs' && inventory.testRuns?.complete === false && <span className="text-amber-400">Partial scan · some test paths could not be measured</span>}
+                {section === 'sessions' && !!inventory.closedTabs?.ready && <span>{inventory.closedTabs.ready} closed tabs ready to expire from History</span>}
               </div>
 
               {section === 'sessions' && (

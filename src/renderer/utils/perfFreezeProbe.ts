@@ -2,7 +2,7 @@ import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { attributeFreeze, recentRendererActivities } from './rendererActivityTrail';
 import { reportPerfIncident, setPerfIncidentWriter, sendPerfHeartbeat, createPerfSocketWriter } from './perfIncidentChannel';
 import { getInteractionCursor } from './interactionCursor';
-import { installUIActionDiagnostics, captureUIAction, recordUIFrame, recordUIEventTiming,
+import { installUIActionDiagnostics, captureUIAction, recordUIFrame, recordUIEventTiming, uiDragInput,
   summarizeUIAction, formatDiagnosticKey, createUIClipboardOutcomeQueue, createUIFrameScheduler } from './uiPerformanceDiagnostics.mjs';
 
 let installed = false;
@@ -217,6 +217,8 @@ export function installPerfFreezeProbe() {
   } });
   log('[Perf:Probe] actionSchema=2 targetSnapshot=1 safeKeyClass=1 stylesheetIdentity=1 nativeCounters=' + Number(!!diagnosticIpc));
 
+  // Read-only diagnostic control; no input synthesis or change of gesture semantics.
+  (window as any).__notedDragDiagnostics = Object.freeze({configure: uiActions.drag.configure, health: uiActions.drag.health});
   const rafSamples: LoopSample[] = [];
   const timerSamples: LoopSample[] = [];
 
@@ -255,11 +257,11 @@ export function installPerfFreezeProbe() {
   frameScheduler = createUIFrameScheduler({
     request: (callback: FrameRequestCallback) => window.requestAnimationFrame(callback),
     cancel: (id: number) => window.cancelAnimationFrame(id),
-    hasPending: () => uiActions.pending(), onFrame: rafProbe,
+    hasPending: () => uiActions.pending() || uiActions.drag.pending(), onFrame: rafProbe,
     // There is no pre-event continuous frame evidence across intentional idle.
     onIdle: () => { lastRaf = null; rafSamples.length = 0; },
   });
-  onFinalPageHide(() => frameScheduler?.dispose());
+  onFinalPageHide(() => { uiActions.drag.dispose(); frameScheduler?.dispose(); });
 
   const timerIntervalMs = 250;
   let lastTimer = performance.now();
@@ -570,7 +572,12 @@ export function installPerfFreezeProbe() {
   window.addEventListener('cut', captureInput, { capture: true, passive: true });
   window.addEventListener('paste', captureInput, { capture: true, passive: true });
   window.addEventListener('mouseover', captureInput, { capture: true, passive: true });
+  window.addEventListener('gotpointercapture', uiDragInput, {capture:true,passive:true});
+  window.addEventListener('lostpointercapture', uiDragInput, {capture:true,passive:true});
+  window.addEventListener('pointerup', uiDragInput, {capture:true,passive:true});
+  window.addEventListener('pointercancel', uiDragInput, {capture:true,passive:true});
   window.addEventListener('pointermove', (event) => {
+    uiDragInput(event);
     lastPointerX = event.clientX;
     lastPointerY = event.clientY;
     lastPointerTarget = event.target instanceof Element ? event.target : null;

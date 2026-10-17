@@ -1,8 +1,34 @@
 import nativePickerProof from '../../shared/codex-native-picker-proof.cjs';
+import { codexSettingsSelection } from './agentSettingsPresentation.mjs';
 
 export const { stripCodexTerminalControls, isCodexSettingsPickerVisible,
   parseCodexModelChangeAcknowledgement } = nativePickerProof;
 const CODEX_WRITER_DEPENDENT_PICKER_SOURCES = new Set(['model', 'effort', 'quick']);
+
+/** Seed the visible child selection synchronously, never a source writer/proof. */
+export function planCodexContextForkSettings({ pendingAction, sourceTab, options = {} } = {}) {
+  const fork = pendingAction?.contextFork;
+  if (pendingAction?.type !== 'codex-fork' || !fork || !sourceTab
+    || sourceTab.id !== fork.sourceTabId || sourceTab.codexSessionId !== fork.sourceSessionId) return {};
+  const clean = value => typeof value === 'string' && value.trim() !== 'none' ? value.trim() : '';
+  // A stale overlay/another launch cannot lend its settings to this source.
+  const exactLive = sourceTab.codexLiveSettingsSessionId === fork.sourceSessionId;
+  const selected = codexSettingsSelection({ isCommandRunning: exactLive, providerState: sourceTab.providerState,
+    effectiveSettings: resolveCodexEffectiveSettings({ ...sourceTab,
+      codexLiveSettingsSessionId: exactLive ? sourceTab.codexLiveSettingsSessionId : undefined,
+      codexForkInitialSettings: undefined }),
+    persistentModel: sourceTab.codexModel, persistentEffort: sourceTab.codexEffort });
+  const model = clean(options.codexModel) || clean(selected.model);
+  const effort = (clean(options.codexEffort) || clean(selected.effort)).toLowerCase();
+  const persistentEffort = clean(sourceTab.codexEffort).toLowerCase();
+  return {
+    ...(model ? { codexModel: model } : {}),
+    ...(effort && effort !== 'ultra' ? { codexEffort: effort }
+      : persistentEffort && persistentEffort !== 'ultra' ? { codexEffort: persistentEffort } : {}),
+    ...(model && effort ? { codexForkInitialSettings: { model, effort, sourceSessionId: fork.sourceSessionId } } : {}),
+    ...(model && effort ? { pendingAction: { ...pendingAction, contextFork: { ...fork, initialSettings: { model, effort } } } } : {}),
+  };
+}
 
 export function hasCodexNextLaunchSettingsIntent({
   model,
@@ -139,6 +165,7 @@ export function resolveCodexEffectiveSettings({
   codexLiveModel,
   codexLiveEffort,
   codexLiveSettingsSessionId,
+  codexForkInitialSettings,
 } = {}) {
   const sessionId = typeof codexSessionId === 'string' ? codexSessionId.trim() : '';
   const liveOwner = typeof codexLiveSettingsSessionId === 'string'
@@ -149,15 +176,19 @@ export function resolveCodexEffectiveSettings({
   // settings must still outrank that historical binding during this window.
   const launchOwned = /^launch:.+/.test(liveOwner);
   const liveOwned = (!!sessionId && liveOwner === sessionId) || launchOwned;
+  const forkSelection = !sessionId && !liveOwned && codexForkInitialSettings
+    && codexModel === codexForkInitialSettings.model
+    && (codexForkInitialSettings.effort === 'ultra' || codexEffort === codexForkInitialSettings.effort)
+    ? codexForkInitialSettings : null;
   return {
-    model: liveOwned && codexLiveModel ? codexLiveModel : codexModel,
-    effort: liveOwned && codexLiveEffort ? codexLiveEffort : codexEffort,
+    model: liveOwned && codexLiveModel ? codexLiveModel : forkSelection?.model || codexModel,
+    effort: liveOwned && codexLiveEffort ? codexLiveEffort : forkSelection?.effort || codexEffort,
     liveOwned,
     source: launchOwned
       ? 'verified-launch-composer'
       : liveOwned
         ? 'live-conversation'
-        : 'persistent-fallback',
+        : forkSelection ? 'pending-fork-selection' : 'persistent-fallback',
   };
 }
 

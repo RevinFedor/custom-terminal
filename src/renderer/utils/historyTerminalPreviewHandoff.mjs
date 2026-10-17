@@ -16,7 +16,7 @@ export const HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL =
 export function historyTerminalPreviewStatusLabel({
   canonicalMaterialized = false, phase = 'streaming', deliveryState = 'pending',
 } = {}) {
-  if (canonicalMaterialized) return HISTORY_TERMINAL_PREVIEW_SYNC_LABEL;
+  if (canonicalMaterialized || deliveryState === 'saved') return HISTORY_TERMINAL_PREVIEW_SYNC_LABEL;
   return phase === 'settled' || deliveryState === 'unknown'
     ? HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL : HISTORY_TERMINAL_PREVIEW_LIVE_LABEL;
 }

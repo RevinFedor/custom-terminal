@@ -132,7 +132,14 @@ export interface AgentSendLaunchContext {
   acceptPreparedSession?: (sessionId: string) => void;
 }
 
+export interface AgentDraftObservationOptions {
+  codexStartupFrameWaitId?: string | null;
+  handoffId?: string;
+  attemptId?: string | null;
+}
+
 export interface AgentSendPromptOptions {
+  codexStartupFrameWaitId?: string | null;
   handoffId?: string;
   sendAttemptId?: string;
   sendOperationKey?: string;
@@ -271,7 +278,7 @@ export interface HistoryAgentRuntime {
   }) => Promise<any>;
   grabDraft: (tabId: string, options?: AgentDraftGrabOptions) => Promise<AgentDraftGrabResult>;
   copyDraft: (tabId: string, options?: AgentDraftGrabOptions) => Promise<AgentDraftGrabResult>;
-  probeDraft?: (tabId: string, reason: string) => Promise<AgentDraftInspection>;
+  probeDraft?: (tabId: string, reason: string, options?: AgentDraftObservationOptions) => Promise<AgentDraftInspection>;
   inspectDraft?: (tabId: string) => AgentDraftInspection;
   getPendingQuestion?: (tabId: string) => Promise<AgentPendingQuestion | null>;
   answerQuestion?: (args: {
@@ -739,16 +746,9 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   const queue = options.queue === true || options.statusAtSend === 'busy';
   const modelForPicker = options.model;
   const effortForPicker = options.effort;
-  const visualDraftStateForSend = terminalRegistry.getCodexDraftState(tabId);
-  const draftStateForSend = await readCodexDraftAuthority({
-    invoke: ipcRenderer.invoke.bind(ipcRenderer),
-    tabId,
-    reason: 'history-send-preflight',
-    timeoutMs: 700,
-    waitFor: false,
-    waitTimeoutMs: 2500,
-    waitOnUnknownOnly: true,
-    visualState: visualDraftStateForSend,
+  const draftStateForSend = await probeCodexDraft(tabId, 'history-send-preflight', {
+    codexStartupFrameWaitId: options.codexStartupFrameWaitId,
+    handoffId: options.handoffId, attemptId: options.sendAttemptId,
   });
   console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=' + (queue ? 'enter-busy' : 'enter') + ' chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=false');
   const sendInvocation = localSlashCommand
@@ -760,6 +760,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
         sendOperationKey: options.sendOperationKey || null,
         sendAttemptId: options.sendAttemptId || null,
         source: options.source || null,
+        codexStartupFrameWaitId: options.codexStartupFrameWaitId || draftStateForSend.codexStartupFrameWaitId,
         promptQueueAction: options.promptQueueAction,
         queue,
         statusAtSend: options.statusAtSend || null,
@@ -778,6 +779,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
         sendAttemptId: options.sendAttemptId || null,
         sendOperationKey: options.sendOperationKey || null,
         source: options.source || null,
+        codexStartupFrameWaitId: options.codexStartupFrameWaitId || draftStateForSend.codexStartupFrameWaitId,
         promptQueueAction: options.promptQueueAction,
         statusAtSend: options.statusAtSend || null,
         skipVisibleDraftGuard: false,
@@ -933,10 +935,18 @@ function inspectCodexDraft(tabId: string): { hasDraft: boolean | null; preview: 
   return state;
 }
 
-async function probeCodexDraft(tabId: string, reason: string) {
+async function probeCodexDraft(tabId: string, reason: string, options: AgentDraftObservationOptions = {}) {
+  let codexStartupFrameWaitId = options.codexStartupFrameWaitId || null;
   const visualState = terminalRegistry.getCodexDraftState(tabId);
   const resolved = await readCodexDraftAuthority({
-    invoke: ipcRenderer.invoke.bind(ipcRenderer),
+    invoke: async (channel: string, ...args: any[]) => {
+      if (channel === 'codex:get-draft-state') args[1] = { ...(args[1] || {}), ...options };
+      const proof = await ipcRenderer.invoke(channel, ...args);
+      if (channel === 'codex:get-draft-state' && proof?.codexStartupFrameWaitId) {
+        codexStartupFrameWaitId = proof.codexStartupFrameWaitId;
+      }
+      return proof;
+    },
     tabId,
     reason,
     timeoutMs: 700,
@@ -953,7 +963,7 @@ async function probeCodexDraft(tabId: string, reason: string) {
     + ' visual=' + resolved.visualHasDraft + ':' + resolved.visualSource
     + (resolved.rendererPositiveIgnored ? ' ignored=' + resolved.rendererPositiveIgnored : '')
     + ' preview=' + JSON.stringify(resolved.preview));
-  return resolved;
+  return { ...resolved, codexStartupFrameWaitId };
 }
 
 async function probeClaudeDraft(tabId: string, reason: string) {

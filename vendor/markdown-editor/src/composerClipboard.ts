@@ -3,6 +3,7 @@ import type { ClipboardAdapter } from './plugins/clipboardAdapter'
 export interface ComposerClipboardPayload {
   text: string
   formats: string[]
+  html?: string
 }
 
 /**
@@ -20,8 +21,10 @@ export function readSynchronousComposerClipboardPayload(
     const value = adapter.readText()
     if (typeof value !== 'string') return null
     const formats = adapter.readFormats?.()
+    const html = adapter.readHTML?.()
     return {
       text: value,
+      ...(typeof html === 'string' ? { html } : {}),
       formats: Array.isArray(formats)
         ? formats.filter((format): format is string => typeof format === 'string')
         : [],

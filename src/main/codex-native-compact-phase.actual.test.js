@@ -15,6 +15,7 @@ function fixture() {
   const owner = { sourceId: 'source', launchId: 'L', terminalToken: term, runSeq: 1, lifecycleGeneration: 'G' };
   const watcher = { sessionId: 'S', processGeneration: 'G', offset: 100, eventSequence: 2 };
   const context = vm.createContext({ console: { log() {}, warn() {} }, Date,
+    codexCanonicalPresentation: null,
     codexProviderSemanticSources: new Map([['T', owner]]), codexTurnWatchers: new Map([['T', watcher]]),
     codexPromptGeneration: new Map([['T', 1]]), compactOperations: registry, codexProviderPreviewOwnerVerdict,
     currentCodexProviderSemanticOwnerContext: () => ({ terminalToken: term, runSeq: 1, lifecycleGeneration: generation, launchId: 'L' }),

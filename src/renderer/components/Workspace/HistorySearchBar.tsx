@@ -25,7 +25,7 @@ export default function HistorySearchBar({inputRef,query,type,onQuery,onType,onP
   }} style={{width:'100%',minWidth:0,flexBasis:'100%',order:2,color:'#ddd'}}>
     <div style={{display:'flex',gap:4,alignItems:'center'}}>
       <Search size={14} aria-hidden/>
-      <input ref={inputRef} aria-label="Поиск по чату" placeholder="Найти в чате…" value={query} onChange={event=>onQuery(event.target.value)}
+      <input ref={inputRef} autoFocus aria-label="Поиск по чату" placeholder="Найти в чате…" value={query} onChange={event=>onQuery(event.target.value)}
         style={{flex:1,minWidth:0,height:27,padding:'0 6px',background:'#18181b',border:'1px solid #444',borderRadius:4,color:'#eee',outline:'none',fontSize:12}}/>
       <span data-history-search-count aria-live="polite" style={{fontSize:11,whiteSpace:'nowrap'}}>{loading?'…':`${count?current+1:0}/${count}`}</span>
       <button aria-label="Предыдущее совпадение" title="Предыдущее · ← / ↑" disabled={!count} onClick={onPrevious} style={{...button,opacity:count?1:.35}}><ArrowUp size={14}/></button>

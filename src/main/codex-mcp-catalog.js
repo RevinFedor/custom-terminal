@@ -3,7 +3,8 @@
 const path = require('node:path');
 const os = require('node:os');
 const { CodexAppServerClient } = require('./codex-account-profiles');
-const { defaultServerDefs, DEFAULT_PORT } = require('./mcp-hub');
+const { DEFAULT_PORT } = require('./mcp-hub');
+const { HUB_NAMES } = require('./mcp-hub-config');
 
 function catalogError(code) {
   const error = new Error(code);
@@ -40,7 +41,7 @@ function hubTarget(value, port, names) {
 
 // Return display metadata only. Native config also contains instructions,
 // auth headers, environment values and command arguments: none cross IPC.
-function configServers(config, { hubPort = DEFAULT_PORT, hubNames = Object.keys(defaultServerDefs()) } = {}) {
+function configServers(config, { hubPort = DEFAULT_PORT, hubNames = HUB_NAMES } = {}) {
   const entries = config?.mcp_servers ?? {};
   if (!entries || typeof entries !== 'object' || Array.isArray(entries)) throw catalogError('invalid_catalog');
   return Object.entries(entries).map(([name, value]) => {
@@ -89,7 +90,7 @@ function createCodexMcpCatalogReader({
   requestTimeoutMs = 5000,
   totalTimeoutMs = 12000,
   hubPort = DEFAULT_PORT,
-  hubNames = Object.keys(defaultServerDefs()),
+  hubNames = HUB_NAMES,
   log = message => console.log(message),
 } = {}) {
   const cache = new Map();

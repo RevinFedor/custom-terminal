@@ -130,6 +130,8 @@ test('preview label reflects durable proof without exposing transport details', 
     HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL);
   assert.equal(historyTerminalPreviewStatusLabel({ phase: 'settled', canonicalMaterialized: true }),
     HISTORY_TERMINAL_PREVIEW_SYNC_LABEL);
+  assert.equal(historyTerminalPreviewStatusLabel({ phase: 'streaming', deliveryState: 'saved' }),
+    HISTORY_TERMINAL_PREVIEW_SYNC_LABEL, 'canonical held for presentation is not ongoing generation');
   assert.doesNotMatch(HISTORY_TERMINAL_PREVIEW_UNCONFIRMED_LABEL, /live|saved|terminal|jsonl|api/i);
 });
 

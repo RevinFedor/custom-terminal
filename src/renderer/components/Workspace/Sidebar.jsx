@@ -29,6 +29,7 @@ import { useUIStore } from '../../store/useUIStore'
 import { getValue, setValue } from '../../utils/storage'
 import { linkedFileSessionChipSnapshot } from '../../utils/linkedFileSessionChips.mjs'
 import { useCommandHierarchyHint } from '../../hooks/useCommandHierarchyHint'
+import {loadPromptCatalogUsage,observePreparedPromptCatalog,promptUsageChangeAffectsTarget,preparedCatalogStatusText} from './promptTabSourcesModel.mjs'
 
 const CUSTOM_TERMINAL_ICON_IMPORT_KEY = import.meta.env.DEV
   ? 'customTerminalDevelopment'
@@ -410,7 +411,13 @@ function Sidebar({
     }
     return byPath
   }, [linkedFileSessionSnapshot])
-  const [projectPromptUsageByPath, setProjectPromptUsageByPath] = useState(() => new Map())
+  const [promptUsageState,setPromptUsageState] = useState({targetKey:'',sequence:0,status:'cold',data:null,error:null})
+  const promptUsageCurrentRef = useRef(folderPath)
+  promptUsageCurrentRef.current = folderPath
+  const usageCurrent = promptUsageState.targetKey === folderPath ? promptUsageState
+    : {targetKey:folderPath,sequence:0,status:'cold',data:null,error:null}
+  const projectPromptUsageByPath = useMemo(() => new Map(promptUsageState.targetKey === folderPath && promptUsageState.status === 'ready'
+    ? (promptUsageState.data || []).filter(usage=>usage?.path).map(usage=>[usage.path,Array.isArray(usage.projects)?usage.projects:[]]) : []),[promptUsageState,folderPath])
   const [treeData, setTreeData] = useState([])
   const [contextMenu, setContextMenu] = useState(null)
   const [fileIconProfile, setFileIconProfile] = useState(() => (
@@ -453,32 +460,15 @@ function Sidebar({
   const treeDataRef = useRef([])
 
   useEffect(() => {
-    if (!folderPath) {
-      setProjectPromptUsageByPath(new Map())
-      return
-    }
-    let cancelled = false
+    if (!folderPath) return
     const ipc = window.require('electron').ipcRenderer
-    const refresh = async () => {
-      try {
-        const result = await ipc.invoke('project-prompts:usage-for-root', folderPath)
-        if (cancelled || !result?.success) return
-        const next = new Map()
-        for (const usage of result.data || []) {
-          if (usage?.path) next.set(usage.path, Array.isArray(usage.projects) ? usage.projects : [])
-        }
-        setProjectPromptUsageByPath(next)
-      } catch (error) {
-        console.warn('[ProjectPrompts] sidebar usage refresh failed:', error?.message || error)
-      }
-    }
-    const onChanged = () => { void refresh() }
-    void refresh()
-    ipc.on('project-prompts:changed', onChanged)
+    const observation=observePreparedPromptCatalog({ipc,targetKey:folderPath,
+      read:()=>loadPromptCatalogUsage(ipc,folderPath),acceptsChange:promptUsageChangeAffectsTarget,
+      isCurrent:()=>promptUsageCurrentRef.current===folderPath,onState:setPromptUsageState})
+    const refresh=()=>observation.receiver.refresh()
     window.addEventListener('focus', refresh)
     return () => {
-      cancelled = true
-      ipc.removeListener('project-prompts:changed', onChanged)
+      observation.close()
       window.removeEventListener('focus', refresh)
     }
   }, [folderPath])
@@ -1750,6 +1740,7 @@ function Sidebar({
     <aside
       ref={sidebarRef}
       className={`sidebar ${effectiveSidebarFocused ? 'focused' : ''}`}
+      data-project-prompt-usage-state={usageCurrent.status}
       style={{ width, '--sidebar-font-size': `${fontSize}px` }}
       tabIndex={-1}
       onMouseDown={(event) => {
@@ -1790,6 +1781,11 @@ function Sidebar({
           )}
         </div>
         {/* New File */}
+        {folderPath && usageCurrent.status !== 'ready' && <span data-prompt-usage-status
+          title={[preparedCatalogStatusText(usageCurrent),usageCurrent.error?.code].filter(Boolean).join(' · ')}
+          aria-label={preparedCatalogStatusText(usageCurrent)} style={{display:'inline-flex',color:usageCurrent.status==='failed'?'#d4a34a':'#999'}}>
+          <MessageSquareQuote size={12} strokeWidth={1.6}/>
+        </span>}
         <ControlHint label="Создать файл" side="bottom">
         <button className="sidebar-toolbar-btn" onClick={() => handleNewFile(getTargetParentNode())}>
           <svg width="16" height="16" viewBox="0 0 16 16"><path d="M9.5 1H4a1 1 0 00-1 1v12a1 1 0 001 1h8a1 1 0 001-1V4.5L9.5 1z" stroke="currentColor" strokeWidth="1.2" fill="none"/><path d="M9 1v4h4" stroke="currentColor" strokeWidth="1.2" fill="none"/><path d="M8 7v4M6 9h4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>

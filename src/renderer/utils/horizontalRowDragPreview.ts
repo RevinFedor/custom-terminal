@@ -1,6 +1,9 @@
 /** Cursor feedback is a clone; the original keeps the future slot in the row. */
-export function createHorizontalRowDragPreview(source: HTMLElement) {
+export function createHorizontalRowDragPreview(source: HTMLElement,
+  onMove?: (sample: Record<string,number>) => void,
+  onPickup?: (sample: Record<string,number>) => void) {
   const rect = source.getBoundingClientRect();
+  onPickup?.({left:rect.left,top:rect.top,width:rect.width,height:rect.height});
   const host = document.createElement('div');
   host.dataset.horizontalRowCursorChip = '1';
   host.setAttribute('aria-hidden', 'true');
@@ -31,6 +34,7 @@ export function createHorizontalRowDragPreview(source: HTMLElement) {
     element: host,
     move: (x: number, y: number) => {
       host.style.transform = `translate3d(${x - rect.width / 2}px, ${y - rect.height / 2}px, 0)`;
+      onMove?.({x,y,left:x-rect.width/2,top:y-rect.height/2,width:rect.width,height:rect.height});
     },
     remove: () => host.remove(),
   };

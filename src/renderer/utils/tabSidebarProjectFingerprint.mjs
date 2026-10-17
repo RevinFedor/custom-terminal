@@ -1,6 +1,34 @@
 const pushScalar = (parts, value) => {
   const text = value === null || value === undefined ? '' : String(value);
-  parts.push(String(text.length), ':', text, '|');
+  parts.push(text);
+};
+
+// Keep normalization at the original read sites; defer only pure encoding.
+const encodeScalars = (scalars) => {
+  const parts = new Array(scalars.length);
+  for (let i = 0; i < scalars.length; i++) {
+    const text = scalars[i];
+    parts[i] = String(text.length) + ':' + text + '|';
+  }
+  return parts.join('');
+};
+
+// An object only locates a candidate. Every invocation still reads ALL current
+// scalar fields in order, and reuse requires the entire normalized vector.
+// One entry per live workspace; no Tab/Map identity or lossy hash is authority.
+const workspaceEncodings = new WeakMap();
+const encodeWorkspaceScalars = (workspace, scalars) => {
+  const cacheable = typeof workspace === 'object' || typeof workspace === 'function';
+  const previous = cacheable ? workspaceEncodings.get(workspace) : undefined;
+  if (previous && previous.scalars.length === scalars.length
+    && scalars.every((text, index) => text === previous.scalars[index])) {
+    return previous.encoded;
+  }
+  const encoded = encodeScalars(scalars);
+  // Invocation-local vectors: a getter/coercion can reenter this projection.
+  // Store only a complete encoding. A throw cannot install a partial entry.
+  if (cacheable) workspaceEncodings.set(workspace, { scalars, encoded });
+  return encoded;
 };
 
 const pushList = (parts, values) => {
@@ -113,7 +141,7 @@ export function tabSidebarProjectFingerprint(workspace) {
     }
     pushTaskPlan(parts, tab?.taskPlan);
   }
-  return parts.join('');
+  return encodeWorkspaceScalars(workspace, parts);
 }
 
 const publicationFingerprints = new WeakMap();
@@ -137,5 +165,5 @@ export function openProjectIdsFingerprint(openProjects) {
   if (!(openProjects instanceof Map)) return '';
   const parts = [];
   for (const projectId of openProjects.keys()) pushScalar(parts, projectId);
-  return parts.join('');
+  return encodeScalars(parts);
 }

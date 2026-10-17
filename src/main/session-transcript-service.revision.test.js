@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const test = require('node:test');
+const { buildHistoryRevision } = require('./history-revision');
 
 const {
   SessionTranscriptService,
@@ -111,6 +112,7 @@ test('Codex Timeline durable revision skips unchanged full projection', async (t
   });
   assert.equal(first.unchanged, false);
   assert.ok(first.revision?.token);
+  assert.equal(JSON.parse(first.revision.context).questionReplySchema, 2);
 
   const unchanged = await service.getTimeline({
     toolType: 'codex',
@@ -132,6 +134,14 @@ test('Codex Timeline durable revision skips unchanged full projection', async (t
   assert.equal(changed.unchanged, false);
   assert.equal(loadCalls, 2);
   assert.equal(projectionCalls, 2);
+  const oldContext = { ...JSON.parse(changed.revision.context), questionReplySchema: 1 };
+  const oldRevision = buildHistoryRevision(changed.revision, changed.revision.sources,
+    { context: JSON.stringify(oldContext) });
+  const reprojected = await service.getTimeline({ toolType: 'codex', sessionId: 'session-timeline',
+    cwd: dir, ifRevision: oldRevision });
+  assert.equal(reprojected.unchanged, false, 'old question framing cannot keep an unchanged Timeline after upgrade');
+  assert.equal(loadCalls, 3);
+  assert.equal(projectionCalls, 3);
 });
 
 test('Codex Timeline projects semantic tags and invalidates cache when sidecar changes', async (t) => {
@@ -295,6 +305,16 @@ test('Codex history returns unchanged before loading or projecting records', asy
   assert.equal(third.unchanged, false);
   assert.equal(loadCalls, 2);
   assert.equal(projectionCalls, 2);
+  assert.equal(JSON.parse(third.revision.context).questionReplySchema, 2);
+  const oldContext = { ...JSON.parse(third.revision.context) };
+  delete oldContext.questionReplySchema;
+  const oldRevision = buildHistoryRevision(third.revision, third.revision.sources,
+    { context: JSON.stringify(oldContext) });
+  const reprojected = await service.getHistory({ toolType: 'codex', sessionId: 'session-a',
+    cwd: dir, ifRevision: oldRevision });
+  assert.equal(reprojected.unchanged, false, 'old question framing cannot keep unchanged History after upgrade');
+  assert.equal(loadCalls, 3);
+  assert.equal(projectionCalls, 3);
 });
 
 test('Codex history revision changes when prompt presentation metadata changes', async (t) => {

@@ -261,15 +261,28 @@ test('actual Main question availability keeps the exact current terminal/lifecyc
 for (const form of Object.keys(formats)) test(`${form}: unchanged actual Send preparation recognizes and closes the modeled expanded panel`, async () => {
   const h = mirrorHarness(form);
   const terminal = {};
+  const executionIdentity = { terminalToken: terminal };
+  let identityCaptures = 0, executionChecks = 0;
   h.onWrite = () => h.emit(frame(collapsed(form, 1), { seq: 11 }));
   const prepare = vm.runInNewContext(mainSource.slice(sendStart, sendEnd) + '\nprepareCodexMainComposerForSend', {
     terminals: new Map([['T', terminal]]), getTerminalLifecycleGeneration: () => 'L1', crypto,
+    captureAgentInputIdentity(tabId, term) {
+      assert.equal(tabId, 'T'); assert.strictEqual(term, terminal); identityCaptures++;
+      return executionIdentity;
+    },
+    agentSendExecutionFailure(tabId, term, identity, options) {
+      assert.equal(tabId, 'T'); assert.strictEqual(term, terminal);
+      assert.strictEqual(identity, executionIdentity); assert.equal(options.stage, 'prepare-main-composer');
+      executionChecks++; return null;
+    },
     agentSendCancellations: { isCancelled: () => false }, agentSendRequestTargetFailure: () => null,
     codexNativeQuestionMirror: h.mirror,
   });
   const r = await prepare('T', { handoffId: 'H', sendAttemptId: 'A' });
   assert.equal(r.success, true);
   assert.equal(r.inputWritten, true);
+  assert.equal(identityCaptures, 1);
+  assert.equal(executionChecks, 2, 'original execution identity is rechecked after native close');
   assert.deepEqual(h.writes, ['\x1b[1;2C']);
   assert.ok(h.writes.every(bytes => !bytes.includes('\r')), 'this fixture never writes Send/Enter');
 });

@@ -48,7 +48,7 @@
    Скрипт делает `openssl req -x509 ... -addext "extendedKeyUsage=codeSigning"` + `security import` в login keychain.
 2. **Вручную** в Keychain Access: Login → «Noted Terminal Dev» → Trust → Code Signing = Always Trust → закрыть, ввести пароль.
 3. Оставляем `CSC_IDENTITY_AUTO_DISCOVERY=false` и `build.mac.identity = null`, чтобы медленный стандартный signer `electron-builder` не запускался.
-4. Сразу после `electron-builder` оба package-script'а (`build`, `build:install`) вызывают `npm run sign:local-fast`. `scripts/codesign/sign-local-fast.sh` делает один локальный `codesign --deep --timestamp=none`, затем обязательный `codesign --verify --deep --strict` и проверяет identifier/authority.
+4. Переносимый `build`/`build:app` оставляет ad-hoc bundle в release без установки. Maintainer `build:install` после него вызывает `npm run sign:local-fast` до validate-release/staging/quit. `scripts/codesign/sign-local-fast.sh` делает один локальный `codesign --deep --timestamp=none`, затем обязательный `codesign --verify --deep --strict` и проверяет identifier/authority. Подмена последней проверки допуском ad-hoc нарушила бы прежнюю TCC identity.
 5. `npm run build:install` → `codesign -dv` должен показать `Identifier=com.noted.terminal`, `Authority=Noted Terminal Dev`. Сетевого timestamp, notarization и hardened runtime в локальном пути нет.
 6. Один раз в System Settings → Privacy добавить установленное приложение в нужные разделы. **Дальше permission переживает rebuild'ы.**
 

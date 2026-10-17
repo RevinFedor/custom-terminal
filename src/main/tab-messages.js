@@ -140,6 +140,13 @@ function receiptOutcome(record, message) {
       retryAllowed: 0, code: record.deliveryControl?.cancelledAt ? 'tab_message_cancelled' : 'tab_message_input_slot_retired',
       error: 'This operation no longer owns the input; its delivery evidence is preserved.' };
   }
+  const applicationQueue = record?.applicationQueue || receipt.applicationQueue;
+  if (applicationQueue?.version === 1 && ['waiting', 'dispatching'].includes(applicationQueue.state)
+    && ((!record.attemptId && ['reserved', 'preparing'].includes(state || record.receiptState))
+      || applicationQueue.waitingBeforeInput === true && state === 'not-submitted')) {
+    return { deliveryState: applicationQueue.state === 'waiting' ? 'pending' : 'sending',
+      retryAllowed: 0, code: null, error: null };
+  }
   if (!['not-submitted', 'provider-not-accepted'].includes(state)
     && (state === 'queued' || receipt.status === 'queued' && receipt.submitted === true
     || isAgentSendProviderQueueAccepted(receipt, {

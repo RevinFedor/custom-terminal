@@ -10,7 +10,10 @@ const { captureNativeSnapshot } = require('./process-metrics-source');
 const { collectSystemPressure, pressureDelta } = require('./perf-system-pressure');
 
 const DAY = 86400000;
+// Cheap CPU checkpoints may help compare days; detailed gesture/span/stack
+// evidence only needs the last day. Both remain inside the SAME disk cap.
 const RETENTION_MS = 7 * DAY;
+const DETAIL_RETENTION_MS = DAY;
 const DISK_CAP = 5 * 1024 * 1024 * 1024;
 const HEAVY_RETENTION_MS = DAY;
 const HEAVY_BYTES = 8 * 1024 * 1024;
@@ -262,8 +265,8 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
       let removed = 0, removedNative = 0, removedExpired = 0, removedHeavyExpired = 0, removedBudget = 0;
       const nativeAt = e => Math.max(e.at, Number(NATIVE_RECEIPT.exec(e.name)?.[1]) || 0);
       const heavy = e => HEAVY_PROFILE.test(e.name) || e.size >= HEAVY_BYTES;
-      const retention = e => NATIVE_RECEIPT.test(e.name) || HEAVY_RECEIPT.test(e.name)
-        || heavy(e) ? HEAVY_RETENTION_MS : RETENTION_MS;
+      const retention = e => heavy(e) ? HEAVY_RETENTION_MS
+        : e.name.startsWith('cpu-') ? RETENTION_MS : DETAIL_RETENTION_MS;
       const expired = e => now - (NATIVE_RECEIPT.test(e.name) ? nativeAt(e) : e.at) >= retention(e);
       // Heavy profiles remain lower-priority than historical CPU evidence.
       // Independent native stacks have their own bounded tier; old metadata
@@ -341,7 +344,8 @@ function createArtifactStore(directory, { log = () => {} } = {}) {
         }
       }
       if (removed) try { log('[Perf:ArtifactPrune] removed=' + removed + ' native=' + removedNative
-        + ' weekExpired=' + removedExpired + ' heavyExpired=' + removedHeavyExpired + ' budgetEvicted=' + removedBudget
+        + ' retentionExpired=' + removedExpired + ' heavyExpired=' + removedHeavyExpired + ' budgetEvicted=' + removedBudget
+        + ' lightRetentionHours=168 detailRetentionHours=24'
         + ' bytes=' + bytes + ' nativeBytes=' + nativeSampleBytes + ' causalBytes=' + causalBytes); } catch {}
       return { bytes, causalBytes, nativeSampleBytes };
   }

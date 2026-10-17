@@ -1,0 +1,153 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const vm = require('node:vm');
+const reader = require('./subagent-transcript');
+
+// Actual Main reader/lease/cache/dehydration declarations; only Electron's
+// transport and the locator are controlled. Files are synthetic and private.
+const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+const start = source.indexOf('const subagentFilePathCache = new Map();');
+const end = source.indexOf("ipcMain.handle('subagent:get-step-payload'", start);
+assert.ok(start > 0 && end > start);
+const slice = source.slice(start, end);
+const meta = { type: 'session_meta', payload: { id: 'child-A', thread_source: 'subagent',
+  parent_thread_id: 'parent', agent_path: '/root/A', multi_agent_version: 'v2' } };
+const snapshot = tier => ({ type: 'event_msg', payload: { type: 'thread_settings_applied',
+  thread_id: 'child-A', thread_settings: { service_tier: tier, model: 'gpt-6-luna' } } });
+const newTask = { type: 'response_item', payload: { type: 'agent_message', author: '/root', recipient: '/root/A',
+  content: 'Message Type: NEW_TASK\nTask name: /root/A\nSender: /root\nPayload:\nSynthetic task' } };
+const context = { type: 'turn_context', payload: { model: 'gpt-6-luna', effort: 'max' } };
+const rows = tier => [meta, snapshot(tier), newTask, context,
+  { type: 'response_item', payload: { type: 'function_call', name: 'Read', call_id: 'read-A', arguments: '{"path":"synthetic.txt"}' } },
+  { type: 'response_item', payload: { type: 'function_call_output', call_id: 'read-A', output: 'Synthetic payload '.repeat(100) } }];
+const serialize = records => records.map(row => JSON.stringify(row)).join('\n') + '\n';
+
+function harness(filePath, overrides = {}) {
+  const handlers = new Map(), events = new Map(), logs = [];
+  let scans = 0, reads = 0;
+  const scope = { fs, crypto,
+    console: { log: value => logs.push(value), error: value => logs.push(value) },
+    ipcMain: { handle: (name, handler) => handlers.set(name, handler), on: (name, handler) => events.set(name, handler) },
+    findCodexAgentFile: () => filePath, findClaudeAgentFile: () => null,
+    findCodexSubagentNewTaskBoundary: async args => { scans++; return reader.findCodexSubagentNewTaskBoundary(args); },
+    createSubagentStepProjectionState: reader.createSubagentStepProjectionState,
+    readAgentStepsAsync: async args => { reads++; return reader.readAgentStepsAsync(args); },
+    codexDataModule: null,
+    HISTORY_PAYLOAD_PREVIEW_CHARS: 100, HISTORY_PAYLOAD_DEHYDRATE_THRESHOLD: 200,
+    ...overrides,
+  };
+  vm.runInNewContext(slice + '\nglobalThis.caches = { subagentStepReaderCache, subagentPayloadSourceCache, subagentCodexBoundaryCache };', scope);
+  return {
+    read: (readerId, offset = 0) => handlers.get('subagent:read-steps')(null, { readerId,
+      chipKey: 'task:spawn-A', toolType: 'codex', parentSessionId: 'parent',
+      agentSessionId: 'child-A', spawnedAt: 100, offset }),
+    release: readerId => events.get('subagent:release-reader')(null, { readerId }),
+    counts: () => ({ scans, reads }), logs, caches: scope.caches,
+  };
+}
+
+test('actual Main IPC carries skipped launch tier through EOF/warm reopen without extra scans or payload changes', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-tier-main-'));
+  const filePath = path.join(dir, 'synthetic-child.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize(rows('priority')));
+    const main = harness(filePath);
+    const first = await main.read('reader-A');
+    assert.equal(first.success, true);
+    assert.equal(first.launchServiceTier.serviceTier, 'priority');
+    assert.equal(first.launchSettings.model, 'gpt-6-luna');
+    assert.equal(first.launchSettings.effort, 'max');
+    const result = first.steps.find(step => step.resultRef);
+    assert.ok(result?.resultRef.payloadId);
+    const payloadId = result.resultRef.payloadId;
+    assert.equal(main.caches.subagentPayloadSourceCache.size, 1);
+    const eof = await main.read('reader-A', first.offset);
+    assert.deepEqual(eof.steps, []);
+    assert.equal(eof.launchServiceTier.serviceTier, 'priority');
+    assert.equal(eof.offset, first.offset);
+    main.release('reader-A');
+    const reopened = await main.read('reader-B');
+    assert.equal(reopened.launchServiceTier.serviceTier, 'priority');
+    assert.equal(reopened.steps.find(step => step.resultRef).resultRef.payloadId, payloadId);
+    assert.equal(main.counts().scans, 1, 'one existing prefix scan, not an extra settings reader');
+    fs.appendFileSync(filePath, serialize([snapshot('default')]));
+    main.release('reader-B');
+    const appended = await main.read('reader-C');
+    assert.equal(appended.launchServiceTier.serviceTier, 'priority');
+    assert.equal(main.counts().scans, 1, 'ordinary append preserves the prefix cache');
+    assert.ok(main.logs.every(line => !line.includes('Synthetic payload')));
+    assert.ok(main.logs.some(line => line.includes('tier=priority')));
+    main.release('reader-C');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('actual Main drops cached launch tier/skip offset after same-size rewrite, replacement and truncation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-tier-main-reset-'));
+  const filePath = path.join(dir, 'synthetic-child.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize(rows('priority')));
+    const main = harness(filePath);
+    assert.equal((await main.read('reader-A')).launchServiceTier.serviceTier, 'priority');
+    main.release('reader-A');
+    const oldSize = fs.statSync(filePath).size;
+    fs.writeFileSync(filePath, serialize(rows('default ')));
+    assert.equal(fs.statSync(filePath).size, oldSize);
+    const changed = new Date(Date.now() + 2000); fs.utimesSync(filePath, changed, changed);
+    assert.equal((await main.read('reader-B')).launchServiceTier.serviceTier, 'default');
+    main.release('reader-B');
+    const replacement = path.join(dir, 'replacement.jsonl');
+    fs.writeFileSync(replacement, serialize(rows('priority')));
+    fs.renameSync(replacement, filePath);
+    assert.equal((await main.read('reader-C')).launchServiceTier.serviceTier, 'priority');
+    main.release('reader-C');
+    fs.writeFileSync(filePath, serialize([meta, newTask, context]));
+    const truncated = await main.read('reader-D');
+    assert.equal(truncated.launchServiceTier, null);
+    assert.equal(truncated.launchSettings.model, 'gpt-6-luna');
+    assert.equal(main.counts().scans, 4);
+    main.release('reader-D');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('release during the actual Main boundary await cannot publish late launch metadata', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-tier-main-release-'));
+  const filePath = path.join(dir, 'synthetic-child.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize(rows('priority')));
+    let resolveBoundary;
+    const main = harness(filePath, { findCodexSubagentNewTaskBoundary: () => new Promise(resolve => { resolveBoundary = resolve; }) });
+    const pending = main.read('reader-A');
+    assert.equal(typeof resolveBoundary, 'function');
+    main.release('reader-A');
+    resolveBoundary(await reader.findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId: 'child-A' }));
+    const late = await pending;
+    assert.equal(late.success, false);
+    assert.equal(late.error, 'subagent reader released');
+    assert.equal(late.launchServiceTier, undefined);
+    assert.equal(main.caches.subagentStepReaderCache.size, 0);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an already open Main reader resets launch metadata when its file is replaced with a larger source', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-tier-main-open-replace-'));
+  const filePath = path.join(dir, 'synthetic-child.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize(rows('priority')));
+    const main = harness(filePath);
+    const first = await main.read('reader-A');
+    assert.equal(first.launchServiceTier.serviceTier, 'priority');
+    const replacement = path.join(dir, 'replacement.jsonl');
+    fs.writeFileSync(replacement, serialize([...rows('default'), snapshot('priority')]));
+    assert.ok(fs.statSync(replacement).size > first.size);
+    fs.renameSync(replacement, filePath);
+    const replaced = await main.read('reader-A', first.offset);
+    assert.equal(replaced.reset, true);
+    assert.equal(replaced.launchServiceTier.serviceTier, 'default');
+    assert.equal(replaced.launchSettings.model, 'gpt-6-luna');
+    main.release('reader-A');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

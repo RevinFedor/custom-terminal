@@ -157,7 +157,7 @@ test('native menu and all history row forms preserve explicit tab ownership', ()
   assert.match(menu, /copyHistoryEntryDetails\(payload/);
   assert.match(menu, /captureDiagnostic: captureTerminalHistoryPreviewDiagnostic/);
   assert.match(menu, /history-entry:diagnostic-copy-result/);
-  assert.equal((history.match(/openHistoryEntryContextMenu\(event, presentedEntry, toolType, tabId\)/g) || []).length, 3);
+  assert.equal((history.match(/openHistoryEntryContextMenu\(event, presentedEntry, toolType, tabId,/g) || []).length, 3);
   assert.match(history, /diagnostic: historyEntryCopyDiagnostic\(entry, tabId, toolType\)/);
   assert.match(history, /removeListener\('history-entry:diagnostic-copy-result'/);
 });
@@ -179,6 +179,7 @@ test('actual native-menu callback starts capture only on Copy and replies after 
     BrowserWindow: { fromWebContents: (value) => value },
     clipboard: { writeText: (text) => { copied = text; } },
     copyHistoryEntryDetails,
+    writeTerminalMessageDetails: require('./terminal-message-clipboard').writeTerminalMessageDetails,
     captureTerminalHistoryPreviewDiagnostic: (request) => {
       captured++;
       assert.equal(request.tabId, 'tab-A');

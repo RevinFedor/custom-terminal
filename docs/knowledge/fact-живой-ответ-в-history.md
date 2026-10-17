@@ -44,8 +44,8 @@ App-CrMYhyA7.js с проверенным SHA d6d4e40f…16b8f71;19 source/compi
    composer, курсора, readiness, picker'ов, cell-style и диагностики кадра.
 2. Структурный producer сообщает, какой смысл имел фрагмент до превращения в
    клетки терминала: assistant text, thinking, tool, activity или side request.
-3. Временная проекция History показывает только ещё не материализованный
-   assistant text: растущий item помечен `Live response · not yet saved to history`,
+3. Временная проекция History показывает assistant text до его canonical
+   replacement: растущий item помечен `Live response · not yet saved to history`,
    завершённый без receipt — `Response · history not confirmed`; после canonical
    proof до замены представления — `Response · synchronizing view`. Завершение
    одного ответа и продолжающийся tool-turn могут существовать одновременно.
@@ -385,6 +385,51 @@ turn-level activity активной. `RESPONSE_END` закрывает лишь
 а обратный порядок оставлял его unknown. Exact A сохраняет обычное adoption;
 отсутствие подтверждения не фабрикуется ни в rejection, ни в durable receipt.
 
+### Шрам17.10: ACK принят, но после writer adoption не опубликована строка
+
+В4196 exact raw receipt544/itemd2aaac5d7739837d8c был принят07:03:38UTC.
+Существующий source-proof replay действительно прочитал66583bytes/12records,
+но весь проход оставался public-suppressed. Release07:03:43 восстановил runtime,
+не пропущенную assistant row. Renderer правильно ждал отсутствующий exact
+replacement; новое сообщение лишь отменило старый handoff. Это иной сбой,
+чем неизвестная доставка245 или смена renderer generation617.
+
+Main сохраняет ограниченное assistant-only продолжение ДО controller ACK.
+Callback фактического item match связывает его с exact physical record;
+raw-before-item/state и item-before-raw проходят тот же путь. После успешного
+прежнего catch-up release и current writer proof строка проходит через прежние
+formatter/projector и общий desktop/web publisher. User/tools/lifecycle повторно
+не обрабатываются, второй rollout scan и полный History read не запускаются.
+Сетевая граница request по-прежнему не завершает whole turn.
+
+ACK и окончание временного показа разделены: `presentationHeld` сохраняет
+materialized item до его публикации; label — `Response · synchronizing view`,
+без spinner. Отдельный `saved` display scalar не меняет busy, delivery или FIFO.
+Перед публикацией сверяются watcher/terminal/run/lifecycle/launch/turn/thread,
+Stop revision, actual writer SID/file и снятие обоих suppression-флагов.
+Complete-record FD ticket и bounded point verification полного диапазона/digest
+защищают от source replacement/rewrite/ABA. Release/offset сами не сертификат:
+ошибка финального чтения после batch не исправляется пустым retry. Смена owner
+или Stop во время await отзывает публикацию и старый release Resolved.
+
+Буфер продолжения ограничен32entries/2MiB UTF-8 raw payload, не размером ответа
+модели и не heap/RSS. Overflow, oversized record или отозванный ticket оставляют
+полный item в прежнем semantic owner и явную причину в логе; усечённая canonical
+строка/таймерный clear/heavy fallback не создаются. Прежний preview display cap
+остаётся отдельным ограничением. Exact обычная публикация также снимает hold;
+общий physical identity/digest dedupe исключает повтор continuation/normal path.
+
+`[CodexCanonicalPresentation] CAPTURE/ACK/RELEASE/PUBLISH/HOLD/INVALIDATE`
+связываются по source/turn/session/run/generation и physical identity/range,
+без body. Current SOURCE:361 focused PASS0skip; прежний Main даёт0 вместо1
+строки в различающем контроле. Actual private HistoryPanel/Virtuoso с DTO из
+реальных Main/controller declarations: null→confirmed SID, saved безspinner,
+одна canonical row ещё при busy, Footer0/duplicate0/same scroller/bottom-gap0.
+Writer admission и transport/IPC — fixtures, не installed/provider E2E.
+Runner: `scripts/history-preview-delivery-regression.mjs --canonical-continuation
+--events=<Main-generated-json>`; source/installed границы и команды — в рабочем
+`../tmp/поток-claude-2026-09-08.md`. Production install/restart не выполнялся.
+
 ## Claude: сетевой ответ и точная запись
 
 `UserPromptSubmit` закрепляет semantic producer за terminal lifecycle и ходом.
@@ -562,8 +607,9 @@ renderer сравнивал её с watcher dev:ino; два разных вид�
 `fact-transcript-сервис.md::Физический файл ≠ поколение содержимого`.
 
 Canonical refresh не очищает весь live-хвост. Каждый item остаётся до своего
-физического совпадения; уже materialized identity навсегда исключена из
-проекции. Abort или новый prompt могут сбросить только незавершённый item своей
+физического совпадения и передачи в presentation; уже опубликованная
+materialized identity не возвращается в preview. Внутренний ACK при suppressed
+public owner сам по себе ещё не снимает `presentationHeld`. Abort или новый prompt могут сбросить только незавершённый item своей
 границы. Для Codex image-аудита provider envelope и `[Image #N]` — два carrier
 одного slot, даже если между ними большой текст; они дедуплицируются по номеру,
 а разные номера остаются разными вложениями.

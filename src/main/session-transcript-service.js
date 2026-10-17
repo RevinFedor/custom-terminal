@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { isDeepStrictEqual } = require('node:util');
 const { createHash } = require('node:crypto');
+const { canonicalSourceTicket } = require('./codex-canonical-source-proof');
 const { getCodexProcessActionOwnershipRevision } = require('./codex-process-action-ownership');
 const { performance } = require('node:perf_hooks');
 const { searchHistoryEntries, normalizeHistorySearchType } = require('../shared/history-search.cjs');
@@ -641,6 +642,10 @@ class SessionTranscriptService {
   // resolves files and, unless explicitly observing, verifies frozen ranges.
   // sourceVerificationBytes counts only the result resolver, not that existing
   // one-time lineage bootstrap or the reader's own prefix verification.
+  readCodexResultSourceRevision(sessionId) {
+    return codexResultSourceRevisionKey(sessionId, this._resolveCodexLineage(sessionId, 'dehydrated'));
+  }
+
   async resolveCodexResultSource({ sessionId, cwd, verifyDigests = true } = {}) {
     let sourceVerificationBytes = 0;
     const unresolved = (lineageReason, retryable = false) => ({
@@ -2149,7 +2154,7 @@ class SessionTranscriptService {
         : 'none';
       const revisionContext = JSON.stringify({
         timelinePreviewSchema: 1,
-        questionReplySchema: 1,
+        questionReplySchema: 2,
         promptPresentationRevision: presentationRevision,
         ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
       });
@@ -2266,7 +2271,7 @@ class SessionTranscriptService {
         {
           context: JSON.stringify({
             timelinePreviewSchema: 1,
-            questionReplySchema: 1,
+            questionReplySchema: 2,
             promptPresentationRevision: finalPresentationRevision,
             ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
           }),
@@ -2344,6 +2349,15 @@ class SessionTranscriptService {
       let rewriteReceipt = this.codexData?._api?.getCodexRewriteReceipt?.(
         sessionId, payload.rewriteFrom?.sessionId,
       ) || null;
+      // Worker preparation also carries private header/byte-proof metadata.
+      // Public row remapping needs coordinates only, not another copy of the
+      // provider header/instructions or internal parser-index hints.
+      if (rewriteReceipt) rewriteReceipt = {
+        schema: rewriteReceipt.schema, sourceSessionId: rewriteReceipt.sourceSessionId, sessionId: rewriteReceipt.sessionId,
+        sourceSnapshot: rewriteReceipt.sourceSnapshot, targetSnapshot: rewriteReceipt.targetSnapshot,
+        records: rewriteReceipt.records.map(({ source, target }) => ({ source, target })),
+        reusedRecords: rewriteReceipt.reusedRecords,
+      };
       if (rewriteReceipt) {
         const previous = payload.rewriteFrom?.revision;
         const source = rewriteReceipt.sourceSnapshot;
@@ -2412,6 +2426,7 @@ class SessionTranscriptService {
         ? this.promptPresentationStore.getHistoryResponseTimingRevision(toolType, sessionId, payload.tabId || null)
         : 'none';
       const revisionContext = JSON.stringify({
+        questionReplySchema: 2,
         promptPresentationRevision: presentationRevision,
         responseTimingRevision,
         rowWindowRequest,
@@ -2658,6 +2673,7 @@ class SessionTranscriptService {
         projectedSnapshots || (projectedSnapshot ? [projectedSnapshot] : []),
         {
           context: JSON.stringify({
+            questionReplySchema: 2,
             promptPresentationRevision: finalPresentationRevision,
             responseTimingRevision: finalResponseTimingRevision,
             rowWindowRequest,
@@ -3141,6 +3157,7 @@ class SessionTranscriptService {
         state.offset = stat.size;
         state.leftover = '';
         state.sourceRewriteVersion = (state.sourceRewriteVersion || 0) + 1;
+        state.codexLeftoverBytes = null;
         this.historyDeltaDigests.invalidateSession(state.toolType, state.sessionId);
         historyPayloadStash.invalidateSession(state.toolType, state.sessionId);
         if (state.toolType === 'codex') this.codexData?._api?.invalidateJsonlCache?.(state.filePath);
@@ -3292,21 +3309,37 @@ class SessionTranscriptService {
     const start = Math.max(0, state.offset || oldSize);
     if (state.size <= start) return;
     const fd = await fs.promises.open(state.filePath, 'r');
-    let text = '';
+    let readBuffer;
+    let readStat;
+    const rewriteVersion = state.sourceRewriteVersion || 0;
     try {
+      readStat = await fd.stat();
       const byteCount = state.size - start;
-      const buf = Buffer.allocUnsafe(byteCount);
-      await fd.read(buf, 0, byteCount, start);
-      text = buf.toString('utf8');
+      readBuffer = Buffer.allocUnsafe(byteCount);
+      let bytesRead = 0;
+      while (bytesRead < byteCount) {
+        const result = await fd.read(readBuffer, bytesRead, byteCount - bytesRead, start + bytesRead);
+        if (!result.bytesRead) throw new Error('codex-raw-short-read');
+        bytesRead += result.bytesRead;
+      }
+      const pathStat = await fs.promises.stat(state.filePath);
+      if (readStat.dev !== pathStat.dev || readStat.ino !== pathStat.ino
+        || rewriteVersion !== (state.sourceRewriteVersion || 0)) throw new Error('codex-raw-source-replaced');
     } finally {
       await fd.close();
     }
     state.offset = state.size;
-    const previousLeftover = state.leftover || '';
-    const bufferBaseOffset = Math.max(0, start - Buffer.byteLength(previousLeftover));
-    const buf = previousLeftover + text;
-    const lines = buf.split('\n');
-    state.leftover = lines.pop() || '';
+    // Keep carried bytes intact when a provider write splits a UTF-8 codepoint.
+    const previousLeftover = state.codexLeftoverBytes || Buffer.from(state.leftover || '', 'utf8');
+    const bufferBaseOffset = Math.max(0, start - previousLeftover.length);
+    const buf = previousLeftover.length ? Buffer.concat([previousLeftover, readBuffer]) : readBuffer;
+    const completeEnd = buf.lastIndexOf(10) + 1;
+    state.codexLeftoverBytes = Buffer.from(buf.subarray(completeEnd));
+    state.leftover = state.codexLeftoverBytes.toString('utf8');
+    const lines = [];
+    for (let from = 0, newline; (newline = buf.indexOf(10, from)) >= 0; from = newline + 1) {
+      lines.push(buf.subarray(from, newline + 1));
+    }
     let sent = 0;
     let parsed = 0;
     let skippedLiveUsers = 0;
@@ -3318,9 +3351,9 @@ class SessionTranscriptService {
     );
     let lineByteOffset = bufferBaseOffset;
     for (let i = 0; i < lines.length; i++) {
-      const rawLine = lines[i];
+      const rawLine = lines[i].subarray(0, -1).toString('utf8');
       const recordByteOffset = lineByteOffset;
-      lineByteOffset += Buffer.byteLength(rawLine) + 1;
+      lineByteOffset += lines[i].length;
       const recordEndByteOffset = lineByteOffset;
       const line = rawLine.trim();
       if (!line) continue;
@@ -3346,6 +3379,13 @@ class SessionTranscriptService {
       // This raw callback carries only the physical record boundary; main must
       // prove the current launch/run before it may settle preview or activity.
       if (this.onRawRecord) {
+        const sourceTicket = record.type === 'response_item' && record.payload?.type === 'message'
+          && record.payload?.role === 'assistant'
+          ? canonicalSourceTicket({ filePath: state.filePath, stat: readStat,
+            start: recordByteOffset, bytes: lines[i],
+            isCurrent: () => this.sessions.get(state.key) === state
+              && (state.sourceRewriteVersion || 0) === rewriteVersion
+              && state.fileIdentity === `${readStat.dev}:${readStat.ino}` }) : null;
         for (const tabId of tabIds) {
           try {
             this.onRawRecord({
@@ -3356,6 +3396,7 @@ class SessionTranscriptService {
               timestamp: record.timestamp || new Date().toISOString(),
               recordByteOffset,
               recordEndByteOffset,
+              sourceTicket,
               message: record,
             });
           } catch (error) {

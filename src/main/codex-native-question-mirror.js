@@ -13,7 +13,39 @@ const QUESTION_SKIP_HINT_RE = /(?:ctrl\+|⌃|\^)\]\s+skip/u;
 const QUESTION_MAIN_PROMPT_HINT_RE = /(?:shift\+|⇧)→\s+main prompt/u;
 const QUESTION_ANSWER_HINT_RE = /(?:shift\+|⇧)←\s+to answer/u;
 const QUESTION_OPTION_RE = /^\s*([›❯>]?)\s*(\d+)\.\s+(.*)$/u;
+const QUESTION_QUEUE_HEADER_RE = /^\s*(?:[•·]\s*)?Queued follow-up inputs\s*$/;
 const nativeRowSeparator = row => row?.wrapped ? '' : ' ';
+const isBoldQuestionRow = row => /(?:^|,)bold(?:,|$)/.test(String(row?.firstTextStyle || ''))
+  && !/(?:^|,)dim(?:,|$)/.test(String(row?.firstTextStyle || ''));
+const isNativeTitleRow = row => (row?.hasNonDefaultBg || row?.hasNonDefaultFg)
+  && isBoldQuestionRow(row);
+
+// A painted selection in a sequential native list anchors the title ABOVE
+// that list. Do not let a later bold fragment replace it. The caller also
+// requires the current question section boundary, not a transcript list.
+function findNativeChoiceGroup(choices, rows, lines) {
+  let group=null, found=null;
+  const finish=()=>{
+    if(group?.size>=2 && group.selections===1 && group.painted)found=group;
+  };
+  for(const choice of choices) {
+    if(choice.number===1) {
+      finish();
+      group={first:choice.row,last:choice.row,size:0,selections:0,painted:false};
+    } else if(!group || choice.number!==group.size+1) {
+      finish();group=null;
+    }
+    if(!group)continue;
+    group.size++;group.last=choice.row;
+    if(QUESTION_OPTION_RE.exec(lines[choice.row])?.[1]) {
+      group.selections++;
+      const row=rows[choice.row];
+      group.painted ||= row?.hasInverse===true || !!(row?.hasNonDefaultBg && isNativeTitleRow(row));
+    }
+  }
+  finish();
+  return found;
+}
 
 // Current committed screen only. Never search scrollback/raw PTY history for
 // a question, and never let an ordinary quoted help example own keyboard input.
@@ -46,41 +78,65 @@ function inspectCodexNativeQuestions(frame) {
       current=1;count=1;
     }
     if (!current || current>count)return {kind:'unknown'};
+    let sectionStart=Math.max(0,progress+1), sectionKnown=progress>=0;
+    for(let i=sectionStart;i<footer;i++) {
+      if(QUESTION_QUEUE_HEADER_RE.test(lines[i]) && !isBoldQuestionRow(rows[i])) {
+        sectionStart=i+1;sectionKnown=true;
+      }
+    }
     const choices=[];
-    let optionIndex=null, firstChoice=footer, editorRow=-1;
+    let optionIndex=null, editorRow=-1;
     const titleRows=[];
     let optionBlock=false;
-    for (let i=Math.max(0,progress+1);i<footer;i++) {
+    for (let i=sectionStart;i<footer;i++) {
       if(!lines[i].trim())optionBlock=false;
       const match=QUESTION_OPTION_RE.exec(lines[i]);
-      if(match)optionBlock=true;
-      // Native accent_style().bold() can set foreground only. A selected
-      // numbered option is also bold/on a surface, but is never the title.
-      if ((rows[i]?.hasNonDefaultBg || rows[i]?.hasNonDefaultFg)
-        && /(?:^|,)bold(?:,|$)/.test(String(rows[i]?.firstTextStyle || ''))
-        && !/(?:^|,)dim(?:,|$)/.test(String(rows[i]?.firstTextStyle || ''))
+      const previousChoice=choices[choices.length-1];
+      const previousMatch=previousChoice && QUESTION_OPTION_RE.exec(lines[previousChoice.row]);
+      // Native option continuations keep their hanging indent (or xterm soft
+      // wrap), including after an empty paragraph. Unrelated text after a
+      // blank row must not be absorbed into the last option.
+      const continuation=!match && previousMatch && lines[i].trim()
+        && (optionBlock || rows[i]?.wrapped
+          || /^\s*/.exec(lines[i])[0].length>=previousMatch[0].length-previousMatch[3].length);
+      if(match || continuation)optionBlock=true;
+      // Native themes may leave accent at the terminal default colour. That
+      // bold-only form needs the current native section, not arbitrary bold
+      // transcript text. Numbered options/continuations still cannot be title.
+      if ((isNativeTitleRow(rows[i]) || sectionKnown && isBoldQuestionRow(rows[i]))
         && !optionBlock) titleRows.push(i);
       if (match) {
-        firstChoice=Math.min(firstChoice,i);
         const item={number:Number(match[2]),label:match[3],row:i,lineCount:1};
         choices.push(item);
         if (match[1]) optionIndex=item.number-1;
       } else if (/^\s*[›❯]\s*/u.test(lines[i])) editorRow=i;
-      else if (choices.length && lines[i].trim()) {
+      else if (continuation) {
         choices[choices.length-1].label+=nativeRowSeparator(rows[i])+lines[i].trim();
         choices[choices.length-1].lineCount++;
       }
     }
-    if (!titleRows.length)return {kind:'unknown'};
+    const nativeGroup=sectionKnown ? findNativeChoiceGroup(choices,rows,lines) : null;
+    if(nativeGroup)while(titleRows.length && titleRows[titleRows.length-1]>=nativeGroup.first)titleRows.pop();
+    if (!titleRows.length)return {kind:'unknown',reason:'native-question-title-unproven',
+      diagnostic:{sectionKnown,footerRow:footer,choices:choices.length,
+        boldRows:rows.slice(sectionStart,footer).filter(isBoldQuestionRow).length,
+        accentRows:rows.slice(sectionStart,footer).filter(isNativeTitleRow).length}};
     // Native titles are one contiguous bold/accent block. Earlier transcript
     // text is not part of the currently focused question.
-    const titleLast=titleRows[titleRows.length-1];
+    let titleIndex=titleRows.length-1;
+    const titleLast=titleRows[titleIndex];
     let titleFirst=titleLast;
-    while(titleRows.includes(titleFirst-1))titleFirst--;
+    while(titleIndex>0 && titleRows[titleIndex-1]===titleFirst-1) {
+      titleFirst--;titleIndex--;
+    }
+    const titleStyle=rows.slice(titleFirst,titleLast+1).some(isNativeTitleRow) ? 'accent-bold' : 'default-bold';
+    if(titleStyle==='default-bold' && choices.length && !nativeGroup)return {kind:'unknown',
+      reason:'native-question-selection-unproven',diagnostic:{sectionKnown,choices:choices.length}};
     const title=lines.slice(titleFirst,titleLast+1).reduce((value,line,index)=>value
       +(index ? nativeRowSeparator(rows[titleFirst+index]) : '')+line.trim(),'');
     // Ignore numbered transcript rows above the last native accent block.
-    const ownChoices=choices.filter(item=>item.row>titleLast);
+    const ownChoices=choices.filter(item=>item.row>titleLast
+      && (!nativeGroup || item.row>=nativeGroup.first && item.row<=nativeGroup.last));
     choices.splice(0,choices.length,...ownChoices);
     optionIndex=choices.find(item=>QUESTION_OPTION_RE.exec(lines[item.row])?.[1])?.number-1;
     if (!Number.isInteger(optionIndex)) optionIndex=null;
@@ -110,14 +166,14 @@ function inspectCodexNativeQuestions(frame) {
     }
     draftUncertain ||= /\[Pasted (?:Text|text)\b/.test(draft);
     return { kind:'expanded', count,current:current-1,title,choices,optionIndex,optionCount,
-      otherSelected,draft,draftUncertain,writeSeq:frame.writeSeq };
+      otherSelected,draft,draftUncertain,titleStyle,writeSeq:frame.writeSeq };
   }
   for(let i=Math.max(0,lines.length-15);i<lines.length;i++) {
     const match=/^\s*\?\s+(\d+)\s+questions?(?:\s*·\s*(\d+s))?\s*$/.exec(lines[i]);
     if (!match)continue;
     const hint=lines.slice(i+1,i+4).join(' ');
     if (!QUESTION_ANSWER_HINT_RE.test(hint) || lastPrompt<=i || lastPrompt-i>6)continue;
-    const nativeHeader=lines.slice(Math.max(0,i-3),i).some(line=>/^\s*(?:[•·]\s*)?Queued follow-up inputs\s*$/.test(line));
+    const nativeHeader=lines.slice(Math.max(0,i-3),i).some(line=>QUESTION_QUEUE_HEADER_RE.test(line));
     if (!nativeHeader || rows[i]?.hasDim!==true || rows[i]?.allTextDim!==false
       || !rows.slice(i+1,i+4).some(row=>row.hasDim===true))continue;
     return {kind:'collapsed',count:Number(match[1]),current:null,countdown:match[2] || null,writeSeq:frame.writeSeq};
@@ -174,6 +230,15 @@ function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames
       current:native.current,targetId,questionId:candidate?.id || null,
       optionIndex:native.optionIndex ?? null,title:candidate?.title || native.title || '',
       options:choices,draft:native.draft || '',countdown:native.countdown || null};
+    if(native.kind==='expanded' && state.public?.targetId!==targetId) {
+      const definitions=state.candidates.filter(item=>item.accepted!==false);
+      log('title-frame',tabId,{writeSeq:native.writeSeq,current:native.current,count:native.count,
+        titleStyle:native.titleStyle,
+        titleChars:native.title.length,titleHash:digest(native.title),
+        nativeChoices:native.choices.length,definitions:definitions.length,matched:!!candidate,
+        ...(definitions.length===1 ? {definitionTitleChars:definitions[0].title.length,
+          definitionTitleHash:digest(definitions[0].title)} : {})});
+    }
     publishState(tabId,state,next);
     return next;
   };
@@ -268,7 +333,10 @@ function createCodexNativeQuestionMirror({ readFrame, readOwner, subscribeFrames
           log('frame-result',tabId,{requestId,action,ready:observed.ready===true,
             reason:observed.reason,frames:observed.observedFrames,elapsedMs:observed.elapsedMs,
             kind:observed.lastInspection?.kind || 'unknown',writeSeq:observed.lastSnapshot?.writeSeq ?? null,
-            count:observed.lastInspection?.count ?? null});
+            count:observed.lastInspection?.count ?? null,
+            titleStyle:observed.lastInspection?.titleStyle || null,
+            inspectionReason:observed.lastInspection?.reason || null,
+            diagnostic:observed.lastInspection?.diagnostic || null});
           if(!observed.ready)throw new Error(observed.reason || 'question_frame_unconfirmed');
           refresh(tabId,observed.lastSnapshot);
           return observed.lastInspection;

@@ -1,3 +1,4 @@
+import {uiDragDiagnostic,uiDragDiagnosticsEnabled} from './uiPerformanceDiagnostics.mjs';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { acquireInteractionCursor } from './interactionCursor';
 import { createHorizontalRowDragPreview } from './horizontalRowDragPreview';
@@ -41,7 +42,10 @@ function finish(cancelled: boolean, reason: string) {
   drag.cleanup();
   // Release consumes the last painted slot. It never resolves an unseen final
   // pointer coordinate. Source DOM may have disappeared during host adoption.
-  const target = getPaneTabDragSnapshot().target;
+  const snapshot=getPaneTabDragSnapshot();
+  const target = snapshot.target;
+  uiDragDiagnostic('release-request',{gestureId:drag.source.gestureId,reason,revision:snapshot.revision,
+    workflowId:target?.spaceId,paneKey:target?.paneKey,zone:target?.zone,at:target?.at});
   const inside = !cancelled && target && paneTabDropTargetContainsPoint(target, drag.point.clientX, drag.point.clientY);
   try {
     const adopted = !cancelled && finishPaneTabPointer(drag.point);
@@ -63,6 +67,7 @@ function finish(cancelled: boolean, reason: string) {
     drag.preview.remove();
     drag.releaseCursor();
     historyForegroundPriority.endInteraction(drag.owner);
+    uiDragDiagnostic('physical-end',{gestureId:drag.source.gestureId,reason:cancelled?'cancel:'+reason:'release'});
   }
   return true;
 }
@@ -76,10 +81,12 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
   const gestureId=crypto.randomUUID(),state=useWorkspaceStore.getState();
   const workflowDrag=state.organizationReady ? captureWorkflowDrag(state,{gestureId,origin:'pane',
     sourceId:`reserve-tab:${source.rootTabId}`,entries:source.entries,sourcePaneKey:source.sourcePaneKey}) : null;
-  if(state.organizationReady && !workflowDrag)return;
+  if(state.organizationReady && !workflowDrag){uiDragDiagnostic('physical-end',{reason:'source-admission-rejected'});return;}
   const drag: Gesture = {
     source: { ...source, input: 'pointer', pointerId: point.pointerId,gestureId,workflowDrag }, point, frame: 0, owner,
-    preview: createHorizontalRowDragPreview(sourceElement),
+    preview: createHorizontalRowDragPreview(sourceElement,
+      sample=>uiDragDiagnostic('authored',{gestureId,presentation:'existing-centred-pane-feedback',...sample}),
+      sample=>uiDragDiagnostic('pickup-rect',{gestureId,...sample})),
     releaseCursor: acquireInteractionCursor('grabbing', { target: sourceElement, pointerId: point.pointerId }),
     cleanup: () => {},
   };
@@ -90,6 +97,7 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
   drag.preview.element.style.zIndex = '99999';
   suppressClick = true;
   beginPaneTabDrag(drag.source);
+  uiDragDiagnostic('start',{gestureId,pointerId:point.pointerId,sourceId:source.rootTabId,owner:'pane',workflowId:source.sourceSpaceId,paneKey:source.sourcePaneKey});
   historyForegroundPriority.beginInteraction(owner);
   drag.preview.move(point.clientX, point.clientY);
 
@@ -180,6 +188,10 @@ export function bindPaneTabPointerDrag(element: HTMLElement, getSource: () => Pa
     if ((event.target as Element)?.closest('button,input,textarea,select,[contenteditable="true"],[data-no-drag]')) return;
     clear();
     pending = { clientX: event.clientX, clientY: event.clientY, metaKey: event.metaKey, pointerId: event.pointerId };
+    if(uiDragDiagnosticsEnabled()){
+      uiDragDiagnostic('pending',{pointerId:event.pointerId,eventAbs:performance.timeOrigin+event.timeStamp,
+        x:event.clientX,y:event.clientY,owner:'pane'});
+    }
     window.addEventListener('pointermove', move, { capture: true, passive: false });
     window.addEventListener('pointerup', clear, true);
     window.addEventListener('pointercancel', clear, true);
@@ -191,11 +203,13 @@ export function bindPaneTabPointerDrag(element: HTMLElement, getSource: () => Pa
     if (Math.hypot(event.clientX - pending.clientX, event.clientY - pending.clientY) < 5) return;
     pending = null;
     clear();
+    uiDragDiagnostic('threshold',{pointerId:event.pointerId,eventAbs:performance.timeOrigin+event.timeStamp,x:event.clientX,y:event.clientY});
     event.preventDefault();
     onActivate?.();
     start(element, getSource(), { clientX: event.clientX, clientY: event.clientY, metaKey: event.metaKey, pointerId: event.pointerId });
   };
   const clear = () => {
+    if(pending)uiDragDiagnostic('click-release',{pointerId:pending.pointerId});
     pending = null;
     window.removeEventListener('pointermove', move, true);
     window.removeEventListener('pointerup', clear, true);

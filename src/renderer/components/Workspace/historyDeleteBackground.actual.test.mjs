@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
+import { createHistoryMutationInputGate } from '../../../main/history-mutation-input.js';
 import { beginHistoryOperationActivity, getHistoryOperationActivities,
   dismissHistoryOperationActivity } from '../../utils/historyOperationActivity.mjs';
 
@@ -20,12 +21,16 @@ function actual(name) {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
 }
-function fixture() {
+function fixture(options = {}) {
   let release;
   const pending = new Promise(resolve => { release = resolve; });
   const calls = [];
   const ref = { current: 'source-A' };
   const binding = { current: 'source-A' };
+  const terminalToken = {};
+  const gate = createHistoryMutationInputGate({ capture: () => ({ terminalToken,
+    projectId: 'P', cwd: '/source', toolType: 'codex', sessionId: binding.current, inputRevision: 0 }),
+    log: { log() {} } });
   const toasts = [];
   const setters = Object.fromEntries(['setSelectionStartId', 'setContextMenu', 'setRangeActionMenu',
     'setDeleteConfirmMode', 'setDeleteEntryConfirmMode', 'setDeletingRange', 'setDeletingPhase'].map(key => [key, () => {}]));
@@ -36,9 +41,16 @@ function fixture() {
     getCodexHistoryMutationSettingsProof: () => null,
     useUIStore: { getState: () => ({ showToast: (...args) => toasts.push(args) }) },
     useWorkspaceStore: { getState: () => ({ getCodexSessionId: () => binding.current }) },
-    adoptAndRestartCodexHistory: async child => calls.push(['adopt', child]),
+    adoptAndRestartCodexHistory: async (child, _reason, _settings, proof) => {
+      calls.push(['adopt', child]);
+      if (options.failAdopt) throw Error('controlled binding failure');
+      binding.current = child; gate.bound(proof, child);
+      gate.assert('A', proof, { action: 'resume', sessionId: child });
+    },
     ipcRenderer: { invoke: async (channel, args) => {
       calls.push([channel, args]);
+      if (channel === 'history-mutation:begin') return gate.reserve(args);
+      if (channel === 'history-mutation:finish') return gate.finish(args);
       if (channel === 'codex:delete-range' && args.validateOnly) return pending;
       if (channel === 'terminal:getCommandState') return { isRunning: true };
       if (channel === 'terminal:stop-ai-process') return { success: true };
@@ -48,7 +60,7 @@ function fixture() {
   });
   vm.runInContext(actual('stopCodexForHistoryMutation') + actual('executeDeleteRange')
     + '\nthis.execute = executeDeleteRange;', context);
-  return { ref, binding, calls, toasts, release, execute: () => context.execute({ startIndex: 0, endIndex: 0 }, 'target-A', 'target-A') };
+  return { ref, binding, calls, toasts, release, gate, execute: () => context.execute({ startIndex: 0, endIndex: 0 }, 'target-A', 'target-A') };
 }
 
 test('actual Delete continues in the background with its original source, not the reused Timeline ref', async () => {
@@ -56,7 +68,7 @@ test('actual Delete continues in the background with its original source, not th
   const work = f.execute();
   assert.equal(getHistoryOperationActivities()[0].status, 'running');
   await f.execute();
-  assert.equal(f.calls.length, 1, 'second click cannot create another delete during preflight');
+  assert.equal(f.calls.filter(([channel]) => channel === 'history-mutation:begin').length, 1, 'second click cannot allocate a second operation');
   f.ref.current = 'source-B'; // window navigated/reused its Timeline while IO was pending
   f.release({ success: true });
   await work;
@@ -75,11 +87,25 @@ test('actual failing preflight reports failure in background, without Stop, rewr
   f.ref.current = 'source-B';
   f.release({ success: false, error: 'Selected Codex user turn has no exact rollout identity' });
   await work;
-  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls.some(([channel]) => channel === 'terminal:stop-ai-process'), false);
+  assert.equal(f.calls.filter(([channel, args]) => channel === 'codex:delete-range' && !args.validateOnly).length, 0);
+  assert.equal(f.gate.held('A'), false);
   assert.equal(getHistoryOperationActivities()[0].status, 'failed');
   assert.match(getHistoryOperationActivities()[0].message, /no exact rollout identity/);
   assert.equal(f.toasts[0][7], 'A', 'full incident stays on its source, not the currently visible tab');
   assert.equal(f.toasts[0][3], true, 'error remains available');
+  dismissHistoryOperationActivity(getHistoryOperationActivities()[0].id);
+});
+
+test('actual committed COW + failed adoption preserves child ID, does not Resume source, releases exact reservation', async () => {
+  const f = fixture({ failAdopt: true });
+  const work = f.execute();
+  f.release({ success: true }); await work;
+  assert.equal(f.calls.filter(([channel, args]) => channel === 'codex:delete-range' && !args.validateOnly).length, 1);
+  assert.equal(f.calls.some(([channel]) => channel === 'codex:run-command'), false);
+  assert.match(f.toasts[0][0], /child-A/);
+  assert.equal(f.gate.held('A'), false);
+  assert.equal(f.binding.current, 'source-A');
   dismissHistoryOperationActivity(getHistoryOperationActivities()[0].id);
 });
 

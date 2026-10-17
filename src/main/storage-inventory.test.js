@@ -103,10 +103,10 @@ test('inventory groups Codex and Claude while protecting exact open dependencies
   assert.equal(bySession.get('codex:rewrite').group, 'rewrite');
   assert.equal(bySession.get('codex:rewrite').eligible, true);
   assert.equal(bySession.get('codex:outside').group, 'outside');
-  assert.equal(bySession.get('codex:dev-only').group, 'development');
-  assert.equal(bySession.get('codex:dev-only').protected, false);
-  assert.equal(bySession.get('codex:dev-only').eligible, true);
-  assert.equal(bySession.get('codex:dev-parent').group, 'development');
+  assert.equal(bySession.get('codex:dev-only').group, 'open');
+  assert.equal(bySession.get('codex:dev-only').protected, true);
+  assert.equal(bySession.get('codex:dev-only').eligible, false);
+  assert.equal(bySession.get('codex:dev-parent').group, 'open');
   assert.equal(bySession.get('claude:claude-1').group, 'outside');
   assert.equal(bySession.get('claude:claude-1').title, 'First useful prompt');
   assert.ok(bySession.get('claude:claude-1').sizeBytes > fs.statSync(claudeFile).size);

@@ -21,6 +21,29 @@ Namespace объединён, ownership нет:
 
 ## History-tools: granular-чтение + редактирование
 
+### Компактный пассивный снимок выбранных вкладок
+
+`inspect_tabs` / `GET /api/terminal-tabs/inspect` требует `tabInspection.version:1`.
+До8 exact tabIds, без поиска всех вкладок; `includeLastResponse` по умолчанию false,
+`maxPreviewChars` 0..2000 на вкладку. Main event snapshot, текущий turn, собственные
+native agents/background tasks и registry jobs/delivery возвращаются отдельно.
+`runtime.source=main-events`, `processVerification=not-performed`: это не новый
+physical proof, write lock или разрешение Send. Revision — opaque content hash,
+не монотонный счётчик. Unknown не становится idle; изменение owner/revision при
+чтении снимает body и current-success. Current run требует exact execution tuple.
+
+Опциональный final использует только существующий admitted Claude Stop-hook cache
+или уже verified Codex result index/text cache. Проверяются lineage revision и
+stat всех удерживаемых частей; cold/stale/unverified/evicted сообщает причину,
+без bootstrap/full transcript scan, process recheck или нового наблюдателя.
+Это намеренная граница дешёвого чтения, не отсутствие сохранённой истории.
+Ref содержит exact provider/session/execution либо Claude prompt/generation;
+он не смешивается с UUID user-записи. `status:current` относится только к этому
+завершённому turn; новая работа/abort/stopped/unknown делают старый final historical.
+Собственный background и inherited jobs могут оставаться активными при current final.
+Для настоящего ожидания по-прежнему `wait_for_tab_response`; обычные history/result
+readers сохраняют полноценный доступ при явном адресном чтении.
+
 **Чтение** — agent сам решает сколько контекста забрать, сервер не навязывает:
 - `list_open_sessions` — все Claude/Codex табы всех проектов: tabId, sessionId, cwd, project, createdAt + runtime-поля `status`, `busy`, `busySources`, `turnBusy`, `lastEventType/lastEventTs`. Для Claude дополнительно отдаёт `model`, `contextUsedPct/contextRemainingPct` и `contextSource` (`bridge` или persisted DB), если это видно из statusline bridge. Эти поля нужны регистратору: `isLive` означает только «PTY/таб жив», а не «ответ уже готов».
 - `session_stats` — масштаб **без контента**: turnCount, char-counts по ролям, toolUseCount, largestUserTurn/largestThinkingTurn, compact-счётчики, заметки/rewind-маркеры/docs-edits
@@ -195,7 +218,7 @@ resolver и прежний metadata lookup Codex. Ошибочный cwd не о
 
 ## Ожидание ответа: status первичен, текст вторичен
 
-Terminal MCP `send_prompt` подтверждает только доставку текста в живую вкладку. `Status: sent` не означает, что Claude/Codex закончил отвечать. Для разовой ручной инспекции регистратор использует history-tools того же MCP: `list_open_sessions` пока нужная сессия появилась с `sessionId`, затем `busy:false` / terminal completion event.
+Terminal MCP `send_prompt` подтверждает только доставку текста в живую вкладку. `Status: sent` не означает, что Claude/Codex закончил отвечать. Для разовой ручной инспекции регистратор адресно читает уже известную сессию через history-tools того же MCP. `list_open_sessions` даёт passive app-owned projection, не новый process/history scan каждой вкладки. `busy:false` означает idle только вместе с `liveLifecycle:true` и status active/idle; unknown/starting/closed/missing не подтверждают завершение ответа. Exact terminal completion event остаётся отдельным доказательством; сохранённый SID не заменяет текущего writer. Каталог не нужен для повторной проверки уже подтверждённого Create/Send.
 
 Это ручной MCP-flow для разовой инспекции уже открытой сессии. Для «дождись её
 нынешней работы, затем прочитай ответ» используется `wait_for_tab_response`,
@@ -236,6 +259,32 @@ fork восстанавливаются из Claude `forkedFrom` или Codex `f
 чего переживают закрытие вкладки и удаление orchestration-run. Источник истории,
 visual parent и orchestration parent возвращаются разными полями и не могут
 подменять друг друга.
+
+### Service Presentation После Codex COW
+
+Копия provider-текста и lineage event не копирует prompt sidecar автоматически.
+Saved-history COW сохраняет его тем же `cloneCodexPromptPresentationsForProvenChild`,
+что native child adoption, внутри существующей metadata transaction. Raw-record
+remap проверяет timestamp, полный текст, порядок и cardinality одинаковых записей;
+отказ sidecar откатывает metadata commit. Чужие receipts/binding не становятся
+child receipts от такого переноса.
+
+У старого app-COW child чтение может восстановить только service semanticTags:
+committed prefix membership, допустимый fork operation/origin, parent audit tuple
+и полный SHA тела должны совпасть. `entryMappings` в сохранённом history event
+не доступны: reader не предполагает их наличие и не угадывает origin по envelope.
+Несколько legacy поколений читаются до16hops; прямой child sidecar приоритетнее.
+Один ancestor metadata read обслуживает весь page, не SQL-запрос на каждую строку.
+При следующем COW унаследованные service tags materialize через его точный remap.
+Неизвестный/изменённый текст остаётся raw, а attachment/writer/delivery authority
+не восстанавливаются этой read-проекцией.
+
+Шрам15.10: после Rewind537dcc65→0cac8016 сохранились полные MCP/Research bodies,
+но пропали semanticTags, поэтому обычная History показала raw оранжевые envelopes.
+Это backend metadata transfer, не включённый режим «MCP как user» и не повод
+добавлять UI-классификатор по строкам. Контроли —
+`codex-cow-service-presentation.actual.test.js` и
+`database.history-prompt-presentations.test.js`; это SOURCE, не installed acceptance.
 
 ## Доказательства отдельной операции без выгрузки всей сессии
 

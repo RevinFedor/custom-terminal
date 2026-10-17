@@ -91,7 +91,7 @@ test('actual shared card prioritizes inline rename over pending label; manual la
   const label = vm.runInNewContext(compile(fn + '\nresolveTabPendingOperationLabel;'));
   assert.equal(label({ pendingOperation: 'Создание форка…', nameSetManually: true, name: 'Моя ветка' }), 'Моя ветка');
   assert.equal(label({ pendingOperation: 'Создание форка…' }), 'Создание форка…');
-  assert.equal(label({ aiClosing: true, nameSetManually: true, name: 'Моя ветка' }), 'остановка сессии...');
+  assert.equal(label({ aiClosing: true, nameSetManually: true, name: 'Моя ветка' }), 'Закрытие…');
 });
 
 test('pending Timeline is a lightweight exact-target placeholder, never a parent reader', () => {

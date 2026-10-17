@@ -6,7 +6,7 @@ import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import { useUIStore } from '../../store/useUIStore';
 import TabPreviewPopover from './TabPreviewPopover';
 import { getTabChromeColorConfig, adjustRgbaAlpha } from './tabChrome';
-import { archiveRecordKey, validateArchiveSnapshot, filterArchiveRecords, archiveRestoreTarget,
+import { archiveRecordKey, validateArchiveSnapshot, filterArchiveRecords, archiveRestoreTarget, omitExpiredArchiveHistory,
   archiveActionRequest, archiveActionAcknowledged, archiveReceiptMatches } from '../../utils/globalTabArchive.mjs';
 import { archiveHitKey, archiveHitPresentation, reconcileArchiveHits, loadArchivePresentation, saveArchivePresentation,
   archiveListWidth, archiveTimestampMillis, ARCHIVE_LIST_WIDTH_KEY, ARCHIVE_LIST_DEFAULT_WIDTH } from '../../utils/globalArchivePresentation.mjs';
@@ -32,6 +32,7 @@ type Action = (request: ArchiveRequest) => Promise<Receipt>;
 export interface GlobalTabArchiveProps {
   // Root may supply () => ipcRenderer.invoke('workflow:archive-read'). No store imports or implicit launches.
   readArchive: () => Promise<GlobalArchiveSnapshot>;
+  expiredHistoryIds?: ReadonlySet<number>;
   workflows: { id: string; name: string; kind?: string }[];
   onRestore: Action;
   onOpenFavorite: Action;
@@ -87,6 +88,8 @@ export default function GlobalTabArchive(props: GlobalTabArchiveProps) {
   };
   const alive = useRef(true), readEpoch = useRef(0), searchEpoch = useRef(0);
   const snapshotRef = useRef(snapshot); snapshotRef.current = snapshot;
+  const expiredIdsRef = useRef(props.expiredHistoryIds);
+  expiredIdsRef.current = props.expiredHistoryIds;
   const locks = useRef(new Set<string>());
   // Unknown receipt retries retain the immutable original request and ID, rather than sending a new intent.
   const requests = useRef(new Map<string, ArchiveRequest>());
@@ -94,7 +97,7 @@ export default function GlobalTabArchive(props: GlobalTabArchiveProps) {
     const epoch = ++readEpoch.current;
     setLoading(true);
     try {
-      const next = validateArchiveSnapshot(await props.readArchive());
+      const next = omitExpiredArchiveHistory(validateArchiveSnapshot(await props.readArchive()),expiredIdsRef.current);
       if (!alive.current || epoch !== readEpoch.current) return;
       setSnapshot(next); snapshotRef.current = next; setError('');
       setSelected(previous => {
@@ -108,6 +111,14 @@ export default function GlobalTabArchive(props: GlobalTabArchiveProps) {
     } finally { if (alive.current && epoch === readEpoch.current) setLoading(false); }
   }, [props.readArchive]);
   useEffect(() => { alive.current = true; void load(); return () => { alive.current = false; readEpoch.current++; searchEpoch.current++; }; }, [load]);
+  useEffect(() => {
+    const ids = props.expiredHistoryIds;
+    if (!ids?.size) return;
+    setSnapshot(previous => omitExpiredArchiveHistory(previous,ids));
+    setSearchRows(previous => previous?.filter(row => !ids.has(row.id)) || previous);
+    setSelected(previous => previous?.kind === 'history' && ids.has(previous.row.id) ? null : previous);
+    setConfirmation(previous => previous?.selection.kind === 'history' && ids.has(previous.selection.row.id) ? null : previous);
+  },[props.expiredHistoryIds]);
   const searchSignature = JSON.stringify([query,workflow,cwd,searchMode,dateFrom,provider]);
   const previousSearchSignature = useRef(searchSignature);
   useEffect(() => {
@@ -141,7 +152,8 @@ export default function GlobalTabArchive(props: GlobalTabArchiveProps) {
   const rows = useMemo(() => filterArchiveRecords(kind === 'history'
     ? searchRows ? reconcileArchiveHits(searchRows,snapshot?.history || []) : snapshot?.history ?? [] : snapshot?.favorites ?? [],
   { query: searchRows && kind === 'history' ? '' : query, workflowId: workflow, cwd })
-    .filter(row=>provider === 'all' || row.command_type === provider), [kind, snapshot, query, workflow, cwd, searchRows,provider]);
+    .filter(row=>provider === 'all' || row.command_type === provider)
+    .filter(row=>kind !== 'history' || !props.expiredHistoryIds?.has(row.id)), [kind, snapshot, query, workflow, cwd, searchRows,provider,props.expiredHistoryIds]);
   const restoreSelection = useRef(initial.selectedHit);
   useEffect(() => {
     if(!snapshot || !restoreSelection.current) return;

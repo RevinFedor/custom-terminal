@@ -8,8 +8,8 @@
 // task plans, and file linking all delegate to existing app/API scenarios.
 // =============================================================================
 
-import { readFileSync, readdirSync, statSync } from 'fs';
-import { basename, join, resolve } from 'path';
+import { readFileSync, readdirSync, statSync, openSync, closeSync, fstatSync, lstatSync, readSync, constants } from 'fs';
+import { basename, isAbsolute, join, resolve } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
 import { execFile } from 'node:child_process';
@@ -51,6 +51,7 @@ const ENV_PARENT_TAB_ID = EXTERNAL_MODE ? '' : (process.env.NOTED_PARENT_TAB_ID 
 // AsyncLocalStorage scope carrying it. Direct stdio spawns (one process per
 // session) have no _meta and keep using the env-derived values.
 const requestIdentity = new AsyncLocalStorage();
+const requestRouteState = new AsyncLocalStorage();
 function PARENT_TAB_ID() {
   const meta = requestIdentity.getStore();
   return (meta && meta.tabId) || ENV_PARENT_TAB_ID;
@@ -65,9 +66,71 @@ function PROJECT_CWD_() {
 }
 function MAIN_PID_HINT() {
   const meta = requestIdentity.getStore();
-  const fromMeta = parseInt((meta && meta.mainPid) || '', 10);
-  if (fromMeta) return fromMeta;
-  return parseInt(process.env.NOTED_MAIN_PID || '', 10);
+  const value = String((meta && meta.mainPid) || process.env.NOTED_MAIN_PID || '');
+  if (!value) return null;
+  if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error('mcp_instance_route_invalid: main PID');
+  return Number(value);
+}
+
+function instanceRouteFailure(reason) {
+  return Object.assign(new Error('mcp_instance_route_unavailable: ' + reason), { code: 'mcp_instance_route_unavailable' });
+}
+
+function readInstanceRecord(directory, filename, pid, strict = false) {
+  const file = join(directory, filename);
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = fstatSync(fd);
+    if (!before.isFile() || before.size > 65536) throw instanceRouteFailure('invalid discovery record');
+    const bytes = Buffer.alloc(65537); let size = 0, read;
+    do { read = readSync(fd, bytes, size, bytes.length - size, null); size += read; } while (read && size < bytes.length);
+    const after = fstatSync(fd), current = lstatSync(file);
+    if (size !== before.size || size > 65536 || ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']
+      .some(key => before[key] !== after[key] || before[key] !== current[key])) throw instanceRouteFailure('discovery changed during read');
+    const record = JSON.parse(bytes.subarray(0, size).toString('utf8'));
+    if (!Number.isInteger(record.port) || record.port < 1 || record.port > 65535
+      || (strict ? record.pid !== pid : record.pid != null && record.pid !== pid)) throw instanceRouteFailure('discovery PID/port mismatch');
+    return { ...record, pid, discoveryDir: directory };
+  } finally { closeSync(fd); }
+}
+
+// Only app-produced transport metadata, never tool arguments. One call pins
+// both service addresses; later reads cannot silently follow a replacement.
+function pinnedInstanceRoute() {
+  const meta = requestIdentity.getStore();
+  const encoded = meta ? meta.instanceRoute : process.env.NOTED_MCP_INSTANCE_ROUTE;
+  if (!encoded) return null;
+  const state = requestRouteState.getStore();
+  let binding;
+  try {
+    if (typeof encoded !== 'string' || encoded.length > 8192 || !/^[\w-]+$/.test(encoded)) throw Error('invalid encoding');
+    binding = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    if (binding.version !== 1 || Object.keys(binding).some(k => !['version', 'discoveryDir', 'instanceId'].includes(k))
+      || typeof binding.discoveryDir !== 'string' || !isAbsolute(binding.discoveryDir)
+      || binding.discoveryDir.includes('\0') || !/^[0-9a-f-]{36}$/i.test(binding.instanceId)) throw Error('invalid binding');
+    const pid = MAIN_PID_HINT();
+    if (!pid) throw Error('missing main PID');
+    process.kill(pid, 0);
+    const directory = resolve(binding.discoveryDir);
+    const mcp = readInstanceRecord(directory, 'mcp-port-' + pid, pid, true);
+    const web = readInstanceRecord(directory, 'web-server-' + pid + '.json', pid, true);
+    if (mcp.instanceId !== binding.instanceId || !/^[0-9a-f-]{36}$/i.test(web.instanceId)) throw Error('replaced instance');
+    const route = { pid, directory, mcp, web };
+    const previous = state?.route;
+    if (previous && (previous.pid !== pid || previous.directory !== directory
+      || previous.mcp.port !== mcp.port || previous.mcp.instanceId !== mcp.instanceId
+      || previous.web.port !== web.port || previous.web.instanceId !== web.instanceId)) throw Error('binding changed during call');
+    if (state) state.route = previous || route;
+    return previous || route;
+  } catch (error) { throw instanceRouteFailure(error.code === 'ENOENT' ? 'pinned discovery missing' : error.message); }
+}
+
+function instanceHeaders(kind, port) {
+  const route = pinnedInstanceRoute();
+  if (!route) return {};
+  const record = route[kind];
+  if (record.port !== port) throw instanceRouteFailure('cross-instance port');
+  return { 'x-noted-main-pid': String(route.pid), 'x-noted-instance-id': record.instanceId };
 }
 
 process.stderr.write(`[terminal-server] Project CWD: ${PROJECT_CWD}\n`);
@@ -86,6 +149,8 @@ if (EXTERNAL_MODE) {
 // Backwards-compatible: legacy port files contained only the bare port number;
 // treat that as { port, openProjectPaths: [] } and fall back to mtime selection.
 function listLiveInstances() {
+  const route = pinnedInstanceRoute();
+  if (route) return [route.mcp];
   const out = [];
   try {
     const files = readdirSync(PORT_DIR).filter(f => f.startsWith('mcp-port-'));
@@ -101,10 +166,12 @@ function listLiveInstances() {
       catch { payload = { port: parseInt(raw), openProjectPaths: [] }; } // legacy
       if (!payload.port) continue;
       const mtime = (() => { try { return statSync(full).mtimeMs; } catch { return 0; } })();
+      if (payload.pid != null && payload.pid !== pid) continue;
       out.push({ ...payload, pid, mtime });
     }
   } catch {}
-  return out;
+  const pinned = MAIN_PID_HINT();
+  return pinned ? out.filter(instance => instance.pid === pinned) : out;
 }
 
 function listLiveVoiceInstances() {
@@ -128,6 +195,8 @@ function listLiveVoiceInstances() {
 }
 
 function listLiveWebInstances() {
+  const route = pinnedInstanceRoute();
+  if (route) return [route.web];
   const out = [];
   try {
     const files = readdirSync(PORT_DIR).filter(f => /^web-server-\d+\.json$/.test(f));
@@ -140,11 +209,13 @@ function listLiveWebInstances() {
       try { payload = JSON.parse(readFileSync(full, 'utf-8').trim()); } catch { continue; }
       if (!payload.port) continue;
       const mtime = (() => { try { return statSync(full).mtimeMs; } catch { return 0; } })();
+      if (payload.pid != null && payload.pid !== pid) continue;
       out.push({ ...payload, pid, mtime });
     }
   } catch {}
   out.sort((a, b) => (b.updatedAt || b.mtime || 0) - (a.updatedAt || a.mtime || 0));
-  return out;
+  const pinned = MAIN_PID_HINT();
+  return pinned ? out.filter(instance => instance.pid === pinned) : out;
 }
 
 function readSharedToken() {
@@ -161,14 +232,14 @@ function readSharedToken() {
 //      open project, e.g. from /tmp).
 function pickInstance(cwd) {
   const instances = listLiveInstances();
-  if (!instances.length) return null;
   // Priority 1: env-pinned main pid
   const hintPid = MAIN_PID_HINT();
   if (hintPid) {
     const pinned = instances.find(i => i.pid === hintPid);
     if (pinned) return pinned;
-    // pinned pid not in live list — fall through, instance probably died
+    throw instanceRouteFailure('pinned main is unavailable; fallback refused');
   }
+  if (!instances.length) return null;
   // Priority 2: cwd longest-prefix
   const target = cwd || PROJECT_CWD_();
   if (target) {
@@ -315,15 +386,20 @@ async function liveSessionSnapshot(sessionId, cwd) {
 
 async function historyResultWithLifecycle(sessionId, cwd, result) {
   const lifecycle = await liveSessionSnapshot(sessionId, cwd);
+  const confirmedIdle = lifecycle?.busy === false
+    && lifecycle?.liveLifecycle === true
+    && ['active', 'idle'].includes(lifecycle?.status);
   return {
     lifecycle,
     waitGate: lifecycle?.lifecycleUnavailable
       ? 'Lifecycle unavailable. Do not infer completion from stable transcript text.'
-      : lifecycle?.busy
+      : lifecycle?.busy === true
         ? 'BUSY: transcript blocks may still be partial.'
-        : lifecycle
+        : confirmedIdle
           ? 'NOT BUSY: the latest transcript state is complete.'
-          : 'Session is not attached to an open tab; no live completion signal is available.',
+          : lifecycle
+            ? 'Runtime is not confirmed idle. Do not infer completion from stable transcript text.'
+            : 'Session is not attached to an open tab; no live completion signal is available.',
     ...result,
   };
 }
@@ -360,7 +436,10 @@ async function httpGet(endpoint, hintCwd) {
 }
 
 async function httpGetOnPort(port, endpoint) {
-  const res = await fetch('http://127.0.0.1:' + port + endpoint);
+  const headers = instanceHeaders('mcp', port);
+  const hintPid = MAIN_PID_HINT();
+  if (hintPid && pickInstance()?.port !== port) throw instanceRouteFailure('cross-instance MCP port');
+  const res = await fetch('http://127.0.0.1:' + port + endpoint, { headers });
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
@@ -394,9 +473,12 @@ async function httpPost(endpoint, body, hintCwd) {
 }
 
 async function httpPostOnPort(port, endpoint, body) {
+  const headers = instanceHeaders('mcp', port);
+  const hintPid = MAIN_PID_HINT();
+  if (hintPid && pickInstance()?.port !== port) throw instanceRouteFailure('cross-instance MCP port');
   const res = await fetch('http://127.0.0.1:' + port + endpoint, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(body),
   });
   const text = await res.text();
@@ -412,29 +494,34 @@ function pickWebInstance(target = {}) {
 
   const hintPid = MAIN_PID_HINT();
   if (hintPid) {
+    if (target.pid && target.pid !== hintPid) throw instanceRouteFailure('cross-instance API target');
     const pinned = instances.find(i => i.pid === hintPid);
     if (pinned) return pinned;
+    throw instanceRouteFailure('pinned web server is unavailable; fallback refused');
   }
   if (target.pid) {
     const pinned = instances.find(i => i.pid === target.pid);
     if (pinned) return pinned;
+    throw instanceRouteFailure('selected web server is unavailable; fallback refused');
   }
   return instances[0];
 }
 
-function apiAuthHeaders() {
-  const token = readSharedToken();
+function apiAuthHeaders(instance = null) {
+  const route = pinnedInstanceRoute();
+  const token = route ? readFileSync(join(route.directory, 'web-token.txt'), 'utf8').trim() : readSharedToken();
   if (!token) throw new Error('Shared web token not found at ' + TOKEN_PATH);
   return {
     'Content-Type': 'application/json',
     Authorization: 'Bearer ' + token,
+    ...(route ? instanceHeaders('web', instance?.port) : {}),
   };
 }
 
 async function httpApiGet(target, endpoint) {
   const inst = pickWebInstance(target);
   const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
-    headers: apiAuthHeaders(),
+    headers: apiAuthHeaders(inst),
   });
   const text = await res.text();
   let json;
@@ -458,7 +545,7 @@ async function httpApiPost(target, endpoint, body) {
   const inst = pickWebInstance(target);
   const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
     method: 'POST',
-    headers: apiAuthHeaders(),
+    headers: apiAuthHeaders(inst),
     body: JSON.stringify(body || {}),
   });
   const text = await res.text();
@@ -484,7 +571,7 @@ async function httpApiPatch(target, endpoint, body) {
   const inst = pickWebInstance(target);
   const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
     method: 'PATCH',
-    headers: apiAuthHeaders(),
+    headers: apiAuthHeaders(inst),
     body: JSON.stringify(body || {}),
   });
   const text = await res.text();
@@ -504,7 +591,7 @@ async function httpPromptLibraryMutation(target, method, endpoint, body) {
   const inst = pickWebInstance(target);
   const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
     method,
-    headers: apiAuthHeaders(),
+    headers: apiAuthHeaders(inst),
     body: JSON.stringify(body || {}),
   });
   const text = await res.text();
@@ -924,6 +1011,7 @@ const CODEX_GOAL_GUIDANCE = ' If native Codex reports codex_resume_goal_action_r
 const STRUCTURED_JSON_TOOLS = new Set([
   'get_tab_context', 'list_tab_contexts', 'set_tab_responsibility', 'publish_context_update',
   'current_context',
+  'inspect_tabs',
   'list_agent_models',
   'list_windows',
   'create_tab',
@@ -945,6 +1033,16 @@ const STRUCTURED_JSON_TOOLS = new Set([
 ]);
 
 const TOOLS = [
+  {
+    name: 'inspect_tabs',
+    description: 'Passively inspect up to 8 exact tabs: Main event/runtime and turn state, own background work, tracked jobs and pending result delivery separately. Optional bounded last completed response is read only from verified existing caches; cold/stale evidence stays unavailable. Historical text never proves current completion. Does not run ps, scan full histories, send, resume, stop or register an observer. Use wait_for_tab_response for actual waiting, not polling this reader.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {
+      tabIds: { type: 'array', minItems: 1, maxItems: 8, uniqueItems: true, items: { type: 'string', minLength: 1, maxLength: 512 } },
+      includeLastResponse: { type: 'boolean', description: 'Default false. Include an exact cached final/ref if available.' },
+      maxPreviewChars: { type: 'integer', minimum: 0, maximum: 2000, description: 'Default 2000 per tab; 0 returns reference/metadata only.' },
+      cwd: { type: 'string' },
+    }, required: ['tabIds'] },
+  },
   {
     name: 'get_codex_goal',
     description: 'Read the native paused-Goal dialog and its exact operationId in an existing Codex tab, without starting it or pressing keys. Use after codex_resume_goal_action_required. Optional requestId reads a prior choice outcome after lost ACK. Pending/unknown is not permission to repeat Enter; do not poll.',
@@ -1397,7 +1495,7 @@ const TOOLS = [
   },
   {
     name: 'list_open_sessions',
-    description: 'Read the live lifecycle of open Claude/Codex sessions: tab identity, model, context usage, and authoritative busy/status state. This is a status tool, not transcript search. When the user asks where a topic/feature appeared, call search_sessions first instead of list_open_sessions followed by list_turns across candidates. A response is complete only when busy=false or the lifecycle reports a terminal completion event.',
+    description: 'Read the app-owned lifecycle projection of open Claude/Codex sessions: tab identity, model, context usage, and busy/status state. This is a passive status tool, not fresh process reconciliation or transcript search. When the user asks where a topic/feature appeared, call search_sessions first instead of list_open_sessions followed by list_turns across candidates. busy=false alone is not completion proof: liveLifecycle must be true and status active/idle, or use an exact terminal completion event. Unknown, starting, closed or missing lifecycle must not be treated as a completed answer.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2220,7 +2318,7 @@ async function handleRequest(msg) {
     const { name, arguments: args } = params;
     const noted = params?._meta?.noted || null;
     try {
-      const result = await requestIdentity.run(noted, () => callTool(name, args || {}));
+      const result = await requestIdentity.run(noted, () => requestRouteState.run({}, () => callTool(name, args || {})));
       const toolResult = { content: [{ type: 'text', text: result }] };
       if (STRUCTURED_JSON_TOOLS.has(name)) {
         try {
@@ -2435,6 +2533,22 @@ async function callTool(name, args) {
       const target = projectHint(args);
       const result = await httpPromptLibraryMutation(target, 'DELETE', '/api/prompt-groups/' + encodeURIComponent(args.groupId), { revision: args.revision });
       return JSON.stringify(result, null, 2);
+    }
+
+    case 'inspect_tabs': {
+      if (!Array.isArray(args.tabIds) || args.tabIds.length < 1 || args.tabIds.length > 8
+        || new Set(args.tabIds).size !== args.tabIds.length
+        || args.tabIds.some(id => typeof id !== 'string' || !id.trim() || id.length > 512)
+        || Object.keys(args).some(key => !['tabIds', 'includeLastResponse', 'maxPreviewChars', 'cwd'].includes(key))
+        || (args.includeLastResponse !== undefined && typeof args.includeLastResponse !== 'boolean')
+        || (args.maxPreviewChars !== undefined && (!Number.isInteger(args.maxPreviewChars)
+          || args.maxPreviewChars < 0 || args.maxPreviewChars > 2000))) throw new Error('invalid_tab_inspection_request');
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD_(), projectId: PARENT_PROJECT_ID() });
+      const me = await httpApiGet(target, '/api/me');
+      if (me?.capabilities?.tabInspection?.version !== 1) throw new Error('app_update_required: Noted Terminal needs tabInspection v1');
+      const query = new URLSearchParams({ tabIds: JSON.stringify(args.tabIds),
+        includeLastResponse: String(args.includeLastResponse === true), maxPreviewChars: String(args.maxPreviewChars ?? 2000) });
+      return JSON.stringify(await httpApiGet(target, '/api/terminal-tabs/inspect?' + query), null, 2);
     }
 
     case 'list_tabs': {
@@ -2781,7 +2895,7 @@ async function callTool(name, args) {
     case 'list_open_sessions': {
       const result = await httpGet('/overseer/sessions', args.cwd || PROJECT_CWD_());
       return JSON.stringify({
-        waitRule: 'Treat assistant output as final only when busy=false or a terminal completion event is present.',
+        waitRule: 'busy=false is an idle signal only with liveLifecycle=true and status active/idle. Unknown, starting, closed or missing lifecycle is not completion proof; use exact current lifecycle or a terminal completion event.',
         ...result,
       }, null, 2);
     }

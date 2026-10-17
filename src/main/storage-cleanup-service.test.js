@@ -21,10 +21,12 @@ function inventory(items, generation = 'generation-1') {
   };
 }
 
-test('only packaged production owns automatic storage retention', () => {
+test('automatic retention defaults to canonical packaged production; private tests require proof', () => {
   assert.equal(canOwnAutomaticStorageRetention({ isPackaged: true, e2e: false }), true);
   assert.equal(canOwnAutomaticStorageRetention({ isPackaged: false, e2e: false }), false);
   assert.equal(canOwnAutomaticStorageRetention({ isPackaged: true, e2e: true }), false);
+  assert.equal(canOwnAutomaticStorageRetention({ isPackaged: true, e2e: false, canonicalProduction: false }), false);
+  assert.equal(canOwnAutomaticStorageRetention({ isPackaged: false, e2e: true, isolatedTest: true }), true);
 });
 
 test('shared storage mutation refuses dev without canonical production authority', async (t) => {

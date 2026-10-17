@@ -109,7 +109,7 @@ function createCodexResumeSourceReader({ findSessionFile, readJsonlRange,
   const views = new Map(), flights = new Map();
   const stats = { reads: 0, bytesRead: 0, cacheHits: 0 };
 
-  async function scan(filePath, stat, sessionId, options) {
+  async function scan(filePath, stat, sessionId, options, preparedRecords = null) {
     const settings = createCodexSourceSettingsReducer(sessionId);
     let timeline = createTimelineProjector(sessionId);
     let sourceMetadata = null, metadataSeen = false, userRecords = 0;
@@ -153,7 +153,8 @@ function createCodexResumeSourceReader({ findSessionFile, readJsonlRange,
         const old = locators.get(state.currentUser);
         if (old) {
           let restored;
-          if (old.toByte - old.fromByte <= SMALL_SOURCE_BYTES) {
+          if (old.preparedRecord) restored = old.preparedRecord;
+          else if (old.toByte - old.fromByte <= SMALL_SOURCE_BYTES) {
             const read = await readJsonlRange(filePath, old.fromByte, old.toByte - 1, { lineCount: old.startLine });
             onBytes(old.toByte - old.fromByte); restored = read.records[0];
           } else {
@@ -173,7 +174,22 @@ function createCodexResumeSourceReader({ findSessionFile, readJsonlRange,
     // The shared incremental reader remains the small-file fast path. It
     // streams callbacks and never builds a raw records cache for Resume.
     let scanResult;
-    if (stat.size <= SMALL_SOURCE_BYTES && !options.forceProjection) {
+    if (preparedRecords) {
+      // The exclusive COW writer already produced exact physical records.
+      // Reuse THIS reducer; no second settings/materialization codec or file
+      // scan, and never retain the raw array in the small Resume views cache.
+      let lastYield = performance.now();
+      for (let index = 0; index < preparedRecords.length; index++) {
+        const record = preparedRecords[index];
+        await consume(record, { preparedRecord: record, filePath,
+          fromByte: record.__byteOffset, toByte: preparedRecords[index + 1]?.__byteOffset ?? stat.size,
+          startLine: record.__line });
+        if (index % 64 === 63 && performance.now() - lastYield >= 8) {
+          await yieldToMain();lastYield = performance.now();
+        }
+      }
+      scanResult = { parsed: preparedRecords.length, errors: 0, partialBytes: 0 };
+    } else if (stat.size <= SMALL_SOURCE_BYTES && !options.forceProjection) {
       const result = await readJsonlRange(filePath, 0, stat.size - 1, {
         collectRecords: false, onRecord: consume, onChunk: bytes => onBytes(bytes.length),
         ...(options.highWaterMark ? { highWaterMark: options.highWaterMark } : {}),
@@ -241,7 +257,39 @@ function createCodexResumeSourceReader({ findSessionFile, readJsonlRange,
     next.finally(() => { if (flights.get(key) === next) flights.delete(key); }).catch(() => {});
     return next;
   }
-  return { load, stats: () => ({ ...stats, views: views.size }), clear: () => views.clear() };
+  // Internal cache admission, called only with the committed exclusive writer's
+  // records/stat lease. It grants neither writer identity nor input readiness.
+  async function seedPrepared(sessionId, cwd, { filePath, stat, records } = {}) {
+    const key = JSON.stringify([sessionId, cwd || '', '']);
+    const previous = flights.get(key) || Promise.resolve();
+    const next = previous.catch(() => {}).then(async () => {
+      if (!filePath || !stat || !Array.isArray(records) || !records.length
+        || records[0]?.type !== 'session_meta' || records[0]?.payload?.id !== sessionId
+        || cwd && records[0].payload.cwd !== cwd
+        || records[0].__byteOffset !== 0
+        || records.some((record, index) => record.__line !== index || !Number.isSafeInteger(record.__byteOffset)
+          || record.__byteOffset < 0 || record.__byteOffset >= stat.size
+          || index > 0 && record.__byteOffset <= records[index - 1].__byteOffset)) return false;
+      const current = await findSessionFile(sessionId, cwd, {});
+      if (current?.filePath !== filePath || statKey(await fs.promises.stat(filePath)) !== statKey(stat)) return false;
+      const proof = await scan(filePath, stat, sessionId, {}, records);
+      const after = await fs.promises.stat(filePath);
+      if (statKey(after) !== statKey(stat) || (await findSessionFile(sessionId, cwd, {}))?.filePath !== filePath) return false;
+      const result = { success: true, filePath, ...proof, mode: 'prepared', sourceSnapshot: {
+        filePath, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs,
+        fileIdentity: stat.dev + ':' + stat.ino, sessionId, linkKind: 'end',
+      } };
+      views.delete(key);views.set(key, { version: filePath + ':' + statKey(stat), result });
+      while (views.size > maxViews) views.delete(views.keys().next().value);
+      log.log?.('[CodexResumeSource] prepared session=' + String(sessionId).slice(0, 8)
+        + ' records=' + records.length + ' readBytes=0');
+      return true;
+    });
+    flights.set(key, next);
+    next.finally(() => { if (flights.get(key) === next) flights.delete(key); }).catch(() => {});
+    return next;
+  }
+  return { load, seedPrepared, stats: () => ({ ...stats, views: views.size }), clear: () => views.clear() };
 }
 
 module.exports = { createCodexResumeSourceReader, createJsonProjection };

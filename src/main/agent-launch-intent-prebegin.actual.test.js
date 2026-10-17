@@ -19,6 +19,7 @@ function fixture() {
   const term = {}, sender = Object.assign(new EventEmitter(), { id: 1 });
   const registry = createAgentLaunchPreparationRegistry();
   const env = { crypto, console: { warn() {}, log() {} }, terminalLaunchFenceOrders: new WeakMap(), nextTerminalLaunchFenceOrder: 0,
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
     terminals: new Map([['T', term]]), terminalStopRevisions: new WeakMap(), terminalLifecycleEpochs: new WeakMap(),
     terminalProjects: new Map([['T', '/fixture']]), terminalProjectIds: new Map([['T', 'P']]),
     aiStoppingTabs: new Map(), agentLaunchIntentSenders: new Set(), agentLaunchPreparations: registry,
@@ -81,6 +82,7 @@ async function composed(options = {}) {
   const events = new EventEmitter();
   const scope = createAgentLaunchAdmission({ invoke, events,
     tabId: 'T', toolType: 'codex', sessionId: 'S', cwd: '/fixture', launchFence: original,
+    createId: () => 'launch:' + crypto.randomUUID() + ':1',
     ...(options.send ? { sendOperationKey: 'O', sendAttemptId: 'A' } : {}),
     responseTimeoutMs: 15, signal: options.signal,
     wait: async ms => { delays.push(ms); await options.backoff?.(f); },

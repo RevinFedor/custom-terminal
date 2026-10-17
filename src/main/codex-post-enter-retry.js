@@ -4,7 +4,7 @@ const {
   codexCanonicalUserMessageMatch,
 } = require('./codex-prompt-audit');
 
-const RETRYABLE_RECEIPT_STATES = new Set(['audit-pending', 'delivery-unknown']);
+const RETRYABLE_RECEIPT_STATES = new Set(['audit-pending']);
 
 function cleanString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -36,6 +36,10 @@ function classifyCodexPostEnterRetryAdmission({
   }
   if (!durableRecord || durableRecord.attemptId !== audit.sendAttemptId) {
     return refusal('durable-attempt-changed');
+  }
+  // Cancellation revokes future input, not the late canonical audit.
+  if (durableRecord.deliveryControl?.cancelledAt) {
+    return refusal('delivery-cancelled');
   }
   if (!RETRYABLE_RECEIPT_STATES.has(durableRecord.state)) {
     return refusal('durable-attempt-not-unresolved');
@@ -92,6 +96,10 @@ function classifyCodexPostEnterRetryCapture({
   if (!audit || audit.finished === true) return refusal('audit-finished-during-capture');
   if (!durableRecord || durableRecord.attemptId !== audit.sendAttemptId) {
     return refusal('durable-attempt-changed-during-capture');
+  }
+  // Cancellation revokes future input, not the late canonical audit.
+  if (durableRecord.deliveryControl?.cancelledAt) {
+    return refusal('delivery-cancelled-during-capture');
   }
   if (!RETRYABLE_RECEIPT_STATES.has(durableRecord.state)) {
     return refusal('durable-attempt-settled-during-capture');

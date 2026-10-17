@@ -4,9 +4,9 @@ const path = require('path');
 const crypto = require('crypto');
 const { causal } = require('./perf-causal-context');
 
-const PROMPT_SUFFIX = '.prompt.md';
+const { PROMPT_SOURCE_FOLDER, PROMPT_SUFFIX, includePromptSourceEntry } = require('../shared/prompt-source-policy.cjs');
+const { PreparedPromptCatalog } = require('./prompt-catalog-preparation');
 const ROOT_PARENT = '__root__';
-const CACHE_TTL_MS = 1500;
 // Reuse the same natural-order rules across the whole catalog scan. Passing
 // options to localeCompare builds a collator for every pair in Array.sort.
 const naturalCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
@@ -95,7 +95,7 @@ function safeDirectoryEntries(dirPath, fsImpl = fs) {
   try {
     causal.count('directoryReads');
     return fsImpl.readdirSync(dirPath, { withFileTypes: true })
-      .filter((entry) => !entry.name.startsWith('.') && !entry.isSymbolicLink())
+      .filter(includePromptSourceEntry)
       .map((entry) => ({
         name: entry.name,
         path: path.join(dirPath, entry.name),
@@ -166,7 +166,7 @@ function sourceDirectoryState(rootPath, fsImpl, readContext) {
     causal.count('directoryHits');
     return readContext.directories.get(rootPath);
   }
-  const docsPath = path.join(rootPath, 'docs');
+  const docsPath = path.join(rootPath, PROMPT_SOURCE_FOLDER);
   let rootExists = false;
   let docsExists = false;
   causal.count('statReads', 2);
@@ -264,19 +264,27 @@ function catalogSource(input, readContext) {
 }
 
 class ProjectPromptCatalogService {
-  constructor({ db, layoutStore, rootRegistry = null, onChanged = null, fsImpl = fs, watch = true } = {}) {
+  constructor({ db, layoutStore, rootRegistry = null, onChanged = null, fsImpl = fs, watch = true,
+    asyncFs, controlOptions, authorityFence } = {}) {
     if (!db) throw new Error('ProjectPromptCatalogService requires db');
-    this.db = db;
-    this.layoutStore = layoutStore || null;
-    this.rootRegistry = rootRegistry;
+    this.db = db; this.layoutStore = layoutStore || null; this.rootRegistry = rootRegistry;
     this.onChanged = typeof onChanged === 'function' ? onChanged : null;
-    this.fs = fsImpl;
-    this.watchEnabled = watch;
-    this.cache = new Map();
-    this.tabCache = new Map();
-    this.watchers = new Map();
-    this.watchDebounce = new Map();
-    if (watch) this.refreshWatchers();
+    this.fs = fsImpl; this.watchEnabled = watch;
+    // Compatibility maps contain no retained tab/project catalogs.
+    this.cache = new Map(); this.tabCache = new Map(); this.watchDebounce = new Map();
+    this.resolveSourcePath = resolvedSourcePath; this.inside = isInside;
+    this.preparationOptions = { asyncFs, controlOptions, authorityFence };
+    this.prepared = new PreparedPromptCatalog(this, this.preparationOptions);
+    this.watchers = this.prepared.watchers;
+  }
+
+  preparation() {
+    // Explicit reuse after close creates a new lifetime; old callbacks stay sealed.
+    if (this.prepared.closed) {
+      this.prepared = new PreparedPromptCatalog(this, this.preparationOptions);
+      this.watchers = this.prepared.watchers;
+    }
+    return this.prepared;
   }
 
   getSources(projectId, readContext) {
@@ -347,44 +355,7 @@ class ProjectPromptCatalogService {
     return causal.hasWork() ? work() : causal.syncWork('catalog.setTabSources', {}, work);
   }
 
-  listTab(tabId, { force = false, refreshWatchers = true, readContext } = {}) {
-    const work = () => {
-      const allSources = this.getTabSources(tabId, readContext);
-      const signature = JSON.stringify(allSources);
-      const cached = this.tabCache.get(tabId);
-      if (!force && cached?.signature === signature && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
-        causal.count('cacheHits');
-        return cached.value;
-      }
-      causal.count('cacheMisses');
-      const sources = allSources.filter(source => source.enabled === true)
-        .sort((a, b) => naturalCompare(a.sourceName, b.sourceName));
-      let complete = true;
-      const scannedSources = sources.map(source => {
-        const scanned = catalogSource({
-          // The namespace of the ORIGINAL binding is part of the prompt id.
-          projectId: source.projectId,
-          rootPath: source.rootPath,
-          sourceName: source.sourceName,
-          layout: this.readLayout(source.rootPath),
-          fsImpl: this.fs,
-        }, readContext);
-        if (partialUsageScans.has(scanned)) complete = false;
-        return { ...source, ...scanned };
-      });
-      const value = {
-        tabId,
-        sources: scannedSources.map(({ prompts, ...source }) => ({ ...source, promptCount: prompts.length })),
-        prompts: scannedSources.flatMap(source => source.prompts),
-        updatedAt: Date.now(),
-      };
-      if (complete) this.tabCache.set(tabId, { signature, cachedAt: Date.now(), value });
-      // Missing roots can reappear while the picker was closed.
-      if (refreshWatchers) this.refreshWatchers(readContext);
-      return value;
-    };
-    return causal.hasWork() ? work() : causal.syncWork('catalog.listTab', { tabId }, work);
-  }
+  listTab(tabId, options = {}) { return this.preparation().list('tab', tabId, options); }
 
   setSources(projectId, roots) {
     const work = () => {
@@ -397,227 +368,34 @@ class ProjectPromptCatalogService {
     return causal.hasWork() ? work() : causal.syncWork('catalog.setSources', {}, work);
   }
 
-  listProject(projectId, { force = false, readContext } = {}) {
-    const work = () => {
-      const cached = this.cache.get(projectId);
-      if (!force && cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
-        causal.count('cacheHits');
-        return cached.value;
-      }
-      causal.count('cacheMisses');
-  
-      const project = this.db.getProjectById(projectId);
-      if (!project) {
-        const error = new Error('project_not_found');
-        error.code = 'project_not_found';
-        throw error;
-      }
-      const sources = this.getSources(projectId, readContext)
-        .sort((a, b) => naturalCompare(a.sourceName, b.sourceName));
-      const scannedSources = sources.map((source) => {
-        const layout = this.readLayout(source.rootPath);
-        return catalogSource({
-          projectId,
-          rootPath: source.rootPath,
-          sourceName: source.sourceName,
-          layout,
-          fsImpl: this.fs,
-        }, readContext);
-      });
-      const prompts = scannedSources.flatMap((source) => source.prompts);
-      const value = {
-        project: {
-          id: project.id,
-          name: project.name,
-          path: project.path,
-          icon: project.icon || null,
-        },
-        sources: scannedSources.map(({ prompts: sourcePrompts, ...source }) => ({
-          ...source,
-          promptCount: sourcePrompts.length,
-        })),
-        prompts,
-        updatedAt: Date.now(),
-      };
-      if (scannedSources.every(source => !partialUsageScans.has(source))) {
-        this.cache.set(projectId, { cachedAt: Date.now(), value });
-      }
-      return value;
-    };
-    return causal.hasWork() ? work() : causal.syncWork('catalog.listProject', {}, work);
-  }
+  listProject(projectId, options = {}) { return this.preparation().list('project', projectId, options); }
 
-  usageForRoot(rootPath) {
-    const work = () => {
-      // A usage request can include hundreds of open and archived tab bindings.
-      // Keep the exact per-tab checks/cache, but reuse identical synchronous reads
-      // inside this request. Nothing here survives into the next usage request.
-      const readContext = { directories: new Map(), scans: new Map(), canonicalPaths: new Map(), canonicalKnown: new Map(), projects: new Map(),
-        sourcesForTab: this.rootRegistry?.createSourcesReader?.() };
-      const canonical = value => canonicalPath(value, this.fs, readContext.canonicalPaths, readContext.canonicalKnown);
-      const canonicalRoot = canonical(rootPath);
-      // Root '/' needs the complete tree. For narrower existing roots, prune
-      // only proven-disjoint directories; every binding and watcher pass stays.
-      if (canonicalRoot !== path.parse(canonicalRoot).root
-        && readContext.canonicalKnown.get(resolvedSourcePath(rootPath)) === true) readContext.usageRoot = canonicalRoot;
-      const byPath = new Map();
-      if (this.rootRegistry) {
-        for (const scope of this.rootRegistry.listSourceScopes()) {
-          causal.count('scopes');
-          const catalog = this.listTab(scope.tabId, { refreshWatchers: false, readContext });
-          for (const prompt of catalog.prompts) {
-            if (!isInside(canonicalRoot, canonical(prompt.path))) continue;
-            const usage = byPath.get(prompt.path) || { projects: new Map(), tabs: new Map() };
-            usage.tabs.set(scope.tabId, { id: scope.tabId, name: scope.name || scope.tabId });
-            if (prompt.projectId && !readContext.projects.has(prompt.projectId)) {
-              readContext.projects.set(prompt.projectId, this.db.getProjectById(prompt.projectId));
-            }
-            const project = readContext.projects.get(prompt.projectId);
-            if (project) usage.projects.set(project.id, { id: project.id, name: project.name, icon: project.icon || null });
-            byPath.set(prompt.path, usage);
-          }
-        }
-        this.refreshWatchers(readContext);
-        return [...byPath.entries()].sort(([a], [b]) => naturalCompare(a, b))
-          .map(([filePath, usage]) => ({
-            path: filePath,
-            projects: [...usage.projects.values()].sort((a, b) => naturalCompare(a.name, b.name)),
-            tabs: [...usage.tabs.values()],
-          }));
-      }
-      for (const project of this.db.getProjectsWithPromptSources()) {
-        causal.count('scopes');
-        let catalog;
-        try { catalog = this.listProject(project.id, { readContext }); } catch { continue; }
-        for (const prompt of catalog.prompts) {
-          if (!isInside(canonicalRoot, canonical(prompt.path))) continue;
-          const existing = byPath.get(prompt.path) || [];
-          existing.push({
-            id: catalog.project.id,
-            name: catalog.project.name,
-            icon: catalog.project.icon || null,
-          });
-          byPath.set(prompt.path, existing);
-        }
-      }
-      return [...byPath.entries()]
-        .sort(([a], [b]) => naturalCompare(a, b))
-        .map(([filePath, projects]) => ({
-          path: filePath,
-          projects: projects.sort((a, b) => naturalCompare(a.name, b.name)),
-        }));
-    };
-    return causal.syncWork('catalog.usageForRoot', { fileIdentity: rootPath }, work);
-  }
+  usageForRoot(rootPath) { return this.preparation().usage(rootPath); }
 
   invalidate(projectIds = null, reason = 'filesystem') {
-    const work = () => {
-      const ids = projectIds ? [...new Set(projectIds.filter(Boolean))] : [...this.cache.keys()];
-      if (projectIds) ids.forEach((projectId) => this.cache.delete(projectId));
-      else this.cache.clear();
-      // Old callers invalidate after shared-layout/root edits. In registry mode
-      // resolve exact tab consumers instead of treating a namespace as a union.
-      const tabIds = this.rootRegistry ? this.rootRegistry.listSourceScopes()
-        .filter(scope => !projectIds || this.getTabSources(scope.tabId).some(source => ids.includes(source.projectId)))
-        .map(scope => scope.tabId) : [];
-      this.invalidateTabs(tabIds, reason, ids);
-    };
-    return causal.hasWork() ? work() : causal.syncWork('catalog.invalidate', {}, work);
+    this.preparation().invalidate(null, reason, projectIds || []);
   }
 
   invalidateTabs(tabIds = null, reason = 'filesystem', projectIds = []) {
-    const work = () => {
-      const ids = tabIds ? [...new Set(tabIds.filter(Boolean))] : [...this.tabCache.keys()];
-      if (tabIds) ids.forEach(tabId => this.tabCache.delete(tabId));
-      else this.tabCache.clear();
-      if (this.onChanged) {
-        causal.count('notifications');
-        try { this.onChanged({ projectIds, ...(this.rootRegistry ? { tabIds: ids } : {}), reason, at: Date.now() }); } catch {}
-      }
-    };
-    return causal.hasWork() ? work() : causal.syncWork('catalog.invalidateTabs', {}, work);
+    this.preparation().invalidate(tabIds, reason, projectIds);
   }
 
-  refreshWatchers(readContext) {
-    const work = () => {
-      if (!this.watchEnabled) return;
-      // Recheck filesystem state for this reconciliation, even after a catalog
-      // read. Share only compiled SQL with that read; roots/rows are never retained.
-      const watchContext = { directories: new Map(),
-        sourcesForTab: readContext?.sourcesForTab || this.rootRegistry?.createSourcesReader?.() };
-      const wanted = new Map();
-      const scopes = this.rootRegistry ? this.rootRegistry.listSourceScopes() : this.db.getProjectsWithPromptSources();
-      const add = (source, projectId = null, tabId = null) => {
-        const target = source.docsExists ? source.docsPath : (source.exists ? source.rootPath : null);
-        if (!target) return;
-        const ids = wanted.get(target) || { projectIds: new Set(), tabIds: new Set() };
-        if (projectId) ids.projectIds.add(projectId);
-        if (tabId) ids.tabIds.add(tabId);
-        wanted.set(target, ids);
-      };
-      for (const scope of scopes) {
-        causal.count('scopes');
-        for (const source of this.rootRegistry ? this.getTabSources(scope.tabId, watchContext) : this.getSources(scope.id, watchContext)) {
-          add(source, this.rootRegistry ? source.projectId : scope.id, scope.tabId);
-        }
-      }
-      if (this.rootRegistry) {
-        for (const source of this.describeSources(this.rootRegistry.read().roots.map(root => ({ ...root, rootPath: root.path })), watchContext)) {
-          add(source);
-        }
-      }
-  
-      for (const [target, entry] of this.watchers) {
-        if (wanted.has(target)) {
-          Object.assign(entry, wanted.get(target));
-          wanted.delete(target);
-          continue;
-        }
-        if (this.watchDebounce.has(target)) {
-          clearTimeout(this.watchDebounce.get(target));
-          this.watchDebounce.delete(target);
-        }
-        try { causal.count('watchersClosed'); entry.watcher.close(); } catch {}
-        this.watchers.delete(target);
-      }
-  
-      for (const [target, scopeIds] of wanted) {
-        try {
-          const entry = { watcher: null, ...scopeIds };
-          causal.count('watchersCreated');
-          entry.watcher = this.fs.watch(target, { recursive: true }, () => causal.syncWork('catalog.watchEvent', { fileIdentity: target }, () => {
-            causal.count('watchEvents');
-            if (this.watchers.get(target) !== entry) return;
-            if (this.watchDebounce.has(target)) clearTimeout(this.watchDebounce.get(target));
-            const timer = setTimeout(() => causal.syncWork('catalog.watchDebounce', { fileIdentity: target }, () => {
-              if (this.watchers.get(target) !== entry) return;
-              this.watchDebounce.delete(target);
-              for (const projectId of entry.projectIds) this.cache.delete(projectId);
-              this.invalidateTabs([...entry.tabIds], 'filesystem', [...entry.projectIds]);
-              this.refreshWatchers();
-            }, { root: true }), 180);
-            timer.unref?.();
-            this.watchDebounce.set(target, timer);
-          }, { root: true }));
-          this.watchers.set(target, entry);
-        } catch (error) {
-          console.warn('[ProjectPrompts] watcher failed path=' + target + ': ' + error.message);
-        }
-      }
-    };
-    return causal.syncWork('catalog.refreshWatchers', {}, work);
+  refreshWatchers(options) {
+    // Constructor, composition and committed mutation callers only schedule.
+    this.preparation().refreshWatchers(options);
   }
 
-  close() {
-    for (const timer of this.watchDebounce.values()) clearTimeout(timer);
-    this.watchDebounce.clear();
-    for (const entry of this.watchers.values()) {
-      try { entry.watcher.close(); } catch {}
+  onLayoutCommitted(rootPath) {
+    // Called AFTER the layout owner's ok:true commit. No FS/SQL traversal and
+    // no exception may rewrite that already committed CAS result.
+    try {
+      return this.preparation().onLayoutCommitted(resolvedSourcePath(rootPath));
+    } catch {
+      return { scheduled: false, state: 'unavailable' };
     }
-    this.watchers.clear();
-    this.cache.clear();
-    this.tabCache.clear();
   }
+
+  close() { this.prepared.close(); this.cache.clear(); this.tabCache.clear(); }
 
   readLayout(rootPath) {
     if (this.layoutStore) causal.count('layoutReads');

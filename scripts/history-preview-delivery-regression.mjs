@@ -13,11 +13,16 @@ import { build } from 'esbuild';
 import { _electron as electron } from 'playwright';
 import { runCanonicalPreviewCases } from './history-preview-canonical-cases.mjs';
 import { runHistoryMcpColorCases } from './history-mcp-color-cases.mjs';
+import { runCanonicalContinuationCase } from './history-preview-continuation-cases.mjs';
+import { historyVirtuosoMeasurementEsbuildPlugin } from './lib/history-virtuoso-measurement.mjs';
+import { patchStyleModSameRules } from './lib/style-mod-same-rules.mjs';
 
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const canonicalHandoff = process.argv.includes('--canonical-handoff');
 const mcpColors = process.argv.includes('--mcp-colors');
-const fixtureName = mcpColors ? 'history-mcp-colors' : canonicalHandoff ? 'history-preview-canonical' : 'history-preview-delivery';
+const canonicalContinuation = process.argv.includes('--canonical-continuation');
+const fixtureName = canonicalContinuation ? 'history-preview-continuation'
+  : mcpColors ? 'history-mcp-colors' : canonicalHandoff ? 'history-preview-canonical' : 'history-preview-delivery';
 const canonicalCase = process.argv.find(arg => arg.startsWith('--case='))?.slice(7) || 'hidden-rebind';
 const artifact = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-preview-delivery-'));
 const snapshot = path.join(artifact, 'source');
@@ -27,6 +32,25 @@ let app;
 let worktree = false;
 let staticServer;
 try {
+  if (canonicalContinuation) {
+    const eventsPath = process.argv.find(arg => arg.startsWith('--events='))?.slice(9);
+    assert(eventsPath, '--canonical-continuation requires actual Main-generated --events=<path>');
+    const events = JSON.parse(await fs.readFile(eventsPath, 'utf8'));
+    for (const [name, hash] of Object.entries(events.mainClosure || {})) {
+      assert.equal(createHash('sha256').update(await fs.readFile(path.join(repo, 'src/main', name))).digest('hex'), hash,
+        `actual Main DTO closure must match CURRENT ${name}`);
+    }
+    for (const [name, hash] of [['main.js', events.mainHash],
+      ['terminal-history-preview-controller.js', events.controllerHash], ['provider-semantic-shadow.js', events.providerHash]]) {
+      assert.equal(createHash('sha256').update(await fs.readFile(path.join(repo, 'src/main', name))).digest('hex'), hash,
+        `actual Main DTO inputs must match CURRENT ${name}`);
+    }
+    await fs.writeFile(path.join(artifact, 'events.json'), JSON.stringify(events));
+    result.mainInputs = { mainHash: events.mainHash, controllerHash: events.controllerHash, providerHash: events.providerHash,
+      source: eventsPath, textChars: events.text.length, sourceIdentity: events.identity,
+      closure: events.mainClosure,
+      runtimeBusy: events.runtime.find(entry => entry.kind === 'busy')?.busy };
+  }
   execFileSync('git', ['worktree', 'add', '--detach', snapshot, 'HEAD'], { cwd: repo, stdio: 'pipe' });
   worktree = true;
   for (const name of ['src', 'packages/claude-blocks']) {
@@ -54,9 +78,12 @@ try {
       '@noted/structured-dnd': path.join(shared, 'structured-dnd/src'),
       '@noted/file-explorer': path.join(shared, 'file-explorer/src'),
       react: path.join(repo, 'node_modules/react'), 'react-dom': path.join(repo, 'node_modules/react-dom') },
-    plugins: [{ name: 'electron-fixture', setup(b) { b.onResolve({ filter: /^electron$/ }, () => ({ path: 'electron', namespace: 'fixture' }));
+    plugins: [historyVirtuosoMeasurementEsbuildPlugin(), {
+      name: 'fixture-style-mod-same-rules', setup(b) { b.onLoad({ filter: /[\\/]style-mod[\\/]src[\\/]style-mod\.js$/ },
+        async ({ path: file }) => ({ contents: patchStyleModSameRules(await fs.readFile(file, 'utf8')), loader: 'js', resolveDir: path.dirname(file) })); },
+    }, { name: 'electron-fixture', setup(b) { b.onResolve({ filter: /^electron$/ }, () => ({ path: 'electron', namespace: 'fixture' }));
       b.onLoad({ filter: /.*/, namespace: 'fixture' }, () => ({ contents: 'export const ipcRenderer=window.require("electron").ipcRenderer;' })); } }],
-    loader: { '.ttf': 'file', '.woff2': 'file', '.svg': 'dataurl' } });
+    loader: { '.ttf': 'file', '.woff2': 'file', '.svg': 'dataurl', '.png': 'dataurl' } });
   const inputs = [];
   const snapshotRoot = await fs.realpath(snapshot);
   const sharedRoot = await fs.realpath(shared);
@@ -84,7 +111,7 @@ try {
   staticServer = createServer(async (req, res) => {
     const name = path.basename(new URL(req.url, 'http://127.0.0.1').pathname) || 'index.html';
     try { const body = await fs.readFile(path.join(artifact, name));
-      res.setHeader('Content-Type', name.endsWith('.js') ? 'application/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
+      res.setHeader('Content-Type', name.endsWith('.json') ? 'application/json' : name.endsWith('.js') ? 'application/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
       res.end(body);
     } catch { res.writeHead(404); res.end(); }
   });
@@ -100,7 +127,9 @@ try {
   page.on('console', m => logs.push(m.text()));
   await page.screenshot({ path: path.join(artifact, 'initial.png') });
   await page.waitForFunction(() => window.fixture?.ready && !!document.querySelector('[data-history-viewport-ready="1"]'));
-  if (mcpColors) {
+  if (canonicalContinuation) {
+    await runCanonicalContinuationCase(page, { artifact, result });
+  } else if (mcpColors) {
     await runHistoryMcpColorCases(page, app, { artifact, result });
   } else if (canonicalHandoff) {
     await runCanonicalPreviewCases(page, { artifact, result, logs, scenario: canonicalCase });

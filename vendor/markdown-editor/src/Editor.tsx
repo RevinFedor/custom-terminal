@@ -23,6 +23,8 @@ if (typeof localStorage !== 'undefined' && !localStorage.getItem('md-editor-fold
 }
 
 import { createDarkTheme } from './theme'
+import { terminalMessageReferences } from './plugins/terminalMessageReference'
+import { resolveClipboardAdapter } from './plugins/clipboardAdapter'
 import {
   collapsibleFoldService,
   collapsibleGutter,
@@ -180,6 +182,8 @@ export interface MarkdownEditorProps {
 
   /** Called when user Cmd+Clicks a URL. Opens in system browser. */
   onOpenUrl?: (url: string) => void
+  /** Explicit Cmd+click on an immutable Noted message snapshot. */
+  onMessageReferenceNavigate?: (snapshot: any) => void | Promise<unknown>
 
   /** Cmd+] toggle Outline-панели. Перехватывается ВНУТРИ редактора (Prec.highest),
       иначе defaultKeymap отрабатывает Mod-] как indentMore и сдвигает строку.
@@ -243,6 +247,7 @@ export function MarkdownEditor({
   onGenerateTitle,
   emojiShortcuts,
   onOpenUrl,
+  onMessageReferenceNavigate,
   onToggleOutline,
   domainIcons,
   resolveAnchorFile,
@@ -295,6 +300,8 @@ export function MarkdownEditor({
   const onGenerateTitleRef = useRef(onGenerateTitle)
   const emojiShortcutsRef = useRef(emojiShortcuts)
   const onOpenUrlRef = useRef(onOpenUrl)
+  const onMessageReferenceNavigateRef = useRef(onMessageReferenceNavigate)
+  onMessageReferenceNavigateRef.current = onMessageReferenceNavigate
   const onToggleOutlineRef = useRef(onToggleOutline)
   const initialScrollTopRef = useRef(initialScrollTop)
   const domainIconsRef = useRef(domainIcons ?? [])
@@ -629,6 +636,10 @@ export function MarkdownEditor({
         onGenerateTitle: (text) => onGenerateTitleRef.current ? onGenerateTitleRef.current(text) : Promise.resolve('paste text'),
         clipboard: clipboardRef.current ?? undefined
       }),
+      terminalMessageReferences(() => ({
+        clipboard: resolveClipboardAdapter(clipboardRef.current),
+        navigate: onMessageReferenceNavigateRef.current,
+      })),
       // Track cursor movement for AI Paste indicator
       aiPasteTrackerPlugin,
       // Tab/Shift+Tab with VS Code-style tab stop snapping

@@ -14,6 +14,7 @@ const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { compactSendReceiptPresentation } = require('./compact-send-settlement');
 const { imagePresentationFromReceipt } = require('./history-authoring-projection');
 const { isLocalSlashCommandPrompt } = require('./agent-history-send-receipt');
+const { runtimeSnapshotCompletionFixture } = require('./test-helpers/runtime-snapshot-completion');
 const web = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const ast = ts.createSourceFile('web-server.js', web, ts.ScriptTarget.Latest, true);
 const declaration = name => {
@@ -30,8 +31,8 @@ function exported(name) {
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-function harness(t, provider) {
-  const db = new Database(':memory:');
+function harness(t, provider, options = {}) {
+  const db = new Database(options.database || ':memory:');
   const store = createAgentSendReceiptStore(db);
   const writes = [], contexts = [];
   let targetSession = 'S';
@@ -100,6 +101,92 @@ function harness(t, provider) {
     setTarget: value => { targetSession = value; } };
 }
 
+for (const process of ['found', 'unknown']) test('snapshot completion: exact FIFO follower survives predecessor writer adoption during ' + process + ' lookup', async t => {
+  const h = harness(t, 'codex');
+  await h.send('head');
+  await h.send('follower');
+  await tick();
+  assert.equal(h.writes.length, 1);
+  const key = 'history:T:follower';
+  const original = h.queue.item(key);
+  const runtime = runtimeSnapshotCompletionFixture();
+  runtime.state.onLookup = ordinal => {
+    if (ordinal === 1) { runtime.adopt(); runtime.state.process = process; }
+    else runtime.cleanupLaunch();
+  };
+  h.context.readAgentRuntimeSnapshot = runtime.snapshot;
+  h.confirm('head');
+  await h.queue.result(key);
+  const record = h.store.get(key);
+  assert.ok(record.attemptId, JSON.stringify(record.receipt));
+  assert.notEqual(record.state, 'not-submitted');
+  assert.deepEqual(h.writes.map(write => write.handoffId), ['head', 'follower']);
+  assert.equal(h.queue.item(key).id, original.id);
+  assert.equal(h.queue.item(key).request_json, original.request_json);
+  assert.equal(runtime.state.lookups, 1);
+});
+
+for (const mode of ['native-v2-order', 'stop-during-reconcile', 'unconfirmed']) {
+  test('snapshot reconcile refresh: actual FIFO keeps the original follower and guards ' + mode, async t => {
+    const h = harness(t, 'codex');
+    await h.send('head'); await h.send('follower'); await tick();
+    const key = 'history:T:follower', original = h.queue.item(key);
+    assert.equal(h.store.get(key).attemptId, null);
+    const runtime = runtimeSnapshotCompletionFixture(); runtime.state.busy = true;
+    runtime.context.getCodexRuntimeSessionSnapshot = async () => {
+      if (mode !== 'unconfirmed') runtime.adopt();
+      if (mode === 'stop-during-reconcile') runtime.state.stop++;
+      return { sessionStatus: 'busy', liveLifecycle: true, inputReady: true,
+        sessionId: null, savedSessionId: 'S', writerConfirmed: false };
+    };
+    runtime.state.onLookup = ordinal => {
+      if (mode === 'native-v2-order' && ordinal === 2) runtime.cleanupLaunch();
+      if (mode === 'stop-during-reconcile') runtime.state.writer = null;
+    };
+    h.context.readAgentRuntimeSnapshot = runtime.snapshot;
+    if (mode === 'unconfirmed') h.context.bridgeRequest = async (_action, payload) => {
+      // Queue admission may retain a provisional target. The unchanged
+      // physical boundary still checks the original SID, not the relaxed hint.
+      const failure = require('./agent-send-target-precondition').agentSendTargetPreconditionFailure(
+        payload.expectedTarget, runtime.context.readAgentSendDestinationAtWriteBoundary('T', 'codex'));
+      assert.equal(failure?.code, 'agent_send_target_changed');
+      return failure;
+    };
+    h.confirm('head'); await h.queue.result(key);
+    const record = h.store.get(key);
+    assert.equal(h.queue.item(key).id, original.id);
+    assert.equal(h.queue.item(key).request_json, original.request_json);
+    if (mode === 'native-v2-order') {
+      assert.ok(record.attemptId, JSON.stringify(record.receipt));
+      assert.deepEqual(h.writes.map(write => write.handoffId), ['head', 'follower']);
+      assert.equal(runtime.state.lookups, 1);
+      assert.equal(h.confirm('follower').promoted, true);
+      assert.equal(h.store.get(key).state, 'confirmed');
+    } else {
+      assert.equal(record.state, 'not-submitted');
+      if (mode === 'unconfirmed') assert.ok(record.attemptId, 'original expectation is rechecked at the physical boundary');
+      else assert.equal(record.attemptId, null);
+      assert.deepEqual(h.writes.map(write => write.handoffId), ['head']);
+    }
+  });
+}
+
+test('snapshot completion: fresh foreign binding refuses the original FIFO follower before beginAttempt', async t => {
+  const h = harness(t, 'codex');
+  await h.send('head'); await h.send('follower'); await tick();
+  const runtime = runtimeSnapshotCompletionFixture();
+  runtime.state.onLookup = ordinal => {
+    if (ordinal === 1) { runtime.state.sessionId = 'FOREIGN'; runtime.state.owner++; runtime.adopt(); }
+  };
+  h.context.readAgentRuntimeSnapshot = runtime.snapshot;
+  h.confirm('head');
+  await h.queue.result('history:T:follower');
+  const record = h.store.get('history:T:follower');
+  assert.equal(record.state, 'not-submitted');
+  assert.equal(record.attemptId, null);
+  assert.deepEqual(h.writes.map(write => write.handoffId), ['head']);
+});
+
 function completionHarness(t, { legacy = false } = {}) {
   const h = harness(t, 'codex');
   const run = { runId: 'completion-test', sourceTabId: 'T', targetTabId: 'other', status: 'completed',
@@ -147,6 +234,275 @@ function completionHarness(t, { legacy = false } = {}) {
   return { ...h, run, content, prefix, reAdmissions: () => reAdmissions };
 }
 
+async function tabMessageQueueHarness(t, options = {}) {
+  const h = harness(t, 'codex', options);
+  const { TabMessageService, formatTabMessagePrompt } = require('./tab-messages');
+  let status = 'inactive';
+  const parties = new Map(['A', 'T'].map(tabId => [tabId, { tabId, tabName: tabId,
+    projectId: 'P', provider: 'codex', sessionId: tabId === 'T' ? 'S' : 'source',
+    cwd: '/fixture' }]));
+  const service = new TabMessageService({ db: h.store.db, resolveTab: async id => parties.get(id),
+    send: message => h.context.sendTabMessage(message),
+    getReceipt: key => h.queue.projectRecord(h.store.get(key)), receiptRequiredBeforeSend: true });
+  Object.assign(h.context, { getTabMessageService: () => service, formatTabMessagePrompt,
+    resolveAgentSessionInfo: async () => ({ status }) });
+  vm.runInContext(declaration('sendTabMessage'), h.context);
+  h.queue.publish = record => service.observeReceipt(record.operationKey, record, 'send-queue-control');
+  await service.initialize();
+  t.after(() => service.dispose());
+  const drained = async () => { while (service.lanes.size) await Promise.all([...service.lanes.values()]); };
+  return { ...h, service, parties, drained, setStatus: value => { status = value; },
+    question: () => service.sendMessage({ source: 'A', target: 'T', text: 'same frozen question', requestId: 'one-question' }),
+  };
+}
+
+test('HH367: accepted tab message stays waiting in actual application FIFO without a false failed/retry state', async t => {
+  const h = await tabMessageQueueHarness(t);
+  h.queue.ready = () => false;
+  const q = (await h.question()).message;
+  await tick(); await tick();
+  const current = h.service.getMessage(q.messageId).message;
+  assert.equal(current.deliveryState, 'pending');
+  assert.equal(current.code, null);
+  assert.equal(h.writes.length, 0);
+  const row = h.store.db.prepare('SELECT retryAllowed,attemptCount FROM tab_messages WHERE messageId=?').get(q.messageId);
+  assert.equal(row.retryAllowed, 0);
+  assert.equal(row.attemptCount, 1);
+  h.queue.ready = () => true; h.queue.wake('T'); await h.drained();
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.service.getMessage(q.messageId).message.deliveryState, 'queued');
+});
+
+test('HH367: known no-input message recovery reuses frozen request across inactive to busy, with one actual Enter', async t => {
+  const h = await tabMessageQueueHarness(t);
+  let attempts = 0;
+  h.context.bridgeRequest = async (action, payload) => {
+    if (++attempts === 1) return { success: false, submitted: false, pasteWritten: false,
+      enterWritten: false, code: 'agent_send_target_unresolved', status: 'not-submitted' };
+    return h.physicalBridge(action, payload);
+  };
+  const q = (await h.question()).message; await h.drained();
+  const first = h.store.get(q.operationKey);
+  const original = h.queue.item(q.operationKey);
+  assert.equal(first.state, 'not-submitted');
+  assert.equal(h.writes.length, 0);
+  h.setStatus('busy');
+  await h.service.wake('T', 'input-ready'); await h.drained();
+  const recovered = h.service.getMessage(q.messageId).message;
+  assert.equal(recovered.deliveryState, 'queued', recovered.code);
+  assert.equal(attempts, 2);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.queue.item(q.operationKey).id, original.id);
+  assert.equal(h.queue.item(q.operationKey).request_json, original.request_json);
+  assert.notEqual(h.store.get(q.operationKey).attemptId, first.attemptId);
+  for (let i = 0; i < 3; i++) await h.service.wake('T', 'runtime');
+  assert.equal(h.writes.length, 1, 'native queued input is never repeated');
+});
+
+test('no-input recovery joins behind an existing FIFO owner and keeps its original question bytes', async t => {
+  const h = await tabMessageQueueHarness(t);
+  let refuse = true;
+  h.context.bridgeRequest = async (action, payload) => {
+    if (payload.sendOperationKey.startsWith('tab-message:') && refuse) {
+      refuse = false;
+      return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+        code: 'agent_send_target_unresolved', status: 'not-submitted' };
+    }
+    return h.physicalBridge(action, payload);
+  };
+  const q = (await h.question()).message; await h.drained();
+  const original = h.queue.item(q.operationKey);
+  assert.equal(h.store.get(q.operationKey).state, 'not-submitted');
+  await h.send('other');
+  await h.queue.result('history:T:other');
+  assert.equal(h.writes.length, 1);
+  h.setStatus('busy');
+  const recovery = h.service.wake('T', 'input-ready');
+  await tick(); await tick();
+  assert.equal(h.queue.item(q.operationKey).state, 'waiting');
+  assert.ok(h.queue.item(q.operationKey).queue_position > h.queue.item('history:T:other').id);
+  assert.equal(h.writes.length, 1);
+  h.confirm('other'); await recovery; await h.drained();
+  assert.equal(h.writes.length, 2);
+  assert.equal(h.writes[1].handoffId, q.handoffId);
+  assert.equal(h.queue.item(q.operationKey).request_json, original.request_json);
+});
+
+test('ordinary same-ID replay of failed input does not rearm without the message owner recovery request', async t => {
+  const h = await tabMessageQueueHarness(t);
+  h.context.bridgeRequest = async () => ({ success: false, submitted: false, pasteWritten: false,
+    enterWritten: false, code: 'agent_send_target_unresolved', status: 'not-submitted' });
+  const q = (await h.question()).message; await h.drained();
+  const original = h.store.get(q.operationKey);
+  const frozen = JSON.parse(h.queue.item(q.operationKey).request_json);
+  const replay = await h.context.runAgentSendScenario(frozen);
+  assert.equal(replay.submitted, false);
+  assert.equal(h.queue.item(q.operationKey).state, 'failed');
+  assert.equal(h.store.get(q.operationKey).attemptId, original.attemptId);
+  const changed = await h.context.runAgentSendScenario({ ...frozen, prompt: frozen.prompt + ' changed',
+    retryNoInputAttemptId: original.attemptId });
+  assert.equal(changed.code, 'agent_send_handoff_conflict');
+  assert.equal(h.queue.item(q.operationKey).state, 'failed');
+});
+
+test('stale retry attempt cannot rearm a newer no-input outcome', async t => {
+  const h = await tabMessageQueueHarness(t);
+  const failure = { success: false, submitted: false, pasteWritten: false,
+    enterWritten: false, code: 'agent_send_target_unresolved', status: 'not-submitted' };
+  h.context.bridgeRequest = async () => failure;
+  const q = (await h.question()).message; await h.drained();
+  const original = h.store.get(q.operationKey);
+  const replacement = h.store.beginAttempt(original);
+  h.store.settleAttempt(q.operationKey, replacement.attemptId, failure);
+  const frozen = JSON.parse(h.queue.item(q.operationKey).request_json);
+  await h.context.runAgentSendScenario({ ...frozen, retryNoInputAttemptId: original.attemptId });
+  assert.equal(h.queue.item(q.operationKey).state, 'failed');
+  assert.equal(h.store.get(q.operationKey).attemptId, replacement.attemptId);
+  assert.equal(h.writes.length, 0);
+});
+
+test('a pre-Enter failure that already pasted input is not an automatic message retry grant', async t => {
+  const h = await tabMessageQueueHarness(t);
+  let calls = 0;
+  h.context.bridgeRequest = async () => { calls++; return { success: false, submitted: false,
+    pasteWritten: true, enterWritten: false, code: 'input_draft_conflict', status: 'not-submitted' }; };
+  const q = (await h.question()).message; await h.drained();
+  const original = h.store.get(q.operationKey);
+  await h.service.wake('T', 'runtime');
+  assert.equal(calls, 1);
+  assert.equal(h.store.get(q.operationKey).attemptId, original.attemptId);
+});
+
+test('Stop cancels a requeued no-input message before it gets a new attempt', async t => {
+  const h = await tabMessageQueueHarness(t);
+  let calls = 0;
+  h.context.bridgeRequest = async () => { calls++; return { success: false, submitted: false,
+    pasteWritten: false, enterWritten: false, code: 'agent_send_target_unresolved', status: 'not-submitted' }; };
+  const q = (await h.question()).message; await h.drained();
+  const original = h.store.get(q.operationKey);
+  h.queue.ready = () => false;
+  const recovery = h.service.wake('T', 'input-ready'); await tick(); await tick();
+  assert.equal(h.queue.item(q.operationKey).state, 'waiting');
+  const cancelled = h.queue.cancelWaiting('T', q.handoffId);
+  assert.equal(cancelled.cancelled, true, JSON.stringify(cancelled));
+  await recovery;
+  h.queue.ready = () => true; h.queue.wake('T'); await tick();
+  await h.service.wake('T', 'runtime');
+  assert.equal(calls, 1);
+  assert.equal(h.store.get(q.operationKey).attemptId, original.attemptId);
+  assert.equal(h.queue.item(q.operationKey).state, 'cancelled');
+});
+
+test('a no-input recovery requested before the old bridge finally waits, then runs once without another wake', async t => {
+  const h = await tabMessageQueueHarness(t);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  let calls = 0;
+  const failure = { success: false, submitted: false, pasteWritten: false,
+    enterWritten: false, code: 'agent_send_target_unresolved', status: 'not-submitted' };
+  h.context.bridgeRequest = async (action, payload) => {
+    if (++calls === 1) {
+      h.store.settleAttempt(payload.sendOperationKey, payload.sendAttemptId, failure);
+      await gate;
+      return failure;
+    }
+    return h.physicalBridge(action, payload);
+  };
+  const q = (await h.question()).message; await h.drained();
+  assert.equal(h.queue.running.has('T'), true);
+  const recovery = h.service.wake('T', 'input-ready'); await tick(); await tick();
+  assert.equal(h.queue.item(q.operationKey).state, 'waiting');
+  assert.equal(h.writes.length, 0);
+  release(); await recovery; await h.drained();
+  assert.equal(calls, 2);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.service.getMessage(q.messageId).message.deliveryState, 'queued');
+});
+
+test('reopened SQLite retains authorized no-input retry without renewing the payload or sending twice', async t => {
+  const h = await tabMessageQueueHarness(t);
+  h.context.bridgeRequest = async () => ({ success: false, submitted: false, pasteWritten: false,
+    enterWritten: false, code: 'agent_send_target_unresolved', status: 'not-submitted' });
+  const q = (await h.question()).message; await h.drained();
+  h.queue.ready = () => false;
+  const recovery = h.service.wake('T', 'input-ready'); await tick(); await tick();
+  const frozen = h.queue.item(q.operationKey).request_json;
+  const database = h.store.db.serialize();
+  h.service.dispose(); h.queue.dispose(); await recovery;
+  const next = await tabMessageQueueHarness(t, { database });
+  assert.equal(next.writes.length, 0);
+  next.queue.resume(); await tick(); await tick(); await next.drained();
+  assert.equal(next.writes.length, 1);
+  assert.equal(next.queue.item(q.operationKey).request_json, frozen);
+  assert.equal(next.service.getMessage(q.messageId).message.deliveryState, 'queued');
+  await next.service.wake('T'); assert.equal(next.writes.length, 1);
+});
+
+for (const outcome of ['unknown', 'provider-rejection']) test('message recovery never resubmits ' + outcome, async t => {
+  const h = await tabMessageQueueHarness(t);
+  let calls = 0;
+  h.context.bridgeRequest = async (_action, payload) => {
+    calls++;
+    h.store.markAttemptState(payload.sendOperationKey, payload.sendAttemptId, 'enter-armed');
+    return outcome === 'unknown' ? { success: null, submitted: null, deliveryUnknown: true, status: 'delivery-unknown' }
+      : { success: false, submitted: true, status: 'provider-not-accepted', providerAccepted: false, enterWritten: true };
+  };
+  const q = (await h.question()).message; await h.drained();
+  const before = h.store.get(q.operationKey);
+  h.setStatus('busy');
+  for (let i = 0; i < 3; i++) await h.service.wake('T', 'runtime');
+  assert.equal(calls, 1);
+  assert.equal(h.store.get(q.operationKey).attemptId, before.attemptId);
+});
+
+test('HH367 combined message/FIFO/actual Main discovery and process cleanup sends once then publishes exact receipt', async t => {
+  const h = await tabMessageQueueHarness(t);
+  const fixtureSource = fs.readFileSync(path.join(__dirname, 'codex-submission-observation.integration.test.js'), 'utf8');
+  const fixtureAst = ts.createSourceFile('fixture.js', fixtureSource, ts.ScriptTarget.Latest, true);
+  const mainSource = fs.readFileSync(process.env.CODEX_OBSERVATION_MAIN_SOURCE || path.join(__dirname, 'main.js'), 'utf8');
+  const mainAst = ts.createSourceFile('main.js', mainSource, ts.ScriptTarget.Latest, true);
+  const names = ['harness', 'completedDiscoveryDuringSubmit', 'completedDiscoveryWithActualProcessRead'];
+  const fixtureCode = names.map(name => fixtureAst.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name).getText(fixtureAst)).join('\n');
+  const writer = vm.runInNewContext(fixtureCode
+    + '\ncompletedDiscoveryWithActualProcessRead(undefined, undefined, {tabId:"T",sessionId:"S"})', {
+    vm, ts, require, assert, ast: mainAst, quiet: { log() {}, warn() {}, error() {} }, setImmediate,
+  });
+  const input = [];
+  writer.term.write = bytes => input.push(bytes);
+  let bridgeCalls = 0;
+  h.context.bridgeRequest = async (action, payload) => {
+    bridgeCalls++;
+    const observed = await writer.observe('send-target-revalidation');
+    if (!observed.available) return { success: false, submitted: false, pasteWritten: false,
+      enterWritten: false, code: 'agent_send_target_unresolved', status: 'not-submitted' };
+    assert.equal(observed.sessionId, payload.expectedTarget.sessionId);
+    h.store.markAttemptState(payload.sendOperationKey, payload.sendAttemptId, 'enter-armed');
+    writer.term.write(payload.prompt); writer.term.write('\r');
+    h.store.settleAttempt(payload.sendOperationKey, payload.sendAttemptId,
+      { success: true, submitted: true, status: 'audit-pending', auditPending: true });
+    h.store.markProviderQueueAccepted(payload.sendOperationKey, payload.sendAttemptId,
+      { provider: 'codex', sessionId: 'S', sourceIdentity: 'codex-tui-queue:' + payload.handoffId });
+    return { success: true, accepted: true, submitted: true, status: 'queued',
+      queued: true, providerQueueAccepted: true, auditPending: true };
+  };
+  h.queue.ready = () => false;
+  const q = (await h.question()).message; await tick(); await tick();
+  assert.equal(h.service.getMessage(q.messageId).message.deliveryState, 'pending');
+  h.setStatus('busy'); h.queue.ready = () => true; h.queue.wake('T'); await h.drained();
+  assert.equal(h.service.getMessage(q.messageId).message.deliveryState, 'queued');
+  assert.equal(bridgeCalls, 1); assert.equal(writer.reads(), 2);
+  assert.deepEqual(input, [JSON.parse(h.queue.item(q.operationKey).request_json).prompt, '\r']);
+  const record = h.store.get(q.operationKey);
+  h.store.promoteFromAudit({ success: true, operationKey: q.operationKey, attemptId: record.attemptId,
+    provider: 'codex', sessionId: 'S', promptHash: record.promptHash, actualHash: record.promptHash,
+    expectedHash: record.promptHash, entryUuid: 'canonical-exact-user', sourceIdentity: 'codex-exact-user',
+    auditTimestamp: new Date().toISOString() });
+  assert.equal(h.service.getMessage(q.messageId).message.deliveryState, 'sent');
+  for (let i = 0; i < 3; i++) await h.service.wake('T', 'runtime');
+  assert.equal(bridgeCalls, 1); assert.equal(input.length, 2);
+});
+
 function manualRunAfterHarness(t) {
   const h = harness(t, 'codex');
   const source = fs.readFileSync(path.join(__dirname, '../renderer/utils/agentScenarios.ts'), 'utf8');
@@ -189,6 +545,8 @@ test('RunAfter explicit send-now survives actual renderer admission, durable FIF
   assert.equal(result.submitted, true);
   assert.equal(h.writes.length, 1);
   assert.equal(h.writes[0].promptQueueAction, 'send-now');
+  assert.deepEqual(structuredClone(h.writes[0].preflightScope), h.store.get('history:T:manual-now').receipt.preflightScope);
+  assert.ok(h.writes[0].preflightScope.id, 'Main scope survives actual App bridge and scenario re-entry');
   const frozen = JSON.parse(h.queue.item('history:T:manual-now').request_json);
   assert.equal(frozen.promptQueueAction, 'send-now');
   assert.equal(frozen.source, 'prompt-queue');
@@ -238,12 +596,19 @@ function automaticWaitHarness(t, { legacy = false } = {}) {
     && node.expression.arguments?.[0]?.text === 'codex:send-command');
   assert.ok(handler);
   const ipc = new Map();
-  vm.runInNewContext(handler.getText(tree), {
+  const frameFixture = require('./fixtures/codex-draft-request-observation.cjs');
+  const ownerSource = ['captureAgentInputIdentity', 'agentSendExecutionFailure']
+    .map(frameFixture.actualFunction).join('\n');
+  vm.runInNewContext(frameFixture.startupFrameDeclarations() + '\n' + ownerSource + '\n' + handler.getText(tree), {
     ipcMain: { handle: (key, fn) => ipc.set(key, fn) }, path, srcMainDir: __dirname,
     require: () => ({ certifyAutomaticReadinessWait: (...args) => h.queue.certifyAutomaticReadinessWait(...args),
       readAutomaticSendAdmission: async () => ready }),
     console: { log() {}, warn() {}, error() {} }, nodePerformance: { now: () => Date.now() },
     terminals: new Map([['T', {}]]), terminalCommandState: new Map(),
+    codexLastRunCommandPayload: new Map(), aiStoppingTabs: new Map(),
+    getHeadlessTerminalMirror: () => null, getTerminalInputRevision: () => 0,
+    getTerminalLifecycleGeneration: () => 'automatic-fixture', getTerminalStopRevision: () => 0,
+    CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000,
     isPromptQueueAutomationSource: require('./prompt-queue-source').isPromptQueueAutomationSource,
     isCodexOperationalInputReady: () => true,
     // This fixture owns the automatic busy gate; the native-question editor
@@ -534,4 +899,170 @@ test('actual SSE queue publisher is an exact compact wake, not a repeated prompt
   assert.equal(events[0].payload.receipt.handoffId, 'large');
   assert.ok(JSON.stringify(events[0]).length < 1000);
   assert.equal(JSON.stringify(events[0]).includes('private context'), false);
+});
+
+async function coldLaunchRefusal(payload, mutate = () => {}) {
+  const { runAgentSendFlow } = await import('../renderer/utils/agentSendFlow.mjs');
+  const refusal = { success: false, accepted: false, launchWritten: false,
+    protocolVersion: 1, launchStage: 'no-launch', launchAttempt: 1,
+    launchIntent: { intentId: 'launch:fixture:1', token: 1, tabId: payload.tabId, toolType: 'codex' },
+    code: 'agent_send_target_changed', reason: 'process_lookup_unknown',
+    sendReceipt: { success: null, accepted: null, submitted: null, deliveryUnknown: true,
+      status: 'delivery-unknown', code: 'agent_send_target_changed',
+      operationKey: payload.sendOperationKey, attemptId: payload.sendAttemptId } };
+  mutate(refusal);
+  try {
+    await runAgentSendFlow({ preflightScope: payload.preflightScope,
+      prepareContext: async () => ({}),
+      ensureReady: async () => { throw Object.assign(new Error('launch refused'), refusal); },
+      proveComposer: () => assert.fail('refused launch must not reach composer'),
+      runProviderOperation: () => assert.fail('refused launch must not reach provider') });
+  } catch (error) { return error.sendReceipt; }
+  assert.fail('launch refusal expected');
+}
+
+test('perf51: exact cold no-launch refusal settles this Send and releases only its existing FIFO follower', async t => {
+  const h = harness(t, 'codex');
+  let release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const held = new Promise(resolve => { release = resolve; });
+  let bridgeCalls = 0;
+  h.context.bridgeRequest = async (action, payload) => {
+    bridgeCalls++;
+    if (payload.handoffId !== 'cold') return h.physicalBridge(action, payload);
+    entered(); await held;
+    return coldLaunchRefusal(payload);
+  };
+  await h.send('cold'); await started; await h.send('follower');
+  const first = h.store.get('history:T:cold');
+  assert.equal(h.queue.item('history:T:follower').state, 'waiting');
+  release(); await h.queue.result(first.operationKey); await tick();
+  const record = h.store.get(first.operationKey);
+  assert.equal(record.state, 'not-submitted');
+  assert.equal(record.attemptId, first.attemptId);
+  assert.equal(record.receipt.submitted, false);
+  assert.equal(record.receipt.pasteWritten, false);
+  assert.equal(record.receipt.enterWritten, false);
+  assert.equal(record.receipt.preflightRefusal.phase, 'ensuring-ready');
+  assert.equal(JSON.parse(h.queue.item(first.operationKey).request_json).prompt, 'test cold');
+  assert.deepEqual(h.writes.map(x => x.handoffId), ['follower']);
+  assert.equal(bridgeCalls, 2, 'one refusal and one already-admitted follower, no retry');
+});
+
+for (const mode of ['lost-launch-ack', 'wrong-attempt', 'wrong-invocation', 'enter-armed', 'cancelled-follower']) {
+  test('cold preflight does not invent negative delivery or revive input: ' + mode, async t => {
+    const h = harness(t, 'codex');
+    let release, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const held = new Promise(resolve => { release = resolve; });
+    h.context.bridgeRequest = async (action, payload) => {
+      if (payload.handoffId !== 'cold') return h.physicalBridge(action, payload);
+      entered(); await held;
+      if (mode === 'enter-armed') h.store.markAttemptState(payload.sendOperationKey, payload.sendAttemptId, 'enter-armed');
+      const result = await coldLaunchRefusal(payload, refusal => {
+        if (mode === 'lost-launch-ack') Object.assign(refusal, { launchWritten: null, accepted: null, launchOutcomeUnknown: true });
+        if (mode === 'wrong-attempt') refusal.sendReceipt.attemptId = 'foreign-attempt';
+      });
+      if (mode === 'wrong-invocation' && result.preflightRefusal) result.preflightRefusal.scope.id = 'foreign-invocation';
+      return result;
+    };
+    await h.send('cold'); await started; await h.send('follower');
+    if (mode === 'cancelled-follower') h.queue.cancelWaiting('T', 'follower');
+    release(); await h.queue.result('history:T:cold'); await tick();
+    assert.equal(h.store.get('history:T:cold').state, mode === 'cancelled-follower' ? 'not-submitted' : 'delivery-unknown');
+    assert.equal(h.writes.length, 0);
+  });
+}
+
+test('post-begin context exception is recorded on the original attempt without invoking renderer', async t => {
+  const h = harness(t, 'codex');
+  h.store.stageAttemptContext = () => { throw Object.assign(new Error('controlled stage failure'), { code: 'stage-test-failed' }); };
+  await h.send('stage-error'); await h.queue.result('history:T:stage-error');
+  const r = h.store.get('history:T:stage-error');
+  assert.equal(r.state, 'not-submitted'); assert.equal(r.receipt.code, 'stage-test-failed');
+  assert.ok(r.attemptId); assert.equal(h.writes.length, 0);
+});
+
+test('bridge payload evaluation failure is not a dispatched timeout', async t => {
+  const h = harness(t, 'codex');
+  h.context.withPromptOriginPresentation = () => { throw Object.assign(new Error('controlled payload failure'), { code: 'payload-test-failed' }); };
+  await h.send('payload-error'); await h.queue.result('history:T:payload-error');
+  const r = h.store.get('history:T:payload-error');
+  assert.equal(r.state, 'not-submitted'); assert.equal(r.receipt.code, 'payload-test-failed');
+  assert.equal(h.writes.length, 0);
+});
+
+test('lost bridge ACK accepts a late exact preflight proof without replaying the original Send', async t => {
+  const h = harness(t, 'codex'); let late, captured; let calls = 0;
+  h.context.bridgeRequest = async (_action, payload, _timeout, options) => {
+    calls++; captured = payload; late = options.onLateReply;
+    throw Object.assign(new Error('controlled lost bridge ACK'), { code: 'bridge_timeout' });
+  };
+  await h.send('late'); await h.queue.result('history:T:late');
+  const before = h.store.get('history:T:late');
+  assert.equal(before.state, 'in-flight');
+  await h.send('late'); assert.equal(calls, 1);
+  await late({ ok: true, data: await coldLaunchRefusal(captured) });
+  const after = h.store.get(before.operationKey);
+  assert.equal(after.state, 'not-submitted'); assert.equal(after.attemptId, before.attemptId);
+  assert.equal(calls, 1);
+});
+
+test('actual registry/store/FIFO keep an armed head after a weak late refusal, until exact audit', async t => {
+  const h = harness(t, 'codex'); let late, calls = 0;
+  h.context.bridgeRequest = async (_action, payload, _timeout, options) => {
+    calls++;
+    if (calls > 1) return h.physicalBridge('sendAgentPromptScenario', payload);
+    late = options.onLateReply;
+    h.store.markAttemptState(payload.sendOperationKey, payload.sendAttemptId, 'enter-armed');
+    throw Object.assign(new Error('controlled lost ACK after durable arm'), { code: 'bridge_timeout' });
+  };
+  await h.send('armed'); await h.queue.result('history:T:armed');
+  const head = h.store.get('history:T:armed');
+  assert.equal(head.state, 'enter-armed');
+  await h.send('follower');
+  await late({ ok: true, data: { success: false, submitted: false, pasteWritten: false,
+    enterWritten: false, status: 'not-submitted', deliveryUnknown: false, auditPending: false } });
+  for (let i = 0; i < 3; i++) { h.queue.notifyRuntime('T'); await tick(); }
+  assert.equal(h.store.get(head.operationKey).state, 'enter-armed');
+  assert.equal(h.store.get(head.operationKey).attemptId, head.attemptId);
+  assert.equal(calls, 1, 'a weak callback and ready wakes cannot release the physical head');
+  assert.equal(h.store.get('history:T:follower').attemptId, null);
+  assert.equal(h.confirm('armed').promoted, true);
+  await tick(); await tick();
+  assert.equal(calls, 2, 'exact canonical proof releases the existing follower once');
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].handoffId, 'follower');
+});
+
+test('late canonical input proof outranks a preflight callback for the same attempt', async t => {
+  const h = harness(t, 'codex'); let late, captured;
+  h.context.bridgeRequest = async (_action, payload, _timeout, options) => {
+    captured = payload; late = options.onLateReply;
+    h.store.markAttemptState(payload.sendOperationKey, payload.sendAttemptId, 'enter-armed');
+    throw Object.assign(new Error('controlled lost ACK'), { code: 'bridge_timeout' });
+  };
+  await h.send('canonical'); await h.queue.result('history:T:canonical');
+  const before = h.store.get('history:T:canonical');
+  h.confirm('canonical');
+  assert.equal(h.store.get(before.operationKey).state, 'confirmed');
+  await late({ ok: true, data: await coldLaunchRefusal(captured) });
+  assert.equal(h.store.get(before.operationKey).state, 'confirmed');
+  assert.equal(h.store.get(before.operationKey).attemptId, before.attemptId);
+});
+
+test('a stale preflight callback cannot settle a replacement attempt (ABA)', async t => {
+  const h = harness(t, 'codex'); let late, captured;
+  h.context.bridgeRequest = async (_action, payload, _timeout, options) => {
+    captured = payload; late = options.onLateReply;
+    throw Object.assign(new Error('controlled lost ACK'), { code: 'bridge_timeout' });
+  };
+  await h.send('aba'); await h.queue.result('history:T:aba');
+  const before = h.store.get('history:T:aba');
+  h.store.settleAttempt(before.operationKey, before.attemptId, { submitted: false, status: 'not-submitted' });
+  const next = h.store.beginAttempt(before);
+  assert.equal(next.action, 'attempt-started'); assert.notEqual(next.attemptId, before.attemptId);
+  await late({ ok: true, data: await coldLaunchRefusal(captured) });
+  assert.equal(h.store.get(before.operationKey).state, 'in-flight');
+  assert.equal(h.store.get(before.operationKey).attemptId, next.attemptId);
 });

@@ -18,11 +18,12 @@ export function runAfterTargetInventory(workspace, projects, ownerTabId) {
   }));
 }
 
-export function automationInventory(workspace, metadata) {
+export function automationInventory(workspace, metadata, tabIds = null) {
   const projects = [...workspace.openProjects].map(([id, value]) => ({ id,
     name: metadata[id]?.name || value.projectPath?.split('/').filter(Boolean).pop() || id,
     icon: metadata[id]?.icon || null, tabs: [...value.tabs.values()]
-      .filter(tab => tab.tabType !== 'claude-sdk' && resolvePtyAgentOwner(tab)) }));
+      .filter(tab => (!tabIds || tabIds.has(tab.id))
+        && tab.tabType !== 'claude-sdk' && resolvePtyAgentOwner(tab)) }));
   const tabs = projects.flatMap(project => project.tabs.map(tab => {
     const provider = resolvePtyAgentOwner(tab);
     return { id: tab.id, name: tab.name, provider,

@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
 import { transformSync } from 'esbuild';
+import { createAgentLaunchAdmission } from './agentLaunchAdmission.mjs';
+import { createLaunchFixture } from './agentLaunchFixture.mjs';
 const require = createRequire(import.meta.url);
 const target = require('../../shared/agent-send-target-precondition.cjs');
 const source = fs.readFileSync(new URL('./agentSendPreparation.ts', import.meta.url), 'utf8');
@@ -15,7 +17,9 @@ const compiled = transformSync(source.slice(start, end).replace(/^export /, ''),
 test('real send readiness deadline yields exact before-paste failure, not delivery-unknown or a resend', async () => {
   let now = 100;
   let waits = 0, cleanup = 0;
+  const { ipcRenderer } = createLaunchFixture();
   const context = vm.createContext({
+    ipcRenderer, AbortController, createAgentLaunchAdmission,
     ...target, Date: { now: () => now }, console: { log() {}, warn() {} },
     manualActionContract: require('../../shared/agent-manual-action.cjs'),
     isCoordinatedAgentSendCancellationRequested: () => false,

@@ -36,15 +36,18 @@ export function applyAgentLaunchPreparationSnapshot(previous, info, snapshot, no
 
   if (snapshot.cleared === true) {
     if (!sameTarget || previousToken === null) return previous;
-    return token !== null && previousToken !== token ? previous : null;
+    return token !== null && token < previousToken ? previous : null;
   }
 
   // A late completion for an older launch must not replace a newer local
   // preparation. Main also rejects stale tokens; this is the renderer's second
   // identity boundary for delayed IPC delivery.
-  if (sameTarget && previousToken !== null && token !== null && previousToken !== token) {
-    if (snapshot.preparing !== true) return previous;
+  if (sameTarget && previousToken !== null && token !== null && token < previousToken) {
+    return previous;
   }
+  if (sameToken && snapshot.preparing === true
+    && (previous.launchPreparationStatus === 'accepted'
+      || previous.launchPreparationStatus === 'rejected')) return previous;
 
   const base = {
     tabId: info.tabId,

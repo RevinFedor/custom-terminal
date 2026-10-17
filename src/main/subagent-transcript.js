@@ -40,7 +40,9 @@ const {
 const MAX_STEP_CHARS = 600;
 const MAX_STEPS_RETURNED = 400;
 const SUBAGENT_READ_CHUNK_BYTES = 4 * 1024 * 1024;
-const { codexOwnTurnLaunchSettings, claudeOwnAssistantLaunchSettings } = require('./subagent-launch-settings');
+const { codexOwnTurnLaunchSettings, codexOwnLaunchServiceTier,
+  claudeOwnAssistantLaunchSettings } = require('./subagent-launch-settings');
+const MAX_LAUNCH_SETTINGS_RECORD_BYTES = 64 * 1024;
 
 function createSubagentStepProjectionState(options = {}) {
   const expectedCodexSessionId = String(options.codexSessionId || '');
@@ -70,6 +72,9 @@ function createSubagentStepProjectionState(options = {}) {
     pendingLineStartOffset: 0,
     prefaceSteps: Array.isArray(options.prefaceSteps) ? [...options.prefaceSteps] : [],
     launchSettings: null,
+    launchServiceTier: options.launchServiceTier || null,
+    codexLaunchServiceTierSealed: boundarySeen || !!options.launchServiceTier,
+    sourceStat: null,
   };
 }
 
@@ -96,6 +101,9 @@ function resetSubagentStepProjectionState(state) {
   state.pendingLineStartOffset = 0;
   state.prefaceSteps = [];
   state.launchSettings = null;
+  state.launchServiceTier = null;
+  state.codexLaunchServiceTierSealed = false;
+  state.sourceStat = null;
   return state;
 }
 
@@ -139,7 +147,7 @@ function codexRecordShapeFromPrefix(buffer) {
   };
 }
 
-function shouldSkipCodexBoundaryLinePrefix(buffer) {
+function shouldSkipCodexBoundaryLinePrefix(buffer, lineBytes = 0) {
   const shape = codexRecordShapeFromPrefix(buffer);
   if (!shape.recordType) return false;
   if (shape.recordType === 'compacted') return true;
@@ -151,6 +159,9 @@ function shouldSkipCodexBoundaryLinePrefix(buffer) {
   }
   if (shape.recordType === 'event_msg') {
     if (!shape.payloadType) return false;
+    if (shape.payloadType === 'thread_settings_applied') {
+      return lineBytes > MAX_LAUNCH_SETTINGS_RECORD_BYTES;
+    }
     return shape.payloadType !== 'agent_message' && shape.payloadType !== 'user_message';
   }
   return shape.recordType !== 'session_meta';
@@ -579,7 +590,12 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
     return { found: false, requiresBoundary: false, offset: 0, sessionId: '', agentPath: '' };
   }
   let statSize = 0;
-  try { statSize = fs.statSync(filePath).size; } catch {}
+  let sourceStat = null;
+  try {
+    const stat = fs.statSync(filePath);
+    statSize = stat.size;
+    sourceStat = { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+  } catch {}
   const resumeOffset = resume && Number(resume.resumeOffset) >= 0
     && Number(resume.resumeOffset) <= statSize
     ? Number(resume.resumeOffset)
@@ -589,6 +605,8 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
   let agentPath = String((rootMetaSeen && resume?.agentPath) || '');
   let requiresBoundary = rootMetaSeen && resume?.requiresBoundary === true;
   let bootstrapInstruction = rootMetaSeen ? (resume?.bootstrapInstruction || null) : null;
+  let launchServiceTier = rootMetaSeen ? (resume?.launchServiceTier || null) : null;
+  let launchServiceTierBlocked = rootMetaSeen && resume?.launchServiceTierBlocked === true;
   let sourceLine = rootMetaSeen ? Math.max(0, Number(resume?.sourceLine) || 0) : 0;
   let pendingParts = [];
   let pendingBytes = 0;
@@ -609,6 +627,9 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
     rootMetaSeen,
     sourceLine,
     bootstrapInstruction,
+    launchServiceTier,
+    launchServiceTierBlocked,
+    sourceStat,
   });
 
   const inspectLine = (lineBuffer, byteOffset, hasNewline, lineNumber) => {
@@ -631,6 +652,13 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
         }
       }
       return null;
+    }
+    if (!launchServiceTier && !launchServiceTierBlocked
+      && lineBuffer.length <= MAX_LAUNCH_SETTINGS_RECORD_BYTES
+      && codexRecordShapeFromPrefix(lineBuffer).payloadType === 'thread_settings_applied') {
+      let record = null;
+      try { record = JSON.parse(lineBuffer.toString('utf8')); } catch { /* metadata stays unknown */ }
+      launchServiceTier = codexOwnLaunchServiceTier(record, expectedSessionId, sessionId);
     }
     if (requiresBoundary && lineBuffer.includes(instructionsMarker)) {
       let contextRecord = null;
@@ -685,7 +713,10 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
       const lineStart = hasPendingLine ? pendingStart : chunkStart + cursor;
       if (!hasPendingLine) pendingPrefix = Buffer.alloc(0);
       pendingPrefix = appendBoundedPrefix(pendingPrefix, segment);
-      if (rootMetaSeen && shouldSkipCodexBoundaryLinePrefix(pendingPrefix)) {
+      if (rootMetaSeen && shouldSkipCodexBoundaryLinePrefix(pendingPrefix, pendingBytes + segment.length)) {
+        if (!launchServiceTier && codexRecordShapeFromPrefix(pendingPrefix).payloadType === 'thread_settings_applied') {
+          launchServiceTierBlocked = true;
+        }
         pendingSkip = true;
         pendingParts = [];
       }
@@ -726,7 +757,10 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
       }
       const tail = Buffer.from(chunk.subarray(cursor));
       pendingPrefix = appendBoundedPrefix(pendingPrefix, tail);
-      if (rootMetaSeen && shouldSkipCodexBoundaryLinePrefix(pendingPrefix)) {
+      if (rootMetaSeen && shouldSkipCodexBoundaryLinePrefix(pendingPrefix, pendingBytes + tail.length)) {
+        if (!launchServiceTier && codexRecordShapeFromPrefix(pendingPrefix).payloadType === 'thread_settings_applied') {
+          launchServiceTierBlocked = true;
+        }
         pendingSkip = true;
         pendingParts = [];
       }
@@ -919,6 +953,17 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
     return [];
   }
 
+  // Read the first exact child-owned settings snapshot even when it precedes
+  // NEW_TASK. Never let a later Resume/settings change masquerade as launch.
+  if (state.codexRootMetaSeen && !state.codexLaunchServiceTierSealed) {
+    const proof = codexOwnLaunchServiceTier(record,
+      state.codexExpectedSessionId, state.codexSessionId);
+    if (proof) {
+      state.launchServiceTier = proof;
+      state.codexLaunchServiceTierSealed = true;
+    }
+  }
+
   // Collaboration v2 forks the whole parent transcript into the child file.
   // The first byte is therefore NOT the beginning of the child's work. The
   // exact boundary is a parent→child NEW_TASK envelope addressed to the
@@ -941,6 +986,7 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
       && !state.codexNewTaskBoundarySeen
       && isExactCodexNewTaskBoundary(payload, state)) {
       state.codexNewTaskBoundarySeen = true;
+      state.codexLaunchServiceTierSealed = true;
       state.codexAwaitingFirstVisibleOutput = true;
       state.codexBootstrapInstructionSeen = false;
       state.codexCurrentCanonicalUserText = '';
@@ -973,6 +1019,11 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
 
   if (state.codexNeedsNewTaskBoundary && !state.codexNewTaskBoundarySeen) {
     return [];
+  }
+  if (!state.codexLaunchServiceTierSealed && (record?.type === 'turn_context' || record?.type === 'response_item'
+    || (record?.type === 'event_msg'
+      && ['task_started', 'task_complete', 'user_message', 'agent_message'].includes(type)))) {
+    state.codexLaunchServiceTierSealed = true;
   }
   if (!state.launchSettings) state.launchSettings = codexOwnTurnLaunchSettings(record,
     state.codexExpectedSessionId, state.codexSessionId);
@@ -1144,17 +1195,24 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
   return [];
 }
 
-function prepareAgentStepReadState({ projectionState, sessionId, offset, size }) {
+function prepareAgentStepReadState({ projectionState, sessionId, offset, size, sourceStat }) {
   const start = Math.max(0, Number(offset) || 0);
   const state = projectionState || createSubagentStepProjectionState({ codexSessionId: sessionId });
   if (!state.codexExpectedSessionId && sessionId) {
     state.codexExpectedSessionId = String(sessionId);
     state.codexSessionId = String(sessionId);
   }
-  if (start === 0) resetSubagentStepProjectionState(state);
+  const previous = state.sourceStat;
+  const sourceChanged = !!previous && !!sourceStat
+    && (previous.dev !== sourceStat.dev || previous.ino !== sourceStat.ino
+      || sourceStat.size < previous.size
+      || (sourceStat.size === previous.size && sourceStat.mtimeMs !== previous.mtimeMs));
+  if (start === 0 || sourceChanged) resetSubagentStepProjectionState(state);
   // File replaced/truncated (rare, but a stale offset would emit garbage).
-  const from = start > size ? 0 : start;
+  const from = sourceChanged || start > size ? 0 : start;
   if (from === 0 && start !== 0) resetSubagentStepProjectionState(state);
+  state.sourceStat = sourceStat ? { dev: sourceStat.dev, ino: sourceStat.ino,
+    size: sourceStat.size, mtimeMs: sourceStat.mtimeMs } : null;
   return { start, state, from, reset: from === 0 && start !== 0 };
 }
 
@@ -1178,6 +1236,7 @@ function consumeAgentStepChunk({
       pending: false,
       reset,
       launchSettings: state.launchSettings,
+      launchServiceTier: state.launchServiceTier,
     };
   }
   let cursor = 0;
@@ -1274,6 +1333,7 @@ function consumeAgentStepChunk({
     pending: nextOffset < size,
     reset,
     launchSettings: state.launchSettings,
+    launchServiceTier: state.launchServiceTier,
   };
 }
 
@@ -1297,7 +1357,7 @@ function readAgentSteps({
   try { stat = fs.statSync(filePath); } catch (error) {
     return { success: false, error: String(error.message || error), steps: [], offset: 0, size: 0 };
   }
-  const prepared = prepareAgentStepReadState({ projectionState, sessionId, offset, size: stat.size });
+  const prepared = prepareAgentStepReadState({ projectionState, sessionId, offset, size: stat.size, sourceStat: stat });
   if (prepared.from >= stat.size) {
     return consumeAgentStepChunk({
       toolType, state: prepared.state, from: prepared.from, chunk: Buffer.alloc(0),
@@ -1337,7 +1397,7 @@ async function readAgentStepsAsync({
   try { stat = await fs.promises.stat(filePath); } catch (error) {
     return { success: false, error: String(error.message || error), steps: [], offset: 0, size: 0 };
   }
-  const prepared = prepareAgentStepReadState({ projectionState, sessionId, offset, size: stat.size });
+  const prepared = prepareAgentStepReadState({ projectionState, sessionId, offset, size: stat.size, sourceStat: stat });
   if (prepared.from >= stat.size) {
     return consumeAgentStepChunk({
       toolType, state: prepared.state, from: prepared.from, chunk: Buffer.alloc(0),

@@ -44,6 +44,8 @@ export interface SendAgentPromptScenarioArgs {
   handoffId?: string;
   sendAttemptId?: string | null;
   sendOperationKey?: string | null;
+  preflightScope?: { version: 1; id: string; tabId: string; provider: string;
+    operationKey: string; attemptId: string; handoffId: string } | null;
   source?: string;
   promptQueueAction?: 'send-now';
   promptQueueIntent?: Record<string, unknown>;
@@ -113,6 +115,7 @@ interface AgentSendFlowContext {
 }
 
 interface AgentSendReadyContext {
+  codexStartupFrameWaitId?: string | null;
   status: Extract<AgentPtyStatus, 'active' | 'busy'>;
   submitCapability: 'direct' | 'queue';
   runtimeSnapshot: unknown;
@@ -120,6 +123,7 @@ interface AgentSendReadyContext {
 }
 
 interface AgentSendComposerContext {
+  codexStartupFrameWaitId?: string | null;
   complete: false;
   exactEmptyEvidence?: Record<string, unknown> | null;
   refreshExactEmptyEvidence?: () => Promise<any>;
@@ -142,6 +146,7 @@ async function runAgentPromptScenario({
   handoffId,
   sendAttemptId,
   sendOperationKey,
+  preflightScope,
   source,
   promptQueueAction,
   statusAtSend,
@@ -197,6 +202,7 @@ async function runAgentPromptScenario({
     };
   }
   return runAgentSendFlow({
+    preflightScope,
     prepareContext: async () => {
       const prepared = await adapter.prepareRecordContext({
         enabled: recordWithoutReply === true,
@@ -250,6 +256,7 @@ async function runAgentPromptScenario({
         submitCapability: readyForSend.submitCapability,
         runtimeSnapshot: readyForSend?.presence?.runtimeSnapshot || null,
         expectedTarget: readyForSend.expectedTarget,
+        codexStartupFrameWaitId: readyForSend.codexStartupFrameWaitId,
       };
     },
     recoverReadyFailure: async (error: any, context: AgentSendFlowContext) => {
@@ -291,6 +298,8 @@ async function runAgentPromptScenario({
         source,
         returnDraftOnConflict,
         initialExactEmptyEvidence: initialComposerProof,
+        codexStartupFrameWaitId: ready.codexStartupFrameWaitId,
+        handoffId, sendAttemptId,
       });
       if (composer.complete === true) {
         return {

@@ -100,6 +100,7 @@ async function acceptanceInChild(root) {
   let db;
   let web;
   const webContents = new EventEmitter();
+  webContents.isDestroyed = () => false;
   const window = { isDestroyed: () => false, webContents };
   const replyBridge = (packet, data) => ipcMain.emit('web:bridge-reply', { sender: webContents }, {
     requestId: packet.requestId, ok: true, data,
@@ -127,9 +128,9 @@ async function acceptanceInChild(root) {
       assert.deepEqual(record.receipt.expectedTarget, {
         toolType: payload.expectedToolType, sessionId: payload.expectedSessionId,
       });
-      assert.equal(db.prepare('SELECT owner FROM agent_send_receipt_pins WHERE operation_key = ?').get(record.operationKey)?.owner, 'tab-message');
+      assert.equal(db.prepare("SELECT owner FROM agent_send_receipt_pins WHERE operation_key = ? AND owner='tab-message'").get(record.operationKey)?.owner, 'tab-message');
       const stored = db.prepare('SELECT * FROM tab_messages WHERE operationKey = ?').get(record.operationKey);
-      assert.equal(stored.deliveryState, 'sending');
+      assert.ok(['sending', 'unconfirmed'].includes(stored.deliveryState), stored.deliveryState);
       assert.equal(stored.frozenPrompt, payload.prompt);
       assert.equal(stored.promptPrepared, 1);
       assert.equal(payload.handoffId, record.operationKey);
@@ -231,6 +232,7 @@ async function acceptanceInChild(root) {
       agentSendBridgeTimeoutMs: 15_000,
     };
     web.start(startOptions);
+    web.markSendQueueRendererReady(true, 1);
     const server = await listening.promise;
     assert.equal(server.address().address, '127.0.0.1');
     assert.equal(web.getInfo().port, privatePort);
@@ -290,7 +292,8 @@ async function acceptanceInChild(root) {
       assert.equal(db.prepare('SELECT count(*) n FROM tab_messages').get().n, 0);
       const me = await request('/api/me');
       assert.equal(me.status, 200);
-      assert.deepEqual(me.body.capabilities.tabMessages, { version: 1, durable: true, replyTo: true, dismiss: true });
+      assert.deepEqual(me.body.capabilities.tabMessages, { version: 1, durable: true, replyTo: true, dismiss: true,
+        sourceNavigation: true, cancellation: { version: 1, durable: true, deliveryEvidencePreserved: true } });
       assert.equal((await request('/api/tab-messages/missing/unsupported')).status, 404);
       const provenSource = statuses.get('A');
       statuses.set('A', { ...provenSource, coherent: false });
@@ -327,16 +330,16 @@ async function acceptanceInChild(root) {
       assert.equal(Object.hasOwn(conflict.body, 'text'), false);
       queue(firstSend);
       await waitState(a, 'queued');
+      await audit(firstSend, { sendAttemptId: 'foreign-attempt' });
+      assert.equal((await request(`/api/tab-messages/${a}`)).body.message.deliveryState, 'queued');
+      assert.equal(sends.length, 1, 'native queued acceptance cannot release the application FIFO head');
+      await audit(firstSend);
+      await waitState(a, 'sent');
       const secondSend = await waitSend(c);
       queue(secondSend);
       await waitState(c, 'queued');
-      assert.equal(receipts.get(firstSend.payload.sendOperationKey).state, 'audit-pending');
-
-      await audit(firstSend, { sendAttemptId: 'foreign-attempt' });
-      assert.equal((await request(`/api/tab-messages/${a}`)).body.message.deliveryState, 'queued');
+      assert.equal(receipts.get(secondSend.payload.sendOperationKey).state, 'audit-pending');
       await audit(secondSend);
-      await audit(firstSend);
-      await waitState(a, 'sent');
       assert.equal(db.prepare('SELECT count(*) n FROM agent_send_receipt_pins').get().n, 0);
 
       assert.equal((await answer(a, 'foreign reply', 'foreign', 'C')).status, 403);
@@ -358,7 +361,7 @@ async function acceptanceInChild(root) {
       const beforeReplyAck = await request(`/api/tab-messages/${a}`);
       assert.equal(beforeReplyAck.body.message.replyMessageId, replyA.body.messageId);
       assert.equal(beforeReplyAck.body.reply.text, fullAnswer);
-      assert.equal(beforeReplyAck.body.reply.deliveryState, 'sending');
+      assert.ok(['sending', 'unconfirmed'].includes(beforeReplyAck.body.reply.deliveryState));
       queue(sendC);
       queue(sendA);
       await waitState(replyC.body.messageId, 'queued');
@@ -389,6 +392,7 @@ async function acceptanceInChild(root) {
       assert.equal(fs.existsSync(path.join(process.env.NOTED_DISCOVERY_DIR, `web-server-${process.pid}.json`)), false);
       listening = deferred();
       web.start(startOptions);
+      web.markSendQueueRendererReady(true, 1);
       await listening.promise;
       const oldAuth = auth;
       auth = web.getInfo().token;

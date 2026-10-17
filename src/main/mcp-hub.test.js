@@ -23,7 +23,8 @@ rl.on('line', (line) => {
   const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
   if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'stub', version: '1' } });
   else if (m.method === 'tools/list') reply({ tools: [{ name: 'echo', description: '', inputSchema: { type: 'object' } }] });
-  else if (m.method === 'tools/call') reply({ content: [{ type: 'text', text: JSON.stringify({ meta: m.params._meta || null, args: m.params.arguments }) }] });
+  else if (m.method === 'tools/call') reply({ content: [{ type: 'text', text: JSON.stringify({ meta: m.params._meta || null, args: m.params.arguments,
+    inheritedRoute: process.env.NOTED_MCP_INSTANCE_ROUTE !== undefined, inheritedDiscovery: process.env.NOTED_DISCOVERY_DIR !== undefined }) }] });
   else if (m.method === 'noise') { process.stdout.write('diagnostic that is not JSON\\n'); reply({ ok: true }); }
   else if (m.method === 'boom') process.exit(7);
   else if (m.id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'nope' } }) + '\\n');
@@ -178,6 +179,24 @@ test('hub: bearer identity parsed, non-pipe token ignored', async () => {
   } finally {
     await hub.stop();
   }
+});
+
+test('hub: opaque app instance route survives bearer/query transport, never shared child env', async () => {
+  const hub = new McpHub({ port: 0, log() {}, env: { ...process.env,
+    NOTED_MCP_INSTANCE_ROUTE: 'must-not-inherit', NOTED_DISCOVERY_DIR: '/private/not-shared' }, serverDefs: stubDefs() });
+  await hub.start({ eager: false });
+  try {
+    for (const query of [false, true]) {
+      const route = Buffer.from(JSON.stringify({ version: 1, discoveryDir: '/private/fixture', instanceId: 'boot' })).toString('base64url');
+      const result = await post(hub.actualPort, '/mcp/stub' + (query ? '?tab=T&mainPid=123&instanceRoute=' + route : ''),
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'echo', arguments: {}, _meta: { noted: { instanceRoute: 'forged' } } } },
+        query ? {} : { authorization: 'Bearer T|P|/fixture|123|' + route });
+      const echoed = JSON.parse(result.body.result.content[0].text);
+      assert.equal(echoed.meta.noted.instanceRoute, route);
+      assert.equal(echoed.inheritedRoute, false);
+      assert.equal(echoed.inheritedDiscovery, false);
+    }
+  } finally { await hub.stop(); }
 });
 
 test('hub: non-JSON child stdout does not poison later replies', async () => {

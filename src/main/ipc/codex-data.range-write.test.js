@@ -189,6 +189,8 @@ test('delete child preserves retained compact image bytes instead of persisting 
   });
   assert.equal(result.success, true);
   const childRaw = await fs.promises.readFile(result.filePath, 'utf8');
+  assert.equal(_api.getCodexRewriteReceipt(result.newSessionId, sessionId).sourceProof[0].hash,
+    crypto.createHash('sha256').update(childRaw).digest('hex'), 'prepared byte proof includes streamed image bytes');
   assert.equal(childRaw.includes('[image omitted]'), false);
   assert.equal(childRaw.includes(dataUrl), true);
   const childRows = childRaw.trim().split('\n').map(JSON.parse);
@@ -198,8 +200,11 @@ test('delete child preserves retained compact image bytes instead of persisting 
   const preparedChild = await _api.loadSessionRecords(result.newSessionId, '/tmp/range-write');
   await fs.promises.unlink(filePath);
   const secondPath = path.join(testHome, 'second-image-copy.jsonl');
-  await _api.writeCodexJsonlExclusive(secondPath, preparedChild.records);
-  assert.equal((await fs.promises.readFile(secondPath, 'utf8')).includes(dataUrl), true);
+  const written = await _api.writeCodexJsonlExclusive(secondPath, preparedChild.records);
+  const second = await fs.promises.readFile(secondPath);
+  assert.equal(second.toString().includes(dataUrl), true);
+  assert.equal(written.sourceProof[0].bytes, second.length);
+  assert.equal(written.sourceProof[0].hash, crypto.createHash('sha256').update(second).digest('hex'));
 });
 
 test('owner-matched renderer proof safely seeds a legacy source without turn_context', async () => {

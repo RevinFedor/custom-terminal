@@ -2,13 +2,14 @@
 
 ## 1. Разработка (Dev)
 - `npm run dev` — запуск приложения с hot-reload.
-- `npm run dev:css` — watch-режим для Tailwind.
-- `npm run rebuild` — пересборка `node-pty` (выполнять при ошибках модуля).
+- Tailwind обрабатывается Vite-плагином; отдельного `dev:css` в текущем package.json нет.
+- `npm run _rebuild` — текущий pinned `node-pty` build/verification path; обычный generic rebuild не заменяет его packaging proof.
 - **После `npm install <native-module>`** — `npx electron-rebuild -f -w <module> --only <module>`. Без `--only` падает на других native-deps (`better-sqlite3` не собирается на Xcode 26 из-за `libexpat`), целевой модуль рядом не пересоберётся. См. [`fix-electron-native-rebuild-trap.md`](fix-electron-native-rebuild-trap.md) — там же про restore `.node` из `/Applications/Noted Terminal.app` когда rebuild не вариант.
 
 ## 2. Сборка (Build)
 - `npm run build` — сборка через electron-builder.
-- `npm run dist` — упаковка в `.dmg` или `.app` для macOS.
+- Текущий target — directory `.app`; отдельного `dist` script/готового DMG pipeline здесь нет.
+- Публичный source checkout имеет собственные переносимые build/setup-команды. Не применять его `build:app` как описание private certificate-backed install: [граница публикации](fact-public-source-publication.md).
 
 ## 3. Пути данных
 - **DB:** `~/Library/Application Support/noted-terminal/noted-terminal.db`

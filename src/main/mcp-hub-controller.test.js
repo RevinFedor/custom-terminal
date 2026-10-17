@@ -28,6 +28,8 @@ function fixture(port) {
   const children = [];
   const make = overrides => createMcpHubController({ port, script, log() {}, executable: process.execPath,
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+    readConfiguration: () => ({ serverDefs: { stub: {} }, status: { entries: [], needsReview: false, error: null },
+      fingerprint: 'synthetic-stub', canLaunch: true }),
     spawnImpl(...args) { const proc = spawn(...args); children.push(proc); return proc; }, ...overrides });
   return { make, children, async close() {
     for (const proc of children) {
@@ -80,6 +82,8 @@ test('controller: legacy 0/6 ENOENT is repaired on ensure and old port closes be
 
 test('controller: isolated E2E cannot spawn or replace the shared hub', async () => {
   const controller = createMcpHubController({ port: await freePort(), canSpawn: false,
+    readConfiguration: () => ({ serverDefs: {}, status: { entries: [], error: null, needsReview: false },
+      fingerprint: 'synthetic-observer', canLaunch: true }),
     spawnImpl() { assert.fail('E2E must not spawn'); } });
   assert.equal(await controller.ensure(), null);
   assert.equal((await controller.restart()).ok, false);

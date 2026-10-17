@@ -76,6 +76,7 @@ function fixture(t, { disk = false } = {}) {
 
 async function httpReceipt(store) {
   const context = vm.createContext({ agentSendReceiptStore: store, agentSendReceiptStartupReady: Promise.resolve(),
+    require, path, srcMainDir: __dirname,
     compactSendReceiptPresentation,
     AGENT_SEND_RECEIPT_STATES: receiptApi.RECEIPT_STATES,
     isAgentSendProviderQueueAccepted: () => false,

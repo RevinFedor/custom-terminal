@@ -12,8 +12,8 @@ function errorPayload(error) {
 function register({ service }) {
   if (!service) throw new Error('project-prompts IPC requires service');
 
-  ipcMain.handle('project-prompts:list-tab', (_event, tabId) => {
-    try { return { success: true, data: service.listTab(tabId) }; }
+  ipcMain.handle('project-prompts:list-tab', async (_event, tabId) => {
+    try { return { success: true, data: await service.listTab(tabId) }; }
     catch (error) { return errorPayload(error); }
   });
 
@@ -44,17 +44,17 @@ function register({ service }) {
     }
   });
 
-  ipcMain.handle('project-prompts:list', (_event, projectId) => {
+  ipcMain.handle('project-prompts:list', async (_event, projectId) => {
     try {
-      return { success: true, data: service.listProject(projectId) };
+      return { success: true, data: await service.listProject(projectId) };
     } catch (error) {
       return errorPayload(error);
     }
   });
 
-  ipcMain.handle('project-prompts:usage-for-root', (_event, rootPath) => {
+  ipcMain.handle('project-prompts:usage-for-root', async (_event, rootPath) => {
     try {
-      return { success: true, data: service.usageForRoot(rootPath) };
+      return { success: true, data: await service.usageForRoot(rootPath) };
     } catch (error) {
       return errorPayload(error);
     }

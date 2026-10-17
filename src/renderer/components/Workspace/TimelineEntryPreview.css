@@ -31,6 +31,12 @@
 .timeline-preview-contents { position: relative; min-width: 0; overflow-wrap: anywhere; }
 .timeline-preview-prompt-collapsed { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #e5e5e5; }
 .timeline-preview-research-collapsed { white-space: pre-wrap; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+/* A compact summary keeps its existing one-line cap, with formatted text. */
+.timeline-preview-markdown-line .cb-prose-preview,
+.timeline-preview-markdown-line .cb-prose-preview :is(p, h1, h2, h3, h4, h5, h6, ul, ol, li, blockquote, pre, table, thead, tbody, tr, th, td) {
+  display: inline; margin: 0; padding: 0; border: 0; white-space: nowrap;
+}
+.timeline-preview-markdown-line .cb-prose-preview :is(p, h1, h2, h3, h4, h5, h6, li, blockquote, pre, tr)::after { content: ' '; }
 .timeline-preview-prompt-collapsed[role=button]:hover { color: #fff; }
 .timeline-entry-preview--loop .timeline-preview-prompt-collapsed,
 .timeline-entry-preview--continue .timeline-preview-prompt-collapsed,

@@ -141,3 +141,50 @@ test('late response cannot replace a newer source window; missing receipt stays 
   assert.equal(invalid.publish, null);
   invalid.unregister();
 });
+
+test('late publish cannot overwrite a newer child window/revision', async () => {
+  const f = await prepare();
+  try {
+    api.historySnapshotCache.set(f.to, { entries: [{ ...next(), content: 'new child work' }], revision: 'newer-child' });
+    const newer = api.historySnapshotCache.peek(f.to);
+    assert.equal(f.publish(), false);
+    assert.equal(api.historySnapshotCache.peek(f.to), newer);
+  } finally { f.unregister(); }
+});
+
+test('child update during awaited History read rejects obsolete preparation before remap', async () => {
+  const tabId = 'rewrite-await-' + Math.random();
+  const from = { tabId, toolType: 'codex', sessionId: 'parent', cwd: '/fixture' };
+  const to = { ...from, sessionId: 'child' };
+  api.historySnapshotCache.set(from, { entries: [old()], revision: { token: 'source' } });
+  let resolve;
+  const response = new Promise(r => { resolve = r; });
+  const prepared = api.prepareHistoryRewriteSnapshot({ ...to, sourceSessionId: 'parent', invoke: () => response });
+  api.historySnapshotCache.set(to, { entries: [{ ...next(), content: 'new window' }], revision: 'new-child' });
+  const newer = api.historySnapshotCache.peek(to);
+  resolve({ success: true, entries: [next()], revision: { sessionId: 'child', cwd: '/fixture', token: 'old-response' }, rewriteReceipt: receipt });
+  assert.equal(await prepared, null);
+  assert.equal(api.historySnapshotCache.peek(to), newer);
+});
+
+test('reading-anchor callback cannot replace a child cache between the guard and publication', async () => {
+  const tabId = 'rewrite-callback-' + Math.random();
+  const from = { tabId, toolType: 'codex', sessionId: 'parent', cwd: '/fixture' };
+  const to = { ...from, sessionId: 'child' };
+  api.historySnapshotCache.set(from, { entries: [old()], revision: { token: 'source' } });
+  let captures = 0, newer;
+  const unregister = api.registerHistoryRewriteCapture(api.makeHistorySnapshotKey(from), () => {
+    if (++captures === 2) {
+      api.historySnapshotCache.set(to, { entries: [{ ...next(), content: 'newer child from callback' }], revision: 'callback-child' });
+      newer = api.historySnapshotCache.peek(to);
+    }
+    return { listKey: 'list', geometryTick: 1, painted: false, anchor: null };
+  });
+  try {
+    const publish = await api.prepareHistoryRewriteSnapshot({ ...to, sourceSessionId: 'parent', invoke: async () => ({
+      success: true, entries: [next()], revision: { sessionId: 'child', cwd: '/fixture', token: 'obsolete' }, rewriteReceipt: receipt,
+    }) });
+    assert.equal(publish(), false);
+    assert.equal(api.historySnapshotCache.peek(to), newer);
+  } finally { unregister(); }
+});

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { FolderOpen, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import {promptSourceSearchPath} from '../Workspace/promptTabSourcesModel.mjs';
 
 type Revision = string | number;
 type Root = { id: string; path: string; name?: string; icon?: string; enabled?: boolean; kind?: string; revision: Revision; [key: string]: unknown };
@@ -103,7 +104,9 @@ export default function DirectoryRootsSettings({compact=false}:{compact?:boolean
     if (lock.current) return;
     lock.current = true; setBusy(true);
     try {
-      const result = await ipc().invoke('app:select-directory');
+      const result = await (compact
+        ? ipc().invoke('app:select-directory',{buttonLabel:'Выбрать корень'})
+        : ipc().invoke('app:select-directory'));
       const path = typeof result === 'string' ? result : result?.path;
       if (mounted.current && path) setDraft(current => current ? { ...current, path } : current);
     } catch (failure) { if (mounted.current) setError(errorText(failure)); }
@@ -129,6 +132,7 @@ export default function DirectoryRootsSettings({compact=false}:{compact?:boolean
         <button style={{ ...control, textAlign: 'left', flex: 1, minWidth: 0 }} disabled={!editable} onClick={() => { setRemoving(null); setDraft({ id: root.id, path: root.path, name: root.name || '', enabled: root.enabled !== false }); }}>
           <span style={{ display: 'block', overflowWrap: 'anywhere' }}>{root.name || root.path}</span>
           {root.name && <span style={{ display: 'block', color: '#888', overflowWrap: 'anywhere' }}>{root.path}</span>}
+          {compact && <span data-prompt-source-search-path style={{display:'block',color:'#aaa',overflowWrap:'anywhere'}}>Search: {promptSourceSearchPath(root)}</span>}
           {(root.missing === true || root.exists === false) && <span style={{ display: 'block', color: '#d4a34a' }}>Директория недоступна</span>}
           {root.enabled === false && <span style={{ display: 'block', color: '#888' }}>Отключена</span>}
         </button>
@@ -139,6 +143,7 @@ export default function DirectoryRootsSettings({compact=false}:{compact?:boolean
     {draft && <form onSubmit={event => { event.preventDefault(); save(); }} style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 12 }}>
       <label style={{ color: '#aaa', fontSize: 12 }}>Название<input aria-label="Название директории" style={{ ...control, display: 'block', width: '100%', boxSizing: 'border-box' }} disabled={busy || Boolean(pending)} value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })} /></label>
       <label style={{ color: '#aaa', fontSize: 12 }}>Путь<input aria-label="Путь директории" style={{ ...control, display: 'block', width: '100%', boxSizing: 'border-box' }} disabled={busy || Boolean(pending)} value={draft.path} onChange={event => setDraft({ ...draft, path: event.target.value })} /></label>
+      {compact && <div data-prompt-source-search-path style={{fontSize:12,color:'#aaa',overflowWrap:'anywhere'}}>Search: {draft.path.trim()?promptSourceSearchPath(draft.path.trim()):'выберите корень — поиск в его docs'}</div>}
       <button type="button" style={control} disabled={!editable} onClick={() => void chooseDirectory()}><FolderOpen size={13} style={{ display: 'inline' }} /> Выбрать директорию</button>
       <label style={{ color: '#aaa', fontSize: 12 }}><input type="checkbox" disabled={!editable} checked={draft.enabled} onChange={event => setDraft({ ...draft, enabled: event.target.checked })} /> Включена в реестре</label>
       <div style={{ display: 'flex', gap: 8 }}>

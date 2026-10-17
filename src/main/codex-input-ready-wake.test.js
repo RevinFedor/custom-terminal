@@ -20,9 +20,22 @@ function harness() {
   let ready = false;
   let deadline;
   let armed = 0;
-  const fn = vm.runInNewContext(source.slice(start, end) + '\nensureCodexInputReadyForExternalPrompt', {
+  let reads = 0;
+  const frameFixture = require('./fixtures/codex-draft-request-observation.cjs');
+  const ownerSource = ['captureAgentInputIdentity', 'agentSendExecutionFailure']
+    .map(frameFixture.actualFunction).join('\n');
+  const fn = vm.runInNewContext(frameFixture.startupFrameDeclarations() + '\n' + ownerSource
+    + '\n' + source.slice(start, end) + '\nensureCodexInputReadyForExternalPrompt', {
     CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS: 90000,
-    getCodexTuiReadyState: async () => ({ inputReady: ready, textReady: ready, processReady: true }),
+    terminals: new Map([['T', {}]]), terminalCommandState: new Map([['T', { runSeq: 1, isRunning: true }]]),
+    codexLastRunCommandPayload: new Map(), aiStoppingTabs: new Map(),
+    getHeadlessTerminalMirror: () => null, getTerminalInputRevision: () => 0,
+    getTerminalLifecycleGeneration: () => 'ready-wake-fixture', getTerminalStopRevision: () => 0,
+    agentSendCancellations: { isCancelled: () => false },
+    createAgentInputObservation: options => require('./agent-input-observation').createAgentInputObservation({
+      ...options, setTimer: callback => { deadline = callback; return 1; }, clearTimer() {},
+    }),
+    getCodexTuiReadyState: async () => { reads++; return { inputReady: ready, textReady: ready, processReady: true }; },
     hasCodexEstablishedComposerLifecycle: () => true,
     codexStartupAutoEnter: new Map(),
     armCodexStartupAutoEnter: () => { armed++; },
@@ -32,7 +45,8 @@ function harness() {
     ipcMain: events, console: { warn() {} },
     setTimeout: (callback) => { deadline = callback; return 1; }, clearTimeout() {},
   });
-  return { fn, events, ready: () => { ready = true; }, deadline: () => deadline(), armed: () => armed };
+  return { fn, events, ready: () => { ready = true; }, deadline: () => deadline(), armed: () => armed,
+    reads: () => reads };
 }
 
 test('send waiting inside a model picker wakes on the common readiness transition', async () => {
@@ -53,26 +67,30 @@ test('send waiting inside a model picker wakes on the common readiness transitio
   assert.equal(h.events.listenerCount('agent:tui-ready-internal'), 0);
 });
 
-test('deadline re-read that already proves readiness cannot report codex_not_input_ready', async () => {
+test('deadline never starts an unbounded async ready read; the real ready edge is required before expiry', async () => {
   const h = harness();
   const pending = h.fn('T');
   await tick();
+  const reads = h.reads();
   h.ready();
   await h.deadline();
   const result = await pending;
-  assert.equal(result.success, true);
-  assert.equal(result.ready.inputReady, true);
+  assert.equal(result.success, false);
+  assert.equal(result.error, 'codex_not_input_ready');
+  assert.equal(h.reads(), reads, 'expiry does not launch another process lookup or startup poke');
 });
 
 test('a pending settings intent reconciles on the same ready edge without a renderer status query', () => {
   const ast = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, true);
   const handler = ast.statements.find(statement => ts.isExpressionStatement(statement)
-    && statement.getText(ast).startsWith("ipcMain.on('agent:readiness-changed-internal'"));
+    && statement.getText(ast).startsWith("ipcMain.on('agent:readiness-changed-internal'")
+    && statement.getText(ast).includes('scheduleCodexModelEffortIntentReconcile'));
   assert.ok(handler, 'top-level readiness owner, not a temporary operation listener');
   const events = new EventEmitter();
   const calls = [];
   vm.runInNewContext(handler.getText(ast), {
     ipcMain: events,
+    historyMutationInput: { notify: async () => {} },
     scheduleCodexModelEffortIntentReconcile: (...args) => calls.push(args),
   });
   events.emit('agent:readiness-changed-internal', null, { tabId: 'T', toolType: 'codex', status: 'waiting' });

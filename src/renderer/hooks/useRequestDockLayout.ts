@@ -3,9 +3,10 @@ import type { RefObject } from 'react';
 
 // The service rail and the visible queue own their measured rectangles. A
 // passive request list may only occupy the remaining space inside this pane.
-export function useRequestDockLayout(root: RefObject<HTMLDivElement | null>, queueVisible: boolean, queueWidth: number) {
+export function useRequestDockLayout(root: RefObject<HTMLDivElement | null>, queueVisible: boolean, queueWidth: number, enabled = true) {
   const [layout, setLayout] = useState({ visible: false, right: 0, maxHeight: 200, panelRight: 0, panelTop: 30, panelWidth: 310 });
   useLayoutEffect(() => {
+    if (!enabled) return;
     const rail = root.current?.parentElement;
     if (!rail) return;
     const owner = rail.closest('[data-prompt-queue-owner]');
@@ -30,6 +31,6 @@ export function useRequestDockLayout(root: RefObject<HTMLDivElement | null>, que
     for (const element of [rail, pane, queue, edges]) if (element) observer.observe(element);
     window.addEventListener('resize', measure);
     return () => { observer.disconnect(); window.removeEventListener('resize', measure); };
-  }, [root, queueVisible, queueWidth]);
+  }, [root, queueVisible, queueWidth, enabled]);
   return layout;
 }

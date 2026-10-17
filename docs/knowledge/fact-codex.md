@@ -293,7 +293,24 @@ DB-транзакцией. Crash между этими двумя записям
 но composite History fail-closed до восстановления manifest; показывать source
 как fallback в этом окне нельзя.
 
-Тот же инцидент доказал независимый performance-разрыв. Один `/tabs` refresh
+Шрам14.10: `Codex F` внешнего SID без Noted-tab действительно создал thin child,
+общий History показал51запись, но после Stop `finalizeAiLaunchSnapshot` вызвал
+legacy `codex:get-timeline`. Его physical-only projector вернул0, а Main
+`discard-unmaterialized` принял отсутствие локальных user turns за metadata-only,
+очистил binding и удалил child-файл. Следующий Start создал пустую беседу.
+Это потеря child при финализации, не отказ импорта внешнего SID и не чужой CAS.
+
+Legacy timeline теперь делегирует тому же `SessionTranscriptService.getTimeline`,
+что читает composite lineage. Ошибка lineage не подменяется physical empty.
+Независимый Main inspector не выдаёт metadata-only при fork/history_base/ordinal
+или non-legacy history mode даже без local user; materialized при этом не
+выдумывается — его доказывает composite reader. Поздняя renderer-финализация
+проверяет исходный launch snapshot/session/cwd перед discard/clear. Обычная
+standalone empty cleanup сохранена. SOURCE20targetedPASS; установленный Stop
+после этой правки ещё не проверялся. Evidence и восстановление конкретной вкладки:
+`docs/tmp/форк-и-ручное-имя.md`, `codex-launch-finalization.actual.test.js`.
+
+Инцидент23.08 также доказал независимый performance-разрыв. Один `/tabs` refresh
 дважды спрашивал состояние Codex (renderer batch, затем main-authoritative
 loop), а каждый read заново запускал process/lsof reconciliation и полный
 materialization parse. За 5 секунд: 59 запросов, суммарное ожидание 361232ms,
@@ -347,9 +364,25 @@ Codex 0.151 добавил ещё одну физическую границу: 
 ждёт причинный `task_started`; второй Enter разрешён только по новому committed
 headless-кадру с точным неизменённым `/compact` и теми же terminal/run/lifecycle/
 input/mirror generation плюс тем же pending operation. Если первый Enter уже
-запустил compact, второй запрещён. Manual takeover, смена поколения или
-отсутствие causal start дают `delivery-unknown`, снимают незапущенный pending и
-не превращаются в `SENT` либо автоматический retry.
+запустил compact, второй запрещён. Отсутствие causal start после записанного
+Enter даёт `delivery-unknown`, но сохраняет исходный pending owner/EOF для позднего
+start и outcome; пустой composer запрещает второй Enter, а не доказательство
+первого. Только доказанный pre-Enter refusal либо прежние input/Stop/generation
+fences отменяют pending. Таймер не создаёт `SENT`, повтор команды или новый owner.
+
+Шрам14.10: в3314 Main обработал записанный task_started после5s submit deadline;
+в776 source-audit-only reader удерживал start до принятия writer и source-proof
+replay. Отмена pending на unknown теряла handoff, хотя CLI уже сжимал контекст.
+Первый случай завершился compacted, второй позднее прерван ручным Escape:
+одинаковая строка UNCONFIRMED не доказывает одинаковый outcome.
+
+Другой14.10 race: ручной follower3314 уже был в Main FIFO, но final writer read
+вернул stale-generation после того, как предыдущий Send подтвердил того же
+writer и закрыл discovery. Устаревший read не становится успешным: unwritten
+operation отдельно присоединяется к принятому current proof с прежними
+terminal/run/lifecycle/input/observation/Stop pins, source/launch и свежими PID.
+Обычная очистка launch-payload сохраняет этот exact proof; чужое поколение/сессия
+или unknown process не разрешают ввод. Старую failed receipt не replay'ят.
 
 Child rollout может скопировать сотни мегабайт source-истории и переписать её внешние timestamps так, будто все строки созданы сейчас. Поэтому `mtime`, внешний timestamp и последние 8 MiB не доказывают live-turn. Граница ищется по внутреннему `payload.started_at` относительно launch-time и хранится как физический byte offset.
 
@@ -390,6 +423,16 @@ Accepted/pending присоединяется к готовности прежн
 доказывает no-write старой операции. Регистрация, refusal и settle коррелируются
 в общем журнале по intent/attempt и original/observed fence; prompt не копируется.
 
+Presentation preparation связана с тем же Main launch intent/attempt: внутренний
+no-write отказ ещё не final failure всей операции. Пока outer owner разрешает
+прежнее bounded продолжение, остаётся preparing/retry-wait; окончательный,
+unknown или исчерпанный отказ показывается без таймера скрытия. Cancel/уход sender
+очищает только свою preparation, не successor. В renderer token сравнивается
+монотонно, а запоздавший hydration после нового lifecycle-события отбрасывается.
+Обычный параллельный presence-read сам по себе не отменяет authoritative hydration.
+Шрам16.10/4fe9: rejected preparation→через1.376s новое начало SAME intent→sent;
+показанный пользователю красный текст в логах не сохранён, source-путь проверен.
+
 Own-writer S→C может прийти до launch ACK и сбросить wasInterrupted. UI-флаг
 не отменяет доказанный запуск: прежнее право записи отзывается, дальше допустим
 только exact Main join. Поздние materialization/launch ACK проверяют source и
@@ -422,6 +465,23 @@ Run After законно joins pending Resume, а AutoResume ложно выда
 Стартовые параметры Codex двухслойные. StatusBar хранит app-level defaults (`defaultCodexModel/defaultCodexEffort`); `none` означает «не добавлять CLI override, пусть Codex читает `~/.codex/config.toml`». На fresh-tab ControlBar может хранить per-tab `codexModel/codexEffort`, и tab-scoped значения выигрывают над StatusBar. Если итоговые значения не `none`, fresh `codex` получает `--model` и `-c 'model_reasoning_effort="..."'`.
 
 Fresh и restore/fork нельзя склеивать. Обычный `codex` действительно потребляет выбранную tab/global пару и только после принятого запуска сохраняет её как fallback вкладки. `codex-c` и `codex-f` обязаны восстановить точную пару из source rollout; renderer launch payload не сохраняется как будто он уже стал состоянием нового writer. Иначе между кликом и writer proof UI показывает чужую пару, а crash в этом окне делает ложь durable. Общий launch helper всё ещё обязателен для всех путей, но main различает fresh defaults и source settings; AutoResume/Resume All/Continue/Fork не повышают локальный UI-кэш до истины.
+
+Ранний context Fork отображает исходный выбранный pair уже при factory allocation,
+не ждёт source-read/запуска. Берётся exact source Tab той же SID и прежнее правило
+selection: pending/stopped desired intent, иначе current effective/fallback.
+Это child choice без parent SID, live-owner, proofAt или applied revision; raw
+source/argv/readiness проверяет прежний Main. Conversation-only Ultra не становится
+durable effort. Начальная transient подсказка исключена из allocation record.
+Если stopped source выбрал B, но его rollout ещё содержит A, после source proof
+Main сохраняет initial B как НОВЫЙ child intent прежнего settings owner, только
+если ребёнок ещё не выбрал C. Это не parent applied proof и не новый launcher:
+точный bootstrap A сохраняется, B применяется обычным readiness/settings-before-Send.
+При совпадении initial/source pair дополнительный intent/picker не создаётся.
+Между выбором B и native apply панель сохраняет B с прежним pending-индикатором,
+не переименовывает его обратно в A от позднего запуска. Provider GET/events
+согласуются по revision/stateVersion; source→child carried patch планируется
+заново непосредственно при применении, после await, и не стирает более новый
+child intent/proof. Это не подтверждение, что B уже применена к процессу.
 
 Первый доказанный writer может иметь тот же SID, но всё равно требует атомарного
 сохранения перенесённых model/effort/proof. Нельзя убирать эту запись ради совпадения
@@ -651,6 +711,70 @@ Resume не получают дополнительного ps-wait; физич�
 Постоянный Ctrl+G этот класс не чинит: empty input уже был доказан, потерялась
 принадлежность разговора. Регрессия должна исполнять настоящий процессный
 reader и write-boundary, а не заглушку «session всегда известна».
+
+Шрам15.10 HH367: completed-discovery join уже имел свежую ps-проверку, но первый
+task_started во время этой проверки удалил disposable launch payload. Общий
+process-scope reader правильно вернул process_scope_changed; caller не дочитал
+текущий тот же owner и отказал stale-generation до paste/Enter. Поэтому только
+точное launchId→null cleanup при прежних terminal/run/lifecycle/project/cwd,
+Stop/input/observation/source и retained writer launch допускает один replacement
+READ внутри той же unwritten операции. После него прежний proof/PID guard проверяется
+снова. Другой ps error, второй stale или смена owner остаются отказом; общий reader
+не превращает unknown в found. `codex-submission-observation.integration.test.js`
+исполняет настоящий process-scope reader: always-found stub этого окна не проверяет.
+
+Отдельный шрам16.10: после подтверждения первого cold Send следующий FIFO item
+мог получить runtime_snapshot_unstable ещё до beginAttempt. Public reader брал
+event snapshot перед медленным ps; обычные writer adoption и task_started cleanup
+расходовали оба coherence pass. Теперь Codex projection читается после process
+await при прежних physical scope/input/Stop/conversation owner; после readiness
+проверяется полная revision. Это не разрешение использовать stale process result:
+изменившийся launch всё ещё требует нового чтения, unknown не становится found,
+а final target/writer/draft остаются у прежнего Send. Проверять через actual FIFO
+follower, не только отдельный status; исходная failed запись не replay'ится.
+
+После настоящего process-unknown уже подтверждённый живой writer может остаться
+без mutation proof. Публичный reader для MCP не должен навсегда возвращать эту
+потерю: при fresh `processStatus=found`, `liveLifecycle=true` и явном
+`writerConfirmed=false` он вызывает прежний canonical runtime reader с writer
+reconciliation. Это проверка process/file/binding, не подстановка saved SID.
+После неё сохраняются прежние physical/input/Stop/conversation guards; unknown
+не получает положительного результата, warm writer не платит дополнительным
+reconcile. Research ingress сверяет прежнюю source identity; существующий run
+не переадресуется и не отправляется снова. Контроль:
+`codex-message-writer-recovery.actual.test.js`. Причину задержки самого ps этот
+ремонт не устанавливает и его timeout не меняет.
+
+Отдельная private full DEV приёмка16.10 проверила один адресный observation
+unknown на живом собственном writer: штатная invalidation, затем recovery в
+research ingress сохранили PID/SID/terminal/run/lifecycle/input/Stop и прежний
+conversation owner. Один новый tracked research вернулся по exact prompt-audit,
+живой Codex ответил без ручного Stop/Resume. Подменён только результат одного
+наблюдения в disposable copy, не reconciliation/PTY/provider. Это подтверждает
+восстановление после transient loss, не OS-причину ps delay и не installed cut.
+
+Native cold follower16.10v2 добавил ещё одну границу: canonical reconcile может
+вернуть захваченный unconfirmed/null snapshot уже после независимой публикации
+того же writer. Это изменение semantic projection не должно расходовать physical
+owner pass, иначе последующий обычный launch cleanup исчерпывает оба прохода.
+После canonical await public reader сначала сверяет прежние physical/Stop/input/
+conversation guards. Только текущий usable writer позволяет синхронно перечитать
+event projection; SID и live state должны совпасть с текущим scoped proof.
+Финальная revision-проверка остаётся после refresh. Старые canonical error/null
+metadata не переносятся в новую readiness projection; sessionId/codexSessionId
+согласованы. No-writer/unknown не заимствуют saved SID, настоящий scope change
+по-прежнему требует следующего из прежних двух проходов. Новых ps/read retries,
+таймеров и post-Enter recovery нет. Regression:
+`agent-runtime-reconcile-refresh.actual.test.js` и связанный actual FIFO контроль.
+В этом инциденте lookup занимал61.8ms; называть его2s ps timeout неверно.
+
+Private full DEV retake16.10v3 подтвердил эту ветку на настоящем Codex/SQLite/UI:
+follower принят за1.098s доready/1.966s доadoption, в Main наблюдался
+refresh-after-reconcile/pass1, оба исходных сообщения получили exact audit и
+по одной canonical user-записи. Fresh process Stop до task Enter оставил
+not-submitted/cancelled и карточку CANCELLED. Это один runtime sample указанного
+cut, не installed acceptance или гарантия всех async interleavings. Изображение
+проверено отдельноv1; совмещённый image+early-follower native case не прогонялся.
 
 ### Возврат обычной модели после Reserve
 
@@ -1372,6 +1496,12 @@ canonical user-carrier. Иначе Timeline чеканит адресуемую 
 не по расстоянию в строках: между ними законно стоят `world_state`,
 `turn_context` и `token_count`.
 
+В History этот служебный carrier подписан `Project instructions · AGENTS.md`,
+а не выглядит выбранным файлом пользователя. Для Codex обязательна canonical
+метка `serviceCarrier=project-instructions` до разбора имени; один путь/текст
+AGENTS.md не превращает explicit file chip в служебный. Диагноз повторной
+отправки требует actual transport receipt, не соседства chip с новым prompt.
+
 Два соседних chip с одинаковыми `AGENTS.md + scope` не обязательно дубль:
 в сохранённой ветке может остаться предыдущая редакция инструкций, а Resume
 добавляет новую перед реальным prompt. Label не содержит версию/дату. Для
@@ -1580,6 +1710,32 @@ Codex0.159.2 подтвердил ordinary UI Send→3questions+accepted→sleep
 **Точная идентичность ответа есть.** Native question ID — JSON.stringify
 `["request_user_input_async", messageId, questionIndex]`, где messageId=call_id.
 
+15.10 при видимом native header/progress SOURCE-разбор title привязан к текущей
+question section и расположению последовательной группы с выделенным вариантом.
+В этом layout поздний bold/accent фрагмент под options не заменяет вопрос; текст после
+пустой строки не дописывается к Other без hanging-indent/soft-wrap продолжения.
+Старые free/Other/controls и exact accepted title-link сохраняются: единственный
+чужой call не подставляется вместо нераспознанного вопроса. Без такого section/
+selection anchor остаются прежние style/identity проверки. `title-frame` пишет
+лишь длины/fingerprints/count/seq/matched при смене target, безbody/новогоreader.
+Контрпример с `call_id: synthetic.` воспроизведён RED→GREEN на реальных xterm
+cells; это controlled frame/transport, не новый native-provider E2E. У production
+tab-b87add59 в07:21UTC полный title+2options и локальный Skip доказаны API/log,
+но прежний frame440 не сохранён: точная причина его прошлого вида не доказана.
+
+Другой layout15.10: bold title может использовать terminal-default FG/BG.
+SOURCE больше не требует отдельного цвета для такого title внутри доказанного
+native header/progress; options требуют painted sequential selection, free —
+прежний cursor/editor proof. Произвольный bold transcript без native section
+не получает authority. Frame-result различает style/reason/scalar shape безbody;
+current/committed/owner/lock/input revision и exact canonical title-link прежние.
+94headless/controlled checks не являются genuine-provider приёмкой. Production
+3951 open→unknown/timeout и следующий отказ безinput доказаны log/скрином, но
+historical styled1056 отсутствует: его ANSI default bits не установлены поPNG.
+Для реального monochrome fixture одного app-level NO_COLOR недостаточно:
+terminal:create штатно удаляет его перед запуском shell; режим надо подтвердить
+на cells настоящего CLI, не выводить из env. Этот env guard не менялся.
+
 Диктовка в свободный ответ использует общий receiptv2 для input/textarea:
 owner-key включает текущий native targetId и questionKey. Это сохраняет draft,
 выделение и Undo обычного браузерного редактирования, но не даёт delayed Paste
@@ -1623,7 +1779,8 @@ reply UUID10099/source58042212 от08.10 12:53:25.733UTC с полным reserve
 answer/skip и не разрешение строить saved provenance из transient pending mirror.
 
 Saved reply presentation в Desktop SOURCE проверяет complete envelope и exact
-raw-call/index/title link, затем full body hash. Это тот же classifier для
+raw-call/index/title link (original title либо точный bounded native framing,
+не произвольное сокращение), затем full body hash. Это тот же classifier для
 History и Timeline: синий readable Q/A, но canonical content/Copy/UUID/time/audit
 не переписываются. Unknown/quoted/malformed/ambiguous остаются literal; старый
 `accepted:true` не создаёт answer. Proof переживает оба carrier порядка и
@@ -1652,12 +1809,48 @@ reasoning_effort; только exact event_id+agent_thread_id дают creation 
 `interacted` приходит с None и не стирает её, дальнейшая смена настроек не меняет
 исторический launch. Для старых записей fallback — первая собственная настройка
 после root-meta/exact NEW_TASK, не copied ancestor turn_context и не latest
-Resume settings. Недоказанное остаётся «Модель — / effort —», без parent/default.
+Resume settings. После первичного чтения недоказанное остаётся «Модель — /
+effort —», без parent/default. Во время initial metadata load Inspector показывает
+статичные skeleton только неизвестным полям, а уже готовые значения сохраняет.
 Метаданные проходят existing Task/stub/live snapshot, а fallback берётся при уже
 открытом child reader: нет отдельного N+1 full History по всем детям. Async512KiB
 boundary scan ограничивает RAM/chunk, но не total copied-prefix I/O. Изменение
 проверено focused reader/component/hook cases и private paired build; это SOURCE,
 не новая physical/provider приёмка0.162 или установленная версия.
+
+Fast — отдельная настройка, не effort. В exact upstream0.162 выбранный root
+service tier передаётся детям с проверкой поддержки моделью child; current Fast
+родителя не доказывает исторический запуск. Полный rollout не равен одному
+turn_context: tier отсутствует там и в started, но durable
+`thread_settings_applied` несёт `thread_id` и `thread_settings.service_tier`.
+Copied ancestor snapshot принадлежит прежнему thread_id; для launch нужен
+собственный initial snapshot, не последний Resume/update. Отсутствие поля/own
+proof означает unknown, не Off. `SessionConfigured` тоже имеет tier в schema,
+но rollout policy0.162 считает событие transient — не рассчитывать на его
+наличие в сохранённом JSONL по одному комментарию в protocol. Это source
+контракт0.162 (`agent/child_config.rs`, `session/thread_settings.rs`,
+`rollout/src/policy.rs`), не проверка конкретного живого ребёнка.
+
+В Inspector Codex Fast стоит справа от effort: priority/fast → янтарная молния
+и `Fast`, explicit default → `Fast выкл.`, отсутствие доказанного launch →
+`Fast —`. Пока initial child metadata ещё читается, рядом с `Fast` вместо прочерка
+стоит skeleton: прочерк означает результат «не подтверждено», не загрузку.
+Фаза привязана к exact selected owner, завершается по catch-up/EOF/error;
+первые transcript rows не завершают её досрочно, обычный tail не включает снова.
+Reset может начать новую фазу, поздний ответ A не завершает загрузку B.
+Это чтение, не настройка и не runtime authority. Tier идёт отдельным
+компактным proof: прежний приоритет model/effort из started не должен скрыть
+более поздно прочитанный launch tier. Для v2 initial snapshot может лежать ДО
+NEW_TASK: сохранять его в уже существующем prefix scan и передавать через его
+skip offset, не запускать второе чтение History. Первый own snapshot фиксируется,
+NEW_TASK/первый own turn не позволяют позднему Resume выдать себя за launch.
+Если prefix settings record превышает64KiB, неизвестность не заменять следующим
+update; raw snapshot не удерживается. Warm EOF сохраняет scalar; source
+replacement/shrink/same-size rewrite и release/A→B сбрасывают старого владельца.
+Обычный append сохраняет prefix cache; новых polling/RPC/Map subscriptions нет.
+На узком Inspector status/time/actions переносятся ниже: иначе Fast накладывался
+на Working при350px. Read-only UI/source chain проверена actual reader/Main/hook
+controls и Electron presentation350/500/1000; это не installed/provider acceptance.
 
 Codex-субагенты приходят в rollout **двумя поколениями инструментов**, и History рендерит оба одинаковыми Task-карточками (тот же вид, что субагенты Claude SDK), а не сырыми JSON-вызовами. v1 — namespace `multi_agent_v1`: `spawn_agent` output несёт `{agent_id, nickname}`, результат приходит в output `wait_agent`/`close_agent`. v2 — namespace `collaboration`: у `spawn_agent` в arguments вместо текста задачи лежит **зашифрованный** блоб (`gAAAA…`, та же Fernet-капсула, что compact) — его нельзя показывать как описание карточки; человекочитаемое имя берётся из `task_name` → `/root/<task_name>`. Привязка call→карточка в v2 идёт через `event_msg.sub_agent_activity` (`event_id` = call_id вызова, `agent_thread_id` = session id дочернего rollout), а финальный текст — через `agent_message` response_item с префиксом `FINAL_ANSWER` (эта запись НЕ обычный assistant-ответ и не должна попадать в transcript отдельной строкой).
 
@@ -1756,7 +1949,7 @@ Top-level `compacted` того же writer/session/generation завершает
 
 **Fork от последнего compact — отдельный copy-on-write rollout.** После `session_meta` первой смысловой записью становится последний top-level `compacted`; более старые snapshots и самостоятельные ранние turns удаляются, а его companion `context_compacted` и весь поздний хвост сохраняются. В новом `session_meta` оба identity-alias обязаны одновременно указывать на child: `payload.id = child` и `payload.session_id = child`; происхождение хранится отдельно как `payload.forked_from_id = source`. Шрам 2026-07-27: writer переписал только `id`, оставил `session_id=source`, и корректно сокращённый файл не запускался с `session-meta-mismatch`. Source-settings resolver нельзя ослаблять: любое противоречие alias означает неизвестную identity и должно блокировать Resume; чинить нужно атомарную запись обоих полей. Source rollout остаётся byte-for-byte неизменным.
 
-App-created compact-fork отличается от generic `codex resume <sourceId>` по силе доказательства чтения. Для compact-fork приложение само атомарно создаёт child rollout с новым точным id, поэтому новая вкладка обязана получить этот id сразу и показать уже перенесённую историю до первого prompt. Это не подтверждает runtime writer: launch всё ещё проходит обычный live-proof до того, как новые записи считаются принадлежащими вкладке. Прод-шрам 2026-07-28: child-файл tab-511 был создан заранее и содержал 380 записей, но id не передали вкладке; History оставался пустым до первого Enter, после writer-proof старая история появилась целиком, а новый prompt — ещё примерно через секунду после реальной записи в rollout.
+App-created compact-fork отличается от generic `codex resume <sourceId>` по силе доказательства чтения. Для compact-fork приложение само атомарно создаёт child rollout с новым точным id; после copy commit новая вкладка обязана получить этот id сразу и показать уже перенесённую историю до первого prompt. Durable UI-контейнер создаётся раньше копии и до этого не получает SID родителя. Это не подтверждает runtime writer: launch всё ещё проходит обычный live-proof до того, как новые записи считаются принадлежащими вкладке. Прод-шрам 2026-07-28: child-файл tab-511 был создан заранее и содержал 380 записей, но id не передали вкладке; History оставался пустым до первого Enter, после writer-proof старая история появилась целиком, а новый prompt — ещё примерно через секунду после реальной записи в rollout.
 
 В отличие от Claude, Codex compact **не создаёт Old History Zone**. Pre-compact записи остаются доступны через rollout JSONL и `codex:get-full-history`, поэтому Timeline не должен выставлять `lastBoundaryIdx`, красный background или click gate для Codex. Оранжевый compact marker у Codex означает только «здесь Codex свёл контекст», а не «всё выше недоступно».
 
@@ -1778,6 +1971,16 @@ child при сменившемся source. Сами base64 в JS-объекте
 Уже повреждённый compact без raw proof fail-closed и не порождает следующий
 fork. Production-класс 20.08: compact-fork `994dd484…`/`e949d096…` был создан
 из memory-safe проекции и каждый Send падал на `input[N].content[1].image_url`.
+
+У составного raw reader этот descriptor обязан пережить добавление physical
+session/segment identity.16.10 compact Fork из существующего virtual child
+отказал `Codex compact image source is unavailable for fork write`: object spread
+в decorator терял non-enumerable Symbol, хотя underlying image bytes могли быть
+доступны. Теперь копируются исходные private Symbol descriptors; это не поля
+public DTO и не разрешение угадать отсутствующие bytes. Оба источника — frozen
+ancestor и собственный child tail — используют тот же путь. Actual composite
+reader→planner→writer regression сохраняет ordered duplicate images и Unicode;
+изменённый raw source и уже записанный placeholder без proof остаются отказом.
 
 **Внутри compact нет прозаического пересказа, и расшифровать его нельзя.** Вопреки названию «свёрнутый контекст», Codex не перефразирует историю в короткое summary как Claude. Запись `type:"compacted"` несёт `payload.message: ""` (пусто — заголовка/резюме компакта в открытом виде нет) и `payload.replacement_history` — массив из (а) **дословных** сообщений последних ходов (`role: user/assistant/developer`, вербатим, не пересказ) и (б) одного финального элемента `{type:"compaction", encrypted_content}`. Именно `encrypted_content` (~20–30 KB, префикс `gAAAAAB`) и есть настоящая модель-читаемая выжимка — но это **Fernet-токен**: открыты только version-байт + timestamp + IV, само тело это `AES-128-CBC` ciphertext + HMAC-SHA256. Расшифровать на стороне клиента **криптографически невозможно**: ключ держит только OpenAI, он привязан к конкретной модели и ротируется (TTL порядка часов/суток). Это by-design для ZDR / `store=false` (капсула транзитом проходит через клиент, лежит в `~/.codex/sessions/`, шлётся обратно — сервер расшифровывает у себя в памяти и выбрасывает) и как anti-prompt-injection (открытую summary можно было бы подменить). Поэтому форматтер заменяет блоб на `[encrypted compaction state]`, а «Копировать compact» по дизайну отдаёт вербатим-сообщения + этот маркер — **это не баг копирования и не «сломанный» компакт**. Те же ключи-капсулы дают `invalid_encrypted_content` при resume старой сессии или смене модели посреди диалога: к этому моменту даже сам OpenAI не может расшифровать свой блоб. Если нужен человеко-читаемый пересказ Codex-сессии — его придётся **генерировать самим** (прогнать `replacement_history` + ходы через модель), а не пытаться достать из компакта.
 
@@ -1860,10 +2063,13 @@ initialized, но model picker временно закрыл input. Старый
 если последний raw diff не содержал footer. Source repair слушает общий
 readiness-changed, публикуемый main после committed initialized composer той же
 generation; промежуточный кадр, busy и replacement не снимают guard. При уже
-initialized lifecycle не запускается новая startup autoEnter-машина. Перед
-ошибкой deadline проверяет текущую readiness. `[CodexReadyWait] settled` логирует
-конкретный исход/ожидание. Regression before2FAIL→afterPASS; physical/installed
-приёмку см. текущий docs/tmp checkpoint, не считать source-тест install-proof.
+initialized lifecycle не запускается новая startup autoEnter-машина. Уточнение
+15.10: Main readiness observation и подписки создаются до первого async read;
+его исходный deadline включает process/frame lookup и startup poke. По expiry
+новый async reread/poke не начинается: прежний timeout callback сам мог зависнуть.
+Current ready/manual choice возвращается по обычному чтению или readiness wake,
+Stop/cancel/смена execution owner отзывают continuation даже после снятия stopping.
+Source-регрессии не являются installed/provider приёмкой.
 
 Тот же порядок обязателен в renderer. History обычного Send не читает draft
 до общего readiness: открытый `/model` ещё не composer и не доказывает потерю
@@ -1872,7 +2078,8 @@ initialized lifecycle не запускается новая startup autoEnter-�
 сохраняет отдельную pre-Stop проверку, потому что сначала останавливает writer.
 `agent:readiness-changed` будит renderer так же, как internal-событие будит main;
 это только повод перечитать текущее состояние своей вкладки/provider, не новый
-`tui-ready` и не разрешение на Enter. Deadline также запускает последнее чтение.
+`tui-ready` и не разрешение на Enter. Последнее чтение renderer readiness не
+означает новый Main process/frame budget после истечения его original deadline.
 Открытое вручную меню само не закрывается и модель за пользователя не выбирается.
 Регрессии actual helper/History boundary: `agentReadyWake.test.mjs`.
 
@@ -1884,7 +2091,56 @@ invalid settings. Global defaults не заменяют эту пару. Реа�
 подтверждается обычным readiness/settings путём. Регрессия
 `codex-empty-resume-settings.test.js`; найдено на RunAfter после restart.
 
+Шрам14.10, cold Resume753: inputReady был подтверждён до окончания следующего
+длинного startup frame. Preflight draft wait2500ms истёк при настоящем DEC2026
+open, writeSeq=flushedSeq140; bounded diagnostic journal126262chars не имел
+closing marker. Это честный pre-input отказ, не proof сломанного MCP/пустого
+composer. Saved frame19 и renderer137 нельзя принимать вместо текущего.
+Отдельный новый Send допускается только после exact original no-input outcome
+и свежего empty/current proof; неизвестная доставка такого разрешения не даёт.
+Поздний успешный Send не переписывает old failed. После повторов776 и73ea
+Main send-preflight продолжает event-driven чтение в пределах оставшегося
+исходного launch deadline, включая кадр, открывшийся во время первого flush
+await. Предварительный empty/frameBlocker не выбирает lifetime будущего чтения;
+возле expiry срок также не расширяется свежими2500ms. Definitive draft возвращается
+сразу; closing marker без flush или с настоящим draft/меню не доказывает empty.
+Это не новый срок на каждое пробуждение:
+Stop/input/mirror guards прежние, истёкший/чужой launch не расширяет новую ordinary
+probe. Нет повторного Send, принятия старого empty frame или смены модели.
+Последний `codex-pre-submit-before-paste` читатель использует тот же остаток:
+между успешным common preflight и фактической вставкой холодный CLI может открыть
+следующий DEC2026 frame. Проверка лишь первого caller оставляла последнему2500ms
+и требовала ручного нового Send (174ad9aa,15.10). Post-paste/обычные наблюдения
+бюджет запуска не наследуют. Регрессия извлекает actual final call из Main, а не
+проверяет только похожий reason публичного preflight; near-expiry и missing-close
+проверяются отдельно, без разрешения ввода по таймеру.
+Проверка полноты15.10 выявила, что добавления reason недостаточно: ready cleanup
+обычно удаляет launch payload. Небольшая Main WeakMap receipt у того же terminal
+сохраняет только original launch/deadline/run/lifecycle/Stop, не settings payload
+или право ввода. Ready→composer→adapter несут Main-issued launch ID; числовой
+deadline от renderer не принимается. Та же начатая операция после expiry получает
+остаток0, а новый самостоятельный warm Send — обычный budget. Receipt захватывается
+до ожидания physical lock/settings; новая launch/Stop не может усыновить старый wait.
+Final composer guard стоит ПОСЛЕ pre-paste drain, перед image bindings и первым
+Codex paste без следующего await. Отдельно проверяются exact execution identity,
+mirror pointer/generation и input ownership; Claude capture/stash не получает
+чужой Codex mirror gate. Send IPC сохраняет original execution до первого await,
+а не берёт нового owner после readiness. Actual headless/pump/grammar controls
+различают close без flush, empty, настоящий draft, picker и missing close;
+данные CLI/clock/PTY остаются controlled, не native acceptance.
+Публичный MCP `draft_state` в installed-срезе14.10 является renderer inspect,
+не этой Main-authority проверкой. Успешный753 recovery после known no-input и
+нового визуального empty подтверждён следующим обычным Send/audit; сам hint не
+выдаёт право обходить Main и не гарантирует следующий cold запуск.
+
 Stock Codex `0.150.1` добавил наблюдаемый исход: длинный paste с изображением уже целиком лежит в composer, PTY принял байт Enter, но TUI не начал turn. Timeout audit сам по себе не разрешает второй Enter — prompt мог уйти, а rollout отстать. Разрешён ровно один повтор только после неразрушающего `Ctrl+G` copy: helper должен вернуть тот же текст и те же image slots, а terminal instance, run, lifecycle и input revision должны остаться прежними; busy-turn и любой более новый ручной/очередной PTY-ввод запрещают повтор. Codex copy может вернуть исходный абсолютный image path побайтно, но `images=0`, потому что external editor не обозначил его marker'ом; exact равенство всего transport-текста уже доказывает путь, порядок вложений и prose и сильнее derived image-count. Только canonical placeholder требует отдельной slot/identity-проверки. Прод-шрам `tab-4457`: exact 386-byte draft был ошибочно отклонён как `captured-image-count-changed`, после чего ручной Enter создал carrier с тем же length/hash.
+
+Post-Enter recovery дополнительно требует ту же durable `audit-pending` attempt
+без `deliveryControl.cancelledAt` и ДО capture, и после его await. Явный
+`delivery-unknown` не получает retry. Отмена не переписывает уже записанный Enter
+в no-submit: exact late audit исходной попытки по-прежнему может подтвердиться.
+Смена owner/attempt, настоящий новый ввод и изменившиеся image slots остаются
+отдельными отказами; одна узкая recovery точного оставшегося draft сохранена.
 
 После согласования09.09 обычный8s deadline больше не превращает живую попытку
 в `delivery-unknown`: History остаётся `CONFIRMING`, API возвращает202
@@ -2271,6 +2527,18 @@ Codex 0.145 использует ветвящийся `/model` flow. Quick-auto 
 доказанная launch-пара существовала в main, но одноразовые чтения ControlBar
 успели раньше неё. Дополнительный process/session lookup для recovery не нужен.
 
+Этот settings-owner нельзя передавать как SID адресата в settings-before-send.
+Шрам17Oct4196: cold delegate ожидал прежний SID, Resume уже показал пустой
+composer/max, но запрос xhigh получил `agent_send_target_changed` до picker:
+guard сравнил SID с `launch:<id>`. Настройки сохраняют свой launch CAS; адресат
+проверяется отдельно по уже выданному provisional Resume authorization и всё ещё
+текущим terminal/run/lifecycle/launch/discovery/lease. После draft await и перед
+каждым picker write token проверяется заново; saved SID не становится writer.
+Один exact adopted child того же launch сохраняет прежний accepted-source guard.
+Ordinary send без override обходит picker, но не является заменой этой проверки
+или поводом молча игнорировать выбранный effort. Контроли —
+`codex-settings-send.integration.test.js`; refusal metadata — `[CodexSettingsTarget]`.
+
 Открытие `/model` нельзя делать через фиксированную задержку. Проваленные варианты из этой сессии:
 - `safePasteAndSubmit('/model', fast:true)` работал, но оставлял `/model` видимым в input около секунды из-за встроенного ожидания перед Enter;
 - raw write `/model\r` мог трактовать Enter как перенос строки в composer;
@@ -2447,6 +2715,69 @@ Fast передаёт exact capture в прежний History draft-recovery con
 имена owned-model-input/error сохранены для совместимости, но защищают и Fast.
 Ordinary audit, canonical UUID/хеши и право повторного Send не ослаблялись.
 
+### Диагностика подтверждения коротких команд
+
+Для `/compact`, `/model` и `/fast` общий `[CodexSlashInput]` связывает один
+retained input receipt с записью paste, входом raw PTY в Main, доставкой в mirror,
+окончанием write-pump, commit/причиной отказа кадра, frame notification и фактически
+полученным wake наблюдателя. Enter-attempt, return и throw различаются; return
+сам по себе не подтверждает принятие команды Codex. Поздняя очистка после timeout
+сохраняет тот же traceId; у compact есть исходный operationId/handoff.
+
+Причина появления:16.10 Main3314 видел `writeSeq==afterWriteSeq` после paste,
+но эта одна строка не различала отсутствие raw output, задержку flush/commit и
+неполученный wake. Новый журнал содержит абсолютные first/last времена, счётчики,
+owner/sequence и scalar reasons, не prompt, raw output, screen text или error body.
+Версия2 сохраняет максимум16 последних событий,8 outbound tasks и12 публикаций;
+totals/потери и распределение причин blockers сохраняются отдельно от ring.
+Завершение receipt снимает mirror hook, но уже поставленная fd-запись сохраняет
+свой trace до callback/dispose, без нового права ввода. Нет построчного PTY logging,
+нового polling/таймера, parser read или flush ради диагностики. Log/snapshot errors
+не меняют результат отправки; timeout и права ввода остаются прежними. Эта трасса
+показывает задержку внутри приложения, но не измеряет CPU/чтение stdin самого CLI.
+
+17.10 повтор cold `/compact` показал14.283s между paste-return и первым app raw,
+при пустом pump в исходные2.5s. Поэтому одного Main write-return недостаточно:
+node-pty возвращает его до собственной fd-записи/callback. Точечный JS observer
+прикрепляет trace к task ПРИ enqueue и различает predecessor wait, fs.write,
+partial/EAGAIN/error, callback и dispose. Поздний callback не принадлежит новой
+операции этой же вкладки. Его полная запись ещё не доказывает CLI read(stdin).
+Размеры здесь — bytes; raw/mirror `chars` — UTF-16. Обход predecessor ограничен128
+элементами, неполный byte subtotal явно помечается. Без patched upstream JS
+выдаётся `outbound-unavailable`, а не выдуманный нулевой интервал. Обычные dev/
+pack hooks готовят exact SHA observer; ASAR validator проверяет его отдельно
+от native fix marker. Нативный writer/алгоритм очереди не заменяются.
+
+Open-frame progress использует ту же redraw grammar и сохраняет исходный onset
+независимо от короткого ring: repeated begin не обнуляет возраст. Printable chunks,
+raw/mirror/flush/commit и callback gaps учитываются отдельно. Manual input trace
+связывает original receive-owner и фактический write-owner через прежний serializer;
+при законном native typeahead они могут различаться. Передача до Main и return
+`term.write` не являются fd completion или CLI read. Отсутствующий hook явно
+`unavailable`; bounded scalar logs не содержат prompt/diff. Они не заменяют raw
+окно и не разрешают ввод. Bounded app-raw collector теперь сохраняет UTF16LE
+chunks до OSC-преобразований:2MiB/8192events на physical PTY,32MiB rolling globally,
+4incident pins по2MiB pre+2MiB tail; worker queue8MiB, disk128MiB/10artifacts/7дней.
+Pin делается до await, prefix публикуется до late tail; tail завершается matching
+closed/flushed current commit, Stop/сменой owner/dispose либо diagnostic60s.
+Quota gaps и persistence loss явные; это не kernel bytes и не полный replay от
+baseline. Worker резервирует обе bounded manifests до payload: поздние aliases
+не должны приводить final prune к удалению только что сохранённого incident.
+Один full UNPACKAGED/file:// app прогон проверил настоящий PTY→worker/disk,
+31.18s late tail и manual input→fd callback→fixture stdin; trigger отказа controlled.
+Это не packaged/installed acceptance или доказанная причина прежнего CLI no-echo.
+Версии, лимиты и оставшаяся app-проверка ведутся в
+[`terminal-large-diff-20261017/RESULT.md`](../tmp/terminal-large-diff-20261017/RESULT.md).
+
+В том же аудите найден отдельный Compact safety-шрам: throw из вызванного Enter
+не доказывает отсутствие записи. При неизвестном первом Enter результат имеет
+`submitted:null`; после уже вернувшегося первого Enter сохраняется `true`, даже
+если второй бросил исключение. Нельзя из этого разрешать rollback, новый Enter,
+отмену pending Compact или native восстановление author draft поверх возможного
+submit. Exact captured text/images возвращаются через прежний History recovery,
+pending остаётся доступным только для late causal outcome. Это не объясняет
+исторический Enter0 timeout и не меняет срок ожидания post-paste composer.
+
 ## Stop и ввод
 
 
@@ -2531,6 +2862,14 @@ Codex startup может показать trust prompt при первом за�
 После chained prompt'ов (`Update available` → directory chooser) raw PTY frame может прийти рваным: в логах видны обрезанные слова вроде `S ssion` / `Use c rrent`, detector честно отказывается нажимать Enter, а новых raw-байт уже может не быть. Поэтому startup auto-enter должен прогонять через тот же detector quiet-snapshot xterm buffer'а (main/headless first, renderer visible-buffer только fallback), где экран уже дорисован целиком. Это не fallback к “нажми Enter потому что похоже”: выбранный `Current`, третий пункт update, неполный chooser, MCP startup banner и `MCP startup interrupted` всё ещё fail-closed.
 
 После любого startup prompt (`update`, model migration, trust, directory chooser) прежний `codex:tui-ready` считается недействительным. Следующий readiness должен прийти заново уже из чистого composer'а; иначе Rewind/History send могут начать ввод в промежуточный экран.
+
+Первое подтверждение этого composer у текущего launch требует свежей process
+observation через прежний single-flight. Cached absent снимок до shell-write
+может ещё жить750ms, когда новый CLI уже нарисовал единственный ready frame;
+его повторное чтение теряло ready edge до следующего status read (~60s в private
+full-app17Oct). Steady-state verifier сохраняет кэш; fresh absent/unknown, смена
+launch/terminal/run/lifecycle/Stop и несовпадение current settings не дают ready.
+Это не готовность по времени и не обход физического доказательства процесса.
 
 `Starting MCP servers ... esc to interrupt` — фоновый прогресс после того, как в том же закрытом кадре доказаны composer и model/effort footer. В этом состоянии `inputReady=true`, а любой ранее взведённый MCP-watchdog очищается. Banner без composer-proof ещё может быть startup blocker и проходить ограниченный recovery; `MCP startup interrupted` всегда остаётся отдельным blocker. Esc не используется как recovery.
 

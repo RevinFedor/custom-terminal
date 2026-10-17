@@ -1,3 +1,4 @@
+import {beginTabCloseFeedback} from './tabCloseFeedback.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
@@ -69,7 +70,7 @@ function closeCallback(state,ipcRenderer) {
   const expression=storeSource.slice(from+'closeTab: '.length,to).trim().replace(/,$/,'');
   return compile(expression,{get:()=>state,set:patch=>Object.assign(state,patch),
     isExactGroupCloseGuard,nextPaneCloseOrder:()=>1,resolvePtyAgentOwner:()=> 'codex',isAiRuntimeTab:()=>true,
-    isAiBusyTab:()=>false,isAiForegroundProcess:()=>false,ipcRenderer,startTransition:fn=>fn(),
+    isAiBusyTab:()=>false,isAiForegroundProcess:()=>false,ipcRenderer,beginTabCloseFeedback,startTransition:fn=>fn(),
     useUIStore:{getState:()=>({showToast:()=>{}})},commitArchiveWithStopRetry,captureTabRestorePlacement:()=>null});
 }
 test('actual guarded close forwards token, keeps owner and never stops/retries on archive refusal',async()=>{

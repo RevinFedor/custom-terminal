@@ -9,6 +9,7 @@ const { prepareClaudePromptTransport } = require('./claude-prompt-transport');
 const { validateClaudePromptRequestProjection } = require('./claude-prompt-request-projection');
 const { historyAuthoringProjectionFromReceipt, normalizeHistoryAuthoringProjection,
   projectHistoryAuthoringEntry } = require('./history-authoring-projection');
+const { resolveForkOperation } = require('../shared/fork-operation.cjs');
 const {
   systemPromptSource,
   promptOriginTagForSource,
@@ -236,18 +237,56 @@ function cloneCodexPromptPresentationsForProvenChild(db, options = {}) {
     childSessionId: options.childSessionId,
     entryMappings: remap.mappings,
   });
+  // A pre-upgrade child may itself still lack the service sidecars. Carry
+  // its proven inherited READ tags into the new child using this operation's
+  // stronger raw-record remap, so another Rewind cannot lose them again.
+  const sourceEntries = (options.sourceRecords || []).flatMap(record => record?.type === 'event_msg'
+    && record.payload?.type === 'user_message' && Number.isInteger(record.__line)
+    ? [{ role: 'user', uuid: `codex-user-${options.sourceSessionId}-${record.__line}`,
+      timestamp: record.timestamp, content: record.payload.message }] : []);
+  const inherited = mappedCodexServicePresentations(db, options.sourceSessionId, sourceEntries, null);
+  let inheritedCloned = 0;
+  if (inherited.length && db.getHistoryPromptPresentationByAudit && db.saveHistoryPromptPresentation) {
+    const childByUuid = new Map((options.childRecords || []).flatMap(record => record?.type === 'event_msg'
+      && record.payload?.type === 'user_message' && Number.isInteger(record.__line)
+      ? [[`codex-user-${options.childSessionId}-${record.__line}`, record.payload.message]] : []));
+    const copy = () => {
+      for (const row of inherited) {
+        const mapping = remap.mappings.find(item => item.sourceEntryUuid === row.entryUuid);
+        if (!mapping || db.getHistoryPromptPresentationByAudit('codex', options.childSessionId,
+          mapping.childAuditTimestamp, mapping.childTransportHash)
+          || db.getHistoryPromptPresentationsForEntries?.('codex', [mapping.childEntryUuid]).length) continue;
+        const text = childByUuid.get(mapping.childEntryUuid);
+        if (typeof text !== 'string' || !row.chips.some(tag => tag.bodyProjectionHash
+          === crypto.createHash('sha256').update(text).digest('hex'))) continue;
+        if (saveAuditedPromptPresentation(db, { toolType: 'codex', sessionId: options.childSessionId,
+          entryUuid: mapping.childEntryUuid, auditTimestamp: mapping.childAuditTimestamp,
+          actualHash: mapping.childTransportHash, actualText: text,
+          snapshot: { semanticTags: row.chips } })) inheritedCloned++;
+      }
+    };
+    if (db.db?.transaction) db.db.transaction(copy)();
+    else copy();
+  }
   return {
     ...remap,
-    cloned: Number(databaseResult?.inserted || 0),
+    cloned: Number(databaseResult?.inserted || 0) + inheritedCloned,
     updated: Number(databaseResult?.updated || 0),
     unchanged: Number(databaseResult?.unchanged || 0),
-    skipped: Number(databaseResult?.skipped || 0),
+    skipped: Math.max(0, Number(databaseResult?.skipped || 0) - inheritedCloned),
   };
 }
 
 function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false } = {}) {
   const chips = Array.isArray(snapshot?.promptChips) ? snapshot.promptChips : [];
   const promptChips = chips.flatMap((chip, index) => {
+    // Opaque snapshot retention only. The shared codec remains the parser in
+    // every editor/navigation boundary; malformed metadata never changes text.
+    if (chip?.kind === 'paste' && typeof chip.text === 'string' && chip.text
+      && chip.messageReference?.detailsText === chip.text) {
+      return [{ id: String(chip.id || `durable-message-chip-${index}`), kind: 'paste', text: chip.text,
+        label: String(chip.label || 'Вставка'), messageReference: chip.messageReference }];
+    }
     if (chip?.kind !== 'prompt') return [];
     const text = String(chip.text || '');
     if (!text && chip.attachmentKind !== 'file') return [];
@@ -480,7 +519,7 @@ function collectHistoryImagePathMarkersOutsidePastedContent(value) {
 function splitPromptPresentationRow(row) {
   const chips = Array.isArray(row?.chips) ? row.chips : [];
   return {
-    promptChips: chips.filter(item => item?.kind === 'prompt'),
+    promptChips: chips.filter(item => item?.kind === 'prompt' || item?.kind === 'paste' && item?.messageReference),
     semanticTags: chips.filter(item => (
       item?.kind === 'orchestration' || item?.kind === 'prompt-origin' || item?.kind === 'tab-message'
     )),
@@ -867,6 +906,64 @@ function recoverManagedHistoryImageRefs({
   return { imagePaths: refs, recovered };
 }
 
+// Older app COW commits copied the transcript/lineage but omitted prompt
+// sidecars. Recover only service tags, through that immutable lineage and an
+// exact full-text proof; raw text, delivery receipts and attachment owners stay
+// untouched. New commits copy the complete sidecar in their transaction.
+function mappedCodexServicePresentations(db, sessionId, entries, logger) {
+  if (!db?.getSessionHistoryContext || !db?.getHistoryPromptPresentations) return [];
+  let pending = entries.filter(entry => entry?.uuid && typeof entry.content === 'string'
+    && ['user', 'queued'].includes(entry.role));
+  const recovered = [];
+  const visited = new Set();
+  let owner = sessionId;
+  for (let depth = 0; pending.length && depth < 16 && !visited.has(owner); depth++) {
+    visited.add(owner);
+    const fork = db.getSessionHistoryContext(owner)?.fork;
+    if (fork?.provider !== 'codex' || fork.sessionId !== owner || fork.snapshotComplete !== true
+      || !['app', 'terminal-mcp', 'orchestration'].includes(fork.origin)
+      || !['rewind', 'edit', 'delete'].includes(resolveForkOperation(fork))
+      || !fork.sourceSessionId || visited.has(fork.sourceSessionId)) break;
+    const parent = fork.sourceSessionId;
+    const membership = new Set(Array.isArray(fork.entryUuids) ? fork.entryUuids : []);
+    const parentRows = new Map(db.getHistoryPromptPresentations('codex', parent)
+      .map(row => [`${row.auditTimestamp}\u0000${row.transportHash}`, row]));
+    const next = [];
+    for (const entry of pending) {
+      // The first event proves that this physical child row was copied, not
+      // appended later. Older ancestors must also predate this audited row.
+      if (depth === 0 && (!membership.has(entry.uuid)
+        || !entry.uuid.startsWith('codex-user-' + owner + '-'))) continue;
+      const occurredAt = Number(fork.occurredAt);
+      const forkTime = occurredAt > 1e12 ? occurredAt : occurredAt * 1000;
+      const auditTime = Date.parse(entry.promptPresentationAuditTimestamp || entry.timestamp);
+      if (depth > 0 && (!Number.isFinite(forkTime) || !Number.isFinite(auditTime)
+        || Math.floor(auditTime / 1000) > Math.floor(forkTime / 1000))) continue;
+      const timestamp = normalizeCodexPromptIdentityTimestamp(entry.promptPresentationAuditTimestamp || entry.timestamp);
+      const transportHash = String(entry.promptPresentationTransportHash || '') || promptTransportHash(entry.content);
+      const row = parentRows.get(`${entry.promptPresentationAuditTimestamp || entry.timestamp}\u0000${transportHash}`);
+      if (!row) { next.push(entry); continue; }
+      const fullHash = crypto.createHash('sha256').update(entry.content).digest('hex');
+      if (!timestamp || row.sessionId !== parent
+        || !row.entryUuid?.startsWith('codex-user-' + parent + '-')
+        || normalizeCodexPromptIdentityTimestamp(row.auditTimestamp) !== timestamp
+        || row.transportHash !== transportHash
+        || !splitPromptPresentationRow(row).semanticTags.some(tag => (
+          ['tab-message', 'orchestration'].includes(tag.kind) && tag.bodyProjectionHash === fullHash
+        ))) continue;
+      // Rebase the READ projection, never the source's durable receipt/row.
+      recovered.push({ ...row, sessionId, entryUuid: entry.uuid,
+        auditTimestamp: entry.promptPresentationAuditTimestamp || entry.timestamp,
+        transportHash, chips: splitPromptPresentationRow(row).semanticTags });
+    }
+    pending = next;
+    owner = parent;
+  }
+  if (recovered.length) logger?.info?.('[HistoryPromptPresentation:CodexLineage] child='
+    + String(sessionId).slice(0, 8) + ' restored=' + recovered.length + ' mode=read-only-exact');
+  return recovered;
+}
+
 function decorateHistoryPromptPresentations(db, {
   toolType,
   sessionId,
@@ -889,7 +986,11 @@ function decorateHistoryPromptPresentations(db, {
         source.map(entry => entry?.uuid).filter(Boolean),
       )
     : [];
-  const rows = [...exactRows, ...sessionRows];
+  const directRows = [...exactRows, ...sessionRows];
+  const directUuids = new Set(directRows.map(row => row.entryUuid).filter(Boolean));
+  const inheritedRows = toolType === 'codex' ? mappedCodexServicePresentations(db, sessionId,
+    source.filter(entry => !directUuids.has(entry?.uuid)), logger) : [];
+  const rows = [...inheritedRows, ...directRows];
 
   const exact = new Map();
   const pending = new Map();

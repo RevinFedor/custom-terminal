@@ -255,7 +255,7 @@ class WorkflowArchive {
     const run = () => {
       const workflows = this.organization.listWorkflows();
       const map = new Map(workflows.map(workflow => [workflow.id, workflow]));
-      const rows = table => this.db.prepare(`SELECT * FROM ${table} ${table === 'tab_history' ? "WHERE tab_type IS NULL OR tab_type!='file'" : ''} ORDER BY id DESC`).all()
+      const rows = table => this.db.prepare(`SELECT * FROM ${table} ${table === 'tab_history' ? `WHERE (tab_type IS NULL OR tab_type!='file') AND ${this.database.visibleTabHistorySql()}` : ''} ORDER BY id DESC`).all()
         .map(raw => {
           const namespace = namespaceOf(raw);
           const row = this.database._executionWireRow(raw);
@@ -274,7 +274,7 @@ class WorkflowArchive {
     return this.db.inTransaction ? run() : this.db.transaction(run)();
   }
   clearScope(namespace) {
-    const rows=this.db.prepare('SELECT * FROM tab_history WHERE COALESCE(project_id,execution_namespace)=? ORDER BY id').all(namespace);
+    const rows=this.db.prepare(`SELECT * FROM tab_history WHERE COALESCE(project_id,execution_namespace)=? AND ${this.database.visibleTabHistorySql()} ORDER BY id`).all(namespace);
     return {namespace,historyIds:rows.map(row=>row.id),rowsHash:fingerprint(rows),count:rows.length,
       cwds:[...new Set(rows.map(row=>row.cwd))],notesCount:rows.filter(row=>!!row.notes).length};
   }
@@ -308,7 +308,7 @@ class WorkflowArchive {
         const lease=this.leases?.leases.get(id);
         if(lease && this.leases.now()-lease.createdAt < this.leases.leaseTtlMs)fail('archive_restore_busy');
       }
-      const rows=this.db.prepare('SELECT id,notes FROM tab_history WHERE COALESCE(project_id,execution_namespace)=?').all(request.namespace);
+      const rows=this.db.prepare(`SELECT id,notes FROM tab_history WHERE COALESCE(project_id,execution_namespace)=? AND ${this.database.visibleTabHistorySql()}`).all(request.namespace);
       const ids=rows.filter(row=>request.kind==='clear-history' || !row.notes).map(row=>row.id);
       for(const id of ids)this.database.deleteTabHistoryEntry(id);
       const result={success:true,version:1,namespace:request.namespace,requestId:request.requestId,kind:request.kind,
@@ -325,6 +325,7 @@ class WorkflowArchive {
     if (!Number.isSafeInteger(id) || id < 1 || request.record?.id !== id || request.record.namespace !== request.namespace) fail('archive_exact_address_required');
     const row = this.db.prepare(`SELECT * FROM ${table} WHERE id=?`).get(id);
     if (!row || namespaceOf(row) !== request.namespace || request.expectedTabId && row.tab_id !== request.expectedTabId) fail('archive_address_changed');
+    if (kind !== 'favorite' && !this.database.getTabHistoryEntry(id, request.namespace)) fail('archive_address_changed');
     if (request.expectedRevision !== undefined && this.read().revision !== request.expectedRevision) fail('archive_revision_changed');
     return row;
   }

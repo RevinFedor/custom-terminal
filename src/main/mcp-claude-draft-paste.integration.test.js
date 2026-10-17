@@ -46,6 +46,7 @@ function harness({ busy = false, firstTurn = false, onDetect = null, onLookup = 
   const alivePids = new Set([101]);
   const stopping = new Map();
   const context = vm.createContext({
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
     ...require('./prompt-queue-source'),
     ...require('./claude-prompt-audit'),
     ...require('./agent-history-send-receipt'),
@@ -268,7 +269,7 @@ async function callActualMcpSendPrompt(h) {
         status: response.statusCode, text: async () => JSON.stringify(response.body) };
     },
   });
-  for (const name of ['httpPostOnPort', 'callTool']) {
+  for (const name of ['historyHttpError', 'httpPostOnPort', 'callTool']) {
     const node = mcpAst.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);
     assert.ok(node, 'actual MCP client function ' + name);
     vm.runInContext(node.getText(mcpAst), context);

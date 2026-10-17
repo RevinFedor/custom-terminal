@@ -52,7 +52,8 @@ Active Tabs и Favorites временно не рендерятся отдель
 
 Глобальный Dashboard и Project Home — разные поверхности. На глобальном Home
 после `MCP servers` и перед `AI processes` находится collapsible `Storage`:
-общий inventory Claude/Codex sessions, build outputs и app data. Он сканирует
+общий inventory Claude/Codex sessions, build outputs, app data и `Test runs`
+(registered private profiles с разбиением DB/conversations/app/other). Он сканирует
 filesystem только после раскрытия; Project Home по-прежнему отвечает только за
 закрытые вкладки и read-only preview и не получает глобальный disk scan. Полный
 контракт — [`fact-хранилище-сессий.md`](fact-хранилище-сессий.md).
@@ -160,7 +161,7 @@ name_set_manually, session_status, group_id
 - **Real-time Sync:** При редактировании названия проекта в табе (шапка), заголовок в Project Home обновляется мгновенно (через событие `project:name-sync`).
 - **Auto-Redirect:** Если в проекте не осталось вкладок, система автоматически переключает вид на Home.
 - **Visuals:** History больше не wrap-grid, а левая bounded-column рядом с постоянным preview. Полное имя видно в row; CMD+hover не дублирует name. Preview Timeline занимает только ширину collapsed Timeline-рельсы (~32px); не добавлять справа пустой декоративный блок. Selected/hover state карточек усиливает их собственный `TabColor` через alpha-step, а не красит всё в зелёный: зелёный уже занят Codex/Resume-семантикой. См. `methodology/дизайн-принципы.md::Контролы по контенту, не на всю ширину` и `methodology/дизайн-принципы.md::Semantic > symmetry: active через alpha-step`.
-- **History Refetch:** История автоматически обновляется при изменении `tabs.length` (закрытие таба → refetch).
+- **History Refetch:** История обновляется при изменении `tabs.length` (закрытие таба → refetch). Retention expiration передаёт exact expired IDs и убирает их из уже открытой global/legacy History/preview без refetch/loader; поздний GET или search не воскрешает строки. После Full Close и срока истёкшая запись исключена из list/count/latest/by-id/undo, но минимальный FK source сохраняет RAG. Native archived row и сохранившийся membership не равны active workflow tab. См. `fact-хранилище-сессий.md`.
 - **Session Search:** Старый collapsible `SemanticSearchSection` по JSONL-сессиям больше не рендерится на Home. Верхний input — instant title-filter, visible `RAG` — iteration-search, title-only index — отдельная maintenance-подсистема. См. [`fact-semantic-search.md`](fact-semantic-search.md).
 - **Scroll:** Контейнер ProjectHome использует `h-full overflow-hidden flex flex-col`; виртуализатор владеет внутренним scroll (`flex-1 min-h-0`). Не возвращать внешний `overflow-y-auto` вокруг всего Home: он конфликтует с bounded list и sticky progress header.
 - **Freeze diagnostics:** Home-flow логируется как цепочка, а не одним timestamp'ом. `[Perf:ProjectView]` / `[Perf:ProjectViewFrame]` показывают переключение terminal↔home на уровне workspace store; `[Perf:Home]` и `[Perf:HomeCommit]` отделяют IPC-загрузку history от render-to-frame. Старые `[Perf:HomeStatusSync]` по Active tabs и `search:stats` не должны появляться в нормальном Home-flow; если появились, значит кто-то вернул Active/Favorites или old SemanticSearch mount.

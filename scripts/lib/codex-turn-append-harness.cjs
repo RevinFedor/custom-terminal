@@ -30,6 +30,7 @@ function createHarness(filePath, options = {}) {
     createCodexLiveUserCarrierPairer: require(path.join(root, 'src/main/codex-live-user-carrier-pairing')).createCodexLiveUserCarrierPairer,
     CODEX_LIVE_USER_EVENT_CARRIER: 'event_msg', CODEX_LIVE_USER_RESPONSE_CARRIER: 'response_item',
     codexKnownSessions: new Map(),
+    codexCanonicalPresentation: null,
     console: { log: s => result.logs.push(s), warn: s => result.warnings.push(s) },
     codexTurnWatchers: watchers,
     readCodexTurnAppend: async args => {

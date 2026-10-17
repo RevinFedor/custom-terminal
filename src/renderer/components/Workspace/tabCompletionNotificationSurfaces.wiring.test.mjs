@@ -19,16 +19,14 @@ const card = readFileSync(join(workspaceDir, 'TabCard.tsx'), 'utf8');
 const store = readFileSync(join(rendererDir, 'store/useWorkspaceStore.ts'), 'utf8');
 const css = readFileSync(join(rendererDir, 'styles/globals.css'), 'utf8');
 
-test('sidebar and pane chip render the same completion-bell visual contract', () => {
+test('sidebar and pane chip share an unread completion ring and notification-mode bell', () => {
   assert.match(signals, /export function useTabCompletionNotificationDismissing/);
   assert.match(signals, /export function TabCompletionNotificationBadge/);
-  assert.equal(/export function (?:resolveTabCompletionNotificationShadow|TabCompletionNotificationAlert)/.test(signals), false,
-    'tab notification frame helpers are removed');
+  assert.match(signals, /export function TabCompletionNotificationAlert/);
 
   assert.match(pane, /<TabCard/);
   for (const source of [sidebar, card]) {
-    assert.equal(/resolveTabCompletionNotificationShadow|useTabCompletionNotificationDismissing|TabCompletionNotificationAlert/.test(source), false,
-      'enabled and fired notifications use the bell, not a tab frame or its fade timer');
+    assert.match(source, /<TabCompletionNotificationAlert fired=\{(?:completionNotificationFired|fired)\}/);
     assert.match(source, /<TabCompletionNotificationBadge armed=\{(?:completionNotificationArmed|armed)\}/);
     assert.match(source, /persistent=\{(?:completionNotificationPersistent|persistent)\}/);
   }
@@ -41,13 +39,45 @@ test('sidebar and pane chip render the same completion-bell visual contract', ()
   assert.match(css, /\.tab-completion-notification-alert--dismiss \{/);
 });
 
-test('removing notification frames preserves error, availability and selection visuals', () => {
+test('the unread overlay preserves error, availability and selection visuals', () => {
   assert.match(card, /border: hiddenErrors > 0 \? '1px solid #f87171'/);
   assert.match(card, /sessionAvailabilityRailShadow\(availability\)/);
   assert.match(sidebar, /sessionAvailabilityRailShadow\(sessionAvailability\)/);
   assert.match(sidebar, /isDragBlockedTarget \? 'inset 0 0 0 1\.5px rgba\(248, 113, 113, 0\.86\)'/);
   assert.match(sidebar, /if \(isSelected\)/);
   assert.match(sidebar, /return '2px dashed rgba\(255,255,255,0\.3\)'/);
+});
+
+test('the shared frame follows unread and dismissal without changing layout or hit targets', () => {
+  const ast = ts.createSourceFile('TabSignals.tsx', signals, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const declaration = ast.statements.find(node => ts.isFunctionDeclaration(node)
+    && node.name?.text === 'TabCompletionNotificationAlert');
+  assert.ok(declaration);
+  let dismissing = false;
+  const context = vm.createContext({ React, useTabCompletionNotificationDismissing: () => dismissing });
+  vm.runInContext(ts.transpile(declaration.getText(ast).replace(/^export /, ''), {
+    jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2022,
+  }) + '\nthis.Alert = TabCompletionNotificationAlert;', context);
+  const render = fired => renderToStaticMarkup(React.createElement(context.Alert, { fired }));
+  assert.equal(render(false), '', 'armed/persistent without unread adds no frame');
+  const unread = render(true);
+  assert.match(unread, /data-tab-completion-notification-ring/);
+  assert.match(unread, /class="tab-completion-notification-alert"/);
+  assert.match(unread, /position:absolute;inset:0;border-radius:inherit;z-index:4/);
+  assert.match(unread, /aria-hidden="true"/);
+  dismissing = true;
+  assert.match(render(false), /tab-completion-notification-alert--dismiss/);
+  assert.doesNotMatch(render(true), /tab-completion-notification-alert--dismiss/,
+    'a new unread completion takes precedence over an old fade');
+  dismissing = false;
+  assert.equal(render(false), '', 'the expired fade leaves no overlay');
+  assert.match(css, /\.tab-completion-notification-alert \{[^}]*pointer-events: none;/);
+  const workflow = readFileSync(join(workspaceDir, 'WorkflowActivityBadges.tsx'), 'utf8');
+  assert.match(workflow, /className=\{`tab-completion-notification-alert/,
+    'the exact same CSS owns the workflow and tab animation');
+  const pause = readFileSync(join(rendererDir, 'styles/presentationAnimations.css'), 'utf8');
+  assert.match(pause, /\.tab-completion-notification-alert,/);
+  assert.match(pause, /\.tab-completion-notification-alert\.tab-completion-notification-alert--dismiss \{\s*animation-play-state: paused, running !important;/);
 });
 
 test('the two bells keep distinct one-shot and persistent semantics', () => {

@@ -9,7 +9,7 @@ const { isAutomaticPromptQueueRequest, isAutomaticNoWriteWait, isAutomaticReadin
 const { mergeableQueuedSend, queuedSendMergeCompatible, composeQueuedSendMerge } = require('./queued-send-merge');
 const { protectQueueAssets, releaseQueueTransferPin, adoptCompletedQueueTransfers, adoptRunAfterItemAssets } = require('./replay-asset-ownership');
 const { classifyInputSlotRetirement, sendInputSlot } = require('./agent-send-input-slot');
-const { hiddenSendPresentation } = require('../shared/agent-send-receipt-control.cjs');
+const { hiddenSendPresentation, isTabMessageNoInputReceipt } = require('../shared/agent-send-receipt-control.cjs');
 const OPEN = "('waiting','dispatching','awaiting-receipt')";
 const ORDER = 'COALESCE(queue_position,id),id';
 const FAILED = new Set(['not-submitted', 'provider-not-accepted']);
@@ -18,12 +18,16 @@ const consumed = record => record?.state === 'confirmed'
   && !!record.auditIdentity?.sessionId
   && !!(record.auditIdentity?.entryUuid || record.auditIdentity?.sourceIdentity);
 
+function waitingBeforeInput(record, item, request) {
+  return item?.state === 'waiting' && (isAutomaticNoWriteWait(record, request)
+    || isTabMessageNoInputReceipt(record));
+}
+
 function applicationQueueReceipt(record, item) {
   if (record?.deliveryControl?.cancelledAt) return null;
-  const waitingBeforeInput = item?.state === 'waiting'
-    && isAutomaticNoWriteWait(record, JSON.parse(item.request_json));
+  const retryWaiting = item && waitingBeforeInput(record, item, JSON.parse(item.request_json));
   if (!record || !item || !['waiting','dispatching'].includes(item.state)
-    || (!waitingBeforeInput && (record.attemptId || !['reserved','preparing'].includes(record.state)))) return null;
+    || (!retryWaiting && (record.attemptId || !['reserved','preparing'].includes(record.state)))) return null;
   return {
     success: true, accepted: true, submitted: false, pasteWritten: false, enterWritten: false,
     status: 'application-queued', queued: true, applicationQueued: true,
@@ -33,7 +37,7 @@ function applicationQueueReceipt(record, item) {
     receiptState: record.state,
     applicationQueue: { version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
       position: item.queue_position ?? item.id,
-      ...(waitingBeforeInput ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}) },
+      ...(retryWaiting ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}) },
     ...(record.receipt?.ownedAttachments ? { attachmentOwnership: attachmentOwnershipReceipt(record.receipt.ownedAttachments) } : {}),
   };
 }
@@ -41,7 +45,7 @@ function applicationQueueReceipt(record, item) {
 class AgentSendQueue {
   constructor({ store, execute, publish = () => {}, publishMerge = null, transferMergedContext = null,
     ready = () => true, cancelAttempt = () => {}, admit = null, reconcile = null,
-    readInputSlot = null, projectPresentation = null }) {
+    readInputSlot = null, projectPresentation = null, claimDispatch = null }) {
     this.store = store;
     this.db = store.db;
     this.execute = execute;
@@ -54,6 +58,7 @@ class AgentSendQueue {
     this.reconcile = reconcile;
     this.readInputSlot = readInputSlot;
     this.projectPresentation = projectPresentation;
+    this.claimDispatch = claimDispatch;
     this.slotObservations = new Map();
     this.slotWakeSignatures = new Map();
     this.slotDirty = new Set();
@@ -99,6 +104,12 @@ class AgentSendQueue {
     return this.db.prepare('SELECT * FROM agent_send_queue WHERE operation_key = ?').get(operationKey) || null;
   }
 
+  hasUnsettledInput(tabId) {
+    return this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
+      AND state IN ('dispatching','awaiting-receipt')`).all(tabId)
+      .some(item => sendInputSlot(this.store.get(item.operation_key), item).state === 'held');
+  }
+
   receipt(operationKey) {
     return applicationQueueReceipt(this.store.get(operationKey), this.item(operationKey));
   }
@@ -106,12 +117,11 @@ class AgentSendQueue {
   queueInfo(operationKey) {
     const item = this.item(operationKey), record = this.store.get(operationKey);
     if (!item || !record) return null;
-    const waitingBeforeInput = item.state === 'waiting' && record.state === 'not-submitted'
-      && isAutomaticNoWriteWait(record, JSON.parse(item.request_json));
+    const retryWaiting = waitingBeforeInput(record, item, JSON.parse(item.request_json));
     return { version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
       inputSlot: sendInputSlot(record, item),
       position: item.queue_position ?? item.id, mergePrevious: this.mergeGuard(operationKey),
-      ...(waitingBeforeInput ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}),
+      ...(retryWaiting ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}),
       ...(item.merge_json ? { merge: JSON.parse(item.merge_json) } : {}),
       ...(item.release_json ? { release: JSON.parse(item.release_json) } : {}),
     };
@@ -295,7 +305,7 @@ class AgentSendQueue {
     return result;
   }
 
-  enqueue({ identity, request, execute }) {
+  enqueue({ identity, request, execute, retryNoInputAttemptId = null }) {
     // A function is only a current-process preparation callback. The immutable
     // JSON request is the recovery source; it contains no live UI references.
     const snapshot = JSON.parse(JSON.stringify(request));
@@ -309,6 +319,22 @@ class AgentSendQueue {
       const existing = this.item(identity.operationKey);
       if (existing) {
         if (existing.request_hash !== requestHash) return { ok: false, action: 'conflict', code: 'agent_send_handoff_conflict' };
+        const record = this.store.get(identity.operationKey);
+        if (existing.state === 'failed' && retryNoInputAttemptId
+          && record?.attemptId === retryNoInputAttemptId && isTabMessageNoInputReceipt(record)) {
+          const reservation = this.store.reserveOrGet(identity, { queuedAdmission: true });
+          if (!reservation.ok) return reservation;
+          // The message owner requested recovery after a proven no-input
+          // refusal. Keep its immutable request/ID; join behind current work.
+          const predecessor = this.db.prepare(`SELECT operation_key FROM agent_send_queue
+            WHERE tab_id=? AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(existing.tab_id);
+          const position = this.db.prepare('SELECT MAX(COALESCE(queue_position,id)) n FROM agent_send_queue WHERE tab_id=?')
+            .get(existing.tab_id).n + 1;
+          this.db.prepare("UPDATE agent_send_queue SET state='waiting',queue_position=?,predecessor_key=?,updated_at=? WHERE operation_key=? AND state='failed'")
+            .run(position, predecessor?.operation_key || null, Date.now(), identity.operationKey);
+          if (predecessor) this.store.pinForOwner(predecessor.operation_key, 'send-queue-successor:' + identity.operationKey);
+          return { ok: true, item: this.item(identity.operationKey), record, replayed: true, retryQueued: true };
+        }
         return { ok: true, item: existing, record: this.store.get(identity.operationKey), replayed: true };
       }
       const mergedSource = this.db.prepare('SELECT * FROM agent_send_queue_merge_sources WHERE operation_key=?').get(identity.operationKey);
@@ -410,7 +436,7 @@ class AgentSendQueue {
       version: 1, id: item.id, state: item.state, queuedAt: item.created_at,
       position: item.queue_position ?? item.id, mergePrevious: this.mergeGuard(item.operation_key),
       ...(item.merge_json ? { merge: JSON.parse(item.merge_json) } : {}),
-      ...(item.state === 'waiting' && isAutomaticNoWriteWait(record, request)
+      ...(waitingBeforeInput(record, item, request)
         ? { waitingBeforeInput: true, lastNoWriteAttemptId: record.attemptId } : {}),
       ...(item.release_json ? { release: JSON.parse(item.release_json) } : {}),
     } };
@@ -420,8 +446,9 @@ class AgentSendQueue {
     if (!record || this.admitting > 0 || this.disposed) return;
     const item = this.item(record.operationKey);
     if (!item) return;
-    if (!record.deliveryControl?.cancelledAt && ['waiting', 'dispatching'].includes(item.state)
-      && isAutomaticNoWriteWait(record, JSON.parse(item.request_json))) {
+    if (!record.deliveryControl?.cancelledAt
+      && (waitingBeforeInput(record, item, JSON.parse(item.request_json))
+        || item.state === 'dispatching' && isAutomaticNoWriteWait(record, JSON.parse(item.request_json)))) {
       this.db.prepare("UPDATE agent_send_queue SET state = 'waiting', updated_at = ? WHERE operation_key = ?")
         .run(Date.now(), item.operation_key);
       this.parked.add(item.tab_id);
@@ -577,13 +604,12 @@ class AgentSendQueue {
       return;
     }
     const request = JSON.parse(item.request_json);
-    const waitingBeforeInput = !record.deliveryControl?.cancelledAt
-      && item.state === 'waiting' && isAutomaticNoWriteWait(record, request);
-    if (consumed(record) || (FAILED.has(record.state) && !waitingBeforeInput)) {
+    const retryWaiting = !record.deliveryControl?.cancelledAt && waitingBeforeInput(record, item, request);
+    if (consumed(record) || (FAILED.has(record.state) && !retryWaiting)) {
       this.observe(record);
       return;
     }
-    if (!waitingBeforeInput && (record.attemptId || !['reserved','preparing'].includes(record.state))) {
+    if (!retryWaiting && (record.attemptId || !['reserved','preparing'].includes(record.state))) {
       await this.retireObsoleteInputSlot(tabId);
       return;
     }
@@ -598,6 +624,7 @@ class AgentSendQueue {
         toolType: record.provider, sessionId: inheritedSession } } : {}),
     };
     let parked = false;
+    let releaseDispatch = null;
     try {
       if (this.admit) {
         this.parked.add(tabId);
@@ -614,6 +641,13 @@ class AgentSendQueue {
       }
       if (this.disposed || !this.ready()) { parked = true; return; }
       if (this.item(item.operation_key)?.state === 'cancelled') return;
+      // Recheck synchronously AFTER asynchronous admission. A History intent
+      // can reserve this tab while that await is pending. Keep this SAME item
+      // waiting, with no attempt/PTY input, instead of failing or re-enqueuing.
+      if (this.claimDispatch) {
+        releaseDispatch = this.claimDispatch(request);
+        if (!releaseDispatch) { this.parked.add(tabId); parked = true; return; }
+      }
       this.db.prepare('UPDATE agent_send_queue SET state = ?, updated_at = ? WHERE operation_key = ?')
         .run('dispatching', Date.now(), item.operation_key);
       this.publishRecord(record);
@@ -634,6 +668,10 @@ class AgentSendQueue {
         && isAutomaticNoWriteWait(this.store.get(item.operation_key), request)) {
         parked = true;
         this.rerun.delete(tabId); // receipt publication is not readiness evidence
+      } else if (waitingBeforeInput(this.store.get(item.operation_key), this.item(item.operation_key), request)) {
+        // A message wake may have requeued the refused attempt before this
+        // callback returned. Keep its executor/waiters and the explicit wake.
+        parked = true;
       }
     } catch (error) {
       // No attempt was begun: the existing executor has not crossed its durable
@@ -645,6 +683,7 @@ class AgentSendQueue {
       console.warn('[AgentSendQueue] dispatch failed tab=' + String(tabId).slice(-12)
         + ' id=' + item.id + ' error=' + error.message);
     } finally {
+      releaseDispatch?.();
       this.running.delete(tabId);
       const rerun = this.rerun.delete(tabId);
       if (!parked || this.item(item.operation_key)?.state !== 'waiting') {
@@ -663,7 +702,7 @@ class AgentSendQueue {
       + (handoffId ? ' AND r.handoff_id = ?' : '')).all(...(handoffId ? [tabId, handoffId] : [tabId]))
       .map(item => ({ item, record: this.store.get(item.operation_key) }))
       .filter(({ item, record }) => record && (!record.attemptId
-        || isAutomaticNoWriteWait(record, JSON.parse(item.request_json))));
+        || waitingBeforeInput(record, item, JSON.parse(item.request_json))));
     const results = items.map(({ item, record }) => {
       try { return this.cancelDelivery(tabId, record.handoffId, { dismiss, reason }); }
       catch (error) { return { cancelled: false, durable: false, complete: false,

@@ -19,7 +19,7 @@ subagents, `tool-results` и многочисленные `.bak`/`autorepair`/ma
 занимали около 2,4 ГБ. Поэтому Storage является provider-neutral поверхностью,
 хотя удаление у Claude и Codex физически различается.
 
-## Принятый продуктовый контракт
+## Защита сессий и текущая реализация Storage
 
 - Все сессии открытых вкладок сохраняются без таймера.
 - Физические source-файлы, необходимые открытой thin-fork сессии, считаются
@@ -27,16 +27,41 @@ subagents, `tool-results` и многочисленные `.bak`/`autorepair`/ma
 - Claude subagent открытой родительской сессии защищён для инспекции.
 - Все остальные session-файлы получают полный срок после доказанной потери
   защиты: по умолчанию не раньше 24 часов, не по старому возрасту JSONL.
-  Home History row может остаться metadata-only:
-  название, проект и дата видны, но Preview/Resume после удаления невозможны.
+  Полный Close имеет собственный срок: после него запись исчезает из History
+  и больше не участвует в Restore/Shift+Cmd+T. Файлы удаляются прежним provider
+  pipeline; источник, нужный другой открытой ветке, остаётся защищён.
 - Таймер можно переопределить по группе: 1/3/7/30 дней либо Never.
   Общий `Auto-delete delay` в часах задаёт минимальную отсрочку после потери
   защиты; более длинный срок группы сохраняется, Never отключает автоматическое
   удаление этой группы. Снятие chip с окна при сохранении вкладки в workflow/
   reserve вообще не снимает защиту.
+- Expiration переиспользует тот же classifier группы, а не складывает fork/dev
+  сроки. Если файл уже отсутствует, происхождение не доказано и relevant группа
+  имеет Never, запись сохраняется с `retention-group-unknown`, не угадывается.
 - Renderer не решает, что безопасно удалить. Main отдаёт `deletable`,
   `protectedReason`, closure и opaque item ID, затем повторно проверяет версии
   выбранных физических файлов и полный подтверждённый состав удаления.
+
+RAG сохраняется: `storage_expired_tab_history` потребляет право восстановления,
+а минимальная исходная строка `tab_history` остаётся владельцем FK поискового
+индекса. Retention не вызывает каскадный `DELETE tab_history` и не копирует
+embeddings. Крупные restore-поля/планы/notes/snapshot и file-link manifest
+очищаются; оригиналы прикреплённых файлов не удаляются. Обычная History,
+count/latest/by-id/window undo и архивный title/iteration search исключают
+истёкшие записи; независимый transcript RAG не меняется. Отсутствие provider
+файла не оставляет вечную запись History, а отказ его удаления не становится
+правом raw unlink: оставшиеся источники перечисляются отдельно.
+
+«Убрать из окна» меняет только размещение: вкладка остаётся в боковом списке
+workflow/reserve и защищает разговор. Полный Close Tab архивирует вкладку,
+убирая её из окон и бокового списка. Эти два действия нельзя смешивать при
+объяснении срока хранения. Проверяется весь active membership всех workflow,
+включая reserve и stopped, а не видимость окна. SQL membership сам по себе не
+доказывает открытость: V2 сохраняет его после Full Close; требуется текущая
+execution row с `execution_archived!=1`, как в `catalog-v1`. Один SID в другой
+открытой вкладке защищает разговор, не старую закрытую запись с другим tab ID.
+Restore lease/созданный restore-owner и живой exact tab повторно проверяются
+после awaited audit, внутри транзакции expiration.
 
 Отсутствие сессии в текущей prod DB само по себе не является доказательством
 «мусор»: dev/prod имеют разные SQLite, standalone CLI/worktree/subagent могут
@@ -56,7 +81,7 @@ Storage живёт на глобальном Home между `MCP servers` и `A
 монтируется независимо от process discovery и начинает filesystem scan только
 после раскрытия; зависший поиск MCP/AI-процессов не имеет права скрыть disk UI.
 
-Storage имеет три вкладки с английскими названиями:
+Storage имеет четыре вкладки с английскими названиями:
 
 1. `Sessions` — provider switch `All / Codex / Claude`, поиск и сортировка по
    size/date/iterations.
@@ -64,6 +89,19 @@ Storage имеет три вкладки с английскими назван�
    и защищённый installed runtime.
 3. `Noted Terminal data` — DB backups, active databases, Chromium caches и
    prompt images.
+4. `Test runs` — registered private Noted test profiles, включая packaged `.app`:
+   Databases / Conversations / Application builds / Cache, sources & evidence.
+   Это учёт всего стенда, не число JSONL и не разрешение удалить остановленный,
+   но ещё нужный acceptance profile.
+
+Полностью private E2E публикует небольшой `noted-test-run.v1.json` в своём
+дереве; ручных отметок вкладок/новых launch-согласований нет. Existing проверенные
+roots могут быть добавлены accounting receipt без запуска приложения.
+Discovery идёт по receipts, bounded по directories/depth/profiles; не следует
+symlinks, не читает SQLite/содержимое разговоров и не угадывает ownership по
+имени папки. Асинхронные readdir/stat/du принадлежат прежнему single-flight
+inventory, не новому History reader. Суммы allocated/CoW не обещают такой же
+reclaimed размер. Partial scan обозначается явно. Whole-profile delete отсутствует.
 
 Session groups также пользовательские, а не внутренние:
 
@@ -203,12 +241,23 @@ Production inventory помечает ссылки, найденные толь�
 child, и его exact source segments; source, одновременно нужный production,
 получает обе environment-ссылки и не становится disposable dev-only.
 
-Автоматическим retention владеет только packaged production. Обычный и
-изолированный dev могут строить inventory, но не запускают фоновый timer.
+Автоматическим общим retention владеет только canonical packaged production.
+Обычный dev и packaged app с посторонним userData не получают общий timer.
 Явное ручное удаление из dev разрешается только когда каноническая production
 DB открыта read-only; отсутствие этой authority возвращает
 `storage_production_authority_unavailable` до scan/provider mutation. E2E
-runtime не получает destructive authority даже при доступной production DB.
+runtime не получает общую destructive authority даже при доступной production DB.
+Исключение — полностью private E2E с физически проверенными userData,
+CODEX_HOME и CLAUDE_CONFIG_DIR внутри собственного isolation root: те же сроки
+применяются только к его собственным закрытым данным. Fresh path guards и
+`mutationRoot` запрещают выход наружу; audit тоже остаётся в private userData.
+Перед test Codex delete provider `thread/read(includeTurns:false)` обязан
+подтвердить physical rollout path каждого затрагиваемого SID внутри root и
+exact path выбранного файла. Скопированный state.sqlite может содержать
+абсолютный путь к исходному профилю: одного private CODEX_HOME недостаточно.
+Unknown/null path — отказ удаления, не fallback к unlink. Production provider
+flow от этого test guard не меняется. Сохранённые открытые вкладки sibling dev
+DB тоже защищаются; archived native row не является open.
 
 После перехода к workflow размер текущих разговоров считают по canonical
 bindings, включая reserve: `catalog-v1.executionRefs[*].savedSessions.codex`
@@ -266,11 +315,12 @@ exact selected IDs/paths и changed-item reasons. Отказ до mutation яв�
 сообщает «Nothing was deleted»; частичный результат не выдаётся за нулевое
 удаление. Повторный Delete при in-flight operation блокируется синхронно.
 
-Automatic sweep стартует только в packaged production через 90 секунд после
-app-ready. Dev и E2E не являются владельцами таймера. Один проход ограничен
+Automatic sweep стартует у canonical production/private test owner через
+90 секунд после app-ready. Shared dev не владеет таймером. Один проход ограничен
 25 items либо примерно 2 ГБ и повторяется через 15 минут, пока есть eligible
-leaves; спокойный интервал — шесть часов. Изменение settings перевзводит sweep
-только у production owner. `Clean all ready` и `Delete now` используют inline
+leaves; спокойный интервал — шесть часов. Expiration History обрабатывает отдельно
+до250 записей; при backlog следующий bounded проход через секунду. Изменение
+settings перевзводит sweep только у разрешённого owner. `Clean all ready` и `Delete now` используют inline
 two-step confirmation и показывают точный count/bytes.
 
 Большой batch не выглядит зависшим: `storage:delete-progress` несёт
@@ -291,16 +341,25 @@ IDs. Те же ID попадают в `[StorageCleanup:Item]` production log; а
 очистке только потому, что её JSONL давно не изменялся. Прежний fallback
 `closedAt || modifiedAt` смешивал возраст данных и время возникновения права
 на автоматическое удаление. Main теперь хранит отдельный `unprotectedSince`:
-первый успешный inventory без защиты даёт полный новый срок. Это консервативное
+первый успешный inventory без защиты даёт полный новый срок внешним файлам. Это консервативное
 наблюдение, не обещание удаления ровно через N часов после клика; sweep может
 обнаружить закрытие позже. При первом запуске новой версии и при потере clock
 старые внешние сессии тоже получают новый срок, не считаются уже просроченными.
+
+Сама History истекает от committed Close независимо от доступности provider-файла.
+У физического файла остаётся отдельная безопасная отсрочка после доказанной
+потери защиты: старый close/mtime/birthtime не доказывает identity после recovery
+или копирования с сохранением timestamps. На первом обновлении ранее ошибочно
+защищённые V2 архивы могут получить новые сутки для удаления файла; это не
+оставляет истёкшую запись в History и не разрешает трогать текущую вкладку.
 
 Clock переживает restart в отдельной SQLite-таблице storage owner. Возврат
 saved binding, физическая замена/изменение файла либо новое закрытие отменяют
 старый отсчёт. SQL-trigger привязки и exact lineage sources нужен потому, что
 Restore → Full Close может целиком пройти между двумя inventory: один только
 UI close callback или следующий scan не доказывает непрерывную потерю защиты.
+V2 `execution_archived:1→0` и создание membership тоже инвалидируют clock:
+Restore может сохранить SID, не вызвав прежний binding-trigger.
 Recovery copy с тем же SID остаётся отдельным физическим объектом. Reconcile
 читает clock после async scan в одной транзакции; перед mutation после await
 audit/provider снова проверяются текущий clock, settings и stat. Истёкший срок
@@ -314,6 +373,31 @@ deadline — более поздний из group-age threshold и `unprotectedS
 а main снова использует один день. Базовый filesystem inventory сам по себе
 не является готовым retention decision: действующий DTO проходит service clock.
 Новых polling/reader/History loops нет — reconcile только на прежнем scan.
+
+## Служебные снимки workflow и проверка без UI
+
+`workflow_org_generations` раньше бесконечно сохраняла полный `readState()`
+на каждую publication. Это копии состояния всех вкладок, не разговоры JSONL.
+Source17.10 удерживает первый migration snapshot и два последних; worker
+запускается с backlog от восьми и удаляет старые rows малыми транзакциями вне
+Main. Current tables, migration source и immutable mutation receipts не
+очищаются. Busy/ошибка откладывает prune до следующей publication; ошибка
+maintenance не превращает committed действие в failed ACK. Test DB path
+проверяется отдельно: physical file/identity, не symlink/hardlink наружу.
+
+Освободившиеся SQLite pages переиспользуются. У старой DB с auto_vacuum=0
+файл сам не уменьшается: это не обещание немедленных свободных гигабайт.
+Новые DB создаются с INCREMENTAL; существующие не переписываются при старте.
+Блокирующий live VACUUM/подмена рабочей DB в этот flow не входят.
+
+Application API `storageMaintenance.version=1`: GET `/api/storage/inventory`,
+`/api/storage/plan`, `/api/storage/database-space`; POST `/api/storage/cleanup`
+с обязательным operationId, GET `/api/storage/cleanup/:operationId` — receipt.
+Started/unknown не переисполняется. API вызывает прежний service и runtime
+guards, не произвольный SQL. `scripts/storage-cleanup.mjs` по умолчанию dry-run;
+на старом app сообщает update-required, не открывает SQLite напрямую.
+Проверка source17.10 — `scripts/storage-retention-dry-run.cjs`: реальные own
+SQLite/worker/V2 Close/expiration/RAG bytes, fake provider; без UI/моделей/install.
 
 ## Инцидент 25.08: изолированный dev удалял production history
 

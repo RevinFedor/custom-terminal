@@ -1,5 +1,7 @@
+import {uiDragDiagnostic} from '../utils/uiPerformanceDiagnostics.mjs';
 import { create } from 'zustand';
 import { rememberAgentLaunchFence, observeAgentLaunchFences } from '../utils/agentLaunchFence.mjs';
+import { beginTabCloseFeedback } from '../utils/tabCloseFeedback.mjs';
 import { createExecutionRevisionAcks } from '../utils/executionRevisionAcks.mjs';
 import { createWorkflowRelationReceipts } from '../utils/workflowRelationReceipts.mjs';
 import { applyWorkflowDragLayout } from '../utils/workflowDragNavigation.mjs';
@@ -41,6 +43,7 @@ import {
   planCarriedCodexSettingsProofApplication,
   projectCodexSettingsProofOwner,
 } from '../utils/codexSessionAdoption.mjs';
+import { planCodexContextForkSettings } from '../utils/codexEffectiveSettings.mjs';
 import {
   stopAiBeforeTerminalKill,
 } from '../utils/terminalCloseLifecycle.mjs';
@@ -404,6 +407,7 @@ export type CodexSessionWriteReason =
 
 export interface CodexSessionAdoptionOptions {
   historyOperation?: { tabId: string; operationId: string };
+  historyInput?: { version: number; tabId: string; operationId: string; token: string };
   carryCodexSettingsProof?: boolean;
   codexSettingsProof?: {
     model: string;
@@ -774,7 +778,7 @@ export interface PendingAction {
   type: 'claude-fork' | 'claude-compact-fork' | 'claude-continue' | 'claude-new' | 'gemini-fork' | 'gemini-continue' | 'gemini-new' | 'codex-fork' | 'codex-compact-fork' | 'codex-continue' | 'codex-new' | 'shell-command';
   sessionId?: string;    // For AI fork/continue actions
   sourceSessionId?: string; // Original branch for pre-created compact forks
-  contextFork?: { sourceTabId: string; sourceSessionId: string; fromLatestCompact: boolean };
+  contextFork?: { sourceTabId: string; sourceSessionId: string; fromLatestCompact: boolean; initialSettings?: { model: string; effort: string } };
   launchFence?: { terminalInstanceId: string; stopRevision: number } | null;
   command?: string;      // For shell-command
   developerInstructions?: string; // Codex external-run launch config
@@ -878,6 +882,7 @@ interface Tab {
   codexLiveServiceTierSource?: string; // Verified composer footer or exact /fast acknowledgement
   codexSettingsProofAt?: number; // Time of latest launch/picker/turn_context proof
   codexSettingsProofSessionId?: string; // Session that owns the settings proof
+  codexForkInitialSettings?: { model: string; effort: string; sourceSessionId: string }; // Transient choice, NOT child/live proof.
   codexModelMigrationPending?: boolean; // Old launch pair was invalidated before native migration Enter
   codexModelMigrationRestoreDefaultModel?: boolean; // Durable provenance for crash recovery
   codexModelMigrationRestoreDefaultEffort?: boolean;
@@ -2064,8 +2069,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string; reservedTabId?: string; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string; reservedTabId?: string; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string; reservedTabId?: string; canPublish?: (tabs: Map<string, Tab>) => boolean; publishOrganizationWithTab?: boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string; reservedTabId?: string; canPublish?: (tabs: Map<string, Tab>) => boolean; publishOrganizationWithTab?: boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean;
     groupCloseGuard?: {mutationId:string;tabId:string;guardToken:string} }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
@@ -2195,7 +2200,7 @@ interface WorkspaceStore {
   reorderProjects: (orderedProjectIds: string[]) => void;
 
   // Claude SDK tabs
-  createSDKTab: (projectId: string, name?: string, options?: { cwd?: string; workflowId?: string; afterTabId?: string; afterVisualSubtree?: boolean; groupId?: string; visualParentTabId?: string; background?: boolean; windowScoped?: boolean; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
+  createSDKTab: (projectId: string, name?: string, options?: { cwd?: string; workflowId?: string; afterTabId?: string; afterVisualSubtree?: boolean; groupId?: string; visualParentTabId?: string; background?: boolean; windowScoped?: boolean; canPublish?: (tabs: Map<string, Tab>) => boolean; publishOrganizationWithTab?: boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
   updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking' | 'sdkMidstreamPending' | 'sdkComposerChips'>>) => void;
   // Merge a partial BgTask patch by taskId. Creates the entry if missing.
@@ -2471,6 +2476,7 @@ const commitCodexSessionId = async (
   expectedSessionId: string | null,
   reason: string,
   historyOperation?: { tabId: string; operationId: string },
+  historyInput?: CodexSessionAdoptionOptions['historyInput'],
 ): Promise<any> => {
   const result = await ipcRenderer.invoke('tab:set-codex-session-id', {
     projectId,
@@ -2479,6 +2485,7 @@ const commitCodexSessionId = async (
     expectedSessionId,
     reason,
     ...(historyOperation ? { historyOperation } : {}),
+    ...(historyInput ? { historyInput } : {}),
   });
   if (result?.success === false) {
     const error: any = new Error(result.error || 'codex_session_point_write_failed');
@@ -3126,14 +3133,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     if(!request || !get().organizationReady || !isCurrent())return false;
     const navigationAtCommit=get().navigationRevision;
     const frozen=JSON.parse(JSON.stringify(request));
+    uiDragDiagnostic('commit-request',{gestureId:frozen.gestureId,mutationId:frozen.mutationId,workflowId:frozen.targetWorkflowId});
     try {
       // Flush ordinary local state first. The drag's member/relation/placement
       // guards stay exactly as captured; the command never samples new guards.
       await get().commitOrganization();
+      uiDragDiagnostic('commit-organization-flushed',{gestureId:frozen.gestureId,mutationId:frozen.mutationId});
       const namespaces=[...new Set(frozen.tabs.map((tab:any)=>tab.expected.namespace))] as string[];
       const commit=()=>organizationCommitter.command('commitDrag',frozen,{isCurrent});
       const result=namespaces.length ? await projectTabSaveQueue.enqueueMany(namespaces,commit) : await commit();
       const snapshot=result.snapshot;
+      uiDragDiagnostic('commit-reply',{gestureId:frozen.gestureId,mutationId:frozen.mutationId,accepted:result.success===true,publicationRevision:snapshot?.publication?.revision,generation:snapshot?.publication?.generation});
       if(!snapshot || result.success!==true)return false;
       const state=get(),openProjects=new Map(state.openProjects);
       const reveal=state.view==='workspace' && state.navigationRevision===navigationAtCommit && isCurrent();
@@ -3167,8 +3177,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         const shown=get().activeSpaceTab;
         if(shown)get().activateCenterTab(shown.projectId,shown.tabId);
       }
-      get().saveSession();return true;
+      get().saveSession();
+      uiDragDiagnostic('commit-applied',{gestureId:frozen.gestureId,mutationId:frozen.mutationId,publicationRevision:snapshot.publication.revision,generation:snapshot.publication.generation,current:reveal});
+      return true;
     } catch(error:any) {
+      uiDragDiagnostic('commit-error',{gestureId:frozen.gestureId,mutationId:frozen.mutationId});
       console.warn('[WorkflowReserveDnd:commit-rejected]',error?.message || error);
       return false;
     }
@@ -4284,6 +4297,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         afterTabId: context.cwdTabId || undefined,
         visualParentTabId: '',
         canPublish,
+        publishOrganizationWithTab: true,
         onPublish,
       } as const;
 
@@ -5944,6 +5958,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       codexSessionId: options?.codexSessionId,
       codexModel: options?.codexModel,
       codexEffort: options?.codexEffort,
+      ...planCodexContextForkSettings({ pendingAction: options?.pendingAction,
+        sourceTab: workspace.tabs.get(options?.pendingAction?.contextFork?.sourceTabId || ''), options }),
       codexSettingsProofAt: (options as any)?.codexSettingsProofAt,
       codexSettingsProofSessionId: (options as any)?.codexSettingsProofSessionId,
       codexModelMigrationPending: (options as any)?.codexModelMigrationPending,
@@ -5987,7 +6003,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       restartAfterArmed: (options as any)?.restartAfterArmed || undefined
     };
 
-    await allocateOrganizationTab(projectId,newTab,options);
+    const organizationPublication = await allocateOrganizationTab(projectId,newTab,options);
     // Claude SDK and linked file tabs don't need a PTY process.
     if (newTab.tabType === 'claude-sdk' || newTab.tabType === 'file') {
       console.log('[Store] createTab: non-PTY tab, skipping terminal for:', tabId, 'type:', newTab.tabType);
@@ -6067,10 +6083,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           );
         },
         publish: (candidateTabs) => {
-          workspace.tabs = candidateTabs;
           if (uiState.terminalIsPrimaryTabs[tabId] === undefined) {
             uiState.setTabTerminalIsPrimary(tabId, terminalPrimaryDefault);
           }
+          workspace.tabs = candidateTabs;
           if (!options?.background) {
             workspace.activeTabId = tabId;
             workspace.activeGroupId = newTab.groupId || null;
@@ -6080,6 +6096,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           }
           const placement = (options as any)?.onPublish?.(tabId, candidateTabs) || null;
           set({
+            ...(organizationPublication?.() || {}),
             openProjects: new Map(get().openProjects),
             pendingEditTabId: shouldEdit ? tabId : null,
             ...(placement || {}),
@@ -6183,6 +6200,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       codexSessionId: options?.codexSessionId,
       codexModel: options?.codexModel,
       codexEffort: options?.codexEffort,
+      ...planCodexContextForkSettings({ pendingAction: options?.pendingAction,
+        sourceTab: workspace.tabs.get(options?.pendingAction?.contextFork?.sourceTabId || ''), options }),
       codexSettingsProofAt: (options as any)?.codexSettingsProofAt,
       codexSettingsProofSessionId: (options as any)?.codexSettingsProofSessionId,
       codexModelMigrationPending: (options as any)?.codexModelMigrationPending,
@@ -6220,7 +6239,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       ? options.pendingAction.command
       : undefined;
 
-    await allocateOrganizationTab(projectId,newTab,options);
+    const organizationPublication = await allocateOrganizationTab(projectId,newTab,options);
     // Claude SDK and linked file tabs don't need a PTY process — mirror createTab's guard.
     // Without it, non-terminal tabs spawn unused shells and enter process lifecycle by accident.
     if (newTab.tabType === 'claude-sdk' || newTab.tabType === 'file') {
@@ -6300,10 +6319,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         'tab-created',
       ),
       publish: (candidateTabs) => {
-        workspace.tabs = candidateTabs;
         if (uiState.terminalIsPrimaryTabs[tabId] === undefined) {
           uiState.setTabTerminalIsPrimary(tabId, terminalPrimaryDefault);
         }
+        workspace.tabs = candidateTabs;
         if (!options?.background) {
           workspace.activeTabId = tabId;
           workspace.activeGroupId = targetGroupId || null;
@@ -6315,6 +6334,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         // уже существует, но её места ещё нет.
         const placement = options?.onPublish?.(tabId, candidateTabs) || null;
         set({
+          ...(organizationPublication?.() || {}),
           openProjects: new Map(get().openProjects),
           pendingEditTabId: shouldEdit ? tabId : null,
           ...(placement || {}),
@@ -6364,6 +6384,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
 
     const tab = workspace.tabs.get(tabId);
     if (!tab) return false;
+    const finishCloseFeedback = beginTabCloseFeedback({
+      tab,
+      isCurrent: () => get().openProjects.get(projectId)?.tabs.get(tabId) === tab,
+      publish: () => set({openProjects: new Map(get().openProjects)}),
+    });
+    try {
     const expectedTabIdsBeforeClose = Array.from(workspace.tabs.keys());
     const skipProcessCheck = options?.skipProcessCheck || false;
     const ptyAgentOwner = resolvePtyAgentOwner(tab);
@@ -6466,20 +6492,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     // spend time here (writer proof + a possible stop-and-retry below), and a
     // click that visibly does nothing for that long was reported as "middle
     // click does not work". Cleared on every return-false path below.
-    const showsPreArchiveLoader = isAiTab || processWasRunning;
-    if (showsPreArchiveLoader) {
-      tab.aiClosing = true;
-      startTransition(() => {
-        set({ openProjects: new Map(openProjects) });
-      });
-    }
-    const clearClosingLoader = () => {
-      if (!tab.aiClosing) return;
-      tab.aiClosing = false;
-      startTransition(() => {
-        set({ openProjects: new Map(openProjects) });
-      });
-    };
+    const clearClosingLoader = finishCloseFeedback;
     const archiveCommit = await commitArchiveWithStopRetry({
       shouldArchive: shouldArchiveToHistory,
       commandType: effectiveCommandType,
@@ -6574,13 +6587,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     // sits there after the click reads as "the close did not work", which is
     // exactly how the broken Codex path was reported. (The loader may already
     // be up from the pre-archive block; this only widens it to the stop phase.)
-    const showsClosingLoader = shouldStopAiProcess || processWasRunning;
-    if (showsClosingLoader && !tab.aiClosing) {
-      tab.aiClosing = true;
-      startTransition(() => {
-        set({ openProjects: new Map(openProjects) });
-      });
-    }
     if (shouldStopAiProcess) {
       try {
         if (tab.tabType === 'claude-sdk') {
@@ -6621,10 +6627,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           + ': ' + (error instanceof Error ? error.message : String(error)));
       }
       if (!closeRuntime.terminalKilled) {
-        tab.aiClosing = false;
-        startTransition(() => {
-          set({ openProjects: new Map(openProjects) });
-        });
+        clearClosingLoader();
         const stopFailure = closeRuntime.stopResult?.error
           || (closeRuntime.stopError instanceof Error
             ? closeRuntime.stopError.message
@@ -6889,6 +6892,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       get().activateCenterTab(splitSurvivor.projectId, splitSurvivor.tabId);
     }
     return true;
+    } finally {
+      finishCloseFeedback();
+    }
   },
 
   restoreTabHistoryEntry: async (projectId, historyId, options = {}) => {
@@ -9239,16 +9245,22 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
-        const carriedSettingsPlan = options.codexSettingsProofInvalid === true
-          ? { allowed: false, reason: 'carried-codex-settings-proof-invalid' }
-          : options.codexSettingsProof
-            ? planCarriedCodexSettingsProofApplication({
+        const applyCarriedSettings = () => {
+          // Re-read after every awaited History/CAS seam, including SAME SID.
+          // A captured source plan cannot overwrite a later child selection.
+          if (get().openProjects.get(projectId)?.tabs.get(tabId) !== tab) return false;
+          const carriedSettingsPlan = options.codexSettingsProofInvalid === true
+            ? { allowed: false, reason: 'carried-codex-settings-proof-invalid' }
+            : options.codexSettingsProof ? planCarriedCodexSettingsProofApplication({
               proof: options.codexSettingsProof,
               nextSessionId: sessionId,
               currentPersistentEffort: tab.codexEffort,
-            })
-            : null;
-        const applyCarriedSettings = () => {
+              currentProofAt: tab.codexSettingsProofAt,
+              currentProofSessionId: tab.codexSettingsProofSessionId,
+              currentLiveProofAt: tab.codexLiveSettingsProofAt,
+              currentLiveSettingsSessionId: tab.codexLiveSettingsSessionId,
+              currentProviderState: tab.providerState,
+            }) : null;
           if (!carriedSettingsPlan?.allowed) return false;
           Object.assign(tab, carriedSettingsPlan.persistentPatch, carriedSettingsPlan.livePatch);
           return true;
@@ -9294,7 +9306,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           // CAS is the admission gate, not a best-effort background write. Do
           // not mutate renderer memory or launch Resume until main confirms the
           // stopped historical binding still equals the expected source.
-          await commitCodexSessionId(projectId, tabId, sessionId, prev || null, reason, options.historyOperation);
+          await commitCodexSessionId(projectId, tabId, sessionId, prev || null, reason, options.historyOperation, options.historyInput);
+          if (get().openProjects.get(projectId)?.tabs.get(tabId) !== tab) return false;
           if (tab.codexSessionId !== prev) return false;
           publishHistory?.();
         }
@@ -9758,6 +9771,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       // одной записью работают здесь без второго лаунчера и без лишнего PTY.
       canPublish: options?.canPublish,
       onPublish: options?.onPublish,
+      publishOrganizationWithTab: options?.publishOrganizationWithTab,
       workflowId: options?.workflowId,
     });
   },
@@ -10156,16 +10170,16 @@ const organizationCommitter = createOrganizationCommitter({
   },
 });
 
-async function allocateOrganizationTab(projectId:string, tab:Tab, options:any): Promise<void> {
+async function allocateOrganizationTab(projectId:string, tab:Tab, options:any) {
   const initial = useWorkspaceStore.getState();
-  if (!initial.organizationReady || options?.restoreId) return;
+  if (!initial.organizationReady || options?.restoreId) return null;
   const ownerId = options?.sourceTabId || options?.visualParentTabId || options?.parentTabId;
   const workflowId = options?.workflowId || (ownerId && initial.tabWorkflowMembership[ownerId]?.workflowId) || initial.activeSpaceId || INBOX_WORKFLOW_ID;
-  await organizationCommitter.runTask(async () => {
+  return organizationCommitter.runTask(async () => {
     // The early fork container is durable; its in-memory launch/Stop fence
     // is not. A restart must not replay a copy with an unknown prior outcome.
     const record = tab.pendingAction?.contextFork
-      ? { ...tab, pendingAction: undefined, pendingOperation: undefined } : tab;
+      ? { ...tab, pendingAction: undefined, pendingOperation: undefined, codexForkInitialSettings: undefined } : tab;
     const request = {mutationId:crypto.randomUUID(),tabId:tab.id,
       cwd:tab.cwd,workflowId,sourceTabId:ownerId,executionNamespace:projectId,record,
       expectedRevision:useWorkspaceStore.getState().organizationRevision};
@@ -10184,11 +10198,30 @@ async function allocateOrganizationTab(projectId:string, tab:Tab, options:any): 
       + ' identity=' + (options?.reservedTabId ? 'reserved-new' : 'new'));
     workflowCreationVisibility.allocated({tabId:tab.id,workflowId:result.workflowId,namespace:projectId,
       sourceTabId:ownerId,background:options?.background,revision:result.revision});
-    const state = useWorkspaceStore.getState();
+    const publication = () => {
+      const state = useWorkspaceStore.getState();
+      // A newer Main publication may already have moved/closed this exact
+      // subject during PTY/persistence awaits. Never overwrite that metadata.
+      const member = state.tabWorkflowMembership[tab.id];
+      return {
+        tabWorkflowMembership:{...state.tabWorkflowMembership,[tab.id]:
+          member && member.revision >= result.membershipRevision ? member
+            : {tabId:tab.id,workflowId:result.workflowId,revision:result.membershipRevision}},
+        tabCatalog:{...state.tabCatalog,[tab.id]:state.tabCatalog[tab.id]
+          || {tabId:tab.id,namespace:projectId,subjectVersion:2,executionSubject:result.executionSubject,active:true}},
+        runAfterWorkflowScopeVersions:{...state.runAfterWorkflowScopeVersions,[tab.id]:
+          state.runAfterWorkflowScopeVersions[tab.id] ?? 2},
+      };
+    };
+    // Fork/window chooser allocate in the background, then publish their exact
+    // Tab and placement together. Do not rebuild retained surfaces for a catalog
+    // owner that is not in workspace.tabs yet. Main revision advances now, so
+    // the next serialized allocation keeps its usual CAS. Other callers retain
+    // their original early metadata publication (including MRU side effects).
+    const deferred = options?.background === true && options?.publishOrganizationWithTab === true;
     useWorkspaceStore.setState({organizationRevision:result.revision,organizationGeneration:result.generation,
-      tabWorkflowMembership:{...state.tabWorkflowMembership,[tab.id]:{tabId:tab.id,workflowId:result.workflowId,revision:result.membershipRevision}},
-      tabCatalog:{...state.tabCatalog,[tab.id]:{tabId:tab.id,namespace:projectId,subjectVersion:2,executionSubject:result.executionSubject,active:true}},
-      runAfterWorkflowScopeVersions:{...state.runAfterWorkflowScopeVersions,[tab.id]:2}});
+      ...(deferred ? {} : publication())});
+    return deferred ? publication : null;
   });
 }
 

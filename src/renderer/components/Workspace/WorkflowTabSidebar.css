@@ -6,6 +6,9 @@
 .workflow-reserve-toolbar button:disabled{opacity:.4;cursor:default}
 .workflow-reserve-scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;overflow-anchor:none}
 .workflow-reserve-outline{padding:var(--reserve-gap,4px)}
+/* Translated source rows must not enlarge scrollHeight/edge-scroll range.
+   Fill a short viewport before clipping Y; semantic X and the real scroller stay unchanged. */
+.workflow-reserve-outline[data-outline-dnd-source-follow="y"]{min-height:100%;box-sizing:border-box;overflow-y:clip}
 .workflow-reserve-row{position:relative;margin-bottom:var(--reserve-gap,4px);min-width:0}
 .workflow-reserve-group{position:relative;display:flex;align-items:center;gap:8px;min-height:24px;box-sizing:border-box;
   padding:var(--reserve-row-padding,3px 6px);background:#ffffff09;border:1px solid #8b5cf644;

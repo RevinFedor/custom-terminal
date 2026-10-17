@@ -1,6 +1,8 @@
 'use strict';
 
 const { CodexAppServerClient } = require('./codex-account-profiles');
+const fs = require('node:fs/promises');
+const path = require('node:path');
 
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_NOTIFICATION_WAIT_MS = 1_000;
@@ -18,6 +20,7 @@ class CodexStorageDeletionProvider {
     clientFactory = (options) => new CodexAppServerClient(options),
     requestTimeoutMs = 120_000,
     notificationWaitMs = DEFAULT_NOTIFICATION_WAIT_MS,
+    allowedRoot = null,
   } = {}) {
     this.codexHome = codexHome;
     this.command = command;
@@ -25,6 +28,7 @@ class CodexStorageDeletionProvider {
     this.requestTimeoutMs = requestTimeoutMs;
     this.notificationWaitMs = notificationWaitMs;
     this.client = null;
+    this.allowedRoot = allowedRoot;
     this.startInflight = null;
   }
 
@@ -76,22 +80,44 @@ class CodexStorageDeletionProvider {
     return descendants;
   }
 
-  async inspectDeleteClosure(sessionId) {
+  async _assertPrivateStorage(sessionIds, item = null) {
+    if (!this.allowedRoot) return;
+    const root = await fs.realpath(this.allowedRoot);
+    const client = await this._getClient();
+    for (const threadId of sessionIds) {
+      // A copied state.sqlite may still contain an ABSOLUTE rollout path to
+      // its source profile. CODEX_HOME alone does not prove deletion scope.
+      const result = await client.request('thread/read', { threadId, includeTurns: false }, this.requestTimeoutMs);
+      const thread = result?.thread;
+      if (thread?.id !== threadId || typeof thread.path !== 'string')
+        throw Object.assign(new Error('Private test rollout path is unproven'), { code: 'storage_test_provider_path_unproven' });
+      const actual = await fs.realpath(thread.path);
+      if (!actual.startsWith(root + path.sep)
+        || item?.sessionId === threadId && actual !== await fs.realpath(item.path)) {
+        throw Object.assign(new Error('Private test state refers to a rollout outside the selected profile'), { code: 'storage_test_provider_path_outside_scope' });
+      }
+    }
+  }
+
+  async inspectDeleteClosure(sessionId, item = null) {
     const root = String(sessionId || '').trim();
     if (!root) throw new Error('Codex session id is required for deletion preflight');
     const [active, archived] = await Promise.all([
       this._listDescendants(root, false),
       this._listDescendants(root, true),
     ]);
-    return uniqueSessionIds([root, ...active, ...archived]);
+    const closure = uniqueSessionIds([root, ...active, ...archived]);
+    await this._assertPrivateStorage(closure, item);
+    return closure;
   }
 
-  async deleteSession(sessionId, expectedSessionIds = null) {
+  async deleteSession(sessionId, expectedSessionIds = null, item = null, beforeDelete = null) {
     const root = String(sessionId || '').trim();
     const expected = uniqueSessionIds(expectedSessionIds?.length
       ? expectedSessionIds
       : await this.inspectDeleteClosure(root));
     const client = await this._getClient();
+    await this._assertPrivateStorage(expected, item);
     const deleted = new Set();
     let resolveNotifications = null;
     const notificationsComplete = new Promise((resolve) => {
@@ -109,6 +135,8 @@ class CodexStorageDeletionProvider {
     };
     client.on('notification', onNotification);
     try {
+      const proof = beforeDelete?.();
+      if (proof?.then) throw new Error('storage_final_delete_guard_must_be_synchronous');
       await client.request('thread/delete', { threadId: root }, this.requestTimeoutMs);
       maybeResolve();
       if (!expected.every((id) => deleted.has(id))) {

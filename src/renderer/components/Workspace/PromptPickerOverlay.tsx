@@ -2,7 +2,7 @@ import { usePointerGesture } from '../../hooks/usePointerGesture';
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Copy, ChevronLeft, ChevronRight, Link2, MessageSquareQuote } from 'lucide-react';
-import { loadPickerPromptCatalog, promptCatalogChangeAffectsTarget } from './promptTabSourcesModel.mjs';
+import { loadPickerPromptCatalog, promptCatalogChangeAffectsTarget, observePreparedPromptCatalog, preparedCatalogStatusText } from './promptTabSourcesModel.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { buildPromptOutline } from '../UI/promptOutlineModel.mjs';
@@ -622,15 +622,18 @@ const PromptPickerOverlay: React.FC = () => {
 
   const [groups, setGroups] = useState<PromptGroupRow[]>([]);
   const [prompts, setPrompts] = useState<PromptRow[]>([]);
+  const [libraryLoaded, setLibraryLoaded] = useState(false);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
   const libraryReceiver = useMemo(() => createSavedPromptLibraryReceiver((library: { prompts: PromptRow[]; groups: PromptGroupRow[] }) => {
     setPrompts(library.prompts);
     setGroups(library.groups);
+    setLibraryLoaded(true);
+    setLibraryError(null);
   }), []);
-  const [projectCatalog, setProjectCatalog] = useState<ProjectPromptCatalog | null>(null);
+  const [catalogState, setCatalogState] = useState<any>({targetKey:'',sequence:0,status:'cold',data:null,error:null});
+  const catalogReceiverRef = useRef<any>(null);
+  const catalogCurrentRef = useRef({open:false,targetKey:''});
   const organizationReady = useWorkspaceStore(s => s.organizationReady);
-  const [catalogRevision, setCatalogRevision] = useState(0);
-  const [libraryLoaded, setLibraryLoaded] = useState(false);
-  const [catalogLoadedKey, setCatalogLoadedKey] = useState<string | null>(null);
   const [contextRequest, setContextRequest] = useState<HistoryInsertMenuRequest | null>(null);
   const [shortcutTarget, setShortcutTarget] = useState<InsertTarget | null>(null);
   const [shortcutAnchor, setShortcutAnchor] = useState<PickerAnchor | null>(null);
@@ -759,6 +762,7 @@ const PromptPickerOverlay: React.FC = () => {
       ) return;
 
       const requestId = ++requestSeqRef.current;
+      catalogReceiverRef.current?.close();
       activePickerGenerationRef.current = requestId;
       const rootWidth = Math.max(120, Math.round(fontSize * 12)) + 8;
       const leftWidth = promptPickerPrimaryPanelWidth(
@@ -824,8 +828,17 @@ const PromptPickerOverlay: React.FC = () => {
   const anchor = contextRequest?.anchor || shortcutAnchor || DEFAULT_PICKER_ANCHOR;
   const pickerProjectId = contextRequest?.projectId || shortcutTarget?.projectId || null;
   const pickerTabId = contextRequest?.tabId || shortcutTarget?.tabId || null;
-  const catalogTargetKey = JSON.stringify([organizationReady, pickerTabId, pickerProjectId, contextRequest?.requestId]);
-  const loaded = libraryLoaded && catalogLoadedKey === catalogTargetKey;
+  const pickerRenderGeneration = contextRequest?.requestId || activePickerGenerationRef.current;
+  const catalogTargetKey = JSON.stringify([organizationReady, pickerTabId, pickerProjectId, contextRequest?.requestId || activePickerGenerationRef.current]);
+  catalogCurrentRef.current = {open,targetKey:catalogTargetKey};
+  const currentCatalogState = catalogState.targetKey === catalogTargetKey ? catalogState
+    : {targetKey:catalogTargetKey,sequence:0,status:'cold',data:null,error:null};
+  const projectCatalog: ProjectPromptCatalog | null = currentCatalogState.status === 'ready' ? currentCatalogState.data : null;
+  const projectReady = currentCatalogState.status === 'ready';
+  const projectTarget = organizationReady ? !!pickerTabId : !!pickerProjectId;
+  const projectLabel = projectCatalog?.project || {id:organizationReady?`tab:${pickerTabId}`:pickerProjectId || '',name:organizationReady?'Промпты вкладки':'Промпты проекта',icon:null};
+  const catalogStatusText = preparedCatalogStatusText(currentCatalogState);
+  const loaded = libraryLoaded;
   const cascadeOpensLeft = anchor.mode === 'point' && openLeftRef.current;
   const cascadeDirection = useMemo(
     () => resolveCascadingMenuDirection(cascadeOpensLeft),
@@ -837,6 +850,7 @@ const PromptPickerOverlay: React.FC = () => {
     let cancelled = false;
     const libraryGeneration = libraryReceiver.generation();
     setLibraryLoaded(false);
+    setLibraryError(null);
     (async () => {
       try {
         const [pr, gr] = await Promise.all([
@@ -844,52 +858,36 @@ const PromptPickerOverlay: React.FC = () => {
           ipcRenderer.invoke('prompt-groups:get'),
         ]);
         if (cancelled) return;
-        const promptsArr: PromptRow[] = pr?.success ? (pr.data || []) : [];
-        const groupsArr: PromptGroupRow[] = gr?.success ? (gr.data || []) : [];
+        if (!pr?.success || !gr?.success) throw new Error(pr?.error || gr?.error || 'Unable to load saved prompts');
+        const promptsArr: PromptRow[] = pr.data || [];
+        const groupsArr: PromptGroupRow[] = gr.data || [];
         libraryReceiver.receiveLoad({ prompts: promptsArr, groups: groupsArr }, libraryGeneration);
         setLibraryLoaded(true);
       } catch (err) {
         if (cancelled) return;
         console.warn('[PromptPicker] load failed:', err);
-        libraryReceiver.receiveLoad({ prompts: [], groups: [] }, libraryGeneration);
-        setLibraryLoaded(true);
+        if (libraryReceiver.generation() === libraryGeneration) {
+          setLibraryError(err instanceof Error ? err.message : String(err));
+          setLibraryLoaded(false);
+        }
       }
     })();
     return () => { cancelled = true; };
   }, [open, contextRequest?.requestId, libraryReceiver]);
 
   useEffect(() => {
-    if (!open) { setCatalogLoadedKey(null); return; }
-    let cancelled = false;
-    if (catalogLoadedKey !== catalogTargetKey) setProjectCatalog(null);
-    // Filesystem refreshes keep the loaded library and editor in place.
-    void loadPickerPromptCatalog(ipcRenderer, { tabId: pickerTabId, projectId: pickerProjectId, organizationReady })
-      .then(catalog => {
-        if (cancelled) return;
-        setProjectCatalog(catalog);
-        setCatalogLoadedKey(catalogTargetKey);
-      }).catch(error => {
-        if (cancelled) return;
-        console.warn('[PromptPicker] tab catalog load failed:', error);
-        showToast(String(error.message || error), 'error');
-        setProjectCatalog(null);
-        setCatalogLoadedKey(catalogTargetKey);
-      });
-    return () => { cancelled = true; };
-  }, [open, catalogTargetKey, pickerProjectId, pickerTabId, organizationReady, catalogRevision, showToast]);
-
-  useEffect(() => {
     if (!open) return;
-    const changed = (_event: unknown, change: any) => {
-      if (promptCatalogChangeAffectsTarget(change, { tabId: pickerTabId, projectId: pickerProjectId, organizationReady })) {
-        setCatalogRevision(value => value + 1);
-      }
-    };
-    ipcRenderer.on('project-prompts:changed', changed);
-    return () => {
-      ipcRenderer.removeListener('project-prompts:changed', changed);
-    };
-  }, [open, pickerTabId, pickerProjectId, organizationReady]);
+    const generation = activePickerGenerationRef.current;
+    const target = {tabId:pickerTabId,projectId:pickerProjectId,organizationReady};
+    const observation = observePreparedPromptCatalog({ipc:ipcRenderer,targetKey:catalogTargetKey,
+      read:() => loadPickerPromptCatalog(ipcRenderer,target),
+      acceptsChange:(change:any) => promptCatalogChangeAffectsTarget(change,target),
+      isCurrent:() => catalogCurrentRef.current.open && catalogCurrentRef.current.targetKey === catalogTargetKey
+        && activePickerGenerationRef.current === generation,
+      onState:setCatalogState});
+    catalogReceiverRef.current = observation.receiver;
+    return () => { observation.close(); if(catalogReceiverRef.current===observation.receiver)catalogReceiverRef.current=null; };
+  }, [open, catalogTargetKey, pickerProjectId, pickerTabId, organizationReady]);
 
   useEffect(() => {
   }, [open, pickerTabId, contextRequest?.requestId]);
@@ -951,10 +949,10 @@ const PromptPickerOverlay: React.FC = () => {
 
   const flatLeft = useMemo<FlatLeftItem[]>(() => {
     const items: FlatLeftItem[] = [];
-    if (projectCatalog?.project && projectCatalog.prompts.length > 0) {
-      items.push({ kind: 'project', project: projectCatalog.project, position: Number.NEGATIVE_INFINITY });
+    if (projectTarget && (!projectReady || (projectCatalog?.prompts.length || 0) > 0)) {
+      items.push({ kind: 'project', project: projectLabel, position: Number.NEGATIVE_INFINITY });
     }
-    for (const root of promptOutline) {
+    for (const root of libraryLoaded ? promptOutline : []) {
       if (root?.entityType === 'group') {
         items.push({ kind: 'group', group: root.rawGroup, position: root.rawGroup.position });
         continue;
@@ -965,10 +963,10 @@ const PromptPickerOverlay: React.FC = () => {
     }
     items.sort((a, b) => a.position - b.position);
     return items;
-  }, [projectCatalog, promptOutline]);
+  }, [projectCatalog, projectTarget, projectReady, libraryLoaded, promptOutline, catalogTargetKey]);
 
   useEffect(() => {
-    if (!open || !loaded) return;
+    if (!open) return;
     setSelectedKey((current) => {
       if (current?.startsWith('project:')) {
         const projectId = current.slice('project:'.length);
@@ -984,12 +982,12 @@ const PromptPickerOverlay: React.FC = () => {
         const ungrouped = flatLeft.filter((item) => item.kind === 'prompt');
         if (Number.isInteger(index) && index >= 0 && index < ungrouped.length) return current;
       }
-      const first = flatLeft[0];
+      const first = flatLeft.find(item => item.kind !== 'project' || projectReady) || flatLeft[0];
       if (!first) return null;
       if (first.kind === 'project') return `project:${first.project.id}`;
       return first.kind === 'group' ? `group:${first.group.id}` : 'ungrouped:0';
     });
-  }, [open, loaded, flatLeft]);
+  }, [open, projectReady, flatLeft]);
 
   const resolveTarget = useCallback((): InsertTarget | null => {
     const state = useWorkspaceStore.getState();
@@ -1067,6 +1065,7 @@ const PromptPickerOverlay: React.FC = () => {
     ) return false;
 
     const closeSequence = ++requestSeqRef.current;
+    catalogReceiverRef.current?.close();
     activePickerGenerationRef.current = 0;
     stopPromptResize();
     const target: InsertTarget | null = contextRequest
@@ -1147,6 +1146,9 @@ const PromptPickerOverlay: React.FC = () => {
   }, [selectedLeftItem, pickerLevel]);
 
   const handleSelectPrompt = useCallback(async (prompt: PromptRow, asReference = false) => {
+    if (!isCurrentPickerGeneration(pickerRenderGeneration,activePickerGenerationRef.current)) return;
+    if (typeof prompt.id === 'string' && prompt.id.startsWith('project-prompt:')
+      && !catalogReceiverRef.current?.canSelect(currentCatalogState.sequence)) return;
     const emptyPrompt = firstEmptyPromptInChain(prompt);
     if (emptyPrompt) {
       showToast(`Промпт «${emptyPrompt.title}» пустой — добавьте текст или файл`, 'error');
@@ -1163,7 +1165,7 @@ const PromptPickerOverlay: React.FC = () => {
     }
     await deliverPromptChain(prompt, target, asReference);
     closePicker(generation);
-  }, [closePicker, contextRequest, shortcutTarget, showToast]);
+  }, [closePicker, contextRequest, shortcutTarget, showToast, currentCatalogState.sequence, pickerRenderGeneration]);
 
   const handleCopyPrompt = useCallback(async (
     event: React.MouseEvent<HTMLDivElement>,
@@ -1173,6 +1175,8 @@ const PromptPickerOverlay: React.FC = () => {
     // These must happen before file resolution yields to the event loop.
     event.preventDefault();
     event.stopPropagation();
+    if (typeof prompt.id === 'string' && prompt.id.startsWith('project-prompt:')
+      && !catalogReceiverRef.current?.canSelect(currentCatalogState.sequence)) return;
 
     const emptyPrompt = firstEmptyPromptInChain(prompt);
     if (emptyPrompt) {
@@ -1206,7 +1210,7 @@ const PromptPickerOverlay: React.FC = () => {
       const message = error instanceof Error ? error.message : String(error);
       showToast(`Copy failed: ${message}`, 'error');
     }
-  }, [restartCopyFeedback, showToast]);
+  }, [restartCopyFeedback, showToast, currentCatalogState.sequence]);
 
   const handleSelectScript = useCallback((script: ScriptRow) => {
     if (!contextRequest) return;
@@ -2018,13 +2022,14 @@ const PromptPickerOverlay: React.FC = () => {
           onScroll={queueContextGeometryRefresh}
         >
           {renderPromptPanelResizeHandle('primary')}
-          {!loaded && (
+          {!libraryLoaded && !libraryError && (
             <div style={placeholderStyle}>Loading…</div>
           )}
-          {loaded && flatLeft.length === 0 && (
+          {libraryError && <div style={placeholderStyle} title={libraryError}>Библиотека недоступна</div>}
+          {libraryLoaded && projectReady && flatLeft.length === 0 && (
             <div style={placeholderStyle}>No prompts</div>
           )}
-          {loaded && flatLeft.map((item) => {
+          {flatLeft.map((item) => {
             if (item.kind === 'project') {
               const key = `project:${item.project.id}`;
               const isSelectedActive = selectedKey === key && pickerLevel === 'group';
@@ -2039,6 +2044,7 @@ const PromptPickerOverlay: React.FC = () => {
                     setSelectedPromptIdx(0);
                   }}
                   onClick={() => {
+                    if (!projectReady) return;
                     setSelectedKey(key);
                     if ((projectCatalog?.prompts.length || 0) > 0) {
                       setPickerLevel('prompt');
@@ -2051,6 +2057,9 @@ const PromptPickerOverlay: React.FC = () => {
                     borderBottom: '1px solid rgba(167,139,250,0.14)',
                   }}
                   data-project-prompt-group={item.project.id}
+                  data-project-prompt-state={currentCatalogState.status}
+                  aria-disabled={!projectReady}
+                  title={!projectReady ? currentCatalogState.error?.message || catalogStatusText : undefined}
                 >
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
                     {item.project.icon ? (
@@ -2058,7 +2067,10 @@ const PromptPickerOverlay: React.FC = () => {
                     ) : (
                       <MessageSquareQuote size={15} strokeWidth={1.8} />
                     )}
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.project.name}</span>
+                    <span style={{minWidth:0}}>
+                      <span style={{display:'block',overflow:'hidden',textOverflow:'ellipsis'}}>{item.project.name}</span>
+                      {!projectReady && <span style={{display:'block',fontSize:Math.max(9,fontSize-2),color:'#999'}}>{catalogStatusText}</span>}
+                    </span>
                   </span>
                   {renderCascadeChevron()}
                 </div>
@@ -2167,6 +2179,7 @@ const PromptPickerOverlay: React.FC = () => {
             style={{ ...panelStyle, width: RIGHT_W, ...contextRightPanelPositionStyle }}
           >
             {renderPromptPanelResizeHandle('secondary')}
+            {selectedLeftItem?.kind === 'project' && !projectReady && <div style={placeholderStyle} title={currentCatalogState.error?.code}>{catalogStatusText}</div>}
             {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
               const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
               const isAncestor = selectedRightAncestorKeys.has(promptTreeKey(p));
@@ -2199,7 +2212,7 @@ const PromptPickerOverlay: React.FC = () => {
                 </React.Fragment>
               );
             })}
-            {rightPrompts.length === 0 && (
+            {rightPrompts.length === 0 && (selectedLeftItem?.kind !== 'project' || projectReady) && (
               <div style={placeholderStyle}>пусто</div>
             )}
           </div>
@@ -2213,6 +2226,7 @@ const PromptPickerOverlay: React.FC = () => {
           {(selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
             <div ref={rightPanelRef} style={{ ...panelStyle, ...rightPanelPositionStyle }}>
               {renderPromptPanelResizeHandle('secondary')}
+              {selectedLeftItem?.kind === 'project' && !projectReady && <div style={placeholderStyle} title={currentCatalogState.error?.code}>{catalogStatusText}</div>}
               {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
                 const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
                 const isAncestor = selectedRightAncestorKeys.has(promptTreeKey(p));
@@ -2245,7 +2259,7 @@ const PromptPickerOverlay: React.FC = () => {
                   </React.Fragment>
                 );
               })}
-              {rightPrompts.length === 0 && (
+              {rightPrompts.length === 0 && (selectedLeftItem?.kind !== 'project' || projectReady) && (
                 <div style={placeholderStyle}>пусто</div>
               )}
             </div>

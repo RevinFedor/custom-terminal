@@ -1,3 +1,5 @@
+import {uiDragDiagnostic} from '../../utils/uiPerformanceDiagnostics.mjs';
+import {getPaneTabPointerSnapshot} from '../../utils/paneTabPointerBridge';
 import React, { useEffect, useLayoutEffect, useRef } from 'react';
 import ReactDOM from 'react-dom';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -50,6 +52,8 @@ export default function TabDragNavigationController({
       ) return;
       console.log('[TabDnd:navigate] kind=' + target.kind + ' id=' + target.id + ' source=' + current.source
         + ' cycle=' + cycle + ' waitMs=' + (performance.now() - startedAt).toFixed(1));
+      uiDragDiagnostic('navigation-accepted',{gestureId:getPaneTabPointerSnapshot().source?.gestureId,
+        workflowId:target.kind==='workflow'?target.id:undefined,revision:cycle,owner:current.source});
       if (target.kind === 'workflow') {
         useWorkspaceStore.getState().switchWorkspaceSpace(target.id);
       } else {

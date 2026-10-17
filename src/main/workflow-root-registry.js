@@ -18,6 +18,7 @@ class WorkflowRootRegistry {
     this.database = database;
     this.db = database.db;
     this.onChanged=()=>{};
+    this.catalogCommittedEpoch = 0;
     const present=sqlStatement('roots.init.sqlite_master', 'get', () => this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_root_meta' AND type='table'"), statement => statement.get());
     if(present && sqlStatement('roots.init.workflow_root_meta', 'get', () => this.db.prepare('SELECT version FROM workflow_root_meta WHERE singleton=1'), statement => statement.get())?.version!==1)return;
     this.db.exec(`CREATE TABLE IF NOT EXISTS workflow_roots (
@@ -96,17 +97,66 @@ class WorkflowRootRegistry {
     return this.readTabSources(tabId,(sql,siteId)=>causal.sql(siteId,'prepare',()=>this.db.prepare(sql)));
   }
   createSourcesReader() {
-    // One synchronous caller owns these four compiled queries. Every invocation
-    // still reads current rows/versions; no binding result or CAS proof is cached.
+    // Statement ports only: each invocation reads exact current authority.
+    // A resumed connection/schema never executes a stale compiled statement.
     const statements=new Map();
+    let connection=null,schema=null;
     const prepare=(sql,siteId)=>{
       if(!statements.has(sql))statements.set(sql,causal.sql(siteId,'prepare',()=>this.db.prepare(sql)));
       return statements.get(sql);
     };
-    return tabId=>this.readTabSources(tabId,prepare);
+    const refresh=()=>{
+      const current=this.captureCatalogFence();
+      if(current.connection!==connection || current.schema!==schema) {
+        statements.clear();connection=current.connection;schema=current.schema;
+      }
+    };
+    const reader=tabId=>{refresh();return this.readTabSources(tabId,prepare);};
+    reader.header=tabId=>{refresh();return this.readTabHeader(tabId,prepare);};
+    reader.page=(header,cursor=null)=>{
+      refresh();
+      const sql=`SELECT r.*,b.position,b.metadata_json AS binding_json FROM workflow_root_bindings b
+        JOIN workflow_roots r ON r.id=b.root_id WHERE b.scope=?
+        ${cursor ? 'AND (b.position>? OR (b.position=? AND r.id>?))' : ''}
+        ORDER BY b.position,r.id LIMIT 256`;
+      const statement=prepare(sql,'roots.catalog.bindingPage');
+      return causal.sql('roots.catalog.bindingPage','all',()=>statement.all(header.sourceScope,
+        ...(cursor ? [cursor.position,cursor.position,cursor.id] : [])));
+    };
+    return reader;
   }
-  readTabSources(tabId,prepare) {
-    const work = () => {
+  captureCatalogFence() {
+    this.db=this.database.db;
+    const connection=this.db;
+    const meta=connection.prepare('SELECT version FROM workflow_root_meta WHERE singleton=1').get();
+    if(meta?.version!==1)this.fail('root_forward_version');
+    return {connection,
+      schema:connection.prepare('PRAGMA schema_version').get().schema_version,
+      external:connection.prepare('PRAGMA data_version').get().data_version,
+      // Conservative hint covers local outer commits lacking notify coverage,
+      // including rollback counters. It causes authority re-pass, never FS scan.
+      changes:connection.prepare('SELECT total_changes() AS n').get().n,
+      committed:this.catalogCommittedEpoch,transaction:!!connection.inTransaction};
+  }
+  readSourceScopesPage(after='',limit=256) {
+    this.captureCatalogFence();
+    return sqlStatement('roots.catalog.scopesPage','all',()=>this.db.prepare(
+      "SELECT scope FROM workflow_root_scope_meta WHERE scope LIKE 'tab:%' AND scope>? ORDER BY scope LIMIT ?"),
+      statement=>statement.all(after,Math.min(256,Math.max(1,limit))))
+      .map(row=>({id:row.scope,tabId:row.scope.slice(4),name:row.scope.slice(4)}));
+  }
+  readSourceRegistrationsPage(after=0,limit=256) {
+    this.captureCatalogFence();
+    return sqlStatement('roots.catalog.registrationsPage','all',()=>this.db.prepare(
+      'SELECT rowid AS catalogCursor,* FROM workflow_roots WHERE removed=0 AND rowid>? ORDER BY rowid LIMIT ?'),
+      statement=>statement.all(after,Math.min(256,Math.max(1,limit))))
+      .map(row=>({...JSON.parse(row.metadata_json),id:row.id,path:row.path,revision:row.revision,catalogCursor:row.catalogCursor}));
+  }
+  noteCatalogCommitted() {
+    if(this.db.inTransaction)this.fail('root_binding_commit_required');
+    this.catalogCommittedEpoch++;
+  }
+  readTabHeader(tabId,prepare) {
       const scope='tab:'+tabId;
       causal.count('sourceReads');
       const ownerStatement=prepare('SELECT project_id,execution_namespace FROM tabs WHERE tab_id=?','roots.tabSources.owner');
@@ -119,17 +169,23 @@ class WorkflowRootRegistry {
       const registered=causal.sql('roots.tabSources.scope','get',()=>scopeStatement.get(scope));
       if(registered && registered.version!==1)this.fail('root_binding_forward_version');
       const sourceScope=registered?scope:'prompts:'+namespace;
+      return {namespace,sourceScope};
+  }
+  decodeCatalogSource(root,namespace) {
+    const metadata=JSON.parse(root.metadata_json),binding=JSON.parse(root.binding_json);
+    return {...metadata,...binding,id:root.id,rootId:root.id,
+      rootPath:root.path,projectId:binding.project_id || namespace,position:root.position,
+      removed:root.removed===1,enabled:root.removed!==1 && metadata.enabled!==false};
+  }
+  readTabSources(tabId,prepare) {
+    const work=()=>{
+      const {namespace,sourceScope}=this.readTabHeader(tabId,prepare);
       const bindingsStatement=prepare(`SELECT r.*,b.position,b.metadata_json AS binding_json FROM workflow_root_bindings b
         JOIN workflow_roots r ON r.id=b.root_id WHERE b.scope=? ORDER BY b.position,r.id`,'roots.tabSources.bindings');
       return causal.sql('roots.tabSources.bindings','all',()=>bindingsStatement.all(sourceScope))
-        .map(root=>{
-          const metadata=JSON.parse(root.metadata_json),binding=JSON.parse(root.binding_json);
-          return {...metadata,...binding,id:root.id,rootId:root.id,
-            rootPath:root.path,projectId:binding.project_id || namespace,position:root.position,
-            removed:root.removed===1,enabled:root.removed!==1 && metadata.enabled!==false};
-        });
+        .map(root=>this.decodeCatalogSource(root,namespace));
     };
-    return causal.hasWork() ? work() : causal.syncWork('roots.readTabSources', { tabId }, work);
+    return causal.hasWork()?work():causal.syncWork('roots.readTabSources',{tabId},work);
   }
   listSourceScopes() {
     const work = () => {
@@ -182,6 +238,9 @@ class WorkflowRootRegistry {
   }
   notify(change) {
     const work = () => {
+      // Nested/outer transactions keep their existing receipt semantics. The
+      // conservative total_changes fence covers missing after-outer-commit hooks.
+      if(!this.db.inTransaction)this.noteCatalogCommitted();
       try{this.onChanged(change);}catch(error){console.warn('[WorkflowRoots] committed; catalog refresh failed:',error?.message || error);}
     };
     return causal.hasWork() ? work() : causal.syncWork('roots.notify', {}, work);

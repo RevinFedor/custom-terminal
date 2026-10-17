@@ -11,10 +11,11 @@ import { ELECTRON_ABI, ELECTRON_VERSION, PTY_MARKER, inspectMachO, sha256 } from
 import { MARKER_SOURCE, afterExtract, atomicPublish, checkToolchain, patchSources, rebuildNodePty, verifyPublished } from './node-pty-build.mjs';
 import { validateAsarArchive } from './validate-app-asar.mjs';
 import { fakeMachO as macho } from './node-pty-test-fixture.mjs';
+import { patchNodePtyWriteTrace, PTY_WRITE_TRACE_SHA } from './node-pty-write-trace.mjs';
 
 const projectDir = fileURLToPath(new URL('../', import.meta.url));
 const sourcePty = path.join(projectDir, 'node_modules/node-pty');
-const sources = ['package.json', 'binding.gyp', 'src/unix/pty.cc', 'src/unix/spawn-helper.cc', 'lib/utils.js', 'node_modules/node-addon-api'];
+const sources = ['package.json', 'binding.gyp', 'src/unix/pty.cc', 'src/unix/spawn-helper.cc', 'lib/utils.js', 'lib/unixTerminal.js', 'node_modules/node-addon-api'];
 
 // These tests never compile, dlopen, execute a native file, start Electron/PTY,
 // or write to the real node_modules.
@@ -87,6 +88,7 @@ test('private rebuild publishes outputs atomically; old open inode and source by
   assert.deepEqual(await fs.readFile(path.join(f.pty, 'src/unix/pty.cc')), await fs.readFile(path.join(sourcePty, 'src/unix/pty.cc')));
   assert.deepEqual(await fs.readFile(path.join(f.pty, 'binding.gyp')), await fs.readFile(path.join(sourcePty, 'binding.gyp')));
   await verifyPublished(f.project, proof);
+  assert.equal(sha256(await fs.readFile(path.join(f.pty, 'lib/unixTerminal.js'))), PTY_WRITE_TRACE_SHA);
   const nextInode = (await fs.stat(file)).ino;
   const again = await rebuildNodePty(f.target, { scratchParent: f.root, rebuild: fakeCompiler(f) });
   assert.deepEqual(again, proof);
@@ -106,7 +108,7 @@ test('binary marker alone cannot mask replacement between beforePack and afterEx
 });
 
 test('version/header/source drift refuses before compiler or output writes', async t => {
-  for (const file of ['package.json', 'binding.gyp', 'src/unix/pty.cc', 'node_modules/node-addon-api/napi-inl.h']) {
+  for (const file of ['package.json', 'binding.gyp', 'src/unix/pty.cc', 'lib/unixTerminal.js', 'node_modules/node-addon-api/napi-inl.h']) {
     await t.test(file, async t => {
       const f = await fixture(t);
       await fs.appendFile(path.join(f.pty, file), '\nDRIFT');
@@ -202,7 +204,7 @@ test('Mach-O guard rejects plain text/source markers, malformed tables and wrong
 });
 
 test('ASAR validation checks actual packaged native bytes, not source hashes or a receipt', async t => {
-  for (const scenario of ['fixed', 'ordinary prebuild', 'missing native', 'loader drift', 'packed native', 'helper arch']) {
+  for (const scenario of ['fixed', 'ordinary prebuild', 'missing native', 'loader drift', 'outbound observer drift', 'packed native', 'helper arch']) {
     await t.test(scenario, async t => {
       const f = await fixture(t);
       const release = path.join(f.pty, 'build/Release');
@@ -211,12 +213,14 @@ test('ASAR validation checks actual packaged native bytes, not source hashes or 
       await fs.writeFile(path.join(release, 'spawn-helper'), macho({ type: 2, marker: false, arch: scenario === 'helper arch' ? 'x64' : 'arm64' }), { mode: 0o755 });
       await fs.writeFile(path.join(release, 'source-proof.json'), JSON.stringify({ marker: PTY_MARKER, sourceSHA: '8e1a7918403a6995655affc6b374e4e7604e60b1c52e3eacfa1876f41200323b' }));
       if (scenario === 'loader drift') await fs.appendFile(path.join(f.pty, 'lib/utils.js'), '\n');
+      if (scenario !== 'outbound observer drift') await fs.writeFile(path.join(f.pty, 'lib/unixTerminal.js'),
+        patchNodePtyWriteTrace(await fs.readFile(path.join(f.pty, 'lib/unixTerminal.js'), 'utf8')));
       const archive = path.join(f.root, 'app.asar');
       const archiveStream = await asar.createPackageWithOptions(f.project, archive, scenario === 'packed native' ? {} : { unpack: '**/build/Release/*' });
       // asar returns its ending WriteStream before the final writes finish.
       await finished(archiveStream);
       if (scenario === 'fixed') assert.equal((await validateAsarArchive(archive)).nodePty.arch, 'arm64');
-      else await assert.rejects(validateAsarArchive(archive), /marker|missing|loader drift|must be unpacked|architecture/);
+      else await assert.rejects(validateAsarArchive(archive), /marker|missing|loader drift|outbound observer drift|must be unpacked|architecture/);
     });
   }
 });

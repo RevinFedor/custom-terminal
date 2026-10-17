@@ -371,6 +371,15 @@ function createAgentResponseObservationReader({
 
   return {
     getAgentResponseState, readAgentObservedResponse, observeClaudeHook,
+    readCachedClaudeResponse(tabId, sessionId) {
+      const saved = [...hookResults.values()].reverse().find(value => value.tabId === tabId
+        && value.subject.sessionId === sessionId && value.result.complete === true);
+      if (!saved) return { known: false, reason: 'response_hook_not_cached' };
+      return { known: true, complete: true, ref: clone(saved.subject),
+        assistantText: saved.result.assistantText.slice(0, 2000),
+        assistantChars: saved.result.assistantChars,
+        truncated: saved.result.truncated === true || saved.result.assistantText.length > 2000 };
+    },
     onAgentResponseCompletion(listener) {
       if (typeof listener !== 'function') throw new TypeError('completion listener required');
       listeners.add(listener);

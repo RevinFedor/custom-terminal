@@ -1,4 +1,9 @@
 // Durable archive identity is namespace + storage id, even before opaque tab IDs.
+export function omitExpiredArchiveHistory(snapshot, ids) {
+  if (!snapshot || !ids?.size || !Array.isArray(snapshot.history) || !snapshot.history.some(row => ids.has(row.id))) return snapshot;
+  return {...snapshot, history:snapshot.history.filter(row => !ids.has(row.id))};
+}
+
 export function archiveRecordKey(kind, row) {
   if (!['history', 'favorite'].includes(kind) || typeof row?.namespace !== 'string' || !row.namespace
     || !Number.isSafeInteger(row.id) || row.id <= 0) throw new Error('Invalid archive address');

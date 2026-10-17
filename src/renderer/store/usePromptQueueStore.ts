@@ -308,6 +308,7 @@ export type QueuedImageRef = {
 export type QueuedPromptAttachmentState = 'ready' | 'materializing' | 'missing';
 
 export type QueuedComposerChip = {
+  messageReference?: unknown;
   id: string;
   kind: 'prompt' | 'paste';
   text: string;

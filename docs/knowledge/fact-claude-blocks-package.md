@@ -33,6 +33,17 @@ Presentation-обвязка групп вынесена в
 семантическую грамматику, `ToolCallPart`, `ThinkBlock`, `Markdown` и
 `ConversationMessage`. Сам lifecycle Task-карточки остаётся в `HistoryPanel` —
 presentation-компонент не решает, жив ли агент и где лежит его rollout.
+Свёрнутая подпись — тот же assistant-комментарий, а не plain-text лог: Markdown
+должен оставаться читаемым и до раскрытия группы. Общий компактный режим
+`Markdown preview` сохраняет абзацы/списки/выделение/код, но наследует серую
+типографику подписи и не монтирует highlighter, Copy, вложенный scroll или
+сетевые изображения. В кликабельном превью ссылки остаются пассивным текстом:
+переход принадлежит точному сообщению, а не вложенному URL. Значимые начальные
+отступы передаются парсеру без trim, иначе indented code меняет смысл.
+Это относится и к вложенной истории, свёрнутым Markdown service-body и
+Timeline answer/summary; ordinary user input, tool digests и JSON excerpts
+остаются буквальными. Raw Copy/UUID/time/hydration не меняются. Новый размер
+подписи требует новой measured-layout identity, но не нового физического UUID.
 Legacy-shape'ы (`FileAction`/string — Gemini/старый кэш) сохранены как
 фоллбэк, рендерятся в исходном порядке (turn чередует Bash→Edit→Task). Пакетные
 компоненты **context-free** (ноль зависимостей от Zustand/контекста) — поэтому

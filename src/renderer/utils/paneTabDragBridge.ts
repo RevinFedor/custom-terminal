@@ -1,3 +1,4 @@
+import {uiDragDiagnostic,uiDragAdmission} from './uiPerformanceDiagnostics.mjs';
 import { useSyncExternalStore } from 'react';
 import {
   createHorizontalDragGeometryCache,
@@ -9,6 +10,8 @@ export type PaneTabDragEntry = { projectId: string; tabId: string };
 export type PaneStripKey = 'center' | `pane:${number}`;
 
 export type PaneTabDragSource = {
+  /** UI-only original sidebar grab; never part of durable workflow admission. */
+  sourceGrabOffsetY?: number;
   owner: 'pane' | 'sidebar';
   entries: PaneTabDragEntry[];
   rootTabId: string;
@@ -95,6 +98,7 @@ export function beginPaneTabDrag(source: PaneTabDragSource) {
     source: { ...source, entries, gestureId:source.gestureId || `pane-drag:${dragSession}` },
     target: null,
   });
+  uiDragAdmission(source.workflowDrag);
   return snapshot.source;
 }
 
@@ -121,6 +125,9 @@ export function setPaneTabDragTarget(target: PaneTabDropTarget | null) {
       + ' autoScroll=' + target.debug.autoScrollDelta.toFixed(1));
   }
   publish({ ...snapshot, revision: snapshot.revision + 1, target });
+  uiDragDiagnostic('target',{gestureId:snapshot.source?.gestureId,revision:snapshot.revision,
+    workflowId:target?.spaceId,paneKey:target?.paneKey,zone:target?.zone,at:target?.at,
+    presentation:'published-target-not-layout-receipt'});
 }
 
 export function claimPaneTabDragDrop(rootTabId?: string) {

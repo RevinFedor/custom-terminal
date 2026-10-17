@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeTabProviderSnapshot, codexSettingsIntentIsWaiting, settingsPresentation } from './agentSettingsPresentation.mjs';
+import { mergeTabProviderSnapshot, projectTabProviderSnapshot, codexSettingsIntentIsWaiting, codexSettingsSelection, settingsPresentation } from './agentSettingsPresentation.mjs';
 
 test('provider revisions belong to a tab, not to a reused ControlBar component', () => {
   const previous = { tabId: 'A', state: { codexSettingsIntentRevision: 99, codexSettingsIntentEffort: 'ultra' } };
@@ -32,4 +32,25 @@ test('empty input, paste end and component unmount are not application completio
   assert.deepEqual(settingsPresentation({ localBusy: false, activity: active }), { busy: true, target: 'effort' });
   assert.deepEqual(settingsPresentation({ localBusy: true, localTarget: 'model', activity: active }), { busy: true, target: 'model' });
   assert.deepEqual(settingsPresentation({ activity: { busy: false }, intentWaiting: true, intentTarget: 'quick' }), { busy: true, target: 'quick' });
+});
+
+test('an explicit choice while Fork is starting stays selected across late inherited observations', () => {
+  const providerState = { codexSettingsIntentRevision: 1, codexSettingsIntentModel: 'chosen', codexSettingsIntentEffort: 'high' };
+  const select = state => codexSettingsSelection({ isCommandRunning: true, providerState: state,
+    effectiveSettings: { model: 'inherited', effort: 'max' } });
+  assert.deepEqual(select(providerState), { model: 'chosen', effort: 'high' });
+  assert.equal(codexSettingsIntentIsWaiting({ isCodex: true, isCommandRunning: true, providerState }), true);
+  const older = mergeTabProviderSnapshot({ tabId: 'T', state: providerState }, 'T', {}).state;
+  assert.deepEqual(select(older), { model: 'chosen', effort: 'high' });
+  const applied = { ...providerState, codexSettingsIntentAppliedRevision: 1 };
+  assert.deepEqual(select(applied), { model: 'inherited', effort: 'max' }, 'settled selection again follows actual proof, not an eternal desired override');
+  assert.deepEqual(select({ ...providerState, codexSettingsIntentError: 'failed' }), { model: 'inherited', effort: 'max' });
+});
+
+test('source projection uses Main revision ordering before another Fork captures the choice', () => {
+  const tab = { providerState: { codexSettingsIntentRevision: 2, codexSettingsIntentModel: 'B', codexSettingsIntentEffort: 'high' } };
+  const tabs = new Map([['T', tab]]), projects = new Map([['P', { tabs }]]);
+  assert.equal(projectTabProviderSnapshot(projects, 'T', { codexSettingsIntentRevision: 1, codexSettingsIntentModel: 'A' }), true);
+  assert.equal(tab.providerState.codexSettingsIntentModel, 'B');
+  assert.equal(projectTabProviderSnapshot(projects, 'gone', {}), false);
 });

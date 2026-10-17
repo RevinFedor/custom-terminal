@@ -20,10 +20,18 @@ function createAgentLaunchPreparationRegistry({
     command = null,
     phase = 'checking',
     reason = 'launch-requested',
+    launchIntent = null,
+    launchAttempt = null,
   } = {}) {
     if (!tabId) throw new Error('tabId required');
     if (toolType !== 'claude' && toolType !== 'codex') {
       throw new Error('toolType must be claude or codex');
+    }
+    const intent = launchIntent ? intents.get(launchIntent.token) : null;
+    if (launchIntent && (!intent || intent.revoked || !intent.inFlight
+      || intent.intentId !== launchIntent.intentId || intent.tabId !== tabId
+      || intent.toolType !== toolType || intent.attempt !== launchAttempt)) {
+      throw new Error('agent_launch_preparation_intent_mismatch');
     }
     const state = {
       tabId,
@@ -36,6 +44,12 @@ function createAgentLaunchPreparationRegistry({
       since: now(),
       preparing: true,
     };
+    if (intent) {
+      state.launchIntentToken = intent.token;
+      state.launchAttempt = intent.attempt;
+      intent.preparationToken = state.token;
+      intent.preparationOutcome = null;
+    }
     byTab.set(tabId, state);
     onChange(publicState(state));
     return publicState(state);
@@ -64,6 +78,15 @@ function createAgentLaunchPreparationRegistry({
   } = {}) {
     const current = byTab.get(tabId);
     if (!current || current.token !== token || current.preparing !== true) return false;
+    const intent = intents.get(current.launchIntentToken);
+    if (accepted !== true && intent?.inFlight && intent.preparationToken === token
+      && intent.attempt === current.launchAttempt) {
+      // The wrapper has not classified this attempt yet. It alone knows
+      // whether the SAME intent retains a legal no-write continuation.
+      intent.preparationOutcome = { accepted: false, reason, error };
+      return true;
+    }
+    if (intent?.preparationToken === token) intent.preparationOutcome = null;
     const finalState = {
       ...publicState(current),
       preparing: false,
@@ -213,6 +236,7 @@ function createAgentLaunchPreparationRegistry({
     state.finished = true;
     state.reason = reason;
     state.cancelledAt = now();
+    settleIntentPreparation(state);
     const result = intentCopy(state);
     retireIntent(state);
     return result;
@@ -220,6 +244,46 @@ function createAgentLaunchPreparationRegistry({
 
   function finishIntent(input) {
     return !!cancelIntent(input, 'agent_launch_intent_finished');
+  }
+
+  function canRetryIntent(state) {
+    return !!state && !state.revoked && !state.finished && state.attempt < 4
+      && state.phase === 'refused' && state.writeState === 'none'
+      && state.result?.success === false && state.result?.launchWritten === false
+      && state.result?.accepted === false && state.result?.acceptancePending !== true
+      && state.result?.joined !== true && state.result?.cancelled !== true
+      && state.result?.suppressed !== true && state.result?.launchOutcomeUnknown !== true
+      && state.result?.deliveryUnknown !== true && state.result?.sendReceipt?.deliveryUnknown !== true
+      && state.result?.status !== 'delivery-unknown'
+      && (state.result?.error === 'process_lookup_failed' || state.result?.reason === 'process_lookup_unknown'
+        || state.result?.lookupStatus === 'unknown');
+  }
+
+  function settleIntentPreparation(state) {
+    const current = byTab.get(state.tabId);
+    if (!current || current.token !== state.preparationToken
+      || current.launchIntentToken !== state.token || current.cleared === true) return;
+    if (state.revoked && state.reason !== 'agent_launch_intent_finished') {
+      // Explicit cancellation/owner teardown clears only this exact token.
+      // Never publish a spurious rejection before the clear.
+      const cleared = { ...current, preparing: false, accepted: false,
+        cleared: true, reason: state.reason, clearedAt: now() };
+      byTab.set(state.tabId, cleared);
+      state.preparationOutcome = null;
+      onChange(publicState(cleared));
+      return;
+    }
+    const outcome = state.preparationOutcome;
+    if (!outcome || state.inFlight || current.preparing !== true) return;
+    if (canRetryIntent(state)) {
+      update(state.tabId, current.token, { phase: 'retry-wait',
+        reason: state.result.reason || outcome.reason,
+        lastAttemptError: state.result.error || outcome.error || null });
+      return;
+    }
+    state.preparationOutcome = null;
+    finish(state.tabId, current.token, { ...outcome,
+      error: state.result?.error || state.result?.reason || outcome.error });
   }
 
   function beginIntentAttempt(token, attempt, payloadKey, senderId) {
@@ -232,14 +296,7 @@ function createAgentLaunchPreparationRegistry({
     if (attempt === state.attempt && state.result) return { allowed: false, replay: true,
       result: { ...state.result }, state: intentCopy(state) };
     if (!Number.isInteger(attempt) || attempt < 1 || attempt > 4 || attempt !== state.attempt + 1
-      || state.attempt > 0 && (state.phase !== 'refused' || state.writeState !== 'none'
-        || state.result?.success !== false || state.result?.launchWritten !== false || state.result?.accepted !== false
-        || state.result?.acceptancePending === true || state.result?.joined === true
-        || state.result?.cancelled === true || state.result?.suppressed === true
-        || state.result?.launchOutcomeUnknown === true || state.result?.deliveryUnknown === true
-        || state.result?.sendReceipt?.deliveryUnknown === true || state.result?.status === 'delivery-unknown'
-        || !(state.result?.error === 'process_lookup_failed' || state.result?.reason === 'process_lookup_unknown'
-          || state.result?.lookupStatus === 'unknown'))) {
+      || state.attempt > 0 && !canRetryIntent(state)) {
       return { allowed: false, reason: 'agent_launch_attempt_unresolved', state: intentCopy(state) };
     }
     state.payloadKey = payloadKey;
@@ -268,6 +325,7 @@ function createAgentLaunchPreparationRegistry({
     state.inFlight = false;
     state.phase = result?.launchWritten === false && result?.accepted === false
       ? 'refused' : 'settled';
+    settleIntentPreparation(state);
     retireIntent(state);
     return true;
   }
@@ -283,7 +341,12 @@ function createAgentLaunchPreparationRegistry({
   function clearIntentSender(senderId) {
     for (const [key, stream] of intentStreams) {
       if (stream.senderId !== senderId) continue;
-      for (const state of stream.entries.values()) intents.delete(state.token);
+      for (const state of stream.entries.values()) {
+        state.revoked = true;
+        state.reason = 'agent_launch_sender_destroyed';
+        settleIntentPreparation(state);
+        intents.delete(state.token);
+      }
       intentStreams.delete(key);
     }
   }

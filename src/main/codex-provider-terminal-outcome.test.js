@@ -38,6 +38,7 @@ function harness({ suppressed = false } = {}) {
   const prompts = new Map();
   const context = {
     ...predicates,
+    codexCanonicalPresentation: null,
     codexProviderSemanticSources: new Map([['T', owner]]),
     codexTurnWatchers: new Map([['T', watcher]]),
     codexPromptInFlight: prompts,

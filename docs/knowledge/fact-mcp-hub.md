@@ -11,14 +11,15 @@ sc-desktop). При ~10 открытых сессиях это 60-70 проце�
 ## Архитектура
 
 ```
-Claude/Codex вкладка ──HTTP──▶ mcp-hub (порт 53133) ──stdio──▶ 6 детей (по одному)
+Claude/Codex вкладка ──HTTP──▶ mcp-hub (порт 53133) ──stdio──▶ настроенные дети (по одному)
 ```
 
 - **`src/main/mcp-hub.js`** — standalone-процесс (`node mcp-hub.js --standalone`),
   detached от Electron: переживает ребилды приложения, живые сессии не теряют
   инструменты. Main его **усыновляет или спавнит** через общий controller и
   нянчит probe'ом каждые 60с; при смерти хаба — respawn. Старый хаб без исправленного
-  launch environment при 0 готовых серверов и ENOENT/code127 заменяется штатно,
+  launch environment при 0 готовых серверов и ENOENT/code127 заменяется штатно
+  только с known-zero pending/recovery и сохранением зарегистрированных имён,
   а не принимается как здоровый только по отвечающему HTTP. Изолированный E2E-main
   может пользоваться уже запущенным хабом, но не имеет права занимать глобальный
   порт, иначе временная копия из `/private/tmp` становится владельцем production-
@@ -35,7 +36,8 @@ Claude/Codex вкладка ──HTTP──▶ mcp-hub (порт 53133) ──s
 - Живой PID не считается достаточным доказательством здоровья. Короткие запросы
   каталога (`tools/list` и соседние list-методы) имеют четырёхсекундный timeout:
   при зависании хаб одним общим recovery перезапускает только этого ребёнка и
-  повторяет запрос один раз. Обычные `tools/call` не получают общий короткий
+  повторяет запрос один раз, если не выполняется другой tool call. Catalog timeout
+  не даёт права отменить активную операцию. Обычные `tools/call` не получают общий короткий
   timeout, потому что индексация и другие реальные операции законно идут минуты.
 - stdout детей трактуется как NDJSON построчно. Невалидная диагностическая строка
   логируется и отбрасывается отдельно; её нельзя накапливать перед следующими
@@ -74,13 +76,13 @@ repo source, без остановки NT/AI-вкладок или дополн�
 ## Identity: кто звонит
 
 Серверам с per-tab состоянием нужно знать вкладку. Хаб кладёт identity каждого
-запроса в `params._meta.noted = {tabId, projectId, cwd, mainPid}`:
+запроса в `params._meta.noted = {tabId, projectId, cwd, mainPid, instanceRoute?}`:
 
 - **Claude** умеет `${VAR}` в url (`services/mcp/config.ts::expandEnvVars`):
-  `~/.claude.json` → `url: "...?tab=${NOTED_PARENT_TAB_ID:-}&project=...&cwd=${CLAUDE_PROJECT_DIR:-}&mainPid=${NOTED_MAIN_PID:-}"`.
+  `~/.claude.json` → URL с tab/project/cwd/mainPid и `instanceRoute=${NOTED_MCP_INSTANCE_ROUTE:-}`.
   Неразвёрнутый плейсхолдер (`${...` literally) хаб трактует как пусто.
 - **Codex** НЕ разворачивает env в url. Используется `bearer_token_env_var =
-  "NOTED_MCP_IDENTITY"` → заголовок `Authorization: Bearer <tab>|<project>|<cwd>|<mainPid>`.
+  "NOTED_MCP_IDENTITY"` → заголовок `Authorization: Bearer <tab>|<project>|<cwd>|<mainPid>|<instanceRoute>`; прежние четыре поля поддерживаются.
   Токен без `|` считается чужим auth-токеном и игнорируется (аноним).
   Переменную составляет PTY env (`NOTED_MCP_IDENTITY` в terminal:create) и
   дублирует composition-строка в `~/.zshrc` И `~/.zshenv` из `NOTED_PARENT_*`
@@ -89,6 +91,18 @@ repo source, без остановки NT/AI-вкладок или дополн�
   hub-url с identity; если хаб недоступен — `mcpServersStdioFallback()`
   возвращает старые stdio-спавны (capability сохранена), и main пинает ensure.
 - Без identity (обычный терминал) — аноним: cwd-роутинг, как раньше.
+
+Main формирует instanceRoute как base64url JSON версии1 с discoveryDir и
+appRuntimeIdentity.instanceId. Credentials и публичного port/root override в
+tool schema нет. Hub переносит значение per-request, но удаляет
+NOTED_DISCOVERY_DIR и NOTED_MCP_INSTANCE_ROUTE из общего child ENV: один клиент
+не становится ambient owner остальных. Terminal закрепляет оба сервиса/токен
+своего root, проверяя PID/instance; stale binding не падает в host. Header-проверки
+обновлённого Main/API отказывают до dispatch. Шрам17.10 private tab=null/exists=false
+был ошибкой маршрута до message POST, не writer guard и не удалением вкладок.
+Actual private Luna roundtrip выполнен через общий hub, без альтернативных stdio.
+Состояние по-прежнему читается в current_context.tab либо passive inspect_tabs;
+новых top-level writer полей нет.
 
 ## Что переделано в самих серверах
 
@@ -168,8 +182,14 @@ Paired main/renderer build PASS; source ещё не установлен. Арт
 
 ## Конфиги (источник правды)
 
-- `~/.claude.json::mcpServers` — все шесть `type: "http"` на hub-url с `${VAR}`.
-- `~/.codex/config.toml::[mcp_servers.*]` — все шесть `url = ...` +
+- `~/.noted-terminal/mcp-hub.json` — machine-local launch bindings. Main и standalone
+  hub читают bounded stable snapshot; source install его не создаёт и не применяет
+  к уже живому Map. Профиль владеет перечисленными entries; omission сохраняет
+  прежний ENV соседей, `enabled:false` явно отключает. Command/args/env/stateful/
+  reapMarker не извлекаются из клиентского HTTP URL. [Форма и применение](../setup/mcp-hub.md).
+- `~/.claude.json::mcpServers` — клиентские `type: "http"` на hub-url с `${VAR}`;
+  исторический maintainer-профиль содержал все шесть.
+- `~/.codex/config.toml::[mcp_servers.*]` — клиентские `url = ...` +
   `bearer_token_env_var = "NOTED_MCP_IDENTITY"`. Верхнеуровневый
   `mcp_optional_startup_grace_ms = 0` заставляет Codex ждать штатный
   `startup_timeout_sec`, а не молча выбрасывать один сервер через дефолтную
@@ -187,7 +207,45 @@ restart обслуживают все сессии; дополнительные
 произвольной AI-вкладки. Списки владельцев/OS-liveness не смешивать; proof и
 границы false-orphan — `fact-resource-usage-panel.md::Брошенное против служебного`.
 
-Список хаба задан `defaultServerDefs()` и содержит шесть наших stdio-серверов; он не импортирует произвольные записи из Codex/Claude config. `6/6` подтверждает здоровье этого хаба, а внешние регистрации source-панель показывает отдельно из Codex (раздел UI выше). Например, `codex mcp add figma --url https://mcp.figma.com/mcp` добавляет прямое HTTP/OAuth-подключение в глобальный конфиг Codex. Отдельный локальный процесс Figma не нужен, а её native OAuth остаётся у Codex.
+Список хаба задаёт profile/ENV resolver, не произвольные записи Codex/Claude.
+Исторический maintainer-срез содержал шесть stdio-серверов. Первая portable-дельта
+14.10 сохранила только terminal/knowledge defaults, а четыре остальных требовала
+через explicit `NOTED_*` пути без переноса прежних code bindings. Текущий SOURCE
+читает постоянный профиль и совместимый ENV; новые Mac не обязаны иметь эти
+пакеты. `6/6`/`2/2 активных` относится только к зарегистрированному комплекту.
+Missing enabled hub route остаётся видимым в native catalog, а не исчезает как
+успешно merged alias. Например, прямой remote Figma HTTP/OAuth остаётся отдельным
+подключением Codex; локальный процесс Figma не нужен, OAuth не переносится в хаб.
+
+Шрам14.10 после Build Install: live `_status` hub21424 содержал только два
+initialized child; installed defaultServerDefs совпал с тогдашним CURRENT. Отсутствие
+Browser/SC в таком случае — не просто stale tools/list одной вкладки. Children
+фиксируются при создании hub; hot-add/reconfigure API нет, `_restart/<name>`
+не регистрирует отсутствующее имя. Нельзя обещать восстановление через restart
+ребёнка, создавать параллельный stdio или самовольно обходить запрет hub restart.
+Причина разрыва — убранные code-default bindings без machine-local миграции;
+почему конкретный ENV не был задан, отдельно не доказано. Новый SOURCE profile
+reader не угадывает утраченную команду и не переписывает личные конфиги. Для этой
+машины подготовлен отдельный неприменённый кандидат четырёх исторических bindings;
+terminal/knowledge он не переопределяет. Старые6/6 proofs остаются историей.
+
+Живой и желаемый profile snapshots сравниваются private fingerprint; наружу
+возвращается только `configurationApplied`, без argv/ENV/digest. Оно не означает
+актуальность executable bytes, ambient ENV или client catalog. При смене файла
+между Main read и spawn исходный fingerprint проверяется до listener/children;
+нельзя сначала исполнить замену, а затем лишь сообщить mismatch. Изменение
+профиля живого hub не вызывает автоматический restart: нужен owner-drain,
+штатная смена поколения, потом initialize/tools/list и actual client access.
+В порученном восстановлении MCP эти действия входят в обслуживание без отдельного
+продуктового согласования; это не разрешение прерывать неизвестную мутацию или AI.
+App Build Install и restart children сами не являются применением профиля.
+
+Pro предложила whole-profile omission как removal; actual local контроль показал,
+что частичная миграция теряет прежний explicit ENV соседа. Поэтому omission не
+disable; отключение выражается отдельно. Реапинг требует существующий точный файл,
+не directory/последний argv и не prefix совпадение с `entry.js.old`. Конкретные
+контроли — mcp-hub-preservation.test.js; real source/private stub процессы не
+подменяют принятие Browser/SC/Electron/iOS или старых AI-клиентов.
 
 Это объяснение относится к remote Figma HTTP/OAuth, не к Figma Console.
 В срезе05.10 native config/read показал enabled stdio `figma_console`

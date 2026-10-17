@@ -6,6 +6,8 @@ const path = require('path');
 const crypto = require('crypto');
 const {
   APP_STATE_KEY,
+  activeStorageTabsSql,
+  workflowStorageBindings,
   DEFAULT_SETTINGS,
   normalizeStorageRetentionSettings,
   scanStorageInventory,
@@ -18,13 +20,14 @@ const {
 } = require('./storage-retention-grace');
 const { CodexStorageDeletionProvider, uniqueSessionIds } = require('./codex-storage-deletion-provider');
 const { StorageDeletionAudit } = require('./storage-deletion-audit');
+const { ClosedTabRetention } = require('./storage-closed-tabs');
 
 const SCAN_CACHE_MS = 15_000;
 const DEFAULT_SWEEP_ITEMS = 25;
 const DEFAULT_SWEEP_BYTES = 2 * 1024 * 1024 * 1024;
 
-function canOwnAutomaticStorageRetention({ isPackaged = false, e2e = false } = {}) {
-  return isPackaged === true && e2e !== true;
+function canOwnAutomaticStorageRetention({ isPackaged = false, e2e = false, isolatedTest = false, canonicalProduction = true } = {}) {
+  return e2e === true ? isolatedTest === true : isPackaged === true && canonicalProduction === true;
 }
 
 function isInside(root, target) {
@@ -52,6 +55,11 @@ class StorageCleanupService {
     currentEnvironment = 'production',
     relationDatabases = [],
     getRuntimeProtectedSessionIds = () => [],
+    getRuntimeTabIds = () => [],
+    isRestoreInProgress = () => false,
+    onHistoryExpired = () => {},
+    testRunRoots = null,
+    mutationRoot = null,
     getMutationAuthority = () => ({ allowed: true, reason: 'default-authority' }),
     scanInventory = scanStorageInventory,
     graceStore = null,
@@ -76,6 +84,8 @@ class StorageCleanupService {
     this.currentEnvironment = currentEnvironment === 'development' ? 'development' : 'production';
     this.relationDatabases = Array.isArray(relationDatabases) ? relationDatabases : [];
     this.getRuntimeProtectedSessionIds = getRuntimeProtectedSessionIds;
+    this.testRunRoots = testRunRoots;
+    this.mutationRoot = mutationRoot;
     this.getMutationAuthority = getMutationAuthority;
     this.scanInventory = scanInventory;
     this.graceStore = graceStore;
@@ -84,6 +94,10 @@ class StorageCleanupService {
     this.now = now;
     this.logger = logger;
     this.audit = audit || (auditPath ? new StorageDeletionAudit({ filePath: auditPath, now }) : null);
+    this.closedTabs = typeof sqlite?.exec === 'function' ? new ClosedTabRetention({ db: sqlite,
+      getRuntimeSessionIds: getRuntimeProtectedSessionIds, getRuntimeTabIds, isRestoreInProgress,
+      currentEnvironment: this.currentEnvironment,
+      getSettings: () => this.getSettings(), audit: this.audit, now, logger, onExpired: onHistoryExpired }) : null;
     this.confirmationSecret = Buffer.isBuffer(confirmationSecret)
       ? confirmationSecret
       : Buffer.from(String(confirmationSecret));
@@ -91,6 +105,7 @@ class StorageCleanupService {
     this.deleteCodexSession = deleteCodexSession;
     this.createCodexDeletionProvider = createCodexDeletionProvider || (() => new CodexStorageDeletionProvider({
       codexHome: this.codexHome,
+      allowedRoot: this.mutationRoot ? this.codexHome : null,
       command: fs.existsSync(this.codexBinary) ? this.codexBinary : 'codex',
     }));
     this.cached = null;
@@ -124,6 +139,7 @@ class StorageCleanupService {
       currentEnvironment: this.currentEnvironment,
       relationDatabases: this.relationDatabases,
       settings: this.getSettings(),
+      testRunRoots: this.testRunRoots,
       nowMs,
     }).then((result) => {
       if (result.success !== true) throw deletionError('storage_inventory_failed', 'Storage inventory is unavailable');
@@ -143,6 +159,10 @@ class StorageCleanupService {
           deletionRevision: storageItemDeletionRevision(item),
         })),
       };
+      if (this.closedTabs) {
+        const plan = this.closedTabs.plan(snapshot);
+        snapshot.closedTabs = { ready: plan.candidates.length, skipped: plan.skipped };
+      }
       this.cached = snapshot;
       return snapshot;
     }).finally(() => {
@@ -178,6 +198,12 @@ class StorageCleanupService {
 
   _assertAllowedPath(item) {
     const target = path.resolve(String(item?.path || ''));
+    if (this.mutationRoot) {
+      const actual = fs.realpathSync(target);
+      const root = fs.realpathSync(this.mutationRoot);
+      if (actual === root || !isInside(root, actual)) throw deletionError('storage_test_scope_violation', 'Test cleanup cannot leave its private profile');
+      return actual;
+    }
     const allowedRoots = [
       path.join(this.codexHome, 'sessions'),
       path.join(this.codexHome, 'archived_sessions'),
@@ -210,11 +236,14 @@ class StorageCleanupService {
 
   _databaseReference(sqlite, sessionIds, { includeDurableRelations = false } = {}) {
     if (!sqlite || typeof sqlite.prepare !== 'function') return null;
+    const workflow = workflowStorageBindings(sqlite).find(row => sessionIds.includes(row.sessionId));
+    if (workflow) return { reference: 'workflow-member', sessionId: workflow.sessionId };
     const placeholders = sessionIds.map(() => '?').join(',');
     const probes = [{
       reference: 'tab',
       sql: `SELECT codex_session_id, claude_session_id FROM tabs
-            WHERE claude_session_id IN (${placeholders}) OR codex_session_id IN (${placeholders}) LIMIT 1`,
+            WHERE (claude_session_id IN (${placeholders}) OR codex_session_id IN (${placeholders}))
+              AND ${activeStorageTabsSql(sqlite)} LIMIT 1`,
       values: [...sessionIds, ...sessionIds],
       fields: ['codex_session_id', 'claude_session_id'],
     }];
@@ -266,7 +295,6 @@ class StorageCleanupService {
     for (const source of databases) {
       const foreignProduction = this.currentEnvironment === 'development'
         && source.environment === 'production';
-      if (!source.current && !foreignProduction) continue;
       try {
         const match = this._databaseReference(source.sqlite, sessionIds, {
           includeDurableRelations: foreignProduction,
@@ -300,7 +328,8 @@ class StorageCleanupService {
           ? item.affectedSessionIds
           : [sessionId],
       ),
-      deleteSession: async (sessionId, expectedSessionIds, item) => {
+      deleteSession: async (sessionId, expectedSessionIds, item, beforeDelete) => {
+        beforeDelete?.();
         const result = await this.deleteCodexSession(sessionId, item);
         return {
           deletedSessionIds: uniqueSessionIds(result?.deletedSessionIds?.length
@@ -554,7 +583,20 @@ class StorageCleanupService {
     const target = this._assertAllowedPath(item);
     if (item.section === 'sessions') {
       if (item.provider === 'codex' && item.recoveryCopy !== true) {
-        const deletion = await codexProvider.deleteSession(item.sessionId, finalClosureSessionIds, item);
+        const deletion = await codexProvider.deleteSession(item.sessionId, finalClosureSessionIds, item, () => {
+          const authority = this._mutationAuthority();
+          if (!authority.allowed) throw deletionError('storage_production_authority_unavailable', authority.reason);
+          const reference = this._sessionStillReferenced(item, finalClosureSessionIds);
+          if (reference) throw deletionError('storage_session_became_protected', 'Session became protected during provider preflight', { protectedReference: reference });
+          this._assertAllowedPath(item);
+          const stat = fs.statSync(target);
+          if ((item.fileIdentity && `${stat.dev}:${stat.ino}` !== item.fileIdentity)
+            || (item.modifiedAt && stat.mtimeMs !== item.modifiedAt)
+            || (Number.isFinite(item.sizeBytes) && stat.size !== item.sizeBytes)) {
+            throw deletionError('storage_retention_source_changed', 'Selected rollout changed during provider preflight');
+          }
+          if (source === 'retention') this._assertRetentionReady(item);
+        });
         // Old/manual rollouts may not be registered in the current Codex state
         // store. If upstream reports success but leaves this exact file, refuse
         // to silently claim reclaimed bytes.
@@ -748,9 +790,18 @@ class StorageCleanupService {
     };
   }
 
-  async runRetentionSweep({
+  async runRetentionSweep(request = {}) {
+    if (request.dryRun === true) return this._runRetentionSweep(request);
+    if (this.retentionInflight) return { success: false, error: 'storage_cleanup_in_progress' };
+    this.retentionInflight = this._runRetentionSweep(request);
+    try { return await this.retentionInflight; }
+    finally { this.retentionInflight = null; }
+  }
+
+  async _runRetentionSweep({
     maxItems = DEFAULT_SWEEP_ITEMS,
     maxBytes = DEFAULT_SWEEP_BYTES,
+    dryRun = false,
   } = {}) {
     const inventory = await this.scan({ force: true });
     if (inventory.settings.enabled !== true) return { success: true, skipped: true, reason: 'retention-disabled' };
@@ -770,16 +821,33 @@ class StorageCleanupService {
       selected.push(item);
       bytes += item.sizeBytes;
     }
-    if (selected.length === 0) return { success: true, removed: [], reclaimedBytes: 0, remainingEligible: 0 };
-    const result = await this.deleteItems({
+    if (dryRun) return { success: true, dryRun: true,
+      sessions: selected.map(item => ({ id: item.id, sessionId: item.sessionId, path: item.path, sizeBytes: item.sizeBytes })),
+      closedTabs: this.closedTabs ? await this.closedTabs.run({ inventory, dryRun: true, maxItems }) : null };
+    const authority = this._mutationAuthority();
+    if (!authority.allowed) return { success: false, error: 'storage_production_authority_unavailable', reason: authority.reason };
+    const result = selected.length ? await this.deleteItems({
       itemIds: selected.map((item) => item.id),
       generation: inventory.generation,
       source: 'retention',
       operationId: `storage-retention-${this.now().toString(36)}`,
-    });
+    }) : { success: true, removed: [], reclaimedBytes: 0 };
+    // Expiration reads fresh archive/membership SQL and rechecks after audit;
+    // it does not need another full filesystem/Test-runs scan. File versions
+    // and provider deletion were already proved by deleteItems above.
+    const removedIds = new Set(result.removed || []);
+    const after = { ...inventory, settings: this.getSettings(),
+      items: inventory.items.filter(item => !removedIds.has(item.id)) };
+    const closed = this.closedTabs ? await this.closedTabs.run({ inventory: after, maxItems: 250 }) : null;
+    this.cached = null;
     return {
       ...result,
-      remainingEligible: Math.max(0, candidates.length - selected.length),
+      expiredHistoryIds: closed?.expiredHistoryIds || [],
+      closedTabFailures: closed?.failures || [],
+      retainedClosedSessionSources: closed?.retainedSessionSources || [],
+      remainingClosedHistory: closed?.skipped?.['batch-limit'] || 0,
+      success: result.success && closed?.success !== false,
+      remainingEligible: Math.max(0, candidates.length - selected.length) + (closed?.skipped?.['batch-limit'] || 0),
     };
   }
 }

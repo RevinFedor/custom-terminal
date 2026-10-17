@@ -12,6 +12,7 @@ import {
 import ControlHint from '../UI/ControlHint';
 import SideSurfaceToggleButton from './SideSurfaceToggleButton';
 import { requestTerminalFullView } from '../../utils/terminalFullView.mjs';
+import {beginPromptNativeMenuIntent,invalidatePromptNativeMenuSource} from '../../utils/promptNativeMenuIntent.mjs';
 
 const { shell } = window.require('electron');
 
@@ -111,8 +112,10 @@ import {
 import { resolveTerminalGeometry } from '../../utils/terminalMinimumGeometry.mjs';
 import {
   resolveTerminalCanvasVisible,
+  retainXtermViewportPresentation,
   shouldRepaintTerminalOnActivation,
 } from '../../utils/terminalCanvasPresentation.mjs';
+import { PANE_LAYER_PRESENTATION_EVENT } from '../../utils/paneLayerPresentation.mjs';
 import { log } from '../../utils/logger';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import {
@@ -1228,6 +1231,8 @@ function Terminal({
   const isCreatingRef = useRef(false); // Lock to prevent double initialization
   const activeRef = useRef(active); // Track current active state for ResizeObserver closure
   const actualPresentationRef = actualPresentationRefProp || activeRef;
+  const viewportPresentationRef = useRef<{ sync: () => void } | null>(null);
+  const viewportPresentedRef = useRef<() => boolean>(() => true);
   const pendingBuffer = useRef(createTerminalHydrationBuffer()); // Sequence-aware PTY tail while renderer xterm is cold
   const hydrationActivity = useRef(createTerminalHydrationActivity()); // Nested generation retries share one active lifetime
   const rendererFlushedHeadlessWriteSeq = useRef<number | null>(null);
@@ -1883,6 +1888,10 @@ function Terminal({
   // This prevents focus/fit/repaint when terminals are hidden behind Dashboard or ProjectHome
   const effectiveActive = active && projectCurrentView === 'terminal' && workspaceView === 'workspace';
   const effectivePresented = effectiveActive && presentedProp;
+  const nativeMenuSourceRef = useRef(Symbol('terminal-native-menu'));
+  const nativeMenuPresentedRef = useRef(false);
+  nativeMenuPresentedRef.current = effectivePresented && isVisible;
+  useLayoutEffect(() => () => invalidatePromptNativeMenuSource(nativeMenuSourceRef.current),[effectivePresented,isVisible,tabId,ownerProjectId]);
   // "On screen" and "may swallow the keyboard" are different questions. A CLOSED
   // side terminal stays mounted and active on purpose (PTY, buffer and
   // scrollback survive so opening it is instant) — but nothing about it is
@@ -1970,6 +1979,32 @@ function Terminal({
   useLayoutEffect(() => {
     activeRef.current = effectivePresented;
   }, [effectivePresented]);
+
+  useLayoutEffect(() => {
+    // Retained active=true is a mount latch, not visibility. Do not use global
+    // keyboard focus: a visible unfocused raw-terminal pane still must update.
+    viewportPresentedRef.current = () => !isReadyRef.current || (
+      actualPresentationRef.current && projectCurrentView === 'terminal'
+      && workspaceView === 'workspace'
+      && (promptQueueInputSurface !== 'history' || isTerminalCentre || sideTerminalOpen)
+    );
+    viewportPresentationRef.current?.sync();
+  }, [actualPresentationRef, effectivePresented, isVisible, isTerminalCentre,
+    sideTerminalOpen, projectCurrentView, workspaceView, promptQueueInputSurface]);
+  useLayoutEffect(() => {
+    if (!actualPresentationRefProp) return;
+    const onPresentation = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string; presented?: boolean }>).detail;
+      if (detail?.tabId !== tabId || detail.presented !== true) return;
+      const projection = viewportPresentationRef.current;
+      // Child listeners may run before PersistentTerminal updates the ref.
+      // After this synchronous publication, reconcile before the next paint;
+      // sync rechecks the latest visibility and the captured instance's life.
+      queueMicrotask(() => projection?.sync());
+    };
+    window.addEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
+    return () => window.removeEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
+  }, [actualPresentationRefProp, tabId]);
 
   // Cmd+Tab focus restore: when our window becomes frontmost via Cmd+Tab,
   // macOS does NOT restore DOM focus to any element — Chromium's NSEvent
@@ -2705,11 +2740,6 @@ function Terminal({
         scrollback: RENDERER_XTERM_SCROLLBACK
       });
 
-      // Monkey-patch: defer Viewport._sync() during DEC 2026 synchronized output.
-      // Equivalent to xterm.js PR #5770 (merged in 6.x, not available in 5.x).
-      // Prevents scrollTop/scrollHeight DOM updates while Ink is mid-frame rewrite.
-      // Monkey-patch will be applied AFTER term.open() — viewport is created there
-
       const fitAddon = new FitAddon();
       const serializeAddon = new SerializeAddon();
       const searchAddon = new SearchAddon();
@@ -2725,6 +2755,9 @@ function Terminal({
       }));
 
       term.open(containerRef);
+      viewportPresentationRef.current = retainXtermViewportPresentation(
+        term, () => viewportPresentedRef.current(),
+      );
 
       // OSC 7 handler - shell reports current working directory
       // Format: file://hostname/path or just /path
@@ -3227,7 +3260,11 @@ function Terminal({
     // Initialize the visible terminal immediately. Warm inactive terminals from
     // the active project one-by-one in idle time, so switching back from Home or
     // another tab does not pay the full xterm cold-start cost on click.
-    if (active && isActiveProject) {
+    // A newly allocated AI child shows History. Its hidden xterm is not the
+    // first visible frame: fonts/open/fit belong to the existing serial warm
+    // lane. Shell readiness and pendingAction above are already subscribed and
+    // launch independently, with the same Main fence and source cut.
+    if (active && isActiveProject && mayClaimFocus) {
       // Lock: prevent double initialization
       if (isCreatingRef.current) {
         return;
@@ -3335,6 +3372,10 @@ function Terminal({
       return;
     }
 
+    // History can be active while its terminal panel is closed. Opening that
+    // panel/choosing terminal primary still initializes immediately below.
+    if (!mayClaimFocus && !xtermInstance.current) return;
+
     // Lazy init: if this is first activation and xterm not created yet
     if (!hasBeenActive.current && !xtermInstance.current && terminalRef.current) {
       console.warn(`[Terminal:LAZY_INIT] tabId=${tabId} — terminal not created yet, initializing from scratch`);
@@ -3387,6 +3428,9 @@ function Terminal({
         }));
 
         term.open(terminalRef.current);
+        viewportPresentationRef.current = retainXtermViewportPresentation(
+          term, () => viewportPresentedRef.current(),
+        );
 
         // OSC 7 handler - shell reports current working directory
         term.parser.registerOscHandler(7, (data: string) => {
@@ -3922,7 +3966,7 @@ function Terminal({
         wasAtBottom.current = buffer.viewportY >= buffer.baseY;
       }
     };
-  }, [armNativeCodexPickerProof, effectiveActive, isActiveProject, presentedProp, retainCanvasPixels, tabId, terminalPid]);
+  }, [armNativeCodexPickerProof, effectiveActive, isActiveProject, presentedProp, retainCanvasPixels, tabId, terminalPid, mayClaimFocus]);
 
   // React to font size changes
   useEffect(() => {
@@ -3972,9 +4016,6 @@ function Terminal({
   // Prompt under the cursor so it's keyboard-focused immediately.
   const openTerminalContextMenu = async (focusInsertPrompt = false) => {
     const hasSelection = xtermInstance.current?.hasSelection() || false;
-    const promptsResult = await ipcRenderer.invoke('prompts:get');
-    const prompts = promptsResult.success ? promptsResult.data : [];
-
     let currentProjectId: string | undefined;
     let shellActionsAllowed = false;
     const state = useWorkspaceStore.getState();
@@ -3986,13 +4027,22 @@ function Terminal({
         break;
       }
     }
+    const owner=beginPromptNativeMenuIntent({tabId,projectId:currentProjectId,kind:'terminal',source:nativeMenuSourceRef.current,
+      isPresented:()=>nativeMenuPresentedRef.current,
+      isAlive:()=>!!currentProjectId && !!useWorkspaceStore.getState().openProjects.get(currentProjectId)?.tabs.has(tabId)});
+    if(!owner.isCurrent()){owner.close();return;}
+    const promptsResult = await ipcRenderer.invoke('prompts:get');
+    if(!owner.isCurrent())return;
+    const prompts = promptsResult.success ? promptsResult.data : [];
     const termCwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
+    if(!owner.isCurrent())return;
     ipcRenderer.send('show-terminal-context-menu', {
       hasSelection, prompts, tabId,
       projectId: currentProjectId,
       cwd: termCwd || cwd,
       shellActionsAllowed,
       focusInsertPrompt,
+      intent:owner.intent,
     });
   };
 

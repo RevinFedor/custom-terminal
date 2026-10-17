@@ -2,6 +2,7 @@ export const STORAGE_SECTIONS = Object.freeze([
   { id: 'sessions', label: 'Sessions' },
   { id: 'builds', label: 'Codex builds' },
   { id: 'app', label: 'Noted Terminal data' },
+  { id: 'test-runs', label: 'Test runs' },
 ]);
 
 export const STORAGE_PROVIDER_FILTERS = Object.freeze([
@@ -33,7 +34,7 @@ export const STORAGE_GROUPS = Object.freeze({
   },
   development: {
     label: 'Dev sessions',
-    description: 'Sessions referenced only by the development Noted Terminal database. Production tabs and history do not depend on them.',
+    description: 'Closed sessions referenced only by the development Noted Terminal database. Current development workflow tabs stay protected in Open now.',
   },
   outside: {
     label: 'Outside Noted Terminal',
@@ -59,12 +60,17 @@ export const STORAGE_GROUPS = Object.freeze({
     label: 'App caches & images',
     description: 'Chromium caches and prompt images. Their existing owners decide garbage collection.',
   },
+  'test-run': {
+    label: 'Test profiles',
+    description: 'Separate development/test instances, including packaged test apps. Shows databases, conversations, app builds and other artifacts separately. A stopped test instance is not automatically disposable.',
+  },
 });
 
 export const STORAGE_GROUP_ORDER = Object.freeze({
   sessions: ['open', 'regular', 'fork', 'rewrite', 'subagent', 'development', 'outside', 'recovery'],
   builds: ['build'],
   app: ['app-backup', 'app-active', 'app-cache'],
+  'test-runs': ['test-run'],
 });
 
 export const RETENTION_DAY_OPTIONS = Object.freeze([

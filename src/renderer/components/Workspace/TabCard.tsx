@@ -12,7 +12,7 @@ import { isErrorToast } from '../../utils/toastPlacement.mjs';
 import { useTabWorkContext } from '../../utils/tabWorkContext';
 import {
   TabProcessBar, TabStatusMarker, TabStatusMarkerButton, TabTopLeftSignals,
-  TabContextUpdateBadge, TabCompletionNotificationBadge,
+  TabContextUpdateBadge, TabCompletionNotificationBadge, TabCompletionNotificationAlert,
   TabSessionAvailabilityMarker, useTabActivitySignals, useTabContextUsage,
   TAB_CONTEXT_UPDATE_INSET_PX,
   TAB_PROCESS_BAR_W_PX,
@@ -184,6 +184,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     {!chooser && <TabProcessBar {...activity} radius={metrics.borderRadius} zIndex={4} />}
     <TabTopLeftSignals fastActive={fastActive} contextPct={contextPct} minContextPct={50} zIndex={8} muted={muted} />
     <TabContextUpdateBadge active={contextUpdate} />
+    <TabCompletionNotificationAlert fired={fired} />
     <TabCompletionNotificationBadge armed={armed} persistent={persistent} fired={fired} />
     {interactiveStatus ? <TabStatusMarkerButton projectId={projectId} tabId={tabId} color={status?.color} title={status?.label} topOffsetPx={hasLinkedFiles&&titleLayout?0:undefined} />
       : <TabStatusMarker color={status?.color} title={status?.label} topOffsetPx={hasLinkedFiles&&titleLayout?0:undefined} />}
@@ -197,6 +198,8 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   </>;
   return React.createElement(as, { ...elementProps, ref, ...(as === 'button' ? { type: 'button' } : {}),
     'data-tab-card': tabId, 'data-linked-file-owner-selected': fileSelected ? '1' : undefined,
+    'data-tab-operation': aiClosing ? 'close'
+      : pendingOperation === 'Создание форка…' ? 'fork' : pendingOperation ? 'other' : undefined,
     'data-tab-session-availability': availability.state === 'none' ? undefined : availability.state,
     onMouseEnter: (event: React.MouseEvent<HTMLElement>) => { setHovered(true); onMouseEnter?.(event); },
     onMouseLeave: (event: React.MouseEvent<HTMLElement>) => { setHovered(false); onMouseLeave?.(event); },

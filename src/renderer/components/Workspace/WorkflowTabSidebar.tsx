@@ -1,3 +1,4 @@
+import {uiDragDiagnostic} from '../../utils/uiPerformanceDiagnostics.mjs';
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {retainWorkflowOutline} from '../../utils/workflowOutlineRetention.mjs';
 import {workflowGroupDisplayName} from '../../../shared/workflow-groups-projection.cjs';
@@ -249,6 +250,7 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
     sourceId:externalProjection.sourceId,pointerId:externalPointer.pointerId,pointerType:'mouse',
     sourceRootIds:externalProjection.sourceRootIds,sourceContext:externalPointer.source!.workflowDrag,
     gestureId:externalPointer.source!.gestureId,
+    grabOffsetY:externalPointer.source!.owner==='sidebar' ? externalPointer.source!.sourceGrabOffsetY : undefined,
     readCurrentInput:()=>{
       const pointer=getPaneTabPointerSnapshot(),source=externalPointer.source;
       if(!pointer.active || pointer.source!==source || pointer.pointerId!==externalPointer.pointerId
@@ -260,7 +262,9 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
     clientX:externalPointer.clientX,clientY:externalPointer.clientY,metaKey:externalPointer.metaKey} : null;
   const membershipOf=(admission:any)=>Object.fromEntries(Object.entries(admission?.guards || {}).map(([id,guard]:any)=>[id,
     {workflowId:guard.workflowId,revision:guard.membershipRevision}]));
+  const sourceFollow = externalPointer?.source?.owner==='pane' ? null : 'y';
   const dnd = useOutlineDnd<Node>({ outline:controlledOutline,
+    sourceFollow,
     hierarchyModifier:'meta',
     pointerPublication:externalPointer?.source?.owner==='pane' && projectedOutline.current.immutable ? 'semantic':'frame',
     ...({externalDrag} as any),
@@ -325,6 +329,7 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
     onExternalCommit: payload => !payload.sourceContext ? false
       : latest.current.onPlaceTabs(payload.sourceContext.paneEntries,
         payload.externalTarget as PaneTabDropTarget,payload.sourceContext,{isCurrent:payload.isCurrent}),
+    onDiagnostic: uiDragDiagnostic,
     onLog:event=>{
       if(['start','external-adopt','commit','cancel','vertical','horizontal','horizontal-blocked','expansion','release-preview','commit-error','commit-rejected'].includes(event.type))
         console.log(`[WorkflowReserveDnd:${event.type}] workflow=${workflowId} source=${event.sourceId || ''} reason=${String(event.detail?.reason || '')} state=${JSON.stringify({
@@ -456,7 +461,7 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
       onDoubleClick={event=>{if(!(event.target as Element).closest('[data-outline-dnd-row]'))void create();}}
       onPointerDown={() => { userScroll.current = true; }}
       onScroll={event => { if (userScroll.current) props.onScrollOffsetChange?.(workflowId, event.currentTarget.scrollTop); }}>
-      <div className="workflow-reserve-outline">
+      <div className="workflow-reserve-outline" data-outline-dnd-source-follow={dnd.dragState?.phase==='dragging' ? sourceFollow : undefined}>
         {dnd.rows.map(row => {
           const node = nodes.get(String(row.id))!;
           const rowProps = dnd.getRowProps(row);
@@ -470,7 +475,7 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
           const parent = ancestors.at(-1), parentTab = parent?.tabId && model.catalog.get(parent.tabId)?.tab;
           const connectorColor = parentTab?.color && parentTab.color !== 'default'
             ? adjustRgbaAlpha(getTabChromeColorConfig(parentTab).bgColor,.22) : '#ffffff24';
-          return <div {...rowProps} key={row.id} className="workflow-reserve-row" style={{marginLeft:indent}}>
+          return <div {...rowProps} key={row.id} className="workflow-reserve-row" style={{...rowProps.style,marginLeft:indent}}>
             {row.depth > 0 && <span aria-hidden className="workflow-reserve-connectors" style={{color:connectorColor}}>
               {row.ancestorContinuationDepths.map(depth => <span key={depth} className="workflow-reserve-connector continuation"
                 data-visual-connector-continuation={depth} style={{left:-7-(row.depth-depth-1)*12}} />)}

@@ -441,6 +441,11 @@ Desktop сначала делает `validateOnly` по ещё живой вкл
 - Cmd+hover открывает SOURCE-превью: одна строка prompt с ellipsis и по умолчанию
   три строки начала **собственного финального ответа**. Это два отдельных
   клика к exact user/final History identity, не поиск похожего текста.
+- Свёрнутые final, readable compact и prose Research сохраняют Markdown, а не
+  показывают raw `#`, `**` и fences. Компактный режим общего renderer не добавляет
+  media fetch, Copy/вложенный scroll или URL-переход внутрь whole-row click;
+  прежние one/three-line caps, raw Copy и exact target сохраняются. Обычный
+  пользовательский prompt и JSON excerpt остаются literal.
 - Финальный адрес/короткий текст готовятся тем же canonical parser. Codex требует
   `final_answer` (legacy untyped — completed, не failed/aborted); Claude — terminal
   text `end_turn/stop_sequence`, не tool_use, thinking или API error. Последний

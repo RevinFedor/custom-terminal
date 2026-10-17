@@ -1,0 +1,53 @@
+/* MicButton: static rules shared by all mounted owners. */
+
+        @keyframes mic-pulse {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.55; transform: scale(0.78); }
+        }
+        @keyframes mic-spin {
+          to { transform: rotate(360deg); }
+        }
+        @keyframes mic-fade-in {
+          from { opacity: 0; transform: translateY(4px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+      
+/* TabNotificationControls: static rules shared by all mounted owners. */
+
+      .tab-notification-control { transition: none; }
+      .tab-notification-control:hover {
+        background-image: linear-gradient(rgba(255,255,255,0.10), rgba(255,255,255,0.10));
+      }
+      .tab-notification-control:focus-visible {
+        outline: none;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.38);
+      }
+    
+/* TabTaskPlanPanel: static rules shared by all mounted owners. */
+
+          [data-task-plan-topic-strip]::-webkit-scrollbar { display: none; }
+          [data-task-plan-topic]:is(:hover,[data-task-plan-preview="true"]) {
+            box-shadow: inset 0 0 0 99px rgba(255,255,255,0.06);
+            transform: scale(1.04);
+            z-index: 1;
+          }
+          [data-task-plan-topic][data-task-plan-markers-only="true"]:is(:hover,[data-task-plan-preview="true"]) {
+            transform: scale(1.16);
+          }
+          [data-tab-task-plan] > [data-tab-responsibility]:hover,
+          [data-tab-task-plan] > [data-task-plan-header]:hover {
+            box-shadow: inset 0 0 0 999px rgba(255,255,255,0.045);
+          }
+          @keyframes noted-task-plan-flash {
+            0% { background-color: rgba(167, 139, 250, 0.34); box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0.62); }
+            100% { background-color: transparent; box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0); }
+          }
+          @keyframes noted-task-plan-selection-reveal {
+            from { opacity: 0.999; }
+            to { opacity: 1; }
+          }
+          @keyframes noted-task-plan-checkbox-reveal {
+            from { opacity: 0; }
+            to { opacity: 1; }
+          }
+        

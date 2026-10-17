@@ -1,13 +1,29 @@
 export const EMPTY_DISK_CAPACITY = Object.freeze({ status: 'unknown', measuredAt: null,
   expiresAt: null, warning: null });
 
-export function diskCapacityPresentation(snapshot, now = Date.now()) {
+export function diskCapacitySnapshotForDisplay(snapshot) {
+  const fallback = snapshot?.status === 'error' ? snapshot.fallback : null;
+  if (!fallback) return snapshot;
+  const hasFreeProjection = Number.isSafeInteger(fallback.freeBytes)
+    && Number.isSafeInteger(fallback.remainingGrowthBytes)
+    && Number.isSafeInteger(fallback.projectedFreeBytes)
+    && typeof fallback.warning === 'boolean';
+  return { ...snapshot, ...fallback, status: hasFreeProjection ? 'ready' : 'error',
+    sampleErrorCode: snapshot.errorCode };
+}
+
+export function diskCapacityPresentation(rawSnapshot, now = Date.now()) {
+  const snapshot = diskCapacitySnapshotForDisplay(rawSnapshot);
   if (snapshot?.status !== 'ready') return snapshot?.status === 'stale' ? 'stale'
     : snapshot?.status === 'error' ? 'error' : 'unknown';
   if (!Number.isFinite(snapshot.expiresAt) || snapshot.expiresAt <= now) return 'stale';
-  const positiveFields = ['freeBytes', 'cacheBytes', 'budgetBytes', 'reserveBytes', 'remainingGrowthBytes'];
+  const positiveFields = ['freeBytes', 'budgetBytes', 'reserveBytes', 'remainingGrowthBytes'];
   if (positiveFields.some(key => !Number.isSafeInteger(snapshot[key]) || snapshot[key] < 0)
       || !Number.isSafeInteger(snapshot.projectedFreeBytes) || typeof snapshot.warning !== 'boolean') return 'error';
+  const cacheFresh = snapshot.cacheFresh !== false;
+  if ((cacheFresh && (!Number.isSafeInteger(snapshot.cacheBytes) || snapshot.cacheBytes < 0))
+      || (!cacheFresh && snapshot.cacheBytes != null
+        && (!Number.isSafeInteger(snapshot.cacheBytes) || snapshot.cacheBytes < 0))) return 'error';
   return snapshot.warning ? 'warning' : 'healthy';
 }
 

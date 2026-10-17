@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
+import { contextCreatedTabPlacement } from '../../utils/contextCreatedTabPlacement.mjs';
 
 // Execute the real TabBar caller: the regression was a loader/claim after its
 // first await, so testing an isolated busy-state helper would miss the bug.
@@ -35,7 +36,9 @@ function fixture({ resolveSource = async () => 'source-session', invoke = async 
     contextMenu: { tabId: liveTab.id },
     workspace: { tabs: new Map([[liveTab.id, renderedTab]]), projectPath: '/fixture' },
     projectId: 'project', contextForkProvider: 'codex', contextForkSessionAvailable: true,
-    useWorkspaceStore: { getState: () => store },
+    useWorkspaceStore: { getState: () => store, setState: patch => Object.assign(store,patch) },
+    contextForkSourceClaims: new WeakSet(),
+    contextCreatedTabPlacement,
     tabContextSurface: () => ({ kind: 'pane', paneIndex: 1 }), renameHostRef: { current: {} },
     setContextMenu: () => events.push({ type: 'close-menu' }),
     resolveContextForkSessionId: async (...args) => { events.push({ type: 'proof' }); return resolveSource(...args); },
@@ -51,8 +54,9 @@ test('first click allocates the child before history work and a second surface c
   const gate = new Promise(resolve => { release = resolve; });
   const f = fixture({ resolveSource: () => gate });
   const pending = f.action(false);
-  assert.equal(f.liveTab.pendingOperation, 'делается форк...');
-  assert.equal(f.events[0].type, 'label');
+  assert.equal(f.liveTab.pendingOperation, undefined, 'Fork preparation belongs to the child, not a false source loader');
+  assert.equal(f.events.some(event => event.type === 'label'), false);
+  assert.equal(f.events[0].type, 'close-menu');
   assert.equal(f.events.filter(event => event.type === 'proof').length, 0);
   await f.action(false);
   assert.equal(f.events.filter(event => event.type === 'proof').length, 0);
@@ -71,12 +75,44 @@ test('first click allocates the child before history work and a second surface c
   assert.equal(f.events.filter(event => event.type === 'create').length, 2, 'a later independent Fork remains available');
 });
 
-test('allocation failure always releases the source label without a ready announcement', async () => {
+test('actual menu caller places the exact durable child in its first publication and retains normal activation', async () => {
+  const f = fixture();
+  Object.assign(f.store, {activeSpaceId:'workflow',navigationRevision:7,
+    splitFocusedIndex:0,splitPanes:[{projectId:'project',tabId:'source-tab'},
+      {projectId:'other',tabId:'neighbor'}],
+    activateCenterTab: (_project,id) => f.events.push({type:'activate',id}),
+    saveSession: () => f.events.push({type:'save-layout'})});
+  let publish;
+  const durable = new Promise(resolve => {publish=resolve;});
+  f.store.createTabAfterCurrent = async (_project,_name,_cwd,options) => {
+    await durable;
+    const workspace=f.store.openProjects.get('project');
+    workspace.tabs.set('child-tab',{id:'child-tab',pendingAction:options.pendingAction});
+    const patch=options.onPublish('child-tab',workspace.tabs);
+    Object.assign(f.store,patch);
+    f.events.push({type:'publication',shown:f.store.splitPanes[1].tabId,
+      sourceSession:workspace.tabs.get('source-tab').codexSessionId});
+    return 'child-tab';
+  };
+  // This surface identifies pane 1; put the source there without losing the neighbor.
+  f.store.splitPanes.reverse();
+  const pending=f.action(false);
+  assert.equal(f.store.openProjects.get('project').tabs.has('child-tab'),false);
+  publish();await pending;
+  assert.deepEqual(f.events.filter(x=>x.type==='publication'),[
+    {type:'publication',shown:'child-tab',sourceSession:'source-session'}]);
+  assert.equal(f.store.splitPanes[0].tabId,'neighbor');
+  assert.deepEqual(f.events.filter(x=>x.type==='activate'),[{type:'activate',id:'child-tab'}]);
+});
+
+test('allocation failure releases the duplicate claim without a source loader or ready announcement', async () => {
   const f = fixture({ resolveSource: async () => { throw new Error('allocation failed'); } });
   await f.action(true);
   assert.equal(f.liveTab.pendingOperation, undefined);
   assert.equal(f.events.some(event => event.type === 'place'), false);
   assert.equal(f.events.filter(event => event.type === 'toast').length, 1);
+  await f.action(false);
+  assert.equal(f.events.filter(event => event.type === 'create').length, 2);
 });
 
 test('compact copy is deferred to target launch; stale cleanup leaves a newer source label alone', async () => {

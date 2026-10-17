@@ -70,10 +70,9 @@ test('legacy timeline/finalizer reads actual composite source prefix, not empty 
       prefixDigest: (await hashFileSegment(childPath, 0, childBytes)).sha256 } });
   const service = new SessionTranscriptService({ getMainWindow: () => null,
     codexData: { _api: { ...codexData._api, findCodexSessionFile: async id => ({ filePath: id === SOURCE ? sourcePath : childPath }) } },
-    sessionHistoryStore: { getSessionHistoryEvents: id => id === CHILD ? [{ eventType: 'fork', provider: 'codex',
+    sessionHistoryStore: { getSessionHistoryEvents: id => id === CHILD ? [{ eventKey: `fork:codex:${SOURCE}:${CHILD}`, eventType: 'fork', provider: 'codex',
       sessionId: CHILD, sourceSessionId: SOURCE, childSessionId: CHILD, snapshotComplete: true,
       origin: 'app', isDirect: true, lineageManifest }] : [] } });
-  t.after(() => service.dispose());
   const invoke = timelineHandler(service, { success: true, entries: [], sessionMeta: childRecords[0].payload });
   const result = await invoke({ sessionId: CHILD, cwd: '/fixture', tabId: 'T' });
   assert.equal(result.success, true, JSON.stringify(result));
@@ -113,6 +112,7 @@ for (const fork of [true, false]) test('actual Main discard boundary ' + (fork ?
   const end = source.indexOf("ipcMain.handle('codex:reconcile-native-rewind-before-history-rewrite'", start);
   let handler, cas = 0, unlinks = 0;
   vm.runInNewContext(source.slice(start, end), {
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
     ipcMain: { handle: (_name, fn) => { handler = fn; } },
     runKeyedExclusive: (_map, _key, operation) => operation(), codexLaunchInflight: new Map(),
     resolveAuthoritativeTabProjectId: () => 'P', codexLastRunCommandPayload: new Map(),

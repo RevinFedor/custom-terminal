@@ -30,15 +30,15 @@ export function createTabMessageSourceNavigation(deps) {
           if (pending === operation && deps.placement() !== placement) cancel();
         });
         unsubscribeIntent = deps.subscribeIntent?.(() => { if (pending === operation) cancel(); }) || (() => {});
-        const result = await deps.locate(source.messageId);
+        const result = await deps.locate(source.messageId, source);
         if (pending !== operation) return false;
         const location = result?.location;
         if (!result?.success) throw new Error(result?.error || 'tab_message_source_call_not_found');
         if (location?.messageId !== source.messageId || location?.tabId !== source.sourceTabId
-          || !location.entryUuid || !location.toolUseId || !location.readSessionId) {
+          || !location.entryUuid || (!location.toolUseId && !location.messageReference) || !location.readSessionId) {
           throw new Error('tab_message_source_identity_changed');
         }
-        const requestId = deps.requestId();
+        const requestId = deps.requestId(source);
         const wait = deps.waitForScroll(requestId);
         cancelWait = wait.cancel;
         deps.reveal(location.tabId);

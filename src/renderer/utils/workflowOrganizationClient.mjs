@@ -1,3 +1,4 @@
+import {uiDragDiagnostic,uiDragActionId} from './uiPerformanceDiagnostics.mjs';
 import { captureSpaceLayout, emptySpaceLayout } from './workspaceSpacesModel.mjs';
 import { INBOX_WORKFLOW_ID } from './workflowMembership.mjs';
 import { orderedWorkflows } from '../../shared/workflow-order.cjs';
@@ -139,13 +140,17 @@ export function createOrganizationCommitter({invoke,getPublication,applyPublicat
     let result = operation.result;
     if (!result) {
       try {
-        result = await invoke('workflow:mutate',{kind:operation.kind || 'commitWorkspace',request:operation.request});
+        if(operation.kind==='commitDrag')uiDragDiagnostic('commit-ipc-send',{gestureId:operation.request.gestureId,mutationId:operation.request.mutationId});
+        result = await invoke('workflow:mutate',{kind:operation.kind || 'commitWorkspace',request:operation.request,
+          ...(operation.kind==='commitDrag'?{diagnosticActionId:uiDragActionId(operation.request.gestureId)}:{})});
+        if(operation.kind==='commitDrag')uiDragDiagnostic('commit-ipc-reply',{gestureId:operation.request.gestureId,mutationId:operation.request.mutationId,publicationRevision:result?.revision,generation:result?.generation,confirmed:confirmed(result,operation.request)});
         if (!confirmed(result,operation.request)) throw Object.assign(new Error('workflow_commit_unconfirmed'),{
           disposition:result?.mutationId === operation.request.mutationId ? result.disposition : undefined,
         });
       }
       catch (original) {
         result = await invoke('workflow:mutation',operation.request.mutationId).catch(() => null);
+        if(operation.kind==='commitDrag')uiDragDiagnostic('commit-recovery-reply',{gestureId:operation.request.gestureId,mutationId:operation.request.mutationId,publicationRevision:result?.revision,generation:result?.generation,confirmed:confirmed(result,operation.request)});
         if (!confirmed(result,operation.request)) {
           // These named Main validation errors prove the transaction rejected.
           // Transport errors and missing ACK keep owning the same request.

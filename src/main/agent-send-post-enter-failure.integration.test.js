@@ -123,6 +123,7 @@ function createHarness(t, options = {}) {
     lastCommittedVisibleSnapshot: { committedFrameGeneration: 8 },
   };
   const context = vm.createContext({
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
     ...require('./agent-send-target-precondition'),
     ...require('./agent-history-send-receipt'),
     ...receiptStoreModule,
@@ -135,6 +136,9 @@ function createHarness(t, options = {}) {
     ...require('./prompt-audit-fingerprint'),
     ...require('./pty-input-ownership'),
     AGENT_SEND_DURABLE_STATES: STORE_STATES,
+    // Notification port only; markAiStopping and Stop revision remain actual.
+    broadcastAgentLaunchFenceRevoked() {},
+    terminalLaunchFenceOrders: new WeakMap(), nextTerminalLaunchFenceOrder: 0,
     Buffer,
     Date,
     Promise,
@@ -297,6 +301,7 @@ function createHarness(t, options = {}) {
     'handleTerminalInput',
     'getTerminalStopRevision',
     'captureAgentInputIdentity',
+    'captureAgentLaunchFence',
     'agentSendExecutionFailure',
     'markAiStopping',
     'clearAiStopping',

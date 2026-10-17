@@ -42,6 +42,7 @@ function createTerminalHistoryPreviewController({
   clearTimer = clearTimeout,
   emitCoalesceMs = DEFAULT_EMIT_COALESCE_MS,
   isEnabled = () => true,
+  onCodexCanonicalAck = null,
 } = {}) {
   if (typeof getContext !== 'function') throw new TypeError('getContext is required');
   if (typeof readFrame !== 'function') throw new TypeError('readFrame is required');
@@ -356,14 +357,14 @@ function createTerminalHistoryPreviewController({
 
   const semanticText = (state) => state.semanticItemOrder
     .map((itemId) => state.semanticItems.get(itemId))
-    .filter((item) => item?.materialized !== true)
+    .filter((item) => item?.materialized !== true || item?.presentationHeld === true)
     .map((item) => item?.text || '')
     .filter((text) => text.length > 0)
     .join('\n\n');
 
   const semanticSegments = (state) => {
     const items = state.semanticItemOrder.map(id => state.semanticItems.get(id))
-      .filter(item => item?.materialized !== true && item?.text);
+      .filter(item => (item?.materialized !== true || item?.presentationHeld === true) && item?.text);
     const fullLength = items.reduce((size, item) => size + item.text.length, 0)
       + Math.max(0, items.length - 1) * 2;
     const cut = Math.max(0, fullLength - MAX_PREVIEW_CHARS);
@@ -374,8 +375,9 @@ function createTerminalHistoryPreviewController({
       const text = item.text.slice(Math.max(0, cut - start));
       return text ? [{ itemId: item.itemId, requestId: item.requestId,
         text, phase: state.phase === 'settled' || item.completed === true
-          || item.deliveryState === 'unknown' ? 'settled' : 'streaming',
-        deliveryState: item.deliveryState || 'pending',
+          || item.materialized === true || item.deliveryState === 'unknown' ? 'settled' : 'streaming',
+        deliveryState: item.materialized === true && item.presentationHeld === true
+          ? 'saved' : item.deliveryState || 'pending',
       }] : [];
     });
   };
@@ -388,6 +390,8 @@ function createTerminalHistoryPreviewController({
       messageId: short(item?.messageId, 18),
       completed: item?.completed === true,
       materialized: item?.materialized === true,
+      presentationHeld: item?.presentationHeld === true,
+      presentationPublished: item?.canonicalPresentationPublished === true,
       deliveryState: item?.deliveryState || 'pending',
       deliveryReason: item?.deliveryReason || null,
       chars: text.length,
@@ -409,6 +413,20 @@ function createTerminalHistoryPreviewController({
         summary.completed ? 'done' : 'open'].join(':');
     })
     .join(',') || '-';
+
+  const notifyCodexCanonicalAck = (state, receipt, item) => {
+    if (state.provider !== 'codex' || !receipt.receiptToken) return;
+    if (receipt.presentationHeld === true && item.canonicalPresentationPublished !== true) {
+      item.presentationHeld = true;
+      item.text = receipt.text;
+    }
+    item.canonicalPresentationReceipt = receipt;
+    try { onCodexCanonicalAck?.({ tabId: state.tabId, receiptToken: receipt.receiptToken,
+      instanceId: state.semanticInstanceId, lifecycleGeneration: state.lifecycleGeneration,
+      previewId: state.previewId, turnId: state.turnId, itemId: item.itemId,
+      identity: receipt.identity, presentationPublished: item.canonicalPresentationPublished === true }); }
+    catch (error) { writeLog('warn', 'CANONICAL_ACK_CALLBACK_FAILED', state, { reason: error?.message || 'callback' }); }
+  };
 
   const reconcileSemanticCanonicalReceipts = (state, { allowTextFallback = false } = {}) => {
     if (state?.sourceMode !== 'semantic'
@@ -453,6 +471,11 @@ function createTerminalHistoryPreviewController({
         if (item) match = 'message-id-and-canonical-prefix';
       }
       if (item?.materialized === true) {
+        if (receipt.receiptToken && item.canonicalIdentity !== receipt.identity) {
+          pending.push(receipt);
+          continue;
+        }
+        notifyCodexCanonicalAck(state, receipt, item);
         writeLog('log', 'SEMANTIC_CANONICAL_ACK', state, {
           match: 'already-materialized',
           item: short(item.itemId, 18),
@@ -481,6 +504,7 @@ function createTerminalHistoryPreviewController({
       }
       item.materialized = true;
       item.canonicalIdentity = receipt.identity || null;
+      notifyCodexCanonicalAck(state, receipt, item);
       state.lastSemanticCanonicalReceipt = receipt;
       matched += 1;
       writeLog('log', 'SEMANTIC_CANONICAL_ACK', state, {
@@ -504,6 +528,8 @@ function createTerminalHistoryPreviewController({
     identity = null,
     text = '',
     receiptKey = null,
+    receiptToken = null,
+    presentationHeld = false,
   } = {}) => {
     if (state?.sourceMode !== 'semantic') return 0;
     if (!Array.isArray(state.semanticCanonicalReceipts)) {
@@ -521,6 +547,7 @@ function createTerminalHistoryPreviewController({
       messageId,
       identity: typeof identity === 'string' && identity ? identity : null,
       text: normalizedSemanticText(text),
+      ...(receiptToken ? { receiptToken, presentationHeld } : {}),
     };
     const sameMessageCandidates = state.provider === 'claude'
       ? claudeReceiptCandidates(state, receipt)
@@ -568,10 +595,12 @@ function createTerminalHistoryPreviewController({
     state.lastUnknownKey = null;
     if (!nextText) {
       if (previousText && state.previewSeq > 0) {
-        const receipt = state.provider === 'claude' && reason !== 'semantic-request-failed'
+        const receipt = (state.provider === 'claude' || state.lastSemanticCanonicalReceipt?.receiptToken)
+          && reason !== 'semantic-request-failed'
           ? state.lastSemanticCanonicalReceipt : null;
         emitAction(state, 'clear', receipt ? 'canonical-materialized' : reason,
-          receipt ? { canonicalIdentity: receipt.identity } : {});
+          receipt ? { canonicalIdentity: receipt.identity,
+            canonicalTextHash: receipt.text ? previewTextHash(receipt.text) : null } : {});
       }
       return true;
     }
@@ -734,6 +763,13 @@ function createTerminalHistoryPreviewController({
     }
     if (!semanticItem.requestId && (event.requestId || item?.requestId)) {
       semanticItem.requestId = String(event.requestId || item.requestId);
+    }
+    if (semanticItem.materialized === true && semanticItem.presentationHeld === true) {
+      // The complete canonical record is stronger than late transport bytes.
+      // Keep the saved presentation stable; an older completion also cannot
+      // repair a newer request's missing-byte gap.
+      if (type === 'item_completed') semanticItem.completed = true;
+      return false;
     }
     if (item?.phase != null) semanticItem.phase = item.phase;
     const identityMatches = reconcileSemanticCanonicalReceipts(state);
@@ -1364,9 +1400,18 @@ function createTerminalHistoryPreviewController({
     semanticMessageId = null,
     canonicalTexts = null,
     canonicalText = '',
+    receiptToken = null,
+    presentationHeld = false,
+    codexReceiptScope = null,
   } = {}) => {
     const state = turns.get(tabId);
     if (!state || state.provider !== provider) return false;
+    const scopedCodexReceipt = provider === 'codex' && codexReceiptScope
+      && state.sourceMode === 'semantic' && exactContext(state).ok
+      && state.semanticInstanceId === codexReceiptScope.instanceId
+      && state.turnId === codexReceiptScope.turnId
+      && state.lifecycleGeneration === codexReceiptScope.lifecycleGeneration;
+    if (codexReceiptScope && !scopedCodexReceipt) return false;
     if (provider === 'claude' && state.sourceMode === 'semantic' && !exactContext(state).ok) return false;
     const semanticCodexSessionHandoff = provider === 'codex'
       && state.sourceMode === 'semantic';
@@ -1384,7 +1429,7 @@ function createTerminalHistoryPreviewController({
     const sequence = finiteNumberOrNull(sourceSequence);
     if (state.sourceSequence !== null
       && sequence !== null
-      && sequence <= state.sourceSequence) {
+      && sequence <= state.sourceSequence && !scopedCodexReceipt) {
       writeLog('warn', 'STALE', state, {
         reason: 'canonical-before-turn-sequence',
         sourceSeq: sequence,
@@ -1397,7 +1442,7 @@ function createTerminalHistoryPreviewController({
       ? state.initialSourceBoundary : state.sourceBoundary;
     if (receiptBoundary !== null
       && endOffset !== null
-      && endOffset <= receiptBoundary) {
+      && endOffset <= receiptBoundary && !scopedCodexReceipt) {
       writeLog('warn', 'STALE', state, {
         reason: 'canonical-before-transcript-boundary',
         sourceEnd: endOffset,
@@ -1418,6 +1463,8 @@ function createTerminalHistoryPreviewController({
       identity,
       receiptKey: identity + ':' + index,
       text,
+      receiptToken,
+      presentationHeld,
     }), 0);
     if (state.sourceMode === 'semantic' && semanticAcks === 0) {
       writeLog('warn', 'CANONICAL_UNMATCHED', state, {
@@ -1674,6 +1721,47 @@ function createTerminalHistoryPreviewController({
     return true;
   };
 
+  // Private Codex presentation bridge: raw cannot create a state or guess a
+  // turn. A queued receipt is delivered ONCE; reconciliation owns late ACK.
+  const admitCodexCanonicalReceipt = ({ scope, ...args }) => {
+    const state = turns.get(args.tabId);
+    if (!state) return { status: 'no-state' };
+    if (!scope || state.provider !== 'codex' || state.sourceMode !== 'semantic'
+      || state.semanticInstanceId !== scope.instanceId || state.turnId !== scope.turnId
+      || (scope.threadId && state.providerThreadId !== scope.threadId)
+      || state.lifecycleGeneration !== scope.lifecycleGeneration || !exactContext(state).ok
+      || !args.semanticItemId || !args.identity) return { status: 'wrong-scope' };
+    if (state.semanticCanonicalReceipts.some(receipt => receipt.receiptToken
+      && receipt.identity === args.identity && receipt.itemId === args.semanticItemId)) {
+      return { status: 'queued' };
+    }
+    observeCanonical({ ...args, provider: 'codex', codexReceiptScope: scope });
+    const item = state.semanticItems.get(args.semanticItemId);
+    return { status: item?.materialized === true && item.canonicalIdentity === args.identity
+      ? 'acked' : 'queued' };
+  };
+
+  const releaseCodexCanonicalPresentation = ({ tabId, scope, itemId, identity }) => {
+    const state = turns.get(tabId);
+    if (!state || !scope || state.provider !== 'codex' || !exactContext(state).ok
+      || state.semanticInstanceId !== scope.instanceId || state.turnId !== scope.turnId
+      || (scope.threadId && state.providerThreadId !== scope.threadId)
+      || state.lifecycleGeneration !== scope.lifecycleGeneration) return false;
+    // Normal publication can precede the item's network completion/late ACK.
+    for (const receipt of state.semanticCanonicalReceipts || []) {
+      if (receipt.itemId === itemId && receipt.identity === identity) receipt.presentationHeld = false;
+    }
+    const item = state.semanticItems.get(itemId);
+    if (!item?.materialized || item.canonicalIdentity !== identity) return false;
+    item.canonicalPresentationPublished = true;
+    if (!item.presentationHeld) return true;
+    item.presentationHeld = false;
+    state.lastSemanticCanonicalReceipt = item.canonicalPresentationReceipt || state.lastSemanticCanonicalReceipt;
+    setSemanticText(state, 'canonical-presentation-published');
+    if (!state.text && state.phase === 'settled') { turns.delete(tabId); disposeMarker(state); }
+    return true;
+  };
+
   const get = (tabId, provider = null) => {
     if (isEnabled() !== true) return null;
     const state = turns.get(tabId);
@@ -1740,6 +1828,7 @@ function createTerminalHistoryPreviewController({
 
   return {
     activateSemanticSource,
+    admitCodexCanonicalReceipt,
     begin,
     beginIfAbsent,
     bindPrompt,
@@ -1756,6 +1845,7 @@ function createTerminalHistoryPreviewController({
     observeCanonical,
     observeFrame,
     observeSemanticEvent,
+    releaseCodexCanonicalPresentation,
     _turns: turns,
     _semanticAuthorities: semanticAuthorities,
   };

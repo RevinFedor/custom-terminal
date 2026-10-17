@@ -39,6 +39,16 @@ backup нужен и при renderer-crash нового пакета.
 
 ## Когда срабатывает
 
+После завершения или отказа собственного прогона агент также обязан убрать
+ненужные тяжёлые build/test копии; post-install hooks не покрывают все ручные
+пробы. Это относится и к `docs/tmp`, и к SC `tmp`/`test-artifacts`: название папки
+не освобождает от проверки состава и live consumers. Оставленный тяжёлый input
+для незавершённого acceptance получает точный путь и причину в рабочем RESULT.
+Компактные доказательства и минимальный repro сохраняются, повторные полные
+рабочие копии — нет; различие read-only/writable mode само по себе не требует
+сохранения вторых byte-identical payloads. Рабочие Markdown не являются build
+output и не удаляются этой политикой.
+
 - SC/Voice `npm run build:install`: post-hook после основной команды;
 - Habit `deploy.sh`: в конце успешного deploy, не в `--check` или error-path;
 - точечные SC vocabulary/practice install scripts: после package proof;

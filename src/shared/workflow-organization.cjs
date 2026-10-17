@@ -15,14 +15,28 @@ const fail = (code, details = {}) => {
 };
 const id = value => typeof value === 'string' && value.length > 0 && value.trim() === value;
 function stableJson(value) {
-  if (ArrayBuffer.isView(value) && typeof value.toJSON === 'function') return stableJson(value.toJSON());
-  if (value === null || typeof value !== 'object') {
-    const out = JSON.stringify(value);
-    if (out === undefined || (typeof value === 'number' && !Number.isFinite(value))) fail('workflow_json_required');
-    return out;
-  }
-  if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
-  return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + stableJson(value[key])).join(',') + '}';
+  // Reuse only pure string encoding within THIS invocation. Every current key
+  // and value is still read in the original order; no object/authority snapshot
+  // is cached and no strings survive this call. Canonical bytes stay identical.
+  const strings = new Map();
+  const stringJson = text => {
+    let encoded = strings.get(text);
+    if (encoded === undefined) {
+      encoded = JSON.stringify(text);
+      strings.set(text, encoded);
+    }
+    return encoded;
+  };
+  return (function stableJson(value) {
+    if (ArrayBuffer.isView(value) && typeof value.toJSON === 'function') return stableJson(value.toJSON());
+    if (value === null || typeof value !== 'object') {
+      const out = typeof value === 'string' ? stringJson(value) : JSON.stringify(value);
+      if (out === undefined || (typeof value === 'number' && !Number.isFinite(value))) fail('workflow_json_required');
+      return out;
+    }
+    if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
+    return '{' + Object.keys(value).sort().map(key => stringJson(key) + ':' + stableJson(value[key])).join(',') + '}';
+  })(value);
 }
 function supported(value, version = ORGANIZATION_VERSION) {
   if (value?.version !== undefined && value.version !== version) fail('workflow_forward_version', { version: value.version });

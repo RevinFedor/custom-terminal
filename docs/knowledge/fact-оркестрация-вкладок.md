@@ -35,6 +35,13 @@ Terminal/History scenario layer остаётся единственной точ
 Absent/unknown, Stop и скрытие карточки не являются таким proof. Контракт и
 app capability — fact-terminal-mcp.md::Адресный Повтор Audit Квитанции.
 
+Отказ cold launch и исход Send различаются. SOURCE15.10 передаёт отдельный
+Main-issued preflight scope той же новой попытки: проверенное завершение общего
+Send до provider operation становится `not-submitted`, а не вечным `sending`.
+Старый неизвестный Enter не выводится из неудачного нового Resume, idle или
+освобождённого input slot. Очередь сохраняет frozen payload; cancelled run не
+оживает, а поздний точный audit не понижается отрицательным callback.
+
 ## Контракт run
 
 Каждый запуск связывает исходную и целевую вкладки вместе с их проектами. Новая target-вкладка всегда создаётся в фоне: запуск исполнителя не меняет активный проект или вкладку пользователя. Связанная работа в том же проекте по умолчанию создаётся visual-child исходной вкладки, но физически добавляется последней, чтобы новый исполнитель не сдвигал ручной порядок существующих вкладок и детей; независимый run использует явный `placement: root`. Межпроектный запуск без явно выбранного parent остаётся root, а повторный вызов существующего `targetTabId` никогда не переподчиняет и не перемещает уже организованную вкладку.
@@ -67,6 +74,14 @@ guard остаётся; это важно для capacity recovery до след
 `wait_for_tab_response`; это чтение нового результата, не повтор старого задания.
 
 ## Наблюдение уже выполняющейся работы
+
+`notifySource:false` отключает автоматическую доставку результата отправителю,
+но не отменяет run, его карточку и существующие зависимости. Поэтому активная
+карточка сама по себе не доказывает включённое обратное уведомление. `detach`
+позже закрывает именно отслеживаемую связь без остановки уже работающего target;
+это другое действие, не повторное выключение notifySource. Чтение
+`inspect_tabs.tracked.jobs` отдельно показывает effective notifySource,
+pendingResultDelivery и inherited activity, не объединяя их в один loader.
 
 `runKind=response-observation` сохраняется в прежнем registry, но не владеет
 исполнением target: нет prompt, delivery intent, predecessor, восстановления
@@ -158,6 +173,24 @@ browser-tab registry или terminal result. Поэтому потерянный
 backoff; каждый capability/start/status/stop HTTP имеет физический deadline
 (status: long-poll60с плюс сетевой запас). Авторитетный SC `status:error`
 становится terminal failure, а не вечным loader.
+
+Deadline и внешний abort клиента SC живут до чтения HTTP body, а не только до
+заголовков. Иначе partial JSON после200 навсегда удерживает status/start либо
+shutdown watcher без работающего ограничения. JSON и typed HTTP errors читаются
+внутри прежнего `_request` try/finally; бюджеты не увеличены. То же относится
+к локальным openJob/openBrowser, без права повторять provider Send по timeout.
+
+Первый research start после status404 повторно проверяет допуск. Опциональный
+`store.patch(...,{unlessTerminal:true})` проверяет terminal уже после initialize
+и до изменения run, затем coordinator снова читает состояние после persistStrict.
+Cancelled/completed/failed, shutdown/abort, исчезнувший run, другой kind/jobId
+не пересекают первый network start. Детерминированный jobId сам этого не гарантирует:
+он защищает повтор существующего запроса, не запрещает первый запуск после detach.
+После уже вызванного client.start отмена сохраняется, но не объявляет network
+request отсутствовавшим. Actual HTTP detach/cancel + настоящий registry/persistence
+и loopback partial-body controls: external-research-cancel-start.actual.test.js,
+sc-external-research-body.actual.test.js; provider и final notification side effects
+в этих тестах controlled.
 
 `status:done` считается успехом только вместе со structured `result`. Store не
 копирует большой ответ: он сохраняет terminal proof, `conversationUrl` /

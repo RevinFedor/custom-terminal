@@ -39,6 +39,7 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
   const term = { write: value => writes.push(value) };
   const handlers = new Map();
   const context = vm.createContext({
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
     reconcileClaudeStartupAfterSettings: () => {},
     _webBroadcast() {},
     conversationOwners: { noteInput() {} },

@@ -143,13 +143,13 @@ function markdownUrlTransform(url: string): string {
   return /^file:/i.test(url) ? url : defaultUrlTransform(url);
 }
 
-export const Markdown: React.FC<{ text: string }> = ({ text }) => {
+export const Markdown = React.memo(function Markdown({ text, preview = false }: { text: string; preview?: boolean }) {
   if (!text.trim()) return null;
   return (
-    <div className="cb-prose" onCopy={handleProseCopy}>
+    <div className={preview ? 'cb-prose cb-prose-preview' : 'cb-prose'} onCopy={handleProseCopy}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHexHighlight]}
+        rehypePlugins={preview ? undefined : [rehypeHexHighlight]}
         urlTransform={markdownUrlTransform}
         components={{
           pre({ children }) {
@@ -157,6 +157,9 @@ export const Markdown: React.FC<{ text: string }> = ({ text }) => {
             const codeProps = codeNode?.props || {};
             const langMatch = /language-(\w+)/.exec(codeProps.className || '');
             const codeString = extractRawText(codeProps.children).replace(/\n$/, '');
+            // A caption is readable Markdown, not another interactive card.
+            // Keep code literal without mounting a highlighter, Copy or scroll.
+            if (preview) return <pre className="cb-prose-preview-code"><code>{codeString}</code></pre>;
             return <MarkdownCodeBlock language={langMatch ? langMatch[1] : ''} code={codeString} />;
           },
           code({ className, children, ...props }) {
@@ -164,6 +167,9 @@ export const Markdown: React.FC<{ text: string }> = ({ text }) => {
             return <code className={className || ''} {...props}>{children}</code>;
           },
           a({ href, children, node: _node, ...props }) {
+            // The host owns a collapsed preview's whole-row navigation. A
+            // nested link must not also open another target from that click.
+            if (preview) return <span>{children}</span>;
             return (
               <a
                 {...props}
@@ -178,10 +184,12 @@ export const Markdown: React.FC<{ text: string }> = ({ text }) => {
               </a>
             );
           },
+          // Merely showing a collapsed caption must not fetch remote images.
+          ...(preview ? { img: ({ alt }: { alt?: string }) => <span>{alt || 'Image'}</span> } : {}),
         }}
       >
         {text}
       </ReactMarkdown>
     </div>
   );
-};
+});

@@ -8,6 +8,7 @@ const { HISTORY_PREPARED_CACHE_DISK_BUDGET_BYTES, DISK_CAPACITY_RESERVE_BYTES } 
 const INTERVAL_MS = 30_000;
 const FRESH_MS = 60_000;
 const SLOW_SAMPLE_MS = 250;
+const CACHE_STAT_CONCURRENCY = 32;
 const SAFE_ERROR_CODES = new Set([...Object.keys(osConstants.errno), 'cancelled', 'scan-limit',
   'cache-symlink', 'invalid-measurement', 'measure-failed', 'destroyed', 'sender-destroyed']);
 const capacityError = code => Object.assign(new Error(code), { code });
@@ -44,25 +45,31 @@ async function readCacheDiskBytes(root, { fsApi = fs, now = Date.now,
   while (pending.length) {
     if (isCancelled()) throw capacityError('cancelled');
     checkLimit(count + 1 > maxEntries);
-    count++;
-    const item = pending.pop();
-    let stat;
-    try { stat = await fsApi.lstat(item); }
-    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    if (stat.isSymbolicLink()) throw capacityError('cache-symlink');
-    if (stat.isDirectory()) {
-      let directory;
-      try { directory = await fsApi.opendir(item); }
-      catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-      for await (const entry of directory) {
-        checkLimit(pending.length + count >= maxEntries);
-        if (isCancelled()) throw capacityError('cancelled');
-        pending.push(path.join(item, entry.name));
+    const batch = pending.splice(-CACHE_STAT_CONCURRENCY);
+    count += batch.length;
+    const stats = await Promise.all(batch.map(async item => {
+      try { return { item, stat: await fsApi.lstat(item) }; }
+      catch (error) { if (error.code === 'ENOENT') return { item, stat: null }; throw error; }
+    }));
+    for (const { item, stat } of stats) {
+      if (isCancelled()) throw capacityError('cancelled');
+      if (!stat) continue;
+      if (stat.isSymbolicLink()) throw capacityError('cache-symlink');
+      if (stat.isDirectory()) {
+        let directory;
+        try { directory = await fsApi.opendir(item); }
+        catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+        for await (const entry of directory) {
+          checkLimit(pending.length + count >= maxEntries);
+          if (isCancelled()) throw capacityError('cancelled');
+          pending.push(path.join(item, entry.name));
+        }
+      } else if (stat.isFile()) {
+        bytes += stat.size;
+        if (!Number.isSafeInteger(bytes)) throw capacityError('invalid-measurement');
       }
-    } else if (stat.isFile()) {
-      bytes += stat.size;
-      if (!Number.isSafeInteger(bytes)) throw capacityError('invalid-measurement');
     }
+    checkLimit(false);
   }
   return bytes;
 }
@@ -95,20 +102,28 @@ function createDiskCapacityService({ cacheDirectory, budgetBytes = HISTORY_PREPA
   const subscribers = new Map();
   const empty = status => ({ scope: 'history-prepared-cache', epoch, revision, status,
     measuredAt: null, expiresAt: null, freeBytes: null, cacheBytes: null,
-    remainingGrowthBytes: null, projectedFreeBytes: null, warning: null, budgetBytes, reserveBytes });
+    remainingGrowthBytes: null, projectedFreeBytes: null, warning: null, budgetBytes, reserveBytes,
+    cacheFresh: false, cacheMeasuredAt: null, freeMeasuredAt: null });
   let snapshot = Object.freeze(empty('unknown'));
+  let lastCacheMeasurement = null;
   let loggedState = 'unknown', loggedErrorCode = null;
   const logMeasurement = (value, durMs) => {
     const state = value.status === 'ready' ? value.warning ? 'ready-warning' : 'ready-healthy' : value.status;
     const errorCode = value.errorCode || null;
+    const fallback = value.fallback;
     const stateKey = state + ':' + (value.ram?.status || 'unknown');
     const transition = stateKey !== loggedState || errorCode !== loggedErrorCode;
     loggedState = stateKey; loggedErrorCode = errorCode;
     if (!transition && durMs < slowSampleMs) return;
     const record = { state, transition, slow: durMs >= slowSampleMs, durMs,
-      source: 'statfs+cache-file-metadata', budgetBytes, reserveBytes, freeBytes: value.freeBytes,
-      cacheBytes: value.cacheBytes, remainingGrowthBytes: value.remainingGrowthBytes,
-      projectedFreeBytes: value.projectedFreeBytes, errorCode,
+      source: 'statfs+cache-file-metadata', budgetBytes, reserveBytes,
+      freeBytes: value.freeBytes, cacheBytes: value.cacheBytes,
+      remainingGrowthBytes: value.remainingGrowthBytes, projectedFreeBytes: value.projectedFreeBytes,
+      fallbackFreeBytes: fallback?.freeBytes ?? null, fallbackCacheBytes: fallback?.cacheBytes ?? null,
+      fallbackRemainingGrowthBytes: fallback?.remainingGrowthBytes ?? null,
+      fallbackProjectedFreeBytes: fallback?.projectedFreeBytes ?? null,
+      cacheFresh: value.cacheFresh, fallbackCacheFresh: fallback?.cacheFresh ?? false,
+      cacheErrorCode: value.cacheErrorCode || null, freeErrorCode: value.freeErrorCode || null, errorCode,
       ramStatus: value.ram?.status || 'unknown', ramApproxBytes: value.ram?.approxBytes ?? null,
       ramBudgetBytes: value.ram?.budgetBytes ?? null,
       ramReason: value.ram?.reason || 'unavailable', ramWorkerGeneration: value.ram?.workerGeneration ?? null,
@@ -128,23 +143,58 @@ function createDiskCapacityService({ cacheDirectory, budgetBytes = HISTORY_PREPA
     stopTimer();
     inFlight = (async () => {
       const startedAt = now();
+      const [freeResult, cacheResult] = await Promise.allSettled([
+        Promise.resolve().then(async () => ({ bytes: await readFree(cacheDirectory, { fsApi }), measuredAt: now() })),
+        Promise.resolve().then(async () => ({ bytes: await readUsage(cacheDirectory, { fsApi, now, isCancelled: () => destroyed }), measuredAt: now() })),
+      ]);
+      if (destroyed) return { ...empty('unknown'), errorCode: 'destroyed' };
+
+      let freeBytes = null, freeMeasuredAt = null, freeError = null;
+      if (freeResult.status === 'fulfilled' && Number.isSafeInteger(freeResult.value.bytes) && freeResult.value.bytes >= 0) {
+        freeBytes = freeResult.value.bytes;
+        freeMeasuredAt = freeResult.value.measuredAt;
+      } else {
+        freeError = freeResult.status === 'rejected' ? freeResult.reason : capacityError('invalid-measurement');
+      }
+
+      let cacheError = null;
+      if (cacheResult.status === 'fulfilled' && Number.isSafeInteger(cacheResult.value.bytes) && cacheResult.value.bytes >= 0) {
+        lastCacheMeasurement = cacheResult.value;
+      } else {
+        cacheError = cacheResult.status === 'rejected' ? cacheResult.reason : capacityError('invalid-measurement');
+      }
+      const cacheBytes = lastCacheMeasurement?.bytes ?? null;
+      const cacheMeasuredAt = lastCacheMeasurement?.measuredAt ?? null;
       let result;
-      try {
-        const cacheBytes = await readUsage(cacheDirectory, { fsApi, now, isCancelled: () => destroyed });
-        if (destroyed) return { ...empty('unknown'), errorCode: 'destroyed' };
-        const freeBytes = await readFree(cacheDirectory, { fsApi });
-        const measuredAt = now();
+      if (!freeError && !cacheError) {
         result = { ...empty('ready'), ...capacityProjection(freeBytes, cacheBytes, budgetBytes, reserveBytes),
-          measuredAt, expiresAt: measuredAt + freshMs };
-      } catch (error) {
-        result = { ...empty('error'), errorCode: diskCapacityErrorCode(error) };
-        if (result.errorCode === 'scan-limit' && ['duration', 'entries'].includes(error?.scanDiagnostic?.limit)) {
-          const diagnostic = error.scanDiagnostic;
-          if (['scannedEntries', 'pendingEntries', 'elapsedMs'].every(key => Number.isSafeInteger(diagnostic[key]) && diagnostic[key] >= 0)) {
-            result.scanDiagnostic = { limit: diagnostic.limit, scannedEntries: diagnostic.scannedEntries,
-              pendingEntries: diagnostic.pendingEntries, elapsedMs: diagnostic.elapsedMs };
-          }
+          cacheFresh: true, cacheMeasuredAt, freeMeasuredAt, measuredAt: freeMeasuredAt,
+          expiresAt: freeMeasuredAt + freshMs };
+      } else {
+        let fallback = null;
+        if (freeBytes != null) {
+          // While the cache inventory is unavailable, project the full budget
+          // as possible growth. A stale last-known total is display-only.
+          const remainingGrowthBytes = cacheError ? budgetBytes
+            : Math.max(0, budgetBytes - cacheBytes);
+          const projectedFreeBytes = freeBytes - remainingGrowthBytes;
+          fallback = { freeBytes, cacheBytes, budgetBytes, reserveBytes, remainingGrowthBytes,
+            projectedFreeBytes, warning: projectedFreeBytes < reserveBytes,
+            cacheFresh: !cacheError, cacheMeasuredAt, freeMeasuredAt,
+            measuredAt: freeMeasuredAt, expiresAt: freeMeasuredAt + freshMs };
+        } else if (cacheBytes != null) {
+          fallback = { cacheBytes, cacheFresh: !cacheError, cacheMeasuredAt };
         }
+        const cacheErrorCode = cacheError ? diskCapacityErrorCode(cacheError) : null;
+        const freeErrorCode = freeError ? diskCapacityErrorCode(freeError) : null;
+        const scanDiagnostic = cacheError?.scanDiagnostic;
+        result = { ...empty('error'), cacheErrorCode, freeErrorCode,
+          errorCode: freeErrorCode || cacheErrorCode || 'measure-failed',
+          ...(fallback ? { fallback } : {}),
+          ...(scanDiagnostic && ['duration', 'entries'].includes(scanDiagnostic.limit)
+            && ['scannedEntries', 'pendingEntries', 'elapsedMs'].every(key => Number.isSafeInteger(scanDiagnostic[key]) && scanDiagnostic[key] >= 0)
+            ? { scanDiagnostic: { limit: scanDiagnostic.limit, scannedEntries: scanDiagnostic.scannedEntries,
+              pendingEntries: scanDiagnostic.pendingEntries, elapsedMs: scanDiagnostic.elapsedMs } } : {}) };
       }
       let ram = { status: 'unknown', approxBytes: null, budgetBytes: null, approximate: true, reason: 'unavailable' };
       try {

@@ -41,6 +41,7 @@ function mainFixture({ toolType = 'codex', ready = true, status = 'active' } = {
     aiProcessLookupScopeCurrent: (_tab, scope) => scope.generation === generation && scope.terminal === terminals.get(tabId),
     getTerminalLifecycleGeneration: () => generation,
     getTerminalInputRevision: () => 1,
+    getTerminalStopRevision: () => 0,
     resolveAiToolTypeForTab: () => toolType,
     conversationOwners: { current: () => ({ ownerToken: 'owner', ownerOrder: 1 }) },
     bridgeKnownSessions: new Map(toolType === 'claude' ? [[tabId, 'claude-live-S']] : []),
@@ -105,6 +106,7 @@ function sendFixture(t, options = {}) {
   const writes = [];
   const context = vm.createContext({
     require, path, srcMainDir: __dirname,
+    crypto: require('node:crypto'),
     ...registry, AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
     agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(), agentSendReceiptStore: store,
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,

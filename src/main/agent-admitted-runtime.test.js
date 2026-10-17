@@ -93,6 +93,7 @@ for (const action of ['start', 'resume']) for (const phase of ['wait', 'fresh', 
     let reads = 0;
     const ctx = vm.createContext({ ...readiness, validateFreshAgentRuntimeStatus, console: { log() {}, warn() {} },
       ipcMain: new EventEmitter(), shortId: x => x, decId: decodeURIComponent, readBody: async () => ({}),
+      readAgentLaunchFence: null,
       resolveAgentSessionInfo: async () => ({ toolType: 'claude', status: 'inactive', canResume: false }),
       readAgentReadyStatus: async () => { reads++; return owned(phase === 'wait' || phase === 'fresh' && reads > 1 ? 'L2' : 'L1'); },
       bridgeRequest: async () => ({ ...owned('L1'), success: true, launchAccepted: true }),

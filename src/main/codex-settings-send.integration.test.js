@@ -66,6 +66,8 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     console: { ...quiet, log: line => logs.push(String(line)) }, terminals, terminalCommandState: commands,
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance']]),
     nodePerformance: { now: Date.now }, CODEX_PASTE_AUDIT_TIMEOUT_MS: 10,
+    CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000,
+    agentSendCancellations: { isCancelled: () => false },
     isPromptQueueAutomationSource: () => false,
     isCodexTuiEffectivelyReady: () => true,
     isCodexOperationalInputReady: () => true,
@@ -188,7 +190,9 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   };
   const helperPath = path.join(__dirname, 'codex-settings-send.js');
   if (fs.existsSync(helperPath)) Object.assign(context, require(helperPath));
+  vm.runInContext(require('./fixtures/codex-draft-request-observation.cjs').startupFrameDeclarations(), context);
   for (const name of ['readCodexSettingsSendScope', 'readCodexSettingsForSend',
+    'captureAgentInputIdentity', 'agentSendExecutionFailure',
     'codexPolicyFrame',
     'resolveConfiguredCodexSettingsModelIdentity',
     'agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure',
@@ -240,6 +244,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
       throw new Error('unexpected IPC ' + channel);
     } },
   });
+  vm.runInContext(compile(functionSource(rendererAst, 'probeCodexDraft')), renderer);
   vm.runInContext(compile(functionSource(rendererAst, 'sendCodexPrompt')), renderer);
   return { context, events, logs, bridge, terminals, commands,
     send: (options = {}) => renderer.sendCodexPrompt('tab', localCommand || 'one prompt', {
@@ -268,6 +273,129 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
       if ('runSeq' in change) commands.get('tab').runSeq = change.runSeq;
     },
   };
+}
+
+async function provisionalResumeSettingsHarness() {
+  const h = await harness();
+  h.set({ ownerId: 'launch:launch', model: 'gpt-6.1-sol', effort: 'max' });
+  const term = h.terminals.get('tab');
+  const launch = { command: 'codex-c', sessionId: 'resume-source', launchId: 'launch',
+    terminalToken: term, runSeq: 2, lifecycleGeneration: 'generation' };
+  h.context.codexLastRunCommandPayload.set('tab', launch);
+  h.context.codexSessionDiscoveryIntents.set('tab', { launchId: 'launch', sourceSessionId: 'resume-source' });
+  h.context.codexWatchers.set('tab', {});
+  h.context.getCodexResumeSourceLeaseForTab = () => ({ tabId: 'tab', sourceSessionId: 'resume-source', launchId: 'launch' });
+  h.context.ensureCodexSubmissionWatcher = async () => ({ available: true,
+    kind: 'provisional-source', sessionId: 'resume-source', launchId: 'launch' });
+  const expectedTarget = { toolType: 'codex', sessionId: 'resume-source' };
+  h.context.agentSendReceiptStore = { get: () => ({ attemptId: 'attempt', receipt: { expectedTarget } }) };
+  const comparisons = [];
+  const targetGuard = h.context.agentSendTargetPreconditionFailure;
+  h.context.agentSendTargetPreconditionFailure = (expected, actual) => {
+    comparisons.push({ expected: { ...expected }, actual: { ...actual } });
+    return targetGuard(expected, actual);
+  };
+  return { ...h, launch, term, comparisons, sendSettings: (options = {}) => h.direct({
+    model: 'gpt-6.1-sol', effort: 'xhigh', expectedTarget,
+    sendOperationKey: 'orchestration-target:resume', sendAttemptId: 'attempt', ...options,
+  }) };
+}
+
+test('cold Resume delegate settings keep launch owner separate from the exact source recipient', async () => {
+  const h = await provisionalResumeSettingsHarness();
+  const result = await h.sendSettings();
+  assert.equal(result.success, true, JSON.stringify({ result, comparisons: h.comparisons }));
+  assert.deepEqual(h.events.filter(e => ['settings', 'prompt'].includes(e.kind)).map(e => [e.kind, e.model, e.effort]),
+    [['settings', 'gpt-6.1-sol', 'xhigh'], ['prompt', 'gpt-6.1-sol', 'xhigh']]);
+  assert.equal(h.context.getCodexWriterProofSnapshot('tab'), null, 'settings must not publish a saved SID as writer');
+  assert.equal(h.comparisons.some(c => c.actual.sessionId === 'launch:launch'), false);
+  assert.ok(h.comparisons.some(c => c.actual.sessionId === 'resume-source'));
+});
+
+test('the frozen receipt target still authorizes only its own provisional Resume when caller omits expectedTarget', async () => {
+  const h = await provisionalResumeSettingsHarness();
+  const result = await h.sendSettings({ expectedTarget: undefined });
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.equal(h.events.filter(e => e.kind === 'prompt').length, 1);
+});
+
+for (const fault of ['unknown', 'absent', 'foreign-source', 'missing-lease', 'foreign-lease',
+  'changed-discovery', 'new-launch', 'terminal', 'run', 'lifecycle', 'dead', 'stop', 'input', 'inflight']) {
+  test('cold Resume settings recipient guard retains no-input refusal: ' + fault, async () => {
+    const h = await provisionalResumeSettingsHarness();
+    const authorize = h.context.ensureCodexSubmissionWatcher;
+    h.context.ensureCodexSubmissionWatcher = async (...args) => {
+      const result = await authorize(...args);
+      if (fault === 'unknown' || fault === 'absent') return { available: false, kind: 'none', writerStatus: fault };
+      if (fault === 'foreign-source') return { ...result, sessionId: 'foreign-source' };
+      if (fault === 'missing-lease') h.context.getCodexResumeSourceLeaseForTab = () => null;
+      if (fault === 'foreign-lease') h.context.getCodexResumeSourceLeaseForTab = () => ({ tabId: 'other-tab', sourceSessionId: 'resume-source', launchId: 'launch' });
+      if (fault === 'changed-discovery') h.context.codexWatchers.delete('tab');
+      if (fault === 'new-launch') h.context.codexSessionDiscoveryIntents.set('tab', { launchId: 'replacement' });
+      if (fault === 'terminal') h.terminals.set('tab', { write() {} });
+      if (fault === 'run') h.set({ runSeq: 3 });
+      if (fault === 'lifecycle') h.set({ lifecycle: 'replacement' });
+      if (fault === 'dead') h.commands.get('tab').isRunning = false;
+      if (fault === 'stop') h.context.aiStoppingTabs.set('tab', { toolType: 'codex' });
+      if (fault === 'input') h.set({ inputRevision: 2 });
+      if (fault === 'inflight') h.context.hasCodexPromptOrTurnInFlight = () => true;
+      return result;
+    };
+    const result = await h.sendSettings();
+    assert.equal(result.submitted, false, JSON.stringify(result));
+    assert.equal(result.pasteWritten, false);
+    assert.equal(result.enterWritten, false);
+    assert.equal(h.events.some(e => ['settings', 'prompt'].includes(e.kind)), false);
+  });
+}
+
+test('provisional Resume cannot retarget a frozen send to another source conversation', async () => {
+  const h = await provisionalResumeSettingsHarness();
+  h.context.agentSendReceiptStore.get = () => ({ attemptId: 'attempt',
+    receipt: { expectedTarget: { toolType: 'codex', sessionId: 'foreign-source' } } });
+  const result = await h.sendSettings();
+  assert.equal(result.submitted, false);
+  assert.equal(h.events.some(e => ['settings', 'prompt'].includes(e.kind)), false);
+});
+
+test('provisional recipient is revalidated after the awaited draft proof', async () => {
+  const h = await provisionalResumeSettingsHarness();
+  h.context.requestTerminalCodexDraftState = async () => {
+    h.context.codexWatchers.set('tab', {});
+    return { success: true, hasDraft: false };
+  };
+  const result = await h.sendSettings();
+  assert.equal(result.submitted, false);
+  assert.equal(h.events.some(e => ['settings', 'prompt'].includes(e.kind)), false);
+});
+
+test('lease lost after picker application preserves the applied pair but never sends the prompt', async () => {
+  const h = await provisionalResumeSettingsHarness();
+  h.set({ afterSelection: () => { h.context.getCodexResumeSourceLeaseForTab = () => null; } });
+  const result = await h.sendSettings();
+  assert.equal(result.submitted, false);
+  assert.equal(h.events.filter(e => e.kind === 'settings').length, 1);
+  assert.equal(h.events.filter(e => e.kind === 'prompt').length, 0);
+});
+
+for (const sameLaunch of [true, false]) {
+  test('settings joins only the same Resume launch into its first proven child: ' + sameLaunch, async () => {
+    const h = await provisionalResumeSettingsHarness();
+    const readProof = h.context.getCodexWriterProofSnapshot;
+    h.context.getCodexWriterProofSnapshot = tabId => {
+      const proof = readProof(tabId);
+      return proof ? { ...proof, sourceSessionId: 'resume-source', launchId: sameLaunch ? 'launch' : 'other-launch' } : null;
+    };
+    h.context.ensureCodexSubmissionWatcher = async () => {
+      h.set({ ownerId: 'child-writer' });
+      return { available: true, kind: 'turn', sessionId: 'child-writer' };
+    };
+    const result = await h.sendSettings();
+    assert.equal(result.success, sameLaunch, JSON.stringify(result));
+    assert.equal(h.events.filter(e => e.kind === 'prompt').length, sameLaunch ? 1 : 0);
+    if (sameLaunch) assert.ok(h.comparisons.some(c => c.actual.sessionId === 'child-writer'
+      && c.actual.acceptedResumeSourceSessionId === 'resume-source'));
+  });
 }
 
 test('actual picker measures preparation, writer check and native selection separately without changing the result', async () => {

@@ -11,7 +11,7 @@ export function resolveTabPendingOperationLabel({
   nameSetManually?: boolean;
   name?: string;
 }): string | null {
-  if (aiClosing) return 'остановка сессии...';
+  if (aiClosing) return 'Закрытие…';
   if (pendingOperation === 'Создание форка…' && nameSetManually && name) return name;
   return pendingOperation || null;
 }

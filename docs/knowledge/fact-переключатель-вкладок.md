@@ -88,6 +88,14 @@ File verdict берётся из общего missing-file tracker; batch пер
 до и после file probe, синхронная revision/onChanged и свежие file verdict остаются;
 нельзя ускорять эту ветку удержанием rows по ссылке mutable openProjects.
 
+Уточнение17.10: metadata bridge отбирает нужные поля ДО копирования Tab, чтобы
+горячий switch не таскал private History/composer payload. Desktop selector
+сохраняет прежнюю полную строку. Повторный icon lookup одного проекта разделён
+только внутри capture; следующий capture заново читает источник. Объединение
+синхронных publications отвергнуто: промежуточные navigation keys/revisions и
+reentrant callbacks наблюдаемы. Точное равенство конечного wire недостаточно,
+если изменился порядок уведомлений или file probe.
+
 ### Отменённая навигация не уничтожает источник списка
 
 Шрам09.10: после клика по внешней ссылке Mac продолжал работать, но native меню

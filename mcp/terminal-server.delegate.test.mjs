@@ -521,6 +521,7 @@ async function createHarness(t, respond, { historyApi = false } = {}) {
     env: {
       ...process.env,
       NOTED_DISCOVERY_DIR: discoveryDir,
+      NOTED_MCP_INSTANCE_ROUTE: '',
       NOTED_MAIN_PID: String(ownerPid),
       NOTED_PARENT_PROJECT_ID: projectId,
       NOTED_PARENT_TAB_ID: sourceTabId,

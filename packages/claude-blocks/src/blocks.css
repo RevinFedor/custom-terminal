@@ -83,6 +83,43 @@
 .cb-prose :not(pre) > code { color: var(--cb-inline-code); }
 .cb-prose code::before, .cb-prose code::after { content: none; }
 
+/* Compact reading surfaces share the Markdown parser but inherit the host's
+   muted typography. No card chrome, extra scroll owner or first/last blank row. */
+.cb-prose.cb-prose-preview {
+  min-width: 0;
+  color: inherit;
+  font: inherit;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.cb-prose-preview h1, .cb-prose-preview h2, .cb-prose-preview h3,
+.cb-prose-preview h4, .cb-prose-preview h5, .cb-prose-preview h6 {
+  font-size: 1em;
+  line-height: inherit;
+  margin: .5em 0;
+}
+.cb-prose-preview p, .cb-prose-preview ul, .cb-prose-preview ol,
+.cb-prose-preview blockquote, .cb-prose-preview table, .cb-prose-preview hr {
+  margin: .5em 0;
+  line-height: inherit;
+}
+.cb-prose-preview p, .cb-prose-preview li { white-space: pre-wrap; }
+.cb-prose-preview li { line-height: inherit; }
+.cb-prose-preview th, .cb-prose-preview td { padding: 2px 6px; }
+.cb-prose-preview pre.cb-prose-preview-code {
+  max-width: 100%;
+  margin: .5em 0;
+  color: inherit;
+  font-family: var(--cb-font-mono);
+  line-height: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.cb-prose-preview-code > code { font: inherit; }
+.cb-prose.cb-prose-preview > :first-child { margin-top: 0; }
+.cb-prose.cb-prose-preview > :last-child { margin-bottom: 0; }
+
 /* ============================================================
    MARKDOWN CODE BLOCK (```lang ... ```)
    ============================================================ */

@@ -154,6 +154,283 @@ export function formatDiagnosticKey(snapshot) {
     + (fields.shortcutClass ? ' shortcutClass=' + fields.shortcutClass : '') : '';
 }
 
+// A gesture belongs to this UIAction recorder, not to a mounted sidebar host.
+// Only scalar latest input is touched on pointermove. Samples share its rAF.
+const DRAG_FRAME_CAP = 120, DRAG_PHASE_CAP = 32, DRAG_MEMBER_CAP = 128;
+const dragStrings = ['gestureId','sessionId','sourceId','owner','ownerKey','workflowId','paneKey',
+  'windowId','zone','reason','presentation','mutationId','operationId','runId','axis'];
+const dragNumbers = ['pointerId','eventAbs','x','y','left','top','width','height','grabX','grabY',
+  'ownerEpoch','revision','at','boundary','depth','scrollTop','scrollLeft','processed','received',
+  'sourceLayoutTop','intendedTop','forestOffset','previousBoundaryTop','nextBoundaryTop','queuedOverwrites','generation','publicationRevision','membershipRevision','sourceCount','familyCount','paneCount'];
+function dragFields(value) {
+  const out = Object.create(null);
+  out.identifiersTruncated=0;
+  for(const key of dragStrings)if(typeof own(value,key)==='string' && own(value,key).length>120)out.identifiersTruncated++;
+  for (const key of dragStrings) if (typeof own(value,key)==='string') out[key]=short(own(value,key),120);
+  for (const key of dragNumbers) if (typeof own(value,key)==='number') out[key]=Number.isFinite(own(value,key))?own(value,key):null;
+  for (const key of ['meta','accepted','confirmed','current','matches','captured']) if(typeof own(value,key)==='boolean') out[key]=own(value,key);
+  return out;
+}
+
+function dragFramePacket(value) {
+  if(!value || typeof value!=='object')return value;
+  const out=Object.create(null);
+  if(Number.isFinite(value.abs))out.abs=value.abs;
+  if(value.axis==='x' || value.axis==='y')out.axis=value.axis;
+  for(const key of dragNumbers)if(Object.hasOwn(value,key))out[key]=value[key];
+  for(const key of ['meta','accepted','confirmed','current','matches','captured'])
+    if(typeof value[key]==='boolean')out[key]=value[key];
+  return out;
+}
+
+const dragAuthorDemand=(author,input)=>!!author && !!input
+  && (author.axis!=='y' && input.x!==author.x || author.axis!=='x' && input.y!==author.y);
+
+function createDragDiagnostics({now,emit,onPendingFrame,matching,actions,appendPhase}) {
+  let config={mode:'summary',hz:null,slowMs:50,runId:'',operationId:''}, active=null;
+  let emitFailed=0, partialGestures=0;
+  const mark=(d,phase)=>{
+    if(d.config.mode!=='frames')return;
+    const name='noted-drag:'+short(d.gestureId || d.action?.id || 'unmatched',120)+':'+phase;
+    try { performance.mark(name);performance.clearMarks(name); }
+    catch {d.markerUnavailable=increment(d.markerUnavailable || 0);}
+  };
+  const safeEmit=(tag,value,serialized=null)=>{try {emit(tag+' '+(serialized ?? JSON.stringify(value)));}catch{emitFailed=increment(emitFailed);}};
+  const phase=(d,name,fields)=>{
+    const item={name,abs:round(now()),...fields};
+    if(d.phases.length>=DRAG_PHASE_CAP){d.phases.splice(8,1);d.phaseOmitted=increment(d.phaseOmitted);}
+    d.phases.push(item);
+  };
+  const summary=(d,reason,partial)=>({schema:1,actionId:d.action?.id || null,gestureId:d.gestureId,
+    runId:d.config.runId,operationId:d.config.operationId,mode:d.config.mode,hz:d.config.hz,slowMs:d.config.slowMs,
+    down:d.down,thresholdAbs:d.thresholdAbs,releaseAbs:d.releaseAbs,endAbs:round(now()),reason,partial,
+    inputPackets:d.packets,inputMovePackets:d.moves,coalesced:d.config.mode==='frames'?d.coalesced:null,coalescedUnavailable:d.config.mode==='frames'?d.coalescedUnavailable:null,
+    invalidTimestamp:d.invalidTimestamp,frameSampleOverwrites:d.config.mode==='frames'?d.sampleOverwrites:null,
+    frames:d.frames,movingFrames:d.movingFrames,maxCallbackGapMs:d.frames?round(d.maxGap):null,maxDeliveryDelayMs:d.validPackets?round(d.maxDelivery):null,
+    maxMovingInputAgeMs:d.movingFrames?round(d.maxMovingAge):null,maxAuthoredLagMs:d.author&&d.frames?round(d.maxAuthorLag):null,
+    authoredAxis:d.author?.axis || null,
+    maxAuthoredErrorX:d.author&&d.frames&&d.author.axis!=='y'?round(d.maxAuthorErrorX):null,
+    maxAuthoredErrorY:d.author&&d.frames&&d.author.axis!=='x'?round(d.maxAuthorErrorY):null,
+    processedStampUnavailable:d.processedStampUnavailable,maxProcessInputAgeMs:d.processedStamped?round(d.maxProcessAge):null,
+    firstAuthoredAbs:d.firstAuthoredAbs,
+    authoredWrites:d.authoredWrites,authoredChanges:d.authoredChanges,
+    firstLayoutAbs:d.firstLayoutAbs,latestInput:d.input,latestCapture:d.capture,identifiersTruncated:d.identifiersTruncated,latestAuthor:d.author,latestLayout:d.layout,
+    latestProcessed:d.processed,latestPublished:d.published,latestGeometry:d.geometry,latestTarget:d.target,phaseOmitted:d.phaseOmitted,memberOmitted:d.memberOmitted,memberOmittedKind:'upper-bound-after-cap',
+    frameEvicted:Math.max(0,d.frames-DRAG_FRAME_CAP),counterSaturated:d.packets===DIAGNOSTIC_COUNTER_LIMIT,
+    coverage:'browser-event-stamp/JS/authored/React-layout; no OS event ID, compositor or pixel receipt',
+    limits:{frames:DRAG_FRAME_CAP,maxStoredFrameObjects:DRAG_FRAME_CAP+8+24,phases:DRAG_PHASE_CAP,members:DRAG_MEMBER_CAP,first:8,slow:24,tail:8},emitFailed});
+  const finish=(reason,partial=false)=>{
+    const d=active;if(!d)return null;active=null;
+    // Ordinary eligible clicks already belong to UIAction. A pending pickup
+    // that never crossed the threshold must add neither drag logs nor frames.
+    if(d.thresholdAbs===null && !partial)return null;
+    partial ||= !d.action || d.memberOmitted>0 || d.phaseOmitted>0 || (d.planOmitted || 0)>0 || d.identifiersTruncated>0;
+    if(partial)partialGestures=increment(partialGestures);
+    mark(d,'end');
+    const report=summary(d,reason,partial);
+    report.markerUnavailable=d.markerUnavailable || 0;
+    let detailText=null;
+    report.detailWindow=d.config.mode!=='frames'?'disabled':d.slow.length || partial?'bounded-window':'not-triggered';
+    if(d.config.mode==='frames' && (d.slow.length || partial)){
+      const detail={schema:1,gestureId:d.gestureId,actionId:d.action?.id || null,runId:d.config.runId,
+        partial,plan:d.plan,planOmitted:d.planOmitted || 0,members:d.members,memberOmitted:d.memberOmitted,phases:d.phases,phaseOmitted:d.phaseOmitted,
+        first:d.first,slow:d.slow,tail:d.ring.slice(-8),frameEvicted:report.frameEvicted,
+        slowPostMissing:Math.max(0,d.slowPost),limits:{...report.limits,serializedChars:65536},emitFailed};
+      // Packet owner strings repeat on every frame. The bounded phases and
+      // summary retain the full identities; frame packets join by owner epoch
+      // and revision. Compact only at release, outside the move/frame path.
+      detail.framePacketIdentity='ownerEpoch/revision; full owners in phases/summary';
+      detailText=JSON.stringify(detail,(key,value)=>
+        ['processed','published','geometry','author','layout','target'].includes(key)
+          ? dragFramePacket(value) : value);
+      if(detailText.length>65536){if(!report.partial)partialGestures=increment(partialGestures);report.partial=true;report.detailOmitted='serialized-cap';
+        detailText=JSON.stringify({schema:1,gestureId:d.gestureId,partial:true,detailOmitted:'serialized-cap',
+          chars:detailText.length,limitChars:65536});}
+    }
+    if(d.action){
+      // The existing 96-action ring retains a cheap join record, never frame windows.
+      d.action.drag={gestureId:d.gestureId,reason,endAbs:report.endAbs,partial:report.partial};
+      appendPhase(d.action,'drag-end',{reason,ms:report.endAbs-d.down.abs,frames:d.frames});
+    }
+    safeEmit('[Perf:DragSummary]',report);
+    if(detailText!==null)safeEmit('[Perf:DragWindow]',null,detailText);
+    return report;
+  };
+  const event=(name,raw={})=>{
+    if(config.mode==='off')return;
+    const f=dragFields(raw);
+    if(name==='pending'){
+      if(active)finish('diagnostic-replaced',true);
+      const action=matching('pointerdown',f.eventAbs);
+      active={config:{...config},gestureId:f.gestureId || null,action,pointerId:f.pointerId,
+        identifiersTruncated:f.identifiersTruncated,down:{abs:f.eventAbs ?? round(now()),receivedAbs:round(now()),...f},input:null,processed:null,
+        author:null,layout:null,target:null,thresholdAbs:null,releaseAbs:null,firstAuthoredAbs:null,firstLayoutAbs:null,
+        packets:0,moves:0,coalesced:0,coalescedUnavailable:0,invalidTimestamp:0,sampleOverwrites:0,lastSampleSeq:0,
+        frames:0,movingFrames:0,validPackets:0,maxGap:0,maxDelivery:0,maxMovingAge:0,
+        maxAuthorLag:0,maxAuthorErrorX:0,maxAuthorErrorY:0,processedStampUnavailable:0,processedStamped:0,maxProcessAge:0,authoredWrites:0,authoredChanges:0,lastFrameAbs:null,
+        previousInput:null,phases:[],phaseOmitted:0,members:[],memberOmitted:0,ring:[],first:[],slow:[],slowScore:0,slowPost:0};
+      phase(active,name,f);return;
+    }
+    const d=active;
+    if(!d || (f.gestureId && d.gestureId && f.gestureId!==d.gestureId)){
+      // Durable ACK may arrive after physical release or a following click.
+      if(f.gestureId){
+        const action=actions.find(a=>a.drag?.gestureId===f.gestureId);
+        const commit=name.startsWith('commit-');
+        const receipt=['layout-receipt','commit','cancel','release-preview'].includes(name);
+        if(commit || (receipt && action)){
+          if(action){
+            action.drag.latePhases=(action.drag.latePhases || 0)+1;
+            if(action.drag.latePhases>16){
+              action.drag.lateOmitted=increment(action.drag.lateOmitted || 0);
+              if(action.drag.lateOmitted===1)safeEmit('[Perf:DragCommit]',{gestureId:f.gestureId,actionId:action.id,
+                partial:true,reason:'late-phase-cap',limit:16});
+              return;
+            }
+            appendPhase(action,name,{revision:f.publicationRevision ?? f.revision,reason:f.reason});
+          }
+          safeEmit('[Perf:DragCommit]',{abs:round(now()),actionId:action?.id || null,partial:!action,
+            postPhysical:true,name,...f});
+        }
+      }
+      return;
+    }
+    d.identifiersTruncated=Math.min(DIAGNOSTIC_COUNTER_LIMIT,d.identifiersTruncated+f.identifiersTruncated);
+    if(f.gestureId)d.gestureId=f.gestureId;
+    if(name==='start' && f.gestureId && !d.boundMarker){mark(d,'bound');d.boundMarker=true;}
+    if(name==='threshold'){
+      d.thresholdAbs ??= now();mark(d,'threshold');
+      if(d.config.mode==='frames')onPendingFrame();
+    }
+    const item={abs:now(),...f};
+    if(name==='authored'){
+      d.authoredWrites=increment(d.authoredWrites);
+      if(!d.author || d.author.left!==f.left || d.author.top!==f.top){
+        d.authoredChanges=increment(d.authoredChanges);
+        if(d.firstAuthoredAbs===null){d.firstAuthoredAbs=item.abs;mark(d,'first-authored');}
+      }
+      d.author=item;
+      if(dragAuthorDemand(item,d.input))d.authorDemandSince ??= d.input.receivedAbs;
+      else d.authorDemandSince=null;
+      return;
+    }
+    if(name==='processed'){d.processed=item;
+      if(Number.isFinite(f.eventAbs)){d.processedStamped=increment(d.processedStamped);d.maxProcessAge=Math.max(d.maxProcessAge,item.abs-f.eventAbs);}
+      else d.processedStampUnavailable=increment(d.processedStampUnavailable);return;}
+    if(name==='published'){d.published=item;return;}
+    if(name==='geometry'){d.geometry=item;return;}
+    if(name==='layout-receipt'){d.layout=item;d.firstLayoutAbs ??= item.abs;return;}
+    if(name==='target')d.target=item;
+    if(name==='physical-end'){d.releaseAbs=d.input?.type==='pointerup' || d.input?.type==='pointercancel'
+      ? d.input.receivedAbs : null;phase(d,name,f);return finish(f.reason || 'release');}
+    if(name==='click-release'){phase(d,name,f);return finish('click-no-drag');}
+    if((name==='cancel' || name==='pending-cancel') && !d.thresholdAbs){phase(d,name,f);return finish(f.reason || 'cancel');}
+    phase(d,name,f);
+  };
+  return {
+    event,
+    configure(value={}){
+      if(active)finish('diagnostic-mode-changed',true);
+      const mode=own(value,'mode');
+      if(['off','summary','frames'].includes(mode))config.mode=mode;
+      const hz=own(value,'hz');config.hz=Number.isFinite(hz)&&hz>=20&&hz<=1000?hz:null;
+      const slow=own(value,'slowMs');config.slowMs=Number.isFinite(slow)&&slow>0?Math.min(1000,slow):config.hz?2000/config.hz:50;
+      config.runId=short(own(value,'runId'),120);config.operationId=short(own(value,'operationId'),120);
+      safeEmit('[Perf:DragControl]',{abs:round(now()),...config});return {...config};
+    },
+    actionId(gestureId){
+      if(active?.gestureId===gestureId)return active.action?.id || null;
+      return actions.find(a=>a.drag?.gestureId===gestureId)?.id || null;
+    },
+    enabled(){return config.mode!=='off';},
+    pending(){return !!active?.thresholdAbs && active.config.mode==='frames';},
+    input(event){
+      const d=active;if(!d || config.mode==='off' || event.pointerId!==d.pointerId)return;
+      const receivedAbs=now(),eventAbs=performance.timeOrigin+event.timeStamp;
+      if(event.type==='gotpointercapture' || event.type==='lostpointercapture'){
+        d.capture={type:event.type,abs:round(receivedAbs),eventAbs:finite(eventAbs),pointerId:event.pointerId};
+        phase(d,event.type,{pointerId:event.pointerId});return;
+      }
+      if(!Number.isFinite(eventAbs)||eventAbs>receivedAbs+2){d.invalidTimestamp=increment(d.invalidTimestamp);}
+      const valid=Number.isFinite(eventAbs)&&eventAbs<=receivedAbs+2;
+      if(d.input && d.lastSampleSeq!==d.packets)d.sampleOverwrites=increment(d.sampleOverwrites);
+      d.packets=increment(d.packets);if(event.type==='pointermove')d.moves=increment(d.moves);
+      // No Event, target, text or coalesced coordinate list survives this callback.
+      const p=d.input || (d.input={});
+      Object.assign(p,{seq:d.packets,type:event.type,eventAbs:valid?round(eventAbs):null,receivedAbs:round(receivedAbs),
+        x:event.clientX,y:event.clientY,meta:event.metaKey===true,buttons:event.buttons});
+      if(dragAuthorDemand(d.author,p))d.authorDemandSince ??= receivedAbs;
+      else d.authorDemandSince=null;
+      if(valid){d.validPackets=increment(d.validPackets);d.maxDelivery=Math.max(d.maxDelivery,receivedAbs-eventAbs);}
+      if(d.config.mode==='frames' && event.type==='pointermove'){
+        try {if(typeof event.getCoalescedEvents==='function')d.coalesced=Math.min(DIAGNOSTIC_COUNTER_LIMIT,d.coalesced+event.getCoalescedEvents().length);
+          else d.coalescedUnavailable=increment(d.coalescedUnavailable);}
+        catch{d.coalescedUnavailable=increment(d.coalescedUnavailable);}
+      }
+    },
+    admission(admission){
+      const d=active;if(!d || !admission || config.mode==='off')return;
+      if(admission?.gestureId && d.gestureId && d.gestureId!==admission.gestureId)return;
+      if(admission?.gestureId)d.gestureId=short(admission.gestureId,120);
+      // Scalar guard projection only. Never traverse a tab/History object or stringify the admission.
+      d.plan={};d.planOmitted=0;
+      for(const key of ['sourceRootIds','rootTabIds','familyIds','paneFamilyIds']){
+        const ids=admission[key] || [];d.plan[key]=ids.slice(0,DRAG_MEMBER_CAP).map(id=>short(id,120));
+        d.planOmitted+=Math.max(0,ids.length-DRAG_MEMBER_CAP);
+      }
+      const guards=admission.guards || {}, seen=new Set();
+      d.members=[];
+      let omitted=0;for(const ids of [admission.familyIds || [],admission.paneFamilyIds || []])for(const id of ids){
+        if(seen.has(id))continue;
+        if(seen.size>=DRAG_MEMBER_CAP){omitted++;continue;}
+        seen.add(id);const g=guards[id];if(!g){omitted++;continue;}d.members.push({id:short(id,120),namespace:short(g.namespace,120),
+          workflowId:short(g.workflowId,120),membershipRevision:finite(g.membershipRevision),
+          storageId:finite(g.storageId),subjectId:short(g.subjectId,120),parentTabId:short(g.parentTabId,120),
+          visualParentTabId:short(g.visualParentTabId,120),groupId:short(g.groupId,120),groupRevision:finite(g.groupRevision)});
+      }
+      // Once full, omitted is an upper bound (an unseen ID can occur in both families).
+      d.memberOmitted=omitted;
+      const sourceLayout=admission.workflows?.[admission.sourceWorkflowId]?.layout;
+      const sourceIndex=/^pane:(\d+)$/.exec(admission.sourcePaneKey || '');
+      phase(d,'admission',{gestureId:d.gestureId,workflowId:admission.sourceWorkflowId,
+        paneKey:admission.sourcePaneKey,windowId:sourceIndex?sourceLayout?.splitPanes?.[Number(sourceIndex[1])]?.windowId:null,
+        sourceCount:admission.sourceRootIds?.length || 0,
+        familyCount:admission.familyIds?.length || 0,paneCount:admission.paneFamilyIds?.length || 0,
+        publicationRevision:admission.organizationRevision ?? admission.expectedRevision ?? null});
+    },
+    frame(at,rafTimestampAbs=at){
+      const d=active;if(!d || d.config.mode!=='frames' || !d.thresholdAbs)return;
+      const input=d.input?{...d.input}:null;
+      const moving=!!input && (!d.previousInput || input.x!==d.previousInput.x || input.y!==d.previousInput.y);
+      const gap=at-(d.lastFrameAbs ?? d.thresholdAbs),age=input?.eventAbs==null?null:at-input.eventAbs;
+      const errorX=input && d.author && d.author.axis!=='y'?input.x-d.author.x:null;
+      const errorY=input && d.author && d.author.axis!=='x'?input.y-d.author.y:null;
+      const needsAuthor=errorX!==null && Math.abs(errorX)>.01 || errorY!==null && Math.abs(errorY)>.01;
+      const authorLag=needsAuthor?at-Math.max(d.author.abs,d.authorDemandSince ?? input.receivedAbs):0;
+      if(d.author){d.maxAuthorLag=Math.max(d.maxAuthorLag,authorLag);
+        d.maxAuthorErrorX=Math.max(d.maxAuthorErrorX,Math.abs(errorX || 0));
+        d.maxAuthorErrorY=Math.max(d.maxAuthorErrorY,Math.abs(errorY || 0));}
+      if(moving)d.movingFrames=increment(d.movingFrames);
+      const sample={abs:round(at),rafTimestampAbs:round(rafTimestampAbs),gapMs:round(gap),moving,
+        needsAuthor,errorX,errorY,authorLagMs:d.author?round(authorLag):null,
+        input,processed:d.processed,published:d.published,geometry:d.geometry,author:d.author,layout:d.layout,target:d.target};
+      d.frames=increment(d.frames);d.maxGap=Math.max(d.maxGap,gap);
+      if(moving && age!==null)d.maxMovingAge=Math.max(d.maxMovingAge,age);
+      if(d.first.length<8)d.first.push(sample);
+      if(d.slowPost>0){d.slow.push(sample);d.slowPost--;}
+      const score=Math.max(gap,moving?age || 0:0,authorLag);
+      if(score>=d.config.slowMs && score>d.slowScore){
+        d.slowScore=score;d.slow=[...d.ring.slice(-8),sample];d.slowPost=15;
+      }
+      d.ring.push(sample);if(d.ring.length>DRAG_FRAME_CAP)d.ring.shift();
+      d.lastFrameAbs=at;d.lastSampleSeq=d.packets;d.previousInput=input;
+    },
+    failed(){emitFailed=increment(emitFailed);},
+    dispose(){finish('document-disposed',true);},
+    health(){return {dragEmitFailed:emitFailed,dragPartialGestures:partialGestures};},
+  };
+}
+
 export function createUIActionDiagnostics({ now = absNow, emit = console.warn, notify = () => {}, onPendingFrame = () => {}, max = 96 } = {}) {
   const boot = Math.floor(now()).toString(36);
   let sequence = 0, current = null, dropped = 0, phasesDropped = 0;
@@ -204,8 +481,9 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
     emit('[Perf:UIAction] ' + JSON.stringify(data));
     if (durationMs >= 100) notify({ id: action.id, event: action.event, startAbs: action.startAbs, durationMs });
   };
+  const drag=createDragDiagnostics({now,emit,onPendingFrame,matching,actions,appendPhase});
   return {
-    capture, phase, matching,
+    drag, capture, phase, matching,
     phaseForAction(id,name,values={}){
       const action=actions.find(action=>action.id===id);
       if(!action)return false;
@@ -245,7 +523,7 @@ export function createUIActionDiagnostics({ now = absNow, emit = console.warn, n
   };
 }
 
-// One owned request for all actions. No timers, DOM reads or continuous sampling.
+// One owned request for actions and opt-in active gestures. No timers, DOM reads or idle sampling.
 // A ticket is installed before requesting so reentrant wakes cannot duplicate it.
 export function createUIFrameScheduler({ request, cancel, hasPending, onFrame, onIdle = () => {} }) {
   let ticket = null, running = false, disposed = false;
@@ -337,6 +615,11 @@ export function captureUIAction(event) {
   if(clipboardState)action.clipboardState=clipboardState;
   return action;
 }
+export function uiDragDiagnostic(name, fields) { try { diagnostics?.drag.event(name,fields); } catch { diagnostics?.drag.failed(); } }
+export function uiDragInput(event) { try { diagnostics?.drag.input(event); } catch { diagnostics?.drag.failed(); } }
+export function uiDragAdmission(admission) { try { diagnostics?.drag.admission(admission); } catch { diagnostics?.drag.failed(); } }
+export function uiDragActionId(gestureId) { return diagnostics?.drag.actionId(gestureId) || null; }
+export function uiDragDiagnosticsEnabled() { return diagnostics?.drag.enabled() || false; }
 export function uiPerformancePhase(name, values) { diagnostics?.phase(name, values); }
 export function uiPerformancePhaseForAction(id,name,values) { return diagnostics?.phaseForAction(id,name,values) || false; }
 export function currentUIActionId() { return diagnostics?.currentId() || null; }
@@ -352,6 +635,8 @@ export function recordUIEventTiming(entry) {
   });
 }
 export function recordUIFrame(at) {
+  diagnostics?.drag.frame(absNow(),at);
+  // A drag frame alone must not sample stylesheet identities.
   if (!diagnostics?.pending()) return;
   const started = performance.now();
   const styles = stylesheetDiagnostics.sample(document.styleSheets);

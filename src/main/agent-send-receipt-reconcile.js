@@ -5,7 +5,7 @@
 const { reconcileAgentSendStartupRecords } = require('./agent-send-startup-reconcile');
 const { agentPromptAuditAddressesOverlap } = require('./agent-prompt-audit-identity');
 
-const AUDITABLE = new Set(['audit-pending', 'delivery-unknown']);
+const AUDITABLE = new Set(['audit-pending', 'delivery-unknown', 'in-flight', 'enter-armed']);
 const fail = (code, statusCode = 409) => { throw Object.assign(new Error(code), { code, statusCode }); };
 const string = value => typeof value === 'string' && value.trim() ? value : null;
 
@@ -33,7 +33,10 @@ function canonical(record) {
 function immutableProofIdentity(record) {
   return JSON.stringify([record.operationKey, record.attemptId, record.tabId,
     record.requestFingerprint, record.provider, record.sessionId, record.promptHash,
-    record.promptLength, record.transcriptBoundary]);
+    record.promptLength, record.transcriptBoundary,
+    record.receipt?.transportText, record.receipt?.promptText,
+    record.receipt?.imageRequestProjection, record.receipt?.ownedAttachmentProjection,
+    record.receipt?.ownedAttachments, record.receipt?.expectedImagePaths]);
 }
 
 function createAgentSendReceiptReconciler({ store, publishAudit,
@@ -48,17 +51,23 @@ function createAgentSendReceiptReconciler({ store, publishAudit,
     if (canonical(before)) return { ...request, record: before,
       reconciliation: { decision: 'confirmed', reason: 'already-exact-confirmed', confirmed: true, promoted: false } };
     if (!AUDITABLE.has(before.state)) fail('send_receipt_not_auditable');
+    if (before.state === 'in-flight') return { ...request, record: before,
+      reconciliation: { decision: 'unknown', reason: 'enter-not-recorded', confirmed: false, promoted: false } };
     const identity = immutableProofIdentity(before);
     const work = Promise.resolve().then(async () => {
       // Neighbouring attempts and claimed canonical rows are part of the
       // existing scanner's causal/ambiguity guards, not just the selected row.
       const allRecords = store.listAuditReferences('codex');
-      const [decision] = await scan([before], { allRecords });
+      // A recorded Enter can be audited before the renderer ACK arrives.
+      // A pre-Enter boundary alone cannot own a matching manual user record.
+      // Startup keeps its existing Enter-fence classification before scanning.
+      const [decision] = await scan([before], { allRecords, liveCodexAttempt: true });
       const current = exactReceipt(store, request);
       if (immutableProofIdentity(current) !== identity) fail('send_receipt_source_changed');
       if (canonical(current)) return { ...request, record: current,
         reconciliation: { decision: 'confirmed', reason: 'confirmed-during-read', confirmed: true, promoted: false } };
       if (!AUDITABLE.has(current.state)) fail('send_receipt_not_auditable');
+      if (current.state === 'in-flight') fail('send_receipt_source_changed');
       if (!decision || decision.operationKey !== request.operationKey || decision.attemptId !== request.attemptId) {
         fail('send_receipt_audit_identity_mismatch');
       }

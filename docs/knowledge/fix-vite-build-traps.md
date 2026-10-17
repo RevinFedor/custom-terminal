@@ -130,7 +130,8 @@ electron-vite main-сборкой и не оставлено как ложный
 Main загружает shared CJS через уже существующий `srcSharedDir`, вычисленный как
 `__dirname/../../src/shared`; эта схема одинаково разрешается из `src/main` и
 `dist/main`, а `src/shared/**/*` входит в electron-builder files. Renderer
-по-прежнему бандлит те же CJS через свою Vite CommonJS admission.
+бандлит те же CJS через свою Vite CommonJS admission; у DEV отдельная
+optimizer/alias граница из части7 ниже, без изменения Main runtime requires.
 
 `validate-app-asar.mjs` после проверки hashes дополнительно читает упакованный
 `dist/main/main.js` и отвергает статический относительный require без реальной
@@ -160,3 +161,23 @@ electron-vite build дал Main/renderer/assets. Product config не переп�
 build PASS ещё не означает Electron/runtime/installed PASS.
 Evidence: `/private/tmp/noted-ui-lag-0715-jc9pi7rs/startup27/build37/evidence/shared-build-result.json`
 и `build38/evidence/shared-build-result.json` в том же startup27.
+
+## Часть 7: DEV optimizer output не доказывает browser CJS interop
+
+15.10 actual ordinary DEV NEW04 показал видимое пустое окно: browser import
+`/src/shared/workflow-drag.cjs?import` не имел named export `applyDragLayout`.
+Абсолютные `optimizeDeps.include` действительно создавали optimizer output,
+но относительный исходный import обходил bare-import resolution; прежние
+5tests проверяли только output/needsInterop/default/transitive require.
+
+`scripts/lib/renderer-shared-cjs.mjs` теперь в `apply:serve` перенаправляет
+только production CJS из `src/shared` через bare aliases в обычный optimizer.
+Named/default/re-export interop выполняет сам Vite, не format-only esbuild
+transform. `?raw`/`?url`, чужие пути, tests, Main и production build не меняются.
+Actual Vite transformRequest regression воспроизвёл raw browser import RED;
+после ремонта его emitted ESM выполняется с реальными nested requires и
+общей named/default identity. Вместе с прежними controls7PASS/0skip. Это SOURCE
+проверка serving boundary, не feature acceptance. Новый actual DEV NEW05 уже
+подтвердил visible Home/App bootstrap; создание native-question fixture затем
+отказало по отдельному private catalog guard до Send. NEW04 evidence:
+`docs/tmp/native-question-3951-20261015/e2e/retake04/main-selected.log`.

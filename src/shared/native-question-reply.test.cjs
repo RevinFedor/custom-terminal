@@ -23,6 +23,48 @@ test('native Codex reply needs the exact call/index/title, not its reserved-look
   assert.equal(q.proveCodexNativeQuestionReply(wire([{ ...row(), question: 'Different question?' }]), definitions(), 'session', hash), null);
 });
 
+// Codex0.162 AnsweredQuestion::new cuts at a UTF-8 boundary <=512 bytes,
+// THEN replaces each CR/LF with a space. This is not a character/word prefix.
+test('Codex bounded native framing and legacy full titles share the existing blue projection', () => {
+  const cases = [
+    ['я'.repeat(300), 'я'.repeat(256)],
+    ['a'.repeat(511) + 'я trailing', 'a'.repeat(511)],
+    ['a'.repeat(510) + '😀 trailing', 'a'.repeat(510)],
+    ['😀'.repeat(130), '😀'.repeat(128)],
+    ['One\r\nTwo\nThree\rFour', 'One  Two Three Four'],
+    ['a'.repeat(510) + '\r\nend', 'a'.repeat(510) + '  '],
+  ];
+  for (const [title, framed] of cases) {
+    const map = new Map();
+    q.registerNativeQuestionDefinition(map, q.codexNativeQuestionDefinition({ ...call,
+      args: { questions: [{ title }] } }, hash));
+    for (const question of [framed, title]) {
+      const content = wire([{ ...row(), question }]), entry = codexEntry(content, map);
+      assert.ok(entry.questionReplyProof, 'exact native framing must be linked to its full definition');
+      assert.equal(q.projectNativeQuestionReply(entry, hash)?.items[0].question, question);
+      assert.equal(entry.content, content, 'source/Copy keep the original envelope');
+    }
+    for (const question of [framed.slice(0, -1), framed + 'x', framed.replace(/^./u, 'z')]) {
+      assert.equal(q.proveCodexNativeQuestionReply(wire([{ ...row(), question }]), map, 'session', hash), null,
+        'arbitrary prefixes and edited framing remain literal');
+    }
+  }
+});
+
+test('same bounded title prefix cannot hide conflicting full definitions or a foreign owner/index', () => {
+  const title = 'я'.repeat(256) + 'first full suffix', content = wire([{ ...row(), question: 'я'.repeat(256) }]);
+  const map = new Map();
+  q.registerNativeQuestionDefinition(map, q.codexNativeQuestionDefinition({ ...call,
+    args: { questions: [{ title }] } }, hash));
+  assert.ok(q.proveCodexNativeQuestionReply(content, map, 'session', hash));
+  assert.equal(q.proveCodexNativeQuestionReply(content, map, 'foreign-session', hash), null);
+  assert.equal(q.proveCodexNativeQuestionReply(wire([{ ...row('answer', 1), question: 'я'.repeat(256) }]), map, 'session', hash), null);
+  q.registerNativeQuestionDefinition(map, q.codexNativeQuestionDefinition({ ...call,
+    args: { questions: [{ title: 'я'.repeat(256) + 'different full suffix' }] } }, hash));
+  assert.equal(q.proveCodexNativeQuestionReply(content, map, 'session', hash), null,
+    'ambiguity still compares the complete original titles');
+});
+
 test('quoted, embedded, partial, malformed and duplicate IDs stay literal', () => {
   const content = wire([row()]);
   for (const value of ['Example: ' + content, '```\n' + content + '\n```', content + ' tail', content.slice(0, -4),

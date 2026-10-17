@@ -107,6 +107,16 @@ explicit gaps, not fabricated complete replays. Files use the existing private
 diagnostic writer/retention (50 artifacts,14 days); later SENT does not erase
 the incident. Capture/notification failure cannot fail or repeat the operation.
 
+17Oct clarification: these are bounded headless-input replay windows, NOT a
+full app-raw/kernel-byte journal. A long open DEC2026 interval can exceed their
+retention before a new committed checkpoint and lose its prefix. Capture copies
+only what remains before renderer-await; it does not reconstruct lost data or
+implicitly pin future tail. New loss counters preserve omitted ranges/reasons.
+Applied==flushed==renderer with an older committed seq is compatible with the
+same still-open frame, not proof of parser desync. See the ongoing separately
+budgeted recent+pin implementation and app acceptance in
+[Main working state](../tmp/terminal-large-diff-20261017/RESULT.md).
+
 Regression checkpoint:384 source tests +60 native-ABI receipt/recovery tests
 PASS, plus exact production snapshot/record replay. No new full UI/CLI E2E,
 build or install claimed. New files must ship together with callers:

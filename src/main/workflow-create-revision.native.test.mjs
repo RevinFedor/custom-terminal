@@ -16,6 +16,7 @@ import {createProjectTabSaveQueue} from '../renderer/utils/projectTabSaveQueue.m
 import {commitCreatedTabSnapshot} from '../renderer/utils/tabCreationCommit.mjs';
 import {createWorkflowCreationVisibility} from '../renderer/utils/workflowCreationVisibility.mjs';
 import {rememberAgentLaunchFence} from '../renderer/utils/agentLaunchFence.mjs';
+import {planCodexContextForkSettings} from '../renderer/utils/codexEffectiveSettings.mjs';
 import {resolveSiblingInsertionIndex,resolveTabInsertionIndex} from '../renderer/utils/tabInsertionModel.mjs';
 import {findOpenTabOwner} from '../renderer/utils/tabLinkNavigation.mjs';
 import {selectWorkflowReserve,workflowReserveOutline} from '../renderer/utils/workflowReserve.mjs';
@@ -54,7 +55,7 @@ async function fixture(t,{namespace,empty=false,initialRecord={}}={}){
     record:{name:'Existing',notes:'preserve user metadata',tabType:'terminal',commandType:'codex',codexSessionId:'same-session',...initialRecord}});
   const workspace={projectId:ns,projectPath:root,tabs:new Map(),tabCounter:0,tabGroups:[],tabHistory:[],activeTabId:'existing'};
   const state={openProjects:new Map([[ns,workspace]]),organizationReady:true,isRestoring:true,splitPanes:[],splitFocusedIndex:0,
-    activeSpaceId:'w',organizationRevision:api.read().publication.revision,tabCatalog:{},tabWorkflowMembership:{},
+    activeSpaceId:'w',organizationRevision:api.read().publication.revision,tabCatalog:{},tabWorkflowMembership:{},runAfterWorkflowScopeVersions:{},
     touchGlobalTabMru(){},clearTerminalBuffer(){}};
   const calls=[],writes=[],module={exports:{}},orgQueue=createProjectTabSaveQueue(),mainEvents=[];
   const mainContext={...ack,validateForceCleanupTabIds,Date,console:quiet,
@@ -77,6 +78,7 @@ async function fixture(t,{namespace,empty=false,initialRecord={}}={}){
     resolveWorkspaceCwd:value=>value||root,restoreShortId:value=>String(value||''),dndShortId:value=>String(value),
     getNextAvailableName:()=> 'New',resolveExistingTabGroupId:()=>undefined,
     commitCreatedTabSnapshot,resolveSiblingInsertionIndex,resolveTabInsertionIndex,rememberAgentLaunchFence,
+    planCodexContextForkSettings,
     workflowCreationVisibility:createWorkflowCreationVisibility({log(){}}),
     ipcRenderer:{send:(...args)=>calls.push(args),invoke:async(channel,payload)=>{
       calls.push([channel,payload]);
@@ -124,6 +126,19 @@ test('empty standalone namespace restore stays empty, then actual New commits wi
   assert.equal(f.calls.filter(([kind])=>kind==='terminal:create').length,1);
   assert.equal(f.calls.some(([kind])=>kind==='terminal:kill'),false);
   assert.equal(f.writes.length,1);assert.equal(f.writes[0].result.success,true);
+});
+
+test('context Fork initial allocation/SQLite row carries the source choice without source SID/proof',async t=>{
+  const f=await fixture(t),source=f.workspace.tabs.get('existing');
+  Object.assign(source,{codexModel:'gpt-6-astra',codexEffort:'max',codexSettingsProofAt:700,codexSettingsProofSessionId:'same-session'});
+  const id=await f.newTab({pendingAction:{type:'codex-fork',sessionId:'same-session',contextFork:{
+    sourceTabId:'existing',sourceSessionId:'same-session',fromLatestCompact:false}}});
+  const child=f.workspace.tabs.get(id),saved=f.manager.getExecutionTabV2({executionNamespace:f.ns,tabId:id}).tab;
+  assert.equal(child.codexModel,'gpt-6-astra');assert.equal(saved.codexModel,'gpt-6-astra');
+  assert.equal(saved.codexEffort,'max');assert.equal(saved.codexSessionId,null);
+  assert.equal(saved.codexSettingsProofAt,null);assert.equal(saved.codexSettingsProofSessionId,null);
+  assert.equal(saved.codexForkInitialSettings,undefined,'transient display hint is not a persistent proof or replay');
+  assert.equal(source.codexSessionId,'same-session');
 });
 
 test('same-SID first-writer settings update reconciles before unrelated New commits exactly once',async t=>{

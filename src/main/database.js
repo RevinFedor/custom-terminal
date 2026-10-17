@@ -51,6 +51,7 @@ const CODEX_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-receipt.v1:'
 const WORKSPACE_SESSION_APP_STATE_KEY = 'workspace-session';
 const workflowStorage = require('../shared/workflow-organization.cjs');
 const APP_STATE_REVISION_LIMIT = 100;
+const { ensureExpiredHistoryTable, visibleHistorySql } = require('./storage-closed-tabs');
 
 function inspectCodexWriterHandoffValue(journalKey, rawValue) {
   if (rawValue === undefined || rawValue === null) {
@@ -321,6 +322,9 @@ class DatabaseManager {
   }
 
   initTables() {
+    // New databases can return free pages incrementally without a blocking
+    // VACUUM or a second full copy. Never convert/rewrite an existing DB here.
+    if (this.db.pragma('page_count', { simple: true }) === 0) this.db.pragma('auto_vacuum=INCREMENTAL');
     // Projects table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects (
@@ -767,6 +771,7 @@ class DatabaseManager {
     `);
 
     // Tab history indexes (must be after table creation)
+    ensureExpiredHistoryTable(this.db);
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_tab_history_project ON tab_history(project_id);
       CREATE INDEX IF NOT EXISTS idx_tab_history_closed ON tab_history(closed_at DESC);
@@ -2336,7 +2341,7 @@ class DatabaseManager {
   }
   restoreExecutionTabV2(request) {
     return this._executionMutation('restore', request, () => {
-      const archive = this.db.prepare('SELECT * FROM tab_history WHERE id=? AND execution_subject_version=2 AND execution_namespace=? AND execution_subject_id=?')
+      const archive = this.db.prepare(`SELECT * FROM tab_history WHERE id=? AND ${this.visibleTabHistorySql()} AND execution_subject_version=2 AND execution_namespace=? AND execution_subject_id=?`)
         .get(request.archiveId, request.executionNamespace, request.subjectId);
       if (!archive) workflowStorage.fail('execution_archive_not_found');
       let tab = this.getExecutionTabV2({ executionNamespace: request.executionNamespace, tabId: archive.tab_id, subjectId: request.subjectId });
@@ -2364,7 +2369,7 @@ class DatabaseManager {
     });
   }
   getExecutionArchive(executionNamespace) {
-    return this.db.prepare('SELECT * FROM tab_history WHERE execution_subject_version=2 AND execution_namespace=? ORDER BY id DESC').all(executionNamespace);
+    return this.db.prepare(`SELECT * FROM tab_history WHERE ${this.visibleTabHistorySql()} AND execution_subject_version=2 AND execution_namespace=? ORDER BY id DESC`).all(executionNamespace);
   }
   saveExecutionArtifactV2(request) {
     return this._executionMutation('artifact', request, () => {
@@ -5624,7 +5629,7 @@ class DatabaseManager {
   // tab first and delete this row only after creation succeeds.
   getLatestTabHistory(projectId) {
     return this._executionWireRow(this.db.prepare(
-      `SELECT * FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT 1`
+      `SELECT * FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND ${this.visibleTabHistorySql()} AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT 1`
     ).get(projectId));
   }
 
@@ -5644,6 +5649,7 @@ class DatabaseManager {
           END, ROUND((julianday(closed_at)-2440587.5)*86400000)) AS closedOrder
       FROM tab_history
       WHERE ${this._executionNamespaceColumn()} IN (${projects.map(() => '?').join(',')})
+        AND ${this.visibleTabHistorySql()}
         AND (tab_type IS NULL OR tab_type != 'file')
         ${projectOnly ? '' : `AND CASE WHEN json_valid(restore_placement) THEN
           json_extract(restore_placement,'$.window.spaceId') = ? AND
@@ -5656,7 +5662,7 @@ class DatabaseManager {
 
   getTabHistoryEntry(id, projectId) {
     return this._executionWireRow(this.db.prepare(
-      `SELECT * FROM tab_history WHERE id = ? AND ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file') LIMIT 1`
+      `SELECT * FROM tab_history WHERE id = ? AND ${this._executionNamespaceColumn()} = ? AND ${this.visibleTabHistorySql()} AND (tab_type IS NULL OR tab_type != 'file') LIMIT 1`
     ).get(id, projectId));
   }
 
@@ -5665,30 +5671,37 @@ class DatabaseManager {
     if (!cleanTabId) return [];
     const safeLimit = Math.max(1, Math.min(10, Number(limit) || 2));
     return this.db.prepare(
-      "SELECT * FROM tab_history WHERE tab_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT ?"
+      `SELECT * FROM tab_history WHERE tab_id = ? AND ${this.visibleTabHistorySql()} AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT ?`
     ).all(cleanTabId, safeLimit).map(row=>this._executionWireRow(row));
   }
 
   getTabHistory(projectId, limit = 0) {
     if (limit && limit > 0) {
       return this.db.prepare(
-        `SELECT * FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT ?`
+        `SELECT * FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND ${this.visibleTabHistorySql()} AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT ?`
       ).all(projectId, limit).map(row=>this._executionWireRow(row));
     }
     return this.db.prepare(
-      `SELECT * FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC`
+      `SELECT * FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND ${this.visibleTabHistorySql()} AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC`
     ).all(projectId).map(row=>this._executionWireRow(row));
   }
 
   getTabHistoryCount(projectId) {
     const row = this.db.prepare(
-      `SELECT COUNT(*) as count FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND (tab_type IS NULL OR tab_type != 'file')`
+      `SELECT COUNT(*) as count FROM tab_history WHERE ${this._executionNamespaceColumn()} = ? AND ${this.visibleTabHistorySql()} AND (tab_type IS NULL OR tab_type != 'file')`
     ).get(projectId);
     return row ? row.count : 0;
   }
 
   clearTabHistory(projectId) {
     this.db.prepare(`DELETE FROM tab_history WHERE ${this._executionNamespaceColumn()} = ?`).run(projectId);
+  }
+
+  visibleTabHistorySql(alias = 'tab_history') {
+    // Minimal legacy SQL fixtures can omit optional retention storage. Actual
+    // DatabaseManager.initTables always creates it before any archive reader.
+    return this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage_expired_tab_history'").get()
+      ? visibleHistorySql(alias) : '1';
   }
 
   clearTabHistoryExceptNotes(projectId) {

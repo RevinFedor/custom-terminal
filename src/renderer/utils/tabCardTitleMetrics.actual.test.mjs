@@ -48,7 +48,7 @@ test('retained titles share one document canvas while every ink measurement stay
  assert.equal(doc.counts.canvas,1,'same document does not allocate90canvases');
  assert.equal(doc.counts.probe,1,'same baseline profile remains reused');
  assert.equal(doc.counts.ink,90,'fresh ink is not replaced with cached ascent/descent');
- assert.equal(doc.counts.fontSet,180,'default and current font are explicitly resolved every time');
+ assert.equal(doc.counts.fontSet,2,'identical private-context font does not repeat180native assignments');
 });
 
 test('font change, pre-loadingdone ink change, and completed font load keep metric semantics',()=>{

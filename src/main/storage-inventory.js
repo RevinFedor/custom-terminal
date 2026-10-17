@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
+const { scanTestRuns } = require('./storage-test-runs');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SETTINGS_VERSION = 1;
@@ -120,11 +121,14 @@ async function readInitialJsonLines(filePath, maxBytes = 512 * 1024, maxLines = 
   }
 }
 
-async function walkFiles(root, predicate) {
+async function walkFiles(root, predicate, errors = []) {
   const results = [];
   async function visit(dir) {
     let entries;
-    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch (error) {
+      if (error.code !== 'ENOENT') errors.push({ path: dir, error: error.code || error.message });
+      return;
+    }
     await Promise.all(entries.map(async (entry) => {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) return visit(fullPath);
@@ -222,6 +226,7 @@ function readStorageRelations(sqlite, options = {}) {
              t.codex_session_id, t.claude_task_count,
              p.name AS project_name
       FROM tabs t LEFT JOIN projects p ON p.id = t.project_id
+      WHERE ${activeStorageTabsSql(sqlite, 't')}
     `).all();
     for (const row of openRows) {
       add('claude', row.claude_session_id, {
@@ -244,6 +249,11 @@ function readStorageRelations(sqlite, options = {}) {
       });
     }
   } catch {}
+  for (const row of workflowStorageBindings(sqlite)) {
+    add(row.provider, row.sessionId, { open: openTabs,
+      protectedByForeignProduction: protectEveryRelation, name: row.name,
+      reference: 'workflow-member' });
+  }
   try {
     const historyRows = sqlite.prepare(`
       SELECT h.name, h.cwd, h.command_type, h.claude_session_id,
@@ -534,16 +544,22 @@ function sessionTitle(item, relation) {
 }
 
 async function scanSessions({ codexHome, claudeHome, relations, runtimeProtectedIds }) {
+  const errors = { codex: [], claude: [] };
   const codexRoots = [path.join(codexHome, 'sessions'), path.join(codexHome, 'archived_sessions')];
   const codexPaths = [];
   for (const root of codexRoots) {
-    codexPaths.push(...await walkFiles(root, (_fullPath, name) => name.includes('.jsonl')));
+    codexPaths.push(...await walkFiles(root, (_fullPath, name) => name.includes('.jsonl'), errors.codex));
   }
-  const claudeAllPaths = await walkFiles(path.join(claudeHome, 'projects'), () => true);
+  const claudeAllPaths = await walkFiles(path.join(claudeHome, 'projects'), () => true, errors.claude);
   const claudePaths = claudeAllPaths.filter((filePath) => path.basename(filePath).includes('.jsonl'));
+  const inspect = async (filePath, provider) => {
+    const item = await scanSessionFile(filePath, provider);
+    if (!item) errors[provider].push({ path: filePath, error: 'session-metadata-unavailable' });
+    return item;
+  };
   const scanned = (await Promise.all([
-    mapLimit(codexPaths, 32, (filePath) => scanSessionFile(filePath, 'codex')),
-    mapLimit(claudePaths, 32, (filePath) => scanSessionFile(filePath, 'claude')),
+    mapLimit(codexPaths, 32, (filePath) => inspect(filePath, 'codex')),
+    mapLimit(claudePaths, 32, (filePath) => inspect(filePath, 'claude')),
   ])).flat().filter(Boolean);
   const claudePrimaryBySession = new Map();
   for (const item of scanned.filter((candidate) => candidate.provider === 'claude' && !candidate.recoveryCopy)) {
@@ -586,7 +602,57 @@ async function scanSessions({ codexHome, claudeHome, relations, runtimeProtected
     item.group = classifySessionItem(item, relation, forkEvent);
     item.deletable = !item.protected;
   }
-  return scanned;
+  return { items: scanned, coverage: { codex: errors.codex.length === 0, claude: errors.claude.length === 0 }, errors };
+}
+
+function activeStorageTabsSql(sqlite, alias = '') {
+  const prefix = alias ? alias + '.' : '';
+  try {
+    const columns = new Set(sqlite.prepare('PRAGMA table_info(tabs)').all().map(row => row.name));
+    const withUnknownProtection = predicate => columns.has('execution_subject_version')
+      ? `(${prefix}execution_subject_version NOT IN (1,2) OR (${predicate}))` : predicate;
+    const migrated = sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_org_meta'").get()
+      && sqlite.prepare('SELECT migration_version FROM workflow_org_meta WHERE singleton=1').get()?.migration_version === 1;
+    if (migrated) {
+      const tab = alias || 'tabs';
+      const namespace = columns.has('execution_namespace') ? `COALESCE(${tab}.project_id,${tab}.execution_namespace)` : `${tab}.project_id`;
+      const unarchived = columns.has('execution_archived') ? `COALESCE(${prefix}execution_archived,0)=0 AND ` : '';
+      return withUnknownProtection(`${unarchived}EXISTS (SELECT 1 FROM workflow_org_memberships sm JOIN workflow_org_workflows sw ON sw.workflow_id=sm.workflow_id
+        WHERE sw.deleted_generation IS NULL AND (sm.tab_id=${tab}.tab_id OR EXISTS (
+          SELECT 1 FROM workflow_org_aliases sa WHERE sa.global_tab_id=sm.tab_id
+            AND sa.tab_id=${tab}.tab_id AND sa.namespace=${namespace})))`);
+    }
+    return withUnknownProtection(columns.has('execution_archived') ? `COALESCE(${prefix}execution_archived,0)=0` : '1');
+  } catch { return '1'; }
+}
+
+function workflowStorageBindings(sqlite) {
+  // Legacy test/adaptor connections expose only the tab-reference statements;
+  // native application connections always expose exec + the workflow schema.
+  if (typeof sqlite?.exec !== 'function') return [];
+  try {
+    // Membership rows deliberately survive Full Close for provenance/restore.
+    // Match the public catalog: a resolved, unarchived execution row AND a live
+    // workflow, not merely a historical membership or serialized SID alias.
+    const active = activeStorageTabsSql(sqlite, 't');
+    const rows = sqlite.prepare(`SELECT t.codex_session_id, t.claude_session_id, t.name
+      FROM workflow_org_memberships m JOIN workflow_org_workflows w ON w.workflow_id=m.workflow_id
+      JOIN tabs t ON t.tab_id=m.tab_id
+      WHERE w.deleted_generation IS NULL AND ${active}`).all();
+    const bindings = [];
+    for (const row of rows) {
+      for (const provider of ['codex', 'claude']) {
+        const sessionId = row[provider + '_session_id'];
+        if (sessionId) bindings.push({ provider, sessionId, name: row.name });
+      }
+    }
+    return bindings;
+  } catch (error) {
+    // An unmigrated database has no workflow catalog. Callers still use the
+    // legacy tabs authority; no absence proof is inferred from this fallback.
+    if (/no such table/.test(error.message || '')) return [];
+    throw error;
+  }
 }
 
 async function listGitWorktrees(projectRoot) {
@@ -816,6 +882,7 @@ async function scanStorageInventory({
   currentEnvironment = 'production',
   relationDatabases = [],
   settings = DEFAULT_SETTINGS,
+  testRunRoots = null,
   nowMs = Date.now(),
 } = {}) {
   const normalizedSettings = normalizeStorageRetentionSettings(settings);
@@ -827,23 +894,27 @@ async function scanStorageInventory({
     readStorageRelations(source.sqlite, {
       target: relations,
       environment,
-      openTabs: environment === normalizedEnvironment,
+      openTabs: true,
       protectEveryRelation: normalizedEnvironment === 'development' && environment === 'production',
     });
   }
   const runtimeProtectedIds = new Set((runtimeProtectedSessionIds || []).map(text).filter(Boolean));
-  const [sessions, builds, appItems] = await Promise.all([
+  const [sessionScan, builds, appItems, testRuns] = await Promise.all([
     scanSessions({ codexHome, claudeHome, relations, runtimeProtectedIds }),
     scanBuilds(projectRoot),
     appDataDir ? scanAppData(appDataDir) : [],
+    testRunRoots ? scanTestRuns({ roots: testRunRoots }) : { items: [], complete: true, warnings: [] },
   ]);
-  const items = decorateRetention([...sessions, ...builds, ...appItems], normalizedSettings, nowMs);
+  const items = decorateRetention([...sessionScan.items, ...builds, ...appItems, ...testRuns.items], normalizedSettings, nowMs);
   items.sort((a, b) => b.sizeBytes - a.sizeBytes || b.modifiedAt - a.modifiedAt || a.id.localeCompare(b.id));
   return {
     success: true,
     generation: inventoryGeneration(items, normalizedSettings),
     scannedAt: nowMs,
     settings: normalizedSettings,
+    sessionCoverage: sessionScan.coverage,
+    sessionScanErrors: sessionScan.errors,
+    testRuns: { complete: testRuns.complete, warnings: testRuns.warnings },
     summary: summarizeInventory(items),
     items,
   };
@@ -851,6 +922,8 @@ async function scanStorageInventory({
 
 module.exports = {
   APP_STATE_KEY,
+  activeStorageTabsSql,
+  workflowStorageBindings,
   DAY_MS,
   DEFAULT_SETTINGS,
   SESSION_GROUPS,

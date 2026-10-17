@@ -189,6 +189,26 @@ async function registerUnknownPresence(h) {
   return presence;
 }
 
+for (const fields of [{ killed: true, signal: 'SIGTERM' }, { code: 1, killed: false }, { code: 'EACCES' }]) {
+  test('failed process snapshot retains bounded cause metadata without process output: ' + JSON.stringify(fields), async () => {
+    const h = fixture();
+    const error = Object.assign(new Error('private command details'), fields,
+      { stdout: 'private process argv', stderr: 'private stderr' });
+    h.queueExec(() => Promise.reject(error));
+    await assert.rejects(h.collect(), caught => caught === error);
+    const log = h.logs.find(([, message]) => String(message).startsWith('[Perf:ProcessTreeSnapshotFailure] '));
+    assert.ok(log, 'a failed ps capture needs its own causal metadata');
+    const data = JSON.parse(log[1].slice('[Perf:ProcessTreeSnapshotFailure] '.length));
+    assert.equal(data.code, fields.code ?? null);
+    assert.equal(data.signal, fields.signal ?? null);
+    assert.equal(data.killed, fields.killed === true);
+    assert.equal(data.timeoutMs, 2000);
+    assert.ok(data.endAbs >= data.startAbs);
+    assert.equal(log[1].includes('private'), false);
+    assert.equal(h.sent.length, 0);
+  });
+}
+
 test('actual Claude presence recovers to absent on the same PTY without inventing input readiness', async () => {
   const h = fixture({ windowSendThrows: true });
   await registerUnknownPresence(h);

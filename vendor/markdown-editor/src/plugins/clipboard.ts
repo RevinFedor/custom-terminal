@@ -3,6 +3,7 @@ import { EditorSelection } from '@codemirror/state'
 import { foldable, foldedRanges, foldEffect } from '@codemirror/language'
 import { findBlock } from './blockMove'
 import { type ClipboardAdapter, resolveClipboardAdapter } from './clipboardAdapter'
+import { readTerminalMessageClipboard, buildTerminalMessageBlock, expandTerminalMessageBlocks } from '../terminalMessageReference.mjs'
 import {
   adoptForeignImagePathMarkers,
   buildPortableImageClipboardOutput,
@@ -567,7 +568,7 @@ export function createClipboardKeymap(config: ClipboardConfig = {}) {
   const portableSelection = (view: EditorView, from: number, to: number) => {
     const portable = buildPortableImageClipboardText(view.state.doc.toString(), from, to)
     logPortableExport(portable, 'keymap')
-    return portable.text
+    return expandTerminalMessageBlocks(portable.text)
   }
   const portableNativeOutput = EditorView.clipboardOutputFilter.of((text, state) => {
     const portable = buildPortableImageClipboardOutput(
@@ -577,7 +578,7 @@ export function createClipboardKeymap(config: ClipboardConfig = {}) {
       state.lineBreak,
     )
     logPortableExport(portable, 'native')
-    return portable.text
+    return expandTerminalMessageBlocks(portable.text)
   })
 
   return [portableNativeOutput, keymap.of([
@@ -712,8 +713,26 @@ export function createClipboardKeymap(config: ClipboardConfig = {}) {
         // readItems (Electron host omits it) — images then flow through the
         // native DOM `paste` handler (imagePaste.ts, event.clipboardData), which
         // works in Electron without permissions and without navigator.clipboard.
+        const pasteDocument = view.state.doc, pasteSelection = view.state.selection
+        const acceptReference = (text: string, html: string) => {
+          const snapshot = readTerminalMessageClipboard({ getData: (type: string) => type === 'text/html' ? html : '' }, text)
+          if (!snapshot) return false
+          if (!view.dom.isConnected || !view.hasFocus || view.state.doc !== pasteDocument || !view.state.selection.eq(pasteSelection)) {
+            console.warn('[MessageReference] paste rejected id=' + snapshot.referenceId + ' reason=editor-changed')
+            return true
+          }
+          const block = buildTerminalMessageBlock(snapshot)
+          if (!block) return false // unsupported framing keeps the original plain text
+          view.dispatch({
+            changes: { from: pasteSelection.main.from, to: pasteSelection.main.to, insert: block },
+            selection: { anchor: pasteSelection.main.from + block.length }, userEvent: 'input.paste',
+          })
+          console.log('[MessageReference] paste id=' + snapshot.referenceId + ' chars=' + text.length)
+          return true
+        }
         const pasteTextOnly = () => {
-          Promise.resolve(cb.readText()).then((text) => {
+          Promise.all([Promise.resolve(cb.readText()), Promise.resolve().then(() => cb.readHTML?.() || '').catch(() => '')]).then(([text, html]) => {
+            if (acceptReference(text, html)) return
             if (text) {
               console.log('[Clipboard:PasteEntry] → pasteWithNormalizedIndent (text-only adapter)', {
                 textLen: text.length, first40: text.slice(0, 40),
@@ -771,6 +790,12 @@ export function createClipboardKeymap(config: ClipboardConfig = {}) {
             }
           }
 
+          for (const item of items) {
+            if (item.types.includes('text/html') && item.types.includes('text/plain')) {
+              const [plain, html] = await Promise.all([item.getType('text/plain').then(blob => blob.text()), item.getType('text/html').then(blob => blob.text())])
+              if (acceptReference(plain, html)) return
+            }
+          }
           // No image, paste text with normalized indent. Text-only
           // [imagePath: /abs/path] markers are adopted inside that text path.
           pasteTextOnly()

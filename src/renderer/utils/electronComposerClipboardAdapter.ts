@@ -28,6 +28,10 @@ const resolveElectronClipboard = (): ElectronClipboard | null => {
  * event, while Electron supplies deterministic text and custom-format reads.
  */
 export const electronComposerClipboardAdapter: ClipboardAdapter = {
+  readHTML: () => {
+    const target = resolveElectronClipboard();
+    return measureComposerClipboardCall('read-html', () => target?.readHTML?.() || '', { missing: !target?.readHTML });
+  },
   readText: () => {
     const target = resolveElectronClipboard();
     return measureComposerClipboardCall('read-text', () => target?.readText() || '', { missing: !target?.readText });

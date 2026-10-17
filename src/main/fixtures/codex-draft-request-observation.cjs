@@ -19,6 +19,21 @@ function actualFunction(name) {
   return node.getText(mainAst);
 }
 
+function actualDeclaration(name) {
+  const node = mainAst.statements.find(statement =>
+    (ts.isFunctionDeclaration(statement) && statement.name?.text === name)
+    || (ts.isVariableStatement(statement) && statement.declarationList.declarations
+      .some(declaration => declaration.name.getText(mainAst) === name)));
+  if (!node) throw new Error('Missing actual main.js declaration ' + name);
+  return node.getText(mainAst);
+}
+
+function startupFrameDeclarations() {
+  return ['codexSendStartupFrameWaits', 'captureCodexSendStartupFrameWait',
+    'codexSendStartupFrameWaitIsCurrent', 'clearCodexSendStartupFrameWait']
+    .map(actualDeclaration).join('\n');
+}
+
 function createFakeClock(startAt = 1000) {
   let time = startAt;
   let nextId = 0;
@@ -112,12 +127,19 @@ function createCodexDraftRequestHarness({
   };
 
   const declarations = [
+    startupFrameDeclarations(),
     actualFunction('waitForHeadlessCodexDraftState'),
     actualFunction('agentDraftObservationResult'),
     actualFunction('requestTerminalCodexDraftState'),
   ].join('\n');
   const context = vm.createContext({
     ...draftAuthority,
+    ...require('../codex-runtime-contract'),
+    // This ordinary-probe fixture has no cold launch. Use the real projector
+    // with empty owner maps; do not stub away the final guard's startup branch.
+    codexLastRunCommandPayload: new Map(), terminals: new Map(), terminalCommandState: new Map(),
+    aiStoppingTabs: new Map(), getTerminalLifecycleGeneration: () => owner.terminalLifecycleGeneration,
+    CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000, Date: { now: clock.now },
     crypto: require('node:crypto'),
     ipcMain,
     createMainAgentInputObservation: observationFactory,
@@ -177,4 +199,4 @@ const drainMicrotasks = async (rounds = 12) => {
   for (let index = 0; index < rounds; index += 1) await Promise.resolve();
 };
 
-module.exports = { actualFunction, createCodexDraftRequestHarness, createFakeClock, drainMicrotasks };
+module.exports = { actualFunction, startupFrameDeclarations, createCodexDraftRequestHarness, createFakeClock, drainMicrotasks };

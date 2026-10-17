@@ -136,6 +136,25 @@ Source и полноценный DEV проверены на изолирова�
 
 ## Контракт поверхностей
 
+До создания handoff отправка может ждать проверку вложений и отложенных обновлений
+контекста. Этот этап обязан сразу показывать на рамке исходного composer
+`Preparing send...`: нажатие принято, но Main ещё не сохранил FIFO snapshot.
+Подпись использует тот же sentence case, шрифт, размер и синий акцент, что
+`Preparing codex session...`. Пока этот же preparation token активен, мягко
+пульсирует только скруглённый контур input; текст/кнопки не мерцают и не блокируются.
+В скрытой панели анимация приостановлена, при reduced motion контур статичен.
+Источник подписи — exact tab-scoped coordinator token без handoff, не runtime busy
+и не квитанция предыдущего сообщения. При handoff, Stop или ошибке подпись исчезает;
+новый ввод не стирается. До handoff draft остаётся редактируемым, прежний snapshot
+отправляется один раз. `IN APP QUEUE` нельзя рисовать как доказательство до Main ACK.
+Известная отмена до provider input в return и exception shared handoff показывается
+как `CANCELLED`, не `SEND FAILED`; cancellation без no-submit proof остаётся
+`UNCONFIRMED`. Durable authoring snapshot и квитанция не изменяются подписью.
+Шрам15.10: ожидание context IPC3,9/10,9с находилось ДО старого SEND_CLICK и очистки,
+поэтому уже обработанный Enter выглядел проигнорированным. Диагностика подготовки
+теперь связывает begin/images-ready/context-ready/handoff с исходным UI action/token.
+Это ремонт feedback; он не означает ускорение чтения контекста или новый Send executor.
+
 Обычный Send Claude/Codex допускает много принятых сообщений во время streaming.
 Desktop показывает `IN APP QUEUE` после durable Main admission; это ещё не
 provider input. Переходы квитанции не переставляют ожидающий prompt перед уже
@@ -246,6 +265,7 @@ limit» в обычном ответе, user prompt или tool result не яв
 - Клик по status-control открывает и сворачивает floating xterm; белая рамка всего control означает, что окно показано. Описание открывается сразу по hover, правый клик копирует title, description, полные session ID и tab ID для логов.
 - Когда focus находится в terminal, `Cmd+F` принадлежит terminal search; когда terminal свёрнут и focus вне composer — History search. При focus в `.gt-composer-editor` открывается только его компактный поиск. В titlebar terminal нет отдельной search-кнопки; один жест никогда не открывает две панели.
 - Обычные user/assistant-блоки показывают контент без повторяющейся строки `CODEX/CLAUDE · время · message id`: агент уже понятен из вкладки, а техническая строка перед каждым сообщением разрушает сканирование. Точное Terminal MCP/orchestration происхождение — единственное цветовое исключение для user-bubble: оно получает тихий фиолетовый фон по semantic tag, не по словам сообщения; детали в `fact-оркестрация-вкладок.md::UI в History`. Правый клик по пустой части блока открывает native action `Copy ID and details`; правый клик по самому тексту не перехватывается, чтобы сохранить системную работу с выделением и копированием.
+  Source-контракт ссылки на сообщение расширяет только этот Copy: окончательный Details (включая диагностическую ссылку при unknown delivery) остаётся идентичным plain text, а один native clipboard item содержит также immutable snapshot выбранной строки. Обычная вставка в History/Run after принимает его как paste-чип независимо от порога. Label — имя исходной вкладки, известный номер итерации и время сообщения; номер берётся только из уже принятого адресного Timeline cache, его отсутствие даёт «Сообщение», без дополнительного reader. Plain click открывает прежний Details viewer, Cmd+click использует общий `openTabById` и прежний History hydration/convergence. Physical SID/raw UUID/segment проверяются отдельно от номера и virtual view; UUID другого физического источника или неоднозначный match не заменяется соседним. GT/Voice вызывают адресный authenticated `/api/message-reference/open` только при live `messageReferenceNavigation.version:1` и совпадающем PID; dispatch не равен `found`, unknown ACK не повторяется. Это Source14.10 и domain/private HTTP checks, не подтверждение installed/3app UI; актуальная приёмка в Voice `docs/tmp/чип-ссылки-на-сообщение-terminal.md`. Codec принадлежит NT `src/shared/terminal-message-reference.mjs`; общий editor импортирует тот же источник, не отдельный parser. При malformed/unknown metadata остаётся пользовательский текст. Bare Tab ID и отдельная ID→Voice команда не относятся к ссылке на сообщение.
 - Под durable user-блоком зарезервирована компактная строка действий Copy/Rewind, которая проявляется по hover или keyboard-focus. Она остаётся в геометрии строки даже когда визуально скрыта, иначе Virtuoso переизмеряет сообщение при каждом наведении. Copy берёт только prompt; Rewind передаёт raw UUID в Timeline и проходит тот же runtime/boundary guard, что контекстное меню точки, а не поддерживает второй rollback-flow.
 - Composer по умолчанию начинает с трёх строк и растёт по переносу текста до пользовательского предела в 20 строк. И начальная высота, и предел настраиваются отдельно в `Settings → Размеры → AI-интерфейс → Поле ввода`; предел никогда не может стать меньше начальной высоты. После него высота фиксируется и появляется тонкий внутренний scrollbar, browser resize-handle намеренно отсутствует. Шрифт transcript/tool-блоков задаётся отдельно в «История», шрифт набираемого текста — в «Поле ввода».
 - Сохранённый prompt из picker всегда становится prompt-чипом независимо от длины: происхождение нужно для узнаваемого label и повторный выбор той же вариации обновляет существующий чип по stable source key. Ручной text paste становится paste-чипом только когда длиннее настраиваемого порога (по умолчанию 800 символов); одинаковые paste-чипы не дедуплицируются, потому что повторная вставка может быть намеренной.
@@ -607,11 +627,26 @@ projection History/Timeline. Исходный текст остаётся у Cop
 цвет/читаемое тело не доказывают, что текущая native-форма ещё доступна.
 
 Codex требует целый valid reserved envelope, exact `questionItemId` и связь с
-раньше записанным raw `request_user_input_async`: call ID, индекс и полный title
-должны совпасть. `:canonical:N` — индекс action, не индекс вопроса. Result
+раньше записанным raw `request_user_input_async`: call ID, индекс и title должны
+совпасть с оригиналом либо его точным native wire-вариантом. Codex0.162
+`AnsweredQuestion::new` оставляет первые ≤512 UTF-8 bytes по границе символа,
+затем заменяет каждый CR/LF пробелом; это не произвольный prefix match.
+Полные исходные title hashes по-прежнему выявляют conflicting definitions,
+даже если их сокращённые заголовки одинаковы. `:canonical:N` — индекс action,
+не индекс вопроса. Result
 `accepted:true` не заменяет пользовательский ответ. Thin certificate привязан
 к full transport hash; pairing/checkpoint сохраняют одну исходную user identity.
 Q/A текст не разбирается повторно как реальные prompt/image-вложения.
+
+Шрам17.10: native user reply SID912d3cc0 в13:30:13.889UTC содержал285chars/
+511bytes вместо исходных354chars/640bytes. Exact call/index были правильными,
+но full-title-only проверка оставляла даже saved History без proof и показывала
+сырой JSON. Общая definition теперь хранит второй compact hash native framing,
+без исходного body/нового reader. Legacy full-title reply поддерживается.
+History/Timeline conditional revision учитывает новую display schema; worker
+prepared cache уже отделяет версии по хешам загруженных parser/helper модулей.
+Это исправление распознавания, не новый цвет/CSS, не pending-question authority
+и не подтверждение доставки ответа внешнему боту.
 
 Доказанный Codex reply становится синим и в живом потоке, не только после idle
 refresh. Main сохраняет exact definition отдельно от временного tool-call cache,

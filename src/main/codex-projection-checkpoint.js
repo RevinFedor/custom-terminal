@@ -27,9 +27,9 @@ function cloneProjectionGraph(value, transform = (_key, item) => item) {
 
 const { createProjectionIdentityMap } = require('../shared/codex-rewrite-identities.cjs');
 
-// Production captures/remaps must yield as well as file I/O. Each slice copies
-// at most 1000 objects; strings stay shared. The owning projection chain keeps
-// the source state immutable for the duration of the capture.
+// Count container items as well as objects: a single huge primitive array/Map
+// also has to yield. Object.keys and one transform remain indivisible; this is
+// a work-unit budget, not a hard slice-time guarantee. Strings stay shared.
 async function cloneProjectionGraphAsync(value, transform = (_key, item) => item) {
   const seen = new Map();
   const queue = [];
@@ -49,17 +49,28 @@ async function cloneProjectionGraphAsync(value, transform = (_key, item) => item
     return result;
   };
   const result = copy(value);
+  let units = 0;
+  const pause = () => new Promise(resolve => setImmediate(resolve));
   for (let index = 0; index < queue.length; index += 1) {
     const { item, result, key, opaque } = queue[index];
     if (item instanceof Map) {
-      for (const [k, v] of item) result.set(copy(k, key, opaque), copy(v, key, opaque));
+      for (const [k, v] of item) {
+        result.set(copy(k, key, opaque), copy(v, key, opaque));
+        if (++units % 1000 === 0) await pause();
+      }
     } else if (item instanceof Set) {
-      for (const v of item) result.add(copy(v, key, opaque));
+      for (const v of item) {
+        result.add(copy(v, key, opaque));
+        if (++units % 1000 === 0) await pause();
+      }
     } else {
-      for (const k of Object.keys(item)) result[k] = copy(item[k], Array.isArray(item) ? key : k,
-        opaque || ['args', 'payload', 'diffHunks'].includes(k));
+      for (const k of Object.keys(item)) {
+        result[k] = copy(item[k], Array.isArray(item) ? key : k,
+          opaque || ['args', 'payload', 'diffHunks'].includes(k));
+        if (++units % 1000 === 0) await pause();
+      }
     }
-    if (index % 1000 === 999) await new Promise((resolve) => setImmediate(resolve));
+    if (++units % 1000 === 0) await pause();
   }
   return { value: result, approxBytes };
 }
@@ -67,19 +78,35 @@ async function cloneProjectionGraphAsync(value, transform = (_key, item) => item
 async function measureProjectionGraphBytes(value) {
   const seen = new Set();
   const pending = [value];
-  let bytes = 0;
-  let visited = 0;
+  let bytes = 0, units = 0;
+  const pause = () => new Promise(resolve => setImmediate(resolve));
   while (pending.length) {
     const item = pending.pop();
     if (!item || typeof item !== 'object') bytes += typeof item === 'string' ? 16 + item.length * 2 : 8;
     else if (!seen.has(item)) {
       seen.add(item);
       bytes += 48;
-      if (item instanceof Map) for (const [key, value] of item) pending.push(key, value);
-      else if (item instanceof Set) for (const value of item) pending.push(value);
-      else for (const key of Object.keys(item)) pending.push(item[key]);
+      // Expanding ONE giant container is work too. The byte cost and graph
+      // identity semantics are unchanged; optional checkpoint retention is not
+      // weakened just because the graph is expensive to measure.
+      if (item instanceof Map) {
+        for (const [key, value] of item) {
+          pending.push(key, value);
+          if (++units % 4000 === 0) await pause();
+        }
+      } else if (item instanceof Set) {
+        for (const value of item) {
+          pending.push(value);
+          if (++units % 4000 === 0) await pause();
+        }
+      } else {
+        for (const key of Object.keys(item)) {
+          pending.push(item[key]);
+          if (++units % 4000 === 0) await pause();
+        }
+      }
     }
-    if (++visited % 4000 === 0) await new Promise((resolve) => setImmediate(resolve));
+    if (++units % 4000 === 0) await pause();
   }
   return bytes;
 }

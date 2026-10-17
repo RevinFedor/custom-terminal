@@ -1,5 +1,8 @@
 'use strict';
 
+const { createTerminalIoProgress, observeTerminalIo } = require('./terminal-io-progress');
+const { createTerminalInputProgress, snapshotTerminalInputProgress } = require('./terminal-input-progress');
+
 const DEFAULT_TRACE_LIMIT = 48;
 const CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const SINGLE_ESC_RE = /\x1b[78]/g;
@@ -59,10 +62,14 @@ function countChar(text, wanted) {
   return count;
 }
 
-function createTerminalRedrawTrace(limit = DEFAULT_TRACE_LIMIT) {
+function createTerminalRedrawTrace(limit = DEFAULT_TRACE_LIMIT, diagnosticOptions = {}) {
   return {
     limit: Math.max(8, Number(limit) || DEFAULT_TRACE_LIMIT),
     entries: [],
+    entriesDropped: 0,
+    controlsOmitted: 0,
+    ioProgress: createTerminalIoProgress(diagnosticOptions),
+    inputProgress: createTerminalInputProgress(diagnosticOptions),
     ansiCarry: '',
     cursorVisible: null,
     cursorVisibilitySeq: null,
@@ -80,6 +87,7 @@ function recordTerminalOutput(trace, data, meta = {}) {
   if (!trace || !data) return null;
   const text = String(data);
   const combined = String(trace.ansiCarry || '') + text;
+  const progressContext = observeTerminalIo(trace, 'output', text, meta.seq);
   const controls = [];
   for (const match of combined.matchAll(CSI_RE)) {
     const sequence = match[0];
@@ -92,6 +100,7 @@ function recordTerminalOutput(trace, data, meta = {}) {
       trace.synchronizedOutputOpen = kind === 'synchronized-output-begin';
       trace.synchronizedOutputSeq = meta.seq ?? null;
       trace.synchronizedOutputGeneration = Number(trace.synchronizedOutputGeneration || 0) + 1;
+      observeTerminalIo(trace, 'control', kind, progressContext);
     } else if (kind === 'alternate-screen-enter' || kind === 'alternate-screen-exit') {
       trace.alternateScreen = kind === 'alternate-screen-enter';
     }
@@ -116,12 +125,15 @@ function recordTerminalOutput(trace, data, meta = {}) {
     controls: controls.slice(-16),
     before: meta.before || null,
   };
+  trace.controlsOmitted = Number(trace.controlsOmitted || 0) + Math.max(0, controls.length - 16);
+  trace.entriesDropped = Number(trace.entriesDropped || 0) + Math.max(0, trace.entries.length + 1 - trace.limit);
   boundedPush(trace.entries, entry, trace.limit);
   return entry;
 }
 
 function recordTerminalFlush(trace, meta = {}) {
   if (!trace) return;
+  observeTerminalIo(trace, 'flush', meta.seq);
   trace.lastFlush = {
     at: Number(meta.at) || Date.now(),
     seq: meta.seq ?? null,
@@ -165,6 +177,14 @@ function recordTerminalResize(trace, cols, rows, meta = {}) {
 function snapshotTerminalRedrawTrace(trace, count = 16) {
   if (!trace) return null;
   return {
+    ioProgress: observeTerminalIo(trace, 'snapshot'),
+    inputProgress: snapshotTerminalInputProgress(trace),
+    inputProgressHookErrors: Number(trace.inputProgressHookErrors || 0),
+    progressHookErrors: Number(trace.progressHookErrors || 0),
+    entriesDropped: Number(trace.entriesDropped || 0),
+    controlsOmitted: Number(trace.controlsOmitted || 0),
+    entriesOmittedAtSnapshot: Math.max(0, trace.entries.length - Math.max(1, Number(count) || 16)),
+    legacyBytesUnit: 'UTF-16 code units (string.length); see ioProgress for re-encoded byte counts',
     cursorVisible: trace.cursorVisible,
     cursorVisibilitySeq: trace.cursorVisibilitySeq,
     synchronizedOutputOpen: trace.synchronizedOutputOpen === true,

@@ -279,3 +279,42 @@ test('Codex raw observer receives exact canonical and tool boundaries without a 
   assert.deepEqual(live, [], 'CodexTurn remains the only live-row publisher');
   assert.deepEqual(rendered, [], 'raw preview receipts never become renderer live rows');
 });
+
+test('Codex raw tickets come from complete actual FD bytes, including short reads and split UTF-8', async t => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-raw-ticket-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'synthetic.jsonl');
+  const text = 'complete 😀 canonical';
+  const bytes = Buffer.from(JSON.stringify({ type: 'response_item', payload: {
+    type: 'message', role: 'assistant', id: 'I', content: [{ type: 'output_text', text }],
+  } }) + '\n');
+  const split = bytes.indexOf(Buffer.from('😀')) + 2;
+  await fs.promises.writeFile(filePath, bytes.subarray(0, split));
+  const observed = [];
+  const service = new SessionTranscriptService({ onRawRecord: d => observed.push(d), claudeData: null, codexData: null });
+  const stat = await fs.promises.stat(filePath);
+  const state = { key: 'fixture', filePath, size: split, offset: 0, leftover: '',
+    fileIdentity: `${stat.dev}:${stat.ino}`, sourceRewriteVersion: 0, sessionId: 'physical',
+    consumers: new Map([['test', { tabId: 'T' }]]) };
+  service.sessions.set(state.key, state);
+  const originalOpen = fs.promises.open;
+  fs.promises.open = async (...args) => {
+    const fd = await originalOpen(...args);
+    return { stat: () => fd.stat(), close: () => fd.close(),
+      read: (buffer, offset, length, position) => fd.read(buffer, offset, Math.min(3, length), position) };
+  };
+  try {
+    await service._broadcastCodexDelta(state, 0);
+    assert.equal(observed.length, 0);
+    await fs.promises.appendFile(filePath, bytes.subarray(split)); state.size = bytes.length;
+    await service._broadcastCodexDelta(state, split);
+  } finally { fs.promises.open = originalOpen; }
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].message.payload.content[0].text, text);
+  assert.equal(observed[0].sourceTicket.start, 0);
+  assert.equal(observed[0].sourceTicket.end, bytes.length);
+  assert.equal(observed[0].sourceTicket.isCurrent(), true);
+  state.sourceRewriteVersion++;
+  assert.equal(observed[0].sourceTicket.isCurrent(), false);
+  assert.equal(state.offset, bytes.length);
+});

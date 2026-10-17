@@ -100,6 +100,7 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
       promptHash: promptAuditFingerprint(prompt), promptLength: prompt.length });
   }
   context = vm.createContext({
+    historyMutationInput: require('./history-mutation-input').createHistoryMutationInputGate(),
     ...require('./agent-history-send-receipt'),
     ...require('./prompt-queue-source'),
     ...require('./claude-prompt-audit'),
@@ -113,6 +114,7 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     console: { log() {}, warn() {}, error() {} },
     _webBroadcast() {},
     CODEX_PASTE_AUDIT_TIMEOUT_MS: 15, CLAUDE_PASTE_AUDIT_TIMEOUT_MS: 15,
+    CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000,
     AGENT_SEND_DURABLE_STATES: STORE_STATES,
     PASTE_START: '\x1b[200~', PASTE_END: '\x1b[201~',
     terminals: new Map([[tabId, term]]), terminalCommandState: commands,
@@ -197,6 +199,14 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     vm.runInContext(node.getText(ast), context);
   }
   vm.runInContext(declaration('withPtyWriteLock'), context);
+  // Include the actual deadline receipt; this target/queue fixture has no
+  // timed cold launch, but must not stub away the wrapper's ownership fence.
+  for (const name of ['codexSendStartupFrameWaits', 'captureCodexSendStartupFrameWait',
+    'codexSendStartupFrameWaitIsCurrent', 'clearCodexSendStartupFrameWait']) {
+    const node = ast.statements.find(item => (ts.isFunctionDeclaration(item) && item.name?.text === name)
+      || (ts.isVariableStatement(item) && item.declarationList.declarations.some(d => d.name.getText(ast) === name)));
+    if (node) vm.runInContext(node.getText(ast), context); // legacy ASAR has no such caller
+  }
   for (const name of ['getTerminalInputRevision', 'bumpTerminalInputRevision', 'findTabIdForTerm',
     'getTerminalStopRevision', 'captureAgentInputIdentity', 'agentSendExecutionFailure',
     'markActivePtySubmit', 'pasteAuditHash', 'pasteAuditPreview', 'captureCodexPtySubmitAdmission',

@@ -6,6 +6,7 @@ import ts from 'typescript';
 import { resolvePtyAgentOwner } from './ptyAgentOwner.mjs';
 import { withAgentLaunchAdmission } from './agentLaunchAdmission.mjs';
 import { planCodexLaunchSettingsPersistence } from './codexEffectiveSettings.mjs';
+import { planCarriedCodexSettingsProofApplication } from './codexSessionAdoption.mjs';
 
 // Selected actual Store/adapter/source-check functions. IPC, materialization
 // ACK timing and accepted-writer proof are controlled, not provider evidence.
@@ -33,6 +34,7 @@ function fixture(sessionId = 'S') {
   const env = { exports: {}, console: { log() {}, warn() {} }, AbortController, resolvePtyAgentOwner, withAgentLaunchAdmission,
     get: () => store, set: () => { for (const fn of subscribers) fn(); },
     projectCodexSettingsProofOwner: () => null, maybeArmPendingAutoTabTitle() {}, clearPendingAutoTabTitle() {},
+    planCarriedCodexSettingsProofApplication,
     saveTabsThenNotifyProjectLayoutChanged: () => history.push(tab.codexSessionId),
     useWorkspaceStore: { getState: () => store }, projectId: 'P', tabId: 'T', engine: 'codex', cwd: '/fixture',
     controller: new AbortController(), sourceSessionId: sessionId, sessionReconciliation: null,
@@ -44,6 +46,55 @@ function fixture(sessionId = 'S') {
   store.setCodexSessionId = env.actualSetSession;
   return { env, tab, store, subscribers, history };
 }
+
+for (const sameSid of [false, true]) test('actual Store late carried source A preserves child B selection; sameSID=' + sameSid, async () => {
+  const f = fixture(sameSid ? 'C' : null);
+  Object.assign(f.tab, { codexModel: 'B', codexEffort: 'high', codexSettingsProofAt: 200,
+    providerState: { codexSettingsIntentRevision: 2, codexSettingsIntentModel: 'B', codexSettingsIntentEffort: 'high' } });
+  assert.equal(await f.store.setCodexSessionId('T', 'C', 'detected', { codexSettingsProof: { model: 'A', effort: 'max', proofAt: 100 } }), true);
+  assert.equal(f.tab.codexSessionId, 'C'); assert.equal(f.tab.codexModel, 'B'); assert.equal(f.tab.codexEffort, 'high');
+  assert.equal(f.tab.codexSettingsProofAt, 200);
+  // A real newer proof for B is accepted independently of the selected label.
+  await f.store.setCodexSessionId('T', 'C', 'detected', { codexSettingsProof: { model: 'B', effort: 'high', proofAt: 300 } });
+  assert.equal(f.tab.codexSettingsProofAt, 300); assert.equal(f.tab.codexSettingsProofSessionId, 'C');
+});
+
+test('queued child choice is not converted into applied source settings on SAME SID', async () => {
+  const f = fixture('C');
+  Object.assign(f.tab, { codexModel: 'A', codexEffort: 'max', providerState: {
+    codexSettingsIntentRevision: 2, codexSettingsIntentModel: 'B', codexSettingsIntentEffort: 'high' } });
+  await f.store.setCodexSessionId('T', 'C', 'detected', { codexSettingsProof: { model: 'A', effort: 'max', proofAt: 100 } });
+  assert.equal(f.tab.providerState.codexSettingsIntentModel, 'B');
+  assert.equal(f.tab.codexSettingsProofAt, undefined, 'late source A cannot settle desired B or erase its pending state');
+  assert.equal(f.tab.providerState.codexSettingsIntentAppliedRevision, undefined);
+});
+
+test('actual Store rereads child choice after awaited binding CAS, not captured before await', async () => {
+  const f = fixture('S');
+  Object.assign(f.tab, { codexModel: 'A', codexEffort: 'max' });
+  let release, enter;
+  const atCommit = new Promise(resolve => { enter = resolve; });
+  f.env.prepareHistoryRewriteSnapshot = async () => null;
+  f.env.commitCodexSessionId = () => new Promise(resolve => { release = resolve; enter(); });
+  f.env.saveTabs = async () => ({ success: true }); f.env.notifyProjectLayoutChanged = () => {};
+  const action = f.store.setCodexSessionId('T', 'C', 'editRange', { codexSettingsProof: { model: 'A', effort: 'max', proofAt: 100 } });
+  await atCommit;
+  Object.assign(f.tab, { codexModel: 'B', codexEffort: 'high', providerState: {
+    codexSettingsIntentRevision: 1, codexSettingsIntentModel: 'B', codexSettingsIntentEffort: 'high' } });
+  release(); assert.equal(await action, true);
+  assert.equal(f.tab.codexModel, 'B'); assert.equal(f.tab.codexEffort, 'high');
+  assert.equal(f.tab.codexSettingsProofAt, undefined, 'desired B is not fabricated application proof');
+});
+
+test('a closed/replaced child during awaited binding is not resurrected by settings hydration', async () => {
+  const f = fixture('S'); let release, enter;
+  const atCommit = new Promise(resolve => { enter = resolve; });
+  f.env.prepareHistoryRewriteSnapshot = async () => null;
+  f.env.commitCodexSessionId = () => new Promise(resolve => { release = resolve; enter(); });
+  const action = f.store.setCodexSessionId('T', 'C', 'editRange', { codexSettingsProof: { model: 'A', effort: 'max', proofAt: 100 } });
+  await atCommit; f.store.openProjects.get('P').tabs.delete('T'); release();
+  assert.equal(await action, false); assert.equal(f.tab.codexSessionId, 'S');
+});
 
 test('R3 gate: actual Store own writer adoption may retire interruption but must still join the exact admitted launch', async () => {
   const f = fixture(); let joins = 0;

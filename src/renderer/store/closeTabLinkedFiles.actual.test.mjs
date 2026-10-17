@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {newerWorkflowGroups} from '../utils/workflowGroupClient.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,6 +15,7 @@ import * as spaces from '../utils/workspaceSpacesModel.mjs';
 import { dropFromMru } from '../utils/tabSwitcherModel.mjs';
 import * as persistence from '../utils/tabPersistenceTransactions.mjs';
 import { stopAiBeforeTerminalKill } from '../utils/terminalCloseLifecycle.mjs';
+import {beginTabCloseFeedback} from '../utils/tabCloseFeedback.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
 import {createExecutionRevisionAcks} from '../utils/executionRevisionAcks.mjs';
 import { collectTabLinkedFiles } from '../utils/tabLinkedFiles.mjs';
@@ -112,7 +114,10 @@ function fixture(t, { foreign = false, count = 2 } = {}) {
   const saveHandler = vm.runInContext('(' + mainSave.arguments[1].getText(mainTree) + ')', mainContext);
   const ipc = { send: (channel, id) => calls.push([channel, id]), invoke: async (channel, args) => {
     calls.push(channel);
-    if (channel === 'terminal:getCommandState') return { isRunning: false };
+    if (channel === 'terminal:getCommandState') {
+      if (state.commandStateGate) await state.commandStateGate;
+      return {isRunning: false};
+    }
     if (channel === 'project:validate-tab-snapshot') return { success: !state.failPreflight };
     if (channel === 'project:archive-tab') return state.failArchive
       ? { success: false, error: 'fixture-archive-refusal' } : { success: true, historyId:state.realArchive
@@ -129,8 +134,8 @@ function fixture(t, { foreign = false, count = 2 } = {}) {
     if (channel === 'orchestration:tab-closed') return { success: true };
     throw Error('unexpected IPC: ' + channel);
   } };
-  const context = vm.createContext({ ...placement, ...panes, ...spaces, ...persistence, collectTabLinkedFiles,isExactGroupCloseGuard,
-    dropFromMru, stopAiBeforeTerminalKill, createProjectTabSaveQueue,createExecutionRevisionAcks,createWorkflowRelationReceipts,
+  const context = vm.createContext({ ...placement, ...panes, ...spaces, ...persistence, collectTabLinkedFiles,isExactGroupCloseGuard,newerWorkflowGroups,
+    dropFromMru, stopAiBeforeTerminalKill, beginTabCloseFeedback, createProjectTabSaveQueue,createExecutionRevisionAcks,createWorkflowRelationReceipts,
     projectTabSaveQueue: createProjectTabSaveQueue(), projectTabSaveRevisions: new Map(),
     get: () => state, set: patch => Object.assign(state, patch), startTransition: fn => fn(),
     useWorkspaceStore:{getState:()=>state},organizationProjection,reconcileWorkflowOrder,INBOX_WORKFLOW_ID:'__noted_workflow_inbox__',
@@ -166,6 +171,17 @@ function fixture(t, { foreign = false, count = 2 } = {}) {
     reopenDb: () => { manager.close(); manager = new DatabaseManager({ existingConnection: new SQLite(dbFile) });api=createWorkflowOrganizationApi({database:manager}); },
     fileBytes: () => fs.readFileSync(diskFile, 'utf8') };
 }
+
+test('actual close publishes feedback before its first awaited runtime read and clears preflight refusal', async t => {
+  const f=fixture(t);let release;f.state.commandStateGate=new Promise(resolve=>{release=resolve;});f.state.failPreflight=true;
+  const owner=f.ws.tabs.get('owner'),closing=f.state.closeTab(f.p,'owner');assert.equal(owner.aiClosing,true,'visible intent before any async runtime result');
+  const neighbour={projectId:'parallel',tabs:new Map()};f.state.openProjects=new Map([...f.state.openProjects,['parallel',neighbour]]);
+  release();assert.equal(await closing,false);assert.equal(owner.aiClosing,false);assert.strictEqual(f.state.openProjects.get('parallel'),neighbour);assert.strictEqual(f.ws.tabs.get('owner'),owner);assert.equal(f.calls.includes('project:archive-tab'),false);
+});
+
+test('actual close clears feedback when the first runtime read rejects', async t => {
+  const f=fixture(t);let reject;f.state.commandStateGate=new Promise((_,r)=>{reject=r;});const owner=f.ws.tabs.get('owner'),closing=f.state.closeTab(f.p,'owner');assert.equal(owner.aiClosing,true);reject(Error('controlled runtime read failure'));await assert.rejects(closing,/controlled runtime read failure/);assert.equal(owner.aiClosing,false);assert.strictEqual(f.ws.tabs.get('owner'),owner);assert.equal(f.calls.includes('project:archive-tab'),false);
+});
 
 test('actual common close removes direct file links, preserves AI children/their files and disk bytes', async t => {
   const f = fixture(t);

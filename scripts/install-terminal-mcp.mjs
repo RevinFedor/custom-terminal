@@ -11,6 +11,7 @@ const REQUIRED_ENV_VARS = [
   'NOTED_PARENT_PROJECT_ID',
   'NOTED_PARENT_TAB_ID',
   'NOTED_DISCOVERY_DIR',
+  'NOTED_MCP_INSTANCE_ROUTE',
 ];
 const SOURCE_FILES = ['terminal-server.mjs', 'terminal-start-ai-request.mjs', 'terminal-prompt-catalog.mjs'];
 
@@ -80,6 +81,12 @@ export function updateClaudeConfig(source, serverPath) {
   // session back to per-session stdio copies of the server.
   if (previous && typeof previous === 'object'
       && (previous.type === 'http' || typeof previous.url === 'string')) {
+    if (typeof previous.url === 'string'
+      && /^http:\/\/127\.0\.0\.1:53133\/mcp\/terminal(?:\?|$)/.test(previous.url)
+      && !/[?&]instanceRoute=/.test(previous.url)) {
+      previous.url += (previous.url.includes('?') ? '&' : '?') + 'instanceRoute=${NOTED_MCP_INSTANCE_ROUTE:-}';
+      return JSON.stringify(parsed, null, 2) + '\n';
+    }
     return source;
   }
   parsed.mcpServers = parsed.mcpServers && typeof parsed.mcpServers === 'object'
@@ -96,6 +103,10 @@ export function updateClaudeConfig(source, serverPath) {
 
 async function atomicWrite(filePath, content, { backup = true, mode = null } = {}) {
   await mkdir(dirname(filePath), { recursive: true });
+  if (mode == null) {
+    try { mode = (await stat(filePath)).mode & 0o777; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; mode = 0o600; }
+  }
   if (backup && existsSync(filePath)) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     await copyFile(filePath, `${filePath}.bak-${stamp}`);

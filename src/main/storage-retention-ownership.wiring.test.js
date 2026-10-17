@@ -15,7 +15,9 @@ test('isolated userData keeps canonical production authority and cannot own auto
   assert.match(mainSource, /getStorageMutationAuthority[\s\S]*canonical-production-db-unavailable/);
   assert.match(mainSource, /getStorageMutationAuthority[\s\S]*e2e-storage-mutation-disabled/);
   assert.match(mainSource, /function scheduleStorageRetentionSweep[\s\S]*canOwnAutomaticStorageRetention/);
-  assert.match(mainSource, /auditPath: path\.join\(canonicalNotedUserDataDir, 'storage-deletion-audit\.jsonl'\)/);
+  assert.match(mainSource, /auditPath: path\.join\(ownsIsolatedStorageProfile\(\) \? app\.getPath\('userData'\) : canonicalNotedUserDataDir, 'storage-deletion-audit\.jsonl'\)/);
+  assert.match(mainSource, /isolatedTest: ownsIsolatedStorageProfile\(\)/);
+  assert.match(mainSource, /mutationRoot: ownsIsolatedStorageProfile\(\) \? isolatedStorageProfile\.root : null/);
 });
 
 test('dashboard deletion passes one operation id into main-owned audit and progress', () => {

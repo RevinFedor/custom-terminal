@@ -123,11 +123,19 @@ async function harness(options = {}) {
   const events = [];
   const executions = [];
   const rows = new Map();
+  let receiptWriteFailed = false;
   const db = { getAppState: key => rows.has(key) ? clone(rows.get(key)) : null,
-    setAppState: (key, value) => rows.set(key, clone(value)), db: { transaction: fn => fn } };
+    setAppState: (key, value) => {
+      if (options.failRewrittenReceipt && value.phase === 'rewritten' && !receiptWriteFailed) {
+        receiptWriteFailed = true;
+        throw Error('fixture receipt persistence failure AFTER commit');
+      }
+      rows.set(key, clone(value));
+    }, db: { transaction: fn => fn } };
   const state = { terminalToken: {}, projectId: 'project', cwd: '/fixture', lifecycleGeneration: 'life-1',
     runSeq: 3, inputRevision: 7, launchId: options.stopped ? null : 'old-launch',
-    sessionId: source.sessionId, toolType: 'codex', isRunning: !options.stopped, stopping: false };
+    sessionId: source.sessionId, toolType: 'codex', isRunning: !options.stopped, stopping: false,
+    inputReady: !options.stopped, inputOwnerLaunchId: options.stopped ? null : 'old-launch' };
   const tab = { id: 'tab-A', cwd: '/fixture' };
   let registry, settled;
   const done = new Promise(resolve => { settled = resolve; });
@@ -151,12 +159,24 @@ async function harness(options = {}) {
   const ui = { historyPromptDrafts: { 'tab-A': 'unrelated desktop draft' }, historyPromptDraftChips: {}, historyPromptDraftImages: {},
     setHistoryPromptDraft: (...args) => events.push(['desktop-draft-write', ...args]) };
   const launchTab = {};
+  const inputGate = require('./history-mutation-input').createHistoryMutationInputGate({
+    capture: () => ({ ...state }), readSendBusy: () => options.sendBusy?.() ?? false,
+    wake: tabId => options.inputWake?.(tabId), log: { log() {} },
+    readInputBoundary: async () => {
+      const version = JSON.stringify([state.sessionId, state.launchId, state.runSeq, state.inputRevision, state.inputReady, state.isRunning]);
+      return { known: true, ownerStable: true,
+        isCurrent: () => version === JSON.stringify([state.sessionId, state.launchId, state.runSeq, state.inputRevision, state.inputReady, state.isRunning]),
+        processStatus: state.isRunning ? 'found' : 'absent', inputReady: state.inputReady,
+        status: !state.isRunning ? 'inactive' : state.inputReady ? 'active' : 'starting' };
+    },
+  });
   const workspace = { openProjects: new Map([['project', { tabs: new Map([['tab-A', launchTab]]) }]]),
     setCodexSessionId: async (_tab, sessionId, _reason, settings) => {
     events.push(['adopt', sessionId, settings]);
     if (options.failAdopt) throw Error('binding transaction failed');
     if (settings.historyOperation) registry.commitCodexBinding({ ...settings.historyOperation, sessionId }, () => { state.sessionId = sessionId; });
     else state.sessionId = sessionId;
+    if (settings.historyInput) inputGate.bound(settings.historyInput, sessionId);
     if (settings.codexSettingsProof) Object.assign(launchTab, {
       codexModel: settings.codexSettingsProof.model, codexEffort: settings.codexSettingsProof.effort,
       codexSettingsProofAt: settings.codexSettingsProof.proofAt,
@@ -166,6 +186,8 @@ async function harness(options = {}) {
   } };
   const ipc = { invoke: async (channel, args) => {
     events.push([channel, args]);
+    if (channel === 'history-mutation:begin') return inputGate.reserve(args);
+    if (channel === 'history-mutation:finish') return inputGate.finish(args);
     if (channel === 'saved-history:get') return registry.read(args.tabId, args.operationId);
     if (channel === 'saved-history:step') return registry.step(args);
     if (channel === 'agent-transcript:get-timeline') return transcript.getTimeline(args);
@@ -174,21 +196,27 @@ async function harness(options = {}) {
     if (channel === 'terminal:stop-ai-process') {
       if (options.beforeStop) await options.beforeStop(state, source);
       registry.validateStop(args.authority);
-      state.isRunning = false; state.launchId = null;
+      state.isRunning = false; state.launchId = null; state.inputOwnerLaunchId = null; state.inputReady = false;
       events.push(['signal', 'SIGTERM']);
       return { success: true };
     }
     if (channel === 'codex:reconcile-native-rewind-before-history-rewrite') return { success: !options.pendingNative, error: 'native unresolved' };
     if (channel === 'codex:run-command') {
       if (options.beforeResume) options.beforeResume(state);
-      registry.validateResume(args.historyOperation, 'claim', { sessionId: args.sessionId });
-      state.runSeq++; state.lifecycleGeneration = 'life-' + state.runSeq; state.isRunning = true; state.launchId = 'resume-exact';
-      registry.validateResume(args.historyOperation, 'claimed', { sessionId: args.sessionId, launchId: state.launchId });
-      if (options.beforeLaunchWrite) options.beforeLaunchWrite(state);
-      registry.validateResume(args.historyOperation, 'write', { sessionId: args.sessionId, launchId: state.launchId });
-      events.push(['launch-write', args.sessionId]);
-      return { ...createCodexLaunchPendingResult({ tabId: 'tab-A', launchId: state.launchId,
-        command: 'codex-c', resumeSourceSessionId: args.sessionId }), lifecycleGeneration: state.lifecycleGeneration };
+      inputGate.authorizeResume(args.historyInput, args);
+      return inputGate.run(args.historyInput, async () => {
+        registry.validateResume(args.historyOperation, 'claim', { sessionId: args.sessionId });
+        state.runSeq++; state.lifecycleGeneration = 'life-' + state.runSeq; state.isRunning = true;
+        state.launchId = 'resume-exact'; state.inputOwnerLaunchId = state.launchId;
+        registry.validateResume(args.historyOperation, 'claimed', { sessionId: args.sessionId, launchId: state.launchId });
+        if (options.beforeLaunchWrite) options.beforeLaunchWrite(state);
+        registry.validateResume(args.historyOperation, 'write', { sessionId: args.sessionId, launchId: state.launchId });
+        inputGate.claimLaunch(args.historyInput, state.launchId, state.runSeq);
+        events.push(['launch-write', args.sessionId]);
+        state.inputReady = options.deferReady !== true;
+        return { ...createCodexLaunchPendingResult({ tabId: 'tab-A', launchId: state.launchId,
+          command: 'codex-c', resumeSourceSessionId: args.sessionId }), lifecycleGeneration: state.lifecycleGeneration };
+      });
     }
     throw Error('unexpected channel ' + channel);
   } };
@@ -208,6 +236,9 @@ async function harness(options = {}) {
   const owner = new ConversationOwners({ db, instanceId: 'fixture', capture: () => ({ known: true, provider: 'codex',
     sessionId: state.sessionId, projectId: state.projectId, cwd: state.cwd, instanceId: 'fixture', terminalId: 'pty', launchId: state.launchId }) });
   registry = new SavedHistoryOperations({ db, transcript, runtime: { owner,
+    reserveInput: request => inputGate.reserve(request), finishInput: proof => inputGate.finish(proof),
+    assertInput: proof => inputGate.assert(proof.tabId, proof, { action: 'mutation' }),
+    bindInput: (proof, sid) => inputGate.bound(proof, sid), runInput: (proof, fn) => inputGate.run(proof, fn),
     capture: () => ({ ...state }), inspectDraft: () => ({ hasDraft: options.foreignDraft ?? false }),
   }, resolveSession: async () => ({ sessionId: state.sessionId, toolType: 'codex', cwd: '/fixture' }),
   dispatch: async (action, payload) => {
@@ -220,7 +251,7 @@ async function harness(options = {}) {
     }
     return execution;
   }, deleteRange: async args => {
-    if (options.beforeMutation) await options.beforeMutation(state, source);
+    if (options.beforeMutation) await options.beforeMutation(state, source, inputGate);
     if (options.failRewrite) throw Error('controlled rewrite failure');
     return codex.deleteCodexRange(options.legacySuffix ? { ...args, toPhysicalEnd: false } : args);
   }, inspectRepair: codex.inspectCodexSavedRewindRepair, hashRecords: codex.codexRepairRecordsHash,
@@ -268,7 +299,7 @@ async function harness(options = {}) {
     return { status: r.status, ...(await r.json()) };
   };
   const close = () => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); });
-  return { source, events, state, registry, request, post, done, close, db, transcript, forkEvents, inbox, inboxOptions, launchTab, ui,
+  return { source, events, state, registry, request, post, done, close, db, transcript, forkEvents, inbox, inboxOptions, launchTab, ui, inputGate,
     finish: () => executions.at(-1),
     get: async () => { const r = await fetch(base + '/' + request.operationId); return { status: r.status, ...(await r.json()) }; } };
 }
@@ -608,7 +639,7 @@ for (const [name, options] of Object.entries({
   });
 }
 
-test('adoption failure reports preserved child evidence, keeps source binding and restores source once', async () => {
+test('adoption failure preserves committed child/draft and never auto-resumes the incumbent', async () => {
   const h = await harness({ failAdopt: true });
   try {
     await h.post(); await h.done;
@@ -618,7 +649,30 @@ test('adoption failure reports preserved child evidence, keeps source binding an
     assert.equal(operation.bindingCommitted, false);
     assert.equal(h.state.sessionId, h.source.sessionId);
     assert.ok(operation.draft);
-    assert.equal(h.events.filter(e => e[0] === 'launch-write').length, 1);
+    assert.ok(operation.newSessionId);
+    assert.equal(h.state.isRunning, false);
+    assert.equal(h.events.filter(e => e[0] === 'launch-write').length, 0);
+  } finally { await h.close(); }
+});
+
+test('actual COW commit survives a receipt-write exception as data through HTTP/App/executor, without source Resume', async () => {
+  const h = await harness({ failRewrittenReceipt: true });
+  try {
+    await h.post(); await h.done;
+    const { operation } = await h.get();
+    assert.equal(operation.success, false);
+    assert.match(operation.error, /receipt persistence failure AFTER commit/);
+    assert.equal(operation.historyMutated, true);
+    assert.equal(operation.bindingCommitted, false);
+    assert.ok(operation.newSessionId);
+    assert.ok(operation.draft?.text);
+    assert.equal(h.forkEvents.has(operation.newSessionId), true, 'lineage was actually committed');
+    const child = await codex.loadSessionRecords(operation.newSessionId, '/fixture');
+    assert.deepEqual(codex.buildCodexTimeline(child.records, operation.newSessionId).filter(e => e.type === 'user').map(e => e.content), ['keep']);
+    assert.equal(h.state.sessionId, h.source.sessionId);
+    assert.equal(h.events.filter(e => e[0] === 'launch-write').length, 0);
+    assert.deepEqual(await fs.promises.readFile(h.source.filePath), h.source.bytes);
+    assert.equal((await h.post()).operation.idempotent, true);
   } finally { await h.close(); }
 });
 
@@ -714,4 +768,74 @@ test('changed frozen ancestor fails before child write or adoption', async () =>
     assert.equal(operation.historyMutated, false);
     assert.equal(operation.bindingCommitted, false);
   } finally { await h.close(); }
+});
+
+for (const deferReady of [false, true]) test('actual HTTP/App/Rewind/COW + SQLite FIFO retains concurrent Send until input-ready, deferReady=' + deferReady, async () => {
+  const Database = require('better-sqlite3');
+  const { AgentSendQueue } = require('./agent-send-queue');
+  const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
+  const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry');
+  const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
+  const tick = () => new Promise(resolve => setImmediate(resolve));
+  let queue, h;
+  const attempts = [];
+  h = await harness({ afterCompactTail: true, deferReady,
+    sendBusy: () => queue?.hasUnsettledInput('tab-A') ?? false,
+    inputWake: tabId => queue?.wake(tabId),
+    beforeMutation: async state => {
+      assert.equal(state.isRunning, false, 'real executor already passed Stop');
+      for (const surface of ['desktop-history', 'tab-message']) {
+        const request = { tabId: 'tab-A', provider: 'codex', handoffId: surface,
+          prompt: 'do not silently retarget ' + surface, sendOperationKey: 'history:tab-A:' + surface,
+          expectedTarget: { toolType: 'codex', sessionId: h.source.sessionId } };
+        const identity = { operationKey: request.sendOperationKey, tabId: 'tab-A', provider: 'codex', surface,
+          handoffId: surface, sessionId: h.source.sessionId, requestFingerprint: fingerprintAgentSendRequest(request),
+          promptHash: fingerprintAgentSendRequest(request.prompt), promptLength: request.prompt.length };
+        assert.equal(queue.enqueue({ request, identity }).receipt.applicationQueued, true);
+      }
+      await tick(); await tick();
+      assert.equal(attempts.length, 0, 'neither concurrent Send can launch Resume into the stopped incumbent');
+      assert.equal(h.events.filter(e => e[0] === 'launch-write').length, 0);
+    },
+  });
+  const db = new Database(':memory:'), store = createAgentSendReceiptStore(db);
+  queue = new AgentSendQueue({ store, admit: request => !h.inputGate.held(request.tabId),
+    claimDispatch: request => h.inputGate.claimSend(request.tabId), execute: request => {
+      const failure = agentSendTargetPreconditionFailure(request.expectedTarget,
+        { toolType: 'codex', sessionId: h.state.sessionId });
+      attempts.push({ request, failure });
+      return failure || { submitted: false, code: 'unexpected-input-admission' };
+    } });
+  try {
+    assert.equal((await h.post()).status, 202);
+    await h.done; await tick(); await tick(); await tick();
+    const { operation } = await h.get();
+    assert.equal(operation.success, true, JSON.stringify(operation));
+    assert.equal(operation.bindingCommitted, true);
+    assert.equal(h.events.filter(e => e[0] === 'launch-write').length, 1, 'only owned child Resume');
+    assert.deepEqual(h.events.filter(e => e[0] === 'launch-write').map(e => e[1]), [operation.newSessionId]);
+    if (deferReady) {
+      assert.equal(h.inputGate.read('tab-A').phase, 'awaiting-input');
+      assert.equal(attempts.length, 0, 'launch-written and completed are not input-ready');
+      for (const id of ['desktop-history', 'tab-message']) {
+        assert.equal(queue.item('history:tab-A:' + id).state, 'waiting');
+        assert.equal(store.get('history:tab-A:' + id).attemptId, null);
+      }
+      h.state.inputReady = true;
+      await h.inputGate.notify('tab-A');
+      await tick(); await tick(); await tick();
+    }
+    assert.equal(attempts.length, 2);
+    for (const { request, failure } of attempts) {
+      assert.equal(failure?.code, 'agent_send_target_changed');
+      assert.equal(store.get(request.sendOperationKey).attemptId, null);
+      assert.equal(JSON.parse(queue.item(request.sendOperationKey).request_json).expectedTarget.sessionId, h.source.sessionId);
+    }
+    const history = await h.transcript.getHistory({ sessionId: operation.newSessionId, toolType: 'codex', cwd: '/fixture' });
+    assert.equal(history.success, true);
+    assert.equal(JSON.stringify(history.entries).includes('orphan-future-final'), false);
+    assert.deepEqual(await fs.promises.readFile(h.source.filePath), h.source.bytes);
+    assert.equal(h.inputGate.held('tab-A'), false);
+    assert.equal((await h.post()).operation.idempotent, true, 'same operation re-read cannot allocate/rewrite again');
+  } finally { queue.dispose(); await tick(); db.close(); await h.close(); }
 });

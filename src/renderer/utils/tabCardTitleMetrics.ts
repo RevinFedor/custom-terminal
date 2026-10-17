@@ -4,7 +4,7 @@ import {useLayoutEffect,useState,type RefObject} from 'react';
 // create different card heights within the same strip/sidebar.
 export const TAB_TITLE_GLYPHS='HРрgjpqy';
 type FontProfile={ascent:number;descent:number;baseline:number;lineHeight:number};
-type FontCache={profiles:Map<string,FontProfile>;context?:CanvasRenderingContext2D;defaultFont?:string};
+type FontCache={profiles:Map<string,FontProfile>;context?:CanvasRenderingContext2D;defaultFont?:string;assignedFont?:string};
 const caches=new WeakMap<Document,FontCache>();
 
 function fontProfile(element:HTMLElement):FontProfile|null {
@@ -14,22 +14,27 @@ function fontProfile(element:HTMLElement):FontProfile|null {
   const font=style.font||[style.fontStyle,style.fontWeight,style.fontSize,style.fontFamily].join(' ');
   const key=font+'|'+style.lineHeight;
   let cache=caches.get(doc);
-  if(!cache){cache={profiles:new Map()};caches.set(doc,cache);doc.fonts?.addEventListener('loadingdone',()=>cache!.profiles.clear());}
+  if(!cache){cache={profiles:new Map()};caches.set(doc,cache);doc.fonts?.addEventListener('loadingdone',()=>{cache!.profiles.clear();cache!.assignedFont=undefined;});}
   // The glyphs still get fresh metrics on every measurement. Only the private
   // canvas/context is reused, avoiding one new canvas per retained title/RO.
-  // Explicitly set font again so font loading and inherited font changes keep
-  // the same refresh path. A lost/unavailable context can recover next time.
+  // Font loading and inherited font changes invalidate the assignment. A
+  // repeated identical font needs no native reset on this private context;
+  // measureText below still reads fresh ink, including before loadingdone.
   let context=cache.context;
   if(!context||context.isContextLost?.()){
     context=doc.createElement('canvas').getContext('2d')||undefined;
     if(!context)return null;
     cache.context=context;
     cache.defaultFont=context.font;
+    cache.assignedFont=undefined;
   }
   // Canvas ignores an unsupported font assignment. Reset its original default
   // first, so a rejected value cannot inherit the preceding title's font.
-  context.font=cache.defaultFont!;
-  context.font=font;
+  if(cache.assignedFont!==font){
+    context.font=cache.defaultFont!;
+    context.font=font;
+    cache.assignedFont=font;
+  }
   const ink=context.measureText(TAB_TITLE_GLYPHS);
   const saved=cache.profiles.get(key);if(saved)return {...saved,ascent:ink.actualBoundingBoxAscent,descent:ink.actualBoundingBoxDescent};
   // One tiny baseline probe per font profile, outside application layout.

@@ -134,8 +134,10 @@ async function readCodexTurnAppend({
         || (fdStat.size === initial.size && (fdStat.mtimeMs !== initial.mtimeMs || fdStat.ctimeMs !== initial.ctimeMs))) {
         throw new Error('codex-append-source-changed');
       }
+      return { fdStat, pathStat };
     };
     await validate();
+    let completeEnd = origin;
     let index = 0;
     for await (const batch of batches()) {
       check();
@@ -144,12 +146,21 @@ async function readCodexTurnAppend({
         throw new Error('codex-append-source-changed');
       }
       await onBatch(batch, prepared);
+      const newline = batch.buffer.lastIndexOf(10);
+      if (newline >= 0) completeEnd = batch.start + newline + 1;
       stats.batches += 1;
       await tick(true);
     }
     if (index !== proofs.length) throw new Error('codex-append-short-read');
-    await validate();
+    const committed = await validate();
     check();
+    // Supplemental presentation evidence only. Provisional onBatch work is
+    // not a certificate; failures return no proof, and growth never certifies
+    // unchanged already-read bytes. Consumers point-verify candidate spans.
+    prepared.sourceProof = { version: 1, fileIdentity: `${initial.dev}:${initial.ino}`,
+      start: origin, completeEnd, readEnd: end,
+      stable: ['size', 'mtimeMs', 'ctimeMs'].every(key => initial[key] === committed.fdStat[key]
+        && initial[key] === committed.pathStat[key]) };
     return prepared;
   } finally { await handle.close(); }
 }

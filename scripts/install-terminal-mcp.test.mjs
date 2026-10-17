@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, writeFile, mkdir } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile, mkdir, chmod, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +14,7 @@ test('Codex update preserves unrelated sections and installs inherited instance 
   const before = '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.terminal]\ncommand = "old"\ncustom = true\n\n[features]\nflag = true\n';
   const after = updateCodexTerminalSection(before, '/tmp/terminal-server.mjs');
   assert.match(after, /\[mcp_servers\.other\][\s\S]*command = "other"/);
-  assert.match(after, /env_vars = \["NOTED_MAIN_PID", "NOTED_PARENT_PROJECT_ID", "NOTED_PARENT_TAB_ID", "NOTED_DISCOVERY_DIR"\]/);
+  assert.match(after, /env_vars = \["NOTED_MAIN_PID", "NOTED_PARENT_PROJECT_ID", "NOTED_PARENT_TAB_ID", "NOTED_DISCOVERY_DIR", "NOTED_MCP_INSTANCE_ROUTE"\]/);
   assert.match(after, /custom = true/);
   assert.match(after, /\[features\]\nflag = true/);
 });
@@ -25,12 +25,14 @@ test('Hub-style Codex section (url =) is left verbatim — no stdio fields injec
   assert.equal(after, before);
 });
 
-test('Hub-style Claude entry (type http / url) is left verbatim — no stdio downgrade', () => {
+test('Hub-style Claude entry retains HTTP and adds the app-produced instance route exactly once', () => {
   const hub = { type: 'http', url: 'http://127.0.0.1:53133/mcp/terminal?tab=${NOTED_PARENT_TAB_ID:-}' };
   const before = JSON.stringify({ mcpServers: { terminal: hub } });
   const after = updateClaudeConfig(before, '/tmp/terminal-server.mjs');
-  assert.equal(after, before);
-  assert.deepEqual(JSON.parse(after).mcpServers.terminal, hub);
+  assert.deepEqual(JSON.parse(after).mcpServers.terminal, { ...hub, url: hub.url + '&instanceRoute=${NOTED_MCP_INSTANCE_ROUTE:-}' });
+  assert.equal(updateClaudeConfig(after, '/tmp/terminal-server.mjs'), after);
+  const other = JSON.stringify({ mcpServers: { terminal: { type: 'http', url: 'http://localhost:1234/mcp/terminal' } } });
+  assert.equal(updateClaudeConfig(other, '/tmp/server'), other, 'unrelated endpoint is not reconfigured');
 });
 
 test('Claude update preserves other MCP servers and terminal-specific unknown fields', () => {
@@ -73,6 +75,7 @@ test('installer atomically mirrors repo bytes, preserves config, and is idempote
       },
       setting: { keep: true },
     }), 'utf8');
+    await chmod(join(home, '.claude.json'), 0o600);
     await writeFile(
       join(home, '.codex', 'config.toml'),
       '[mcp_servers.other]\ncommand = "keep-other"\n\n[mcp_servers.terminal]\ncommand = "old"\ncustom = true\n\n[features]\nkeep = true\n',
@@ -95,6 +98,7 @@ test('installer atomically mirrors repo bytes, preserves config, and is idempote
     assert.equal(claudeInstalled.mcpServers.terminal.disabled, false);
     assert.equal(claudeInstalled.mcpServers.terminal.custom, 'keep-terminal');
     assert.equal(claudeInstalled.setting.keep, true);
+    assert.equal((await stat(join(home, '.claude.json'))).mode & 0o777, 0o600);
     const codexInstalled = await readFile(join(home, '.codex', 'config.toml'), 'utf8');
     assert.match(codexInstalled, /\[mcp_servers\.other\]\ncommand = "keep-other"/);
     assert.match(codexInstalled, /custom = true/);

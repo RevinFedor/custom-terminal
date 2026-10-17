@@ -483,6 +483,18 @@ History их не ждал. Это отдельная нагрузка, а не 
 click ждал JSONL. Точная причина отказа SSD-кэша по этим суммарным логам неизвестна;
 RAM eviction, schema/source invalidation и disk eviction нельзя объявлять одним.
 
+Дополнение17.10: реальный production-built renderer на длинных captured History
+показал повторную metadata-проекцию в urgent click. Bridge копировал private Tab
+поля, повторял project-icon lookup, sidebar повторно кодировал равный свежий
+вектор; no-op activeArea и шесть menu queries добавляли работу. Сохраняющий ремонт
+уменьшает эту работу, оставляя синхронные publications/revisions/probes прежними.
+Для double-click rename второй plain click больше не повторяет activation;
+локальные activity maps игнорируют чужие execution namespaces. Workflow и Project
+не тождественны: native tabs разных workflow могут разделять один namespace.
+Сопоставимый UI A/B улучшился, но continuous input всё ещё имеет задержки>100ms;
+source controls или быстрое первое нажатие не заменяют всю latency-серию. Замеры
+и ограничения — `docs/tmp/оптимизация-history.md`; shared encoding — `fact-tabs.md`.
+
 ## 7b. Пустой поиск чата инвалидировал стили всех окон
 
 29.09 после Build Install открытие «Найти в чате» и закрытие крестиком давали
@@ -512,6 +524,28 @@ DOM-предок: SplitPaneSurface здесь обозначал portal-host, а
 PromptQueueOverlay. Их неизменный template перенесён в один Document-owned sheet,
 без изменения фокуса, layout-формул и queue actions. Chromium-контроль сравнил
 CSSOM/геометрию/фазы анимаций; это не измеренный выигрыш самого workflow click.
+
+17.10 тот же механизм мешал ПКМ Fork → выбор настоящего pending child → rename
+при четырёх работающих Luna в двух workflow. Перед доступом к карточке появлялись
+стили плана задач и двух MicButton; style-mod4.1.3 дополнительно переписывал уже
+установленный CSS CodeMirror теми же байтами. Само переиспользование StyleModule
+не предотвращает эту запись. Статические правила контролов загружаются один раз,
+а точное равенство CSS пропускает только повторную запись: новые правила, порядок,
+nonce и восстановление удалённого style остаются прежними. Нужны обе границы;
+один guard при оставшихся inline stylesheet не ускорил весь путь.
+
+Профили и возврат старого renderer подтвердили снятие части commit/style работы;
+реальная короткая серия улучшила доступ к child и rename без переноса mount,
+durable ACK, публикаций или подготовки Fork. Объединение scalar-подписок карточки,
+detached EditorView и перенос чтения fonts.ready сами по себе весь путь не ускорили.
+Вложенный дорогой стек не следует объявлять причиной всего ожидания. Подробные
+интервалы и оставшиеся задержки ввода — в `docs/tmp/оптимизация-history.md`;
+CDP callback/hit-test не доказывает момент native foreground presentation.
+
+Отдельная Main-стоимость — canonical encoding полного organization snapshot перед
+ACK. Повторные string keys/values кодируются один раз внутри одного вызова;
+все поля читаются свежо, canonical bytes и transaction/CAS прежние. Это чистая
+экономия кодирования, не кэш row/Tab identity и не самостоятельная UI-приёмка.
 
 ---
 
@@ -600,6 +634,33 @@ inode рабочего файла при сохранённых bytes: обыч�
 вместе с coordinator и actual Git merge controls; Electron/UI в этом контроле нет.
 Это source-ремонт лишнего фонового цикла, не доказанное устранение production Main
 SQL-пауз28–32s. Installed-приёмка отдельно; пользователь пока запретил Build Install.
+
+## 7e. Закрытый raw terminal продолжал обновлять DOM scrollbar
+
+17.10 первый реальный UP в History при чужих streams выявил отдельную стоимость
+retention: opacity сохраняет Canvas, но не останавливает xterm 5.5 Viewport.
+У четырёх готовых raw-hidden Luna точный receiver→instance→tabId контроль нашёл
+280 `_innerRefresh` за конечный нагрузочный прогон. Это около1.8s накопленной
+работы, не задержка одного wheel. В коротких input windows стек занимал115–119ms
+sampled; после presentation-гейта в этих окнах он исчез, parsing продолжился.
+
+Откладываются только новые DOM refresh requests после начальной калибровки.
+Write pump/parser/buffer/OSC и Main/headless generation/sequence остаются живыми;
+visible-unfocused raw terminal не считается скрытым. При показе применяется
+текущее состояние. Dirty DOM scroll согласуется до прежнего native listener,
+а программный scroll ACK потребляется до первого настоящего raw wheel, иначе
+Chromium coalescing может поглотить именно это пользовательское движение.
+Adapter привязан к exact xterm instance и проверенной5.5 dependency; при upgrade
+нужны actual controls, unsupported shape сохраняет прежнее поведение.
+
+Удаление этого стека не доказывает устранение production-паузы: в native серии
+первый observed scroll busy70–71ms сменился20/76.5ms, устойчивый whole-path выигрыш
+на малом N не установлен. В оставшемся случае до capture были React/publication,
+GC и native style/hit-test; затем paint/layer work. Вложенные интервалы не складывать.
+Compositor FRAME_SWAP не равен физическим пикселям. Рост scrollTop вместе с
+уточнением scrollHeight не доказывает обратный жест: проверять реальную row identity
+и её координату. Точные cuts, отказавшие probes и installed-граница — в рабочем
+`docs/tmp/оптимизация-history.md`, не в обещании нулевой фоновой стоимости.
 
 ## 8. Observability Toolkit (для будущих регрессий)
 

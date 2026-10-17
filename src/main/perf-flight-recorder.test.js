@@ -163,15 +163,14 @@ test('5GiB pruning evicts large artifacts without refunding either current quota
   assert.equal(createArtifactStore(store.directory).reserveCaptureDetails('incident-' + now + '-1', now).reason, 'rolling-quota-exhausted');
 });
 
-test('native receipts expire at 24h while sample metadata/full report retain the general 7-day policy', t => {
+test('native receipts and detailed sample metadata/full report expire at 24h', t => {
   const { store, now, sparse } = artifactFixture(t), day = 86400000;
   const id = 'stall-' + (now - day - 1) + '-123-1';
   for (const extension of ['.sample.txt', '.sample.json', '.sample-capture.json']) sparse(id + extension, 100, now - day - 1);
   store.prune(now);
   assert.equal(fs.existsSync(store.file(id + '.sample-capture.json')), false);
-  assert.equal(fs.existsSync(store.file(id + '.sample.txt')), true);
-  assert.equal(fs.existsSync(store.file(id + '.sample.json')), true);
-  store.prune(now + 7 * day);
+  assert.equal(fs.existsSync(store.file(id + '.sample.txt')), false);
+  assert.equal(fs.existsSync(store.file(id + '.sample.json')), false);
   assert.deepEqual(store.entries(), []);
 });
 
@@ -186,11 +185,11 @@ test('old incident metadata cannot erase every freshly captured native stack und
   assert.equal(fs.existsSync(store.file(id + '.sample.txt')), true, 'the recent stack remains useful beyond its two-minute write grace');
 });
 
-test('causal journals retain one week and may borrow unused space beyond their protected share', t => {
+test('causal journals retain 24h and may borrow unused space beyond their protected share', t => {
   const { store, now, sparse } = artifactFixture(t), hour = 3600000, miB = 1048576;
   const bucket = at => 'causal-' + new Date(at).toISOString().slice(0, 13).replace(/\D/g, '') + '.ndjson';
-  const expired = bucket(now - 169 * hour), recent = bucket(now - 167 * hour);
-  sparse(expired, 1024, now - 169 * hour); sparse(recent, 1024, now - 167 * hour);
+  const expired = bucket(now - 24 * hour), recent = bucket(now - 23 * hour);
+  sparse(expired, 1024, now - 24 * hour); sparse(recent, 1024, now - 23 * hour);
   store.prune(now);
   assert.equal(fs.existsSync(store.file(expired)), false); assert.equal(fs.existsSync(store.file(recent)), true);
   fs.unlinkSync(store.file(recent));
@@ -224,7 +223,7 @@ test('native reports may borrow the shared budget; heavy expiry records loss wit
   assert.equal(store.entries().filter(e=>e.name.endsWith('.sample-capture.json')).length,9);
 });
 
-test('CPU profiles, traces and oversized files expire at 24h; small reports and metadata retain one week', t => {
+test('profiles, traces and detailed reports expire at 24h; only small CPU checkpoints retain one week', t => {
   const { store, now, sparse } = artifactFixture(t), day = 86400000;
   const profiles=['incident-1000-1.main.cpuprofile','incident-1000-1.cpuprofile','incident-1000-1.trace.json'];
   store.write('incident-1000-1.profile.json',{traceComplete:true,mainStoppedWallMs:now-day-1});
@@ -232,12 +231,18 @@ test('CPU profiles, traces and oversized files expire at 24h; small reports and 
   sparse('incident-1001-1.ui.json',8*1048576,now-day-1);
   sparse('incident-1002-1.main.cpuprofile',100,now-day+1);
   sparse('stall-1000-1-1.sample.txt',100,now-day-1);
-  sparse('incident-1000-1.json',100,now-7*day-1);
+  sparse('incident-1000-1.json',100,now-day-1);
+  sparse('incident-1003-1.ui.json',100,now-day-1);
+  sparse('incident-1004-1.ui.json',100,now-day+1);
+  sparse('cpu-2026101600.ndjson',100,now-7*day-1);
+  sparse('cpu-2026101601.ndjson',100,now-7*day+1);
   store.prune(now);
   for(const name of profiles)assert.equal(fs.existsSync(store.file(name)),false);
   assert.equal(fs.existsSync(store.file('incident-1001-1.ui.json')),false);
-  for(const name of ['incident-1002-1.main.cpuprofile','incident-1000-1.profile.json','stall-1000-1-1.sample.txt'])
+  for(const name of ['incident-1002-1.main.cpuprofile','incident-1000-1.profile.json','incident-1004-1.ui.json','cpu-2026101601.ndjson'])
     assert.equal(fs.existsSync(store.file(name)),true);
+  for(const name of ['stall-1000-1-1.sample.txt','incident-1003-1.ui.json','cpu-2026101600.ndjson'])
+    assert.equal(fs.existsSync(store.file(name)),false);
   const metadata=JSON.parse(store.read('incident-1000-1.profile.json'));
   assert.equal(metadata.traceComplete,true);
   for(const name of profiles)assert.equal(metadata.artifactRetention[name].removalReason,'heavy-retention-expired');

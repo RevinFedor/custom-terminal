@@ -6,7 +6,44 @@ import {
   planCarriedCodexSettingsProofApplication,
   projectCodexSettingsProofOwner,
 } from './codexSessionAdoption.mjs';
-import { resolveCodexEffectiveSettings } from './codexEffectiveSettings.mjs';
+import { planCodexContextForkSettings, resolveCodexEffectiveSettings } from './codexEffectiveSettings.mjs';
+
+test('early Fork selection has no parent identity/application proof; exact live pair beats stale fallback', () => {
+  const sourceTab = { id: 'S', codexSessionId: 'A', codexModel: 'fallback', codexEffort: 'max',
+    codexLiveModel: 'gpt-6-astra', codexLiveEffort: 'high', codexLiveSettingsSessionId: 'A' };
+  const pendingAction = { type: 'codex-fork', contextFork: { sourceTabId: 'S', sourceSessionId: 'A' } };
+  const seed = planCodexContextForkSettings({ pendingAction, sourceTab });
+  assert.equal(seed.codexModel, 'gpt-6-astra'); assert.equal(seed.codexEffort, 'high');
+  assert.equal(seed.codexSessionId, undefined); assert.equal(seed.codexSettingsProofAt, undefined);
+  assert.equal(resolveCodexEffectiveSettings(seed).liveOwned, false);
+  assert.deepEqual(planCodexContextForkSettings({ pendingAction, sourceTab: { ...sourceTab, codexSessionId: 'FOREIGN' } }), {});
+  assert.equal(planCodexContextForkSettings({ pendingAction, sourceTab: { ...sourceTab, codexLiveSettingsSessionId: 'FOREIGN' } }).codexModel, 'fallback');
+  assert.equal(planCodexContextForkSettings({ pendingAction, sourceTab, options: { codexModel: 'explicit', codexEffort: 'medium' } }).codexModel, 'explicit');
+  assert.equal(planCodexContextForkSettings({ pendingAction, sourceTab: { ...sourceTab, codexLiveSettingsSessionId: 'launch:parent' } }).codexModel, 'fallback');
+  assert.equal(planCodexContextForkSettings({ pendingAction, sourceTab: { ...sourceTab, codexLiveSettingsSessionId: undefined,
+    providerState: { codexSettingsIntentRevision: 2, codexSettingsIntentModel: 'stopped-choice', codexSettingsIntentEffort: 'medium' } } }).codexModel, 'stopped-choice');
+  assert.equal(resolveCodexEffectiveSettings({ ...seed, codexModel: 'new-child-choice' }).model, 'new-child-choice');
+});
+
+test('Fork Ultra is an initial selection only, never a persistent default or forged live owner', () => {
+  const sourceTab = { id: 'S', codexSessionId: 'A', codexModel: 'fallback', codexEffort: 'max',
+    codexLiveModel: 'gpt-6-astra', codexLiveEffort: 'ultra', codexLiveSettingsSessionId: 'A' };
+  const seed = planCodexContextForkSettings({ pendingAction: { type: 'codex-fork',
+    contextFork: { sourceTabId: 'S', sourceSessionId: 'A' } }, sourceTab });
+  assert.equal(seed.codexEffort, 'max');
+  assert.equal(resolveCodexEffectiveSettings(seed).effort, 'ultra');
+  assert.equal(resolveCodexEffectiveSettings(seed).liveOwned, false);
+  assert.equal(resolveCodexEffectiveSettings({ ...seed, codexSessionId: 'B' }).effort, 'max');
+  assert.equal(resolveCodexEffectiveSettings({ ...seed, codexLiveModel: 'own', codexLiveEffort: 'high', codexLiveSettingsSessionId: 'launch:own' }).model, 'own');
+});
+
+test('late source settings cannot replace newer child choice/proof; foreign proof time is not priority', () => {
+  const args = { proof: { model: 'inherited', effort: 'max', proofAt: 100 }, nextSessionId: 'B' };
+  assert.equal(planCarriedCodexSettingsProofApplication({ ...args, currentProofAt: 200 }).allowed, false);
+  assert.equal(planCarriedCodexSettingsProofApplication({ ...args, currentProofAt: 200, currentProofSessionId: 'B' }).allowed, false);
+  assert.equal(planCarriedCodexSettingsProofApplication({ ...args, currentProofAt: 200, currentProofSessionId: 'FOREIGN' }).allowed, true);
+  assert.equal(planCarriedCodexSettingsProofApplication({ ...args, currentLiveProofAt: 200, currentLiveSettingsSessionId: 'launch:child' }).allowed, false);
+});
 
 test('proven native Rewind event carries live settings proof from writer A to child B', () => {
   const event = {

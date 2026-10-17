@@ -4,6 +4,12 @@ import { workflowFallbackColor, workflowInitial } from './workflowVisuals.mjs';
 const { normalizeSwitcherRequest, switcherRequestKey } = contract;
 const fail = (code, statusCode = 503) => { throw Object.assign(new Error(code), { code, statusCode }); };
 
+// The bridge publishes metadata only. Do not clone every Tab's drafts, notes,
+// task plans and process fields just to discard them again in tabDto below.
+// The desktop switcher keeps captureSwitcherInputs' complete default snapshot.
+const bridgeTab = tab => ({ id: tab.id, name: tab.name, tabType: tab.tabType,
+  commandType: tab.commandType, filePath: tab.filePath, missing: tab.missing });
+
 function tabDto(row, fileVerdict, iconRef) {
   const tab = row.tab;
   const fileRef = tab.tabType === 'file' && typeof tab.filePath === 'string' && tab.filePath
@@ -16,7 +22,7 @@ function tabDto(row, fileVerdict, iconRef) {
     provider: ['claude', 'codex', 'gemini'].includes(commandType) ? commandType
       : tab.tabType === 'claude-sdk' || commandType === 'claude-sdk' ? 'claude' : null,
     fileRef, availability: fileRef ? exists === true ? 'available' : exists === false ? 'missing' : 'unknown' : null,
-    missing: row.missing === true, selectable: row.missing !== true, projectIconId: iconRef(row.projectIcon) };
+    missing: row.missing === true, selectable: row.missing !== true, projectIconId: iconRef(row.projectIcon, row.projectId) };
 }
 function rowsDto(rows, fileVerdict) {
   // Build the final DTO directly: no intermediate raw-icon rows followed by
@@ -29,8 +35,19 @@ function rowsDto(rows, fileVerdict) {
     }
     return ids.get(value);
   };
+  // Equal image strings from different projects can require a full byte
+  // comparison in Map. Resolve a project's repeated icon once per capture,
+  // retaining exact value checks and first-occurrence icon numbering.
+  const projectIcons = new Map();
+  const projectRef = (value, projectId) => {
+    const cached = projectIcons.get(projectId);
+    if (cached && cached.value === value) return cached.id;
+    const id = ref(value);
+    projectIcons.set(projectId, { value, id });
+    return id;
+  };
   return { icons, rows: rows.map(row => {
-    if (row.kind === 'tab') return tabDto(row, fileVerdict, ref);
+    if (row.kind === 'tab') return tabDto(row, fileVerdict, projectRef);
     const index = occurrences.get(row.workflowId) || 0; occurrences.set(row.workflowId, index + 1);
     return { kind: 'workflow', rowId: 'workflow:' + row.workflowId + ':' + index,
       workflowId: row.workflowId, title: row.workflowName,
@@ -50,7 +67,9 @@ export function createWorkspaceSwitcherSnapshot({ epoch, readWorkspace, readProj
     if (disposed) fail('switcher_renderer_retired');
     const ws = readWorkspace();
     if (ws.isRestoring || !readReady()) fail('switcher_renderer_restoring');
-    const input = captureSwitcherInputs(ws, readProjects(), { isFileMissing: path => fileVerdict(path) === false, inboxName });
+    const input = captureSwitcherInputs(ws, readProjects(), {
+      isFileMissing: path => fileVerdict(path) === false, inboxName, projectTab: bridgeTab,
+    });
     const catalog = rowsDto(selectSwitcherRows(input).rows, fileVerdict);
     // Explicit metadata only. Never serialize the full Tab (draft/chips/body).
     const next = JSON.stringify([input.desktop, input.globalMru.map(x => [x.projectId, x.tabId]), catalog]);

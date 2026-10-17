@@ -113,6 +113,7 @@ function planCodexCompactPostEnterAction({
 function buildCodexCompactUnconfirmedResult({
   reason = 'codex_compact_start_unconfirmed',
   enterCount = 0,
+  enterWriteUnknown = false,
   frameProof = null,
 } = {}) {
   const normalizedEnterCount = Math.max(0, Number.isInteger(Number(enterCount))
@@ -123,10 +124,14 @@ function buildCodexCompactUnconfirmedResult({
   return {
     success: false,
     error: reason,
-    submitted: normalizedEnterCount > 0,
+    submitted: normalizedEnterCount > 0 ? true : enterWriteUnknown ? null : false,
     slashInserted: true,
     compactStartConfirmed: false,
-    deliveryUnconfirmed: normalizedEnterCount > 0,
+    deliveryUnconfirmed: normalizedEnterCount > 0 || enterWriteUnknown,
+    ...(enterWriteUnknown ? {
+      enterWriteUnknown: true, deliveryUnknown: true, status: 'delivery-unknown',
+      code: 'codex_compact_enter_write_unknown',
+    } : {}),
     compactEnterCount: normalizedEnterCount,
     manualTakeover,
     admissionRejected: manualTakeover,

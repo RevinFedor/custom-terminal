@@ -9,6 +9,8 @@ const http = require('node:http');
 const url = require('node:url');
 const contract = require('./project-api-runtime-contract');
 const { runKeyedExclusive } = require('./codex-writer-ownership');
+const { createTerminalShellReadinessTracker } = require('./terminal-shell-readiness.cjs');
+const { createHistoryMutationInputGate } = require('./history-mutation-input');
 const { spawn } = require('node:child_process');
 const quiet = { log() {}, warn() {}, error() {} };
 function functions(file, names) {
@@ -18,7 +20,7 @@ function functions(file, names) {
     assert.ok(node, name); return node.getText(tree);
   }).join('\n');
 }
-const mainCode = functions('main.js', ['stopAgentProcessScenarioInMain', 'stopAiProcessInTabSerialized', 'stopAiProcessInTab']);
+const mainCode = functions('main.js', ['getTerminalStopRevision', 'prepareStopPendingSends', 'stopAgentProcessScenarioInMain', 'stopAiProcessInTabSerialized', 'stopAiProcessInTab']);
 const webCode = functions('web-server.js', ['checkAuth', 'handleApi', 'runAgentStopScenario']);
 
 function fixture({ residual = false, guarded = false } = {}) {
@@ -29,9 +31,18 @@ function fixture({ residual = false, guarded = false } = {}) {
   const ctx = vm.createContext({ console: quiet, path, srcMainDir: __dirname, clearTimeout,
     require: modulePath => {
       assert.equal(modulePath, path.join(__dirname, 'web-server'));
-      return { cancelQueuedAgentSends: (...args) => queueCancellations.push(args) };
+      return { sendIntentCancellationAvailable: () => false,
+        cancelQueuedAgentSends: (...args) => {
+          queueCancellations.push(args);
+          return { cancelled: false, count: 0, complete: true, results: [] };
+        } };
     },
     terminals: new Map([['T', term]]), terminalCommandState: new Map([['T', { isRunning: true, runSeq: 2 }]]),
+    terminalShellReadiness: createTerminalShellReadinessTracker(),
+    historyMutationInput: createHistoryMutationInputGate(),
+    terminalStopRevisions: new WeakMap(),
+    broadcastAgentLaunchFenceRevoked: () => events.push('stop-fence'),
+    ipcMain: new (require('node:events').EventEmitter)(),
     aiLifecycleActionInflight: new Map(), runKeyedExclusive,
     cancelCodexManualCompactPending() {}, resolveAiToolTypeForTab: (_tab, tool) => tool || 'claude',
     markAiStopping: () => events.push('stopping'),

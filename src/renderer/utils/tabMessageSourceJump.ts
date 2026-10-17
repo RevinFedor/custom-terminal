@@ -2,6 +2,7 @@ import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { useUIStore } from '../store/useUIStore';
 import { tabNavigationLocation } from './tabNavigationLocation.mjs';
 import { createTabMessageSourceNavigation } from './tabMessageSourceNavigation.mjs';
+import { normalizeTerminalMessageSnapshot, normalizeTerminalMessageTarget } from '../../shared/terminal-message-reference.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -23,8 +24,18 @@ const navigation = createTabMessageSourceNavigation({
       window.removeEventListener('keydown', key, true);
     };
   },
-  locate: messageId => ipcRenderer.invoke('tab-messages:source-location', { messageId }),
-  requestId: () => crypto.randomUUID(),
+  locate: (messageId, source) => source.referenceTarget
+    ? Promise.resolve({ success: true, location: {
+      messageId, tabId: source.sourceTabId, entryUuid: messageId,
+      readSessionId: source.referenceTarget.viewOwnerSessionId || source.referenceTarget.sessionId,
+      messageReference: source.referenceTarget,
+    } })
+    : ipcRenderer.invoke('tab-messages:source-location', { messageId }),
+  requestId: source => {
+    const requestId = crypto.randomUUID();
+    if (source.referenceId) console.log('[MessageReference] seek id=' + source.referenceId + ' request=' + requestId);
+    return requestId;
+  },
   reveal: tabId => {
     const ui = useUIStore.getState();
     ui.setTabTerminalIsPrimary(tabId, false);
@@ -34,6 +45,7 @@ const navigation = createTabMessageSourceNavigation({
   scroll: (location, requestId) => {
     useUIStore.getState().setHistoryScrollToUuid(location.entryUuid, location.tabId, {
       toolUseId: location.toolUseId, readSessionId: location.readSessionId, requestId,
+      messageReference: location.messageReference,
     });
     return useUIStore.getState().historyScrollRequestGeneration;
   },
@@ -59,3 +71,17 @@ const navigation = createTabMessageSourceNavigation({
 
 export const cancelTabMessageSourceJump = () => navigation.cancel();
 export const jumpToTabMessageSource = source => navigation.jump(source);
+export const jumpToTerminalMessageReference = snapshot => {
+  const reference = normalizeTerminalMessageSnapshot(snapshot);
+  if (!reference) throw Error('message_reference_invalid');
+  return jumpToTerminalMessageTarget(reference.source, reference.referenceId);
+};
+export const jumpToTerminalMessageTarget = (value, referenceId) => {
+  const target = normalizeTerminalMessageTarget(value);
+  if (!target) throw Error('message_reference_invalid');
+  console.log('[MessageReference] open id=' + referenceId + ' tab=' + target.tabId);
+  return navigation.jump({ messageId: target.messageId, sourceTabId: target.tabId, referenceTarget: target, referenceId }).then(found => {
+    console.log('[MessageReference] jump id=' + referenceId + ' found=' + found);
+    return found;
+  });
+};

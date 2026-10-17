@@ -51,7 +51,7 @@ export const TAB_PROCESS_BAR_W_PX = 3;
 // exact square is clickable” before the user presses it.
 const TAB_MARKER_HOVER_SCALE = 1.32;
 
-/** Fade duration for the aggregate workflow completion frame. */
+/** Fade duration for tab and aggregate workflow completion frames. */
 export const TAB_COMPLETION_NOTIFICATION_DISMISS_MS = 420;
 
 export function TabCompletionNotificationIcon({ persistent = false, size = 13, color, viewportWidth = size }: {
@@ -67,7 +67,7 @@ export function TabCompletionNotificationIcon({ persistent = false, size = 13, c
     style={{ flexShrink: 0, overflow: viewportWidth < size ? 'visible' : undefined }} aria-hidden="true" />;
 }
 
-/** The bell is the only notification marker on an individual tab. */
+/** The bell shows the notification mode, independently of the unread frame. */
 export function TabCompletionNotificationBadge({ armed, persistent, fired }: {
   armed: boolean;
   persistent: boolean;
@@ -100,8 +100,8 @@ export function TabCompletionNotificationBadge({ armed, persistent, fired }: {
 }
 
 /**
- * Keep the aggregate workflow ring alive briefly after acknowledgement.
- * Individual tabs use only the bell; fired remains canonical workspace state.
+ * Keep completion rings alive briefly after acknowledgement.
+ * This is a visual fade only; fired remains canonical workspace state.
  */
 export function useTabCompletionNotificationDismissing(fired: boolean): boolean {
   const [dismissing, setDismissing] = useState(false);
@@ -132,6 +132,15 @@ export function useTabCompletionNotificationDismissing(fired: boolean): boolean 
   }, [fired]);
 
   return dismissing;
+}
+
+/** Unread completion uses the workflow's existing red perimeter animation. */
+export function TabCompletionNotificationAlert({ fired }: { fired: boolean }) {
+  const dismissing = useTabCompletionNotificationDismissing(fired);
+  if (!fired && !dismissing) return null;
+  return <span data-tab-completion-notification-ring aria-hidden
+    className={`tab-completion-notification-alert${!fired && dismissing ? ' tab-completion-notification-alert--dismiss' : ''}`}
+    style={{ position: 'absolute', inset: 0, borderRadius: 'inherit', zIndex: 4 }} />;
 }
 
 export interface TabProcessBarProps {

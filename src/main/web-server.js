@@ -61,6 +61,7 @@ const { HistoryFreshness, historyFreshnessScopeKey } = require(path.join(srcMain
 const { isLocalSlashCommandPrompt } = require(path.join(srcMainDir, 'agent-history-send-receipt'));
 const { TabMessageService, formatTabMessagePrompt } = require(path.join(srcMainDir, 'tab-messages'));
 const { resolveTabMessageSourceLocation } = require(path.join(srcMainDir, 'tab-message-source-location'));
+const { handleTerminalMessageOpen } = require(path.join(srcMainDir, 'terminal-message-navigation'));
 const { compactTabMessage, handleTabMessageApi } = require(path.join(srcMainDir, 'tab-message-api'));
 const { messageRuntimeIdentity, scenarioDestination, identityUnavailable } = require(path.join(srcMainDir, 'agent-message-identity'));
 const { CompletionContentStore, buildOrchestrationCompletionContent,
@@ -91,6 +92,8 @@ const { readInboxResult } = require('./inbox-result-reader');
 const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
 const { resolveInboxRewindTarget } = require('./inbox-rewind-identity');
 const { historyEntryHasExactIdentity } = require('../shared/history-entry-identity.cjs');
+const { CAPABILITY: STORAGE_MAINTENANCE_CAPABILITY, handleStorageMaintenance } = require('./storage-maintenance-api');
+let storageMaintenance = null;
 const {
   classifyAgentActionBridgeError,
   classifyAgentActionResult,
@@ -423,6 +426,8 @@ let getAgentTurnResult = null;
 let getAgentExecutionContext = null;
 let userNotificationOutbox = null;
 let getAgentResponseState = null;
+let captureTabInspection = null;
+let readTabInspectionResponse = null;
 let readAgentObservedResponse = null;
 let orchestrationContinuationService = null;
 let readAgentSendDestination = null;
@@ -462,6 +467,7 @@ let readCodexNativeRewindState = null;
 let recoverCodexRewindPostEnter = null;
 let readCodexRewindPostEnterResult = null;
 let savedHistoryOperations = null;
+let historyMutationInput = null;
 let inboxSavedHistoryOperations = null;
 let savedHistoryIpcRegistered = false;
 let conversationOwners = null;
@@ -990,7 +996,7 @@ async function prepareOrchestrationCompletionContent(run) {
   return content;
 }
 
-async function resolveTabMessageIdentity(tabId) {
+async function resolveTabMessageIdentity(tabId, purpose = 'tab-message') {
   const descriptor = findOrchestrationTabDescriptor(tabId);
   if (!descriptor) return null;
   if (descriptor.tabType === 'claude-sdk') {
@@ -999,7 +1005,23 @@ async function resolveTabMessageIdentity(tabId) {
     return { ...descriptor, provider: 'claude', sessionId, sendTarget: { toolType: 'claude', sessionId } };
   }
   if (typeof readAgentRuntimeSnapshot !== 'function') throw identityUnavailable();
-  return messageRuntimeIdentity(descriptor, await readAgentRuntimeSnapshot(tabId));
+  let snapshot = null;
+  try {
+    snapshot = await readAgentRuntimeSnapshot(tabId);
+    return messageRuntimeIdentity(descriptor, snapshot);
+  } catch (error) {
+    console.warn('[AgentMessageIdentity] refused ' + JSON.stringify({ tabId,
+      purpose: typeof purpose === 'string' ? purpose : 'tab-message',
+      code: error?.code || 'message_runtime_identity_unavailable',
+      coherent: snapshot?.coherent ?? null, status: snapshot?.status || snapshot?.sessionStatus || null,
+      liveLifecycle: snapshot?.liveLifecycle ?? null, processStatus: snapshot?.processStatus || null,
+      sessionId: snapshot?.sessionId || null, savedSessionId: snapshot?.savedSessionId || null,
+      canResume: snapshot?.canResume ?? null, writerConfirmed: snapshot?.writerConfirmed ?? null,
+      inputReady: snapshot?.inputReady ?? null, lifecycleGeneration: snapshot?.lifecycleGeneration || null,
+      terminalRunSeq: snapshot?.terminalRunSeq ?? null, inputRevision: snapshot?.inputRevision ?? null,
+    }));
+    throw error;
+  }
 }
 
 async function readScenarioDestination(tabId) {
@@ -1011,7 +1033,7 @@ async function readScenarioDestination(tabId) {
 
 async function captureOrchestrationSourceTarget(source, priorRun, expectedExecution = null) {
   if (priorRun) return priorRun.sourceSendTarget || null;
-  const identity = await resolveTabMessageIdentity(source.tabId);
+  const identity = await resolveTabMessageIdentity(source.tabId, 'orchestration-source');
   if (!identity) throw identityUnavailable('orchestration_source_tab_unavailable');
   if (expectedExecution && (expectedExecution.provider !== identity.provider
     || (expectedExecution.sessionId && expectedExecution.sessionId !== identity.sessionId
@@ -1104,6 +1126,11 @@ async function sendTabMessage(message) {
   try {
   service.assertDeliveryActive(message.messageId);
   const status = await resolveAgentSessionInfo(message.targetTabId, 2000);
+  const queuedRequest = typeof agentSendQueue !== 'undefined' && agentSendQueue
+    ? agentSendQueue.item(message.operationKey) : null;
+  // statusAtSend is a frozen admission hint. The shared executor rechecks live
+  // readiness; a later busy snapshot must not change the same request's hash.
+  const originalRequest = queuedRequest ? JSON.parse(queuedRequest.request_json) : null;
   service.assertDeliveryActive(message.messageId);
   const expectedTarget = message.targetSendTarget || { toolType: message.targetProvider, sessionId: message.targetSessionId };
   const source = 'tab-message:' + message.messageId;
@@ -1120,10 +1147,13 @@ async function sendTabMessage(message) {
   const result = await runAgentSendScenario({
     tabId: message.targetTabId, prompt, workContextPrepared: true,
     handoffId: message.handoffId, source,
-    statusAtSend: status?.status || 'unknown', queue: true, ownership: 'project',
+    statusAtSend: originalRequest ? originalRequest.statusAtSend : status?.status || 'unknown', queue: true, ownership: 'project',
     provider: message.targetProvider, sessionId: message.targetSessionId,
     expectedTarget, cwd: message.targetCwd,
     sendOperationKey: message.operationKey, sendSurface: 'tab-message',
+    ...(queuedRequest && message.attemptCount > 1 ? {
+      retryNoInputAttemptId: agentSendReceiptStore.get(message.operationKey)?.attemptId || null,
+    } : {}),
     presentationSnapshot: { semanticTags: [{ kind: 'tab-message',
       messageId: message.messageId, replyTo: message.replyTo || null, phase: message.kind,
       ...(prompt.endsWith(rawPrompt) ? { envelopeStart: prompt.length - rawPrompt.length } : {}),
@@ -3260,6 +3290,7 @@ async function runPreparedAgentSendScenario(args) {
   onLateReceipt = null,
   applicationQueueAcceptedResponse = false,
   applicationQueueExecution = false,
+  retryNoInputAttemptId = null,
   } = args;
   // A restart may have left an Enter-armed operation whose exact transcript
   // proof is still being reconciled. Never reserve/replay that operation until
@@ -3313,8 +3344,8 @@ async function runPreparedAgentSendScenario(args) {
     if (typeof agentSendQueue !== 'undefined' && agentSendQueue && !applicationQueueExecution
       && ['claude', 'codex'].includes(provider) && !isLocalSlashCommandPrompt(prompt)
       && findOrchestrationTabDescriptor(tabId)?.tabType !== 'claude-sdk') {
-      const { prepareSend: _prepare, onLateReceipt: _late, ...request } = args;
-      const admitted = agentSendQueue.enqueue({ identity: durableIdentity, request,
+      const { prepareSend: _prepare, onLateReceipt: _late, retryNoInputAttemptId: _retry, ...request } = args;
+      const admitted = agentSendQueue.enqueue({ identity: durableIdentity, request, retryNoInputAttemptId,
         execute: typeof prepareSend === 'function' || typeof onLateReceipt === 'function' ? async scope => {
           const receipt = await runPreparedAgentSendScenario({ ...args, applicationQueueExecution: true,
             sendRequestFingerprint: scope.requestFingerprint,
@@ -3353,6 +3384,8 @@ async function runPreparedAgentSendScenario(args) {
   const executeSend = async () => {
     tabWorkContext?.activate(tabId, handoffId);
     let durableAttemptId = null;
+    let preDispatchFailure = false;
+    let preflightScope = null;
     let result;
     let preparedTarget = null;
     let admittedExpectedTarget = expectedTarget;
@@ -3426,27 +3459,36 @@ async function runPreparedAgentSendScenario(args) {
         });
       }
       durableAttemptId = begun.attemptId;
-      if (expectedTarget) {
-        // Persist the immutable destination on the same attempt. The physical
-        // PTY boundary rechecks it; no renderer-only lease or new side registry.
-        const staged = agentSendReceiptStore.stageAttemptContext(sendOperationKey, durableAttemptId, {
-          expectedTarget: admittedExpectedTarget,
-          ...(ownedAttachments ? { ownedAttachments } : {}),
+      try {
+        if (['codex', 'claude'].includes(provider)) preflightScope = Object.freeze({
+          version: 1, id: crypto.randomUUID(), operationKey: sendOperationKey,
+          attemptId: durableAttemptId, tabId, handoffId, provider,
         });
-        if (staged?.ok !== true) result = {
-          success: false, accepted: false, submitted: false, pasteWritten: false,
-          status: 'not-submitted', code: 'agent_send_target_precondition_not_durable',
-          error: 'The exact send destination could not be recorded before submission.',
-        };
-      }
-      if (!result && expectedTarget?.expectedBinding === 'none') {
-        try { conversationOwners.claimSend(tabId, expectedTarget, { sendOperationKey, sendAttemptId: durableAttemptId }); }
-        catch (error) { result = { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
-      }
-      if (!result && ownedAttachments && !expectedTarget) {
-        const staged = agentSendReceiptStore.stageAttemptContext(sendOperationKey, durableAttemptId, { ownedAttachments });
-        if (staged?.ok !== true) result = { success: false, submitted: false, pasteWritten: false,
-          code: 'attachment_context_not_durable', error: 'Attachment ownership could not be staged.' };
+        if (expectedTarget || ownedAttachments || preflightScope) {
+          // Issue one driver scope only after this caller began the attempt.
+          // Replay/old renderer replies cannot borrow it to negate prior input.
+          const staged = agentSendReceiptStore.stageAttemptContext(sendOperationKey, durableAttemptId, {
+            ...(expectedTarget ? { expectedTarget: admittedExpectedTarget } : {}),
+            ...(ownedAttachments ? { ownedAttachments } : {}),
+            ...(preflightScope ? { preflightScope } : {}),
+          });
+          if (staged?.ok !== true) result = {
+            success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+            status: 'not-submitted', code: expectedTarget ? 'agent_send_target_precondition_not_durable'
+              : ownedAttachments ? 'attachment_context_not_durable' : 'agent_send_preflight_scope_not_durable',
+            error: 'The exact send context could not be recorded before submission.',
+          };
+        }
+        if (!result && expectedTarget?.expectedBinding === 'none') {
+          conversationOwners.claimSend(tabId, expectedTarget, { sendOperationKey, sendAttemptId: durableAttemptId });
+        }
+      } catch (error) {
+        preDispatchFailure = true;
+        result = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+          status: 'not-submitted', code: error?.code || 'agent_send_pre_dispatch_failed',
+          error: error?.message || String(error), httpStatus: Number(error?.statusCode) || undefined };
+        console.warn('[AgentSendReceipt] pre-dispatch failed operation=' + String(sendOperationKey).slice(0, 90)
+          + ' attempt=' + String(durableAttemptId).slice(0, 12) + ' code=' + result.code);
       }
     }
     const settleLateBridgeReceipt = async ({ ok, data, error }) => {
@@ -3483,9 +3525,10 @@ async function runPreparedAgentSendScenario(args) {
       result = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
         status: 'not-submitted', code: 'agent_send_cancelled', error: 'Send cancelled before adapter dispatch' };
     }
+    let rendererDispatchInvoked = false;
     if (!result) try {
       const target = preparedTarget?.descriptor || findOrchestrationTabDescriptor(tabId);
-      result = await bridgeRequest('sendAgentPromptScenario', {
+      const bridgePayload = {
         tabId,
         targetProjectId: target?.projectId || null,
         expectedToolType: expectedTarget?.toolType || target?.toolType || provider || null,
@@ -3503,6 +3546,7 @@ async function runPreparedAgentSendScenario(args) {
         handoffId,
         sendOperationKey: sendOperationKey || null,
         sendAttemptId: durableAttemptId,
+        ...(preflightScope ? { preflightScope } : {}),
         source,
         ...(promptQueueAction === 'send-now' ? { promptQueueAction: 'send-now' } : {}),
         statusAtSend,
@@ -3513,17 +3557,21 @@ async function runPreparedAgentSendScenario(args) {
         // terminal draft untouched and report conflict. External Inbox owns its
         // own chat composer: atomically pull terminal draft out for caller rollback.
         returnDraftOnConflict: ownership === 'external',
-      }, timeoutMs, {
+      };
+      rendererDispatchInvoked = true;
+      result = await bridgeRequest('sendAgentPromptScenario', bridgePayload, timeoutMs, {
         onLateReply: settleLateBridgeReceipt,
       });
     } catch (error) {
-      if (error?.dispatched === false || error?.code === 'bridge_unavailable') {
+      if (!rendererDispatchInvoked || error?.dispatched === false || error?.code === 'bridge_unavailable') {
+        preDispatchFailure = !rendererDispatchInvoked;
         result = {
           success: false,
           accepted: false,
           submitted: false,
+          ...(!rendererDispatchInvoked ? { pasteWritten: false, enterWritten: false } : {}),
           status: 'not-submitted',
-          code: error?.code || 'bridge_unavailable',
+          code: error?.code || (!rendererDispatchInvoked ? 'agent_send_pre_dispatch_failed' : 'bridge_unavailable'),
           error: error?.message || String(error),
           httpStatus: 503,
           handoffId: handoffId || null,
@@ -3596,7 +3644,8 @@ async function runPreparedAgentSendScenario(args) {
         );
         // An exact audit may win the race while the renderer callback is still
         // returning. Never let that stale callback overwrite the durable fact.
-        if (settled?.record && (settled.record.state === 'confirmed' || settled.applied !== true)) {
+        if (settled?.record && (preDispatchFailure || settled.record.receipt?.preflightRefusal?.verified === true
+          || settled.record.state === 'confirmed' || settled.applied !== true)) {
           return durableAgentSendReplay(settled.record, {
             operationKey: sendOperationKey,
             attemptId: durableAttemptId,
@@ -7757,7 +7806,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
       lanIp: getLanIp(),
       service: webServerServiceHealth(),
       capabilities: {
+        messageReferenceNavigation: { version: 1, endpoint: '/api/message-reference/open' },
         workspaceSwitcher: WORKSPACE_SWITCHER_CAPABILITY,
+        ...(storageMaintenance ? { storageMaintenance: STORAGE_MAINTENANCE_CAPABILITY } : {}),
         dictationClipboardReceipt: { version: 2, endpoint: '/api/dictation-clipboard/receipts', proof: 'exact-xterm-pty-write-or-editable-commit' },
         ...(require('./project-manager').workflowOrganization?.ready() ? { workflowOrganization: WORKFLOW_HTTP_CAPABILITY } : {}),
         // The remote guard belongs to the current mutation journal, not the
@@ -7765,6 +7816,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         runAfter: { ...RUN_AFTER_CAPABILITY, mainEpoch: getRunAfterApi().journal.epoch },
         ...(projectCardSignals ? { cardSignals: projectCardSignals.capability } : {}),
         ...(publicTabActivity ? { tabActivity: publicTabActivity.capability } : {}),
+        ...(captureTabInspection && readTabInspectionResponse
+          ? { tabInspection: require('./tab-inspection').TAB_INSPECTION_CAPABILITY } : {}),
         ...(publicHistoryFreshness ? { historyFreshness: historyFreshnessCapability } : {}),
         completionNotifications: completionNotificationCapability,
         ...(userNotificationOutbox ? { userNotifications: userNotificationCapability } : {}),
@@ -7920,6 +7973,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
         detail: String(e?.message || e),
       });
     }
+  }
+
+  if (parsed.pathname === '/api/message-reference/open' && req.method === 'POST') {
+    return handleTerminalMessageOpen(req, res, { checkAuth, readBody, sendJson, pid: process.pid, bridgeRequest,
+      reveal: revealTerminalApplicationWindow });
   }
 
   if (parsed.pathname === '/api/dictation-chip/open' && req.method === 'POST') {
@@ -8199,6 +8257,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
 
   if (await workflowOrganizationHttp(req, res, parsed)) return;
+  if (await handleStorageMaintenance({ req, res, parsed, api: storageMaintenance, readBody, sendJson })) return;
 
   if (parsed.pathname === '/api/history-freshness' && req.method === 'GET') {
     let ids;
@@ -9375,12 +9434,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 400, { ok: false, error: 'absolute root required' });
     }
     try {
-      const usages = perfCausal.syncWork('http.prompt-usage', {
+      const usages = await perfCausal.run('http.prompt-usage', {
         caller: 'http.project-prompt-usage', fileIdentity: rootPath,
       }, () => projectPromptCatalog.usageForRoot(rootPath), { root: true });
       return sendJson(res, 200, { ok: true, root: rootPath, usages, updatedAt: Date.now() });
     } catch (error) {
-      return sendJson(res, 500, { ok: false, error: String(error?.message || error) });
+      return sendJson(res, error?.statusCode || (error?.code === 'prompt_catalog_preparing' ? 503 : 500), {
+        ok: false, error: String(error?.message || error), code: error?.code || 'project_prompts_error',
+      });
     }
   }
 
@@ -12064,6 +12125,30 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  if (parsed.pathname === '/api/terminal-tabs/inspect' && req.method === 'GET') {
+    const startedAt = Date.now();
+    if (!captureTabInspection || !readTabInspectionResponse) {
+      return sendJson(res, 503, { error: 'tab_inspection_unavailable' });
+    }
+    try {
+      const query = parsed.query || {};
+      if (Object.keys(query).some(key => !['tabIds', 'includeLastResponse', 'maxPreviewChars'].includes(key))
+        || (query.includeLastResponse !== undefined && !['true', 'false'].includes(query.includeLastResponse))) {
+        return sendJson(res, 400, { error: 'invalid_tab_inspection_request' });
+      }
+      const result = await require('./tab-inspection').inspectTabs({
+        tabIds: JSON.parse(query.tabIds || '[]'), includeLastResponse: query.includeLastResponse === 'true',
+        ...(query.maxPreviewChars !== undefined ? { maxPreviewChars: Number(query.maxPreviewChars) } : {}),
+      }, { capture: captureTabInspection, readResponse: readTabInspectionResponse,
+        readTracked: tabId => orchestrationRunStore?.readTabInspection(tabId)
+          || { known: false, revision: null, reason: 'orchestration-not-ready' } });
+      console.log('[TabInspection] read tabs=' + result.tabs.length + ' ms=' + (Date.now() - startedAt)
+        + ' outcomes=' + result.tabs.map(tab => String(tab.tabId).slice(-12) + ':'
+          + (tab.known ? 'known' : 'unknown') + ':' + (tab.lastResponse?.reason || tab.lastResponse?.status)).join(','));
+      return sendJson(res, 200, result);
+    } catch (error) { return sendJson(res, error.statusCode || 400, { error: 'invalid_tab_inspection_request' }); }
+  }
+
   // Status snapshot for a PTY+Claude tab: active | busy | inactive.
   // Mobile polls this on chat-open to decide Resume-banner visibility.
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/status$/);
@@ -13454,6 +13539,7 @@ function webBroadcast(tabId, payload) {
     const historyFreshness = publicHistoryFreshness.invalidate(tabId, type);
     webBroadcast(tabId, { type: 'history-freshness', historyFreshness });
   }
+  if (['busy','done','snapshot','bridge-update'].includes(type)) void historyMutationInput?.notify(tabId);
   if (['busy','done','snapshot','bridge-update'].includes(type)) agentSendQueue?.notifyRuntime(tabId,
     JSON.stringify([type, payload.lifecycleGeneration, payload.terminalRunSeq, payload.launchId,
       payload.sessionId, payload.status, payload.sessionStatus, payload.busy, payload.inputReady, payload.stopping]));
@@ -13872,6 +13958,7 @@ function attachWebSocket(server, sdkSessions) {
 // ───────── lifecycle ─────────
 
 function start({
+  storageMaintenance: storageMaintenanceValue,
   tabWorkContext: tabWorkContextInstance,
   userNotificationOutbox: userNotificationOutboxInstance,
   projectCardSignals: projectCardSignalsInstance,
@@ -13894,6 +13981,7 @@ function start({
   getClaudePendingQuestion: getQFn,
   transcriptService: transcriptServiceFn,
   savedHistoryRuntime,
+  historyMutationInput: historyMutationInputValue,
   resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn,
   resolveCodexRuntimeProjectionBatch: resolveCodexRuntimeProjectionBatchFn,
   readCodexNativeRewindState: readCodexNativeRewindStateFn,
@@ -13904,6 +13992,8 @@ function start({
   readAgentContinuationOriginalProof: readAgentContinuationOriginalProofFn,
   getAgentExecutionContext: getAgentExecutionContextFn,
   getAgentResponseState: getAgentResponseStateFn,
+  captureTabInspection: captureTabInspectionFn,
+  readTabInspectionResponse: readTabInspectionResponseFn,
   readAgentObservedResponse: readAgentObservedResponseFn,
   onAgentResponseCompletion,
   readAgentLifecycleIdentity: readAgentLifecycleIdentityFn,
@@ -13928,6 +14018,7 @@ function start({
     return;
   }
   if (!sdkSessions) throw new Error('start({sdkSessions}) — Map of live SDK sessions required');
+  storageMaintenance = storageMaintenanceValue || null;
   tabMessageSdkSessions = sdkSessions;
   tabWorkContext = tabWorkContextInstance || null;
   projectCardSignals = projectCardSignalsInstance || null;
@@ -13946,6 +14037,7 @@ function start({
     }) : null;
   mobileAttachmentAssetStore = mobileAttachmentAssetStoreInstance || null;
   agentSendReceiptStore = agentSendReceiptStoreFn || null;
+  historyMutationInput = historyMutationInputValue || null;
   reconcileAgentSendReceipt = reconcileAgentSendReceiptFn || null;
   sendQueueRecoveryReady = false;
   if (agentSendReceiptStore?.subscribe) {
@@ -13957,6 +14049,7 @@ function start({
       projectPresentation: record => record.surface === 'tab-message'
         ? tabMessageService?.receiptPresentation(record.operationKey, record.tabId) : null,
       admit: admitQueuedAgentSend,
+      claimDispatch: historyMutationInput ? request => historyMutationInput.claimSend(request.tabId) : null,
       transferMergedContext: ({ tabId, requests, request }) => {
         if (tabWorkContext && tabWorkContext.db !== agentSendReceiptStore.db) throw new Error('send_queue_merge_context_owner_mismatch');
         tabWorkContext?.mergeHandoffs(tabId, requests, request);
@@ -14118,6 +14211,8 @@ function start({
   getAgentExecutionContext = getAgentExecutionContextFn || null;
   userNotificationOutbox = userNotificationOutboxInstance || null;
   getAgentResponseState = getAgentResponseStateFn || null;
+  captureTabInspection = captureTabInspectionFn || null;
+  readTabInspectionResponse = readTabInspectionResponseFn || null;
   readAgentObservedResponse = readAgentObservedResponseFn || null;
   readAgentSendDestination = readAgentSendDestinationFn || null;
   orchestrationContinuationService = null;
@@ -14167,6 +14262,10 @@ function start({
     .catch((error) => console.warn('[Orchestration] startup recovery failed:', error?.message || error));
 
   httpServer = http.createServer((req, res) => {
+    if ((req.headers['x-noted-main-pid'] && req.headers['x-noted-main-pid'] !== String(process.pid))
+      || (req.headers['x-noted-instance-id'] && req.headers['x-noted-instance-id'] !== webServerInstanceId)) {
+      return sendJson(res, 409, { code: 'mcp_instance_route_changed', error: 'Noted instance changed before request admission' });
+    }
     const parsed = url.parse(req.url, true);
     if (parsed.pathname.startsWith('/api/') || parsed.pathname === '/api') {
       webServerLastRequestAt = Date.now();
@@ -14318,6 +14417,8 @@ function stop() {
   getAgentExecutionContext = null;
   userNotificationOutbox = null;
   getAgentResponseState = null;
+  captureTabInspection = null;
+  readTabInspectionResponse = null;
   readAgentObservedResponse = null;
   readAgentSendDestination = null;
   orchestrationContinuationService = null;
@@ -14503,6 +14604,12 @@ async function sendCodexCapacityContinuation({ tabId, sessionId, turnId, generat
 }
 
 async function admitQueuedAgentSend(request) {
+  if (historyMutationInput?.held(request.tabId)) {
+    // Also arms a recovered passive hold on the first FIFO demand after boot.
+    // No timer, new attempt, or provider action is created by this observation.
+    void historyMutationInput.notify(request.tabId);
+    return false;
+  }
   if (isAutomaticPromptQueueRequest(request)) {
     const diagnosticKey = JSON.stringify([request.tabId, request.handoffId]);
     const wait = (reason, status = null) => {
@@ -14559,6 +14666,8 @@ async function admitQueuedAgentSend(request) {
 }
 
 module.exports = {
+  historyMutationInputBusy: tabId => agentSendQueue?.hasUnsettledInput(tabId) ?? false,
+  wakeHistoryMutationInput: tabId => agentSendQueue?.wake(tabId),
   readInheritedTabActivity: () => getOrchestrationRunStore().readInheritedActivity(),
   mergeQueuedAgentMessages: async request => {
     await agentSendReceiptStartupReady;

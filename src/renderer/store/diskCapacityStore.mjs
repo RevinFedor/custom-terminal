@@ -1,4 +1,4 @@
-import { EMPTY_DISK_CAPACITY, diskCapacityPresentation } from '../utils/diskCapacityPresentation.mjs';
+import { EMPTY_DISK_CAPACITY, diskCapacityPresentation, diskCapacitySnapshotForDisplay } from '../utils/diskCapacityPresentation.mjs';
 
 // One IPC lease and one freshness deadline per renderer, not per component copy.
 export function createDiskCapacityStore({ ipc, now = Date.now,
@@ -11,12 +11,14 @@ export function createDiskCapacityStore({ ipc, now = Date.now,
     if (generation !== owner || !listeners.size) return;
     if (value?.epoch && value.epoch === snapshot.epoch && value.revision < snapshot.revision) return;
     clearTimer();
-    const state = diskCapacityPresentation(value, now());
-    publish(state === 'error' && value?.status === 'ready'
+    const displaySnapshot = diskCapacitySnapshotForDisplay(value);
+    const state = diskCapacityPresentation(displaySnapshot, now());
+    publish(state === 'error' && displaySnapshot?.status === 'ready'
       ? { ...EMPTY_DISK_CAPACITY, status: 'error', errorCode: 'invalid-measurement' }
-      : { ...value, status: state === 'stale' ? 'stale' : value?.status || 'unknown',
+      : { ...displaySnapshot,
+        status: state === 'healthy' || state === 'warning' ? 'ready' : state,
         ...(state === 'stale' ? { warning: null } : {}) });
-    const expiry = value?.status === 'ready' ? value.expiresAt : value?.ram?.expiresAt;
+    const expiry = displaySnapshot?.status === 'ready' ? displaySnapshot.expiresAt : displaySnapshot?.ram?.expiresAt;
     if (expiry > now()) {
       timer = setTimeoutFn(() => { timer = null;
         if (generation === owner && listeners.size) publish({ ...snapshot,

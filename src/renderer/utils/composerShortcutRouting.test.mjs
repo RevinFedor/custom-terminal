@@ -31,19 +31,19 @@ const surface = (overrides = {}) => ({
   ...overrides,
 });
 
-test('shared composer owns Cmd/Ctrl+F even when it is rendered through a portal', () => {
+test('History owns Cmd/Ctrl+F from its shared composer, including portals', () => {
   assert.equal(isComposerKeyboardTarget(target(true)), true);
   assert.equal(
     shouldOpenHistorySearchFromKeydown(event({ target: target(true) }), surface()),
-    false,
+    true,
   );
   assert.equal(
     shouldOpenHistorySearchFromKeydown(event({ metaKey: false, ctrlKey: true, target: target(true) }), surface()),
-    false,
+    true,
   );
 });
 
-test('History owns find only from its non-composer surface', () => {
+test('History owns find across its surface while raw-terminal presentation keeps its route', () => {
   assert.equal(shouldOpenHistorySearchFromKeydown(event(), surface()), true);
   assert.equal(
     shouldOpenHistorySearchFromKeydown(event(), surface({ terminalIsPrimary: true })),
@@ -53,6 +53,11 @@ test('History owns find only from its non-composer surface', () => {
     shouldOpenHistorySearchFromKeydown(event(), surface({ terminalOpen: true })),
     false,
   );
+});
+
+test('physical Cmd+F works in a non-Latin layout without claiming another physical key', () => {
+  assert.equal(shouldOpenHistorySearchFromKeydown(event({ code:'KeyF', key:'а', target:target(true) }), surface()), true);
+  assert.equal(shouldOpenHistorySearchFromKeydown(event({ code:'KeyG', key:'f' }), surface()), false);
 });
 
 test('History ignores unrelated, modified and already handled key events', () => {

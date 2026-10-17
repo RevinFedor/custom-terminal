@@ -202,6 +202,7 @@ export async function prepareAgentRuntimeForSend({
   let expectedTarget = pinnedTarget
     ? Object.freeze({ ...pinnedTarget })
     : createAgentSendTargetExpectation(runtime.toolType, sessionId);
+  let startupWait: { launchId: string; lifecycleGeneration: string; deadlineAt: number } | null = null;
   const observePhysicalTarget = () => {
     const observed = resolveReadyAgentSendTarget(expectedTarget, presence, runtime.toolType);
     // Pin the process as soon as Main proves it, including while starting.
@@ -276,6 +277,7 @@ export async function prepareAgentRuntimeForSend({
     presence,
     submitCapability,
     expectedTarget: resolveReadyAgentSendTarget(expectedTarget, presence, runtime.toolType),
+    codexStartupFrameWaitId: startupWait?.launchId || null,
   });
   console.log('[AgentScenario:send] presence before tool=' + runtime.toolType
     + ' tab=' + String(tabId).slice(-12)
@@ -373,7 +375,6 @@ export async function prepareAgentRuntimeForSend({
   }
 
   let deadline = Date.now() + 30000;
-  let startupWait: { launchId: string; lifecycleGeneration: string; deadlineAt: number } | null = null;
   const followStartupDeadline = () => {
     const window = runtime.toolType === 'codex' ? presence?.runtimeSnapshot?.startupWait : null;
     if (!window?.launchId || !window.lifecycleGeneration || !Number.isFinite(window.deadlineAt)) return;
@@ -521,6 +522,8 @@ export async function proveAgentComposerForSend({
   source,
   returnDraftOnConflict,
   initialExactEmptyEvidence,
+  codexStartupFrameWaitId: readyStartupFrameWaitId,
+  handoffId, sendAttemptId,
   assertSendNotCancelled,
 }: {
   tabId: string;
@@ -531,8 +534,12 @@ export async function proveAgentComposerForSend({
   source?: string;
   returnDraftOnConflict?: boolean;
   initialExactEmptyEvidence?: Record<string, unknown> | null;
+  codexStartupFrameWaitId?: string | null;
+  handoffId?: string;
+  sendAttemptId?: string | null;
   assertSendNotCancelled: () => void;
 }) {
+  let codexStartupFrameWaitId = readyStartupFrameWaitId || null;
   const canInspectDraft = !!runtime.probeDraft || !!runtime.inspectDraft;
   let exactEmptyEvidence = providerContract.carriesExactEmptyEvidence
     ? (initialExactEmptyEvidence || null)
@@ -540,9 +547,14 @@ export async function proveAgentComposerForSend({
 
   if ((statusForSend === 'active' || statusForSend === 'busy') && canInspectDraft) {
     let visual = runtime.probeDraft
-      ? await runtime.probeDraft(tabId, 'agent-send-preflight:' + (source || 'unknown'))
+      ? await runtime.probeDraft(tabId, 'agent-send-preflight:' + (source || 'unknown'), {
+          codexStartupFrameWaitId, handoffId, attemptId: sendAttemptId,
+        })
       : runtime.inspectDraft!(tabId);
     assertSendNotCancelled();
+    if (toolType === 'codex' && visual.codexStartupFrameWaitId) {
+      codexStartupFrameWaitId = visual.codexStartupFrameWaitId;
+    }
     let draftDecision = classifyAgentDraftPreflight(visual);
     if (needsExactDraftCapture(visual, draftDecision)) {
       const captureMode = returnDraftOnConflict === true ? 'grab' : 'copy';
@@ -685,6 +697,7 @@ export async function proveAgentComposerForSend({
 
   return {
     complete: false,
+    codexStartupFrameWaitId,
     exactEmptyEvidence,
     refreshExactEmptyEvidence,
   };

@@ -5,6 +5,7 @@ const os = require('os');
 const crypto = require('crypto');
 const readline = require('readline');
 const { performance } = require('perf_hooks');
+const { ensureExpiredHistoryTable, visibleHistorySql } = require('../storage-closed-tabs');
 
 // ========== GEMINI EMBEDDING PROVIDER ==========
 
@@ -364,6 +365,7 @@ function initSearchTables(db) {
 }
 
 function initTabTitleSearchTables(db) {
+  ensureExpiredHistoryTable(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS tab_history_title_index (
       history_id INTEGER PRIMARY KEY,
@@ -390,6 +392,7 @@ function initTabTitleSearchTables(db) {
 }
 
 function initTabIterationSearchTables(db) {
+  ensureExpiredHistoryTable(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS tab_history_iteration_index (
       history_id INTEGER NOT NULL,
@@ -817,8 +820,8 @@ function getIndexStats(db) {
 let _indexingInProgress = false;
 let _titleIndexingInProgress = false;
 let _iterationIndexingInProgress = false;
-const NON_FILE_HISTORY_PREDICATE = "(h.tab_type IS NULL OR h.tab_type != 'file')";
-const NON_FILE_HISTORY_PREDICATE_UNALIASED = "(tab_type IS NULL OR tab_type != 'file')";
+const NON_FILE_HISTORY_PREDICATE = `(h.tab_type IS NULL OR h.tab_type != 'file') AND ${visibleHistorySql('h')}`;
+const NON_FILE_HISTORY_PREDICATE_UNALIASED = `(tab_type IS NULL OR tab_type != 'file') AND ${visibleHistorySql()}`;
 
 function cleanupTabTitleIndex(db) {
   db.prepare(`

@@ -555,6 +555,7 @@ export async function interruptClaudePtyTurn(tabId: string): Promise<{
 export async function stopClaudePtyProcess(tabId: string, options: {
   reason?: string | null;
   authority?: Record<string, unknown> | null;
+  historyInput?: Record<string, unknown> | null;
   captureCodexRestartSettings?: boolean;
 } = {}): Promise<any> {
   if (!tabId) return { success: false, error: 'tabId required' };
@@ -569,6 +570,7 @@ export async function stopClaudePtyProcess(tabId: string, options: {
     toolType: 'claude',
     ...(options.reason ? { reason: options.reason } : {}),
     ...(options.authority ? { authority: options.authority } : {}),
+    ...(options.historyInput ? { historyInput: options.historyInput } : {}),
   })
     .then((result: any) => {
       console.log('[ClaudePtyActions:stop-process] done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' error=' + (result?.error || '-'));

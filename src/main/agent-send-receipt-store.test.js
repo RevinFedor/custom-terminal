@@ -941,6 +941,48 @@ test('enter-armed cannot move backwards to in-flight', (t) => {
   assert.equal(fixture.store.get(request.operationKey).state, STORE_STATES.ENTER_ARMED);
 });
 
+test('same-attempt late negative cannot undo durable Enter arm or release its retry guard', (t) => {
+  const h = openMemoryHarness(t);
+  if (!h) return;
+  const request = identity();
+  const begun = h.store.beginAttempt(request);
+  h.store.stageAttemptContext(request.operationKey, begun.attemptId, {
+    transportText: 'immutable prompt', transcriptBoundary: { byteOffset: 42 },
+  });
+  h.store.markAttemptState(request.operationKey, begun.attemptId, STORE_STATES.ENTER_ARMED);
+  const before = h.store.get(request.operationKey);
+  const late = h.store.settleAttempt(request.operationKey, begun.attemptId, {
+    success: false, submitted: false, pasteWritten: false, enterWritten: false,
+    status: 'not-submitted', deliveryUnknown: false, auditPending: false,
+    code: 'late_readiness_refusal',
+  });
+  assert.equal(late.applied, false);
+  assert.equal(late.reason, 'non-monotonic-attempt-state');
+  assert.deepEqual(h.store.get(request.operationKey), before);
+  assert.equal(h.store.beginAttempt(request).action, 'replay');
+  assert.equal(h.getUuidCount(), 1, 'late readiness cannot authorize a second physical attempt');
+  assert.equal(h.store.promoteFromAudit(exactAudit(begun.attemptId)).promoted, true);
+  assert.equal(h.store.get(request.operationKey).state, STORE_STATES.CONFIRMED);
+});
+
+test('Enter-arm monotonicity preserves exact provider rejection and real pre-arm refusal', (t) => {
+  const h = openMemoryHarness(t);
+  if (!h) return;
+  const request = identity({ provider: 'claude' });
+  const begun = h.store.beginAttempt(request);
+  h.store.markAttemptState(request.operationKey, begun.attemptId, STORE_STATES.ENTER_ARMED);
+  const rejected = h.store.settleAttempt(request.operationKey, begun.attemptId, exactProviderNotAccepted());
+  assert.equal(rejected.applied, true);
+  assert.equal(rejected.record.state, STORE_STATES.PROVIDER_NOT_ACCEPTED);
+  assert.equal(rejected.record.receipt.submitted, true);
+  const fresh = identity({ operationKey: 'fresh-no-input', handoffId: 'fresh-no-input' });
+  const attempt = h.store.beginAttempt(fresh);
+  const refused = h.store.settleAttempt(fresh.operationKey, attempt.attemptId,
+    { success: false, submitted: false, pasteWritten: false, enterWritten: false });
+  assert.equal(refused.applied, true);
+  assert.equal(refused.record.state, STORE_STATES.NOT_SUBMITTED);
+});
+
 test('restart distinguishes proven pre-Enter attempts from enter-armed unknown delivery', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-send-receipts-'));
   const filename = path.join(root, 'receipts.sqlite');

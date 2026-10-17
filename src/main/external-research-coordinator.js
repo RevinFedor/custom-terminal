@@ -128,9 +128,14 @@ class ExternalResearchCoordinator {
             externalResearchStartAttemptedAt: Date.now(),
             externalResearchTransportError: null,
             deliveryDeferredReason: null,
-          });
+          }, { unlessTerminal: true });
+          if (!attempting) return;
           await this.store.persistStrict();
-          this.emitChanges(attempting ? [attempting] : [], reason + '-start-attempt');
+          const current = await this.store.getInternal(runId);
+          if (signal.aborted || this.stopped || !current
+            || current.runKind !== 'external-research' || current.externalResearchJobId !== jobId
+            || ['completed', 'failed', 'cancelled'].includes(current.status)) return;
+          this.emitChanges([attempting], reason + '-start-attempt');
           snapshot = await this.client.start({
             jobId,
             provider: intent.provider,

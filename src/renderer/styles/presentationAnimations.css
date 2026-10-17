@@ -54,7 +54,15 @@
   [data-history-owner][data-history-presented="0"],
   [data-tab-sidebar-layer][data-sidebar-presented="0"],
   [data-workspace-presentation][aria-hidden="true"]
-) .cm-composer-token[data-composer-token-id^="dictation:"]::before {
+) .cm-composer-token[data-composer-token-id^="dictation:"]::before,
+:is(
+  [data-terminal-pane-wrapper][data-terminal-surface-presented="0"],
+  [data-terminal-pane-chrome-host][aria-hidden="true"],
+  [data-single-center-focus-boundary][aria-hidden="true"],
+  [data-history-owner][data-history-presented="0"],
+  [data-tab-sidebar-layer][data-sidebar-presented="0"],
+  [data-workspace-presentation][aria-hidden="true"]
+) .hp-history-composer-preparing::after {
   animation-play-state: paused !important;
 }
 

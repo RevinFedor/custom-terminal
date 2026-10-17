@@ -49,12 +49,20 @@ async function hashFileSegment(filePath, fromByte, toByte) {
 }
 
 function decoratePhysicalRecord(record, segment, segmentIndex) {
-  return {
+  const decorated = {
     ...record,
     __physicalSessionId: segment.physicalSessionId,
     __segmentId: segment.segmentId,
     __segmentIndex: segmentIndex,
   };
+  // These are still raw operation records, not public History DTOs. The
+  // reader's non-enumerable symbol metadata owns verified image byte ranges;
+  // object spread alone drops it and leaves only display placeholders for COW.
+  // Keep the original descriptors private; JSON/provider payloads ignore them.
+  for (const key of Object.getOwnPropertySymbols(record ?? {})) {
+    Object.defineProperty(decorated, key, Object.getOwnPropertyDescriptor(record, key));
+  }
+  return decorated;
 }
 
 function virtualEntryRef(viewOwnerSessionId, entry, segmentBySession) {

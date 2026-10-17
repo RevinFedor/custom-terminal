@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { ArrowLeftRight, BringToFront, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search, FolderInput, Minimize2 } from 'lucide-react';
-import {requestHistorySearch} from '../../utils/historySearchMarkers';
+import { ArrowLeftRight, BringToFront, Columns2, MessageSquareText, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search, FolderInput, Minimize2 } from 'lucide-react';
+import {requestHistorySearch,requestInputSearch} from '../../utils/historySearchMarkers';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -46,6 +46,7 @@ import { IdleSessionStopCountdown } from './IdleSessionStopCountdown';
 import { acquireInteractionCursor } from '../../utils/interactionCursor';
 import { reportPerfIncident } from '../../utils/perfIncidentChannel';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
+import { bindFilePaneReadingPosition } from '../../utils/filePaneReadingPosition.mjs';
 import '@gt-editor/markdown-editor/styles.css';
 
 const { ipcRenderer } = window.require('electron');
@@ -196,10 +197,15 @@ export function SplitPaneAttachRow({
     && workspaceSwapPicker.sourceSpaceId === activeSpaceId
     && workspaceSwapPicker.sourcePaneIndex === sourcePaneAddress;
   const timelineTreeMode = useUIStore((s) => s.timelineTreeModeTabs[tabId] ?? false);
-  const canSearchHistory = useWorkspaceStore(state => {
+  const historyMcpAsUser = useUIStore((s) => s.historyMcpAsUserTabs[tabId] ?? false);
+  const searchTarget = useWorkspaceStore(state => {
     const tab=state.openProjects.get(projectId)?.tabs.get(tabId);
-    return !!tab && tab.tabType !== 'file' && (tab.commandType === 'claude' || tab.commandType === 'codex' || tab.tabType === 'claude-sdk');
+    if(!tab || tab.tabType === 'file')return null;
+    if(tab.tabType === 'claude-sdk')return 'history';
+    return tab.commandType === 'claude' || tab.commandType === 'codex' ? 'input' : null;
   });
+  const canSearchHistory = searchTarget !== null;
+  const canSearchInput = searchTarget === 'input';
   const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
   const historyPinned = useUIStore((s) => s.historyPinned);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
@@ -864,15 +870,16 @@ export function SplitPaneAttachRow({
               onClick={()=>{if(sourceWindowId && useWorkspaceStore.getState().minimizeWorkspaceWindow(activeSpaceId,sourceWindowId))setStripMenu(null);}}>
               <Minimize2 size={13}/>Minimize
             </button>
-            {!vacant && canSearchHistory && <button type="button" role="menuitem" data-split-strip-menu-item="search-history"
+            {!vacant && canSearchHistory && <button type="button" role="menuitem" data-split-strip-menu-item={canSearchInput?'search-input':'search-history'}
               onClick={(event)=>{
                 event.stopPropagation();setStripMenu(null);
                 useUIStore.getState().setHistoryPanelOpen(tabId,true);
                 useUIStore.getState().setSideTerminalOpen(tabId,false);
-                requestHistorySearch(tabId);
+                if(canSearchInput)requestInputSearch(tabId);
+                else requestHistorySearch(tabId);
               }}
               style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',cursor:'pointer'}}>
-              <Search size={13}/><span style={{flex:1,textAlign:'left'}}>Search</span><span style={{fontSize:10,color:'#999'}}>⌘F</span>
+              <Search size={13}/><span style={{flex:1,textAlign:'left'}}>{canSearchInput?'Search input':'Search'}</span>{!canSearchInput&&<span style={{fontSize:10,color:'#999'}}>⌘F</span>}
             </button>}
             <TabMenuChoices label="Move" icon={<FolderInput size={13}/>} action="move-window-to-workflow" side="left"
               choices={workflows.filter(workflow=>workflow.id!==activeSpaceId).map(workflow=>({id:workflow.id,name:workflow.name}))}
@@ -966,6 +973,28 @@ export function SplitPaneAttachRow({
                 : <PanelRightOpen size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />}
               Timeline
             </div>}
+            {!vacant && canSearchHistory && <button
+              type="button"
+              role="menuitemcheckbox"
+              aria-checked={historyMcpAsUser}
+              data-split-strip-menu-item="mcp-as-user"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                useUIStore.getState().setHistoryMcpAsUser(tabId, !historyMcpAsUser);
+              }}
+              style={{ ...CONTEXT_MENU_ROW_STYLE, width: '100%', display: 'flex', alignItems: 'center',
+                gap: 8, border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', whiteSpace: 'nowrap' }}
+            >
+              <MessageSquareText size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
+              <span style={{ flex: 1, textAlign: 'left' }}>MCP как user</span>
+              <span aria-hidden="true" style={{ display: 'inline-flex', alignItems: 'center', width: 24, height: 14,
+                flexShrink: 0, padding: 2, boxSizing: 'border-box', borderRadius: 7,
+                background: historyMcpAsUser ? '#7c3aed' : '#49494f' }}>
+                <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#ddd',
+                  transform: historyMcpAsUser ? 'translateX(10px)' : undefined }} />
+              </span>
+            </button>}
             {!vacant && <IdleSessionStopCountdown tabId={tabId} />}
           </div>
         </>,
@@ -1555,26 +1584,41 @@ export function SplitDividerLayer() {
 // stays the single-mode surface; a pane needs its own reader because the
 // overlay is a fixed singleton covering the whole window.
 export function SplitFilePane({ filePath, visible }: { filePath: string; visible: boolean }) {
-  const [content, setContent] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState<{ path: string; content: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fontSize = 13;
+  const detachReadingPosition = useRef<(() => void) | null>(null);
+  const onEditorView = useCallback((view: any) => {
+    detachReadingPosition.current?.();
+    detachReadingPosition.current = view ? bindFilePaneReadingPosition({
+      scroller: view.scrollDOM,
+      path: filePath,
+      save: (path: string, top: number) => useUIStore.getState().setFilePreviewScrollTop(path, top),
+    }) : null;
+  }, [filePath]);
+  useEffect(() => () => {
+    detachReadingPosition.current?.();
+    detachReadingPosition.current = null;
+  }, [onEditorView]);
 
   useEffect(() => {
     let cancelled = false;
     if (!filePath) return undefined;
-    setContent(null);
+    setLoaded(null);
     setError(null);
     ipcRenderer.invoke('file:read', filePath).then((result: any) => {
       if (cancelled) return;
-      if (result?.success) setContent(String(result.content ?? ''));
+      if (result?.success) setLoaded({ path: filePath, content: String(result.content ?? '') });
       else setError(result?.error || 'Не удалось прочитать файл');
     }).catch((e: any) => { if (!cancelled) setError(e?.message || String(e)); });
     return () => { cancelled = true; };
   }, [filePath, visible]);
 
   if (!visible) return null;
+  const content = loaded?.path === filePath ? loaded.content : null;
   return (
-    <div style={{ position: 'absolute', inset: 0, background: '#161522', overflow: 'hidden', display: 'flex', flexDirection: 'column', pointerEvents: 'auto' }}>
+    <div data-split-file-path={filePath} data-loaded-file-path={content === null ? undefined : filePath}
+      style={{ position: 'absolute', inset: 0, background: '#161522', overflow: 'hidden', display: 'flex', flexDirection: 'column', pointerEvents: 'auto' }}>
       {error ? (
         <div style={{ padding: 16, color: '#f87171', fontSize: 12.5 }}>{error}</div>
       ) : content === null ? (
@@ -1583,6 +1627,8 @@ export function SplitFilePane({ filePath, visible }: { filePath: string; visible
         <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
           <MarkdownEditor
             content={content}
+            onEditorView={onEditorView}
+            initialScrollTop={useUIStore.getState().getFilePreviewScrollTop(filePath)}
             onChange={() => {}}
             readOnly
             fontSize={fontSize}
