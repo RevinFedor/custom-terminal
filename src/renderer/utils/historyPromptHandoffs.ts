@@ -7,6 +7,7 @@ import {
   projectAgentLocalCommandSendResult,
 } from './agentLocalCommand.mjs';
 import { isAutomaticReadinessWaitReceipt } from '../../shared/prompt-queue-send-intent.cjs';
+import { readHistorySendRecovery, removeHistorySendRecovery } from './historySendRecovery.mjs';
 import { hiddenSendPresentation, canProjectCurrentProviderQueue, retiredSendInputSlot, cancelledSendIntent, isTabMessageNoInputReceipt } from '../../shared/agent-send-receipt-control.cjs';
 
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
@@ -128,6 +129,7 @@ export interface HistoryPromptHandoff {
   authoringChips: readonly Readonly<Record<string, any>>[];
   authoringImagePaths: readonly Readonly<HistoryPromptHandoffImageRef>[];
   submittedAt: number;
+  enterAttemptAt?: number;
   source: string;
   statusAtSend: HistoryPromptHandoffAgentStatus;
   queueStatus: HistoryPromptHandoffStatus;
@@ -192,6 +194,7 @@ export interface BeginHistoryPromptHandoffInput {
   authoringChips?: readonly Record<string, any>[];
   authoringImagePaths?: readonly HistoryPromptHandoffImageRef[];
   submittedAt?: number;
+  enterAttemptAt?: number;
   source?: string;
   statusAtSend?: HistoryPromptHandoffAgentStatus;
   initialStatus?: Extract<HistoryPromptHandoffStatus, 'preparing' | 'sending' | 'queued' | 'application-queued'>;
@@ -328,6 +331,7 @@ export type BindHistoryPromptHandoffSendIdentityResult =
  * timestamps are presentation data, never identity fallbacks.
  */
 export interface HistoryPromptHandoffProjectionRow {
+  enterAttemptAt?: number;
   semanticTags?: readonly Readonly<HistoryPromptHandoffSemanticTag>[];
   applicationQueuePosition?: number;
   applicationQueueMerge?: QueuedMessageMergeGuard | null;
@@ -416,7 +420,7 @@ export interface HistoryPromptHandoffStoreStats {
   approxBytes: number;
 }
 
-export type HistoryPromptHandoffTransportPhase = 'sending' | 'queued' | 'confirming';
+export type HistoryPromptHandoffTransportPhase = 'preparing' | 'sending' | 'queued' | 'confirming';
 
 export function historyPromptHandoffInitialStatus(
   statusAtSend: HistoryPromptHandoffAgentStatus | null | undefined,
@@ -798,6 +802,7 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
     && row.statusAtSend === handoff.statusAtSend
     && row.timestamp === timestamp
     && row.optimisticAt === handoff.submittedAt
+    && row.enterAttemptAt === handoff.enterAttemptAt
     && row.requiresAuditIdentity === handoff.requiresAuditIdentity
     && row.auditTimestamp === auditTimestamp
     && row.auditHash === auditHash
@@ -822,6 +827,7 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
     statusAtSend: handoff.statusAtSend,
     timestamp,
     optimisticAt: handoff.submittedAt,
+    enterAttemptAt: handoff.enterAttemptAt,
     requiresAuditIdentity: handoff.requiresAuditIdentity,
     auditTimestamp,
     auditHash,
@@ -1074,7 +1080,8 @@ export class HistoryPromptHandoffStore {
       // terminal. A duplicate begin without a fresh attempt id stays
       // idempotent and can never clear an exact receipt.
       if (nextAttemptId && nextAttemptId !== currentAttemptId) {
-        const submittedAt = finiteTimestamp(input.submittedAt, Date.now());
+        const submittedAt = currentAttemptId
+          ? finiteTimestamp(input.submittedAt, Date.now()) : existing.value.submittedAt;
         const initialReceipt = input.initialReceipt;
         const initialStatus = initialReceipt?.queueStatus || input.initialStatus || 'sending';
         const next = freezeHandoff({
@@ -1089,6 +1096,7 @@ export class HistoryPromptHandoffStore {
             ? input.sessionIdHint
             : existing.value.sessionIdHint,
           submittedAt,
+          enterAttemptAt: currentAttemptId ? input.enterAttemptAt : existing.value.enterAttemptAt || input.enterAttemptAt,
           source: typeof input.source === 'string' ? input.source : existing.value.source,
           semanticTags: input.semanticTags || existing.value.semanticTags,
           // null → first attempt only binds the existing click to its durable
@@ -1162,6 +1170,7 @@ export class HistoryPromptHandoffStore {
       authoringChips: input.authoringChips || [],
       authoringImagePaths: input.authoringImagePaths || input.imagePaths || [],
       submittedAt,
+      enterAttemptAt: input.enterAttemptAt,
       source: typeof input.source === 'string' ? input.source : '',
       statusAtSend: input.statusAtSend || 'unknown',
       queueStatus: initialStatus,
@@ -1198,6 +1207,35 @@ export class HistoryPromptHandoffStore {
     return value;
   }
 
+  recordEnterAttempt(tabId: string, handoffId: string, input: BindHistoryPromptHandoffSendIdentityInput & { enterAttemptAt?: number }) {
+    const current = this.tabs.get(tabId)?.get(handoffId)?.value;
+    if (!current || !Number.isFinite(input.enterAttemptAt) || Number(input.enterAttemptAt) <= 0
+      || current.enterAttemptAt || !historyPromptHandoffAcceptsAuditIdentity(current, input)
+      || (current.requiresAuditIdentity && (!input.sendAttemptId || !input.sendOperationKey))) return current;
+    const bound = this.bindSendIdentity(tabId, handoffId, input);
+    if (!bound.ok) return current;
+    const tab = this.tabs.get(tabId)!;
+    const owned = tab.get(handoffId)!;
+    const next = freezeHandoff({ ...owned.value, enterAttemptAt: input.enterAttemptAt });
+    tab.set(handoffId, { ...owned, value: next });
+    this.notify(tabId, { type: 'transport-phase', handoffId });
+    return next;
+  }
+
+  preparePresentation(tabId: string, handoffId: string, input: Pick<BeginHistoryPromptHandoffInput, 'text' | 'imagePaths'>) {
+    const tab = this.tabs.get(tabId);
+    const current = tab?.get(handoffId);
+    if (!tab || !current || current.value.sendAttemptId || current.value.sendOperationKey
+      || current.value.queueStatus !== 'preparing') return undefined;
+    const next = freezeHandoff({ ...current.value, text: input.text, imagePaths: input.imagePaths || [] });
+    const approxBytes = estimateHandoffBytes(next);
+    if (approxBytes > this.limits.maxBytes) return undefined;
+    this.approxBytes += approxBytes - current.approxBytes;
+    tab.set(handoffId, { value: next, approxBytes });
+    this.notify(tabId, { type: 'transport-phase', handoffId });
+    return next;
+  }
+
   advanceTransportPhase(
     tabIdValue: string,
     handoffIdValue: string,
@@ -1221,7 +1259,10 @@ export class HistoryPromptHandoffStore {
     }
 
     let queueStatus: HistoryPromptHandoffStatus | null = null;
-    if (phase === 'queued') {
+    if (phase === 'preparing') {
+      if (!current.value.providerQueueProof && !current.value.auditProof
+        && ['application-queued', 'sending', 'queued'].includes(current.value.queueStatus)) queueStatus = 'preparing';
+    } else if (phase === 'queued') {
       if (current.value.queueStatus === 'application-queued' || current.value.queueStatus === 'preparing' || current.value.queueStatus === 'sending') {
         queueStatus = 'queued';
       }
@@ -1246,6 +1287,7 @@ export class HistoryPromptHandoffStore {
       queueStatus,
       statusReason: phase === 'confirming'
         ? 'send-enter-written-confirming'
+        : phase === 'preparing' ? 'send-preparing'
         : phase === 'queued'
           ? 'send-ready-queued'
           : 'send-ready-pasting',
@@ -1650,6 +1692,7 @@ export class HistoryPromptHandoffStore {
       if (status !== 'failed' && status !== 'cancelled') continue;
       if (now - record.value.statusChangedAt < HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS) continue;
       if (record.value.applicationQueueId) continue;
+      if (record.value.statusReason === 'history-preparation-interrupted') continue;
       tab.delete(handoffId);
       this.handoffs -= 1;
       this.approxBytes -= record.approxBytes;
@@ -1724,6 +1767,16 @@ export class HistoryPromptHandoffStore {
 }
 
 const historyPromptHandoffStore = new HistoryPromptHandoffStore();
+// Restore presentation/recovery only. A dispatched request may already have
+// reached Main; absence of a renderer reply cannot authorize another Send.
+try {
+  for (const { input, phase } of readHistorySendRecovery()) {
+    historyPromptHandoffStore.begin({ ...input, initialReceipt: {
+      queueStatus: phase === 'preparing' ? 'failed' : 'delivery-unknown',
+      reason: phase === 'preparing' ? 'history-preparation-interrupted' : 'history-send-reply-interrupted',
+    } });
+  }
+} catch (error) { console.warn('[HistorySendRecovery] restore failed:', error); }
 export const hydrateHistoryPromptHandoffImages = (record: DurableHistorySendReceiptRecord) =>
   historyPromptHandoffStore.hydrateImagePresentation(record);
 
@@ -1890,11 +1943,16 @@ export async function runHistoryPromptHandoff(
     imageCount: input.imagePaths?.length || 0,
     chipCount: input.promptChips?.length || 0,
   });
-  store.begin({
+  const begun = store.begin({
     ...input,
     handoffId,
     requiresAuditIdentity: !localCommandCandidate,
   });
+  if (input.initialStatus === 'preparing' && input.sendAttemptId
+    && begun?.sendAttemptId === input.sendAttemptId
+    && begun?.sendOperationKey === input.sendOperationKey) {
+    store.advanceTransportPhase(input.tabId, handoffId, 'preparing');
+  }
 
   try {
     const result = await input.send(handoffId);
@@ -2006,6 +2064,14 @@ export const bindHistoryPromptHandoffSendIdentity = (
   input: BindHistoryPromptHandoffSendIdentityInput,
 ) => historyPromptHandoffStore.bindSendIdentity(tabId, handoffId, input);
 
+export const recordHistorySendEnterAttempt = (data: BindHistoryPromptHandoffSendIdentityInput & {
+  tabId: string; handoffId: string; enterAttemptAt?: number;
+}) => historyPromptHandoffStore.recordEnterAttempt(data.tabId, data.handoffId, data);
+
+export const prepareHistoryPromptHandoffPresentation = (tabId: string, handoffId: string,
+  input: Pick<BeginHistoryPromptHandoffInput, 'text' | 'imagePaths'>) =>
+  historyPromptHandoffStore.preparePresentation(tabId, handoffId, input);
+
 export const advanceHistoryPromptHandoffTransportPhase = (
   tabId: string,
   handoffId: string,
@@ -2034,10 +2100,14 @@ export const retractHistoryPromptHandoff = (
   tabId: string,
   handoffId: string,
   reason: string,
-) => historyPromptHandoffStore.retract(tabId, handoffId, reason);
+) => {
+  return historyPromptHandoffStore.retract(tabId, handoffId, reason);
+};
 
-export const consumeHistoryPromptHandoff = (tabId: string, handoffId: string) =>
-  historyPromptHandoffStore.consume(tabId, handoffId);
+export const consumeHistoryPromptHandoff = (tabId: string, handoffId: string) => {
+  removeHistorySendRecovery(tabId, handoffId);
+  return historyPromptHandoffStore.consume(tabId, handoffId);
+};
 
 export const subscribeHistoryPromptHandoffs = (
   tabId: string,
@@ -2255,10 +2325,12 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
         semanticTags: presentation.semanticTags,
         promptChips: presentation.promptChips || [], authoringText: receipt.authoringSnapshot?.editorText,
         authoringChips: receipt.authoringSnapshot?.chips, authoringImagePaths: receipt.authoringSnapshot?.imagePaths,
-        submittedAt: Number(record.createdAt), requiresAuditIdentity: true,
+        submittedAt: Number(presentation.historySendStartedAt) || Number(record.createdAt),
+        enterAttemptAt: receipt.enterAttemptAt, requiresAuditIdentity: true,
         initialReceipt: { queueStatus: receipt.cancelled || record.applicationQueue?.state === 'cancelled' ? 'cancelled' : 'failed',
           reason: receipt.code || 'application-queue-not-submitted' } });
       historyPromptHandoffStore.hydrateSemanticPresentation(record);
+      if (handoff) removeHistorySendRecovery(tabId, handoffId);
       return { hydrated: !!handoff, reason: 'application-queue-not-submitted',
         handoff: getHistoryPromptHandoffsSnapshot(tabId).find(item => item.handoffId === handoffId) || handoff };
     }
@@ -2434,7 +2506,8 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     authoringText: receipt.authoringSnapshot?.editorText,
     authoringChips: receipt.authoringSnapshot?.chips,
     authoringImagePaths: receipt.authoringSnapshot?.imagePaths,
-    submittedAt: Number(record.applicationQueue?.queuedAt) || Number(record.createdAt) || Date.now(),
+    submittedAt: Number(presentation.historySendStartedAt) || Number(record.applicationQueue?.queuedAt) || Number(record.createdAt) || Date.now(),
+    enterAttemptAt: receipt.enterAttemptAt,
     source: typeof receipt.source === 'string' ? receipt.source : 'history-panel',
     statusAtSend: 'unknown',
     requiresAuditIdentity: true,
@@ -2448,6 +2521,9 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     sendOperationKey: operationKey,
   });
   if (!bound.ok) return { hydrated: false, reason: bound.reason };
+  const timedHandoff = historyPromptHandoffStore.recordEnterAttempt(tabId, handoffId, {
+    sendAttemptId: attemptId, sendOperationKey: operationKey, enterAttemptAt: receipt.enterAttemptAt,
+  });
   let hydratedHandoff = initialProviderQueueProof
     && bound.handoff.providerQueueProof?.sourceIdentity !== initialProviderQueueProof.sourceIdentity
     ? acceptHistoryPromptHandoffProviderQueue(tabId, handoffId, {
@@ -2456,7 +2532,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
         proof: initialProviderQueueProof,
         changedAt: Number(record.updatedAt) || Date.now(),
     }) || bound.handoff
-    : bound.handoff;
+    : timedHandoff || bound.handoff;
 
   // The receipt may be the first creator or the first attempt binding of
   // this local card. Enrichment before begin/bind cannot prove that identity.
@@ -2472,8 +2548,10 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   }
 
   if (!queueStatus) {
+    removeHistorySendRecovery(tabId, handoffId);
     return { hydrated: true, reason: 'durable-history-send-active', handoff: hydratedHandoff };
   }
+  removeHistorySendRecovery(tabId, handoffId);
   return {
     hydrated: true,
     reason: 'durable-history-receipt-hydrated',

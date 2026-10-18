@@ -57,12 +57,65 @@ function rowsDto(rows, fileVerdict) {
   }) };
 }
 
+// All accepted containers below are created by this projection/selector. Only
+// immutable scalar values may come from the mutable stores; opaque values keep
+// the original JSON path. In particular, this never caches a Tab/Map identity.
+const jsonScalar = value => value === null || typeof value === 'string'
+  || typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value);
+const scalarRecord = value => value !== null && typeof value === 'object'
+  && !Array.isArray(value) && !('toJSON' in value)
+  && Object.keys(value).every(key => jsonScalar(value[key]));
+function scalarArray(value) {
+  if (!Array.isArray(value)) return false;
+  // for-of visits holes as undefined, unlike every: JSON would encode them null.
+  for (const item of value) if (!jsonScalar(item)) return false;
+  return true;
+}
+function comparablePublication([desktop, mru, catalog]) {
+  if ('toJSON' in [] || 'toJSON' in desktop || 'toJSON' in catalog) return false;
+  if (!Object.keys(desktop).every(key => key === 'visibleTabIds'
+    ? scalarArray(desktop[key]) : jsonScalar(desktop[key]))) return false;
+  for (const pair of mru) if (!Array.isArray(pair) || pair.length !== 2 || !scalarArray(pair)) return false;
+  if (!scalarRecord(catalog.icons)) return false;
+  for (const row of catalog.rows) {
+    if ('toJSON' in row || !Object.keys(row).every(key => {
+      const value = row[key];
+      return key === 'fileRef' || key === 'iconFallback'
+        ? value === null || scalarRecord(value) : jsonScalar(value);
+    })) return false;
+  }
+  return true;
+}
+// A fast snapshot has no JSON hooks. If a hook is introduced later, encode
+// that previous value with neutral private containers, not the new prototype.
+function neutralPublicationValue(value) {
+  if (value === null || typeof value !== 'object') return value;
+  const copy = Array.isArray(value) ? Object.setPrototypeOf([], null) : Object.create(null);
+  for (const key of Object.keys(value)) copy[key] = neutralPublicationValue(value[key]);
+  return copy;
+}
+function samePublicationValue(left, right) {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
+  if (Array.isArray(left)) {
+    if (!Array.isArray(right) || left.length !== right.length) return false;
+    for (let i = 0; i < left.length; i++) if (!samePublicationValue(left[i], right[i])) return false;
+    return true;
+  }
+  if (Array.isArray(right)) return false;
+  const a = Object.keys(left), b = Object.keys(right);
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]
+    || !samePublicationValue(left[a[i]], right[b[i]])) return false;
+  return true;
+}
+
 // A revisioned read projection of the same store snapshots the panel consumes.
 // Subscription ownership lives in App; this object has no timers/navigation.
 export function createWorkspaceSwitcherSnapshot({ epoch, readWorkspace, readProjects, readReady = () => true,
   fileVerdict = () => undefined, probeFiles = async () => {}, inboxName = 'Inbox', onChanged = () => {} }) {
   if (!epoch) throw Error('switcher_epoch_required');
-  let revision = 0, fingerprint = null, disposed = false;
+  let revision = 0, fingerprint = null, published = null, disposed = false;
   const capture = () => {
     if (disposed) fail('switcher_renderer_retired');
     const ws = readWorkspace();
@@ -72,9 +125,20 @@ export function createWorkspaceSwitcherSnapshot({ epoch, readWorkspace, readProj
     });
     const catalog = rowsDto(selectSwitcherRows(input).rows, fileVerdict);
     // Explicit metadata only. Never serialize the full Tab (draft/chips/body).
-    const next = JSON.stringify([input.desktop, input.globalMru.map(x => [x.projectId, x.tabId]), catalog]);
-    if (next !== fingerprint) {
-      fingerprint = next; revision++;
+    const value = [input.desktop, input.globalMru.map(x => [x.projectId, x.tabId]), catalog];
+    let changed;
+    if (comparablePublication(value)) {
+      changed = published !== null ? !samePublicationValue(published, value)
+        : typeof fingerprint !== 'string' || fingerprint.startsWith('unavailable:')
+          || JSON.stringify(value) !== fingerprint;
+      published = value; fingerprint = null;
+    } else {
+      const next = JSON.stringify(value);
+      changed = next !== (published !== null ? JSON.stringify(neutralPublicationValue(published)) : fingerprint);
+      published = null; fingerprint = next;
+    }
+    if (changed) {
+      revision++;
       onChanged({ version: 1, epoch, revision, available: true });
     }
     return { input, catalog: catalog.rows };
@@ -82,6 +146,7 @@ export function createWorkspaceSwitcherSnapshot({ epoch, readWorkspace, readProj
   const refresh = () => {
     try { capture(); } catch (error) {
       if (disposed) return;
+      published = null;
       const next = 'unavailable:' + error.code;
       if (fingerprint !== next) {
         fingerprint = next; revision++;

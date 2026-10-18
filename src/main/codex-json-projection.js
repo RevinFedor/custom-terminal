@@ -13,6 +13,7 @@ const ITEMS = Symbol('array items');
 const RANGE = Symbol('physical JSON value');
 
 const CHUNK_BYTES = 1024 * 1024;
+const TOKEN_FRAGMENT_BATCH = 1024;
 // readJsonlRange trims ECMAScript whitespace at the physical line boundary
 // before JSON.parse. Inside a JSON value only JSON whitespace is legal.
 const EDGE_WHITESPACE = ['\u00a0', '\u1680', '\u2000', '\u2001', '\u2002', '\u2003',
@@ -63,10 +64,24 @@ function createJsonProjection(rootSchema) {
     token.length += text.length;
     // Only keys longer than every possible selected key can be discarded.
     // This is not a size limit on selected names or searchable values.
-    if (token.key && token.length > token.keyLimit) { token.capture = false; token.parts = []; return; }
+    if (token.key && token.length > token.keyLimit) {
+      token.capture = false; token.parts = []; token.blocks = undefined; return;
+    }
     token.parts.push(text);
+    // Escapes and tiny writes can produce one fragment per encoded byte. Keep
+    // the complete token in blocks, without retaining millions of references
+    // or repeatedly joining its entire growing prefix.
+    if (token.parts.length >= TOKEN_FRAGMENT_BATCH) {
+      (token.blocks ||= []).push(token.parts.join(''));
+      token.parts = [];
+    }
     maxTokenBytes = Math.max(maxTokenBytes, token.length);
     maxBufferedBytes = Math.max(maxBufferedBytes, chunkBytes + token.length);
+  };
+  const tokenText = () => {
+    if (!token.blocks) return token.parts.join('');
+    if (token.parts.length) token.blocks.push(token.parts.join(''));
+    return token.blocks.join('');
   };
   const atomPiece = text => {
     // Validate discarded numbers/literals without buffering them. A legal
@@ -105,17 +120,17 @@ function createJsonProjection(rootSchema) {
     if (token.key) {
       const parent = stack.at(-1);
       parent.key = token.capture
-        ? JSON.parse(Buffer.from(token.parts.join(''), 'latin1').toString('utf8')) : null;
+        ? JSON.parse(Buffer.from(tokenText(), 'latin1').toString('utf8')) : null;
       parent.state = 'colon';
     } else {
       let result;
       if (token.kind === 'atom') {
         if (token.word ? token.wordIndex !== token.word.length
           : !['zero', 'int', 'fraction', 'exponent'].includes(token.numberState)) throw Error('atom');
-        if (token.capture) result = JSON.parse(token.parts.join(''));
+        if (token.capture) result = JSON.parse(tokenText());
         else if (token.schema === PRESENCE) result = token.word === 'null' ? null : 0;
       } else if (token.capture) {
-        result = JSON.parse(Buffer.from(token.parts.join(''), 'latin1').toString('utf8'));
+        result = JSON.parse(Buffer.from(tokenText(), 'latin1').toString('utf8'));
       } else if (token.schema === PRESENCE) result = '';
       put(result, token.schema, token.from, end);
     }

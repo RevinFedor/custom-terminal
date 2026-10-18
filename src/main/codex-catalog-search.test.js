@@ -33,11 +33,9 @@ const isNoise = Function(`return (${functionText('_isNoisePrompt')})`)();
 const promptText = Function('extractClaudePromptCarrier', `return (${functionText('_extractTurnPromptText')})`)(
   require('./claude-prompt-carriers').extractClaudePromptCarrier);
 const collect = Function(`return (${functionText('_collectAssistantBlocks')})`)();
-const groupStart = main.indexOf('  const codexTimelineUsersByUuid =', main.indexOf('async function _loadCodexSessionTurns'));
-const groupEnd = main.indexOf('\n  const annotations =', groupStart);
-assert.ok(groupStart > 0 && groupEnd > groupStart);
-const group = Function('historyEntries', 'timelineEntries', 'sessionId', '_isNoisePrompt', '_sessionProgressToolDetail',
-  main.slice(groupStart, groupEnd) + '\nreturn {turns, recordMap};');
+const { buildCodexTurnsDto } = require('./codex-turns-projection');
+const group = (historyEntries, timelineEntries, sessionId, isNoisePrompt, toolDetail) =>
+  buildCodexTurnsDto({ historyEntries, timelineEntries, sessionId, isNoisePrompt, toolDetail });
 const searchStart = main.indexOf('    const iterations = [];', main.indexOf('async function searchSessionCatalog'));
 const searchEnd = main.indexOf('    if (sessionMatches.length === 0)', searchStart);
 assert.ok(searchStart > 0 && searchEnd > searchStart);

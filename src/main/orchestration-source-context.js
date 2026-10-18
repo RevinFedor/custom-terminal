@@ -1,5 +1,8 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
+const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+
 // A dismissed attention badge is not evidence that the source model received
 // its completion prompt. This is a small read projection of the SAME durable
 // run, not another notification, result read, queue item or retry.
@@ -37,4 +40,36 @@ function completionContextText(facts) {
   ].join('\n');
 }
 
-module.exports = { sourceCompletionFacts, completionContextText };
+// The prefix is read from the app's frozen handoff, never discovered in user
+// text. Only its exact confirmed carrier can acquire this display projection.
+function completionContextPresentation(handoff, record) {
+  const receipt = record?.receipt, audit = record?.auditIdentity;
+  if (!handoff || record?.state !== 'confirmed' || !['claude', 'codex'].includes(record.provider)
+    || handoff.tab_id !== record.tabId || handoff.handoff_id !== record.handoffId
+    || !audit || audit.attemptId !== record.attemptId || audit.provider !== record.provider
+    || !record.operationKey || !audit.sessionId || audit.sessionId !== record.sessionId
+    || receipt?.sessionId !== audit.sessionId || receipt.exactAuditConfirmed !== true
+    || !audit.auditTimestamp || !Number.isFinite(Date.parse(audit.auditTimestamp))
+    || receipt.auditTimestamp !== audit.auditTimestamp
+    || !audit.entryUuid && !audit.sourceIdentity
+    || !handoff.prepared_prompt || receipt.transportText !== handoff.prepared_prompt
+    || handoff.payload_hash !== promptAuditFingerprint(handoff.prepared_prompt)
+    || audit.promptHash !== handoff.payload_hash || receipt.actualHash !== handoff.payload_hash) return null;
+  let facts;
+  try { facts = JSON.parse(handoff.continuation_facts || '[]').map(value => JSON.parse(value)); } catch { return null; }
+  if (!facts.length || facts.length > 8 || facts.some(fact => !Array.isArray(fact) || fact.length !== 5
+    || fact[0] !== 'orchestration-completion-v1' || typeof fact[1] !== 'string' || !fact[1]
+    || fact[3] !== record.provider || fact[4] !== audit.sessionId)) return null;
+  const prefix = handoff.prefix, open = '<orchestration_state source="noted-terminal" version="1">\n';
+  const close = '\n</orchestration_state>\n\n';
+  if (typeof prefix !== 'string' || !prefix.startsWith(open) || !handoff.prepared_prompt.startsWith(prefix)) return null;
+  const boundary = prefix.indexOf(close);
+  const bodyStart = boundary < 0 ? -1 : boundary + close.length;
+  if (bodyStart < 0 || bodyStart > 16000 || bodyStart >= handoff.prepared_prompt.length) return null;
+  return { id: 'orchestration-context:' + record.handoffId, kind: 'context-prefix', contextKind: 'orchestration-state',
+    envelopeStart: 0, envelopeText: handoff.prepared_prompt.slice(0, bodyStart), bodyStart,
+    bodyEnd: handoff.prepared_prompt.length,
+    bodyProjectionHash: createHash('sha256').update(handoff.prepared_prompt).digest('hex') };
+}
+
+module.exports = { sourceCompletionFacts, completionContextText, completionContextPresentation };

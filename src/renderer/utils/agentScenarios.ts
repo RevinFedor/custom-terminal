@@ -72,6 +72,7 @@ export interface SendAgentPromptScenarioArgs {
   onHistoryRecorded?: (result: any) => void | Promise<void>;
   onReadyForSend?: (status: Extract<AgentPtyStatus, 'active' | 'busy'>) => void;
   presentationSnapshot?: {
+    historySendStartedAt?: number;
     historySessionId?: string | null;
     authoringTransport?: { sourceHash: string; imageRanges: Array<{ start: number; end: number; path: string }> };
     imagePaths?: HistoryPromptDraftImageRef[];

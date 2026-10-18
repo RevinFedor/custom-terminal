@@ -45,6 +45,7 @@ function harness({ frameTimedOut = true, synchronousClear = true, diagnosticLogT
     if (!frameTimedOut && slash) frame(slash);
   } };
   const ctx = vm.createContext({ ...picker, codexNativeDraftTransfer, observeAgentInput,
+    ...require('./agent-send-preparation'), agentSendReceiptStore: null,
     ...require('./codex-slash-input-diagnostics'),
     ...require('./codex-runtime-contract'),
     codexSendStartupFrameWaits: new WeakMap(), CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000,

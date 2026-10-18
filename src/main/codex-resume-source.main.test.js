@@ -160,13 +160,27 @@ test('actual History rebuild publishes known-heavy work and finishes before unch
   t.after(unsubscribe);
   const first = await api.projectCodexTimelineFromFile(SID, h.root, { sessionsDir: h.sessionsDir, tabId: 'H' });
   assert.equal(first.success, true);
-  assert.deepEqual(operations.map(rows => rows.length), [1, 0]);
-  assert.equal(operations[0][0].kind, 'history');
+  // A slower read can publish progress for the SAME operation before release.
+  // Begin/update/end are valid; an intermediate disappearance or new owner is not.
+  assert.ok(operations.length >= 2);
+  assert.deepEqual(operations.at(-1), []);
+  const owner = operations[0][0];
+  assert.equal(owner.kind, 'history');
+  let completedBytes = 0;
+  for (const rows of operations.slice(0, -1)) {
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, owner.id);
+    assert.equal(rows[0].kind, 'history');
+    assert.ok(rows[0].completedBytes >= completedBytes);
+    assert.ok(rows[0].completedBytes <= rows[0].totalBytes);
+    completedBytes = rows[0].completedBytes;
+  }
+  const publishedStates = operations.length;
   const unchanged = await api.projectCodexTimelineFromFile(SID, h.root, { sessionsDir: h.sessionsDir });
   assert.equal(unchanged.mode, 'unchanged');
   fs.appendFileSync(h.filePath, line({ type: 'event_msg', payload: { type: 'task_complete' } }));
   assert.equal((await api.projectCodexTimelineFromFile(SID, h.root, { sessionsDir: h.sessionsDir })).mode, 'append');
-  assert.equal(operations.length, 2);
+  assert.equal(operations.length, publishedStates);
 });
 
 test('actual History failed cold read releases its preparation operation', async t => {

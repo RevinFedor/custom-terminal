@@ -873,10 +873,12 @@ export function SplitPaneAttachRow({
             {!vacant && canSearchHistory && <button type="button" role="menuitem" data-split-strip-menu-item={canSearchInput?'search-input':'search-history'}
               onClick={(event)=>{
                 event.stopPropagation();setStripMenu(null);
-                useUIStore.getState().setHistoryPanelOpen(tabId,true);
-                useUIStore.getState().setSideTerminalOpen(tabId,false);
                 if(canSearchInput)requestInputSearch(tabId);
-                else requestHistorySearch(tabId);
+                else {
+                  useUIStore.getState().setHistoryPanelOpen(tabId,true);
+                  useUIStore.getState().setSideTerminalOpen(tabId,false);
+                  requestHistorySearch(tabId);
+                }
               }}
               style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,border:0,background:'transparent',color:'inherit',cursor:'pointer'}}>
               <Search size={13}/><span style={{flex:1,textAlign:'left'}}>{canSearchInput?'Search input':'Search'}</span>{!canSearchInput&&<span style={{fontSize:10,color:'#999'}}>⌘F</span>}

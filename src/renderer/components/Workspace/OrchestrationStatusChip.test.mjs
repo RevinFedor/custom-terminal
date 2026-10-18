@@ -137,6 +137,18 @@ test('deferred delivery to a busy target is waiting, not an error or an already 
   assert.equal(presentation({ status: 'waiting_recovery', runKind: 'response-observation' }, 'source').label, 'Проверка недоступна');
 });
 
+test('proven offline browser shows a static amber wait, never sent or spinning', () => {
+  const start = source.indexOf('function runPresentation'), end = source.indexOf('function StatusIcon', start);
+  const presentation = vm.runInNewContext(transformSync(source.slice(start, end), { loader: 'ts' }).code + '\nrunPresentation', {
+    isOrchestrationResultProofPending: () => false, hasSourceNotificationError: () => false,
+    hasPendingSourceHandoff: () => false, STATUS_LABEL: { queued: 'Ожидает отправки', sent: 'Доставлено' },
+  });
+  const offline = presentation({ status: 'queued', deliveryDeferredReason: 'waiting-for-browser' }, 'source');
+  assert.equal(offline.color, '#fbbf24'); assert.equal(offline.label, 'Ждёт браузер');
+  assert.equal(offline.spinning, false);
+  assert.equal(presentation({ status: 'cancelled', deliveryDeferredReason: 'waiting-for-browser' }, 'source').label, 'Закрыто');
+});
+
 test('detaching an observer never asks the target to cancel Send; exact source handoff remains independently cancellable', async () => {
   const start = source.indexOf('  const runAction = useCallback');
   const end = source.indexOf('  const saveSettings =', start);

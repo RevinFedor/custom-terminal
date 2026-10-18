@@ -537,6 +537,10 @@ class AgentSendReceiptStore {
           AND attempt_id = @attemptId
           AND state IN ('in-flight', 'enter-armed')
       `),
+      enterTiming: this.db.prepare(`
+        UPDATE ${TABLE_NAME} SET receipt_json = @receiptJson
+        WHERE operation_key = @operationKey AND attempt_id = @attemptId
+      `),
       compactReceipt: this.db.prepare(`
         UPDATE ${TABLE_NAME}
         SET receipt_json = @receiptJson, state = @state,
@@ -1419,6 +1423,22 @@ class AgentSendReceiptStore {
         reason: info.changes === 1 ? null : 'compact-attempt-state-changed',
         record: this._record(owner.sendOperationKey) };
     })());
+  }
+
+  recordEnterAttempt({ tabId, handoffId, operationKey, attemptId, enterAttemptAt }) {
+    if (!operationKey || !attemptId || !Number.isFinite(enterAttemptAt) || enterAttemptAt <= 0) return null;
+    return this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record || record.tabId !== tabId || record.handoffId !== handoffId
+        || record.attemptId !== attemptId) return null;
+      if (record.receipt?.enterAttemptAt) return record.receipt.enterAttemptAt;
+      // No state, updatedAt, cancellation, audit or input-slot mutation. The
+      // caller has already attempted the physical write; failure here cannot
+      // turn it into no-Enter or permission to retry.
+      this.statements.enterTiming.run({ operationKey, attemptId,
+        receiptJson: encodeJson({ ...(record.receipt || {}), enterAttemptAt }) });
+      return enterAttemptAt;
+    })();
   }
 
   settleAttempt(operationKeyInput, attemptIdInput, receiptInput) {

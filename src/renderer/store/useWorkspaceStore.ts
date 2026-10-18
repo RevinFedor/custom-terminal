@@ -1892,6 +1892,7 @@ interface WorkspaceStore {
     /** Цветная SVG/PNG-иконка workflow. undefined бывает только у legacy-записи. */
     icon?: string | null;
     defaultCwd?: string | null;
+    promptDirectories?: string[];
     kind?: 'user' | 'inbox';
     organizationRevision?: number;
     order?: number;
@@ -1935,7 +1936,7 @@ interface WorkspaceStore {
   reorderWorkspaceSpaces: (orderedIds: string[]) => boolean;
   updateWorkspaceSpaceMetadata: (
     id: string,
-    updates: { icon?: string | null; projectIds?: string[]; defaultCwd?: string | null },
+    updates: { icon?: string | null; projectIds?: string[]; defaultCwd?: string | null; promptDirectories?: string[] },
   ) => boolean;
   switchWorkspaceSpace: (id: string) => void;
   /**

@@ -96,6 +96,9 @@ class WorkflowRootRegistry {
   sourcesForTab(tabId) {
     return this.readTabSources(tabId,(sql,siteId)=>causal.sql(siteId,'prepare',()=>this.db.prepare(sql)));
   }
+  boundSourcesForTab(tabId) {
+    return this.readTabSources(tabId,(sql,siteId)=>causal.sql(siteId,'prepare',()=>this.db.prepare(sql)),false);
+  }
   createSourcesReader() {
     // Statement ports only: each invocation reads exact current authority.
     // A resumed connection/schema never executes a stale compiled statement.
@@ -115,6 +118,7 @@ class WorkflowRootRegistry {
     reader.header=tabId=>{refresh();return this.readTabHeader(tabId,prepare);};
     reader.page=(header,cursor=null)=>{
       refresh();
+      if(header.workflowId)return [];
       const sql=`SELECT r.*,b.position,b.metadata_json AS binding_json FROM workflow_root_bindings b
         JOIN workflow_roots r ON r.id=b.root_id WHERE b.scope=?
         ${cursor ? 'AND (b.position>? OR (b.position=? AND r.id>?))' : ''}
@@ -167,9 +171,28 @@ class WorkflowRootRegistry {
       const namespace=row?.execution_namespace || row?.project_id || execution?.executionNamespace || execution?.projectId || null;
       const scopeStatement=prepare('SELECT * FROM workflow_root_scope_meta WHERE scope=?','roots.tabSources.scope');
       const registered=causal.sql('roots.tabSources.scope','get',()=>scopeStatement.get(scope));
-      if(registered && registered.version!==1)this.fail('root_binding_forward_version');
       const sourceScope=registered?scope:'prompts:'+namespace;
-      return {namespace,sourceScope};
+      const workflowStatement=prepare(`SELECT w.workflow_id,w.metadata_json FROM workflow_org_memberships m
+        JOIN workflow_org_workflows w ON w.workflow_id=m.workflow_id
+        WHERE m.tab_id=? AND w.deleted_generation IS NULL`,'roots.tabSources.workflow');
+      const workflow=causal.sql('roots.tabSources.workflow','get',()=>workflowStatement.get(tabId));
+      const metadata=workflow ? JSON.parse(workflow.metadata_json) : null;
+      if(!workflow && registered && registered.version!==1)this.fail('root_binding_forward_version');
+      if(metadata?.promptDirectories!=null && !Array.isArray(metadata.promptDirectories))this.fail('workflow_directory_forward_version');
+      if((metadata?.promptDirectories || []).some(value=>typeof value!=='string'))this.fail('workflow_directory_forward_version');
+      const directories=[...new Set([metadata?.defaultCwd,...(metadata?.promptDirectories || [])]
+        .filter(value=>typeof value==='string' && value.trim()).map(value=>value.trim().replace(/\/+$/, '') || '/'))];
+      if(directories.some(directory=>!directory.startsWith('/')))this.fail('workflow_directory_invalid');
+      const workflowSources=directories.map((directory,position)=>{
+        const rootStatement=prepare('SELECT * FROM workflow_roots WHERE path=? ORDER BY removed,rowid LIMIT 1','roots.tabSources.workflowRoot');
+        const root=causal.sql('roots.tabSources.workflowRoot','get',()=>rootStatement.get(directory));
+        return {...(root || {}),id:root?.id || 'workflow-directory:'+crypto.createHash('sha256').update(directory).digest('hex').slice(0,24),
+          path:directory,removed:0,position,
+          metadata_json:JSON.stringify({...JSON.parse(root?.metadata_json || '{}'),name:directory.split('/').pop() || '/',
+            enabled:true,workflowDefault:true,workflowId:workflow.workflow_id}),
+          binding_json:JSON.stringify({kind:'workflow-directory',bindingVersion:1,workflowId:workflow.workflow_id})};
+      });
+      return {namespace,sourceScope,workflowId:workflow?.workflow_id || null,workflowSources,bindingVersion:registered?.version};
   }
   decodeCatalogSource(root,namespace) {
     const metadata=JSON.parse(root.metadata_json),binding=JSON.parse(root.binding_json);
@@ -177,13 +200,15 @@ class WorkflowRootRegistry {
       rootPath:root.path,projectId:binding.project_id || namespace,position:root.position,
       removed:root.removed===1,enabled:root.removed!==1 && metadata.enabled!==false};
   }
-  readTabSources(tabId,prepare) {
+  readTabSources(tabId,prepare,includeWorkflow=true) {
     const work=()=>{
-      const {namespace,sourceScope}=this.readTabHeader(tabId,prepare);
+      const {namespace,sourceScope,workflowId,workflowSources,bindingVersion}=this.readTabHeader(tabId,prepare);
+      if(includeWorkflow && workflowId)return workflowSources.map(root=>this.decodeCatalogSource(root,namespace));
+      if(bindingVersion!=null && bindingVersion!==1)this.fail('root_binding_forward_version');
       const bindingsStatement=prepare(`SELECT r.*,b.position,b.metadata_json AS binding_json FROM workflow_root_bindings b
         JOIN workflow_roots r ON r.id=b.root_id WHERE b.scope=? ORDER BY b.position,r.id`,'roots.tabSources.bindings');
-      return causal.sql('roots.tabSources.bindings','all',()=>bindingsStatement.all(sourceScope))
-        .map(root=>this.decodeCatalogSource(root,namespace));
+      const bindings=causal.sql('roots.tabSources.bindings','all',()=>bindingsStatement.all(sourceScope));
+      return bindings.map(root=>this.decodeCatalogSource(root,namespace));
     };
     return causal.hasWork()?work():causal.syncWork('roots.readTabSources',{tabId},work);
   }

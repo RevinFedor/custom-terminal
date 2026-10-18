@@ -848,7 +848,7 @@ async function ensureAgentModelSelectionSupport(target, args) {
   }
 }
 
-async function ensureExternalResearchOrchestrationSupport(target) {
+async function ensureExternalResearchOrchestrationSupport(target, requireBrowserSelection = false) {
   const capabilities = await httpApiGet(target, '/api/me');
   if (Number(capabilities?.capabilities?.externalResearchOrchestration?.version) !== 1) {
     throw new Error(
@@ -856,6 +856,28 @@ async function ensureExternalResearchOrchestrationSupport(target) {
       + 'Nothing was started. Rebuild/reinstall the app before retrying.',
     );
   }
+  const browser = capabilities?.capabilities?.externalResearchOrchestration?.browserSelection;
+  if (requireBrowserSelection && (browser?.version !== 1 || browser.field !== 'browserId'
+    || browser.jobOwnerPinned !== true || browser.offlinePreflight !== true)) {
+    throw Object.assign(new Error('app_update_required: Update Noted Terminal for explicit/pinned research browser selection. Nothing was started.'),
+      { code: 'app_update_required' });
+  }
+}
+
+const EXTERNAL_RESEARCH_BROWSER_SCHEMA = {
+  type: 'string', pattern: '^(chrome|yandex|[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})$',
+  description: 'Configured chrome/yandex profile or persistent profile UUID. No primary change/fallback. Continue inherits the previous exact job owner and rejects a conflicting selection.',
+};
+
+function externalResearchBrowserId(value, options) {
+  if (options && (Object.hasOwn(options, 'browserId') || Object.hasOwn(options, 'browserInstanceId'))) {
+    throw new Error('Use top-level browserId, not options, for research browser selection');
+  }
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !new RegExp(EXTERNAL_RESEARCH_BROWSER_SCHEMA.pattern).test(value)) {
+    throw new Error('browserId must be chrome, yandex or a registered profile UUID');
+  }
+  return value.toLowerCase();
 }
 
 async function ensureTabMessagesSupport(target) {
@@ -1380,6 +1402,7 @@ const TOOLS = [
       properties: {
         prompt: { type: 'string', description: 'Task for the browser model. File bodies belong in files, not in this text.' },
         provider: { type: 'string', enum: ['chatgpt', 'claude', 'perplexity'], description: 'SC Desktop provider. Default chatgpt.' },
+        browserId: EXTERNAL_RESEARCH_BROWSER_SCHEMA,
         options: EXTERNAL_RESEARCH_OPTIONS_SCHEMA,
         files: EXTERNAL_RESEARCH_FILES_SCHEMA,
         conversationUrl: { type: 'string', description: 'Optional existing ChatGPT conversation URL. Prefer continue_external_research when continuing a prior tracked run.' },
@@ -1397,11 +1420,12 @@ const TOOLS = [
   },
   {
     name: 'continue_external_research',
-    description: 'Send a new question and current file versions to the same ChatGPT conversation as one completed external-research run. This always creates a new runId and SC jobId; previousRunId supplies only the durable conversation identity and default provider/options, so the old answer can never be returned as the new review. After acceptance finish the current turn and handle the later completion notification.' + ORCHESTRATION_COMPLETION_GUIDANCE,
+    description: 'Send a new question and current file versions to the same ChatGPT conversation and verified browser profile as one completed external-research run. This always creates a new runId and SC jobId; previousRunId supplies the durable conversation/browser identity and default provider/options, so the old answer can never be returned as the new review. A conflicting browserId is rejected, not routed through the current primary. After acceptance finish the current turn and handle the later completion notification.' + ORCHESTRATION_COMPLETION_GUIDANCE,
     inputSchema: {
       type: 'object',
       properties: {
         previousRunId: { type: 'string', description: 'Completed tracked run whose conversationUrl should be continued.' },
+        browserId: EXTERNAL_RESEARCH_BROWSER_SCHEMA,
         prompt: { type: 'string', description: 'New follow-up question.' },
         options: EXTERNAL_RESEARCH_OPTIONS_SCHEMA,
         files: EXTERNAL_RESEARCH_FILES_SCHEMA,
@@ -1424,6 +1448,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         url: { type: 'string', description: 'Existing URL in the form https://chatgpt.com/c/<conversation-id>.' },
+        browserId: EXTERNAL_RESEARCH_BROWSER_SCHEMA,
         waitForFinal: { type: 'boolean', description: 'Default false. If true, keep observing the existing conversation for up to timeoutMs instead of failing when its current user-turn has no final yet.' },
         timeoutMs: { type: 'integer', minimum: 10000, maximum: 1800000, description: 'Only with waitForFinal. Default 1800000 (30 minutes).' },
         sources: { type: 'boolean', description: 'Include the source list in result.text. Structured sources are retained regardless.' },
@@ -1581,6 +1606,19 @@ const TOOLS = [
         maxChars: { type: 'integer', minimum: 256, maximum: 250000, description: 'Total text budget per page; default60000.' },
         cursor: { type: 'string' }, cwd: { type: 'string' },
       }, required: ['messages'],
+    },
+  },
+  {
+    name: 'read_session_snapshot',
+    description: 'Read the latest Codex user iterations and available assistant text while the session is busy. Returns a verified byte-cutoff snapshot with asOf, exact turn/user refs, in_progress/completed/aborted/unknown and explicit coverage/truncation. Append after cutoff is allowed; rewritten/replaced sources or changed view/owner are refused. No Stop, idle wait, Send or automatic retry. Read-only evidence, not completion/delivery authority. Requires sessionSnapshot v1 in the running app.',
+    inputSchema: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        sessionId: { type: 'string' }, cwd: { type: 'string' },
+        tabId: { type: 'string', description: 'Optional exact owning tab; mismatch refuses the read.' },
+        limit: { type: 'integer', minimum: 1, maximum: 8, description: 'Latest user iterations, default 5.' },
+        maxChars: { type: 'integer', minimum: 0, maximum: 20000, description: 'Per user/assistant field, default 4000. Zero returns refs/counts only.' },
+      }, required: ['sessionId'],
     },
   },
   {
@@ -2793,6 +2831,8 @@ async function callTool(name, args) {
     case 'start_external_research':
     case 'import_external_conversation':
     case 'continue_external_research': {
+      if (Object.hasOwn(args, 'browserInstanceId')) throw new Error('Use browserId to select a research profile');
+      const browserId = externalResearchBrowserId(args.browserId, args.options);
       const sourceTabId = args.sourceTabId || PARENT_TAB_ID();
       if (!sourceTabId) throw new Error('sourceTabId is required outside a full Noted Terminal session');
       if (name === 'continue_external_research'
@@ -2807,10 +2847,11 @@ async function callTool(name, args) {
       const importUrl = name === 'import_external_conversation'
         ? normalizeChatGPTConversationImportUrl(args.url)
         : null;
-      await ensureExternalResearchOrchestrationSupport(target);
+      await ensureExternalResearchOrchestrationSupport(target, !!browserId || name === 'continue_external_research');
       const result = await httpApiPost(target, '/api/external-research/orchestrations', {
         runId: args.runId || undefined,
         sourceTabId,
+        browserId,
         prompt: name === 'import_external_conversation' ? EXTERNAL_CONVERSATION_IMPORT_PROMPT : args.prompt,
         provider: name === 'continue_external_research' ? undefined : (name === 'start_external_research' ? (args.provider || 'chatgpt') : 'chatgpt'),
         options: name === 'import_external_conversation' ? {
@@ -2948,6 +2989,21 @@ async function callTool(name, args) {
         throw error;
       }
       return JSON.stringify(result, null, 2);
+    }
+
+    case 'read_session_snapshot': {
+      if (Object.keys(args).some(key => !['sessionId', 'cwd', 'tabId', 'limit', 'maxChars'].includes(key))
+        || typeof args.sessionId !== 'string' || !args.sessionId.trim() || args.sessionId.length > 512
+        || args.tabId != null && (typeof args.tabId !== 'string' || !args.tabId || args.tabId.length > 512)
+        || args.cwd != null && (typeof args.cwd !== 'string' || !args.cwd || args.cwd.length > 4096)
+        || args.limit != null && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 8)
+        || args.maxChars != null && (!Number.isInteger(args.maxChars) || args.maxChars < 0 || args.maxChars > 20000)) {
+        throw new Error('invalid_session_snapshot_request');
+      }
+      const capabilities = await httpGet('/overseer/capabilities', args.cwd || PROJECT_CWD_());
+      if (capabilities?.sessionSnapshot?.version !== 1) throw new Error('app_update_required: Noted Terminal needs sessionSnapshot v1');
+      return JSON.stringify(await httpGet('/overseer/session/' + encodeURIComponent(args.sessionId) + '/snapshot'
+        + qs({ cwd: args.cwd, tabId: args.tabId, limit: args.limit, maxChars: args.maxChars }), args.cwd || PROJECT_CWD_()), null, 2);
     }
 
     case 'session_stats': {

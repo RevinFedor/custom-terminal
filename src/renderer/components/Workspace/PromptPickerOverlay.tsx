@@ -828,15 +828,21 @@ const PromptPickerOverlay: React.FC = () => {
   const anchor = contextRequest?.anchor || shortcutAnchor || DEFAULT_PICKER_ANCHOR;
   const pickerProjectId = contextRequest?.projectId || shortcutTarget?.projectId || null;
   const pickerTabId = contextRequest?.tabId || shortcutTarget?.tabId || null;
+  const workflowSourceKey = useWorkspaceStore(state => {
+    if (!open || !pickerTabId || !organizationReady) return '';
+    const workflowId = state.tabWorkflowMembership?.[pickerTabId]?.workflowId || '';
+    const workflow = state.spaces.find(space => space.id === workflowId);
+    return JSON.stringify([workflowId, workflow?.defaultCwd || null, workflow?.promptDirectories || []]);
+  });
   const pickerRenderGeneration = contextRequest?.requestId || activePickerGenerationRef.current;
-  const catalogTargetKey = JSON.stringify([organizationReady, pickerTabId, pickerProjectId, contextRequest?.requestId || activePickerGenerationRef.current]);
+  const catalogTargetKey = JSON.stringify([organizationReady, pickerTabId, pickerProjectId, workflowSourceKey, contextRequest?.requestId || activePickerGenerationRef.current]);
   catalogCurrentRef.current = {open,targetKey:catalogTargetKey};
   const currentCatalogState = catalogState.targetKey === catalogTargetKey ? catalogState
     : {targetKey:catalogTargetKey,sequence:0,status:'cold',data:null,error:null};
   const projectCatalog: ProjectPromptCatalog | null = currentCatalogState.status === 'ready' ? currentCatalogState.data : null;
   const projectReady = currentCatalogState.status === 'ready';
   const projectTarget = organizationReady ? !!pickerTabId : !!pickerProjectId;
-  const projectLabel = projectCatalog?.project || {id:organizationReady?`tab:${pickerTabId}`:pickerProjectId || '',name:organizationReady?'Промпты вкладки':'Промпты проекта',icon:null};
+  const projectLabel = projectCatalog?.project || {id:organizationReady?`tab:${pickerTabId}`:pickerProjectId || '',name:organizationReady?'Промпты рабочего пространства':'Промпты проекта',icon:null};
   const catalogStatusText = preparedCatalogStatusText(currentCatalogState);
   const loaded = libraryLoaded;
   const cascadeOpensLeft = anchor.mode === 'point' && openLeftRef.current;

@@ -362,3 +362,130 @@ test('a short real-ID gesture retains its slow window within the existing serial
   assert.equal(w.first[0].author.axis,'y');assert.equal(s.authoredWrites,73);
   assert.ok(w.phases.some(p=>p.ownerKey===owner.ownerKey));
 });
+
+// Controlled actual-recorder regression prompted by LEG-current-cross-pane4.json.
+// 1740 callbacks / 15 moves / Y author match its shape. These are test inputs,
+// not recovered native frames, pixel receipts, or reconstructed Source clocks.
+function capGesture({memberCount=3,longMembers=false,axis='y',frames=1740,admit=true}={}) {
+  const h=dragHarness(),gestureId='gesture-A';
+  const ids=Array.from({length:memberCount},(_,i)=>longMembers
+    ? ('member-'+i+'-').padEnd(120,'m') : `tab-${String(i).padStart(8,'0')}-39f8-4660-a786-2fdc7a7da5f0`);
+  const owner={gestureId,sessionId:'4c8f368c-1de5-4ed2-b176-fd432dcadf5b',
+    sourceId:'reserve-tab:'+ids[0],ownerKey:'reserve:night17-ux-a:4c8f368c-1de5-4ed2-b176-fd432dcadf5b',
+    workflowId:'night17-ux-a',ownerEpoch:8,pointerId:1,x:895.7265625,y:416.79998779296875,
+    grabY:13.3515625,depth:0,boundary:0};
+  const guards=Object.fromEntries(ids.map((id,i)=>[id,{namespace:longMembers?'n'.repeat(120):'__tab_catalog_v2__',
+    workflowId:longMembers?'w'.repeat(120):owner.workflowId,membershipRevision:1,storageId:651+i,
+    subjectId:longMembers?'s'.repeat(120):'5e95bd55-f16d-41fc-848b-462e8003c08f',
+    parentTabId:longMembers?'p'.repeat(120):null,visualParentTabId:longMembers?'v'.repeat(120):ids[0],
+    groupId:longMembers?'g'.repeat(120):null,groupRevision:0,secret:'PRIVATE-ADMISSION'}]));
+  const admission={gestureId,sourceRootIds:[ids[0]],rootTabIds:[ids[0]],familyIds:ids,paneFamilyIds:ids,guards,
+    sourceWorkflowId:owner.workflowId,sourcePaneKey:'pane:0',organizationRevision:2297,
+    workflows:{[owner.workflowId]:{layout:{splitPanes:[{windowId:'night17-pane-source'}]}}}};
+  h.d.drag.event('threshold',{gestureId});h.d.drag.event('start',owner);
+  if(admit)h.d.drag.admission(admission);
+  h.d.drag.event('navigation-accepted',{...owner,paneKey:'pane:1',publicationRevision:2297});
+  for(let i=0;i<frames;i++){
+    h.advance(i===30?168.3:8.3);
+    if(i<15){
+      h.input(owner.x+i,owner.y+i);
+      const packet={...owner,x:owner.x+i,y:owner.y+i,revision:25+i,eventAbs:h.time()-2.300048828125,
+        left:24.283203125,top:403.44842529296875,width:194.28515625,height:27.283203125,
+        grabX:19.728515625,scrollTop:1.234567890123,scrollLeft:2.345678901234,
+        sourceLayoutTop:82.283203125,intendedTop:403.44842529296875,forestOffset:0,
+        previousBoundaryTop:71.234567890123,nextBoundaryTop:132.345678901234,
+        processed:i+1,received:i+1,queuedOverwrites:0,generation:2297,publicationRevision:2297,
+        membershipRevision:1,sourceCount:1,familyCount:ids.length,paneCount:ids.length,
+        captured:true,current:true,matches:true,meta:false};
+      for(const phase of ['processed','published','geometry','layout-receipt'])h.d.drag.event(phase,packet);
+      h.d.drag.event('authored',{...packet,axis,presentation:'in-tree-source-y-style-not-pixels'});
+      h.d.drag.event('target',{gestureId,workflowId:owner.workflowId,paneKey:'pane:1',revision:i+1,at:2});
+    }
+    h.d.drag.frame(h.time());
+  }
+  const hotLogs=h.logs.length;
+  h.input(owner.x+14,owner.y+14,h.time()-performance.timeOrigin,'pointerup',0);
+  h.d.drag.event('physical-end',{gestureId,reason:'release'});
+  const [summary]=h.records('[Perf:DragSummary]'),[detail]=h.records('[Perf:DragWindow]');
+  return {...h,ids,guards,admission,summary,detail,hotLogs};
+}
+
+test('serialized cap preserves complete bounded admission and phases for a 1740-callback 15-move long hold',()=>{
+  const h=capGesture(),s=h.summary,w=h.detail;
+  assert.equal(h.hotLogs,0,'no extra serialization/emission before release');
+  assert.equal(s.frames,1740);assert.equal(s.movingFrames,15);assert.equal(s.frameEvicted,1620);
+  assert.equal(s.partial,true,'serialization reduction must remain partial');
+  assert.equal(s.detailOmitted,undefined,'frame pressure must not discard the frozen admission');
+  assert.deepEqual(w.plan,{sourceRootIds:[h.ids[0]],rootTabIds:[h.ids[0]],familyIds:h.ids,paneFamilyIds:h.ids});
+  assert.deepEqual(w.members,h.ids.map(id=>({id,namespace:h.guards[id].namespace,workflowId:h.guards[id].workflowId,
+    membershipRevision:1,storageId:h.guards[id].storageId,subjectId:h.guards[id].subjectId,parentTabId:'',
+    visualParentTabId:h.ids[0],groupId:'',groupRevision:0})));
+  assert.deepEqual(w.phases.map(p=>p.name),['pending','threshold','start','admission','navigation-accepted',...Array(15).fill('target'),'physical-end']);
+  assert.equal(w.phases[3].publicationRevision,2297);assert.equal(w.phases[3].windowId,'night17-pane-source');
+  assert.equal(w.phases[2].ownerKey,s.latestAuthor.ownerKey);
+  assert.equal(w.planOmitted,0);assert.equal(w.memberOmitted,0);assert.equal(w.phaseOmitted,0);
+  assert.equal(w.partial,true);assert.equal(w.frameEvicted,1620);
+  assert.deepEqual(w.frameOmitted,s.frameOmitted);
+  for(const [key,size] of [['first',8],['slow',24],['tail',8]])assert.equal(w[key].length+w.frameOmitted[key],size);
+  assert.ok(Object.values(w.frameOmitted).some(n=>n>0));
+  assert.equal(w.frameOmittedKind,'serialized-cap-window-occurrences');
+  assert.ok(w.slow.some(f=>f.gapMs===168.3),'retain the strongest slow frame');
+  assert.equal(s.authoredAxis,'y');assert.equal(s.maxAuthoredErrorX,null);assert.equal(s.maxAuthoredErrorY,0);
+  for(const f of [...w.first,...w.slow,...w.tail])assert.equal(f.author.axis,'y');
+  assert.equal(s.latestAuthor.ownerEpoch,8);assert.equal(s.latestPublished.publicationRevision,2297);
+  assert.equal(h.d.drag.health().dragPartialGestures,1);
+  assert.equal(h.a.drag.partial,true);assert.equal(h.a.drag.gestureId,s.gestureId);
+  assert.ok(JSON.stringify(w).length<=65536);assert.doesNotMatch(h.logs.join('\n'),/PRIVATE-ADMISSION/);
+  const count=h.logs.length;
+  h.d.drag.event('commit-ipc-reply',{gestureId:s.gestureId,mutationId:'workflow-drag:gesture-A',generation:2299,confirmed:true});
+  h.d.drag.event('commit-applied',{gestureId:s.gestureId,mutationId:'workflow-drag:gesture-A',generation:2299,current:true});
+  assert.equal(h.logs.length,count+2);assert.equal(h.records('[Perf:DragCommit]')[1].actionId,s.actionId);
+  assert.equal(s.partial,true,'late commit must not relabel the lossy physical summary');
+});
+
+test('mandatory admission larger than the same cap is an exact bounded refusal, never a shortened certificate',()=>{
+  const h=capGesture({memberCount:128,longMembers:true}),s=h.summary,w=h.detail;
+  assert.equal(s.detailOmitted,'serialized-cap');assert.equal(w.detailOmitted,'serialized-cap');
+  assert.equal(w.detailRefusal,'mandatory-fields-exceed-cap');assert.equal(s.detailRefusal,w.detailRefusal);
+  assert.ok(w.mandatoryChars>65536);assert.ok(w.chars>w.mandatoryChars);
+  assert.deepEqual(w.missing,{plan:true,planIds:{sourceRootIds:1,rootTabIds:1,familyIds:128,paneFamilyIds:128},members:128,phases:21});
+  assert.equal(w.plan,undefined);assert.equal(w.members,undefined);assert.equal(w.phases,undefined);
+  assert.equal(w.planOmitted,0);assert.equal(w.memberOmitted,0);assert.equal(w.phaseOmitted,0);
+  assert.deepEqual(w.frameOmitted,{first:8,slow:24,tail:8});assert.deepEqual(s.frameOmitted,w.frameOmitted);
+  assert.equal(w.actionId,s.actionId);assert.equal(w.runId,s.runId);assert.equal(w.gestureId,s.gestureId);
+  assert.equal(w.frameEvicted,1620);assert.equal(w.limits.serializedChars,65536);
+  assert.equal(w.partial,true);assert.equal(s.partial,true);assert.equal(h.d.drag.health().dragPartialGestures,1);
+  assert.ok(JSON.stringify(w).length<2048);
+});
+
+test('a preexisting partial stays partial and is counted once after serialization reduction',()=>{
+  const h=capGesture({memberCount:140}),s=h.summary,w=h.detail;
+  assert.equal(s.partial,true);assert.equal(w.partial,true);assert.equal(h.d.drag.health().dragPartialGestures,1);
+  assert.equal(w.detailOmitted,undefined);assert.equal(w.members.length,128);
+  assert.equal(w.planOmitted,24);assert.equal(w.memberOmitted,24);assert.equal(w.phaseOmitted,0);
+  assert.equal(w.frameEvicted,1620);assert.ok(JSON.stringify(w).length<=65536);
+});
+
+// Focused axis control from current outlineSourceFollow.actual.test.mjs;
+// same actual recorder, no TS/React adapter, browser, native input or build.
+test('cap candidate actual recorder keeps Y-only demand, stopped Y and default pane XY',()=>{
+  for(const axis of ['y',undefined]){
+    let at=performance.timeOrigin+1000;const logs=[];
+    const d=createUIActionDiagnostics({now:()=>at,emit:line=>logs.push(line)});
+    d.capture('pointerdown',at,{tab:'a'});d.drag.configure({mode:'frames',hz:120,slowMs:16});
+    d.drag.event('pending',{gestureId:'g',pointerId:7,eventAbs:at});d.drag.event('threshold',{gestureId:'g'});
+    const input=(x,y)=>d.drag.input({type:'pointermove',pointerId:7,timeStamp:at-performance.timeOrigin,clientX:x,clientY:y,buttons:1,getCoalescedEvents:()=>[]});
+    input(45,91.5);d.drag.event('authored',{gestureId:'g',axis,x:45,y:91.5,top:87.5});
+    at+=8;input(105,91.5);d.drag.frame(at);at+=32;d.drag.frame(at);
+    if(axis==='y'){at+=8;input(105,94.5);d.drag.frame(at);at+=32;d.drag.frame(at);}
+    d.drag.event('physical-end',{gestureId:'g',reason:'cancel:test'});
+    const summary=JSON.parse(logs.find(line=>line.startsWith('[Perf:DragSummary]')).slice(19));
+    const detail=JSON.parse(logs.find(line=>line.startsWith('[Perf:DragWindow]')).slice(18));
+    if(axis==='y'){
+      assert.equal(summary.maxAuthoredErrorX,null);assert.equal(summary.maxAuthoredErrorY,3);
+      assert.equal(detail.first[0].needsAuthor,false,'semantic X does not request Y author');
+      assert.equal(detail.first[1].authorLagMs,0);assert.ok(summary.maxAuthoredLagMs>=32,'stopped Y is still detected');
+      assert.equal(detail.first[0].author.axis,'y','compact-at-release retains the axis');
+    }else{assert.equal(summary.maxAuthoredErrorX,60);assert.equal(summary.maxAuthoredErrorY,0);assert.ok(detail.first[0].needsAuthor);}
+  }
+});

@@ -1885,6 +1885,35 @@ class SessionTranscriptService {
 
   // A catalog candidate returns query facts, not a full History/turn graph.
   // The resolver still owns canonical lineage recovery and physical ranges.
+  async readSessionSnapshot(payload = {}) {
+    const { normalizeSessionSnapshotRequest } = require('./history-session-snapshot');
+    const request = normalizeSessionSnapshotRequest(payload);
+    if (this.historyReader) return this.historyReader.call('readSessionSnapshot', request);
+    const lineage = this._resolveCodexLineage(request.sessionId, 'dehydrated');
+    const lineageKey = JSON.stringify(lineage);
+    if (lineage.kind === 'unresolved') throw Object.assign(new Error(lineage.reason), { code: 'history_lineage_unresolved' });
+    const legacy = lineage.legacyForkEvent;
+    if (lineage.kind === 'physical' && legacy && (!legacy.forkMode || legacy.forkMode === 'unknown')
+      && (!Array.isArray(legacy.entryUuids) || !legacy.entryUuids.length)) {
+      throw Object.assign(new Error('snapshot_requires_prepared_lineage'), { code: 'history_lineage_unresolved',
+        lineageReason: 'snapshot_requires_prepared_lineage' });
+    }
+    const { createCodexCatalogSearchReader } = require('./codex-catalog-search');
+    const resolver = createCodexResultSourceResolver({ codexApi: this.codexData?._api });
+    const reader = createCodexCatalogSearchReader({ codexApi: this.codexData?._api,
+      onRead: this.catalogSearchHooks?.onRead, onDiagnostic: this.catalogSearchHooks?.onDiagnostic });
+    return reader.snapshot({ ...request,
+      resolveSource: () => resolver.resolve({ sessionId: request.sessionId, cwd: request.cwd,
+        lineage: this._resolveCodexLineage(request.sessionId, 'dehydrated'), verifyDigests: false }),
+      assertSnapshotCurrent: this.snapshotAssertCurrent,
+      assertLogicalCurrent: () => lineageKey === JSON.stringify(this._resolveCodexLineage(request.sessionId, 'dehydrated')),
+    });
+  }
+
+  assertSessionSnapshotCurrent(result) {
+    this.historyReader?.assertSnapshotCurrent(result);
+  }
+
   async searchCatalogCandidate(payload = {}) {
     if (normalizeToolType(payload.toolType) !== 'codex' || !payload.sessionId) {
       throw Object.assign(new Error('Codex catalog identity required'), { code: 'HISTORY_CATALOG_IDENTITY_REQUIRED' });

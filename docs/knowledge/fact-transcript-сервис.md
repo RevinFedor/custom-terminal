@@ -107,6 +107,13 @@ remember/known. Иначе событие в этом промежутке вы�
 sequence. Новое событие оставляет окно unverified/unknown даже при совпавшем stat;
 событие другой вкладки не отзывает его proof. Runtime idle это правило не заменяет.
 
+`changed-during-read` не означает только append в rollout. Само чтение может
+связать pending response timing с готовым assistant UUID и изменить SQLite
+metadata version: файл уже стабилен и provider idle, но первый certificate ещё
+unknown. После стабилизации metadata следующее выбранное чтение может стать
+known. Такой собственный bind не разрешает обходить прежние owner/event/source
+guards или объявлять доставленные rows свежими по одному `success:true`.
+
 В Claude устранён prerequisite-дефект: equal size раньше позволял прикрепить
 новые stat к старому recordMap после replacement/rewrite. Теперь совпадает
 физический witness; timestamp-only touch сохраняет прежний graph лишь после
@@ -150,6 +157,16 @@ fork-event и свежую bounded metadata. SSD hit или один header не
 чтение текущих входов в своём bounded retry. Нельзя продолжать с захваченным старым
 event или вернуть success, лишь отказавшись от cache admission. Unknown fast-path
 guard сохраняет canonical fallback, ошибки не превращаются в negative cache.
+
+Отдельный read-only `read_session_snapshot` сохраняет зафиксированный prefix при
+дальнейшем append: request-local FD/identity, hash всех диапазонов и повторный
+logical/resolver proof. Его rewrite epochs отделены от strict append epochs,
+а Main journal и owner/Stop/input проверяются до публикации. Canonical query
+projection не создаёт Main raw graph; выходной ответ и decode batches ограничены.
+Новый метод не использует тяжёлый cold lineage bootstrap: нужен physical full
+source либо готовый virtual manifest. Строгие cache/mutation readers выше
+сохраняют прежнюю инвалидизацию. Контракт и ошибки —
+`fact-session-history.md::Снимок последних Codex-итераций во время busy`.
 
 25.09 SOURCE: desktop Codex больше не связывает просмотр старого участка с
 наличием полного parser graph в RAM. Read-сервис исполняется в Node worker:

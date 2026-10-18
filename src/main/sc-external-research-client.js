@@ -1,4 +1,5 @@
 const path = require('path');
+const { normalizeBrowserId, assertBrowserSelectionCapability } = require('./external-research-browser');
 
 const DEFAULT_SC_RESEARCH_URL = process.env.NOTED_SC_RESEARCH_URL || 'http://127.0.0.1:53127';
 const MAX_FILES = 1000;
@@ -123,7 +124,14 @@ class ScExternalResearchClient {
     );
   }
 
-  async start({ jobId, provider, prompt, options, files, conversationUrl }, { signal } = {}) {
+  async start({ jobId, provider, prompt, options, files, conversationUrl, browserId }, { signal, beforeStart } = {}) {
+    if (options && (Object.hasOwn(options, 'browserId') || Object.hasOwn(options, 'browserInstanceId'))) {
+      throw Object.assign(new Error('Use top-level browserId, not options, for research browser selection'),
+        { code: 'external_research_browser_id_invalid', statusCode: 400 });
+    }
+    const selected = normalizeBrowserId(browserId);
+    if (selected) assertBrowserSelectionCapability(await this.capabilities({ signal }));
+    if (beforeStart && !await beforeStart()) return null;
     return this._request(`${this.baseUrl}/research-start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -135,6 +143,7 @@ class ScExternalResearchClient {
         options: options || {},
         files: normalizeExternalResearchFiles(files),
         ...(conversationUrl ? { conversationUrl } : {}),
+        ...(selected ? { browserId: selected } : {}),
       }),
     }, this.startTimeoutMs);
   }
@@ -146,6 +155,23 @@ class ScExternalResearchClient {
       { signal },
       wait + this.statusOverheadMs,
     );
+  }
+
+  async jobMetadata(jobId, { capabilities, signal } = {}) {
+    const supported = capabilities || await this.capabilities({ signal });
+    assertBrowserSelectionCapability(supported);
+    if (supported.browserSelection.jobMetadataReadOnly !== true) {
+      throw Object.assign(new Error('Update SC Desktop for effect-free exact research job metadata'),
+        { code: 'external_research_browser_update_required', statusCode: 503 });
+    }
+    const metadata = await this._request(`${this.baseUrl}/research-status?id=${encodeURIComponent(jobId)}&metadataOnly=true`,
+      { signal }, this.statusOverheadMs);
+    if (metadata?.id !== jobId || metadata.metadataOnly !== true
+      || !['memory', 'durable'].includes(metadata.metadataSource)) {
+      throw Object.assign(new Error('SC Desktop did not confirm exact read-only job metadata'),
+        { code: 'external_research_browser_metadata_unproven', statusCode: 503 });
+    }
+    return metadata;
   }
 
   async stop(jobId, { signal } = {}) {

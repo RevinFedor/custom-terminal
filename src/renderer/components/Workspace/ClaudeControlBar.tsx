@@ -2002,35 +2002,61 @@ function ClaudeControlBar({
     setEnterHovered(false);
   }, [tabId]);
 
+  // Physical keys are remembered by every retained bar; only feedback that
+  // can currently be shown projects them into React. Hover is independent of
+  // keyboard focus, so a visible unfocused Enter keeps its Cmd preview.
+  const enterModifierRelevant = isPrimaryHistoryAgent
+    && historySubmitButtonEnabled && enterHovered;
+  const runAfterModifierRelevant = showComposerInputActions
+    && workspaceOwnsKeyboard && runAfterHotkeyTargetsThisTab && !promptPickerOpen
+    && (historyDraftHasAuthoringContent || runAfterActiveItemCount > 0);
+  const modifierPhysicalRef = useRef({ meta: false, control: false,
+    alt: false, shift: false, composing: false });
+  const modifierProjectedRef = useRef({ meta: false, control: false });
+  const modifierRelevantRef = useRef({ meta: false, control: false });
+  modifierRelevantRef.current.meta = enterModifierRelevant;
+  modifierRelevantRef.current.control = runAfterModifierRelevant;
+  const projectModifiers = useCallback(() => {
+    const physical = modifierPhysicalRef.current;
+    const meta = physical.meta && modifierRelevantRef.current.meta;
+    const control = physical.control && !physical.meta && !physical.alt
+      && !physical.shift && !physical.composing && modifierRelevantRef.current.control;
+    if (modifierProjectedRef.current.meta !== meta) {
+      modifierProjectedRef.current.meta = meta;
+      setEnterCmdHeld(meta);
+    }
+    if (modifierProjectedRef.current.control !== control) {
+      modifierProjectedRef.current.control = control;
+      setRunAfterControlHeld(control);
+    }
+  }, []);
+  // Re-entering hover or becoming eligible while a key is held must work
+  // without requiring another key event (the same admission idiom as useCmdKey).
+  useLayoutEffect(projectModifiers, [enterModifierRelevant, runAfterModifierRelevant, projectModifiers]);
+
   useEffect(() => {
-    // Plain typing must not enqueue same-valued updates in every retained bar.
-    // React can have other pending work, so its eager state bailout alone does
-    // not keep these discrete events out of the render lane. These two values
-    // have no other writers; the listener retains the last physical edge.
-    let publishedMeta = false;
-    let publishedControl = false;
-    const publish = (meta: boolean, control: boolean) => {
-      if (publishedMeta !== meta) {
-        publishedMeta = meta;
-        setEnterCmdHeld(meta);
-      }
-      if (publishedControl !== control) {
-        publishedControl = control;
-        setRunAfterControlHeld(control);
-      }
-    };
     const sync = (event: KeyboardEvent) => {
-      publish(event.metaKey,
-        event.ctrlKey
-        && !event.metaKey
-        && !event.altKey
-        && !event.shiftKey
-        && !event.isComposing,
-      );
+      const physical = modifierPhysicalRef.current;
+      physical.meta = event.metaKey;
+      physical.control = event.ctrlKey;
+      physical.alt = event.altKey;
+      physical.shift = event.shiftKey;
+      physical.composing = event.isComposing;
+      projectModifiers();
+    };
+    const resetPhysical = () => {
+      const physical = modifierPhysicalRef.current;
+      physical.meta = false;
+      physical.control = false;
+      physical.alt = false;
+      physical.shift = false;
+      physical.composing = false;
     };
     const clear = () => {
-      publish(false, false);
+      resetPhysical();
+      projectModifiers();
     };
+    projectModifiers();
     window.addEventListener('keydown', sync, true);
     window.addEventListener('keyup', sync, true);
     window.addEventListener('blur', clear);
@@ -2038,8 +2064,9 @@ function ClaudeControlBar({
       window.removeEventListener('keydown', sync, true);
       window.removeEventListener('keyup', sync, true);
       window.removeEventListener('blur', clear);
+      resetPhysical();
     };
-  }, []);
+  }, [projectModifiers]);
 
   const activeCodexModel = codexModels.find(m => m.id === codexModel)
     || { id: codexModel, label: codexModel, efforts: [...CODEX_EFFORT_LEVELS] };

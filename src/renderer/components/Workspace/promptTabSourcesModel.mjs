@@ -24,7 +24,7 @@ export async function loadPickerPromptCatalog(ipc, { tabId, projectId, organizat
     validatePreparedCatalog(result.data);
     return {
       ...result.data,
-      project: { id: `tab:${tabId}`, name: 'Промпты вкладки', icon: null },
+      project: { id: `tab:${tabId}`, name: 'Промпты рабочего пространства', icon: null },
     };
   }
   if (!projectId) return null;

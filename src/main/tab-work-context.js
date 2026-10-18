@@ -16,7 +16,8 @@ const { TextDecoder } = require('node:util');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { isLocalSlashCommandPrompt } = require('../shared/agent-local-command.cjs');
-const { completionContextText } = require('./orchestration-source-context');
+const { completionContextText, completionContextPresentation } = require('./orchestration-source-context');
+const { normalizePromptPresentationSnapshot, saveAuditedPromptPresentation } = require('./history-prompt-presentations');
 const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
 const { computedPatchWriteIntents, computedPatchResultFailed, computedPatchResultYielded } = require('./codex-computed-patch-intent');
 const {
@@ -1050,6 +1051,15 @@ class TabWorkContext {
         this.release(row.tab_id, row.handoff_id);
       }
     }
+    // Recent frozen handoffs + retained exact receipts also repair previously
+    // delivered rows. No transcript scan, delivery change or notification.
+    const receipts = new Map();
+    for (const row of sqlStatement('tabContext.configure.continuationPresentation', 'all', () => this.db.prepare(`SELECT tab_id,handoff_id
+      FROM tab_context_handoffs WHERE status='delivered' AND continuation_facts!='[]' ORDER BY created_at DESC LIMIT 512`), statement => statement.all())) {
+      if (!receipts.has(row.tab_id)) receipts.set(row.tab_id, readReceipts?.(row.tab_id) || []);
+      this.restoreContinuationPresentation(row.tab_id, row.handoff_id,
+        receipts.get(row.tab_id).find(record => record.handoffId === row.handoff_id));
+    }
     void this.syncLinks().catch((error) => console.warn('[TabContext] startup:', error.message));
   }
 
@@ -1766,16 +1776,50 @@ class TabWorkContext {
   confirm(tabId, handoffId, expectedHash) {
     const work = () => {
       const sent = sqlStatement('tabContext.confirm.tab_context_handoffs', 'get', () => this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
-      if (!sent || sent.payload_hash !== expectedHash || sent.status === 'delivered' || sent.status === 'merged') return;
+      if (!sent || sent.payload_hash !== expectedHash || sent.status === 'merged') return;
+      if (sent.status === 'delivered') {
+        if (this.restoreContinuationPresentation(tabId, handoffId)) this.touch(tabId);
+        return;
+      }
       this.db.transaction(() => {
         for (const id of JSON.parse(sent.update_ids)) {
           sqlStatement('tabContext.confirm.tab_context_updates', 'run', () => this.db.prepare("UPDATE tab_context_updates SET status='delivered',before_text=NULL,after_text=NULL WHERE id=? AND tab_id=? AND status='sending'"), statement => statement.run(id, tabId));
         }
         sqlStatement('tabContext.confirm.tab_context_handoffs.2', 'run', () => this.db.prepare("UPDATE tab_context_handoffs SET status='delivered' WHERE tab_id=? AND handoff_id=?"), statement => statement.run(tabId, handoffId));
       })();
+      this.restoreContinuationPresentation(tabId, handoffId);
       this.touch(tabId);
     };
     return causal.hasWork() ? work() : causal.syncWork('tabContext.confirm', {}, work);
+  }
+
+  restoreContinuationPresentation(tabId, handoffId, record = undefined) {
+    const store = this.transcriptService?.promptPresentationStore;
+    if (!store?.getHistoryPromptPresentationByAudit || !store?.saveHistoryPromptPresentation) return false;
+    try {
+      const saved = sqlStatement('tabContext.continuationPresentation', 'get', () => this.db.prepare(
+        'SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?'), statement => statement.get(tabId, handoffId));
+      if (!saved || !['preparing', 'delivered'].includes(saved.status)) return false;
+      record ??= (this.readReceipts?.(tabId) || []).find(item => item.handoffId === handoffId);
+      const tag = completionContextPresentation(saved, record);
+      if (!tag) return false;
+      const audit = record.auditIdentity;
+      const previous = store.getHistoryPromptPresentationByAudit(record.provider, audit.sessionId, audit.auditTimestamp, audit.promptHash);
+      if (previous?.entryUuid && audit.entryUuid && previous.entryUuid !== audit.entryUuid) return false;
+      const existingTag = (previous?.chips || []).find(item => item.kind === 'context-prefix');
+      if (existingTag) return false; // Do not overwrite a conflicting prior proof.
+      const prior = normalizePromptPresentationSnapshot(previous ? {
+        promptChips: previous.chips, semanticTags: previous.chips,
+        imagePaths: previous.chips.filter(item => item.kind === 'image-ref'),
+      } : record.receipt.presentationSnapshot, { contextProof: true }) || { promptChips: [], semanticTags: [], imagePaths: [] };
+      return saveAuditedPromptPresentation(store, { toolType: record.provider, sessionId: audit.sessionId,
+        entryUuid: audit.entryUuid || previous?.entryUuid || null, auditTimestamp: audit.auditTimestamp,
+        actualText: record.receipt.transportText, actualHash: audit.promptHash,
+        snapshot: { ...prior, semanticTags: [...prior.semanticTags, tag] }, trustedContextPrefix: true });
+    } catch (error) {
+      console.warn('[OrchestrationContext] presentation unavailable tab=' + tabId.slice(-12) + ' handoff=' + handoffId + ' error=' + error.message);
+      return false;
+    }
   }
 
   activate(tabId, handoffId) {

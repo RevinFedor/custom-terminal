@@ -1,5 +1,7 @@
 const crypto = require('crypto');
 const { normalizeExternalResearchFiles } = require('./sc-external-research-client');
+const { normalizeBrowserId, browserError, browserInstanceId, exactBrowserOwner,
+  configuredBrowserInstanceId } = require('./external-research-browser');
 
 const PROVIDERS = new Set(['chatgpt', 'claude', 'perplexity']);
 
@@ -23,6 +25,7 @@ function externalResearchJobId(runId) {
 }
 
 function normalizeExternalResearchRequest(body = {}) {
+  if (Object.hasOwn(body, 'browserInstanceId')) throw new Error('Use browserId to select a research profile');
   const provider = String(body.provider || 'chatgpt').trim().toLowerCase();
   if (!PROVIDERS.has(provider)) {
     throw new Error('provider must be chatgpt, claude, or perplexity');
@@ -32,6 +35,10 @@ function normalizeExternalResearchRequest(body = {}) {
   const options = body.options && typeof body.options === 'object' && !Array.isArray(body.options)
     ? stableValue(body.options)
     : {};
+  if (Object.hasOwn(options, 'browserId') || Object.hasOwn(options, 'browserInstanceId')) {
+    throw new Error('Use top-level browserId, not options, for research browser selection');
+  }
+  const browserId = normalizeBrowserId(body.browserId);
   const files = normalizeExternalResearchFiles(body.files ?? body.attachments ?? []);
   if (files.length > 0 && provider !== 'chatgpt') {
     throw new Error('files are currently supported only for provider=chatgpt');
@@ -40,7 +47,7 @@ function normalizeExternalResearchRequest(body = {}) {
   if (conversationUrl && provider !== 'chatgpt') {
     throw new Error('conversationUrl is supported only for provider=chatgpt');
   }
-  return { provider, prompt, options, files, conversationUrl };
+  return { provider, prompt, options, files, conversationUrl, ...(browserId ? { browserId } : {}) };
 }
 
 function externalResearchRequestFingerprint({
@@ -60,6 +67,7 @@ function externalResearchRequestFingerprint({
     options: request?.options || {},
     files: request?.files || [],
     conversationUrl: request?.conversationUrl || '',
+    ...(request?.browserId ? { browserId: request.browserId } : {}),
     label: String(label || ''),
     parentRunId: String(parentRunId || ''),
     continueFromRunId: String(continueFromRunId || ''),
@@ -95,7 +103,36 @@ function continuationRequest(previous, body = {}) {
     options: nextOptions,
     files: body.files ?? body.attachments,
     conversationUrl,
+    browserId: body.browserId,
   });
+}
+
+async function resolveExternalResearchBrowserBinding({ request, previous, existingRun, capabilities, client, store }) {
+  // Replays keep the originally reserved target, not today's alias/primary.
+  if (existingRun) return existingRun.externalResearchExpectedBrowserInstanceId || null;
+  const selected = request.browserId ? configuredBrowserInstanceId(request.browserId, capabilities) : null;
+  if (!previous) return selected;
+  const previousRunId = previous.runId;
+  const previousJobId = previous.externalResearchJobId;
+  const previousUrl = previous.externalResearchConversationUrl;
+  let owner = browserInstanceId(previous.externalResearchBrowserInstanceId);
+  if (!owner && previous.externalResearchJobId) {
+    const metadata = await client.jobMetadata(previousJobId, { capabilities });
+    owner = exactBrowserOwner(metadata, previousJobId);
+    if (owner) await store.recordExternalResearchBrowser(previousRunId, metadata, { allowTerminal: true });
+  }
+  if (!owner) throw browserError('external_research_browser_owner_unproven',
+    'The previous exact SC job browser owner is unavailable; continuation was not started');
+  if (selected && selected !== owner) throw browserError('external_research_browser_owner_mismatch',
+    'Continuation must use the previous SC job browser profile');
+  const current = await store.getInternal(previousRunId);
+  if (!current || current.runKind !== 'external-research' || current.status !== 'completed'
+    || current.resultComplete !== true || current.externalResearchJobId !== previousJobId
+    || current.externalResearchConversationUrl !== previousUrl
+    || current.externalResearchBrowserInstanceId !== owner) {
+    throw browserError('external_research_browser_owner_unproven', 'Previous research owner changed during continuation preparation');
+  }
+  return owner;
 }
 
 module.exports = {
@@ -105,4 +142,5 @@ module.exports = {
   externalResearchRequestFingerprint,
   externalResearchTargetLabel,
   continuationRequest,
+  resolveExternalResearchBrowserBinding,
 };

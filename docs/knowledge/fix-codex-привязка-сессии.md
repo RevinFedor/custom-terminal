@@ -82,4 +82,4 @@ PTY-действие не повторяется — это strengthening author
 
 После ремонта три ранее повреждённые production-привязки восстановлены через stopped-session compare-and-set и проверены одновременно в renderer и SQLite: `portfolio → 019f8a92…`, `sidebar → 019f8aa7…`, `реализация drag-and-drop… → 71044c52…`.
 
-Связано: [`fact-codex.md`](fact-codex.md), [`fact-data-persistence.md`](fact-data-persistence.md), [`fact-reopen-last-closed-tab.md`](fact-reopen-last-closed-tab.md), [`../methodology/диагностика-логами.flow.md`](../methodology/диагностика-логами.flow.md).
+Связано: [`fact-codex.md`](fact-codex.md), [`fact-data-persistence.md`](fact-data-persistence.md), [`fact-reopen-last-closed-tab.md`](fact-reopen-last-closed-tab.md), [логирование терминала — PTY](логирование-терминала-pty.md).

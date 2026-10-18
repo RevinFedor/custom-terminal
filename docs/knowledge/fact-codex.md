@@ -2549,7 +2549,14 @@ Ordinary send без override обходит picker, но не является 
 sync marker занятого turn либо слово `/model` в старом выводе не являются ACK.
 Таймаут2500ms завершает ожидание caller, но не уничтожает receipt вставки;
 общий Send с пользовательским текстом по-прежнему не получает pre-Enter ACK
-и сохраняет ordered paste+Enter. Остальные slash-протоколы не менялись.
+и сохраняет ordered paste+Enter. У первоначального standalone `/compact` с18.10
+свой единый Main preparation lifetime до60s (cold не продлевает original deadline):
+неизвестный кадр до вставки и exact-owned proof после единственной вставки
+принадлежат той же операции. Continuation ждёт вне PTY/settings locks, не делает
+repaste и не публикует final failure перед неожиданным поздним исполнением.
+Stop/manual/owner/settings/expiry отзывают будущие записи; pending после возможного
+Enter остаётся только для позднего causal outcome, не replay. Это не расширение
+всех `/model`/`/fast` waits и не перенос общего startup budget на любой post-paste.
 
 Шрам14.10 `perf35`: после Resume footer подтвердил Sol6.1/max, а Send явно
 потребовал high. Считать такой picker лишним только по одинаковой модели нельзя.
@@ -2776,7 +2783,16 @@ baseline. Worker резервирует обе bounded manifests до payload: �
 отмену pending Compact или native восстановление author draft поверх возможного
 submit. Exact captured text/images возвращаются через прежний History recovery,
 pending остаётся доступным только для late causal outcome. Это не объясняет
-исторический Enter0 timeout и не меняет срок ожидания post-paste composer.
+исторический Enter0 timeout. Отдельный preparation lifetime первоначального
+Compact описан выше и не выводится из этого exceptional-path ремонта.
+
+Raw worker учитывает весь unwritten batch/rest при header/record ошибке,
+включая возможный partial record; поздний seal ACK не стирает persistence failure.
+Main присоединяет dispose к awaited `before-quit`, writer удерживает worker до
+ACK/failure/deadline, а coalesced close ограничивает drain+terminate одним2s.
+Это bounded decoded-window diagnostics, не синхронный disk journal на каждый
+chunk и не гарантия полного kernel stream. Квота128MiB относится к raw artifacts,
+а не ко всем `production.log`, performance captures, History cache и сборкам.
 
 ## Stop и ввод
 

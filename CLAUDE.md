@@ -99,9 +99,11 @@ Workflow владеет организацией и окнами, а cwd и exec
 сменой cwd или повтором frozen operation. Legacy `projectId` остаётся точным
 адресом исполнения; его нельзя переименовать в workflowId. Для новых вкладок
 нужен независимый subject без Project FK. Не создавать скрытый Everything Project.
-Optional workflow defaultCwd — только начальный каталог новых вкладок, после
-explicit/source cwd; он не переписывает живые subject/cwd. Sources в настройках
-workflow редактирует явно выбранную вкладку, bindings остаются tab-owned.
+Для исполнения optional workflow defaultCwd — начальный каталог новых вкладок,
+после explicit/source cwd; он не переписывает живые subject/cwd. Промпты из docs
+основной и дополнительных директорий workflow (`promptDirectories`) общие для
+всех его вкладок. Настройка директорий не требует выбора вкладки или Sources;
+закрытие настроек сохраняет изменения через прежний organization commit.
 См. `docs/knowledge/fact-workspace.md::Workflow, вкладка и исполнение`.
 
 Порядок workflow разрешается общим `workflow-order.cjs` по Main publication,
@@ -186,6 +188,12 @@ Cold Codex Send сохраняет original launch deadline после ready cle
 settings/physical lock; renderer несёт только Main-issued scope ID. Final composer
 proof выполняется после последнего pre-paste await. Ready не равно empty; Stop,
 смена owner/mirror и late negative после durable Enter arm не разрешают повтор Send.
+
+Принятый Codex Send получает один60s preparation scope при входе ACTIVE HEAD,
+не при enqueue; cold ограничен также original startup deadline. Поздний кадр
+продолжает тот же H/O/A вне PTY/settings locks. Standalone Compact сохраняет
+единственную вставку до exact-owned proof; отмена/expiry не становятся replay.
+Подробности — `fact-terminal-mcp.md::Main FIFO принятых Send` и `fact-codex.md`.
 
 Replay bytes нельзя отпускать по historical mobile manifest/JSON preview.
 Conditional assetDisposition соединяет exact source lease с текущим FIFO/History

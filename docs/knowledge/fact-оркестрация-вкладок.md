@@ -219,6 +219,45 @@ run с conversation identity, наследует его provider/options при 
 override и передаёт новые file descriptors. Переиспользовать завершённый request
 ID запрещено: иначе старый result мог бы ложно стать ответом нового review.
 
+SOURCE18.10: все три typed wrapper и общий POST принимают top-level `browserId`:
+`chrome`, `yandex` либо persistent profile UUID. В `options` selector запрещён.
+Явный выбор требует Noted `externalResearchOrchestration.browserSelection` и SC
+`browserSelection` v1 (`field:browserId`, `jobOwnerPinned`, `offlinePreflight`).
+Старый участник возвращает update-required до dispatch, не игнорирует поле.
+Новый omitted start сохраняет прежний default без изменения global primary.
+Alias разрешается по origin-less SC `configuredTargets:{version:1,state:known,aliases}`:
+это конфигурация route, не online/account proof. Missing alias и unavailable settings
+различаются. В intent/fingerprint остаётся выбор caller; expected UUID сохраняется
+до эффекта, exact SC job отдельно подтверждает `externalResearchBrowserInstanceId`.
+Status/result с другим pin отвергается. Same-ID retry не выбирает сегодняшнюю alias map.
+
+Continue наследует **exact UUID прежнего job**, не текущий primary. Явный selector
+должен совпасть с этим owner. Для legacy без pin используется один
+`GET /research-status?id=<jobId>&metadataOnly=true`, только при
+`browserSelection.jobMetadataReadOnly:true`, с exact id/metadataOnly/source ACK.
+Обычный status не заменяет этот reader: restore prepared job способен вызвать
+find/open. UUID=null остаётся owner-unproven; metadata не доказывает свежую живость
+браузера. Новые capability awaits сохраняют финальный cancel/job/pin guard перед POST.
+
+Только новый ещё не admitted запрос с SC
+`BROWSER_UNAVAILABLE/profile_offline/preflightOnly:true/deliveryUnknown:false/retrySafe:true`
+получает queued `waiting-for-browser` и `externalResearchBrowserWait.notSubmitted:true`.
+Прежний pending/unknown start либо accepted job не понижается до no-submit по этому
+новому preflight. Tracker показывает статичное «Ждёт браузер», детали — «Не отправлен».
+Один frozen `research-browser-offline:<hash>` отправляется в server-owned Telegram
+outbox от сохранённого source context. Queued outbox не равен доставленному Telegram;
+сбой outbox виден отдельно, run не завершается и модель не будится. Retry/backoff
+сохраняет IDs/payload/UUID, не запускает Chrome и не переключается на Яндекс.
+Bridge `transport_unknown` не объявляется закрытым Chrome. HTTP429 у SC-клиента —
+transport wait, но native provider `status:error` остаётся terminal. Generic
+no-progress attention этим не реализуется.
+
+Публичные browserAccount содержат только записанные user/account IDs, source,
+observed_at и binding `before_send|read`, без email/credentials. Read не является
+атрибуцией старого Send или billing; profile UUID не подтверждает неизменный account
+после перелогина. SOURCE/HTTP fixtures не подтверждают installed capabilities,
+реальный provider Send или Telegram delivery.
+
 Для Codex live audit может раньше canonical UUID получить точную физическую
 identity `session + byte offset`, особенно в Resume, где единственным carrier
 остаётся `response_item/message(role=user)`. Store сохраняет эту identity. Если
@@ -392,6 +431,19 @@ Abort/interrupt target-turn переводит run в failure, а не в comple
 receipt hash, с собственными ID в immutable handoff, не через новый queue runner.
 Ни prompt исполнителя, ни полный result туда не входят; terminal fact не означает
 команду заново читать уже прочитанный ответ или создавать новый run.
+
+Quiet `<orchestration_state>` остаётся transport-контекстом, но не началом
+показываемого user bubble. С18Oct SOURCE `context-prefix` sidecar строится только
+из frozen handoff с continuation IDs и exact confirmed receipt того же tab/H/O/A/
+provider/SID/hash. History/Timeline снимают только этот заголовок по полному
+SHA-256/offset/envelope proof; raw content для audit/Copy/Rewind сохраняется.
+Обычный user suffix остаётся literal, без смены origin/цвета или включения Markdown.
+Sent при этом остаётся sent: completed fact или скрытое warning не создают SEND FAILED.
+Поздний audit может добавить proof после раннего context confirm; повтор уже
+сохранённого sidecar не публикует новую доставку. Startup восстанавливает до512
+недавних delivered handoffs только при наличии retained exact receipts; JSONL
+не сканируется и не переписывается. Unknown/canonical-mismatch без точного proof
+остаётся исходным текстом, без regex по похожей пользовательской цитате.
 
 Не больше8 фактов на handoff; новая подготовка не добавляет reserved/unknown
 факты, доказанный отказ освобождает их для следующего обычного prompt. Ранняя подготовка старой отправки не меняется

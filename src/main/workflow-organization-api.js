@@ -25,6 +25,8 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
     const receipt=database.db.prepare('SELECT request_json FROM workflow_org_mutations WHERE mutation_id=?').get(publication.mutationId);
     const kind=receipt && JSON.parse(receipt.request_json).kind;
     if(['publishMigration','createTab','registerLegacyTab'].includes(kind))roots.notify({kind,tabIds:publication.tabId?[publication.tabId]:null});
+    if(['moveTab','detachTab','deleteWorkflow','createWorkflow','commitDrag'].includes(kind))
+      roots.notify({kind:'workflow-sources',tabIds:null});
     publish(publication);
   },
     captureSource: () => migrationSource || {},
@@ -161,7 +163,19 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
     if (kind === 'commitDrag') return drag.commit(JSON.parse(JSON.stringify(request)));
     const allowed = new Set(['moveTab', 'detachTab', 'createWorkflow', 'saveLayout', 'deleteWorkflow', 'commitWorkspace']);
     if (!allowed.has(kind) || typeof service[kind] !== 'function') error('workflow_mutation_unknown', 400);
-    return service[kind](JSON.parse(JSON.stringify(request)));
+    const frozen=JSON.parse(JSON.stringify(request));
+    // Layout saves alone do not wake the catalog. Only an actual shared
+    // directory change needs to prepare new source metadata for its members.
+    const directoryChanged=kind==='commitWorkspace' && (frozen.spaces || []).some(space=>{
+      if(!Object.hasOwn(space,'defaultCwd') && !Object.hasOwn(space,'promptDirectories'))return false;
+      const old=db.prepare('SELECT metadata_json FROM workflow_org_workflows WHERE workflow_id=?').get(space.id);
+      const metadata=old?JSON.parse(old.metadata_json):{};
+      return (Object.hasOwn(space,'defaultCwd') && (metadata.defaultCwd || null)!==(space.defaultCwd || null))
+        || (Object.hasOwn(space,'promptDirectories') && JSON.stringify(metadata.promptDirectories || [])!==JSON.stringify(space.promptDirectories));
+    });
+    const result=service[kind](frozen);
+    if(directoryChanged)roots.notify({kind:'workflow-sources',tabIds:null});
+    return result;
   };
   const getMutation = mutationId => {
     const row = db.prepare('SELECT response_json FROM workflow_org_mutations WHERE mutation_id=?').get(mutationId);
@@ -191,7 +205,7 @@ function registerWorkflowOrganizationIpc(ipcMain, api) {
   ipcMain.handle('workflow:save-root', (_event, request) => api.roots.save(request));
   ipcMain.handle('workflow:remove-root', (_event, request) => api.roots.remove(request));
   ipcMain.handle('workflow:tab-roots', (_event, tabId) => ({...api.roots.read(),sources:api.roots.sourcesForTab(tabId),
-    rootIds:api.roots.sourcesForTab(tabId).map(source=>source.rootId)}));
+    rootIds:api.roots.boundSourcesForTab(tabId).map(source=>source.rootId)}));
   ipcMain.handle('workflow:set-tab-roots', (_event, request) => api.roots.setTabSources(request));
   ipcMain.handle('workflow:groups-read', () => api.groups.read());
   ipcMain.handle('workflow:group-mutation', (_event, mutationId) => api.groups.getMutation(mutationId));

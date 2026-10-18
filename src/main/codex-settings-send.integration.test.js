@@ -59,6 +59,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   const rendererTab = { codexSessionId: 'writer', codexModel: model, codexEffort: effort,
     codexSettingsProofSessionId: 'writer' };
   const context = vm.createContext({
+    ...require('./agent-send-preparation'), agentSendReceiptStore: null,
     ...runtimeContract, ...writerTransition, ...require('./agent-send-target-precondition'),
     resolveConfiguredAgentModel,
     projectManager: { db: { getAppState: () => ({ models: [] }) } },

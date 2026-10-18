@@ -188,6 +188,7 @@ function rememberWrittenSource(filePath) {
 let sourceBytes = 0, sourceVerificationBytes = 0;
 const api = codexData._api;
 const sourceEpochs = new Int32Array(workerData.sourceEpochBuffer);
+const sourceRewriteEpochs = new Int32Array(workerData.sourceRewriteEpochBuffer || workerData.sourceEpochBuffer);
 const sourceEpochSlots = new Map(), epochPending = new Map();
 const epochSlot = file => sourceEpochSlots.get(file) ?? 0;
 cache.assertCurrent = () => {
@@ -473,6 +474,13 @@ const service = createSessionTranscriptService({ codexData, promptPresentationSt
     return result;
   },
 });
+service.snapshotAssertCurrent = () => {
+  const context = requestContext.getStore();
+  if (!context?.snapshotEpochs || [...context.sources].some(file =>
+    context.snapshotEpochs[epochSlot(file)] !== Atomics.load(sourceRewriteEpochs, epochSlot(file)))) {
+    throw Object.assign(new Error('Codex snapshot source invalidated'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+  }
+};
 let lastCacheMemory = '';
 function publishCacheMemory() {
   try {
@@ -549,23 +557,26 @@ parentPort.on('message', message => {
     if (method === 'releaseMemory') { api.invalidateCodexHistoryProjectors(); cache.clearMemory();
       service.codexVirtualTranscriptStore?.clear(); return { value: true, readProof: [] }; }
     if (!['getHistory', 'getTimeline', 'getToolPayload', 'getTabMessageSourceLocation', 'getMessages', 'searchHistory', 'searchCatalogCandidate',
-      'resolveCodexPhysicalRow', 'copyCodexVirtualRange', 'exportCodexSession', 'prepareCodexRewrite'].includes(method)) throw new Error('history_read_method');
+      'resolveCodexPhysicalRow', 'copyCodexVirtualRange', 'exportCodexSession', 'prepareCodexRewrite', 'readSessionSnapshot'].includes(method)) throw new Error('history_read_method');
     context.rewriteReceipt = message.rewriteReceipt || null;
-    Object.assign(context, { payloads: new Map(), sources: new Set(), sourceEpochs: sourceEpochs.slice(), preparations: [], assets: new Map() });
+    Object.assign(context, { payloads: new Map(), sources: new Set(), sourceEpochs: sourceEpochs.slice(),
+      snapshotEpochs: method === 'readSessionSnapshot' ? sourceRewriteEpochs.slice() : null, preparations: [], assets: new Map() });
     return requestContext.run(context, async () => {
       const memoryRead = method === 'searchCatalogCandidate' ? beginHistoryReadDiagnostic('catalog-projection', {
         sessionId: payload.sessionId, provider: 'codex', readId: correlation.diagnosticReadId,
       }) : null;
       try {
-        if (method === 'searchCatalogCandidate') { context.catalogScan = true; await enterCold(); }
+        if (method === 'searchCatalogCandidate' || method === 'readSessionSnapshot') { context.catalogScan = true; await enterCold(); }
         const prepared = method === 'prepareCodexRewrite'
           ? await api.projectCodexFullHistoryFromFile(payload.sessionId, payload.cwd) : null;
         const result = prepared ? { success: prepared.success, error: prepared.error, mode: prepared.mode,
           fedRecords: prepared.fedRecords, reusedRecords: prepared.reusedRecords || 0, sourceSnapshot: prepared.sourceSnapshot }
           : await service[method](payload);
+        const epochs = context.snapshotEpochs ? sourceRewriteEpochs : sourceEpochs;
+        const capturedEpochs = context.snapshotEpochs || context.sourceEpochs;
         const readProof = [...context.sources].map(filePath => ({ filePath,
-          epoch: context.sourceEpochs[epochSlot(filePath)], slot: epochSlot(filePath) }));
-        if (readProof.some(source => source.epoch !== Atomics.load(sourceEpochs, source.slot))) {
+          epoch: capturedEpochs[epochSlot(filePath)], slot: epochSlot(filePath) }));
+        if (readProof.some(source => source.epoch !== Atomics.load(epochs, source.slot))) {
           phaseDiagnostic({ phase: 'source-fence', outcome: 'invalidated', reason: 'source-epoch-invalidated' });
           throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
         }

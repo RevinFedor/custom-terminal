@@ -1,8 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import vm from 'node:vm';
-import { transformSync } from 'esbuild';
 import { loadPickerPromptCatalog, promptCatalogChangeAffectsTarget, promptRootChoices, promptSourceSearchPath, promptRootForSelectedFolder, togglePromptRoot, tabPromptBindingRequest, validatePromptRootSnapshot } from './promptTabSourcesModel.mjs';
 
 test('source settings show the configured root and fixed docs search folder without rewriting a root named docs',()=>{
@@ -31,7 +29,7 @@ test('migrated picker reads the captured opaque target, never its common executi
   const target = { tabId: 'captured:tab', projectId: '__global_namespace__', organizationReady: true };
   const catalog = await loadPickerPromptCatalog(ipc, target);
   assert.deepEqual(requests, [['project-prompts:list-tab', 'captured:tab']]);
-  assert.equal(catalog.project.name, 'Промпты вкладки');
+  assert.equal(catalog.project.name, 'Промпты рабочего пространства');
   assert.equal(catalog.prompts[0].id, 'stable:legacy');
   await loadPickerPromptCatalog(ipc, { ...target, organizationReady: false });
   assert.deepEqual(requests.at(-1), ['project-prompts:list', '__global_namespace__']);
@@ -80,124 +78,13 @@ test('picker keeps captured insertion targets while source controls live in work
   assert.match(picker, /const pickerTabId = contextRequest\?\.tabId \|\| shortcutTarget\?\.tabId/);
   assert.match(picker, /const target = \{tabId:pickerTabId,projectId:pickerProjectId,organizationReady\}/);
   assert.match(picker, /read:\(\) => loadPickerPromptCatalog\(ipcRenderer,target\)/);
-  const settings = fs.readFileSync(new URL('../UI/WorkflowSourcesSettings.tsx', import.meta.url), 'utf8');
+  const settings = fs.readFileSync(new URL('../UI/WorkflowDirectorySettings.tsx', import.meta.url), 'utf8');
   assert.doesNotMatch(picker, /data-prompt-tab-sources-action/);
-  assert.match(settings, /workflow:tab-roots/);
-  assert.match(settings, /project-prompts:set-tab-sources/);
+  assert.doesNotMatch(settings, /workflow:tab-roots|project-prompts:set-tab-sources|<select/);
   assert.match(settings, /app:select-directory/);
-  assert.match(settings, /workflow:save-root/);
+  assert.match(settings, /promptDirectories/);
   assert.match(picker, /handleSelectPrompt\(p, event\.metaKey\)/);
   assert.match(picker, /handleCopyPrompt\(event, p\)/);
   assert.match(picker, /subscribeSavedPromptLibraryChanges/);
   assert.doesNotMatch(picker, /window\.prompt\(/);
-});
-
-function actualSourceActions(invoke, extra = {}) {
-  const source = fs.readFileSync(new URL('../UI/WorkflowSourcesSettings.tsx', import.meta.url), 'utf8');
-  const start = source.indexOf('  const current=()=>'),end = source.indexOf('  return <div',start);
-  assert.ok(start > 0 && end > start);
-  const state = {open:true,busy:false,error:'',rootIds:['old'],snapshot:null,revision:0,pending:null};
-  const generation={current:0},operation={current:false},alive={current:true};
-  const snapshot=extra.sourceSnapshot || {version:1,revision:8,roots:[],rootIds:['old'],sources:[]};
-  const context={useCallback:callback=>callback,useEffect:()=>{},tabId:'captured-target',workflowId:'W',snapshot,ids:['old'],pending:null,
-    generation,lock:operation,alive,ipc:()=>({invoke}),crypto:{randomUUID:()=> 'generated-uuid'},
-    useWorkspaceStore:{getState:()=>({tabWorkflowMembership:{'captured-target':{workflowId:'W'}}})},
-    tabPromptBindingRequest,togglePromptRoot,validatePromptRootSnapshot,promptRootForSelectedFolder};
-  const set=(key,variable=key)=>value=>{state[key]=typeof value==='function'?value(state[key]):value;context[variable]=state[key];};
-  Object.assign(context,{setBusy:set('busy'),setError:set('error'),setSnapshot:set('snapshot'),setIds:set('rootIds','ids'),setPending:set('pending')});
-  const script=transformSync(source.slice(start,end)+'\nglobalThis.actions={openSourceEditor:load,saveTabSources:save,addPromptFolder:add};',{loader:'ts'}).code;
-  vm.runInNewContext(script,context);
-  return {actions:context.actions,state,generation,operation,alive};
-}
-
-test('actual editor handlers snapshot the captured tab and ignore late results after a different picker opens', async () => {
-  let finish;
-  const requests = [];
-  const f = actualSourceActions((...args) => { requests.push(args); return new Promise(resolve => { finish = resolve; }); });
-  const pending = f.actions.openSourceEditor();
-  assert.deepEqual(requests, [['workflow:tab-roots', 'captured-target']]);
-  assert.equal(f.state.busy, true);
-  f.generation.current = 2;
-  finish({ version: 1, revision: 9, rootIds: ['foreign'] });
-  await pending;
-  assert.equal(f.state.snapshot, null);
-  assert.deepEqual(f.state.rootIds, ['old']);
-  assert.equal(f.operation.current, false);
-});
-
-test('actual Save sends exact CAS and failed CAS retains the choices without reporting success', async () => {
-  const requests = [];
-  const f = actualSourceActions(async (...args) => { requests.push(args); return { success: false, error: 'root_revision_changed' }; });
-  f.state.open = true;
-  await f.actions.saveTabSources();
-  assert.equal(requests[0][0], 'project-prompts:set-tab-sources');
-  assert.equal(requests[0][1].tabId, 'captured-target');
-  assert.equal(requests[0][1].expectedRevision, 8);
-  assert.equal(requests[0][1].mutationId, 'generated-uuid');
-  assert.deepEqual(Array.from(requests[0][1].rootIds), ['old']);
-  assert.match(f.state.error, /root_revision_changed/);
-  assert.equal(f.state.open, true);
-  assert.equal(f.state.revision, 0);
-});
-
-test('actual Add registers a folder with CAS then requires the acknowledged revision before keeping the draft', async () => {
-  const requests = [];
-  const f = actualSourceActions(async (...args) => {
-    requests.push(args);
-    if (args[0] === 'app:select-directory') return '/chosen';
-    if (args[0] === 'workflow:save-root') return { id: 'new', version: 1, revision: 9 };
-    return { version: 1, revision: 10, roots: [{ id: 'new', path: '/chosen' }], rootIds: ['concurrent-choice'] };
-  });
-  await f.actions.addPromptFolder();
-  assert.equal(requests[1][1].expectedRevision, 8);
-  assert.equal(requests[1][1].path, '/chosen');
-  assert.equal(requests[1][1].enabled, true);
-  assert.deepEqual(requests[2], ['workflow:tab-roots', 'captured-target']);
-  assert.equal(f.state.snapshot, null, 'must not silently adopt newer binding revision');
-  assert.deepEqual(f.state.rootIds, ['old']);
-  assert.match(f.state.error, /изменился/);
-});
-
-test('actual Add reuses an existing registration and never changes cwd or creates a Project', async () => {
-  const requests = [];
-  const f = actualSourceActions(async (...args) => { requests.push(args); return '/registered'; }, {
-    sourceSnapshot: { version: 1, revision: 8, roots: [{ id: 'existing', path: '/registered' }] },
-  });
-  await f.actions.addPromptFolder();
-  assert.deepEqual(JSON.parse(JSON.stringify(requests)), [['app:select-directory', {buttonLabel:'Выбрать корень'}]]);
-  assert.deepEqual(Array.from(f.state.rootIds), ['old', 'existing']);
-});
-
-test('actual Add of a known docs folder keeps its parent root ID and does not create docs/docs registration',async()=>{
-  const requests=[];
-  const f=actualSourceActions(async(...args)=>{requests.push(args);return '/registered/docs';},{
-    sourceSnapshot:{version:1,revision:8,roots:[{id:'existing',path:'/registered'}]},
-  });
-  await f.actions.addPromptFolder();
-  assert.equal(requests.length,1);
-  assert.equal(requests[0][0],'app:select-directory');
-  assert.deepEqual(Array.from(f.state.rootIds),['old','existing']);
-});
-
-test('actual Save retains an unknown envelope and retries the same exact mutation without selecting another tab',async()=>{
-  const requests=[];
-  const f=actualSourceActions(async(...args)=>{requests.push(args);throw Error('transport outcome unknown');});
-  await f.actions.saveTabSources();
-  const pending=f.state.pending;
-  assert.equal(pending.tabId,'captured-target');
-  assert.equal(pending.expectedRevision,8);
-  await f.actions.saveTabSources();
-  assert.equal(requests.length,2);
-  assert.equal(requests[0][1],requests[1][1]);
-  assert.equal(f.state.pending,pending);
-});
-
-test('actual Add ignores a late native directory choice after its captured target was closed',async()=>{
-  const requests=[];let resolve;
-  const f=actualSourceActions((...args)=>{requests.push(args);return new Promise(done=>{resolve=done;});});
-  const pending=f.actions.addPromptFolder();
-  f.alive.current=false;resolve('/registered/docs');await pending;
-  assert.equal(requests.length,1);
-  assert.equal(requests[0][0],'app:select-directory');
-  assert.deepEqual(f.state.rootIds,['old']);
 });

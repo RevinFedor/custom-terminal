@@ -189,7 +189,7 @@ test('actual HTTP Send + registry carries done fact once; GET status stays done 
   const sent = [], transportResults = []; let resultReads = 0;
   const sendJson = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const target = { tabId: 'T', sessionId: 'S', toolType: 'codex', projectId: 'P', tabType: 'terminal' };
-  const env = vm.createContext({ crypto, console, tabWorkContext: h.context,
+  const env = vm.createContext({ crypto, console, require, tabWorkContext: h.context,
     promptAuditFingerprint, fingerprintAgentSendRequest, withPromptOriginPresentation,
     prepareStructuredAuthoring, validateStructuredSendEnvelope, bindStructuredAuthoringPresentation, agentSendTargetPreconditionFailure,
     classifyAgentSendReceipt, isAgentSendProviderQueueAccepted, AGENT_SEND_RECEIPT_STATES: RECEIPT_STATES,
@@ -209,7 +209,7 @@ test('actual HTTP Send + registry carries done fact once; GET status stays done 
       exactAuditConfirmed: true, codexAudit: { success: true, actualHash: promptAuditFingerprint(payload.prompt) } }; },
     getOrchestrationRunStore: () => h.store, isActiveStatus, isExternalResearchRun,
     reconcileExternalResearchRun: id => h.store.get(id), withOrchestrationUrls: run => run,
-    getScExternalResearchClient: () => ({ status: async () => { resultReads++; return { status: 'done', result: { text: 'final answer' } }; } }),
+    getScExternalResearchClient: () => ({ status: async () => { resultReads++; return { id: 'noted_fixture', status: 'done', result: { text: 'final answer' } }; } }),
     isScResearchTerminalStatus: status => ['done', 'error'].includes(status),
     externalResearchAnswerText: snapshot => snapshot?.result?.text || '',
   });
@@ -324,16 +324,21 @@ test('actual main PTY queue and paste/Enter destination guard reject late contex
     withPtyWriteLock: async (_term, work) => { h.setScope({ ...scope, sessionId: 'B' }); return work(); },
     bumpTerminalInputRevision: () => { inputReservations++; return 1; },
     _safePasteAndSubmitInner: async () => { writes++; },
+    // This control has no admitted preparation lease. Keep the current Main
+    // preparation port explicit while exercising its real destination guard.
+    agentSendReceiptStore: {}, readAgentSendPreparation: () => null,
+    historyMutationInput: { assert: tabId => assert.equal(tabId, 'T') },
   });
   vm.runInContext(['getTerminalStopRevision', 'captureAgentInputIdentity', 'agentSendExecutionFailure',
     'assertKnownEmptySend', 'safePasteAndSubmit', 'finishSafePasteAfterWrite', 'resolveSafePasteFailureAfterWrite'].map(mainFn).join('\n'), env);
   const result = await env.safePasteAndSubmit(term, prepared.prompt, { handoffId: 'one' });
-  assert.equal(result.code, 'agent_context_source_changed');
+  assert.equal(result.code, 'agent_context_source_changed', JSON.stringify(result));
   assert.equal(result.submitted, false); assert.equal(writes, 0); assert.equal(inputReservations, 0);
   const gateEnv = vm.createContext({ assertKnownEmptySend: env.assertKnownEmptySend, broadcastTabId: 'T',
     agentSendExecutionFailure: env.agentSendExecutionFailure, term,
     writeExecutionIdentity: env.captureAgentInputIdentity('T', term),
     pasteWritten: false,
+    submitAttempted: false, preparation: null, codexStartupFrameWait: null,
     handoffId: 'one', expectedDestination: null, expectedTarget: null, sendOperationKey: null, sendAttemptId: null, options: {} });
   const gate = vm.runInContext(destination, gateEnv);
   assert.equal(gate().code, 'agent_context_source_changed', 'runs even without legacy expectedTarget');

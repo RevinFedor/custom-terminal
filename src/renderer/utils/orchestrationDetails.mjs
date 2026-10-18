@@ -89,11 +89,19 @@ export function orchestrationDetailRows(run, tabId) {
   if (outcome) rows.push({ key: 'outcome', label: 'Итог', value: outcome });
   const notification = orchestrationNotificationText(run, tabId);
   if (notification) rows.push({ key: 'notification', label: 'Уведомление', value: notification });
+  if (run.status === 'queued' && run.deliveryDeferredReason === 'waiting-for-browser'
+    && run.externalResearchBrowserWait?.notSubmitted === true) {
+    const browser = run.externalResearchRequestedBrowserId === 'chrome' ? 'Chrome'
+      : run.externalResearchRequestedBrowserId === 'yandex' ? 'Яндекс'
+        : run.externalResearchBrowserWait.browserInstanceId;
+    rows.push({ key: 'browser-wait', label: 'Браузер', value: `${browser}: не в сети. Не отправлен` });
+  }
   const issues = new Map();
   for (const [label, value] of [
     ['Выполнение', run.error], ['Результат', run.resultError],
     ['Уведомление', run.notificationError],
     ['Связь с SC Desktop', run.externalResearchTransportError],
+    ['Telegram', run.externalResearchBrowserNoticeError],
   ]) {
     const message = text(value);
     if (['Выполнение', 'Результат'].includes(label) && message === 'turn_aborted'

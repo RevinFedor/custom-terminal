@@ -631,12 +631,21 @@ export async function proveAgentComposerForSend({
       }
     }
     if (draftDecision.decision === 'unknown') {
+      // This branch has not invoked the provider writer. A Main-owned
+      // preparation refusal must not turn into a generic frame error when
+      // Stop also supersedes the observation's final publication.
+      const preparationCode = toolType === 'codex' && [
+        'agent_send_cancelled', 'agent_send_preparation_expired',
+        'agent_send_preparation_superseded', 'agent_send_preparation_storage_unavailable',
+      ].includes(visual.preparationFailure?.code) ? visual.preparationFailure.code : null;
       return {
         complete: true,
         result: {
           tabId, toolType, success: false, ok: false, submitted: false, accepted: false,
-          code: 'terminal_draft_state_unknown',
-          error: 'Terminal draft state is unknown; send stopped before touching input',
+          code: preparationCode || 'terminal_draft_state_unknown',
+          error: preparationCode || 'Terminal draft state is unknown; send stopped before touching input',
+          ...(preparationCode ? { pasteWritten: false, enterWritten: false } : {}),
+          ...(preparationCode === 'agent_send_cancelled' ? { cancelled: true } : {}),
           draftPreview: visual.preview || '', draftSource: visual.source || '',
           proofOutcome: visual.proofOutcome || 'unknown', proofReason: draftDecision.reason,
         },

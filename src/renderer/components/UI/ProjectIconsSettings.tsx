@@ -118,6 +118,7 @@ function WorkflowNameEditor({
   disabled,
   onCommit,
   onFocused,
+  saveOnEscape = false,
 }: {
   id: string;
   name: string;
@@ -125,6 +126,7 @@ function WorkflowNameEditor({
   disabled: boolean;
   onCommit: (id: string, name: string) => void;
   onFocused: () => void;
+  saveOnEscape?: boolean;
 }) {
   const renameInput = useInlineRenameInputRef(focusOnMount);
   const inputRef = renameInput.nodeRef;
@@ -162,8 +164,8 @@ function WorkflowNameEditor({
       onKeyDown={(event) => {
         if (event.key === 'Enter') event.currentTarget.blur();
         if (event.key === 'Escape') {
-          cancelled.current = true;
-          setDraft(name);
+          cancelled.current = !saveOnEscape;
+          if(!saveOnEscape)setDraft(name);
           event.currentTarget.blur();
         }
       }}
@@ -419,6 +421,7 @@ export default function WorkflowSettings({workflowId}:{workflowId?:string}={}) {
                 <WorkflowNameEditor
                   id={space.id}
                   name={space.name}
+                  saveOnEscape={!!workflowId}
                   focusOnMount={newWorkflowId === space.id}
                   disabled={Boolean(busyKey)}
                   onFocused={() => {

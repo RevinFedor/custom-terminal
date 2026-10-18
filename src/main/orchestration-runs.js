@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { isDeepStrictEqual } = require('node:util');
+const { assertBrowserOwner, browserInstanceId, publicBrowserAccount } = require('./external-research-browser');
 const { continuationOwnerKey } = require('./orchestration-continuation');
 const { bindTargetInputOwner } = require('./orchestration-target-input-owner');
 const {
@@ -795,6 +796,7 @@ function publicRun(run) {
     // an app restart.  It must never leak through Project API/status payloads.
     deliveryIntent: _deliveryIntent,
     externalResearchIntent: _externalResearchIntent,
+    externalResearchBrowserNotice: _externalResearchBrowserNotice,
     requestFingerprint: _requestFingerprint,
     promptHash: _promptHash,
     resultPromptHash: _resultPromptHash,
@@ -1175,6 +1177,7 @@ class OrchestrationRunStore {
 
   async markExternalResearchTransportWait(runId, {
     error,
+    code,
     retryAt,
   } = {}) {
     await this.initialize();
@@ -1183,9 +1186,54 @@ class OrchestrationRunStore {
     run.status = 'queued';
     run.deliveryDeferredReason = 'external-research-transport';
     run.externalResearchTransportError = String(error || 'SC Desktop is unavailable');
+    run.externalResearchTransportCode = code || null;
     run.externalResearchRetryAt = Number(retryAt) || null;
+    run.externalResearchBrowserWait = null;
     run.updatedAt = Date.now();
     this._schedulePersist();
+    return publicRun(run);
+  }
+
+  async recordExternalResearchBrowser(runId, snapshot, { allowTerminal = false } = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!isExternalResearchRun(run) || snapshot?.id !== run.externalResearchJobId
+      || (!allowTerminal && isTerminalStatus(run.status))) return null;
+    const owner = assertBrowserOwner(run, snapshot);
+    if (!owner) return null;
+    const account = publicBrowserAccount(snapshot.browserAccount);
+    const patch = { externalResearchBrowserInstanceId: owner };
+    if (account && !isDeepStrictEqual(account, run.externalResearchBrowserAccount)) {
+      patch.externalResearchBrowserAccount = account;
+    }
+    if (owner !== run.externalResearchBrowserInstanceId || patch.externalResearchBrowserAccount) {
+      Object.assign(run, patch, { updatedAt: Date.now() });
+      await this.persistStrict();
+    }
+    return owner;
+  }
+
+  async markExternalResearchBrowserWait(runId, { jobId, owner, retryAt, message } = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!isExternalResearchRun(run) || isTerminalStatus(run.status)
+      || run.externalResearchJobId !== jobId || !browserInstanceId(owner)
+      || run.externalResearchAcceptedAt || run.externalResearchDeliveryUnknown === true
+      || run.externalResearchStartHadUncertainty !== false) return null;
+    assertBrowserOwner(run, { id: jobId, browserInstanceId: owner });
+    run.externalResearchExpectedBrowserInstanceId = owner;
+    run.externalResearchStartPending = false;
+    run.externalResearchBrowserOfflineAt ||= Date.now();
+    run.externalResearchBrowserWait = { availability: 'profile_offline', preflightOnly: true,
+      notSubmitted: true, browserInstanceId: owner, since: run.externalResearchBrowserOfflineAt };
+    run.status = 'queued';
+    run.deliveryDeferredReason = 'waiting-for-browser';
+    run.externalResearchTransportError = null;
+    run.externalResearchTransportCode = null;
+    run.externalResearchBrowserWait.message = message || null;
+    run.externalResearchRetryAt = retryAt;
+    run.updatedAt = Date.now();
+    await this.persistStrict();
     return publicRun(run);
   }
 
@@ -1202,6 +1250,12 @@ class OrchestrationRunStore {
     }
     if (!snapshot.id || snapshot.id !== run.externalResearchJobId) {
       return { run: publicRun(run), changed, settled, terminal: false, ignored: true };
+    }
+
+    await this.recordExternalResearchBrowser(runId, snapshot);
+    // A detach can complete while the browser pin is being persisted.
+    if (this.runs.get(runId) !== run || isTerminalStatus(run.status)) {
+      return { run: publicRun(this.runs.get(runId)), changed, settled, terminal: true };
     }
 
     const now = Date.now();
@@ -1229,9 +1283,12 @@ class OrchestrationRunStore {
     run.externalResearchDeliveryUnknown = snapshot.deliveryUnknown === true;
     run.externalResearchUpdatedAt = Number(snapshot.updatedAt) || now;
     run.externalResearchAcceptedAt ||= now;
+    run.externalResearchStartPending = false;
+    run.externalResearchBrowserWait = null;
     run.deliveryAcceptedAt ||= now;
     run.deliveryDeferredReason = null;
     run.externalResearchTransportError = null;
+    run.externalResearchTransportCode = null;
     run.externalResearchRetryAt = null;
     run.externalResearchResultSummary = result ? {
       textChars: answerText.length,

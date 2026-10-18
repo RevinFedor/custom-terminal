@@ -392,6 +392,11 @@ class AgentSendQueue {
       adoptRunAfterItemAssets(this.db, identity, snapshot);
       return { ok: true, item: this.item(identity.operationKey), record: this.store.get(identity.operationKey) };
     })(); } catch (error) {
+      console.warn('[AgentSendQueue] admission storage failed tab=' + String(identity.tabId).slice(-12)
+        + ' operation=' + String(identity.operationKey).slice(0, 90)
+        + ' sqliteCode=' + String(error?.code || 'unknown').slice(0, 80)
+        + ' inTransaction=' + (this.db.inTransaction === true)
+        + ' reason=' + String(error?.message || error).slice(0, 220));
       throw Object.assign(new Error('Application send queue could not persist admission'), {
         code: 'agent_send_queue_storage_failed', statusCode: 503,
         submitted: false, pasteWritten: false, enterWritten: false, cause: error,
@@ -515,11 +520,12 @@ class AgentSendQueue {
     const item = this.db.prepare(`SELECT * FROM agent_send_queue WHERE tab_id = ?
       AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(tabId);
     const record = item && this.store.get(item.operation_key);
+    const cancellationRetires = classifyInputSlotRetirement(record, null).retire;
     if (!record?.attemptId || !['dispatching', 'awaiting-receipt'].includes(item.state)
-      || (!record.deliveryControl?.cancelledAt && typeof this.readInputSlot !== 'function')) return Promise.resolve(false);
+      || (!cancellationRetires && typeof this.readInputSlot !== 'function')) return Promise.resolve(false);
     let retired = false;
     const work = Promise.resolve().then(async () => {
-      const observation = record.deliveryControl?.cancelledAt ? null : await this.readInputSlot(record);
+      const observation = cancellationRetires ? null : await this.readInputSlot(record);
       if (this.disposed || this.running.has(tabId)) return false;
       const result = this.db.transaction(() => {
         const current = this.store.get(item.operation_key);
@@ -527,7 +533,7 @@ class AgentSendQueue {
           AND state IN ${OPEN} ORDER BY ${ORDER} LIMIT 1`).get(tabId);
         if (head?.operation_key !== item.operation_key || current?.attemptId !== record.attemptId
           || consumed(current) || this.running.has(tabId)) return false;
-        if (!current.deliveryControl?.cancelledAt
+        if (!classifyInputSlotRetirement(current, null).retire
           && (typeof observation?.isCurrent !== 'function' || observation.isCurrent() !== true)) return false;
         const decision = classifyInputSlotRetirement(current, observation);
         if (!decision.retire) return false;
@@ -624,6 +630,7 @@ class AgentSendQueue {
         toolType: record.provider, sessionId: inheritedSession } } : {}),
     };
     let parked = false;
+    let executorInvoked = false, storageBlockedBeforeExecutor = false;
     let releaseDispatch = null;
     try {
       if (this.admit) {
@@ -654,6 +661,7 @@ class AgentSendQueue {
       console.log('[AgentSendQueue] dispatch tab=' + String(tabId).slice(-12)
         + ' id=' + item.id + ' operation=' + item.operation_key.slice(0, 90));
       const executor = this.executors.get(item.operation_key);
+      executorInvoked = true;
       const result = await (executor ? executor(executionScope) : this.execute(request, executionScope));
       const current = this.store.get(item.operation_key);
       if (!current?.attemptId && result?.submitted === false) {
@@ -677,6 +685,17 @@ class AgentSendQueue {
       // No attempt was begun: the existing executor has not crossed its durable
       // write boundary. Otherwise retain the receipt's uncertainty, never retry.
       const current = this.store.get(item.operation_key);
+      if (!executorInvoked && current && !current.attemptId
+        && /^SQLITE_(BUSY|LOCKED)(?:_|$)/.test(String(error.code || ''))) {
+        // Admission already committed this immutable request. A continuing
+        // writer can still block dispatch; trying to persist a failure under
+        // that same lock would throw again and self-schedule the pump forever.
+        // Keep the SAME unwritten executor for the existing external wake.
+        storageBlockedBeforeExecutor = true;
+        console.warn('[AgentSendQueue] dispatch storage unavailable tab=' + String(tabId).slice(-12)
+          + ' id=' + item.id + ' sqliteCode=' + error.code + ' executorInvoked=false');
+        return;
+      }
       if (current && !current.attemptId) this.store.settleQueuedNoWrite(item.operation_key,
         { error: error.message, code: error.code || 'agent_send_queue_prepare_failed' });
       else if (current) this.publishRecord(current);
@@ -686,7 +705,9 @@ class AgentSendQueue {
       releaseDispatch?.();
       this.running.delete(tabId);
       const rerun = this.rerun.delete(tabId);
-      if (!parked || this.item(item.operation_key)?.state !== 'waiting') {
+      if (storageBlockedBeforeExecutor) {
+        this.parked.add(tabId); // No timer, SQL retry loop or global ready gate.
+      } else if (!parked || this.item(item.operation_key)?.state !== 'waiting') {
         this.parked.delete(tabId);
         this.executors.delete(item.operation_key);
         this.resolveWaiters(item.operation_key);

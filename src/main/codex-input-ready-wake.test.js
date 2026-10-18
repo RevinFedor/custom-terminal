@@ -26,6 +26,7 @@ function harness() {
     .map(frameFixture.actualFunction).join('\n');
   const fn = vm.runInNewContext(frameFixture.startupFrameDeclarations() + '\n' + ownerSource
     + '\n' + source.slice(start, end) + '\nensureCodexInputReadyForExternalPrompt', {
+    ...require('./agent-send-preparation'), agentSendReceiptStore: null,
     CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS: 90000,
     terminals: new Map([['T', {}]]), terminalCommandState: new Map([['T', { runSeq: 1, isRunning: true }]]),
     codexLastRunCommandPayload: new Map(), aiStoppingTabs: new Map(),

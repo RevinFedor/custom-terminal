@@ -221,6 +221,13 @@ export function updateSpaceMetadata(spaces, id, updates) {
     if((current.defaultCwd || null)!==(cwd || null)){next.defaultCwd=cwd || null;changed=true;}
   }
 
+  if (Object.prototype.hasOwnProperty.call(updates, 'promptDirectories')) {
+    if(!Array.isArray(updates.promptDirectories) || updates.promptDirectories.some(path=>typeof path!=='string' || !path.trim().startsWith('/')))return null;
+    const directories=[...new Set(updates.promptDirectories.map(path=>path.trim().replace(/\/+$/, '') || '/'))];
+    const previous=Array.isArray(current.promptDirectories)?current.promptDirectories:[];
+    if(JSON.stringify(previous)!==JSON.stringify(directories)){next.promptDirectories=directories;changed=true;}
+  }
+
   if (Object.prototype.hasOwnProperty.call(updates, 'icon')) {
     const icon = typeof updates.icon === 'string' ? updates.icon : null;
     if (current.icon !== icon) {

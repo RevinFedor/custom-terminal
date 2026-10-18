@@ -8,7 +8,7 @@ const { createAgentInputObservation, observeAgentInput } = require('../agent-inp
 const draftAuthority = require('../codex-draft-authority');
 const { agentInputObservationInvalidated } = require('../../shared/agent-input-observation.cjs');
 
-const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+const mainSource = fs.readFileSync(path.join(process.env.ACTUAL_SOURCE_DIR || path.join(__dirname, '..'), 'main.js'), 'utf8');
 const mainAst = ts.createSourceFile('main.js', mainSource, ts.ScriptTarget.Latest, true);
 
 function actualFunction(name) {
@@ -26,6 +26,15 @@ function actualDeclaration(name) {
       .some(declaration => declaration.name.getText(mainAst) === name)));
   if (!node) throw new Error('Missing actual main.js declaration ' + name);
   return node.getText(mainAst);
+}
+
+function actualDraftStateHandler() {
+  const statement = mainAst.statements.find(node => ts.isExpressionStatement(node)
+    && ts.isCallExpression(node.expression)
+    && node.expression.expression.getText(mainAst) === 'ipcMain.handle'
+    && node.expression.arguments[0]?.text === 'codex:get-draft-state');
+  if (!statement) throw new Error('Missing actual codex:get-draft-state handler');
+  return statement.expression.arguments[1].getText(mainAst);
 }
 
 function startupFrameDeclarations() {
@@ -101,7 +110,7 @@ function createCodexDraftRequestHarness({
       && owner.terminalLifecycleGeneration === capturedOwner.terminalLifecycleGeneration
       && owner.mirrorGeneration === capturedOwner.mirrorGeneration
       && owner.terminalStopRevision === capturedOwner.terminalStopRevision
-      && options.isCancelled?.() !== true;
+      && options.isCancelled?.() !== true && options.isOwnerCurrent?.() !== false;
     const observation = createAgentInputObservation({
       timeoutMs,
       isCurrent,
@@ -133,6 +142,7 @@ function createCodexDraftRequestHarness({
     actualFunction('requestTerminalCodexDraftState'),
   ].join('\n');
   const context = vm.createContext({
+    ...require('../agent-send-preparation'), agentSendReceiptStore: null,
     ...draftAuthority,
     ...require('../codex-runtime-contract'),
     // This ordinary-probe fixture has no cold launch. Use the real projector
@@ -142,6 +152,7 @@ function createCodexDraftRequestHarness({
     CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000, Date: { now: clock.now },
     crypto: require('node:crypto'),
     ipcMain,
+    mainWindow: null,
     createMainAgentInputObservation: observationFactory,
     observeAgentInput,
     agentInputObservationInvalidated,
@@ -164,15 +175,19 @@ function createCodexDraftRequestHarness({
   });
   vm.runInContext(`${declarations}\n`
     + 'globalThis.readDraft = requestTerminalCodexDraftState;\n'
+    + 'globalThis.publicReadDraft = ' + actualDraftStateHandler() + ';\n'
     + 'globalThis.waitForDraft = waitForHeadlessCodexDraftState;', context);
 
   return {
-    clock, ipcMain, reports, logs, mirror,
+    clock, ipcMain, reports, logs, mirror, context,
     get rendererRequest() { return rendererRequest; },
     setCurrentMirror(value) { currentMirror = value; },
     setOwner(value) { owner = { ...owner, ...value }; },
     read(reason = 'codex-pre-submit-before-paste', options = {}, contents = webContents, timeoutMs = 700) {
       return context.readDraft(contents, 'T', reason, timeoutMs, options);
+    },
+    readPublic(reason = 'codex-pre-submit-before-paste', options = {}, timeoutMs = 700) {
+      return context.publicReadDraft(null, 'T', { ...options, reason, timeoutMs });
     },
     waitForHeadlessDraftState(expected = false, timeoutMs = 1000,
       reason = 'headless-draft-wait', options = { waitOnUnknownOnly: true }) {

@@ -6,6 +6,9 @@ const path = require('node:path');
 const test = require('node:test');
 const esbuild = require('esbuild');
 
+// Electron's renderer has Web Crypto; RUN_AS_NODE on Electron 28 does not.
+global.crypto ||= require('node:crypto').webcrypto;
+
 const repoDir = path.join(__dirname, '../../..');
 const scenarioPath = path.join(__dirname, 'agentScenarios.ts');
 
@@ -90,7 +93,7 @@ async function buildBundle() {
         stopProcess: async () => ({ success: true }),
         grabDraft: async () => ({ success: false }),
         copyDraft: async () => ({ success: false }),
-        probeDraft: async () => ({ hasDraft: false, proofOutcome: 'absent', source: 'test' }),
+        probeDraft: async () => options.draftProof || ({ hasDraft: false, proofOutcome: 'absent', source: 'test' }),
       };
       let result;
       try { result = await sendAgentPromptScenario({
@@ -134,12 +137,6 @@ async function buildBundle() {
       export function isCoordinatedAgentSendCancellationRequested() { return false; }
       export async function settleCoordinatedAgentSend() { return { settled: true }; }
     `],
-    ['./agentDraftPreflight.mjs', `
-      export function classifyAgentDraftPreflight() { return { decision: 'clear' }; }
-      export function buildExactDraftCaptureProof() { return {}; }
-      export function resolveAgentDraftConflict() { return { decision: 'clear' }; }
-      export function applyAgentDraftCaptureResolution(value) { return value; }
-    `],
     ['./agentDraftContradictionToast.mjs', `export function showAgentDraftScreenContradictionToast() {}`],
   ]);
   const plugin = {
@@ -179,6 +176,30 @@ async function buildBundle() {
 
 let bundle;
 test.before(async () => { bundle = await buildBundle(); });
+
+for (const code of ['agent_send_cancelled', 'agent_send_preparation_expired', 'agent_send_preparation_storage_unavailable']) {
+  test('actual renderer scenario preserves Main pre-input preparation refusal: ' + code, async () => {
+    const { result, events } = await bundle.run({ toolType: 'codex', source: 'history-panel',
+      draftProof: { success: false, hasDraft: null, proofOutcome: 'unknown',
+        source: 'headless-main:observation-owner-changed-before-publication',
+        observation: { status: 'superseded' }, preparationFailure: { code } } });
+    assert.equal(result.code, code);
+    assert.equal(result.submitted, false);
+    assert.equal(result.pasteWritten, false);
+    assert.equal(result.enterWritten, false);
+    assert.equal(events.filter(event => event[0] === 'send').length, 0);
+    if (code === 'agent_send_cancelled') assert.equal(result.cancelled, true);
+  });
+}
+
+test('actual renderer unknown frame without Main preparation refusal remains an unknown-frame refusal', async () => {
+  const { result, events } = await bundle.run({ toolType: 'codex', source: 'history-panel',
+    draftProof: { success: false, hasDraft: null, observation: { status: 'superseded' },
+      preparationFailure: { code: 'unrecognized-marker' }, source: 'headless-main:unavailable' } });
+  assert.equal(result.code, 'terminal_draft_state_unknown');
+  assert.equal(result.cancelled, undefined);
+  assert.equal(events.filter(event => event[0] === 'send').length, 0);
+});
 
 for (const toolType of ['codex', 'claude']) {
   for (const source of ['history-panel', 'project-api', 'mobile-native', 'prompt-queue']) {

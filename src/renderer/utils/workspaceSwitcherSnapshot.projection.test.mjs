@@ -71,7 +71,7 @@ function countProjection(fn) {
   try { fn(); return counters; } finally { Array.prototype.map = map; JSON.stringify = stringify; }
 }
 
-test('two synchronous Zustand publications make one DTO per row each; both fingerprints/notifications remain', t => {
+test('two synchronous Zustand publications make one DTO per row each; both notifications remain without JSON fingerprints', t => {
   const f = fixture(undefined, 32); t.after(() => f.close());
   f.snapshot.refresh(); f.changes.length = 0;
   const events = []; f.hooks.changed = c => events.push('changed:' + c.revision);
@@ -82,7 +82,7 @@ test('two synchronous Zustand publications make one DTO per row each; both finge
   });
   t.diagnostic(JSON.stringify(counts));
   assert.equal(counts.dtoObjects, 2 * (32 + 1), 'do not build raw-icon DTOs and then copy each DTO for compaction');
-  assert.equal(counts.fingerprints, 2, 'publication count/timing must not be coalesced');
+  assert.equal(counts.fingerprints, 0, 'exact synchronous publications do not serialize large metadata fingerprints');
   assert.deepEqual(events, ['before-1', 'changed:2', 'after-1', 'before-2', 'changed:3', 'after-2']);
   assert.equal(f.workspace.getState().openProjects, sameMap, 'mutable nested state was reused');
 });
@@ -234,3 +234,53 @@ test('wire JSON, publication clocks, reader/probe order match the immutable sour
     const baseline = await import(pathToFileURL(process.env.NOTED_SWITCHER_BASELINE_FILE));
     assert.deepEqual(await transcript(createWorkspaceSwitcherSnapshot), await transcript(baseline.createWorkspaceSwitcherSnapshot));
   });
+
+test('repeated body-only publications do not serialize the large metadata fingerprint', t => {
+  const f = fixture(undefined, 240); t.after(() => f.close());
+  f.projects.P.icon = 'data:image/png;base64,' + 'X'.repeat(512000);
+  f.snapshot.refresh(); const changes = f.changes.length;
+  const work = countProjection(() => {
+    for (let i = 0; i < 12; i++) { f.tabs.get('t0').aiBusy = !!(i % 2); f.publish(); }
+  });
+  assert.equal(work.fingerprintBytes, 0, 'busy updates must not copy all icon bytes into comparison strings');
+  assert.equal(f.changes.length, changes, 'metadata publication clocks remain unchanged');
+});
+
+test('JSON-equivalent legacy MRU values preserve clocks across fallback/fast transitions', async t => {
+  const f = fixture(); t.after(() => f.close()); f.snapshot.refresh();
+  const mru = f.workspace.getState().globalTabMru;
+  mru[0].projectId = undefined; f.publish(); const revision = f.changes.at(-1).revision;
+  mru[0].projectId = null; f.publish(); assert.equal(f.changes.at(-1).revision, revision);
+  mru[0].projectId = undefined; f.publish(); assert.equal(f.changes.at(-1).revision, revision);
+  mru[0].projectId = 'P'; f.publish(); assert.equal(f.changes.at(-1).revision, revision + 1);
+  assert.equal((await f.snapshot.read(native)).rows.find(x => x.tabId === 'b').projectId, 'P');
+});
+
+test('opaque metadata retains JSON behavior, in-place changes and unavailability recovery', async t => {
+  const f = fixture(); t.after(() => f.close()); f.snapshot.refresh();
+  const date = new Date('2020-01-01T00:00:00.000Z'); f.projects.P.name = date; f.publish();
+  const revision = f.changes.at(-1).revision;
+  date.setUTCFullYear(2021); f.publish(); assert.equal(f.changes.at(-1).revision, revision + 1);
+  const wire = JSON.stringify(await f.snapshot.read(native)); assert.ok(wire.includes('2021-01-01T00:00:00.000Z'));
+  f.projects.P.name = { toJSON() { throw Object.assign(Error('opaque metadata'), { code: 'private_test_json_error' }); } };
+  f.publish(); const unavailable = f.changes.at(-1);
+  assert.equal(unavailable.available, false); assert.equal(unavailable.reason, 'private_test_json_error');
+  f.publish(); assert.equal(f.changes.at(-1), unavailable);
+  f.projects.P.name = 'recovered'; f.publish(); assert.equal(f.changes.at(-1).available, true);
+  assert.equal((await f.snapshot.read(native)).rows.find(x => x.tabId === 'a').projectName, 'recovered');
+});
+
+test('a newly introduced JSON hook compares against the previous hook-free value', t => {
+  const f = fixture(); t.after(() => f.close()); f.snapshot.refresh();
+  const revision = f.changes.at(-1).revision;
+  const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'toJSON');
+  try {
+    Object.defineProperty(Array.prototype, 'toJSON', { configurable: true, value() { return 17; } });
+    f.publish(); assert.equal(f.changes.at(-1).revision, revision + 1);
+    f.publish(); assert.equal(f.changes.at(-1).revision, revision + 1);
+  } finally {
+    if (descriptor) Object.defineProperty(Array.prototype, 'toJSON', descriptor);
+    else delete Array.prototype.toJSON;
+  }
+  f.publish(); assert.equal(f.changes.at(-1).revision, revision + 2);
+});

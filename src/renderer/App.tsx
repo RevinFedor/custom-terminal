@@ -175,7 +175,7 @@ import {
   AGENT_SETTINGS_INTENT_NONE,
   createAgentSettingsIntent,
 } from './utils/agentSendSettingsContract';
-import { runHistoryPromptHandoff, hydrateHistoryPromptHandoffFromDurableReceipt, applyHistoryQueuedMessageMerge } from './utils/historyPromptHandoffs';
+import { runHistoryPromptHandoff, hydrateHistoryPromptHandoffFromDurableReceipt, applyHistoryQueuedMessageMerge, recordHistorySendEnterAttempt } from './utils/historyPromptHandoffs';
 import { executeHistoryRewriteRewindScenario, executeHistoryDeleteIterationScenario } from './utils/historyRewriteRewind';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { installTerminalInputFeedback } from './utils/terminalInputFeedback.mjs';
@@ -5328,6 +5328,7 @@ function App() {
               sendOperationKey,
               source: promptSource,
               statusAtSend,
+              ...(payload?.preflightScope?.preparation?.version === 1 ? { initialStatus: 'preparing' as const } : {}),
               send: (resolvedHandoffId) => sendAgentPromptScenario({
                 tabId,
                 toolType,
@@ -5353,6 +5354,7 @@ function App() {
                 }),
                 returnDraftOnConflict,
                 presentationSnapshot: {
+                  historySendStartedAt: presentationSnapshot?.historySendStartedAt,
                   historySessionId: sessionId,
                   promptChips: presentationSnapshot?.promptChips || [],
                   imagePaths: presentationSnapshot?.imagePaths || [],
@@ -5699,6 +5701,8 @@ function App() {
       hydrateHistoryPromptHandoffFromDurableReceipt(record);
     };
     ipcRenderer.on('agent:send-queue-receipt', handleSendQueueReceipt);
+    const handleSendEnterAttempt = (_event: any, data: any) => { recordHistorySendEnterAttempt(data); };
+    ipcRenderer.on('agent:send-enter-attempt', handleSendEnterAttempt);
     const handleSendQueueMerge = (_event: any, result: any) => { applyHistoryQueuedMessageMerge(result); };
     ipcRenderer.on('agent:send-queue-merged', handleSendQueueMerge);
     void ipcRenderer.invoke('agent:send-queue-ready', true).catch((error: any) =>
@@ -5975,6 +5979,7 @@ function App() {
       ipcRenderer.removeListener('codex:model-migration-settings-applied', handleCodexModelMigrationApplied);
       ipcRenderer.removeListener('web:bridge-request', handleWebBridge);
       ipcRenderer.removeListener('agent:send-queue-receipt', handleSendQueueReceipt);
+      ipcRenderer.removeListener('agent:send-enter-attempt', handleSendEnterAttempt);
       ipcRenderer.removeListener('agent:send-queue-merged', handleSendQueueMerge);
       void ipcRenderer.invoke('agent:send-queue-ready', false).catch(() => {});
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);

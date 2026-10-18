@@ -14,8 +14,86 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { SavedHistoryOperations } = require('../src/main/saved-history-operation.js');
 const { SessionTranscriptService } = require('../src/main/session-transcript-service.js');
+const { HistoryReadClient } = require('../src/main/history-read-client.js');
+const codexData = require('../src/main/ipc/codex-data.js');
 
 const terminalServerPath = fileURLToPath(new URL('./terminal-server.mjs', import.meta.url));
+
+test('read_session_snapshot uses bounded read-only capability+snapshot GETs with no lifecycle/idle wait', async t => {
+  const body = { success: true, asOf: '2026-10-18T00:00:00Z', entries: [{ status: 'in_progress', user: { text: 'task' } }] };
+  const h = await createHarness(t, (_body, _i, req) => ({ status: 200, body: req.url === '/overseer/capabilities'
+    ? { sessionSnapshot: { version: 1 } } : body }), { historyApi: true });
+  const response = await h.invoke({ sessionId: 'source', tabId: 'own', limit: 2, maxChars: 500 }, 'read_session_snapshot');
+  assert.equal(response.result.isError, undefined);
+  assert.deepEqual(JSON.parse(response.result.content[0].text), body);
+  assert.deepEqual(h.requests.map(r => [r.method, r.url]), [['GET', '/overseer/capabilities'],
+    ['GET', '/overseer/session/source/snapshot?tabId=own&limit=2&maxChars=500']]);
+  const tool = (await h.rpc('tools/list')).result.tools.find(item => item.name === 'read_session_snapshot');
+  assert.deepEqual(tool.inputSchema.required, ['sessionId']);
+});
+
+test('read_session_snapshot refuses old apps, invalid arguments and errors without fallback or repeat', async t => {
+  const old = await createHarness(t, () => ({ status: 200, body: {} }), { historyApi: true });
+  const noCapability = await old.invoke({ sessionId: 's' }, 'read_session_snapshot');
+  assert.equal(noCapability.result.isError, true);
+  assert.match(noCapability.result.content[0].text, /app_update_required/);
+  assert.equal(old.requests.length, 1);
+  const invalid = await old.invoke({ sessionId: 's', limit: 9 }, 'read_session_snapshot');
+  assert.equal(invalid.result.isError, true); assert.equal(old.requests.length, 1);
+  const failed = await createHarness(t, (_body, _i, req) => req.url === '/overseer/capabilities'
+    ? { status: 200, body: { sessionSnapshot: { version: 1 } } }
+    : { status: 409, body: { code: 'CODEX_SOURCE_READ_INVALIDATED', error: 'changed' } }, { historyApi: true });
+  const result = await failed.invoke({ sessionId: 's' }, 'read_session_snapshot');
+  assert.equal(result.result.isError, true);
+  assert.match(result.result.content[0].text, /CODEX_SOURCE_READ_INVALIDATED/);
+  assert.equal(failed.requests.length, 2);
+});
+
+test('read_session_snapshot crosses actual MCP, Main route/wrapper, service and real worker over an owned busy fixture', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'terminal-mcp-busy-snapshot-'));
+  const sessionId = '11111111-1111-4111-8111-111111111111', tabId = 'own';
+  const file = join(directory, 'rollout-' + sessionId + '.jsonl');
+  const records = [{ type: 'session_meta', payload: { id: sessionId, cwd: directory } },
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'busy-turn' } },
+    { type: 'event_msg', payload: { type: 'user_message', message: 'actual latest user task' } },
+    { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'partial response' }] } }];
+  await writeFile(file, records.map(record => JSON.stringify(record)).join('\n') + '\n');
+  const client = new HistoryReadClient({ codexData, sessionsDir: directory, cacheDirectory: join(directory, 'cache'), memoryBudgetMb: 64 });
+  t.after(async () => { await client.close(); await rm(directory, { recursive: true, force: true }); });
+  const transcriptService = new SessionTranscriptService({ codexData, historyReader: client, getMainWindow: () => null });
+  const main = await readFile(new URL('../src/main/main.js', import.meta.url), 'utf8');
+  const functionSource = name => {
+    const start = main.indexOf('function ' + name + '(');
+    const actualStart = main.slice(Math.max(0, start - 6), start) === 'async ' ? start - 6 : start;
+    return main.slice(actualStart, main.indexOf('\n}', start) + 2);
+  };
+  const context = vm.createContext({ URL, require, path: await import('node:path'),
+    srcMainDir: fileURLToPath(new URL('../src/main', import.meta.url)), transcriptService,
+    _resolveHistoryReadSession: async () => ({ provider: 'codex' }),
+    _historyReadBindings: () => [{ tabId, provider: 'codex', source: 'tabs', sessionId }],
+    captureConversationOwner: () => ({ known: true, provider: 'codex', sessionId, terminalId: 'own-physical', runSeq: 1, cwd: directory }),
+    conversationOwners: { stored: () => ({ epoch: 'own-main', revision: 1 }) },
+    getTerminalLifecycleGeneration: () => 'own-physical:1', getTerminalStopRevision: () => 0, getTerminalInputRevision: () => 0,
+    captureTabInspection: () => ({ known: true, sessionId, busy: true, runtime: { known: true, status: 'busy', liveLifecycle: true }, turn: { turnId: 'busy-turn' } }),
+    _loadSessionTurns: () => assert.fail('no strict turns reader or idle wait'),
+  });
+  for (const name of ['_captureSessionSnapshotOwner', '_readSessionSnapshot', 'handleOverseerRequest']) vm.runInContext(functionSource(name), context);
+  const h = await createHarness(t, async (_body, _i, req) => {
+    const value = await context.handleOverseerRequest(req.url);
+    return { status: value.status || 200, body: value.body };
+  }, { historyApi: true });
+  const first = await h.invoke({ sessionId, tabId, limit: 1, maxChars: 1000 }, 'read_session_snapshot');
+  assert.equal(first.result.isError, undefined);
+  const value = JSON.parse(first.result.content[0].text);
+  assert.equal(value.runtime.busy, true);
+  assert.equal(value.entries[0].user.text, 'actual latest user task');
+  assert.equal(value.entries[0].assistant.text, 'partial response');
+  assert.equal(value.entries[0].status, 'in_progress');
+  assert.equal(value.entries[0].isCurrent, true);
+  assert.equal(client.diagnosticCounters.retries, 0);
+  assert.ok(h.requests.every(request => request.method === 'GET'));
+  assert.equal(h.requests.length, 2);
+});
 
 test('continue_delegation is one app-owned action, keeps the original recipient and does not replay a task', async t => {
   const h = await createHarness(t, (_body, _i, req) => req.url === '/api/me'
@@ -978,7 +1056,8 @@ test('external research tools preserve source identity, file descriptors, and se
     if (req.url === '/api/me') {
       return {
         status: 200,
-        body: { ok: true, capabilities: { externalResearchOrchestration: { version: 1 } } },
+        body: { ok: true, capabilities: { externalResearchOrchestration: { version: 1,
+          browserSelection: { version: 1, field: 'browserId', jobOwnerPinned: true, offlinePreflight: true } } } },
       };
     }
     mutation += 1;
@@ -1025,6 +1104,43 @@ test('external research tools preserve source identity, file descriptors, and se
   assert.deepEqual(posts[1].body.files, [{
     path: '/tmp/version-two.md', startLine: 4, endLine: 12,
   }]);
+});
+
+test('all three research MCP schemas forward a top-level selector without changing source/options', async t => {
+  const harness = await createHarness(t, (_body, _index, req) => ({ status: req.url === '/api/me' ? 200 : 202,
+    body: req.url === '/api/me' ? { capabilities: { externalResearchOrchestration: { version: 1,
+      browserSelection: { version: 1, field: 'browserId', jobOwnerPinned: true, offlinePreflight: true } } } }
+      : { runId: 'selected-run', jobId: 'noted_selected-run' } }));
+  const tools = (await harness.rpc('tools/list')).result.tools;
+  for (const [name, args] of [['start_external_research', { prompt: 'new task' }],
+    ['continue_external_research', { prompt: 'follow-up', previousRunId: 'prior' }],
+    ['import_external_conversation', { url: 'https://chatgpt.com/c/6aa82f55-3204-83eb-81a3-2d34f2150242' }]]) {
+    assert.equal(tools.find(tool => tool.name === name).inputSchema.properties.browserId.type, 'string');
+    const response = await harness.invoke({ ...args, browserId: 'chrome' }, name);
+    assert.notEqual(response.result.isError, true, response.result.content[0].text);
+    const post = harness.requests.at(-1);
+    assert.equal(post.method, 'POST'); assert.equal(post.body.browserId, 'chrome');
+    assert.equal(post.body.sourceTabId, 'test-source-tab');
+    assert.equal(post.body.options?.browserId, undefined);
+  }
+});
+
+test('MCP explicit selection and inherited continuation require the new app capability, with no fallback POST', async t => {
+  const harness = await createHarness(t, () => ({ status: 200,
+    body: { capabilities: { externalResearchOrchestration: { version: 1 } } } }));
+  for (const [name, args] of [['start_external_research', { prompt: 'x', browserId: 'chrome' }],
+    ['import_external_conversation', { url: 'https://chatgpt.com/c/6aa82f55-3204-83eb-81a3-2d34f2150242', browserId: 'yandex' }],
+    ['continue_external_research', { prompt: 'x', previousRunId: 'old' }]]) {
+    const result = await harness.invoke(args, name);
+    assert.equal(result.result.isError, true); assert.match(result.result.content[0].text, /app_update_required/);
+  }
+  assert.ok(harness.requests.every(req => req.method === 'GET' && req.url === '/api/me'));
+  const before = harness.requests.length;
+  for (const browserId of [null, 'primary', {}, 'http://localhost']) {
+    assert.equal((await harness.invoke({ prompt: 'x', browserId }, 'start_external_research')).result.isError, true);
+  }
+  assert.equal((await harness.invoke({ prompt: 'x', options: { browserId: 'chrome' } }, 'start_external_research')).result.isError, true);
+  assert.equal(harness.requests.length, before);
 });
 
 test('existing ChatGPT conversation import creates a tracked read-only run without a model prompt', async (t) => {

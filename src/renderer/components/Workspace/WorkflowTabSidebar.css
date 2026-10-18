@@ -10,6 +10,8 @@
    Fill a short viewport before clipping Y; semantic X and the real scroller stay unchanged. */
 .workflow-reserve-outline[data-outline-dnd-source-follow="y"]{min-height:100%;box-sizing:border-box;overflow-y:clip}
 .workflow-reserve-row{position:relative;margin-bottom:var(--reserve-gap,4px);min-width:0}
+.workflow-reserve-row [data-workflow-reserve-tab]{user-select:none}
+.workflow-reserve-row [data-workflow-reserve-tab] input{user-select:text}
 .workflow-reserve-group{position:relative;display:flex;align-items:center;gap:8px;min-height:24px;box-sizing:border-box;
   padding:var(--reserve-row-padding,3px 6px);background:#ffffff09;border:1px solid #8b5cf644;
   border-radius:var(--reserve-row-radius,6px);cursor:pointer;user-select:none;font-size:var(--reserve-font-size,14px);line-height:var(--reserve-line-height,1.2)}

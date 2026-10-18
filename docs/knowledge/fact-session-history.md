@@ -52,6 +52,49 @@ readers сохраняют полноценный доступ при явном
 - `get_user_prompt` / `get_thinking` / `get_assistant_text` — точечный pull одного блока, UTF-16 диапазон через `start/end` (negative offsets как в Python)
 - `get_turn_evidence` — историческая модель/effort и страничная карта инструментов одного выбранного хода; по точному `operationId` возвращает ограниченные input/result и их источник. `operationOffset/operationLimit` листают операции, `inputStart/inputEnd` и `resultStart/resultEnd` читают нужный диапазон; `maxChars` ограничен 65536
 
+### Снимок последних Codex-итераций во время busy
+
+`read_session_snapshot({sessionId,tabId?,cwd?,limit?,maxChars?})` требует
+`GET /overseer/capabilities → sessionSnapshot.version:1`; endpoint —
+`GET /overseer/session/:sessionId/snapshot`. До8 последних реальных user-итераций
+(default5), до20000 UTF-16 символов отдельно user/assistant (default4000).
+`tabId` дополнительно закрепляет текущую принадлежность SID; archived SID можно
+читать без tabId. Claude сохраняет прежние readers; новый capability объявляет
+`providers:["codex"]`. Старый app явно требует обновления, без fallback на старый
+final, responsibility или raw provider storage.
+
+Канонический catalog-проход возвращает настоящий user prompt, доступный assistant
+text, стабильные iterationIndex/turnIndex/userUuid/physicalSessionId/turnId и refs
+с snapshotId/userTextHash. `requestedAt`, `asOf` и byte-cutoff каждой части различены:
+cutoff фиксируется до сканирования, `completeToByte` исключает незавершённую
+JSONL/UTF-8 запись. Это срез прочитанных данных, не глобально атомарные часы всех
+вкладок. `coverage` сообщает partial bytes, parse errors, пропущенные старые ходы
+и truncation. Статус хода — `in_progress/completed/aborted/unknown`; complete
+требует exact provider terminal, не наличия assistant text или idle loader.
+`isCurrent` требует отдельный живой exact Main turn; stopped/unknown и неполный
+tail не превращают старый complete в текущий. `completionAuthority:false`:
+snapshot не подтверждает delivery, всё background work или право записи.
+
+Чтение работает в прежнем worker и canonical reducer, без raw graph в Main,
+Send/Stop/Resume/observer и без требования idle. Каждый зафиксированный диапазон
+удерживает FD/identity и SHA-256 прочитанных байтов; перед возвратом сверяются весь
+prefix, resolver и logical manifest. Frozen ancestors и child prefix проверяются
+отдельно, один child stat не заменяет ancestry. Только для этого метода append
+не отзывает сохранный prefix; shared rewrite epochs, lineage journal и последний
+Main owner/Stop/input guard остаются. Одно чтение имеет одну попытку, без retry-loop.
+Строгие `list_turns`/stats/progress, cache admission и write paths не меняются.
+
+Большой файл сканируется чанками, без строки размером со весь JSONL/полного answer join в RAM.
+Выходной assistant prefix ограничивается до накопления; metadata projection
+ограничен50000 rows/executions, одно декодируемое значение8MiB, patch/cell batch16MiB.
+Превышение даёт `HISTORY_SNAPSHOT_BUDGET_EXCEEDED` до большого decode. Это защитные
+bounds, не замер/гарантия peak RSS. Cold paginated/unknown legacy view без готового
+canonical manifest даёт `history_lineage_unresolved/snapshot_requires_prepared_lineage`;
+snapshot не запускает тяжёлый lineage bootstrap и не подставляет parent. При
+имеющемся manifest virtual child, включая partial tail, поддержан.
+
+### Готовый Physical Turns Graph
+
 В SOURCE12.10 готовый **physical Codex turns graph в Main RAM** допускается до
 полного чтения JSONL, если сохранилось доказательство именно исходного чтения
 этого graph. Это отдельный кэш от raw records: вытеснение raw LRU само по себе

@@ -6,6 +6,11 @@ import ts from 'typescript';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import * as coordinator from './agentActionCoordinator.mjs';
+import { HistoryPromptHandoffStore, historyPromptHandoffUnconfirmedStatusFromSendResult,
+  historyPromptHandoffAuditProofFromSendResult, historyPromptAuditIsProviderQueueReturn } from './historyPromptHandoffs.ts';
+import { projectAgentLocalCommandSendResult } from './agentLocalCommand.mjs';
+import { saveHistorySendRecovery, readHistorySendRecovery, removeHistorySendRecovery } from './historySendRecovery.mjs';
+import { mergeFailedHistoryAuthoringSnapshot } from './historyDraftOwnership.mjs';
 
 const source = fs.readFileSync(new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url), 'utf8');
 const ast = ts.createSourceFile('HistoryPanel.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -32,18 +37,44 @@ const js = value => ts.transpileModule('globalThis.result = (' + value + ');', {
 }).outputText;
 const gate = () => { let resolve, reject; const promise = new Promise((r, j) => { resolve = r; reject = j; }); return { resolve, reject, promise }; };
 
-function harness(t, { text = 'fixture prompt', status = 'active', imageFailure = false, contextPending = false, emptyAfterPrepare = false } = {}) {
+function harness(t, { text = 'fixture prompt', status = 'active', imageFailure = false, contextPending = false, emptyAfterPrepare = false, saveFailure = false, scenarioResult } = {}) {
   coordinator.resetCoordinatedAgentActionsForTests();
   const prepared = gate(), contextEntered = gate(), stopped = gate(), stopEntered = gate();
   const events = [], input = { historyPromptDrafts: { T: text }, historyPromptDraftChips: {}, historyPromptDraftImages: {} };
+  input.historyPromptDraftPendingImages = {};
+  const records = new Map(), storage = { getItem: key => records.get(key) || null,
+    setItem: (key, value) => { if (saveFailure) throw Error('quota'); records.set(key, value); }, removeItem: key => records.delete(key) };
+  const store = new HistoryPromptHandoffStore(), rows = new Map();
   const ref = current => ({ current });
-  const ctx = { ...coordinator, console: { log() {}, warn() {} },
+  const ctx = { ...coordinator, console: { log() {}, warn() {}, error() {} },
+    projectAgentLocalCommandSendResult, historyPromptHandoffUnconfirmedStatusFromSendResult,
+    historyPromptHandoffAuditProofFromSendResult, historyPromptAuditIsProviderQueueReturn,
+    midstreamPromptRecoveryRef: ref(null), refreshHistoryWithUpdating() {},
     tabId: 'T', toolType: 'claude', sessionId: 'S', cwd: '/fixture', projectId: 'P', presenceOwnerKey: 'T:S',
     tabIdRef: ref('T'), presenceOwnerKeyRef: ref('T:S'), presenceGenerationRef: ref(1), actionSeqRef: ref(0),
     actionInFlightRef: ref(false), activeActionKindRef: ref(null), pasteBusyRef: ref(false),
     processStopInFlightRef: ref(false), pendingQuestionRef: ref(null), statusRef: ref(status),
     busyAction: null, resumeMaterialized: true, prompt: text,
-    historyPromptHandoffBlocksNewSubmit: () => false, getHistoryPromptHandoffsSnapshot: () => [],
+    historyPromptHandoffBlocksNewSubmit: () => false, getHistoryPromptHandoffsSnapshot: id => store.getSnapshot(id),
+    beginHistoryPromptHandoff: value => store.begin(value),
+    prepareHistoryPromptHandoffPresentation: (...args) => store.preparePresentation(...args),
+    bindHistoryPromptHandoffSendIdentity: (...args) => store.bindSendIdentity(...args),
+    settleHistoryPromptHandoff: (...args) => store.settle(...args),
+    saveHistorySendRecovery: (...args) => { saveHistorySendRecovery(args[0], args[1], storage); events.push(['saved']); },
+    removeHistorySendRecovery: (...args) => removeHistorySendRecovery(...args, storage),
+    HISTORY_IMAGE_PENDING_MARKER: '[Image saving…]',
+    promptTextareaRef: ref(null), delayedDeliveryWarningHandoffRef: ref(null),
+    isStandaloneAgentLocalCommand: () => false, historyOwnerDigest: text => String(text.length), promptPreview: text => text.slice(0, 40),
+    applyHistoryComposerSnapshot: ({ ownerTabId, text, images, chips }) => {
+      input.historyPromptDrafts[ownerTabId] = text; input.historyPromptDraftImages[ownerTabId] = images;
+      input.historyPromptDraftChips[ownerTabId] = chips; events.push(['draft', text]);
+    },
+    setHistoryComposerView() {}, flushHistoryComposerDrafts() {}, flushHistoryComposerView() {},
+    mergeFailedHistoryAuthoringSnapshot, createComposerChipId: () => 'recovered-chip',
+    resolveCodexHistoryRestartSettingsState: () => null, AGENT_SETTINGS_INTENT_NONE: { kind: 'none' },
+    onPromptSubmitted: (text, queueStatus, meta) => { rows.set(meta.handoffId, { text, queueStatus, ...meta }); events.push(['card', queueStatus]); },
+    sendAgentPromptScenario: async args => { events.push(['admission', args]); return scenarioResult || { applicationQueued: true,
+      applicationQueue: { version: 1, id: 1 }, operationKey: 'history:T:H' }; },
     currentUIActionId: () => 'ui-preparation-fixture', uiPerformancePhaseForAction: (...args) => events.push(['phase', ...args]),
     HISTORY_PENDING_DELIVERY_BLOCK_NOTICE: 'pending', historyDiag: message => events.push(['log', message]),
     normalizeComposerChips: value => value, isTerminalOnlyComposerDraft: () => false,
@@ -62,7 +93,8 @@ function harness(t, { text = 'fixture prompt', status = 'active', imageFailure =
     prepareTabWorkContext: async () => { contextEntered.resolve(); return contextPending ? prepared.promise : { prompt: text, prefix: '' }; },
     settleTabWorkContext: async () => {},
     recoverAgentDraftTransferToHistory: async () => {}, queueSendTransferredOwnership: () => false,
-    onPromptStatusChange() {}, retractHistoryPromptHandoff() {},
+    onPromptStatusChange: (id, queueStatus) => { if (rows.has(id)) rows.get(id).queueStatus = queueStatus; },
+    retractHistoryPromptHandoff: (...args) => store.retract(...args),
     ipcRenderer: { invoke: async (name) => { events.push(['ipc', name]); return {}; } },
     runtime: { toolType: 'claude', logPrefix: 'fixture', label: 'Claude', allowSendWhileBusy: true,
       stopProcess: async () => { events.push(['physical-stop']); stopEntered.resolve(); return stopped.promise; } },
@@ -70,7 +102,11 @@ function harness(t, { text = 'fixture prompt', status = 'active', imageFailure =
   vm.createContext(ctx); vm.runInContext(js(action), ctx); const run = ctx.result;
   vm.runInContext(js(subscribe), ctx); const unsubscribe = ctx.result();
   t.after(() => { unsubscribe(); coordinator.resetCoordinatedAgentActionsForTests(); });
-  return { ctx, input, events, run, prepared, contextEntered, stopEntered, stopped };
+  const enter = contextEntered.promise;
+  contextEntered.promise = Promise.race([enter, new Promise((_, reject) => { ctx.failEarly = reject; })]);
+  const checkedRun = (...args) => { const pending = run(...args); if (args[0] === 'send' && contextPending)
+    pending.then(() => ctx.failEarly(Error(JSON.stringify(events))), ctx.failEarly); return pending; };
+  return { ctx, input, events, run: checkedRun, prepared, contextEntered, stopEntered, stopped, store, rows, storage };
 }
 
 function preparationPresentation(h, owner = 'T', overrides = {}) {
@@ -92,15 +128,16 @@ function preparationPresentation(h, owner = 'T', overrides = {}) {
 
 const renderPreparation = (h, owner = 'T') => renderToStaticMarkup(preparationPresentation(h, owner).historyComposerFloatingStatus);
 
-test('actual History shows preparation before a slow context promise, never claims Main queue acceptance', async t => {
+test('actual History shows one PREPARING card before slow context; input is already empty', async t => {
   const h = harness(t, { contextPending: true }); const send = h.run('send', { uiActionId: 'ui-preparation-fixture' });
   await h.contextEntered.promise;
   try {
     const markup = renderPreparation(h);
-    assert.match(markup, /data-history-send-preparation/);
-    assert.match(markup, /Preparing send\.\.\./);
+    assert.equal(markup, '');
+    assert.equal(h.rows.size, 1); assert.equal(h.rows.get('H').queueStatus, 'preparing');
+    assert.equal(readHistorySendRecovery(h.storage)[0].input.authoringText, 'fixture prompt');
     assert.doesNotMatch(markup, /IN APP QUEUE|SENT|data-agent-send-phase/);
-    assert.equal(h.input.historyPromptDrafts.T, 'fixture prompt');
+    assert.equal(h.input.historyPromptDrafts.T, '');
     assert.equal(renderPreparation(h, 'other-tab'), '', 'foreign surface owns no caption');
     assert.ok(h.events.some(e => e[0] === 'phase' && e[1] === 'ui-preparation-fixture'
       && e[2] === 'history-send-preparation-begin'), 'diagnostics bind to the original UI action');
@@ -112,8 +149,8 @@ test('actual History shows preparation before a slow context promise, never clai
   assert.equal(h.input.historyPromptDrafts.T, 'fixture prompt', 'pre-input failure preserves draft');
 });
 
-test('preparation uses the lifecycle caption typography and pulses only its own composer outline', async t => {
-  const h = harness(t, { contextPending: true }); const send = h.run('send'); await h.contextEntered.promise;
+test('composer caption presents provider lifecycle only, including before an early handoff exists', async t => {
+  const h = harness(t); coordinator.beginCoordinatedAgentSend('T');
   try {
     for (const historyTranscriptFontSize of [11, 13, 18]) {
       const view = preparationPresentation(h, 'T', { historyTranscriptFontSize, showStatusText: true,
@@ -121,22 +158,18 @@ test('preparation uses the lifecycle caption typography and pulses only its own 
       const children = React.Children.toArray(view.historyComposerFloatingStatus.props.children.props.children);
       const preparing = children.find(child => child.props?.['data-history-send-preparation'] !== undefined);
       const lifecycle = children.find(child => child.props?.['data-agent-status-title'] !== undefined);
-      assert.equal(preparing.props.children, 'Preparing send...');
+      assert.equal(preparing, undefined, 'Send is never a second caption on the provider frame');
       assert.equal(lifecycle.props.children, 'Preparing codex session...');
-      assert.deepEqual(preparing.props.style, lifecycle.props.style, 'both captions inherit the same parent font/size/weight');
       assert.equal(view.historyComposerFloatingStatus.props.style.fontSize, historyTranscriptFontSize * 0.82);
-      assert.match(view.composerFrameClassName, /\bhp-history-composer-preparing\b/);
+      assert.equal(view.composerFrameClassName, 'hp-history-composer-frame');
     }
     assert.doesNotMatch(preparationPresentation(h, 'other-tab').composerFrameClassName, /hp-history-composer-preparing/);
     const token = coordinator.getCoordinatedAgentAction('T').token;
     coordinator.bindCoordinatedAgentSendHandoff('T', token, 'H');
     assert.doesNotMatch(preparationPresentation(h).composerFrameClassName, /hp-history-composer-preparing/);
-  } finally { h.prepared.reject(new Error('fixture complete')); await send; }
+  } finally { coordinator.resetCoordinatedAgentActionsForTests(); }
   assert.doesNotMatch(preparationPresentation(h).composerFrameClassName, /hp-history-composer-preparing/);
-  assert.match(source, /\.hp-history-composer-preparing::after\s*\{[^}]*pointer-events:\s*none;[^}]*animation:\s*hp-history-composer-preparing[^}]*infinite;/);
-  assert.match(source, /prefers-reduced-motion:\s*reduce[^]*?\.hp-history-composer-preparing::after\s*\{\s*animation:\s*none;/);
-  const pauseCss = fs.readFileSync(new URL('../styles/presentationAnimations.css', import.meta.url), 'utf8');
-  assert.match(pauseCss, /\.hp-history-composer-preparing::after\s*\{\s*animation-play-state:\s*paused !important;/);
+  assert.doesNotMatch(source, /data-history-send-preparation|hp-history-composer-preparing/);
 });
 
 for (const status of ['busy', 'starting', 'inactive']) {
@@ -144,9 +177,10 @@ for (const status of ['busy', 'starting', 'inactive']) {
     const h = harness(t, { contextPending: true, status }); const send = h.run('send');
     await h.contextEntered.promise;
     try {
-      assert.match(renderPreparation(h), /data-history-send-preparation/);
-      assert.equal(h.input.historyPromptDrafts.T, 'fixture prompt');
-      assert.equal(coordinator.getCoordinatedAgentAction('T').handoffId, null);
+      assert.equal(renderPreparation(h), '');
+      assert.equal(h.rows.get('H').queueStatus, 'preparing');
+      assert.equal(h.input.historyPromptDrafts.T, '');
+      assert.equal(coordinator.getCoordinatedAgentAction('T').handoffId, 'H');
     } finally { h.prepared.reject(new Error('fixture context refusal')); await send; }
     assert.equal(renderPreparation(h), '');
   });
@@ -155,7 +189,7 @@ for (const status of ['busy', 'starting', 'inactive']) {
 test('actual preparation caption stops at handoff and does not return while the action unwinds', async t => {
   const h = harness(t, { contextPending: true }); const send = h.run('send'); await h.contextEntered.promise;
   try {
-    assert.match(renderPreparation(h), /data-history-send-preparation/);
+    assert.equal(renderPreparation(h), '');
     const token = coordinator.getCoordinatedAgentAction('T').token;
     assert.equal(coordinator.bindCoordinatedAgentSendHandoff('T', token, 'H').bound, true);
     assert.equal(renderPreparation(h), '', 'handoff owns delivery feedback, not the composer');
@@ -165,7 +199,7 @@ test('actual preparation caption stops at handoff and does not return while the 
 test('actual preparation caption disappears on Stop before late context returns', async t => {
   const h = harness(t, { contextPending: true }); const send = h.run('send'); await h.contextEntered.promise;
   try {
-    assert.match(renderPreparation(h), /data-history-send-preparation/);
+    assert.equal(renderPreparation(h), '');
     const stop = h.run('stop'); await h.stopEntered.promise;
     assert.equal(renderPreparation(h), '');
     assert.doesNotMatch(preparationPresentation(h).composerFrameClassName, /hp-history-composer-preparing/);
@@ -173,7 +207,7 @@ test('actual preparation caption disappears on Stop before late context returns'
   } finally { h.stopped.resolve({ success: true, stopped: true }); h.prepared.reject(new Error('fixture cancelled')); await send; }
 });
 
-for (const options of [{ text: '' }, { status: 'unknown' }, { imageFailure: true }]) {
+for (const options of [{ text: '' }, { text: '[Image saving…]' }, { status: 'unknown' }, { imageFailure: true }, { saveFailure: true }]) {
   test('actual History pre-handoff exit releases Send owner: ' + JSON.stringify(options), async t => {
     const h = harness(t, options); const original = h.input.historyPromptDrafts.T;
     await h.run('send');
@@ -187,7 +221,8 @@ for (const options of [{ text: '' }, { status: 'unknown' }, { imageFailure: true
 test('actual History Stop during pre-handoff await starts common Stop; late preparation cannot submit', async t => {
   const h = harness(t, { contextPending: true });
   const send = h.run('send'); await h.contextEntered.promise;
-  assert.equal(coordinator.getCoordinatedAgentAction('T').handoffId, null);
+  assert.equal(coordinator.getCoordinatedAgentAction('T').handoffId, 'H');
+  assert.equal(coordinator.getCoordinatedAgentAction('T').transportStarted, false);
   const stop = h.run('stop'); await h.stopEntered.promise;
   assert.equal(h.ctx.statusRef.current, 'stopping');
   assert.equal(h.events.filter(e => e[0] === 'physical-stop').length, 1);
@@ -195,7 +230,7 @@ test('actual History Stop during pre-handoff await starts common Stop; late prep
   h.prepared.resolve({ prompt: 'fixture prompt', prefix: '' });
   await new Promise(setImmediate);
   assert.equal(h.ctx.statusRef.current, 'stopping');
-  assert.equal(coordinator.getCoordinatedAgentAction('T').handoffId, null, 'cancelled owner cannot acquire a handoff');
+  assert.equal(coordinator.getCoordinatedAgentAction('T').transportStarted, false, 'cancelled early card cannot dispatch');
   assert.equal(h.input.historyPromptDrafts.T, 'fixture prompt');
   h.stopped.resolve({ success: true, stopped: true }); await Promise.all([send, stop]);
   assert.equal(coordinator.getCoordinatedAgentAction('T'), null); assert.equal(h.ctx.statusRef.current, 'inactive');
@@ -211,4 +246,39 @@ test('unproven physical Stop releases transient stopping without claiming inacti
   h.prepared.resolve({ prompt: 'fixture prompt', prefix: '' }); await send;
   assert.equal(h.input.historyPromptDrafts.T, 'fixture prompt');
   assert.equal(h.events.filter(e => e[0] === 'physical-stop').length, 1);
+});
+
+test('prepared content promotes the SAME card/start and preserves the next draft on admission', async t => {
+  const h = harness(t, { contextPending: true }); const send = h.run('send'); await h.contextEntered.promise;
+  const start = h.rows.get('H').submittedAt;
+  h.input.historyPromptDrafts.T = 'next draft';
+  h.prepared.resolve({ prompt: 'context\nfixture prompt', prefix: 'context\n' }); await send;
+  assert.equal(h.rows.size, 1); assert.equal(h.rows.get('H').text, 'context\nfixture prompt');
+  assert.equal(h.rows.get('H').submittedAt, start); assert.equal(h.input.historyPromptDrafts.T, 'next draft');
+  const admissions = h.events.filter(e => e[0] === 'admission');
+  assert.equal(admissions.length, 1, JSON.stringify(h.events));
+  assert.equal(admissions[0][1].presentationSnapshot.historySendStartedAt, start);
+  assert.equal(readHistorySendRecovery(h.storage).length, 0);
+});
+
+test('failed preparation merges saved authoring before the next draft, never overwrites it', async t => {
+  const h = harness(t, { contextPending: true }); const send = h.run('send'); await h.contextEntered.promise;
+  h.input.historyPromptDrafts.T = 'next draft';
+  h.prepared.reject(Error('context unavailable')); await send;
+  assert.match(h.input.historyPromptDrafts.T, /fixture prompt[\s\S]*next draft/);
+  assert.equal(readHistorySendRecovery(h.storage).length, 0);
+  assert.equal(h.events.some(e => e[0] === 'admission'), false);
+});
+
+test('lost Main admission ACK retains the same unknown card and saved authoring, never restores as a new draft', async t => {
+  const h = harness(t, { scenarioResult: { success: null, accepted: true, submitted: null,
+    deliveryUnknown: true, status: 'delivery-unknown', operationKey: 'history:T:H', code: 'agent_send_admission_ack_unknown' } });
+  await h.run('send');
+  assert.equal(h.events.some(e => e[0] === 'error'), false, JSON.stringify(h.events));
+  assert.equal(h.rows.get('H').queueStatus, 'delivery-unknown');
+  assert.equal(h.input.historyPromptDrafts.T, '');
+  const saved = readHistorySendRecovery(h.storage);
+  assert.equal(saved.length, 1); assert.equal(saved[0].phase, 'dispatched');
+  assert.equal(saved[0].input.authoringText, 'fixture prompt');
+  assert.equal(h.events.filter(e => e[0] === 'admission').length, 1);
 });

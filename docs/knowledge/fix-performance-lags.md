@@ -233,6 +233,39 @@ const ids = useStore(useShallow(s => s.items.filter(i => i.active).map(i => i.id
 
 ### OOM при подготовке catalog search
 
+Новый17Oct19:16:21UTC (18Oct02:16BKK) — установленный Main57334 завершился
+`SIGABRT/FatalProcessOutOfMemory` при создании two-byte string; IPS faulting
+native thread176, не UI thread0. Его соответствие логическому History worker1
+не доказано. Последний завершённый worker catalog read605/603 имел phase snapshot
+heapUsed≈1.92GiB; два последующих Main candidate-start не подтверждают запуск
+в worker. Соседний `agent-transcript:get-history` также не доказывает allocator.
+Это отдельный incident уже с query-worker кодом в ASAR: прежний SOURCE repair
+нельзя повторно объявить отсутствующим. Native abort не ловится обычным JS catch;
+команда quit/install не установлена. Новый boot32258 и его cpu_resource report
+не относятся к причинности старого падения. Точные pins/IPS и незакрытая причинная
+граница сохранены в рабочем `docs/tmp/оптимизация-history.md`; exact allocator OPEN.
+
+Отдельно18Oct подтверждён и исправлен SOURCE-дефект общего JSON projector:
+captured token удерживал один элемент `parts` на каждый мелкий фрагмент/escape.
+Теперь каждые1024фрагмента соединяются в блок без повторного склеивания всего
+растущего prefix; выбранное значение, Unicode, validation и byte locators полные.
+Для незакрытой строки2.36MB локальный Node22 удерживал≈21–23.5MB сверх baseline,
+embedded Electron28≈9.4–11.75MB; grouping убрал этот множитель. Это retained heap
+контроля, не production peak/RSS.124controls прошли на Node22 и во встроенном
+Node18/Electron28; PRE даёт3memory RED/2semantic PASS. Прогресс тяжёлого read
+проверяется по тому же operation ID/монотонным bytes и конечному release:
+`[1,1,0]` с progress допустим, точное число callbacks зависит от времени read.
+Исторический fatal caller, GUI/installed acceptance и остальные transient peaks
+этим не закрыты. Raw persistence, full content и source/lineage clocks не менялись.
+
+Отдельный closed-fixture прогон actual catalog selected-value пути через
+HistoryReadClient→Worker→canonical query→transfer→Main на том же Electron28/Node18
+сохранил полный выбранный Unicode payload и query result. Максимальный
+наблюдённый worker heap на write-boundaries составил72.4→25.3MB при одинаковых
+2.36MB escaped input; это sampled whole-isolate heap, не peak/RSS и не allocator
+старого crash. `client.close()` после начала hydration завершил pending request
+ошибкой `history_reader_closed`, без Main raw graph; это отмена reader, не UI Stop.
+
 Отдельные11.10 OOM имели разные стеки:10:57UTC — Main `JSON.parse`,13:39 —
 GC worker/ConsString. Конкретные fatal files/callers не установлены. При этом
 catalog search доказанно загружал полные Codex records в Main до проверки
@@ -662,6 +695,27 @@ Compositor FRAME_SWAP не равен физическим пикселям. Р�
 и её координату. Точные cuts, отказавшие probes и installed-граница — в рабочем
 `docs/tmp/оптимизация-history.md`, не в обещании нулевой фоновой стоимости.
 
+## 7f. Cmd публиковал React-state без доступной подсказки
+
+Удерживаемый ControlBar запоминал Meta/strict-Ctrl через два React-state на
+каждом физическом переходе. Даже без hover, keyboard ownership или draft это
+будило крупный компонент. Равные значения уже отсекались для обычной буквы,
+но настоящий Meta edge оставался общей публикацией.
+
+Физические flags сохраняются в прежнем listener через стабильные scalar refs;
+React получает только видимый по прежним predicates feedback. Layout-проекция
+сохраняет Cmd→hover и изменения owner/draft/picker при удержании. Enter hover
+не требует keyboard focus. Отправка/Record/Run After используют прежние handlers
+и event flags; нового input authority или глобального registry нет.
+
+В18.10 private A/B/A/B с built renderer и2actual bars mean bare-Meta EventDispatch
+снизился5.046→3.592ms на16edges/variant. Это небольшой локальный выигрыш,
+не объяснение прежних49ms или production-очереди713ms. Первый и warm Cmd+B
+меняли знак выигрыша между парами; whole latency/installed/p95 этим не закрыты.
+11actual-code controls и парная live React-проверка Enter/Ctrl feedback прошли;
+ошибочный observer DOM-title исправлен после проверки реального ControlHint.
+Подробные cuts, исходные отказы и оставшиеся сценарии — в рабочем tmp темы.
+
 ## 8. Observability Toolkit (для будущих регрессий)
 
 12.10 installed-репорт после restore показал одновременно renderer input waits
@@ -721,7 +775,7 @@ pointerdown занял236.3ms и содержал работу переключ�
 
 Тестовые логи из CDP/harness проверяй на `document.visibilityState`. Если окно hidden, Chromium может throttle'ить renderer так, что synthetic hover/input выглядит как многосекундная задержка без реального foreground freeze. CPU-профиль скрытого окна может показывать idle при неисполнившихся rAF/свапах. Показ окна через CDP допустим в отдельно разрешённом foreground-эксперименте. Автоматический incident-recorder никогда не поднимает production-окно: сохраняет фактическую видимость и не выдаёт скрытый idle за доказательство быстрого foreground.
 
-Платформенная атрибуция long tasks бесполезна для своего кода: за двое суток все 898 длинных блокировок пришли `attribution=unknown` (включая одну на 14.2с) — same-origin работа схлопывается в «self». Поэтому приложение ведёт собственный короткий журнал активности (`rendererActivityTrail.ts`, `markRendererActivity('имя:'+tag)`), и freeze probe стампует каждый LongTask списком работ, шедших одновременно (`during=`). Незакрытая метка помечается `(open)`, но не получает повышенной причинной силы: например, `history-load` может ждать apply-очередь минутами и накрывать чужие задачи. Это диагностический след, не сигнал управления. `during=` означает только пересечение по времени; CPU-вклад требует профиля (см. `диагностика-логами.flow.md`).
+Платформенная атрибуция long tasks бесполезна для своего кода: за двое суток все 898 длинных блокировок пришли `attribution=unknown` (включая одну на 14.2с) — same-origin работа схлопывается в «self». Поэтому приложение ведёт собственный короткий журнал активности (`rendererActivityTrail.ts`, `markRendererActivity('имя:'+tag)`), и freeze probe стампует каждый LongTask списком работ, шедших одновременно (`during=`). Незакрытая метка помечается `(open)`, но не получает повышенной причинной силы: например, `history-load` может ждать apply-очередь минутами и накрывать чужие задачи. Это диагностический след, не сигнал управления. `during=` означает только пересечение по времени; CPU-вклад требует профиля (см. [логирование оптимизации](логирование-оптимизации.md#как-читать-доказательства)).
 
 | Тег | Норма | Регрессия |
 |---|---|---|

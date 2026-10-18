@@ -161,6 +161,7 @@ export interface AgentSendPromptOptions {
     error?: string;
   }>;
   presentationSnapshot?: {
+    historySendStartedAt?: number;
     historySessionId?: string | null;
     imagePaths?: Array<{
       id: number;

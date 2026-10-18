@@ -162,3 +162,43 @@ test('dismissed no-input cancellation releases only its own recoverable asset ow
   assert.equal(h.queue.referencedAssetIds().has('asset-b'), true);
   assert.deepEqual(h.writes, []);
 });
+
+for (const physical of ['absent', 'replacement']) {
+  test('renderer loss preserves uncertainty but not a permanent slot after exact ' + physical + ' proof', async t => {
+    let current = observation('G1');
+    const h = fixture(t, { read: () => current });
+    h.add('a'); h.add('b'); await tick(); await tick();
+    const original = h.store.get('history:T:a');
+    h.store.cancelDelivery({ operationKey: original.operationKey, tabId: 'T', handoffId: 'a',
+      attemptId: original.attemptId, provider: 'codex', reason: 'send-renderer-owner-lost' });
+    await tick(); await tick();
+    assert.deepEqual(h.writes, ['a'], 'automatic input revocation is not a release grant');
+    const fenced = h.store.get(original.operationKey);
+    current = physical === 'absent' ? observation(null, { processStatus: 'absent' }) : observation('G2');
+    h.generation('G2');
+    assert.equal(await h.queue.retireObsoleteInputSlot('T'), true);
+    await tick(); await tick();
+    assert.deepEqual(h.writes, ['a', 'b'], 'same follower, not replay of old input');
+    assert.deepEqual(h.store.get(original.operationKey), fenced, 'slot release must not rewrite delivery or cancellation');
+    assert.equal(h.queue.queueInfo(original.operationKey).inputSlot.reason,
+      physical === 'absent' ? 'physical-process-absent' : 'physical-input-owner-replaced');
+    assert.equal(h.store.get(original.operationKey).state, 'delivery-unknown');
+  });
+}
+
+test('renderer-loss retirement still requires fresh exact physical proof, not merely a cancellation marker', async t => {
+  let current = observation('G1');
+  const h = fixture(t, { read: () => current }); h.add('a'); h.add('b'); await tick(); await tick();
+  const original = h.store.get('history:T:a');
+  h.store.cancelDelivery({ operationKey: original.operationKey, tabId: 'T', handoffId: 'a',
+    attemptId: original.attemptId, provider: 'codex', reason: 'send-renderer-owner-lost' });
+  await tick(); await tick();
+  for (const invalid of [observation('G1'), observation('G2', { inputReady: false }),
+    observation('G2', { known: false }), observation('G2', { ownerStable: false }),
+    observation('G2', { tabId: 'foreign' }), observation('G2', { processStatus: 'unknown' }),
+    observation('G2', { isCurrent: () => false }), observation('G2', { isCurrent: null })]) {
+    current = invalid;
+    assert.equal(await h.queue.retireObsoleteInputSlot('T'), false);
+    assert.deepEqual(h.writes, ['a']);
+  }
+});

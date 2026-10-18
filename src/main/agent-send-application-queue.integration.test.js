@@ -15,7 +15,7 @@ const { compactSendReceiptPresentation } = require('./compact-send-settlement');
 const { imagePresentationFromReceipt } = require('./history-authoring-projection');
 const { isLocalSlashCommandPrompt } = require('./agent-history-send-receipt');
 const { runtimeSnapshotCompletionFixture } = require('./test-helpers/runtime-snapshot-completion');
-const web = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
+const web = fs.readFileSync(path.join(process.env.ACTUAL_SOURCE_DIR || __dirname, 'web-server.js'), 'utf8');
 const ast = ts.createSourceFile('web-server.js', web, ts.ScriptTarget.Latest, true);
 const declaration = name => {
   const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
@@ -38,6 +38,7 @@ function harness(t, provider, options = {}) {
   let targetSession = 'S';
   const context = vm.createContext({
     require, path, srcMainDir: __dirname,
+    ...require('./agent-send-preparation'),
     ...registry, agentSendReceiptStore: store, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,
     AGENT_SEND_RECEIPT_STATES: registry.RECEIPT_STATES,
@@ -558,7 +559,7 @@ test('actual Main merge IPC replaces two waiting History sends then dispatches o
   await h.send('a'); await h.send('b'); await h.send('c');
   const original = ['a', 'b'].map(id => h.queue.item('history:T:' + id).request_json);
   const request = { ...h.queue.mergeGuard('history:T:b'), requestId: 'actual-ipc-merge' };
-  const result = await h.merge(request); assert.equal(result.success, true);
+  const result = await h.merge(request); assert.equal(result.success, true, JSON.stringify(result));
   assert.equal(result.record.receipt.promptText, 'test a\n\ntest b'); assert.equal(h.writes.length, 0);
   assert.deepEqual(['a', 'b'].map(id => h.queue.item('history:T:' + id).request_json), original);
   h.queue.execute = (request, scope) => h.context.runPreparedAgentSendScenario({ ...request,
@@ -600,6 +601,7 @@ function automaticWaitHarness(t, { legacy = false } = {}) {
   const ownerSource = ['captureAgentInputIdentity', 'agentSendExecutionFailure']
     .map(frameFixture.actualFunction).join('\n');
   vm.runInNewContext(frameFixture.startupFrameDeclarations() + '\n' + ownerSource + '\n' + handler.getText(tree), {
+    ...require('./agent-send-preparation'), agentSendReceiptStore: h.store,
     ipcMain: { handle: (key, fn) => ipc.set(key, fn) }, path, srcMainDir: __dirname,
     require: () => ({ certifyAutomaticReadinessWait: (...args) => h.queue.certifyAutomaticReadinessWait(...args),
       readAutomaticSendAdmission: async () => ready }),
@@ -1065,4 +1067,137 @@ test('a stale preflight callback cannot settle a replacement attempt (ABA)', asy
   await late({ ok: true, data: await coldLaunchRefusal(captured) });
   assert.equal(h.store.get(before.operationKey).state, 'in-flight');
   assert.equal(h.store.get(before.operationKey).attemptId, next.attemptId);
+});
+
+test('preparation: active HEAD clock excludes FIFO residence and preserves the original item', async t => {
+  const h = harness(t, 'codex'); let now = 1000;
+  h.context.Date = class extends Date { static now() { return now; } };
+  await h.send('head'); await h.send('follower'); await tick();
+  const key = 'history:T:follower', item = h.queue.item(key);
+  const first = h.store.get('history:T:head').receipt.preflightScope;
+  assert.ok(first.preparation, 'active executor must issue one preparation deadline');
+  assert.equal(first.preparation.startedAt, 1000);
+  assert.equal(h.store.get(key).attemptId, null);
+  now += 75000;
+  h.confirm('head'); await h.queue.result(key);
+  const next = h.store.get(key).receipt.preflightScope;
+  assert.equal(next.preparation.startedAt, now);
+  assert.equal(next.preparation.deadlineAt, now + 60000);
+  assert.equal(h.queue.item(key).id, item.id);
+  assert.equal(h.queue.item(key).request_json, item.request_json);
+  assert.equal(h.store.get('history:T:head').receipt.preflightScope.preparation.deadlineAt, 61000);
+  assert.deepEqual(h.writes.map(x => x.handoffId), ['head', 'follower']);
+});
+
+test('preparation: time inside active prepareSend is charged before beginAttempt and bridge dispatch', async t => {
+  const h = harness(t, 'codex'); let now = 1000;
+  h.context.Date = class extends Date { static now() { return now; } };
+  await h.context.runPreparedAgentSendScenario({ tabId: 'T', handoffId: 'prepared',
+    sendOperationKey: 'history:T:prepared', provider: 'codex', sessionId: 'S', prompt: 'frozen',
+    source: 'history-panel', applicationQueueAcceptedResponse: true,
+    prepareSend: async () => { now += 45000; return null; } });
+  await h.queue.result('history:T:prepared');
+  const record = h.store.get('history:T:prepared');
+  assert.ok(record.receipt.preflightScope.preparation, 'prepareSend time must belong to the active deadline');
+  assert.equal(record.receipt.preflightScope.preparation.startedAt, 1000);
+  assert.equal(record.receipt.preflightScope.preparation.deadlineAt - now, 15000);
+  assert.equal(h.writes.length, 1);
+});
+
+function actualOwnedBridge(t, h, { enter = false } = {}) {
+  const { EventEmitter } = require('node:events');
+  const { createFakeClock } = require('./fixtures/codex-draft-request-observation.cjs');
+  const cancellations = require('./agent-send-cancellation').createAgentSendCancellationRegistry();
+  const clock = createFakeClock(), sender = new EventEmitter(), ipcMain = new EventEmitter(), dispatched = [];
+  sender.mainFrame = { processId: 41, routingId: 3 };
+  sender.send = (_channel, message) => {
+    dispatched.push(message);
+    if (enter) h.store.markAttemptState(message.payload.sendOperationKey, message.payload.sendAttemptId, 'enter-armed');
+  };
+  h.queue.cancelAttempt = record => cancellations.cancel(record.tabId, record.handoffId, { attemptId: record.attemptId });
+  // The actual existing frame identity function; no renderer authority stub.
+  const frameSource = fs.readFileSync(path.join(__dirname, 'workspace-switcher-api.js'), 'utf8');
+  const frameAst = ts.createSourceFile('workspace-switcher-api.js', frameSource, ts.ScriptTarget.Latest, true);
+  const frameKey = frameAst.statements.find(n => ts.isVariableStatement(n)
+    && n.declarationList.declarations.some(d => d.name.getText(frameAst) === 'frameKey')).getText(frameAst);
+  Object.assign(h.context, { pendingBridge: new Map(), ipcMain,
+    BrowserWindow: { getAllWindows: () => [{ webContents: sender, isDestroyed: () => false }] },
+    LATE_BRIDGE_REPLY_RETENTION_MS: 10000, e2eBoundaryTestGate: null,
+    setTimeout: clock.setTimer, clearTimeout: clock.clearTimer,
+    Date: class extends Date { static now() { return clock.now(); } } });
+  vm.runInContext(frameKey + '\nvar switcherFrameKey = frameKey;\n'
+    + ['bridgePayloadLabel', 'bridgeRequest', 'registerBridgeReplyHandler'].map(declaration).join('\n'), h.context);
+  h.context.registerBridgeReplyHandler();
+  t.after(() => { for (const p of h.context.pendingBridge.values()) p.dispose?.(); h.context.pendingBridge.clear(); clock.timers.clear(); });
+  return { sender, ipcMain, clock, dispatched, cancellations,
+    reply(message, data, from = sender, frame = sender.mainFrame) {
+      ipcMain.emit('web:bridge-reply', { sender: from, senderFrame: frame },
+        { requestId: message.requestId, ok: true, data });
+    } };
+}
+
+test('preparation: expired active prepareSend cannot create an attempt or dispatch a late renderer launch', async t => {
+  const h = harness(t, 'codex'); let now = 1000;
+  h.context.Date = class extends Date { static now() { return now; } };
+  await h.context.runPreparedAgentSendScenario({ tabId: 'T', handoffId: 'expired',
+    sendOperationKey: 'history:T:expired', provider: 'codex', sessionId: 'S', prompt: 'frozen',
+    source: 'history-panel', applicationQueueAcceptedResponse: true,
+    prepareSend: async () => { now += 60000; return null; } });
+  await h.queue.result('history:T:expired');
+  const record = h.store.get('history:T:expired');
+  assert.equal(record.state, 'not-submitted'); assert.equal(record.attemptId, null);
+  assert.equal(h.writes.length, 0);
+});
+
+for (const event of ['destroyed', 'render-process-gone', 'did-navigate']) {
+  test('preparation: actual bridge owner ' + event + ' revokes future input and holds possible-Enter follower', async t => {
+    const h = harness(t, 'codex'), b = actualOwnedBridge(t, h, { enter: true });
+    await h.send('lost'); await h.send('follower'); await tick();
+    assert.equal(b.dispatched.length, 1);
+    const before = h.store.get('history:T:lost');
+    b.sender.emit(event); await tick();
+    assert.equal(b.cancellations.isCancelled('T', 'lost', before.attemptId), true);
+    assert.equal(h.store.isDeliveryCancelled(before.operationKey, before.attemptId), true);
+    assert.equal(h.store.get(before.operationKey).state, 'delivery-unknown');
+    assert.equal(h.store.get('history:T:follower').attemptId, null);
+    h.queue.resume(); b.clock.advance(60000); await tick();
+    assert.equal(b.dispatched.length, 1);
+    assert.equal(h.store.get(before.operationKey).attemptId, before.attemptId);
+    assert.equal(b.sender.listenerCount('destroyed') + b.sender.listenerCount('render-process-gone')
+      + b.sender.listenerCount('did-navigate'), 0);
+    // A late exact canonical proof may enrich delivery; it cannot uncancel H.
+    h.confirm('lost'); await tick();
+    assert.equal(h.store.get(before.operationKey).state, 'confirmed');
+    assert.equal(h.store.isDeliveryCancelled(before.operationKey, before.attemptId), true);
+  });
+}
+
+test('preparation: actual bridge ignores foreign replies and blocked navigation, then accepts its exact owner', async t => {
+  const h = harness(t, 'codex'), b = actualOwnedBridge(t, h);
+  await h.send('owner'); await tick(); const message = b.dispatched[0];
+  const refusal = { success: false, submitted: false, pasteWritten: false, enterWritten: false, status: 'not-submitted' };
+  b.reply(message, refusal, {}); await tick();
+  assert.equal(h.context.pendingBridge.size, 1);
+  b.reply(message, refusal, b.sender, { processId: 99, routingId: 2 }); await tick();
+  assert.equal(h.context.pendingBridge.size, 1);
+  b.sender.emit('did-start-navigation', {}, 'https://blocked.example', false, true);
+  assert.equal(h.context.pendingBridge.size, 1);
+  assert.equal(h.store.isDeliveryCancelled(message.payload.sendOperationKey, message.payload.sendAttemptId), false);
+  b.reply(message, refusal); await h.queue.result('history:T:owner');
+  assert.equal(h.store.get('history:T:owner').state, 'not-submitted');
+  assert.equal(h.context.pendingBridge.size, 0);
+  assert.equal(b.sender.listenerCount('destroyed'), 0);
+});
+
+test('preparation: actual bridge timeout keeps unknown and late receipt ownership until bounded cleanup', async t => {
+  const h = harness(t, 'codex'), b = actualOwnedBridge(t, h, { enter: true });
+  await h.send('timeout'); await h.send('follower'); await tick();
+  b.clock.advance(1000); await tick();
+  assert.equal(h.store.get('history:T:timeout').state, 'enter-armed');
+  assert.equal(h.store.get('history:T:follower').attemptId, null);
+  assert.equal(h.context.pendingBridge.size, 1);
+  b.clock.advance(10000); await tick();
+  assert.equal(h.context.pendingBridge.size, 0);
+  assert.equal(b.sender.listenerCount('destroyed'), 0);
+  assert.equal(b.dispatched.length, 1);
 });

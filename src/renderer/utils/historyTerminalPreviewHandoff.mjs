@@ -82,6 +82,15 @@ export function historyTerminalPreviewHasNewUserGesture(handoff, {
     && Number(gestureAt) > Number(handoff.gestureAt || 0);
 }
 
+// Data adoption still needs its exact canonical proof after input. Only the
+// old position lease is retired: a wheel's default scroll may arrive AFTER a
+// rebase/layout commit, so capturing its pre-scroll position would undo it.
+export function cancelHistoryTerminalPreviewHandoffScroll(handoff) {
+  return { ...handoff, scrollCancelledByGesture: true,
+    anchorKind: 'stationary', readingUnitKey: null,
+    anchorOffsetPx: null, bottomGapPx: null };
+}
+
 export function historyTerminalPreviewHandoffAnchor({
   followBottom = false,
   previewOffsetPx = null,

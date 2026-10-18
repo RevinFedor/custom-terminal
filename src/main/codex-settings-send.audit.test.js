@@ -40,6 +40,7 @@ function harness({ outcome = 'confirmed', pending = false, competingWriter = fal
   const audit = { expectedHash: 'hash', expectedLen: 6, enterRetryCount: 0, submitted: true };
   const settingsQueue = createCodexSettingsMutationQueue();
   const context = vm.createContext({
+    ...require('./agent-send-preparation'), agentSendReceiptStore: null,
     console: { log() {}, warn() {}, error() {} },
     terminals: new Map([['tab', term]]),
     terminalCommandState: new Map([['tab', { runSeq: 1 }]]),

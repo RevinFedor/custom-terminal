@@ -79,7 +79,13 @@ function mergeLayout(previous, requested) {
       const key = value => value?.windowId || value?.slotId || value?.tabId || null;
       return next.map(value => {
         const match = Array.isArray(old) && key(value) ? old.find(candidate => key(candidate) === key(value)) : null;
-        return merge(match, value);
+        const merged = merge(match, value);
+        // A pane without column is explicitly horizontal (its array index),
+        // not an omitted extension. Retaining its old stacked column changes
+        // the requested grid as soon as Main's saved layout is restored.
+        if (field === 'splitPanes' && value && typeof value === 'object'
+          && !Array.isArray(value) && !Object.hasOwn(value, 'column')) delete merged.column;
+        return merged;
       });
     }
     if (next && typeof next === 'object') {

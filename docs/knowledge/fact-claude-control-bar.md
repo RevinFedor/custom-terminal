@@ -222,13 +222,26 @@ Layout одинаковый для PTY и SDK, но набор контроло�
 а ширина rename-input оставалась60px. Локальный renameDraft уже существовал и
 не был источником общей публикации на каждый символ.
 
-Повторные значения отсекаются до React setter, реальные Cmd/strict-Ctrl edges,
-release и blur сохраняются. В коротком real idle/busy повторе эта часть dispatch
-занимала около1мс; очередь renderer всё ещё давала отдельные задержки.
+Повторные значения отсекаются до React setter. С18.10 физические Meta/Control/
+Alt/Shift/composition flags остаются в ref, а React получает только доступный
+feedback: Cmd для разрешённого History Enter под hover, strict Ctrl для точного
+keyboard owner с draft либо активной очередью и закрытым picker. Cmd→hover,
+hover→Cmd, смена eligibility при удержании, release и blur сохраняются; видимый
+нефокусный Enter не заменяется проверкой keyboard focus. Actual click/Send/Record
+продолжает читать прежний event/owner, а не диагностическую UI-проекцию.
+В коротком real idle/busy повторе17.10 отрезок обычной буквы занимал около1мс;
+он не является результатом нового modifier-ремонта. Отдельная18.10 пара полных
+private built renderer показала mean Meta dispatch5.046→3.592мс на16events/variant
+и только2mounted bars. Whole Cmd+B по этим четырём boots не дал устойчивого gain.
 Проверять нужно весь набор имени до Enter, отдельно от первого символа и появления
 карточки. Совпавший `controlbar-rebind` span до rAF не является exclusive CPU
 атрибуцией; стоимость width/layout и фоновых lifecycle updates различается по trace.
 Подробные интервалы и предел малого N — в `docs/tmp/оптимизация-history.md`.
+При включённых control help `ControlHint` убирает нативный `title` ребёнка,
+оставляя собственный tooltip. Пустой DOM-title не означает потерянный Record
+feedback: client-проверка сверяет цвет Enter и логический label, не отключает help
+ради наблюдения. Парный stopped-History UI сохранил оба порядка Cmd/hover,
+выход/возврат hover и Ctrl/Meta preview; временный draft восстановлен Undo без Send.
 
 ## Codex mode в том же bar
 

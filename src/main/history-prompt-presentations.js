@@ -262,7 +262,7 @@ function cloneCodexPromptPresentationsForProvenChild(db, options = {}) {
         if (saveAuditedPromptPresentation(db, { toolType: 'codex', sessionId: options.childSessionId,
           entryUuid: mapping.childEntryUuid, auditTimestamp: mapping.childAuditTimestamp,
           actualHash: mapping.childTransportHash, actualText: text,
-          snapshot: { semanticTags: row.chips } })) inheritedCloned++;
+          snapshot: { semanticTags: row.chips }, trustedContextPrefix: true })) inheritedCloned++;
       }
     };
     if (db.db?.transaction) db.db.transaction(copy)();
@@ -277,7 +277,7 @@ function cloneCodexPromptPresentationsForProvenChild(db, options = {}) {
   };
 }
 
-function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false } = {}) {
+function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false, contextProof = false } = {}) {
   const chips = Array.isArray(snapshot?.promptChips) ? snapshot.promptChips : [];
   const promptChips = chips.flatMap((chip, index) => {
     // Opaque snapshot retention only. The shared codec remains the parser in
@@ -330,6 +330,16 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
   });
   const tags = Array.isArray(snapshot?.semanticTags) ? snapshot.semanticTags : [];
   const semanticTags = tags.flatMap((tag, index) => {
+    if (tag?.kind === 'context-prefix') {
+      if ((!storedAuthoring && !contextProof) || tag.contextKind !== 'orchestration-state' || tag.envelopeStart !== 0
+        || !Number.isSafeInteger(tag.bodyStart) || tag.bodyStart < 1
+        || !Number.isSafeInteger(tag.bodyEnd) || tag.bodyEnd <= tag.bodyStart
+        || typeof tag.envelopeText !== 'string' || tag.envelopeText.length !== tag.bodyStart || tag.envelopeText.length > 16000
+        || typeof tag.bodyProjectionHash !== 'string' || !/^[a-f0-9]{64}$/.test(tag.bodyProjectionHash)) return [];
+      return [{ id: String(tag.id || `durable-context-prefix-${index}`), kind: 'context-prefix', contextKind: tag.contextKind,
+        envelopeStart: 0, envelopeText: tag.envelopeText, bodyStart: tag.bodyStart, bodyEnd: tag.bodyEnd,
+        bodyProjectionHash: tag.bodyProjectionHash }];
+    }
     if (tag?.kind === 'tab-message') {
       const messageId = typeof tag.messageId === 'string' ? tag.messageId.trim() : '';
       if (!messageId || !['question', 'reply'].includes(tag.phase)) return [];
@@ -433,12 +443,15 @@ function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false
   // validation opts in; creation is from an exact confirmed durable receipt.
   const authoringProjection = storedAuthoring
     ? normalizeHistoryAuthoringProjection(snapshot?.authoringProjection) : null;
-  return promptChips.length > 0 || semanticTags.length > 0 || imageRefs.length > 0 || authoringProjection
+  const historySendStartedAt = Number.isFinite(snapshot?.historySendStartedAt) && snapshot.historySendStartedAt > 0
+    ? snapshot.historySendStartedAt : null;
+  return promptChips.length > 0 || semanticTags.length > 0 || imageRefs.length > 0 || authoringProjection || historySendStartedAt
     ? {
         version: authoringProjection ? 4 : imageRefs.length > 0 ? 3 : 2,
         promptChips,
         semanticTags,
         imagePaths: imageRefs,
+        ...(historySendStartedAt ? { historySendStartedAt } : {}),
         ...(authoringProjection ? { authoringProjection } : {}),
       }
     : null;
@@ -459,8 +472,9 @@ function saveAuditedPromptPresentation(db, {
   actualText,
   actualHash = null,
   snapshot,
+  trustedContextPrefix = false,
 } = {}) {
-  const normalized = normalizePromptPresentationSnapshot(snapshot);
+  const normalized = normalizePromptPresentationSnapshot(snapshot, { contextProof: trustedContextPrefix });
   if (!normalized || !db?.saveHistoryPromptPresentation) return false;
   const hash = String(actualHash || promptTransportHash(actualText)).trim();
   if (!toolType || !sessionId || !auditTimestamp || !hash) return false;
@@ -470,6 +484,11 @@ function saveAuditedPromptPresentation(db, {
     ? readPromptPresentationByAudit(db, toolType, sessionId, auditTimestamp, hash) : null;
   const authoringProjection = storedAuthoringProjection(existing);
   const requestPresentation = storedClaudeRequestPresentation(existing);
+  const savedContexts = normalizePromptPresentationSnapshot({ semanticTags: (existing?.chips || [])
+    .filter(tag => tag.kind === 'context-prefix') }, { contextProof: true })?.semanticTags || [];
+  const contextTags = normalized.semanticTags.filter(tag => tag.kind === 'context-prefix');
+  if (savedContexts.length && contextTags.length && JSON.stringify(savedContexts) !== JSON.stringify(contextTags)) return false;
+  const semanticTags = [...normalized.semanticTags, ...(!contextTags.length ? savedContexts : [])];
   if (requestPresentation && entryUuid && entryUuid !== requestPresentation.binding.entryUuid) return false;
   return db.saveHistoryPromptPresentation({
     toolType,
@@ -483,7 +502,7 @@ function saveAuditedPromptPresentation(db, {
     // exposing them to History/Timeline.
     chips: [
       ...normalized.promptChips,
-      ...normalized.semanticTags,
+      ...semanticTags,
       ...(authoringProjection ? splitPromptPresentationRow(existing).imagePaths
         .map((ref, index) => ({ ...ref, kind: 'image-ref', presentationIndex: index })) : normalized.imagePaths),
       ...(authoringProjection ? [authoringProjection] : []),
@@ -521,7 +540,7 @@ function splitPromptPresentationRow(row) {
   return {
     promptChips: chips.filter(item => item?.kind === 'prompt' || item?.kind === 'paste' && item?.messageReference),
     semanticTags: chips.filter(item => (
-      item?.kind === 'orchestration' || item?.kind === 'prompt-origin' || item?.kind === 'tab-message'
+      item?.kind === 'orchestration' || item?.kind === 'prompt-origin' || item?.kind === 'tab-message' || item?.kind === 'context-prefix'
     )),
     imagePaths: chips
       .filter(item => item?.kind === 'image-ref')
@@ -949,7 +968,7 @@ function mappedCodexServicePresentations(db, sessionId, entries, logger) {
         || normalizeCodexPromptIdentityTimestamp(row.auditTimestamp) !== timestamp
         || row.transportHash !== transportHash
         || !splitPromptPresentationRow(row).semanticTags.some(tag => (
-          ['tab-message', 'orchestration'].includes(tag.kind) && tag.bodyProjectionHash === fullHash
+          ['tab-message', 'orchestration', 'context-prefix'].includes(tag.kind) && tag.bodyProjectionHash === fullHash
         ))) continue;
       // Rebase the READ projection, never the source's durable receipt/row.
       recovered.push({ ...row, sessionId, entryUuid: entry.uuid,

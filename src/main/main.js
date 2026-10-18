@@ -828,8 +828,14 @@ const agentSendReceiptStartupReady = (async () => {
     markedUnconfirmed,
   };
 })().catch((error) => {
-  console.warn('[AgentSendReceipt] startup transcript reconcile failed:', error?.message || error);
-  return { ready: false, error: error?.message || String(error) };
+  // The synchronous reconcileStartup() above already committed conservative
+  // restart fences. This asynchronous pass only refines those exact receipts.
+  // A failed refinement must keep possible Enter/unknown heads held, not close
+  // every unrelated tab's FIFO forever after a transient SQLite writer lock.
+  console.warn('[AgentSendReceipt] startup transcript reconcile failed:', error?.message || error,
+    'action=preserve-attempt-barriers-and-allow-independent-lanes'
+    + ' code=' + (error?.code || 'unknown'));
+  return { ready: true, degraded: true, error: error?.message || String(error) };
 });
 const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
@@ -890,6 +896,25 @@ const CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:
 const CODEX_NATIVE_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-receipt.v1:';
 const CODEX_NATIVE_REWIND_CHILD_WINDOW_MS = 2 * 60 * 1000;
 const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
+const { writeWithSendEnterTiming } = require(path.join(srcMainDir, 'agent-send-enter-timing'));
+
+function writeHistorySendEnter(term, data, { tabId, handoffId, sendOperationKey, sendAttemptId } = {}) {
+  if (!tabId || !handoffId || (data !== '\r' && data !== '\n')) return term.write(data);
+  return writeWithSendEnterTiming(() => term.write(data), (enterAttemptAt) => {
+    // Publish before any additional DB work. Persist only after the caller has
+    // recorded the physical-write outcome; metadata failure is not Send failure.
+    queueMicrotask(() => {
+      try { agentSendReceiptStore.recordEnterAttempt({ tabId, handoffId,
+        operationKey: sendOperationKey, attemptId: sendAttemptId, enterAttemptAt }); }
+      catch (error) { console.warn('[AgentSendTiming] receipt timing unavailable:', error?.message || error); }
+    });
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:send-enter-attempt', {
+      tabId, handoffId, sendOperationKey: sendOperationKey || null, sendAttemptId: sendAttemptId || null, enterAttemptAt,
+    });
+    console.log('[AgentSendTiming] Enter attempt tab=' + tabId + ' handoff=' + handoffId
+      + ' attempt=' + (sendAttemptId || '-') + ' at=' + enterAttemptAt);
+  }, Date.now);
+}
 const {
   backfillConfirmedCanonicalAuthoringPresentations,
   backfillConfirmedSystemPromptPresentations,
@@ -3278,6 +3303,7 @@ const terminalStopRevisions = new WeakMap();
 const terminalLaunchFenceOrders = new WeakMap();
 let nextTerminalLaunchFenceOrder = 0;
 const { createAgentInputObservation, observeAgentInput } = require(path.join(srcMainDir, 'agent-input-observation'));
+const { PREPARATION_MS, createInputPreparation, readAgentSendPreparation, deferPreparedInput, mapPreparedInput } = require(path.join(srcMainDir, 'agent-send-preparation'));
 const { agentInputObservationInvalidated } = require(path.join(srcMainDir, '../shared/agent-input-observation.cjs'));
 // Keep the main/headless mirror on the same bounded raw-tail budget as the
 // renderer. Automation reads the current viewport and durable transcripts;
@@ -4413,10 +4439,6 @@ const terminalRawWriter = createTerminalRawWindowWriter({
 });
 const terminalRawWindow = createTerminalRawWindow({ persist: terminalRawWriter,
   log: value => console.log('[TerminalRawWindow] ' + JSON.stringify(value)) });
-app.once('will-quit', () => {
-  void Promise.resolve().then(() => terminalRawWindow.dispose())
-    .catch(() => console.warn('[TerminalRawWindow] shutdown artifact incomplete'));
-});
 const reportTerminalIncident = createTerminalIncidentReporter({
   capture: payload => payload.incidentReason === 'claude-audit-multiblock-shape'
     ? captureClaudePromptShapeDiagnostic(payload)
@@ -5354,6 +5376,10 @@ function assertAgentSendLaunchCurrent(tabId, toolType, request = {}, {
     if (record.state !== AGENT_SEND_DURABLE_STATES.IN_FLIGHT) {
       refuse('agent_send_launch_attempt_not_active');
     }
+    const preparation = readAgentSendPreparation(agentSendReceiptStore, tabId,
+      { ...request, handoffId: record.handoffId });
+    const preparationFailure = preparation?.failure();
+    if (preparationFailure) refuse(preparationFailure.code);
     if (validateTarget) {
       const failure = agentSendRequestTargetFailure(tabId, toolType, request, null, { allowUnresolved: true });
       if (failure) refuse(failure.code);
@@ -5915,6 +5941,7 @@ function decorateAgentDraftProofIdentity(tabId, proof, ownedRebase = null) {
     return { success: false, hasDraft: null, proofOutcome: 'unknown', text: '', preview: '',
       source: 'headless-main:observation-owner-changed-before-publication',
       error: 'agent_input_observation_superseded', proofReason: 'owner-changed-before-publication',
+      ...(proof?.preparationFailure ? { preparationFailure: { code: proof.preparationFailure.code } } : {}),
       observation: { ...(proof?.observation || {}), status: 'superseded', owner: original || null } };
   }
   // One trusted caller deliberately rebases after its own proven Escape. This
@@ -21653,6 +21680,43 @@ async function _loadSessionTurns(sessionId, cwd, options = {}) {
   }
 }
 
+function _captureSessionSnapshotOwner(request) {
+  const bindings = _historyReadBindings(request.sessionId);
+  if (request.tabId && !bindings.some(binding => binding.tabId === request.tabId && binding.provider === 'codex')) {
+    throw Object.assign(new Error('Snapshot tab no longer owns the requested session'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+  }
+  const owners = bindings.filter(binding => binding.provider === 'codex')
+    .map(binding => {
+      const tabId = binding.tabId, owner = captureConversationOwner(tabId);
+      return { ...binding, owner: owner && { known: owner.known, archived: owner.archived,
+        provider: owner.provider, sessionId: owner.sessionId, cwd: owner.cwd, projectId: owner.projectId,
+        instanceId: owner.instanceId, terminalId: owner.terminalId, runSeq: owner.runSeq,
+        executionScope: owner.executionScope },
+      order: conversationOwners.stored(tabId), lifecycle: getTerminalLifecycleGeneration(tabId),
+      stop: getTerminalStopRevision(tabId), input: getTerminalInputRevision(tabId) };
+    }).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  return JSON.stringify({ bindings: bindings.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))), owners });
+}
+
+async function _readSessionSnapshot(request) {
+  return require(path.join(srcMainDir, 'history-session-snapshot')).readSessionSnapshot(request, {
+    resolve: value => _resolveHistoryReadSession(value.sessionId, value.cwd),
+    captureOwner: _captureSessionSnapshotOwner,
+    captureRuntime: value => {
+      const candidates = _historyReadBindings(value.sessionId).filter(binding => binding.provider === 'codex' && binding.source === 'tabs');
+      const ids = [...new Set(candidates.map(binding => binding.tabId))];
+      const tabId = value.tabId || (ids.length === 1 ? ids[0] : null);
+      const state = tabId ? captureTabInspection(tabId) : null;
+      return state?.known && state.sessionId === value.sessionId
+        ? { known: state.runtime.known === true, source: 'main-events', tabId, sessionId: state.sessionId,
+          status: state.runtime.status, liveLifecycle: state.runtime.liveLifecycle, busy: state.busy, turnId: state.turn.turnId }
+        : { known: false, source: 'main-events', reason: 'no_unique_current_tab' };
+    },
+    read: value => transcriptService.readSessionSnapshot(value),
+    assertCurrent: value => transcriptService.assertSessionSnapshotCurrent(value),
+  });
+}
+
 function _historyReadBindings(sessionId) {
   const bindings = [];
   for (const table of ['tabs', 'tab_history']) {
@@ -23092,7 +23156,8 @@ async function handleOverseerRequest(rawUrl) {
   const url = new URL(rawUrl, 'http://localhost');
   const p = url.pathname; // e.g. /overseer/sessions
 
-  if (p === '/overseer/capabilities') return { body: { userMessageHistory: { version: 1, diagnostics: true } } };
+  if (p === '/overseer/capabilities') return { body: { userMessageHistory: { version: 1, diagnostics: true },
+    sessionSnapshot: require(path.join(srcMainDir, 'history-session-snapshot')).SESSION_SNAPSHOT_CAPABILITY } };
 
   if (p === '/overseer/user-messages') {
     const input = Object.fromEntries(url.searchParams);
@@ -23274,6 +23339,12 @@ async function handleOverseerRequest(rawUrl) {
   const sessionId = m[1];
   const subpath = m[2] || '';
   const cwd = url.searchParams.get('cwd') || null;
+
+  if (subpath === '/snapshot') {
+    const input = Object.fromEntries(url.searchParams);
+    for (const key of ['limit', 'maxChars']) if (key in input) input[key] = Number(input[key]);
+    return { body: await _readSessionSnapshot({ ...input, sessionId }) };
+  }
 
   if (subpath === '/diagnostics') {
     const resolved = await _resolveHistoryReadSession(sessionId, cwd);
@@ -26272,6 +26343,13 @@ app.on('before-quit', async (event) => {
       + ' minimumMs=' + SHUTDOWN_OVERLAY_MIN_VISIBLE_MS);
   }
 
+  // Join the bounded raw writer while the existing before-quit owner still
+  // prevents teardown. will-quit does not await a returned Promise.
+  try {
+    const rawShutdown = await terminalRawWindow.dispose();
+    if (rawShutdown?.timedOut) console.warn('[TerminalRawWindow] shutdown artifact incomplete: worker deadline');
+  } catch { console.warn('[TerminalRawWindow] shutdown artifact incomplete'); }
+
   // All graceful work done. Re-trigger quit; the guard above will let it pass.
   console.log('[Shutdown:GracefulCtrlC] graceful flow complete, calling app.quit()');
   _gracefulShutdownDone = true;
@@ -28893,6 +28971,10 @@ async function retryCodexEnterAfterAuditTimeout({
   const durableBefore = audit?.sendOperationKey
     ? agentSendReceiptStore.get(audit.sendOperationKey)
     : null;
+  const preparation = audit?.writeOperation?.preparation;
+  const revoked = () => (preparation && preparation.remainingMs() <= 0)
+    || (audit?.sendOperationKey && agentSendReceiptStore.isDeliveryCancelled(audit.sendOperationKey, audit.sendAttemptId));
+  if (revoked()) return { retry: false, retried: false, reason: 'send-preparation-revoked' };
   const turnBusyBefore = codexTurnWatchers.get(tabId)?.busy === true;
   const admission = classifyCodexPostEnterRetryAdmission({
     timeoutResult,
@@ -28947,6 +29029,7 @@ async function retryCodexEnterAfterAuditTimeout({
     return captureDecision;
   }
 
+  if (revoked()) return { retry: false, retried: false, reason: 'send-preparation-revoked' };
   recordComposerForensicPtyInput(tabId, '\r', {
     kind: 'programmatic-enter-retry',
     phase: 'pty-write-attempt',
@@ -29239,9 +29322,14 @@ async function requestTerminalCodexDraftState(webContents, tabId, reason, timeou
     console.log('[CodexDraftState] join startup frame tab=' + String(tabId).slice(-12)
       + ' launch=' + startup.launchId + ' deadlineAt=' + startup.deadlineAt);
   }
+  const preparation = sendFrameRead
+    ? (typeof options.preparation?.failure === 'function' ? options.preparation : null)
+      || readAgentSendPreparation(agentSendReceiptStore, tabId, options, startup) : null;
+  if (preparation) budgetMs = preparation.remainingMs();
   const mergeRendererPositive = options.mergeRendererPositive === true;
   const observation = createMainAgentInputObservation(tabId, 'codex', budgetMs, {
-    ...options, isOwnerCurrent: () => startupCurrent() && options.isOwnerCurrent?.() !== false,
+    ...options, isOwnerCurrent: () => startupCurrent()
+      && preparation?.isCurrent() !== false && options.isOwnerCurrent?.() !== false,
   });
   const headless = observation.identity.mirrorToken;
   let headlessState = null, rendererState = null, rendererObserved = false;
@@ -29317,7 +29405,22 @@ async function requestTerminalCodexDraftState(webContents, tabId, reason, timeou
     report.value = null; report.reason = 'owner-changed';
     report.observation = { ...report.observation, status: 'superseded' };
   }
+  // A final synchronous diagnostic read at the observation deadline is useful,
+  // but cannot resurrect an expired accepted intent or a cancelled attempt.
+  const preparationFailure = preparation?.failure();
+  if (preparationFailure || (startup && Date.now() >= startup.deadlineAt)) {
+    report.value = null;
+    report.reason = preparationFailure?.code || 'agent_send_preparation_expired';
+    report.observation = { ...report.observation,
+      status: report.reason === 'agent_send_preparation_expired' ? 'expired' : 'superseded' };
+  }
   const result = agentDraftObservationResult(tabId, 'codex', observation, report);
+  if (preparationFailure) {
+    // Stop can also invalidate the final frame publication. Keep the exact
+    // accepted intent's refusal separate from that unknown frame; this is not
+    // an empty-composer proof or a claim about any previous physical input.
+    result.preparationFailure = { code: preparationFailure.code };
+  }
   if (agentInputObservationInvalidated(result)) return result;
   const normalizedHeadlessState = headlessState
     ? { requestId: null, tabId, reason, ...headlessState }
@@ -29590,6 +29693,8 @@ async function safePasteAndSubmit(term, content, options = {}) {
     ? options.codexStartupFrameWait
     : operationTabId && String(options.source || '').startsWith('codex-')
       ? captureCodexSendStartupFrameWait(operationTabId, options.codexStartupFrameWaitId || null) : null;
+  operation.preparation = operationTabId
+    ? readAgentSendPreparation(agentSendReceiptStore, operationTabId, options, operation.codexStartupFrameWait) : null;
   const requestedInputRevision = operationTabId
     ? getTerminalInputRevision(operationTabId)
     : null;
@@ -29603,6 +29708,8 @@ async function safePasteAndSubmit(term, content, options = {}) {
       const executionFailure = agentSendExecutionFailure(operationTabId, term, operation.executionIdentity,
         { stage: 'write-owner-admission' });
       if (executionFailure) return executionFailure;
+      const expired = operation.preparation?.failure();
+      if (expired) return expired;
       if (preparationWaited && getTerminalInputRevision(operationTabId) !== requestedInputRevision) {
         return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
           error: 'codex_input_ownership_changed', manualTakeover: true };
@@ -29689,7 +29796,8 @@ async function safePasteAndSubmit(term, content, options = {}) {
       if (!preparationWaited) preparationIntent = result.intent;
       preparationWaited = true;
       const prepared = await waitForCodexInputPreparation(operationTabId, term, {
-        deadline: preparationDeadline, intent: preparationIntent, handoffId: options.handoffId,
+        deadline: Math.min(preparationDeadline, operation.preparation?.deadlineAt ?? Infinity),
+        intent: preparationIntent, handoffId: options.handoffId,
       });
       if (prepared.success !== true) { result = prepared; break; }
       // No reservation, image staging, paste or Enter has occurred. The same
@@ -29699,8 +29807,13 @@ async function safePasteAndSubmit(term, content, options = {}) {
     result = resolveSafePasteFailureAfterWrite(error, term, options, operation);
   }
   const finish = async () => {
-    try { return await finishSafePasteAfterWrite(term, content, options, operation, result); }
-    catch (error) { return resolveSafePasteFailureAfterWrite(error, term, options, operation); }
+    try {
+      // The caller has now left both the existing PTY serializer and, for a
+      // settings transaction, its global settings queue. Resume the same
+      // prepared closure; never restage images or reserve a second revision.
+      if (result?.continuePreparation) result = await result.continuePreparation();
+      return await finishSafePasteAfterWrite(term, content, options, operation, result);
+    } catch (error) { return resolveSafePasteFailureAfterWrite(error, term, options, operation); }
   };
   if (options.deferPostWriteResolution === true) {
     return { submitted: result?.submitted, enterWritten: operation.submitted === true,
@@ -30162,6 +30275,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   let codexImagePasteSegments = null;
   let codexImageRequestProjection = null;
   let pasteBusyPublished = false;
+  let pasteBusyPhase = null;
   let confirmedClaudeAuditResult = null;
   let claudeAuditBoundary = null;
   let claudeHookRouteProof = null;
@@ -30193,7 +30307,17 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       pasteWritten, enterWritten: false, draftPasteRejected: true,
       error: validation.reason, rejectionStage: stage };
   };
+  const preparation = sendOperationContext?.preparation
+    || readAgentSendPreparation(agentSendReceiptStore, broadcastTabId, options, codexStartupFrameWait);
   const destinationFailure = () => {
+    // After possible Enter, outcome reconciliation owns the receipt. The
+    // preparation deadline only revokes additional writes, never that fact.
+    const expired = !submitAttempted && preparation?.failure(pasteWritten);
+    if (expired) return expired;
+    if (!submitAttempted && codexStartupFrameWait && Date.now() >= codexStartupFrameWait.deadlineAt) {
+      return { success: false, accepted: false, submitted: false, pasteWritten, enterWritten: false,
+        status: 'not-submitted', code: 'agent_send_preparation_expired', error: 'agent_send_preparation_expired' };
+    }
     const executionFailure = agentSendExecutionFailure(broadcastTabId, term, writeExecutionIdentity,
       { pasteWritten, stage: pasteWritten ? 'before-enter' : 'before-paste' });
     if (executionFailure) return executionFailure;
@@ -30261,8 +30385,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     sendOperationContext.sendAttemptId = sendAttemptId;
   }
   const emitBusy = (busy, phase = busy ? 'sending' : 'idle') => {
-    if (pasteBusyPublished === busy) return;
+    if (pasteBusyPublished === busy && pasteBusyPhase === phase) return;
     pasteBusyPublished = busy;
+    pasteBusyPhase = phase;
     if (!broadcastTabId) {
       console.warn(logPrefix + ' [PasteBusy] no-tab busy=' + busy + ' termPid=' + (term && term.pid ? term.pid : 'unknown'));
       return;
@@ -30279,7 +30404,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       });
     }
   };
-  emitBusy(true, 'sending');
+  let preparationDeferred = false, cleanupPrepared;
+  let preparedCleanupDone = false;
+  emitBusy(true, preparation ? 'preparing' : 'sending');
   try {
   const draftAdmissionFailure = draftPasteFailure('write-owner-admission');
   if (draftAdmissionFailure) return draftAdmissionFailure;
@@ -30803,6 +30930,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     await drainPtyData(term, 150, 600);
   }
 
+  // All staging above belongs to this single closure, including owned assets,
+  // provisional submit authority and the reserved input revision.
+  const writePrepared = async () => {
+  const boundaryFailure = destinationFailure();
+  if (boundaryFailure) return boundaryFailure;
   const renderTimes = [];
   let pasteRenderAck = null;
 
@@ -30831,38 +30963,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         manualTakeover: true,
       };
     }
-    const draftProbeInputRevision = getTerminalInputRevision(broadcastTabId);
-    const beforeDraft = await requestTerminalCodexDraftState(
-      mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
-      broadcastTabId,
-      'codex-pre-submit-before-paste',
-      700,
-      {
-        waitFor: false,
-        waitTimeoutMs: 2500,
-        waitOnUnknownOnly: true,
-        mergeRendererPositive: true,
-        startupFrameWait: codexStartupFrameWait,
-        codexStartupFrameWaitId: options.codexStartupFrameWaitId,
-        handoffId, attemptId: sendAttemptId,
-        isCancelled: exactSendCancellationRequested,
-      },
-    );
-    const afterDraftProbeInputRevision = getTerminalInputRevision(broadcastTabId);
-    if (
-      afterDraftProbeInputRevision !== draftProbeInputRevision
-      || (
-        expectedInputRevision !== null
-        && afterDraftProbeInputRevision !== expectedInputRevision
-      )
-    ) {
-      return {
-        success: false,
-        error: 'codex_input_ownership_changed',
-        submitted: false,
-        manualTakeover: true,
-        codexDraftGuard: beforeDraft || null,
-      };
+    // This read is synchronous: no open/unflushed wait may retain the writer
+    // lock. A wake only schedules a recheck here; it does not authorize paste.
+    const beforeDraft = getHeadlessCodexDraftState(broadcastTabId, 'codex-pre-submit-before-paste');
+    if (!beforeDraft?.success || beforeDraft.hasDraft === null) {
+      return { waitForComposerPreparation: true };
     }
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexDraftGuard] before-paste success=' + !!beforeDraft?.success
       + ' hasDraft=' + beforeDraft?.hasDraft
@@ -31190,6 +31295,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       });
     }
     try {
+      emitBusy(true, 'sending');
       term.write(payload);
       if (options.claudeSettingEvidenceToken) claudeSettingEvidence.markWritten(options.claudeSettingEvidenceToken, 'paste');
     } catch (error) {
@@ -31980,7 +32086,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           sendOperationContext.enterAttempted = true;
           sendOperationContext.pasteWritten = pasteWritten;
         }
-        term.write(submitSequence);
+        writeHistorySendEnter(term, submitSequence, { tabId: broadcastTabId, handoffId, sendOperationKey, sendAttemptId });
         // Physical fact FIRST: receipt persistence, settings proof, telemetry
         // and audit projection below may throw after these bytes were written.
         if (sendOperationContext) sendOperationContext.submitted = true;
@@ -32150,6 +32256,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
               === Number(auditResult.retryInputRevision)
             && stagedClaudeAudit.finished !== true
             && stagedClaudeAudit.enterRetryCount === 0
+            && (!preparation || preparation.remainingMs() > 0)
             && !exactSendCancellationRequested()
             && aiStoppingTabs.get(broadcastTabId)?.toolType !== 'claude';
           if (retryIdentityCurrent) {
@@ -32310,7 +32417,43 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     ...(confirmedClaudeAuditResult ? { pasteAudit: confirmedClaudeAuditResult } : {}),
   };
 
+  };
+  const physical = await writePrepared();
+  if (!physical?.waitForComposerPreparation) return physical;
+  preparationDeferred = true;
+  return deferPreparedInput({
+    wait: async () => {
+      const failure = destinationFailure();
+      if (failure) return failure;
+      if (exactSendCancellationRequested()) return cancelledSendResult('preparing-composer');
+      const currentOwner = () => getTerminalInputRevision(broadcastTabId) === expectedInputRevision
+        && !agentSendExecutionFailure(broadcastTabId, term, writeExecutionIdentity,
+          { stage: 'preparing-composer', checkMirror: true });
+      const proof = await requestTerminalCodexDraftState(
+        mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+        broadcastTabId, 'codex-pre-submit-before-paste', 700,
+        { waitFor: false, waitTimeoutMs: 2500, waitOnUnknownOnly: true, mergeRendererPositive: true,
+          startupFrameWait: codexStartupFrameWait, codexStartupFrameWaitId: options.codexStartupFrameWaitId,
+          handoffId, attemptId: sendAttemptId, sendOperationKey,
+          isOwnerCurrent: currentOwner, isCancelled: exactSendCancellationRequested },
+      );
+      const after = destinationFailure();
+      if (after) return after;
+      if (exactSendCancellationRequested()) return cancelledSendResult('prepared-composer');
+      if (currentOwner() && proof?.success === true && proof.hasDraft === false) return { success: true };
+      return { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+        status: 'not-submitted', error: proof?.hasDraft === true
+          ? 'codex_existing_draft_before_paste' : 'codex_draft_state_unknown_before_paste',
+        codexDraftGuard: proof };
+    },
+    resume: () => withPtyWriteLock(term, writePrepared, sendOperationContext),
+    cleanup: () => cleanupPrepared(),
+  });
+
   } finally {
+    cleanupPrepared = () => {
+    if (preparedCleanupDone) return;
+    preparedCleanupDone = true;
     try {
     if (stagedCodexAudit
       && hasPendingCodexPasteAudit(broadcastTabId, stagedCodexAudit)
@@ -32409,6 +32552,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       // or its UI spinner. Delivery remains attached to the same attempt above.
       emitBusy(false, 'idle');
     }
+    };
+    if (!preparationDeferred) cleanupPrepared();
   }
 }
 
@@ -52537,13 +52682,17 @@ async function ensureCodexInputReadyForExternalPrompt(tabId, {
   const identity = sendExecutionIdentity || captureAgentInputIdentity(tabId, terminal);
   const startup = startupFrameWait !== undefined ? startupFrameWait
     : captureCodexSendStartupFrameWait(tabId, codexStartupFrameWaitId);
+  const preparation = readAgentSendPreparation(agentSendReceiptStore, tabId,
+    { handoffId, attemptId, sendOperationKey }, startup);
   const cancelled = () => agentSendCancellations.isCancelled(tabId, handoffId, attemptId)
     || !!(sendOperationKey && agentSendReceiptStore.isDeliveryCancelled?.(sendOperationKey, attemptId));
   const current = () => !agentSendExecutionFailure(tabId, terminal, identity)
+    && (!preparation || preparation.isCurrent())
     && (!codexStartupFrameWaitId || startup?.launchId === codexStartupFrameWaitId)
     && (!startup || codexSendStartupFrameWaitIsCurrent(tabId, startup)) && !cancelled();
-  const budget = startup ? Math.max(0, startup.deadlineAt - startedAt)
-    : Math.max(1000, Number(timeoutMs) || CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS);
+  const budget = Math.min(preparation?.remainingMs() ?? Infinity,
+    startup ? Math.max(0, startup.deadlineAt - startedAt)
+      : Math.max(1000, Number(timeoutMs) || CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS));
   // Subscribe BEFORE the first read. The same transaction owns initial reads,
   // the existing startup poke and every wake; no await gets a renewed clock.
   // Readiness controls have their own input owner. This fence follows their
@@ -52570,6 +52719,8 @@ async function ensureCodexInputReadyForExternalPrompt(tabId, {
   let state = null, poke = null, outcome = null;
   const settled = result => { outcome = result; return result; };
   const resultFor = () => {
+    const expired = preparation?.failure();
+    if (expired) return expired;
     if (state?.manualActionRequired) return { success: false, error: 'codex_manual_action_required',
       reason: state.manualActionType || state.lastNotReady?.reason || 'manual-action-required',
       blockers: state.lastNotReady?.blockers || null, ready: state,
@@ -52602,6 +52753,8 @@ async function ensureCodexInputReadyForExternalPrompt(tabId, {
   } catch (error) {
     // A deadline is not a ready proof. In particular do not start another
     // asynchronous process/frame lookup or startup writer from its callback.
+    const expired = preparation?.failure();
+    if (expired) return settled(expired);
     const wasCancelled = cancelled() || error?.reason === 'send-cancelled';
     const superseded = !wasCancelled && (!current() || error?.reason === 'owner-changed');
     const code = wasCancelled ? 'agent_send_cancelled'
@@ -64021,19 +64174,30 @@ function readCodexOwnedModelInputDecision(term, receipt, { observePaste = false 
     : { action: 'wait', reason: owned.reason, frameEvidence };
 }
 
-async function waitForCodexOwnedModelPaste(tabId, term, receipt) {
-  const observation = createMainAgentInputObservation(tabId, 'codex', 2500, { diagnostic: receipt.diagnostic });
+async function waitForCodexOwnedModelPaste(tabId, term, receipt, options = {}) {
+  const preparation = options.preparation || null;
+  const observation = createMainAgentInputObservation(tabId, 'codex', preparation ? preparation.remainingMs() : 2500,
+    { ...options, diagnostic: receipt.diagnostic,
+      isOwnerCurrent: () => codexSettingsMutationQueue.getUnsubmittedInput(term) === receipt
+        && preparation?.isCurrent() !== false });
   const probe = () => {
     const decision = readCodexOwnedModelInputDecision(term, receipt, { observePaste: true });
     receipt.diagnostic?.record('check', { action: decision.action, reason: decision.reason,
       ...decision.frameEvidence, ...decision.controlEvidence, wakeRevision: observation.revision() });
-    return { ...decision, accepted: decision.action === 'clear'
+    const foreign = preparation && decision.reason === 'draft-changed-after-slash-insert';
+    return { ...decision, ...(foreign ? { action: 'foreign' } : {}), accepted: decision.action === 'clear'
       && !receipt.recoveryPending && receipt.clearWriteSeq == null };
   };
   const report = await observeAgentInput({ observation, probe, finalProbe: probe,
     isSettled: result => result?.accepted === true,
     shouldWait: result => result?.action === 'wait',
   });
+  const failure = preparation?.failure(true);
+  if (failure) {
+    report.value = null; report.reason = failure.code;
+    report.observation = { ...report.observation,
+      status: failure.code === 'agent_send_preparation_expired' ? 'expired' : 'superseded' };
+  }
   const decision = report.value || report.lastObservation;
   receipt.diagnostic?.record('observation-result', { ...report.observation, checks: report.checks,
     reason: report.reason, accepted: report.value?.accepted === true });
@@ -64465,12 +64629,14 @@ async function submitCodexCompactSlashCommandWithProof({
   timeoutMs = 5000,
   beforeEnter = null,
   diagnostic = null,
+  preparation = null,
+  sendTimingIdentity = null,
 }) {
   const mirror = getHeadlessTerminalMirror(tabId);
   let baselineSnapshot = null;
   let baselineFrameProof = null;
   if (mirror) {
-    const flushed = await flushHeadlessTerminalMirror(tabId);
+    const flushed = preparation ? { success: true } : await flushHeadlessTerminalMirror(tabId);
     if (flushed?.success === true && getHeadlessTerminalMirror(tabId) === mirror) {
       baselineSnapshot = getHeadlessVisibleBufferSnapshot(
         tabId,
@@ -64484,6 +64650,7 @@ async function submitCodexCompactSlashCommandWithProof({
       });
     }
   }
+  if (preparation && baselineFrameProof?.owned !== true) return { waitForComposerPreparation: true };
   const afterWriteSeq = Number.isFinite(Number(baselineSnapshot?.writeSeq))
     ? Number(baselineSnapshot.writeSeq)
     : null;
@@ -64527,8 +64694,9 @@ async function submitCodexCompactSlashCommandWithProof({
     });
     diagnostic?.record('enter-attempt', { ordinal });
     try {
-      if (diagnostic) diagnostic.withWrite(term, 'enter', ordinal, () => term.write('\r'));
-      else term.write('\r');
+      const write = () => writeHistorySendEnter(term, '\r', sendTimingIdentity || {});
+      if (diagnostic) diagnostic.withWrite(term, 'enter', ordinal, write);
+      else write();
       diagnostic?.record('enter-returned', { ordinal });
     }
     catch (error) {
@@ -64654,6 +64822,10 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
     tabId = null,
     readDraftState = null,
     compactOperationId = null,
+    preparation = null,
+    writeOperation = null,
+    handoffId = null,
+    sendAttemptId = null,
   } = options;
   if (tabId && codexSettingsMutationQueue.getUnsubmittedInput(term)) {
     const recovered = await settleCodexOwnedModelInput(tabId, term);
@@ -64709,9 +64881,7 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   // Other slash commands keep their existing protocol. These controls have a short,
   // exactly owned composer value: an unrelated busy render/sync marker is not
   // its acknowledgement and must not authorize Enter.
-  const frame = modelInputReceipt
-    ? await waitForCodexOwnedModelPaste(tabId, term, modelInputReceipt)
-    : await inputFrame;
+  const finishInput = async frame => {
   if (frame.ownerChanged) {
     modelInputReceipt?.requestRecovery();
     return { success: false, submitted: false, slashInserted: true, pasteWritten: true, enterWritten: false,
@@ -64814,7 +64984,10 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
       timeoutMs: Math.max(5000, Number(submitTimeoutMs) || 0),
       beforeEnter: () => { if (modelInputReceipt) releaseCodexOwnedModelInput(term, modelInputReceipt, 'enter-armed'); },
       diagnostic: modelInputReceipt?.diagnostic,
+      preparation,
+      sendTimingIdentity: { tabId, handoffId, sendAttemptId, sendOperationKey: writeOperation?.sendOperationKey },
     });
+    if (compactResult?.waitForComposerPreparation) return compactResult;
     if (compactResult?.submitted !== true && compactResult?.success !== true
       && compactResult?.deliveryUnconfirmed !== true) {
       const rollback = await rollbackCodexOwnedSlashDraft({
@@ -64848,8 +65021,10 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   if (modelInputReceipt) releaseCodexOwnedModelInput(term, modelInputReceipt, 'enter-armed');
   modelInputReceipt?.diagnostic?.record('enter-attempt', { ordinal: 1 });
   try {
-    if (modelInputReceipt?.diagnostic) modelInputReceipt.diagnostic.withWrite(term, 'enter', 1, () => term.write('\r'));
-    else term.write('\r');
+    const write = () => writeHistorySendEnter(term, '\r', { tabId, handoffId, sendAttemptId,
+      sendOperationKey: writeOperation?.sendOperationKey });
+    if (modelInputReceipt?.diagnostic) modelInputReceipt.diagnostic.withWrite(term, 'enter', 1, write);
+    else write();
     modelInputReceipt?.diagnostic?.record('enter-returned', { ordinal: 1 });
   }
   catch (error) { modelInputReceipt?.diagnostic?.record('enter-threw', { ordinal: 1 }); throw error; }
@@ -64873,6 +65048,37 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   }
   console.log(logPrefix + ' sent slash command ' + JSON.stringify(text) + ' after render +' + (Date.now() - t0) + 'ms');
   return { success: true, submitted: true };
+  };
+  if (preparation && text === '/compact' && modelInputReceipt) {
+    let observed;
+    return deferPreparedInput({
+      wait: async () => {
+        observed = await waitForCodexOwnedModelPaste(tabId, term, modelInputReceipt,
+          { preparation, handoffId, attemptId: sendAttemptId });
+        // Even a refusal needs the original cleanup, under the write owner.
+        // This signals observation completion only; resume proves permission.
+        return { success: true };
+      },
+      resume: () => withPtyWriteLock(term, () => {
+        const failure = preparation.failure(true);
+        if (failure) observed = { ...observed, timedOut: true,
+          ownerChanged: failure.code !== 'agent_send_preparation_expired' };
+        if (!observed.ownerChanged && !observed.timedOut) {
+          const decision = readCodexOwnedModelInputDecision(term, modelInputReceipt, { observePaste: true });
+          if (decision.action === 'wait' && decision.reason !== 'draft-changed-after-slash-insert') {
+            return { waitForComposerPreparation: true };
+          }
+          if (decision.action !== 'clear') observed = { ...observed, timedOut: true,
+            ownerChanged: ['retire', 'retired'].includes(decision.action) };
+        }
+        return finishInput(observed);
+      }, writeOperation),
+    });
+  }
+  const frame = modelInputReceipt
+    ? await waitForCodexOwnedModelPaste(tabId, term, modelInputReceipt)
+    : await inputFrame;
+  return finishInput(frame);
 }
 
 function parseCodexServiceTierFeedback(text) {
@@ -66307,6 +66513,10 @@ async function sendCodexLiveSlashCommand(term, {
   readDraftState = null,
   captureDraftSnapshot = null,
   compactOperationId = null,
+  preparation = null,
+  writeOperation = null,
+  handoffId = null,
+  sendAttemptId = null,
 }) {
   const logPrefix = '[Codex:Slash:' + tabId + ']';
   const text = String(command || '').trim();
@@ -66360,20 +66570,8 @@ async function sendCodexLiveSlashCommand(term, {
   }
 
   let outcome = null;
+  const finishSlash = async slashResult => {
   try {
-    const isFastCommand = /^\/fast(?:\s|$)/i.test(text);
-    const slashResult = await sendCodexSlashCommand(term, text, logPrefix + ':command', {
-      clearStrategy: 'line',
-      waitForSubmitFrame: shouldRestoreDraft || isFastCommand,
-      submitTimeoutMs: isFastCommand ? 3500 : 2500,
-      submitPredicate: isFastCommand
-        ? (clean) => !!parseCodexServiceTierFeedback(clean)
-        : null,
-      writeGuard,
-      tabId,
-      readDraftState,
-      compactOperationId,
-    });
     if (slashResult.submitted === true) {
       slashSubmitted = true;
     }
@@ -66426,6 +66624,28 @@ async function sendCodexLiveSlashCommand(term, {
     }
   }
   return outcome || { success: false, error: 'Codex slash command did not produce a result' };
+  };
+  try {
+    const isFastCommand = /^\/fast(?:\s|$)/i.test(text);
+    const slashResult = await sendCodexSlashCommand(term, text, logPrefix + ':command', {
+      clearStrategy: 'line',
+      waitForSubmitFrame: shouldRestoreDraft || isFastCommand,
+      submitTimeoutMs: isFastCommand ? 3500 : 2500,
+      submitPredicate: isFastCommand
+        ? (clean) => !!parseCodexServiceTierFeedback(clean)
+        : null,
+      writeGuard,
+      tabId,
+      readDraftState,
+      compactOperationId, preparation, writeOperation, handoffId, sendAttemptId,
+    });
+    if (slashResult?.continuePreparation) return mapPreparedInput(slashResult,
+      value => withPtyWriteLock(term, () => finishSlash(value), writeOperation));
+    return await finishSlash(slashResult);
+  } catch (error) {
+    return finishSlash({ success: false, error: error?.message || String(error), applied: slashSubmitted });
+  }
+
 }
 
 // Gemini Sniper Watcher: watch for new session file creation when gemini starts
@@ -67920,6 +68140,13 @@ async function readCodexSettingsForSend(tabId, scope) {
 const codexSettingsSendRuntime = createCodexSettingsSendRuntime({
   readScope: readCodexSettingsSendScope,
   readSettings: readCodexSettingsForSend,
+  beginPreparation: request => {
+    const local = request.localCommand;
+    if (!local || String(local.command || '').trim() !== '/compact') return null;
+    const startup = captureCodexSendStartupFrameWait(request.tabId, local.codexStartupFrameWaitId || null);
+    return readAgentSendPreparation(agentSendReceiptStore, request.tabId, local, startup)
+      || createInputPreparation(Math.min(Date.now() + PREPARATION_MS, startup?.deadlineAt ?? Infinity));
+  },
   withSettingsQueue: work => codexSettingsMutationQueue.run(work),
   withWriteLock: withPtyWriteLock,
   selectSettings: (sender, request, owner) => executeCodexSelectModelEffortRequest(sender, request, owner),
@@ -67973,11 +68200,14 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
   }
   const sendExecutionIdentity = captureAgentInputIdentity(tabId, term);
   const codexStartupFrameWait = captureCodexSendStartupFrameWait(tabId, options.codexStartupFrameWaitId || null);
-  const requestFailure = () => agentSendExecutionFailure(tabId, term, sendExecutionIdentity,
+  const preparation = readAgentSendPreparation(agentSendReceiptStore, tabId, options, codexStartupFrameWait);
+  const requestFailure = () => preparation?.failure() || agentSendExecutionFailure(tabId, term, sendExecutionIdentity,
     { stage: 'send-command-preparation' })
     || (agentSendCancellations.isCancelled(tabId, handoffId, sendAttemptId)
       ? { success: false, submitted: false, pasteWritten: false, enterWritten: false,
         cancelled: true, code: 'agent_send_cancelled', error: 'agent_send_cancelled' } : null);
+  const beforeComposerFailure = requestFailure();
+  if (beforeComposerFailure) return beforeComposerFailure;
   const composerPrepared = await prepareCodexMainComposerForSend(tabId, options);
   const afterComposerFailure = requestFailure();
   if (afterComposerFailure) return afterComposerFailure;
@@ -68072,7 +68302,7 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
     ));
     const result = hasSettings
       ? await codexSettingsSendRuntime.sendPrompt({
-          tabId, content: command, sender: _event.sender,
+          tabId, content: command, sender: _event.sender, preparation,
           model: options.model, effort: options.effort,
           expectedTarget: options.expectedTarget || null,
           expectedWriterSessionId: options.expectedWriterSessionId || null,
@@ -68108,6 +68338,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
   visualSource = '',
   visualPreview = '',
   settingsControl = 'model',
+  preparation = null,
 } = {}, ptyWriteOwner = null) {
   const expectedSettingsWriterSessionId = typeof expectedWriterSessionId === 'string'
     ? (expectedWriterSessionId.trim() || null)
@@ -68298,6 +68529,8 @@ async function executeCodexSelectModelEffortRequest(sender, {
           };
         };
         const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
+          const expired = typeof preparation?.failure === 'function' ? preparation.failure() : null;
+          if (expired) return { allowed: false, reason: expired.code };
           const currentState = terminalCommandState.get(tabId) || null;
           const writerTransition = readWriterTransition();
           if (writerTransition.allowed !== true) {
@@ -68740,6 +68973,8 @@ async function executeCodexLiveSlashCommandRequest({
   turnBusy = false,
   expectedTarget = null,
   settingsWriteGuard = null,
+  codexStartupFrameWaitId = null,
+  preparation: suppliedPreparation = null,
 } = {}, ptyWriteOwner = null) {
   console.log('[codex:send-live-slash-command] Received: tabId=' + tabId + ' command=' + JSON.stringify(command || '') + ' source=' + (source || '-') + ' queue=' + (queue === true) + ' statusAtSend=' + (statusAtSend || '-') + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)) + ' turnBusy=' + turnBusy);
   const term = terminals.get(tabId);
@@ -68765,6 +69000,7 @@ async function executeCodexLiveSlashCommandRequest({
   let preparationIntent;
   const slashOperation = {
     kind: 'codex-live-slash-command',
+    sendOperationKey,
     source: 'codex-send-live-slash-command',
     tabId,
     submitted: false,
@@ -68780,9 +69016,25 @@ async function executeCodexLiveSlashCommandRequest({
 
   const prev = codexPickerQueue.get(tabId) || Promise.resolve();
   const execute = async () => {
+    const startup = captureCodexSendStartupFrameWait(tabId, codexStartupFrameWaitId);
+    const preparation = String(command || '').trim() === '/compact'
+      ? (typeof suppliedPreparation?.failure === 'function' ? suppliedPreparation : null)
+        || readAgentSendPreparation(agentSendReceiptStore, tabId, { handoffId, sendAttemptId, sendOperationKey }, startup)
+        || createInputPreparation(Math.min(Date.now() + PREPARATION_MS, startup?.deadlineAt ?? Infinity), () => {
+          if (handoffId && agentSendCancellations.isCancelled(tabId, handoffId, sendAttemptId)) return 'agent_send_cancelled';
+          if (terminals.get(tabId) !== term || getTerminalLifecycleGeneration(tabId) !== preparationLifecycle
+            || getTerminalStopRevision(tabId) !== preparationStopRevision
+            || Number(terminalCommandState.get(tabId)?.runSeq || 0) !== expectedRunSeq
+            || aiStoppingTabs.has(tabId)) return 'agent_send_preparation_superseded';
+          return null;
+        }) : null;
+    slashOperation.preparation = preparation;
     try {
+      let activeWriteOwner = ptyWriteOwner;
       const perform = () => withPtyWriteLock(term, async () => {
         let compactPendingOperation = null;
+        const expired = preparation?.failure();
+        if (expired) return expired;
         if (preparationIntent !== undefined) {
           const current = getCodexModelEffortIntentRecord(tabId);
           if (current?.revision !== preparationIntent?.revision
@@ -68800,7 +69052,7 @@ async function executeCodexLiveSlashCommandRequest({
           return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
             error: 'codex_input_ownership_changed', admissionRejected: true, manualTakeover: true };
         }
-        if (ptyWriteOwner === null && (
+        if (activeWriteOwner === null && (
           codexSettingsMutationQueue.getUnsubmittedInput(term)
           || codexModelEffortIntentReconcileInflight.has(tabId))) {
           return { waitForLocalPreparation: true, intent: getCodexModelEffortIntentRecord(tabId) };
@@ -68809,6 +69061,10 @@ async function executeCodexLiveSlashCommandRequest({
           ? await ensureCodexSubmissionWatcher(tabId, terminalProjects.get(tabId), 'local-command-target')
           : null;
         const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
+          const expired = preparation?.failure(true);
+          if (expired) return { allowed: false, reason: expired.code };
+          if (getTerminalLifecycleGeneration(tabId) !== preparationLifecycle
+            || getTerminalStopRevision(tabId) !== preparationStopRevision) return { allowed: false, reason: 'codex_input_ownership_changed' };
           const currentState = terminalCommandState.get(tabId) || null;
           const settingsCheck = typeof settingsWriteGuard === 'function' ? settingsWriteGuard() : null;
           if (settingsCheck && settingsCheck.allowed !== true) return settingsCheck;
@@ -68861,7 +69117,9 @@ async function executeCodexLiveSlashCommandRequest({
         // the composer at the exact write boundary and reject if the user
         // typed while that asynchronous probe was in flight.
         const draftProbeInputRevision = getTerminalInputRevision(tabId);
-        const freshDraft = await requestTerminalCodexDraftState(
+        const freshDraft = preparation
+          ? getHeadlessCodexDraftState(tabId, 'live-slash-command-write-boundary')
+          : await requestTerminalCodexDraftState(
           sender,
           tabId,
           'live-slash-command-write-boundary',
@@ -68885,6 +69143,7 @@ async function executeCodexLiveSlashCommandRequest({
           && (freshDraft.hasDraft === true || freshDraft.hasDraft === false)
           ? freshDraft.hasDraft
           : null;
+        if (preparation && freshHasDraft === null) return { waitForComposerPreparation: true };
         const finalAdmission = readAdmission(freshHasDraft, expectedInputRevision);
         if (!finalAdmission.allowed) {
           console.warn('[codex:send-live-slash-command] admission rejected tab='
@@ -69000,7 +69259,9 @@ async function executeCodexLiveSlashCommandRequest({
             },
           ),
           compactOperationId: compactPendingOperation?.operationId || null,
+          preparation, writeOperation: slashOperation, handoffId, sendAttemptId,
         });
+        const finishResult = result => {
         if (result && typeof result === 'object') {
           result.localSlashCommand = true;
           result.queued = queuedHistoryCommand;
@@ -69058,18 +69319,50 @@ async function executeCodexLiveSlashCommandRequest({
           }
         }
         return result;
-      }, slashOperation, ptyWriteOwner);
-      for (;;) {
-        const physical = await perform();
-        if (!physical?.waitForLocalPreparation) return physical;
-        if (preparationIntent === undefined) preparationIntent = physical.intent || null;
-        const prepared = await waitForCodexInputPreparation(tabId, term, {
-          deadline: preparationDeadline, intent: preparationIntent, handoffId,
-        });
-        if (prepared.success !== true) return prepared;
-        // No bytes were written. Re-enter the SAME serializer and repeat the
-        // existing target/run/input/draft guards, without renewing the deadline.
-      }
+        };
+        return result?.continuePreparation ? mapPreparedInput(result, finishResult) : finishResult(result);
+      }, slashOperation, activeWriteOwner);
+      const finishPhysical = async first => {
+        activeWriteOwner = null; // An outer settings owner has released before this continuation.
+        let physical = first;
+        for (;;) {
+          if (physical?.waitForComposerPreparation) {
+            const proof = await requestTerminalCodexDraftState(sender, tabId,
+              'agent-send-preflight:compact-before-insert', 700, {
+                waitFor: false, waitOnUnknownOnly: true, mergeRendererPositive: true,
+                preparation, handoffId, attemptId: sendAttemptId, sendOperationKey,
+                startupFrameWait: startup, codexStartupFrameWaitId,
+                isOwnerCurrent: () => terminals.get(tabId) === term
+                  && getTerminalInputRevision(tabId) === requestedInputRevision
+                  && getTerminalLifecycleGeneration(tabId) === preparationLifecycle
+                  && getTerminalStopRevision(tabId) === preparationStopRevision,
+              });
+            const expired = preparation?.failure();
+            if (expired) return expired;
+            if (proof?.success !== true || typeof proof.hasDraft !== 'boolean') return {
+              success: false, submitted: false, pasteWritten: false, enterWritten: false,
+              error: proof?.error || 'codex_input_ownership_changed',
+            };
+          } else if (physical?.waitForLocalPreparation) {
+            if (preparationIntent === undefined) preparationIntent = physical.intent || null;
+            const prepared = await waitForCodexInputPreparation(tabId, term, {
+              deadline: Math.min(preparationDeadline, preparation?.deadlineAt ?? Infinity),
+              intent: preparationIntent, handoffId,
+            });
+            if (prepared.success !== true) return prepared;
+          } else {
+            return physical?.continuePreparation ? physical.continuePreparation() : physical;
+          }
+          // Nothing inserted yet: re-enter the same operation's exact guards.
+          // Once inserted, its separate continuation retains that single paste.
+          physical = await perform();
+        }
+      };
+      const physical = await perform();
+      if (!physical?.waitForComposerPreparation && !physical?.waitForLocalPreparation
+        && !physical?.continuePreparation) return physical;
+      return ptyWriteOwner !== null
+        ? { finishAfterPtyWrite: () => finishPhysical(physical) } : finishPhysical(physical);
     } catch (error) {
       console.error('[codex:send-live-slash-command] Error:', error);
       return { success: false, error: error.message };

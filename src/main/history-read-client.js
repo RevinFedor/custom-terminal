@@ -40,6 +40,8 @@ class HistoryReadClient {
     this.diagnosticSlowMs = Number.isFinite(config.diagnosticSlowMs) ? Math.max(0, config.diagnosticSlowMs) : 100;
     this.diagnosticCounters = { requests: 0, responses: 0, failures: 0, callErrors: 0, retries: 0, cancellations: 0, invalidations: 0, workerDeaths: 0 };
     this.sourceEpochs = new Int32Array(new SharedArrayBuffer(SLOTS * 4));
+    this.sourceRewriteEpochs = new Int32Array(new SharedArrayBuffer(SLOTS * 4));
+    this.snapshotAdmissions = new WeakMap();
     this.sourceEpochSlots = new Map();
     this.invalidations = []; this.invalidationSequence = 0;
     this.unsubscribe = codexData?._api?.observeCodexReadInvalidation?.(event => this.invalidate(event));
@@ -62,7 +64,8 @@ class HistoryReadClient {
     const worker = new Worker(path.join(__dirname, 'history-read-worker.js'), {
       workerData: { ...this.config, memoryBudgetMb: this.getMemoryBudgetMb?.() || this.config.memoryBudgetMb || 400,
         diagnosticClientId: this.clientId, diagnosticGeneration: generation, diagnosticSlowMs: this.diagnosticSlowMs,
-        ownership: getCodexProcessActionOwnershipSnapshot(), sourceEpochBuffer: this.sourceEpochs.buffer },
+        ownership: getCodexProcessActionOwnershipSnapshot(), sourceEpochBuffer: this.sourceEpochs.buffer,
+        sourceRewriteEpochBuffer: this.sourceRewriteEpochs.buffer },
     });
     this.worker = worker;
     this.diagnose('worker-start', { workerGeneration: generation, startAbs: started.abs, startPerf: started.perf,
@@ -156,6 +159,10 @@ class HistoryReadClient {
     Atomics.add(this.sourceEpochs, 0, 1);
     const slot = this.sourceEpochSlots.get(event.filePath);
     if (slot) Atomics.add(this.sourceEpochs, slot, 1);
+    if (!event.filePath || event.sourceAppend !== true || event.readRefresh === true) {
+      Atomics.add(this.sourceRewriteEpochs, 0, 1);
+      if (slot) Atomics.add(this.sourceRewriteEpochs, slot, 1);
+    }
     this.invalidations.push({ ...event, sequence: ++this.invalidationSequence });
     if (this.invalidations.length > 2048) this.invalidations.shift();
     this.count('invalidations');
@@ -195,13 +202,14 @@ class HistoryReadClient {
   async call(method, payload = {}, binary = false, preparedRewriteReceipt = null) {
     const call = { callId: ++this.callSequence };
     const started = stamp();
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const snapshot = method === 'readSessionSnapshot', attempts = snapshot ? 1 : 3;
+    for (let attempt = 0; attempt < attempts; attempt++) {
       call.attempt = attempt + 1;
       const before = this.invalidationSequence;
       let envelope;
       try { envelope = await this.request(method, payload, binary, call, preparedRewriteReceipt); }
       catch (error) {
-        if (attempt < 2 && (error.code === 'CODEX_SOURCE_READ_INVALIDATED'
+        if (attempt + 1 < attempts && (error.code === 'CODEX_SOURCE_READ_INVALIDATED'
           || error.code === 'ERR_WORKER_OUT_OF_MEMORY' || error.message.startsWith('history_worker_exit:'))) {
           this.count('retries'); this.diagnose('request-retry', { ...call, reason: errorReason(error), nextAttempt: attempt + 2 }); continue;
         }
@@ -223,10 +231,13 @@ class HistoryReadClient {
       }
       const sources = new Set(dependencies.map(source => source.filePath));
       const admissionFailure = () => {
-        if (dependencies.some(source => source.epoch !== Atomics.load(this.sourceEpochs, source.slot))) return 'source-epoch-invalidated';
+        if (snapshot && (this.workerGeneration !== envelope.reader?.generation || !this.worker)) return 'worker-generation-changed';
+        const epochs = snapshot ? this.sourceRewriteEpochs : this.sourceEpochs;
+        if (dependencies.some(source => source.epoch !== Atomics.load(epochs, source.slot))) return 'source-epoch-invalidated';
         if (this.invalidations.length && before < this.invalidations[0].sequence - 1) return 'invalidation-history-overflow';
         if (this.invalidations.some(e => e.sequence > before && (e.logicalSessionId !== undefined
-          ? e.logicalSessionId === payload.sessionId : !e.filePath || sources.has(e.filePath)))) return 'source-invalidation';
+          ? e.logicalSessionId === payload.sessionId : (!e.filePath || sources.has(e.filePath))
+            && !(snapshot && e.filePath && e.sourceAppend === true && e.readRefresh !== true)))) return 'source-invalidation';
         return null;
       };
       let failure = admissionFailure();
@@ -242,9 +253,13 @@ class HistoryReadClient {
         failure = admissionFailure();
         // Public freshness is bound to the reader that produced this result,
         // not whichever worker happens to exist when HTTP publishes it.
-        if (!failure) return method === 'getHistory' && payload.freshnessProof === true && !binary && result?.success
-          ? { ...result, freshnessReader: envelope.reader } : result;
+        if (!failure) {
+          if (snapshot && result?.success) this.snapshotAdmissions.set(result, admissionFailure);
+          return method === 'getHistory' && payload.freshnessProof === true && !binary && result?.success
+            ? { ...result, freshnessReader: envelope.reader } : result;
+        }
       }
+      if (snapshot) throw Object.assign(new Error('History snapshot invalidated before publication'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
       if (attempt < 2) this.count('retries');
       this.diagnose(attempt < 2 ? 'request-retry' : 'request-revoked', { ...call,
         reason: failure,
@@ -253,6 +268,10 @@ class HistoryReadClient {
     this.count('callErrors');
     this.diagnose('call-complete', { ...call, outcome: 'retry-exhausted', reason: 'source-changed-during-preparation', elapsedMs: performance.now() - started.perf });
     return { success: false, error: 'history_source_changed_during_preparation', entries: [] };
+  }
+  assertSnapshotCurrent(result) {
+    const guard = this.snapshotAdmissions.get(result);
+    if (!guard || guard()) throw Object.assign(new Error('History snapshot invalidated before publication'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
   }
   request(method, payload, binary = false, call = { callId: ++this.callSequence, attempt: 1 }, preparedRewriteReceipt = null) {
     const worker = this.start(); const id = ++this.sequence;

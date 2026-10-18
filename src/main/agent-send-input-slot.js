@@ -14,10 +14,18 @@ function classifyInputSlotRetirement(record, observation) {
   if (!record?.attemptId || !['audit-pending', 'delivery-unknown', 'enter-armed', 'confirmed'].includes(record.state)) {
     return { retire: false, reason: 'attempt-not-settled' };
   }
-  if (record.deliveryControl?.cancelledAt) return { retire: true, reason: 'user-cancelled-intent' };
+  const rendererLost = record.deliveryControl?.cancelledAt
+    && record.deliveryControl.reason === 'send-renderer-owner-lost';
+  if (record.deliveryControl?.cancelledAt && !rendererLost) {
+    // An automatic lost-renderer fence revokes future input only. It is not
+    // the user's explicit permission to move past an uncertain earlier Enter,
+    // but the existing independent physical absence/replacement proof remains valid.
+    return { retire: true, reason: 'user-cancelled-intent' };
+  }
   if (observation?.version !== 1 || observation.kind !== 'main-input-slot'
     || observation.tabId !== record.tabId || observation.known !== true
-    || observation.ownerStable !== true) return { retire: false, reason: 'input-owner-unknown' };
+    || observation.ownerStable !== true) return { retire: false,
+      reason: rendererLost ? 'renderer-lost-delivery-unknown' : 'input-owner-unknown' };
   if (observation.processStatus === 'absent') return { retire: true, reason: 'physical-process-absent' };
   if (observation.processStatus !== 'found' || observation.inputReady !== true) {
     return { retire: false, reason: 'current-input-not-ready' };

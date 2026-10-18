@@ -111,6 +111,17 @@ ref/truncated. Cold/unknown остаётся явным. Он не создаё�
 `wait_for_tab_response`. Полные границы — fact-session-history::Компактный пассивный
 снимок выбранных вкладок. Новый app handler требует обновления bundle, новый MCP
 wrapper — штатного refresh terminal-child после обновления его установленной копии.
+
+Для последних Codex user-итераций при busy есть отдельный `read_session_snapshot`
+(`sessionSnapshot.version:1` у `/overseer/capabilities`), до8 ходов, default5;
+`maxChars` до20000 отдельно для user/assistant. Возвращает cutoff/asOf, реальные
+prompt/partial answer, canonical refs, in_progress/responseComplete и coverage.
+Сохранный append после cutoff не требует idle/Stop или нового Send. Rewrite,
+resolver/view/owner changes отзывают результат. Это read-only snapshot одной
+попытки, не completion authority; новые app handler и MCP wrapper обновляются
+отдельно. Bounds декодирования и граница cold lineage —
+`fact-session-history.md::Снимок последних Codex-итераций во время busy`.
+
 Внутри полноценной Noted Terminal-сессии main передаёт MCP `NOTED_PARENT_PROJECT_ID`, `NOTED_PARENT_TAB_ID` и `NOTED_MAIN_PID`. Они приоритетнее cwd и активной вкладки UI: пользователь может смотреть другой проект, пока агент работает в фоне. `current_context` возвращает доказанную пару project/tab и известный sessionId; self-операции (`rename_tab`, `link_file`, `get_tab_plan`, `apply_tab_plan_changes`) принимают отсутствующий `tabId` как эту родительскую вкладку.
 
 Внешний клиент без parent env использует `list_projects` и передаёт явный `projectId`/`tabId`. `process.cwd()` остаётся fallback для старых callers, но не source of truth для собственной идентичности.
@@ -400,7 +411,7 @@ identity; отдельный GET в обычном пути не требует�
 передаёт `includeActivity:false` по умолчанию; явный forensic-вызов может включить его.
 
 `continue_external_research({previousRunId,...})` берёт у завершённого ChatGPT-run
-только сохранённый `conversationUrl` и прежние provider options; явный частичный
+сохранённый `conversationUrl`, exact SC job browser owner и прежние provider options; явный частичный
 options override накладывается поверх них, а не стирает модель/режим. Новое сообщение
 в том же разговоре всегда получает новый `runId` и новый `jobId`; старый ответ
 не может удовлетворить новый review. Локальные файлы передаются SC как
@@ -410,6 +421,17 @@ caller явно задаёт `mode:chat`, `temporaryChat:false`, `autoClose:true
 остаётся в истории, а закрывается лишь disposable browser-вкладка после локального
 save. `autoClose:false` нужен только по явному желанию оставить её открытой; оба варианта
 не меняют глобальный default SC Desktop.
+
+SOURCE browserSelection v1 добавляет top-level `browserId:"chrome"|"yandex"|UUID`
+к start/continue/import. Explicit требует поддерживающие App и SC до dispatch;
+options.browserId не fallback. Omitted NEW start остаётся default, continue всегда
+наследует доказанный previous-job UUID, legacy — только через capability-gated
+metadataOnly reader без restore/native calls. Proven offline нового выбранного
+профиля сохраняет тот же run в ожидании и один human-only Telegram outbox request,
+без model callback/auto-launch/смены account. Unknown/admitted не становятся no-submit.
+Подробности и границы account proof — `fact-оркестрация-вкладок.md::Browser-консультация
+как второй тип target`. Поддержка SOURCE не заменяет live schema/capability после
+обновления App, SC и долгоживущего Terminal MCP child.
 
 Повтор одного browser-запуска разрешён только с тем же `runId` и полностью тем
 же нормализованным запросом. После потери ACK или restart main сначала читает
@@ -594,6 +616,24 @@ snapshot запроса в SQLite `agent_send_queue`, связывая его с
 refs фиксируются при приёме; дальнейший input их не меняет. Очередь не зависит
 от смонтированной History. Ошибка сохранения не является ACK.
 
+Подготовка принятого Codex Send имеет один Main-issued срок 60s: начало — вход
+в ACTIVE HEAD executor до `prepareSend`, не enqueue/FIFO wait. Чтения/wakes,
+settings и возврат PTY lock срок не обновляют; cold использует минимум этого
+срока и original startup deadline. Незавершённый кадр сохраняет тот же H/O/A,
+frozen assets и reservation; continuation ждёт вне PTY/global settings queues,
+после возврата lock повторяет current proof. Готовый кадр отправляет сразу,
+streaming сам не запрещает steering. Stop/manual/owner/settings/expiry отзывают
+будущий ввод; possible Enter сохраняет прежние audit/unknown barriers.
+В публичном draft IPC отказ подготовки передаётся отдельно от неизвестного
+кадра: final owner re-decoration не должна стирать точную отмену/expiry.
+
+Bridge привязан к исходным WebContents/frame. Автоматический renderer loss
+отзывает future input, но сам не освобождает possible-Enter slot как явная
+пользовательская отмена: нужны прежние fresh absent/new-ready-owner proofs.
+Узкий SQLite BUSY/LOCKED ДО executor и ДО attempt паркует уже committed item с
+тем же executor до существующего runtime wake; не пишет failed под тем же lock,
+не теряет request и не раскручивает self-pump. Начатые/unknown attempts не retry.
+
 Pre-beginAttempt проверка адресата не должна смешивать раннюю event projection
 с поздним process proof: нормальная adoption первого cold Send иначе превращала
 следующий item в runtime_snapshot_unstable. Public Codex reader обновляет projection
@@ -761,6 +801,14 @@ entered/unknown не повторяет отправку; его slot перео
 описанному Main physical-owner proof, не по отрицательному audit. Закрытие одной
 renderer-поверхности не отзывает готовность другого живого App renderer.
 Уже существовавшие legacy unknown receipts не переписываются этой миграцией.
+
+Conservative restart conversion коммитится синхронно до async transcript refinement.
+Ошибка последнего (например SQLite BUSY) оставляет точные possible-Enter/unknown
+heads и их followers под прежними barriers, но не закрывает независимые FIFO
+всех вкладок навсегда. Main завершает этот refinement как degraded-ready, не как
+неограниченное ожидание; failed storage admission по-прежнему не получает ACK.
+Шрам17Oct19:51UTC: `ready:false` в catch удержал History/Terminal MCP доставки
+глобально; actual Main/Web+две SQLite connections/FIFO regression RED→GREEN.
 
 #### Адресный Повтор Audit Квитанции
 

@@ -76,7 +76,10 @@ function createTerminalRawArtifactStore({ directory, maxBytes = 128 * 1024 * 102
     await fs.rename(partial, path.join(state.folder, 'manifest.json'));
   };
   const entries = async (state, list) => {
-    const batch = (list || []).map(item => {
+    const input = list || [];
+    let completed = 0, writingRecord = false;
+    try {
+    const batch = input.map(item => {
       const body = Buffer.from(item.buffer.buffer, item.buffer.byteOffset, item.buffer.byteLength);
       const header = Buffer.from(JSON.stringify(item.descriptor), 'utf8');
       if (header.length > 16 * 1024) throw Error('raw-record-header-budget');
@@ -91,21 +94,27 @@ function createTerminalRawArtifactStore({ directory, maxBytes = 128 * 1024 * 102
       - (await inventory()).reduce((n, row) => n + row.size, 0));
     for (const { item, body, header, prefix, charge } of batch) {
       if (charge > available) {
-        state.lost.events++; state.lost.codeUnits += item.descriptor.originalCodeUnits || body.length / 2;
+        state.lost.events++; state.lost.codeUnits += body.length / 2;
         state.lost.fromSeq ??= item.descriptor.seq; state.lost.toSeq = item.descriptor.seq;
-        state.lost.reason = 'disk-budget'; continue;
+        state.lost.reason = 'disk-budget'; completed++; continue;
       }
-      try {
-        await writeAll(state.handle, prefix); await writeAll(state.handle, header); await writeAll(state.handle, body);
-      } catch (error) {
-        state.lost.events++; state.lost.codeUnits += item.descriptor.originalCodeUnits || body.length / 2;
-        state.lost.fromSeq ??= item.descriptor.seq; state.lost.toSeq = item.descriptor.seq;
-        state.lost.reason = String(error.code || 'disk-write-error').slice(0, 64);
-        state.lost.partialRecordPossible = true;
-        throw error;
-      }
+      writingRecord = true;
+      await writeAll(state.handle, prefix); await writeAll(state.handle, header); await writeAll(state.handle, body);
+      writingRecord = false;
       available -= charge;
-      state.records++; state.bytes += body.length;
+      state.records++; state.bytes += body.length; completed++;
+    }
+    } catch (error) {
+      // A failed header/inventory scan can reject the WHOLE batch before the
+      // first write. A mid-record error also loses every unattempted successor.
+      // A later seal must not advertise either gap as a complete raw range.
+      for (const item of input.slice(completed)) {
+        state.lost.events++; state.lost.codeUnits += item.buffer.byteLength / 2;
+        state.lost.fromSeq ??= item.descriptor?.seq; state.lost.toSeq = item.descriptor?.seq;
+      }
+      state.lost.reason = String(error.code || error.message || 'disk-write-error').slice(0, 64);
+      if (writingRecord) state.lost.partialRecordPossible = true;
+      throw error;
     }
   };
   return {

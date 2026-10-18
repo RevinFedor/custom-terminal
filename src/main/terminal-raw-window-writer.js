@@ -8,7 +8,7 @@ function createTerminalRawWindowWriter({ directory, maxQueuedBytes = 8 * 1024 * 
   maxQueuedMessages = 128, workerFactory, log = () => {} } = {}) {
   let worker = null, queuedBytes = 0, sequence = 0, failures = 0, omissions = 0, closed = false;
   const pending = new Map(), statuses = new Map(), drains = new Set(), staged = new Map(), losses = new Map();
-  let stagedBytes = 0;
+  let stagedBytes = 0, closing = null;
   let publications = 0, suppressedPublications = 0, publicationAt = 0;
   const report = (phase, reason) => {
     try {
@@ -24,7 +24,13 @@ function createTerminalRawWindowWriter({ directory, maxQueuedBytes = 8 * 1024 * 
     value.events += entries.length; value.codeUnits += entries.reduce((n, e) => n + e.buffer.byteLength / 2, 0);
     value.reason = reason; losses.set(id, value); while (losses.size > 64) losses.delete(losses.keys().next().value);
   };
-  const setStatus = (id, value) => { statuses.set(id, value); while (statuses.size > 64) statuses.delete(statuses.keys().next().value); };
+  const setStatus = (id, value) => {
+    const previous = statuses.get(id);
+    // A successful seal ACK describes publication, not recovery of an earlier
+    // omitted/failed batch. Keep that incident's persistence failure visible.
+    statuses.set(id, previous?.ok === false ? { ...value, ok: false, error: value.error || previous.error } : value);
+    while (statuses.size > 64) statuses.delete(statuses.keys().next().value);
+  };
   const flushDrains = () => { if (!pending.size) { for (const done of drains) done(); drains.clear(); } };
   const ensure = () => {
     if (worker) return;
@@ -106,12 +112,37 @@ function createTerminalRawWindowWriter({ directory, maxQueuedBytes = 8 * 1024 * 
       suppressedPublications,
       maxQueuedBytes, maxQueuedMessages, statuses: [...statuses].map(([id, value]) => ({ id, ...value })) }),
     async drain() { for (const id of [...staged.keys()]) flush(id); if (pending.size) await new Promise(resolve => drains.add(resolve)); },
-    async close() {
-      for (const id of [...staged.keys()]) flush(id);
-      closed = true;
-      worker?.unref?.();
-      if (pending.size) await new Promise(resolve => drains.add(resolve));
-      if (worker) { const owned = worker; worker = null; await owned.terminate(); }
+    close({ timeoutMs = 2000 } = {}) {
+      if (closing) return closing;
+      closing = (async () => {
+        for (const id of [...staged.keys()]) flush(id);
+        closed = true;
+        const deadline = Date.now() + Math.max(1, Math.min(Number(timeoutMs) || 2000, 2000));
+        const withinDeadline = work => new Promise(resolve => {
+          const timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
+          Promise.resolve(work).then(() => { clearTimeout(timer); resolve(true); },
+            () => { clearTimeout(timer); resolve(false); });
+        });
+        let timedOut = false;
+        if (pending.size) {
+          // A pending Promise alone does not keep Node alive. Close owns the
+          // worker reference until ACK, failure or this single bounded deadline.
+          worker?.ref?.();
+          timedOut = !await withinDeadline(new Promise(resolve => drains.add(resolve)));
+        }
+        if (pending.size) {
+          failures++;
+          for (const job of pending.values()) setStatus(job.id, { ok: false, phase: job.kind, error: 'worker-close-timeout' });
+          pending.clear(); queuedBytes = 0; report('close', 'worker-close-timeout'); flushDrains();
+        }
+        if (worker) {
+          const owned = worker; worker = null;
+          try { if (!await withinDeadline(owned.terminate())) timedOut = true; }
+          catch { failures++; timedOut = true; }
+        }
+        return { drained: !timedOut, timedOut };
+      })();
+      return closing;
     },
   };
 }

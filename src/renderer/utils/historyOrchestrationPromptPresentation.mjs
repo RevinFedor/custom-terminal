@@ -50,26 +50,37 @@ export function projectHistoryServicePromptBody(entry, fingerprint) {
   const text = typeof entry?.content === 'string' ? entry.content : '';
   const questionReply = projectNativeQuestionReply(entry, fingerprint);
   if (questionReply) return { text: questionReply.text, projected: true, questionReply };
-  const tag = resolveHistoryOrchestrationPromptPresentation(entry);
-  const { envelopeStart, envelopeText, bodyStart, bodyEnd, bodyProjectionHash } = tag || {};
-  // Generated bodies are suffixes. Canonical TAB/CRLF transforms may shift
-  // offsets, so reject a length or saved-header mismatch instead of cutting.
-  if (![envelopeStart, bodyStart, bodyEnd].every(Number.isSafeInteger)
-    || envelopeStart < 0 || envelopeStart > bodyStart || bodyStart > bodyEnd || bodyEnd !== text.length
-    || (envelopeText !== undefined && (typeof envelopeText !== 'string'
-      || envelopeText !== text.slice(envelopeStart, bodyStart)))
-    || typeof bodyProjectionHash !== 'string' || !/^[a-f0-9]{64}$/.test(bodyProjectionHash)
-    || typeof fingerprint !== 'function') {
-    return { text, projected: false };
+  const serviceTag = resolveHistoryOrchestrationPromptPresentation(entry);
+  const contexts = ['user', 'queued'].includes(entry?.role) && Array.isArray(entry?.semanticTags)
+    ? entry.semanticTags.filter(tag => tag.kind === 'context-prefix' && tag.contextKind === 'orchestration-state') : [];
+  const ranges = [];
+  for (const tag of [serviceTag, ...(contexts.length === 1 ? contexts : [])].filter(Boolean)) {
+    const { envelopeStart, envelopeText, bodyStart, bodyEnd, bodyProjectionHash } = tag;
+    // All offsets refer to the FULL immutable transport, including other
+    // prefixes. Never recalculate a service range from already-shortened text.
+    if (![envelopeStart, bodyStart, bodyEnd].every(Number.isSafeInteger)
+      || envelopeStart < 0 || envelopeStart > bodyStart || bodyStart > bodyEnd || bodyEnd !== text.length
+      || (envelopeText !== undefined && (typeof envelopeText !== 'string'
+        || envelopeText !== text.slice(envelopeStart, bodyStart)))
+      || typeof bodyProjectionHash !== 'string' || !/^[a-f0-9]{64}$/.test(bodyProjectionHash)
+      || tag.kind === 'context-prefix' && (envelopeStart !== 0 || typeof envelopeText !== 'string' || bodyStart <= 0)
+      || typeof fingerprint !== 'function') continue;
+    ranges.push({ start: envelopeStart, end: bodyStart, hash: bodyProjectionHash, service: tag === serviceTag });
   }
-  // A reused UUID or equal-length edit can satisfy all positional guards.
-  // Bind the entire displayed UTF-8 text to the prepared prompt synchronously.
-  try {
-    if (fingerprint(text) !== bodyProjectionHash) return { text, projected: false };
-  } catch {
-    return { text, projected: false };
+  if (!ranges.length) return { text, projected: false };
+  let actual;
+  try { actual = fingerprint(text); } catch { return { text, projected: false }; }
+  const proven = ranges.filter(range => range.hash === actual).sort((a, b) => b.start - a.start);
+  if (!proven.length) return { text, projected: false };
+  let result = text, boundary = text.length;
+  for (const range of proven) {
+    if (range.end > boundary) return { text, projected: false };
+    result = result.slice(0, range.start) + result.slice(range.end);
+    boundary = range.start;
   }
-  return { text: text.slice(0, envelopeStart) + text.slice(bodyStart, bodyEnd), projected: true };
+  // Removing quiet context does not turn an ordinary literal user into a
+  // Markdown service message or change its sender/origin.
+  return { text: result, projected: true, ...(!proven.some(range => range.service) ? { markdown: false } : {}) };
 }
 
 export function resolveHistoryPromptSender(presentation) {

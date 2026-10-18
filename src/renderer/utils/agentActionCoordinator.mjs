@@ -64,6 +64,7 @@ export function beginCoordinatedAgentSend(tabId, now = Date.now(), options = {})
     cascadeRestoreByToken: null,
     cascadeRestoreBatched: false,
     handoffId: null,
+    transportStarted: false,
     recordWithoutReply: options.recordWithoutReply === true,
   };
   queue.push(state);
@@ -117,6 +118,14 @@ export function requestCoordinatedStopAfterSend(tabId, now = Date.now()) {
   }
   emit(key, 'stop-queued');
   return { queued: true, deduped: false, token: state.token, state: snapshot(state, queue) };
+}
+
+export function markCoordinatedAgentSendDispatch(tabId, token) {
+  const state = actionQueue(String(tabId || '')).find(candidate => candidate.token === token);
+  if (!state || !state.handoffId || state.phase !== 'sending'
+    || state.stopRequestedAt !== null || state.cancelledAt !== null) return false;
+  state.transportStarted = true;
+  return true;
 }
 
 export function isCoordinatedAgentSendCancellationRequested(tabId, token) {

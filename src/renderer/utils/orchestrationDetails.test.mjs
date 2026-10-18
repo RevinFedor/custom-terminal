@@ -143,3 +143,12 @@ test('native send date requires proof and never relabels mere browser acceptance
   assert.equal(orchestrationRequestTime({ ...run, deliveryAcceptedAt: null, targetPromptProofAt: createdAt + 5000 }).label, 'Подтверждён');
   assert.equal(orchestrationRequestTime({ ...browserFailure, targetPromptProofAt: createdAt + 5000 }).label, 'Создан');
 });
+test('offline selected browser is an unsent wait, not a completion or generic transport error', () => {
+  const rows = orchestrationDetailRows({ status: 'queued', deliveryDeferredReason: 'waiting-for-browser',
+    externalResearchRequestedBrowserId: 'chrome',
+    externalResearchBrowserWait: { notSubmitted: true, browserInstanceId: 'own-chrome' } }, 'source');
+  assert.equal(rows.find(row => row.key === 'browser-wait').value, 'Chrome: не в сети. Не отправлен');
+  assert.equal(rows.some(row => row.key === 'error'), false);
+  assert.equal(orchestrationDetailRows({ status: 'cancelled', deliveryDeferredReason: 'waiting-for-browser',
+    externalResearchBrowserWait: { notSubmitted: true } }, 'source').some(row => row.key === 'browser-wait'), false);
+});

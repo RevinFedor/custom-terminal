@@ -173,6 +173,7 @@ const {
   agentPromptAuditMatchesHash,
 } = require('./agent-prompt-audit-identity');
 const { compactSendReceiptPresentation } = require(path.join(srcMainDir, 'compact-send-settlement'));
+const { PREPARATION_MS, createSendPreparationScope } = require(path.join(srcMainDir, 'agent-send-preparation'));
 const {
   RECEIPT_STATES: AGENT_SEND_RECEIPT_STATES,
   createAgentSendReceiptRegistry,
@@ -1189,6 +1190,8 @@ function getExternalResearchCoordinator() {
       client: getScExternalResearchClient(),
       emitChanges: emitOrchestrationChanges,
       finalizeSettled: finalizeSettledOrchestration,
+      notifyBrowserOffline: envelope => userNotificationOutbox
+        ? userNotificationOutbox.enqueue(envelope) : Promise.resolve({ ok: false, reason: 'outbox_unavailable' }),
     });
   }
   return externalResearchCoordinator;
@@ -3382,6 +3385,7 @@ async function runPreparedAgentSendScenario(args) {
   }
 
   const executeSend = async () => {
+    const preparationStartedAt = Date.now(); // Active HEAD, never enqueue/FIFO residence.
     tabWorkContext?.activate(tabId, handoffId);
     let durableAttemptId = null;
     let preDispatchFailure = false;
@@ -3441,6 +3445,11 @@ async function runPreparedAgentSendScenario(args) {
           code: error.code || 'agent_send_target_unavailable', error: error.message, httpStatus: 503 };
       }
     }
+    if (!result && durableIdentity && ['codex', 'claude'].includes(provider)
+      && Date.now() >= preparationStartedAt + PREPARATION_MS) {
+      result = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+        status: 'not-submitted', code: 'agent_send_preparation_expired', error: 'agent_send_preparation_expired' };
+    }
     if (!result && durableIdentity) {
       if (applicationQueueExecution && agentSendQueue?.item(sendOperationKey)?.state === 'cancelled') {
         return durableAgentSendReplay(agentSendReceiptStore.get(sendOperationKey),
@@ -3460,10 +3469,10 @@ async function runPreparedAgentSendScenario(args) {
       }
       durableAttemptId = begun.attemptId;
       try {
-        if (['codex', 'claude'].includes(provider)) preflightScope = Object.freeze({
-          version: 1, id: crypto.randomUUID(), operationKey: sendOperationKey,
+        if (['codex', 'claude'].includes(provider)) preflightScope = createSendPreparationScope({
+          operationKey: sendOperationKey,
           attemptId: durableAttemptId, tabId, handoffId, provider,
-        });
+        }, preparationStartedAt);
         if (expectedTarget || ownedAttachments || preflightScope) {
           // Issue one driver scope only after this caller began the attempt.
           // Replay/old renderer replies cannot borrow it to negate prior input.
@@ -3561,9 +3570,24 @@ async function runPreparedAgentSendScenario(args) {
       rendererDispatchInvoked = true;
       result = await bridgeRequest('sendAgentPromptScenario', bridgePayload, timeoutMs, {
         onLateReply: settleLateBridgeReceipt,
+        onAbort: error => {
+          if (error?.dispatched === false || !durableAttemptId || !sendOperationKey) return;
+          // Revoke this exact live waiter before persistence: a continuing DB
+          // writer cannot leave the lost renderer with future input authority.
+          // The durable control does not settle an earlier possible Enter.
+          const identity = { operationKey: sendOperationKey, attemptId: durableAttemptId,
+            tabId, handoffId, provider };
+          agentSendQueue?.cancelAttempt(identity);
+          try {
+            agentSendReceiptStore.cancelDelivery({ ...identity, reason: 'send-renderer-owner-lost' });
+          } catch (failure) {
+            console.warn('[AgentScenario] cancelled live input; durable cancellation unavailable operation='
+              + sendOperationKey + ' code=' + (failure?.code || 'storage-unavailable'));
+          }
+        },
       });
     } catch (error) {
-      if (!rendererDispatchInvoked || error?.dispatched === false || error?.code === 'bridge_unavailable') {
+      if (!rendererDispatchInvoked || error?.dispatched === false) {
         preDispatchFailure = !rendererDispatchInvoked;
         result = {
           success: false,
@@ -3598,6 +3622,7 @@ async function runPreparedAgentSendScenario(args) {
         // exact handoff for a later audit and surface an explicit unknown state.
         const bridgeFailureCode = error?.code === 'bridge_failed'
           ? 'bridge_failed_delivery_unknown'
+          : error?.code === 'bridge_unavailable' ? 'bridge_unavailable_delivery_unknown'
           : 'bridge_timeout_delivery_unknown';
         console.warn('[AgentScenario] renderer receipt unavailable tab=' + shortId(tabId, 12)
           + ' handoff=' + (handoffId || '-')
@@ -4672,7 +4697,7 @@ function withOrchestrationUrls(run) {
   return run ? { ...run, ...orchestrationUrls(run) } : null;
 }
 
-async function assertExternalResearchCapabilities(provider) {
+async function assertExternalResearchCapabilities(provider, requireBrowserSelection = false) {
   let capabilities;
   try {
     capabilities = await getScExternalResearchClient().capabilities();
@@ -4700,6 +4725,9 @@ async function assertExternalResearchCapabilities(provider) {
     error.statusCode = 400;
     throw error;
   }
+  if (requireBrowserSelection) {
+    require('./external-research-browser').assertBrowserSelectionCapability(capabilities);
+  }
   return capabilities;
 }
 
@@ -4720,6 +4748,7 @@ async function reconcileExternalResearchRun(runId, reason = 'external-research-r
   } catch (error) {
     const waiting = await store.markExternalResearchTransportWait(runId, {
       error: String(error?.message || error),
+      code: error?.code || null,
       retryAt: Date.now() + 1000,
     });
     if (waiting) emitOrchestrationRun(waiting, reason + '-transport-wait');
@@ -4768,7 +4797,8 @@ async function readExternalResearchResult(runId, maxChars) {
   if (run.status !== 'completed') {
     try {
       snapshot = await getScExternalResearchClient().status(run.externalResearchJobId, { waitMs: 0 });
-    } catch {}
+      require('./external-research-browser').assertExactResearchSnapshot(run, snapshot);
+    } catch { snapshot = null; }
     const assistantText = externalResearchAnswerText(snapshot);
     const truncated = assistantText.length > maxChars;
     return {
@@ -4783,6 +4813,8 @@ async function readExternalResearchResult(runId, maxChars) {
         outcome: run.outcome || run.status,
         provider: run.externalResearchProvider || snapshot?.provider || null,
         jobId: run.externalResearchJobId,
+        browserInstanceId: run.externalResearchBrowserInstanceId || null,
+        browserAccount: run.externalResearchBrowserAccount || null,
         conversationUrl: snapshot?.conversationUrl
           || snapshot?.result?.url
           || snapshot?.url
@@ -4800,6 +4832,7 @@ async function readExternalResearchResult(runId, maxChars) {
   }
   try {
     snapshot = await getScExternalResearchClient().status(run.externalResearchJobId, { waitMs: 0 });
+    require('./external-research-browser').assertExactResearchSnapshot(run, snapshot);
   } catch (error) {
     return {
       statusCode: Number(error?.status || error?.statusCode) === 404 ? 409 : 503,
@@ -4840,6 +4873,9 @@ async function readExternalResearchResult(runId, maxChars) {
       outcome: run.outcome || (success ? 'success' : 'failed'),
       provider: run.externalResearchProvider || snapshot.provider || null,
       jobId: run.externalResearchJobId,
+      browserInstanceId: run.externalResearchBrowserInstanceId || snapshot.browserInstanceId || null,
+      browserAccount: require('./external-research-browser').publicBrowserAccount(snapshot.browserAccount)
+        || run.externalResearchBrowserAccount || null,
       conversationUrl,
       conversationId: snapshot?.conversationId || run.externalResearchConversationId || null,
       continuedFromRunId: run.externalResearchContinuedFromRunId || null,
@@ -7421,10 +7457,14 @@ async function bridgeRequest(action, payload, timeoutMs = 5000, {
       if (pending && typeof pending.onLateReply === 'function') {
         pending.timedOut = true;
         pending.lateCleanupTimer = setTimeout(() => {
-          if (pendingBridge.get(requestId) === pending) pendingBridge.delete(requestId);
+          if (pendingBridge.get(requestId) === pending) {
+            pending.dispose?.();
+            pendingBridge.delete(requestId);
+          }
         }, Math.max(1_000, Number(lateReplyRetentionMs) || LATE_BRIDGE_REPLY_RETENTION_MS));
         pending.lateCleanupTimer.unref?.();
       } else {
+        pending.dispose?.();
         pendingBridge.delete(requestId);
       }
       console.log('[BridgeDiag] TIMEOUT action=' + action + label + ' rid=' + requestId + ' afterMs=' + timeoutMs);
@@ -7445,17 +7485,19 @@ async function bridgeRequest(action, payload, timeoutMs = 5000, {
       captureReply,
       onAbort,
       dispose: null,
-      expectedSender: observationOnly || ['getStatusMarkerConfig', 'readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(action) ? win.webContents : null,
-      expectedSwitcherFrame: ['readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(action) ? switcherFrameKey(win.webContents.mainFrame) : null,
+      expectedSender: observationOnly || ['sendAgentPromptScenario', 'getStatusMarkerConfig', 'readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(action) ? win.webContents : null,
+      expectedSwitcherFrame: ['sendAgentPromptScenario', 'readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(action) ? switcherFrameKey(win.webContents.mainFrame) : null,
     });
     console.log('[BridgeDiag] SEND action=' + action + label + ' rid=' + requestId + ' wins=' + wins.length);
     try {
       onDispatch?.({ requestId });
-      if (observationOnly && typeof win.webContents.once === 'function') {
+      if ((observationOnly || typeof onAbort === 'function') && typeof win.webContents.once === 'function') {
         const destroyed = () => {
           const pending = pendingBridge.get(requestId);
           if (!pending) return;
           clearTimeout(pending.timer);
+          if (pending.lateCleanupTimer) clearTimeout(pending.lateCleanupTimer);
+          pending.dispose?.();
           pendingBridge.delete(requestId);
           const error = Object.assign(new Error('Bridge renderer closed during owned operation'), {
             code: 'bridge_unavailable', dispatched: true,
@@ -7463,8 +7505,17 @@ async function bridgeRequest(action, payload, timeoutMs = 5000, {
           try { pending.onAbort?.(error); } catch {}
           pending.reject(error);
         };
+        // Match the existing renderer lease: a blocked external navigation
+        // leaves the same owner alive; a committed main document retires it.
+        const navigate = () => destroyed();
         win.webContents.once('destroyed', destroyed);
-        pendingBridge.get(requestId).dispose = () => win.webContents.removeListener?.('destroyed', destroyed);
+        win.webContents.once('render-process-gone', destroyed);
+        if (action === 'sendAgentPromptScenario') win.webContents.on?.('did-navigate', navigate);
+        pendingBridge.get(requestId).dispose = () => {
+          win.webContents.removeListener?.('destroyed', destroyed);
+          win.webContents.removeListener?.('render-process-gone', destroyed);
+          win.webContents.removeListener?.('did-navigate', navigate);
+        };
       }
       win.webContents.send('web:bridge-request', { requestId, action, payload });
     } catch (sendError) {
@@ -7495,6 +7546,7 @@ async function bridgeRequest(action, payload, timeoutMs = 5000, {
       });
       if (claimed.claimed === true && claimed.action === 'drop') {
         clearTimeout(timer);
+        pendingBridge.get(requestId)?.dispose?.();
         pendingBridge.delete(requestId);
         const error = new Error('Bridge receipt dropped by exact E2E boundary');
         error.code = 'bridge_timeout';
@@ -7677,7 +7729,7 @@ function registerBridgeReplyHandler() {
       console.warn('[BridgeDiag] FOREIGN_REPLY action=' + pending.action + ' rid=' + requestId);
       return;
     }
-    if (['readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(pending.action)
+    if (['sendAgentPromptScenario', 'readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(pending.action)
       && (!pending.expectedSwitcherFrame || switcherFrameKey(event?.senderFrame) !== pending.expectedSwitcherFrame)) {
       console.warn('[BridgeDiag] FOREIGN_FRAME action=' + pending.action + ' rid=' + requestId);
       return;
@@ -7905,6 +7957,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           resultEndpoint: '/api/orchestrations/:runId/result',
           providers: ['chatgpt', 'claude', 'perplexity'],
           continuation: 'continueFromRunId',
+          browserSelection: require('./external-research-browser').BROWSER_SELECTION_CAPABILITY,
         },
       },
     });
@@ -8570,7 +8623,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const targetLabel = externalResearchTargetLabel(request);
       const existingRun = await getOrchestrationRunStore().getInternal(requestedRunId);
       const sourceSendTarget = notifySource ? await captureOrchestrationSourceTarget(source, existingRun, sourceExecutionContext) : null;
-      if (!existingRun) await assertExternalResearchCapabilities(request.provider);
+      const researchCapabilities = !existingRun
+        ? await assertExternalResearchCapabilities(request.provider, !!request.browserId || !!continueFromRunId) : null;
+      const expectedBrowser = await require('./external-research-request').resolveExternalResearchBrowserBinding({
+        request, previous, existingRun, capabilities: researchCapabilities,
+        client: getScExternalResearchClient(), store: getOrchestrationRunStore(),
+      });
       const reservation = await getOrchestrationRunStore().reserveOrGet({
         runId: requestedRunId,
         runKind: 'external-research',
@@ -8601,6 +8659,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         promptChars: request.prompt.length,
         externalResearchJobId: jobId,
         externalResearchProvider: request.provider,
+        externalResearchRequestedBrowserId: request.browserId || null,
+        externalResearchExpectedBrowserInstanceId: expectedBrowser,
         externalResearchModel: request.options?.model || null,
         externalResearchEffort: request.options?.effort || null,
         externalResearchMode: request.options?.mode || null,

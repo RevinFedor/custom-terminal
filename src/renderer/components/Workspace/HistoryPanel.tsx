@@ -115,6 +115,7 @@ import { terminalRegistry } from '../../utils/terminalRegistry';
 import {
   beginCoordinatedAgentSend,
   bindCoordinatedAgentSendHandoff,
+  markCoordinatedAgentSendDispatch,
   getCoordinatedAgentAction,
   requestCoordinatedStopAfterSend,
   settleCoordinatedAgentSend,
@@ -343,6 +344,7 @@ import {
   historyTerminalPreviewHandoffScrollTop,
   historyTerminalPreviewHasCanonicalIdentity,
   historyTerminalPreviewHasNewUserGesture,
+  cancelHistoryTerminalPreviewHandoffScroll,
   historyTerminalPreviewStatusLabel,
   resolveHistoryTerminalPreviewCanonicalTarget,
 } from '../../utils/historyTerminalPreviewHandoff.mjs';
@@ -390,8 +392,10 @@ import {
   acceptHistoryPromptHandoffProviderQueue,
   adoptHistoryPromptHandoffCanonicalEntry,
   advanceHistoryPromptHandoffTransportPhase,
+  historyPromptHandoffAcceptsAuditIdentity,
   beginHistoryPromptHandoff,
   bindHistoryPromptHandoffSendIdentity,
+  prepareHistoryPromptHandoffPresentation,
   consumeHistoryPromptHandoff,
   applyHistoryQueuedMessageMerge,
   durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry,
@@ -418,6 +422,8 @@ import {
   type HistoryPromptHandoffStatus,
   type QueuedMessageMergeGuard,
 } from '../../utils/historyPromptHandoffs';
+import { saveHistorySendRecovery, removeHistorySendRecovery } from '../../utils/historySendRecovery.mjs';
+import { historySendTimerState } from '../../utils/historySendTiming.mjs';
 import {
   isStandaloneAgentLocalCommand,
   projectAgentLocalCommandSendResult,
@@ -715,6 +721,7 @@ interface FullHistoryEntry {
   applicationQueuePosition?: number;
   statusReason?: string;
   statusChangedAt?: number;
+  enterAttemptAt?: number;
   statusAtSend?: AgentPtyStatus;
   rewindStatus?: 'rewinding' | 'done' | 'failed';
   optimisticAt?: number;
@@ -758,7 +765,7 @@ interface FullHistoryEntry {
   recordByteOffset?: number;
   semanticTags?: Array<{
     id?: string;
-    kind: 'orchestration' | 'prompt-origin' | 'tab-message';
+    kind: 'orchestration' | 'prompt-origin' | 'tab-message' | 'context-prefix';
     runId?: string;
     phase?: 'request' | 'completion' | 'failure' | 'question' | 'reply';
     messageId?: string;
@@ -886,6 +893,7 @@ interface TerminalHistoryPreviewClearHandoff {
   gestureAt: number;
   followBottom: boolean;
   scrollOwnerToken: number | null;
+  scrollCancelledByGesture?: boolean;
   phase: 'waiting-row' | 'clearing-preview' | 'settling-row';
   requestedAt: number;
 }
@@ -1912,6 +1920,7 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     JSON.stringify(left.applicationQueueMerge || null) !== JSON.stringify(right.applicationQueueMerge || null) ||
     left.statusReason !== right.statusReason ||
     left.statusChangedAt !== right.statusChangedAt ||
+    left.enterAttemptAt !== right.enterAttemptAt ||
     left.statusAtSend !== right.statusAtSend ||
     left.rewindStatus !== right.rewindStatus ||
     left.optimisticAt !== right.optimisticAt ||
@@ -4916,6 +4925,22 @@ const HistoryResearchReply = ({ result, source, phase, copied, onCopy, forceExpa
   </div>;
 };
 
+const HistorySendTimer = memo(({ startedAt, enterAttemptAt, status, changedAt, reason }: {
+  startedAt?: number; enterAttemptAt?: number; status?: HistoryPromptHandoffStatus; changedAt?: number; reason?: string;
+}) => {
+  const [now, setNow] = useState(() => Date.now());
+  const timing = historySendTimerState({ startedAt, enterAttemptAt, status, changedAt, reason }, now);
+  const running = timing?.running === true;
+  useEffect(() => {
+    if (!running) return;
+    setNow(Date.now());
+    const clock = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(clock);
+  }, [startedAt, running]);
+  return timing ? <span className="hp-history-send-timer" data-history-send-timer
+    data-running={running} title="Время от Send до первого Enter сообщения в терминале">{timing.seconds}s</span> : null;
+});
+
 const HistoryUserEntry = memo(({
   entry,
   tabId,
@@ -5218,6 +5243,8 @@ const HistoryUserEntry = memo(({
               </button>
             </Tooltip>
           )}
+          {queueStatusPresentation && <HistorySendTimer startedAt={entry.optimisticAt}
+            enterAttemptAt={entry.enterAttemptAt} status={queueStatus} changedAt={entry.statusChangedAt} reason={entry.statusReason} />}
           {canDismissPromptPresentation && (
             <Tooltip content={queueStatus === 'application-queued' ? 'Отменить отправку из очереди' : 'Скрыть эту карточку'}>
               <button
@@ -5413,7 +5440,7 @@ const HistoryUserEntry = memo(({
       </> : <HistoryUserPromptContent
         text={serviceBody.text}
         messageText={entry.content}
-        markdown={serviceBody.projected && !serviceBody.questionReply}
+        markdown={serviceBody.projected && !serviceBody.questionReply && serviceBody.markdown !== false}
         tabId={tabId}
         promptChips={entry.promptChips}
         imagePaths={entry.imagePaths}
@@ -6428,6 +6455,17 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
 .hp-history-response-tail-label {
   white-space: nowrap;
 }
+.hp-history-send-timer {
+  color: var(--cb-text, #e0e0e0);
+  font-size: 0.9em;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+  white-space: nowrap;
+  padding-right: 4px;
+  margin-right: 1px;
+  border-right: 1px solid var(--cb-border, #555);
+}
 .hp-history-response-tail[data-state="completed"] {
   width: max-content;
   max-width: 100%;
@@ -6646,28 +6684,6 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
 }
 .hp-history-composer-frame:focus-within {
   border-color: #FFB382;
-}
-/* Preparation is feedback, not an input lock. Composite only this painted
-   outline; the editable draft, caption and controls never blink or reflow. */
-@keyframes hp-history-composer-preparing {
-  0%, 100% { opacity: 0.2; }
-  50% { opacity: 1; }
-}
-.hp-history-composer-preparing::after {
-  content: '';
-  position: absolute;
-  inset: -1px;
-  border: 1px solid #60a5fa;
-  border-radius: inherit;
-  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.2), 0 0 8px rgba(96, 165, 250, 0.3);
-  pointer-events: none;
-  animation: hp-history-composer-preparing 1.2s ease-in-out infinite;
-}
-@media (prefers-reduced-motion: reduce) {
-  .hp-history-composer-preparing::after {
-    animation: none;
-    opacity: 1;
-  }
 }
 .hp-history-composer-frame .cb-composer-main {
   padding-top: 0;
@@ -7821,10 +7837,11 @@ function AgentHistoryControls({
   // The actual composer owns this request, including its portalled placement.
   // Keep it until its live owner is mounted; no timer, draft edit or global scan.
   useLayoutEffect(() => {
-    if (!requestedInputSearch || !agentInputSurface || interactionDisabled
-      || effectiveSuppressWindowEscapeRef.current) return;
+    if (!requestedInputSearch || !agentInputSurface || interactionDisabled) return;
     const editor = promptTextareaRef.current;
     if (editor?.getAttribute('data-history-composer-tab-id') !== tabId) return;
+    const pane = editor.dom?.closest<HTMLElement>('[data-terminal-pane-wrapper]');
+    if (pane?.dataset.terminalSurfacePresented === '0') return;
     if (openComposerInputSearch(editor)) {
       uiPerformancePhase('input-search-open', {tab:tabId});
       consumeInputSearchRequest(tabId,requestedInputSearch);
@@ -8747,12 +8764,18 @@ function AgentHistoryControls({
     const handlePasteBusy = (_: any, data: {
       tabId?: string;
       busy?: boolean;
-      phase?: 'sending' | 'confirming' | 'idle';
+      phase?: 'preparing' | 'sending' | 'confirming' | 'idle';
       handoffId?: string | null;
+      sendAttemptId?: string | null;
+      sendOperationKey?: string | null;
     }) => {
       if (data?.tabId !== tabId) return;
-      if (data.handoffId && (data.phase === 'sending' || data.phase === 'confirming')) {
-        advanceHistoryPromptHandoffTransportPhase(tabId, data.handoffId, data.phase);
+      if (data.handoffId && ['preparing', 'sending', 'confirming'].includes(data.phase || '')) {
+        const handoff = getHistoryPromptHandoffsSnapshot(tabId).find(item => item.handoffId === data.handoffId);
+        if (historyPromptHandoffAcceptsAuditIdentity(handoff, data)) {
+          advanceHistoryPromptHandoffTransportPhase(tabId, data.handoffId,
+            data.phase as 'preparing' | 'sending' | 'confirming');
+        }
       }
       const nextBusy = !!data.busy;
       const wasPasteBusy = pasteBusyRef.current;
@@ -9335,11 +9358,13 @@ function AgentHistoryControls({
           historyDiag('QUEUE_ACTION tab=' + tabId.slice(-12)
             + ' kind=stop after=send'
             + ' busyAction=' + (busyAction || activeKind));
-          if (!queued.state?.handoffId && queued.token) {
-            // No handoff means the common Send/PTY scenario has not been
-            // entered. Stop must not wait on image/context preparation (or an
-            // orphaned preflight). A late preparation cannot bind this token.
+          if (!queued.state?.transportStarted && queued.token) {
+            // An early card is not transport admission. Stop still must not
+            // wait for image/context preparation, even though it has an H.
             historyDiag('STOP_PREPARATION tab=' + tabId.slice(-12) + ' token=' + queued.token);
+            if (queued.state?.handoffId) settleHistoryPromptHandoff(tabId, queued.state.handoffId, {
+              queueStatus: 'cancelled', reason: 'history-preparation-cancelled-before-dispatch',
+            });
             await settleCoordinatedAgentSend({
               tabId,
               token: queued.token,
@@ -9472,6 +9497,7 @@ function AgentHistoryControls({
           + ' chars=' + (restorePrompt || '').length
           + ' images=' + clearedPromptImages.length
           + ' chips=' + clearedPromptChips.length);
+        if (sendHandoffId) removeHistorySendRecovery(actionTabId, sendHandoffId);
         return;
       }
       const merged = mergeFailedHistoryAuthoringSnapshot({
@@ -9501,6 +9527,7 @@ function AgentHistoryControls({
       });
       flushHistoryComposerDrafts();
       flushHistoryComposerView();
+      if (sendHandoffId) removeHistorySendRecovery(actionTabId, sendHandoffId);
       if (isCurrentAction()) {
         setDraftWarning('Send stopped before Enter. The failed prompt was restored before your newer draft.');
       }
@@ -9561,6 +9588,9 @@ function AgentHistoryControls({
         sendIncidentChips = sendDraftChips.length;
         sendIncidentTextInserts = sendDraftChips.filter(chip => chip.kind === 'paste').length;
         if (!presentationText) return;
+        // Direct/external callers obey the same image-import gate as Enter.
+        // A blocked Enter is never remembered for automatic submission later.
+        if (rawDraftSnapshot.includes(HISTORY_IMAGE_PENDING_MARKER)) return;
         if (pendingQuestionRef.current) throw new Error(runtime.label + ' is waiting for a question answer');
         const statusAtSend = statusRef.current;
         sendIncidentStatusAtSend = statusAtSend;
@@ -9635,31 +9665,54 @@ function AgentHistoryControls({
           rawDraftSnapshot,
           useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
         );
+        const handoffId = createPromptHandoffId();
+        const submittedAt = preparationStartedAt;
+        const initialQueueStatus = 'preparing' as const;
+        const promptChipsForHistory = sendDraftChips
+          .filter((chip) => chip.kind === 'prompt' || chip.kind === 'paste' && chip.messageReference)
+          .map((chip) => ({ ...chip }));
+        const localCommandCandidate = !recordWithoutReply && isStandaloneAgentLocalCommand({
+          prompt: presentationText, imageCount: sourceDraftImages.length, chipCount: promptChipsForHistory.length,
+        });
+        const requiresAuditIdentity = !localCommandCandidate;
+        const earlyHandoff = {
+          tabId: actionTabId, handoffId, toolType: runtime.toolType, sessionIdHint: sessionId || null,
+          text: presentationText, promptChips: promptChipsForHistory, imagePaths: sourceDraftImages,
+          authoringText: rawDraftSnapshot, authoringChips: sendDraftChips, authoringImagePaths: sourceDraftImages,
+          submittedAt, source: 'history-panel', statusAtSend, initialStatus: initialQueueStatus, requiresAuditIdentity,
+        };
+        // Save authoring BEFORE clearing the editor. This local recovery record
+        // is not a Main ACK, FIFO admission, or authority to replay on reload.
+        saveHistorySendRecovery(earlyHandoff);
+        if (!beginHistoryPromptHandoff(earlyHandoff)) {
+          removeHistorySendRecovery(actionTabId, handoffId);
+          throw new Error('Could not retain the History Send snapshot');
+        }
+        sendHandoffId = handoffId;
+        if (coordinatedSendToken && !bindCoordinatedAgentSendHandoff(actionTabId, coordinatedSendToken, handoffId).bound) {
+          removeHistorySendRecovery(actionTabId, handoffId); // composer has not been cleared
+          throw new Error('Send cancelled before preparation');
+        }
+        onPromptSubmitted(presentationText, initialQueueStatus, { handoffId, statusAtSend, submittedAt,
+          promptChips: promptChipsForHistory, imagePaths: sourceDraftImages, requiresAuditIdentity });
+        clearedPromptText = rawDraftSnapshot;
+        clearedPromptImages = sourceDraftImages;
+        clearedPromptChips = sendDraftChips;
+        applyHistoryComposerSnapshot({ ownerTabId: actionTabId, text: '', images: [],
+          chips: systemCommand ? sourceDraftChips : [], selectionStart: 0,
+          history: 'external', userEvent: 'input.complete' });
+        setHistoryComposerView(actionTabId, { selectionStart: 0, selectionEnd: 0, scrollTop: 0 });
+        flushHistoryComposerDrafts();
+        flushHistoryComposerView();
+        delayedDeliveryWarningHandoffRef.current = null;
+        setDraftWarning(null);
+        markSendPreparation('handoff-published');
         const preparedPrompt = await prepareHistoryPromptForSend(rawDraftSnapshot, sourceDraftImages);
         markSendPreparation('images-ready');
-        if (!isCurrentAction()) return;
+        if (!isCurrentAction()) throw new Error('History Send owner changed during preparation');
         if (!preparedPrompt.success) {
-          const latestText = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
-          const latestImages = retainHistoryDraftImages(
-            latestText,
-            useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
-          );
-          const latestChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
-          const sourceStillCurrent = latestText === rawDraftSnapshot
-            && haveSamePromptImageRefs(latestImages, sourceDraftImages)
-            && haveSameComposerChips(latestChips, sourceDraftChips);
-          if (sourceStillCurrent) {
-            setHistoryPromptDraft(actionTabId, rawDraftSnapshot, {
-              images: preparedPrompt.images,
-              chips: sourceDraftChips,
-            });
-            setDraftWarning(preparedPrompt.warning || 'Image attachment is not ready.');
-          } else {
-            setDraftWarning('The draft changed while the image was being checked. Review it and press Send again.');
-            console.log('[' + runtime.logPrefix + ':images] materialize stale draft preserved tab=' + actionTabId.slice(-12));
-          }
-          requestAnimationFrame(() => promptTextareaRef.current?.focus());
-          return;
+          clearedPromptImages = preparedPrompt.images;
+          throw new Error(preparedPrompt.warning || 'Image attachment is not ready.');
         }
         if (preparedPrompt.degraded) {
           const degradedInspection = inspectPromptImageAttachments(
@@ -9679,18 +9732,11 @@ function AgentHistoryControls({
         // The copied incident must contain what the PTY scenario attempted to
         // send, not only the compact chip labels visible in the editor.
         sendIncidentPromptText = sendPayload;
-        const handoffId = createPromptHandoffId();
-        sendHandoffId = handoffId;
         const contextPrepared = await prepareTabWorkContext(actionTabId, handoffId, sendPayload);
         markSendPreparation('context-ready');
         sendPayload = contextPrepared.prompt;
         presentationText = contextPrepared.prefix + presentationText;
         sendIncidentPromptText = sendPayload;
-        const submittedAt = Date.now();
-        const initialQueueStatus = recordWithoutReply || queuedBehindExistingSend
-          ? 'preparing'
-          : historyPromptHandoffInitialStatus(statusAtSend);
-        sendHandoffId = handoffId;
         if (coordinatedSendToken) {
           const bound = bindCoordinatedAgentSendHandoff(
             actionTabId,
@@ -9721,32 +9767,8 @@ function AgentHistoryControls({
           ' images=' + sendDraftImages.length +
           ' pasteBusy=' + pasteBusyRef.current +
           ' preview="' + promptPreview(presentationText) + '"');
-        const promptChipsForHistory = sendDraftChips
-          .filter((chip) => chip.kind === 'prompt' || chip.kind === 'paste' && chip.messageReference)
-          .map((chip) => ({ ...chip }));
-        const localCommandCandidate = !recordWithoutReply
-          && isStandaloneAgentLocalCommand({
-            prompt: sendPayload,
-            imageCount: sendDraftImages.length,
-            chipCount: promptChipsForHistory.length,
-          });
-        const requiresAuditIdentity = !localCommandCandidate;
-        beginHistoryPromptHandoff({
-          tabId: actionTabId,
-          handoffId,
-          toolType: runtime.toolType,
-          sessionIdHint: sessionId || null,
-          text: presentationText,
-          promptChips: promptChipsForHistory,
-          imagePaths: sendDraftImages,
-          authoringText: rawDraftSnapshot,
-          authoringChips: sendDraftChips,
-          authoringImagePaths: sendDraftImages,
-          submittedAt,
-          source: 'history-panel',
-          statusAtSend,
-          initialStatus: initialQueueStatus,
-          requiresAuditIdentity,
+        prepareHistoryPromptHandoffPresentation(actionTabId, handoffId, {
+          text: presentationText, imagePaths: sendDraftImages,
         });
         onPromptSubmitted(presentationText, initialQueueStatus, {
           handoffId,
@@ -9756,66 +9778,11 @@ function AgentHistoryControls({
           imagePaths: sendDraftImages,
           requiresAuditIdentity,
         });
-        const latestText = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
-        const latestImages = retainHistoryDraftImages(
-          latestText,
-          useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
-        );
-        const latestChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
-        const sourceStillCurrent = latestText === rawDraftSnapshot
-          && haveSamePromptImageRefs(latestImages, sourceDraftImages)
-          && haveSameComposerChips(latestChips, sourceDraftChips);
-        if (sourceStillCurrent) {
-          clearedPromptImages = sendDraftImages;
-          clearedPromptChips = sendDraftChips;
-          const editorBeforeClear = promptTextareaRef.current;
-          const editorCharsBefore = editorBeforeClear?.getAttribute('data-history-composer-tab-id') === actionTabId
-            ? editorBeforeClear.value.length
-            : -1;
-          applyHistoryComposerSnapshot({
-            ownerTabId: actionTabId,
-            text: '',
-            images: [],
-            chips: systemCommand ? sourceDraftChips : [],
-            selectionStart: 0,
-            history: 'external',
-            userEvent: 'input.complete',
-          });
-          setHistoryComposerView(actionTabId, {
-            selectionStart: 0,
-            selectionEnd: 0,
-            scrollTop: 0,
-          });
-          // The handoff boundary must clear both the live CodeMirror document
-          // and the restart-persistent draft before PTY ownership begins.
-          // Otherwise the sent text can be revived by a stale editor callback
-          // or by the previous persisted snapshot after renderer restart.
-          flushHistoryComposerDrafts();
-          flushHistoryComposerView();
-          historyDiag('COMPOSER_HANDOFF_CLEAR tab=' + actionTabId.slice(-12)
-            + ' handoff=' + handoffId
-            + ' editorBefore=' + editorCharsBefore
-            + ' editorAfter=' + (promptTextareaRef.current?.value.length ?? -1)
-            + ' storeAfter=' + (useUIStore.getState().historyPromptDrafts[actionTabId] || '').length
-            + ' persisted=1');
-          clearedPromptText = rawDraftSnapshot;
-        } else {
-          const mismatch = latestText !== rawDraftSnapshot
-            ? 'text'
-            : !haveSamePromptImageRefs(latestImages, sourceDraftImages)
-              ? 'images'
-              : 'chips';
-          console.log('[' + runtime.logPrefix + ':images] send snapshot handed off; newer draft preserved tab='
-            + actionTabId.slice(-12)
-            + ' mismatch=' + mismatch
-            + ' snapshotChars=' + rawDraftSnapshot.length
-            + ' latestChars=' + latestText.length
-            + ' snapshotHash=' + historyOwnerDigest(rawDraftSnapshot)
-            + ' latestHash=' + historyOwnerDigest(latestText));
+        // The next draft is independent now; never clear it after this await.
+        saveHistorySendRecovery({ ...earlyHandoff, text: presentationText, imagePaths: sendDraftImages }, 'dispatched');
+        if (coordinatedSendToken && !markCoordinatedAgentSendDispatch(actionTabId, coordinatedSendToken)) {
+          throw new Error('Send cancelled before terminal submission');
         }
-        delayedDeliveryWarningHandoffRef.current = null;
-        setDraftWarning(null);
-        markSendPreparation('handoff-published');
         // A normal prompt does not request model/effort at all. The live
         // ControlBar picker has already applied them, while cold Start/Resume
         // gets them from buildCodexRunPayload. Only record-without-reply stops
@@ -9895,6 +9862,7 @@ function AgentHistoryControls({
               return;
             }
             sendOwnershipTransferred = true;
+            removeHistorySendRecovery(actionTabId, handoffId); // exact recorded-context proof
             sendAuditIdentity = {
               requiresAuditIdentity: true,
               auditTimestamp: proof.auditTimestamp,
@@ -9928,6 +9896,7 @@ function AgentHistoryControls({
             );
           },
           presentationSnapshot: {
+            historySendStartedAt: submittedAt,
             historySessionId: sessionId || null,
             promptChips: promptChipsForHistory,
             imagePaths: sendDraftImages,
@@ -9936,6 +9905,7 @@ function AgentHistoryControls({
         });
         sendFailureResult = result;
         if (result?.applicationQueued === true && result?.applicationQueue?.version === 1) {
+          removeHistorySendRecovery(actionTabId, handoffId);
           bindHistoryPromptHandoffSendIdentity(actionTabId, handoffId, { sendOperationKey: result.operationKey,
             applicationQueueId: result.applicationQueue.id });
           settleHistoryPromptHandoff(actionTabId, handoffId, { queueStatus: 'application-queued',
@@ -9955,7 +9925,11 @@ function AgentHistoryControls({
         });
         const resultOwnershipTransferred = localSlashReceipt.handled
           ? localSlashReceipt.transferred === true
-          : queueSendTransferredOwnership(result);
+          // A lost admission/submit reply keeps authoring with this exact H.
+          // It is not successful delivery, but also cannot restore/replay a
+          // new draft while Main may already own the original request.
+          : queueSendTransferredOwnership(result)
+            || historyPromptHandoffUnconfirmedStatusFromSendResult(result) !== null;
         const resultSendAttemptId = typeof (result?.sendAttemptId || result?.attemptId) === 'string'
           ? String(result.sendAttemptId || result.attemptId)
           : '';
@@ -10054,6 +10028,10 @@ function AgentHistoryControls({
           ' chunks=' + (result?.chunksTotal ?? 'na') +
           ' error=' + (result?.error || '-'));
         sendOwnershipTransferred = resultOwnershipTransferred;
+        if (resultOwnershipTransferred && ((resultSendAttemptId && resultSendOperationKey)
+          || localSlashReceipt.handled && result?.success === true && !unconfirmedStatus)) {
+          removeHistorySendRecovery(actionTabId, handoffId);
+        }
         sendDeliveryUnconfirmed = localSlashReceipt.handled
           ? localSlashReceipt.deliveryUnconfirmed === true
           : !providerQueueReturned && (
@@ -10670,14 +10648,8 @@ function AgentHistoryControls({
   const meta = AGENT_STATUS_META[status];
   const rawActiveLifecycle = lifecycleStatus?.tabId === tabId ? lifecycleStatus : null;
   const coordinatedComposerAction = getCoordinatedAgentAction(tabId);
-  // Before the exact handoff exists the text is still an editable draft, not
-  // a Main FIFO receipt. Show the existing coordinator's preparation lease
-  // immediately, including while image/context IPC awaits. Never borrow a
-  // completed message's delivery phase or let late cleanup revive this label.
-  const sendPreparationPending = coordinatedComposerAction?.phase === 'sending'
-    && !coordinatedComposerAction.handoffId
-    && coordinatedComposerAction.stopRequestedAt === null
-    && coordinatedComposerAction.cancelledAt === null;
+  // Message preparation belongs to its History card. This frame presents only
+  // the provider lifecycle (including Start/Resume), never a second Send state.
   const recordContextAcceptsFollowup = busyAction === 'send'
     && coordinatedComposerAction?.recordWithoutReply === true
     && coordinatedComposerAction.stopRequestedAt === null;
@@ -11968,7 +11940,6 @@ function AgentHistoryControls({
   // with them. Suppressing them was only ever about not stacking two red things
   // in the same place.
   const hasFloatingStatus = showStatusText
-    || sendPreparationPending
     || !!activeLifecycle
     || (!!visibleDraftWarning && !!inlineDraftNoticeMeta)
     || rewindPreviewActive;
@@ -12026,18 +11997,6 @@ function AgentHistoryControls({
       }}
     >
       <span style={{ display: 'contents', pointerEvents: 'auto' }}>
-        {sendPreparationPending && (
-          <span
-            role="status"
-            aria-live="polite"
-            data-history-send-preparation
-            data-preparation-token={coordinatedComposerAction.token}
-            title="Нажатие принято. Проверяем вложения и обновления контекста; сообщение ещё не принято в очередь приложения. Повторять Enter не нужно."
-            style={{ color: '#60a5fa', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }}
-          >
-            {presentStatusTitle('PREPARING SEND...')}
-          </span>
-        )}
         {showStatusText && (
           <span
             data-agent-status-title
@@ -12514,7 +12473,7 @@ function AgentHistoryControls({
       ) : (
         <AIComposerSurface
           density="comfortable"
-          className={'hp-history-composer-frame' + (sendPreparationPending ? ' hp-history-composer-preparing' : '')}
+          className="hp-history-composer-frame"
           topBar={historyComposerTopBar}
           topBarTrailing={historyComposerTopBarTrailing}
           // Никаких чипов ВНУТРИ поверхности: и промпты, и вставки, и картинки
@@ -16199,6 +16158,7 @@ function HistoryPanel({
       sessionId?: string;
       statusChangedAt?: number;
       semanticTags?: FullHistoryEntry['semanticTags'];
+      enterAttemptAt?: number;
       applicationQueueMerge?: QueuedMessageMergeGuard | null;
       applicationQueuePosition?: number;
       presentationHandoffId?: string;
@@ -16233,6 +16193,7 @@ function HistoryPanel({
       content: cleanContent,
       sessionId: resolvedSessionId,
       optimisticAt: submittedAt,
+      enterAttemptAt: meta.enterAttemptAt,
       statusChangedAt,
       promptChips: normalizeComposerChips(meta.promptChips || [])
         .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
@@ -16308,12 +16269,14 @@ function HistoryPanel({
         : prev.map((candidate, index) => index === existingIndex
           ? {
               ...candidate,
+              content: entry.content,
               queueStatus,
               applicationQueueMerge: entry.applicationQueueMerge,
               applicationQueuePosition: entry.applicationQueuePosition,
               statusAtSend: entry.statusAtSend,
               statusReason: entry.statusReason,
               statusChangedAt,
+              enterAttemptAt: entry.enterAttemptAt ?? candidate.enterAttemptAt,
               promptChips: entry.promptChips,
               imagePaths: entry.imagePaths,
               requiresAuditIdentity: entry.requiresAuditIdentity,
@@ -16930,6 +16893,7 @@ function HistoryPanel({
           statusAtSend: record.statusAtSend,
           submittedAt: record.submittedAt,
           statusChangedAt: record.statusChangedAt,
+          enterAttemptAt: record.enterAttemptAt,
           applicationQueueMerge: record.applicationQueueMerge,
           applicationQueuePosition: record.applicationQueuePosition,
           presentationHandoffId: record.applicationQueuePresentationHandoffId,
@@ -16949,6 +16913,7 @@ function HistoryPanel({
           statusAtSend: record.statusAtSend,
           submittedAt: record.submittedAt,
           statusChangedAt: record.statusChangedAt,
+          enterAttemptAt: record.enterAttemptAt,
           promptChips,
           imagePaths,
           semanticTags,
@@ -17449,8 +17414,11 @@ function HistoryPanel({
       rawServerEntriesRef.current = [];
       setClaudeMemoryBoundaryUuid(null);
       historyRevisionRef.current = null;
-      presentationEntriesRef.current = [];
-      setEntries((current) => current.length === 0 ? current : []);
+      // A fresh tab can own PREPARING before its first SID exists.
+      const localEntries = presentationEntriesRef.current.filter(isLocalPromptEntry);
+      presentationEntriesRef.current = localEntries;
+      setEntries((current) => current.length === localEntries.length && current.every((row, index) => row === localEntries[index])
+        ? current : localEntries);
       historyLoaderReasonRef.current = 'no-session';
       setHistoryLoadError(null);
       setLoading(false);
@@ -18906,6 +18874,7 @@ function HistoryPanel({
           sessionId: route.presentationSessionId,
           optimisticAt: handoff.submittedAt,
           statusChangedAt: handoff.statusChangedAt,
+          enterAttemptAt: handoff.enterAttemptAt,
           promptChips: normalizeComposerChips(handoff.promptChips)
             .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
           imagePaths: retainHistoryDraftImages(cleanContent, handoff.imagePaths),
@@ -19921,17 +19890,19 @@ function HistoryPanel({
           gestureGeneration: historyUserGestureGenerationRef.current,
           gestureAt: historyUserGestureAtRef.current, pointerActive: historyPointerScrollActiveRef.current,
         });
+        const anchorOwner = gesture ? cancelHistoryTerminalPreviewHandoffScroll(old) : old;
         // A model rebind is not a new user scroll. Preserve tail INTENT while
-        // the new list measures; a real gesture chooses the current anchor.
+        // the new list measures; actual input retires only its position lease.
         const followBottom = !gesture && old.anchorKind === 'tail' ? true : isAtBottomRef.current;
         terminalPreviewAnchorSettleCancelRef.current?.();
         terminalPreviewAnchorSettleCancelRef.current = null;
         if (old.scrollOwnerToken !== null && historyRestoreInFlightRef.current === old.scrollOwnerToken) {
           historyRestoreInFlightRef.current = 0;
         }
-        current = { ...old, ownerGeneration: historyOwnerGenerationRef.current,
+        current = { ...anchorOwner, ownerGeneration: historyOwnerGenerationRef.current,
           presentationVisit: presentation.visit, phase: 'waiting-row', scrollOwnerToken: null,
-          ...captureHistoryTerminalPreviewHandoffAnchor({ scroller, previewNode: node, followBottom }),
+          ...(!anchorOwner.scrollCancelledByGesture
+            ? captureHistoryTerminalPreviewHandoffAnchor({ scroller, previewNode: node, followBottom }) : {}),
           followBottom, gestureGeneration: historyUserGestureGenerationRef.current,
           gestureAt: historyUserGestureAtRef.current, requestedAt: performance.now() };
         publishTerminalPreviewClearHandoff(current);
@@ -19980,13 +19951,13 @@ function HistoryPanel({
         gestureAt: historyUserGestureAtRef.current,
         pointerActive: historyPointerScrollActiveRef.current,
       });
-      // Re-select BEFORE waiting for canonical DOM or writing a position. The
-      // reader may leave the preview while waiting, or between the two commits.
+      // Input takes the position lease before the browser's default scroll.
+      // Keep exact preview adoption, but never capture a pre-scroll anchor as
+      // a new machine target and then pull the user's first wheel back to it.
       if (ownsWrite && current.phase !== 'settling-row' && newestGestureIsReal) {
         const followBottom = isAtBottomRef.current;
         current = {
-          ...current,
-          ...captureHistoryTerminalPreviewHandoffAnchor({ scroller, previewNode, followBottom }),
+          ...cancelHistoryTerminalPreviewHandoffScroll(current),
           gestureGeneration: historyUserGestureGenerationRef.current,
           gestureAt: historyUserGestureAtRef.current,
           followBottom,
@@ -20040,6 +20011,7 @@ function HistoryPanel({
           presentationVisit: latestPresentation.visit,
           presented: latestPresentation.presented,
         })) return false;
+        if (current.scrollCancelledByGesture) return true;
         const targetOffsetPx = current.anchorKind === 'reading-row'
           ? readHistoryTerminalPreviewReadingTop(scroller, current.readingUnitKey)
           : targetNode

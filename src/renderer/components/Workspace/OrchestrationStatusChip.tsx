@@ -204,14 +204,17 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
   if (run.status === 'queued' || run.status === 'sent') {
     return {
       color: run.status === 'queued'
-        ? (run.deliveryTransportUnknownAt || run.externalResearchTransportError || run.externalResearchDeliveryUnknown ? '#fbbf24' : '#a1a1aa')
+        ? (run.deliveryTransportUnknownAt || run.externalResearchTransportError || run.externalResearchDeliveryUnknown
+          || run.deliveryDeferredReason === 'waiting-for-browser' ? '#fbbf24' : '#a1a1aa')
         : '#4ade80',
       icon: 'waiting',
       label: run.status === 'queued' && run.deliveryDeferredReason === 'target-not-idle:busy'
         ? 'Ждёт занятую вкладку'
         : run.status === 'queued' && run.deliveryDeferredReason === 'external-research-transport'
           ? 'Ждёт SC Desktop'
-          : STATUS_LABEL[run.status],
+          : run.status === 'queued' && run.deliveryDeferredReason === 'waiting-for-browser'
+            ? 'Ждёт браузер'
+            : STATUS_LABEL[run.status],
       spinning: false,
     };
   }

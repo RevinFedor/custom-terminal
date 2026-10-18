@@ -240,12 +240,59 @@ function createDragDiagnostics({now,emit,onPendingFrame,matching,actions,appendP
       // summary retain the full identities; frame packets join by owner epoch
       // and revision. Compact only at release, outside the move/frame path.
       detail.framePacketIdentity='ownerEpoch/revision; full owners in phases/summary';
-      detailText=JSON.stringify(detail,(key,value)=>
+      const serialize=value=>JSON.stringify(value,(key,value)=>
         ['processed','published','geometry','author','layout','target'].includes(key)
           ? dragFramePacket(value) : value);
-      if(detailText.length>65536){if(!report.partial)partialGestures=increment(partialGestures);report.partial=true;report.detailOmitted='serialized-cap';
-        detailText=JSON.stringify({schema:1,gestureId:d.gestureId,partial:true,detailOmitted:'serialized-cap',
-          chars:detailText.length,limitChars:65536});}
+      detailText=serialize(detail);
+      if(detailText.length>65536){
+        if(!report.partial)partialGestures=increment(partialGestures);
+        report.partial=true;detail.partial=true;
+        const chars=detailText.length;
+        // Release-only reduction of frame occurrences, never admission or phases.
+        // Keep the endpoints and the strongest slow sample for as long as possible.
+        // At most 8+24+8 removals; capture, sampling and retention stay unchanged.
+        detail.first=detail.first.slice();detail.slow=detail.slow.slice();
+        detail.frameOmitted={first:0,slow:0,tail:0};
+        detail.frameOmittedKind='serialized-cap-window-occurrences';
+        let peak=null,peakScore=-Infinity;
+        for(const sample of detail.slow){
+          const score=Math.max(sample.gapMs,sample.moving && sample.input?.eventAbs!=null
+            ? sample.abs-sample.input.eventAbs : 0,sample.authorLagMs || 0);
+          if(score>peakScore){peak=sample;peakScore=score;}
+        }
+        detailText=serialize(detail);
+        let windowChars=detailText.length;
+        while(windowChars>65536){
+          const key=['slow','first','tail'].reduce((best,key)=>
+            detail[key].length>detail[best].length?key:best,'slow');
+          const window=detail[key];if(!window.length)break;
+          let index=Math.floor(window.length/2);
+          if(window[index]===peak && window.length>1)index=index>0?index-1:index+1;
+          // Exact JSON array cost, including its comma and omission-counter
+          // digits. Serialize each removed occurrence once, not the full block
+          // on every removal. The final serialization still checks the cap.
+          const removed=window.splice(index,1)[0],omitted=detail.frameOmitted[key]++;
+          windowChars-=serialize(removed).length+(window.length?1:0);
+          windowChars+=String(omitted+1).length-String(omitted).length;
+        }
+        detailText=serialize(detail);
+        report.frameOmitted={...detail.frameOmitted};
+        report.frameOmittedKind=detail.frameOmittedKind;
+        if(detailText.length>65536){
+          // Even zero frames cannot fit. Refuse the critical block explicitly;
+          // never publish a silently shortened plan/member/phase certificate.
+          report.detailOmitted='serialized-cap';
+          report.detailRefusal='mandatory-fields-exceed-cap';
+          detailText=JSON.stringify({schema:1,gestureId:d.gestureId,actionId:detail.actionId,runId:detail.runId,
+            partial:true,detailOmitted:report.detailOmitted,detailRefusal:report.detailRefusal,
+            chars,mandatoryChars:detailText.length,limitChars:65536,
+            missing:{plan:!!detail.plan,planIds:Object.fromEntries(Object.entries(detail.plan || {}).map(([key,ids])=>[key,ids.length])),
+              members:detail.members.length,phases:detail.phases.length},
+            planOmitted:detail.planOmitted,memberOmitted:detail.memberOmitted,phaseOmitted:detail.phaseOmitted,
+            frameOmitted:detail.frameOmitted,frameOmittedKind:detail.frameOmittedKind,
+            frameEvicted:detail.frameEvicted,slowPostMissing:detail.slowPostMissing,limits:detail.limits,emitFailed});
+        }
+      }
     }
     if(d.action){
       // The existing 96-action ring retains a cheap join record, never frame windows.

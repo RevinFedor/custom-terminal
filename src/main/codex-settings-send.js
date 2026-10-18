@@ -78,7 +78,7 @@ async function observeCodexSettingsApplication({
 function createCodexSettingsSendRuntime({
   readScope, readSettings, withSettingsQueue, withWriteLock,
   selectSettings, paste, sendLocalCommand, publishSettings = () => {},
-  resolveModelIdentity = null,
+  resolveModelIdentity = null, beginPreparation = null,
 }) {
   const appliedByTerminal = new WeakMap();
   function publishApplied(tabId, result) {
@@ -119,17 +119,22 @@ function createCodexSettingsSendRuntime({
     if (!initialScope?.terminal || initialScope.live !== true) {
       return codexSettingsSendNotSubmitted({ error: 'codex_send_runtime_unavailable' });
     }
+    let preparation = request.preparation || null;
     let promptPasteInvoked = false;
     let settingsResult = null;
     const operation = { kind: 'codex-settings-send', source: request.source,
       tabId, submitted: false, promptSubmitted: false, manualInputYields: false, queuedAt: Date.now() };
     const assertCurrent = (scope, input = false) => {
+      const expired = preparation?.failure();
+      if (expired) throw Object.assign(new Error(expired.code), expired);
       if (!codexSettingsSendScopeCurrent(scope, readScope(tabId), { input })) {
         throw new Error(input ? 'codex_input_ownership_changed' : 'codex_send_runtime_changed');
       }
     };
     try {
-      const physical = await withSettingsQueue(() => withWriteLock(initialScope.terminal, async owner => {
+      const physical = await withSettingsQueue(() => {
+        preparation ||= beginPreparation?.(request) || null;
+        return withWriteLock(initialScope.terminal, async owner => {
         assertCurrent(initialScope);
         let scope = readScope(tabId);
         const expectedOwnerId = clean(request.expectedWriterSessionId);
@@ -173,6 +178,8 @@ function createCodexSettingsSendRuntime({
         // fallback can change this pair during config confirmation or paste
         // preparation without changing inputRevision or the process owner.
         const settingsWriteGuard = () => {
+          const expired = preparation?.failure();
+          if (expired) return { allowed: false, reason: expired.code };
           const latest = readScope(tabId);
           if (!codexSettingsSendScopeCurrent(scope, latest)) return {
             allowed: false, reason: 'codex_send_runtime_changed',
@@ -194,7 +201,7 @@ function createCodexSettingsSendRuntime({
         }
         if (!samePair) {
           settingsResult = await selectSettings(sender, {
-            tabId, model, effort,
+            tabId, model, effort, preparation,
             expectedTarget: request.expectedTarget,
             sendOperationKey: request.pasteOptions?.sendOperationKey,
             sendAttemptId: request.pasteOptions?.sendAttemptId,
@@ -222,7 +229,7 @@ function createCodexSettingsSendRuntime({
         });
         promptPasteInvoked = true;
         const written = request.localCommand
-          ? await sendLocalCommand({ ...request.localCommand, sender, tabId, command: content, settingsWriteGuard }, owner)
+          ? await sendLocalCommand({ ...request.localCommand, sender, tabId, command: content, settingsWriteGuard, preparation }, owner)
           : await paste(scope.terminal, content, {
               ...request.pasteOptions, ptyWriteOwner: owner,
               settingsWriteGuard,
@@ -230,7 +237,8 @@ function createCodexSettingsSendRuntime({
             });
         operation.promptSubmitted = written?.enterWritten === true || written?.submitted === true;
         return written;
-      }, operation));
+      }, operation);
+      });
       const result = typeof physical?.finishAfterPtyWrite === 'function'
         ? await physical.finishAfterPtyWrite() : physical;
       return settingsResult ? { ...result, settingsResult } : result;

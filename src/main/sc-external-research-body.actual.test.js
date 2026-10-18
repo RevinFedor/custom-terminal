@@ -9,7 +9,8 @@ const { OrchestrationRunStore } = require('./orchestration-runs');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const capabilities = { navigation: { version: 1, renderedAck: true },
-  browserNavigation: { version: 1, exactJob: true, confirmedTab: true } };
+  browserNavigation: { version: 1, exactJob: true, confirmedTab: true },
+  browserSelection: { version: 1, field: 'browserId', jobOwnerPinned: true, offlinePreflight: true, jobMetadataReadOnly: true } };
 
 async function within(promise, ms = 1000) {
   let timer;
@@ -47,12 +48,13 @@ const methods = {
   capabilities: client => options => client.capabilities(options),
   start: client => options => client.start({ jobId: 'private-job', provider: 'chatgpt', prompt: 'fixture' }, options),
   status: client => options => client.status('private-job', options),
+  jobMetadata: client => options => client.jobMetadata('private-job', { ...options, capabilities }),
   stop: client => options => client.stop('private-job', options),
   openJob: client => options => client.openJob('private-job', { ...options, requestId: 'nav' }),
   openBrowser: client => options => client.openBrowser('private-job', { ...options, requestId: 'nav' }),
 };
 const paths = { capabilities: '/research-capabilities', start: '/research-start', status: '/research-status',
-  stop: '/research-stop', openJob: '/research-open', openBrowser: '/research-open-browser' };
+  jobMetadata: '/research-status', stop: '/research-stop', openJob: '/research-open', openBrowser: '/research-open-browser' };
 
 for (const method of Object.keys(methods)) test('actual HTTP body remains abortable after headers: ' + method, async t => {
   const h = await fixture(t, paths[method]);
@@ -68,7 +70,7 @@ for (const method of Object.keys(methods)) test('actual HTTP body remains aborta
   assert.ok(result.error); assert.equal(h.calls.filter(value => value === paths[method]).length, 1);
 });
 
-for (const method of ['capabilities', 'start', 'status', 'stop']) test('actual HTTP body uses the existing deadline: ' + method, async t => {
+for (const method of ['capabilities', 'start', 'status', 'jobMetadata', 'stop']) test('actual HTTP body uses the existing deadline: ' + method, async t => {
   const h = await fixture(t, paths[method]);
   const result = await within(methods[method](h.client)({}));
   assert.equal(result.settled, true, 'partial body must not wait forever');
@@ -105,7 +107,8 @@ test('all public methods preserve JSON results and typed HTTP errors over real l
     if (url.pathname === '/research-capabilities') res.end(JSON.stringify(capabilities));
     else if (url.pathname.startsWith('/research-open')) res.end(JSON.stringify({ ok: true, opened: true,
       jobId: 'private-job', requestId: 'nav', tabId: 7 }));
-    else res.end(JSON.stringify({ id: 'private-job', status: 'running' }));
+    else res.end(JSON.stringify({ id: 'private-job', status: 'running',
+      ...(url.searchParams.get('metadataOnly') === 'true' ? { metadataOnly: true, metadataSource: 'memory' } : {}) }));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });

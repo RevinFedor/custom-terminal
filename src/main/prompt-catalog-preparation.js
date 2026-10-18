@@ -341,6 +341,9 @@ class PreparedPromptCatalog {
     if (kind === 'tab' && (typeof id !== 'string' || !id)) throw Object.assign(Error('tab_id_required'), { code: 'tab_id_required' });
     if (kind === 'tab' && ctx.reader?.header && ctx.reader?.page) {
       const header = await ctx.control.step('authority', () => ctx.reader.header(id)), output = [];
+      for (const row of header.workflowSources || []) await ctx.control.step('authority', () =>
+        output.push(this.service.rootRegistry.decodeCatalogSource(row, header.namespace)));
+      if (header.workflowId) return output;
       let cursor = null;
       for (;;) {
         const page = await ctx.control.step('authority', () => ctx.reader.page(header, cursor));
@@ -436,6 +439,9 @@ class PreparedPromptCatalog {
       (a, b) => naturalCompare(a.sourceName, b.sourceName), ctx.control);
     const sources = [], prompts = [];
     for (const source of selected) {
+      // A newly shared workflow directory may not yet appear in the last
+      // background consumer inventory. Its ready event must wake this tab.
+      if (kind === 'tab') this.slot(source.rootPath).tabIds.add(id);
       const view = await this.view(source.rootPath, ctx), metadata = view.ready?.metadata;
       const facts = { docsPath: view.probe.docsPath, exists: view.probe.root.exists, docsExists: view.probe.docs.exists };
       const base = kind === 'tab' ? { ...source, ...facts } : { rootPath: source.rootPath, sourceName: source.sourceName, ...facts };
