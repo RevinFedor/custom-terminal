@@ -88,9 +88,10 @@ test('проекты workflow выводятся и из активной вкл
   }), ['p0', 'p1', 'p2']);
 });
 
-test('новое пространство ПУСТОЕ — ничего не создаётся само', () => {
+test('новое пространство содержит только постоянное пустое окно, без вкладок и процессов', () => {
   const res = addSpace([space('s1', 'main')], 's1', 's2');
-  assert.deepEqual(res.spaces[1].layout, emptySpaceLayout());
+  assert.deepEqual(res.spaces[1].layout, { ...emptySpaceLayout(),
+    splitPanes: [{ windowId: 's2:initial', projectId: '', tabId: '' }] });
   assert.deepEqual(res.spaces[1].projectIds, []);
   assert.equal(res.spaces[1].icon, null);
   assert.equal(res.activeSpaceId, 's2', 'и сразу становится текущим');

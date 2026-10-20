@@ -56,6 +56,10 @@ function fixture({throwAt=0,autocomplete=false,confirm=true,foreign=false,deny=n
     }
   }};
   const ctx=vm.createContext({...helpers,createCodexSlashInputDiagnostic,console:{log(...a){logs.push(a.join(' '));},warn(...a){logs.push(a.join(' '));}},
+    agentSendReceiptStore: null,
+    historySendReturnControl: () => ({ isReturned: () => false }),
+    writeHistorySendPayload: (term, data) => term.write(data), // no registered History return in this control
+    writeHistorySendEnter: (term, data) => term.write(data), // same controlled throw endpoint, timing has its own tests
     setTimeout(fn,ms){timers.set(++id,fn);return id;},clearTimeout(id){timers.delete(id);},
     getHeadlessTerminalMirror:()=>mirror,getHeadlessVisibleBufferSnapshot:frame,getHeadlessCodexDraftState:draft,
     flushHeadlessTerminalMirror:async()=>({success:true}),

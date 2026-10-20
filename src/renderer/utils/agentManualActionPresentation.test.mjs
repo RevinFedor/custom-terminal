@@ -75,3 +75,20 @@ test('actual History reporter uses information only for a proven unwritten manua
     { ...failure, code: 'unknown_failure' },
   ]) { report('T', different, { action: 'send' }); assert.equal(calls.at(-1)[1], 'error'); }
 });
+
+test('handled Goal with unknown process proof no longer renders the old Goal info summary', () => {
+  const info = { tabId: 'T', engine: 'codex', sessionId: 'S' };
+  const old = syncSessionStartingWithPresence(null, info, { status: 'active', inputReady: false,
+    manualActionRequired: true, lastNotReady: { reason: 'codex_resume_goal_action_required',
+      message: 'Завершите выбор для Goal в терминале.' } });
+  const state = syncSessionStartingWithPresence(old, info, { status: 'unknown', inputReady: false,
+    manualActionRequired: false, runtimePolicy: { type: 'resume-goal', phase: 'handled' },
+    lastNotReady: { reason: 'process_lookup_unknown', message: 'Process proof unavailable' } });
+  const result = evaluate('const getSessionStartingPresentation = ' + variable(hookAst, 'getSessionStartingPresentation')
+    + '; (' + summary + ')()', { sessionStarting: state, enabled: true, tabId: 'T',
+      agentStopping: null, handleDismiss() {}, handleRetry() {} });
+  assert.notEqual(result.kind, 'info');
+  assert.doesNotMatch(JSON.stringify(result), /Завершите выбор для Goal|Codex ждёт выбора/);
+  assert.equal(state.lastNotReady.reason, 'process_lookup_unknown');
+  assert.equal(state.inputReady, undefined);
+});

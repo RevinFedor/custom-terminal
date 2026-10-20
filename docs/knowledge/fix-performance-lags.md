@@ -445,6 +445,38 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab
   читается заново; pending очищается до dispatch, чтобы синхронный новый intent
   не был стёрт старым. Уникальный ID — invariant producer, не самостоятельное
   разрешение focus. Отдельного registry, таймера или scroll writer не добавлено;
+- С18.10 два height-effect `SplitPaneChrome` ищут настоящий tab-wrapper через
+  свежий indexed ID с exact fallback для legacy/missing/foreign узла. У пустой
+  панели `tabId=""`: wrapper отсутствует, поэтому helper возвращает null до DOM
+  lookup. Иначе каждый эффект делал полный безрезультатный поиск retained DOM.
+  Pane-scoped высота на chrome-host и ResizeObserver продолжают публиковаться;
+  новая вкладка получает прежний surface-height. Controlled Node22/Electron28
+  и собственная full-app диагностика с точной private JS-дельтой подтвердили
+  устранение этих поисков; whole-switch latency и установленная версия отдельно;
+- С18.10 `PaneToasts` заново на прежней effect-границе ищет свой
+  `terminal-toast-anchor:<tabId>` через indexed ID, проверяя dataset владельца.
+  Отсутствующий/чужой/legacy ID сохраняет прежний selector fallback. Node не
+  кэшируется; TerminalArea задаёт ID из того же tabId. В four-busy профиле прежний
+  querySelector был отдельным sampled owner; это не обещание фиксированного
+  выигрыша. Actual effect controls и full-app portal-проверки first/unfocused/
+  workflow return/re-add сохраняют eligibility и размещение. Whole-switch и
+  wheel latency измеряются отдельно, текущий положительный lookup не закрывает их;
+- С18.10 нулевое сохранённое смещение `WorkflowTabSidebar` присваивается без
+  JS-чтений scrollHeight/clientHeight. В обычном вертикальном контейнере прежний
+  clamp для нуля всегда давал ноль; ненулевые значения сохраняют прежний расчёт.
+  ResizeObserver, сам scrollTop setter и прекращение восстановления после
+  пользовательского wheel/pointer сохранены. Actual-source controls проверяют
+  отсутствие двух getter-вызовов и прежнее поведение; сам native setter ещё
+  может потребовать layout. Это не доказательство выигрыша всего переключения;
+- С19.10 соседние bottom-решения в `HistoryPanel.handleScroll` используют одно
+  свежее расстояние: вызов `isHistoryAtContentBottom(el)` повторял те же три DOM
+  getter без промежуточных callbacks/writes. Здесь default threshold равен4px;
+  custom slack других caller'ов не переносится. Между событиями геометрия не
+  кэшируется, остальные чтения после callbacks/writes остаются свежими.
+  `historyScrollBottomSample.actual.test.mjs` исполняет полный callback и
+  различает повтор, границу4px, позднюю геометрию и подмену follow-intent.
+  Private four-busy at-tail/reading/native проверили сохранность поведения;
+  вклад этой пары в runtime pause и whole latency по-прежнему не установлен;
 - focus quarantine обрабатывает boundaries по одной background `scheduler.postTask` (`MessageChannel` capability fallback), без rAF/setTimeout в navigation contract;
 - С11.10 повторный discovery известных pane/center/workspace boundaries не
   обходит retained descendants в каждом sync/deferred task. Manager хранит DOM
@@ -527,6 +559,17 @@ RAM eviction, schema/source invalidation и disk eviction нельзя объя�
 Сопоставимый UI A/B улучшился, но continuous input всё ещё имеет задержки>100ms;
 source controls или быстрое первое нажатие не заменяют всю latency-серию. Замеры
 и ограничения — `docs/tmp/оптимизация-history.md`; shared encoding — `fact-tabs.md`.
+
+19.10 отдельный профиль начала настоящего pane-drag под четырьмя работающими
+Luna показал лишний JSON-обход всех workflow layouts внутри immutable admission:
+каждая раскладка сначала копировалась отдельно, затем ещё раз вместе с полным
+снимком. Сохранён один общий detached/frozen snapshot; guards, payload и их
+срок действия не сокращены. На actual model с11workflow проходов по каждому
+layout стало2→1, результат и same/cross-workflow requests совпали. Старый inner
+обход имел16.291мс sampled weight; это не измеренный latency gain и не вся цена
+pickup. Остальные React/native/GC участки остаются отдельными. Интерфейс и новые
+ответы агентов на время жеста не замораживаются; private native A/B этой Source
+дельты и полный post-drop compositor результат ещё не приняты.
 
 ## 7b. Пустой поиск чата инвалидировал стили всех окон
 
@@ -695,6 +738,69 @@ Compositor FRAME_SWAP не равен физическим пикселям. Р�
 и её координату. Точные cuts, отказавшие probes и installed-граница — в рабочем
 `docs/tmp/оптимизация-history.md`, не в обещании нулевой фоновой стоимости.
 
+19.10 отдельный путь остался у очищенного selection: xterm RenderService всегда
+передавал его renderer, а DOM renderer перерисовывал все строки даже без выделения.
+В native four-busy записи exact owner observer увидел38 empty events, включая
+скрытые workflow; их211.3мс суммарных listener spans не являются ожидаемой экономией.
+В прежнем presentation adapter coalesce разрешён только готовому скрытому terminal
+после первого прохода того же renderer и при обоих selection ends строго undefined.
+Logical selection-state обновляется сразу: пропуск этих записей возвращал старую
+подсветку при замене renderer, хотя Copy уже видел пустое выделение. Глобальный
+empty-skip тоже неверен — новый renderer ещё может не иметь нарисованных строк.
+Prewarm, visible-unfocused, первый запрос нового renderer, nonempty/partial/zero-length
+остаются upstream; reveal применяет latest state к текущему renderer. Обычные
+row paints, parser, resize/theme/decorations и render/write signals продолжаются.
+Actual xterm controls на Node22/Electron28 сохраняют эти границы. В R38 новая
+дельта действительно загружена под четырьмя Luna: empty listener spans во время
+удержания стали не больше0.1мс при разрешении recorder0.1мс, а прежний cut давал
+16.7–26.9мс max по владельцам. Это стеночные spans, не нулевая CPU-цена или whole
+выигрыш. Callback gaps233–255мс с React/GC остались; POST отказал на дополнительном
+post-move AX hit-test после штатного mouse-up и durable apply. Полная native/body
+приёмка и whole-path результат по-прежнему отдельно, детали — в рабочем tmp.
+
+## 7g. History повторно собирал уже сохранённые durable identity
+
+`useRef(new Set(snapshot.entries.flatMap(...)))` вычисляет аргумент при каждом
+render, хотя React сохраняет только первое значение. Поэтому собственный live
+update History заново проходил весь cached snapshot, включая невидимые строки.
+Инициализация прежнего ref теперь выполняется только при `null`; owner reset
+по-прежнему пишет пустой Set и не возвращает старый cache. Canonical layout-effect
+также строил Set прямо перед reconciliation, который сам синхронно заменяет его
+до ранних return. Удалён только первый из этих одинаковых обходов. Exact aliases,
+owner guards, committed retirement и передача локального prompt сохранены; новых
+identity cache, hidden-adoption ограничений и отложенных publications нет.
+
+Actual extracted блоки + production reconciler дают три различающих RED на
+прежнем исходнике и11 PASS на Node22/Electron28 после правки; React hook slots и
+layout-effect в контроле подменены. Счёт60→8 обходов четырёх owners — объём работы,
+не время. Вклад именно этих обходов в прежние233–255ms R38 и whole native/body
+приёмка остаются открытыми; широкую App-подписку нельзя автоматически считать
+причиной всех retained History renders через memo-host.
+
+R39 отдельно проверил собранные PRE/POST под четырьмя живыми Luna и своим PTY
+producer: оба переноса332/332, следующий клик и поздние correct body pixels,
+сессия/семейство/черновик и canonical86/84 подтверждены. Три новых вывода producer
+получены при удержании в каждом arm. Callback max437→147ms в этой паре не даёт
+whole-gain: N1/arm, история выросла, renderer CPU первых2s1.61–1.62→1.82–1.83s.
+Selected trace не содержит cc/gpu/v8/blink; actual HPL traversal count по owners
+и цена AX/profiler/screencast не измерены. Независимый точный join загруженного PRE
+App с raw profile подтвердил именно callback eager initializer: семь sample-интервалов,
+26.542ms веса в первых2s; в худшем gap только1.083ms. Путь исполнялся, но samples
+не являются числом вызовов или оценкой causal gain. В POST counterpart не sampled,
+что тоже не доказывает ноль вызовов. Не назначать весь React или `(program)`
+этому исправлению. Точные версии/профили/ограничения — в рабочем tmp темы.
+
+С19.10 нормализация live/durable History не готовит сортировочные записи для
+уже упорядоченного участка: инверсия определяется при прежнем проходе до его
+конца. Неизвестная позиция и другая session остаются барьерами; при инверсии
+сортируется весь прежний участок с сохранением arrival ties. Между вызовами
+результат не кэшируется: те же array/object identities могут получить новый
+offset, append или alias. Full-module controls на Node22/Electron28 различают
+лишнюю подготовку и неправильные варианты порядка, сохраняя ссылки и inputs.
+Это устранение source-работы, не измеренные heap bytes/GC или runtime gain:
+размеры и упорядоченность actual R50 inputs не были сохранены, полная UI-приёмка
+нового renderer остаётся отдельной. Сам helper по-прежнему выполняет линейный merge.
+
 ## 7f. Cmd публиковал React-state без доступной подсказки
 
 Удерживаемый ControlBar запоминал Meta/strict-Ctrl через два React-state на
@@ -744,6 +850,18 @@ hashing и SQL PREPARE в Main. Source-ремонт переиспользует
 192 executions, stat54→6. Этот профиль снят после trigger, а не на wheel17:18:
 счётчики доказывают устранение лишних операций, не ускорение того жеста.
 Границы свежести и retirement debounce — [каталог промптов](fact-project-prompts.md).
+
+19.10 повторный запуск exact incident bundle f11da5fc дал около2.95s sampled
+union catalog preparation в4.14s Main profile. Это повторное наблюдение того же
+cut, не стек исходного11:08 и не сумма async spans. Общая usage inventory заново
+собирала tab headers при unrelated History/status writes; sibling I/O parent
+sentinel дополнительно планировал consumer reconciliation. Source-ремонт делит
+pending inventory, сохраняет SQL ownership только под certified catalog-input
+epoch и переиспользует её при reconciliation. FS/layout/watch/physical-leaf proof
+каждого получателя остаётся свежим; preparing/unknown не становится ready. Cold
+FS failure не уничтожает независимо проверенную SQL projection. Native renderer
+работа и причина каждого старого ps timeout этим профилем не локализованы;
+UI/no-lag принимаются отдельным installed сценарием, не счётчиками Source controls.
 
 После пользовательской установки Diagnostic25 в13Oct18:24UTC именованные production
 summaries показали оставшуюся работу этого caller: один `catalog.usageForRoot` занял

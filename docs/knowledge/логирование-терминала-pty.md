@@ -92,11 +92,20 @@ attempt/return/throw, task ID, enqueue, fd-call, partial/EAGAIN/error/complete.
 только suffix в rolling; pinned tail сохраняет раннюю часть и учитывает
 последующее переполнение, не вытесняя уже зафиксированный prefix.
 
-Хвост наблюдается до соответствующего current committed/closed/flushed кадра,
-смены owner epoch, завершения/dispose либо diagnostic deadline60s. Бюджет хвоста
-может закончиться раньше. Завершённый кадр не обязательно означает пустой input,
-доставку Send или окончание ответа. Этот срок не является Main preparation
-deadline и ничего не разрешает писать в терминал.
+Обычное окно наблюдает хвост до current committed/closed/flushed кадра,
+смены owner epoch, завершения/dispose либо diagnostic deadline60s. У отказавшего
+owned `/model`/`/fast`/`/compact` применяется более точная граница: matching
+receipt/trace удерживает pin до release именно этой служебной операции. Первый
+поздний OSC может commit'ить неизменённый экран и не завершает её диагностику.
+При release сохраняется отдельный existing forensic snapshot конечного экрана
+со ссылкой на тот же raw manifest, без нового pin/ввода/повтора команды.
+
+Deadline60s и byte budgets не продлеваются; если они закончились до release,
+`completion.pending` и причина `tail-deadline` явно оставляют прикладной конец
+непокрытым. Complete сохранённого диапазона не означает complete всей попытки.
+Завершённый кадр не обязательно означает пустой input, доставку Send или конец
+ответа. Диагностический срок не является Main preparation deadline и ничего
+не разрешает писать в терминал.
 
 Обычное успешное действие не создаёт raw incident само по себе. Уже сохранённый
 инцидент **не удаляется немедленно от позднего успеха**: хвост как раз может

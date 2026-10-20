@@ -31,6 +31,36 @@ function exported(name) {
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
+test('returned History H cannot begin a late Main attempt; next original FIFO item still dispatches', async t => {
+  const h = harness(t, 'codex');
+  const control = require('./history-send-return').historySendReturnControl(h.store);
+  const identity = { tabId: 'T', handoffId: 'returned', token: 'return-before-admission', provider: 'codex' };
+  assert.equal(control.register(identity).success, true);
+  assert.equal(control.request(identity).returned, true);
+  await h.send('returned'); await tick(); await tick();
+  const old = h.store.get('history:T:returned');
+  assert.equal(old.attemptId, null); assert.equal(old.state, 'not-submitted');
+  assert.equal(old.receipt.code, 'history_send_returned'); assert.equal(h.writes.length, 0);
+  await h.send('next'); await tick(); await tick();
+  assert.equal(h.writes.length, 1); assert.equal(h.writes[0].handoffId, 'next');
+});
+
+test('returning waiting History follower does not cancel native queued head or next follower', async t => {
+  const h = harness(t, 'codex');
+  await h.send('head'); await tick();
+  await h.send('returned', { authoringSnapshot: { editorText: 'test returned', chips: [], imagePaths: [] } });
+  await h.send('next'); await tick();
+  const controls = require('./history-send-return').historySendReturnControl(h.store);
+  const selected = controls.read('T', 'returned'); assert.ok(selected);
+  assert.equal(controls.request(selected).returned, true);
+  assert.equal(h.queue.cancelWaiting('T', 'returned', { dismiss: false }).cancelled, true);
+  assert.equal(h.store.isDeliveryCancelled('history:T:head'), false);
+  assert.equal(h.store.isDeliveryCancelled('history:T:next'), false);
+  assert.equal(h.writes.length, 1);
+  h.confirm('head'); await tick(); await tick();
+  assert.deepEqual(h.writes.map(row => row.handoffId), ['head', 'next']);
+});
+
 function harness(t, provider, options = {}) {
   const db = new Database(options.database || ':memory:');
   const store = createAgentSendReceiptStore(db);
@@ -38,6 +68,9 @@ function harness(t, provider, options = {}) {
   let targetSession = 'S';
   const context = vm.createContext({
     require, path, srcMainDir: __dirname,
+    // Match the private admission capability now present in the real Main.
+    // Ordinary user sends never receive this symbol as a serialized field.
+    COMPLETION_ADMISSION: Symbol('owned-external-completion-admission'),
     ...require('./agent-send-preparation'),
     ...registry, agentSendReceiptStore: store, agentSendReceiptRegistry: registry.createAgentSendReceiptRegistry(),
     agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,
@@ -1109,6 +1142,7 @@ function actualOwnedBridge(t, h, { enter = false } = {}) {
   const { createFakeClock } = require('./fixtures/codex-draft-request-observation.cjs');
   const cancellations = require('./agent-send-cancellation').createAgentSendCancellationRegistry();
   const clock = createFakeClock(), sender = new EventEmitter(), ipcMain = new EventEmitter(), dispatched = [];
+  const diagnostics = require('./http-read-diagnostics');
   sender.mainFrame = { processId: 41, routingId: 3 };
   sender.send = (_channel, message) => {
     dispatched.push(message);
@@ -1121,6 +1155,8 @@ function actualOwnedBridge(t, h, { enter = false } = {}) {
   const frameKey = frameAst.statements.find(n => ts.isVariableStatement(n)
     && n.declarationList.declarations.some(d => d.name.getText(frameAst) === 'frameKey')).getText(frameAst);
   Object.assign(h.context, { pendingBridge: new Map(), ipcMain,
+    beginHttpReadDependency: diagnostics.beginHttpReadDependency,
+    httpReadDiagnostics: diagnostics.createHttpReadDiagnostics({ serviceId: 'owned-bridge', enabled: false, log() {} }),
     BrowserWindow: { getAllWindows: () => [{ webContents: sender, isDestroyed: () => false }] },
     LATE_BRIDGE_REPLY_RETENTION_MS: 10000, e2eBoundaryTestGate: null,
     setTimeout: clock.setTimer, clearTimeout: clock.clearTimer,
@@ -1200,4 +1236,124 @@ test('preparation: actual bridge timeout keeps unknown and late receipt ownershi
   assert.equal(h.context.pendingBridge.size, 0);
   assert.equal(b.sender.listenerCount('destroyed'), 0);
   assert.equal(b.dispatched.length, 1);
+});
+
+// Full current Main kernel + its actual restored-FIFO execute factory. Content
+// preparation/runtime lookup and the final renderer/PTY remain controlled.
+async function completionKernel(t) {
+  const parent = path.join(require('node:os').homedir(), 'Library/Application Support/sc-desktop/test-artifacts/research-autonomy-20261019');
+  fs.mkdirSync(parent, { recursive: true });
+  const root = fs.mkdtempSync(path.join(parent, 'completion-kernel-'));
+  let queue, runs;
+  t.after(async () => { queue?.dispose(); await runs?.flush(); fs.rmSync(root, { recursive: true, force: true }); });
+  const h = harness(t, 'codex'); h.queue.dispose();
+  const local = require('./external-research-completion-delivery');
+  vm.runInContext(declaration('revokeExternalCompletionDelivery'), h.context);
+  runs = new (require('./orchestration-runs').OrchestrationRunStore)(path.join(root, 'runs.json'), {
+    onCompletionRevoked: (run, delivery) => h.context.revokeExternalCompletionDelivery(run, delivery),
+  });
+  await runs.reserveOrGet({ runId: 'kernel-R', runKind: 'external-research', requestFingerprint: 'owned-kernel',
+    sourceTabId: 'T', sourceProjectId: 'P', sourceSessionId: 'S', sourceToolType: 'codex',
+    sourceSendTarget: { toolType: 'codex', sessionId: 'S' }, notifySource: true,
+    externalResearchJobId: 'noted_kernel-R', externalResearchIntent: { provider: 'chatgpt', prompt: 'owned', options: {}, files: [] } });
+  await runs.applyExternalResearchSnapshot('kernel-R', { id: 'noted_kernel-R', provider: 'chatgpt', status: 'done', result: { text: 'owned result' } });
+  const run = await runs.getInternal('kernel-R'), d = run.externalResearchDelivery;
+  const request = { tabId: 'T', handoffId: 'orchestration-complete:kernel-R', prompt: 'owned frozen result',
+    sendOperationKey: 'history:T:orchestration-complete:kernel-R', sendSurface: 'desktop-history',
+    source: 'orchestration-completion:kernel-R', provider: 'codex', sessionId: 'S',
+    expectedTarget: { toolType: 'codex', sessionId: 'S' }, queue: true, ownership: 'project',
+    statusAtSend: 'busy', workContextPrepared: true, timeoutMs: 1000 };
+  h.store.pinForOwner(request.sendOperationKey, local.PIN);
+  await runs.updateExternalResearchDelivery(run.runId, d.id, { request,
+    requestHash: require('node:crypto').createHash('sha256').update(JSON.stringify(request)).digest('hex'),
+    retentionPinned: true, phase: 'admitting' });
+  const frozen = local.frozenRequest((await runs.getInternal(run.runId)).externalResearchDelivery);
+  let resolves = 0, afterLookup = false, afterLookupResolves = 0, ready = false;
+  h.context.getExternalCompletionDelivery = () => ({ resolve: value => {
+    resolves++; if (afterLookup) afterLookupResolves++;
+    return local.resolveCompletionRequest(runs, value);
+  } });
+  let factory;
+  const visit = node => {
+    if (ts.isNewExpression(node) && node.expression.getText(ast) === 'AgentSendQueue') {
+      factory = node.arguments[0].properties.find(p => p.name?.getText(ast) === 'execute').initializer;
+    }
+    ts.forEachChild(node, visit);
+  }; visit(ast); assert(factory);
+  const actualExecute = vm.runInContext('(' + factory.getText(ast) + ')', h.context), executions = [];
+  const makeQueue = () => {
+    queue = new AgentSendQueue({ store: h.store, ready: () => ready, execute: (value, scope) => {
+      const result = actualExecute(value, scope); executions.push(result); return result;
+    } });
+    h.context.agentSendQueue = queue;
+  };
+  makeQueue();
+  const identity = { operationKey: frozen.sendOperationKey, tabId: 'T', handoffId: frozen.handoffId,
+    surface: 'desktop-history', provider: 'codex', sessionId: 'S', promptLength: frozen.prompt.length,
+    promptHash: promptAuditFingerprint(frozen.prompt), requestFingerprint: registry.fingerprintAgentSendRequest(frozen) };
+  return { h, runs, frozen, executions,
+    reopenWithoutBirth: async () => {
+      await runs.flush();
+      const file = path.join(root, 'runs.json'), saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+      delete saved.runs[0].externalResearchDeliveryBirth;
+      delete saved.runs[0].externalResearchDelivery.birthId;
+      fs.writeFileSync(file, JSON.stringify(saved));
+      runs = new (require('./orchestration-runs').OrchestrationRunStore)(file, {
+        onCompletionRevoked: (run, delivery) => h.context.revokeExternalCompletionDelivery(run, delivery),
+      });
+      await runs.initialize();
+    },
+    get queue() { return queue; }, get resolves() { return resolves; }, get afterLookupResolves() { return afterLookupResolves; },
+    enqueue: () => queue.enqueue({ identity, request: frozen }),
+    restore: () => { queue.dispose(); makeQueue(); },
+    markLookupFinished: () => { afterLookup = true; },
+    activate: () => { ready = true; queue.resume(); },
+  };
+}
+
+test('completion kernel: actual restored FIFO restores private capability and reaches renderer exactly once', async t => {
+  const f = await completionKernel(t), admitted = f.enqueue(); assert.equal(admitted.ok, true);
+  const id = f.queue.item(f.frozen.sendOperationKey).id;
+  f.restore(); f.activate(); await f.queue.result(f.frozen.sendOperationKey); await Promise.all(f.executions);
+  assert.equal(f.queue.item(f.frozen.sendOperationKey).id, id);
+  assert.equal(f.h.writes.length, 1); assert.equal(f.h.writes[0].prompt, f.frozen.prompt);
+  assert.equal(f.h.writes[0].expectedSessionId, 'S');
+  // This wrapper sees admission and pre-attempt reads; prepareSend uses the
+  // module's direct recursive guard rather than the wrapper counter.
+  assert(f.resolves >= 2);
+});
+
+test('completion kernel: external request cannot manufacture the private admission capability', async t => {
+  const f = await completionKernel(t);
+  await assert.rejects(f.h.context.runPreparedAgentSendScenario(f.frozen), { code: 'completion_admission_required', submitted: false });
+  assert.equal(f.h.writes.length, 0); assert.equal(f.h.store.get(f.frozen.sendOperationKey), null);
+});
+
+test('completion kernel: loaded birthless v1 request cannot dispatch through actual restored FIFO and Main guard', async t => {
+  const f = await completionKernel(t); assert.equal(f.enqueue().ok, true);
+  const original = f.queue.item(f.frozen.sendOperationKey);
+  await f.reopenWithoutBirth(); f.restore(); f.activate();
+  await f.queue.result(f.frozen.sendOperationKey); await Promise.allSettled(f.executions);
+  assert.equal(f.h.writes.length, 0);
+  const receipt = f.h.store.get(f.frozen.sendOperationKey);
+  assert.equal(receipt.attemptId, null); assert.equal(receipt.state, 'not-submitted');
+  assert.equal(f.queue.item(f.frozen.sendOperationKey).id, original.id);
+  assert.equal(f.queue.item(f.frozen.sendOperationKey).request_json, original.request_json);
+});
+
+for (const change of ['suppressed', 'source-replaced', 'notify-off']) test('completion kernel: ' + change + ' during actual destination await is checked again before attempt', async t => {
+  const f = await completionKernel(t); let entered, release;
+  const arrived = new Promise(resolve => { entered = resolve; }), held = new Promise(resolve => { release = resolve; });
+  f.h.context.readAgentRuntimeSnapshot = () => {};
+  f.h.context.readScenarioDestination = async () => { entered(); await held; f.markLookupFinished(); return { toolType: 'codex', sessionId: 'S' }; };
+  assert.equal(f.enqueue().ok, true); f.restore(); f.activate(); await arrived;
+  try {
+    if (change === 'suppressed') await f.runs.markNotification('kernel-R', 'suppressed');
+    else { await f.runs.patch('kernel-R', change === 'notify-off' ? { notifySource: false }
+      : { sourceSendTarget: { toolType: 'codex', sessionId: 'replacement' } }); await f.runs.persistStrict(); }
+  } finally { release(); }
+  await Promise.allSettled(f.executions); await tick();
+  assert(f.afterLookupResolves > 0, 'the current Main kernel actually reran the completion owner guard after its awaited destination read');
+  assert.equal(f.h.writes.length, 0); assert.equal(f.h.store.get(f.frozen.sendOperationKey).attemptId, null);
+  assert.equal(f.h.store.isDeliveryCancelled(f.frozen.sendOperationKey), true);
 });

@@ -31,7 +31,9 @@ function install() {
   };
   const move=(event:PointerEvent)=>{
     point={x:event.clientX,y:event.clientY};
-    held=event.metaKey || held;paint();
+    // Visible unfocused windows receive hover but may never receive the keyup
+    // sent to another application. Each pointer event carries current truth.
+    held=event.metaKey;paint();
   };
   const key=(event:KeyboardEvent)=>{if(event.key==='Meta'){
     const actionId=currentUIActionId(),started=performance.now();

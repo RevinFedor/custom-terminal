@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { codexOwnLaunchServiceTier } = require('./subagent-launch-settings');
+const { codexOwnLaunchServiceTier, inspectCodexOwnLaunchServiceTier } = require('./subagent-launch-settings');
 const { createSubagentStepProjectionState, codexRecordToSteps, readAgentStepsAsync,
   findCodexSubagentNewTaskBoundary } = require('./subagent-transcript');
 
@@ -18,6 +18,44 @@ const context = { type: 'turn_context', payload: { model: 'gpt-6-luna', effort: 
 const state = () => createSubagentStepProjectionState({ codexSessionId: 'child-A' });
 const apply = (projection, ...records) => records.flatMap(record => codexRecordToSteps(record, projection));
 const jsonl = records => records.map(record => JSON.stringify(record)).join('\n') + '\n';
+
+test('tier diagnostics distinguish missing, explicit null, unsupported values and owner refusal without changing proof', () => {
+  const missing = snapshot('priority'); delete missing.payload.thread_settings.service_tier;
+  const cases = [[missing, 'tier-field-absent'], [snapshot(null), 'tier-null'],
+    [snapshot('UNRETAINED_SECRET_VALUE'), 'tier-unsupported-string'], [snapshot(true), 'tier-invalid-type'],
+    [snapshot('priority'), 'priority'], [snapshot('default'), 'default']];
+  for (const [record, reason] of cases) {
+    const result = inspectCodexOwnLaunchServiceTier(record, 'child-A', 'child-A');
+    assert.equal(result.reason, reason);
+    assert.deepEqual(result.proof, codexOwnLaunchServiceTier(record, 'child-A', 'child-A'));
+    assert.ok(!JSON.stringify(result).includes('UNRETAINED_SECRET_VALUE'));
+  }
+  assert.equal(inspectCodexOwnLaunchServiceTier(snapshot('priority', 'parent'), 'child-A', 'child-A').reason, 'foreign-thread');
+  assert.equal(inspectCodexOwnLaunchServiceTier(snapshot('priority'), 'child-A', 'child-B').reason, 'root-owner-mismatch');
+  assert.equal(inspectCodexOwnLaunchServiceTier(context, 'child-A', 'child-A'), null);
+});
+
+test('launch diagnostics separate no initial snapshot, accepted empty value and later settings', () => {
+  const missing = state();
+  apply(missing, meta, snapshot('priority', 'parent'), newTask, context,
+    { ...snapshot('priority'), __line: 10, __byteOffset: 1200 });
+  assert.equal(missing.launchServiceTier, null);
+  assert.equal(missing.launchTierDiagnostics.reason, 'initial-snapshot-not-observed');
+  assert.equal(missing.launchTierDiagnostics.foreign, 1);
+  assert.equal(missing.launchTierDiagnostics.lateOwn, 1);
+  assert.equal(missing.launchTierDiagnostics.firstLateReason, 'priority');
+  assert.equal(missing.launchTierDiagnostics.firstLateLine, 10);
+  assert.equal(missing.launchTierDiagnostics.firstLateOffset, 1200);
+  apply(missing, snapshot('default'));
+  assert.equal(missing.launchTierDiagnostics.firstLateReason, 'priority', 'keep the first late observation, not current settings');
+  const empty = state(); apply(empty, meta, snapshot(null), newTask, context);
+  assert.equal(empty.launchTierDiagnostics.reason, 'tier-null');
+  assert.ok(empty.launchServiceTier, 'an accepted own snapshot is distinct from no snapshot');
+  const absent = snapshot(null); delete absent.payload.thread_settings.service_tier;
+  const noField = state(); apply(noField, meta, absent, newTask, context);
+  assert.equal(noField.launchTierDiagnostics.reason, 'tier-field-absent');
+  assert.ok(JSON.stringify(noField.launchTierDiagnostics).length < 512);
+});
 
 for (const [input, expected] of [['priority', 'priority'], ['fast', 'priority'], ['default', 'default'],
   [null, null], [undefined, null], ['flex', null], [true, null]]) {
@@ -90,6 +128,8 @@ test('selected reader keeps tier at empty EOF and across chunks; replay/truncati
     assert.equal(eof.launchServiceTier, second.launchServiceTier);
     assert.equal(eof.offset, second.offset);
     assert.deepEqual(eof.steps, []);
+    assert.equal(projection.launchTierDiagnostics.reason, 'priority');
+    assert.equal(projection.launchTierDiagnostics.lateOwn, 1);
     fs.writeFileSync(filePath, jsonl([{ type: 'session_meta', payload: { id: 'child-A' } }, snapshot('default')]));
     const reset = await readAgentStepsAsync({ toolType: 'codex', filePath, sessionId: 'child-A', projectionState: projection, offset: eof.offset });
     assert.equal(reset.reset, true);
@@ -97,6 +137,8 @@ test('selected reader keeps tier at empty EOF and across chunks; replay/truncati
     fs.writeFileSync(filePath, jsonl([{ type: 'session_meta', payload: { id: 'child-A' } }, context]));
     const replay = await readAgentStepsAsync({ toolType: 'codex', filePath, sessionId: 'child-A', projectionState: projection, offset: 0 });
     assert.equal(replay.launchServiceTier, null);
+    assert.equal(projection.launchTierDiagnostics.reason, 'initial-snapshot-not-observed');
+    assert.equal(projection.launchTierDiagnostics.lateOwn, 0, 'reset cannot retain another source diagnostic');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -136,11 +178,13 @@ test('partial settings line cannot publish Fast before the full committed JSON r
     const projection = state();
     const partial = await readAgentStepsAsync({ toolType: 'codex', filePath, sessionId: 'child-A', projectionState: projection });
     assert.equal(partial.launchServiceTier, null);
+    assert.equal(projection.launchTierDiagnostics.partial, true);
     const pending = await findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId: 'child-A' });
     assert.equal(pending.launchServiceTier, null);
     fs.appendFileSync(filePath, line.slice(split) + '\n' + jsonl([newTask, context]));
     const committed = await readAgentStepsAsync({ toolType: 'codex', filePath, sessionId: 'child-A', projectionState: projection, offset: partial.offset });
     assert.equal(committed.launchServiceTier.serviceTier, 'priority');
+    assert.equal(projection.launchTierDiagnostics.partial, false);
     const boundary = await findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId: 'child-A', resume: pending });
     assert.equal(boundary.found, true);
     assert.equal(boundary.launchServiceTier.serviceTier, 'priority');
@@ -157,7 +201,26 @@ test('NEW_TASK scan skips oversized settings without retaining their payload or 
     assert.equal(boundary.found, true);
     assert.equal(boundary.launchServiceTier, null);
     assert.equal(boundary.launchServiceTierBlocked, true, 'do not promote a later small update over skipped initial metadata');
+    assert.equal(boundary.launchTierDiagnostics.reason, 'settings-record-too-large');
+    assert.equal(boundary.launchTierDiagnostics.oversized, 1);
     assert.ok(JSON.stringify(boundary).length < 1024);
     assert.ok(boundary.offset > 600_000);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('prefix diagnostics distinguish committed malformed settings from an unfinished line without another scan', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-child-tier-diagnostic-'));
+  const filePath = path.join(dir, 'synthetic-child.jsonl');
+  try {
+    const malformed = '{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"child-A",BROKEN}';
+    fs.writeFileSync(filePath, jsonl([meta]) + malformed + '\n' + jsonl([newTask, context]));
+    const broken = await findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId: 'child-A' });
+    assert.equal(broken.launchServiceTier, null);
+    assert.equal(broken.launchTierDiagnostics.reason, 'settings-record-invalid-json');
+    assert.equal(broken.launchTierDiagnostics.malformed, 1);
+    fs.writeFileSync(filePath, jsonl([meta]) + JSON.stringify(snapshot('priority')).slice(0, 110));
+    const partial = await findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId: 'child-A' });
+    assert.equal(partial.launchTierDiagnostics.partial, true);
+    assert.equal(partial.launchTierDiagnostics.malformed, 0, 'incomplete is not a committed malformed record');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

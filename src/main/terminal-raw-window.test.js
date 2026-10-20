@@ -1,6 +1,6 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
-const { createTerminalRawWindow, observeTerminalRaw, EVENT_CHARGE } = require('./terminal-raw-window');
+const { createTerminalRawWindow, observeTerminalRaw, EVENT_CHARGE } = require(process.env.RAW_CONTROL_SOURCE || './terminal-raw-window');
 
 function fixture(limits = {}, persistOverride) {
   let time = 1000, timerId = 0;
@@ -105,4 +105,48 @@ test('recent age eviction is separate from byte pressure', () => {
   const h = fixture({ ageMs: 1000 }); h.output('old'); h.at(3000); h.output('recent'); h.pin();
   assert.equal(text(h.events[0].entries), 'recent');
   assert.equal(h.events[0].summary.pre.lossBeforeCapture.reasons.age, 1);
+});
+
+test('joined owned completion extends no clock and only exact receipt keys settle the same pin', () => {
+  const h = fixture(); h.output('before'); const a = h.pin();
+  const timer = [...h.timers.values()][0].at;
+  h.at(2000); const b = h.pin({ completionKey: 'receipt-A' });
+  assert.equal(b.id, a.id); assert.equal(b.completionRegistered, true);
+  h.pin({ completionKey: 'receipt-B' });
+  assert.equal([...h.timers.values()][0].at, timer);
+  h.output('OSC'); h.commit(); assert.equal(h.journal.snapshot().activePins, 1);
+  assert.equal(h.journal.settle({}, { id: a.id, completionKey: 'receipt-A' }, h.identity), false);
+  assert.equal(h.journal.settle(h.token, { id: 'wrong', completionKey: 'receipt-A' }, h.identity), false);
+  assert.equal(h.journal.settle(h.token, { id: a.id, completionKey: 'foreign' }, h.identity), false);
+  assert.equal(h.journal.settle(h.token, { id: a.id, completionKey: 'receipt-A' }, h.identity), false);
+  assert.equal(h.journal.snapshot().pins[0].completion.pending, 1);
+  assert.equal(h.journal.settle(h.token, { id: a.id, completionKey: 'receipt-B' }, h.identity), true);
+  assert.equal(h.events.at(-1).summary.end.reason, 'owned-control-released');
+  assert.equal(h.events.at(-1).summary.completion.pending, 0);
+});
+
+test('old completion cannot seal a replacement incident or cross its owner epoch', () => {
+  const h = fixture(); h.output('before'); const a = h.pin({ completionKey: 'old' });
+  h.identity.runSeq++; h.output('new owner');
+  assert.equal(h.events.at(-1).summary.end.reason, 'owner-epoch-changed');
+  const b = h.pin({ completionKey: 'new' });
+  assert.equal(h.journal.settle(h.token, { id: a.id, completionKey: 'old' }, h.identity), false);
+  assert.equal(h.journal.snapshot().pins[0].id, b.id);
+  h.identity.stopRevision++;
+  assert.equal(h.journal.settle(h.token, { id: b.id, completionKey: 'new' }, h.identity), false);
+  assert.equal(h.events.at(-1).summary.end.reason, 'owner-epoch-changed');
+});
+
+test('completion registration is bounded and diagnostic expiry remains unresolved, not successful input', () => {
+  const h = fixture({ tailBytes: 1024 }); h.output('baseline'); const a = h.pin({ completionKey: 'key-0' });
+  for (let i = 1; i <= 20; i++) h.pin({ completionKey: 'key-' + i });
+  assert.equal(h.journal.snapshot().pins[0].completion.registered, 16);
+  assert.equal(h.journal.snapshot().pins[0].completion.omitted, 5);
+  h.output('x'.repeat(2000)); h.output('late'); h.commit();
+  assert.equal(h.journal.snapshot().activePins, 1);
+  h.expire(); const end = h.events.at(-1).summary;
+  assert.equal(end.end.reason, 'tail-deadline'); assert.equal(end.completion.pending, 16);
+  assert.equal(end.tail.complete, false); assert.ok(end.tail.droppedCodeUnits > 0);
+  assert.equal(h.journal.settle(h.token, { id: a.id, completionKey: 'key-0' }, h.identity), false);
+  assert.equal(h.pin({ completionKey: 'bad\nkey' }).reason, 'invalid-completion-key');
 });

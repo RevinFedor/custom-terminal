@@ -128,6 +128,20 @@ export function markCoordinatedAgentSendDispatch(tabId, token) {
   return true;
 }
 
+// Main has confirmed a return-before-input. Release only the pre-dispatch UI
+// lease; a late context/image promise cannot bind/dispatch with its old token.
+// No Stop request, no follower cancellation and no launch-abort signal.
+export function releaseReturnedHistoryPreparation(tabId, handoffId) {
+  const key = String(tabId || '');
+  const queue = actionQueue(key), state = queue[0];
+  if (!state || state.handoffId !== handoffId || state.transportStarted
+    || state.stopRequestedAt !== null || state.phase !== 'sending') return false;
+  queue.shift();
+  if (!queue.length) actionsByTab.delete(key);
+  emit(key, 'send-settled');
+  return true;
+}
+
 export function isCoordinatedAgentSendCancellationRequested(tabId, token) {
   const state = actionQueue(String(tabId || ''))
     .find((candidate) => candidate.token === token);

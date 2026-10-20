@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const { startSnapshotPrune } = require('./workflow-snapshot-prune');
 const { orderedWorkflows } = require('../shared/workflow-order.cjs');
+const {mergePaneStripColorGroups,paneStripColorGroupEdits,assertPaneStripGather}=require('../shared/pane-strip-color-groups.cjs');
 const {
   ORGANIZATION_VERSION, EXECUTION_SUBJECT_VERSION, INBOX_WORKFLOW_ID,
   clone, fail, id, stableJson, supported, supportedLayout, mergeLayout, layoutReferences, removeLayoutTabs, planMigration,
@@ -13,6 +14,10 @@ const LEGACY_TABLES = Object.freeze(['projects', 'tabs', 'tab_history', 'favorit
   'ai_sessions', 'gemini_history', 'project_prompt_sources', 'quick_actions', 'app_state', 'workflow_execution_scopes']);
 const fingerprint = value => crypto.createHash('sha256').update(stableJson(value)).digest('hex');
 const parse = raw => JSON.parse(raw);
+const DIRECTORY_TAB_COLUMNS = ['id','tab_id','project_id','name','tab_type','command_type','color',
+  'session_status','is_utility','file_path','parent_tab_id','visual_parent_tab_id','position','cwd',
+  'execution_subject_version','execution_subject_id','execution_namespace','execution_archived',
+  'execution_storage_revision'].join(',');
 const requireId = value => { if (!id(value)) fail('workflow_id_required'); return value; };
 const syncValue = value => { if (value?.then) fail('workflow_synchronous_capture_required'); return value; };
 
@@ -305,11 +310,12 @@ class WorkflowOrganization {
   getTab(tabId) {
     return this.read(() => this.readTab(tabId));
   }
-  prepareTabRead() {
+  prepareTabRead({ directory = false } = {}) {
     const hasTabs = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tabs'").get();
     return {
       hasTabs: !!hasTabs,
-      row: this.db.prepare('SELECT * FROM workflow_org_tabs WHERE tab_id=?'),
+      directory, columns: directory ? DIRECTORY_TAB_COLUMNS : '*',
+      row: this.db.prepare(`SELECT ${directory ? 'tab_id,subject_version,execution_json,revision' : '*'} FROM workflow_org_tabs WHERE tab_id=?`),
       membership: this.db.prepare('SELECT * FROM workflow_org_memberships WHERE tab_id=?'),
       legacy: null,
       native: null,
@@ -321,17 +327,17 @@ class WorkflowOrganization {
       ? (prepared?.row || this.db.prepare('SELECT * FROM workflow_org_tabs WHERE tab_id=?')).get(tabId)
       : capturedRow;
     if (!row) return null;
-    const saved = parse(row.record_json);
+    const saved = prepared?.directory ? {} : parse(row.record_json);
     let executionSubject = row.execution_json ? parse(row.execution_json) : null;
     // Legacy runtime fields are read from the current source row, never from
     // stale migration data. An archived/missing row retains exact provenance.
     const hasTabs = prepared ? prepared.hasTabs
       : this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tabs'").get();
     const legacyRow = row.subject_version === 1 && hasTabs
-      ? (prepared ? (prepared.legacy ||= this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND project_id=?'))
+      ? (prepared ? (prepared.legacy ||= this.db.prepare(`SELECT ${prepared.columns} FROM tabs WHERE tab_id=? AND project_id=?`))
         : this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND project_id=?')).get(tabId, executionSubject.projectId) || null : null;
     const nativeRow = row.subject_version === 2 && hasTabs
-      ? (prepared ? (prepared.native ||= this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND execution_subject_id=? AND execution_namespace=? AND execution_subject_version=2'))
+      ? (prepared ? (prepared.native ||= this.db.prepare(`SELECT ${prepared.columns} FROM tabs WHERE tab_id=? AND execution_subject_id=? AND execution_namespace=? AND execution_subject_version=2`))
         : this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND execution_subject_id=? AND execution_namespace=? AND execution_subject_version=2'))
         .get(tabId, executionSubject.subjectId, executionSubject.executionNamespace) || null : legacyRow;
     if (nativeRow) executionSubject = { ...executionSubject, ...executionScopeForRow(nativeRow) };
@@ -369,6 +375,19 @@ class WorkflowOrganization {
   }
   readState() {
     return this.read(() => ({ publication: this.getPublication(), workflows: this.listWorkflows(), tabs: this.listGlobalTabs() }));
+  }
+  // Separate read profile. Full state/drag/writers retain their original input.
+  readDirectoryState() {
+    return this.read(() => {
+      const publication = this.getPublication();
+      const workflows = this.db.prepare(`SELECT workflow_id,kind,revision,metadata_json
+        FROM workflow_org_workflows WHERE deleted_generation IS NULL OR deleted_generation=0 ORDER BY rowid`).all()
+        .map(row => ({ id: row.workflow_id, kind: row.kind, revision: row.revision, metadata: parse(row.metadata_json) }));
+      const prepared = this.prepareTabRead({ directory: true });
+      const tabs = this.db.prepare('SELECT tab_id,subject_version,execution_json,revision FROM workflow_org_tabs ORDER BY rowid')
+        .all().map(row => this.readTab(row.tab_id, prepared, row));
+      return { publication, workflows: orderedWorkflows(workflows, publication), tabs };
+    });
   }
   getJournal() {
     return this.db.prepare('SELECT * FROM workflow_org_journal ORDER BY id').all()
@@ -485,6 +504,7 @@ class WorkflowOrganization {
       // Inbox omission never means system deletion. Its identity/kind survive
       // every complete renderer snapshot, including a snapshot with no spaces.
       if (!requested.has(INBOX_WORKFLOW_ID)) requested.set(INBOX_WORKFLOW_ID, this.getWorkflow(INBOX_WORKFLOW_ID).metadata);
+      const stripGroupEdits=paneStripColorGroupEdits(requested,request.stripColorGroupEdits);
       const removed = previous.filter(workflow => !requested.has(workflow.id));
       const deletedIds = new Set(removed.map(workflow => workflow.id));
       const supplied = Array.isArray(request.tabWorkflowMembership)
@@ -496,6 +516,7 @@ class WorkflowOrganization {
       for (const [workflowId, space] of requested) if (!this.getWorkflow(workflowId)) {
         const metadata = clone(space);
         delete metadata.layout;
+        delete metadata.stripColorGroups; // explicit field intent is admitted below
         this.insertWorkflow({ id: workflowId, kind: 'user', revision: 1, metadata, layout: {} });
         newIds.add(workflowId);
       }
@@ -517,7 +538,18 @@ class WorkflowOrganization {
         const fields = clone(space);
         delete fields.layout;
         const metadata = { ...mergeLayout(old?.metadata || {}, fields), id: workflowId };
+        const stripColorGroups=mergePaneStripColorGroups(old?.metadata?.stripColorGroups,fields.stripColorGroups,
+          stripGroupEdits.get(workflowId),tabId=>{
+            const tab=this.readTab(tabId);
+            const member=tab?.membership?.workflowId===workflowId;
+            return {member,active:member&&tab.executionResolved===true&&!!tab.nativeRow&&tab.nativeRow.execution_archived!==1};
+          });
+        if(stripColorGroups===undefined)delete metadata.stripColorGroups;else metadata.stripColorGroups=stripColorGroups;
         const proposedLayout = space.layout === undefined ? old?.layout || {} : mergeLayout(old?.layout || {}, space.layout);
+        const gathered=stripGroupEdits.has(workflowId)?assertPaneStripGather(old?.layout,proposedLayout,
+          old?.metadata?.stripColorGroups,stripColorGroups,stripGroupEdits.get(workflowId)):null;
+        if(gathered?.pane)proposedLayout.splitPanes[gathered.paneIndex].tabs=gathered.slots;
+        else if(gathered)proposedLayout.centerStrips={...proposedLayout.centerStrips,[gathered.centerKey]:gathered.slots};
         const foreign = layoutReferences(proposedLayout).filter(ref => this.getMembership(ref.tabId)?.workflowId !== workflowId).map(ref => ref.tabId);
         const layout = removeLayoutTabs(proposedLayout, foreign);
         if (foreign.length) this.journal(generation, { reason: 'snapshot-placement-prune', workflowId, before: proposedLayout, after: layout });

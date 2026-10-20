@@ -74,7 +74,7 @@ async function copyMetadata(input, control) {
 
 // Bounds async FS operations shared by scanner and reads. No implicit sync port.
 function createFsLimiter(limit = 4, maxWaiting = 256) {
-  let active = 0; const waiting = [];
+  let active = 0, rejected = 0; const waiting = [];
   const pump = () => {
     while (active < limit && waiting.length) {
       const { run, resolve, reject } = waiting.shift(); active++;
@@ -82,8 +82,12 @@ function createFsLimiter(limit = 4, maxWaiting = 256) {
     }
   };
   return { run(run) {
-    if (waiting.length >= maxWaiting) return Promise.reject(Object.assign(Error('prompt_catalog_unavailable'), { code: 'prompt_catalog_unavailable', statusCode: 503 }));
+    if (waiting.length >= maxWaiting) {
+      rejected++;
+      return Promise.reject(Object.assign(Error('prompt_catalog_unavailable'), { code: 'prompt_catalog_unavailable',
+        statusCode: 503, reason: 'fs_queue_full', fsActive: active, fsWaiting: waiting.length }));
+    }
     return new Promise((resolve, reject) => { waiting.push({ run, resolve, reject }); pump(); });
-  }, get active() { return active; }, get waiting() { return waiting.length; } };
+  }, get active() { return active; }, get waiting() { return waiting.length; }, get rejected() { return rejected; } };
 }
 module.exports = { createCatalogControl, stableSort, stableSortSteps, copyMetadata, createFsLimiter, immediate };

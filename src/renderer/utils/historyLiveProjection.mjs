@@ -624,7 +624,7 @@ function buildHistoryLivePresentationBase(durableEntries, liveEntries) {
   // live answer. Keep unconfirmed unknown input at the same waiting boundary.
   // Known active sends retain their own response order, and exact SENT rows
   // use physical transcript positions below.
-  const deferredPromptIndex = durable.findIndex((entry) =>
+  const isDeferredPrompt = (entry) =>
     entry?.role === 'queued'
     // A finished local attempt remains visible, but is no longer future input.
     // Otherwise one failed send strands every later accepted prompt below all
@@ -643,13 +643,22 @@ function buildHistoryLivePresentationBase(durableEntries, liveEntries) {
         && ['preparing', 'sending', 'audit-pending', 'delivery-unknown'].includes(entry?.queueStatus)
       )
     )
-  );
-  let causalPrefix = deferredPromptIndex < 0
-    ? durable
-    : durable.slice(0, deferredPromptIndex);
-  const deferredTail = deferredPromptIndex < 0
-    ? []
-    : durable.slice(deferredPromptIndex);
+  ;
+  // Only that unconsumed intent is deferred, NOT every later durable/local
+  // row. A long-lived unknown card may precede independently confirmed input;
+  // stranding the whole suffix placed those users below their own live tools.
+  // Keep each pending object/state intact: presentation is not delivery proof.
+  const deferredPromptIndex = durable.findIndex(isDeferredPrompt);
+  const deferredTail = [];
+  let causalPrefix = durable;
+  if (deferredPromptIndex >= 0) {
+    causalPrefix = durable.slice(0, deferredPromptIndex);
+    for (let index = deferredPromptIndex; index < durable.length; index += 1) {
+      const entry = durable[index];
+      if (isDeferredPrompt(entry)) deferredTail.push(entry);
+      else causalPrefix.push(entry);
+    }
+  }
 
   // Once an optimistic Codex prompt is confirmed, it carries the exact rollout
   // byte offset of its user_message. The same is true for canonical live rows.
@@ -688,20 +697,24 @@ function buildHistoryLivePresentationBase(durableEntries, liveEntries) {
       continue;
     }
     let end = cursor + 1;
+    let previousOffset = firstPosition.offset;
+    let inverted = false;
     while (end < causalPrefix.length) {
       const nextPosition = physicalPosition(causalPrefix[end]);
       if (!nextPosition || nextPosition.sessionId !== firstPosition.sessionId) break;
+      if (previousOffset > nextPosition.offset) inverted = true;
+      previousOffset = nextPosition.offset;
       end += 1;
     }
-    const run = causalPrefix.slice(cursor, end).map((entry, arrival) => ({
-      entry,
-      arrival,
-      offset: physicalPosition(entry).offset,
-    }));
-    const inverted = run.some((item, index) => (
-      index > 0 && run[index - 1].offset > item.offset
-    ));
     if (inverted) {
+      // The scan already proves whether this exact-session run needs sorting.
+      // Materialize sort records only for an inversion, not for every row of
+      // an already ordered durable history on each new live update.
+      const run = causalPrefix.slice(cursor, end).map((entry, arrival) => ({
+        entry,
+        arrival,
+        offset: physicalPosition(entry).offset,
+      }));
       if (normalizedPrefix === causalPrefix) normalizedPrefix = causalPrefix.slice();
       run.sort((left, right) => left.offset - right.offset || left.arrival - right.arrival);
       run.forEach((item, index) => {
@@ -965,11 +978,10 @@ export function reduceHistoryLiveProjection(
     };
     return upsertEntry(entries, entry);
   }
-  // A paired Codex user carrier retains the earlier physical source as an
-  // exact alias. Route that canonical upgrade through the provider-neutral
-  // identity upsert below; the Claude prompt-carrier reducer predates source
-  // aliases and would otherwise append the canonical event beside the already
-  // visible response carrier for one frame.
+  // Codex owns both single and paired user carriers. The latter retains an
+  // exact source alias, but the former is equally valid (some native replies
+  // have no companion event). Neither may enter Claude's prompt normalizer:
+  // it drops questionReplyProof and can rewrite literal answer bytes.
   const role = canonical?.message?.role || canonical?.type;
   const claudeFailure = canonical?.uuid && envelope?.toolType === 'claude'
     ? claudeProviderFailure.claudeHistoryFailureFromRecord(canonical) : null;
@@ -1035,7 +1047,7 @@ export function reduceHistoryLiveProjection(
   }
   const hasExactSourceAliases = Array.isArray(canonical?.sourceIdentityAliases)
     && canonical.sourceIdentityAliases.some((identity) => typeof identity === 'string' && identity);
-  if (!hasExactSourceAliases) {
+  if (envelope?.toolType !== 'codex' && !hasExactSourceAliases) {
     const promptCarrier = reduceClaudeHistoryPromptCarrier(entries, envelope, {
       includeUserText,
     });

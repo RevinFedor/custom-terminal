@@ -5,7 +5,10 @@ import { spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { validateAsarArchive } from './validate-app-asar.mjs';
+import maintenanceApi from './research-maintenance.cjs';
+import { readPreparedInstall } from './prepared-noted-install.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const APP_NAME = 'Noted Terminal.app';
@@ -289,6 +292,8 @@ export async function buildInstallNotedTerminal({
   stagingKeep = STAGING_KEEP_DEFAULT,
   prune = pruneInstallStaging,
   beforeQuit = async () => {},
+  maintenance = null,
+  preparedCut = null,
   signal,
   log = message => console.log('[NotedInstall] ' + message),
 } = {}) {
@@ -304,6 +309,9 @@ export async function buildInstallNotedTerminal({
   let launchAttempted = false;
   let step = 'lock';
   let recovery = null;
+  let maintenanceBegun = false;
+  let maintenanceReceipt = maintenance?.operationId
+    ? { operationId: maintenance.operationId, beginConfirmed: false, complete: false } : null;
   const runStep = async (command, args, options = {}) => {
     checkAbort(signal);
     return run(command, args, { cwd: projectDir, signal, ...options });
@@ -314,7 +322,14 @@ export async function buildInstallNotedTerminal({
     // with the exact release command, never guessed away or removed recursively.
     await acquireInstallLock({ lockDir, fileSystem, aliveCheck, log });
     lockOwned = true;
-    for (const script of PREPARE_SCRIPTS) {
+    if (preparedCut) {
+      step = 'prepared-cut-admission';
+      await preparedCut.verify(installedApp);
+      await preparedCut.claim();
+      releaseApp = preparedCut.candidateApp;
+      log('using explicit prepared cut; CURRENT build/integration scripts are excluded');
+    }
+    for (const script of preparedCut ? [] : PREPARE_SCRIPTS) {
       step = script;
       log('prepare ' + script + ' (installed app remains available)');
       await runStep('npm', ['run', script]);
@@ -332,9 +347,15 @@ export async function buildInstallNotedTerminal({
     await runStep('/usr/bin/ditto', [releaseApp, stagedApp]);
     step = 'validate-stage';
     await validate(stagedApp, { run, fileSystem, signal });
+    if (preparedCut) await preparedCut.verifyCandidate(stagedApp);
     step = 'owner-idle-ack';
+    if (maintenance) {
+      maintenanceReceipt = { ...await maintenance.begin(), beginConfirmed: true };
+      maintenanceBegun = true;
+    }
     await beforeQuit({ stagingRoot, installedApp, signal });
     checkAbort(signal);
+    if (preparedCut) await preparedCut.verifyCandidate(stagedApp);
     step = 'quit';
     quitAttempted = true;
     // Do not abort the shutdown helper halfway through and race its remaining
@@ -352,16 +373,31 @@ export async function buildInstallNotedTerminal({
     checkAbort(signal);
     step = 'validate-installed';
     await validate(installedApp, { run, fileSystem, signal });
+    if (preparedCut) await preparedCut.verifyCandidate(installedApp);
     step = 'launch';
     launchAttempted = true;
-    await runStep('/usr/bin/open', [installedApp]);
+    await runStep('/usr/bin/open', [installedApp, ...(maintenance?.launchArguments?.() || [])]);
+    if (maintenance) {
+      step = 'maintenance-complete';
+      try { maintenanceReceipt = await maintenance.complete(); }
+      catch (error) {
+        // A verified installed app is not rolled back just because its API
+        // reconnection is delayed. Keep the same quiet operation for recovery.
+        log('installed app preserved; maintenance completion pending: ' + error.message);
+        return { ok: false, installed: true, launchRequested: true, installedApp,
+          failedStep: step, error: error.message, maintenance: { ...maintenanceReceipt, complete: false },
+          previousApp: previousMoved ? previousApp : null, stagingRoot,
+          recovery: { status: 'installed-app-preserved', path: installedApp } };
+      }
+    }
     step = 'complete';
     log('installed verified app; launch requested; previous app preserved at ' + (previousMoved ? previousApp : '(first install)'));
     // Уборка только после успеха: пока установка не доехала, каждый старый
     // откат ещё может понадобиться.
     try { await prune({ applicationsDir, keep: stagingKeep, currentStagingRoot: stagingRoot, fileSystem, log }); }
     catch (error) { log('staging prune skipped: ' + error.message); }
-    return { ok: true, installed: true, launchRequested: true, installedApp, previousApp: previousMoved ? previousApp : null, stagingRoot };
+    return { ok: true, installed: true, launchRequested: true, installedApp, previousApp: previousMoved ? previousApp : null, stagingRoot,
+      ...(maintenanceReceipt ? { maintenance: maintenanceReceipt } : {}) };
   } catch (error) {
     log('failed step=' + step + ' error=' + error.message);
     if (quitAttempted) {
@@ -387,7 +423,12 @@ export async function buildInstallNotedTerminal({
         log('recovery failed; preserved artifacts at ' + (stagingRoot || installedApp) + ': ' + recoveryError.message);
       }
     } else recovery = { status: 'installed-app-untouched', path: installedApp };
-    return { ok: false, installed: replacementInstalled, launchRequested: false, error: error.message, failedStep: step, recovery, previousApp: previousMoved ? previousApp : null, stagingRoot };
+    if (maintenanceBegun && (!quitAttempted || recovery?.status === 'previous-app-reopened')) {
+      try { maintenanceReceipt = await maintenance.complete({ reopenedPrevious: true }); }
+      catch (endError) { log('same maintenance operation retained: ' + endError.message); }
+    }
+    return { ok: false, installed: replacementInstalled, launchRequested: false, error: error.message, failedStep: step, recovery, previousApp: previousMoved ? previousApp : null, stagingRoot,
+      ...(maintenanceReceipt ? { maintenance: maintenanceReceipt } : {}) };
   } finally {
     // Only our empty lock directory is removed. All app artifacts (including
     // the last known installed version) remain recoverable on disk.
@@ -423,13 +464,21 @@ async function main() {
     process.stdin.once('error', onControlEnd);
   }
   try {
+    const preparedCut = await readPreparedInstall(projectRoot, nonce);
     const result = await buildInstallNotedTerminal({
       signal: controller.signal,
+      preparedCut,
+      maintenance: maintenanceApi.createClient().installScope('install:noted:' + (nonce || randomUUID()), {
+        log: message => console.log('[NotedInstall] ' + message),
+      }),
       beforeQuit: nonce ? async ({ signal }) => {
         await waitForInstallAck({ nonce, signal });
         process.stdin.resume(); // keep cancellation observable after the ACK
       } : async () => {},
     });
+    // Exact intent stays claimed if this receipt write itself fails; another
+    // install must diagnose that same job, not replay an uncertain swap.
+    await preparedCut?.finish(result);
     console.log(INSTALL_RESULT_PREFIX + JSON.stringify({ protocol: 1, nonce: nonce || null, ...result }));
     process.exitCode = result.ok ? 0 : 1;
   } finally {

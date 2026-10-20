@@ -19,6 +19,24 @@ function normalizeCodexResumeGoalText(value) {
     .replace(/\u00a0/g, ' ');
 }
 
+function hasInsetGoalBody(text, titleIndex) {
+  // The CLI paints an inset picker over its composer without erasing the
+  // underlay to the left. Read the picker column, not arbitrary leading prose.
+  const start = text.lastIndexOf('\n', titleIndex - 1) + 1;
+  const margin = text.slice(start, titleIndex);
+  if (!/^ +$/.test(margin)) return false;
+  const column = margin.length;
+  const lines = text.slice(titleIndex).split(/\r?\n/).slice(1);
+  const body = lines.find(line => line.trim());
+  if (!body || !/^Goal:[\t ]*\S/.test(body.slice(column))) return false;
+  const aligned = (index, label) => lines.some(line => {
+    const prefix = /^[ ]*(?:[›❯»>][ ]*)?[12]\./.exec(line)?.[0];
+    return prefix && prefix.length - 2 === column
+      && line.slice(column).startsWith(index + '. ' + label);
+  });
+  return aligned(1, 'Resume goal') && aligned(2, 'Leave paused');
+}
+
 function inspectCodexResumeGoalPrompt(cleanText) {
   const text = normalizeCodexResumeGoalText(cleanText);
   const titleIndex = [...text.matchAll(RESUME_GOAL_TITLE_RE)].at(-1)?.index ?? -1;
@@ -44,7 +62,8 @@ function inspectCodexResumeGoalPrompt(cleanText) {
     title: true,
     // Codex 0.162 may prefix the description with › as well as the option.
     // Keep that decoration local: it must not count as a selected menu item.
-    goal: /(?:^|\n)[\t ]*(?:›[\t ]+)?Goal:[\t ]*\S/im.test(section),
+    goal: /(?:^|\n)[\t ]*(?:›[\t ]+)?Goal:[\t ]*\S/im.test(section)
+      || hasInsetGoalBody(text, titleIndex),
     resumeOption: /(?:^|\n)[\t ]*(?:[›❯»>][\t ]*)?1\.[\t ]*Resume\s+goal\b/im.test(section),
     resumeDescription: /Mark it active and continue when idle/i.test(compact),
     leaveOption: /(?:^|\n)[\t ]*(?:[›❯»>][\t ]*)?2\.[\t ]*Leave\s+paused\b/im.test(section),

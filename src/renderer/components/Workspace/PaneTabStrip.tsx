@@ -21,7 +21,9 @@ import {
   resolvePaneTabDropTarget,
   setPaneTabDragTarget,
   usePaneTabDragSnapshot,
+  usePaneTabDropPresentation,observePaneTabStrip,forgetPaneTabStrip,
 } from '../../utils/paneTabDragBridge';
+import {panePresentationKey} from '../../utils/paneTabDropPresentation.mjs';
 import { commitPaintedPaneTabDrop } from '../../utils/paneTabDropCommit';
 import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview';
 import type { SharedTabActivityMaps } from './TabSignals';
@@ -31,15 +33,25 @@ import {
   CONTEXT_MENU_PANEL_STYLE,
 } from '../UI/contextMenuMetrics.mjs';
 import NewTabMenuRows from './NewTabMenuRows';
+import {PaneStripSelectionContext,usePaneStripSelectionController} from './PaneStripSelection';
+import PaneStripGroupOutline from './PaneStripGroupOutline';
+import {paneStripOutlineGap} from '../../utils/paneStripSelectionModel.mjs';
+import {readPaneStripOwnerEntries,readyPaneStripOutlineGroups,readPaneStripActiveGroups} from '../../utils/paneStripGroupsModel.mjs';
+import {normalizePaneStripRowPlacement,projectPaneStripRowPlacement} from '../../../shared/pane-strip-row-placement.cjs';
+import {readPaneStripRowPlacement} from '../../../shared/pane-strip-row-layout.cjs';
 
 export interface StripEntry { projectId: string; tabId: string }
 
 export interface PaneTabStripProps {
+  /** Retained chrome belongs to this workflow/window, including while dormant. */
+  spaceId?: string;
+  windowId?: string | null;
   entries: StripEntry[];
   /** The tab filling the window — exactly one of `entries`. */
   shownTabId: string;
   /** Keyboard focus; each window highlights its own shown tab independently. */
   focused: boolean;
+  presented?: boolean;
   paneIndex: number | null;
   inSplit: boolean;
   /** Double-click on empty space in the strip: one more tab in THIS window. */
@@ -60,42 +72,79 @@ export interface PaneTabStripProps {
 }
 
 export default function PaneTabStrip({
-  entries, shownTabId, focused, paneIndex, inSplit, onCreateTab,
+  entries, shownTabId, focused, presented=true, paneIndex, inSplit, onCreateTab,
   sharedActivity = null, slots, selectedSlotId = '',
+  spaceId,windowId:ownedWindowId,
 }: PaneTabStripProps) {
   const stripRootRef = useRef<HTMLDivElement | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
-  const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
+  const activeSpaceId = useWorkspaceStore((s) => spaceId || s.activeSpaceId);
   const paneKey = paneStripKey(paneIndex);
   const paneDrag = usePaneTabDragSnapshot();
+  const presentation = usePaneTabDropPresentation();
+  const surfaceOwner = useRef({});
+  const windowId = useWorkspaceStore(s=>ownedWindowId!==undefined ? ownedWindowId
+    : paneIndex===null ? null:s.splitPanes[paneIndex]?.windowId || null);
+  const centerKey = useWorkspaceStore(s=>paneIndex===null ? s.activeProjectId:null);
+  const storedRowPlacement = useWorkspaceStore(s=>readPaneStripRowPlacement(
+    activeSpaceId===s.activeSpaceId ? s:s.spaces.find(space=>space.id===activeSpaceId)?.layout,
+    {windowId,centerKey,paneIndex}));
+  const [stripWidth,setStripWidth]=useState(0);
+  useLayoutEffect(()=>{
+    const strip=scrollerRef.current;
+    if(!presented || !strip)return;
+    const update=(width:number)=>setStripWidth(previous=>Math.abs(previous-width)<0.01?previous:width);
+    update(strip.getBoundingClientRect().width);
+    const observer=new ResizeObserver(records=>{
+      const record=records.find(record=>record.target===strip);
+      if(record)update(record.contentRect.width);
+    });
+    observer.observe(strip);
+    return()=>observer.disconnect();
+  },[presented]);
+  const presentationKey = panePresentationKey(activeSpaceId,windowId,centerKey);
+  const releasedStrip = presentation?.strips.find((strip:any)=>strip.key===presentationKey);
   const baseEntriesKey = entries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('|');
   const baseIds = React.useMemo(() => entries.map((entry) => entry.tabId), [baseEntriesKey]);
-  const horizontalPreview = useHorizontalOrderPreview(
-    baseIds,
-    scrollerRef,
-    '[data-strip-item]',
-    'data-strip-tab-id',
-    { animate: false },
-  );
   const desiredPreviewEntries = React.useMemo(() => {
     if (!paneDrag.active || !paneDrag.source || paneDrag.target?.paneKey !== paneKey
-      || paneDrag.target?.spaceId !== activeSpaceId) return null;
+      || paneDrag.target?.spaceId !== activeSpaceId) return releasedStrip?.entries || null;
     return moveEntriesToIndex(entries, paneDrag.source.entries, paneDrag.target.at);
-  }, [baseEntriesKey, paneDrag.active, paneDrag.revision, paneDrag.source, paneDrag.target, paneKey, activeSpaceId]);
-  useLayoutEffect(() => {
-    horizontalPreview.updatePreview(desiredPreviewEntries?.map((entry) => entry.tabId) || null);
-  }, [desiredPreviewEntries, horizontalPreview.updatePreview]);
+  }, [baseEntriesKey, paneDrag.active, paneDrag.revision, paneDrag.source, paneDrag.target, paneKey, activeSpaceId,releasedStrip]);
+  const horizontalPreview = useHorizontalOrderPreview(
+    baseIds,scrollerRef,'[data-strip-item]','data-strip-tab-id',
+    { animate: false,projectionIds:desiredPreviewEntries?.map((entry:StripEntry)=>entry.tabId) || null },
+  );
   const entryById = React.useMemo(() => {
     const out = new Map(entries.map((entry) => [entry.tabId, entry]));
     paneDrag.source?.entries.forEach((entry) => out.set(entry.tabId, entry));
+    releasedStrip?.entries.forEach((entry:StripEntry)=>out.set(entry.tabId,entry));
     return out;
-  }, [baseEntriesKey, paneDrag.source]);
+  }, [baseEntriesKey, paneDrag.source,releasedStrip]);
   const previewEntries = horizontalPreview.displayedIds
     .map((tabId) => entryById.get(tabId))
     .filter((entry): entry is StripEntry => !!entry);
   const baseEntryIds = React.useMemo(() => new Set(entries.map((entry) => entry.tabId)), [entries]);
   const entriesKey = previewEntries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('|');
+  const baseRowPlacement=normalizePaneStripRowPlacement(storedRowPlacement,{order:baseIds,width:stripWidth});
+  const targetHere=paneDrag.active && paneDrag.source && paneDrag.target?.paneKey===paneKey
+    && paneDrag.target?.spaceId===activeSpaceId;
+  const projectedRows=targetHere ? projectPaneStripRowPlacement({current:storedRowPlacement,
+    baseOrder:baseIds,order:previewEntries.map(entry=>entry.tabId),sourceIds:paneDrag.source!.entries.map(entry=>entry.tabId),
+    rowStartId:paneDrag.target?.rowStartId,width:paneDrag.target?.stripWidth || stripWidth})
+    : releasedStrip ? releasedStrip.rowPlacement : baseRowPlacement;
+  const rowPlacement=normalizePaneStripRowPlacement(projectedRows,{order:previewEntries.map(entry=>entry.tabId),width:stripWidth});
+  const rowStarts=new Set<string>(rowPlacement?.rowStartIds || []);
+  const layoutKey=JSON.stringify([stripWidth,rowPlacement?.rowStartIds || []]);
   const inStrip = previewEntries.length > 1;
+  useLayoutEffect(()=>{
+    if(stripRootRef.current?.closest('[data-pane-focus-isolated="1"]')) {
+      forgetPaneTabStrip(surfaceOwner.current);return;
+    }
+    observePaneTabStrip(surfaceOwner.current,{workflowId:activeSpaceId,windowId,centerKey,paneKey,
+      baseEntries:entries,entries:previewEntries,baseRowPlacement,rowPlacement,stripWidth});
+  });
+  useLayoutEffect(()=>()=>forgetPaneTabStrip(surfaceOwner.current),[]);
   useLayoutEffect(()=>{
     if(!desiredPreviewEntries || !paneDrag.source)return;
     const matches=desiredPreviewEntries.length===previewEntries.length
@@ -118,6 +167,17 @@ export default function PaneTabStrip({
     return paneStripRenderItems(slots || [], previewEntries);
   }, [slots, entriesKey, previewEntries]);
   const indexOfTab = new Map(previewEntries.map((entry, i) => [entry.tabId, i]));
+  const stripSelection=usePaneStripSelectionController({workflowId:activeSpaceId,windowId,paneIndex,entries,presented});
+  const groupState=useWorkspaceStore(state=>state.spaces.find(space=>space.id===activeSpaceId)?.stripColorGroups);
+  const stripGroups=groupState?.version===1&&Array.isArray(groupState.groups)?readPaneStripActiveGroups(useWorkspaceStore.getState(),activeSpaceId):[];
+  const knownOutlineGroups=useRef(new Set<string>());
+  const canonicalOutlineEntries=readPaneStripOwnerEntries(useWorkspaceStore.getState(),{workflowId:activeSpaceId,windowId,paneIndex});
+  const canonicalOutlineKey=canonicalOutlineEntries?.map(entry=>`${entry.projectId}:${entry.tabId}`).join('|');
+  const outlineGroups=React.useMemo(()=>readyPaneStripOutlineGroups(stripGroups,previewEntries,canonicalOutlineEntries,knownOutlineGroups.current),
+    [stripGroups,entriesKey,canonicalOutlineKey]);
+  // Actual linkedTitleLayout uses the configured gap minus 1px as overhang.
+  // Keep that title/chip geometry and add only the one missing strip pixel.
+  const rowGap=paneStripOutlineGap(TAB_STRIP_ROW_GAP,Math.max(0,TAB_STRIP_ROW_GAP)-1);
 
   // Empty header space is a real target too. Chip targets own their own exact
   // edge; this parent handles gaps/trailing space and computes
@@ -256,9 +316,11 @@ export default function PaneTabStrip({
   }, [newTabMenu]);
 
   return (
+    <PaneStripSelectionContext.Provider value={stripSelection}>
     <div
       ref={stripRootRef}
       data-pane-tab-strip
+      data-keep-selection
       data-pane-tab-drop-zone="strip"
       data-pane-key={paneKey}
       data-space-id={activeSpaceId}
@@ -296,6 +358,7 @@ export default function PaneTabStrip({
         // Do not create a flex/BFC here: inline descendants must wrap beside
         // the header's action float, then below it at the FULL pane width.
         display: 'block',
+        position: 'relative',
         minWidth: 0,
       }}
     >
@@ -326,7 +389,7 @@ export default function PaneTabStrip({
           <React.Fragment key={`chooser:${item.slotId}`}>
             {/* The chooser compensates its border with -1px margins. Keep its
                 physical top/bottom aligned with the adjacent full cards. */}
-            <span style={{ display: 'inline-flex', verticalAlign: 'top', padding: '1px 0', marginBottom: TAB_STRIP_ROW_GAP, wordSpacing: 'normal' }}>
+            <span style={{ display: 'inline-flex', verticalAlign: 'top', padding: '1px 0', marginBottom: rowGap, wordSpacing: 'normal' }}>
               <PaneChooserChip
                 slotId={item.slotId}
                 paneIndex={paneIndex}
@@ -339,12 +402,13 @@ export default function PaneTabStrip({
           <React.Fragment key={`${item.projectId}:${itemIndex}`}>
             {item.tabIds.map((tabId, tabIndex) => (
               <React.Fragment key={tabId}>
+                {rowStarts.has(tabId) && <br data-pane-strip-row-start={tabId} aria-hidden="true"/>}
                 <span
                   data-strip-item
                   data-strip-tab-id={tabId}
                   data-strip-project-start={tabIndex === 0 ? item.projectId : undefined}
                   style={{ display: 'inline-flex', alignItems: 'center',
-                    verticalAlign: 'top', marginBottom: TAB_STRIP_ROW_GAP, wordSpacing: 'normal',
+                    verticalAlign: 'top', marginBottom: rowGap, wordSpacing: 'normal',
                     flexShrink: 0, minWidth: 0 }}
                 >
                   <PaneTabChip
@@ -357,7 +421,8 @@ export default function PaneTabStrip({
                     index={indexOfTab.get(tabId) ?? 0}
                     inStrip={inStrip}
                     sharedActivity={sharedActivity}
-                    previewOnly={!baseEntryIds.has(tabId)}
+                    previewOnly={!releasedStrip && !baseEntryIds.has(tabId)}
+                    releasedPlacement={!!releasedStrip}
                     dragPlaceholder={paneDrag.active && paneDrag.source?.entries.some((entry) => entry.tabId === tabId)}
                   />
                 </span>{' '}
@@ -366,6 +431,8 @@ export default function PaneTabStrip({
           </React.Fragment>
         )))}
       </div>
+      <PaneStripGroupOutline rootRef={stripRootRef} scrollerRef={scrollerRef}
+        entriesKey={entriesKey} layoutKey={layoutKey} groups={outlineGroups} presented={presented}/>
       {/* Портал по той же причине, что и у прочих меню шапки: строка низкая и
           обрезает своё содержимое. */}
       {newTabMenu && createPortal(
@@ -414,5 +481,6 @@ export default function PaneTabStrip({
         document.body,
       )}
     </div>
+    </PaneStripSelectionContext.Provider>
   );
 }

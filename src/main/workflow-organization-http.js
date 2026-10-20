@@ -3,6 +3,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { GLOBAL_EXECUTION_NAMESPACE, INBOX_WORKFLOW_ID } = require('../shared/workflow-organization.cjs');
+const { directoryReadRoute } = require('../shared/workflow-directory-catalog.cjs');
 
 const WORKFLOW_HTTP_CAPABILITY = Object.freeze({ version: 1, executionSubjectVersion: 2,
   endpoint: '/api/workflow-organization', workflows: '/api/workflows', tabCatalog: '/api/tab-catalog',
@@ -27,6 +28,10 @@ const WORKFLOW_HTTP_CAPABILITY = Object.freeze({ version: 1, executionSubjectVer
 const fail = (code, statusCode = 409) => { throw Object.assign(new Error(code), { code, statusCode }); };
 const copy = value => JSON.parse(JSON.stringify(value));
 const text = value => typeof value === 'string' ? value.trim() : '';
+function workflowOrganizationCapability(api) {
+  const catalogV2 = api?.catalogV2Capability?.();
+  return catalogV2 ? { ...WORKFLOW_HTTP_CAPABILITY, catalogV2 } : WORKFLOW_HTTP_CAPABILITY;
+}
 
 // These are execution addresses. A workflow id must never be substituted here.
 function executionNamespaceForRow(row) {
@@ -107,8 +112,17 @@ function createWorkflowOrganizationHttp({ getProjectManager, checkAuth, readBody
       if (!api.ready()) fail('workflow_migration_required');
       const pathname = parsed.pathname;
       const method = req.method;
+      const directoryRead = directoryReadRoute(method, pathname)
+        || (pathname === '/api/workflow-organization' && method === 'GET' && parsed.query?.projection === 'catalog-v2');
       let result;
-      if (pathname === '/api/workflow-organization/groups' && method === 'GET') result=api.groups.read();
+      if (pathname === '/api/workflow-organization/file-page' && method === 'POST') result = await api.readFilePage(await readBody(req));
+      else if (pathname === '/api/workflow-organization/runtime-summary' && method === 'POST') result = await api.readRuntimeSummary(await readBody(req));
+      else if (pathname === '/api/workflow-organization/card-signals' && method === 'POST') result = await api.readCardSignals(await readBody(req));
+      else if (/^\/api\/tab-catalog\/[^/]+\/(detail|file-preview)$/.test(pathname) && method === 'POST') {
+        const pieces = pathname.split('/'), tabId = decodeURIComponent(pieces[3]), body = await readBody(req);
+        result = await api[pieces[4] === 'detail' ? 'readTabDetail' : 'readFilePreview'](tabId, body);
+      }
+      else if (pathname === '/api/workflow-organization/groups' && method === 'GET') result=api.groups.read();
       else if (pathname === '/api/workflow-organization/groups/mutations' && method === 'POST') {
         const body=await readBody(req);result=api.groups.mutate(body.kind,body.request);
       } else if (/^\/api\/workflow-organization\/groups\/mutations\/[^/]+$/.test(pathname) && method === 'GET') {
@@ -123,6 +137,7 @@ function createWorkflowOrganizationHttp({ getProjectManager, checkAuth, readBody
         const projection = parsed.query?.projection;
         if (projection === undefined) result = api.read();
         else if (projection === 'catalog-v1') result = await api.readCatalog();
+        else if (projection === 'catalog-v2') result = await api.readCatalogV2();
         else fail('workflow_projection_unsupported',400);
       }
       else if (pathname === '/api/workflows' && method === 'GET') {
@@ -159,6 +174,7 @@ function createWorkflowOrganizationHttp({ getProjectManager, checkAuth, readBody
           } else fail('method_not_allowed', 405);
         } else fail('workflow_route_not_found', 404);
       }
+      if (directoryRead && getProjectManager().workflowOrganization !== api) fail('directory_source_changed');
       sendJson(res, 200, result);
     } catch (error) {
       if (sendCreationError && (error.bridgeData || error.code?.startsWith('bridge_'))) sendCreationError(res, error);
@@ -170,4 +186,4 @@ function createWorkflowOrganizationHttp({ getProjectManager, checkAuth, readBody
 }
 
 module.exports = { WORKFLOW_HTTP_CAPABILITY, createWorkflowOrganizationHttp, freezeWorkflowCreationContext,
-  legacyCreationContext, listExecutionNamespaces, executionNamespaceForRow };
+  legacyCreationContext, listExecutionNamespaces, executionNamespaceForRow, workflowOrganizationCapability };

@@ -96,6 +96,66 @@ test('portable ad-hoc output is signed for the existing install identity before 
   assert.equal(f.events.filter(event => event.label === 'sign:local-fast').length, 1);
 });
 
+test('planned install quiet ACK precedes Quit and is completed only after replacement launch', async t => {
+  const f = await fixture(t);
+  const result = await f.execute({ maintenance: {
+    begin: async () => { f.events.push({ label: 'quiet-begin' }); return { operationId: 'install:one' }; },
+    complete: async () => { f.events.push({ label: 'quiet-complete' }); return { operationId: 'install:one', complete: true }; },
+  } });
+  assert.equal(result.ok, true); assert.equal(result.maintenance.complete, true);
+  const labels = f.events.map(x => x.label);
+  assert(labels.indexOf('quiet-begin') < labels.indexOf('quit'));
+  assert(labels.indexOf('quiet-complete') > labels.indexOf('opened-version'));
+});
+
+test('same maintenance operation is a launch argument before replacement startup, not a later notification', async t => {
+  const f = await fixture(t), operationId = 'install:startup:exact';
+  const result = await f.execute({ maintenance: { operationId,
+    begin: async () => ({ operationId, bootstrap: true, preparedBeforeQuit: false }),
+    launchArguments: () => ['--args', '--research-maintenance-operation=' + operationId],
+    complete: async () => {
+      assert.deepEqual(f.events.find(e => e.label === 'open').args,
+        [f.installedApp, '--args', '--research-maintenance-operation=' + operationId]);
+      return { operationId, complete: true };
+    },
+  } });
+  assert.equal(result.ok, true); assert.equal(result.maintenance.operationId, operationId);
+});
+
+test('explicit frozen candidate excludes every CURRENT build/integration script', async t => {
+  const f = await fixture(t), proof = [];
+  const result = await f.execute({ preparedCut: { candidateApp: f.releaseApp,
+    verify: async app => { assert.equal(app, f.installedApp); proof.push('baseline'); },
+    claim: async () => proof.push('claimed'), verifyCandidate: async app => proof.push(app === f.installedApp ? 'installed-bytes' : 'staged-bytes'),
+  } });
+  assert.equal(result.ok, true); assert.deepEqual(proof, ['baseline', 'claimed', 'staged-bytes', 'staged-bytes', 'installed-bytes']);
+  assert(!f.events.some(x => PREPARE_SCRIPTS.includes(x.label)), 'no WIP compiler or integrations');
+  assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
+});
+
+test('ambiguous quiet begin ACK forbids Quit and does not complete an unknown operation', async t => {
+  const f = await fixture(t);
+  const result = await f.execute({ maintenance: {
+    operationId: 'install:unknown-begin',
+    begin: async () => { throw Error('owned quiet ACK lost'); }, complete: () => assert.fail('no automatic release'),
+  } });
+  assert.equal(result.ok, false); assert.equal(result.recovery.status, 'installed-app-untouched');
+  assert.equal(result.maintenance.operationId, 'install:unknown-begin'); assert.equal(result.maintenance.beginConfirmed, false);
+  assert(!f.events.some(x => x.label === 'quit'));
+});
+
+test('failed post-launch quiet readback preserves verified installed app and same operation', async t => {
+  const f = await fixture(t);
+  const result = await f.execute({ maintenance: {
+    begin: async () => ({ operationId: 'install:pending' }), complete: async () => { throw Error('owned API reconnect delayed'); },
+  } });
+  assert.equal(result.ok, false); assert.equal(result.installed, true);
+  assert.equal(result.failedStep, 'maintenance-complete'); assert.equal(result.maintenance.complete, false);
+  assert.equal(result.maintenance.operationId, 'install:pending');
+  assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
+  assert(!f.events.some(x => x.label === 'restore'));
+});
+
 for (const failure of [...PREPARE_SCRIPTS, 'validate-release', 'copy', 'validate-stage', 'idle-ack']) {
   test('failure before quit leaves installed app byte-for-byte in place: ' + failure, async t => {
     const f = await fixture(t, { fail: failure });

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { buildSync, transformSync } from 'esbuild';
 import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
@@ -13,7 +14,7 @@ import { resolveSiblingInsertionIndex, resolveTabInsertionIndex } from '../utils
 import { planCodexContextForkSettings, resolveCodexEffectiveSettings } from '../utils/codexEffectiveSettings.mjs';
 const require = createRequire(import.meta.url);
 const { resolveWorkingDirectory } = require('../../shared/working-directory.cjs');
-const root = path.resolve(import.meta.dirname, '../../..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const quiet = { log() {}, warn() {}, error() {}, time() {}, timeEnd() {} };
 const systemSource = path.join(root, 'src/renderer/constants/systemProjects.ts');
 const built = buildSync({ entryPoints: [systemSource], bundle: true, platform: 'browser', format: 'cjs', write: false,
@@ -38,6 +39,11 @@ const main = fs.readFileSync(path.join(root, 'src/main/main.js'), 'utf8');
 const mainStart = main.indexOf("ipcMain.handle('terminal:create', async");
 const mainEnd = main.indexOf("    disarmCodexProviderSemanticSource(tabId, 'terminal-generation-changed');", mainStart);
 assert.ok(mainStart >= 0 && mainEnd > mainStart);
+const terminal = fs.readFileSync(process.env.NOTED_CREATION_TERMINAL_SOURCE || path.join(root, 'src/renderer/components/Workspace/Terminal.tsx'), 'utf8');
+const clearStart = terminal.indexOf('const clearTabPendingAction = ');
+const clearEnd = terminal.indexOf('\n};', clearStart) + 3;
+assert.ok(clearStart >= 0 && clearEnd > clearStart);
+const clearPendingCode = transformSync(terminal.slice(clearStart, clearEnd) + ';clearTabPendingAction;', {loader:'ts'}).code;
 
 function runtime(home, nativeEnv = {}) {
   const module = { exports: {} };
@@ -56,7 +62,7 @@ async function fixture(t, projectPath = '~') {
   await fs.promises.mkdir(path.join(home, 'project'));
   const systems = runtime(home);
   let createPty;
-  const validated = [], persisted = [];
+  const validated = [], persisted = [], hooks = {}, rollbacks = [], kills = [];
   // Execute the real IPC reuse/validation boundary, with a PTY seam AFTER
   // successful stat. No shell, agent, application DB or user directory.
   vm.runInNewContext(main.slice(mainStart, mainEnd) + 'validated.push(workingDir); return { pid: 321, cwd: workingDir }; });', {
@@ -76,8 +82,10 @@ async function fixture(t, projectPath = '~') {
     resolveWorkspaceCwd: systems.resolveWorkspaceCwd, restoreShortId: value => String(value || ''),
     resolveExistingTabGroupId: () => undefined, getNextAvailableName: () => 'tab',
     ipcRenderer: { invoke: async (channel, request) => {
-      assert.equal(channel, 'terminal:create'); return createPty({}, request);
-    }, send() { throw new Error('unexpected kill'); } },
+      assert.equal(channel, 'terminal:create'); const result = await createPty({}, request);
+      if (hooks.afterPty) await hooks.afterPty(request); return result;
+    }, send(channel, tabId) { assert.equal(channel,'terminal:kill');kills.push(tabId); } },
+    rollbackUnmaterializedCreatedTab: async (projectId,tabId) => {rollbacks.push({projectId,tabId});return {success:true};},
     commitCreatedTabSnapshot, rememberAgentLaunchFence, projectTabCreationQueue: createProjectTabSaveQueue(), projectTabSaveRevisions: new Map(),
     planCodexContextForkSettings,
     saveTabsThenNotifyProjectLayoutChanged: async (project, tabs) => {
@@ -85,7 +93,33 @@ async function fixture(t, projectPath = '~') {
     }, resolveSiblingInsertionIndex, resolveTabInsertionIndex,
   });
   Object.assign(state, module.exports);
-  return { home, systems, methods: module.exports, workspace, validated, persisted, createPty };
+  const clearPending=vm.runInNewContext(clearPendingCode,{console:quiet,useWorkspaceStore:{getState:()=>state,setState:patch=>Object.assign(state,patch)}});
+  return { home, systems, methods: module.exports, workspace, validated, persisted, createPty, state, hooks, clearPending, rollbacks, kills };
+}
+
+for (const method of ['createTab','createTabAfterCurrent']) {
+  test(method + ': consuming a sibling pending action does not close the in-flight creation owner', async t => {
+    const f=await fixture(t),a=await f.methods.createTab('project','first',f.home,{background:true,pendingAction:{type:'shell-command',command:'echo fixture'}});
+    const original=f.workspace.tabs.get(a),mapBefore=f.state.openProjects;
+    let release,started;const gate=new Promise(resolve=>release=resolve),entered=new Promise(resolve=>started=resolve);
+    f.hooks.afterPty=async()=>{started();await gate;};
+    const outcome=f.methods[method]('project','second',f.home,{background:true}).then(id=>({id}),error=>({error}));
+    await entered;f.clearPending(a);release();const result=await outcome;
+    assert.equal(result.error,undefined,result.error?.message);assert.ok(result.id);
+    assert.equal(f.state.openProjects.get('project'),f.workspace);assert.notEqual(f.state.openProjects,mapBefore);
+    assert.equal(f.workspace.tabs.get(a),original);assert.equal(original.pendingAction,undefined);
+    assert.deepEqual([...f.workspace.tabs.keys()],[a,result.id]);assert.deepEqual(f.rollbacks,[]);assert.deepEqual(f.kills,[]);
+  });
+  test(method + ': consuming pending metadata does not admit a creation into a reopened workspace', async t => {
+    const f=await fixture(t),a=await f.methods.createTab('project','first',f.home,{background:true,pendingAction:{type:'shell-command',command:'echo fixture'}});
+    let release,started;const gate=new Promise(resolve=>release=resolve),entered=new Promise(resolve=>started=resolve);
+    f.hooks.afterPty=async()=>{started();await gate;};
+    const outcome=f.methods[method]('project','second',f.home,{background:true}).then(id=>({id}),error=>({error}));
+    await entered;f.clearPending(a);const reopened={...f.workspace,tabs:new Map([['foreign',{id:'foreign'}]])};
+    f.state.openProjects.set('project',reopened);release();const result=await outcome;
+    assert.match(result.error?.message||'',/project_closed_during_tab_creation/);
+    assert.deepEqual([...reopened.tabs.keys()],['foreign']);assert.equal(f.rollbacks.length,1);assert.equal(f.kills.length,1);
+  });
 }
 
 for (const method of ['createTab', 'createTabAfterCurrent']) test(method + ': Fork publishes source model before SID/proof, not global defaults', async t => {

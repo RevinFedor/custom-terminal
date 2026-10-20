@@ -34,6 +34,7 @@ const live = (overrides = {}) => ({ coherent: true, status: 'busy', toolType: 'c
 
 function wrapperContext(overrides = {}) {
   const context = vm.createContext({ messageRuntimeIdentity, scenarioDestination, identityUnavailable,
+    require, path, srcMainDir: __dirname,
     findOrchestrationTabDescriptor: () => descriptor,
     readAgentRuntimeSnapshot: async () => live(), tabMessageSdkSessions: new Map(), ...overrides });
   vm.runInContext(['resolveTabMessageIdentity', 'readScenarioDestination', 'captureOrchestrationSourceTarget']
@@ -157,7 +158,9 @@ for (const toolType of ['codex', 'claude']) {
         return live({ toolType, sessionId: current.sessionId, sendTarget: { ...current } });
       },
       agentSendReceiptStartupReady: Promise.resolve(), agentSendBridgeTimeoutMs: 1000,
-      agentSendReceiptStore: {}, agentSendReceiptRegistry: createAgentSendReceiptRegistry(),
+      // This wrapper case deliberately has no durable web operation. Real
+      // SQLite receipt owners are exercised by the delivery integration suite.
+      agentSendReceiptStore: null, agentSendReceiptRegistry: createAgentSendReceiptRegistry(),
       AGENT_SEND_RECEIPT_STATES: RECEIPT_STATES,
       tabWorkContext: null, promptAuditFingerprint, fingerprintAgentSendRequest,
       bindStructuredAuthoringPresentation, withPromptOriginPresentation,
@@ -182,7 +185,7 @@ for (const toolType of ['codex', 'claude']) {
       // Completion gets its History receipt downstream. There is deliberately
       // no web sendOperationKey to carry expectedTarget in an attempt sidecar.
     });
-    assert.equal(bridgeCalls.length, 1, 'same-launch materialization must reach the bridge');
+    assert.equal(bridgeCalls.length, 1, 'same-launch materialization must reach the bridge: ' + JSON.stringify(result));
     assert.equal(preflightTargets.length, 1);
     assert.deepEqual(preflightTargets[0], materializedA);
     const { action, payload } = bridgeCalls[0];
@@ -249,6 +252,7 @@ function reservationHarness(route, { snapshot = live(), priorRun = null, notifyS
     resolveSendPromptPresentation: async (_manager, _body, prompt) => ({ prompt, identityPrompt: prompt, contextFiles: [], promptChips: [] }),
     resolveProjectAgentModelRequest: async () => ({ model: null }),
     assertExternalResearchCapabilities: async () => {},
+    getScExternalResearchClient: () => ({}), // Omitted default browser: this source-identity fixture performs no SC RPC.
     getOrchestrationRunStore: () => ({
       getInternal: async () => priorRun,
       reserveOrGet: async input => { reserved = input; return { created: !priorRun, run: priorRun || input }; },

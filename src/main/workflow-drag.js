@@ -2,6 +2,7 @@
 
 const {fail,stableJson,layoutReferences,executionScopeForRow}=require('../shared/workflow-organization.cjs');
 const {dragPlacement,dragRelation,dragFamily,applyDragLayout}=require('../shared/workflow-drag.cjs');
+const {assertPaneStripGroupDrag}=require('../shared/pane-strip-drag-guard.cjs');
 const same=(a,b)=>stableJson(a)===stableJson(b);
 
 /** One canonical transaction for the forest that was actually painted. */
@@ -73,7 +74,8 @@ class WorkflowDrag {
       const expectedGuarded=[...new Set([...request.sourceFamilyIds,...(request.destinationKind==='window' ? request.paneFamilyIds:[])])].sort();
       if(!same(expectedGuarded,[...request.guardedFamilyIds].sort()))fail('workflow_drag_plan_incomplete');
       const family=new Set(request.guardedFamilyIds);
-      const placements=Object.fromEntries(this.org.listWorkflows().map(space=>[space.id,layoutReferences(space.layout)
+      const currentWorkflows=this.org.listWorkflows();
+      const placements=Object.fromEntries(currentWorkflows.map(space=>[space.id,layoutReferences(space.layout)
         .filter(ref=>family.has(ref.tabId)).map(({tabId,namespace,path,kind})=>({tabId,namespace,path,kind}))])
         .filter(([,refs])=>refs.length));
       if(!same(placements,request.sourcePlacements || {}))fail('workflow_drag_source_placement_changed');
@@ -110,10 +112,14 @@ class WorkflowDrag {
           || !same(old.metadata.reserveRootOrder || [],proposal.expectedReserveRootOrder))fail('workflow_drag_destination_changed');
         return {proposal,old,layout:applyDragLayout(old.layout,proposal.beforeLayout,proposal.layout)};
       });
+      assertPaneStripGroupDrag(currentWorkflows,workflows,request,id=>{
+        const tab=byId.get(id);
+        return tab ? !!(tab.nativeRow||tab.legacyRow)&&tab.nativeRow?.execution_archived!==1 : undefined;
+      });
       // A move cannot leave a placement behind in an unguarded hidden/profile
       // owner. Every touched workflow must be part of this immutable command.
       const touched=new Set(workflows.map(({old})=>old.id));
-      for(const space of this.org.listWorkflows())for(const ref of layoutReferences(space.layout)) {
+      for(const space of currentWorkflows)for(const ref of layoutReferences(space.layout)) {
         const proposal=request.tabs.find(tab=>tab.tabId===ref.tabId);
         if(proposal && proposal.workflowId!==space.id && !touched.has(space.id))fail('workflow_drag_unguarded_placement');
       }

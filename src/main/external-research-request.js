@@ -86,7 +86,7 @@ function externalResearchTargetLabel(request) {
   return model ? `${provider} · ${model}` : provider;
 }
 
-function continuationRequest(previous, body = {}) {
+function continuationRequest(previous, body = {}, { validateMode = true } = {}) {
   if (previous?.runKind !== 'external-research') throw new Error('previousRunId is not an external research run');
   if (previous.status !== 'completed' || previous.resultComplete !== true) {
     throw new Error('previous external research result is not complete');
@@ -94,6 +94,13 @@ function continuationRequest(previous, body = {}) {
   const conversationUrl = String(previous.externalResearchConversationUrl || '').trim();
   if (!conversationUrl) throw new Error('previous external research result has no conversationUrl');
   const previousIntent = previous.externalResearchIntent || {};
+  const oldMode = String(previousIntent.options?.mode || previous.externalResearchMode || '').trim().toLowerCase();
+  const requestedMode = String(body.options?.mode || '').trim().toLowerCase();
+  if (validateMode && (previousIntent.provider || previous.externalResearchProvider || 'chatgpt') === 'chatgpt'
+    && ['chat', 'work'].includes(oldMode) && ['chat', 'work'].includes(requestedMode) && requestedMode !== oldMode) {
+    throw Object.assign(new Error(`Saved ChatGPT conversation is ${oldMode}; continuation cannot change it to ${requestedMode}. Research was not started. Report the channel owner and wait for a context-preserving recovery decision.`),
+      { code: 'external_research_continuation_mode_conflict', statusCode: 409 });
+  }
   const nextOptions = body.options && typeof body.options === 'object' && !Array.isArray(body.options)
     ? { ...(previousIntent.options || {}), ...body.options }
     : previousIntent.options;

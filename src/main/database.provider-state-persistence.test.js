@@ -5,22 +5,18 @@ const os = require('node:os');
 const path = require('node:path');
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-provider-state-db-'));
-const electronModulePath = require.resolve('electron');
-const previousElectronModule = require.cache[electronModulePath];
-require.cache[electronModulePath] = {
-  id: electronModulePath,
-  filename: electronModulePath,
-  loaded: true,
-  exports: {
-    app: {
-      isPackaged: false,
-      getPath: () => tempRoot,
-    },
-  },
-};
-const DatabaseManager = require('./database');
-if (previousElectronModule) require.cache[electronModulePath] = previousElectronModule;
-else delete require.cache[electronModulePath];
+// A combined suite may have loaded DatabaseManager before this test's Electron
+// port. Compile the same complete source in a private module instead of mutating
+// the shared module cache (or accidentally retaining another fixture's app).
+const Module = require('node:module');
+const filename = require.resolve('./database');
+const isolatedModule = new Module(filename, module);
+isolatedModule.filename = filename;
+isolatedModule.paths = module.paths;
+isolatedModule.require = name => name === 'electron'
+  ? { app: { isPackaged: false, getPath: () => tempRoot } } : require(name);
+isolatedModule._compile(fs.readFileSync(filename, 'utf8'), filename);
+const DatabaseManager = isolatedModule.exports;
 
 test('stale full tab saves cannot erase or resurrect main-owned startup settings', (t) => {
   let manager;

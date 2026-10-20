@@ -1,4 +1,4 @@
-import { horizontalInsertIndex, wrappedInsertIndex } from './horizontalReorder.mjs';
+import { horizontalInsertIndex, wrappedInsertTarget } from './horizontalReorder.mjs';
 
 const idsKey = (ids) => (Array.isArray(ids) ? ids : [])
   .filter(Boolean)
@@ -53,7 +53,9 @@ export function horizontalDragAutoScrollDelta({
  * pointer is before or after a neighbour: the preview changes the target, the
  * target reverses the preview, and the row oscillates under a stationary
  * cursor. A lease captures the target strip once, in content coordinates, and
- * only the pointer/scroll position remains live until the gesture ends.
+ * only the pointer/scroll position remains live until the gesture ends. An
+ * unanimated host may explicitly clear its lease after a committed layout
+ * changes the shown order; a requested preview alone must not expire it.
  */
 export function createHorizontalDragGeometryCache() {
   const leases = new Map();
@@ -74,6 +76,7 @@ export function createHorizontalDragGeometryCache() {
       scrollLeft = 0,
       scrollTop = 0,
       wrap = false,
+      includeRowPlacement = false,
       readChips,
     }) {
       const key = String(ownerKey || '');
@@ -101,7 +104,8 @@ export function createHorizontalDragGeometryCache() {
       const pointerInContent = Number(clientX) - (Number(viewportLeft) || 0) + (Number(scrollLeft) || 0);
       if (wrap) {
         const y = Number(clientY) - (Number(viewportTop) || 0) + (Number(scrollTop) || 0);
-        return wrappedInsertIndex(lease.chips, pointerInContent, y, excluded);
+        const target = wrappedInsertTarget(lease.chips, pointerInContent, y, excluded);
+        return includeRowPlacement ? target : target.at;
       }
       return horizontalInsertIndex(lease.chips, pointerInContent);
     },

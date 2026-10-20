@@ -22,6 +22,33 @@ test('actual immediate current frame sends without spending preparation ceiling'
   assert.equal(h.writes.length, 2);
 });
 
+test('History return while current frame is pending revokes payload, not the live terminal', async t => {
+  const h = fixture(t, { returnable: true });
+  const pending = h.start(); await tick(100);
+  assert.equal(h.returnControl.request(h.returnIdentity).returned, true);
+  assert.equal(h.store.isDeliveryCancelled(h.identity.operationKey, h.attempt.attemptId), false,
+    'not generic cancellation of launch/lifecycle');
+  assert.equal(h.ctx.terminals.get('T'), h.term);
+  h.frame(); const result = await pending;
+  assert.equal(result.submitted, false, JSON.stringify(result));
+  assert.equal(result.pasteWritten, false);
+  assert.equal(result.code, 'history_send_returned');
+  assert.equal(h.writes.length, 0);
+  assert.equal(h.store.settleAttempt(h.identity.operationKey, h.attempt.attemptId, result).record.state, 'not-submitted');
+});
+
+test('History return after the actual payload call cannot cancel Enter or return the draft', async t => {
+  const h = fixture(t, { returnable: true, open: false });
+  const write = h.term.write;
+  h.term.write = bytes => {
+    write(bytes);
+    if (bytes !== '\r') assert.equal(h.returnControl.request(h.returnIdentity).returned, false);
+  };
+  const result = await h.start();
+  assert.equal(result.submitted, true);
+  assert.deepEqual(h.writes, ['\x1b[200~frozen\x1b[201~', '\r']);
+});
+
 test('actual Main first Enter stores its timestamp; pre-Enter refusal never supplies one', async t => {
   const h = fixture(t, { open: false }); const at = h.clock.now();
   const result = await h.start(); await tick(10);

@@ -7,6 +7,8 @@ const DEFAULTS = Object.freeze({ rollingBytes: 2 * MiB, globalRollingBytes: 32 *
   preBytes: 2 * MiB, tailBytes: 2 * MiB, events: 8192, maxPins: 4,
   maxOwners: 1024, ageMs: 120000, tailMs: 60000 });
 const EVENT_CHARGE = 256, OWNER_CHARGE = 4096;
+const MAX_COMPLETIONS = 16;
+const completionKeyValid = key => typeof key === 'string' && /^[a-zA-Z0-9:_-]{1,256}$/.test(key);
 const EPOCH_KEYS = ['lifecycleGeneration', 'mirrorGeneration', 'runSeq', 'stopRevision'];
 function ownerFields(value = {}) {
   value ||= {};
@@ -87,6 +89,8 @@ function createTerminalRawWindow({ persist, now = () => performance.timeOrigin +
     aliasesOmitted: pin.aliasesOmitted, captureAt: pin.at, captureSeq: pin.seq,
     captureHeadlessSeq: pin.headlessSeq, captureWhileSyncOpen: pin.syncOpen,
     pre: { ...pin.pre }, tail: { ...pin.tail }, end: pin.end && { ...pin.end },
+    completion: { mode: pin.completionMode, registered: pin.completions.size,
+      pending: [...pin.completions.values()].filter(Boolean).length, omitted: pin.completionsOmitted },
     persistenceComplete: pin.persistenceComplete, persistenceOmissions: pin.persistenceOmissions,
     // Raw and headless include different synthetic/resize paths; do not invent
     // a complete baseline replay from a complete range of app-delivered data.
@@ -135,14 +139,26 @@ function createTerminalRawWindow({ persist, now = () => performance.timeOrigin +
       state.events.set(block.id, block); blocks.set(block.id, block); state.charge += charge; rollingCharge += charge;
       return state.seq;
     }); },
-    pin(token, { incidentId, sendIdentity = {}, identity = {}, headlessSeq = null, syncOpen = null } = {}) { return safe(() => {
+    pin(token, { incidentId, sendIdentity = {}, identity = {}, headlessSeq = null, syncOpen = null,
+      completionKey = null } = {}) { return safe(() => {
+      if (completionKey !== null && !completionKeyValid(completionKey)) return { available: false, reason: 'invalid-completion-key' };
       const state = get(token, identity);
       if (!state) return { available: false, reason: 'raw-owner-unavailable' };
       const alias = sendFields({ ...sendIdentity, incidentId });
       if (state.pin && epochChanged(state.pin.epoch, ownerFields(identity))) seal(state.pin, 'owner-epoch-changed');
       if (state.pin) {
         if (state.pin.aliases.length < 16) state.pin.aliases.push(alias); else state.pin.aliasesOmitted++;
-        return { available: true, id: state.pin.id, joined: true, manifestPath: persist?.reference?.(state.pin.id) || null };
+        let completionRegistered = false;
+        if (completionKey !== null) {
+          const pin = state.pin;
+          if (pin.completions.has(completionKey)) completionRegistered = pin.completions.get(completionKey);
+          else if (pin.completions.size < MAX_COMPLETIONS) {
+            pin.completions.set(completionKey, true); completionRegistered = true;
+          } else pin.completionsOmitted++;
+          if (completionRegistered) pin.completionMode = 'owned-control-release';
+        }
+        return { available: true, id: state.pin.id, joined: true, completionRegistered,
+          manifestPath: persist?.reference?.(state.pin.id) || null };
       }
       if (pins.size >= limits.maxPins) { pinOmissions++; return { available: false, reason: 'pin-admission-budget' }; }
       const time = now(); pruneOwner(state, time);
@@ -153,6 +169,8 @@ function createTerminalRawWindow({ persist, now = () => performance.timeOrigin +
       }
       kept.reverse();
       const pin = { id: randomUUID(), owner: state, epoch: ownerFields(identity), send: alias, aliases: [], aliasesOmitted: 0,
+        completionMode: completionKey === null ? 'committed-current-frame' : 'owned-control-release',
+        completions: new Map(completionKey === null ? [] : [[completionKey, true]]), completionsOmitted: 0,
         at: time, seq: state.seq, headlessSeq, syncOpen,
         pre: { fromSeq: kept[0]?.seq ?? null, toSeq: kept.at(-1)?.seq ?? null,
           storedCodeUnits: kept.reduce((n, b) => n + b.codeUnits, 0), events: kept.length, charge,
@@ -168,16 +186,32 @@ function createTerminalRawWindow({ persist, now = () => performance.timeOrigin +
       catch { diagnosticsErrors++; seal(pin, 'diagnostic-timer-unavailable'); }
       pin.timer?.unref?.();
       return { available: true, id: pin.id, joined: false, captureSeq: pin.seq,
+        completionRegistered: completionKey !== null,
         manifestPath: persist?.reference?.(pin.id) || null,
         persistence: 'queued-not-yet-confirmed', pre: { ...pin.pre }, replayFromBaselineComplete: false };
     }); },
     commit(token, frame, identity = {}) { safe(() => {
       const state = weak.get(token), pin = state?.pin; if (!pin) return;
       if (epochChanged(pin.epoch, ownerFields(identity))) { seal(pin, 'owner-epoch-changed'); return; }
+      // A metadata-only OSC can commit an unchanged screen. It is not the
+      // completion of an exact failed control's late echo/clear lifecycle.
+      if (pin.completionMode === 'owned-control-release') return;
       if (frame?.authoritativeFrameCommitted === true && frame.synchronizedOutputOpen !== true
         && Number.isFinite(frame.writeSeq) && frame.writeSeq === frame.flushedSeq
         && Number.isFinite(pin.headlessSeq) && frame.writeSeq >= pin.headlessSeq) seal(pin, 'committed-current-frame', frame);
     }); },
+    settle(token, { id, completionKey, frame = null } = {}, identity = {}) { return safe(() => {
+      const pin = weak.get(token)?.pin;
+      if (!pin || pin.id !== id || pin.completions.get(completionKey) !== true) return false;
+      if (epochChanged(pin.epoch, ownerFields(identity))) { seal(pin, 'owner-epoch-changed'); return false; }
+      pin.completions.set(completionKey, false);
+      if ([...pin.completions.values()].some(Boolean)) return false;
+      // Observer-only settlement. It never submits/clears input or renews the
+      // original tail deadline/budget; the existing receipt owner calls once.
+      const currentFrame = frame?.authoritativeFrameCommitted === true && frame.synchronizedOutputOpen !== true
+        && Number.isFinite(frame.writeSeq) && frame.writeSeq === frame.flushedSeq ? frame : null;
+      seal(pin, 'owned-control-released', currentFrame); return true;
+    }, false); },
     end(token, reason = 'terminal-disposed') { safe(() => {
       const state = weak.get(token); if (!state) return;
       if (state.pin) seal(state.pin, reason);

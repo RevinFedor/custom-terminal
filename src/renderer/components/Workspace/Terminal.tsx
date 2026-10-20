@@ -489,12 +489,13 @@ const getTabPendingAction = (tabId: string): PendingAction | undefined => {
 // Clear pending action after execution
 const clearTabPendingAction = (tabId: string) => {
   const state = useWorkspaceStore.getState();
-  for (const [projectId, workspace] of state.openProjects) {
+  for (const workspace of state.openProjects.values()) {
     const tab = workspace.tabs.get(tabId);
     if (tab && tab.pendingAction) {
       console.log('[RESTORE] 13. clearTabPendingAction:', { tabId, pendingAction: tab.pendingAction });
       tab.pendingAction = undefined;
-      state.openProjects.set(projectId, { ...workspace });
+      // Metadata consumption keeps the workspace incarnation. A shallow copy
+      // would make a sibling's in-flight creation look like project close/reopen.
       useWorkspaceStore.setState({ openProjects: new Map(state.openProjects) });
       return;
     }

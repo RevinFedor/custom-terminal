@@ -61,17 +61,24 @@ function createPublicTabActivity({ epoch = randomUUID(), readState, readInherite
     }
     const capturedRevision = revision;
     const capturedStyle = { ...style, value: style.value && { ...style.value } };
-    return ({ projectId = null, tabId = null } = {}) => {
-      const scoped = all.filter(tab => (!projectId || tab.projectId === projectId) && (!tabId || tab.tabId === tabId));
-      const found = !tabId || scoped.length > 0;
+    return ({ projectId = null, tabId = null, tabIds = null } = {}) => {
+      if (tabIds !== null && (!Array.isArray(tabIds) || tabIds.length < 1 || tabIds.length > 256
+        || new Set(tabIds).size !== tabIds.length || tabIds.some(id => typeof id !== 'string' || !id))) {
+        throw Object.assign(new Error('tab_activity_scope_invalid'), { code: 'tab_activity_scope_invalid', statusCode: 400 });
+      }
+      const selected = tabIds === null ? null : new Set(tabIds);
+      const scoped = all.filter(tab => (!projectId || tab.projectId === projectId) && (!tabId || tab.tabId === tabId)
+        && (!selected || selected.has(tab.tabId)));
+      const found = selected ? scoped.length === selected.size : !tabId || scoped.length > 0;
       return { version: 1, epoch, revision: capturedRevision,
-        scope: { kind: tabId ? 'tab' : projectId ? 'project' : 'all', projectId, tabId },
+        scope: { kind: selected ? 'tabs' : tabId ? 'tab' : projectId ? 'project' : 'all', projectId, tabId,
+          ...(selected ? { tabIds: [...tabIds] } : {}) },
         known: known && found, reason: known && !found ? 'tab-not-found' : reason,
         loaderCount: known && found ? scoped.filter(tab => tab.loader).length : null,
         processBar: capturedStyle,
         // Global is a complete ACTIVE set. Scoped reads also include idle tabs.
-        activeSet: !projectId && !tabId,
-        tabs: !projectId && !tabId ? scoped.filter(tab => tab.loader) : scoped };
+        activeSet: !projectId && !tabId && !selected,
+        tabs: !projectId && !tabId && !selected ? scoped.filter(tab => tab.loader) : scoped };
     };
   };
   return { capability: { ...TAB_ACTIVITY_CAPABILITY, epoch }, sample, capture: scope => sample()(scope), invalidate, observeStyle,

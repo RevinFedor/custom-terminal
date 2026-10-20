@@ -21,17 +21,35 @@ export interface SubagentLaunchServiceTier {
   timestamp: string | null;
 }
 
-export default function HistoryAgentLaunchParameters({ settings, taskLabel, provider = settings?.provider, serviceTier = null, loading = false }: {
+export interface SubagentRequestServiceTier {
+  version: 1;
+  provider: 'codex';
+  sessionId: string;
+  parentSessionId: string;
+  source: 'own-provider-request';
+  serviceTier: 'priority' | 'default' | null;
+  timestamp: string;
+  requestId: string;
+  turnId: string;
+}
+
+export default function HistoryAgentLaunchParameters({ settings, taskLabel, provider = settings?.provider, serviceTier = null, requestServiceTier = null, loading = false }: {
   settings: SubagentLaunchSettings | null;
   taskLabel: string;
   provider?: string;
   serviceTier?: SubagentLaunchServiceTier | null;
+  requestServiceTier?: SubagentRequestServiceTier | null;
   loading?: boolean;
 }) {
   const model = settings?.model || null;
   const effort = settings?.effort || null;
   const showFast = provider === 'codex';
-  const tier = showFast && serviceTier?.version === 1 && serviceTier.provider === 'codex'
+  const ownRequest = showFast && requestServiceTier?.version === 1 && requestServiceTier.provider === 'codex'
+    && requestServiceTier.source === 'own-provider-request' && !!requestServiceTier.requestId && !!requestServiceTier.turnId
+    && !!requestServiceTier.parentSessionId && !!requestServiceTier.sessionId
+    && [null, 'priority', 'default'].includes(requestServiceTier.serviceTier)
+    && (!settings?.sessionId || settings.sessionId === requestServiceTier.sessionId);
+  const tier = ownRequest ? requestServiceTier.serviceTier : showFast && serviceTier?.version === 1 && serviceTier.provider === 'codex'
     && serviceTier.source === 'own-thread-settings'
     && (!settings?.sessionId || settings.sessionId === serviceTier.sessionId)
       ? serviceTier.serviceTier : null;
@@ -46,7 +64,9 @@ export default function HistoryAgentLaunchParameters({ settings, taskLabel, prov
   const title = [taskLabel, 'Параметры запуска',
     modelLoading ? 'Модель загружается' : !model ? 'Модель не подтверждена' : model,
     effortLoading ? 'Effort загружается' : !effort ? 'Effort не подтверждён' : effort,
-    ...(showFast ? [fastLoading ? 'Fast загружается' : tier ? fastLabel : 'Fast при запуске не подтверждён'] : [])].join(' · ');
+    ...(showFast ? [fastLoading ? 'Fast загружается'
+      : ownRequest ? (tier ? fastLabel + ' · собственный запрос агента' : 'Fast в последнем запросе не подтверждён')
+        : tier ? fastLabel : 'Fast при запуске не подтверждён'] : [])].join(' · ');
   return <span data-history-agent-launch-parameters title={title}
     aria-busy={modelLoading || effortLoading || fastLoading || undefined}
     style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0, flex: '1 1 auto' }}>

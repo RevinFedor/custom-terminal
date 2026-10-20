@@ -350,6 +350,11 @@ const EditCard: React.FC<{
 // The visual dictionary forbids the transport name (`mcp__server__method`,
 // raw JSON args) as the row label. Header: plug icon + `server · method`;
 // args land in the expanded body only.
+/** Display alias only: server/method IDs and invocation payload stay raw. */
+export function mcpServerDisplayLabel(server: string): string {
+  return server === 'cua_repl' ? 'Computer Use' : server || 'MCP';
+}
+
 const McpToolCard: React.FC<{
   toolName: string;
   args: Record<string, any>;
@@ -370,7 +375,7 @@ const McpToolCard: React.FC<{
     const redundant = server.toLowerCase() + '_';
     if (method.toLowerCase().startsWith(redundant)) method = method.slice(redundant.length);
   }
-  const label = server || 'MCP';
+  const label = mcpServerDisplayLabel(server);
   // Compact one-string argument preview (dim, never the label). `summary`
   // is what Codex normalization writes — but it LEADS with the same
   // `server · method` action this card already prints as its label, so strip
@@ -386,7 +391,9 @@ const McpToolCard: React.FC<{
     if (!summary) return '';
     const action = method ? `${server} · ${method.replace(/_/g, ' ')}` : server;
     const actionExact = method ? `${server} · ${method}` : server;
-    for (const prefix of [action, actionExact]) {
+    const displayAction = method ? `${label} · ${method.replace(/_/g, ' ')}` : label;
+    const displayActionExact = method ? `${label} · ${method}` : label;
+    for (const prefix of [action, actionExact, displayAction, displayActionExact]) {
       if (prefix && summary.toLowerCase().startsWith(prefix.toLowerCase())) {
         summary = summary.slice(prefix.length).replace(/^\s*—\s*/, '').trim();
         break;

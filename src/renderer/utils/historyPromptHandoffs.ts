@@ -7,7 +7,7 @@ import {
   projectAgentLocalCommandSendResult,
 } from './agentLocalCommand.mjs';
 import { isAutomaticReadinessWaitReceipt } from '../../shared/prompt-queue-send-intent.cjs';
-import { readHistorySendRecovery, removeHistorySendRecovery } from './historySendRecovery.mjs';
+import { readHistorySendRecovery, removeHistorySendRecovery, hideHistorySendRecoveryPresentation } from './historySendRecovery.mjs';
 import { hiddenSendPresentation, canProjectCurrentProviderQueue, retiredSendInputSlot, cancelledSendIntent, isTabMessageNoInputReceipt } from '../../shared/agent-send-receipt-control.cjs';
 
 export type HistoryPromptHandoffTool = 'claude' | 'codex';
@@ -110,6 +110,7 @@ export interface QueuedMessageMergeGuard {
 }
 
 export interface HistoryPromptHandoff {
+  historyReturn?: any;
   applicationQueuePosition?: number;
   applicationQueuePresentationHandoffId?: string;
   applicationQueueId?: number | null;
@@ -175,6 +176,7 @@ export function historyPromptHandoffPresentationIdentity(
 }
 
 export interface BeginHistoryPromptHandoffInput {
+  historyReturn?: any;
   applicationQueuePosition?: number;
   applicationQueuePresentationHandoffId?: string;
   applicationQueueId?: number | null;
@@ -240,6 +242,7 @@ export interface AcceptHistoryPromptHandoffProviderQueueInput
 }
 
 export interface DurableHistorySendReceiptRecord {
+  historyReturn?: any;
   deliveryControl?: { version: number; cancelledAt?: number | null; presentationDismissed?: boolean } | null;
   inputSlot?: { version: number; state: string; reason?: string | null; retiredAt?: number | null } | null;
   applicationQueue?: { version: number; id: number; state: string; queuedAt: number;
@@ -331,6 +334,7 @@ export type BindHistoryPromptHandoffSendIdentityResult =
  * timestamps are presentation data, never identity fallbacks.
  */
 export interface HistoryPromptHandoffProjectionRow {
+  historyReturn?: any;
   enterAttemptAt?: number;
   semanticTags?: readonly Readonly<HistoryPromptHandoffSemanticTag>[];
   applicationQueuePosition?: number;
@@ -803,6 +807,7 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
     && row.timestamp === timestamp
     && row.optimisticAt === handoff.submittedAt
     && row.enterAttemptAt === handoff.enterAttemptAt
+    && row.historyReturn === handoff.historyReturn
     && row.requiresAuditIdentity === handoff.requiresAuditIdentity
     && row.auditTimestamp === auditTimestamp
     && row.auditHash === auditHash
@@ -828,6 +833,7 @@ function projectHandoffReceiptOntoRow<TRow extends HistoryPromptHandoffProjectio
     timestamp,
     optimisticAt: handoff.submittedAt,
     enterAttemptAt: handoff.enterAttemptAt,
+    historyReturn: handoff.historyReturn,
     requiresAuditIdentity: handoff.requiresAuditIdentity,
     auditTimestamp,
     auditHash,
@@ -973,6 +979,10 @@ export function reconcileHistoryPromptHandoffRows<
  * begin remains replayable when that surface mounts later.
  */
 export class HistoryPromptHandoffStore {
+  private returned = new Set<string>();
+  private restored = new Set<string>();
+  isReturned(tabId: string, handoffId: string) { return this.returned.has(tabId + '\0' + handoffId); }
+  isRestored(tabId: string, handoffId: string) { return this.restored.has(tabId + '\0' + handoffId); }
   private readonly limits: Readonly<HistoryPromptHandoffStoreLimits>;
   private readonly tabs = new Map<string, Map<string, StoredHandoff>>();
   private readonly listeners = new Map<string, Set<HistoryPromptHandoffListener>>();
@@ -1067,6 +1077,7 @@ export class HistoryPromptHandoffStore {
   begin(input: BeginHistoryPromptHandoffInput): Readonly<HistoryPromptHandoff> | undefined {
     const tabId = requireKey(input.tabId, 'tabId');
     const handoffId = requireKey(input.handoffId, 'handoffId');
+    if (this.restored.has(tabId + '\0' + handoffId)) return undefined;
     const existing = this.tabs.get(tabId)?.get(handoffId);
     if (existing) {
       this.promoteTab(tabId);
@@ -1171,6 +1182,7 @@ export class HistoryPromptHandoffStore {
       authoringImagePaths: input.authoringImagePaths || input.imagePaths || [],
       submittedAt,
       enterAttemptAt: input.enterAttemptAt,
+      historyReturn: input.historyReturn,
       source: typeof input.source === 'string' ? input.source : '',
       statusAtSend: input.statusAtSend || 'unknown',
       queueStatus: initialStatus,
@@ -1220,6 +1232,36 @@ export class HistoryPromptHandoffStore {
     tab.set(handoffId, { ...owned, value: next });
     this.notify(tabId, { type: 'transport-phase', handoffId });
     return next;
+  }
+
+  recordReturnControl(control: any) {
+    const tab = this.tabs.get(control?.tabId);
+    const owned = tab?.get(control?.handoffId);
+    if (!owned || control.version !== 1 || !control.token
+      || owned.value.historyReturn?.token && owned.value.historyReturn.token !== control.token) return;
+    const rank: Record<string, number> = { registering: 0, available: 1, writing: 2, superseded: 2, returned: 2, restored: 3 };
+    const prior = owned.value.historyReturn;
+    if (prior?.token === control.token && prior?.state === control.state
+      && prior?.inputStartedAt === control.inputStartedAt && prior?.returnedAt === control.returnedAt
+      && prior?.restoredAt === control.restoredAt) return;
+    if (rank[control.state] == null || (rank[prior?.state] || 0) > rank[control.state]
+      || prior?.state === 'writing' && control.state !== 'writing'
+      || ['returned', 'restored'].includes(prior?.state) && control.state === 'writing') return;
+    const next = freezeHandoff({ ...owned.value, historyReturn: Object.freeze({ ...control }),
+      ...(['returned', 'restored'].includes(control.state) ? {
+        queueStatus: 'cancelled' as const, statusReason: 'history-send-returned',
+        statusChangedAt: control.returnedAt || Date.now(),
+      } : {}),
+    });
+    tab!.set(control.handoffId, { ...owned, value: next });
+    if (['returned', 'restored'].includes(control.state)) this.returned.add(control.tabId + '\0' + control.handoffId);
+    if (control.state === 'restored') this.restored.add(control.tabId + '\0' + control.handoffId);
+    if (control.state === 'restored') {
+      removeHistorySendRecovery(control.tabId, control.handoffId);
+      this.consume(control.tabId, control.handoffId);
+      return next;
+    }
+    this.notify(control.tabId, { type: 'transport-phase', handoffId: control.handoffId });
   }
 
   preparePresentation(tabId: string, handoffId: string, input: Pick<BeginHistoryPromptHandoffInput, 'text' | 'imagePaths'>) {
@@ -1767,10 +1809,17 @@ export class HistoryPromptHandoffStore {
 }
 
 const historyPromptHandoffStore = new HistoryPromptHandoffStore();
+const receiptlessPresentationDismissals = new Map<string, string>();
 // Restore presentation/recovery only. A dispatched request may already have
 // reached Main; absence of a renderer reply cannot authorize another Send.
 try {
-  for (const { input, phase } of readHistorySendRecovery()) {
+  for (const { input, phase, presentationDismissedAt, presentationDismissedReturnToken } of readHistorySendRecovery()) {
+    if (Number.isFinite(presentationDismissedAt) && presentationDismissedAt > 0) {
+      if (typeof presentationDismissedReturnToken === 'string' && presentationDismissedReturnToken) {
+        receiptlessPresentationDismissals.set(JSON.stringify([input.tabId, input.handoffId]), presentationDismissedReturnToken);
+      }
+      continue;
+    }
     historyPromptHandoffStore.begin({ ...input, initialReceipt: {
       queueStatus: phase === 'preparing' ? 'failed' : 'delivery-unknown',
       reason: phase === 'preparing' ? 'history-preparation-interrupted' : 'history-send-reply-interrupted',
@@ -1892,7 +1941,7 @@ export function historyPromptHandoffStatusPresentation(
         label: 'UNCONFIRMED',
         tone: 'warning',
         pending: false,
-        title: 'Доставка не подтверждена. Не отправляйте текст повторно как новую команду',
+        title: 'Исход отправки неизвестен: сообщение могло быть принято. Не отправляйте его повторно',
       };
     case 'sent':
       if (Number.isFinite(options.now)) {
@@ -2068,6 +2117,10 @@ export const recordHistorySendEnterAttempt = (data: BindHistoryPromptHandoffSend
   tabId: string; handoffId: string; enterAttemptAt?: number;
 }) => historyPromptHandoffStore.recordEnterAttempt(data.tabId, data.handoffId, data);
 
+export const recordHistorySendReturnControl = (control: any) => historyPromptHandoffStore.recordReturnControl(control);
+export const isHistorySendReturned = (tabId: string, handoffId: string) => historyPromptHandoffStore.isReturned(tabId, handoffId);
+export const isHistorySendReturnRestored = (tabId: string, handoffId: string) => historyPromptHandoffStore.isRestored(tabId, handoffId);
+
 export const prepareHistoryPromptHandoffPresentation = (tabId: string, handoffId: string,
   input: Pick<BeginHistoryPromptHandoffInput, 'text' | 'imagePaths'>) =>
   historyPromptHandoffStore.preparePresentation(tabId, handoffId, input);
@@ -2106,6 +2159,16 @@ export const retractHistoryPromptHandoff = (
 
 export const consumeHistoryPromptHandoff = (tabId: string, handoffId: string) => {
   removeHistorySendRecovery(tabId, handoffId);
+  return historyPromptHandoffStore.consume(tabId, handoffId);
+};
+
+export const dismissReceiptlessHistoryPromptPresentation = (tabId: string, handoffId: string, input: any) => {
+  // Called only after Main's successful exact absence read, not an IPC error.
+  // Persist before removal; do NOT consume the recovery snapshot/assets.
+  const marker = hideHistorySendRecoveryPresentation({ ...input, tabId, handoffId, text: input.text ?? input.content });
+  if (marker.presentationDismissedReturnToken) {
+    receiptlessPresentationDismissals.set(JSON.stringify([tabId, handoffId]), marker.presentationDismissedReturnToken);
+  }
   return historyPromptHandoffStore.consume(tabId, handoffId);
 };
 
@@ -2304,8 +2367,15 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   if (controlOwner?.sendAttemptId && attemptId && controlOwner.sendAttemptId !== attemptId) {
     return { hydrated: false, reason: 'durable-history-receipt-owner-mismatch' };
   }
+  if (record.historyReturn?.token && receiptlessPresentationDismissals.get(JSON.stringify([tabId, handoffId])) === record.historyReturn.token) {
+    // An exact original return token can join its late durable identity. A
+    // different/unproven owner is NOT hidden by the old receiptless card.
+    // Canonical History, receipt/audit/FIFO and other handoffs are untouched.
+    return { hydrated: false, reason: 'local-history-presentation-dismissed' };
+  }
   const deliveryControl = historyPromptHandoffStore.observeDeliveryControl(record);
-  if (hiddenSendPresentation(record) || deliveryControl?.hidden) {
+  if (record.historyReturn) recordHistorySendReturnControl(record.historyReturn);
+  if (record.historyReturn?.state === 'restored' || hiddenSendPresentation(record) || deliveryControl?.hidden) {
     const current = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
     if (current && current.sendOperationKey === operationKey
       && (!current.sendAttemptId || current.sendAttemptId === attemptId)) consumeHistoryPromptHandoff(tabId, handoffId);
@@ -2320,6 +2390,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
       }
       const presentation = receipt.presentationSnapshot || {};
       const handoff = beginHistoryPromptHandoff({ tabId, handoffId, sendOperationKey: operationKey, sendAttemptId: attemptId,
+        historyReturn: record.historyReturn,
         applicationQueueId: record.applicationQueue?.id,
         toolType, text: promptText, imagePaths: presentation.imagePaths || [],
         semanticTags: presentation.semanticTags,
@@ -2488,6 +2559,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
       }
     : undefined;
   const begun = beginHistoryPromptHandoff({
+    historyReturn: record.historyReturn,
     applicationQueueId: record.applicationQueue?.id,
     applicationQueuePosition: record.applicationQueue?.position ?? record.applicationQueue?.id,
     applicationQueuePresentationHandoffId: record.applicationQueue?.merge?.presentationHandoffId,
@@ -2515,6 +2587,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     ...(initialReceipt ? { initialReceipt } : {}),
   });
   if (!begun) return { hydrated: false, reason: 'durable-history-handoff-bounds' };
+  if (record.historyReturn) recordHistorySendReturnControl(record.historyReturn);
   const bound = bindHistoryPromptHandoffSendIdentity(tabId, handoffId, {
     applicationQueueId: record.applicationQueue?.id,
     sendAttemptId: attemptId,

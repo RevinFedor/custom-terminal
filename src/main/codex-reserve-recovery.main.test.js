@@ -49,6 +49,9 @@ for (const scenario of ['current', 'account-changed', 'choice-changed']) {
       effectiveModel: 'gpt-6-sol', effectiveEffort: 'max',
       sourceSettingsProof: { model: 'gpt-reserve', effort: 'max' },
       reserveReturn: { restore: true, choice, home: 'home', availability: {} },
+      assertCurrent() {},
+      // This suite owns Reserve model/effort, not the separately-tested Fast intent.
+      ensureCodexFastLaunchIntent: () => ({ desiredFast: false, revision: 1 }),
       proveIdleShellForAgentLaunch: async () => ({ allowed: true }),
       readCodexReserveReturnChoice: () => scenario === 'choice-changed' ? { ...choice, actionSequence: 5 } : choice,
       getCodexReserveAvailabilityProbe: () => ({ current: () => scenario !== 'account-changed' }),

@@ -46,7 +46,7 @@ function harness(t, { text = 'fixture prompt', status = 'active', imageFailure =
     setItem: (key, value) => { if (saveFailure) throw Error('quota'); records.set(key, value); }, removeItem: key => records.delete(key) };
   const store = new HistoryPromptHandoffStore(), rows = new Map();
   const ref = current => ({ current });
-  const ctx = { ...coordinator, console: { log() {}, warn() {}, error() {} },
+  const ctx = { ...coordinator, crypto: globalThis.crypto, console: { log() {}, warn() {}, error() {} },
     projectAgentLocalCommandSendResult, historyPromptHandoffUnconfirmedStatusFromSendResult,
     historyPromptHandoffAuditProofFromSendResult, historyPromptAuditIsProviderQueueReturn,
     midstreamPromptRecoveryRef: ref(null), refreshHistoryWithUpdating() {},
@@ -57,6 +57,8 @@ function harness(t, { text = 'fixture prompt', status = 'active', imageFailure =
     busyAction: null, resumeMaterialized: true, prompt: text,
     historyPromptHandoffBlocksNewSubmit: () => false, getHistoryPromptHandoffsSnapshot: id => store.getSnapshot(id),
     beginHistoryPromptHandoff: value => store.begin(value),
+    recordHistorySendReturnControl: value => store.recordReturnControl(value),
+    isHistorySendReturned: (tab, id) => store.isReturned(tab, id),
     prepareHistoryPromptHandoffPresentation: (...args) => store.preparePresentation(...args),
     bindHistoryPromptHandoffSendIdentity: (...args) => store.bindSendIdentity(...args),
     settleHistoryPromptHandoff: (...args) => store.settle(...args),
@@ -95,7 +97,8 @@ function harness(t, { text = 'fixture prompt', status = 'active', imageFailure =
     recoverAgentDraftTransferToHistory: async () => {}, queueSendTransferredOwnership: () => false,
     onPromptStatusChange: (id, queueStatus) => { if (rows.has(id)) rows.get(id).queueStatus = queueStatus; },
     retractHistoryPromptHandoff: (...args) => store.retract(...args),
-    ipcRenderer: { invoke: async (name) => { events.push(['ipc', name]); return {}; } },
+    ipcRenderer: { invoke: async (name, input) => { events.push(['ipc', name]);
+      return name === 'agent:register-history-send-return' ? { success: true, control: { ...input, state: 'available' } } : {}; } },
     runtime: { toolType: 'claude', logPrefix: 'fixture', label: 'Claude', allowSendWhileBusy: true,
       stopProcess: async () => { events.push(['physical-stop']); stopEntered.resolve(); return stopped.promise; } },
   };
@@ -147,6 +150,24 @@ test('actual History shows one PREPARING card before slow context; input is alre
   } finally { h.prepared.reject(new Error('fixture context read failed')); await send; }
   assert.equal(renderPreparation(h), '', 'failed preparation removes only its caption');
   assert.equal(h.input.historyPromptDrafts.T, 'fixture prompt', 'pre-input failure preserves draft');
+});
+
+test('return before dispatch releases local preparation immediately; late old context cannot send over next draft', async t => {
+  const h = harness(t, { contextPending: true });
+  const first = h.run('send'); await h.contextEntered.promise;
+  const control = h.store.getSnapshot('T')[0].historyReturn;
+  h.store.recordReturnControl({ ...control, state: 'returned' });
+  assert.equal(coordinator.releaseReturnedHistoryPreparation('T', 'H'), true);
+  assert.equal(coordinator.getCoordinatedAgentAction('T'), null);
+  h.input.historyPromptDrafts.T = 'next independent send';
+  h.ctx.createPromptHandoffId = () => 'H2';
+  h.ctx.prepareTabWorkContext = async (_tab, handoff, prompt) => ({ prompt, prefix: '' });
+  await h.run('send');
+  assert.equal(h.events.filter(e => e[0] === 'admission').length, 1);
+  assert.equal(h.events.find(e => e[0] === 'admission')[1].handoffId, 'H2');
+  h.prepared.resolve({ prompt: 'old delayed context', prefix: '' }); await first;
+  assert.equal(h.events.filter(e => e[0] === 'admission').length, 1);
+  assert.equal(h.events.filter(e => e[0] === 'physical-stop').length, 0);
 });
 
 test('composer caption presents provider lifecycle only, including before an early handoff exists', async t => {

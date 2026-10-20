@@ -597,11 +597,19 @@ const {
 } = require(path.join(srcMainDir, 'codex-context-session-observer'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const { createWorkflowOrganizationApi, registerWorkflowOrganizationIpc } = require(path.join(srcMainDir, 'workflow-organization-api'));
+const workflowPublicationWake = require(path.join(srcMainDir, 'workflow-publication-wake')).createWorkflowPublicationWake({
+  onError: reason => console.warn('[WorkflowPublicationWake] ' + reason),
+});
 let idleSessionStopService = null;
+let workflowSelectionRuntime = null;
 const workflowOrganization = createWorkflowOrganizationApi({ database: projectManager.db,
+  readDirectoryRuntime: entries => captureWorkflowDirectoryRuntime(entries),
+  readDirectoryCards: entries => captureWorkflowDirectoryCards(entries),
   captureExecution: tabId => ({...captureConversationOwner(tabId),inputRevision:getTerminalInputRevision(tabId),
     lifecycleGeneration:getTerminalLifecycleGeneration(tabId)}),
   publish: publication => {
+    try { workflowPublicationWake.observe(publication); }
+    catch { console.warn('[WorkflowPublicationWake] observer-failed'); }
     idleSessionStopService?.refresh();
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) window.webContents.send('workflow:changed', publication);
@@ -897,6 +905,17 @@ const CODEX_NATIVE_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-recei
 const CODEX_NATIVE_REWIND_CHILD_WINDOW_MS = 2 * 60 * 1000;
 const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
 const { writeWithSendEnterTiming } = require(path.join(srcMainDir, 'agent-send-enter-timing'));
+const { historySendReturnControl } = require(path.join(srcMainDir, 'history-send-return'));
+
+function publishHistorySendReturn(control) {
+  if (!control) return;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:history-send-return', control);
+}
+function writeHistorySendPayload(term, data, tabId, handoffId) {
+  const control = historySendReturnControl(agentSendReceiptStore).beforeWrite(tabId, handoffId);
+  try { if (control?.newlyStarted) publishHistorySendReturn(control); } catch { /* publication cannot change the write fence */ }
+  return term.write(data);
+}
 
 function writeHistorySendEnter(term, data, { tabId, handoffId, sendOperationKey, sendAttemptId } = {}) {
   if (!tabId || !handoffId || (data !== '\r' && data !== '\n')) return term.write(data);
@@ -1223,6 +1242,7 @@ const {
   resolveAcceptedClaudeResumeShutdownTarget,
   resolveExactShutdownTarget,
 } = require(path.join(srcMainDir, 'shutdown-ai-session-snapshot'));
+const { captureShutdownProcessProof } = require(path.join(srcMainDir, 'shutdown-process-proof'));
 const {
   compareAiLifecycleIdentity,
   normalizeAgentLaunchSource,
@@ -1372,6 +1392,7 @@ function getProjectCardSignals() {
     readTabs: (projectId, tabIds) => projectManager.db.getProjectCardPlanSummaries(projectId, tabIds),
     readPending: tabIds => tabWorkContext.summaries(tabIds),
     readFast: readMainCardFast,
+    readDirectoryAppearance: () => require(path.join(srcMainDir, 'directory-appearance')).readDirectoryAppearance(projectManager.db),
     readCatalog: () => {
       const marker = projectManager.db.getAppState('noted-terminal-task-status-marker')
         || projectManager.db.getAppState('noted-terminal-status-marker') || {};
@@ -1403,7 +1424,7 @@ function noteProjectCardSignalsChanged(projectId = null, tabId = null) {
 
 function noteCardSignalSettingsChanged(key) {
   if (['noted-terminal-task-statuses', 'noted-terminal-task-status-marker',
-    'noted-terminal-session-statuses', 'noted-terminal-status-marker'].includes(key)) {
+    'noted-terminal-session-statuses', 'noted-terminal-status-marker', 'noted-terminal-process-bar'].includes(key)) {
     noteProjectCardSignalsChanged();
   }
 }
@@ -4084,11 +4105,25 @@ function handleClaudeProviderSemanticEvent({ tabId, sourceId, gap, event } = {})
   });
 }
 
+function authorizeCodexSubagentTierRequest({ tabId, sourceId } = {}) {
+  const owner = codexProviderSemanticSources.get(tabId) || null;
+  const current = currentCodexProviderSemanticOwnerContext(tabId);
+  const verdict = codexProviderPreviewOwnerVerdict(owner, current, sourceId);
+  if (!sourceId || !verdict.allowed) return { allowed: false, reason: verdict.reason || 'source-missing' };
+  const writer = getCodexWriterProofSnapshot(tabId);
+  if (!writer?.sessionId || writer.terminalToken !== current.terminalToken
+    || writer.runSeq !== current.runSeq || writer.lifecycleGeneration !== current.lifecycleGeneration) {
+    return { allowed: false, reason: 'subagent-tier-parent-writer-unproven' };
+  }
+  return { allowed: true, parentSessionId: writer.sessionId };
+}
+
 const providerSemanticShadow = createProviderSemanticShadow({
   log: console,
   onCodexSemanticEvent: handleCodexProviderSemanticEvent,
   onClaudeSemanticEvent: handleClaudeProviderSemanticEvent,
   authorizeCodexMainRequest: authorizeCodexProviderMainRequest,
+  authorizeCodexSubagentRequest: authorizeCodexSubagentTierRequest,
 });
 function safelyObserveProviderSemantic(action, operation, fallback = null) {
   try { return operation(); } catch (error) {
@@ -4222,7 +4257,7 @@ function terminalHistoryPreviewDiagnosticCommandState(tabId) {
   };
 }
 
-async function captureTerminalHistoryPreviewDiagnostic(payload = {}) {
+async function captureTerminalHistoryPreviewDiagnostic(payload = {}, continuationWindow = null) {
   const tabId = String(payload?.tabId || '');
   const toolType = payload?.toolType === 'claude' || payload?.toolType === 'codex'
     ? payload.toolType
@@ -4239,13 +4274,31 @@ async function captureTerminalHistoryPreviewDiagnostic(payload = {}) {
   }
   // Pin before renderer/disk awaits. The error packet keeps a stable reference
   // while its independently bounded tail continues observing this physical PTY.
-  let rawWindow = { available: false, reason: 'raw-observer-unavailable' };
-  try { rawWindow = observeTerminalRaw(terminalRawWindow, 'pin', terminal, {
-    incidentId, sendIdentity: { ...payload.sendIdentity,
-      handoffId: payload.sendIdentity?.handoffId || historyEntry?.handoffId },
-    identity: readTerminalInputDiagnosticOwner(tabId), headlessSeq: mirror?.writeSeq,
-    syncOpen: mirror?.redrawTrace?.synchronizedOutputOpen === true,
-  }); } catch { /* Diagnostic failure cannot prevent the original error packet. */ }
+  let rawWindow = continuationWindow || { available: false, reason: 'raw-observer-unavailable' };
+  try {
+    if (!continuationWindow) {
+      const rawOwner = readTerminalInputDiagnosticOwner(tabId);
+      const candidate = toolType === 'codex' && terminal && payload.context?.source === 'owned-short-control-frame'
+        ? codexSettingsMutationQueue.getUnsubmittedInput(terminal) : null;
+      const exact = candidate?.diagnostic?.traceId === payload.context?.traceId
+        && candidate?.identity?.terminalToken === terminal && candidate.identity.tabId === tabId
+        && candidate.identity.mirrorGeneration === mirror?.generation
+        && candidate.identity.terminalLifecycleGeneration === rawOwner.lifecycleGeneration
+        && candidate.identity.terminalRunSeq === rawOwner.runSeq
+        && candidate.identity.terminalStopRevision === rawOwner.stopRevision
+        && candidate.identity.inputRevision === rawOwner.inputRevision;
+      const completionKey = exact ? candidate.diagnostic.traceId : null;
+      rawWindow = observeTerminalRaw(terminalRawWindow, 'pin', terminal, {
+        incidentId, sendIdentity: { ...payload.sendIdentity,
+          handoffId: payload.sendIdentity?.handoffId || historyEntry?.handoffId },
+        identity: rawOwner, headlessSeq: mirror?.writeSeq, completionKey,
+        syncOpen: mirror?.redrawTrace?.synchronizedOutputOpen === true,
+      });
+      if (exact && rawWindow?.available && rawWindow.completionRegistered) candidate.rawCompletion = {
+        id: rawWindow.id, completionKey, rawWindow: { ...rawWindow }, incidentId,
+      };
+    }
+  } catch { /* Diagnostic failure cannot prevent the original error packet. */ }
   if (mirror && terminal) mirror.rawPhysicalTerminal = terminal;
   const presentedPreview = normalizeTerminalHistoryPreviewDiagnosticPreview(payload?.preview);
   const currentPreview = normalizeTerminalHistoryPreviewDiagnosticPreview(
@@ -9645,6 +9698,61 @@ function computeProjectActivity() {
   };
 }
 
+function captureWorkflowDirectoryRuntime(entries) {
+  const { createDirectoryRuntimeReader } = require(path.join(srcMainDir, 'workflow-directory-runtime'));
+  const read = () => {
+    const activity = new Map(computeProjectActivity().projects.flatMap(project => project.tabs).map(tab => [tab.tabId, tab.turnBusy === true]));
+    const pending = new Set(agentSendActivity.snapshot().pendingTabIds);
+    const inherited = require(path.join(srcMainDir, 'web-server')).readInheritedTabActivity();
+    return { activity, pending, inherited };
+  };
+  // read() is shared within each synchronous sample; isCurrent takes a fresh
+  // owner sample after the caller's await and compares its exact fingerprint.
+  let sample;
+  const reader = createDirectoryRuntimeReader({ epoch: appRuntimeIdentity.instanceId, ownerInstanceId: conversationOwners.instanceId,
+    beginSample: () => { sample = read(); }, capture: entry => {
+    const id = entry.tabId, term = terminals.get(id), command = terminalCommandState.get(id);
+    const owners = getLiveAiRuntimeOwners(id), provider = owners.length === 1 ? owners[0] : null;
+    return { stored: conversationOwners.stored(id), provider, liveOwnerCount: owners.length,
+      terminalPresent: !!term, terminalId: term ? terminalLifecycleEpochs.get(term) || null : null,
+      projectId: terminalProjectIds.get(id) || null, cwd: terminalProjects.get(id) || null,
+      sdkPresent: sdkSessions.has(id), commandRunning: typeof command?.isRunning === 'boolean' ? command.isRunning : null,
+      lookupUnknown: command?.processLookupUnknown === true, runSeq: Number(command?.runSeq || 0),
+      lifecycleGeneration: getTerminalLifecycleGeneration(id),
+      launchId: provider === 'codex' ? codexLastRunCommandPayload.get(id)?.launchId || null
+        : provider === 'claude' ? claudeLaunchGenerationByTab.get(id)?.generation || null : null,
+      ownBusy: sample.activity.get(id) === true || sample.pending.has(id), pending: sample.pending.has(id),
+      inheritedKnown: sample.inherited?.known === true, inheritedBusy: sample.inherited?.sourceTabIds?.includes(id) === true,
+      notification: tabCompletionNotifications.get(id) || null };
+  } });
+  return reader(entries);
+}
+
+function captureWorkflowDirectoryCards(entries) {
+  const { executionRefForInput } = require(path.join(srcMainDir, '../shared/workflow-directory-catalog.cjs'));
+  const runtime = captureWorkflowDirectoryRuntime(entries), byId = new Map(runtime.tabs.map(tab => [tab.tabId, tab]));
+  const service = getProjectCardSignals(), groups = new Map();
+  for (const entry of entries) {
+    const namespace = executionRefForInput(entry).namespace;
+    if (!groups.has(namespace)) groups.set(namespace, []);
+    groups.get(namespace).push(entry.tabId);
+  }
+  const captures = [...groups].map(([namespace, ids]) => service.snapshot(namespace, ids, { scope: 'directory-v2' }));
+  // Empty row batch still returns the small palette/marker, never a namespace inventory.
+  const palette = captures[0] || service.snapshot('__tab_catalog_v2__', [], { scope: 'directory-v2' });
+  const tabs = captures.flatMap(value => value.tabs).map(tab => {
+    const proof = byId.get(tab.tabId);
+    return { ...tab, executionScope: proof?.executionScope,
+      ...(!(proof?.liveKnown === true && proof.live === true && proof.ownerToken)
+      ? { fast: require(path.join(srcMainDir, 'project-card-signals')).unknownFast('directory-owner-unproven') } : {}) };
+  });
+  const clock = service.wake();
+  return { epoch: clock.epoch, revision: clock.revision, taskStatuses: palette.taskStatuses, taskStatusMarker: palette.taskStatusMarker,
+    directoryAppearance: palette.directoryAppearance, tabs,
+    isCurrent: () => runtime.isCurrent() && service.wake().revision === clock.revision
+      && service.isDirectoryAppearanceCurrent(palette.directoryAppearance) };
+}
+
 function readPublicTabActivityState() {
   const own = new Map(computeProjectActivity().projects.flatMap(project => project.tabs)
     .map(tab => [tab.tabId, tab.turnBusy === true]));
@@ -9712,6 +9820,7 @@ ipcMain.on('agent:tui-ready-internal', (_event, payload = {}) => {
   scheduleProjectActivityBroadcast(toolType + '-ready');
   if (toolType === 'codex' && payload?.tabId) {
     void scheduleCodexModelEffortIntentReconcile(payload.tabId, 'tui-ready');
+    void scheduleCodexFastIntentReconcile(payload.tabId, 'tui-ready');
   }
 });
 
@@ -9722,6 +9831,10 @@ ipcMain.on('agent:readiness-changed-internal', (_event, payload = {}) => {
   // ControlBar mounted and no new status query from a tab switch.
   if (payload?.toolType === 'codex' && payload?.tabId && payload?.status === 'ready') {
     void scheduleCodexModelEffortIntentReconcile(payload.tabId, 'input-ready:' + (payload.source || 'event'));
+  }
+  if (payload?.toolType === 'codex' && payload?.tabId
+    && (payload.status === 'ready' || payload.source === 'settings-reconcile-settled')) {
+    void scheduleCodexFastIntentReconcile(payload.tabId, 'input-ready:' + (payload.source || 'event'));
   }
 });
 
@@ -11428,6 +11541,7 @@ providerProxy.on('upgrade', (req, socket, head) => {
       tabId: route.tabId,
       transport: 'websocket',
       sourceId: currentCodexProviderSemanticSourceId(route.tabId),
+      headers: req.headers,
     }),
   );
   let client = null;
@@ -15611,6 +15725,7 @@ function projectCodexRuntimeSnapshotFromEvents(
     goalWork: turnState.goalWork || null,
     startupWait: projectCodexSendStartupWait({ payload: currentPayload, terminal: currentTerminal,
       lifecycleGeneration: currentLifecycleGeneration, runSeq: currentRunSeq,
+      lifecycleEstablished: hasCodexEstablishedComposerLifecycle(tabId),
       commandRunning: commandState?.isRunning === true, stopping, inputReady,
       timeoutMs: CODEX_STARTUP_NO_STATE_TIMEOUT_MS }),
     // The fast renderer presence path must carry the SAME physical target as
@@ -16025,23 +16140,38 @@ function readCodexShutdownEvidence(tabId, inspection) {
  * Process lookup answers only liveness/provider. A missing Codex writer gets
  * one bounded canonical reconciliation; an untouched Resume may separately
  * prove its exact source recovery lease. Neither path guesses an id from DB.
- * Sequential reads share one process-tree snapshot and avoid a new ps storm.
+ * Freeze the complete inventory before one shared process observation. Unknown
+ * is retained for this Quit only; ordinary launch/read/Stop lookup is unchanged.
  */
 async function augmentShutdownStateFromProcessProof(seedEntries, seedLiveTabIds) {
   const entries = new Map(seedEntries || []);
   const liveTabIds = new Set(seedLiveTabIds || []);
   const codexProofDeadline = Date.now() + 4500;
-  for (const tabId of terminals.keys()) {
-    const terminalToken = terminals.get(tabId) || null;
-    const intentBefore = claudeStartupIntents.get(tabId) || null;
-    const launchBefore = claudeLaunchGenerationByTab.get(tabId) || null;
-    const runSeqBefore = Number(terminalCommandState.get(tabId)?.runSeq || 0);
-    const codexScopeBefore = captureCodexShutdownScope(tabId);
+  const targets = Array.from(terminals.keys(), (tabId) => ({
+    tabId,
+    processScope: captureAiProcessLookupScope(tabId),
+    terminalToken: terminals.get(tabId) || null,
+    intentBefore: claudeStartupIntents.get(tabId) || null,
+    launchBefore: claudeLaunchGenerationByTab.get(tabId) || null,
+    runSeqBefore: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    codexScopeBefore: captureCodexShutdownScope(tabId),
+  }));
+  const processProof = await captureShutdownProcessProof({
+    targets,
+    readSnapshot: () => getProcessTreeSnapshot({ forceFresh: true }),
+    isScopeCurrent: aiProcessLookupScopeCurrent,
+    getProcessName: getAiProcessNameFromCommand,
+    now: () => nodePerformance.now(),
+    maxAgeMs: PROCESS_TREE_SNAPSHOT_TTL_MS,
+  });
+  console.log('[Shutdown:ProcessProof] inventory ' + JSON.stringify(processProof.summary));
+  for (const target of targets) {
+    const { tabId, terminalToken, intentBefore, launchBefore, runSeqBefore, codexScopeBefore } = target;
     let lookup;
     try {
       // expectedName=null is deliberate: prove BOTH providers so a dual-owner
       // PTY cannot be misclassified by searching only the preferred label.
-      lookup = await inspectAiDescendantProcessesByTab(tabId, null);
+      lookup = processProof.lookup(tabId);
     } catch (error) {
       console.warn('[Shutdown:ProcessProof] unknown tab=' + String(tabId).slice(-12)
         + ' error=' + String(error?.message || error));
@@ -16080,6 +16210,9 @@ async function augmentShutdownStateFromProcessProof(seedEntries, seedLiveTabIds)
             // a second owner appearing during descriptor IO cannot be ignored.
             const currentLookup = await inspectAiDescendantProcessesByTab(tabId, null);
             const currentProviders = new Set((currentLookup.matches || []).map((match) => match.processName));
+            if (currentLookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
+              return { status: 'shutdown-process-proof-unknown' };
+            }
             return currentLookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND
               && currentProviders.size === 1 && currentProviders.has('codex')
               ? inspection
@@ -25791,6 +25924,13 @@ app.whenReady().then(async () => {
     // Load from src/main, not dist/main — electron-vite only bundles main.js,
     // sibling modules live as raw .js files (same pattern as claude-agent etc).
     const webServer = require(path.join(srcMainDir, 'web-server'));
+    // All Main owners and the existing broadcast scheduler are initialized.
+    // An early publication never reaches them through the callback above.
+    workflowPublicationWake.start({ epoch: appRuntimeIdentity.instanceId,
+      isCurrent: () => projectManager.workflowOrganization === workflowOrganization,
+      readPublication: () => workflowOrganization.service.getPublication(),
+      schedule: reason => scheduleProjectActivityBroadcast(reason),
+    });
     // computeActiveLoaders is injected (not imported) so web-server stays a leaf
     // module with no back-reference into main — it only reads the live Maps that
     // already exist here. GET /api/active-loaders calls it on each poll.
@@ -25803,6 +25943,7 @@ app.whenReady().then(async () => {
       userNotificationOutbox,
       computeActiveLoaders,
       computeProjectActivity,
+      readWorkflowPublication: () => workflowPublicationWake.snapshot(),
       readTabActivityState: readPublicTabActivityState,
       scheduleTabActivityBroadcast: scheduleProjectActivityBroadcast,
       readAgentTabTiming: readPublicAgentTabTiming,
@@ -29276,9 +29417,13 @@ function captureCodexSendStartupFrameWait(tabId, requestedLaunchId = null) {
   }
   if (!receipt || !codexSendStartupFrameWaitIsCurrent(tabId, receipt)
     || (requestedLaunchId && receipt.launchId !== requestedLaunchId)) return null;
-  // A NEW warm read gets its ordinary budget. A caller carrying an earlier
-  // Main-issued launch id still joins the old deadline, even after expiry.
-  if (!requestedLaunchId && receipt.deadlineAt <= Date.now()) return null;
+  // The retained receipt belongs to callers already pinned to this launch.
+  // Ready cleanup may retain it (and a late-MCP payload), but a NEW warm read
+  // must use its own HEAD budget even before the old launch deadline expires.
+  // Mint above before this check so cleanup still preserves earlier cold waits.
+  if (!requestedLaunchId && (!payload || hasCodexEstablishedComposerLifecycle(tabId)
+    || isCodexOperationalInputReady(tabId)
+    || receipt.deadlineAt <= Date.now())) return null;
   return receipt;
 }
 
@@ -29615,6 +29760,11 @@ async function waitForClaudePasteReadyBeforeSubmit({
 // Wraps the actual work in a per-term promise chain so two concurrent callers
 // can't interleave bytes on the same PTY. See pasteInflight comment above.
 function resolveSafePasteFailureAfterWrite(error, term, options, operation) {
+  if (error?.code === 'history_send_returned' && !operation?.enterAttempted
+    && historySendReturnControl(agentSendReceiptStore).isReturned(operation?.tabId, operation?.handoffId)) {
+    return { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+      status: 'not-submitted', code: 'history_send_returned', error: error.message };
+  }
   if (!operation?.enterAttempted && operation?.submitted !== true) throw error;
   const tabId = operation.tabId || null;
   const operationKey = operation.sendOperationKey || null;
@@ -31296,7 +31446,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
     try {
       emitBusy(true, 'sending');
-      term.write(payload);
+      writeHistorySendPayload(term, payload, broadcastTabId, handoffId);
       if (options.claudeSettingEvidenceToken) claudeSettingEvidence.markWritten(options.claudeSettingEvidenceToken, 'paste');
     } catch (error) {
       if (options.claudeSettingEvidenceToken) claudeSettingEvidence.markUncertain(options.claudeSettingEvidenceToken, 'paste');
@@ -33596,6 +33746,55 @@ ipcMain.handle('agent:cancel-queued-send', (_event, { tabId, handoffId } = {}) =
   return result.cancelled ? result : web.dismissUnwrittenQueuedSend(tabId, handoffId);
 });
 
+ipcMain.handle('agent:register-history-send-return', (_event, input) => {
+  const result = historySendReturnControl(agentSendReceiptStore).register(input);
+  publishHistorySendReturn(result.control);
+  return result;
+});
+ipcMain.handle('agent:return-history-send', (_event, input) => {
+  const result = historySendReturnControl(agentSendReceiptStore).request(input);
+  if (result.returned) {
+    result.authoringSnapshot = require(path.join(srcMainDir, 'web-server')).readQueuedSendAuthoring(input.tabId, input.handoffId);
+    // Only untouched WAITING items are removed. An active launch/scenario is
+    // allowed to finish; its payload write is fenced above, not via Stop.
+    require(path.join(srcMainDir, 'web-server')).cancelQueuedAgentSends(input.tabId, input.handoffId,
+      { dismiss: false, reason: 'history-return-before-input' });
+  }
+  publishHistorySendReturn(result.control);
+  console.log('[HistorySendReturn] request tab=' + String(input?.tabId).slice(-12)
+    + ' handoff=' + String(input?.handoffId) + ' returned=' + !!result.returned
+    + ' reason=' + (result.reason || '-'));
+  return result;
+});
+ipcMain.handle('agent:ack-history-send-return', (_event, input) => {
+  // localStorage's normal mirror is async. Read its durable envelope before
+  // releasing queue assets; renderer success alone is not a storage ACK.
+  const rawDrafts = projectManager.db.getAppState('noted-terminal-history-composer-drafts');
+  let drafts;
+  try { drafts = typeof rawDrafts === 'string' ? JSON.parse(rawDrafts) : rawDrafts; } catch { drafts = null; }
+  const previous = historySendReturnControl(agentSendReceiptStore).read(input.tabId, input.handoffId);
+  if (previous?.state !== 'restored' && !drafts?.[input.tabId]?.returned?.includes(input.token)) {
+    return { success: false, reason: 'returned-draft-not-durable' };
+  }
+  const frozenAuthoring = require(path.join(srcMainDir, 'web-server')).readQueuedSendAuthoring(input.tabId, input.handoffId);
+  const retainedAssets = new Set((drafts?.[input.tabId]?.images || []).map(ref => ref.assetId).filter(Boolean));
+  if (previous?.state !== 'restored' && (frozenAuthoring?.imagePaths || [])
+    .some(ref => ref.assetId && !retainedAssets.has(ref.assetId))) {
+    return { success: false, reason: 'returned-assets-not-durable' };
+  }
+  const result = historySendReturnControl(agentSendReceiptStore).acknowledge(input);
+  if (result.success) {
+    const matches = agentSendReceiptStore.list({ tabId: input.tabId, handoffId: input.handoffId });
+    for (const record of matches.filter(row => row.handoffId === input.handoffId)) {
+      agentSendReceiptStore.dismissPresentation({ operationKey: record.operationKey, attemptId: record.attemptId,
+        tabId: input.tabId, handoffId: input.handoffId, surface: DESKTOP_HISTORY_SEND_SURFACE });
+      require(path.join(srcMainDir, 'web-server')).releaseQueuedSendPresentation(record.operationKey);
+    }
+  }
+  publishHistorySendReturn(result.control);
+  return result;
+});
+
 ipcMain.handle('agent:cancel-send', (_event, { tabId, handoffId, sendAttemptId = null } = {}) => {
   const resolved = resolveAgentSendCancellationAttempt(tabId, handoffId, sendAttemptId);
   // Validate a supplied physical attempt before the waiting-item fast path.
@@ -33686,6 +33885,7 @@ ipcMain.handle('agent:list-send-receipts', async (_event, { tabId, surface = nul
     state: record.state,
     attemptId: record.attemptId,
     receipt: record.receipt,
+    historyReturn: historySendReturnControl(agentSendReceiptStore).read(record.tabId, record.handoffId),
     imagePresentation: imagePresentationFromReceipt(record),
     transcriptBoundary: record.transcriptBoundary,
     auditIdentity: record.auditIdentity,
@@ -33750,9 +33950,28 @@ ipcMain.handle('agent:dismiss-send-receipt-presentation', async (_event, input =
       success: false,
       dismissed: false,
       reason: matches.length === 0 ? 'receipt-not-found' : 'receipt-ambiguous',
+      receiptAbsent: matches.length === 0,
     };
   }
   const record = matches[0];
+  const unknownPresentationAlreadyHidden = record.receipt?.presentationDismissedSurface === DESKTOP_HISTORY_SEND_SURFACE
+    && Number(record.receipt.presentationDismissedAt) > 0;
+  if (input.unknownOnly === true && ((record.state !== 'delivery-unknown' && !unknownPresentationAlreadyHidden)
+    || (input.operationKey !== undefined && input.operationKey !== record.operationKey)
+    || input.attemptId !== record.attemptId)) {
+    console.warn('[AgentSendReceipt] unknown presentation dismiss rejected tab=' + tabId.slice(-12)
+      + ' handoff=' + handoffId + ' state=' + record.state + ' reason=unknown-presentation-changed');
+    return { success: false, dismissed: false, reason: 'unknown-presentation-changed' };
+  }
+  if (input.failedOnly === true && (!['not-submitted', 'provider-not-accepted'].includes(record.state)
+    || (input.operationKey !== undefined && input.operationKey !== record.operationKey)
+    || input.attemptId !== record.attemptId)) {
+    // The failed-card X is presentation only. A stale UI must not dismiss a
+    // pending/new attempt, even when it reuses the same handoff identity.
+    console.warn('[AgentSendReceipt] failed presentation dismiss rejected tab=' + tabId.slice(-12)
+      + ' handoff=' + handoffId + ' state=' + record.state + ' reason=failed-presentation-changed');
+    return { success: false, dismissed: false, reason: 'failed-presentation-changed' };
+  }
   const result = agentSendReceiptStore.dismissPresentation({
     operationKey: record.operationKey,
     attemptId: record.attemptId,
@@ -37747,6 +37966,35 @@ function getCodexFastIntentRecord(tabId) {
   };
 }
 
+function ensureCodexFastLaunchIntent(tabId) {
+  const current = getCodexFastIntentRecord(tabId);
+  if (current) return current;
+  // No app selection means normal speed, NOT inheritance from another CLI's
+  // persisted global tier. Preserve an older explicit boolean lacking a revision.
+  let saved = providerStates.get(tabId);
+  if (typeof saved?.codexFastIntent !== 'boolean' && projectManager?.db) {
+    // A missed/failed startup hydration is not proof of an absent DB choice.
+    // Read this tab only; unknown/malformed storage must not overwrite on/off.
+    const row = projectManager.db.db.prepare('SELECT provider_state FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
+    if (!row) throw new Error('codex_fast_intent_source_unavailable');
+    if (row.provider_state != null) {
+      let stored;
+      try { stored = JSON.parse(row.provider_state); } catch { throw new Error('codex_fast_intent_source_unavailable'); }
+      if (!stored || typeof stored !== 'object' || Array.isArray(stored)) throw new Error('codex_fast_intent_source_unavailable');
+      if (stored.codexFastIntent != null && typeof stored.codexFastIntent !== 'boolean') throw new Error('codex_fast_intent_source_unavailable');
+      saved = { ...stored, ...saved };
+      if (typeof stored.codexFastIntent === 'boolean') {
+        saved.codexFastIntent = stored.codexFastIntent;
+        saved.codexFastIntentRevision = stored.codexFastIntentRevision;
+      }
+      setProviderState(tabId, saved);
+      const restored = getCodexFastIntentRecord(tabId);
+      if (restored) { broadcastProviderState(tabId, saved); return restored; }
+    }
+  }
+  return persistCodexFastIntentValue(tabId, saved?.codexFastIntent === true, 'managed-launch');
+}
+
 function persistNextCodexFastIntent(tabId) {
   const ownState = providerStates.get(tabId) || { type: 'anthropic' };
   const currentProof = codexTuiReadyMeta.get(tabId)?.serviceTierProof || null;
@@ -37760,7 +38008,7 @@ function persistNextCodexFastIntent(tabId) {
 function persistCodexFastIntentValue(tabId, desiredFast, source = 'explicit') {
   const ownState = providerStates.get(tabId) || { type: 'anthropic' };
   const previousRevision = Number(ownState.codexFastIntentRevision || 0);
-  if (ownState.codexFastIntent === desiredFast
+  if (ownState.codexFastIntent === desiredFast && !ownState.codexFastIntentPersistenceError
     && Number.isInteger(previousRevision)
     && previousRevision > 0) {
     return {
@@ -37778,14 +38026,53 @@ function persistCodexFastIntentValue(tabId, desiredFast, source = 'explicit') {
     codexFastIntent: desiredFast,
     codexFastIntentRevision: revision,
   };
+  delete next.codexFastIntentPersistenceError;
+  try {
+    const db = projectManager?.db;
+    if (db) {
+      db.updateTabProviderState(tabId, next);
+      // This legacy point writer logs/swallow errors. A successful return is
+      // not evidence that the per-tab intent survives the next app launch.
+      const saved = db.db.prepare('SELECT provider_state FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
+      if (saved?.provider_state !== JSON.stringify(next)) throw new Error('codex_fast_intent_persistence_unconfirmed');
+    }
+  } catch (error) {
+    if (source !== 'external-fast-feedback') throw error;
+    // Native /fast already happened. Keep that newer choice in memory even
+    // when persistence failed, otherwise reconciliation would undo the user.
+    next.codexFastIntentPersistenceError = String(error?.code || error?.message || 'write-failed');
+    console.warn('[CodexFastIntent] native choice not persisted tab=' + String(tabId).slice(-12)
+      + ' revision=' + revision + ' error=' + next.codexFastIntentPersistenceError);
+  }
   setProviderState(tabId, next);
-  if (projectManager?.db) projectManager.db.updateTabProviderState(tabId, next);
   broadcastProviderState(tabId, next);
   console.log('[CodexFastIntent] saved tab=' + String(tabId).slice(-12)
     + ' desired=' + desiredFast
     + ' revision=' + revision
     + ' source=' + source);
   return { desiredFast, revision, providerState: next, changed: true };
+}
+
+function readCodexFastIntentWriteAdmission(tabId, expectedIntent, expectedIdentity, phase) {
+  if (!resolveCodexServiceTierResultIdentity(tabId, expectedIdentity)) {
+    return { allowed: false, reason: 'codex_input_ownership_changed' };
+  }
+  // Restoring the already-captured author draft is cleanup of this transaction,
+  // not another toggle. A newer Fast click must not prevent that restoration.
+  // The caller still checks terminal/run/Stop/input/draft ownership on every key.
+  if (String(phase || '').startsWith('draft-restore-')) return { allowed: true };
+  const current = getCodexFastIntentRecord(tabId);
+  if (!current || current.revision !== expectedIntent.revision
+    || current.desiredFast !== expectedIntent.desiredFast) {
+    return { allowed: false, reason: 'codex_fast_intent_changed' };
+  }
+  const retained = reconcileCodexServiceTierProofIdentity(tabId, 'fast-write-boundary');
+  const tier = retained.preserved ? retained.proof.serviceTier : null;
+  if (!tier) return { allowed: false, reason: 'codex_fast_tier_unproven' };
+  if ((tier === 'priority') === current.desiredFast) {
+    return { allowed: false, reason: 'codex_fast_intent_settled' };
+  }
+  return { allowed: true };
 }
 
 function scheduleCodexFastIntentReconcile(tabId, reason = 'scheduled') {
@@ -37829,6 +38116,7 @@ function scheduleCodexFastIntentReconcile(tabId, reason = 'scheduled') {
       if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) {
         return { success: true, queued: true, reason: 'renderer-unavailable' };
       }
+      const tierIdentity = getCurrentCodexServiceTierProofIdentity(tabId);
       const result = await executeCodexLiveSlashCommandRequest({
         sender: mainWindow.webContents,
         tabId,
@@ -37839,8 +38127,14 @@ function scheduleCodexFastIntentReconcile(tabId, reason = 'scheduled') {
         visualHasDraft: false,
         visualSource: 'intent-reconcile',
         turnBusy: hasCodexPromptOrTurnInFlight(tabId),
+        settingsWriteGuard: phase => readCodexFastIntentWriteAdmission(tabId, intent, tierIdentity, phase),
       });
       if (result?.success !== true) {
+        // Nothing was written: recompute the plan at the current revision.
+        // After any insertion/unknown Enter the existing retained owner, not
+        // this loop, controls cleanup and the next permitted attempt.
+        if (result?.pasteWritten === false && result?.enterWritten === false
+          && ['codex_fast_intent_changed', 'codex_fast_intent_settled'].includes(result.error)) continue;
         console.warn('[CodexFastIntent] apply deferred tab=' + String(tabId).slice(-12)
           + ' desired=' + intent.desiredFast
           + ' revision=' + intent.revision
@@ -43194,6 +43488,8 @@ ipcMain.handle('claude:persist-session-id', (event, payload = {}) => {
   }
 });
 
+const { writeAppStateWithDiagnostics } = require(path.join(srcMainDir, 'app-state-write-diagnostics'));
+
 ipcMain.handle('app:setState', (event, {
   key,
   value,
@@ -43201,10 +43497,14 @@ ipcMain.handle('app:setState', (event, {
   source,
   allowWorkspaceSpaceRemoval,
 }) => {
-  const result = projectManager.db.setAppState(key, value, {
+  const writeMetadata = {
     reason,
     source,
     allowWorkspaceSpaceRemoval: allowWorkspaceSpaceRemoval === true,
+  };
+  const result = writeAppStateWithDiagnostics(projectManager.db, key, value, writeMetadata, {
+    kind: 'async',
+    event,
   });
   if (result?.success === false) {
     console.warn('[AppState] write rejected key=' + key
@@ -43225,10 +43525,14 @@ ipcMain.on('app:setStateSync', (event, {
   source,
   allowWorkspaceSpaceRemoval,
 }) => {
-  const result = projectManager.db.setAppState(key, value, {
+  const writeMetadata = {
     reason,
     source,
     allowWorkspaceSpaceRemoval: allowWorkspaceSpaceRemoval === true,
+  };
+  const result = writeAppStateWithDiagnostics(projectManager.db, key, value, writeMetadata, {
+    kind: 'sync',
+    event,
   });
   if (result?.success === false) {
     console.warn('[AppState] sync write rejected key=' + key
@@ -43606,7 +43910,50 @@ ipcMain.handle('codex:reconcile-native-rewind-before-history-rewrite', async (_e
   });
 });
 
-ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, expectedTabIds, tabSnapshots,groupFileCloseGuard }) => {
+ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, expectedTabIds, tabSnapshots,groupFileCloseGuard,closeFinalization }) => {
+  if(closeFinalization!==undefined) {
+    if(closeFinalization?.recover || closeFinalization?.runtimeAction)
+      return recoverArchivedCloseRuntime(event,closeFinalization);
+    if(JSON.stringify(closeFinalization?.groupCloseGuard || null)!==JSON.stringify(groupFileCloseGuard || null))
+      return {success:false,error:'archive_close_group_changed'};
+    const runtimeGuard=runSaveTabsWithAck(()=>{
+      const scope=projectManager.db.assertArchivedCloseReceipt(closeFinalization.receipt);
+      if(scope.runtimeOwner) {
+        const current=captureArchivedCloseRuntimeOwner(scope.receipt.tabId);
+        const killed=projectManager.db.archivedCloseRuntimeStep(scope.receipt,'kill-settled');
+        const expected=killed?.afterOwner;
+        if(current.mainInstanceId!==scope.runtimeOwner.mainInstanceId || current.terminalId || current.sdkOwnerId
+          || (scope.runtimeOwner.terminalId || scope.runtimeOwner.sdkOwnerId)
+            && (!expected || Object.keys(expected).some(key=>expected[key]!==current[key])))
+          throw Error('archive_close_runtime_not_retired');
+      }
+      return {success:true};
+    });
+    if(runtimeGuard.success!==true)return runtimeGuard;
+    const result=runSaveTabsWithAck(()=>projectManager.db.finalizeArchivedClose(closeFinalization,
+      groupFileCloseGuard?{
+        before:snapshots=>workflowCloseGuardOwner(groupFileCloseGuard).prepareClose(groupFileCloseGuard,snapshots),
+        after:proof=>workflowCloseGuardOwner(groupFileCloseGuard).finishClose(proof),
+      }:{}));
+    if(result.success!==true) {
+      console.warn('[CloseTab:Finalize] refused mutation='+String(closeFinalization?.receipt?.mutationId || '-')+' error='+result.error);
+      return result;
+    }
+    const executionRevisions=result.afterRows.filter(item=>item.row?.execution_subject_version===2)
+      .map(item=>({tabId:item.tabId,subjectId:item.row.execution_subject_id,revision:item.row.execution_storage_revision}));
+    if(!_gracefulShutdownInProgress) {
+      try {
+        for(const id of result.projectIds)noteProjectCardSignalsChanged(id);
+        void tabWorkContext.syncLinks().catch(error=>console.warn('[TabContext] close finalize sync:',error.message));
+      } catch(error) {
+        console.warn('[CloseTab:Finalize] post-commit publication failed mutation='+result.closeReceipt.mutationId+' error='+error.message);
+      }
+    }
+    console.log('[CloseTab:Finalize] committed mutation='+result.closeReceipt.mutationId+' historyId='+result.closeReceipt.historyId
+      +' tabs='+result.closedTabIds.length+' namespaces='+result.projectIds.length);
+    const {afterRows,...receipt}=result;
+    return {...receipt,executionRevisions};
+  }
   if (tabSnapshots !== undefined) {
     const result = runSaveTabsBatchWithAck({
       snapshots: tabSnapshots,
@@ -43614,8 +43961,8 @@ ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, exp
       getTabIds: id => projectManager.db.getProjectTabIds(id),
       save: row => projectManager.saveProjectTabs(row.projectId, row.tabs, true, _gracefulShutdownInProgress),
       ...(groupFileCloseGuard?{
-        beforeSave:snapshots=>workflowOrganization.groupActions.prepareClose(groupFileCloseGuard,snapshots),
-        afterSave:proof=>workflowOrganization.groupActions.finishClose(proof),
+        beforeSave:snapshots=>workflowCloseGuardOwner(groupFileCloseGuard).prepareClose(groupFileCloseGuard,snapshots),
+        afterSave:proof=>workflowCloseGuardOwner(groupFileCloseGuard).finishClose(proof),
       }:{}),
     });
     // ACK names this transaction, not a later point write caused by publication.
@@ -44521,12 +44868,160 @@ function getCodexArchiveGeneration(tabId) {
   ].join(':');
 }
 
+function captureArchivedCloseRuntimeOwner(tabId) {
+  const term=terminals.get(tabId),sdk=sdkSessions.get(tabId);
+  if(sdk && !sdk.archiveCloseOwnerId)sdk.archiveCloseOwnerId=crypto.randomUUID();
+  const fence=term?captureAgentLaunchFence(tabId):null;
+  return {mainInstanceId:conversationOwners.instanceId,terminalId:fence?.terminalInstanceId || null,
+    sdkOwnerId:sdk?.archiveCloseOwnerId || null,sdkInputRevision:sdk?.stopObservation?.inputRevision ?? null,
+    lifecycleGeneration:getTerminalLifecycleGeneration(tabId),
+    runSeq:Number(terminalCommandState.get(tabId)?.runSeq || 0),inputRevision:getTerminalInputRevision(tabId),
+    stopRevision:getTerminalStopRevision(tabId),pendingLaunch:term
+      ? terminalShellReadiness.snapshot(tabId,term).pendingAgentLaunch?.writeId || null : null};
+}
+
+function workflowCloseGuardOwner(guard) {
+  return workflowSelectionRuntime?.owns(guard?.mutationId)
+    ? workflowSelectionRuntime.closeActions : workflowOrganization.groupActions;
+}
+
+async function recoverArchivedCloseRuntime(event,request,receiptOwner=projectManager.db) {
+  const db=receiptOwner;
+  try {
+    const scope=request.recover?db.readArchivedCloseIntent(request.archiveRequest):db.assertArchivedCloseReceipt(request.receipt);
+    const receipt=scope.receipt,tabId=receipt.tabId;
+    const same=(a,b)=>!!a && !!b && Object.keys(a).length===Object.keys(b).length
+      && Object.entries(a).every(([key,value])=>b[key]===value);
+    const current=()=>captureArchivedCloseRuntimeOwner(tabId);
+    const stopAdmitted=db.archivedCloseRuntimeStep(receipt,'stop-admitted');
+    const stopSettled=db.archivedCloseRuntimeStep(receipt,'stop-settled');
+    const owner=stopSettled?.owner || scope.runtimeOwner;
+    const assertOwner=()=>{
+      if(!owner || !same(owner,current()))throw Error('archive_close_runtime_owner_changed');
+      // Keep the no-new-launch witness across the durable Stop -> kill steps.
+      // A newer write can finish before this read and leave pending=null again.
+      if(stopSettled && Object.hasOwn(stopSettled,'launchWitness')) {
+        const proof=stopSettled.launchWitness,term=terminals.get(tabId);
+        const launch=term?terminalShellReadiness.launchSnapshot?.(tabId,term):null;
+        if(!proof || proof.version!==1 || !Number.isSafeInteger(proof.epoch) || proof.epoch<1
+          || proof.writeId!==null && (!Number.isSafeInteger(proof.writeId) || proof.writeId<1)
+          || !launch || launch.epoch!==proof.epoch || launch.writeId!==proof.writeId
+          || launch.pendingWriteId!==owner.pendingLaunch) {
+          console.warn('[CloseTab:Recovery] launch-source-changed mutation='+receipt.mutationId
+            +' expectedEpoch='+String(proof?.epoch ?? '-')+' expectedWrite='+String(proof?.writeId ?? '-')
+            +' currentEpoch='+String(launch?.epoch ?? '-')+' currentWrite='+String(launch?.writeId ?? '-'));
+          throw Error('archive_close_runtime_owner_changed');
+        }
+      }
+    };
+    // The archive itself changed the terminal member signature. Reuse the
+    // group's post-archive guard (also used by finalization), not its pre-archive
+    // assertCloseGuard, which would reject our own committed transition.
+    const assertGroup=()=>{if(scope.groupCloseGuard)workflowCloseGuardOwner(scope.groupCloseGuard).prepareClose(scope.groupCloseGuard,[]);};
+    const archiveResult={success:true,historyId:receipt.historyId,closeReceipt:receipt,
+      codexSessionId:scope.root.codex_session_id || null,processWasRunning:!!scope.root.process_was_running};
+    const killSettled=db.archivedCloseRuntimeStep(receipt,'kill-settled');
+    if(killSettled) {
+      if(!same(killSettled.afterOwner,current()))throw Error('archive_close_runtime_owner_changed');
+      return {success:true,archiveResult,runtimeStopped:true};
+    }
+    assertOwner();
+    const killAdmitted=db.archivedCloseRuntimeStep(receipt,'kill-admitted');
+    if(killAdmitted)throw Error('archive_close_kill_unresolved');
+    if(request.runtimeAction==='stop') {
+      if(stopAdmitted)return {success:false,error:'archive_close_stop_already_admitted'};
+      assertGroup();
+      const stopTerm=terminals.get(tabId);
+      const launchBefore=stopTerm?terminalShellReadiness.launchSnapshot?.(tabId,stopTerm):null;
+      const launchCurrent=()=>stopTerm?terminalShellReadiness.launchSnapshot?.(tabId,stopTerm):null;
+      const sameLaunchWrite=()=>{const now=launchCurrent();return !launchBefore
+        || !!now && now.epoch===launchBefore.epoch && now.writeId===launchBefore.writeId;};
+      db.archivedCloseRuntimeStep(receipt,'stop-admitted',{owner});
+      let result,admitted=false;
+      const guard={
+          preSignalGuard:()=>{try {db.assertArchivedCloseReceipt(receipt);assertGroup();const now=current();
+            if(!sameLaunchWrite() || !same(owner,{...now,stopRevision:owner.stopRevision})
+              || now.stopRevision!==owner.stopRevision && !(admitted && now.stopRevision===owner.stopRevision+1))
+              throw Error('archive_close_runtime_owner_changed');
+            return {allowed:true};}
+            catch(error){return {allowed:false,reason:error.message};}},
+          onStopAdmitted:()=>{assertOwner();if(!sameLaunchWrite())throw Error('archive_close_runtime_owner_changed');admitted=true;},
+        };
+      const sdk=sdkSessions.get(tabId);
+      try {result=db.stopArchivedCloseRuntime?await db.stopArchivedCloseRuntime(scope,guard):sdk?await stopSdkSession({tabId,hard:true,runningTaskIds:[...sdk.stopObservation.tasks]},
+          {expectedSession:sdk,guard:guard.preSignalGuard,onStopAdmitted:guard.onStopAdmitted})
+        : await historyMutationInput.run(null,()=>stopAgentProcessScenarioInMain(
+          {tabId,toolType:scope.root.command_type,reason:'close-tab'},guard));}
+      catch(error){result={success:false,error:error.message};}
+      const after=current();
+      if(owner.sdkOwnerId && admitted && result?.success===true && result.hard===true
+        && !after.sdkOwnerId && !after.terminalId && after.mainInstanceId===owner.mainInstanceId) {
+        db.archivedCloseRuntimeStep(receipt,'stop-settled',{owner,result});
+        db.archivedCloseRuntimeStep(receipt,'kill-settled',{owner,afterOwner:after,kind:'sdk-hard-stop'});
+        return {...result,runtimeStopped:true};
+      }
+      // Existing markAiStopping advances one fence AFTER its synchronous
+      // onStopAdmitted callback. Only that observed, owned transition may rebase.
+      const launchAfter=launchCurrent();
+      const launchRetired=admitted && result?.success===true && owner.pendingLaunch!=null
+        && after.pendingLaunch===null && launchBefore?.pendingWriteId===owner.pendingLaunch
+        && launchAfter?.retiredWriteId===owner.pendingLaunch && sameLaunchWrite();
+      const owned=sameLaunchWrite() && same(owner,{...after,stopRevision:owner.stopRevision,
+        ...(launchRetired?{pendingLaunch:owner.pendingLaunch}:{})})
+        && (after.stopRevision===owner.stopRevision || admitted && after.stopRevision===owner.stopRevision+1);
+      if(!owned)result={success:false,error:'archive_close_runtime_owner_changed'};
+      db.archivedCloseRuntimeStep(receipt,'stop-settled',{owner:owned?after:owner,result,
+        ...(owned && launchRetired?{launchRetirement:{version:1,writeId:owner.pendingLaunch,epoch:launchBefore.epoch}}:{}),
+        ...(owned && launchBefore?{launchWitness:{version:1,epoch:launchBefore.epoch,writeId:launchBefore.writeId}}:{})});
+      return result;
+    }
+    // Same existing typed, force-fresh process observation as workflow/Stop.
+    // UNKNOWN never becomes absent; owner is checked on both sides of await.
+    const identity=await (db.observeArchivedCloseRuntime?db.observeArchivedCloseRuntime(scope)
+      :readAiLifecycleIdentityForTab(tabId,scope.root.command_type));
+    assertOwner();
+    const stopped=identity?.processStatus==='absent' && !current().pendingLaunch && !current().sdkOwnerId;
+    if(request.recover)return {success:true,archiveResult,runtimeStopped:false,
+      canContinue:!stopAdmitted && ['found','absent'].includes(identity?.processStatus),stopAbsent:stopped,
+      observation:identity};
+    if(request.runtimeAction!=='kill' || !stopped)throw Error('archive_close_process_not_proven_absent');
+    assertGroup();
+    const lateKill=db.archivedCloseRuntimeStep(receipt,'kill-settled');
+    if(lateKill) {
+      if(!same(lateKill.afterOwner,current()))throw Error('archive_close_runtime_owner_changed');
+      return {success:true,archiveResult,runtimeStopped:true};
+    }
+    if(db.archivedCloseRuntimeStep(receipt,'kill-admitted'))throw Error('archive_close_kill_unresolved');
+    db.archivedCloseRuntimeStep(receipt,'kill-admitted',{owner,identity});
+    // Terminate the exact captured shell with the SAME primitive as terminal:kill.
+    // The normal kill event then performs existing cleanup, with no PTY left to
+    // signal a second time. No await between owner guard, termination and cleanup.
+    const term=terminals.get(tabId);
+    if(term) {
+      const termination=terminateCapturedTerminalRuntime(terminals,tabId,term);
+      if(!termination.released)throw Error('archive_close_runtime_owner_changed');
+    }
+    ipcMain.emit('terminal:kill',event,tabId);
+    if(terminals.has(tabId) || sdkSessions.has(tabId))throw Error('archive_close_runtime_owner_changed');
+    const afterOwner=current();
+    db.archivedCloseRuntimeStep(receipt,'kill-settled',{owner,afterOwner});
+    return {success:true,archiveResult,runtimeStopped:true};
+  }catch(error) {
+    console.warn('[CloseTab:Recovery] held mutation='+String(request.receipt?.mutationId || request.archiveRequest?.closeRequest?.mutationId || '-')+' error='+error.message);
+    return {success:false,error:error.message};
+  }
+}
+
 function commitTabArchive(projectId, tab, {
   sourceTabId = null,
   codexWriterSessionId = null,
   groupCloseGuard = null,
+  closeRequest = null,
+  closeIntentHash = null,
+  closeRuntimeOwner = null,
+  selectionArchiveRequest = null,
 } = {}) {
-  if(groupCloseGuard) workflowOrganization.groupActions.assertCloseGuard(groupCloseGuard);
+  if(groupCloseGuard) workflowCloseGuardOwner(groupCloseGuard).assertCloseGuard(groupCloseGuard);
   const started = Date.now();
   const tabType = tab?.tabType || tab?.tab_type || 'terminal';
   if (tabType === 'file') {
@@ -44535,10 +45030,16 @@ function commitTabArchive(projectId, tab, {
       ' durMs=' + (Date.now() - started));
     return { success: true, skipped: true, historyId: null };
   }
-  const historyId = projectManager.db.archiveTab(projectId, tab, {
+  if(selectionArchiveRequest)workflowSelectionRuntime.startArchive(groupCloseGuard,selectionArchiveRequest);
+  const archived = projectManager.db.archiveTab(projectId, tab, {
     sourceTabId,
     codexWriterSessionId,
+    closeRequest,
+    groupCloseGuard,
+    closeIntentHash,
+    closeRuntimeOwner,
   });
+  const historyId = typeof archived==='object' ? archived?.historyId : archived;
   if (historyId === null || historyId === undefined) {
     return { success: false, error: 'archive_not_committed', historyId: null };
   }
@@ -44560,16 +45061,32 @@ function commitTabArchive(projectId, tab, {
     console.warn('[Archive:Close] post-commit side-effects failed historyId=' + historyId +
       ' error=' + (error?.message || String(error)));
   }
-  return {
+  const result = {
     success: true,
     historyId,
     codexSessionId: tab?.codexSessionId || null,
     processWasRunning: !!tab?.processWasRunning,
+    ...(archived?.closeReceipt?{closeReceipt:archived.closeReceipt}:{}),
   };
+  if(selectionArchiveRequest)workflowSelectionRuntime.finishArchive(groupCloseGuard,result);
+  return result;
 }
 
-ipcMain.handle('project:archive-tab', async (event, { projectId, tab, groupCloseGuard }) => {
+ipcMain.handle('project:archive-tab', async (event, { projectId, tab, groupCloseGuard,closeRequest }) => {
   const sourceTabId = tab?.tabId || null;
+  const selectionArchiveRequest=groupCloseGuard&&workflowSelectionRuntime?.owns(groupCloseGuard.mutationId)
+    ? {projectId,tab,groupCloseGuard,...(closeRequest?{closeRequest}:{})}:null;
+  if(selectionArchiveRequest) {
+    const replay=workflowSelectionRuntime.archiveReplay(groupCloseGuard,selectionArchiveRequest);
+    if(replay)return replay;
+    workflowSelectionRuntime.assertCloseGuard(groupCloseGuard);
+    const {member}=workflowSelectionRuntime.checkGuard(groupCloseGuard);
+    const observation=await observeWorkflowSelectionProcess(member).catch(()=>({known:false}));
+    workflowSelectionRuntime.assertCloseGuard(groupCloseGuard);
+    if(observation.known!==true)return {success:false,error:'selection_close_process_unknown'};
+  }
+  const closeIntentHash=closeRequest?projectManager.db.archiveCloseIntentHash({projectId,tab,groupCloseGuard,closeRequest}):null;
+  const closeRuntimeOwner=closeRequest?captureArchivedCloseRuntimeOwner(sourceTabId):null;
   const resolvedToolType = sourceTabId
     ? resolveAiToolTypeForTab(sourceTabId, null)
     : null;
@@ -44580,7 +45097,7 @@ ipcMain.handle('project:archive-tab', async (event, { projectId, tab, groupClose
     ? { ...tab, commandType: resolvedToolType }
     : tab;
   if (resolvedToolType !== 'codex') {
-    return commitTabArchive(projectId, resolvedArchiveTab,{groupCloseGuard});
+    return commitTabArchive(projectId, resolvedArchiveTab,{groupCloseGuard,closeRequest,closeIntentHash,closeRuntimeOwner,selectionArchiveRequest});
   }
 
   if (!sourceTabId || !projectId) {
@@ -44666,6 +45183,10 @@ ipcMain.handle('project:archive-tab', async (event, { projectId, tab, groupClose
       sourceTabId,
       codexWriterSessionId: snapshot.source === 'writer-proof' ? snapshot.codexSessionId : null,
       groupCloseGuard,
+      closeRequest,
+      closeIntentHash,
+      closeRuntimeOwner,
+      selectionArchiveRequest,
     });
   });
 });
@@ -46904,6 +47425,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'tab not found' };
   const requestedToolType = resolveAiToolTypeForTab(tabId, options?.toolType || null);
+  const stopLaunch = terminalShellReadiness.launchSnapshot?.(tabId, term) || null;
   let capturedCodexRestartSettings = null;
   if (requestedToolType && !preSignalGuard && !captureCodexRestartSettings) {
     markAiStopping(tabId, requestedToolType, stopReason);
@@ -46913,7 +47435,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
     // cancel its Send/compact or restore/clear a replacement's runtime state.
     if (!stopAdmitted) return result;
     if (result?.success === true && result?.noProcess !== true) {
-      terminalShellReadiness.finishAgentLaunch(tabId, term, true);
+      terminalShellReadiness.finishAgentLaunch(tabId, term, true, stopLaunch);
     }
     const resolvedToolType = resolveAiToolTypeForTab(
       tabId,
@@ -47802,7 +48324,7 @@ function prepareStopPendingSends(payload) {
   return { ok: true, inputs };
 }
 
-async function stopAgentProcessScenarioInMain(request) {
+async function stopAgentProcessScenarioInMain(request, closeRuntimeGuard = null) {
   const payload = request && typeof request === 'object' ? request : { tabId: request };
   const authority = payload.authority && typeof payload.authority === 'object'
     ? payload.authority
@@ -47879,11 +48401,12 @@ async function stopAgentProcessScenarioInMain(request) {
       toolType: payload.toolType || null,
       reason: payload.reason || 'manual-stop',
       captureCodexRestartSettings: payload.captureCodexRestartSettings === true,
-      preSignalGuard: authority?.kind === 'orchestration-auto-stop'
+      ...(closeRuntimeGuard ? {onStopAdmitted:closeRuntimeGuard.onStopAdmitted} : {}),
+      preSignalGuard: closeRuntimeGuard?.preSignalGuard || (authority?.kind === 'orchestration-auto-stop'
         ? (observedIdentity) => validateOrchestrationAutoStopGuard(authority, observedIdentity)
         : authority?.kind === 'saved-history'
           ? () => web.validateSavedHistoryStop({ ...authority, tabId: payload.tabId })
-        : undefined,
+        : undefined),
     });
   } catch (error) { processResult = { success: false, error: error.message,
     code: error.code || 'agent_process_stop_failed' }; }
@@ -47959,8 +48482,8 @@ async function observeWorkflowSessionProcess(tabId, owner) {
   return { known: identity.processStatus !== 'unknown', identity };
 }
 
-async function stopWorkflowSessionTarget(tabId, owner, proof, guard) {
-  const admitted = () => require(path.join(srcMainDir, 'web-server')).cancelQueuedAgentSends(tabId, null, { stop: true });
+async function stopWorkflowSessionTarget(tabId, owner, proof, guard, {onAdmitted,reason='manual-stop'} = {}) {
+  const admitted = () => {onAdmitted?.();return require(path.join(srcMainDir, 'web-server')).cancelQueuedAgentSends(tabId, null, { stop: true });};
   if (owner.kind === 'sdk') return stopSdkSession({ tabId, hard: true,
     runningTaskIds: [...owner.token.stopObservation.tasks] }, { guard, expectedSession: owner.token, onStopAdmitted: admitted });
   if (owner.kind === 'terminal') return deterministicStopTerminal(tabId, false, {
@@ -47971,9 +48494,86 @@ async function stopWorkflowSessionTarget(tabId, owner, proof, guard) {
     const identity = compareAiLifecycleIdentity(proof.identity, observed);
     return { allowed: identity.matches, reason: identity.reason };
   };
-  return stopAiProcessInTabSerialized(tabId, { toolType: owner.toolType, reason: 'manual-stop',
+  return stopAiProcessInTabSerialized(tabId, { toolType: owner.toolType, reason,
     preSignalGuard, onStopAdmitted: admitted });
 }
+
+async function observeWorkflowSelectionProcess(member) {
+  const owner=captureWorkflowSessionOwner({tabId:member.tabId});
+  if(owner.kind==='sdk')return {known:true,owner,identity:{processStatus:'found'}};
+  if(owner.kind==='ai')return {...await observeWorkflowSessionProcess(member.tabId,owner),owner};
+  // A successful AI-only lookup is not absence of an ordinary shell child.
+  // Use the SAME fresh process snapshot, retaining throw/UNKNOWN on failure.
+  const snapshot=await getProcessTreeSnapshot({forceFresh:true});
+  const term=terminals.get(member.tabId);
+  return {known:true,owner,identity:currentAiLifecycleIdentity(member.tabId,{processStatus:
+    term&&(snapshot.children.get(term.pid)||[]).length?'found':'absent'})};
+}
+
+async function stopWorkflowSelectionTarget(member,observation,isCurrent) {
+  const tabId=member.tabId,before=member.runtimeOwner,term=terminals.get(tabId);
+  const launchBefore=term?terminalShellReadiness.launchSnapshot(tabId,term):null;
+  let admitted=false;
+  const guard=()=>{
+    const now=captureArchivedCloseRuntimeOwner(tabId);
+    if(now.stopRevision!==before.stopRevision&&!(admitted&&now.stopRevision===before.stopRevision+1)
+      ||!isCurrent({...before,stopRevision:now.stopRevision}))return {allowed:false,reason:'selection_action_owner_changed'};
+    return {allowed:true};
+  };
+  const onAdmitted=()=>{if(guard().allowed!==true)throw Error('selection_action_owner_changed');admitted=true;};
+  if(guard().allowed!==true)return null;
+  let result;
+  if(!observation.owner.token) {
+    onAdmitted();require(path.join(srcMainDir,'web-server')).cancelQueuedAgentSends(tabId,null,{stop:true});
+    result={success:true,stopped:true,processAbsent:true};
+  } else result=await historyMutationInput.run(null,()=>stopWorkflowSessionTarget(tabId,observation.owner,observation,guard,{onAdmitted}));
+  const after=captureArchivedCloseRuntimeOwner(tabId),launchAfter=term?terminalShellReadiness.launchSnapshot(tabId,term):null;
+  const exact=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+  const sdkRetired=admitted&&result?.success===true&&result.hard===true&&before.sdkOwnerId
+    &&!after.sdkOwnerId&&!after.terminalId&&exact(before,{...after,
+      sdkOwnerId:before.sdkOwnerId,sdkInputRevision:before.sdkInputRevision});
+  const sameLaunch=!launchBefore||!!launchAfter&&launchBefore.epoch===launchAfter.epoch&&launchBefore.writeId===launchAfter.writeId;
+  const retired=admitted&&result?.success===true&&before.pendingLaunch!=null&&after.pendingLaunch===null
+    &&launchBefore?.pendingWriteId===before.pendingLaunch&&launchAfter?.retiredWriteId===before.pendingLaunch&&sameLaunch;
+  const owned=sameLaunch&&exact(before,{...after,stopRevision:before.stopRevision,
+    ...(retired?{pendingLaunch:before.pendingLaunch}:{})})
+    &&(after.stopRevision===before.stopRevision||admitted&&after.stopRevision===before.stopRevision+1);
+  if(result?.success!==true||!sdkRetired&&!owned)return null;
+  const settled=await observeWorkflowSelectionProcess(member).catch(()=>({known:false}));
+  if(settled.known!==true||settled.identity?.processStatus!=='absent'
+    ||!exact(after,captureArchivedCloseRuntimeOwner(tabId))
+    ||!workflowSelectionRuntime.current(member,{archived:true}))return null;
+  return {version:1,completed:true,before,after,result,
+    ...(launchBefore?{launchWitness:{version:1,epoch:launchBefore.epoch,writeId:launchBefore.writeId}}:{})};
+}
+
+workflowSelectionRuntime = new (require(path.join(srcMainDir,'workflow-selection-runtime')).WorkflowSelectionRuntime)({
+  database:projectManager.db,organization:workflowOrganization.service,groupActions:workflowOrganization.groupActions,
+  captureOwner:captureArchivedCloseRuntimeOwner,observe:observeWorkflowSelectionProcess,stop:stopWorkflowSelectionTarget,
+  recoverRuntime:(event,request,port,member)=>{
+    port.observeArchivedCloseRuntime=async()=>{
+      const proof=await observeWorkflowSelectionProcess(member);
+      return proof.known===true?proof.identity:{processStatus:'unknown'};
+    };
+    port.stopArchivedCloseRuntime=async(_scope,guard)=>{
+      const proof=await observeWorkflowSelectionProcess(member);
+      if(proof.known!==true)return {success:false,error:'selection_close_process_unknown'};
+      const currentGuard=()=>guard.preSignalGuard();
+      if(currentGuard().allowed!==true)return {success:false,error:'selection_action_owner_changed'};
+      if(!proof.owner.token) {guard.onStopAdmitted();return {success:true,stopped:true,processAbsent:true};}
+      return historyMutationInput.run(null,()=>stopWorkflowSessionTarget(member.tabId,proof.owner,proof,currentGuard,
+        {onAdmitted:guard.onStopAdmitted,reason:'close-tab'}));
+    };
+    return recoverArchivedCloseRuntime(event,request,port);
+  },
+  log:(phase,data)=>console.log('[SelectionAction] '+phase+' '+JSON.stringify(data)),
+});
+ipcMain.handle('workflow:selection-begin',(_event,request)=>workflowSelectionRuntime.begin(request));
+ipcMain.handle('workflow:selection-step',(_event,request)=>workflowSelectionRuntime.step(request));
+ipcMain.handle('workflow:selection-ack',(_event,request)=>workflowSelectionRuntime.ack(request));
+ipcMain.handle('workflow:selection-receipt',(_event,{mutationId})=>workflowSelectionRuntime.receipt(mutationId));
+ipcMain.handle('workflow:selection-close-runtime',(event,{closeGuard})=>workflowSelectionRuntime.runtime(closeGuard,event));
+ipcMain.handle('workflow:selection-close-state',(_event,{closeGuard})=>workflowSelectionRuntime.closeState(closeGuard));
 
 const stopWorkflowSessions = createWorkflowSessionStop({ organization: workflowOrganization,
   captureOwner: captureWorkflowSessionOwner, sameOwner: sameWorkflowSessionOwner,
@@ -51767,6 +52367,7 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
           : null),
       manualQueueContinuationExpected:
         outcomeDetails?.manualQueueContinuationExpected === true,
+      goalCompletionOffset: outcomeDetails?.goalCompletionOffset ?? null,
       ...taskCompletionMeta,
     });
   }
@@ -51961,6 +52562,15 @@ async function resolveCodexTurnState(tabId) {
   }
   return codexTurnStateSnapshot(state);
 }
+
+require(path.join(srcMainDir, 'codex-goal-desktop-ipc')).registerCodexGoalDesktopIpc({
+  ipcMain,
+  actions: {
+    read: (tabId, request) => getCodexRuntimePolicies().readGoalAction(tabId, request),
+    apply: (tabId, request) => getCodexRuntimePolicies().applyGoalAction(tabId, request),
+  },
+  describeTab: tabId => ({ toolType: resolveAiToolTypeForTab(tabId) }),
+});
 
 ipcMain.handle('codex:get-turn-state', async (_event, tabId) => resolveCodexTurnState(tabId));
 
@@ -54610,6 +55220,77 @@ function trackCodexTabSubagentActivity(state, record) {
   if (changed) publishCodexSubagentActivity(tabId);
 }
 
+function publishCodexGoalTurnCompletion(state, record, outcome, manualQueueContinuationExpected = false) {
+  const tabId = state.tabId;
+  const terminal = terminals.get(tabId);
+  const generation = state.processGeneration;
+  const stopRevision = getTerminalStopRevision(tabId);
+  // Read-only Goal metadata does not own composer input. Rewind/source changes
+  // revoke writer observation independently of harmless draft keystrokes.
+  const writerObservationGeneration = getCodexWriterObservationGeneration(tabId);
+  const runSeq = terminalCommandState.get(tabId)?.runSeq;
+  const sessionId = state.sessionId;
+  const filePath = state.filePath;
+  const turnId = outcome.turnId;
+  const key = JSON.stringify([sessionId, generation, runSeq, turnId, record.__byteOffset, record.timestamp]);
+  if (outcome.goalWork?.pending === true && state.codexGoalCompletionPublicationKey === key) return;
+  const current = () => codexTurnWatchers.get(tabId) === state && !!terminal
+    && terminals.get(tabId) === terminal && state.sourceObservationTerminal === terminal
+    && !!generation && getTerminalLifecycleGeneration(tabId) === generation
+    && state.processGeneration === generation && state.sessionId === sessionId
+    && state.filePath === filePath && state.currentTurnId === turnId && state.busy === false
+    && getTerminalStopRevision(tabId) === stopRevision
+    && getCodexWriterObservationGeneration(tabId) === writerObservationGeneration
+    && terminalCommandState.get(tabId)?.runSeq === runSeq
+    && state.lastOutcomeGoalWork === outcome.goalWork
+    && state.lastEventTs === record.timestamp && state.lastOutcomeTurnId === turnId
+    && !state.publicTurnStateSuppressed && !state.catchUpPublicationsSuppressed
+    && !state.manualBindingConflict && !state.deferredUntilComposer && !state.sourceObservationLaunchId;
+  const publish = value => emitCodexBusy(tabId, false, value.reason, {
+    outcome: value, timestamp: record.timestamp, turnId, manualQueueContinuationExpected,
+    goalCompletionOffset: record.__byteOffset,
+  });
+  const boundary = state.processGenerationBoundaryOffset;
+  if (outcome.goalWork?.pending !== true || outcome.reason !== 'task_complete'
+    || !Number.isSafeInteger(record.__byteOffset) || !Number.isSafeInteger(boundary)
+    || record.__byteOffset < boundary || !current()) {
+    publish(outcome); return;
+  }
+  state.codexGoalCompletionPublicationKey = key;
+  // Turn idle is independent of whole-Goal completion, including when the
+  // native read stalls or a later Stop/source change revokes observation.
+  publish(outcome);
+  const publishGoal = goalWork => {
+    if (!current() || !goalWork || goalWork === outcome.goalWork) return;
+    state.lastOutcomeGoalWork = goalWork;
+    const metadata = {
+      ...codexTurnStateSnapshot(state), tabId, busy: false, turnBusy: false,
+      reason: outcome.reason, turnId, sessionId, lifecycleGeneration: generation,
+      outcomeTs: state.lastOutcomeTs, goalCompletionOffset: record.__byteOffset,
+      goalMetadataOnly: true, goalWork,
+    };
+    // Same-value metadata wake on the existing channel, not another turn end:
+    // no finishTurn/activity/readiness/preview/input side effects or done replay.
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('codex:busy-state', metadata);
+    _webBroadcast(tabId, { ...metadata, type: 'snapshot', toolType: 'codex', provider: 'codex' });
+  };
+  const log = decision => console.log('[CodexGoal:Read] tab=' + String(tabId).slice(-12)
+    + ' sid=' + String(sessionId).slice(0, 12) + ' turn=' + String(turnId)
+    + ' offset=' + record.__byteOffset + ' decision=' + decision);
+  log('native-read-scheduled');
+  void require(path.join(srcMainDir, 'codex-goal-work')).reconcileCodexGoalCompletion({
+    tracker: state, outcome, record, codexHome: codexHomeDir(), isCurrent: current, log,
+  }).then(value => {
+    if (value && current()) publishGoal(value.goalWork);
+    else if (!value && current()) {
+      // A newer typed Goal event can arrive during the read without replacing
+      // this ended turn. Publish that newer projection, never the stale RPC.
+      const goalWork = require(path.join(srcMainDir, 'codex-goal-work')).codexGoalWorkForOutcome(state, outcome);
+      publishGoal(goalWork);
+    }
+  }).catch(() => { if (current()) log('native-read-adapter-unknown'); });
+}
+
 function processCodexTurnLine(state, line, sourceByteOffset = null) {
   if (state.manualBindingConflict) codexCanonicalPresentation?.invalidate(state.tabId, 'manual-binding-conflict');
   const text = String(line || '').trim();
@@ -54816,6 +55497,24 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     },
     }),
   });
+  // Goal has independent turn/whole-work semantics. Log bounded provenance
+  // only, never the objective, final answer or rollout record body.
+  if (event === 'thread_goal_updated'
+    || (event === 'task_started' && state.codexGoalDecision !== 'ordinary-turn')
+    || event === 'task_complete') {
+    console.log('[CodexGoal:Projection] tab=' + String(state.tabId).slice(-12)
+      + ' sid=' + String(state.sessionId || '-').slice(0, 12)
+      + ' generation=' + String(state.processGeneration || '-').slice(-18)
+      + ' event=' + event
+      + ' offset=' + (Number.isSafeInteger(record.__byteOffset) ? record.__byteOffset : '-')
+      + ' turn=' + String(record.payload?.turn_id || record.payload?.turnId || '-').slice(0, 40)
+      + ' trigger=' + (record.payload?.turn_attribution?.turn_trigger === 'goal' ? 'goal' : '-')
+      + ' decision=' + String(state.codexGoalDecision || 'none')
+      + ' origin=' + String(turnOutcome?.goalWork?.origin || state.codexGoalForTurn?.origin || '-')
+      + ' status=' + String(turnOutcome?.goalWork?.status || state.codexGoalForTurn?.status || '-')
+      + ' pending=' + (turnOutcome?.goalWork?.pending === true ? '1'
+        : turnOutcome?.goalWork?.pending === false ? '0' : '?'));
+  }
   const compactEvidence = classifyCodexCompactEvidence(record);
   let pendingManualCompact = reconcileCodexManualCompactPendingOwner(state.tabId);
   if (event === 'task_complete') {
@@ -55248,13 +55947,8 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     } else {
       finishCodexStartupLifecycle(state.tabId, event);
     }
-    emitCodexBusy(state.tabId, false, outcomeReason, {
-      outcome: turnOutcome,
-      timestamp: record.timestamp,
-      turnId: record.payload?.turn_id || null,
-      manualQueueContinuationExpected:
-        manualQueueContinuation?.expectedContinuation === true,
-    });
+    publishCodexGoalTurnCompletion(state, record, turnOutcome,
+      manualQueueContinuation?.expectedContinuation === true);
   }
 }
 
@@ -59759,6 +60453,7 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     hasLaunchPayload: !!currentPayload,
     startupWait: projectCodexSendStartupWait({ payload: currentPayload, terminal: terminals.get(tabId),
       lifecycleGeneration: currentLifecycleGeneration, runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      lifecycleEstablished: hasCodexEstablishedComposerLifecycle(tabId),
       commandRunning: terminalCommandState.get(tabId)?.isRunning === true, stopping, inputReady,
       timeoutMs: CODEX_STARTUP_NO_STATE_TIMEOUT_MS }),
     ...(provisionalSettings || {}),
@@ -62451,6 +63146,7 @@ function buildCodexCommand({
   cwd,
   model,
   effort,
+  fast = false,
   developerInstructions,
   profile,
   providerProxyBaseUrl = null,
@@ -62466,6 +63162,9 @@ function buildCodexCommand({
     parts.push('-c', shellQuote('openai_base_url=' + tomlString(providerProxyBaseUrl)));
   }
   for (const override of authProfileOverrides) parts.push('-c', shellQuote(override));
+  // CLI /fast persists outside Noted. An explicit per-process override keeps
+  // another tab/profile/default from silently selecting our service tier.
+  parts.push('-c', shellQuote('service_tier=' + tomlString(fast === true ? 'fast' : 'default')));
   if (model) parts.push('--model', shellQuote(model));
   if (effort) parts.push('-c', shellQuote('model_reasoning_effort="' + effort + '"'));
   if (cwd) parts.push('-C', shellQuote(cwd));
@@ -64091,6 +64790,35 @@ function releaseCodexOwnedModelInput(term, receipt, reason) {
   receipt.unsubscribe?.();
   receipt.diagnostic?.record('released', { reason });
   receipt.diagnostic?.publish('released');
+  // A failed control's first late OSC/frame is not its final input state.
+  // Finish only this receipt's forensic pin and take a separate existing
+  // artifact snapshot, without writing input, renewing limits or creating a pin.
+  try {
+    const completion = receipt.rawCompletion;
+    if (completion) {
+      const tabId = receipt.identity.tabId, mirror = getHeadlessTerminalMirror(tabId);
+      observeTerminalRaw(terminalRawWindow, 'settle', term, {
+        id: completion.id, completionKey: completion.completionKey,
+        frame: mirror?.lastCommittedVisibleSnapshot,
+      }, readTerminalInputDiagnosticOwner(tabId));
+      if (terminals.get(tabId) === term && mirror?.generation === receipt.identity.mirrorGeneration
+        && getTerminalLifecycleGeneration(tabId) === receipt.identity.terminalLifecycleGeneration) {
+        receipt.rawCompletionCapture = captureTerminalHistoryPreviewDiagnostic({
+          tabId, toolType: 'codex', incidentReason: 'owned-control-diagnostic-completion',
+          context: { source: 'owned-short-control-completion', traceId: completion.completionKey,
+            originalIncidentId: completion.incidentId, completionReason: reason },
+        }, { ...completion.rawWindow, continuation: true }).then(result => {
+          console.log('[TerminalIncident] owned-control-completion tab=' + String(tabId).slice(-12)
+            + ' raw=' + completion.id + ' reason=' + reason + ' path=' + result.artifactPath);
+          return result;
+        }).catch(error => {
+          try { console.warn('[TerminalIncident] owned-control-completion-failed tab=' + String(tabId).slice(-12)
+            + ' raw=' + completion.id + ' error=' + String(error?.code || error?.name || 'diagnostic-error')); } catch {}
+          return null;
+        });
+      }
+    }
+  } catch { /* Observability cannot change the release or grant input. */ }
   console.log('[CodexOwnedModelInput] released tab=' + receipt.identity.tabId.slice(-12) + ' reason=' + reason);
   if (reason !== 'enter-armed') emitAgentReadinessChanged(receipt.identity.tabId, {
     toolType: 'codex', source: 'owned-model-input', status: 'changed', reason,
@@ -64204,6 +64932,7 @@ async function waitForCodexOwnedModelPaste(tabId, term, receipt, options = {}) {
   receipt.diagnostic?.publish('observation-result');
   return { timedOut: report.value?.accepted !== true, raw: '',
     clean: report.value?.proof?.preview || '',
+    preparationFailure: failure || null,
     inputObservation: { ...report.observation, checks: report.checks, reason: report.reason || null,
       decision: decision?.action || null, decisionReason: decision?.reason || null,
       frame: decision?.frameEvidence || null, control: decision?.controlEvidence || null },
@@ -64823,6 +65552,8 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
     readDraftState = null,
     compactOperationId = null,
     preparation = null,
+    resumePreparation = null,
+    onBeforeEnter = null,
     writeOperation = null,
     handoffId = null,
     sendAttemptId = null,
@@ -64853,6 +65584,10 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   // precede its first echo; releasing the write receipt at that point lets a
   // queued author prompt append to the delayed slash over an old empty frame.
   const ownsShortControlInput = !!tabId && (text === '/model' || text === '/fast' || text === '/compact');
+  if (handoffId && historySendReturnControl(agentSendReceiptStore).isReturned(tabId, handoffId)) {
+    return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+      code: 'history_send_returned', error: 'history_send_returned' };
+  }
   const inputFrame = ownsShortControlInput ? null : captureCodexFrame(term, {
     timeoutMs: 2500,
     logPrefix: logPrefix + ':slash-input',
@@ -64869,7 +65604,7 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   }
   modelInputReceipt?.diagnostic?.record('paste-attempt');
   try {
-    const write = () => term.write(clearPrefix + PASTE_START + text + PASTE_END);
+    const write = () => writeHistorySendPayload(term, clearPrefix + PASTE_START + text + PASTE_END, tabId, handoffId);
     if (modelInputReceipt?.diagnostic) modelInputReceipt.diagnostic.withWrite(term, 'paste', 1, write);
     else write();
     modelInputReceipt?.diagnostic?.record('paste-returned');
@@ -64882,7 +65617,7 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   // exactly owned composer value: an unrelated busy render/sync marker is not
   // its acknowledgement and must not authorize Enter.
   const finishInput = async frame => {
-  if (frame.ownerChanged) {
+  if (frame.ownerChanged && !frame.preparationFailure) {
     modelInputReceipt?.requestRecovery();
     return { success: false, submitted: false, slashInserted: true, pasteWritten: true, enterWritten: false,
       error: 'codex_input_ownership_changed', manualTakeover: true };
@@ -64914,7 +65649,9 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
       : null;
     return {
       success: false,
-      error: 'Codex slash input frame timed out',
+      error: frame.preparationFailure?.code || 'Codex slash input frame timed out',
+      ...(frame.preparationFailure ? { code: frame.preparationFailure.code,
+        cancelled: frame.preparationFailure.cancelled === true } : {}),
       submitted: false,
       slashInserted: true,
       pasteWritten: true,
@@ -65016,6 +65753,9 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
       predicate: submitPredicate,
     })
     : null;
+  // Subscribe to the model menu immediately BEFORE this exact Enter, not
+  // before a potentially long owned-paste wait. No await may open a gap here.
+  onBeforeEnter?.();
   // From this boundary Enter may have reached Codex; the old unsubmitted
   // receipt must never authorize a later clear or another submission.
   if (modelInputReceipt) releaseCodexOwnedModelInput(term, modelInputReceipt, 'enter-armed');
@@ -65027,7 +65767,14 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
     else write();
     modelInputReceipt?.diagnostic?.record('enter-returned', { ordinal: 1 });
   }
-  catch (error) { modelInputReceipt?.diagnostic?.record('enter-threw', { ordinal: 1 }); throw error; }
+  catch (error) {
+    modelInputReceipt?.diagnostic?.record('enter-threw', { ordinal: 1 });
+    if (text === '/model') return { success: false, submitted: null,
+      slashInserted: true, pasteWritten: true, enterWritten: null,
+      enterWriteUnknown: true, deliveryUnconfirmed: true,
+      code: 'codex_model_enter_write_unknown', error: 'codex_model_enter_write_unknown' };
+    throw error;
+  }
   finally { modelInputReceipt?.diagnostic?.publish('enter-result'); }
   if (submitFramePromise) {
     const submitFrame = await submitFramePromise;
@@ -65049,7 +65796,7 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   console.log(logPrefix + ' sent slash command ' + JSON.stringify(text) + ' after render +' + (Date.now() - t0) + 'ms');
   return { success: true, submitted: true };
   };
-  if (preparation && text === '/compact' && modelInputReceipt) {
+  if (preparation && (text === '/compact' || text === '/model') && modelInputReceipt) {
     let observed;
     return deferPreparedInput({
       wait: async () => {
@@ -65059,10 +65806,11 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
         // This signals observation completion only; resume proves permission.
         return { success: true };
       },
-      resume: () => withPtyWriteLock(term, () => {
+      resume: () => {
+        const resume = () => {
         const failure = preparation.failure(true);
         if (failure) observed = { ...observed, timedOut: true,
-          ownerChanged: failure.code !== 'agent_send_preparation_expired' };
+          ownerChanged: failure.code !== 'agent_send_preparation_expired', preparationFailure: failure };
         if (!observed.ownerChanged && !observed.timedOut) {
           const decision = readCodexOwnedModelInputDecision(term, modelInputReceipt, { observePaste: true });
           if (decision.action === 'wait' && decision.reason !== 'draft-changed-after-slash-insert') {
@@ -65072,7 +65820,10 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
             ownerChanged: ['retire', 'retired'].includes(decision.action) };
         }
         return finishInput(observed);
-      }, writeOperation),
+        };
+        return typeof resumePreparation === 'function'
+          ? resumePreparation(resume) : withPtyWriteLock(term, resume, writeOperation);
+      },
     });
   }
   const frame = modelInputReceipt
@@ -65702,6 +66453,8 @@ async function selectCodexModelEffort(term, {
   writeGuard = null,
   readDraftState = null,
   captureDraftSnapshot = null,
+  preparation = null,
+  resumePreparation = null,
 }) {
   const logPrefix = '[Codex:Picker:' + tabId + ']';
   const t0 = Date.now();
@@ -65800,27 +66553,17 @@ async function selectCodexModelEffort(term, {
     console.log(logPrefix + ' skip Ctrl+C draft clear; picker only runs after empty-composer probe');
   }
 
+  // This closure owns the remainder of the ORIGINAL picker, including its
+  // finally/draft transfer. Returning a preparation descriptor must not run it.
+  const finishSelection = async slashResult => {
   try {
-    const openCapture = modelOpenCapture = captureCodexFrame(term, {
-      timeoutMs: 6000,
-      logPrefix: logPrefix + ':open',
-      tabId,
-      authoritativeScreen: true,
-      predicate: (clean) => inspectCodexModelPickerFrame(clean, model).ready,
-    });
-    const slashResult = await sendCodexSlashCommand(term, '/model', logPrefix + ':open-command', {
-      clearStrategy: 'line',
-      writeGuard,
-      tabId,
-      readDraftState,
-    });
     if (!slashResult.success) {
       outcome = slashResult;
       return slashResult;
     }
     slashSubmitted = true;
     pickerMayBeOpen = true;
-    const modelFrame = await openCapture;
+    const modelFrame = await modelOpenCapture;
     if (modelFrame.timedOut) {
       console.warn(logPrefix + ' model menu capture timed out. clean=' + JSON.stringify(modelFrame.clean.slice(0, 500)));
       outcome = { success: false, error: 'Codex model menu capture timed out', clean: modelFrame.clean };
@@ -66435,11 +67178,12 @@ async function selectCodexModelEffort(term, {
     return outcome;
   } finally {
     modelOpenCapture?.cancel?.();
+    const uncertainEnter = outcome?.enterWriteUnknown === true;
     let inputOwnershipLost = outcome?.manualTakeover === true
       || outcome?.error === 'codex_input_ownership_changed';
     const unsubmittedModelInput = codexSettingsMutationQueue.getUnsubmittedInput(term);
     unsubmittedModelInput?.requestRecovery();
-    if (slashSubmitted && outcome?.success !== true && pickerMayBeOpen && !inputOwnershipLost) {
+    if (slashSubmitted && outcome?.success !== true && pickerMayBeOpen && !inputOwnershipLost && !uncertainEnter) {
       const closeResult = await closeCodexPickerToComposer(term, {
         tabId,
         logPrefix,
@@ -66459,7 +67203,7 @@ async function selectCodexModelEffort(term, {
       }
     }
     if (shouldRestoreDraft) {
-      if (!pickerMayBeOpen && !inputOwnershipLost && !unsubmittedModelInput) {
+      if (!pickerMayBeOpen && !inputOwnershipLost && !unsubmittedModelInput && !uncertainEnter) {
         const restoreResult = await restoreCodexDraftAfterPicker(term, {
           tabId,
           logPrefix,
@@ -66490,12 +67234,36 @@ async function selectCodexModelEffort(term, {
         outcome.admissionRejected = true;
         outcome.error = 'Codex model/effort operation yielded to newer terminal input; the previous input text was not restored';
       }
-      if ((pickerMayBeOpen || inputOwnershipLost || unsubmittedModelInput) && outcome && typeof outcome === 'object') {
+      if ((pickerMayBeOpen || inputOwnershipLost || unsubmittedModelInput || uncertainEnter) && outcome && typeof outcome === 'object') {
         outcome.draftRestoreFailed = true;
         outcome.draftTransfer = codexNativeDraftTransfer(tabId, stashedDraftSnapshot);
         if (unsubmittedModelInput) outcome.serviceInputPending = true;
       }
     }
+  }
+  };
+  try {
+    const slashResult = await sendCodexSlashCommand(term, '/model', logPrefix + ':open-command', {
+      clearStrategy: 'line', writeGuard, tabId, readDraftState, preparation,
+      onBeforeEnter: () => {
+        modelOpenCapture = captureCodexFrame(term, {
+          timeoutMs: 6000, logPrefix: logPrefix + ':open', tabId,
+          authoritativeScreen: true,
+          predicate: clean => inspectCodexModelPickerFrame(clean, model).ready,
+        });
+      },
+      resumePreparation: work => {
+        const resume = async () => {
+          const result = await work();
+          return result?.waitForComposerPreparation ? result : finishSelection(result);
+        };
+        return typeof resumePreparation === 'function'
+          ? resumePreparation(resume) : withPtyWriteLock(term, resume);
+      },
+    });
+    return slashResult?.continuePreparation ? slashResult : finishSelection(slashResult);
+  } catch (error) {
+    return finishSelection({ success: false, error: error?.message || String(error) });
   }
 }
 
@@ -66622,6 +67390,18 @@ async function sendCodexLiveSlashCommand(term, {
         };
       }
     }
+  }
+  if (text === '/fast' && outcome?.success === true && outcome?.submitted === true) {
+    // Enter retires the owned slash receipt before Codex paints its result.
+    // A Send can receive an older blocked presence reply after that result;
+    // wake the SAME waiter now. This is not readiness or permission to paste:
+    // it must re-read the current owner/input and keep its original deadline.
+    try {
+      emitAgentReadinessChanged(tabId, { toolType: 'codex', source: 'codex-fast-command',
+        status: 'changed', reason: 'fast-command-settled' });
+      console.log(logPrefix + ' readiness recheck requested reason=fast-command-settled');
+    }
+    catch (error) { console.warn(logPrefix + ' completion wake failed: ' + (error?.message || String(error))); }
   }
   return outcome || { success: false, error: 'Codex slash command did not produce a result' };
   };
@@ -67933,10 +68713,19 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}, assertCurre
           revision: reserveReturn.choice.revision, actionSequence: reserveReturn.choice.actionSequence,
         });
       }
+      const fastIntent = ensureCodexFastLaunchIntent(tabId);
+      const currentFastLaunch = codexLastRunCommandPayload.get(tabId);
+      if (currentFastLaunch?.launchId === launchId) Object.assign(currentFastLaunch, {
+        requestedFast: fastIntent.desiredFast, fastIntentRevision: fastIntent.revision,
+      });
+      console.log('[CodexFastIntent] launch tab=' + String(tabId).slice(-12)
+        + ' desired=' + fastIntent.desiredFast + ' revision=' + fastIntent.revision
+        + ' launch=' + launchId + ' source=app-intent-override');
       const cmdLine = buildCodexCommand({
         command: normalizedCommand, sessionId, cwd: termCwd, model: launchModel, effort: launchEffort,
         developerInstructions: profile ? '' : developerInstructions, profile, providerProxyBaseUrl,
         authProfileOverrides: codexAuthProfileRoute?.launchOverrides(tabId, providerProxyBaseUrl) || [],
+        fast: fastIntent.desiredFast,
       });
       startedAt = Date.now();
       rebaseCodexLaunchObservationAtWrite(tabId, launchId, startedAt);
@@ -68354,6 +69143,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
   }
   if (!model) return { success: false, error: 'model is required' };
   const activity = beginAgentSettingsActivity(tabId, 'codex', settingsControl);
+  let activityDeferred = false;
   const requestStartedAt = Date.now();
   let latencyPhase = 'config';
   let phaseStartedAt = requestStartedAt;
@@ -68361,6 +69151,8 @@ async function executeCodexSelectModelEffortRequest(sender, {
     const now = Date.now();
     console.log('[CodexSettingsLatency] tab=' + String(tabId).slice(-12)
       + ' activity=' + (activity?.id ?? '-') + ' requestAt=' + requestStartedAt
+      + ' operation=' + (sendOperationKey || '-') + ' attempt=' + (sendAttemptId || '-')
+      + ' scope=' + (preparation?.scope?.id || '-') + ' deadlineAt=' + (preparation?.deadlineAt ?? '-')
       + ' phase=' + latencyPhase + ' ms=' + Math.max(0, now - phaseStartedAt)
       + ' totalMs=' + Math.max(0, now - requestStartedAt) + ' next=' + next);
     latencyPhase = next;
@@ -68654,10 +69446,15 @@ async function executeCodexSelectModelEffortRequest(sender, {
         }
 
         pickerInputAdmitted = true;
+        const settingsObservationBeforePicker = readCodexSettingsSendScope(tabId)?.settingsObservationKey;
         const writeGuard = (phase) => {
           pickerOperation.phase = phase;
           pickerOperation.manualEnterSubmitsPrompt = false;
-          const admission = readAdmission(freshHasDraft, expectedInputRevision);
+          let admission = readAdmission(freshHasDraft, expectedInputRevision);
+          if (admission.allowed && !codexSettingsObservationCurrent(
+            { settingsObservationKey: settingsObservationBeforePicker }, readCodexSettingsSendScope(tabId),
+            model, effort, resolveConfiguredCodexSettingsModelIdentity,
+          )) admission = { allowed: false, reason: 'codex_settings_observation_changed' };
           if (!admission.allowed) {
             console.warn('[codex:select-model-effort] write boundary rejected tab='
               + String(tabId).slice(-12)
@@ -68670,11 +69467,21 @@ async function executeCodexSelectModelEffortRequest(sender, {
         };
 
         measurePhase('picker');
-        const settingsObservationBeforePicker = readCodexSettingsSendScope(tabId)?.settingsObservationKey;
         const result = await selectCodexModelEffort(term, {
           tabId,
           model,
           effort,
+          preparation,
+          // Invoked lazily only AFTER this initial writer and any outer
+          // settings+Send owner have released. Resume the same picker under
+          // fresh existing owners; do not re-run admission/stash/paste.
+          resumePreparation: work => codexSettingsMutationQueue.run(() => (
+            withPtyWriteLock(term, async () => {
+              measurePhase('picker-resume');
+              const resumed = await work();
+              return resumed?.waitForComposerPreparation ? resumed : finishResult(resumed);
+            }, pickerOperation)
+          )),
           configPath: activeConfig.configPath,
           hasDraft: freshHasDraft,
           draftSource: freshDraft?.source || draftSource,
@@ -68700,6 +69507,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
             },
           ),
         });
+        async function finishResult(result) {
         if ((result?.success === true || result?.applied === true)
           && !codexSettingsObservationCurrent(
             { settingsObservationKey: settingsObservationBeforePicker },
@@ -68856,6 +69664,12 @@ async function executeCodexSelectModelEffortRequest(sender, {
           }
         }
         return ownedResult;
+        }
+        if (result?.continuePreparation) {
+          measurePhase('owned-paste-observation');
+          return result;
+        }
+        return finishResult(result);
       }, pickerOperation, ptyWriteOwner);
     } catch (error) {
       console.error('[codex:select-model-effort] Error:', error);
@@ -68864,10 +69678,23 @@ async function executeCodexSelectModelEffortRequest(sender, {
       return { success: false, error: error.message };
     }
   });
-  return await next;
+  const result = await next;
+  if (result?.continuePreparation) {
+    activityDeferred = true;
+    let finished;
+    return { continuePreparation() {
+      return finished ||= Promise.resolve().then(() => result.continuePreparation()).finally(() => {
+        measurePhase('settled');
+        agentSettingsActivity.end(activity);
+      });
+    } };
+  }
+  return result;
   } finally {
-    measurePhase('settled');
-    agentSettingsActivity.end(activity);
+    if (!activityDeferred) {
+      measurePhase('settled');
+      agentSettingsActivity.end(activity);
+    }
   }
 }
 
@@ -69060,13 +69887,13 @@ async function executeCodexLiveSlashCommandRequest({
         const targetWriter = expectedTarget?.sessionId
           ? await ensureCodexSubmissionWatcher(tabId, terminalProjects.get(tabId), 'local-command-target')
           : null;
-        const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
+        const readAdmission = (freshHasDraft, expectedInputRevision = null, phase = 'admission') => {
           const expired = preparation?.failure(true);
           if (expired) return { allowed: false, reason: expired.code };
           if (getTerminalLifecycleGeneration(tabId) !== preparationLifecycle
             || getTerminalStopRevision(tabId) !== preparationStopRevision) return { allowed: false, reason: 'codex_input_ownership_changed' };
           const currentState = terminalCommandState.get(tabId) || null;
-          const settingsCheck = typeof settingsWriteGuard === 'function' ? settingsWriteGuard() : null;
+          const settingsCheck = typeof settingsWriteGuard === 'function' ? settingsWriteGuard(phase) : null;
           if (settingsCheck && settingsCheck.allowed !== true) return settingsCheck;
           if (expectedTarget) {
             const currentTarget = readAgentSendDestinationAtWriteBoundary(tabId, 'codex',
@@ -69166,7 +69993,7 @@ async function executeCodexLiveSlashCommandRequest({
         const writeGuard = (phase) => {
           slashOperation.phase = phase;
           slashOperation.manualEnterSubmitsPrompt = false;
-          const admission = readAdmission(freshHasDraft, expectedInputRevision);
+          const admission = readAdmission(freshHasDraft, expectedInputRevision, phase);
           if (!admission.allowed) {
             console.warn('[codex:send-live-slash-command] write boundary rejected tab='
               + String(tabId).slice(-12)
@@ -71910,6 +72737,7 @@ const SUBAGENT_BOUNDARY_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const trimSubagentBoundaryCache = (cache) => {
   const entryBytes = (value) => 256
     + (value?.launchServiceTier ? 512 : 0)
+    + (value?.launchTierDiagnostics ? 1024 : 0)
     + (value?.sourceStat ? 64 : 0)
     + String(value?.bootstrapInstruction?.text || '').length * 2;
   let totalBytes = 0;
@@ -72139,6 +72967,7 @@ const getCodexSubagentBoundary = async (filePath, expectedSessionId) => {
 
 ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
   const {
+    tabId,
     readerId,
     chipKey,
     toolType,
@@ -72225,6 +73054,7 @@ ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
       codexNeedsNewTaskBoundary: codexBoundary?.requiresBoundary === true,
       codexNewTaskBoundarySeen: codexBoundary?.found === true,
       launchServiceTier: codexBoundary?.launchServiceTier || null,
+      launchTierDiagnostics: codexBoundary?.launchTierDiagnostics || null,
       sourceLine: codexBoundary?.found === true
         ? Number(codexBoundary.nextSourceLine) || 0
         : 0,
@@ -72272,16 +73102,47 @@ ipcMain.handle('subagent:read-steps', async (_event, payload = {}) => {
       reader.offset = Number(result.offset) || 0;
       const settings = result.launchSettings;
       const tier = result.launchServiceTier;
+      // The request is independent of historical launch metadata. Only the
+      // already selected child's proven root can consume its compact record.
+      result.requestServiceTier = toolType === 'codex'
+        && reader.projectionState?.codexRootMetaSeen === true
+        && reader.projectionState.codexSessionId === (agentSessionId || agentId)
+        ? providerSemanticShadow.getCodexSubagentServiceTier({tabId, parentSessionId,
+            sessionId: agentSessionId || agentId}) : null;
+      const requestTier = result.requestServiceTier;
+      const diagnostic = toolType === 'codex' ? reader.projectionState?.launchTierDiagnostics || null : null;
+      const tierRoot = !reader.projectionState?.codexRootMetaSeen ? 'unseen'
+        : reader.projectionState.codexSessionId === reader.projectionState.codexExpectedSessionId ? 'match' : 'mismatch';
+      const tierSealed = reader.projectionState?.codexLaunchServiceTierSealed === true;
+      const diagnosticKey = diagnostic ? [diagnostic.reason, diagnostic.seen, diagnostic.own,
+        diagnostic.foreign, diagnostic.beforeRoot, diagnostic.malformed, diagnostic.oversized,
+        diagnostic.lateOwn, diagnostic.partial, tierRoot, tierSealed].join(':') : 'unavailable';
       const launchKey = [settings?.source || 'unknown', settings?.sessionId || '',
         settings?.model || '', settings?.effort || '', tier?.sessionId || '',
-        tier?.source || '', tier?.serviceTier || 'unknown'].join('|');
+        tier?.source || '', tier?.serviceTier || 'unknown', diagnosticKey,
+        requestTier?.sessionId || '', requestTier?.serviceTier || 'unknown', requestTier?.reason || 'unobserved'].join('|');
       if (reader.launchSettingsObservedKey !== launchKey) {
         reader.launchSettingsObservedKey = launchKey;
+        const tierDiagnosticLog = toolType === 'codex'
+          ? ' tierProof=' + (tier ? 'own-thread-settings' : 'none')
+            + ' tierReason=' + String(diagnostic?.reason || 'diagnostics-unavailable')
+            + ' tierSeen=' + Number(diagnostic?.seen || 0) + ' tierOwn=' + Number(diagnostic?.own || 0)
+            + ' tierForeign=' + Number(diagnostic?.foreign || 0) + ' tierBeforeRoot=' + Number(diagnostic?.beforeRoot || 0)
+            + ' tierMalformed=' + Number(diagnostic?.malformed || 0) + ' tierOversized=' + Number(diagnostic?.oversized || 0)
+            + ' tierLateOwn=' + Number(diagnostic?.lateOwn || 0) + ' tierPartial=' + (diagnostic?.partial ? 1 : 0)
+            + ' tierFirstLateReason=' + String(diagnostic?.firstLateReason || 'none')
+            + ' tierFirstLateLine=' + (diagnostic?.firstLateLine ?? -1) + ' tierFirstLateOffset=' + (diagnostic?.firstLateOffset ?? -1)
+            + ' tierRoot=' + tierRoot + ' tierSealed=' + (tierSealed ? 1 : 0)
+            + ' tierLine=' + (diagnostic?.line ?? -1) + ' tierOffset=' + (diagnostic?.offset ?? -1)
+            + ' requestTier=' + String(requestTier?.serviceTier || 'unknown')
+            + ' requestTierReason=' + String(requestTier?.reason || 'request-unobserved')
+          : '';
         console.log('[SubagentLaunchSettings] reader=' + cacheKey
           + ' child=' + String(agentSessionId || agentId || '-')
           + ' source=' + String(settings?.source || 'unknown')
           + ' model=' + String(settings?.model || '-') + ' effort=' + String(settings?.effort || '-')
-          + ' tier=' + String(tier?.serviceTier || 'unknown'));
+          + ' tier=' + String(tier?.serviceTier || 'unknown')
+          + tierDiagnosticLog);
       }
     }
     return { ...result, reset: reset || result?.reset === true };

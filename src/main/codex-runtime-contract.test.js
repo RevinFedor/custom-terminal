@@ -59,6 +59,42 @@ test('send startup wait belongs only to the current launch and reuses its absolu
   }
 });
 
+test('public startup wait does not reappear when initialized input closes again', () => {
+  const terminal = {};
+  const input = { terminal, lifecycleGeneration: 'G', runSeq: 2, commandRunning: true,
+    inputReady: false, lifecycleEstablished: true, timeoutMs: 60000,
+    payload: { terminalToken: terminal, lifecycleGeneration: 'G', runSeq: 2, launchId: 'L', startedAt: 1000 } };
+  assert.equal(projectCodexSendStartupWait(input), null);
+  assert.equal(projectCodexSendStartupWait({ ...input, lifecycleEstablished: false }).deadlineAt, 61000);
+});
+
+test('both actual public runtime paths stop advertising an initialized launch as a new startup wait', () => {
+  const fs = require('node:fs'), vm = require('node:vm'), ts = require('typescript');
+  const source = fs.readFileSync(require.resolve('./main'), 'utf8');
+  const ast = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, true);
+  const helper = ast.statements.find(n => ts.isFunctionDeclaration(n)
+    && n.name?.text === 'hasCodexEstablishedComposerLifecycle');
+  assert.ok(helper);
+  for (const name of ['projectCodexRuntimeSnapshotFromEvents', 'getCodexRuntimeSessionSnapshot']) {
+    const fn = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
+    const calls = [];
+    const visit = n => { if (ts.isCallExpression(n) && n.expression.getText(ast) === 'projectCodexSendStartupWait') calls.push(n); ts.forEachChild(n, visit); };
+    assert.ok(fn, name); visit(fn); assert.equal(calls.length, 1, name);
+    const terminal = {}, payload = { terminalToken: terminal, lifecycleGeneration: 'G', runSeq: 2, launchId: 'L', startedAt: 1000 };
+    const meta = new Map([['T', { initializedLifecycleGeneration: 'G' }]]);
+    const context = vm.createContext({ projectCodexSendStartupWait, currentPayload: payload,
+      currentTerminal: terminal, currentLifecycleGeneration: 'G', currentRunSeq: 2,
+      commandState: { isRunning: true }, stopping: false, inputReady: false, tabId: 'T',
+      terminals: new Map([['T', terminal]]), terminalCommandState: new Map([['T', { isRunning: true, runSeq: 2 }]]),
+      getTerminalLifecycleGeneration: () => 'G', codexTuiReadyMeta: meta, CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000 });
+    vm.runInContext(helper.getText(ast), context);
+    assert.equal(vm.runInContext(calls[0].getText(ast), context), null, name + ' must not issue a new stale launch ID');
+    meta.set('T', { initializedLifecycleGeneration: 'previous-generation' });
+    assert.equal(vm.runInContext(calls[0].getText(ast), context).deadlineAt, 61000,
+      name + ' retains the original deadline for a genuinely new cold lifecycle');
+  }
+});
+
 test('service-tier acknowledgement identity belongs to one exact terminal writer generation', () => {
   const terminal = {};
   const expected = { success: true, ownerId: 'writer-A', terminalToken: terminal,

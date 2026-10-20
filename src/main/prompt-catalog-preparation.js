@@ -7,12 +7,18 @@ const { causal } = require('./perf-causal-context');
 const { createCatalogControl, createFsLimiter, stableSort, copyMetadata } = require('./prompt-catalog-cooperative');
 const { naturalCompare, probeSource, sameProbe, captureLayout, scanSourceMetadata,
   optionalStat, identity, error } = require('./prompt-catalog-source');
-const { PROMPT_SUFFIX } = require('../shared/prompt-source-policy.cjs');
 const policyVersion = () => require('../shared/prompt-source-policy.cjs').PROMPT_SOURCE_POLICY_VERSION;
 
 const obsolete = () => Object.assign(Error('prompt_catalog_obsolete'), { code: 'prompt_catalog_obsolete' });
 const sameFence = (a, b) => !!a && !!b && a.connection === b.connection
-  && ['schema', 'external', 'changes', 'committed', 'transaction'].every(k => a[k] === b[k]);
+  && ['schema', 'external', 'changes', 'committed', 'transaction', 'authoritySource'].every(k => a[k] === b[k]);
+// Only retained SQL owners may renew across unrelated external commits. The
+// owning registry's certified trigger epoch covers their complete SQL inputs;
+// each whole request still checks the FULL fence, including data_version.
+const sameCatalogSqlInputs = (a, b) => !!a && !!b
+  && a.authoritySource === 'catalog-read-epoch-v2' && b.authoritySource === a.authoritySource
+  && a.transaction === false && b.transaction === false && a.connection === b.connection
+  && ['schema', 'changes', 'committed'].every(k => a[k] === b[k]);
 const rowSignature = rows => { const h = crypto.createHash('sha256'); for (const row of rows) h.update(JSON.stringify(row) + '\n'); return h.digest('hex'); };
 
 /** Complete ordered metadata per CONFIGURED spelling; request authority is never cached. */
@@ -24,19 +30,31 @@ class PreparedPromptCatalog {
       throw error('prompt_catalog_async_fs_required');
     }
     this.controlOptions = controlOptions; this.authorityFence = authorityFence;
-    this.pool = createFsLimiter(); this.slots = new Map(); this.watchers = new Map();
+    this.pool = createFsLimiter(); this.probes = new Map(); this.slots = new Map(); this.watchers = new Map();
     this.queue = []; this.running = null; this.pumpScheduled = false;
     this.closed = false; this.lifetime = 1; this.reconcileScheduled = false;
+    // One pending inventory and one retained SQL ownership projection. Physical
+    // metadata/authority is still observed by each recipient, without a TTL.
+    this.usageFlight = null; this.usageInventory = null;
     this.reconcileRunning = false; this.reconcileDesired = false; this.consumersKnown = false;
     this.counters = { preparations: 0, publications: 0, obsolete: 0, failures: 0, reconciliations: 0,
-      diagnosticLoss: 0, notificationLoss: 0, watchLoss: 0 };
+      diagnosticLoss: 0, notificationLoss: 0, watchLoss: 0, sharedProbes: 0, contentChecks: 0, contentCheckFailures: 0,
+      usageInventoryHits: 0, usageInventoryBuilds: 0 };
     this.sourceSequence = 0;
     if (service.watchEnabled) this.refreshWatchers();
   }
   control(assertCurrent = () => this.assertOpen()) { return createCatalogControl({ ...this.controlOptions, assertCurrent }); }
   assertOpen() { if (this.closed) throw error('prompt_catalog_unavailable'); }
   io(method, target, ...args) {
-    return this.pool.run(() => ['read', 'close'].includes(method) ? target[method](...args) : this.fs[method](target, ...args));
+    // Concurrent consumers observe the same outstanding syscall. This is not
+    // a result/TTL cache: a later read always makes a new observation. Directory
+    // handles (read/close) are never shared between traversal owners.
+    const key = ['stat', 'lstat', 'realpath'].includes(method) && !args.length ? method + ':' + target : null;
+    if (key && this.probes.has(key)) { this.counters.sharedProbes++; return this.probes.get(key); }
+    const request = this.pool.run(() => ['read', 'close'].includes(method) ? target[method](...args) : this.fs[method](target, ...args));
+    if (!key) return request;
+    const observation = request.finally(() => { if (this.probes.get(key) === observation) this.probes.delete(key); });
+    this.probes.set(key, observation); return observation;
   }
   changed(payload) {
     try { this.service.onChanged?.({ ...payload, at: Date.now() }); } catch { this.counters.notificationLoss++; }
@@ -53,7 +71,11 @@ class PreparedPromptCatalog {
       readId: fields?.readId, requestId: fields?.requestId,
       mode: 'prepared-source-metadata', ...control.finish(),
       diagnosticLoss: this.counters.diagnosticLoss, notificationLoss: this.counters.notificationLoss,
-      watchLoss: this.counters.watchLoss, ...extra })); } catch { this.counters.diagnosticLoss++; }
+      watchLoss: this.counters.watchLoss, fsActive: this.pool.active, fsWaiting: this.pool.waiting, fsRejected: this.pool.rejected,
+      sharedProbes: this.counters.sharedProbes, contentChecks: this.counters.contentChecks,
+      contentCheckFailures: this.counters.contentCheckFailures,
+      usageInventoryHits: this.counters.usageInventoryHits, usageInventoryBuilds: this.counters.usageInventoryBuilds,
+      ...extra })); } catch { this.counters.diagnosticLoss++; }
   }
   slot(root) {
     let slot = this.slots.get(root);
@@ -79,8 +101,12 @@ class PreparedPromptCatalog {
   }
   markDirty(slot, reason, coalesce = false) {
     if (this.closed || this.slots.get(slot.root) !== slot) return;
+    const notify = slot.state !== 'preparing';
+    if (reason !== 'content-change') slot.contentCheck = null;
     slot.epoch++; slot.state = 'preparing'; slot.failure = null; slot.observationRetries = 0;
-    this.notifySlot(slot, 'preparing');
+    // One invalidation already makes the rows unselectable. Repeated events
+    // advance the epoch but must not fan out another read to every consumer.
+    if (notify) this.notifySlot(slot, 'preparing');
     if (coalesce) {
       if (!slot.timer) {
         const life = this.lifetime;
@@ -117,6 +143,7 @@ class PreparedPromptCatalog {
     while (this.queue.length && !this.closed) {
       const slot = this.queue.shift(); slot.queued = false;
       if (this.slots.get(slot.root) !== slot) continue;
+      slot.contentCheck = null;
       if (slot.timer) { clearTimeout(slot.timer); slot.timer = null; }
       const token = {}, epoch = slot.epoch, life = this.lifetime, policy = policyVersion();
       this.running = token; slot.running = token; slot.runningEpoch = epoch;
@@ -157,7 +184,8 @@ class PreparedPromptCatalog {
         else if (!this.closed && this.slots.get(slot.root) === slot && epoch === slot.epoch) {
           slot.state = 'failed'; slot.failure = e; this.counters.failures++; this.notifySlot(slot, 'failed');
         }
-        this.diagnostic('prepare', control, { sourceId: slot.sourceId, candidateEpoch: epoch, state: e.code === 'prompt_catalog_obsolete' ? 'obsolete' : 'failed', errorCode: e.code || 'prepare_error' });
+        this.diagnostic('prepare', control, { sourceId: slot.sourceId, candidateEpoch: epoch, state: e.code === 'prompt_catalog_obsolete' ? 'obsolete' : 'failed', errorCode: e.code || 'prepare_error',
+          ...(e.reason === 'fs_queue_full' ? { errorReason: e.reason, failedFsActive: e.fsActive, failedFsWaiting: e.fsWaiting } : {}) });
       } finally {
         slot.running = null; this.running = null;
         // Latest desired epoch goes to queue END; unrelated sources remain fair.
@@ -246,36 +274,82 @@ class PreparedPromptCatalog {
     // recursive docs owner; a sentinel's own ancestor name is not that proof.
     if (entry.recursive && name && !path.isAbsolute(name)
       && name.split(/[\\/]/).some((part, i, parts) => part.startsWith('.') || (part === 'node_modules' && i < parts.length - 1))) return;
+    let relevant = false, descendantObservation = false;
     for (const slot of [...entry.slots]) {
       if (!entry.recursive && name) {
         const event = path.resolve(entry.target, name), docs = path.join(slot.root, 'docs');
         const ancestor = target => event === target || target.startsWith(event + path.sep);
-        if (!ancestor(slot.root) && !ancestor(docs)) continue;
+        if (!ancestor(slot.root) && !ancestor(docs)) {
+          // Preserve the prior conservative topology check if a backend emits
+          // a descendant path despite this being a nonrecursive sentinel.
+          if (event.startsWith(slot.root + path.sep)) descendantObservation = true;
+          continue;
+        }
       }
-      const before = slot.snapshot;
-      this.markDirty(slot, 'filesystem', true); // revoke synchronously, before debounce/probes
-      const epoch = slot.epoch, life = this.lifetime;
+      relevant = true;
+      const before = slot.snapshot, previous = slot.contentCheck;
       const file = name && path.resolve(entry.target, name);
       const fact = before?.metadata.leafFacts.get(file);
-      if (entry.recursive && kind === 'change' && fact && file.endsWith(PROMPT_SUFFIX)) {
-        this.confirmContentOnly(slot, entry, before, epoch, life, file, fact).catch(() => {});
+      const verifying = previous && previous.before === before && previous.entry === entry && previous.epoch === slot.epoch;
+      if (entry.recursive && kind === 'change' && fact?.regular && !slot.running && !slot.queued
+        && (slot.state === 'ready' || verifying)) {
+        const check = verifying ? previous : { before, entry, life: this.lifetime, files: new Set() };
+        // A large set of distinct changes falls back to ONE complete inventory;
+        // nothing is clipped and no unbounded per-event async workers are kept.
+        if (check.files.size >= 256 && !check.files.has(file)) {
+          this.markDirty(slot, 'filesystem', true); continue;
+        }
+        slot.contentCheck = check;
+        this.markDirty(slot, 'content-change', true); // revoke before async verification
+        check.epoch = slot.epoch; check.files.add(file);
+        this.checkContentChanges(slot);
+      } else {
+        this.markDirty(slot, 'filesystem', true);
       }
     }
-    if (!entry.recursive || name == null || kind === 'rename') this.refreshWatchers();
+    // A parent sentinel also receives sibling I/O. It has no catalog consumer
+    // or watcher topology to reconcile when every source rejected that path.
+    if ((relevant || descendantObservation) && (!entry.recursive || name == null || kind === 'rename')) this.refreshWatchers();
   }
-  async confirmContentOnly(slot, entry, before, epoch, life, file, fact) {
-    const stat = await this.io('lstat', file);
-    if (identity(stat) !== fact.identity || stat.isSymbolicLink() || !stat.isFile()) return;
-    const control = this.control();
-    const probe = await probeSource(slot.root, this.io.bind(this), control);
-    const layout = await captureLayout(this.service.layoutStore, slot.root, control);
-    if (this.closed || life !== this.lifetime || this.slots.get(slot.root) !== slot || slot.epoch !== epoch
-      || this.watchers.get(entry.key) !== entry || slot.running || slot.queued
-      || !sameProbe(before.probe, probe) || before.layoutStamp !== layout.stamp) return;
-    this.assertCoverage(slot);
-    if (slot.timer) { clearTimeout(slot.timer); slot.timer = null; }
-    slot.snapshot = { ...before, epoch, watchEpoch: slot.watchEpoch, observedAt: Date.now() }; slot.state = 'ready';
-    this.notifySlot(slot, 'ready');
+  checkContentChanges(slot) {
+    if (slot.contentChecking) return;
+    slot.contentChecking = true;
+    const drain = async () => {
+      try {
+        while (!this.closed && this.slots.get(slot.root) === slot && slot.contentCheck) {
+          const check = slot.contentCheck;
+          try { await this.confirmContentOnly(slot, check); }
+          catch { this.counters.contentCheckFailures++; } // existing first-event coalescer prepares instead
+          if (slot.contentCheck === check) slot.contentCheck = null;
+        }
+      } finally { slot.contentChecking = false; }
+    };
+    void drain();
+  }
+  async confirmContentOnly(slot, check) {
+    const { before, entry, life } = check;
+    const current = () => !this.closed && life === this.lifetime && this.slots.get(slot.root) === slot
+      && slot.contentCheck === check && slot.epoch === check.epoch && slot.snapshot === before
+      && this.watchers.get(entry.key) === entry && !entry.retired && !slot.running && !slot.queued;
+    const control = this.control(); this.counters.contentChecks++;
+    while (current()) {
+      while (check.files.size && current()) {
+        const file = check.files.values().next().value; check.files.delete(file);
+        const fact = before.metadata.leafFacts.get(file), stat = await this.io('lstat', file);
+        if (!current() || !fact || (fact.identity != null && identity(stat) !== fact.identity)
+          || stat.isSymbolicLink() || !stat.isFile()) return;
+      }
+      const epoch = check.epoch;
+      const probe = await probeSource(slot.root, this.io.bind(this), control);
+      const layout = await captureLayout(this.service.layoutStore, slot.root, control);
+      if (!current()) return;
+      if (check.files.size || epoch !== check.epoch) continue;
+      if (!sameProbe(before.probe, probe) || before.layoutStamp !== layout.stamp) return;
+      this.assertCoverage(slot);
+      if (slot.timer) { clearTimeout(slot.timer); slot.timer = null; }
+      slot.snapshot = { ...before, epoch, watchEpoch: slot.watchEpoch, observedAt: Date.now() }; slot.state = 'ready';
+      this.notifySlot(slot, 'ready'); return;
+    }
   }
   fence() {
     if (this.authorityFence) return this.authorityFence();
@@ -361,7 +435,7 @@ class PreparedPromptCatalog {
   }
   context() {
     return { control: this.control(), reader: this.service.rootRegistry?.createSourcesReader?.(), views: new Map(),
-      leaves: new Map(), projects: new Map(), tokens: new Map(), selections: [], availability: null };
+      leaves: new Map(), projects: new Map(), tokens: new Map(), selections: [], usageSnapshots: [], availability: null };
   }
   async request(name, run) {
     this.assertOpen(); const life = this.lifetime;
@@ -371,7 +445,9 @@ class PreparedPromptCatalog {
       try {
         value = await causal.run(name, {}, async () => {
           const value = await run(ctx);
-          this.diagnostic('read', ctx.control, { authorityPasses: attempt + 1 });
+          this.diagnostic('read', ctx.control, { authorityPasses: attempt + 1,
+            authoritySource: before.authoritySource || 'conservative', usageInventory: ctx.usageInventoryState,
+            usageFenceChanged: ctx.usageFenceChanged });
           return value;
         });
       } catch (e) { failure = e; }
@@ -386,8 +462,22 @@ class PreparedPromptCatalog {
       after = this.fence();
       if (!sameFence(after, this.fence())) { if (attempt === 0) continue; throw error('prompt_catalog_changed'); }
       if (this.closed || life !== this.lifetime) throw error('prompt_catalog_changed');
+      let sourceChanged = false;
       for (const [slot, snapshot] of ctx.tokens) if (this.slots.get(slot.root) !== slot || slot.snapshot !== snapshot
-        || slot.state !== 'ready' || slot.epoch !== snapshot.epoch || slot.watchEpoch !== snapshot.watchEpoch || snapshot.policy !== policyVersion()) throw error('prompt_catalog_changed');
+        || slot.state !== 'ready' || slot.epoch !== snapshot.epoch || slot.watchEpoch !== snapshot.watchEpoch || snapshot.policy !== policyVersion()) sourceChanged = true;
+      if (sourceChanged) {
+        // Usage recipients now observe their own views too; preserve their
+        // existing single retry after late source-only diagnostic mutations.
+        if (ctx.usageSnapshots.length && attempt === 0) continue;
+        throw error('prompt_catalog_changed');
+      }
+      // A joined inventory can settle before this recipient's filtering and
+      // diagnostics. Recheck its exact authority and source tokens in the LAST
+      // synchronous frame too; an old result never adopts a newer fence.
+      if (ctx.usageSnapshots.some(snapshot => !this.usageSnapshotCurrent(snapshot))) {
+        if (attempt === 0) continue;
+        throw error('prompt_catalog_changed');
+      }
       return value;
     }
     throw error('prompt_catalog_changed');
@@ -431,18 +521,23 @@ class PreparedPromptCatalog {
     if (ready) { this.assertCoverage(slot); ctx.tokens.set(slot, ready); }
     const view = { slot, ready, probe }; ctx.views.set(root, view); return view;
   }
-  async catalog(kind, id, ctx) {
+  async catalogSources(kind, id, ctx) {
     const rows = await this.readRows(kind, id, ctx), signature = await this.signature(rows, ctx.control);
     ctx.selections.push({ kind, id, signature });
     const all = await this.describe(rows, ctx);
-    const selected = await stableSort(kind === 'tab' ? all.filter(s => s.enabled === true) : all,
+    return stableSort(kind === 'tab' ? all.filter(s => s.enabled === true) : all,
       (a, b) => naturalCompare(a.sourceName, b.sourceName), ctx.control);
+  }
+  catalogSourceView(kind, id, source, ctx) {
+    // A newly shared directory may precede the background consumer census.
+    if (kind === 'tab') this.slot(source.rootPath).tabIds.add(id);
+    return this.view(source.rootPath, ctx);
+  }
+  async catalog(kind, id, ctx) {
+    const selected = await this.catalogSources(kind, id, ctx);
     const sources = [], prompts = [];
     for (const source of selected) {
-      // A newly shared workflow directory may not yet appear in the last
-      // background consumer inventory. Its ready event must wake this tab.
-      if (kind === 'tab') this.slot(source.rootPath).tabIds.add(id);
-      const view = await this.view(source.rootPath, ctx), metadata = view.ready?.metadata;
+      const view = await this.catalogSourceView(kind, id, source, ctx), metadata = view.ready?.metadata;
       const facts = { docsPath: view.probe.docsPath, exists: view.probe.root.exists, docsExists: view.probe.docs.exists };
       const base = kind === 'tab' ? { ...source, ...facts } : { rootPath: source.rootPath, sourceName: source.sourceName, ...facts };
       sources.push({ ...base, promptCount: metadata?.prompts.length || 0 });
@@ -473,33 +568,158 @@ class PreparedPromptCatalog {
     }
     return ctx.leaves.get(resolved);
   }
-  usage(root) {
-    return this.request('catalog.usageForRoot', async ctx => {
-      const wanted = await this.canonical(root, ctx), byPath = new Map(), scopes = await this.scopes(ctx.control);
-      for (const scope of scopes) {
-        const catalog = await this.catalog(this.service.rootRegistry ? 'tab' : 'project', scope.tabId || scope.id, ctx);
-        for (const prompt of catalog.prompts) {
-          if (!this.service.inside(wanted, await this.canonical(prompt.path, ctx))) continue;
-          await ctx.control.step('map', () => {
-            if (this.service.rootRegistry) {
-              const use = byPath.get(prompt.path) || { projects: new Map(), tabs: new Map() };
-              use.tabs.set(scope.tabId, { id: scope.tabId, name: scope.name || scope.tabId });
-              if (prompt.projectId && !ctx.projects.has(prompt.projectId)) ctx.projects.set(prompt.projectId, this.service.db.getProjectById(prompt.projectId));
-              const project = ctx.projects.get(prompt.projectId);
-              if (project) use.projects.set(project.id, { id: project.id, name: project.name, icon: project.icon || null });
-              byPath.set(prompt.path, use);
-            } else {
-              const use = byPath.get(prompt.path) || []; use.push({ id: catalog.project.id, name: catalog.project.name, icon: catalog.project.icon }); byPath.set(prompt.path, use);
+  usageSnapshotCurrent(snapshot) {
+    if (this.closed || snapshot.life !== this.lifetime || !sameFence(snapshot.fence, this.fence())) return false;
+    for (const [slot, value] of snapshot.tokens) if (this.slots.get(slot.root) !== slot || slot.snapshot !== value
+      || slot.state !== 'ready' || slot.epoch !== value.epoch || slot.watchEpoch !== value.watchEpoch
+      || value.policy !== policyVersion()) return false;
+    return true;
+  }
+  retainedUsageFence() {
+    const registry = this.service.rootRegistry;
+    // A source label or controlled fence is not a certificate. The actual
+    // registry's connection-local, schema-certified SQL epoch must also agree.
+    if (this.authorityFence || !registry?.catalogSchemaKnown ||
+      !(registry instanceof require('./workflow-root-registry').WorkflowRootRegistry)) return null;
+    const fence = this.fence();
+    if (fence.authoritySource !== 'catalog-read-epoch-v2' || fence.transaction !== false ||
+      fence.connection !== this.service.db.db || fence.connection !== registry.database.db ||
+      !['schema', 'external', 'changes', 'committed'].every(key => Number.isSafeInteger(fence[key]) && fence[key] >= 0) ||
+      registry.catalogReadEpoch.read(fence.connection, fence.schema) !== fence.changes) return null;
+    return fence;
+  }
+  async usageOwnership(ctx, life) {
+    const fence = this.retainedUsageFence(), retained = this.usageInventory;
+    if (fence && retained?.life === life && sameCatalogSqlInputs(retained.fence, fence)) {
+      const renewed = !sameFence(retained.fence, fence);
+      ctx.usageInventoryState = renewed ? 'certified-external' : 'certified-hit';
+      if (renewed) ctx.usageFenceChanged = ['external'];
+      this.counters.usageInventoryHits++;
+      return renewed ? { ...retained, fence } : retained;
+    }
+    ctx.usageInventoryState = !fence ? 'uncertified' : retained ? 'fence-changed' : 'cold';
+    // Fixed field names only, no paths/metadata/payload. Distinguish actual SQL
+    // input revision, other-connection writes and commit/schema changes.
+    if (fence && retained) ctx.usageFenceChanged = ['connection', 'schema', 'external', 'changes', 'committed', 'transaction', 'authoritySource']
+      .filter(key => fence[key] !== retained.fence[key]);
+    this.usageInventory = null; this.counters.usageInventoryBuilds++;
+    const owners = new Map(), scopeOrder = new Map(), scopes = await this.scopes(ctx.control);
+    let nextScope = 0;
+    for (const scope of scopes) {
+      const kind = this.service.rootRegistry ? 'tab' : 'project', id = scope.tabId || scope.id;
+      const order = nextScope++;
+      if (!scopeOrder.has(scope.tabId)) scopeOrder.set(scope.tabId, order);
+      const sources = await this.catalogSources(kind, id, ctx), refs = [];
+      for (const source of sources) {
+        let use = owners.get(source.rootPath);
+        if (!use) owners.set(source.rootPath, use = { projectIds: new Set(), projectRanks: new Map(),
+          reconcileProjectIds: new Set(), tabs: new Map(), merged: false });
+        use.reconcileProjectIds.add(source.projectId || scope.id);
+        refs.push({ use, projectId: source.projectId });
+      }
+      const project = kind === 'project' ? this.service.db.getProjectById(id) : null;
+      if (kind === 'project' && !project) throw Object.assign(Error('project_not_found'), { code: 'project_not_found' });
+      for (const { use, projectId } of refs) {
+        await ctx.control.step('map', () => {
+          if (this.service.rootRegistry) {
+            use.tabs.set(scope.tabId, { id: scope.tabId, name: scope.name || scope.tabId });
+            if (projectId) {
+              use.projectIds.add(projectId);
+              if (!use.projectRanks.has(projectId)) use.projectRanks.set(projectId, order);
             }
-          });
-        }
+          } else {
+            use.projectIds.add(project.id);
+            if (!use.projectRanks.has(project.id)) use.projectRanks.set(project.id, order);
+          }
+        });
+      }
+    }
+    return { owners, scopeOrder, fence, life };
+  }
+  usageSnapshot() {
+    const life = this.lifetime, current = this.usageFlight;
+    // A changed DB hint cannot make a second concurrent inventory any fresher:
+    // the existing reader already revalidates/re-passes, and EVERY recipient
+    // checks its final fence and source tokens after filtering/diagnostics.
+    if (current && current.life === life) return current.promise;
+    const flight = { life, promise: null };
+    flight.promise = this.request('catalog.usageInventory', async ctx => {
+      // SQL ownership has its own complete authority proof. A slow/failed FS
+      // preparation cannot force all tab headers through the same SQL again.
+      const inventory = await this.request('catalog.usageOwners', async ownerContext => {
+        const value = await this.usageOwnership(ownerContext, life);
+        ctx.usageInventoryState = ownerContext.usageInventoryState;
+        ctx.usageFenceChanged = ownerContext.usageFenceChanged;
+        return value;
+      });
+      if (this.closed || life !== this.lifetime) throw error('prompt_catalog_changed');
+      const fence = this.retainedUsageFence();
+      this.usageInventory = fence && sameCatalogSqlInputs(inventory.fence, fence)
+        ? (sameFence(inventory.fence, fence) ? inventory : { ...inventory, fence }) : null;
+      const { owners, scopeOrder } = inventory;
+      // Retain only SQL owners, never a ready-path or physical-source result.
+      // Each configured spelling still gets current FS/layout/watch/policy proof.
+      for (const [root, use] of owners) {
+        if (this.service.rootRegistry) for (const tabId of use.tabs.keys())
+          await ctx.control.step('map', () => this.slot(root).tabIds.add(tabId));
+        await this.view(root, ctx);
       }
       if (ctx.availability) throw ctx.availability;
-      const entries = await stableSort(byPath.entries(), ([a], [b]) => naturalCompare(a, b), ctx.control), output = [];
+      // Usage exposes paths and provenance, not authoring IDs/content/arrays.
+      // Enumerate complete physical metadata once per configured source, then
+      // reuse its immutable private owners across paths. Overlapping sources
+      // merge exact owners and retain the original global scope order.
+      const byPath = new Map();
+      for (const [root, use] of owners) for (const prompt of ctx.views.get(root)?.ready?.metadata.prompts || []) {
+        await ctx.control.step('map', () => {
+          const prior = byPath.get(prompt.path);
+          if (!prior) byPath.set(prompt.path, use);
+          else if (prior !== use) {
+            const projectRanks = new Map(prior.projectRanks);
+            for (const [id, rank] of use.projectRanks) projectRanks.set(id, Math.min(projectRanks.get(id) ?? Infinity, rank));
+            byPath.set(prompt.path, { projectIds: new Set([...prior.projectIds, ...use.projectIds]), projectRanks,
+              tabs: new Map([...prior.tabs, ...use.tabs]), merged: true });
+          }
+        });
+      }
+      return { byPath, scopeOrder, inventory, tokens: new Map(ctx.tokens), fence: this.fence(), life };
+    }).finally(() => { if (this.usageFlight === flight) this.usageFlight = null; });
+    this.usageFlight = flight;
+    return flight.promise;
+  }
+  usage(root) {
+    return this.request('catalog.usageForRoot', async ctx => {
+      const wanted = await this.canonical(root, ctx), snapshot = await this.usageSnapshot();
+      ctx.usageSnapshots.push(snapshot);
+      // Joined recipients cannot inherit even the flight's physical observations.
+      for (const sourceRoot of snapshot.inventory.owners.keys()) await this.view(sourceRoot, ctx);
+      if (ctx.availability) throw ctx.availability;
+      const selected = [];
+      for (const entry of snapshot.byPath) {
+        // Physical leaf/alias observations remain request-local. The shared
+        // inventory contains metadata/owners, not a completed realpath cache.
+        const canonical = await this.canonical(entry[0], ctx);
+        await ctx.control.step('map', () => {
+          if (this.service.inside(wanted, canonical)) selected.push(entry);
+        });
+      }
+      const entries = await stableSort(selected, ([a], [b]) => naturalCompare(a, b), ctx.control), output = [];
       for (const [file, use] of entries) {
-        const projects = await stableSort(this.service.rootRegistry ? use.projects.values() : use, (a, b) => naturalCompare(a.name, b.name), ctx.control);
+        const found = new Map(), ranks = new Map();
+        for (const id of use.projectIds) await ctx.control.step('authority', () => {
+          if (!ctx.projects.has(id)) ctx.projects.set(id, this.service.db.getProjectById(id));
+          const project = ctx.projects.get(id);
+          if (project) {
+            found.set(project.id, { id: project.id, name: project.name, icon: project.icon || null });
+            ranks.set(project.id, Math.min(ranks.get(project.id) ?? Infinity, use.projectRanks.get(id)));
+          }
+        });
+        const projects = await stableSort(found.values(), (a, b) => naturalCompare(a.name, b.name)
+          || ranks.get(a.id) - ranks.get(b.id), ctx.control);
         const tabs = [];
-        if (this.service.rootRegistry) for (const tab of use.tabs.values()) await ctx.control.step('map', () => tabs.push(tab));
+        const orderedTabs = use.merged ? await stableSort(use.tabs.values(), (a, b) =>
+          snapshot.scopeOrder.get(a.id) - snapshot.scopeOrder.get(b.id), ctx.control) : use.tabs.values();
+        if (this.service.rootRegistry) for (const tab of orderedTabs) await ctx.control.step('map', () => tabs.push({ ...tab }));
         await ctx.control.step('map', () => output.push({ path: file, projects, ...(this.service.rootRegistry ? { tabs } : {}) }));
       }
       return output;
@@ -529,7 +749,17 @@ class PreparedPromptCatalog {
         wanted.clear(); before = this.fence();
         if (before.transaction) throw error('prompt_catalog_changed');
         const ctx = { control, reader: this.service.rootRegistry?.createSourcesReader?.() };
-        for (const scope of await this.scopes(control)) {
+        const certificate = this.retainedUsageFence(), retained = this.usageInventory;
+        const retainedOwners = certificate && retained?.life === life && sameFence(before, certificate)
+          && sameCatalogSqlInputs(retained.fence, certificate) && [...retained.owners.values()]
+            .every(use => use.reconcileProjectIds instanceof Set) ? retained.owners : null;
+        if (retainedOwners) for (const [root, use] of retainedOwners) {
+          const owner = { tabs: new Set(), projects: new Set() };
+          for (const tabId of use.tabs.keys()) await control.step('authority', () => owner.tabs.add(tabId));
+          for (const projectId of use.reconcileProjectIds) await control.step('authority', () => owner.projects.add(projectId));
+          wanted.set(root, owner);
+        }
+        else for (const scope of await this.scopes(control)) {
           const rows = await this.readRows(this.service.rootRegistry ? 'tab' : 'project', scope.tabId || scope.id, ctx);
           for (const row of rows) {
             if (this.service.rootRegistry && row.enabled !== true) continue;
@@ -581,6 +811,7 @@ class PreparedPromptCatalog {
   close() {
     if (this.closed) return;
     this.closed = true; this.lifetime++; this.queue.length = 0;
+    this.usageFlight = null; this.usageInventory = null;
     for (const entry of [...this.watchers.values()]) this.retire(entry);
     for (const slot of this.slots.values()) if (slot.timer) clearTimeout(slot.timer);
     this.slots.clear();

@@ -1,12 +1,17 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import {
   claimPaneTabDragDrop,
+  paneTabGroupDragIsCurrent,constrainPaneTabGroupTarget,
   type PaneTabDragSource,
   type PaneTabDropTarget,
 } from './paneTabDragBridge';
 import { isSamePaneDrop } from './paneTabDropIdentity.mjs';
 
 export function commitPaneTabDrop(source: PaneTabDragSource, target: PaneTabDropTarget) {
+  if(!paneTabGroupDragIsCurrent(source))return false;
+  const constrained=constrainPaneTabGroupTarget(source,target);
+  if(!constrained)return false;
+  target=constrained;
   const store = useWorkspaceStore.getState();
   let shownTabId = source.rootTabId;
   // Reordering inside one strip changes order only. Crossing into another
@@ -30,6 +35,7 @@ export function commitPaneTabDrop(source: PaneTabDragSource, target: PaneTabDrop
     source.entries,
     target.at,
     shownTabId,
+    target,
   );
 }
 

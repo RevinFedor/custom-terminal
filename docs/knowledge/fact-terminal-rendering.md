@@ -326,6 +326,15 @@ caches удалены, проверенные archives сохраняют origin
 Рекомендация: не менять default ради RAM/idleCPU; faster cold Send заслуживает
 отдельной полноценной совместимости. Benchmark завершён, rollout не выполнен.
 
+Отдельный upstream audit17Oct для exact0.162/0.163 нашёл compact activity path
+owned fullscreen transcript: patch preview ограничен3строками, полный diff
+остаётся в expanded/display/raw путях. Это не universal hide-diff switch и не
+измерение цены giant diff;9Oct benchmark выше его отключение не проверял.
+Managed launch Noted передаёт `--no-alt-screen`; preference fullscreen_transcript
+сама этот argv не отменяет. `/raw` меняет scrollback presentation, не выключает
+patch output. Точные source commits/blobs и предел проверки —
+[UPSTREAM17Oct](</private/tmp/noted-giant-diff-implementation-20261017.45i0U9/giant-diff-audit-20261017/UPSTREAM.ru.md>).
+
 ## 1. Ink/TUI Render Tearing & Synchronized Output (Input Jitter)
 **Файл-источник:** `fix-ink-tui-render-tearing.md`, `fix-terminal-jitter.md`
 

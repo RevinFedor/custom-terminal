@@ -15,6 +15,52 @@ import {
 const codexInfo = { tabId: 'tab-codex', engine: 'codex', sessionId: 'session-codex' };
 const claudeInfo = { tabId: 'tab-claude', engine: 'claude', sessionId: 'session-claude' };
 
+function manualGoalState() {
+  return syncSessionStartingWithPresence(null, codexInfo, {
+    status: 'active', inputReady: false, manualActionRequired: true,
+    lastNotReady: { reason: 'codex_resume_goal_action_required', message: 'Complete Goal choice' },
+  });
+}
+
+for (const status of ['unknown', 'starting']) test('handled Goal loses only its manual presentation while readiness stays ' + status, () => {
+  const old = manualGoalState();
+  const next = syncSessionStartingWithPresence(old, codexInfo, {
+    status, inputReady: false, manualActionRequired: false,
+    runtimePolicy: { type: 'resume-goal', phase: 'handled' },
+    lastNotReady: { reason: 'process_lookup_unknown', message: 'Process proof unavailable' },
+  });
+  assert.notEqual(next.manualActionRequired, true);
+  assert.equal(next.lastNotReady.reason, 'process_lookup_unknown');
+  assert.equal(next.startupFailed, false);
+  assert.equal(next.inputReady, undefined, 'presentation must not manufacture input proof');
+  assert.equal(old.manualActionRequired, true, 'retain the previous immutable value');
+});
+
+test('unknown/manual/confirming Goal never loses its explanation merely because process proof is unavailable', () => {
+  for (const runtimePolicy of [undefined, { type: 'resume-goal', phase: 'manual' },
+    { type: 'resume-goal', phase: 'confirming' }, { type: 'usage-exhaustion', phase: 'handled' }]) {
+    const next = syncSessionStartingWithPresence(manualGoalState(), codexInfo, {
+      status: 'unknown', inputReady: false, manualActionRequired: false, runtimePolicy,
+    });
+    assert.equal(next.manualActionRequired, true);
+  }
+  const noExplicitFalse = syncSessionStartingWithPresence(manualGoalState(), codexInfo, {
+    status: 'unknown', runtimePolicy: { type: 'resume-goal', phase: 'handled' },
+  });
+  assert.equal(noExplicitFalse.manualActionRequired, true);
+});
+
+test('handled Goal does not replace a rejected launch, foreign target or another manual action', () => {
+  const presence = { status: 'unknown', manualActionRequired: false,
+    runtimePolicy: { type: 'resume-goal', phase: 'handled' } };
+  const rejected = { ...manualGoalState(), launchPreparationStatus: 'rejected', startupError: 'E' };
+  assert.equal(syncSessionStartingWithPresence(rejected, codexInfo, presence), rejected);
+  const old = manualGoalState();
+  assert.equal(syncSessionStartingWithPresence(old, { ...codexInfo, tabId: 'other' }, presence), old);
+  const auth = { ...old, lastNotReady: { reason: 'codex_auth_required' } };
+  assert.equal(syncSessionStartingWithPresence(auth, codexInfo, presence).manualActionRequired, true);
+});
+
 test('live unhandled Codex policy is a static dismissible explanation, cleared by later readiness', () => {
   const state = syncSessionStartingWithPresence({ ...codexInfo, since: 1 }, codexInfo, {
     status: 'active', inputReady: false, manualActionRequired: true,

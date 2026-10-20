@@ -1,7 +1,7 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Copy, ChevronLeft, ChevronRight, Link2, MessageSquareQuote } from 'lucide-react';
+import { Copy, ChevronLeft, ChevronRight, Link2, MessageSquareQuote, Loader2 } from 'lucide-react';
 import { loadPickerPromptCatalog, promptCatalogChangeAffectsTarget, observePreparedPromptCatalog, preparedCatalogStatusText } from './promptTabSourcesModel.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -842,7 +842,8 @@ const PromptPickerOverlay: React.FC = () => {
   const projectCatalog: ProjectPromptCatalog | null = currentCatalogState.status === 'ready' ? currentCatalogState.data : null;
   const projectReady = currentCatalogState.status === 'ready';
   const projectTarget = organizationReady ? !!pickerTabId : !!pickerProjectId;
-  const projectLabel = projectCatalog?.project || {id:organizationReady?`tab:${pickerTabId}`:pickerProjectId || '',name:organizationReady?'Промпты рабочего пространства':'Промпты проекта',icon:null};
+  const projectLabel = projectCatalog?.project || {id:organizationReady?`tab:${pickerTabId}`:pickerProjectId || '',name:organizationReady?'Workflow':'Промпты проекта',icon:null};
+  const catalogPreparing = ['cold', 'preparing', 'stale'].includes(currentCatalogState.status);
   const catalogStatusText = preparedCatalogStatusText(currentCatalogState);
   const loaded = libraryLoaded;
   const cascadeOpensLeft = anchor.mode === 'point' && openLeftRef.current;
@@ -1440,7 +1441,7 @@ const PromptPickerOverlay: React.FC = () => {
     : LEFT_W + GAP + RIGHT_W + PANEL_PAD * 2;
   const estH = contextMode
     ? Math.ceil(fontSize * 1.3 + ROW_PAD_Y * 2) * 2 + PANEL_PAD * 2 + 2
-    : MAX_H;
+    : Math.ceil(fontSize * 1.3 + ROW_PAD_Y * 2) * Math.max(1, flatLeft.length) + PANEL_PAD * 2 + 2;
 
   const queueContextGeometryRefresh = useCallback(() => {
     if (!contextMode || contextGeometryRafRef.current !== null) return;
@@ -1699,14 +1700,14 @@ const PromptPickerOverlay: React.FC = () => {
     boxShadow: '0 10px 26px rgba(0,0,0,0.45)',
     padding: PANEL_PAD,
   };
-  const pointConstrainedPanelStyle: React.CSSProperties = (
-    !contextMode
-    && anchor.mode === 'point'
-    && pos?.pointAvailableHeight != null
-    && pos.measuredWithLoadedContent === loaded
-  )
-    ? { maxHeight: Math.max(1, Math.min(MAX_H, pos.pointAvailableHeight)) }
-    : {};
+  // Prompt columns grow to their contents. The root/Scripts menu keeps its
+  // existing profile; neither the460px cap nor point-anchor availability may
+  // turn a prompt column into an internal scroller.
+  const promptPanelStyle: React.CSSProperties = {
+    ...panelStyle,
+    maxHeight: 'none',
+    overflowY: 'visible',
+  };
 
   const rowStyle = (
     selected: boolean,
@@ -2019,8 +2020,7 @@ const PromptPickerOverlay: React.FC = () => {
         <div
           ref={leftPanelRef}
           style={{
-            ...panelStyle,
-            ...pointConstrainedPanelStyle,
+            ...promptPanelStyle,
             width: LEFT_W,
             position: 'relative',
             ...contextFirstPanelPositionStyle,
@@ -2068,15 +2068,16 @@ const PromptPickerOverlay: React.FC = () => {
                   title={!projectReady ? currentCatalogState.error?.message || catalogStatusText : undefined}
                 >
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
-                    {item.project.icon ? (
+                    {catalogPreparing ? (
+                      <span data-workflow-prompt-loader className="animate-spin noted-infinite-animation" style={{ display: 'inline-flex', width: 15, height: 15, flexShrink: 0 }}>
+                        <Loader2 size={15} strokeWidth={1.8} />
+                      </span>
+                    ) : item.project.icon ? (
                       <img data-project-icon={item.project.id} src={item.project.icon} alt="" style={{ width: 15, height: 15, borderRadius: 4, objectFit: 'cover' }} />
                     ) : (
                       <MessageSquareQuote size={15} strokeWidth={1.8} />
                     )}
-                    <span style={{minWidth:0}}>
-                      <span style={{display:'block',overflow:'hidden',textOverflow:'ellipsis'}}>{item.project.name}</span>
-                      {!projectReady && <span style={{display:'block',fontSize:Math.max(9,fontSize-2),color:'#999'}}>{catalogStatusText}</span>}
-                    </span>
+                    <span style={{minWidth:0,overflow:'hidden',textOverflow:'ellipsis'}}>{item.project.name}</span>
                   </span>
                   {renderCascadeChevron()}
                 </div>
@@ -2182,7 +2183,7 @@ const PromptPickerOverlay: React.FC = () => {
       {promptLibraryVisible && contextMode && (selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
           <div
             ref={rightPanelRef}
-            style={{ ...panelStyle, width: RIGHT_W, ...contextRightPanelPositionStyle }}
+            style={{ ...promptPanelStyle, width: RIGHT_W, ...contextRightPanelPositionStyle }}
           >
             {renderPromptPanelResizeHandle('secondary')}
             {selectedLeftItem?.kind === 'project' && !projectReady && <div style={placeholderStyle} title={currentCatalogState.error?.code}>{catalogStatusText}</div>}
@@ -2230,7 +2231,7 @@ const PromptPickerOverlay: React.FC = () => {
       {promptLibraryVisible && !contextMode && (
         <div style={rightWrapperStyle}>
           {(selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
-            <div ref={rightPanelRef} style={{ ...panelStyle, ...rightPanelPositionStyle }}>
+            <div ref={rightPanelRef} style={{ ...promptPanelStyle, ...rightPanelPositionStyle }}>
               {renderPromptPanelResizeHandle('secondary')}
               {selectedLeftItem?.kind === 'project' && !projectReady && <div style={placeholderStyle} title={currentCatalogState.error?.code}>{catalogStatusText}</div>}
               {rightPrompts.length > 0 && rightPrompts.map((p, i) => {

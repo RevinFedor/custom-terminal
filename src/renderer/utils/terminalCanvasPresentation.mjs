@@ -91,6 +91,39 @@ export function retainXtermViewportPresentation(term, isPresented) {
       if (viewport._ignoreNextScrollEvent) viewport._handleScroll();
     } finally { flushing = false; }
   };
+  // SelectionService still emits every redraw/selection/copy signal. Only a
+  // fully-cleared visual projection of a ready hidden terminal may coalesce.
+  // This same predicate admits prewarm; a fresh renderer always gets one pass.
+  const render = term?._core?._renderService;
+  const state = render?._selectionState;
+  const selectionChange = render && typeof render.handleSelectionChanged === 'function'
+    && render._renderer && state && ['start', 'end', 'columnSelectMode'].every(key => key in state)
+    ? render.handleSelectionChanged : null;
+  let selectionRenderer = null, selectionDirty = false;
+  if (selectionChange) render.handleSelectionChanged = function projectSelection(start, end, columnSelectMode) {
+    if (disposed) return;
+    const renderer = this._renderer?.value;
+    if (this === render && renderer && renderer === selectionRenderer
+      && start === undefined && end === undefined && !isPresented()) {
+      // These are exactly the three logical writes in xterm5.5 RenderService.
+      // Nonempty/partial/zero-length selections use upstream unchanged.
+      this._selectionState.start = start;
+      this._selectionState.end = end;
+      this._selectionState.columnSelectMode = columnSelectMode;
+      selectionDirty = true;
+      return;
+    }
+    const result = selectionChange.apply(this, arguments);
+    if (this === render) { selectionRenderer = renderer; selectionDirty = false; }
+    return result;
+  };
+  const flushSelection = () => {
+    if (!selectionDirty || !render?._renderer?.value) return;
+    const renderer = render._renderer.value, latest = render._selectionState;
+    selectionChange.call(render, latest.start, latest.end, latest.columnSelectMode);
+    selectionRenderer = renderer;
+    selectionDirty = false;
+  };
   // A queued/clamped/reparented DOM scroll must not feed the old pixel offset
   // back into a newer buffer. Reconcile before xterm's bound scroll listener;
   // keep that listener and its native compensation/scroll notifications intact.
@@ -101,11 +134,12 @@ export function retainXtermViewportPresentation(term, isPresented) {
     dispose() {
       disposed = true;
       dirty = false;
+      selectionDirty = false; selectionRenderer = null;
       cancelFrame();
       element.removeEventListener('scroll', reconcileScroll, true);
       // Keep closed guards on the retired instance: constructor/reset callbacks
       // can still arrive late. Never redirect them to a replacement terminal.
     },
   });
-  return { sync() { if (!disposed && isPresented()) flush(true); } };
+  return { sync() { if (!disposed && isPresented()) { flush(true); flushSelection(); } } };
 }

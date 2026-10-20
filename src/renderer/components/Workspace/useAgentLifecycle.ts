@@ -43,8 +43,13 @@ import {
 } from '../../utils/codexSurfaceReadIdentityStore.mjs';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
 import { reconcileRestoredInterruptedTab } from '../../utils/interruptedAutoRestore.mjs';
+import { createCodexGoalDesktopAdapter, watchCodexGoalDesktop, projectCodexGoalLifecycle } from '../../utils/codexGoalDesktopAdapter.mjs';
 
 const { ipcRenderer } = window.require('electron');
+const codexGoalDesktop = createCodexGoalDesktopAdapter({
+  invoke: (channel: string, request: any) => ipcRenderer.invoke(channel, request),
+  log: (message: string) => console.warn(message),
+});
 
 export type AgentLifecycleEngine = 'claude' | 'codex';
 
@@ -283,6 +288,13 @@ export function useAgentLifecycle({
   const dismissedKeysRef = useRef<Set<string>>(new Set());
   const [sessionStarting, setSessionStarting] = useState<SessionStartingState | null>(null);
   const [agentStopping, setAgentStopping] = useState<AgentStoppingState | null>(null);
+  const [goalState, setGoalState] = useState<any>(null);
+
+  useEffect(() => {
+    setGoalState(null);
+    if (!enabled || target?.engine !== 'codex') return;
+    return watchCodexGoalDesktop(codexGoalDesktop, ipcRenderer, target.tabId, target.sessionId, setGoalState);
+  }, [enabled, target]);
 
   useEffect(() => {
     targetRef.current = target;
@@ -752,7 +764,7 @@ export function useAgentLifecycle({
   // exact launch, that current transaction is more informative than the old
   // persisted `wasInterrupted` marker. The marker remains durable on failure
   // for the next app start, but it renders no summary of its own (see above).
-  return useMemo<AgentLifecycleSummary | null>(() => {
+  const lifecycle = useMemo<AgentLifecycleSummary | null>(() => {
     if (!enabled || !tabId) return null;
     if (agentStopping && agentStopping.tabId === tabId) {
       const engineLabel = agentStopping.engine === 'codex' ? 'CODEX' : 'CLAUDE';
@@ -780,6 +792,13 @@ export function useAgentLifecycle({
         title: presentation.title,
         description: presentation.subtitle,
         detail: presentation.detail,
+        goalControlsBlocked: sessionStarting.launchPreparing === true || sessionStarting.startupPending === true
+          || /auth-required|usage-exhaustion|trust-directory|cwd-chooser/.test(
+            [sessionStarting.lastNotReady?.reason, ...(sessionStarting.lastNotReady?.blockers || [])].join(' ')),
+        goalOperationId: sessionStarting.engine === 'codex'
+          && (sessionStarting.lastNotReady?.blockers?.includes('resume-goal')
+            || String(sessionStarting.lastNotReady?.reason || '').startsWith('codex_resume_goal_'))
+          ? sessionStarting.lastNotReady?.operationId : undefined,
         copyText: sessionStarting.engine === 'claude' && sessionStarting.startupFailed
           ? formatClaudeStartupFailureReport({ tabId: sessionStarting.tabId, sessionId: sessionStarting.sessionId,
             generation: sessionStarting.startupGeneration, attemptId: sessionStarting.startupAttemptId,
@@ -797,4 +816,14 @@ export function useAgentLifecycle({
       title: 'СОЗДАНИЕ ФОРКА…', description: 'Подготовка истории новой вкладки', spinner: true };
     return null;
   }, [agentStopping, creatingFork, enabled, handleDismiss, handleRetry, sessionStarting, tabId, target?.engine]);
+  if (!enabled || target?.engine !== 'codex' || goalState?.tabId !== target.tabId
+    || goalState?.owner?.sessionId && target.sessionId && goalState.owner.sessionId !== target.sessionId) return lifecycle;
+  return projectCodexGoalLifecycle(lifecycle, goalState, {
+    onChoose: (action: 'resume' | 'leave-paused') => {
+      if (targetRef.current !== target) return;
+      void codexGoalDesktop.choose(target.tabId, target.sessionId, goalState.operationId, action);
+    },
+    onRefresh: () => { void codexGoalDesktop.refresh(target.tabId); },
+    onDismiss: () => { codexGoalDesktop.dismiss(target.tabId, goalState.operationId); },
+  });
 }

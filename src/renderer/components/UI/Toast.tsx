@@ -148,7 +148,10 @@ function PaneToasts({
   // render. Cheap (one query), and it cannot go stale.
   const [anchor, setAnchor] = React.useState<HTMLElement | null>(null);
   React.useEffect(() => {
-    setAnchor(document.querySelector<HTMLElement>(`[data-toast-anchor-tab-id="${tabId}"]`));
+    const indexed = document.getElementById(`terminal-toast-anchor:${tabId}`);
+    setAnchor(indexed?.dataset.toastAnchorTabId === tabId
+      ? indexed
+      : document.querySelector<HTMLElement>(`[data-toast-anchor-tab-id="${tabId}"]`));
   }, [tabId, toasts.length]);
   if (!anchor || toasts.length === 0) return null;
   return createPortal(

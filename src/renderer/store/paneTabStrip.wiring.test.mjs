@@ -412,7 +412,7 @@ test('vacant pane keeps parked chips visible in its header, with no shown owner'
     'canonical chrome reads parked entries from the exact pane layout');
   assert.match(header, /if \(!tabExists && !vacant\) return null/);
   assert.match(header, /shownTabId=\{vacant \? '' : tabId\}/);
-  assert.match(header, /data-vacant-pane-label/);
+  assert.doesNotMatch(header, /data-vacant-pane-label/);
 });
 
 test('Cmd+T окна открывает МЕСТО выбора там, где стоит человек', () => {

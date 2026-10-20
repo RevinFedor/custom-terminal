@@ -48,6 +48,35 @@ draft/modelchange контракт этим не закрыт. Цифры/мет
 [`fact-terminal-rendering.md`](fact-terminal-rendering.md), «Codex0.162 fullscreen
 против inline». Default и продуктовый source в этом исследовании не менялись.
 
+## Перенос из Terminal.app и блокировка общего daemon
+
+Codex0.163 может подключать обычные CLI к одному локальному app-server daemon.
+Это не MCP hub и не proxy. Exact release `tui/src/daemon_startup.rs::config_exclusion`
+исключает такой reuse при произвольных `-c`: Noted передаёт `tui.whimsy`,
+`openai_base_url` и effort, поэтому его обычный запуск использует отдельное ядро.
+Proxy при этом нужен прежнему live History producer; убирать его ради подключения
+к daemon означает менять существующую интеграцию, а не освобождать разговор.
+
+`This conversation is open in another app` после выхода из старого интерфейса
+может означать живого фонового writer. В инциденте20.10/4196 `lsof` подтвердил
+rollout и `thread-writer-locks/<SID>.lock` у daemon, `thread/read` — idle.
+Idle не означает отсутствия владельца; documented unload после последнего
+subscriber занимает30min. Штатный restart23389→14072 не освободил4196:
+новый daemon снова загрузил тот же SID. Причина его повторной загрузки отдельно
+не установлена. Текущий диагностический CLI тоже оказался клиентом daemon:
+его собственный restart прервал turn и пришёл как `daemon_recovery`.
+
+Проверенное разовое восстановление4196: через живой app-server API временно
+archive→unarchive, затем native Terminal MCP `start_ai`. Archive затрагивает
+потомков: до него подтверждены idle root, paused Goal, отсутствие background
+terminals и полная выборка19unarchived descendants (все notLoaded); после него
+восстановлены ровно эти19 и root, сверены IDs/paths/cwd/name и неизменный Goal.
+Ранее archived потомки не восстанавливались. До запуска root стал notLoaded;
+после — exact writer под Noted PTY и live running turn. Это scoped recovery,
+не автоматический обход любого lock: неизвестный ACK требует восстановления
+по сохранённому перечню и квитанциям, не повторного archive или restart всех.
+JSONL/lock вручную не удалять; fallback `agent_ready_timeout` не первопричина.
+
 ## Открытое ядро без TUI: граница возможной интеграции
 
 В upstream Codex 0.159.3 есть `codex-core-api` и `thread-manager-sample`:
@@ -813,7 +842,10 @@ revision/action sequence. Изменение сохраняет исходный
 
 Codex0.162 (`c1382380`) сохраняет `thread_goal_updated` с точным threadId,
 optional turnId и состоянием Goal. `on_turn_stop` выполняется до `task_complete`,
-а после него `on_thread_idle` может запустить продолжение active Goal. Поэтому
+но новый Goal update не гарантирован: accounting публикует `Updated`, а не
+`Unchanged`/отсутствующий progress snapshot. `on_thread_idle` может запустить
+продолжение active Goal; его durable `task_started.turn_attribution.turn_trigger`
+равен `goal`. Поэтому
 финальный ответ и успешный `task_complete` доказывают конец этого хода, не всей
 цели. Источники: `ext/goal/src/extension.rs`, `core/src/tasks/mod.rs`,
 `rollout/src/policy.rs` exact upstream tag; старый локальный HEAD не заменяет tag.
@@ -826,8 +858,14 @@ optional turnId и состоянием Goal. `on_turn_stop` выполняет�
 Current turn, Goal lifetime и результат delivery остаются разными фактами;
 точная текущая стадия ремонта — в `docs/tmp/план-стабилизация-ai-состояний.md`.
 
-Source10.10: `codex-goal-work.js` читает typed Goal из того же ordered watcher,
-только для совпадающих physical thread/turn. `goalWork` v1 сопровождает результат
+Source10.10 с уточнением19.10: `codex-goal-work.js` читает typed Goal и явный native
+Goal trigger из того же ordered watcher, с прежним physical source owner. Только
+Goal-trigger разрешает перенести прежний active status в новый turn без нового
+update; без известного статуса этот trigger даёт pending/attention, не успех.
+Обычный новый turn старую Goal не наследует. No-turn update допускается по exact
+thread и текущей byte boundary; malformed explicit turn не равен omitted turn,
+старый callback или update до текущей turn boundary не вытесняет новое доказательство.
+`goalWork` v1 сопровождает результат
 хода и cold-tail/suppressed snapshot; не меняет `busy`, final text, inputReady
 или delivery. Active даёт continuing; paused/blocked/лимиты — attention, не
 natural whole-work success. Complete освобождает прежний completion flow.
@@ -840,7 +878,25 @@ blocker между ходами, не увеличивая число child-пр
 по-прежнему гасит свой Loop даже при продолжающейся native Goal, но не выпускает
 обычную очередь. Default response-observation учитывает Goal до чтения, после
 await и до fast freeze; explicit current-turn false сохраняет свой точный ответ.
+При отсутствии обоих структурированных сигналов остаётся прежний ordinary
+completion-контракт, не доказательство отсутствия Goal. Внешний clear без нового
+события не разрешает ретроспективно объявить deferred результат завершённым.
 Это source/private контракт, не новая installed/native Goal UI приёмка.
+
+19.10 собственный production Goal завершился через native tool без нового
+`thread_goal_updated complete` в rollout. Произвольный JSON tool result не стал
+новым источником статуса: Source adapter использует readonly `thread/goal/get`
+официального app-server того же установленного CLI. Один запрос после ordered
+успешного turn-end сверяет текущие SID/owner/generation/turn, Goal incarnation,
+версию, byte boundary и время обновления. Безвредное редактирование composer
+не отзывает readonly Goal observation: её отзывают существующая writer-observation
+generation, Stop, source/Rewind или новый turn. UNKNOWN/active/stale/replaced proof
+сохраняет pending без автоматического повтора. Обычный busy=false публикуется
+сразу; поздний exact complete даёт только Goal metadata wake с прежними turn и
+outcome timestamp, без второго done, readiness, ввода или foreground.
+RestartAfter/RunAfter освобождают лишь ранее наблюдённый pending end той же
+identity; Stop, новый turn и иной owner отзывают старое ожидание. Source controls
+и реальный readonly native proof отделены от следующей installed Goal приёмки.
 
 ### Goal / usage: выбор принадлежит main, клавиша не означает результат
 
@@ -874,6 +930,15 @@ Captured renderer frame различает старый/новый parser, actua
 проверяет обе политики и последующий composer без повторного Enter. Это локальная
 совместимость grammar, не потеря Goal/настройки и не новый lifecycle owner.
 Installed/native acceptance и evidence — в рабочем файле Goal.
+
+19.10 отдельный actual80×24 picker содержит остаток старого composer (`› As`)
+слева от inset-колонки меню. Это тоже давало `missing:goal` до Enter. Parser
+допускает такой underlay только вне колонки, доказанной отступом title, Goal body
+и обеими цифрами options. Внутри остаются exact labels/descriptions/footer и
+выделение; owner/run/input/current-frame guards прежние. Полный captured frame
+различает PRE/POST,94Node/E28 checks прошли. На V5 собственный production Luna
+Resume подтвердил exact choice и composer после единственного Enter; это не
+приёмка обоих manual UI actions. Текст произвольной реплики не становится Goal proof.
 
 04.10 добавлен явный recovery через Project API/Terminal MCP поверх этого же
 контроллера: Resume/Leave paused выбирается по exact operationId и requestId.
@@ -911,12 +976,24 @@ rollout — Reserve. Production25.09 12:12:43UTC tab776:
 
 Action принадлежит terminal/lifecycle/run/input и текущему полностью закрытому
 кадру. До записи repaint может отложить выбор до следующего committed frame;
-общий предел10s не продлевается перерисовками. После Enter предел подтверждения3s,
-повторной клавиши нет. Только последующий готовый composer завершает выбор.
-Неподтверждённый выбор даёт typed manual-action, живой процесс сохраняется;
-поздний настоящий composer снимает объяснение. UI/remount и таймаут HTTP не
+общий предел10s не продлевается перерисовками. После Enter выполняется одна проверка
+подтверждения через3s, повторной клавиши нет. Для Goal отсутствие нового целостного
+кадра/ошибка чтения/незавершённая redraw — `provider-result-unobserved`, не доказанный
+manual-action. Policy сохраняет confirming, явный Goal API — unknown без recovery;
+тот же unwritten Send ждёт existing committed/operational events в ИСХОДНОМ Main
+preparation scope. Нового таймера/polling/renew срока нет. Новый current committed
+same-Goal menu после проверки даёт прежний typed manual-action; недоказанное меню
+не позволяет повторить Enter. Usage exhaustion сохраняет прежний3s manual outcome.
+Только последующий готовый composer подтверждает сам выбор; exact current
+operational turn может снять runtime blocker без choiceConfirmed/delivery proof.
+Живой процесс сохраняется; поздний настоящий composer снимает объяснение. UI/remount и таймаут HTTP не
 запускают Resume/выбор заново. Desktop показывает статическую синюю информацию,
 не Starting-spinner; скрытие плашки не меняет main policy.
+
+Шрам19Oct/753: auto Goal Enter → продолжающаяся synchronized redraw6.47s → старый
+3s manual отказ Send, затем current-turn-operational1.7s позже. Сохранённый старый
+committed menu не равен текущему открытому меню. Source repair различает отсутствие
+proof и новый подтверждённый menu; cancel/Stop/expiry не оживляют старый Send.
 
 Desktop Send теперь читает тот же typed manual-action, что API waiter, и сразу
 завершает unwritten операцию с `submitted/pasteWritten/enterWritten=false`.
@@ -926,6 +1003,13 @@ info-подсказку вместо красного incident, только п�
 Unknown и post-Enter ошибки не перекрашиваются и не восстанавливаются как
 несостоявшаяся отправка. Record-without-reply, уже записавший историю до Resume,
 сохраняет собственный `historyRecorded/reopenWarning`, не возвращает её в draft.
+
+Goal-choice и process/readiness — разные оси. Положительный Main snapshot
+`resume-goal/handled` с explicit `manualActionRequired=false` снимает прежний
+manual Goal flag и старое описание, даже если process proof ещё unknown/starting.
+Иначе сохраняющие startup branches копировали старый flag и возвращали «Codex
+ждёт выбора» уже после решения. Один unknown без такого handled-proof не снимает
+плашку; input-ready, rejected launch receipt и другие manual blockers не меняются.
 
 Если после Enter тот же input-owner уже получил новый operational task_started,
 ожидание меню отступает перед существующей готовностью работающего хода. Это
@@ -1791,8 +1875,11 @@ Busy/idle не является gate синего ответа: достаточ
 Live producer держит bounded definition hashes на physical rollout observer,
 отдельно от `liveToolCalls`: accepted output удаляет обычный call раньше human
 reply. Это metadata для display proof, не pending queue/availability. Certificate
-формируется по final body после прежнего response/event pairing и проходит через
-live user projection; generic потеря поля откладывала readable вид до конца parent.
+формируется по final body после прежнего response/event pairer (включая
+single-carrier fallback) и проходит через live user projection. Explicit Codex
+не должен попадать в Claude prompt normalization при отсутствии aliases: там
+теряются certificate и буквальные answer bytes. Шрам20.10 и сохранённые границы —
+`fact-история-как-основная-поверхность.md::Сохранённый ответ на native-вопрос`.
 Whole visible native retake06 подтвердил два настоящих UI answer во время busy,
 blue Q/A до task_complete, сохранённый draft и одинаковые sourceIdentity/call/index/
 full UTF-8 body hash в live и canonical. Generated live UUID может отличаться от
@@ -1802,8 +1889,9 @@ refresh скроет сломанный live путь.
 
 ### In-process субагенты (multi_agent_v1 / collaboration)
 
-Navbar раскрытого child показывает **параметры его запуска**, а не текущие
-настройки родителя: task name остаётся в chip, сверху model/effort. В0.162
+Navbar раскрытого child показывает **model/effort его запуска**, а не текущие
+настройки родителя; Fast может подтверждаться отдельным собственным запросом
+этого child (ниже). Task name остаётся в chip, сверху model/effort. В0.162
 `sub_agent_activity(kind=started)` несёт resolved child snapshot model и
 reasoning_effort; только exact event_id+agent_thread_id дают creation metadata.
 `interacted` приходит с None и не стирает её, дальнейшая смена настроек не меняет
@@ -1832,8 +1920,32 @@ proof означает unknown, не Off. `SessionConfigured` тоже имее�
 `rollout/src/policy.rs`), не проверка конкретного живого ребёнка.
 
 В Inspector Codex Fast стоит справа от effort: priority/fast → янтарная молния
-и `Fast`, explicit default → `Fast выкл.`, отсутствие доказанного launch →
-`Fast —`. Пока initial child metadata ещё читается, рядом с `Fast` вместо прочерка
+и `Fast`, explicit default → `Fast выкл.`, отсутствие собственного подтверждения →
+`Fast —`. Сначала используется последнее наблюдённое `service_tier` собственного
+Responses-запроса ребёнка; при отсутствии такого наблюдения — прежний initial
+JSONL snapshot. Это разные поля: `requestServiceTier` не переписывает
+`launchServiceTier`, tooltip отмечает собственный запрос, model/effort остаются
+параметрами запуска. Отсутствующий/null/auto/неподдержанный tier в новом запросе
+остаётся unknown, не выдаётся за Off и не заменяется старым launch или parent Fast.
+
+HTTP/SSE и WebSocket используют прежний `provider-semantic-shadow` observer,
+без изменения отправляемых bytes/model/tools. Main допускает запись только от
+exact provider source/terminal/run/lifecycle с доказанным parent writer; нужны
+child thread и turn, subagent marker, не prewarm/compaction. Для WS сохраняются
+только bounded identity-поля handshake, не Authorization/account headers.
+Компактный request proof keyed tab+parent SID+child SID удерживается в Main
+до512 записей; старое соединение после owner replacement не обновляет его.
+Существующий `subagent:read-steps` выдаёт его только после проверки root выбранного
+child. Hook сохраняет A→B/cancel и same-valued reference equality; новых readers,
+History RPC/poll/timers/Map subscriptions нет. PTY Stop не стирает уже наблюдённую
+историческую настройку child; app restart или вытеснение cache её не восстанавливают
+из родителя/старых логов, нужен собственный новый запрос либо JSONL fallback.
+Это параметр отправленного запроса, не отдельное доказательство серверного billing
+tier и не input/busy/Send authority. `[ProviderSemanticShadow] REQUEST` пишет
+`serviceTier/tierReason/tierCapture`, включая owner/cap refusal; selected reader
+добавляет `requestTier/requestTierReason`. Тела и сырые неизвестные значения не пишутся.
+
+Пока initial child metadata ещё читается, рядом с `Fast` вместо прочерка
 стоит skeleton: прочерк означает результат «не подтверждено», не загрузку.
 Фаза привязана к exact selected owner, завершается по catch-up/EOF/error;
 первые transcript rows не завершают её досрочно, обычный tail не включает снова.
@@ -1848,6 +1960,17 @@ NEW_TASK/первый own turn не позволяют позднему Resume �
 update; raw snapshot не удерживается. Warm EOF сохраняет scalar; source
 replacement/shrink/same-size rewrite и release/A→B сбрасывают старого владельца.
 Обычный append сохраняет prefix cache; новых polling/RPC/Map subscriptions нет.
+Диагностика JSONL launch-части в `[SubagentLaunchSettings]`: `tierProof=none`
+означает отсутствие принятого initial snapshot (отдельный request proof при
+этом может уже показывать Fast), а `own-thread-settings` с
+`tierReason=tier-field-absent/tier-null/tier-unsupported-string` — собственный
+snapshot уже принят, но его значение неизвестно. Счётчики foreign/before-root,
+malformed/oversized/partial и root/sealed плюс line/offset объясняют отказ в
+существующем selected reader/prefix scan, без второго прохода или body logs.
+Первое позднее own-наблюдение фиксируется отдельными `tierFirstLate*`: это
+доказательство наличия более поздних настроек, не право выдать их за launch.
+Диагностика сбрасывается вместе с source/reader, bounded metadata учитывается
+в прежнем32MiB prefix cache; одинаковое состояние не повторяет лог на каждом EOF.
 На узком Inspector status/time/actions переносятся ниже: иначе Fast накладывался
 на Working при350px. Read-only UI/source chain проверена actual reader/Main/hook
 controls и Electron presentation350/500/1000; это не installed/provider acceptance.
@@ -2121,6 +2244,26 @@ probe. Нет повторного Send, принятия старого empty f
 deadline от renderer не принимается. Та же начатая операция после expiry получает
 остаток0, а новый самостоятельный warm Send — обычный budget. Receipt захватывается
 до ожидания physical lock/settings; новая launch/Stop не может усыновить старый wait.
+Warm не означает «старый startup deadline уже истёк»: после ready новый ACTIVE HEAD
+получает свои60s и тогда, когда старому launch осталось248ms. Удалённый payload,
+уже initialized текущий lifecycle (включая последующий picker) либо operational
+input не разрешают неявно присоединить сохранённую receipt. Точный ранее выданный
+launch ID/захваченный Main receipt по-прежнему удерживает исходный cold deadline;
+очистка всей WeakMap или удаление `Math.min` лишили бы этой защиты прежний Send.
+То же правило действует у обоих public runtime readers: `startupWait` больше
+не выдаёт старый launch ID для initialized текущего lifecycle при повторном
+закрытии input, например в picker. Иначе renderer заново закреплял его как
+якобы cold. Сам `inputReady` этим не меняется; прежний pinned caller сохраняет ID.
+Рубеж проверяют actual Main reader + SQLite preparation controls в
+`agent-send-preparation.actual.test.js`; это не provider/installed acceptance.
+После успешной служебной `/fast` Main отдельно будит прежнее Send-ожидание через
+общий readiness-change. Её Enter снимает owned slash receipt раньше результата;
+задержавшийся IPC-ответ «input занят» может прийти уже после результата. Без
+этого wake отправка ждала до deadline и затем отказывала по уже истёкшему HEAD,
+хотя CLI закончил настройку. Wake имеет status=changed, не ready: повторяются
+current owner/input/composer guards с тем же context/attempt и исходным сроком,
+без повторной `/fast` или возрождения отменённого Send. Ошибка доставки wake
+логируется, но не переписывает результат уже выполненной команды.
 Final composer guard стоит ПОСЛЕ pre-paste drain, перед image bindings и первым
 Codex paste без следующего await. Отдельно проверяются exact execution identity,
 mirror pointer/generation и input ownership; Claude capture/stash не получает
@@ -2547,7 +2690,7 @@ Ordinary send без override обходит picker, но не является 
 Для `/model` Enter разрешён только после нового committed main-frame, где
 само текущее поле точно равно принадлежащей операции короткой команде. Обычный
 sync marker занятого turn либо слово `/model` в старом выводе не являются ACK.
-Таймаут2500ms завершает ожидание caller, но не уничтожает receipt вставки;
+У unscoped settings-вызова таймаут2500ms завершает ожидание caller, но не уничтожает receipt вставки;
 общий Send с пользовательским текстом по-прежнему не получает pre-Enter ACK
 и сохраняет ordered paste+Enter. У первоначального standalone `/compact` с18.10
 свой единый Main preparation lifetime до60s (cold не продлевает original deadline):
@@ -2557,6 +2700,22 @@ repaste и не публикует final failure перед неожиданны
 Stop/manual/owner/settings/expiry отзывают будущие записи; pending после возможного
 Enter остаётся только для позднего causal outcome, не replay. Это не расширение
 всех `/model`/`/fast` waits и не перенос общего startup budget на любой post-paste.
+
+Для `/model` внутри уже принятого Send действует именно исходный preparation
+этого H/O/A, включая меньший cold deadline, а не отдельные2500ms. После одной
+служебной вставки наблюдение exact composer выполняется вне ОБЕИХ блокировок;
+возврат в ту же settings queue + PTY owner продолжает оставшиеся стадии того
+же picker с прежними target/writer/input/settings guards, не повторяет selector.
+Его cleanup/draft restore и settings activity живут до окончательного результата,
+а reader меню вооружается непосредственно перед guarded Enter: ранний6s capture
+иначе истекал бы во время законного ожидания эха. Descriptor не является applied
+ACK; associated prompt отдельно возвращается в прежний owner и повторяет guards.
+Истечение срока не превращается в новую попытку. Throw служебного Enter означает
+unknown для этой команды: без позднего Esc/ArrowUp поверх возможного submit,
+captured text/images остаются доступными через прежний draft transfer. Это не
+объяснение исторического56.8s CLI no-echo и не новый pre-Enter ACK обычного prompt.
+Actual regression — `codex-model-preparation.actual.test.js`; CLI/config leaves
+там controlled, installed подтверждение ведётся отдельно в рабочем плане.
 
 Шрам14.10 `perf35`: после Resume footer подтвердил Sol6.1/max, а Send явно
 потребовал high. Считать такой picker лишним только по одинаковой модели нельзя.
@@ -2571,7 +2730,24 @@ hasDraft и readiness-control без текста пользователя. Эт
 
 Физическое применение Fast использует live slash-command контракт, а не старый `safePasteAndSubmit(..., fast:true)`. Симптом регресса был пользовательский: кнопка выглядела как аналог смены модели, но работала медленнее и ошибочно блокировалась во время ответа. Production-отказ `codex_turn_busy` оказался нашим pre-write guard, а не ответом Codex: установленный Codex 0.145 принимает точный `/fast` как service-tier команду активного turn. Живые прогоны при `turnBusy=true` подтвердили оба acknowledgement — `Service tier set to priority` и `Service tier set to default`.
 
-Пользовательский клик при этом является tab-scoped desired state, доступным в `stopped`, `starting`, `active` и `busy`. Intent хранится с монотонной ревизией в main-owned `provider_state`; `false` является полноценным сохранённым значением. После exact footer/feedback main сравнивает intent с текущим `priority/default`: совпадение ничего не пишет, несовпадение выполняет один `/fast`. Новая ревизия, пришедшая во время TUI-транзакции, перечитывается перед следующим проходом, поэтому два ранних клика не превращаются в два слепых toggle и всегда дают состояние последнего клика. До proof кнопка сразу показывает выбранное состояние как pending. Ручной native `/fast` усыновляет точный feedback как новое желаемое состояние, иначе durable intent немедленно отменял бы ручной выбор.
+Пользовательский клик при этом является tab-scoped desired state, доступным в `stopped`, `starting`, `active` и `busy`, включая ещё выполняющуюся смену модели или Send. Intent хранится с монотонной ревизией в main-owned `provider_state`; `false` является полноценным сохранённым значением. После exact footer/feedback main сравнивает intent с текущим `priority/default`: совпадение ничего не пишет, несовпадение выполняет один `/fast`. Последний intent и exact tier/owner проверяются снова после ожидания очереди, composer read и перед paste/Enter: одного решения «нужен toggle» до await недостаточно. Изменённый ещё не отправленный выбор не выполняется ради последующего обратного toggle; после уже ушедшего Enter настоящий ответ сохраняется, затем применяется последний выбор. До proof кнопка показывает выбранное состояние как pending. Ручной native `/fast` усыновляет точный feedback как новое желаемое состояние, иначе durable intent немедленно отменял бы ручной выбор.
+
+**Fast при запуске — выбор Noted, а не наследование CLI.** Native `/fast` может
+сохранить режим вне вкладки и повлиять на следующий процесс. Поэтому у managed
+Start/Resume/Fork отсутствие отдельного app intent означает normal speed; старый
+явный boolean сохраняется. Последний выбор читается у shell write и передаётся
+явным `service_tier="default"` либо `"fast"` override, не правкой глобального
+config. Если RAM hydration не дала intent, перед default читается ровно эта
+DB-строка: сохранённые on/off сохраняют revision, malformed/read failure — unknown,
+не permission перезаписать выбор значением off. Аргумент не становится runtime
+proof: footer/feedback остаются обязательны.
+Иначе вкладка без выбранного Fast могла стартовать priority, а reconciler вообще
+не запускался из-за отсутствующего intent. Main проверяет point-write чтением
+той же строки: swallowed DB failure не подтверждает сохранение нового клика.
+Если native Fast уже применился, ошибка persistence не отменяет наблюдённый факт
+и более новый RAM intent; она остаётся явной диагностикой, не поводом undo/replay.
+Model/Effort, FIFO/UNKNOWN и readiness имеют прежних владельцев. Повторная сверка
+Fast будится существующими ready/settings-settled событиями, без polling.
 
 Разрешение узкое: во время streaming composer обязан быть доказанно пустым; реальный draft блокирует Fast, потому что `Ctrl+C` ради временного stash остановит текущий ответ. `hasDraft=null` также fail-closed. На idle live-процессе `hasDraft=true` по-прежнему можно stash'ить через native `Ctrl+C` и восстановить `ArrowUp`. Main повторяет current-frame и turn-state прямо у write-boundary, поэтому разрешение `/fast` нельзя обобщать на остальные slash-команды. После bracketed paste `/fast` main ждёт frame с echo/sync marker и только затем Enter; затем ждёт submit-frame с `Service tier set to priority/default` и возвращает `notice` из этого TUI-факта. В текущем rollout `019efacc-3dab-7883-9e3d-5736e26fba46` эта строка не сохранялась как отдельный Codex JSONL event, поэтому JSONL/history нельзя использовать как источник Fast feedback. Таймер здесь только ошибка, не «подождать 500ms и нажать Enter».
 

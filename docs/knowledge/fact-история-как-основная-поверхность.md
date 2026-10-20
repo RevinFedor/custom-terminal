@@ -152,11 +152,16 @@ Enter заблокированы без запоминания нажатия и
 Над input остаётся только lifecycle терминала, например `Preparing codex session…`,
 а `PREPARING/SENDING/CONFIRMING` относятся к конкретному сообщению в History.
 
-Счётчик слева от X показывает полные секунды от принятого жеста, включая
+Счётчик слева от ↩ показывает полные секунды от принятого жеста, включая
 подготовку и IN APP QUEUE, до первого вызова записи Enter именно этого сообщения.
 Это не таймер подтверждения: после Enter число фиксировано в CONFIRMING и native
 QUEUED, исчезает вместе с SENT. Durable arm и Enter настроек/launch его не завершают;
-write-throw сохраняет возможный Enter и не разрешает повтор. Click time проходит
+write-throw сохраняет возможный Enter и не разрешает повтор. Типографика счётчика
+общая с подписью статуса: размер, жирность и межбуквенное расстояние. Пока секунды
+растут, текст синий как PREPARING; при остановке — обычный белый, даже если
+соседний CONFIRMING loader ещё движется. Блика, мигания и переходной анимации нет.
+Это различает законченное измерение и продолжающееся подтверждение доставки.
+Click time проходит
 также через App bridge и Main presentation snapshot: потеря поля там незаметна
 в живой карточке, но обрезает длительность после восстановления из квитанции.
 Известная отмена до provider input в return и exception shared handoff показывается
@@ -184,12 +189,53 @@ retirement. Live/list проекции сохраняют control; старый 
 по себе оставляет честный delivery-unknown, не создаёт canonical user identity.
 Полный контракт — `fact-terminal-mcp.md::Main FIFO принятых Send`.
 
-Waiting-крестик означает «Отменить отправку из очереди»; после dispatch это
-уже прежний отдельный hide-presentation, не отмена физического сообщения.
+↩ означает «Вернуть в поле ввода» и действует только до первой попытки записи
+текста или вложения сообщения в PTY, включая раннюю PREPARING и IN APP QUEUE.
+Main упорядочивает возврат и первый payload write по точным tab/H/token; UI-статус
+или отсутствие Enter сами не доказывают возможность возврата. С начала записи,
+в том числе write-throw с неизвестным исходом, возврат disabled без подписи
+«недоступно»; при SENT контрол исчезает. Кнопка не скрывает уже отправляемую
+карточку и не посылает Escape/Stop. Начатый запуск Codex продолжается, остальные
+сообщения не отменяются; поздняя подготовка возвращённого H уже не вправе писать.
+
+Исходные text/chips/images вставляются перед новым draft прежним authoring merge.
+Frozen Main refs имеют приоритет над ранними renderer refs. Draft и одноразовая
+метка возврата сохраняются одним composer envelope; только после чтения этого
+durable mirror и проверки сохранённых asset IDs Main отпускает прежние pins.
+LocalStorage write и асинхронный DB mirror — разные рубежи: потерянный ACK/повтор
+подтверждения не вставляет текст дважды, ошибка сохранения не разрешает release.
+Return state должен проходить live subscriber, row projection, memo и remount:
+одного поля в Main receipt недостаточно для доступной кнопки в живой History.
+
+У завершённой `SEND FAILED`/`CANCELLED` карточки вместо ↩ — крестик: пользователь
+убирает только её presentation, без восстановления текста в input. При желании
+повторить сообщение он копирует его сам. Durable dismiss сверяет текущую terminal
+receipt и точный nullable attempt; старая failed-строка не скрывает новую попытку.
+Скрытие не меняет delivery proof, PTY draft, другие Send или canonical JSONL.
+Потерянный ACK сохраняет карточку до подтверждённого explicit dismiss; он не
+является разрешением повторить сообщение. Ранние PREPARING/IN APP QUEUE сохраняют
+прежний Main-fenced возврат, после payload write — disabled.
+
+У `UNCONFIRMED` вместо заблокированной ↩ — X «Скрыть карточку»: отсутствие
+подтверждения не равно доказанному отказу, а иконка возврата ошибочно читалась
+как reload/retry. X не повторяет и не отменяет отправку, не освобождает input-slot
+и не снимает unknown asset pins. Main сверяет exact operation/nullable attempt
+и неизвестный исход; поздний exact audit сохраняет возможность подтвердить
+прошлую доставку, а каноническая строка остаётся в истории. Уже Main-fenced
+возврат со state `returned` сохраняет ↩ до завершения adoption, не теряя draft.
+
+При подтверждённом Main чтении `receipt-not-found` и отсутствии обоих durable IDs
+скрывается только локальный handoff: исходные authoring/images и dispatched phase
+сохраняются в прежнем recovery envelope с presentation marker. Reload не возвращает
+карточку; поздняя hydration скрыта только при том же Main return token, другой
+или недоказанный owner не наследует marker. Ошибка IPC/чтения, ambiguity или новые IDs не
+равны отсутствию receipt: карточка остаётся; сбой сохранения marker тоже не даёт
+её убрать. Это не новый negative delivery proof и не основание replay/release.
+
 Крестик адресной переписки в MCP tracker — другой boundary: отменяет ещё
 возможную доставку question/reply, не Stop процесса. Не подменять его History
 hide; сохранённая переписка остаётся читаемой (`fact-tab-messages.md`).
-У нижней из двух совместимых ручных `IN APP QUEUE` карточек рядом с × есть ↑:
+У нижней из двух совместимых ручных `IN APP QUEUE` карточек рядом с ↩ есть ↑:
 добавить её к предыдущей через одну пустую строку. Если предыдущая уже передана
 провайдеру или началась physical attempt, стрелки нет. Объединение сохраняет
 вложения/чипы, позицию/время предыдущей карточки; Main атомарно создаёт новую
@@ -198,17 +244,18 @@ merge или повторного Send. У читающего выше оста�
 внизу продолжает следовать низу через прежний scroll-owner, без нового rearm.
 Контракт no-write/identity — `fact-terminal-mcp.md::Main FIFO принятых Send`.
 Failed application snapshots не исчезают по15s legacy TTL и остаются доступны
-до явного скрытия. У status-footer каждой локальной карточки свой20px slot
+до явного крестика, без возврата в composer. У status-footer каждой локальной карточки свой20px slot
 в потоке: предположение «ниже всегда loader/assistant» ломалось на соседних
 queued user bubbles. Slot остаётся при истечении SENT badge, поэтому его
 двухсекундный таймер не меняет высоту строки.
 
+Прежний hide API используется крестиком завершённой ошибки; текущая ↩ его не вызывает.
 Старый failed completion может иметь durable operation, но ни одной physical
 attempt: требование непустого attemptId ломало его крестик после Build Install
 с `invalid-presentation-dismiss`. Hide теперь сопоставляет и явный null точно,
 не создаёт фиктивную попытку и не приписывает доставку/отмену. Legacy local card
-и уже hydrated FIFO card проверяются отдельно: последняя сохраняет прежний
-cancel/dismiss-unwritten путь. Повторное открытие не возвращает hidden карточку,
+и уже hydrated FIFO card проверяются отдельно. Failed-card X не вызывает
+cancel/dismiss-unwritten активной очереди. Повторное открытие не возвращает hidden карточку,
 а каноническая user-строка с тем же текстом не удаляется.
 
 Ошибка API Claude — отдельная служебная строка, а не текст ответа. Assistant
@@ -348,7 +395,7 @@ limit» в обычном ответе, user prompt или tool result не яв
   изображения. Modified arrows сохраняют свои shortcuts; скрытая/inert History
   не перехватывает клавиши. Draft/composer и Timeline этим не изменяются.
 - **Undo/Redo восстанавливает весь draft, а не только текст.** CodeMirror history хранит рядом с изменением документа точные image refs и тела chips. Обычное удаление, Cut и `Select all → Delete` одним Undo возвращают markers, sidecars и selection; Redo удаляет их вместе. Pending→ready замена картинки не создаёт второй шаг: Undo удаляет всю вставку, Redo возвращает уже финальный ref. При смене `tabId` стек обнуляется, поэтому история одной вкладки не может изменить другую.
-- **Весь draft и его view state принадлежат вкладке.** Один durable snapshot хранит editable text, image refs и полные тела prompt/paste chips; отдельно рядом с ним сохраняются selection и внутренний `scrollTop`. Оба состояния сбрасываются в синхронное localStorage/SQLite-зеркало на blur, смене вкладки, `beforeunload` и явном flush, а при mount/restart восстанавливаются по `tabId`. События selection/scroll от технической подмены CodeMirror owner игнорируются до завершения restore, иначе временные `0` перезапишут координаты возвращаемой вкладки. Высота отдельно не хранится и каждый раз выводится из актуального документа; пустая вкладка не наследует раскрытые восемь строк заполненной. Кэш ограничен 100 вкладками и общим бюджетом примерно 3 млн символов, но самый свежий draft сохраняется даже если он один превышает бюджет.
+- **Весь draft и его view state принадлежат вкладке.** Один durable snapshot хранит editable text, image refs и полные тела prompt/paste chips; отдельно рядом с ним сохраняются selection и внутренний `scrollTop`. Оба состояния сбрасываются в localStorage с последующим SQLite-зеркалом на blur, смене вкладки, `beforeunload` и явном flush, а при mount/restart восстанавливаются по `tabId`. Возврат до вставки отдельно проверяет durable adoption перед отпусканием asset pins; успешный localStorage write не заменяет эту проверку. События selection/scroll от технической подмены CodeMirror owner игнорируются до завершения restore, иначе временные `0` перезапишут координаты возвращаемой вкладки. Высота отдельно не хранится и каждый раз выводится из актуального документа; пустая вкладка не наследует раскрытые восемь строк заполненной. Кэш ограничен 100 вкладками и общим бюджетом примерно 3 млн символов, но самый свежий draft сохраняется даже если он один превышает бюджет.
   Durable receipt с доказанным `not-submitted` — только одноразовый источник
   восстановления, не второй вечный draft-store. Перед его применением History
   ждёт текущую canonical-проекцию. Совпавший user-record той же session строго
@@ -404,6 +451,11 @@ away/return требует согласованной shared-package/host сбо
 выходе из прохода, а не перед последней проверкой. Иначе ожидание отменённого
 Promise не получит ни события, ни таймаута и оставит карточку `PREPARING` навсегда.
 Это правило не заменяет main-owned Claude startup gate renderer-таймером.
+
+Завершённая Codex `/fast` также будит это ожидание. Иначе IPC-снимок занятого
+input, запрошенный до её завершения, мог вернуться после него и оставить Send
+до самого deadline. Сигнал завершения требует свежего чтения, а не объявляет
+input ready; тот же frozen prompt передаётся один раз только после прежних guards.
 
 Известное ожидание пользовательского выбора Codex (например, paused Goal) —
 информационное состояние, не failed launch. Если Send остановился здесь до
@@ -662,12 +714,23 @@ prepared cache уже отделяет версии по хешам загруж
 
 Доказанный Codex reply становится синим и в живом потоке, не только после idle
 refresh. Main сохраняет exact definition отдельно от временного tool-call cache,
-который очищается при accepted output; final paired carrier получает тот же thin
+который очищается при accepted output; final carrier (single либо paired) получает тот же thin
 certificate, live user projection обязана перенести его без потери. Native mirror
 и «есть pending question» не источник этого proof. Иначе endpoint уже имеет
 правильную saved пару, но активная History ещё показывает raw JSON до конца хода.
 Native retake06 подтвердил actual option/free blue Q/A при busy без forced full
 read; body/hash и sourceIdentity/aliases совпали с последующей canonical History.
+
+Шрам20.10: у SID01a03217 live reply167-user уже имел Main `action=proved`,
+Timeline получил `replyProof=codex`, saved API тоже содержал certificate, но
+History показывала raw XML. Причина — одиночный Codex response carrier без alias
+попадал в старый Claude prompt reducer: тот терял proof и мог нормализовать текст
+внутри answer. Парные записи обходили эту ветку, скрывая пробел проверки.
+SOURCE dispatch теперь направляет все explicit Codex envelopes в прежний
+provider-neutral projector, включая single event/response; Claude queue path
+не меняется. Исходный body/hash/UUID/owner и exact certificate guards сохраняются;
+нового дизайна, reader или ожидания полного History нет. Проверять single до
+появления companion, а не только конечный paired результат.
 
 Отдельный Timeline live consumer также должен сохранить этот сертификат. В
 инциденте3314 09.10 10:45:07 History и Main уже имели correct proof, но лёгкая
@@ -1023,18 +1086,23 @@ destructive запись до idle, а Stop-request перед файловой/
 Кнопки «вниз» и открытия терминала над composer должны получать клик всей
 площадью. Полоса prompt/context-чипов выше рамки имеет `pointer-events:none`,
 а реальные чипы и их слоты — `auto`: прозрачная часть flex-полосы не является
-целью. Справа она резервирует ширину пары28+2+28px и тот же `centerRightInset`,
-что кнопки, включая открытый неприкреплённый terminal/Timeline. Иначе после
-открытия терминала кнопка закрытия уезжает под настоящий чип. Источник размеров
-общий; повышение z-index поверх кликабельных чипов не заменяет раскладку.
+целью. Справа она резервирует ширину пары28+2+28px и прежний `centerRightInset`
+для стрелки/чипов. CURRENT Source20Oct поднимает кнопки над composer на6px —
+`RIGHT_CLUSTER_INNER_GAP_PX`, тот же gap Model/Effort/Fast. Terminal toggle
+находится в существующем стационарном queue/composer host140 над terminal stage130:
+его right равен padding рамки и не меняется при Cmd+]. Меняются label/pressed/tint.
+Стрелка сохраняет прежние visibility и side-panel inset. Прежний HPL toggle в
+hosted layout отключён; скрытая retained-вкладка не получает hit target.
 
-Два быстрых нажатия **ArrowDown или Space** (одной клавиши, до400мс) вызывают
-существующий переход History, Timeline и xterm текущей вкладки в самый низ.
-Одиночное нажатие сохраняет стандартное действие. Поля ввода, contenteditable,
-поиск, select и xterm забирают клавиши себе; Space также остаётся активацией
-сфокусированной кнопки/ссылки/checkbox. Модификаторы, autorepeat, IME, уже
-обработанное событие и другая клавиша разрывают пару; смена вкладки сбрасывает
-первое нажатие. Этот gesture не создаёт provider input и не отправляет prompt.
+Один обычный **ArrowDown** адресует прежнюю `history-panel:scroll-to-bottom`
+фокусной Claude/Codex History, в том числе из её composer. Цель читается fresh
+через focused pane/child owner, не last tab sidebar. Existing Workspace router
+и composer до CodeMirror keymap делят один weak native-event marker: команда
+не дублируется, caret/Undo/текст остаются у редактора. IME, modifiers/repeat,
+обработанный key, slash/prompt picker, поиск и TUI сохраняют владение клавишей.
+Вне History остаётся прежний double-tap ArrowDown; два Space до400мс вне input
+по-прежнему адресуют History/Timeline/xterm, а в composer остаются пробелами.
+Эти команды не создают provider input и не отправляют prompt.
 
 ## Геометрия вторичного терминала — панель и показ поверх окон
 

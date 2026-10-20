@@ -392,7 +392,11 @@ export default function WorkflowTabSidebar(props: WorkflowTabSidebarProps) {
     const scroller = dnd.scrollerRef.current; if (!scroller) return;
     userScroll.current = false;
     const apply = () => {
-      if (!userScroll.current) scroller.scrollTop = Math.min(props.scrollTop || 0, Math.max(0, scroller.scrollHeight - scroller.clientHeight));
+      if (!userScroll.current) {
+        const top = props.scrollTop || 0;
+        // Zero needs no height clamp in this top-to-bottom scroller.
+        scroller.scrollTop = top === 0 ? 0 : Math.min(top, Math.max(0, scroller.scrollHeight - scroller.clientHeight));
+      }
     };
     apply(); const observer = new ResizeObserver(apply);
     if (scroller.firstElementChild) observer.observe(scroller.firstElementChild);

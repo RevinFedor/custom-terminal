@@ -9,6 +9,9 @@ import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
 import { CompositedTextShimmer } from '../UI/CompositedTextShimmer';
 import TabNotificationControls from './TabNotificationControls';
+import PaneStripSelectionMenu from './PaneStripSelectionMenu';
+import {createPaneSelectionRuntimePort} from '../../utils/paneSelectionRuntime.mjs';
+import {tabSessionUuid,tabUuidPathText} from '../../utils/paneStripSelectionActions.mjs';
 import { IdleSessionStopCountdown } from './IdleSessionStopCountdown';
 import TabFileDeleteAction from './TabFileDeleteAction';
 import { openSidebarLinkedFile } from '../../utils/tabLinkedFilePreview';
@@ -178,6 +181,9 @@ import { resolveTabRangeSelection } from '../../utils/tabRangeSelection.mjs';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 
 const { ipcRenderer } = window.require('electron');
+const paneSelectionRuntimePort=createPaneSelectionRuntimePort({
+  invoke:(channel:string,request:unknown)=>ipcRenderer.invoke(channel,request),getState:useWorkspaceStore.getState,
+});
 // A duplicate menu claim is not activity of the source conversation. Share it
 // across card surfaces without publishing a false Fork loader on that source.
 const contextForkSourceClaims = new WeakSet<object>();
@@ -258,6 +264,7 @@ interface ExternalTabContextMenu {
   singleTarget?: boolean;
   isCurrent?: () => boolean;
   onClose?: () => void;
+  paneSelection?: import('./PaneStripSelection').PaneStripSelectionLease;
 }
 
 /**
@@ -291,7 +298,7 @@ export function openTabContextMenuAt(
   tabId: string,
   x: number,
   y: number,
-  options?: Pick<ExternalTabContextMenu, 'renameHost' | 'singleTarget' | 'isCurrent' | 'onClose'>,
+  options?: Pick<ExternalTabContextMenu, 'renameHost' | 'singleTarget' | 'isCurrent' | 'onClose' | 'paneSelection'>,
 ): void {
   window.dispatchEvent(new CustomEvent(TAB_CONTEXT_MENU_EVENT, {
     detail: { projectId, tabId, x, y, ...options },
@@ -642,7 +649,7 @@ const shortDndId = (id?: string | null) => {
 };
 
 const getTabSessionUuid = (tab?: { claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string } | null) =>
-  tab?.claudeSessionId || tab?.geminiSessionId || tab?.codexSessionId || null;
+  tabSessionUuid(tab);
 
 const isCodexSessionTab = (tab?: {
   commandType?: string | null;
@@ -7224,7 +7231,7 @@ function TabBar({
     setGroupContextMenu({ x: e.clientX, y: e.clientY, groupId: group.id });
   };
 
-  const handleContextMenu = (e: React.MouseEvent, tabId: string) => {
+  const handleContextMenu = (e: React.MouseEvent, tabId: string, skipShellEnrichment=false) => {
     e.preventDefault();
     e.stopPropagation();
     // A real right click in THIS list: the list hosts its own rename input.
@@ -7240,6 +7247,10 @@ function TabBar({
     setContextLastCommand(null);
     const scriptsLoadSeq = ++contextScriptsLoadSeqRef.current;
     const isCurrentScriptsLoad = () => contextScriptsLoadSeqRef.current === scriptsLoadSeq;
+
+    if(skipShellEnrichment) {
+      setContextScripts([]);setContextShScripts([]);return;
+    }
 
     const targetTab = workspace.tabs.get(tabId);
     if (!tabAllowsShellActions(targetTab)) {
@@ -7354,6 +7365,7 @@ function TabBar({
             clientY: Number(detail.y) || 0,
           } as unknown as React.MouseEvent,
           tabId,
+          !!detail.paneSelection,
         );
         // AFTER the handler, which clears this for its own right clicks: who
         // opened the menu, and can they host the rename input themselves.
@@ -7361,7 +7373,7 @@ function TabBar({
         renameHostRef.current = detail.renameHost || null;
         externalContextMenuRef.current = detail;
       };
-      if (!menuOnlyForProject || sharedProcessStatus) { openAt(); return; }
+      if ((detail.paneSelection?.entries.length||0)>1 || !menuOnlyForProject || sharedProcessStatus) { openAt(); return; }
       // Hidden menu owners skip the mount-time status sync (see the guard in
       // the sync effect above): nobody reads their status maps until this very
       // moment. Ask main about the ONE tab the menu is opened for, then open —
@@ -9754,6 +9766,11 @@ function TabBar({
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
+          {externalContextMenuRef.current?.paneSelection && externalContextMenuRef.current.paneSelection.entries.length>1 ? (
+            <PaneStripSelectionMenu lease={externalContextMenuRef.current.paneSelection}
+              runtimePort={paneSelectionRuntimePort}
+              onClose={()=>setContextMenu(null)}/>
+          ) : <>
           {/* Close Tab(s) + optional Stop split. Stop visible when at least one
               selected tab has a running AI process or script process. */}
           {(() => {
@@ -10776,11 +10793,8 @@ function TabBar({
                     : getTabSessionUuid(tab);
                   if (uuid) resolvedRows.push({ tab, uuid });
                 }
-                const lines = resolvedRows.map(({ tab, uuid }) => {
-                  const path = tab.cwd || project?.path || '/';
-                  return `${uuid}\ncwd: ${path}`;
-                });
-                window.require('electron').clipboard.writeText(lines.join('\n\n'));
+                window.require('electron').clipboard.writeText(tabUuidPathText(
+                  resolvedRows.map(({tab,uuid})=>({uuid,cwd:tab.cwd || project?.path || '/'}))));
                 showToast(isContextMultiSelect ? `Скопировано UUID + путей: ${resolvedRows.length}` : 'UUID + путь скопированы', 'success');
                 setContextMenu(null);
               } catch (error: any) {
@@ -10899,6 +10913,9 @@ function TabBar({
           })()}
 
           {!isContextMultiSelect && contextMenu && !isContextFileTab && <IdleSessionStopCountdown tabId={contextMenu.tabId} />}
+          {externalContextMenuRef.current?.paneSelection && <PaneStripSelectionMenu colorOnly
+            lease={externalContextMenuRef.current.paneSelection} onClose={()=>setContextMenu(null)}/>}
+          </>}
         </div>
       )}
 

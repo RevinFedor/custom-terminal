@@ -1,6 +1,18 @@
 import { isNaturalAgentTurnEndReason } from './agentCompletionOutcome.mjs';
 import { hasPendingAgentGoalWork } from '../../shared/agent-work-completion.mjs';
 
+// A metadata wake may settle only an already observed deferred turn end.
+// Missing identity is UNKNOWN; display text or a same-value false is no proof.
+export function deferredGoalCompletionKey(data) {
+  const goal = data?.goalWork;
+  if (goal?.version !== 1 || !data.sessionId || !data.lifecycleGeneration || !data.turnId
+    || goal.sessionId !== data.sessionId || goal.turnId !== data.turnId
+    || !Number.isFinite(data.outcomeTs) || !Number.isSafeInteger(goal.createdAt)
+    || !Number.isSafeInteger(data.goalCompletionOffset) || data.goalCompletionOffset < 0) return null;
+  return JSON.stringify([data.sessionId, data.lifecycleGeneration, data.turnId,
+    data.outcomeTs, goal.createdAt, data.goalCompletionOffset]);
+}
+
 /** One app-wide owner, independent of TabBar instances and UI focus. */
 export function createRestartAfterCoordinator(deps) {
   const sources = new Map(), jobs = new Map(), receipts = new Set(), finishes = new Map();
@@ -9,6 +21,8 @@ export function createRestartAfterCoordinator(deps) {
   const current = job => jobs.get(job.tabId) === job && deps.allowed(job.request);
 
   function cancel(tabId, reason = 'manual-stop') {
+    const source = sources.get(tabId);
+    if (source) { source.goalDeferred = null; source.deferred = null; }
     const job = jobs.get(tabId);
     jobs.delete(tabId); // synchronous, before any IPC/await or command-finished
     if (job) deps.cancel?.(tabId, job.operationId, reason);
@@ -89,17 +103,34 @@ export function createRestartAfterCoordinator(deps) {
     if (!data?.tabId || data.reason === 'spinner' || data.reason === 'local-command') return;
     const state = sources.get(data.tabId) || { busy: false, cycle: 0, deferred: null, deliveredCycle: -1 };
     sources.set(data.tabId, state);
+    if (data.goalMetadataOnly === true) {
+      const identity = deferredGoalCompletionKey(data);
+      if (state.busy || !identity || state.goalDeferred !== identity
+        || data.busy !== false || data.goalWork?.pending !== false || data.goalWork.status !== 'complete'
+        || !isNaturalAgentTurnEndReason(data.reason)) return;
+      state.goalDeferred = null;
+      state.goalPending = false;
+      if (deps.blocked?.(data.tabId)) { state.deferred = data.outcomeTs; return; }
+      state.deliveredCycle = state.cycle;
+      state.directCompletedAt = data.outcomeTs;
+      complete(data.tabId, data.outcomeTs);
+      return;
+    }
     if (data.busy) {
       if (!state.busy) state.cycle++;
-      state.busy = true; state.deferred = null;
+      state.busy = true; state.deferred = null; state.goalDeferred = null;
       return;
     }
     const wasBusy = state.busy;
     state.busy = false;
-    state.goalPending = hasPendingAgentGoalWork(data);
-    if (state.goalPending) { state.deferred = null; return; }
-    if (!isNaturalAgentTurnEndReason(data.reason)) { state.deferred = null; return; }
+    if (!isNaturalAgentTurnEndReason(data.reason)) { state.deferred = null; state.goalDeferred = null; return; }
     if (!wasBusy) return;
+    state.goalPending = hasPendingAgentGoalWork(data);
+    if (state.goalPending) {
+      state.goalDeferred = deferredGoalCompletionKey(data);
+      state.deferred = null; return;
+    }
+    state.goalDeferred = null;
     const identity = data.outcomeTs ?? data.turnId ?? ('cycle-' + state.cycle);
     if (deps.blocked?.(data.tabId)) { state.deferred = identity; return; }
     state.deliveredCycle = state.cycle;

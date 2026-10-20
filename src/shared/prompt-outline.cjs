@@ -204,4 +204,4 @@ function promptOutlineSelection(outline, promptId) {
   return location ? [...location.ancestors, location.node].filter(node => node.entityType === 'prompt') : [];
 }
 
-module.exports = { promptOutlineGroupId, promptOutlinePromptId, buildPromptOutline, applyPromptOutline, promptOutlineHorizontalPolicy, promptOutlineVerticalSlotPolicy, promptOutlineSelection };
+module.exports = { promptOutlineGroupId, promptOutlinePromptId, buildPromptOutline, applyPromptOutline, promptOutlineHorizontalPolicy, promptOutlineVerticalSlotPolicy, promptOutlineSelection, promptOutlineLocation: outlineParentInfo };

@@ -1271,7 +1271,7 @@ test('receipt and chip presentation distinguish confirming from unknown delivery
     label: 'UNCONFIRMED',
     tone: 'warning',
     pending: false,
-    title: 'Доставка не подтверждена. Не отправляйте текст повторно как новую команду',
+    title: 'Исход отправки неизвестен: сообщение могло быть принято. Не отправляйте его повторно',
   });
   assert.notEqual(historyPromptHandoffStatusPresentation('audit-pending')?.tone, 'success');
   assert.notEqual(historyPromptHandoffStatusPresentation('delivery-unknown')?.tone, 'success');

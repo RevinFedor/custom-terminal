@@ -114,6 +114,41 @@ function createHarness() {
   };
 }
 
+test('canonical diagnostic identifies two distinct items even when their shortened suffixes collide', () => {
+  const h = createHarness(), suffix = 'same-native-suffix';
+  h.controller.activateSemanticSource({tabId:'tab-a',instanceId:'codex-process-1'});
+  h.controller.begin({tabId:'tab-a',provider:'codex',sessionId:'thread-a',turnId:'turn-a'});
+  const pairs = ['one','two'].map(prefix => ({itemId:'msg-'+prefix+'-'+suffix,identity:'source-'+prefix+'-'+suffix,text:'own '+prefix}));
+  for (const [index,pair] of pairs.entries()) {
+    h.controller.observeSemanticEvent({tabId:'tab-a',instanceId:'codex-process-1',event:{type:'item_started',threadId:'thread-a',turnId:'turn-a',
+      item:{kind:'agentMessage',itemId:pair.itemId,phase:'finalAnswer'}}});
+    h.controller.observeSemanticEvent({tabId:'tab-a',instanceId:'codex-process-1',event:{type:'assistant_delta',threadId:'thread-a',turnId:'turn-a',itemId:pair.itemId,delta:pair.text}});
+    h.flushTimers();
+    assert.equal(h.controller.observeCanonical({tabId:'tab-a',provider:'codex',sessionId:'thread-a',sourceSequence:index+1,
+      identity:pair.identity,semanticItemId:pair.itemId,canonicalText:pair.text}),true);
+  }
+  const acks=h.logs.filter(line=>line.includes('SEMANTIC_CANONICAL_ACK'));
+  assert.equal(acks.length,2);
+  for (const [index,pair] of pairs.entries()) {
+    assert.ok(acks[index].includes('exactItem='+JSON.stringify(pair.itemId)));
+    assert.ok(acks[index].includes('exactCanonical='+JSON.stringify(pair.identity)));
+    assert.ok(acks[index].includes('exactTurn="turn-a"'));
+    assert.ok(acks[index].includes('joinIds=full'));
+  }
+});
+
+test('oversized canonical diagnostic IDs remain explicitly unjoinable without clipping them into identity', () => {
+  const h=createHarness();h.controller.activateSemanticSource({tabId:'tab-a',instanceId:'codex-process-1'});
+  h.controller.begin({tabId:'tab-a',provider:'codex',sessionId:'thread-a',turnId:'turn-a'});
+  h.controller.observeSemanticEvent({tabId:'tab-a',instanceId:'codex-process-1',event:{type:'item_started',threadId:'thread-a',turnId:'turn-a',item:{kind:'agentMessage',itemId:'own-item',phase:'finalAnswer'}}});
+  h.controller.observeSemanticEvent({tabId:'tab-a',instanceId:'codex-process-1',event:{type:'assistant_delta',threadId:'thread-a',turnId:'turn-a',itemId:'own-item',delta:'own text'}});
+  assert.equal(h.controller.observeCanonical({tabId:'tab-a',provider:'codex',sessionId:'thread-a',sourceSequence:1,
+    identity:'source:'+('x'.repeat(600)),semanticItemId:'own-item',canonicalText:'own text'}),true);
+  const ack=h.logs.find(line=>line.includes('SEMANTIC_CANONICAL_ACK'));
+  assert.ok(ack.includes('exactCanonical=-'));assert.ok(ack.includes('joinIds=incomplete'));
+  assert.ok(!ack.includes('x'.repeat(100)));
+});
+
 test('publishes terminal output only after an exact owned committed frame', () => {
   const h = createHarness();
   h.controller.begin({

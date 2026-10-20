@@ -13,6 +13,8 @@ const { EventEmitter } = require('node:events');
 const { createFakeClock, drainMicrotasks } = require('./fixtures/codex-draft-request-observation.cjs');
 const { createAgentInputObservation, observeAgentInput } = require('./agent-input-observation');
 const { createAgentSendCancellationRegistry } = require('./agent-send-cancellation');
+const preparation = require('./agent-send-preparation');
+const { createAgentSendReceiptStore, STORE_STATES } = require('./agent-send-receipt-store');
 const mainSource = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const mainAst = ts.createSourceFile('main.js', mainSource, ts.ScriptTarget.Latest, true);
 const actual = name => {
@@ -30,11 +32,27 @@ const baseFunctions = ['getTerminalStopRevision', 'getTerminalInputRevision', 'b
   'createMainAgentInputObservation', 'agentDraftObservationResult', 'decorateAgentDraftProofIdentity',
   'agentSendExecutionFailure', 'requestTerminalCodexDraftState', 'clearCodexLaunchPayload',
   'finishCodexStartupLifecycle', '_safePasteAndSubmitInner', 'safePasteAndSubmit',
+  'finishSafePasteAfterWrite', 'resolveSafePasteFailureAfterWrite',
+  'writeHistorySendPayload', 'writeHistorySendEnter', 'publishHistorySendReturn',
   'prepareCodexMainComposerForSend', 'ensureCodexInputReadyForExternalPrompt'];
-function fixture({ startup = true, mirrorComplete = true, now = 10000, provisional = false } = {}) {
+function fixture({ startup = true, mirrorComplete = true, now = 10000, provisional = false,
+  operationalReady = false } = {}) {
   const tabId = 'cold-tab', clock = createFakeClock(now), events = new EventEmitter();
   const writes = [], trace = [], audits = [], receipts = [];
+  const db = new (require('better-sqlite3'))(':memory:');
+  const store = createAgentSendReceiptStore(db, { randomUUID: () => 'A', now: clock.now });
+  // These are legacy accepted attempts, without a HEAD preparation scope. The
+  // actual preparation reader must retain their bounded observation contract.
+  assert.equal(store.beginAttempt({ operationKey: 'O', tabId, handoffId: 'H', provider: 'codex',
+    surface: 'desktop-history', requestFingerprint: 'request-H', sessionId: 'source',
+    promptHash: require('node:crypto').createHash('sha256').update('immutable prompt').digest('hex'),
+    promptLength: 16 }).ok, true);
+  for (const [method, label] of [['markAttemptState', 'arm'], ['settleAttempt', 'settle']]) {
+    const actualMethod = store[method];
+    store[method] = (...args) => { receipts.push([label, ...args]); return actualMethod.apply(store, args); };
+  }
   let text = '', drainImpl = async () => {}, settingsFailure = null;
+  let established = false;
   let turn = provisional ? { available: true, kind: 'provisional-source', sessionId: 'source',
     launchId: 'L', reservation: {} } : { available: true, kind: 'turn', sessionId: 'source' };
   const term = { pid: 7, write: data => { writes.push(data); trace.push(data === '\r' ? 'enter' : 'paste'); } };
@@ -60,6 +78,10 @@ function fixture({ startup = true, mirrorComplete = true, now = 10000, provision
     provisionalSubmitReservation: turn.reservation });
   const c = vm.createContext({ ...m, ...require('./codex-runtime-contract'), ...require('./codex-draft-authority'),
     ...require('../shared/agent-input-observation.cjs'), ...require('./claude-composer-proof'),
+    ...preparation, ...require('./agent-send-enter-timing'), ...require('./history-send-return'),
+    readAgentSendPreparation: (s, id, options, startup) =>
+      preparation.readAgentSendPreparation(s, id, options, startup, clock.now),
+    queueMicrotask,
     Date: { now: clock.now }, setTimeout: clock.setTimer, clearTimeout: clock.clearTimer,
     console: { log() {}, warn() {}, error() {} }, crypto: require('node:crypto'), Buffer,
     ipcMain: events, mainWindow: null, HEADLESS_XTERM_FLUSH_TIMEOUT_MS: 700,
@@ -67,10 +89,11 @@ function fixture({ startup = true, mirrorComplete = true, now = 10000, provision
     CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000, CODEX_PASTE_AUDIT_TIMEOUT_MS: 1000, CLAUDE_PASTE_AUDIT_TIMEOUT_MS: 1000,
     PASTE_START: '\x1b[200~', PASTE_END: '\x1b[201~',
     CODEX_ACTION_PROFILE_RESUMED_ACTIVE_SUBMIT: 'resumed-active-submit',
-    AGENT_SEND_DURABLE_STATES: { IN_FLIGHT: 'in-flight', ENTER_ARMED: 'enter-armed',
-      AUDIT_PENDING: 'audit-pending', DELIVERY_UNKNOWN: 'delivery-unknown', CONFIRMED: 'confirmed', NOT_SUBMITTED: 'not-submitted' },
+    AGENT_SEND_DURABLE_STATES: STORE_STATES,
     agentSendCancellations: createAgentSendCancellationRegistry(),
     getTerminalLifecycleGeneration: () => 'G:' + m.terminalCommandState.get(tabId).runSeq,
+    hasCodexEstablishedComposerLifecycle: () => established,
+    isCodexOperationalInputReady: () => operationalReady,
     getHeadlessTerminalMirror: id => m.terminalHeadlessMirrors.get(id), findTabIdForTerm: t => t === term ? tabId : null,
     createAgentInputObservation: options => createAgentInputObservation({ ...options, now: clock.now,
       setTimer: clock.setTimer, clearTimer: clock.clearTimer }), observeAgentInput,
@@ -132,33 +155,32 @@ function fixture({ startup = true, mirrorComplete = true, now = 10000, provision
     releaseCodexProvisionalSubmitReservation: (_id, reservation) => { trace.push('release-reservation'); reservation.released = true; },
     markCodexProvisionalSubmitReservationWritten() {},
     finishCodexPasteAuditAfterWrite: async () => ({ success: null, submitted: true, auditPending: true }),
-    finishSafePasteAfterWrite: async (_term, _content, _options, _op, result) => result,
-    resolveSafePasteFailureAfterWrite: error => { throw error; },
+    publishAgentSendReceiptRecord() {}, notifyPromptSubmitWritten() {},
     withPtyWriteLock: async (_term, fn) => fn(),
-    agentSendReceiptStore: {
-      get: () => null, isDeliveryCancelled: () => false,
-      stageAttemptContext: () => ({ ok: true }),
-      markAttemptState: (...args) => { receipts.push(['arm', ...args]); return { ok: true }; },
-      settleAttempt: (...args) => { receipts.push(['settle', ...args]); return { ok: true }; },
-    },
+    agentSendReceiptStore: store,
   });
   vm.runInContext(scopeDeclarations + '\n' + baseFunctions.map(actual).join('\n'), c);
   const options = () => ({ source: 'codex-history-panel', handoffId: 'H', sendAttemptId: 'A', sendOperationKey: 'O',
     expectedInputRevision: c.getTerminalInputRevision(tabId), verifyCodexVisibleDraftBeforeSubmit: true,
     skipRenderWait: true, awaitCodexUserMessageAudit: true,
     settingsWriteGuard: () => settingsFailure || { allowed: true } });
-  return { c, m, clock, events, tabId, term, mirror, writes, trace, audits, receipts,
-    options, text(value) { text = value; }, drain(fn) { drainImpl = fn; }, settings(value) { settingsFailure = value; },
+  return { c, m, clock, events, tabId, term, mirror, writes, trace, audits, receipts, store,
+    options, text(value) { text = value; },
+    // Inject one provider-output change. A resumed writer may drain again.
+    drain(fn) { drainImpl = async () => { drainImpl = async () => {}; await fn(); }; },
+    settings(value) { settingsFailure = value; },
     wake() { for (const f of [...mirror.synchronizedFrameWaiters]) f(); },
     close() { mirror.redrawTrace.synchronizedOutputOpen = false; mirror.flushedSeq = ++mirror.writeSeq; this.wake(); },
     stopABA() { c.terminalStopRevisions.set(term, c.getTerminalStopRevision(tabId) + 1);
       events.emit('agent:input-owner-changed-internal', null, { tabId, reason: 'process-stopping' }); },
-    read() { return c.requestTerminalCodexDraftState(null, tabId, 'agent-send-preflight:history-panel', 700,
-      { waitFor: false, waitOnUnknownOnly: true, waitTimeoutMs: 2500, handoffId: 'H', attemptId: 'A' }); },
-    send(extra = {}) { return c._safePasteAndSubmitInner(term, 'immutable prompt', { ...options(), ...extra }); },
+    ready(value = true) { operationalReady = value; if (value) established = true; },
+    read(extra = {}) { return c.requestTerminalCodexDraftState(null, tabId, 'agent-send-preflight:history-panel', 700,
+      { waitFor: false, waitOnUnknownOnly: true, waitTimeoutMs: 2500, handoffId: 'H', attemptId: 'A', ...extra }); },
+    send(extra = {}) { return c.safePasteAndSubmit(term, 'immutable prompt', { ...options(), ...extra }); },
     clean() { assert.equal(clock.timers.size, 0); assert.equal(mirror.synchronizedFrameWaiters.size, 0);
       assert.equal(events.listenerCount('agent:input-owner-changed-internal'), 0);
-      assert.equal(events.listenerCount('agent:readiness-changed-internal'), 0); },
+      assert.equal(events.listenerCount('agent:readiness-changed-internal'), 0);
+      if (db.open) db.close(); },
   };
 }
 async function tickUntil(predicate) {
@@ -172,10 +194,11 @@ test('baseline control: whole actual Codex writer pastes and enters once', async
 });
 
 test('ready cleanup must not discard the original frame deadline', async () => {
-  const h = fixture(); h.c.finishCodexStartupLifecycle(h.tabId);
+  const h = fixture(); const pinned = h.c.captureCodexSendStartupFrameWait(h.tabId);
+  h.ready(); h.c.finishCodexStartupLifecycle(h.tabId);
   assert.equal(h.m.codexLastRunCommandPayload.has(h.tabId), false, 'do not retain launch settings payload');
   h.mirror.redrawTrace.synchronizedOutputOpen = true;
-  let done = false; const p = h.read().then(r => { done = true; return r; });
+  let done = false; const p = h.read({ codexStartupFrameWaitId: pinned.launchId }).then(r => { done = true; return r; });
   await drainMicrotasks(30); h.clock.advance(5500); await drainMicrotasks(30);
   const premature = done; h.close(); await p; h.clean();
   assert.equal(premature, false, 'ready cleanup may not replace the original launch deadline with 2500ms');
@@ -251,10 +274,12 @@ test('actual send IPC must not rebase across Stop ABA during external readiness'
 for (const retained of [false, true]) {
   test('ready cleanup (late MCP retained=' + retained + ') keeps only the original deadline', async () => {
     const h = fixture({ now: 60000 });
+    const pinned = h.c.captureCodexSendStartupFrameWait(h.tabId);
+    h.ready();
     h.c.finishCodexStartupLifecycle(h.tabId, 'ready', { preserveLateMcpRecovery: retained });
     assert.equal(h.m.codexLastRunCommandPayload.has(h.tabId), retained);
     h.mirror.redrawTrace.synchronizedOutputOpen = true;
-    const p = h.read(); await drainMicrotasks(50);
+    const p = h.read({ codexStartupFrameWaitId: pinned.launchId }); await drainMicrotasks(50);
     const due = [...h.clock.timers.values()].map(t => t.dueAt);
     h.clock.advance(2500); const r = await p; h.clean();
     assert.deepEqual(due, [61000]); assert.equal(r.hasDraft, null); assert.equal(r.observation.budgetMs, 1000);
@@ -268,7 +293,7 @@ test('one Send crossing the launch deadline in the existing write queue cannot a
   h.clock.advance(1000); release(); await drainMicrotasks(80);
   const timers = h.clock.timers.size;
   h.clock.advance(2500); const result = await p; h.clean();
-  assert.equal(timers, 0); assert.equal(result.codexDraftGuard.observation.budgetMs, 0);
+  assert.equal(timers, 0); assert.equal(result.code, 'agent_send_preparation_expired');
   assert.equal(result.submitted, false); assert.equal(h.writes.length, 0);
 });
 
@@ -278,6 +303,33 @@ test('new warm send after expiry still has the ordinary bounded frame wait', asy
   assert.deepEqual([...h.clock.timers.values()].map(t => t.dueAt), [64500]);
   h.close(); assert.equal((await p).submitted, true); h.clean();
 });
+
+for (const mode of ['cleaned', 'late-mcp', 'late-mcp-input-closed']) {
+  test('actual writer: new warm send before preceding launch expiry keeps its own frame wait: ' + mode, async () => {
+    const h = fixture({ now: 60752 });
+    const pinned = h.c.captureCodexSendStartupFrameWait(h.tabId);
+    h.ready(); h.c.finishCodexStartupLifecycle(h.tabId, 'ready', { preserveLateMcpRecovery: mode !== 'cleaned' });
+    // The input-ready port can close again for /model after initialization.
+    // Closing it does not turn the retained late-MCP payload into a cold launch.
+    if (mode === 'late-mcp-input-closed') h.ready(false);
+    assert.equal(h.m.codexLastRunCommandPayload.has(h.tabId), mode !== 'cleaned');
+    const warmReceipt = h.c.captureCodexSendStartupFrameWait(h.tabId);
+    const retainedColdReceipt = h.c.captureCodexSendStartupFrameWait(h.tabId, pinned.launchId);
+    h.mirror.redrawTrace.synchronizedOutputOpen = true;
+    const p = h.send(); await drainMicrotasks(60);
+    const due = [...h.clock.timers.values()].map(t => t.dueAt);
+    h.clock.advance(350); h.close(); const result = await p;
+    assert.equal(result.submitted, true);
+    assert.deepEqual(h.writes, ['\x1b[200~immutable prompt\x1b[201~', '\r']);
+    assert.deepEqual(due, [63252]);
+    assert.equal(warmReceipt, null);
+    assert.equal(retainedColdReceipt, pinned,
+      'a new warm caller must not revoke the original pinned cold receipt');
+    assert.equal(h.store.get('O').attemptId, 'A');
+    assert.equal(h.store.get('O').state, 'audit-pending');
+    h.clean();
+  });
+}
 
 test('foreign cancellation does not settle the exact final cold attempt', async () => {
   const h = fixture(); h.mirror.redrawTrace.synchronizedOutputOpen = true;
@@ -353,7 +405,7 @@ async function rendererFixture(h) {
     vm.runInContext(node.getText(mainAst), h.c);
   }
   h.c.nodePerformance = { now: h.clock.now };
-  h.c.isCodexOperationalInputReady = () => true;
+  h.ready();
   const ipcCalls = [];
   const ipcRenderer = new EventEmitter();
   ipcRenderer.invoke = async (name, ...args) => {
@@ -393,8 +445,9 @@ async function rendererFixture(h) {
 
 test('Main proof -> actual renderer adapter/transport -> final Main guard keeps the original expired budget', async () => {
   const h = fixture({ now: 60000 }); const r = await rendererFixture(h);
+  const pinned = h.c.captureCodexSendStartupFrameWait(h.tabId, 'L');
   const composer = await r.adapter.proveComposer({ statusForSend: 'active', source: 'history-panel',
-    handoffId: 'H', sendAttemptId: 'A' });
+    handoffId: 'H', sendAttemptId: 'A', codexStartupFrameWaitId: pinned.launchId });
   h.c.finishCodexStartupLifecycle(h.tabId);
   h.clock.advance(1500); h.mirror.redrawTrace.synchronizedOutputOpen = true;
   let done = false;
@@ -408,7 +461,8 @@ test('Main proof -> actual renderer adapter/transport -> final Main guard keeps 
   assert.equal(composer.codexStartupFrameWaitId, 'L'); assert.equal(immediate, true);
   const send = r.ipcCalls.find(call => call[0] === 'codex:send-command');
   assert.equal(send[3].codexStartupFrameWaitId, 'L'); assert.equal(send[3].sendAttemptId, 'A');
-  assert.equal(result.submitted, false); assert.equal(result.codexDraftGuard.observation.budgetMs, 0);
+  assert.equal(result.submitted, false); assert.equal(result.code, 'agent_send_preparation_expired');
+  assert.equal(h.clock.timers.size, 0, 'an expired pinned operation cannot acquire a new observation');
   assert.equal(h.writes.length, 0);
 });
 
@@ -443,9 +497,9 @@ test('actual provider contracts still admit manual busy Codex and Claude sends a
 function readyFixture(options = {}) {
   const h = fixture(options);
   let state = { inputReady: false }, readImpl = async () => state, pokes = 0;
+  h.m.codexStartupAutoEnter.set(h.tabId, {});
   Object.assign(h.c, {
     getCodexTuiReadyState: () => readImpl(),
-    hasCodexEstablishedComposerLifecycle: () => true,
     probeCodexStartupFromRawBuffer: () => { pokes++; return { ready: false }; },
   });
   return { ...h, state(value) { state = value; }, reads(fn) { readImpl = fn; }, pokes: () => pokes,
@@ -575,7 +629,8 @@ function actualFrameFixture(t) {
   const h = fixture();
   Object.assign(h.c, require('./terminal-redraw-diagnostics'), require('./codex-tui-readiness'),
     require('./codex-model-picker'), require('./codex-manual-rewind'),
-    require('./terminal-composer-forensics'), require('./terminal-replay-journal'), {
+    require('./terminal-composer-forensics'), require('./terminal-replay-journal'),
+    require('./terminal-io-progress'), {
       HeadlessXTerminal: require('@xterm/headless').Terminal, HeadlessSerializeAddon: null,
       HEADLESS_XTERM_SCROLLBACK: 100, terminalHeadlessGenerationCounter: 0,
       createXtermWritePump: require('../shared/xterm-write-pump.cjs').createXtermWritePump,
@@ -608,14 +663,8 @@ function actualFrameFixture(t) {
   t.after(() => { mirror.writePump.dispose(); mirror.terminal.dispose(); });
   vm.runInContext(['pasteInflight', 'ptyWriteOwners', 'ptyActiveWriteOperation', 'ptyLastQueuedWriteOperation']
     .map(optionalDeclaration).join('\n') + '\n' + actual('withPtyWriteLock'), h.c);
-  const db = new (require('better-sqlite3'))(':memory:');
-  t.after(() => db.close());
-  const store = require('./agent-send-receipt-store').createAgentSendReceiptStore(db,
-    { randomUUID: () => 'A', now: h.clock.now });
-  store.beginAttempt({ operationKey: 'O', tabId: h.tabId, handoffId: 'H', provider: 'codex',
-    surface: 'desktop-history', requestFingerprint: 'request-H', sessionId: 'source',
-    promptHash: h.c.pasteAuditHash('immutable prompt'), promptLength: 16 });
-  h.c.agentSendReceiptStore = store;
+  const store = h.store;
+  t.after(() => { if (store.db.open) store.db.close(); });
   const write = async text => {
     h.c.writeHeadlessTerminalMirror(h.tabId, text);
     await mirror.writePump.drain();
@@ -623,7 +672,7 @@ function actualFrameFixture(t) {
   };
   const paint = text => '\x1b[2J\x1b[H' + text + '\r\n\x1b[2mgpt-6 high · Context 10% used\x1b[0m';
   return { ...h, liveMirror: mirror, store, write, paint,
-    send: () => h.c.safePasteAndSubmit(h.term, 'immutable prompt', h.options()),
+    send: extra => h.c.safePasteAndSubmit(h.term, 'immutable prompt', { ...h.options(), ...extra }),
   };
 }
 
@@ -634,6 +683,8 @@ for (const ending of ['empty', 'draft', 'picker', 'missing-close']) {
     await h.write(empty);
     const common = await h.read();
     assert.equal(common.hasDraft, false, JSON.stringify(common));
+    assert.equal(common.codexStartupFrameWaitId, 'L');
+    h.ready();
     h.c.finishCodexStartupLifecycle(h.tabId);
     assert.equal(h.m.codexLastRunCommandPayload.has(h.tabId), false);
     // Actual onData path opens the frame during the pre-paste drain, after
@@ -642,7 +693,8 @@ for (const ending of ['empty', 'draft', 'picker', 'missing-close']) {
     const openFrameFlushed = new Promise(resolve => { opened = resolve; });
     h.drain(async () => { await h.write('\x1b[?2026h' + h.paint('partial repaint')); opened(); });
     let settled = false;
-    const pending = h.send().then(r => { settled = true; return r; });
+    const pending = h.send({ codexStartupFrameWaitId: common.codexStartupFrameWaitId })
+      .then(r => { settled = true; return r; });
     await openFrameFlushed;
     await drainMicrotasks(100);
     assert.ok(mirror.synchronizedFrameWaiters.size > 0);

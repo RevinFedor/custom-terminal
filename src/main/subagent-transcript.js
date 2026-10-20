@@ -40,9 +40,52 @@ const {
 const MAX_STEP_CHARS = 600;
 const MAX_STEPS_RETURNED = 400;
 const SUBAGENT_READ_CHUNK_BYTES = 4 * 1024 * 1024;
-const { codexOwnTurnLaunchSettings, codexOwnLaunchServiceTier,
+const { codexOwnTurnLaunchSettings, inspectCodexOwnLaunchServiceTier,
   claudeOwnAssistantLaunchSettings } = require('./subagent-launch-settings');
 const MAX_LAUNCH_SETTINGS_RECORD_BYTES = 64 * 1024;
+
+// Scalar explanation of the existing read, not another reader or tier proof.
+// No record/settings body is retained; counters saturate for long-lived files.
+function createLaunchTierDiagnostics(seed = null) {
+  return { reason: 'snapshot-not-observed', seen: 0, own: 0, foreign: 0,
+    beforeRoot: 0, malformed: 0, oversized: 0, lateOwn: 0,
+    line: -1, offset: -1, partial: false,
+    firstLateReason: 'none', firstLateLine: -1, firstLateOffset: -1, ...(seed || {}) };
+}
+
+function noteLaunchTierDiagnostic(diagnostic, reason, record = {}, { own = false, foreign = false, late = false } = {}) {
+  const bump = key => { diagnostic[key] = Math.min(65535, (Number(diagnostic[key]) || 0) + 1); };
+  bump('seen');
+  if (own) bump('own');
+  if (foreign) bump('foreign');
+  if (late && own) {
+    if (!diagnostic.lateOwn) {
+      diagnostic.firstLateReason = reason;
+      diagnostic.firstLateLine = Number.isSafeInteger(record.__line) ? record.__line : -1;
+      diagnostic.firstLateOffset = Number.isSafeInteger(record.__byteOffset) ? record.__byteOffset : -1;
+    }
+    bump('lateOwn');
+  }
+  if (reason === 'settings-before-root') bump('beforeRoot');
+  if (reason === 'settings-record-invalid-json') bump('malformed');
+  if (reason === 'settings-record-too-large') bump('oversized');
+  if (!late) {
+    diagnostic.reason = reason;
+    diagnostic.line = Number.isSafeInteger(record.__line) ? record.__line : -1;
+    diagnostic.offset = Number.isSafeInteger(record.__byteOffset) ? record.__byteOffset : -1;
+  }
+  diagnostic.partial = false;
+}
+
+function sealLaunchTierDiagnostic(diagnostic, proof, record = {}) {
+  if (proof) return;
+  diagnostic.reason = diagnostic.oversized ? 'settings-record-too-large'
+    : diagnostic.malformed ? 'settings-record-invalid-json' : 'initial-snapshot-not-observed';
+  if (!diagnostic.oversized && !diagnostic.malformed) {
+    diagnostic.line = Number.isSafeInteger(record.__line) ? record.__line : -1;
+    diagnostic.offset = Number.isSafeInteger(record.__byteOffset) ? record.__byteOffset : -1;
+  }
+}
 
 function createSubagentStepProjectionState(options = {}) {
   const expectedCodexSessionId = String(options.codexSessionId || '');
@@ -74,6 +117,8 @@ function createSubagentStepProjectionState(options = {}) {
     launchSettings: null,
     launchServiceTier: options.launchServiceTier || null,
     codexLaunchServiceTierSealed: boundarySeen || !!options.launchServiceTier,
+    launchTierDiagnostics: createLaunchTierDiagnostics(options.launchTierDiagnostics
+      || (options.launchServiceTier ? { reason: options.launchServiceTier.serviceTier || 'own-snapshot-unclassified' } : null)),
     sourceStat: null,
   };
 }
@@ -103,6 +148,7 @@ function resetSubagentStepProjectionState(state) {
   state.launchSettings = null;
   state.launchServiceTier = null;
   state.codexLaunchServiceTierSealed = false;
+  state.launchTierDiagnostics = createLaunchTierDiagnostics();
   state.sourceStat = null;
   return state;
 }
@@ -607,6 +653,7 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
   let bootstrapInstruction = rootMetaSeen ? (resume?.bootstrapInstruction || null) : null;
   let launchServiceTier = rootMetaSeen ? (resume?.launchServiceTier || null) : null;
   let launchServiceTierBlocked = rootMetaSeen && resume?.launchServiceTierBlocked === true;
+  const launchTierDiagnostics = createLaunchTierDiagnostics(rootMetaSeen ? resume?.launchTierDiagnostics : null);
   let sourceLine = rootMetaSeen ? Math.max(0, Number(resume?.sourceLine) || 0) : 0;
   let pendingParts = [];
   let pendingBytes = 0;
@@ -629,6 +676,7 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
     bootstrapInstruction,
     launchServiceTier,
     launchServiceTierBlocked,
+    launchTierDiagnostics: { ...launchTierDiagnostics },
     sourceStat,
   });
 
@@ -657,8 +705,17 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
       && lineBuffer.length <= MAX_LAUNCH_SETTINGS_RECORD_BYTES
       && codexRecordShapeFromPrefix(lineBuffer).payloadType === 'thread_settings_applied') {
       let record = null;
-      try { record = JSON.parse(lineBuffer.toString('utf8')); } catch { /* metadata stays unknown */ }
-      launchServiceTier = codexOwnLaunchServiceTier(record, expectedSessionId, sessionId);
+      try { record = JSON.parse(lineBuffer.toString('utf8')); } catch {
+        if (!hasNewline) { launchTierDiagnostics.partial = true; return null; }
+        noteLaunchTierDiagnostic(launchTierDiagnostics, 'settings-record-invalid-json',
+          { __line: lineNumber, __byteOffset: byteOffset });
+      }
+      const inspected = inspectCodexOwnLaunchServiceTier(record, expectedSessionId, sessionId);
+      if (inspected) {
+        noteLaunchTierDiagnostic(launchTierDiagnostics, inspected.reason,
+          { __line: lineNumber, __byteOffset: byteOffset }, { own: !!inspected.proof, foreign: !inspected.proof });
+        launchServiceTier = inspected.proof;
+      }
     }
     if (requiresBoundary && lineBuffer.includes(instructionsMarker)) {
       let contextRecord = null;
@@ -689,6 +746,8 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
     const payload = record?.payload || {};
     if (payload.type !== 'agent_message') return null;
     if (!isExactCodexNewTaskBoundary(payload, { codexAgentPath: agentPath })) return null;
+    sealLaunchTierDiagnostic(launchTierDiagnostics, launchServiceTier,
+      { __line: lineNumber, __byteOffset: byteOffset });
     return {
       found: true,
       requiresBoundary: true,
@@ -715,6 +774,8 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
       pendingPrefix = appendBoundedPrefix(pendingPrefix, segment);
       if (rootMetaSeen && shouldSkipCodexBoundaryLinePrefix(pendingPrefix, pendingBytes + segment.length)) {
         if (!launchServiceTier && codexRecordShapeFromPrefix(pendingPrefix).payloadType === 'thread_settings_applied') {
+          if (!pendingSkip) noteLaunchTierDiagnostic(launchTierDiagnostics, 'settings-record-too-large',
+            { __line: sourceLine, __byteOffset: lineStart });
           launchServiceTierBlocked = true;
         }
         pendingSkip = true;
@@ -759,6 +820,8 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
       pendingPrefix = appendBoundedPrefix(pendingPrefix, tail);
       if (rootMetaSeen && shouldSkipCodexBoundaryLinePrefix(pendingPrefix, pendingBytes + tail.length)) {
         if (!launchServiceTier && codexRecordShapeFromPrefix(pendingPrefix).payloadType === 'thread_settings_applied') {
+          if (!pendingSkip) noteLaunchTierDiagnostic(launchTierDiagnostics, 'settings-record-too-large',
+            { __line: sourceLine, __byteOffset: pendingStart });
           launchServiceTierBlocked = true;
         }
         pendingSkip = true;
@@ -773,6 +836,9 @@ async function findCodexSubagentNewTaskBoundary({ filePath, expectedSessionId = 
     const lineBuffer = Buffer.concat(pendingParts, pendingBytes);
     const hit = inspectLine(lineBuffer, pendingStart, false, sourceLine);
     if (hit) return hit;
+  }
+  if (pendingSkip && codexRecordShapeFromPrefix(pendingPrefix).payloadType === 'thread_settings_applied') {
+    launchTierDiagnostics.partial = true;
   }
   return {
     found: false,
@@ -955,12 +1021,20 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
 
   // Read the first exact child-owned settings snapshot even when it precedes
   // NEW_TASK. Never let a later Resume/settings change masquerade as launch.
-  if (state.codexRootMetaSeen && !state.codexLaunchServiceTierSealed) {
-    const proof = codexOwnLaunchServiceTier(record,
-      state.codexExpectedSessionId, state.codexSessionId);
-    if (proof) {
-      state.launchServiceTier = proof;
-      state.codexLaunchServiceTierSealed = true;
+  if (record?.type === 'event_msg' && type === 'thread_settings_applied') {
+    if (!state.codexRootMetaSeen) {
+      noteLaunchTierDiagnostic(state.launchTierDiagnostics, 'settings-before-root', record);
+    } else {
+      const inspected = inspectCodexOwnLaunchServiceTier(record,
+        state.codexExpectedSessionId, state.codexSessionId);
+      if (inspected) {
+        noteLaunchTierDiagnostic(state.launchTierDiagnostics, inspected.reason, record,
+          { own: !!inspected.proof, foreign: !inspected.proof, late: state.codexLaunchServiceTierSealed });
+        if (!state.codexLaunchServiceTierSealed && inspected.proof) {
+          state.launchServiceTier = inspected.proof;
+          state.codexLaunchServiceTierSealed = true;
+        }
+      }
     }
   }
 
@@ -987,6 +1061,7 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
       && isExactCodexNewTaskBoundary(payload, state)) {
       state.codexNewTaskBoundarySeen = true;
       state.codexLaunchServiceTierSealed = true;
+      sealLaunchTierDiagnostic(state.launchTierDiagnostics, state.launchServiceTier, record);
       state.codexAwaitingFirstVisibleOutput = true;
       state.codexBootstrapInstructionSeen = false;
       state.codexCurrentCanonicalUserText = '';
@@ -1024,6 +1099,7 @@ function codexRecordToSteps(record, projectionState = null, decodeCall = null) {
     || (record?.type === 'event_msg'
       && ['task_started', 'task_complete', 'user_message', 'agent_message'].includes(type)))) {
     state.codexLaunchServiceTierSealed = true;
+    sealLaunchTierDiagnostic(state.launchTierDiagnostics, state.launchServiceTier, record);
   }
   if (!state.launchSettings) state.launchSettings = codexOwnTurnLaunchSettings(record,
     state.codexExpectedSessionId, state.codexSessionId);
@@ -1285,7 +1361,14 @@ function consumeAgentStepChunk({
     const line = skipHeavyCodexRecord || !lineBuffer ? '' : lineBuffer.toString('utf8');
     if (!skipHeavyCodexRecord && line.trim()) {
       let record;
-      try { record = JSON.parse(line); } catch { record = null; }
+      try { record = JSON.parse(line); } catch {
+        record = null;
+        const shape = toolType === 'codex' ? codexRecordShapeFromPrefix(lineBuffer) : null;
+        if (shape?.recordType === 'event_msg' && shape.payloadType === 'thread_settings_applied') {
+          noteLaunchTierDiagnostic(state.launchTierDiagnostics, 'settings-record-invalid-json',
+            { __line: sourceLine, __byteOffset: sourceByteOffset }, { late: state.codexLaunchServiceTierSealed });
+        }
+      }
       if (record) {
         if (!Number.isFinite(record.__line)) record.__line = sourceLine;
         if (!Number.isFinite(record.__byteOffset)) record.__byteOffset = sourceByteOffset;
@@ -1325,6 +1408,11 @@ function consumeAgentStepChunk({
     state.pendingLineBytes = (Number(state.pendingLineBytes) || 0) + tail.length;
   }
   const nextOffset = from + bytesRead;
+  if (toolType === 'codex') {
+    const shape = codexRecordShapeFromPrefix(state.pendingLinePrefix);
+    state.launchTierDiagnostics.partial = shape.recordType === 'event_msg'
+      && shape.payloadType === 'thread_settings_applied';
+  }
   return {
     success: true,
     steps: steps.slice(-MAX_STEPS_RETURNED),

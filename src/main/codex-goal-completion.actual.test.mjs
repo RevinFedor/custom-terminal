@@ -75,6 +75,7 @@ test('actual store busy edge and common bell gate preserve armed state until Goa
   const sent = [];
   const c = vm.createContext({ get: () => state, set() {}, useWorkspaceStore: { getState: () => state },
     console: { warn() {} }, Map, shouldDeferTabCompletionNotification,
+    deferredTabCompletionReasons: new WeakMap(),
     isOrchestrationCompletionBlocked: () => false, tabHasPendingQueueContinuation: () => false,
     isNaturalAgentTurnEndReason: reason => reason === 'task_complete',
     emitTabCompletionNotificationCleared() {}, emitTabCompletionNotificationStateChanged() {},

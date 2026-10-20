@@ -29,7 +29,7 @@ test('migrated picker reads the captured opaque target, never its common executi
   const target = { tabId: 'captured:tab', projectId: '__global_namespace__', organizationReady: true };
   const catalog = await loadPickerPromptCatalog(ipc, target);
   assert.deepEqual(requests, [['project-prompts:list-tab', 'captured:tab']]);
-  assert.equal(catalog.project.name, 'Промпты рабочего пространства');
+  assert.equal(catalog.project.name, 'Workflow');
   assert.equal(catalog.prompts[0].id, 'stable:legacy');
   await loadPickerPromptCatalog(ipc, { ...target, organizationReady: false });
   assert.deepEqual(requests.at(-1), ['project-prompts:list', '__global_namespace__']);

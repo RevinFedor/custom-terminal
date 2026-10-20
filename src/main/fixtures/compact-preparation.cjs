@@ -10,6 +10,7 @@ const main = fs.readFileSync(path.join(process.env.ACTUAL_SOURCE_DIR || path.joi
 const ast = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
 const names = ['executeCodexLiveSlashCommandRequest', 'sendCodexLiveSlashCommand', 'sendCodexSlashCommand',
   'writeHistorySendEnter',
+  'writeHistorySendPayload', 'publishHistorySendReturn',
   'readCodexPickerWriteRefusal', 'captureCodexOwnedSlashDraftIdentity', 'validateCodexOwnedSlashDraftIdentity',
   'validateCodexOwnedModelInputIdentity', 'retainCodexOwnedModelInput', 'releaseCodexOwnedModelInput',
   'readCodexOwnedModelInputDecision', 'waitForCodexOwnedModelPaste', 'isCodexOwnedSlashSubmitReady',
@@ -60,6 +61,7 @@ function fixture(t, { capturedDraft = false, immediate = false, throwEnter = fal
   ctx.terminals.set('T', term); ctx.terminalCommandState.set('T', { runSeq: 1, isRunning: true });
   Object.assign(ctx, { ...preparation, ...require('../codex-runtime-contract'), ...require('../codex-model-picker'),
     ...require('../agent-send-enter-timing'), mainWindow: null,
+    ...require('../history-send-return'),
     ...require('../codex-compact-slash-submit'), ...require('../codex-slash-input-diagnostics'),
     readAgentSendPreparation: (s, tab, opts, cold) => preparation.readAgentSendPreparation(s, tab, opts, cold, h.clock.now),
     createInputPreparation: (deadline, why) => preparation.createInputPreparation(deadline, why, h.clock.now),

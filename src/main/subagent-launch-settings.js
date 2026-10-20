@@ -27,16 +27,29 @@ function codexOwnTurnLaunchSettings(record, sessionId, physicalSessionId) {
 
 // Independent of model/effort creation proof: started and turn_context do not
 // carry this field. A copied ancestor snapshot keeps its original thread_id.
-function codexOwnLaunchServiceTier(record, sessionId, physicalSessionId) {
+function inspectCodexOwnLaunchServiceTier(record, sessionId, physicalSessionId) {
   const payload = record?.payload;
-  if (record?.type !== 'event_msg' || payload?.type !== 'thread_settings_applied'
-    || !clean(sessionId) || sessionId !== physicalSessionId
-    || payload.thread_id !== sessionId) return null;
+  if (record?.type !== 'event_msg' || payload?.type !== 'thread_settings_applied') return null;
+  if (!clean(sessionId)) return { proof: null, reason: 'owner-unavailable' };
+  if (sessionId !== physicalSessionId) return { proof: null, reason: 'root-owner-mismatch' };
+  if (!payload.thread_id) return { proof: null, reason: 'thread-id-missing' };
+  if (payload.thread_id !== sessionId) return { proof: null, reason: 'foreign-thread' };
   const value = payload.thread_settings?.service_tier;
   const tier = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  return { version: 1, provider: 'codex', sessionId, source: 'own-thread-settings',
+  const proof = { version: 1, provider: 'codex', sessionId, source: 'own-thread-settings',
     serviceTier: tier === 'priority' || tier === 'fast' ? 'priority' : tier === 'default' ? 'default' : null,
     timestamp: clean(record.timestamp) };
+  const reason = proof.serviceTier || (!payload.thread_settings ? 'settings-object-absent'
+    : !Object.hasOwn(payload.thread_settings, 'service_tier') ? 'tier-field-absent'
+      : value === null ? 'tier-null'
+        : typeof value !== 'string' ? 'tier-invalid-type'
+          : tier ? 'tier-unsupported-string' : 'tier-empty-string');
+  // Only a fixed reason vocabulary, never an unknown raw settings value.
+  return { proof, reason };
+}
+
+function codexOwnLaunchServiceTier(record, sessionId, physicalSessionId) {
+  return inspectCodexOwnLaunchServiceTier(record, sessionId, physicalSessionId)?.proof || null;
 }
 
 function claudeOwnAssistantLaunchSettings(record) {
@@ -47,4 +60,4 @@ function claudeOwnAssistantLaunchSettings(record) {
 }
 
 module.exports = { codexStartedLaunchSettings, codexOwnTurnLaunchSettings,
-  codexOwnLaunchServiceTier, claudeOwnAssistantLaunchSettings };
+  codexOwnLaunchServiceTier, inspectCodexOwnLaunchServiceTier, claudeOwnAssistantLaunchSettings };

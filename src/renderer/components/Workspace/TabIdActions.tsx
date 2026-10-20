@@ -3,17 +3,18 @@ import { Clock3, Copy, Plus } from 'lucide-react';
 import voiceRecordIcon from '../../assets/icons/voice-record.svg';
 import { CONTEXT_MENU_COMPACT_ROW_STYLE } from '../UI/contextMenuMetrics.mjs';
 
-export function TabIdActions({ tabIds, onClose, showToast }: {
+export function TabIdActions({ tabIds, onClose, showToast, isCurrent }: {
   tabIds: string[];
   onClose: () => void;
   showToast: (message: string, type: 'error' | 'success') => void;
+  isCurrent?: () => boolean;
 }) {
   const inFlight = useRef(false);
   const enabled = tabIds.length > 0;
   const base = 'min-w-0 text-[12px] flex items-center justify-center text-[#ccc] hover:bg-white/10 cursor-pointer disabled:text-[#555] disabled:cursor-not-allowed';
   const insert = async (event: React.MouseEvent, withTime = false) => {
     event.stopPropagation();
-    if (inFlight.current) return;
+    if (inFlight.current || isCurrent?.()===false) return;
     inFlight.current = true;
     const payload = { tabIds: [...tabIds], ...(withTime ? { timestamp: Date.now() } : {}) };
     onClose();
@@ -43,6 +44,7 @@ export function TabIdActions({ tabIds, onClose, showToast }: {
       title={tabIds.length > 1 ? `Скопировать ID: ${tabIds.length}` : 'Скопировать ID вкладки'} disabled={!enabled}
       onClick={event => {
         event.stopPropagation();
+        if(isCurrent?.()===false)return;
         window.require('electron').clipboard.writeText(tabIds.join('\n'));
         showToast(tabIds.length > 1 ? `Скопировано ID: ${tabIds.length}` : 'ID скопирован', 'success');
         onClose();

@@ -22,6 +22,7 @@ import {
   ColoredToolIcon,
   ComposerChip,
   defaultOpenForTool,
+  mcpServerDisplayLabel,
   ThinkBlock,
   ToolCallPart,
   toolIcon,
@@ -143,7 +144,7 @@ const historyInnerGroupHeaderData = (group: HistoryPresentationGroup): HistoryGr
   );
   const docsKind = String(group.docsKind || '');
   if (family === 'mcp') {
-    const server = String(group.facts?.[0]?.mcpServer || 'mcp').replace(/_/g, ' ');
+    const server = mcpServerDisplayLabel(String(group.facts?.[0]?.mcpServer || 'mcp')).replace(/_/g, ' ');
     return {
       segments: [{
         key: `mcp:${server}:${docsKind || 'regular'}`,
@@ -184,7 +185,7 @@ const historyGroupHeaderData = (group: HistoryPresentationGroup): HistoryGroupHe
       if (servers.length === 0) servers.push(['mcp', bucket.count]);
       for (let serverIndex = 0; serverIndex < servers.length; serverIndex += 1) {
         const [rawServer, count] = servers[serverIndex];
-        const server = String(rawServer || 'mcp').replace(/_/g, ' ');
+        const server = mcpServerDisplayLabel(String(rawServer || 'mcp')).replace(/_/g, ' ');
         const errorCount = historyFactErrorCount(group.facts || [], (fact) => (
           historyFactFamily(fact) === 'mcp'
           && String(fact.mcpServer || 'mcp') === String(rawServer || 'mcp')
@@ -235,7 +236,10 @@ const historyGroupHeaderData = (group: HistoryPresentationGroup): HistoryGroupHe
     const bucket = breakdown[0];
     const parts = bucket.subjects.length > 0
       ? bucket.subjects
-      : Array.from(bucket.words.entries()).map(([word, n]) => (n > 1 ? `${word} ×${n}` : word));
+      : Array.from(bucket.words.entries()).map(([word, n]) => {
+        const label = bucket.family === 'mcp' ? mcpServerDisplayLabel(word) : word;
+        return n > 1 ? `${label} ×${n}` : label;
+      });
     return { segments, digest: parts.join(', ') };
   }
   return { segments, digest: '' };

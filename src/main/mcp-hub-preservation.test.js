@@ -25,7 +25,7 @@ setting:process.env.NOTED_SERVICE_OPTION,identity:process.env.NOTED_PARENT_TAB_I
 process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n')});`;
 
 function fixture(t) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-profile-'));
+  const home = fs.mkdtempSync(path.join(process.env.SC_OWN_HOST_FIXTURE_ROOT || os.tmpdir(), 'noted-profile-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const file = path.join(home, '.noted-terminal/mcp-hub.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -78,6 +78,7 @@ test('integration: shared child identity and credentials never enter status or l
 });
 
 test('integration: busy legacy hub is not replaced even by upgrade ensure', async t => {
+  const f = fixture(t);
   let writes = 0, spawns = 0;
   const legacy = http.createServer((req, res) => {
     if (req.url === '/mcp/_status') res.end(JSON.stringify({ pid: 999, servers: [
@@ -87,6 +88,7 @@ test('integration: busy legacy hub is not replaced even by upgrade ensure', asyn
   await new Promise(done => legacy.listen(0, '127.0.0.1', done));
   t.after(() => { legacy.closeAllConnections(); legacy.close(); });
   const controller = createMcpHubController({ port: legacy.address().port, startupTimeoutMs: 200, log() {},
+    ingressFile: path.join(f.home, 'private-ingress.json'),
     readConfiguration: () => ({ serverDefs: { browser: {} }, status: {}, fingerprint: 'test', canLaunch: true }),
     spawnImpl() { spawns++; throw new Error('must not spawn'); } });
   assert.equal((await controller.ensure({ upgrade: true })).pid, 999);
@@ -250,12 +252,13 @@ test('profile: bad cold config refuses spawn; correction allows retry; observer 
   f.write(f.disabled); assert.equal((await controller.ensure()).configurationApplied, true); assert.equal(d.children.length, 1);
 });
 
-test('integration: catalog timeout cannot cancel an active tool call', async () => {
+test('integration: catalog timeout cannot cancel an active tool call', async (t) => {
+  const f = fixture(t);
   const source = `const rl=require('readline').createInterface({input:process.stdin});rl.on('line',line=>{
     const m=JSON.parse(line);const reply=result=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');
     if(m.method==='initialize')reply({capabilities:{tools:{}}});
     if(m.method==='tools/call')setTimeout(()=>reply({ok:true}),120);});`;
-  const hub = new McpHub({ port: 0, log() {}, catalogTimeoutMs: 20,
+  const hub = new McpHub({ port: 0, env: f.env, log() {}, catalogTimeoutMs: 20,
     serverDefs: { browser: { command: process.execPath, args: ['-e', source], env: {} } } });
   const child = hub.children.get('browser');
   try {
@@ -267,7 +270,7 @@ test('integration: catalog timeout cannot cancel an active tool call', async () 
   } finally { await hub.stop(); }
 });
 
-test('integration: reaper uses explicit marker or node script, never generic argv', () => {
+test('integration: generic reaper excludes Browser and still uses exact unrelated marker, never generic argv', () => {
   const source = `const cp=require('child_process');
     cp.execFileSync=()=>Buffer.from('111 1 unrelated --stdio\\n222 1 node /owned/entry.js\\n333 1 electron /owned/sc.js\\n444 55 node /owned/entry.js\\n555 1 node /owned/entry.js.old\\n666 1 electron /owned/sc.js.backup\\n');
     const killed=[];process.kill=pid=>killed.push(pid);
@@ -276,7 +279,7 @@ test('integration: reaper uses explicit marker or node script, never generic arg
       'sc-desktop':{command:'/owned/wrapper',args:[],env:{},reapMarker:'/owned/sc.js'}}});
     hub.reapOrphanedChildren();process.stdout.write(JSON.stringify(killed));`;
   const result = spawnSync(process.execPath, ['-e', source], { encoding: 'utf8' });
-  assert.equal(result.status, 0, result.stderr); assert.deepEqual(JSON.parse(result.stdout), [222, 333]);
+  assert.equal(result.status, 0, result.stderr); assert.deepEqual(JSON.parse(result.stdout), [333]);
 });
 
 test('profile: bare IPC readiness cannot attest desired config when status read fails', async () => {

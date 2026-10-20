@@ -385,7 +385,7 @@ function SpaceChip({
         switchQueuedRef.current = true;
         if (!pending) setPending(true);
         const commitSwitch = () => {
-          useWorkspaceStore.getState().switchWorkspaceSpace(id);
+          useWorkspaceStore.getState().switchWorkspaceSpace(id, { source: 'workflow-strip' });
           if (useWorkspaceStore.getState().activeSpaceId === id
             && useWorkspaceStore.getState().view === 'workspace') {
             switchQueuedRef.current = false;

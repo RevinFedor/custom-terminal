@@ -54,6 +54,13 @@ function terminalUserNotificationId(tabId, requestId) {
   return 'terminal-user:' + createHash('sha256').update(JSON.stringify([tabId, requestId])).digest('hex');
 }
 
+// Reserved producer identities, not user text. Retain compatibility with
+// already-persisted operational notices when the automatic channel is disabled.
+function isAutomaticResearchNotification(envelope) {
+  return envelope?.kind === 'terminal-user' && typeof envelope.requestId === 'string'
+    && /^(?:operational-human:research-operational:|research-browser-offline:)[a-f0-9]{64}$/.test(envelope.requestId);
+}
+
 function buildTerminalUserEnvelope(detail = {}) {
   const string = (value, field, limit) => {
     if (typeof value !== 'string' || !value.trim() || value.trim().length > limit
@@ -259,6 +266,7 @@ class ScDesktopNotificationOutbox {
     maxRetryMs = OUTBOX_MAX_RETRY_MS,
     maxPending = OUTBOX_MAX_PENDING,
     strictLoad = false,
+    allowAutomaticResearchNotifications = false,
   } = {}) {
     if (!storagePath) throw new Error('storagePath required');
     this.storagePath = storagePath;
@@ -268,6 +276,7 @@ class ScDesktopNotificationOutbox {
     this.maxRetryMs = Math.max(this.initialRetryMs, Number(maxRetryMs) || OUTBOX_MAX_RETRY_MS);
     this.maxPending = Math.max(1, Number(maxPending) || OUTBOX_MAX_PENDING);
     this.strictLoad = strictLoad;
+    this.allowAutomaticResearchNotifications = allowAutomaticResearchNotifications === true;
     this.loadError = null;
     this.pending = new Map();
     this.settled = new Map();
@@ -340,7 +349,7 @@ class ScDesktopNotificationOutbox {
         const receipt = value.userReceipt;
         const envelope = normalizeStoredEnvelope(receipt?.envelope);
         if (envelope?.kind === 'terminal-user' && envelope.eventId === eventId
-          && ['sent', 'failed'].includes(receipt.deliveryState)
+          && ['sent', 'failed', 'suppressed'].includes(receipt.deliveryState)
           && (receipt.deliveryState !== 'sent' || Number.isSafeInteger(receipt.sentAt) && receipt.sentAt > 0
             && Number.isSafeInteger(receipt.messageId) && receipt.messageId > 0)) {
           this.userReceipts.set(eventId, { ...receipt, envelope, receiptDurable: true });
@@ -545,6 +554,19 @@ class ScDesktopNotificationOutbox {
   }
 
   async deliverRecord(record) {
+    if (!this.allowAutomaticResearchNotifications && isAutomaticResearchNotification(record.envelope)) {
+      const eventId = record.envelope.eventId;
+      this.pending.delete(eventId);
+      this.settled.set(eventId, Date.now());
+      const receipt = { envelope: record.envelope, deliveryState: 'suppressed',
+        error: 'Automatic Research Telegram notifications are disabled',
+        errorCode: 'research_automatic_notifications_disabled',
+        previousDeliveryState: record.deliveryState || 'pending', previousAttemptCount: record.attemptCount,
+        ...(record.lastError ? { previousError: { ...record.lastError } } : {}) };
+      this.userReceipts.set(eventId, receipt);
+      receipt.receiptDurable = await this.persistSafely('research-notification-suppressed');
+      return;
+    }
     let result;
     try {
       result = await this.transport(record.envelope);
@@ -626,6 +648,7 @@ module.exports = {
   buildTerminalCompletionEnvelope,
   buildTerminalUserEnvelope,
   terminalUserNotificationId,
+  isAutomaticResearchNotification,
   postTerminalCompletionToScDesktop,
   createScDesktopNotificationOutbox,
 };

@@ -5,6 +5,7 @@ import { stripTypeScriptTypes } from 'node:module';
 import test from 'node:test';
 import sendTargetContract from '../../shared/agent-send-target-precondition.cjs';
 import manualActionContract from '../../shared/agent-manual-action.cjs';
+import codexPolicies from '../../main/codex-runtime-policies.js';
 import { runAgentSendFlow } from './agentSendFlow.mjs';
 import { createAgentLaunchAdmission } from './agentLaunchAdmission.mjs';
 import { createLaunchFixture, assertOnlyFenceObservers } from './agentLaunchFixture.mjs';
@@ -367,6 +368,67 @@ test('Goal policy manual transition wakes the same pending Send and releases lis
   assert.equal(h.timers.size, 0); assertOnlyFenceObservers(h.ipcRenderer);
 });
 
+const goalMenu = 'Resume paused goal?\nGoal: synthetic task\n> 1. Resume goal   Mark it active and continue when idle\n  2. Leave paused  Keep it paused; use /goal resume later\nPress enter to confirm or esc to go back';
+function goalConfirmationHarness() {
+  const h = harness(), owner = { terminal: {}, lifecycleGeneration: 'G', runSeq: 1, inputRevision: 1, live: true, turnId: 'old' };
+  const policyTimers = new Map(), keys = []; let serial = 0, base = { status: 'starting', sessionStatus: 'starting', inputReady: false,
+    runtimeSnapshot: startupSnapshot() }, frame = { valid: true, seq: 10, text: goalMenu };
+  const update = () => {
+    h.setState(codexPolicies.projectCodexPolicyRuntime(base, controller.read('T')));
+    h.ipcRenderer.emit('agent:readiness-changed', null, { tabId: 'T', toolType: 'codex', source: 'runtime-policy' });
+  };
+  const controller = codexPolicies.createCodexRuntimePolicyController({ capture: () => ({ ...owner }), readFrame: async () => frame,
+    withWriteLock: async (_term, work) => work({ active: true }), sendKey: async (_tab, key) => { keys.push(key); return { written: true }; },
+    readPolicy: () => ({ resumeGoal: true }), isComposer: value => value.text === 'proven-current-composer',
+    stopAll: () => { throw Error('Goal must not Stop'); }, publish: update,
+    setTimer: (callback, ms) => { const id = ++serial; policyTimers.set(id, { callback, ms }); return id; },
+    clearTimer: id => policyTimers.delete(id) });
+  controller.observe('T', frame); update();
+  return { h, controller, keys, owner, policyTimers,
+    async checkAfter3s(extra = {}) {
+      frame = { ...frame, valid: false, ...extra }; h.advance(3500);
+      const entry = [...policyTimers].find(([_id, timer]) => timer.ms === 3000); assert.ok(entry);
+      policyTimers.delete(entry[0]); await entry[1].callback(); await tick();
+    },
+    operational() { base = { ...base, status: 'busy', sessionStatus: 'busy', inputReady: true };
+      controller.observeOperationalTurn('T', 'new-owned-turn'); },
+    paint(text) { frame = { valid: true, seq: frame.seq + 1, text }; if (text === 'proven-current-composer')
+      base = { ...base, status: 'active', sessionStatus: 'active', inputReady: true };
+      controller.observe('T', frame); },
+  };
+}
+
+for (const result of ['operational', 'composer']) test('Goal open redraw after3s retains SAME Send until exact ' + result + ' proof', async () => {
+  const g = goalConfirmationHarness(); await tick();
+  let prepared = 0, submitted = 0, proved = 0, settled = false;
+  const context = Object.freeze({ handoffId: 'H753', operationKey: 'history:T:H753', attemptId: 'A753', text: 'frozen authoring' });
+  const pending = runAgentSendFlow({ prepareContext: async () => { prepared++; return context; }, ensureReady: () => g.h.start(),
+    proveComposer: async () => { proved++; }, runProviderOperation: async value => {
+      assert.strictEqual(value, context); submitted++; return { success: true }; } });
+  pending.then(() => { settled = true; }, () => { settled = true; }); await tick();
+  await g.checkAfter3s();
+  assert.equal(g.controller.read('T').manualActionRequired, false, 'unobserved result is not a proven live Goal menu');
+  assert.equal(g.controller.readGoalAction('T').status, 'unknown');
+  assert.equal(settled, false); assert.equal(submitted, 0); assert.equal(proved, 0); assert.equal(prepared, 1);
+  assert.equal(g.policyTimers.size, 0, 'no polling or replacement policy deadline');
+  if (result === 'operational') g.operational(); else g.paint('proven-current-composer');
+  await pending; assert.equal(submitted, 1); assert.equal(proved, 1); assert.equal(prepared, 1);
+  assert.deepEqual(g.keys, ['\r']); assert.equal(g.h.resumes, 0); assert.equal(g.h.timers.size, 0);
+});
+
+for (const stop of ['cancel','expiry','live-menu']) test('Goal unobserved result preserves original Send ' + stop + ' fence', async () => {
+  const g = goalConfirmationHarness(); await tick(); let submitted = 0;
+  const pending = runAgentSendFlow({ prepareContext: async () => Object.freeze({ handoffId:'H753',attemptId:'A753' }), ensureReady: () => g.h.start(),
+    proveComposer: async () => {}, runProviderOperation: async () => { submitted++; } });
+  const rejected = assert.rejects(pending, error => stop === 'cancel' ? error.cancelled === true
+    : stop === 'expiry' ? error.code === 'agent_send_readiness_timeout' : error.code === 'codex_resume_goal_action_required');
+  await tick(); await g.checkAfter3s(); assert.equal(submitted,0);
+  if (stop === 'cancel') g.h.cancel(); else if (stop === 'expiry') await g.h.wakeAt(61001); else g.paint(goalMenu);
+  await rejected; g.operational(); g.paint('proven-current-composer'); await tick();
+  assert.equal(submitted,0,'late success must not revive a cancelled/expired/rejected Send');
+  assert.deepEqual(g.keys,['\r']); assert.equal(g.h.timers.size,0); assertOnlyFenceObservers(g.h.ipcRenderer);
+});
+
 test('normal History Send leaves draft proof after readiness in the common scenario', () => {
   const history = fs.readFileSync(new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url), 'utf8');
   const match = history.match(/if \(([^\n]+)\) \{\s*const terminalDraft = await readTerminalDraft\('send-preflight'\)/);
@@ -392,4 +454,92 @@ test('main readiness changes wake both main and renderer waiters without synthes
   assert.equal(calls[1][0], 'agent:readiness-changed');
   assert.equal(calls[1][1].tabId, 'T');
   assert.equal(calls[1][1].toolType, 'codex');
+});
+
+for (const cancel of [false, true]) test('actual /fast completion wakes the same cold Send after a stale blocked reply; cancelled=' + cancel, async () => {
+  const h = harness();
+  let resolveOldPresence, reads = 0, result, error, ready, preparations = 0, proofs = 0, submits = 0;
+  h.runtime.getPresence = async () => {
+    reads++;
+    if (reads === 2) return new Promise(resolve => { resolveOldPresence = resolve; });
+    return reads < 2
+      ? { status: 'active', inputReady: false, runtimeSnapshot: startupSnapshot() }
+      : { status: 'active', inputReady: true, runtimeSnapshot: { ...startupSnapshot(), startupWait: null } };
+  };
+  const frozen = Object.freeze({ text: 'exact original text', handoffId: 'same-H', operationKey: 'same-O', attemptId: 'same-A' });
+  const pending = runAgentSendFlow({
+    prepareContext: async () => { preparations++; return frozen; },
+    ensureReady: async () => { ready = await h.start(); return ready; },
+    proveComposer: async context => { assert.strictEqual(context, frozen); proofs++; },
+    runProviderOperation: async context => { assert.strictEqual(context, frozen); submits++; return { success: true }; },
+  }).then(value => { result = value; }, value => { error = value; });
+  await tick();
+  assert.equal(typeof resolveOldPresence, 'function', 'readiness listener is armed before the pending Main presence reply');
+  const declaration = name => {
+    const at = main.indexOf('function ' + name + '(');
+    const end = main.indexOf('\n}\n', at) + 3;
+    assert.ok(at >= 0 && end > at, name);
+    return main.slice(main.slice(Math.max(0, at - 6), at) === 'async ' ? at - 6 : at, end);
+  };
+  const writes = [], notifications = [];
+  const fn = vm.runInNewContext(declaration('emitAgentReadinessChanged') + '\n'
+    + declaration('sendCodexLiveSlashCommand') + '\nsendCodexLiveSlashCommand', {
+    console: { log() {}, warn() {} }, codexTurnWatchers: new Map(),
+    ipcMain: { emit: (...args) => notifications.push(args) },
+    mainWindow: { isDestroyed: () => false, webContents: {
+      send: (name, detail) => { notifications.push([name, detail]); h.ipcRenderer.emit(name, {}, detail); },
+    } },
+    // Only physical slash transport is controlled; Main's completion and the
+    // renderer's admission/readiness loop/listeners are actual product code.
+    sendCodexSlashCommand: async (_term, text) => { writes.push(text); return { success: true, submitted: true }; },
+  });
+  try {
+    h.advance(43000); // launch + delayed /fast still fit the original HEAD budget
+    if (cancel) h.cancel();
+    const control = await fn({}, { tabId: 'T', command: '/fast', hasDraft: false });
+    assert.equal(control.success, true);
+    // This was sampled while /fast owned input, but arrives after it settled.
+    resolveOldPresence({ status: 'active', inputReady: false, runtimeSnapshot: startupSnapshot() });
+    await tick();
+    if (cancel) {
+      assert.equal(error?.cancelled, true); assert.equal(result, undefined);
+      assert.equal(proofs, 0); assert.equal(submits, 0, 'a completion wake cannot revive the cancelled Send');
+    } else {
+      assert.equal(result?.success, true, 'completed /fast must wake a fresh read, not park Send until its deadline');
+      assert.equal(ready?.status, 'active'); assert.equal(error, undefined);
+      assert.equal(proofs, 1); assert.equal(submits, 1, 'one controlled provider adapter call, no replay');
+    }
+    assert.equal(preparations, 1, 'no context rebuild or new H/O/A');
+    assert.deepEqual(writes, ['/fast']); assert.equal(h.resumes, 0);
+    assert.equal(notifications.filter(x => x[0] === 'agent:readiness-changed').length, 1);
+    assert.equal(h.timers.size, 0);
+  } finally { h.cancel(); await pending; }
+  assertOnlyFenceObservers(h.ipcRenderer);
+});
+
+test('actual fast wake is not a readiness grant; refusals/other controls emit nothing and observer failure cannot undo the result', async () => {
+  const begin = main.indexOf('async function sendCodexLiveSlashCommand(');
+  const end = main.indexOf('\n}\n', begin) + 3;
+  assert.ok(begin >= 0 && end > begin);
+  for (const [command, transport, throws, count] of [
+    ['/fast', { success: false, submitted: true }, false, 0],
+    ['/fast', { success: true, submitted: false }, false, 0],
+    ['/compact', { success: true, submitted: true }, false, 0],
+    ['/fast', { success: true, submitted: true }, false, 1],
+    ['/fast', { success: true, submitted: true }, true, 1],
+  ]) {
+    const events = [], warnings = [];
+    const fn = vm.runInNewContext(main.slice(begin, end) + '\nsendCodexLiveSlashCommand', {
+      codexTurnWatchers: new Map(), console: { log() {}, warn: line => warnings.push(line) },
+      sendCodexSlashCommand: async () => transport,
+      emitAgentReadinessChanged: (tabId, detail) => { events.push({ tabId, ...detail }); if (throws) throw Error('fixture IPC gone'); },
+    });
+    const outcome = await fn({}, { tabId: 'T', command, hasDraft: false });
+    assert.strictEqual(outcome, transport); assert.equal(events.length, count);
+    if (events.length) {
+      assert.equal(events[0].status, 'changed'); assert.equal(events[0].toolType, 'codex');
+      assert.equal(events[0].reason, 'fast-command-settled'); assert.equal(events[0].inputReady, undefined);
+    }
+    assert.equal(warnings.length, throws ? 1 : 0);
+  }
 });

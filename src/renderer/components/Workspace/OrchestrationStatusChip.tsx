@@ -30,7 +30,7 @@ import { RequestTrackerRow, RequestTrackerStatus, requestRowActionStyle, request
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import type { OrchestrationRun, OrchestrationStatus } from '../../store/useOrchestrationStore';
 import { isOrchestrationResultProofPending, mergeOrchestrationRuns } from '../../utils/orchestrationRunProjection.mjs';
-import { orchestrationRequestTime, orchestrationDetailRows } from '../../utils/orchestrationDetails.mjs';
+import { orchestrationRequestTime, orchestrationDetailRows, orchestrationLinkedName } from '../../utils/orchestrationDetails.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -542,7 +542,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
 
   const renderTooltip = (run: OrchestrationRun) => {
     const isSource = run.sourceTabId === tabId;
-    const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
+    const linkedTabName = orchestrationLinkedName(run, tabId);
     const linkedProjectName = isSource ? run.targetProjectName : run.sourceProjectName;
     const presentation = runPresentation(run, tabId);
     const remaining = countdown(run.recoveryDeadlineAt, now);
@@ -653,7 +653,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
             onOpen={openMessage} onDismiss={cancelMessage} error={messages.actionErrors[entry.thread.question.messageId]} />;
           const run = entry.run;
           const isSource = run.sourceTabId === tabId;
-          const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
+          const linkedTabName = orchestrationLinkedName(run, tabId);
           const linkedProjectName = isSource ? run.targetProjectName : run.sourceProjectName;
           const presentation = runPresentation(run, tabId);
           const requestTime = orchestrationRequestTime(run);
@@ -817,7 +817,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth, queu
         >
           {statusRuns.map((run, index) => {
             const isSource = run.sourceTabId === tabId;
-            const linkedTabName = isSource ? run.targetTabName : run.sourceTabName;
+            const linkedTabName = orchestrationLinkedName(run, tabId);
             const presentation = runPresentation(run, tabId);
             const canDismissAttention = presentation.icon === 'error'
               && run.status !== 'waiting_recovery'

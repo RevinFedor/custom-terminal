@@ -8,7 +8,7 @@ export function useHorizontalOrderPreview(
   containerRef: MutableRefObject<HTMLElement | null>,
   itemSelector: string,
   idAttribute: string,
-  options: { duration?: number; easing?: string; animate?: boolean } = {},
+  options: { duration?: number; easing?: string; animate?: boolean; projectionIds?: string[] | null } = {},
 ) {
   const [previewIds, setPreviewIds] = useState<string[] | null>(null);
   const previewRef = useRef<string[] | null>(null);
@@ -53,7 +53,11 @@ export function useHorizontalOrderPreview(
     setPreviewIds(null);
   }, [animate, capture]);
 
-  const displayedIds = previewIds || baseIds;
+  // The wrapped strip already knows its physical/released presentation owner.
+  // Read its projection in this render, so owner retirement cannot replay the
+  // previous hook state for one commit. Imperative callers keep their API.
+  const displayedIds = Object.hasOwn(options,'projectionIds')
+    ? options.projectionIds || baseIds : previewIds || baseIds;
   const displayedKey = displayedIds.join('\u0000');
   const baseKey = baseIds.join('\u0000');
 

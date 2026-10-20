@@ -80,6 +80,7 @@ export const SPACE_LAYOUT_FIELDS = Object.freeze([
   'splitFocusedIndex',
   'splitSizes',
   'centerStrips',
+  'centerStripRowPlacements',
   // Проект, на котором стоит боковой список, и вкладка, которую показывает
   // центр: пространство это рабочий контекст целиком, и возврат в него без них
   // означал бы «окна те, а смотрю не туда».
@@ -105,6 +106,7 @@ export function emptySpaceLayout() {
     splitFocusedIndex: 0,
     splitSizes: null,
     centerStrips: {},
+    centerStripRowPlacements: {},
     activeProjectId: null,
     focusedProjectId: null,
     activeSpaceTab: null,
@@ -197,7 +199,9 @@ export function addSpace(spaces, activeSpaceId, id, name, metadata = {}) {
     name: nextName(list, (name && String(name).trim()) || 'Пространство'),
     icon: typeof metadata.icon === 'string' ? metadata.icon : null,
     projectIds: normalizeProjectIds(metadata.projectIds),
-    layout: emptySpaceLayout(),
+    // First hover during a drag must reveal the same window that was in its
+    // pickup snapshot. Materializing it only on activation changes that target.
+    layout: { ...emptySpaceLayout(), splitPanes: [{ windowId: `${id}:initial`, projectId: '', tabId: '' }] },
   };
   return { spaces: list.concat([created]), activeSpaceId: id, createdId: id };
 }

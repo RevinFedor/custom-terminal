@@ -46,6 +46,11 @@ function harness({ frameTimedOut = true, synchronousClear = true, diagnosticLogT
   } };
   const ctx = vm.createContext({ ...picker, codexNativeDraftTransfer, observeAgentInput,
     ...require('./agent-send-preparation'), agentSendReceiptStore: null,
+    // These are unregistered picker operations; History return has separate
+    // real-SQLite + actual-writer controls.
+    historySendReturnControl: () => ({ isReturned: () => false }),
+    writeHistorySendPayload: (term, data) => term.write(data),
+    writeHistorySendEnter: (term, data) => term.write(data),
     ...require('./codex-slash-input-diagnostics'),
     ...require('./codex-runtime-contract'),
     codexSendStartupFrameWaits: new WeakMap(), CODEX_STARTUP_NO_STATE_TIMEOUT_MS: 60000,
@@ -220,15 +225,15 @@ test('slash diagnostics distinguish a late MCP control from a missing echo frame
   h.change('input');
 });
 
-test('failed slash preparation cancels only its unused model-menu reader', async () => {
+test('failed slash preparation never arms a premature model-menu reader', async () => {
   const h = harness(); let cancelled = 0;
   h.ctx.captureCodexFrame = () => Object.assign(new Promise(() => {}), { cancel: () => { cancelled++; } });
   const result = await h.ctx.withPtyWriteLock(h.term, () => h.ctx.selectCodexModelEffort(h.term, {
     tabId: 'T', model: 'gpt-6.1-sol', effort: 'high', hasDraft: false,
     readDraftState: async () => ({ success: true, hasDraft: false }),
   }));
-  assert.equal(result.success, false); assert.equal(cancelled, 1);
-  assert.equal(h.receipt.command, '/model', 'physical insertion lifetime survives reader cancellation');
+  assert.equal(result.success, false); assert.equal(cancelled, 0);
+  assert.equal(h.receipt.command, '/model', 'physical insertion lifetime survives failed preparation');
   assert.equal(h.writes.length, 1);
   h.change('input');
 });
@@ -379,6 +384,8 @@ test('background Fast reconciler publishes the captured draft through existing H
     reconcileCodexServiceTierProofIdentity: () => ({ preserved: true, proof: { serviceTier: 'fast' } }),
     planCodexFastIntentReconcile: () => ({ action: 'toggle', reason: 'desired-tier-differs' }),
     codexHasLivePtySubmitEvidence: () => true, hasCodexPromptOrTurnInFlight: () => false,
+    getCurrentCodexServiceTierProofIdentity: () => ({ success: true, ownerId: 'S',
+      terminalToken: h.term, terminalLifecycleGeneration: 'G:2', terminalRunSeq: 2 }),
     mainWindow: { isDestroyed: () => false, webContents: { isDestroyed: () => false,
       send: (...args) => notifications.push(args) } },
     executeCodexLiveSlashCommandRequest: async () => ({ success: false, submitted: false,

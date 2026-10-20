@@ -1,6 +1,7 @@
 'use strict';
 
 const { causal } = require('./perf-causal-context');
+const { createCatalogReadEpoch } = require('./prompt-catalog-read-epoch');
 
 // Named call sites only: retain the original statement and separate compile/execute timing.
 function sqlStatement(siteId, operation, prepare, execute) {
@@ -17,6 +18,11 @@ class WorkflowRootRegistry {
   constructor(database) {
     this.database = database;
     this.db = database.db;
+    // Cache statement ports per exact connection, never their results. SQLite
+    // re-prepares them on schema changes; every fence read still executes.
+    this.catalogFenceStatements = new WeakMap();
+    this.catalogReadEpoch = createCatalogReadEpoch();
+    this.catalogSchemaKnown = false;
     this.onChanged=()=>{};
     this.catalogCommittedEpoch = 0;
     const present=sqlStatement('roots.init.sqlite_master', 'get', () => this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_root_meta' AND type='table'"), statement => statement.get());
@@ -32,7 +38,9 @@ class WorkflowRootRegistry {
       CREATE TABLE IF NOT EXISTS workflow_root_mutations (id TEXT PRIMARY KEY,request_json TEXT NOT NULL,result_json TEXT NOT NULL);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS workflow_root_scope_meta(scope TEXT PRIMARY KEY,version INTEGER NOT NULL,
       revision INTEGER NOT NULL DEFAULT 1);`);
+    this.catalogSchemaKnown = true;
   }
+  prepareCatalogReadEpoch() { return this.catalogSchemaKnown && this.catalogReadEpoch.initialize(this.database.db); }
   fail(code) { throw Object.assign(new Error(code), { code, statusCode: 409 }); }
   read() {
     const work = () => {
@@ -132,14 +140,25 @@ class WorkflowRootRegistry {
   captureCatalogFence() {
     this.db=this.database.db;
     const connection=this.db;
-    const meta=connection.prepare('SELECT version FROM workflow_root_meta WHERE singleton=1').get();
+    let statements=this.catalogFenceStatements.get(connection);
+    if(!statements) {
+      statements={meta:connection.prepare('SELECT version FROM workflow_root_meta WHERE singleton=1'),
+        schema:connection.prepare('PRAGMA schema_version'),external:connection.prepare('PRAGMA data_version'),
+        changes:connection.prepare('SELECT total_changes() AS n')};
+      this.catalogFenceStatements.set(connection,statements);
+    }
+    const meta=statements.meta.get();
     if(meta?.version!==1)this.fail('root_forward_version');
+    const schema=statements.schema.get().schema_version;
+    const epoch=this.catalogReadEpoch.read(connection,schema);
     return {connection,
-      schema:connection.prepare('PRAGMA schema_version').get().schema_version,
-      external:connection.prepare('PRAGMA data_version').get().data_version,
-      // Conservative hint covers local outer commits lacking notify coverage,
-      // including rollback counters. It causes authority re-pass, never FS scan.
-      changes:connection.prepare('SELECT total_changes() AS n').get().n,
+      schema,
+      external:statements.external.get().data_version,
+      // Owned composition installs a derived SQL epoch for all catalog inputs,
+      // including direct/outer writes without notify. Uncertified handles/schema
+      // retain the conservative total_changes hint, never cached row authority.
+      changes:epoch === null ? statements.changes.get().n : epoch,
+      authoritySource:epoch === null ? 'sqlite-total-changes' : 'catalog-read-epoch-v2',
       committed:this.catalogCommittedEpoch,transaction:!!connection.inTransaction};
   }
   readSourceScopesPage(after='',limit=256) {
@@ -264,7 +283,8 @@ class WorkflowRootRegistry {
   notify(change) {
     const work = () => {
       // Nested/outer transactions keep their existing receipt semantics. The
-      // conservative total_changes fence covers missing after-outer-commit hooks.
+      // SQL read epoch (or conservative total_changes fallback) also covers
+      // missing after-outer-commit hooks without trusting notifications alone.
       if(!this.db.inTransaction)this.noteCatalogCommitted();
       try{this.onChanged(change);}catch(error){console.warn('[WorkflowRoots] committed; catalog refresh failed:',error?.message || error);}
     };

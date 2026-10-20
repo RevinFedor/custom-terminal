@@ -54,6 +54,13 @@ Hex normalizer (`normalizeHexValue`) принимает `'fff'` / `'#fff'` / `'f
 
 Палитра вкладок живёт в `noted-terminal-session-statuses`, палитра задач — в `noted-terminal-task-statuses`. Геометрия хранится отдельно в `noted-terminal-status-marker` и `noted-terminal-task-status-marker`. Универсальное зеркало `noted-terminal-*` переносит эти значения в app state, поэтому main process и Terminal MCP видят тот же каталог задач, что renderer.
 
+Для compact catalog-v2 Main передаёт палитру вкладок и её маркер в
+`card-signals.directoryAppearance` независимо от прежних taskStatuses/taskStatusMarker.
+`known:true,value:[]` — явная пустая палитра, `known:false,value:null` — неизвестно,
+а не команда очистить прежние цвета. Источник — проверенный persisted mirror либо
+действующие desktop defaults при доказанно отсутствующем ключе; без renderer bridge
+и полного `/tabs`. Clock/wake — прежний producer cards, не runtime/input authority.
+
 В DEV зеркало обязано восстанавливаться **до создания любого Zustand-store**. Текстовое расположение вызова перед `import App` этого не гарантирует: статические ESM-импорты исполняются до тела entry-модуля, а диагностический модуль производительности тоже импортирует workspace-store. Поэтому renderer сначала синхронно восстанавливает `localStorage` из `noted-terminal-dev.db`, а приложение и диагностический модуль подключает динамически. Иначе база содержит сохранённый квадрат, но интерфейс после перезапуска показывает дефолтный круг до следующего ручного изменения.
 
 `Tab.sessionStatus` идёт через стандартный saveTabs → SQLite; `TabGroup.sessionStatus` — через `tab_groups`. Id статуса корневой задачи хранится внутри документа плана вкладки. Удаление определения статуса не переписывает уже сохранённые id: маркер временно исчезает и возвращается, если определение с тем же id появится снова.

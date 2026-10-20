@@ -79,6 +79,27 @@ admission. Для workflow эти побочные действия и отме�
 Этот desktop IPC не является новым HTTP/native operation wire и не меняет
 системный Process Controls, composer Escape или удаление вкладок.
 
+## Stop/Full явно выделенных вкладок оконной полосы
+
+`PaneStripSelectionMenu` передаёт captured ordered `{projectId,tabId}[]` и
+origin workflow/window в `workflow:selection-begin`. Это произвольный набор,
+не весь workflow и не полная global group. Main сам фиксирует active subject,
+namespace, membership/generation и runtime owner; caller не приносит proof.
+`workflow-selection-runtime.js` использует прежний action/step SQL journal,
+без скрытых групп и новых tables. `selection-step/ack/receipt` относятся только
+к этому mutationId. Durable started до эффекта запрещает второй Stop после
+lost ACK/restart; caller success/отсутствие процесса не создают receipt.
+
+Stop переиспользует обычный manual-stop owner (SDK hard Stop, AI serialized Stop,
+ordinary shell deterministic Stop), не Pause Run After. Full использует прежние
+archive/file-family writers и exact Stop→shell-retirement/finalization guards,
+включая W1/W2 и UNKNOWN. При Full родителя обычный visual AI child остаётся:
+только доказанный detach этой же SQL-транзакции может обновить его signature
+для следующего явно выбранного Full; frozen initial members не переписываются.
+После admission исчезновение меню/первой вкладки не отменяет batch. До admission
+локальный lease обязателен; успех UI — только canonical completed всех целей.
+Одиночные, workflow и complete-global-group пути не заменены этим API.
+
 ## Общие механизмы
 
 - **Sniper Watcher:** Фоновое наблюдение за файловой системой для захвата идентификаторов сессий.

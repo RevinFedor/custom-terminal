@@ -26,4 +26,12 @@ export interface AgentLifecycleSummary {
   onDismiss?: () => void;
   retryLabel?: string;
   onRetry?: () => void;
+  goalOperationId?: string;
+  goalControlsBlocked?: boolean;
+  goalActions?: {
+    operationId: string;
+    availableActions: Array<'resume' | 'leave-paused'>;
+    onChoose?: (action: 'resume' | 'leave-paused') => void;
+    onRefresh?: () => void;
+  };
 }

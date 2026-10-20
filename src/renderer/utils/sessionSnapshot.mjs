@@ -61,6 +61,7 @@ export function buildSessionSnapshot(state) {
     // as you move between projects — one shared list would follow you across and
     // read as somebody else's tabs.
     centerStrips: state.centerStrips || {},
+    centerStripRowPlacements: state.centerStripRowPlacements || {},
     // Рабочие пространства. Раскладка текущего лежит ВЫШЕ, на верхнем уровне —
     // здесь она записывается ещё и в его собственный снимок, иначе перезапуск
     // вернул бы окна на месте, но у пространства они бы «пропали» при первом же
@@ -100,6 +101,7 @@ export const SESSION_SNAPSHOT_FIELDS = Object.freeze([
   'splitFocusedIndex',
   'splitSizes',
   'centerStrips',
+  'centerStripRowPlacements',
   'spaces',
   'activeSpaceId',
   'tabLastWorkflowIds',

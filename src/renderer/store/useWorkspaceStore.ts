@@ -1,4 +1,6 @@
 import {uiDragDiagnostic} from '../utils/uiPerformanceDiagnostics.mjs';
+import {beginPaneTabDropPresentation} from '../utils/paneTabDragBridge';
+import {paneDropScopeCurrent} from '../utils/paneTabDropPresentation.mjs';
 import { create } from 'zustand';
 import { rememberAgentLaunchFence, observeAgentLaunchFences } from '../utils/agentLaunchFence.mjs';
 import { beginTabCloseFeedback } from '../utils/tabCloseFeedback.mjs';
@@ -6,6 +8,12 @@ import { createExecutionRevisionAcks } from '../utils/executionRevisionAcks.mjs'
 import { createWorkflowRelationReceipts } from '../utils/workflowRelationReceipts.mjs';
 import { applyWorkflowDragLayout } from '../utils/workflowDragNavigation.mjs';
 import { organizationProjection, organizationSnapshot, reconcileWorkflowOrder, createOrganizationCommitter, archiveRestoreLeaseAddress, isExactGroupCloseGuard } from '../utils/workflowOrganizationClient.mjs';
+import {adoptPaneStripColorGroups,paneStripColorGroupsBasis,paneStripLayoutOwner} from '../../shared/pane-strip-color-groups.cjs';
+import {stableJson} from '../../shared/workflow-organization.cjs';
+import {projectPaneStripRowPlacement,samePaneStripRowPlacement} from '../../shared/pane-strip-row-placement.cjs';
+import {projectPaneStripLayoutRows} from '../../shared/pane-strip-row-layout.cjs';
+import {preparePaneStripGroupColor,applyPaneStripGatherPublication,readPaneStripGroupState,readPaneStripActiveGroups} from '../utils/paneStripGroupsModel.mjs';
+import {classifyPaneStripColorSelection,normalizeStripGroupColor} from '../utils/paneStripSelectionModel.mjs';
 import {createWorkflowGroupClient,newerWorkflowGroups} from '../utils/workflowGroupClient.mjs';
 import { INBOX_WORKFLOW_ID, GLOBAL_EXECUTION_NAMESPACE } from '../utils/workflowMembership.mjs';
 import { organizationPlacementIntent } from '../utils/workflowPlacementMembership.mjs';
@@ -1619,6 +1627,7 @@ export interface GlobalTabMruEntry {
 export interface SplitPane {
   /** Stable content identity, independent of its screen slot. */
   windowId?: string;
+  stripRowPlacement?: {version:1;width:number;order:string[];rowStartIds:string[]} | null;
   displayHidden?: boolean;
   displayRect?: { leftPct: number; topPct: number; widthPct: number; heightPct: number } | null;
   /** Project of the SHOWN tab. Follows `tabId` — see below. */
@@ -1849,6 +1858,7 @@ interface WorkspaceStore {
     entries: Array<{ projectId: string; tabId: string }>,
     at?: number | null,
     shownTabId?: string | null,
+    placement?: {rowStartId?:string|null;stripWidth?:number},
   ) => boolean;
   /** Move tabs out of every workflow window while keeping the tab records alive. */
   detachTabsFromWorkspaceWindows: (tabIds: string[]) => boolean;
@@ -1876,6 +1886,7 @@ interface WorkspaceStore {
    * behaves exactly as it did before strips existed.
    */
   centerStrips: Record<string, Array<{ projectId: string; tabId: string }>>;
+  centerStripRowPlacements: Record<string, {version:1;width:number;order:string[];rowStartIds:string[]} | null>;
   /**
    * Рабочие пространства — ВИДЫ на раскладку окон.
    *
@@ -1893,6 +1904,8 @@ interface WorkspaceStore {
     icon?: string | null;
     defaultCwd?: string | null;
     promptDirectories?: string[];
+    /** Visual strip membership only; independent of sidebar/global groups. */
+    stripColorGroups?: {version:1;revision:number;groups:Array<{id:string;color:string;tabIds:string[];revision:number}>};
     kind?: 'user' | 'inbox';
     organizationRevision?: number;
     order?: number;
@@ -1925,7 +1938,8 @@ interface WorkspaceStore {
   runAfterWorkflowScopeVersions: Record<string, number>;
   bootstrapOrganization: (options?: {fresh?: boolean}) => Promise<void>;
   commitOrganization: () => Promise<any>;
-  commitWorkflowDrag: (request:any, options?:{isCurrent?:()=>boolean}) => Promise<boolean>;
+  commitPaneStripGroupColor: (lease:any,color:string) => Promise<any>;
+  commitWorkflowDrag: (request:any, options?:{isCurrent?:()=>boolean;isSourceCurrent?:()=>boolean}) => Promise<boolean>;
   ensureTabRuntime: (tabId: string) => Promise<boolean>;
   createWorkflowTab: (options?: {workflowId?: string; cwd?: string; sourceTabId?: string; name?: string; tabOptions?: any}) => Promise<string>;
   moveTabsToWorkflow: (tabIds:string[], workflowId:string) => Promise<boolean>;
@@ -1938,7 +1952,7 @@ interface WorkspaceStore {
     id: string,
     updates: { icon?: string | null; projectIds?: string[]; defaultCwd?: string | null; promptDirectories?: string[] },
   ) => boolean;
-  switchWorkspaceSpace: (id: string) => void;
+  switchWorkspaceSpace: (id: string, options?: { source?: 'workflow-strip' }) => void;
   /**
    * Evidence-backed repair path used by the authenticated workspace API.
    * Merges named workflow layouts, validates every project/tab against the
@@ -2073,7 +2087,8 @@ interface WorkspaceStore {
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string; reservedTabId?: string; canPublish?: (tabs: Map<string, Tab>) => boolean; publishOrganizationWithTab?: boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterWorkflowIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string; reservedTabId?: string; canPublish?: (tabs: Map<string, Tab>) => boolean; publishOrganizationWithTab?: boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean;
-    groupCloseGuard?: {mutationId:string;tabId:string;guardToken:string} }) => Promise<boolean>;
+    groupCloseGuard?: {mutationId:string;tabId:string;guardToken:string};
+    selectionCloseGuard?: {mutationId:string;tabId:string;guardToken:string} }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string, options?: { targetPaneIndex?: number }) => Promise<TabHistoryRestoreResult>;
   switchTab: (projectId: string, tabId: string) => void;
@@ -3023,6 +3038,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
   },
 
   centerStrips: {},
+  centerStripRowPlacements: {},
 
   // ── Рабочие пространства ────────────────────────────────────────────────
   //
@@ -3073,7 +3089,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     const ordered = reconcileWorkflowOrder(projection.spaces,state.spaces,state.organizationWorkflowOrder,state.activeSpaceId);
     const spaces = inbox && !ordered.some(space => space.id === inbox.id) ? [...ordered,inbox] : ordered;
     // A catalog refresh cannot replace a local layout or steal focus.
-    set({openProjects,spaces,organizationWorkflowOrder:projection.organizationWorkflowOrder,tabCatalog:projection.tabCatalog,tabWorkflowMembership:projection.tabWorkflowMembership,
+    set({openProjects,spaces:adoptPaneStripColorGroups(spaces,projection.spaces),organizationWorkflowOrder:projection.organizationWorkflowOrder,tabCatalog:projection.tabCatalog,tabWorkflowMembership:projection.tabWorkflowMembership,
       globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
   },
   activeTabNavigationIntent:null,
@@ -3130,24 +3146,61 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     return organizationCommitter.commit(() => organizationSnapshot(get()));
   },
 
-  commitWorkflowDrag: async (request, {isCurrent=()=>true}={}) => {
-    if(!request || !get().organizationReady || !isCurrent())return false;
+  commitPaneStripGroupColor: async (lease,color) => {
+    const initial=get(),before=readPaneStripGroupState(initial,lease.workflowId);
+    const prepared=preparePaneStripGroupColor(initial,lease,color,crypto.randomUUID());
+    if(!prepared)return {revision:initial.organizationRevision,unchanged:true};
+    const next=JSON.parse(JSON.stringify(prepared.state.spaces.find(space=>space.id===lease.workflowId)!.stripColorGroups));
+    const basis=paneStripColorGroupsBasis(before);
+    // As with an ordinary window drop, settle earlier local layout intents
+    // first. Color+gather below remain ONE explicit atomic organization edit.
+    await get().commitOrganization();
+    // Explicit frozen field intent, through the SAME organization journal.
+    // It is not published optimistically into incidental complete snapshots.
+    return organizationCommitter.commit(()=>{
+      const state=get();
+      if(!lease.isCurrent())throw Object.assign(Error('strip_selection_changed'),{disposition:'not-applied'});
+      if(prepared.gather&&stableJson(paneStripLayoutOwner(captureSpaceLayout(state),prepared.gather.owner)?.slots||[])!==stableJson(prepared.gather.beforeSlots))
+        throw Object.assign(Error('workflow_strip_groups_order_changed'),{disposition:'not-applied'});
+      const current=readPaneStripGroupState(state,lease.workflowId);
+      if(paneStripColorGroupsBasis(current)!==basis) {
+        const selected=classifyPaneStripColorSelection(readPaneStripActiveGroups(state,lease.workflowId),lease.entries.map((entry:any)=>entry.tabId));
+        // Recovery of the previous unknown ACK may already have applied
+        // this very color. Do not create another group or overwrite it.
+        if(selected.kind==='recolor'&&selected.group.color===normalizeStripGroupColor(color))return organizationSnapshot(state);
+        throw Object.assign(Error('workflow_strip_groups_revision_changed'),{disposition:'not-applied'});
+      }
+      const candidate=preparePaneStripGroupColor(state,lease,color,next.groups.at(-1)?.id || crypto.randomUUID());
+      if(!candidate)return organizationSnapshot(state);
+      return {...organizationSnapshot(candidate.state),stripColorGroupEdits:[{workflowId:lease.workflowId,basis,
+        ...(candidate.gather?{gather:candidate.gather}:{})}]};
+    });
+  },
+
+  commitWorkflowDrag: async (request, {isCurrent=()=>true,isSourceCurrent=()=>true}={}) => {
+    if(!request || !get().organizationReady || !isCurrent() || !isSourceCurrent())return false;
     const navigationAtCommit=get().navigationRevision;
     const frozen=JSON.parse(JSON.stringify(request));
+    const presentation=beginPaneTabDropPresentation(frozen,{getState:get,subscribe:api.subscribe},isCurrent);
+    let presentationAccepted=false;
     uiDragDiagnostic('commit-request',{gestureId:frozen.gestureId,mutationId:frozen.mutationId,workflowId:frozen.targetWorkflowId});
     try {
       // Flush ordinary local state first. The drag's member/relation/placement
       // guards stay exactly as captured; the command never samples new guards.
       await get().commitOrganization();
+      if(!isSourceCurrent())return false;
       uiDragDiagnostic('commit-organization-flushed',{gestureId:frozen.gestureId,mutationId:frozen.mutationId});
       const namespaces=[...new Set(frozen.tabs.map((tab:any)=>tab.expected.namespace))] as string[];
-      const commit=()=>organizationCommitter.command('commitDrag',frozen,{isCurrent});
+      const commit=()=>isSourceCurrent()
+        ? organizationCommitter.command('commitDrag',frozen,{isCurrent:()=>isCurrent()&&isSourceCurrent()})
+        : {success:false};
       const result=namespaces.length ? await projectTabSaveQueue.enqueueMany(namespaces,commit) : await commit();
       const snapshot=result.snapshot;
       uiDragDiagnostic('commit-reply',{gestureId:frozen.gestureId,mutationId:frozen.mutationId,accepted:result.success===true,publicationRevision:snapshot?.publication?.revision,generation:snapshot?.publication?.generation});
       if(!snapshot || result.success!==true)return false;
       const state=get(),openProjects=new Map(state.openProjects);
-      const reveal=state.view==='workspace' && state.navigationRevision===navigationAtCommit && isCurrent();
+      const reveal=state.view==='workspace' && state.navigationRevision===navigationAtCommit && isCurrent()
+        && (frozen.destinationKind!=='window' || paneDropScopeCurrent(frozen,state));
       for(const receipt of result.relationReceipts || []) {
         workflowRelationReceipts.record(receipt);
         const tab=openProjects.get(receipt.namespace)?.tabs.get(receipt.tabId);
@@ -3170,6 +3223,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           layout:applyWorkflowDragLayout(currentLayout,change,{reveal})};
       });
       const live=byId.has(state.activeSpaceId)?spaces.find(space=>space.id===state.activeSpaceId)?.layout:{};
+      presentation?.applying();
       set({openProjects,spaces,...live,globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),
         tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,
         organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation});
@@ -3180,11 +3234,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       }
       get().saveSession();
       uiDragDiagnostic('commit-applied',{gestureId:frozen.gestureId,mutationId:frozen.mutationId,publicationRevision:snapshot.publication.revision,generation:snapshot.publication.generation,current:reveal});
+      presentationAccepted=true;
       return true;
     } catch(error:any) {
       uiDragDiagnostic('commit-error',{gestureId:frozen.gestureId,mutationId:frozen.mutationId});
       console.warn('[WorkflowReserveDnd:commit-rejected]',error?.message || error);
       return false;
+    } finally {
+      presentation?.settle(presentationAccepted);
     }
   },
 
@@ -3297,10 +3354,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       //
       // Указатели проектов остаются на месте — пустому окну надо знать, где
       // запускать.
-      splitPanes: [{ projectId: '', tabId: '' }],
+      splitPanes: res.spaces.find((space: any) => space.id === id)!.layout.splitPanes,
       splitFocusedIndex: 0,
       splitSizes: null,
       centerStrips: {},
+      centerStripRowPlacements: {},
     });
     console.log('[Spaces] add id=' + res.activeSpaceId + ' total=' + saved.length);
     get().saveSession();
@@ -3417,8 +3475,18 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     return true;
   },
 
-  switchWorkspaceSpace: (id) => {
-    if (!ownedTabNavigation) set({activeTabNavigationIntent:null});
+  switchWorkspaceSpace: (id, options) => {
+    if (!ownedTabNavigation) {
+      const navigationState = get();
+      // Direct workflow-chip commits have no unpublished workspace edits.
+      // Only that entry can omit a settled cancellation; shared callers keep
+      // the original publication boundary, as do absent/stale navigation keys.
+      if (options?.source !== 'workflow-strip'
+        || navigationState.activeTabNavigationIntent !== null
+        || navigationState.navigationKey !== tabNavigationLocation(navigationState)) {
+        set({activeTabNavigationIntent:null});
+      }
+    }
     const switchStartedAt = performance.now();
     const st = get();
     if (id === st.activeSpaceId) {
@@ -3878,6 +3946,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       splitFocusedIndex: activeLayout.splitFocusedIndex || 0,
       splitSizes: activeLayout.splitSizes || null,
       centerStrips: activeLayout.centerStrips || {},
+      centerStripRowPlacements: activeLayout.centerStripRowPlacements || {},
       activeProjectId: activeLayout.activeProjectId || st.activeProjectId,
       focusedProjectId: activeLayout.focusedProjectId || st.focusedProjectId,
       activeSpaceTab: activeLayout.activeSpaceTab || null,
@@ -4426,7 +4495,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     }
   },
 
-  moveTabsToWindowStrip: (paneIndex, rawEntries, at = null, shownTabId = null) => {
+  moveTabsToWindowStrip: (paneIndex, rawEntries, at = null, shownTabId = null, placement) => {
     const st = get();
     const entries: Array<{ projectId: string; tabId: string }> = [];
     const seen = new Set<string>();
@@ -4459,6 +4528,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         ? current
         : (shown ? [{ projectId: st.activeProjectId || incomingRoot.projectId, tabId: shown }] : []);
       const next = moveEntriesToIndex(base, entries, at);
+      const rowPlacement=projectPaneStripRowPlacement({current:st.centerStripRowPlacements[key],
+        baseOrder:base.map(entry=>entry.tabId),order:next.map(entry=>entry.tabId),sourceIds:movedTabIds,
+        rowStartId:placement?.rowStartId,width:placement?.stripWidth || st.centerStripRowPlacements[key]?.width});
       const finalShownTabId = shownTabId && next.some((entry) => entry.tabId === shownTabId)
         ? shownTabId
         : incomingRootTabId;
@@ -4466,9 +4538,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       const nextStrips = { ...st.centerStrips };
       if (next.length > 1) nextStrips[key] = next;
       else delete nextStrips[key];
-      if (next !== base || current.length !== next.length || hiddenSpacePurge) {
+      if (next !== base || current.length !== next.length || hiddenSpacePurge
+        || !samePaneStripRowPlacement(st.centerStripRowPlacements[key],rowPlacement)) {
         set({
           centerStrips: nextStrips,
+          centerStripRowPlacements:{...st.centerStripRowPlacements,[key]:rowPlacement},
           ...(hiddenSpacePurge ? { spaces: hiddenSpacePurge.spaces } : {}),
         });
       }
@@ -4481,6 +4555,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
 
     const result = moveTabsToPane(st.splitPanes, paneIndex, entries, at, shownTabId || incomingRootTabId);
     if (!result) return false;
+    result.panes=projectPaneStripLayoutRows(captureSpaceLayout(st),{splitPanes:result.panes},{sourceIds:movedTabIds,
+      target:{windowId:st.splitPanes[paneIndex]?.windowId,paneIndex,rowStartId:placement?.rowStartId,width:placement?.stripWidth}}).splitPanes;
     const finalShown = paneTabs(result.panes[paneIndex])
       .find((entry) => entry.tabId === result.shownTabId) || incomingRoot;
     if (collapseLonePane(result.panes)) {
@@ -5456,6 +5532,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         splitFocusedIndex: restoredSplit.focusedIndex,
         splitSizes: packSplitSizes(restoredSplit.panes, (sessionState as any).splitSizes ?? null),
         centerStrips: restoredCenterStrips,
+        centerStripRowPlacements: (sessionState as any).centerStripRowPlacements || {},
         activeProjectId: restoredActiveId,
         focusedProjectId: restoredFocusedId,
       };
@@ -5502,6 +5579,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         // that dimension reads as equal anyway, so store nothing for it).
         splitSizes: packSplitSizes(restoredSplit.panes, (sessionState as any).splitSizes ?? null),
         centerStrips: restoredCenterStrips,
+        centerStripRowPlacements: restoredLayout.centerStripRowPlacements,
         runAfterWorkflowScopeVersions:(sessionState as any).runAfterWorkflowScopeVersions || {},
         workflowSidebarState:(sessionState as any).workflowSidebarState || {},
       });
@@ -6373,7 +6451,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
   },
 
   closeTab: async (projectId, tabId, options) => {
-    const groupCloseGuard = options?.groupCloseGuard ? {...options.groupCloseGuard} : null;
+    const selectionCloseGuard=options?.selectionCloseGuard?{...options.selectionCloseGuard}:null;
+    if(selectionCloseGuard&&options?.groupCloseGuard)return false;
+    const groupCloseGuard = selectionCloseGuard || (options?.groupCloseGuard ? {...options.groupCloseGuard} : null);
     if (groupCloseGuard && !isExactGroupCloseGuard(groupCloseGuard,tabId)) return false;
     const closeStartedAt = Date.now();
     const closeOrder = nextPaneCloseOrder(get().splitPanes);
@@ -6391,6 +6471,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       publish: () => set({openProjects: new Map(get().openProjects)}),
     });
     try {
+    // A post-archive refusal retains THIS operation, never a new Archive/Stop.
+    let pendingClose = (tab as any).__archiveClosePending;
+    if(selectionCloseGuard) {
+      const original=await ipcRenderer.invoke('workflow:selection-close-state',{closeGuard:selectionCloseGuard})
+        .catch((error:any)=>({success:false,error:error.message}));
+      if(original?.success!==true||get().openProjects.get(projectId)?.tabs.get(tabId)!==tab)return false;
+      if(original.started) {
+        pendingClose={archiveRequest:original.archiveRequest,result:original.archiveResult,
+          runtimeStopped:original.runtimeStopped===true,parameters:{shouldStopAiProcess:false}};
+        (tab as any).__archiveClosePending=pendingClose;
+      }else if(pendingClose)return false;
+    }
+    const recoveringClose = !!pendingClose;
+    if(!selectionCloseGuard && pendingClose && (!pendingClose.result || !pendingClose.runtimeStopped)) {
+      const recovery=await ipcRenderer.invoke('project:save-tabs',{closeFinalization:{recover:true,
+        archiveRequest:pendingClose.archiveRequest}}).catch((error:any)=>({success:false,error:error.message}));
+      if(get().openProjects.get(projectId)?.tabs.get(tabId)!==tab || recovery?.success!==true
+        || !recovery.archiveResult || !recovery.runtimeStopped && !recovery.canContinue && !recovery.stopAbsent)return false;
+      pendingClose.result=recovery.archiveResult;
+      pendingClose.runtimeStopped=recovery.runtimeStopped===true;
+      pendingClose.stopAbsent=recovery.stopAbsent===true;
+    }
     const expectedTabIdsBeforeClose = Array.from(workspace.tabs.keys());
     const skipProcessCheck = options?.skipProcessCheck || false;
     const ptyAgentOwner = resolvePtyAgentOwner(tab);
@@ -6415,7 +6517,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     let runningProcessInfo: any = null;
     let foregroundAiProcess = false;
 
-    if (tab.tabType !== 'claude-sdk' && tab.tabType !== 'file') {
+    if (!recoveringClose && tab.tabType !== 'claude-sdk' && tab.tabType !== 'file') {
       // Check if terminal has running process via OSC 133 state (fast, no syscalls)
       commandState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
       processWasRunning = !!commandState?.isRunning;
@@ -6450,7 +6552,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     }
     // For SDK tabs, "running" means the SDK turn is mid-stream — we infer it
     // from claudeBusy which is the same signal SessionActionChip watches.
-    if (tab.tabType === 'claude-sdk') {
+    if (!recoveringClose && tab.tabType === 'claude-sdk') {
       processWasRunning = aiBusyAtClose;
       if (!skipProcessCheck && aiBusyAtClose) {
         const confirmed = await confirmDestructiveClose({
@@ -6461,7 +6563,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       }
     }
 
-    const closePreflight = await ipcRenderer.invoke('project:validate-tab-snapshot', {
+    const closePreflight = recoveringClose ? {success:true} : await ipcRenderer.invoke('project:validate-tab-snapshot', {
       projectId: workspace.projectId,
       expectedTabIds: expectedTabIdsBeforeClose,
     }).catch((error: unknown) => ({
@@ -6477,7 +6579,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       return false;
     }
 
-    const shouldStopAiProcess = isAiTab
+    const shouldStopAiProcess = recoveringClose ? pendingClose.parameters.shouldStopAiProcess : isAiTab
       && (aiBusyAtClose || (processWasRunning && (foregroundAiProcess || !runningProcessInfo?.hasProcess)));
 
     // Compute TabBar position at close time (excluding sub-agent tabs, which
@@ -6489,12 +6591,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
 
     // File tabs are linked document previews, not restorable terminal/AI sessions.
     const shouldArchiveToHistory = tab.tabType !== 'file' && options?.archive !== false;
+    const nativeSubject = (tab as any).executionSubject;
+    let closeRequest: any = null;
+    let archiveRequest: any = pendingClose?.archiveRequest || null;
+    if (!recoveringClose && shouldArchiveToHistory && nativeSubject?.version === 2) {
+      const owners=[tabId],seen=new Set(owners),namespaces=new Set([projectId]);
+      for(const owner of owners)for(const file of collectTabLinkedFiles(get().openProjects,owner)) {
+        namespaces.add(file.projectId);
+        if(!seen.has(file.id)){seen.add(file.id);owners.push(file.id);}
+      }
+      for(const [id,ws] of get().openProjects)if([...ws.tabs.values()].some(t=>seen.has(t.visualParentTabId || '')))
+        namespaces.add(id);
+      closeRequest={version:1,mutationId:crypto.randomUUID(),namespace:projectId,tabId,subjectId:nativeSubject.subjectId,
+        expectedNamespaces:[...namespaces].map(namespace=>({namespace,tabIds:namespace===projectId
+          ? expectedTabIdsBeforeClose : Array.from(get().openProjects.get(namespace)!.tabs.keys())}))};
+    }
     // Loader BEFORE the archive, not after it. The Codex path can legitimately
     // spend time here (writer proof + a possible stop-and-retry below), and a
     // click that visibly does nothing for that long was reported as "middle
     // click does not work". Cleared on every return-false path below.
     const clearClosingLoader = finishCloseFeedback;
-    const archiveCommit = await commitArchiveWithStopRetry({
+    const archiveCommit = recoveringClose ? {ok:true,skipped:false,result:pendingClose.result,stoppedForRetry:false}
+      : await commitArchiveWithStopRetry({
       shouldArchive: shouldArchiveToHistory,
       commandType: effectiveCommandType,
       // The unproven-writer refusal only: stop the live Codex first, then
@@ -6508,11 +6626,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         toolType: effectiveCommandType,
         reason: 'close-tab-archive-retry',
       }),
-      archive: () => {
-        closedPlacement = captureTabRestorePlacement(get(), workspace, tabId);
-        if (closedPlacement) closedPlacement = {...closedPlacement,closedOrder:closeOrder};
-        return ipcRenderer.invoke('project:archive-tab', {
+      archive: async () => {
+        if(get().openProjects.get(projectId)?.tabs.get(tabId)!==tab)
+          return Promise.resolve({success:false,error:'archive_close_owner_changed'});
+        if(!archiveRequest) {
+          closedPlacement = captureTabRestorePlacement(get(), workspace, tabId);
+          if (closedPlacement) closedPlacement = {...closedPlacement,closedOrder:closeOrder};
+          archiveRequest={
         projectId,
+        ...(closeRequest ? {closeRequest} : {}),
         ...(groupCloseGuard ? {groupCloseGuard} : {}),
         tab: {
           tabId,
@@ -6549,7 +6671,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
           restorePlacement: closedPlacement,
           processWasRunning,
         }
-        });
+          };
+        }
+        if(closeRequest && !pendingClose) {
+          const immutable=(value:any):any=>{if(value && typeof value==='object'){
+            for(const child of Object.values(value))immutable(child);Object.freeze(value);
+          }return value;};
+          pendingClose={archiveRequest:immutable(JSON.parse(JSON.stringify(archiveRequest))),result:null,runtimeStopped:false,
+            parameters:{shouldStopAiProcess}};
+          (tab as any).__archiveClosePending=pendingClose;
+        }
+        const result=await ipcRenderer.invoke('project:archive-tab',pendingClose?.archiveRequest || archiveRequest);
+        if(result?.success===false && pendingClose) {
+          if((tab as any).__archiveClosePending===pendingClose)delete (tab as any).__archiveClosePending;
+          pendingClose=null;
+        }else if(closeRequest) {
+          const receipt=result?.closeReceipt;
+          if(!receipt || receipt.version!==1 || receipt.mutationId!==closeRequest.mutationId
+            || receipt.tabId!==tabId || receipt.namespace!==projectId || receipt.subjectId!==closeRequest.subjectId
+            || receipt.historyId!==result.historyId)throw Error('archive_close_ack_mismatch');
+          pendingClose.result=result;
+        }
+        return result;
       },
     });
     if (!archiveCommit.ok) {
@@ -6577,6 +6720,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     } else if (tab.tabType === 'file') {
       console.log('[CloseTab] archive skipped file tab=' + tabId.slice(-12));
     }
+    const closeReceipt = archiveCommit.result?.closeReceipt;
+    if(closeReceipt && pendingClose)pendingClose.result=archiveCommit.result;
+    if(closeReceipt && get().openProjects.get(projectId)?.tabs.get(tabId)!==tab)return false;
+
+    // Selected Full uses the same Main runtime retirement owner for BOTH
+    // legacy and native subjects. Never route its frozen proof through the
+    // old renderer Stop/fire-and-forget kill path or delete its History on
+    // an unknown result. Native finalization still consumes its old receipt.
+    if(selectionCloseGuard&&tab.tabType!=='file') {
+      const retired=await ipcRenderer.invoke('workflow:selection-close-runtime',{closeGuard:selectionCloseGuard})
+        .catch((error:any)=>({success:false,error:error.message}));
+      if(retired?.success!==true||retired.runtimeStopped!==true)return false;
+      if(get().openProjects.get(projectId)?.tabs.get(tabId)!==tab)return false;
+      if(pendingClose)pendingClose.runtimeStopped=true;
+    }
 
     // Nothing below this point may run until a requested History row is
     // durably committed. On archive failure the live process and tab stay
@@ -6588,9 +6746,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     // sits there after the click reads as "the close did not work", which is
     // exactly how the broken Codex path was reported. (The loader may already
     // be up from the pre-archive block; this only widens it to the stop phase.)
-    if (shouldStopAiProcess) {
+    if (!selectionCloseGuard && !pendingClose?.runtimeStopped && shouldStopAiProcess) {
       try {
-        if (tab.tabType === 'claude-sdk') {
+        if (!closeReceipt && tab.tabType === 'claude-sdk') {
           await Promise.race([
             ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }),
             new Promise(resolve => setTimeout(resolve, 2500)),
@@ -6604,14 +6762,27 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     // HARD kill — closing an SDK tab must fully terminate the process and all
     // background agents (no orphans). A soft interrupt would leave a parked
     // session with no UI to control it.
-    if (tab.tabType === 'claude-sdk') {
+    if (!selectionCloseGuard && !closeReceipt && !pendingClose?.runtimeStopped && tab.tabType === 'claude-sdk') {
       if (!shouldStopAiProcess) {
         ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }).catch(() => {});
       }
       ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: false, reason: 'close' });
     }
 
-    if (tab.tabType !== 'claude-sdk' && tab.tabType !== 'file') {
+    if(closeReceipt && !pendingClose.runtimeStopped && tab.tabType!=='file') {
+      if((shouldStopAiProcess || tab.tabType==='claude-sdk') && !pendingClose.stopAbsent) {
+        const stopped=await ipcRenderer.invoke('project:save-tabs',{closeFinalization:{receipt:closeReceipt,runtimeAction:'stop'}})
+          .catch((error:any)=>({success:false,error:error.message}));
+        if(stopped?.success!==true)return false;
+        if(stopped.runtimeStopped===true)pendingClose.runtimeStopped=true;
+      }
+      if(!pendingClose.runtimeStopped) {
+        const killed=await ipcRenderer.invoke('project:save-tabs',{closeFinalization:{receipt:closeReceipt,runtimeAction:'kill'}})
+          .catch((error:any)=>({success:false,error:error.message}));
+        if(killed?.success!==true)return false;
+        pendingClose.runtimeStopped=true;
+      }
+    } else if (!selectionCloseGuard && !closeReceipt && !recoveringClose && tab.tabType !== 'claude-sdk' && tab.tabType !== 'file') {
       const closeRuntime = await stopAiBeforeTerminalKill({
         shouldStopAiProcess,
         stopAiProcess: () => ipcRenderer.invoke('terminal:stop-ai-process', {
@@ -6634,7 +6805,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
             ? closeRuntime.stopError.message
             : String(closeRuntime.stopError || 'stop_not_confirmed'));
         const historyId = archiveCommit.result?.historyId;
-        if (historyId !== null && historyId !== undefined) {
+        if (!closeReceipt && historyId !== null && historyId !== undefined) {
           const rollback = await ipcRenderer.invoke('project:delete-tab-history-entry', {
             id: historyId,
           }).catch((error: any) => ({
@@ -6655,6 +6826,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       console.log('[CloseTab] terminal:kill sent tab=' + tabId.slice(-12) +
         ' durMs=' + (Date.now() - closeStartedAt));
     }
+    if(closeReceipt)(tab as any).__archiveClosePending.runtimeStopped=true;
     const closeCandidateTabs = tabsAfterClose(workspace.tabs, tabId, shouldArchiveToHistory);
     const closeCatalogs = new Map([[projectId, { workspace, tabs: closeCandidateTabs,
       expectedTabIds: expectedTabIdsBeforeClose }]]);
@@ -6671,6 +6843,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
         closeCatalogs.set(file.projectId, catalog);
       }
     }
+    if(closeReceipt)for(const [id,ws]of get().openProjects) {
+      let candidate=closeCatalogs.get(id)?.tabs || ws.tabs;
+      for(const ownerId of attachmentOwners)candidate=tabsAfterClose(candidate,ownerId,ownerId===tabId && shouldArchiveToHistory);
+      if(candidate.size!==ws.tabs.size || [...candidate].some(([key,value])=>ws.tabs.get(key)!==value))
+        closeCatalogs.set(id,{workspace:ws,tabs:candidate,expectedTabIds:id===projectId
+          ? expectedTabIdsBeforeClose : Array.from(ws.tabs.keys())});
+    }
     const closedTabs = Array.from(closeCatalogs, ([projectId, catalog]) => (
       Array.from(catalog.workspace.tabs.keys()).filter(id => !catalog.tabs.has(id))
         .map(tabId => ({ projectId, tabId, workspace: catalog.workspace }))
@@ -6680,7 +6859,35 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     // The same group intent owns acknowledgments for all retained families,
     // including when its current step closes a terminal with attached files.
     const groupFileCloseGuard=groupCloseGuard || undefined;
-    const closeSnapshot = closeCatalogs.size > 1 || groupFileCloseGuard
+    const closeSnapshot = closeReceipt
+      ? await projectTabSaveQueue.enqueueMany([...closeCatalogs.keys()],()=>{
+        const snapshots=Array.from(closeCatalogs,([id,catalog])=>({projectId:id,
+          tabs:Array.from(catalog.tabs.values()).map(t=>({tabId:t.id,executionSubject:(t as any).executionSubject,
+            executionStorageRevision:(t as any).executionStorageRevision,visualParentTabId:t.visualParentTabId,
+            closedVisualParentTabId:t.closedVisualParentTabId})),expectedTabIds:catalog.expectedTabIds}));
+        for(const id of closeCatalogs.keys())projectTabSaveRevisions.set(id,(projectTabSaveRevisions.get(id) || 0)+1);
+        return ipcRenderer.invoke('project:save-tabs',{closeFinalization:{receipt:closeReceipt,snapshots,
+          groupCloseGuard:groupFileCloseGuard},...(groupFileCloseGuard?{groupFileCloseGuard}:{})})
+          .then((result:any)=>{
+            const sameIds=(actual:any,expected:string[])=>{
+              if(!Array.isArray(actual) || actual.length!==expected.length)return false;
+              const ordered=[...expected].sort();
+              return [...actual].sort().every((id,index)=>id===ordered[index]);
+            };
+            if(result?.success===true && (!result.closeReceipt
+              || Object.keys(result.closeReceipt).length!==Object.keys(closeReceipt).length
+              || Object.entries(closeReceipt).some(([key,value])=>result.closeReceipt[key]!==value)
+              || !sameIds(result.closedTabIds,closedTabs.map(row=>row.tabId))
+              || !sameIds(result.projectIds,[...closeCatalogs.keys()])))
+              return {success:false,error:'archive_close_ack_mismatch'};
+            for(const row of snapshots)executionRevisionAcks.ack(row.projectId,row.tabs,result,id=>[
+              closeCatalogs.get(row.projectId)?.tabs.get(id),get().openProjects.get(row.projectId)?.tabs.get(id),
+            ]);
+            return result;
+          })
+          .catch((error:any)=>({success:false,error:error?.message || String(error)}));
+      })
+      : closeCatalogs.size > 1 || groupFileCloseGuard
       ? await saveTabsBatchThenNotifyProjectLayoutChanged(
         Array.from(closeCatalogs, ([projectId, catalog]) => ({ projectId, tabs: catalog.tabs,
           expectedTabIds: catalog.expectedTabIds })), 'tab-closed',groupFileCloseGuard)
@@ -6694,7 +6901,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
     if (!isDurableSaveTabsAck(closeSnapshot)) {
       clearClosingLoader();
       const historyId = archiveCommit.result?.historyId;
-      if (historyId !== null && historyId !== undefined) {
+      if (!selectionCloseGuard && !closeReceipt && historyId !== null && historyId !== undefined) {
         await ipcRenderer.invoke('project:delete-tab-history-entry', { id: historyId }).catch(() => null);
       }
       useUIStore.getState().showToast(
@@ -6707,7 +6914,29 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
       return false;
     }
 
-    for (const catalog of closeCatalogs.values()) catalog.workspace.tabs = catalog.tabs;
+    if(closeReceipt) {
+      // Canonical receipt is not authority to remove a replacement renderer owner.
+      if(get().openProjects.get(projectId)?.tabs.get(tabId)!==tab) return false;
+      const closedSet=new Set(closedTabs.map(row=>row.tabId));
+      const updates=[];
+      for(const [id,catalog]of closeCatalogs) {
+        const current=get().openProjects.get(id);
+        if(!current) return false;
+        for(const closed of closedTabs.filter(row=>row.projectId===id))
+          if(current.tabs.get(closed.tabId)!==catalog.workspace.tabs.get(closed.tabId))return false;
+        let merged=current.tabs;
+        for(const ownerId of attachmentOwners)merged=tabsAfterClose(merged,ownerId,ownerId===tabId && shouldArchiveToHistory);
+        if([...current.tabs.keys()].some(key=>!merged.has(key) && !closedSet.has(key)))return false;
+        updates.push({id,current,tabs:merged});
+      }
+      for(const update of updates) {
+        update.current.tabs=update.tabs;
+        closeCatalogs.get(update.id)!.workspace=update.current;
+      }
+      for(const row of closedTabs)row.workspace=closeCatalogs.get(row.projectId)!.workspace;
+      for(const id of closeCatalogs.keys())notifyProjectLayoutChanged(id,'tab-closed');
+      delete (tab as any).__archiveClosePending;
+    } else for (const catalog of closeCatalogs.values()) catalog.workspace.tabs = catalog.tabs;
     const closedIds = new Set(closedTabs.map(row => row.tabId));
     const ui = useUIStore.getState();
     if (ui.filePreview?.source === 'tab'
@@ -6871,7 +7100,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get, api) => {
 
     // Use startTransition to prevent UI blocking
     startTransition(() => {
-      set({ openProjects: new Map(openProjects) });
+      set({ openProjects: new Map(get().openProjects) });
     });
 
     console.log('[CloseTab] snapshot-committed tab=' + tabId.slice(-12)
@@ -10148,7 +10377,7 @@ const workflowGroupClient = createWorkflowGroupClient({
 const organizationCommitter = createOrganizationCommitter({
   invoke:(channel:string,payload:any) => ipcRenderer.invoke(channel,payload),
   getPublication:() => ({revision:useWorkspaceStore.getState().organizationRevision}),
-  applyPublication:async (result:any) => {
+  applyPublication:async (result:any,request:any) => {
     const snapshot = await ipcRenderer.invoke('workflow:read');
     const state = useWorkspaceStore.getState();
     if (snapshot.publication.revision < state.organizationRevision) return;
@@ -10157,8 +10386,9 @@ const organizationCommitter = createOrganizationCommitter({
     for (const [tabId,member] of Object.entries(projection.tabWorkflowMembership) as any) {
       if (pending[tabId]?.workflowId === member.workflowId) delete pending[tabId];
     }
-    useWorkspaceStore.setState({tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,
-      spaces:reconcileWorkflowOrder(projection.spaces,state.spaces,state.organizationWorkflowOrder,state.activeSpaceId),
+    const groupPublication=applyPaneStripGatherPublication(state,
+      adoptPaneStripColorGroups(reconcileWorkflowOrder(projection.spaces,state.spaces,state.organizationWorkflowOrder,state.activeSpaceId),projection.spaces),projection.spaces,request);
+    useWorkspaceStore.setState({tabWorkflowMembership:projection.tabWorkflowMembership,tabCatalog:projection.tabCatalog,...groupPublication,
       organizationWorkflowOrder:projection.organizationWorkflowOrder,
       organizationRevision:snapshot.publication.revision,organizationGeneration:snapshot.publication.generation,
       globalGroups:newerWorkflowGroups(state.globalGroups,snapshot.globalGroups),

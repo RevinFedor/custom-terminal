@@ -5,6 +5,7 @@ import ControlHint from '../UI/ControlHint';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { resolveStableTerminalViewportOffsets } from '../../utils/stableTerminalViewport.mjs';
+import { HISTORY_TOP_CHROME_INSET } from '../../utils/promptQueueChrome.mjs';
 import { acquireInteractionCursor } from '../../utils/interactionCursor';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { PANE_LAYER_PRESENTATION_EVENT } from '../../utils/paneLayerPresentation.mjs';
@@ -271,9 +272,8 @@ export default function FloatingTerminalFrame({
         pointerEvents: 'none',
         // The composer only shifts/crops this stable-size stage. It must not
         // change xterm rows and trigger a PTY resize/redraw.
-        // Side panel opens ABOVE everything in the center — including the
-        // Run after strip host (z 120) and orchestration chips — matching how
-        // the History side panel covers them in terminal-primary.
+        // Side content overlays the center; the stationary Run after service
+        // host remains above it (140). Chrome reserves its shared top rail.
         zIndex: floating ? 130 : (allowSideOverlayOverflow ? undefined : 0),
       }}
     >
@@ -351,6 +351,13 @@ export default function FloatingTerminalFrame({
           data-floating-terminal-titlebar
           style={{
             height: floating ? 30 : 0,
+            // The stable PTY stage moves up behind the composer. Its controls
+            // must stay at the visible pane top; translating chrome alone
+            // keeps the body size/rows and retained xterm untouched.
+            position: 'relative',
+            zIndex: 2,
+            transform: floating && open && !fullView
+              ? `translateY(${-stageOffsets.translateY + HISTORY_TOP_CHROME_INSET}px)` : undefined,
             // НЕ 'visible': явное значение перебивало бы visibility:hidden
             // обёртки окна чужого пространства (TerminalArea) — шапка панели
             // просвечивала бы из скрытого пространства. undefined наследует.

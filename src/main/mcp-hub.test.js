@@ -217,7 +217,7 @@ test('hub: non-JSON child stdout does not poison later replies', async () => {
 });
 
 test('hub: stalled tools/list restarts one child and retries once', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-hub-stall-'));
+  const dir = fs.mkdtempSync(path.join(process.env.SC_OWN_HOST_FIXTURE_ROOT || os.tmpdir(), 'mcp-hub-stall-'));
   const markerPath = path.join(dir, 'stalled');
   const hub = new McpHub({
     port: 0,

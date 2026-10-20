@@ -6,6 +6,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const vm = require('node:vm');
 const reader = require('./subagent-transcript');
+const {createProviderSemanticShadow} = require('./provider-semantic-shadow');
+const {codexProviderPreviewOwnerVerdict} = require('./codex-provider-preview');
 
 // Actual Main reader/lease/cache/dehydration declarations; only Electron's
 // transport and the locator are controlled. Files are synthetic and private.
@@ -37,18 +39,89 @@ function harness(filePath, overrides = {}) {
     createSubagentStepProjectionState: reader.createSubagentStepProjectionState,
     readAgentStepsAsync: async args => { reads++; return reader.readAgentStepsAsync(args); },
     codexDataModule: null,
+    providerSemanticShadow: {getCodexSubagentServiceTier: () => null},
     HISTORY_PAYLOAD_PREVIEW_CHARS: 100, HISTORY_PAYLOAD_DEHYDRATE_THRESHOLD: 200,
     ...overrides,
   };
   vm.runInNewContext(slice + '\nglobalThis.caches = { subagentStepReaderCache, subagentPayloadSourceCache, subagentCodexBoundaryCache };', scope);
   return {
-    read: (readerId, offset = 0) => handlers.get('subagent:read-steps')(null, { readerId,
+    read: (readerId, offset = 0, extra = {}) => handlers.get('subagent:read-steps')(null, { readerId,
+      tabId: 'tab-A',
       chipKey: 'task:spawn-A', toolType: 'codex', parentSessionId: 'parent',
-      agentSessionId: 'child-A', spawnedAt: 100, offset }),
+      agentSessionId: 'child-A', spawnedAt: 100, offset, ...extra }),
     release: readerId => events.get('subagent:release-reader')(null, { readerId }),
     counts: () => ({ scans, reads }), logs, caches: scope.caches,
   };
 }
+
+function tierAuthority() {
+  const terminal = {};
+  const owner = {sourceId: 'source-A', terminalToken: terminal, runSeq: 2,
+    lifecycleGeneration: 'generation-A', launchId: 'launch-A'};
+  const current = {...owner};
+  const writer = {sessionId: 'parent', terminalToken: terminal, runSeq: 2, lifecycleGeneration: 'generation-A'};
+  const scope = {codexProviderSemanticSources: new Map([['tab-A', owner]]),
+    currentCodexProviderSemanticOwnerContext: () => current,
+    getCodexWriterProofSnapshot: () => writer,
+    codexProviderPreviewOwnerVerdict};
+  const begin = source.indexOf('function authorizeCodexSubagentTierRequest(');
+  const end = source.indexOf('const providerSemanticShadow = ', begin);
+  assert.ok(begin > 0 && end > begin);
+  const authorize = vm.runInNewContext(source.slice(begin, end) + '\nauthorizeCodexSubagentTierRequest;', scope);
+  return {authorize, current, owner, writer};
+}
+
+test('actual Main authorizes tier capture only for the current source/terminal/run/lifecycle and proven parent', () => {
+  const exact = {tabId: 'tab-A', sourceId: 'source-A'};
+  assert.equal(tierAuthority().authorize(exact).allowed, true);
+  assert.equal(tierAuthority().authorize({...exact, sourceId: 'stale-source'}).allowed, false);
+  for (const [target, field, changed] of [
+    ['current', 'terminalToken', {}], ['current', 'runSeq', 3],
+    ['current', 'lifecycleGeneration', 'generation-B'], ['current', 'launchId', 'launch-B'],
+    ['writer', 'terminalToken', {}], ['writer', 'runSeq', 3],
+    ['writer', 'lifecycleGeneration', 'generation-B'], ['writer', 'sessionId', null],
+  ]) {
+    const h = tierAuthority(); h[target][field] = changed;
+    assert.equal(h.authorize(exact).allowed, false, target + '.' + field);
+  }
+});
+
+test('actual provider observer → Main reader returns child request Fast without a JSONL launch snapshot or a new reader', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-tier-request-main-'));
+  const filePath = path.join(dir, 'synthetic-child.jsonl');
+  try {
+    fs.writeFileSync(filePath, serialize([meta, newTask, context]));
+    const {authorize} = tierAuthority();
+    const shadow = createProviderSemanticShadow({log: {log() {}}, authorizeCodexSubagentRequest: authorize});
+    const connection = shadow.createCodexConnection({tabId: 'tab-A', sourceId: 'source-A'});
+    const request = tier => ({type: 'response.create', service_tier: tier,
+      client_metadata: {'x-codex-turn-metadata': JSON.stringify({session_id: 'parent',
+        thread_id: 'child-A', turn_id: 'turn-A'}), 'x-openai-subagent': 'worker'}});
+    connection.observeClientFrame(JSON.stringify(request('priority')));
+    const main = harness(filePath, {providerSemanticShadow: shadow});
+    const first = await main.read('reader-A');
+    assert.equal(first.launchServiceTier, null, 'no invented initial snapshot');
+    assert.equal(first.requestServiceTier.serviceTier, 'priority');
+    assert.equal(first.requestServiceTier.parentSessionId, 'parent');
+    assert.equal(first.requestServiceTier.sessionId, 'child-A');
+    assert.ok(main.logs.some(line => line.includes('requestTier=priority')));
+    const counts = main.counts();
+    connection.observeClientFrame(JSON.stringify(request('default')));
+    const next = await main.read('reader-A', first.offset);
+    assert.equal(next.requestServiceTier.serviceTier, 'default');
+    assert.equal(next.launchServiceTier, null);
+    assert.equal(main.counts().scans, counts.scans, 'reuse existing prefix scan');
+    assert.equal(next.offset, first.offset);
+    const otherParent = await main.read('reader-A', next.offset, {parentSessionId: 'other-parent'});
+    assert.equal(otherParent.requestServiceTier, null);
+    const otherTab = await main.read('reader-A', next.offset, {tabId: 'other-tab'});
+    assert.equal(otherTab.requestServiceTier, null);
+    main.release('reader-A');
+    const reopened = await main.read('reader-B');
+    assert.equal(reopened.requestServiceTier.serviceTier, 'default');
+    main.release('reader-B');
+  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
+});
 
 test('actual Main IPC carries skipped launch tier through EOF/warm reopen without extra scans or payload changes', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-tier-main-'));
@@ -82,6 +155,34 @@ test('actual Main IPC carries skipped launch tier through EOF/warm reopen withou
     assert.ok(main.logs.every(line => !line.includes('Synthetic payload')));
     assert.ok(main.logs.some(line => line.includes('tier=priority')));
     main.release('reader-C');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('existing Main log explains unknown tier once per actual scalar change, without bodies or extra readers', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-tier-main-diagnostic-'));
+  const filePath = path.join(dir, 'synthetic-child.jsonl');
+  try {
+    const noField = snapshot(null); delete noField.payload.thread_settings.service_tier;
+    for (const [settingsRows, reason, proof] of [
+      [[], 'initial-snapshot-not-observed', 'none'],
+      [[snapshot(null)], 'tier-null', 'own-thread-settings'],
+      [[noField], 'tier-field-absent', 'own-thread-settings'],
+      [[snapshot('UNRETAINED_SECRET_VALUE')], 'tier-unsupported-string', 'own-thread-settings'],
+    ]) {
+      fs.writeFileSync(filePath, serialize([meta, ...settingsRows, newTask, context]));
+      const main = harness(filePath);
+      const first = await main.read('reader-A');
+      const lines = main.logs.filter(line => line.includes('[SubagentLaunchSettings]'));
+      assert.equal(lines.length, 1);
+      assert.ok(lines[0].includes('tierReason=' + reason), lines[0]);
+      assert.ok(lines[0].includes('tierProof=' + proof), lines[0]);
+      const readCount = main.counts();
+      await main.read('reader-A', first.offset);
+      assert.equal(main.logs.filter(line => line.includes('[SubagentLaunchSettings]')).length, 1, 'unchanged EOF is quiet');
+      assert.equal(main.counts().scans, readCount.scans);
+      assert.ok(main.logs.every(line => !line.includes('UNRETAINED_SECRET_VALUE') && !line.includes('Synthetic task')));
+      main.release('reader-A');
+    }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

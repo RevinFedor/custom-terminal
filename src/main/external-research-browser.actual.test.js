@@ -19,7 +19,7 @@ const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'a
 const account = { source: 'browser_auth_session', user_id: 'user-1', account_id: 'account-1',
   observed_at: 1792312164881, binding: 'before_send', email: 'private@example.test', token: 'must-not-leak' };
 
-async function fixture(t, handler, { browserId = 'chrome' } = {}) {
+async function fixture(t, handler, { browserId = 'chrome', humanNotificationsEnabled = false } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'noted-research-browser-'));
   const file = path.join(directory, 'runs.json');
   const store = new OrchestrationRunStore(file);
@@ -27,7 +27,7 @@ async function fixture(t, handler, { browserId = 'chrome' } = {}) {
     sourceTabId: 'own-source', sourceProjectId: 'own-project', sourceTabName: 'Private source',
     notifySource: false, externalResearchJobId: 'noted_browser-test',
     externalResearchIntent: normalizeExternalResearchRequest({ prompt: 'private fixture', browserId }) });
-  const requests = [], emissions = [], notices = [], finalized = [];
+  const requests = [], emissions = [], emissionReasons = [], notices = [], finalized = [];
   const server = http.createServer(async (req, res) => {
     let text = ''; for await (const chunk of req) text += chunk;
     const request = { method: req.method, url: req.url, body: text ? JSON.parse(text) : null };
@@ -37,12 +37,12 @@ async function fixture(t, handler, { browserId = 'chrome' } = {}) {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const client = new ScExternalResearchClient({ baseUrl: 'http://127.0.0.1:' + server.address().port });
-  const coordinator = new ExternalResearchCoordinator({ store, client, longPollMs: 0, retryBaseMs: 1, retryMaxMs: 1,
-    emitChanges: runs => emissions.push(...runs), finalizeSettled: async run => finalized.push(run),
+  const coordinator = new ExternalResearchCoordinator({ store, client, longPollMs: 0, retryBaseMs: 1, retryMaxMs: 1, humanNotificationsEnabled,
+    emitChanges: (runs, reason) => { emissions.push(...runs); emissionReasons.push(reason); }, finalizeSettled: async run => finalized.push(run),
     notifyBrowserOffline: async envelope => { notices.push(envelope); return { ok: true, durable: true }; } });
   t.after(async () => { await coordinator.stop(); server.closeAllConnections();
     await new Promise(resolve => server.close(resolve)); await store.flush(); await fs.rm(directory, { recursive: true, force: true }); });
-  return { store, file, requests, emissions, notices, finalized, coordinator, client };
+  return { store, file, requests, emissions, emissionReasons, notices, finalized, coordinator, client };
 }
 
 test('selector is strict, top-level, durable and changes only explicit request fingerprints', () => {
@@ -71,7 +71,7 @@ test('real HTTP client gates selected start before POST; omitted default does no
   assert.equal(Object.hasOwn(h.requests.at(-1).body, 'browserId'), false);
 });
 
-test('proven new offline profile waits without settlement, pins retry UUID and queues one human-only notice', async t => {
+test('proven new offline profile waits without settlement, pins retry UUID and stays quiet in Telegram by default', async t => {
   let starts = 0, accepted = false;
   const h = await fixture(t, (req, res) => {
     if (req.url === '/research-capabilities') return json(res, 200, caps);
@@ -88,14 +88,10 @@ test('proven new offline profile waits without settlement, pins retry UUID and q
   assert.deepEqual(posts.map(req => req.body.browserId), ['chrome', CHROME, CHROME]);
   assert.ok(posts.every(req => req.body.requestId === 'noted_browser-test' && req.body.prompt === 'private fixture'));
   const waiting = h.emissions.filter(run => run.deliveryDeferredReason === 'waiting-for-browser');
-  assert.equal(waiting.length, 3, 'two offline preflights plus the durable human-notice publication');
+  assert.equal(waiting.length, 4, 'two offline preflights and two separate operational projections; no automatic human notice');
+  assert.equal(h.emissionReasons.filter(reason => reason?.endsWith('-operational')).length, 2);
   assert.ok(waiting.every(run => run.resultComplete === false && !run.deliveryAcceptedAt && run.externalResearchBrowserWait.notSubmitted));
-  assert.equal(h.notices.length, 1);
-  assert.equal(h.notices[0].kind, 'terminal-user');
-  assert.equal(h.notices[0].tabId, 'own-source');
-  assert.equal(h.notices[0].projectId, 'own-project');
-  assert.match(h.notices[0].text, /Chrome/);
-  assert.match(h.notices[0].requestId, /^research-browser-offline:/);
+  assert.equal(h.notices.length, 0);
   assert.equal(h.finalized.length, 1);
   const run = await h.store.get('browser-test');
   assert.equal(run.status, 'completed');
@@ -170,8 +166,8 @@ test('cancel during real client capability await prevents the first POST after t
   assert.equal(h.notices.length, 0);
 });
 
-test('notice ACK loss retries the identical frozen human envelope, never a model callback', async t => {
-  const h = await fixture(t, (_req, res) => json(res, 500, {}));
+test('explicitly enabled human channel retries lost ACK with the identical envelope, never a model callback', async t => {
+  const h = await fixture(t, (_req, res) => json(res, 500, {}), { humanNotificationsEnabled: true });
   await h.store.patch('browser-test', { externalResearchStartHadUncertainty: false });
   await h.store.markExternalResearchBrowserWait('browser-test', { jobId: 'noted_browser-test', owner: CHROME });
   const seen = new Map(); let calls = 0;
@@ -230,13 +226,13 @@ test('restored admitted job retries only its persisted owner and cannot downgrad
 });
 
 test('durable queued human notice is not re-enqueued by a restored coordinator', async t => {
-  const h = await fixture(t, (_req, res) => json(res, 500, {}));
+  const h = await fixture(t, (_req, res) => json(res, 500, {}), { humanNotificationsEnabled: true });
   await h.store.patch('browser-test', { externalResearchStartHadUncertainty: false });
   await h.store.markExternalResearchBrowserWait('browser-test', { jobId: 'noted_browser-test', owner: CHROME });
   await h.coordinator._noticeBrowserOffline('browser-test', 'noted_browser-test');
   await h.store.flush();
   const restored = new OrchestrationRunStore(h.file);
-  const coordinator = new ExternalResearchCoordinator({ store: restored, client: h.client,
+  const coordinator = new ExternalResearchCoordinator({ store: restored, client: h.client, humanNotificationsEnabled: true,
     notifyBrowserOffline: () => assert.fail('notice was already durably queued') });
   await coordinator._noticeBrowserOffline('browser-test', 'noted_browser-test');
   await coordinator.stop(); await restored.flush();
@@ -257,7 +253,7 @@ test('offline preflight for a conflicting profile is rejected, not installed as 
   assert.equal(run.status, 'failed'); assert.equal(h.notices.length, 0);
 });
 
-test('unavailable human outbox remains an explicit notice error and never fails the research', async t => {
+test('explicit human-channel opt-in keeps unavailable outbox separate from the research outcome', async t => {
   let starts = 0;
   const h = await fixture(t, (req, res) => {
     if (req.url === '/research-capabilities') return json(res, 200, caps);
@@ -265,7 +261,7 @@ test('unavailable human outbox remains an explicit notice error and never fails 
       ? { id: 'noted_browser-test', status: 'done', browserInstanceId: CHROME, result: { text: 'done' } } : { error: 'missing' });
     if (++starts === 1) return json(res, 409, offline);
     return json(res, 200, { id: req.body.requestId, status: 'running', browserInstanceId: CHROME });
-  });
+  }, { humanNotificationsEnabled: true });
   h.coordinator.notifyBrowserOffline = async () => ({ ok: false, reason: 'outbox_unavailable' });
   await h.coordinator.watch('browser-test');
   assert.ok(h.emissions.some(run => run.externalResearchBrowserNoticeError === 'outbox_unavailable'));

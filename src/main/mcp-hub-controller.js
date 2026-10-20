@@ -3,6 +3,8 @@
 const http = require('http');
 const { spawn } = require('child_process');
 const os = require('os');
+const path = require('path');
+const hostProtocol = require('./research-host-protocol.cjs');
 const { buildMcpEnvironment } = require('./mcp-hub');
 const { resolveHubConfiguration, CONFIG_HEADER, EXPECTED_CONFIG_ENV } = require('./mcp-hub-config');
 
@@ -11,7 +13,7 @@ const { resolveHubConfiguration, CONFIG_HEADER, EXPECTED_CONFIG_ENV } = require(
 // close, so quick app reopen cannot race a port still held by the old hub.
 function createMcpHubController({ port, script, canSpawn = true, log = console.log,
   executable = process.execPath, env = process.env, fetchImpl = fetch, spawnImpl = spawn,
-  startupTimeoutMs = 12000, readConfiguration = () => resolveHubConfiguration(env) } = {}) {
+  startupTimeoutMs = 12000, ingressFile = path.join(env.HOME || os.homedir(), 'Library/Application Support/sc-desktop/research-maintenance-ingress.json'), readConfiguration = () => resolveHubConfiguration(env) } = {}) {
   const base = 'http://127.0.0.1:' + port;
   let inflight = null;
   const ready = server => server.up && server.initialized && !server.recovering;
@@ -23,7 +25,7 @@ function createMcpHubController({ port, script, canSpawn = true, log = console.l
         headers: { [CONFIG_HEADER]: desired.fingerprint } });
       if (!response.ok) return null;
       const value = await response.json();
-      return Array.isArray(value.servers) ? describe(value, desired) : null;
+      return Array.isArray(value.servers) ? describe({ ...value, browserMaintenance: maintenance(value) }, desired) : null;
     } catch { return null; }
   }
   async function post(route) {
@@ -54,9 +56,32 @@ function createMcpHubController({ port, script, canSpawn = true, log = console.l
       req.end();
     });
   }
+  function maintenance(existing) {
+    const held = hostProtocol.readIngress(ingressFile).fences.some(f => f.state === 'held');
+    if (held && existing?.capabilities?.browserMaintenance !== 1) {
+      return { version: 1, held: true, code: 'research_legacy_host_bootstrap_required', replayPermission: false };
+    }
+    if (existing?.capabilities?.browserMaintenance === 1 && (existing.browserMaintenance
+      || existing.servers?.some(server => server.name === 'browser'))) {
+      try {
+        hostProtocol.validateIngressAuthority(existing.browserMaintenance?.ingressAuthority, ingressFile);
+        hostProtocol.readBoundIngress(existing.browserMaintenance.ingressAuthority, existing.browserMaintenance.ingressEpoch, existing.browserMaintenance.ingressBasis);
+      }
+      catch (error) { return { version: 1, held: true, code: error.code || 'research_host_ingress_authority_required', replayPermission: false }; }
+    }
+    return existing?.browserMaintenance || null;
+  }
   function launch(desired) {
     return new Promise((resolve, reject) => {
-      const child = spawnImpl(executable, [script, '--standalone', '--port', String(port)], {
+      // New hubs carry the guard; all configured bindings remain unchanged.
+      const ingress = hostProtocol.readIngress(ingressFile);
+      if (ingress.fences.some(f => f.state === 'held')) {
+        const pin = hostProtocol.binding('hub', { command: 'node', args: [script], env: {} }, 'noted-mcp-hub');
+        if (pin?.kind !== 'cooperative') throw Object.assign(Error('research_hub_launch_capability_required'), { code: 'research_hub_launch_capability_required' });
+      }
+      // Explicit owner configuration travels separately from per-server env.
+      const child = spawnImpl(executable, [script, '--standalone', '--port', String(port),
+        '--browser-ingress-file', ingressFile], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
         env: buildMcpEnvironment({ ...env, ELECTRON_RUN_AS_NODE: '1',
           [EXPECTED_CONFIG_ENV]: desired.fingerprint }), cwd: os.homedir(),
@@ -90,6 +115,8 @@ function createMcpHubController({ port, script, canSpawn = true, log = console.l
     inflight = (async () => {
       const desired = readConfiguration();
       const existing = await status(1200, desired);
+      const maintenanceState = maintenance(existing);
+      if (existing && maintenanceState?.held) return { ...existing, browserMaintenance: maintenanceState };
       const brokenLaunch = existing && existing.servers.length > 0
         && existing.servers.every(server => !ready(server) && !server.pendingRequests)
         && existing.servers.some(server => /ENOENT|code=127/.test(server.lastError || ''));
@@ -121,6 +148,8 @@ function createMcpHubController({ port, script, canSpawn = true, log = console.l
       const st = await ensure({ upgrade: true });
       if (!st) return { ok: false, error: 'MCP-хаб недоступен' };
       const configuration = { desiredConfiguration: st.desiredConfiguration, configurationApplied: st.configurationApplied };
+      if (st.browserMaintenance?.held && (!name || name === 'browser')) return { ok: false,
+        code: st.browserMaintenance.code || 'RESEARCH_MAINTENANCE_HELD', replayPermission: false, ...configuration };
       if (name) return { ...await post('/mcp/_restart/' + encodeURIComponent(name)), ...configuration };
       if (st.capabilities?.restartAll) return { ...await post('/mcp/_restart-all'), ...configuration };
       // Observe-only E2E must not replace an existing older hub.

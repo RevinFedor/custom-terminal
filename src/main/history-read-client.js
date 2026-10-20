@@ -4,6 +4,7 @@ const path = require('node:path');
 const { randomUUID, createHash } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { Worker } = require('node:worker_threads');
+const { httpReadCorrelation } = require('./http-read-diagnostics');
 const { SLOTS, registerSourceEpochSlot } = require('./history-worker-epochs');
 const { historyPreparationActivity } = require('./history-preparation-activity');
 const { publishHistoryResponseTimingBinding } = require('./history-response-timings');
@@ -39,6 +40,7 @@ class HistoryReadClient {
     this.onDiagnostic = onDiagnostic;
     this.diagnosticSlowMs = Number.isFinite(config.diagnosticSlowMs) ? Math.max(0, config.diagnosticSlowMs) : 100;
     this.diagnosticCounters = { requests: 0, responses: 0, failures: 0, callErrors: 0, retries: 0, cancellations: 0, invalidations: 0, workerDeaths: 0 };
+    this.readPhaseWindow = { at: -Infinity, count: 0, omitted: 0 };
     this.sourceEpochs = new Int32Array(new SharedArrayBuffer(SLOTS * 4));
     this.sourceRewriteEpochs = new Int32Array(new SharedArrayBuffer(SLOTS * 4));
     this.snapshotAdmissions = new WeakMap();
@@ -55,6 +57,13 @@ class HistoryReadClient {
     // Observers/logging are deliberately outside the read/proof contract.
     try { console.log('[HistoryRead] ' + JSON.stringify(diagnostic)); } catch {}
     try { this.onDiagnostic?.(diagnostic); } catch {}
+  }
+  readPhase(event, fields) {
+    if (!fields?.httpRead && this.config.diagnosticReadPhases !== true) return;
+    const window = this.readPhaseWindow, now = performance.now();
+    if (now - window.at >= 60000) { window.at = now; window.count = 0; }
+    if (window.count >= 240) { window.omitted++; return; }
+    window.count++; this.diagnose(event, fields);
   }
   start() {
     if (this.worker) return this.worker;
@@ -84,10 +93,17 @@ class HistoryReadClient {
           : { status: 'unknown', generation, reason: 'invalid-counters' };
         return;
       }
-      if (message.event === 'diagnostic') { this.diagnose(message.diagnostic.event, message.diagnostic); return; }
+      if (message.event === 'diagnostic') {
+        const received = stamp();
+        this.diagnose(message.diagnostic.event, { ...message.diagnostic,
+          mainReceivedAbs: received.abs, mainReceivedPerf: received.perf }); return;
+      }
       if (message.event === 'source-epoch') {
+        this.readPhase('source-epoch-registration-begin', message.diagnostic || {});
+        if (worker !== this.worker) return;
         const slot = registerSourceEpochSlot(this.sourceEpochSlots, message.filePath);
-        worker.postMessage({ event: 'source-epoch', filePath: message.filePath, slot }); return;
+        worker.postMessage({ event: 'source-epoch', filePath: message.filePath, slot });
+        this.readPhase('source-epoch-registration-posted', message.diagnostic || {}); return;
       }
       if (message.event === 'log') {
         const level = ['log', 'warn', 'error'].includes(message.level) ? message.level : 'log';
@@ -102,6 +118,8 @@ class HistoryReadClient {
       const request = this.pending.get(message.id);
       if (!request) return;
       const received = stamp();
+      this.readPhase('rpc-received', { ...request.identity, receivedAbs: received.abs,
+        receivedPerf: received.perf, resultBytes: message.diagnostic?.resultBytes ?? null });
       this.count('responses');
       if (message.error) this.count('failures');
       const diagnostic = message.diagnostic;
@@ -195,12 +213,18 @@ class HistoryReadClient {
   }
   // Does not start a worker, enqueue RPC or read any transcript/cache file.
   getCacheMemorySnapshot() { return { ...this.cacheMemory }; }
+  getReadDiagnosticHealth() { return { clientId: this.clientId, generation: this.workerGeneration,
+    pending: this.pending.size, counters: { ...this.diagnosticCounters }, readPhaseOmitted: this.readPhaseWindow.omitted,
+    readPhaseLimitPerMinute: 240, coverage: 'worker messages forwarded by Main; silence is unknown' }; }
   async prepareCodexRewrite({ receipt, cwd }) {
     return this.call('prepareCodexRewrite', { toolType: 'codex', sessionId: receipt.sessionId, cwd,
       rewriteFrom: { sessionId: receipt.sourceSessionId } }, false, receipt);
   }
   async call(method, payload = {}, binary = false, preparedRewriteReceipt = null) {
-    const call = { callId: ++this.callSequence };
+    // Trace stays exclusively in the existing RPC diagnostic envelope. The
+    // business payload/fingerprint/readScope is never copied or amended.
+    const httpRead = httpReadCorrelation();
+    const call = { callId: ++this.callSequence, ...(httpRead ? { httpRead } : {}) };
     const started = stamp();
     const snapshot = method === 'readSessionSnapshot', attempts = snapshot ? 1 : 3;
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -288,12 +312,21 @@ class HistoryReadClient {
       const posted = stamp(); const request = { resolve, reject, identity, posted };
       this.count('requests');
       this.pending.set(id, request); worker.ref();
+      this.readPhase('rpc-post', { ...identity, postedAbs: posted.abs, postedPerf: posted.perf, pending: this.pending.size });
+      // A synchronous observer can close the client; it cannot grant a late post.
+      if (worker !== this.worker || this.pending.get(id) !== request) {
+        if (this.pending.get(id) === request) this.pending.delete(id);
+        if (!this.pending.size) worker.unref();
+        reject(new Error('history_reader_closed')); return;
+      }
       try { worker.postMessage({ id, method, payload, rewriteReceipt, binary, diagnostic: identity });
         request.postMessageMs = performance.now() - posted.perf; }
       catch (error) {
         this.count('failures');
         this.diagnose('request-failed', { ...identity, reason: 'post-message-error', errorCode: errorReason(error) });
-        this.pending.delete(id); reject(error);
+        this.pending.delete(id);
+        if (!this.pending.size) worker.unref();
+        reject(error);
       }
     });
   }

@@ -47,6 +47,8 @@ const http2 = require('http2');
 const url = require('url');
 const path = require('path');
 const srcMainDir = __dirname;
+const { createHttpReadDiagnostics, beginHttpReadDependency } = require(path.join(srcMainDir, 'http-read-diagnostics'));
+const { performance: readPerformance } = require('node:perf_hooks');
 const { causal: perfCausal } = require(path.join(srcMainDir, 'perf-causal-context'));
 const { AgentSendQueue, hasCanonicalSendConsumption } = require(path.join(srcMainDir, 'agent-send-queue'));
 const { isAutomaticPromptQueueRequest, hasPromptQueueContextConditionKey } = require(path.join(srcMainDir, '../shared/prompt-queue-send-intent.cjs'));
@@ -222,7 +224,7 @@ const {
 } = require('./agent-context-files');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
-const { WORKFLOW_HTTP_CAPABILITY, createWorkflowOrganizationHttp, freezeWorkflowCreationContext,
+const { WORKFLOW_HTTP_CAPABILITY, workflowOrganizationCapability, createWorkflowOrganizationHttp, freezeWorkflowCreationContext,
   legacyCreationContext, listExecutionNamespaces, executionNamespaceForRow } = require('./workflow-organization-http');
 // Lazy-require the helpers (loaded fresh each call so missing module just
 // disables the dependent endpoints, not the whole server).
@@ -374,6 +376,8 @@ let wss = null;
 let token = null;
 let apnsJwtCache = null;
 const webServerInstanceId = crypto.randomUUID();
+const httpReadDiagnostics = createHttpReadDiagnostics({ serviceId: webServerInstanceId,
+  enabled: () => process.env.NOTED_E2E_TEST !== 'true' || process.env.NOTED_E2E_FILE_LOG === '1' });
 let webServerState = 'stopped';
 let webServerStartRequestedAt = null;
 let webServerListeningAt = null;
@@ -411,6 +415,7 @@ let computeActiveLoaders = null;
 // list badge. This is deliberately project-scoped, not a tab transcript stream:
 // one SSE connection carries a full snapshot of {projectId,count,streaming}.
 let computeProjectActivity = null;
+let readWorkflowPublication = null;
 // Frozen in main before renderer restore can clear wasInterrupted.
 let startupInterruptedSnapshot = null;
 // Mobile question answering — injected by main.start(). answerClaudeQuestion
@@ -741,6 +746,10 @@ let externalResearchCoordinator = null;
 let agentSendReceiptStore = null;
 let reconcileAgentSendReceipt = null;
 let agentSendQueue = null;
+const OPERATIONAL_ADMISSION = Symbol('research-operational-admission');
+const COMPLETION_ADMISSION = Symbol('external-completion-admission');
+let externalCompletionDelivery = null;
+let externalOperationalDelivery = null;
 let sendQueueRendererReady = false;
 const sendQueueRendererOwners = new Set();
 let sendQueueRecoveryReady = false;
@@ -869,6 +878,7 @@ const agentSendReceiptRegistry = createAgentSendReceiptRegistry({
   },
 });
 let orchestrationPolicyTimer = null;
+let orchestrationStartupRecovery = null;
 const ORCHESTRATION_RESULT_PROOF_FLUSH_GRACE_MS = 60_000;
 let orchestrationResultProofCoordinator = null;
 let orchestrationSourceProofCoordinator = null;
@@ -876,10 +886,240 @@ let orchestrationSourceProofCoordinator = null;
 function getOrchestrationRunStore() {
   if (!orchestrationRunStore) {
     orchestrationRunStore = new OrchestrationRunStore(path.join(app.getPath('userData'), 'orchestration-runs.json'), {
+      startupMaintenance: require('./external-research-maintenance').startupFromArgv(process.argv),
+      beforeStartupMaintenance: async () => {
+        const ready = await agentSendReceiptStartupReady;
+        if (!agentSendReceiptStore || ready?.ready === false) throw Object.assign(
+          new Error('Startup maintenance needs the existing receipt owner'), { code: 'orchestration_store_unavailable', statusCode: 503 });
+      },
       onActivityChanged: () => scheduleTabActivityBroadcast?.('orchestration-registry'),
+      onOperationalRevoked: revokeExternalOperationalDelivery,
+      onCompletionRevoked: revokeExternalCompletionDelivery,
     });
   }
   return orchestrationRunStore;
+}
+
+async function restoreAgentSendQueueAfterReceipts(startupQueue) {
+  const result = await agentSendReceiptStartupReady;
+  if (agentSendQueue !== startupQueue || result?.ready === false) return false;
+  const store = getOrchestrationRunStore();
+  if (store.startupMaintenance) await store.initialize({ requireAuthority: true });
+  if (agentSendQueue !== startupQueue) return false;
+  if (sendQueueRecoveryReady) return true;
+  sendQueueRecoveryReady = true;
+  void store.listAll().then(runs => getExternalOperationalDelivery().restore(runs))
+    .catch(error => console.warn('[ResearchOperational] startup restore pending:', error.code || 'unavailable'));
+  agentSendQueue?.resume();
+  void store.listAll().then(runs => {
+    for (const run of runs) if (run.runKind === 'external-research' && run.externalResearchDelivery)
+      getExternalResearchCoordinator().wakeDelivery(run.runId, 'completion-reconnect');
+  }).catch(error => console.warn('[ExternalResearchDelivery] restore pending:', error.code || 'unavailable'));
+  return true;
+}
+
+function stopOrchestrationStartupRecovery() {
+  if (orchestrationStartupRecovery?.timer) clearTimeout(orchestrationStartupRecovery.timer);
+  orchestrationStartupRecovery = null;
+}
+
+function startOrchestrationStartupRecovery() {
+  stopOrchestrationStartupRecovery();
+  const owner = { timer: null, failures: 0, startupQueue: agentSendQueue };
+  orchestrationStartupRecovery = owner;
+  const store = getOrchestrationRunStore();
+  const current = () => orchestrationStartupRecovery === owner;
+  async function attempt() {
+    owner.timer = null;
+    if (!current()) return;
+    try {
+      // Retry only unread authoritative storage. No empty startup inventory,
+      // provider retry or new input authority can arise from a failed load.
+      await store.initialize({ requireAuthority: true });
+      if (!current()) return;
+      if (store.startupMaintenance) await restoreAgentSendQueueAfterReceipts(owner.startupQueue);
+      if (!current()) return;
+      if (getAgentResponseState && readAgentObservedResponse) await getResponseObservationService().restore();
+      if (!current()) return;
+      await reconcileActiveOrchestrations();
+      if (current()) orchestrationStartupRecovery = null;
+    } catch (error) {
+      if (!current()) return;
+      console.warn('[Orchestration] startup recovery failed:', error?.message || error);
+      if (error?.code === 'orchestration_store_unavailable'
+        || (store.startupMaintenance && !store.startupMaintenanceApplied
+          && !['research_maintenance_startup_invalid', 'research_maintenance_busy'].includes(error?.code))) {
+        const delay = Math.min(15000, 500 * 2 ** Math.min(5, owner.failures++));
+        owner.timer = setTimeout(() => { void attempt(); }, delay);
+        owner.timer.unref?.();
+      } else orchestrationStartupRecovery = null;
+    }
+  }
+  return attempt();
+}
+
+function revokeExternalOperationalDelivery(run, notice) {
+  const { hash } = require('./external-research-operational');
+  if (notice.runId !== run.runId || notice.runCreatedAt !== run.createdAt || notice.handoffId !== notice.id
+    || !notice.id.startsWith('research-operational:')
+    || notice.operationKey !== `history:${notice.sourceTabId}:${notice.handoffId}`
+    || hash(notice.body) !== notice.bodyHash) throw new Error('operational_cancel_identity_invalid');
+  if (!agentSendReceiptStore) return { ok: false };
+  const record = agentSendReceiptStore.get(notice.operationKey);
+  const identity = { operationKey: notice.operationKey, tabId: notice.sourceTabId, handoffId: notice.handoffId,
+    attemptId: record?.attemptId || null, provider: notice.sourceTarget?.toolType || null };
+  // Revoke the actual live waiter BEFORE the SQLite cancellation can fail.
+  if (record?.attemptId) agentSendQueue?.cancelAttempt(identity);
+  const queued = agentSendQueue?.cancelDelivery(notice.sourceTabId, notice.handoffId,
+    { dismiss: true, reason: 'research-operational-revoked' });
+  if (queued?.cancelled === true) return { ok: true };
+  const cancelled = agentSendReceiptStore.cancelDelivery({ ...identity, allowUnreserved: !record,
+    reason: 'research-operational-revoked', presentationDismissed: true });
+  return { ok: cancelled?.ok === true || cancelled?.cancelled === true };
+}
+
+function getExternalOperationalDelivery() {
+  if (externalOperationalDelivery) return externalOperationalDelivery;
+  const { createOperationalDelivery } = require('./external-research-operational-delivery');
+  externalOperationalDelivery = createOperationalDelivery({ store: getOrchestrationRunStore(),
+    classify: classifyAgentSendReceipt, providerQueued: isAgentSendProviderQueueAccepted,
+    prepare: async (_run, notice) => {
+      const status = await resolveAgentSessionInfo(notice.sourceTabId, 2000);
+      if (!status) throw Object.assign(new Error('Operational source unavailable'), { code: 'operational_source_unavailable' });
+      const options = resolveOrchestrationSourceNotificationSendOptions(status);
+      const prepared = tabWorkContext ? await tabWorkContext.prepare(notice.sourceTabId, notice.handoffId, notice.body)
+        : { prompt: notice.body };
+      return { prompt: prepared.prompt, sendOptions: { provider: notice.sourceTarget?.toolType || status.toolType || status.commandType,
+        queue: options.queue === true, statusAtSend: options.statusAtSend ?? null } };
+    },
+    pin: notice => {
+      if (!agentSendReceiptStore) throw new Error('operational_receipt_store_unavailable');
+      agentSendReceiptStore.pinForOwner(notice.operationKey, 'research-operational');
+    },
+    lookup: async notice => {
+      await agentSendReceiptStartupReady;
+      const record = agentSendReceiptStore?.get(notice.operationKey);
+      if (record) return { result: durableAgentSendReplay(record, { operationKey: notice.operationKey,
+        attemptId: record.attemptId || null, tabId: notice.sourceTabId, handoffId: notice.handoffId }) };
+      const queued = agentSendQueue?.item(notice.operationKey);
+      const pinned = agentSendReceiptStore?.listOwnerPins('research-operational').includes(notice.operationKey);
+      return { absentBeforeAdmission: !queued && pinned === true && notice.receiptRetentionPinned === true };
+    },
+    send: request => runAgentSendScenario({ ...request, [OPERATIONAL_ADMISSION]: true,
+      timeoutMs: 60000, onLateReceipt: result => getExternalOperationalDelivery().observeReceipt(request.sendOperationKey, result) }),
+    onBlocked: async (run, notice) => {
+      if (!userNotificationOutbox) return;
+      const { buildTerminalUserEnvelope } = require('./sc-desktop-notification-client');
+      const envelope = buildTerminalUserEnvelope({ requestId: 'operational-human:' + notice.id,
+        tabId: run.sourceTabId, projectId: run.sourceProjectId, tabName: run.sourceTabName || 'Terminal',
+        createdAt: notice.createdAt, waitSeconds: 0,
+        text: 'External Research ' + run.runId + ': служебное сообщение о сбое пока не доставлено исходному агенту. '
+          + 'Состояние сохранено, повторной генерации нет. Требуется внимание к доставке уведомления.' });
+      await userNotificationOutbox.enqueue(envelope);
+    },
+  });
+  return externalOperationalDelivery;
+}
+
+function revokeExternalCompletionDelivery(run, delivery) {
+  const request = require(path.join(srcMainDir, 'external-research-completion-delivery')).frozenRequest(delivery);
+  if (delivery.runId !== run.runId || delivery.runCreatedAt !== run.createdAt
+    || request.handoffId !== 'orchestration-complete:' + run.runId
+    || request.sendOperationKey !== `history:${delivery.sourceTabId}:${request.handoffId}`) throw new Error('completion_cancel_identity_invalid');
+  if (!agentSendReceiptStore) return { ok: false };
+  const record = agentSendReceiptStore.get(request.sendOperationKey);
+  const identity = { operationKey: request.sendOperationKey, tabId: delivery.sourceTabId,
+    handoffId: request.handoffId, attemptId: record?.attemptId || null, provider: delivery.sourceTarget.toolType };
+  if (record?.attemptId) agentSendQueue?.cancelAttempt(identity);
+  const queued = agentSendQueue?.cancelDelivery(identity.tabId, identity.handoffId,
+    { dismiss: true, reason: 'external-completion-revoked' });
+  if (queued?.cancelled === true) return { ok: true };
+  return agentSendReceiptStore.cancelDelivery({ ...identity, allowUnreserved: !record,
+    reason: 'external-completion-revoked', presentationDismissed: true });
+}
+
+function getExternalCompletionDelivery() {
+  if (externalCompletionDelivery) return externalCompletionDelivery;
+  const { createExternalCompletionDelivery } = require(path.join(srcMainDir, 'external-research-completion-delivery'));
+  externalCompletionDelivery = createExternalCompletionDelivery({
+    store: getOrchestrationRunStore(), receipts: agentSendReceiptStore,
+    queueItem: key => agentSendQueue?.item(key),
+    waitReady: async () => {
+      const ready = await agentSendReceiptStartupReady;
+      if (ready?.ready === false || !agentSendReceiptStore) throw Object.assign(new Error('Completion receipt owner unavailable'),
+        { code: 'external_completion_receipts_unavailable' });
+    },
+    prepare: prepareExternalCompletionRequest,
+    send: (request, control) => runAgentSendScenario({ ...request, [COMPLETION_ADMISSION]: true,
+      ...(control.retryCompletionNoInput ? { retryCompletionNoInput: true } : {}) }),
+    reconcile: async run => {
+      const delivery = run.externalResearchDelivery, target = delivery?.sourceTarget;
+      const materializedSessionId = delivery?.request
+        ? require(path.join(srcMainDir, 'external-research-completion-delivery')).receiptSourceSessionId(delivery,
+          agentSendReceiptStore?.get(delivery.request.sendOperationKey), agentSendQueue?.item(delivery.request.sendOperationKey)) : null;
+      const proofSessionId = target?.sessionId || materializedSessionId;
+      if (!run.sourceFollowupStartedAt && (run.externalResearchDelivery?.request || run.notificationPromptHash)
+        && typeof proofSessionId === 'string' && proofSessionId.length > 0
+        && ['claude', 'codex'].includes(target.toolType)) {
+        await armOrchestrationSourceProof(run, { toolType: target.toolType, sessionId: proofSessionId, cwd: run.sourceProjectPath });
+      }
+      return reconcileOrchestrationSourceFollowup(run, 'external-completion-reconcile');
+    },
+    notifyOperational: (id, detail = {}) => {
+      const owner = getExternalOperationalDelivery(); owner.schedule(id);
+      if (detail.blocked) void owner.reportBlocked(id).catch(error =>
+        console.warn('[ExternalResearchDelivery] human notice pending run=' + id + ' code=' + String(error.code || 'unavailable')));
+    },
+    changed: run => emitOrchestrationRun(run, 'external-completion-delivery'),
+  });
+  return externalCompletionDelivery;
+}
+
+async function prepareExternalCompletionRequest(run, assertCurrent) {
+  const content = await prepareOrchestrationCompletionContent(run);
+  await assertCurrent();
+  if (!content) throw Object.assign(new Error('Legacy completion is not an automatic delivery intent'),
+    { code: 'external_completion_legacy_handoff' });
+  const d = run.externalResearchDelivery;
+  const target = d.sourceTarget;
+  const provisional = !target?.sessionId && typeof target?.terminalInstanceId === 'string' && target.terminalInstanceId.length > 0
+    && typeof target?.launchId === 'string' && target.launchId.length > 0;
+  if ((!target?.sessionId && !provisional) || !['claude', 'codex'].includes(target.toolType)) {
+    throw Object.assign(new Error('Original completion source is unresolved'), { code: 'external_completion_source_unresolved' });
+  }
+  const info = await resolveAgentSessionInfo(d.sourceTabId, 2000);
+  await assertCurrent();
+  if (!info || (target.sessionId && info.sessionId && info.sessionId !== target.sessionId)
+    || (info.toolType || info.commandType) !== d.sourceTarget.toolType) {
+    throw Object.assign(new Error('Original completion source is unavailable or changed'), { code: 'external_completion_source_changed' });
+  }
+  let writerSessionId = target.sessionId || null;
+  if (provisional) {
+    // Presence supplies readiness, not launch identity. Read the same Main
+    // destination contract used at the physical write boundary; never adopt
+    // a saved/history SID or rewrite the immutable birth pin.
+    const current = await readScenarioDestination(d.sourceTabId);
+    await assertCurrent();
+    if (require('../shared/agent-send-target-precondition.cjs').agentSendTargetPreconditionFailure(target, current)) {
+      throw Object.assign(new Error('Original completion source launch changed'), { code: 'external_completion_source_changed' });
+    }
+    writerSessionId = current.sessionId || null;
+  }
+  const options = resolveOrchestrationSourceNotificationSendOptions(info);
+  const handoffId = 'orchestration-complete:' + run.runId;
+  const prompt = tabWorkContext ? (await tabWorkContext.prepare(d.sourceTabId, handoffId, content.prompt)).prompt : content.prompt;
+  await assertCurrent();
+  if (writerSessionId) await armOrchestrationSourceProof({ ...run, notificationSourceSessionId: writerSessionId },
+    { ...info, sessionId: writerSessionId });
+  await assertCurrent();
+  return {
+    tabId: d.sourceTabId, prompt, handoffId, workContextPrepared: true,
+    sendOperationKey: `history:${d.sourceTabId}:${handoffId}`, sendSurface: 'desktop-history',
+    source: 'orchestration-completion:' + run.runId, ownership: 'project',
+    statusAtSend: options.statusAtSend, queue: options.queue,
+    provider: d.sourceTarget.toolType, sessionId: d.sourceTarget.sessionId || null, expectedTarget: d.sourceTarget,
+    presentationSnapshot: orchestrationPresentationSnapshot(run, 'completion', content, prompt), timeoutMs: 60000,
+  };
 }
 
 function getCompletionContentStore() {
@@ -982,7 +1222,8 @@ async function prepareOrchestrationCompletionContent(run) {
   }
   const current = await getOrchestrationRunStore().getInternal(run.runId);
   if (!current || current.status !== run.status || current.completedAt !== run.completedAt
-    || current.notificationSuppressed || current.notificationCancelRequestedAt
+    || current.notifySource === false || current.notificationSuppressed || current.notificationCancelRequestedAt
+    || (run.externalResearchDelivery && !require(path.join(srcMainDir, 'external-research-completion-delivery')).sameOwner(current, run.externalResearchDelivery))
     || (!isExternalResearchRun(run) && !orchestrationResultAttemptMatches(current, resultAttempt))) {
     throw Object.assign(new Error('orchestration_completion_changed_during_read'), {
       code: 'orchestration_completion_changed_during_read',
@@ -1190,6 +1431,7 @@ function getExternalResearchCoordinator() {
       client: getScExternalResearchClient(),
       emitChanges: emitOrchestrationChanges,
       finalizeSettled: finalizeSettledOrchestration,
+      notifyOperational: runId => getExternalOperationalDelivery().schedule(runId),
       notifyBrowserOffline: envelope => userNotificationOutbox
         ? userNotificationOutbox.enqueue(envelope) : Promise.resolve({ ok: false, reason: 'outbox_unavailable' }),
     });
@@ -1282,6 +1524,10 @@ async function releaseOrchestrationSourceProof(runId, reason) {
       // A previous confirmation may have mutated RAM before its disk write
       // failed. Do not discard the recovery witness until a strict retry lands.
       await store.persistStrict();
+      agentSendReceiptStore.unpinForOwner(
+        `history:${run.sourceTabId}:${run.notificationHandoffId || 'orchestration-complete:' + run.runId}`,
+        'external-research-completion',
+      );
       agentSendReceiptStore.unpinForOwner(
         `history:${run.sourceTabId}:${run.notificationHandoffId || 'orchestration-complete:' + run.runId}`,
         'orchestration-source-followup',
@@ -2319,7 +2565,8 @@ function summarizeBroadcastPayload(payload) {
     const projects = Array.isArray(payload.projects) ? payload.projects : [];
     const active = projects.filter((p) => (Number(p?.count) || 0) > 0 || p?.streaming === true).length;
     const streaming = projects.filter((p) => p?.streaming === true).length;
-    return ' projects=' + projects.length + ' active=' + active + ' streaming=' + streaming + ' projectOrder=' + (payload.projectOrderChanged === true);
+    return ' projects=' + projects.length + ' active=' + active + ' streaming=' + streaming + ' projectOrder=' + (payload.projectOrderChanged === true)
+      + (payload.workflowPublication ? ' workflowGeneration=' + payload.workflowPublication.generation + ' workflowRevision=' + payload.workflowPublication.revision : '');
   }
   if (payload.type === 'snapshot') {
     return ' status=' + (payload.sessionStatus || '-') +
@@ -2579,33 +2826,53 @@ function checkAuth(req) {
 // which is the difference between a 15s WiFi transfer and a 1.5s one.
 const GZIP_THRESHOLD = 4 * 1024;
 function sendJson(res, status, body) {
-  // An owned operation may settle after its HTTP observer already received
-  // 202 or disconnected. That does not cancel the operation or write twice.
-  if (res.writableEnded || res.destroyed) return;
-  const json = JSON.stringify(body);
-  const headers = {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-    'Vary': 'Accept-Encoding',
-  };
-  const accept = (res.req && res.req.headers['accept-encoding']) || '';
-  const useGzip = json.length >= GZIP_THRESHOLD && /\bgzip\b/.test(accept);
-  if (useGzip) {
-    const t0 = Date.now();
-    const buf = zlib.gzipSync(json, { level: 6 });
-    headers['Content-Encoding'] = 'gzip';
-    headers['Content-Length'] = String(buf.length);
-    res.writeHead(status, headers);
-    res.end(buf);
-    if (json.length > 64 * 1024) {
-      console.log(`[WebGzip] ${json.length}B → ${buf.length}B (${Math.round((1 - buf.length / json.length) * 100)}%) in ${Date.now() - t0}ms`);
+  // Closing the HTTP observer does not cancel the owned work.
+  if (res.writableEnded || res.destroyed) {
+    httpReadDiagnostics.phase(res, 'response-discarded', { destroyed: res.destroyed });
+    return;
+  }
+  let stage = 'stringify';
+  try {
+    httpReadDiagnostics.phase(res, 'stringify-begin');
+    let phaseAt = readPerformance.now();
+    const json = JSON.stringify(body); // The sole serialization of the response.
+    httpReadDiagnostics.phase(res, 'stringify-end', () => ({ elapsedMs: readPerformance.now() - phaseAt }));
+    const headers = {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+      'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+      'Vary': 'Accept-Encoding',
+    };
+    const accept = (res.req && res.req.headers['accept-encoding']) || '';
+    const useGzip = json.length >= GZIP_THRESHOLD && /\bgzip\b/.test(accept);
+    let wire = json;
+    let legacyGzipStart = null;
+    if (useGzip) {
+      stage = 'gzip';
+      legacyGzipStart = Date.now();
+      httpReadDiagnostics.phase(res, 'gzip-begin');
+      phaseAt = readPerformance.now();
+      wire = zlib.gzipSync(json, { level: 6 });
+      httpReadDiagnostics.phase(res, 'gzip-end', () => ({ elapsedMs: readPerformance.now() - phaseAt, wireBytes: wire.length }));
+      headers['Content-Encoding'] = 'gzip';
     }
-  } else {
-    headers['Content-Length'] = String(Buffer.byteLength(json));
+    const bytes = useGzip ? wire.length : Buffer.byteLength(json);
+    headers['Content-Length'] = String(bytes);
+    stage = 'write-head';
+    httpReadDiagnostics.phase(res, 'headers-begin');
+    if (res.writableEnded || res.destroyed) { httpReadDiagnostics.phase(res, 'response-discarded'); return; }
     res.writeHead(status, headers);
-    res.end(json);
+    httpReadDiagnostics.phase(res, 'headers-queued', () => ({ status, wireBytes: bytes, utf8Bytes: useGzip ? Buffer.byteLength(json) : bytes }));
+    stage = 'end';
+    httpReadDiagnostics.phase(res, 'end-call', { wireBytes: bytes });
+    if (res.writableEnded || res.destroyed) { httpReadDiagnostics.phase(res, 'response-discarded'); return; }
+    res.end(wire);
+    if (useGzip && json.length > 64 * 1024) console.log('[WebGzip] ' + json.length + 'B → ' + wire.length + 'B (' + Math.round((1 - wire.length / json.length) * 100) + '%) in ' + (Date.now() - legacyGzipStart) + 'ms');
+    httpReadDiagnostics.phase(res, 'end-return');
+  } catch (error) {
+    httpReadDiagnostics.phase(res, 'encode-error', () => ({ stage, code: error?.code || error?.name || 'response-error' }));
+    throw error; // Preserve the existing caller's HTTP error handling.
   }
 }
 
@@ -3232,6 +3499,12 @@ function projectCardsSnapshot(projectId, tabs) {
 }
 
 async function runAgentSendScenario(args) {
+  if (args.completionDeliveryRef && args[COMPLETION_ADMISSION] !== true) {
+    throw Object.assign(new Error('Completion admission is server-owned'), { code: 'completion_admission_required', submitted: false });
+  }
+  if ((String(args.source || '').startsWith('research-operational:') || args.operationalNoticeRef)
+    && args[OPERATIONAL_ADMISSION] !== true) throw Object.assign(new Error('Operational notice admission is server-owned'),
+      { code: 'operational_admission_required', submitted: false, statusCode: 403 });
   if (!args.handoffId) args = { ...args, handoffId: 'context-send:' + crypto.randomUUID() };
   // Capture the intended conversation at admission, not when a later slot is
   // finally dispatched. Runtime/writer proof is still obtained by the scenario.
@@ -3264,6 +3537,18 @@ async function runAgentSendScenario(args) {
 }
 
 async function runPreparedAgentSendScenario(args) {
+  if (args.completionDeliveryRef) {
+    if (args[COMPLETION_ADMISSION] !== true) throw Object.assign(new Error('Completion admission is server-owned'),
+      { code: 'completion_admission_required', submitted: false });
+    const resolved = await getExternalCompletionDelivery().resolve(args);
+    args = { ...args, prepareSend: resolved.prepareSend };
+  }
+  if (String(args.source || '').startsWith('research-operational:') || args.operationalNoticeRef) {
+    if (args[OPERATIONAL_ADMISSION] !== true) throw Object.assign(new Error('Operational notice admission is server-owned'),
+      { code: 'operational_admission_required', submitted: false, statusCode: 403 });
+    const resolved = await getExternalOperationalDelivery().resolve(args);
+    args = { ...args, prepareSend: resolved.prepareSend };
+  }
   const {
   tabId,
   prompt,
@@ -3294,6 +3579,7 @@ async function runPreparedAgentSendScenario(args) {
   applicationQueueAcceptedResponse = false,
   applicationQueueExecution = false,
   retryNoInputAttemptId = null,
+  retryCompletionNoInput = false,
   } = args;
   // A restart may have left an Enter-armed operation whose exact transcript
   // proof is still being reconciled. Never reserve/replay that operation until
@@ -3347,8 +3633,9 @@ async function runPreparedAgentSendScenario(args) {
     if (typeof agentSendQueue !== 'undefined' && agentSendQueue && !applicationQueueExecution
       && ['claude', 'codex'].includes(provider) && !isLocalSlashCommandPrompt(prompt)
       && findOrchestrationTabDescriptor(tabId)?.tabType !== 'claude-sdk') {
-      const { prepareSend: _prepare, onLateReceipt: _late, retryNoInputAttemptId: _retry, ...request } = args;
+      const { prepareSend: _prepare, onLateReceipt: _late, retryNoInputAttemptId: _retry, retryCompletionNoInput: _completionRetry, ...request } = args;
       const admitted = agentSendQueue.enqueue({ identity: durableIdentity, request, retryNoInputAttemptId,
+        retryCompletionNoInput: args[COMPLETION_ADMISSION] === true && retryCompletionNoInput,
         execute: typeof prepareSend === 'function' || typeof onLateReceipt === 'function' ? async scope => {
           const receipt = await runPreparedAgentSendScenario({ ...args, applicationQueueExecution: true,
             sendRequestFingerprint: scope.requestFingerprint,
@@ -3393,6 +3680,12 @@ async function runPreparedAgentSendScenario(args) {
     let result;
     let preparedTarget = null;
     let admittedExpectedTarget = expectedTarget;
+    const returnedBeforeInput = () => handoffId && agentSendReceiptStore
+      && require(path.join(srcMainDir, 'history-send-return')).historySendReturnControl(agentSendReceiptStore).isReturned(tabId, handoffId);
+    const returnedResult = () => ({ success: false, accepted: false, submitted: false,
+      pasteWritten: false, enterWritten: false, status: 'not-submitted',
+      code: 'history_send_returned', error: 'Message returned to composer before input' });
+    if (returnedBeforeInput()) result = returnedResult();
     try { tabWorkContext?.assertContinuationScope?.(tabId, handoffId); }
     catch (error) { result = { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
     if (!result && typeof prepareSend === 'function') {
@@ -3445,10 +3738,18 @@ async function runPreparedAgentSendScenario(args) {
           code: error.code || 'agent_send_target_unavailable', error: error.message, httpStatus: 503 };
       }
     }
+    if (!result && args.completionDeliveryRef) {
+      try { await getExternalCompletionDelivery().resolve(args); }
+      catch (error) { result = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+        status: 'not-submitted', code: error.code || 'external_completion_revoked', error: error.message }; }
+    }
     if (!result && durableIdentity && ['codex', 'claude'].includes(provider)
       && Date.now() >= preparationStartedAt + PREPARATION_MS) {
       result = { success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
         status: 'not-submitted', code: 'agent_send_preparation_expired', error: 'agent_send_preparation_expired' };
+    }
+    if (!result && durableIdentity) {
+      if (returnedBeforeInput()) result = returnedResult();
     }
     if (!result && durableIdentity) {
       if (applicationQueueExecution && agentSendQueue?.item(sendOperationKey)?.state === 'cancelled') {
@@ -4583,6 +4884,8 @@ async function openAgentTabInWorkspace({ tabId, spaceId = '', workspaceName = '�
 }
 
 async function resolveHistorySessionInfo(tabId, timeoutMs = 1500) {
+  const readEnd = beginHttpReadDependency('history-session-owner');
+  try {
   // Claude History is a durable data read, not a renderer/presence question.
   // Prefer the persisted tab binding so a hidden, reloading or absent window
   // cannot add latency or make server-side history unavailable.
@@ -4595,6 +4898,7 @@ async function resolveHistorySessionInfo(tabId, timeoutMs = 1500) {
     return historyReadOwnerFromProjection(persisted, runtime, true);
   }
   return historyReadSession(await resolveAgentSessionInfo(tabId, timeoutMs));
+  } finally { readEnd(); }
 }
 
 function historyFreshnessReadOwners(tabIds) {
@@ -4638,7 +4942,7 @@ async function readPublicHistoryFreshness(tabIds) {
   }
   const result = { ok: true, epoch: owner.epoch, snapshots };
   console.log('[HistoryFreshness] batch tabs=' + tabIds.length + ' known='
-    + snapshots.filter(s => s.state === 'known').length + ' bytes=' + Buffer.byteLength(JSON.stringify(result))
+    + snapshots.filter(s => s.state === 'known').length
     + ' ms=' + (Date.now() - started));
   return result;
 }
@@ -4736,10 +5040,13 @@ async function reconcileExternalResearchRun(runId, reason = 'external-research-r
   const current = await store.getInternal(runId);
   if (!isExternalResearchRun(current)) return current ? store.get(runId) : null;
   if (isTerminalStatus(current.status)) return store.get(runId);
+  let operationalRead = null;
   try {
+    operationalRead = await store.captureExternalOperationalRead?.(runId) || null;
     const snapshot = await getExternalResearchCoordinator().readStatus(runId);
     if (snapshot) {
-      const applied = await store.applyExternalResearchSnapshot(runId, snapshot);
+      const applied = await store.applyExternalResearchSnapshot(runId, snapshot, { operationalRead });
+      if (applied.rearmCheck) await getExternalResearchCoordinator().recheckOperational(runId, applied.rearmCheck);
       emitOrchestrationChanges(applied.changed, reason);
       for (const settled of applied.settled || []) {
         await finalizeSettledOrchestration(settled, reason + '-terminal');
@@ -4750,8 +5057,11 @@ async function reconcileExternalResearchRun(runId, reason = 'external-research-r
       error: String(error?.message || error),
       code: error?.code || null,
       retryAt: Date.now() + 1000,
+      operationalRead,
     });
     if (waiting) emitOrchestrationRun(waiting, reason + '-transport-wait');
+  } finally {
+    store.releaseExternalOperationalRead?.(operationalRead);
   }
   const after = await store.get(runId);
   if (after && !isTerminalStatus(after.status)) {
@@ -5006,9 +5316,20 @@ function orchestrationPresentationSnapshot(run, phase, content = null, preparedP
 async function sendOrchestrationCompletionNotification(run, options = {}) {
   if (!run?.runId || orchestrationNotificationInflight.has(run.runId)) return;
   const store = getOrchestrationRunStore();
-  const current = await store.getInternal(run.runId);
+  let current = await store.getInternal(run.runId);
   if (!current || !isTerminalStatus(current.status)) return;
   if (current.status === 'completed' && current.resultComplete !== true) return;
+  if (current.runKind === 'external-research' && !current.externalResearchDelivery
+    && ['completed', 'failed'].includes(current.status)
+    && !require(path.join(srcMainDir, 'external-research-completion-delivery')).hasBirth(current)) {
+    await store.adoptLegacyExternalResearchDelivery(current.runId);
+    current = await store.getInternal(run.runId);
+    if (!current?.externalResearchDelivery) return;
+  }
+  if (current.runKind === 'external-research' && current.externalResearchDelivery
+    && !(current.externalResearchDelivery.legacy && options.force === true)) {
+    return getExternalCompletionDelivery().deliver(current.runId, { retryNoInput: options.sourceReady === true || options.force === true });
+  }
   if (current.notifySource === false || current.notificationSuppressed) return;
   if (['audit-pending', 'sent', 'queued', 'suppressed', 'source-closed'].includes(current.notificationStatus)) return;
   if (current.notificationStatus === 'unconfirmed' && options.force !== true) return;
@@ -5087,6 +5408,16 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
     // input. A failed write here cannot be mistaken for an attempted delivery.
     await store.persistStrict();
     const beforeInput = await store.getInternal(current.runId);
+    // Preparation reads may have overlapped a durable detach/dismiss. The
+    // frozen result is still readable, but it no longer authorizes NEW input.
+    // Once FIFO owns an attempt its existing exact cancellation fence applies;
+    // this check makes no assertion about an earlier/unknown delivery.
+    if (!beforeInput || beforeInput.notifySource === false || beforeInput.notificationSuppressed === true
+      || beforeInput.notificationCancelRequestedAt
+      || ['suppressed', 'source-closed'].includes(beforeInput.notificationStatus)) {
+      await releaseOrchestrationSourceProof(current.runId, 'source-notification-suppressed-before-input');
+      return;
+    }
     if (beforeInput?.sourceFollowupStartedAt) {
       await releaseOrchestrationSourceProof(current.runId, 'source-followup-proved-before-input');
       return;
@@ -5535,6 +5866,10 @@ function orchestrationSourceReceiptProof(run, record) {
   const receipt = record?.receipt;
   const expectedProvider = run.sourceToolType || run.sourceExecutionContext?.provider || run.sourceSendTarget?.toolType;
   const expectedSession = run.notificationSourceSessionId || run.sourceSendTarget?.sessionId || run.sourceExecutionContext?.sessionId;
+  const completion = run.externalResearchDelivery;
+  if (completion?.sourceTarget?.terminalInstanceId && completion.sourceTarget.launchId && !completion.sourceTarget.sessionId
+    && !require(path.join(srcMainDir, 'external-research-completion-delivery')).receiptMatchesDelivery(completion, record,
+      agentSendQueue?.item(record?.operationKey))) return null;
   if (record?.state !== 'confirmed' || record.surface !== 'desktop-history'
     || record.operationKey !== `history:${run.sourceTabId}:${handoffId}`
     || record.tabId !== run.sourceTabId || record.handoffId !== handoffId
@@ -5569,6 +5904,15 @@ async function reconcileOrchestrationSourceReceiptPins() {
   for (const item of catalog) {
     const run = await store.getInternal(item.runId);
     if (run?.sourceTabId) byKey.set(`history:${run.sourceTabId}:${run.notificationHandoffId || 'orchestration-complete:' + run.runId}`, run);
+  }
+  for (const key of agentSendReceiptStore.listOwnerPins('external-research-completion')) {
+    const run = byKey.get(key);
+    if (run?.sourceFollowupStartedAt || run?.externalResearchDelivery?.cancellationConfirmed) {
+      await store.persistStrict();
+      const fresh = await store.getInternal(run.runId);
+      if (fresh?.sourceFollowupStartedAt || fresh?.externalResearchDelivery?.cancellationConfirmed)
+        agentSendReceiptStore.unpinForOwner(key, 'external-research-completion');
+    }
   }
   const pinned = agentSendReceiptStore.listOwnerPins('orchestration-source-followup');
   const pending = new Set([...byKey].filter(([, run]) => run.notificationPromptAuditHash
@@ -5631,6 +5975,19 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
     || sourceInfo?.sessionId
     || current.sourceFollowupSessionId
     || null;
+  const completionPin = current.externalResearchDelivery?.sourceTarget;
+  if (completionPin?.terminalInstanceId && completionPin.launchId && !completionPin.sessionId) {
+    // Without an exact durable receipt, a newer session in the same tab is
+    // not the original provisional source. Do not search unrelated histories.
+    let destination;
+    try { destination = await readScenarioDestination(current.sourceTabId); } catch {}
+    if (!destination || require('../shared/agent-send-target-precondition.cjs')
+      .agentSendTargetPreconditionFailure(completionPin, destination)) {
+      return { confirmed: false, reason: 'source-followup-launch-changed-or-unavailable' };
+    }
+    sessionId = destination.sessionId || null;
+    if (!sessionId) return { confirmed: false, reason: 'source-followup-session-not-materialized' };
+  }
   let cwd = sourceInfo?.cwd || current.sourceProjectPath || null;
   const requestedAt = current.notificationAttemptedAt
     || current.notificationDeliveredAt
@@ -5973,7 +6330,7 @@ async function retryWaitingNotificationsForSource(tabId) {
     if (!neverAttemptedPending
       && run.notificationStatus !== 'waiting-for-input'
       && run.notificationStatus !== 'failed') continue;
-    await sendOrchestrationCompletionNotification(run);
+    await sendOrchestrationCompletionNotification(run, { sourceReady: true });
   }
 }
 
@@ -6530,6 +6887,16 @@ async function recoverMissingOrchestrationTarget(run, reason = 'startup-missing-
 async function reconcileActiveOrchestrations() {
   const store = getOrchestrationRunStore();
   await reconcileOrchestrationSourceReceiptPins();
+  // Old terminal rows may predate sourceFollowupPending and therefore be
+  // absent from listActive. Adopt only an observational delivery, never birth.
+  for (const item of await store.listAll()) {
+    if (!isExternalResearchRun(item) || item.externalResearchDelivery || item.sourceFollowupStartedAt
+      || !(item.status === 'failed' || item.status === 'completed' && item.resultComplete === true)) continue;
+    const saved = await store.getInternal(item.runId);
+    if (!require(path.join(srcMainDir, 'external-research-completion-delivery')).hasBirth(saved)) {
+      await store.adoptLegacyExternalResearchDelivery(item.runId);
+    }
+  }
   if (agentSendReceiptStore && getAgentResponseState && readAgentObservedResponse && getAgentTurnResult) {
     for (const item of await store.listAll()) {
       if (item.continuation) await getOrchestrationContinuationService().reconcile(item.runId);
@@ -6545,7 +6912,17 @@ async function reconcileActiveOrchestrations() {
         await finalizeSettledOrchestration(run, 'startup-response-notification');
       }
     } else if (isExternalResearchRun(run)) {
-      if (isActiveStatus(run.status)) {
+      let internal = await store.getInternal(run.runId);
+      if ((internal?.status === 'completed' || internal?.status === 'failed'
+        && !require(path.join(srcMainDir, 'external-research-completion-delivery')).hasBirth(internal))
+        && !internal.externalResearchDelivery && !internal.sourceFollowupStartedAt) {
+        await store.adoptLegacyExternalResearchDelivery(run.runId);
+        internal = await store.getInternal(run.runId);
+      }
+      if (internal?.externalResearchDelivery && ['completed', 'failed'].includes(run.status)) {
+        getExternalResearchCoordinator().wakeDelivery(run.runId, 'external-completion-startup');
+        continue; // This durable delivery owner also restores the exact source proof.
+      } else if (isActiveStatus(run.status)) {
         getExternalResearchCoordinator().watch(run.runId, 'external-research-startup');
       } else if (isTerminalStatus(run.status)
         && run.resultComplete === true
@@ -6800,6 +7177,7 @@ async function performOrchestrationAction(runId, action, options = {}) {
           };
         }
         const pending = await store.patch(runId, { notificationCancelRequestedAt: Date.now() });
+        if (isExternalResearchRun(current)) await store.persistStrict();
         emitOrchestrationRun(pending, 'notification-cancel-requested');
         return { ok: true, cancellationPending: true, run: withOrchestrationUrls(pending) };
       }
@@ -7355,6 +7733,9 @@ function projectActivitySnapshot(reason = 'snapshot', activitySample = publicTab
   }
   try {
     const snap = computeProjectActivity() || {};
+    let workflowPublication = null;
+    try { workflowPublication = typeof readWorkflowPublication === 'function' ? readWorkflowPublication() : null; }
+    catch { console.warn('[WorkflowPublicationWake] snapshot-unavailable'); }
     const projects = (Array.isArray(snap.projects) ? snap.projects : []).map((project) => ({
       ...project,
       tabs: Array.isArray(project?.tabs)
@@ -7377,6 +7758,7 @@ function projectActivitySnapshot(reason = 'snapshot', activitySample = publicTab
       layoutChangedProjectIds: Array.isArray(snap.layoutChangedProjectIds) ? snap.layoutChangedProjectIds : [],
       projectOrderChanged: snap.projectOrderChanged === true,
       ...(snap.cardSignals ? { cardSignals: snap.cardSignals } : {}),
+      ...(workflowPublication ? { workflowPublication } : {}),
       workspaceSwitcher: workspaceSwitcherWake(),
       runAfter: runAfterWake(),
       ...(activitySample ? { tabActivity: activitySample() } : {}),
@@ -7422,6 +7804,7 @@ async function bridgeRequest(action, payload, timeoutMs = 5000, {
   onAbort = null,
   onObservationExpired = null,
 } = {}) {
+  const readEnd = beginHttpReadDependency('renderer-bridge', { source: action });
   if(action==='createAgentTab' || action==='createTerminalTab') {
     const manager=require('./project-manager');
     if(manager.workflowOrganization?.ready()) {
@@ -7440,6 +7823,7 @@ async function bridgeRequest(action, payload, timeoutMs = 5000, {
       return reject(error);
     }
     const requestId = ownedRequestId || crypto.randomBytes(8).toString('hex');
+    httpReadDiagnostics.event('bridge-enqueue', { bridgeRequestId: requestId, source: action, queueDepth: pendingBridge.size });
     if (pendingBridge.has(requestId)) return reject(Object.assign(new Error('Bridge request already pending'), {
       code: 'bridge_request_identity_conflict', dispatched: false,
     }));
@@ -7475,6 +7859,7 @@ async function bridgeRequest(action, payload, timeoutMs = 5000, {
     pendingBridge.set(requestId, {
       resolve,
       reject,
+      readDiagnostic: httpReadDiagnostics.bind(),
       timer,
       action,
       label,
@@ -7489,6 +7874,7 @@ async function bridgeRequest(action, payload, timeoutMs = 5000, {
       expectedSwitcherFrame: ['sendAgentPromptScenario', 'readWorkspaceSwitcher', 'readRunAfter', 'mutateRunAfter', 'previewRunAfterImage', 'readPromptQueueSendAdmission'].includes(action) ? switcherFrameKey(win.webContents.mainFrame) : null,
     });
     console.log('[BridgeDiag] SEND action=' + action + label + ' rid=' + requestId + ' wins=' + wins.length);
+    httpReadDiagnostics.event('bridge-dispatch', { bridgeRequestId: requestId, source: action });
     try {
       onDispatch?.({ requestId });
       if ((observationOnly || typeof onAbort === 'function') && typeof win.webContents.once === 'function') {
@@ -7570,7 +7956,7 @@ async function bridgeRequest(action, payload, timeoutMs = 5000, {
         });
       }
     }
-  });
+  }).then(value => { readEnd('returned'); return value; }, error => { readEnd('error', () => ({ code: error?.code || 'bridge-error' })); throw error; });
 }
 
 async function resolveAgentSessionInfo(tabId, timeoutMs = 1500, { onLateStatus = null } = {}) {
@@ -7735,6 +8121,8 @@ function registerBridgeReplyHandler() {
       return;
     }
     const elapsed = Date.now() - pending.sentAt;
+    pending.readDiagnostic?.('bridge-reply', { bridgeRequestId: requestId, source: pending.action,
+      accepted: ok === true, elapsedMs: elapsed, outcome: pending.timedOut ? 'late' : 'received' });
     console.log('[BridgeDiag] REPLY action=' + pending.action + (pending.label || '') + ' rid=' + requestId + ' ok=' + ok + ' elapsedMs=' + elapsed + ' err=' + (error || '-'));
     clearTimeout(pending.timer);
     pending.dispose?.();
@@ -7845,6 +8233,7 @@ const workflowOrganizationHttp = createWorkflowOrganizationHttp({
 });
 
 async function handleApi(req, res, parsed, sdkSessions) {
+  httpReadDiagnostics.phase(res, 'handler-enter');
   if (req.method === 'OPTIONS') {
     sendJson(res, 200, {});
     return;
@@ -7862,7 +8251,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         workspaceSwitcher: WORKSPACE_SWITCHER_CAPABILITY,
         ...(storageMaintenance ? { storageMaintenance: STORAGE_MAINTENANCE_CAPABILITY } : {}),
         dictationClipboardReceipt: { version: 2, endpoint: '/api/dictation-clipboard/receipts', proof: 'exact-xterm-pty-write-or-editable-commit' },
-        ...(require('./project-manager').workflowOrganization?.ready() ? { workflowOrganization: WORKFLOW_HTTP_CAPABILITY } : {}),
+        ...(require('./project-manager').workflowOrganization?.ready()
+          ? { workflowOrganization: workflowOrganizationCapability(require('./project-manager').workflowOrganization) } : {}),
         // The remote guard belongs to the current mutation journal, not the
         // HTTP service UUID (which survives stop/start in this module).
         runAfter: { ...RUN_AFTER_CAPABILITY, mainEpoch: getRunAfterApi().journal.epoch },
@@ -7943,6 +8333,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         tabMessages: { version: 1, durable: true, replyTo: true, dismiss: true, sourceNavigation: true,
           cancellation: { version: 1, durable: true, deliveryEvidencePreserved: true } },
         orchestrationInlineResults: { version: 1 },
+        orchestrationMaintenance: { version: 1, endpoint: '/api/orchestrations/maintenance',
+          scope: 'operational-model-prompts', completionDelivery: 'preserved', durable: true },
         ...(agentSendReceiptStore && getAgentResponseState && readAgentObservedResponse && getAgentTurnResult
           ? { orchestrationContinuation: { version: 1, durable: true, actions: ['continue', 'new-request'], exactInput: true } } : {}),
         ...(getAgentResponseState && readAgentObservedResponse ? { responseObservations: {
@@ -8592,12 +8984,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
 
       const requestedRunId = cleanOptionalString(body.runId, '') || crypto.randomUUID();
+      const existingRun = await getOrchestrationRunStore().getInternal(requestedRunId);
       const continueFromRunId = cleanOptionalString(body.continueFromRunId, '');
       const previous = continueFromRunId
         ? await getOrchestrationRunStore().getInternal(continueFromRunId)
         : null;
       const request = continueFromRunId
-        ? continuationRequest(previous, body)
+        ? continuationRequest(previous, body, { validateMode: !existingRun })
         : normalizeExternalResearchRequest(body);
 
       const sourceMeta = body.sourceMeta && typeof body.sourceMeta === 'object'
@@ -8621,7 +9014,6 @@ async function handleApi(req, res, parsed, sdkSessions) {
       });
       const jobId = externalResearchJobId(requestedRunId);
       const targetLabel = externalResearchTargetLabel(request);
-      const existingRun = await getOrchestrationRunStore().getInternal(requestedRunId);
       const sourceSendTarget = notifySource ? await captureOrchestrationSourceTarget(source, existingRun, sourceExecutionContext) : null;
       const researchCapabilities = !existingRun
         ? await assertExternalResearchCapabilities(request.provider, !!request.browserId || !!continueFromRunId) : null;
@@ -8725,6 +9117,21 @@ async function handleApi(req, res, parsed, sdkSessions) {
     return sendJson(res, 200, { ok: true, settings: await getOrchestrationRunStore().getSettings() });
   }
 
+  if (parsed.pathname === '/api/orchestrations/maintenance' && req.method === 'GET') {
+    return sendJson(res, 200, { ok: true, maintenance: await getOrchestrationRunStore().getResearchMaintenance() });
+  }
+
+  if (parsed.pathname === '/api/orchestrations/maintenance' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      if (body.version !== 1) return sendJson(res, 400, { ok: false, code: 'research_maintenance_version_required' });
+      const maintenance = await getOrchestrationRunStore().transitionResearchMaintenance({ action: body.action, operationId: body.operationId });
+      return sendJson(res, 200, { ok: true, maintenance });
+    } catch (error) {
+      return sendJson(res, error.statusCode || 503, { ok: false, code: error.code || 'research_maintenance_unavailable', error: String(error.message || error) });
+    }
+  }
+
   if (parsed.pathname === '/api/orchestrations/settings' && req.method === 'POST') {
     const body = await readBody(req);
     const settings = await getOrchestrationRunStore().updateSettings({
@@ -8732,6 +9139,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       successAutoStopMs: Object.prototype.hasOwnProperty.call(body, 'successAutoStopMs') ? body.successAutoStopMs : undefined,
       reactToManualInterrupt: typeof body.reactToManualInterrupt === 'boolean' ? body.reactToManualInterrupt : undefined,
       autoStopCreatedTargets: typeof body.autoStopCreatedTargets === 'boolean' ? body.autoStopCreatedTargets : undefined,
+      externalResearchOperationalPrompts: typeof body.externalResearchOperationalPrompts === 'boolean' ? body.externalResearchOperationalPrompts : undefined,
       codexCapacityRetryEnabled: typeof body.codexCapacityRetryEnabled === 'boolean' ? body.codexCapacityRetryEnabled : undefined,
       codexCapacityRetryLimit: Object.prototype.hasOwnProperty.call(body, 'codexCapacityRetryLimit') ? body.codexCapacityRetryLimit : undefined,
       codexCapacityRetryDelaysMs: Object.prototype.hasOwnProperty.call(body, 'codexCapacityRetryDelaysMs') ? body.codexCapacityRetryDelaysMs : undefined,
@@ -13224,7 +13632,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
               if (freshnessRequested) readScope.freshness = 'v1';
               if (payloadPolicy) Object.assign(readScope, { payloadPolicy, dehydrate: true,
                 payloadHeaderVersion: historyPayloadCapability.headerVersion });
-              data = freshnessRequested ? await readHistoryFreshnessWindow({ info, readScope, requestedRevision, deltaOk })
+              const historyReadEnd = beginHttpReadDependency(freshnessRequested ? 'history-freshness' : 'history-service');
+              try { data = freshnessRequested ? await readHistoryFreshnessWindow({ info, readScope, requestedRevision, deltaOk })
                 : await transcriptService.getHistory({
                 ...readScope,
                 ifRevision: publicHistoryRevisions.lookup(requestedRevision, readScope),
@@ -13232,7 +13641,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
                 deltaConsumerId: deltaOk
                   ? 'http:' + crypto.createHash('sha256').update(JSON.stringify(readScope)).digest('hex')
                   : null,
-              });
+              }); } finally { historyReadEnd(); }
               if (data?.success) {
                 if (freshnessRequested || payloadPolicy || requestedRevision != null || deltaOk || info.readIdentitySource === 'empty-resume-source') {
                   const current = await resolveHistorySessionInfo(tabId, 1500);
@@ -14031,6 +14440,7 @@ function start({
   readAgentSendInputSlot: readAgentSendInputSlotFn,
   computeActiveLoaders: computeFn,
   computeProjectActivity: computeProjectActivityFn,
+  readWorkflowPublication: readWorkflowPublicationFn,
   readTabActivityState,
   scheduleTabActivityBroadcast: scheduleTabActivityBroadcastFn,
   readAgentTabTiming: readAgentTabTimingFn,
@@ -14129,9 +14539,12 @@ function start({
         }
       },
       execute: async (request, scope) => {
+        const operational = String(request.source || '').startsWith('research-operational:') || !!request.operationalNoticeRef;
         const continuation = String(request.source || '').replace(/^codex-/, '').startsWith('orchestration-continue:');
         const continuationRunId = continuation ? require('./orchestration-continuation').continuationRunIdFromAudit(request) : null;
         const receipt = await runPreparedAgentSendScenario({ ...request, applicationQueueExecution: true,
+          ...(operational ? { [OPERATIONAL_ADMISSION]: true } : {}),
+          ...(request.completionDeliveryRef ? { [COMPLETION_ADMISSION]: true } : {}),
           sendRequestFingerprint: scope.requestFingerprint,
           ...(scope.expectedTarget ? { expectedTarget: scope.expectedTarget } : {}),
           ...(request.restoreClosedTab === true ? {
@@ -14149,6 +14562,16 @@ function start({
         return receipt;
       },
       publish: record => {
+        if (String(record.handoffId || '').startsWith('orchestration-complete:')) {
+          const id = record.handoffId.slice('orchestration-complete:'.length);
+          getExternalResearchCoordinator().wakeDelivery(id, 'completion-receipt');
+        }
+        if (String(record.handoffId || '').startsWith('research-operational:') && externalOperationalDelivery) {
+          void externalOperationalDelivery.observeReceipt(record.operationKey,
+            durableAgentSendReplay(record, { operationKey: record.operationKey, attemptId: record.attemptId || null,
+              tabId: record.tabId, handoffId: record.handoffId })).catch(error =>
+            console.warn('[ResearchOperational] receipt pending:', error.code || 'unavailable'));
+        }
         if (record.surface === 'tab-message' && tabMessageService?.initialized) {
           tabMessageService.observeReceipt(record.operationKey, record, 'send-queue-control');
         }
@@ -14185,11 +14608,10 @@ function start({
     }))
     : Promise.resolve({ ready: true });
   const startupQueue = agentSendQueue;
-  void agentSendReceiptStartupReady.then(result => {
-    if (agentSendQueue !== startupQueue || result?.ready === false) return;
-    sendQueueRecoveryReady = true;
-    agentSendQueue?.resume();
-  });
+  // The same owner also resumes this boundary after a retryable strict-write
+  // refusal; a recovered startup must not leave the whole FIFO paused forever.
+  void restoreAgentSendQueueAfterReceipts(startupQueue)
+    .catch(error => console.warn('[ResearchMaintenance] startup handover pending:', error.code || 'unavailable'));
   if (agentSendReceiptStore && !agentSendReceiptStartupReadyFn) {
     const reconciled = agentSendReceiptStore.reconcileStartup();
     if (reconciled?.changed) {
@@ -14198,6 +14620,7 @@ function start({
   }
   computeActiveLoaders = computeFn || null;
   computeProjectActivity = computeProjectActivityFn || null;
+  readWorkflowPublication = typeof readWorkflowPublicationFn === 'function' ? readWorkflowPublicationFn : null;
   readAgentTabTiming = readAgentTabTimingFn || null;
   readAgentUsage = readAgentUsageFn || null;
   readCodexAuthProfile = readCodexAuthProfileFn || null;
@@ -14314,14 +14737,9 @@ function start({
   const messageServiceForStart = getTabMessageService();
   void agentSendReceiptStartupReady.then(() => messageServiceForStart.initialize())
     .catch(error => console.warn('[TabMessages] startup-failed error=' + error.message));
-  void getOrchestrationRunStore().initialize()
-    .then(async () => {
-      if (getAgentResponseState && readAgentObservedResponse) await getResponseObservationService().restore();
-      await reconcileActiveOrchestrations();
-    })
-    .catch((error) => console.warn('[Orchestration] startup recovery failed:', error?.message || error));
+  void startOrchestrationStartupRecovery();
 
-  httpServer = http.createServer((req, res) => {
+  httpServer = http.createServer((req, res) => httpReadDiagnostics.run(req, res, () => {
     if ((req.headers['x-noted-main-pid'] && req.headers['x-noted-main-pid'] !== String(process.pid))
       || (req.headers['x-noted-instance-id'] && req.headers['x-noted-instance-id'] !== webServerInstanceId)) {
       return sendJson(res, 409, { code: 'mcp_instance_route_changed', error: 'Noted instance changed before request admission' });
@@ -14331,14 +14749,21 @@ function start({
       webServerLastRequestAt = Date.now();
       webServerLastRequest = String(req.method || 'GET') + ' ' + parsed.pathname;
       webServerRequestCount += 1;
-      handleApi(req, res, parsed, sdkSessions).catch((err) => {
+      httpReadDiagnostics.phase(res, 'route-enter');
+      handleApi(req, res, parsed, sdkSessions).then(() => {
+        httpReadDiagnostics.phase(res, 'handler-return');
+      }).catch((err) => {
         console.error('[WebServer] handler error:', err);
+        if (err?.code === 'orchestration_store_unavailable') {
+          return sendJson(res, 503, { ok: false, code: err.code,
+            error: String(err.message), retryable: true });
+        }
         sendJson(res, 500, { error: String(err.message) });
       });
       return;
     }
     serveStatic(req, res, parsed);
-  });
+  }));
 
   attachWebSocket(httpServer, sdkSessions);
 
@@ -14415,8 +14840,13 @@ function stop() {
     ? externalResearchCoordinator.stop().catch(() => {})
     : Promise.resolve();
   externalResearchCoordinator = null;
+  externalCompletionDelivery?.stop();
+  externalCompletionDelivery = null;
+  externalOperationalDelivery?.stop();
+  externalOperationalDelivery = null;
   scExternalResearchClient = null;
   webServerState = 'stopping';
+  stopOrchestrationStartupRecovery();
   console.log('[WebServer:Health] stop-request pid=' + process.pid + ' listening=' + !!serverToClose?.listening);
   if (orchestrationPolicyTimer) clearTimeout(orchestrationPolicyTimer);
   orchestrationPolicyTimer = null;
@@ -14459,6 +14889,7 @@ function stop() {
   wss = null;
   computeActiveLoaders = null;
   computeProjectActivity = null;
+  readWorkflowPublication = null;
   publicTabActivity = null;
   workspaceSwitcherApi?.retire(); workspaceSwitcherApi = null;
   runAfterApi = null;
@@ -14726,6 +15157,9 @@ async function admitQueuedAgentSend(request) {
 }
 
 module.exports = {
+  // Read-only health for the existing diagnostics owner; no new HTTP route.
+  getHttpReadDiagnosticsSnapshot: () => ({ ...httpReadDiagnostics.snapshot(),
+    historyReader: transcriptService?.historyReader?.getReadDiagnosticHealth?.() || null }),
   historyMutationInputBusy: tabId => agentSendQueue?.hasUnsettledInput(tabId) ?? false,
   wakeHistoryMutationInput: tabId => agentSendQueue?.wake(tabId),
   readInheritedTabActivity: () => getOrchestrationRunStore().readInheritedActivity(),
@@ -14803,6 +15237,7 @@ module.exports = {
     || { cancelled: false, count: 0, complete: true, results: [],
       ...(options?.stop ? { available: false, reason: 'agent_send_queue_unavailable' } : {}) },
   publicAgentSendReceipt,
+  readQueuedSendAuthoring: (tabId, handoffId) => agentSendQueue?.authoringSnapshot(tabId, handoffId) || null,
   sendIntentCancellationAvailable,
   dismissUnwrittenQueuedSend: (tabId, handoffId) => agentSendQueue?.dismissUnwritten(tabId, handoffId)
     || { cancelled: false, count: 0 },

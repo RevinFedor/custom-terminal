@@ -21,6 +21,104 @@ const message = (uuid, offset) => ({ type: 'user', uuid, sessionId,
   sourceIdentity: 'codex-user-source-' + sessionId + '-' + offset,
   message: { role: 'user', content: [{ type: 'text', text: content }] } });
 
+test('a single Codex user carrier keeps its proven Q/A in live History, not only after a paired carrier or refresh', async () => {
+  const {projectHistoryServicePromptBody} = await import('../renderer/utils/historyOrchestrationPromptPresentation.mjs');
+  const {reduceHistoryLiveProjection} = await import('../renderer/utils/historyLiveProjection.mjs');
+  for (const kind of ['response_item', 'event_msg']) {
+    const proof = createCodexLiveQuestionReplyProof({physicalSessionId: sessionId});
+    proof.observe(definition, 'exact-call-source', sessionId);
+    const pairer = createCodexLiveUserCarrierPairer();
+    const projected = pairer.accept({kind, byteOffset: 200, text: content,
+      projection: {sessionId, message: message('single-' + kind, 200)}});
+    assert.equal(projected.paired, false);
+    const decorated = proof.decorate(projected.projections[0].message);
+    assert.ok(decorated.questionReplyProof, 'Main already proved the native call');
+    assert.equal(decorated.sourceIdentityAliases, undefined, 'there is no companion carrier yet');
+    const entry = reduceHistoryLiveProjection([], {toolType: 'codex', sessionId,
+      message: decorated}, {includeUserText: true})[0];
+    assert.ok(entry.questionReplyProof, 'single-carrier path must not enter the Claude prompt adapter');
+    assert.equal(projectHistoryServicePromptBody(entry, hash).questionReply?.kind, 'question-reply');
+    assert.equal(entry.uuid, decorated.uuid);
+    assert.equal(entry.sourceIdentity, decorated.sourceIdentity);
+    assert.equal(entry.content, content);
+  }
+});
+
+test('Codex single-carrier Q/A preserves literal answer bytes that Claude prompt normalization would remove', async () => {
+  const {projectHistoryServicePromptBody} = await import('../renderer/utils/historyOrchestrationPromptPresentation.mjs');
+  const {reduceHistoryLiveProjection} = await import('../renderer/utils/historyLiveProjection.mjs');
+  const proof = createCodexLiveQuestionReplyProof({physicalSessionId: sessionId});
+  proof.observe(definition, 'exact-call-source', sessionId);
+  const literal = content.replace('Native free answer', '[200~ <system-reminder>literal user answer</system-reminder> ~]');
+  const input = message('literal-carrier', 200); input.message.content[0].text = literal;
+  const decorated = proof.decorate(input);
+  assert.ok(decorated.questionReplyProof);
+  const [entry] = reduceHistoryLiveProjection([], {toolType: 'codex', sessionId,
+    message: decorated}, {includeUserText: true});
+  assert.equal(entry.content, literal, 'provider transport is not Claude composer text');
+  assert.equal(entry.questionReplyProof?.transportHash, hash(literal));
+  assert.match(projectHistoryServicePromptBody(entry, hash).questionReply?.text || '', /literal user answer/);
+});
+
+test('single-carrier live display never invents proof, bypasses local ownership or duplicates a later proof update', async () => {
+  const {projectHistoryServicePromptBody} = await import('../renderer/utils/historyOrchestrationPromptPresentation.mjs');
+  const {reduceHistoryLiveProjection, shouldIncludeHistoryLiveUserText, buildHistoryLivePresentation,
+    reconcileCommittedHistoryLiveProjection} = await import('../renderer/utils/historyLiveProjection.mjs');
+  const input = message('single-update', 200);
+  const detail = {toolType: 'codex', sessionId, message: input};
+  const literal = reduceHistoryLiveProjection([], detail, {includeUserText: true});
+  assert.equal(projectHistoryServicePromptBody(literal[0], hash).questionReply, undefined);
+  assert.equal(literal[0].content, content);
+  const proof = createCodexLiveQuestionReplyProof({physicalSessionId: sessionId});
+  proof.observe(definition, 'exact-call-source', sessionId);
+  const decorated = proof.decorate(input), nextDetail = {...detail, message: decorated};
+  const owned = shouldIncludeHistoryLiveUserText({toolType: 'codex', envelope: nextDetail,
+    localHandoffs: [{handoffId: 'owned', sourceIdentity: decorated.sourceIdentity}]});
+  assert.equal(owned, false);
+  assert.deepEqual(reduceHistoryLiveProjection([], nextDetail, {includeUserText: owned}), []);
+  const proved = reduceHistoryLiveProjection(literal, nextDetail, {includeUserText: true});
+  assert.equal(proved.length, 1);
+  assert.equal(proved[0].uuid, literal[0].uuid);
+  assert.equal(projectHistoryServicePromptBody(proved[0], hash).questionReply?.kind, 'question-reply');
+  assert.equal(reduceHistoryLiveProjection(proved, nextDetail, {includeUserText: true}), proved,
+    'identical proved replay preserves the array reference');
+  const durable = [{...proved[0], uuid: 'durable-user'}];
+  assert.equal(buildHistoryLivePresentation(durable, proved), durable);
+  assert.deepEqual(reconcileCommittedHistoryLiveProjection(proved, durable).entries, []);
+  assert.equal(projectHistoryServicePromptBody({...proved[0], content: content + '\nchanged'}, hash).questionReply,
+    undefined, 'the new provider dispatch does not bypass full-body proof validation');
+});
+
+test('a lone proven reply uses the actual History blue shell and readable body before any saved refresh', async () => {
+  const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
+  const {transformSync} = require('esbuild'), React = require('react');
+  const {renderToStaticMarkup} = require('react-dom/server');
+  const {reduceHistoryLiveProjection} = await import('../renderer/utils/historyLiveProjection.mjs');
+  const {projectHistoryServicePromptBody} = await import('../renderer/utils/historyOrchestrationPromptPresentation.mjs');
+  const proof = createCodexLiveQuestionReplyProof({physicalSessionId: sessionId});
+  proof.observe(definition, 'exact-call-source', sessionId);
+  const [entry] = reduceHistoryLiveProjection([], {toolType: 'codex', sessionId,
+    message: proof.decorate(message('one-visible-reply', 200))}, {includeUserText: true});
+  const serviceBody = projectHistoryServicePromptBody(entry, hash);
+  const history = fs.readFileSync(path.join(__dirname, '../renderer/components/Workspace/HistoryPanel.tsx'), 'utf8');
+  const toneExpression = history.match(/tone=\{(serviceBody\.questionReply \? 'info' : 'default')\}/)?.[1];
+  assert.ok(toneExpression, 'actual HistoryUserEntry tone expression');
+  const tone = vm.runInNewContext(toneExpression, {serviceBody});
+  const shellFile = path.join(__dirname, '../../packages/claude-blocks/src/components/ConversationMessage.tsx');
+  const code = transformSync(fs.readFileSync(shellFile, 'utf8'), {loader: 'tsx', format: 'cjs', target: 'es2022'}).code;
+  const module = {exports: {}};
+  vm.runInNewContext(code, {module, exports: module.exports, require});
+  const html = renderToStaticMarkup(React.createElement(module.exports.ConversationMessage, {
+    layout: 'user', tone, entryUuid: entry.uuid, 'data-history-question-reply': serviceBody.questionReply?.provider,
+  }, serviceBody.text));
+  assert.match(html, /data-message-tone="info"/);
+  assert.match(html, /data-history-question-reply="codex"/);
+  assert.match(html, /Вопрос: .*Ответ:/s);
+  assert.doesNotMatch(html, /send_user_message_question_reply|questionItemId/);
+  const css = fs.readFileSync(path.join(__dirname, '../../packages/claude-blocks/src/blocks.css'), 'utf8');
+  assert.match(css, /\.cb-message--info > \.cb-user-col > \.cb-user-bubble\s*\{\s*background-color: rgba\(59, 130, 246, 0\.12\)/);
+});
+
 test('bounded native reply is blue through actual live proof, pairing, History and Timeline without a refresh', async () => {
   const { projectHistoryServicePromptBody } = await import('../renderer/utils/historyOrchestrationPromptPresentation.mjs');
   const { projectTimelineLiveUserMessage } = await import('../renderer/utils/timelineTranscriptRefresh.mjs');

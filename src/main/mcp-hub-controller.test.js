@@ -19,7 +19,7 @@ async function freePort() {
   return port;
 }
 function fixture(port) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-controller-'));
+  const dir = fs.mkdtempSync(path.join(process.env.SC_OWN_HOST_FIXTURE_ROOT || os.tmpdir(), 'mcp-controller-'));
   const script = path.join(dir, 'hub.cjs');
   fs.writeFileSync(script, `const {McpHub}=require(${JSON.stringify(require.resolve('./mcp-hub'))});
     const hub=new McpHub({port:${port},log(){},serverDefs:{stub:{command:'node',args:['-e',${JSON.stringify(STUB)}],env:{}}}});
@@ -27,11 +27,12 @@ function fixture(port) {
   `);
   const children = [];
   const make = overrides => createMcpHubController({ port, script, log() {}, executable: process.execPath,
+    ingressFile: path.join(dir, 'ingress.json'),
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
     readConfiguration: () => ({ serverDefs: { stub: {} }, status: { entries: [], needsReview: false, error: null },
       fingerprint: 'synthetic-stub', canLaunch: true }),
     spawnImpl(...args) { const proc = spawn(...args); children.push(proc); return proc; }, ...overrides });
-  return { make, children, async close() {
+  return { dir, make, children, async close() {
     for (const proc of children) {
       if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) continue;
       proc.ref(); // production detaches; the test owns and awaits this process
@@ -80,8 +81,10 @@ test('controller: legacy 0/6 ENOENT is repaired on ensure and old port closes be
   } finally { legacy.closeAllConnections(); legacy.close(); await f.close(); }
 });
 
-test('controller: isolated E2E cannot spawn or replace the shared hub', async () => {
-  const controller = createMcpHubController({ port: await freePort(), canSpawn: false,
+test('controller: isolated E2E cannot spawn or replace the shared hub', async (t) => {
+  const f = fixture(await freePort());
+  t.after(() => f.close());
+  const controller = createMcpHubController({ port: await freePort(), canSpawn: false, ingressFile: path.join(f.dir, 'ingress.json'),
     readConfiguration: () => ({ serverDefs: {}, status: { entries: [], error: null, needsReview: false },
       fingerprint: 'synthetic-observer', canLaunch: true }),
     spawnImpl() { assert.fail('E2E must not spawn'); } });

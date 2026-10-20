@@ -155,14 +155,14 @@ export function createOrganizationCommitter({invoke,getPublication,applyPublicat
           // These named Main validation errors prove the transaction rejected.
           // Transport errors and missing ACK keep owning the same request.
           if (original?.disposition === 'not-applied'
-            || /workflow_(drag_|group_|revision_changed|membership_revision_changed|incomplete_membership_snapshot|membership_target_missing|space_identity_conflict|system_kind_reserved|id_exists|tab_unknown)/.test(String(original?.code || original?.message || original)))
+            || /workflow_(drag_|group_|strip_groups_|revision_changed|membership_revision_changed|incomplete_membership_snapshot|membership_target_missing|space_identity_conflict|system_kind_reserved|id_exists|tab_unknown)/.test(String(original?.code || original?.message || original)))
             unresolved = null;
           throw original;
         }
       }
       operation.result = result;
     }
-    operation.publication = await applyPublication(result);
+    operation.publication = await applyPublication(result,operation.request);
     if (unresolved === operation) unresolved = null;
     return result;
   };

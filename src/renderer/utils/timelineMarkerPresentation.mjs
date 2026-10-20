@@ -1,15 +1,25 @@
 import { getAutomaticContinuationKind, getTerminalMcpTag, isSystemPromptEntry } from '../../shared/prompt-origin.mjs';
 import { projectNativeQuestionReply } from '../../shared/native-question-reply.mjs';
 
+const isScResearchTag = tag => tag?.kind === 'orchestration' && tag.runKind === 'external-research'
+  && typeof tag.runId === 'string' && !!tag.runId.trim();
+
 export function timelineMarkerKind(entry, fingerprint) {
   if (entry?.questionReplyProof && projectNativeQuestionReply(entry, fingerprint)) return 'question-reply';
   const tag = getTerminalMcpTag(entry);
-  if (tag?.kind === 'orchestration' && tag.runKind === 'external-research'
-    && typeof tag.runId === 'string' && tag.runId.trim()) return 'sc-desktop';
+  if (isScResearchTag(tag)) return 'sc-desktop';
   if (tag) return 'terminal-mcp';
   const continuation = getAutomaticContinuationKind(entry);
   if (continuation) return continuation;
   return isSystemPromptEntry(entry) ? 'system' : 'ordinary';
+}
+
+/** SC Desktop owns a standalone source point, even next to other SC results.
+ * It also breaks a run of MCP entries: grouping must not bridge across it. */
+export function timelineAutomaticGroupKind(entry) {
+  const tag = getTerminalMcpTag(entry);
+  if (tag) return isScResearchTag(tag) ? null : 'orchestration';
+  return entry?.isSubAgent || entry?.isSubAgentTimeout ? 'subagent' : null;
 }
 
 export function collectTimelineDocs(entries) {

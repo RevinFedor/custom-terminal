@@ -11,6 +11,8 @@ const contract = require('./project-api-runtime-contract');
 const { runKeyedExclusive } = require('./codex-writer-ownership');
 const { createTerminalShellReadinessTracker } = require('./terminal-shell-readiness.cjs');
 const { createHistoryMutationInputGate } = require('./history-mutation-input');
+const { createHttpReadDiagnostics } = require('./http-read-diagnostics');
+const { handleStorageMaintenance } = require('./storage-maintenance-api');
 const { spawn } = require('node:child_process');
 const quiet = { log() {}, warn() {}, error() {} };
 function functions(file, names) {
@@ -81,6 +83,8 @@ function fixture({ residual = false, guarded = false } = {}) {
   ctx.bridgeKnownSessions.set('T', 'S'); ctx.claudeTurnBusy.set('T', true); ctx.claudeCliActive = new Set(['T']);
   vm.runInContext(mainCode, ctx);
   const web = vm.createContext({ console: quiet, url, require: () => ({}), token: 'fixture', ...contract,
+    httpReadDiagnostics: createHttpReadDiagnostics({ serviceId: 'stop-fixture', enabled: false, log() {} }),
+    handleStorageMaintenance, storageMaintenance: null,
     handleDictationClipboardHttp: async () => false,
     workflowOrganizationHttp: async () => false,
     handleSystemPromptApi: async () => false, systemPromptService: null, readBody: async () => ({}),

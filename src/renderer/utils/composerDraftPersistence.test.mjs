@@ -35,6 +35,7 @@ test('composer draft persistence round-trips text, image refs, and hidden chip b
     images: { a: [{ id: 1, path: '/tmp/image.png', assetId: 'asset.png', availability: 'available' }] },
     chips: { a: [{ id: 'paste-1', kind: 'paste', text: 'hello', label: 'Paste' }] },
     updatedAtByTab: { a: 42 },
+    returnedByTab: {},
   });
 });
 

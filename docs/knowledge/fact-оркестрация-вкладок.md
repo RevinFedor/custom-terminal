@@ -140,6 +140,14 @@ History run является кнопкой: тот же `orchestration:open-res
 сохранённый SC Research detail по полному jobId, не браузер и не новый запрос.
 Успех ждёт rendered ACK; repeated click coalesces, ошибка видна в прежних деталях.
 
+Подпись Research в tracker, его History и hover различает модель и effort:
+`6-astra/pro` показывает `ChatGPT · 6 Pro`, `6/xhigh` — `ChatGPT · 6 X High`,
+`6/high` — `ChatGPT · 6 High`. Источник — сохранённые model/effort этого run,
+не текущие defaults и не только старое `targetTabName`, иначе существующие записи
+теряют режим. Medium/Instant и неизвестный явный effort сохраняются. При отсутствии
+параметров остаётся прежнее имя, без предположения Pro. Это только display:
+wire IDs, intent/fingerprint, mode, source и переход к exact job не меняются.
+
 В Research-строке History справа от SC-стрелки есть отдельная browser SVG,
 затем прежние Copy/chevron. Новый `orchestration:open-research-browser` связывает
 run с сохранённым jobId и вызывает SC `/research-open-browser({jobId,requestId})`.
@@ -244,9 +252,9 @@ find/open. UUID=null остаётся owner-unproven; metadata не доказы
 получает queued `waiting-for-browser` и `externalResearchBrowserWait.notSubmitted:true`.
 Прежний pending/unknown start либо accepted job не понижается до no-submit по этому
 новому preflight. Tracker показывает статичное «Ждёт браузер», детали — «Не отправлен».
-Один frozen `research-browser-offline:<hash>` отправляется в server-owned Telegram
-outbox от сохранённого source context. Queued outbox не равен доставленному Telegram;
-сбой outbox виден отдельно, run не завершается и модель не будится. Retry/backoff
+В прежней версии один frozen `research-browser-offline:<hash>` отправлялся в
+server-owned Telegram outbox. SOURCE20Oct отключает автоматический human channel
+по умолчанию, сохраняя ожидание и inline-статус. Retry/backoff
 сохраняет IDs/payload/UUID, не запускает Chrome и не переключается на Яндекс.
 Bridge `transport_unknown` не объявляется закрытым Chrome. HTTP429 у SC-клиента —
 transport wait, но native provider `status:error` остаётся terminal. Generic
@@ -373,6 +381,100 @@ browser также даёт job/conversation identity. В History видны т�
 отсутствующий или больший ответ даёт явный reference с точным run/session/job,
 без молчаливого усечения или объявления частичного текста полным. Ненормальный
 исход передаёт причину ошибки, не выдавая partial output за успешный ответ.
+Для External Research исторические failure/operational подсказки SOURCE19.10 направляли
+продуктовую source-вкладку к известному владельцу SC: сохранить run/job/error/Send
+receipt, сообщить ему и ждать полного результата либо адресного восстановления.
+Это не разрешение выбирать новый Chat/mode/браузер/платную копию или самостоятельно
+реализовать зависимый участок вместо эксперта. Владелец инфраструктурного ремонта
+продолжает свою задачу; успешный inline ответ, agent-run и cancellation этого
+дополнительного ожидания не создают. `Queue status: sent` означает доставку input,
+не успешный ответ Astra. Skills обновлены отдельно; SOURCE подсказки требуют
+обновления Noted Main, а установка SC их не активирует. Обычный operational wake
+включён по умолчанию (`externalResearchOperationalPrompts:true`), включая старые
+settings без этого поля. Подготовленный SOURCE20.10 default-off исправлен до его
+публикации: он отключал требуемое ночное восстановление вне обслуживания. Явный
+false сохраняет отдельный opt-out; он не меняет `notifySource`, birth, исходные
+run/job/Send или доставку полного ответа. Incidents всё равно сохраняются в журнале.
+
+Автоматический Research Telegram — отдельная политика от source-agent wake.
+SOURCE20Oct default-off применяется и к `onBlocked` operational delivery, и к
+browser-offline producer. Общий user outbox до транспорта подавляет также старый
+backlog с reserved identities `operational-human:research-operational:<sha256>` и
+`research-browser-offline:<sha256>`: сохраняет `suppressed`, прежний unknown/число
+попыток и durable receipt; не объявляет старую доставку failed/no-send. При restart
+эти записи не отправляются. Ручной `notify_user` и completion bell сохраняются;
+публичный notification POST не принимает эти внутренние request IDs. Даже при
+явном включении human callback плановое обслуживание остаётся quiet. Проверки
+используют private JSON/SQLite/HTTP/FIFO и controlled transport/input; установка
+обоих приложений — отдельный подтверждаемый этап.
+
+Плановый build/install имеет отдельную durable policy, не Browser hold:
+`POST /api/orchestrations/maintenance {version:1,action:begin|complete,operationId}`.
+Begin подавляет и отзывает только queued operational inputs через exact FIFO
+guards, включая ACTIVE HEAD; новые incidents сохраняются как `planned_maintenance`.
+Пока операция active, это действует и при обычном default-on operational wake. Restart
+сохраняет policy; complete того же ID не рассылает накопленные предупреждения и
+не переписывает пользовательскую настройку. Повтор старого begin не открывает
+completed операцию, чужой complete не снимает активную. Нет TTL/force-clear или
+освобождения UNKNOWN. Обычные сообщения между вкладками и FULL completion не
+подавляются. Проверено SOURCE/private на actual JSON/SQLite/HTTP; отсутствие этой
+capability в installed Main означает необходимость установки, не live quiet ACK.
+SOURCE startup handover передаёт один operationId через
+`--research-maintenance-operation=<ID>`: RunStore не допускает restore до готовности
+receipt owner, strict begin и exact cancellation queued operational input. Initial
+write/refusal сохраняет RAM intent и не даёт quiet receipt; тот же startup owner
+может повторить commit и затем один раз возобновить прежний FIFO. GET maintenance
+возвращает `startup.durable/beforeRestore` только после этого рубежа. Legacy installer
+не заменяет этот proof поздним POST begin и не доказывает quiet старого Main задним
+числом. Это проверка actual factories/private JSON/SQLite/HTTP, не macOS launch или
+установленный runtime. Подтверждённый policy сохраняется в прежнем RunStore, не в
+отдельной глобальной настройке отключения wake.
+Для свежего наблюдения SC SOURCE-клиент имеет `operationalRecheck`: проверяет
+advertised observational/durable capability и отправляет exact job/epoch/browser/
+checkId в `/research-recheck`, без нового research/open/Send. Он принимает только
+завершённую коррелированную квитанцию и сохраняет её `current/verdict`; status или
+одно время HTTP-ответа не превращаются в fresh proof. Ошибка этой проверки помечена
+`operationalCheckOnly`, поэтому даже HTTP400/409 не завершает исходный paid run как
+provider failure. Это транспорт наблюдения, не право отправить suppressed input;
+source/run/maintenance-generation authority проверяется отдельно у RunStore/FIFO.
+SOURCE20Oct RunStore/Coordinator связывают этот вызов с durable поколением конкретного
+`complete`: frozen source/job/epoch/browser, check ID и граница начала новой проверки.
+Свежий сохраняющийся сбой прежнего SC episode либо новый завершившийся transport
+read после complete создаёт один новый notice; прежний suppressed notice и его
+cancellation остаются неизменными. Status/revision/heartbeat сами права не дают.
+RAM read scopes и monotonic read sequence запрещают поддельный, дорестартовый или
+поздний старый success, который иначе затёр бы более новый отказ. Cancel/detach,
+final, explicit false, смена source и новый maintenance отзывают право до FIFO/input.
+
+Доказанный operational no-input refusal теперь паркуется в прежнем FIFO. Свежий
+runtime-ready event может продолжить тот же notice/handoff/body после повторных
+проверок authority. Нужны явные submitted=false, pasteWritten=false, enterWritten=false
+и отсутствие UNKNOWN/cancel/retired slot; недостающий receipt не является no-input.
+Restart восстанавливает только такие старые failed rows, не оживляя cancelled.
+Событие readiness во время отказа не теряется, но публикация receipt не создаёт
+самоповторяющийся цикл. Pin terminalInstanceId+launchId сохраняется: FIFO не
+подставляет в него SID predecessor.
+
+SOURCE20Oct поддерживает тот же provisional pin и в final preparation: отсутствие
+SID не отвергает исходный terminalInstanceId+launchId. Readiness читается отдельно;
+живой Main destination должен соответствовать исходному launch. Birth/frozen request
+не переписываются появившимся SID. После ввода materialization связывается через
+неизменный FIFO request, его hash и exact canonical receipt; один SID либо новый
+процесс в той же вкладке не заменяет эту цепочку. Lost ACK/restart читает прежнюю
+квитанцию, не отправляет второй input. Без неё transcript fallback требует того же
+живого launch и не сканирует посторонние сессии. Проверены Codex/Claude и замена
+между preparation/physical boundary на private JSON/SQLite с controlled PTY/runtime.
+
+Повторяемые transport-read ошибки в coordinator/completion имеют durable60s grace:
+быстрое восстановление не будит source, непрерывный сбой после границы — будит один
+episode. Это не задержка доказанного неизвестного physical input и не отключение
+ночного wake. Проверки выполнены на actual factories/private JSON/SQLite/HTTP/FIFO
+с controlled provider/PTY; installed runtime этой SOURCE-правкой не обновляется.
+Новая SOURCE continuation preflight также отвергает известную смену сохранённого
+Chat↔Work до reservation/SC packing/browser dispatch. Модель/effort по-прежнему
+частично merge поверх intent; existing run/idempotent retry не переписывается новой
+проверкой. Отказ не разрешает source выбрать fresh Chat: это адресное решение
+владельца с сохранением полного контекста, а не автоматический fallback.
 Уже начатые до обновления handoffs сохраняют прежний технический payload:
 смена текста под тем же operation ID нарушила бы audit/idempotency. Поэтому
 агент смотрит на фактически пришедшее сообщение: inline использует сразу,
@@ -624,6 +726,84 @@ orchestration/Codex usage-limit suites сохранены. Это source/integra
 
 ## Persistence и восстановление
 
+SOURCE19.10 terminal snapshot External Research (`done|error`), включая legacy без
+attention, и локальный pre-send отказ сохраняются raw strict write ДО completion/
+failure callback. Failed rename может оставить финал в RAM, но не даёт durable ACK:
+повтор того же terminal/failure пути снова пишет, не заменяя исходную ошибку.
+При исключении после принятого исхода coordinator повторяет только локальную
+запись и прежний finalizer с тем же run/handoff; новый SC start/status/Send не требуется. Перед
+callback заново читается suppression; stop прерывает локальный retry/backoff.
+Полный финал отзывает только свой queued operational input, не подменяя его
+квитанцией completion. Это продолжение прежнего strict-контракта, не exactly-once
+обещание физического ввода и не автоматическое повторение неизвестного Enter.
+
+Для сохранённого local delivery-intent SOURCE отдельно восстанавливает полный body
+после SC commit, даже если обычный callback вернул failed без исключения. SQL content,
+frozen source/request/hash и durable receipt pins фиксируются до FIFO; startup и
+retry читают тот же result/handoff. Локальный DELIVERING episode не открывает cleared
+SC warning и не меняет provider outcome. Unknown input остаётся receipt-only;
+source-ready повтор требует явных submitted/pasteWritten/enterWritten=false.
+Современное право delivery теперь требует private matching birth: Main создаёт его
+только для новой external reservation и ждёт raw strict commit. Load, existing ID,
+caller JSON и свежий SC done birth не создают. Lost reservation ACK сохраняет тот же
+UUID и требует повторной строгой записи до acceptance. ACTIVE FIFO HEAD заново
+проверяет birthId/intent/source binding. Legacy ACTIVE→done и frozen v1 без birth
+остаются receipt/source-proof observation, без нового completion input; operational
+wait отделён от provider outcome. При отсутствии сохранённой source session watcher
+не вооружается выдуманным адресом.
+
+Общий RunStore не получает authority из неудачного чтения: все асинхронные reads/
+mutations и writer требуют успешного initial load, включая обычные agent rows,
+settings, lifecycle и cancellation. EIO повторно читает тот же файл одним load owner;
+до восстановления — typed503/known:false, без prune/snapshot/revocation из пустой RAM.
+Malformed envelope/rows/duplicate ID и ENOENT после failed read не означают новый store.
+После первого успешного load ошибка write/lost ACK не вызывает перечитывание старого
+диска поверх RAM intents/cancel/suppression. Raw strict rejection отделён от caught
+persistChain; flush не является strict ACK. Web startup повторяет только unread load
+с backoff500ms–15s и продолжает прежние restore/reconcile после восстановления;
+stop/replacement отсекают старый callback. Это не повтор provider Send.
+Общий HTTP catch сохраняет `orchestration_store_unavailable` как503/code/retryable,
+включая registry/settings GET; другие handler errors не меняют прежний generic500.
+
+Проверки `external-research-operational.test.js` различают held/failed atomic rename,
+ошибку finalizer, повтор, suppression и stop. `external-research-final-flow.test.js`
+связывает actual SC Electron34/SQLite commit → loopback HTTP → Noted Electron28/
+RunStore и SQLite FIFO/receipts → reopen: старое предупреждение отменено, финал
+имеет отдельный handoff. Дополнительный вариант выполняет actual result-read,
+content freeze, notification и canonical source-proof функции Main, не подставляя
+готовый notification body. Ровно250000UTF16 Unicode проходит весь этот local путь
+и reopen без потери bytes/offsets;250001 сохраняется в primary целиком, но уведомление
+честно reference, не обрезанный «полный» ответ. SC primary callback/status endpoint
+в этой fixture контролируемые (owned_primary, не production research_jobs serializer).
+Provider-result, source runtime/watcher, нижний send→FIFO
+adapter и физический model-input/audit proof также контролируемые; это private source
+integration, не полный web-server/send-scenario, installed либо provider acceptance.
+
+Отдельный `agent-send-application-queue.integration.test.js` исполняет полный
+current shared Main sender и production execute-factory восстановленного SQL FIFO.
+Проверены выдача внутренней capability восстановленной row, отказ без неё и свежий
+отзыв suppression/source/notify после awaited destination lookup: до beginAttempt,
+без bridge write. Подготовленный content, runtime read и renderer/PTY/audit здесь
+контролируемые; пересоздание queue object на той же SQLite connection не является
+полным process restart. Дополнительный control держит birthless frozen v1 row после
+reopen/FIFO restore без beginAttempt; исходный loaded-active legacy counterexample
+стал обычным acceptance с input0. Это не подтверждает установленную версию, физический
+ввод. Отдельные store/startup controls и actual delivery acceptance после EIO проверяют
+общую load authority: старый run не пересоздаётся, birth/input0; modern startup после
+трёх EIO сохраняет прежнюю birth/options и доставку. В локальном E28/SC34 этапе393PASS
+provider/runtime/physical input/audit остаются controlled leaves, не installed proof.
+
+SOURCE18.10 external-research cancel/detach и suppression completion/attention
+дожидаются raw strict write до success ACK, как прежняя response-observation.
+RAM tombstone сохраняется при ENOSPC; повтор already-cancelled ветки снова пишет
+строго. `flush()` caught-chain не заменяет подтверждение записи. Подготовка completion
+повторно сверяет suppression/cancelRequested после awaited content/session/arm/checkpoint
+перед новым FIFO input; уже crossed/unknown доставка не объявляется no-submit.
+`suppressNotification:false` остаётся допустимым для pre-submit failure, Cancel не Stop.
+Проверка `external-research-durable-cancel.actual.test.js` использует настоящий
+RunStore/atomic-file IO и actual web function с controlled provider/input leaves;
+это не установка Noted и не причина исторического инцидента.
+
 Run-метаданные, точный target-prompt UUID, контекст исполнения, дерево зависимостей, recovery/auto-stop deadlines и настройки пишутся атомарно вне renderer-state и переживают Electron restart. При старте tracked-записи сверяются с transcript и текущим состоянием вкладки: exact UUID восстанавливает `running`, `waiting_descendants` или результат; bounded hash-fallback разрешён только для legacy-записи без UUID. `completed + resultComplete=false` остаётся tracked, заново вооружает доказательство transcript и не разрешает auto-stop. Для source completion сначала проверяется точная durable History-квитанция того же handoff; при недостаточном proof используется прежний exact сохранённый prompt hash в transcript source-вкладки. Совпадение завершает handoff; отсутствие обоих доказательств переводит старое `sent/queued` в `unconfirmed`, сохраняет возможность позднего exact proof, но убирает ложный spinner и требует Retry либо явного закрытия. Renderer нужен для отображения, countdown и переходов, но не является владельцем lifecycle. После authoritative target completion UI немедленно меняет running-spinner на отдельную статичную фазу проверки результата; жёлтый timer относится только к реальному recovery.
 
 CompletionContentStore замораживает неизменный пакет до доставки; inline-пакет
@@ -772,12 +952,19 @@ Markdown-представление выше; оно переиспользуе�
 
 Сообщение оркестрации распознаётся не по редактируемой строке `[Оркестрация]`, а по app-owned semantic tag в `history_prompt_presentations`. Tag сохраняется только после post-Enter audit рядом с точной durable identity пользовательской записи; Claude/Codex JSONL остаётся неизменным. Тот же sidecar переносит tag в доказанный Codex child при Resume/Fork вместе с presentation metadata.
 
-Последовательные Terminal MCP request/completion/failure turns образуют отдельную фиолетовую группу и ромб-маркер. Счётчик группы — отдельная цифра без `×`: при наличии Pencil/Search верхний и нижний углы распределяются заранее, поэтому значки не перекрываются. Свёрнутая группа агрегирует работу с документацией всех своих turns в общем Cmd-hover, раскрытая показывает её у конкретных turns. Клик раскрывает список вниз без изменения ширины рельсы; горизонтальная полоса сворачивает только группу. Ширина панели и раскрытие детей независимы: узкая панель тоже допускает обычную UUID-навигацию History по детям. Ромб всегда строится из квадратной геометрии до поворота — общий child-marker `8×3` превращал его в диагональную черту. Это не группа встроенных Claude subagents: внешняя полноценная вкладка имеет durable `runId`, а встроенный Agent/Task остаётся отдельным типом Timeline. Миграция старых записей допускает exact-prefix только в одноразовом backfill; runtime никогда не классифицирует сообщение по тексту.
+Последовательные Terminal MCP request/completion/failure turns, кроме External Research, образуют отдельную фиолетовую группу и ромб-маркер. Счётчик группы — отдельная цифра без `×`: при наличии Pencil/Search верхний и нижний углы распределяются заранее, поэтому значки не перекрываются. Свёрнутая группа агрегирует работу с документацией всех своих turns в общем Cmd-hover, раскрытая показывает её у конкретных turns. Клик раскрывает список вниз без изменения ширины рельсы; горизонтальная полоса сворачивает только группу. Ширина панели и раскрытие детей независимы: узкая панель тоже допускает обычную UUID-навигацию History по детям. Ромб всегда строится из квадратной геометрии до поворота — общий child-marker `8×3` превращал его в диагональную черту. Это не группа встроенных Claude subagents: внешняя полноценная вкладка имеет durable `runId`, а встроенный Agent/Task остаётся отдельным типом Timeline. Миграция старых записей допускает exact-prefix только в одноразовом backfill; runtime никогда не классифицирует сообщение по тексту.
 
 В эту визуальную MCP-группу входят также адресная переписка и обычные MCP prompts
 по своим metadata tags. Это объединение происхождения на экране, не создание
 orchestration-run/parent для вопроса или обычной отправки. Их phase и message ID
 сохраняются отдельно; runtime-выполнение из фиолетового цвета не выводится.
+
+SC Desktop Research с exact `runKind=external-research` в Timeline не входит
+ни в эту группу, ни в соседнюю subagent-группу, даже при нескольких соседних
+результатах. Он разрывает последовательность, сохраняя собственные glyph/UUID,
+tooltip и переход к исходнику. Модель/effort и этап request/completion/failure
+этого правила не меняют. Это только display membership: отдельная серия
+Research-карточек в History, source tags и orchestration lifecycle прежние.
 
 Пока занятый ход откладывает чтение полного transcript, Timeline показывает временную точку подтверждённой отправки по её точному UUID. Она должна нести ту же orchestration-метку, что History: метка берётся только из совпавших app-owned `handoffId` и `source`, а не из текста уведомления. Инцидент 25.09, Codex source tab-4196: browser completion `d9bb5fe6-13b3-4ece-9c57-2df3bcb7e35e` уже имел durable tag `completion` и фиолетовую History-карточку, но временная Timeline-точка переносила только prompt-origin, поэтому оставалась обычной user-точкой до refresh. Source теперь переносит orchestration identity в эту временную точку; если Timeline уже прочитал ту же user-запись до сохранения её метки, он временно дополняет только эту запись по точному UUID/source alias, не меняя кэш и не создавая дубль. Подтверждены live receipt/history identity и 38 узких тестов; установленная версия после этой source-правки отдельно не проверялась.
 

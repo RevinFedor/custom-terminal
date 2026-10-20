@@ -2,6 +2,7 @@
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const { beginHttpReadDependency } = require('./http-read-diagnostics');
 const { WorkflowOrganization, INBOX_WORKFLOW_ID, fingerprint } = require('./workflow-organization');
 const { GLOBAL_EXECUTION_NAMESPACE, executionScopeForRow } = require('../shared/workflow-organization.cjs');
 const { WorkflowRootRegistry } = require('./workflow-root-registry');
@@ -13,9 +14,11 @@ const { WorkflowGroupActions } = require('./workflow-group-actions');
 const { WorkflowDrag } = require('./workflow-drag');
 const { projectWorkflowCatalog } = require('../shared/workflow-catalog-projection.cjs');
 const {WorkflowNativeDrag}=require('./workflow-native-drag');
+const { createWorkflowDirectoryApi } = require('./workflow-directory-api');
 
 /** One Main publication serves the renderer, automation and external readers. */
-function createWorkflowOrganizationApi({ database, publish = () => {}, validateDirectory = cwd => fs.statSync(cwd).isDirectory(),captureExecution }) {
+function createWorkflowOrganizationApi({ database, publish = () => {}, validateDirectory = cwd => fs.statSync(cwd).isDirectory(),captureExecution,
+  readDirectoryRuntime, readDirectoryCards, directoryOptions = {} }) {
   let migrationSource = null;
   const roots = new WorkflowRootRegistry(database);
   const groups = new WorkflowGroups({database});
@@ -54,6 +57,7 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
       roots.bindCreatedTab(tabId,namespace,request.admissionRequest?.sourceTabId);
     },
   });
+  roots.prepareCatalogReadEpoch();
   const db = database.db;
   database.ensureInboxProject();
   db.prepare('INSERT OR IGNORE INTO workflow_execution_scopes(namespace,metadata_json) VALUES(?,?)')
@@ -77,10 +81,17 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
   };
   let catalogFlight = null;
   const readCapture = () => {
-    if (catalogFlight) return catalogFlight;
+    if (catalogFlight) {
+      const joined = beginHttpReadDependency('catalog-shared-capture');
+      catalogFlight.then(() => joined('joined'), () => joined('error'));
+      return catalogFlight;
+    }
     // Join only before capture. No settled cache, timer or publication-only key:
     // legacy metadata can change without advancing the organization revision.
+    const queued = beginHttpReadDependency('catalog-scheduler');
     const flight = new Promise((resolve,reject) => setImmediate(() => {
+      queued('admitted');
+      const captureEnd = beginHttpReadDependency('catalog-capture');
       try {
         const captured = service.read(() => {
           const snapshot = read();
@@ -89,15 +100,23 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
           const namespaceOrder = [...(Array.isArray(saved?.openProjects) ? saved.openProjects : []).map(project=>project.projectId),
             ...namespaceIds(snapshot.tabs,legacyNamespaces)];
           const aliases = db.prepare('SELECT namespace,tab_id AS tabId,global_tab_id AS globalTabId FROM workflow_org_aliases ORDER BY rowid').all();
-          const dto = projectWorkflowCatalog({snapshot,namespaceOrder,legacyNamespaces,aliases});
+          const projectionEnd = beginHttpReadDependency('catalog-projection');
+          let dto;
+          try { dto = projectWorkflowCatalog({snapshot,namespaceOrder,legacyNamespaces,aliases}); }
+          finally { projectionEnd(); }
+          const fingerprintEnd = beginHttpReadDependency('catalog-fingerprint');
+          try {
           dto.clocks.descriptors = {kind:'content-hash',value:fingerprint({rows:dto.rows,executionRefs:dto.executionRefs,provenance:dto.provenance})};
           dto.clocks.tree = {kind:'content-hash',value:fingerprint(dto.workflows.map(({id,memberTabIds,rootIds,nodes})=>({id,memberTabIds,rootIds,nodes})))};
+          } finally { fingerprintEnd(); }
           const freeze = value => {if(value && typeof value==='object' && !Object.isFrozen(value)){Object.values(value).forEach(freeze);Object.freeze(value);}return value;};
-          return freeze({snapshot,dto,namespaceOrder,legacyNamespaces,aliases});
+          const freezeEnd = beginHttpReadDependency('catalog-freeze');
+          try { return freeze({snapshot,dto,namespaceOrder,legacyNamespaces,aliases}); }
+          finally { freezeEnd(); }
         });
         resolve(captured);
       } catch (error) {reject(error);
-      } finally {if (catalogFlight===flight) catalogFlight=null;}
+      } finally {captureEnd(); if (catalogFlight===flight) catalogFlight=null;}
     }));
     catalogFlight=flight;
     return flight;
@@ -108,6 +127,30 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
     if(!catalogProjections.has(captured))catalogProjections.set(captured,captured.then(value=>value.dto));
     return catalogProjections.get(captured);
   };
+  let directoryFlight = null;
+  const readDirectoryCapture = () => {
+    if (directoryFlight) return directoryFlight;
+    const queued = beginHttpReadDependency('directory-scheduler');
+    const flight = new Promise((resolve, reject) => setImmediate(() => {
+      queued('admitted'); const end = beginHttpReadDependency('directory-capture');
+      try { resolve(service.read(() => {
+        const snapshot = { ...service.readDirectoryState(), globalGroups: groups.read({ directory: true }) };
+        // Parse only the namespace order in SQL, not the whole saved layout.
+        const savedOrder = db.prepare(`SELECT CASE WHEN j.type='object' THEN json_extract(j.value,'$.projectId') END AS projectId
+          FROM app_state a, json_each(CASE WHEN json_valid(a.value) THEN
+            CASE WHEN json_type(a.value,'$.openProjects')='array' THEN json_extract(a.value,'$.openProjects') ELSE '[]' END
+            ELSE '[]' END) j
+          WHERE a.key='workspace-session' ORDER BY CAST(j.key AS INTEGER)`).all().map(row => row.projectId);
+        const legacyNamespaces = legacyNamespaceIds();
+        const namespaceOrder = [...savedOrder, ...namespaceIds(snapshot.tabs, legacyNamespaces)];
+        return projectWorkflowCatalog({ snapshot, namespaceOrder, legacyNamespaces, directory: true });
+      })); } catch (error) { reject(error); }
+      finally { end(); if (directoryFlight === flight) directoryFlight = null; }
+    }));
+    directoryFlight = flight; return flight;
+  };
+  const directory = createWorkflowDirectoryApi({ readCapture: readDirectoryCapture, database,
+    readRuntime: readDirectoryRuntime, readCards: readDirectoryCards, ...directoryOptions });
   const bootstrap = request => {
     if (!ready()) {
       if (!request?.workspace || typeof request.workspace !== 'object') error('workflow_bootstrap_workspace_required');
@@ -191,7 +234,8 @@ function createWorkflowOrganizationApi({ database, publish = () => {}, validateD
       const row=db.prepare('SELECT request_json FROM workflow_org_mutations WHERE mutation_id=?').get(mutationId);
       return row ? JSON.parse(row.request_json) : null;
     }});
-  return { service, roots, groups, archive, groupActions, archivedFileLinks,ready, read, readCatalog, bootstrap, execution, namespace, createTab, mutate, getMutation, listNamespaces,storageRevisions,nativeDrag };
+  return { service, roots, groups, archive, groupActions, archivedFileLinks,ready, read, readCatalog, ...directory,
+    bootstrap, execution, namespace, createTab, mutate, getMutation, listNamespaces,storageRevisions,nativeDrag };
 }
 
 function registerWorkflowOrganizationIpc(ipcMain, api) {

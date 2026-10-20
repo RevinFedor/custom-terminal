@@ -33,5 +33,32 @@ function isTabMessageNoInputReceipt(record) {
     && receipt.code !== 'agent_send_queue_cancelled';
 }
 
-module.exports = { cancelledSendIntent, retiredSendInputSlot, canProjectCurrentProviderQueue, hiddenSendPresentation,
+function isExternalCompletionNoInputReceipt(record, request) {
+  const ref = request?.completionDeliveryRef, receipt = record?.receipt;
+  return ref?.version === 1 && typeof ref.deliveryId === 'string' && typeof ref.requestHash === 'string'
+    && record?.surface === 'desktop-history' && ['claude', 'codex'].includes(record.provider)
+    && request.source === 'orchestration-completion:' + ref.runId
+    && record.handoffId === 'orchestration-complete:' + ref.runId
+    && record.operationKey === request.sendOperationKey && record.tabId === request.tabId
+    && record.state === 'not-submitted' && !cancelledSendIntent(record) && !retiredSendInputSlot(record)
+    && receipt?.submitted === false && receipt.pasteWritten === false && receipt.enterWritten === false
+    && receipt.deliveryUnknown !== true && receipt.auditPending !== true && receipt.providerQueueAccepted !== true
+    && receipt.cancelled !== true && receipt.code !== 'agent_send_queue_cancelled';
+}
+
+function isExternalOperationalNoInputReceipt(record, request) {
+  const ref = request?.operationalNoticeRef, receipt = record?.receipt;
+  return ref?.version === 1 && typeof ref.runId === 'string' && typeof ref.noticeId === 'string'
+    && typeof ref.bodyHash === 'string' && typeof ref.preparedPromptHash === 'string'
+    && record?.surface === 'desktop-history' && ['claude', 'codex'].includes(record.provider)
+    && request.source === 'research-operational:' + ref.runId + ':' + ref.noticeId
+    && record.handoffId === ref.noticeId && record.handoffId === request.handoffId
+    && record.operationKey === request.sendOperationKey && record.tabId === request.tabId
+    && record.state === 'not-submitted' && !cancelledSendIntent(record) && !retiredSendInputSlot(record)
+    && receipt?.submitted === false && receipt.pasteWritten === false && receipt.enterWritten === false
+    && receipt.deliveryUnknown !== true && receipt.auditPending !== true && receipt.providerQueueAccepted !== true
+    && receipt.cancelled !== true && receipt.code !== 'agent_send_queue_cancelled';
+}
+
+module.exports = { isExternalOperationalNoInputReceipt, isExternalCompletionNoInputReceipt, cancelledSendIntent, retiredSendInputSlot, canProjectCurrentProviderQueue, hiddenSendPresentation,
   isTabMessageNoInputReceipt };

@@ -9,8 +9,11 @@ function dragPlacement(layout = {}) {
     hidden: !!pane.displayHidden,
     tabs: (pane.tabs?.length ? pane.tabs : pane.tabId ? [{projectId:pane.projectId,tabId:pane.tabId}] : [])
       .map(entry => typeof entry === 'string' ? {tabId:entry} : entry.tabId
-        ? {projectId:entry.projectId || null,tabId:entry.tabId} : {slotId:entry.slotId,cwd:entry.cwd || null}) }));
+        ? {projectId:entry.projectId || null,tabId:entry.tabId} : {slotId:entry.slotId,cwd:entry.cwd || null}),
+    ...(pane.stripRowPlacement!=null ? {stripRowPlacement:pane.stripRowPlacement}:{}),
+  }));
   return { panes, centerStrips: layout.centerStrips || {},
+    ...(Object.keys(layout.centerStripRowPlacements || {}).length ? {centerStripRowPlacements:layout.centerStripRowPlacements}:{}),
     center: panes.length ? null : layout.activeSpaceTab || null,
     profiles: Object.fromEntries(Object.entries(layout.windowDisplayLayouts || {})
       .filter(([,profile]) => profile?.splitPanes || profile?.centerStrips || profile?.activeSpaceTab)
@@ -40,9 +43,14 @@ function dragFamily(records, rootIds, {physicalOnly=false}={}) {
 }
 // Apply only the painted placement delta. A concurrent resize/focus update is
 // not permission to overwrite it with the pickup frame's complete layout.
-function applyDragLayout(current,before,after) {
+function applyDragLayout(current,before,after,field=null) {
   const same=before===undefined || after===undefined ? before===after : stableJson(before)===stableJson(after);
   if(same)return current===undefined ? undefined : clone(current);
+  // Width, exact order and anchors describe one presentation. A late ACK must
+  // not combine fields from two different gestures into a third descriptor.
+  if(field==='stripRowPlacement' || field==='rowPlacementValue')
+    return current!==undefined && !sameValue(current,before) ? clone(current)
+      : after===undefined ? undefined : clone(after);
   if(Array.isArray(after)) {
     const key=value=>value?.windowId || value?.tabId || value?.slotId;
     const shape=list=>Array.isArray(list) ? list.map(value=>key(value) || value) : list;
@@ -59,7 +67,8 @@ function applyDragLayout(current,before,after) {
     for(const key of new Set([...Object.keys(before || {}),...Object.keys(after)])) {
       if(!Object.hasOwn(after,key)) {if(Object.hasOwn(before || {},key) && sameValue(current?.[key],before[key]))delete next[key];}
       else {
-        const value=applyDragLayout(current?.[key],before?.[key],after[key]);
+        const value=applyDragLayout(current?.[key],before?.[key],after[key],
+          field==='centerStripRowPlacements'?'rowPlacementValue':key);
         if(value===undefined)delete next[key];else next[key]=value;
       }
     }

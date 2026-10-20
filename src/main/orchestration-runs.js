@@ -1,6 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const externalOperational = require('./external-research-operational');
+const externalCompletion = require('./external-research-completion-delivery');
+const researchMaintenance = require('./external-research-maintenance');
 const { isDeepStrictEqual } = require('node:util');
 const { assertBrowserOwner, browserInstanceId, publicBrowserAccount } = require('./external-research-browser');
 const { continuationOwnerKey } = require('./orchestration-continuation');
@@ -76,6 +79,7 @@ const DEFAULT_ORCHESTRATION_SETTINGS = Object.freeze({
   successAutoStopMs: 5 * 60 * 1000,
   reactToManualInterrupt: false,
   autoStopCreatedTargets: true,
+  externalResearchOperationalPrompts: true,
 });
 
 function isExternalResearchRun(run) {
@@ -786,6 +790,7 @@ function normalizeSettings(value = {}) {
     successAutoStopMs: clampDelay(value.successAutoStopMs, DEFAULT_ORCHESTRATION_SETTINGS.successAutoStopMs),
     reactToManualInterrupt: value.reactToManualInterrupt === true,
     autoStopCreatedTargets: value.autoStopCreatedTargets !== false,
+    externalResearchOperationalPrompts: value.externalResearchOperationalPrompts !== false,
   };
 }
 
@@ -797,6 +802,10 @@ function publicRun(run) {
     deliveryIntent: _deliveryIntent,
     externalResearchIntent: _externalResearchIntent,
     externalResearchBrowserNotice: _externalResearchBrowserNotice,
+    externalResearchOperational: _externalResearchOperational,
+    externalResearchOperationalRearm: _externalResearchOperationalRearm,
+    externalResearchDelivery: _externalResearchDelivery,
+    externalResearchDeliveryBirth: _externalResearchDeliveryBirth,
     requestFingerprint: _requestFingerprint,
     promptHash: _promptHash,
     resultPromptHash: _resultPromptHash,
@@ -813,7 +822,12 @@ function publicRun(run) {
     continuationIntent: _continuationIntent,
     ...safe
   } = run;
-  return { ...safe, ...(run.continuationIntent ? { continuation: {
+  return { ...safe, ...(run.externalResearchDelivery ? { externalResearchDelivery: {
+    version: 1, phase: run.externalResearchDelivery.phase, retryPending: run.externalResearchDelivery.retryPending,
+    retryAt: run.externalResearchDelivery.retryAt, failures: run.externalResearchDelivery.failures,
+    lastError: run.externalResearchDelivery.lastError,
+  } } : {}), ...(run.externalResearchOperational ? { externalResearchOperational:
+    externalOperational.publicOperational(run.externalResearchOperational) } : {}), ...(run.continuationIntent ? { continuation: {
     operationId: run.continuationIntent.operationId, handoffId: run.continuationIntent.handoffId,
     state: run.continuationIntent.state, error: run.continuationIntent.error || null,
     createdAt: run.continuationIntent.createdAt, confirmedAt: run.continuationIntent.confirmedAt || null,
@@ -821,101 +835,193 @@ function publicRun(run) {
 }
 
 class OrchestrationRunStore {
-  constructor(filePath, { onActivityChanged = () => {} } = {}) {
+  constructor(filePath, { onActivityChanged = () => {}, onOperationalRevoked = null, onCompletionRevoked = null,
+    startupMaintenance = null, beforeStartupMaintenance = null } = {}) {
     this.filePath = filePath;
     this.onActivityChanged = onActivityChanged;
+    this.onOperationalRevoked = onOperationalRevoked;
+    this.onCompletionRevoked = onCompletionRevoked;
+    this.startupMaintenance = startupMaintenance;
+    this.beforeStartupMaintenance = beforeStartupMaintenance;
+    this.startupMaintenanceApplied = !startupMaintenance;
+    this.startupMaintenancePromise = null;
+    this.startupMaintenanceReceipt = null;
+    this.pendingExternalBirths = new Map();
     this.activityReadError = null;
     this.loadedFromDisk = false;
     this.runs = new Map();
     this.createdTargetTabIds = new Set();
     this.targetActivityByTab = new Map();
     this.settings = { ...DEFAULT_ORCHESTRATION_SETTINGS };
+    this.researchMaintenance = researchMaintenance.normalize(null);
     this.initialized = false;
     this.initializePromise = null;
     this.persistChain = Promise.resolve();
     this.reservationChain = Promise.resolve();
+    this.externalOperationalReadScopes = new Map();
+    this.externalRearmDurableGenerations = new Set();
   }
 
-  async initialize() {
-    if (this.initialized) return;
-    if (this.initializePromise) return this.initializePromise;
-    this.initializePromise = (async () => {
-      try {
-        const raw = await fs.promises.readFile(this.filePath, 'utf8');
-        const parsed = JSON.parse(raw);
-        this.loadedFromDisk = Array.isArray(parsed?.runs);
-        this.settings = normalizeSettings(parsed?.settings);
-        const storedRuns = Array.isArray(parsed?.runs) ? parsed.runs : [];
-        for (const tabId of Array.isArray(parsed?.createdTargetTabIds) ? parsed.createdTargetTabIds : []) {
-          if (typeof tabId === 'string' && tabId) this.createdTargetTabIds.add(tabId);
-        }
-        const storedTargetActivity = parsed?.targetActivityByTab && typeof parsed.targetActivityByTab === 'object'
-          ? parsed.targetActivityByTab
-          : {};
-        for (const [tabId, activity] of Object.entries(storedTargetActivity)) {
-          if (typeof tabId === 'string' && tabId) {
-            this.targetActivityByTab.set(tabId, normalizeTargetActivity(activity));
-          }
-        }
-        // Backfill ownership from v2 stores before settled-run pruning removes
-        // the original run which physically created the executor tab.
-        for (const stored of storedRuns) {
-          if (stored?.targetCreated === true && stored?.targetTabId) {
-            this.createdTargetTabIds.add(stored.targetTabId);
-          }
-        }
-        let migrationNeeded = !Array.isArray(parsed?.createdTargetTabIds);
-        for (const stored of storedRuns) {
-          if (!stored?.runId || (!stored?.targetTabId && !isExternalResearchRun(stored))) continue;
-          const run = {
-            waitForDescendants: stored.waitForDescendants !== false,
-            failureGraceMs: clampDelay(stored.failureGraceMs, this.settings.failureGraceMs),
-            successAutoStopMs: clampDelay(stored.successAutoStopMs, this.settings.successAutoStopMs),
-            reactToManualInterrupt: stored.reactToManualInterrupt === true,
-            autoStopCreatedTargets: stored.autoStopCreatedTargets !== false,
-            ...stored,
-          };
-          run.targetCreatedByOrchestration = !isResponseObservation(stored)
-            && (stored.targetCreatedByOrchestration === true || this.createdTargetTabIds.has(stored.targetTabId));
-          if (stored.targetCreatedByOrchestration !== run.targetCreatedByOrchestration) {
-            migrationNeeded = true;
-          }
-          // Legacy notification failures predate the persistent attention flag.
-          // Surface only failures that still block the source, not every old run.
-          if (isSourceNotificationBlocked(run) && !run.attentionRequiredAt) {
-            run.attentionRequiredAt = run.notificationAttemptedAt || run.updatedAt || run.completedAt || Date.now();
-          }
-          // Exact transcript identity proves that the prompt crossed Enter.
-          // A stale private queue payload must not survive that proof and be
-          // replayed after restart.
-          if (run.targetPromptProofAt && run.deliveryIntent) {
-            run.deliveryIntent = null;
-            migrationNeeded = true;
-          }
-          if (run.autoStopAt && !run.autoStopFinishedAt
-            && !Number.isInteger(Number(run.autoStopActivityRevision))) {
-            run.autoStopActivityRevision = this._activityForTarget(run.targetTabId).revision;
-            migrationNeeded = true;
-          }
-          this.runs.set(run.runId, run);
-        }
-        migrationNeeded = this._backfillCreatedTargetAutoStops() || migrationNeeded;
-        this._pruneInMemory();
-        if (migrationNeeded) this._schedulePersist();
-      } catch (error) {
-        if (error?.code !== 'ENOENT') {
-          this.activityReadError = 'orchestration-load-failed';
-          console.warn('[OrchestrationRuns] load failed:', error?.message || error);
+  async initialize({ requireAuthority = false, externalResearch = false } = {}) {
+    if (!this.initialized) {
+      // One load owner. No mutation is admitted until this attempt completes;
+      // a failed attempt is retryable, never an authoritative empty registry.
+      if (!this.initializePromise) this.initializePromise = this._loadInitialState()
+        .finally(() => { this.initializePromise = null; });
+      await this.initializePromise;
+    }
+    if (this.initialized && !this.activityReadError && !this.startupMaintenanceApplied) {
+      // Set the single flight before invoking callbacks: concurrent readers,
+      // restorers and the operator GET all await this same strict handover.
+      if (!this.startupMaintenancePromise) this.startupMaintenancePromise = Promise.resolve()
+        .then(() => this._applyStartupMaintenance())
+        .finally(() => { this.startupMaintenancePromise = null; });
+      await this.startupMaintenancePromise;
+    }
+    if (requireAuthority) this._assertStoreAuthority(externalResearch);
+  }
+
+  _hasStoreAuthority(startupMaintenanceCommit = false) {
+    return this.initialized && !this.activityReadError && (this.startupMaintenanceApplied || startupMaintenanceCommit);
+  }
+
+  async _applyStartupMaintenance() {
+    const descriptor = this.startupMaintenance;
+    if (descriptor?.version !== 1 || descriptor.error || !descriptor.operationId) {
+      throw Object.assign(new Error('Invalid startup maintenance handover'), { code: 'research_maintenance_startup_invalid', statusCode: 503 });
+    }
+    await this.beforeStartupMaintenance?.();
+    const result = researchMaintenance.transition(this.researchMaintenance,
+      { action: 'begin', operationId: descriptor.operationId });
+    this.researchMaintenance = result.value;
+    const operationId = researchMaintenance.activeId(this.researchMaintenance);
+    for (const run of this.runs.values()) if (isExternalResearchRun(run)) {
+      run.externalResearchMaintenanceOperationId = operationId;
+    }
+    // Only this startup owner's write can proceed before admission is ready.
+    // It synchronously revokes pending operational inputs, then strictly writes
+    // the original RunStore. Failure keeps the RAM hold and blocks restore;
+    // a same-ID retry never reloads an older disk snapshot over that intent.
+    await this._enqueuePersist(true, { startupMaintenanceCommit: true });
+    this.startupMaintenanceReceipt = { version: 1, operationId: descriptor.operationId,
+      operationState: result.operation.state, durable: true, beforeRestore: true };
+    this.startupMaintenanceApplied = true;
+  }
+
+  _assertStoreAuthority(externalResearch = false, startupMaintenanceCommit = false) {
+    if (this._hasStoreAuthority(startupMaintenanceCommit)) return;
+    throw Object.assign(new Error('Orchestration store could not be read; original state is preserved'), {
+      code: externalResearch ? 'external_research_birth_store_unavailable' : 'orchestration_store_unavailable',
+      statusCode: 503, retryable: true, reason: this.activityReadError
+        || (!this.startupMaintenanceApplied ? 'research-maintenance-startup-pending' : 'orchestration-not-ready'),
+    });
+  }
+
+  async _loadInitialState() {
+    // This method only runs before the first authoritative load. Write/ACK
+    // failures must NEVER reload old disk state over accepted RAM intents,
+    // cancellation tombstones, suppression or a pending external birth.
+    const before = { runs: this.runs, settings: this.settings, researchMaintenance: this.researchMaintenance,
+      createdTargetTabIds: this.createdTargetTabIds, targetActivityByTab: this.targetActivityByTab };
+    try {
+      const raw = await fs.promises.readFile(this.filePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      // Parse success alone is not coverage: malformed envelopes, omitted
+      // rows and duplicate IDs must not normalize to a fresh empty cohort.
+      const ids = new Set();
+      if (!Array.isArray(parsed?.runs) || parsed.runs.some(run => {
+        if (!run || typeof run.runId !== 'string' || !run.runId
+          || (!run.targetTabId && !isExternalResearchRun(run)) || ids.has(run.runId)) return true;
+        ids.add(run.runId); return false;
+      })) throw new Error('orchestration-store-invalid');
+      this.runs = new Map();
+      this.createdTargetTabIds = new Set();
+      this.targetActivityByTab = new Map();
+      this.settings = normalizeSettings(parsed.settings);
+      this.researchMaintenance = researchMaintenance.normalize(parsed.researchMaintenance);
+      const storedRuns = parsed.runs;
+      for (const tabId of Array.isArray(parsed?.createdTargetTabIds) ? parsed.createdTargetTabIds : []) {
+        if (typeof tabId === 'string' && tabId) this.createdTargetTabIds.add(tabId);
+      }
+      const storedTargetActivity = parsed?.targetActivityByTab && typeof parsed.targetActivityByTab === 'object'
+        ? parsed.targetActivityByTab
+        : {};
+      for (const [tabId, activity] of Object.entries(storedTargetActivity)) {
+        if (typeof tabId === 'string' && tabId) {
+          this.targetActivityByTab.set(tabId, normalizeTargetActivity(activity));
         }
       }
+      // Backfill ownership from v2 stores before settled-run pruning removes
+      // the original run which physically created the executor tab.
+      for (const stored of storedRuns) {
+        if (stored?.targetCreated === true && stored?.targetTabId) {
+          this.createdTargetTabIds.add(stored.targetTabId);
+        }
+      }
+      let migrationNeeded = !Array.isArray(parsed?.createdTargetTabIds);
+      for (const stored of storedRuns) {
+        if (!stored?.runId || (!stored?.targetTabId && !isExternalResearchRun(stored))) continue;
+        const run = {
+          waitForDescendants: stored.waitForDescendants !== false,
+          failureGraceMs: clampDelay(stored.failureGraceMs, this.settings.failureGraceMs),
+          successAutoStopMs: clampDelay(stored.successAutoStopMs, this.settings.successAutoStopMs),
+          reactToManualInterrupt: stored.reactToManualInterrupt === true,
+          autoStopCreatedTargets: stored.autoStopCreatedTargets !== false,
+          ...stored,
+        };
+        if (isExternalResearchRun(run)) {
+          const enabled = this.settings.externalResearchOperationalPrompts === true;
+          if (run.externalResearchOperationalPrompts !== enabled) migrationNeeded = true;
+          run.externalResearchOperationalPrompts = enabled;
+          const maintenanceId = researchMaintenance.activeId(this.researchMaintenance);
+          if ((run.externalResearchMaintenanceOperationId || null) !== maintenanceId) migrationNeeded = true;
+          run.externalResearchMaintenanceOperationId = maintenanceId;
+        }
+        run.targetCreatedByOrchestration = !isResponseObservation(stored)
+          && (stored.targetCreatedByOrchestration === true || this.createdTargetTabIds.has(stored.targetTabId));
+        if (stored.targetCreatedByOrchestration !== run.targetCreatedByOrchestration) {
+          migrationNeeded = true;
+        }
+        // Legacy notification failures predate the persistent attention flag.
+        // Surface only failures that still block the source, not every old run.
+        if (isSourceNotificationBlocked(run) && !run.attentionRequiredAt) {
+          run.attentionRequiredAt = run.notificationAttemptedAt || run.updatedAt || run.completedAt || Date.now();
+        }
+        // Exact transcript identity proves that the prompt crossed Enter.
+        // A stale private queue payload must not survive that proof and be
+        // replayed after restart.
+        if (run.targetPromptProofAt && run.deliveryIntent) {
+          run.deliveryIntent = null;
+          migrationNeeded = true;
+        }
+        if (run.autoStopAt && !run.autoStopFinishedAt
+          && !Number.isInteger(Number(run.autoStopActivityRevision))) {
+          run.autoStopActivityRevision = this._activityForTarget(run.targetTabId).revision;
+          migrationNeeded = true;
+        }
+        this.runs.set(run.runId, run);
+      }
+      migrationNeeded = this._backfillCreatedTargetAutoStops() || migrationNeeded;
+      this._pruneInMemory();
+      this.loadedFromDisk = true;
+      this.activityReadError = null;
       this.initialized = true;
-      this._notifyActivityChanged();
-    })();
-    return this.initializePromise;
+      if (migrationNeeded && this.startupMaintenanceApplied) this._schedulePersist();
+    } catch (error) {
+      Object.assign(this, before);
+      // Initial ENOENT supports a genuinely new store. Disappearance after
+      // a failed read cannot establish absence of the old authority.
+      if (error?.code === 'ENOENT' && !this.activityReadError) this.initialized = true;
+      else {
+        this.activityReadError = 'orchestration-load-failed';
+        console.warn('[OrchestrationRuns] load failed:', error?.message || error);
+      }
+    }
+    this._notifyActivityChanged();
   }
 
   async create(input, options = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true, externalResearch: isExternalResearchRun(input) });
     if (!input?.runId) throw new Error('runId required');
     if (this.runs.has(input.runId)) throw new Error('runId already exists');
     const observing = isResponseObservation(input);
@@ -943,6 +1049,10 @@ class OrchestrationRunStore {
       createdAt: now,
       updatedAt: now,
       notifySource: input.notifySource !== false,
+      ...(isExternalResearchRun(input) ? {
+        externalResearchOperationalPrompts: this.settings.externalResearchOperationalPrompts === true,
+        externalResearchMaintenanceOperationId: researchMaintenance.activeId(this.researchMaintenance),
+      } : {}),
       notificationStatus: 'pending',
       resultAvailable: false,
       resultComplete: false,
@@ -982,12 +1092,22 @@ class OrchestrationRunStore {
       targetContinuationExecutionContext: null,
       ...(observing ? { observationRevision: 0, status: 'running', targetCreated: false } : {}),
     };
+    if (isExternalResearchRun(run)) {
+      // Main-owned birth, never caller JSON or a load/default migration.
+      run.externalResearchDelivery = null;
+      run.externalResearchDeliveryBirth = externalCompletion.createBirth(run);
+      this.pendingExternalBirths.set(run.runId, run);
+    }
     this.runs.set(run.runId, run);
-    if (options.persistStrict === true) {
+    if (options.persistStrict === true || isExternalResearchRun(run)) {
       try {
         await this.persistStrict();
+        this.pendingExternalBirths.delete(run.runId);
       } catch (error) {
-        this.runs.delete(run.runId);
+        // A rename may have committed before its ACK was lost. Retain this
+        // exact external birth; same-ID retry must strictly persist it before
+        // acceptance, not allocate a different generation over the disk row.
+        if (!isExternalResearchRun(run)) this.runs.delete(run.runId);
         this._notifyActivityChanged();
         if (input.targetCreated === true
           && !Array.from(this.runs.values()).some((candidate) => (
@@ -1008,7 +1128,7 @@ class OrchestrationRunStore {
     const work = this.reservationChain
       .catch(() => undefined)
       .then(async () => {
-        await this.initialize();
+        await this.initialize({ requireAuthority: true, externalResearch: isExternalResearchRun(input) });
         const existing = this.runs.get(input?.runId);
         if (existing) {
           if (!existing.requestFingerprint) {
@@ -1027,6 +1147,11 @@ class OrchestrationRunStore {
               run: publicRun(existing),
             };
           }
+          if (this.pendingExternalBirths.get(existing.runId) === existing) {
+            await this.persistStrict();
+            if (this.runs.get(existing.runId) !== existing) throw new Error('external_reservation_owner_changed');
+            this.pendingExternalBirths.delete(existing.runId);
+          }
           return { created: false, conflict: false, reason: null, run: publicRun(existing) };
         }
         const run = await this.create(input, { persistStrict: true });
@@ -1037,9 +1162,13 @@ class OrchestrationRunStore {
   }
 
   async patch(runId, patch, { unlessTerminal = false } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run) return null;
+    if (Object.hasOwn(patch, 'externalResearchDeliveryBirth')
+      && !isDeepStrictEqual(patch.externalResearchDeliveryBirth, run.externalResearchDeliveryBirth)) {
+      throw new Error('external_research_birth_immutable');
+    }
     // Admission may have been cancelled while initialization was awaiting I/O.
     if (unlessTerminal && isTerminalStatus(run.status)) return null;
     Object.assign(run, patch, { updatedAt: Date.now() });
@@ -1055,8 +1184,160 @@ class OrchestrationRunStore {
     return publicRun(run);
   }
 
+  async markExternalOperationalDelivery(runId, noticeId, patch = {}) {
+    await this.initialize({ requireAuthority: true });
+    const run = this.runs.get(runId), notice = run?.externalResearchOperational?.notices?.[noticeId];
+    if (!notice) return null;
+    if (patch.preparedPrompt != null) {
+      if (typeof patch.preparedPrompt !== 'string' || patch.preparedPrompt.length > 250000) throw new Error('operational_prepared_prompt_invalid');
+      const digest = externalOperational.hash(patch.preparedPrompt);
+      if (notice.preparedPromptHash && notice.preparedPromptHash !== digest) throw new Error('operational_prepared_prompt_conflict');
+      notice.preparedPrompt = patch.preparedPrompt; notice.preparedPromptHash = digest;
+    }
+    if (patch.sendOptions) {
+      if (notice.sendOptions && !isDeepStrictEqual(notice.sendOptions, patch.sendOptions)) throw new Error('operational_send_options_conflict');
+      notice.sendOptions = JSON.parse(JSON.stringify(patch.sendOptions));
+    }
+    if (patch.receiptRetentionPinned === true) notice.receiptRetentionPinned = true;
+    if (patch.delivery && !['suppressed', 'sent'].includes(notice.delivery)) {
+      if (!['pending', 'sending', 'queued', 'sent', 'unknown', 'waiting_for_input'].includes(patch.delivery)) throw new Error('operational_delivery_invalid');
+      notice.delivery = patch.delivery;
+    }
+    for (const field of ['attemptId', 'lastError', 'observedReceipt']) if (Object.hasOwn(patch, field)) notice[field] = patch[field];
+    notice.updatedAt = Date.now();
+    await this.persistStrict();
+    return externalOperational.publicOperational(run.externalResearchOperational);
+  }
+
+  async adoptLegacyExternalResearchDelivery(runId) {
+    await this.initialize({ requireAuthority: true });
+    const run = this.runs.get(runId);
+    if (!run || run.notifySource === false || run.notificationSuppressed || run.notificationCancelRequestedAt
+      || ['suppressed', 'source-closed'].includes(run.notificationStatus) || run.sourceFollowupStartedAt) return null;
+    externalCompletion.initializeDelivery(run, { legacy: true });
+    if (!run.externalResearchDelivery?.legacy) return publicRun(run);
+    run.notificationStatus = 'unconfirmed';
+    this._syncSourceFollowupState(run);
+    await this.persistStrict();
+    return publicRun(run);
+  }
+
+  async updateExternalResearchDelivery(runId, deliveryId, patch) {
+    await this.initialize({ requireAuthority: true });
+    const run = this.runs.get(runId), d = run?.externalResearchDelivery;
+    if (d?.id !== deliveryId || !externalCompletion.authorized(run)) return null;
+    if (patch.request) {
+      if (d.request && !isDeepStrictEqual(d.request, patch.request)) throw new Error('external_completion_request_conflict');
+      d.request = JSON.parse(JSON.stringify(patch.request));
+      d.requestHash = patch.requestHash;
+      const request = d.request;
+      run.notificationHandoffId = request.handoffId;
+      run.notificationPromptHash = require('./claude-prompt-carriers').promptFingerprint(request.prompt);
+      run.notificationPromptAuditHash = require('./prompt-audit-fingerprint').promptAuditFingerprint(request.prompt);
+      run.notificationSourceSessionId = d.sourceTarget.sessionId;
+      run.notificationAttemptedAt ||= Date.now();
+      run.notificationAttempt = Math.max(1, Number(run.notificationAttempt || 0));
+      run.notificationStatus = 'sending';
+      externalOperational.clearDeliveryEpisode(run);
+    }
+    for (const key of ['phase', 'retryPending', 'retryAt', 'failures', 'retentionPinned', 'lastError']) {
+      if (Object.hasOwn(patch, key)) d[key] = patch[key];
+    }
+    if (run.sourceFollowupStartedAt) {
+      d.phase = 'delivered'; d.retryPending = false; d.retryAt = null; d.lastError = null;
+      run.notificationStatus = 'sent';
+    } else if (patch.notificationStatus) run.notificationStatus = patch.notificationStatus;
+    if (['delivered', 'observing', 'admitting'].includes(d.phase)) externalOperational.clearDeliveryEpisode(run);
+    d.updatedAt = Date.now(); run.updatedAt = d.updatedAt;
+    this._syncSourceFollowupState(run);
+    await this.persistStrict();
+    return publicRun(run);
+  }
+
+  async captureExternalOperationalRead(runId) {
+    const work = this.reservationChain.catch(() => undefined).then(async () => {
+      await this.initialize({ requireAuthority: true });
+      const run = this.runs.get(runId), r = run?.externalResearchOperationalRearm;
+      if (!isExternalResearchRun(run) || !r || isTerminalStatus(run.status) || run.resultComplete === true) return null;
+      const key = JSON.stringify([runId, run.createdAt, r.operationId, r.generation]);
+      if (!this.externalRearmDurableGenerations.has(key)) {
+        // Even a RAM-only complete after EIO must strictly commit before any
+        // post-boundary read is issued. Never infer this from a timestamp.
+        await this.persistStrict();
+        if (this.runs.get(runId) !== run || run.externalResearchOperationalRearm !== r) return null;
+        this.externalRearmDurableGenerations.add(key);
+      }
+      const scope = Object.freeze({ version: 1, id: crypto.randomUUID(), runId,
+        jobId: run.externalResearchJobId, runCreatedAt: run.createdAt,
+        operationId: r.operationId, generation: r.generation,
+        readSequence: this.externalOperationalReadSequence = Math.max(this.externalOperationalReadSequence || 0,
+          r.lastSettledReadSequence || 0) + 1,
+        sourcePin: externalOperational.rearmOwner(run), startedAt: Date.now() });
+      this.externalOperationalReadScopes.set(scope.id, scope);
+      return scope;
+    });
+    this.reservationChain = work.then(() => undefined, () => undefined);
+    return work;
+  }
+
+  releaseExternalOperationalRead(scope) {
+    if (scope && this.externalOperationalReadScopes.get(scope.id) === scope) this.externalOperationalReadScopes.delete(scope.id);
+  }
+
+  _externalOperationalReadCurrent(run, scope) {
+    const r = run?.externalResearchOperationalRearm;
+    return !!scope && this.externalOperationalReadScopes.get(scope.id) === scope
+      && scope.runId === run.runId && scope.jobId === run.externalResearchJobId && scope.runCreatedAt === run.createdAt
+      && r?.operationId === scope.operationId && r.generation === scope.generation
+      && Number.isSafeInteger(scope.readSequence) && scope.readSequence >= (r.lastSettledReadSequence || 0)
+      && scope.sourcePin === externalOperational.rearmOwner(run);
+  }
+
+  _acceptExternalOperationalRead(run, scope) {
+    if (!this._externalOperationalReadCurrent(run, scope)) return false;
+    run.externalResearchOperationalRearm.lastSettledReadSequence = scope.readSequence;
+    run.externalResearchOperationalRearm.lastSettledReadId = scope.id;
+    return true;
+  }
+
+  async externalOperationalRearmCheckCurrent(runId, scope) {
+    await this.initialize({ requireAuthority: true });
+    return externalOperational.rearmCheckAuthorized(this.runs.get(runId), scope);
+  }
+
+  async completeExternalOperationalRearmCheck(runId, scope, result) {
+    await this.initialize({ requireAuthority: true });
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    const outcome = externalOperational.completeRearmScCheck(run, scope, result);
+    // Retry a raw commit even when the exact receipt was already applied in RAM.
+    await this.persistStrict();
+    return { ...outcome, run: publicRun(run) };
+  }
+
+  async recordExternalOperationalRearmFailure(runId, scope, error) {
+    await this.initialize({ requireAuthority: true });
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    const outcome = externalOperational.recordRearmProbeFailure(run, scope, error);
+    await this.persistStrict();
+    return { ...outcome, run: publicRun(run) };
+  }
+
+  async recordExternalOperationalFailure(runId, input) {
+    await this.initialize({ requireAuthority: true });
+    const run = this.runs.get(runId);
+    if (!run || !isExternalResearchRun(run)) return null;
+    const guarded = run.externalResearchOperationalRearm && !isTerminalStatus(run.status) && run.resultComplete !== true;
+    if (guarded && !this._acceptExternalOperationalRead(run, input.operationalRead)) return publicRun(run);
+    externalOperational.recordLocalOperationalFailure(run, input);
+    if (guarded) externalOperational.settleRearmTransport(run, input.operationalRead, input);
+    await this.persistStrict();
+    return publicRun(run);
+  }
+
   async bindResponseObservationSubject(runId, value) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!isResponseObservation(run) || isTerminalStatus(run.status)) return null;
     const subject = normalizeResponseSubject(value);
@@ -1095,7 +1376,7 @@ class OrchestrationRunStore {
   }
 
   async setResponseObservationWait(runId, { expectedRevision, status, waitingOnRunIds, observationWaitReason, error }) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!isResponseObservation(run) || isTerminalStatus(run.status) || run.observationRevision !== expectedRevision) return null;
     Object.assign(run, { status, waitingOnRunIds, observationWaitReason, error,
@@ -1106,6 +1387,8 @@ class OrchestrationRunStore {
   }
 
   recordResponseObservationContext(runId, value) {
+    // This synchronous observer cannot wait for a load and cannot admit one.
+    if (!this._hasStoreAuthority()) return false;
     const run = this.runs.get(runId), context = normalizeExecutionContext(value);
     if (!isResponseObservation(run) || isTerminalStatus(run.status) || run.observationSubject || !context
       || context.provider !== run.observationTarget?.toolType || context.sessionId !== run.observationTarget?.sessionId
@@ -1118,7 +1401,7 @@ class OrchestrationRunStore {
   }
 
   async settleResponseObservation(runId, { expectedRevision, result, error, code, evidenceCommitted } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!isResponseObservation(run) || isTerminalStatus(run.status)
       || run.observationRevision !== expectedRevision) {
@@ -1151,7 +1434,7 @@ class OrchestrationRunStore {
   }
 
   async adoptRestoredTarget(runId, {descriptor,restoration}, {prepareContext} = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run=this.runs.get(runId);
     const refuse=()=>{throw Object.assign(new Error('orchestration_restore_target_changed'),{code:'orchestration_restore_target_changed'});};
     if(!run || isTerminalStatus(run.status) || !run.deliveryIntent || run.deliveryDispatchStartedAt
@@ -1179,10 +1462,12 @@ class OrchestrationRunStore {
     error,
     code,
     retryAt,
+    operationalRead,
   } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!isExternalResearchRun(run) || isTerminalStatus(run.status)) return publicRun(run);
+    if (run.externalResearchOperationalRearm && !this._acceptExternalOperationalRead(run, operationalRead)) return publicRun(run);
     run.status = 'queued';
     run.deliveryDeferredReason = 'external-research-transport';
     run.externalResearchTransportError = String(error || 'SC Desktop is unavailable');
@@ -1195,7 +1480,7 @@ class OrchestrationRunStore {
   }
 
   async recordExternalResearchBrowser(runId, snapshot, { allowTerminal = false } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!isExternalResearchRun(run) || snapshot?.id !== run.externalResearchJobId
       || (!allowTerminal && isTerminalStatus(run.status))) return null;
@@ -1213,13 +1498,14 @@ class OrchestrationRunStore {
     return owner;
   }
 
-  async markExternalResearchBrowserWait(runId, { jobId, owner, retryAt, message } = {}) {
-    await this.initialize();
+  async markExternalResearchBrowserWait(runId, { jobId, owner, retryAt, message, operationalRead } = {}) {
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!isExternalResearchRun(run) || isTerminalStatus(run.status)
       || run.externalResearchJobId !== jobId || !browserInstanceId(owner)
       || run.externalResearchAcceptedAt || run.externalResearchDeliveryUnknown === true
       || run.externalResearchStartHadUncertainty !== false) return null;
+    if (run.externalResearchOperationalRearm && !this._acceptExternalOperationalRead(run, operationalRead)) return null;
     assertBrowserOwner(run, { id: jobId, browserInstanceId: owner });
     run.externalResearchExpectedBrowserInstanceId = owner;
     run.externalResearchStartPending = false;
@@ -1237,15 +1523,25 @@ class OrchestrationRunStore {
     return publicRun(run);
   }
 
-  async applyExternalResearchSnapshot(runId, snapshot = {}) {
-    await this.initialize();
+  async applyExternalResearchSnapshot(runId, snapshot = {}, { operationalRead = null } = {}) {
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     const changed = [];
     const settled = [];
     if (!isExternalResearchRun(run)) {
       return { run: publicRun(run), changed, settled, terminal: false };
     }
+    if (this.pendingExternalBirths.get(runId) === run) {
+      await this.persistStrict();
+      if (this.runs.get(runId) !== run) return { run: publicRun(this.runs.get(runId)), changed, settled, ignored: true };
+      this.pendingExternalBirths.delete(runId);
+    }
     if (isTerminalStatus(run.status)) {
+      // A failed raw write can leave the accepted final in RAM. An exact
+      // terminal retry must persist it again, not acknowledge that RAM alone.
+      // Keep cancel/suppression authority; never reapply an old provider body.
+      if (snapshot.id === run.externalResearchJobId && ['completed', 'failed'].includes(run.status)
+        && ['done', 'error'].includes(String(snapshot.status || '').trim().toLowerCase())) await this.persistStrict();
       return { run: publicRun(run), changed, settled, terminal: true };
     }
     if (!snapshot.id || snapshot.id !== run.externalResearchJobId) {
@@ -1259,6 +1555,7 @@ class OrchestrationRunStore {
     }
 
     const now = Date.now();
+    const readCurrent = this._acceptExternalOperationalRead(run, operationalRead);
     const externalStatus = String(snapshot.status || '').trim().toLowerCase();
     const result = snapshot.result && typeof snapshot.result === 'object'
       ? snapshot.result
@@ -1284,12 +1581,14 @@ class OrchestrationRunStore {
     run.externalResearchUpdatedAt = Number(snapshot.updatedAt) || now;
     run.externalResearchAcceptedAt ||= now;
     run.externalResearchStartPending = false;
-    run.externalResearchBrowserWait = null;
-    run.deliveryAcceptedAt ||= now;
-    run.deliveryDeferredReason = null;
-    run.externalResearchTransportError = null;
-    run.externalResearchTransportCode = null;
-    run.externalResearchRetryAt = null;
+    if (!run.externalResearchOperationalRearm || readCurrent || ['done', 'error'].includes(externalStatus)) {
+      run.externalResearchBrowserWait = null;
+      run.deliveryAcceptedAt ||= now;
+      run.deliveryDeferredReason = null;
+      run.externalResearchTransportError = null;
+      run.externalResearchTransportCode = null;
+      run.externalResearchRetryAt = null;
+    }
     run.externalResearchResultSummary = result ? {
       textChars: answerText.length,
       sourceCount: Array.isArray(result.sources) ? result.sources.length : null,
@@ -1297,6 +1596,11 @@ class OrchestrationRunStore {
       isResearch: typeof result.is_research === 'boolean' ? result.is_research : null,
       textKind: result.text_kind || null,
     } : null;
+    const operational = externalOperational.ingestOperational(run, snapshot, now);
+    const localOperationalCleared = (!run.externalResearchOperationalRearm || readCurrent)
+      && ['queued', 'pending', 'running', 'done', 'error'].includes(externalStatus)
+      && externalOperational.clearLocalOperationalEpisode(run, now);
+    if (readCurrent) externalOperational.settleRearmTransport(run, operationalRead, null, now);
 
     if (externalStatus === 'done' && result) {
       run.resultAvailable = Boolean(result);
@@ -1307,6 +1611,7 @@ class OrchestrationRunStore {
       run.completionReason = 'external-research-done';
       run.externalResearchCompletedAt = Number(snapshot.doneAt) || now;
       this._settleSuccessfulRun(run, changed, settled, now);
+      externalCompletion.initializeDelivery(run);
       this._refreshAncestors(run.parentRunId, changed, settled, now);
     } else if (externalStatus === 'error' || externalStatus === 'done') {
       run.status = 'failed';
@@ -1328,27 +1633,37 @@ class OrchestrationRunStore {
       this._pushChanged(changed, run);
       settled.push(publicRun(run));
       this._refreshAncestors(run.parentRunId, changed, settled, now);
-    } else {
+    } else if (!run.externalResearchOperationalRearm || readCurrent) {
       run.status = externalStatus === 'running' ? 'running' : 'starting';
       run.startedAt ||= externalStatus === 'running' ? now : null;
       run.updatedAt = now;
       this._pushChanged(changed, run);
     }
-    this._schedulePersist();
+    const rearmCheck = readCurrent ? externalOperational.reserveRearmScCheck(run, now) : null;
+    if (operational.changed || localOperationalCleared || readCurrent || ['done', 'error'].includes(externalStatus)) await this.persistStrict();
+    else this._schedulePersist();
     return {
       run: publicRun(run),
       changed,
       settled,
       terminal: externalStatus === 'done' || externalStatus === 'error',
+      ...(rearmCheck && externalOperational.rearmCheckAuthorized(run, rearmCheck) ? { rearmCheck } : {}),
     };
   }
 
   async failExternalResearch(runId, { message, code } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     const changed = [];
     const settled = [];
     if (!isExternalResearchRun(run) || isTerminalStatus(run.status)) {
+      if (isExternalResearchRun(run) && run.status === 'failed'
+        && run.completionReason === 'external-research-start-failed') {
+        // A previous write may have failed after retaining this exact failure
+        // in RAM. Persist again without replacing its original reason/identity.
+        await this.persistStrict();
+        settled.push(publicRun(run));
+      }
       return { run: publicRun(run), changed, settled };
     }
     const now = Date.now();
@@ -1368,12 +1683,12 @@ class OrchestrationRunStore {
     this._pushChanged(changed, run);
     settled.push(publicRun(run));
     this._refreshAncestors(run.parentRunId, changed, settled, now);
-    this._schedulePersist();
+    await this.persistStrict();
     return { run: publicRun(run), changed, settled };
   }
 
   async recordResultProofObservation(runId, observation = {}, { withOutcome = false } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     const finish = (changed = false, ignored = false) => {
       const result = publicRun(run);
@@ -1436,7 +1751,7 @@ class OrchestrationRunStore {
   }
 
   async bindNotificationSourceSession(runId, sessionId) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run) return null;
     run.notificationSourceSessionId = sessionId || null;
@@ -1496,7 +1811,7 @@ class OrchestrationRunStore {
     const work = this.reservationChain
       .catch(() => undefined)
       .then(async () => {
-        await this.initialize();
+        await this.initialize({ requireAuthority: true });
         const source = normalizeAgentLaunchSource(launchSource);
         const due = this._pendingAutoStopsForTarget(tabId, { dueOnly: true, now });
         const decision = decideAutomaticRestoreAdmission({
@@ -1554,7 +1869,7 @@ class OrchestrationRunStore {
     const work = this.reservationChain
       .catch(() => undefined)
       .then(async () => {
-        await this.initialize();
+        await this.initialize({ requireAuthority: true });
         const run = this.runs.get(runId);
         if (!run) return { claimed: false, reason: 'run-not-found', run: null };
         if (run.autoStopFinishedAt) {
@@ -1653,7 +1968,7 @@ class OrchestrationRunStore {
     const work = this.reservationChain
       .catch(() => undefined)
       .then(async () => {
-        await this.initialize();
+        await this.initialize({ requireAuthority: true });
         const run = this.runs.get(runId);
         if (!run) return { settled: false, reason: 'run-not-found', run: null };
         if (run.autoStopFinishedAt) {
@@ -1686,7 +2001,7 @@ class OrchestrationRunStore {
     const work = this.reservationChain
       .catch(() => undefined)
       .then(async () => {
-        await this.initialize();
+        await this.initialize({ requireAuthority: true });
         const run = this.runs.get(runId);
         if (!run) return { cancelled: false, reason: 'run-not-found', run: null };
         if (!run.autoStopAt || run.autoStopFinishedAt) {
@@ -1712,7 +2027,7 @@ class OrchestrationRunStore {
     launchGeneration = null,
     auditPending = false,
   } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run || isTerminalStatus(run.status)) return publicRun(run);
     const predecessor = run.predecessorRunId ? this.runs.get(run.predecessorRunId) : null;
@@ -1750,7 +2065,7 @@ class OrchestrationRunStore {
   }
 
   async confirmTargetPromptDelivery(runId, proof = {}, options = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     const changed = [];
     if (!run) return { confirmed: false, reason: 'run-not-found', changed };
@@ -1896,7 +2211,7 @@ class OrchestrationRunStore {
     lifecycleGeneration = null,
     launchGeneration = null,
   } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run || isTerminalStatus(run.status)) return publicRun(run);
     if (!run.deliveryIntent) return publicRun(run);
@@ -1918,7 +2233,7 @@ class OrchestrationRunStore {
     lifecycleGeneration = null,
     launchGeneration = null,
   } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run) return { claimed: false, reason: 'run-not-found', run: null, intent: null };
     if (isTerminalStatus(run.status)) {
@@ -1960,7 +2275,7 @@ class OrchestrationRunStore {
   }
 
   async resetDeferredDelivery(runId, reason = 'delivery-not-sent') {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run || isTerminalStatus(run.status) || !run.deliveryIntent) return publicRun(run);
     run.status = 'queued';
@@ -1974,7 +2289,7 @@ class OrchestrationRunStore {
   }
 
   async markNotification(runId, status, patch = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run) return null;
     // Exact prompt/transcript proof is stronger than the transport's earlier
@@ -1999,13 +2314,13 @@ class OrchestrationRunStore {
     this._pushChanged(changed, run);
     const settled = [];
     this._refreshAncestors(run.parentRunId, changed, settled, Date.now());
-    if (isResponseObservation(run) && status === 'suppressed') await this.persistStrict();
+    if ((isResponseObservation(run) || isExternalResearchRun(run)) && status === 'suppressed') await this.persistStrict();
     else this._schedulePersist();
     return { run: publicRun(run), changed, settled };
   }
 
   async applyLifecycle(tabId, payload = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     if (payload.type === 'background-work') {
       const changed = [];
       const settled = [];
@@ -2265,7 +2580,7 @@ class OrchestrationRunStore {
   }
 
   async confirmSourceFollowup(runId, proof = {}, options = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     const changed = [];
     const settled = [];
@@ -2430,7 +2745,7 @@ class OrchestrationRunStore {
   }
 
   async reconcile(runId, observation = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (hasResultAttemptConflict(run, observation)) {
       return { changed: null, completed: false, settled: [], ignored: true,
@@ -2632,7 +2947,7 @@ class OrchestrationRunStore {
   }
 
   async markResultProofUnavailable(runId, reason = 'exact result proof is unavailable', options = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (hasResultAttemptConflict(run, options)) {
       return { run: publicRun(run), changed: [], settled: [], resolved: false,
@@ -2683,7 +2998,7 @@ class OrchestrationRunStore {
   }
 
   async markResultProofTerminalFailure(runId, reason, options = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (hasResultAttemptConflict(run, options)) {
       return { run: publicRun(run), changed: [], settled: [], resolved: false,
@@ -2741,7 +3056,7 @@ class OrchestrationRunStore {
   }
 
   async handleTargetClosed(tabId, { now = Date.now(), failureGraceMs } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const changed = [];
     const settled = [];
     for (const run of this._activeForTarget(tabId)) {
@@ -2761,7 +3076,7 @@ class OrchestrationRunStore {
   }
 
   async beginRecovery(runId, outcome = 'failed', reason = 'agent run failed', options = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run || isTerminalStatus(run.status)) {
       return { changed: run ? [publicRun(run)] : [], settled: [] };
@@ -2776,7 +3091,7 @@ class OrchestrationRunStore {
   }
 
   async beginResultProofRecovery(runId, reason = 'result proof deadline elapsed', options = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (options.resultSourceVerified === false) {
       return { changed: [], settled: [], run: publicRun(run), ignored: true,
@@ -2806,7 +3121,7 @@ class OrchestrationRunStore {
   }
 
   async handleSourceClosed(tabId) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const changed = [];
     const now = Date.now();
     for (const run of this.runs.values()) {
@@ -2831,7 +3146,7 @@ class OrchestrationRunStore {
   }
 
   async resolveRecovery(runId, action, proof = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     const capacityRetry = action === 'codex-capacity-retry';
     if (capacityRetry && run?.capacityRetryHandoffId === proof.handoffId && proof.handoffId) {
@@ -2943,7 +3258,7 @@ class OrchestrationRunStore {
 
   async beginRequestContinuation(runId, input) {
     const work = this.reservationChain.catch(() => {}).then(async () => {
-      await this.initialize();
+      await this.initialize({ requireAuthority: true });
       const run = this.runs.get(runId);
       if (!run || run.status !== 'waiting_recovery' || isPausedRun(run)
         || run.notificationSuppressed || continuationOwnerKey(run) !== input.ownerKey) {
@@ -2981,7 +3296,7 @@ class OrchestrationRunStore {
   }
 
   async markRequestContinuationSending(runId, operationId) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId), intent = run?.continuationIntent;
     if (!intent || intent.operationId !== operationId || isTerminalStatus(run.status) || intent.cancelledAt) {
       throw new Error('continuation_cancelled');
@@ -2992,7 +3307,7 @@ class OrchestrationRunStore {
   }
 
   async setRequestContinuationOutcome(runId, operationId, state, error) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId), intent = run?.continuationIntent;
     if (!intent || intent.operationId !== operationId || ['bound', 'delivered-paused'].includes(intent.state) || isTerminalStatus(run.status)) return { run: publicRun(run) };
     intent.state = state; intent.error = error || null; run.updatedAt = Date.now();
@@ -3001,7 +3316,7 @@ class OrchestrationRunStore {
   }
 
   async resetRequestContinuationBeforeAdmission(runId, operationId, error) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId), intent = run?.continuationIntent;
     if (!intent || intent.operationId !== operationId || isTerminalStatus(run.status)) return;
     intent.state = 'prepared'; intent.sendStartedAt = null; intent.error = error || null;
@@ -3009,7 +3324,7 @@ class OrchestrationRunStore {
   }
 
   async confirmRequestContinuation(runId, proof) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId), intent = run?.continuationIntent;
     if (!run || !intent || isTerminalStatus(run.status) || intent.cancelledAt
       || proof.handoffId !== intent.handoffId || proof.operationKey !== intent.operationKey) return { confirmed: false, reason: 'continuation-identity-mismatch' };
@@ -3059,7 +3374,7 @@ class OrchestrationRunStore {
   }
 
   async acceptContinuationReadyResult(runId, ownerKey, proof) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run || run.status !== 'waiting_recovery' || continuationOwnerKey(run) !== ownerKey
       || proof?.complete !== true || proof.sourceVerified !== true
@@ -3078,7 +3393,7 @@ class OrchestrationRunStore {
   }
 
   async adoptWorkingContinuation(runId, ownerKey, context) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run || run.status !== 'waiting_recovery' || continuationOwnerKey(run) !== ownerKey
       || !executionContextsMatch(run.targetExecutionContext, context)) return { accepted: false };
@@ -3089,7 +3404,7 @@ class OrchestrationRunStore {
   }
 
   async pause(runId) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run) return { run: null, changed: [], settled: [], paused: false };
     if (isPausedRun(run)) {
@@ -3138,10 +3453,11 @@ class OrchestrationRunStore {
     suppressNotification = true,
     outcome = 'interrupted',
   } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run || (isTerminalStatus(run.status) && !isResultProofPending(run))) {
-      if (isResponseObservation(run) && (run.status === 'cancelled' || run.notificationSuppressed === true)) {
+      if ((isResponseObservation(run) || isExternalResearchRun(run))
+        && (run.status === 'cancelled' || run.notificationSuppressed === true)) {
         await this.persistStrict();
       }
       return { run: publicRun(run), changed: [], settled: [] };
@@ -3165,13 +3481,13 @@ class OrchestrationRunStore {
     this._pushChanged(changed, run);
     settled.push(publicRun(run));
     this._refreshAncestors(run.parentRunId, changed, settled, now);
-    if (isResponseObservation(run)) await this.persistStrict();
+    if (isResponseObservation(run) || isExternalResearchRun(run)) await this.persistStrict();
     else this._schedulePersist();
     return { run: publicRun(run), changed, settled };
   }
 
   async expireRecoveryDeadlines(now = Date.now()) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const changed = [];
     const settled = [];
     for (const run of this.runs.values()) {
@@ -3190,7 +3506,7 @@ class OrchestrationRunStore {
   }
 
   async nextRecoveryDeadline() {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     let next = null;
     for (const run of this.runs.values()) {
       if (run.status !== 'waiting_recovery' || !run.recoveryDeadlineAt) continue;
@@ -3200,24 +3516,24 @@ class OrchestrationRunStore {
   }
 
   async get(runId) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     return publicRun(this.runs.get(runId));
   }
 
   async getInternal(runId) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     return this.runs.get(runId) || null;
   }
 
   async sourceCompletionFacts(scope) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     return require('./orchestration-source-context').sourceCompletionFacts(
       Array.from(this.runs.values()), scope,
     );
   }
 
   async acknowledge(runId, tabId) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run) return null;
     const now = Date.now();
@@ -3233,7 +3549,7 @@ class OrchestrationRunStore {
   }
 
   async dismissAttention(runId, tabId) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const run = this.runs.get(runId);
     if (!run) return { run: null, changed: [], settled: [], dismissed: false };
     if (run.sourceTabId !== tabId && run.targetTabId !== tabId) {
@@ -3265,13 +3581,13 @@ class OrchestrationRunStore {
     run.updatedAt = now;
     this._pushChanged(changed, run);
     this._refreshAncestors(run.parentRunId, changed, settled, now);
-    if (isResponseObservation(run) && run.notificationSuppressed === true) await this.persistStrict();
+    if ((isResponseObservation(run) || isExternalResearchRun(run)) && run.notificationSuppressed === true) await this.persistStrict();
     else this._schedulePersist();
     return { run: publicRun(run), changed, settled, dismissed: true };
   }
 
   async listForTab(tabId, { activeOnly = false } = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     return Array.from(this.runs.values())
       .filter((run) => run.sourceTabId === tabId || run.targetTabId === tabId)
       .filter((run) => !activeOnly || isTrackedOrchestrationRun(run))
@@ -3280,7 +3596,7 @@ class OrchestrationRunStore {
   }
 
   async listActive() {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     return Array.from(this.runs.values())
       .filter(isTrackedOrchestrationRun)
       .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
@@ -3289,7 +3605,7 @@ class OrchestrationRunStore {
 
   // Uses the initialized registry; a metadata GET never initializes/migrates it.
   readInheritedActivity() {
-    if (!this.initialized || this.activityReadError) return { known: false,
+    if (!this._hasStoreAuthority()) return { known: false,
       reason: this.activityReadError || 'orchestration-not-ready', sourceTabIds: [] };
     const { isOrchestrationInheritedActivity } = require('../shared/orchestration-activity.cjs');
     return { known: true, sourceTabIds: [...new Set([...this.runs.values()]
@@ -3297,7 +3613,7 @@ class OrchestrationRunStore {
   }
 
   readTabInspection(tabId) {
-    if (!this.initialized || this.activityReadError) return { known: false,
+    if (!this._hasStoreAuthority()) return { known: false,
       reason: this.activityReadError || 'orchestration-not-ready', revision: null };
     const { isOrchestrationInheritedActivity } = require('../shared/orchestration-activity.cjs');
     const jobs = [...this.runs.values()]
@@ -3322,24 +3638,56 @@ class OrchestrationRunStore {
   }
 
   async listAll() {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     return Array.from(this.runs.values())
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
       .map(publicRun);
   }
 
   async getSettings() {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     return { ...this.settings, codexCapacityRetryDelaysMs: [...this.settings.codexCapacityRetryDelaysMs] };
   }
 
+  async getResearchMaintenance() {
+    await this.initialize({ requireAuthority: true });
+    return { ...JSON.parse(JSON.stringify(this.researchMaintenance)),
+      activeOperationId: researchMaintenance.activeId(this.researchMaintenance),
+      ...(this.startupMaintenanceReceipt ? { startup: { ...this.startupMaintenanceReceipt } } : {}) };
+  }
+
+  async transitionResearchMaintenance(request) {
+    await this.initialize({ requireAuthority: true });
+    const result = researchMaintenance.transition(this.researchMaintenance, request);
+    this.researchMaintenance = result.value;
+    const operationId = researchMaintenance.activeId(this.researchMaintenance);
+    for (const run of this.runs.values()) if (isExternalResearchRun(run)) {
+      const previousOperation = run.externalResearchMaintenanceOperationId;
+      run.externalResearchMaintenanceOperationId = operationId;
+      if (!result.repeated && request.action === 'complete' && previousOperation === request.operationId) {
+        externalOperational.beginPostMaintenanceRearm(run, request.operationId);
+      }
+    }
+    // A repeated request retries the raw strict commit too: a RAM-only begin
+    // after a lost write ACK must not authorize the operator to quit the app.
+    await this.persistStrict();
+    return { ...await this.getResearchMaintenance(), repeated: result.repeated, operation: result.operation };
+  }
+
   async updateSettings(patch = {}) {
-    await this.initialize();
+    await this.initialize({ requireAuthority: true });
     const definedPatch = Object.fromEntries(
       Object.entries(patch).filter(([, value]) => value !== undefined),
     );
     this.settings = normalizeSettings({ ...this.settings, ...definedPatch });
-    this._schedulePersist();
+    if (Object.hasOwn(definedPatch, 'externalResearchOperationalPrompts')) {
+      for (const run of this.runs.values()) if (isExternalResearchRun(run)) {
+        run.externalResearchOperationalPrompts = this.settings.externalResearchOperationalPrompts;
+      }
+      // Revoke already-admitted operational inputs before acknowledging the
+      // policy change. Completion delivery has its own untouched authority.
+      await this.persistStrict();
+    } else this._schedulePersist();
     return { ...this.settings, codexCapacityRetryDelaysMs: [...this.settings.codexCapacityRetryDelaysMs] };
   }
 
@@ -3348,6 +3696,7 @@ class OrchestrationRunStore {
   }
 
   async persistStrict() {
+    if (!this._hasStoreAuthority()) await this.initialize({ requireAuthority: true });
     await this._enqueuePersist(true);
   }
 
@@ -3690,12 +4039,32 @@ class OrchestrationRunStore {
     }
   }
 
-  _enqueuePersist(strict) {
+  _enqueuePersist(strict, { startupMaintenanceCommit = false } = {}) {
+    // Check at admission, before serializing, pruning or revoking anything.
+    // A later successful load must not authorize a snapshot captured earlier.
+    // Keep the raw rejecting promise separate from the logged/caught chain;
+    // _schedulePersist remains synchronous and flush is not a strict receipt.
+    try { this._assertStoreAuthority(false, startupMaintenanceCommit); }
+    catch (error) {
+      const rejected = this.persistChain.then(() => { throw error; });
+      this.persistChain = rejected.catch(cause => {
+        console.warn('[OrchestrationRuns] persist blocked:', cause.message);
+      });
+      return strict ? rejected : this.persistChain;
+    }
+    let operationalCancellationError = null;
+    for (const run of this.runs.values()) {
+      const cancellationError = externalOperational.synchronizeRevocations(run, this.onOperationalRevoked);
+      operationalCancellationError ||= cancellationError;
+      const completionError = externalCompletion.synchronizeRevocation(run, this.onCompletionRevoked);
+      operationalCancellationError ||= completionError;
+    }
     this._pruneInMemory();
     this._notifyActivityChanged();
     const snapshot = JSON.stringify({
       version: 4,
       settings: this.settings,
+      researchMaintenance: this.researchMaintenance,
       createdTargetTabIds: Array.from(this.createdTargetTabIds),
       targetActivityByTab: Object.fromEntries(this.targetActivityByTab),
       runs: Array.from(this.runs.values()),
@@ -3707,6 +4076,7 @@ class OrchestrationRunStore {
         const tempPath = this.filePath + '.tmp-' + process.pid;
         await fs.promises.writeFile(tempPath, snapshot, 'utf8');
         await fs.promises.rename(tempPath, this.filePath);
+        if (operationalCancellationError) throw operationalCancellationError;
       });
     this.persistChain = write.catch((error) => {
         console.warn('[OrchestrationRuns] persist failed:', error?.message || error);

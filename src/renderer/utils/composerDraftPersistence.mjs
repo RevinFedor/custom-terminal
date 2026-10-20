@@ -22,7 +22,7 @@ function normalizeChip(value) {
   const id = typeof value.id === 'string' ? value.id.trim() : '';
   const kind = value.kind === 'prompt' || value.kind === 'paste' ? value.kind : null;
   if (!id || !kind || typeof value.text !== 'string') return null;
-  const result = { id, kind, text: value.text };
+  const result = { ...normalizeComposerChips([value])[0], id, kind, text: value.text };
   if (typeof value.label === 'string') result.label = value.label;
   if (typeof value.sourceKey === 'string' && value.sourceKey) result.sourceKey = value.sourceKey;
   if (typeof value.replaySourceKey === 'string' && value.replaySourceKey) result.replaySourceKey = value.replaySourceKey;
@@ -47,12 +47,14 @@ export function readComposerDraftMemory(value) {
     const text = typeof raw.text === 'string' ? raw.text : '';
     const images = Array.isArray(raw.images) ? raw.images.map(normalizeImageRef).filter(Boolean) : [];
     const chips = Array.isArray(raw.chips) ? raw.chips.map(normalizeChip).filter(Boolean) : [];
-    if (!text && images.length === 0 && chips.length === 0) continue;
+    const returned = Array.isArray(raw.returned) ? [...new Set(raw.returned.filter(id => typeof id === 'string' && id))] : [];
+    if (!text && images.length === 0 && chips.length === 0 && returned.length === 0) continue;
     const updatedAt = Number(raw.updatedAt);
     candidates.push([tabId, {
       text,
       images,
       chips,
+      ...(returned.length ? { returned } : {}),
       updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : 0,
     }]);
   }
@@ -72,11 +74,12 @@ export function readComposerDraftMemory(value) {
   return Object.fromEntries(retained.reverse());
 }
 
-export function buildComposerDraftMemory({ drafts, images, chips, updatedAtByTab }) {
+export function buildComposerDraftMemory({ drafts, images, chips, updatedAtByTab, returnedByTab = {} }) {
   const tabIds = new Set([
     ...Object.keys(drafts || {}),
     ...Object.keys(images || {}),
     ...Object.keys(chips || {}),
+    ...Object.keys(returnedByTab || {}),
   ]);
   const memory = {};
   for (const tabId of tabIds) {
@@ -84,6 +87,7 @@ export function buildComposerDraftMemory({ drafts, images, chips, updatedAtByTab
       text: typeof drafts?.[tabId] === 'string' ? drafts[tabId] : '',
       images: Array.isArray(images?.[tabId]) ? images[tabId] : [],
       chips: Array.isArray(chips?.[tabId]) ? chips[tabId] : [],
+      returned: returnedByTab[tabId] || [],
       updatedAt: Number(updatedAtByTab?.[tabId]) || 0,
     };
   }
@@ -96,11 +100,14 @@ export function splitComposerDraftMemory(value) {
   const images = {};
   const chips = {};
   const updatedAtByTab = {};
+  const returnedByTab = {};
   for (const [tabId, record] of Object.entries(memory)) {
     if (record.text) drafts[tabId] = record.text;
     if (record.images.length > 0) images[tabId] = record.images;
     if (record.chips.length > 0) chips[tabId] = record.chips;
     updatedAtByTab[tabId] = record.updatedAt;
+    if (record.returned?.length) returnedByTab[tabId] = record.returned;
   }
-  return { drafts, images, chips, updatedAtByTab };
+  return { drafts, images, chips, updatedAtByTab, returnedByTab };
 }
+import { normalizeComposerChips } from './composerChips.mjs';

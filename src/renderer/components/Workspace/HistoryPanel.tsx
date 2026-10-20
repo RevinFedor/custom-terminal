@@ -20,7 +20,7 @@ import {
   bindHistoryImagePreviewKeys,
 } from '../../utils/historyImageRuns.mjs';
 import HistorySearchBar from './HistorySearchBar';
-import HistoryAgentLaunchParameters, { type SubagentLaunchSettings, type SubagentLaunchServiceTier } from './HistoryAgentLaunchParameters';
+import HistoryAgentLaunchParameters, { type SubagentLaunchSettings, type SubagentLaunchServiceTier, type SubagentRequestServiceTier } from './HistoryAgentLaunchParameters';
 import CodexNativeQuestionMirror from './CodexNativeQuestionMirror';
 import { projectNativeQuestionReply } from '../../../shared/native-question-reply.mjs';
 import { getAutomaticContinuationKind } from '../../../shared/prompt-origin.mjs';
@@ -89,6 +89,8 @@ import ControlHint from '../UI/ControlHint';
 import HistoryLoadingStatus from './HistoryLoadingStatus';
 import AgentLifecycleActions from './AgentLifecycleActions';
 import SideSurfaceToggleButton from './SideSurfaceToggleButton';
+import {RIGHT_CLUSTER_INNER_GAP_PX} from '../../utils/controlBarWrap.mjs';
+import {requestFocusedHistoryBottomKey} from '../../utils/workspaceHistoryBottomKey.mjs';
 import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
 import {
   getHistoryAgentRuntime,
@@ -397,6 +399,7 @@ import {
   bindHistoryPromptHandoffSendIdentity,
   prepareHistoryPromptHandoffPresentation,
   consumeHistoryPromptHandoff,
+  dismissReceiptlessHistoryPromptPresentation,
   applyHistoryQueuedMessageMerge,
   durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry,
   durableHistorySendReceiptMatchesCanonicalEntry,
@@ -424,6 +427,10 @@ import {
 } from '../../utils/historyPromptHandoffs';
 import { saveHistorySendRecovery, removeHistorySendRecovery } from '../../utils/historySendRecovery.mjs';
 import { historySendTimerState } from '../../utils/historySendTiming.mjs';
+import { historySendReturnEnabled, historySendPresentationAction } from '../../utils/historySendReturn.mjs';
+import { planHistoryPromptPresentationDismissal } from '../../utils/historyPromptPresentationDismissal.mjs';
+import { recordHistorySendReturnControl, isHistorySendReturned, isHistorySendReturnRestored } from '../../utils/historyPromptHandoffs';
+import { releaseReturnedHistoryPreparation } from '../../utils/agentActionCoordinator.mjs';
 import {
   isStandaloneAgentLocalCommand,
   projectAgentLocalCommandSendResult,
@@ -437,7 +444,6 @@ import {
   matchesHistoryPromptSuppression,
   resolveHistoryPromptHandoffPresentationSession,
 } from '../../utils/historyPromptPresentation.mjs';
-import { planHistoryPromptPresentationDismissal } from '../../utils/historyPromptPresentationDismissal.mjs';
 import {
   resolveHistoryOrchestrationPromptPresentation,
   projectHistoryServicePromptBody,
@@ -704,6 +710,7 @@ const historyActionToolUseId = (action: Action) => {
 };
 
 interface FullHistoryEntry {
+  historyReturn?: any;
   questionReplyProof?: any;
   settingsProjectionError?: string;
   settingsFact?: { version: number; provider: string; kind: string; value: string; source: string; live?: boolean };
@@ -1105,6 +1112,7 @@ interface HistoryPanelProps {
   // then a pure transcript. Same component, same draft — only the DOM location
   // moves, because two mounted composers would mean two drafts.
   composerPortalHostId?: string;
+  sideSurfaceToggleHosted?: boolean;
   // Height of the docked input this panel must stop above, in px.
   //
   // The side panel is docked to the right edge of the CENTER box, and in
@@ -1921,6 +1929,7 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.statusReason !== right.statusReason ||
     left.statusChangedAt !== right.statusChangedAt ||
     left.enterAttemptAt !== right.enterAttemptAt ||
+    left.historyReturn !== right.historyReturn ||
     left.statusAtSend !== right.statusAtSend ||
     left.rewindStatus !== right.rewindStatus ||
     left.optimisticAt !== right.optimisticAt ||
@@ -3158,12 +3167,13 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     chip?.agentSessionId || chip?.agentId || '', String(chip?.startedAt || '')].join('|');
   const [launchSnapshot, setLaunchSnapshot] = useState<{
     ownerKey: string; settings: SubagentLaunchSettings | null; serviceTier: SubagentLaunchServiceTier | null;
+    requestTier: SubagentRequestServiceTier | null;
     loading: boolean;
-  }>({ ownerKey: '', settings: null, serviceTier: null, loading: false });
+  }>({ ownerKey: '', settings: null, serviceTier: null, requestTier: null, loading: false });
 
   useEffect(() => {
     if (!chipKey) { setSteps([]); setPending(false); offsetRef.current = 0;
-      setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null, serviceTier: null, loading: false }); return; }
+      setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null, serviceTier: null, requestTier: null, loading: false }); return; }
     let cancelled = false;
     let tickInFlight = false;
     let drainTimer: number | null = null;
@@ -3178,7 +3188,7 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
     offsetRef.current = 0;
     setSteps([]);
     setPending(true);
-    setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null, serviceTier: null, loading: true });
+    setLaunchSnapshot({ ownerKey: launchOwnerKey, settings: null, serviceTier: null, requestTier: null, loading: true });
     const finishMetadataLoading = () => setLaunchSnapshot(previous =>
       previous.ownerKey !== launchOwnerKey || !previous.loading ? previous : { ...previous, loading: false });
     // A LIVE Codex card has no thread id yet: the spawn is rendered when the
@@ -3202,6 +3212,7 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
         }
         if (cancelled) return;
         const res = await ipcRenderer.invoke('subagent:read-steps', {
+          tabId,
           readerId: effectReaderId,
           chipKey,
           toolType,
@@ -3225,6 +3236,14 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
             && !!resolvedThreadId && res.launchServiceTier.sessionId === resolvedThreadId
             && [null, 'priority', 'default'].includes(res.launchServiceTier.serviceTier)
               ? res.launchServiceTier : null;
+          const requestTier: SubagentRequestServiceTier | null = toolType === 'codex'
+            && res.requestServiceTier?.version === 1 && res.requestServiceTier.provider === 'codex'
+            && res.requestServiceTier.source === 'own-provider-request'
+            && !!resolvedThreadId && res.requestServiceTier.sessionId === resolvedThreadId
+            && res.requestServiceTier.parentSessionId === sessionId
+            && !!res.requestServiceTier.requestId && !!res.requestServiceTier.turnId
+            && [null, 'priority', 'default'].includes(res.requestServiceTier.serviceTier)
+              ? res.requestServiceTier : null;
           const nextOffset = Number(res.offset) || offsetRef.current;
           setLaunchSnapshot(previous => {
             // Transcript rows can arrive before launch metadata. Keep its
@@ -3240,7 +3259,11 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
             && previous.serviceTier?.serviceTier === serviceTier?.serviceTier
             && previous.serviceTier?.source === serviceTier?.source
             && previous.serviceTier?.sessionId === serviceTier?.sessionId
-            ? previous : { ownerKey: launchOwnerKey, settings, serviceTier, loading };
+            && previous.requestTier?.serviceTier === requestTier?.serviceTier
+            && previous.requestTier?.source === requestTier?.source
+            && previous.requestTier?.sessionId === requestTier?.sessionId
+            && previous.requestTier?.parentSessionId === requestTier?.parentSessionId
+            ? previous : { ownerKey: launchOwnerKey, settings, serviceTier, requestTier, loading };
           });
           offsetRef.current = nextOffset;
           if (res.steps.length > 0) {
@@ -3299,6 +3322,7 @@ function useSubagentSteps(chip: HistoryBackgroundChip | null, tabId: string, too
   return { steps, pending,
     launchMetadataPending: !!chipKey && (launchSnapshot.ownerKey !== launchOwnerKey || launchSnapshot.loading),
     launchSettings: launchSnapshot.ownerKey === launchOwnerKey ? launchSnapshot.settings : null,
+    requestServiceTier: launchSnapshot.ownerKey === launchOwnerKey ? launchSnapshot.requestTier : null,
     launchServiceTier: launchSnapshot.ownerKey === launchOwnerKey ? launchSnapshot.serviceTier : null };
 }
 
@@ -3346,7 +3370,7 @@ const HistoryBackgroundDetailPane = memo(({
   const followBottomRef = useRef(true);
   const restoredScrollRef = useRef(false);
   const programmaticScrollRef = useRef(false);
-  const { steps: liveSteps, pending: stepsPending, launchSettings: ownLaunchSettings, launchServiceTier, launchMetadataPending } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
+  const { steps: liveSteps, pending: stepsPending, launchSettings: ownLaunchSettings, launchServiceTier, requestServiceTier, launchMetadataPending } = useSubagentSteps(chip, tabId, toolType, cwd, sessionId);
   const creationLaunchSettings = chip.launchSettings?.version === 1
     && chip.launchSettings.provider === toolType
     && (toolType !== 'codex' || chip.launchSettings.sessionId === chip.agentSessionId)
@@ -3528,7 +3552,7 @@ const HistoryBackgroundDetailPane = memo(({
             : <Bot size={12} style={{ color: statusColor, flexShrink: 0 }} />}
         {chip.kind === 'subagent'
           ? <HistoryAgentLaunchParameters settings={creationLaunchSettings || ownLaunchSettings}
-              provider={toolType} serviceTier={launchServiceTier} loading={launchMetadataPending} taskLabel={chip.label} />
+              provider={toolType} serviceTier={launchServiceTier} requestServiceTier={requestServiceTier} loading={launchMetadataPending} taskLabel={chip.label} />
           : <span className="truncate" style={{ flex: 1, fontFamily: 'monospace' }}>{chip.label}</span>}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, marginLeft: 'auto' }}>
         <span style={{ color: statusColor, fontSize: '0.9em' }}>{statusLabel}</span>
@@ -4938,7 +4962,9 @@ const HistorySendTimer = memo(({ startedAt, enterAttemptAt, status, changedAt, r
     return () => clearInterval(clock);
   }, [startedAt, running]);
   return timing ? <span className="hp-history-send-timer" data-history-send-timer
-    data-running={running} title="Время от Send до первого Enter сообщения в терминале">{timing.seconds}s</span> : null;
+    data-running={running} title={`${running ? 'Счёт идёт' : 'Счёт остановлен'} · время от Send до первого Enter сообщения в терминале`}>
+    {timing.seconds}s
+  </span> : null;
 });
 
 const HistoryUserEntry = memo(({
@@ -5020,6 +5046,8 @@ const HistoryUserEntry = memo(({
     && !!entry.handoffId
     && queueStatus !== 'sent'
     && !!onDismissPromptPresentation;
+  const promptPresentationAction = historySendPresentationAction(entry);
+  const returnEnabled = canDismissPromptPresentation && promptPresentationAction.enabled;
   const serviceBody = useMemo(() => projectHistoryServicePromptBody({
     role: entry.role, content: entry.content, semanticTags: entry.semanticTags, questionReplyProof: entry.questionReplyProof,
   }, historyServicePromptFingerprint), [entry.role, entry.content, entry.semanticTags, entry.questionReplyProof]);
@@ -5205,7 +5233,7 @@ const HistoryUserEntry = memo(({
   const dismissPromptPresentation = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     event.stopPropagation();
-    if (canDismissPromptPresentation) onDismissPromptPresentation?.(entry);
+    if (returnEnabled) onDismissPromptPresentation?.(entry);
   };
   const mergeQueuedPrompt = async (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault(); event.stopPropagation();
@@ -5246,11 +5274,15 @@ const HistoryUserEntry = memo(({
           {queueStatusPresentation && <HistorySendTimer startedAt={entry.optimisticAt}
             enterAttemptAt={entry.enterAttemptAt} status={queueStatus} changedAt={entry.statusChangedAt} reason={entry.statusReason} />}
           {canDismissPromptPresentation && (
-            <Tooltip content={queueStatus === 'application-queued' ? 'Отменить отправку из очереди' : 'Скрыть эту карточку'}>
+            <Tooltip content={promptPresentationAction.kind === 'dismiss' ? 'Скрыть карточку. Не отменяет и не повторяет отправку'
+              : returnEnabled ? 'Вернуть сообщение в input' : 'Ввод сообщения уже начат или его состояние проверяется'}>
               <button
                 type="button"
                 className="hp-user-message-status-dismiss"
-                aria-label={queueStatus === 'application-queued' ? 'Отменить отправку из очереди' : 'Скрыть статусную карточку сообщения'}
+                aria-label={promptPresentationAction.kind === 'dismiss' ? 'Скрыть карточку' : 'Вернуть сообщение в input'}
+                disabled={!returnEnabled}
+                data-history-send-return={promptPresentationAction.kind === 'return' || undefined}
+                data-history-send-dismiss={promptPresentationAction.kind === 'dismiss' || undefined}
                 onMouseDown={stopActionPropagation}
                 onContextMenu={(event) => {
                   event.preventDefault();
@@ -5258,7 +5290,7 @@ const HistoryUserEntry = memo(({
                 }}
                 onClick={dismissPromptPresentation}
               >
-                <X size={10} />
+                {promptPresentationAction.kind === 'dismiss' ? <X size={10} /> : <RotateCcw size={10} />}
               </button>
             </Tooltip>
           )}
@@ -5998,6 +6030,12 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   margin-bottom: 0;
   box-sizing: border-box;
 }
+.hp-user-message-status > .cb-message-status,
+.hp-history-send-timer {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
 .hp-user-message-status-dismiss {
   display: inline-flex;
   align-items: center;
@@ -6019,10 +6057,14 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
   display: block;
   margin: 0;
 }
-.hp-user-message-status-dismiss:hover {
+.hp-user-message-status-dismiss:hover:not(:disabled) {
   border-color: rgba(245, 158, 11, 0.8);
   background: rgba(245, 158, 11, 0.16);
   color: #f0b95b;
+}
+.hp-user-message-status-dismiss:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 .hp-history-user-prompt-band {
   display: flex;
@@ -6457,14 +6499,15 @@ const historyPanelStyleText = `${HISTORY_NAVIGATION_FLASH_CSS}
 }
 .hp-history-send-timer {
   color: var(--cb-text, #e0e0e0);
-  font-size: 0.9em;
-  font-weight: 600;
   font-variant-numeric: tabular-nums;
   line-height: 1.45;
   white-space: nowrap;
   padding-right: 4px;
   margin-right: 1px;
   border-right: 1px solid var(--cb-border, #555);
+}
+.hp-history-send-timer[data-running="true"] {
+  color: var(--cb-message-info, #60a5fa);
 }
 .hp-history-response-tail[data-state="completed"] {
   width: max-content;
@@ -9680,6 +9723,9 @@ function AgentHistoryControls({
           text: presentationText, promptChips: promptChipsForHistory, imagePaths: sourceDraftImages,
           authoringText: rawDraftSnapshot, authoringChips: sendDraftChips, authoringImagePaths: sourceDraftImages,
           submittedAt, source: 'history-panel', statusAtSend, initialStatus: initialQueueStatus, requiresAuditIdentity,
+          historyReturn: !recordWithoutReply && ['codex', 'claude'].includes(runtime.toolType)
+            ? { version: 1, tabId: actionTabId, handoffId, token: crypto.randomUUID(),
+              provider: runtime.toolType, state: 'registering' } : undefined,
         };
         // Save authoring BEFORE clearing the editor. This local recovery record
         // is not a Main ACK, FIFO admission, or authority to replay on reload.
@@ -9707,8 +9753,15 @@ function AgentHistoryControls({
         delayedDeliveryWarningHandoffRef.current = null;
         setDraftWarning(null);
         markSendPreparation('handoff-published');
+        if (earlyHandoff.historyReturn) {
+          const registered = await ipcRenderer.invoke('agent:register-history-send-return', earlyHandoff.historyReturn);
+          if (registered?.success !== true) throw new Error('Could not register message return: ' + (registered?.reason || 'unknown'));
+          recordHistorySendReturnControl(registered.control);
+          if (isHistorySendReturned(actionTabId, handoffId)) return;
+        }
         const preparedPrompt = await prepareHistoryPromptForSend(rawDraftSnapshot, sourceDraftImages);
         markSendPreparation('images-ready');
+        if (isHistorySendReturned(actionTabId, handoffId)) return;
         if (!isCurrentAction()) throw new Error('History Send owner changed during preparation');
         if (!preparedPrompt.success) {
           clearedPromptImages = preparedPrompt.images;
@@ -9734,6 +9787,10 @@ function AgentHistoryControls({
         sendIncidentPromptText = sendPayload;
         const contextPrepared = await prepareTabWorkContext(actionTabId, handoffId, sendPayload);
         markSendPreparation('context-ready');
+        if (isHistorySendReturned(actionTabId, handoffId)) {
+          await settleTabWorkContext(actionTabId, handoffId, { submitted: false });
+          return;
+        }
         sendPayload = contextPrepared.prompt;
         presentationText = contextPrepared.prefix + presentationText;
         sendIncidentPromptText = sendPayload;
@@ -9905,7 +9962,7 @@ function AgentHistoryControls({
         });
         sendFailureResult = result;
         if (result?.applicationQueued === true && result?.applicationQueue?.version === 1) {
-          removeHistorySendRecovery(actionTabId, handoffId);
+          removeHistorySendRecovery(actionTabId, handoffId); // Main now owns the complete immutable authoring.
           bindHistoryPromptHandoffSendIdentity(actionTabId, handoffId, { sendOperationKey: result.operationKey,
             applicationQueueId: result.applicationQueue.id });
           settleHistoryPromptHandoff(actionTabId, handoffId, { queueStatus: 'application-queued',
@@ -10143,6 +10200,7 @@ function AgentHistoryControls({
         setStatusFrom('inactive', 'stop-process-click');
       }
     } catch (e: any) {
+      if (kind === 'send' && sendHandoffId && isHistorySendReturned(actionTabId, sendHandoffId)) return;
       if (kind === 'send') {
         sendCoordinatedSettlement = e?.coordinatedSettlement || sendCoordinatedSettlement;
         // Freeze at the failure boundary, before draft recovery/renderer awaits.
@@ -12598,6 +12656,10 @@ function AgentHistoryControls({
                       return;
                     }
                   }
+                  if(e.key==='ArrowDown')requestFocusedHistoryBottomKey(e.nativeEvent || e,{
+                    workspace:useWorkspaceStore.getState(),ui:useUIStore.getState(),composerTabId:tabId,
+                    dispatchHistory:targetTabId=>window.dispatchEvent(new CustomEvent('history-panel:scroll-to-bottom',{detail:{tabId:targetTabId}})),
+                  });
                   if (isPlainTextPasteShortcut(e)) {
                     e.preventDefault();
                     e.stopPropagation();
@@ -13033,6 +13095,7 @@ function HistoryPanel({
   mainSurface = false,
   agentSidePanel = false,
   composerPortalHostId,
+  sideSurfaceToggleHosted = false,
   bottomInset = 0,
   compactComposer = false,
   onSwapPrimarySurface,
@@ -13645,13 +13708,16 @@ function HistoryPanel({
     ownerKey: string;
     results: Map<string, HistoryLiveToolResult>;
   }>({ ownerKey: historyOwnerKey, results: new Map() });
-  const durableSourceIdentitiesRef = useRef<Set<string>>(new Set(
-    (
-      (firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined)
-      || []
-    )
-      .flatMap((entry) => historyLivePresentationIdentities(entry)),
-  ));
+  // Seed this existing ref once. useRef(new Set(snapshot.flatMap(...))) also
+  // scanned every durable row on later renders, then discarded the result.
+  // Owner reset and committed reconciliation below remain its only writers.
+  const durableSourceIdentitiesRef = useRef<Set<string>>(null!);
+  if (durableSourceIdentitiesRef.current === null) {
+    durableSourceIdentitiesRef.current = new Set(
+      ((firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined) || [])
+        .flatMap((entry) => historyLivePresentationIdentities(entry)),
+    );
+  }
   const presentationEntriesRef = useRef(entries);
   presentationEntriesRef.current = entries;
   const historyPresentationApplyGuardRef = useRef<(reason: string) => void>(() => {});
@@ -14380,11 +14446,11 @@ function HistoryPanel({
   );
   const topChromeInset = mainSurface && enableClaudePtyControls && !previewMode ? HISTORY_TOP_CHROME_INSET : 0;
   const displayUnitLayoutKeys = useMemo(
-    // Chrome and optional MCP source headers change heights, not unit IDs.
+    // Chrome, source headers and friendly MCP names change heights, not IDs.
     // Keep cached geometry specific to the presentation; reading anchors
     // still restore through their normal semantic owner.
     () => displayUnits.map((unit) => (topChromeInset ? `chrome:${topChromeInset}|` : '')
-      + (historyMcpAsUser ? 'mcp-as-user|' : '') + historyMeasuredUnitKey(unit)),
+      + (historyMcpAsUser ? 'mcp-as-user|' : '') + 'mcp-display:v1|' + historyMeasuredUnitKey(unit)),
     [displayUnits, topChromeInset, historyMcpAsUser],
   );
   const displayUnitLayoutKeysRef = useRef(displayUnitLayoutKeys);
@@ -16159,6 +16225,7 @@ function HistoryPanel({
       statusChangedAt?: number;
       semanticTags?: FullHistoryEntry['semanticTags'];
       enterAttemptAt?: number;
+      historyReturn?: any;
       applicationQueueMerge?: QueuedMessageMergeGuard | null;
       applicationQueuePosition?: number;
       presentationHandoffId?: string;
@@ -16194,6 +16261,7 @@ function HistoryPanel({
       sessionId: resolvedSessionId,
       optimisticAt: submittedAt,
       enterAttemptAt: meta.enterAttemptAt,
+      historyReturn: meta.historyReturn,
       statusChangedAt,
       promptChips: normalizeComposerChips(meta.promptChips || [])
         .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
@@ -16277,6 +16345,7 @@ function HistoryPanel({
               statusReason: entry.statusReason,
               statusChangedAt,
               enterAttemptAt: entry.enterAttemptAt ?? candidate.enterAttemptAt,
+              historyReturn: entry.historyReturn ?? candidate.historyReturn,
               promptChips: entry.promptChips,
               imagePaths: entry.imagePaths,
               requiresAuditIdentity: entry.requiresAuditIdentity,
@@ -16490,110 +16559,92 @@ function HistoryPanel({
     } finally { queueMergeInflight.current.delete(handoffId); }
   }, [tabId]);
 
+  const returnPromptInflight = useRef(new Set<string>());
   const dismissPromptPresentation = useCallback(async (entry: FullHistoryEntry) => {
-    const handoffId = typeof entry.handoffId === 'string' ? entry.handoffId.trim() : '';
-    if (!handoffId || !isLocalPromptEntry(entry)) return;
-    try {
-      const planDismissal = (row: FullHistoryEntry, handoff: any) => planHistoryPromptPresentationDismissal({
-        isLocalPrompt: isLocalPromptEntry(row),
-        handoffId,
-        requiresAuditIdentity: row.requiresAuditIdentity ?? handoff?.requiresAuditIdentity,
-        sendOperationKey: handoff?.sendOperationKey,
-        sendAttemptId: handoff?.sendAttemptId,
-        queueStatus: row.queueStatus && handoff?.queueStatus && row.queueStatus !== handoff.queueStatus
-          ? 'delivery-unknown'
-          : handoff?.queueStatus ?? row.queueStatus,
-        statusReason: handoff?.statusReason ?? row.statusReason,
-        hasAcceptedProof: !!(handoff?.auditProof || handoff?.providerQueueProof
-          || row.auditEntryUuid || row.auditHash || row.auditTimestamp || row.sourceIdentity),
-      });
-      const currentHandoff = getHistoryPromptHandoffsSnapshot(tabId)
-        .find((handoff) => handoff.handoffId === handoffId);
-      if (currentHandoff?.queueStatus === 'application-queued'
-        || (currentHandoff?.applicationQueueId && !currentHandoff.sendAttemptId)) {
-        const cancelled = await ipcRenderer.invoke('agent:cancel-queued-send', { tabId, handoffId });
-        if (cancelled?.cancelled) {
-          consumeHistoryPromptHandoff(tabId, handoffId);
-          removeLocalPromptEntry(handoffId, 'application-queue-cancelled');
-          return;
+    const handoffId = entry.handoffId || '';
+    const handoff = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
+    if (isLocalPromptEntry(entry) && handoffId && historySendPresentationAction(entry).kind === 'dismiss') {
+      // A stale row must not hide a newer attempt. Dismissal
+      // never adopts its text, calls Return/Stop, or cancels another send.
+      if ((handoff && (handoff.queueStatus !== entry.queueStatus
+        || (entry.sendOperationKey && entry.sendOperationKey !== handoff.sendOperationKey)
+        || (entry.sendAttemptId && entry.sendAttemptId !== handoff.sendAttemptId)))
+        || returnPromptInflight.current.has(handoffId)) return;
+      const current = handoff || entry;
+      const unknown = current.queueStatus === 'delivery-unknown';
+      const plan = planHistoryPromptPresentationDismissal({ ...current, isLocalPrompt: true, handoffId });
+      if (!plan.allowed) return;
+      returnPromptInflight.current.add(handoffId);
+      try {
+        if (plan.mode !== 'local-only') {
+          const result = await ipcRenderer.invoke('agent:dismiss-send-receipt-presentation', {
+            tabId, handoffId, ...(unknown ? { unknownOnly: true } : { failedOnly: true }),
+            operationKey: current.sendOperationKey || undefined,
+            attemptId: current.sendAttemptId || null,
+          });
+          // A proved missing receipt is not a proved failed Send. Hide only
+          // its local presentation, retaining recovery bytes and UNKNOWN.
+          if (unknown && result?.receiptAbsent === true && result.success === false
+            && result.reason === 'receipt-not-found' && !current.sendOperationKey && !current.sendAttemptId) {
+            const latest = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
+            if (latest && (latest.queueStatus !== 'delivery-unknown' || latest.sendOperationKey || latest.sendAttemptId)) return;
+            dismissReceiptlessHistoryPromptPresentation(tabId, handoffId, current);
+            removeLocalPromptEntry(handoffId, 'unknown-local-presentation-dismissed');
+            return;
+          }
+          if (!result?.success || !result.dismissed) throw new Error(result?.reason || 'dismiss-unconfirmed');
         }
-        // Admission may have won the race. Do not hide a now-physical attempt
-        // as though cancelling the untouched application item had succeeded.
-        return;
-      }
-      const dismissalPlan = planDismissal(entry, currentHandoff);
-      if (dismissalPlan.mode === 'local-only') {
-        historyDiag('LOCAL_PRESENTATION_DISMISS tab=' + tabId.slice(-12)
-          + ' handoff=' + handoffId
-          + ' reason=' + dismissalPlan.reason);
+        const latest = getHistoryPromptHandoffsSnapshot(tabId).find(value => value.handoffId === handoffId);
+        if (latest && (latest.sendOperationKey !== current.sendOperationKey || latest.sendAttemptId !== current.sendAttemptId)) return;
         consumeHistoryPromptHandoff(tabId, handoffId);
-        removeLocalPromptEntry(handoffId, 'user-dismissed-' + dismissalPlan.reason);
-        return;
-      }
-      if (dismissalPlan.mode !== 'verify-local-failure'
-        && dismissalPlan.reason !== 'durable-no-attempt-presentation'
-        && currentHandoff && (!currentHandoff.sendOperationKey || !currentHandoff.sendAttemptId)) {
-        await waitForHistoryPromptHandoffSendIdentity(tabId, handoffId);
-      }
-      const result = await ipcRenderer.invoke('agent:dismiss-send-receipt-presentation', {
-        tabId,
-        handoffId,
-      });
-      historyDiag('DURABLE_PRESENTATION_DISMISS tab=' + tabId.slice(-12)
-        + ' handoff=' + handoffId
-        + ' success=' + (result?.success === true ? '1' : '0')
-        + ' dismissed=' + (result?.dismissed === true ? '1' : '0')
-        + ' reason=' + (result?.reason || '-'));
-      if (result?.reason === 'receipt-not-found' && dismissalPlan.mode === 'verify-local-failure') {
-        // Legacy failed rows did not distinguish a proved pre-Enter refusal
-        // from a generic transport failure. The user is hiding only this
-        // failed local presentation, not cancelling or reclassifying a send.
-        // Recheck after the read: a newer pending/accepted/durable identity
-        // must not be erased by the old click's late response.
-        const latestRow = presentationEntriesRef.current.find((row) =>
-          isLocalPromptEntry(row) && row.handoffId === handoffId);
-        const latestHandoff = getHistoryPromptHandoffsSnapshot(tabId)
-          .find((handoff) => handoff.handoffId === handoffId);
-        if (!latestRow) return;
-        if (planDismissal(latestRow, latestHandoff).mode === 'verify-local-failure') {
-          consumeHistoryPromptHandoff(tabId, handoffId);
-          removeLocalPromptEntry(handoffId, 'user-dismissed-failed-local-presentation-no-receipt');
-          return;
-        }
-      }
-      if (result?.success !== true || result?.dismissed !== true) {
-        const reason = String(result?.reason || 'presentation-dismiss-failed');
-        showHistoryIncidentToast(tabId, 'Не удалось скрыть карточку сообщения: ' + reason, {
-          headline: 'Не удалось скрыть карточку сообщения',
-          toolType,
-          action: 'dismiss-prompt-presentation',
-          handoffId,
-          sendAttemptId: currentHandoff?.sendAttemptId || null,
-          sendOperationKey: currentHandoff?.sendOperationKey || null,
-          statusAtSend: entry.queueStatus || null,
-          code: reason,
-        });
-        return;
-      }
-      consumeHistoryPromptHandoff(tabId, handoffId);
-      removeLocalPromptEntry(handoffId, 'user-dismissed-prompt-presentation');
-    } catch (error: any) {
-      console.warn('[HistoryPanel] durable presentation dismiss failed tab=' + tabId.slice(-12)
-        + ' handoff=' + handoffId
-        + ': ' + String(error?.message || error));
-      const failureHandoff = getHistoryPromptHandoffsSnapshot(tabId)
-        .find((handoff) => handoff.handoffId === handoffId);
-      showHistoryIncidentToast(tabId, error, {
-        headline: 'Не удалось скрыть карточку сообщения',
-        toolType,
-        action: 'dismiss-prompt-presentation',
-        handoffId,
-        sendAttemptId: failureHandoff?.sendAttemptId || null,
-        sendOperationKey: failureHandoff?.sendOperationKey || null,
-        statusAtSend: entry.queueStatus || null,
-        code: 'presentation-dismiss-exception',
-      });
+        removeLocalPromptEntry(handoffId, unknown ? 'unknown-presentation-dismissed' : 'failed-presentation-dismissed');
+      } catch (error: any) {
+        showHistoryIncidentToast(tabId, error, { headline: 'Не удалось скрыть карточку',
+          toolType, action: unknown ? 'dismiss-unknown-prompt' : 'dismiss-failed-prompt', handoffId, code: 'history-send-dismiss-unconfirmed' });
+      } finally { returnPromptInflight.current.delete(handoffId); }
+      return;
     }
+    if (!handoff || !historySendReturnEnabled({ ...entry, historyReturn: handoff.historyReturn })
+      || returnPromptInflight.current.has(handoffId)) return;
+    const identity = { tabId, handoffId, token: handoff.historyReturn.token, provider: handoff.toolType };
+    returnPromptInflight.current.add(handoffId);
+    try {
+      // Registration may still be crossing IPC when this very early click
+      // arrives. Same identity joins registration; it never submits a prompt.
+      const registered = await ipcRenderer.invoke('agent:register-history-send-return', identity);
+      if (!registered?.success) throw new Error(registered?.reason || 'return-owner-unavailable');
+      recordHistorySendReturnControl(registered.control);
+      const result = await ipcRenderer.invoke('agent:return-history-send', identity);
+      if (result?.control) recordHistorySendReturnControl(result.control);
+      if (!result?.success) throw new Error(result?.reason || 'return-unconfirmed');
+      if (!result.returned) {
+        useUIStore.getState().showToast('Ввод сообщения уже начался.', 'info');
+        return;
+      }
+      releaseReturnedHistoryPreparation(tabId, handoffId);
+      const authoring = result.authoringSnapshot;
+      if (!result.restored) useUIStore.getState().restoreHistorySendDraft({
+        ...identity, text: typeof authoring?.editorText === 'string' ? authoring.editorText : handoff.authoringText,
+        images: authoring?.imagePaths || handoff.authoringImagePaths, chips: authoring?.chips || handoff.authoringChips,
+      });
+      const acknowledged = await ipcRenderer.invoke('agent:ack-history-send-return', identity);
+      if (!acknowledged?.success) throw new Error(acknowledged?.reason || 'return-adoption-unconfirmed');
+      recordHistorySendReturnControl(acknowledged.control);
+      useUIStore.getState().acknowledgeHistorySendDraftReturn(tabId, identity.token);
+      removeHistorySendRecovery(tabId, handoffId);
+      consumeHistoryPromptHandoff(tabId, handoffId);
+      removeLocalPromptEntry(handoffId, 'returned-to-composer');
+    } catch (error: any) {
+      // Unknown return ACK cannot justify restoring a potentially sent message.
+      // A failed draft save/ACK keeps the card and its original asset owner.
+      if (isHistorySendReturnRestored(tabId, handoffId)) {
+        useUIStore.getState().acknowledgeHistorySendDraftReturn(tabId, identity.token);
+        removeLocalPromptEntry(handoffId, 'return-adopted-event-before-reply');
+        return;
+      }
+      showHistoryIncidentToast(tabId, error, { headline: 'Не удалось завершить возврат сообщения',
+        toolType, action: 'return-prompt-before-input', handoffId, code: 'history-send-return-unconfirmed' });
+    } finally { returnPromptInflight.current.delete(handoffId); }
   }, [removeLocalPromptEntry, tabId, toolType]);
 
   const acknowledgeMaterializedHistoryReceipt = useCallback(async (input: {
@@ -16894,6 +16945,7 @@ function HistoryPanel({
           submittedAt: record.submittedAt,
           statusChangedAt: record.statusChangedAt,
           enterAttemptAt: record.enterAttemptAt,
+          historyReturn: record.historyReturn,
           applicationQueueMerge: record.applicationQueueMerge,
           applicationQueuePosition: record.applicationQueuePosition,
           presentationHandoffId: record.applicationQueuePresentationHandoffId,
@@ -16914,6 +16966,7 @@ function HistoryPanel({
           submittedAt: record.submittedAt,
           statusChangedAt: record.statusChangedAt,
           enterAttemptAt: record.enterAttemptAt,
+          historyReturn: record.historyReturn,
           promptChips,
           imagePaths,
           semanticTags,
@@ -18875,6 +18928,7 @@ function HistoryPanel({
           optimisticAt: handoff.submittedAt,
           statusChangedAt: handoff.statusChangedAt,
           enterAttemptAt: handoff.enterAttemptAt,
+          historyReturn: handoff.historyReturn,
           promptChips: normalizeComposerChips(handoff.promptChips)
             .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
           imagePaths: retainHistoryDraftImages(cleanContent, handoff.imagePaths),
@@ -19149,10 +19203,8 @@ function HistoryPanel({
       presentedOwnerKey !== historyOwnerKey
       || historyOwnerKeyRef.current !== historyOwnerKey
     ) return;
-    durableSourceIdentitiesRef.current = new Set(
-      entries
-        .flatMap((entry) => historyLivePresentationIdentities(entry)),
-    );
+    // Reconciliation computes and publishes the same exact identity set
+    // synchronously, including when there are no live rows to retire.
     reconcileLiveProjectionAgainstDurable(entries, historyOwnerKey);
     const committed = entries.filter(entry => !isLocalPromptEntry(entry) && !entry.liveProjection);
     committedHistoryEntriesRef.current = { ownerKey: historyOwnerKey, entries: committed };
@@ -22514,7 +22566,9 @@ function HistoryPanel({
     // Since the composer is the column's last row, the physical scroller
     // bottom is the only bottom. There is no synthetic footer to subtract.
     const distFromBottom = historyContentDistanceFromBottom(el);
-    const physicalPinned = isHistoryAtContentBottom(el);
+    // These adjacent decisions use the same fresh geometry sample. Reusing
+    // its distance avoids a second scrollHeight/scrollTop/clientHeight read.
+    const physicalPinned = distFromBottom <= HISTORY_TAIL_PIN_THRESHOLD_PX;
     const recentGestureDirection = performance.now() - historyUserGestureAtRef.current <= 500
       ? historyUserScrollDirectionRef.current
       : null;
@@ -23051,6 +23105,7 @@ function HistoryPanel({
       // closed when their width is 0.
       inert={(embedded ? (!embeddedFill && !slideIn) : !isOpen) || staleOwnerCurtain}
       data-history-owner={historyOwnerDomId}
+      data-history-tab-id={tabId}
       data-history-session={sessionId || undefined}
       data-history-presented={presented ? '1' : '0'}
       data-history-presentation-visit={historyPresentationVisit}
@@ -23973,16 +24028,14 @@ function HistoryPanel({
             (общая настройка historyHorizontalPadding). Своё независимое число здесь уже
             один раз разъехалось: у кнопки был `centerRightInset + 12`, а у
             рамки — свои 16px, и кнопка встала на 4px правее линии. */}
-        {mainSurface && (
+        {mainSurface && !sideSurfaceToggleHosted && (
           <div
             data-history-side-surface-toggle
             style={{
               position: 'absolute',
-              // 1px над рамкой поля — «буквально в расстоянии одного пикселя».
-              // Поле теперь обычная нижняя строка колонки, поэтому низ этой
-              // области = верхняя граница рамки; вычитать её высоту не нужно.
-              bottom: 1,
-              right: centerRightInset + historyHorizontalPadding,
+              // Same6px as Model/Effort/Fast, above the input's top border.
+              bottom: RIGHT_CLUSTER_INNER_GAP_PX,
+              right: historyHorizontalPadding,
               zIndex: 10,
             }}
           >
@@ -24009,7 +24062,7 @@ function HistoryPanel({
           style={{
             display: 'none',
             position: 'absolute',
-            bottom: mainSurface ? 1 : 12,
+            bottom: mainSurface ? RIGHT_CLUSTER_INNER_GAP_PX : 12,
             right: mainSurface
               ? centerRightInset + historyHorizontalPadding + HISTORY_FLOATING_CONTROL_SIZE_PX + HISTORY_FLOATING_CONTROL_GAP_PX
               : 12,

@@ -174,6 +174,43 @@ class ScExternalResearchClient {
     return metadata;
   }
 
+  async operationalRecheck(jobId, { checkId, controlEpoch, browserInstanceId, capabilities, signal } = {}) {
+    try { return await this._operationalRecheck(jobId, { checkId, controlEpoch, browserInstanceId, capabilities, signal }); }
+    catch (error) {
+      // A failed read-only probe is never an authoritative provider verdict.
+      // Preserve the typed HTTP/correlation error for same-intent recovery.
+      error.operationalCheckOnly = true;
+      throw error;
+    }
+  }
+
+  async _operationalRecheck(jobId, { checkId, controlEpoch, browserInstanceId, capabilities, signal }) {
+    if (typeof checkId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9:._-]{0,159}$/.test(checkId)
+      || typeof controlEpoch !== 'string' || !controlEpoch || typeof browserInstanceId !== 'string' || !browserInstanceId) {
+      throw new ScExternalResearchHttpError('Exact operational check identity is required', { code: 'sc_research_check_identity_invalid', status: 400 });
+    }
+    const supported = capabilities || await this.capabilities({ signal });
+    const feature = supported?.execution?.operationalRecheck;
+    if (feature?.version !== 1 || feature.observational !== true || feature.durableReceipt !== true
+      || feature.endpoint !== '/research-recheck') throw new ScExternalResearchHttpError('Update SC Desktop for a correlated operational check', {
+      code: 'sc_research_operational_recheck_unavailable', status: 503 });
+    // Separate bounded observational RPC, not a new Send preparation deadline.
+    // It covers at most two existing 8-second worker/reader checks plus I/O.
+    const result = await this._request(`${this.baseUrl}/research-recheck`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
+      body: JSON.stringify({ version: 1, jobId, checkId, controlEpoch, browserInstanceId }),
+    }, 20_000 + this.statusOverheadMs);
+    const check = result?.check;
+    if (result?.ok !== true || check?.version !== 1 || check.state !== 'complete' || check.checkId !== checkId
+      || check.jobId !== jobId || check.controlEpoch !== controlEpoch || check.browserInstanceId !== browserInstanceId
+      || !Number.isFinite(check.startedAt) || !Number.isFinite(check.completedAt)
+      || !['open', 'healthy', 'settled', 'changed', 'unconfirmed'].includes(check.verdict)
+      || result.execution?.version !== 1 || result.execution.controlEpoch !== controlEpoch
+      || typeof result.current !== 'boolean') throw new ScExternalResearchHttpError('SC did not certify the exact completed operational check', {
+      code: 'sc_research_operational_check_unproven', status: 503 });
+    return result;
+  }
+
   async stop(jobId, { signal } = {}) {
     return this._request(`${this.baseUrl}/research-stop`, {
       method: 'POST',

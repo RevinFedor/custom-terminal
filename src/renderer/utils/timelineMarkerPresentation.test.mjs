@@ -6,6 +6,7 @@ import {
   isTimelineGroupExpanded,
   timelineMarkerGeometry,
   timelineMarkerKind,
+  timelineAutomaticGroupKind,
 } from './timelineMarkerPresentation.mjs';
 import { projectTimelineSentHandoff, mergeTimelineEntriesWithSentHandoffs } from './timelineTranscriptRefresh.mjs';
 
@@ -21,11 +22,27 @@ test('SC channel comes only from an exact external research tag, not its model o
   const tag = { kind: 'orchestration', runId: 'run', runKind: 'external-research', phase: 'completion' };
   for (const targetTabName of ['ChatGPT - 6-astra', 'Another model', undefined]) {
     assert.equal(timelineMarkerKind({ semanticTags: [{ ...tag, targetTabName }] }), 'sc-desktop');
+    assert.equal(timelineAutomaticGroupKind({ semanticTags: [{ ...tag, targetTabName }] }), null);
   }
   assert.equal(timelineMarkerKind({ content: 'SC Desktop ChatGPT - 6-astra' }), 'ordinary');
   assert.equal(timelineMarkerKind({ semanticTags: [{ ...tag, runKind: 'agent' }] }), 'terminal-mcp');
   assert.equal(timelineMarkerKind({ semanticTags: [{ ...tag, runId: '' }] }), 'terminal-mcp');
   assert.equal(timelineMarkerKind({ semanticTags: [{ kind: 'prompt-origin', source: 'terminal-mcp' }] }), 'terminal-mcp');
+});
+
+test('automatic group membership keeps addressed/native MCP and built-in agents, not model-name guesses or ordinary rows', () => {
+  const addressed = { kind: 'tab-message', messageId: 'm', phase: 'reply', sourceTabId: 'B', targetTabId: 'A' };
+  for (const tag of [addressed, { ...addressed, phase: 'question' },
+    { kind: 'prompt-origin', source: 'terminal-mcp' }, { kind: 'orchestration', runId: 'r', runKind: 'agent' }]) {
+    assert.equal(timelineAutomaticGroupKind({ semanticTags: [tag], content: 'SC Desktop 6-astra' }), 'orchestration');
+  }
+  assert.equal(timelineAutomaticGroupKind({ isSubAgent: true }), 'subagent');
+  assert.equal(timelineAutomaticGroupKind({ isSubAgentTimeout: true }), 'subagent');
+  for (const entry of [null, {}, { content: 'SC Desktop external-research' },
+    { semanticTags: [{ kind: 'prompt-origin', source: 'loop' }] },
+    { semanticTags: [{ kind: 'prompt-origin', source: 'system', systemSource: 'codex-capacity-retry' }] }]) {
+    assert.equal(timelineAutomaticGroupKind(entry), null);
+  }
 });
 
 test('exact confirmed SC handoff retains its channel before canonical adoption without a duplicate', () => {
@@ -35,6 +52,7 @@ test('exact confirmed SC handoff retains its channel before canonical adoption w
     auditProof: { sessionId: 's', entryUuid: 'canonical', sourceIdentity: 'source', auditTimestamp: '2026-10-07T04:00:00.000Z' } };
   const point = projectTimelineSentHandoff(handoff, { toolType: 'codex', sessionId: 's' });
   assert.equal(timelineMarkerKind(point), 'sc-desktop');
+  assert.equal(timelineAutomaticGroupKind(point), null);
   assert.equal(point.semanticTags[0].targetTabName, tag.targetTabName);
   for (const queueStatus of ['queued', 'audit-pending', 'delivery-unknown']) {
     assert.equal(projectTimelineSentHandoff({ ...handoff, queueStatus }, { toolType: 'codex', sessionId: 's' }), null);
@@ -43,6 +61,7 @@ test('exact confirmed SC handoff retains its channel before canonical adoption w
   const merged = mergeTimelineEntriesWithSentHandoffs([canonical], [point]);
   assert.equal(merged.length, 1);
   assert.equal(timelineMarkerKind(merged[0]), 'sc-desktop');
+  assert.equal(timelineAutomaticGroupKind(merged[0]), null);
 });
 
 test('collapsed orchestration group aggregates unique docs activity from every call', () => {

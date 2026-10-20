@@ -44,6 +44,42 @@ test('status uses a bounded long-poll and exposes typed 404', async () => {
   assert.match(requestedUrl, /wait=60000$/);
 })
 
+test('operational recheck uses one exact observational request and rejects uncorrelated or unsupported receipts', async () => {
+  const options = { checkId: 'after-maintenance:1', controlEpoch: 'epoch', browserInstanceId: 'browser' };
+  const capability = { execution: { operationalRecheck: { version: 1, endpoint: '/research-recheck', observational: true, durableReceipt: true } } };
+  const ack = { ok: true, current: true, execution: { version: 1, controlEpoch: 'epoch' }, check: {
+    version: 1, state: 'complete', jobId: 'job', ...options, startedAt: 10, completedAt: 11, verdict: 'open' } };
+  const calls = [];
+  const client = new ScExternalResearchClient({ fetchImpl: async (url, init = {}) => {
+    calls.push({ url, body: init.body ? JSON.parse(init.body) : null });
+    return response(200, url.endsWith('/research-capabilities') ? capability : ack);
+  } });
+  assert.deepEqual(await client.operationalRecheck('job', options), ack);
+  assert.deepEqual(calls[1].body, { version: 1, jobId: 'job', ...options });
+  assert.ok(calls.every(c => !/research-start|research-stop|open-url/.test(c.url)));
+  for (const broken of [{ ...ack, check: { ...ack.check, checkId: 'other' } },
+    { ...ack, check: { ...ack.check, controlEpoch: 'other' } }, { ...ack, current: undefined },
+    { ...ack, check: { ...ack.check, state: 'started' } }]) {
+    const invalid = new ScExternalResearchClient({ fetchImpl: async () => response(200, broken) });
+    await assert.rejects(invalid.operationalRecheck('job', { ...options, capabilities: capability }),
+      e => e.code === 'sc_research_operational_check_unproven');
+  }
+  let checks = 0;
+  const old = new ScExternalResearchClient({ fetchImpl: async () => { checks++; return response(200, {}); } });
+  await assert.rejects(old.operationalRecheck('job', options), e => e.code === 'sc_research_operational_recheck_unavailable');
+  assert.equal(checks, 1);
+});
+test('observational check 400/409/503 failures never become a terminal provider outcome', async () => {
+  const { isAuthoritativeClientFailure } = require('./external-research-coordinator');
+  const capabilities = { execution: { operationalRecheck: { version: 1, endpoint: '/research-recheck', observational: true, durableReceipt: true } } };
+  for (const status of [400, 409, 503]) {
+    const client = new ScExternalResearchClient({ fetchImpl: async () => response(status, { code: 'research_control_epoch_stale', error: 'controlled read refusal' }) });
+    await assert.rejects(client.operationalRecheck('job', { checkId: 'same-check', controlEpoch: 'old-epoch', browserInstanceId: 'browser', capabilities }),
+      error => error.operationalCheckOnly === true && error.status === status && isAuthoritativeClientFailure(error) === false);
+  }
+  assert.equal(isAuthoritativeClientFailure({ status: 400, code: 'invalid_prompt' }), true);
+});
+
 test('files must be absolute but line ranges stay as descriptors', () => {
   assert.deepEqual(normalizeExternalResearchFiles(['/tmp/a.md']), [{ path: '/tmp/a.md' }]);
   assert.throws(() => normalizeExternalResearchFiles(['relative.md']), /must be absolute/);

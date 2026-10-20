@@ -1184,6 +1184,7 @@ function TerminalArea({
                 left pane landed over the right one). Empty box, no hit-testing:
                 the toast itself re-enables pointer events. */}
             <div
+              id={`terminal-toast-anchor:${tab.id}`}
               data-toast-anchor-tab-id={tab.id}
               style={{
                 position: 'absolute',

@@ -15,7 +15,7 @@ test('split header is keyed by workflow pane and lives outside per-tab wrappers'
   );
   assert.doesNotMatch(tabWrapper, /<SplitPaneAttachRow/);
   assert.doesNotMatch(tabWrapper, /<SplitPaneFocusFrame/);
-  assert.match(area, /const ownerKey = `\${layout\.id}:\${paneIndex}`/);
+  assert.match(area, /const ownerKey = `\${layout\.id}:\${pane\.windowId \|\| paneIndex}`/);
   assert.match(area, /key={`pane:chrome:\${ownerKey}`}/);
   assert.match(area, /data-terminal-pane-chrome-host=\{ownerKey\}/);
   assert.match(area, /<SplitPaneAttachRow[\s\S]{0,220}tabId=\{pane\.tabId\}/);

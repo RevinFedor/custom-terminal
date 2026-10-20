@@ -424,6 +424,15 @@ grep -E "Shutdown:before-quit\] EARLY-MARK|Shutdown:will-quit\] cleared|AutoResu
 
 ## `process_lookup_unknown` во время большого startup restore (fix 2026-08-24)
 
+19.10 shutdown-only repair: перед первым await замораживаются все PTY targets и
+их owners, один fresh global process snapshot обслуживает весь этот inventory.
+После await и при последующем consume каждого target проверяется его прежний
+owner. `unknown` сохраняет точный seed и не становится absent; смена snapshot не
+даёт права kill. Обычные runtime lookup/Stop guards независимы, негативного общего
+кэша нет. Инцидент43failed lookups воспроизвёл107.5s; новый production quit с147PTY
+дал1snapshot/50.7ms и штатный will-quit, без повышения timeout или урезания targets.
+Это исправляет долгий выход; причины лагов до закрытия исследуются отдельно.
+
 Production-инцидент `tab-3951`, 13:01:26 МСК не означал, что в PTY уже жил
 другой Codex. Первый AutoResume admission запросил системный снимок процессов,
 но `ps -eo ...` завершился ошибкой через 2875мс. В том же пятиминутном агрегате

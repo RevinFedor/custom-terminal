@@ -8,6 +8,9 @@ const http = require('node:http');
 const url = require('node:url');
 const zlib = require('node:zlib');
 const ts = require('typescript');
+const { performance: readPerformance } = require('node:perf_hooks');
+const { createHttpReadDiagnostics } = require('./http-read-diagnostics');
+const { handleStorageMaintenance } = require('./storage-maintenance-api');
 const { createAgentParamsOperations, paramsOperationId } = require('./agent-params-operations');
 const { createAgentContextUsageState } = require('./agent-context-usage-state');
 const { createClaudeThinkingProofStore } = require('./claude-thinking-proof');
@@ -77,7 +80,7 @@ function mainFixture(database = memoryDb()) {
     claude_session_id: state.provider === 'claude' ? 'S' + state.version : null,
     codex_session_id: state.provider === 'codex' ? 'S' + state.version : null });
   if (!database.fixtureSqlite) database.db.prepare = sql => {
-    assert.match(sql, /SELECT tab_type, command_type, project_id, cwd, claude_session_id, codex_session_id/);
+    assert.match(sql, /SELECT tab_type, command_type, COALESCE\(project_id,execution_namespace\) AS project_id, cwd, claude_session_id, codex_session_id/);
     return { get: tabId => tabId === 'T' ? row() : undefined };
   };
   database.getTabCodexSettingsState = () => ({ model: 'saved-codex', effort: 'high' });
@@ -111,8 +114,8 @@ function mainFixture(database = memoryDb()) {
     bridgeKnownSessions.set('T', 'S' + state.version);
     if (database.fixtureSqlite) {
       const value = row();
-      database.db.prepare('INSERT OR REPLACE INTO tabs VALUES (?,?,?,?,?,?,?)')
-        .run('T', value.tab_type, value.command_type, value.project_id, value.cwd, value.claude_session_id, value.codex_session_id);
+      database.db.prepare('INSERT OR REPLACE INTO tabs VALUES (?,?,?,?,?,?,?,?)')
+        .run('T', value.tab_type, value.command_type, value.project_id, null, value.cwd, value.claude_session_id, value.codex_session_id);
     }
     thinkingProofs.confirm(thinkingScope(), state.version % 2 === 1);
     publishContext(); paint();
@@ -230,7 +233,23 @@ async function httpFixture(t, h, options = {}) {
   const bridgeCalls = [], dropped = [];
   const bindings = startCallbacks({ readAgentParams: tabId => h.reader.read(tabId), agentParamsService: h.service });
   const deps = { ...bindings, token: 'params-fixture-bearer', url, Buffer, zlib, GZIP_THRESHOLD: 4096,
-    require: name => { assert.equal(name, './project-manager'); return {}; },
+    httpReadDiagnostics: createHttpReadDiagnostics({ serviceId: 'params-fixture', enabled: false, log() {} }),
+    readPerformance, handleStorageMaintenance, storageMaintenance: null,
+    handleDictationClipboardHttp: async () => false,
+    workflowOrganizationHttp: async () => false,
+    handleSystemPromptApi: async () => false, systemPromptService: null,
+    require: name => {
+      if (name === './project-manager') return {};
+      assert.equal(name, './external-research-browser'); return require(name);
+    },
+    WORKSPACE_SWITCHER_CAPABILITY: require('./workspace-switcher-api').WORKSPACE_SWITCHER_CAPABILITY,
+    RUN_AFTER_CAPABILITY: require('../shared/run-after-api.cjs').RUN_AFTER_CAPABILITY,
+    getRunAfterApi: () => ({ journal: { epoch: 'params-fixture-main' } }),
+    completionNotificationCapability: require('./tab-completion-notification-api').completionNotificationCapability,
+    projectCardSignals: null, publicTabActivity: null, captureTabInspection: null, readTabInspectionResponse: null,
+    publicHistoryFreshness: null, userNotificationOutbox: null, sendIntentCancellationAvailable: () => false,
+    agentSendQueue: null, savedPromptService: null, transcriptService: null, codexGoalActions: null,
+    agentSendReceiptStore: null, getAgentResponseState: null,
     decId: decodeURIComponent,
     bridgeRequest: async (action, payload) => {
       bridgeCalls.push({ action, payload });
@@ -274,6 +293,7 @@ test('actual authenticated HTTP route + main service keeps one operation after l
   const h = mainFixture(), http = await httpFixture(t, h);
   const payload = { requestId: 'lost-reply', model: 'requested', effort: 'max' };
   await assert.rejects(http.request('POST', undefined, payload, { 'x-fixture-drop-response': '1' }));
+  assert.equal(http.dropped[0].status, 202, JSON.stringify(http.dropped[0]));
   const execute = await h.started;
   assert.equal(http.dropped[0].status, 202);
   const operationId = paramsOperationId('T', payload.requestId);
@@ -303,7 +323,7 @@ test('actual auth/capability boundary rejects unauthorized reads and writes befo
   }
   assert.equal(h.state.runtimeCalls, 0); assert.equal(h.state.captureCalls, 0); assert.equal(h.state.settingsCalls, 0);
   const me = await http.request('GET', '/api/me');
-  assert.equal(me.status, 200);
+  assert.equal(me.status, 200, JSON.stringify(me.body));
   assert.deepEqual(me.body.capabilities.agentParams.providers, ['codex', 'claude']);
   assert.deepEqual(me.body.capabilities.agentParams.operationProviders, ['claude']);
   assert.equal(me.body.capabilities.agentParams.requestId, 'client-stable');
@@ -467,7 +487,7 @@ test('actual HTTP receipt uses real SQLite app-state ABI, survives service recon
   }
   t.after(() => sqlite.close());
   sqlite.exec('CREATE TABLE app_state(key TEXT PRIMARY KEY,value TEXT,updated_at INTEGER);'
-    + 'CREATE TABLE tabs(tab_id TEXT PRIMARY KEY,tab_type TEXT,command_type TEXT,project_id TEXT,cwd TEXT,claude_session_id TEXT,codex_session_id TEXT);');
+    + 'CREATE TABLE tabs(tab_id TEXT PRIMARY KEY,tab_type TEXT,command_type TEXT,project_id TEXT,execution_namespace TEXT,cwd TEXT,claude_session_id TEXT,codex_session_id TEXT);');
   const manager = Object.create(require('./database').prototype); manager.db = sqlite; manager.fixtureSqlite = true;
   const h = mainFixture(manager), http = await httpFixture(t, h);
   const payload = { requestId: 'sqlite-id', model: 'requested' };

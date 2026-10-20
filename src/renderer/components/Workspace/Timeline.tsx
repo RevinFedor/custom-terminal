@@ -101,6 +101,7 @@ import {
   collectTimelinePromptLabels,
   isTimelineGroupExpanded,
   timelineMarkerKind,
+  timelineAutomaticGroupKind,
   timelineMarkerGeometry,
 } from '../../utils/timelineMarkerPresentation.mjs';
 import { mapTimelinePromptBoundaries } from '../../utils/timelinePromptBoundaryMap.mjs';
@@ -760,7 +761,8 @@ function getOrchestrationTag(entry: TimelineEntry) {
 
 // Build grouping map for consecutive built-in sub-agent or durable Terminal MCP
 // turns. The structural sidecar tag is the only orchestration classifier; text
-// such as "[Оркестрация]" is intentionally ignored.
+// such as "[Оркестрация]" is intentionally ignored. External Research keeps
+// its own original SC point and is a boundary, not a child of an MCP group.
 function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
   const groups = new Map<number, GroupInfo>();
   let i = 0;
@@ -768,11 +770,7 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
 
   while (i < entries.length) {
     const entry = entries[i];
-    const groupKind = getOrchestrationTag(entry)
-      ? 'orchestration'
-      : (entry.isSubAgent || entry.isSubAgentTimeout)
-        ? 'subagent'
-        : null;
+    const groupKind = timelineAutomaticGroupKind(entry);
     if (!groupKind) {
       i++;
       continue;
@@ -784,11 +782,7 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
     // Keep provider-internal agents and durable Terminal MCP calls as separate
     // visual groups even when they happen next to each other.
     while (j < entries.length) {
-      const candidateKind = getOrchestrationTag(entries[j])
-        ? 'orchestration'
-        : (entries[j].isSubAgent || entries[j].isSubAgentTimeout)
-          ? 'subagent'
-          : null;
+      const candidateKind = timelineAutomaticGroupKind(entries[j]);
       if (candidateKind !== groupKind) break;
       j++;
     }

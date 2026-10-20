@@ -211,6 +211,23 @@ test('failure accepts absent result and does not fabricate error details', () =>
   assert.match(body(content), /Подробности ошибки не предоставлены/);
 });
 
+test('failed browser consultation routes recovery to its owner and never authorizes a new Chat or dependent implementation', () => {
+  const failed = build(run({ runKind: 'external-research', status: 'failed', externalResearchJobId: 'job-exact' }),
+    { success: false, error: 'chatgpt_mode_select_failed' });
+  assert.equal(failed.mode, 'failure'); assert.equal(failed.metadata.jobId, 'job-exact');
+  assert.match(failed.prompt, /не заключение эксперта/);
+  assert.match(failed.prompt, /send_message и жди/);
+  assert.match(failed.prompt, /Не обходи сбой новым Chat/);
+  assert.match(failed.prompt, /Зависимый продуктовый ремонт до полного ответа не начинай/);
+  const success = build(run({ runKind: 'external-research' }), result());
+  assert.equal(body(success), 'Full exact answer.');
+  assert.doesNotMatch(success.prompt, /send_message и жди/);
+  const cancelled = build(run({ runKind: 'external-research', status: 'cancelled' }), null);
+  assert.doesNotMatch(cancelled.prompt, /send_message и жди/, 'user cancellation is not a recovery-owner wake');
+  const agentFailure = build(run({ status: 'failed', runKind: 'agent' }), null);
+  assert.doesNotMatch(agentFailure.prompt, /владельцу SC/);
+});
+
 test('defensive checks reject nonterminal, wrong-run and explicitly unverified results', () => {
   assert.throws(() => build(run({ status: 'running' }), result()), { code: 'orchestration_completion_not_terminal' });
   assert.throws(() => build(run(), result({ runId: 'different' })), { code: 'orchestration_completion_identity_conflict' });

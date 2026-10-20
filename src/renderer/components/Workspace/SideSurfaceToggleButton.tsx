@@ -2,6 +2,23 @@ import React from 'react';
 import { Bot, SquareTerminal } from 'lucide-react';
 import { useUIStore, resolveTabTerminalPrimary } from '../../store/useUIStore';
 import ControlHint from '../UI/ControlHint';
+import {useWorkspaceStore} from '../../store/useWorkspaceStore';
+import {RIGHT_CLUSTER_INNER_GAP_PX} from '../../utils/controlBarWrap.mjs';
+
+/** The existing stationary queue/composer host stays above the side terminal.
+ * A scalar presentation guard also quarantines retained hidden owners. */
+export function StationaryHistorySurfaceToggle({tabId}: {tabId:string}) {
+  const presented=useWorkspaceStore(state=>state.view==='workspace'&&(state.splitPanes.length
+    ?state.splitPanes.some(pane=>!pane.displayHidden&&pane.tabId===tabId)
+    :state.getEffectiveTabId()===tabId));
+  const padding=useUIStore(state=>state.historyHorizontalPadding);
+  if(!presented)return null;
+  return <div data-history-side-surface-toggle data-history-side-surface-stationary
+    style={{position:'absolute',bottom:RIGHT_CLUSTER_INNER_GAP_PX,right:padding,zIndex:10,pointerEvents:'auto'}}
+    onMouseDown={event=>event.stopPropagation()}>
+    <SideSurfaceToggleButton tabId={tabId} size={28}/>
+  </div>;
+}
 
 /**
  * «Выдвинуть/скрыть вторую поверхность» — рядом со стрелкой вниз, над полем

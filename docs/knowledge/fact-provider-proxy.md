@@ -223,6 +223,12 @@ Port fallback имеет собственную гонку: неуспешный
 Полный ownership и migration-gate описаны в
 [`fact-живой-ответ-в-history.md`](fact-живой-ответ-в-history.md).
 
+Для Inspector Codex child тот же request observer сохраняет только scalar
+`service_tier` с exact child/thread/turn и Main parent source/run proof.
+Это отдельная read-only metadata, не main History prose и не tier родителя;
+wire forwarding и lifecycle не меняются. HTTP/SSE и WS, bounds/сброс/предел
+исторического восстановления — `fact-codex.md::In-process субагенты`.
+
 ## Graceful Shutdown
 При `before-quit` proxy drain'ит активные соединения (до 15s). Без этого crash mid-stream → assistant response не записывается в JSONL → chain break в backtrace. См. [`fact-backtrace-jsonl.md`](fact-backtrace-jsonl.md) секция 2.2 (Generic Chain Break Recovery).
 

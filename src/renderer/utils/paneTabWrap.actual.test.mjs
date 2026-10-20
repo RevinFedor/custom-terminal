@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import { buildSync } from 'esbuild';
 
 const { outputFiles } = buildSync({
-  entryPoints: [new URL('./paneTabDragBridge.ts', import.meta.url).pathname],
+  entryPoints: [process.env.NOTED_PANE_WRAP_TEST_SOURCE || new URL('./paneTabDragBridge.ts', import.meta.url).pathname],
   bundle: true, platform: 'node', format: 'cjs', write: false, external: ['react'],
 });
 const module = { exports: {} };
@@ -13,7 +13,9 @@ vm.runInNewContext(outputFiles[0].text, {
   require: name => { assert.equal(name, 'react'); return { useSyncExternalStore() {} }; },
 });
 const { resolvePaneTabDropTarget: resolve, beginPaneTabDrag: begin,
-  endPaneTabDrag: end, setPaneTabDragTarget: setTarget, claimPaneTabDragDrop: claim } = module.exports;
+  endPaneTabDrag: end, setPaneTabDragTarget: setTarget, claimPaneTabDragDrop: claim,
+  observePaneTabStrip: observe, forgetPaneTabStrip: forget } = module.exports;
+const {getPaneTabDragSnapshot:getSnapshot}=module.exports;
 
 function strip({ paneKey = 'pane:0', spaceId = 'a', oldWrapValue = 'false' } = {}) {
   let writes = 0, reads = 0;
@@ -79,4 +81,116 @@ test('other windows and workflows have independent row geometry; release commits
   assert.deepEqual([a.reads(), b.reads(), c.reads()], [1, 1, 1]);
   end();
   assert.equal(claim('d'), null);
+});
+
+function unequalStrip() {
+  const f = strip();
+  f.chips.splice(0, f.chips.length,
+    { id: 'guide', left: 10, right: 110, top: 10, bottom: 36 },
+    { id: 'usage', left: 116, right: 366, top: 10, bottom: 36 });
+  return f;
+}
+const usageSource = { ...source, rootTabId: 'usage', entries: [{ projectId: 'p', tabId: 'usage' }] };
+const paneSurface = (ids, extra = {}) => ({ workflowId: 'a', windowId: 'w', paneKey: 'pane:0',
+  baseEntries: ['guide', 'usage'].map(tabId => ({ projectId: 'p', tabId })),
+  entries: ids.map(tabId => ({ projectId: 'p', tabId })), ...extra });
+function showUsageFirst(f) {
+  f.chips.splice(0, f.chips.length,
+    { id: 'usage', left: 10, right: 260, top: 10, bottom: 36 },
+    { id: 'guide', left: 266, right: 366, top: 10, bottom: 36 });
+}
+
+test('unequal chips reverse against the committed preview, with one read per shown order', () => {
+  begin(usageSource);
+  const f = unequalStrip(), owner = {};
+  observe(owner, paneSurface(['guide', 'usage']));
+  assert.equal(resolve(f.el, 240, ['usage'], 20).at, 1);
+  setTarget(resolve(f.el, 40, ['usage'], 20));
+  showUsageFirst(f);
+  observe(owner, paneSurface(['usage', 'guide']));
+  // x=160 is right of the OLD guide midpoint60, but left of its SHOWN midpoint316.
+  assert.equal(resolve(f.el, 160, ['usage'], 20).at, 0);
+  for (let i = 0; i < 20; i++) {
+    observe(owner, paneSurface(['usage', 'guide']));
+    assert.equal(resolve(f.el, 160, ['usage'], 20).at, 0);
+  }
+  assert.equal(f.reads(), 2, 'unrelated renders/pointer samples do not remeasure chips');
+  assert.equal(resolve(f.el, 316, ['usage'], 20).at, 1);
+  assert.equal(f.reads(), 2);
+  forget(owner); end();
+});
+
+test('a requested preview does not advance geometry before its layout receipt', () => {
+  begin(usageSource);
+  const f = unequalStrip(), owner = {};
+  observe(owner, paneSurface(['guide', 'usage']));
+  setTarget(resolve(f.el, 40, ['usage'], 20));
+  assert.equal(resolve(f.el, 160, ['usage'], 20).at, 1);
+  assert.equal(f.reads(), 1);
+  showUsageFirst(f);
+  observe(owner, paneSurface(['usage', 'guide']));
+  assert.equal(resolve(f.el, 160, ['usage'], 20).at, 0);
+  forget(owner); end();
+});
+
+test('retained strips of another workflow cannot expire the visible strip geometry', () => {
+  begin(usageSource);
+  const f = unequalStrip(), owner = {}, dormant = {};
+  observe(owner, paneSurface(['guide', 'usage']));
+  setTarget(resolve(f.el, 40, ['usage'], 20));
+  showUsageFirst(f);
+  observe(dormant, paneSurface(['usage', 'guide'], { workflowId: 'other' }));
+  assert.equal(resolve(f.el, 160, ['usage'], 20).at, 1);
+  assert.equal(f.reads(), 1);
+  observe(owner, paneSurface(['usage', 'guide']));
+  assert.equal(resolve(f.el, 160, ['usage'], 20).at, 0);
+  forget(dormant); forget(owner); end();
+});
+
+test('leaving and returning to a strip uses its restored base layout', () => {
+  begin(usageSource);
+  const f = unequalStrip(), owner = {};
+  observe(owner, paneSurface(['guide', 'usage']));
+  setTarget(resolve(f.el, 40, ['usage'], 20));
+  showUsageFirst(f);
+  observe(owner, paneSurface(['usage', 'guide']));
+  assert.equal(resolve(f.el, 160, ['usage'], 20).at, 0);
+  setTarget(null);
+  const original = unequalStrip().chips;
+  f.chips.splice(0, f.chips.length, ...original);
+  observe(owner, paneSurface(['guide', 'usage']));
+  assert.equal(resolve(f.el, 160, ['usage'], 20).at, 1);
+  forget(owner); end();
+});
+
+test('group preview clamps vertical/horizontal strip targets and own body to its boundaries', () => {
+  const grouped={...source,groupDrag:{boundary:{kind:'group',start:1,end:3},isCurrent:()=>true}};
+  begin(grouped);
+  for(const at of [-9,0,1,2,3,4,99]) {
+    setTarget({zone:'strip',paneKey:'pane:0',paneIndex:0,spaceId:'a',at});
+    assert.equal(getSnapshot().target.at,Math.max(1,Math.min(3,at)));
+  }
+  setTarget({zone:'body',paneKey:'pane:0',paneIndex:0,spaceId:'a',at:Infinity});
+  assert.equal(getSnapshot().target.at,3);
+  assert.equal(claim('d').target.at,3);
+  end();
+});
+
+test('a locked group member never previews or claims another window/workflow', () => {
+  begin({...source,groupDrag:{boundary:{kind:'group',start:1,end:3},isCurrent:()=>true}});
+  for(const target of [
+    {zone:'strip',paneKey:'pane:1',paneIndex:1,spaceId:'a',at:0},
+    {zone:'body',paneKey:'pane:0',paneIndex:0,spaceId:'other',at:Infinity},
+  ]) {setTarget(target);assert.equal(getSnapshot().target,null);assert.equal(claim('d'),null);}
+  end();
+});
+
+test('stale group ownership refuses drop without another target or writer grant', () => {
+  let current=true;
+  begin({...source,groupDrag:{boundary:{kind:'group',start:1,end:3},isCurrent:()=>current}});
+  setTarget({zone:'strip',paneKey:'pane:0',paneIndex:0,spaceId:'a',at:2});
+  current=false;
+  assert.equal(claim('d'),null);end();
+  begin({...source,groupDrag:{boundary:{kind:'blocked',reason:'mixed'},isCurrent:()=>true}});
+  assert.equal(getSnapshot().active,false);
 });

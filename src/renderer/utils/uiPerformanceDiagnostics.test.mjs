@@ -270,6 +270,20 @@ test('late durable reply joins the original gesture after a following ordinary c
   assert.equal(h.d.drag.actionId('gesture-A'),h.a.id,'the existing Main causal envelope gets the old action, not current click');
 });
 
+test('released strip presentation stays correlated after physical release and a new click',()=>{
+  const h=dragHarness();h.d.drag.event('threshold',{gestureId:'gesture-A'});
+  h.d.drag.event('physical-end',{gestureId:'gesture-A',reason:'release'});
+  h.advance(1000);const click=h.d.capture('click',h.time(),{tab:'other'}),wakes=h.wakes();
+  for(const name of ['presentation-held','presentation-end'])h.d.drag.event(name,{
+    gestureId:'gesture-A',mutationId:'workflow-drag:gesture-A',reason:'canonical-react-layout',text:'PRIVATE'});
+  h.d.drag.event('presentation-end',{gestureId:'foreign-gesture',reason:'PRIVATE'});
+  const rows=h.records('[Perf:DragCommit]');assert.equal(rows.length,2);
+  assert.deepEqual(rows.map(r=>r.name),['presentation-held','presentation-end']);
+  for(const r of rows){assert.equal(r.actionId,h.a.id);assert.notEqual(r.actionId,click.id);assert.equal(r.postPhysical,true);assert.equal(r.partial,false);}
+  assert.equal(h.d.drag.pending(),false);assert.equal(h.wakes(),wakes);
+  assert.doesNotMatch(h.logs.join('\n'),/PRIVATE|foreign-gesture/);
+});
+
 test('OFF reads no pointer fields, wakes no drag frame, and configuration change is explicit partial',()=>{
   const h=dragHarness('off'),before=h.wakes();
   h.d.drag.input(new Proxy({},{get(){throw Error('OFF must not inspect input');}}));

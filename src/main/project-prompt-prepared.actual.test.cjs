@@ -4,19 +4,56 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const Module = require('node:module');
 const { EventEmitter } = require('node:events');
-const { ProjectPromptCatalogService } = require('./project-prompt-catalog');
+const { ProjectPromptCatalogService, scanSource } = require('./project-prompt-catalog');
 const { createCatalogControl, stableSort, copyMetadata } = require('./prompt-catalog-cooperative');
 const { orderEntries, captureLayout } = require('./prompt-catalog-source');
 const { causal } = require('./perf-causal-context');
 const support = require('./project-prompt-catalog.test-support.cjs');
-const beforePath = '/private/tmp/noted-ui-lag-0715-jc9pi7rs/startup27/source46-backend/before/src/main/project-prompt-catalog.js';
-const before = new Module(path.join(__dirname, 'project-prompt-catalog.js'), module);
-before.filename = path.join(__dirname, 'project-prompt-catalog.js'); before.paths = Module._nodeModulePaths(__dirname);
-before._compile(fs.readFileSync(beforePath, 'utf8'), before.filename);
-const original = before.exports;
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test('unrelated parent-sentinel events do not schedule all-consumer catalog reconciliation', async t => {
+  const f = fixture(t, { n: 32 });
+  await support.tab(f.s, 'tab-0');
+  const p = f.s.prepared, slot = p.slots.get(f.a);
+  const entry = { key: 's:' + f.root, target: f.root, recursive: false,
+    slots: new Set([slot]), retired: false };
+  p.watchers.set(entry.key, entry);
+  const before = { reconciliations: p.counters.reconciliations, epoch: slot.epoch,
+    changes: f.changes.length };
+  for (const name of ['unrelated.sqlite-wal', 'another-project', 'a-other'])
+    p.watchEvent(entry, 'rename', name);
+  await tick(); // Flush the handler's scheduled setImmediate, not a readiness delay.
+  assert.equal(p.counters.reconciliations, before.reconciliations,
+    'sibling I/O must not start a fresh read of every tab scope');
+  assert.equal(slot.epoch, before.epoch);
+  assert.equal(f.changes.length, before.changes);
+});
+
+for (const filename of ['a', null]) test(`relevant/unknown sentinel ${filename} still revokes and reconciles`, async t => {
+  const f = fixture(t); await support.tab(f.s, 'tab-0');
+  const p = f.s.prepared, slot = p.slots.get(f.a);
+  const entry = { key: 's:' + f.root, target: f.root, recursive: false,
+    slots: new Set([slot]), retired: false };
+  p.watchers.set(entry.key, entry);
+  const epoch = slot.epoch, reconciliations = p.counters.reconciliations;
+  p.watchEvent(entry, 'rename', filename);
+  assert.ok(slot.epoch > epoch, 'revoke is synchronous before any async observation');
+  await tick();
+  assert.ok(p.counters.reconciliations > reconciliations);
+});
+
+test('a descendant reported by a nonrecursive backend keeps conservative topology reconciliation', async t => {
+  const f = fixture(t); await support.tab(f.s, 'tab-0');
+  const p = f.s.prepared, slot = p.slots.get(f.a);
+  const entry = { key: 's:' + f.root, target: f.root, recursive: false,
+    slots: new Set([slot]), retired: false };
+  p.watchers.set(entry.key, entry);
+  const before = p.counters.reconciliations;
+  p.watchEvent(entry, 'rename', 'a/docs/nested/own.prompt.md');
+  await tick();
+  assert.ok(p.counters.reconciliations > before);
+});
 function gate() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 function fixture(t, { watch = false, n = 2 } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'catalog46-')));
@@ -72,7 +109,7 @@ test('warm after1501ms and much later has zero discovery/watch passes; fresh exa
   assert.deepEqual((await f.s.listTab('tab-0')).sources[0].extra, ['detached']);
   f.bindings.set('tab-0', []); assert.deepEqual((await f.s.listTab('tab-0')).prompts, []);
 });
-test('immutable CURRENT4929 oracle preserves full order/IDs/labels/positions, visual children and legitimate same-title paths', async t => {
+test('retained synchronous scanner oracle preserves full order/IDs/labels/positions, visual children and legitimate same-title paths', async t => {
   const f = fixture(t); const docs = path.join(f.a, 'docs');
   fs.mkdirSync(path.join(docs, 'folder')); fs.mkdirSync(path.join(docs, 'node_modules')); fs.mkdirSync(path.join(docs, 'tmp'));
   for (const name of ['10.prompt.md', '2.prompt.md', 'parent.md', 'other.prompt.md', '.hidden.prompt.md']) fs.writeFileSync(path.join(docs, name), 'private');
@@ -81,10 +118,13 @@ test('immutable CURRENT4929 oracle preserves full order/IDs/labels/positions, vi
     visualParentByPath: { [path.join(docs, 'other.prompt.md')]: path.join(docs, 'parent.md') } };
   f.s.layoutStore = { get: () => ({ revision: 1, layout }) };
   f.bindings.set('tab-0', [f.row(f.a), { ...f.row(f.b), enabled: false }]);
-  const expected = new original.ProjectPromptCatalogService({ db: f.db, rootRegistry: f.registry, layoutStore: f.s.layoutStore, watch: false });
-  t.after(() => expected.close());
-  const old = expected.listTab('tab-0'), current = await support.tab(f.s, 'tab-0');
-  assert.deepEqual(current.prompts, old.prompts); assert.deepEqual(current.sources, old.sources);
+  // The legacy scanner remains an independent synchronous implementation. Do
+  // not require an author's already-cleaned /private/tmp source capture.
+  const expected = scanSource({ projectId: 'original-P', rootPath: f.a, sourceName: 'a', layout });
+  const current = await support.tab(f.s, 'tab-0');
+  assert.deepEqual(current.prompts, expected.prompts);
+  assert.deepEqual(current.sources, [{ ...f.row(f.a), sourceName: 'a', docsPath: docs,
+    exists: true, docsExists: true, promptCount: expected.prompts.length }]);
   assert.equal(current.prompts.filter(p => p.title === 'same').length, 2);
   assert.ok(!current.prompts.some(p => p.path.includes('node_modules')));
 });

@@ -6,6 +6,7 @@ import { historyForegroundPriority } from './historyForegroundPriority.mjs';
 import { beginPaneTabDrag, endPaneTabDrag, getPaneTabDragSnapshot,
   paneTabDropTargetContainsPoint, resolvePaneTabDropTarget, setPaneTabDragTarget,
   claimPaneTabDragDrop,
+  paneTabGroupDragIsCurrent,
   type PaneTabDragSource } from './paneTabDragBridge';
 import { cancelPaneTabPointer, finishPaneTabPointer, updatePaneTabPointer } from './paneTabPointerBridge';
 import { commitPaintedPaneTabDrop } from './paneTabDropCommit';
@@ -54,7 +55,7 @@ function finish(cancelled: boolean, reason: string) {
       if(drag.source.workflowDrag) {
         const claimed=claimPaneTabDragDrop(drag.source.rootTabId);
         const request=claimed && workflowDragRequest(drag.source.workflowDrag,{workflowId:target.spaceId || useWorkspaceStore.getState().activeSpaceId,target});
-        if(request)void useWorkspaceStore.getState().commitWorkflowDrag(request).then(accepted=>
+        if(request)void useWorkspaceStore.getState().commitWorkflowDrag(request,{isSourceCurrent:()=>paneTabGroupDragIsCurrent(drag.source)}).then(accepted=>
           console.log('[PaneTabDnd:durable-release] gesture='+drag.source.gestureId+' committed='+Number(accepted)));
       } else result=commitPaintedPaneTabDrop(drag.source.rootTabId);
     }
@@ -77,10 +78,12 @@ export const cancelPaneTabPointerDrag = (reason = 'cancel') => finish(true, reas
 function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Point) {
   cancelPaneTabPointerDrag('replaced');
   installClickGuard();
+  if(!paneTabGroupDragIsCurrent(source)){suppressClick=true;uiDragDiagnostic('physical-end',{reason:'strip-group-scope-changed'});return;}
   const owner = `pane-pointer-drag:${source.rootTabId}`;
   const gestureId=crypto.randomUUID(),state=useWorkspaceStore.getState();
   const workflowDrag=state.organizationReady ? captureWorkflowDrag(state,{gestureId,origin:'pane',
-    sourceId:`reserve-tab:${source.rootTabId}`,entries:source.entries,sourcePaneKey:source.sourcePaneKey}) : null;
+    sourceId:`reserve-tab:${source.rootTabId}`,entries:source.entries,sourcePaneKey:source.sourcePaneKey,
+    sourceWorkflowId:source.sourceSpaceId || state.activeSpaceId}) : null;
   if(state.organizationReady && !workflowDrag){uiDragDiagnostic('physical-end',{reason:'source-admission-rejected'});return;}
   const drag: Gesture = {
     source: { ...source, input: 'pointer', pointerId: point.pointerId,gestureId,workflowDrag }, point, frame: 0, owner,
@@ -112,6 +115,9 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
     const projectId = pointed?.closest<HTMLElement>('[data-structured-project-drop-target]')?.dataset.projectId;
     if (workflowId || projectId) {
       setPaneTabDragTarget(null);
+      if(drag.source.groupDrag?.boundary.kind==='group') {
+        clearTabDragNavigationTarget('pane');return;
+      }
       setTabDragNavigationTarget('pane', {
         kind: workflowId ? 'workflow' : 'project', id: workflowId || projectId!,
         clientX: p.clientX, clientY: p.clientY,
@@ -153,6 +159,7 @@ function start(sourceElement: HTMLElement, source: PaneTabDragSource, point: Poi
   // A projected sidebar row may take capture, and a reflow may replace the
   // original chip. Neither ends this renderer-wide physical gesture.
   const unsubscribe = useWorkspaceStore.subscribe(state => {
+    if(!paneTabGroupDragIsCurrent(drag.source)) {finish(true,'strip-group-scope-changed');return;}
     if(drag.source.workflowDrag && !workflowDragSourceValid(drag.source.workflowDrag,state)) {finish(true,'source-admission-changed');return;}
     if (!state.openProjects.get(drag.source.entries[0].projectId)?.tabs.has(drag.source.rootTabId)) finish(true, 'source-removed');
   });

@@ -324,7 +324,7 @@ function createDragDiagnostics({now,emit,onPendingFrame,matching,actions,appendP
       if(f.gestureId){
         const action=actions.find(a=>a.drag?.gestureId===f.gestureId);
         const commit=name.startsWith('commit-');
-        const receipt=['layout-receipt','commit','cancel','release-preview'].includes(name);
+        const receipt=['layout-receipt','commit','cancel','release-preview','presentation-held','presentation-end'].includes(name);
         if(commit || (receipt && action)){
           if(action){
             action.drag.latePhases=(action.drag.latePhases || 0)+1;

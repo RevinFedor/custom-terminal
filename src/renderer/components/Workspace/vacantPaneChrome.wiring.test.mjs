@@ -19,7 +19,7 @@ function between(source, start, end) {
 test('vacant pane stays a real pointer-focus target', () => {
   const vacant = between(
     terminalArea,
-    'splitPanes.forEach((pane, paneIndex) => {\n      if (!isEmptyPane(pane)) return;',
+    'splitPanes.forEach((pane, paneIndex) => {',
     '\n    for (const tabId of tabLayerNodeCacheRef.current.keys())',
   );
   assert.match(vacant, /data-terminal-pane-wrapper="empty"/);
@@ -33,7 +33,7 @@ test('vacant pane stays a real pointer-focus target', () => {
 test('vacant pane uses the canonical window navbar instead of a reduced copy', () => {
   const vacant = between(
     terminalArea,
-    'splitPanes.forEach((pane, paneIndex) => {\n      if (!isEmptyPane(pane)) return;',
+    'splitPanes.forEach((pane, paneIndex) => {',
     '\n    for (const tabId of tabLayerNodeCacheRef.current.keys())',
   );
   assert.match(vacant, /<SplitPaneAttachRow[\s\S]*?tabId=""[\s\S]*?vacant/);
@@ -44,7 +44,8 @@ test('vacant pane uses the canonical window navbar instead of a reduced copy', (
   assert.match(vacant, /onCreateTab=\{\(\) => useWorkspaceStore\.getState\(\)\.openWindowTabChooser\(paneIndex\)\}/);
   assert.doesNotMatch(vacant, /onCreateTab=\{\(\) => launchIntoEmptyPane\(/,
     'создание МЕСТА не подменяется прямым запуском терминала');
-  // `×` закрывает окно целиком, вместе со всеми его местами.
+  // Window Close in the canonical ellipsis menu removes this vacant window,
+  // not the tabs/processes in its parked strip.
   assert.match(vacant, /onCloseVacantPane=\{\(\) => useWorkspaceStore\.getState\(\)\.closeWindowPane\(paneIndex\)\}/);
   // Явный «Терминал» полосы запуска остаётся отдельной кнопкой.
   assert.match(vacant, /onLaunch=\{\(action\) => \{ void launchIntoEmptyPane\(paneIndex, action\); \}\}/);
@@ -62,8 +63,8 @@ test('canonical navbar renders vacancy without a tab and keeps strip menu/create
   assert.match(attach, /shownTabId=\{vacant \? '' : tabId\}/);
   assert.match(attach, /onCreateTab=\{onCreateTab \|\| createTabInThisWindow\}/);
   assert.match(attach, /data-vacant-pane-parked-count=\{vacant \? entries\.length : undefined\}/);
-  assert.match(attach, /data-vacant-pane-label/);
-  assert.match(attach, /data-vacant-pane-close/);
+  assert.doesNotMatch(attach, /data-vacant-pane-label|data-vacant-pane-close/);
+  assert.match(attach, /data-split-strip-menu-item="close-window"/);
   assert.match(attach, /data-split-strip-menu-button/,
     'the same ellipsis/settings owner must remain present');
   assert.match(attach, /\{!vacant && <div[\s\S]*?data-split-strip-menu-item="timeline"/,

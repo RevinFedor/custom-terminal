@@ -181,10 +181,29 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
               if (!current(tabId, state) || state.actionToken !== token || state.phase !== 'confirming') return;
               const latest = await readFrame(tabId).catch(() => null);
               if (!current(tabId, state) || state.actionToken !== token || state.phase !== 'confirming') return;
+              state.timer = null;
               if (current(tabId, state, true) && latest?.valid && latest.seq > state.actionFrameSeq
                 && latest.seq >= state.lastSeenSeq && isComposer(latest)) {
                 confirmComposer(tabId, state, latest, 'committed-composer');
               } else {
+                if (state.type === 'resume-goal' && current(tabId, state, true)) {
+                  const fresh = latest?.valid && Number.isSafeInteger(latest.seq)
+                    && latest.seq > state.actionFrameSeq && latest.seq >= state.lastSeenSeq
+                    && (latest.seq !== state.lastSeenSeq || latest.text === state.lastFrame.text);
+                  const dialog = fresh ? inspectCodexPolicyDialog(latest.text) : null;
+                  if (dialog?.type === 'resume-goal' && goalDialogKey(latest) !== state.goalKey) {
+                    setPhase(tabId, state, 'manual', 'goal-dialog-changed'); return;
+                  }
+                  if (dialog?.type !== 'resume-goal' || !dialog.interactive || !dialog.selectedIndex) {
+                    // A pre-Enter frame or unfinished redraw does not prove a
+                    // live menu requiring user action. Keep the same unwritten
+                    // Send waiting on events within its ORIGINAL preparation
+                    // scope. No new timer, readiness grant or repeat Enter.
+                    state.confirmationUnobserved = true;
+                    setPhase(tabId, state, 'confirming', 'provider-result-unobserved');
+                    return;
+                  }
+                }
                 if (current(tabId, state, true) && latest?.valid && Number.isSafeInteger(latest.seq)
                   && latest.seq > state.lastSeenSeq && state.type === 'resume-goal'
                   && inspectCodexPolicyDialog(latest.text)?.type === state.type && goalDialogKey(latest) === state.goalKey) {
@@ -232,6 +251,10 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
       return;
     }
     if (state && state.type === dialog.type && state.phase !== 'handled') {
+      if (state.type === 'resume-goal' && state.actionWritten && state.confirmationUnobserved
+        && frame.seq > state.actionFrameSeq && dialog.interactive && dialog.selectedIndex) {
+        setPhase(tabId, state, 'manual', 'provider-choice-not-confirmed');
+      }
       if (state.phase === 'awaiting-frame' && !state.actionWritten && frame.seq > state.frameSeq) void act(tabId, state);
       return;
     }
@@ -282,7 +305,8 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
     let status = 'unavailable';
     let reason = state.reason;
     if (state.choiceConfirmed) status = 'confirmed';
-    else if (state.actionAttempted) status = inputOwned && (state.phase === 'applying' || state.phase === 'confirming')
+    else if (state.actionAttempted) status = inputOwned && (state.phase === 'applying'
+      || state.phase === 'confirming' && !state.confirmationUnobserved)
       ? 'pending' : 'unknown';
     else if (!owned) reason = owner?.live ? 'goal-owner-changed' : 'runtime-not-live';
     else if (!inputOwned) reason = 'input-owner-changed';
@@ -365,6 +389,7 @@ function createCodexRuntimePolicyController({ capture, readFrame, withWriteLock,
     // lastSeenSeq/content and final sendKey frame guard remain authoritative.
     if (view.recoveryAvailable) {
       state.actionWritten = state.actionAttempted = state.choiceConfirmed = state.keyWritten = false;
+      state.confirmationUnobserved = false;
       state.actionFrameSeq = state.resultFrameSeq = state.composerProofSeq = state.selectionFrameSeq = null;
       state.expectedSelectedIndex = null;
     }

@@ -769,13 +769,13 @@ async function appPathItem({ targetPath, title, group, protectedReason = null })
   };
 }
 
-async function scanAppData(appDataDir) {
+async function scanAppData(appDataDir, { retentionOnly = false } = {}) {
   const items = [];
   let names = [];
   try { names = await fs.promises.readdir(appDataDir); } catch {}
   for (const name of names) {
     const targetPath = path.join(appDataDir, name);
-    if (/^noted-terminal(?:-dev)?\.db(?:-wal|-shm)?$/.test(name)) {
+    if (!retentionOnly && /^noted-terminal(?:-dev)?\.db(?:-wal|-shm)?$/.test(name)) {
       const item = await appPathItem({ targetPath, title: name.includes('-dev') ? 'Development database' : 'Production database', group: 'app-active', protectedReason: 'Active application database' });
       if (item) items.push(item);
     } else if (/^noted-terminal\.db\.(?:backup|before-)/.test(name)) {
@@ -783,7 +783,7 @@ async function scanAppData(appDataDir) {
       if (item) items.push(item);
     }
   }
-  for (const [name, title, reason] of [
+  for (const [name, title, reason] of retentionOnly ? [] : [
     ['Code Cache', 'Browser code cache', 'In use by the running app'],
     ['Cache', 'Browser cache', 'In use by the running app'],
     ['prompt-queue-assets', 'Prompt images', 'Managed by receipt and composer garbage collection'],
@@ -883,38 +883,59 @@ async function scanStorageInventory({
   relationDatabases = [],
   settings = DEFAULT_SETTINGS,
   testRunRoots = null,
+  scope = 'full',
+  logger = console,
   nowMs = Date.now(),
 } = {}) {
+  const retentionOnly = scope === 'retention';
+  const scanScope = retentionOnly ? 'retention' : 'full';
+  const scanId = crypto.randomUUID();
+  const startedAt = Date.now();
+  const phase = async (name, read) => {
+    const phaseStartedAt = Date.now();
+    logger.log?.('[StorageInventory:Phase] ' + JSON.stringify({ scanId, scope: scanScope, phase: name, state: 'started', startedAt: phaseStartedAt }));
+    try {
+      const value = await read();
+      logger.log?.('[StorageInventory:Phase] ' + JSON.stringify({ scanId, scope: scanScope, phase: name, state: 'completed', elapsedMs: Date.now() - phaseStartedAt }));
+      return value;
+    } catch (error) {
+      logger.warn?.('[StorageInventory:Phase] ' + JSON.stringify({ scanId, scope: scanScope, phase: name, state: 'failed', elapsedMs: Date.now() - phaseStartedAt, reason: error.code || 'scan-failed' }));
+      throw error;
+    }
+  };
   const normalizedSettings = normalizeStorageRetentionSettings(settings);
   const normalizedEnvironment = currentEnvironment === 'development' ? 'development' : 'production';
-  const relations = readStorageRelations(sqlite, { environment: normalizedEnvironment });
-  for (const source of Array.isArray(relationDatabases) ? relationDatabases : []) {
-    if (!source?.sqlite || source.sqlite === sqlite) continue;
-    const environment = source.environment === 'development' ? 'development' : 'production';
-    readStorageRelations(source.sqlite, {
-      target: relations,
-      environment,
-      openTabs: true,
-      protectEveryRelation: normalizedEnvironment === 'development' && environment === 'production',
-    });
-  }
+  const relations = await phase('relations', () => {
+    const collected = readStorageRelations(sqlite, { environment: normalizedEnvironment });
+    for (const source of Array.isArray(relationDatabases) ? relationDatabases : []) {
+      if (!source?.sqlite || source.sqlite === sqlite) continue;
+      const environment = source.environment === 'development' ? 'development' : 'production';
+      readStorageRelations(source.sqlite, { target: collected, environment, openTabs: true,
+        protectEveryRelation: normalizedEnvironment === 'development' && environment === 'production' });
+    }
+    return collected;
+  });
   const runtimeProtectedIds = new Set((runtimeProtectedSessionIds || []).map(text).filter(Boolean));
   const [sessionScan, builds, appItems, testRuns] = await Promise.all([
-    scanSessions({ codexHome, claudeHome, relations, runtimeProtectedIds }),
-    scanBuilds(projectRoot),
-    appDataDir ? scanAppData(appDataDir) : [],
-    testRunRoots ? scanTestRuns({ roots: testRunRoots }) : { items: [], complete: true, warnings: [] },
+    phase('sessions', () => scanSessions({ codexHome, claudeHome, relations, runtimeProtectedIds })),
+    retentionOnly ? [] : phase('builds', () => scanBuilds(projectRoot)),
+    appDataDir ? phase('app-data', () => scanAppData(appDataDir, { retentionOnly })) : [],
+    !retentionOnly && testRunRoots ? phase('test-runs', () => scanTestRuns({ roots: testRunRoots }))
+      : { items: [], complete: !retentionOnly, warnings: [], ...(retentionOnly ? { skipped: 'retention-scope' } : {}) },
   ]);
   const items = decorateRetention([...sessionScan.items, ...builds, ...appItems, ...testRuns.items], normalizedSettings, nowMs);
   items.sort((a, b) => b.sizeBytes - a.sizeBytes || b.modifiedAt - a.modifiedAt || a.id.localeCompare(b.id));
+  logger.log?.('[StorageInventory:Scan] ' + JSON.stringify({ scanId, scope: scanScope, state: 'completed', elapsedMs: Date.now() - startedAt, items: items.length,
+    ...(retentionOnly ? { skipped: ['builds', 'test-runs', 'active-app-accounting'] } : {}) }));
   return {
     success: true,
+    scanScope,
     generation: inventoryGeneration(items, normalizedSettings),
     scannedAt: nowMs,
     settings: normalizedSettings,
     sessionCoverage: sessionScan.coverage,
     sessionScanErrors: sessionScan.errors,
-    testRuns: { complete: testRuns.complete, warnings: testRuns.warnings },
+    testRuns: { complete: testRuns.complete, warnings: testRuns.warnings, ...(testRuns.skipped ? { skipped: testRuns.skipped } : {}) },
     summary: summarizeInventory(items),
     items,
   };

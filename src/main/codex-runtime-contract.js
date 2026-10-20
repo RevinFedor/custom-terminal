@@ -429,10 +429,10 @@ function verifyCodexNextLaunchSettings({
 
 function projectCodexSendStartupWait({
   payload, terminal, lifecycleGeneration, runSeq, commandRunning,
-  stopping = false, inputReady = false, timeoutMs,
+  stopping = false, inputReady = false, lifecycleEstablished = false, timeoutMs,
 } = {}) {
   if (!terminal || !payload?.launchId || !lifecycleGeneration || !commandRunning
-    || stopping || inputReady || payload.terminalToken !== terminal
+    || stopping || inputReady || lifecycleEstablished || payload.terminalToken !== terminal
     || payload.lifecycleGeneration !== lifecycleGeneration || payload.runSeq !== runSeq
     || !Number.isFinite(payload.startedAt) || payload.startedAt <= 0
     || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return null;

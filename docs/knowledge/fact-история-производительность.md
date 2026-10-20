@@ -398,6 +398,13 @@ presentation и resize; видимая нефокусная pane тоже доп
 state при обновлении Footer/context не запускает новую eager-проверку; нет
 покадрового таймера, заморозки оценочных высот или второго anchor-writer.
 
+Пустой `sizeRanges([])` в этой версии Virtuoso тоже может публиковать
+`listRefresh(false)`: на него опираются завершение scroll, initial positioning
+и follow-output. Равные размеры строк не разрешают пропустить весь прежний
+measurement callback. Его sampled self также может включать синхронный native
+layout и дальнейшие stream publications; это не оценка чистого JS или лишней
+работы. Сохранять эти связи при оптимизации измерителя.
+
 Узкий build adapter привязан к проверенным bytes Virtuoso4.18.7 и включён
 только через History context. Node_modules не переписывается; upstream drift
 останавливает сборку с причиной. Standalone esbuild-проба обязана подключить

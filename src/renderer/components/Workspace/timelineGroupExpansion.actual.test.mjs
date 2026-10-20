@@ -108,16 +108,48 @@ test('actual collapsed group click updates only its expansion state, never Timel
   collapse('exact-group');assert.equal(groups.has('exact-group'),false);assert.deepEqual(calls,[]);
 });
 
-test('actual mixed MCP/SC grouping counts entries once, independently of model label',()=>{
+function actualGroups(entries){
  const declaration=ast.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='computeGroups');assert.ok(declaration);
- const compute=vm.runInNewContext(ts.transpileModule(declaration.getText(ast)+'\ncomputeGroups;',{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,{getOrchestrationTag:getTerminalMcpTag});
+ const compute=vm.runInNewContext(ts.transpileModule(declaration.getText(ast)+'\ncomputeGroups;',{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,{...presentation,getOrchestrationTag:getTerminalMcpTag});
+ return compute(entries);
+}
+test('actual MCP groups stop at SC Desktop, independently of model label',()=>{
  for(const n of [9,10,100,1000]){
   const entries=Array.from({length:n},(_,i)=>({uuid:'entry-'+i,semanticTags:[{kind:'orchestration',runId:'run-'+i,
    runKind:i===1?'external-research':'agent',targetTabName:i===1?'Another model':'Worker'}]}));
-  const map=compute(entries);assert.equal(map.size,n);assert.equal(map.get(0).groupSize,n);
+  const map=actualGroups(entries);assert.equal(map.has(1),false,'SC is a standalone original row, not a group child');
+  assert.equal(map.get(0).isGroupChild,false,'the singleton before SC cannot bridge across it');
+  assert.equal(map.get(2).groupSize,n-2);
   assert.equal(Array.from(map.values()).filter(value=>value.isGroupHeader).length,1);
-  assert.equal(map.get(1).groupId,map.get(0).groupId);
+  assert.notEqual(map.get(2).groupId,map.get(0).groupId);
  }
+});
+
+test('SC request/completion/failure and consecutive research results remain outside automatic groups',()=>{
+ const mcp=(id,kind='agent',phase='completion')=>({uuid:id,type:'user',semanticTags:[{kind:'orchestration',runId:id,runKind:kind,phase}]});
+ for(const phase of ['request','completion','failure']){
+  const entries=[mcp('a'),mcp('b'),mcp('sc1','external-research',phase),mcp('sc2','external-research'),mcp('c'),mcp('d')];
+  const before=JSON.stringify(entries),map=actualGroups(entries);
+  assert.equal(map.get(0).groupSize,2);assert.equal(map.get(4).groupSize,2);
+  assert.equal(map.has(2),false);assert.equal(map.has(3),false);
+  assert.notEqual(map.get(0).groupId,map.get(4).groupId);
+  const html=renderToStaticMarkup(React.createElement(actualRow(),{entry:entries[2],index:2,api:{},groupInfo:map.get(2),isGroupExpanded:false,isExpandedLayout:false}));
+  assert.match(html,/data-timeline-sc-desktop/);
+  assert.match(html,/data-timeline-entry-uuid="sc1"/);
+  assert.doesNotMatch(html,/data-timeline-group-toggle|data-timeline-group-guide/);
+  assert.equal(JSON.stringify(entries),before);
+ }
+});
+
+test('SC is also a hard boundary between built-in subagent groups',()=>{
+ const entries=[{uuid:'a',isSubAgent:true},{uuid:'b',isSubAgentTimeout:true},
+  {uuid:'sc',semanticTags:[{kind:'orchestration',runId:'r',runKind:'external-research'}]},
+  {uuid:'c',isSubAgent:true},{uuid:'d',isSubAgent:true}];
+ const groups=actualGroups(entries);
+ assert.equal(groups.has(2),false);
+ assert.equal(groups.get(0).groupKind,'subagent');assert.equal(groups.get(3).groupKind,'subagent');
+ assert.equal(groups.get(0).groupSize,2);assert.equal(groups.get(3).groupSize,2);
+ assert.equal(groups.get(0).hasTimeout,true);assert.equal(groups.get(3).hasTimeout,false);
 });
 
 test('actual collapsed group preserves first-entry note strips and dot-note colour',()=>{

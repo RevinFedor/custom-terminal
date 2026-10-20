@@ -60,6 +60,36 @@ function fixture(t,{files=false}={}) {
 }
 const rejects=(fn,pattern)=>assert.throws(fn,error=>pattern.test(error.code || error.message));
 
+test('renderer admission visits each layout payload once and keeps a detached frozen snapshot',t=>{
+  const f=fixture(t),s=f.state(),visits=new Map();
+  // A marker survives JSON normalization, so both traversals of a duplicate
+  // clone are observable without wall-clock thresholds or changing the model.
+  const display=id=>({splitPanes:[],capturePayloadProbe:id,numbers:[0,-0,NaN,Infinity,null]});
+  s.windowDisplayLayouts={screen:display('active')};
+  s.spaces.find(space=>space.id==='w2').layout.windowDisplayLayouts={screen:display('saved')};
+  const stringify=JSON.stringify;let admission;
+  try {
+    JSON.stringify=(value,replacer,space)=>replacer===undefined ? stringify(value,(_key,item)=>{
+      if(item && typeof item==='object' && typeof item.capturePayloadProbe==='string')
+        visits.set(item.capturePayloadProbe,(visits.get(item.capturePayloadProbe)||0)+1);
+      return item;
+    },space):stringify(value,replacer,space);
+    admission=captureWorkflowDrag(s,{gestureId:'single-layout-copy',outline:f.outline(s),
+      sourceId:'reserve-tab:B',selectedTabIds:['B']});
+  } finally { JSON.stringify=stringify; }
+  assert.ok(admission);
+  assert.deepEqual([...visits].sort(),[['active',1],['saved',1]]);
+  const active=admission.workflows.w1.layout.windowDisplayLayouts.screen;
+  const saved=admission.workflows.w2.layout.windowDisplayLayouts.screen;
+  assert.deepEqual(active.numbers,[0,0,null,null,null]);
+  for(const value of [active,saved,active.numbers,saved.numbers])assert.equal(Object.isFrozen(value),true);
+  assert.notEqual(active,s.windowDisplayLayouts.screen);
+  assert.equal(Object.isFrozen(s.windowDisplayLayouts.screen),false);
+  s.windowDisplayLayouts.screen.numbers[0]=101;
+  s.spaces.find(space=>space.id==='w2').layout.windowDisplayLayouts.screen.numbers[0]=202;
+  assert.equal(active.numbers[0],0);assert.equal(saved.numbers[0],0);
+});
+
 test('renderer stationary admission rejects exact identity replacement and a newly attached hidden descendant',t=>{
   const f=fixture(t),a=f.admission({selectedTabIds:['B']});
   assert.equal(workflowDragSourceValid(a,f.state()),true);

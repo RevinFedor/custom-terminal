@@ -6,6 +6,7 @@ const { StringDecoder } = require('string_decoder');
 const MAX_EVENT_HISTORY = 96;
 const MAX_SSE_BUFFER_BYTES = 4 * 1024 * 1024;
 const MAX_ITEM_TEXT_CHARS = 256 * 1024;
+const MAX_CODEX_SUBAGENT_TIERS = 512;
 
 const normalizeText = (value) => String(value || '')
   .replace(/\r\n?/g, '\n')
@@ -239,6 +240,18 @@ function responseOutputText(response) {
   return parts.join('');
 }
 
+function codexRequestServiceTier(payload) {
+  const root = payload?.response && typeof payload.response === 'object' ? payload.response : payload;
+  if (!root || !Object.hasOwn(root, 'service_tier')) return { serviceTier: null, reason: 'tier-field-absent' };
+  const value = root.service_tier;
+  const tier = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (tier === 'priority' || tier === 'fast') return { serviceTier: 'priority', reason: 'priority' };
+  if (tier === 'default') return { serviceTier: 'default', reason: 'default' };
+  return { serviceTier: null, reason: value === null ? 'tier-null'
+    : typeof value !== 'string' ? 'tier-invalid-type'
+      : tier ? 'tier-unsupported-string' : 'tier-empty-string' };
+}
+
 function createProviderSemanticShadow({
   log = console,
   now = () => Date.now(),
@@ -246,9 +259,53 @@ function createProviderSemanticShadow({
   onCodexSemanticEvent = null,
   onClaudeSemanticEvent = null,
   authorizeCodexMainRequest = null,
+  authorizeCodexSubagentRequest = null,
 } = {}) {
   const tabs = new Map();
+  // Only exact child request scalars, not bodies, headers, or the parent's
+  // settings. Historical request metadata survives Inspector/PTY close, not
+  // app restart; it never grants current process/input authority.
+  const codexSubagentTiers = new Map();
   let requestSequence = 0;
+
+  const tierKey = (tabId, parentSessionId, sessionId) => JSON.stringify([tabId, parentSessionId, sessionId]);
+  const boundedId = value => typeof value === 'string' && value.length > 0 && value.length <= 256 ? value : null;
+  const retainCodexSubagentTier = ({ tabId, sourceId, identity, classification, requestId, tier }) => {
+    if (classification !== 'subagent') return 'not-subagent';
+    if (!boundedId(tabId) || !boundedId(sourceId)
+      || !boundedId(identity.threadId) || !boundedId(identity.turnId)) return 'request-identity-missing';
+    if (['prewarm', 'compaction'].includes(identity.requestKind)) return 'side-request';
+    if (typeof authorizeCodexSubagentRequest !== 'function') return 'parent-authority-unavailable';
+    let admission;
+    try { admission = authorizeCodexSubagentRequest({tabId, sourceId, identity}); }
+    catch {
+      log.warn?.('[ProviderSemanticShadow] type=CODEX_SUBAGENT_TIER_REFUSED reason=owner-check-error');
+      return 'parent-authority-error';
+    }
+    const parentSessionId = boundedId(admission?.parentSessionId);
+    if (admission?.allowed !== true || !parentSessionId) {
+      return ['provider-owner-missing', 'provider-source-replaced', 'provider-terminal-replaced',
+        'provider-run-replaced', 'provider-lifecycle-replaced', 'provider-launch-replaced',
+        'subagent-tier-parent-writer-unproven', 'source-missing'].includes(admission?.reason)
+        ? admission.reason : 'parent-owner-unproven';
+    }
+    if (identity.threadId === parentSessionId
+      || (identity.sessionId && identity.sessionId !== identity.threadId && identity.sessionId !== parentSessionId)) return 'request-owner-mismatch';
+    const proof = Object.freeze({version: 1, provider: 'codex', source: 'own-provider-request',
+      parentSessionId, sessionId: identity.threadId, requestId, turnId: identity.turnId,
+      serviceTier: tier.serviceTier, reason: tier.reason, timestamp: new Date(now()).toISOString()});
+    const key = tierKey(tabId, parentSessionId, identity.threadId);
+    codexSubagentTiers.delete(key);
+    codexSubagentTiers.set(key, {tabId, sourceId, proof});
+    const evicted = codexSubagentTiers.size > MAX_CODEX_SUBAGENT_TIERS;
+    while (codexSubagentTiers.size > MAX_CODEX_SUBAGENT_TIERS) {
+      codexSubagentTiers.delete(codexSubagentTiers.keys().next().value);
+    }
+    return evicted ? 'retained-evicted-oldest' : 'retained';
+  };
+  const getCodexSubagentServiceTier = ({tabId, parentSessionId, sessionId} = {}) =>
+    boundedId(tabId) && boundedId(parentSessionId) && boundedId(sessionId)
+      ? codexSubagentTiers.get(tierKey(tabId, parentSessionId, sessionId))?.proof || null : null;
 
   const ensureProvider = (tabId, provider) => {
     let tab = tabs.get(tabId);
@@ -664,13 +721,21 @@ function createProviderSemanticShadow({
     tabId,
     transport = 'websocket',
     sourceId = null,
+    headers = {},
   } = {}) => {
     const { providerState } = ensureProvider(tabId, 'codex');
     const contexts = new Map();
     let current = null;
+    // Keep only identity headers, never Authorization/account credentials.
+    const headerMetadata = parseJson(headerValue(headers, 'x-codex-turn-metadata')) || {};
+    const connectionHeaders = {'x-openai-subagent': boundedId(headerValue(headers, 'x-openai-subagent')) || '',
+      'x-codex-turn-metadata': JSON.stringify(Object.fromEntries(
+        ['session_id', 'thread_id', 'turn_id', 'request_kind', 'subagent_kind', 'parent_thread_id']
+          .filter(key => boundedId(headerMetadata[key])).map(key => [key, headerMetadata[key]])))};
 
-    const beginRequest = (payload, headers = {}) => {
+    const beginRequest = (payload, headers = connectionHeaders) => {
       const identity = codexRequestIdentity(payload, headers);
+      const requestTier = codexRequestServiceTier(payload);
       const requestId = 'codex-' + (++requestSequence);
       let classification = identity.subagent
         ? 'subagent'
@@ -736,6 +801,7 @@ function createProviderSemanticShadow({
         deliveryUnknown: false,
       };
       contexts.set(requestId, current);
+      const tierCapture = retainCodexSubagentTier({tabId, sourceId, identity, classification, requestId, tier: requestTier});
       record(tabId, 'codex', 'REQUEST', {
         request: short(requestId, 20),
         transport,
@@ -745,6 +811,9 @@ function createProviderSemanticShadow({
         kind: identity.requestKind || '-',
         classification,
         reason: classificationReason,
+        serviceTier: requestTier.serviceTier || 'unknown',
+        tierReason: requestTier.reason,
+        tierCapture,
       });
       if (classification === 'main' && sourceId) {
         emitCodexSemanticEvent({
@@ -1149,6 +1218,11 @@ function createProviderSemanticShadow({
       + ' type=CLEAR reason=' + reason
       + ' events=' + (tab?.events?.length || 0));
     tabs.delete(tabId);
+    if (reason !== 'pty-exit' && reason !== 'terminal-kill') {
+      for (const [key, value] of codexSubagentTiers) {
+        if (value.tabId === tabId) codexSubagentTiers.delete(key);
+      }
+    }
     return true;
   };
 
@@ -1158,12 +1232,14 @@ function createProviderSemanticShadow({
     clear,
     createCodexConnection,
     finishClaudeTurn,
+    getCodexSubagentServiceTier,
     observeCanonical,
     snapshot,
   };
 }
 
 module.exports = {
+  MAX_CODEX_SUBAGENT_TIERS,
   MAX_EVENT_HISTORY,
   MAX_ITEM_TEXT_CHARS,
   MAX_SSE_BUFFER_BYTES,
@@ -1171,6 +1247,7 @@ module.exports = {
   claudeToolResultIds,
   claudeUserText,
   codexRequestIdentity,
+  codexRequestServiceTier,
   createProviderSemanticShadow,
   createSseParser,
   headerValue,

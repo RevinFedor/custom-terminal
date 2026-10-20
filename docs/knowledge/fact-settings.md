@@ -160,6 +160,15 @@ Live preview остаётся локальным renderer-state и не пише
 
 При сохранении (`savePrompts`, `savePromptGroups`) обе функции используют `p.position != null ? p.position : index` — если позиция задана явно, она сохраняется. Иначе fallback на array index. Шрам: ранее `savePromptGroups` всегда использовал array index, игнорируя `g.position`, что сбрасывало flat-порядок при каждом сохранении.
 
+В point Application API/MCP параметр position — zero-based sibling insertion index,
+а не сохранённая координата. Root-list общий для групп и ungrouped roots (без
+потомков), group/parent children имеют свои sibling-lists. SOURCE19.10 общий
+prompt-outline обслуживает и create/move/update API: отдельная prompt-only либо
+group-only нормализация ломала смешанный порядок. Clamp за пределы списка означает
+append и сам не является ошибкой. Непереставленные child-lists не перенумеровываются;
+text/collapse-only update сохраняет порядок. Wire/guards —
+`fact-prompt-picker.md::Библиотека промптов через внешний API`.
+
 ### Collapse Persistence
 Состояние сворачивания (`is_collapsed`) группы сохраняется в БД, а не в React state. Переживает перезапуск приложения.
 

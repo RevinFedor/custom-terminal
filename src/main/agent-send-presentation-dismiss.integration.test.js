@@ -13,10 +13,11 @@ const { fingerprintAgentSendRequest } = require('./agent-send-receipt-registry')
 const main = fs.readFileSync(path.join(__dirname,'main.js'),'utf8');
 const panel = fs.readFileSync(path.join(__dirname,'../renderer/components/Workspace/HistoryPanel.tsx'),'utf8');
 const handoffSource = fs.readFileSync(path.join(__dirname,'../renderer/utils/historyPromptHandoffs.ts'),'utf8');
-let presentation, localCommand, planHistoryPromptPresentationDismissal;
+let presentation, localCommand, recovery, planHistoryPromptPresentationDismissal;
 test.before(async()=>{
   presentation=await import('../renderer/utils/historyPromptPresentation.mjs');
   localCommand=await import('../renderer/utils/agentLocalCommand.mjs');
+  recovery=await import('../renderer/utils/historySendRecovery.mjs');
   ({planHistoryPromptPresentationDismissal}=await import('../renderer/utils/historyPromptPresentationDismissal.mjs'));
 });
 const part=(source,first,next)=>{
@@ -34,6 +35,7 @@ function handoffs() {
   }).outputText,{exports,console:quiet,setTimeout,clearTimeout,require:id=>{
     if(id==='./historyPromptPresentation.mjs')return presentation;
     if(id==='./agentLocalCommand.mjs')return localCommand;
+    if(id==='./historySendRecovery.mjs')return recovery;
     if(id.startsWith('.'))return require(path.resolve(__dirname,'../renderer/utils',id));
     return require(id);
   }});
@@ -88,29 +90,22 @@ async function harness(t,{provider='codex',surface='desktop-history',hydrated=fa
   });
   vm.runInContext(part(main,"ipcMain.handle('agent:dismiss-send-receipt-presentation'","ipcMain.handle('agent:record-history-context'"),context);
   vm.runInContext(part(main,"ipcMain.handle('agent:cancel-queued-send'","ipcMain.handle('agent:cancel-send'"),context);
-  // Only the actual dismissal functions belong to this fixture; intervening
-  // merge controls have independent useRef/IPC owners and tests.
-  const panelAst=ts.createSourceFile('HistoryPanel.tsx',panel,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
-  const variable=name=>{
-    let found;
-    const visit=node=>{
-      if(ts.isVariableDeclaration(node)&&node.name.getText(panelAst)===name)found='const '+node.getText(panelAst)+';';
-      ts.forEachChild(node,visit);
-    };
-    visit(panelAst);assert.ok(found,name);return found;
+  // This remains a compatibility API test, not the new History ↩ control.
+  // Current actual UI→return→Main/SQLite is in history-send-return.integration.
+  const dismiss = async () => {
+    const result = await context.ipcRenderer.invoke('agent:dismiss-send-receipt-presentation', { tabId:'T', handoffId });
+    if (!result.success) { notices.push(result.reason); return; }
+    rows = rows.filter(row => row.handoffId !== handoffId); persisted.push(rows);
   };
-  vm.runInContext(compile(part(panel,'const isLocalPromptEntry =','const isLocalRewindEntry ='))
-    +compile(variable('removeLocalPromptEntry'))+compile(variable('dismissPromptPresentation'))
-    +'\nglobalThis.dismiss = dismissPromptPresentation;',context);
   t.after(async()=>{queue.dispose();await tick();db.close();fs.rmSync(root,{recursive:true,force:true})});
   return {context,module,queue,store,identity,before,sends,calls,notices,persisted,rows:()=>rows,
-    dismiss:()=>context.dismiss(rows[0]),
+    dismiss,
     reopen:async()=>{queue.dispose();await tick();db.close();db=new Database(filename);store=createAgentSendReceiptStore(db);return store.get(identity.operationKey)},
   };
 }
 
 for(const provider of ['codex','claude'])for(const surface of ['desktop-history','project-api']) {
-  test(provider+'/'+surface+': actual old local card → Main → SQLite null attempt; reopen cannot resurrect it',async t=>{
+  test(provider+'/'+surface+': legacy dismissal API → Main → SQLite null attempt; reopen cannot resurrect it',async t=>{
     const h=await harness(t,{provider,surface});
     await h.dismiss();
     assert.deepEqual(h.notices,[]);
@@ -138,9 +133,9 @@ test('partial durable identity reads the terminal receipt immediately, without a
   assert.deepEqual(h.notices,[]);assert.equal(h.rows().length,1);assert.equal(h.sends.length,0);
 });
 
-test('rehydrated failed FIFO row keeps the existing cancel/dismiss-unwritten path and no physical send',async t=>{
+test('rehydrated failed FIFO receipt keeps legacy hide API and no physical send',async t=>{
   const h=await harness(t,{hydrated:true});await h.dismiss();
-  assert.deepEqual(h.calls,['agent:cancel-queued-send']);
+  assert.deepEqual(h.calls,['agent:dismiss-send-receipt-presentation']);
   assert.deepEqual(h.notices,[]);assert.equal(h.rows().length,1);assert.equal(h.sends.length,0);
   assert.equal(h.store.get(h.identity.operationKey).state,'not-submitted');
 });

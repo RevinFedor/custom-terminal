@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { ArrowLeftRight, BringToFront, Columns2, MessageSquareText, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search, FolderInput, Minimize2 } from 'lucide-react';
+import { ArrowLeftRight, BringToFront, Columns2, MessageSquareText, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, Search, FolderInput, Minimize2, X } from 'lucide-react';
 import {requestHistorySearch,requestInputSearch} from '../../utils/historySearchMarkers';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { findTerminalPaneElement } from '../../utils/terminalPaneElement.mjs';
 import { requestTerminalFullView } from '../../utils/terminalFullView.mjs';
 import {
   resolveSplitAttachRowHeight,
@@ -177,6 +178,7 @@ export function SplitPaneAttachRow({
   const splitPanes = useWorkspaceStore((s) => paneLayout || s.splitPanes);
   const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
   const sideTerminalShown = useUIStore(s => !!s.sideTerminalOpenTabs[tabId] && !resolveTabTerminalPrimary(s, tabId));
+  const fullViewAvailable = sideTerminalShown && !vacant && tabExists;
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
   // Window actions remain in the ellipsis menu; wrapping is unconditional.
   const [stripMenu, setStripMenu] = useState<{ x: number; y: number } | null>(null);
@@ -373,9 +375,7 @@ export function SplitPaneAttachRow({
       }
       if (paneIndex !== null && paneIndex !== undefined) {
         const currentTabId = currentHeaderTabIdRef.current;
-        const wrapper = document.querySelector<HTMLElement>(
-          `[data-terminal-pane-wrapper="${CSS.escape(currentTabId)}"]`,
-        );
+        const wrapper = findTerminalPaneElement(currentTabId);
         if (wrapper?.style.getPropertyValue(TAB_SURFACE_HEADER_HEIGHT_VAR) !== cssHeight) {
           wrapper?.style.setProperty(TAB_SURFACE_HEADER_HEIGHT_VAR, cssHeight);
         }
@@ -413,9 +413,7 @@ export function SplitPaneAttachRow({
   React.useLayoutEffect(() => {
     if (paneIndex === null || paneIndex === undefined) return;
     const h = publishedHeaderHeightRef.current || rowH;
-    const wrapper = document.querySelector<HTMLElement>(
-      `[data-terminal-pane-wrapper="${CSS.escape(tabId)}"]`,
-    );
+    const wrapper = findTerminalPaneElement(tabId);
     const cssHeight = h + 'px';
     if (wrapper?.style.getPropertyValue(TAB_SURFACE_HEADER_HEIGHT_VAR) !== cssHeight) {
       wrapper?.style.setProperty(TAB_SURFACE_HEADER_HEIGHT_VAR, cssHeight);
@@ -531,6 +529,9 @@ export function SplitPaneAttachRow({
         data-split-pane-actions
         style={{
           position: 'relative',
+          // The following positioned strip spans the full row, including this
+          // float's empty rectangle. Keep the real controls above its hit area.
+          zIndex: 1,
           float: 'right',
           marginLeft: 6,
           flexShrink: 0,
@@ -543,72 +544,6 @@ export function SplitPaneAttachRow({
           gap: 2,
         }}
       >
-
-      {/* «Нет вкладки» — это ответ на вопрос «что здесь показано», и он верен
-          ровно до тех пор, пока показывать действительно нечего. Открытая
-          страница выбора — уже содержимое: она названа своим чипом и занимает
-          тело окна, поэтому вторая подпись рядом утверждала бы обратное тому,
-          что человек видит. Кнопка `×` окна при этом не исчезает: она стоит на
-          своём месте, потому что закрыть само окно по-прежнему можно только ею
-          (у заготовки свой средний клик — он закрывает заготовку, не окно). */}
-      {vacant && (
-        <div
-          data-vacant-pane-controls
-          style={{
-            display: 'flex',
-            alignItems: 'stretch',
-            alignSelf: 'stretch',
-            flexShrink: 0,
-            color: '#6f6f75',
-          }}
-        >
-          {!selectedSlotId && (
-            <span
-              data-vacant-pane-label
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                padding: '0 5px',
-                fontSize: 11,
-                fontWeight: 500,
-                whiteSpace: 'nowrap',
-              }}
-            >
-              Нет вкладки
-            </span>
-          )}
-          <button
-            type="button"
-            data-vacant-pane-close
-            title="Убрать пустую панель"
-            aria-label="Убрать пустую панель"
-            onPointerDown={(e) => e.stopPropagation()}
-            onDoubleClick={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.stopPropagation();
-              onCloseVacantPane?.();
-            }}
-            style={{
-              width: 18,
-              alignSelf: 'stretch',
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              padding: 0,
-              border: 'none',
-              borderRadius: 4,
-              background: 'transparent',
-              color: '#8f8f94',
-              cursor: 'pointer',
-              fontSize: 14,
-              lineHeight: 1,
-              flexShrink: 0,
-            }}
-          >
-            ×
-          </button>
-        </div>
-      )}
 
       {/* Git follows the focused window from the application titlebar.
           The remaining focus actions retain their geometry reservation.
@@ -634,21 +569,29 @@ export function SplitPaneAttachRow({
       >
       {/* This header is outside the translated/clipped terminal stage. A side
           panel can fit its minimum grid while still losing its own titlebar. */}
-      {sideTerminalShown && !vacant && <button type="button"
-        data-terminal-full-view-open={tabId}
+      {/* Keep the same22px action slot for empty/file/AI and side-terminal
+          presentation changes. Visibility cannot repack the wrapped strip. */}
+      <button type="button"
+        data-split-pane-terminal-slot
+        data-terminal-full-view-open={fullViewAvailable ? tabId : undefined}
+        disabled={!fullViewAvailable}
+        aria-hidden={!fullViewAvailable}
+        tabIndex={fullViewAvailable ? undefined : -1}
         aria-label="Показать терминал поверх окон" title="Показать терминал поверх окон"
         onPointerDown={event => { event.preventDefault(); event.stopPropagation(); }}
         onClick={event => {
           event.stopPropagation();
+          if (!fullViewAvailable) return;
           useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
           const terminal = terminalRegistry.get(tabId)?.element
             || document.querySelector(`[data-floating-terminal-tab-id="${CSS.escape(tabId)}"][data-floating-terminal-side="1"]`);
           requestTerminalFullView(terminal, tabId);
         }}
-        style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:22,alignSelf:'stretch',padding:0,
-          border:0,borderRadius:4,background:'transparent',color:'#a78bfa',cursor:'pointer'}}>
+        style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:22,flexShrink:0,alignSelf:'stretch',padding:0,
+          border:0,borderRadius:4,background:'transparent',color:'#a78bfa',cursor:'pointer',
+          visibility:fullViewAvailable?'visible':'hidden',pointerEvents:fullViewAvailable?'auto':'none'}}>
         <BringToFront size={14} />
-      </button>}
+      </button>
       {/* Split remains mounted and visible in every pane. `splitCan` changes
           only whether the action is available; it never changes geometry. */}
       <button
@@ -796,7 +739,10 @@ export function SplitPaneAttachRow({
         entries={entries}
         shownTabId={vacant ? '' : tabId}
         focused={focused}
+        presented={presented}
         paneIndex={paneIndex ?? null}
+        spaceId={activeSpaceId}
+        windowId={sourceWindowId}
         inSplit={inSplit}
         onCreateTab={onCreateTab || createTabInThisWindow}
         slots={slots}
@@ -998,6 +944,24 @@ export function SplitPaneAttachRow({
               </span>
             </button>}
             {!vacant && <IdleSessionStopCountdown tabId={tabId} />}
+            {vacant && <button type="button" role="menuitem" data-split-strip-menu-item="close-window"
+              title="Убрать пустую панель" disabled={!onCloseVacantPane}
+              onPointerDown={event => event.stopPropagation()}
+              onClick={event => {
+                event.stopPropagation(); setStripMenu(null);
+                const store = useWorkspaceStore.getState();
+                if (paneIndex == null) return;
+                const currentPane = store.splitPanes[paneIndex];
+                // A menu can outlive its original presentation. Never close
+                // another workflow/window that reused this pane index.
+                if (store.activeSpaceId !== activeSpaceId || !currentPane || !isEmptyPane(currentPane)
+                  || (sourceWindowId ? currentPane.windowId !== sourceWindowId : currentPane !== splitPanes[paneIndex])) return;
+                onCloseVacantPane?.();
+              }}
+              style={{...CONTEXT_MENU_ROW_STYLE,width:'100%',display:'flex',alignItems:'center',gap:8,
+                border:0,background:'transparent',color:'inherit',textAlign:'left',cursor:'pointer'}}>
+              <X size={13}/>Close window
+            </button>}
           </div>
         </>,
         document.body,

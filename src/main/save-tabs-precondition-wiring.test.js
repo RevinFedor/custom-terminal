@@ -16,8 +16,12 @@ test('async and sync destructive snapshots validate exact DB tab ids before save
     const end = source.indexOf('\n});', start);
     assert.ok(start >= 0 && end > start, `handler missing: ${marker}`);
     const block = source.slice(start, end);
-    const validateAt = block.indexOf('validateForceCleanupTabIds({');
-    const saveAt = block.indexOf('projectManager.saveProjectTabs(');
+    // The async handler also has batch and receipt-finalization branches.
+    // Their own transactional validators run separately; this check owns the
+    // ordinary scalar destructive snapshot, not the first save token in file.
+    const scalar = block.slice(block.indexOf('const precondition = validateForceCleanupTabIds({'));
+    const validateAt = scalar.indexOf('validateForceCleanupTabIds({');
+    const saveAt = scalar.indexOf('projectManager.saveProjectTabs(');
     assert.match(block, /expectedTabIds/);
     assert.match(block, /projectManager\.db\.getProjectTabIds\(projectId\)/);
     assert.ok(validateAt >= 0 && saveAt > validateAt, 'precondition must run before saveTabs');

@@ -79,7 +79,7 @@ class WorkflowGroups {
       seedGeneration: row.seed_generation, metadata: JSON.parse(row.metadata_json) };
   }
   writable() { if (this.meta().version !== VERSION) fail('workflow_group_version_unsupported'); }
-  read() {
+  read({ directory = false } = {}) {
     const read = () => {
       const meta = this.meta();
       const groups = this.db.prepare('SELECT * FROM workflow_global_groups WHERE deleted=0 ORDER BY group_id').all()
@@ -91,7 +91,7 @@ class WorkflowGroups {
         .map(row => [row.tab_id, row.revision]));
       // Read publication never drags whole legacy tab/archival records into
       // renderer state. Their complete provenance remains addressable below.
-      const contexts = this.db.prepare('SELECT legacy_namespace,tab_id,context_key,group_id,archived FROM workflow_group_contexts ORDER BY legacy_namespace,tab_id,context_key').all()
+      const contexts = directory ? [] : this.db.prepare('SELECT legacy_namespace,tab_id,context_key,group_id,archived FROM workflow_group_contexts ORDER BY legacy_namespace,tab_id,context_key').all()
         .map(row => ({ namespace: row.legacy_namespace, tabId: row.tab_id, contextKey: row.context_key,
           groupId: row.group_id, archived: !!row.archived }));
       return { ...meta, groups, tabGroups, membershipRevisions, contexts };

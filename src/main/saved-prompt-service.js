@@ -1,5 +1,6 @@
 const crypto = require('crypto');
-const { buildPromptOutline } = require('../shared/prompt-outline.cjs');
+const { buildPromptOutline, applyPromptOutline, promptOutlineLocation,
+  promptOutlinePromptId, promptOutlineGroupId } = require('../shared/prompt-outline.cjs');
 const { resolveSavedPromptComposition } = require('./saved-prompt-resolution');
 
 const PROMPT_LIBRARY_READ_CAPABILITY = Object.freeze({
@@ -169,7 +170,7 @@ function createSavedPromptService({ projectManager, onUpdated, onChanged } = {})
     }
     onChanged?.({
       promptIds: ids,
-      groupIds: result.changedGroupIds || [],
+      groupIds: (result.changedGroupIds || []).map(id => result.groupIdMap?.[id] ?? id),
       removedPromptIds: result.removedPromptIds || [],
       removedGroupIds: result.removedGroupIds || [],
       library: result.library,
@@ -199,43 +200,58 @@ function createSavedPromptService({ projectManager, onUpdated, onChanged } = {})
     }
     return descendants;
   };
-  const normalizeScopePositions = (state, groupId) => {
-    const scope = state.prompts.filter((prompt) => (prompt.group_id ?? null) === (groupId ?? null));
-    const byId = new Map(scope.map((prompt) => [asId(prompt.id), prompt]));
-    const childrenOf = (parentId) => scope
-      .filter((prompt) => (prompt.visual_parent_id ?? null) === parentId)
-      .sort((left, right) => left.position - right.position || asId(left.id).localeCompare(asId(right.id)));
-    const ordered = [];
-    const visit = (prompt) => {
-      ordered.push(prompt);
-      for (const child of childrenOf(asId(prompt.id))) visit(child);
+  const outlineOf = state => buildPromptOutline(state.prompts, state.groups);
+  const outlineContainers = outline => {
+    const lists = new Map(), parents = new Map();
+    const visit = (nodes, parentId = 'root') => {
+      lists.set(parentId, nodes.map(node => node.id));
+      for (const node of nodes) {
+        parents.set(node.id, parentId);
+        visit(node.children, node.id);
+      }
     };
-    for (const root of childrenOf(null)) visit(root);
-    // The caller validates the whole graph after mutation. Keep any temporary
-    // invalid orphan visible here so it receives a deterministic position too.
-    for (const prompt of scope) if (!ordered.includes(prompt) && !byId.has(asId(prompt.visual_parent_id))) ordered.push(prompt);
-    ordered.forEach((prompt, index) => { prompt.position = index; });
-    return ordered.map((prompt) => asId(prompt.id));
+    visit(outline);
+    return { lists, parents };
   };
-  const insertAtSiblingPosition = (state, root, position) => {
-    if (!Number.isInteger(position) || position < 0) throw fail('position must be a non-negative integer', 400, 'saved_prompt_position_invalid');
-    const parentId = root.visual_parent_id ?? null;
-    const siblings = state.prompts
-      .filter((prompt) => (prompt.group_id ?? null) === (root.group_id ?? null)
-        && (prompt.visual_parent_id ?? null) === parentId && prompt !== root)
-      .sort((left, right) => left.position - right.position || asId(left.id).localeCompare(asId(right.id)));
-    const target = Math.min(position, siblings.length);
-    siblings.splice(target, 0, root);
-    siblings.forEach((prompt, index) => { prompt.position = index; });
-  };
-  const insertGroupAtPosition = (state, group, position) => {
-    if (!Number.isInteger(position) || position < 0) throw fail('group position must be a non-negative integer', 400, 'prompt_group_position_invalid');
-    const groups = state.groups
-      .filter((item) => item !== group)
-      .sort((left, right) => left.position - right.position || Number(left.id) - Number(right.id));
-    groups.splice(Math.min(position, groups.length), 0, group);
-    groups.forEach((item, index) => { item.position = index; });
-    return groups.map((item) => item.id);
+  const commitOrder = (state, beforeOutline, nodeId, position) => {
+    // The desktop outline repairs legacy relations for display. A point API
+    // mutation must reject an invalid graph, not silently persist that repair.
+    validateLibrary(state);
+    const outline = outlineOf(state);
+    const location = promptOutlineLocation(outline, nodeId);
+    if (!location) throw fail('prompt outline entity not found', 409, 'saved_prompt_outline_invalid');
+    if (position !== undefined) {
+      const group = location.node.entityType === 'group';
+      if (!Number.isInteger(position) || position < 0) throw fail('position must be a non-negative integer', 400,
+        group ? 'prompt_group_position_invalid' : 'saved_prompt_position_invalid');
+      const siblings = location.ancestors.at(-1)?.children || outline;
+      siblings.splice(siblings.indexOf(location.node), 1);
+      siblings.splice(Math.min(position, siblings.length), 0, location.node);
+    }
+    const before = outlineContainers(beforeOutline), after = outlineContainers(outline);
+    const reordered = new Set([...after.lists].filter(([id, values]) => {
+      const old = before.lists.get(id);
+      return !old || old.length !== values.length || old.some((value, index) => value !== values[index]);
+    }).map(([id]) => id));
+    const next = applyPromptOutline({ prompts: state.prompts, promptGroups: state.groups }, outline);
+    if (!next.ok) throw fail('invalid prompt outline: ' + next.reason, 409, 'saved_prompt_outline_invalid');
+    const changedPromptIds = [], changedGroupIds = [];
+    state.prompts = next.prompts.map((prompt, index) => {
+      const old = state.prompts[index];
+      // Only siblings whose order changed need new coordinates. In particular,
+      // a root edit must not renumber members of unrelated groups.
+      if (!reordered.has(after.parents.get(promptOutlinePromptId(prompt.id)))) prompt.position = old.position;
+      if (prompt.position !== old.position || prompt.group_id !== old.group_id
+        || prompt.visual_parent_id !== old.visual_parent_id) changedPromptIds.push(asId(prompt.id));
+      return prompt;
+    });
+    state.groups = next.promptGroups.map((group, index) => {
+      const old = state.groups[index];
+      if (!reordered.has('root')) group.position = old.position;
+      if (group.position !== old.position) changedGroupIds.push(group.id);
+      return group;
+    });
+    return { changedPromptIds, changedGroupIds };
   };
   const moveInState = (state, { stableId, revision, groupId, parentPromptId, position }) => {
     const root = findPrompt(state, stableId);
@@ -254,12 +270,11 @@ function createSavedPromptService({ projectManager, onUpdated, onChanged } = {})
     }
     const descendants = collectSubtreeIds(state, root.id);
     if (parent && descendants.has(asId(parent.id))) throw fail('prompt cannot move under its own subtree', 409, 'saved_prompt_cycle');
+    const beforeOutline = outlineOf(state);
     root.visual_parent_id = parent ? asId(parent.id) : null;
     for (const id of descendants) findPrompt(state, id).group_id = targetGroupId;
-    if (position !== undefined) insertAtSiblingPosition(state, root, position);
-    const normalized = new Set(normalizeScopePositions(state, targetGroupId));
-    if (oldGroupId !== targetGroupId) normalizeScopePositions(state, oldGroupId).forEach((id) => normalized.add(id));
-    return [...new Set([...descendants, ...normalized])];
+    const changed = commitOrder(state, beforeOutline, promptOutlinePromptId(root.id), position);
+    return { ...changed, changedPromptIds: [...new Set([...descendants, ...changed.changedPromptIds])] };
   };
 
   return {
@@ -322,9 +337,10 @@ function createSavedPromptService({ projectManager, onUpdated, onChanged } = {})
           throw fail('parent and target group identify different locations', 409, 'saved_prompt_cross_group_parent');
         }
         const prompt = { id, title, content: text, file_paths: cleanPaths(filePaths), group_id: targetGroupId, visual_parent_id: parent ? asId(parent.id) : null, position };
+        const beforeOutline = outlineOf(state);
         state.prompts.push(prompt);
-        insertAtSiblingPosition(state, prompt, position);
-        return { changedPromptIds: normalizeScopePositions(state, targetGroupId) };
+        const changed = commitOrder(state, beforeOutline, promptOutlinePromptId(id), position);
+        return { ...changed, changedPromptIds: [...new Set([id, ...changed.changedPromptIds])] };
       });
       return publicPrompt(findPrompt(result.library, id));
     },
@@ -336,15 +352,13 @@ function createSavedPromptService({ projectManager, onUpdated, onChanged } = {})
         if (title !== undefined) prompt.title = title;
         if (text !== undefined) prompt.content = text;
         if (filePaths !== undefined) prompt.file_paths = cleanPaths(filePaths);
-        const changedPromptIds = position === undefined
-          ? [asId(prompt.id)]
-          : (insertAtSiblingPosition(state, prompt, position), normalizeScopePositions(state, prompt.group_id ?? null));
-        return { changedPromptIds };
+        const changed = position === undefined ? {} : commitOrder(state, outlineOf(state), promptOutlinePromptId(prompt.id), position);
+        return { ...changed, changedPromptIds: [...new Set([asId(prompt.id), ...(changed.changedPromptIds || [])])] };
       });
       return publicPrompt(findPrompt(result.library, stableId));
     },
     movePrompt(args = {}) {
-      const result = mutate((state) => ({ changedPromptIds: moveInState(state, args) }));
+      const result = mutate((state) => moveInState(state, args));
       return publicPrompt(findPrompt(result.library, args.stableId));
     },
     deletePrompt({ stableId, revision } = {}) {
@@ -367,8 +381,10 @@ function createSavedPromptService({ projectManager, onUpdated, onChanged } = {})
       const temporaryId = `new-group:${crypto.randomUUID()}`;
       const result = mutate((state) => {
         const group = { id: temporaryId, name, description, position, is_collapsed: !!isCollapsed };
+        const beforeOutline = outlineOf(state);
         state.groups.push(group);
-        return { changedGroupIds: insertGroupAtPosition(state, group, position) };
+        const changed = commitOrder(state, beforeOutline, promptOutlineGroupId(group.id), position);
+        return { ...changed, changedGroupIds: [...new Set([group.id, ...changed.changedGroupIds])] };
       });
       return publicGroup(findGroup(result.library, result.groupIdMap[temporaryId]));
     },
@@ -380,12 +396,10 @@ function createSavedPromptService({ projectManager, onUpdated, onChanged } = {})
         if (name === undefined && description === undefined && position === undefined && isCollapsed === undefined) throw fail('group patch required', 400, 'prompt_group_patch_required');
         if (name !== undefined) group.name = name;
         if (description !== undefined) group.description = description;
-        const changedGroupIds = position === undefined
-          ? [group.id]
-          : insertGroupAtPosition(state, group, position);
         if (isCollapsed !== undefined) group.is_collapsed = !!isCollapsed;
         if (typeof group.name !== 'string' || !group.name.trim()) throw fail('group name must be a non-empty string', 400, 'prompt_group_name_invalid');
-        return { changedGroupIds };
+        const changed = position === undefined ? {} : commitOrder(state, outlineOf(state), promptOutlineGroupId(group.id), position);
+        return { ...changed, changedGroupIds: [...new Set([group.id, ...(changed.changedGroupIds || [])])] };
       });
       return publicGroup(findGroup(result.library, groupId));
     },

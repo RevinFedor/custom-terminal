@@ -27,7 +27,7 @@ function catalogHydrationOrder(entries, namespaceOrder, legacyNamespaces = []) {
 
 /** Pure read DTO. Saved descriptors do not assert provider liveness, card-signal
  * freshness, History coverage, or permission to replay a frozen operation. */
-function projectWorkflowCatalog({ snapshot, namespaceOrder = [], legacyNamespaces = [], aliases = [] }) {
+function projectWorkflowCatalog({ snapshot, namespaceOrder = [], legacyNamespaces = [], aliases = [], directory = false }) {
   if (snapshot?.publication?.version !== 1 || snapshot.publication.migrationVersion !== 1)
     throw Object.assign(new Error('workflow_publication_unavailable'), {code:'workflow_publication_unavailable'});
   if (snapshot.globalGroups?.version !== 1)
@@ -35,8 +35,9 @@ function projectWorkflowCatalog({ snapshot, namespaceOrder = [], legacyNamespace
   const workflows = orderedWorkflows(snapshot.workflows, snapshot.publication);
   const workflowIds = new Set(workflows.map(workflow => workflow.id));
   const catalog = new Map(), membership = Object.create(null), rows = Object.create(null), executionRefs = Object.create(null), provenance = [];
+  const executionInputs = Object.create(null), provenanceCounts = Object.create(null);
   const aliasesById = new Map();
-  for (const alias of aliases) {
+  for (const alias of directory ? [] : aliases) {
     const id = alias.globalTabId;
     if (!aliasesById.has(id)) aliasesById.set(id, []);
     aliasesById.get(id).push({namespace:alias.namespace,tabId:alias.tabId});
@@ -46,7 +47,7 @@ function projectWorkflowCatalog({ snapshot, namespaceOrder = [], legacyNamespace
     const reason = !entry.executionResolved || !row || !namespace ? 'unresolved'
       : row.execution_archived === 1 ? 'archived'
         : !workflowIds.has(entry.membership?.workflowId) ? 'membership-unavailable' : null;
-    const executionRef = {
+    const executionRef = directory ? null : {
       subjectVersion:entry.subjectVersion, subject:entry.executionSubject || null,
       namespace:namespace || null, tabId:entry.tabId, cwd:row?.cwd ?? entry.executionSubject?.cwd ?? null,
       storageId:row?.id ?? null, storageRevision:row?.execution_storage_revision ?? null,
@@ -62,10 +63,14 @@ function projectWorkflowCatalog({ snapshot, namespaceOrder = [], legacyNamespace
       visualParentTabId:row?.visual_parent_tab_id || null,
     };
     catalog.set(entry.tabId,{projectId:namespace,tabId:entry.tabId,tab:descriptor,active:!reason,provenance:reason});
-    if (reason) provenance.push({tabId:entry.tabId,workflowId:entry.membership?.workflowId || null,reason,executionRef});
+    if (reason) {
+      provenanceCounts[reason] = (provenanceCounts[reason] || 0) + 1;
+      if (!directory) provenance.push({tabId:entry.tabId,workflowId:entry.membership?.workflowId || null,reason,executionRef});
+    }
     else {
       rows[entry.tabId] = {...descriptor,membership:{workflowId:entry.membership.workflowId,revision:entry.membership.revision}};
-      executionRefs[entry.tabId] = executionRef;
+      if (directory) executionInputs[entry.tabId] = entry;
+      else executionRefs[entry.tabId] = executionRef;
     }
   }
   const headers = workflows.map(workflow => {
@@ -96,13 +101,13 @@ function projectWorkflowCatalog({ snapshot, namespaceOrder = [], legacyNamespace
       memberTabIds:selected.items.map(owner=>owner.tabId),rootIds:tree.map(node=>node.id),nodes,
       groups:[...selected.visibleGroups.values()].map(group=>({id:group.id,memberTabIds:groupMembers.get(group.id) || []}))};
   });
-  return {version:1,projection:'catalog-v1',inventory:'active-membership',
-    workflows:headers,rows,executionRefs,groups:snapshot.globalGroups.groups.map(group=>({
+  return {...(directory ? {kind:'directory-core'} : {version:1,projection:'catalog-v1'}),inventory:'active-membership',
+    workflows:headers,rows,...(directory ? {executionInputs} : {executionRefs}),groups:snapshot.globalGroups.groups.map(group=>({
       id:group.id,revision:group.revision,name:group.name || '',displayName:workflowGroupDisplayName(group),
       color:group.color || null,sessionStatus:group.sessionStatus || null,collapsed:!!group.collapsed,
       reserveWorkflowId:group.reserveWorkflowId || null,missingLegacyDefinition:!!group.missingLegacyDefinition,
     })),
-    provenance,
+    ...(directory ? {provenanceCounts} : {provenance}),
     clocks:{organization:{version:snapshot.publication.version,revision:snapshot.publication.revision,generation:snapshot.publication.generation},
       groups:{version:snapshot.globalGroups.version,revision:snapshot.globalGroups.revision}},
     excludedSignals:['runtime','cardSignals','history'],sourceBindings:'tab'};

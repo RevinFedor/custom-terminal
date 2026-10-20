@@ -1,4 +1,4 @@
-const { buildTerminalUserEnvelope } = require('./sc-desktop-notification-client');
+const { buildTerminalUserEnvelope, isAutomaticResearchNotification } = require('./sc-desktop-notification-client');
 const { TextDecoder } = require('util');
 const MAX_USER_NOTIFICATION_BODY_BYTES = 16 * 1024;
 
@@ -65,6 +65,8 @@ async function userNotificationRequest({ method, tabId, query = {}, body = {}, d
     envelope = buildTerminalUserEnvelope({ ...body, tabId, projectId: source.projectId,
       tabName: source.tabName, createdAt: Date.now() });
   } catch (error) { return { statusCode: 400, body: { ok: false, error: error.message } }; }
+  if (isAutomaticResearchNotification(envelope)) return { statusCode: 409,
+    body: { ok: false, error: 'notification_request_id_reserved', requestId: envelope.requestId } };
   const result = await outbox.enqueue(envelope);
   if (!result.ok) return { statusCode: result.reason === 'request_id_conflict' ? 409 : 503,
     body: { ok: false, error: result.reason, requestId: envelope.requestId,

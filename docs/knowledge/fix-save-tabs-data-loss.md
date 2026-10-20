@@ -76,6 +76,29 @@ commit недоказанным.
 восстановлении. Лог `snapshot-committed` относится к точному проекту и снимку;
 один ранний `state-updated` без commit не является доказательством durability.
 
+## Native Close не должен пересохранять соседние metadata
+
+19.10 архив собственного C уже commit'ился, но последующий полный namespace save
+отказал на stale revision соседнего A. Renderer оставлял C открытым, а rollback
+удалял только что созданную History. Native V2 Close теперь сохраняет исходный
+immutable intent до IPC; Main выдаёт exact archive receipt и завершает только
+замороженную root/file family и необходимые child relations одной транзакцией.
+Namespace membership, subject/storage/revision, late links и group guards
+проверяются по-прежнему; revision A не продвигается и его metadata не пишутся.
+Post-archive failure сохраняет History. Lost ACK читает тот же intent/receipt;
+Stop и shell retirement имеют точные admission/settlement receipts, без повтора
+Archive/Stop/kill при UNKNOWN. Fresh ABSENT того же owner разрешает продолжить
+первоначальное закрытие; чужой input/Stop/run/owner не становится этим proof.
+У normal Stop собственный `pendingLaunch` может законно перейти W1→null.
+Сравнивать лишь конечный null нельзя: W2 мог записаться и уже завершиться.
+Close принимает только exact owned retirement по epoch/last-write witness;
+Stop не очищает replacement W2. Witness сохраняется в том же stop-settled
+receipt и перепроверяется после fresh process await/при recovery. Смена tracker
+epoch даже на том же terminal не получает старое разрешение. Blanket ignore
+pendingLaunch либо любой non-null→null воспроизводят отрицательные controls.
+Source actual Main/Store/private SQLite RED→GREEN отделены от installed Close/
+reopen проверки. Обычные snapshots и legacy Close сохраняют прежнюю сериализацию.
+
 ## Файлы
 - `src/main/database.js` — метод `saveTabs()` (~line 470)
 - `src/main/project-manager.js` — прокси `saveProjectTabs()` с `forceCleanup`

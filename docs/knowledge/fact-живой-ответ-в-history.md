@@ -570,6 +570,18 @@ provider queue ACK возвращал вниз. Первая привязка `n
 после текущего вывода; известный `active` сохраняет обычный порядок нового хода.
 Failed/cancelled не удерживают будущие ответы. Эта логика меняет только порядок
 History, не подтверждение доставки, очередь Main, source identity или scroll writer.
+
+Pending boundary относится только к самим неподтверждённым карточкам, не всему
+суффиксу durable/local списка после первой из них.20Oct tab5957: canonical API
+сохранял правильное user→answer/tool, но старая UNCONFIRMED-карточка уносила поздний
+exact user ниже его ответа при busy-deferred refresh. Partition оставляет только
+pending cards в будущей части, сохраняя их объекты/unknown status, а поздние
+подтверждённые строки отдаёт прежнему physical merge. Это не право считать старый
+Send успешным/failed и не устранение его исходной ошибки admission. Same-text
+не заменяет exact source alias; response/event promotion и canonical adoption
+проверяются отдельно. Без pending fast path не копирует весь durable список.
+Regression: `historyLiveProjection.pendingBarrier.actual.test.mjs` использует
+metadata public API и controlled bodies, не installed DOM/pixels.
 Проверка: `historyPromptOrder.test.ts` и изолированный `history-prompt-order-regression.mjs`.
 
 ## Canonical replacement и геометрия

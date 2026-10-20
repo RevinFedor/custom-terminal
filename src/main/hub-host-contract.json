@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "kind": "noted-mcp-hub",
+  "entry": "mcp-hub.js",
+  "files": {
+    "mcp-hub.js": "c7d9a34a115bb41a62243c7811c8c2392c2e17e4946712df8e23e1b10adf3153",
+    "mcp-browser-maintenance.js": "b271b4621bfbfd71e4aa08d3cf26a490e7d1f82dc2ca6cd72d119fc75f046683",
+    "research-host-protocol.cjs": "c06f01ed1e9494e66edfc5a38083ce1cbefdd43f5440c7c78c7b924ac9a77663",
+    "mcp-hub-config.js": "901fa5bd25d3c7f4f04295fa07bdf8eb610748cb32ef51ff451a850a0ac12329",
+    "child-process-env.js": "62b979e0a26372896ef3d7e3deb7f1bbe7ab9588fc9d517ebee2089c328bced9"
+  }
+}

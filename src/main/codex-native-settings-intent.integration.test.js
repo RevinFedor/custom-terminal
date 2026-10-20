@@ -30,8 +30,11 @@ const compile = source => ts.transpileModule(source, { compilerOptions: {
 
 async function harness() {
   const effective = await import('../renderer/utils/codexEffectiveSettings.mjs');
+  const { createExecutionRevisionAcks } = await import('../renderer/utils/executionRevisionAcks.mjs');
+  const { createWorkflowRelationReceipts } = await import('../renderer/utils/workflowRelationReceipts.mjs');
   const requests = [];
   const writes = [];
+  const warnings = [];
   const durable = { settings: { model: 'gpt-5.6-sol', effort: 'max', proofSessionId: 'W1' }, providerState: null };
   let rendererProjection = () => {};
   const state = { ownerId: 'W1', runSeq: 1, lifecycle: 'L1', inputRevision: 2,
@@ -49,7 +52,8 @@ async function harness() {
   const frame = () => ({ success: true, authoritativeFrameCommitted: true, writeSeq: state.frameSeq,
     committedFrameGeneration: state.frameSeq, lines: state.frame.split('\n').map((text, row) => ({ text, row })) });
   const context = vm.createContext({
-    ...intent, ...picker, ...effective, createCodexNativeSettingsIntentTracker, console: { log() {}, warn() {} },
+    ...intent, ...picker, ...effective, createCodexNativeSettingsIntentTracker,
+    console: { log() {}, warn: (...values) => warnings.push(values.join(' ')) },
     providerStates, terminals: terms, setImmediate,
     ipcMain: { emit() {} },
     getProviderState: () => providerStates.get('T'),
@@ -99,6 +103,8 @@ async function harness() {
     ...effective, tabId: 'T', useRef: value => ({ current: value }), useCallback: callback => callback,
     useWorkspaceStore: { getState: () => rendererState }, get: () => rendererState, set() {},
     terminalRegistry: { getVisibleText: () => state.frame },
+    executionRevisionAcks: createExecutionRevisionAcks(), workflowRelationReceipts: createWorkflowRelationReceipts(),
+    dndShortId: value => String(value),
     projectTabSaveRevisions: new Map(),
     projectTabSaveQueue: { enqueue: (_project, work) => Promise.resolve().then(work) },
     ipcRenderer: { on() {}, removeListener() {}, invoke: async (channel, payload) => {
@@ -113,7 +119,7 @@ async function harness() {
     handleCodexModelEffortIntentDeferred() {}, console: { warn() {}, log() {} },
   });
   vm.runInContext(compile(
-    part(store, 'const saveTabs = (', 'const notifyProjectLayoutChanged =')
+    part(store, 'const serializeTabs = (', 'const notifyProjectLayoutChanged =')
     + '\nglobalThis.methods = {'
     + part(store, '  getCodexSessionId: (tabId) => {', '  updateCodexLiveServiceTier:') + '};'
     + part(terminal, '  const nativeCodexPickerProofRef = useRef<', '  useEffect(() => {\n    if (isInitialized.current')
@@ -124,7 +130,7 @@ async function harness() {
   ), renderer);
   Object.assign(rendererState, renderer.methods);
   rendererProjection = payload => renderer.handleCodexModelEffortIntentApplied({}, payload);
-  return { state, context, renderer, mirror, frame, term, terms, tab, requests, writes, durable, providerStates,
+  return { state, context, renderer, mirror, frame, term, terms, tab, requests, writes, durable, providerStates, warnings,
     enter(origin = 'user') {
       if (state.rendererEnabled) renderer.armNativeCodexPickerProof(term, '\r', origin);
       // The actual intercepted picker helper owns the physical write; hooks
@@ -213,7 +219,9 @@ test('model-only preset acknowledgement takes effort from the proved footer, not
 
 test('ACK and restored composer may arrive in separate frames, but a mismatching footer proves nothing', async () => {
   const h = await harness();
-  h.enter();
+  assert.equal(h.enter().handled, true);
+  const pending = () => vm.runInContext("codexNativeSettingsIntentTracker.hasPending('T')", h.context);
+  assert.equal(pending(), true);
   h.context.observeCodexNativeSettingsIntentOutput('T', '\n• Model changed to gpt-5.6-luna high\n', h.term);
   const commit = text => {
     h.state.frame = text; h.state.frameSeq += 1;
@@ -222,9 +230,13 @@ test('ACK and restored composer may arrive in separate frames, but a mismatching
     return h.context.observeCodexNativeSettingsIntentFrame('T', h.mirror, h.mirror.lastCommittedVisibleSnapshot);
   };
   assert.equal(commit('Select Reasoning Level\n› High\nPress enter to confirm or esc to go back'), null);
+  assert.equal(pending(), true, 'picker frame must retain the gesture');
   assert.equal(commit('›\ngpt-6-astra max · /fixture'), null);
+  assert.equal(pending(), true, 'contrary footer must not consume the gesture');
   assert.equal(h.context.getCodexModelEffortIntentRecord('T').model, 'gpt-5.6-sol');
-  assert.equal(commit('›\ngpt-5.6-luna high · /fixture').applied, true);
+  const result = commit('›\ngpt-5.6-luna high · /fixture');
+  assert.ok(result, JSON.stringify(h.warnings));
+  assert.equal(result.applied, true);
   assert.equal(h.context.getCodexModelEffortIntentRecord('T').model, 'gpt-5.6-luna');
 });
 

@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const {
   classifyTerminalShellDraftProof,
   createTerminalShellReadinessTracker,
-} = require('./terminal-shell-readiness.cjs');
+} = require(process.env.CLOSE_B_TRACKER_SOURCE || './terminal-shell-readiness.cjs');
 
 test('late renderer mount can read the exact current shell prompt boundary', () => {
   const tracker = createTerminalShellReadinessTracker();
@@ -16,6 +16,7 @@ test('late renderer mount can read the exact current shell prompt boundary', () 
     ready: false,
     pid: 101,
     readyAt: null,
+    pendingAgentLaunch: null,
   });
 
   tracker.markPromptReady('tab-a', firstPty, 101, 5000);
@@ -23,6 +24,7 @@ test('late renderer mount can read the exact current shell prompt boundary', () 
     ready: true,
     pid: 101,
     readyAt: 5000,
+    pendingAgentLaunch: null,
   });
 
   assert.equal(tracker.markPromptFrame('tab-a', firstPty, 5000, {
@@ -52,6 +54,7 @@ test('a recreated PTY rejects a stale prompt-ready callback from the old generat
     ready: false,
     pid: 202,
     readyAt: null,
+    pendingAgentLaunch: null,
   });
 });
 

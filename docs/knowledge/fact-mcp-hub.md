@@ -28,7 +28,8 @@ Claude/Codex вкладка ──HTTP──▶ mcp-hub (порт 53133) ──s
   ремапом JSON-RPC id (много клиентов на одну трубу). `initialize` отвечается
   из кэша хендшейка; `server/discover` (проба Claude) отвечается локально.
 - Ребёнок упал → pending-запросы фейлятся, respawn с backoff; следующий запрос
-  прозрачно попадает в новый процесс. Ручной рестарт: `POST /mcp/_restart/<name>`;
+  прозрачно попадает в новый процесс, кроме Browser под persistent maintenance hold.
+  Ручной рестарт: `POST /mcp/_restart/<name>`;
   общий — `POST /mcp/_restart-all`, listener и identity клиентов остаются живыми.
   Совпавшие ручной/общий/catalog recovery объединяются на конкретном ребёнке;
   новый процесс запускается после exit старого, позднее событие старого не может
@@ -45,10 +46,41 @@ Claude/Codex вкладка ──HTTP──▶ mcp-hub (порт 53133) ──s
   непарсируемыми при внешне живом процессе.
 - После успешного занятия порта хаб **реапит осиротевших детей** прошлого хаба (ppid 1 + путь
   сервера из своего списка; `sc-desktop` матчится по `reapMarker` server.js,
-  потому что run.sh экзекается в Electron). bridge.js браузера НЕ реапится.
+  потому что run.sh экзекается в Electron). SOURCE Browser child/helper исключены
+  из marker-only reaper: им нужны собственные journal birth pins. Detached bridge.js
+  браузера также НЕ реапится.
   Проигравший одновременный старт не получает права на reaping. Main получает
   одноразовый IPC ready от нового detached-хаба, затем отпускает IPC; shutdown
   старого подтверждается закрытием его HTTP-соединения перед повторным bind.
+
+### SOURCE19.10: host-owned Browser maintenance
+
+Hub перечитывает SC file fence до всех Browser spawn paths и прямо перед stdin.
+Новый cooperative child удостоверяется SOURCE hash contract; host хранит generation,
+точные child/helper birth pins и UNKNOWN/no-replay carry, не credentials/prompt text.
+`/mcp/_browser-maintenance` — authenticated identity-only control; SC независимо читает
+durable host receipts. Неполный profile scope shared child не разрешает его retirement.
+После worker-open ACK host отвечает release_ready, но запускается только после
+финального Main activation commit. Другие пять bindings/lifecycle не заменяются.
+Старый живой hub под hold не становится cooperative от изменения файлов: controller
+возвращает typed bootstrap blocker, не shutdown/spawn. Это enrolled cohort protocol,
+не certification старых VR/bridge/loaded-CS authority и не installed assertion.
+Private Mac stdio/HTTP/SQLite/WS tests проверяют этот путь с controlled browser/native/
+worker leaves. Darwin Z/<defunct> уже не исполняется; ошибки инспектора не дают absence.
+Enrollment связывает child с parent-selected canonical ingress path, dev/ino pin
+каталога и digest; explicit path передаётся и detached controller. Другой MCP HOME/
+SC_DESKTOP_DIR сохраняется как конфигурация, но не выбирает другую authority.
+Первый epoch/fence записывается до ошибки held и восстанавливается из child journal
+до нового Browser spawn. Пропавший/заменённый binding, epoch или basis не становится
+пустым разрешением. Причина: actual Mac stdio-проба прежде проходила native startup
+в отдельном HOME между file-first hold и host ACK; текущие guards блокируют её.
+Darwin E/P_WEXIT с потерянным argv — typed pending-exit, не replacement и не absence.
+Exact retirement ждёт actual absence/Z; другой birth/inspection failure/timeout
+остаются закрытыми. SOURCE Voice Record теперь использует те же byte-identical
+host wire/authority protocol как отдельный configured Browser MCP-клиент; это не
+новое звено Noted External Research и не смена владельца hub. Его positive/negative
+private checks не покрывают старые VR/bridge/loaded-CS или installed handover.
+Enrolled receipt по-прежнему не объявляет историческое UNKNOWN известным.
 
 ### 19.09.2026: все серверы красные, перезапуск ничего не меняет
 

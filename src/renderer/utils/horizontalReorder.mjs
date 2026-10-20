@@ -61,6 +61,12 @@ export function horizontalInsertIndex(chips, clientX, excludedIds = []) {
 // Keep excluded/source chips in the row geometry: an otherwise empty source
 // row still owns a valid insertion slot until the gesture ends.
 export function wrappedInsertIndex(chips, clientX, clientY, excludedIds = []) {
+  return wrappedInsertTarget(chips, clientX, clientY, excludedIds).at;
+}
+
+// Two pointer positions can name the same flat index: the previous row's tail
+// and the next row's start. Keep that visual distinction without changing order.
+export function wrappedInsertTarget(chips, clientX, clientY, excludedIds = []) {
   const excluded = excludedIds instanceof Set ? excludedIds : new Set(excludedIds || []);
   const rows = [];
   for (const chip of chips || []) {
@@ -80,11 +86,14 @@ export function wrappedInsertIndex(chips, clientX, clientY, excludedIds = []) {
     const row = rows[i];
     const next = rows[i + 1];
     if (!next || clientY < (row.bottom + next.top) / 2) {
-      return before + horizontalInsertIndex(row.chips, clientX, excluded);
+      const within = horizontalInsertIndex(row.chips, clientX, excluded);
+      const first = row.chips.find(chip => !excluded.has(chip.id));
+      return {at: before + within,
+        rowStartId: i > 0 && within === 0 && first ? first.id : null};
     }
     before += row.chips.filter((chip) => !excluded.has(chip.id)).length;
   }
-  return before;
+  return {at: before, rowStartId: null};
 }
 
 export function sameHorizontalOrder(a, b) {

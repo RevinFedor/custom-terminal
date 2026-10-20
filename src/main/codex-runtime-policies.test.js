@@ -20,7 +20,7 @@ function fixture(options = {}) {
   let frame = { valid: true, seq: 1, text: options.text || goal };
   let locked = Promise.resolve();
   const controller = createCodexRuntimePolicyController({
-    capture: () => ({ ...owner }), readFrame: async () => frame,
+    capture: () => ({ ...owner }), readFrame: async () => options.readFrame ? options.readFrame(frame) : frame,
     readPolicy: () => options.policy || {},
     isComposer: value => !!parseCodexVerifiedComposerFooter(value.text),
     withWriteLock: async (_term, work) => { await locked; return work({ active: true }); },
@@ -73,8 +73,8 @@ for (const [label, policy, expected] of [
   h.paint(composer()); await tick(); assert.deepEqual(h.writes, expected);
 });
 
-test('lost provider choice yields finite typed manual state and never retries Enter', async () => {
-  const h = fixture(); h.paint(); await tick(); await h.timers.at(-1)();
+test('fresh still-visible provider choice yields typed manual state and never retries Enter', async () => {
+  const h = fixture(); h.paint(); await tick(); h.paint(); await h.timers.at(-1)();
   const policy = h.controller.read('T');
   assert.equal(policy.manualActionRequired, true);
   const status = projectCodexPolicyRuntime({ sessionStatus: 'starting', busy: false, inputReady: true, liveLifecycle: true }, policy);
@@ -85,6 +85,52 @@ test('lost provider choice yields finite typed manual state and never retries En
     error => error.code === 'codex_resume_goal_action_required' && error.statusCode === 409);
   h.paint(); h.paint(); await tick(); assert.deepEqual(h.writes, ['\r']);
   h.paint(composer()); assert.equal(h.controller.read('T'), null, 'late actual success wins, no retry');
+});
+
+for (const frame of ['uncommitted','same-pre-enter','older','non-dialog','fractional-seq']) {
+  test('Goal confirmation checkpoint keeps an unobserved ' + frame + ' result pending, not manual', async () => {
+    const h = fixture(); h.paint(); await tick(); const action = h.frame;
+    if (frame === 'uncommitted') h.paint(goal, { valid: false });
+    if (frame === 'older') h.paint(goal, { seq: action.seq - 1 });
+    if (frame === 'non-dialog') h.paint('new output without an input proof');
+    if (frame === 'fractional-seq') h.paint(goal, { seq: action.seq + 0.5 });
+    const timersBefore = h.timers.length; await h.timers.at(-1)();
+    assert.equal(h.controller.read('T').manualActionRequired, false);
+    assert.equal(h.controller.read('T').reason, 'provider-result-unobserved');
+    const request = h.controller.readGoalAction('T');
+    assert.equal(request.status, 'unknown'); assert.equal(request.recoveryAvailable, false);
+    assert.deepEqual(request.availableActions, []); assert.equal(request.choiceConfirmed, false);
+    assert.equal(h.controller.applyGoalAction('T', { operationId: request.operationId, requestId:'no-replay', action:'resume' }).accepted, false);
+    assert.equal(h.timers.length, timersBefore, 'a read checkpoint must not create another timer');
+    assert.deepEqual(h.writes, ['\r']);
+    h.paint(composer(), { valid: true, seq: action.seq + 10 });
+    assert.equal(h.controller.readGoalAction('T').status, 'confirmed'); assert.deepEqual(h.writes, ['\r']);
+  });
+}
+
+test('late fresh Goal after unobserved result is manual and explicit-only, never a second automatic Enter', async () => {
+  const h = fixture(); h.paint(); await tick(); await h.timers.at(-1)();
+  assert.equal(h.controller.read('T').manualActionRequired, false);
+  h.paint(); assert.equal(h.controller.read('T').manualActionRequired, true);
+  assert.equal(h.controller.read('T').reason, 'provider-choice-not-confirmed');
+  assert.equal(h.controller.readGoalAction('T').recoveryAvailable, true);
+  h.paint(); await tick(); assert.deepEqual(h.writes, ['\r']);
+});
+
+test('failed Goal confirmation read is unknown until an event, not manual action or a retry timer', async () => {
+  let unavailable = false;
+  const h = fixture({ readFrame: frame => { if (unavailable) throw Error('controlled frame failure'); return frame; } });
+  h.paint(); await tick(); unavailable = true; await h.timers.at(-1)();
+  assert.equal(h.controller.read('T').manualActionRequired, false);
+  assert.equal(h.controller.readGoalAction('T').status, 'unknown'); assert.deepEqual(h.writes, ['\r']);
+  h.paint(composer()); assert.equal(h.controller.readGoalAction('T').status, 'confirmed');
+});
+
+test('usage confirmation behavior is unchanged when its response frame is unobserved', async () => {
+  const h = fixture({ text: usage }); h.paint(); await tick(); h.paint(usage, { valid: false });
+  await h.timers.at(-1)(); assert.equal(h.controller.read('T').type, 'usage-exhaustion');
+  assert.equal(h.controller.read('T').manualActionRequired, true);
+  assert.deepEqual(h.writes, ['\x1b[B','\x1b[B','\r']);
 });
 
 test('synchronous committed result during Enter does not resurrect confirming', async () => {

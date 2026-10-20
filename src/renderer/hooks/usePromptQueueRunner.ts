@@ -65,6 +65,7 @@ import { getAppRuntimeIdentity } from '../utils/appRuntimeIdentity';
 import { appRestartTriggerIsSatisfied } from '../utils/promptQueueAppRestart.mjs';
 import { pendingPromptTabIds, promptTabTriggerMatches, promptTabTriggerReady } from '../utils/promptQueueDependencies.mjs';
 import { hasPendingAgentGoalWork } from '../../shared/agent-work-completion.mjs';
+import { deferredGoalCompletionKey } from '../utils/restartAfterCoordinator.mjs';
 import { hasPromptQueueContextConditionKey, promptQueueContextConditionKeysEqual } from '../../shared/prompt-queue-send-intent.cjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -950,6 +951,7 @@ function clearDeferredOwnerSend(ownerTabId: string, reason: string, release = tr
 // Stop. Future deadlines/dependencies still enter the usual Resume/send path.
 function cancelPreparationsForManualStop(tabId: string): void {
   autoCompactCoordinator?.stop(tabId);
+  deferredGoalNaturalOutcomes.delete(tabId);
   deferredOrchestrationNaturalOutcomes.delete(tabId);
   deferredContinuationPivotReleases.delete(tabId);
   processedNaturalOutcomes.delete(tabId);
@@ -2121,6 +2123,10 @@ function beginValidatedQueueSend(
 
 type BusyStatePayload = {
   goalWork?: any;
+  goalMetadataOnly?: boolean;
+  goalCompletionOffset?: number | null;
+  sessionId?: string | null;
+  lifecycleGeneration?: string | null;
   tabId: string;
   busy: boolean;
   reason?: string;
@@ -2158,6 +2164,11 @@ const deferredOrchestrationNaturalOutcomes = new Map<string, {
   source: string;
   outcomeTs: number;
   liveOwnArmAt?: number | null;
+}>();
+const deferredGoalNaturalOutcomes = new Map<string, {
+  data: BusyStatePayload;
+  key: string;
+  liveOwnArmAt: number | null;
 }>();
 const deferredContinuationPivotReleases = new Map<string, {
   outcomeTs: number;
@@ -2899,7 +2910,7 @@ export function usePromptQueueRunner() {
       const tabId = data.tabId;
       const explicitTaskComplete = data.explicitTaskComplete === true;
       const explicitTaskBlocked = data.explicitTaskBlocked === true;
-      if (explicitTaskComplete || explicitTaskBlocked) {
+      if ((explicitTaskComplete || explicitTaskBlocked) && data.goalMetadataOnly !== true) {
         const currentQueue = usePromptQueueStore.getState().getQueue(tabId);
         if (currentQueue.loopPromptEnabled) {
           usePromptQueueStore.getState().setLoopPromptEnabled(tabId, false);
@@ -3036,10 +3047,22 @@ export function usePromptQueueRunner() {
           return;
         }
 
+        const goalDeferred = data.goalMetadataOnly === true ? deferredGoalNaturalOutcomes.get(tabId) : null;
+        if (data.goalMetadataOnly === true) {
+          if (!goalDeferred || goalDeferred.key !== deferredGoalCompletionKey(data)
+            || busy !== false || prevBusyRef.get(tabId) === true
+            || data.goalWork?.pending !== false || data.goalWork.status !== 'complete'
+            || !isNaturalAgentTurnEndReason(reason)) return;
+          // Preserve the original turn's exact task-completion flags and arm
+          // boundary. This wake supplies Goal metadata, never another turn.
+          data = { ...goalDeferred.data, ...data };
+        }
+
         const wasBusy = prevBusyRef.get(tabId) ?? false;
         prevBusyRef.set(tabId, busy);
 
         if (busy) {
+          deferredGoalNaturalOutcomes.delete(tabId);
           setPromptQueueContextSkipped(usePromptQueueStore.getState().getQueue(tabId), false);
           for (const [ownerTabId, check] of queueConditionChecks) {
             if (ownerTabId === tabId || check.triggerTabId === tabId) queueConditionChecks.delete(ownerTabId);
@@ -3100,6 +3123,7 @@ export function usePromptQueueRunner() {
         // Only authoritative success advances a workflow. An explicit process
         // Stop preserves its configuration; actual failures still disarm it.
         if (!busy && !isNaturalAgentTurnEndReason(reason) && !compactLocalCommandDone) {
+          deferredGoalNaturalOutcomes.delete(tabId);
           coordinator.cancel(tabId, false);
           if (interruptionContinuesWithQueuedTurn(classifiedData)) {
             console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
@@ -3115,12 +3139,17 @@ export function usePromptQueueRunner() {
         // A normal live completion still requires the real busy→idle edge.
         // Replayed restore outcomes bypass this edge check in reconciliation,
         // where their persisted timestamps are the correlation proof.
-        if (!(wasBusy && !busy)) { if (!busy) coordinator.wake(tabId); return; }
+        if (!(wasBusy && !busy) && !goalDeferred) { if (!busy) coordinator.wake(tabId); return; }
         if (compactLocalCommandDone) {
           console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' command=/compact localReason=' + data.localCommandReason + ' → CONTINUE queue after compact');
         }
-        const liveOwnArmAt = hasRuntimeWorkflowArm(tabId)
+        const liveOwnArmAt = goalDeferred ? goalDeferred.liveOwnArmAt : hasRuntimeWorkflowArm(tabId)
           ? promptQueueOutcomeFloor(usePromptQueueStore.getState().getQueue(tabId)) : null;
+        if (goalDeferred) deferredGoalNaturalOutcomes.delete(tabId);
+        else if (hasPendingAgentGoalWork(classifiedData)) {
+          const key = deferredGoalCompletionKey(classifiedData);
+          if (key) deferredGoalNaturalOutcomes.set(tabId, { data: classifiedData, key, liveOwnArmAt });
+        }
         processSuccessfulWorkflowOutcome(classifiedData, channel + '-live', explicitOutcomeTimestamp(classifiedData), false, liveOwnArmAt);
         signalQueueOwnerReadiness(tabId, channel + '-turn-idle');
       };

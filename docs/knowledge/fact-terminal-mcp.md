@@ -303,6 +303,11 @@ Same requestId связан с tab/operation/action; другой payload кон
 После unknown новая явная попытка возможна только по recoveryAvailable и новому
 committed кадру того же интерактивного меню после завершения прежнего writer.
 Старая квитанция остаётся unknown, простой повтор Enter запрещён.
+Если3s проверка после Goal Enter не получила нового current committed результата,
+unknown не является доказанным manual-action: исходный unwritten Send продолжает
+existing event-driven ожидание в своём прежнем preparation scope. Только свежий
+same-menu proof разрешает прежний explicit recovery; GET ничего не нажимает.
+Отменённый/истёкший/failed Send от поздней готовности не возобновляется.
 Квитанции runtime-scoped:1024 без вытеснения, затем явный capacity error;
 после restart namespace новый, старый operationId не может нажать новое меню.
 Ни выбор, ни GET не пересылают failed prompt и не меняют System preference.
@@ -624,8 +629,23 @@ frozen assets и reservation; continuation ждёт вне PTY/global settings q
 после возврата lock повторяет current proof. Готовый кадр отправляет сразу,
 streaming сам не запрещает steering. Stop/manual/owner/settings/expiry отзывают
 будущий ввод; possible Enter сохраняет прежние audit/unknown barriers.
+Если внутри этого Send нужен `/model`, тот же срок проходит через picker до
+exact owned echo; ни его прежние2500ms, ни reader меню не создают ранний lifetime.
+Наблюдение освобождает обе очереди, затем продолжаются оставшиеся стадии той же
+операции под свежими owners, без повторной вставки или нового H/O/A. Settings
+publication и сам prompt требуют окончательного proof, не deferred descriptor.
 В публичном draft IPC отказ подготовки передаётся отдельно от неизвестного
 кадра: final owner re-decoration не должна стирать точную отмену/expiry.
+Новый warm HEAD не заимствует сохранённый startup clock предыдущего запуска,
+даже если тот ещё не истёк или payload оставлен для late-MCP recovery. Ранее
+начатый cold caller несёт точный Main-issued launch ID/receipt и сохраняет свой
+минимальный срок после ready; наличие прежней receipt само не делает новый Send cold.
+Публичные event/snapshot projections тоже снимают `startupWait` у initialized
+текущего lifecycle, даже если input позже закрыт picker-ом. Старый ID не должен
+вновь попадать в новый warm Send через renderer; фактический readiness независим.
+Успешная служебная `/fast` будит тот же ожидающий Send, чтобы поздний blocked
+presence reply не оставил его до expiry. Это только recheck, без нового срока,
+права вставки или replay; механизм — `fact-codex.md`.
 
 Bridge привязан к исходным WebContents/frame. Автоматический renderer loss
 отзывает future input, но сам не освобождает possible-Enter slot как явная
@@ -737,11 +757,21 @@ Main повторно использует её существующий admissi
 Standalone slash и record-without-reply остаются в своих доказательных flows.
 
 Waiting item можно отменить до начала attempt; race с dispatch не объявляется
-доказательством отсутствия прошлой отправки. Явный process Stop/закрытие вкладки снимает принятый backlog и
+доказательством отсутствия прошлой отправки. Desktop History ↩ имеет более точную
+pre-input границу: отдельный Main fence упорядочивает возврат с первым payload
+write, не с запуском CLI или назначением attempt. Он отзывает только выбранный H;
+уже начатый launch продолжает работать, будущий payload отозванного H запрещён.
+Непереданный waiting item убирается прежним queue owner; активный executor сам
+заканчивает no-input путь. После possible-write возврат disabled, unknown barriers
+и native очередь не отменяются. Frozen authoring передаётся в composer до release
+старых asset pins, по durable adoption exact return token. Это не публичный Stop,
+не hide и не разрешение replay; см. `fact-история-как-основная-поверхность.md`.
+Явный process Stop/закрытие вкладки снимает принятый backlog и
 отзывает текущую подготовку через прежний cancellation registry. Interrupt
 по-прежнему относится к текущему turn и не превращается в process Stop.
 Непереданные failed/cancelled snapshots не пропадают по15s UI-таймеру или общей
-receipt-retention: остаются pinned до явного скрытия, image asset IDs входят в
+receipt-retention: остаются pinned до явного скрытия либо durable composer adoption
+при возврате, image asset IDs входят в
 прежний GC inventory. Зависимые cold items удерживают exact proof начального
 provider writer, а не подставляют текущий SID в момент исполнения.
 
@@ -972,7 +1002,8 @@ provider, audit-session и exact row identity; совпадение текста
 на один кадр перед уже сохранённым ответом. ACK failure не скрывает
 каноническую строку; следующий remount повторяет exact reconciliation.
 
-Ручное скрытие локальной карточки — не этот canonical ACK. Durable admission
+Ручное скрытие локальной карточки — не этот canonical ACK и не текущая ↩.
+Durable admission
 может завершиться `not-submitted` ещё до создания physical attempt (например,
 ранний requestFingerprint conflict). Поэтому hide принимает явный `attemptId:null`
 как точную отсутствующую попытку вместе с operation/tab/handoff, но не как wildcard:
@@ -980,6 +1011,12 @@ provider, audit-session и exact row identity; совпадение текста
 ошибкой. Меняется presentation marker, не delivery, settledAt или исходный prompt.
 Ожидать появления attempt у окончательно failed/cancelled карточки бессмысленно;
 Main читает существующую квитанцию сразу. Waiting FIFO cancellation остаётся отдельной.
+`UNCONFIRMED` имеет отдельный X presentation-only с exact unknown/attempt guard:
+сохраняются submitted/UNKNOWN, immutable snapshot, FIFO slot и удержание bytes.
+Hide не запускает audit/Send/Stop/release; поздний прежний exact audit остаётся
+действительным. Для receiptless локальной карточки положительное Main absence
+read разрешает только сохраняющий recovery marker, не новую отрицательную
+квитанцию. Не путать это действие с отменой MCP question/reply.
 
 Для native краткая галочка «принято Mac» читает ту же durable квитанцию, не
 создаёт второй executor/ACK. Exact audit-pending+submitted, typed provider queue
@@ -1109,6 +1146,14 @@ Noted Terminal должен инициировать `npm run build:install` с�
 `run_command("npm run build:install")` или чтение terminal output: управляющая вкладка будет
 убита install-процессом, а readiness после рестарта определяется через MCP `/terminal/tabs`,
 не через таймаут.
+
+SOURCE20.10 штатный внешний installer отдельно включает/завершает same-ID
+operational maintenance (`orchestrationMaintenance.version:1`). Это не prompt
+соседним вкладкам и не обход idle: временные research incidents остаются в UI,
+FULL results продолжают доставляться. Для планового обновления SC есть операторская
+команда `scripts/research-maintenance.cjs begin|complete <operationId>` через live
+Noted API; без capability нельзя выдавать Source/CLI наличие за действующий режим.
+Подробности — fact-build-when-idle::Плановый install без служебных research-промптов.
 
 #### Completion prompt после rebuild — одноразовая доставка.
 

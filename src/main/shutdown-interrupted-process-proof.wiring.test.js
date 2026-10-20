@@ -7,8 +7,9 @@ const test = require('node:test');
 const vm = require('node:vm');
 const shutdown = require('./shutdown-ai-session-snapshot');
 const { resolveCodexReadIdentity } = require('./codex-runtime-contract');
+const { captureShutdownProcessProof } = require('./shutdown-process-proof');
 
-const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+const source = fs.readFileSync(process.env.NOTED_SHUTDOWN_MAIN_SOURCE || path.join(__dirname, 'main.js'), 'utf8');
 
 function block(start, end) {
   const at = source.indexOf(start);
@@ -23,7 +24,9 @@ test('process proof confirms liveness but never invents identity from a saved ro
     'async function augmentShutdownStateFromProcessProof',
     '\n\nfunction markInterruptedAiSessionEntries',
   );
-  assert.match(helper, /for \(const tabId of terminals\.keys\(\)\)/);
+  assert.match(helper, /Array\.from\(terminals\.keys\(\)/);
+  assert.match(helper, /captureShutdownProcessProof\(\{/);
+  assert.match(helper, /readSnapshot: \(\) => getProcessTreeSnapshot\(\{ forceFresh: true \}\)/);
   assert.match(helper, /inspectAiDescendantProcessesByTab\(tabId, null\)/);
   assert.match(helper, /providers\.size > 1/);
   assert.match(helper, /resolveAcceptedClaudeResumeShutdownTarget\(\{/);
@@ -71,14 +74,24 @@ test('shutdown uses bounded canonical writer reconcile and a recovery-only compl
 
 function shutdownHarness() {
   const tabId = 'root-tab-3314';
-  const term = {};
+  const term = { pid: 60628 };
   const state = { proof: null, runSeq: 7, reconcileCalls: 0, lookups: 0, providers: ['codex'], adopted: false };
   const readLease = {
     command: 'codex-c', tabId, sessionId: 'source-a', launchId: 'launch-a',
     terminalToken: term, runSeq: 7, lifecycleGeneration: 'terminal:7', materializedFresh: false,
   };
   const context = {
-    ...shutdown, resolveCodexReadIdentity, Date, Set, Map,
+    ...shutdown, resolveCodexReadIdentity, captureShutdownProcessProof, Date, Set, Map,
+    PROCESS_TREE_SNAPSHOT_TTL_MS: 750, nodePerformance: { now: () => Date.now() },
+    captureAiProcessLookupScope: () => ({ terminal: term }),
+    aiProcessLookupScopeCurrent: (_id, scope) => scope.terminal === term,
+    getAiProcessNameFromCommand: cmd => cmd,
+    getProcessTreeSnapshot: async () => {
+      state.lookups += 1;
+      return { createdAt: Date.now(), processesByPid: new Map(), children: new Map([[term.pid,
+        state.providers.map((cmd, i) => ({ pid: 60629 + i, ppid: term.pid, cmd })),
+      ]]) };
+    },
     console: { log() {}, warn() {} },
     terminals: new Map([[tabId, term]]),
     terminalCommandState: { get: () => ({ runSeq: state.runSeq, isRunning: true }) },
@@ -156,8 +169,8 @@ test('actual augmentation rejects fresh, unresolved first submit, dual owners an
 
 test('a writer adopted after the seed snapshot is re-read without another reconcile', async () => {
   const { context, state, tabId } = shutdownHarness();
-  const inspect = context.inspectAiDescendantProcessesByTab;
-  context.inspectAiDescendantProcessesByTab = async () => {
+  const inspect = context.getProcessTreeSnapshot;
+  context.getProcessTreeSnapshot = async () => {
     state.proof = { sessionId: 'child-b', launchId: 'launch-a' };
     return inspect();
   };

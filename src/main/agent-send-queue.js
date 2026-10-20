@@ -9,7 +9,8 @@ const { isAutomaticPromptQueueRequest, isAutomaticNoWriteWait, isAutomaticReadin
 const { mergeableQueuedSend, queuedSendMergeCompatible, composeQueuedSendMerge } = require('./queued-send-merge');
 const { protectQueueAssets, releaseQueueTransferPin, adoptCompletedQueueTransfers, adoptRunAfterItemAssets } = require('./replay-asset-ownership');
 const { classifyInputSlotRetirement, sendInputSlot } = require('./agent-send-input-slot');
-const { hiddenSendPresentation, isTabMessageNoInputReceipt } = require('../shared/agent-send-receipt-control.cjs');
+const { hiddenSendPresentation, isTabMessageNoInputReceipt, isExternalCompletionNoInputReceipt, isExternalOperationalNoInputReceipt } = require('../shared/agent-send-receipt-control.cjs');
+const { historySendReturnControl } = require('./history-send-return');
 const OPEN = "('waiting','dispatching','awaiting-receipt')";
 const ORDER = 'COALESCE(queue_position,id),id';
 const FAILED = new Set(['not-submitted', 'provider-not-accepted']);
@@ -20,7 +21,8 @@ const consumed = record => record?.state === 'confirmed'
 
 function waitingBeforeInput(record, item, request) {
   return item?.state === 'waiting' && (isAutomaticNoWriteWait(record, request)
-    || isTabMessageNoInputReceipt(record));
+    || isTabMessageNoInputReceipt(record) || isExternalCompletionNoInputReceipt(record, request)
+    || isExternalOperationalNoInputReceipt(record, request));
 }
 
 function applicationQueueReceipt(record, item) {
@@ -61,6 +63,7 @@ class AgentSendQueue {
     this.claimDispatch = claimDispatch;
     this.slotObservations = new Map();
     this.slotWakeSignatures = new Map();
+    this.runtimeWakeRevisions = new Map();
     this.slotDirty = new Set();
     this.disposed = false;
     this.running = new Set();
@@ -102,6 +105,13 @@ class AgentSendQueue {
 
   item(operationKey) {
     return this.db.prepare('SELECT * FROM agent_send_queue WHERE operation_key = ?').get(operationKey) || null;
+  }
+
+  authoringSnapshot(tabId, handoffId) {
+    const rows = this.db.prepare(`SELECT q.request_json FROM agent_send_queue q
+      JOIN agent_send_receipts r ON r.operation_key=q.operation_key WHERE q.tab_id=? AND r.handoff_id=?`).all(tabId, handoffId);
+    if (rows.length > 1) throw new Error('history_return_authoring_ambiguous');
+    return rows.length ? JSON.parse(rows[0].request_json).authoringSnapshot || null : null;
   }
 
   hasUnsettledInput(tabId) {
@@ -305,7 +315,7 @@ class AgentSendQueue {
     return result;
   }
 
-  enqueue({ identity, request, execute, retryNoInputAttemptId = null }) {
+  enqueue({ identity, request, execute, retryNoInputAttemptId = null, retryCompletionNoInput = false, retryOperationalNoInput = false }) {
     // A function is only a current-process preparation callback. The immutable
     // JSON request is the recovery source; it contains no live UI references.
     const snapshot = JSON.parse(JSON.stringify(request));
@@ -320,8 +330,10 @@ class AgentSendQueue {
       if (existing) {
         if (existing.request_hash !== requestHash) return { ok: false, action: 'conflict', code: 'agent_send_handoff_conflict' };
         const record = this.store.get(identity.operationKey);
-        if (existing.state === 'failed' && retryNoInputAttemptId
-          && record?.attemptId === retryNoInputAttemptId && isTabMessageNoInputReceipt(record)) {
+        if (existing.state === 'failed' && (retryNoInputAttemptId
+          && record?.attemptId === retryNoInputAttemptId && isTabMessageNoInputReceipt(record)
+          || retryCompletionNoInput === true && isExternalCompletionNoInputReceipt(record, snapshot)
+          || retryOperationalNoInput === true && isExternalOperationalNoInputReceipt(record, snapshot))) {
           const reservation = this.store.reserveOrGet(identity, { queuedAdmission: true });
           if (!reservation.ok) return reservation;
           // The message owner requested recovery after a proven no-input
@@ -433,7 +445,14 @@ class AgentSendQueue {
     const item = this.item(record.operationKey);
     if (!item) return record;
     const request = JSON.parse(item.request_json);
-    return { ...record, inputSlot: sendInputSlot(record, item), receipt: { promptText: request.prompt,
+    const returnControl = historySendReturnControl(this.store);
+    if (!record.attemptId && item.state === 'waiting' && request.source === 'history-panel'
+      && request.authoringSnapshot && !returnControl.read(record.tabId, record.handoffId)) {
+      returnControl.register({ tabId: record.tabId, handoffId: record.handoffId, provider: record.provider,
+        token: require('node:crypto').randomUUID() }, { allowUnattemptedQueue: true });
+    }
+    return { ...record, historyReturn: returnControl.read(record.tabId, record.handoffId),
+      inputSlot: sendInputSlot(record, item), receipt: { promptText: request.prompt,
       presentationSnapshot: request.presentationSnapshot, authoringSnapshot: request.authoringSnapshot,
       ...(request.ownedAttachments ? { ownedAttachments: request.ownedAttachments,
         attachmentOwnership: attachmentOwnershipReceipt(request.ownedAttachments) } : {}),
@@ -451,9 +470,11 @@ class AgentSendQueue {
     if (!record || this.admitting > 0 || this.disposed) return;
     const item = this.item(record.operationKey);
     if (!item) return;
+    const request = JSON.parse(item.request_json);
     if (!record.deliveryControl?.cancelledAt
-      && (waitingBeforeInput(record, item, JSON.parse(item.request_json))
-        || item.state === 'dispatching' && isAutomaticNoWriteWait(record, JSON.parse(item.request_json)))) {
+      && (waitingBeforeInput(record, item, request)
+        || item.state === 'dispatching' && isAutomaticNoWriteWait(record, request)
+        || ['dispatching', 'awaiting-receipt'].includes(item.state) && isExternalOperationalNoInputReceipt(record, request))) {
       this.db.prepare("UPDATE agent_send_queue SET state = 'waiting', updated_at = ? WHERE operation_key = ?")
         .run(Date.now(), item.operation_key);
       this.parked.add(item.tab_id);
@@ -464,6 +485,11 @@ class AgentSendQueue {
     // the physical scenario until its finally, even after this exact promotion.
     if (consumed(record) || FAILED.has(record.state)) {
       this.finish(item, consumed(record) ? 'completed' : record.deliveryControl?.cancelledAt ? 'cancelled' : 'failed');
+      if (historySendReturnControl(this.store).read(record.tabId, record.handoffId)?.state === 'restored') {
+        this.store.dismissPresentation({ operationKey: record.operationKey, attemptId: record.attemptId,
+          tabId: record.tabId, handoffId: record.handoffId, surface: 'desktop-history' });
+        this.releasePresentation(record.operationKey);
+      }
     }
     this.publishRecord(record);
     this.wake(item.tab_id);
@@ -570,6 +596,10 @@ class AgentSendQueue {
   }
 
   notifyRuntime(tabId, slotSignature = null) {
+    if (this.disposed) return;
+    if (this.running.has(tabId) || this.parked.has(tabId)) {
+      this.runtimeWakeRevisions.set(tabId, (this.runtimeWakeRevisions.get(tabId) || 0) + 1);
+    }
     // Only tabs with an unresolved physical head require this bounded read.
     // It is event driven and coalesced; runtime events never retry old input.
     const changed = slotSignature === null || this.slotWakeSignatures.get(tabId) !== slotSignature;
@@ -590,6 +620,19 @@ class AgentSendQueue {
   }
 
   resume() {
+    if (this.disposed) return;
+    // Older versions terminalized a proven pre-input operational refusal.
+    // Restore only that exact immutable request to the existing FIFO; the
+    // operational owner is checked again by the real executor before input.
+    for (const row of this.db.prepare("SELECT operation_key,request_json FROM agent_send_queue WHERE state='failed' AND json_type(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END,'$.operationalNoticeRef')='object'").all()) {
+      const request = JSON.parse(row.request_json), record = this.store.get(row.operation_key);
+      if (!isExternalOperationalNoInputReceipt(record, request)) continue;
+      this.enqueue({ request, retryOperationalNoInput: true, identity: {
+        operationKey: record.operationKey, surface: record.surface, runId: record.runId, tabId: record.tabId,
+        handoffId: record.handoffId, provider: record.provider, sessionId: record.sessionId,
+        requestFingerprint: record.requestFingerprint, promptHash: record.promptHash, promptLength: record.promptLength,
+      } });
+    }
     for (const row of this.db.prepare(`SELECT DISTINCT tab_id FROM agent_send_queue WHERE state IN ${OPEN}`).all()) {
       this.wake(row.tab_id);
     }
@@ -622,8 +665,10 @@ class AgentSendQueue {
     // Claim synchronously before calling any asynchronous scenario. An event or
     // a second client cannot launch another physical sender in this tab.
     this.running.add(tabId);
+    const runtimeRevisionAtStart = this.runtimeWakeRevisions.get(tabId) || 0;
     const predecessor = item.predecessor_key ? this.store.get(item.predecessor_key) : null;
-    const inheritedSession = !request.expectedTarget?.sessionId && consumed(predecessor)
+    const pinnedLaunch = !!request.expectedTarget?.terminalInstanceId && !!request.expectedTarget?.launchId;
+    const inheritedSession = !request.expectedTarget?.sessionId && !pinnedLaunch && consumed(predecessor)
       ? predecessor.auditIdentity.sessionId : null;
     const executionScope = { requestFingerprint: record.requestFingerprint,
       ...(inheritedSession ? { expectedTarget: { ...request.expectedTarget,
@@ -672,10 +717,14 @@ class AgentSendQueue {
           .run('awaiting-receipt', Date.now(), item.operation_key);
       }
       this.observe(this.store.get(item.operation_key));
+      const afterAttempt = this.store.get(item.operation_key);
+      const automaticWait = isAutomaticNoWriteWait(afterAttempt, request);
       if (this.item(item.operation_key)?.state === 'waiting'
-        && isAutomaticNoWriteWait(this.store.get(item.operation_key), request)) {
+        && (automaticWait || isExternalOperationalNoInputReceipt(afterAttempt, request))) {
         parked = true;
-        this.rerun.delete(tabId); // receipt publication is not readiness evidence
+        if (automaticWait || (this.runtimeWakeRevisions.get(tabId) || 0) === runtimeRevisionAtStart) {
+          this.rerun.delete(tabId); // receipt publication is not readiness evidence
+        } else this.rerun.add(tabId); // a real runtime wake arrived while preparation was still in flight
       } else if (waitingBeforeInput(this.store.get(item.operation_key), this.item(item.operation_key), request)) {
         // A message wake may have requeued the refused attempt before this
         // callback returned. Keep its executor/waiters and the explicit wake.
@@ -709,6 +758,7 @@ class AgentSendQueue {
         this.parked.add(tabId); // No timer, SQL retry loop or global ready gate.
       } else if (!parked || this.item(item.operation_key)?.state !== 'waiting') {
         this.parked.delete(tabId);
+        this.runtimeWakeRevisions.delete(tabId);
         this.executors.delete(item.operation_key);
         this.resolveWaiters(item.operation_key);
         this.wake(tabId);
@@ -848,6 +898,7 @@ class AgentSendQueue {
 
   dispose() {
     this.disposed = true; this.unsubscribe(); this.executors.clear();
+    this.runtimeWakeRevisions.clear();
     for (const operationKey of this.waiters.keys()) this.resolveWaiters(operationKey);
   }
 }

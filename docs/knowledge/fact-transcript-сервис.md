@@ -293,6 +293,16 @@ read proof. `[HistoryRead]` отделяет очередь своей сесс�
 cache/read/preparation, serialization и main delivery; renderer отдельно пишет
 decode. Причина SSD miss и RAM eviction различается, поздний отказ не теряется
 за успешными фазами. Точный словарь/пределы — `логирование-оптимизации.md`.
+Finite HTTP read дополнительно связывает logical read и physical GET attempt с
+этим RPC tuple исключительно через diagnostic envelope, не service payload.
+Worker boot/import/DB-ready, source-epoch wait, session/cold admission и work/reply
+имеют begin/progress; emitted и Main-received времена различаются. Diagnostic
+callback не обходит final source fence: синхронный invalidation остаётся отказом
+с прежними максимум тремя попытками. Disconnect HTTP не cancel-all worker.
+Новые подробные фазы ограничены и включаются для HTTP, а не каждого desktop read;
+их доставка через Main не является независимым свидетельством при его паузе.
+HTTP finish, потери и проверка реальными host socket/Worker —
+`fact-mobile-web.md::Конечные HTTP-чтения: подготовка не равна доставке`.
 Source fingerprint кэша сохранён: изменение реализации, включая этот этап,
 создаёт новую версию disposable cache; первый read после установки может быть
 cold. Это не потеря исходной истории и не разрешение ослаблять проверку версии.

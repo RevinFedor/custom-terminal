@@ -141,6 +141,19 @@ export function syncSessionStartingWithPresence(previous, info, presence, now = 
     return previous;
   }
 
+  // Goal choice and process/readiness proof are independent axes. A fresh
+  // handled Goal must not leave its old manual flag in the unknown/starting
+  // branches below; those branches deliberately retain other startup state.
+  // Missing/unknown policy is not proof of resolution, and this grants no input.
+  if (sameTarget && previous?.manualActionRequired === true
+    && previous.lastNotReady?.reason === 'codex_resume_goal_action_required'
+    && presence.manualActionRequired === false
+    && presence.runtimePolicy?.type === 'resume-goal'
+    && presence.runtimePolicy.phase === 'handled') {
+    previous = { ...previous, manualActionRequired: false,
+      lastNotReady: presence.lastNotReady || null };
+  }
+
   // A provider-capacity outcome ends the loader but leaves the composer
   // usable. Preserve the explanation as a separate, dismissible warning even
   // though inputReady is already true.

@@ -11,6 +11,7 @@ const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
 const ast = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
 const names = ['safePasteAndSubmit', '_safePasteAndSubmitInner', 'finishSafePasteAfterWrite',
   'writeHistorySendEnter',
+  'writeHistorySendPayload', 'publishHistorySendReturn',
   'resolveSafePasteFailureAfterWrite', 'agentSendExecutionFailure', 'withPtyWriteLock',
   'pasteInflight', 'ptyActiveWriteOperation', 'ptyLastQueuedWriteOperation', 'ptyWriteOwners'];
 const source = names.map(name => {
@@ -19,7 +20,7 @@ const source = names.map(name => {
   if (!node) throw new Error('Actual declaration missing: ' + name); return node.getText(ast);
 }).join('\n');
 
-function fixture(t, { open = true, throwEnter = false, deadlineOffset = null } = {}) {
+function fixture(t, { open = true, throwEnter = false, deadlineOffset = null, returnable = false } = {}) {
   let inputRevision = 1, stopRevision = 0, stages = 0, drains = 0, settingsCurrent = true;
   let proof = { success: true, hasDraft: open ? null : false, source: 'headless-main:cursor:10',
     ...(open ? { frameBlocker: 'synchronized-output-open' } : {}) };
@@ -29,6 +30,9 @@ function fixture(t, { open = true, throwEnter = false, deadlineOffset = null } =
   const db = new Database(':memory:'), store = createAgentSendReceiptStore(db);
   const identity = { operationKey: 'history:T:H', tabId: 'T', handoffId: 'H', provider: 'codex',
     surface: 'desktop-history', requestFingerprint: 'immutable', promptHash: 'hash', promptLength: 6 };
+  const returnControl = require('../history-send-return').historySendReturnControl(store);
+  const returnIdentity = { tabId: 'T', handoffId: 'H', provider: 'codex', token: 'return-H' };
+  if (returnable) returnControl.register(returnIdentity);
   const attempt = store.beginAttempt(identity);
   const scope = preparation.createSendPreparationScope({ ...identity, attemptId: attempt.attemptId }, h.clock.now());
   const ownedAttachments = { version: 1, refs: [{ assetId: 'frozen-A', path: '/controlled/A.png' }] };
@@ -41,6 +45,7 @@ function fixture(t, { open = true, throwEnter = false, deadlineOffset = null } =
     deadlineAt: h.clock.now() + deadlineOffset };
   Object.assign(ctx, { ...preparation, agentSendReceiptStore: store, AGENT_SEND_DURABLE_STATES: STORE_STATES,
     ...require('../agent-send-enter-timing'),
+    ...require('../history-send-return'),
     queueMicrotask,
     readAgentSendPreparation: (s, tab, opts, cold) => preparation.readAgentSendPreparation(s, tab, opts, cold, h.clock.now),
     findTabIdForTerm: () => 'T', captureAgentInputIdentity: initialOwner,
@@ -94,7 +99,7 @@ function fixture(t, { open = true, throwEnter = false, deadlineOffset = null } =
     settingsWriteGuard: () => ({ allowed: settingsCurrent, reason: 'settings-changed' }) };
   t.after(async () => { stopRevision++; h.setOwner({ terminalStopRevision: stopRevision }); h.notifyFrame();
     await drainMicrotasks(100); db.close(); });
-  return { ...h, ctx, term, store, identity, attempt, scope, ownedAttachments, writes, events, opts,
+  return { ...h, ctx, term, store, identity, attempt, scope, ownedAttachments, writes, events, opts, returnControl, returnIdentity,
     start: more => ctx.safePasteAndSubmit(term, 'frozen', { ...opts, ...more }),
     get stages() { return stages; }, get drains() { return drains; }, get inputRevision() { return inputRevision; },
     frame(hasDraft = false) { proof = { success: true, hasDraft, source: 'headless-main:cursor:10',

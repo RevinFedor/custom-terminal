@@ -110,6 +110,8 @@ class StorageCleanupService {
     }));
     this.cached = null;
     this.scanInflight = null;
+    this.retentionScanInflight = null;
+    this.inventoryRevision = 0;
   }
 
   getSettings() {
@@ -121,15 +123,26 @@ class StorageCleanupService {
   setSettings(value) {
     const settings = normalizeStorageRetentionSettings(value);
     this.dbManager?.setAppState?.(APP_STATE_KEY, settings);
-    this.cached = null;
+    this._invalidateInventory();
     return settings;
   }
 
-  async scan({ force = false } = {}) {
+  _invalidateInventory() {
+    this.cached = null;
+    this.inventoryRevision += 1;
+  }
+
+  async scan({ force = false, scope = 'full' } = {}) {
+    const retentionOnly = scope === 'retention';
+    const inflightKey = retentionOnly ? 'retentionScanInflight' : 'scanInflight';
+    const revision = this.inventoryRevision;
     const nowMs = this.now();
-    if (!force && this.cached && nowMs - this.cached.scannedAt < SCAN_CACHE_MS) return this.cached;
-    if (this.scanInflight) return this.scanInflight;
-    this.scanInflight = this.scanInventory({
+    // Mutation preflight needs every session/backup and its fresh protection,
+    // not the unrelated build/Test-runs accounting used by Home. Do not join
+    // that potentially slow flight or publish a partial inventory to its UI.
+    if (!retentionOnly && !force && this.cached && nowMs - this.cached.scannedAt < SCAN_CACHE_MS) return this.cached;
+    if (this[inflightKey]) return this[inflightKey];
+    const flight = this.scanInventory({
       sqlite: this.sqlite,
       codexHome: this.codexHome,
       claudeHome: this.claudeHome,
@@ -140,9 +153,20 @@ class StorageCleanupService {
       relationDatabases: this.relationDatabases,
       settings: this.getSettings(),
       testRunRoots: this.testRunRoots,
+      scope: retentionOnly ? 'retention' : 'full',
+      logger: this.logger,
       nowMs,
     }).then((result) => {
       if (result.success !== true) throw deletionError('storage_inventory_failed', 'Storage inventory is unavailable');
+      // Narrow cleanup can finish while full accounting is still in flight.
+      // That old result must not republish removed rows or restore old clocks.
+      // Rejoin/start ONE latest full read after its explicit invalidation;
+      // this is causal recovery, not a timer or a polling loop.
+      if (!retentionOnly && revision !== this.inventoryRevision) {
+        if (this[inflightKey] === flight) this[inflightKey] = null;
+        this.logger.log?.('[StorageInventory:Retry] reason=mutation-during-full-accounting');
+        return this.scan({ force: true });
+      }
       const settings = normalizeStorageRetentionSettings(result.settings);
       // Read the clock after asynchronous I/O and reconcile inside one DB
       // transaction: a binding committed during the scan cannot restore an
@@ -163,12 +187,13 @@ class StorageCleanupService {
         const plan = this.closedTabs.plan(snapshot);
         snapshot.closedTabs = { ready: plan.candidates.length, skipped: plan.skipped };
       }
-      this.cached = snapshot;
+      if (!retentionOnly) this.cached = snapshot;
       return snapshot;
     }).finally(() => {
-      this.scanInflight = null;
+      if (this[inflightKey] === flight) this[inflightKey] = null;
     });
-    return this.scanInflight;
+    this[inflightKey] = flight;
+    return flight;
   }
 
   _getGraceStore() {
@@ -636,7 +661,7 @@ class StorageCleanupService {
     }
     const resolvedOperationId = String(operationId || '').trim()
       || `storage-${source}-${this.now().toString(36)}`;
-    const before = await this.scan({ force: true });
+    const before = await this.scan({ force: true, scope: source === 'retention' ? 'retention' : 'full' });
     let deleteConfirmation = null;
     if (source === 'dashboard') {
       try {
@@ -773,7 +798,7 @@ class StorageCleanupService {
     } finally {
       try { codexProvider?.close?.(); } catch {}
     }
-    this.cached = null;
+    this._invalidateInventory();
     this.logger.log?.('[StorageCleanup] source=' + source
       + ' requested=' + ids.length
       + ' removed=' + removed.length
@@ -803,7 +828,7 @@ class StorageCleanupService {
     maxBytes = DEFAULT_SWEEP_BYTES,
     dryRun = false,
   } = {}) {
-    const inventory = await this.scan({ force: true });
+    const inventory = await this.scan({ force: true, scope: 'retention' });
     if (inventory.settings.enabled !== true) return { success: true, skipped: true, reason: 'retention-disabled' };
     const candidates = inventory.items
       .filter((item) => item.eligible === true)
@@ -839,7 +864,7 @@ class StorageCleanupService {
     const after = { ...inventory, settings: this.getSettings(),
       items: inventory.items.filter(item => !removedIds.has(item.id)) };
     const closed = this.closedTabs ? await this.closedTabs.run({ inventory: after, maxItems: 250 }) : null;
-    this.cached = null;
+    this._invalidateInventory();
     return {
       ...result,
       expiredHistoryIds: closed?.expiredHistoryIds || [],

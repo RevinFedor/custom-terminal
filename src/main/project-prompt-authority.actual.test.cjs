@@ -13,6 +13,8 @@ function fixture(t, n = 2) {
   db.exec(`CREATE TABLE tabs(tab_id TEXT PRIMARY KEY,project_id TEXT,execution_namespace TEXT,name TEXT);
     CREATE TABLE tab_history(tab_id TEXT,project_id TEXT,execution_namespace TEXT,name TEXT);
     CREATE TABLE workflow_org_tabs(tab_id TEXT PRIMARY KEY,execution_json TEXT);
+    CREATE TABLE workflow_org_memberships(tab_id TEXT PRIMARY KEY,workflow_id TEXT);
+    CREATE TABLE workflow_org_workflows(workflow_id TEXT PRIMARY KEY,metadata_json TEXT,deleted_generation INTEGER);
     CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT,path TEXT,icon TEXT,updated_at INTEGER);
     CREATE TABLE history_noise(value TEXT);
     INSERT INTO projects VALUES('P','Project',NULL,NULL,1);`);

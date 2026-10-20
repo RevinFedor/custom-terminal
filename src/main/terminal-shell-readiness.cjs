@@ -3,6 +3,7 @@
 function createTerminalShellReadinessTracker() {
   const states = new Map();
   let launchWriteSequence = 0;
+  let launchEpochSequence = 0;
   const normalizePid = (pid) => (
     pid !== null && pid !== undefined && Number.isFinite(Number(pid))
       ? Number(pid)
@@ -18,6 +19,9 @@ function createTerminalShellReadinessTracker() {
       readyAt: null,
       promptFrame: null,
       pendingAgentLaunch: null,
+      launchEpoch: ++launchEpochSequence,
+      lastLaunchWriteId: null,
+      retiredLaunchWriteId: null,
     };
     states.set(tabId, state);
     return state;
@@ -69,6 +73,8 @@ function createTerminalShellReadinessTracker() {
     if (!state || state.terminalToken !== terminalToken) return false;
     state.pendingAgentLaunch = { writeId: ++launchWriteSequence,
       toolType, launchId: launchId || null, commandStarted: false };
+    state.lastLaunchWriteId = state.pendingAgentLaunch.writeId;
+    state.retiredLaunchWriteId = null;
     markCommandBoundary(tabId, terminalToken);
     return true;
   };
@@ -78,12 +84,28 @@ function createTerminalShellReadinessTracker() {
       state.pendingAgentLaunch.commandStarted = true;
     }
   };
-  const finishAgentLaunch = (tabId, terminalToken, processStopped = false) => {
+  const finishAgentLaunch = (tabId, terminalToken, processStopped = false, expectedLaunch = undefined) => {
     const state = states.get(tabId);
     if (!state || state.terminalToken !== terminalToken || !state.pendingAgentLaunch) return false;
+    // A Stop owns the launch observed on entry. Its late completion cannot
+    // retire a replacement write, including one with the same launch label.
+    if (expectedLaunch !== undefined && (!expectedLaunch
+      || expectedLaunch.epoch !== state.launchEpoch
+      || expectedLaunch.pendingWriteId !== state.pendingAgentLaunch.writeId)) return false;
     if (!processStopped && !state.pendingAgentLaunch.commandStarted) return false;
+    state.retiredLaunchWriteId = state.pendingAgentLaunch.writeId;
     state.pendingAgentLaunch = null;
     return true;
+  };
+
+  // One bounded record in the existing terminal owner. Preserve the last write
+  // after retirement so W1 -> W2 -> null cannot look like W1 -> null.
+  const launchSnapshot = (tabId, terminalToken) => {
+    const state = states.get(tabId);
+    if (!state || state.terminalToken !== terminalToken) return null;
+    return { epoch: state.launchEpoch, writeId: state.lastLaunchWriteId,
+      pendingWriteId: state.pendingAgentLaunch?.writeId || null,
+      retiredWriteId: state.retiredLaunchWriteId };
   };
 
   const remove = (tabId, terminalToken = null) => {
@@ -110,6 +132,7 @@ function createTerminalShellReadinessTracker() {
     markAgentLaunchWrite,
     markAgentLaunchStarted,
     finishAgentLaunch,
+    launchSnapshot,
     markCommandBoundary,
     markPromptFrame,
     markPromptReady,

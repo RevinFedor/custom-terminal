@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import {transformSync} from 'esbuild';
+import React from 'react';
+import {renderToStaticMarkup} from 'react-dom/server';
 import {loadPickerPromptCatalog,loadPromptCatalogUsage,observePreparedPromptCatalog,
   createPreparedCatalogReceiver,promptCatalogChangeAffectsTarget,promptUsageChangeAffectsTarget} from './promptTabSourcesModel.mjs';
 
@@ -14,6 +16,29 @@ function emitter() {
   return{on:(_name,fn)=>listeners.add(fn),removeListener:(_name,fn)=>listeners.delete(fn),
     changed:value=>[...listeners].forEach(fn=>fn({},value)),count:()=>listeners.size};
 }
+
+test('actual Workflow row has one title line and swaps only the leading SVG while preparing',()=>{
+  const source=fs.readFileSync(new URL('./PromptPickerOverlay.tsx',import.meta.url),'utf8');
+  const map=source.indexOf('{flatLeft.map((item) => {');
+  const start=source.indexOf("            if (item.kind === 'project')",map);
+  const end=source.indexOf("            if (item.kind === 'group')",start);
+  assert.ok(map>=0 && start>map && end>start);
+  const js=transformSync('globalThis.renderRow=(item)=>{'+source.slice(start,end)+'};',{loader:'tsx'}).code;
+  for(const status of ['cold','preparing','stale','ready','failed']){
+    const projectReady=status==='ready', catalogPreparing=['cold','preparing','stale'].includes(status);
+    const svg=()=>React.createElement('svg');
+    const context={React,selectedKey:'',pickerLevel:'group',selectedLeftRowRef:{current:null},
+      projectReady,catalogPreparing,projectCatalog:null,currentCatalogState:{status,error:null},
+      catalogStatusText:'DO NOT SHOW SECOND LINE',rowStyle:()=>({}),
+      renderCascadeChevron:()=>React.createElement('i'),Loader2:svg,MessageSquareQuote:svg};
+    vm.runInNewContext(js,context);
+    const html=renderToStaticMarkup(context.renderRow({kind:'project',project:{id:'tab:T',name:'Workflow'}}));
+    assert.equal(html.includes('data-workflow-prompt-loader'),catalogPreparing);
+    assert.ok(html.includes('>Workflow</span>')); assert.ok(!html.includes('font-size:'));
+    assert.ok(!html.includes('DO NOT SHOW SECOND LINE</span>'));
+    assert.equal((html.match(/<svg/g)||[]).length,1);
+  }
+});
 
 test('catalog and usage preserve typed preparing/changed/future errors, never success with a Promise',async()=>{
   for(const code of ['prompt_catalog_preparing','prompt_catalog_changed','root_binding_forward_version']){

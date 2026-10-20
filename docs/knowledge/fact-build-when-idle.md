@@ -11,6 +11,47 @@ DiagnosticReports/Spotlight может коснуться старого отч�
 
 Команда: **`npm run build:i-obs`** (`i` = install, `obs` = observe). Реализация — `scripts/build-when-idle.js` (чистый Node, без зависимостей).
 
+## Плановый install без служебных research-промптов (SOURCE20.10)
+
+Внешний штатный `build-install-noted-terminal.mjs` перед Quit включает durable
+operational maintenance через Noted API, после запуска нового Main завершает тот
+же operationId и проверяет readback. Это только политика доставки временных
+служебных событий ожидающим моделям, не отмена research и не новый idle/Browser
+proof. Исходные запросы и FULL-доставка сохраняются; старые suppressed notices
+после complete не отправляются. Для обновления соседнего SC оператор использует
+`node scripts/research-maintenance.cjs begin <operationId>`, после фактической
+проверки связи — `complete <тот-же-operationId>`; `status` только читает policy.
+
+Первое развёртывание на Main без этого API явно отмечается bootstrap: отсутствие
+старого quiet ACK не выдается за подтверждение. SOURCE передаёт новому Main
+`--research-maintenance-operation=<тот-же-ID>` через launch arguments. RunStore
+ждёт прежнего receipt owner и строго сохраняет begin с exact cancellations до
+operational restore/FIFO resume. Bootstrap complete требует GET-подтверждение
+`startup:{version:1,operationId,durable:true,beforeRestore:true}` и активный тот же ID;
+поздний POST begin больше не считается доказательством quiet startup. Ошибка
+записи/отзыва не даёт ACK или resume; существующий startup owner повторяет ту же
+операцию, не перечитывая старый JSON поверх принятого RAM intent. Подтверждённый
+hold переживает обычный restart; completed ID не открывает новую maintenance.
+Обычная operational policy default-on: отсутствие её settings-поля не отключает
+ночное пробуждение модели; launch descriptor не является глобальным opt-out.
+Неоднозначная ошибка POST не допускает bootstrap fallback. Если после успешной замены API ещё не восстановлен, installer сохраняет
+проверенный новый bundle и same maintenance operation, возвращает failure/pending,
+а не молча откатывает его и не объявляет восстановление завершённым. Это SOURCE
+contract/tests, не свидетельство уже выполненной установки. Старые idle/owner-ACK
+guards и внешний Voice Record callback остаются отдельными механизмами.
+
+При unrelated CURRENT WIP можно заранее подготовить frozen bundle и явно
+зарезервировать `release/prepared-install-intent.json` (version1/pending, baseline
+ASAR SHA, candidate SHA, Source pins). Этот путь выполняет ТОТ ЖЕ внешний installer,
+но не компилирует CURRENT и не публикует его MCP/hook integrations. Под normal install
+lock сверяются baseline/candidate/Source; exact intent атомарно становится claimed
+под Voice Record job nonce. Candidate повторно проверяется в stage, после idle ACK
+и после install. Lost/failed job не разрешает другой cut без разбора receipt;
+manual CURRENT build не потребляет pending prepared intent. Подготовка сама не
+Quit/не install/не launch. Для narrow Main overlay проверяются все ASAR leaves,
+неизменность renderer/прочего runtime, embedded Electron header integrity и прежняя
+локальная codesign identity; подпись сама по себе не проверяет корректный header.
+
 Run After `after app restart` отслеживает identity нового Electron main, а не имя install-команды. `build:install`/alias `build:i`, ожидающий `build:i-obs` и `build:i-cont` удовлетворяют его после замены и открытия приложения; обычный Quit/Open тоже. Package-only build либо отказ сборки до замены не удовлетворяет условие. Возврат `continue`/AI-hop callback и такой queue-item — отдельные явно настроенные сообщения, одно не заменяет другое. Готовность Resume ограничивает физическую отправку карточки, но прошлый assistant outcome не является дополнительным условием запуска; подробности — `fact-prompt-queue.md::Overlay UI`.
 
 ## Замок установки: владелец, а не просто каталог (12.09)

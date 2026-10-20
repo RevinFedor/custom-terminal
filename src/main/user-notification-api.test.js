@@ -57,6 +57,54 @@ test('user notification has a separate stable identity, no alarm/completion fiel
   }
 });
 
+for (const prefix of ['operational-human:research-operational:', 'research-browser-offline:']) {
+  test('automatic Research notice is suppressed before transport: ' + prefix, async t => {
+    let calls = 0;
+    const h = await fixture(t, async () => { calls++; return { ok: true, messageId: 901, sentAt: Date.now() }; });
+    const e = envelope({ requestId: prefix + 'a'.repeat(64), waitSeconds: 0 });
+    await h.outbox.enqueue(e); await h.outbox.attemptUserNotification(e.eventId);
+    const receipt = await h.outbox.readUserNotification('source', e.requestId);
+    assert.equal(calls, 0); assert.equal(receipt.deliveryState, 'suppressed');
+    assert.equal(receipt.errorCode, 'research_automatic_notifications_disabled');
+    assert.equal(receipt.sentAt, null); assert.equal(receipt.messageId, null);
+    assert.equal(receipt.receiptDurable, true);
+  });
+}
+
+test('manual notify_user keeps its text but cannot use reserved automatic Research identities', async t => {
+  let calls = 0;
+  const h = await fixture(t, async () => { calls++; return { ok: true, messageId: 903, sentAt: Date.now() }; });
+  const denied = await h.request('POST', body({ requestId: 'research-browser-offline:' + 'c'.repeat(64) }));
+  assert.equal(denied.statusCode, 409); assert.equal(denied.body.error, 'notification_request_id_reserved');
+  assert.equal(calls, 0);
+  const manual = await h.request('POST', body({ requestId: 'manual-research-status', text: 'External Research: requested manual status', waitSeconds: 0 }));
+  assert.equal(manual.body.deliveryState, 'sent'); assert.equal(calls, 1);
+});
+
+test('pending legacy Research Telegram is retired across restart without claiming its unknown prior delivery failed', async t => {
+  const h = await fixture(t, async () => assert.fail('old owner does not send'));
+  await h.outbox.ready; h.outbox.stop();
+  const e = envelope({ requestId: 'operational-human:research-operational:' + 'b'.repeat(64), waitSeconds: 0 });
+  await fs.writeFile(h.storagePath, JSON.stringify({ version: 1, settled: [], pending: [{ envelope: e,
+    enqueuedAt: Date.now(), attemptCount: 3, nextAttemptAt: 0, durable: true, deliveryState: 'unknown',
+    lastError: { code: 'timeout', message: 'prior HTTP outcome unknown' } }] }));
+  let calls = 0;
+  const restored = createScDesktopNotificationOutbox({ storagePath: h.storagePath, strictLoad: true, logger: quiet,
+    transport: async () => { calls++; return { ok: true, messageId: 902, sentAt: Date.now() }; } });
+  t.after(async () => { restored.stop(); await restored.persistChain; });
+  await restored.ready; await restored.drain(); restored.stop();
+  const saved = JSON.parse(await fs.readFile(h.storagePath, 'utf8'));
+  assert.equal(calls, 0); assert.equal(saved.pending.length, 0);
+  const receipt = saved.settled[0].userReceipt;
+  assert.equal(receipt.deliveryState, 'suppressed'); assert.equal(receipt.previousDeliveryState, 'unknown');
+  assert.equal(receipt.previousAttemptCount, 3); assert.equal(receipt.messageId, undefined);
+  const again = createScDesktopNotificationOutbox({ storagePath: h.storagePath, strictLoad: true, logger: quiet,
+    transport: async () => assert.fail('suppressed backlog must not return after restart') });
+  t.after(async () => { again.stop(); await again.persistChain; });
+  await again.ready;
+  assert.equal((await again.readUserNotification('source', e.requestId)).deliveryState, 'suppressed');
+});
+
 test('durable admission precedes Telegram, and send receipt fixes the requested wait', async t => {
   let calls = 0, stored;
   const sentAt = Date.now();

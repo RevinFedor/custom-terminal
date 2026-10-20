@@ -1,11 +1,13 @@
 import test from 'node:test';
 import {newerWorkflowGroups} from '../utils/workflowGroupClient.mjs';
+import {adoptPaneStripColorGroups} from '../../shared/pane-strip-color-groups.cjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import ts from 'typescript';
 import { transformSync } from 'esbuild';
@@ -15,6 +17,7 @@ import * as spaces from '../utils/workspaceSpacesModel.mjs';
 import { dropFromMru } from '../utils/tabSwitcherModel.mjs';
 import * as persistence from '../utils/tabPersistenceTransactions.mjs';
 import { stopAiBeforeTerminalKill } from '../utils/terminalCloseLifecycle.mjs';
+import {isAiForegroundProcess} from '../utils/aiForegroundProcess.mjs';
 import {beginTabCloseFeedback} from '../utils/tabCloseFeedback.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
 import {createExecutionRevisionAcks} from '../utils/executionRevisionAcks.mjs';
@@ -63,6 +66,11 @@ const persistenceCode = ['executionRevisionAcks','workflowRelationReceipts','ser
   .map(name => variable(name)).filter(Boolean).map(node => 'const ' + node.getText(storeTree) + ';').join('\n');
 const mainSave = walk(mainTree, node => ts.isCallExpression(node) && node.expression.getText(mainTree) === 'ipcMain.handle'
   && node.arguments[0]?.text === 'project:save-tabs');
+const mainArchive = walk(mainTree,node=>ts.isCallExpression(node)&&node.expression.getText(mainTree)==='ipcMain.handle'
+  && node.arguments[0]?.text==='project:archive-tab');
+const archiveCommitNode=walk(mainTree,node=>ts.isFunctionDeclaration(node)&&node.name?.text==='commitTabArchive');
+const closeRuntimeNodes=['captureArchivedCloseRuntimeOwner','workflowCloseGuardOwner','recoverArchivedCloseRuntime'].map(name=>
+  walk(mainTree,node=>ts.isFunctionDeclaration(node)&&node.name?.text===name));
 const bridgeClose = walk(appTree, node => ts.isIfStatement(node) && node.expression.getText(appTree) === "action === 'closeTab'");
 assert.ok(mainSave && bridgeClose);
 const compile = code => transformSync(code, { loader: 'ts', format: 'cjs' }).code;
@@ -102,45 +110,110 @@ function fixture(t, { foreign = false, count = 2 } = {}) {
     [...w.tabs.values()].map(row => ({ ...row, tabId: row.id })), true); };
   saveInitial();
   let api=createWorkflowOrganizationApi({database:manager});
+  const terminals=new Map(),commandStates=new Map(),sdkSessions=new Map();
+  let runtimeGeneration=0;
+  const addRuntime=id=>{const term={pid:100+terminals.size,epoch:'pty:'+id+':'+(++runtimeGeneration),runSeq:1,inputRevision:0,stopRevision:0,
+    kill(){calls.push(['pty.kill',id]);}};terminals.set(id,term);commandStates.set(id,{runSeq:1});return term;};
   api.bootstrap({workspace:{activeSpaceId:'live',spaces:[{id:'live',projectIds:[p,q],layout:{}}]},migrationId:'close-fixture',mutationId:'close-fixture'});
   const mainContext = vm.createContext({ ...ack, validateForceCleanupTabIds,
+    workflowSelectionRuntime:null,
     get workflowOrganization(){return api;},
     projectManager: { get db() { return manager; }, saveProjectTabs: (id, rows, force, interrupted) => {
       if (state.failSave && (!foreign || id === q)) return { success: false, error: 'fixture-save-refusal' };
       return ActualProjectManager.prototype.saveProjectTabs.call({db:manager},id,rows,force,interrupted);
     } }, _gracefulShutdownInProgress: false, Date,
-    noteProjectCardSignalsChanged() {}, tabWorkContext: { syncLinks: async () => {} },
+    noteProjectCardSignalsChanged() {if(state.failPublication)throw Error('controlled-publication-failure');}, tabWorkContext: { syncLinks: async () => {} },
+    scheduleArchiveSideEffects() {},resolveAiToolTypeForTab:()=>null,
+    crypto,terminals,sdkSessions,terminalCommandState:commandStates,conversationOwners:{instanceId:'fixture-main'},
+    captureAgentLaunchFence:id=>({terminalInstanceId:terminals.get(id)?.epoch}),
+    getTerminalLifecycleGeneration:id=>terminals.has(id)?terminals.get(id).epoch+':'+terminals.get(id).runSeq:null,
+    getTerminalInputRevision:id=>terminals.get(id)?.inputRevision || 0,
+    getTerminalStopRevision:id=>terminals.get(id)?.stopRevision || 0,
+    terminalShellReadiness:{snapshot:()=>({pendingAgentLaunch:state.pendingRuntimeLaunch?{writeId:'pending-launch'}:null})},
+    historyMutationInput:{run:(_input,action)=>action()},
+    readAiLifecycleIdentityForTab:async id=>{
+      if(state.beforeProcessProof)await state.beforeProcessProof(id);
+      if(state.missingProcessProof)return null;
+      return {processStatus:state.processStatus || (state.stopResult?.success===false?'unknown':'absent')};
+    },
+    stopAgentProcessScenarioInMain:async(request,guard)=>{calls.push('terminal:stop-ai-process');
+      if(state.beforeProcessStop)await state.beforeProcessStop();
+      const result=state.stopResult || {success:true};
+      if(result.success || state.advanceOwnStopFence) {
+        if(guard?.preSignalGuard && !guard.preSignalGuard().allowed)return {success:false,error:'guard-refused'};
+        guard?.onStopAdmitted?.();
+        if(terminals.has(request.tabId))terminals.get(request.tabId).stopRevision++;
+        if(state.recheckStopGuardAfterFence)state.stopGuardAfterFence=guard.preSignalGuard().allowed;
+      }
+      if(result.success && !state.keepProcessAfterStop)state.processStatus='absent';
+      return result;},
+    stopSdkSession:async(request,options)=>{
+      calls.push('claude-sdk:stop');
+      if(sdkSessions.get(request.tabId)!==options.expectedSession || !options.guard().allowed)
+        return {success:false,error:'sdk-owner-changed'};
+      options.onStopAdmitted();
+      if(state.sdkStopResult?.success===false)return state.sdkStopResult;
+      sdkSessions.delete(request.tabId);return {success:true,hard:true};
+    },
+    terminateCapturedTerminalRuntime:require('../../main/terminal-runtime-identity.cjs').terminateCapturedTerminalRuntime,
+    ipcMain:{emit:(channel,_event,id)=>{calls.push([channel,id]);}},
     console: { log() {}, warn() {} } });
   const saveHandler = vm.runInContext('(' + mainSave.arguments[1].getText(mainTree) + ')', mainContext);
+  vm.runInContext(archiveCommitNode.getText(mainTree),mainContext);
+  for(const node of closeRuntimeNodes)vm.runInContext(node.getText(mainTree),mainContext);
+  const archiveHandler=vm.runInContext('('+mainArchive.arguments[1].getText(mainTree)+')',mainContext);
   const ipc = { send: (channel, id) => calls.push([channel, id]), invoke: async (channel, args) => {
     calls.push(channel);
     if (channel === 'terminal:getCommandState') {
       if (state.commandStateGate) await state.commandStateGate;
-      return {isRunning: false};
+      return {isRunning:state.commandRunning===true};
     }
+    if(channel==='terminal:hasRunningProcess')return {hasProcess:true,processName:'codex',command:'codex'};
+    if(channel==='terminal:stop-ai-process')return state.stopResult || {success:true};
     if (channel === 'project:validate-tab-snapshot') return { success: !state.failPreflight };
-    if (channel === 'project:archive-tab') return state.failArchive
-      ? { success: false, error: 'fixture-archive-refusal' } : { success: true, historyId:state.realArchive
-        ? manager.archiveTab(args.projectId,args.tab,{sourceTabId:args.tab.tabId}) : 1 };
+    if (channel === 'project:archive-tab') {
+      if(args.closeRequest)state.intentSeenBeforeArchive=ws.tabs.get(args.tab.tabId)?.__archiveClosePending?.archiveRequest
+        ?.closeRequest?.mutationId===args.closeRequest.mutationId;
+      if(state.archiveTransportBeforeCommit)throw Error('controlled-archive-delivery-unknown');
+      const result=state.failArchive?{success:false,error:'fixture-archive-refusal'}:state.realArchive
+        ? (state.lastArchiveRequest=structuredClone(args),await archiveHandler({},args)):{success:true,historyId:1};
+      if(state.loseArchiveAck){state.loseArchiveAck=false;throw Error('controlled-archive-ACK-loss-after-commit');}
+      return result;
+    }
     if(channel==='workflow:group-close-guard'){api.groupActions.assertCloseGuard(args);return {success:true};}
     if(channel==='workflow:catalog')return state.catalogOverride || {...api.read(),namespaces:api.listNamespaces()};
-    if (channel === 'project:delete-tab-history-entry') return { success: true };
+    if (channel === 'project:delete-tab-history-entry') return { success:state.realArchive?manager.deleteTabHistoryEntry(args.id):true };
     if (channel === 'project:save-tabs') {
-      if (state.beforeSave) await state.beforeSave(args);
+      const familySave=!args.closeFinalization?.recover && !args.closeFinalization?.runtimeAction;
+      if (familySave && state.beforeSave) await state.beforeSave(args);
       if (state.missingSaveAck) return undefined;
-      state.lastSaveResult=saveHandler({}, args);return state.lastSaveResult;
+      if(args.closeFinalization && familySave) {
+        state.lastFinalizeRequest=structuredClone(args.closeFinalization);
+        if(state.failFinalize)return {success:false,error:'controlled-finalize-refusal'};
+      }
+      const result=await saveHandler({}, args);
+      if(!familySave){
+        if(args.closeFinalization?.runtimeAction==='stop' && state.loseStopAck){state.loseStopAck=false;throw Error('controlled-stop-ACK-loss');}
+        if(args.closeFinalization?.runtimeAction==='kill' && state.loseKillAck){state.loseKillAck=false;throw Error('controlled-kill-ACK-loss');}
+        return result;
+      }
+      state.lastSaveResult=result;
+      if(args.closeFinalization && state.loseFinalizeAck){state.loseFinalizeAck=false;return undefined;}
+      if(args.closeFinalization && state.wrongFinalizeAck){state.wrongFinalizeAck=false;
+        return {...state.lastSaveResult,closeReceipt:{...state.lastSaveResult.closeReceipt,mutationId:'foreign-ack'}};}
+      return state.lastSaveResult;
     }
     if (channel === 'project:layout-changed') { notifications.push(args.projectId); return { success: true }; }
     if (channel === 'orchestration:tab-closed') return { success: true };
     throw Error('unexpected IPC: ' + channel);
   } };
-  const context = vm.createContext({ ...placement, ...panes, ...spaces, ...persistence, collectTabLinkedFiles,isExactGroupCloseGuard,newerWorkflowGroups,
+  const context = vm.createContext({ ...placement, ...panes, ...spaces, ...persistence, collectTabLinkedFiles,isExactGroupCloseGuard,newerWorkflowGroups,adoptPaneStripColorGroups,
     dropFromMru, stopAiBeforeTerminalKill, beginTabCloseFeedback, createProjectTabSaveQueue,createExecutionRevisionAcks,createWorkflowRelationReceipts,
     projectTabSaveQueue: createProjectTabSaveQueue(), projectTabSaveRevisions: new Map(),
     get: () => state, set: patch => Object.assign(state, patch), startTransition: fn => fn(),
     useWorkspaceStore:{getState:()=>state},organizationProjection,reconcileWorkflowOrder,INBOX_WORKFLOW_ID:'__noted_workflow_inbox__',
-    ipcRenderer: ipc, Date, console: { log() {}, warn() {} },
-    resolvePtyAgentOwner: () => null, isAiRuntimeTab: () => false, isAiBusyTab: () => false,
+    ipcRenderer: ipc, Date, crypto, console: { log() {}, warn() {} },
+    resolvePtyAgentOwner: () => null, isAiRuntimeTab: () => state.aiRuntime===true, isAiBusyTab: () => false,isAiForegroundProcess,
     clearPendingAutoTabTitle() {}, autoTabTitleIntents: new Map(),
     usePromptQueueStore: { getState: () => ({ cleanupClosedTab: id => cleanedQueues.push(id) }) },
     useUIStore: { getState: () => ui }, module: { exports: {} } });
@@ -162,12 +235,17 @@ function fixture(t, { foreign = false, count = 2 } = {}) {
     get api(){return api;},get manager(){return manager;},
     addNative:(id,record={})=>{const result=api.createTab({mutationId:'create:'+id,tabId:id,cwd:root,executionNamespace:p,
       workflowId:'live',record:{name:id,tabType:'file',filePath:diskFile,...record}});
-      const tab=manager.getExecutionTabV2({executionNamespace:p,tabId:id}).tab;ws.tabs.set(id,{...tab,id});return result;},
+      const tab=manager.getExecutionTabV2({executionNamespace:p,tabId:id}).tab;ws.tabs.set(id,{...tab,id});
+      if(record.tabType==='terminal')addRuntime(id);return result;},
     keepOwnerOnly:()=>{ws.tabs=new Map([['owner',ws.tabs.get('owner')]]);saveInitial();},
     bridge,closeMembers,persist:()=>actual.saveTabs(p,ws.tabs),refresh:()=>actual.refresh(),updateCwd:(id,cwd,commit)=>actual.updateCwd(p,id,cwd,commit),
     catalog:()=>({...api.read(),namespaces:api.listNamespaces()}),dbIds: id => manager.getProjectTabIds(id),
+    finalize:request=>saveHandler({}, {closeFinalization:request,groupFileCloseGuard:request.groupCloseGuard}),
+    archive:request=>archiveHandler({},request),
+    runtimes:terminals,addRuntime,sdkSessions,mainContext,ipc,commandStates,
     addFile: (id, parent, projectId) => { state.openProjects.get(projectId).tabs.set(id,
-      { ...tab(id, parent, 'file'), filePath: diskFile }); saveInitial(); },
+      { ...tab(id, parent, 'file'), filePath: diskFile });
+      manager.saveTabs(projectId,[...state.openProjects.get(projectId).tabs.values()].map(row=>({...row,tabId:row.id})),true); },
     reopenDb: () => { manager.close(); manager = new DatabaseManager({ existingConnection: new SQLite(dbFile) });api=createWorkflowOrganizationApi({database:manager}); },
     fileBytes: () => fs.readFileSync(diskFile, 'utf8') };
 }
@@ -487,4 +565,345 @@ test('HTTP/MCP propagates archive refusal, with file relations and private SQL u
   await assert.rejects(tool({ tabId: 'owner' }), /HTTP 409: tab_close_not_committed/);
   assert.ok(f.ws.tabs.has('owner') && f.ws.tabs.has('file-0'));
   assert.ok(f.dbIds(f.p).includes('owner') && f.dbIds(f.p).includes('file-0'));
+});
+
+function nativeIncident(t,{foreign=false,linked=false}={}) {
+  const f=fixture(t);f.keepOwnerOnly();f.state.realArchive=true;
+  f.addNative('C',{tabType:'terminal',filePath:null,commandType:'generic'});
+  f.addNative('A',{tabType:'terminal',filePath:null,commandType:'generic'});
+  if(linked) {
+    f.addNative('F',{visualParentTabId:'C'});
+    if(foreign)f.addFile('foreign-file','F',f.q);
+  }
+  return f;
+}
+async function staleNeighbour(f) {
+  assert.equal((await f.persist()).success,true);
+  const cached=f.ws.tabs.get('A'),revision=cached.executionStorageRevision;
+  f.manager.db.prepare('UPDATE tabs SET notes=? WHERE tab_id=?').run('foreign-authoritative-A','A');
+  const current=f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'A'});
+  assert.ok(current.revision>revision);
+  return {cached,revision,current};
+}
+
+test('incident C: actual App/Main/SQL closes exactly C despite unrelated A metadata conflict',async t=>{
+  const f=nativeIncident(t),a=await staleNeighbour(f);
+  const result=await f.bridge({tabId:'C'});
+  assert.equal(result.ok,true,JSON.stringify(f.state.lastSaveResult));assert.equal(result.data.closed,true);
+  assert.ok(!f.ws.tabs.has('C'));assert.ok(!f.dbIds(f.p).includes('C'));
+  assert.equal(f.manager._executionPendingArchiveIds.has('C'),false);
+  assert.deepEqual(f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'A'}).row,a.current.row);
+  assert.equal(f.ws.tabs.get('A'),a.cached);assert.equal(a.cached.executionStorageRevision,a.revision);
+  assert.notEqual(a.cached.notes,'foreign-authoritative-A','no blind hydration of foreign metadata');
+});
+test('incident C: native close retains authoritative History and exact archive mutation receipt',async t=>{
+  const f=nativeIncident(t);await staleNeighbour(f);assert.equal((await f.bridge({tabId:'C'})).ok,true);
+  const receipt=f.state.lastSaveResult.closeReceipt,entry=f.manager.getTabHistoryEntry(receipt.historyId,f.p);
+  assert.equal(entry.tab_id,'C');assert.equal(entry.execution_subject_id,receipt.subjectId);
+  assert.equal(f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'C'}).archived,true);
+  assert.ok(f.manager.db.prepare('SELECT 1 FROM workflow_execution_mutations WHERE mutation_id=?').get(receipt.mutationId));
+  assert.equal(f.calls.filter(x=>x==='project:delete-tab-history-entry').length,0);
+});
+test('incident C: MCP → private HTTP → actual App/Store/Main/SQL returns truthful committed close with stale A',async t=>{
+  const f=nativeIncident(t);await staleNeighbour(f);const {tool}=await httpFixture(t,f);
+  const result=JSON.parse(await tool({tabId:'C'}));assert.equal(result.ok,true);assert.equal(result.closed,true);
+  f.reopenDb();assert.ok(!f.dbIds(f.p).includes('C'));assert.equal(f.manager.getTabHistory(f.p).filter(row=>row.tab_id==='C').length,1);
+});
+test('lost finalize ACK recovers same original receipt without Archive/Stop/terminal-kill replay',async t=>{
+  const f=nativeIncident(t);f.state.loseFinalizeAck=true;
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);assert.ok(f.ws.tabs.has('C'));
+  const request=f.state.lastFinalizeRequest,counts={archive:f.calls.filter(x=>x==='project:archive-tab').length,
+    kill:f.calls.filter(x=>Array.isArray(x)&&x[0]==='terminal:kill').length};
+  assert.equal(f.manager._executionPendingArchiveIds.has('C'),false,'durable finalize already settled Main');
+  assert.equal((await f.bridge({tabId:'C'})).ok,true,JSON.stringify(f.state.lastSaveResult));
+  assert.equal(f.state.lastFinalizeRequest.receipt.mutationId,request.receipt.mutationId);
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,counts.archive);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='terminal:kill').length,counts.kill);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,0);
+  assert.equal(f.manager.getTabHistory(f.p).filter(row=>row.tab_id==='C').length,1);
+});
+test('refused finalization preserves History and recovers original receipt after DB reopen',async t=>{
+  const f=nativeIncident(t);f.state.failFinalize=true;assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  const request=f.state.lastFinalizeRequest;assert.ok(f.manager.getTabHistoryEntry(request.receipt.historyId,f.p));
+  f.reopenDb();f.state.failFinalize=false;
+  assert.equal((await f.bridge({tabId:'C'})).ok,true,JSON.stringify(f.state.lastSaveResult));
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);assert.ok(!f.dbIds(f.p).includes('C'));
+});
+for(const field of ['mutationId','scopeId','historyId','namespace','subjectId','storageId','archivedRevision','manifestHash'])
+  test('exact finalization refuses changed receipt '+field,async t=>{
+    const f=nativeIncident(t);f.state.failFinalize=true;await f.bridge({tabId:'C'});
+    const original=f.state.lastFinalizeRequest,request=structuredClone(original);
+    request.receipt[field]=typeof request.receipt[field]==='number'?request.receipt[field]+1:request.receipt[field]+'-foreign';
+    assert.equal(f.finalize(request).success,false);
+    assert.ok(f.ws.tabs.has('C'));assert.ok(f.manager.getTabHistoryEntry(original.receipt.historyId,f.p));
+  });
+for(const change of ['restored','replaced','history-missing'])test('native finalize rejects '+change+' original owner',async t=>{
+  const f=nativeIncident(t);f.state.failFinalize=true;await f.bridge({tabId:'C'});const request=f.state.lastFinalizeRequest;
+  const row=f.manager.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get('C');
+  if(change==='restored')f.manager.db.prepare('UPDATE tabs SET execution_archived=0 WHERE tab_id=?').run('C');
+  else if(change==='replaced'){
+    f.manager.db.prepare('DELETE FROM tabs WHERE tab_id=?').run('C');const {id,...copy}=row;f.manager._executionInsert('tabs',copy);
+    assert.notEqual(f.manager.db.prepare('SELECT id FROM tabs WHERE tab_id=?').get('C').id,id);
+  }else f.manager.deleteTabHistoryEntry(request.receipt.historyId);
+  assert.equal(f.finalize(request).success,false);assert.ok(f.ws.tabs.has('C'));
+});
+test('native file-family close is atomic across catalogs without touching stale A or document bytes',async t=>{
+  const f=nativeIncident(t,{foreign:true,linked:true});const a=await staleNeighbour(f);
+  assert.equal((await f.bridge({tabId:'C'})).ok,true,JSON.stringify(f.state.lastSaveResult));
+  for(const id of ['C','F']){assert.ok(!f.ws.tabs.has(id));assert.ok(!f.dbIds(f.p).includes(id));}
+  assert.ok(!f.other.tabs.has('foreign-file'));assert.ok(!f.dbIds(f.q).includes('foreign-file'));
+  assert.deepEqual(f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'A'}).row,a.current.row);
+  assert.equal(f.fileBytes(),'# Original document\n');
+});
+for(const change of ['late-link','file-revision','file-namespace'])test('native finalization preserves linked family on '+change,async t=>{
+  const f=nativeIncident(t,{linked:true});f.state.beforeSave=()=>{
+    f.state.beforeSave=null;
+    if(change==='late-link')f.addFile('late','C',f.q);
+    else if(change==='file-revision')f.manager.db.prepare('UPDATE tabs SET notes=? WHERE tab_id=?').run('changed file','F');
+    else {const row=f.manager.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get('F');
+      f.manager.db.prepare('DELETE FROM tabs WHERE tab_id=?').run('F');f.manager._executionInsert('tabs',{...row,execution_namespace:f.q});}
+  };
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.ok(f.ws.tabs.has('C')&&f.ws.tabs.has('F'));
+  assert.equal(f.manager.getExecutionTabV2({executionNamespace:change==='file-namespace'?f.q:f.p,tabId:'F'}).archived,false);
+  assert.ok(f.manager.getTabHistoryEntry(f.state.lastFinalizeRequest.receipt.historyId,f.p));
+});
+test('SQL failure mid-family rolls back every file while retaining root archive and pending receipt',async t=>{
+  const f=nativeIncident(t,{foreign:true,linked:true});
+  f.manager.db.exec("CREATE TEMP TRIGGER close_fail BEFORE DELETE ON tabs WHEN OLD.tab_id='foreign-file' BEGIN SELECT RAISE(ABORT,'controlled-family-write-failure'); END");
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'F'}).archived,false);
+  assert.ok(f.dbIds(f.q).includes('foreign-file'));assert.ok(f.manager._executionPendingArchiveIds.has('C'));
+  const request=f.state.lastFinalizeRequest;assert.ok(f.manager.getTabHistoryEntry(request.receipt.historyId,f.p));
+  f.manager.db.exec('DROP TRIGGER close_fail');assert.equal((await f.bridge({tabId:'C'})).ok,true);
+});
+test('duplicate receipt is idempotent and later restored file invalidates that same completion',async t=>{
+  const f=nativeIncident(t,{linked:true});assert.equal((await f.bridge({tabId:'C'})).ok,true);
+  const request=f.state.lastFinalizeRequest,before=f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'F'}).revision;
+  assert.equal(f.finalize(request).success,true);assert.equal(f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'F'}).revision,before);
+  f.manager.db.prepare('UPDATE tabs SET execution_archived=0 WHERE tab_id=?').run('F');
+  assert.equal(f.finalize(request).success,false);
+});
+test('native close advances only its own child relation and keeps child session/files usable',async t=>{
+  const f=nativeIncident(t);f.addNative('child-C',{tabType:'terminal',filePath:null,visualParentTabId:'C'});
+  f.addNative('child-C-file',{visualParentTabId:'child-C'});const child=f.ws.tabs.get('child-C');
+  assert.equal((await f.bridge({tabId:'C'})).ok,true,JSON.stringify(f.state.lastSaveResult));
+  assert.ok(f.ws.tabs.has('child-C')&&f.ws.tabs.has('child-C-file'));assert.equal(f.ws.tabs.get('child-C').visualParentTabId,undefined);
+  const current=f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'child-C'});
+  assert.equal(current.tab.visualParentTabId,null);assert.equal(current.tab.closedVisualParentTabId,'C');
+  assert.equal(f.ws.tabs.get('child-C').executionStorageRevision,current.revision);
+});
+test('unknown Stop cannot finalize or delete native History and cannot replay Archive/Stop on recovery',async t=>{
+  const f=nativeIncident(t);f.state.aiRuntime=true;f.state.commandRunning=true;
+  f.state.stopResult={success:false,error:'process_lookup_unknown'};
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  const entry=f.manager.getTabHistory(f.p).find(row=>row.tab_id==='C');assert.ok(entry);
+  assert.ok(!f.calls.some(x=>Array.isArray(x)&&x[0]==='terminal:kill'));
+  assert.equal(f.state.lastFinalizeRequest,undefined);
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,1);
+  assert.ok(f.ws.tabs.has('C'));assert.ok(f.manager.getTabHistoryEntry(entry.id,f.p));
+});
+test('renderer replacement is kept even when the exact original SQL close committed',async t=>{
+  const f=nativeIncident(t);let replacement;
+  f.state.beforeSave=()=>{f.state.beforeSave=null;replacement={...f.ws.tabs.get('C'),name:'replacement renderer owner'};f.ws.tabs.set('C',replacement);};
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);assert.equal(f.ws.tabs.get('C'),replacement);
+  assert.equal(f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'C'}).archived,true);
+  assert.equal(f.manager.getTabHistory(f.p).filter(row=>row.tab_id==='C').length,1);
+});
+test('same original archive request returns its receipt; changed body or a new archive operation cannot adopt archived1',async t=>{
+  const f=nativeIncident(t);f.state.failFinalize=true;await f.bridge({tabId:'C'});
+  const original=f.state.lastArchiveRequest,first=await f.archive(original);
+  assert.deepEqual(first.closeReceipt,f.state.lastFinalizeRequest.receipt);
+  await assert.rejects(f.archive({...original,tab:{...original.tab,name:'changed under old key'}}),/archive_close_operation_changed/);
+  await assert.rejects(f.archive({...original,closeRequest:{...original.closeRequest,mutationId:crypto.randomUUID()}}),/archive_close_operation_changed/);
+  assert.equal(f.manager.getTabHistory(f.p).filter(row=>row.tab_id==='C').length,1);
+});
+for(const change of ['late-unrelated','missing-unrelated','omitted-survivor'])test('exact namespace precondition rejects '+change,async t=>{
+  const f=nativeIncident(t);f.state.failFinalize=true;await f.bridge({tabId:'C'});
+  const request=structuredClone(f.state.lastFinalizeRequest);
+  if(change==='late-unrelated')f.addNative('late-unrelated',{tabType:'terminal',filePath:null});
+  if(change==='missing-unrelated')f.manager.db.prepare('DELETE FROM tabs WHERE tab_id=?').run('A');
+  if(change==='omitted-survivor')request.snapshots[0].tabs=request.snapshots[0].tabs.filter(row=>row.tabId!=='A');
+  assert.equal(f.finalize(request).success,false);assert.ok(f.ws.tabs.has('C'));
+  assert.ok(f.manager.getTabHistoryEntry(request.receipt.historyId,f.p));
+});
+test('unknown authority read cannot publish a close ACK or discard its existing History',async t=>{
+  const f=nativeIncident(t);f.state.failFinalize=true;await f.bridge({tabId:'C'});
+  const request=f.state.lastFinalizeRequest;
+  f.manager.db.exec('ALTER TABLE workflow_execution_mutations RENAME TO unavailable_mutations');
+  assert.equal(f.finalize(request).success,false);assert.ok(f.ws.tabs.has('C'));
+  assert.ok(f.manager.getTabHistoryEntry(request.receipt.historyId,f.p));
+});
+test('finalization cannot clear RAM pending inside an uncommitted outer transaction',async t=>{
+  const f=nativeIncident(t);f.state.failFinalize=true;await f.bridge({tabId:'C'});
+  const request=f.state.lastFinalizeRequest;
+  assert.throws(()=>f.manager.db.transaction(()=>f.manager.finalizeArchivedClose(request))(),/archive_close_outer_transaction_not_supported/);
+  assert.ok(f.manager._executionPendingArchiveIds.has('C'));
+  assert.ok(f.manager.getTabHistoryEntry(request.receipt.historyId,f.p));
+});
+test('post-commit publication failure preserves truthful close ACK and its durable History',async t=>{
+  const f=nativeIncident(t);f.state.failPublication=true;
+  assert.equal((await f.bridge({tabId:'C'})).ok,true);assert.ok(!f.ws.tabs.has('C'));
+  assert.ok(f.manager.getTabHistoryEntry(f.state.lastSaveResult.closeReceipt.historyId,f.p));
+});
+test('native close preserves concurrent unrelated renderer metadata and another workspace',async t=>{
+  const f=nativeIncident(t);let pending;const neighbour={projectId:'parallel',tabs:new Map()};
+  f.state.beforeSave=()=>{f.state.beforeSave=null;
+    f.state.openProjects=new Map([...f.state.openProjects,['parallel',neighbour]]);
+    pending={...f.ws.tabs.get('A'),name:'Pending renderer authoring'};f.ws.tabs.set('A',pending);
+  };
+  assert.equal((await f.bridge({tabId:'C'})).ok,true);
+  assert.equal(f.state.openProjects.get('parallel'),neighbour);assert.equal(f.ws.tabs.get('A'),pending);
+  assert.equal(pending.name,'Pending renderer authoring');assert.equal(f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'A'}).tab.name,'A');
+});
+test('finalization cannot change snapshot namespace or drop an original group guard',async t=>{
+  const f=nativeIncident(t);f.state.failFinalize=true;await f.bridge({tabId:'C'});
+  const original=f.state.lastFinalizeRequest,request=structuredClone(original);request.snapshots[0].projectId=f.q;
+  assert.equal(f.finalize(request).success,false);
+  const forged=structuredClone(original);forged.groupCloseGuard={mutationId:'foreign',tabId:'C',guardToken:'foreign'};
+  assert.equal(f.finalize(forged).success,false);assert.ok(f.ws.tabs.has('C'));
+});
+test('wrong successful finalize ACK cannot remove renderer owner; exact original receipt still recovers without replay',async t=>{
+  const f=nativeIncident(t);f.state.wrongFinalizeAck=true;
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);assert.ok(f.ws.tabs.has('C'));
+  assert.equal(f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'C'}).archived,true);
+  assert.equal((await f.bridge({tabId:'C'})).ok,true);
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='terminal:kill').length,1);
+});
+test('review R1: committed archive ACK loss retains immutable intent before invoke and recovers without another archive',async t=>{
+  const f=nativeIncident(t);f.state.loseArchiveAck=true;
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.manager.getExecutionTabV2({executionNamespace:f.p,tabId:'C'}).archived,true);
+  assert.equal(f.manager.getTabHistory(f.p).filter(row=>row.tab_id==='C').length,1);
+  const pending=f.ws.tabs.get('C').__archiveClosePending;
+  assert.ok(pending?.archiveRequest,'original immutable request exists despite missing ACK');
+  assert.equal(f.state.intentSeenBeforeArchive,true);assert.equal(Object.isFrozen(pending.archiveRequest),true);
+  assert.equal(Object.isFrozen(pending.archiveRequest.tab),true);
+  assert.equal(pending.archiveRequest.closeRequest.mutationId,f.state.lastArchiveRequest.closeRequest.mutationId);
+  assert.equal((await f.bridge({tabId:'C'})).ok,true,JSON.stringify(f.state.lastSaveResult));
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+  assert.equal(f.manager.getTabHistory(f.p).filter(row=>row.tab_id==='C').length,1);
+});
+test('review R2: UNKNOWN original Stop stays held then same-owner fresh absence completes without repeating Stop',async t=>{
+  const f=nativeIncident(t);f.state.aiRuntime=true;f.state.commandRunning=true;
+  f.state.stopResult={success:false,error:'process_lookup_unknown'};f.state.processStatus='unknown';
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal((await f.bridge({tabId:'C'})).ok,false,'unknown remains held');
+  f.state.processStatus='absent';
+  assert.equal((await f.bridge({tabId:'C'})).ok,true,JSON.stringify(f.state.lastSaveResult));
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,1);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='terminal:kill').length,1,'only the original owned shell teardown');
+});
+for(const change of ['replacement','runSeq','inputRevision','stopRevision'])test('review R2: later absent proof refuses '+change,async t=>{
+  const f=nativeIncident(t);f.state.aiRuntime=true;f.state.commandRunning=true;f.state.stopResult={success:false,error:'unknown'};
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  if(change==='replacement')f.addRuntime('C');else f.runtimes.get('C')[change]++;
+  f.state.processStatus='absent';assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,1);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='terminal:kill').length,0);
+  assert.ok(f.ws.tabs.has('C'));
+});
+test('review R2: original admitted Stop fence advances once; later absence recovers that owned fence, not latest revision',async t=>{
+  const f=nativeIncident(t);f.state.aiRuntime=true;f.state.commandRunning=true;f.state.advanceOwnStopFence=true;
+  f.state.stopResult={success:false,error:'exit-observation-unknown'};
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);assert.equal(f.runtimes.get('C').stopRevision,1);
+  f.state.processStatus='absent';assert.equal((await f.bridge({tabId:'C'})).ok,true);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,1);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='pty.kill').length,1);
+});
+test('review R2: owner replacement during fresh process observation never kills either owner',async t=>{
+  const f=nativeIncident(t);f.state.aiRuntime=true;f.state.commandRunning=true;f.state.stopResult={success:false,error:'unknown'};
+  await f.bridge({tabId:'C'});f.state.processStatus='absent';
+  f.state.beforeProcessProof=()=>{f.state.beforeProcessProof=null;f.addRuntime('C');};
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='pty.kill').length,0);
+});
+for(const phase of ['Stop','Kill'])test('review: lost '+phase+' ACK recovers exact original runtime step without another signal',async t=>{
+  const f=nativeIncident(t);f.state.aiRuntime=true;f.state.commandRunning=true;f.state['lose'+phase+'Ack']=true;
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);assert.ok(f.ws.tabs.has('C'));
+  assert.equal((await f.bridge({tabId:'C'})).ok,true,JSON.stringify(f.state.lastSaveResult));
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,1);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='pty.kill').length,1);
+});
+test('review R1: archive outcome with no authoritative journal remains held without new Archive/Stop/kill',async t=>{
+  const f=nativeIncident(t);f.state.archiveTransportBeforeCommit=true;
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);assert.ok(f.ws.tabs.get('C').__archiveClosePending);
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,0);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='pty.kill').length,0);
+});
+test('review R1: original frozen archive body survives renderer authoring changes; altered recovery request refuses',async t=>{
+  const f=nativeIncident(t);f.state.loseArchiveAck=true;await f.bridge({tabId:'C'});
+  const pending=f.ws.tabs.get('C').__archiveClosePending,original=pending.archiveRequest;
+  const wrong=structuredClone(original);wrong.tab.name='foreign recovery body';
+  const before=f.manager.db.prepare('SELECT COUNT(*) n FROM workflow_execution_mutations').get().n;
+  assert.equal((await f.finalize({recover:true,archiveRequest:wrong})).success,false);
+  assert.equal(f.manager.db.prepare('SELECT COUNT(*) n FROM workflow_execution_mutations').get().n,before,'recovery read does not mutate journal');
+  assert.equal(pending.archiveRequest,original);assert.equal((await f.bridge({tabId:'C'})).ok,true);
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+});
+test('review R1: archive ACK loss while original AI still exists admits its first guarded Stop exactly once',async t=>{
+  const f=nativeIncident(t);f.state.aiRuntime=true;f.state.commandRunning=true;f.state.processStatus='found';
+  f.state.loseArchiveAck=true;f.state.recheckStopGuardAfterFence=true;
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,0);
+  assert.equal((await f.bridge({tabId:'C'})).ok,true);
+  assert.equal(f.state.stopGuardAfterFence,true,'same operation may continue after its own single markAiStopping fence');
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,1);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='pty.kill').length,1);
+});
+test('review R2: success receipt without fresh absence cannot kill a still-present process',async t=>{
+  const f=nativeIncident(t);f.state.aiRuntime=true;f.state.commandRunning=true;
+  f.state.processStatus='found';f.state.keepProcessAfterStop=true;
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='pty.kill').length,0);
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,1);
+});
+test('actual shared Stop scenario forwards private close guards, while ordinary Stop has unchanged options',async()=>{
+  const node=walk(mainTree,n=>ts.isFunctionDeclaration(n)&&n.name?.text==='stopAgentProcessScenarioInMain');
+  const guard={preSignalGuard:()=>({allowed:true}),onStopAdmitted:()=>{}};let options;
+  const run=vm.runInNewContext('('+node.getText(mainTree)+')',{
+    require:()=>({sendIntentCancellationAvailable:()=>true}),path,srcMainDir:'/private-source',
+    prepareStopPendingSends:()=>({ok:true,inputs:[]}),console:{log(){}},
+    stopAiProcessInTabSerialized:async(_id,value)=>{options=value;return {success:true};},
+  });
+  assert.equal((await run({tabId:'C',reason:'close-tab'},guard)).success,true);
+  assert.equal(options.preSignalGuard,guard.preSignalGuard);assert.equal(options.onStopAdmitted,guard.onStopAdmitted);
+  assert.equal((await run({tabId:'C',reason:'close-tab'})).success,true);
+  assert.equal(options.preSignalGuard,undefined);assert.equal(options.onStopAdmitted,undefined);
+});
+for(const lost of ['Archive','Stop'])test('review: native SDK '+lost+' ACK loss recovers its original guarded hard-stop, without PTY kill',async t=>{
+  const f=fixture(t);f.keepOwnerOnly();f.state.realArchive=true;
+  f.addNative('S',{tabType:'claude-sdk',filePath:null,commandType:'generic'});
+  f.sdkSessions.set('S',{stopObservation:{inputRevision:0,tasks:new Set()}});
+  f.state['lose'+lost+'Ack']=true;
+  assert.equal((await f.bridge({tabId:'S'})).ok,false);assert.ok(f.ws.tabs.has('S'));
+  assert.equal((await f.bridge({tabId:'S'})).ok,true,JSON.stringify(f.state.lastSaveResult));
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+  assert.equal(f.calls.filter(x=>x==='claude-sdk:stop').length,1);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='pty.kill').length,0);
+});
+test('review: missing typed process proof never becomes absence or permission to continue',async t=>{
+  const f=nativeIncident(t);f.state.missingProcessProof=true;
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.calls.filter(x=>x==='project:archive-tab').length,1);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='pty.kill').length,0);
+  assert.ok(f.ws.tabs.has('C'));
+});
+test('review: new pending launch fences late absence and never repeats the original Stop',async t=>{
+  const f=nativeIncident(t);f.state.aiRuntime=true;f.state.commandRunning=true;f.state.stopResult={success:false,error:'unknown'};
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  f.state.pendingRuntimeLaunch=true;f.state.processStatus='absent';
+  assert.equal((await f.bridge({tabId:'C'})).ok,false);
+  assert.equal(f.calls.filter(x=>x==='terminal:stop-ai-process').length,1);
+  assert.equal(f.calls.filter(x=>Array.isArray(x)&&x[0]==='pty.kill').length,0);
 });

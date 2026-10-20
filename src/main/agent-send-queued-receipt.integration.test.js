@@ -95,6 +95,7 @@ function harness(t, { outcome = 'queued', provider = 'codex', scopeLoss = 'termi
   }
   const context = vm.createContext({
     require, path, srcMainDir: __dirname,
+    ...require('./agent-send-preparation'),
     compactSendReceiptPresentation,
     ...registryModule,
     AGENT_SEND_RECEIPT_STATES: registryModule.RECEIPT_STATES,

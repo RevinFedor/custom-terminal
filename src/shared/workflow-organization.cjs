@@ -7,7 +7,7 @@ const EXECUTION_SUBJECT_VERSION = 2;
 const GLOBAL_EXECUTION_NAMESPACE = '__tab_catalog_v2__';
 const INBOX_WORKFLOW_ID = '__noted_workflow_inbox__';
 const LAYOUT_FIELDS = Object.freeze(['windowDisplayKey', 'windowDisplayLayouts',
-  'splitPanes', 'splitFocusedIndex', 'splitSizes', 'centerStrips',
+  'splitPanes', 'splitFocusedIndex', 'splitSizes', 'centerStrips', 'centerStripRowPlacements',
   'activeProjectId', 'focusedProjectId', 'activeSpaceTab']);
 const clone = value => JSON.parse(JSON.stringify(value));
 const fail = (code, details = {}) => {
@@ -89,7 +89,7 @@ function mergeLayout(previous, requested) {
       });
     }
     if (next && typeof next === 'object') {
-      const dictionary = field === 'windowDisplayLayouts' || field === 'centerStrips';
+      const dictionary = field === 'windowDisplayLayouts' || field === 'centerStrips' || field === 'centerStripRowPlacements';
       const out = !dictionary && old && typeof old === 'object' && !Array.isArray(old) ? clone(old) : {};
       for (const [field, value] of Object.entries(next)) Object.defineProperty(out, field,
         { value: merge(old?.[field], value, field), enumerable: true, writable: true, configurable: true });

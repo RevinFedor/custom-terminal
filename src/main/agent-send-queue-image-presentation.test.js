@@ -80,6 +80,9 @@ test('actual bounded list IPC and live publication carry identical proven image 
   let handler;
   vm.runInNewContext(main.slice(start,end),{ipcMain:{handle:(_name,fn)=>{handler=fn;}},path,srcMainDir:__dirname,
     agentSendReceiptStartupReady:Promise.resolve(),agentSendReceiptStore:{list:()=>[r]},imagePresentationFromReceipt,
+    // This project-API image fixture has no desktop return registration. The
+    // separate return IPC/SQLite suite exercises its real durable controller.
+    historySendReturnControl:()=>({read:()=>null}),
     require:()=>({projectQueuedSendReceipt:x=>x,applicationQueueInfo:()=>r.applicationQueue})});
   const listed=await handler(null,{tabId:r.tabId});let live;
   livePublisher(value=>{live=value;}).publish(r);

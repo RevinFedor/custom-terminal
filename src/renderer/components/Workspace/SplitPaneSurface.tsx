@@ -11,6 +11,7 @@ import PersistentPaneTimeline from './PersistentPaneTimeline';
 import ForkPendingTimeline from './ForkPendingTimeline';
 import ClaudeControlBar from './ClaudeControlBar';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
+import {StationaryHistorySurfaceToggle} from './SideSurfaceToggleButton';
 import { useAgentLifecycle } from './useAgentLifecycle';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import { useCodexSurfaceReadSessionId } from '../../hooks/useCodexSurfaceReadSessionId';
@@ -714,6 +715,7 @@ export default function SplitPaneSurface({
                 embedded
                 embeddedFill
                 mainSurface
+                sideSurfaceToggleHosted
                 projectId={projectId}
                 onSwapPrimarySurface={showOtherSurface}
                 terminalIsPrimary={false}
@@ -825,7 +827,9 @@ export default function SplitPaneSurface({
               zIndex: 140,
               pointerEvents: 'none',
             }}
-          />
+          >
+            {historySelected&&surfacesAwake&&<StationaryHistorySurfaceToggle tabId={tabId}/>}
+          </div>
 
           {surfacesAwake && <TabTaskPlanPanel
             bottomInset={historyControlsHeight}

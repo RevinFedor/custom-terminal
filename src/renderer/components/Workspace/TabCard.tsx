@@ -50,6 +50,8 @@ export interface TabCardProps extends React.HTMLAttributes<HTMLElement> {
   activityOverride?: Activity;
   geometry?: { paddingY: number; paddingX: number; paddingLeft: number; borderRadius: number; gap?: number };
   fontSize?: number;
+  /** Pane group outline is below these two overhanging signals. */
+  cornerSignalZIndex?: number;
   onTaskClick?: (taskId: string, event: React.MouseEvent<HTMLButtonElement>) => void;
   /** Opt-in only for placed pane cards; other consumers keep their own lanes. */
   onLinkedFileOpen?: (file: LinkedFile) => void;
@@ -62,7 +64,7 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
   pressed = false, fullWidth = false, truncate = true, showShownStripe = false,
   showProjectIcon: _showProjectIcon = false, showTaskMarkers: _showTaskMarkers, reserveSignalSpace = false, interactiveStatus = false, chooser = false,
   label, children, trailingActions, sharedActivity = null, activityOverride,
-  geometry, fontSize, onTaskClick: _onTaskClick, onLinkedFileOpen, linkedFilesMode = 'menu', style, onMouseEnter, onMouseLeave, ...elementProps
+  geometry, fontSize, cornerSignalZIndex = 8, onTaskClick: _onTaskClick, onLinkedFileOpen, linkedFilesMode = 'menu', style, onMouseEnter, onMouseLeave, ...elementProps
 }, ref) {
   const [hovered, setHovered] = useState(false);
   const nativeQuestion = useCodexNativeQuestion(tabId);
@@ -182,8 +184,8 @@ const LiveTabCard = forwardRef<HTMLElement, TabCardProps>(function LiveTabCard({
     {nativeQuestion && <span data-tab-codex-question-ring aria-hidden
       className="tab-codex-question-ring noted-infinite-animation" style={{ zIndex: 3 }} />}
     {!chooser && <TabProcessBar {...activity} radius={metrics.borderRadius} zIndex={4} />}
-    <TabTopLeftSignals fastActive={fastActive} contextPct={contextPct} minContextPct={50} zIndex={8} muted={muted} />
-    <TabContextUpdateBadge active={contextUpdate} />
+    <TabTopLeftSignals fastActive={fastActive} contextPct={contextPct} minContextPct={50} zIndex={cornerSignalZIndex} muted={muted} />
+    <TabContextUpdateBadge active={contextUpdate} zIndex={cornerSignalZIndex} />
     <TabCompletionNotificationAlert fired={fired} />
     <TabCompletionNotificationBadge armed={armed} persistent={persistent} fired={fired} />
     {interactiveStatus ? <TabStatusMarkerButton projectId={projectId} tabId={tabId} color={status?.color} title={status?.label} topOffsetPx={hasLinkedFiles&&titleLayout?0:undefined} />
@@ -212,7 +214,7 @@ const ChooserTabCard = forwardRef<HTMLElement, TabCardProps>(function ChooserTab
   projectId, tabId, as = 'span', shown, active, selected, pressed, fullWidth, truncate = true,
   showShownStripe, showProjectIcon: _showProjectIcon, showTaskMarkers: _showTaskMarkers, reserveSignalSpace: _reserveSignalSpace, interactiveStatus: _interactiveStatus, chooser: _chooser,
   label, children, trailingActions, sharedActivity: _sharedActivity, activityOverride: _activity,
-  geometry, fontSize, onTaskClick: _onTaskClick, onLinkedFileOpen: _onLinkedFileOpen, linkedFilesMode: _linkedFilesMode, style, onMouseEnter, onMouseLeave, ...props
+  geometry, fontSize, cornerSignalZIndex: _cornerSignalZIndex, onTaskClick: _onTaskClick, onLinkedFileOpen: _onLinkedFileOpen, linkedFilesMode: _linkedFilesMode, style, onMouseEnter, onMouseLeave, ...props
 }, ref) {
   const configuredGeometry = useUIStore(s => s.tabGeometry);
   const configuredFont = useUIStore(s => s.tabsFontSize);

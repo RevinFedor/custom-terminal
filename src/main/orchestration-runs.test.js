@@ -2311,6 +2311,7 @@ test('orchestration settings persist and are snapshotted into new runs', async (
       successAutoStopMs: 5678,
       reactToManualInterrupt: true,
       autoStopCreatedTargets: true,
+      externalResearchOperationalPrompts: true,
       codexCapacityRetryEnabled: true,
       codexCapacityRetryLimit: 1,
       codexCapacityRetryDelaysMs: [1800000, 3600000],

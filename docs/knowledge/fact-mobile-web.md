@@ -44,6 +44,65 @@ legacy имени/cwd/позиции может не менять organization r
 bindings остаются tab-owned. Source проверки — actual HTTP/SQLite + pure tree и
 renderer callbacks; native UIKit, Simulator и installed acceptance отдельные.
 
+### Компактный catalog-v2: имена отдельно от статусов
+
+Additive `workflowOrganization.catalogV2` публикуется с подключёнными Core read
+adapters; v1/RAW/writers сохраняются. Полный index/search и прежний canonical tree
+не обрезаются: materialized details включают все ordinary rows и первые5leaf files
+каждого canonical tab-parent, затем ещё20 по явному tap. Direct group/root files
+не перегруппируются по raw parent; nonleaf file не скрывает обычного потомка.
+Names/index не ждут runtime/cards, file tabs не входят в runtime producer.
+
+`GET …?projection=catalog-v2` отделяет index/tree от details/fileWindows и передаёт
+sourceEpoch/catalogClock/clocks/provenanceCounts. Нет aliases/saved SIDs/record bodies.
+Узкий SQL сохраняет hydration/read transaction/single-flight по профилю, без settled
+cache; names/path/provider/subject/cwd/storage/tree входят в content basis даже без
+organization revision. Полные record/layout/aliases/archive contexts и весь
+workspace-session JSON этому профилю не нужны. Window.nodeIds — весь canonical
+bucket, page.nodeIds — только срез. HMAC cursor связывает epoch/clock/workflow/parent/
+offset/previous node; повтор — read, не advance. Hidden by-ID не двигает prefix.
+Непринятый64KiB page отказ и обрезка имён не допускаются.
+
+Authenticated pure-read POST: `/api/workflow-organization/file-page` принимает
+`{cursor}`; `…/runtime-summary` и `…/card-signals` — basis+0..256unique tabIds;
+`/api/tab-catalog/:id/detail` и `…/file-preview` — basis+workflowId, tabId только route.
+256 ограничивает batch, не ordinary inventory. Detail читает одну execution row и
+project header, не полный namespace; это не полный tabsByProject. Preview разрешает
+текущий typed file/path на Main, без caller path/cwd fallback, и повторно проверяет
+binding после await. Прежний1MiB предел — raw bytes, не re-encoded UTF8 replacements.
+V2 error оставляет readable cache/unavailable, не запускает тяжёлый v1 fallback.
+
+Runtime aggregates покрывают весь non-file membership независимо от row batch.
+live/busy/notification — отдельные known/value; unknown count=null, не0. Coverage.complete
+подтверждает адреса, не известность фактов. Fresh SQL+tabId не заменяют retained
+exact owner/PTY/run/launch/namespace/cwd/provider и проверку после await. Registry
+absence не является OS-wide process proof, lookup unknown не даёт ноль. Старые
+notification records без typed owner остаются unknown в v2, не удаляются из v1.
+runtimeEpoch/revision и cardsEpoch/revision — clocks новых projections;
+Cards.producerEpoch/producerRevision — прежний Main card wake floor. Не смешивать их
+с HTTP service UUID или ConversationOwners instance/ownerOrder. Subset не делает
+namespace current; Fast/plans/pending сохраняют прежних owners и bounded summaries.
+
+`card-signals` дополнительно возвращает `directoryAppearance.version=1`, в том числе
+при `tabIds:[]`: независимые `sessionStatuses`, `statusMarker`, `processBar` с
+`known/stale/source/settingsSource/value/reason`. Это категории вкладок (`dev`),
+НЕ task palette (`task-dev`). Main читает три exact строки прежнего app_state
+mirror; отсутствующий ключ даёт реальные desktop defaults, malformed/read failure
+даёт unknown/null. Только known empty `[]` очищает палитру; unknown не должен стирать
+прежнее native значение. Process-bar сохраняет position/colors/inherited/spacing/
+opacity; cosmetics не становятся runtime/input proof. Existing card producer clock/
+wake floor включает appearance; process-bar key будит прежний coalesced scheduler.
+После await повторно проверяются basis/owner/revision и сами настройки, даже если
+их wake был пропущен. Имена/catalogClock/курсоры не зависят от cosmetics. Legacy
+`/tabs` и его renderer style bridge не менялись; compact не требует их inventory.
+
+Core явно сообщает `presentation:'canonical-tree-v1',windowPresentation:false`:
+canonical tree не является доказательством порядка desktop-окон/profile. Actual
+Node22/private HTTP/SQL controls используют node:sqlite вместо native binding;
+это не installed/native UI/actual-project-DB PASS. Guards/DTO —
+`workflow-directory-catalog.cjs`/`workflow-directory-api.js`; проверки —
+`workflow-directory-catalog.test.js`.
+
 ### Канонические действия групп и native drag
 
 `catalogProjection` подтверждает только read. Отдельные capabilities
@@ -79,6 +138,14 @@ POST `…/drag/commit` принимает именно это тело, повт
 и проверяет preview hash; пишет прежний атомарный commitDrag. Org receipt route
 восстанавливает исход, а exact повтор commit после нового API epoch читает прежний
 journal command. Неизвестный ответ не разрешает новый mutationId.
+
+V2 initial добавляет `nativeDragExpected:{organizationRevision,groupsRevision,tree}`
+по точной старой v1 tree-hash формуле. Его можно передать прежнему capture; v2
+clocks.tree/descriptors/catalogClock не являются этим expected. Main всё ещё
+снимает full capture со всеми hidden refs, клиент их не выдумывает. Старый capture
+проверяет org/groups/tree, не descriptor clock: это не усиление writer guarantees.
+На сервере без bridge допустим explicit v1 read только по USER pickup, не initial
+timeout fallback. Paging не ослабляет painted/full-tree coverage ACK.
 
 Same-workflow reorder сохраняет окна/hidden/profile размещения; transfer меняет
 membership и снимает прежние family placements без смены execution namespace/cwd.
@@ -2001,8 +2068,10 @@ busy/done/snapshot, `_notifyClaudeSession`, `recordActivity` open/close. Не с
 `tabs[]` в snapshot — компактный runtime patch для native project-tabs page. Он нужен, чтобы
 телефон, стоящий на списке вкладок проекта, увидел busy-loader без входа в chat и без
 фонового `/api/projects/:id/tabs` refresh во время свайпа. Полные tab metadata, порядок,
-statusMarker, processBar и contextPct остаются ответственностью `/api/projects/:id/tabs`;
-project-activity патчит только `status/streaming`.
+statusMarker, processBar и contextPct в legacy остаются ответственностью
+`/api/projects/:id/tabs`; project-activity патчит только `status/streaming`.
+Compact catalog-v2 получает category/loader appearance отдельным полем cards,
+описанным выше; это не возврат automatic namespace inventory.
 
 Completion notification использует тот же project-activity канал, но это отдельная ось от
 busy. Если desktop bell сработал на скрытой AI-вкладке, snapshot включает
@@ -2238,12 +2307,47 @@ Token общий — `~/.noted-terminal/web-token.txt` читается обои
 
 ## Performance instrumentation
 
-Server: `[WebTiming]` теги — каждый `/timeline`, `/history` пишет `bridge=Xms find=Yms parse=Zms total=Wms`, `[WebGzip] origB → gzipB (N%) in Tms` для крупных payloads (>64KB).
+Server: `[WebTiming]` теги — каждый `/timeline`, `/history` пишет `bridge=Xms find=Yms parse=Zms total=Wms`, `[WebGzip] origB → gzipB (N%) in Tms` для крупных payloads (>64KB). History DONE означает готовность результата обработчика, не конец JSON/gzip или доставку клиенту.
 
 Client: `[History] streamFetch / streamMeta / streamDone / prefixMerged / idbWrote / cacheHit` через `Api.log()` → `POST /api/log/client` → `console.log` → `dev.log`. Каждый шаг с `*Ms` для blame'а. `[TimelineGoTo] click / done / NOT FOUND` для timeline-навигации. `[WS] open / close` с code/reason/backoffMs для reconnect диагностики. `[ScrollDiag] flushReducer / followOutput / atBottomStateChange / isScrolling / scroll {delta:N}` — для отладки scroll-jitter (см. `fix-mobile-scroll-jitter-virtuoso.md` для CV-кейса, `fix-mobile-scroll-teleport.md` для shrink+false-atBottom-кейса). `atBottomStateChange` несёт `{isScrolling}` тегом — gate в коде дропает true пока юзер тащит палец.
 
 **Архивные теги (устарели):** `tailFetch / tailFetched / fullFetch / fullFetched / fullApplied` использовались в JSON two-phase архитектуре, удалены вместе с ней.
 
+### Конечные HTTP-чтения: подготовка не равна доставке
+
+Для native GET `[HttpRead]` связывает optional action/read/physical-attempt/ingress
+с новым Main serverRequestId и прежним worker client/generation/call/request/attempt.
+Некорректный diagnostic ID становится null, не HTTP 400 и не новым cache key.
+Main-issued instance/PID, auth, source/readScope и final admission остаются authority.
+Наблюдение начинается перед instance guards; это вход JS callback, не socket/kernel
+accept и не независимое доказательство прохождения reverse SSH.
+
+```text
+http-enter → route/handler → dependency/bridge/worker → stringify → gzip
+→ headers-queued → end-call/end-return ≠ finish ≠ получение/показ на iPhone
+```
+
+Bridge enqueue/dispatch/reply и dependency begin/end различают ожидание от работы.
+Одна сериализация и прежние gzip bytes сохраняются. `res.finish` — передача нижнему
+Writable; нормальный 503 тоже может иметь finish. `res.close` без writableFinished
+означает неполный HTTP, а обычный req.close не является cancellation. Поздний ответ
+после закрытия не пишется повторно; disconnect не отменяет shared worker и не
+разрешает повтор Send/export. errorMonitor не поглощает исходную response error.
+
+Это allowlisted finite GET и только пять exact pure-read POST catalog-v2 (см. выше),
+не SSE или все POST. Router и observer используют общий method/route/read-effect
+predicate; Send/Stop/export/drag/mutations остаются вне него. Новая read route требует
+адресного допуска, не wildcard POST. Query, тела и literal paths не логируются.
+Detail ограничен 48/read и 240/min, terminal имеет отдельные 120/min; active128,
+completed64, record2KiB. Counters/loss ranges и active-at-cut доступны read-only
+snapshot: исчерпанная квота/потерянный sink не превращаются в success.
+Worker phases пока проходят через Main; их молчание при зависшем Main не доказывает
+worker idle. Снимок source/boot не является installed build manifest.
+
+Host-проверка `http-read-observability.test.js` использует настоящий HTTP/zlib и
+Worker/canonical parser с synthetic JSONL, максимум два GET. Renderer endpoints и
+SQL/catalog leaves управляются fixture; это не phone/installed/network acceptance.
+
 ## gzip threshold
 
-`sendJson` — gzip только для payloads ≥ 4KB **и** только если client прислал `Accept-Encoding: gzip`. Уровень 6 (баланс ratio/CPU). На 20MB JSON history даёт 60-65% сжатие (7-8MB), 250ms server CPU — приемлемо когда альтернатива 4-15 сек transfer на phone. Под threshold'ом overhead не оправдан (gzip header + CPU > saved bytes).
+`sendJson` — gzip при прежнем пороге `json.length >= 4096` (JS code units, не UTF-8 bytes) **и** только если client прислал `Accept-Encoding: gzip`. Уровень 6 (баланс ratio/CPU). На 20MB JSON history даёт 60-65% сжатие (7-8MB), 250ms server CPU — приемлемо когда альтернатива 4-15 сек transfer на phone. Под threshold'ом overhead не оправдан (gzip header + CPU > saved bytes).

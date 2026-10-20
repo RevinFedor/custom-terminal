@@ -17,6 +17,7 @@ export { DiffView } from './components/DiffView';
 export {
   ToolCallPart,
   BashCard, ReadCard, EditCard, GenericToolCard, McpToolCard,
+  mcpServerDisplayLabel,
   type ToolCallProps, type CollapseInjection, type ActionHeadline,
 } from './components/ToolCards';
 export {

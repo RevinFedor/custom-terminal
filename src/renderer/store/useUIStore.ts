@@ -35,6 +35,7 @@ import {
   splitComposerDraftMemory,
 } from '../utils/composerDraftPersistence.mjs';
 import { expireReloadedHistoryImageImports, normalizeHistoryPendingImageImports } from '../utils/historyImageImportOwnership.mjs';
+import { restoreHistorySendDraft } from '../utils/historySendReturn.mjs';
 import type { GeminiModelId } from '../constants/geminiModels';
 import { isGeminiModelId } from '../constants/geminiModels';
 
@@ -648,6 +649,9 @@ interface UIStore {
   // do not survive an app restart, and are not serialized as clipboard assets.
   historyPromptDraftPendingImages: Record<string, HistoryPromptDraftPendingImageRef[]>;
   historyPromptDraftUpdatedAt: Record<string, number>;
+  historyPromptReturnedSends: Record<string, string[]>;
+  restoreHistorySendDraft: (input: any) => void;
+  acknowledgeHistorySendDraftReturn: (tabId: string, token: string) => void;
   historyComposerViewByTab: Record<string, HistoryComposerViewState>;
   historyComposerAvailability: Record<string, HistoryComposerAvailability>;
   historyRewindPreviews: Record<string, HistoryRewindPreview>;
@@ -3057,6 +3061,19 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyPromptDraftChips: initialHistoryComposerDraftState.chips,
   historyPromptDraftPendingImages: {},
   historyPromptDraftUpdatedAt: initialHistoryComposerDraftState.updatedAtByTab,
+  historyPromptReturnedSends: initialHistoryComposerDraftState.returnedByTab,
+  restoreHistorySendDraft: input => {
+    const result = restoreHistorySendDraft(get(), input, bytes => localStorage.setItem(HISTORY_COMPOSER_DRAFTS_STORAGE_KEY, bytes));
+    if (result.patch) set(result.patch);
+  },
+  acknowledgeHistorySendDraftReturn: (tabId, token) => {
+    const state = get();
+    const next = { ...state.historyPromptReturnedSends };
+    next[tabId] = (next[tabId] || []).filter(id => id !== token);
+    if (!next[tabId].length) delete next[tabId];
+    set({ historyPromptReturnedSends: next });
+    get().flushHistoryComposerDrafts();
+  },
   historyComposerViewByTab: (() => {
     try {
       const raw = localStorage.getItem('noted-terminal-history-composer-view');
@@ -3249,6 +3266,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
       images: state.historyPromptDraftImages,
       chips: state.historyPromptDraftChips,
       updatedAtByTab: state.historyPromptDraftUpdatedAt,
+      returnedByTab: state.historyPromptReturnedSends,
     });
     try {
       // persistedStorage mirrors every noted-terminal-* key to SQLite

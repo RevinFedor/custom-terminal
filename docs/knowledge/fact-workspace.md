@@ -7,6 +7,24 @@ Workflow организует окна и вкладки независимо о
 
 ## Workflow, вкладка и исполнение
 
+Цветные группы оконной полосы хранятся в metadata workflow `stripColorGroups`
+(version/revision/groups), независимо от глобальных sidebar-групп. CURRENT Source20Oct
+записывает их прежним `commitWorkspace`/mutation journal: только explicit
+`stripColorGroupEdits` с точным field basis может изменить или очистить definition.
+Incidental полный snapshot сохраняет более свежий Main field, даже если renderer
+уже принял latest organization revision. Unknown/null/future basis не означает
+пустой набор; потерянный ACK восстанавливается тем же mutation ID.
+
+CREATE gather и цвет принимаются одной transaction. Main сверяет exact window и
+исходный порядок до применения; stale source отвергает оба изменения без journal
+или сдвига clocks. ACK применяет metadata и slots одной публикацией, без focus/
+activate/remount; более новая локальная перестановка не откатывается. Recolor не
+переставляет окна/вкладки, reorder не меняет execution namespace или color revision.
+Активная проекция исключает только явно inactive участников, не меняя raw
+definition/basis. Recolor сохраняет прежних закрытых участников того же workflow;
+CREATE требует active membership, unknown/foreign не превращаются в ready-empty.
+Эта authority не разрешает Send/Stop/Full и не меняет общий global-group CAS.
+
 Пользователь отказался от Projects как обязательных контейнеров директорий:
 одно окно может содержать вкладки разных cwd, а один репозиторий — участвовать
 в нескольких workflow. Поэтому принадлежность вкладки хранится один раз в Main,
@@ -74,6 +92,12 @@ stopped/unstarted/shell/file. Shared selection/tree/group intersection не вы
 прежний per-namespace row order, без сортировки по имени/cwd/MRU. Mixed root order
 остаётся `reserveRootOrder`; visual parent и physical parent передаются отдельно.
 Wire, clocks и capability — `fact-mobile-web.md::Каталог workflow для native`.
+
+Catalog-v2 сохраняет этот full membership/tree, отделяя лёгкий index от materialized
+details: первые5canonical leaf files под tab-parent, затем20; все обычные rows доступны.
+Raw parent не заменяет canonical group/tree ownership. Этот Core read не является
+window placement projection (`windowPresentation:false`) и не меняет namespace,
+writer/drag или политику скрытых/profile участников.
 
 ## Резерв, окна и переходы
 
@@ -239,8 +263,9 @@ project раньше возвращал пустой div и размонтиро
 шрифта cap/descender envelope, а не CSS line box или отдельное имя: все карточки
 имеют одинаковую минимальную высоту, независимо от наличия файлов. Нижние
 выносные элементы могут касаться чипа; файл рисуется выше текста. При большом
-padding название и чип смещаются вместе. Существующий6px row gutter оконной
-полосы сохраняется, нижний край файла оставляет ровно1px до следующего ряда;
+padding название и чип смещаются вместе. CURRENT Source20Oct сохраняет
+геометрию file chip от прежнего6px gutter, а оконный ряд резервирует7px:
+нижний край файла оставляет2px до следующего ряда для двух1px групповых рамок;
 неиспользованный запас идёт на уменьшение общей высоты. Ширина, размер
 шрифта/чипа сохраняются. В reserve sidebar чип не дублируется: файл уже показан
 самостоятельной строкой дерева. Нижняя

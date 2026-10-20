@@ -33,6 +33,8 @@ const fs = require('fs');
 const { buildChildProcessEnv } = require('./child-process-env');
 const { resolveHubConfiguration, CONFIG_HEADER, EXPECTED_CONFIG_ENV } = require('./mcp-hub-config');
 
+const { createBrowserHost } = require('./mcp-browser-maintenance');
+const hostProtocol = require('./research-host-protocol.cjs');
 const DEFAULT_PORT = 53133;
 const HUB_VERSION = '1.1.0';
 const HOME = os.homedir();
@@ -86,7 +88,8 @@ function canOwnGlobalHub(env = process.env) {
 }
 
 class ChildServer {
-  constructor(name, def, log, { catalogTimeoutMs = DEFAULT_CATALOG_TIMEOUT_MS, env = process.env } = {}) {
+  constructor(name, def, log, { catalogTimeoutMs = DEFAULT_CATALOG_TIMEOUT_MS, env = process.env, maintenance = () => null } = {}) {
+    this.maintenance = maintenance;
     this.name = name;
     this.def = def;
     this.log = log;
@@ -130,6 +133,7 @@ class ChildServer {
   }
 
   ensureStarted() {
+    try { this.maintenance()?.assertEntry(this.name); } catch (error) { return Promise.reject(error); }
     if (this.restartPromise) return this.restartPromise;
     return this._ensureStarted();
   }
@@ -137,6 +141,7 @@ class ChildServer {
   _ensureStarted() {
     if (this.stopped) return Promise.reject(new Error(`hub stopped`));
     if (this.initPromise) return this.initPromise;
+    try { this.maintenance()?.assertEntry(this.name); } catch (error) { return Promise.reject(error); }
     this.initPromise = this._spawnAndInit().catch((err) => {
       this.initPromise = null; // allow retry on next request
       throw err;
@@ -147,7 +152,7 @@ class ChildServer {
   _spawnAndInit() {
     return new Promise((resolve, reject) => {
       const { command, args, env } = this.def;
-      let proc;
+      let proc, owner, childId;
       try {
         // Children are SHARED across sessions: strip per-session identity vars
         // that a standalone hub launched from inside an AI tab would inherit.
@@ -160,6 +165,9 @@ class ChildServer {
         // Explicit per-server env must not reintroduce another tab's identity.
         for (const key of ['NOTED_PARENT_TAB_ID', 'NOTED_PARENT_PROJECT_ID', 'NOTED_MAIN_PID',
           'NOTED_MCP_IDENTITY', 'NOTED_MCP_INSTANCE_ROUTE', 'NOTED_DISCOVERY_DIR', 'CLAUDE_PROJECT_DIR', EXPECTED_CONFIG_ENV]) delete childEnv[key];
+        owner = this.maintenance();
+        childId = owner?.beforeSpawn(this.name, childEnv);
+        owner?.assertEntry(this.name);
         this.log(`[MCPHub] spawn ${this.name}`);
         proc = spawn(executable, args, {
           env: childEnv,
@@ -232,14 +240,25 @@ class ChildServer {
         resolve: (result) => {
           clearTimeout(timer);
           this.initResult = result;
-          this._writeRaw({ jsonrpc: '2.0', method: 'notifications/initialized' });
+          try { this._writeRaw({ jsonrpc: '2.0', method: 'notifications/initialized' }); }
+          catch (error) { this.initResult = null; failStartup(error.code || 'maintenance held'); return; }
           settled = true;
           this.log(`[MCPHub] ${this.name} ready (pid ${proc.pid})`);
           resolve(result);
         },
         reject: () => { clearTimeout(timer); failStartup('initialize rejected'); },
       });
-      this._writeRaw({ ...HANDSHAKE, id });
+      proc.once('spawn', () => {
+        try {
+          // spawn event confirms exec; a pre-exec executable pin can name the
+          // parent image on Linux. No initialize/effect bytes precede this.
+          owner?.afterSpawn(childId, proc);
+          this._writeRaw({ ...HANDSHAKE, id });
+        } catch (error) {
+          this.pending.delete(id); clearTimeout(timer); failStartup(error.code || 'maintenance held');
+          try { proc.kill('SIGTERM'); } catch {}
+        }
+      });
     });
   }
 
@@ -293,6 +312,7 @@ class ChildServer {
 
   _writeRaw(obj) {
     if (!this.proc || this.proc.exitCode !== null) throw new Error(`${this.name} not running`);
+    this.maintenance()?.assertEntry(this.name);
     this.proc.stdin.write(JSON.stringify(obj) + '\n');
   }
 
@@ -362,12 +382,15 @@ class ChildServer {
   restart() {
     if (this.restartPromise) return this.restartPromise;
     if (this.stopped) return Promise.reject(new Error('hub stopped'));
+    try { this.maintenance()?.assertEntry(this.name); } catch (error) { return Promise.reject(error); }
     this.restarting = true;
     if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
     this.restartPromise = Promise.resolve().then(async () => {
       this.log(`[MCPHub] manual restart ${this.name}`);
+      this.maintenance()?.assertEntry(this.name);
       this.restarts += 1;
       await this._terminate();
+      this.maintenance()?.assertEntry(this.name);
       this.backoffMs = 1000;
       return this._ensureStarted();
     }).finally(() => { this.restarting = false; this.restartPromise = null; });
@@ -445,14 +468,33 @@ class McpHub {
     serverDefs = null,
     catalogTimeoutMs = DEFAULT_CATALOG_TIMEOUT_MS,
     env = process.env,
+    maintenanceOptions = {},
   } = {}) {
     this.port = port;
     this.log = log;
     this.children = new Map();
     this.configuration = serverDefs === null ? resolveHubConfiguration(env) : null;
     this.expectedConfiguration = env[EXPECTED_CONFIG_ENV];
-    for (const [name, def] of Object.entries(serverDefs || this.configuration.serverDefs)) {
-      this.children.set(name, new ChildServer(name, def, log, { catalogTimeoutMs, env }));
+    const definitions = serverDefs || this.configuration.serverDefs;
+    let browserOwner = null;
+    const homeRoot = path.join(env.HOME || os.homedir(), 'Library/Application Support/sc-desktop');
+    const needsOwner = Object.entries(definitions).some(([name, def]) => name === 'browser' || hostProtocol.binding(name, def));
+    this.maintenance = () => {
+      if (!needsOwner) return null;
+      if (!browserOwner) browserOwner = createBrowserHost({
+        hostId: 'noted-mcp-' + (this.actualPort || port || this.privateHostId), port: this.actualPort || port,
+        definitions, configurationDigest: this.configuration?.fingerprint || hostProtocol.digest(definitions),
+        ingressFile: path.join(homeRoot, 'research-maintenance-ingress.json'), root: path.join(homeRoot, 'research-hosts'),
+        log, ...maintenanceOptions,
+      });
+      return browserOwner;
+    };
+    this.privateHostId = require('node:crypto').randomUUID();
+    this.maintenanceStatus = () => { try { return this.maintenance()?.status() || null; }
+      catch (error) { return { version: 1, held: true, code: error.code || 'research_host_unavailable' }; } };
+    for (const [name, def] of Object.entries(definitions)) {
+      this.children.set(name, new ChildServer(name, def, log, { catalogTimeoutMs, env, maintenance: () =>
+        name === 'browser' || hostProtocol.binding(name, def) ? this.maintenance() : null }));
     }
     this.httpServer = null;
     this.actualPort = null;
@@ -464,6 +506,7 @@ class McpHub {
   status() {
     return {
       port: this.actualPort,
+      browserMaintenance: this.maintenanceStatus(),
       configuration: this.configuration?.status || null,
       servers: Array.from(this.children.values()).map((c) => c.status()),
       clients: Array.from(this.knownClients.entries()).map(([tabId, lastSeen]) => ({ tabId, lastSeen })),
@@ -482,6 +525,9 @@ class McpHub {
     } catch { return; }
     const needles = [];
     for (const child of this.children.values()) {
+      // Browser children/helpers require exact journal birth pins. The old
+      // marker reaper is not an authority for that cohort.
+      if (child.name === 'browser' || hostProtocol.binding(child.name, child.def)) continue;
       // Generic commands/last arbitrary argv are not ownership evidence.
       const script = child.def.args?.[0];
       const marker = child.def.reapMarker ||
@@ -532,6 +578,7 @@ class McpHub {
     });
     // Only the winner of the port bind owns recovery. A second app starting
     // concurrently must not touch servers belonging to the existing hub.
+    this.maintenanceStatus(); // initialize before eager work; failures fence only Browser
     this.reapOrphanedChildren();
     if (eager) {
       // Warm all servers so first tool call in a fresh session is instant.
@@ -580,6 +627,7 @@ class McpHub {
   async stop() {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     await Promise.allSettled([...this.children.values()].map(child => child.stop()));
+    try { this.maintenance()?.close(); } catch {}
     if (this.httpServer) {
       const server = this.httpServer;
       this.httpServer = null;
@@ -604,11 +652,16 @@ class McpHub {
   async _handleHttp(req, res) {
     const urlObj = new URL(req.url, 'http://127.0.0.1');
     const parts = urlObj.pathname.split('/').filter(Boolean); // ['mcp', '<name>']
+    if (parts[1] === '_browser-maintenance') {
+      try { if (await this.maintenance()?.handle(req, res)) return; }
+      catch (error) { return sendJson(res, 409, { ok: false, code: error.code || 'research_host_unavailable' }); }
+      return sendJson(res, 409, { ok: false, code: 'research_host_binding_unavailable' });
+    }
     if (parts[0] !== 'mcp') return sendJson(res, 404, { error: 'not found' });
 
     if (parts[1] === '_status') {
       return sendJson(res, 200, { version: HUB_VERSION, pid: process.pid,
-        capabilities: { restartAll: true, launchEnvironment: 1, configuration: 1, instanceRouting: 1 }, ...this.status(),
+        capabilities: { restartAll: true, launchEnvironment: 1, configuration: 1, instanceRouting: 1, browserMaintenance: 1 }, ...this.status(),
         configurationMatches: this.configuration ? req.headers[CONFIG_HEADER] === this.configuration.fingerprint : null });
     }
     // Control endpoints (used by Noted Terminal main over HTTP — the hub is a
@@ -665,7 +718,9 @@ class McpHub {
       } catch (err) {
         this.log(`[MCPHub] ${child.name} rpc failure`);
         if (!res.headersSent) {
-          const rpcError = err.rpcError || { code: -32000, message: String(err.message || err) };
+          const rpcError = err.rpcError || { code: -32000, message: String(err.message || err),
+            ...(err.code?.startsWith('research_') || err.code === 'RESEARCH_MAINTENANCE_HELD'
+              ? { data: { code: err.code, attention: 'maintenance', replayPermission: false } } : {}) };
           sendJson(res, 200, { jsonrpc: '2.0', id: msg.id ?? null, error: rpcError });
         }
       }
@@ -720,11 +775,16 @@ if (require.main === module) {
   if (argv.includes('--standalone')) {
     const portIdx = argv.indexOf('--port');
     const port = portIdx !== -1 ? parseInt(argv[portIdx + 1], 10) : DEFAULT_PORT;
-    const hub = new McpHub({ port });
+    const ingressIdx = argv.indexOf('--browser-ingress-file');
+    const ingressFile = ingressIdx !== -1 ? argv[ingressIdx + 1] : null;
+    if (ingressIdx !== -1 && (!ingressFile || !path.isAbsolute(ingressFile))) throw Error('research_host_ingress_authority_invalid');
+    const hub = new McpHub({ port, ...(ingressFile ? { maintenanceOptions: {
+      ingressFile, root: path.join(path.dirname(ingressFile), 'research-hosts'),
+    } } : {}) });
     hub.start().then(() => {
       console.log(`[MCPHub] standalone ready on ${hub.actualPort}`);
       process.send?.({ type: 'mcp-hub:ready', status: { version: HUB_VERSION, pid: process.pid,
-        capabilities: { restartAll: true, launchEnvironment: 1, configuration: 1 }, ...hub.status() } });
+        capabilities: { restartAll: true, launchEnvironment: 1, configuration: 1, browserMaintenance: 1 }, ...hub.status() } });
     }).catch((err) => {
       console.error(`[MCPHub] failed to start: ${err.message}`);
       if (process.send) process.send({ type: 'mcp-hub:error', error: err.message }, () => process.exit(1));

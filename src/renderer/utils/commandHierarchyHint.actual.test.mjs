@@ -6,10 +6,10 @@ import {transformSync} from 'esbuild';
 
 const code=transformSync(fs.readFileSync(new URL('./commandHierarchyHint.ts',import.meta.url),'utf8'),{loader:'ts',format:'cjs'}).code;
 function fixture(){
-  const listeners=new Map(),children=[];let hit=null;
+  const listeners=new Map(),children=[];let hit=null,hitReads=0;
   const window={addEventListener:(type,fn)=>{const set=listeners.get(type)||new Set();set.add(fn);listeners.set(type,set);},
     removeEventListener:(type,fn)=>listeners.get(type)?.delete(fn)};
-  const document={elementFromPoint:()=>hit,createElement:()=>({dataset:{},style:{},setAttribute(){},remove(){children.splice(children.indexOf(this),1);}}),
+  const document={elementFromPoint:()=>{hitReads++;return hit;},createElement:()=>({dataset:{},style:{},setAttribute(){},remove(){children.splice(children.indexOf(this),1);}}),
     body:{appendChild:element=>children.push(element)}};
   const phases=[];
   const module={exports:{}};vm.runInNewContext(code,{module,exports:module.exports,window,document,innerWidth:800,innerHeight:600,Set,Math,performance,
@@ -19,7 +19,7 @@ function fixture(){
   const target={closest:selector=>selector.startsWith('[data-outline-hierarchy')?row:null};
   const dispatch=(type,extra={})=>{const e={clientX:100,clientY:120,metaKey:false,key:'',type,...extra};for(const fn of listeners.get(type)||[])fn(e);return e;};
   return {register:module.exports.registerCommandHierarchyHint,children,listeners,root,row,target,phases,
-    setHit:value=>hit=value,dispatch};
+    setHit:value=>hit=value,dispatch,get hitReads(){return hitReads;}};
 }
 test('Cmd paints one passive badge for the pointed owner, not rows or application state',()=>{
   const f=fixture(),stop=f.register(f.root);f.setHit(f.target);
@@ -48,4 +48,33 @@ test('blur, pointercancel, leaving the window and removed hover owner dispose th
     const f=fixture(),stop=f.register(f.root);f.setHit(f.target);f.dispatch('pointerover',{metaKey:true});
     assert.equal(f.children.length,1);f.dispatch(type,{relatedTarget:null});assert.equal(f.children.length,0);stop();
   }
+});
+
+test('pointer truth clears a missed Meta keyup in an already unfocused window without another hit test',()=>{
+  const f=fixture(),stop=f.register(f.root);f.setHit(f.target);
+  // A visible unfocused window can receive pointer events while keyup goes to
+  // another application; there is no new blur to clear the remembered modifier.
+  f.dispatch('pointerover',{metaKey:true});assert.equal(f.children.length,1);
+  const reads=f.hitReads;
+  f.dispatch('pointermove',{metaKey:false});
+  assert.equal(f.children.length,0,'released modifier cannot retain the hint');
+  assert.equal(f.hitReads,reads,'ordinary move must not force style/layout for a hidden hint');
+  f.dispatch('scroll');assert.equal(f.hitReads,reads);stop();
+});
+
+test('leaving with Meta then returning without Meta does not resurrect the hint',()=>{
+  const f=fixture(),stop=f.register(f.root);f.setHit(f.target);
+  f.dispatch('pointerover',{metaKey:true});f.dispatch('pointerout',{relatedTarget:null});
+  assert.equal(f.children.length,0);const reads=f.hitReads;
+  f.dispatch('pointerover',{metaKey:false});
+  assert.equal(f.children.length,0);assert.equal(f.hitReads,reads);stop();
+});
+
+test('corrected no-Meta pointer still supports stationary hover then Cmd and unfocused Cmd entry',()=>{
+  const f=fixture(),stop=f.register(f.root);f.setHit(f.target);
+  f.dispatch('pointerover',{metaKey:false});assert.equal(f.hitReads,0);
+  f.dispatch('keydown',{key:'Meta'});assert.equal(f.children.length,1);
+  f.dispatch('keyup',{key:'Meta'});assert.equal(f.children.length,0);
+  f.dispatch('blur');f.dispatch('pointerover',{metaKey:true});assert.equal(f.children.length,1);
+  f.dispatch('pointercancel');assert.equal(f.children.length,0);stop();
 });

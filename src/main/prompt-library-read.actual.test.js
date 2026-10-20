@@ -5,6 +5,9 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
 const http = require('node:http'), vm = require('node:vm'), Module = require('node:module');
+const { spawn } = require('node:child_process');
+const { once } = require('node:events');
+const { createInterface } = require('node:readline');
 const crypto = require('node:crypto');
 const { createSavedPromptService } = require('./saved-prompt-service');
 const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
@@ -61,14 +64,14 @@ async function fixture(t) {
   whole.configure(service);
   server = http.createServer((req, res) => {
     const parsed = new URL(req.url, 'http://private');
-    assert.ok(['/api/me', '/api/prompt-library', '/api/prompt-library/read', '/api/prompts'].includes(parsed.pathname));
+    assert.ok(/^\/api\/(?:me|prompt-library(?:\/read)?|prompts(?:\/[^/]+(?:\/move)?)?|prompt-groups(?:\/\d+)?)$/.test(parsed.pathname));
     tasks.push(whole.route(req, res, { pathname: parsed.pathname, query: Object.fromEntries(parsed.searchParams) }, new Map())
       .catch(error => { res.writeHead(500); res.end(JSON.stringify({ error: error.message })); }));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = 'http://127.0.0.1:' + server.address().port;
-  const request = (route, body, authorized = true) => new Promise((resolve, reject) => {
-    const req = http.request(origin + route, { method: body === undefined ? 'GET' : 'POST',
+  const request = (route, body, authorized = true, method = body === undefined ? 'GET' : 'POST') => new Promise((resolve, reject) => {
+    const req = http.request(origin + route, { method,
       headers: { ...(authorized ? { authorization: 'Bearer private-token' } : {}), 'content-type': 'application/json' } }, res => {
       const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => {
         try { resolve({ status: res.statusCode, value: JSON.parse(Buffer.concat(chunks).toString()) }); } catch (e) { reject(e); }
@@ -79,10 +82,72 @@ async function fixture(t) {
   const seedRows = (prompts, groups = []) => { pm.db.savePromptGroups(groups); pm.db.savePrompts(prompts); };
   const read = (id, extra = {}) => request('/api/prompt-library/read', { promptIds: [id], mode: 'resolved', projection: 'steps-v1', ...extra });
   return { root, pm, service, request, read, seedRows, configure: whole.configure,
+    port: server.address().port,
     file(name, text) { const file = path.join(root, name); fs.writeFileSync(file, text); return file; },
     hold(file) { const hold = { entered: barrier(), release: barrier() }; holds.set(file, hold); return hold; },
     counts: () => ({ mutations, libraryReads, fileReads }) };
 }
+
+async function withPromptMcp(f, run) {
+  const discovery = path.join(f.root, 'mcp-fixture'); fs.mkdirSync(discovery);
+  fs.writeFileSync(path.join(discovery, 'web-token.txt'), 'private-token');
+  fs.writeFileSync(path.join(discovery, `web-server-${process.pid}.json`), JSON.stringify({ port: f.port, updatedAt: Date.now() }));
+  fs.writeFileSync(path.join(discovery, `mcp-port-${process.pid}`), JSON.stringify({ port: f.port,
+    openProjectPaths: [f.root], openProjects: [{ id: 'private', path: f.root }], updatedAt: Date.now() }));
+  const child = spawn(process.execPath, [path.join(__dirname, '../../mcp/terminal-server.mjs'), '--project', f.root], {
+    env: { ...process.env, NOTED_DISCOVERY_DIR: discovery, NOTED_MAIN_PID: String(process.pid),
+      NOTED_MCP_INSTANCE_ROUTE: '', NOTED_PARENT_PROJECT_ID: 'private', NOTED_PARENT_TAB_ID: 'private-fixture' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const lines = createInterface({ input: child.stdout }), pending = new Map(); let id = 0;
+  child.stderr.resume();
+  lines.on('line', line => { const value = JSON.parse(line); pending.get(value.id)?.(value); });
+  const call = (name, args) => new Promise((resolve, reject) => {
+    const key = ++id;
+    const timer = setTimeout(() => { pending.delete(key); reject(new Error('owned MCP fixture deadline')); }, 5000);
+    pending.set(key, value => { clearTimeout(timer); pending.delete(key); resolve(value); });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: key, method: 'tools/call', params: { name, arguments: args } }) + '\n');
+  });
+  try { await run(call); }
+  finally {
+    lines.close(); child.stdin.end();
+    if (child.exitCode === null) { child.kill('SIGTERM'); await once(child, 'exit'); }
+  }
+}
+
+test('mixed prompt order crosses actual MCP, HTTP handler, service and private SQLite without UI or whole-library save', async t => {
+  const f = await fixture(t);
+  f.seedRows([prompt('a', { position: 10 }), prompt('child', { position: 11, visual_parent_id: 'a' }),
+    prompt('b', { position: 30 })], [{ id: 1, name: 'G1', position: 0 }, { id: 2, name: 'G2', position: 20 }]);
+  const before = f.pm.getPromptLibrary(), roots = async () =>
+    (await f.request('/api/prompt-library?projection=outline-v1')).value.outline.roots.map(row => row.id);
+  const initial = await roots();
+  await withPromptMcp(f, async call => {
+    const invoke = async (name, args) => {
+      const reply = await call(name, args);
+      assert.notEqual(reply.result?.isError, true, reply.result?.content?.[0]?.text);
+      return JSON.parse(reply.result.content[0].text);
+    };
+    await invoke('create_prompt', { stableId: 'own-last', title: 'Last', text: 'new', position: initial.length });
+    assert.deepEqual(await roots(), [...initial, 'prompt:own-last']);
+    const group = (await invoke('create_prompt_group', { name: 'Middle', position: 2 })).group;
+    assert.deepEqual(await roots(), ['prompt-group:1', 'prompt:a', 'prompt-group:' + group.id, 'prompt-group:2', 'prompt:b', 'prompt:own-last']);
+    await invoke('move_prompt', { promptId: 'own-last', revision: f.service.get('own-last').revision, position: 1 });
+    const g = f.service.getGroup(2);
+    await invoke('update_prompt_group', { groupId: 2, revision: g.revision, position: 2 });
+    assert.deepEqual(await roots(), ['prompt-group:1', 'prompt:own-last', 'prompt-group:2', 'prompt:a', 'prompt-group:' + group.id, 'prompt:b']);
+    const a = f.service.get('a'), oldOrder = await roots();
+    await invoke('update_prompt', { promptId: 'a', revision: a.revision, text: 'edited own' });
+    assert.deepEqual(await roots(), oldOrder);
+    const saved = f.pm.getPromptLibrary();
+    const stale = await call('move_prompt', { promptId: 'a', revision: a.revision, position: 0 });
+    assert.equal(stale.result.isError, true); assert.match(stale.result.content[0].text, /changed by another client/);
+    assert.deepEqual(f.pm.getPromptLibrary(), saved);
+    assert.equal(f.service.get('child').visual_parent_id, 'a');
+    assert.equal(f.service.get('b').content, before.prompts.find(row => row.id === 'b').content);
+    assert.equal(f.counts().fileReads, 0);
+  });
+});
 
 test('actual authenticated HTTP capability/outline, mixed roots and empty groups: no file IO or library mutation', async t => {
   const f = await fixture(t);

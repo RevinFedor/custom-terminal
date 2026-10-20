@@ -11,6 +11,13 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const v8 = require('node:v8');
 const { performance } = require('node:perf_hooks');
+const { httpReadCorrelation } = require('./http-read-diagnostics');
+const DIAGNOSTIC_SCHEMA = 1, MAX_PHASE_GROUPS = 16;
+const workerBoot = crypto.randomUUID();
+let diagnosticSequence = 0, diagnosticSendErrors = 0;
+const stamp = () => { const perf = performance.now(); return { abs: performance.timeOrigin + perf, perf }; };
+emitDiagnostic('worker-boot');
+emitDiagnostic('imports-begin');
 const Database = require('better-sqlite3');
 const DatabaseManager = require('./database');
 const codexData = require('./ipc/codex-data');
@@ -22,15 +29,18 @@ const { observeHistoryResponseTimingBindings } = require('./history-response-tim
 const { PromptQueueAssetStore } = require('./prompt-queue-assets');
 const { recordCodexProcessActionOwnership } = require('./codex-process-action-ownership');
 const { beginHistoryReadDiagnostic } = require('./history-read-memory-diagnostics');
+emitDiagnostic('imports-end');
 
 // This connection uses the existing application's schema and exact methods.
 // It does not run startup migrations, create tabs, or own runtime delivery.
+emitDiagnostic('database-ready-begin', { configured: !!workerData.databasePath });
 const db = workerData.databasePath ? new DatabaseManager({
   existingConnection: new Database(workerData.databasePath, { fileMustExist: true }),
 }) : null;
 if (db) {
   db.db.pragma('busy_timeout = 5000');
 }
+emitDiagnostic('database-ready-end', { configured: !!db });
 // Parsed data is valid for the exact parser/preparation implementation. A
 // source update must not silently reuse a previous version's interpretation.
 const schemaHash = crypto.createHash('sha256');
@@ -42,13 +52,13 @@ for (const filename of Object.keys(require.cache).filter(name => name.startsWith
   schemaHash.update(fs.readFileSync(filename));
 }
 const startupCacheDiagnostics = [];
+emitDiagnostic('cache-init-begin');
 const cache = new HistoryPreparedCache({ directory: workerData.cacheDirectory, maxBytes: workerData.diskBudgetBytes,
   onDiagnostic: event => { if (startupCacheDiagnostics.length < 8) startupCacheDiagnostics.push(event); },
   indexBudgetBytes: workerData.indexBudgetBytes,
   schema: '1-' + schemaHash.digest('hex').slice(0, 20) });
-const DIAGNOSTIC_SCHEMA = 1, MAX_PHASE_GROUPS = 16;
+emitDiagnostic('cache-init-end', { enabled: cache.enabled });
 const slowMs = Number.isFinite(workerData.diagnosticSlowMs) ? Math.max(0, workerData.diagnosticSlowMs) : 100;
-const stamp = () => { const perf = performance.now(); return { abs: performance.timeOrigin + perf, perf }; };
 const token = value => typeof value === 'string' && /^[\w.:-]{1,80}$/.test(value) ? value : 'other';
 const identity = value => value == null || value === '' ? null : token(String(value)) !== 'other' ? String(value)
   : 'sha256:' + crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 24);
@@ -58,7 +68,30 @@ function emitDiagnostic(event, fields = {}) {
   const now = stamp();
   try { parentPort.postMessage({ event: 'diagnostic', diagnostic: { schema: DIAGNOSTIC_SCHEMA, side: 'worker', event,
     clientId: workerData.diagnosticClientId || null, workerGeneration: workerData.diagnosticGeneration || 0,
-    emittedAbs: now.abs, emittedPerf: now.perf, ...fields } }); } catch {}
+    producerBoot: workerBoot, seq: ++diagnosticSequence,
+    emittedAbs: now.abs, emittedPerf: now.perf, ...fields } }); } catch { diagnosticSendErrors++; }
+}
+let phaseWindowAt = -Infinity, phaseWindowCount = 0, phaseGlobalOmitted = 0;
+const phaseEnabled = context => !!context && (!!context.correlation?.httpRead || workerData.diagnosticReadPhases === true);
+function requestPhase(context, event, fields = {}) {
+  if (!phaseEnabled(context)) return;
+  const now = performance.now();
+  if (now - phaseWindowAt >= 60000) { phaseWindowAt = now; phaseWindowCount = 0; }
+  context.observationEvents ||= 0;
+  if (context.observationEvents >= 48 || phaseWindowCount >= 240) {
+    context.observationOmitted = (context.observationOmitted || 0) + 1; phaseGlobalOmitted++; return;
+  }
+  context.observationEvents++; phaseWindowCount++;
+  emitDiagnostic(event, { ...context.correlation, ...fields });
+}
+function beginWorkPhase(stage) {
+  const context = requestContext.getStore();
+  if (!phaseEnabled(context)) return () => {};
+  const started = performance.now();
+  requestPhase(context, 'work-phase-begin', { stage });
+  let ended = false;
+  return (outcome = 'returned') => { if (!ended) { ended = true;
+    requestPhase(context, 'work-phase-end', { stage, outcome, elapsedMs: performance.now() - started }); } };
 }
 // A fixed-size, request-local summary. No payload, path, SQL, row identity or
 // error text is retained, and repeated row/page phases only increment counters.
@@ -147,7 +180,8 @@ for (const operation of ['readPrepared', 'savePrepared', 'readTimeline', 'saveTi
     const item = { operation, started: stamp() };
     const active = context.cacheOperations ||= [];
     active.push(item);
-    const finish = () => { const index = active.indexOf(item); if (index >= 0) active.splice(index, 1); };
+    const end = beginWorkPhase(operation);
+    const finish = () => { const index = active.indexOf(item); if (index >= 0) active.splice(index, 1); end(); };
     try {
       const result = original.apply(this, args);
       if (result?.then) return result.finally(finish);
@@ -173,9 +207,26 @@ historyPreparationActivity.begin = options => {
   const finish = beginPreparation(options);
   const context = requestContext.getStore();
   if (!context) return finish;
-  context.preparations.push(finish);
-  const prepared = () => finish.update?.({ phase: 'preparing' });
-  prepared.update = finish.update;
+  const end = beginWorkPhase('history-preparation');
+  context.preparations.push(() => { end(); return finish(); });
+  let lastPhase = null, milestone = 0;
+  const update = value => {
+    if (typeof value?.phase === 'string' && value.phase !== lastPhase) {
+      lastPhase = value.phase; requestPhase(context, 'preparation-phase', { stage: token(value.phase) });
+    }
+    // First actual progress, then at most eight byte milestones. No polling
+    // or per-row message; retain the actual last progress even after quota.
+    if (Number.isFinite(value?.completedBytes)) {
+      context.lastProgress = { bytes: value.completedBytes, emittedAbs: performance.timeOrigin + performance.now() };
+      const step = Math.max(1, Math.ceil((Number(options.bytes) || 0) / 8));
+      if (milestone < 8 && (milestone === 0 || value.completedBytes >= milestone * step)) {
+        milestone++; requestPhase(context, 'preparation-progress', { bytes: value.completedBytes });
+      }
+    }
+    return finish.update?.(value);
+  };
+  const prepared = () => update({ phase: 'preparing' });
+  prepared.update = typeof finish.update === 'function' ? update : finish.update;
   return prepared;
 };
 const assets = workerData.assetDirectory ? new PromptQueueAssetStore({ rootDir: workerData.assetDirectory }) : null;
@@ -201,9 +252,15 @@ cache.assertCurrent = () => {
 function prepareSourceEpoch(filePath) {
   // Every source access participates, including raw/search/payload/virtual
   // reads whose public DTO contains no revision or filePath.
-  requestContext.getStore()?.sources.add(filePath);
-  if (epochPending.has(filePath)) return epochPending.get(filePath).promise;
+  const context = requestContext.getStore();
+  context?.sources.add(filePath);
+  if (epochPending.has(filePath)) {
+    const endWait = beginWorkPhase('source-epoch');
+    requestPhase(context, 'source-epoch-join');
+    return epochPending.get(filePath).promise.finally(() => endWait());
+  }
   if (sourceEpochSlots.has(filePath)) return Promise.resolve();
+  const endWait = beginWorkPhase('source-epoch');
   let resolve; const registered = new Promise(done => { resolve = done; });
   const promise = registered.then(async () => {
     const owner = requestContext.getStore()?.payload;
@@ -213,9 +270,10 @@ function prepareSourceEpoch(filePath) {
       const stat = saved?.filePath === filePath ? await fs.promises.stat(filePath).catch(() => null) : null;
       if (saved && exactSource(saved, stat)) api.restoreCodexSourceSnapshot(saved);
     }
-  }).finally(() => epochPending.delete(filePath));
+  }).finally(() => { epochPending.delete(filePath); endWait(); });
   epochPending.set(filePath, { promise, resolve });
-  send({ event: 'source-epoch', filePath });
+  requestPhase(context, 'source-epoch-request');
+  send({ event: 'source-epoch', filePath, diagnostic: context?.correlation });
   return promise;
 }
 api.setCodexExternalReadPrepare(prepareSourceEpoch);
@@ -268,10 +326,12 @@ async function enterCold() {
     const queued = stamp();
     context.coldQueuedAbs = queued.abs; context.coldQueuedPerf = queued.perf;
     context.coldQueueDepth = coldWaiters.length + Number(coldActive);
+    requestPhase(context, 'cold-queued', { queueDepth: context.coldQueueDepth });
     context.coldAdmission = acquireCold().then(release => {
       const admitted = stamp();
       context.coldAdmittedAbs = admitted.abs; context.coldAdmittedPerf = admitted.perf;
       context.coldAdmissionMs = admitted.perf - queued.perf; context.coldRelease = release;
+      requestPhase(context, 'cold-admitted', { coldAdmissionMs: context.coldAdmissionMs });
     });
   }
   await context.coldAdmission;
@@ -287,7 +347,10 @@ api.findCodexSessionFile = async (id, cwd) => {
 };
 const load = api.loadSessionRecords;
 api.loadSessionRecords = async (id, cwd, options = {}) => {
-  const result = await load(id, cwd, { ...options, ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}) });
+  const end = beginWorkPhase('records-read');
+  let result;
+  try { result = await load(id, cwd, { ...options, ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}) }); }
+  finally { end(); }
   const context = requestContext.getStore();
   if (context && result.success) {
     context.loadedRecords = (context.loadedRecords || 0) + result.records.length;
@@ -308,10 +371,13 @@ function observeProjection(result) {
   if (context && Number.isFinite(result?.fedRecords)) context.fedRecords += result.fedRecords;
   return result;
 }
-api.projectCodexFullHistoryFromFile = async (id, cwd, options = {}) => observeProjection(await originalHistory(id, cwd, {
-  ...options, rewriteReceipt: currentRewriteReceipt(id),
-  ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
-}));
+api.projectCodexFullHistoryFromFile = async (id, cwd, options = {}) => {
+  const end = beginWorkPhase('history-projection');
+  try { return observeProjection(await originalHistory(id, cwd, {
+    ...options, rewriteReceipt: currentRewriteReceipt(id),
+    ...(workerData.sessionsDir ? { sessionsDir: workerData.sessionsDir } : {}),
+  })); } finally { end(); }
+};
 const originalTimeline = api.projectCodexTimelineFromFile;
 api.projectCodexTimelineFromFile = async (id, cwd, options = {}) => {
   const found = await api.findCodexSessionFile(id, cwd);
@@ -545,12 +611,16 @@ parentPort.on('message', message => {
       ? diagnosticActionId : undefined,
     diagnosticReadId: typeof diagnosticReadId === 'string' && /^[a-z0-9-]{1,90}$/.test(diagnosticReadId)
       ? diagnosticReadId : undefined };
+  const httpRead = httpReadCorrelation(message.diagnostic?.httpRead);
+  if (httpRead) correlation.httpRead = httpRead;
   context.correlation = { ...correlation, workerGeneration: workerData.diagnosticGeneration || 0 };
   const sessionQueueDepth = queueDepths.get(key) || 0;
   queueDepths.set(key, sessionQueueDepth + 1);
+  requestPhase(context, 'request-received', { sessionQueueDepth });
   let executionStart, executionEnd, serializationStart, serializationEnd;
   const work = async () => {
     executionStart = stamp();
+    requestPhase(context, 'execution-begin', { sessionQueueMs: executionStart.perf - received.perf });
     if (method === 'stats') return { value: { cache: cache.stats(), projector: api.getCodexHistoryProjectorStats(), sourceBytes, sourceVerificationBytes,
       virtual: { ...service.codexVirtualTranscriptStore?.stats(), budgetBytes: virtualGraphBudget }, workerGraphBudget,
       memory: { heapUsed: process.memoryUsage().heapUsed, rss: process.memoryUsage().rss } }, readProof: [] };
@@ -562,6 +632,7 @@ parentPort.on('message', message => {
     Object.assign(context, { payloads: new Map(), sources: new Set(), sourceEpochs: sourceEpochs.slice(),
       snapshotEpochs: method === 'readSessionSnapshot' ? sourceRewriteEpochs.slice() : null, preparations: [], assets: new Map() });
     return requestContext.run(context, async () => {
+      const serviceEnd = beginWorkPhase('service-work');
       const memoryRead = method === 'searchCatalogCandidate' ? beginHistoryReadDiagnostic('catalog-projection', {
         sessionId: payload.sessionId, provider: 'codex', readId: correlation.diagnosticReadId,
       }) : null;
@@ -587,9 +658,11 @@ parentPort.on('message', message => {
         memoryRead?.end('error', { errorCode: error.code });
         throw error;
       } finally {
+        serviceEnd();
         if (context.assets.size) send({ event: 'assets', refs: [...context.assets.values()] });
         for (const finish of context.preparations) finish();
         context.coldRelease?.();
+        if (context.coldRelease) requestPhase(context, 'cold-released');
       }
     });
   };
@@ -624,6 +697,13 @@ parentPort.on('message', message => {
       fedRecords: context.fedRecords, consumedRecords: context.consumedRecords, lineCount: context.lineCount,
       ramHits: context.ramHits, ssdHits: context.ssdHits, rebuilds: context.rebuilds, outcome, reason, exceptional };
     publishCacheMemory();
+    // Terminal witness is reserved outside the request-detail budget. It still
+    // travels through Main; absence cannot prove worker idleness during a gap.
+    if (phaseEnabled(context)) emitDiagnostic('reply-ready', { ...context.correlation, outcome, resultBytes,
+      observationEvents: context.observationEvents || 0, observationOmitted: context.observationOmitted || 0,
+      phaseGlobalOmitted, diagnosticSendErrors, lastProgress: context.lastProgress || null });
+    diagnostic.observationHealth = { lastSeq: diagnosticSequence, sendErrors: diagnosticSendErrors,
+      omitted: context.observationOmitted || 0, globalOmitted: phaseGlobalOmitted };
     send({ ...body, diagnostic }, transfer);
     const posted = stamp();
     if (exceptional || posted.perf - received.perf >= slowMs) {

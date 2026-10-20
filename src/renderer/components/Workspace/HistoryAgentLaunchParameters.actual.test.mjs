@@ -23,6 +23,28 @@ const settings = sid => ({ version: 1, provider: 'codex', sessionId: sid,
   source: 'own-turn-context', model: 'gpt-6-luna', effort: 'max', timestamp: '2026-10-09T07:00:00Z' });
 const serviceTier = (tier, sid = 'child-A') => ({ version: 1, provider: 'codex', sessionId: sid,
   source: 'own-thread-settings', serviceTier: tier, timestamp: '2026-10-15T06:00:00Z' });
+const requestTier = (tier, sid = 'child-A', parent = 'parent-A') => ({version: 1, provider: 'codex',
+  sessionId: sid, parentSessionId: parent, source: 'own-provider-request', serviceTier: tier,
+  requestId: 'request-A', turnId: 'turn-A', timestamp: '2026-10-18T17:00:00Z'});
+
+for (const [tier, label] of [['priority', 'Fast'], ['default', 'Fast выкл.'], [null, 'Fast —']]) {
+  test(`actual header displays own request ${label} independently of launch proof`, () => {
+    const html = renderToStaticMarkup(React.createElement(Header, {settings: settings('child-A'),
+      taskLabel: 'A', serviceTier: serviceTier('priority'), requestServiceTier: requestTier(tier)}));
+    assert.ok(html.includes('>' + label + '</span>'));
+    assert.equal(html.includes('<svg'), tier === 'priority');
+    assert.match(html, tier ? /собственный запрос агента/ : /Fast в последнем запросе не подтверждён/);
+  });
+}
+
+test('actual header rejects another child request and retains Codex-only presentation', () => {
+  const foreign = renderToStaticMarkup(React.createElement(Header, {settings: settings('child-B'),
+    taskLabel: 'B', requestServiceTier: requestTier('priority')}));
+  assert.match(foreign, /Fast —/); assert.doesNotMatch(foreign, /<svg/);
+  const claude = renderToStaticMarkup(React.createElement(Header, {settings: {...settings('child-A'), provider: 'claude'},
+    taskLabel: 'A', requestServiceTier: requestTier('priority')}));
+  assert.doesNotMatch(claude, /data-history-agent-launch-fast/);
+});
 
 test('actual navbar renders launch model/effort, not the generic agent title', () => {
   const html = renderToStaticMarkup(React.createElement(Header, { settings: settings('child-A'), taskLabel: 'Task A' }));
@@ -212,6 +234,44 @@ function loadingReader() {
   };
 }
 const flushRead = async () => { await Promise.resolve(); await Promise.resolve(); };
+
+test('actual selected hook carries request Fast to the header without launch tier, extra IPC or state churn', async () => {
+  const h = loadingReader(); h.render();
+  assert.equal(h.requests[0].request.tabId, 'tab-A');
+  h.requests[0].resolve({success: true, steps: [], offset: 80, pending: false,
+    launchSettings: settings('child-A'), requestServiceTier: requestTier('priority')});
+  await flushRead();
+  const ready = h.render();
+  assert.equal(ready.launchServiceTier, null);
+  assert.equal(ready.requestServiceTier.serviceTier, 'priority');
+  const html = renderToStaticMarkup(React.createElement(Header, {settings: ready.launchSettings,
+    serviceTier: ready.launchServiceTier, requestServiceTier: ready.requestServiceTier,
+    provider: 'codex', taskLabel: 'A', loading: ready.launchMetadataPending}));
+  assert.match(html, /data-history-agent-launch-fast="priority"/);
+  const snapshot = h.states[2];
+  const same = h.tick();
+  h.requests[1].resolve({success: true, steps: [], offset: 80, pending: false,
+    launchSettings: settings('child-A'), requestServiceTier: {...requestTier('priority'), requestId: 'request-B'}});
+  await same;
+  assert.equal(h.states[2], snapshot, 'same tier keeps metadata reference despite another segment');
+  const update = h.tick();
+  h.requests[2].resolve({success: true, steps: [], offset: 80, pending: false,
+    launchSettings: settings('child-A'), requestServiceTier: requestTier('default')});
+  await update;
+  assert.equal(h.render().requestServiceTier.serviceTier, 'default');
+  const wrongParent = h.tick();
+  h.requests[3].resolve({success: true, steps: [], offset: 80, pending: false,
+    launchSettings: settings('child-A'), requestServiceTier: requestTier('priority', 'child-A', 'other-parent')});
+  await wrongParent;
+  assert.equal(h.render().requestServiceTier, null);
+  const old = h.tick();
+  h.render('child-B');
+  h.requests[4].resolve({success: true, steps: [], offset: 80, pending: false,
+    requestServiceTier: requestTier('priority')});
+  await old;
+  assert.equal(h.render('child-B').requestServiceTier, null, 'late A cannot add Fast to B');
+  h.dispose();
+});
 
 test('launch metadata stays loading after first rows until catch-up, then final unknown uses dash', async () => {
   const h = loadingReader();

@@ -1206,7 +1206,7 @@ const TOOLS = [
         title: { type: 'string', description: 'Replacement title. May contain punctuation including /.' },
         text: { type: 'string', description: 'Replacement own prompt text; attached files are not changed.' },
         filePaths: { type: 'array', items: { type: 'string' }, description: 'Replacement linked-file list.' },
-        position: { type: 'integer', minimum: 0, description: 'Zero-based insertion index among the current siblings, matching Settings order.' },
+        position: { type: 'integer', minimum: 0, description: 'Zero-based sibling insertion index. At root, counts groups and ungrouped root prompts together; oversized indexes append. Stored position is not this index.' },
         projectId: { type: 'string', description: 'Optional project id used to select the correct running Noted Terminal instance.' },
         cwd: { type: 'string', description: 'Optional project path used to select the correct running Noted Terminal instance.' },
       },
@@ -1225,12 +1225,12 @@ const TOOLS = [
   },
   {
     name: 'create_prompt',
-    description: 'Create one saved prompt. stableId is optional; title, text, filePaths, groupId, parentPromptId and position match Settings fields. position is a zero-based insertion index among siblings. A child inherits its parent group.',
+    description: 'Create one saved prompt. stableId is optional; title, text, filePaths, groupId, parentPromptId and position match Settings fields. position is a zero-based sibling insertion index; root siblings include groups and ungrouped root prompts together, and oversized indexes append. A child inherits its parent group.',
     inputSchema: { type: 'object', properties: { stableId: { type: 'string' }, title: { type: 'string' }, text: { type: 'string' }, filePaths: { type: 'array', items: { type: 'string' } }, groupId: { type: ['number', 'null'] }, parentPromptId: { type: ['string', 'null'] }, position: { type: 'integer', minimum: 0 }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['title'] },
   },
   {
     name: 'move_prompt',
-    description: 'Move or reparent a saved prompt by stable id. position is a zero-based insertion index among the destination siblings; omitted parentPromptId preserves the current parent, while explicit null detaches it. Moving a parent moves its whole subtree to the same group. Pass the current revision; missing parents, cycles, and cross-group links are rejected.',
+    description: 'Move or reparent a saved prompt by stable id. position is a zero-based destination sibling index; root siblings include groups and ungrouped root prompts together, and oversized indexes append. Omitted parentPromptId preserves the current parent, while explicit null detaches it. Moving a parent moves its whole subtree to the same group. Pass the current revision; missing parents, cycles, and cross-group links are rejected.',
     inputSchema: { type: 'object', properties: { promptId: { type: 'string' }, revision: { type: 'string' }, groupId: { type: ['number', 'null'] }, parentPromptId: { type: ['string', 'null'] }, position: { type: 'integer', minimum: 0 }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['promptId', 'revision'] },
   },
   {
@@ -1240,7 +1240,7 @@ const TOOLS = [
   },
   {
     name: 'create_prompt_group',
-    description: 'Create a saved-prompt group. position is a zero-based insertion index among groups. Groups use their persistent numeric id as the stable group id.',
+    description: 'Create a saved-prompt group. position is a zero-based insertion index among mixed root siblings (groups and ungrouped root prompts), not just groups; oversized indexes append. Groups use their persistent numeric id as the stable group id.',
     inputSchema: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, position: { type: 'integer', minimum: 0 }, isCollapsed: { type: 'boolean' }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['name'] },
   },
   {
@@ -1250,7 +1250,7 @@ const TOOLS = [
   },
   {
     name: 'update_prompt_group',
-    description: 'Update one saved-prompt group with revision CAS. position is a zero-based insertion index among groups; name, description and isCollapsed match Settings fields.',
+    description: 'Update one saved-prompt group with revision CAS. position is a zero-based insertion index among mixed root siblings (groups and ungrouped root prompts), not just groups; oversized indexes append. name, description and isCollapsed match Settings fields.',
     inputSchema: { type: 'object', properties: { groupId: { type: 'number' }, revision: { type: 'string' }, name: { type: 'string' }, description: { type: 'string' }, position: { type: 'integer', minimum: 0 }, isCollapsed: { type: 'boolean' }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['groupId', 'revision'] },
   },
   {

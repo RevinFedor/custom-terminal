@@ -47,7 +47,7 @@ test('recovery retains text/assets/authoring and phase without executing or manu
   assert.equal(readHistorySendRecovery(storage)[0].phase, 'dispatched');
   assert.equal(readHistorySendRecovery(storage)[0].input.sendAttemptId, undefined);
 });
-test('actual timer JSX renders total seconds and is located immediately before X, outside live badge', () => {
+test('actual timer JSX freezes to static seconds while its adjacent status can keep loading', () => {
   const source = fs.readFileSync(new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url), 'utf8');
   const ast = ts.createSourceFile('HistoryPanel.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   let timer;
@@ -56,10 +56,21 @@ test('actual timer JSX renders total seconds and is located immediately before X
   const code = ts.transpileModule(`const ${timer}; globalThis.Component = HistorySendTimer;`, {
     compilerOptions: { jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText;
-  const ctx = vm.createContext({ React, memo: React.memo, useState: React.useState, useEffect: React.useEffect, historySendTimerState });
+  const ctx = vm.createContext({ React, memo: React.memo, useState: React.useState, useEffect: React.useEffect,
+    historySendTimerState });
   vm.runInContext(code, ctx);
   const html = renderToStaticMarkup(React.createElement(ctx.Component, { startedAt: 1000, enterAttemptAt: 66000, status: 'audit-pending' }));
   assert.match(html, /65s<\/span>/); assert.match(html, /data-running="false"/); assert.doesNotMatch(html, /0:|aria-live/);
+  assert.match(html, /Счёт остановлен/);
+  assert.doesNotMatch(html, /noted-text-shimmer/, 'confirmation does not keep the frozen duration animated');
+  const runningHtml = renderToStaticMarkup(React.createElement(ctx.Component, { startedAt: Date.now(), status: 'preparing' }));
+  assert.match(runningHtml, /data-running="true"/);
+  assert.doesNotMatch(runningHtml, /noted-text-shimmer|<svg/, 'the running duration has no animation');
+  assert.match(runningHtml, /Счёт идёт/);
+  assert.match(source, /\.hp-history-send-timer\[data-running="true"\]\s*\{\s*color: var\(--cb-message-info, #60a5fa\);/);
+  assert.match(source, /\.hp-history-send-timer\s*\{\s*color: var\(--cb-text, #e0e0e0\);/);
+  assert.match(source, /\.hp-user-message-status > \.cb-message-status,\s*\.hp-history-send-timer\s*\{[^}]*font-size: 10px;[^}]*font-weight: 600;/,
+    'the duration and status share their font size and weight');
   const start = source.indexOf('{queueStatusPresentation && <HistorySendTimer');
   assert.ok(start > 0 && start < source.indexOf('{canDismissPromptPresentation && (', start));
 });

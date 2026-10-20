@@ -3351,8 +3351,8 @@ function ClaudeControlBar({
   };
 
   // Which control is being written, and therefore which one shows the spinner.
-  // Everything else in the cluster is plainly unavailable meanwhile — the CLI
-  // applies one setting at a time.
+  // Physical settings still serialize. Fast is a separate durable intent: its
+  // button can save a newer choice while the current setting is being applied.
   const settingsWritePresentation = settingsPresentation({
     localBusy: isLocalBusy && ['model', 'effort', 'quick'].includes(controlBarBusyTarget(localBusyReason) || ''),
     localTarget: controlBarBusyTarget(localBusyReason), activity: settingsActivity,
@@ -4671,7 +4671,7 @@ function ClaudeControlBar({
             position: 'relative',
             display: 'flex',
             alignItems: 'center',
-            gap: 6,
+            gap: RIGHT_CLUSTER_INNER_GAP_PX,
             ...(dockedInComposer ? { maxWidth: '55%', minWidth: 0, flexShrink: 1, overflowX: 'auto', scrollbarWidth: 'none' } : { flexShrink: 0 }),
             // Первая строка при переносе. justifyContent сохраняет прижатие к
             // правому краю, как в одну строку, — иначе блок «переехал бы» влево.
@@ -5266,13 +5266,9 @@ function ClaudeControlBar({
                   data-codex-fast-pending={codexFastModeState.pending ? '1' : undefined}
                   data-busy-spinner={fastSpinning ? '1' : undefined}
                   title={codexFastTitle}
-                  disabled={codexFastDisabled || settingsWriteBusy}
+                  disabled={codexFastDisabled}
                   aria-busy={fastSpinning}
-                  {...(fastSpinning ? {
-                    onClick: forceResetBusy,
-                    onMouseEnter: () => setBusyCancelHover(true),
-                    onMouseLeave: () => setBusyCancelHover(false),
-                  } : { onClick: sendCodexFast })}
+                  onClick={sendCodexFast}
                   style={{
                     ...triggerStyle,
                     position: 'relative',
@@ -5307,7 +5303,7 @@ function ClaudeControlBar({
                   >
                     <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
                   </svg>
-                  {fastSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
+                  {fastSpinning && <ControlBusySpinner hovered={false} />}
                 </button>
               </ControlHint>
             );

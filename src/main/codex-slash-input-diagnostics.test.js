@@ -31,6 +31,7 @@ function pipeline() {
     synchronizedFrameWaiters: new Set() };
   const context = vm.createContext({ state, tabId: 'T',
     ...require('./terminal-redraw-diagnostics'), ...require('./codex-draft-authority'),
+    observeTerminalIo: require('./terminal-io-progress').observeTerminalIo,
     getHeadlessTerminalMirror: () => state,
     // Parser content and provider are controlled here. The actual production
     // pump/commit/blocker/notify declarations are executed, not copied formulas.

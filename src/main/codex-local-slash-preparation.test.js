@@ -27,6 +27,9 @@ function fixture() {
   const receipt = { original: '/model' };
   queue.rememberUnsubmittedInput(term, receipt);
   const context = vm.createContext({
+    ...require('./agent-send-preparation'), agentSendReceiptStore: null,
+    codexLastRunCommandPayload: new Map(),
+    agentSendCancellations: { isCancelled: () => false },
     ...require('./codex-runtime-contract'), ...require('./codex-model-effort-intent'),
     console: { log() {}, warn() {}, error() {} }, Date, observeAgentInput,
     codexSettingsMutationQueue: queue, codexModelEffortIntentReconcileInflight: new Map(),
@@ -57,6 +60,7 @@ function fixture() {
     codexHasLivePtySubmitEvidence: () => true, hasCodexPromptOrTurnInFlight: () => false,
     isOwnedDesktopHistorySendSource: () => true,
     requestTerminalCodexDraftState: async () => ({ success: true, hasDraft: false }),
+    getHeadlessCodexDraftState: () => ({ success: true, hasDraft: false }),
     createCodexPickerDraftCapture: () => ({}), getCurrentCodexServiceTierProofIdentity: () => null,
     captureCodexManualCompactBoundary: () => ({ tabId: 'T', sessionId: 'S' }),
     readCodexManualInputOwner: () => ({}),
@@ -76,6 +80,7 @@ function fixture() {
       });
     },
   });
+  vm.runInContext(require('./fixtures/codex-draft-request-observation.cjs').startupFrameDeclarations(), context);
   for (const name of ['withPtyWriteLock', 'waitForCodexInputPreparation', 'waitForCodexLocalSlashPreparation',
     'executeCodexLiveSlashCommandRequest', 'safePasteAndSubmit', 'agentSendExecutionFailure']) {
     const node = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
@@ -222,10 +227,16 @@ test('actual API compact binds the exact durable attempt before any PTY submissi
   assert.deepEqual(h.writes, ['/compact', 'Enter']);
 });
 
-test('failed exact compact receipt binding refuses before slash bytes without starting another executor', async () => {
+test('failed exact compact receipt binding refuses before slash bytes without starting another executor', async t => {
+  const Database = require('better-sqlite3'), db = new Database(':memory:'); t.after(() => db.close());
+  const store = require('./agent-send-receipt-store').createAgentSendReceiptStore(db);
+  const attempt = store.beginAttempt({ operationKey: 'project:T:H', surface: 'project-api',
+    tabId: 'T', handoffId: 'H', provider: 'codex', promptHash: 'unused', promptLength: 8,
+    requestFingerprint: 'one-request' });
   const h = fixture(); await h.finishSettings();
-  h.context.agentSendReceiptStore = { bindCompactOperation: () => ({ ok: false, reason: 'stale-attempt' }) };
-  const result = await h.send({ sendOperationKey: 'project:T:H', sendAttemptId: 'old-attempt' });
+  h.context.agentSendReceiptStore = { get: key => store.get(key),
+    bindCompactOperation: () => ({ ok: false, reason: 'stale-attempt' }) };
+  const result = await h.send({ sendOperationKey: 'project:T:H', sendAttemptId: attempt.attemptId });
   assert.equal(result.error, 'compact_send_receipt_binding_failed');
   assert.equal(result.submitted, false); assert.equal(result.pasteWritten, false);
   assert.equal(result.enterWritten, false); assert.deepEqual(h.writes, []);
@@ -253,6 +264,7 @@ test('a different tab settings preparation cannot delay this ready compact', asy
 test('fresh unknown draft after the wait cannot reuse the earlier empty proof', async () => {
   const h = fixture(); const result = h.send(); await tick();
   h.context.requestTerminalCodexDraftState = async () => ({ success: false, hasDraft: null });
+  h.context.getHeadlessCodexDraftState = () => ({ success: false, hasDraft: null });
   await h.finishSettings();
   assert.equal((await result).success, false);
   assert.deepEqual(h.writes, []);

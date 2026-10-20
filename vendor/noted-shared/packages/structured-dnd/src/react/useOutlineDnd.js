@@ -1008,6 +1008,15 @@ export function useOutlineDnd({
       return true;
     }
 
+    if (drag.phase === 'committing' && drag.sourceRootIds) {
+      // A released operation owns only its preview. Rejection/supersession
+      // must expose current host data and preserve the user's newer scroll,
+      // never restore a pickup outline after navigation or another writer.
+      publish(null, controlledOutlineRef.current, scrollLeaseRef.current);
+      emitLog('cancel', { reason }, drag);
+      return true;
+    }
+
     restoreTemporaryExpansions(drag);
     suppressClickRef.current = {
       sourceId: drag.sourceId,
@@ -1821,12 +1830,14 @@ export function useOutlineDnd({
 
   const handlePointerDown = useCallback((event, sourceId) => {
     const config = configRef.current;
-    if (config.disabled || event.button !== 0 || dragRef.current) return;
+    if (config.disabled || event.button !== 0) return;
     if (
       config.ignoreSelector
       && event.target !== event.currentTarget
       && event.target?.closest?.(config.ignoreSelector)
     ) return;
+    if (dragRef.current?.phase === 'committing' && dragRef.current.sourceRootIds) cancel('new-pointer');
+    if (dragRef.current) return;
 
     const location = findNodeLocation(previewOutlineRef.current, sourceId);
     if (!location) return;
@@ -1851,7 +1862,7 @@ export function useOutlineDnd({
     publish(pending, undefined, undefined);
     emitLog('pending', {}, pending);
     emitDiagnostic('pickup-rect',{left:rowRect.left,top:rowRect.top,width:rowRect.width,height:rowRect.height},pending);
-  }, [emitLog, publish]);
+  }, [cancel, emitLog, publish]);
 
 
 
@@ -1999,7 +2010,8 @@ export function useOutlineDnd({
           if (changed) processActivePointerMove(changed, event);
           return;
         }
-        if (!current.externalOwnerKey || current.phase === 'committing') return;
+        const releasedForest = current.phase === 'committing' && current.sourceRootIds;
+        if (!releasedForest && (!current.externalOwnerKey || current.phase === 'committing')) return;
         cancel('external-drag-owner-change');
       }
 

@@ -20,6 +20,10 @@ const short = (value, size = 12) => {
   const text = String(value || '');
   return text ? text.slice(-size) : '-';
 };
+// Join receipts by complete bounded IDs, never by the old display suffixes.
+// Serialize only these scalar IDs; no input/response text or payload is read.
+const exactDiagnosticId = value => typeof value === 'string' && value.length > 0 && value.length <= 512
+  ? JSON.stringify(value) : '-';
 
 const oneLine = (value, size = 96) => String(value || '')
   .replace(/\s+/g, ' ')
@@ -507,10 +511,18 @@ function createTerminalHistoryPreviewController({
       notifyCodexCanonicalAck(state, receipt, item);
       state.lastSemanticCanonicalReceipt = receipt;
       matched += 1;
+      const exactIds = {
+        exactItem: exactDiagnosticId(item.itemId),
+        exactCanonical: exactDiagnosticId(receipt.identity),
+        exactTurn: exactDiagnosticId(state.turnId),
+        exactLifecycle: exactDiagnosticId(state.lifecycleGeneration),
+      };
       writeLog('log', 'SEMANTIC_CANONICAL_ACK', state, {
         match,
         item: short(item.itemId, 18),
         identity: short(receipt.identity, 20),
+        ...exactIds,
+        joinIds: Object.values(exactIds).every(value => value !== '-') ? 'full' : 'incomplete',
         candidateChars: normalizedSemanticText(item.text).length,
         canonicalChars: receipt.text.length,
         missingChars: Math.max(0,

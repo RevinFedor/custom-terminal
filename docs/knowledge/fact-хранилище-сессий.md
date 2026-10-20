@@ -323,6 +323,18 @@ leaves; спокойный интервал — шесть часов. Expiratio
 settings перевзводит sweep только у разрешённого owner. `Clean all ready` и `Delete now` используют inline
 two-step confirmation и показывают точный count/bytes.
 
+Source18.10: retention plan и повторный delete-preflight читают все sessions,
+их runtime/dev/prod/lineage protection и DB recovery backups, но не ждут
+полного учёта builds, Chromium caches и Test runs. У полного Home inventory
+и retention отдельные single-flight; узкий результат не попадает в UI cache.
+Если cleanup/settings инвалидировали ещё выполняющийся полный обход, его
+старый результат не публикует удалённые строки и не восстанавливает старые
+grace clocks: один новый полный read выполняется по mutation revision.
+Права удаления/provider leaf/audit/final guards от scope не ослабляются.
+`[StorageInventory:Phase]` связывает scanId/scope/phase с startedAt и wall-time;
+relations, sessions, builds, app-data и test-runs различаются. Долгий HTTP read
+сам по себе не доказывает, какой из этих этапов задержался.
+
 Большой batch не выглядит зависшим: `storage:delete-progress` несёт
 `completed/total/removed/failed/reclaimedBytes` после каждого item. Main всё
 равно revalidates каждый target; progress — presentation, не разрешение удалить.
@@ -389,6 +401,21 @@ maintenance не превращает committed действие в failed ACK. 
 файл сам не уменьшается: это не обещание немедленных свободных гигабайт.
 Новые DB создаются с INCREMENTAL; существующие не переписываются при старте.
 Блокирующий live VACUUM/подмена рабочей DB в этот flow не входят.
+
+18.10 по отдельному явному поручению выполнено offline обслуживание после
+закрытия владельца:59.055→5.516GB без удаления действующих данных. Проверялись
+exact physical identity, отсутствие Main/open files/sidecars, независимая копия,
+integrity_check и полный logical dump с сохранёнными ROWID; user_version и
+application_id сохранены, rebuilt DB переведена в INCREMENTAL. После Build
+Install live catalog подтвердил все675 актуальных tab IDs и11 workflow. Это
+не возможность storageMaintenance v1 и не разрешение на raw/live maintenance.
+`immutable=1` использовался только после доказанного закрытия DB; к живой DB
+его применять нельзя. Apple sqlite3 3.51 dump --preserve-rowids пропустил reset
+sqlite_sequence: первый scratch import безопасно отказал на UNIQUE rowid.
+Reset в новой копии перед явными sequence rows исправил перенос; counters,
+ROWID gaps/BLOB/FTS5 и полный реальный dump сравнены. Временный внешний backup
+удалён лишь после API/UI-проверки и пользовательского подтверждения работы.
+Подробности/evidence — `docs/tmp/хранилище-и-очистка-диска.md`, checkpoint18.10.
 
 Application API `storageMaintenance.version=1`: GET `/api/storage/inventory`,
 `/api/storage/plan`, `/api/storage/database-space`; POST `/api/storage/cleanup`

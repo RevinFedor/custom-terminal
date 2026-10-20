@@ -29,6 +29,28 @@ const text = value => typeof value === 'string' ? value.trim() : '';
 const validTime = value => typeof value === 'number' && Number.isFinite(value) && value > 0
   && Number.isFinite(new Date(value).getTime());
 
+const RESEARCH_PROVIDERS = { chatgpt: 'ChatGPT', claude: 'Claude', perplexity: 'Perplexity' };
+const RESEARCH_EFFORTS = {
+  pro: 'Pro', xhigh: 'X High', high: 'High', medium: 'Medium', low: 'Low',
+  instant: 'Instant', max: 'Max', standard: 'Standard', extended: 'Extended', light: 'Light',
+};
+
+export function orchestrationLinkedName(run, tabId) {
+  if (run.sourceTabId !== tabId) return run.sourceTabName;
+  if (run.runKind !== 'external-research') return run.targetTabName;
+  const provider = Object.hasOwn(RESEARCH_PROVIDERS, run.externalResearchProvider)
+    ? RESEARCH_PROVIDERS[run.externalResearchProvider] : '';
+  const model = text(run.externalResearchModel);
+  const effort = text(run.externalResearchEffort);
+  if (!provider || !model) return run.targetTabName;
+  // Old names may contain a mode missing from the saved fields; never guess Pro.
+  if (!effort) return run.targetTabName || `${provider} · ${model}`;
+  const modelLabel = run.externalResearchProvider === 'chatgpt' && model === '6-astra' ? '6' : model;
+  const effortLabel = Object.hasOwn(RESEARCH_EFFORTS, effort.toLowerCase())
+    ? RESEARCH_EFFORTS[effort.toLowerCase()] : effort;
+  return `${provider} · ${modelLabel} ${effortLabel}`;
+}
+
 export function orchestrationDateTime(value) {
   if (!validTime(value)) return '—';
   return new Date(value).toLocaleString('ru-RU', {

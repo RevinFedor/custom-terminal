@@ -2462,68 +2462,33 @@ class DatabaseManager {
     return this.getProjectById(project.id);
   }
 
-  getProjectById(projectId) {
-    const work = () => {
-      const project = sqlStatement('db.getProjectById.projects', 'get', () => this.db.prepare('SELECT * FROM projects WHERE id = ?'), statement => statement.get(projectId));
-      const v2 = !!sqlStatement('db.getProjectById.sqlite_master', 'get', () => this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'"), statement => statement.get());
-      if (!project) {
-        if (!v2) return null;
-        const scope = this.getExecutionNamespace(projectId);
-        if (!scope) return null;
-        // Legacy wire shape for an exact execution bucket. This is not a Project
-        // row, cwd/default directory or workflow organization authority.
-        return { id: scope.namespace, executionNamespace: scope.namespace, executionScopeVersion: 2,
-          recommendedCwd:scope.metadata.recommendedCwd || null,
-          path: null, name: scope.metadata.name || scope.namespace, description: '', icon: scope.metadata.icon || null,
-          notesGlobal: scope.notes, tabGroups: scope.groups, quickActions:this.getGlobalCommands().map(command=>({name:command.name,command:command.command})),
-          sidebarOpen:scope.metadata.sidebarOpen || false,openFilePath:scope.metadata.openFilePath || null,
-          sidebarExpandedDirs:scope.metadata.sidebarExpandedDirs || null,sidebarScrollTop:scope.metadata.sidebarScrollTop || 0,
-          tabListScrollTop:scope.metadata.tabListScrollTop || 0,tabs: scope.tabs };
-      }
-  
-      // The removed Utils surface had its own position namespace. During the
-      // one-way migration, preserve the old visible order: main tabs first,
-      // then utility tabs, with a deterministic row-id tie-break.
-      const tabs = sqlStatement('db.getProjectById.tabs', 'all', () => this.db.prepare(`
-        SELECT * FROM tabs
-        WHERE ${v2 ? '(project_id = ? OR (execution_subject_version=2 AND execution_namespace=? AND execution_archived=0))' : 'project_id = ?'}
-        ORDER BY is_utility ASC, position ASC, id ASC
-      `), statement => statement.all(...(v2 ? [project.id, project.id] : [project.id])));
-      const globalCommands = this.getGlobalCommands();
-  
-      return {
-        id: project.id,
-        path: project.path,
-        name: project.name,
-        description: project.description || '',
-        icon: project.icon || null,
-        // The titlebar owns a coloured folder fallback, so icon-only remains a
-        // valid persisted preference even when a custom raster is later removed.
-        hideName: project.hide_name === 1,
-        geminiPrompt: project.gemini_prompt,
-        notesGlobal: project.notes_global || '',
-        tabGroups: (() => {
-          if (!project.tab_groups) return [];
-          try {
-            const parsed = JSON.parse(project.tab_groups);
-            return Array.isArray(parsed) ? parsed : [];
-          } catch {
-            return [];
-          }
-        })(),
-        sidebarOpen: project.sidebar_open === 1,
-        openFilePath: project.open_file_path || null,
-        sidebarExpandedDirs: project.sidebar_expanded_dirs ? JSON.parse(project.sidebar_expanded_dirs) : null,
-        sidebarScrollTop: Number.isFinite(Number(project.sidebar_scroll_top))
-          ? Math.max(0, Number(project.sidebar_scroll_top))
-          : 0,
-        tabListScrollTop: Number.isFinite(Number(project.tab_list_scroll_top))
-          ? Math.max(0, Number(project.tab_list_scroll_top))
-          : 0,
-        createdAt: project.created_at,
-        updatedAt: project.updated_at,
-        quickActions: globalCommands.map(gc => ({ name: gc.name, command: gc.command })),
-        tabs: tabs.map(t => ({
+  getDirectoryProjectHeader(namespace) {
+    const project = this.db.prepare('SELECT id,path,name,icon,hide_name FROM projects WHERE id=?').get(namespace);
+    if (project) return { id: project.id, path: project.path, name: project.name,
+      icon: project.icon || null, hideName: project.hide_name === 1 };
+    const scope = this.db.prepare('SELECT namespace,metadata_json FROM workflow_execution_scopes WHERE namespace=?').get(namespace);
+    if (!scope) return null;
+    const metadata = JSON.parse(scope.metadata_json);
+    return { id: scope.namespace, executionScopeVersion: 2, path: null,
+      name: metadata.name || scope.namespace, icon: metadata.icon || null, recommendedCwd: metadata.recommendedCwd || null };
+  }
+
+  getDirectoryTabDetail(ref) {
+    const { sameDirectoryScope } = require('../shared/workflow-directory-catalog.cjs');
+    const value = ref.subjectVersion === 2
+      ? this.getExecutionTabV2({ executionNamespace: ref.namespace, tabId: ref.tabId, subjectId: ref.subject.subjectId })
+      : null;
+    const row = ref.subjectVersion === 2 ? value?.row
+      : this.db.prepare('SELECT * FROM tabs WHERE tab_id=? AND project_id=?').get(ref.tabId, ref.namespace);
+    if (!row || row.execution_archived === 1 || row.id !== ref.storageId
+      || (row.execution_storage_revision ?? null) !== ref.storageRevision
+      || !sameDirectoryScope(workflowStorage.executionScopeForRow(row), ref.subject)) return null;
+    // Same mapper as the existing namespace response, but exactly one row.
+    return ref.subjectVersion === 2 ? value.tab : this._projectTabFromRow(row);
+  }
+
+  _projectTabFromRow(t) {
+    return ({
           ...(t.execution_subject_version === 2 ? {executionSubject:workflowStorage.executionScopeForRow(t),
             executionStorageRevision:t.execution_storage_revision} : {}),
           ...(t.execution_subject_version === 2 ? { ...JSON.parse(t.execution_record_json),
@@ -2617,7 +2582,71 @@ class DatabaseManager {
             try { return JSON.parse(t.provider_state); }
             catch { return undefined; }
           })()
-        }))
+        });
+  }
+
+  getProjectById(projectId) {
+    const work = () => {
+      const project = sqlStatement('db.getProjectById.projects', 'get', () => this.db.prepare('SELECT * FROM projects WHERE id = ?'), statement => statement.get(projectId));
+      const v2 = !!sqlStatement('db.getProjectById.sqlite_master', 'get', () => this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'"), statement => statement.get());
+      if (!project) {
+        if (!v2) return null;
+        const scope = this.getExecutionNamespace(projectId);
+        if (!scope) return null;
+        // Legacy wire shape for an exact execution bucket. This is not a Project
+        // row, cwd/default directory or workflow organization authority.
+        return { id: scope.namespace, executionNamespace: scope.namespace, executionScopeVersion: 2,
+          recommendedCwd:scope.metadata.recommendedCwd || null,
+          path: null, name: scope.metadata.name || scope.namespace, description: '', icon: scope.metadata.icon || null,
+          notesGlobal: scope.notes, tabGroups: scope.groups, quickActions:this.getGlobalCommands().map(command=>({name:command.name,command:command.command})),
+          sidebarOpen:scope.metadata.sidebarOpen || false,openFilePath:scope.metadata.openFilePath || null,
+          sidebarExpandedDirs:scope.metadata.sidebarExpandedDirs || null,sidebarScrollTop:scope.metadata.sidebarScrollTop || 0,
+          tabListScrollTop:scope.metadata.tabListScrollTop || 0,tabs: scope.tabs };
+      }
+  
+      // The removed Utils surface had its own position namespace. During the
+      // one-way migration, preserve the old visible order: main tabs first,
+      // then utility tabs, with a deterministic row-id tie-break.
+      const tabs = sqlStatement('db.getProjectById.tabs', 'all', () => this.db.prepare(`
+        SELECT * FROM tabs
+        WHERE ${v2 ? '(project_id = ? OR (execution_subject_version=2 AND execution_namespace=? AND execution_archived=0))' : 'project_id = ?'}
+        ORDER BY is_utility ASC, position ASC, id ASC
+      `), statement => statement.all(...(v2 ? [project.id, project.id] : [project.id])));
+      const globalCommands = this.getGlobalCommands();
+  
+      return {
+        id: project.id,
+        path: project.path,
+        name: project.name,
+        description: project.description || '',
+        icon: project.icon || null,
+        // The titlebar owns a coloured folder fallback, so icon-only remains a
+        // valid persisted preference even when a custom raster is later removed.
+        hideName: project.hide_name === 1,
+        geminiPrompt: project.gemini_prompt,
+        notesGlobal: project.notes_global || '',
+        tabGroups: (() => {
+          if (!project.tab_groups) return [];
+          try {
+            const parsed = JSON.parse(project.tab_groups);
+            return Array.isArray(parsed) ? parsed : [];
+          } catch {
+            return [];
+          }
+        })(),
+        sidebarOpen: project.sidebar_open === 1,
+        openFilePath: project.open_file_path || null,
+        sidebarExpandedDirs: project.sidebar_expanded_dirs ? JSON.parse(project.sidebar_expanded_dirs) : null,
+        sidebarScrollTop: Number.isFinite(Number(project.sidebar_scroll_top))
+          ? Math.max(0, Number(project.sidebar_scroll_top))
+          : 0,
+        tabListScrollTop: Number.isFinite(Number(project.tab_list_scroll_top))
+          ? Math.max(0, Number(project.tab_list_scroll_top))
+          : 0,
+        createdAt: project.created_at,
+        updatedAt: project.updated_at,
+        quickActions: globalCommands.map(gc => ({ name: gc.name, command: gc.command })),
+        tabs: tabs.map(t => this._projectTabFromRow(t))
       };
     };
     return causal.hasWork() ? work() : causal.syncWork('db.getProjectById', {}, work);
@@ -5455,10 +5484,32 @@ class DatabaseManager {
   // ========== TAB HISTORY (CLOSED TABS ARCHIVE) ==========
 
   archiveTab(projectId,tab,options={}) {
+    if(options.closeRequest && this.db.inTransaction)workflowStorage.fail('archive_close_outer_transaction_not_supported');
     const run=() => {
       const tabId=options.sourceTabId || tab?.tabId || tab?.id;
       const present=this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'").get();
       const native=present && tabId ? this.getExecutionTabV2({executionNamespace:projectId,tabId}) : null;
+      const close=options.closeRequest;
+      const sourceRequestHash=close && crypto.createHash('sha256').update(workflowStorage.stableJson({tab,
+        sourceTabId:options.sourceTabId || null,groupCloseGuard:options.groupCloseGuard || null})).digest('hex');
+      if(close && (!native || close.version!==1 || close.tabId!==tabId || close.namespace!==projectId
+        || close.subjectId!==native.executionSubject.subjectId || !workflowStorage.id(close.mutationId)))
+        workflowStorage.fail('archive_close_owner_changed');
+      const scopeId=close && 'archive-close-scope:'+close.mutationId;
+      if(scopeId) {
+        const saved=this.db.prepare('SELECT response_json FROM workflow_execution_mutations WHERE mutation_id=?').get(scopeId);
+        if(saved) {
+          const scope=JSON.parse(saved.response_json);
+          this.assertArchivedCloseReceipt(scope.receipt);
+          if(workflowStorage.stableJson(scope.expectedNamespaces)!==workflowStorage.stableJson(close.expectedNamespaces)
+            || workflowStorage.stableJson(scope.groupCloseGuard)!==workflowStorage.stableJson(options.groupCloseGuard || null)
+            || scope.sourceRequestHash!==sourceRequestHash)
+            workflowStorage.fail('archive_close_operation_changed');
+          return {historyId:scope.receipt.historyId,closeReceipt:scope.receipt};
+        }
+        if(native.archived)workflowStorage.fail('archive_close_operation_changed');
+        this.assertArchiveCloseNamespaces(close.expectedNamespaces);
+      }
       let historyId,replay=false;
       if(native) {
         const previous=native.archived && this.getExecutionArchive(projectId).find(row=>row.tab_id===tabId && row.execution_subject_id===native.executionSubject.subjectId);
@@ -5474,12 +5525,12 @@ class DatabaseManager {
           const archiveColumns={restore_placement:tab?.restorePlacement?.version===1?JSON.stringify(tab.restorePlacement):null,
             process_was_running:tab?.processWasRunning?1:0,message_count:tab?.messageCount ?? null,
             group_id:tab?.groupId || current.row.tab_group_id || null};
-          historyId=this.archiveExecutionTabV2({mutationId:options.mutationId || 'close:'+crypto.randomUUID(),
+          historyId=this.archiveExecutionTabV2({mutationId:close?.mutationId || options.mutationId || 'close:'+crypto.randomUUID(),
             executionNamespace:projectId,tabId,subjectId:current.executionSubject.subjectId,expectedRevision:current.revision,
             archiveColumns,
             workflowContext:options.workflowContext || {restorePlacement:tab?.restorePlacement || null}}).archiveId;
         }
-        this._executionPendingArchiveIds ||= new Set();this._executionPendingArchiveIds.add(tabId);
+        if(!close){this._executionPendingArchiveIds ||= new Set();this._executionPendingArchiveIds.add(tabId);}
       } else historyId=this._archiveLegacyTab(projectId,tab,options);
       if(Number.isSafeInteger(historyId)) {
         if(!replay)this.archivedFileLinks?.capture(historyId,projectId,tabId);
@@ -5488,10 +5539,184 @@ class DatabaseManager {
           if(saved && (saved.ownerTabId!==tabId || saved.namespace!==projectId))workflowStorage.fail('file_manifest_owner_changed');
         }
       }
+      if(close) {
+        const current=this.getExecutionTabV2({executionNamespace:projectId,tabId});
+        const manifest=this.archivedFileLinks?.read(historyId);
+        if(!manifest || manifest.namespace!==projectId || manifest.ownerTabId!==tabId)
+          workflowStorage.fail('archive_close_manifest_missing');
+        const closedIds=new Set([tabId,...manifest.files.map(row=>row.tab_id)]);
+        const children=this.db.prepare('SELECT tab_id,visual_parent_tab_id FROM tabs WHERE execution_archived=0').all()
+          .filter(row=>!closedIds.has(row.tab_id) && closedIds.has(row.visual_parent_tab_id))
+          .map(row=>this.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get(row.tab_id));
+        const namespaces=[...new Set([projectId,...manifest.files.map(row=>row.execution_namespace || row.project_id),
+          ...children.map(row=>row.execution_namespace || row.project_id)])].sort();
+        if(JSON.stringify(namespaces)!==JSON.stringify(close.expectedNamespaces.map(row=>row.namespace).sort()))
+          workflowStorage.fail('archive_close_namespace_changed');
+        const receipt={version:1,mutationId:close.mutationId,scopeId,historyId,namespace:projectId,tabId,
+          subjectId:current.executionSubject.subjectId,storageId:current.row.id,archivedRevision:current.revision,
+          manifestHash:manifest.hash};
+        this._executionMutation('archive-close-scope',{mutationId:scopeId,archiveMutationId:close.mutationId},()=>({
+          receipt,root:current.row,files:manifest.files,children,expectedNamespaces:close.expectedNamespaces,
+          groupCloseGuard:options.groupCloseGuard || null,sourceRequestHash,
+          intentHash:options.closeIntentHash || null,runtimeOwner:options.closeRuntimeOwner || null,
+        }));
+        return {historyId,closeReceipt:receipt};
+      }
       return historyId;
     };
     const schema=this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflow_execution_schema' AND type='table'").get();
-    return schema ? this._executionTransaction(run) : this.db.inTransaction ? run() : this.db.transaction(run).immediate();
+    const result=schema ? this._executionTransaction(run) : this.db.inTransaction ? run() : this.db.transaction(run).immediate();
+    if(result?.closeReceipt && !this.db.prepare('SELECT 1 FROM workflow_execution_mutations WHERE mutation_id=?')
+      .get('archive-close-finalize:'+result.closeReceipt.mutationId)) {
+      this._executionPendingArchiveIds ||= new Set();this._executionPendingArchiveIds.add(result.closeReceipt.tabId);
+    }
+    return result;
+  }
+
+  assertArchiveCloseNamespaces(expected,omitted=[]) {
+    if(!Array.isArray(expected) || !expected.length || new Set(expected.map(row=>row.namespace)).size!==expected.length)
+      workflowStorage.fail('archive_close_namespaces_required');
+    for(const row of expected) {
+      if(!workflowStorage.id(row.namespace) || !Array.isArray(row.tabIds) || new Set(row.tabIds).size!==row.tabIds.length
+        || row.tabIds.some(id=>!workflowStorage.id(id)))workflowStorage.fail('archive_close_namespace_invalid');
+      const actual=new Set(this.getProjectTabIds(row.namespace));
+      for(const id of omitted)if(row.tabIds.includes(id))actual.add(id);
+      if(JSON.stringify([...actual].sort())!==JSON.stringify([...row.tabIds].sort()))
+        workflowStorage.fail('force_cleanup_tab_snapshot_conflict');
+    }
+  }
+
+  archiveCloseIntentHash(request) {
+    return crypto.createHash('sha256').update(workflowStorage.stableJson({projectId:request.projectId,tab:request.tab,
+      closeRequest:request.closeRequest,groupCloseGuard:request.groupCloseGuard || null})).digest('hex');
+  }
+
+  readArchivedCloseIntent(request) {
+    const intent=request?.closeRequest;
+    if(intent?.version!==1 || !workflowStorage.id(intent.mutationId) || intent.namespace!==request.projectId)
+      workflowStorage.fail('archive_close_intent_required');
+    const row=this.db.prepare('SELECT response_json FROM workflow_execution_mutations WHERE mutation_id=?')
+      .get('archive-close-scope:'+intent.mutationId);
+    if(!row)workflowStorage.fail('archive_close_intent_unresolved');
+    const scope=JSON.parse(row.response_json);
+    if(scope.intentHash!==this.archiveCloseIntentHash(request) || scope.receipt.tabId!==intent.tabId
+      || scope.receipt.namespace!==intent.namespace || scope.receipt.subjectId!==intent.subjectId)
+      workflowStorage.fail('archive_close_operation_changed');
+    this.assertArchivedCloseReceipt(scope.receipt);
+    return scope;
+  }
+
+  archivedCloseRuntimeStep(receipt,phase,value) {
+    this.assertArchivedCloseReceipt(receipt);
+    if(!['stop-admitted','stop-settled','kill-admitted','kill-settled'].includes(phase))
+      workflowStorage.fail('archive_close_runtime_phase_invalid');
+    const mutationId='archive-close-runtime:'+phase+':'+receipt.mutationId;
+    const row=this.db.prepare('SELECT response_json FROM workflow_execution_mutations WHERE mutation_id=?').get(mutationId);
+    if(value===undefined)return row?JSON.parse(row.response_json):null;
+    return this._executionMutation('archive-close-runtime:'+phase,{mutationId,receipt,value},()=>value);
+  }
+
+  assertArchivedCloseReceipt(receipt) {
+    if(receipt?.version!==1 || !workflowStorage.id(receipt.scopeId))workflowStorage.fail('archive_close_receipt_required');
+    const scopeRow=this.db.prepare('SELECT request_json,response_json FROM workflow_execution_mutations WHERE mutation_id=?').get(receipt.scopeId);
+    const scope=scopeRow && JSON.parse(scopeRow.response_json);
+    const archive=this.db.prepare('SELECT request_json,response_json FROM workflow_execution_mutations WHERE mutation_id=?').get(receipt.mutationId);
+    const request=archive && JSON.parse(archive.request_json),result=archive && JSON.parse(archive.response_json);
+    const history=this.getTabHistoryEntry(receipt.historyId,receipt.namespace);
+    const current=this.getExecutionTabV2({executionNamespace:receipt.namespace,tabId:receipt.tabId,subjectId:receipt.subjectId});
+    if(!scope || workflowStorage.stableJson(scope.receipt)!==workflowStorage.stableJson(receipt)
+      || JSON.parse(scopeRow.request_json).operation!=='archive-close-scope'
+      || request?.operation!=='archive' || request.request.executionNamespace!==receipt.namespace
+      || request.request.tabId!==receipt.tabId || request.request.subjectId!==receipt.subjectId
+      || result?.archiveId!==receipt.historyId || result?.archivedRevision!==receipt.archivedRevision
+      || !history || history.tab_id!==receipt.tabId || history.execution_subject_id!==receipt.subjectId
+      || history.execution_namespace!==receipt.namespace || history.execution_storage_revision+1!==receipt.archivedRevision
+      || !current?.archived || current.row.id!==receipt.storageId || current.revision!==receipt.archivedRevision
+      || JSON.parse(history.execution_snapshot_json || '{}').id!==receipt.storageId)
+      workflowStorage.fail('archive_close_receipt_changed');
+    const manifest=this.archivedFileLinks?.read(receipt.historyId);
+    if(!manifest || manifest.hash!==receipt.manifestHash || manifest.restoredOwnerId)
+      workflowStorage.fail('archive_close_manifest_changed');
+    return scope;
+  }
+
+  finalizeArchivedClose({receipt,snapshots,groupCloseGuard},hooks={}) {
+    if(this.db.inTransaction)workflowStorage.fail('archive_close_outer_transaction_not_supported');
+    let closedIds;
+    const result=this._executionTransaction(()=>{
+      const scope=this.assertArchivedCloseReceipt(receipt);
+      const namespace=row=>row.execution_namespace || row.project_id;
+      closedIds=[receipt.tabId,...scope.files.map(row=>row.tab_id)];
+      if(workflowStorage.stableJson(groupCloseGuard || null)!==workflowStorage.stableJson(scope.groupCloseGuard))
+        workflowStorage.fail('archive_close_group_changed');
+      if(groupCloseGuard && (typeof hooks.before!=='function' || typeof hooks.after!=='function'))
+        workflowStorage.fail('archive_close_group_guard_required');
+      if(!Array.isArray(snapshots) || snapshots.length!==scope.expectedNamespaces.length
+        || new Set(snapshots.map(row=>row.projectId)).size!==snapshots.length)
+        workflowStorage.fail('archive_close_snapshots_required');
+      for(const expected of scope.expectedNamespaces) {
+        const snapshot=snapshots.find(row=>row.projectId===expected.namespace);
+        const keep=expected.tabIds.filter(id=>!closedIds.includes(id)).sort();
+        if(!snapshot || !Array.isArray(snapshot.tabs) || !Array.isArray(snapshot.expectedTabIds)
+          || JSON.stringify([...snapshot.expectedTabIds].sort())!==JSON.stringify([...expected.tabIds].sort())
+          || JSON.stringify(snapshot.tabs.map(tab=>tab.tabId).sort())!==JSON.stringify(keep))
+          workflowStorage.fail('archive_close_snapshot_changed');
+        for(const child of scope.children.filter(row=>namespace(row)===expected.namespace)) {
+          const incoming=snapshot.tabs.find(tab=>tab.tabId===child.tab_id);
+          const parent=child.visual_parent_tab_id===receipt.tabId?scope.root:scope.files.find(row=>row.tab_id===child.visual_parent_tab_id);
+          const marker=parent?.tab_type==='file'?null:parent?.restore_placement_id || parent?.tab_id;
+          if(incoming?.visualParentTabId || (incoming?.closedVisualParentTabId || null)!==(marker || null))
+            workflowStorage.fail('archive_close_child_relation_changed');
+        }
+      }
+      const finalId='archive-close-finalize:'+receipt.mutationId;
+      const previous=this.db.prepare('SELECT response_json FROM workflow_execution_mutations WHERE mutation_id=?').get(finalId);
+      const completed=previous && JSON.parse(previous.response_json);
+      const readRow=id=>this.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get(id) || null;
+      if(completed) {
+        for(const row of completed.afterRows)if(workflowStorage.stableJson(readRow(row.tabId))!==workflowStorage.stableJson(row.row))
+          workflowStorage.fail('archive_close_completed_owner_changed');
+        if(this.db.prepare('SELECT tab_type,visual_parent_tab_id,parent_tab_id FROM tabs WHERE execution_archived=0').all().some(row=>
+          closedIds.includes(row.visual_parent_tab_id)
+          || row.tab_type==='file' && closedIds.includes(row.parent_tab_id)))
+          workflowStorage.fail('archive_close_family_changed');
+        this.assertArchiveCloseNamespaces(scope.expectedNamespaces,closedIds);
+        return completed;
+      }
+      this.assertArchiveCloseNamespaces(scope.expectedNamespaces,[receipt.tabId]);
+      for(const row of [...scope.files,...scope.children])if(workflowStorage.stableJson(readRow(row.tab_id))!==workflowStorage.stableJson(row))
+        workflowStorage.fail('archive_close_family_changed');
+      // A late file/child in another namespace must not escape the frozen family.
+      const family=this.db.prepare('SELECT tab_id,tab_type,visual_parent_tab_id,parent_tab_id FROM tabs WHERE execution_archived=0').all();
+      const seen=new Set([receipt.tabId]),queue=[receipt.tabId];
+      for(const owner of queue)for(const row of family)if(row.tab_type==='file'
+        && (row.visual_parent_tab_id || row.parent_tab_id)===owner && !seen.has(row.tab_id)) {
+        seen.add(row.tab_id);queue.push(row.tab_id);
+      }
+      if(JSON.stringify([...seen].sort())!==JSON.stringify([...closedIds].sort())
+        || family.some(row=>!seen.has(row.tab_id) && seen.has(row.visual_parent_tab_id)
+          && !scope.children.some(child=>child.tab_id===row.tab_id)))workflowStorage.fail('archive_close_family_changed');
+      const groupProof=hooks.before?.(snapshots);
+      const finalized=this._executionMutation('archive-close-finalize',{mutationId:finalId,receipt},()=>{
+        for(const row of scope.files) {
+          if(row.execution_subject_version===2)this.db.prepare('UPDATE tabs SET execution_archived=1 WHERE id=?').run(row.id);
+          else this.db.prepare('DELETE FROM tabs WHERE id=?').run(row.id);
+        }
+        for(const child of scope.children) {
+          const parent=child.visual_parent_tab_id===receipt.tabId?scope.root:scope.files.find(row=>row.tab_id===child.visual_parent_tab_id);
+          this.db.prepare('UPDATE tabs SET visual_parent_tab_id=NULL,closed_visual_parent_tab_id=? WHERE id=?')
+            .run(parent?.tab_type==='file'?null:parent?.restore_placement_id || parent?.tab_id || null,child.id);
+        }
+        hooks.after?.(groupProof);
+        const afterRows=[...closedIds,...scope.children.map(row=>row.tab_id)].map(tabId=>({tabId,row:readRow(tabId)}));
+        return {success:true,projectIds:scope.expectedNamespaces.map(row=>row.namespace),closeReceipt:receipt,
+          closedTabIds:closedIds,afterRows};
+      });
+      return finalized;
+    });
+    // RAM admission mirrors are retired only AFTER the transaction committed.
+    for(const id of closedIds)this._executionPendingArchiveIds?.delete(id);
+    return result;
   }
 
   _archiveLegacyTab(projectId, tab, {

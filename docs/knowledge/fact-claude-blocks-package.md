@@ -52,6 +52,16 @@ hot-reload'ится — нужен рестарт Electron (dev: рестарт 
 `build:install`), иначе `rawTool` не появится и HistoryPanel молча уйдёт в legacy-
 фоллбэк.
 
+### Имена MCP-серверов и описание вызова
+
+В строке MCP пользователь должен узнавать интеграцию, а не расшифровывать её
+транспортный ID. `cua_repl` отображается как `Computer Use`; метод остаётся рядом.
+`title` описывает конкретное действие и не заменяет имя сервера. Alias общий для
+карточки и MCP-qualifier основной/вложенной History, но raw server/method,
+arguments/result, Copy и ключи группировки не переписываются; неизвестные серверы
+не угадываются по title/summary. Изменение длины видимого имени может изменить
+переносы, поэтому старый measured-layout snapshot не считается exact geometry.
+
 ### Вложенный transcript субагента
 
 `HistoryTranscriptPresentation` принимает компактные `HistoryTranscriptStep[]`

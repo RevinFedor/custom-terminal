@@ -24,10 +24,12 @@ import {
   paneStripKey,
 } from '../../utils/paneTabDragBridge';
 import { bindPaneTabPointerDrag } from '../../utils/paneTabPointerGesture';
+import {canonicalPaneDragAddress} from '../../utils/paneTabDropPresentation.mjs';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 import { openTabLinkedFile } from '../../utils/tabLinkedFilePreview';
 import { useUIStore } from '../../store/useUIStore';
+import {usePaneStripSelection} from './PaneStripSelection';
 
 export interface PaneTabChipProps {
   projectId: string;
@@ -48,18 +50,22 @@ export interface PaneTabChipProps {
   sharedActivity?: SharedTabActivityMaps | null;
   /** A target-strip preview clone; it must not register a second draggable. */
   previewOnly?: boolean;
+  /** Released visual placement; a new gesture recaptures canonical ownership. */
+  releasedPlacement?: boolean;
   /** Keep this chip's slot visible while its full preview follows the pointer. */
   dragPlaceholder?: boolean;
 }
 
 export default function PaneTabChip({
   projectId, tabId, shown, paneFocused, paneIndex, inSplit, index = 0, inStrip = false, sharedActivity = null,
-  previewOnly = false, dragPlaceholder = false,
+  previewOnly = false, dragPlaceholder = false,releasedPlacement = false,
 }: PaneTabChipProps) {
   const tabExists = useWorkspaceStore(s => !!s.openProjects.get(projectId)?.tabs.has(tabId));
   const activeSpaceId = useWorkspaceStore(s => s.activeSpaceId);
   const tabName = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.name || '');
   const tabType = useWorkspaceStore(s => s.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
+  const stripSelection=usePaneStripSelection();
+  const selectionRef=useRef(stripSelection);selectionRef.current=stripSelection;
 
   const chipRef = useRef<HTMLSpanElement | null>(null);
   // Immediate acknowledgement lives on the chip, independently of the heavy
@@ -132,10 +138,12 @@ export default function PaneTabChip({
     if (!element || !paneDndEnabled || previewOnly || renaming) return undefined;
     const paneKey = paneStripKey(paneIndex);
     return bindPaneTabPointerDrag(element, () => ({
-      owner: 'pane', entries: [{ projectId, tabId }], rootTabId: tabId,
+      owner: 'pane', entries: selectionRef.current?.dragEntries(tabId) || [{ projectId, tabId }], rootTabId: tabId,
+      groupDrag:selectionRef.current?.captureGroupDrag(tabId),
       sourcePaneKey: paneKey, sourceSpaceId: activeSpaceId,
+      ...(releasedPlacement ? canonicalPaneDragAddress(useWorkspaceStore.getState(),projectId,tabId):{}),
     }), () => { setPointerHeld(false); setPressed(false); });
-  }, [activeSpaceId, paneDndEnabled, paneIndex, previewOnly, projectId, tabId, renaming]);
+  }, [activeSpaceId, paneDndEnabled, paneIndex, previewOnly, projectId, tabId, renaming,releasedPlacement]);
 
 
   if (!tabExists) return null;
@@ -162,7 +170,9 @@ export default function PaneTabChip({
     <TabCard
       ref={chipRef}
       projectId={projectId} tabId={tabId} shown={shown} active={shown}
+      selected={stripSelection?.selected(tabId)}
       pressed={pressed} showShownStripe={inStrip} truncate={!inStrip}
+      cornerSignalZIndex={11}
       interactiveStatus sharedActivity={sharedActivity}
       onLinkedFileOpen={previewOnly ? undefined : file => {
         void openTabLinkedFile(projectId, file, () => useWorkspaceStore.getState().openTabById(tabId, {
@@ -185,6 +195,7 @@ export default function PaneTabChip({
       data-chip-active={shown && paneFocused ? '1' : '0'}
       data-chip-pressed={pressed ? '1' : '0'}
       data-chip-index={index}
+      data-strip-selected={stripSelection?.selected(tabId) ? '1' : undefined}
       data-pane-chip-preview-only={previewOnly ? '1' : '0'}
       data-pane-chip-drag-placeholder={(dragPlaceholder || previewOnly) ? '1' : undefined}
       // Only a LEFT press may take focus. A right-click opens a menu about
@@ -216,6 +227,14 @@ export default function PaneTabChip({
         // special project-following path anymore.
         e.stopPropagation();
         if (renaming) return;
+        if (stripSelection && !e.ctrlKey && !e.altKey) {
+          const handled=stripSelection.click(tabId,e);
+          if(handled) {
+            setPointerHeld(false);setPressed(false);
+            if(pressedFallbackRef.current!==null)window.clearTimeout(pressedFallbackRef.current);
+            pressedFallbackRef.current=null;return;
+          }
+        }
         // The first click already navigated. A plain second click belongs to
         // rename; repeating activation delays its input and requests composer
         // focus just before the name editor mounts.
@@ -268,6 +287,7 @@ export default function PaneTabChip({
         e.preventDefault();
         e.stopPropagation();
         if (tabType === 'file') return;
+        if (stripSelection && (e.metaKey || e.shiftKey)) return;
         renameOriginal.current = tabName;
         setRenameDraft(tabName);
         setRenaming(true);
@@ -282,7 +302,9 @@ export default function PaneTabChip({
         // me". Without it the sidebar list opened the input on ITS copy of
         // the tab — the name committed correctly on Enter, but the editing
         // happened out of sight, on another surface than the one clicked.
-        openTabContextMenuAt(projectId, tabId, e.clientX, e.clientY, { renameHost: renameHostId });
+        const selection=stripSelection?.menu(tabId) || null;
+        openTabContextMenuAt(projectId, tabId, e.clientX, e.clientY, { renameHost: renameHostId,
+          singleTarget:!selection||selection.entries.length===1,paneSelection:selection || undefined,isCurrent:selection?.isCurrent });
       }}
       onAuxClick={(e) => {
         // Middle-click takes this tab OUT OF THE WINDOW: its chip goes and the

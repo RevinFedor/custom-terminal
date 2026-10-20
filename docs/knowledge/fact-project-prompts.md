@@ -99,6 +99,10 @@ Natural/manual/visual порядок сохраняется, включая ordi
 не обрезается, maxUnit/maxSlice фиксируются; это targets, не hard latency limits.
 Async FS ports opendir/stat/lstat/realpath явные, общий небольшой limiter;
 handle закрывается до descent, unknown/read/close failure не становится ready.
+Одновременные одинаковые stat/lstat/realpath делят только незавершённый syscall;
+после его завершения запись удаляется. Это не TTL-кэш и не замена свежей binding
+authority. Directory handles не разделяются. Диагностика различает active/waiting,
+rejected и `fs_queue_full`; configured paths и содержимое файлов не логируются.
 
 `listTab/listProject/usageForRoot` возвращают Promises. Read не запускает recursive
 scan или watcher reconciliation: cold/stale планирует одну source preparation и
@@ -113,13 +117,43 @@ Obsolete latest epoch уходит в конец очереди; unrelated sourc
 Usage по-прежнему обрабатывает fresh open/archive bindings и project labels,
 поэтому не O(1). SQL scopes/bindings/registrations читаются bounded keyset pages
 в прежнем ordering, без all-scopes .all или iterator/transaction через await.
+Одновременные usage requests делят одну pending inventory. Последующие reads
+могут переиспользовать одну SQL ownership/order projection только под exact
+connection-local certified catalog epoch; source label сам не сертификат.
+Незаверенная schema/connection/future proof возвращает полную fresh assembly.
+Retained projection не содержит paths/canonical leaf proofs: каждый получатель
+заново проверяет configured sources/FS/layout/watch/policy и physical leaves,
+final fence/diagnostic settle/lifetime, создаёт собственный detached результат.
+SQL ownership имеет отдельную завершённую проверку authority до ожидания FS:
+медленная или failed physical preparation остаётся explicit unavailable, но не
+заставляет заново читать все tab headers. Reconciliation переиспользует только
+тот же certified consumer/order projection; registrations, FS/layout/watch probes
+и before/after fence остаются свежими. Unknown certificate сохраняет полный проход.
+Usage собирает metadata paths по source, не неиспользуемые authoring DTO на каждую
+вкладку. Равные project labels, overlap/alias и полный scope order сохраняются.
 Sources reader переиспользует statements, не ответы; connection/schema swap
 сбрасывает compiled ports. Exact selected authority читается до metadata и
-повторно перед return. Connection/schema, relevant committed epoch и external
-SQLite data_version fenced. Из-за неполной notification coverage local
-`total_changes()` — conservative recheck hint (включая rollback), не authority:
-он допускает одну дополнительную authority pass, затем `prompt_catalog_changed`,
-и НЕ инвалидирует FS inventory из-за unrelated History writes. Settings и durable
+повторно перед return; certified ownership hit доказывает ту же неизменность
+SQL через current epoch, не повторяет все headers. Для retained SQL projection
+посторонний commit другой connection может обновить только external fence, если
+current certificate доказывает прежние catalog inputs. Полный API-result так
+не переиспользуется: до/после чтения и await external `data_version` по-прежнему
+проверяется вместе с connection/schema и relevant committed epoch. Из-за неполной notification coverage local
+`total_changes()` остаётся conservative fallback (включая rollback), не authority.
+19.10 owning schema composition устанавливает derived `catalog-read-epoch-v2`:
+триггеры следят за exact catalog inputs, включая direct SQL writes без notify;
+History/status/layout updates этот epoch не меняют. До/после await остаются fresh
+fence и exact selections. Неизвестные schema/connection/epoch/trigger definitions
+возвращают прежний fallback, reader не создаёт и не чинит authority. Известный v1
+обновляет только schema owner атомарно; future/неизвестные определения не заменяет.
+Source root/org versions проверяются при каждом чтении: row-only смена версии
+не обязана менять SQLite schema cookie. Duplicate/escaped execution JSON keys
+консервативно инвалидируют projection: JavaScript берёт последний duplicate,
+SQLite может читать первый. Обычные уникальные keys сохраняют fast path.
+Одна смена
+допускает повторную pass, затем `prompt_catalog_changed`; unrelated writes не
+инвалидируют FS inventory. Prepared statements — ports, не cached SQL answers.
+Settings и durable
 CAS/replay receipts никогда не ждут preparation и не становятся async unknown.
 
 Usage не создаёт pruned candidate: source inventory всегда полный. Query root и
@@ -138,6 +172,9 @@ file rename и null filename требуют reconciliation. Ignore лишь prov
 entries/dependency descendants. Loss/close/error, inode replacement и alias retarget
 отзывают coverage; old callback/timer/completion проверяют exact owner/token.
 Shared non-recursive parent/alias sentinels восстанавливают missing roots/docs.
+Постороннее sibling-событие такого sentinel, отвергнутое всеми source slots,
+не планирует общий consumer reconcile. Null filename, затронутый root/ancestor
+и неожиданно доставленный descendant сохраняют прежнюю консервативную проверку.
 После успешного layout store.put parent вызывает synchronous
 `catalog.onLayoutCommitted(rootPath)`: revokes только exact configured source key,
 queued rebuild, без FS/SQL в самом seam. Committed CAS result не меняется даже
@@ -148,6 +185,21 @@ observation gap/explicit recovery. Event-only FS не доказывает об�
 потерянного nested event без такого сигнала; TTL/readiness polling не возвращаются.
 `close()` seals old lifetime; явное reuse создаёт новый preparer, old callbacks мертвы.
 Unknown consumers notification omits tabIds; [] значит «нет tabs», не broadcast.
+
+Повторные content-change events объединяются одним verifier на source и одним
+preparing wake; epoch всё равно отзывается синхронно. Сканер запоминает regular
+dirent facts обычных файлов: изменение их тела тоже не требует обхода docs.
+Prompt identity, regular-file type, root/docs/layout и exact watcher owner
+перепроверяются до возврата ready. Больше256 разных pending paths либо rename/
+unknown/type change переходят в одну полную preparation, без обрезки inventory.
+Старый verifier не публикует snapshot после нового dirty epoch/смены watcher.
+Это исправляет прежний unbounded fanout: по одному async verifier на КАЖДЫЙ
+event могло переполнить FS queue и оставить source failed с `unavailable`.
+
+Граница Source19Oct:73 finite Node/SQL/VM/SSR checks; реальный HH docs и
+`сообщения-обновления.prompt.md` прочитаны CURRENT scanner через контролируемые
+workflow bindings.8 повторных открытий дали0 discovery scans. Это не проверка
+новой installed версии или native latency.
 
 THREE IPC read handlers await внутри try; Settings/CAS sync. HTTP
 `GET /api/project-prompt-usage` await-ит usage перед success body и сохраняет
@@ -167,10 +219,14 @@ catalog work (production6956ms/4822ms Main CPU). Это не обещание me
 
 ## Opt+V и контекстная вставка
 
-В Opt+V есть общий раздел «Промпты рабочего пространства», справа — компактные
+В Opt+V есть общий раздел `Workflow`, справа — компактные
 группы по директориям. Обычные сохранённые groups/ungrouped prompts остаются
 отдельно в прежнем порядке. Папки выбираются настройками workflow; адрес вставки
 остаётся exact вкладкой, в composer которой пользователь открыл меню.
+Строка `Workflow` однострочная: subtitle отсутствует; при cold/preparing/stale
+SVG loader заменяет ведущую иконку в том же15px слоте. Failed не показывает
+бесконечный loader; код ошибки сохраняется у consumer, дочерний placeholder
+сообщает отказ.
 
 Prepared consumer отделяет global library от каталога вкладки. Listener
 `project-prompts:changed` подключается до первого чтения; событие синхронно отзывает

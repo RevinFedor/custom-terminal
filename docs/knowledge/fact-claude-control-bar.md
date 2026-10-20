@@ -254,6 +254,13 @@ feedback: client-проверка сверяет цвет Enter и логиче�
 `fix-codex-settings-history-rollback.md` — включая ошибочное возвращение Ultra
 из старой History и ограничения проверки.
 
+Это ограничение Model/Effort/Quick не распространяется на Fast: его клик сохраняет
+независимое намерение, не запускает параллельный picker и не отменяет spinner
+чужой настройки. При сочетании Start → Send → Model → Fast сохраняется последний
+выбор Fast, а запись в PTY проходит прежнюю сериализацию и свежие guards. На
+managed запуске отсутствие выбора означает Fast off, а не глобальный tier Codex;
+подтверждённый runtime tier по-прежнему отделён от желаемого.
+
 Компонент исторически называется `ClaudeControlBar`, но теперь держит общий lifecycle PTY-агентов. Codex использует тот же triplet session-id / Continue-Stop / refresh Timeline, но с отдельным `codexSessionId` и без Claude-only affordance'ов. На pristine табе рядом с Claude/SDK fork-кнопками видны `Codex` и `⑂ Codex-F`; как только в табе появился любой AI-process или session id, launch/fork-from-clipboard chips прячутся тем же `!hasAnySession && !isCommandRunning` guard'ом, иначе юзер видит fork-кнопки поверх занятого таба.
 
 Codex не показывает секцию провайдера, Think и cache chip: у него нет provider proxy в нашем смысле и нет отдельного think toggle. Правая зона для Codex — квадратная кнопка быстрого перехода, Model и Effort, а `Fast` остаётся отдельным квадратом с молнией. Model/Effort идут через интерактивный `/model` picker Codex TUI; при наведении на строку модели совместимые effort показываются отдельной плашкой **сбоку** от этой строки (`SideFlyout`). Быстрая кнопка модели берёт сохранённую в настройках пару и умеет вернуться к прежней; Fast этой парой не управляет.

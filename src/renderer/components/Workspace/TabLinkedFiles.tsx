@@ -11,6 +11,9 @@ import { TAB_CARD_LINE_HEIGHT } from '../../utils/tabCardVisual.mjs';
 import { useWorkspaceOverlayTarget } from '../../hooks/useWorkspaceOverlayTarget';
 import './TabLinkedFiles.css';
 
+const LINKED_FILE_HOVER_MS = 100;
+const LINKED_FILE_HOVER_ANIMATION = 'tab-linked-file-hover-intent';
+
 export type LinkedFile = { projectId: string; id: string; ownerTabId: string; path: string; name: string; parentTabId?:string;depth?:number };
 export function useTabLinkedFiles(tabId: string, enabled = true): LinkedFile[] {
   // A value snapshot avoids allocating new selector results or reacting to
@@ -30,6 +33,15 @@ export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 
   const bridge = useRef<HTMLDivElement>(null);
   const contextMenuActive = useRef(false);
   const dragging=useRef(false),dismissed=useRef(false);
+  const hoverIntent = useRef<{ startedAt: number; cancel: () => void; escape: (event: KeyboardEvent) => void } | null>(null);
+  const cancelHoverIntent = useCallback(() => {
+    const pending = hoverIntent.current; hoverIntent.current = null;
+    trigger.current?.removeAttribute('data-linked-files-opening');
+    if (!pending) return;
+    window.removeEventListener('blur', pending.cancel);
+    window.removeEventListener('pointerdown', pending.cancel, true);
+    window.removeEventListener('keydown', pending.escape, true);
+  }, []);
   const onDraggingChange=useCallback((active:boolean)=>{dragging.current=active;},[]);
   const [open, setOpen] = useState(false), [pinned, setPinned] = useState(false);
   const [hovered,setHovered]=useState(false);
@@ -38,13 +50,36 @@ export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 
   const [,setMissingRevision]=useState(0);
   useEffect(()=>subscribeMissingFiles(()=>setMissingRevision(n=>n+1)),[]);
   useEffect(()=>{void probeFiles(files.map(file=>file.path));},[files]);
-  const close = () => { setOpen(false); setPinned(false); setHovered(false); onHoverChange?.(false); };
+  const close = () => { cancelHoverIntent(); setOpen(false); setPinned(false); setHovered(false); onHoverChange?.(false); };
   const contains = (target: EventTarget | null) => target instanceof Node &&
     [trigger.current, popup.current, bridge.current].some(element => element?.contains(target));
   // The menu also exposes actions on a single file; its count only controls +N.
-  const enter = () => { setHovered(mode==='menu'); onHoverChange?.(true); void probeFiles(files.map(file=>file.path)); if (mode==='menu' && files.length > 0 && !dismissed.current) setOpen(true); };
+  const enter = () => {
+    setHovered(mode==='menu'); onHoverChange?.(true);
+    if (mode!=='menu') { void probeFiles(files.map(file=>file.path)); return; }
+    if (!files.length || dismissed.current || open || hoverIntent.current) return;
+    const cancel = () => { cancelHoverIntent(); setHovered(false); onHoverChange?.(false); };
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') cancel(); };
+    hoverIntent.current = { startedAt: performance.now(), cancel, escape };
+    // The finite transform animation is the dwell clock. Fast crossings never
+    // mount/measure a popup or perform a fresh file probe.
+    trigger.current?.setAttribute('data-linked-files-opening', '1');
+    window.addEventListener('blur', cancel);
+    window.addEventListener('pointerdown', cancel, true);
+    window.addEventListener('keydown', escape, true);
+  };
+  const finishHover = (event: React.AnimationEvent<HTMLSpanElement>) => {
+    const pending = hoverIntent.current;
+    if (event.target !== event.currentTarget || event.animationName !== LINKED_FILE_HOVER_ANIMATION
+      || !pending || performance.now() - pending.startedAt < LINKED_FILE_HOVER_MS) return;
+    cancelHoverIntent();
+    if (mode !== 'menu' || !files.length || dismissed.current || !trigger.current?.isConnected
+      || !trigger.current.matches(':hover')) return;
+    void probeFiles(files.map(file=>file.path)); setOpen(true);
+  };
   const leave = (event: React.MouseEvent) => {
     if (contains(event.relatedTarget)) return;
+    cancelHoverIntent();
     dismissed.current=false;
     setHovered(false);
     onHoverChange?.(false);
@@ -92,11 +127,13 @@ export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 
     return () => { window.removeEventListener('pointerdown', outside, true); window.removeEventListener('keydown', escape, true); };
   }, [open]);
   const chosen=preferredLinkedFile(files.filter(file=>!isFileMissing(file.path)),preview,ownerTabId,lastFileId);
+  useEffect(() => () => cancelHoverIntent(), [cancelHoverIntent, ownerTabId, mode, chosen?.id, chosen?.path]);
   if (!chosen) return null;
   const selected = isLinkedFilePreview(preview, ownerTabId);
   const stop = (event: React.SyntheticEvent) => event.stopPropagation();
   const openContextMenu = (event: React.MouseEvent, file: LinkedFile) => {
     event.preventDefault(); stop(event);
+    cancelHoverIntent();
     if(mode==='navigate')return;
     contextMenuActive.current = true;
     window.dispatchEvent(new CustomEvent('tab-context-menu:open', { detail: {
@@ -114,16 +151,17 @@ export default function TabLinkedFiles({ ownerTabId, files, onOpen, insetLeft = 
       title={chosen.name}
       aria-expanded={mode==='menu' ? open : undefined} aria-haspopup={mode==='menu' ? 'menu' : undefined}
       onMouseEnter={enter} onMouseLeave={leave}
+      onAnimationEnd={finishHover}
       onPointerDown={event=>{stop(event);if(event.button===1)event.preventDefault();}}
       onMouseDown={event=>{stop(event);if(event.button===1)event.preventDefault();}} onDoubleClick={stop}
       onAuxClick={event=>{stop(event);if(event.button!==1)return;event.preventDefault();
         dismissed.current=true;close();void closeTabLinkedFile(ownerTabId);}}
       onContextMenu={event => openContextMenu(event, chosen)}>
-      <button type="button" data-linked-file-open onClick={event=>{stop(event);onOpen(chosen);}}>
+      <button type="button" data-linked-file-open onClick={event=>{stop(event);cancelHoverIntent();onOpen(chosen);}}>
         <FileText size={10} aria-hidden="true" /><span data-linked-file-short-name>{chosen.name}</span>
       </button>
       {files.length > 1 && <button type="button" data-linked-file-more data-linked-file-menu-trigger aria-label="Меню файлов"
-        aria-expanded={mode==='menu'?open:undefined} onClick={event=>{stop(event);if(mode==='navigate'){onOpen(chosen);return;}if(pinned){dismissed.current=true;close();}
+        aria-expanded={mode==='menu'?open:undefined} onClick={event=>{stop(event);cancelHoverIntent();if(mode==='navigate'){onOpen(chosen);return;}if(pinned){dismissed.current=true;close();}
           else{dismissed.current=false;setOpen(true);setPinned(true);}}}>+{files.length - 1}</button>}
     </span>
     {mode==='menu' && open && createPortal(<><div ref={bridge} data-linked-files-hover-bridge aria-hidden="true"

@@ -12,6 +12,7 @@ set -u
 
 DEADLINE="${1:-5}"
 APP_NAME="Noted Terminal"
+QUIT_FALLBACK="none"
 
 is_running() {
   pgrep -f "/Applications/${APP_NAME}.app" > /dev/null 2>&1
@@ -56,6 +57,7 @@ while is_running; do
   ELAPSED=$(( $(date +%s) - START_TS ))
   if [ "${ELAPSED}" -ge "${DEADLINE}" ]; then
     echo "[graceful-quit] app did NOT exit in ${DEADLINE}s — falling back to pkill (JSONL of unfinished turns may be lost)"
+    QUIT_FALLBACK="SIGTERM"
     pkill -f "/Applications/${APP_NAME}.app" 2>/dev/null || true
     sleep 0.5
     break
@@ -72,6 +74,7 @@ done
 
 if is_running; then
   echo "[graceful-quit] WARNING: app still running after deadline+SIGTERM; forcing SIGKILL"
+  QUIT_FALLBACK="SIGKILL"
   pkill -9 -f "/Applications/${APP_NAME}.app" 2>/dev/null || true
 fi
 
@@ -104,6 +107,8 @@ if [ -n "${CRASHED}" ]; then
   echo "[graceful-quit] ВНИМАНИЕ: приложение не вышло штатно, а аварийно завершилось."
   echo "[graceful-quit] отчёт: ${CRASHED}"
   echo "[graceful-quit] уборка при закрытии оборвана на середине; установка продолжается."
+elif [ "${QUIT_FALLBACK}" != "none" ]; then
+  echo "[graceful-quit] применён fallback ${QUIT_FALLBACK}; штатный выход не подтверждён"
 else
   echo "[graceful-quit] приложение вышло штатно"
 fi

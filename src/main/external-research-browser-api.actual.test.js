@@ -55,6 +55,7 @@ async function fixture(t) {
   const ctx = vm.createContext({ ...request, require, crypto, ExternalResearchCoordinator, ScExternalResearchClient,
     externalResearchCoordinator: null, scExternalResearchClient: client,
     getOrchestrationRunStore: () => store, console,
+    getExternalOperationalDelivery: () => ({ schedule: async () => {} }), // Controlled notification leaf; actual dispatcher has its own FIFO tests.
     userNotificationOutbox: { enqueue: async envelope => { notices.push(envelope); return { ok: true, durable: true }; } },
     emitOrchestrationChanges: runs => changes.push(...runs), emitOrchestrationRun: run => changes.push(run),
     finalizeSettledOrchestration: async () => {},
@@ -92,9 +93,9 @@ async function fixture(t) {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceTabId: 'own-source', notifySource: false, ...body }) });
       return { status: response.status, body: await response.json() };
     },
-    prior: async ({ legacy = false } = {}) => {
+    prior: async ({ legacy = false, mode } = {}) => {
       await store.reserveOrGet({ runId: 'prior', runKind: 'external-research', sourceTabId: 'own-source', requestFingerprint: 'old',
-        externalResearchJobId: 'noted_prior', externalResearchIntent: request.normalizeExternalResearchRequest({ prompt: 'old' }) });
+        externalResearchJobId: 'noted_prior', externalResearchIntent: request.normalizeExternalResearchRequest({ prompt: 'old', ...(mode ? { options: { mode } } : {}) }) });
       await store.applyExternalResearchSnapshot('prior', { id: 'noted_prior', status: 'done',
         ...(legacy ? {} : { browserInstanceId: CHROME }),
         conversationUrl: 'https://chatgpt.com/c/own-conversation', result: { text: 'old result' } });
@@ -176,6 +177,13 @@ test('legacy continuation reads exact effect-free job metadata once, never prima
   ]);
   assert.equal(h.starts[0].browserId, CHROME);
   assert.equal((await h.store.get('prior')).externalResearchBrowserInstanceId, CHROME);
+});
+test('a new Work→Chat continuation is rejected before reservation/capabilities/packing or browser dispatch', async t => {
+  const h = await fixture(t); await h.prior({ mode: 'work' });
+  const result = await h.post({ runId: 'mode-conflict', continueFromRunId: 'prior', prompt: 'follow-up',
+    options: { mode: 'chat', model: '6-astra', effort: 'pro' } });
+  assert.equal(result.status, 409); assert.equal(result.body.code, 'external_research_continuation_mode_conflict');
+  assert.equal(await h.store.get('mode-conflict'), null); assert.equal(h.starts.length, 0); assert.equal(h.scRequests.length, 0);
 });
 
 test('restored old continuation derives the previous owner without rewriting its original intent', async t => {

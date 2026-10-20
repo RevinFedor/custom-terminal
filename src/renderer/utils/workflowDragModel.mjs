@@ -5,6 +5,7 @@ import {moveTabsToPane} from './splitPanesModel.mjs';
 import {moveEntriesToIndex} from './horizontalReorder.mjs';
 import {removeLayoutTabs,stableJson,layoutReferences} from '../../shared/workflow-organization.cjs';
 import {dragPlacement,dragRelation,dragFamily} from '../../shared/workflow-drag.cjs';
+import {projectPaneStripLayoutRows} from '../../shared/pane-strip-row-layout.cjs';
 
 const freeze = value => {
   if(value && typeof value==='object' && !Object.isFrozen(value)) {
@@ -17,7 +18,7 @@ const visit = (nodes,fn,parent=null,group=null) => nodes.forEach(node=>{
   fn(node,parent,group); visit(node.children || [],fn,node.tabId || parent,node.groupId || group);
 });
 
-export function captureWorkflowDrag(state,{gestureId,outline,sourceId,selectedTabIds=[],entries,origin='sidebar',sourcePaneKey=null}) {
+export function captureWorkflowDrag(state,{gestureId,outline,sourceId,selectedTabIds=[],entries,origin='sidebar',sourcePaneKey=null,sourceWorkflowId=state.activeSpaceId}) {
   const catalog=workflowTabCatalog(state), guards={};
   for(const [id,owner] of catalog) {
     if(!owner.active || owner.tab.archived || owner.tab.isArchived || owner.tab.archivedAt || owner.tab.deleted)continue;
@@ -47,13 +48,16 @@ export function captureWorkflowDrag(state,{gestureId,outline,sourceId,selectedTa
   // Window placement follows the established typed family: visual AI children
   // stay independent; physical subagents/files follow the represented owner.
   const paneFamilyIds=dragFamily(guards,paneEntries.map(entry=>entry.tabId),{physicalOnly:true});
+  // The final JSON snapshot below detaches every layout before freezing it.
+  // Cloning each layout here would traverse the same payload a second time.
   const workflows=Object.fromEntries(state.spaces.map(space=>[space.id,{
-    layout:json(space.id===state.activeSpaceId ? captureSpaceLayout(state):space.layout || {}),
+    layout:space.id===state.activeSpaceId ? captureSpaceLayout(state):space.layout || {},
     reserveOrder:[...(space.reserveOrder || [])],
     reserveRootOrder:[...(space.reserveRootOrder || [])],
     kind:space.kind || 'user',
   }]));
-  return freeze(json({version:1,gestureId,origin,sourceWorkflowId:state.activeSpaceId,sourceId,sourcePaneKey,
+  if(!workflows[sourceWorkflowId])return null;
+  return freeze(json({version:1,gestureId,origin,sourceWorkflowId,sourceId,sourcePaneKey,
     multiSelected:requested.length>1,
     presentationRootOrder:origin==='sidebar' ? tree.map(node=>node.id):[],
     sourceRootIds,sourceNodes,rootTabIds,familyIds,paneEntries,paneFamilyIds,guards,workflows,
@@ -164,6 +168,16 @@ export function workflowDragRequest(admission,{workflowId,previewOutline,target=
         layout={...layout,splitPanes:moved.panes,splitFocusedIndex:index,activeSpaceTab:shown,
           activeProjectId:shown.projectId,focusedProjectId:shown.projectId};
       }
+    }
+    if(target) {
+      const targetPane=id===workflowId && target.paneIndex!=null ? baseline.layout.splitPanes?.[target.paneIndex] : null;
+      const targetKey=id===workflowId && target.paneIndex==null
+        ? baseline.layout.activeProjectId || admission.paneEntries[0]?.projectId : null;
+      layout=projectPaneStripLayoutRows(baseline.layout,layout,{
+        sourceIds:admission.paneEntries.map(entry=>entry.tabId),
+        target:id===workflowId ? {windowId:targetPane?.windowId,paneIndex:target.paneIndex,centerKey:targetKey,
+          rowStartId:target.rowStartId,width:target.stripWidth}:null,
+      });
     }
     const preserveSourceOrder=!!target && admission.origin==='sidebar' && id===admission.sourceWorkflowId;
     let rootOrder=baseline.reserveRootOrder;

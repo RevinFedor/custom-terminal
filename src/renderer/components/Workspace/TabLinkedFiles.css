@@ -13,6 +13,13 @@
 .tab-linked-files-chip [data-linked-file-more] { flex: 0 0 auto; overflow: visible; }
 .tab-linked-files-chip { transform-origin:left bottom; }
 .tab-linked-files-chip:not([data-linked-files-mode="navigate"]):is(:hover,[data-linked-files-hovered="1"]) { background: #201e32; color: #e0d3ff; transform:scale(1.04); }
+.tab-linked-files-chip[data-linked-files-opening="1"] {
+  animation: tab-linked-file-hover-intent 100ms linear;
+}
+@keyframes tab-linked-file-hover-intent {
+  from { transform: scale(1); }
+  to { transform: scale(1.04); }
+}
 .tab-linked-files-chip[data-file-selected="1"] { border-color: #b6a1e8; color: #e0d3ff; background: #302842; }
 .tab-linked-files-popup {
   position: fixed; visibility: hidden; width: max-content; max-width: calc(100vw - 16px);

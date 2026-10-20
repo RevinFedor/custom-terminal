@@ -103,6 +103,15 @@ Tab/Map; непрозрачные JSON-значения сохраняют пр�
 file probes и синхронные промежуточные revision/onChanged остаются наблюдаемыми.
 Экономия этого участка сама по себе не подтверждает ускорение всего перехода.
 
+Прямой клик `SpaceStrip` может не публиковать начальный сброс уже-null
+`activeTabNavigationIntent`, когда сохранённый `navigationKey` совпадает с текущей
+скалярной navigation location. Это opt-in только `source: 'workflow-strip'`:
+pending/undefined intent, stale/отсутствующий key и общие callers сохраняют прежний
+setter с adoption/revision. Owned navigation сохраняет своего владельца. Две
+содержательные синхронные публикации — incoming layout, затем MRU — остаются
+раздельными и в прежнем порядке. Пропуск этого no-op не разрешает объединять их
+или кэшировать mutable Tab/Map по ссылке. Контроль — `workflowReturnIntent.actual.test.mjs`.
+
 ### Отменённая навигация не уничтожает источник списка
 
 Шрам09.10: после клика по внешней ссылке Mac продолжал работать, но native меню

@@ -109,8 +109,11 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     ...require('./history-prompt-presentations'),
     ...require('./codex-image-request-projection'),
     ...require('./agent-send-target-precondition'),
+    ...require('./agent-send-preparation'),
+    ...require('./agent-send-enter-timing'),
+    ...require('./history-send-return'),
     ...queueProof, promptAuditFingerprint,
-    Buffer, Date, Promise, setTimeout, clearTimeout, crypto: require('node:crypto'),
+    Buffer, Date, Promise, setTimeout, clearTimeout, queueMicrotask, crypto: require('node:crypto'),
     console: { log() {}, warn() {}, error() {} },
     _webBroadcast() {},
     CODEX_PASTE_AUDIT_TIMEOUT_MS: 15, CLAUDE_PASTE_AUDIT_TIMEOUT_MS: 15,
@@ -165,6 +168,10 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     markCodexPromptSubmitted: (_tab, state) => { state.submitted = true; },
     clearCodexPromptInFlight() {},
     requestTerminalCodexDraftState: async () => ({ success: true, hasDraft: false }),
+    // Both current draft-reader entry points see the same controlled empty
+    // composer. Draft parsing has its own actual-frame suite; do not replace
+    // the target/preparation/receipt executors under test here.
+    getHeadlessCodexDraftState: () => ({ success: true, hasDraft: false }),
     drainPtyData: async () => { if (beforeDrain) beforeDrain(setWriter); },
     recordComposerForensicPtyInput: () => null,
     captureCodexPromptAuditBoundary: () => ({ sessionId: writer.sessionId, byteOffset: 42, fileSize: 42 }),
@@ -217,6 +224,12 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     'observeCodexQueuedMessageCommittedFrame', 'waitForCodexPasteAudit', 'markCodexAuditDeliveryUnknown',
     'finishCodexPasteAudit', 'currentCodexAcceptedResumeSourceProof', 'readAgentSendDestinationAtWriteBoundary']) {
     vm.runInContext(declaration(name), context);
+  }
+  // Old installed-ASAR controls predate these caller helpers; current Main
+  // uses their actual declarations rather than a replacement write stub.
+  for (const name of ['publishHistorySendReturn', 'writeHistorySendPayload', 'writeHistorySendEnter']) {
+    const node = ast.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);
+    if (node) vm.runInContext(node.getText(ast), context);
   }
   for (const name of ['expectedKnownEmptySend', 'assertKnownEmptySend']) {
     vm.runInContext(declaration(name), context);

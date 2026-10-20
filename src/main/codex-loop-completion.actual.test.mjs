@@ -6,13 +6,16 @@ import ts from 'typescript';
 import { createRequire } from 'node:module';
 import { isNaturalAgentTurnEndReason, normalizeAgentTurnEndReason } from '../renderer/utils/agentCompletionOutcome.mjs';
 import { choosePromptQueueContinuationForOutcome } from '../renderer/utils/promptQueueReconciliation.mjs';
+import { deferredGoalCompletionKey } from '../renderer/utils/restartAfterCoordinator.mjs';
 import { hasPendingAgentGoalWork } from '../shared/agent-work-completion.mjs';
 
 const require = createRequire(import.meta.url);
 const { TaskCompletionIntentRegistry, taskCompletionOutcomeMeta } = require('./task-completion-intent');
 const { codexProviderPreviewOwnerVerdict, codexProviderTerminalOutcomeVerdict } = require('./codex-provider-preview');
+const { classifyCodexTurnRecord } = require('./codex-turn-outcome');
 const main = fs.readFileSync(new URL('./main.js', import.meta.url), 'utf8');
 const runner = fs.readFileSync(new URL('../renderer/hooks/usePromptQueueRunner.ts', import.meta.url), 'utf8');
+const queueStore = fs.readFileSync(new URL('../renderer/store/usePromptQueueStore.ts', import.meta.url), 'utf8');
 function declarations(source, names) {
   const tree = ts.createSourceFile('source.ts', source, ts.ScriptTarget.Latest, true);
   const found = new Map();
@@ -28,7 +31,9 @@ function declarations(source, names) {
 const mainCode = declarations(main, ['currentCodexProviderSemanticOwnerContext', 'publishCodexProviderTurnActivity',
   'settleCodexProviderActivityFromWatcherOutcome', 'codexOutcomeTimestampMs', 'applyCodexWatcherAbnormalOutcome',
   'applyCodexWatcherOutcome', 'codexTurnStateSnapshot', 'registerTaskCompletionIntent', 'emitCodexBusy']);
-const rendererCode = ts.transpileModule(declarations(runner, ['explicitOutcomeTimestamp', 'liveOutcomeTimestamp',
+const queueContextCode = declarations(queueStore, ['skippedContextQueues', 'setPromptQueueContextSkipped'])
+  .replace(/^export /gm, '');
+const rendererCode = ts.transpileModule(queueContextCode + '\n' + declarations(runner, ['explicitOutcomeTimestamp', 'liveOutcomeTimestamp',
   'naturalOutcomeKey', 'processSuccessfulWorkflowOutcome', 'handleBusyState']) + '\nglobalThis.receive = handleBusyState("codex");',
 { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 
@@ -48,9 +53,9 @@ function harness({ eligible = true, ordinaryQueue = false, providerActive = true
   const renderer = vm.createContext({ console, Map, Set, Date, Number, JSON,
     queueShutdownPending: false, getPromptQueueAgent: () => 'codex', getWorkspaceCommandType: () => 'codex',
     prevBusyRef, autoCompactTurnStarts: new Map(), observedWorkflowStarts: new Set(), queueAwaitingBusyStart: new Set(),
-    deferredOrchestrationNaturalOutcomes: new Map(), deferredContinuationPivotReleases: new Map(),
+    deferredGoalCompletionKey, deferredGoalNaturalOutcomes: new Map(), deferredOrchestrationNaturalOutcomes: new Map(), deferredContinuationPivotReleases: new Map(),
     queueLifecycleStopInflight: new Set(), queueSendInflight: new Set(), latestLoopCauseByOwner: new Map(),
-    processedNaturalOutcomes: new Map(), queueRendererStartedAt: 0,
+    processedNaturalOutcomes: new Map(), queueConditionChecks: new Map(), queueRendererStartedAt: 0,
     usePromptQueueStore: { getState: () => ({ getQueue: () => queue, setLoopPromptEnabled: (_id, enabled) => { queue.loopPromptEnabled = enabled; }, resumeWorkflowsForTrigger() {} }) },
     useUIStore: { getState: () => ({ showToast: text => toasts.push(text) }) }, getTabName: () => 'T',
     coordinator: { intercept: (_tab, _outcome, continuation) => {
@@ -99,7 +104,7 @@ function harness({ eligible = true, ordinaryQueue = false, providerActive = true
       watcher.busy = false;
       // Actual record handler settles provider activity BEFORE emitCodexBusy.
       context.applyCodexWatcherOutcome(watcher, outcome, 100, eventTurnId, null);
-      context.emitCodexBusy(tabId, false, reason, { outcome, timestamp: 100, turnId: eventTurnId });
+      context.emitCodexBusy(tabId, false, reason, { outcome, timestamp: 100, turnId: eventTurnId, goalCompletionOffset:20 });
     } };
 }
 
@@ -113,9 +118,18 @@ test('accepted completed survives provider activity settlement and the real rend
   assert.ok(h.activity.some(([, busy]) => busy === false)); assert.ok(h.projected.length > 0);
 });
 
-test('native active Goal preserves turn idle but does not launch Loop/queued work', () => {
+function nativeGoalContinuationOutcome() {
+  const tracker = { sessionId: 'S' };
+  classifyCodexTurnRecord(tracker, { type: 'event_msg', __byteOffset: 10,
+    payload: { type: 'task_started', turn_id: 'turn-1', turn_attribution: { turn_trigger: 'goal' } } });
+  return classifyCodexTurnRecord(tracker, { type: 'event_msg', __byteOffset: 20,
+    payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'one turn final' } });
+}
+
+test('native Goal continuation preserves turn idle but does not launch Loop/queued work', () => {
   const h = harness({ ordinaryQueue: true });
-  h.finish('task_complete', 'turn-1', { version: 1, pending: true, phase: 'continuing', status: 'active', turnId: 'turn-1', sessionId: 'S' });
+  const outcome = nativeGoalContinuationOutcome();
+  h.finish(outcome.reason, outcome.turnId, outcome.goalWork);
   assert.equal(h.events[0].busy, false);
   assert.equal(h.events[0].goalWork.pending, true);
   assert.deepEqual(h.fired, []);
@@ -126,7 +140,8 @@ test('native active Goal preserves turn idle but does not launch Loop/queued wor
 test('native Goal deferral still consumes the separate exact Loop completion intent', () => {
   const h = harness({ ordinaryQueue: true });
   assert.equal(h.request('completed').ok, true);
-  h.finish('task_complete', 'turn-1', { version: 1, pending: true, phase: 'continuing', status: 'active', turnId: 'turn-1', sessionId: 'S' });
+  const outcome = nativeGoalContinuationOutcome();
+  h.finish(outcome.reason, outcome.turnId, outcome.goalWork);
   assert.equal(h.queue.loopPromptEnabled, false);
   assert.equal(h.queue.autoRun, true);
   assert.deepEqual(h.fired, []);
@@ -180,4 +195,53 @@ test('a delayed compact continuation cannot lend its live idle allowance to a ne
   h.finish(); assert.deepEqual(h.fired, []);
   h.rearm(250); h.releaseCompact();
   assert.deepEqual(h.fired, ['loop'], 'the original busy edge belongs to arm150, not a newer arm250');
+});
+
+const knownPendingGoal = () => ({version:1,pending:true,status:'active',phase:'continuing',
+  sessionId:'S',turnId:'turn-1',createdAt:1,updatedAt:2,sourceOffset:10});
+function deferredGoalQueue() {
+  const h=harness({eligible:false,ordinaryQueue:true});h.queue.loopPromptEnabled=false;
+  h.finish('task_complete','turn-1',knownPendingGoal());
+  const initial=h.events[0];
+  const wake={...initial,goalMetadataOnly:true,goalWork:{...initial.goalWork,status:'complete',pending:false,phase:'complete'}};
+  return {...h,initial,wake,publish:data=>h.context.mainWindow.webContents.send('codex:busy-state',data)};
+}
+test('actual RunAfter remembers public idle pending Goal and releases its queue once from exact metadata',()=>{
+  const h=deferredGoalQueue();assert.equal(h.initial.busy,false);assert.equal(h.initial.goalWork.pending,true);
+  assert.deepEqual(h.fired,[]);h.publish(h.wake);assert.deepEqual(h.fired,['queue']);
+  h.publish(h.wake);assert.deepEqual(h.fired,['queue']);assert.equal(h.queue.autoRun,true);
+});
+for(const patch of [{sessionId:'OTHER'},{lifecycleGeneration:'NEW'},{turnId:'NEXT'},{outcomeTs:101},
+  {goalCompletionOffset:21},{goalCompletionOffset:null},
+  {goalWork:{...knownPendingGoal(),createdAt:2,status:'complete',pending:false}},
+  {goalWork:{...knownPendingGoal(),status:'active'}},{goalWork:{...knownPendingGoal(),status:'unknown'}}]) {
+  test('actual RunAfter rejects mismatched or active/unknown Goal metadata: '+JSON.stringify(patch),()=>{
+    const h=deferredGoalQueue();h.publish({...h.wake,...patch});assert.deepEqual(h.fired,[]);
+    h.publish(h.wake);assert.deepEqual(h.fired,['queue']);
+  });
+}
+test('actual RunAfter new turn or abnormal end revokes the old Goal-end deferral',()=>{
+  for(const next of [{tabId:'T',busy:true,reason:'task_started'},
+    {tabId:'T',busy:false,reason:'turn_aborted',outcomeTs:101}]) {
+    const h=deferredGoalQueue();h.publish(next);h.publish(h.wake);assert.deepEqual(h.fired,[]);
+  }
+});
+test('actual RunAfter Goal wake preserves completed Loop intent while releasing ordinary queue once',()=>{
+  const h=harness({ordinaryQueue:true});assert.equal(h.request('completed').ok,true);
+  h.finish('task_complete','turn-1',knownPendingGoal());assert.equal(h.queue.loopPromptEnabled,false);
+  const initial=h.events[0];const wake={...initial,goalMetadataOnly:true,
+    goalWork:{...initial.goalWork,status:'complete',phase:'complete',pending:false}};
+  delete wake.explicitTaskComplete;delete wake.taskCompletionIntentId;
+  h.context.mainWindow.webContents.send('codex:busy-state',wake);
+  assert.equal(h.queue.loopPromptEnabled,false);assert.deepEqual(h.fired,['queue']);
+  h.context.mainWindow.webContents.send('codex:busy-state',wake);assert.deepEqual(h.fired,['queue']);
+});
+
+test('actual RunAfter metadata does not replay a consumed Loop intent against a later user re-arm',()=>{
+  const h=harness({ordinaryQueue:true});assert.equal(h.request('completed').ok,true);
+  h.finish('task_complete','turn-1',knownPendingGoal());assert.equal(h.queue.loopPromptEnabled,false);
+  h.queue.loopPromptEnabled=true;h.queue.loopPromptArmedAt=200;
+  const initial=h.events[0];h.context.mainWindow.webContents.send('codex:busy-state',{
+    ...initial,goalMetadataOnly:true,goalWork:{...initial.goalWork,status:'complete',pending:false}});
+  assert.equal(h.queue.loopPromptEnabled,true);assert.deepEqual(h.fired,['queue']);
 });

@@ -30,6 +30,11 @@ export function updatePaneTabPointer(
   source: PaneTabDragSource,
   input: { clientX?: number; clientY?: number; metaKey?: boolean; pointerId?: number },
 ) {
+  // Locked strip members never enter the sidebar adoption transport. This
+  // does not end their physical gesture or the strip's clamped preview.
+  if(source.groupDrag && source.groupDrag.boundary?.kind!=='free') {
+    cancelPaneTabPointer();return;
+  }
   snapshot = {
     active: true,
     revision: snapshot.revision + 1,

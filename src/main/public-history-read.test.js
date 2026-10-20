@@ -15,10 +15,11 @@ const { SessionTranscriptService } = require('./session-transcript-service');
 const { applyHistoryEntryWindow } = require('./history-entry-window');
 const { historyReadSession, historyReadOwnerFromProjection } = require('./history-read-session');
 const { completionNotificationCapability } = require('./tab-completion-notification-api');
+const { beginHttpReadDependency } = require('./http-read-diagnostics');
 const { WORKSPACE_SWITCHER_CAPABILITY } = require('./workspace-switcher-api');
 const { RUN_AFTER_CAPABILITY } = require('../shared/run-after-api.cjs');
 const { normalizeHistoryResponseToolType, decorateHistoryResponseTimings, observeHistoryResponseTimingBindings } = require('./history-response-timings');
-const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
+const source = fs.readFileSync(process.env.PUBLIC_HISTORY_SOURCE_FILE || path.join(__dirname, 'web-server.js'), 'utf8');
 const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const functions = (text, names) => {
   const ast = ts.createSourceFile('actual.js', text, ts.ScriptTarget.Latest, true);
@@ -29,6 +30,15 @@ const functions = (text, names) => {
 };
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const quiet = { log() {}, warn() {}, error() {} };
+function requireHostSqlite(t) {
+  try { const Database = require('better-sqlite3'); const db = new Database(':memory:'); db.close(); return true; }
+  catch (error) {
+    if (error?.code === 'ERR_DLOPEN_FAILED' && /NODE_MODULE_VERSION/.test(error.message)) {
+      t.skip('SSD restart requires the existing native SQLite ABI; no dependency rebuild in host-only checks'); return false;
+    }
+    throw error;
+  }
+}
 const sendJson = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
 
 test('multiplex validation is bounded, explicit, backwards compatible and percent-safe', () => {
@@ -167,7 +177,7 @@ async function historyHarness(t, realRecords = null, ownerProof = false, worker 
         if (inputDuringRead) { owner?.noteInput('A'); inputDuringRead = false; }
         const projection=rows.map(row => ({ ...row, sessionId:sid })); if(nextSid){sid=nextSid;nextSid=null;} return projection; },
     } } });
-  const scope = vm.createContext({ console:quiet, crypto, sendJson, decId:decodeURIComponent, applyHistoryEntryWindow,
+  const scope = vm.createContext({ console:quiet, crypto, sendJson, decId:decodeURIComponent, applyHistoryEntryWindow, beginHttpReadDependency,
     historyPayloadCapability, historyPayloadQuery,
     conversationOwners: owner,
     publicHistoryRevisions:new PublicHistoryRevisions(), transcriptService:service,
@@ -222,7 +232,14 @@ test('actual /api/me advertises the opt-in only with an available payload owner 
     RUN_AFTER_CAPABILITY,
     // These are unrelated owners advertised by the same /me declaration;
     // an absent organization must not turn this read-only VM into HTTP 500.
-    require: name => { assert.equal(name, './project-manager'); return { workflowOrganization: null }; },
+    require: name => {
+      if (name === './external-research-browser') return require(name);
+      assert.equal(name, './project-manager'); return { workflowOrganization: null };
+    },
+    storageMaintenance: null, captureTabInspection: null, readTabInspectionResponse: null,
+    userNotificationOutbox: null, savedPromptService: null, sendIntentCancellationAvailable: () => false,
+    getRunAfterApi: () => ({ journal: { epoch: 'fixture-main-epoch' } }),
+    getAgentResponseState: null, readAgentObservedResponse: null, getAgentTurnResult: null,
     publicTabActivity: null, projectCardSignals: null, codexGoalActions: null,
     publicHistoryFreshness: null, agentSendQueue: null, systemPromptService: null, agentParamsService: null, completionNotificationCapability,
     getLanIp: () => '127.0.0.1', webServerServiceHealth: () => ({ instanceId: 'fixture' }), MAX_EVENT_TABS,
@@ -241,6 +258,7 @@ test('actual /api/me advertises the opt-in only with an available payload owner 
   const address = `http://127.0.0.1:${server.address().port}/api/me`;
   assert.equal((await fetch(address)).status, 401);
   const allowed = await (await fetch(address, { headers: { authorization: 'Bearer fixture' } })).json();
+  assert.ok(allowed.capabilities, JSON.stringify(allowed));
   assert.deepEqual(allowed.capabilities.historyPayloads, historyPayloadCapability);
   assert.equal(allowed.capabilities.tabMessages.sourceNavigation, true);
   assert.equal(allowed.capabilities.historyPayloads.headerVersion, 2);
@@ -294,6 +312,7 @@ test('actual HTTP -> worker -> canonical parser: no hidden bodies, full prose, e
 });
 
 test('canonical settings baseline precedes a bounded tail, survives SSD restart, and preserves A→B→A and rollback', async t => {
+  if (!requireHostSqlite(t)) return;
   const settings = (model, effort, index) => ({ type: 'event_msg', timestamp: new Date(1000000 + index * 1000).toISOString(),
     payload: { type: 'thread_settings_applied', thread_settings: { model, reasoning_effort: effort } } });
   const user = text => ({ type: 'event_msg', payload: { type: 'user_message', message: text } });
@@ -339,6 +358,7 @@ test('canonical settings baseline precedes a bounded tail, survives SSD restart,
 });
 
 test('on-demand refs survive worker restart/SSD and reject rewrite, wrong row/hash/session and malformed ranges', async t => {
+  if (!requireHostSqlite(t)) return;
   const h = await historyHarness(t, hiddenRecords(), false, true);
   const first = (await h.read(lightQuery)).data;
   const ref = first.entries.find(row => row.actions?.[0]?.actionRef).actions[0].actionRef;
@@ -598,7 +618,7 @@ test('an async subscribe failure releases its partial consumer without an automa
 });
 
 test('read-only Codex resolution uses main event projection, not bridge or process lookup, and keeps writer distinct', async () => {
-  const scope = vm.createContext({ historyReadSession, historyReadOwnerFromProjection,
+  const scope = vm.createContext({ historyReadSession, historyReadOwnerFromProjection, beginHttpReadDependency,
     findOrchestrationTabDescriptor: () => ({toolType:'codex',sessionId:'saved',projectId:'P',cwd:'/fixture'}),
     resolveCodexRuntimeProjectionBatch: () => ({A:{sessionId:null,readSessionId:'source',writerConfirmed:false,provenWriterSessionId:null}}),
     resolveAgentSessionInfo: () => { throw Error('no process/renderer query'); } });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRestartAfterCoordinator } from './restartAfterCoordinator.mjs';
+const { createRestartAfterCoordinator } = await import(process.env.RESTART_AFTER_UNDER_TEST || './restartAfterCoordinator.mjs');
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
@@ -137,4 +137,45 @@ test('new background orchestration remains capable of running after an earlier d
   await settle(); assert.equal(f.writes.length, 1);
   f.runtime.orchestration({ sourceTabId: 'source', releaseKind: 'success', run: { runId: 'new', createdAt: 110 } });
   await settle(); assert.equal(f.writes.length, 2);
+});
+
+const pendingGoalEnd = () => ({tabId:'source',busy:false,reason:'task_complete',
+  sessionId:'S',lifecycleGeneration:'G',turnId:'T',outcomeTs:100,goalCompletionOffset:50,
+  goalWork:{version:1,pending:true,status:'active',sessionId:'S',turnId:'T',createdAt:1}});
+const goalWake = (end = pendingGoalEnd()) => ({...end,goalMetadataOnly:true,
+  goalWork:{...end.goalWork,pending:false,status:'complete'}});
+function deferGoal(f) {
+  f.runtime.busy({tabId:'source',busy:true});const end=pendingGoalEnd();f.runtime.busy(end);return end;
+}
+test('Goal metadata releases the already-public idle end exactly once without a fake busy edge',async()=>{
+  const f=fixture(),end=deferGoal(f);await settle();assert.equal(f.writes.length,0);
+  f.runtime.busy(goalWake(end));await settle();assert.equal(f.writes.length,1);
+  for(let i=0;i<5;i++)f.runtime.busy(goalWake(end));await settle();assert.equal(f.writes.length,1);
+});
+for(const patch of [{sessionId:'OTHER'},{lifecycleGeneration:'OTHER'},{turnId:'OTHER'},
+  {outcomeTs:101},{goalCompletionOffset:51},{goalCompletionOffset:null},
+  {goalWork:{...goalWake().goalWork,createdAt:2}},
+  {goalWork:{...goalWake().goalWork,pending:true,status:'active'}},
+  {goalWork:{...goalWake().goalWork,pending:true,status:'unknown'}}]) {
+  test('foreign/unknown metadata cannot release deferred Goal: '+JSON.stringify(patch),async()=>{
+    const f=fixture();deferGoal(f);f.runtime.busy({...goalWake(),...patch});await settle();
+    assert.equal(f.writes.length,0);f.runtime.busy(goalWake());await settle();assert.equal(f.writes.length,1);
+  });
+}
+test('metadata without an observed pending end or without metadata flag is not a second completion',async()=>{
+  const f=fixture();f.runtime.busy(goalWake());await settle();assert.equal(f.writes.length,0);
+  deferGoal(f);f.runtime.busy({...goalWake(),goalMetadataOnly:false});await settle();assert.equal(f.writes.length,0);
+  f.runtime.busy(goalWake());await settle();assert.equal(f.writes.length,1);
+});
+for(const action of [f=>f.runtime.cancel('source'),f=>f.runtime.busy({tabId:'source',busy:true}),
+  f=>f.runtime.busy({tabId:'source',busy:false,reason:'manual-stop'}),
+  f=>f.runtime.busy({tabId:'source',busy:false,reason:'turn_aborted'})]) {
+  test('Stop/new turn/abnormal end revokes the old deferred Goal metadata',async()=>{
+    const f=fixture();deferGoal(f);action(f);f.runtime.busy(goalWake());await settle();assert.equal(f.writes.length,0);
+  });
+}
+test('Goal metadata held by child work is released once by existing orchestration result',async()=>{
+  const f=fixture();deferGoal(f);f.block(true);f.runtime.busy(goalWake());await settle();assert.equal(f.writes.length,0);
+  f.block(false);const change={sourceTabId:'source',releaseKind:'success',run:{runId:'child',createdAt:0}};
+  f.runtime.orchestration(change);f.runtime.orchestration(change);await settle();assert.equal(f.writes.length,1);
 });

@@ -2,6 +2,7 @@
 
 const { classifyCodexSettingsWriterTransition } = require('./codex-settings-writer-transition');
 const { createAgentInputObservation, observeAgentInput } = require('./agent-input-observation');
+const { mapPreparedInput } = require('./agent-send-preparation');
 const clean = value => typeof value === 'string' && value.trim() !== 'none' ? value.trim() : '';
 
 function codexSettingsSendNotSubmitted(result = {}) {
@@ -132,7 +133,7 @@ function createCodexSettingsSendRuntime({
       }
     };
     try {
-      const physical = await withSettingsQueue(() => {
+      let physical = await withSettingsQueue(() => {
         preparation ||= beginPreparation?.(request) || null;
         return withWriteLock(initialScope.terminal, async owner => {
         assertCurrent(initialScope);
@@ -199,15 +200,11 @@ function createCodexSettingsSendRuntime({
           return codexSettingsSendNotSubmitted({ error: 'codex_settings_change_requires_idle',
             code: 'codex_settings_change_requires_idle' });
         }
+        const finishSettings = async (selected, currentOwner) => {
+        settingsResult = selected;
         if (!samePair) {
-          settingsResult = await selectSettings(sender, {
-            tabId, model, effort, preparation,
-            expectedTarget: request.expectedTarget,
-            sendOperationKey: request.pasteOptions?.sendOperationKey,
-            sendAttemptId: request.pasteOptions?.sendAttemptId,
-            expectedWriterSessionId: scope.ownerId || null,
-            allowTurnBusy: false,
-          }, owner);
+          // A deferred picker is not application proof. Only the final result
+          // reaches publication/prompt, under a freshly acquired write owner.
           assertCurrent(scope);
           const currentSettings = settingsWriteGuard();
           if (!currentSettings.allowed) return codexSettingsSendNotSubmitted({
@@ -229,16 +226,36 @@ function createCodexSettingsSendRuntime({
         });
         promptPasteInvoked = true;
         const written = request.localCommand
-          ? await sendLocalCommand({ ...request.localCommand, sender, tabId, command: content, settingsWriteGuard, preparation }, owner)
+          ? await sendLocalCommand({ ...request.localCommand, sender, tabId, command: content, settingsWriteGuard, preparation }, currentOwner)
           : await paste(scope.terminal, content, {
-              ...request.pasteOptions, ptyWriteOwner: owner,
+              ...request.pasteOptions, ptyWriteOwner: currentOwner,
               settingsWriteGuard,
               queueProofWriteOperation: operation, deferPostWriteResolution: true,
             });
         operation.promptSubmitted = written?.enterWritten === true || written?.submitted === true;
         return written;
+        };
+        if (!samePair) {
+          const selected = await selectSettings(sender, {
+            tabId, model, effort, preparation,
+            expectedTarget: request.expectedTarget,
+            sendOperationKey: request.pasteOptions?.sendOperationKey,
+            sendAttemptId: request.pasteOptions?.sendAttemptId,
+            expectedWriterSessionId: scope.ownerId || null,
+            allowTurnBusy: false,
+          }, owner);
+          if (selected?.continuePreparation) return mapPreparedInput(selected, result => (
+            withSettingsQueue(() => withWriteLock(initialScope.terminal,
+              currentOwner => finishSettings(result, currentOwner), operation))
+          ));
+          return finishSettings(selected, owner);
+        }
+        return finishSettings(null, owner);
       }, operation);
       });
+      // No global settings slot or PTY token is retained by an owned-paste
+      // observation. It resumes the SAME selection, never calls it a second time.
+      if (physical?.continuePreparation) physical = await physical.continuePreparation();
       const result = typeof physical?.finishAfterPtyWrite === 'function'
         ? await physical.finishAfterPtyWrite() : physical;
       return settingsResult ? { ...result, settingsResult } : result;

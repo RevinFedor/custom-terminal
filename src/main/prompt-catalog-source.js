@@ -102,7 +102,7 @@ async function scanSourceMetadata(root, probe, layout, io, control) {
           await control.step('scan', () => {
             entriesRead++;
             if (includePromptSourceEntry(entry)) entries.push({ name: entry.name,
-              path: path.join(frame.path, entry.name), isDirectory: entry.isDirectory() });
+              path: path.join(frame.path, entry.name), isDirectory: entry.isDirectory(), isFile: entry.isFile?.() === true });
           });
         }
       } finally { if (handle) await io('close', handle); }
@@ -111,7 +111,13 @@ async function scanSourceMetadata(root, probe, layout, io, control) {
     if (frame.index >= frame.entries.length) { stack.pop(); continue; }
     const entry = frame.entries[frame.index++];
     if (entry.isDirectory) { stack.push({ path: entry.path, entries: null, index: 0 }); continue; }
-    if (!entry.name.toLocaleLowerCase().endsWith(PROMPT_SUFFIX)) continue;
+    if (!entry.name.toLocaleLowerCase().endsWith(PROMPT_SUFFIX)) {
+      // Known ordinary files may be visual parents, but changing their body
+      // cannot change prompt membership/order. Keep only the dirent fact;
+      // verification uses async lstat, never a body read or another tree walk.
+      if (entry.isFile) leafFacts.set(entry.path, { identity: null, regular: true });
+      continue;
+    }
     const stat = await io('lstat', entry.path);
     if (stat.isSymbolicLink()) throw error('prompt_catalog_changed');
     await control.step('map', () => {

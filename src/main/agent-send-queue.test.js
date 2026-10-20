@@ -83,6 +83,23 @@ test('exact duplicate joins; same text with different IDs remains separate; edit
   assert.equal(h.sends.length, 2);
 });
 
+for (const provider of ['claude', 'codex']) test(provider + ': an exact provisional launch pin is not rewritten with a predecessor SID', async t => {
+  const h = harness(t, provider), scopes = [], execute = h.queue.execute;
+  h.queue.execute = async (request, scope) => { scopes.push(scope); return execute(request, scope); };
+  const target = { toolType: provider, terminalInstanceId: 'owned-instance', launchId: 'owned-launch' };
+  h.add('before'); h.add('pinned', { expectedTarget: target }); await tick(); h.confirm('before'); await tick();
+  assert.equal(scopes.length, 2);
+  assert.equal(scopes[1].expectedTarget, undefined, 'the original full launch target stays with the real Main readiness boundary');
+  assert.deepEqual(h.sends[1].expectedTarget, target);
+});
+
+test('a queued request without a launch or SID still inherits its confirmed predecessor conversation', async t => {
+  const h = harness(t), scopes = [], execute = h.queue.execute;
+  h.queue.execute = async (request, scope) => { scopes.push(scope); return execute(request, scope); };
+  h.add('before'); h.add('unpinned', { expectedTarget: { toolType: 'codex' } }); await tick(); h.confirm('before'); await tick();
+  assert.equal(scopes[1].expectedTarget.sessionId, 'S');
+});
+
 test('frozen text/images/chips survive editing the caller snapshot', async t => {
   const h = harness(t);
   h.add('a');

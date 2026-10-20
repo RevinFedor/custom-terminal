@@ -29,8 +29,7 @@ class WorkflowGroupActions {
     if(this.db.prepare('SELECT version FROM workflow_group_action_meta WHERE singleton=1').get()?.version!==1)fail('group_action_forward_version');
     this.groups.writable();
   }
-  signature(tabId) {
-    const row=this.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get(tabId);
+  signature(tabId, row=this.db.prepare('SELECT * FROM tabs WHERE tab_id=?').get(tabId)) {
     if(!row || row.execution_archived===1)return null;
     const owner=this.database.getAppState('conversation-owner.v1:'+tabId);
     return clean({scope:executionScopeForRow(row),claudeSessionId:row.claude_session_id,codexSessionId:row.codex_session_id,

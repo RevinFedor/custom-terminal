@@ -3,12 +3,13 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const Database = require('better-sqlite3');
 const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
 const { createSendPreparationScope } = require('./agent-send-preparation');
-const { actualFunction, createCodexDraftRequestHarness, drainMicrotasks } = require('./fixtures/codex-draft-request-observation.cjs');
+const { actualFunction, createCodexDraftRequestHarness, createFakeClock, drainMicrotasks } = require('./fixtures/codex-draft-request-observation.cjs');
 
-function fixture(t) {
+function fixture(t, { now = 1000 } = {}) {
   let proof = { success: true, hasDraft: null, preview: '', source: 'headless-main:open',
     frameBlocker: 'synchronized-output-open' };
-  const h = createCodexDraftRequestHarness({ rendererAvailable: false, getDraft: () => proof });
+  const h = createCodexDraftRequestHarness({ rendererAvailable: false, getDraft: () => proof,
+    clock: createFakeClock(now) });
   const db = new Database(':memory:'), store = createAgentSendReceiptStore(db);
   const identity = { operationKey: 'history:T:H', tabId: 'T', handoffId: 'H', surface: 'desktop-history',
     provider: 'codex', requestFingerprint: 'frozen', promptHash: 'hash', promptLength: 6 };
@@ -30,6 +31,79 @@ function fixture(t) {
   t.after(async () => { h.setOwner({ terminalStopRevision: 9 }); h.notifyFrame();
     await drainMicrotasks(40); db.close(); });
   return { ...h, db, store, identity, begun, scope, read, frame };
+}
+
+// The public readiness signal is controlled; the startup projector, retained
+// receipt, accepted HEAD scope, SQLite owner and Main frame reader are actual.
+function installNearlyExpiredLaunch(h) {
+  const terminal = {}, launchId = 'previous-launch';
+  let ready = false, established = false;
+  h.context.terminals.set('T', terminal);
+  h.context.terminalCommandState.set('T', { runSeq: 1, isRunning: true });
+  h.context.codexLastRunCommandPayload.set('T', { launchId, terminalToken: terminal,
+    lifecycleGeneration: 'L1', runSeq: 1, startedAt: h.clock.now() - 59752 });
+  h.context.getTerminalStopRevision = () => 0;
+  h.context.isCodexOperationalInputReady = () => ready;
+  h.context.hasCodexEstablishedComposerLifecycle = () => established;
+  const pinned = h.context.captureCodexSendStartupFrameWait('T');
+  assert.equal(pinned.deadlineAt, h.clock.now() + 248);
+  return { launchId, pinned, ready(inputReady = true) { established = true; ready = inputReady; } };
+}
+
+test('a later picker cannot reattach a new warm HEAD to a retained startup clock', async t => {
+  const h = fixture(t, { now: 60000 }), launch = installNearlyExpiredLaunch(h);
+  launch.ready(false); // initialized same lifecycle, current input temporarily unavailable
+  const pending = h.read(); await drainMicrotasks(40);
+  h.clock.advance(350); h.frame(); const result = await pending;
+  assert.equal(result.hasDraft, false);
+  assert.equal(result.observation.budgetMs, 60000);
+  assert.equal(h.context.captureCodexSendStartupFrameWait('T', launch.launchId), launch.pinned);
+});
+
+for (const retainedPayload of [false, true]) {
+  test('new warm HEAD does not borrow the preceding launch deadline; payload retained=' + retainedPayload, async t => {
+    const h = fixture(t, { now: 60000 }), launch = installNearlyExpiredLaunch(h);
+    launch.ready();
+    if (!retainedPayload) h.context.codexLastRunCommandPayload.delete('T');
+    const pending = h.read(); await drainMicrotasks(40);
+    h.clock.advance(350); h.frame();
+    const result = await pending;
+    assert.equal(result.hasDraft, false, 'a fresh empty frame after the OLD expiry belongs to the new warm HEAD');
+    assert.equal(result.observation.budgetMs, 60000);
+    assert.equal(h.store.get(h.identity.operationKey).receipt.preflightScope.id, h.scope.id);
+    assert.equal(h.context.codexSendStartupFrameWaitIsCurrent('T', launch.pinned), true,
+      'warm admission must not revoke a pinned cold caller');
+  });
+
+  test('pinned cold HEAD retains its original deadline after ready; payload retained=' + retainedPayload, async t => {
+    const h = fixture(t, { now: 60000 }), launch = installNearlyExpiredLaunch(h);
+    launch.ready();
+    if (!retainedPayload) h.context.codexLastRunCommandPayload.delete('T');
+    const pending = h.read({ codexStartupFrameWaitId: launch.launchId });
+    await drainMicrotasks(40); h.clock.advance(350);
+    const result = await pending;
+    assert.equal(result.hasDraft, null);
+    assert.equal(result.preparationFailure?.code, 'agent_send_preparation_expired');
+    assert.equal(result.observation.budgetMs, 248);
+    h.frame();
+    const late = await h.read({ codexStartupFrameWaitId: launch.launchId });
+    assert.equal(late.hasDraft, null, 'ready or a late empty frame cannot renew the pinned cold operation');
+  });
+}
+
+for (const change of ['launch', 'run', 'stop']) {
+  test('retained startup receipt cannot cross ' + change, async t => {
+    const h = fixture(t, { now: 60000 }), launch = installNearlyExpiredLaunch(h);
+    launch.ready();
+    if (change === 'launch') h.context.codexLastRunCommandPayload.get('T').launchId = 'replacement';
+    if (change === 'run') h.context.terminalCommandState.get('T').runSeq++;
+    if (change === 'stop') h.context.getTerminalStopRevision = () => 1;
+    assert.equal(h.context.codexSendStartupFrameWaitIsCurrent('T', launch.pinned), false);
+    h.frame();
+    const result = await h.read({ codexStartupFrameWaitId: launch.launchId });
+    assert.equal(result.hasDraft, null);
+    assert.equal(result.observation.status, 'superseded');
+  });
 }
 
 test('actual Main warm preflight keeps the SAME accepted H/O/A and authoring after 2.5s', async t => {

@@ -10,6 +10,8 @@ import ConnectedWorkflowSidebar from './ConnectedWorkflowSidebar';
 import GlobalTabArchive, {type ArchiveRequest,type GlobalArchiveRecord} from './GlobalTabArchive';
 import TerminalArea, { type AgentLifecycleSummary } from './TerminalArea';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
+import {StationaryHistorySurfaceToggle} from './SideSurfaceToggleButton';
+import {requestFocusedHistoryBottomKey} from '../../utils/workspaceHistoryBottomKey.mjs';
 import Timeline from './Timeline';
 import ForkPendingTimeline from './ForkPendingTimeline';
 import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
@@ -1513,14 +1515,11 @@ export default function Workspace({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [workspaceView, agentSurfacePairAvailable, swapPrimarySurface, effectiveTab?.id]);
 
-  // Double-tap ArrowDown or Space — jump BOTH surfaces to their newest content, from
-  // anywhere in the app. Aiming at the small floating arrow button is the
-  // annoying part; the keyboard shortcut removes it. A single key keeps
-  // its normal meaning everywhere (page scroll, caret movement, TUI history, list
-  // navigation) — only the fast second press within the window triggers this,
-  // and it never fires while the user is typing into a text field.
+  // A plain ArrowDown jumps the focused History immediately. Its composer
+  // shares this router before CodeMirror navigation. Legacy double-tap Space
+  // (and non-History ArrowDown) keeps the old all-surfaces shortcut.
   useEffect(() => {
-    if (workspaceView !== 'workspace' || currentView !== 'terminal') return;
+    if (workspaceView !== 'workspace') return;
     const DOUBLE_TAP_MS = 400;
     let lastTap: { key: string; at: number } | null = null;
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1531,6 +1530,14 @@ export default function Workspace({
         lastTap = null;
         return;
       }
+      if(e.key==='ArrowDown') {
+        const ui=useUIStore.getState();
+        if(requestFocusedHistoryBottomKey(e,{workspace:useWorkspaceStore.getState(),ui,
+          terminalPrimary:id=>resolveTabTerminalPrimary(ui,id),
+          dispatchHistory:tabId=>window.dispatchEvent(new CustomEvent('history-panel:scroll-to-bottom',{detail:{tabId}})),
+        })){lastTap=null;return;}
+      }
+      if(currentView!=='terminal'){lastTap=null;return;}
       const target = e.target as HTMLElement | null;
       // Typing surfaces own ArrowDown: composer, search inputs, editors, and
       // the xterm textarea all use it for their own navigation.
@@ -2154,6 +2161,7 @@ export default function Workspace({
       embedded={historyPlacementForRender.isPrimary || historyPlacementForRender.pinned}
       embeddedFill={historyPlacementForRender.isPrimary}
       mainSurface={historyPlacementForRender.isPrimary}
+      sideSurfaceToggleHosted
       // Terminal-primary keeps the same History as the side panel: it stays
       // the tab's live input surface (grab, dictation, task plan, Escape),
       // only its geometry differs from the centered layout.
@@ -2456,7 +2464,9 @@ export default function Workspace({
                   zIndex: 140,
                   pointerEvents: 'none',
                 }}
-              />
+              >
+                {historyIsPrimary&&singleCenterTab&&<StationaryHistorySurfaceToggle tabId={singleCenterTab.id}/>}
+              </div>
             )}
 
             {singleCenterTab && (
